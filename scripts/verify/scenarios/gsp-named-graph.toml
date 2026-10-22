@@ -1,0 +1,89 @@
+description = """The Graph Store Protocol on a named graph (docs/ops/http-api.md, "Graph Store
+Protocol"): it doesn't exist (404); PUT creates it (201); GET reads its statements (200); PUT
+again replaces them (200), not adds to them; DELETE removes it (204); then it doesn't exist
+again: GET and DELETE answer 404, each with a problem document."""
+
+[vars]
+graph = "http://example.com/verify/g1"
+
+[[step]]
+name = "before: the graph doesn't exist"
+path = "/dataset/data"
+params = { graph = "${graph}" }
+headers = { Accept = "application/n-triples" }
+[step.expect]
+status = 404
+headers = { content-type = { contains = "application/problem+json" } }
+
+[[step]]
+name = "PUT creates it"
+method = "PUT"
+path = "/dataset/data"
+params = { graph = "${graph}" }
+headers = { Content-Type = "text/turtle" }
+body = """
+@prefix ex: <http://example.com/verify/> .
+ex:s ex:p "one" , "two" .
+"""
+[step.expect]
+status = 201
+
+[[step]]
+name = "GET reads its two statements"
+path = "/dataset/data"
+params = { graph = "${graph}" }
+headers = { Accept = "application/n-triples" }
+[step.expect]
+status = 200
+headers = { content-type = { contains = "application/n-triples" } }
+rows = 2
+body = [{ contains = '<http://example.com/verify/s> <http://example.com/verify/p> "one" .' },
+        { contains = '"two"' }]
+
+[[step]]
+name = "PUT again replaces it"
+method = "PUT"
+path = "/dataset/data"
+params = { graph = "${graph}" }
+headers = { Content-Type = "application/n-triples" }
+body = """
+<http://example.com/verify/s> <http://example.com/verify/p> "three" .
+"""
+[step.expect]
+status = 200
+
+[[step]]
+name = "GET reads the replacement alone"
+path = "/dataset/data"
+params = { graph = "${graph}" }
+headers = { Accept = "application/n-triples" }
+[step.expect]
+status = 200
+rows = 1
+body = [{ contains = '"three"' }, { not_contains = '"one"' }]
+
+[[step]]
+name = "DELETE removes it"
+method = "DELETE"
+path = "/dataset/data"
+params = { graph = "${graph}" }
+[step.expect]
+status = 204
+
+[[step]]
+name = "after: GET answers 404"
+path = "/dataset/data"
+params = { graph = "${graph}" }
+headers = { Accept = "application/n-triples" }
+[step.expect]
+status = 404
+headers = { content-type = { contains = "application/problem+json" } }
+json = { "$.status" = 404 }
+
+[[step]]
+name = "after: DELETE answers 404"
+method = "DELETE"
+path = "/dataset/data"
+params = { graph = "${graph}" }
+[step.expect]
+status = 404

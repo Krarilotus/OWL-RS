@@ -32,13 +32,15 @@ fn inferences_are_explained_by_their_derivations() {
         .unwrap();
     store.rematerialise(Ruleset::Owl2Rl).unwrap();
     let explain = |s: &str, p: &str, o: &str| {
-        store.explain_statement(
-            Ruleset::Owl2Rl,
-            &nrese_store::ReadScope::All,
-            iri(s).as_ref(),
-            iri(p).as_ref(),
-            iri(o).as_ref(),
-        )
+        store
+            .explain_statement(
+                Ruleset::Owl2Rl,
+                &nrese_store::ReadScope::All,
+                iri(s).as_ref(),
+                iri(p).as_ref(),
+                iri(o).as_ref(),
+            )
+            .unwrap()
     };
 
     // Two subclass steps down to the asserted statements: `a` is a D, and D is a subclass
@@ -122,13 +124,15 @@ fn explanations_stay_within_the_readers_graphs() {
         }))
     };
     let explain = |scope: &nrese_store::ReadScope, s: &str, p: &str, o: &str| {
-        store.explain_statement(
-            Ruleset::Owl2Rl,
-            scope,
-            iri(s).as_ref(),
-            iri(p).as_ref(),
-            iri(o).as_ref(),
-        )
+        store
+            .explain_statement(
+                Ruleset::Owl2Rl,
+                scope,
+                iri(s).as_ref(),
+                iri(p).as_ref(),
+                iri(o).as_ref(),
+            )
+            .unwrap()
     };
     // `a` is a D: the open premise shown, the secret one hidden.
     let steps =
@@ -173,6 +177,7 @@ fn inferences_are_justified_by_minimal_sets() {
                 [iri("a").as_ref(), iri(TYPE).as_ref(), iri("E").as_ref()],
                 mode,
             )
+            .unwrap()
             .expect("a is an E")
     };
     let text = |set: &[nrese_store::reasoning::JustifiedStatement]| {
@@ -241,6 +246,7 @@ fn inferences_are_justified_by_minimal_sets() {
             [iri("a").as_ref(), iri(TYPE).as_ref(), iri("C").as_ref()],
             JustificationMode::One,
         )
+        .unwrap()
         .unwrap();
     assert_eq!(text(&asserted.sets[0]), "a type C");
     // A statement that doesn't hold has none.
@@ -252,6 +258,7 @@ fn inferences_are_justified_by_minimal_sets() {
                 [iri("a").as_ref(), iri(TYPE).as_ref(), iri("B").as_ref()],
                 JustificationMode::One,
             )
+            .unwrap()
             .is_none()
     );
 }

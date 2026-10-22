@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use super::compaction::{CompactionPolicy, merge_runs};
 use super::run::Run;
-use super::{IndexVersion, Layout};
+use super::{IndexEncoding, IndexVersion, Layout};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
 
@@ -74,7 +74,7 @@ fn random_quad(layout: Layout, rng: &mut Rng) -> EncodedQuad {
 /// Applies a random batch as an exact delta, the way the transaction layer does.
 fn random_commit(layout: Layout, rng: &mut Rng, model: &mut BTreeSet<EncodedQuad>) -> Run {
     let (inserts, deletes) = random_delta(layout, rng, model);
-    Run::from_delta(layout, &inserts, &deletes)
+    Run::from_delta(layout, IndexEncoding::Fast, &inserts, &deletes)
 }
 
 /// A random exact delta of quads `layout` can hold, applied to `model`: inserts, deletes.
@@ -227,7 +227,7 @@ fn random_commits_with_policy_compaction_match_the_model() {
         for seed in 0..40 {
             let mut rng = Rng(fuzz(seed));
             let mut model = BTreeSet::new();
-            let mut version = IndexVersion::empty(layout);
+            let mut version = IndexVersion::empty(layout, IndexEncoding::Fast);
             for step in 0..60 {
                 version = version.with_run(random_commit(layout, &mut rng, &mut model));
                 if let Some(plan) = policy.plan(version.runs()) {
@@ -254,7 +254,7 @@ fn arbitrary_compaction_windows_preserve_contents() {
         for seed in 100..140 {
             let mut rng = Rng(fuzz(seed));
             let mut model = BTreeSet::new();
-            let mut version = IndexVersion::empty(layout);
+            let mut version = IndexVersion::empty(layout, IndexEncoding::Fast);
             for step in 0..40 {
                 version = version.with_run(random_commit(layout, &mut rng, &mut model));
                 let runs = version.runs().len() as u64;
@@ -293,7 +293,7 @@ fn old_versions_are_unaffected_by_later_writes() {
 #[test]
 fn base_run_from_quads_deduplicates() {
     let quad = EncodedQuad::new(term(0), term(1), term(2), graph(0));
-    let version = IndexVersion::from_quads(Layout::Quads, vec![quad, quad]);
+    let version = IndexVersion::from_quads(Layout::Quads, IndexEncoding::Fast, vec![quad, quad]);
     assert_eq!(version.len(), 1);
     assert_eq!(Arc::strong_count(&version.runs()[0]), 1);
 }
@@ -303,9 +303,10 @@ fn default_graph_layout_stores_four_of_seven_permutations() {
     let quads: Vec<_> = (0..4)
         .map(|n| EncodedQuad::new(term(n), term(1), term(2), graph(0)))
         .collect();
-    let quads_bytes =
-        IndexVersion::from_quads(Layout::Quads, quads.clone()).runs()[0].memory_bytes();
-    let triples = IndexVersion::from_quads(Layout::DefaultGraph, quads);
+    let quads_bytes = IndexVersion::from_quads(Layout::Quads, IndexEncoding::Fast, quads.clone())
+        .runs()[0]
+        .memory_bytes();
+    let triples = IndexVersion::from_quads(Layout::DefaultGraph, IndexEncoding::Fast, quads);
     assert_eq!(triples.runs()[0].memory_bytes() * 7, quads_bytes * 4);
 }
 
@@ -321,7 +322,7 @@ fn default_graph_versions_turn_into_quad_versions_at_a_named_graph() {
     for seed in 200..230 {
         let mut rng = Rng(fuzz(seed));
         let mut model = BTreeSet::new();
-        let mut version = IndexVersion::empty(Layout::DefaultGraph);
+        let mut version = IndexVersion::empty(Layout::DefaultGraph, IndexEncoding::Fast);
         let mut named = false;
         for step in 0..50 {
             // Default-graph quads first, then any.
@@ -348,6 +349,44 @@ fn default_graph_versions_turn_into_quad_versions_at_a_named_graph() {
     }
 }
 
+/// The walking count of distinct values equals the groups listed, over ranges cut into
+/// parallel parts (groups of every size, one across many cuts); with deletions in range
+/// it declines, and the listing decides.
+#[test]
+fn distinct_counts_equal_the_listed_groups() {
+    // Subject s has 2s + 1 quads; subject 7 owns a stretch across several cuts.
+    let mut quads: Vec<EncodedQuad> = (0..300_000u64)
+        .map(|i| {
+            let s = (i as f64).sqrt() as u64;
+            EncodedQuad::new(term(1000 + s), term(1), term(10_000 + i), graph(0))
+        })
+        .collect();
+    quads.extend(
+        (0..200_000u64).map(|i| EncodedQuad::new(term(7), term(1), term(400_000 + i), graph(0))),
+    );
+    let version =
+        IndexVersion::from_quads(Layout::DefaultGraph, IndexEncoding::Fast, quads.clone());
+    let pattern = QuadPattern {
+        subject: None,
+        predicate: Some(term(1)),
+        object: None,
+        graph: GraphSelector::Any,
+    };
+    let plan = AccessPlan::in_permutation(&pattern, Permutation::Psog).unwrap();
+    let mut listed = Vec::new();
+    version.group_counts(&plan, 1, &mut listed);
+    assert_eq!(version.count_groups(&plan, 1), Some(listed.len() as u64));
+    // Objects: every quad its own group.
+    let by_object = AccessPlan::in_permutation(&pattern, Permutation::Posg).unwrap();
+    assert_eq!(
+        version.count_groups(&by_object, 1),
+        Some(quads.len() as u64)
+    );
+    let deletes: Vec<EncodedQuad> = quads.iter().step_by(7).copied().collect();
+    let deleted = version.with_delta(&[], &deletes);
+    assert_eq!(deleted.count_groups(&plan, 1), None);
+}
+
 /// Group counts over ranges large enough to be walked in parallel parts: groups that span
 /// the parts' cuts are added up once, and deletions in a later run still count.
 #[test]
@@ -361,7 +400,8 @@ fn group_counts_of_large_ranges_add_up_across_parts() {
         .collect();
     let deletes: Vec<EncodedQuad> = quads.iter().step_by(7).copied().collect();
     let version =
-        IndexVersion::from_quads(Layout::DefaultGraph, quads.clone()).with_delta(&[], &deletes);
+        IndexVersion::from_quads(Layout::DefaultGraph, IndexEncoding::Fast, quads.clone())
+            .with_delta(&[], &deletes);
     let pattern = QuadPattern {
         subject: None,
         predicate: Some(term(1)),
@@ -382,4 +422,36 @@ fn group_counts_of_large_ranges_add_up_across_parts() {
         *expected.entry(quad.subject.raw()).or_insert(0i64) += 1;
     }
     assert_eq!(totals, expected);
+}
+
+/// Every layout keeps the permutation each pattern shape's access plan reads, the pattern's
+/// bound components a prefix of it: an equality expansion merges its matches in that order
+/// as it reads them, collecting none (`Snapshot::expanded`).
+#[test]
+fn every_layout_keeps_every_access_plans_permutation() {
+    let selectors = [
+        GraphSelector::Any,
+        GraphSelector::AnyNamed,
+        GraphSelector::Exact(TermId::DEFAULT_GRAPH),
+        GraphSelector::Exact(graph(1)),
+    ];
+    for graph in selectors {
+        for bits in 0..8u8 {
+            let bound = |bit: u8| (bits & bit != 0).then(|| term(1));
+            let pattern = QuadPattern {
+                subject: bound(1),
+                predicate: bound(2),
+                object: bound(4),
+                graph,
+            };
+            let permutation = AccessPlan::for_pattern(&pattern).permutation;
+            assert!(
+                AccessPlan::in_permutation(&pattern, permutation).is_some(),
+                "{pattern:?}"
+            );
+            for layout in LAYOUTS {
+                assert!(layout.supports(permutation), "{pattern:?} {layout:?}");
+            }
+        }
+    }
 }

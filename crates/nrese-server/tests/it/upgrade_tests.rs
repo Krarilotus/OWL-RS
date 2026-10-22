@@ -22,6 +22,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use nrese_reasoner::rulesets::Ruleset;
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
+use nrese_store::catalog::RepositorySettings;
 
 const TOKEN: &str = "fixture-admin";
 
@@ -317,20 +319,30 @@ async fn a_store_written_by_main_opens_with_its_data_answers_and_settings()
         .await?;
     assert!(login.status().is_success(), "{}", login.status());
 
-    // Each inferred stack is current under this build's rules: kept where the rules are
-    // unchanged (owl2-rl, rdfs, the N3 rules), rebuilt where they changed (owl2-ql,
-    // owl-horst).
+    // Each inferred stack is current under this build's configured program, including
+    // user rules added to a built-in. Its semantic fingerprint may change even when
+    // the persisted configuration and rule text stay the same.
     for (id, before) in &main_markers {
         let after = marker(&data.join("repositories").join(id));
         assert_eq!(after["ruleset"], before["ruleset"], "{id}");
-        match Ruleset::from_name(&after["ruleset"]) {
-            Some(ruleset) => assert_eq!(
-                after["fingerprint"],
-                format!("{:016x}", ruleset.fingerprint()),
-                "{id}: not current"
-            ),
-            None => assert_eq!(after["fingerprint"], before["fingerprint"], "{id}"),
-        }
+        let settings: RepositorySettings = serde_json::from_slice(&std::fs::read(
+            fixture()
+                .join("data/repositories")
+                .join(id)
+                .join("repository.json"),
+        )?)?;
+        let config = settings
+            .reasoner_config()?
+            .unwrap_or_else(|| ReasonerConfig::for_mode(ReasoningMode::Owl2Rl));
+        let program = config
+            .materialised_program()
+            .expect("the fixture repositories have materialised reasoning");
+        assert_eq!(after["ruleset"], program.name(), "{id}: configured program");
+        assert_eq!(
+            after["fingerprint"],
+            format!("{:016x}", program.fingerprint()),
+            "{id}: not current"
+        );
     }
     let default = marker(&data);
     assert_eq!(

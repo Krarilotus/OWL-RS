@@ -56,8 +56,11 @@ fn vocabulary_study() {
         eprintln!("NRESE_STUDY_CHECKPOINT not set");
         return;
     };
-    let (base, _) = crate::durability::checkpoint::map_written(std::path::Path::new(&path))
-        .expect("checkpoint");
+    let (base, _) = crate::durability::checkpoint::map_written(
+        std::path::Path::new(&path),
+        crate::IndexEncoding::Fast,
+    )
+    .expect("checkpoint");
     let keys: Vec<&[u8]> = (0..base.len).map(|i| base.key(i)).collect();
     let text: usize = keys.iter().map(|k| k.len()).sum();
     let lengths: Vec<usize> = keys.iter().map(|k| k.len()).collect();

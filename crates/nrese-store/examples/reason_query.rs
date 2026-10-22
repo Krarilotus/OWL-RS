@@ -31,7 +31,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use nrese_reasoner::rulesets::Ruleset;
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_store::{
     BulkLoadRequest, CancellationToken, GraphTarget, MutationCommand, MutationPipeline,
     MutationTicket, PreparedQuery, QueryEvaluationError, SparqlQueryRequest, SparqlUpdateRequest,
@@ -319,10 +319,8 @@ fn commit_latency(
     n: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mode = ReasoningMode::for_ruleset(ruleset);
-    let pipeline = MutationPipeline::new(
-        std::sync::Arc::clone(store),
-        std::sync::Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode))),
-    );
+    let pipeline =
+        MutationPipeline::new(std::sync::Arc::clone(store), ReasonerConfig::for_mode(mode));
     // Asserted ABox type statements (IRIs, classes outside the W3C vocabularies), spread
     // over the dataset.
     let mut request = nrese_store::SparqlQueryRequest::all(format!(

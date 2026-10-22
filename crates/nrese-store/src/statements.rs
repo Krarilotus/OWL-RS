@@ -233,25 +233,9 @@ pub(crate) fn write_statements(
         format,
         GraphResultFormat::NQuads | GraphResultFormat::TriG | GraphResultFormat::BinaryRdf
     );
-    let mut writer = nrese_rdf_io::RdfSerializer::from_format(format.rdf_format()).for_writer(out);
-    let mut written = 0;
-    for engine_pattern in pattern.patterns(view, scope) {
-        for quad in decoded_quads(view, model, &engine_pattern) {
-            cancel.check()?;
-            let quad = quad?;
-            match quads_kept {
-                true => writer.serialize_quad(&quad)?,
-                false => writer.serialize_triple(&nrese_rdf::Triple::new(
-                    quad.subject,
-                    quad.predicate,
-                    quad.object,
-                ))?,
-            }
-            written += 1;
-        }
-    }
-    writer.finish()?;
-    Ok(written)
+    let patterns = pattern.patterns(view, scope);
+    let format = (format.rdf_format(), quads_kept);
+    crate::rdf_io::write_quads(view, model, &patterns, format, cancel, out).map(|(n, _)| n)
 }
 
 /// How many statements match `pattern`.

@@ -70,7 +70,7 @@ impl Context<'_> {
                     .into());
                 }
             };
-            let mut subset = IdTable::new(bound.table.width());
+            let mut subset = IdTable::charged(bound.table.width(), 0, &self.budget)?;
             for &row in &rows {
                 subset.push_row(&bound.table.row(row), &self.budget)?;
             }
@@ -86,7 +86,7 @@ impl Context<'_> {
             } else {
                 let mut vars = found.vars.clone();
                 vars.push(variable.clone());
-                let mut table = IdTable::new(vars.len());
+                let mut table = IdTable::charged(vars.len(), 0, &self.budget)?;
                 let mut line = vec![id; vars.len()];
                 for row in 0..found.table.len() {
                     line[..found.vars.len()].copy_from_slice(&found.table.row(row));
@@ -198,7 +198,7 @@ fn import(
     budget: &std::sync::Arc<nrese_exec::Budget>,
     id: impl Fn(&Term) -> NativeResult<u64>,
 ) -> NativeResult<IdTable> {
-    let mut table = IdTable::new(results.variables.len());
+    let mut table = IdTable::charged(results.variables.len(), 0, budget)?;
     let mut row = vec![UNDEF; results.variables.len()];
     for values in &results.rows {
         for (slot, value) in row.iter_mut().zip(values) {

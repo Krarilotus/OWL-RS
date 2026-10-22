@@ -611,7 +611,7 @@ impl Context<'_> {
             .collect();
         let mut index: HashMap<Vec<u64>, u64> = HashMap::new();
         let mut key_of_row = Vec::with_capacity(solutions.table.len());
-        let mut distinct = IdTable::new(keys.len() + 1);
+        let mut distinct = IdTable::charged(keys.len() + 1, 0, &self.budget)?;
         let mut row = vec![0u64; keys.len() + 1];
         for r in 0..solutions.table.len() {
             let key: Vec<u64> = keys.iter().map(|&c| solutions.table.get(r, c)).collect();
@@ -700,7 +700,7 @@ impl Context<'_> {
             matched[r as usize] = true;
         }
         // The kept pairs, in left order, with the left rows none was kept for in between.
-        let mut out = IdTable::new(width - 1);
+        let mut out = IdTable::charged(width - 1, 0, &self.budget)?;
         let mut line = vec![UNDEF; width - 1];
         let mut next = 0;
         let mut unmatched_before =

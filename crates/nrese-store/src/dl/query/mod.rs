@@ -46,6 +46,12 @@ use crate::{StoreError, StoreResult, StoreService};
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const OWL_SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
+
+/// Why answers to a read of `owl:sameAs` whose ends can be one term are sound only
+/// ([`analysis::reads_reflexive_same_as`]).
+const REFLEXIVE_SAME_AS: &str = "the query reads owl:sameAs where both ends can be one term: \
+     `x owl:sameAs x` holds of every individual, and neither bound materialises it (eq-ref), \
+     so the answers are sound only";
 const OWL_THING: &str = "http://www.w3.org/2002/07/owl#Thing";
 const U1: &str = "urn:nrese:u1:";
 
@@ -116,11 +122,11 @@ fn consistency_at(
     }
     let cancel = nrese_dl::tableau::Cancel::from_flag(cancellation.flag());
     let ontology = ontology_at(store, snapshot);
-    let budget = gate::budget(store, Some(cancel), memory).remaining(deadline);
+    let budget = gate::budget(store, Some(cancel), memory);
     if let Some(stopped) = stopped() {
         return stopped;
     }
-    let checked = consistency::check(&ontology, &budget);
+    let checked = consistency::check_until(&ontology, &budget, deadline);
     // Request-local cancellation, expiry or memory must not replace shared revision
     // status.
     if let Some(stopped) = stopped() {
@@ -229,6 +235,9 @@ fn plan_status_built(store: &StoreService, prepared: &PreparedQuery) -> Status {
         return Status::sound_only(format!(
             "the query reads {what}: entailed schema statements aren't bounded"
         ));
+    }
+    if reads_reflexive_same_as(&analysis) {
+        return Status::sound_only(REFLEXIVE_SAME_AS);
     }
     if closed(&analysis, &view, &snapshot) {
         let mut status = Status::complete();
@@ -350,6 +359,10 @@ fn decide_answers(
             "the query reads {what}: entailed schema statements aren't bounded (the RL \
              closure's are sound; /classification has the subsumptions under OWL 2 DL)"
         ));
+        return Ok(status.stream(lower_view(&view)));
+    }
+    if reads_reflexive_same_as(&analysis) {
+        status.add(REFLEXIVE_SAME_AS.to_owned());
         return Ok(status.stream(lower_view(&view)));
     }
     if closed(&analysis, &view, &snapshot) {

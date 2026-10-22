@@ -21,6 +21,7 @@
 
 mod bulk;
 pub mod characteristic;
+mod corpora;
 mod equality;
 mod replication;
 mod snapshot;
@@ -40,17 +41,21 @@ use crate::durability::{DurabilityConfig, Durable, checkpoint};
 use crate::error::EngineResult;
 use crate::index::compaction::merge_runs;
 use crate::index::run::Run;
-use crate::index::{CompactionPolicy, IndexVersion, Layout};
+use crate::index::{CompactionPolicy, IndexEncoding, IndexVersion, Layout};
 use crate::quad::{EncodedQuad, EncodedTriple};
+use crate::term::vocabulary::VocabularyEncoding;
 use crate::term::{Dictionary, DictionaryStats, TermId};
 
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
+pub use corpora::TextCorpusStats;
 pub use equality::Classes as EqualityClasses;
 pub use replication::LogBatch;
-pub use snapshot::{InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity};
+pub use snapshot::{
+    InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity, TextScope,
+};
 pub use transaction::{CommitSummary, Transaction};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub compaction: CompactionPolicy,
     /// Run large compactions and automatic checkpoints on a background thread. When
@@ -59,6 +64,19 @@ pub struct EngineConfig {
     pub background_maintenance: bool,
     /// Used by [`Engine::open`] only.
     pub durability: DurabilityConfig,
+    /// The bytes the kept full-text corpora may hold together ([`Snapshot::text_search_in`]):
+    /// beyond, the least recently used go (`corpora`).
+    pub text_corpus_bytes: usize,
+    /// How the index blocks this engine builds are encoded; blocks of either encoding are
+    /// read.
+    pub index_encoding: IndexEncoding,
+    /// How the checkpoints this engine writes store the dictionary's keys; checkpoints of
+    /// either are read.
+    pub vocabulary: VocabularyEncoding,
+    /// The process's memory root, which the scratch of every checkpoint the engine writes
+    /// (its own, images, bulk loads') is charged within before it is allocated: one more
+    /// can't spend what queries or another store's checkpoint hold. `None`: no limit.
+    pub admission: Option<Arc<nrese_exec::SharedBudget>>,
 }
 
 impl Default for EngineConfig {
@@ -67,6 +85,10 @@ impl Default for EngineConfig {
             compaction: CompactionPolicy::default(),
             background_maintenance: true,
             durability: DurabilityConfig::default(),
+            text_corpus_bytes: 256 << 20,
+            index_encoding: IndexEncoding::default(),
+            vocabulary: VocabularyEncoding::default(),
+            admission: None,
         }
     }
 }
@@ -101,6 +123,8 @@ pub struct EngineStats {
     pub compactions: u64,
     /// Checkpoints written since the engine started (bulk loads write one each).
     pub checkpoints: u64,
+    /// The full-text corpora kept, their bytes and budget, and how they were built.
+    pub text_corpora: TextCorpusStats,
 }
 
 /// Which statements a read sees. GraphDB calls them explicit and implicit statements.
@@ -147,19 +171,32 @@ impl Stack {
 
 impl CommitRecord {
     /// The runs this record adds to the asserted stack, of `asserted` layout, and to the
-    /// inferred stack. Shared by commit and WAL replay, so both build identical versions.
-    pub(crate) fn runs(&self, asserted: Layout) -> [Run; 2] {
+    /// inferred stack, packed in `encoding`. Shared by commit and WAL replay, so both build
+    /// identical versions.
+    pub(crate) fn runs(&self, asserted: Layout, encoding: IndexEncoding) -> [Run; 2] {
         let in_default_graph = |triples: &[EncodedTriple]| -> Vec<EncodedQuad> {
             triples.iter().map(|t| t.in_default_graph()).collect()
         };
         [
-            Run::from_delta(asserted, &self.inserts, &self.deletes),
+            Run::from_delta(asserted, encoding, &self.inserts, &self.deletes),
             Run::from_delta(
                 Layout::DefaultGraph,
+                encoding,
                 &in_default_graph(&self.inferred_inserts),
                 &in_default_graph(&self.inferred_deletes),
             ),
         ]
+    }
+
+    /// The statements the record adds or removes, in either stack, as (subject,
+    /// predicate, object): what the full-text corpora look at again (`corpora`). Read in
+    /// place: a commit copies none of them.
+    pub(crate) fn touched(&self) -> impl Iterator<Item = (TermId, TermId, TermId)> + Clone + '_ {
+        let quads = self.inserts.iter().chain(&self.deletes);
+        let triples = self.inferred_inserts.iter().chain(&self.inferred_deletes);
+        quads
+            .map(|quad| (quad.subject, quad.predicate, quad.object))
+            .chain(triples.map(|triple| (triple.subject, triple.predicate, triple.object)))
     }
 
     /// Whether the record puts a quad in a named graph: then a default-graph asserted stack
@@ -210,11 +247,11 @@ impl Content {
 }
 
 impl Version {
-    /// The empty revision 0.
-    pub(crate) fn empty() -> Self {
+    /// The empty revision 0, its runs to be packed in `encoding`.
+    pub(crate) fn empty(encoding: IndexEncoding) -> Self {
         Self {
-            asserted: IndexVersion::empty(Layout::DefaultGraph),
-            inferred: IndexVersion::empty(Layout::DefaultGraph),
+            asserted: IndexVersion::empty(Layout::DefaultGraph, encoding),
+            inferred: IndexVersion::empty(Layout::DefaultGraph, encoding),
             revision: 0,
             dictionary_len: 0,
             equality: Default::default(),
@@ -365,6 +402,13 @@ struct Shared {
     /// What the canonical views versions keep are charged to
     /// ([`Engine::set_canonical_view_budget`]).
     views: RwLock<Arc<nrese_exec::Budget>>,
+    /// [`EngineConfig::index_encoding`]: what fresh versions (loads, mapped checkpoints)
+    /// pack their runs in; derived versions keep their parent's.
+    index_encoding: IndexEncoding,
+    /// [`EngineConfig::vocabulary`].
+    vocabulary: VocabularyEncoding,
+    /// The checkpoints' scratch is charged within it ([`EngineConfig::admission`]).
+    admission: Option<Arc<nrese_exec::SharedBudget>>,
 }
 
 impl Shared {
@@ -400,7 +444,19 @@ impl Shared {
                 wal.rotate(snapshot.revision() + 1)?;
                 snapshot
             };
-            let path = checkpoint::write(durable.root(), &snapshot)?;
+            // A checkpoint copies a revision already committed: whether its file is in place
+            // or not, recovery reaches the same state, so a publication whose outcome is
+            // unknown returns its error without poisoning the WAL, and releases no segment
+            // (they stay the source of that revision). Only publishing a new revision
+            // poisons on an unknown outcome ([`super::bulk`]).
+            let path = checkpoint::write(
+                durable.root(),
+                &snapshot,
+                self.vocabulary,
+                self.admission.as_ref(),
+            )?
+            .commit()
+            .map_err(checkpoint::Uncommitted::into_error)?;
             self.checkpoints.fetch_add(1, Ordering::Relaxed);
             durable.wal.lock().release_through(snapshot.revision())?;
             (snapshot, path)
@@ -423,7 +479,8 @@ impl Shared {
     /// copies in memory are freed once no snapshot holds them. A failure leaves everything
     /// in memory (the checkpoint is written either way).
     fn serve_mapped(&self, path: &Path, written: Snapshot) {
-        let (base, [asserted, inferred]) = match checkpoint::map_written(path) {
+        let (base, [asserted, inferred]) = match checkpoint::map_written(path, self.index_encoding)
+        {
             Ok(mapped) => mapped,
             Err(error) => {
                 tracing::warn!(%error, path = %path.display(), "checkpoint not mapped; data stays in memory");
@@ -564,7 +621,8 @@ impl std::fmt::Debug for Engine {
 impl Engine {
     /// An in-memory engine.
     pub fn new(config: EngineConfig) -> EngineResult<Self> {
-        Self::build(config, Arc::default(), None, Version::empty())
+        let empty = Version::empty(config.index_encoding);
+        Self::build(config, Arc::default(), None, empty)
     }
 
     /// Opens (or creates) a durable engine in `dir`, recovering its last committed revision.
@@ -576,6 +634,7 @@ impl Engine {
             &dictionary,
             &config.compaction,
             config.durability,
+            config.index_encoding,
         )?;
         let version = recovered.version;
         dictionary.set_derived_dir(dir.as_ref().join("derived"));
@@ -605,7 +664,7 @@ impl Engine {
         };
         let shared = Arc::new(Shared {
             dictionary,
-            statistics: Arc::default(),
+            statistics: Arc::new(statistics::Statistics::new(config.text_corpus_bytes)),
             versions: Versions {
                 current: RwLock::new(Arc::new(version)),
                 compaction_slot: Mutex::new(()),
@@ -619,6 +678,9 @@ impl Engine {
             checkpoints: AtomicU64::new(0),
             equality: RwLock::new(None),
             views: RwLock::new(Arc::new(nrese_exec::Budget::unlimited())),
+            index_encoding: config.index_encoding,
+            vocabulary: config.vocabulary,
+            admission: config.admission,
         });
         let worker = config
             .background_maintenance
@@ -650,6 +712,12 @@ impl Engine {
             .prepare_sets(&snapshot, ReadModel::default());
     }
 
+    /// What the planner's statistics kept are charged to from now on: their owner's budget
+    /// (a store's own envelope within its catalog's; unset, an unlimited one of their own).
+    pub fn charge_statistics_to(&self, budget: Arc<nrese_exec::budget::Budget>) {
+        self.inner.shared.statistics.set_budget(budget);
+    }
+
     /// Equality by representatives (work package W4, stage B): with `Some(sameAs)`, the
     /// inferred stack holds the closure over one representative per `owl:sameAs` class,
     /// each other identity stored as `identity sameAs representative`, and snapshots taken
@@ -667,6 +735,14 @@ impl Engine {
     /// on use it.
     pub fn set_canonical_view_budget(&self, budget: Arc<nrese_exec::Budget>) {
         *self.inner.shared.views.write() = budget;
+    }
+
+    /// The budget what the full-text corpora keep is charged to from now on (one within
+    /// the server's, say), instead of one of [`EngineConfig::text_corpus_bytes`]: the
+    /// corpora kept so far are let go (searches holding them keep them, charged to the
+    /// old one).
+    pub fn set_text_corpus_budget(&self, budget: nrese_exec::Budget) {
+        self.inner.shared.statistics.corpora.set_budget(budget);
     }
 
     /// `owl:sameAs` if reads expand equality classes ([`Self::set_equality`]).
@@ -734,8 +810,16 @@ impl Engine {
     /// and both stacks) like the store's own, named by its revision, while writers go on. A
     /// data directory holding it opens at that revision.
     pub fn write_image(&self, dir: &std::path::Path) -> EngineResult<ImageInfo> {
-        let snapshot = self.inner.shared.snapshot();
-        let path = crate::durability::checkpoint::write(dir, &snapshot)?;
+        let shared = &self.inner.shared;
+        let snapshot = shared.snapshot();
+        let path = crate::durability::checkpoint::write(
+            dir,
+            &snapshot,
+            shared.vocabulary,
+            shared.admission.as_ref(),
+        )?
+        .commit()
+        .map_err(crate::durability::checkpoint::Uncommitted::into_error)?;
         let version = snapshot.version();
         Ok(ImageInfo {
             path,
@@ -772,6 +856,7 @@ impl Engine {
                 .compactions
                 .load(Ordering::Relaxed),
             checkpoints: self.inner.shared.checkpoints.load(Ordering::Relaxed),
+            text_corpora: self.inner.shared.statistics.corpora.stats(),
         }
     }
 }

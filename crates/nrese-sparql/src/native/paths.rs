@@ -99,7 +99,7 @@ pub(crate) enum PathGraph<'a> {
     Named(TermId),
     /// The merge of all graphs, or of the listed ones (a dataset with several `FROM`):
     /// every statement once.
-    Merged(Option<&'a [TermId]>),
+    Merged(Option<&'a crate::dataset::GraphSet>),
 }
 
 pub(crate) struct PathEvaluator<'a> {

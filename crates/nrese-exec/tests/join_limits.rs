@@ -1,6 +1,8 @@
 //! A join over its row limit stops before it expands its matches: the pairs of an
-//! equal-key group are charged before they are made (the review of 3 October 2026, P1).
-//! Measured with a counting allocator, so this file is a test binary of its own.
+//! equal-key group are charged before they are made (the review of 3 October 2026, P1),
+//! and a cross product is refused from its inputs' sizes (the server's
+//! `a_query_beyond_its_memory_limit_is_rejected`). Measured with a counting allocator, so
+//! this file is a test binary of its own, and one test.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -72,6 +74,14 @@ fn joins_over_their_limit_stop_before_expanding_a_group() {
         peak < 256 * 1024,
         "OPTIONAL allocated {peak} bytes before refusing"
     );
+    // Without keys: 4 million rows of four columns, 128 MB if made.
+    let peak = peak_of(|| {
+        assert!(join(&left, &right, &[], &[], &budget(), 1_000_000).is_err());
+    });
+    assert!(
+        peak < 256 * 1024,
+        "the cross product allocated {peak} bytes before refusing"
+    );
     // Within the limit the same joins give every pair.
     assert_eq!(
         join(&left, &right, &[0], &[0], &budget(), usize::MAX)
@@ -81,6 +91,12 @@ fn joins_over_their_limit_stop_before_expanding_a_group() {
     );
     assert_eq!(
         left_join(&left, &right, &[0], &[0], None, &budget(), usize::MAX)
+            .unwrap()
+            .len(),
+        4_000_000
+    );
+    assert_eq!(
+        join(&left, &right, &[], &[], &budget(), 4_000_000)
             .unwrap()
             .len(),
         4_000_000

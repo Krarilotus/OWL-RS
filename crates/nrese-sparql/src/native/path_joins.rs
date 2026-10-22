@@ -195,7 +195,7 @@ impl Context<'_> {
             let width = vars.len();
             return Ok(Solutions {
                 vars,
-                table: IdTable::new(width),
+                table: IdTable::charged(width, 0, &self.budget)?,
                 ordered: false,
             });
         };

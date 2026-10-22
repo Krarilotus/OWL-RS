@@ -154,8 +154,16 @@ struct Sink<'a> {
 }
 
 impl<'a> Sink<'a> {
-    fn new(width: usize, limit: &'a Limit, budget: &'a Arc<Budget>) -> Self {
-        Self::after(IdTable::new(width), limit, budget)
+    fn new(
+        width: usize,
+        limit: &'a Limit,
+        budget: &'a Arc<Budget>,
+    ) -> Result<Self, BudgetExceeded> {
+        Ok(Self::after(
+            IdTable::charged(width, 0, budget)?,
+            limit,
+            budget,
+        ))
     }
 
     /// Rows appended to `out`, whose own rows are counted already.
@@ -330,7 +338,7 @@ fn cross_product(
     }
     let width = left.width() + right.width();
     chunked(left.len(), width, budget, |lefts| {
-        let mut out = Sink::new(width, limit, budget);
+        let mut out = Sink::new(width, limit, budget)?;
         let mut row = vec![0; width];
         for l in lefts {
             for (i, c) in left.columns().iter().enumerate() {
@@ -650,7 +658,7 @@ fn hash_join(
     let payload = right_payload(right.width(), rk);
     let width = left.width() + payload.len();
     let out = chunked(probe.len(), width, budget, |rows| {
-        let mut out = Sink::new(width, limit, budget);
+        let mut out = Sink::new(width, limit, budget)?;
         let mut row = vec![0; width];
         for p in rows {
             let mut b = table.first(probe, p, probe_keys);
@@ -789,7 +797,7 @@ fn left_join_rows(
     } = *join;
     let payload = right_payload(right.width(), right_keys);
     let width = left.width() + payload.len();
-    let mut out = Sink::new(width, limit, budget);
+    let mut out = Sink::new(width, limit, budget)?;
     let mut row = vec![0; width];
     for l in rows {
         for (i, c) in left.columns().iter().enumerate() {
@@ -1141,7 +1149,7 @@ pub fn outer_join_with_undef(
     let payload = right_payload(right.width(), right_keys);
     let width = left.width() + payload.len();
     let limit = Limit::new(limit);
-    let mut out = Sink::new(width, &limit, budget);
+    let mut out = Sink::new(width, &limit, budget)?;
     let compatible = Compatible::new(right, left_keys, right_keys, budget)?;
     let mut row = vec![0; width];
     for l in 0..left.len() {

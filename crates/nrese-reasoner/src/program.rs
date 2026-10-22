@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use super::ir::{ParseError, Rule, Vocabulary};
+use super::ir::{Head, ParseError, Rule, Term, Vocabulary};
 use super::n3::{self, N3Program};
 use super::rulesets::{Ruleset, SEMANTICS_VERSION};
 use super::vocabulary::LocalVocabulary;
@@ -20,6 +20,11 @@ pub struct UserRules {
     name: String,
     text: String,
     format: RuleFormat,
+    /// Selected once with the validated text; fingerprint checks must not parse it again.
+    pie_contexts: bool,
+    /// A head can produce generalized rdf:type/owl:sameAs facts. Parsed once with the
+    /// rules, not while comparing a persisted state's fingerprint.
+    value_checks: bool,
 }
 
 /// The languages user rules are read in.
@@ -47,12 +52,30 @@ impl UserRules {
         text: impl Into<String>,
         format: RuleFormat,
     ) -> Result<Self, ParseError> {
-        let rules = Self {
+        let mut rules = Self {
             name: name.into(),
             text: text.into(),
             format,
+            pie_contexts: false,
+            value_checks: false,
         };
-        rules.compile(&mut LocalVocabulary::default())?;
+        let mut vocabulary = LocalVocabulary::default();
+        let compiled = rules.compile(&mut vocabulary)?;
+        let rdf_type = vocabulary.iri(&format!("{}type", super::ir::RDF));
+        let same_as = vocabulary.iri(&format!("{}sameAs", super::ir::OWL));
+        let checked = |predicate: Term| {
+            matches!(predicate, Term::Var(_))
+                || predicate == Term::Const(rdf_type)
+                || predicate == Term::Const(same_as)
+        };
+        rules.value_checks = compiled.rules.iter().any(|rule| match &rule.head {
+            Head::Facts(heads) => heads.iter().any(|atom| checked(atom.0[1])),
+            Head::Inconsistent => false,
+        }) || compiled
+            .facts
+            .iter()
+            .any(|fact| checked(Term::Const(fact[1])));
+        rules.pie_contexts = format == RuleFormat::Pie && super::pie::uses_contexts(&rules.text);
         Ok(rules)
     }
 
@@ -132,6 +155,17 @@ impl RuleProgram {
         feed(&SEMANTICS_VERSION.to_le_bytes());
         feed(b"custom:");
         feed(user.text.as_bytes());
+        // A GraphDB ruleset with contexts derives relations named by the PIE compiler; a
+        // change of those names is a change of what it derives. Others keep their value.
+        if user.pie_contexts {
+            feed(b"pie-context-names:");
+            feed(&super::pie::CONTEXT_NAMES.to_le_bytes());
+        }
+        // Built-ins already carry this feature. Pure custom rules that cannot produce
+        // generalized type/equality facts keep their previous fingerprint.
+        if self.base.is_none() && user.value_checks {
+            feed(super::rulesets::VALUE_CHECK_SEMANTICS);
+        }
         hash
     }
 
@@ -201,6 +235,62 @@ mod tests {
     const RULES: &str = "@prefix : <http://e/> .
         { ?x :parent ?y . ?y :parent ?z } => { ?x :grandparent ?z } .
         :parent :is :relation .";
+
+    /// What a build before the PIE context names changed stored for a user ruleset.
+    fn fingerprint_before_context_names(user: &str) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &byte in SEMANTICS_VERSION
+            .to_le_bytes()
+            .iter()
+            .chain(b"custom:")
+            .chain(user.as_bytes())
+        {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// A GraphDB ruleset with contexts no longer matches the state a build with the old
+    /// context names stored, so the store rebuilds its closure; other rulesets keep theirs.
+    #[test]
+    fn changed_context_names_make_older_closures_stale() {
+        let with = "Prefices { e : http://e/ }
+Rules
+{
+Id: r
+  x <e:p> y
+  ---
+  x <e:q> y [Context <e:g#x>]
+}
+";
+        let without = "Prefices { e : http://e/ }
+Rules
+{
+Id: r
+  x <e:p> y
+  ---
+  x <e:q> y
+}
+";
+        let spaced = with.replace("[Context", "[ Context");
+        let tabbed = with.replace("[Context", "[\tContext");
+        let prefixed_comment = with.replace("[Context", "[/*gap*/Context");
+        let inner_comment = with.replace("[Context", "[Con/*gap*/text");
+        for (text, rebuilds) in [
+            (with, true),
+            (&spaced, true),
+            (&tabbed, true),
+            (&prefixed_comment, true),
+            (&inner_comment, true),
+            (without, false),
+        ] {
+            let user = Arc::new(UserRules::pie("rules.pie", text).unwrap());
+            let program = RuleProgram::new(None, Some(user)).unwrap();
+            let stored = fingerprint_before_context_names(text);
+            assert_eq!(program.fingerprint() != stored, rebuilds, "{text}");
+        }
+    }
 
     #[test]
     fn names_fingerprints_and_parts() {

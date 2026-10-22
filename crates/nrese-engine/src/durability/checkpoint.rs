@@ -38,20 +38,28 @@
 //! read.
 //!
 //! A checkpoint is written from a [`Snapshot`], so writers keep committing while it is being
-//! written. It is streamed to `checkpoint-<revision>.tmp`, synced, and atomically renamed
-//! to `checkpoint-<revision>.nck`; a crash at any point leaves either the old or the new
-//! checkpoint, never a partial one. Leftover `.tmp` files are deleted on open.
+//! written. It is streamed to `checkpoint-<revision>.tmp` and synced ([`Written`]), then
+//! atomically renamed to `checkpoint-<revision>.nck` and the directory synced
+//! ([`Written::commit`]); a crash at any point leaves either the old or the new checkpoint,
+//! never a partial one. Leftover `.tmp` files are deleted on open. In between, the written
+//! file can already be mapped: a bulk load's commit point is that rename
+//! ([`crate::engine::bulk`]), and nothing fallible needs to follow it.
 
 use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation, SharedBudget};
 use rayon::prelude::*;
 
 use super::codec::{Reader, put_u32, put_u64};
+use super::fault::{self, Step};
+use super::publish;
 use crate::engine::{Snapshot, Stack};
 use crate::error::{EngineError, EngineResult};
+use crate::index::IndexEncoding;
 use crate::index::keys::PackedKeys;
 use crate::index::{IndexVersion, Layout};
 use crate::mapped::{Map, Mapped};
@@ -60,7 +68,7 @@ use crate::term::Dictionary;
 use crate::term::dictionary::{Base, base_slots};
 use crate::term::hash::key_hash;
 use crate::term::offsets::{BlockEnds, Ends, Offsets};
-use crate::term::vocabulary::{Codec, VocabularyEncoding, vocabulary_encoding};
+use crate::term::vocabulary::{Codec, Trained, VocabularyEncoding};
 
 /// Version 2 added the inferred stack (roadmap E6); version 3 changed term encoding (E1);
 /// version 4 made integer ids order-preserving and split literal kinds (XC1); version 5
@@ -87,12 +95,33 @@ const MAGIC_V5: &[u8; 8] = b"NRESECK5";
 const MAGIC_V4: &[u8; 8] = b"NRESECK4";
 /// Magic prefix shared by every checkpoint format version.
 const FAMILY: &[u8; 7] = b"NRESECK";
+/// The file writer's buffer.
+const WRITER: usize = 1 << 20;
+/// What the writer's buffer holds before it is written out; it is made twice this, so that
+/// nothing appended between two drains grows it (a key that doesn't fit is written past it).
+/// The file writer's size: a flush that large goes past `BufWriter` to the file instead of
+/// being copied into it (at 64 KiB, every key was copied once more: YAGO's checkpoint
+/// dictionary pass 8 % slower, w6-ckpt-12).
+const BUFFER: usize = WRITER;
 const EXTENSION: &str = "nck";
 /// Dictionary keys copied per lock acquisition, so interning is never blocked for long.
 const KEY_CHUNK: u64 = 64 * 1024;
 
 fn checkpoint_path(dir: &Path, revision: u64, extension: &str) -> PathBuf {
     dir.join(format!("checkpoint-{revision:020}.{extension}"))
+}
+
+/// The revision of the checkpoint (or image) file named `name`: `checkpoint-<revision>.nck`,
+/// a plain file name; `None` for any other name.
+pub fn image_revision(name: &str) -> Option<u64> {
+    let stem = name
+        .strip_prefix("checkpoint-")?
+        .strip_suffix(&format!(".{EXTENSION}"))?;
+    // Digits only: `parse` would take a sign.
+    match !stem.is_empty() && stem.bytes().all(|b| b.is_ascii_digit()) {
+        true => stem.parse().ok(),
+        false => None,
+    }
 }
 
 fn list(dir: &Path) -> EngineResult<Vec<(u64, PathBuf)>> {
@@ -102,9 +131,7 @@ fn list(dir: &Path) -> EngineResult<Vec<(u64, PathBuf)>> {
         let revision = path
             .file_name()
             .and_then(|name| name.to_str())
-            .and_then(|name| name.strip_prefix("checkpoint-"))
-            .and_then(|rest| rest.strip_suffix(&format!(".{EXTENSION}")))
-            .and_then(|stem| stem.parse::<u64>().ok());
+            .and_then(image_revision);
         if let Some(revision) = revision {
             found.push((revision, path));
         }
@@ -125,15 +152,17 @@ pub(crate) fn remove_temporaries(dir: &Path) -> EngineResult<()> {
 }
 
 /// Writer that feeds everything it writes into a CRC.
-struct Checksummed<W> {
+struct Checksummed<'b, W> {
     inner: W,
     crc: crc32fast::Hasher,
     buffer: Vec<u8>,
     /// Bytes handed to `inner` so far.
     written: u64,
+    /// The charge of `inner`'s and `buffer`'s room: after them, released once they are freed.
+    _held: Reservation<&'b Budget>,
 }
 
-impl<W: Write> Checksummed<W> {
+impl<W: Write> Checksummed<'_, W> {
     /// Writes and checksums the scratch buffer.
     fn flush_buffer(&mut self) -> std::io::Result<()> {
         self.crc.update(&self.buffer);
@@ -164,20 +193,34 @@ impl<W: Write> Checksummed<W> {
 
     /// Writes the buffer out once it is large.
     fn drain(&mut self) -> std::io::Result<()> {
-        if self.buffer.len() >= 1 << 16 {
+        if self.buffer.len() >= BUFFER {
             self.flush_buffer()?;
         }
         Ok(())
     }
+
+    /// Appends `bytes` without growing the buffer: into it where they fit, else written
+    /// after it.
+    fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        if bytes.len() > self.buffer.capacity() - self.buffer.len() {
+            return self.write_bytes(bytes);
+        }
+        self.buffer.extend_from_slice(bytes);
+        self.drain()
+    }
 }
 
-/// Writes the dictionary section (module docs) of the entries `0..len`, reading the
-/// dictionary in chunks so interning is never blocked for long.
+/// Writes the dictionary section (module docs) of the entries `0..len` but its text order
+/// ([`write_text_order`]), reading the dictionary in chunks so interning is never blocked
+/// for long. Its scratch, which grows with the whole vocabulary however small the change
+/// since the last checkpoint, is charged to `admission` before it is allocated: the keys
+/// decoded and compressed, the hash table and the offsets.
 fn write_dictionary<W: Write>(
-    out: &mut Checksummed<W>,
+    out: &mut Checksummed<'_, W>,
     dictionary: &Dictionary,
     len: u64,
     codec: Option<&Codec>,
+    admission: &Budget,
 ) -> EngineResult<()> {
     if len >= u64::from(u32::MAX) {
         return Err(EngineError::Configuration(
@@ -188,90 +231,10 @@ fn write_dictionary<W: Write>(
         (0..len.div_ceil(KEY_CHUNK)).map(move |c| (c * KEY_CHUNK, ((c + 1) * KEY_CHUNK).min(len)))
     };
     let started = std::time::Instant::now();
-    // The key lengths and the hash table. Each key is read once, on every core, for its
-    // stored length and its home slot; the table is then filled in slot order, each entry
-    // at the first free slot from its home (what linear probing finds), in one sweep over
-    // the table instead of a cache miss per entry. Lookups don't depend on the order the
-    // entries went in.
-    let slot_count = base_slots(len) as usize;
-    let mask = slot_count - 1;
-    let mut slots = vec![0u32; slot_count];
-    let mut lengths: Vec<u32> = Vec::with_capacity(len as usize);
-    let stored_len = |key: &[u8], stored: &mut Vec<u8>| match codec {
-        None => key.len(),
-        Some(codec) => {
-            stored.clear();
-            codec.compress(key, stored);
-            stored.len()
-        }
-    };
-    if slot_count <= 1 << 32 {
-        let ranges: Vec<(u64, u64)> = chunks().collect();
-        let parts: Vec<(Vec<u64>, Vec<u32>)> = ranges
-            .into_par_iter()
-            .map(|(from, to)| {
-                let n = (to - from) as usize;
-                let (mut homes, mut lens) = (Vec::with_capacity(n), Vec::with_capacity(n));
-                let mut stored = Vec::new();
-                dictionary.for_each_key(from, to, |key| {
-                    let home = (key_hash(key) as usize & mask) as u64;
-                    homes.push(home << 32 | (from + homes.len() as u64));
-                    lens.push(stored_len(key, &mut stored) as u32);
-                });
-                (homes, lens)
-            })
-            .collect();
-        let mut placed: Vec<u64> = Vec::with_capacity(len as usize);
-        for (homes, lens) in parts {
-            placed.extend_from_slice(&homes);
-            lengths.extend_from_slice(&lens);
-        }
-        placed.par_sort_unstable();
-        let mut next = 0usize;
-        let mut wrapped = Vec::new();
-        for entry in placed {
-            let (home, index) = ((entry >> 32) as usize, (entry & 0xffff_ffff) as u32);
-            let slot = home.max(next);
-            if slot >= slot_count {
-                // Past the end, probing wraps around to the start.
-                wrapped.push(index);
-                continue;
-            }
-            slots[slot] = index + 1;
-            next = slot + 1;
-        }
-        let mut slot = 0;
-        for index in wrapped {
-            while slots[slot] != 0 {
-                slot += 1;
-            }
-            slots[slot] = index + 1;
-        }
-    } else {
-        let mut stored = Vec::new();
-        for (from, to) in chunks() {
-            dictionary.for_each_key(from, to, |key| {
-                let mut slot = key_hash(key) as usize & mask;
-                while slots[slot] != 0 {
-                    slot = (slot + 1) & mask;
-                }
-                lengths.push(stored_len(key, &mut stored) as u32);
-                slots[slot] = lengths.len() as u32;
-            });
-        }
-    }
-    if lengths.len() as u64 != len {
-        return Err(EngineError::Corruption(
-            "the dictionary is shorter than the snapshot".to_owned(),
-        ));
-    }
+    let (slots, lengths) = hashed(dictionary, len, codec, admission)?;
     let arena_len: u64 = lengths.iter().map(|&n| u64::from(n)).sum();
-    let (blocks, ends) = crate::term::offsets::encode(&lengths).ok_or_else(|| {
-        EngineError::Configuration(
-            "64 consecutive dictionary keys take 4 GiB or more; a checkpoint can't hold them"
-                .to_owned(),
-        )
-    })?;
+    let slot_count = slots.len();
+    let (blocks, ends) = offsets(&lengths, admission)?;
     drop(lengths);
     let hashed = started.elapsed();
     put_u64(&mut out.buffer, len);
@@ -282,25 +245,51 @@ fn write_dictionary<W: Write>(
         codec.write(&mut out.buffer);
     }
     out.pad();
-    for block in blocks {
+    for &block in blocks.iter() {
         put_u64(&mut out.buffer, block);
         out.drain()?;
     }
+    drop(blocks);
+    let (mut decoded, mut stored) = (ChargedVec::new(admission), ChargedVec::new(admission));
     for (from, to) in chunks() {
-        dictionary.for_each_key(from, to, |key| match codec {
-            None => out.buffer.extend_from_slice(key),
-            Some(codec) => codec.compress(key, &mut out.buffer),
-        });
-        out.drain()?;
+        dictionary.for_each_key(from, to, &mut decoded, |key| -> EngineResult<()> {
+            let key = match codec {
+                None => key,
+                Some(codec) => {
+                    stored.clear();
+                    codec.compress_within(key, &mut stored)?;
+                    &stored
+                }
+            };
+            Ok(out.append(key)?)
+        })?;
     }
+    drop((decoded, stored));
     out.write_bytes(&ends)?;
     drop(ends);
     out.pad();
-    for slot in slots {
+    for &slot in slots.iter() {
         put_u32(&mut out.buffer, slot);
         out.drain()?;
     }
-    let written = started.elapsed();
+    drop(slots);
+    tracing::debug!(
+        entries = len,
+        hash_ms = hashed.as_millis() as u64,
+        keys_and_slots_ms = (started.elapsed() - hashed).as_millis() as u64,
+        "checkpoint dictionary written"
+    );
+    Ok(())
+}
+
+/// Writes the end of the dictionary section: the entries `0..len` with a text, sorted by it
+/// ([`crate::term::order`]). Its sort is not charged yet (the scans' charging brings one).
+fn write_text_order<W: Write>(
+    out: &mut Checksummed<'_, W>,
+    dictionary: &Dictionary,
+    len: u64,
+) -> EngineResult<()> {
+    let started = std::time::Instant::now();
     let order = dictionary.text_order(len);
     let ordered = started.elapsed();
     out.pad();
@@ -311,13 +300,133 @@ fn write_dictionary<W: Write>(
     }
     tracing::debug!(
         entries = len,
-        hash_ms = hashed.as_millis() as u64,
-        keys_and_slots_ms = (written - hashed).as_millis() as u64,
-        text_order_ms = (ordered - written).as_millis() as u64,
+        text_order_ms = ordered.as_millis() as u64,
         order_write_ms = (started.elapsed() - ordered).as_millis() as u64,
-        "checkpoint dictionary written"
+        "checkpoint text order written"
     );
     Ok(())
+}
+
+/// The block offsets of keys of `lengths` ([`crate::term::offsets::encode`]), each vector
+/// charged to `admission` for its exact capacity before it is allocated.
+fn offsets<'b>(
+    lengths: &[u32],
+    admission: &'b Budget,
+) -> EngineResult<(Scratch<'b, u64>, Scratch<'b, u8>)> {
+    crate::term::offsets::encode(lengths, admission)?.ok_or_else(|| {
+        EngineError::Configuration(
+            "64 consecutive dictionary keys take 4 GiB or more; a checkpoint can't hold them"
+                .to_owned(),
+        )
+    })
+}
+
+/// A checkpoint's scratch, charged to its admission.
+type Scratch<'b, T> = ChargedVec<T, &'b Budget>;
+
+/// The hash table of the entries `0..len` (each slot the entry's index + 1, or 0) and their
+/// stored lengths, every array charged to `admission` before it is made.
+///
+/// Each key is read once, on every core, for its stored length and its home slot; the table
+/// is then filled in slot order, each entry at the first free slot from its home (what
+/// linear probing finds), in one sweep over the table instead of a cache miss per entry.
+/// Lookups don't depend on the order the entries went in.
+fn hashed<'b>(
+    dictionary: &Dictionary,
+    len: u64,
+    codec: Option<&Codec>,
+    admission: &'b Budget,
+) -> EngineResult<(Scratch<'b, u32>, Scratch<'b, u32>)> {
+    let slot_count = base_slots(len) as usize;
+    let mask = slot_count - 1;
+    let n = len as usize;
+    let mut slots: ChargedVec<u32, &Budget> = ChargedVec::with_capacity(admission, slot_count)?;
+    slots.resize(slot_count, 0)?;
+    let mut lengths: ChargedVec<u32, &Budget> = ChargedVec::with_capacity(admission, n)?;
+    // A compressed key's stored length: compressed into `stored`, its room charged first.
+    let stored_len = |key: &[u8], stored: &mut Scratch<'b, u8>| {
+        let Some(codec) = codec else {
+            return Ok(key.len());
+        };
+        stored.clear();
+        codec.compress_within(key, stored)?;
+        Ok::<_, BudgetExceeded>(stored.len())
+    };
+    if slot_count <= 1 << 32 {
+        let mut placed: ChargedVec<u64, &Budget> = ChargedVec::with_capacity(admission, n)?;
+        placed.resize(n, 0)?;
+        lengths.resize(n, 0)?;
+        let chunk = KEY_CHUNK as usize;
+        // Each chunk's count summed as they end: nothing collected.
+        let total = placed
+            .par_chunks_mut(chunk)
+            .zip(lengths.par_chunks_mut(chunk))
+            .enumerate()
+            .map(|(c, (homes, lens))| {
+                let from = (c * chunk) as u64;
+                let mut i = 0;
+                let (mut decoded, mut stored) =
+                    (ChargedVec::new(admission), ChargedVec::new(admission));
+                dictionary.for_each_key(from, from + homes.len() as u64, &mut decoded, |key| {
+                    let length = stored_len(key, &mut stored)?;
+                    let home = (key_hash(key) as usize & mask) as u64;
+                    homes[i] = home << 32 | (from + i as u64);
+                    lens[i] = length as u32;
+                    i += 1;
+                    Ok::<_, BudgetExceeded>(())
+                })?;
+                Ok::<_, BudgetExceeded>(i as u64)
+            })
+            .try_reduce(|| 0, |a, b| Ok(a + b))?;
+        if total != len {
+            return Err(EngineError::Corruption(
+                "the dictionary is shorter than the snapshot".to_owned(),
+            ));
+        }
+        placed.par_sort_unstable();
+        let mut next = 0usize;
+        let mut wrapped: ChargedVec<u32, &Budget> = ChargedVec::new(admission);
+        for &entry in placed.iter() {
+            let (home, index) = ((entry >> 32) as usize, (entry & 0xffff_ffff) as u32);
+            let slot = home.max(next);
+            if slot >= slot_count {
+                // Past the end, probing wraps around to the start.
+                wrapped.push(index)?;
+                continue;
+            }
+            slots[slot] = index + 1;
+            next = slot + 1;
+        }
+        drop(placed);
+        let mut slot = 0;
+        for &index in wrapped.iter() {
+            while slots[slot] != 0 {
+                slot += 1;
+            }
+            slots[slot] = index + 1;
+        }
+    } else {
+        let (mut decoded, mut stored) = (ChargedVec::new(admission), ChargedVec::new(admission));
+        for (from, to) in
+            (0..len.div_ceil(KEY_CHUNK)).map(|c| (c * KEY_CHUNK, ((c + 1) * KEY_CHUNK).min(len)))
+        {
+            dictionary.for_each_key(from, to, &mut decoded, |key| {
+                let mut slot = key_hash(key) as usize & mask;
+                while slots[slot] != 0 {
+                    slot = (slot + 1) & mask;
+                }
+                lengths.push(stored_len(key, &mut stored)? as u32)?;
+                slots[slot] = lengths.len() as u32;
+                Ok::<_, BudgetExceeded>(())
+            })?;
+        }
+        if lengths.len() as u64 != len {
+            return Err(EngineError::Corruption(
+                "the dictionary is shorter than the snapshot".to_owned(),
+            ));
+        }
+    }
+    Ok((slots, lengths))
 }
 
 /// Reads the dictionary section (module docs) from `reader`, positioned after the
@@ -441,46 +550,147 @@ pub(crate) fn exists(dir: &Path, revision: u64) -> bool {
     checkpoint_path(dir, revision, EXTENSION).exists()
 }
 
-/// Writes a checkpoint of `snapshot` and returns its path.
-pub(crate) fn write(dir: &Path, snapshot: &Snapshot) -> EngineResult<PathBuf> {
+/// A checkpoint written and synced under its temporary name, not yet in place. Dropped
+/// without [`commit`](Self::commit), the file goes.
+pub(crate) struct Written {
+    dir: PathBuf,
+    tmp: PathBuf,
+    revision: u64,
+    /// Cleared once renamed.
+    pending: bool,
+}
+
+/// Why [`Written::commit`] failed.
+pub(crate) enum Uncommitted {
+    /// The checkpoint is not in place.
+    No(EngineError),
+    /// It may be: the rename failed with the target there, or the directory didn't sync.
+    Unknown(std::io::Error),
+}
+
+impl Written {
+    fn new(dir: &Path, revision: u64) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            tmp: checkpoint_path(dir, revision, "tmp"),
+            revision,
+            pending: true,
+        }
+    }
+
+    /// The written file, under its temporary name.
+    pub(crate) fn tmp(&self) -> &Path {
+        &self.tmp
+    }
+
+    /// Renames the checkpoint into place and syncs the directory: from here a restart
+    /// recovers it. Returns its path.
+    pub(crate) fn commit(mut self) -> Result<PathBuf, Uncommitted> {
+        let path = checkpoint_path(&self.dir, self.revision, EXTENSION);
+        fault::check(Step::Rename).map_err(|error| Uncommitted::No(error.into()))?;
+        match publish::publish(&self.tmp, &path) {
+            Ok(()) => {}
+            Err(publish::Failed::NotMoved(error)) => return Err(Uncommitted::No(error.into())),
+            Err(publish::Failed::Unknown(error)) => {
+                self.pending = false;
+                return Err(Uncommitted::Unknown(error));
+            }
+        }
+        self.pending = false;
+        fault::check(Step::DirSync).map_err(Uncommitted::Unknown)?;
+        Ok(path)
+    }
+}
+
+impl Drop for Written {
+    fn drop(&mut self) {
+        if self.pending {
+            let _ = fs::remove_file(&self.tmp);
+        }
+    }
+}
+
+impl Uncommitted {
+    /// As an error of an operation that publishes nothing (a checkpoint of a committed
+    /// revision, an image): either outcome is the same state.
+    pub(crate) fn into_error(self) -> EngineError {
+        match self {
+            Self::No(error) => error,
+            Self::Unknown(error) => error.into(),
+        }
+    }
+}
+
+/// Writes a checkpoint of `snapshot` under its temporary name.
+pub(crate) fn write(
+    dir: &Path,
+    snapshot: &Snapshot,
+    vocabulary: VocabularyEncoding,
+    admission: Option<&Arc<SharedBudget>>,
+) -> EngineResult<Written> {
     let version = snapshot.version();
     write_parts(
         dir,
+        admission,
         snapshot.revision(),
         snapshot.dictionary(),
         snapshot.dictionary_len(),
         [version.asserted.layout(), version.inferred.layout()],
+        vocabulary,
         &mut |stack, permutation| Ok(snapshot.version().stack(stack).packed(permutation)),
     )
 }
 
-/// Writes a checkpoint of `revision` from its parts and returns its path: the dictionary's
+/// Writes a checkpoint of `revision` from its parts under its temporary name: the dictionary's
 /// entries `0..dictionary_len`, and each stack's permutations as `packed` gives them, in
 /// the order of the stack's layout (`layouts`: asserted, inferred). Each is written before the next is asked for, so a
 /// caller can build one at a time and drop it (bulk loads).
+///
+/// The scratch of the dictionary's section is charged to a budget within `admission`, the
+/// process's root (`EngineConfig::admission`; `None`: no limit), before it is allocated:
+/// refused, it fails with [`EngineError::MemoryLimit`] and publishes nothing.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a checkpoint's parts, and how its dictionary's keys are written and charged"
+)]
 pub(crate) fn write_parts<'a>(
     dir: &Path,
+    admission: Option<&Arc<SharedBudget>>,
     revision: u64,
     dictionary: &Dictionary,
     dictionary_len: u64,
     layouts: [Layout; 2],
+    vocabulary: VocabularyEncoding,
     packed: &mut dyn FnMut(Stack, Permutation) -> EngineResult<Cow<'a, PackedKeys>>,
-) -> EngineResult<PathBuf> {
-    let tmp = checkpoint_path(dir, revision, "tmp");
-    let mut file = File::create(&tmp)?;
+) -> EngineResult<Written> {
+    let admission = Budget::unlimited().within(admission.cloned());
+    // The writer's buffers, and keys compressed with tables trained on a sample of them
+    // ([`crate::term::vocabulary`]), before the file is made.
+    let mut held = Reservation::new(&admission);
+    held.charge(WRITER + 2 * BUFFER)?;
+    let trained = match vocabulary {
+        VocabularyEncoding::Fsst => {
+            let sample = dictionary.sample_within(dictionary_len, &admission)?;
+            Some(Codec::train_within(&sample, &admission)?)
+        }
+        VocabularyEncoding::Plain => None,
+    };
+    let codec = trained.as_ref().map(Trained::codec);
+    // Remove the temporary file if writing fails before publication.
+    let written = Written::new(dir, revision);
+    fault::check(Step::Write)?;
+    let mut file = File::create(written.tmp())?;
     // The magic is written last, once everything else is on file; it is checksummed apart
     // and the checksums combined.
     file.write_all(MAGIC)?;
     let mut out = Checksummed {
-        inner: BufWriter::with_capacity(1 << 20, file),
+        inner: BufWriter::with_capacity(WRITER, file),
         crc: crc32fast::Hasher::new(),
-        buffer: Vec::with_capacity(1 << 16),
+        buffer: Vec::with_capacity(2 * BUFFER),
         written: MAGIC.len() as u64,
+        _held: held,
     };
     put_u64(&mut out.buffer, revision);
-    // Keys compressed with tables trained on a sample of them ([`crate::term::vocabulary`]).
-    let codec = (vocabulary_encoding() == VocabularyEncoding::Fsst)
-        .then(|| Codec::train(&dictionary.sample_keys(dictionary_len)));
     let flags = match dictionary.integers_in_dictionary() {
         true => INTEGERS_IN_DICTIONARY,
         false => 0,
@@ -491,7 +701,8 @@ pub(crate) fn write_parts<'a>(
     put_u64(&mut out.buffer, flags);
     // Where the time goes, for the load log (bulk loads build the permutations here).
     let started = std::time::Instant::now();
-    write_dictionary(&mut out, dictionary, dictionary_len, codec.as_ref())?;
+    write_dictionary(&mut out, dictionary, dictionary_len, codec, &admission)?;
+    write_text_order(&mut out, dictionary, dictionary_len)?;
     let dictionary_ms = started.elapsed().as_millis() as u64;
     let (mut build, mut write) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
     for (stack, layout) in Stack::ALL.into_iter().zip(layouts) {
@@ -523,12 +734,9 @@ pub(crate) fn write_parts<'a>(
     let flushed = syncing.elapsed();
     file.sync_all()?;
     drop(file);
-    let path = checkpoint_path(dir, revision, EXTENSION);
-    fs::rename(&tmp, &path)?;
-    super::sync_dir(dir)?;
     tracing::debug!(
         revision,
-        bytes = out_written(&path),
+        bytes = out_written(written.tmp()),
         dictionary_ms,
         permutations_build_ms = build.as_millis() as u64,
         permutations_write_ms = write.as_millis() as u64,
@@ -536,7 +744,7 @@ pub(crate) fn write_parts<'a>(
         sync_ms = (syncing.elapsed() - flushed).as_millis() as u64,
         "checkpoint written"
     );
-    Ok(path)
+    Ok(written)
 }
 
 /// The index of `stack` from a checkpoint's packed permutations: the inferred stack in the
@@ -544,8 +752,9 @@ pub(crate) fn write_parts<'a>(
 pub(crate) fn stack_index(
     stack: Stack,
     packed: Vec<(Permutation, PackedKeys)>,
+    encoding: IndexEncoding,
 ) -> Result<IndexVersion, String> {
-    let index = IndexVersion::from_packed(packed)?;
+    let index = IndexVersion::from_packed(packed, encoding)?;
     match (stack, index.layout()) {
         (Stack::Inferred, Layout::Quads) => Err("the inferred stack holds named graphs".into()),
         _ => Ok(index),
@@ -736,7 +945,11 @@ fn read_stacks<'a>(
 /// The checkpoint at `path`, which this engine has just written, mapped: its dictionary
 /// base and both stacks, each one run, to be used in place of the copies in memory. Only
 /// the structure is read (the file was checked as it was written).
-pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])> {
+pub(crate) fn map_written(
+    path: &Path,
+    encoding: IndexEncoding,
+) -> EngineResult<(Base, [IndexVersion; 2])> {
+    fault::check(Step::Map)?;
     let corrupt =
         |what: &str| EngineError::Corruption(format!("checkpoint {}: {what}", path.display()));
     let map = crate::mapped::map(path)?;
@@ -762,7 +975,9 @@ pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])
     .map_err(|error| corrupt(&error))?;
     let [asserted, inferred] =
         read_stacks(&mut reader, body, Some(&map), false).map_err(|error| corrupt(&error))?;
-    let index = |stack: Stack, packed| stack_index(stack, packed).map_err(|error| corrupt(&error));
+    let index = |stack: Stack, packed| {
+        stack_index(stack, packed, encoding).map_err(|error| corrupt(&error))
+    };
     Ok((
         base,
         [
@@ -772,9 +987,11 @@ pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])
     ))
 }
 
-/// Deletes checkpoints older than `revision`. One still mapped can't be deleted on Windows
-/// ([`crate::mapped`]); it stays until a later checkpoint, and recovery reads the newest.
+/// Deletes checkpoints older than `revision`. One that can't be deleted (still mapped,
+/// where Windows refuses that: [`crate::mapped`]) stays until a later checkpoint, and
+/// recovery reads the newest.
 pub(crate) fn remove_older_than(dir: &Path, revision: u64) -> EngineResult<()> {
+    fault::check(Step::RemoveOlder)?;
     for (checkpoint_revision, path) in list(dir)? {
         if checkpoint_revision < revision
             && let Err(error) = fs::remove_file(&path)
@@ -783,4 +1000,238 @@ pub(crate) fn remove_older_than(dir: &Path, revision: u64) -> EngineResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use nrese_exec::{Budget, Reservation, SharedBudget};
+    use nrese_rdf::{GraphName, Literal, LiteralRef, NamedNode, Quad};
+
+    use super::Checksummed;
+    use crate::term::Dictionary;
+    use crate::term::vocabulary::{Codec, SAMPLE, Sample};
+
+    /// `n` pseudo-random hex digits, from `seed`.
+    fn hex(seed: u64, n: usize) -> String {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ seed;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                char::from_digit((x & 15) as u32, 16).unwrap()
+            })
+            .collect()
+    }
+
+    /// 70,000 keys over two of the hash's chunks: a block of 64 of them of 2,000
+    /// pseudo-random hex digits each (a wide offset block even compressed), and one of
+    /// 8,000,000 (compressed, longer than the writer's buffer), mapped from a section written
+    /// with a codec trained on them (a compressed base: each key decoded as it is read), and
+    /// 1,000 keys interned on top.
+    fn dictionary(dir: &Path) -> Dictionary {
+        let heap = Dictionary::default();
+        for i in 0..70_000u64 {
+            let tail = match i {
+                6_400..6_464 => hex(i, 2_000),
+                50_000 => hex(i, 8_000_000),
+                _ => String::new(),
+            };
+            heap.intern(LiteralRef::new_simple_literal(&format!("word {i}{tail}")).into());
+        }
+        let codec = Codec::train(&heap.export_keys(0, heap.len()));
+        let budget = Budget::unlimited();
+        let mut out = Checksummed {
+            inner: Vec::new(),
+            crc: crc32fast::Hasher::new(),
+            buffer: Vec::new(),
+            written: 0,
+            _held: Reservation::new(&budget),
+        };
+        super::write_dictionary(&mut out, &heap, heap.len(), Some(&codec), &budget).unwrap();
+        super::write_text_order(&mut out, &heap, heap.len()).unwrap();
+        out.flush_buffer().unwrap();
+        let path = dir.join("dictionary");
+        std::fs::write(&path, out.inner).unwrap();
+        let map = crate::mapped::map(&path).unwrap();
+        let base = super::read_dictionary(&mut super::Reader::new(&map), &map, true, true, true);
+        let dictionary = Dictionary::default();
+        dictionary.restore_base(base.unwrap()).unwrap();
+        for i in 0..1_000 {
+            dictionary.intern(LiteralRef::new_simple_literal(&format!("new {i}")).into());
+        }
+        dictionary
+    }
+
+    /// Samples FSST trains on at its largest: the most keys a sample has, each empty (FSST
+    /// copies the list of them), of either table; long keys of both (FSST samples them, one
+    /// table trained while the other lives); every byte value, in no order (the most symbol
+    /// pairs it weighs).
+    fn largest_trainings() -> [Vec<Vec<u8>>; 4] {
+        let empty = |tag: &[u8]| vec![tag.to_vec(); 2 * SAMPLE - 1];
+        let long = (0..2_000)
+            .map(|i| format!("{} item {i} {}", ["I", "S"][i % 2], "of words ".repeat(50)))
+            .map(String::into_bytes)
+            .collect();
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let noise = (0..2_000)
+            .map(|i| {
+                let bytes = (0..500).map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                });
+                [b"IS"[i % 2]].into_iter().chain(bytes).collect()
+            })
+            .collect();
+        [empty(b"S"), empty(b"I"), long, noise]
+    }
+
+    /// A checkpoint's dictionary section takes nothing it didn't charge to its admission
+    /// first: the codec's sample and training, the keys of a compressed base decoded (Sol's
+    /// review: 176,020 bytes held beyond the charges), the hash table, homes, lengths and
+    /// offsets, the keys compressed, and the writer's buffer, which never grows (a key past
+    /// it is written after it). All of it grows with the whole vocabulary, however small the
+    /// change since the last checkpoint, and was charged nowhere (EEV-25). Rows after the
+    /// section's: the codec's training at its largest, within the constants it charges for
+    /// FSST's training and tables (fsst pinned; a new version fails here first).
+    #[test]
+    fn the_dictionary_section_holds_what_it_charged() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = dictionary(dir.path());
+        let budget = Budget::unlimited();
+        let mut out = Checksummed {
+            inner: std::io::sink(),
+            crc: crc32fast::Hasher::new(),
+            buffer: Vec::with_capacity(2 * super::BUFFER),
+            written: 0,
+            _held: Reservation::new(&budget),
+        };
+        let ((), section) = nrese_exec::measure::measure_within(&budget, || {
+            let sample = dictionary.sample_within(dictionary.len(), &budget).unwrap();
+            let trained = Codec::train_within(&sample, &budget).unwrap();
+            drop(sample);
+            let (len, codec) = (dictionary.len(), Some(trained.codec()));
+            super::write_dictionary(&mut out, &dictionary, len, codec, &budget).unwrap();
+        });
+        let mut excess = vec![section];
+        for keys in largest_trainings() {
+            let (_, training) = nrese_exec::measure::measure_within(&budget, || {
+                let mut sample = Sample::new(&budget);
+                for key in &keys {
+                    sample.push(key).unwrap();
+                }
+                Codec::train_within(&sample, &budget).unwrap()
+            });
+            excess.push(training);
+        }
+        assert_eq!(excess, [0; 5], "bytes held beyond the charges");
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// A dictionary section refused part way, by a root another holder filled (here on the
+    /// writer's first write: the keys' first flush, before the long key's compression needs
+    /// room), frees every buffer before it releases its charge, on the error
+    /// path as on success: the offsets' reservation was released before their bytes, 60,100
+    /// bytes held uncharged (Sol's review r2, `review_dictionary_error_frees_before_releasing`).
+    #[test]
+    fn a_refused_section_frees_before_it_releases() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        const ROOM: usize = 8 << 20;
+        /// A writer whose first write fills the root but 64 bytes, for another holder.
+        struct Filling<'a> {
+            other: Reservation<&'a Budget>,
+            root: &'a SharedBudget,
+        }
+        impl std::io::Write for Filling<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.other.bytes() == 0 {
+                    self.other.charge(ROOM - self.root.used() - 64).unwrap();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dictionary = Dictionary::default();
+        // Keys enough for the writer's buffer to flush before the long key (over 1 MiB stored).
+        for i in 0..120_000 {
+            let key = format!("word {i} {}", hex(i, 24));
+            dictionary.intern(LiteralRef::new_simple_literal(&key).into());
+        }
+        dictionary.intern(LiteralRef::new_simple_literal(&"long ".repeat(20_000)).into());
+        let codec = Codec::train(&dictionary.export_keys(0, dictionary.len()));
+        let root = SharedBudget::new(ROOM);
+        let budget = Budget::unlimited().within(Some(Arc::clone(&root)));
+        let other = Budget::unlimited().within(Some(Arc::clone(&root)));
+        let buffer = Vec::with_capacity(2 * super::BUFFER);
+        let ((), excess) = nrese_exec::measure::measure_within(&budget, || {
+            let mut out = Checksummed {
+                inner: Filling {
+                    other: Reservation::new(&other),
+                    root: &root,
+                },
+                crc: crc32fast::Hasher::new(),
+                buffer,
+                written: 0,
+                _held: Reservation::new(&budget),
+            };
+            let len = dictionary.len();
+            let refused =
+                super::write_dictionary(&mut out, &dictionary, len, Some(&codec), &budget);
+            assert!(matches!(refused, Err(crate::EngineError::MemoryLimit(_))));
+        });
+        assert_eq!((excess, budget.used(), root.used()), (0, 0, 0));
+    }
+
+    /// A checkpoint its admission root has no room for fails with a memory error, once its
+    /// file is begun: it publishes nothing, removes its temporary file and holds nothing.
+    /// The next start recovers the revision from the log, and a checkpoint with room is written
+    /// (Sol's review: the refusal was only seen in a helper).
+    #[test]
+    fn a_checkpoint_its_admission_refuses_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = |admission| crate::EngineConfig {
+            background_maintenance: false,
+            admission,
+            ..Default::default()
+        };
+        // Room for the writer's buffers, none for the dictionary's scratch.
+        let root = SharedBudget::new(super::WRITER + 2 * super::BUFFER);
+        let engine = crate::Engine::open(dir.path(), config(Some(Arc::clone(&root)))).unwrap();
+        let mut transaction = engine.transaction();
+        transaction.insert(
+            Quad::new(
+                NamedNode::new_unchecked("urn:s"),
+                NamedNode::new_unchecked("urn:p"),
+                Literal::new_simple_literal("value"),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+        transaction.commit().unwrap();
+        let refused = engine.checkpoint();
+        assert!(matches!(refused, Err(crate::EngineError::MemoryLimit(_))));
+        assert_eq!((engine.snapshot().len(), root.used()), (1, 0));
+        assert!(!super::exists(dir.path(), 1));
+        assert!(!super::checkpoint_path(dir.path(), 1, "tmp").exists());
+        drop(engine);
+        for _ in 0..2 {
+            let engine = crate::Engine::open(dir.path(), config(None)).unwrap();
+            assert!(!super::checkpoint_path(dir.path(), 1, "tmp").exists());
+            let snapshot = engine.snapshot();
+            assert_eq!((snapshot.revision(), snapshot.len()), (1, 1));
+            assert_eq!(engine.checkpoint().unwrap(), 1);
+        }
+    }
 }

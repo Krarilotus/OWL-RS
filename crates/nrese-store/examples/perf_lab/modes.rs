@@ -379,3 +379,187 @@ pub fn classification(
         samples.join(", ")
     ))
 }
+
+/// Read replicas' log shipping (`--replication COMMITS:QUADS`): a durable primary commits
+/// COMMITS transactions of QUADS new statements each; then, `runs` times, a fresh durable
+/// follower started from the primary's image (taken before those commits) catches up in
+/// the server's batches (8 MiB), each read from the primary's feed (`Engine::log_since`)
+/// and applied (`Engine::apply_log`). Feed and apply are timed apart, per run; `catch_up`
+/// is the peak memory of a run's catch-up (the apply's, with one batch beside it); and
+/// `caught_up` whether every follower ended at the primary's revision holding exactly the
+/// statements the generator wrote: their decoded set's digest against the generator's own
+/// (`content_ok`), computed after the run's timed and measured window.
+/// Without background maintenance on either engine: no checkpoint lands in a run.
+/// `swap_one` (`--replication-probe swap-one`, for testing that check) has the primary write
+/// one statement other than the generator's: the same revision and count, other content,
+/// which must make the report ineligible.
+pub fn replication(
+    spec: &str,
+    runs: usize,
+    store: Option<&Path>,
+    swap_one: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use nrese_engine::{
+        DurabilityConfig, Engine, EngineConfig, QuadPattern, ReadModel, SyncPolicy,
+    };
+    use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
+    use sha2::{Digest, Sha256};
+    const BATCH_BYTES: usize = 8 << 20;
+    let (commits, quads) = spec
+        .split_once(':')
+        .ok_or(format!("--replication COMMITS:QUADS, not {spec}"))?;
+    let (commits, quads): (u64, u64) = (commits.parse()?, quads.parse()?);
+    let config = |sync| EngineConfig {
+        background_maintenance: false,
+        durability: DurabilityConfig {
+            sync,
+            ..DurabilityConfig::default()
+        },
+        ..EngineConfig::default()
+    };
+    let root = match store {
+        Some(dir) => tempfile::tempdir_in(dir)?,
+        None => tempfile::tempdir()?,
+    };
+    let (primary_dir, image_dir) = (root.path().join("primary"), root.path().join("image"));
+    // The primary's commits are set-up, not measured: buffered.
+    let primary = Engine::open(&primary_dir, config(SyncPolicy::OsBuffered))?;
+    let quad = |n: u64| {
+        Quad::new(
+            NamedNode::new_unchecked(format!("http://example.com/s{}", n / 8)),
+            NamedNode::new_unchecked(format!("http://example.com/p{}", n % 8)),
+            Literal::new_simple_literal(format!("value {n}")),
+            GraphName::DefaultGraph,
+        )
+    };
+    // The digest of a set of statements: their N-Quads, sorted, hashed.
+    let digest = |mut lines: Vec<String>| {
+        lines.sort_unstable();
+        let mut hasher = Sha256::new();
+        for line in &lines {
+            hasher.update(line.as_bytes());
+            hasher.update(
+                b"
+",
+            );
+        }
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let expected = digest(
+        std::iter::once(u64::MAX)
+            .chain(0..commits * quads)
+            .map(|n| quad(n).to_string())
+            .collect(),
+    );
+    let held = |engine: &Engine| -> Result<String, String> {
+        let snapshot = engine.snapshot();
+        let lines = snapshot
+            .quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::all())
+            .map(|q| {
+                snapshot
+                    .decode_quad(q)
+                    .map(|q| q.to_string())
+                    .ok_or_else(|| "a statement doesn't decode".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(digest(lines))
+    };
+    let mut tx = primary.transaction();
+    tx.insert(quad(u64::MAX).as_ref());
+    tx.commit()?;
+    std::fs::create_dir_all(&image_dir)?;
+    primary.write_image(&image_dir)?;
+    let started = Instant::now();
+    for commit in 0..commits {
+        let mut tx = primary.transaction();
+        for n in 0..quads {
+            let n = commit * quads + n;
+            match swap_one && n == 0 {
+                // Another value in the statement's place: the same count.
+                true => tx.insert(
+                    Quad::new(
+                        NamedNode::new_unchecked("http://example.com/s0"),
+                        NamedNode::new_unchecked("http://example.com/p0"),
+                        Literal::new_simple_literal("swapped"),
+                        GraphName::DefaultGraph,
+                    )
+                    .as_ref(),
+                ),
+                false => tx.insert(quad(n).as_ref()),
+            };
+        }
+        tx.commit()?;
+    }
+    let commit_s = started.elapsed().as_secs_f64();
+    let latest = primary.stats();
+    let (mut feed_times, mut apply_times) = (Vec::new(), Vec::new());
+    let (mut records, mut bytes, mut caught_up, mut content_ok) = (0usize, 0usize, true, true);
+    let mut peaks = Vec::new();
+    for run in 0..runs {
+        let follower_dir = root.path().join(format!("follower-{run}"));
+        std::fs::create_dir_all(&follower_dir)?;
+        for entry in std::fs::read_dir(&image_dir)? {
+            let entry = entry?;
+            std::fs::copy(entry.path(), follower_dir.join(entry.file_name()))?;
+        }
+        // The follower syncs every commit, as a server's replica does by default.
+        let follower = Engine::open(&follower_dir, config(SyncPolicy::EveryCommit))?;
+        let (mut feed, mut apply) = (Duration::ZERO, Duration::ZERO);
+        let (mut run_records, mut run_bytes) = (0, 0);
+        let phase = crate::Phase::start();
+        let mut at = follower.stats().revision;
+        while at < latest.revision {
+            let started = Instant::now();
+            let batch = primary.log_since(at, BATCH_BYTES)?;
+            feed += started.elapsed();
+            let started = Instant::now();
+            at = follower.apply_log(&batch.frames)?;
+            apply += started.elapsed();
+            run_records += batch.records;
+            run_bytes += batch.frames.len();
+        }
+        peaks.push(phase.json());
+        // After the run's window: what the follower holds, against the generator.
+        let reached = follower.stats();
+        let same = held(&follower).is_ok_and(|held| held == expected);
+        content_ok &= same;
+        caught_up &= reached.revision == latest.revision && reached.quads == latest.quads && same;
+        (records, bytes) = (run_records, run_bytes);
+        feed_times.push(feed);
+        apply_times.push(apply);
+        drop(follower);
+        std::fs::remove_dir_all(&follower_dir)?;
+    }
+    let ms = |times: &[Duration]| -> Vec<String> {
+        times
+            .iter()
+            .map(|t| format!("{:.3}", t.as_secs_f64() * 1e3))
+            .collect()
+    };
+    let (feed_samples, apply_samples) = (ms(&feed_times), ms(&apply_times));
+    let (feed_p50, _, _) = percentiles(&mut feed_times);
+    let (apply_p50, _, _) = percentiles(&mut apply_times);
+    let per_s = |p50_ms: f64| records as f64 / (p50_ms / 1e3).max(1e-9);
+    let mib = bytes as f64 / 1048576.0;
+    eprintln!(
+        "replication {spec}: {records} records ({mib:.1} MiB); feed p50 {feed_p50:.1} ms ({:.0} records/s), \
+         apply p50 {apply_p50:.1} ms ({:.0} records/s); caught up: {caught_up}",
+        per_s(feed_p50),
+        per_s(apply_p50)
+    );
+    Ok(format!(
+        "{{\"commits\": {commits}, \"quads_per_commit\": {quads}, \"records\": {records}, \"frames_mib\": {mib:.3}, \
+         \"commit_s\": {commit_s:.3}, \"feed_p50_ms\": {feed_p50:.3}, \"apply_p50_ms\": {apply_p50:.3}, \
+         \"feed_records_per_s\": {:.1}, \"apply_records_per_s\": {:.1}, \"caught_up\": {caught_up}, \"content_ok\": {content_ok}, \
+         \"feed_samples_ms\": [{}], \"apply_samples_ms\": [{}], \"catch_up\": [{}]}}",
+        per_s(feed_p50),
+        per_s(apply_p50),
+        feed_samples.join(", "),
+        apply_samples.join(", "),
+        peaks.join(", ")
+    ))
+}

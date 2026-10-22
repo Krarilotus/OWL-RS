@@ -9,9 +9,33 @@ use crate::results::{
 };
 use crate::view::ReadView;
 
+/// Effort spent choosing a join order; this changes planning work, not query answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannerOptions {
+    /// Approximate candidate estimates across greedy starts (default 524288); `None`
+    /// removes this effort bound. At least one complete greedy start is always tried.
+    /// The DP threshold and the maximum number of greedy starts are unchanged.
+    pub greedy_effort: Option<usize>,
+}
+
+impl PlannerOptions {
+    /// The established greedy effort bound, retained for default query plans.
+    pub const DEFAULT_GREEDY_EFFORT: usize = 1 << 19;
+}
+
+impl Default for PlannerOptions {
+    fn default() -> Self {
+        Self {
+            greedy_effort: Some(Self::DEFAULT_GREEDY_EFFORT),
+        }
+    }
+}
+
 /// What an evaluation may use while it runs, for queries and update `WHERE` clauses.
 #[derive(Clone, Default)]
 pub struct Resources {
+    /// Work spent choosing a join order, independently of result memory.
+    pub planner: PlannerOptions,
     /// Checked by the evaluator while it runs; the transport layer cancels it at the
     /// request deadline.
     pub cancellation: Option<CancellationToken>,
@@ -30,6 +54,15 @@ impl Resources {
         self.cancellation
             .as_ref()
             .map_or(Ok(()), CancellationToken::check)
+    }
+
+    /// What long work polls ([`nrese_exec::Ticker`]): the cancellation's flag, no deadline of
+    /// its own (the transport cancels the token at its deadline).
+    pub fn stop(&self) -> nrese_exec::StopSource {
+        nrese_exec::StopSource::new(
+            self.cancellation.as_ref().map(CancellationToken::flag),
+            None,
+        )
     }
 }
 
@@ -348,4 +381,25 @@ pub fn prepare_ql_query<'q, V: ReadView>(
 /// For coverage reports and tests; the decision itself is made per call.
 pub fn runs_natively(query: &Query) -> bool {
     crate::native::query_supported(query)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Resources;
+    use crate::results::CancellationToken;
+
+    /// The stop long work polls is the request's cancellation: cancelling the token stops it.
+    #[test]
+    fn the_stop_follows_the_cancellation() {
+        let token = CancellationToken::new();
+        let resources = Resources {
+            cancellation: Some(token.clone()),
+            ..Resources::default()
+        };
+        let stop = resources.stop();
+        assert_eq!(stop.check(), Ok(()));
+        token.cancel();
+        assert_eq!(stop.check(), Err(nrese_exec::Stop::Cancelled));
+        assert_eq!(Resources::default().stop().check(), Ok(()));
+    }
 }

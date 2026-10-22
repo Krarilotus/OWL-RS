@@ -98,8 +98,11 @@ fn compression_study() {
     let Some(path) = std::env::var_os("NRESE_STUDY_CHECKPOINT") else {
         return;
     };
-    let (_, stacks) = crate::durability::checkpoint::map_written(std::path::Path::new(&path))
-        .expect("checkpoint");
+    let (_, stacks) = crate::durability::checkpoint::map_written(
+        std::path::Path::new(&path),
+        crate::IndexEncoding::Fast,
+    )
+    .expect("checkpoint");
     for (name, index) in ["asserted", "inferred"].iter().zip(&stacks) {
         for run in index.runs() {
             for &permutation in run.layout().permutations() {

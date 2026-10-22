@@ -2,6 +2,7 @@
 //! engine handles, consistent and inconsistent, with every optimisation on and off.
 
 mod build;
+mod definitions;
 mod limits;
 mod ni;
 mod probes;

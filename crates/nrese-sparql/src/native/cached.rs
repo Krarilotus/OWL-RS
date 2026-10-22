@@ -45,7 +45,17 @@ impl Context<'_> {
         let mut encoder = Encoder::default();
         encoder.bytes.extend_from_slice(&fixed);
         encoder.tag(self.model as u8);
-        for graphs in [&self.merge_set, &self.named] {
+        // Every graph, the listed ones, or every graph but the listed ones: each told apart
+        // (a list's length is never u64::MAX - 1).
+        let (merged, left_out) = match &self.merge_set {
+            None => (None, false),
+            Some(crate::dataset::GraphSet::Only(graphs)) => (Some(graphs), false),
+            Some(crate::dataset::GraphSet::AllBut(graphs)) => (Some(graphs), true),
+        };
+        if left_out {
+            encoder.number(u64::MAX - 1);
+        }
+        for graphs in [merged, self.named.as_ref()] {
             match graphs {
                 Some(graphs) => {
                     encoder.number(graphs.len() as u64);
@@ -260,7 +270,9 @@ impl Context<'_> {
                     "a cached part numbers another key's variables".into(),
                 )
             })?;
-        // A copy charged to the query, the part's computed ids made this query's in place.
+        self.check()?;
+        // Resolve computed ids first, as on the ct path: a refused interning performs no
+        // table copy. try_clone then admits its query-owned storage before copying it.
         let ids: Vec<u64> = part
             .computed
             .iter()
@@ -281,7 +293,7 @@ impl Context<'_> {
         if let (Some(trace), Some(step)) = (&self.trace, step) {
             trace.borrow_mut()[step].cache = Some(how);
         }
-        self.produced(Solutions {
+        Ok(Solutions {
             vars: names,
             table,
             ordered: part.ordered,
@@ -310,7 +322,9 @@ impl Context<'_> {
 /// The key of `query`'s whole answer written in `format` (the media type with its
 /// parameters) on `snapshot`, for a caller whose answer depends on `context` too: its
 /// context, the format, the caller's context, the QL rewriting, the query form with a CONSTRUCT's
-/// template, and its pattern as parsed (the answer is the query's, however it is planned).
+/// template, and its pattern as parsed (the answer is the query's, however it is planned);
+/// for a SELECT, the names its answer shows, in order: the pattern numbers its variables
+/// (parts of renamed queries share answers), but these bytes hold the names in their header.
 /// `None` if the query isn't cached (no cache, a volatile query, pre-bound variables).
 pub(crate) fn output_key(
     snapshot: &nrese_engine::Snapshot,
@@ -368,6 +382,26 @@ pub(crate) fn output_key(
         }
     };
     encoder.pattern(pattern).ok()?;
+    if let Query::Select { pattern, .. } = query {
+        // The projection under the solution modifiers; else every variable, in the
+        // pattern's numbering.
+        let mut top = pattern;
+        let names = loop {
+            match top {
+                GraphPattern::Slice { inner, .. }
+                | GraphPattern::Distinct { inner }
+                | GraphPattern::Reduced { inner }
+                | GraphPattern::OrderBy { inner, .. } => top = inner,
+                GraphPattern::Project { variables, .. } => break variables.clone(),
+                _ => break encoder.vars.clone(),
+            }
+        };
+        encoder.tag(b'N');
+        encoder.number(names.len() as u64);
+        for name in &names {
+            encoder.text(name.as_str());
+        }
+    }
     Some(Key {
         snapshot: scope.snapshot,
         part: encoder.bytes.into(),

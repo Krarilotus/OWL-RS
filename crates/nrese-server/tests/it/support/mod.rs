@@ -1,6 +1,6 @@
 use axum::body::Body;
 use axum::http::{Method, Request};
-use nrese_reasoner::{ReasonerConfig, ReasonerService};
+use nrese_reasoner::ReasonerConfig;
 use nrese_server::ai::AiSuggestionService;
 use nrese_store::{StoreConfig, StoreService};
 use tower::util::ServiceExt;
@@ -31,7 +31,7 @@ pub fn test_app_with_posture(
     deployment_posture: DeploymentPosture,
 ) -> Result<axum::Router, Box<dyn std::error::Error>> {
     let store = started(StoreService::new(StoreConfig::default())?, &reasoner_config)?;
-    let reasoner = ReasonerService::new(reasoner_config);
+    let reasoner = reasoner_config;
     let state = AppState::new(
         store,
         reasoner,
@@ -72,7 +72,7 @@ pub fn test_app_with_store(
     policy: PolicyConfig,
     reasoner_config: ReasonerConfig,
 ) -> Result<axum::Router, Box<dyn std::error::Error>> {
-    let reasoner = ReasonerService::new(reasoner_config);
+    let reasoner = reasoner_config;
     let state = AppState::new(
         store,
         reasoner,

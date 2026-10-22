@@ -129,7 +129,7 @@ fn checkpoint_plus_wal_recovers_and_releases_covered_segments() {
         ..config()
     };
     let states = {
-        let engine = Engine::open(dir.path(), small_segments).unwrap();
+        let engine = Engine::open(dir.path(), small_segments.clone()).unwrap();
         let mut states = commit_all(&engine, &batches(0..30));
         assert!(segments(dir.path()).len() > 3, "small segments rotate");
         assert_eq!(engine.checkpoint().unwrap(), 30);
@@ -193,7 +193,7 @@ fn corruption_before_the_tail_is_an_error_not_data_loss() {
         ..config()
     };
     {
-        let engine = Engine::open(dir.path(), small_segments).unwrap();
+        let engine = Engine::open(dir.path(), small_segments.clone()).unwrap();
         commit_all(&engine, &batches(0..30));
     }
     let first = &segments(dir.path())[0];
@@ -205,6 +205,356 @@ fn corruption_before_the_tail_is_an_error_not_data_loss() {
         Err(EngineError::Corruption(_)) => {}
         other => panic!("expected corruption, got {other:?}"),
     }
+}
+
+/// The frames of a WAL segment: (start, end) of each, after the 8-byte magic.
+fn frames(bytes: &[u8]) -> Vec<(usize, usize)> {
+    let mut frames = Vec::new();
+    let mut at = 8;
+    while at < bytes.len() {
+        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        frames.push((at, at + 8 + len));
+        at += 8 + len;
+    }
+    frames
+}
+
+/// Damage to the one segment of a three-commit log, by the sync policy it was written
+/// under: truncated where the write never landed whole (or the policy allows losing the last
+/// commits), refused as corruption where acknowledged records may be lost, naming the last
+/// intact revision; `recover_until` at it then keeps the intact part.
+#[test]
+fn wal_damage_is_truncated_or_refused_by_its_evidence() {
+    type Damage = fn(&mut Vec<u8>, &[(usize, usize)]);
+    let flip_first: Damage = |bytes, frames| bytes[frames[0].0 + 12] ^= 1;
+    let flip_last: Damage = |bytes, frames| bytes[frames[2].0 + 12] ^= 1;
+    // The segment rewritten as version 4 (untimed frames, as a store that keeps integers in
+    // its dictionary writes), then its last frame damaged.
+    let untimed_flip_last: Damage = |bytes, frames| {
+        let mut untimed = b"NRESEWL4".to_vec();
+        for &(start, end) in frames {
+            let payload = &bytes[start + 8..end - 8];
+            untimed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            untimed.extend_from_slice(&crc32fast::hash(payload).to_le_bytes());
+            untimed.extend_from_slice(payload);
+        }
+        let last = untimed.len() - (frames[2].1 - frames[2].0 - 8) + 12;
+        untimed[last] ^= 1;
+        *bytes = untimed;
+    };
+    let flip_two: Damage = |bytes, frames| {
+        bytes[frames[0].0 + 12] ^= 1;
+        bytes[frames[1].0 + 12] ^= 1;
+    };
+    let long_and_flipped: Damage = |bytes, frames| {
+        bytes[frames[0].0..frames[0].0 + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[frames[0].0 + 12] ^= 1;
+    };
+    let zero_tail: Damage = |bytes, _| bytes.extend_from_slice(&[0; 40]);
+    let zero_end: Damage = |bytes, frames| bytes[frames[2].1 - 8..frames[2].1].fill(0);
+    let long_length: Damage = |bytes, frames| {
+        bytes[frames[1].0..frames[1].0 + 4].copy_from_slice(&u32::MAX.to_le_bytes())
+    };
+    let every = SyncPolicy::EveryCommit;
+    let buffered = SyncPolicy::OsBuffered;
+    // The segment's sidecar: as written, removed (an older segment), or there but unreadable.
+    #[derive(Debug, PartialEq)]
+    enum Sidecar {
+        Kept,
+        Missing,
+        Unreadable,
+    }
+    // Opening: at this revision; refused as corruption, naming this last intact revision; or
+    // failing on an I/O error.
+    #[derive(Debug)]
+    enum Expect {
+        Opens(u64),
+        Refused(u64),
+        Fails,
+    }
+    use {Expect::*, Sidecar::*};
+    // (case, policy, sidecar, damage, recover_until, expected)
+    type Row = (
+        &'static str,
+        SyncPolicy,
+        Sidecar,
+        Damage,
+        Option<u64>,
+        Expect,
+    );
+    let rows: [Row; 14] = [
+        (
+            "damage before intact records",
+            every,
+            Kept,
+            flip_first,
+            None,
+            Refused(0),
+        ),
+        (
+            "the same, under os-buffered",
+            buffered,
+            Kept,
+            flip_first,
+            None,
+            Refused(0),
+        ),
+        (
+            "cut before the damage",
+            every,
+            Kept,
+            flip_first,
+            Some(0),
+            Opens(0),
+        ),
+        (
+            "two damaged records before an intact one, os-buffered",
+            buffered,
+            Kept,
+            flip_two,
+            None,
+            Refused(0),
+        ),
+        (
+            "a damaged length and payload before intact records",
+            every,
+            Kept,
+            long_and_flipped,
+            None,
+            Refused(0),
+        ),
+        ("a zero-filled tail", every, Kept, zero_tail, None, Opens(3)),
+        (
+            "an untimed (version 4) last record damaged",
+            every,
+            Kept,
+            untimed_flip_last,
+            None,
+            Refused(2),
+        ),
+        (
+            "a damaged length over an intact record",
+            every,
+            Kept,
+            long_length,
+            None,
+            Refused(1),
+        ),
+        (
+            "a synced last record damaged",
+            every,
+            Kept,
+            flip_last,
+            None,
+            Refused(2),
+        ),
+        (
+            "cut before the damaged last record",
+            every,
+            Kept,
+            flip_last,
+            Some(2),
+            Opens(2),
+        ),
+        (
+            "a last record whose end never landed",
+            every,
+            Kept,
+            zero_end,
+            None,
+            Opens(2),
+        ),
+        (
+            "a last record damaged under os-buffered",
+            buffered,
+            Kept,
+            flip_last,
+            None,
+            Opens(2),
+        ),
+        (
+            "a last record damaged, no policy recorded",
+            every,
+            Missing,
+            flip_last,
+            None,
+            Opens(2),
+        ),
+        (
+            "a last record damaged, its sidecar unreadable",
+            every,
+            Unreadable,
+            flip_last,
+            None,
+            Fails,
+        ),
+    ];
+    for (case, sync, sidecar, damage, until, expected) in rows {
+        let dir = tempfile::tempdir().unwrap();
+        let written = EngineConfig {
+            durability: DurabilityConfig {
+                sync,
+                ..config().durability
+            },
+            ..config()
+        };
+        {
+            let engine = Engine::open(dir.path(), written.clone()).unwrap();
+            commit_all(&engine, &batches(0..3));
+        }
+        let segment = &segments(dir.path())[0];
+        let mut bytes = fs::read(segment).unwrap();
+        let at = frames(&bytes);
+        assert_eq!(at.len(), 3, "{case}");
+        damage(&mut bytes, &at);
+        fs::write(segment, bytes).unwrap();
+        let mut meta = segment.clone().into_os_string();
+        meta.push(".meta");
+        if sidecar != Kept {
+            fs::remove_file(&meta).unwrap();
+        }
+        if sidecar == Unreadable {
+            // A directory where the file should be: reading it fails on every platform.
+            fs::create_dir(&meta).unwrap();
+        }
+        let reopen = EngineConfig {
+            durability: DurabilityConfig {
+                recover_until: until,
+                ..written.durability
+            },
+            ..written
+        };
+        match (Engine::open(dir.path(), reopen), expected) {
+            (Ok(engine), Opens(revision)) => {
+                assert_eq!(engine.stats().revision, revision, "{case}")
+            }
+            (Err(EngineError::Corruption(why)), Refused(intact)) => assert!(
+                why.contains(&format!("intact through revision {intact};")),
+                "{case}: {why}"
+            ),
+            (Err(EngineError::Io(_)), Fails) => {}
+            (other, expected) => panic!(
+                "{case}: expected {expected:?}, got {:?}",
+                other.map(|e| e.stats().revision)
+            ),
+        }
+    }
+}
+
+/// A segment's name is only a lower bound of its records: an empty segment keeps its name
+/// while bulk loads publish revisions without frames. Ten bulk loads leave segment 1 empty,
+/// then commits 11 and 12 go into it; damage to 11 must not let recovery drop the intact,
+/// acknowledged 12 (Sol r2 N1-R2-1: the search bounded revisions by the stale name).
+#[test]
+fn a_stale_segment_name_hides_no_intact_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let quad = |n: u64| {
+        Quad::new(
+            NamedNode::new_unchecked(format!("urn:s:{n}")),
+            NamedNode::new_unchecked("urn:p"),
+            NamedNode::new_unchecked("urn:o"),
+            GraphName::DefaultGraph,
+        )
+    };
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    // Every term in the checkpoint first, so that the two later records carry no keys.
+    let terms: Vec<_> = (0..12).map(quad).collect();
+    let load = engine.bulk_load(BulkMode::Replace);
+    load.add(&terms);
+    assert_eq!(load.finish().unwrap().revision, 1);
+    for (n, term) in terms.iter().enumerate().take(10).skip(1) {
+        let load = engine.bulk_load(BulkMode::Replace);
+        load.add(std::slice::from_ref(term));
+        assert_eq!(load.finish().unwrap().revision, n as u64 + 1);
+    }
+    for n in [10, 11] {
+        let mut tx = engine.transaction();
+        tx.insert(terms[n].as_ref());
+        assert_eq!(tx.commit().unwrap().revision, n as u64 + 1);
+    }
+    drop(engine);
+    let segment = dir.path().join("wal").join(format!("{:020}.wal", 1));
+    let mut bytes = fs::read(&segment).unwrap();
+    let at = frames(&bytes);
+    assert_eq!(at.len(), 2);
+    assert_eq!(
+        u64::from_le_bytes(bytes[at[1].0 + 8..at[1].0 + 16].try_into().unwrap()),
+        12
+    );
+    // Revision 11's length and a byte of its payload damaged; 12 intact behind it.
+    bytes[at[0].0..at[0].0 + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+    bytes[at[0].0 + 12] ^= 1;
+    fs::write(&segment, bytes).unwrap();
+    match Engine::open(dir.path(), config()) {
+        Err(EngineError::Corruption(why)) => {
+            assert!(why.contains("intact through revision 10;"), "{why}")
+        }
+        other => panic!(
+            "the intact revision 12 must not be dropped; got {:?}",
+            other.map(|e| e.stats().revision)
+        ),
+    }
+}
+
+/// A damaged tail whose search runs out of budget at a failed structure parse is refused as
+/// corruption, never a panic (Sol r2 N1-R2-2: the parse could be charged past the budget,
+/// and the next subtraction underflowed). The fixture is Sol's: 200 frames of 40 quads, a
+/// 4 KiB page of them zeroed.
+#[test]
+fn an_exhausted_evidence_search_refuses_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = dir.path().join("wal");
+    fs::create_dir(&wal).unwrap();
+    let segment = wal.join(format!("{:020}.wal", 1));
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wal-budget-page20.wal"),
+        &segment,
+    )
+    .unwrap();
+    let mut meta = segment.into_os_string();
+    meta.push(".meta");
+    fs::write(meta, b"sync=every-commit\n").unwrap();
+    let opened = std::panic::catch_unwind(|| Engine::open(dir.path(), config()));
+    match opened {
+        Ok(Err(EngineError::Corruption(_))) => {}
+        Ok(other) => panic!(
+            "expected corruption, got {:?}",
+            other.map(|e| e.stats().revision)
+        ),
+        Err(_) => panic!("the evidence search panicked"),
+    }
+}
+
+/// A segment holds commits of one sync policy: reopening under another starts a new one,
+/// and each records its own.
+#[test]
+fn a_new_sync_policy_starts_a_new_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let under = |sync| EngineConfig {
+        durability: DurabilityConfig {
+            sync,
+            ..config().durability
+        },
+        ..config()
+    };
+    for (sync, commits) in [
+        (SyncPolicy::EveryCommit, 0..2),
+        (SyncPolicy::OsBuffered, 2..3),
+    ] {
+        let engine = Engine::open(dir.path(), under(sync)).unwrap();
+        commit_all(&engine, &batches(commits));
+    }
+    let policies: Vec<String> = segments(dir.path())
+        .iter()
+        .map(|segment| {
+            let mut meta = segment.clone().into_os_string();
+            meta.push(".meta");
+            fs::read_to_string(meta).unwrap()
+        })
+        .collect();
+    assert_eq!(policies, ["sync=every-commit\n", "sync=os-buffered\n"]);
+    let engine = Engine::open(dir.path(), under(SyncPolicy::OsBuffered)).unwrap();
+    assert_eq!(engine.stats().revision, 3);
 }
 
 #[test]
@@ -353,7 +703,7 @@ fn background_checkpoints_bound_the_wal() {
         ..EngineConfig::default()
     };
     let states = {
-        let engine = Engine::open(dir.path(), config).unwrap();
+        let engine = Engine::open(dir.path(), config.clone()).unwrap();
         commit_all(&engine, &batches(0..200))
     };
     let checkpoints = fs::read_dir(dir.path())
@@ -400,7 +750,7 @@ fn checkpoint_of_many_runs_with_tombstones_recovers() {
         },
         ..config()
     };
-    let engine = Engine::open(dir.path(), config).unwrap();
+    let engine = Engine::open(dir.path(), config.clone()).unwrap();
     let mut batches = batches(0..400);
     // Delete quads inserted by earlier commits: tombstones in later runs.
     for (i, (_, deletes)) in batches.iter_mut().enumerate().skip(1) {
@@ -671,7 +1021,7 @@ fn bulk_loads_are_served_from_their_checkpoint() {
             },
             ..config()
         };
-        let engine = Engine::open(dir.path(), config).unwrap();
+        let engine = Engine::open(dir.path(), config.clone()).unwrap();
         let data: Vec<Quad> = (0..500).flat_map(|n| [quad(n), label(n)]).collect();
         let load = engine.bulk_load(BulkMode::Append);
         load.add(&data);
@@ -704,7 +1054,7 @@ fn bulk_loads_past_their_budget_spill_and_merge() {
         },
         ..config()
     };
-    let engine = Engine::open(dir.path(), config).unwrap();
+    let engine = Engine::open(dir.path(), config.clone()).unwrap();
     commit_all(&engine, &batches(0..5));
     let data: Vec<Quad> = (0..900).flat_map(|n| [quad(n), label(n)]).collect();
     let load = engine.bulk_load(BulkMode::Replace);
@@ -929,4 +1279,42 @@ fn bulk_replacement_is_streamed_into_its_checkpoint() {
     drop(engine);
     let engine = Engine::open(dir.path(), config()).unwrap();
     assert_eq!(contents(&engine), expected);
+}
+
+/// A checkpoint orders the dictionary's texts (format 7): two equal texts of 256 KiB, a
+/// simple literal's and a typed one's, are ordered as any others, and a prefix search finds
+/// both after reopening. (The order refined them a level per shared 8 bytes, which
+/// overflowed the checkpoint's worker stacks.)
+#[test]
+fn a_checkpoint_orders_equal_long_texts() {
+    use nrese_engine::{Placement, StringTest};
+    let dir = tempfile::tempdir().unwrap();
+    let text = "abcdefgh".repeat(32 << 10);
+    let objects = [
+        Literal::new_simple_literal(&text),
+        Literal::new_typed_literal(&text, NamedNode::new_unchecked("http://example.com/type")),
+    ];
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    let mut tx = engine.transaction();
+    for (i, object) in objects.iter().enumerate() {
+        let subject = NamedNode::new_unchecked(format!("http://example.com/s{i}"));
+        let predicate = NamedNode::new_unchecked("http://example.com/p");
+        tx.insert(Quad::new(subject, predicate, object.clone(), GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    engine.checkpoint().unwrap();
+    drop(engine);
+    let snapshot = Engine::open(dir.path(), config()).unwrap().snapshot();
+    let test = StringTest {
+        needle: "abcdefghabcdefgh",
+        placement: Placement::Start,
+        iris: false,
+        strings: true,
+        lang_strings: false,
+        typed: true,
+        language: None,
+        ascii_case_insensitive: false,
+    };
+    assert!(snapshot.text_order_ready());
+    assert_eq!(snapshot.matching_strings(&test).len(), 2);
 }

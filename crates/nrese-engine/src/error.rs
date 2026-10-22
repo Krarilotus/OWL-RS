@@ -4,18 +4,32 @@ pub type EngineResult<T> = Result<T, EngineError>;
 
 #[derive(Debug, Error)]
 pub enum EngineError {
+    /// Work refused by its memory budget before it allocated: nothing was changed (a
+    /// checkpoint's scratch, a search's corpus or scoring).
+    #[error("not enough memory: {0}")]
+    MemoryLimit(#[from] nrese_exec::BudgetExceeded),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error("storage corruption: {0}")]
     Corruption(String),
     #[error("invalid engine configuration: {0}")]
     Configuration(String),
+    #[error("invalid text query: {0}")]
+    InvalidTextQuery(String),
     #[error("term {0:#x} is not known to the dictionary")]
     UnknownTerm(u64),
     #[error("RDF-star triple terms are not supported by the engine")]
     UnsupportedTerm,
     #[error("the write-ahead log failed earlier; reopen the engine to recover")]
     WalPoisoned,
+    /// A bulk publication failed at its commit point: whether revision `revision` was
+    /// committed shows when the engine is reopened. Nothing is written meanwhile, so the
+    /// revision can't be used twice.
+    #[error("whether revision {revision} was committed shows on reopening the engine: {cause}")]
+    CommitUnknown {
+        revision: u64,
+        cause: std::io::Error,
+    },
     #[error("transaction too large for one WAL record ({bytes} bytes); use the bulk loader")]
     TransactionTooLarge { bytes: u64 },
     #[error("data directory {0} is locked by another process")]

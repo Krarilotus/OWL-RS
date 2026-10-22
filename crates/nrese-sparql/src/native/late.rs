@@ -110,20 +110,18 @@ impl super::Context<'_> {
     fn canonical_child(&self) -> super::Context<'static> {
         use std::cell::{Cell, RefCell};
         let mut child = super::Context {
+            planner: self.planner,
             snapshot: std::borrow::Cow::Owned(self.snapshot.with_canonical_equality()),
             model: self.model,
             aliases: RefCell::new(self.aliases.borrow().clone()),
             evaluator: super::Evaluator::default(),
             computed: RefCell::default(),
-            computed_ids: RefCell::default(),
-            computed_table: Cell::new(0),
             decoded: RefCell::default(),
-            decoded_terms: Cell::new(0),
-            decoded_table: Cell::new(0),
             decodes: std::sync::atomic::AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: self.cancellation.clone(),
             budget: std::sync::Arc::clone(&self.budget),
+            memory: self.memory.clone(),
             trace: None,
             depth: Cell::new(0),
             probed: Cell::default(),
@@ -143,6 +141,7 @@ impl super::Context<'_> {
             late: None,
             canonical: None,
             canonical_refused: None,
+            reads_refused: self.reads_refused,
             cache: None,
             pin: RefCell::default(),
         };

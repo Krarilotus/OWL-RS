@@ -6,15 +6,25 @@
 //! title, reasoning and rules are its [`RepositorySettings`] (the server's reasoning when
 //! they name none), kept in `repository.json` in its directory.
 //!
+//! A repository's lifecycle is serialised: creation and removal reserve its id, and a
+//! change or removal holds the repository's lifecycle lock throughout. A change prepares
+//! (checks, compiles, recomputes the inferences) with the old write path retired, writes
+//! the settings whole ([`crate::metadata`]), then publishes; on failure the old reasoning
+//! is published again, so the settings on disk are always the acknowledged ones. A removal
+//! writes a tombstone beside the repositories (outside the directory it reclaims) before
+//! reclaiming the files, and removes it only once the directory is gone: a repository
+//! whose files can't be removed yet is never opened again. A repository whose stored settings or files can't be read is
+//! listed as unavailable with the reason ([`Catalog::unavailable`]), not left out.
+//!
 //! The catalogue is the store's (ADR-0007): the server, the command line and embedders
 //! use the same one; protocols only translate their requests and errors.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, UserRules};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::{MutationPipeline, StoreConfig, StoreMode, StoreService};
@@ -39,6 +49,7 @@ pub enum CatalogError {
 /// no file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryRules {
     /// Shown in errors and diagnostics: the file name, or `configuration`.
     pub name: String,
@@ -52,15 +63,18 @@ impl RepositoryRules {
     fn compile(&self) -> Result<UserRules, String> {
         let rules = match self.format.as_str() {
             "pie" => UserRules::pie(self.name.clone(), self.text.clone()),
-            _ => UserRules::n3(self.name.clone(), self.text.clone()),
+            "n3" => UserRules::n3(self.name.clone(), self.text.clone()),
+            other => return Err(format!("rules format must be 'n3' or 'pie', not '{other}'")),
         };
         rules.map_err(|error| error.to_string())
     }
 }
 
-/// What a repository is created with besides the server's settings.
+/// What a repository is created with besides the server's settings. Unknown fields are
+/// refused: a misspelt setting would otherwise be silently ignored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
 pub struct RepositorySettings {
     /// Shown in the repository list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,10 +119,15 @@ impl RepositorySettings {
     }
 
     /// The repository's reasoner configuration, if the settings choose one (else the
-    /// server's applies).
+    /// server's applies). Rules need a mode: the server's reasoning would leave them out.
     pub fn reasoner_config(&self) -> Result<Option<ReasonerConfig>, String> {
         let Some(mode) = self.reasoning_mode() else {
-            return Ok(None);
+            return match self.rules {
+                Some(_) => Err("rules need a reasoning mode ('custom' runs them alone, a \
+                     ruleset's name adds them to it)"
+                    .to_owned()),
+                None => Ok(None),
+            };
         };
         let rules = self
             .rules
@@ -128,7 +147,7 @@ const SETTINGS_FILE: &str = "repository.json";
 /// The default repository's id.
 pub const DEFAULT_REPOSITORY: &str = "nrese";
 
-/// A repository's write path, which a reconfiguration replaces ([`reconfigure`]).
+/// A repository's write path, which a change of its reasoning replaces ([`Catalog::change`]).
 pub type PipelineSlot = Arc<RwLock<Arc<MutationPipeline>>>;
 
 /// One repository: its write path (and store) and its settings.
@@ -136,6 +155,18 @@ pub type PipelineSlot = Arc<RwLock<Arc<MutationPipeline>>>;
 pub struct Repository {
     pub pipeline: PipelineSlot,
     pub settings: Arc<RwLock<RepositorySettings>>,
+    /// Held through a change or removal of this repository.
+    lifecycle: Arc<Mutex<()>>,
+}
+
+impl Repository {
+    fn new(pipeline: MutationPipeline, settings: RepositorySettings) -> Self {
+        Self {
+            pipeline: Arc::new(RwLock::new(Arc::new(pipeline))),
+            settings: Arc::new(RwLock::new(settings)),
+            lifecycle: Arc::default(),
+        }
+    }
 }
 
 /// The default repository's settings file in the data directory, if the server is on
@@ -160,39 +191,44 @@ pub fn stored_default_settings(
     }
 }
 
-/// Gives the repository whose write path is `slot` the reasoning of `settings` (`fallback`
-/// where they name none): a new write path over the same store takes over, the old one is
-/// retired (its waiting writes are refused, retryable), and the inferences are recomputed
-/// under the new rules (or cleared without reasoning). Returns the new reasoning's name.
-pub fn reconfigure(
-    slot: &PipelineSlot,
-    settings: &RepositorySettings,
-    fallback: &ReasonerService,
-) -> Result<&'static str, CatalogError> {
-    let reasoner = match settings.reasoner_config().map_err(CatalogError::Invalid)? {
-        Some(config) => ReasonerService::new(config),
-        None => fallback.clone(),
-    };
-    let store = Arc::clone(slot.read().store());
-    let next = Arc::new(MutationPipeline::new(
-        Arc::clone(&store),
-        Arc::new(reasoner),
-    ));
-    let previous = std::mem::replace(&mut *slot.write(), Arc::clone(&next));
-    previous.retire();
-    match next.reasoner().config().materialised_program() {
-        Some(program) => {
-            store
-                .rematerialise(&program)
-                .map_err(|error| CatalogError::Store(error.to_string()))?;
-        }
-        None => {
-            store
-                .clear_inferred()
-                .map_err(|error| CatalogError::Store(error.to_string()))?;
-        }
+/// A removal's tombstone, beside the repositories: `~removed-<id>`, a name no repository can
+/// have ([`existing`]: no `~`). Written (durably) before the files are reclaimed, outside the
+/// directory a reclamation removes, and removed only once that directory is gone: a
+/// repository it names is never opened again, only reclaimed.
+const REMOVED: &str = "~removed-";
+
+fn tombstone(root: &std::path::Path, id: &str) -> PathBuf {
+    root.join(format!("{REMOVED}{id}"))
+}
+
+/// Brings `store`'s inferences in line with `reasoner`: recomputed under its rules, or
+/// cleared without reasoning. A failure says whether the store's inferences changed
+/// (published, then not recorded) or not.
+fn settle(store: &StoreService, reasoner: &ReasonerService) -> Result<(), Unsettled> {
+    match reasoner.config().materialised_program() {
+        Some(program) => store.rematerialise(&program).map(drop),
+        None => store.clear_inferred().map(drop),
     }
-    Ok(next.reasoner().mode_name())
+    .map_err(|error| Unsettled {
+        published: matches!(error, crate::StoreError::InferencesNotRecorded(_)),
+        error: CatalogError::Store(error.to_string()),
+    })
+}
+
+/// A failed [`settle`]: whether the new inferences were published nonetheless.
+struct Unsettled {
+    published: bool,
+    error: CatalogError,
+}
+
+/// How a removal ended ([`Catalog::delete`]): the repository is gone either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Removal {
+    /// Its files are deleted.
+    Reclaimed,
+    /// Its files are still held (or couldn't be deleted): its tombstone (or its directory's
+    /// trash name) keeps it removed, and they are deleted at the next start.
+    Pending,
 }
 
 /// The repositories: the default one and the others, with their stores, write paths and
@@ -207,6 +243,22 @@ pub struct Catalog {
     /// Where on-disk repositories live; `None` for an in-memory server.
     root: Option<PathBuf>,
     others: RwLock<BTreeMap<String, Repository>>,
+    /// Repositories on disk that didn't open, with why and how to repair them.
+    unavailable: RwLock<BTreeMap<String, String>>,
+    /// Ids (ASCII lowercase) being created or removed.
+    reserved: Mutex<BTreeSet<String>>,
+}
+
+/// An id reserved by a creation or removal, until it is dropped.
+struct Reservation<'a> {
+    reserved: &'a Mutex<BTreeSet<String>>,
+    key: String,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.reserved.lock().remove(&self.key);
+    }
 }
 
 /// Whether `id` can name a repository: letters, digits, `-`, `_` and `.`, at most 64, not
@@ -249,24 +301,26 @@ fn existing(id: &str) -> bool {
 const TRASH: &str = "~trash-";
 
 impl Catalog {
-    /// The repositories of a server whose default store is `store`, reasoning with
-    /// `reasoner` where a repository's settings name none: the default with its stored
+    /// The repositories of a server whose default store is `store`, reasoning as
+    /// `reasoning` says where a repository's settings name none: the default with its stored
     /// settings (those changed through the engine API), and on disk the others found under
     /// `repositories/` of its data directory (one that fails to open is logged and left
     /// out).
-    pub fn open(store: StoreService, reasoner: ReasonerService) -> Result<Self, CatalogError> {
+    pub fn open(store: StoreService, reasoning: ReasonerConfig) -> Result<Self, CatalogError> {
+        let reasoner = ReasonerService::new(reasoning);
         let template = store.config().clone();
         let runtime = Arc::clone(store.runtime());
         let default_settings = stored_default_settings(&template)
             .map_err(CatalogError::Store)?
             .unwrap_or_default();
-        let default = Repository {
-            pipeline: Arc::new(RwLock::new(Arc::new(MutationPipeline::new(
-                Arc::new(store),
-                Arc::new(reasoner.clone()),
-            )))),
-            settings: Arc::new(RwLock::new(default_settings)),
-        };
+        if let Err(error) = check(&default_settings) {
+            let file = default_settings_file(&template).unwrap_or_default();
+            return Err(CatalogError::Store(repair(&file, &error.to_string())));
+        }
+        let default = Repository::new(
+            MutationPipeline::new(Arc::new(store), reasoner.config().clone()),
+            default_settings,
+        );
         let root = matches!(template.mode, StoreMode::OnDisk)
             .then(|| template.data_dir.join("repositories"));
         let repositories = Self {
@@ -276,11 +330,27 @@ impl Catalog {
             reasoner,
             root,
             others: RwLock::default(),
+            unavailable: RwLock::default(),
+            reserved: Mutex::default(),
         };
         if let Some(root) = &repositories.root
             && let Ok(entries) = std::fs::read_dir(root)
         {
-            for entry in entries.flatten() {
+            let entries: Vec<_> = entries.flatten().collect();
+            // Removals: their repositories reclaimed (again) and never opened.
+            let removed: BTreeSet<String> = entries
+                .iter()
+                .filter_map(|entry| {
+                    let name = entry.file_name();
+                    name.to_str()?.strip_prefix(REMOVED).map(str::to_owned)
+                })
+                .collect();
+            for id in &removed {
+                if repositories.reclaim(root, id) == Removal::Pending {
+                    tracing::warn!(repository = %id, "removed repository's files not deleted yet");
+                }
+            }
+            for entry in entries {
                 let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
                     continue;
                 };
@@ -291,33 +361,42 @@ impl Catalog {
                     }
                     continue;
                 }
-                if !existing(&id) || !entry.path().is_dir() {
+                if !existing(&id) || !entry.path().is_dir() || removed.contains(&id) {
                     continue;
                 }
                 if !valid(&id) {
                     tracing::warn!(repository = %id, "a repository id that can't be created any more (it starts or ends with '.' or is a device name): opened as it is; copy it into a repository with another id to move the data directory between systems");
                 }
-                let settings = match std::fs::read(entry.path().join(SETTINGS_FILE)) {
-                    Ok(bytes) => match serde_json::from_slice(&bytes) {
-                        Ok(settings) => settings,
-                        Err(error) => {
-                            tracing::warn!(repository = %id, %error, "repository settings not read");
-                            continue;
-                        }
-                    },
+                let file = entry.path().join(SETTINGS_FILE);
+                let settings = match std::fs::read(&file) {
+                    // Settings written by hand meet the same checks as those sent to the API.
+                    Ok(bytes) => serde_json::from_slice(&bytes)
+                        .map_err(|error| error.to_string())
+                        .and_then(|settings| {
+                            check(&settings)
+                                .map(|()| settings)
+                                .map_err(|error| error.to_string())
+                        })
+                        .map_err(|error| repair(&file, &error)),
                     // Created before settings were kept: the server's.
-                    Err(_) => RepositorySettings::default(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(RepositorySettings::default())
+                    }
+                    Err(error) => Err(repair(&file, &error.to_string())),
                 };
-                // Settings written by hand meet the same checks as those sent to the API.
-                if let Err(error) = check(&settings) {
-                    tracing::warn!(repository = %id, %error, "repository settings refused");
-                    continue;
-                }
-                match repositories.start(&id, settings) {
+                let started = |settings| {
+                    repositories
+                        .start(&id, settings)
+                        .map_err(|error| repair_files(&entry.path(), &error))
+                };
+                match settings.and_then(started) {
                     Ok(repository) => {
                         repositories.others.write().insert(id, repository);
                     }
-                    Err(error) => tracing::warn!(repository = %id, %error, "repository not opened"),
+                    Err(error) => {
+                        tracing::error!(repository = %id, %error, "repository unavailable");
+                        repositories.unavailable.write().insert(id, error);
+                    }
                 }
             }
         }
@@ -360,20 +439,146 @@ impl Catalog {
                 store.clear_inferred().map_err(|error| error.to_string())?;
             }
         }
-        Ok(Repository {
-            pipeline: Arc::new(RwLock::new(Arc::new(MutationPipeline::new(
-                Arc::new(store),
-                Arc::new(reasoner),
-            )))),
-            settings: Arc::new(RwLock::new(settings)),
+        Ok(Repository::new(
+            MutationPipeline::new(Arc::new(store), reasoner.config().clone()),
+            settings,
+        ))
+    }
+
+    /// The reasoning of `settings`: theirs, else the server's.
+    fn reasoner_for(&self, settings: &RepositorySettings) -> Result<ReasonerService, CatalogError> {
+        Ok(
+            match settings.reasoner_config().map_err(CatalogError::Invalid)? {
+                Some(config) => ReasonerService::new(config),
+                None => self.reasoner.clone(),
+            },
+        )
+    }
+
+    /// Where repository `id`'s settings are kept (`None` in memory).
+    fn settings_file(&self, id: &str) -> Option<PathBuf> {
+        match id {
+            DEFAULT_REPOSITORY => default_settings_file(&self.template),
+            id => self
+                .root
+                .as_ref()
+                .map(|root| root.join(id).join(SETTINGS_FILE)),
+        }
+    }
+
+    /// Makes repository `id`, whose store is `store`, unavailable until a restart: its
+    /// inferences match neither its old reasoning nor its new one. Other repositories go
+    /// on; requests to it are answered 503 with why (operators: which file, how to repair).
+    fn make_unavailable(&self, id: &str, store: &StoreService, error: &str) {
+        let why = format!(
+            "repository '{id}' ({}): a change of its reasoning failed and its inferences couldn't be restored: {error}. Repair: restart the server; it reads the settings kept in {} and recomputes the inferences",
+            store.config().data_dir.display(),
+            self.settings_file(id)
+                .map_or_else(|| "memory".to_owned(), |file| file.display().to_string())
+        );
+        store.make_unavailable(why.clone());
+        if id != DEFAULT_REPOSITORY {
+            self.others.write().remove(id);
+            self.unavailable.write().insert(id.to_owned(), why);
+        }
+    }
+
+    /// Why repository `id` (not the default) can't serve, if it can't: it didn't open at
+    /// start, or its store became unavailable since ([`StoreService::unavailable`]); with
+    /// how to repair it.
+    pub fn unavailable(&self, id: &str) -> Option<String> {
+        if let Some(why) = self.unavailable.read().get(id) {
+            return Some(why.clone());
+        }
+        let others = self.others.read();
+        let store = Arc::clone(others.get(id)?.pipeline.read().store());
+        store.unavailable().map(str::to_owned)
+    }
+
+    /// The repositories besides the default that can't serve, sorted, each with why.
+    pub fn unavailable_list(&self) -> Vec<(String, String)> {
+        let mut list: BTreeMap<String, String> = self.unavailable.read().clone();
+        for (id, repository) in self.others.read().iter() {
+            if let Some(why) = repository.pipeline.read().store().unavailable() {
+                list.insert(id.clone(), why.to_owned());
+            }
+        }
+        list.into_iter().collect()
+    }
+
+    /// Reserves `id` for a creation or removal: refused while another holds it.
+    fn reserve(&self, id: &str) -> Result<Reservation<'_>, CatalogError> {
+        let key = id.to_ascii_lowercase();
+        if !self.reserved.lock().insert(key.clone()) {
+            return Err(CatalogError::Conflict(format!(
+                "repository '{id}' is being created or removed"
+            )));
+        }
+        Ok(Reservation {
+            reserved: &self.reserved,
+            key,
         })
     }
 
+    /// Deletes removed repository `id`'s directory (its tombstone written): renamed out of
+    /// the way first, at once, so that files still held (mapped checkpoints of a request
+    /// in flight, on Windows) leave a `~trash-` directory the next start deletes; then the
+    /// tombstone goes. A directory that can't be renamed keeps its name and its tombstone,
+    /// whole (nothing is deleted under a name a start could open), for the next start.
+    fn reclaim(&self, root: &std::path::Path, id: &str) -> Removal {
+        let dir = root.join(id);
+        let trash = (0..)
+            .map(|n| root.join(format!("{TRASH}{id}-{n}")))
+            .find(|path| !path.exists())
+            .expect("a free name");
+        match std::fs::rename(&dir, &trash) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return match self.unmark(root, id) {
+                    true => Removal::Reclaimed,
+                    false => Removal::Pending,
+                };
+            }
+            Err(error) => {
+                tracing::warn!(dir = %dir.display(), %error, "removed repository's directory not renamed; reclaimed at the next start");
+                return Removal::Pending;
+            }
+        }
+        let unmarked = self.unmark(root, id);
+        match std::fs::remove_dir_all(&trash) {
+            Ok(()) if unmarked => Removal::Reclaimed,
+            Ok(()) => Removal::Pending,
+            Err(error) => {
+                tracing::warn!(dir = %trash.display(), %error, "removed repository's files not deleted yet; deleted at the next start");
+                Removal::Pending
+            }
+        }
+    }
+
+    /// Removes repository `id`'s tombstone, its directory gone; whether it is removed
+    /// durably. One that stays visible keeps the id taken; one gone but not durably (the
+    /// directory sync failed) is made durable by the next creation's sync ([`Self::create`]).
+    fn unmark(&self, root: &std::path::Path, id: &str) -> bool {
+        match crate::metadata::remove(&tombstone(root, id)) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(repository = %id, %error, "removed repository's tombstone not deleted durably; the id is taken until it is");
+                false
+            }
+        }
+    }
+
     /// Repository `id`, the default one included.
+    /// One that can't serve ([`Self::unavailable`]) is not served: `None`, but the default.
     pub fn get(&self, id: &str) -> Option<Repository> {
         match id {
             DEFAULT_REPOSITORY => Some(self.default.clone()),
-            id => self.others.read().get(id).cloned(),
+            id => self
+                .others
+                .read()
+                .get(id)
+                .filter(|repository| repository.pipeline.read().store().unavailable().is_none())
+                .cloned(),
         }
     }
 
@@ -384,32 +589,108 @@ impl Catalog {
     }
 
     /// Changes repository `id`'s settings: its title, and its reasoning, which takes effect
-    /// at once ([`reconfigure`]). Kept in its directory on disk; the default repository's
-    /// override the configuration's reasoning at the next start.
+    /// at once. Kept in its directory on disk; the default repository's override the
+    /// configuration's reasoning at the next start.
+    ///
+    /// A new reasoning is prepared with the old write path retired (its writes are refused,
+    /// retryable, until the new one is published): compiled, the inferences recomputed,
+    /// the settings written, then a write path over the store with it published. A failure
+    /// publishes the old reasoning again, its inferences recomputed if they had changed.
     pub fn change(&self, id: &str, settings: RepositorySettings) -> Result<(), CatalogError> {
-        let repository = self
-            .get(id)
-            .ok_or_else(|| CatalogError::NotFound(format!("no repository '{id}'")))?;
+        let missing = || CatalogError::NotFound(format!("no repository '{id}'"));
+        let repository = self.get(id).ok_or_else(missing)?;
+        let _lifecycle = repository.lifecycle.lock();
+        // Removed while this waited.
+        if id != DEFAULT_REPOSITORY
+            && !self
+                .others
+                .read()
+                .get(id)
+                .is_some_and(|r| Arc::ptr_eq(&r.lifecycle, &repository.lifecycle))
+        {
+            return Err(missing());
+        }
         check(&settings)?;
         let before = repository.settings.read().clone();
+        // A settings file in place but not made durable: neither the old state nor the new
+        // one is known to survive, so the repository serves nothing until a restart, which
+        // reads the file again.
+        let persist = || {
+            match self.settings_file(id) {
+            Some(file) => written(&file, &settings).map_err(|error| {
+                let failed = CatalogError::Store(format!("{}: {error}", file.display()));
+                if error.renamed {
+                    let store = Arc::clone(repository.pipeline.read().store());
+                    store.make_unavailable(format!(
+                        "repository '{id}': its settings were written to {} but not made durable ({}). Repair: restart the server; it reads the file again and brings the inferences in line",
+                        file.display(),
+                        error.error
+                    ));
+                    if id != DEFAULT_REPOSITORY {
+                        let why = store.unavailable().unwrap_or_default().to_owned();
+                        self.others.write().remove(id);
+                        self.unavailable.write().insert(id.to_owned(), why);
+                    }
+                }
+                (failed, error.renamed)
+            }),
+            None => Ok(()),
+        }
+        };
         if (&before.reasoning, &before.rules) != (&settings.reasoning, &settings.rules) {
-            reconfigure(&repository.pipeline, &settings, &self.reasoner)?;
+            let reasoner = self.reasoner_for(&settings)?;
+            let previous = Arc::clone(&*repository.pipeline.read());
+            let store = Arc::clone(previous.store());
+            // First: the old write path would otherwise recompute its own inferences over
+            // the new ones.
+            previous.retire();
+            let restore = || {
+                *repository.pipeline.write() = Arc::new(MutationPipeline::new(
+                    Arc::clone(&store),
+                    previous.reasoner().config().clone(),
+                ));
+            };
+            // Back to the old reasoning after the new inferences were published: they are
+            // recomputed under it before its write path is published again. If that fails
+            // too, the repository serves nothing more until a restart (never old rules over
+            // new inferences): its write path stays retired.
+            let roll_back = |error: CatalogError| {
+                match settle(&store, previous.reasoner()) {
+                    Ok(()) => restore(),
+                    Err(back) => {
+                        self.make_unavailable(id, &store, &back.error.to_string());
+                        return CatalogError::Store(format!(
+                            "{error}; the old inferences couldn't be restored ({}): the repository is unavailable until the server restarts",
+                            back.error
+                        ));
+                    }
+                }
+                error
+            };
+            match settle(&store, &reasoner) {
+                Ok(()) => {}
+                // One commit that didn't happen: the inferences are the old ones.
+                Err(failed) if !failed.published => {
+                    restore();
+                    return Err(failed.error);
+                }
+                Err(failed) => return Err(roll_back(failed.error)),
+            }
+            match persist() {
+                Ok(()) => {}
+                Err((error, true)) => return Err(error),
+                Err((error, false)) => return Err(roll_back(error)),
+            }
+            *repository.pipeline.write() =
+                Arc::new(MutationPipeline::new(store, reasoner.config().clone()));
+        } else {
+            persist().map_err(|(error, _)| error)?;
         }
         if before.ql_rewriting != settings.ql_rewriting {
             let mode = settings
                 .ql_rewriting_mode()
                 .unwrap_or(self.template.ql_rewriting);
             repository.pipeline.read().store().set_ql_rewriting(mode);
-        }
-        let file = match id {
-            DEFAULT_REPOSITORY => default_settings_file(&self.template),
-            id => self
-                .root
-                .as_ref()
-                .map(|root| root.join(id).join(SETTINGS_FILE)),
-        };
-        if let Some(file) = file {
-            write_settings(&file, &settings)?;
         }
         *repository.settings.write() = settings;
         Ok(())
@@ -421,7 +702,8 @@ impl Catalog {
     }
 }
 
-/// Refuses settings that name no reasoning mode or whose rules don't compile.
+/// Refuses settings that name an unknown reasoning mode, rules without a mode, or rules
+/// that don't compile.
 pub fn check(settings: &RepositorySettings) -> Result<(), CatalogError> {
     if let Some(name) = &settings.reasoning
         && settings.reasoning_mode().is_none()
@@ -446,15 +728,45 @@ pub fn check(settings: &RepositorySettings) -> Result<(), CatalogError> {
     Ok(())
 }
 
-/// Writes `settings` to `file`.
+/// Writes `settings` to `file`, whole or not at all ([`crate::metadata`]; an error may
+/// still have put the new file in place, undurably: it says so).
 pub fn write_settings(
     file: &std::path::Path,
     settings: &RepositorySettings,
 ) -> Result<(), CatalogError> {
-    let json = serde_json::to_vec_pretty(settings)
-        .map_err(|error| CatalogError::Store(error.to_string()))?;
-    std::fs::write(file, json)
+    written(file, settings)
         .map_err(|error| CatalogError::Store(format!("{}: {error}", file.display())))
+}
+
+fn written(
+    file: &std::path::Path,
+    settings: &RepositorySettings,
+) -> Result<(), crate::metadata::WriteError> {
+    let json =
+        serde_json::to_vec_pretty(settings).map_err(|error| crate::metadata::WriteError {
+            error: std::io::Error::other(error),
+            renamed: false,
+        })?;
+    crate::metadata::write(file, &json)
+}
+
+/// Why the stored settings in `file` are refused, and how to repair them.
+fn repair(file: &std::path::Path, error: &str) -> String {
+    format!(
+        "{}: {error}. Repair or remove the file (the repository then takes the server's \
+         settings) and start again, or remove the repository",
+        file.display()
+    )
+}
+
+/// Why the store in `dir` didn't open (or its inferences weren't brought in line), and how
+/// to repair it.
+fn repair_files(dir: &std::path::Path, error: &str) -> String {
+    format!(
+        "{}: the repository's store didn't open: {error}. Repair: free or restore its files \
+         there (a backup's image, the log) and start again, or remove the repository",
+        dir.display()
+    )
 }
 
 impl Catalog {
@@ -463,82 +775,485 @@ impl Catalog {
         self.others
             .read()
             .iter()
+            .filter(|(_, repository)| repository.pipeline.read().store().unavailable().is_none())
             .map(|(id, repository)| (id.clone(), repository.settings.read().title.clone()))
             .collect()
     }
 
-    /// Creates repository `id`, empty, with `settings`.
+    /// Creates repository `id`, empty, with `settings`: its id reserved, `repositories/` synced
+    /// (so that no earlier removal's tombstone can come back over it), its settings written,
+    /// then its store opened. A failed start removes what was made.
     pub fn create(&self, id: &str, settings: RepositorySettings) -> Result<(), CatalogError> {
         if !valid(id) {
             return Err(CatalogError::Invalid(format!(
                 "'{id}' can't name a repository (letters, digits, '-', '_', '.', not starting or ending with '.', no device name such as 'CON')"
             )));
         }
+        check(&settings)?;
+        let _reservation = self.reserve(id)?;
         // Ids differing only in case are one directory on Windows and macOS.
         let taken = |other: &str| other.eq_ignore_ascii_case(id);
-        if let Some(other) = std::iter::once(DEFAULT_REPOSITORY)
-            .chain(self.others.read().keys().map(String::as_str))
-            .find(|other| taken(other))
-            .map(str::to_owned)
-        {
+        let existing = std::iter::once(DEFAULT_REPOSITORY.to_owned())
+            .chain(self.others.read().keys().cloned())
+            .chain(self.unavailable.read().keys().cloned())
+            .find(|other| taken(other));
+        if let Some(other) = existing {
             return Err(CatalogError::Conflict(format!(
                 "repository '{other}' exists already"
             )));
         }
-        check(&settings)?;
-        let repository = self
-            .start(id, settings.clone())
-            .map_err(CatalogError::Store)?;
         if let Some(root) = &self.root {
-            let file = root.join(id).join(SETTINGS_FILE);
-            let json = serde_json::to_vec_pretty(&settings)
-                .map_err(|error| CatalogError::Store(error.to_string()))?;
-            std::fs::write(&file, json)
-                .map_err(|error| CatalogError::Store(format!("{}: {error}", file.display())))?;
+            let dir = root.join(id);
+            // An earlier removal of the id may have unlinked its tombstone without making that
+            // durable, in this run or one before it (a restart doesn't make it durable): a crash
+            // could bring it back, and the next start would reclaim the new repository. A sync
+            // of the directory makes every such unlink durable, else nothing is created.
+            // (A new directory holds no tombstone: its first sync is as good.)
+            let synced = std::fs::create_dir_all(root).and_then(|()| crate::metadata::sync(root));
+            if let Err(error) = synced {
+                return Err(CatalogError::Store(format!(
+                    "{}: {error}; no repository is created until the directory can be synced (a removal's tombstone may not be durably gone)",
+                    root.display()
+                )));
+            }
+            // A removal whose files weren't deleted: done now, or the id stays taken.
+            if tombstone(root, id).exists() && self.reclaim(root, id) == Removal::Pending {
+                return Err(CatalogError::Conflict(format!(
+                    "repository '{id}' is still being removed (its files are held); try again later"
+                )));
+            }
+            if dir.exists() {
+                return Err(CatalogError::Conflict(format!(
+                    "{} exists already and is no repository of the catalogue",
+                    dir.display()
+                )));
+            }
+            std::fs::create_dir_all(&dir)
+                .map_err(|error| CatalogError::Store(format!("{}: {error}", dir.display())))?;
+            write_settings(&dir.join(SETTINGS_FILE), &settings)?;
         }
+        let repository = match self.start(id, settings) {
+            Ok(repository) => repository,
+            Err(error) => {
+                if let Some(root) = &self.root {
+                    self.remove_files(root, id);
+                }
+                return Err(CatalogError::Store(error));
+            }
+        };
         self.others.write().insert(id.to_owned(), repository);
         Ok(())
     }
 
-    /// Removes repository `id` and its data. The default repository stays.
-    pub fn delete(&self, id: &str) -> Result<(), CatalogError> {
+    /// Removes repository `id` and its data (one that didn't open too); the default
+    /// repository stays. Its tombstone is written first; then it leaves the catalogue, its
+    /// write path is retired, and its files are deleted, at once or, while requests in
+    /// flight hold them, at the next start ([`Removal::Pending`]).
+    pub fn delete(&self, id: &str) -> Result<Removal, CatalogError> {
         if id == DEFAULT_REPOSITORY {
             return Err(CatalogError::Invalid(
                 "the default repository can't be removed".to_owned(),
             ));
         }
-        let Some(repository) = self.others.write().remove(id) else {
+        let _reservation = self.reserve(id)?;
+        let repository = self.others.read().get(id).cloned();
+        if repository.is_none() && !self.unavailable.read().contains_key(id) {
             return Err(CatalogError::NotFound(format!("no repository '{id}'")));
-        };
-        // The store goes with the last request that holds it; its files after that. The
-        // directory is renamed first (at once), so that files still held (mapped
-        // checkpoints of a request in flight, on Windows) leave a `.trash-` directory the
-        // next start deletes, not a broken repository.
-        drop(repository);
+        }
+        let _lifecycle = repository.as_ref().map(|r| r.lifecycle.lock());
         if let Some(root) = &self.root {
-            let dir = root.join(id);
-            let trash = (0..)
-                .map(|n| root.join(format!("{TRASH}{id}-{n}")))
-                .find(|path| !path.exists())
-                .expect("a free name");
-            let doomed = match std::fs::rename(&dir, &trash) {
-                Ok(()) => trash,
-                Err(error) => {
-                    tracing::warn!(dir = %dir.display(), %error, "repository directory not renamed");
-                    dir
+            let tombstone = tombstone(root, id);
+            match crate::metadata::write(&tombstone, b"") {
+                Ok(()) => {}
+                // The tombstone is in place: the removal is decided, whether it lasts or not.
+                Err(error) if error.renamed => {
+                    tracing::warn!(file = %tombstone.display(), %error, "tombstone not made durable");
                 }
-            };
-            if let Err(error) = std::fs::remove_dir_all(&doomed) {
-                tracing::warn!(dir = %doomed.display(), %error, "repository files not removed yet; deleted at the next start");
+                Err(error) => {
+                    return Err(CatalogError::Store(format!(
+                        "{}: {error}",
+                        tombstone.display()
+                    )));
+                }
             }
         }
-        Ok(())
+        self.others.write().remove(id);
+        self.unavailable.write().remove(id);
+        // The store goes with the last request that holds it, and takes no more writes.
+        if let Some(repository) = &repository {
+            repository.pipeline.read().retire();
+        }
+        Ok(match &self.root {
+            Some(root) => self.reclaim(root, id),
+            None => Removal::Reclaimed,
+        })
+    }
+
+    /// Removes the files of repository `id`, which isn't in the catalogue: tombstoned,
+    /// then reclaimed.
+    fn remove_files(&self, root: &std::path::Path, id: &str) {
+        let tombstone = tombstone(root, id);
+        if let Err(error) = crate::metadata::write(&tombstone, b"") {
+            tracing::warn!(file = %tombstone.display(), %error, "tombstone not written");
+        }
+        self.reclaim(root, id);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{TRASH, existing, valid};
+
+    /// Executed with a real pre-change build to produce the fixture, then with the
+    /// candidate to reopen a private copy. Ordinary tests need no old executable.
+    #[test]
+    #[ignore = "requires a fixture written by the pinned pre-change implementation"]
+    fn old_value_check_closures_rebuild_with_the_same_rules() {
+        use super::{Catalog, RepositoryRules, RepositorySettings};
+        use crate::{
+            ConsistencyStatus, MutationCommand, MutationTicket, Requester, SparqlUpdateRequest,
+            StoreConfig, StoreService,
+        };
+        use nrese_reasoner::ReasonerConfig;
+
+        fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+        let source = std::path::PathBuf::from(
+            std::env::var_os("NRESE_LEGACY_CLOSURES").expect("fixture path"),
+        );
+        let writing = std::env::var_os("NRESE_WRITE_LEGACY_CLOSURES").is_some();
+        let private = tempfile::tempdir().unwrap();
+        let root = if writing {
+            assert!(!source.exists(), "never overwrite the original fixture");
+            source.clone()
+        } else {
+            copy_tree(&source, private.path());
+            private.path().to_path_buf()
+        };
+        let prefixes = "PREFIX ex: <http://example.com/> PREFIX owl: <http://www.w3.org/2002/07/owl#> \
+            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
+        let guarded = "@prefix ex: <http://example.com/> . @prefix log: <http://www.w3.org/2000/10/swap/log#> .\n\
+            { ?x ex:p ?z . ?y ex:p ?z . ?x log:notEqualTo ?y } => { ?x ex:q ?z } .";
+        let plain = "@prefix ex: <http://example.com/> . { ?x ex:p ?z } => { ?x ex:q ?z } .";
+        let ask = |store: &StoreService| {
+            let result = store
+                .execute_query_str(&format!("{prefixes}ASK {{ ex:a ex:q ex:z }}"))
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&result.payload).unwrap()["boolean"] == true
+        };
+        for (mode, representatives, compact) in [
+            ("replicate", false, false),
+            ("representatives", true, false),
+            ("compact", true, true),
+        ] {
+            let dir = root.join(mode);
+            let config = StoreConfig {
+                equality_by_representatives: representatives,
+                equality_compact: compact,
+                query_cache_bytes: 0,
+                ..StoreConfig::on_disk(&dir)
+            };
+            let catalog = Catalog::open(
+                StoreService::new(config).unwrap(),
+                ReasonerConfig::default(),
+            )
+            .unwrap();
+            let metadata = dir.join("legacy-evidence.json");
+            if writing {
+                let mut evidence = serde_json::Map::new();
+                for (id, reasoning, rules, data) in [
+                    (
+                        "guarded",
+                        "owl2-rl",
+                        Some(guarded),
+                        "ex:a ex:p ex:z . ex:b ex:p ex:z . ex:a owl:sameAs ex:b",
+                    ),
+                    (
+                        "datatype",
+                        "rdfs",
+                        None,
+                        "ex:age rdfs:range xsd:integer . ex:a ex:age \"abc\"^^xsd:integer",
+                    ),
+                    ("plain", "custom", Some(plain), "ex:a ex:p ex:z"),
+                ] {
+                    let settings = RepositorySettings {
+                        reasoning: Some(reasoning.to_owned()),
+                        rules: rules.map(|text| RepositoryRules {
+                            name: "upgrade.n3".to_owned(),
+                            format: "n3".to_owned(),
+                            text: text.to_owned(),
+                        }),
+                        ..RepositorySettings::default()
+                    };
+                    let program = settings
+                        .reasoner_config()
+                        .unwrap()
+                        .unwrap()
+                        .materialised_program()
+                        .unwrap();
+                    catalog.create(id, settings).unwrap();
+                    let repository = catalog.get(id).unwrap();
+                    let pipeline = std::sync::Arc::clone(&*repository.pipeline.read());
+                    let store = pipeline.store();
+                    // Import through the existing pipeline, then replace the inferred
+                    // stack by full materialisation. The historical commit path could
+                    // derive guarded heads that the full materialiser then lost.
+                    pipeline
+                        .apply(
+                            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                                "{prefixes}INSERT DATA {{ {data} }}"
+                            ))),
+                            &Requester::all(),
+                            &MutationTicket::new(),
+                        )
+                        .unwrap();
+                    let report = store.rematerialise(&program).unwrap();
+                    assert_eq!(report.violations, 0, "old {mode}/{id}");
+                    let state = store.reasoning_state().unwrap();
+                    assert!(store.reasoning_is_current(&program));
+                    if id == "guarded" {
+                        assert_eq!(ask(store), !representatives, "old guard closure");
+                    }
+                    if id == "plain" {
+                        assert!(ask(store), "unchanged control");
+                    }
+                    evidence.insert(id.to_owned(), serde_json::json!({ "fingerprint": state.fingerprint,
+                        "revision": store.current_revision(), "rules": program.name(), "violations": state.violations }));
+                }
+                std::fs::write(metadata, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+            } else {
+                let evidence: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(metadata).unwrap()).unwrap();
+                for id in ["guarded", "datatype", "plain"] {
+                    let repository = catalog.get(id).expect("legacy repository reopens");
+                    let pipeline = std::sync::Arc::clone(&*repository.pipeline.read());
+                    let store = pipeline.store();
+                    let state = store.reasoning_state().unwrap();
+                    let settings = repository.settings.read().clone();
+                    let program = settings
+                        .reasoner_config()
+                        .unwrap()
+                        .unwrap()
+                        .materialised_program()
+                        .unwrap();
+                    assert!(store.reasoning_is_current(&program), "{mode}/{id}");
+                    let old = evidence[id]["fingerprint"].as_u64().unwrap();
+                    if id == "plain" {
+                        assert_eq!(state.fingerprint, old, "unaffected custom fingerprint");
+                        assert_eq!(
+                            store.current_revision(),
+                            evidence[id]["revision"].as_u64().unwrap(),
+                            "unaffected closure was reused"
+                        );
+                        assert!(ask(store));
+                    } else {
+                        assert_ne!(
+                            state.fingerprint, old,
+                            "old semantics must be stale: {mode}/{id}"
+                        );
+                        if id == "guarded" {
+                            assert!(ask(store), "missing guarded heads rebuilt: {mode}");
+                        }
+                        if id == "datatype" {
+                            assert!(
+                                matches!(store.consistency(), ConsistencyStatus::Inconsistent { violations } if violations > 0),
+                                "old zero-violation marker rebuilt: {mode}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_disk(dir: &std::path::Path) -> super::Catalog {
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir)).unwrap();
+        super::Catalog::open(store, nrese_reasoner::ReasonerConfig::default()).unwrap()
+    }
+
+    /// A removal whose tombstone can't be removed (held or protected; a failed sync of the
+    /// directory too) keeps the id taken: a repository created under it would be reclaimed
+    /// by the next start, its acknowledged writes with it (Sol, r2 of the store lifecycle).
+    /// After a start has removed the tombstone the id is free, and what is written to the new
+    /// repository stays across restarts.
+    #[test]
+    fn an_id_whose_tombstone_stays_is_not_reused_until_a_start() {
+        use super::{CatalogError, RepositorySettings};
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = on_disk(dir.path());
+        catalog
+            .create("probe", RepositorySettings::default())
+            .unwrap();
+        // The fault stays on through the creation: on Windows the removal's rename fails first
+        // (the store is still open), and the creation's own reclaim then reaches the tombstone.
+        crate::metadata::tests::FAIL_REMOVE.set(true);
+        let removal = catalog.delete("probe");
+        let recreated = catalog.create("probe", RepositorySettings::default());
+        crate::metadata::tests::FAIL_REMOVE.set(false);
+        assert_eq!(removal.unwrap(), super::Removal::Pending);
+        assert!(
+            matches!(recreated, Err(CatalogError::Conflict(_))),
+            "{recreated:?}"
+        );
+        drop(catalog);
+        let catalog = on_disk(dir.path());
+        catalog
+            .create("probe", RepositorySettings::default())
+            .unwrap();
+        let pipeline = std::sync::Arc::clone(&*catalog.get("probe").unwrap().pipeline.read());
+        pipeline
+            .apply(
+                crate::MutationCommand::Update(crate::SparqlUpdateRequest::new(
+                    "INSERT DATA { <urn:a> <urn:p> <urn:b> }",
+                )),
+                &crate::Requester::all(),
+                &crate::MutationTicket::new(),
+            )
+            .expect("acknowledged");
+        drop(pipeline);
+        drop(catalog);
+        let catalog = on_disk(dir.path());
+        let store = std::sync::Arc::clone(
+            catalog
+                .get("probe")
+                .expect("the new repository is kept")
+                .pipeline
+                .read()
+                .store(),
+        );
+        let answer = store
+            .execute_query_str("ASK { <urn:a> <urn:p> <urn:b> }")
+            .unwrap();
+        assert!(String::from_utf8(answer.payload).unwrap().contains("true"));
+    }
+
+    /// A tombstone unlinked without the directory sync (R3-1, Sol r3 of the store lifecycle):
+    /// its absence isn't durable, and a restart doesn't make it so. A creation of the id after
+    /// a restart, with the directory still unsyncable, is refused (a crash could bring the
+    /// tombstone back, and the next start would reclaim the new repository). Once the
+    /// directory syncs, the id is reused, and what is written to it stays across restarts.
+    /// The fault stays on through the restarts: on Windows the removal's rename fails first
+    /// (the store is still open), and the next start's reclaim does the unlink.
+    #[test]
+    fn an_id_is_reused_only_after_its_tombstones_removal_is_durable() {
+        use super::{CatalogError, RepositorySettings};
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = on_disk(dir.path());
+        catalog
+            .create("probe", RepositorySettings::default())
+            .unwrap();
+        crate::metadata::tests::FAIL_DIR_SYNC.set(true);
+        let removal = catalog.delete("probe");
+        drop(catalog);
+        // Two starts with the directory unsyncable: by the second, no tombstone is visible and
+        // nothing in memory remembers the removal.
+        drop(on_disk(dir.path()));
+        let catalog = on_disk(dir.path());
+        let recreated = catalog.create("probe", RepositorySettings::default());
+        crate::metadata::tests::FAIL_DIR_SYNC.set(false);
+        assert!(removal.is_ok(), "{removal:?}");
+        let root = dir.path().join("repositories");
+        assert!(
+            !root.join("~removed-probe").exists(),
+            "unlinked, not durably"
+        );
+        // Refused by the barrier itself (not by a later write the fault also fails), before
+        // anything is made.
+        assert!(
+            matches!(&recreated, Err(CatalogError::Store(why)) if why.contains("until the directory can be synced")),
+            "{recreated:?}"
+        );
+        assert!(!root.join("probe").exists(), "nothing made");
+        catalog
+            .create("probe", RepositorySettings::default())
+            .unwrap();
+        let pipeline = std::sync::Arc::clone(&*catalog.get("probe").unwrap().pipeline.read());
+        pipeline
+            .apply(
+                crate::MutationCommand::Update(crate::SparqlUpdateRequest::new(
+                    "INSERT DATA { <urn:a> <urn:p> <urn:b> }",
+                )),
+                &crate::Requester::all(),
+                &crate::MutationTicket::new(),
+            )
+            .expect("acknowledged");
+        drop(pipeline);
+        drop(catalog);
+        let catalog = on_disk(dir.path());
+        let store = std::sync::Arc::clone(
+            catalog
+                .get("probe")
+                .expect("the new repository is kept")
+                .pipeline
+                .read()
+                .store(),
+        );
+        let answer = store
+            .execute_query_str("ASK { <urn:a> <urn:p> <urn:b> }")
+            .unwrap();
+        assert!(String::from_utf8(answer.payload).unwrap().contains("true"));
+    }
+
+    /// A repository whose store became unavailable after it opened (here: namespaces written
+    /// but not made durable) is unavailable wherever the catalogue is asked: not served,
+    /// not listed as serving, listed unavailable with why (Sol, r2 of the store lifecycle).
+    #[test]
+    fn a_repository_whose_store_became_unavailable_is_not_served() {
+        use super::RepositorySettings;
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = on_disk(dir.path());
+        catalog
+            .create("probe", RepositorySettings::default())
+            .unwrap();
+        let store = std::sync::Arc::clone(catalog.get("probe").unwrap().pipeline.read().store());
+        crate::metadata::tests::FAIL_DIR_SYNC.set(true);
+        let written = store.namespaces().set("ex", "http://example.com/");
+        crate::metadata::tests::FAIL_DIR_SYNC.set(false);
+        assert!(written.is_err());
+        assert!(catalog.get("probe").is_none(), "served");
+        assert!(catalog.list().is_empty(), "listed as serving");
+        let why = catalog.unavailable("probe").expect("unavailable");
+        assert!(why.contains("restart"), "{why}");
+        assert_eq!(catalog.unavailable_list().len(), 1);
+    }
+
+    /// A change whose settings file is in place but not made durable (the directory sync
+    /// after the rename failed) leaves the repository unavailable until a restart: the
+    /// error doesn't mean "as before", nor "as after".
+    #[test]
+    fn settings_written_but_not_durable_make_the_repository_unavailable() {
+        use super::{Catalog, RepositorySettings};
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir.path())).unwrap();
+        let catalog = Catalog::open(store, nrese_reasoner::ReasonerConfig::default()).unwrap();
+        catalog
+            .create("probe", RepositorySettings::default())
+            .unwrap();
+        let titled = RepositorySettings {
+            title: Some("renamed".to_owned()),
+            ..RepositorySettings::default()
+        };
+        crate::metadata::tests::FAIL_DIR_SYNC.set(true);
+        let result = catalog.change("probe", titled);
+        crate::metadata::tests::FAIL_DIR_SYNC.set(false);
+        assert!(result.is_err());
+        assert!(catalog.get("probe").is_none(), "served as if unchanged");
+        let why = catalog.unavailable("probe").expect("unavailable");
+        assert!(
+            why.contains("repository.json") && why.contains("restart"),
+            "{why}"
+        );
+    }
 
     #[test]
     fn repository_ids() {

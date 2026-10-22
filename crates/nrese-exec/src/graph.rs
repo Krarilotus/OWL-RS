@@ -122,7 +122,7 @@ pub fn closure(
     reflexive: bool,
     budget: &std::sync::Arc<crate::Budget>,
 ) -> Result<IdTable, crate::BudgetExceeded> {
-    let mut out = IdTable::new(2);
+    let mut out = IdTable::charged(2, 0, budget)?;
     for start in starts {
         for end in reachable(start, reflexive, |node, buffer| {
             buffer.extend_from_slice(adjacency.neighbours(node))

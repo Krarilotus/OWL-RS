@@ -325,8 +325,12 @@ fn client(config: &ReplicationConfig) -> anyhow::Result<(reqwest::Client, String
         .ok_or_else(|| {
             anyhow::anyhow!("replication.mode = \"replica\" needs replication.primary")
         })?;
+    // No redirects: the replica's bearer token (an administrator's) would follow one, and
+    // reqwest keeps Authorization when only the scheme changes (https://p:8443 ->
+    // http://p:8443 sends it in clear). `replication.primary` names the primary itself.
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()?;
     Ok((client, primary))
 }
@@ -340,6 +344,10 @@ fn authorised(
         None => request,
     }
 }
+
+/// What a replica's download of the primary's image is called while it comes, in a
+/// directory of its own.
+const STAGED_IMAGE: &str = "image.download";
 
 /// A replica's start: if `data_dir` holds no store, the primary's image placed there.
 /// Returns the image's revision, or `None` if a store was already there (the replica
@@ -378,23 +386,25 @@ pub async fn bootstrap(config: &ReplicationConfig, data_dir: &Path) -> anyhow::R
             .and_then(|v| v.to_str().ok())
             .ok_or_else(|| anyhow::anyhow!("the image came without its manifest"))?,
     )?;
+    // The name comes from the primary: checked before anything, and the download staged
+    // under a name of this side's.
+    manifest
+        .image_name()
+        .map_err(|error| anyhow::anyhow!("{primary}: {error}"))?;
     std::fs::create_dir_all(data_dir)?;
     let incoming = tempfile::tempdir_in(data_dir)?;
+    let staged = incoming.path().join(STAGED_IMAGE);
     {
         use std::io::Write;
-        let mut file = std::fs::File::create(incoming.path().join(&manifest.file))?;
+        let mut file = std::fs::File::create(&staged)?;
         let mut response = response;
         while let Some(chunk) = response.chunk().await? {
             file.write_all(&chunk)?;
         }
         file.sync_all()?;
     }
-    std::fs::write(
-        incoming.path().join(nrese_store::image_backup::MANIFEST),
-        serde_json::to_vec_pretty(&manifest)?,
-    )?;
     // Checks the image against its manifest and places it.
-    let placed = nrese_store::restore_image(incoming.path(), data_dir)
+    let placed = nrese_store::image_backup::place_image(&staged, manifest, data_dir)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     Ok(Some(placed.revision))
 }
@@ -485,4 +495,84 @@ pub fn log_headers(headers: &HeaderMap) -> (u64, u64, u64) {
             .unwrap_or(0)
     };
     (get(RECORDS), get(LAST), get(LATEST))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::http::{HeaderMap, StatusCode, header};
+    use axum::response::IntoResponse;
+
+    use super::*;
+
+    /// A listener that records the Authorization of every request, answering 500; its URL.
+    async fn recorder(seen: &Arc<Mutex<Vec<Option<String>>>>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let record = Arc::clone(seen);
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move |headers: HeaderMap| {
+                let record = Arc::clone(&record);
+                async move {
+                    let bearer = headers
+                        .get(header::AUTHORIZATION)
+                        .map(|value| format!("{value:?}"));
+                    record.lock().unwrap().push(bearer);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+            });
+            axum::serve(listener, app).await.unwrap();
+        });
+        url
+    }
+
+    /// A primary that answers every request with a redirect to `target`; its URL.
+    async fn redirecting(target: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let app = axum::Router::new().fallback(move || {
+                let target = target.clone();
+                async move {
+                    (StatusCode::TEMPORARY_REDIRECT, [(header::LOCATION, target)]).into_response()
+                }
+            });
+            axum::serve(listener, app).await.unwrap();
+        });
+        url
+    }
+
+    /// A replica follows no redirect, so its token reaches only the configured primary:
+    /// neither the bootstrap request nor the client the log requests use (`follow`) goes
+    /// where a redirect points. (A redirect that only downgrades the scheme would keep
+    /// Authorization; refusing every redirect covers it without TLS in the test.)
+    #[tokio::test]
+    async fn a_replica_sends_its_token_nowhere_a_redirect_points() {
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let elsewhere = recorder(&seen).await;
+        let primary = redirecting(format!("{elsewhere}/")).await;
+        let config = ReplicationConfig {
+            mode: ReplicationMode::Replica,
+            primary: Some(primary.clone()),
+            token: Some("replica-token".to_owned()),
+            ..ReplicationConfig::default()
+        };
+        let data = tempfile::tempdir().unwrap();
+        assert!(bootstrap(&config, data.path()).await.is_err());
+        let (client, base) = client(&config).unwrap();
+        let log = authorised(
+            client.get(format!("{base}/api/v1/replication/log?after=0")),
+            &config,
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(log.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+    }
 }

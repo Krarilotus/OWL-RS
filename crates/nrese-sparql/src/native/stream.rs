@@ -173,7 +173,7 @@ impl Context<'_> {
                 // A constant the store doesn't know: no rows.
                 None => {
                     return self.group_solutions(
-                        self.empty_of(plan.patterns),
+                        self.empty_of(plan.patterns)?,
                         variables,
                         aggregates,
                     );
@@ -212,7 +212,23 @@ impl Context<'_> {
         let (mut from, mut size) = (0, self.stream_rows.unwrap_or(FIRST_MORSEL_ROWS).max(1));
         // A morsel's rows at a quarter of the memory left (they are copied, filtered and
         // grouped), each row a word per variable.
-        let width = self.empty_of(plan.patterns).vars.len().max(1);
+        // Scan slots already own these names, including blank-node aliases. Count
+        // subject/predicate/object variables without allocating or constructing a table.
+        // Like the former names Vec's contains checks, this is quadratic in query size.
+        let names = || {
+            scans
+                .iter()
+                .flat_map(|scan| scan.slots[..3].iter())
+                .filter_map(|slot| match slot {
+                    Slot::Var(variable) => Some(variable),
+                    _ => None,
+                })
+        };
+        let width = names()
+            .enumerate()
+            .filter(|(at, name)| !names().take(*at).any(|earlier| earlier == *name))
+            .count()
+            .max(1);
         let target = (self.budget.remaining() / (width * 8 * 4)).clamp(1024, MORSEL_TARGET_ROWS);
         let total = seeds.table.len();
         while from < total {
@@ -262,7 +278,7 @@ impl Context<'_> {
         self.consumed(seeds);
         if partials.is_empty() {
             // No rows at all: the GROUP BY of nothing (one empty group without keys).
-            return self.group_solutions(self.empty_of(plan.patterns), variables, aggregates);
+            return self.group_solutions(self.empty_of(plan.patterns)?, variables, aggregates);
         }
         let merged = self.merge_partials(partials, variables, plan)?;
         // The aggregates' columns, by their targets.
@@ -301,7 +317,7 @@ impl Context<'_> {
     }
 
     /// No rows, with the columns of `patterns`' variables.
-    fn empty_of(&self, patterns: &[TriplePattern]) -> Solutions {
+    fn empty_of(&self, patterns: &[TriplePattern]) -> NativeResult<Solutions> {
         let mut vars = Vec::new();
         for triple in patterns {
             for v in triple_variables(triple) {
@@ -310,10 +326,10 @@ impl Context<'_> {
                 }
             }
         }
-        Solutions {
-            table: IdTable::new(vars.len()),
+        Ok(Solutions {
+            table: IdTable::charged(vars.len(), 0, &self.budget)?,
             vars,
             ordered: false,
-        }
+        })
     }
 }

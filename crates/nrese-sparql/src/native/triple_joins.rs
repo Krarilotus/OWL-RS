@@ -199,7 +199,7 @@ impl Context<'_> {
         let mut keep = Vec::with_capacity(rows);
         // The bound values of the kept rows, charged as they grow (refused: undecided here,
         // as for a row not decided on ids).
-        let mut columns = IdTable::new(link.binds.len());
+        let mut columns = IdTable::charged(link.binds.len(), 0, &self.budget).ok()?;
         let mut values = vec![UNDEF; link.binds.len()];
         let snapshot: &Snapshot = &self.snapshot;
         for row in 0..rows {

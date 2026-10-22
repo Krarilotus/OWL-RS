@@ -11,9 +11,10 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 SUITE = Path(__file__).resolve().parent.parent
@@ -172,11 +173,68 @@ class Running(unittest.TestCase):
         self.assertEqual(done["turns"], 2)
         self.assertIn("2", (Path(done["results"]) / "queue-2.log").read_text())
 
+    @unittest.skipUnless(Path("/proc").is_dir(), "the quiet watcher watches /proc (Linux)")
+    def test_a_timed_chunk_neither_starts_over_unresolved_suspensions_nor_passes_when_its_watcher_left_some(self):
+        """Sol, 20 Oct 2026: the queue started the timed command before reconciling an earlier
+        watcher's record, and ran it on when that failed; nor did a watcher left with
+        suspensions fail the chunk."""
+        q = queue.Queue(self.q.directory, self.repo, self.q.results, self.q.worktrees, watch=True)
+        marker = Path(self.tmp.name) / "ran"
+        command = [[sys.executable, "-c", f"import pathlib; pathlib.Path({str(marker)!r}).write_text('ran')"]]
+        quiet = q.results / "j" / "quiet"
+        quiet.mkdir(parents=True)
+        (quiet / "frozen").write_text("pid 51\n")  # no start time: it can't be settled
+        path, found = self.submit(command)
+        self.assertEqual(q.run(path, found, self.retreat), "failed")
+        note = queue.read_job(q.directory / "failed" / "j.toml")["note"]
+        self.assertEqual((marker.exists(), (quiet / "frozen").read_text()), (False, "pid 51\n"))
+        self.assertIn("couldn't be resumed", note)
+
+        class Watcher:  # the chunk's own watcher, which ends having left something suspended
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 1
+        (quiet / "frozen").unlink()
+        subprocess.run(["git", "-C", str(self.repo), "branch", "-f", "queue/j", "HEAD"], check=True)
+        path, found = self.submit(command)
+        with patch.object(queue, "quiet_watch", lambda *a: Watcher()):
+            self.assertEqual(q.run(path, found, self.retreat), "failed")
+        self.assertTrue(marker.exists())
+        self.assertIn("left suspensions", queue.read_job(q.directory / "failed" / "j.toml")["note"])
+
     def test_a_chunk_past_its_limit_is_stopped_and_the_job_must_be_split(self):
+        # The limit (1.5 x 20 min) runs out when the test says: the chunk's first timed wait
+        # reports it over at once. The real chunk, asleep for 30 s, is stopped and reaped.
+        children, limits = [], []
+
+        class Chunk(subprocess.Popen):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                children.append(self)
+
+            def wait(self, timeout=None):
+                if timeout is not None and not limits:
+                    limits.append(timeout)
+                    raise subprocess.TimeoutExpired(self.args, timeout)
+                return super().wait(timeout)
+
         path, found = self.submit([[sys.executable, "-c", "import time; time.sleep(30)"]])
-        started = time.monotonic()
-        self.assertEqual(self.q.run(path, found, self.retreat, chunk_min=0.02), "failed")
-        self.assertLess(time.monotonic() - started, 20)
+        states = []
+        with patch.object(queue, "subprocess", SimpleNamespace(**{**vars(subprocess), "Popen": Chunk})):
+            runner = threading.Thread(
+                target=lambda: states.append(self.q.run(path, found, self.retreat, chunk_min=20)), daemon=True)
+            runner.start()
+            runner.join(60)  # contains a stop that never happens
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+        self.assertFalse(runner.is_alive(), "the limit didn't stop the chunk")
+        self.assertEqual(states, ["failed"])
+        self.assertEqual(limits, [20 * 1.5 * 60])
+        [child] = children
+        self.assertNotIn(child.returncode, (None, 0), "the chunk was stopped and reaped")
         self.assertIn("split it", queue.read_job(self.q.directory / "failed" / "j.toml")["note"])
 
 

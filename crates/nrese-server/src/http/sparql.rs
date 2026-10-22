@@ -9,7 +9,7 @@ use crate::error::ApiError;
 use crate::http::media::{BOOLEAN, GRAPHS, SOLUTIONS, negotiated};
 use crate::http::mutation;
 use crate::http::requests::{Explain, QueryOperation, UpdateOperation};
-use crate::http::result_stream::stream_blocking;
+use crate::http::result_stream::{Pace, stream_blocking};
 use crate::policy::PolicyConfig;
 use crate::state::AppState;
 
@@ -40,9 +40,7 @@ pub async fn execute_query_in(
 
     let explain = operation.explain;
     let origin = operation.origin.clone();
-    let mut request = build_query_request(operation);
-    let memory = policy.limits.max_query_memory_bytes;
-    request.memory_limit = (memory > 0).then_some(memory);
+    let request = build_query_request(operation, &policy.limits);
     // Prefixes it doesn't declare mean what the repository's namespaces say.
     let mut prepared = state
         .store()
@@ -64,7 +62,7 @@ pub async fn execute_query_in(
         // Statistics only, nothing evaluated; under the deadline as evaluation is: planning
         // a large pattern stops when the deadline cancels it.
         return stream_blocking(
-            deadline,
+            Pace::Total(deadline),
             cancellation,
             "application/json",
             QUERY_TIMEOUT_MESSAGE,
@@ -80,7 +78,7 @@ pub async fn execute_query_in(
     }
     if explain == Explain::Analyze {
         return stream_blocking(
-            deadline,
+            Pace::Total(deadline),
             cancellation,
             "application/json",
             QUERY_TIMEOUT_MESSAGE,
@@ -103,7 +101,7 @@ pub async fn execute_query_in(
         *slot.lock().unwrap_or_else(|p| p.into_inner()) = r;
     };
     let mut response = stream_blocking(
-        deadline,
+        Pace::Total(deadline),
         cancellation,
         media_type,
         QUERY_TIMEOUT_MESSAGE,
@@ -119,10 +117,18 @@ pub async fn execute_query_in(
     )
     .await?;
     if let Some(report) = status.lock().unwrap_or_else(|p| p.into_inner()).take() {
-        response.headers_mut().insert(
+        let headers = response.headers_mut();
+        headers.insert(
             COMPLETENESS,
             axum::http::HeaderValue::from_str(&report.header())
                 .unwrap_or_else(|_| axum::http::HeaderValue::from_static(report.as_str())),
+        );
+        // Readable by a console on another origin too (CORS hides other response headers),
+        // so an incomplete answer never shows as a complete one there; appended, so what a
+        // proxy exposes besides stays exposed.
+        headers.append(
+            axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            axum::http::HeaderValue::from_static(COMPLETENESS),
         );
     }
     Ok(response)
@@ -281,9 +287,7 @@ pub async fn execute_update(
     state
         .policy()
         .enforce_update_bytes(operation.update.len())?;
-    let mut request = SparqlUpdateRequest::new(operation.update);
-    request.using_graphs = operation.using_graphs;
-    request.using_named_graphs = operation.using_named_graphs;
+    let request = build_update_request(operation, &state.policy().limits);
     mutation::run(
         &state,
         MutationCommand::Update(request),
@@ -309,13 +313,32 @@ fn negotiate_formats(
     })
 }
 
-fn build_query_request(operation: QueryOperation) -> SparqlQueryRequest {
+/// An update request with the server's planner setting, as [`build_query_request`] gives
+/// a query's.
+fn build_update_request(
+    operation: UpdateOperation,
+    limits: &crate::policy::RequestLimits,
+) -> SparqlUpdateRequest {
+    let mut request = SparqlUpdateRequest::new(operation.update);
+    request.using_graphs = operation.using_graphs;
+    request.using_named_graphs = operation.using_named_graphs;
+    request.planner = limits.planner;
+    request
+}
+
+fn build_query_request(
+    operation: QueryOperation,
+    limits: &crate::policy::RequestLimits,
+) -> SparqlQueryRequest {
     let mut request = SparqlQueryRequest::new(
         operation.query,
         nrese_store::ReadScope::of(operation.access),
     );
     request.default_graphs = operation.default_graphs;
     request.named_graphs = operation.named_graphs;
+    let memory = limits.max_query_memory_bytes;
+    request.memory_limit = (memory > 0).then_some(memory);
+    request.planner = limits.planner;
     // GraphDB's `infer=false`: explicit statements only.
     if operation.infer == Some(false) {
         request.read_model = Some(nrese_store::ReadModel::Asserted);
@@ -329,6 +352,55 @@ mod tests {
     use nrese_store::{GraphResultFormat, QueryResultKind, SolutionsResultFormat};
 
     use super::negotiate_formats;
+
+    #[test]
+    fn planner_policy_reaches_queries_and_both_explain_modes() {
+        for effort in [Some(17), None] {
+            let mut limits = crate::policy::RequestLimits::default();
+            limits.planner.greedy_effort = effort;
+            for explain in [
+                super::Explain::No,
+                super::Explain::Plan,
+                super::Explain::Analyze,
+            ] {
+                let request = super::build_query_request(
+                    super::QueryOperation {
+                        query: "SELECT * WHERE { ?s ?p ?o }".into(),
+                        explain,
+                        ..Default::default()
+                    },
+                    &limits,
+                );
+                assert_eq!(request.planner.greedy_effort, effort);
+            }
+        }
+    }
+
+    /// The server's planner setting reaches every update request it builds: SPARQL 1.1
+    /// Protocol updates, and RDF4J's (repository, statements and transaction updates).
+    #[test]
+    fn planner_policy_reaches_updates() {
+        for effort in [Some(17), None] {
+            let mut limits = crate::policy::RequestLimits::default();
+            limits.planner.greedy_effort = effort;
+            let request = super::build_update_request(
+                super::UpdateOperation {
+                    update: "DELETE WHERE { ?s ?p ?o }".into(),
+                    ..Default::default()
+                },
+                &limits,
+            );
+            assert_eq!(request.planner.greedy_effort, effort);
+            let request = crate::http::rdf4j::update(
+                &axum::extract::RawQuery(None),
+                &axum::http::HeaderMap::new(),
+                &axum::body::Bytes::from_static(b"DELETE WHERE { ?s ?p ?o }"),
+                limits.planner,
+            )
+            .expect("an update in the body");
+            assert_eq!(request.planner.greedy_effort, effort);
+        }
+    }
 
     #[test]
     fn the_query_form_decides_which_formats_are_negotiated() {

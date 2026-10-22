@@ -504,7 +504,7 @@ fn both_stacks_survive_checkpoints_and_reopening() {
     let mut rng = Rng(fuzz(99));
     let mut committed = Model::default();
     for round in 0..6 {
-        let engine = Engine::open(dir.path(), config).expect("open");
+        let engine = Engine::open(dir.path(), config.clone()).expect("open");
         assert_eq!(
             intern_terms(&engine),
             (0..TERM_COUNT).map(id).collect::<Vec<_>>()
@@ -594,10 +594,12 @@ fn inferred_additions_are_read_by_that_snapshot_alone() {
 }
 
 /// A mask of hidden inferred statements carried across a commit by a run per change:
-/// reads see exactly the statements neither hidden nor gone, counts included.
+/// reads see exactly the statements neither hidden nor gone, counts included. What the
+/// masks and views make stays charged until the last of them lets it go.
 #[test]
 fn inferred_masks_stack_across_commits() {
     use nrese_engine::InferredMask;
+    let budget = std::sync::Arc::new(nrese_exec::Budget::unlimited());
     let engine = engine();
     let quad = |o: u64| triple(1, 2, o).in_default_graph();
     let infer = |tx: &mut Transaction<'_>, o: u64| {
@@ -611,8 +613,11 @@ fn inferred_masks_stack_across_commits() {
     tx.commit().expect("commit");
     let first = engine.snapshot();
     // Hide 6, 7, 8.
-    let mask = InferredMask::hiding(&first, &[quad(6), quad(7), quad(8)]);
-    let view = first.with_inferred_mask(&mask).expect("same layout");
+    let first_mask = InferredMask::hiding(&first, &[quad(6), quad(7), quad(8)], &budget).unwrap();
+    let view = first
+        .with_inferred_mask(&first_mask, &budget)
+        .unwrap()
+        .expect("same layout");
     let seen = |view: &Snapshot| -> Vec<u64> {
         scan(view, ReadModel::Inferred)
             .into_iter()
@@ -632,9 +637,15 @@ fn inferred_masks_stack_across_commits() {
     tx.commit().expect("commit");
     let second = engine.snapshot();
     // Now hidden: 6 still, 11 newly; 8 shown again; 7 gone.
-    let mask = mask.changed(&second, &[quad(11)], &[quad(8), quad(7)]);
+    let mask = first_mask
+        .changed(&second, &[quad(11)], &[quad(8), quad(7)], &budget)
+        .unwrap();
     assert_eq!(mask.runs(), 2);
-    let view = second.with_inferred_mask(&mask).expect("same layout");
+    drop((first_mask, view));
+    let view = second
+        .with_inferred_mask(&mask, &budget)
+        .unwrap()
+        .expect("same layout");
     assert_eq!(seen(&view), [5, 8, 9, 10]);
     assert_eq!(view.len_in(ReadModel::Inferred), 4);
     let pattern = QuadPattern {
@@ -650,4 +661,10 @@ fn inferred_masks_stack_across_commits() {
         .expect("sorted scan")
         .collect();
     assert_eq!(sorted.len(), 4);
+    // The first run is the second mask's too: still charged, as the view over it is.
+    assert!(budget.used() > mask.charged());
+    drop(mask);
+    assert!(budget.used() > 0);
+    drop(view);
+    assert_eq!(budget.used(), 0);
 }

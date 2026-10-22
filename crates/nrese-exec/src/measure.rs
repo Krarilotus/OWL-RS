@@ -4,7 +4,9 @@
 //! budget. An allocation that wasn't reserved first, or a charge released while its memory
 //! lives, fails the test instead of needing a review, wherever in the operation it happens.
 //! Test-only: built for this crate's tests and with the `measure` feature, which test
-//! builds of other crates turn on; product builds have none of it.
+//! builds of other crates turn on; product builds have none of it. In a binary whose
+//! global allocator isn't [`Measured`], [`measure`], [`measure_within`] and [`alone`]
+//! panic, naming it: there a measurement would count nothing and pass.
 //!
 //! # What a measurement counts
 //!
@@ -81,6 +83,31 @@
 //! outside more than 62 times, or a pool of its own from outside, allocates a queue block
 //! of 1,520 bytes per 63 entries, which it counts.
 //!
+//! And a pool's threads as they start: each allocates its own queue (1,520 bytes) and, as
+//! it first looks for work, its crossbeam-epoch handle (2,304), on its own thread, when the
+//! system runs it, which under load can be well after the pool was made. [`prepare`] waits
+//! for every thread of the global pool to start before the first measurement, from outside
+//! any pool, whatever pool that measurement runs on: input built on the global pool, then
+//! a measurement on another, counted the global threads that started late, in pairs of
+//! those sizes (the GeoSPARQL guard's rare excess, attributed 20 Oct). That wait for the
+//! threads to start runs no job and lasts at most 4 seconds a pool: a global thread busy for
+//! longer, or one that never runs its part (the caller's own, if it is one, or one blocked on
+//! this preparation), is not waited for, and if it hasn't started, a measurement counts its
+//! start. A pool of a test's own is the test's: rule, start its threads before measuring
+//! (`pool.broadcast(|_| ())`), or a measurement counts those that start in it.
+//!
+//! And the preparation's own waits for the global pool, which are not bounded: outside any
+//! pool, the first measurement makes the caller's own thread state with a `rayon::join`,
+//! within the preparation that runs once per process, and every measurement aligns rayon's
+//! queue with such joins (see [`prepare`]); each waits for a thread of the global pool to run
+//! its job. A global thread that waits for that preparation, or for a lock the measuring
+//! thread holds, never does, and neither returns (Sol, measure-pool r3; the base had the same
+//! waits). So, the rule for a measured test: its first measurement is not made while a thread
+//! of a pool is entering one, and a measuring thread holds no lock a pool's job needs. In the
+//! suite's own runs it did not occur: 0 hangs in 91 runs of this module's tests recorded from
+//! 19 to 21 October 2026 (commit hooks, push gates and fleet proofs). A preparation that
+//! waits on no pool is the follow-up.
+//!
 //! Counts are `i128`: a `usize` converts exactly, and no sum of them reaches its bounds.
 //! A realloc counts the new block, then frees the old: it may move the bytes. Measurements
 //! nest (up to 8 at once); one that unwinds ends as one that returns, and no thread reads
@@ -89,6 +116,7 @@
 use std::alloc::{GlobalAlloc, Layout};
 use std::cell::UnsafeCell;
 use std::hint::spin_loop;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 
 use crate::Budget;
@@ -174,6 +202,30 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 /// Held while a measurement starts: starts publish their generations in order.
 static STARTING: AtomicBool = AtomicBool::new(false);
+/// Panics unless [`Measured`] is the process's global allocator: without it a measurement
+/// counts nothing, and passes whatever the work holds. Asked anew each time: one byte from
+/// the global allocator, uncounted, which only a [`Measured`] that is the global allocator
+/// sees (a `Measured` of the test's own, called directly, never does).
+fn require_measured() {
+    let before = UNCOUNTED.replace(Some(0));
+    let layout = Layout::new::<u8>();
+    // SAFETY: a layout of non-zero size; the block, if one was made, is freed with it.
+    unsafe {
+        let block = std::alloc::alloc(layout);
+        if !block.is_null() {
+            std::alloc::dealloc(block, layout);
+        }
+    }
+    let seen = UNCOUNTED.replace(before).is_some_and(|bytes| bytes > 0);
+    assert!(
+        seen,
+        "a measurement needs nrese_exec::measure::Measured as this test binary's global \
+         allocator, or it counts nothing and passes: add `#[global_allocator] static \
+         MEASURED: nrese_exec::measure::Measured<std::alloc::System> = \
+         nrese_exec::measure::Measured(std::alloc::System);` to the binary (a crate's unit \
+         tests are one binary, each file in tests/ another)"
+    );
+}
 
 /// The generation a block or reservation made now records.
 pub(crate) fn tag() -> u64 {
@@ -218,13 +270,14 @@ fn bytes(bytes: usize) -> i128 {
 
 thread_local! {
     /// The bytes this thread allocated uncounted, while it aligns rayon's queue
-    /// ([`prepare`]); `None` while it doesn't.
+    /// ([`prepare`]) or asks whether [`Measured`] is the global allocator; `None` while it
+    /// does neither.
     static UNCOUNTED: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// The generation a block of `size` bytes made now records, and whether it is counted: not
-/// while its thread aligns rayon's queue, whose blocks record 0, before every measurement,
-/// so that none counts their allocation or their free.
+/// while its thread aligns rayon's queue or asks for [`Measured`], whose blocks record 0,
+/// before every measurement, so that none counts their allocation or their free.
 fn block_tag(size: usize) -> (u64, bool) {
     match UNCOUNTED.try_with(std::cell::Cell::get) {
         Ok(Some(bytes)) => {
@@ -417,6 +470,11 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
 /// - parking_lot's table, which grows with the threads that park at once and never shrinks:
 ///   once per process, before the first measurement, threads at least twice the machine's
 ///   and 8 more park at once;
+/// - the global pool's threads, and the pool's the first measurement runs on, each of which
+///   allocates its state as it starts (see "Known limits"): once per process, before the
+///   first measurement, each has run a broadcast that only counts, the global pool's sent
+///   from outside any pool, the caller waiting without running any job, for at most 4
+///   seconds a pool (the joins below wait without a bound: "Known limits");
 /// - rayon's global queue, which allocates its next block on the 63rd entry from outside
 ///   the pool: before each measurement made outside the pool (nested ones too), empty
 ///   entries until one allocates its block (at most 63, about a millisecond), uncounted by
@@ -424,6 +482,7 @@ unsafe impl<A: GlobalAlloc> GlobalAlloc for Measured<A> {
 ///   global pool from outside more often, or a pool of its own from outside, still
 ///   allocates such blocks: one per 63 entries.
 fn prepare() {
+    require_measured();
     // Under Miri, which checks what the work does to memory and not what it counts (and
     // rejects parking_lot's futex call), there is nothing to prepare.
     if cfg!(miri) {
@@ -453,9 +512,34 @@ fn prepare() {
                     });
                 }
             });
-            // The global pool started, and the entering thread's state made.
-            rayon::broadcast(|_| ());
-            rayon::join(|| (), || ());
+            // Every thread of the global pool started, and of the pool the caller is on (a
+            // thread allocates as it starts: "Known limits"). The wait runs no job on the
+            // caller: a job it ran could measure, entering this preparation again, or wait
+            // for a lock the caller holds (Sol, measure-pool r2). So each pool gets a
+            // broadcast that only counts, sent without waiting, and the caller waits for the
+            // count (`started`). The global pool's is sent from outside any pool, as a
+            // broadcast reaches the pool it is made on.
+            let in_pool = rayon::current_thread_index().is_some();
+            let global = Arc::new(AtomicUsize::new(0));
+            let threads = if in_pool {
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| counted_broadcast(&global))
+                        .join()
+                        .expect("the broadcast is sent")
+                })
+            } else {
+                counted_broadcast(&global)
+            };
+            started(&global, threads);
+            if in_pool {
+                let own = Arc::new(AtomicUsize::new(0));
+                let threads = counted_broadcast(&own);
+                started(&own, threads);
+            } else {
+                // The entering thread's state, made: outside any pool, nothing it runs.
+                rayon::join(|| (), || ());
+            }
         });
     }
     if rayon::current_thread_index().is_none() {
@@ -467,6 +551,33 @@ fn prepare() {
             }
         }
     }
+}
+
+/// Sends every thread of the current pool (the global one outside any pool) a job that only
+/// counts into `count`, without waiting for it; the pool's threads.
+fn counted_broadcast(count: &Arc<AtomicUsize>) -> usize {
+    let ran = Arc::clone(count);
+    rayon::spawn_broadcast(move |_| {
+        ran.fetch_add(1, SeqCst);
+    });
+    rayon::current_num_threads()
+}
+
+/// Waits, running nothing, until `count` says each of `threads` has run its job: all but
+/// one for at most 3 seconds, then the last for at most 1 more. The caller's own thread, if
+/// it is one of them, runs its job only once it is back in its pool, so it waits for itself
+/// that 1 second; a thread that doesn't come within the time (busy for longer, so started)
+/// doesn't hold it either.
+fn started(count: &AtomicUsize, threads: usize) {
+    use std::time::{Duration, Instant};
+    let wait = |least: usize, most: Duration| {
+        let since = Instant::now();
+        while count.load(SeqCst) < least && since.elapsed() < most {
+            std::thread::yield_now();
+        }
+    };
+    wait(threads.saturating_sub(1), Duration::from_secs(3));
+    wait(threads, Duration::from_secs(1));
 }
 
 /// A running measurement; it ends when this drops, whether the measurement returns or
@@ -528,7 +639,8 @@ fn reported(count: i128) -> usize {
 }
 
 /// `work`'s result, and the most bytes it held at once: allocated while it ran and not
-/// yet freed. Without [`Measured`] installed, the count is 0.
+/// yet freed. Without [`Measured`] as the global allocator, it panics. Its preparation can
+/// wait for the global pool: mind the rule for measured tests in "Known limits".
 pub fn measure<T>(work: impl FnOnce() -> T) -> (T, usize) {
     prepare();
     let running = Running::start(None);
@@ -538,7 +650,8 @@ pub fn measure<T>(work: impl FnOnce() -> T) -> (T, usize) {
 
 /// `work`'s result, and the most bytes it held beyond what it reserved of `budget` (or a
 /// part of it) at any of its events, 0 if never beyond: what it allocated before reserving
-/// it, or still held when it released the charge.
+/// it, or still held when it released the charge. As for [`measure`], mind the rule for
+/// measured tests in "Known limits".
 pub fn measure_within<T>(budget: &Budget, work: impl FnOnce() -> T) -> (T, usize) {
     prepare();
     let running = Running::start(Some(budget));
@@ -575,6 +688,7 @@ fn alone_args(test: &str) -> [&str; 5] {
 /// is running long, allocating into the measurement (594 bytes counted, 20 Oct, a guard
 /// slowed past a minute by a loaded machine). On the main thread nothing else runs.
 pub fn alone() -> bool {
+    require_measured();
     // Miri can't start a process; it runs the tests it is given one at a time.
     if cfg!(miri) {
         return true;

@@ -1,7 +1,8 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import App from "../App";
+import * as api from "../lib/api";
 
 vi.mock("../lib/api", () => ({
   getRuntimeSnapshot: async () => ({
@@ -72,7 +73,7 @@ vi.mock("../lib/api", () => ({
     model: "gemini-2.5-flash",
     suggestions: [],
   }),
-  runQuery: async () => ({ ok: true, status: 200, body: "ok" }),
+  runQuery: vi.fn(async () => ({ ok: true, status: 200, body: "ok" })),
   runUpdate: async () => ({ ok: true, status: 204, body: "" }),
   runTell: async () => ({ ok: true, status: 204, body: "" }),
   readGraph: async () => ({ ok: true, status: 200, body: "" }),
@@ -97,4 +98,21 @@ test("renders console sections", async () => {
   expect((await screen.findAllByText(/owl-property-chain-axioms/i)).length).toBeGreaterThan(0);
   expect(await screen.findByText(/Last commit-path run/i)).toBeInTheDocument();
   expect(screen.getByText(/Inferred statements/i)).toBeInTheDocument();
+});
+
+test("answers not shown to be complete don't read as a success", async () => {
+  vi.mocked(api.runQuery).mockResolvedValueOnce({
+    ok: true,
+    status: 200,
+    body: "false",
+    completeness: { status: "sound-only", header: 'sound-only; regime=owl2-dl; reasons="dl: open"' },
+  });
+  render(
+    <QueryClientProvider client={new QueryClient()}>
+      <App />
+    </QueryClientProvider>,
+  );
+  fireEvent.click(await screen.findByRole("button", { name: /Run query/i }));
+  expect(await screen.findByText("incomplete")).toBeInTheDocument();
+  expect(screen.getByText(/answers may be missing/i)).toBeInTheDocument();
 });

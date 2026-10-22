@@ -9,6 +9,8 @@
 //!     [--rules FILE.n3] [--reason-runs 1] [--results DIR] [--routes] [--commits FILE]
 //!     [--readers 0] [--clients N --duration-s 10] [--threads N] [--export FILE]
 //!     [--canonicalize FILE]... [--prepare-vector-graph DIM:METRIC] [--read-graphs IRI,...]
+//! cargo run --release -p nrese-store --example perf_lab -- --durable NAME --store DIR [--runs 5]
+//!     [--replication COMMITS:QUADS [--store DIR] [--replication-probe swap-one]]
 //! cargo run --release -p nrese-store --example perf_lab -- generate KIND OUT [key=value]...
 //! ```
 //!
@@ -62,8 +64,18 @@
 //!   `--duration-s`. `--threads N` sizes the thread pool (1: single-threaded). `--export`
 //!   writes the store's statements, inferred ones included, as N-Triples (the closure the
 //!   stores without reasoning load). `--canonicalize` canonicalises blank nodes.
-//!   `--prepare-vector-graph 64:cosine` synchronously prepares that vector space before
-//!   query timing, recording its preparation phase and checking full graph coverage.
+//!   `--prepare-vector-graph 64:cosine` synchronously prepares what searches of that vector
+//!   space read before query timing (its vectors and the corpus of every graph's), recording
+//!   its preparation phase.
+//!   A query file ending in `.ac` holds typed text: autocompletion (the store's, ten
+//!   suggestions, inferred statements included) is timed for it.
+//!   `--then-commit FILE` applies one SPARQL update per line as a commit after the timed
+//!   runs, then runs each query once more: the report's `after_commit` (what the first
+//!   query after a commit pays, as full-text corpora do).
+//!   `--replication COMMITS:QUADS` times read replicas' log shipping: COMMITS commits of
+//!   QUADS statements on a durable primary, then per run a fresh follower catching up from
+//!   its image through the feed (`log_since`) and the apply (`apply_log`), timed apart, with
+//!   the catch-up's peak memory (`modes::replication`; under `--store DIR` when given).
 //!   `generate` writes the suite's data (`generate.rs`). A failure still writes the report, with
 //!   its `error`.
 //!
@@ -73,6 +85,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+mod durable;
 mod generate;
 mod modes;
 
@@ -81,7 +94,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, UserRules};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode, UserRules};
 use nrese_store::{
     BulkLoadRequest, CancellationToken, GraphTarget, MutationPipeline, PreparedQuery,
     QueryResultKind, ShaclValidationRequest, SolutionsResultFormat, SparqlQueryRequest,
@@ -247,6 +260,7 @@ struct Args {
     results: Option<PathBuf>,
     routes: bool,
     commits: Option<PathBuf>,
+    then_commit: Option<PathBuf>,
     readers: usize,
     clients: Vec<usize>,
     cache_bytes: usize,
@@ -257,6 +271,10 @@ struct Args {
     count_allocations: bool,
     parse_only: bool,
     kernel: Option<String>,
+    /// `--durable NAME`: the durable engine's own costs ([`durable`]).
+    durable: Option<String>,
+    replication: Option<String>,
+    replication_probe: bool,
     classify: bool,
     prepare_vector_graph: Option<(usize, nrese_engine::vector::Metric)>,
     read_graphs: Vec<String>,
@@ -288,6 +306,7 @@ fn parse_args() -> Result<Args, String> {
         results: None,
         routes: false,
         commits: None,
+        then_commit: None,
         readers: 0,
         clients: Vec::new(),
         cache_bytes: 0,
@@ -298,6 +317,9 @@ fn parse_args() -> Result<Args, String> {
         count_allocations: false,
         parse_only: false,
         kernel: None,
+        durable: None,
+        replication: None,
+        replication_probe: false,
         classify: false,
         prepare_vector_graph: None,
         read_graphs: Vec::new(),
@@ -344,6 +366,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--routes" => args.routes = true,
             "--commits" => args.commits = Some(value()?.into()),
+            "--then-commit" => args.then_commit = Some(value()?.into()),
             "--readers" => {
                 args.readers = value()?.parse().map_err(|e| format!("--readers: {e}"))?
             }
@@ -372,6 +395,12 @@ fn parse_args() -> Result<Args, String> {
             "--count-allocations" => args.count_allocations = true,
             "--parse-only" => args.parse_only = true,
             "--kernel" => args.kernel = Some(value()?),
+            "--durable" => args.durable = Some(value()?),
+            "--replication" => args.replication = Some(value()?),
+            "--replication-probe" => match value()?.as_str() {
+                "swap-one" => args.replication_probe = true,
+                other => return Err(format!("--replication-probe swap-one, not {other}")),
+            },
             "--classify" => args.classify = true,
             "--read-graphs" => args.read_graphs = value()?.split(',').map(str::to_owned).collect(),
             "--prepare-vector-graph" => {
@@ -497,6 +526,49 @@ fn write_results(
     let file = std::io::BufWriter::new(std::fs::File::create(path)?);
     store.run_query(&prepared, &CancellationToken::new(), file)?;
     Ok(())
+}
+
+/// Whether a query file is typed text for autocompletion.
+fn is_autocomplete(file: &std::path::Path) -> bool {
+    file.extension().is_some_and(|x| x == "ac")
+}
+
+/// One autocompletion of `typed`: its suggestions and how long it took.
+fn complete_once(store: &StoreService, typed: &str) -> Result<(u64, Duration), String> {
+    let started = Instant::now();
+    let found = store
+        .autocomplete(&nrese_store::ReadScope::All, typed.trim(), 10, true)
+        .map_err(|e| e.to_string())?;
+    Ok((found.len() as u64, started.elapsed()))
+}
+
+/// [`measure`] for autocompletion.
+fn measure_autocomplete(store: &StoreService, typed: &str, args: &Args) -> Measured {
+    let mut measured = Measured {
+        rows: 0,
+        times: Vec::new(),
+        first: None,
+        error: None,
+        first_faults: None,
+        faults: Vec::new(),
+    };
+    for i in 0..args.warmup + args.runs {
+        match complete_once(store, typed) {
+            Ok((rows, elapsed)) => {
+                measured.rows = rows;
+                measured.first.get_or_insert(elapsed);
+                if i >= args.warmup {
+                    measured.times.push(elapsed);
+                }
+            }
+            Err(e) => {
+                measured.error = Some(e);
+                break;
+            }
+        }
+    }
+    measured.times.sort();
+    measured
 }
 
 /// Each sample of `measure` times `batch` executions (1: one).
@@ -1032,10 +1104,29 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         ..config
     };
     COUNT_ALLOCATIONS.store(args.count_allocations, Ordering::Relaxed);
+    if let Some(name) = &args.durable {
+        let root = args.store.as_ref().ok_or("--durable needs --store DIR")?;
+        report
+            .sections
+            .push(("durable", durable::durable(name, root, args.runs)?));
+        return Ok(());
+    }
     if let Some(kernel) = &args.kernel {
         report
             .sections
             .push(("kernel", modes::kernel(kernel, args.runs)?));
+        return Ok(());
+    }
+    if let Some(spec) = &args.replication {
+        report.sections.push((
+            "replication",
+            modes::replication(
+                spec,
+                args.runs,
+                args.store.as_deref(),
+                args.replication_probe,
+            )?,
+        ));
         return Ok(());
     }
     let mut phases: Vec<(&'static str, String)> = Vec::new();
@@ -1084,12 +1175,10 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     let program = reasoner.materialised_program();
     // Under `owl2-dl` the store enters the mode with its pipeline (the bounds, the
     // consistency gate, a status on every answer); the commits below use the same one.
-    let mut dl_pipeline = reasoner.mode().is_dl().then(|| {
-        MutationPipeline::new(
-            Arc::clone(&store),
-            Arc::new(ReasonerService::new(reasoner.clone())),
-        )
-    });
+    let mut dl_pipeline = reasoner
+        .mode()
+        .is_dl()
+        .then(|| MutationPipeline::new(Arc::clone(&store), reasoner.clone()));
     if let Some(program) = &program {
         if let Some((peak, rss)) = memory_mib() {
             eprintln!("before reasoning: memory peak {peak} MiB, resident {rss} MiB");
@@ -1217,7 +1306,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     } else {
         std::fs::read_dir(&args.queries)?
             .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "rq"))
+            .filter(|p| p.extension().is_some_and(|x| x == "rq" || x == "ac"))
             .filter(|p| {
                 args.only.as_ref().is_none_or(|only| {
                     p.file_stem()
@@ -1233,12 +1322,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         .collect::<Result<_, _>>()?;
     if let Some(file) = &args.commits {
         let phase = Phase::start();
-        let pipeline = dl_pipeline.take().unwrap_or_else(|| {
-            MutationPipeline::new(
-                Arc::clone(&store),
-                Arc::new(ReasonerService::new(reasoner.clone())),
-            )
-        });
+        let pipeline = dl_pipeline
+            .take()
+            .unwrap_or_else(|| MutationPipeline::new(Arc::clone(&store), reasoner.clone()));
         report.sections.push((
             "commits",
             modes::commits(&pipeline, file, &texts, args.readers)?,
@@ -1363,23 +1449,26 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     if let Some((dimension, metric)) = args.prepare_vector_graph {
         let phase = Phase::start();
         let started = Instant::now();
-        let snapshot = store.read_snapshot(None);
+        let snapshot = store.read_snapshot(None)?;
         let mut query = nrese_engine::VectorQuery::new(vec![0.0; dimension], 1);
         query.vector[0] = 1.0;
         query.metric = metric;
         query.strategy = nrese_engine::VectorStrategy::Approximate;
-        snapshot.prepare_vector_graph(&query);
-        let (_, readiness) = snapshot.vector_search(&query, &|_| true);
+        snapshot
+            .prepare_vector_search()
+            .expect("an unbudgeted reader");
+        let (_, readiness) = snapshot
+            .vector_search(&query, &|_| true)
+            .expect("an unlimited search");
         report.sections.push(("vector_prepare", phase.json()));
         let metric = metric.name();
         report.sections.push(("vector_graph", format!(
             "{{\"dimension\": {dimension}, \"metric\": \"{metric}\", \"space\": {}, \"graph\": {}, \"scanned\": {}, \"prepare_ms\": {}}}",
             readiness.space, readiness.graph, readiness.scanned, started.elapsed().as_secs_f64() * 1000.0,
         )));
-        if readiness.space == 0 || !readiness.graph || readiness.scanned != 0 {
-            return Err(
-                "vector graph does not cover the requested space; query timing skipped".into(),
-            );
+        // Every search is exact over the reader's vectors: prepared means they are there.
+        if readiness.space == 0 {
+            return Err("no vectors of the requested space; query timing skipped".into());
         }
     }
     let baseline = args
@@ -1401,6 +1490,28 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             let (json, p50) = modes::parse_and_plan(&store, &name, text, args.runs)?;
             report.queries.push(json);
             report.sum_p50 += p50;
+            continue;
+        }
+        if is_autocomplete(file) {
+            let m = measure_autocomplete(&store, text, args);
+            if let Some(error) = &m.error {
+                println!("{name:<28} error: {error}");
+                continue;
+            }
+            let p50 = ms(m.times[m.times.len() / 2]);
+            let (min, max) = (ms(m.times[0]), ms(*m.times.last().unwrap()));
+            report.sum_p50 += p50;
+            println!(
+                "{name:<28} {:>10} {p50:>11.2} {min:>10.2} {max:>10.2} {:>9}",
+                m.rows, "-"
+            );
+            let samples: Vec<String> = m.times.iter().map(|t| format!("{:.3}", ms(*t))).collect();
+            report.queries.push(format!(
+                "    {{\n      \"name\": \"{name}\",\n      \"rows\": {},\n      \"p50_ms\": {p50:.3},\n      \"min_ms\": {min:.3},\n      \"max_ms\": {max:.3},\n      \"samples_ms\": [{}],\n      \"first_ms\": {:.3}\n    }}",
+                m.rows,
+                samples.join(", "),
+                m.first.map_or(0.0, ms)
+            ));
             continue;
         }
         // Batched where asked: every query, or those `--batch-queries` names.
@@ -1489,6 +1600,51 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     }
     if !files.is_empty() {
         println!("sum of p50: {:.1} ms", report.sum_p50);
+    }
+    if let Some(file) = &args.then_commit {
+        let phase = Phase::start();
+        let pipeline = dl_pipeline
+            .take()
+            .unwrap_or_else(|| MutationPipeline::new(Arc::clone(&store), reasoner.clone()));
+        for update in std::fs::read_to_string(file)?.lines() {
+            if !update.trim().is_empty() {
+                pipeline.execute_update_str(update)?;
+            }
+        }
+        phases.push(("then_commit", phase.json()));
+        let mut after = Vec::new();
+        for (file, text) in files.iter().zip(&texts) {
+            let name = file.file_stem().unwrap().to_string_lossy().into_owned();
+            if is_autocomplete(file) {
+                let (rows, elapsed) = complete_once(&store, text)?;
+                println!(
+                    "{name:<28} after the commits: {rows} rows, {:.2} ms",
+                    ms(elapsed)
+                );
+                after.push(format!(
+                    "{{\"name\": \"{name}\", \"rows\": {rows}, \"ms\": {:.3}}}",
+                    ms(elapsed)
+                ));
+                continue;
+            }
+            let prepared = PreparedQuery::parse(&request(text))?;
+            let (rows, elapsed) = run_once(&store, &prepared, args.timeout, 1)?;
+            let value = (rows == 1)
+                .then(|| first_value(&store, text))
+                .flatten()
+                .map_or(String::new(), |value| format!(", \"value\": {value:?}"));
+            println!(
+                "{name:<28} after the commits: {rows} rows, {:.2} ms",
+                ms(elapsed)
+            );
+            after.push(format!(
+                "{{\"name\": \"{name}\", \"rows\": {rows}, \"ms\": {:.3}{value}}}",
+                ms(elapsed)
+            ));
+        }
+        report
+            .sections
+            .push(("after_commit", format!("[{}]", after.join(", "))));
     }
     if args.batch > 1 {
         report.sections.push(("batch", args.batch.to_string()));

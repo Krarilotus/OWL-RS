@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_store::{DlConfig, DlConsistency, MutationError, MutationPipeline, StoreService};
 
 use super::{ask, insert, pipeline, pipeline_with};
@@ -26,9 +26,7 @@ fn rl_pipeline() -> MutationPipeline {
     let store = StoreService::new(crate::support::in_memory_store_config()).expect("store");
     MutationPipeline::new(
         Arc::new(store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     )
 }
 

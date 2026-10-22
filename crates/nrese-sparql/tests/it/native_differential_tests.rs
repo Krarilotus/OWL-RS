@@ -1452,6 +1452,14 @@ fn dictionary_first_string_tests_equal_the_reference() {
         "CONTAINS(LCASE(?l), \"mi\")",
         "CONTAINS(LCASE(?l), \"k\")",
         "CONTAINS(LCASE(STR(?l)), \"semanticthing\")",
+        // Regexes of literal text, anchored or not, as the string tests.
+        "REGEX(?l, \"^wind\")",
+        "REGEX(?l, \"^Semantic Web$\")",
+        "REGEX(STR(?l), \"^1879\")",
+        "REGEX(?l, \"Web$\", \"\")",
+        "REGEX(?l, \"mantic\")",
+        "REGEX(STR(?l), \"Thing$\")",
+        "REGEX(?l, \"^filler 1\") && LANG(?l) = \"de\"",
     ] {
         for pattern in [
             format!("?s <{EX}label> ?l"),
@@ -4006,6 +4014,33 @@ fn a_dataset_is_what_the_query_names() {
             options.dataset
         );
     }
+    // The merge of every graph but some (SHACL's data graph), asked for without the union
+    // default graph: nothing left out is every graph, as is leaving out a graph the store
+    // doesn't hold; the named graphs stay the store's.
+    let unknown = || -> GraphName { ex("g9").into() };
+    for (left_out, text, solutions) in [
+        (vec![], "SELECT * WHERE { ?s ?p ?o }", 5),
+        (vec![unknown()], "SELECT * WHERE { ?s ?p ?o }", 5),
+        (vec![ex("g0").into()], "SELECT * WHERE { ?s ?p ?o }", 4),
+        (
+            vec![GraphName::DefaultGraph, ex("g2").into()],
+            "SELECT * WHERE { ?s ?p ?o }",
+            3,
+        ),
+        (vec![ex("g0").into()], "SELECT * WHERE { GRAPH ?g { } }", 3),
+    ] {
+        let mut dataset = nrese_sparql::QueryDatasetSpecification::new();
+        dataset.set_default_graph_excluding(left_out.clone());
+        let options = QueryOptions {
+            dataset: Some(dataset),
+            ..QueryOptions::default()
+        };
+        assert_eq!(
+            count(text, &options),
+            solutions,
+            "{text} without {left_out:?}"
+        );
+    }
     // Rows no statement gives, under names in and outside the dataset: checked by example
     // and against the reference evaluator.
     let native_count = |text: &str| {
@@ -5356,6 +5391,8 @@ fn triple_terms_and_base_directions_equal_the_reference() {
                         "",
                         "FILTER(hasLANGDIR(?t))",
                         "FILTER(sameTerm(PREDICATE(?u), ?p))",
+                        // A triple term is no literal (the id-kind test once said it was).
+                        "FILTER(isLITERAL(?t))",
                     ])
                 ),
             };
@@ -6582,4 +6619,137 @@ fn paths_ordered_with_patterns_equal_the_reference() {
         covered(checked, planned, path_first),
         "{planned} of {checked} planned with their paths, a path first in {path_first}"
     );
+}
+
+/// A sequence path is two steps joined on a fresh blank node: evaluated as a set (DISTINCT,
+/// COUNT(DISTINCT)), the join kept that blank node's column. Without it the path's other
+/// end's values came back as answers (found by the count tests' seed 4).
+#[test]
+fn sequence_paths_keep_their_join_in_sets() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for (s, p, o) in [
+        ("a", "p2", "b"),
+        ("b", "p1", "c"),
+        ("c", "q", "d"),
+        ("x", "p2", "y"),
+        ("x", "q", "d"),
+        ("z", "p1", "x"),
+        ("a", "q", "d"),
+    ] {
+        tx.insert(Quad::new(ex(s), ex(p), ex(o), GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    for text in [
+        format!("SELECT DISTINCT ?v0 WHERE {{ ?v1 <{EX}p2>/<{EX}p1>+ ?v0 . ?v0 <{EX}q> ?w }}"),
+        format!(
+            "SELECT (COUNT(DISTINCT ?v0) AS ?n) WHERE {{ ?v1 <{EX}p2>/<{EX}p1>+ ?v0 . ?v0 <{EX}q> ?w }}"
+        ),
+        format!(
+            "SELECT DISTINCT ?v0 WHERE {{ ?v1 <{EX}p2>/<{EX}p1>+ ?v0 . {{ ?v0 <{EX}q> ?w }} UNION {{ ?v0 <{EX}p1> ?u }} }}"
+        ),
+    ] {
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let options = QueryOptions::default();
+        let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+        let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+        assert_eq!(native, expected, "{text}");
+    }
+}
+
+/// SUM and AVG of a group with a value that is neither a number nor a duration are
+/// unbound, as the reference has them, whether the value is met first or last; durations
+/// still sum, and numbers alone too.
+#[test]
+fn sums_of_values_neither_numeric_nor_durations_are_unbound() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let values: Vec<(&str, &str, Term)> = vec![
+        ("a", "g1", Literal::from(1).into()),
+        ("b", "g1", Literal::new_simple_literal("x").into()),
+        ("c", "g1", Literal::from(2).into()),
+        ("d", "g2", Literal::from(3).into()),
+        ("e", "g2", Literal::from(4).into()),
+        (
+            "f",
+            "g3",
+            Literal::new_typed_literal("PT1H", xsd::DAY_TIME_DURATION).into(),
+        ),
+        (
+            "g",
+            "g3",
+            Literal::new_typed_literal("PT2H", xsd::DAY_TIME_DURATION).into(),
+        ),
+        ("h", "g4", ex("i").into()),
+        ("i", "g4", Literal::from(5).into()),
+    ];
+    for (s, g, o) in values {
+        tx.insert(Quad::new(ex(s), ex("g"), ex(g), GraphName::DefaultGraph).as_ref());
+        tx.insert(Quad::new(ex(s), ex("v"), o, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    for text in [
+        format!(
+            "SELECT ?g (SUM(?o) AS ?s) (AVG(?o) AS ?a) WHERE {{ ?x <{EX}g> ?g . ?x <{EX}v> ?o }} GROUP BY ?g"
+        ),
+        format!("SELECT (SUM(?o) AS ?s) (AVG(?o) AS ?a) WHERE {{ ?x <{EX}v> ?o }}"),
+        format!("SELECT (SUM(?o > 0) AS ?s) WHERE {{ ?x <{EX}v> ?o }}"),
+    ] {
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let options = QueryOptions::default();
+        let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+        let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+        assert_eq!(native, expected, "{text}");
+    }
+}
+
+/// Duplicate-insensitive aggregates of one triple pattern without GROUP BY are evaluated
+/// over the pattern's distinct values (a set evaluation): the reference's answers,
+/// duplicates and mixed term kinds included, and one row of empty aggregates where the
+/// pattern matches nothing.
+#[test]
+fn insensitive_aggregates_of_one_pattern_equal_the_reference() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for (s, o) in [
+        ("a", Term::from(Literal::from(3))),
+        ("b", Literal::from(3).into()),
+        ("c", Literal::from(1).into()),
+        ("d", Literal::new_simple_literal("x").into()),
+        ("e", Literal::new_simple_literal("x").into()),
+        ("f", ex("n").into()),
+    ] {
+        tx.insert(Quad::new(ex(s), ex("v"), o, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    for p in ["v", "absent"] {
+        for text in [
+            format!("SELECT (MIN(?o) AS ?a) (MAX(?o) AS ?b) WHERE {{ ?s <{EX}{p}> ?o }}"),
+            format!("SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE {{ ?s <{EX}{p}> ?o }}"),
+            format!(
+                "SELECT (COUNT(DISTINCT ?s) AS ?n) (MAX(?s) AS ?m) WHERE {{ ?s <{EX}{p}> ?o }}"
+            ),
+            format!(
+                "SELECT (GROUP_CONCAT(DISTINCT STR(?o); SEPARATOR=\"|\") AS ?c) WHERE {{ ?s <{EX}{p}> ?o }}"
+            ),
+            format!("SELECT (SUM(DISTINCT ?o) AS ?t) WHERE {{ ?s <{EX}{p}> ?o }}"),
+        ] {
+            let query = SparqlParser::new().parse_query(&text).unwrap();
+            let options = QueryOptions::default();
+            let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+            let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+            if text.contains("GROUP_CONCAT") {
+                assert_eq!(
+                    concatenations_sorted(&native, '|'),
+                    concatenations_sorted(&expected, '|'),
+                    "{text}"
+                );
+            } else {
+                assert_eq!(native, expected, "{text}");
+            }
+        }
+    }
 }

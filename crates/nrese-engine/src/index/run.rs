@@ -13,7 +13,7 @@ use rayon::prelude::*;
 
 use super::Layout;
 use super::derive::Ordered;
-use super::keys::PackedKeys;
+use super::keys::{IndexEncoding, PackedKeys};
 use crate::quad::{EncodedQuad, Key, Permutation};
 
 /// Deltas at least this large are sorted with all of the layout's permutations in parallel.
@@ -69,16 +69,17 @@ impl PermutationRun {
     }
 
     /// Builds a run from entries sorted by key, each flagged as tombstone or not.
-    pub(crate) fn from_sorted(entries: Vec<(Key, bool)>) -> Self {
-        Self::from_sorted_within(entries, &mut super::Uncharged, true)
+    pub(crate) fn from_sorted(entries: Vec<(Key, bool)>, encoding: IndexEncoding) -> Self {
+        Self::from_sorted_within(entries, encoding, &mut super::Uncharged, true)
             .unwrap_or_else(|_| unreachable!("nothing is charged"))
     }
 
     /// [`Self::from_sorted`], each array reserved on `charge` before it is made, the keys
     /// packed on one thread unless `parallel`.
-    fn from_sorted_within(
+    fn from_sorted_within<C: super::Charge>(
         entries: Vec<(Key, bool)>,
-        charge: &mut impl super::Charge,
+        encoding: IndexEncoding,
+        charge: &mut C,
         parallel: bool,
     ) -> Result<Self, nrese_exec::BudgetExceeded> {
         let has_tombstones = entries.iter().any(|(_, tomb)| *tomb);
@@ -91,19 +92,36 @@ impl PermutationRun {
         let mut tombstones = vec![0u64; words];
         let keys_bytes = entries.len() * std::mem::size_of::<Key>();
         charge.reserve(keys_bytes)?;
-        let keys: Vec<Key> = entries
-            .into_iter()
-            .enumerate()
-            .map(|(i, (key, tomb))| {
-                if tomb {
-                    tombstones[i / 64] |= 1 << (i % 64);
+        let mut mark = |i: usize, tomb: bool| {
+            if tomb {
+                tombstones[i / 64] |= 1 << (i % 64);
+            }
+        };
+        let keys: Vec<Key> = match C::COUNTED {
+            // A collect in place keeps the entries' allocation and, its size not a multiple
+            // of the keys', shrinks it by a reallocation that holds both blocks at once: a
+            // charged build makes the keys beside the entries instead, in the room reserved.
+            true => {
+                let mut keys = Vec::with_capacity(entries.len());
+                for (i, &(key, tomb)) in entries.iter().enumerate() {
+                    mark(i, tomb);
+                    keys.push(key);
                 }
-                key
-            })
-            .collect();
+                drop(entries);
+                keys
+            }
+            false => entries
+                .into_iter()
+                .enumerate()
+                .map(|(i, (key, tomb))| {
+                    mark(i, tomb);
+                    key
+                })
+                .collect(),
+        };
         let packed = match parallel {
-            true => PackedKeys::from_sorted(&keys),
-            false => PackedKeys::from_sorted_within(&keys, charge)?,
+            true => PackedKeys::from_sorted(&keys, encoding),
+            false => PackedKeys::from_sorted_within(&keys, encoding, charge)?,
         };
         drop(keys);
         charge.release(keys_bytes);
@@ -118,6 +136,8 @@ impl PermutationRun {
 #[derive(Debug, Default)]
 pub(crate) struct Run {
     layout: Layout,
+    /// What its blocks are built in, and what runs made from it are built in.
+    encoding: IndexEncoding,
     perms: [PermutationRun; Permutation::COUNT],
     inserts: u64,
     deletes: u64,
@@ -128,6 +148,7 @@ impl Run {
     /// duplicates (the transaction guarantees this). O(d log d).
     pub(crate) fn from_delta(
         layout: Layout,
+        encoding: IndexEncoding,
         inserts: &[EncodedQuad],
         deletes: &[EncodedQuad],
     ) -> Self {
@@ -136,10 +157,11 @@ impl Run {
             entries.extend(inserts.iter().map(|q| (permutation.to_key(q), false)));
             entries.extend(deletes.iter().map(|q| (permutation.to_key(q), true)));
             entries.sort_unstable_by_key(|entry| entry.0);
-            PermutationRun::from_sorted(entries)
+            PermutationRun::from_sorted(entries, encoding)
         };
         Self::from_permutations(
             layout,
+            encoding,
             build_all(layout, inserts.len() + deletes.len(), build),
         )
     }
@@ -149,6 +171,7 @@ impl Run {
     /// lives (`engine::equality::View`). A refusal leaves nothing made.
     pub(crate) fn from_delta_within(
         layout: Layout,
+        encoding: IndexEncoding,
         inserts: &[EncodedQuad],
         deletes: &[EncodedQuad],
         held: &mut nrese_exec::Reservation,
@@ -161,18 +184,22 @@ impl Run {
             entries.extend(inserts.iter().map(|q| (permutation.to_key(q), false)));
             entries.extend(deletes.iter().map(|q| (permutation.to_key(q), true)));
             entries.sort_unstable_by_key(|entry| entry.0);
-            let built = PermutationRun::from_sorted_within(entries, held, false);
+            let built = PermutationRun::from_sorted_within(entries, encoding, held, false);
             held.release(entries_bytes);
             perms[permutation as usize] = built?;
         }
-        Ok(Self::from_permutations(layout, perms))
+        Ok(Self::from_permutations(layout, encoding, perms))
     }
 
     /// Builds a tombstone-free run from arbitrary quads, removing duplicates. Used for bulk
     /// replacement and checkpoint loading. O(n log n), parallel over permutations and within
     /// each sort.
-    pub(crate) fn from_quads(layout: Layout, quads: Vec<EncodedQuad>) -> Self {
-        let mut builder = PermutationBuilder::planned(quads, layout.permutations());
+    pub(crate) fn from_quads(
+        layout: Layout,
+        encoding: IndexEncoding,
+        quads: Vec<EncodedQuad>,
+    ) -> Self {
+        let mut builder = PermutationBuilder::planned(quads, layout.permutations(), encoding);
         let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
         for &permutation in layout.permutations() {
             perms[permutation as usize] = PermutationRun {
@@ -180,7 +207,7 @@ impl Run {
                 tombstones: Box::default(),
             };
         }
-        Self::from_permutations(layout, perms)
+        Self::from_permutations(layout, encoding, perms)
     }
 
     /// Assembles a run from the permutation runs of `layout`, which hold the same entries.
@@ -188,6 +215,7 @@ impl Run {
     /// the data.
     pub(crate) fn from_permutations(
         layout: Layout,
+        encoding: IndexEncoding,
         perms: [PermutationRun; Permutation::COUNT],
     ) -> Self {
         let spog = &perms[Permutation::Spog as usize];
@@ -195,6 +223,7 @@ impl Run {
         let inserts = spog.keys.len() as u64 - deletes;
         Self {
             layout,
+            encoding,
             perms,
             inserts,
             deletes,
@@ -203,6 +232,10 @@ impl Run {
 
     pub(crate) fn layout(&self) -> Layout {
         self.layout
+    }
+
+    pub(crate) fn encoding(&self) -> IndexEncoding {
+        self.encoding
     }
 
     #[inline]
@@ -242,6 +275,7 @@ impl Run {
                         PermutationRun {
                             keys: PackedKeys::from_sorted_iter(
                                 source.keys.iter().map(|[a, b, c, g]| [g, a, b, c]),
+                                self.encoding,
                             ),
                             tombstones: source.tombstones.clone(),
                         }
@@ -256,6 +290,7 @@ impl Run {
         }
         Self {
             layout: Layout::Quads,
+            encoding: self.encoding,
             perms,
             inserts: self.inserts,
             deletes: self.deletes,
@@ -316,6 +351,8 @@ pub(crate) struct PermutationBuilder {
     /// Full sorts of the keys so far (the first one included): what deriving saves, and
     /// what a guard test counts.
     sorts: usize,
+    /// What the permutations are packed in.
+    encoding: IndexEncoding,
 }
 
 impl PermutationBuilder {
@@ -323,11 +360,15 @@ impl PermutationBuilder {
     /// asked for in the layout's order is sorted (the tests' oracle).
     #[cfg(test)]
     pub(crate) fn new(quads: Vec<EncodedQuad>) -> Self {
-        Self::planned(quads, &[])
+        Self::planned(quads, &[], IndexEncoding::Fast)
     }
 
     /// For `quads`, to be asked for the permutations in `wanted`, in any order.
-    pub(crate) fn planned(mut quads: Vec<EncodedQuad>, wanted: &[Permutation]) -> Self {
+    pub(crate) fn planned(
+        mut quads: Vec<EncodedQuad>,
+        wanted: &[Permutation],
+        encoding: IndexEncoding,
+    ) -> Self {
         quads.par_sort_unstable();
         quads.dedup();
         Self {
@@ -336,6 +377,7 @@ impl PermutationBuilder {
             wanted: wanted.to_vec(),
             ready: Vec::new(),
             sorts: 1,
+            encoding,
         }
     }
 
@@ -352,7 +394,7 @@ impl PermutationBuilder {
             return self.ready.swap_remove(at).1;
         }
         if permutation == self.order {
-            let packed = PackedKeys::from_sorted(&self.keys);
+            let packed = PackedKeys::from_sorted(&self.keys, self.encoding);
             self.derive_ahead();
             return packed;
         }
@@ -363,7 +405,7 @@ impl PermutationBuilder {
             positions: None,
         };
         if let Some(positions) = own.partitioned(permutation) {
-            let packed = self.ordered(permutation, &positions).packed();
+            let packed = self.ordered(permutation, &positions).packed(self.encoding);
             self.derive_ahead_from(permutation, Some(&positions));
             return packed;
         }
@@ -376,13 +418,13 @@ impl PermutationBuilder {
             .unwrap_or(permutation);
         self.sort_into(source);
         if source == permutation {
-            let packed = PackedKeys::from_sorted(&self.keys);
+            let packed = PackedKeys::from_sorted(&self.keys, self.encoding);
             self.derive_ahead();
             return packed;
         }
         self.wanted.retain(|&p| p != source);
         self.ready
-            .push((source, PackedKeys::from_sorted(&self.keys)));
+            .push((source, PackedKeys::from_sorted(&self.keys, self.encoding)));
         self.derive_ahead();
         self.packed(permutation)
     }
@@ -430,7 +472,7 @@ impl PermutationBuilder {
                 positions,
             };
             if let Some(derived) = from.partitioned(permutation) {
-                let packed = self.ordered(permutation, &derived).packed();
+                let packed = self.ordered(permutation, &derived).packed(self.encoding);
                 self.wanted.retain(|&p| p != permutation);
                 self.ready.push((permutation, packed));
                 self.derive_ahead_from(permutation, Some(&derived));
