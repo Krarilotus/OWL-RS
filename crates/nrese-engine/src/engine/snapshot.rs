@@ -664,6 +664,7 @@ impl Snapshot {
             content: super::Content::fresh(),
             asserted: self.version.asserted.clone(),
             inferred,
+            committed: self.version.committed,
             revision: self.version.revision,
             dictionary_len: self.version.dictionary_len,
             equality: Default::default(),

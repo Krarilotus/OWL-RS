@@ -1,13 +1,15 @@
 //! `store.index_encoding` (`nrese_engine::IndexEncoding`): checkpoints are written as format
-//! 11 with either encoding and reopen with the same statements; checkpoints of formats 9
-//! (no palettes) and 10 (palettes), written by the engine before format 11, still open. The
+//! 12 with either encoding and reopen with the same statements; checkpoints of formats 9
+//! (no palettes) and 10 (palettes) require export and reload into a new directory. The
 //! encoding is the engine's (`EngineConfig::index_encoding`): two engines of one process
 //! may differ.
 
 use std::fs;
 use std::path::Path;
 
-use nrese_engine::{DurabilityConfig, Engine, EngineConfig, IndexEncoding, QuadPattern};
+use nrese_engine::{
+    DurabilityConfig, Engine, EngineConfig, EngineError, IndexEncoding, QuadPattern,
+};
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 
@@ -100,10 +102,10 @@ fn two_engines_of_one_process_keep_their_own_encodings() {
 }
 
 #[test]
-fn checkpoints_of_either_encoding_are_format_11() {
+fn checkpoints_of_either_encoding_are_format_12() {
     for (encoding, expected) in [
-        (IndexEncoding::Fast, b"NRESECKB"),
-        (IndexEncoding::Compact, b"NRESECKB"),
+        (IndexEncoding::Fast, b"NRESECKC"),
+        (IndexEncoding::Compact, b"NRESECKC"),
     ] {
         let config = || EngineConfig {
             index_encoding: encoding,
@@ -129,10 +131,9 @@ fn checkpoints_of_either_encoding_are_format_11() {
     }
 }
 
-/// Checkpoints the engine wrote before format 11 (the statements of [`quads`]; format 9
-/// without palettes, format 10 with) open, and their next checkpoint is format 11.
+/// Old format 9/10 checkpoint bytes stay unchanged and require export and reload.
 #[test]
-fn checkpoints_before_format_11_open() {
+fn checkpoints_before_format_12_need_reload() {
     for name in ["checkpoint-format-9.nck", "checkpoint-format-10.nck"] {
         let dir = tempfile::tempdir().unwrap();
         fs::copy(
@@ -142,49 +143,11 @@ fn checkpoints_before_format_11_open() {
             dir.path().join("checkpoint-00000000000000000001.nck"),
         )
         .unwrap();
-        {
-            let engine = Engine::open(dir.path(), config()).unwrap();
-            let snapshot = engine.snapshot();
-            assert_eq!(
-                snapshot.quads_for_pattern(&QuadPattern::all()).count(),
-                2_000,
-                "{name}"
-            );
-            for quad in quads() {
-                assert!(
-                    snapshot
-                        .lookup_quad(quad.as_ref())
-                        .is_some_and(|q| snapshot.contains(&q)),
-                    "{name}: {quad}"
-                );
-            }
-            let mut tx = engine.transaction();
-            tx.insert(
-                Quad::new(
-                    NamedNode::new_unchecked("http://example.com/new"),
-                    NamedNode::new_unchecked("http://example.com/p0"),
-                    NamedNode::new_unchecked("http://example.com/o"),
-                    GraphName::DefaultGraph,
-                )
-                .as_ref(),
-            );
-            tx.commit().unwrap();
-            engine.checkpoint().unwrap();
-        }
-        let checkpoints: Vec<_> = fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension().is_some_and(|e| e == "nck"))
-            .collect();
-        let newest = checkpoints.iter().max().unwrap();
-        assert_eq!(&fs::read(newest).unwrap()[..8], b"NRESECKB", "{name}");
-        let engine = Engine::open(dir.path(), config()).unwrap();
-        assert_eq!(
-            engine
-                .snapshot()
-                .quads_for_pattern(&QuadPattern::all())
-                .count(),
-            2_001,
+        assert!(
+            matches!(
+                Engine::open(dir.path(), config()),
+                Err(EngineError::UnsupportedFormat(_))
+            ),
             "{name}"
         );
     }

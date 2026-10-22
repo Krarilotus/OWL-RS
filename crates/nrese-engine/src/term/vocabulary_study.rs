@@ -56,7 +56,7 @@ fn vocabulary_study() {
         eprintln!("NRESE_STUDY_CHECKPOINT not set");
         return;
     };
-    let (base, _) = crate::durability::checkpoint::map_written(
+    let (base, _, _) = crate::durability::checkpoint::map_written(
         std::path::Path::new(&path),
         crate::IndexEncoding::Fast,
     )

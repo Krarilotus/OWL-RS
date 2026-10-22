@@ -189,6 +189,7 @@ impl<'e> Transaction<'e> {
                 .inferred
                 .with_delta(&inferred_inserts, &inferred_deletes),
             revision: base.revision,
+            committed: base.committed,
             dictionary_len: self.engine.shared.dictionary.len(),
             equality: match self.changes_equality() {
                 true => Default::default(),
@@ -487,6 +488,7 @@ impl<'e> Transaction<'e> {
         let shared = &engine.shared;
         let dictionary_len = shared.dictionary.len();
         let dictionary_start = base.dictionary_len();
+        let committed = base.version().committed.local();
         let triples = |set: HashSet<EncodedQuad>| set.into_iter().map(Into::into).collect();
         let record = CommitRecord {
             revision: summary.revision,
@@ -503,11 +505,7 @@ impl<'e> Transaction<'e> {
             deletes: asserted.deletes.into_iter().collect(),
             inferred_inserts: triples(inferred.inserts),
             inferred_deletes: triples(inferred.deletes),
-            committed_micros: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |since| since.as_micros() as u64),
-            ),
+            committed_micros: Some(committed.clock),
         };
         // The first quad in a named graph turns a default-graph asserted stack into a quad
         // stack. No compaction or checkpoint may replace its runs meanwhile: the writer slot
@@ -535,6 +533,7 @@ impl<'e> Transaction<'e> {
                 asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,
+                committed,
                 dictionary_len,
                 equality: match changes_equality {
                     true => Default::default(),
@@ -546,7 +545,7 @@ impl<'e> Transaction<'e> {
         let wal_bytes = match &shared.durable {
             Some(durable) => {
                 let mut wal = durable.wal.lock();
-                wal.append(&record)?;
+                let _ = wal.append(&record)?;
                 shared.versions.publish(publish);
                 wal.bytes_since_checkpoint()
             }
