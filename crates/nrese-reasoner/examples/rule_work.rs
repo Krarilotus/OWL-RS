@@ -235,7 +235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         derived.sort_unstable();
         let mut violations = closure.violations;
         violations.sort_by(|a, b| (&a.rule, &a.bindings).cmp(&(&b.rule, &b.bindings)));
-        let same = derived == batch.derived && violations == batch.violations;
+        let same = derived == batch.derived && *violations == *batch.violations;
         println!(
             "naive {:.2} s | derived {} | violations {} | {}",
             started.elapsed().as_secs_f64(),

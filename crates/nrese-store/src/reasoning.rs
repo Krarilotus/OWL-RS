@@ -7,14 +7,14 @@ use std::time::{Duration, Instant};
 use nrese_engine::{ReadModel, TermId, Transaction};
 use nrese_reasoner::delta;
 use nrese_reasoner::eval::GroundProgram;
-use nrese_reasoner::ir::Violation;
+use nrese_reasoner::ir::Violations;
 use nrese_reasoner::lists::ListDiagnostic;
 
 pub use nrese_reasoner::RuleProgram;
 pub use nrese_reasoner::engine::{
-    Closure, InferenceStep, JUSTIFICATIONS_AT_MOST, JustificationAnswer, JustificationMode,
-    JustifiedStatement, Program, decoded, explain_fact, explain_violation, justify_fact,
-    materialise, materialise_until,
+    Closure, Explained, InferenceStep, JUSTIFICATIONS_AT_MOST, JustificationAnswer,
+    JustificationMode, JustifiedStatement, Program, ProofScope, decoded, explain_fact,
+    explain_violation, justify_fact, materialise, materialise_until, materialise_within,
 };
 
 /// The most diagnostics a report lists; `diagnostics_total` counts them all.
@@ -118,9 +118,10 @@ pub(crate) fn apply_delta(
     ground: Option<&GroundProgram>,
     tx: &mut Transaction<'_>,
     stop: nrese_reasoner::eval::Stop<'_>,
-) -> Result<(Vec<Violation>, MaterialisationReport, Option<GroundProgram>), delta::Interrupted> {
+    budget: &std::sync::Arc<nrese_exec::Budget>,
+) -> Result<(Violations, MaterialisationReport, Option<GroundProgram>), delta::Interrupted> {
     let started = Instant::now();
-    let done = nrese_reasoner::engine::maintain(program, ground, tx, stop)?;
+    let done = nrese_reasoner::engine::maintain_within(program, ground, tx, stop, budget)?;
     let report = MaterialisationReport {
         ruleset: program.program.name(),
         revision: tx.base().revision() + 1,
@@ -128,7 +129,7 @@ pub(crate) fn apply_delta(
         inferred: tx.len_in(ReadModel::Inferred),
         inferred_inserted: done.inserted,
         inferred_deleted: done.removed,
-        violations: done.violations.len(),
+        violations: done.violations.found(),
         rounds: done.rounds,
         elapsed: started.elapsed(),
         work: done.work,
@@ -209,12 +210,19 @@ mod tests {
             assert!(program.stores_representatives());
             tx.remove(bridge.as_ref());
             let polls = AtomicU64::new(0);
-            let (violations, report, _) = apply_delta(&program, None, &mut tx, &|| {
-                polls.fetch_add(1, Ordering::Relaxed);
-                false
-            })
+            let budget = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+            let (violations, report, _) = apply_delta(
+                &program,
+                None,
+                &mut tx,
+                &|| {
+                    polls.fetch_add(1, Ordering::Relaxed);
+                    false
+                },
+                &budget,
+            )
             .unwrap();
-            assert!(violations.is_empty());
+            assert!(!violations.inconsistent());
             let pending = tx.pending_snapshot();
             let stored: HashSet<EncodedTriple> = pending
                 .stored()

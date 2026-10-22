@@ -308,7 +308,7 @@ fn both_with(
     }
     let mut violations = naive.violations;
     violations.sort_by(|a, b| (&a.rule, &a.bindings).cmp(&(&b.rule, &b.bindings)));
-    assert_eq!(violations, batch.violations, "violations differ");
+    assert_eq!(violations, &batch.violations[..], "violations differ");
     (naive.derived, violations)
 }
 
@@ -759,6 +759,72 @@ fn stopped_updates_are_interrupted() {
         let result = update_until(&base, &added, &[], compiled, None, &stop);
         assert_eq!(result.err(), Some(Interrupted), "stop at poll {k} of {n}");
     }
+}
+
+/// A change whose violations its budget can't hold (N12; Sol r1): the evaluation still
+/// reports the state inconsistent, the list says it isn't complete, and the charge never
+/// passes the budget; unlimited, every violation is listed and charged.
+#[test]
+fn violations_past_their_budget_still_make_the_state_inconsistent() {
+    use std::sync::Arc;
+
+    use super::delta::{MemoryBase, Rules, update_within};
+    let mut vocabulary = LocalVocabulary::default();
+    let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let schema = Schema::owl(&mut vocabulary);
+    let compiled = Rules {
+        rules: &rules,
+        lists: Some(&lists),
+        schema: &schema,
+    };
+    let mut text: Vec<String> = (0..200).map(|j| format!("ex:x{j} rdf:type ex:A")).collect();
+    text.push("ex:A owl:disjointWith ex:B".to_owned());
+    let mut asserted = load(
+        &mut vocabulary,
+        &text.join(
+            "
+",
+        ),
+    );
+    asserted.sort_unstable();
+    let inferred = batch::materialise(&asserted, &rules, Some(&lists), &schema).derived;
+    let added = load(
+        &mut vocabulary,
+        &(0..200)
+            .map(|j| format!("ex:x{j} rdf:type ex:B"))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            ),
+    );
+    asserted.extend(&added);
+    asserted.sort_unstable();
+    let base = MemoryBase::new(&asserted, &inferred);
+    let update = |budget: &Arc<nrese_exec::Budget>| {
+        update_within(
+            &base,
+            &added,
+            &[],
+            compiled,
+            None,
+            crate::eval::NEVER,
+            super::delta::policy::Policy::default(),
+            budget,
+        )
+        .expect("runs")
+    };
+    let unlimited = Arc::new(nrese_exec::Budget::unlimited());
+    let all = update(&unlimited);
+    assert_eq!(all.violations.len(), 200);
+    assert!(all.violations.complete() && unlimited.used() > 0);
+    drop(all);
+    assert_eq!(unlimited.used(), 0);
+    let tight = Arc::new(nrese_exec::Budget::new(1_024));
+    let some = update(&tight);
+    assert!(some.violations.inconsistent() && !some.violations.complete());
+    assert!(some.violations.len() < 200 && tight.used() <= 1_024);
 }
 
 /// A commit reports the list axioms it made uninstantiable, and only those: a broken

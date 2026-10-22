@@ -55,6 +55,9 @@ pub async fn execute_query_in(
         prepared.set_formats(solutions, graph);
     }
     let media_type = prepared.media_type();
+    // A reader who may not read every graph gets no plan: the planner's estimates, its join
+    // order, and the operators' rows and times all follow every graph (N12, research round 11).
+    let restricted = prepared.access().is_some();
     let store = state.store();
     let cancellation = CancellationToken::new();
     let token = cancellation.clone();
@@ -70,7 +73,7 @@ pub async fn execute_query_in(
                 let planned = store
                     .plan_query(&prepared, &token)
                     .map_err(|error| map_query_error(&policy, error))?;
-                serde_json::to_writer(out, &plan_json(&planned))
+                serde_json::to_writer(out, &plan_json(&planned, restricted))
                     .map_err(|error| ApiError::internal(error.to_string()))
             },
         )
@@ -86,7 +89,7 @@ pub async fn execute_query_in(
                 let explanation = store
                     .explain_query(&prepared, &token)
                     .map_err(|error| map_query_error(&policy, error))?;
-                serde_json::to_writer(out, &explanation_json(&explanation))
+                serde_json::to_writer(out, &explanation_json(&explanation, restricted))
                     .map_err(|error| ApiError::internal(error.to_string()))
             },
         )
@@ -168,7 +171,10 @@ fn completeness_json(
 
 /// The JSON form of an EXPLAIN: the executor, the rewrites that changed the query, totals,
 /// and one object per operator in evaluation order (`depth` gives the nesting).
-fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value {
+/// How a query ran. For a `restricted` reader (one who may not read every graph) without
+/// its plan and time, nor what the schema made of it (its rewrites, the QL rewriting's
+/// report and the completeness it gives): they follow the graphs it can't read too.
+fn explanation_json(explanation: &nrese_store::Explanation, restricted: bool) -> serde_json::Value {
     let steps: Vec<serde_json::Value> = explanation
         .steps
         .iter()
@@ -184,7 +190,7 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
             })
         })
         .collect();
-    serde_json::json!({
+    let mut report = serde_json::json!({
         "executor": explanation.executor,
         "rewrites": explanation.rewrites,
         "rows": explanation.rows,
@@ -199,7 +205,32 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
         })),
         "ql": ql_json(explanation.ql.as_ref()),
         "steps": steps,
-    })
+    });
+    if restricted {
+        without_plan(&mut report, &RESTRICTED_EXPLANATION);
+    }
+    report
+}
+
+/// What a restricted reader's EXPLAIN leaves out. The plan, its estimates and its times
+/// follow every graph (`GraphSelector::Any`). The rewrites, the QL report and the
+/// completeness follow the schema, which under `inferred = "visible"` is every graph's
+/// (`nrese_sparql::ql`): seeing what the whole schema derives isn't seeing the schema
+/// (N12, Sol r3 F1).
+const RESTRICTED_EXPLANATION: [&str; 5] = ["steps", "micros", "rewrites", "ql", "completeness"];
+const RESTRICTED_PLAN: [&str; 4] = ["steps", "rewrites", "ql", "completeness"];
+
+/// `report` without `keys`, saying why: the plan is for readers of every graph.
+fn without_plan(report: &mut serde_json::Value, keys: &[&str]) {
+    if let Some(report) = report.as_object_mut() {
+        for key in keys {
+            report.remove(*key);
+        }
+        report.insert(
+            "plan".to_owned(),
+            serde_json::Value::from("for readers of every graph"),
+        );
+    }
 }
 
 /// What the OWL 2 QL rewriting did and whether the answers are complete (`null` where it
@@ -228,8 +259,8 @@ fn ql_json(report: Option<&nrese_sparql::ql::QlReport>) -> serde_json::Value {
 
 /// The JSON form of a plan before running: the rewrites that changed the query, and one
 /// object per node from the top down (`depth` gives the nesting), each with its estimated
-/// rows (`null` where unknown).
-fn plan_json(planned: &nrese_store::PlannedQuery) -> serde_json::Value {
+/// rows (`null` where unknown). For a `restricted` reader without the nodes.
+fn plan_json(planned: &nrese_store::PlannedQuery, restricted: bool) -> serde_json::Value {
     let steps: Vec<serde_json::Value> = planned
         .steps
         .iter()
@@ -242,13 +273,17 @@ fn plan_json(planned: &nrese_store::PlannedQuery) -> serde_json::Value {
             })
         })
         .collect();
-    serde_json::json!({
+    let mut report = serde_json::json!({
         "executor": "native",
         "rewrites": planned.rewrites,
         "completeness": completeness_json(planned.completeness.as_ref(), &[]),
         "ql": ql_json(planned.ql.as_ref()),
         "steps": steps,
-    })
+    });
+    if restricted {
+        without_plan(&mut report, &RESTRICTED_PLAN);
+    }
+    report
 }
 
 /// Query errors caused by the request are 400s; a cancelled evaluation is a timeout;

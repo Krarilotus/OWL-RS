@@ -260,7 +260,7 @@ async fn posted_shapes_validate_without_being_stored() -> TestResult {
         "ex:bob a ex:Person . ex:ada a ex:Person ; ex:name \"Ada\" .",
     )
     .await?;
-    let before = crate::support::readyz_text(app.clone()).await?;
+    let before = crate::support::info_text(app.clone(), None).await?;
 
     let post = |body: String, content_type: &'static str| {
         let app = app.clone();
@@ -286,7 +286,7 @@ async fn posted_shapes_validate_without_being_stored() -> TestResult {
 
     // Nothing was committed: same revision and counts, no shapes anywhere, and the
     // writer is free.
-    assert_eq!(crate::support::readyz_text(app.clone()).await?, before);
+    assert_eq!(crate::support::info_text(app.clone(), None).await?, before);
     let shapes = query_text(
         app.clone(),
         "ASK { GRAPH ?g { ?s <http://www.w3.org/ns/shacl#targetClass> ?c } }",

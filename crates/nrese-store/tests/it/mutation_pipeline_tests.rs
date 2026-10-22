@@ -197,67 +197,313 @@ fn owl2_rl_rejects_inconsistent_commits() {
     assert!(!contains(&pipeline, &conflicting));
 }
 
-/// The G3 safety audit (7 October 2026): a commit the OWL 2 RL gate rejects listed its
-/// premises whatever the committer could read. A committer who may read and write `open`
-/// only is rejected for what the secret schema makes inconsistent, and the rejection shows
-/// the premises asserted in the graphs it may read: not the secret disjointness, nor the
-/// type the secret subclass axiom infers. A committer who reads everything sees them all.
+/// The G3 safety audit (7 October 2026) and N12 (Sol r1, F3): a commit the OWL 2 RL gate
+/// rejects listed its premises, and counted its violations, whatever the committer could
+/// read. A committer who may read and write `open` only is rejected for what the secret
+/// schema makes inconsistent with the same report however many secret axioms it breaks: no
+/// premise, no count, and the same fixed reason where the violated statements are all in
+/// `open` (Sol r2: what the envelope let the gate keep mustn't show). A
+/// committer who reads everything sees every premise and the count.
 #[test]
-fn an_rl_rejection_shows_no_premise_of_a_graph_the_committer_cannot_read() {
+fn an_rl_rejection_shows_nothing_that_depends_on_graphs_the_committer_cannot_read() {
     use nrese_sparql::GraphAccess;
     use nrese_store::{ReadScope, Requester, WriteScope};
-    let setup = format!(
-        "GRAPH <{EX}secret> {{ <{EX}A> <http://www.w3.org/2002/07/owl#disjointWith> <{EX}B> .
-           <{EX}C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <{EX}B> }}
-         GRAPH <{EX}open> {{ <{EX}x> a <{EX}A> }}"
-    );
-    let conflicting = format!("GRAPH <{EX}open> {{ <{EX}x> a <{EX}C> }}");
+    const DISJOINT: &str = "http://www.w3.org/2002/07/owl#disjointWith";
     let access = Arc::new(GraphAccess {
         graphs: vec![format!("{EX}open")],
         ..GraphAccess::default()
     });
-    let committers = [
-        Requester::new(
-            ReadScope::Graphs(Arc::clone(&access)),
-            WriteScope::Graphs(Arc::clone(&access)),
-        ),
-        Requester::all(),
-    ];
-    for (restricted, committer) in [true, false].into_iter().zip(committers) {
+    let restricted = Requester::new(
+        ReadScope::Graphs(Arc::clone(&access)),
+        WriteScope::Graphs(Arc::clone(&access)),
+    );
+    let conflicting = format!("GRAPH <{EX}open> {{ <{EX}x> a <{EX}B> , <{EX}C> }}");
+    let reject = |schema: &str, committer: &Requester| {
         let pipeline = pipeline(ReasoningMode::Owl2Rl);
         pipeline
             .apply(
-                insert(&setup),
-                &nrese_store::Requester::all(),
+                insert(&format!(
+                    "{schema} GRAPH <{EX}open> {{ <{EX}x> a <{EX}A> }}"
+                )),
+                &Requester::all(),
                 &MutationTicket::new(),
             )
             .expect("consistent setup");
-        let result = pipeline.apply(insert(&conflicting), &committer, &MutationTicket::new());
+        let result = pipeline.apply(insert(&conflicting), committer, &MutationTicket::new());
         let Err(MutationError::Rejected(reject)) = result else {
             panic!("expected a rejection, got {result:?}");
         };
-        let explanation = reject.explanation.expect("an explanation");
-        let shown: Vec<String> = explanation
-            .evidence
+        reject
+    };
+    let secret = |pairs: &[&str]| {
+        let axioms: String = pairs
             .iter()
-            .map(|e| format!("{} {} {}", e.subject, e.predicate, e.object))
+            .map(|c| format!("<{EX}A> <{DISJOINT}> <{EX}{c}> . "))
             .collect();
-        let secret = |text: &str| text.contains("disjointWith") || text.contains(&format!("{EX}B"));
-        if restricted {
-            // The committer's own statement, nothing of the secret graph or inferred from it.
-            assert!(
-                shown
-                    .iter()
-                    .any(|s| s.contains(&format!("{EX}x")) && s.contains(&format!("{EX}A"))),
-                "{shown:#?}"
-            );
-            assert!(!shown.iter().any(|s| secret(s)), "{shown:#?}");
-            assert!(!secret(&explanation.summary), "{}", explanation.summary);
-            assert!(!secret(&reject.detail), "{}", reject.detail);
-            assert!(reject.detail.contains("not shown"), "{}", reject.detail);
-        } else {
-            assert_eq!(shown.len(), 3, "{shown:#?}");
-            assert!(shown.iter().any(|s| secret(s)), "{shown:#?}");
+        format!("GRAPH <{EX}secret> {{ {axioms} }}")
+    };
+    let one = reject(&secret(&["B"]), &restricted);
+    let two = reject(&secret(&["B", "C"]), &restricted);
+    assert_eq!(one.detail, two.detail);
+    assert_eq!(one.explanation, two.explanation);
+    assert!(!one.detail.contains("disjointWith"), "{}", one.detail);
+    assert!(one.explanation.expect("an explanation").evidence.is_empty());
+    // The violated statements all in `open`: the same fixed reason (Sol r2, R2-F2).
+    let open = reject(
+        &format!("GRAPH <{EX}open> {{ <{EX}A> <{DISJOINT}> <{EX}B> }}"),
+        &restricted,
+    );
+    assert_eq!(open.detail, one.detail);
+    // Every graph: every premise, and the count.
+    let all = reject(&secret(&["B", "C"]), &Requester::all());
+    assert!(
+        all.detail.contains("violates 2 consistency check(s)"),
+        "{}",
+        all.detail
+    );
+    assert_eq!(all.explanation.expect("an explanation").evidence.len(), 3);
+}
+
+/// N12 (attack review r1, P2-9 and P2-10): a restricted committer's RL rejection says
+/// nothing false, and shows only a violation whose premises are typed whole (by where its
+/// rule came from, not by its rule's name); the administrators' diagnostics keep the whole
+/// violation. Its own data in `open` conflicts through an inferred premise: not shown,
+/// with a reason that doesn't claim graphs it can't read. A rule instantiated from a list
+/// axiom, even one in `open`: not shown, its list not among its premises.
+#[test]
+fn a_restricted_rl_rejection_is_truthful_and_admins_keep_its_evidence() {
+    use nrese_sparql::GraphAccess;
+    use nrese_store::{ReadScope, Requester, WriteScope};
+    const OWL: &str = "http://www.w3.org/2002/07/owl#";
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
+    let access = Arc::new(GraphAccess {
+        graphs: vec![format!("{EX}open")],
+        ..GraphAccess::default()
+    });
+    let committer = Requester::new(
+        ReadScope::Graphs(Arc::clone(&access)),
+        WriteScope::Graphs(access),
+    );
+    let reject = |setup: &str, conflicting: &str| {
+        let pipeline = pipeline(ReasoningMode::Owl2Rl);
+        pipeline
+            .apply(insert(setup), &Requester::all(), &MutationTicket::new())
+            .expect("consistent setup");
+        let result = pipeline.apply(insert(conflicting), &committer, &MutationTicket::new());
+        let Err(MutationError::Rejected(reject)) = result else {
+            panic!("expected a rejection, got {result:?}");
+        };
+        let recorded = pipeline
+            .last_reasoning_run()
+            .and_then(|run| run.primary_reject)
+            .expect("the run's diagnostics");
+        (reject, recorded)
+    };
+    // Through an inferred premise: `x a B` follows from `x a C`.
+    let (own, recorded) = reject(
+        &format!(
+            "GRAPH <{EX}open> {{ <{EX}A> <{OWL}disjointWith> <{EX}B> .
+               <{EX}C> <{RDFS}subClassOf> <{EX}B> . <{EX}x> a <{EX}A> }}"
+        ),
+        &format!("GRAPH <{EX}open> {{ <{EX}x> a <{EX}C> }}"),
+    );
+    assert!(own.detail.contains("administrator"), "{}", own.detail);
+    assert!(!own.detail.contains("can read"), "{}", own.detail);
+    assert!(own.explanation.expect("an explanation").evidence.is_empty());
+    assert_eq!(recorded.evidence.len(), 3, "{recorded:#?}");
+    // A list axiom in `open`: a list rule's violation isn't whole.
+    let (list, recorded) = reject(
+        &format!(
+            "GRAPH <{EX}open> {{ _:d a <{OWL}AllDisjointClasses> ; <{OWL}members> _:l .
+               _:l <{RDF}first> <{EX}A> ; <{RDF}rest> _:m .
+               _:m <{RDF}first> <{EX}B> ; <{RDF}rest> <{RDF}nil> .
+               <{EX}x> a <{EX}A> }}"
+        ),
+        &format!("GRAPH <{EX}open> {{ <{EX}x> a <{EX}B> }}"),
+    );
+    assert_eq!(list.detail, own.detail);
+    assert!(
+        list.explanation
+            .expect("an explanation")
+            .evidence
+            .is_empty()
+    );
+    assert_eq!(recorded.violated_constraint, "cax-adc", "{recorded:#?}");
+}
+
+/// N12 (Sol r2, R2-F2): a restricted committer's RL rejection is one fixed reason, the same
+/// byte for byte whatever secret violations the commit also causes and however small the
+/// operation's memory envelope (whose refusals stop the list of violations the gate keeps).
+/// A readable violation is present in every world: before, it was shown where the list kept
+/// it and not where secret ones had used the envelope up.
+#[test]
+fn a_restricted_rl_rejection_is_the_same_whatever_secret_work_it_causes() {
+    use nrese_sparql::GraphAccess;
+    use nrese_store::{ReadScope, Requester, WriteScope};
+    const DISJOINT: &str = "http://www.w3.org/2002/07/owl#disjointWith";
+    let access = Arc::new(GraphAccess {
+        graphs: vec![format!("{EX}open")],
+        ..GraphAccess::default()
+    });
+    let committer = Requester::new(
+        ReadScope::Graphs(Arc::clone(&access)),
+        WriteScope::Graphs(access),
+    );
+    let reply = |secrets: usize, envelope: usize| {
+        let store = StoreService::new(nrese_store::StoreConfig {
+            total_query_memory_bytes: envelope,
+            ..in_memory_store_config()
+        })
+        .expect("store");
+        let pipeline = MutationPipeline::new(
+            Arc::new(store),
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+        );
+        let secret: String = (0..secrets)
+            .map(|i| format!("<{EX}B> <{DISJOINT}> <{EX}D{i}> . <{EX}x> a <{EX}D{i}> . "))
+            .collect();
+        pipeline
+            .apply(
+                insert(&format!(
+                    "GRAPH <{EX}open> {{ <{EX}A> <{DISJOINT}> <{EX}B> . <{EX}x> a <{EX}A> }}
+                     GRAPH <{EX}secret> {{ {secret} }}"
+                )),
+                &Requester::all(),
+                &MutationTicket::new(),
+            )
+            .expect("consistent setup");
+        let result = pipeline.apply(
+            insert(&format!("GRAPH <{EX}open> {{ <{EX}x> a <{EX}B> }}")),
+            &committer,
+            &MutationTicket::new(),
+        );
+        let Err(MutationError::Rejected(reject)) = result else {
+            panic!("{secrets} secrets, envelope {envelope}: expected a rejection, got {result:?}");
+        };
+        format!(
+            "{} {:?} {:?}",
+            reject.detail, reject.explanation, reject.attribution
+        )
+    };
+    let alone = reply(0, 0);
+    assert!(
+        alone.contains("details are available to an administrator"),
+        "{alone}"
+    );
+    for (secrets, envelope) in [(0, 4_096), (50, 0), (50, 4_096)] {
+        assert_eq!(
+            reply(secrets, envelope),
+            alone,
+            "{secrets} secrets, envelope {envelope}"
+        );
+    }
+}
+
+/// D-1 (the owner's recorded exception): under a global consistency gate, whether a
+/// restricted principal's commit is accepted tells whether it conflicts with data it can't
+/// read, a bit per commit. The pipeline counts those rejections by principal, so operators
+/// can spot probing; a reader of every graph isn't counted.
+#[test]
+fn a_restricted_rejection_is_counted_by_principal() {
+    use nrese_sparql::GraphAccess;
+    use nrese_store::{ReadScope, Requester, WriteScope};
+    const DISJOINT: &str = "http://www.w3.org/2002/07/owl#disjointWith";
+    let access = Arc::new(GraphAccess {
+        graphs: vec![format!("{EX}open")],
+        ..GraphAccess::default()
+    });
+    let alice = Requester::new(
+        ReadScope::Graphs(Arc::clone(&access)),
+        WriteScope::Graphs(access),
+    )
+    .with_principal(Some("alice".to_owned()));
+    let pipeline = pipeline(ReasoningMode::Owl2Rl);
+    pipeline
+        .apply(
+            insert(&format!(
+                "GRAPH <{EX}secret> {{ <{EX}A> <{DISJOINT}> <{EX}B> }}
+                 GRAPH <{EX}open> {{ <{EX}x> a <{EX}A> }}"
+            )),
+            &Requester::all(),
+            &MutationTicket::new(),
+        )
+        .expect("consistent setup");
+    let conflicting = format!("GRAPH <{EX}open> {{ <{EX}x> a <{EX}B> }}");
+    for committer in [&alice, &alice, &Requester::all()] {
+        let result = pipeline.apply(insert(&conflicting), committer, &MutationTicket::new());
+        assert!(
+            matches!(result, Err(MutationError::Rejected(_))),
+            "{result:?}"
+        );
+    }
+    let counted = pipeline.restricted_rejections();
+    assert_eq!(counted.len(), 1, "{counted:?}");
+    assert_eq!(
+        (counted[0].principal.as_str(), counted[0].rejections),
+        ("alice", 2)
+    );
+    assert_eq!(counted[0].principal_hash.len(), 16);
+    assert!(!counted[0].principal_hash.contains("alice"));
+}
+
+/// N12 (RSH-01): a violation no static rule names (a synthesised datatype check, a rule
+/// generated from a list) was explained by its raw bindings, decoded whatever the
+/// committer could read. A committer of `open` is still rejected, and no term of the
+/// secret graph reaches the detail, the summary, the focus or the evidence.
+#[test]
+fn a_rejection_without_a_readable_premise_decodes_no_binding() {
+    use nrese_sparql::GraphAccess;
+    use nrese_store::{ReadScope, Requester, WriteScope};
+    const OWL: &str = "http://www.w3.org/2002/07/owl#";
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let rows = [
+        // dt-diff: a public functional data property, a secret value, a new one.
+        (
+            format!(
+                "GRAPH <{EX}open> {{ <{EX}p> a <{OWL}FunctionalProperty> , <{OWL}DatatypeProperty> }}
+                 GRAPH <{EX}secret> {{ <{EX}a> <{EX}p> \"SECRET\" }}"
+            ),
+            format!("GRAPH <{EX}open> {{ <{EX}a> <{EX}p> \"new\" }}"),
+            "SECRET",
+        ),
+        // cax-adc, generated from the list: a secret instance of both classes.
+        (
+            format!("GRAPH <{EX}secret> {{ <{EX}hidden> a <{EX}A> , <{EX}B> }}"),
+            format!(
+                "GRAPH <{EX}open> {{ _:d a <{OWL}AllDisjointClasses> ; <{OWL}members> _:l .
+                   _:l <{RDF}first> <{EX}A> ; <{RDF}rest> _:m .
+                   _:m <{RDF}first> <{EX}B> ; <{RDF}rest> <{RDF}nil> }}"
+            ),
+            "hidden",
+        ),
+    ];
+    let access = Arc::new(GraphAccess {
+        graphs: vec![format!("{EX}open")],
+        ..GraphAccess::default()
+    });
+    let committer = Requester::new(
+        ReadScope::Graphs(Arc::clone(&access)),
+        WriteScope::Graphs(access),
+    );
+    for (setup, conflicting, secret) in rows {
+        let pipeline = pipeline(ReasoningMode::Owl2Rl);
+        pipeline
+            .apply(insert(&setup), &Requester::all(), &MutationTicket::new())
+            .expect("consistent setup");
+        let result = pipeline.apply(insert(&conflicting), &committer, &MutationTicket::new());
+        let Err(MutationError::Rejected(reject)) = result else {
+            panic!("{secret}: expected a rejection, got {result:?}");
+        };
+        let explanation = reject.explanation.expect("an explanation");
+        let evidence = format!("{:?}", explanation.evidence);
+        for text in [
+            &reject.detail,
+            &explanation.summary,
+            &explanation.focus_resource,
+            &evidence,
+        ] {
+            assert!(!text.contains(secret), "{secret}: {text}");
         }
     }
 }

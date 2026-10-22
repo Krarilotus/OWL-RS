@@ -38,16 +38,30 @@ pub struct Explanation {
 /// Derivations collected per fact.
 const BRANCHES: usize = 16;
 
+/// Why [`explain`] gave no derivation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unexplained {
+    /// The fact doesn't hold in the state.
+    DoesNotHold,
+    /// It holds, and the search, within its limits throughout, found no derivation of it
+    /// from asserted facts.
+    NoDerivation,
+    /// A limit cut the search short (what it says): a derivation may exist past it. Not an
+    /// answer that the fact doesn't hold.
+    Limit(&'static str),
+}
+
 /// The derivation of `fact` over the materialised state `base` under `rules`, if `fact`
-/// holds there; facts examined at most `budget`.
+/// holds there; facts examined at most `budget`, past which the answer is a
+/// [`Unexplained::Limit`].
 pub fn explain<B: Base + ?Sized>(
     base: &B,
     rules: Rules<'_>,
     fact: Triple,
     budget: usize,
-) -> Option<Explanation> {
+) -> Result<Explanation, Unexplained> {
     if !base.contains(fact) {
-        return None;
+        return Err(Unexplained::DoesNotHold);
     }
     let program = super::delta::program(base, rules);
     explain_with(base, &program, fact, budget)
@@ -59,8 +73,10 @@ pub fn explain_with<B: Base + ?Sized>(
     program: &GroundProgram,
     fact: Triple,
     budget: usize,
-) -> Option<Explanation> {
+) -> Result<Explanation, Unexplained> {
     let source = Whole(base);
+    // A limit the collection reached: a derivation may lie past it.
+    let mut cut: Option<&'static str> = None;
     // Backwards: the derivations of every inferred fact reachable from `fact`.
     let mut derivations: HashMap<Triple, Vec<(String, Vec<Triple>)>> = HashMap::new();
     let mut queue = vec![fact];
@@ -69,9 +85,13 @@ pub fn explain_with<B: Base + ?Sized>(
             continue;
         }
         if derivations.len() >= budget {
+            cut = Some("the explanation's budget of facts to examine ran out");
             break;
         }
         let mut found = program.named_derivations(&source, next, BRANCHES);
+        if found.len() >= BRANCHES {
+            cut.get_or_insert("a fact had more derivations than the explanation collects per fact");
+        }
         if program.bodiless.contains(&next) {
             found.insert(
                 0,
@@ -131,7 +151,7 @@ pub fn explain_with<B: Base + ?Sized>(
         proved.extend(round);
     }
     if !proved.contains_key(&fact) && !base.is_asserted(fact) {
-        return None;
+        return Err(cut.map_or(Unexplained::NoDerivation, Unexplained::Limit));
     }
     // The proof of `fact`, each fact once.
     let mut steps: Vec<Step> = Vec::new();
@@ -167,7 +187,7 @@ pub fn explain_with<B: Base + ?Sized>(
         at
     }
     add(fact, &proved, &mut steps, &mut index);
-    Some(Explanation { steps })
+    Ok(Explanation { steps })
 }
 
 /// One-step derivations collected per fact for a proof graph: enough for every
@@ -290,6 +310,31 @@ mod tests {
     use super::super::delta::MemoryBase;
     use super::super::ir::{Atom, Head, Rule, Term};
     use super::*;
+
+    /// A derivation deeper than the budget (fact i from fact i - 1, 200 steps) isn't
+    /// answered as one that doesn't hold, nor as no derivation: the budget is the reason.
+    /// With room, the same search proves it.
+    #[test]
+    fn a_derivation_past_the_budget_is_a_limit_not_an_absence() {
+        let facts: Vec<Triple> = (0u64..=200).map(|i| [i, 7, 8]).collect();
+        let base = MemoryBase::new(&facts[..1], &facts[1..]);
+        let mut program = GroundProgram::default();
+        let atom = |fact: Triple| Atom(fact.map(Term::Const));
+        for i in 1..=200 {
+            program.add(Rule {
+                name: format!("step_{i}"),
+                body: vec![atom(facts[i - 1])],
+                guards: vec![],
+                head: Head::Facts(vec![atom(facts[i])]),
+            });
+        }
+        assert!(matches!(
+            explain_with(&base, &program, facts[200], 50),
+            Err(Unexplained::Limit(_))
+        ));
+        let proof = explain_with(&base, &program, facts[200], 300).expect("within the budget");
+        assert_eq!(proof.steps.len(), 201);
+    }
 
     #[test]
     fn a_proof_dag_with_shared_premises_does_not_overflow_its_size() {

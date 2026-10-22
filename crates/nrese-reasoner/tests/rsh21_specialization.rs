@@ -132,7 +132,10 @@ x <urn:out> y
     let proof =
         r::explain::explain_with(&now, &cache, want, 64).expect("survivor keeps original proof");
     assert_eq!(proof.steps[0].rule.as_deref(), Some("eq-rep-p"));
-    assert!(r::explain::explain_with(&now, &cache, [s, never, o], 64).is_none());
+    assert!(matches!(
+        r::explain::explain_with(&now, &cache, [s, never, o], 64),
+        Err(r::explain::Unexplained::NoDerivation)
+    ));
 }
 
 fn region_control(survives: bool) {

@@ -9,7 +9,7 @@ use rayon::prelude::*;
 use super::{Program, encode, storable};
 use crate::batch::{self, Phases, Schema};
 use crate::delta;
-use crate::ir::{Triple, Violation};
+use crate::ir::{Triple, Violations};
 use crate::lists::ListDiagnostic;
 
 /// A closure computed over engine term ids.
@@ -20,7 +20,7 @@ pub struct Closure {
     /// The derived facts no store can hold (a literal subject, a non-IRI predicate). A
     /// first load whose closure has any takes the delta executor ([`super::maintain`]).
     pub unstorable: Vec<Triple>,
-    pub violations: Vec<Violation>,
+    pub violations: Violations,
     /// List axioms that weren't instantiated.
     pub diagnostics: Vec<ListDiagnostic>,
     pub rounds: usize,
@@ -38,27 +38,42 @@ pub fn materialise_until(
     snapshot: &Snapshot,
     stop: crate::eval::Stop<'_>,
 ) -> Result<Closure, delta::Interrupted> {
+    let unlimited = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+    materialise_within(program, snapshot, stop, &unlimited)
+}
+
+/// [`materialise_until`], the violations it finds charged to `budget` (the operation's:
+/// [`Violations`]).
+pub fn materialise_within(
+    program: &Program,
+    snapshot: &Snapshot,
+    stop: crate::eval::Stop<'_>,
+    budget: &std::sync::Arc<nrese_exec::Budget>,
+) -> Result<Closure, delta::Interrupted> {
     nrese_exec::heap::phase("reasoner: input");
     let (input, axioms) = input_of(program, snapshot);
     let schema = program.schema_for(snapshot);
     let result = match program.same_as.filter(|_| program.by_representatives) {
-        Some(same_as) => by_representatives(program, input, same_as, &schema, stop)?,
-        None => batch::materialise_grouped_until(
+        Some(same_as) => by_representatives(program, input, same_as, &schema, stop, budget)?,
+        None => batch::materialise_grouped_within(
             input,
             &program.rules,
             program.lists.as_ref(),
             &schema,
             stop,
+            budget,
         )?,
     };
     nrese_exec::heap::phase("reasoner: datatype checks");
     let mut violations = result.violations;
-    violations.extend(super::datatypes::violations(
+    super::datatypes::violations(
         &result.derived,
         program.rdf_type,
         program.same_as,
         &|id| snapshot.decode(TermId::from_raw(id)),
-    ));
+        &mut violations,
+    );
+    violations.finish();
     nrese_exec::heap::phase("store: encode");
     // At its exact size: collected by doubling, the list held up to twice the facts, and
     // at a doubling three times, beside them (LUBM 1000: 6.6 GB at this step's peak).
@@ -118,18 +133,20 @@ fn by_representatives(
     same_as: u64,
     schema: &Schema,
     stop: crate::eval::Stop<'_>,
+    budget: &std::sync::Arc<nrese_exec::Budget>,
 ) -> Result<batch::Materialisation, delta::Interrupted> {
     let listing = match program.store_representatives {
         true => batch::Listing::Stored,
         false => batch::Listing::Expanded,
     };
-    let mut result = batch::materialise_representatives_until(
+    let mut result = batch::materialise_representatives_within(
         batch::Input::Grouped(input),
         &program.rules,
         program.lists.as_ref(),
         schema,
         listing,
         stop,
+        budget,
     )?;
     if program.store_representatives && !result.classes.is_empty() {
         let classes = &result.classes;

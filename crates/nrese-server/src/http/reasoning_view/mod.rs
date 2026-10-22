@@ -6,4 +6,4 @@ mod types;
 pub use mapping::{
     capability_view, last_run_view, materialisation_view, reject_diagnostics_baseline,
 };
-pub use types::ReasoningDiagnosticsResponse;
+pub use types::{ReasoningDiagnosticsResponse, RestrictedRejectionsView};

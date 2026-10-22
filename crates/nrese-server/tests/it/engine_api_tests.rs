@@ -401,6 +401,57 @@ async fn sessions_collect_writes_and_commit_them_as_one() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// An explanation whose search runs out of its budget (a derivation of 4,100 user-rule
+/// steps, past the 4,096 facts it examines) is answered 200, incomplete with the limit, not
+/// 404 "the statement doesn't hold": a work limit isn't a negative answer.
+#[tokio::test]
+async fn an_explanation_past_its_budget_is_answered_incomplete() {
+    let text: String = (0..4_100)
+        .map(|i| {
+            format!(
+                "{{ ?x <http://example.com/p{i}> ?y }} => {{ ?x <http://example.com/p{}> ?y }} .\n",
+                i + 1
+            )
+        })
+        .collect();
+    let rules = std::sync::Arc::new(
+        nrese_reasoner::UserRules::n3("chain.n3", &text).expect("the rules compile"),
+    );
+    let app = crate::support::test_app_with_settings(
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Custom)
+            .with_rules(Some(rules))
+            .expect("custom rules"),
+    )
+    .unwrap();
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/dataset/update",
+        Some("application/sparql-update"),
+        "INSERT DATA { <http://example.com/a> <http://example.com/p0> <http://example.com/b> }",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, text) = send(
+        &app,
+        Method::GET,
+        "/api/v1/repositories/nrese/explain?subj=%3Chttp%3A%2F%2Fexample.com%2Fa%3E\
+         &pred=%3Chttp%3A%2F%2Fexample.com%2Fp4100%3E&obj=%3Chttp%3A%2F%2Fexample.com%2Fb%3E",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["complete"], false, "{text}");
+    assert!(body["reason"].is_string(), "{text}");
+    assert!(
+        body["steps"].as_array().is_some_and(Vec::is_empty),
+        "{text}"
+    );
+}
+
 #[tokio::test]
 async fn explanations_through_the_engine_api() {
     let app = crate::support::test_app_with_settings(
