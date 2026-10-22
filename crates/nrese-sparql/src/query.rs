@@ -81,8 +81,8 @@ pub struct QueryOptions {
     pub equality_early_expansion: bool,
     /// Pre-bound variables (SHACL-SPARQL's `$this`, `$value`, parameters): their values
     /// are put in for them throughout the query before it is evaluated, as SHACL §5.6
-    /// defines pre-binding. A subquery sees them only where it projects them; the query's
-    /// own projection drops them (the caller knows their values).
+    /// defines pre-binding. Subqueries see them even where they do not project them;
+    /// projections drop them from the result (the caller knows their values).
     pub pre_bound:
         Option<std::sync::Arc<std::collections::HashMap<nrese_rdf::Variable, nrese_rdf::Term>>>,
     /// The rows of a cross product made at once below a GROUP BY (the product is grouped
