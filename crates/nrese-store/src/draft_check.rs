@@ -283,17 +283,17 @@ fn check_shacl(inputs: &DraftInputs, limits: &DraftLimits) -> Checked {
         }
         Err(error) => return Err(failed(format!("SHACL validation failed: {error}"))),
     };
-    if !report.failures.is_empty() {
+    if !report.failures().is_empty() {
         return Err(failed(format!(
             "SHACL validation reached no verdict: {}",
-            report.failures.join("; ")
+            report.failures().join("; ")
         )));
     }
     Ok(DraftOutcome {
-        shacl_conforms: Some(report.results.is_empty()),
+        shacl_conforms: Some(report.results().is_empty()),
         shacl_applicable: Some(applicable),
         shacl_meta_validated: Some(true),
-        ..DraftOutcome::completed(format!("{} validation results", report.results.len()))
+        ..DraftOutcome::completed(format!("{} validation results", report.results().len()))
     })
 }
 

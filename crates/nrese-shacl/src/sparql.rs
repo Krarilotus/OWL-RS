@@ -26,9 +26,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::graph::stopped;
 use nrese_engine::TermId;
-use nrese_rdf::{NamedNode, Term, Variable};
-use nrese_sparql::{QueryOptions, QueryResults, ReadView};
+use nrese_exec::{Budget, ChargedVec, Reservation, Ticker, map_bytes};
+use nrese_rdf::{GraphName, NamedNode, Term, Variable};
+use nrese_sparql::{QueryEvaluationError, QueryOptions, QueryResults, ReadView, Resources};
 use nrese_sparql_syntax::algebra::{Expression, GraphPattern, PropertyPathExpression};
 
 use crate::graph::Selection;
@@ -173,19 +175,21 @@ pub(crate) struct Found {
 }
 
 /// What a check found for one focus node: per value node (ASK) or per solution (SELECT).
-pub(crate) enum Outcome {
-    /// The value nodes an ASK validator answered false for.
-    Failed(Vec<TermId>),
-    Solutions(Vec<Found>),
+pub(crate) enum Outcome<'b> {
+    Failed(ChargedVec<TermId, &'b Budget>),
+    Solutions {
+        found: ChargedVec<Found, &'b Budget>,
+        _held: Reservation<&'b Budget>,
+    },
 }
 
-/// Runs `check` for `focus` (with `values`, its value nodes, for an ASK validator) over
-/// `data`, with the pre-bound variables of SHACL-SPARQL.
+/// The query table/computed terms keep CT's charge. Only copied SHACL bindings and
+/// Found payloads are additionally admitted here; evaluator errors remain typed.
 #[expect(
     clippy::too_many_arguments,
-    reason = "The shared program and per-check parameters are separate borrowed inputs."
+    reason = "Existing borrowed check inputs plus the same request resources, budget and task ticker."
 )]
-pub(crate) fn run<V: ReadView>(
+pub(crate) fn run<'b, V: ReadView>(
     view: &V,
     data: Selection,
     check: &SparqlProgram,
@@ -194,63 +198,128 @@ pub(crate) fn run<V: ReadView>(
     values: &[TermId],
     shape: TermId,
     shapes_graph: Option<TermId>,
-) -> Result<Outcome, String> {
-    let decode = |id: TermId| {
-        view.decode(id)
-            .ok_or_else(|| format!("term #{} isn't known", id.raw()))
-    };
-    let mut bound: HashMap<Variable, Term> = HashMap::new();
+    resources: &Resources,
+    budget: &'b Budget,
+    ticker: &mut Ticker,
+) -> Result<Outcome<'b>, QueryEvaluationError> {
+    ticker.check().map_err(stopped)?;
+    // Exact upper bound on the existing pre-bound map's entries, not on query rows.
+    let count = 3usize
+        .checked_add(parameters.len())
+        .and_then(|n| n.checked_add(usize::from(check.ask)))
+        .ok_or_else(|| budget.refusal(usize::MAX))?;
+    let mut bound_held = Reservation::new(budget);
+    bound_held.charge(map_bytes::<(Variable, Term)>(count))?;
+    let mut bound: HashMap<Variable, Term> = HashMap::with_capacity(count);
     let variable = |name: &str| Variable::new_unchecked(name);
-    bound.insert(variable(THIS), decode(focus)?);
-    bound.insert(variable(CURRENT_SHAPE), decode(shape)?);
+    let decode = |id, held: &mut Reservation<&Budget>| -> Result<Term, QueryEvaluationError> {
+        view.decode_within(id, held)?.ok_or_else(|| {
+            QueryEvaluationError::Unexpected(format!("term #{} isn't known", id.raw()))
+        })
+    };
+    bound.insert(variable(THIS), decode(focus, &mut bound_held)?);
+    bound.insert(variable(CURRENT_SHAPE), decode(shape, &mut bound_held)?);
     if let Some(graph) = shapes_graph {
-        bound.insert(variable(SHAPES_GRAPH), decode(graph)?);
+        bound.insert(variable(SHAPES_GRAPH), decode(graph, &mut bound_held)?);
     }
     for (name, value) in check.parameters.iter().zip(parameters) {
-        bound.insert(name.clone(), decode(*value)?);
+        ticker.tick(1).map_err(stopped)?;
+        bound.insert(name.clone(), decode(*value, &mut bound_held)?);
     }
-    // The statements Core reads, shapes graphs left out ([`Selection::query_dataset`]).
-    let mut options = QueryOptions::default();
-    data.query_dataset(view, &mut options)?;
-    let evaluate = |bound: HashMap<Variable, Term>| {
+    let mut dataset_held = Reservation::new(budget);
+    let mut options = QueryOptions {
+        resources: resources.clone(),
+        ..Default::default()
+    };
+    data.query_dataset(view, &mut options, &mut dataset_held, ticker)?;
+    let evaluate = |bound: HashMap<Variable, Term>, query_held: &mut Reservation<&Budget>| {
+        if let Some(dataset) = &options.dataset {
+            for names in [
+                dataset.default_graph_graphs(),
+                dataset.excluded_default_graphs(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                query_held.charge(std::mem::size_of_val(names))?;
+                for name in names {
+                    query_held.charge(match name {
+                        GraphName::NamedNode(n) => n.heap_bytes(),
+                        GraphName::BlankNode(n) => n.heap_bytes(),
+                        GraphName::DefaultGraph => 0,
+                    })?;
+                }
+            }
+        }
         let options = QueryOptions {
             pre_bound: Some(Arc::new(bound)),
             ..options.clone()
         };
-        nrese_sparql::evaluate_query(view, &check.query, &options).map_err(|e| e.to_string())
+        nrese_sparql::evaluate_query(view, &check.query, &options)
     };
     if check.ask {
-        let mut failed = Vec::new();
+        let mut failed = ChargedVec::new(budget);
         for &value in values {
-            let mut bound = bound.clone();
-            bound.insert(variable(VALUE), decode(value)?);
-            match evaluate(bound)? {
+            ticker.tick(1).map_err(stopped)?;
+            // Existing ASK evaluation owns a pre-bound map per query. Its data-term
+            // clones are admitted beside the base map; no per-result Arc is introduced.
+            let mut query_held = Reservation::new(budget);
+            query_held.charge(map_bytes::<(Variable, Term)>(count))?;
+            for term in bound.values() {
+                query_held.charge(term.heap_bytes())?;
+            }
+            let mut chosen = HashMap::with_capacity(count);
+            chosen.extend(bound.iter().map(|(k, v)| (k.clone(), v.clone())));
+            chosen.insert(variable(VALUE), decode(value, &mut query_held)?);
+            ticker.check().map_err(stopped)?;
+            let result = evaluate(chosen, &mut query_held)?;
+            ticker.check().map_err(stopped)?;
+            match result {
                 QueryResults::Boolean(true) => {}
-                QueryResults::Boolean(false) => failed.push(value),
-                _ => return Err("an ASK validator isn't an ASK query".into()),
+                QueryResults::Boolean(false) => failed.push(value)?,
+                _ => {
+                    return Err(QueryEvaluationError::Unexpected(
+                        "an ASK validator isn't an ASK query".into(),
+                    ));
+                }
             }
         }
         return Ok(Outcome::Failed(failed));
     }
-    let QueryResults::Solutions(solutions) = evaluate(bound)? else {
-        return Err("a SELECT constraint isn't a SELECT query".into());
+    ticker.check().map_err(stopped)?;
+    let mut query_held = Reservation::new(budget);
+    let evaluated = evaluate(bound, &mut query_held)?;
+    ticker.check().map_err(stopped)?;
+    let QueryResults::Solutions(solutions) = evaluated else {
+        return Err(QueryEvaluationError::Unexpected(
+            "a SELECT constraint isn't a SELECT query".into(),
+        ));
     };
-    let mut found = Vec::new();
+    // The bound map may be retained by the iterator: keep its lease until it drops.
+    let mut held = Reservation::new(budget);
+    let mut found = ChargedVec::new(budget);
     for solution in solutions {
-        let solution = solution.map_err(|e| e.to_string())?;
-        let failure = matches!(
-            solution.get("failure"),
-            Some(Term::Literal(l)) if l.value() == "true"
-        );
+        ticker.tick(1).map_err(stopped)?;
+        let solution = solution?;
+        let failure =
+            matches!(solution.get("failure"), Some(Term::Literal(l)) if l.value() == "true");
+        // Charge only the data actually copied out of the CT-owned solution.
+        if let Some(value) = solution.get(VALUE) {
+            held.charge(value.heap_bytes())?;
+        }
         let path = match solution.get("path") {
-            Some(Term::NamedNode(path)) => Some(path.clone()),
+            Some(Term::NamedNode(path)) => {
+                held.charge(path.heap_bytes())?;
+                Some(path.clone())
+            }
             _ => None,
         };
         found.push(Found {
             value: solution.get(VALUE).cloned(),
             path,
             failure,
-        });
+        })?;
     }
-    Ok(Outcome::Solutions(found))
+    ticker.finish().map_err(stopped)?;
+    Ok(Outcome::Solutions { found, _held: held })
 }

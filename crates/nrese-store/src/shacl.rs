@@ -7,12 +7,13 @@
 //! [`StoreConfig::shapes_graph`]: crate::StoreConfig::shapes_graph
 
 use nrese_engine::{EncodedQuad, GraphSelector, ReadModel, TermId, Transaction};
+use nrese_exec::{ChargedVec, Stop};
 use nrese_rdf::{GraphName, NamedNode, NamedNodeRef, Term};
 use nrese_shacl::{
     CompileError, PropertyPath, Selection, Shapes, ValidationReport, compile, validate,
     validate_changes,
 };
-use nrese_sparql::{ReadView, Resources};
+use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 
 use crate::error::{StoreError, StoreResult};
 use crate::query::GraphResultFormat;
@@ -65,7 +66,7 @@ impl Default for ShaclValidationRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ShaclValidation {
     pub report: ValidationReport,
     /// The revision that was validated.
@@ -107,7 +108,7 @@ impl ShaclValidation {
             other => other.to_string(),
         };
         self.report
-            .results
+            .results()
             .iter()
             .map(|result| ShaclResultText {
                 focus_node: text(&result.focus_node),
@@ -172,8 +173,9 @@ fn validate_view<V: ReadView + Sync>(
         },
     };
     data.model = request.read_model;
-    let applicable = nrese_shacl::applicable(view, &shapes, data);
-    Ok((validate(view, &shapes, data), shapes.len(), applicable))
+    let report = validate(view, &shapes, data, resources).map_err(StoreError::SparqlEvaluation)?;
+    let applicable = report.applicable();
+    Ok((report, shapes.len(), applicable))
 }
 
 /// Fails if the commit in `tx` changes the graph `shapes_graph` and leaves shapes in it that
@@ -228,12 +230,16 @@ pub(crate) fn introduced(
         .any(|quad| quad.graph == shapes_id);
     if shapes_changed {
         let shapes_after = compile(&after, shapes_selection, resources).map_err(shapes_error)?;
-        let mut report = validate(&after, &shapes_after, data);
+        let mut report = validate(&after, &shapes_after, data, resources)
+            .map_err(StoreError::SparqlEvaluation)?;
         // Shapes that didn't compile before had no results.
         match compile(before, shapes_selection, resources) {
             Ok(shapes_before) => {
-                let earlier = validate(before, &shapes_before, data).results;
-                report.results.retain(|result| !earlier.contains(result));
+                let earlier = validate(before, &shapes_before, data, resources)
+                    .map_err(StoreError::SparqlEvaluation)?;
+                report = report
+                    .without_results_from(&earlier, resources)
+                    .map_err(StoreError::SparqlEvaluation)?;
             }
             Err(CompileError::Shapes(_)) => {}
             Err(error @ CompileError::Evaluation(_)) => return Err(shapes_error(error)),
@@ -244,18 +250,31 @@ pub(crate) fn introduced(
     if shapes.is_empty() {
         return Ok(None);
     }
-    let changed: Vec<EncodedQuad> = tx
-        .inserted()
-        .chain(tx.deleted())
-        .chain(
-            tx.inferred_inserted()
-                .chain(tx.inferred_deleted())
-                .map(nrese_engine::EncodedTriple::in_default_graph),
-        )
-        .collect();
-    Ok(Some(validate_changes(
-        before, &after, &shapes, data, &changed,
-    )))
+    let budget = resources.memory.part();
+    let mut changed = ChargedVec::<EncodedQuad, _>::new(&budget);
+    let stopped = |stop| {
+        StoreError::SparqlEvaluation(match stop {
+            Stop::Cancelled => QueryEvaluationError::Cancelled,
+            Stop::Memory(error) => QueryEvaluationError::MemoryLimit(error),
+            other => QueryEvaluationError::Unexpected(other.to_string()),
+        })
+    };
+    let mut ticker = resources.stop().ticker().map_err(stopped)?;
+    for quad in tx.inserted().chain(tx.deleted()).chain(
+        tx.inferred_inserted()
+            .chain(tx.inferred_deleted())
+            .map(nrese_engine::EncodedTriple::in_default_graph),
+    ) {
+        ticker.tick(1).map_err(stopped)?;
+        changed
+            .push(quad)
+            .map_err(QueryEvaluationError::from)
+            .map_err(StoreError::SparqlEvaluation)?;
+    }
+    ticker.finish().map_err(stopped)?;
+    validate_changes(before, &after, &shapes, data, &changed, resources)
+        .map(Some)
+        .map_err(StoreError::SparqlEvaluation)
 }
 
 impl StoreService {

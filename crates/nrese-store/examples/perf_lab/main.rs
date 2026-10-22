@@ -1277,7 +1277,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
                 &ShaclValidationRequest::default(),
             )?;
             times.push(started.elapsed());
-            results = validation.report.results.len();
+            results = validation.report.results().len();
             last = Some(validation);
         }
         if let (Some(path), Some(validation)) = (&args.shacl_report, &last) {

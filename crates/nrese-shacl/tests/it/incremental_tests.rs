@@ -76,7 +76,7 @@ fn random_quad(rng: &mut Rng) -> Quad {
 
 fn keys(report: &ValidationReport) -> BTreeSet<String> {
     report
-        .results
+        .results()
         .iter()
         .map(|r| {
             format!(
@@ -149,9 +149,17 @@ fn incremental_validation_equals_the_difference_of_full_validations() {
         }
         let changed: Vec<_> = tx.inserted().chain(tx.deleted()).collect();
         let after = tx.pending_snapshot();
-        let incremental = validate_changes(&before, &after, &shapes, data, &changed);
-        let full_before = keys(&validate(&before, &shapes, data));
-        let full_after = keys(&validate(&after, &shapes, data));
+        let incremental = validate_changes(
+            &before,
+            &after,
+            &shapes,
+            data,
+            &changed,
+            &Default::default(),
+        )
+        .unwrap();
+        let full_before = keys(&validate(&before, &shapes, data, &Default::default()).unwrap());
+        let full_after = keys(&validate(&after, &shapes, data, &Default::default()).unwrap());
         let expected: BTreeSet<String> = full_after.difference(&full_before).cloned().collect();
         assert_eq!(
             keys(&incremental),

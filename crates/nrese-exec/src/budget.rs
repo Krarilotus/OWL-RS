@@ -564,8 +564,12 @@ impl<B: Deref<Target = Budget>> Reservation<B> {
 
 impl Reservation<&Budget> {
     /// Retains the exact budget and original measurement origin, without readmission.
-    /// Only the combined token is promoted at the Scratch-to-Columns handoff.
-    pub(crate) fn into_shared(mut self, budget: &Arc<Budget>) -> Reservation<Arc<Budget>> {
+    /// No readmission or measurement retagging occurs. The caller keeps the promoted
+    /// token with its original payload until that payload is freed.
+    ///
+    /// # Panics
+    /// If `budget` is not the identical budget this reservation borrows.
+    pub fn into_shared(mut self, budget: &Arc<Budget>) -> Reservation<Arc<Budget>> {
         assert!(std::ptr::eq(self.budget(), &**budget), "one budget");
         Reservation {
             budget: Arc::clone(budget),

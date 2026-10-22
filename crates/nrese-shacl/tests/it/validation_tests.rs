@@ -137,8 +137,9 @@ fn the_selection_decides_which_statements_are_validated() {
     let snapshot = engine.snapshot();
     let shapes = compiled(&snapshot);
     let focus_nodes = |selection: Selection| -> Vec<String> {
-        let mut nodes: Vec<String> = validate(&snapshot, &shapes, selection)
-            .results
+        let mut nodes: Vec<String> = validate(&snapshot, &shapes, selection, &Default::default())
+            .unwrap()
+            .results()
             .iter()
             .map(|result| result.focus_node.to_string())
             .collect();
@@ -170,16 +171,34 @@ fn recursive_shapes_terminate() {
     let cycle = "ex:a ex:name \"A\" ; ex:knows ex:b . ex:b ex:name \"B\" ; ex:knows ex:a .";
     let engine_ok = engine(cycle, shapes);
     let snapshot = engine_ok.snapshot();
-    assert!(validate(&snapshot, &compiled(&snapshot), DEFAULT).conforms());
+    assert!(
+        validate(
+            &snapshot,
+            &compiled(&snapshot),
+            DEFAULT,
+            &Default::default()
+        )
+        .unwrap()
+        .conforms()
+    );
 
     let broken = "ex:a ex:name \"A\" ; ex:knows ex:b . ex:b ex:knows ex:a .";
     let engine_broken = engine(broken, shapes);
     let snapshot = engine_broken.snapshot();
-    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
-    assert_eq!(report.results.len(), 1, "{report:#?}");
-    assert_eq!(report.results[0].component.as_str(), Component::Node.iri());
+    let report = validate(
+        &snapshot,
+        &compiled(&snapshot),
+        DEFAULT,
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(report.results().len(), 1, "{report:#?}");
     assert_eq!(
-        report.results[0].value.as_ref().map(ToString::to_string),
+        report.results()[0].component.as_str(),
+        Component::Node.iri()
+    );
+    assert_eq!(
+        report.results()[0].value.as_ref().map(ToString::to_string),
         Some(ex("b"))
     );
 }
@@ -194,10 +213,16 @@ fn severities_messages_and_deactivation() {
          ex:Off sh:targetNode ex:a ; sh:deactivated true ; sh:path ex:age ; sh:maxCount 0 .",
     );
     let snapshot = engine.snapshot();
-    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    let report = validate(
+        &snapshot,
+        &compiled(&snapshot),
+        DEFAULT,
+        &Default::default(),
+    )
+    .unwrap();
     assert!(!report.conforms(), "a warning is a result too");
     let mut found: Vec<(String, String, Vec<String>)> = report
-        .results
+        .results()
         .iter()
         .map(|result| {
             (
@@ -233,9 +258,15 @@ fn the_report_is_an_rdf_graph() {
          ex:Fine sh:targetNode ex:b ; sh:path ex:name ; sh:minCount 1 .",
     );
     let snapshot = engine.snapshot();
-    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
-    assert_eq!(report.results.len(), 1);
-    let path = report.results[0].path.clone().expect("path");
+    let report = validate(
+        &snapshot,
+        &compiled(&snapshot),
+        DEFAULT,
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(report.results().len(), 1);
+    let path = report.results()[0].path.clone().expect("path");
     assert_eq!(
         path.to_string(),
         "(<http://example.com/parent>/^<http://example.com/parent>)"
@@ -331,9 +362,13 @@ fn path_is_substituted_only_as_a_predicate() {
             expected,
         ) {
             (Ok(shapes), Ok(results)) => {
-                let report = validate(&snapshot, &shapes, DEFAULT);
-                assert!(report.failures.is_empty(), "{query}: {:?}", report.failures);
-                assert_eq!(report.results.len(), results, "{query}");
+                let report = validate(&snapshot, &shapes, DEFAULT, &Default::default()).unwrap();
+                assert!(
+                    report.failures().is_empty(),
+                    "{query}: {:?}",
+                    report.failures()
+                );
+                assert_eq!(report.results().len(), results, "{query}");
             }
             (Err(nrese_shacl::CompileError::Shapes(errors)), Err(problem)) => assert!(
                 errors.iter().any(|error| error.message.contains(problem)),
@@ -361,10 +396,10 @@ fn sparql_constraints_read_the_data_core_reads() {
     let snapshot = engine.snapshot();
     let shapes = compiled(&snapshot);
     let data = Selection::of(GraphSelector::Any).excluding(id(&snapshot, SHAPES_GRAPH));
-    let report = validate(&snapshot, &shapes, data);
-    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let report = validate(&snapshot, &shapes, data, &Default::default()).unwrap();
+    assert!(report.failures().is_empty(), "{:?}", report.failures());
     let sources: Vec<String> = report
-        .results
+        .results()
         .iter()
         .map(|result| result.source_shape.to_string())
         .collect();
@@ -395,13 +430,13 @@ fn a_constraints_dataset_is_the_selection_whatever_its_form() {
         let snapshot = engine.snapshot();
         let shapes = compiled(&snapshot);
         let results = |selection: Selection| {
-            let report = validate(&snapshot, &shapes, selection);
+            let report = validate(&snapshot, &shapes, selection, &Default::default()).unwrap();
             assert!(
-                report.failures.is_empty(),
+                report.failures().is_empty(),
                 "{clause}: {:?}",
-                report.failures
+                report.failures()
             );
-            report.results.len()
+            report.results().len()
         };
         // ex:p is a term, but no graph is named so: leaving it out leaves the data as it is.
         let any = Selection::of(GraphSelector::Any);
@@ -513,12 +548,12 @@ fn compile_resources_success_holds_product_and_preserves_multiplicity() {
     let shapes = compile(&snapshot, shapes_selection(&snapshot), &resources).unwrap();
     drop(resources);
     assert!(memory.used() >= 9 * (3 * size_of::<usize>() + 2 * size_of::<TermId>()));
-    let report = validate(&snapshot, &shapes, DEFAULT);
-    assert!(report.failures.is_empty(), "{:?}", report.failures);
-    assert_eq!(report.results.len(), 9);
+    let report = validate(&snapshot, &shapes, DEFAULT, &Default::default()).unwrap();
+    assert!(report.failures().is_empty(), "{:?}", report.failures());
+    assert_eq!(report.results().len(), 9);
     assert!(
         report
-            .results
+            .results()
             .iter()
             .all(|r| r.messages.len() == 1 && r.messages[0].value() == "one message")
     );
@@ -544,8 +579,8 @@ fn current_shape_and_shapes_graph_are_bound_in_subqueries() {
         );
         let snapshot = engine.snapshot();
         let shapes = compiled(&snapshot);
-        let report = validate(&snapshot, &shapes, DEFAULT);
-        assert!(report.failures.is_empty(), "{query}: {:?}", report.failures);
-        assert_eq!(report.results.len(), 1, "{query}");
+        let report = validate(&snapshot, &shapes, DEFAULT, &Default::default()).unwrap();
+        assert!(report.failures().is_empty(), "{query}: {:?}", report.failures());
+        assert_eq!(report.results().len(), 1, "{query}");
     }
 }

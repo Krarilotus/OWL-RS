@@ -143,9 +143,19 @@ fn repeated_path_refuses_before_expansion_and_retains_success_until_drop() {
         memory.peak()
     );
     assert!(memory.used() >= 31 * 2 * size_of::<usize>());
-    let report = validate(&snapshot, &shapes, DEFAULT);
-    assert_eq!(report.results.len(), 1);
-    assert!(report.failures.is_empty());
+    let report = validate(
+        &snapshot,
+        &shapes,
+        DEFAULT,
+        &Resources {
+            memory: memory.clone(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(report.results().len(), 1);
+    assert!(report.failures().is_empty());
+    drop(report);
     drop(shapes);
     assert_eq!(memory.used(), 0);
 

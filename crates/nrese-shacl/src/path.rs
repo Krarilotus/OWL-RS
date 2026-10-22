@@ -1,103 +1,142 @@
-//! Property path evaluation: the value nodes of a focus node.
+//! Admitted property-path work over SHACL's selected graph.
 
 use nrese_engine::TermId;
-use nrese_sparql::ReadView;
+use nrese_exec::{Budget, ChargedVec, Ticker};
+use nrese_sparql::{QueryEvaluationError, ReadView};
 
-use crate::graph::GraphView;
+use crate::graph::{GraphView, sort_set, stopped};
 use crate::model::Path;
 
-/// The nodes `path` reaches from `node`, as a sorted set.
-pub(crate) fn values<V: ReadView>(
+type Nodes<'b> = ChargedVec<TermId, &'b Budget>;
+type Result<T> = std::result::Result<T, QueryEvaluationError>;
+
+pub(crate) fn values<'b, V: ReadView>(
     graph: &GraphView<'_, V>,
     path: &Path,
     node: TermId,
-) -> Vec<TermId> {
-    reach(graph, path, &[node], false)
+    budget: &'b Budget,
+    ticker: &mut Ticker,
+) -> Result<Nodes<'b>> {
+    reach(graph, path, &[node], false, budget, ticker)
 }
 
-/// The nodes that reach any of `from` (a sorted set) along `path`: the path followed
-/// backwards.
-pub(crate) fn back<V: ReadView>(
+pub(crate) fn back<'b, V: ReadView>(
     graph: &GraphView<'_, V>,
     path: &Path,
     from: &[TermId],
-) -> Vec<TermId> {
-    reach(graph, path, from, true)
+    budget: &'b Budget,
+    ticker: &mut Ticker,
+) -> Result<Nodes<'b>> {
+    reach(graph, path, from, true, budget, ticker)
 }
 
-fn union(mut nodes: Vec<TermId>) -> Vec<TermId> {
-    nodes.sort_unstable();
-    nodes.dedup();
-    nodes
+fn copy<'b>(from: &[TermId], budget: &'b Budget, ticker: &mut Ticker) -> Result<Nodes<'b>> {
+    ticker.check().map_err(stopped)?;
+    let mut out = ChargedVec::with_capacity(budget, from.len())?;
+    out.extend_from_slice(from)?;
+    ticker
+        .tick(u32::try_from(from.len()).unwrap_or(u32::MAX))
+        .map_err(stopped)?;
+    Ok(out)
 }
 
-/// The nodes `path` reaches from any of `from` (a sorted set), following it backwards if
-/// `inverse`.
-fn reach<V: ReadView>(
+fn union<'b>(mut nodes: Nodes<'b>, ticker: &mut Ticker) -> Result<Nodes<'b>> {
+    let kept = sort_set(&mut nodes, ticker)?;
+    nodes.truncate(kept);
+    Ok(nodes)
+}
+
+fn reach<'b, V: ReadView>(
     graph: &GraphView<'_, V>,
     path: &Path,
     from: &[TermId],
     inverse: bool,
-) -> Vec<TermId> {
+    budget: &'b Budget,
+    ticker: &mut Ticker,
+) -> Result<Nodes<'b>> {
+    ticker.tick(1).map_err(stopped)?;
     match path {
-        Path::Predicate(predicate) => union(
-            from.iter()
-                .flat_map(|&node| {
-                    if inverse {
-                        graph.subjects(*predicate, node)
-                    } else {
-                        graph.objects(node, *predicate)
-                    }
-                })
-                .collect(),
-        ),
-        Path::Inverse(inner) => reach(graph, inner, from, !inverse),
-        Path::Sequence(parts) => {
-            let mut nodes = from.to_vec();
-            let mut step = |part: &Path| nodes = reach(graph, part, &nodes, inverse);
-            if inverse {
-                parts.iter().rev().for_each(&mut step);
-            } else {
-                parts.iter().for_each(&mut step);
+        Path::Predicate(predicate) => {
+            let mut out = ChargedVec::new(budget);
+            for &node in from {
+                ticker.tick(1).map_err(stopped)?;
+                let next = if inverse {
+                    graph.subjects_within(*predicate, node, budget, ticker)?
+                } else {
+                    graph.objects_within(node, *predicate, budget, ticker)?
+                };
+                out.extend_from_slice(&next)?;
             }
-            nodes
+            union(out, ticker)
         }
-        Path::Alternative(parts) => union(
-            parts
-                .iter()
-                .flat_map(|part| reach(graph, part, from, inverse))
-                .collect(),
+        Path::Inverse(inner) => reach(graph, inner, from, !inverse, budget, ticker),
+        Path::Sequence(parts) => {
+            let mut nodes = copy(from, budget, ticker)?;
+            if inverse {
+                for part in parts.iter().rev() {
+                    nodes = reach(graph, part, &nodes, inverse, budget, ticker)?;
+                }
+            } else {
+                for part in parts {
+                    nodes = reach(graph, part, &nodes, inverse, budget, ticker)?;
+                }
+            }
+            Ok(nodes)
+        }
+        Path::Alternative(parts) => {
+            let mut out = ChargedVec::new(budget);
+            for part in parts {
+                let next = reach(graph, part, from, inverse, budget, ticker)?;
+                out.extend_from_slice(&next)?;
+            }
+            union(out, ticker)
+        }
+        Path::ZeroOrMore(inner) => closure(
+            graph,
+            inner,
+            copy(from, budget, ticker)?,
+            inverse,
+            budget,
+            ticker,
         ),
-        Path::ZeroOrMore(inner) => closure(graph, inner, from.to_vec(), inverse),
         Path::OneOrMore(inner) => {
-            let first = reach(graph, inner, from, inverse);
-            closure(graph, inner, first, inverse)
+            let first = reach(graph, inner, from, inverse, budget, ticker)?;
+            closure(graph, inner, first, inverse, budget, ticker)
         }
         Path::ZeroOrOne(inner) => {
-            let mut nodes = reach(graph, inner, from, inverse);
-            nodes.extend_from_slice(from);
-            union(nodes)
+            let mut out = reach(graph, inner, from, inverse, budget, ticker)?;
+            out.extend_from_slice(from)?;
+            union(out, ticker)
         }
     }
 }
 
-/// `start` and everything `path` reaches from it in any number of steps.
-fn closure<V: ReadView>(
+fn closure<'b, V: ReadView>(
     graph: &GraphView<'_, V>,
     path: &Path,
-    start: Vec<TermId>,
+    start: Nodes<'b>,
     inverse: bool,
-) -> Vec<TermId> {
-    let mut reached = union(start);
-    let mut frontier = reached.clone();
+    budget: &'b Budget,
+    ticker: &mut Ticker,
+) -> Result<Nodes<'b>> {
+    let mut reached = union(start, ticker)?;
+    let mut frontier = copy(&reached, budget, ticker)?;
     while !frontier.is_empty() {
-        let next = reach(graph, path, &frontier, inverse);
-        frontier = next
-            .into_iter()
-            .filter(|node| reached.binary_search(node).is_err())
-            .collect();
-        reached.extend_from_slice(&frontier);
-        reached.sort_unstable();
+        let mut next = reach(graph, path, &frontier, inverse, budget, ticker)?;
+        drop(frontier);
+        // Retain counts candidates, including the ones already reached.
+        let mut kept = 0;
+        for read in 0..next.len() {
+            ticker.tick(1).map_err(stopped)?;
+            if reached.binary_search(&next[read]).is_err() {
+                next[kept] = next[read];
+                kept += 1;
+            }
+        }
+        next.truncate(kept);
+        reached.extend_from_slice(&next)?;
+        reached = union(reached, ticker)?;
+        frontier = next;
     }
-    reached
+    Ok(reached)
 }

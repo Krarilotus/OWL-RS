@@ -169,7 +169,7 @@ fn report_json(validation: &ShaclValidation) -> serde_json::Value {
         "revision": validation.revision,
         "shapes": validation.shapes,
         "results": results,
-        "failures": validation.report.failures,
+        "failures": validation.report.failures(),
     })
 }
 
