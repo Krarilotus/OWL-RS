@@ -9,10 +9,10 @@
 use nrese_engine::{EncodedQuad, GraphSelector, ReadModel, TermId, Transaction};
 use nrese_rdf::{GraphName, NamedNode, NamedNodeRef, Term};
 use nrese_shacl::{
-    PropertyPath, Selection, ShapeError, Shapes, ValidationReport, compile, validate,
+    CompileError, PropertyPath, Selection, Shapes, ValidationReport, compile, validate,
     validate_changes,
 };
-use nrese_sparql::ReadView;
+use nrese_sparql::{ReadView, Resources};
 
 use crate::error::{StoreError, StoreResult};
 use crate::query::GraphResultFormat;
@@ -133,8 +133,11 @@ fn graph_iri(iri: &str) -> StoreResult<NamedNode> {
     NamedNode::new(iri).map_err(|_| StoreError::InvalidGraphIri(iri.to_owned()))
 }
 
-fn shapes_error(errors: Vec<ShapeError>) -> StoreError {
-    StoreError::ShaclShapes(errors.iter().map(ToString::to_string).collect())
+fn shapes_error(error: CompileError) -> StoreError {
+    match error {
+        CompileError::Shapes(errors) => StoreError::ShaclShapes(errors),
+        CompileError::Evaluation(error) => StoreError::SparqlEvaluation(error),
+    }
 }
 
 /// Validates `view` against the shapes in the graph `shapes` (none, if the graph holds
@@ -144,6 +147,7 @@ fn validate_view<V: ReadView + Sync>(
     shapes: Option<TermId>,
     also_excluded: Option<TermId>,
     request: &ShaclValidationRequest,
+    resources: &Resources,
 ) -> StoreResult<(ValidationReport, usize, bool)> {
     let Some(shapes_graph) = shapes else {
         return Ok((ValidationReport::default(), 0, false));
@@ -151,6 +155,7 @@ fn validate_view<V: ReadView + Sync>(
     let shapes: Shapes = compile(
         view,
         Selection::asserted(GraphSelector::Exact(shapes_graph)),
+        resources,
     )
     .map_err(shapes_error)?;
     let mut data = match &request.graphs {
@@ -175,7 +180,11 @@ fn validate_view<V: ReadView + Sync>(
 /// don't compile: the shapes graph is a managed object, well-formed whatever wrote it and
 /// whether or not the SHACL gate is on ([`StoreError::ShaclShapes`], one message per
 /// problem).
-pub(crate) fn check_shapes(tx: &Transaction<'_>, shapes_graph: &str) -> StoreResult<()> {
+pub(crate) fn check_shapes(
+    tx: &Transaction<'_>,
+    shapes_graph: &str,
+    resources: &Resources,
+) -> StoreResult<()> {
     let iri = graph_iri(shapes_graph)?;
     let Some(shapes_id) = tx.lookup(iri.as_ref().into()) else {
         return Ok(());
@@ -190,6 +199,7 @@ pub(crate) fn check_shapes(tx: &Transaction<'_>, shapes_graph: &str) -> StoreRes
     compile(
         &tx.pending_snapshot(),
         Selection::asserted(GraphSelector::Exact(shapes_id)),
+        resources,
     )
     .map(drop)
     .map_err(shapes_error)
@@ -202,6 +212,7 @@ pub(crate) fn check_shapes(tx: &Transaction<'_>, shapes_graph: &str) -> StoreRes
 pub(crate) fn introduced(
     tx: &Transaction<'_>,
     shapes_graph: &str,
+    resources: &Resources,
 ) -> StoreResult<Option<ValidationReport>> {
     let iri = graph_iri(shapes_graph)?;
     let Some(shapes_id) = tx.lookup(iri.as_ref().into()) else {
@@ -216,16 +227,20 @@ pub(crate) fn introduced(
         .chain(tx.deleted())
         .any(|quad| quad.graph == shapes_id);
     if shapes_changed {
-        let shapes_after = compile(&after, shapes_selection).map_err(shapes_error)?;
+        let shapes_after = compile(&after, shapes_selection, resources).map_err(shapes_error)?;
         let mut report = validate(&after, &shapes_after, data);
         // Shapes that didn't compile before had no results.
-        if let Ok(shapes_before) = compile(before, shapes_selection) {
-            let earlier = validate(before, &shapes_before, data).results;
-            report.results.retain(|result| !earlier.contains(result));
+        match compile(before, shapes_selection, resources) {
+            Ok(shapes_before) => {
+                let earlier = validate(before, &shapes_before, data).results;
+                report.results.retain(|result| !earlier.contains(result));
+            }
+            Err(CompileError::Shapes(_)) => {}
+            Err(error @ CompileError::Evaluation(_)) => return Err(shapes_error(error)),
         }
         return Ok(Some(report));
     }
-    let shapes = compile(before, shapes_selection).map_err(shapes_error)?;
+    let shapes = compile(before, shapes_selection, resources).map_err(shapes_error)?;
     if shapes.is_empty() {
         return Ok(None);
     }
@@ -252,6 +267,11 @@ impl StoreService {
         request: &ShaclValidationRequest,
     ) -> StoreResult<ShaclValidation> {
         scope.require_all("validation")?;
+        // Compile slice only; approved transport token threading follows separately.
+        let resources = Resources {
+            memory: self.envelope(None),
+            ..Default::default()
+        };
         let stored = graph_iri(&self.config().shapes_graph)?;
         match &request.shapes {
             ShapesSource::Stored | ShapesSource::Graph(_) => {
@@ -265,6 +285,7 @@ impl StoreService {
                     snapshot.lookup(shapes_graph.as_ref().into()),
                     snapshot.lookup(stored.as_ref().into()),
                     request,
+                    &resources,
                 )?;
                 Ok(ShaclValidation {
                     report,
@@ -299,6 +320,7 @@ impl StoreService {
                     tx.lookup(scratch.into()),
                     tx.lookup(stored.as_ref().into()),
                     request,
+                    &resources,
                 )?;
                 Ok(ShaclValidation {
                     report,
@@ -308,5 +330,49 @@ impl StoreService {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod compile_resource_tests {
+    use super::*;
+
+    #[test]
+    fn diagnostics_conversion_keeps_payload_and_reservation() {
+        let engine = nrese_engine::Engine::new(nrese_engine::EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in parse_graph(GraphResultFormat::Turtle, None,
+            b"@prefix sh: <http://www.w3.org/ns/shacl#> . <http://example.com/S> sh:targetNode <http://example.com/a> ; sh:minCount \"many\" .".as_slice(),
+            GraphName::DefaultGraph, BlankNodes::Fresh).unwrap() {
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let memory = nrese_exec::Envelope::new(Some(64 * 1024), None);
+        let resources = Resources {
+            memory: memory.clone(),
+            ..Default::default()
+        };
+        let compiled = compile(
+            &engine.snapshot(),
+            Selection::asserted(GraphSelector::Exact(TermId::DEFAULT_GRAPH)),
+            &resources,
+        )
+        .unwrap_err();
+        let before = memory.used();
+        assert!(before > 0);
+        let error = shapes_error(compiled);
+        drop(resources);
+        assert_eq!(memory.used(), before);
+        assert!(error.is_request_error());
+        assert_eq!(
+            error.to_string(),
+            "ill-formed SHACL shapes: shape <http://example.com/S>: sh:minCount isn't a non-negative integer"
+        );
+        let StoreError::ShaclShapes(errors) = &error else {
+            panic!("classification");
+        };
+        assert_eq!(errors.errors().len(), 1);
+        drop(error);
+        assert_eq!(memory.used(), 0);
     }
 }

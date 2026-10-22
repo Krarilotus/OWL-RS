@@ -49,8 +49,8 @@ pub enum StoreError {
     #[error("RDF parse error: {0}")]
     RdfParse(#[from] RdfParseError),
     /// The shapes graph is ill-formed; one message per problem.
-    #[error("ill-formed SHACL shapes: {}", .0.join("; "))]
-    ShaclShapes(Vec<String>),
+    #[error("ill-formed SHACL shapes: {0}")]
+    ShaclShapes(nrese_shacl::ShapeErrors),
     #[error("RDF parse error in {}: {source}", path.display())]
     FileParse {
         path: PathBuf,
