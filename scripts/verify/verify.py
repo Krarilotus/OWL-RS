@@ -54,7 +54,8 @@ from verifykit.server import LaunchError, Server, sha256_of  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCTOR = ("/healthz", "/readyz", "/version", "/api/v1/repositories")
-CACHE = Path(os.environ.get("NRESE_VERIFY_CACHE", "~/fleet/cache/owlrs-verify")).expanduser()
+# The host's one cache, shared with the gates (Harness/notes/2026-10-20-host-cache-contract.md).
+CACHE = Path(os.environ.get("NRESE_VERIFY_CACHE", "~/fleet/cache/owlrs-gate")).expanduser()
 
 
 class Interrupted(Exception):
@@ -356,7 +357,17 @@ def summarise(evidence: Path, results: list[dict], target: dict, title: str, ext
 
 def target_of(args) -> dict:
     """Where the server comes from: --url (running), --server (a binary), --server-rev (a
-    fleet host's build, its checksum checked)."""
+    fleet host's build, its checksum checked). Runs take no lock on the host's cache, so a sweep
+    may remove the build while it is chosen: any file error here is a launch failure, with its
+    failing summary, never an escape without one (Sol r3, finding 4)."""
+    try:
+        return _target_of(args)
+    except OSError as e:
+        raise LaunchError(f"reading the server's build failed ({e}); a build in the host's cache may "
+                          "have been swept meanwhile: build it again") from None
+
+
+def _target_of(args) -> dict:
     if args.url:
         return {"url": args.url}
     if args.server_rev:
@@ -367,6 +378,8 @@ def target_of(args) -> dict:
                               "(submit its build job: verify.py jobs)")
         if sums.read_text().split()[0] != sha256_of(binary):
             raise LaunchError(f"{binary}: its checksum doesn't hold (SHA256SUMS): build it again")
+        # Its use, for the host cache's sweep (Harness/notes/2026-10-20-host-cache-contract.md §5).
+        (binary.parent / ".last-used").write_text(f"{int(time.time())}\n", encoding="utf-8")
     else:
         binary = Path(args.server).expanduser().resolve()
         if not binary.is_file():

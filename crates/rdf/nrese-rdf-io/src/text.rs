@@ -17,20 +17,7 @@ pub(crate) const NOT_IN_IRI: [bool; 256] = {
     table
 };
 
-/// The character of a `\uXXXX` or `\UXXXXXXXX` escape at `bytes[at]` (on '\').
-pub(crate) fn unicode_escape(bytes: &[u8], at: usize) -> Option<char> {
-    let digits = match bytes.get(at + 1)? {
-        b'u' => 4,
-        b'U' => 8,
-        _ => return None,
-    };
-    let hex = bytes.get(at + 2..at + 2 + digits)?;
-    if !hex.iter().all(u8::is_ascii_hexdigit) {
-        return None;
-    }
-    let code = u32::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?;
-    char::from_u32(code)
-}
+pub(crate) use nrese_rdf::escape::unicode_escape;
 
 /// The width of the escape at `bytes[at]`: 6 for `\u`, 10 for `\U`, 2 for the others.
 fn escape_width(bytes: &[u8], at: usize) -> usize {
@@ -116,6 +103,5 @@ mod tests {
         out.clear();
         assert!(decode_iri(r"http://e/ ", &mut out).is_err());
         assert!(decode_iri("http://e/a b", &mut String::new()).is_err());
-        assert_eq!(unicode_escape(br"\u+041", 0), None);
     }
 }

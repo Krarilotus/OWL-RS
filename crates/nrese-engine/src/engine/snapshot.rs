@@ -1470,8 +1470,8 @@ impl Snapshot {
     /// The characteristic sets of the default graph in `model`, for estimates of star
     /// joins ([`super::characteristic`]): kept (drifted ones while one rebuild replaces
     /// them), read, or built before this returns, the first time (a caller that arrives
-    /// during that build waits for it; on a Rayon worker it gets `None`); `None` also
-    /// where the graph's subjects have too many.
+    /// during that build helps with it and waits for it, on a Rayon worker too); `None`
+    /// also where the graph's subjects have too many, or the build failed.
     pub fn characteristic_sets_in(
         &self,
         model: ReadModel,

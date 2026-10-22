@@ -40,6 +40,9 @@ poll = "500ms"
 batch_bytes = "8MiB"
 ```
 
+`primary` is the primary's own base URL: a replica follows no redirect from it, so its token goes only to that
+address (a redirect is reported as the primary's error).
+
 ## Falling behind
 
 The primary's log holds the records since its last checkpoint, unless `storage.wal_archive`

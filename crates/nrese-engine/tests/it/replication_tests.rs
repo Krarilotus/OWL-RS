@@ -163,3 +163,36 @@ fn records_out_of_order_are_refused() {
         Err(EngineError::LogTruncated { .. })
     ));
 }
+
+/// A complete record in the log whose commit isn't published (still syncing, or its sync
+/// failed) isn't shipped: the feed stops at the revision published when it was asked.
+#[test]
+fn the_feed_stops_at_the_published_revision() {
+    let (primary_dir, twin_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let primary = Engine::open(primary_dir.path(), config()).unwrap();
+    let twin = Engine::open(twin_dir.path(), config()).unwrap();
+    for n in 0..2 {
+        commit(&primary, n);
+        commit(&twin, n);
+    }
+    // The twin's third record, as the primary's log would hold it before publishing it.
+    commit(&twin, 2);
+    let unpublished = twin.log_since(2, 1 << 20).unwrap();
+    assert_eq!(unpublished.last, 3);
+    let wal = primary_dir.path().join("wal");
+    let active = std::fs::read_dir(&wal)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .max()
+        .unwrap();
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(active)
+        .unwrap()
+        .write_all(&unpublished.frames)
+        .unwrap();
+    let batch = primary.log_since(0, 1 << 20).unwrap();
+    assert_eq!((batch.records, batch.last, batch.latest), (2, 2, 2));
+}

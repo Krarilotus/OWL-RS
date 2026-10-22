@@ -91,6 +91,7 @@ impl From<AccessError> for ApiError {
             AccessError::NotFound(message) => ApiError::not_found(message),
             AccessError::Conflict(message) => ApiError::conflict(message),
             AccessError::Throttled(message) => ApiError::too_many_requests(message),
+            AccessError::Busy(message) => ApiError::busy(message),
             AccessError::Store(message) => ApiError::internal(message),
         }
     }
