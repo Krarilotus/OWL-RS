@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use super::ir::{ParseError, Rule, Vocabulary};
+use super::ir::{Head, ParseError, Rule, Term, Vocabulary};
 use super::n3::{self, N3Program};
 use super::rulesets::{Ruleset, SEMANTICS_VERSION};
 use super::vocabulary::LocalVocabulary;
@@ -22,6 +22,9 @@ pub struct UserRules {
     format: RuleFormat,
     /// Selected once with the validated text; fingerprint checks must not parse it again.
     pie_contexts: bool,
+    /// A head can produce generalized rdf:type/owl:sameAs facts. Parsed once with the
+    /// rules, not while comparing a persisted state's fingerprint.
+    value_checks: bool,
 }
 
 /// The languages user rules are read in.
@@ -54,8 +57,24 @@ impl UserRules {
             text: text.into(),
             format,
             pie_contexts: false,
+            value_checks: false,
         };
-        rules.compile(&mut LocalVocabulary::default())?;
+        let mut vocabulary = LocalVocabulary::default();
+        let compiled = rules.compile(&mut vocabulary)?;
+        let rdf_type = vocabulary.iri(&format!("{}type", super::ir::RDF));
+        let same_as = vocabulary.iri(&format!("{}sameAs", super::ir::OWL));
+        let checked = |predicate: Term| {
+            matches!(predicate, Term::Var(_))
+                || predicate == Term::Const(rdf_type)
+                || predicate == Term::Const(same_as)
+        };
+        rules.value_checks = compiled.rules.iter().any(|rule| match &rule.head {
+            Head::Facts(heads) => heads.iter().any(|atom| checked(atom.0[1])),
+            Head::Inconsistent => false,
+        }) || compiled
+            .facts
+            .iter()
+            .any(|fact| checked(Term::Const(fact[1])));
         rules.pie_contexts = format == RuleFormat::Pie && super::pie::uses_contexts(&rules.text);
         Ok(rules)
     }
@@ -141,6 +160,11 @@ impl RuleProgram {
         if user.pie_contexts {
             feed(b"pie-context-names:");
             feed(&super::pie::CONTEXT_NAMES.to_le_bytes());
+        }
+        // Built-ins already carry this feature. Pure custom rules that cannot produce
+        // generalized type/equality facts keep their previous fingerprint.
+        if self.base.is_none() && user.value_checks {
+            feed(super::rulesets::VALUE_CHECK_SEMANTICS);
         }
         hash
     }

@@ -904,6 +904,178 @@ impl Catalog {
 mod tests {
     use super::{TRASH, existing, valid};
 
+    /// Executed with a real pre-change build to produce the fixture, then with the
+    /// candidate to reopen a private copy. Ordinary tests need no old executable.
+    #[test]
+    #[ignore = "requires a fixture written by the pinned pre-change implementation"]
+    fn old_value_check_closures_rebuild_with_the_same_rules() {
+        use super::{Catalog, RepositoryRules, RepositorySettings};
+        use crate::{
+            ConsistencyStatus, MutationCommand, MutationTicket, Requester, SparqlUpdateRequest,
+            StoreConfig, StoreService,
+        };
+        use nrese_reasoner::ReasonerConfig;
+
+        fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+            std::fs::create_dir_all(to).unwrap();
+            for entry in std::fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    std::fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+        let source = std::path::PathBuf::from(
+            std::env::var_os("NRESE_LEGACY_CLOSURES").expect("fixture path"),
+        );
+        let writing = std::env::var_os("NRESE_WRITE_LEGACY_CLOSURES").is_some();
+        let private = tempfile::tempdir().unwrap();
+        let root = if writing {
+            assert!(!source.exists(), "never overwrite the original fixture");
+            source.clone()
+        } else {
+            copy_tree(&source, private.path());
+            private.path().to_path_buf()
+        };
+        let prefixes = "PREFIX ex: <http://example.com/> PREFIX owl: <http://www.w3.org/2002/07/owl#> \
+            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
+        let guarded = "@prefix ex: <http://example.com/> . @prefix log: <http://www.w3.org/2000/10/swap/log#> .\n\
+            { ?x ex:p ?z . ?y ex:p ?z . ?x log:notEqualTo ?y } => { ?x ex:q ?z } .";
+        let plain = "@prefix ex: <http://example.com/> . { ?x ex:p ?z } => { ?x ex:q ?z } .";
+        let ask = |store: &StoreService| {
+            let result = store
+                .execute_query_str(&format!("{prefixes}ASK {{ ex:a ex:q ex:z }}"))
+                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&result.payload).unwrap()["boolean"] == true
+        };
+        for (mode, representatives, compact) in [
+            ("replicate", false, false),
+            ("representatives", true, false),
+            ("compact", true, true),
+        ] {
+            let dir = root.join(mode);
+            let config = StoreConfig {
+                equality_by_representatives: representatives,
+                equality_compact: compact,
+                query_cache_bytes: 0,
+                ..StoreConfig::on_disk(&dir)
+            };
+            let catalog = Catalog::open(
+                StoreService::new(config).unwrap(),
+                ReasonerConfig::default(),
+            )
+            .unwrap();
+            let metadata = dir.join("legacy-evidence.json");
+            if writing {
+                let mut evidence = serde_json::Map::new();
+                for (id, reasoning, rules, data) in [
+                    (
+                        "guarded",
+                        "owl2-rl",
+                        Some(guarded),
+                        "ex:a ex:p ex:z . ex:b ex:p ex:z . ex:a owl:sameAs ex:b",
+                    ),
+                    (
+                        "datatype",
+                        "rdfs",
+                        None,
+                        "ex:age rdfs:range xsd:integer . ex:a ex:age \"abc\"^^xsd:integer",
+                    ),
+                    ("plain", "custom", Some(plain), "ex:a ex:p ex:z"),
+                ] {
+                    let settings = RepositorySettings {
+                        reasoning: Some(reasoning.to_owned()),
+                        rules: rules.map(|text| RepositoryRules {
+                            name: "upgrade.n3".to_owned(),
+                            format: "n3".to_owned(),
+                            text: text.to_owned(),
+                        }),
+                        ..RepositorySettings::default()
+                    };
+                    let program = settings
+                        .reasoner_config()
+                        .unwrap()
+                        .unwrap()
+                        .materialised_program()
+                        .unwrap();
+                    catalog.create(id, settings).unwrap();
+                    let repository = catalog.get(id).unwrap();
+                    let pipeline = std::sync::Arc::clone(&*repository.pipeline.read());
+                    let store = pipeline.store();
+                    // Import through the existing pipeline, then replace the inferred
+                    // stack by full materialisation. The historical commit path could
+                    // derive guarded heads that the full materialiser then lost.
+                    pipeline
+                        .apply(
+                            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                                "{prefixes}INSERT DATA {{ {data} }}"
+                            ))),
+                            &Requester::all(),
+                            &MutationTicket::new(),
+                        )
+                        .unwrap();
+                    let report = store.rematerialise(&program).unwrap();
+                    assert_eq!(report.violations, 0, "old {mode}/{id}");
+                    let state = store.reasoning_state().unwrap();
+                    assert!(store.reasoning_is_current(&program));
+                    if id == "guarded" {
+                        assert_eq!(ask(store), !representatives, "old guard closure");
+                    }
+                    if id == "plain" {
+                        assert!(ask(store), "unchanged control");
+                    }
+                    evidence.insert(id.to_owned(), serde_json::json!({ "fingerprint": state.fingerprint,
+                        "revision": store.current_revision(), "rules": program.name(), "violations": state.violations }));
+                }
+                std::fs::write(metadata, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+            } else {
+                let evidence: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(metadata).unwrap()).unwrap();
+                for id in ["guarded", "datatype", "plain"] {
+                    let repository = catalog.get(id).expect("legacy repository reopens");
+                    let pipeline = std::sync::Arc::clone(&*repository.pipeline.read());
+                    let store = pipeline.store();
+                    let state = store.reasoning_state().unwrap();
+                    let settings = repository.settings.read().clone();
+                    let program = settings
+                        .reasoner_config()
+                        .unwrap()
+                        .unwrap()
+                        .materialised_program()
+                        .unwrap();
+                    assert!(store.reasoning_is_current(&program), "{mode}/{id}");
+                    let old = evidence[id]["fingerprint"].as_u64().unwrap();
+                    if id == "plain" {
+                        assert_eq!(state.fingerprint, old, "unaffected custom fingerprint");
+                        assert_eq!(
+                            store.current_revision(),
+                            evidence[id]["revision"].as_u64().unwrap(),
+                            "unaffected closure was reused"
+                        );
+                        assert!(ask(store));
+                    } else {
+                        assert_ne!(
+                            state.fingerprint, old,
+                            "old semantics must be stale: {mode}/{id}"
+                        );
+                        if id == "guarded" {
+                            assert!(ask(store), "missing guarded heads rebuilt: {mode}");
+                        }
+                        if id == "datatype" {
+                            assert!(
+                                matches!(store.consistency(), ConsistencyStatus::Inconsistent { violations } if violations > 0),
+                                "old zero-violation marker rebuilt: {mode}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn on_disk(dir: &std::path::Path) -> super::Catalog {
         let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir)).unwrap();
         super::Catalog::open(store, nrese_reasoner::ReasonerConfig::default()).unwrap()
