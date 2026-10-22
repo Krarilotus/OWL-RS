@@ -151,6 +151,11 @@ impl Evaluator {
         }
     }
 
+    /// The query's existing BASE, also used when serializing a SERVICE request.
+    pub(super) fn base(&self) -> Option<&Iri<String>> {
+        self.base.as_ref()
+    }
+
     /// Runs `evaluate` for solution number `solution`: what `BNODE(label)` keeps apart.
     pub fn in_solution<T>(&self, solution: u64, evaluate: impl FnOnce() -> T) -> T {
         let previous = SOLUTION.with(|s| s.replace(solution));
