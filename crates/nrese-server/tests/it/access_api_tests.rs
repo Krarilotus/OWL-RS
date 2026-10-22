@@ -588,6 +588,21 @@ async fn local_users_log_in_with_passwords_besides_tokens() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+/// A user who may not change another user is refused before its password is looked at
+/// (and hashed): the refusal, not the password's length.
+#[tokio::test]
+async fn changing_another_users_password_is_refused_before_hashing() {
+    let app = app();
+    let (status, body) = put(
+        &app,
+        ALICE,
+        "/api/v1/access/users/dana",
+        json!({ "password": "short", "reason": "takeover" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
 /// A client transaction (an `/api/v1` session or an RDF4J transaction) exists for the user
 /// who opened it only: nobody else adds to it, reads in it, commits or closes it.
 #[tokio::test]

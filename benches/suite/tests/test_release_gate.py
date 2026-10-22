@@ -223,7 +223,8 @@ class Rounds(unittest.TestCase):
         passed, text = gate_module.verdict([first], self.W3C, self.GUARDS)
         self.assertFalse(passed)
         self.assertIn("**pending**", text)
-        job = gate_module.confirm_job([first], "C:/repo")
+        with patch.object(gate_module, "checkout_rev", lambda checkout, cand, harness: harness):  # no repository
+            job = gate_module.confirm_job([first], "C:/repo")
         self.assertEqual((job["id"], job["requires"]["hosts"]), ("rg-cccccccc-confirm", ["phuoc-yu"]))
         self.assertEqual(job["steps"][0][2:], ["plan-cases", "lab-olympics"])
         self.assertEqual({s[2] for s in job["steps"][1:-2]}, {"block"})
@@ -260,6 +261,20 @@ class Rounds(unittest.TestCase):
         self.assertEqual(gatestats.holm({"a": 0.01, "b": 0.04, "c": 0.04}), {"a"})
         self.assertAlmostEqual(gatestats.combine_rounds([0.01, 0.02]), 0.02 / 0.9)
         self.assertAlmostEqual(gatestats.combine_rounds([0.5, 0.001, 0.001]), 0.01)
+
+    def test_a_confirmation_runs_whole_squares_of_its_timed_sides(self):
+        """Sol r2: the candidate is timed whatever revision it shares; only a main that is base's
+        build isn't. Counting revisions gave three timed sides 2 blocks."""
+        for cand, main, sides in (("b", "m", 3), ("m", "m", 3), ("b", "b", 2), ("c", "m", 3), ("c", "b", 2)):
+            with self.subTest(cand=cand, main=main), patch.dict(REVS, {"cand": cand * 40, "base": "b" * 40, "main": main * 40}):
+                summary = run_gate(passes(slower(1.08), blocks=6))
+                for calibrated in (None, 3):
+                    measure = {"lab-olympics": {"blocks": calibrated}} if calibrated else None
+                    with patch.object(gate_module, "checkout_rev", return_value="x"):
+                        job = gate_module.confirm_job([summary], "C:/repo", measure=measure)
+                    n = len([s for s in job["steps"] if s[2] == "block"])
+                    self.assertEqual(n % sides, 0, (cand, main, calibrated, n))
+                    self.assertGreaterEqual(n, calibrated or gate_module.CONFIRM_BLOCKS[0])
 
     def test_nothing_flagged_needs_no_confirmation(self):
         clean = self.round_(1.0)
@@ -500,10 +515,10 @@ class Parts(unittest.TestCase):
         self.assertEqual((timed["kind"], timed["class"], timed["after"]), ("owlrs.timed", "exclusive", ["rg-test-build"]))
         self.assertEqual(checks["requires"]["hosts"], ["office-pc"])
         blocks_ = [s for s in timed["steps"] if s[2] == "block"]
-        self.assertEqual([s[3] for s in blocks_], ["1", "2"])
+        self.assertEqual([s[3] for s in blocks_], ["1", "2", "3"])  # 2 asked: one whole square of three sides
         self.assertEqual(blocks_[0][2:], ["block", "1", "c" * 40, "1", "-", f"base={gate_module.BASE}",
                                           f"main={gate_module.MAIN}", f"cand={'c' * 40}"])
-        self.assertEqual(timed["env"]["GATE_MIN_BLOCKS"], "2")
+        self.assertEqual(timed["env"]["GATE_MIN_BLOCKS"], "3")
         for job in found.values():
             self.assertNotIn("priority", job)
             self.assertEqual(job["priority_class"], "merge-gate")
@@ -547,11 +562,7 @@ class Parts(unittest.TestCase):
         bash, python = shutil.which("bash"), shutil.which("python3")
         if bash is None or python is None:
             self.skipTest("no bash or python3")
-        # Outside a commit hook's index: its GIT_INDEX_FILE would take the new worktree's checkout
-        # (20 Oct 2026: the hook's own test run emptied two commits).
-        clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, env=clean, capture_output=True,
-                              text=True).stdout.strip()
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
         with tempfile.TemporaryDirectory() as tmp:
             t = Path(tmp).as_posix()
             # fast.py block as it numbers its reports (2 per side a block); every other python3 call the real one.
@@ -577,19 +588,26 @@ echo tool > "$b/release/tool"; echo {head} > "$b/REVISION"; echo timing=watchdog
 point {head} "$b"
 echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
 '''
-            env = {**clean, "NRESE_GATE_DIR": f"{t}/gate", "GATE_BIN": f"{t}/bin", "FLEET_OUT": f"{t}/out",
+            env = {**os.environ, "NRESE_GATE_DIR": f"{t}/gate", "GATE_BIN": f"{t}/bin", "FLEET_OUT": f"{t}/out",
                    "GATE_QUIET": "0"}
             subprocess.run([bash, "-c", setup], cwd=ROOT, env=env, check=True, capture_output=True)
             done = subprocess.run([bash, "-c", f'PATH="$(cygpath -u "{shim}" 2>/dev/null || echo "{shim}"):$PATH" '
                                    f'exec bash scripts/release-gate.sh block 2 {head} 1 - base={head} main={head} '
                                    f'cand={head}'],
                                   cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
+            # An A-B-B-A's A' (benches/suite/abba.py) is A's build by design: timed, never skipped.
+            aa = subprocess.run([bash, "-c", f'PATH="$(cygpath -u "{shim}" 2>/dev/null || echo "{shim}"):$PATH" '
+                                 f'exec bash scripts/release-gate.sh block 3 {head} 1 - a={head} a2={head} b={head}'],
+                                cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
+            reports = len(list(Path(tmp).glob("out/passes/pass-*.json"))) - 4  # block 2's: base and cand
             subprocess.run(["git", "worktree", "remove", "--force", f"{t}/gate/src-{head[:8]}"], cwd=ROOT,
-                           env=clean, capture_output=True)
-        subprocess.run(["git", "worktree", "prune"], cwd=ROOT, env=clean, capture_output=True)
+                           capture_output=True)
+        subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("block 2: done", done.stdout)
         self.assertIn("main is the same build as another side", done.stdout)  # timed once, as base
+        self.assertEqual((aa.returncode, reports), (0, 6), aa.stdout + aa.stderr)  # a, a2, b: twice each
+        self.assertNotIn("same build", aa.stdout)
 
     def test_a_main_that_is_the_base_is_timed_once_and_declared_once(self):
         """Orchestrator, 20 Oct 2026: the jobs require a main, so a confirmation passes the base
@@ -607,6 +625,33 @@ echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
                          ([], {"main": "base"}, sorted(h for h in family if h.startswith("base|"))))
         self.assertTrue(s["passed"])
         self.assertIn("main is base's build", gate_module.render(s))
+
+    def test_a_job_s_checkout_holds_the_candidate_and_the_harness_or_there_is_no_job(self):
+        """Keepers, 20 Oct 2026: a confirmation's candidate rebased onto the harness was built in a
+        checkout at the harness, which doesn't contain it, and the build failed with exit 2."""
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            git = lambda *a: subprocess.run(["git", "-C", tmp, *a], capture_output=True, text=True,  # noqa: E731
+                                            check=True).stdout.strip()
+            git("init", "-q")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base")
+            root = git("rev-parse", "HEAD")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "harness")
+            harness = git("rev-parse", "HEAD")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "rebased candidate")
+            rebased = git("rev-parse", "HEAD")
+            git("checkout", "-q", "-b", "elsewhere", root)
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "diverged")
+            diverged = git("rev-parse", "HEAD")
+
+            def checkout_of(candidate):
+                found = gate_module.jobs(candidate, harness, tmp, "rg-test", 2, None, base=root, main=root,
+                                         checks=False, big_host=None)
+                return found["rg-test-build"]["inputs"][0]["source"]["rev"]
+            self.assertEqual((checkout_of(rebased), checkout_of(root)), (rebased, harness))
+            with self.assertRaises(SystemExit) as refused:
+                checkout_of(diverged)
+            self.assertIn("contains the other", str(refused.exception))
 
     def test_a_cached_build_counts_only_with_its_whole_identity(self):
         """Round 8: binaries from before counted by revision alone, whatever toolchain, flags or
@@ -645,7 +690,7 @@ printf "no linker" > "$d/release/other"; lld_of "$d" 2>/dev/null || echo not-lld
             (Path(tmp) / "plan.json").write_text(done.stdout, encoding="utf-8")
             (Path(tmp) / "measure.toml").write_text(f'[case.{plan["run"][0]}]\nblocks = 3\n', encoding="utf-8")
             done = subprocess.run([sys.executable, "-B", str(script), "blocks", "--plan", str(Path(tmp) / "plan.json"),
-                                   "--measure", str(Path(tmp) / "measure.toml"), "--out", tmp],
+                                   "--measure", str(Path(tmp) / "measure.toml"), "--square", "1", "--out", tmp],
                                   capture_output=True, text=True, encoding="utf-8")
             self.assertEqual(done.returncode, 0, done.stderr[-500:])
             third = json.loads((Path(tmp) / "plan-block-3.json").read_text(encoding="utf-8"))
@@ -655,6 +700,164 @@ printf "no linker" > "$d/release/other"; lld_of "$d" 2>/dev/null || echo not-lld
         from types import SimpleNamespace
         with self.assertRaises(SystemExit):
             fast.select([{"name": "a", "area": "query"}], SimpleNamespace(cases="", areas=None))
+
+    def test_a_block_that_work_not_its_own_disturbed_is_noted_in_the_report(self):
+        """COT-13 (20 Oct 2026): the watcher no longer stops work that isn't the job's own; it
+        leaves it running and records it, and the report says which blocks it disturbed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for n, verdict in ((1, {"verdict": "quiet", "samples": 30, "unowned_share": 0.0}),
+                               (2, {"verdict": "disturbed", "samples": 30, "unowned_share": 0.4,
+                                    "not_resumed": ["pid 51"]})):
+                (Path(tmp) / f"quiet-block-{n}.json").write_text(json.dumps(verdict), encoding="utf-8")
+            verdicts, notes = gate_module.quiet_verdicts(Path(tmp))
+        self.assertEqual(sorted(verdicts), [1, 2])
+        self.assertEqual(len(notes), 2)
+        self.assertTrue(notes[0].startswith("block 2: disturbed") and "40%" in notes[0], notes)
+        self.assertIn("not resumed", notes[1])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the watcher watches /proc (Linux)")
+    def test_a_blocks_attempts_from_every_crash_point_one_repeat_at_most_a_verdict_before_acceptance(self):
+        """The orchestrator, 20 Oct 2026: a disturbed block is left out of the statistics, both
+        sides, and repeated once; a disturbed repeat is kept and listed. Sol, 20 Oct 2026: a restart
+        accepted a disturbed block, or ran a third attempt. One table over the states a crash leaves
+        a block in: what the restarted step runs and keeps. git, the watcher and fast.py are faked
+        (the watcher's --resume is the real one); no repository is touched."""
+        import shutil
+        import subprocess
+        bash, python = shutil.which("bash"), shutil.which("python3")
+        head = "a" * 40
+        reports = [f"pass-{k}-x{k}.json" for k in range(1, 5)]
+        complete = {r: '{"finished_ns": 1}' for r in reports}
+        archived = {f"disturbed-{r[:-5]}-9.json": "{}" for r in reports}
+        quiet, disturbed = '{"verdict": "quiet"}', '{"verdict": "disturbed"}'
+        # case, the state file, files in passes, an earlier watcher's record, the verdicts of the
+        # attempts it runs -> exit, attempts run, pass-*, disturbed-pass-*, final state, a report
+        # note; and a fault: mv failing on paths that contain a text, or a directory where the
+        # state is written (its temporary file) or renamed to
+        faults = {
+            "a state that can't be written: nothing run":
+                (None, {}, None, ["quiet"], (2, 0, 0, 0, None, None), ("squat", "block-1.state.new")),
+            "a state that can't be renamed: nothing run":
+                (None, {}, None, ["quiet"], (2, 0, 0, 0, "squatted", None), ("squat", "block-1.state")),
+            "an acceptance that can't be saved: not accepted":
+                ("1:ran", {**complete, "quiet-block-1.json": quiet}, None, [], (2, 0, 4, 0, "1:ran", None),
+                 ("squat", "block-1.state.new")),
+            "an archival move that fails: no repeat":
+                ("1:ran", {**complete, "quiet-block-1.json": disturbed}, None, ["quiet"], (2, 0, 4, 0, "1:archiving", None),
+                 ("mv", "disturbed-pass")),
+        }
+        rows = [
+            ("fresh, quiet", None, {}, None, ["quiet"], (0, 1, 4, 0, "1:accepted", None)),
+            ("fresh, disturbed then quiet", None, {}, None, ["disturbed", "quiet"],
+             (0, 2, 4, 4, "2:accepted", "left out of the statistics")),
+            ("fresh, disturbed twice: kept", None, {}, None, ["disturbed", "disturbed"],
+             (0, 2, 4, 4, "2:accepted", "its repeat disturbed, kept")),
+            ("a crash during attempt 1: resumed", "1:running", dict(list(complete.items())[:2]), None, ["quiet"],
+             (0, 1, 4, 0, "1:accepted", None)),
+            ("attempt 1 run, its verdict not recorded: run again", "1:ran", complete, None, ["quiet"],
+             (0, 1, 4, 0, "1:accepted", None)),
+            ("attempt 1 disturbed, a crash before archiving", "1:ran", {**complete, "quiet-block-1.json": disturbed},
+             None, ["quiet"], (0, 1, 4, 4, "2:accepted", "left out of the statistics")),
+            ("a crash midway through archiving", "1:archiving",
+             {**dict(list(complete.items())[2:]), **dict(list(archived.items())[:2]), "quiet-block-1.json": disturbed},
+             None, ["quiet"], (0, 1, 4, 4, "2:accepted", "left out of the statistics")),
+            ("archived, a crash before the repeat", "2:start", archived, None, ["quiet"], (0, 1, 4, 4, "2:accepted", None)),
+            ("a crash during the repeat: resumed, never a third", "2:running",
+             {**archived, **dict(list(complete.items())[:1])}, None, ["disturbed"],
+             (0, 1, 4, 4, "2:accepted", "its repeat disturbed, kept")),
+            ("the repeat disturbed and recorded: kept, nothing run", "2:ran",
+             {**archived, **complete, "quiet-block-1.json": disturbed}, None, [], (0, 0, 4, 4, "2:accepted", None)),
+            ("accepted before: nothing run", "1:accepted", {**complete, "quiet-block-1.json": quiet}, None, [],
+             (0, 0, 4, 0, "1:accepted", None)),
+            ("complete and disturbed, no state, an earlier record unresolved: stopped", None,
+             {**complete, "quiet-block-1.json": disturbed}, "pid 51\n", [], (2, 0, 4, 0, None, None)),
+            ("a third attempt: never started", "3:start", {}, None, [], (2, 0, 0, 0, "3:start", None)),
+        ]
+        rows = [(*row, None) for row in rows] + [(case, *rest) for case, rest in faults.items()]
+        for case, state, files, frozen, verdicts, expected, fault in rows:
+            with self.subTest(case), tempfile.TemporaryDirectory() as tmp:
+                t = Path(tmp).as_posix()
+                shim = Path(tmp) / "shim"
+                shim.mkdir()
+                (Path(tmp) / "verdicts").write_text("".join(f"{v}\n" for v in verdicts), encoding="utf-8")
+                # fast.py block writes the block's reports (each run counted); quiet-watch.py writes
+                # the next verdict when it is stopped; its --resume is the real watcher's.
+                (shim / "python3").write_text(f"""#!/usr/bin/env bash
+case " $* " in
+  *" benches/fast/fast.py block "*)
+    echo run >> {t}/runs
+    n=0; out=; sides=()
+    while [ $# -gt 0 ]; do case $1 in --block) n=$2 ;; --out) out=$2 ;; --side) sides+=("${{2%%:*}}") ;; esac; shift; done
+    per=$(( 2 * ${{#sides[@]}} ))
+    for k in $(seq 1 $per); do echo '{{"finished_ns": 1}}' > "$out/pass-$(( per * (n - 1) + k ))-x$k.json"; done
+    sleep 1 ;;  # a block takes time: the watcher is up before it ends
+  *"quiet-watch.py"*" --resume "*) exec "{Path(python).as_posix()}" "{(ROOT / 'scripts/lib/quiet-watch.py').as_posix()}" "$2" --resume ;;
+  *"quiet-watch.py"*)
+    state=$2
+    verdict() {{
+      v=$(head -1 {t}/verdicts); sed -i 1d {t}/verdicts
+      printf '{{"verdict": "%s", "samples": 9, "unowned_share": 0.5}}\\n' "$v" > "$state/verdict.json"
+      echo "$v" > "$state/watch.log"; exit 0
+    }}
+    trap verdict TERM
+    while :; do sleep 0.2; done ;;
+  *) exec "{Path(python).as_posix()}" "$@" ;;
+esac
+""", encoding="utf-8", newline="\n")
+                (shim / "python3").chmod(0o755)
+                # git, faked: the revision is a fixed id, a worktree an empty directory; anything
+                # else the step asks fails loudly (no real repository is touched).
+                (shim / "git").write_text(f"""#!/usr/bin/env bash
+case "$1 $2" in
+  "rev-parse --short=8") echo "${{3:0:8}}" ;;
+  "rev-parse HEAD") echo {head} ;;
+  "worktree add") mkdir -p "${{@: -2:1}}" ;;
+  "status --porcelain") ;;
+  *) if [ "$1" = rev-parse ] && [ $# -eq 2 ]; then echo "$2"; else echo "fake git: $*" >&2; exit 99; fi ;;
+esac
+""", encoding="utf-8", newline="\n")
+                (shim / "git").chmod(0o755)
+                if fault and fault[0] == "mv":
+                    (shim / "mv").write_text(f'#!/bin/sh\ncase "$*" in *{fault[1]}*) echo "injected mv failure" >&2; exit 1 ;; '
+                                             'esac\nexec /bin/mv "$@"\n', encoding="utf-8", newline="\n")
+                    (shim / "mv").chmod(0o755)
+                setup = f'''
+. scripts/lib/gate-publish.sh
+GATE={t}/gate GATE_BIN={t}/bin
+b=$GATE_BIN/bin-test; mkdir -p "$b/release" "$GATE" {t}/out/passes
+echo tool > "$b/release/tool"; echo {head} > "$b/REVISION"; echo timing=watchdog > "$b/CAPABILITIES"
+(cd "$b" && sha256sum release/tool > SHA256SUMS)
+point {head} "$b"
+echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
+'''
+                env = {**os.environ, "NRESE_GATE_DIR": f"{t}/gate", "GATE_BIN": f"{t}/bin", "FLEET_OUT": f"{t}/out",
+                       "PATH": f"{shim}{os.pathsep}{os.environ['PATH']}"}
+                subprocess.run([bash, "-c", setup], cwd=ROOT, env=env, check=True, capture_output=True)
+                passes = Path(tmp) / "out" / "passes"
+                for name, content in files.items():
+                    (passes / name).write_text(content, encoding="utf-8")
+                if state:
+                    attempt, stage = state.split(":")
+                    (passes / "block-1.state").write_text(f"attempt={attempt}\nstage={stage}\n", encoding="utf-8")
+                if fault and fault[0] == "squat":
+                    (passes / fault[1]).mkdir()  # a directory where the state is written or renamed to
+                if frozen:
+                    (Path(tmp) / "gate" / "quiet").mkdir(parents=True)
+                    (Path(tmp) / "gate" / "quiet" / "frozen").write_text(frozen, encoding="utf-8")
+                done = subprocess.run([bash, "-c", f'PATH="{shim}:$PATH" exec bash scripts/release-gate.sh block 1 {head} 1 - '
+                                       f'base={head} cand={head}'], cwd=ROOT, env=env, capture_output=True, text=True)
+                runs = Path(tmp) / "runs"
+                final = passes / "block-1.state"
+                found = (done.returncode, len(runs.read_text().split()) if runs.exists() else 0,
+                         len(list(passes.glob("pass-*.json"))), len(list(passes.glob("disturbed-pass-*.json"))),
+                         "squatted" if final.is_dir() else
+                         ":".join(line.split("=", 1)[1] for line in final.read_text().split()) if final.exists() else None)
+                self.assertEqual(found, expected[:5], done.stdout + done.stderr)
+                if frozen:
+                    self.assertEqual((Path(tmp) / "gate" / "quiet" / "frozen").read_text(), frozen)
+                notes = gate_module.quiet_verdicts(passes)[1]
+                if expected[5]:
+                    self.assertTrue(any(expected[5] in note for note in notes), notes)
 
     def test_report_writes_markdown_and_json(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -677,7 +880,9 @@ class Tradeoffs(unittest.TestCase):
                                     "q06": [v * (worse(1.08, n) if cand else 1) for v in [4.8, 4.85, 4.8]]}),
                     record(case="kernel-intersect",
                            samples={"triangles": [v * (worse(0.36, n) if cand else 1) for v in [140.0, 140.5]]})]
-        return [run_gate(passes(records_of), tradeoffs=list(tradeoffs), context={**CONTEXT, "round": k})
+        # Three blocks: with two, the 8 % loss sat on Holm's threshold (combined p 0.0082 against
+        # 0.0083), and which runs a side got in the block's order decided it.
+        return [run_gate(passes(records_of, blocks=3), tradeoffs=list(tradeoffs), context={**CONTEXT, "round": k})
                 for k in (0, 1)]
 
     def entry(self, **changes):
@@ -714,11 +919,25 @@ class Measurement(unittest.TestCase):
 
     def test_a_case_whose_noise_needs_more_blocks_is_tested_on_them_and_the_jobs_run_them(self):
         measure = {"a": {"blocks": 2}, "b": {"blocks": 4}, "c": {"blocks": 3}}
-        self.assertEqual(gate_module.blocks(["a", "b", "c"], measure), [["a", "b", "c"], ["a", "b", "c"], ["b", "c"], ["b"]])
+        self.assertEqual(gate_module.blocks(["a", "b", "c"], measure, square=1),  # one side: no squares
+                         [["a", "b", "c"], ["a", "b", "c"], ["b", "c"], ["b"]])
+        with self.assertRaises(TypeError):  # Sol r1: no square given planned 2 and 8 blocks for three sides
+            gate_module.blocks(["a"], measure)
+        # Sol r2: the plan files follow the job's minimum (jobs() with 4 blocks a round and a case
+        # needing 2: 6 block steps, the plan 3), and a declared outcome's case keeps its one block.
+        plan = gate_module.blocks(["a", "b", "c"], measure, 6, square=3, checked={"c"})
+        self.assertEqual([sorted(cases) for cases in plan], [["a", "b", "c"]] + [["a", "b"]] * 5)
+        # Whole Latin squares of the timed sides (tf2-gate-1: a first run's cost; a case in 2
+        # blocks of three sides leaves one side never opening): 2 -> 3, 4 -> 6, 3 stays.
+        self.assertEqual(gate_module.blocks(["a", "b", "c"], measure, square=3),
+                         [["a", "b", "c"]] * 3 + [["b"]] * 3)
         timed = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None, measure=measure)["rg-test-timed"]
         self.assertEqual(timed["steps"][0][2:], ["plan-blocks", "c" * 40])
-        self.assertEqual([s[6] for s in timed["steps"] if s[2] == "block"],
-                         ["plan-block-1.json", "plan-block-2.json", "plan-block-3.json", "plan-block-4.json"])
+        self.assertEqual([s[6] for s in timed["steps"] if s[2] == "block"], [f"plan-block-{k}.json" for k in range(1, 7)])
+        self.assertEqual((timed["env"]["GATE_SQUARE"], timed["env"]["GATE_MIN_BLOCKS"]), ("3", "3"))
+        two = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None, measure=measure,
+                               main=gate_module.BASE)["rg-test-timed"]  # main is base's build: two sides
+        self.assertEqual(len([s for s in two["steps"] if s[2] == "block"]), 4)
 
         def records_of(side, n):
             return [record()] + ([record(case="lab-yago-tiny")] if n <= 12 else [])
@@ -833,15 +1052,20 @@ class Instances(unittest.TestCase):
         with self.assertRaises(SystemExit):
             fast.parse_side("../escape:/bin:rev")
 
-    def test_each_pair_of_blocks_has_both_orientations_which_first_drawn_from_the_seed(self):
+    def test_each_square_of_blocks_gives_every_side_every_place_once_drawn_from_the_seed(self):
+        """tf2-gate-1 (20 Oct 2026): a block's first run cost 15.8 % on one series. With the mirror
+        alternating per pair of blocks the middle side (main; A' in an A-B-B-A) never opened."""
         firsts = set()
-        for seed in map(str, range(20)):
-            for b in (1, 3, 5, 7):
-                pair = [fast.palindrome(list(SIDES), x, seed)[0][0] for x in (b, b + 1)]
-                self.assertEqual(sorted(pair), ["base", "cand"], (seed, b))
+        for seed in [None, *map(str, range(20))]:
+            for square in range(3):
+                orders = [[s for s, run in fast.palindrome(list(SIDES), 3 * square + j, seed) if run == 1]
+                          for j in (1, 2, 3)]
+                for place in range(3):
+                    self.assertEqual(sorted(o[place] for o in orders), sorted(SIDES), (seed, square, orders))
             firsts.add(fast.palindrome(list(SIDES), 1, seed)[0][0])
             self.assertEqual(fast.palindrome(list(SIDES), 3, seed), fast.palindrome(list(SIDES), 3, seed))
-        self.assertEqual(firsts, {"base", "cand"})
+        self.assertEqual(firsts, set(SIDES))
+        self.assertEqual([fast.palindrome(["a", "b"], b)[0][0] for b in (1, 2, 3)], ["a", "b", "a"])
 
     def test_a_loss_is_judged_against_the_host_s_a_a_floor(self):
         """An A-A' gate (every side one revision, each block its own copies) gives the floor; a

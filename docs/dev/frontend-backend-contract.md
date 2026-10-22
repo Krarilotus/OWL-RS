@@ -119,6 +119,10 @@ Do not:
 ## Acceptance Criteria
 
 - Browser UI can be built and hosted separately from the backend.
-- Browser UI can target a non-same-origin backend through runtime config.
+- Browser UI can target a non-same-origin backend through runtime config. The backend has no CORS policy of its
+  own: the proxy in front of it answers the preflight and sends `Access-Control-Allow-Origin`. The backend marks
+  `NRESE-Completeness` with `Access-Control-Expose-Headers` on every query answer that carries it, so the console
+  can tell a sound-only answer from a complete one on another origin too; a proxy that sets its own exposed
+  headers must keep that one.
 - CLI can talk to the same backend without using browser code paths.
 - Endpoint paths and request construction remain centralized in one frontend client boundary.

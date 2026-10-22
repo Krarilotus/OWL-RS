@@ -483,7 +483,7 @@ mod tests {
                 })
                 .collect()
         };
-        let engine = Engine::open(dir.path(), config).unwrap();
+        let engine = Engine::open(dir.path(), config.clone()).unwrap();
         let gate = std::sync::Arc::new(Gate::default());
         HELD.lock()
             .unwrap()

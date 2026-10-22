@@ -22,6 +22,7 @@
 //! stays where it was interned ([`Dictionary::adopt_pending`]).
 
 use hashbrown::HashTable;
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec};
 use nrese_rdf::{
     BaseDirection, BlankNode, GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, Quad,
     QuadRef, Term, TermRef,
@@ -31,8 +32,8 @@ use parking_lot::RwLock;
 use super::hash::key_hash;
 use super::offsets::{Ends, Offsets};
 use super::order::Key;
-use super::pending::{Adopted, NewKey, Pending};
-use super::vocabulary::Codec;
+use super::pending::{Adopted, NEW, Pending};
+use super::vocabulary::{Codec, Sample};
 use super::{TermId, TermKind, inline_to_literal, try_inline_literal};
 use crate::error::{EngineError, EngineResult};
 use crate::mapped::Mapped;
@@ -114,6 +115,20 @@ impl Base {
                 let mut key = Vec::with_capacity(stored.len() * 3);
                 codec.decompress(stored, &mut key);
                 Key::Owned(key)
+            }
+        }
+    }
+
+    /// The most bytes entry `index`'s key holds while [`Self::plain`] decompresses it and
+    /// its text is copied out of it: the buffer it starts in and the one it moves to (a
+    /// code is at most a symbol of 8 bytes), then that one and the text.
+    fn decode_bound(&self, index: u64) -> usize {
+        let stored = self.key(index).len();
+        match &self.codec {
+            None => stored,
+            Some(_) => {
+                let moved = 8 * stored + 9;
+                (3 * stored + moved).max(2 * moved)
             }
         }
     }
@@ -317,11 +332,45 @@ impl Inner {
                 .expect("an index below the base")
                 .plain(index);
         }
+        Key::Borrowed(self.added_key(index))
+    }
+
+    /// Entry `index`'s key, above the base: on the heap or in a segment, in place.
+    fn added_key(&self, index: u64) -> &[u8] {
         if index >= self.heap.start {
-            return Key::Borrowed(self.heap.key(index));
+            return self.heap.key(index);
         }
         let at = self.segments.partition_point(|s| s.start() <= index) - 1;
-        Key::Borrowed(self.segments[at].key(index))
+        self.segments[at].key(index)
+    }
+
+    /// [`Self::key`], a key of a compressed base decoded into `decoded`, its room charged
+    /// first; every other key is read in place.
+    fn key_within<'k, B: std::ops::Deref<Target = Budget>>(
+        &'k self,
+        index: u64,
+        decoded: &'k mut ChargedVec<u8, B>,
+    ) -> Result<&'k [u8], BudgetExceeded> {
+        let Some(base) = self.base.as_ref().filter(|base| index < base.len) else {
+            return Ok(self.added_key(index));
+        };
+        match &base.codec {
+            None => Ok(base.key(index)),
+            Some(codec) => {
+                decoded.clear();
+                codec.decompress_within(base.key(index), decoded)?;
+                Ok(decoded)
+            }
+        }
+    }
+
+    /// The most bytes decoding entry `index` allocates: its text's, and for a key stored
+    /// compressed the buffer it is decompressed into ([`Base::decode_bound`]).
+    fn decode_bound(&self, index: u64) -> usize {
+        match &self.base {
+            Some(base) if index < base.len => base.decode_bound(index),
+            _ => self.key(index).len(),
+        }
     }
 
     /// The index of `key`, whose hash is `hash`, if it is an entry.
@@ -737,23 +786,52 @@ impl Dictionary {
     /// Like [`lookup`](Self::lookup) but treats entries with index `>= limit` as absent.
     /// Snapshots use this so that terms interned after the snapshot was taken are never
     /// observed, which keeps term identity stable for the lifetime of a query.
+    /// [`Self::lookup_bounded`], what it allocates charged first through `charge`: its key
+    /// (from 64 bytes, grown to the term's encoded length by doubling, the old buffer beside
+    /// the new while it grows), and where the base's keys are compressed the compressor's
+    /// output (twice the key) and the stored key it is copied into, grown past the key's
+    /// length; a triple term's, its components' looked up one after another and then its key
+    /// of ids. The bound and the lookup read one state of the dictionary, under one read
+    /// guard: a checkpoint can't publish a compressed base between them.
+    pub fn lookup_charged<E>(
+        &self,
+        term: TermRef<'_>,
+        limit: u64,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<Option<TermId>, E> {
+        let inner = self.inner.read_recursive();
+        let compressed = inner.base.as_ref().is_some_and(|base| base.codec.is_some());
+        charge(lookup_bytes(term, compressed))?;
+        Ok(self.lookup_in(&inner, term, limit))
+    }
+
     pub fn lookup_bounded(&self, term: TermRef<'_>, limit: u64) -> Option<TermId> {
+        self.lookup_in(&self.inner.read_recursive(), term, limit)
+    }
+
+    /// [`Self::lookup_bounded`] in `inner`, a state of the dictionary read under a guard the
+    /// caller holds.
+    fn lookup_in(&self, inner: &Inner, term: TermRef<'_>, limit: u64) -> Option<TermId> {
         if let Some(id) = self.inline_id(term) {
             return Some(id);
         }
         if let TermRef::Triple(triple) = term {
             let ids = [
-                self.lookup_bounded(triple.subject.as_ref().into(), limit)?,
-                self.lookup_bounded(triple.predicate.as_ref().into(), limit)?,
-                self.lookup_bounded(triple.object.as_ref(), limit)?,
+                self.lookup_in(inner, triple.subject.as_ref().into(), limit)?,
+                self.lookup_in(inner, triple.predicate.as_ref().into(), limit)?,
+                self.lookup_in(inner, triple.object.as_ref(), limit)?,
             ];
-            return self.triple_term_bounded(ids, limit);
+            let mut key = Vec::with_capacity(TRIPLE_KEY_LEN);
+            triple_key(ids, &mut key);
+            return inner
+                .find(key_hash(&key), &key)
+                .filter(|&index| index < limit)
+                .map(|index| TermId::new(TermKind::Triple, index));
         }
         let mut key = Vec::with_capacity(64);
         let kind = encode_key(term, &mut key);
         let hash = key_hash(&key);
-        self.inner
-            .read()
+        inner
             .find(hash, &key)
             .filter(|&index| index < limit)
             .map(|index| TermId::new(kind, index))
@@ -1252,6 +1330,37 @@ impl Dictionary {
         }
     }
 
+    /// [`Self::decode`] of the dictionary term `id`, what it allocates charged first through
+    /// `charge`: the term's text, and for a key stored compressed the buffers it is
+    /// decompressed through. The bound and the decoding read one state of the dictionary,
+    /// under one read guard. `Ok(None)` for inline ids, triple terms (decoded part by part)
+    /// and unknown ids, which it doesn't decode.
+    pub fn decode_charged<E>(
+        &self,
+        id: TermId,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<Option<Term>, E> {
+        if !id.kind().is_dictionary() || id.kind() == TermKind::Triple {
+            return Ok(None);
+        }
+        let inner = self.inner.read_recursive();
+        if id.payload() >= inner.len() {
+            return Ok(None);
+        }
+        charge(inner.decode_bound(id.payload()))?;
+        Ok(Some(decode_key(&inner.key(id.payload()))))
+    }
+
+    /// [`Self::decode_charged`]'s bound for the dictionary term `id`, as the dictionary
+    /// stores it now; `None` for inline ids, triple terms and unknown ids.
+    pub fn decode_bound(&self, id: TermId) -> Option<usize> {
+        if !id.kind().is_dictionary() || id.kind() == TermKind::Triple {
+            return None;
+        }
+        let inner = self.inner.read_recursive();
+        (id.payload() < inner.len()).then(|| inner.decode_bound(id.payload()))
+    }
+
     /// Calls `f` with a borrowed view of the dictionary term `id`, without allocating: the
     /// view points into the arena under the read lock, so `f` must be short. `None` for
     /// inline ids (which carry their value, see [`TermId`]) and unknown ids.
@@ -1312,39 +1421,33 @@ impl Dictionary {
         &self,
         quads: &[Quad],
         pending: &Pending,
-        chunk: u32,
-        batch: u32,
+        (chunk, batch): (u32, u32),
+        scratch: &mut BatchScratch,
     ) -> Vec<EncodedQuad> {
-        let mut keys = KeyBatch::with_capacity(quads.len());
-        let slots = keys.slots(self, quads);
+        let BatchScratch {
+            keys,
+            slots,
+            indexes,
+            by_shard,
+        } = scratch;
+        keys.clear();
+        keys.slots(self, quads, slots);
         // Known keys under the shared lock; the others go to `pending`, each shard locked
         // once, at their positions in the input.
-        let found: Vec<Option<u64>> = {
+        indexes.clear();
+        {
             let inner = self.inner.read();
-            keys.keys
-                .iter()
-                .map(|key| inner.find(key.hash, &keys.arena[key.start..key.end]))
-                .collect()
-        };
-        let new: Vec<NewKey> = keys
-            .keys
-            .iter()
-            .enumerate()
-            .filter(|&(i, _)| found[i].is_none())
-            .map(|(i, key)| NewKey {
-                start: key.start,
-                end: key.end,
-                hash: key.hash,
-                at: super::pending::position(chunk, batch, i),
-            })
-            .collect();
-        let provisional = pending.intern(&keys.arena, &new);
-        let mut provisional = provisional.into_iter();
-        let indexes: Vec<u64> = found
-            .into_iter()
-            .map(|index| index.unwrap_or_else(|| provisional.next().expect("one per new key")))
-            .collect();
-        keys.resolve(&slots, &indexes)
+            indexes.extend(keys.keys.iter().map(|key| {
+                inner
+                    .find(key.hash, &keys.arena[key.start..key.end])
+                    .unwrap_or(NEW)
+            }));
+        }
+        pending.intern((chunk, batch), indexes, by_shard, |i| {
+            let key = &keys.keys[i];
+            (&keys.arena[key.start..key.end], key.hash)
+        });
+        keys.resolve(slots, indexes)
     }
 
     /// Numbers a bulk load's `pending` terms after the entries there are (in the order of
@@ -1357,7 +1460,12 @@ impl Dictionary {
             return;
         }
         let inner = self.inner.upgradable_read();
-        let adopted = pending.number(inner.len(), |hash, key| inner.find(hash, key));
+        // A load into an empty dictionary finds none of its terms there: no hashing.
+        let empty = inner.len() == 0;
+        let adopted = pending.number(inner.len(), |key| match empty {
+            true => None,
+            false => inner.find(key_hash(key), key),
+        });
         remap(&adopted);
         let mut inner = parking_lot::RwLockUpgradableReadGuard::upgrade(inner);
         inner.adopt(adopted);
@@ -1397,13 +1505,20 @@ impl Dictionary {
         ))
     }
 
-    /// The plain keys of a sample of the entries `0..len`, spread over them: what a
-    /// checkpoint's symbol tables are trained on ([`super::vocabulary`]).
-    pub(crate) fn sample_keys(&self, len: u64) -> Vec<Vec<u8>> {
+    /// The plain keys of a sample of the entries `0..len`, spread over them, each charged to
+    /// `budget` before it is copied (or decoded): what a checkpoint's symbol tables are
+    /// trained on ([`super::vocabulary`]).
+    pub(crate) fn sample_within<'b>(
+        &self,
+        len: u64,
+        budget: &'b Budget,
+    ) -> Result<Sample<'b>, BudgetExceeded> {
         let inner = self.inner.read();
-        Codec::sample_indexes(len.min(inner.len()))
-            .map(|index| inner.key(index).into_owned())
-            .collect()
+        let (mut sample, mut decoded) = (Sample::new(budget), ChargedVec::new(budget));
+        for index in Codec::sample_indexes(len.min(inner.len())) {
+            sample.push(inner.key_within(index, &mut decoded)?)?;
+        }
+        Ok(sample)
     }
 
     /// Raw key bytes of entries `[from, to)`, in id order. Used by the WAL and checkpoints.
@@ -1415,12 +1530,24 @@ impl Dictionary {
     }
 
     /// Calls `f` with the key of each entry in `from..to`, in id order, holding the read
-    /// lock for the range: checkpoints read the dictionary in chunks with this.
-    pub(crate) fn for_each_key(&self, from: u64, to: u64, mut f: impl FnMut(&[u8])) {
+    /// lock for the range, until `f` fails: checkpoints read the dictionary in chunks with
+    /// this. A key of a compressed base is decoded into `decoded`, its room charged first.
+    pub(crate) fn for_each_key<B, E>(
+        &self,
+        from: u64,
+        to: u64,
+        decoded: &mut ChargedVec<u8, B>,
+        mut f: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        B: std::ops::Deref<Target = Budget>,
+        E: From<BudgetExceeded>,
+    {
         let inner = self.inner.read();
         for index in from..to.min(inner.len()) {
-            f(&inner.key(index));
+            f(inner.key_within(index, decoded)?)?;
         }
+        Ok(())
     }
 
     /// Restores a checkpoint's mapped entries into this empty dictionary.
@@ -1555,7 +1682,20 @@ struct PreparedKey {
     kind: TermKind,
 }
 
+/// What interning a bulk load's batch works in, kept for its next batches (one per thread
+/// at a time, [`crate::engine::BulkLoad`]): allocated afresh for each batch, on every thread
+/// at once, these arrays made the allocator hold far more than the load's data at its peak
+/// (18 Oct 2026).
+#[derive(Default)]
+pub(crate) struct BatchScratch {
+    keys: KeyBatch,
+    slots: Vec<[Slot; 4]>,
+    indexes: Vec<u64>,
+    by_shard: Vec<(u16, u32)>,
+}
+
 /// The distinct keys of one batch, encoded into one arena, with their hashes.
+#[derive(Default)]
 struct KeyBatch {
     arena: Vec<u8>,
     keys: Vec<PreparedKey>,
@@ -1567,21 +1707,19 @@ impl KeyBatch {
     /// Each quad's terms as slots, its keys added to the batch.
     /// Keys are added in the order the terms come (subject, predicate, object, graph): a
     /// bulk load's new terms are numbered in this order ([`super::pending`]).
-    fn slots(&mut self, dictionary: &Dictionary, quads: &[Quad]) -> Vec<[Slot; 4]> {
-        quads
-            .iter()
-            .map(|quad| {
-                let quad = quad.as_ref();
-                let subject = self.slot(dictionary, quad.subject.into());
-                let predicate = self.slot(dictionary, quad.predicate.into());
-                let object = self.slot(dictionary, quad.object);
-                let graph = match graph_term(quad.graph_name) {
-                    Some(term) => self.slot(dictionary, term),
-                    None => Slot::Id(TermId::DEFAULT_GRAPH),
-                };
-                [subject, predicate, object, graph]
-            })
-            .collect()
+    fn slots(&mut self, dictionary: &Dictionary, quads: &[Quad], slots: &mut Vec<[Slot; 4]>) {
+        slots.clear();
+        slots.extend(quads.iter().map(|quad| {
+            let quad = quad.as_ref();
+            let subject = self.slot(dictionary, quad.subject.into());
+            let predicate = self.slot(dictionary, quad.predicate.into());
+            let object = self.slot(dictionary, quad.object);
+            let graph = match graph_term(quad.graph_name) {
+                Some(term) => self.slot(dictionary, term),
+                None => Slot::Id(TermId::DEFAULT_GRAPH),
+            };
+            [subject, predicate, object, graph]
+        }));
     }
 
     /// The quads of `slots`, each key taking its index in `indexes`.
@@ -1604,12 +1742,11 @@ impl KeyBatch {
         quads
     }
 
-    fn with_capacity(quads: usize) -> Self {
-        Self {
-            arena: Vec::with_capacity(quads * 64),
-            keys: Vec::with_capacity(quads),
-            table: HashTable::with_capacity(quads),
-        }
+    /// Empty, its capacity kept.
+    fn clear(&mut self) {
+        self.arena.clear();
+        self.keys.clear();
+        self.table.clear();
     }
 
     fn slot(&mut self, dictionary: &Dictionary, term: TermRef<'_>) -> Slot {
@@ -1649,6 +1786,45 @@ fn graph_term(graph: GraphNameRef<'_>) -> Option<TermRef<'_>> {
         GraphNameRef::NamedNode(node) => Some(node.into()),
         GraphNameRef::BlankNode(node) => Some(node.into()),
         GraphNameRef::DefaultGraph => None,
+    }
+}
+
+/// The most bytes a lookup of `term` allocates ([`Dictionary::lookup_charged`]), in a
+/// dictionary whose base's keys are `compressed` or not.
+fn lookup_bytes(term: TermRef<'_>, compressed: bool) -> usize {
+    if let TermRef::Triple(triple) = term {
+        let parts = [
+            lookup_bytes(triple.subject.as_ref().into(), compressed),
+            lookup_bytes(triple.predicate.as_ref().into(), compressed),
+            lookup_bytes(triple.object.as_ref(), compressed),
+        ];
+        return parts.into_iter().max().unwrap_or(0).max(TRIPLE_KEY_LEN);
+    }
+    let encoded = encoded_len(term);
+    let key = encoded.max(64);
+    match compressed {
+        false => 3 * key,
+        true => 2 * key + 5 * encoded + 16,
+    }
+}
+
+/// The length of `term`'s key ([`encode_key`]), but a triple term's.
+fn encoded_len(term: TermRef<'_>) -> usize {
+    match term {
+        TermRef::NamedNode(node) => 1 + node.as_str().len(),
+        TermRef::BlankNode(node) => 1 + node.as_str().len(),
+        TermRef::Literal(literal) => {
+            let head = match literal.language() {
+                Some(language) => {
+                    let direction = literal.direction().map_or(0, |d| d.as_str().len() + 1);
+                    1 + language.len() + direction + 1
+                }
+                None if literal.datatype() == nrese_rdf::vocab::xsd::STRING => 1,
+                None => 1 + literal.datatype().as_str().len() + 1,
+            };
+            head + literal.value().len()
+        }
+        TermRef::Triple(_) => TRIPLE_KEY_LEN,
     }
 }
 

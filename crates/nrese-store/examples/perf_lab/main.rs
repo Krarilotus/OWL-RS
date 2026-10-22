@@ -10,6 +10,7 @@
 //!     [--readers 0] [--clients N --duration-s 10] [--threads N] [--export FILE]
 //!     [--canonicalize FILE]... [--prepare-vector-graph DIM:METRIC] [--read-graphs IRI,...]
 //! cargo run --release -p nrese-store --example perf_lab -- --durable NAME --store DIR [--runs 5]
+//!     [--replication COMMITS:QUADS [--store DIR] [--replication-probe swap-one]]
 //! cargo run --release -p nrese-store --example perf_lab -- generate KIND OUT [key=value]...
 //! ```
 //!
@@ -65,6 +66,10 @@
 //!   stores without reasoning load). `--canonicalize` canonicalises blank nodes.
 //!   `--prepare-vector-graph 64:cosine` synchronously prepares that vector space before
 //!   query timing, recording its preparation phase and checking full graph coverage.
+//!   `--replication COMMITS:QUADS` times read replicas' log shipping: COMMITS commits of
+//!   QUADS statements on a durable primary, then per run a fresh follower catching up from
+//!   its image through the feed (`log_since`) and the apply (`apply_log`), timed apart, with
+//!   the catch-up's peak memory (`modes::replication`; under `--store DIR` when given).
 //!   `generate` writes the suite's data (`generate.rs`). A failure still writes the report, with
 //!   its `error`.
 //!
@@ -261,6 +266,8 @@ struct Args {
     kernel: Option<String>,
     /// `--durable NAME`: the durable engine's own costs ([`durable`]).
     durable: Option<String>,
+    replication: Option<String>,
+    replication_probe: bool,
     classify: bool,
     prepare_vector_graph: Option<(usize, nrese_engine::vector::Metric)>,
     read_graphs: Vec<String>,
@@ -303,6 +310,8 @@ fn parse_args() -> Result<Args, String> {
         parse_only: false,
         kernel: None,
         durable: None,
+        replication: None,
+        replication_probe: false,
         classify: false,
         prepare_vector_graph: None,
         read_graphs: Vec::new(),
@@ -378,6 +387,11 @@ fn parse_args() -> Result<Args, String> {
             "--parse-only" => args.parse_only = true,
             "--kernel" => args.kernel = Some(value()?),
             "--durable" => args.durable = Some(value()?),
+            "--replication" => args.replication = Some(value()?),
+            "--replication-probe" => match value()?.as_str() {
+                "swap-one" => args.replication_probe = true,
+                other => return Err(format!("--replication-probe swap-one, not {other}")),
+            },
             "--classify" => args.classify = true,
             "--read-graphs" => args.read_graphs = value()?.split(',').map(str::to_owned).collect(),
             "--prepare-vector-graph" => {
@@ -1049,6 +1063,18 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         report
             .sections
             .push(("kernel", modes::kernel(kernel, args.runs)?));
+        return Ok(());
+    }
+    if let Some(spec) = &args.replication {
+        report.sections.push((
+            "replication",
+            modes::replication(
+                spec,
+                args.runs,
+                args.store.as_deref(),
+                args.replication_probe,
+            )?,
+        ));
         return Ok(());
     }
     let mut phases: Vec<(&'static str, String)> = Vec::new();
