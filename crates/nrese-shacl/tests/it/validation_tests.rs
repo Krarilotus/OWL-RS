@@ -1,6 +1,8 @@
 //! What the W3C suite doesn't cover: ill-formed shapes, which statements are validated,
 //! recursion, severities and messages, and the report's RDF form.
 
+mod path_admission;
+
 use nrese_engine::{
     EncodedTriple, Engine, EngineConfig, GraphSelector, ReadModel, Snapshot, TermId,
 };

@@ -23,13 +23,12 @@ use crate::model::{
 };
 use crate::sparql;
 
+mod path;
+
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDFS_CLASS: &str = "http://www.w3.org/2000/01/rdf-schema#Class";
 const OWL_CLASS: &str = "http://www.w3.org/2002/07/owl#Class";
 const OWL_IMPORTS: &str = "http://www.w3.org/2002/07/owl#imports";
-
-/// The deepest path nesting accepted; a deeper (or cyclic) path is ill-formed.
-const MAX_PATH_DEPTH: usize = 64;
 
 /// Builds a path from its one inner path (`sh:inversePath` and the like).
 type UnaryPath = fn(Box<Path>) -> Path;
@@ -331,52 +330,6 @@ impl<V: ReadView> Compiler<'_, V> {
         Ok(members)
     }
 
-    fn path(&self, node: TermId, depth: usize) -> Result<Path, String> {
-        if depth > MAX_PATH_DEPTH {
-            return Err("sh:path is nested too deeply or cyclic".to_owned());
-        }
-        match node.kind() {
-            TermKind::Iri => return Ok(Path::Predicate(node)),
-            TermKind::BlankNode => {}
-            _ => return Err("sh:path isn't an IRI or a path".to_owned()),
-        }
-        let members = |head: TermId| -> Result<Vec<Path>, String> {
-            let members = self
-                .list(head)
-                .map_err(|problem| format!("sh:path {problem}"))?;
-            if members.len() < 2 {
-                return Err("a sequence or alternative path needs two members".to_owned());
-            }
-            members
-                .into_iter()
-                .map(|member| self.path(member, depth + 1))
-                .collect()
-        };
-        // A node that is a list is a sequence path, whatever else it also says (the W3C
-        // suite's `path-strange` tests pin this reading).
-        if self
-            .rdf_first
-            .is_some_and(|first| !self.graph.objects(node, first).is_empty())
-        {
-            return Ok(Path::Sequence(members(node)?));
-        }
-        let unary: [(&str, UnaryPath); 4] = [
-            ("inversePath", Path::Inverse),
-            ("zeroOrMorePath", Path::ZeroOrMore),
-            ("oneOrMorePath", Path::OneOrMore),
-            ("zeroOrOnePath", Path::ZeroOrOne),
-        ];
-        for (local, make) in unary {
-            if let [inner] = self.values(node, local).as_slice() {
-                return Ok(make(Box::new(self.path(*inner, depth + 1)?)));
-            }
-        }
-        if let [alternatives] = self.values(node, "alternativePath").as_slice() {
-            return Ok(Path::Alternative(members(*alternatives)?));
-        }
-        Err("sh:path isn't an IRI or a path".to_owned())
-    }
-
     /// The shapes in the list that is the value of a logical parameter.
     fn shape_list(
         &mut self,
@@ -418,13 +371,7 @@ impl<V: ReadView> Compiler<'_, V> {
 
         let path = match self.one(node, "path")? {
             None => None,
-            Some(path) => match self.path(path, 0) {
-                Ok(path) => Some(path),
-                Err(problem) => {
-                    self.error(node, problem)?;
-                    None
-                }
-            },
+            Some(path) => path::compile(self, node, path)?,
         };
         let targets = self.targets(node)?;
         let severity = match self.one(node, "severity")? {
