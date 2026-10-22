@@ -122,106 +122,200 @@ pub(crate) fn write_term(out: &mut Vec<u8>, term: TermRef<'_>) {
 // ---------------------------------------------------------------------------------------
 // Reading
 
-/// The events of a document, from memory or a reader.
-pub(crate) trait Events {
-    fn next(&mut self) -> Result<JsonEvent<'_>, QueryResultsParseError>;
-}
+use crate::parser::scoped::{self, Held, Owner, Policy, Unchecked};
+use nrese_json::SliceJsonSession;
+use std::io;
 
+pub(crate) trait Events {
+    type P: Policy;
+    fn with_next<R>(
+        &mut self,
+        f: impl for<'a> FnOnce(&mut Self::P, JsonEvent<'a>) -> Result<R, QueryResultsParseError>,
+    ) -> Result<R, QueryResultsParseError>;
+    fn with_owner<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self::P) -> Result<R, QueryResultsParseError>,
+    ) -> Result<R, QueryResultsParseError>;
+}
 impl Events for SliceJsonParser<'_> {
-    fn next(&mut self) -> Result<JsonEvent<'_>, QueryResultsParseError> {
-        Ok(self.next_event()?)
+    type P = Unchecked;
+    fn with_next<R>(
+        &mut self,
+        f: impl for<'a> FnOnce(&mut Self::P, JsonEvent<'a>) -> Result<R, QueryResultsParseError>,
+    ) -> Result<R, QueryResultsParseError> {
+        f(&mut Unchecked, self.next_event()?)
+    }
+    fn with_owner<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self::P) -> Result<R, QueryResultsParseError>,
+    ) -> Result<R, QueryResultsParseError> {
+        f(&mut Unchecked)
     }
 }
-
-impl<R: Read> Events for ReaderJsonParser<R> {
-    fn next(&mut self) -> Result<JsonEvent<'_>, QueryResultsParseError> {
-        Ok(self.next_event()?)
+impl<Rd: Read> Events for ReaderJsonParser<Rd> {
+    type P = Unchecked;
+    fn with_next<R>(
+        &mut self,
+        f: impl for<'a> FnOnce(&mut Self::P, JsonEvent<'a>) -> Result<R, QueryResultsParseError>,
+    ) -> Result<R, QueryResultsParseError> {
+        f(&mut Unchecked, self.next_event()?)
+    }
+    fn with_owner<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self::P) -> Result<R, QueryResultsParseError>,
+    ) -> Result<R, QueryResultsParseError> {
+        f(&mut Unchecked)
+    }
+}
+pub(crate) struct ScopedEvents<'c, 'i, 's, 'o, C>(
+    pub &'c mut SliceJsonSession<'i, 's, Owner<'o, C>>,
+);
+impl<'o, C> Events for ScopedEvents<'_, '_, '_, 'o, C> {
+    type P = Owner<'o, C>;
+    fn with_next<R>(
+        &mut self,
+        f: impl for<'a> FnOnce(&mut Self::P, JsonEvent<'a>) -> Result<R, QueryResultsParseError>,
+    ) -> Result<R, QueryResultsParseError> {
+        self.0
+            .next_event(|p, event| {
+                f(p, event)
+                    .map_err(io::Error::from)
+                    .map_err(nrese_json::JsonParseError::from)
+            })
+            .map_err(scoped::from_json)
+    }
+    fn with_owner<R>(
+        &mut self,
+        f: impl FnOnce(&mut Self::P) -> Result<R, QueryResultsParseError>,
+    ) -> Result<R, QueryResultsParseError> {
+        f(self.0.owner_mut())
     }
 }
 
 fn syntax(message: impl Into<String>) -> QueryResultsParseError {
     QueryResultsSyntaxError::msg(message).into()
 }
-
-/// What the start of a document says.
 pub(crate) enum Start {
     Boolean(bool),
     Solutions,
 }
+type Sparse<P> = Held<Vec<(Held<String, P>, Held<Term, P>)>, P>;
+type Early<P> = Held<std::vec::IntoIter<Sparse<P>>, P>;
+type Row<P> = Held<Vec<Option<Term>>, P>;
 
-/// Solutions read from a JSON document.
 pub(crate) struct JsonSolutions<E: Events> {
-    events: E,
     variables: Arc<[Variable]>,
-    /// Rows collected before the head (`results` before `head`), handed out first.
     buffered: VecDeque<Vec<Option<Term>>>,
-    /// Inside the bindings array.
+    early: Option<Early<E::P>>,
     streaming: bool,
     done: bool,
+    events: E, // Payload fields drop before the scoped event owner.
 }
-
-/// How deep triple terms may nest: deeper input is an error, not a stack overflow.
 const MAX_NESTING: usize = 64;
 
+#[derive(PartialEq)]
+enum Shape {
+    Object,
+    EndObject,
+    Array,
+    EndArray,
+    Eof,
+    Other,
+}
+fn shape<E: Events>(events: &mut E) -> Result<Shape, QueryResultsParseError> {
+    events.with_next(|_, event| {
+        Ok(match event {
+            JsonEvent::StartObject => Shape::Object,
+            JsonEvent::EndObject => Shape::EndObject,
+            JsonEvent::StartArray => Shape::Array,
+            JsonEvent::EndArray => Shape::EndArray,
+            JsonEvent::Eof => Shape::Eof,
+            _ => Shape::Other,
+        })
+    })
+}
+enum Key {
+    Head,
+    Boolean,
+    Results,
+    Bindings,
+    Vars,
+    Other,
+    End,
+}
+fn key<E: Events>(events: &mut E, error: &'static str) -> Result<Key, QueryResultsParseError> {
+    events.with_next(|_, event| match event {
+        JsonEvent::EndObject => Ok(Key::End),
+        JsonEvent::ObjectKey(name) => Ok(match name.as_ref() {
+            "head" => Key::Head,
+            "boolean" => Key::Boolean,
+            "results" => Key::Results,
+            "bindings" => Key::Bindings,
+            "vars" => Key::Vars,
+            _ => Key::Other,
+        }),
+        _ => Err(syntax(error)),
+    })
+}
+
 impl<E: Events> JsonSolutions<E> {
-    /// Reads up to the first binding (or the whole document, for a boolean or when the
-    /// bindings come before the head).
     pub(crate) fn start(mut events: E) -> Result<(Start, Self), QueryResultsParseError> {
-        if !matches!(events.next()?, JsonEvent::StartObject) {
+        if shape(&mut events)? != Shape::Object {
             return Err(syntax("SPARQL JSON results must be an object"));
         }
         let mut variables: Option<Vec<Variable>> = None;
         let mut boolean = None;
-        let mut early: Vec<Vec<(String, Term)>> = Vec::new();
+        let mut early: Vec<Sparse<E::P>> = Vec::new();
         let mut saw_results = false;
         loop {
-            let key = match events.next()? {
-                JsonEvent::ObjectKey(key) => key.into_owned(),
-                JsonEvent::EndObject => break,
-                _ => return Err(syntax("expected a member of the results object")),
-            };
-            match key.as_str() {
-                "head" => variables = Some(read_head(&mut events)?),
-                "boolean" => match events.next()? {
-                    JsonEvent::Boolean(value) => boolean = Some(value),
-                    _ => return Err(syntax("'boolean' must be true or false")),
-                },
-                "results" => {
+            match key(&mut events, "expected a member of the results object")? {
+                Key::End => break,
+                Key::Head => variables = Some(read_head(&mut events)?),
+                Key::Boolean => {
+                    boolean = Some(events.with_next(|_, event| match event {
+                        JsonEvent::Boolean(value) => Ok(value),
+                        _ => Err(syntax("'boolean' must be true or false")),
+                    })?)
+                }
+                Key::Results => {
                     saw_results = true;
-                    if !matches!(events.next()?, JsonEvent::StartObject) {
+                    if shape(&mut events)? != Shape::Object {
                         return Err(syntax("'results' must be an object"));
                     }
                     loop {
-                        let key = match events.next()? {
-                            JsonEvent::ObjectKey(key) => key.into_owned(),
-                            JsonEvent::EndObject => break,
-                            _ => return Err(syntax("expected a member of 'results'")),
-                        };
-                        if key != "bindings" {
-                            skip_value(&mut events)?;
-                            continue;
+                        match key(&mut events, "expected a member of 'results'")? {
+                            Key::End => break,
+                            Key::Bindings => {}
+                            _ => {
+                                skip_value(&mut events)?;
+                                continue;
+                            }
                         }
-                        if !matches!(events.next()?, JsonEvent::StartArray) {
+                        if shape(&mut events)? != Shape::Array {
                             return Err(syntax("'bindings' must be an array"));
                         }
-                        if let Some(variables) = &variables {
-                            // The usual order: stream from here.
-                            let variables: Arc<[Variable]> = variables.clone().into();
+                        if let Some(variables) = variables.take() {
                             return Ok((
                                 Start::Solutions,
                                 Self {
-                                    events,
-                                    variables,
+                                    variables: variables.into(),
                                     buffered: VecDeque::new(),
+                                    early: None,
                                     streaming: true,
                                     done: false,
+                                    events,
                                 },
                             ));
                         }
                         loop {
-                            match events.next()? {
-                                JsonEvent::StartObject => early.push(read_binding(&mut events)?),
-                                JsonEvent::EndArray => break,
+                            match shape(&mut events)? {
+                                Shape::Object => {
+                                    events.with_owner(|p| p.row_start())?;
+                                    let binding = read_binding(&mut events)?;
+                                    events.with_owner(|p| scoped::grow(p, &mut early, 1))?;
+                                    early.push(binding);
+                                }
+                                Shape::EndArray => break,
                                 _ => return Err(syntax("a binding must be an object")),
                             }
                         }
@@ -230,7 +324,7 @@ impl<E: Events> JsonSolutions<E> {
                 _ => skip_value(&mut events)?,
             }
         }
-        if !matches!(events.next()?, JsonEvent::Eof) {
+        if shape(&mut events)? != Shape::Eof {
             return Err(syntax("text after the results object"));
         }
         let (start, variables): (Start, Arc<[Variable]>) = match (boolean, variables) {
@@ -239,46 +333,76 @@ impl<E: Events> JsonSolutions<E> {
             (None, None) => return Err(syntax("neither 'boolean' nor 'head' and 'results'")),
             (Some(_), None) => return Err(syntax("'results' without 'head'")),
         };
-        let mut buffered = VecDeque::with_capacity(early.len());
-        for binding in early {
-            buffered.push_back(place(&variables, binding)?);
-        }
+        let mut buffered = VecDeque::new();
+        let early = if E::P::CHECKED {
+            let bytes = early
+                .capacity()
+                .checked_mul(size_of::<Sparse<E::P>>())
+                .ok_or_else(scoped::overflow)?;
+            Some(Held::new(early.into_iter(), bytes))
+        } else {
+            buffered = VecDeque::with_capacity(early.len());
+            // Ordinary start keeps its established eager error timing.
+            for binding in early {
+                buffered.push_back(place(&mut events, &variables, binding)?.value);
+            }
+            None
+        };
         Ok((
             start,
             Self {
-                events,
                 variables,
                 buffered,
+                early,
                 streaming: false,
                 done: true,
+                events,
             },
         ))
     }
-
     pub(crate) fn variables(&self) -> &Arc<[Variable]> {
         &self.variables
     }
-
-    /// The next solution's values, or `None` after the last.
+    pub(crate) fn with_owner<R>(
+        &mut self,
+        f: impl FnOnce(&mut E::P) -> Result<R, QueryResultsParseError>,
+    ) -> Result<R, QueryResultsParseError> {
+        self.events.with_owner(f)
+    }
     pub(crate) fn next_row(&mut self) -> Result<Option<Vec<Option<Term>>>, QueryResultsParseError> {
+        self.next_held().map(|row| row.map(|row| row.value))
+    }
+    pub(crate) fn next_held(&mut self) -> Result<Option<Row<E::P>>, QueryResultsParseError> {
         if let Some(row) = self.buffered.pop_front() {
-            return Ok(Some(row));
+            return Ok(Some(Held::new(row, 0)));
+        }
+        if let Some(early) = &mut self.early {
+            if let Some(binding) = early.value.next() {
+                return place(&mut self.events, &self.variables, binding).map(Some);
+            }
+            let early = self.early.take().expect("present");
+            self.events.with_owner(|p| {
+                scoped::release(p, early);
+                Ok(())
+            })?;
         }
         if self.done || !self.streaming {
             return Ok(None);
         }
-        match self.events.next()? {
-            JsonEvent::StartObject => read_row(&mut self.events, &self.variables).map(Some),
-            JsonEvent::EndArray => {
+        match shape(&mut self.events)? {
+            Shape::Object => {
+                self.events.with_owner(|p| p.row_start())?;
+                read_row(&mut self.events, &self.variables).map(Some)
+            }
+            Shape::EndArray => {
                 self.done = true;
-                // The rest of `results`, and of the document.
                 let mut depth = 2;
                 loop {
-                    match self.events.next()? {
-                        JsonEvent::StartObject | JsonEvent::StartArray => depth += 1,
-                        JsonEvent::EndObject | JsonEvent::EndArray => depth -= 1,
-                        JsonEvent::Eof if depth == 0 => return Ok(None),
-                        JsonEvent::Eof => return Err(syntax("the document ends inside 'results'")),
+                    match shape(&mut self.events)? {
+                        Shape::Object | Shape::Array => depth += 1,
+                        Shape::EndObject | Shape::EndArray => depth -= 1,
+                        Shape::Eof if depth == 0 => return Ok(None),
+                        Shape::Eof => return Err(syntax("the document ends inside 'results'")),
                         _ => {}
                     }
                 }
@@ -288,88 +412,113 @@ impl<E: Events> JsonSolutions<E> {
     }
 }
 
-/// `head`: `{"vars": [...], "link": [...]}`.
-fn read_head(events: &mut impl Events) -> Result<Vec<Variable>, QueryResultsParseError> {
-    if !matches!(events.next()?, JsonEvent::StartObject) {
+fn read_head<E: Events>(events: &mut E) -> Result<Vec<Variable>, QueryResultsParseError> {
+    if shape(events)? != Shape::Object {
         return Err(syntax("'head' must be an object"));
     }
-    let mut variables = Vec::new();
+    let mut variables = Vec::new(); // Metadata exemption is deliberately unchanged.
     loop {
-        let key = match events.next()? {
-            JsonEvent::ObjectKey(key) => key.into_owned(),
-            JsonEvent::EndObject => return Ok(variables),
-            _ => return Err(syntax("expected a member of 'head'")),
-        };
-        if key != "vars" {
-            skip_value(events)?;
-            continue;
+        match key(events, "expected a member of 'head'")? {
+            Key::End => return Ok(variables),
+            Key::Vars => {}
+            _ => {
+                skip_value(events)?;
+                continue;
+            }
         }
-        if !matches!(events.next()?, JsonEvent::StartArray) {
+        if shape(events)? != Shape::Array {
             return Err(syntax("'vars' must be an array"));
         }
         loop {
-            match events.next()? {
-                JsonEvent::String(name) => {
-                    let variable = Variable::new(name.as_ref())
-                        .map_err(|e| syntax(format!("an invalid variable: {e}")))?;
-                    if variables.contains(&variable) {
-                        return Err(syntax(format!("the variable {variable} twice in 'vars'")));
-                    }
-                    variables.push(variable);
-                }
-                JsonEvent::EndArray => break,
-                _ => return Err(syntax("a variable must be a string")),
+            let variable = events.with_next(|_, event| match event {
+                JsonEvent::String(name) => Variable::new(name.as_ref())
+                    .map(Some)
+                    .map_err(|e| syntax(format!("an invalid variable: {e}"))),
+                JsonEvent::EndArray => Ok(None),
+                _ => Err(syntax("a variable must be a string")),
+            })?;
+            let Some(variable) = variable else {
+                break;
+            };
+            if variables.contains(&variable) {
+                return Err(syntax(format!("the variable {variable} twice in 'vars'")));
             }
+            variables.push(variable);
         }
     }
 }
 
-/// A binding object after its `{`: variable names and terms.
-fn read_binding(events: &mut impl Events) -> Result<Vec<(String, Term)>, QueryResultsParseError> {
+fn read_binding<E: Events>(events: &mut E) -> Result<Sparse<E::P>, QueryResultsParseError> {
     let mut binding = Vec::new();
+    let mut payload = 0usize;
     loop {
-        let name = match events.next()? {
-            JsonEvent::ObjectKey(name) => name.into_owned(),
-            JsonEvent::EndObject => return Ok(binding),
-            _ => return Err(syntax("expected a variable of the binding")),
+        let name = events.with_next(|p, event| match event {
+            JsonEvent::ObjectKey(name) => scoped::text(p, name).map(Some),
+            JsonEvent::EndObject => Ok(None),
+            _ => Err(syntax("expected a variable of the binding")),
+        })?;
+        let Some(name) = name else {
+            let slots = binding
+                .capacity()
+                .checked_mul(size_of::<(Held<String, E::P>, Held<Term, E::P>)>())
+                .ok_or_else(scoped::overflow)?;
+            return Ok(Held::new(
+                binding,
+                slots.checked_add(payload).ok_or_else(scoped::overflow)?,
+            ));
         };
-        if !matches!(events.next()?, JsonEvent::StartObject) {
-            return Err(syntax(format!("the value of {name} must be an object")));
+        if shape(events)? != Shape::Object {
+            return Err(syntax(format!(
+                "the value of {} must be an object",
+                name.value
+            )));
         }
-        binding.push((name, read_term(events, 0)?));
+        let term = read_term(events, 0)?;
+        payload = payload
+            .checked_add(name.bytes())
+            .and_then(|n| n.checked_add(term.bytes()))
+            .ok_or_else(scoped::overflow)?;
+        events.with_owner(|p| scoped::grow(p, &mut binding, 1))?;
+        binding.push((name, term));
     }
 }
 
-/// A binding object after its `{`, its values put in the order of `variables` as they
-/// come (no name is copied).
-fn read_row(
-    events: &mut impl Events,
+fn read_row<E: Events>(
+    events: &mut E,
     variables: &[Variable],
-) -> Result<Vec<Option<Term>>, QueryResultsParseError> {
-    let mut row = vec![None; variables.len()];
-    // Values usually come in the variables' order: try the next one first.
+) -> Result<Held<Vec<Option<Term>>, E::P>, QueryResultsParseError> {
+    let mut row = events.with_owner(|p| scoped::slots(p, variables.len()))?;
     let mut next = 0;
     loop {
-        let i = match events.next()? {
-            JsonEvent::ObjectKey(name) => match variables.get(next) {
-                Some(v) if v.as_str() == name => next,
-                _ => variables
-                    .iter()
-                    .position(|v| v.as_str() == name)
-                    .ok_or_else(|| syntax(format!("the variable {name} isn't in 'head'")))?,
-            },
-            JsonEvent::EndObject => return Ok(row),
-            _ => return Err(syntax("expected a variable of the binding")),
+        let index = events.with_next(|p, event| match event {
+            JsonEvent::ObjectKey(name) => {
+                if variables.get(next).is_some_and(|v| v.as_str() == name) {
+                    return Ok(Some(next));
+                }
+                for (i, variable) in variables.iter().enumerate() {
+                    p.work(1)?;
+                    if variable.as_str() == name {
+                        return Ok(Some(i));
+                    }
+                }
+                Err(syntax(format!("the variable {name} isn't in 'head'")))
+            }
+            JsonEvent::EndObject => Ok(None),
+            _ => Err(syntax("expected a variable of the binding")),
+        })?;
+        let Some(i) = index else {
+            return Ok(row);
         };
         next = i + 1;
-        if !matches!(events.next()?, JsonEvent::StartObject) {
+        if shape(events)? != Shape::Object {
             return Err(syntax(format!(
                 "the value of {} must be an object",
                 variables[i]
             )));
         }
         let term = read_term(events, 0)?;
-        if row[i].replace(term).is_some() {
+        row.add(term.bytes());
+        if row.value[i].replace(term.value).is_some() {
             return Err(syntax(format!(
                 "the variable {} twice in a binding",
                 variables[i]
@@ -378,182 +527,334 @@ fn read_row(
     }
 }
 
-/// The values of a binding in the order of `variables`.
-fn place(
+fn place<E: Events>(
+    events: &mut E,
     variables: &[Variable],
-    binding: Vec<(String, Term)>,
-) -> Result<Vec<Option<Term>>, QueryResultsParseError> {
-    let mut row = vec![None; variables.len()];
-    for (name, term) in binding {
-        let i = variables
-            .iter()
-            .position(|v| v.as_str() == name)
-            .ok_or_else(|| syntax(format!("the variable {name} isn't in 'head'")))?;
-        if row[i].replace(term).is_some() {
-            return Err(syntax(format!("the variable {name} twice in a binding")));
+    binding: Sparse<E::P>,
+) -> Result<Held<Vec<Option<Term>>, E::P>, QueryResultsParseError> {
+    let mut row = events.with_owner(|p| scoped::slots(p, variables.len()))?;
+    let slots = binding
+        .value
+        .capacity()
+        .checked_mul(size_of::<(Held<String, E::P>, Held<Term, E::P>)>())
+        .ok_or_else(scoped::overflow)?;
+    for (name, term) in binding.value {
+        let mut index = None;
+        for (i, variable) in variables.iter().enumerate() {
+            events.with_owner(|p| p.work(1))?;
+            if variable.as_str() == name.value {
+                index = Some(i);
+                break;
+            }
         }
+        let i =
+            index.ok_or_else(|| syntax(format!("the variable {} isn't in 'head'", name.value)))?;
+        let message_name = &variables[i];
+        row.add(term.bytes());
+        if row.value[i].replace(term.value).is_some() {
+            return Err(syntax(format!(
+                "the variable {message_name} twice in a binding"
+            )));
+        }
+        events.with_owner(|p| {
+            scoped::release(p, name);
+            Ok(())
+        })?;
     }
+    events.with_owner(|p| {
+        p.free(slots);
+        Ok(())
+    })?;
     Ok(row)
 }
 
-/// The `type` of a term object.
-enum TermType {
+enum TermType<P: Policy> {
     Uri,
     Bnode,
     Literal,
     Triple,
-    Unknown(String),
+    Unknown(Held<String, P>),
 }
-
-/// A term object after its `{`.
-fn read_term(events: &mut impl Events, depth: usize) -> Result<Term, QueryResultsParseError> {
-    enum Value {
-        Text(String),
-        Triple(Box<Triple>),
+enum Value {
+    Text(String),
+    Triple(Box<Triple>),
+}
+enum Member {
+    Type,
+    Value,
+    Datatype,
+    Language,
+    Direction,
+    Other,
+    End,
+}
+fn discard<E: Events, T>(
+    events: &mut E,
+    value: Option<Held<T, E::P>>,
+) -> Result<(), QueryResultsParseError> {
+    if let Some(value) = value {
+        events.with_owner(|p| {
+            scoped::release(p, value);
+            Ok(())
+        })?;
     }
-    /// The members of a term object.
-    enum Member {
-        Type,
-        Value,
-        Datatype,
-        Language,
-        Direction,
-        Other,
+    Ok(())
+}
+fn replace<E: Events, T>(
+    events: &mut E,
+    slot: &mut Option<Held<T, E::P>>,
+    value: Held<T, E::P>,
+) -> Result<(), QueryResultsParseError> {
+    discard(events, slot.replace(value))
+}
+fn read_string<E: Events>(events: &mut E) -> Result<Held<String, E::P>, QueryResultsParseError> {
+    events.with_next(|p, event| match event {
+        JsonEvent::String(text) => scoped::text(p, text),
+        _ => Err(syntax("the members of a term must be strings")),
+    })
+}
+fn as_text<P: Policy>(value: Held<Value, P>) -> Result<Held<String, P>, QueryResultsParseError> {
+    let (value, bytes) = value.parts();
+    match value {
+        Value::Text(text) => Ok(Held::new(text, bytes)),
+        Value::Triple(_) => Err(syntax(
+            "an IRI, blank node or literal with a triple as value",
+        )),
     }
+}
+fn read_term<E: Events>(
+    events: &mut E,
+    depth: usize,
+) -> Result<Held<Term, E::P>, QueryResultsParseError> {
     let (mut kind, mut value, mut datatype, mut language, mut direction) =
         (None, None, None, None, None);
     loop {
-        let member = match events.next()? {
-            JsonEvent::ObjectKey(key) => match key.as_ref() {
+        let member = events.with_next(|_, event| match event {
+            JsonEvent::ObjectKey(key) => Ok(match key.as_ref() {
                 "type" => Member::Type,
                 "value" => Member::Value,
                 "datatype" => Member::Datatype,
                 "xml:lang" => Member::Language,
                 "its:dir" => Member::Direction,
                 _ => Member::Other,
-            },
-            JsonEvent::EndObject => break,
-            _ => return Err(syntax("expected a member of a term")),
-        };
-        if let Member::Value = member {
-            value = Some(match events.next()? {
-                JsonEvent::String(text) => Value::Text(text.into_owned()),
-                JsonEvent::StartObject => {
+            }),
+            JsonEvent::EndObject => Ok(Member::End),
+            _ => Err(syntax("expected a member of a term")),
+        })?;
+        match member {
+            Member::End => break,
+            Member::Value => {
+                let text = events.with_next(|p, event| match event {
+                    JsonEvent::String(text) => scoped::text(p, text).map(Some),
+                    JsonEvent::StartObject => Ok(None),
+                    _ => Err(syntax("a term's value must be a string or a triple")),
+                })?;
+                let next = if let Some(text) = text {
+                    text.map(Value::Text)
+                } else {
                     if depth >= MAX_NESTING {
                         return Err(syntax("triple terms nested too deeply"));
                     }
-                    Value::Triple(Box::new(read_triple(events, depth + 1)?))
-                }
-                _ => return Err(syntax("a term's value must be a string or a triple")),
-            });
-            continue;
-        }
-        let JsonEvent::String(text) = events.next()? else {
-            return Err(syntax("the members of a term must be strings"));
-        };
-        match member {
-            Member::Type => {
-                kind = Some(match text.as_ref() {
-                    "uri" => TermType::Uri,
-                    "bnode" => TermType::Bnode,
-                    "literal" | "typed-literal" => TermType::Literal,
-                    "triple" => TermType::Triple,
-                    _ => TermType::Unknown(text.into_owned()),
-                });
+                    let triple = read_triple(events, depth + 1)?;
+                    events.with_owner(|p| p.reserve(size_of::<Triple>()))?;
+                    let (triple, bytes) = triple.parts();
+                    Held::new(
+                        Value::Triple(Box::new(triple)),
+                        bytes
+                            .checked_add(size_of::<Triple>())
+                            .ok_or_else(scoped::overflow)?,
+                    )
+                };
+                replace(events, &mut value, next)?;
             }
-            Member::Datatype => datatype = Some(text.into_owned()),
-            Member::Language => language = Some(text.into_owned()),
-            Member::Direction => direction = Some(text.into_owned()),
-            Member::Value | Member::Other => {}
+            Member::Type => {
+                let next = events.with_next(|p, event| {
+                    let JsonEvent::String(text) = event else {
+                        return Err(syntax("the members of a term must be strings"));
+                    };
+                    Ok(match text.as_ref() {
+                        "uri" => TermType::Uri,
+                        "bnode" => TermType::Bnode,
+                        "literal" | "typed-literal" => TermType::Literal,
+                        "triple" => TermType::Triple,
+                        _ => TermType::Unknown(scoped::text(p, text)?),
+                    })
+                })?;
+                if let Some(TermType::Unknown(old)) = kind.replace(next) {
+                    discard(events, Some(old))?;
+                }
+            }
+            Member::Datatype => {
+                let text = read_string(events)?;
+                replace(events, &mut datatype, text)?;
+            }
+            Member::Language => {
+                let text = read_string(events)?;
+                replace(events, &mut language, text)?;
+            }
+            Member::Direction => {
+                let text = read_string(events)?;
+                replace(events, &mut direction, text)?;
+            }
+            Member::Other => events.with_next(|_, event| match event {
+                JsonEvent::String(_) => Ok(()),
+                _ => Err(syntax("the members of a term must be strings")),
+            })?,
         }
     }
     let kind = kind.ok_or_else(|| syntax("a term without 'type'"))?;
     let value = value.ok_or_else(|| syntax("a term without 'value'"))?;
-    let text = |value: Value| match value {
-        Value::Text(text) => Ok(text),
-        Value::Triple(_) => Err(syntax(
-            "an IRI, blank node or literal with a triple as value",
-        )),
-    };
     match kind {
-        TermType::Uri => Ok(NamedNode::new(text(value)?)
-            .map_err(|e| syntax(format!("an invalid IRI: {e}")))?
-            .into()),
-        TermType::Bnode => Ok(BlankNode::new(text(value)?)
-            .map_err(|e| syntax(format!("an invalid blank node: {e}")))?
-            .into()),
-        TermType::Literal => {
-            let value = text(value)?;
-            match (language, datatype, direction) {
-                (Some(language), _, None) => Literal::new_language_tagged_literal(value, language)
+        TermType::Uri | TermType::Bnode => {
+            discard(events, datatype)?;
+            discard(events, language)?;
+            discard(events, direction)?;
+            let (text, bytes) = as_text(value)?.parts();
+            let term = match kind {
+                TermType::Uri => NamedNode::new(text)
                     .map(Term::from)
-                    .map_err(|e| syntax(e.to_string())),
-                (Some(language), _, Some(direction)) => {
-                    let direction = direction
+                    .map_err(|e| syntax(format!("an invalid IRI: {e}")))?,
+                _ => BlankNode::new(text)
+                    .map(Term::from)
+                    .map_err(|e| syntax(format!("an invalid blank node: {e}")))?,
+            };
+            Ok(Held::new(term, bytes))
+        }
+        TermType::Literal => {
+            let (text, text_bytes) = as_text(value)?.parts();
+            if let Some(language) = language {
+                discard(events, datatype)?;
+                let (language, language_bytes) = language.parts();
+                let literal = if let Some(direction) = direction {
+                    let parsed = direction
+                        .value
                         .parse()
                         .map_err(|e: nrese_rdf::TermParseError| syntax(e.to_string()))?;
-                    Literal::new_directional_language_tagged_literal(value, language, direction)
-                        .map(Term::from)
-                        .map_err(|e| syntax(e.to_string()))
+                    discard(events, Some(direction))?;
+                    Literal::new_directional_language_tagged_literal(text, language, parsed)
+                } else {
+                    Literal::new_language_tagged_literal(text, language)
                 }
-                (None, Some(datatype), _) => {
-                    let datatype = NamedNode::new(datatype)
+                .map_err(|e| syntax(e.to_string()))?;
+                Ok(Held::new(
+                    literal.into(),
+                    text_bytes
+                        .checked_add(language_bytes)
+                        .ok_or_else(scoped::overflow)?,
+                ))
+            } else {
+                discard(events, direction)?;
+                if let Some(datatype) = datatype {
+                    let (name, datatype_bytes) = datatype.parts();
+                    let datatype = NamedNode::new(name)
                         .map_err(|e| syntax(format!("an invalid datatype: {e}")))?;
                     if datatype == rdf::LANG_STRING || datatype == rdf::DIR_LANG_STRING {
                         return Err(syntax("a language-string datatype without 'xml:lang'"));
                     }
-                    Ok(Literal::new_typed_literal(value, datatype).into())
+                    let simple = datatype == nrese_rdf::vocab::xsd::STRING;
+                    let term = Literal::new_typed_literal(text, datatype).into();
+                    if simple {
+                        events.with_owner(|p| {
+                            p.free(datatype_bytes);
+                            Ok(())
+                        })?;
+                    }
+                    Ok(Held::new(
+                        term,
+                        text_bytes
+                            .checked_add(if simple { 0 } else { datatype_bytes })
+                            .ok_or_else(scoped::overflow)?,
+                    ))
+                } else {
+                    Ok(Held::new(
+                        Literal::new_simple_literal(text).into(),
+                        text_bytes,
+                    ))
                 }
-                (None, None, _) => Ok(Literal::new_simple_literal(value).into()),
             }
         }
-        TermType::Triple => match value {
-            Value::Triple(triple) => Ok(Term::Triple(triple)),
-            Value::Text(_) => Err(syntax("a triple term's value must be an object")),
-        },
-        TermType::Unknown(other) => Err(syntax(format!("an unknown term type '{other}'"))),
+        TermType::Triple => {
+            discard(events, datatype)?;
+            discard(events, language)?;
+            discard(events, direction)?;
+            let (value, bytes) = value.parts();
+            match value {
+                Value::Triple(triple) => Ok(Held::new(Term::Triple(triple), bytes)),
+                Value::Text(_) => Err(syntax("a triple term's value must be an object")),
+            }
+        }
+        TermType::Unknown(other) => Err(syntax(format!("an unknown term type '{}'", other.value))),
     }
 }
 
-/// `{"subject": …, "predicate": …, "object": …}` after its `{`.
-fn read_triple(events: &mut impl Events, depth: usize) -> Result<Triple, QueryResultsParseError> {
+fn read_triple<E: Events>(
+    events: &mut E,
+    depth: usize,
+) -> Result<Held<Triple, E::P>, QueryResultsParseError> {
     let (mut subject, mut predicate, mut object) = (None, None, None);
     loop {
-        let key = match events.next()? {
-            JsonEvent::ObjectKey(key) => key.into_owned(),
-            JsonEvent::EndObject => break,
-            _ => return Err(syntax("expected a member of a triple")),
+        let key = events.with_next(|p, event| match event {
+            JsonEvent::ObjectKey(key) => scoped::text(p, key).map(Some),
+            JsonEvent::EndObject => Ok(None),
+            _ => Err(syntax("expected a member of a triple")),
+        })?;
+        let Some(key) = key else {
+            break;
         };
-        if !matches!(events.next()?, JsonEvent::StartObject) {
-            return Err(syntax(format!("the {key} of a triple must be a term")));
+        if shape(events)? != Shape::Object {
+            return Err(syntax(format!(
+                "the {} of a triple must be a term",
+                key.value
+            )));
         }
         let term = read_term(events, depth)?;
-        match key.as_str() {
-            "subject" => subject = Some(term),
-            "predicate" => predicate = Some(term),
-            "object" => object = Some(term),
+        match key.value.as_str() {
+            "subject" => replace(events, &mut subject, term)?,
+            "predicate" => replace(events, &mut predicate, term)?,
+            "object" => replace(events, &mut object, term)?,
             other => return Err(syntax(format!("an unknown member '{other}' of a triple"))),
         }
+        discard(events, Some(key))?;
     }
-    let subject =
-        NamedOrBlankNode::try_from(subject.ok_or_else(|| syntax("a triple without subject"))?)
-            .map_err(|e| syntax(format!("a triple's subject: {e}")))?;
-    let Some(Term::NamedNode(predicate)) = predicate else {
+    let (subject, sb) = subject
+        .ok_or_else(|| syntax("a triple without subject"))?
+        .parts();
+    let subject = NamedOrBlankNode::try_from(subject)
+        .map_err(|e| syntax(format!("a triple's subject: {e}")))?;
+    let (predicate, pb) = predicate
+        .ok_or_else(|| syntax("a triple's predicate must be an IRI"))?
+        .parts();
+    let Term::NamedNode(predicate) = predicate else {
         return Err(syntax("a triple's predicate must be an IRI"));
     };
-    let object = object.ok_or_else(|| syntax("a triple without object"))?;
-    Ok(Triple::new(subject, predicate, object))
+    let (object, ob) = object
+        .ok_or_else(|| syntax("a triple without object"))?
+        .parts();
+    let bytes = sb
+        .checked_add(pb)
+        .and_then(|n| n.checked_add(ob))
+        .ok_or_else(scoped::overflow)?;
+    Ok(Held::new(Triple::new(subject, predicate, object), bytes))
 }
 
-/// Skips the next value (whatever its nesting).
-fn skip_value(events: &mut impl Events) -> Result<(), QueryResultsParseError> {
-    let mut depth = 0_usize;
+fn skip_value<E: Events>(events: &mut E) -> Result<(), QueryResultsParseError> {
+    let mut depth = 0usize;
     loop {
-        match events.next()? {
-            JsonEvent::StartObject | JsonEvent::StartArray => depth += 1,
-            JsonEvent::EndObject | JsonEvent::EndArray => depth -= 1,
-            JsonEvent::ObjectKey(_) => continue,
-            JsonEvent::Eof => return Err(syntax("the document ends inside a value")),
+        // ObjectKey is distinct from scalar for the existing skip rule.
+        let item = events.with_next(|_, event| {
+            Ok(match event {
+                JsonEvent::StartObject | JsonEvent::StartArray => 1,
+                JsonEvent::EndObject | JsonEvent::EndArray => 2,
+                JsonEvent::ObjectKey(_) => 3,
+                JsonEvent::Eof => 4,
+                _ => 0,
+            })
+        })?;
+        match item {
+            1 => depth += 1,
+            2 => depth -= 1,
+            3 => continue,
+            4 => return Err(syntax("the document ends inside a value")),
             _ => {}
         }
         if depth == 0 {

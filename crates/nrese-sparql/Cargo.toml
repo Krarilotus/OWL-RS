@@ -34,6 +34,8 @@ nrese-sparql-results = { path = "../rdf/nrese-sparql-results" }
 thiserror.workspace = true
 
 [dev-dependencies]
+# Scoped lexer probes use the same actual exec Budget as the response builder.
+nrese-json = { path = "../rdf/nrese-json" }
 # The unit tests' counting allocator (src/lib.rs): measured operations hold no more than
 # they charge.
 nrese-exec = { path = "../nrese-exec", features = ["measure"] }

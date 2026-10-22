@@ -16,6 +16,8 @@ use nrese_rdf::{NamedOrBlankNode, Term, Triple, Variable};
 
 use crate::{CancellationToken, QueryEvaluationError};
 
+mod json;
+
 /// Rows of bound values per `SERVICE` request of a bind join.
 pub const BIND_CHUNK: usize = 200;
 
