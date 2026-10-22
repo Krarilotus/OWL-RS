@@ -492,10 +492,35 @@ else: sys.exit(3)
         return subprocess.run(['git', '-C', str(self.repo), *args], env=self.env,
              check=True, capture_output=True, text=True).stdout.strip()
 
-    def hook(self, **extra):
+    def hook(self, refs=None, **extra):
+        if refs is None:
+            refs = [(self.head, 'refs/heads/refactor/engine-v2')]
         return subprocess.run(['bash', '.githooks/pre-push'], cwd=self.repo, env={**self.env, **extra},
-            input=f'refs/heads/finish {self.head} refs/heads/finish {"0"*40}\n',
+            input=''.join(f'refs/heads/finish {sha} {target} {"0"*40}\n' for sha, target in refs),
             capture_output=True, text=True, timeout=60)
+
+    def test_only_protected_destinations_require_push_records(self):
+        cases = [
+            ('finish', [(self.head, 'refs/heads/finish/release')], 0),
+            ('engine', [(self.head, 'refs/heads/refactor/engine-v2')], 75),
+            ('main', [(self.head, 'refs/heads/main')], 75),
+            ('mixed', [(self.head, 'refs/heads/refactor/engine-v2'),
+                       (self.head, 'refs/heads/finish/release')], 75),
+            ('delete', [('0'*40, 'refs/heads/main')], 0),
+            ('other-commit', [(self.base, 'refs/heads/finish/release')], 1),
+        ]
+        for name, refs, expected in cases:
+            with self.subTest(name=name):
+                before = (self.fake/'calls').read_text() if (self.fake/'calls').exists() else ''
+                done = self.hook(refs)
+                after = (self.fake/'calls').read_text() if (self.fake/'calls').exists() else ''
+                if os.environ.get('FLEET_OUT'):
+                    (Path(os.environ['FLEET_OUT'])/(name+'.json')).write_text(json.dumps({
+                        'refs': refs, 'code': done.returncode, 'stdout': done.stdout,
+                        'stderr': done.stderr, 'fleet_calls': after[len(before):]}, indent=2))
+                self.assertEqual(done.returncode, expected, (done.stdout, done.stderr))
+                if expected != 75:
+                    self.assertEqual(after, before, 'unprotected/deleted refs must not consult fleet')
 
     def request(self):
         return json.loads(next((self.repo/'.git/nrese-gate-requests').glob('*/request.json')).read_text())
