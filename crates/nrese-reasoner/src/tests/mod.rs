@@ -2768,3 +2768,5 @@ fn a_failing_backward_proof_stops_within_its_poll_interval() {
         "{scanned} facts scanned (bound {bound}; the whole update scans {total})"
     );
 }
+
+mod grouped;
