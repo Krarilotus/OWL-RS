@@ -25,13 +25,16 @@ use crate::index::Layout;
 /// (released) between listing and opening.
 const OPEN_ATTEMPTS: usize = 3;
 
+struct OpenedSegment {
+    path: std::path::PathBuf,
+    file: std::fs::File,
+    facts: wal::SegmentFacts,
+}
+
 /// The log segments of the store at `root` that may hold `after + 1` or later, in order,
 /// archived ones first, each open. Segments are named after their first revision. `None`
 /// when they kept moving through every attempt: the log is being cut faster than it is read.
-fn open_segments(
-    root: &std::path::Path,
-    after: u64,
-) -> EngineResult<Option<Vec<(std::path::PathBuf, std::fs::File)>>> {
+fn open_segments(root: &std::path::Path, after: u64) -> EngineResult<Option<Vec<OpenedSegment>>> {
     let mut attempt = 0;
     'list: loop {
         attempt += 1;
@@ -51,15 +54,17 @@ fn open_segments(
         tests::between_listing_and_opening();
         let mut open = Vec::with_capacity(segments.len() - start);
         for (_, path) in segments.drain(start..) {
-            match std::fs::File::open(&path) {
-                Ok(file) => open.push((path, file)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match wal::open_segment(&path) {
+                Ok((file, facts)) => {
+                    open.push(OpenedSegment { path, file, facts });
+                }
+                Err(EngineError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                     match attempt < OPEN_ATTEMPTS {
                         true => continue 'list,
                         false => return Ok(None),
                     }
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
         }
         return Ok(Some(open));
@@ -107,15 +112,26 @@ impl Engine {
         };
         // Segments that kept moving: the follower starts again from an image, as for a log a
         // checkpoint has covered.
-        let Some(segments) = open_segments(durable.root(), after)? else {
+        let segments = {
+            // The mutex excludes the active segment's first-unknown transition. Stable
+            // metadata acquisition also detects the independent archive prune/copy owners.
+            let _wal = durable.wal.lock();
+            open_segments(durable.root(), after)?
+        };
+        let Some(segments) = segments else {
             return Err(EngineError::LogTruncated { oldest: latest });
         };
         let mut expected = after + 1;
         let mut oldest = None;
-        'segments: for (path, mut file) in segments {
+        'segments: for OpenedSegment {
+            path,
+            mut file,
+            facts,
+        } in segments
+        {
             // The active segment may grow while it is read: its complete records count,
             // up to `latest`.
-            let contents = wal::read_open_segment(&mut file, &path, after)?;
+            let contents = wal::read_open_segment(&mut file, &path, after, facts)?;
             for record in contents.records {
                 oldest.get_or_insert(record.revision);
                 if record.revision < expected {
@@ -224,7 +240,7 @@ impl Engine {
         });
         let touched = record.touched();
         let corpora = std::sync::Arc::clone(&shared.statistics.corpora);
-        let publish = move |current: &Version| {
+        let publish = move |current: &Version, physical_floor: u64| {
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
             let content = super::Content::fresh();
             corpora.record(current.content, content, touched);
@@ -233,6 +249,10 @@ impl Engine {
                 asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,
+                committed: current
+                    .committed
+                    .observe(record.committed_micros)
+                    .with_floor(physical_floor),
                 dictionary_len,
                 equality: match changes_equality {
                     true => Default::default(),
@@ -244,12 +264,14 @@ impl Engine {
         let wal_bytes = match &shared.durable {
             Some(durable) => {
                 let mut wal = durable.wal.lock();
-                wal.append(record)?;
-                shared.versions.publish(publish);
+                let floor = wal.append(record)?.unwrap_or(0);
+                shared.versions.publish(|current| publish(current, floor));
                 wal.bytes_since_checkpoint()
             }
             None => {
-                shared.versions.publish(publish);
+                shared
+                    .versions
+                    .publish(|current| publish(current, record.committed_micros.unwrap_or(0)));
                 0
             }
         };
@@ -258,6 +280,9 @@ impl Engine {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod acquisition_tests;
 
 #[cfg(test)]
 mod tests {
@@ -361,5 +386,6 @@ mod tests {
         let batch = engine.log_since(0, 1 << 20).unwrap();
         BETWEEN.with(|between| *between.borrow_mut() = None);
         assert_eq!((batch.records, batch.last), (3, 3));
+        super::acquisition_tests::facts_stay_associated_during_acquisition();
     }
 }

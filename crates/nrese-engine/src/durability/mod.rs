@@ -47,6 +47,7 @@
 pub(crate) mod checkpoint;
 pub(crate) mod codec;
 pub(crate) mod fault;
+pub(crate) mod history;
 pub(crate) mod publish;
 pub(crate) mod sidecar;
 pub(crate) mod wal;
@@ -139,8 +140,8 @@ pub struct DurabilityConfig {
     /// the checkpoint is newer or the log ends before it.
     pub recover_until: Option<u64>,
     /// Recover the commits made up to this time only (microseconds since 1970), cut as
-    /// with `recover_until`; commits logged without a time (before WAL version 6) count as
-    /// earlier.
+    /// with `recover_until`. Refuses if the requested projection requires a checkpoint
+    /// or record whose time provenance is unknown; revision recovery remains available.
     pub recover_until_micros: Option<u64>,
 }
 
@@ -235,6 +236,7 @@ impl Durable {
                     asserted,
                     inferred,
                     revision: loaded.revision,
+                    committed: loaded.committed,
                     dictionary_len: 0,
                     equality: Default::default(),
                     canonical: Default::default(),
@@ -262,10 +264,16 @@ impl Durable {
         }
         // Set once the log has been cut at `recover_until`: later segments go.
         let mut cut = false;
+        // Validate the complete requested projection before cutting any supplied log.
+        // Normal clean recovery allocates no entries; repair/restore stores only paths.
+        let mut cuts = Vec::new();
         let checkpointed = version.revision;
+        if let Some(until) = config.recover_until_micros {
+            version.committed.check_cut(until)?;
+        }
         for (position, (_, path)) in segments.iter().enumerate() {
             if cut {
-                wal::remove_segment(path)?;
+                cuts.push((path.clone(), None));
                 continue;
             }
             let contents = wal::read_segment(path, version.revision)?;
@@ -300,6 +308,14 @@ impl Durable {
                 if record.revision <= version.revision {
                     continue; // covered by the checkpoint
                 }
+                if config.recover_until_micros.is_some()
+                    && !record.committed_micros.is_some_and(|time| time > 0)
+                {
+                    return Err(EngineError::Configuration(
+                        "time restore needs known replay times; use revision restore instead"
+                            .into(),
+                    ));
+                }
                 let after = config
                     .recover_until
                     .is_some_and(|until| record.revision > until)
@@ -310,8 +326,8 @@ impl Durable {
                 if after {
                     // Point-in-time restore: the log ends before this record.
                     match index {
-                        0 => wal::remove_segment(path)?,
-                        _ => wal::truncate_segment(path, contents.ends[index - 1])?,
+                        0 => cuts.push((path.clone(), None)),
+                        _ => cuts.push((path.clone(), Some(contents.ends[index - 1].0))),
                     }
                     cut = true;
                     break;
@@ -325,6 +341,7 @@ impl Durable {
                     )));
                 }
                 replay(&mut version, dictionary, policy, record)?;
+                version.committed = version.committed.with_floor(contents.ends[index].1);
             }
             match &contents.tail {
                 _ if cut => {}
@@ -336,7 +353,7 @@ impl Durable {
                         revision = version.revision,
                         "truncating a WAL tail that was never written whole; the log ends at this revision"
                     );
-                    wal::truncate_segment(path, contents.valid_len)?;
+                    cuts.push((path.clone(), Some(contents.valid_len)));
                 }
                 tail => {
                     let why = match tail {
@@ -346,7 +363,7 @@ impl Durable {
                     if config.recover_until == Some(version.revision) {
                         // Asked to end here: the damage goes with the rest of the log.
                         tracing::warn!(segment = %path.display(), why, "cutting a damaged WAL at recover_until");
-                        wal::truncate_segment(path, contents.valid_len)?;
+                        cuts.push((path.clone(), Some(contents.valid_len)));
                         cut = true;
                     } else {
                         return Err(EngineError::Corruption(format!(
@@ -371,6 +388,12 @@ impl Durable {
             )));
         }
         let integers_in_dictionary = integers_in_dictionary.unwrap_or(false);
+        for (path, keep) in cuts {
+            match keep {
+                Some(len) => wal::truncate_segment(&path, len)?,
+                None => wal::remove_segment(&path)?,
+            }
+        }
         dictionary.set_integers_in_dictionary(integers_in_dictionary);
         let wal = Wal::open(
             &wal_dir,
@@ -430,5 +453,6 @@ fn replay(
         *version.stack_mut(stack) = index;
     }
     version.revision = record.revision;
+    version.committed = version.committed.observe(record.committed_micros);
     Ok(())
 }

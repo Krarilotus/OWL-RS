@@ -185,7 +185,15 @@ mod tests {
             .filter(|path| path.file_name().is_some_and(|name| name != "publish.rs"))
             .collect();
         files.push(crates.join("nrese-store/src/image_backup.rs"));
-        for file in files {
+        while let Some(file) = files.pop() {
+            if file.is_dir() {
+                files.extend(
+                    std::fs::read_dir(file)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+                continue;
+            }
             let source = std::fs::read_to_string(&file).unwrap();
             assert!(
                 !source.contains("rename("),

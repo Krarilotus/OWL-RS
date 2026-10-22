@@ -31,6 +31,10 @@ use super::publish::publish_or_fail;
 use super::sidecar;
 use crate::error::{EngineError, EngineResult};
 
+pub(crate) mod acquire;
+mod time;
+pub(crate) use acquire::open_segment;
+
 /// Version 2 added the inferred stack to commit records (roadmap E6); version 3 inlines
 /// `xsd:decimal`, `xsd:date` and `xsd:dateTime` (E1), which changes the ids of such terms;
 /// version 4 made integer ids order-preserving and split literal kinds (XC1); version 5
@@ -77,8 +81,9 @@ pub(crate) fn list_segments(dir: &Path) -> EngineResult<Vec<(u64, PathBuf)>> {
 /// Decoded contents of one segment.
 pub(crate) struct SegmentContents {
     pub records: Vec<CommitRecord>,
-    /// Where each record ends in the file.
-    pub ends: Vec<u64>,
+    /// Each record's end offset and physical clock floor. The floor alone never proves
+    /// semantic time: even a restamped unknown v6 record has a positive marker.
+    pub ends: Vec<(u64, u64)>,
     /// Length of the valid prefix (header plus complete records).
     pub valid_len: u64,
     /// What the bytes after `valid_len` are.
@@ -104,15 +109,7 @@ pub(crate) enum Tail {
 /// can't be read or names a policy this engine doesn't know (recovery must not take it for
 /// a missing one and so be lenient).
 fn segment_policy(segment: &Path) -> EngineResult<Option<SyncPolicy>> {
-    match sidecar::read(segment, "sync")? {
-        None => Ok(None),
-        Some(word) => SyncPolicy::from_word(&word).map(Some).ok_or_else(|| {
-            EngineError::Corruption(format!(
-                "{}: unknown sync policy {word:?}",
-                sidecar::path_of(segment).display()
-            ))
-        }),
-    }
+    segment_facts(segment).policy
 }
 
 /// Removes what a crash left of a segment or sidecar being written under a temporary name
@@ -145,7 +142,19 @@ pub(crate) fn remove_segment(path: &Path) -> EngineResult<()> {
 /// reached before it (the checkpoint's, or the last record replayed), the least bound on
 /// what an uncovered record after damage in it can be.
 pub(crate) fn read_segment(path: &Path, reached: u64) -> EngineResult<SegmentContents> {
-    read_open_segment(&mut File::open(path)?, path, reached)
+    let mut file = File::open(path)?;
+    read_open_segment(&mut file, path, reached, segment_facts(path))
+}
+
+/// Capture with the file under the WAL mutex (or during quiescent recovery). Policy
+/// errors stay deferred until damaged bytes need classification, as before.
+pub(crate) struct SegmentFacts {
+    time: time::Fact,
+    policy: EngineResult<Option<SyncPolicy>>,
+}
+
+pub(crate) fn segment_facts(path: &Path) -> SegmentFacts {
+    SegmentFacts::from_text(path, sidecar::read_text(path))
 }
 
 /// Read an already open segment while retaining recovery's revision bound. Replication
@@ -154,6 +163,7 @@ pub(crate) fn read_open_segment(
     file: &mut File,
     path: &Path,
     reached: u64,
+    facts: SegmentFacts,
 ) -> EngineResult<SegmentContents> {
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(file, &mut bytes)?;
@@ -186,10 +196,12 @@ pub(crate) fn read_open_segment(
     let mut ends = Vec::new();
     loop {
         match decode_frame(&bytes[pos..]) {
-            Frame::Record(record, used) => {
+            Frame::Record(mut record, used) => {
+                let floor = record.committed_micros.unwrap_or(0);
+                facts.time.apply(&mut record);
                 records.push(record);
                 pos += used;
-                ends.push(pos as u64);
+                ends.push((pos as u64, floor));
             }
             Frame::End => break,
             frame @ (Frame::Short | Frame::Damaged(_)) => {
@@ -215,7 +227,7 @@ pub(crate) fn read_open_segment(
                         dictionary: None,
                     },
                 };
-                let policy = segment_policy(path)?;
+                let policy = facts.policy?;
                 return Ok(SegmentContents {
                     tail: classify(&bytes[pos..], damaged, timed, policy, next),
                     records,
@@ -434,6 +446,7 @@ pub(crate) struct Wal {
     active: File,
     active_first_revision: u64,
     active_bytes: u64,
+    active_time: time::Fact,
     bytes_since_checkpoint: u64,
     segment_bytes: u64,
     sync: SyncPolicy,
@@ -492,7 +505,7 @@ impl Wal {
                 if let Some((_, path)) = newest {
                     super::publish::sync_file(&path)?;
                 }
-                let file = create_segment(dir, next_revision, magic, sync)?;
+                let file = create_segment(dir, next_revision, magic, sync, time::Fact::KNOWN)?;
                 (next_revision, file, SEGMENT_MAGIC.len() as u64)
             }
         };
@@ -501,6 +514,7 @@ impl Wal {
             active,
             active_first_revision: first_revision,
             active_bytes,
+            active_time: time::read(&segment_path(dir, first_revision)),
             bytes_since_checkpoint: 0,
             segment_bytes,
             sync,
@@ -515,15 +529,17 @@ impl Wal {
         self.bytes_since_checkpoint
     }
 
-    /// Appends one record and makes it durable according to the sync policy. The caller
-    /// publishes the commit only after this returns `Ok`.
-    pub(crate) fn append(&mut self, record: &CommitRecord) -> EngineResult<()> {
+    /// Appends one record and makes it durable according to the sync policy. Returns the
+    /// physical stamp (None for v4), which supplies a clock floor, never semantic provenance.
+    /// The caller publishes the commit only after this returns `Ok`.
+    pub(crate) fn append(&mut self, record: &CommitRecord) -> EngineResult<Option<u64>> {
         if self.poisoned {
             return Err(EngineError::WalPoisoned);
         }
         if self.active_bytes >= self.segment_bytes {
             self.rotate(record.revision)?;
         }
+        self.prepare_time(record)?;
         self.buffer.clear();
         // Version 4 segments (stores that keep integers in their dictionary) have no times.
         // Every version 6 frame ends in a non-zero time, which recovery relies on (a final
@@ -548,7 +564,7 @@ impl Wal {
         }
         self.active_bytes += self.buffer.len() as u64;
         self.bytes_since_checkpoint += self.buffer.len() as u64;
-        Ok(())
+        Ok(committed_micros)
     }
 
     /// Starts a new segment whose first record will be `next_revision` or later. No-op if
@@ -556,6 +572,10 @@ impl Wal {
     /// active segment's sync failed (its earlier records can't be trusted to be on disk), or
     /// the new segment is in an unknown state.
     pub(crate) fn rotate(&mut self, next_revision: u64) -> EngineResult<()> {
+        self.rotate_with_time(next_revision, time::Fact::KNOWN)
+    }
+
+    fn rotate_with_time(&mut self, next_revision: u64, fact: time::Fact) -> EngineResult<()> {
         if self.poisoned {
             return Err(EngineError::WalPoisoned);
         }
@@ -565,12 +585,13 @@ impl Wal {
         let rotated = fault::check(Step::Rotate)
             .and_then(|()| self.active.sync_all())
             .map_err(EngineError::from)
-            .and_then(|()| create_segment(&self.dir, next_revision, self.magic, self.sync));
+            .and_then(|()| create_segment(&self.dir, next_revision, self.magic, self.sync, fact));
         match rotated {
             Ok(active) => {
                 self.active = active;
                 self.active_first_revision = next_revision;
                 self.active_bytes = SEGMENT_MAGIC.len() as u64;
+                self.active_time = time::read(&segment_path(&self.dir, next_revision));
                 Ok(())
             }
             Err(error) => {
@@ -610,7 +631,7 @@ impl Wal {
 /// sidecar placed there first.
 fn archive_segment(path: &Path, archive: &Path) -> EngineResult<()> {
     let target = archive.join(path.file_name().expect("segment file name"));
-    sidecar::copy(path, &target)?;
+    time::copy(path, &target)?;
     if publish_or_fail(path, &target).is_err() {
         // Another file system: a copy, published, then the original goes.
         let mut partial = target.clone().into_os_string();
@@ -632,11 +653,11 @@ pub fn copy_log_segment(segment: &Path, dir: &Path) -> EngineResult<PathBuf> {
         EngineError::Configuration(format!("{} is not a segment", segment.display()))
     })?;
     let target = dir.join(name);
-    sidecar::copy(segment, &target)?;
     let mut partial = target.clone().into_os_string();
     partial.push(".copying");
     let partial = PathBuf::from(partial);
-    fs::copy(segment, &partial)?;
+    let metadata = acquire::copy_segment(segment, &partial)?;
+    time::copy_text(segment, &target, metadata.as_deref())?;
     publish_or_fail(&partial, &target)?;
     Ok(target)
 }
@@ -653,9 +674,10 @@ fn create_segment(
     first_revision: u64,
     magic: &[u8; 8],
     sync: SyncPolicy,
+    fact: time::Fact,
 ) -> EngineResult<File> {
     let path = segment_path(dir, first_revision);
-    sidecar::write(&path, &[("sync", sync.word())])?;
+    time::write(&path, sync, fact)?;
     // Written under a temporary name and published: the segment is there whole or not at all.
     let mut partial = path.clone().into_os_string();
     partial.push(".creating");
@@ -920,7 +942,7 @@ mod tests {
                     committed_micros: time,
                     ..CommitRecord::default()
                 };
-                wal.append(&record).unwrap();
+                let _ = wal.append(&record).unwrap();
                 record.revision = 2;
                 let before = record.clone();
                 let (_, peak) = nrese_exec::measure::measure(|| wal.append(&record).unwrap());
@@ -937,7 +959,8 @@ mod tests {
         );
     }
 
-    /// The WAL owns timestamp policy, independently of the codec's optional scalar.
+    /// Logical provenance is separate from the v6 physical positive marker used by
+    /// recovery's torn-tail classification. Appending changes neither input record.
     #[test]
     fn append_keeps_effective_time_and_input_record() {
         for legacy in [true, false] {
@@ -957,17 +980,23 @@ mod tests {
                     committed_micros: time,
                     ..CommitRecord::default()
                 };
-                wal.append(&record).unwrap();
+                let _ = wal.append(&record).unwrap();
                 let path = list_segments(dir.path()).unwrap().pop().unwrap().1;
                 let decoded = read_segment(&path, 0).unwrap().records.pop().unwrap();
                 let expected = match (legacy, time) {
                     (true, _) => None,
                     (false, Some(t)) if t > 0 => Some(t),
-                    (false, _) => {
-                        assert!(decoded.committed_micros.is_some_and(|t| t > 0));
-                        decoded.committed_micros
-                    }
+                    (false, _) => None,
                 };
+                let bytes = fs::read(&path).unwrap();
+                let Frame::Record(physical, _) = decode_frame(&bytes[8..]) else {
+                    panic!("append did not write a complete physical frame");
+                };
+                match (legacy, time) {
+                    (true, _) => assert_eq!(physical.committed_micros, None),
+                    (false, Some(t)) if t > 0 => assert_eq!(physical.committed_micros, Some(t)),
+                    (false, _) => assert!(physical.committed_micros.is_some_and(|t| t > 0)),
+                }
                 assert_eq!(decoded.committed_micros, expected);
                 assert_eq!(record.committed_micros, time);
                 assert_eq!(

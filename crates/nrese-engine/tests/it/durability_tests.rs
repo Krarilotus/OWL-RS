@@ -14,6 +14,8 @@ use nrese_engine::{
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
 
+mod commit_time_tests;
+
 fn config() -> EngineConfig {
     EngineConfig {
         background_maintenance: false,
@@ -549,10 +551,15 @@ fn a_new_sync_policy_starts_a_new_segment() {
         .map(|segment| {
             let mut meta = segment.clone().into_os_string();
             meta.push(".meta");
-            fs::read_to_string(meta).unwrap()
+            fs::read_to_string(meta)
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("sync="))
+                .expect("segment sync policy")
+                .to_owned()
         })
         .collect();
-    assert_eq!(policies, ["sync=every-commit\n", "sync=os-buffered\n"]);
+    assert_eq!(policies, ["every-commit", "os-buffered"]);
     let engine = Engine::open(dir.path(), under(SyncPolicy::OsBuffered)).unwrap();
     assert_eq!(engine.stats().revision, 3);
 }
@@ -839,11 +846,10 @@ fn new_stores_inline_integer_derived_literals() {
     assert_eq!(contents(&engine), expected);
 }
 
-/// Checkpoints in format 4 (stacks as quad lists) are still read. Such a store keeps
-/// integer-derived literals in its dictionary for good: through new checkpoints (format 8
-/// records it), new WAL segments (version 4) and restarts.
+/// A format 4 checkpoint (stacks as quad lists) requires export and reload into a new
+/// directory. Keep its original bytes rather than silently upgrading the fixture.
 #[test]
-fn format_4_checkpoints_are_read() {
+fn format_4_checkpoints_need_reload() {
     let dir = tempfile::tempdir().unwrap();
     let iri = |index: u64| (1u64 << 60) | index;
     let integer = {
@@ -877,23 +883,10 @@ fn format_4_checkpoints_are_read() {
     let crc = crc32(&file);
     file.extend_from_slice(&crc.to_le_bytes());
     fs::write(dir.path().join("checkpoint-00000000000000000007.nck"), file).unwrap();
-    let engine = Engine::open(dir.path(), config()).unwrap();
-    let mut expected: HashSet<Quad> = [quad(0)].into_iter().collect();
-    assert_eq!(contents(&engine), expected);
-    assert_eq!(engine.stats().revision, 7);
-    // Integer-derived literals stay dictionary entries in this store.
-    commit_one(&engine, &with_int(5));
-    expected.insert(with_int(5));
-    assert_eq!(int_kind(&engine, 5), Some(TermKind::TypedLiteral));
-    assert_eq!(newest_segment_magic(dir.path()), b"NRESEWL4");
-    engine.checkpoint().unwrap();
-    commit_one(&engine, &with_int(6));
-    expected.insert(with_int(6));
-    drop(engine);
-    let engine = Engine::open(dir.path(), config()).unwrap();
-    assert_eq!(int_kind(&engine, 5), Some(TermKind::TypedLiteral));
-    assert_eq!(int_kind(&engine, 6), Some(TermKind::TypedLiteral));
-    assert_eq!(contents(&engine), expected);
+    assert!(matches!(
+        Engine::open(dir.path(), config()),
+        Err(EngineError::UnsupportedFormat(_))
+    ));
 }
 
 /// A reopened store uses its checkpoint in place: the index data and the dictionary stay

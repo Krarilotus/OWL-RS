@@ -1,7 +1,11 @@
 //! Checkpoints: a full image of one revision (dictionary plus both index stacks).
 //!
-//! Format 11 (little-endian): `magic | revision u64 | flags u64 | dictionary | stack* | crc32
-//! u32`. The CRC covers everything before it. Flag bit 1 ([`COMPRESSED_KEYS`], format 11):
+//! Format 12 (little-endian): `magic | revision u64 | flags u64 | clock_floor u64 |
+//! guard_crc32 u32 | reserved_zero u32 | dictionary | stack* | crc32 u32`. The guard
+//! covers revision, flags and clock floor; it is always checked. An invalid guard or
+//! reserved field makes the time unknown with a zero clock floor. Flag bit 2 records
+//! known commit history (zero time is known only at revision zero). The final CRC covers
+//! everything before it. Flag bit 1 ([`COMPRESSED_KEYS`], format 11):
 //! the dictionary's keys are FSST-compressed ([`crate::term::vocabulary`]); its two symbol
 //! tables follow the dictionary's header. Flag bit 0 ([`INTEGERS_IN_DICTIONARY`]):
 //! integer-derived literals are dictionary entries, not inline (a store created before
@@ -34,8 +38,8 @@
 //!
 //! Format 5 had the dictionary as `len u64 | (key_len u32, key)*` and no padding (it is
 //! copied into memory); format 4 stored the stacks as quad lists (`quad_count u64 | (s p o
-//! g)* | inferred_count u64 | (s p o)*`), and the indexes are then rebuilt. Both are still
-//! read.
+//! g)* | inferred_count u64 | (s p o)*`), and the indexes were then rebuilt. Older folders
+//! must be exported and reloaded into a new directory before this release can open them.
 //!
 //! A checkpoint is written from a [`Snapshot`], so writers keep committing while it is being
 //! written. It is streamed to `checkpoint-<revision>.tmp` and synced ([`Written`]), then
@@ -56,6 +60,7 @@ use rayon::prelude::*;
 
 use super::codec::{Reader, put_u32, put_u64};
 use super::fault::{self, Step};
+use super::history::CommitTime;
 use super::publish;
 use crate::engine::{Snapshot, Stack};
 use crate::error::{EngineError, EngineResult};
@@ -70,29 +75,10 @@ use crate::term::hash::key_hash;
 use crate::term::offsets::{BlockEnds, Ends, Offsets};
 use crate::term::vocabulary::{Codec, Trained, VocabularyEncoding};
 
-/// Version 2 added the inferred stack (roadmap E6); version 3 changed term encoding (E1);
-/// version 4 made integer ids order-preserving and split literal kinds (XC1); version 5
-/// stores the packed permutations (Pf2); version 6 aligns them for mapping; version 7 adds
-/// the dictionary's text order; version 8 the flags (integer-derived literals inline);
-/// version 9 lets the asserted stack have the default-graph layout; version 10 lets blocks
-/// of the packed permutations store a position as a palette; version 11 stores the
-/// dictionary's offsets in blocks.
-const MAGIC: &[u8; 8] = b"NRESECKB";
-/// Format 10: 8-byte dictionary end offsets.
-const MAGIC_V10: &[u8; 8] = b"NRESECKA";
-/// Formats 9 and 8 read as 10: their blocks have no palettes (the byte was zero padding).
-const MAGIC_V9: &[u8; 8] = b"NRESECK9";
-const MAGIC_V8: &[u8; 8] = b"NRESECK8";
-/// Earlier formats, still read (their integer-derived literals are in the dictionary):
-/// without the flags, without the text order, unaligned packed permutations, quad lists.
-const MAGIC_V7: &[u8; 8] = b"NRESECK7";
-const MAGIC_V6: &[u8; 8] = b"NRESECK6";
-/// Flags bit: integer-derived literals are dictionary entries.
-const INTEGERS_IN_DICTIONARY: u64 = 1;
-/// Flags bit: the dictionary's keys are compressed (format 11).
-const COMPRESSED_KEYS: u64 = 2;
-const MAGIC_V5: &[u8; 8] = b"NRESECK5";
-const MAGIC_V4: &[u8; 8] = b"NRESECK4";
+mod header;
+
+use header::{COMPRESSED_KEYS, Header, INTEGERS_IN_DICTIONARY, MAGIC};
+
 /// Magic prefix shared by every checkpoint format version.
 const FAMILY: &[u8; 7] = b"NRESECK";
 /// The file writer's buffer.
@@ -633,6 +619,7 @@ pub(crate) fn write(
         dir,
         admission,
         snapshot.revision(),
+        version.committed,
         snapshot.dictionary(),
         snapshot.dictionary_len(),
         [version.asserted.layout(), version.inferred.layout()],
@@ -657,6 +644,7 @@ pub(crate) fn write_parts<'a>(
     dir: &Path,
     admission: Option<&Arc<SharedBudget>>,
     revision: u64,
+    committed: CommitTime,
     dictionary: &Dictionary,
     dictionary_len: u64,
     layouts: [Layout; 2],
@@ -690,7 +678,6 @@ pub(crate) fn write_parts<'a>(
         written: MAGIC.len() as u64,
         _held: held,
     };
-    put_u64(&mut out.buffer, revision);
     let flags = match dictionary.integers_in_dictionary() {
         true => INTEGERS_IN_DICTIONARY,
         false => 0,
@@ -698,7 +685,7 @@ pub(crate) fn write_parts<'a>(
         Some(_) => COMPRESSED_KEYS,
         None => 0,
     };
-    put_u64(&mut out.buffer, flags);
+    Header::write(&mut out.buffer, revision, flags, committed);
     // Where the time goes, for the load log (bulk loads build the permutations here).
     let started = std::time::Instant::now();
     write_dictionary(&mut out, dictionary, dictionary_len, codec, &admission)?;
@@ -764,6 +751,7 @@ pub(crate) fn stack_index(
 /// A loaded checkpoint: its revision and both stacks; the dictionary is restored in place.
 pub(crate) struct Loaded {
     pub revision: u64,
+    pub committed: CommitTime,
     pub stacks: Stacks,
     /// The store keeps integer-derived literals in its dictionary.
     pub integers_in_dictionary: bool,
@@ -780,9 +768,9 @@ pub(crate) enum Stacks {
     },
 }
 
-/// Loads the newest checkpoint into `dictionary`, if there is one. Format 6 is used in
-/// place, and only its structure is checked unless `verify` (then also the CRC, every
-/// index block and every dictionary key); older formats are copied and always checked.
+/// Loads the newest checkpoint into `dictionary`, if there is one. Only format 12 opens;
+/// its structure and bounded header guard are always checked, and `verify` also checks
+/// the full CRC, every index block and every dictionary key.
 pub(crate) fn load_latest(
     dir: &Path,
     dictionary: &Dictionary,
@@ -799,7 +787,7 @@ pub(crate) fn load_latest(
             "recovery: checkpoint part"
         );
     };
-    // Mapped: the packed permutations are used in place (format 6).
+    // Mapped: the packed permutations are used in place.
     let map = crate::mapped::map(&path)?;
     let bytes: &[u8] = &map;
     lap("file mapped");
@@ -809,19 +797,8 @@ pub(crate) fn load_latest(
         .split_at_checked(bytes.len().saturating_sub(4))
         .ok_or_else(|| corrupt("truncated"))?;
     let mut reader = Reader::new(body);
-    let mut blocks = false;
-    let (packed, aligned, with_order, with_flags) = match reader.bytes(MAGIC.len()) {
-        Some(magic) if magic == MAGIC => {
-            blocks = true;
-            (true, true, true, true)
-        }
-        Some(magic) if magic == MAGIC_V10 || magic == MAGIC_V9 || magic == MAGIC_V8 => {
-            (true, true, true, true)
-        }
-        Some(magic) if magic == MAGIC_V7 => (true, true, true, false),
-        Some(magic) if magic == MAGIC_V6 => (true, true, false, false),
-        Some(magic) if magic == MAGIC_V5 => (true, false, false, false),
-        Some(magic) if magic == MAGIC_V4 => (false, false, false, false),
+    let (packed, aligned, with_order, blocks) = match reader.bytes(MAGIC.len()) {
+        Some(magic) if magic == MAGIC => (true, true, true, true),
         Some(magic) if magic.starts_with(FAMILY) => {
             return Err(EngineError::UnsupportedFormat(path));
         }
@@ -835,21 +812,13 @@ pub(crate) fn load_latest(
         return Err(corrupt("checksum mismatch"));
     }
     lap("crc");
-    let revision = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
-    let (integers_in_dictionary, compressed) = match with_flags {
-        true => {
-            let flags = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
-            let known = INTEGERS_IN_DICTIONARY | if blocks { COMPRESSED_KEYS } else { 0 };
-            if flags & !known != 0 {
-                return Err(corrupt("unknown flags"));
-            }
-            (
-                flags & INTEGERS_IN_DICTIONARY != 0,
-                flags & COMPRESSED_KEYS != 0,
-            )
-        }
-        false => (true, false),
-    };
+    let Header {
+        revision,
+        flags,
+        committed,
+    } = Header::read(&mut reader).map_err(corrupt)?;
+    let integers_in_dictionary = flags & INTEGERS_IN_DICTIONARY != 0;
+    let compressed = flags & COMPRESSED_KEYS != 0;
     if aligned {
         let base = read_dictionary(&mut reader, &map, with_order, blocks, compressed)
             .map_err(|error| corrupt(&error))?;
@@ -882,6 +851,7 @@ pub(crate) fn load_latest(
         lap("packed permutations");
         return Ok(Some(Loaded {
             revision,
+            committed,
             stacks: Stacks::Packed(stacks),
             integers_in_dictionary,
         }));
@@ -904,6 +874,7 @@ pub(crate) fn load_latest(
         .ok_or_else(|| corrupt("truncated inferred"))?;
     Ok(Some(Loaded {
         revision,
+        committed,
         stacks: Stacks::Quads { quads, inferred },
         integers_in_dictionary,
     }))
@@ -948,7 +919,7 @@ fn read_stacks<'a>(
 pub(crate) fn map_written(
     path: &Path,
     encoding: IndexEncoding,
-) -> EngineResult<(Base, [IndexVersion; 2])> {
+) -> EngineResult<(Base, [IndexVersion; 2], CommitTime)> {
     fault::check(Step::Map)?;
     let corrupt =
         |what: &str| EngineError::Corruption(format!("checkpoint {}: {what}", path.display()));
@@ -956,23 +927,15 @@ pub(crate) fn map_written(
     let bytes: &[u8] = &map;
     let body = &bytes[..bytes.len().saturating_sub(4)];
     let mut reader = Reader::new(body);
-    // Format 8 is format 9 with the quad layout only; 9 is 10 without palettes.
-    let blocks = match reader.bytes(MAGIC.len()) {
-        Some(magic) if magic == MAGIC => true,
-        Some(magic) if magic == MAGIC_V10 || magic == MAGIC_V9 || magic == MAGIC_V8 => false,
+    match reader.bytes(MAGIC.len()) {
+        Some(magic) if magic == MAGIC => {}
         _ => return Err(corrupt("bad magic")),
-    };
-    reader.u64().ok_or_else(|| corrupt("truncated header"))?;
-    // The flags: this engine's, but whether the keys are compressed.
-    let flags = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
-    let base = read_dictionary(
-        &mut reader,
-        &map,
-        true,
-        blocks,
-        flags & COMPRESSED_KEYS != 0,
-    )
-    .map_err(|error| corrupt(&error))?;
+    }
+    let Header {
+        flags, committed, ..
+    } = Header::read(&mut reader).map_err(corrupt)?;
+    let base = read_dictionary(&mut reader, &map, true, true, flags & COMPRESSED_KEYS != 0)
+        .map_err(|error| corrupt(&error))?;
     let [asserted, inferred] =
         read_stacks(&mut reader, body, Some(&map), false).map_err(|error| corrupt(&error))?;
     let index = |stack: Stack, packed| {
@@ -984,6 +947,7 @@ pub(crate) fn map_written(
             index(Stack::Asserted, asserted)?,
             index(Stack::Inferred, inferred)?,
         ],
+        committed,
     ))
 }
 
