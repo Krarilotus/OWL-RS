@@ -6,6 +6,8 @@ builds locally. A later invocation consumes the same owned jobs, including on fi
 """
 from __future__ import annotations
 
+import base64
+import functools
 import json
 import os
 from pathlib import Path
@@ -18,11 +20,48 @@ import uuid
 from gate_protocol import (NoVerdict, PUBLISHED_BASE, UNITS, atomic_json, check_overrides,
                            clean_env, digest, git, scope, tooling, validate_part, validate_unit)
 
+@functools.lru_cache(maxsize=4)
+def windows_tools(path, system_root):
+    # Reuse the shipped selected-Git resolver, including Git's hook exec-path.
+    # Native CreateProcess searches System32 before PATH for a bare executable;
+    # neither a child env PATH prepend nor shutil.which can fix that search.
+    source = str(Path(__file__).with_name('git-bash.ps1')).replace("'", "''")
+    script = f"""$ErrorActionPreference='Stop'
+. '{source}'
+$bash=Resolve-GitBash
+$timeout=Join-Path (Split-Path -Parent $bash) 'timeout.exe'
+if (-not (Test-Path -LiteralPath $timeout -PathType Leaf)) {{
+    throw "native gate requires GNU timeout from selected Git: '$timeout'"
+}}
+@{{bash=$bash; timeout=$timeout}} | ConvertTo-Json -Compress
+"""
+    powershell = str(Path(system_root)/'System32/WindowsPowerShell/v1.0/powershell.exe')
+    p = subprocess.run([powershell, '-NoProfile', '-NonInteractive', '-EncodedCommand',
+                        base64.b64encode(script.encode('utf-16le')).decode()],
+                       env={**os.environ, 'PATH': path}, stdin=subprocess.DEVNULL,
+                       capture_output=True, text=True, timeout=20)
+    if p.returncode:
+        raise NoVerdict('native producer tools: ' + p.stderr[-2000:])
+    tools = json.loads(p.stdout)
+    if any(not Path(tools[name]).is_absolute() or not Path(tools[name]).is_file()
+           for name in ('bash', 'timeout')):
+        raise NoVerdict('native producer tools must be existing absolute selected-Git paths')
+    return tools
+
+
 def command(args, env, seconds=60):
     # GNU timeout owns the whole process group, escalating TERM. Do not wrap this in a
     # pipeline that discards transport/producer failures. Available in the existing Git Bash route.
-    p = subprocess.run(['timeout', '--kill-after=10', str(seconds), *args], env=env,
-                       capture_output=True, text=True, timeout=seconds + 20)
+    timeout = 'timeout'
+    options = {}
+    if os.name == 'nt':
+        tools = windows_tools(env.get('PATH', os.environ.get('PATH', '')), os.environ['SystemRoot'])
+        timeout = tools['timeout']
+        if args[0] in ('bash', 'bash.exe'):
+            args = [tools['bash'], *args[1:]]
+        options['stdin'] = subprocess.DEVNULL  # Actual EOF even at a detached native boundary.
+    p = subprocess.run([timeout, '--kill-after=10', str(seconds), *args], env=env,
+                       capture_output=True, text=True, timeout=seconds + 20, **options)
     if p.returncode:
         raise NoVerdict(f'{args[0]} {args[1:2]} exit {p.returncode}: {p.stderr[-2000:]}')
     return p.stdout.rstrip('\r\n')
