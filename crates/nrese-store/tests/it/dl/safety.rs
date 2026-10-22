@@ -144,16 +144,112 @@ fn explanations_are_only_for_readers_of_every_graph() {
     assert!(dl.store().explain_dl(&open_reader(), statement).is_none());
 }
 
-/// Consistency on commit (and the islands deciding it): a committer who may read and
-/// write `open` only is rejected for what the secret schema makes inconsistent, and the
-/// rejection shows the axioms of the graphs it may read, never the secret ones.
+/// Consistency on commit (and the islands deciding it), N12 (Sol r1, F3): a committer who
+/// may read and write `open` only is rejected for what the secret schema makes inconsistent
+/// with the same report however much secret schema takes part: no secret axiom, and no
+/// axiom or statement count, engine or time, which told how much; and the same fixed reason
+/// for an inconsistency within `open` alone (Sol r2: its evidence followed the deadline).
 #[test]
-fn a_rejection_shows_no_axiom_of_a_graph_the_committer_cannot_read() {
+fn a_restricted_rejection_is_the_same_whatever_secret_graphs_hold() {
+    let access = Arc::new(GraphAccess {
+        graphs: vec![format!("{EX}open")],
+        ..GraphAccess::default()
+    });
+    let committer = Requester::new(
+        ReadScope::Graphs(Arc::clone(&access)),
+        WriteScope::Graphs(access),
+    );
+    let reject = |schema: &str, data: &str| {
+        let dl = pipeline();
+        insert(&dl, schema).expect("schema");
+        let rejected = dl.apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "{PREFIXES}INSERT DATA {{ GRAPH :open {{ {data} }} }}"
+            ))),
+            &committer,
+            &MutationTicket::new(),
+        );
+        let Err(MutationError::Rejected(reject)) = rejected else {
+            panic!("expected a rejection, got {rejected:?}");
+        };
+        reject
+    };
+    let one = reject(
+        "GRAPH :secret { :A owl:equivalentClass [ owl:unionOf ( :B :C ) ] .            :B owl:disjointWith :D . :C owl:disjointWith :D }",
+        ":x a :A , :D",
+    );
+    let more = reject(
+        "GRAPH :secret { :A owl:equivalentClass [ owl:unionOf ( :B :C ) ] . :B rdfs:subClassOf :B2 . :B2 owl:disjointWith :D . :C owl:disjointWith :D }",
+        ":x a :A , :D",
+    );
+    assert_eq!(one.detail, more.detail);
+    assert_eq!(one.explanation, more.explanation);
+    assert!(one.explanation.expect("an explanation").evidence.is_empty());
+    // Within `open` alone: the same fixed reason (Sol r2: evidence follows the deadline).
+    let open = reject("GRAPH :open { :B owl:disjointWith :D }", ":x a :B , :D");
+    assert_eq!(open.detail, one.detail);
+    assert!(
+        open.explanation
+            .expect("an explanation")
+            .evidence
+            .is_empty()
+    );
+}
+
+/// N12 (Sol r2, R2-F3): a restricted committer's DL rejection is one fixed reason, the same
+/// byte for byte whether the gate had evidence to spare or none (no explanation test left): the
+/// evidence a deadline or budget allows depends on what else it was spent on, private work
+/// included.
+#[test]
+fn a_restricted_dl_rejection_is_the_same_whatever_budget_its_evidence_had() {
+    let access = Arc::new(GraphAccess {
+        graphs: vec![format!("{EX}open")],
+        ..GraphAccess::default()
+    });
+    let committer = Requester::new(
+        ReadScope::Graphs(Arc::clone(&access)),
+        WriteScope::Graphs(access),
+    );
+    let reply = |explanation_tests: Option<usize>| {
+        let dl = pipeline_with(DlConfig {
+            explanation_tests,
+            ..DlConfig::default()
+        });
+        insert(&dl, "GRAPH :open { :B owl:disjointWith :D }").expect("schema");
+        let rejected = dl.apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "{PREFIXES}INSERT DATA {{ GRAPH :open {{ :x a :B , :D }} }}"
+            ))),
+            &committer,
+            &MutationTicket::new(),
+        );
+        let Err(MutationError::Rejected(reject)) = rejected else {
+            panic!("expected a rejection, got {rejected:?}");
+        };
+        format!(
+            "{} {:?} {:?}",
+            reject.detail, reject.explanation, reject.attribution
+        )
+    };
+    let unspent = reply(None);
+    assert!(
+        unspent.contains("details are available to an administrator"),
+        "{unspent}"
+    );
+    assert_eq!(reply(Some(0)), unspent);
+}
+
+/// N12 (RSH-03): a public subclass axiom whose restriction is stated in a secret graph.
+/// The rejection's evidence was labelled by the axiom's graph, so the restriction's
+/// triples, `secretP` with them, showed as public. Each triple is authorised by its own graphs.
+#[test]
+fn a_rejection_shows_no_structure_of_a_graph_the_committer_cannot_read() {
     let dl = pipeline();
     insert(
         &dl,
-        "GRAPH :secret { :A owl:equivalentClass [ owl:unionOf ( :B :C ) ] . \
-           :B owl:disjointWith :D . :C owl:disjointWith :D }",
+        "GRAPH :open { :A rdfs:subClassOf _:r } \
+         GRAPH :secret { _:r a owl:Restriction ; owl:onProperty :secretP ; \
+           owl:someValuesFrom owl:Nothing }",
     )
     .expect("schema");
     let access = Arc::new(GraphAccess {
@@ -166,7 +262,7 @@ fn a_rejection_shows_no_axiom_of_a_graph_the_committer_cannot_read() {
     );
     let rejected = dl.apply(
         MutationCommand::Update(SparqlUpdateRequest::new(format!(
-            "{PREFIXES}INSERT DATA {{ GRAPH :open {{ :x a :A , :D }} }}"
+            "{PREFIXES}INSERT DATA {{ GRAPH :open {{ :a a :A }} }}"
         ))),
         &committer,
         &MutationTicket::new(),
@@ -174,27 +270,9 @@ fn a_rejection_shows_no_axiom_of_a_graph_the_committer_cannot_read() {
     let Err(MutationError::Rejected(reject)) = rejected else {
         panic!("expected a rejection, got {rejected:?}");
     };
-    let evidence = reject.explanation.expect("an explanation").evidence;
-    let shown = |local: &str| {
-        evidence.iter().any(|e| {
-            [&e.subject, &e.predicate, &e.object]
-                .iter()
-                .any(|t| t.contains(local))
-        })
-    };
-    // The committer's own statements, not the secret union or disjointness.
-    assert!(shown("example.com/x"), "{evidence:#?}");
-    assert!(
-        !evidence.iter().any(|e| e.predicate.contains("unionOf")
-            || e.predicate.contains("disjointWith")
-            || e.predicate.contains("equivalentClass")),
-        "{evidence:#?}"
-    );
-    assert!(
-        reject.detail.contains("graphs you can't read"),
-        "{}",
-        reject.detail
-    );
+    let evidence = format!("{:?}", reject.explanation.expect("an explanation").evidence);
+    assert!(!evidence.contains("secretP"), "{evidence}");
+    assert!(!reject.detail.contains("secretP"), "{}", reject.detail);
 }
 
 /// U1 with representatives under graph access: what U1's classes give (both departments

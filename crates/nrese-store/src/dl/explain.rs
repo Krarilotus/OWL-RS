@@ -218,13 +218,37 @@ pub(crate) fn explained(
             axiom: ontology.functional(&ontology.axioms[i], decode),
             sources: ontology.sources[i]
                 .iter()
-                .map(|source| {
-                    let graph = (source.graph != nrese_engine::TermId::DEFAULT_GRAPH.raw())
-                        .then(|| decode(source.graph));
-                    let triples = source.triples.iter().map(|t| t.map(decode)).collect();
-                    (graph, triples)
-                })
+                .flat_map(|source| by_graph(source, decode))
                 .collect(),
+        })
+        .collect()
+}
+
+/// `source`'s triples under each graph they are stated in, the source's own graph first
+/// (`None`: the default graph).
+fn by_graph(
+    source: &nrese_owl::Source,
+    decode: &dyn Fn(u64) -> String,
+) -> Vec<(Option<String>, Vec<[String; 3]>)> {
+    let mut groups: Vec<(u64, Vec<[String; 3]>)> = vec![(source.graph, Vec::new())];
+    for (i, triple) in source.triples.iter().enumerate() {
+        for graph in source.graphs(i) {
+            let at = match groups.iter().position(|(g, _)| *g == graph) {
+                Some(at) => at,
+                None => {
+                    groups.push((graph, Vec::new()));
+                    groups.len() - 1
+                }
+            };
+            groups[at].1.push(triple.map(decode));
+        }
+    }
+    groups
+        .into_iter()
+        .filter(|(_, triples)| !triples.is_empty())
+        .map(|(graph, triples)| {
+            let named = graph != nrese_engine::TermId::DEFAULT_GRAPH.raw();
+            (named.then(|| decode(graph)), triples)
         })
         .collect()
 }

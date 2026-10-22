@@ -45,6 +45,8 @@ SHACL_OBSERVATION = r'''
 '''
 WRITE = '        std::fs::write(path, json)?;'
 JSON_END = r'\"queries\": [\n{}\n  ]\n}}\n",'
+LOAD_START = '    let mut load_s = 0.0;'
+LOAD_DONE = '        load_s = started.elapsed().as_secs_f64();'
 
 
 def patch(text: str) -> tuple[str, str]:
@@ -54,9 +56,14 @@ def patch(text: str) -> tuple[str, str]:
     if ('"reason",' in text and '"shacl",' in text
             and 'let done = store.rematerialise(program)?;' in text):
         return text, 'native'
-    if any(text.count(anchor) != 1 for anchor in (REASON, SHACL_END, WRITE, JSON_END)):
+    if any(text.count(anchor) != 1 for anchor in
+           (REASON, SHACL_END, WRITE, JSON_END, LOAD_START, LOAD_DONE)):
         return text, 'no match'
+    text = text.replace(LOAD_START, LOAD_START + '\n    let mut loaded: Option<u64> = None;')
+    text = text.replace(LOAD_DONE, LOAD_DONE + '\n        loaded = Some(report.inserted);')
     observed = (f'    {MARKER}\n    let mut phase_sections = String::new();\n'
+                + '    if let Some(inserted) = loaded {\n'
+                + r'        phase_sections.push_str(&format!(",\n  \"loaded\": {inserted}"));' + '\n    }\n'
                 + REASON[:-6] + REASON_OBSERVATION + '    }')
     text = text.replace(REASON, observed).replace(SHACL_END, SHACL_END + SHACL_OBSERVATION)
     text = text.replace(WRITE, '        let mut json = json;\n'

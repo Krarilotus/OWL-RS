@@ -82,6 +82,15 @@ pub fn reasoning(state: AppState) -> Response {
                 .as_ref()
                 .map(reasoning_view::materialisation_view),
             reject_diagnostics: reasoning_view::reject_diagnostics_baseline(last_run.as_ref()),
+            restricted_rejections: state
+                .pipeline()
+                .restricted_rejections()
+                .into_iter()
+                .map(|counted| reasoning_view::RestrictedRejectionsView {
+                    principal: counted.principal,
+                    rejections: counted.rejections,
+                })
+                .collect(),
         }),
     )
         .into_response()

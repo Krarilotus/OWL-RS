@@ -100,10 +100,10 @@ fn inferences_are_explained_by_their_derivations() {
     assert!(explain("w", "ancestor", "x").is_none());
 }
 
-/// An explanation shows only what the requester may read (graph access): asserted
-/// premises in no readable graph are `hidden` steps; a statement the requester doesn't
-/// see is answered as one that doesn't hold, so `explain` tells nothing about hidden
-/// statements' existence.
+/// An explanation is searched for within what the requester may read (graph access, N12):
+/// a derivation from its graphs is shown whole, one that needs a graph it can't read isn't
+/// found (no step hints at it); a statement the requester doesn't see is answered as one
+/// that doesn't hold, so `explain` tells nothing about hidden statements' existence.
 #[test]
 fn explanations_stay_within_the_readers_graphs() {
     use std::sync::Arc;
@@ -111,7 +111,7 @@ fn explanations_stay_within_the_readers_graphs() {
     store
         .execute_update(&SparqlUpdateRequest::new(format!(
             "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-             INSERT DATA {{ GRAPH ex:open {{ ex:a a ex:C }}
+             INSERT DATA {{ GRAPH ex:open {{ ex:a a ex:C . ex:C rdfs:subClassOf ex:E }}
                             GRAPH ex:secret {{ ex:C rdfs:subClassOf ex:D . ex:s ex:p ex:o }} }}"
         )))
         .unwrap();
@@ -134,17 +134,19 @@ fn explanations_stay_within_the_readers_graphs() {
             )
             .unwrap()
     };
-    // `a` is a D: the open premise shown, the secret one hidden.
+    // `a` is an E by the open graph alone: shown whole.
     let steps =
-        explain(&scope(true), "a", TYPE, "D").expect("a is a D, and inferences are visible");
+        explain(&scope(true), "a", TYPE, "E").expect("a is an E, and inferences are visible");
     let origins: Vec<&str> = steps.iter().map(|s| s.origin).collect();
     assert_eq!(origins[0], "inferred");
+    assert!(origins[1..].iter().all(|o| *o == "asserted"), "{origins:?}");
     assert!(
-        origins.contains(&"asserted") && origins.contains(&"hidden"),
-        "{origins:?}"
+        steps
+            .iter()
+            .all(|s| !s.subject.is_empty() && !s.object.is_empty())
     );
-    let hidden = steps.iter().find(|s| s.origin == "hidden").unwrap();
-    assert!(hidden.subject.is_empty() && hidden.object.is_empty());
+    // `a` is a D only through the secret graph's axiom: no derivation within the reader's.
+    assert!(explain(&scope(true), "a", TYPE, "D").is_none());
     // Inferences not visible: as if it didn't hold.
     assert!(explain(&scope(false), "a", TYPE, "D").is_none());
     // A statement asserted only in the secret graph: as if it didn't hold.
@@ -257,6 +259,73 @@ fn inferences_are_justified_by_minimal_sets() {
                 &nrese_store::ReadScope::All,
                 [iri("a").as_ref(), iri(TYPE).as_ref(), iri("B").as_ref()],
                 JustificationMode::One,
+            )
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A derivation deeper than the explanation's budget of facts to examine (a chain of 4,100
+/// user rules) is answered as incomplete, with the limit, not as a statement that doesn't
+/// hold (a work limit isn't a negative answer). For a reader of `open` too: the budget
+/// counts only its share's work, so that it ran out tells nothing of other graphs.
+#[test]
+fn an_explanation_past_its_budget_is_incomplete_not_absent() {
+    use std::sync::Arc;
+
+    use nrese_reasoner::{RuleProgram, UserRules};
+    use nrese_store::reasoning::Explained;
+    const DEPTH: usize = 4_100;
+    let text: String = (0..DEPTH)
+        .map(|i| format!("{{ ?x <{EX}p{i}> ?y }} => {{ ?x <{EX}p{}> ?y }} .\n", i + 1))
+        .collect();
+    let program = RuleProgram::new(
+        None,
+        Some(Arc::new(
+            UserRules::n3("chain.n3", &text).expect("the rules compile"),
+        )),
+    )
+    .expect("a program");
+    let store = StoreService::new(in_memory_store_config()).unwrap();
+    store
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "INSERT DATA {{ GRAPH <{EX}open> {{ <{EX}a> <{EX}p0> <{EX}b> }} }}"
+        )))
+        .unwrap();
+    store.rematerialise(&program).unwrap();
+    let open = nrese_store::ReadScope::Graphs(Arc::new(nrese_sparql::GraphAccess {
+        graphs: vec![format!("{EX}open")],
+        inferred: true,
+        ..nrese_sparql::GraphAccess::default()
+    }));
+    let at = |depth: usize, scope: &nrese_store::ReadScope| {
+        store
+            .explain_statement_outcome(
+                program.clone(),
+                scope,
+                iri("a").as_ref(),
+                iri(&format!("p{depth}")).as_ref(),
+                iri("b").as_ref(),
+            )
+            .unwrap()
+    };
+    for scope in [&nrese_store::ReadScope::All, &open] {
+        assert!(
+            matches!(at(DEPTH, scope), Some(Explained::Incomplete(_))),
+            "{:?}",
+            at(DEPTH, scope)
+        );
+        assert!(matches!(at(10, scope), Some(Explained::Proof(_))));
+    }
+    // The plain answer leaves the incomplete one out: callers that need it ask for it.
+    assert!(
+        store
+            .explain_statement(
+                program.clone(),
+                &nrese_store::ReadScope::All,
+                iri("a").as_ref(),
+                iri(&format!("p{DEPTH}")).as_ref(),
+                iri("b").as_ref(),
             )
             .unwrap()
             .is_none()

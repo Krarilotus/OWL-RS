@@ -318,11 +318,179 @@ impl Rule {
 /// A fact: subject, predicate and object ids.
 pub type Triple = [u64; 3];
 
-/// A consistency rule that fired: its name and the bindings of its variables.
+/// A consistency rule that fired: its name, the bindings of its variables, and its
+/// premises: the facts that clash (the rule's body under the bindings, or what a
+/// synthesised check read), in body order. A reject report shows a reader that may not
+/// read every graph only the premises, never the bindings, and only for a violation whose
+/// premises are `whole`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Violation {
     pub rule: String,
     pub bindings: Vec<u64>,
+    pub premises: Vec<Triple>,
+    /// Whether the premises are every fact the violation holds by: its rule's body lists
+    /// them all, schema facts too. False for a rule instantiated from a list axiom, whose
+    /// list isn't in its body (by where the rule came from, never by its name). No report
+    /// reads it yet: v1.5 tells a restricted committer one fixed reason; readable-only
+    /// evidence (v2.0, with item 18) starts from it.
+    pub whole: bool,
+}
+
+impl Violation {
+    /// `rule` fired under `bindings` (by variable; `None` unbound, given as 0): its
+    /// premises are the body atoms with every term bound; `whole` as [`Self::whole`].
+    pub fn of(rule: &Rule, bindings: &[Option<u64>], whole: bool) -> Self {
+        let value = |term: Term| match term {
+            Term::Const(c) => Some(c),
+            Term::Var(v) => bindings.get(usize::from(v)).copied().flatten(),
+        };
+        let mut premises: Vec<Triple> = Vec::with_capacity(rule.body.len());
+        for atom in &rule.body {
+            if let (Some(s), Some(p), Some(o)) =
+                (value(atom.0[0]), value(atom.0[1]), value(atom.0[2]))
+                && !premises.contains(&[s, p, o])
+            {
+                premises.push([s, p, o]);
+            }
+        }
+        Self {
+            rule: rule.name.clone(),
+            bindings: bindings.iter().map(|b| b.unwrap_or(0)).collect(),
+            premises,
+            whole,
+        }
+    }
+}
+
+/// The consistency violations an evaluation found, charged to a budget before they are
+/// made: the list's capacity as it grows ([`nrese_exec::ChargedVec`]), and each violation's
+/// own bytes (its rule's name, a binding per variable, a premise per body atom) reserved
+/// from those bounds before it is built. Where the budget has no room for one, the list
+/// stops there and says so ([`Self::complete`]): the state is inconsistent all the same.
+#[derive(Debug)]
+pub struct Violations {
+    items: nrese_exec::ChargedVec<Violation>,
+    /// The violations' names, bindings and premises.
+    heap: nrese_exec::Reservation,
+    refused: bool,
+}
+
+impl Default for Violations {
+    fn default() -> Self {
+        Self::new(std::sync::Arc::new(nrese_exec::Budget::unlimited()))
+    }
+}
+
+/// The same violations, listed as completely: whatever budget charged them.
+impl PartialEq for Violations {
+    fn eq(&self, other: &Self) -> bool {
+        self.refused == other.refused && *self.items == *other.items
+    }
+}
+
+impl std::ops::Deref for Violations {
+    type Target = [Violation];
+
+    fn deref(&self) -> &[Violation] {
+        &self.items
+    }
+}
+
+/// The bytes a violation holds beside itself.
+fn heap_bytes(name: usize, bindings: usize, premises: usize) -> usize {
+    name + bindings * std::mem::size_of::<u64>() + premises * std::mem::size_of::<Triple>()
+}
+
+impl Violations {
+    pub fn new(budget: std::sync::Arc<nrese_exec::Budget>) -> Self {
+        Self {
+            items: nrese_exec::ChargedVec::new(std::sync::Arc::clone(&budget)),
+            heap: nrese_exec::Reservation::new(budget),
+            refused: false,
+        }
+    }
+
+    /// `rule` fired under `bindings` ([`Violation::of`]), reserved first.
+    pub fn record(&mut self, rule: &Rule, bindings: &[Option<u64>], whole: bool) {
+        let bytes = heap_bytes(rule.name.len(), bindings.len(), rule.body.len());
+        if self.reserve(bytes) {
+            self.items
+                .push(Violation::of(rule, bindings, whole))
+                .expect("its room reserved");
+        }
+    }
+
+    /// A synthesised check's violation of the one statement it read, reserved first.
+    pub fn record_check(&mut self, rule: &'static str, bindings: [u64; 2], premise: Triple) {
+        if self.reserve(heap_bytes(rule.len(), 2, 1)) {
+            self.items
+                .push(Violation {
+                    rule: rule.to_owned(),
+                    bindings: bindings.to_vec(),
+                    premises: vec![premise],
+                    whole: true,
+                })
+                .expect("its room reserved");
+        }
+    }
+
+    /// Room for one more violation of `bytes` of its own; once refused, none more.
+    fn reserve(&mut self, bytes: usize) -> bool {
+        if self.refused {
+            return false;
+        }
+        if self.items.reserve(1).is_ok() && self.heap.charge(bytes).is_ok() {
+            return true;
+        }
+        self.refused = true;
+        false
+    }
+
+    /// Sorted by rule, bindings and premises, each once (in place: the duplicates' bytes
+    /// handed back).
+    pub fn finish(&mut self) {
+        let items: &mut [Violation] = &mut self.items;
+        items.sort_unstable_by(|a, b| {
+            (&a.rule, &a.bindings, &a.premises).cmp(&(&b.rule, &b.bindings, &b.premises))
+        });
+        // Each distinct one moved to the front, the duplicates left behind it.
+        let mut kept = usize::from(!items.is_empty());
+        for at in 1..items.len() {
+            if items[at] != items[kept - 1] {
+                items.swap(kept, at);
+                kept += 1;
+            }
+        }
+        let freed: usize = items[kept..]
+            .iter()
+            .map(|v| {
+                heap_bytes(
+                    v.rule.capacity(),
+                    v.bindings.capacity(),
+                    v.premises.capacity(),
+                )
+            })
+            .sum();
+        self.items.truncate(kept);
+        self.heap.release(freed);
+    }
+
+    /// Whether every violation found is listed: false where the budget refused one.
+    pub fn complete(&self) -> bool {
+        !self.refused
+    }
+
+    /// How many distinct violations there are at least: those listed, and where the budget
+    /// refused one with none listed, that one (a refused firing beside listed ones may repeat
+    /// one of them, so it adds nothing sure).
+    pub fn found(&self) -> usize {
+        self.items.len().max(usize::from(self.refused))
+    }
+
+    /// Whether the state is inconsistent: a violation listed, or one the budget refused.
+    pub fn inconsistent(&self) -> bool {
+        self.refused || !self.items.is_empty()
+    }
 }
 
 /// A rule text that doesn't compile: which rule, what is wrong, and where.

@@ -134,6 +134,101 @@ fn readers_see_the_inferences_their_graphs_support() {
     assert!(explain("b", "D").is_none());
 }
 
+/// A store for N12's noninterference tests: a public transitive `p` and a public chain
+/// `a→b→c→e→d`, then `private` added to a secret graph; reasoned, the rules registered.
+fn chain_store(private: &str) -> StoreService {
+    let store = StoreService::new(in_memory_store_config()).unwrap();
+    store
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "PREFIX ex: <{EX}> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             INSERT DATA {{ ex:p a owl:TransitiveProperty .
+                            GRAPH ex:open {{ ex:a ex:p ex:b . ex:b ex:p ex:c . ex:c ex:p ex:e . ex:e ex:p ex:d }}
+                            GRAPH ex:secret {{ {private} }} }}"
+        )))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    store
+}
+
+/// The secret additions of the noninterference tests: a shorter derivation of `a p d`
+/// through secret asserted statements (Sol r1, F1), and one through a secret inferred
+/// intermediate (RSH-02, the validation's corrected trigger).
+const SHORTCUTS: [&str; 2] = [
+    "ex:a ex:p ex:x . ex:x ex:p ex:d",
+    "ex:a ex:p ex:x . ex:x ex:p ex:y . ex:y ex:p ex:d",
+];
+
+fn chain_statement() -> [nrese_rdf::NamedNode; 3] {
+    ["a", "p", "d"].map(|local| nrese_rdf::NamedNode::new_unchecked(format!("{EX}{local}")))
+}
+
+/// N12 (RSH-02; Sol r1, F1): a reader who sees `a p d` by its public support gets the same
+/// explanation whatever a graph it can't read adds: a shorter secret derivation, through
+/// asserted statements or an inferred intermediate, is neither chosen nor hinted at.
+#[test]
+fn a_supported_explanation_is_the_same_whatever_secret_graphs_hold() {
+    let explain = |store: &StoreService| {
+        let [a, p, d] = chain_statement();
+        store
+            .explain_statement(
+                Ruleset::Owl2Rl,
+                &reader(true),
+                a.as_ref().into(),
+                p.as_ref().into(),
+                d.as_ref().into(),
+            )
+            .unwrap()
+            .expect("a public derivation")
+    };
+    let public = explain(&chain_store(""));
+    assert!(
+        public.iter().all(|step| step.origin != "hidden"),
+        "{public:#?}"
+    );
+    for private in SHORTCUTS {
+        assert_eq!(explain(&chain_store(private)), public, "{private}");
+    }
+}
+
+/// N12 (Sol r1, F2): a supported reader's justifications of `a p d`, in every mode, with
+/// their completeness and verification, are the same whatever a graph it can't read adds.
+/// A secret shortcut changed `one`'s members, `all`'s count and `core` (with no hidden
+/// member at all): the sets were enumerated over every graph, then redacted.
+#[test]
+fn supported_justifications_are_the_same_whatever_secret_graphs_hold() {
+    use nrese_store::reasoning::JustificationMode;
+    let justify = |store: &StoreService| {
+        let [a, p, d] = chain_statement();
+        [
+            JustificationMode::One,
+            JustificationMode::All,
+            JustificationMode::Core,
+            JustificationMode::Union,
+            JustificationMode::Top(2),
+        ]
+        .map(|mode| {
+            store
+                .justify_statement(
+                    Ruleset::Owl2Rl,
+                    &reader(true),
+                    [a.as_ref().into(), p.as_ref().into(), d.as_ref().into()],
+                    mode,
+                )
+                .unwrap()
+                .expect("a public justification")
+        })
+    };
+    let public = justify(&chain_store(""));
+    assert!(
+        public.iter().all(|answer| answer.verified != Some(false)),
+        "{public:#?}"
+    );
+    for private in SHORTCUTS {
+        assert_eq!(justify(&chain_store(private)), public, "{private}");
+    }
+}
+
 /// A new revision gets its own sets: data the reader may read, added later, supports
 /// what it derives.
 #[test]
@@ -192,6 +287,65 @@ fn readers_past_the_cap_see_what_their_graphs_derive() {
 /// graph asserted it, an exact membership test for any statement the reader can make
 /// derivable. Each row: the reader's graph `open` derives the statement, `secret` asserts it
 /// or not; ASK and COUNT answer alike either way, by support and seeing every inference.
+/// A statement in the tests' Turtle shorthand (`ex:`, `owl:`, `a`), as terms.
+fn statement_of(text: &str) -> [nrese_rdf::NamedNode; 3] {
+    let term = |name: &str| {
+        nrese_rdf::NamedNode::new_unchecked(match name.split_once(':') {
+            Some(("ex", local)) => format!("{EX}{local}"),
+            Some(("owl", local)) => format!("http://www.w3.org/2002/07/owl#{local}"),
+            _ if name == "a" => "http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_owned(),
+            _ => panic!("{name}: not in the shorthand"),
+        })
+    };
+    let names: Vec<&str> = text.split_whitespace().collect();
+    [term(names[0]), term(names[1]), term(names[2])]
+}
+
+/// What `scope` is told of how `statement` holds: its explanation and its justifications
+/// in every mode (N12, with the hidden-assertion rows of item 18).
+fn proofs(
+    store: &StoreService,
+    scope: &ReadScope,
+    statement: &str,
+) -> (
+    Option<Vec<nrese_store::reasoning::InferenceStep>>,
+    Vec<Option<nrese_store::reasoning::JustificationAnswer>>,
+) {
+    use nrese_store::reasoning::JustificationMode;
+    let [s, p, o] = statement_of(statement);
+    let explained = store
+        .explain_statement(
+            Ruleset::Owl2Rl,
+            scope,
+            s.as_ref().into(),
+            p.as_ref().into(),
+            o.as_ref().into(),
+        )
+        .unwrap();
+    let justified = [
+        JustificationMode::One,
+        JustificationMode::All,
+        JustificationMode::Core,
+        JustificationMode::Union,
+        JustificationMode::Top(2),
+    ]
+    .into_iter()
+    .map(|mode| {
+        store
+            .justify_statement(
+                Ruleset::Owl2Rl,
+                scope,
+                [s.as_ref().into(), p.as_ref().into(), o.as_ref().into()],
+                mode,
+            )
+            .unwrap()
+    })
+    .collect();
+    (explained, justified)
+}
+
+/// Also its explanation and justifications (N12): what a reader is told of how the statement
+/// holds doesn't depend on the hidden assertion either.
 #[test]
 fn a_hidden_assertion_does_not_change_what_a_reader_derives() {
     const OWL: &str = "PREFIX owl: <http://www.w3.org/2002/07/owl#>";
@@ -216,7 +370,13 @@ fn a_hidden_assertion_does_not_change_what_a_reader_derives() {
             "SELECT (COUNT(*) AS ?n) WHERE { ex:alice owl:sameAs ?o }",
         ),
     ];
-    let answers = |open: &str, secret: Option<&str>, ask: &str, count: &str, scope: &ReadScope| {
+    // `statement`: the row's secret one, asked for whether or not `secret` asserts it.
+    let answers = |open: &str,
+                   secret: Option<&str>,
+                   statement: &str,
+                   ask: &str,
+                   count: &str,
+                   scope: &ReadScope| {
         let store = StoreService::new(in_memory_store_config()).unwrap();
         let hidden = secret.map_or(String::new(), |s| format!("GRAPH ex:secret {{ {s} }}"));
         store
@@ -228,17 +388,17 @@ fn a_hidden_assertion_does_not_change_what_a_reader_derives() {
         store.rematerialise(Ruleset::Owl2Rl).unwrap();
         store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
         let query = |q: &str| select(&store, scope, &format!("{OWL} {q}"));
-        (query(ask), query(count))
+        (query(ask), query(count), proofs(&store, scope, statement))
     };
     for (by_support, mode) in [(true, "supported"), (false, "visible")] {
         let scope = reader(by_support);
         for (open, secret, ask, count) in rows {
-            let public = answers(open, None, ask, count, &scope);
+            let public = answers(open, None, secret, ask, count, &scope);
             assert!(
-                public.0.contains("true"),
-                "{mode}: {ask} derivable from open: {public:?}"
+                public.0.contains("true") && public.2.0.is_some(),
+                "{mode}: {ask} derivable from open, and explained: {public:?}"
             );
-            let hidden = answers(open, Some(secret), ask, count, &scope);
+            let hidden = answers(open, Some(secret), secret, ask, count, &scope);
             assert_eq!(hidden, public, "{mode}: {secret} asserted in secret");
         }
     }
@@ -278,13 +438,23 @@ fn a_hidden_assertion_committed_later_does_not_change_what_a_reader_derives() {
                     "SELECT (COUNT(*) AS ?n) WHERE { ?s a ex:Patient }",
                 ]
                 .map(|query| select(pipeline.store(), scope, query))
+                .into_iter()
+                // And how it holds (N12): explanation and justifications.
+                .chain([format!(
+                    "{:?}",
+                    proofs(pipeline.store(), scope, "ex:alice a ex:Patient")
+                )])
             })
             .collect()
     };
     let before = seen();
     assert!(
-        before[0].contains("true") && before[2].contains("true"),
+        before[0].contains("true") && before[3].contains("true"),
         "{before:?}"
+    );
+    assert!(
+        before[2].starts_with("(Some(") && before[5].starts_with("(Some("),
+        "explained: {before:?}"
     );
     apply("INSERT DATA { GRAPH ex:secret { ex:alice a ex:Patient } }");
     assert_eq!(seen(), before, "asserted in secret");

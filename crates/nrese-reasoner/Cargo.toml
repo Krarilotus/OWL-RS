@@ -30,6 +30,8 @@ oracle = []
 [dev-dependencies]
 # Its own tests and examples use the oracle.
 nrese-reasoner = { path = ".", features = ["oracle"] }
+# The violations' memory guard measures against budgets (tests/violations_memory.rs).
+nrese-exec = { path = "../nrese-exec", features = ["measure"] }
 
 [lints]
 workspace = true

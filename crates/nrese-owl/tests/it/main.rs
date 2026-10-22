@@ -597,6 +597,127 @@ fn unreadable_expressions_are_reported() {
     );
 }
 
+/// A statement given twice in one graph is one value, not a structure property given twice,
+/// and an expression two axioms share is in each one's source (N12, Sol r3 F2 and F3: the
+/// one-graph path skipped the dedup and the second axiom's recollection).
+#[test]
+fn one_graph_reads_a_repeated_statement_once_and_a_shared_expression_into_every_source() {
+    let mut table = Table::default();
+    let mut statements = load(
+        &mut table,
+        "ex:A rdfs:subClassOf _:r . ex:C rdfs:subClassOf _:r .
+         _:r a owl:Restriction ; owl:onProperty ex:p ; owl:someValuesFrom ex:B .",
+    );
+    let on_property = table
+        .iri("http://www.w3.org/2002/07/owl#onProperty")
+        .unwrap();
+    let repeated = *statements
+        .iter()
+        .find(|s| s.triple[1] == on_property)
+        .unwrap();
+    statements.push(repeated);
+    let ontology = read(&statements, &table);
+    assert!(
+        !ontology.diagnostics.iter().any(Diagnostic::is_fatal),
+        "{:?}",
+        ontology.diagnostics
+    );
+    let structural: Vec<_> = statements
+        .iter()
+        .filter(|s| matches!(table.terms[s.triple[0] as usize], RdfTerm::BlankNode(_)))
+        .map(|s| s.triple)
+        .collect();
+    let mut checked = 0;
+    for (axiom, sources) in ontology.axioms.iter().zip(&ontology.sources) {
+        if !matches!(axiom, Axiom::SubClassOf(..)) {
+            continue;
+        }
+        checked += 1;
+        for source in sources {
+            for triple in &structural {
+                assert!(source.triples.contains(triple), "{source:?}");
+            }
+        }
+    }
+    assert_eq!(checked, 2);
+}
+
+/// A source in one graph costs what it did before graphs were recorded per triple, give or
+/// take its pointer to them: every axiom has one, and 16 bytes more on each showed as 4% more
+/// memory reading a 60,000-class ontology (N12's timing, dl-pipeline).
+#[test]
+fn a_source_records_other_graphs_out_of_line() {
+    assert!(
+        size_of::<nrese_owl::Source>() <= 40,
+        "{} bytes",
+        size_of::<nrese_owl::Source>()
+    );
+}
+
+/// An axiom's sources say where each of its triples is stated (N12: RSH-03, RSH-05): an
+/// expression's triples in another graph than the axiom's keep their graph, the same
+/// triple in two graphs is one value with both graphs, and an axiom read again (here:
+/// stated in a second graph, a source per graph) has its expression's triples again,
+/// though the expression is read once.
+#[test]
+fn sources_keep_the_graphs_of_structural_triples() {
+    let text = "ex:A rdfs:subClassOf _:r .
+        _:r a owl:Restriction ; owl:onProperty ex:secretP ; owl:someValuesFrom owl:Nothing .";
+    // Graphs per triple: the axiom's own triple, and the restriction's.
+    for (axiom_graphs, structure_graphs) in [
+        (&[1][..], &[2][..]),
+        (&[1][..], &[2, 3][..]),
+        (&[1, 4][..], &[2][..]),
+    ] {
+        let mut table = Table::default();
+        let statements: Vec<Statement> = load(&mut table, text)
+            .into_iter()
+            .flat_map(|statement| {
+                let structural = matches!(
+                    table.terms[statement.triple[0] as usize],
+                    RdfTerm::BlankNode(_)
+                );
+                let graphs = if structural {
+                    structure_graphs
+                } else {
+                    axiom_graphs
+                };
+                graphs
+                    .iter()
+                    .map(move |&graph| Statement { graph, ..statement })
+            })
+            .collect();
+        let ontology = read(&statements, &table);
+        assert!(
+            !ontology.diagnostics.iter().any(|d| d.is_fatal()),
+            "{structure_graphs:?}: {:?}",
+            ontology.diagnostics
+        );
+        let at = ontology
+            .axioms
+            .iter()
+            .position(|a| matches!(a, Axiom::SubClassOf(..)))
+            .expect("the subclass axiom");
+        let sources = &ontology.sources[at];
+        assert_eq!(
+            sources.iter().map(|s| s.graph).collect::<Vec<_>>(),
+            axiom_graphs,
+            "one source per graph of the axiom's triple"
+        );
+        for source in sources {
+            assert_eq!(source.triples.len(), 1 + 3, "{source:?}");
+            assert_eq!(source.graphs(0).collect::<Vec<_>>(), [source.graph]);
+            for i in 1..source.triples.len() {
+                assert_eq!(
+                    source.graphs(i).collect::<Vec<_>>(),
+                    structure_graphs,
+                    "{source:?}"
+                );
+            }
+        }
+    }
+}
+
 /// Horn axioms give Horn clauses (found by the U1 bound on OWL2Bench, 4 October 2026): a
 /// union on the left (`A ⊔ B ⊑ C` was `⊤ → C ∨ Q`) and an existential over a non-simple
 /// property on the left (`A ⊓ ∃R.D ⊑ B` was `A → B ∨ Q`, Q the start of R's automaton).
