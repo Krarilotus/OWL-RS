@@ -284,10 +284,12 @@ fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Outcome, String> 
         Some(graph) => GraphSelector::Exact(graph),
         None => return Err("empty shapes graph".to_owned()),
     };
-    let shapes = compile(&snapshot, Selection::asserted(shapes_selector)).map_err(|errors| {
-        let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
-        format!("ill-formed shapes: {}", errors.join("; "))
-    })?;
+    let shapes = compile(
+        &snapshot,
+        Selection::asserted(shapes_selector),
+        &Default::default(),
+    )
+    .map_err(|error| format!("ill-formed shapes: {error}"))?;
     let report = validate(
         &snapshot,
         &shapes,

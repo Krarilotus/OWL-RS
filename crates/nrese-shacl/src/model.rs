@@ -19,6 +19,10 @@ pub struct Shapes {
     pub(crate) index: HashMap<TermId, ShapeRef>,
     /// The shapes graph's name, if it is a named graph: `$shapesGraph` in SHACL-SPARQL.
     pub(crate) graph: Option<TermId>,
+    pub(crate) programs: Vec<SparqlProgram>,
+    pub(crate) parameter_values: Vec<TermId>,
+    // Payloads precede reservations: moves keep admission alive; drop frees payload first.
+    pub(crate) _held: Option<nrese_exec::Reservation>,
 }
 
 impl Shapes {
@@ -159,6 +163,13 @@ pub(crate) enum Constraint {
 /// A SPARQL query that checks a focus node (SHACL §5, §6).
 #[derive(Debug)]
 pub(crate) struct SparqlCheck {
+    pub(crate) program: usize,
+    pub(crate) parameters: std::ops::Range<usize>,
+}
+
+/// One immutable validator program, shared by its parameter combinations without Arc.
+#[derive(Debug)]
+pub(crate) struct SparqlProgram {
     /// `sh:sourceConstraint`: the `sh:sparql` value, or the component's validator.
     pub(crate) source: TermId,
     /// `sh:SPARQLConstraintComponent`, or the custom component.
@@ -169,7 +180,7 @@ pub(crate) struct SparqlCheck {
     /// false. Otherwise a SELECT: each solution is a result.
     pub(crate) ask: bool,
     /// The component's parameters: the variable each is pre-bound as, and the value.
-    pub(crate) parameters: Vec<(nrese_rdf::Variable, TermId)>,
+    pub(crate) parameters: Vec<nrese_rdf::Variable>,
     /// The `sh:message`s of the constraint or validator (else the component's).
     pub(crate) messages: Vec<TermId>,
 }

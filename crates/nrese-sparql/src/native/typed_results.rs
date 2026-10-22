@@ -14,7 +14,7 @@ use crate::{QueryEvaluationError, QueryResults, QuerySolutionIter, QueryTripleIt
 
 /// An evaluated query, retaining encoded solutions until their consumer needs terms.
 // Keep the common solutions result inline; boxing it would add an allocation to queries.
-#[expect(clippy::large_enum_variant)]
+#[allow(clippy::large_enum_variant)]
 pub enum TypedResults {
     Boolean(bool),
     Solutions(SolutionTable),
