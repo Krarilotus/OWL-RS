@@ -1286,11 +1286,11 @@ def metric_value(case: dict, result: dict):
                 total = (total or 0.0) + statistics.median(values)
         return total
     value = lookup(case["metric"], result)
-    if case["metric"] in ("load_s", "open_s") and value is not None:
+    if case["metric"] in ("load_s", "open_s", "commits.whole_s") and value is not None:
         value = value * 1000.0
-    if "_repeats" in result and case["metric"] in ("load_s", "open_s", "clients.p99_ms", "canonicalize.p50_ms"):
+    if "_repeats" in result and case["metric"] in ("load_s", "open_s", "commits.whole_s", "clients.p99_ms", "canonicalize.p50_ms"):
         values = [lookup(case["metric"], r) for r in result["_repeats"]]
-        values = [v * (1000.0 if case["metric"] in ("load_s", "open_s") else 1.0) for v in values if v is not None]
+        values = [v * (1000.0 if case["metric"] in ("load_s", "open_s", "commits.whole_s") else 1.0) for v in values if v is not None]
         value = statistics.median(values) if values else value
     return value
 
@@ -1302,13 +1302,18 @@ def samples(case: dict, result: dict) -> dict:
     if result.get("client_sweep"):
         return {f"{level['clients']} clients p99": [level["p99_ms"]] for level in result["client_sweep"]}
     if case.get("sweep") and "_repeats" in result:
-        scale = 1000.0 if metric in ("load_s", "open_s") else 1.0
+        scale = 1000.0 if metric in ("load_s", "open_s", "commits.whole_s") else 1.0
         series: dict[str, list[float]] = {}
         for r in result["_repeats"]:
             value = lookup(metric, r)
             if value is not None:
                 series.setdefault(r.get("_sweep") or "-", []).append(value * scale)
         return series
+    if metric == "commits.whole_s":
+        # One whole operation per process, including a rejected first commit. Inner
+        # samples_ms records only successful commits and measures another window.
+        values = [lookup(metric, r) for r in result.get("_repeats", [result])]
+        return {"_": [v * 1000.0 for v in values if v is not None]}
     if result.get("phase_samples") and any(result["phase_samples"].values()):
         return {k: v for k, v in result["phase_samples"].items() if v}
     if metric == "cold_ms":
@@ -1331,7 +1336,7 @@ def samples(case: dict, result: dict) -> dict:
         return {"_": [s for r in runs for s in r.get("samples_ms", []) if s is not None]}
     if "_repeats" in result:
         values = [lookup(metric, r) for r in result["_repeats"]]
-        scale = 1000.0 if metric in ("load_s", "open_s") else 1.0
+        scale = 1000.0 if metric in ("load_s", "open_s", "commits.whole_s") else 1.0
         return {"_": [v * scale for v in values if v is not None]}
     value = metric_value(case, result)
     return {"_": [value]} if value is not None else {}
