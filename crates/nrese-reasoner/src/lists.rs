@@ -465,17 +465,15 @@ pub fn instantiate_with_premises(
         &mut |node, members, rules| {
             if members.len() > PAIRWISE_MEMBERS {
                 let mut long = long.borrow_mut();
-                for (kind, index, premises) in [
-                    (voc.all_disjoint_classes, 0, 0),
-                    (voc.all_different, 1, 1),
-                    (voc.all_disjoint_properties, 2, 2),
+                for (kind, index, premises, name) in [
+                    (voc.all_disjoint_classes, 0, 0, "cax-adc"),
+                    (voc.all_different, 1, 1, "eq-diff2"),
+                    (voc.all_disjoint_properties, 2, 2, "prp-adp"),
                 ] {
                     if typed(node, kind) {
                         long.indexes[index].add(members);
                         long.premises[premises].push([node, ty, kind]);
-                        if kind == voc.all_different {
-                            duplicates(members, node, voc, rules, "eq-diff2");
-                        }
+                        duplicates(members, node, kind, name, voc, rules);
                     }
                 }
                 return;
@@ -522,7 +520,7 @@ pub fn instantiate_with_premises(
                 let mut long = long.borrow_mut();
                 long.indexes[3].add(members);
                 long.premises[3].push([node, ty, voc.all_different]);
-                duplicates(members, node, voc, rules, "eq-diff3");
+                duplicates(members, node, voc.all_different, "eq-diff3", voc, rules);
                 return;
             }
             for (i, &a) in members.iter().enumerate() {
@@ -598,18 +596,34 @@ struct Long {
     premises: [Vec<[u64; 3]>; 4],
 }
 
-/// A long `owl:AllDifferent` list that names an individual twice is inconsistent by
-/// itself (`a sameAs a` holds by eq-ref, which isn't materialised): the axiom's rule.
-fn duplicates(members: &[u64], node: u64, voc: &ListVocabulary, rules: &mut Vec<Rule>, name: &str) {
+/// The rules for a member a long list of `kind` names twice: the pairwise axioms compare
+/// positions, and two positions holding one term are a pair the list index (one pair of
+/// distinct terms each) can't name. Over representatives this is how two members of one
+/// `sameAs` class read. An `owl:AllDifferent` list is then inconsistent by itself (`a
+/// sameAs a` holds by eq-ref, which isn't materialised); disjoint classes, where the class
+/// has an instance (`cax-adc`); disjoint properties, where the property has a pair
+/// (`prp-adp`).
+fn duplicates(
+    members: &[u64],
+    node: u64,
+    kind: u64,
+    name: &str,
+    voc: &ListVocabulary,
+    rules: &mut Vec<Rule>,
+) {
     let mut seen = std::collections::HashSet::new();
+    let mut named = std::collections::HashSet::new();
     for &member in members {
-        if !seen.insert(member) {
-            rules.push(rule(
-                name,
-                vec![Atom([c(node), c(voc.rdf_type), c(voc.all_different)])],
-                vec![],
-                Head::Inconsistent,
-            ));
+        if seen.insert(member) || !named.insert(member) {
+            continue;
+        }
+        let premise = match kind {
+            k if k == voc.all_disjoint_classes => Atom([v(0), c(voc.rdf_type), c(member)]),
+            k if k == voc.all_disjoint_properties => Atom([v(0), c(member), v(1)]),
+            _ => Atom([c(node), c(voc.rdf_type), c(voc.all_different)]),
+        };
+        rules.push(rule(name, vec![premise], vec![], Head::Inconsistent));
+        if kind == voc.all_different {
             return;
         }
     }
