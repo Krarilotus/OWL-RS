@@ -529,25 +529,12 @@ impl Wal {
         // Every version 6 frame ends in a non-zero time, which recovery relies on (a final
         // frame ending in zeros never landed whole: [`classify`]): a record without one (a
         // replica's from an older primary) or with a zero clock gets this one's.
-        let restamped;
-        let record = match (self.magic == SEGMENT_MAGIC, record.committed_micros) {
-            (true, Some(micros)) if micros > 0 => record,
-            (true, _) => {
-                restamped = CommitRecord {
-                    committed_micros: Some(now_micros().max(1)),
-                    ..record.clone()
-                };
-                &restamped
-            }
-            (false, _) => {
-                restamped = CommitRecord {
-                    committed_micros: None,
-                    ..record.clone()
-                };
-                &restamped
-            }
+        let committed_micros = match (self.magic == SEGMENT_MAGIC, record.committed_micros) {
+            (true, Some(time)) if time > 0 => Some(time),
+            (true, _) => Some(now_micros().max(1)),
+            (false, _) => None,
         };
-        encode_record(record, &mut self.buffer)?; // nothing written yet on error
+        encode_record(record, committed_micros, &mut self.buffer)?; // nothing written yet on error
         let result = self
             .active
             .write_all(&self.buffer)
@@ -845,6 +832,7 @@ mod tests {
                 committed_micros: Some(1),
                 ..CommitRecord::default()
             },
+            Some(1),
             &mut record,
         )
         .unwrap();
@@ -874,6 +862,7 @@ mod tests {
                     committed_micros: Some(revision),
                     ..CommitRecord::default()
                 },
+                Some(revision),
                 &mut frames,
             )
             .unwrap();
@@ -898,6 +887,97 @@ mod tests {
             let found = search_within(&frames, next, true, &mut work, budget);
             assert!(work.verified <= budget, "budget {budget}: {work:?}");
             assert_ne!(found, Search::None, "budget {budget}");
+        }
+    }
+
+    /// A scalar timestamp override must not copy the transaction's payload. Buffers and
+    /// files are warmed before measurement; the old v4 and untimed/zero v6 branches held
+    /// another full set of keys and deltas until encoding finished.
+    #[test]
+    fn a_prewarmed_append_does_not_copy_the_payload() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        let quad = crate::quad::EncodedQuad::from_components([1, 2, 3, 0]);
+        let mut results = Vec::new();
+        for legacy in [true, false] {
+            for time in [None, Some(0), Some(7)] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut wal = Wal::open(
+                    dir.path(),
+                    1,
+                    u64::MAX,
+                    SyncPolicy::OsBuffered,
+                    legacy,
+                    None,
+                )
+                .unwrap();
+                let mut record = CommitRecord {
+                    revision: 1,
+                    keys: vec![vec![b'x'; 8192]; 32],
+                    inserts: vec![quad; 1024],
+                    deletes: vec![quad; 1024],
+                    committed_micros: time,
+                    ..CommitRecord::default()
+                };
+                wal.append(&record).unwrap();
+                record.revision = 2;
+                let before = record.clone();
+                let (_, peak) = nrese_exec::measure::measure(|| wal.append(&record).unwrap());
+                assert_eq!(record, before);
+                results.push((legacy, time, peak));
+            }
+        }
+        for (legacy, time, peak) in &results {
+            eprintln!("prewarmed_append v4={legacy} source_time={time:?} peak_bytes={peak}");
+        }
+        assert!(
+            results.iter().all(|(_, _, peak)| *peak == 0),
+            "prewarmed append copied payload: {results:?}"
+        );
+    }
+
+    /// The WAL owns timestamp policy, independently of the codec's optional scalar.
+    #[test]
+    fn append_keeps_effective_time_and_input_record() {
+        for legacy in [true, false] {
+            for time in [None, Some(0), Some(7), Some(u64::MAX)] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut wal = Wal::open(
+                    dir.path(),
+                    1,
+                    u64::MAX,
+                    SyncPolicy::OsBuffered,
+                    legacy,
+                    None,
+                )
+                .unwrap();
+                let record = CommitRecord {
+                    revision: 1,
+                    committed_micros: time,
+                    ..CommitRecord::default()
+                };
+                wal.append(&record).unwrap();
+                let path = list_segments(dir.path()).unwrap().pop().unwrap().1;
+                let decoded = read_segment(&path, 0).unwrap().records.pop().unwrap();
+                let expected = match (legacy, time) {
+                    (true, _) => None,
+                    (false, Some(t)) if t > 0 => Some(t),
+                    (false, _) => {
+                        assert!(decoded.committed_micros.is_some_and(|t| t > 0));
+                        decoded.committed_micros
+                    }
+                };
+                assert_eq!(decoded.committed_micros, expected);
+                assert_eq!(record.committed_micros, time);
+                assert_eq!(
+                    decoded,
+                    CommitRecord {
+                        committed_micros: expected,
+                        ..record
+                    }
+                );
+            }
         }
     }
 }

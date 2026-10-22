@@ -125,7 +125,7 @@ impl Engine {
                     break 'segments;
                 }
                 let before = batch.frames.len();
-                encode_record(&record, &mut batch.frames)?;
+                encode_record(&record, record.committed_micros, &mut batch.frames)?;
                 if batch.records > 0 && batch.frames.len() > max_bytes {
                     batch.frames.truncate(before);
                     break 'segments;
