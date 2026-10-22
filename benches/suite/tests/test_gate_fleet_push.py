@@ -323,7 +323,7 @@ class NativeWrapper(unittest.TestCase):
                 destination = Path(os.environ['FLEET_OUT'])/('native-fixture-'+Path(directory).name)
                 shutil.copytree(source,destination,dirs_exist_ok=True)
 
-    def exercise(self, sleeping, limit, helper_fail=False):
+    def exercise(self, sleeping, limit, helper_fail=False, arguments=()):
         with tempfile.TemporaryDirectory(prefix='gate-native-proof-') as d, self.retained_artifacts(d):
             root = Path(d)
             (root/'scripts/lib').mkdir(parents=True)
@@ -350,6 +350,8 @@ cap=$(cygpath -u "$NRESE_GATE_CAP_FILE")
 fixture_out=$(cygpath -u "$FLEET_OUT")
 cat "/proc/$$/winpid" > "$fixture_out/bash-pid"
 until [ -s "$cap" ]; do sleep 0.1; done
+: > "$fixture_out/arguments"
+if [ "$#" -gt 0 ]; then printf '%s\\0' "$@" > "$fixture_out/arguments"; fi
 python -c 'import os,time,pathlib,subprocess,sys; pathlib.Path(os.environ["FLEET_OUT"],"worker-pid").write_text(str(os.getpid())); subprocess.check_call([sys.executable,"-c","pass"]); time.sleep('''+str(sleeping)+''')'
 ''', encoding='utf-8')
             # Reproduce a detached native entry without a valid stdin handle. The
@@ -362,7 +364,7 @@ public static class GateFixtureStdin {
  [DllImport("kernel32.dll")] public static extern bool SetStdHandle(int which, IntPtr handle);
 }'
 [GateFixtureStdin]::SetStdHandle(-10, [IntPtr]::Zero) | Out-Null
-& '''+quote(str(ROOT/'scripts/lib/gate-unit.ps1'))+' '+quote(json.dumps(['fixture.sh']))+'''
+& '''+quote(str(ROOT/'scripts/lib/gate-unit.ps1'))+' '+quote(json.dumps(['fixture.sh', *arguments]))+'''
 exit $LASTEXITCODE
 '''
             argv = ['powershell','-NoProfile','-NonInteractive','-EncodedCommand',
@@ -396,6 +398,9 @@ exit $LASTEXITCODE
                     f'if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }}'],
                     stdin=subprocess.DEVNULL,capture_output=True,timeout=10)
                 self.assertEqual(alive.returncode,0,'native part left '+name+' alive: '+text)
+            if not helper_fail:
+                self.assertEqual((out/'arguments').read_bytes(),
+                                 b''.join(value.encode('utf-8')+b'\0' for value in arguments), text)
             lifecycle = (out/'unit-0.lifecycle.log').read_text()
             self.assertIn('cleanup-end',lifecycle,text)
             # A Git bin/bash launcher has a different PID from its real Bash
@@ -413,6 +418,17 @@ exit $LASTEXITCODE
                 self.assertRegex(name,r'^nrese-build-[0-9]+-[0-9]+$')
                 self.assertIn('cap-attached '+name,lifecycle,text)
             return done
+
+    def test_30_direct_request_arguments_remain_separate(self):
+        # The ordinary first push has metadata plus hundreds of paths. The old
+        # PowerShell @(...ConvertFrom-Json...) made that entire array one filename;
+        # the earlier one-script-argument lifecycle fixtures could not expose it.
+        arguments = ['push', 'a'*40, 'b'*40, 'windows', '0', 'c'*64,
+                     'd'*40, '-C target-cpu=native', 'e'*40, '--']
+        arguments += [f'crates/fixture/src/file-{i}.rs' for i in range(315)]
+        arguments += ['path with spaces/file.rs', 'say "quoted"', 'C:\\path with spaces\\']
+        done = self.exercise(0, 30, arguments=arguments)
+        self.assertEqual(done.returncode, 0, (done.stdout, done.stderr))
 
     def test_20_helper_failure_before_cap_stops_its_waiter_tree(self):
         done = self.exercise(0,30,helper_fail=True)
