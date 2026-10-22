@@ -23,7 +23,7 @@
 //!
 //! The naive evaluator (`naive`, tests and the `oracle` feature only) is the oracle: both compute the same closure.
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
@@ -1944,7 +1944,10 @@ impl TermSet {
 /// the listing read only current facts ([`Current`]).
 struct Representatives {
     same_as: u64,
-    classes: EqualityClasses,
+    classes: Arc<EqualityClasses>,
+    /// The classes as the rules' guards read them ([`super::representatives::ClassGuards`]):
+    /// `classes`, published after each merge.
+    published: super::representatives::SharedClasses,
     /// Former representatives.
     stale: TermSet,
     /// The representatives of classes of two or more.
@@ -1956,7 +1959,16 @@ struct Representatives {
 impl Representatives {
     /// Merges the classes `pairs` equate; returns the terms that lost their place.
     fn merge(&mut self, pairs: &[(u64, u64)]) -> HashSet<u64> {
-        let lost: HashSet<u64> = self.classes.union_all(pairs).into_iter().collect();
+        // The published copy let go of, so that the classes change in place.
+        let mut published = self
+            .published
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        *published = Arc::default();
+        let classes = Arc::make_mut(&mut self.classes);
+        let lost: HashSet<u64> = classes.union_all(pairs).into_iter().collect();
+        *published = Arc::clone(&self.classes);
+        drop(published);
         if !lost.is_empty() {
             self.merges += 1;
             for &term in &lost {
@@ -1972,6 +1984,14 @@ impl Representatives {
     }
 
     /// The facts the merge that took the places of `lost` makes stale, rewritten.
+    /// `rules` as they run over the classes: their term guards decided over them.
+    fn guarded(&self, rules: Vec<Rule>) -> Vec<Rule> {
+        rules
+            .into_iter()
+            .map(|rule| super::representatives::over_classes(rule, self.same_as, &self.published))
+            .collect()
+    }
+
     fn rewrites(&self, store: &Store, lost: &HashSet<u64>) -> Vec<Triple> {
         let mut facts = store.mentioning(lost);
         facts
@@ -2269,7 +2289,8 @@ pub fn materialise_representatives_until(
     };
     let representatives = super::representatives::same_as(rules).map(|same_as| Representatives {
         same_as,
-        classes: EqualityClasses::default(),
+        classes: Default::default(),
+        published: Default::default(),
         stale: TermSet::default(),
         shared: TermSet::default(),
         listing,
@@ -2337,6 +2358,9 @@ fn run(
     let mut regrounding = true;
     // Ground every rule again (rules whose constants were merged, rewritten).
     let mut reground_all = false;
+    // Evaluate the rules with class guards again in full: classes merged, so bindings
+    // they failed may hold now, with no new fact to match.
+    let mut reevaluate = false;
     // Facts to add in the first round, checked against the store: the input's stale
     // facts rewritten, where the input asserts equalities.
     let mut pending: Vec<Triple> = Vec::new();
@@ -2383,6 +2407,9 @@ fn run(
             let mut source = fact_rules(&current, &rules, lists, &mut result.diagnostics);
             if equality.is_some() {
                 source.retain(|r| !is_replacement_rule(r));
+            }
+            if let Some(reps) = &representatives {
+                source = reps.guarded(source);
             }
             // The first round grounds everything; later ones through new schema facts
             // only (list rules in full, deduplicated).
@@ -2437,8 +2464,16 @@ fn run(
         // family derives goes to the family's part of the delta.
         let mut jobs = Vec::new();
         let mut families: Vec<Option<u64>> = Vec::new();
+        let in_full = |r: usize| {
+            r >= evaluated
+                || (reevaluate
+                    && program.rules[r]
+                        .guards
+                        .iter()
+                        .any(|guard| matches!(guard, super::ir::Guard::Classes(_))))
+        };
         for (r, i) in program.variants(&store) {
-            if r < evaluated {
+            if !in_full(r) {
                 let family = program.closed_family(r);
                 let delta = family.map_or(Seg::Delta, Seg::DeltaNotBy);
                 if let Some(job) = Job::variant_reading(&current, &program.rules[r], i, delta) {
@@ -2447,7 +2482,12 @@ fn run(
                 }
             }
         }
-        for (r, rule) in program.rules.iter().enumerate().skip(evaluated) {
+        for (r, rule) in program
+            .rules
+            .iter()
+            .enumerate()
+            .filter(|&(r, _)| in_full(r))
+        {
             if let Some(job) = Job::full(&current, rule) {
                 jobs.push(job);
                 families.push(program.closed_family(r));
@@ -2566,7 +2606,13 @@ fn run(
         phases.merge += clock.elapsed();
         phases.new_facts += new as u64;
         result.counters.store_bytes.push(store.bytes());
-        if new == 0 && !reground_all {
+        reevaluate = merged
+            && program.rules.iter().any(|rule| {
+                rule.guards
+                    .iter()
+                    .any(|guard| matches!(guard, super::ir::Guard::Classes(_)))
+            });
+        if new == 0 && !reground_all && !reevaluate {
             break;
         }
         transitive.observe(&store);
@@ -2588,11 +2634,12 @@ fn run(
             store: &store,
             stale,
         };
-        program.ground(
-            &current,
-            schema,
-            &consistency_rules(&current, &rules, lists),
-        );
+        let checks = consistency_rules(&current, &rules, lists);
+        let checks = match &representatives {
+            Some(reps) => reps.guarded(checks),
+            None => checks,
+        };
+        program.ground(&current, schema, &checks);
     }
     let reads = Reads::of(
         program.rules.iter().chain(
@@ -2642,7 +2689,12 @@ fn run(
         None => store.into_derived(),
         Some(reps) => {
             let derived = list(store, &reps);
-            result.classes = reps.classes;
+            // The rules' published copy let go of first: the classes are moved, not copied.
+            *reps
+                .published
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = Arc::default();
+            result.classes = Arc::unwrap_or_clone(reps.classes);
             result.merges = reps.merges;
             derived
         }

@@ -162,6 +162,15 @@ fn an_upper_bound_with_equality_classes_is_read_expanded() {
         !rows.contains(&"d2".to_owned()),
         "U1's equality is not an answer: {rows:?}"
     );
+    // This read can bind x = d1, whose reflexive pair is omitted from both bounds.
+    assert!(!status.is_complete(), "{:?}", status.reasons());
+    assert!(
+        status.reasons().iter().any(|r| r.contains("eq-ref")),
+        "{:?}",
+        status.reasons()
+    );
+    let (rows, status) = super::queries::query(&dl, "ASK { :d1 owl:sameAs :d2 }");
+    assert_eq!(rows, ["false"], "U1's equality is refuted");
     assert!(status.is_complete(), "{:?}", status.reasons());
 }
 

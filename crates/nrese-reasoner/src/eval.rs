@@ -500,6 +500,11 @@ fn instance(
                     (a, b) => guards.push(Guard::SameList(a, b, index.clone())),
                 }
             }
+            // Decided when the rule is evaluated: whether a class holds identities that
+            // satisfy it changes as classes merge.
+            Guard::Classes(ref class_guards) => {
+                guards.push(Guard::Classes(class_guards.ground(substitution)));
+            }
         }
     }
     let head = match &rule.head {

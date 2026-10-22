@@ -65,6 +65,9 @@ fn closed_predicates_answer_from_the_lower_bound_alone() {
     assert_eq!(rows, ["y"]);
     assert!(status.is_complete(), "{:?}", status.reasons());
     assert_eq!(status.paths, ["closed-predicates"]);
+    // Through U1 as on the RL route: `x owl:sameAs x` is in neither bound.
+    let (_, status) = query(&dl, "ASK { :x owl:sameAs :x }");
+    assert!(!status.is_complete());
     // Non-monotone operators over closed predicates are exact too.
     let (rows, status) = query(&dl, "SELECT ?x { ?x :knows ?y OPTIONAL { ?x :hates ?y } }");
     assert_eq!(rows, ["z"]);
@@ -233,8 +236,17 @@ fn schema_vocabulary_and_variable_predicates_are_not_bounded() {
     );
     let (_, status) = query(&dl, "SELECT ?x { ?x ?p :y }");
     assert!(status.reasons()[0].contains("variable predicate"));
-    // rdf:type and owl:sameAs are bounded.
+    // A variable sameAs read can bind both ends to one term, whose reflexive pair is
+    // omitted from both bounds. Equality between two distinct constants stays decided.
     let (_, status) = query(&dl, "SELECT ?x { ?x owl:sameAs ?y }");
+    assert!(!status.is_complete(), "{:?}", status.reasons());
+    assert!(
+        status.reasons().iter().any(|r| r.contains("eq-ref")),
+        "{:?}",
+        status.reasons()
+    );
+    let (rows, status) = query(&dl, "ASK { :x owl:sameAs :y }");
+    assert_eq!(rows, ["false"]);
     assert!(status.is_complete(), "{:?}", status.reasons());
 }
 
