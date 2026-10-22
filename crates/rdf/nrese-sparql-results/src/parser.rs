@@ -14,6 +14,9 @@ use crate::solution::QuerySolution;
 use crate::tsv;
 use crate::xml::{self, XmlSolutions};
 
+pub(crate) mod scoped;
+pub use scoped::SolutionsCallbacks;
+
 /// Reads query results in a [`QueryResultsFormat`] (JSON, XML or TSV; CSV is lossy and
 /// can't be read).
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +42,26 @@ fn syntax_only(error: QueryResultsParseError) -> QueryResultsSyntaxError {
 impl QueryResultsParser {
     pub fn from_format(format: QueryResultsFormat) -> Self {
         Self { format }
+    }
+
+    /// JSON SELECT results constructed under one invocation owner. The callbacks
+    /// admit storage before allocation and receive owned, already-admitted rows.
+    /// This first scoped entry is JSON-only; ordinary XML/TSV APIs are unchanged.
+    /// Retained variable metadata follows the caller's existing metadata policy.
+    pub fn read_solutions_with<C>(
+        self,
+        bytes: &[u8],
+        max_rows: usize,
+        owner: &mut C,
+        callbacks: &SolutionsCallbacks<C>,
+    ) -> Result<(), QueryResultsParseError> {
+        if self.format != QueryResultsFormat::Json {
+            return Err(QueryResultsSyntaxError::msg(
+                "scoped solutions currently support JSON only",
+            )
+            .into());
+        }
+        scoped::read(bytes, max_rows, owner, callbacks)
     }
 
     /// Results in memory.

@@ -15,6 +15,9 @@ mod value;
 mod writer;
 
 pub use error::{JsonParseError, JsonSyntaxError};
-pub use parser::{JsonEvent, JsonParserState, MAX_DEPTH, ReaderJsonParser, SliceJsonParser};
+pub use parser::{
+    JsonEvent, JsonParserState, JsonSessionCallbacks, MAX_DEPTH, ReaderJsonParser, SliceJsonParser,
+    SliceJsonSession,
+};
 pub use value::{Object, Value};
 pub use writer::{JsonWriter, escape, write_string, write_value};

@@ -132,6 +132,10 @@ build)
   [ -f "$lab" ] || lab=$src/crates/nrese-store/examples/perf_lab.rs
   patched=$(py benches/fast/patches/perf_lab_watchdog.py "$lab")
   case $patched in applied|present) timing=watchdog ;; *) timing=spawn ;; esac
+  observed=$(py benches/fast/patches/perf_lab_reporting.py "$lab") || {
+    log "reporting patch refused $rev: $observed"; exit 2;
+  }
+  case $observed in applied|present|native) ;; *) log "reporting patch refused $rev: $observed"; exit 2 ;; esac
   log "build $rev ($(cd "$src" && rustc -V 2>/dev/null)); layouts to build: ${todo[*]}"
   missing=()
   if [ "${todo[0]}" = 1 ]; then
@@ -161,6 +165,7 @@ build)
   echo "$rev" > "$part/REVISION"
   { echo "revision $rev"; (cd "$src" && rustc -V); echo "missing at this revision: ${missing[*]:-none}";
     echo "measurement patch perf_lab_watchdog: $patched";
+    echo "measurement patch perf_lab_reporting: $observed";
     cat "$part/CAPABILITIES"; } > "$part/BUILD.txt"
   lld=$(lld_of "$part") || { log "build $rev: not linked by the toolchain's LLD"; exit 1; }
   echo "linker $lld" >> "$part/BUILD.txt"

@@ -332,7 +332,7 @@ pub fn support_sets(
                 .zip(program.transitive.iter())
                 .map(|(rule, &p)| (rule, Grounding::Transitive(p))),
         )
-        .filter(|(rule, _)| !rule.body.is_empty() && matches!(rule.head, Head::Facts(_)))
+        .filter(|(rule, _)| !rule.body.is_empty() && rule.head != Head::Inconsistent)
         .collect();
     // The rules each schema fact grounds: run over all their instances in a round where
     // its sets changed.
@@ -410,20 +410,18 @@ pub fn support_sets(
             }
         }
         round::Gather::absorb(&news, bodiless_part);
-        let mut jobs: Vec<(Job<'_>, &[super::ir::Atom], Annotation)> = Vec::new();
+        let mut jobs: Vec<(Job<'_>, &Head, Annotation)> = Vec::new();
         for (k, &(rule, grounding)) in rules.iter().enumerate() {
             // The schema facts' part, once per rule and round: the minimal sets over the
             // alternative groundings.
             let schema = grounding_sets(program, grounding, &sets, cap, &empty);
-            let Head::Facts(heads) = &rule.head else {
-                continue;
-            };
+            let heads = &rule.head;
             if schema.is_empty() {
                 continue;
             }
             // Instances with a changed premise; all of them when a schema fact changed.
             if whole[k] {
-                jobs.extend(Job::full(&source, rule).map(|job| (job, heads.as_slice(), schema)));
+                jobs.extend(Job::full(&source, rule).map(|job| (job, heads, schema)));
             } else {
                 for i in 0..rule.body.len() {
                     let job =
@@ -435,7 +433,7 @@ pub fn support_sets(
                                 if j == i { Seg::Delta } else { Seg::All }
                             },
                         );
-                    jobs.extend(job.map(|job| (job, heads.as_slice(), schema.clone())));
+                    jobs.extend(job.map(|job| (job, heads, schema.clone())));
                 }
             }
         }
@@ -451,7 +449,7 @@ pub fn support_sets(
         // What the round holds beside its tasks' parts: the sets, its delta and its jobs.
         let base = held(sets_now, annotations)
             + delta.bytes().total()
-            + jobs.capacity() * size_of::<(Job<'_>, &[super::ir::Atom], Annotation)>()
+            + jobs.capacity() * size_of::<(Job<'_>, &Head, Annotation)>()
             + tasks.capacity() * size_of::<(usize, std::ops::Range<usize>)>();
         let polling = round::Polling::new(watch, base, unit);
         round::run(&tasks, &news, &polling, &|(j, range), part, tick| {
@@ -461,25 +459,68 @@ pub fn support_sets(
             };
             let (job, heads, schema) = &jobs[*j];
             let mut body = Vec::with_capacity(job.rule.body.len());
-            job.run(&source, range.clone(), &mut poll, &mut |bindings| {
-                if tick.done() {
+            if !job.rule.has_class_guards() && matches!(heads, Head::Facts(_)) {
+                job.run(&source, range.clone(), &mut poll, &mut |bindings| {
+                    if tick.done() {
+                        return;
+                    }
+                    body.clear();
+                    body.extend(
+                        job.rule
+                            .body
+                            .iter()
+                            .map(|atom| super::eval::instantiate_head(atom, bindings)),
+                    );
+                    let from = premise_sets_from(&body, schema, sets_now, cap);
+                    let mut units = 1;
+                    super::eval::for_each_head(heads, bindings, |head| {
+                        let fact = super::eval::instantiate_head(head, bindings);
+                        units += add(part, fact, &from);
+                    });
+                    tick.tick(units, part.bytes());
+                });
+            } else {
+                let mut scratch = super::representatives::GuardWorkspace::default();
+                if scratch.prepare_rule(job.rule, &mut poll).is_err() {
                     return;
                 }
-                body.clear();
-                body.extend(
-                    job.rule
-                        .body
-                        .iter()
-                        .map(|atom| super::eval::instantiate_head(atom, bindings)),
+                job.run_prepared(
+                    &source,
+                    range.clone(),
+                    &mut poll,
+                    &mut scratch,
+                    |bindings, active, scratch| {
+                        if tick.done() {
+                            return false;
+                        }
+                        body.clear();
+                        body.extend(
+                            job.rule
+                                .body
+                                .iter()
+                                .map(|atom| super::eval::instantiate_head(atom, bindings)),
+                        );
+                        let from = premise_sets_from(&body, schema, sets_now, cap);
+                        let mut units = 1;
+                        if super::eval::for_each_head_prepared(
+                            heads,
+                            bindings,
+                            active,
+                            scratch,
+                            |head| {
+                                let fact = super::eval::instantiate_head(head, bindings);
+                                units += add(part, fact, &from);
+                            },
+                        )
+                        .is_err()
+                        {
+                            return false;
+                        }
+                        tick.tick(units, part.bytes());
+                        false
+                    },
                 );
-                let from = premise_sets_from(&body, schema, sets_now, cap);
-                let mut units = 1;
-                for head in heads.iter() {
-                    let fact = super::eval::instantiate_head(head, bindings);
-                    units += add(part, fact, &from);
-                }
-                tick.tick(units, part.bytes());
-            });
+            }
         })
         .map_err(stopped)?;
         drop((jobs, tasks));
@@ -751,7 +792,7 @@ fn body_rules(program: &GroundProgram) -> Vec<(std::borrow::Cow<'_, Rule>, Groun
                 Grounding::Transitive(p),
             )
         }))
-        .filter(|(rule, _)| !rule.body.is_empty() && matches!(rule.head, Head::Facts(_)))
+        .filter(|(rule, _)| !rule.body.is_empty() && rule.head != Head::Inconsistent)
         .collect()
 }
 
@@ -792,21 +833,55 @@ fn forward_cone<S: Source + Sync + ?Sized>(
                 return;
             };
             let (k, job) = &jobs[*j];
-            let Head::Facts(heads) = &rules[*k].0.head else {
-                return;
-            };
-            job.run(&changed, range.clone(), &mut poll, &mut |bindings| {
-                if tick.done() {
+            let heads = &rules[*k].0.head;
+            if !job.rule.has_class_guards() && matches!(heads, Head::Facts(_)) {
+                job.run(&changed, range.clone(), &mut poll, &mut |bindings| {
+                    if tick.done() {
+                        return;
+                    }
+                    super::eval::for_each_head(heads, bindings, |head| {
+                        let fact = instantiate_head(head, bindings);
+                        if !affected_now.contains(&fact) {
+                            part.insert(fact);
+                        }
+                    });
+                    tick.tick(1, table_bytes::<Triple, ()>(part.capacity()));
+                });
+            } else {
+                let mut scratch = super::representatives::GuardWorkspace::default();
+                if scratch.prepare_rule(job.rule, &mut poll).is_err() {
                     return;
                 }
-                for head in heads {
-                    let fact = instantiate_head(head, bindings);
-                    if !affected_now.contains(&fact) {
-                        part.insert(fact);
-                    }
-                }
-                tick.tick(1, table_bytes::<Triple, ()>(part.capacity()));
-            });
+                job.run_prepared(
+                    &changed,
+                    range.clone(),
+                    &mut poll,
+                    &mut scratch,
+                    |bindings, active, scratch| {
+                        if tick.done() {
+                            return false;
+                        }
+                        if super::eval::for_each_head_prepared(
+                            heads,
+                            bindings,
+                            active,
+                            scratch,
+                            |head| {
+                                let fact = instantiate_head(head, bindings);
+                                if !affected_now.contains(&fact) {
+                                    part.insert(fact);
+                                }
+                            },
+                        )
+                        .is_err()
+                        {
+                            return false;
+                        }
+                        tick.tick(1, table_bytes::<Triple, ()>(part.capacity()));
+                        false
+                    },
+                );
+            }
         });
         match ran {
             Ok(()) => {}
@@ -1092,34 +1167,80 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
                     return;
                 };
                 let (k, job) = &jobs[*j];
-                let Head::Facts(heads) = &rules[*k].0.head else {
-                    return;
-                };
+                let heads = &rules[*k].0.head;
                 let mut body = Vec::with_capacity(job.rule.body.len());
-                job.run(&source, range.clone(), &mut poll, &mut |bindings| {
-                    if tick.done() {
+                if !job.rule.has_class_guards() && matches!(heads, Head::Facts(_)) {
+                    job.run(&source, range.clone(), &mut poll, &mut |bindings| {
+                        if tick.done() {
+                            return;
+                        }
+                        body.clear();
+                        body.extend(
+                            job.rule
+                                .body
+                                .iter()
+                                .map(|atom| instantiate_head(atom, bindings)),
+                        );
+                        let mut units = 1;
+                        if premises_in_closure(&body) {
+                            let from = premise_sets_from(&body, &schemas[*k], &lookup, cap);
+                            super::eval::for_each_head(heads, bindings, |head| {
+                                let fact = instantiate_head(head, bindings);
+                                if members.contains(&fact) && !from.is_empty() {
+                                    units += from.sets.len() as u32;
+                                    part.put(fact, from.clone(), cap);
+                                }
+                            });
+                        }
+                        tick.tick(units, part.bytes());
+                    });
+                } else {
+                    let mut scratch = super::representatives::GuardWorkspace::default();
+                    if scratch.prepare_rule(job.rule, &mut poll).is_err() {
                         return;
                     }
-                    body.clear();
-                    body.extend(
-                        job.rule
-                            .body
-                            .iter()
-                            .map(|atom| instantiate_head(atom, bindings)),
-                    );
-                    let mut units = 1;
-                    if premises_in_closure(&body) {
-                        let from = premise_sets_from(&body, &schemas[*k], &lookup, cap);
-                        for head in heads {
-                            let fact = instantiate_head(head, bindings);
-                            if members.contains(&fact) && !from.is_empty() {
-                                units += from.sets.len() as u32;
-                                part.put(fact, from.clone(), cap);
+                    job.run_prepared(
+                        &source,
+                        range.clone(),
+                        &mut poll,
+                        &mut scratch,
+                        |bindings, active, scratch| {
+                            if tick.done() {
+                                return false;
                             }
-                        }
-                    }
-                    tick.tick(units, part.bytes());
-                });
+                            body.clear();
+                            body.extend(
+                                job.rule
+                                    .body
+                                    .iter()
+                                    .map(|atom| instantiate_head(atom, bindings)),
+                            );
+                            let mut units = 1;
+                            if premises_in_closure(&body) {
+                                let from = premise_sets_from(&body, &schemas[*k], &lookup, cap);
+                                if super::eval::for_each_head_prepared(
+                                    heads,
+                                    bindings,
+                                    active,
+                                    scratch,
+                                    |head| {
+                                        let fact = instantiate_head(head, bindings);
+                                        if members.contains(&fact) && !from.is_empty() {
+                                            units += from.sets.len() as u32;
+                                            part.put(fact, from.clone(), cap);
+                                        }
+                                    },
+                                )
+                                .is_err()
+                                {
+                                    return false;
+                                }
+                            }
+                            tick.tick(units, part.bytes());
+                            false
+                        },
+                    );
+                }
             })
             .map_err(stopped)?;
         }

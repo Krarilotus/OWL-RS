@@ -40,7 +40,7 @@ use std::borrow::Cow;
 use hashbrown::HashSet;
 use rayon::prelude::*;
 
-use super::batch::{Equality, Store, check, is_replacement_rule, sorted};
+use super::batch::{Equality, EqualityRule, Store, check, sorted};
 use super::eval::{
     AllFacts, GroundProgram, Job, NEVER, RuleKey, Schema, Seg, Source, Stop, instantiate_head,
     rule_key, run_jobs, run_jobs_acyclic, transitive_predicate,
@@ -316,7 +316,7 @@ pub fn update_with<B: Base + ?Sized>(
             hidden: &inserted_set,
             extra: &Store::new(deleted.to_vec()),
         };
-        super::recursion::non_recursive(&old_program.rules, schema.rdf_type(), &|term| {
+        super::recursion::non_recursive_program(old_program, schema.rdf_type(), &|term| {
             super::recursion::same_as_partners(&before, same_as, term)
         })
     };
@@ -411,9 +411,9 @@ pub fn update_with<B: Base + ?Sized>(
                             old.scan([None, Some(p), None], Seg::All, &mut |t| component.push(t));
                         }
                         None if rule.body.is_empty() => {
-                            if let Head::Facts(heads) = &rule.head {
-                                bodiless.extend(heads.iter().map(|h| instantiate_head(h, &[])));
-                            }
+                            super::eval::for_each_head(&rule.head, &[], |h| {
+                                bodiless.push(instantiate_head(h, &[]))
+                            });
                         }
                         None => fresh.push(rule.clone()),
                     }
@@ -429,7 +429,7 @@ pub fn update_with<B: Base + ?Sized>(
             let (mut jobs, mut equality_jobs) = (Vec::new(), Vec::new());
             for (r, i) in old_program.variants(&extra) {
                 let rule = &old_program.rules[r];
-                if !region.is_empty() && is_equality_rule(rule) {
+                if !region.is_empty() && old_program.equality_rule(r) != EqualityRule::Generic {
                     equality_jobs.extend(Job::variant(&outside, rule, i));
                 } else {
                     jobs.extend(Job::variant(&old, rule, i));
@@ -670,7 +670,8 @@ pub fn update_with<B: Base + ?Sized>(
             let not_equality: Vec<bool> = program
                 .rules
                 .iter()
-                .map(|rule| !is_equality_rule(rule))
+                .enumerate()
+                .map(|(r, _)| program.equality_rule(r) == EqualityRule::Generic)
                 .collect();
             let by_rules: Vec<Triple> = open
                 .par_iter()
@@ -761,7 +762,6 @@ pub fn update_with<B: Base + ?Sized>(
     // The equality module replaces eq-rep-s/p/o here, as in the batch executor.
     let mut equality = Equality::for_rules(rules.rules);
     let module_equality = equality.is_some();
-    let replaced = |rule: &Rule| module_equality && is_replacement_rule(rule);
     let mut reclose = recloses;
     loop {
         check_stop()?;
@@ -771,14 +771,24 @@ pub fn update_with<B: Base + ?Sized>(
             hidden: &hidden,
             extra: &extra,
         };
-        // Instances through new schema facts, and list rules from new list facts. They
-        // are appended, so the new ones are `evaluated..`.
+        // New instances are appended. A retained replacement can also first become
+        // generic through a newly grounded grouped origin and must read old data.
         let evaluated = program.rules.len();
+        let mut reactivated = Vec::new();
         let transitive_before = program.transitive.clone();
         let mut delta_facts = Vec::new();
         extra.scan([None, None, None], Seg::Delta, &mut |f| delta_facts.push(f));
         if delta_facts.iter().any(|&f| schema.is_schema_fact(f)) {
-            program.to_mut().ground_delta(&state, schema, &schema_rules);
+            reactivated = program
+                .to_mut()
+                .ground_delta(&state, schema, &schema_rules)
+                .0;
+            if module_equality {
+                reactivated.retain(|&r| r < evaluated);
+                reactivated.sort_unstable();
+            } else {
+                reactivated.clear();
+            }
         }
         if delta_facts.iter().any(|&f| rules.is_list_fact(f))
             && let Some(vocabulary) = rules.lists
@@ -797,13 +807,19 @@ pub fn update_with<B: Base + ?Sized>(
         candidates.retain(|&f| !state.contains(f));
         let mut jobs = Vec::new();
         for (r, i) in program.variants(&extra) {
-            if r < evaluated && !replaced(&program.rules[r]) {
+            if r < evaluated
+                && reactivated.binary_search(&r).is_err()
+                && !(module_equality && program.equality_rule(r) == EqualityRule::Replacement)
+            {
                 jobs.extend(Job::variant(&state, &program.rules[r], i));
             }
         }
-        for rule in &program.rules[evaluated..] {
-            if !replaced(rule) {
-                jobs.extend(Job::full(&state, rule));
+        for r in reactivated
+            .into_iter()
+            .chain(evaluated..program.rules.len())
+        {
+            if !(module_equality && program.equality_rule(r) == EqualityRule::Replacement) {
+                jobs.extend(Job::full(&state, &program.rules[r]));
             }
         }
         candidates.extend(run_jobs(&state, &jobs, &|fact| !state.contains(fact), stop));
@@ -1036,15 +1052,6 @@ fn asserted_mentioning<B: Base + ?Sized>(base: &B, terms: &HashSet<u64>) -> Hash
 /// Whether `fact` mentions one of `terms`.
 fn mentions(terms: &HashSet<u64>, fact: Triple) -> bool {
     !terms.is_empty() && fact.iter().any(|term| terms.contains(term))
-}
-
-/// The equality rules, which a recomputed region leaves out of overdeletion and
-/// rederivation ([`policy::Plan::Recompute`]).
-fn is_equality_rule(rule: &Rule) -> bool {
-    matches!(
-        rule.name.as_str(),
-        "eq-rep-s" | "eq-rep-p" | "eq-rep-o" | "eq-sym" | "eq-trans"
-    )
 }
 
 /// A source whose delta leaves out the facts of the region being recomputed: what the

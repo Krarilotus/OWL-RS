@@ -839,11 +839,40 @@ impl PackedKeys {
         if start >= end {
             return;
         }
+        let mut column = Vec::with_capacity(BLOCK);
+        let result: Result<(), std::convert::Infallible> = self.try_groups(
+            start,
+            end,
+            position,
+            &mut column,
+            |_| Ok(()),
+            |value, from, to, _| {
+                f(value, from, to);
+                Ok(())
+            },
+        );
+        result.unwrap_or_else(|never| match never {});
+    }
+
+    /// The same physical walk, with caller-owned column storage and fallible checkpoints
+    /// and emission. Failure stops before another group is decoded or allocated.
+    pub(crate) fn try_groups<E, W: FnMut(u32) -> Result<(), E>>(
+        &self,
+        start: usize,
+        end: usize,
+        position: usize,
+        column: &mut Vec<u64>,
+        mut work: W,
+        mut f: impl FnMut(u64, usize, usize, &mut W) -> Result<(), E>,
+    ) -> Result<(), E> {
+        if start >= end {
+            return Ok(());
+        }
         let mut value = self.get(start)[position];
         let mut from = start;
         let mut i = start;
-        let mut column = Vec::with_capacity(BLOCK);
         while i < end {
+            work(1)?;
             let mut block = i / BLOCK;
             if i == block * BLOCK {
                 // Blocks whose first key has the current value: everything before the last
@@ -853,15 +882,18 @@ impl PackedKeys {
                     && (last + step) * BLOCK < end
                     && self.firsts[last + step][position] == value
                 {
+                    work(1)?;
                     last += step;
                     step *= 2;
                 }
                 while step > 1 {
+                    work(1)?;
                     step /= 2;
                     if last + step < self.firsts.len()
                         && (last + step) * BLOCK < end
                         && self.firsts[last + step][position] == value
                     {
+                        work(1)?;
                         last += step;
                     }
                 }
@@ -877,7 +909,7 @@ impl PackedKeys {
                 let constant = (u64::from(header.tag_min[position]) << TAG_SHIFT)
                     | header.payload_min[position];
                 if constant != value {
-                    f(value, from, i);
+                    f(value, from, i, &mut work)?;
                     (value, from) = (constant, i);
                 }
             } else {
@@ -887,18 +919,20 @@ impl PackedKeys {
                     i - block * BLOCK,
                     block_end - block * BLOCK,
                     position,
-                    &mut column,
+                    column,
                 );
                 for (k, &v) in column.iter().enumerate() {
+                    work(1)?;
                     if v != value {
-                        f(value, from, i + k);
+                        f(value, from, i + k, &mut work)?;
                         (value, from) = (v, i + k);
                     }
                 }
             }
             i = block_end;
         }
-        f(value, from, end);
+        f(value, from, end, &mut work)?;
+        Ok(())
     }
 
     /// Appends, for each of `positions`, the key component at that position of the keys

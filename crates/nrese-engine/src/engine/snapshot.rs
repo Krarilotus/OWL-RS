@@ -10,6 +10,7 @@ use super::{ReadModel, Stack, Version};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::{Dictionary, TermId, TermKind};
 
+mod counts;
 mod cursor;
 pub use cursor::{ProbeCursor, Seek};
 
