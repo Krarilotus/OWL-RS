@@ -3,7 +3,7 @@ use std::sync::{Arc, RwLock};
 use nrese_reasoner::{ReasonerConfig, ReasonerService};
 
 use super::attribution::attribute_reject_delta;
-use super::command::{MutationCommand, MutationCommitReport};
+use super::command::{MutationCommand, MutationCommitReport, MutationKind};
 use super::error::{MutationError, MutationReject};
 use super::record::ReasoningRunRecord;
 use super::ticket::MutationTicket;
@@ -210,6 +210,7 @@ impl MutationPipeline {
             services: self.store.services(),
             namespaces: self.store.namespaces().all(),
         };
+        let shacl_resources = context.resources(Default::default());
         let report = command
             .apply(&mut tx, requester, &context)
             .map_err(store_error)?;
@@ -325,9 +326,9 @@ impl MutationPipeline {
                     attribution: None,
                 })));
             }
-            crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph)
+            crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph, &shacl_resources)
                 .map_err(store_error)?;
-            self.shacl_gate(&tx)?;
+            self.shacl_gate(&tx, &shacl_resources, kind)?;
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }
@@ -374,8 +375,9 @@ impl MutationPipeline {
 
         // Without reasoning, commits don't maintain the inferred stack.
         self.store.invalidate_reasoning().map_err(store_error)?;
-        crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph).map_err(store_error)?;
-        self.shacl_gate(&tx)?;
+        crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph, &shacl_resources)
+            .map_err(store_error)?;
+        self.shacl_gate(&tx, &shacl_resources, kind)?;
         if !ticket.begin_commit() {
             return Err(MutationError::Cancelled);
         }
@@ -388,13 +390,24 @@ impl MutationPipeline {
 
     /// The SHACL commit gate (C2): validates what the transaction's changes can affect,
     /// after reasoning, and rejects the commit if the policy says so.
-    fn shacl_gate(&self, tx: &nrese_engine::Transaction<'_>) -> Result<(), MutationError> {
+    fn shacl_gate(
+        &self,
+        tx: &nrese_engine::Transaction<'_>,
+        resources: &nrese_sparql::Resources,
+        kind: MutationKind,
+    ) -> Result<(), MutationError> {
         let gate = self.store.config().shacl_gate;
         if gate == ShaclGate::Off {
             return Ok(());
         }
-        let report = crate::shacl::introduced(tx, &self.store.config().shapes_graph)
-            .map_err(|error| MutationError::Gate(error.to_string()))?;
+        let report = crate::shacl::introduced(tx, &self.store.config().shapes_graph, resources)
+            .map_err(|error| match error {
+                StoreError::SparqlEvaluation(nrese_sparql::QueryEvaluationError::Cancelled) => {
+                    MutationError::Cancelled
+                }
+                source @ StoreError::SparqlEvaluation(_) => MutationError::Store { kind, source },
+                error => MutationError::Gate(error.to_string()),
+            })?;
         let Some(report) = report else {
             return Ok(());
         };

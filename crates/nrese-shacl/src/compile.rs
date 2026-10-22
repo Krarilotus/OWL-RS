@@ -6,17 +6,20 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::str::FromStr;
+use std::sync::Arc;
+
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation, Stop, Ticker};
 
 use nrese_engine::{GraphSelector, TermId, TermKind};
 use nrese_rdf::{Term, Variable};
-use nrese_sparql::ReadView;
 use nrese_sparql::value::{Value, compile_regex};
+use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 use nrese_sparql_syntax::{Query, SparqlParser};
 
 use crate::graph::{GraphView, Selection};
 use crate::model::{
     Bound, Component, Constraint, Logical, NodeKind, Path, SH, Severity, Shape, ShapeRef, Shapes,
-    SparqlCheck, Target,
+    SparqlCheck, SparqlProgram, Target,
 };
 use crate::sparql;
 
@@ -49,8 +52,77 @@ impl std::fmt::Display for ShapeError {
 
 impl std::error::Error for ShapeError {}
 
-/// Compiles the shapes in `shapes_graph`.
-pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes, Vec<ShapeError>> {
+fn stopped(stop: Stop) -> QueryEvaluationError {
+    match stop {
+        Stop::Cancelled => QueryEvaluationError::Cancelled,
+        Stop::Memory(error) => QueryEvaluationError::MemoryLimit(error),
+        error => QueryEvaluationError::Unexpected(error.to_string()),
+    }
+}
+
+/// Owned, move-only shape diagnostics. Borrowing never detaches their reservation.
+#[derive(Debug)]
+pub struct ShapeErrors {
+    errors: Vec<ShapeError>,
+    _held: Reservation,
+}
+
+impl ShapeErrors {
+    pub fn errors(&self) -> &[ShapeError] {
+        &self.errors
+    }
+    pub fn iter(&self) -> std::slice::Iter<'_, ShapeError> {
+        self.errors.iter()
+    }
+}
+
+impl std::fmt::Display for ShapeErrors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, error) in self.errors.iter().enumerate() {
+            if i != 0 {
+                f.write_str("; ")?;
+            }
+            std::fmt::Display::fmt(error, f)?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for ShapeErrors {}
+
+/// Malformed shapes and operational refusal/cancellation are distinct.
+#[derive(Debug)]
+pub enum CompileError {
+    Shapes(ShapeErrors),
+    Evaluation(QueryEvaluationError),
+}
+impl std::fmt::Display for CompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shapes(errors) => std::fmt::Display::fmt(errors, f),
+            Self::Evaluation(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+impl std::error::Error for CompileError {}
+impl From<QueryEvaluationError> for CompileError {
+    fn from(error: QueryEvaluationError) -> Self {
+        Self::Evaluation(error)
+    }
+}
+impl From<BudgetExceeded> for CompileError {
+    fn from(error: BudgetExceeded) -> Self {
+        Self::Evaluation(QueryEvaluationError::MemoryLimit(error))
+    }
+}
+
+/// Compiles shapes with the request's existing resource envelope.
+pub fn compile<V: ReadView>(
+    view: &V,
+    shapes_graph: Selection,
+    resources: &Resources,
+) -> Result<Shapes, CompileError> {
+    resources.check()?;
+    let budget = Arc::new(resources.memory.part());
     let graph = GraphView::new(view, shapes_graph);
     let mut compiler = Compiler {
         rdf_type: graph.iri(&format!("{RDF}type")),
@@ -58,12 +130,20 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
         rdf_rest: graph.iri(&format!("{RDF}rest")),
         rdf_nil: graph.iri(&format!("{RDF}nil")),
         graph,
-        shapes: Vec::new(),
+        resources,
+        ticker: resources.stop().ticker().map_err(stopped)?,
+        budget: budget.clone(),
+        shapes: ChargedVec::new(budget.clone()),
         index: HashMap::new(),
-        errors: Vec::new(),
+        errors: ChargedVec::new(budget.clone()),
+        diagnostics: Reservation::new(budget.clone()),
         components: Vec::new(),
+        programs: ChargedVec::new(budget.clone()),
+        parameter_values: ChargedVec::new(budget.clone()),
+        held: Reservation::new(budget.clone()),
     };
-    compiler.components = compiler.discover_components();
+    compiler.components = compiler.discover_components()?;
+    resources.check()?;
     let mut roots: BTreeSet<TermId> = BTreeSet::new();
     for target in [
         "targetNode",
@@ -79,33 +159,59 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
         roots.extend(compiler.instances(&format!("{SH}{class}")));
     }
     for root in roots {
-        compiler.shape(root);
+        compiler.shape(root)?;
     }
-    if compiler.errors.is_empty() {
-        Ok(Shapes {
-            shapes: compiler.shapes,
-            index: compiler.index,
-            graph: match shapes_graph.graphs {
-                GraphSelector::Exact(graph) if !graph.is_default_graph() => Some(graph),
-                _ => None,
-            },
-        })
-    } else {
-        Err(compiler.errors)
+    resources.check()?;
+    if !compiler.errors.is_empty() {
+        let (errors, held) = compiler.errors.into_parts();
+        compiler.diagnostics.absorb(held);
+        return Err(CompileError::Shapes(ShapeErrors {
+            errors,
+            _held: compiler.diagnostics,
+        }));
     }
+    compiler
+        .held
+        .charge(nrese_exec::map_bytes::<(TermId, ShapeRef)>(
+            compiler.index.capacity(),
+        ))?;
+    let (shapes, shapes_held) = compiler.shapes.into_parts();
+    let (programs, programs_held) = compiler.programs.into_parts();
+    let (parameter_values, parameters_held) = compiler.parameter_values.into_parts();
+    compiler.held.absorb(shapes_held);
+    compiler.held.absorb(programs_held);
+    compiler.held.absorb(parameters_held);
+    Ok(Shapes {
+        shapes,
+        index: compiler.index,
+        graph: match shapes_graph.graphs {
+            GraphSelector::Exact(graph) if !graph.is_default_graph() => Some(graph),
+            _ => None,
+        },
+        programs,
+        parameter_values,
+        _held: Some(compiler.held),
+    })
 }
 
 struct Compiler<'a, V: ReadView> {
     graph: GraphView<'a, V>,
+    resources: &'a Resources,
+    ticker: Ticker,
+    budget: Arc<Budget>,
+    programs: ChargedVec<SparqlProgram>,
+    parameter_values: ChargedVec<TermId>,
     rdf_type: Option<TermId>,
     rdf_first: Option<TermId>,
     rdf_rest: Option<TermId>,
     rdf_nil: Option<TermId>,
-    shapes: Vec<Shape>,
+    shapes: ChargedVec<Shape>,
     index: HashMap<TermId, ShapeRef>,
-    errors: Vec<ShapeError>,
+    errors: ChargedVec<ShapeError>,
     /// The shapes graph's SPARQL-based constraint components.
     components: Vec<ComponentDef>,
+    held: Reservation,
+    diagnostics: Reservation,
 }
 
 impl<V: ReadView> Compiler<'_, V> {
@@ -141,20 +247,28 @@ impl<V: ReadView> Compiler<'_, V> {
             .map_or_else(|| format!("#{}", id.raw()), |term| term.to_string())
     }
 
-    fn error(&mut self, shape: TermId, message: impl Into<String>) {
-        self.errors.push(ShapeError {
+    fn error(
+        &mut self,
+        shape: TermId,
+        message: impl Into<String>,
+    ) -> Result<(), QueryEvaluationError> {
+        let error = ShapeError {
             shape: self.text(shape),
             message: message.into(),
-        });
+        };
+        self.diagnostics.charge(error.shape.capacity())?;
+        self.diagnostics.charge(error.message.capacity())?;
+        self.errors.push(error)?;
+        Ok(())
     }
 
     /// The single value of `local`, if any; more than one is an error.
-    fn one(&mut self, node: TermId, local: &str) -> Option<TermId> {
+    fn one(&mut self, node: TermId, local: &str) -> Result<Option<TermId>, QueryEvaluationError> {
         let values = self.values(node, local);
         if values.len() > 1 {
-            self.error(node, format!("more than one sh:{local}"));
+            self.error(node, format!("more than one sh:{local}"))?;
         }
-        values.first().copied()
+        Ok(values.first().copied())
     }
 
     fn literal(&self, id: TermId) -> Option<nrese_rdf::Literal> {
@@ -165,14 +279,19 @@ impl<V: ReadView> Compiler<'_, V> {
     }
 
     /// A non-negative integer parameter.
-    fn count(&mut self, node: TermId, id: TermId, local: &str) -> Option<u64> {
+    fn count(
+        &mut self,
+        node: TermId,
+        id: TermId,
+        local: &str,
+    ) -> Result<Option<u64>, QueryEvaluationError> {
         let count = self
             .literal(id)
             .and_then(|literal| u64::from_str(literal.value()).ok());
         if count.is_none() {
-            self.error(node, format!("sh:{local} isn't a non-negative integer"));
+            self.error(node, format!("sh:{local} isn't a non-negative integer"))?;
         }
-        count
+        Ok(count)
     }
 
     /// Whether a boolean parameter is switched on. Only the literal `true` does it: the
@@ -259,23 +378,29 @@ impl<V: ReadView> Compiler<'_, V> {
     }
 
     /// The shapes in the list that is the value of a logical parameter.
-    fn shape_list(&mut self, node: TermId, head: TermId, local: &str) -> Vec<ShapeRef> {
+    fn shape_list(
+        &mut self,
+        node: TermId,
+        head: TermId,
+        local: &str,
+    ) -> Result<Vec<ShapeRef>, QueryEvaluationError> {
         match self.list(head) {
             Ok(members) => members
                 .into_iter()
                 .map(|member| self.shape(member))
                 .collect(),
             Err(problem) => {
-                self.error(node, format!("sh:{local} {problem}"));
-                Vec::new()
+                self.error(node, format!("sh:{local} {problem}"))?;
+                Ok(Vec::new())
             }
         }
     }
 
     /// Compiles `node` as a shape (once), and the shapes it refers to.
-    fn shape(&mut self, node: TermId) -> ShapeRef {
+    fn shape(&mut self, node: TermId) -> Result<ShapeRef, QueryEvaluationError> {
+        self.resources.check()?;
         if let Some(&shape) = self.index.get(&node) {
-            return shape;
+            return Ok(shape);
         }
         let shape = self.shapes.len();
         self.index.insert(node, shape);
@@ -289,15 +414,20 @@ impl<V: ReadView> Compiler<'_, V> {
             severity: Severity::Violation,
             messages: Vec::new(),
             deactivated: false,
-        });
+        })?;
 
-        let path = self.one(node, "path").and_then(|path| {
-            self.path(path, 0)
-                .map_err(|problem| self.error(node, problem))
-                .ok()
-        });
-        let targets = self.targets(node);
-        let severity = match self.one(node, "severity") {
+        let path = match self.one(node, "path")? {
+            None => None,
+            Some(path) => match self.path(path, 0) {
+                Ok(path) => Some(path),
+                Err(problem) => {
+                    self.error(node, problem)?;
+                    None
+                }
+            },
+        };
+        let targets = self.targets(node)?;
+        let severity = match self.one(node, "severity")? {
             None => Severity::Violation,
             Some(severity) if Some(severity) == self.sh("Violation") => Severity::Violation,
             Some(severity) if Some(severity) == self.sh("Warning") => Severity::Warning,
@@ -305,10 +435,12 @@ impl<V: ReadView> Compiler<'_, V> {
             Some(severity) => Severity::Other(severity),
         };
         let deactivated = self
-            .one(node, "deactivated")
+            .one(node, "deactivated")?
             .is_some_and(|value| self.is_true(value));
         let messages = self.values(node, "message");
-        let constraints = self.constraints(node, path.as_ref());
+        let constraints = self.constraints(node, path.as_ref())?;
+        let (constraints, constraints_held) = constraints.into_parts();
+        self.held.absorb(constraints_held);
         self.shapes[shape] = Shape {
             node,
             path,
@@ -318,10 +450,10 @@ impl<V: ReadView> Compiler<'_, V> {
             messages,
             deactivated,
         };
-        shape
+        Ok(shape)
     }
 
-    fn targets(&mut self, node: TermId) -> Vec<Target> {
+    fn targets(&mut self, node: TermId) -> Result<Vec<Target>, QueryEvaluationError> {
         let mut targets = Vec::new();
         targets.extend(
             self.values(node, "targetNode")
@@ -332,7 +464,7 @@ impl<V: ReadView> Compiler<'_, V> {
             if class.kind() == TermKind::Iri {
                 targets.push(Target::Class(class));
             } else {
-                self.error(node, "sh:targetClass isn't an IRI");
+                self.error(node, "sh:targetClass isn't an IRI")?;
             }
         }
         targets.extend(
@@ -351,26 +483,30 @@ impl<V: ReadView> Compiler<'_, V> {
         if is_shape && (self.is_a(node, RDFS_CLASS) || self.is_a(node, OWL_CLASS)) {
             targets.push(Target::Class(node));
         }
-        targets
+        Ok(targets)
     }
 
-    fn constraints(&mut self, node: TermId, path: Option<&Path>) -> Vec<Constraint> {
-        let mut out = Vec::new();
+    fn constraints(
+        &mut self,
+        node: TermId,
+        path: Option<&Path>,
+    ) -> Result<ChargedVec<Constraint>, QueryEvaluationError> {
+        let mut out = ChargedVec::new(self.budget.clone());
 
         // Value type.
         for class in self.values(node, "class") {
             if class.kind() == TermKind::Iri {
-                out.push(Constraint::Class(class));
+                out.push(Constraint::Class(class))?;
             } else {
-                self.error(node, "sh:class isn't an IRI");
+                self.error(node, "sh:class isn't an IRI")?;
             }
         }
         for datatype in self.values(node, "datatype") {
             match self.graph.decode(datatype) {
                 Some(Term::NamedNode(datatype)) => {
-                    out.push(Constraint::Datatype(datatype.into_string()));
+                    out.push(Constraint::Datatype(datatype.into_string()))?;
                 }
-                _ => self.error(node, "sh:datatype isn't an IRI"),
+                _ => self.error(node, "sh:datatype isn't an IRI")?,
             }
         }
         for kind in self.values(node, "nodeKind") {
@@ -383,23 +519,25 @@ impl<V: ReadView> Compiler<'_, V> {
                 ("IRIOrLiteral", NodeKind::IriOrLiteral),
             ];
             match kinds.iter().find(|(local, _)| self.sh(local) == Some(kind)) {
-                Some(&(_, kind)) => out.push(Constraint::NodeKind(kind)),
-                None => self.error(node, "sh:nodeKind isn't one of the six node kinds"),
+                Some(&(_, kind)) => out.push(Constraint::NodeKind(kind))?,
+                None => self.error(node, "sh:nodeKind isn't one of the six node kinds")?,
             }
         }
 
         // Cardinality.
         for value in self.values(node, "minCount") {
-            out.extend(
-                self.count(node, value, "minCount")
+            out.extend_bounded(
+                1,
+                self.count(node, value, "minCount")?
                     .map(Constraint::MinCount),
-            );
+            )?;
         }
         for value in self.values(node, "maxCount") {
-            out.extend(
-                self.count(node, value, "maxCount")
+            out.extend_bounded(
+                1,
+                self.count(node, value, "maxCount")?
                     .map(Constraint::MaxCount),
-            );
+            )?;
         }
 
         // Value range.
@@ -412,28 +550,30 @@ impl<V: ReadView> Compiler<'_, V> {
             for value in self.values(node, local) {
                 match self.graph.decode(value) {
                     Some(term @ Term::Literal(_)) => {
-                        out.push(Constraint::Range(bound, Value::of(&term)));
+                        out.push(Constraint::Range(bound, Value::of(&term)))?;
                     }
-                    _ => self.error(node, format!("sh:{local} isn't a literal")),
+                    _ => self.error(node, format!("sh:{local} isn't a literal"))?,
                 }
             }
         }
 
         // Strings.
         for value in self.values(node, "minLength") {
-            out.extend(
-                self.count(node, value, "minLength")
+            out.extend_bounded(
+                1,
+                self.count(node, value, "minLength")?
                     .map(Constraint::MinLength),
-            );
+            )?;
         }
         for value in self.values(node, "maxLength") {
-            out.extend(
-                self.count(node, value, "maxLength")
+            out.extend_bounded(
+                1,
+                self.count(node, value, "maxLength")?
                     .map(Constraint::MaxLength),
-            );
+            )?;
         }
         let flags = self
-            .one(node, "flags")
+            .one(node, "flags")?
             .and_then(|flags| self.literal(flags))
             .map(|flags| flags.value().to_owned())
             .unwrap_or_default();
@@ -442,8 +582,8 @@ impl<V: ReadView> Compiler<'_, V> {
                 .literal(pattern)
                 .and_then(|pattern| compile_regex(pattern.value(), &flags));
             match regex {
-                Some(regex) => out.push(Constraint::Pattern(regex)),
-                None => self.error(node, "sh:pattern isn't a valid regular expression"),
+                Some(regex) => out.push(Constraint::Pattern(regex))?,
+                None => self.error(node, "sh:pattern isn't a valid regular expression")?,
             }
         }
         for languages in self.values(node, "languageIn") {
@@ -454,15 +594,15 @@ impl<V: ReadView> Compiler<'_, V> {
                     .collect()
             });
             match ranges {
-                Some(ranges) => out.push(Constraint::LanguageIn(ranges)),
-                None => self.error(node, "sh:languageIn isn't a list of strings"),
+                Some(ranges) => out.push(Constraint::LanguageIn(ranges))?,
+                None => self.error(node, "sh:languageIn isn't a list of strings")?,
             }
         }
         if self
-            .one(node, "uniqueLang")
+            .one(node, "uniqueLang")?
             .is_some_and(|value| self.is_true(value))
         {
-            out.push(Constraint::UniqueLang);
+            out.push(Constraint::UniqueLang)?;
         }
 
         // Property pairs.
@@ -475,16 +615,16 @@ impl<V: ReadView> Compiler<'_, V> {
         for (local, make) in pairs {
             for property in self.values(node, local) {
                 if property.kind() == TermKind::Iri {
-                    out.push(make(property));
+                    out.push(make(property))?;
                 } else {
-                    self.error(node, format!("sh:{local} isn't an IRI"));
+                    self.error(node, format!("sh:{local} isn't an IRI"))?;
                 }
             }
         }
 
         // Logic.
         for shape in self.values(node, "not") {
-            out.push(Constraint::Not(self.shape(shape)));
+            out.push(Constraint::Not(self.shape(shape)?))?;
         }
         for (local, logical) in [
             ("and", Logical::And),
@@ -492,60 +632,66 @@ impl<V: ReadView> Compiler<'_, V> {
             ("xone", Logical::Xone),
         ] {
             for head in self.values(node, local) {
-                let shapes = self.shape_list(node, head, local);
-                out.push(Constraint::Logical(logical, shapes));
+                let shapes = self.shape_list(node, head, local)?;
+                out.push(Constraint::Logical(logical, shapes))?;
             }
         }
 
         // Shapes.
         for shape in self.values(node, "node") {
-            out.push(Constraint::Node(self.shape(shape)));
+            out.push(Constraint::Node(self.shape(shape)?))?;
         }
         for shape in self.values(node, "property") {
-            out.push(Constraint::Property(self.shape(shape)));
+            out.push(Constraint::Property(self.shape(shape)?))?;
         }
-        self.qualified(node, &mut out);
+        self.qualified(node, &mut out)?;
 
         // Others.
         if self
-            .one(node, "closed")
+            .one(node, "closed")?
             .is_some_and(|value| self.is_true(value))
         {
-            out.push(Constraint::Closed(self.allowed_properties(node)));
+            out.push(Constraint::Closed(self.allowed_properties(node)?))?;
         }
-        out.extend(
-            self.values(node, "hasValue")
-                .into_iter()
-                .map(Constraint::HasValue),
-        );
+        for value in self.values(node, "hasValue") {
+            out.push(Constraint::HasValue(value))?;
+        }
         for head in self.values(node, "in") {
             match self.list(head) {
-                Ok(members) => out.push(Constraint::In(members.into_iter().collect())),
-                Err(problem) => self.error(node, format!("sh:in {problem}")),
+                Ok(members) => out.push(Constraint::In(members.into_iter().collect()))?,
+                Err(problem) => self.error(node, format!("sh:in {problem}"))?,
             }
         }
 
         // SHACL-SPARQL.
-        self.sparql_constraints(node, path, &mut out);
+        self.sparql_constraints(node, path, &mut out)?;
         let components = std::mem::take(&mut self.components);
-        self.component_constraints(node, path, &components, &mut out);
+        self.component_constraints(node, path, &components, &mut out)?;
         self.components = components;
-        out
+        Ok(out)
     }
 
-    fn qualified(&mut self, node: TermId, out: &mut Vec<Constraint>) {
+    fn qualified(
+        &mut self,
+        node: TermId,
+        out: &mut ChargedVec<Constraint>,
+    ) -> Result<(), QueryEvaluationError> {
         let qualified = self.values(node, "qualifiedValueShape");
         if qualified.is_empty() {
-            return;
+            return Ok(());
         }
         let min = self
-            .one(node, "qualifiedMinCount")
-            .and_then(|value| self.count(node, value, "qualifiedMinCount"));
+            .one(node, "qualifiedMinCount")?
+            .map(|value| self.count(node, value, "qualifiedMinCount"))
+            .transpose()?
+            .flatten();
         let max = self
-            .one(node, "qualifiedMaxCount")
-            .and_then(|value| self.count(node, value, "qualifiedMaxCount"));
+            .one(node, "qualifiedMaxCount")?
+            .map(|value| self.count(node, value, "qualifiedMaxCount"))
+            .transpose()?
+            .flatten();
         let disjoint = self
-            .one(node, "qualifiedValueShapesDisjoint")
+            .one(node, "qualifiedValueShapesDisjoint")?
             .is_some_and(|value| self.is_true(value));
         // Sibling shapes: the qualified value shapes of the other property shapes of this
         // shape's parents.
@@ -562,19 +708,23 @@ impl<V: ReadView> Compiler<'_, V> {
                 .iter()
                 .filter(|&&sibling| sibling != shape)
                 .map(|&sibling| self.shape(sibling))
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
             out.push(Constraint::Qualified {
-                shape: self.shape(shape),
+                shape: self.shape(shape)?,
                 min,
                 max,
                 siblings,
-            });
+            })?;
         }
+        Ok(())
     }
 
     /// The predicates a closed shape allows: its property shapes' predicate paths and
     /// `sh:ignoredProperties`.
-    fn allowed_properties(&mut self, node: TermId) -> BTreeSet<TermId> {
+    fn allowed_properties(
+        &mut self,
+        node: TermId,
+    ) -> Result<BTreeSet<TermId>, QueryEvaluationError> {
         let mut allowed = BTreeSet::new();
         for property in self.values(node, "property") {
             allowed.extend(
@@ -586,10 +736,10 @@ impl<V: ReadView> Compiler<'_, V> {
         for ignored in self.values(node, "ignoredProperties") {
             match self.list(ignored) {
                 Ok(members) => allowed.extend(members),
-                Err(problem) => self.error(node, format!("sh:ignoredProperties {problem}")),
+                Err(problem) => self.error(node, format!("sh:ignoredProperties {problem}"))?,
             }
         }
-        allowed
+        Ok(allowed)
     }
 }
 
@@ -651,7 +801,8 @@ impl<V: ReadView> Compiler<'_, V> {
         path: Option<&Path>,
         pre_bound: &[String],
         ask: bool,
-    ) -> Option<Query> {
+    ) -> Result<Option<Query>, QueryEvaluationError> {
+        self.resources.check()?;
         let mut parser = SparqlParser::new();
         let graph = &self.graph;
         let iri = |id: TermId| match graph.decode(id) {
@@ -665,10 +816,11 @@ impl<V: ReadView> Compiler<'_, V> {
         let query = match parser.parse_query(&text) {
             Ok(query) => query,
             Err(error) => {
-                self.error(shape, format!("a SPARQL query doesn't parse: {error}"));
-                return None;
+                self.error(shape, format!("a SPARQL query doesn't parse: {error}"))?;
+                return Ok(None);
             }
         };
+        self.resources.check()?;
         // What is left of `$PATH` after parsing stands elsewhere than as a predicate, or in a
         // node shape's query, which has no path (SHACL §5.2: ill-formed).
         let mut uses_path = false;
@@ -680,78 +832,98 @@ impl<V: ReadView> Compiler<'_, V> {
                 Some(_) => "a SPARQL query uses $PATH other than as a predicate",
                 None => "a SPARQL query uses $PATH outside a property shape",
             };
-            self.error(shape, problem);
-            return None;
+            self.error(shape, problem)?;
+            return Ok(None);
         }
         let pattern = match (&query, ask) {
             (Query::Ask { pattern, .. }, true) | (Query::Select { pattern, .. }, false) => pattern,
             _ => {
                 let expected = if ask { "ASK" } else { "SELECT" };
-                self.error(shape, format!("a SPARQL query isn't an {expected} query"));
-                return None;
+                self.error(shape, format!("a SPARQL query isn't an {expected} query"))?;
+                return Ok(None);
             }
         };
         if let Some(problem) = sparql::prebinding_problem(pattern, pre_bound) {
-            self.error(shape, format!("a SPARQL query {problem} (SHACL §5.6.2)"));
-            return None;
+            self.error(shape, format!("a SPARQL query {problem} (SHACL §5.6.2)"))?;
+            return Ok(None);
         }
-        Some(query)
+        Ok(Some(query))
     }
 
     /// `sh:sparql` constraints (SHACL §5).
-    fn sparql_constraints(&mut self, node: TermId, path: Option<&Path>, out: &mut Vec<Constraint>) {
+    fn sparql_constraints(
+        &mut self,
+        node: TermId,
+        path: Option<&Path>,
+        out: &mut ChargedVec<Constraint>,
+    ) -> Result<(), QueryEvaluationError> {
         for constraint in self.values(node, "sparql") {
             if self
-                .one(constraint, "deactivated")
+                .one(constraint, "deactivated")?
                 .is_some_and(|value| self.is_true(value))
             {
                 continue;
             }
             let Some(select) = self.string(constraint, "select") else {
-                self.error(node, "an sh:sparql constraint has no sh:select");
+                self.error(node, "an sh:sparql constraint has no sh:select")?;
                 continue;
             };
             let pre_bound =
                 [sparql::THIS, sparql::SHAPES_GRAPH, sparql::CURRENT_SHAPE].map(str::to_owned);
-            let Some(query) = self.sparql_query(node, constraint, &select, path, &pre_bound, false)
+            let Some(query) =
+                self.sparql_query(node, constraint, &select, path, &pre_bound, false)?
             else {
                 continue;
             };
-            out.push(Constraint::Sparql(Box::new(SparqlCheck {
+            self.resources.check()?;
+            out.reserve_exact(1)?;
+            self.held.charge(size_of::<SparqlCheck>())?;
+            let messages = self.values(constraint, "message");
+            self.held
+                .charge(messages.capacity().saturating_mul(size_of::<TermId>()))?;
+            let program = self.programs.len();
+            self.programs.push(SparqlProgram {
                 source: constraint,
                 component: Component::Sparql,
                 query,
                 ask: false,
                 parameters: Vec::new(),
-                messages: self.values(constraint, "message"),
-            })));
+                messages,
+            })?;
+            out.fill(1, |room| {
+                room.push(Constraint::Sparql(Box::new(SparqlCheck {
+                    program,
+                    parameters: 0..0,
+                })))
+            })?;
         }
+        Ok(())
     }
 
     /// The SPARQL-based constraint components of the shapes graph: nodes with parameters
     /// and a validator.
-    fn discover_components(&mut self) -> Vec<ComponentDef> {
+    fn discover_components(&mut self) -> Result<Vec<ComponentDef>, QueryEvaluationError> {
         let Some(parameter) = self.sh("parameter") else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut out = Vec::new();
         for node in self.graph.subjects_of(parameter) {
             let (validator, node_validator, property_validator) = (
-                self.one(node, "validator"),
-                self.one(node, "nodeValidator"),
-                self.one(node, "propertyValidator"),
+                self.one(node, "validator")?,
+                self.one(node, "nodeValidator")?,
+                self.one(node, "propertyValidator")?,
             );
             if validator.is_none() && node_validator.is_none() && property_validator.is_none() {
                 continue;
             }
             let mut parameters = Vec::new();
             for declared in self.graph.objects(node, parameter) {
-                let Some(predicate) = self.one(declared, "path") else {
-                    self.error(node, "a parameter has no sh:path");
+                let Some(predicate) = self.one(declared, "path")? else {
+                    self.error(node, "a parameter has no sh:path")?;
                     continue;
                 };
                 let Some(Term::NamedNode(iri)) = self.graph.decode(predicate) else {
-                    self.error(node, "a parameter's sh:path isn't an IRI");
+                    self.error(node, "a parameter's sh:path isn't an IRI")?;
                     continue;
                 };
                 let name = iri
@@ -761,7 +933,7 @@ impl<V: ReadView> Compiler<'_, V> {
                     .unwrap_or_default()
                     .to_owned();
                 let optional = self
-                    .one(declared, "optional")
+                    .one(declared, "optional")?
                     .is_some_and(|value| self.is_true(value));
                 parameters.push((predicate, Variable::new_unchecked(name), optional));
             }
@@ -774,7 +946,7 @@ impl<V: ReadView> Compiler<'_, V> {
                 messages: self.values(node, "message"),
             });
         }
-        out
+        Ok(out)
     }
 
     /// The constraints of the SPARQL-based components that constrain `node`: one per
@@ -784,10 +956,12 @@ impl<V: ReadView> Compiler<'_, V> {
         node: TermId,
         path: Option<&Path>,
         components: &[ComponentDef],
-        out: &mut Vec<Constraint>,
-    ) {
+        out: &mut ChargedVec<Constraint>,
+    ) -> Result<(), QueryEvaluationError> {
         for component in components {
-            let mut values: Vec<(Variable, Vec<TermId>)> = Vec::new();
+            let input_budget = self.budget.clone();
+            let mut input_held = Reservation::new(&*input_budget);
+            let mut values = ChargedVec::new(&*input_budget);
             let mut applies = true;
             for (predicate, variable, optional) in &component.parameters {
                 let found = self.graph.objects(node, *predicate);
@@ -796,7 +970,8 @@ impl<V: ReadView> Compiler<'_, V> {
                     break;
                 }
                 if !found.is_empty() {
-                    values.push((variable.clone(), found));
+                    input_held.charge(found.capacity().saturating_mul(size_of::<TermId>()))?;
+                    values.push((variable.clone(), found))?;
                 }
             }
             if !applies || values.is_empty() {
@@ -819,7 +994,7 @@ impl<V: ReadView> Compiler<'_, V> {
                     self.error(
                         node,
                         "a constraint component's validator has no usable query",
-                    );
+                    )?;
                     continue;
                 }
             };
@@ -836,7 +1011,7 @@ impl<V: ReadView> Compiler<'_, V> {
             if ask {
                 pre_bound.push(sparql::VALUE.to_owned());
             }
-            let Some(query) = self.sparql_query(node, validator, &text, path, &pre_bound, ask)
+            let Some(query) = self.sparql_query(node, validator, &text, path, &pre_bound, ask)?
             else {
                 continue;
             };
@@ -844,30 +1019,70 @@ impl<V: ReadView> Compiler<'_, V> {
                 messages if messages.is_empty() => component.messages.clone(),
                 messages => messages,
             };
-            // Every combination of the parameters' values.
-            let mut combinations: Vec<Vec<(Variable, TermId)>> = vec![Vec::new()];
-            for (variable, found) in &values {
-                combinations = combinations
-                    .into_iter()
-                    .flat_map(|chosen| {
-                        found.iter().map(move |&value| {
-                            let mut chosen = chosen.clone();
-                            chosen.push((variable.clone(), value));
-                            chosen
-                        })
-                    })
-                    .collect();
-            }
-            for parameters in combinations {
-                out.push(Constraint::Sparql(Box::new(SparqlCheck {
-                    source: validator,
-                    component: Component::Custom(component.node),
-                    query: query.clone(),
-                    ask,
-                    parameters,
-                    messages: messages.clone(),
-                })));
-            }
+            self.resources.check()?;
+            // Admit the full product before any amplified output/box is constructed.
+            let product = values.iter().try_fold(1usize, |n, (_, found)| {
+                n.checked_mul(found.len())
+                    .ok_or_else(|| self.budget.refusal(usize::MAX))
+            })?;
+            let parameter_count = product
+                .checked_mul(values.len())
+                .ok_or_else(|| self.budget.refusal(usize::MAX))?;
+            out.reserve_exact(product)?;
+            self.parameter_values.reserve_exact(parameter_count)?;
+            self.held.charge(
+                product
+                    .checked_mul(size_of::<SparqlCheck>())
+                    .ok_or_else(|| self.budget.refusal(usize::MAX))?,
+            )?;
+            let program = self.programs.len();
+            let names: Vec<_> = values.iter().map(|(name, _)| name.clone()).collect();
+            self.held
+                .charge(names.capacity().saturating_mul(size_of::<Variable>()))?;
+            self.held
+                .charge(messages.capacity().saturating_mul(size_of::<TermId>()))?;
+            self.programs.push(SparqlProgram {
+                source: validator,
+                component: Component::Custom(component.node),
+                query,
+                ask,
+                parameters: names,
+                messages,
+            })?;
+            // Only k digits of scratch; no prefix vectors or P query/message clones.
+            let mut positions = ChargedVec::with_capacity(&*self.budget, values.len())?;
+            positions.resize(values.len(), 0usize)?;
+            let ticker = &mut self.ticker;
+            self.parameter_values.fill(
+                parameter_count,
+                |parameters| -> Result<(), QueryEvaluationError> {
+                    out.fill(product, |checks| -> Result<(), QueryEvaluationError> {
+                        for _ in 0..product {
+                            ticker
+                                .tick(u32::try_from(values.len()).unwrap_or(u32::MAX))
+                                .map_err(stopped)?;
+                            let start = parameters.len();
+                            for ((_, found), &position) in values.iter().zip(positions.iter()) {
+                                parameters.push(found[position]);
+                            }
+                            checks.push(Constraint::Sparql(Box::new(SparqlCheck {
+                                program,
+                                parameters: start..parameters.len(),
+                            })));
+                            for digit in (0..positions.len()).rev() {
+                                positions[digit] += 1;
+                                if positions[digit] < values[digit].1.len() {
+                                    break;
+                                }
+                                positions[digit] = 0;
+                            }
+                        }
+                        Ok(())
+                    })??;
+                    Ok(())
+                },
+            )??;
         }
+        Ok(())
     }
 }

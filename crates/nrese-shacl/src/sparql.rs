@@ -32,7 +32,7 @@ use nrese_sparql::{QueryOptions, QueryResults, ReadView};
 use nrese_sparql_syntax::algebra::{Expression, GraphPattern, PropertyPathExpression};
 
 use crate::graph::Selection;
-use crate::model::{Path, SparqlCheck};
+use crate::model::{Path, SparqlProgram};
 
 /// The variables every SHACL-SPARQL query may have pre-bound.
 pub(crate) const THIS: &str = "this";
@@ -181,10 +181,15 @@ pub(crate) enum Outcome {
 
 /// Runs `check` for `focus` (with `values`, its value nodes, for an ASK validator) over
 /// `data`, with the pre-bound variables of SHACL-SPARQL.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The shared program and per-check parameters are separate borrowed inputs."
+)]
 pub(crate) fn run<V: ReadView>(
     view: &V,
     data: Selection,
-    check: &SparqlCheck,
+    check: &SparqlProgram,
+    parameters: &[TermId],
     focus: TermId,
     values: &[TermId],
     shape: TermId,
@@ -201,7 +206,7 @@ pub(crate) fn run<V: ReadView>(
     if let Some(graph) = shapes_graph {
         bound.insert(variable(SHAPES_GRAPH), decode(graph)?);
     }
-    for (name, value) in &check.parameters {
+    for (name, value) in check.parameters.iter().zip(parameters) {
         bound.insert(name.clone(), decode(*value)?);
     }
     // The statements Core reads, shapes graphs left out ([`Selection::query_dataset`]).
