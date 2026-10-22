@@ -2457,7 +2457,13 @@ impl<'a> Context<'a> {
             }
             (Err(start), Ok(o)) => (vec![o], column(evaluator.from(&resolved, start))?),
             (Ok(s), Err(finish)) => (vec![s], column(evaluator.to(&resolved, finish))?),
-            (Ok(s), Ok(o)) if s == o => (vec![s], self.same_ends(&evaluator.open(&resolved))?),
+            (Ok(s), Ok(o)) if s == o => (
+                vec![s],
+                match evaluator.diagonal(&resolved)? {
+                    Some(table) => table,
+                    None => self.same_ends(&evaluator.open(&resolved))?,
+                },
+            ),
             (Ok(s), Ok(o)) => (vec![s, o], self.both_ends(&evaluator.open(&resolved))?),
         };
         let estimate = || {
@@ -4820,7 +4826,7 @@ impl<'a> Context<'a> {
             && start != end
             && let Some(count) = self
                 .path_evaluator()?
-                .count_open(&paths::Path::resolve(path, &self.snapshot))
+                .count_open(&paths::Path::resolve(path, &self.snapshot))?
         {
             if self.trace.is_some() {
                 let detail = format!("COUNT of {path} from the closure's size per component");
