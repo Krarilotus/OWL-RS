@@ -47,6 +47,9 @@ pub enum ApiError {
     Timeout(String),
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+    /// Busy for now: 503 with `Retry-After`, to be tried again shortly.
+    #[error("busy: {0}")]
+    Busy(String),
     #[error("internal server error: {0}")]
     Internal(String),
 }
@@ -121,6 +124,11 @@ impl ApiError {
         Self::ServiceUnavailable(message.into())
     }
 
+    /// 503 with `Retry-After: 1`: the request may succeed when tried again.
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self::Busy(message.into())
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
     }
@@ -137,6 +145,13 @@ impl IntoResponse for ApiError {
         if let Self::IncompleteAnswer(answer) = self {
             return incomplete_answer(&answer);
         }
+        if let Self::Busy(detail) = self {
+            let mut response = Self::ServiceUnavailable(detail).into_response();
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
         let (status, detail, reasoner_reject) = match self {
             Self::BadRequest(detail) => (StatusCode::BAD_REQUEST, detail, None),
             Self::BadRequestPlainText(detail) => {
@@ -152,7 +167,7 @@ impl IntoResponse for ApiError {
             Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail, None),
             Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail, None),
             Self::Conflict(detail) => (StatusCode::CONFLICT, detail, None),
-            Self::IncompleteAnswer(_) => unreachable!("answered above"),
+            Self::IncompleteAnswer(_) | Self::Busy(_) => unreachable!("answered above"),
             Self::Gone(detail) => (StatusCode::GONE, detail, None),
             Self::NotAcceptable(detail) => (StatusCode::NOT_ACCEPTABLE, detail, None),
             Self::UnsupportedMediaType(detail) => {
@@ -277,4 +292,23 @@ struct ProblemJson {
     status: u16,
     detail: String,
     reasoner_reject: Option<RejectExplanationView>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A retryable refusal (busy, or a write that met a reconfiguration) is told when to send
+    /// it again; a plain unavailability isn't.
+    #[test]
+    fn a_retryable_refusal_says_when_to_retry() {
+        let response = ApiError::busy("reconfigured").into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        let plain = ApiError::unavailable("down").into_response();
+        assert!(plain.headers().get(header::RETRY_AFTER).is_none());
+    }
 }

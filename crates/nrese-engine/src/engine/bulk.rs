@@ -36,6 +36,7 @@ use crate::index::keys::PackedKeys;
 use crate::index::run::{PermutationBuilder, Run};
 use crate::index::{IndexVersion, Layout};
 use crate::quad::{EncodedQuad, EncodedTriple, Permutation, QuadPattern};
+use crate::term::dictionary::BatchScratch;
 use crate::term::pending::Pending;
 
 /// Batches copied between releases of their memory ([`crate::memory`]): about 256 MiB at
@@ -70,6 +71,8 @@ pub struct BulkLoad<'e> {
     pending: Pending,
     /// Batches [`add`](Self::add) has numbered.
     added: std::sync::atomic::AtomicU32,
+    /// What interning a batch works in, kept for the next ones: one per thread adding.
+    scratch: Mutex<Vec<BatchScratch>>,
 }
 
 /// Interned quads not yet spilled.
@@ -101,6 +104,7 @@ impl<'e> BulkLoad<'e> {
             spill_failed: Mutex::new(None),
             pending: Pending::default(),
             added: std::sync::atomic::AtomicU32::new(0),
+            scratch: Mutex::default(),
         }
     }
 
@@ -119,11 +123,14 @@ impl<'e> BulkLoad<'e> {
     /// from several threads at once. Past the memory budget, it waits while the last
     /// chunk is spilled.
     pub fn add_at(&self, chunk: u32, batch: u32, quads: &[Quad]) {
-        let encoded =
-            self.engine
-                .shared
-                .dictionary
-                .intern_quads_pending(quads, &self.pending, chunk, batch);
+        let mut scratch = self.scratch.lock().pop().unwrap_or_default();
+        let encoded = self.engine.shared.dictionary.intern_quads_pending(
+            quads,
+            &self.pending,
+            (chunk, batch),
+            &mut scratch,
+        );
+        self.scratch.lock().push(scratch);
         let full = {
             let mut batches = self.batches.lock();
             batches.quads += encoded.len();
@@ -192,8 +199,10 @@ impl<'e> BulkLoad<'e> {
             spiller,
             spill_failed,
             pending,
+            scratch,
             ..
         } = self;
+        drop(scratch);
         let shared = &engine.shared;
         // No commit can run (writer slot) and no compaction can replace runs while the new
         // version is built from the current one and installed.
@@ -490,14 +499,13 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
             let mut wal = durable.wal.lock();
             wal.rotate(revision + 1)?;
             shared.versions.install(next);
-            wal.release_through(revision)?;
+            release_covered(&mut wal, durable.root(), revision);
             drop(wal);
             if let Some(base) = base
                 && let Err(error) = shared.dictionary.rebase(base)
             {
                 tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
             }
-            checkpoint::remove_older_than(durable.root(), revision)?;
         }
         None => shared.versions.install(next),
     }
@@ -586,13 +594,27 @@ fn publish_streamed(
     let mut wal = durable.wal.lock();
     wal.rotate(revision + 1)?;
     shared.versions.install(next);
-    wal.release_through(revision)?;
+    release_covered(&mut wal, durable.root(), revision);
     drop(wal);
     if let Err(error) = shared.dictionary.rebase(base) {
         tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
     }
-    checkpoint::remove_older_than(durable.root(), revision)?;
     Ok(len)
+}
+
+/// Removes what a published checkpoint at `revision` covers: the log segments before it and
+/// the older checkpoints. After the version is installed this is cleanup, not part of the
+/// commit, which has happened (its checkpoint is written and synced): a failure keeps those
+/// files, which recovery skips (the newest checkpoint and the records after it count), and the
+/// next checkpoint that writes removes them. Returning it would report a published commit as
+/// failed.
+fn release_covered(wal: &mut crate::durability::wal::Wal, root: &std::path::Path, revision: u64) {
+    if let Err(error) = wal.release_through(revision) {
+        tracing::warn!(%error, revision, "log segments the checkpoint covers kept for now; the next checkpoint releases them");
+    }
+    if let Err(error) = checkpoint::remove_older_than(root, revision) {
+        tracing::warn!(%error, revision, "older checkpoints kept for now; the next checkpoint removes them");
+    }
 }
 
 /// A rematerialisation in progress: the reasoner reads [`base`](Self::base), computes the

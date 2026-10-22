@@ -145,6 +145,31 @@ _:b <http://e/p> _:c <http://e/g> .
     );
 }
 
+/// A subject whose statements pass the writer's bound (`jsonld-node-flush`, 64 KiB) is
+/// written as several node objects with one `@id`: they read back as the same statements.
+#[test]
+fn a_large_subject_is_written_in_several_node_objects() {
+    let mut text = String::new();
+    for i in 0..4000 {
+        text.push_str(&format!(
+            "<http://e/hub> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://e/C{}> .\n\
+             <http://e/hub> <http://e/p> <http://e/o{i}> .\n",
+            i % 3
+        ));
+    }
+    let quads: Vec<Quad> = RdfParser::from_format(RdfFormat::NQuads)
+        .for_slice(text.as_bytes())
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let serializer = RdfSerializer::from_format(RdfFormat::JsonLd)
+        .with_prefix("ex", "http://e/")
+        .unwrap();
+    let (written, back) = round_trip(&quads, serializer);
+    let objects = written.matches(r#""@id":"ex:hub""#).count();
+    assert!(objects > 1, "one node object of {} bytes", written.len());
+    assert_eq!(canonical(back), canonical(quads));
+}
+
 #[test]
 fn the_expanded_writer_finds_lists() {
     let quads: Vec<Quad> = RdfParser::from_format(RdfFormat::Turtle)

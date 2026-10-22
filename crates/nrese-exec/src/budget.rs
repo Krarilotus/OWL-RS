@@ -12,17 +12,32 @@
 //! [`Envelope::part`] is one part's, such as an evaluation, counted on its own so that
 //! what the part leaves behind can be handed to its result. Each level charges the one
 //! above it too, and returns what it holds when it ends, however it ends.
+//!
+//! A [`SharedBudget`] can itself lie within another ([`SharedBudget::within`]): the
+//! process's, which everything charged in it draws from (queries, maintenance), above the
+//! queries' and others'. Their limits may add up to more than the process's: it refuses
+//! what doesn't fit them all.
 
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-/// The memory all running queries may hold together.
+/// The memory a group of operations may hold together: all running queries, or the
+/// process's for everything it charges.
 #[derive(Debug)]
 pub struct SharedBudget {
     limit: usize,
     used: AtomicUsize,
     peak: AtomicUsize,
+    /// The budget this one lies within, charged first.
+    parent: Option<Arc<SharedBudget>>,
+}
+
+/// A shared budget's refusal: the limit of the level that refused, and its use then.
+#[derive(Debug, Clone, Copy)]
+struct Refused {
+    limit: usize,
+    used: usize,
 }
 
 impl SharedBudget {
@@ -31,7 +46,28 @@ impl SharedBudget {
             limit: limit_bytes,
             used: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            parent: None,
         })
+    }
+
+    /// `limit_bytes` within `parent`: a charge here is charged there too, first, and
+    /// refused where either refuses.
+    pub fn within(limit_bytes: usize, parent: Arc<SharedBudget>) -> Arc<Self> {
+        Arc::new(Self {
+            limit: limit_bytes,
+            used: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            parent: Some(parent),
+        })
+    }
+
+    /// Bytes that may still be charged here: the own rest, and no more than the levels
+    /// above have left.
+    pub fn remaining(&self) -> usize {
+        let own = self.limit.saturating_sub(self.used());
+        self.parent
+            .as_ref()
+            .map_or(own, |parent| own.min(parent.remaining()))
     }
 
     pub fn limit(&self) -> usize {
@@ -47,11 +83,21 @@ impl SharedBudget {
         self.peak.load(Ordering::Relaxed)
     }
 
-    fn charge(&self, bytes: usize) -> Result<(), usize> {
+    /// Charges `bytes` above, then here; refused anywhere, nothing stays charged.
+    fn charge(&self, bytes: usize) -> Result<(), Refused> {
+        if let Some(parent) = &self.parent {
+            parent.charge(bytes)?;
+        }
         let mut used = self.used.load(Ordering::Relaxed);
         loop {
             let Some(next) = used.checked_add(bytes).filter(|&next| next <= self.limit) else {
-                return Err(used);
+                if let Some(parent) = &self.parent {
+                    parent.release(bytes);
+                }
+                return Err(Refused {
+                    limit: self.limit,
+                    used,
+                });
             };
             match self
                 .used
@@ -66,12 +112,17 @@ impl SharedBudget {
         }
     }
 
+    /// Releases `bytes` here, at most what is charged, and as much above.
     fn release(&self, bytes: usize) {
-        let _ = self
+        let before = self
             .used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 Some(used.saturating_sub(bytes))
-            });
+            })
+            .unwrap_or_else(|used| used);
+        if let Some(parent) = &self.parent {
+            parent.release(bytes.min(before));
+        }
     }
 }
 
@@ -245,12 +296,14 @@ impl Budget {
             }
         }
         let above = match &self.parent {
-            Some(Parent::Server(shared)) => shared.charge(bytes).map_err(|in_use| BudgetExceeded {
-                limit: shared.limit,
-                requested: bytes,
-                used: in_use,
-                shared: true,
-            }),
+            Some(Parent::Server(shared)) => {
+                shared.charge(bytes).map_err(|refused| BudgetExceeded {
+                    limit: refused.limit,
+                    requested: bytes,
+                    used: refused.used,
+                    shared: true,
+                })
+            }
             Some(Parent::Envelope(envelope)) => envelope.take(bytes),
             None => Ok(()),
         };
@@ -318,7 +371,7 @@ impl Budget {
     pub fn remaining(&self) -> usize {
         let own = self.limit.saturating_sub(self.used());
         match &self.parent {
-            Some(Parent::Server(shared)) => own.min(shared.limit.saturating_sub(shared.used())),
+            Some(Parent::Server(shared)) => own.min(shared.remaining()),
             Some(Parent::Envelope(envelope)) => own.min(envelope.remaining()),
             None => own,
         }
@@ -337,7 +390,7 @@ impl Budget {
     pub fn bounded_by_shared(&self) -> bool {
         let own = self.limit.saturating_sub(self.used());
         match &self.parent {
-            Some(Parent::Server(shared)) => shared.limit.saturating_sub(shared.used()) < own,
+            Some(Parent::Server(shared)) => shared.remaining() < own,
             Some(Parent::Envelope(envelope)) => {
                 envelope.remaining() < own && envelope.bounded_by_shared()
             }
@@ -1060,6 +1113,93 @@ mod tests {
         assert_eq!(fill(4, &[]), (Ok(()), 101));
     }
 
+    /// Two failures both observed return the lower: items 2 and 6 of 8, a range each on two
+    /// workers (each half of the fill on its own), each waiting until the other has started,
+    /// for at most 5 seconds, so that neither stops the other first. And a worker that panics
+    /// while another fails unwinds out of the fill with every item made dropped once, the
+    /// vector as it was and the items' memory released (Sol, w1-step1 r1, F1).
+    #[test]
+    fn a_parallel_fill_returns_its_lowest_failure_and_unwinds_past_one() {
+        use std::time::{Duration, Instant};
+        static MADE: AtomicUsize = AtomicUsize::new(0);
+        static DROPPED: AtomicUsize = AtomicUsize::new(0);
+        struct Item<'b>(#[allow(dead_code)] ChargedVec<u8, &'b Budget>);
+        impl Drop for Item<'_> {
+            fn drop(&mut self) {
+                DROPPED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let budget = Budget::unlimited();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let started = AtomicUsize::new(0);
+        let meet = || {
+            started.fetch_add(1, Ordering::SeqCst);
+            let since = Instant::now();
+            while started.load(Ordering::SeqCst) < 2 && since.elapsed() < Duration::from_secs(5) {
+                std::thread::yield_now();
+            }
+        };
+        let made = || {
+            MADE.fetch_add(1, Ordering::SeqCst);
+            Ok(Item(ChargedVec::with_capacity(&budget, 100).unwrap()))
+        };
+        let mut items: ChargedVec<Item<'_>, &Budget> = ChargedVec::new(&budget);
+        items.push(Item(ChargedVec::new(&budget))).unwrap();
+        let filled = items
+            .fill(8, |room| {
+                pool.install(|| {
+                    room.try_par_fill(8, |i| match i {
+                        2 | 6 => {
+                            meet();
+                            Err(i)
+                        }
+                        _ => made(),
+                    })
+                })
+            })
+            .unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 2, "both failures observed");
+        assert_eq!(filled, Err(2), "the lower of the two");
+        assert_eq!(items.len(), 1);
+        assert_eq!(DROPPED.load(Ordering::SeqCst), MADE.load(Ordering::SeqCst));
+        assert_eq!(budget.used(), items.charged(), "the items' memory released");
+        // Item 2 panics once item 6 has started, and item 6 fails.
+        started.store(0, Ordering::SeqCst);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            items.fill(8, |room| {
+                pool.install(|| {
+                    room.try_par_fill(8, |i| match i {
+                        2 => {
+                            meet();
+                            panic!("the worker at item 2 panics");
+                        }
+                        6 => {
+                            meet();
+                            Err(i)
+                        }
+                        _ => made(),
+                    })
+                })
+            })
+        }));
+        assert!(unwound.is_err(), "the panic unwinds out of the fill");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "the failure observed too"
+        );
+        assert_eq!(items.len(), 1, "the vector as it was");
+        assert_eq!(
+            DROPPED.load(Ordering::SeqCst),
+            MADE.load(Ordering::SeqCst),
+            "each item made dropped once"
+        );
+        assert_eq!(budget.used(), items.charged(), "the items' memory released");
+    }
+
     /// A charged vector never holds more than it was charged: every path that grows it
     /// reserves first, a writer it lends can't grow it, a capacity no vector can hold is
     /// refused, and its items leave with their reservation.
@@ -1154,6 +1294,42 @@ mod tests {
         assert_eq!(server.used(), 30);
         drop(second);
         assert_eq!((server.used(), server.peak()), (0, 100));
+    }
+
+    /// The process's budget above the queries' and maintenance's: each level refuses
+    /// what doesn't fit it, a refusal leaves nothing charged at any level, and what is
+    /// released is released all the way up.
+    #[test]
+    fn shared_budgets_nest_within_the_processs() {
+        let process = SharedBudget::new(100);
+        let queries = SharedBudget::within(80, Arc::clone(&process));
+        let query = Budget::new(usize::MAX).within(Some(Arc::clone(&queries)));
+        let maintenance = Budget::new(usize::MAX).within(Some(Arc::clone(&process)));
+        query.charge(70).unwrap();
+        assert_eq!((queries.used(), process.used()), (70, 70));
+        // The queries' own limit refuses, the process's is left as it was.
+        let err = query.charge(20).unwrap_err();
+        assert_eq!((err.shared, err.limit, err.used), (true, 80, 70));
+        assert_eq!((query.used(), queries.used(), process.used()), (70, 70, 70));
+        // Maintenance takes what the process has left; then the process refuses the
+        // queries what their own limit would allow.
+        maintenance.charge(25).unwrap();
+        assert_eq!((query.remaining(), queries.remaining()), (5, 5));
+        let err = query.charge(8).unwrap_err();
+        assert_eq!((err.shared, err.limit, err.used), (true, 100, 95));
+        assert_eq!(
+            (queries.used(), process.used()),
+            (70, 95),
+            "nothing charged"
+        );
+        assert!(query.bounded_by_shared());
+        // Released, and ended, all the way up.
+        query.release(30);
+        assert_eq!((queries.used(), process.used()), (40, 65));
+        drop(maintenance);
+        drop(query);
+        assert_eq!((queries.used(), process.used()), (0, 0));
+        assert_eq!((queries.peak(), process.peak()), (70, 95));
     }
 
     #[test]

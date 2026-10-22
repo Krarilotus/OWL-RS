@@ -5,8 +5,10 @@ host.
 The build runs there too: fleet stages only git inputs onto a WSL host (fleet-hosts copy.rs
 refuses artifacts there), so a binary built elsewhere can't reach it (the orchestrator's choice,
 20 Oct 2026). The build job's step is build-on-host.sh, sent inline, so the commit under test
-needn't have it; it leaves the binary at ~/fleet/cache/owlrs-verify/bin-<sha12>/ for the run
-jobs (and returns it with build.json), and a second build of the same commit only checks it.
+needn't have it; it builds in the host's one cache, shared with the gates
+(~/fleet/cache/owlrs-gate; Harness/notes/2026-10-20-host-cache-contract.md), and leaves the binary
+there in bin-<sha12>/ for the run jobs (and returns it with build.json); a second build of the
+same commit only checks it.
 The run job takes the harness (runner and scenarios) from its own checkout, which may be another
 commit than the server's: scenarios a fleet job runs must be committed there."""
 from __future__ import annotations
@@ -27,7 +29,9 @@ BUILD = {"cores": 2, "ram_gb": 2, "est_min": 10}
 # the self-test at 42.7 MiB (the step's cgroup, verify-run-ebaeb593-10201343), about a minute
 # together. Scenarios with more data declare more (--ram-gb); each summary records its peak.
 RUN = {"cores": 2, "ram_gb": 0.5, "est_min": 5}
-RUN_CEILING_S = 1800
+# Each step's ceiling, not the job's: a run job (the self-test, then the scenarios) ends within
+# twice this plus the kill grace, 2 × (1800 + 60) s.
+STEP_CEILING_S = 1800
 
 
 def git(repo: Path, *args: str) -> str:
@@ -76,9 +80,10 @@ def jobs(repo: Path, rev: str, harness: str, scenarios: list[str], settings: lis
         "requires": {"hosts": [HOST], "cores": BUILD["cores"], "ram_gb": BUILD["ram_gb"]},
         "inputs": [{"name": "checkout", "source": {"git": source, "rev": sha}}]}
     run_args = [a for s in settings for a in ("--set", s)]
-    # Every phase of verify.py has its own deadline; this ceiling is the fleet step's (fleet stops
-    # no step itself). Its SIGTERM makes verify.py clean up and write a failing summary.
-    ceiling = ["timeout", "--kill-after=60", str(RUN_CEILING_S), "python3", "scripts/verify/verify.py"]
+    # Every phase of verify.py has its own deadline; each step also has a ceiling of its own
+    # (fleet stops no step itself), whose SIGTERM makes verify.py clean up and write a failing
+    # summary. The steps don't share one: the job's bound is the sum of theirs.
+    ceiling = ["timeout", "--kill-after=60", str(STEP_CEILING_S), "python3", "scripts/verify/verify.py"]
     # The self-test first: a runner whose checks don't fail when they should proves nothing after.
     steps = [[*ceiling, "selftest", "--server-rev", sha]] if selftest else []
     steps.append([*ceiling, "run", "--server-rev", sha, *run_args, *scenarios])

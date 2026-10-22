@@ -21,7 +21,8 @@
 //!
 //! The reader takes both versions (UTF-8 and UTF-16 charsets); the writer writes version 2
 //! in UTF-8, declaring each IRI and blank node on its first use and referring to it after
-//! (a bounded table), as RDF4J's own writer does for repeated values.
+//! (a table bounded in entries and in bytes: [`WRITER_TABLE`], [`WRITER_TABLE_BYTES`]), as
+//! RDF4J's own writer does for repeated values.
 
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -53,6 +54,43 @@ const TRIPLE_VALUE: u8 = 7;
 const MAX_DECLARED: usize = 1 << 26;
 /// The longest string read (a literal of 1 GiB).
 const MAX_STRING: usize = 1 << 30;
+/// Reads up to this long take their buffer at once; longer ones grow it as their bytes
+/// arrive, so a record's declared length never allocates more than the document holds.
+const EAGER: usize = 1 << 16;
+
+/// The values a document declared, by id. RDF4J's writer numbers them from 0 and reuses
+/// ids within its table, so they are dense: a `Vec`. An id past its end goes to a map, so
+/// that memory follows the declarations made, never the largest id named.
+#[derive(Default)]
+struct Declared {
+    dense: Vec<Option<Term>>,
+    sparse: HashMap<usize, Option<Term>>,
+}
+
+impl Declared {
+    fn get(&self, id: usize) -> Option<&Term> {
+        match self.dense.get(id) {
+            Some(value) => value.as_ref(),
+            None => self.sparse.get(&id)?.as_ref(),
+        }
+    }
+
+    fn set(&mut self, id: usize, value: Option<Term>) {
+        if id < self.dense.len() {
+            self.dense[id] = value;
+        } else if id == self.dense.len() {
+            self.dense.push(value);
+            // What was declared past the end joins the dense part once it is reached.
+            while !self.sparse.is_empty()
+                && let Some(next) = self.sparse.remove(&self.dense.len())
+            {
+                self.dense.push(next);
+            }
+        } else {
+            self.sparse.insert(id, value);
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Charset {
@@ -67,7 +105,7 @@ pub(crate) struct BinaryParser<R: Read> {
     offset: u64,
     version: Option<i32>,
     charset: Charset,
-    declared: Vec<Option<Term>>,
+    declared: Declared,
     blank_nodes: BlankNodes,
     unchecked: bool,
     pub(crate) current: Option<Quad>,
@@ -81,7 +119,7 @@ impl<R: Read> BinaryParser<R> {
             offset: 0,
             version: None,
             charset: Charset::Utf8,
-            declared: Vec::new(),
+            declared: Declared::default(),
             blank_nodes,
             unchecked,
             current: None,
@@ -98,15 +136,27 @@ impl<R: Read> BinaryParser<R> {
         RdfSyntaxError::new(message, at..at).into()
     }
 
+    /// The next `n` bytes, in a buffer that holds no more than the bytes that came.
     fn bytes(&mut self, n: usize) -> Result<Vec<u8>, RdfParseError> {
-        let mut buffer = vec![0; n];
-        self.reader.read_exact(&mut buffer).map_err(|error| {
-            if error.kind() == io::ErrorKind::UnexpectedEof {
-                self.error("the document ends in the middle of a record")
-            } else {
-                error.into()
+        let ended = |parser: &Self| parser.error("the document ends in the middle of a record");
+        let buffer = if n <= EAGER {
+            let mut buffer = vec![0; n];
+            self.reader.read_exact(&mut buffer).map_err(|error| {
+                if error.kind() == io::ErrorKind::UnexpectedEof {
+                    ended(self)
+                } else {
+                    error.into()
+                }
+            })?;
+            buffer
+        } else {
+            let mut buffer = Vec::with_capacity(EAGER);
+            Read::take(&mut self.reader, n as u64).read_to_end(&mut buffer)?;
+            if buffer.len() < n {
+                return Err(ended(self));
             }
-        })?;
+            buffer
+        };
         self.offset += n as u64;
         Ok(buffer)
     }
@@ -218,8 +268,8 @@ impl<R: Read> BinaryParser<R> {
             VALUE_REF => {
                 let id = self.id()?;
                 return match self.declared.get(id) {
-                    Some(Some(term)) => Ok(Some(term.clone())),
-                    _ => Err(self.error(format!("a reference to value {id}, never declared"))),
+                    Some(term) => Ok(Some(term.clone())),
+                    None => Err(self.error(format!("a reference to value {id}, never declared"))),
                 };
             }
             URI_VALUE => {
@@ -316,10 +366,7 @@ impl<R: Read> BinaryParser<R> {
                 VALUE_DECL => {
                     let id = self.id()?;
                     let value = self.value(0)?;
-                    if self.declared.len() <= id {
-                        self.declared.resize(id + 1, None);
-                    }
-                    self.declared[id] = value;
+                    self.declared.set(id, value);
                 }
                 NAMESPACE_DECL => {
                     self.string()?;
@@ -336,11 +383,17 @@ impl<R: Read> BinaryParser<R> {
 
 /// Values the writer refers to by id: the most it keeps at once.
 const WRITER_TABLE: usize = 1 << 16;
+/// The most bytes those values hold (the named bound `binary-rdf-idtable-bytes`): long IRIs
+/// fill it before the count does. A value past either bound is written in full each time,
+/// which reads back the same.
+const WRITER_TABLE_BYTES: usize = 4 << 20;
 
 /// Writes Binary RDF, version 2 in UTF-8.
 pub(crate) struct BinaryWriter {
     started: bool,
     ids: HashMap<Term, u32>,
+    /// What `ids` holds: each entry's slot and its value's text.
+    held: usize,
     /// Where the record being written starts in the buffer: declarations go before it.
     record_start: usize,
 }
@@ -363,6 +416,7 @@ impl BinaryWriter {
         Self {
             started: false,
             ids: HashMap::new(),
+            held: 0,
             record_start: 0,
         }
     }
@@ -387,7 +441,14 @@ impl BinaryWriter {
                 varint(out, id);
                 return Ok(());
             }
-            if self.ids.len() < WRITER_TABLE {
+            let text = match term {
+                TermRef::NamedNode(node) => node.as_str().len(),
+                TermRef::BlankNode(node) => node.as_str().len(),
+                _ => 0,
+            };
+            let entry = std::mem::size_of::<(Term, u32)>() + text;
+            if self.ids.len() < WRITER_TABLE && self.held + entry <= WRITER_TABLE_BYTES {
+                self.held += entry;
                 let id = self.ids.len() as u32;
                 // The declaration goes before the record that uses it.
                 let mut declaration = vec![VALUE_DECL];
@@ -537,6 +598,42 @@ mod tests {
             .for_slice(&bytes[..bytes.len() - 5])
             .collect::<Result<Vec<_>, _>>();
         assert!(cut.is_err());
+    }
+
+    /// IRIs whose text passes the table's byte bound (`binary-rdf-idtable-bytes`) before its
+    /// count does: the later ones are written in full at every use, and the document reads
+    /// back the same.
+    #[test]
+    fn values_past_the_table_bytes_are_written_in_full() {
+        let iri =
+            |i: usize| NamedNode::new_unchecked(format!("http://e/{i:04}/{}", "x".repeat(1024)));
+        let count = 2 * WRITER_TABLE_BYTES / 1024;
+        let p = NamedNode::new_unchecked("http://e/p");
+        let quads: Vec<Quad> = (0..count)
+            .map(|i| Quad::new(iri(i), p.clone(), iri(i), GraphName::DefaultGraph))
+            .collect();
+        let mut serializer =
+            RdfSerializer::from_format(RdfFormat::BinaryRdf).for_writer(Vec::new());
+        for quad in &quads {
+            serializer.serialize_quad(quad).unwrap();
+        }
+        let bytes = serializer.finish().unwrap();
+        let read: Vec<Quad> = RdfParser::from_format(RdfFormat::BinaryRdf)
+            .for_slice(&bytes)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(read, quads);
+        let occurrences = |i: usize| {
+            let text = iri(i);
+            let text = text.as_str().as_bytes();
+            bytes.windows(text.len()).filter(|w| w == &text).count()
+        };
+        assert_eq!(occurrences(0), 1, "the first is declared once");
+        assert_eq!(
+            occurrences(count - 1),
+            2,
+            "the last is written in full twice"
+        );
     }
 
     /// A version 1 document as RDF4J 2 wrote it: i32 ids, UTF-16 strings.

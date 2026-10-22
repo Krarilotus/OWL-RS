@@ -18,8 +18,11 @@ import json
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -174,6 +177,110 @@ class Interruption(unittest.TestCase):
         self.assertEqual(result["error"], "interrupted: terminated (SIGTERM)")
         self.assertEqual([(s["name"], s["ok"]) for s in result["steps"]], [("health 1", True), ("health 2", False)])
         self.assertTrue(result["cleanup"]["removed"] and result["cleanup"]["stopped"], result["cleanup"])
+
+
+class Resolution(unittest.TestCase):
+    def test_resolving_the_host_name_is_within_the_deadline(self):
+        from verifykit import client
+        release = threading.Event()
+
+        def resolver(*args, **kwargs):  # answers only once the exchange has returned
+            release.wait(10)
+            raise OSError("resolved too late")
+
+        original, client.socket.getaddrinfo = client.socket.getaddrinfo, resolver
+        try:
+            got = client.get("http://resolves.slowly.invalid:8080/healthz", 0.2)
+        finally:
+            client.socket.getaddrinfo = original
+            release.set()
+        self.assertEqual(got["error"], "no response: the 0.2 s deadline passed while resolving the host's name")
+
+    def test_an_address_whose_socket_cant_be_made_gives_way_to_the_next(self):
+        from verifykit import client
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        self.addCleanup(listener.close)
+        port = listener.getsockname()[1]
+        both = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", port, 0, 0)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+        make = client.socket.socket
+
+        def without_ipv6(family=-1, *args, **kwargs):  # a host with IPv6 off
+            if family == socket.AF_INET6:
+                raise OSError(97, "Address family not supported by protocol")
+            return make(family, *args, **kwargs)
+
+        resolve = client.socket.getaddrinfo
+        client.socket.getaddrinfo, client.socket.socket = (lambda *a, **k: both), without_ipv6
+        try:
+            sock = client.connect("dual.example", port, client.Deadline(5))
+        finally:
+            client.socket.getaddrinfo, client.socket.socket = resolve, make
+        self.addCleanup(sock.close)
+        self.assertEqual(sock.getpeername()[1], port)
+
+
+class SweptBuild(unittest.TestCase):
+    def test_a_build_swept_while_it_is_chosen_is_a_launch_failure_with_a_summary(self):
+        root = Path(tempfile.mkdtemp(prefix="verify-test-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        build = root / "cache" / "bin-0123456789ab"
+        build.mkdir(parents=True)
+        (build / "nrese-server").write_bytes(b"x")
+        (build / "SHA256SUMS").write_text(f"{verify.sha256_of(build / 'nrese-server')}  nrese-server\n")
+        (build / ".last-used").mkdir()  # its mark can't be written, as when a sweep took the directory
+        scenario_file = root / "one.toml"
+        scenario_file.write_text('[[step]]\nname = "health"\npath = "/healthz"\nexpect = { status = 200 }\n')
+        original, verify.CACHE = verify.CACHE, root / "cache"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                code = verify.main(["run", "--server-rev", "0123456789ab" + "0" * 28,
+                                    "--evidence", str(root / "evidence"), str(scenario_file)])
+        finally:
+            verify.CACHE = original
+        self.assertEqual(code, 3)
+        summary = json.loads((root / "evidence" / "summary.json").read_text(encoding="utf-8"))
+        self.assertTrue(summary["scenarios"][0]["error"].startswith("launch: reading the server's build failed"))
+
+
+@unittest.skipUnless(shutil.which("flock") and shutil.which("bash"), "needs flock (Linux)")
+class Migration(unittest.TestCase):
+    """build-on-host.sh's migration of /verify's old cache, the block as written: its lock file stays
+    (the same inode), so a build of the old kind waiting on it and every later migration contend
+    on one lock, and while one holds it nothing of the old cache goes (Sol r3, finding 1)."""
+
+    def migrate(self, old: Path) -> None:
+        text = (ROOT / "scripts/verify/build-on-host.sh").read_text(encoding="utf-8")
+        block = text[text.index("migrated=0\n"):]
+        block = block[:block.index("\nfi\n") + 4]
+        subprocess.run(["bash", "-c", f"set -euo pipefail\nold='{old}'\ncache='{old}-new'\n{block}"],
+                       check=True, capture_output=True, timeout=60)
+
+    def test_the_old_lock_stays_and_guards_what_a_holder_builds(self):
+        old = Path(tempfile.mkdtemp(prefix="verify-old-"))
+        self.addCleanup(shutil.rmtree, old, True)
+        (old / "lock").touch()
+        inode = (old / "lock").stat().st_ino
+        (old / "bin-0123456789ab").mkdir()
+        (old / "target\nnewline").mkdir()  # du prints such a name over two lines
+        self.migrate(old)
+        self.assertEqual(sorted(p.name for p in old.iterdir()), ["lock"])
+        self.assertEqual((old / "lock").stat().st_ino, inode)
+        # A build of the old kind holds the lock (a waiter that got it): its target survives a migration.
+        (old / "target-1.98.1").mkdir()
+        # --no-fork: the holder is the sleep itself, so killing it frees the lock and its pipes at once.
+        holder = subprocess.Popen(["flock", "--no-fork", str(old / "lock"), "sleep", "30"],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)
+        deadline = time.monotonic() + 10
+        while subprocess.run(["flock", "-n", str(old / "lock"), "true"]).returncode == 0:
+            self.assertLess(time.monotonic(), deadline, "the holder never took the lock")
+            time.sleep(0.05)
+        self.migrate(old)
+        self.assertTrue((old / "target-1.98.1").is_dir())
 
 
 class Launch(unittest.TestCase):
