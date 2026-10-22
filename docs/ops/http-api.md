@@ -29,6 +29,12 @@ rules and the rewriting's existentials entail, not every certain answer under OW
 ([semantics](../spec/reasoning-semantics.md)).
 The answers are never changed for it ([design](../design/ql-rewriting.md) §7).
 
+A reader of some graphs with `inferred = "visible"` gets `NRESE-Completeness: not-certified`
+wherever the QL rewriting runs, inside a transaction too: the status would be read from the
+schema of every graph. Answers may then be missing or wrong, and no regime, reason or count
+is given. Other readers get the status as before. Clients warn on `not-certified` and on any
+token they don't know; the console's CLI exits 3 under `--require-complete`.
+
 | Parameter | Meaning |
 |---|---|
 | `default-graph-uri`, `named-graph-uri` (repeatable) | The query's dataset; replaces its `FROM` clauses |

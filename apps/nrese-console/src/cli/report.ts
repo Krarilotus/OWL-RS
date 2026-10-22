@@ -33,7 +33,9 @@ export function textReport(
   if (response.ok && completeness && completeness.status !== "complete") {
     return {
       lines,
-      warnings: [`completeness=${completeness.header}`],
+      warnings: [completeness.status === "not-certified"
+        ? `completeness=${completeness.header}; soundness and completeness are not certified; answers may be missing or incorrect`
+        : `completeness=${completeness.header}`],
       exitCode: requireComplete ? INCOMPLETE_EXIT_CODE : 0,
     };
   }

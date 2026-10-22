@@ -266,6 +266,15 @@ Tree witnesses can be exponential in the query: k independent ones give 2^k bran
 
 ## 7. Completeness, reported with every answer
 
+**A reader of some graphs who sees every inference** (`inferred = "visible"`) is told
+`NRESE-Completeness: not-certified` wherever the rewriting runs, and no QL report: the
+assessment reads the schema of every graph, graphs the reader can't read included
+(R13-diag). The token asserts neither soundness nor completeness, so answers may be missing
+or wrong, and it carries no regime, reason or count. Whether the rewriting runs depends on
+the query and the configuration, not on the schema, so the token is the same with an empty
+schema, from the cache and inside a transaction. Other readers keep their status; EXPLAIN
+has its own rules. `Completeness::not_certified()` absorbs whatever it is merged with.
+
 The rewriting is complete for OWL 2 QL. Over the RL closure, axioms outside QL can meet
 the anonymous individuals it reasons about: a transitive property or a chain links them to
 other individuals, a functional property, key or cardinality makes one equal to a named
