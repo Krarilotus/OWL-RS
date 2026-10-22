@@ -1767,13 +1767,36 @@ pub(crate) fn same_as_of(rules: &[Rule]) -> Option<u64> {
     Equality::for_rules(rules).map(|equality| equality.same_as)
 }
 
-/// The rules the equality module replaces.
+/// One eligibility policy for source rules and their retained grounding provenance.
+/// Generic producers must run even when their proof name resembles a module rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EqualityRule {
+    Generic,
+    Replacement,
+    Closure,
+}
+
+/// Source-origin exemption, distinct from ordinary rules that execute generically.
+pub(crate) fn equality_exempt(rule: &Rule) -> bool {
+    matches!(rule.head, Head::Grouped(_))
+}
+
+pub(crate) fn equality_rule(rule: &Rule) -> EqualityRule {
+    // Keep the older Facts name contract and its fingerprint unchanged. Grouped
+    // sources are newly affected and must not acquire a module role by normalization.
+    if equality_exempt(rule) {
+        return EqualityRule::Generic;
+    }
+    match rule.name.as_str() {
+        "eq-rep-s" | "eq-rep-p" | "eq-rep-o" => EqualityRule::Replacement,
+        "eq-sym" | "eq-trans" => EqualityRule::Closure,
+        _ => EqualityRule::Generic,
+    }
+}
+
+/// The source rules the equality module replaces.
 pub(crate) fn is_replacement_rule(rule: &Rule) -> bool {
-    // Group-local constraints must run at their actual emission owner. Retain the
-    // existing name contract for older Facts rules; broad shape validation would
-    // change unrelated persisted programs outside the affected head marker.
-    !matches!(rule.head, Head::Grouped(_))
-        && matches!(rule.name.as_str(), "eq-rep-s" | "eq-rep-p" | "eq-rep-o")
+    equality_rule(rule) == EqualityRule::Replacement
 }
 
 impl Equality {
@@ -2344,11 +2367,7 @@ pub fn materialise_representatives_until(
 fn under_representatives(rules: &[Rule]) -> Vec<Rule> {
     rules
         .iter()
-        .filter(|r| {
-            !is_replacement_rule(r)
-                && !(!matches!(r.head, Head::Grouped(_))
-                    && matches!(r.name.as_str(), "eq-sym" | "eq-trans"))
-        })
+        .filter(|r| equality_rule(r) == EqualityRule::Generic)
         .cloned()
         .collect()
 }
