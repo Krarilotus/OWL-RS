@@ -28,23 +28,7 @@ pub(crate) fn write(file: &Path, entries: &[(&str, &str)]) -> EngineResult<()> {
     write_text(file, &text)
 }
 
-/// Gives `to` the sidecar `from` has, written as [`write`] does; or none, removing a stale
-/// one, if `from` has none. Before `to` itself is placed: a file never counts at its new
-/// place without its facts.
-pub(crate) fn copy(from: &Path, to: &Path) -> EngineResult<()> {
-    match fs::read_to_string(path_of(from)) {
-        Ok(text) => write_text(to, &text),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match fs::remove_file(path_of(to)) {
-                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
-                _ => Ok(()),
-            }
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn write_text(file: &Path, text: &str) -> EngineResult<()> {
+pub(crate) fn write_text(file: &Path, text: &str) -> EngineResult<()> {
     let path = path_of(file);
     let mut tmp = OsString::from(path.as_os_str());
     tmp.push(".tmp");
@@ -58,15 +42,22 @@ fn write_text(file: &Path, text: &str) -> EngineResult<()> {
 /// key). A sidecar that is there but can't be read is an error, never taken for a missing
 /// one.
 pub(crate) fn read(file: &Path, key: &str) -> std::io::Result<Option<String>> {
-    let text = match fs::read_to_string(path_of(file)) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    let text = match read_text(file)? {
+        Some(text) => text,
+        None => return Ok(None),
     };
     Ok(text.lines().find_map(|line| {
         let (name, value) = line.split_once('=')?;
         (name == key).then(|| value.to_owned())
     }))
+}
+
+pub(crate) fn read_text(file: &Path) -> std::io::Result<Option<String>> {
+    match fs::read_to_string(path_of(file)) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Removes the sidecar of `file`, if any.

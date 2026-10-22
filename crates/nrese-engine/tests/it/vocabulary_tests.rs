@@ -181,7 +181,7 @@ fn compressed_vocabularies_read_as_plain_ones() {
         .unwrap();
     // The flags' bit 1: the keys are compressed.
     let header = std::fs::read(checkpoint).unwrap();
-    assert_eq!(&header[..8], b"NRESECKB");
+    assert_eq!(&header[..8], b"NRESECKC");
     assert_eq!(
         u64::from_le_bytes(header[16..24].try_into().unwrap()) & 2,
         2
