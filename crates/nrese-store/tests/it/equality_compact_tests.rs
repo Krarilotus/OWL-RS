@@ -631,3 +631,122 @@ fn a_merging_commit_stores_the_representative_form_of_what_it_asserts() {
         }
     }
 }
+
+/// A rule's guards compare terms (N3's `log:notEqualTo`, PIE's `[Constraint]`), and a long
+/// list's axiom compares positions; equality by representatives decides them over the
+/// identities its values stand for, so every mode derives and rejects as replication does,
+/// in a commit and in a full materialisation (one compared it over representatives: a guard
+/// over two identities of one class saw `x != x`). Each row is a way that went wrong:
+/// - `guard`: two identities of one class satisfy `?x log:notEqualTo ?y`;
+/// - `constant`: an identity other than the rule's constant satisfies `?x log:notEqualTo :a`;
+/// - `later-merge`: a merge the rules derive makes a binding the rules saw before satisfy
+///   its guard, with no new fact to match;
+/// - `long-list`: two members of a long `owl:AllDisjointClasses` list in one class (the
+///   axiom compares positions; one rule for the whole list).
+#[test]
+fn guarded_rules_answer_as_replication_in_every_equality_mode() {
+    use crate::support::Writes;
+    use nrese_reasoner::UserRules;
+    const N3: &str = "@prefix : <http://example.com/> .
+@prefix log: <http://www.w3.org/2000/10/swap/log#> .
+{ ?x :p ?z . ?y :p ?z . ?x log:notEqualTo ?y } => { ?x :q ?z } .
+{ ?x :c ?z . ?x log:notEqualTo :a } => { ?x :r ?z } .
+";
+    let members: Vec<String> = (0..=nrese_reasoner::lists::PAIRWISE_MEMBERS)
+        .map(|i| format!("ex:C{i}"))
+        .collect();
+    let long_list = format!(
+        "[] a owl:AllDisjointClasses ; owl:members ({}) . ex:C3 owl:sameAs ex:C7 . ex:x a ex:C3",
+        members.join(" ")
+    );
+    let rows: [(&str, &str); 4] = [
+        (
+            "guard",
+            "ex:a ex:p ex:z . ex:b ex:p ex:z . ex:a owl:sameAs ex:b",
+        ),
+        ("constant", "ex:a ex:c ex:z . ex:a owl:sameAs ex:b"),
+        (
+            "later-merge",
+            "ex:f a owl:FunctionalProperty . ex:k ex:f ex:a . ex:k ex:f ex:b . ex:a ex:p ex:z",
+        ),
+        ("long-list", &long_list),
+    ];
+    let config = || {
+        let rules = UserRules::n3("guards.n3", N3).expect("the rules compile");
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl)
+            .with_rules(Some(Arc::new(rules)))
+            .expect("the rules apply")
+    };
+    let store = |mode: Mode| {
+        StoreService::new(StoreConfig {
+            equality_by_representatives: mode != Mode::Replicate,
+            equality_compact: mode == Mode::Compact,
+            ..in_memory_store_config()
+        })
+        .expect("store")
+    };
+    // What the user rules derived.
+    let derived = |store: &StoreService| -> String {
+        let mut facts: Vec<String> = ["q", "r"]
+            .iter()
+            .flat_map(|p| {
+                let pattern = StatementPattern {
+                    predicate: Some(nrese_rdf::NamedNode::new_unchecked(format!(
+                        "http://example.com/{p}"
+                    ))),
+                    ..StatementPattern::default()
+                };
+                store
+                    .statements(&nrese_store::ReadContext::all(), &pattern)
+                    .expect("statements")
+            })
+            .map(|quad| quad.to_string().replace("http://example.com/", ""))
+            .collect();
+        facts.sort();
+        facts.dedup();
+        facts.join(", ")
+    };
+    let insert =
+        |data: &str| SparqlUpdateRequest::new(format!("{PREFIXES} INSERT DATA {{ {data} }}"));
+    let committed = |mode: Mode, data: &str| -> String {
+        let pipeline = MutationPipeline::new(Arc::new(store(mode)), config());
+        match pipeline.apply(
+            MutationCommand::Update(insert(data)),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        ) {
+            Err(nrese_store::MutationError::Rejected(_)) => "rejected".to_owned(),
+            Err(error) => panic!("{error}"),
+            Ok(_) => derived(pipeline.store()),
+        }
+    };
+    let materialised = |mode: Mode, data: &str| -> String {
+        let store = store(mode);
+        store.execute_update(&insert(data)).expect("inserted");
+        let report = store
+            .rematerialise(config().materialised_program().expect("program"))
+            .expect("materialised");
+        match report.violations {
+            0 => derived(&store),
+            _ => "rejected".to_owned(),
+        }
+    };
+    let mut differences = Vec::new();
+    for (name, data) in rows {
+        for (path, run) in [
+            ("commit", &committed as &dyn Fn(Mode, &str) -> String),
+            ("materialise", &materialised),
+        ] {
+            let replicated = run(Mode::Replicate, data);
+            for mode in [Mode::Representatives, Mode::Compact] {
+                let answer = run(mode, data);
+                if answer != replicated {
+                    differences.push(format!(
+                        "{name} / {path} / {mode:?}: {answer}, replicated: {replicated}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(differences.is_empty(), "{}", differences.join("\n"));
+}

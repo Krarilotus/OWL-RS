@@ -1142,14 +1142,22 @@ fn a_commit_breaking_a_datatype_rule_is_rejected_with_the_rule_named() {
             &nrese_store::Requester::all(), &MutationTicket::new(),
         )
         .unwrap();
-    let error = pipeline
-        .apply(
-            insert(&format!("<{ex}b> <{ex}age> \"-5\"^^<{xsd}integer>")),
-            &nrese_store::Requester::all(),
-            &MutationTicket::new(),
-        )
-        .unwrap_err();
-    assert!(error.to_string().contains("dt-not-type"), "{error}");
+    // A well-typed value outside the range, and a mapped integer with no value.
+    for lexical in ["-5", "abc"] {
+        let before = pipeline.store().current_revision();
+        let error = pipeline
+            .apply(
+                insert(&format!("<{ex}b> <{ex}age> \"{lexical}\"^^<{xsd}integer>")),
+                &nrese_store::Requester::all(),
+                &MutationTicket::new(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("dt-not-type"),
+            "{lexical}: {error}"
+        );
+        assert_eq!(pipeline.store().current_revision(), before, "{lexical}");
+    }
     pipeline
         .apply(
             insert(&format!("<{ex}b> <{ex}age> \"5\"^^<{xsd}integer>")),

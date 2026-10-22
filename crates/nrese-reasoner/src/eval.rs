@@ -317,6 +317,24 @@ pub fn guards_hold(guards: &[Guard], bindings: &[Option<u64>]) -> bool {
         .all(|guard| guard.holds(|term| value(term, bindings)))
 }
 
+/// The active operation's guards: interruption is distinct from a guard that fails.
+pub(crate) fn guards_hold_polled(
+    guards: &[Guard],
+    bindings: &[Option<u64>],
+    poll: &mut Poller<'_>,
+) -> Result<bool, super::delta::Interrupted> {
+    for guard in guards {
+        let holds = match guard {
+            Guard::Classes(classes) => classes.holds_polled(&|term| value(term, bindings), poll)?,
+            _ => guard.holds(|term| value(term, bindings)),
+        };
+        if !holds {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Evaluates `order[depth..]` of `body`, calling `emit` for each complete binding. Each
 /// fact it scans, bound or not, is one unit `poll` counts; once the stop has fired, the rest
 /// of each scan under way is passed over (a scan can't be stopped) and nothing deeper is
@@ -335,7 +353,7 @@ pub fn walk<S: Source + ?Sized>(
     emit: &mut dyn FnMut(&[Option<u64>]),
 ) {
     let Some(&(index, seg)) = order.get(depth) else {
-        if guards_hold(guards, bindings) {
+        if matches!(guards_hold_polled(guards, bindings, poll), Ok(true)) {
             emit(bindings);
         }
         return;
@@ -370,7 +388,7 @@ pub fn walk_until<S: Source + ?Sized>(
     emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
 ) -> bool {
     let Some(&(index, seg)) = order.get(depth) else {
-        return guards_hold(guards, bindings) && emit(bindings);
+        return matches!(guards_hold_polled(guards, bindings, poll), Ok(true)) && emit(bindings);
     };
     let atom = &body[index];
     let mut stopped = false;
@@ -500,6 +518,11 @@ fn instance(
                     (a, b) => guards.push(Guard::SameList(a, b, index.clone())),
                 }
             }
+            // Decided when the rule is evaluated: whether a class holds identities that
+            // satisfy it changes as classes merge.
+            Guard::Classes(ref class_guards) => {
+                guards.push(Guard::Classes(class_guards.ground(substitution)));
+            }
         }
     }
     let head = match &rule.head {
@@ -537,6 +560,16 @@ pub fn ground<S: Source + ?Sized>(
     rule: &Rule,
     emit: &mut dyn FnMut(Grounded),
 ) {
+    ground_polled(source, schema, rule, &mut Poller::never(), emit);
+}
+
+fn ground_polled<S: Source + ?Sized>(
+    source: &S,
+    schema: &Schema,
+    rule: &Rule,
+    poll: &mut Poller<'_>,
+    emit: &mut dyn FnMut(Grounded),
+) {
     let (schema_atoms, instance_atoms) = split_schema(schema, rule);
     if schema_atoms.is_empty() {
         emit(Grounded {
@@ -558,8 +591,7 @@ pub fn ground<S: Source + ?Sized>(
         &order,
         0,
         &mut bindings,
-        // Grounding runs to its end: a program grounded part-way would be kept as if whole.
-        &mut Poller::never(),
+        poll,
         &mut |substitution| {
             if let Some(grounded) = instance(rule, &instance_atoms, substitution) {
                 emit(grounded);
@@ -575,6 +607,16 @@ pub fn ground_delta<S: Source + ?Sized>(
     source: &S,
     schema: &Schema,
     rule: &Rule,
+    emit: &mut dyn FnMut(Grounded),
+) {
+    ground_delta_polled(source, schema, rule, &mut Poller::never(), emit);
+}
+
+fn ground_delta_polled<S: Source + ?Sized>(
+    source: &S,
+    schema: &Schema,
+    rule: &Rule,
+    poll: &mut Poller<'_>,
     emit: &mut dyn FnMut(Grounded),
 ) {
     let (schema_atoms, instance_atoms) = split_schema(schema, rule);
@@ -602,13 +644,16 @@ pub fn ground_delta<S: Source + ?Sized>(
             &order,
             0,
             &mut bindings,
-            &mut Poller::never(),
+            poll,
             &mut |substitution| {
                 if let Some(grounded) = instance(rule, &instance_atoms, substitution) {
                     emit(grounded);
                 }
             },
         );
+        if poll.stopped() {
+            return;
+        }
     }
 }
 
@@ -796,6 +841,16 @@ impl<'a> Poller<'a> {
     /// Whether the stop fired: what was found since is incomplete.
     pub fn stopped(&self) -> bool {
         self.stopped
+    }
+
+    /// One non-scan unit (an exact guard candidate/check); a stop decides no result.
+    #[inline]
+    pub(crate) fn work(&mut self) -> Result<(), super::delta::Interrupted> {
+        if self.tick() {
+            Err(super::delta::Interrupted)
+        } else {
+            Ok(())
+        }
     }
 
     /// Counts one unit; true once the stop has fired. The common path is a test of
@@ -1440,9 +1495,31 @@ impl GroundProgram {
 
     /// Grounds `rules` (fact and consistency rules) over all of `source`.
     pub fn ground<S: Source + ?Sized>(&mut self, source: &S, schema: &Schema, rules: &[Rule]) {
+        let mut poll = Poller::never();
         for rule in rules {
-            self.ground_one(source, schema, rule, false, &[]);
+            self.ground_one(source, schema, rule, false, &[], &mut poll);
         }
+    }
+
+    /// Batch grounding with its latched stop. A partially grounded program is local to
+    /// that run and is discarded on interruption, never published as a whole program.
+    pub(crate) fn ground_until<S: Source + ?Sized>(
+        &mut self,
+        source: &S,
+        schema: &Schema,
+        rules: &[Rule],
+        delta: bool,
+        stop: Stop<'_>,
+    ) -> Result<(), super::delta::Interrupted> {
+        let mut poll = Poller::new(stop).ok_or(super::delta::Interrupted)?;
+        for rule in rules {
+            poll.work()?;
+            self.ground_one(source, schema, rule, delta, &[], &mut poll);
+            if poll.stopped() {
+                return Err(super::delta::Interrupted);
+            }
+        }
+        Ok(())
     }
 
     /// [`Self::ground`] for rules that come with premises of their own (list rules and the
@@ -1454,8 +1531,9 @@ impl GroundProgram {
         rules: &[Rule],
         premises: &[Vec<Triple>],
     ) {
+        let mut poll = Poller::never();
         for (rule, extra) in rules.iter().zip(premises) {
-            self.ground_one(source, schema, rule, false, extra);
+            self.ground_one(source, schema, rule, false, extra, &mut poll);
         }
     }
 
@@ -1469,14 +1547,16 @@ impl GroundProgram {
         rules: &[Rule],
     ) -> (Vec<usize>, Vec<usize>) {
         let (mut facts, mut checks) = (Vec::new(), Vec::new());
+        let mut poll = Poller::never();
         for rule in rules {
-            let (f, c) = self.ground_one(source, schema, rule, true, &[]);
+            let (f, c) = self.ground_one(source, schema, rule, true, &[], &mut poll);
             facts.extend(f);
             checks.extend(c);
         }
         (facts, checks)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ground_one<S: Source + ?Sized>(
         &mut self,
         source: &S,
@@ -1484,6 +1564,7 @@ impl GroundProgram {
         rule: &Rule,
         delta: bool,
         extra: &[Triple],
+        poll: &mut Poller<'_>,
     ) -> (Vec<usize>, Vec<usize>) {
         let (mut facts, mut checks) = (Vec::new(), Vec::new());
         // Source-level transitivity rules (`scm-sco`, `scm-spo`) don't depend on the
@@ -1516,9 +1597,12 @@ impl GroundProgram {
             self.family_relations.entry(p).or_insert(family);
         }
         if delta && has_schema_atoms {
-            ground_delta(source, schema, rule, &mut |g| grounded.push(g));
+            ground_delta_polled(source, schema, rule, poll, &mut |g| grounded.push(g));
         } else {
-            ground(source, schema, rule, &mut |g| grounded.push(g));
+            ground_polled(source, schema, rule, poll, &mut |g| grounded.push(g));
+        }
+        if poll.stopped() {
+            return (facts, checks);
         }
         for g in grounded {
             if rule.head == Head::Inconsistent {
