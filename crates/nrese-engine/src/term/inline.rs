@@ -88,6 +88,27 @@ pub(crate) fn inline_to_literal(id: TermId) -> Option<Literal> {
     Some(Literal::new_typed_literal(lexical, datatype))
 }
 
+/// Peak heap of `inline_to_literal`, including its formatter scratch, String growth
+/// overlap and datatype copy. Payload width bounds all formatting, even for raw IDs:
+/// at most 20 integer digits, 19 decimal characters, 25 date characters or 36 dateTime
+/// characters; the longest datatype is 52 bytes. Decimal holds its padded digits beside
+/// its result; dates hold date/timezone/fraction scratch beside the final String. 256
+/// covers their growth overlap as well as the retained literal. No allocation or scan.
+pub(super) fn decode_peak(id: TermId) -> Option<usize> {
+    match id.kind() {
+        TermKind::Integer
+        | TermKind::Boolean
+        | TermKind::Decimal
+        | TermKind::Date
+        | TermKind::DateTime => Some(256),
+        TermKind::DerivedInteger => {
+            let (_, code) = decode_derived(id.payload());
+            DERIVED.get(code).map(|_| 256)
+        }
+        _ => None,
+    }
+}
+
 // --- xsd:integer ------------------------------------------------------------------------
 
 /// Offset binary (`value - INT_MIN`), so payload order is numeric order and a FILTER range
