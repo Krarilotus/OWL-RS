@@ -259,7 +259,7 @@ impl<'a> IntoIterator for &'a VectorHits {
 pub(crate) fn search(
     index: &RwLock<VectorIndex>,
     query: &VectorQuery,
-    eligible: &(dyn Fn(u64) -> bool + Sync),
+    eligible: &(impl Fn(u64) -> bool + Sync + ?Sized),
     bound: usize,
     accept: &(dyn Fn(u64) -> bool + Sync),
     budget: &Arc<Budget>,

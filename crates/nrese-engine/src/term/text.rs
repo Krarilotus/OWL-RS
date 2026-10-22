@@ -608,6 +608,7 @@ impl Corpus {
     }
 
     /// Whether `document` is one of its documents.
+    #[inline]
     pub fn contains(&self, document: u64) -> bool {
         match &self.members {
             Members::Bits(bits) => {

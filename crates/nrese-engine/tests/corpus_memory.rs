@@ -1,14 +1,15 @@
 //! Guard of the full-text corpora's memory under churn (docs/design/performance.md §0):
 //! commits over a bounded pool of literals, each followed by a search, derive each version's
 //! corpus from the last; the corpus and the lineage they keep must not grow past the first
-//! rounds. Counted with a counting allocator, so this file is a test binary of its own.
+//! rounds. The heap counter covers the whole process, so each test runs alone.
 
 use nrese_engine::{Engine, EngineConfig, TextQuery};
-use nrese_exec::heap;
+use nrese_exec::{heap, measure};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
 
 #[global_allocator]
-static ALLOCATOR: heap::Counting<std::alloc::System> = heap::Counting(std::alloc::System);
+static ALLOCATOR: heap::Counting<measure::Measured<std::alloc::System>> =
+    heap::Counting(measure::Measured(std::alloc::System));
 
 /// Literals and subjects the commits draw from.
 const POOL: u64 = 2_000;
@@ -27,6 +28,9 @@ fn label(i: u64) -> Quad {
 
 #[test]
 fn corpora_under_churn_hold_the_heap_level() {
+    if !measure::alone() {
+        return;
+    }
     let engine = Engine::new(EngineConfig {
         background_maintenance: false,
         ..EngineConfig::default()
@@ -93,6 +97,9 @@ fn corpora_under_churn_hold_the_heap_level() {
 /// loaded machine's work stealing grows and frees later.
 #[test]
 fn kept_keys_are_within_the_budget() {
+    if !measure::alone() {
+        return;
+    }
     use nrese_engine::{ReadModel, TextScope};
     let engine = Engine::new(EngineConfig {
         text_corpus_bytes: 1024,
