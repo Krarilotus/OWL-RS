@@ -174,7 +174,7 @@ type Measured = Result<(Vec<Duration>, (u64, u64))>;
 
 fn commits(dir: &Path, sync: SyncPolicy, n: u64) -> Measured {
     let config = config(sync, DurabilityConfig::default());
-    let engine = Engine::open(dir, config)?;
+    let engine = Engine::open(dir, config.clone())?;
     let mut times = Vec::with_capacity(n as usize);
     for i in 0..n {
         let at = Instant::now();
@@ -205,7 +205,7 @@ fn bulk(engine: &Engine, n: u64) -> Result<()> {
 
 fn checkpoint(dir: &Path, n: u64) -> Measured {
     let config = config(SyncPolicy::EveryCommit, DurabilityConfig::default());
-    let engine = Engine::open(dir, config)?;
+    let engine = Engine::open(dir, config.clone())?;
     bulk(&engine, n)?;
     let mut tx = engine.transaction();
     tx.insert(quad(n).as_ref());
@@ -227,7 +227,7 @@ fn open(dir: &Path, segments: u64, per_commit: u64) -> Measured {
     };
     let config = config(SyncPolicy::EveryCommit, durability);
     {
-        let engine = Engine::open(dir, config)?;
+        let engine = Engine::open(dir, config.clone())?;
         for commit in 0..segments {
             let mut tx = engine.transaction();
             for i in 0..per_commit {
@@ -249,7 +249,7 @@ fn load(dir: &Path, n: u64, spill: bool) -> Measured {
         ..DurabilityConfig::default()
     };
     let config = config(SyncPolicy::EveryCommit, durability);
-    let engine = Engine::open(dir, config)?;
+    let engine = Engine::open(dir, config.clone())?;
     let at = Instant::now();
     bulk(&engine, n)?;
     let time = at.elapsed();

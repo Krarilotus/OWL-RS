@@ -4,6 +4,9 @@ pub type EngineResult<T> = Result<T, EngineError>;
 
 #[derive(Debug, Error)]
 pub enum EngineError {
+    /// Work refused by its memory budget before it allocated: nothing was changed.
+    #[error("not enough memory: {0}")]
+    MemoryLimit(#[from] nrese_exec::BudgetExceeded),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
     #[error("storage corruption: {0}")]

@@ -44,6 +44,75 @@ pub struct Snapshot {
     /// What the canonical views versions keep are charged to, beside the readers' own
     /// budgets ([`crate::Engine::set_canonical_view_budget`]).
     views: Arc<nrese_exec::Budget>,
+    /// The reader's budget, where it brought one ([`Self::reading_within`]).
+    reads: Option<ReadBudget>,
+}
+
+/// A reader's budget for what its reads hold while they run, and the first charge it
+/// refused ([`Snapshot::reading_within`]).
+#[derive(Debug)]
+pub(crate) struct Reads {
+    budget: Arc<nrese_exec::Budget>,
+    refused: std::sync::OnceLock<nrese_exec::BudgetExceeded>,
+}
+
+impl Reads {
+    /// Charges `bytes`; false, the refusal kept, where the budget has no room.
+    pub(crate) fn charge(&self, bytes: usize) -> bool {
+        match self.budget.charge(bytes) {
+            Ok(()) => true,
+            Err(refused) => {
+                let _ = self.refused.set(refused);
+                false
+            }
+        }
+    }
+
+    pub(crate) fn release(&self, bytes: usize) {
+        self.budget.release(bytes);
+    }
+}
+
+/// A handle on one reader's [`Reads`], shared by its snapshots and their scans. The state's
+/// own allocation is charged to the reader's budget before it is made, and released once
+/// the last handle has freed it.
+#[derive(Debug)]
+pub(crate) struct ReadBudget(Option<Arc<Reads>>);
+
+impl ReadBudget {
+    /// The bytes of the shared state: the Arc's two counts and [`Reads`].
+    const BYTES: usize = 2 * size_of::<usize>() + size_of::<Reads>();
+
+    fn new(budget: Arc<nrese_exec::Budget>) -> Result<Self, nrese_exec::BudgetExceeded> {
+        budget.charge(Self::BYTES)?;
+        Ok(Self(Some(Arc::new(Reads {
+            budget,
+            refused: std::sync::OnceLock::new(),
+        }))))
+    }
+}
+
+impl Clone for ReadBudget {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl std::ops::Deref for ReadBudget {
+    type Target = Reads;
+
+    fn deref(&self) -> &Reads {
+        self.0.as_ref().expect("a live handle")
+    }
+}
+
+impl Drop for ReadBudget {
+    /// The last handle frees the state, then releases its charge.
+    fn drop(&mut self) {
+        if let Some(Reads { budget, .. }) = self.0.take().and_then(Arc::into_inner) {
+            budget.release(Self::BYTES);
+        }
+    }
 }
 
 /// The canonical view of `version` under `same_as` ([`Snapshot::canonical_data`]): made on
@@ -151,6 +220,7 @@ impl Snapshot {
             canonical: false,
             canonical_data: None,
             views,
+            reads: None,
         }
     }
 
@@ -167,6 +237,27 @@ impl Snapshot {
             canonical_data: None,
             ..self.clone()
         }
+    }
+
+    /// This snapshot charging what its reads hold while they run to `budget` (a query's): the
+    /// copies an equality expansion holds until they are in order ([`Expand`]). A read the
+    /// budget has no room for stops, and the refusal is kept: [`Self::read_refused`] tells the
+    /// reader, which must not use what it read then. Without one, reads charge nothing. The
+    /// reader's shared state is charged to `budget` too: refused where it has no room for it.
+    pub fn reading_within(
+        &self,
+        budget: Arc<nrese_exec::Budget>,
+    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        Ok(Snapshot {
+            reads: Some(ReadBudget::new(budget)?),
+            ..self.clone()
+        })
+    }
+
+    /// The first charge a read refused since [`Self::reading_within`]: what was read since
+    /// may be incomplete.
+    pub fn read_refused(&self) -> Option<nrese_exec::BudgetExceeded> {
+        self.reads.as_ref()?.refused.get().copied()
     }
 
     /// This snapshot reading the statements as stored: no equality expansion.
@@ -375,6 +466,7 @@ impl Snapshot {
         Snapshot {
             canonical_data,
             views: Arc::clone(&self.views),
+            reads: self.reads.clone(),
             version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::default(),
@@ -403,6 +495,7 @@ impl Snapshot {
         Snapshot {
             canonical_data,
             views: Arc::clone(&self.views),
+            reads: self.reads.clone(),
             version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::default(),
@@ -432,6 +525,7 @@ impl Snapshot {
         Some(Snapshot {
             canonical_data,
             views: Arc::clone(&self.views),
+            reads: self.reads.clone(),
             version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::default(),
@@ -533,7 +627,8 @@ impl Snapshot {
             named && !renamed,
             model,
             data,
-        );
+        )
+        .charging(self.reads.clone());
         let named = named_plan
             .into_iter()
             .flat_map(move |plan| data.asserted.scan_plan(&plan))
@@ -545,58 +640,18 @@ impl Snapshot {
         })
     }
 
-    /// The expanded matches of `pattern` in `model`, in the order of its access plan.
+    /// The expanded matches of `pattern` in `model`, in the order of its access plan,
+    /// merged as they are read: nothing is collected. Every layout keeps the permutation a
+    /// pattern's access plan reads (`Layout::supports`, tested over every pattern shape).
     fn expanded<'a>(
         &'a self,
         classes: Arc<EqualityClasses>,
         model: ReadModel,
         pattern: &QuadPattern,
     ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
-        let data = self.data(model);
         let permutation = AccessPlan::for_pattern(&classes.normalised(pattern)).permutation;
-        match self.expanded_sorted(Arc::clone(&classes), model, pattern, permutation) {
-            Some(sorted) => Either::Left(sorted),
-            None => {
-                // A layout without the permutation: every match, then sorted.
-                let mut all: Vec<EncodedQuad> = Vec::new();
-                let normalised = classes.normalised(pattern);
-                for stack in Stack::ALL {
-                    for quad in data.stack(stack).scan(&normalised) {
-                        if !quad.graph.is_default_graph() {
-                            if model == ReadModel::Materialised
-                                && (normalised == *pattern || self.canonical)
-                            {
-                                all.push(quad);
-                            }
-                            continue;
-                        }
-                        if !classes.is_canonical(&quad) {
-                            continue;
-                        }
-                        let touching = classes.touches(&quad);
-                        let visibility = CopyVisibility::new(data, model);
-                        classes.expand(&quad, pattern, &mut |copy| {
-                            if visibility.shows(&copy, touching) {
-                                all.push(copy);
-                            }
-                        });
-                    }
-                }
-                if model == ReadModel::Materialised
-                    && pattern.graph == GraphSelector::Any
-                    && normalised != *pattern
-                    && !self.canonical
-                {
-                    all.extend(
-                        data.asserted
-                            .scan(pattern)
-                            .filter(|quad| !quad.graph.is_default_graph()),
-                    );
-                }
-                all.sort_unstable_by_key(|quad| permutation.to_key(quad));
-                Either::Right(all.into_iter())
-            }
-        }
+        self.expanded_sorted(classes, model, pattern, permutation)
+            .expect("every layout keeps the permutation of a pattern's access plan")
     }
 
     /// The number of quads matching `pattern` in `model`, expanded: the stored matches over
@@ -686,6 +741,7 @@ impl Snapshot {
         Snapshot {
             canonical_data,
             views: Arc::clone(&self.views),
+            reads: self.reads.clone(),
             version,
             dictionary: Arc::clone(&self.dictionary),
             statistics: Arc::clone(&self.statistics),
@@ -1286,8 +1342,8 @@ impl Snapshot {
     /// The characteristic sets of the default graph in `model`, for estimates of star
     /// joins ([`super::characteristic`]): kept (drifted ones while one rebuild replaces
     /// them), read, or built before this returns, the first time (a caller that arrives
-    /// during that build waits for it; on a Rayon worker it gets `None`); `None` also
-    /// where the graph's subjects have too many.
+    /// during that build helps with it and waits for it, on a Rayon worker too); `None`
+    /// also where the graph's subjects have too many, or the build failed.
     pub fn characteristic_sets_in(
         &self,
         model: ReadModel,
@@ -1328,6 +1384,32 @@ impl Snapshot {
     }
 
     /// Id of `term` as of this snapshot; `None` if the term is unknown (so no quad uses it).
+    /// [`Self::lookup`], what it allocates charged first through `charge`
+    /// ([`Dictionary::lookup_charged`]: the bound and the lookup read one state of the
+    /// dictionary, which a checkpoint may otherwise change between them).
+    pub fn lookup_charged<E>(
+        &self,
+        term: TermRef<'_>,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<Option<TermId>, E> {
+        self.dictionary
+            .lookup_charged(term, self.version.dictionary_len, charge)
+    }
+
+    /// The most bytes a read of this snapshot in `model` holds while it runs
+    /// ([`Self::quads_for_pattern_in`] without equality expansion): each stack's merge,
+    /// its cursors and a decoded block per run. What a charged reader reserves first. The
+    /// runs are this snapshot's own, which no checkpoint changes. An expansion holds its
+    /// pending copies besides.
+    pub fn scan_bytes(&self, model: ReadModel) -> usize {
+        let data = self.data(model);
+        Stack::ALL
+            .into_iter()
+            .filter(|&stack| model.includes(stack))
+            .map(|stack| data.stack(stack).scan_bytes())
+            .sum()
+    }
+
     pub fn lookup(&self, term: TermRef<'_>) -> Option<TermId> {
         self.dictionary
             .lookup_bounded(term, self.version.dictionary_len)
@@ -1363,6 +1445,32 @@ impl Snapshot {
 
     pub fn decode(&self, id: TermId) -> Option<Term> {
         self.dictionary.decode(id)
+    }
+
+    /// [`Self::decode`] of the dictionary term `id`, what it allocates charged first
+    /// through `charge` ([`Dictionary::decode_charged`]: the bound and the decoding read one
+    /// state of the dictionary). `Ok(None)` for inline ids, triple terms and ids this
+    /// snapshot doesn't know.
+    pub fn decode_charged<E>(
+        &self,
+        id: TermId,
+        charge: impl FnOnce(usize) -> Result<(), E>,
+    ) -> Result<Option<Term>, E> {
+        if id.kind().is_dictionary() && id.payload() >= self.version.dictionary_len {
+            return Ok(None);
+        }
+        self.dictionary.decode_charged(id, charge)
+    }
+
+    /// An upper bound of the bytes [`Self::decode`] allocates for `id`, for the dictionary
+    /// as stored now: a checkpoint may store the term compressed after, so a charge for a
+    /// decode goes through [`Self::decode_charged`]. `None` for inline ids, triple terms and
+    /// ids this snapshot doesn't know.
+    pub fn decode_bound(&self, id: TermId) -> Option<usize> {
+        if id.kind().is_dictionary() && id.payload() >= self.version.dictionary_len {
+            return None;
+        }
+        self.dictionary.decode_bound(id)
     }
 
     /// Calls `f` with a borrowed view of the dictionary term `id` (see

@@ -22,8 +22,11 @@
 //! `subj`, `pred`, `obj` and `context` are written as in N-Triples (`<iri>`, `_:b`,
 //! `"text"@en`, `"1"^^<…#int>`); `context=null` is the default graph. A transaction's
 //! operations are kept on the server and applied in one commit; reads inside one
-//! (`action=QUERY`, `GET`, `SIZE`) see its changes: its operations are applied to an engine
-//! transaction that is never committed, holding the writer slot while they read. Namespaces
+//! (`action=QUERY`, `GET`, `SIZE`) see its changes: its operations are applied to a
+//! speculative engine transaction over the latest revision, never committed, so it takes no
+//! writer slot and other clients commit meanwhile (`StoreService::with_pending`). That is
+//! RDF4J's SNAPSHOT_READ: a transaction asking for a stronger level is refused at its begin
+//! ([`transaction_begin`]). Namespaces
 //! are kept in `rdf4j-namespaces.json` in an on-disk store's directory (in memory
 //! otherwise), written whole at every change.
 
@@ -112,35 +115,32 @@ pub(crate) fn term(text: &str) -> Result<Term, ApiError> {
     Ok(Literal::new_typed_literal(value, datatype).into())
 }
 
-/// N-Triples string escapes undone.
+/// N-Triples string escapes undone; `None` for a malformed one (a `\u` escape takes exactly
+/// four hex digits, `\U` eight, as everywhere else).
 fn unescape(text: &str) -> Option<String> {
     let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next()? {
-            't' => out.push('\t'),
-            'b' => out.push('\u{8}'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            'f' => out.push('\u{c}'),
-            '"' => out.push('"'),
-            '\'' => out.push('\''),
-            '\\' => out.push('\\'),
-            'u' => out.push(hex(&mut chars, 4)?),
-            'U' => out.push(hex(&mut chars, 8)?),
+    let mut rest = text;
+    while let Some(at) = rest.find('\\') {
+        out.push_str(&rest[..at]);
+        let escape = &rest[at..];
+        let (c, width) = match escape.as_bytes().get(1)? {
+            b't' => ('\t', 2),
+            b'b' => ('\u{8}', 2),
+            b'n' => ('\n', 2),
+            b'r' => ('\r', 2),
+            b'f' => ('\u{c}', 2),
+            b'"' => ('"', 2),
+            b'\'' => ('\'', 2),
+            b'\\' => ('\\', 2),
+            b'u' => (nrese_rdf::escape::unicode_escape(escape.as_bytes(), 0)?, 6),
+            b'U' => (nrese_rdf::escape::unicode_escape(escape.as_bytes(), 0)?, 10),
             _ => return None,
-        }
+        };
+        out.push(c);
+        rest = &escape[width..];
     }
+    out.push_str(rest);
     Some(out)
-}
-
-fn hex(chars: &mut std::str::Chars<'_>, digits: usize) -> Option<char> {
-    let code: String = chars.take(digits).collect();
-    char::from_u32(u32::from_str_radix(&code, 16).ok()?)
 }
 
 /// The graphs of the `context` parameters (`null`: the default graph).
@@ -393,16 +393,34 @@ pub async fn repositories(
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &authenticated).await?;
     let writable = state.runtime_posture().sparql_update_enabled;
-    let ids = std::iter::once((DEFAULT_REPOSITORY.to_owned(), Some("NRESE".to_owned())))
-        .chain(state.repositories().list());
+    // Those that didn't open at start are listed neither readable nor writable.
+    let ids = std::iter::once((
+        DEFAULT_REPOSITORY.to_owned(),
+        Some("NRESE".to_owned()),
+        state.default_unavailable().is_none(),
+    ))
+    .chain(
+        state
+            .repositories()
+            .list()
+            .into_iter()
+            .map(|(id, title)| (id, title, true)),
+    )
+    .chain(
+        state
+            .repositories()
+            .unavailable_list()
+            .into_iter()
+            .map(|(id, _)| (id, None, false)),
+    );
     let rows = ids
-        .map(|(id, title)| {
+        .map(|(id, title, open)| {
             vec![
                 literal(format!("/repositories/{id}")),
                 literal(id.as_str()),
                 literal(title.unwrap_or_else(|| format!("NRESE: {id}"))),
-                Some(Literal::from(true).into()),
-                Some(Literal::from(writable).into()),
+                Some(Literal::from(open).into()),
+                Some(Literal::from(open && writable).into()),
             ]
         })
         .collect();
@@ -527,12 +545,13 @@ async fn statements(
     let format = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
     let store = state.store();
     let (scope, infer) = (access.read_scope(), infer(&pairs));
-    // Streamed as read: a whole repository in constant memory.
-    let deadline = tokio::time::Instant::now() + state.policy().timeouts.graph_read;
+    // Streamed as read: a whole repository in constant memory, for as long as the client
+    // keeps reading.
+    let pace = super::result_stream::Pace::stalled_after(state.policy().timeouts.graph_read);
     let cancellation = nrese_store::CancellationToken::new();
     let token = cancellation.clone();
     super::result_stream::stream_blocking(
-        deadline,
+        pace,
         cancellation,
         format.media_type(),
         "reading the statements exceeded the policy timeout",
@@ -824,15 +843,81 @@ fn absolute(headers: &HeaderMap, path: &str) -> String {
     format!("{scheme}://{host}{path}")
 }
 
+/// The isolation levels a transaction may ask for (RDF4J's `IsolationLevels`) and whether
+/// this server's transactions meet each. Each of their reads sees the latest commit with
+/// the transaction's own operations applied, one snapshot per read: SNAPSHOT_READ, and so
+/// every weaker level. SNAPSHOT (one snapshot for the whole transaction) and SERIALIZABLE
+/// (conflicting commits refused) they don't give; holding a revision is v1.6's.
+const ISOLATION_LEVELS: [(&str, bool); 6] = [
+    ("NONE", true),
+    ("READ_UNCOMMITTED", true),
+    ("READ_COMMITTED", true),
+    ("SNAPSHOT_READ", true),
+    ("SNAPSHOT", false),
+    ("SERIALIZABLE", false),
+];
+/// Where a begin names its isolation level: RDF4J's client since 3.3 (a transaction setting,
+/// in the form body), and the older parameter (graphdb.js, in the URL), whose value may carry
+/// the Sesame namespace.
+const ISOLATION_SETTING: &str =
+    "transaction-setting__org.eclipse.rdf4j.common.transaction.IsolationLevel";
+const ISOLATION_LEGACY: &str = "isolation-level";
+const SESAME: &str = "http://www.openrdf.org/schema/sesame#";
+
+/// Refuses a begin that names an isolation level this server's transactions don't meet, or
+/// one RDF4J doesn't know, looking in the URL and a form body under either name, as RDF4J's
+/// server does. The reason is plain text, which RDF4J's client shows as its exception's
+/// message (its Workbench then leaves the level out of its list). A refused level is never
+/// given weaker in silence; no level named means the server's own.
+fn check_isolation(raw: &RawQuery, headers: &HeaderMap, body: &Bytes) -> Result<(), ApiError> {
+    let mut named = pairs(raw)?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    if media_type_matches(content_type, "application/x-www-form-urlencoded") {
+        named.extend(
+            serde_urlencoded::from_bytes::<Vec<(String, String)>>(body)
+                .map_err(|error| ApiError::bad_request_plain_text(error.to_string()))?,
+        );
+    }
+    for (name, value) in named {
+        let level = match name.as_str() {
+            ISOLATION_SETTING => value.as_str(),
+            ISOLATION_LEGACY => value.strip_prefix(SESAME).unwrap_or(value.as_str()),
+            _ => continue,
+        };
+        match ISOLATION_LEVELS.iter().find(|(known, _)| *known == level) {
+            Some((_, true)) => {}
+            Some((known, false)) => {
+                return Err(ApiError::bad_request_plain_text(format!(
+                    "isolation level {known} isn't supported: a transaction here reads the \
+                     latest commit with its own changes, one snapshot per read (SNAPSHOT_READ); \
+                     ask for NONE, READ_UNCOMMITTED, READ_COMMITTED or SNAPSHOT_READ"
+                )));
+            }
+            None => {
+                return Err(ApiError::bad_request_plain_text(format!(
+                    "unknown isolation level '{value}' in {name}; the levels are NONE, \
+                     READ_UNCOMMITTED, READ_COMMITTED, SNAPSHOT_READ, SNAPSHOT and SERIALIZABLE"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn transaction_begin(
     authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
+    raw: RawQuery,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, ApiError> {
     // Authenticated first; the view is the repository's (workspaces are per repository).
     let identity = guard::enforce_update_write(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
+    check_isolation(&raw, &headers, &body)?;
     let access = guard::view(&state, &identity);
     let txid = state
         .store()
@@ -972,6 +1057,11 @@ mod tests {
         assert!(matches!(term("_:b1").unwrap(), Term::BlankNode(_)));
         assert!(term("plain").is_err());
         assert!(term("\"open").is_err());
+        // A truncated or signed `\u` escape is refused, never read as another character
+        // (a DELETE with it would remove a different statement).
+        assert!(term("\"\\u12\"").is_err());
+        assert!(term("\"\\u+041\"").is_err());
+        assert!(term("<http://e/\\U0001F98>").is_err());
     }
 
     #[test]

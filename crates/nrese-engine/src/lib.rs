@@ -14,6 +14,13 @@
 //! policy (L3 `nrese-store`), transport (L4). Fix storage-layout, visibility and durability
 //! bugs here and nowhere else.
 
+/// The unit tests' allocator: the system's, counting what measured operations hold
+/// against their budgets ([`nrese_exec::measure`]), so that an allocation not charged to its
+/// budget fails a test.
+#[cfg(test)]
+#[global_allocator]
+static MEASURED: nrese_exec::measure::Measured<std::alloc::System> =
+    nrese_exec::measure::Measured(std::alloc::System);
 pub mod cpu;
 mod durability;
 pub mod engine;
@@ -24,6 +31,7 @@ pub mod memory;
 pub mod quad;
 pub mod term;
 
+pub use durability::checkpoint::image_revision;
 pub use durability::{
     DurabilityConfig, SyncPolicy, copy_log_segment, place_file, remove_log_segment,
 };

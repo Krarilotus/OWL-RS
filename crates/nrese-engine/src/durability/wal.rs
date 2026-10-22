@@ -145,7 +145,18 @@ pub(crate) fn remove_segment(path: &Path) -> EngineResult<()> {
 /// reached before it (the checkpoint's, or the last record replayed), the least bound on
 /// what an uncovered record after damage in it can be.
 pub(crate) fn read_segment(path: &Path, reached: u64) -> EngineResult<SegmentContents> {
-    let bytes = fs::read(path)?;
+    read_open_segment(&mut File::open(path)?, path, reached)
+}
+
+/// Read an already open segment while retaining recovery's revision bound. Replication
+/// keeps this handle readable across archive/release and uses only complete records.
+pub(crate) fn read_open_segment(
+    file: &mut File,
+    path: &Path,
+    reached: u64,
+) -> EngineResult<SegmentContents> {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(file, &mut bytes)?;
     if bytes.len() < SEGMENT_MAGIC.len() {
         // Crash while creating the segment: treat it as empty and torn.
         return Ok(SegmentContents {
@@ -670,6 +681,67 @@ fn create_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A rematerialisation whose covered log segments can't be released (held, on Windows)
+    /// has published its inferences: it succeeds, and the next checkpoint that writes (after
+    /// a commit) releases them.
+    /// Reported as failed, its caller would take the published inferences for the old ones.
+    #[test]
+    fn a_published_rematerialisation_survives_a_failed_segment_release() {
+        use crate::{DurabilityConfig, Engine, EngineConfig, SyncPolicy};
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            background_maintenance: false,
+            durability: DurabilityConfig {
+                sync: SyncPolicy::EveryCommit,
+                ..DurabilityConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        let engine = Engine::open(dir.path(), config).unwrap();
+        let node = |n: &str| nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{n}"));
+        let mut tx = engine.transaction();
+        let quad = nrese_rdf::Quad::new(
+            node("a"),
+            node("p"),
+            node("b"),
+            nrese_rdf::GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+        tx.commit().unwrap();
+        let segments = || {
+            super::list_segments(&super::wal_dir(dir.path()))
+                .unwrap()
+                .len()
+        };
+        let rematerialisation = engine.rematerialisation();
+        // One statement that isn't asserted (an asserted one isn't inferred: nothing would
+        // change, and nothing be published).
+        let id =
+            |n: &str| rematerialisation.intern(nrese_rdf::TermRef::NamedNode(node(n).as_ref()));
+        let inferred = vec![crate::EncodedTriple {
+            subject: id("a"),
+            predicate: id("q"),
+            object: id("b"),
+        }];
+        crate::durability::fault::fail_at(crate::durability::fault::Step::Release);
+        let finished = rematerialisation.finish(inferred);
+        assert!(finished.is_ok(), "{:?}", finished.err());
+        assert_eq!(engine.stats().inferred, 1, "published");
+        let kept = segments();
+        assert!(kept >= 2, "the covered segment is still there ({kept})");
+        // The next checkpoint that writes (after a commit; one with nothing new returns early).
+        let mut tx = engine.transaction();
+        let next = nrese_rdf::Quad::new(
+            node("c"),
+            node("p"),
+            node("d"),
+            nrese_rdf::GraphName::DefaultGraph,
+        );
+        tx.insert(next.as_ref());
+        tx.commit().unwrap();
+        engine.checkpoint().unwrap();
+        assert!(segments() < kept, "the next checkpoint released it");
+    }
 
     /// After a process crash the replayed tail may be in the page cache alone: when opening
     /// starts a new segment (here: another sync policy), the newest old one is synced before
