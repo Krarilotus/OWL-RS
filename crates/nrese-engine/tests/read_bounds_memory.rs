@@ -4,7 +4,7 @@
 //! Measured against the charging budget (`nrese_exec::measure`), so this file is a test
 //! binary of its own.
 
-use nrese_engine::{Engine, EngineConfig, VocabularyEncoding, set_vocabulary_encoding};
+use nrese_engine::{Engine, EngineConfig, VocabularyEncoding};
 use nrese_exec::{Budget, measure};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 
@@ -21,10 +21,10 @@ fn a_read_charged_across_a_checkpoint_holds_no_more_than_its_charge() {
     if !measure::alone() {
         return;
     }
-    set_vocabulary_encoding(VocabularyEncoding::Fsst);
     let dir = tempfile::tempdir().unwrap();
     let config = EngineConfig {
         background_maintenance: false,
+        vocabulary: VocabularyEncoding::Fsst,
         ..EngineConfig::default()
     };
     let engine = Engine::open(dir.path(), config).unwrap();

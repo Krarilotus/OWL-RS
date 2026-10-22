@@ -226,6 +226,22 @@ nrese_support_seconds_total{{phase=\"view\"}} {}
         support.updating_us as f64 / 1e6,
         support.viewing_us as f64 / 1e6,
     ));
+    let corpora = engine.text_corpora;
+    body.push_str(&format!(
+        "# HELP nrese_text_corpus_bytes The kept full-text corpora (the documents each search scope ranks among), and their budget.
+# TYPE nrese_text_corpus_bytes gauge
+nrese_text_corpus_bytes{{of=\"kept\"}} {}
+nrese_text_corpus_bytes{{of=\"budget\"}} {}
+# HELP nrese_text_corpora The full-text corpora kept.
+# TYPE nrese_text_corpora gauge
+nrese_text_corpora {}
+# HELP nrese_text_corpora_built_total Full-text corpora built by a walk of the store, and derived from an earlier version's.
+# TYPE nrese_text_corpora_built_total counter
+nrese_text_corpora_built_total{{how=\"walked\"}} {}
+nrese_text_corpora_built_total{{how=\"derived\"}} {}
+",
+        corpora.bytes, corpora.budget, corpora.kept, corpora.walked, corpora.derived,
+    ));
     state.request_metrics().render(&mut body);
 
     let mut response = (StatusCode::OK, body).into_response();
@@ -240,7 +256,7 @@ nrese_support_seconds_total{{phase=\"view\"}} {}
 mod tests {
     use crate::ai::AiSuggestionService;
     use axum::body::to_bytes;
-    use nrese_reasoner::{ReasonerConfig, ReasonerService};
+    use nrese_reasoner::ReasonerConfig;
     use nrese_store::{StoreConfig, StoreService};
 
     use crate::policy::PolicyConfig;
@@ -251,7 +267,7 @@ mod tests {
     #[tokio::test]
     async fn metrics_output_contains_stable_metric_names() {
         let store = StoreService::new(StoreConfig::default()).expect("store should initialize");
-        let reasoner = ReasonerService::new(ReasonerConfig::default());
+        let reasoner = ReasonerConfig::default();
         let state = AppState::new(
             store,
             reasoner,

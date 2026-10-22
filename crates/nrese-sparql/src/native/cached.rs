@@ -274,6 +274,13 @@ impl Context<'_> {
                     "a cached part numbers another key's variables".into(),
                 )
             })?;
+        // The copy is charged before it is made: a hit past the query's budget ends with a
+        // memory error and allocates nothing (concurrent hits of a large part each copied
+        // it before their charge failed).
+        self.check()?;
+        self.budget
+            .charge(part.table.memory_bytes())
+            .map_err(QueryEvaluationError::MemoryLimit)?;
         let table = match part.computed.is_empty() {
             true => part.table.clone(),
             false => {
@@ -295,7 +302,7 @@ impl Context<'_> {
         if let (Some(trace), Some(step)) = (&self.trace, step) {
             trace.borrow_mut()[step].cache = Some(how);
         }
-        self.produced(Solutions {
+        Ok(Solutions {
             vars: names,
             table,
             ordered: part.ordered,

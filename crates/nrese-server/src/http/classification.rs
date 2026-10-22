@@ -41,13 +41,17 @@ async fn blocking<T: Send + 'static>(
     .map_err(|error| ApiError::internal(error.to_string()))
 }
 
-fn respond(triples: bool, text: String, json: serde_json::Value) -> Result<Response, ApiError> {
+fn respond(
+    triples: bool,
+    text: impl FnOnce() -> String,
+    json: impl FnOnce() -> serde_json::Value,
+) -> Result<Response, ApiError> {
     let (media_type, body) = if triples {
-        ("application/n-triples", text.into_bytes())
+        ("application/n-triples", text().into_bytes())
     } else {
         (
             "application/json",
-            serde_json::to_vec(&json).map_err(|error| ApiError::internal(error.to_string()))?,
+            serde_json::to_vec(&json()).map_err(|error| ApiError::internal(error.to_string()))?,
         )
     };
     Ok((
@@ -66,25 +70,32 @@ pub async fn classify(
     state.ensure_serving()?;
     let store = state.store();
     let report = blocking(&state, "classification", move || store.classify(&scope)).await?;
-    let mut text = String::new();
-    for (sub, sup) in &report.subsumptions {
-        text.push_str(&format!("<{sub}> <{SUB_CLASS_OF}> <{sup}> .\n"));
-    }
-    for class in &report.unsatisfiable {
-        text.push_str(&format!("<{class}> <{SUB_CLASS_OF}> <{NOTHING}> .\n"));
-    }
-    let json = serde_json::json!({
-        "profile": "OWL 2 DL",
-        "engine": report.engine,
-        "complete": report.complete(),
-        "incomplete": report.incomplete,
-        "consistent": report.consistent,
-        "micros": report.micros,
-        "subsumptions": report.subsumptions,
-        "unsatisfiable": report.unsatisfiable,
-        "equivalent_to_thing": report.equivalent_to_thing,
-    });
-    respond(wants_triples(headers), text, json)
+    respond(
+        wants_triples(headers),
+        || {
+            let mut text = String::new();
+            for (sub, sup) in &report.subsumptions {
+                text.push_str(&format!("<{sub}> <{SUB_CLASS_OF}> <{sup}> .\n"));
+            }
+            for class in &report.unsatisfiable {
+                text.push_str(&format!("<{class}> <{SUB_CLASS_OF}> <{NOTHING}> .\n"));
+            }
+            text
+        },
+        || {
+            serde_json::json!({
+                "profile": "OWL 2 DL",
+                "engine": report.engine,
+                "complete": report.complete(),
+                "incomplete": report.incomplete,
+                "consistent": report.consistent,
+                "micros": report.micros,
+                "subsumptions": report.subsumptions,
+                "unsatisfiable": report.unsatisfiable,
+                "equivalent_to_thing": report.equivalent_to_thing,
+            })
+        },
+    )
 }
 
 pub async fn realise(
@@ -95,25 +106,70 @@ pub async fn realise(
     state.ensure_serving()?;
     let store = state.store();
     let report = blocking(&state, "realisation", move || store.realise(&scope)).await?;
-    let mut text = String::new();
-    for (individual, types) in &report.types {
-        for class in types {
-            text.push_str(&format!("<{individual}> <{RDF_TYPE}> <{class}> .\n"));
-        }
+    respond(
+        wants_triples(headers),
+        || {
+            let mut text = String::new();
+            for (individual, types) in &report.types {
+                for class in types {
+                    text.push_str(&format!("<{individual}> <{RDF_TYPE}> <{class}> .\n"));
+                }
+            }
+            text
+        },
+        || {
+            let types: serde_json::Map<String, serde_json::Value> = report
+                .types
+                .iter()
+                .map(|(individual, types)| (individual.clone(), serde_json::json!(types)))
+                .collect();
+            serde_json::json!({
+                "profile": "OWL 2 DL",
+                "engine": report.engine,
+                "complete": report.complete(),
+                "incomplete": report.incomplete,
+                "consistent": report.consistent,
+                "micros": report.micros,
+                "types": types,
+            })
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn respond_invokes_only_the_selected_renderer() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let text = "<urn:s> <urn:p> <urn:o> .\n".to_owned();
+        let response = respond(
+            true,
+            move || text,
+            || panic!("JSON renderer invoked for N-Triples"),
+        )?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/n-triples"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(body.as_ref(), b"<urn:s> <urn:p> <urn:o> .\n");
+
+        let json = serde_json::json!({"complete": false, "incomplete": ["budget"]});
+        let response = respond(
+            false,
+            || panic!("N-Triples renderer invoked for JSON"),
+            move || json,
+        )?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(
+            body.as_ref(),
+            br#"{"complete":false,"incomplete":["budget"]}"#
+        );
+        Ok(())
     }
-    let types: serde_json::Map<String, serde_json::Value> = report
-        .types
-        .iter()
-        .map(|(individual, types)| (individual.clone(), serde_json::json!(types)))
-        .collect();
-    let json = serde_json::json!({
-        "profile": "OWL 2 DL",
-        "engine": report.engine,
-        "complete": report.complete(),
-        "incomplete": report.incomplete,
-        "consistent": report.consistent,
-        "micros": report.micros,
-        "types": types,
-    });
-    respond(wants_triples(headers), text, json)
 }

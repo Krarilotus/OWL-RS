@@ -40,6 +40,7 @@ fn search(engine: &Engine, text: &str) -> Vec<String> {
             prefix: false,
             stem: None,
         })
+        .unwrap()
         .into_iter()
         .filter_map(|m| snapshot.decode(nrese_engine::TermId::from_raw(m.id)))
         .map(|t| t.to_string())
@@ -50,6 +51,62 @@ fn search(engine: &Engine, text: &str) -> Vec<String> {
 
 fn vector(values: &[f32]) -> Literal {
     Literal::new_typed_literal(lexical(values), NamedNode::new_unchecked(DATATYPE))
+}
+
+#[test]
+fn text_query_errors_reach_snapshot_callers() {
+    let engine = Engine::new(config()).unwrap();
+    for populated in [false, true] {
+        if populated {
+            insert(
+                &engine,
+                "quick",
+                Literal::new_simple_literal("quick brown fox"),
+            );
+        }
+        let snapshot = engine.snapshot();
+        for text in [
+            "quick~nope",
+            "quick~0.5",
+            "quick~3",
+            "quick~256",
+            "quick~999999999999999999999",
+            "quick~-1",
+            "quick~1~2",
+            "~1",
+            "quick -fo*",
+            "quick -fox~1",
+            "quick -\"brown fox\"",
+            "quick -fox?",
+            "\"quick brown",
+        ] {
+            let query = TextQuery {
+                text: text.to_owned(),
+                all_words: false,
+                prefix: false,
+                stem: None,
+            };
+            let every = nrese_engine::TextScope::EVERY;
+            let model = nrese_engine::ReadModel::Materialised;
+            for result in [
+                snapshot.text_search(&query),
+                snapshot.iri_search_in(model, &every, &query, None),
+            ] {
+                assert!(
+                    matches!(result, Err(nrese_engine::EngineError::InvalidTextQuery(_))),
+                    "{text}: {result:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        search(&engine, "quick-brown"),
+        search(&engine, "quick brown")
+    );
+    assert_eq!(search(&engine, "\"quick: brown! fox?\"").len(), 1);
+    for text in ["quick~", "quick~0", "quick~1", "quick~2"] {
+        assert_eq!(search(&engine, text).len(), 1, "{text}");
+    }
 }
 
 #[test]
@@ -74,10 +131,11 @@ fn text_and_vector_indexes_survive_a_reopen() {
         }
         let text = search(&engine, "bridge*");
         assert_eq!(text.len(), 2);
-        let snapshot = engine.snapshot();
-        snapshot.prepare_vector_graph(&query);
-        let (found, report) = snapshot.vector_search(&query, &|_| true);
-        assert!(report.graph);
+        let (found, report) = engine
+            .snapshot()
+            .vector_search(&query, &|_| true)
+            .expect("an unlimited search");
+        assert_eq!(report.space, 50);
         engine.checkpoint().unwrap();
         assert!(dir.path().join("derived/text.index").exists());
         assert!(dir.path().join("derived/vectors.index").exists());
@@ -87,18 +145,20 @@ fn text_and_vector_indexes_survive_a_reopen() {
     assert_eq!(engine.stats().dictionary.derived_loaded, 0);
     assert_eq!(search(&engine, "bridge*"), before_text);
     let snapshot = engine.snapshot();
-    let (found, report) = snapshot.vector_search(&query, &|_| true);
-    assert!(
-        report.graph && report.scanned == 0,
-        "the graph read back: {report:?}"
-    );
+    let (found, report) = snapshot
+        .vector_search(&query, &|_| true)
+        .expect("an unlimited search");
+    assert_eq!(report.space, 50, "the vectors read back");
     assert_eq!(found, before_vectors);
     assert_eq!(engine.stats().dictionary.derived_loaded, 2);
     // Terms interned since extend what was read.
     insert(&engine, "c", Literal::new_simple_literal("Bridge of Sighs"));
     assert_eq!(search(&engine, "bridge*").len(), 3);
     insert(&engine, "near", vector(&[1.0, 0.0001]));
-    let (found, _) = engine.snapshot().vector_search(&query, &|_| true);
+    let (found, _) = engine
+        .snapshot()
+        .vector_search(&query, &|_| true)
+        .expect("an unlimited search");
     assert!(found[0].1 < 1e-6, "{found:?}");
 }
 
@@ -131,49 +191,4 @@ fn files_of_another_store_are_ignored() {
     assert!(search(&engine, "tower").is_empty());
     assert_eq!(search(&engine, "else").len(), 1);
     assert_eq!(engine.stats().dictionary.derived_loaded, 0);
-}
-
-/// A space past the size built at once: the first search scans while a thread builds
-/// the graph; later searches use it.
-#[test]
-fn large_graphs_are_built_on_a_thread() {
-    let engine = Engine::new(EngineConfig {
-        background_maintenance: false,
-        ..EngineConfig::default()
-    })
-    .unwrap();
-    let mut tx = engine.transaction();
-    for i in 0..60_000usize {
-        let a = (i as f32 * 0.37).sin();
-        let b = (i as f32 * 0.11).cos();
-        tx.insert(QuadRef::new(
-            NamedNode::new_unchecked(format!("http://example.com/{i}")).as_ref(),
-            NamedNode::new_unchecked("http://example.com/p").as_ref(),
-            vector(&[a, b, (i % 13) as f32]).as_ref(),
-            GraphNameRef::DefaultGraph,
-        ));
-    }
-    tx.commit().unwrap();
-    let query = VectorQuery {
-        metric: Metric::L2,
-        ..VectorQuery::new(vec![0.3, 0.4, 5.0], 5)
-    };
-    let snapshot = engine.snapshot();
-    let (first, report) = snapshot.vector_search(&query, &|_| true);
-    assert!(!report.graph && report.scanned == 60_000, "{report:?}");
-    let mut waited = 0;
-    loop {
-        let (found, report) = snapshot.vector_search(&query, &|_| true);
-        if report.graph {
-            let shared = found
-                .iter()
-                .filter(|(id, _)| first.iter().any(|(f, _)| f == id))
-                .count();
-            assert!(shared >= 4, "{shared} of 5");
-            break;
-        }
-        waited += 1;
-        assert!(waited < 600, "no graph after a minute");
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
 }

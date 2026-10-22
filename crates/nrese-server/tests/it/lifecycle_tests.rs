@@ -4,7 +4,7 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use nrese_reasoner::rulesets::Ruleset;
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_server::policy::PolicyConfig;
 use nrese_store::{MutationPipeline, SparqlUpdateRequest, StoreConfig, StoreService};
 use tower::util::ServiceExt;
@@ -37,7 +37,7 @@ async fn inconsistent_data_is_quarantined_but_readable_and_repairable()
     // Imported with reasoning off: through a pipeline without a reasoner.
     let import = MutationPipeline::new(
         std::sync::Arc::new(store.clone()),
-        std::sync::Arc::new(ReasonerService::new(ReasonerConfig::default())),
+        ReasonerConfig::default(),
     );
     import.execute_update(&SparqlUpdateRequest::new(format!(
         "INSERT DATA {{ <{EX}A> <http://www.w3.org/2002/07/owl#disjointWith> <{EX}B> .

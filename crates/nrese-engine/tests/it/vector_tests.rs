@@ -1,7 +1,7 @@
 //! Vector search over the dictionary's vector literals (`Snapshot::vector_search`).
 
 use nrese_engine::vector::{DATATYPE, Metric, lexical};
-use nrese_engine::{Engine, EngineConfig, TermId, VectorQuery, VectorStrategy};
+use nrese_engine::{Engine, EngineConfig, TermId, VectorQuery};
 use nrese_rdf::{Literal, NamedNode, Quad, QuadRef};
 
 fn engine() -> Engine {
@@ -55,7 +55,9 @@ fn the_nearest_vector_literals_are_found() {
     let before = engine.snapshot();
     let angle = 90.4f32.to_radians();
     let query = VectorQuery::new(vec![angle.cos(), angle.sin()], 3);
-    let (found, report) = before.vector_search(&query, &|_| true);
+    let (found, report) = before
+        .vector_search(&query, &|_| true)
+        .expect("an unlimited search");
     assert_eq!(angles(&engine, &found), [90, 91, 89]);
     assert_eq!(report.space, 360);
     assert!(!report.graph, "a small space is scanned");
@@ -69,18 +71,23 @@ fn the_nearest_vector_literals_are_found() {
         let values = nrese_engine::vector::parse(literal.value()).unwrap();
         (values[1].atan2(values[0]).to_degrees().round() as i64).rem_euclid(2) == 1
     };
-    let (found, _) = before.vector_search(&query, &odd);
+    let (found, _) = before
+        .vector_search(&query, &odd)
+        .expect("an unlimited search");
     assert_eq!(angles(&engine, &found), [91, 89, 93]);
     // Euclidean: the same order on a circle.
     let euclidean = VectorQuery {
         metric: Metric::L2,
         ..query.clone()
     };
-    let (found, _) = before.vector_search(&euclidean, &|_| true);
+    let (found, _) = before
+        .vector_search(&euclidean, &|_| true)
+        .expect("an unlimited search");
     assert_eq!(angles(&engine, &found), [90, 91, 89]);
     // Another dimension finds nothing.
-    let (found, report) =
-        before.vector_search(&VectorQuery::new(vec![1.0, 0.0, 0.0], 3), &|_| true);
+    let (found, report) = before
+        .vector_search(&VectorQuery::new(vec![1.0, 0.0, 0.0], 3), &|_| true)
+        .expect("an unlimited search");
     assert!(found.is_empty() && report.space == 0);
     // A snapshot doesn't see literals interned after it.
     let mut tx = engine.transaction();
@@ -95,64 +102,277 @@ fn the_nearest_vector_literals_are_found() {
         nrese_rdf::GraphNameRef::DefaultGraph,
     ));
     tx.commit().expect("commit");
-    let (found, _) = before.vector_search(&query, &|_| true);
+    let (found, _) = before
+        .vector_search(&query, &|_| true)
+        .expect("an unlimited search");
     assert_eq!(angles(&engine, &found), [90, 91, 89]);
-    let (found, _) = engine.snapshot().vector_search(&query, &|_| true);
+    let (found, _) = engine
+        .snapshot()
+        .vector_search(&query, &|_| true)
+        .expect("an unlimited search");
     assert!(
         found[0].1 < 1e-6,
         "the new literal is the nearest: {found:?}"
     );
 }
 
-/// A large space is searched through its graph and finds what the exact scan finds.
+/// An answer depends on the vectors the reader sees alone: with deleted vectors and an
+/// open transaction's in the dictionary, each nearer to a query than any visible one, an
+/// approximate search finds the nearest visible ones, as comparing every one the filter
+/// takes does (the review's case of 19 October: one graph of every vector the dictionary
+/// held, whose links and descent ran through the hidden ones).
 #[test]
-fn large_spaces_are_searched_through_a_graph() {
+fn hidden_vectors_change_no_answer() {
+    use nrese_engine::{QuadPattern, VectorStrategy};
     let engine = engine();
-    // 72,000 points: the circle with 200 radii.
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut random = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+    };
+    let queries: Vec<Vec<f32>> = (0..20)
+        .map(|_| (0..16).map(|_| random()).collect())
+        .collect();
+    let quad = |name: String, values: &[f32]| {
+        let literal =
+            Literal::new_typed_literal(lexical(values), NamedNode::new_unchecked(DATATYPE));
+        Quad::new(
+            NamedNode::new_unchecked(format!("http://example.com/{name}")),
+            NamedNode::new_unchecked("http://example.com/embedding"),
+            literal,
+            nrese_rdf::GraphName::DefaultGraph,
+        )
+    };
+    // Near a query: within a hundredth on each axis.
+    let near = |q: &[f32], random: &mut dyn FnMut() -> f32| -> Vec<f32> {
+        q.iter().map(|x| x + random() * 0.01).collect()
+    };
+    let visible: Vec<Quad> = (0..20_000)
+        .map(|i| {
+            let values: Vec<f32> = (0..16).map(|_| random()).collect();
+            quad(format!("v{i}"), &values)
+        })
+        .collect();
+    let deleted: Vec<Quad> = (0..20_000)
+        .map(|i| quad(format!("d{i}"), &near(&queries[i % 20], &mut random)))
+        .collect();
     let mut tx = engine.transaction();
-    for i in 0..72_000usize {
-        let angle = ((i % 360) as f32 + (i / 360) as f32 * 0.001).to_radians();
-        let radius = 1.0 + (i / 360) as f32 * 0.01;
-        let literal = Literal::new_typed_literal(
-            lexical(&[radius * angle.cos(), radius * angle.sin(), (i % 7) as f32]),
-            NamedNode::new_unchecked(DATATYPE),
-        );
-        tx.insert(QuadRef::new(
-            NamedNode::new_unchecked(format!("http://example.com/item/{i}")).as_ref(),
-            NamedNode::new_unchecked("http://example.com/embedding").as_ref(),
-            literal.as_ref(),
-            nrese_rdf::GraphNameRef::DefaultGraph,
-        ));
+    for quad in visible.iter().chain(&deleted) {
+        tx.insert(QuadRef::from(quad));
     }
     tx.commit().expect("commit");
+    let mut tx = engine.transaction();
+    for quad in &deleted {
+        tx.remove(QuadRef::from(quad));
+    }
+    tx.commit().expect("commit");
+    let mut open = engine.transaction();
+    for i in 0..4_000 {
+        let values = near(&queries[i % 20], &mut random);
+        open.insert(QuadRef::from(&quad(format!("o{i}"), &values)));
+    }
     let snapshot = engine.snapshot();
+    let seen = |id: TermId| {
+        let pattern = QuadPattern {
+            object: Some(id),
+            ..QuadPattern::all()
+        };
+        snapshot.quads_for_pattern(&pattern).next().is_some()
+    };
+    for query in &queries {
+        let approximate = VectorQuery {
+            strategy: VectorStrategy::Approximate,
+            ..VectorQuery::new(query.clone(), 10)
+        };
+        let exact = VectorQuery {
+            strategy: VectorStrategy::Exact,
+            ..approximate.clone()
+        };
+        let (found, _) = snapshot.vector_search(&approximate, &seen).unwrap();
+        let (truth, _) = snapshot.vector_search(&exact, &seen).unwrap();
+        assert_eq!(found.len(), 10);
+        assert_eq!(found, truth);
+    }
+    drop(open);
+}
+
+fn embedding(i: usize, graph: nrese_rdf::GraphName) -> Quad {
+    Quad::new(
+        NamedNode::new_unchecked(format!("urn:item:{i}")),
+        NamedNode::new_unchecked("urn:embedding"),
+        Literal::new_typed_literal(format!("[{i}]"), NamedNode::new_unchecked(DATATYPE)),
+        graph,
+    )
+}
+
+/// A search's admission, refusal and report depend on the vectors its reader may read alone:
+/// 10,000 vectors in a graph outside the scope, committed after the snapshot or visible to
+/// a later one, change nothing under a hit limit or a byte budget (Sol's review of W2, r1
+/// F1: the earlier snapshot's search was refused as `TooLarge { hits: 40 }`, counted over
+/// every vector of the dictionary).
+#[test]
+fn hidden_vectors_change_no_admission_nor_report() {
+    use nrese_engine::{GraphSelector, ReadModel, TextScope};
+    let engine = engine();
+    let mut tx = engine.transaction();
+    tx.insert(QuadRef::from(&embedding(
+        0,
+        nrese_rdf::GraphName::DefaultGraph,
+    )));
+    tx.commit().expect("commit");
+    let old = engine.snapshot();
+    let scope = TextScope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
     let query = VectorQuery {
-        metric: Metric::L2,
-        ..VectorQuery::new(vec![0.5, 1.2, 3.0], 10)
+        max_hits: Some(20),
+        ..VectorQuery::new(vec![0.0], 10)
     };
-    // Past SYNC_BUILD the graph is built on a thread; a warm-up waits for it.
-    snapshot.prepare_vector_graph(&query);
-    let (approximate, report) = snapshot.vector_search(&query, &|_| true);
-    assert!(
-        report.graph && report.space == 72_000 && report.scanned == 0,
-        "{report:?}"
-    );
-    let exact = VectorQuery {
-        strategy: VectorStrategy::Exact,
-        ..query.clone()
+    let search = |snapshot: &nrese_engine::Snapshot, budget: Option<u64>| {
+        let budget =
+            budget.map(|bytes| std::sync::Arc::new(nrese_exec::Budget::new(bytes as usize)));
+        snapshot
+            .vector_search_in(
+                ReadModel::Asserted,
+                &scope,
+                &query,
+                &|_| true,
+                budget.as_ref(),
+            )
+            .map(|(hits, report)| (hits.to_vec(), report))
     };
-    let (truth, report) = snapshot.vector_search(&exact, &|_| true);
-    assert!(!report.graph);
-    let shared = approximate
-        .iter()
-        .filter(|(id, _)| truth.iter().any(|(t, _)| t == id))
-        .count();
-    assert!(shared >= 9, "{shared} of 10");
-    // A selective filter is answered exactly.
-    let selective = VectorQuery {
-        accepted: Some(10),
-        ..query
+    let before = search(&old, None).expect("one vector");
+    assert_eq!(before.0.len(), 1);
+    let mut tx = engine.transaction();
+    for i in 1..10_001 {
+        let private = NamedNode::new_unchecked("urn:private").into();
+        tx.insert(QuadRef::from(&embedding(i, private)));
+    }
+    tx.commit().expect("commit");
+    for snapshot in [&old, &engine.snapshot()] {
+        for budget in [None, Some(64 << 10)] {
+            assert_eq!(
+                search(snapshot, budget),
+                Ok(before.clone()),
+                "budget {budget:?}"
+            );
+        }
+    }
+}
+
+/// A vector the reader may not read that is the first of its dimension changes no refusal:
+/// the search of that dimension is admitted and charged as before (Sol's review of W2, r2
+/// F1: it answered nothing before the space existed, and was refused as `TooLarge` or out of
+/// memory after).
+#[test]
+fn an_unreadable_first_vector_of_a_dimension_changes_no_refusal() {
+    use nrese_engine::{GraphSelector, ReadModel, TextScope};
+    let engine = engine();
+    let mut tx = engine.transaction();
+    tx.insert(QuadRef::from(&embedding(
+        0,
+        nrese_rdf::GraphName::DefaultGraph,
+    )));
+    tx.commit().expect("commit");
+    let old = engine.snapshot();
+    let scope = TextScope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
+    let plane = VectorQuery::new(vec![0.0, 0.0], 1);
+    let limited = VectorQuery {
+        max_hits: Some(2),
+        ..plane.clone()
     };
-    let (_, report) = snapshot.vector_search(&selective, &|_| true);
-    assert!(!report.graph);
+    let tiny = std::sync::Arc::new(nrese_exec::Budget::new(1024));
+    let outcomes = |snapshot: &nrese_engine::Snapshot| {
+        // The corpus kept first, on the engine's budget.
+        drop(snapshot.vector_search_in(ReadModel::Asserted, &scope, &plane, &|_| true, None));
+        [(&limited, None), (&plane, Some(&tiny))].map(|(query, budget)| {
+            snapshot
+                .vector_search_in(ReadModel::Asserted, &scope, query, &|_| true, budget)
+                .map(|(hits, report)| (hits.to_vec(), report))
+        })
+    };
+    let before = outcomes(&old);
+    let mut tx = engine.transaction();
+    tx.insert(QuadRef::from(&Quad::new(
+        NamedNode::new_unchecked("urn:item:hidden"),
+        NamedNode::new_unchecked("urn:embedding"),
+        Literal::new_typed_literal("[1, 2]", NamedNode::new_unchecked(DATATYPE)),
+        NamedNode::new_unchecked("urn:private"),
+    )));
+    tx.commit().expect("commit");
+    for snapshot in [&old, &engine.snapshot()] {
+        assert_eq!(outcomes(snapshot), before);
+    }
+    assert_eq!(tiny.used(), 0);
+}
+
+/// A corpus built by a read its reader's budget refused (an equality expansion past it) is
+/// neither kept nor used, and the search and its warm-up refuse: the next reader of the same
+/// statements finds every member (Sol's review of W2, r2 M1, with engine-v2's reader budgets).
+#[test]
+fn a_refused_read_keeps_no_partial_corpus() {
+    use nrese_engine::EncodedTriple;
+    let node = |name: &str| NamedNode::new_unchecked(format!("urn:{name}"));
+    let engine = engine();
+    let mut tx = engine.transaction();
+    let rep = tx.intern(node("rep").as_ref().into());
+    let same_as = tx.intern(node("sameAs").as_ref().into());
+    for i in 1..1000 {
+        let alias = tx.intern(node(&format!("alias{i}")).as_ref().into());
+        tx.insert_inferred(EncodedTriple {
+            subject: alias,
+            predicate: same_as,
+            object: rep,
+        });
+    }
+    tx.insert(QuadRef::from(&Quad::new(
+        node("rep"),
+        node("embedding"),
+        Literal::new_typed_literal("[1]", NamedNode::new_unchecked(DATATYPE)),
+        nrese_rdf::GraphName::DefaultGraph,
+    )));
+    tx.commit().expect("commit");
+    engine.set_equality(Some(same_as));
+    let reader = engine.snapshot();
+    let query = VectorQuery::new(vec![0.0], 1);
+    let small = reader
+        .reading_within(std::sync::Arc::new(nrese_exec::Budget::new(1024)))
+        .unwrap();
+    assert!(small.vector_search(&query, &|_| true).is_err());
+    assert!(small.read_refused().is_some());
+    // The warm-up refuses too, as an error (Sol's review of W2, r3 F1: it panicked).
+    assert!(small.prepare_vector_search().is_err());
+    drop(small);
+    let (hits, report) = reader.vector_search(&query, &|_| true).unwrap();
+    assert_eq!((hits.len(), report.space), (1, 1));
+}
+
+/// The hits a search returns keep their charge until they drop (Sol's review of W2, r1 F2:
+/// the scan's reservation went as the search returned).
+#[test]
+fn returned_vector_hits_keep_their_reservation() {
+    use nrese_engine::{GraphSelector, ReadModel, TextScope};
+    let engine = engine();
+    let mut tx = engine.transaction();
+    tx.insert(QuadRef::from(&embedding(
+        0,
+        nrese_rdf::GraphName::DefaultGraph,
+    )));
+    tx.commit().expect("commit");
+    let snapshot = engine.snapshot();
+    let scope = TextScope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
+    let query = VectorQuery::new(vec![0.0], 1);
+    let search = |budget| {
+        snapshot
+            .vector_search_in(ReadModel::Asserted, &scope, &query, &|_| true, budget)
+            .expect("one vector")
+    };
+    // The corpus kept first, on the engine's budget: the request's holds the scan's alone.
+    drop(search(None));
+    let budget = std::sync::Arc::new(nrese_exec::Budget::new(1 << 20));
+    let (hits, _) = search(Some(&budget));
+    assert_eq!(hits.len(), 1);
+    assert!(budget.used() >= std::mem::size_of::<(TermId, f32)>());
+    drop(hits);
+    assert_eq!(budget.used(), 0);
 }

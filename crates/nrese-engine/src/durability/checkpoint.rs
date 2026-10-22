@@ -54,6 +54,7 @@ use rayon::prelude::*;
 use super::codec::{Reader, put_u32, put_u64};
 use crate::engine::{Snapshot, Stack};
 use crate::error::{EngineError, EngineResult};
+use crate::index::IndexEncoding;
 use crate::index::keys::PackedKeys;
 use crate::index::{IndexVersion, Layout};
 use crate::mapped::{Map, Mapped};
@@ -62,7 +63,7 @@ use crate::term::Dictionary;
 use crate::term::dictionary::{Base, base_slots};
 use crate::term::hash::key_hash;
 use crate::term::offsets::{BlockEnds, Ends, Offsets};
-use crate::term::vocabulary::{Codec, Trained, VocabularyEncoding, vocabulary_encoding};
+use crate::term::vocabulary::{Codec, Trained, VocabularyEncoding};
 
 /// Version 2 added the inferred stack (roadmap E6); version 3 changed term encoding (E1);
 /// version 4 made integer ids order-preserving and split literal kinds (XC1); version 5
@@ -544,11 +545,12 @@ pub(crate) fn exists(dir: &Path, revision: u64) -> bool {
     checkpoint_path(dir, revision, EXTENSION).exists()
 }
 
-/// Writes a checkpoint of `snapshot` and returns its path; its scratch is charged within
-/// `admission` ([`write_parts`]).
+/// Writes a checkpoint of `snapshot` with the dictionary's keys as `vocabulary` says and
+/// returns its path; its scratch is charged within `admission` ([`write_parts`]).
 pub(crate) fn write(
     dir: &Path,
     snapshot: &Snapshot,
+    vocabulary: VocabularyEncoding,
     admission: Option<&Arc<SharedBudget>>,
 ) -> EngineResult<PathBuf> {
     let version = snapshot.version();
@@ -559,6 +561,7 @@ pub(crate) fn write(
         snapshot.dictionary(),
         snapshot.dictionary_len(),
         [version.asserted.layout(), version.inferred.layout()],
+        vocabulary,
         &mut |stack, permutation| Ok(snapshot.version().stack(stack).packed(permutation)),
     )
 }
@@ -571,6 +574,10 @@ pub(crate) fn write(
 /// The scratch of the dictionary's section is charged to a budget within `admission`, the
 /// process's root (`EngineConfig::admission`; `None`: no limit), before it is allocated:
 /// refused, it fails with [`EngineError::MemoryLimit`] and publishes nothing.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a checkpoint's parts, and how its dictionary's keys are written and charged"
+)]
 pub(crate) fn write_parts<'a>(
     dir: &Path,
     admission: Option<&Arc<SharedBudget>>,
@@ -578,6 +585,7 @@ pub(crate) fn write_parts<'a>(
     dictionary: &Dictionary,
     dictionary_len: u64,
     layouts: [Layout; 2],
+    vocabulary: VocabularyEncoding,
     packed: &mut dyn FnMut(Stack, Permutation) -> EngineResult<Cow<'a, PackedKeys>>,
 ) -> EngineResult<PathBuf> {
     let admission = Budget::unlimited().within(admission.cloned());
@@ -585,7 +593,7 @@ pub(crate) fn write_parts<'a>(
     // ([`crate::term::vocabulary`]), before the file is made.
     let mut held = Reservation::new(&admission);
     held.charge(WRITER + 2 * BUFFER)?;
-    let trained = match vocabulary_encoding() {
+    let trained = match vocabulary {
         VocabularyEncoding::Fsst => {
             let sample = dictionary.sample_within(dictionary_len, &admission)?;
             Some(Codec::train_within(&sample, &admission)?)
@@ -670,8 +678,9 @@ pub(crate) fn write_parts<'a>(
 pub(crate) fn stack_index(
     stack: Stack,
     packed: Vec<(Permutation, PackedKeys)>,
+    encoding: IndexEncoding,
 ) -> Result<IndexVersion, String> {
-    let index = IndexVersion::from_packed(packed)?;
+    let index = IndexVersion::from_packed(packed, encoding)?;
     match (stack, index.layout()) {
         (Stack::Inferred, Layout::Quads) => Err("the inferred stack holds named graphs".into()),
         _ => Ok(index),
@@ -862,7 +871,11 @@ fn read_stacks<'a>(
 /// The checkpoint at `path`, which this engine has just written, mapped: its dictionary
 /// base and both stacks, each one run, to be used in place of the copies in memory. Only
 /// the structure is read (the file was checked as it was written).
-pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])> {
+/// Runs built later over its stacks are packed in `encoding`.
+pub(crate) fn map_written(
+    path: &Path,
+    encoding: IndexEncoding,
+) -> EngineResult<(Base, [IndexVersion; 2])> {
     let corrupt =
         |what: &str| EngineError::Corruption(format!("checkpoint {}: {what}", path.display()));
     let map = crate::mapped::map(path)?;
@@ -888,7 +901,9 @@ pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])
     .map_err(|error| corrupt(&error))?;
     let [asserted, inferred] =
         read_stacks(&mut reader, body, Some(&map), false).map_err(|error| corrupt(&error))?;
-    let index = |stack: Stack, packed| stack_index(stack, packed).map_err(|error| corrupt(&error));
+    let index = |stack: Stack, packed| {
+        stack_index(stack, packed, encoding).map_err(|error| corrupt(&error))
+    };
     Ok((
         base,
         [

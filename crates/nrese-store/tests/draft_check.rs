@@ -44,7 +44,14 @@ fn name_required(class: &str) -> String {
 }
 
 fn check(operation: DraftOperation, inputs: DraftInputs) -> DraftOutcome {
-    run_draft_check(operation, &inputs, &LIMITS, &CancellationToken::new(), None)
+    run_draft_check(
+        operation,
+        &inputs,
+        &LIMITS,
+        &CancellationToken::new(),
+        None,
+        Default::default(),
+    )
 }
 
 fn shacl(data: &str, schema: &str, shapes: &str) -> DraftOutcome {
@@ -218,6 +225,7 @@ fn inputs_beyond_the_triple_limit_or_not_n_triples_fail() {
         &limits,
         &CancellationToken::new(),
         None,
+        Default::default(),
     );
     assert_eq!(outcome.terminal_status, DraftStatus::Failed);
     assert!(outcome.detail.contains("max_triples"));
@@ -286,6 +294,7 @@ fn a_cancelled_check_times_out() {
         &LIMITS,
         &cancellation,
         None,
+        Default::default(),
     );
     assert_eq!(outcome.terminal_status, DraftStatus::Timeout, "{outcome:?}");
 }

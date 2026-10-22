@@ -312,10 +312,21 @@ impl StoreService {
     /// Whether the asserted statements (every graph) entail `conclusion` under the OWL 2
     /// Direct Semantics: each logical axiom of the conclusion read as an OWL 2 ontology
     /// (declarations and annotations hold no logical content), decided by the DL engines
-    /// ([`crate::dl::entailment`]) within `dl.timeout` per test. A conclusion that isn't
-    /// well-formed OWL 2 DL is `unknown`. Reads only; never commits.
+    /// ([`crate::dl::entailment`]) within one `dl.timeout`, including the premise check.
+    /// A conclusion that isn't well-formed OWL 2 DL is `unknown`. Reads only; never commits.
     pub fn entails_dl(&self, conclusion: &[Triple]) -> StoreResult<DlEntailment> {
-        use crate::dl::entailment::{Entailed, entails_ontology};
+        self.entails_dl_until(
+            conclusion,
+            nrese_dl::limits::Deadline::after(self.config().dl.timeout),
+        )
+    }
+
+    fn entails_dl_until(
+        &self,
+        conclusion: &[Triple],
+        deadline: nrese_dl::limits::Deadline,
+    ) -> StoreResult<DlEntailment> {
+        use crate::dl::entailment::{Entailed, entails_ontology_until};
         use crate::dl::{Verdict, consistency, gate, source};
         use nrese_rdf::{BlankNode, NamedNodeRef, NamedOrBlankNode};
         if self.dl().replica() {
@@ -327,7 +338,7 @@ impl StoreService {
         let snapshot = self.engine().snapshot();
         let premise = source::read_snapshot(&snapshot);
         let budget = gate::budget(self, None, &self.envelope(None));
-        let checked = consistency::check(&premise, &budget);
+        let checked = consistency::check_until(&premise, &budget, deadline);
         if checked.verdict != Verdict::Consistent {
             let answer = match &checked.verdict {
                 Verdict::Unknown(why) => Entailed::Unknown(format!("the premise: {why}")),
@@ -392,9 +403,33 @@ impl StoreService {
             })
             .collect();
         Ok(DlEntailment {
-            answer: entails_ontology(&premise, &read, &fresh, &budget),
+            answer: entails_ontology_until(&premise, &read, &fresh, &budget, deadline),
             premise: checked.verdict,
         })
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use crate::dl::{Verdict, entailment::Entailed};
+    use nrese_dl::limits::Deadline;
+    use std::time::Instant;
+
+    #[test]
+    fn entailment_operation_inherits_expired_and_unlimited_deadlines() {
+        let mut config = crate::StoreConfig::in_memory();
+        config.dl.timeout = None;
+        let store = StoreService::new(config).unwrap();
+        let expired = store
+            .entails_dl_until(&[], Deadline::at(Instant::now()))
+            .unwrap();
+        assert!(matches!(expired.premise, Verdict::Unknown(_)));
+        assert!(matches!(expired.answer, Entailed::Unknown(_)));
+
+        let unlimited = store.entails_dl(&[]).unwrap();
+        assert_eq!(unlimited.premise, Verdict::Consistent);
+        assert_eq!(unlimited.answer, Entailed::Yes);
     }
 }
 

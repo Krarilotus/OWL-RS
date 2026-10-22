@@ -36,16 +36,17 @@ pub use durability::{DurabilityConfig, SyncPolicy};
 pub use engine::{
     BulkLoad, BulkMode, CommitSummary, Content, Engine, EngineConfig, EngineStats, EqualityClasses,
     ImageInfo, InferredMask, InferredSubset, LogBatch, ProbeCursor, ReadModel, Rematerialisation,
-    Seek, Snapshot, SnapshotIdentity, Transaction,
+    Seek, Snapshot, SnapshotIdentity, TextCorpusStats, TextScope, Transaction,
 };
 pub use error::{EngineError, EngineResult};
 pub use index::cursor::SeekStats;
-pub use index::{CompactionPolicy, IndexEncoding, set_index_encoding};
+pub use index::{CompactionPolicy, IndexEncoding};
 /// Vector literals, metrics and indexes ([`Snapshot::vector_search`]).
 pub use nrese_vector as vector;
 pub use quad::{EncodedQuad, EncodedTriple, GraphSelector, QuadPattern};
-pub use term::vocabulary::{VocabularyEncoding, set_vocabulary_encoding};
+pub use term::vocabulary::VocabularyEncoding;
 pub use term::{
     Dictionary, DictionaryStats, Placement, StringScan, StringTest, TermId, TermKind, TermView,
-    TextMatch, TextQuery, VectorQuery, VectorSearchReport, VectorStrategy,
+    TextMatch, TextMatches, TextQuery, VectorHits, VectorQuery, VectorSearchReport, VectorStop,
+    VectorStrategy,
 };

@@ -85,24 +85,27 @@ impl Search<'_> {
             o.axioms.push(self.ontology.axioms[i].clone());
             o.sources.push(Vec::new());
         }
-        let budget = self.budget.remaining(self.deadline);
         match self.goal {
-            Goal::Inconsistent => match consistency::check(&o, &budget).verdict {
-                Verdict::Inconsistent => true,
-                Verdict::Consistent => false,
-                Verdict::Unknown(_) => {
-                    self.spent = true;
-                    false
+            Goal::Inconsistent => {
+                match consistency::check_until(&o, self.budget, self.deadline).verdict {
+                    Verdict::Inconsistent => true,
+                    Verdict::Consistent => false,
+                    Verdict::Unknown(_) => {
+                        self.spent = true;
+                        false
+                    }
                 }
-            },
-            Goal::Entails(axiom) => match entailment::entails(&o, axiom, self.fresh, &budget) {
-                Entailed::Yes => true,
-                Entailed::No => false,
-                Entailed::Unknown(_) => {
-                    self.spent = true;
-                    false
+            }
+            Goal::Entails(axiom) => {
+                match entailment::entails_until(&o, axiom, self.fresh, self.budget, self.deadline) {
+                    Entailed::Yes => true,
+                    Entailed::No => false,
+                    Entailed::Unknown(_) => {
+                        self.spent = true;
+                        false
+                    }
                 }
-            },
+            }
         }
     }
 

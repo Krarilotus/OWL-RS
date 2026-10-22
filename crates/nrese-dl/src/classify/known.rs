@@ -60,6 +60,7 @@ pub fn horn_lower_bound(
     core: &crate::context::Options,
     workers: &nrese_exec::workers::Workers,
     cancel: Option<crate::Cancel>,
+    traced: Option<std::time::Instant>,
 ) -> Option<Lower> {
     let all = &normalised.clauses;
     let budget = core.budget.clone();
@@ -97,13 +98,22 @@ pub fn horn_lower_bound(
         &with(first),
         workers,
         cancel.clone(),
+        traced,
     ) {
         return Some(l);
     }
     if all_horn {
         return None;
     }
-    saturate(normalised, horn, classes, &with(budget), workers, cancel)
+    saturate(
+        normalised,
+        horn,
+        classes,
+        &with(budget),
+        workers,
+        cancel,
+        traced,
+    )
 }
 
 /// The context core on the clauses `part` (indexes) of `n`, dropping clauses it refuses a
@@ -115,6 +125,7 @@ fn saturate(
     options: &crate::context::Options,
     workers: &nrese_exec::workers::Workers,
     cancel: Option<crate::Cancel>,
+    traced: Option<std::time::Instant>,
 ) -> Option<Lower> {
     let build = |part: &[usize]| Normalised {
         clauses: part.iter().map(|&i| n.clauses[i].clone()).collect(),
@@ -133,15 +144,18 @@ fn saturate(
         ) {
             Ok(saturated) => {
                 let mut lower = lower(&saturated.classification(), classes);
-                exact_for(&mut lower, &saturated, n, &part, classes);
+                exact_for(&mut lower, &saturated, n, &part, classes, traced);
                 return Some(lower);
             }
             Err(why) => why,
         };
-        super::trace(&format!(
-            "lower bound: the context core refuses {} clauses: {why}",
-            part.len()
-        ));
+        super::trace(
+            traced,
+            &format!(
+                "lower bound: the context core refuses {} clauses: {why}",
+                part.len()
+            ),
+        );
         use crate::context::Unsupported as U;
         match why {
             U::NotHorn { .. } if part.iter().any(|&i| !n.clauses[i].flags.horn) => {
@@ -184,13 +198,14 @@ fn exact_for(
     n: &Normalised,
     part: &[usize],
     classes: &[Term],
+    traced: Option<std::time::Instant>,
 ) {
     // Axioms the clauses don't cover: no part of them is exact.
     if n.unsupported
         .iter()
         .any(|(_, r)| *r != UNSUPPORTED_DATATYPE_DEFINITIONS && *r != UNSUPPORTED_KEYS)
     {
-        super::trace("exactness: unsupported axioms");
+        super::trace(traced, "exactness: unsupported axioms");
         return;
     }
     let mut inside = vec![false; n.clauses.len()];
@@ -205,10 +220,13 @@ fn exact_for(
             continue;
         }
         if c.body.is_empty() {
-            super::trace(&format!(
-                "exactness: an everywhere clause left out: {:?} -> {:?}",
-                c.body, c.head
-            ));
+            super::trace(
+                traced,
+                &format!(
+                    "exactness: an everywhere clause left out: {:?} -> {:?}",
+                    c.body, c.head
+                ),
+            );
             return;
         }
         if let Some(l) = local_clause(c, saturated) {
@@ -223,7 +241,7 @@ fn exact_for(
                     // Not in the part: no context has it.
                     None => {}
                     Some((_, true)) => {
-                        super::trace("exactness: a flipped body concept");
+                        super::trace(traced, "exactness: a flipped body concept");
                         return;
                     }
                     Some((id, false)) => triggers.push(id),
@@ -264,12 +282,15 @@ fn exact_for(
     {
         lower.exact = true;
     }
-    super::trace(&format!(
-        "exactness: {} triggers, {} roles, {} local clauses",
-        triggers.len(),
-        role_ids.len(),
-        local.len()
-    ));
+    super::trace(
+        traced,
+        &format!(
+            "exactness: {} triggers, {} roles, {} local clauses",
+            triggers.len(),
+            role_ids.len(),
+            local.len()
+        ),
+    );
     let untouched = saturated.untouched(&triggers, &role_ids, &local);
     let names = &saturated.program().names;
     lower.exact_for = classes
