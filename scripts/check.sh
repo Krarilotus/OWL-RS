@@ -33,16 +33,30 @@ mode=${1:-all}
 # artifacts.
 export CARGO_BUILD_WARNINGS=deny
 [ "$mode" = --changed ] && mode=commit
+if [ "$mode" = push ] && [ "${NRESE_GATE_INNER:-}" != unit ]; then
+  exec bash scripts/lib/fleet-gate.sh
+fi
+if [ "$mode" = push ]; then
+  [ -n "${FLEET_JOB:-}" ] && [ -n "${FLEET_STEP:-}" ] && [ -n "${NRESE_GATE_UNIT:-}" ] \
+    || { echo "push execution needs an official fleet unit" >&2; exit 75; }
+  . scripts/lib/gate-key.sh
+fi
 guarded=scripts/cargo-guarded.sh
 declare -a results=()
 step() {
   local name=$1
   shift
+  if [ "$mode" = push ]; then
+    printf '%s\n' "$name" >> "${NRESE_GATE_REQUIRED:?}"
+  fi
   echo "=== $name"
   local start=$SECONDS
   "$@"
   local code=$?
   results+=("$code  $name ($((SECONDS - start)) s)")
+  if [ "$mode" = push ]; then
+    printf '%s\t%s\n' "$code" "$name" >> "${NRESE_GATE_STEPS:?}"
+  fi
   echo "=== $name: exit $code"
 }
 nextest() { cargo nextest --version > /dev/null 2>&1; }
@@ -99,7 +113,12 @@ run_tests() {
   [ ${#all[@]} -eq 0 ] && return 0
   if nextest; then
     local filter=""
-    [ ${#fast_only[@]} -gt 0 ] && filter=$(python scripts/lib/test-targets.py exclude "${fast_only[@]}" | tr -d '\r')
+    if [ "$mode" = push ] && [ ${#fast_only[@]} -gt 0 ]; then
+      filter=$(python scripts/lib/test-targets.py exclude "${fast_only[@]}") || return 2
+      filter=${filter//$'\r'/}
+    else
+      [ ${#fast_only[@]} -gt 0 ] && filter=$(python scripts/lib/test-targets.py exclude "${fast_only[@]}" | tr -d '\r')
+    fi
     # shellcheck disable=SC2046
     "$guarded" nextest run --locked --no-fail-fast $(package_args "${all[@]}") \
       ${filter:+-E "$filter"}
@@ -183,7 +202,8 @@ w3c_data() {
 side_steps() {
   local files=("$@")
   if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
-    step locks bash scripts/check-locks.sh
+    if [ "$mode" = push ]; then step "locks (side inputs)" bash scripts/check-locks.sh
+    else step locks bash scripts/check-locks.sh; fi
   fi
   if printf '%s\n' "${files[@]}" | grep -qE '^benches/suite/'; then
     step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
@@ -195,7 +215,7 @@ side_steps() {
   if printf '%s\n' "${files[@]}" | grep -qE '^benches/nrese-bench-harness/'; then
     harness
   fi
-  if printf '%s\n' "${files[@]}" | grep -qE '^apps/nrese-console/'; then
+  if [ "$mode" != push ] && printf '%s\n' "${files[@]}" | grep -qE '^apps/nrese-console/'; then
     console
   fi
 }
@@ -207,12 +227,35 @@ harness() {
   step "test (bench harness)" "$guarded" test --locked --manifest-path $manifest --no-fail-fast
 }
 console() {
-  if [ -d apps/nrese-console/node_modules ]; then
+  if [ "$mode" = push ]; then
+    step "console dependencies" npm --prefix apps/nrese-console ci --no-audit --no-fund
+    step "console typecheck" npm --prefix apps/nrese-console run typecheck
+    step "console tests" npx --prefix apps/nrese-console vitest run --root apps/nrese-console
+  elif [ -d apps/nrese-console/node_modules ]; then
     step "console typecheck" npm --prefix apps/nrese-console run typecheck
     step "console tests" npx --prefix apps/nrese-console vitest run --root apps/nrese-console
   else
     echo "=== the console's dependencies aren't installed (npm ci in apps/nrese-console): skipped"
   fi
+}
+
+# The Windows workload is the existing native OS/measure adapter, through guarded cargo.
+windows_part() {
+  local os packages expr
+  step "Windows tests list" python scripts/lib/windows-tests.py check
+  os=$(python scripts/lib/windows-tests.py os-crates "${changed[@]}") || exit 75
+  packages=$(python scripts/lib/windows-tests.py packages "$@") || exit 75
+  expr=$(python scripts/lib/windows-tests.py expr "$@") || exit 75
+  os=${os//$'\r'/}; packages=${packages//$'\r'/}; expr=${expr//$'\r'/}
+  [ -z "$os" ] || step "clippy (Windows)" "$guarded" clippy --locked $(package_args $os) --all-targets
+  [ -z "$packages" ] || { [ -n "$expr" ] || exit 75; step "tests (Windows)" "$guarded" nextest run --locked --no-fail-fast $(package_args $packages) -E "$expr"; }
+  if printf '%s\n' "${files[@]}" | grep -qE '^apps/nrese-console/'; then console; fi
+}
+push_summary() {
+  local failed=0 result
+  echo "=== summary"
+  for result in "${results[@]}"; do echo "  $result"; [ "${result%% *}" = 0 ] || failed=1; done
+  return $failed
 }
 
 # Whether nrese-exec differs from where this branch left refactor/engine-v2, committed or
@@ -252,12 +295,13 @@ if [ "$build_host" = local ] && [ -f "${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY
   echo "this machine is busy ($(cat "${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}")); building on the build host" >&2
   build_host=$(git config --get nrese.buildHost)
 fi
-if [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
+if [ "$mode" != push ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
   list=$(mktemp)
-  [ "$mode" = all ] || changed_files "$mode" > "$list"
+  [ "$mode" = all ] || changed_files "$mode" > "$list" || { rm -f "$list"; exit 2; }
   # A tier that passed for this exact tree and file list doesn't run again. So the gate can
   # run before `git push`, whose hook then needn't hold the remote's connection open for it.
-  key="$mode${NRESE_W3C_OPTIONAL:+ w3c-optional} $(bash scripts/lib/remote.sh tree) $(git hash-object "$list")"
+  tree=$(bash scripts/lib/remote.sh tree) || { rm -f "$list"; exit 2; }
+  key="$mode${NRESE_W3C_OPTIONAL:+ w3c-optional} $tree $(git hash-object "$list")"
   passed="$(git rev-parse --git-common-dir)/nrese-gate-passed"
   if grep -qxF "$key" "$passed" 2> /dev/null; then
     echo "=== $mode: passed before for this tree and these files"
@@ -282,8 +326,24 @@ case "$mode" in
     else
       mapfile -t files < <(changed_files "$mode")
     fi
-    mapfile -t changed < <(crates_of "${files[@]}")
-    mapfile -t dependents < <([ ${#changed[@]} -gt 0 ] && dependents_of "${changed[@]}")
+    if [ "$mode" = push ]; then
+      python scripts/lib/gate-selection.py "$NRESE_FILES_FROM" "$NRESE_GATE_SELECTION" || exit 75
+      selected=$(python -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1]))[sys.argv[2]]))' "$NRESE_GATE_SELECTION" changed) || exit 75
+      mapfile -t changed < <(printf '%s' "$selected")
+      [ -n "$selected" ] || changed=()
+      selected=$(python -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1]))[sys.argv[2]]))' "$NRESE_GATE_SELECTION" dependents) || exit 75
+      mapfile -t dependents < <(printf '%s' "$selected")
+      [ -n "$selected" ] || dependents=()
+      step tools gate_tools_check cargo-nextest
+      if [ "$NRESE_GATE_PART" = windows ]; then
+        windows_part "${changed[@]}" "${dependents[@]}"
+        push_summary
+        exit $?
+      fi
+    else
+      mapfile -t changed < <(crates_of "${files[@]}")
+      mapfile -t dependents < <([ ${#changed[@]} -gt 0 ] && dependents_of "${changed[@]}")
+    fi
     echo "=== changed: ${changed[*]:-none}; depending on them: ${dependents[*]:-none}"
     step fmt cargo fmt --all --check
     if [ ${#changed[@]} -gt 0 ]; then
@@ -308,7 +368,7 @@ case "$mode" in
     fi
     # nrese-exec's unsafe primitives under Miri (scripts/miri.sh), and its doc tests: the
     # compile-fail rows that keep their misuse unwritable (a settled region grows).
-    if [ "$mode" = push ] && exec_changed; then
+    if [ "$mode" = push ]; then
       step miri bash scripts/miri.sh
       step "doc tests (nrese-exec)" "$guarded" test --locked --doc -p nrese-exec
     fi

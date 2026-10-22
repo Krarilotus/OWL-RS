@@ -153,7 +153,7 @@ function Build {
     }
 }
 function Run($program) {
-    try { & $program @arguments; return $LASTEXITCODE } catch { [Console]::Error.WriteLine("memory-cap: $program doesn't run: $_"); return 1 }
+    try { & $program @arguments | ForEach-Object { [Console]::Out.WriteLine($_) }; return $LASTEXITCODE } catch { [Console]::Error.WriteLine("memory-cap: $program doesn't run: $_"); return 1 }
 }
 $arguments = @("$ProcessId", $LimitGB.ToString([Globalization.CultureInfo]::InvariantCulture))
 if ($Registry) { $arguments += $Registry }
