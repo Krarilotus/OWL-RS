@@ -166,17 +166,35 @@ pub fn materialise(input: &[Triple], rules: &[Rule], lists: Option<&ListVocabula
         }
         let mut new = Vec::new();
         for rule in &program {
-            let Head::Facts(heads) = &rule.head else {
-                continue;
-            };
-            matches(rule, &index, &mut |bindings| {
-                for head in heads {
-                    let triple = instantiate_head(head, bindings);
-                    if !index.set.contains(&triple) {
-                        new.push(triple);
+            match &rule.head {
+                Head::Facts(heads) => matches(rule, &index, &mut |bindings| {
+                    for head in heads {
+                        let triple = instantiate_head(head, bindings);
+                        if !index.set.contains(&triple) {
+                            new.push(triple);
+                        }
                     }
-                }
-            });
+                }),
+                Head::Grouped(groups) => matches(rule, &index, &mut |bindings| {
+                    for group in groups {
+                        if !group.guards.iter().all(|guard| {
+                            guard.holds(|term| match term {
+                                Term::Const(id) => Some(id),
+                                Term::Var(v) => bindings[usize::from(v)],
+                            })
+                        }) {
+                            continue;
+                        }
+                        for head in &group.heads {
+                            let triple = instantiate_head(head, bindings);
+                            if !index.set.contains(&triple) {
+                                new.push(triple);
+                            }
+                        }
+                    }
+                }),
+                Head::Inconsistent => {}
+            }
         }
         if new.is_empty() {
             // Consistency rules on the final closure.

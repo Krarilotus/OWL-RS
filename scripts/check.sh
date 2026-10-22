@@ -329,9 +329,11 @@ case "$mode" in
     if [ "$mode" = push ]; then
       python scripts/lib/gate-selection.py "$NRESE_FILES_FROM" "$NRESE_GATE_SELECTION" || exit 75
       selected=$(python -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1]))[sys.argv[2]]))' "$NRESE_GATE_SELECTION" changed) || exit 75
+      selected=${selected//$'\r'/}
       mapfile -t changed < <(printf '%s' "$selected")
       [ -n "$selected" ] || changed=()
       selected=$(python -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1]))[sys.argv[2]]))' "$NRESE_GATE_SELECTION" dependents) || exit 75
+      selected=${selected//$'\r'/}
       mapfile -t dependents < <(printf '%s' "$selected")
       [ -n "$selected" ] || dependents=()
       step tools gate_tools_check cargo-nextest
