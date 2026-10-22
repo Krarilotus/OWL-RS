@@ -27,9 +27,9 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
-use crate::index::Layout;
 use crate::index::keys::PackedKeys;
 use crate::index::run::PermutationBuilder;
+use crate::index::{IndexEncoding, Layout};
 use crate::mapped;
 use crate::quad::{EncodedQuad, Key, Permutation};
 
@@ -128,7 +128,9 @@ impl Spill {
     fn write_chunk(&mut self, quads: Vec<EncodedQuad>) -> std::io::Result<()> {
         let layout = Layout::holding(&quads);
         let chunk = self.chunks.len();
-        let mut builder = PermutationBuilder::planned(quads, layout.permutations());
+        // A chunk is read once, merged into the engine's encoding: the fastest to write.
+        let mut builder =
+            PermutationBuilder::planned(quads, layout.permutations(), IndexEncoding::Fast);
         for &permutation in layout.permutations() {
             let packed = builder.packed(permutation);
             let file = File::create(self.path(chunk, permutation))?;
@@ -145,7 +147,11 @@ impl Spill {
     /// The keys of `permutation` (of [`layout`](Self::layout)) over all chunks, in order,
     /// duplicates dropped, packed. The files stay until the spill is dropped: a graph-last
     /// permutation's also answers its graph-first one.
-    pub(crate) fn merged(&self, permutation: Permutation) -> std::io::Result<PackedKeys> {
+    pub(crate) fn merged(
+        &self,
+        permutation: Permutation,
+        encoding: IndexEncoding,
+    ) -> std::io::Result<PackedKeys> {
         let mut cursors = Vec::with_capacity(self.chunks.len());
         for (chunk, layout) in self.chunks.iter().enumerate() {
             let (file, rotate) = match layout.permutations().contains(&permutation) {
@@ -165,7 +171,7 @@ impl Spill {
                 .map_err(|error| std::io::Error::other(format!("{}: {error}", path.display())))?;
             cursors.push(Cursor::new(keys, rotate));
         }
-        Ok(PackedKeys::from_sorted_iter(Merge::new(cursors)))
+        Ok(PackedKeys::from_sorted_iter(Merge::new(cursors), encoding))
     }
 }
 
@@ -410,7 +416,7 @@ mod tests {
             assert_eq!(layout == Layout::Quads, named);
             let mut builder = PermutationBuilder::new(all);
             for &permutation in layout.permutations() {
-                let merged = spill.merged(permutation).unwrap();
+                let merged = spill.merged(permutation, IndexEncoding::Fast).unwrap();
                 let expected = builder.packed(permutation);
                 assert_eq!(merged.len(), expected.len(), "{permutation:?}");
                 assert!(

@@ -1,5 +1,5 @@
 use axum::body::to_bytes;
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_store::{StoreConfig, StoreService};
 
 use crate::ai::AiSuggestionService;
@@ -10,7 +10,7 @@ use crate::state::AppState;
 #[tokio::test]
 async fn reasoning_diagnostics_includes_reject_diagnostics_baseline() {
     let store = StoreService::new(StoreConfig::default()).expect("store should initialize");
-    let reasoner = ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::Owl2Rl));
+    let reasoner = ReasonerConfig::for_mode(ReasoningMode::Owl2Rl);
     let state = AppState::new(
         store,
         reasoner,

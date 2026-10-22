@@ -16,11 +16,22 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use parking_lot::RwLock;
 use rayon::prelude::*;
 
 use crate::{Hit, Metric, Ordered, Query, Vectors};
+
+/// Expansions of a graph search between two looks at its stop flag.
+pub const STOP_STEP: usize = 256;
+
+/// How far one level's search goes: its beam, and the flag that ends it early.
+#[derive(Clone, Copy)]
+struct Beam<'a> {
+    ef: usize,
+    stop: Option<&'a AtomicBool>,
+}
 
 /// How a graph is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -174,6 +185,21 @@ impl Hnsw {
         ef: usize,
         accept: &(dyn Fn(u64) -> bool + Sync),
     ) -> Vec<Hit> {
+        self.search_until(vectors, query, k, ef, accept, None)
+    }
+
+    /// [`Self::search`], stopping early once `stop` is set (checked every
+    /// [`STOP_STEP`] expansions): a stopped search's hits are incomplete, the caller
+    /// checks the flag after it.
+    pub fn search_until(
+        &self,
+        vectors: &Vectors,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        accept: &(dyn Fn(u64) -> bool + Sync),
+        stop: Option<&AtomicBool>,
+    ) -> Vec<Hit> {
         let Some((entry, top)) = *self.entry.read() else {
             return Vec::new();
         };
@@ -186,7 +212,17 @@ impl Hnsw {
             nearest = self.greedy(vectors, &query, nearest, level);
         }
         let accepted = |position: u32| accept(vectors.id(position));
-        let mut found = self.search_level(vectors, &query, &[nearest], ef.max(k), 0, &accepted);
+        let mut found = self.search_level(
+            vectors,
+            &query,
+            &[nearest],
+            Beam {
+                ef: ef.max(k),
+                stop,
+            },
+            0,
+            &accepted,
+        );
         found.truncate(k);
         found
             .into_iter()
@@ -265,7 +301,10 @@ impl Hnsw {
                 vectors,
                 &query,
                 &entries,
-                self.parameters.ef_construction,
+                Beam {
+                    ef: self.parameters.ef_construction,
+                    stop: None,
+                },
                 current,
                 &|_| true,
             );
@@ -379,10 +418,11 @@ impl Hnsw {
         vectors: &Vectors,
         query: &Query<'_>,
         entries: &[(f32, u32)],
-        ef: usize,
+        beam: Beam<'_>,
         level: u8,
         accept: &dyn Fn(u32) -> bool,
     ) -> Vec<(f32, u32)> {
+        let Beam { ef, stop } = beam;
         with_visited(self.links.len(), |visited| {
             let mut candidates: BinaryHeap<Reverse<Ordered<u32>>> = BinaryHeap::new();
             let mut results: BinaryHeap<Ordered<u32>> = BinaryHeap::new();
@@ -398,7 +438,14 @@ impl Hnsw {
             while results.len() > ef {
                 results.pop();
             }
+            let mut expanded = 0usize;
             while let Some(Reverse(Ordered(distance, node))) = candidates.pop() {
+                expanded += 1;
+                if expanded.is_multiple_of(STOP_STEP)
+                    && stop.is_some_and(|stop| stop.load(Ordering::Relaxed))
+                {
+                    break;
+                }
                 let full = results.len() >= ef;
                 if full && results.peek().is_some_and(|worst| distance > worst.0) {
                     break;
@@ -475,6 +522,28 @@ fn with_visited<R>(nodes: usize, f: impl FnOnce(&mut Visited<'_>) -> R) -> R {
 mod tests {
     use super::*;
     use crate::{exact, tests::random_vectors};
+
+    /// A set stop flag ends a graph search within [`STOP_STEP`] expansions; unset, the
+    /// search finds what it finds without one.
+    #[test]
+    fn a_stopped_graph_search_ends_early() {
+        let vectors = random_vectors(3_000, 8, 5);
+        let mut graph = Hnsw::new(Metric::L2, HnswParameters::default());
+        graph.extend(&vectors);
+        let query = vectors.get(17).to_vec();
+        let stop = AtomicBool::new(false);
+        let all = graph.search_until(&vectors, &query, 3_000, 3_000, &|_| true, Some(&stop));
+        assert_eq!(all, graph.search(&vectors, &query, 3_000, 3_000, &|_| true));
+        assert!(all.len() > STOP_STEP);
+        stop.store(true, Ordering::Relaxed);
+        let stopped = graph.search_until(&vectors, &query, 3_000, 3_000, &|_| true, Some(&stop));
+        assert!(
+            stopped.len() < all.len(),
+            "{} of {}",
+            stopped.len(),
+            all.len()
+        );
+    }
 
     #[test]
     fn adjacency_snapshots_reuse_storage_and_release_the_lock() {

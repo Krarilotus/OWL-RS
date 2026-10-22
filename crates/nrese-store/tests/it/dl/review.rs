@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, UserRules};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode, UserRules};
 use nrese_store::{MutationPipeline, SparqlQueryRequest, StoreService};
 
 use super::queries::query;
@@ -60,7 +60,7 @@ fn with_user_rules_no_answer_is_claimed_complete() {
         .with_rules(Some(Arc::new(rules)))
         .expect("owl2-dl with rules");
     let store = StoreService::new(crate::support::in_memory_store_config()).expect("store");
-    let dl = MutationPipeline::new(Arc::new(store), Arc::new(ReasonerService::new(config)));
+    let dl = MutationPipeline::new(Arc::new(store), config);
     assert!(dl.store().dl().user_rules());
     insert(&dl, UNION).expect("data");
     // x is a D under OWL 2 DL only, so the rule never sees it: x a Special is missing
@@ -183,9 +183,7 @@ fn a_part_of_a_part_of_a_fleet_is_found_through_the_bounds() {
     let store = StoreService::new(crate::support::in_memory_store_config()).expect("store");
     let rl = MutationPipeline::new(
         Arc::new(store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     );
     insert(&rl, FLEET).expect("data");
     let (rows, status) = query(&rl, q);

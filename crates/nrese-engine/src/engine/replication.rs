@@ -125,7 +125,7 @@ impl Engine {
                     break 'segments;
                 }
                 let before = batch.frames.len();
-                encode_record(&record, &mut batch.frames)?;
+                encode_record(&record, record.committed_micros, &mut batch.frames)?;
                 if batch.records > 0 && batch.frames.len() > max_bytes {
                     batch.frames.truncate(before);
                     break 'segments;
@@ -198,6 +198,7 @@ impl Engine {
         }
         let dictionary_len = shared.dictionary.len();
         let latest = shared.versions.load();
+        let encoding = latest.asserted.encoding();
         let converting = latest.asserted.layout() == Layout::DefaultGraph && record.names_a_graph();
         let _compaction = converting.then(|| shared.versions.compaction_slot.lock());
         let converted = converting.then(|| shared.versions.load().asserted.with_quads_layout());
@@ -205,7 +206,7 @@ impl Engine {
             .as_ref()
             .map_or(latest.asserted.layout(), |index| index.layout());
         drop(latest);
-        let [asserted_run, inferred_run] = record.runs(asserted_layout);
+        let [asserted_run, inferred_run] = record.runs(asserted_layout, encoding);
         let revision = record.revision;
         // Equality classes are found again where `sameAs` statements changed.
         let same_as = *shared.equality.read();
@@ -221,10 +222,14 @@ impl Engine {
                     .chain(&record.inferred_deletes)
                     .any(|t| t.predicate == same_as)
         });
+        let touched = record.touched();
+        let corpora = std::sync::Arc::clone(&shared.statistics.corpora);
         let publish = move |current: &Version| {
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
+            let content = super::Content::fresh();
+            corpora.record(current.content, content, touched);
             Version {
-                content: super::Content::fresh(),
+                content,
                 asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,

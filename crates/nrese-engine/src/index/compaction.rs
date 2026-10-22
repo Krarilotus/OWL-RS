@@ -68,6 +68,10 @@ pub(crate) fn merge_runs(runs: &[Arc<Run>]) -> Run {
     let layout = runs
         .first()
         .map_or_else(Default::default, |run| run.layout());
+    // The newest run's: a store that switched builds its merges in the new encoding.
+    let encoding = runs
+        .last()
+        .map_or_else(Default::default, |run| run.encoding());
     debug_assert!(
         runs.iter().all(|run| run.layout() == layout),
         "merging runs of different stacks"
@@ -82,9 +86,9 @@ pub(crate) fn merge_runs(runs: &[Arc<Run>]) -> Run {
             .filter(|&(_, sign)| sign != 0)
             .map(|(key, sign)| (key, sign < 0))
             .collect();
-        PermutationRun::from_sorted(entries)
+        PermutationRun::from_sorted(entries, encoding)
     });
-    Run::from_permutations(layout, perms)
+    Run::from_permutations(layout, encoding, perms)
 }
 
 #[cfg(test)]
@@ -102,6 +106,7 @@ mod tests {
     fn run_of(size: u64) -> Arc<Run> {
         Arc::new(Run::from_quads(
             Layout::Quads,
+            crate::IndexEncoding::Fast,
             (0..size).map(quad).collect(),
         ))
     }
@@ -125,6 +130,7 @@ mod tests {
         let base = run_of(4);
         let delta = Arc::new(Run::from_delta(
             Layout::Quads,
+            crate::IndexEncoding::Fast,
             &[quad(9)],
             &[quad(0), quad(1)],
         ));
@@ -134,8 +140,18 @@ mod tests {
 
     #[test]
     fn merging_newer_runs_keeps_unmatched_tombstones() {
-        let a = Arc::new(Run::from_delta(Layout::Quads, &[quad(9)], &[quad(0)]));
-        let b = Arc::new(Run::from_delta(Layout::Quads, &[], &[quad(9)]));
+        let a = Arc::new(Run::from_delta(
+            Layout::Quads,
+            crate::IndexEncoding::Fast,
+            &[quad(9)],
+            &[quad(0)],
+        ));
+        let b = Arc::new(Run::from_delta(
+            Layout::Quads,
+            crate::IndexEncoding::Fast,
+            &[],
+            &[quad(9)],
+        ));
         let merged = merge_runs(&[a, b]);
         // quad(9) cancels out; the tombstone for quad(0) still shadows an older run.
         assert_eq!((merged.inserts(), merged.deletes()), (0, 1));

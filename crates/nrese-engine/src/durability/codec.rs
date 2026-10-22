@@ -39,29 +39,25 @@ pub(crate) struct CommitRecord {
 }
 
 /// Exact payload size of `record` in bytes.
-fn payload_len(record: &CommitRecord) -> u64 {
+fn payload_len(record: &CommitRecord, committed_micros: Option<u64>) -> u64 {
     let keys: u64 = record.keys.iter().map(|key| 4 + key.len() as u64).sum();
     let quads = (record.inserts.len() + record.deletes.len()) as u64 * QUAD_BYTES as u64;
     let triples = (record.inferred_inserts.len() + record.inferred_deletes.len()) as u64
         * TRIPLE_BYTES as u64;
-    8 + 8
-        + 4
-        + keys
-        + 4 * 4
-        + quads
-        + triples
-        + if record.committed_micros.is_some() {
-            8
-        } else {
-            0
-        }
+    8 + 8 + 4 + keys + 4 * 4 + quads + triples + if committed_micros.is_some() { 8 } else { 0 }
 }
 
-/// Appends one framed record to `out`. Fails without writing anything if the payload does
+/// Appends one framed record to `out`, borrowing its payload and writing the supplied
+/// effective time without changing the record. The caller owns the format/time policy.
+/// Fails without writing anything if the payload does
 /// not fit the 32-bit frame length (about 130 M quads); such loads go through the bulk
 /// loader, which writes a checkpoint instead of a WAL record.
-pub(crate) fn encode_record(record: &CommitRecord, out: &mut Vec<u8>) -> EngineResult<()> {
-    let len = payload_len(record);
+pub(crate) fn encode_record(
+    record: &CommitRecord,
+    committed_micros: Option<u64>,
+    out: &mut Vec<u8>,
+) -> EngineResult<()> {
+    let len = payload_len(record, committed_micros);
     let payload_len =
         u32::try_from(len).map_err(|_| EngineError::TransactionTooLarge { bytes: len })?;
     out.reserve(FRAME_HEADER + payload_len as usize);
@@ -79,7 +75,7 @@ pub(crate) fn encode_record(record: &CommitRecord, out: &mut Vec<u8>) -> EngineR
     put_quads(out, &record.deletes);
     put_triples(out, &record.inferred_inserts);
     put_triples(out, &record.inferred_deletes);
-    if let Some(micros) = record.committed_micros {
+    if let Some(micros) = committed_micros {
         put_u64(out, micros);
     }
     debug_assert_eq!((out.len() - payload_start) as u64, len);
@@ -320,8 +316,8 @@ mod tests {
     #[test]
     fn records_roundtrip() {
         let mut bytes = Vec::new();
-        encode_record(&sample(), &mut bytes).unwrap();
-        encode_record(&CommitRecord::default(), &mut bytes).unwrap();
+        encode_record(&sample(), sample().committed_micros, &mut bytes).unwrap();
+        encode_record(&CommitRecord::default(), None, &mut bytes).unwrap();
         let Frame::Record(first, used) = decode_frame(&bytes) else {
             panic!("first frame")
         };
@@ -336,7 +332,7 @@ mod tests {
     #[test]
     fn every_truncation_and_bit_flip_is_detected() {
         let mut bytes = Vec::new();
-        encode_record(&sample(), &mut bytes).unwrap();
+        encode_record(&sample(), sample().committed_micros, &mut bytes).unwrap();
         for cut in 1..bytes.len() {
             assert_eq!(decode_frame(&bytes[..cut]), Frame::Short, "cut at {cut}");
         }
@@ -347,6 +343,89 @@ mod tests {
                 !matches!(decode_frame(&flipped), Frame::Record(ref r, _) if *r == sample()),
                 "flip at {i}"
             );
+        }
+    }
+
+    fn reference_payload_len(record: &CommitRecord) -> u64 {
+        let keys: u64 = record.keys.iter().map(|key| 4 + key.len() as u64).sum();
+        let quads = (record.inserts.len() + record.deletes.len()) as u64 * QUAD_BYTES as u64;
+        let triples = (record.inferred_inserts.len() + record.inferred_deletes.len()) as u64
+            * TRIPLE_BYTES as u64;
+        8 + 8
+            + 4
+            + keys
+            + 4 * 4
+            + quads
+            + triples
+            + if record.committed_micros.is_some() {
+                8
+            } else {
+                0
+            }
+    }
+
+    /// Appends one framed record to `out`. Fails without writing anything if the payload does
+    /// not fit the 32-bit frame length (about 130 M quads); such loads go through the bulk
+    /// loader, which writes a checkpoint instead of a WAL record.
+    fn reference_encode_record(record: &CommitRecord, out: &mut Vec<u8>) -> EngineResult<()> {
+        let len = reference_payload_len(record);
+        let reference_payload_len =
+            u32::try_from(len).map_err(|_| EngineError::TransactionTooLarge { bytes: len })?;
+        out.reserve(FRAME_HEADER + reference_payload_len as usize);
+        let frame_start = out.len();
+        out.extend_from_slice(&[0; FRAME_HEADER]);
+        let payload_start = out.len();
+        put_u64(out, record.revision);
+        put_u64(out, record.dictionary_start);
+        put_u32(out, record.keys.len() as u32);
+        for key in &record.keys {
+            put_u32(out, key.len() as u32);
+            out.extend_from_slice(key);
+        }
+        put_quads(out, &record.inserts);
+        put_quads(out, &record.deletes);
+        put_triples(out, &record.inferred_inserts);
+        put_triples(out, &record.inferred_deletes);
+        if let Some(micros) = record.committed_micros {
+            put_u64(out, micros);
+        }
+        debug_assert_eq!((out.len() - payload_start) as u64, len);
+        let crc = crc32fast::hash(&out[payload_start..]);
+        out[frame_start..frame_start + 4].copy_from_slice(&reference_payload_len.to_le_bytes());
+        out[frame_start + 4..payload_start].copy_from_slice(&crc.to_le_bytes());
+        Ok(())
+    }
+
+    /// Byte-for-byte oracle frozen from f707337f, including every payload collection,
+    /// frame length, CRC and appending to a nonempty output. Zero is legal in this pure
+    /// codec; Wal::append separately enforces the positive v6 marker.
+    #[test]
+    fn effective_time_matches_the_prechange_serializer() {
+        for source in [None, Some(0), Some(1), Some(u64::MAX)] {
+            let record = CommitRecord {
+                committed_micros: source,
+                ..sample()
+            };
+            let before = record.clone();
+            for effective in [None, Some(0), Some(1), Some(u64::MAX)] {
+                let expected_record = CommitRecord {
+                    committed_micros: effective,
+                    ..record.clone()
+                };
+                let mut expected = vec![0xaa, 0x55];
+                reference_encode_record(&expected_record, &mut expected).unwrap();
+                let mut actual = vec![0xaa, 0x55];
+                encode_record(&record, effective, &mut actual).unwrap();
+                assert_eq!(
+                    actual, expected,
+                    "source={source:?}, effective={effective:?}"
+                );
+                assert_eq!(
+                    decode_frame(&actual[2..]),
+                    Frame::Record(expected_record, actual.len() - 2)
+                );
+                assert_eq!(record, before, "encoding changed its input");
+            }
         }
     }
 }

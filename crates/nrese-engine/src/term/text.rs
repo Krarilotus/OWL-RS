@@ -5,32 +5,48 @@
 //! varint deltas, the words in 256 shards by their first byte, so that the build runs on
 //! every core (DBpedia's 40 M terms). It is built the first time a query searches, and extended
 //! with the terms the dictionary gained since before each later search: the dictionary is
-//! append-only, so nothing indexed ever changes. Whether a literal still occurs in the data
+//! append-only, so nothing indexed ever changes. A large extension is built apart, as an
+//! index of the new documents alone (a fragment), with no lock held, and then taken in
+//! ([`TextIndex::absorb`]): a part of the parallel build may run a job that wants the
+//! dictionary or this index. Taking it in runs under the index's lock, on a pool of its
+//! own (not the global one: its threads run nothing else, so no job they take on can wait
+//! for the lock); into an empty index it is a move. Whether a literal still occurs in the data
 //! is the query's business (it joins the matches with the statements).
 //!
 //! Scores are BM25 (k1 = 1.2, b = 0.75) summed over the query's words and divided by the
-//! best match's, so relevance lies in (0, 1] as Blazegraph's does.
+//! best match's, so relevance lies in (0, 1] as Blazegraph's does. A search ranks among the
+//! documents of a [`Corpus`] only: the literals a reader's snapshot and graphs hold (the
+//! dictionary is shared by every version and transaction, and holds what no statement uses
+//! any more). Its document count, average length and each word's document frequency are
+//! counted over the corpus, so no score depends on a literal outside it.
 //!
 //! A part of the query in double quotes is a phrase (`"quick brown" fox`): it matches the
 //! literals whose words hold it as a sequence, and counts as one of the query's terms.
 //! Its words find the candidates in the index; each is checked against its text.
 //!
 //! A word after `-` is excluded: literals that have it don't match. A word ending in `~`
-//! (or `~1`, `~2`) matches the indexed words within that many edits (insertions, deletions,
-//! substitutions, transpositions; `~` is two), as Lucene's fuzzy queries do.
+//! (or `~0`, `~1`, `~2`) matches the indexed words within that many edits (insertions,
+//! deletions, substitutions, transpositions; `~` is two). `~0` uses exact spelling even
+//! with stemming. Malformed or unsupported operators return `EngineError::InvalidTextQuery`.
 //!
 //! With a stemming language ([`TextQuery::stem`]), words match by their Snowball stem
 //! (`connected` finds `connection` and `connecting`), phrases too. The index keeps the
 //! words as written; per language, a map from stems to the indexed words with that stem
 //! is built at the first stemmed search and extended at later ones.
 
-use std::borrow::Cow;
+use std::sync::Arc;
+
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation, Room};
 use std::collections::{BTreeMap, HashMap};
 
 use rayon::prelude::*;
 use rust_stemmers::{Algorithm, Stemmer};
 
-/// What to search for.
+use crate::{EngineError, EngineResult};
+
+/// What to search for. Search methods return `EngineError::InvalidTextQuery` for
+/// unsupported or malformed operators, including on an empty index. Use
+/// [`Self::plain_prefix`] for typed text whose punctuation must not introduce operators.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextQuery {
     /// The words to find; a word ending in `*` matches every word it starts, and words in
@@ -43,6 +59,18 @@ pub struct TextQuery {
     /// Match words by their stem in this language (ISO 639-1: `en`, `de`, `fr`, ...;
     /// [`stemmer`] lists them). `None`, or a language without a stemmer: as written.
     pub stem: Option<String>,
+}
+
+impl TextQuery {
+    /// Plain typed words, all matched as prefixes; punctuation never introduces operators.
+    pub fn plain_prefix(text: &str) -> Self {
+        Self {
+            text: word_slices(text).collect::<Vec<_>>().join(" "),
+            all_words: true,
+            prefix: true,
+            stem: None,
+        }
+    }
 }
 
 /// The Snowball stemmer for `language` (an ISO 639-1 code, a region after `-` ignored).
@@ -84,30 +112,78 @@ enum Match {
 /// Whether `a` and `b` are at most `max` edits apart: insertions, deletions and
 /// substitutions of characters, and transpositions of neighbours, as Lucene counts them
 /// (optimal string alignment).
+#[cfg(test)]
 fn within_edits(a: &str, b: &str, max: usize) -> bool {
-    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
-    if a.len().abs_diff(b.len()) > max {
-        return false;
+    let budget = Arc::new(Budget::unlimited());
+    Edits::new(&budget)
+        .within(a, b, max)
+        .expect("no budget to exceed")
+}
+
+/// The characters and rows [`Edits::within`] compares words with, kept from one word to
+/// the next (a fuzzy match compares its word with every indexed word), charged.
+struct Edits {
+    a: ChargedVec<char>,
+    b: ChargedVec<char>,
+    before: ChargedVec<usize>,
+    row: ChargedVec<usize>,
+    next: ChargedVec<usize>,
+}
+
+impl Edits {
+    fn new(budget: &Arc<Budget>) -> Self {
+        Self {
+            a: ChargedVec::new(Arc::clone(budget)),
+            b: ChargedVec::new(Arc::clone(budget)),
+            before: ChargedVec::new(Arc::clone(budget)),
+            row: ChargedVec::new(Arc::clone(budget)),
+            next: ChargedVec::new(Arc::clone(budget)),
+        }
     }
-    let mut before: Vec<usize> = Vec::new();
-    let mut row: Vec<usize> = (0..=b.len()).collect();
-    for i in 0..a.len() {
-        let mut next = vec![i + 1; b.len() + 1];
-        for j in 0..b.len() {
-            let mut cost = (row[j] + usize::from(a[i] != b[j]))
-                .min(row[j + 1] + 1)
-                .min(next[j] + 1);
-            if i > 0 && j > 0 && a[i] == b[j - 1] && a[i - 1] == b[j] {
-                cost = cost.min(before[j - 1] + 1);
+
+    /// Whether `a` and `b` are at most `max` edits apart ([`within_edits`]).
+    fn within(&mut self, a: &str, b: &str, max: usize) -> Result<bool, BudgetExceeded> {
+        let Self {
+            a: a_chars,
+            b: b_chars,
+            before,
+            row,
+            next,
+        } = self;
+        a_chars.clear();
+        a_chars.extend_bounded(a.len(), a.chars())?;
+        b_chars.clear();
+        b_chars.extend_bounded(b.len(), b.chars())?;
+        let (a, b) = (&a_chars[..], &b_chars[..]);
+        if a.len().abs_diff(b.len()) > max {
+            return Ok(false);
+        }
+        row.clear();
+        row.extend_bounded(b.len() + 1, 0..=b.len())?;
+        // Read only from the second row on, when it holds the row before the last.
+        before.clear();
+        before.resize(b.len() + 1, 0)?;
+        next.clear();
+        next.resize(b.len() + 1, 0)?;
+        for i in 0..a.len() {
+            next[..].fill(i + 1);
+            for j in 0..b.len() {
+                let mut cost = (row[j] + usize::from(a[i] != b[j]))
+                    .min(row[j + 1] + 1)
+                    .min(next[j] + 1);
+                if i > 0 && j > 0 && a[i] == b[j - 1] && a[i - 1] == b[j] {
+                    cost = cost.min(before[j - 1] + 1);
+                }
+                next[j + 1] = cost;
             }
-            next[j + 1] = cost;
+            if next.iter().min().is_some_and(|&least| least > max) {
+                return Ok(false);
+            }
+            std::mem::swap(before, row);
+            std::mem::swap(row, next);
         }
-        if next.iter().min().is_some_and(|&least| least > max) {
-            return false;
-        }
-        before = std::mem::replace(&mut row, next);
+        Ok(row[b.len()] <= max)
     }
-    row[b.len()] <= max
 }
 
 /// The key of a stemming language: its code, lower case, without a region.
@@ -124,6 +200,120 @@ fn stem_key(language: &str) -> String {
 pub struct TextMatch {
     pub id: u64,
     pub relevance: f64,
+}
+
+/// A search's matches, best first, held on the budget they were charged to until they
+/// drop.
+#[derive(Debug)]
+pub struct TextMatches {
+    /// Before the charge: fields drop in order, the matches first.
+    matches: Vec<TextMatch>,
+    _charge: Reservation,
+}
+
+impl TextMatches {
+    /// No matches (nothing allocated).
+    pub(crate) fn empty(budget: &Arc<Budget>) -> Self {
+        Self {
+            matches: Vec::new(),
+            _charge: Reservation::new(Arc::clone(budget)),
+        }
+    }
+}
+
+impl TextMatches {
+    /// Each match named by `representative` of its id, each id once at its best match's
+    /// relevance; best first (ties by id), in place.
+    pub(crate) fn as_representatives(&mut self, representative: impl Fn(u64) -> u64) {
+        for found in &mut self.matches {
+            found.id = representative(found.id);
+        }
+        self.matches.sort_unstable_by(|a, b| {
+            a.id.cmp(&b.id)
+                .then_with(|| b.relevance.total_cmp(&a.relevance))
+        });
+        self.matches.dedup_by_key(|found| found.id);
+        self.matches.sort_unstable_by(|a, b| {
+            b.relevance
+                .total_cmp(&a.relevance)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
+}
+
+impl std::ops::Deref for TextMatches {
+    type Target = [TextMatch];
+
+    fn deref(&self) -> &[TextMatch] {
+        &self.matches
+    }
+}
+
+impl std::ops::DerefMut for TextMatches {
+    fn deref_mut(&mut self) -> &mut [TextMatch] {
+        &mut self.matches
+    }
+}
+
+impl PartialEq for TextMatches {
+    fn eq(&self, other: &Self) -> bool {
+        self.matches == other.matches
+    }
+}
+
+impl<'a> IntoIterator for &'a TextMatches {
+    type Item = &'a TextMatch;
+    type IntoIter = std::slice::Iter<'a, TextMatch>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.matches.iter()
+    }
+}
+
+/// A document's text, for the phrases of a search ([`TextIndex::search`]): given to
+/// `visit` where document `id` has one, what that takes charged first.
+pub(crate) type TextOf<'a> = &'a dyn Fn(u64, &mut dyn FnMut(&str)) -> Result<(), BudgetExceeded>;
+
+/// Whether the words of `text`, as a phrase compares them (lower case; with `stemmer`,
+/// stemmed), hold `phrase` in sequence. `active[k]`: whether the last words read end the
+/// phrase's first `k + 1` (so no word is read twice). A word's lower case or stem is made
+/// only where it differs from the word's ASCII lower case read in place, charged first
+/// (by the text's length).
+fn holds_phrase(
+    text: &str,
+    phrase: &[String],
+    stemmer: Option<&Stemmer>,
+    active: &mut [bool],
+    budget: &Arc<Budget>,
+) -> Result<bool, BudgetExceeded> {
+    let mut charge = Reservation::new(Arc::clone(budget));
+    if stemmer.is_some() || !text.is_ascii() {
+        charge.charge(text.len() * 12 + 64)?;
+    }
+    active.fill(false);
+    let last = phrase.len() - 1;
+    for word in text
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+    {
+        let normal: Option<String> = match stemmer {
+            None if word.is_ascii() => None,
+            None => Some(word.to_lowercase()),
+            Some(stemmer) => Some(stemmer.stem(&word.to_lowercase()).into_owned()),
+        };
+        let same = |target: &str| match &normal {
+            None => word.eq_ignore_ascii_case(target),
+            Some(normal) => normal == target,
+        };
+        for k in (1..=last).rev() {
+            active[k] = active[k - 1] && same(&phrase[k]);
+        }
+        active[0] = same(&phrase[0]);
+        if active[last] {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The text an IRI is found by in autocompletion: its local name (after the last `#`,
@@ -149,9 +339,12 @@ pub(crate) fn local_name_text(iri: &str) -> Option<String> {
 
 /// The words of `text`: maximal runs of letters and digits, lower-cased.
 pub fn words(text: &str) -> impl Iterator<Item = String> + '_ {
+    word_slices(text).map(str::to_lowercase)
+}
+
+fn word_slices(text: &str) -> impl Iterator<Item = &str> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|word| !word.is_empty())
-        .map(str::to_lowercase)
 }
 
 /// Words go into shards by their first byte, so that a build fills the shards in parallel
@@ -159,7 +352,10 @@ pub fn words(text: &str) -> impl Iterator<Item = String> + '_ {
 const SHARDS: usize = 256;
 
 /// Documents tokenised per parallel part of a build.
-const BUILD_PART: usize = 1 << 14;
+pub(crate) const BUILD_PART: usize = 1 << 14;
+
+/// Fewer documents than this are indexed one at a time, on one thread.
+pub(crate) const SERIAL_DOCUMENTS: u64 = 2 * BUILD_PART as u64;
 
 fn shard_of(word: &str) -> usize {
     usize::from(word.as_bytes()[0])
@@ -207,15 +403,290 @@ impl Postings {
         self.len += 1;
     }
 
-    fn decode(&self) -> Vec<(u64, u16)> {
-        let mut out = Vec::with_capacity(self.len as usize);
+    /// `other`'s documents after this one's (all numbered after them).
+    fn append(&mut self, other: Postings) {
+        if self.len == 0 {
+            *self = other;
+            return;
+        }
+        // Its first number is a delta from 0: from this one's last now.
+        let mut position = 0;
+        let first = get_varint(&other.bytes, &mut position);
+        debug_assert!(other.len == 0 || first > self.last);
+        if other.len == 0 {
+            return;
+        }
+        put_varint(&mut self.bytes, first - self.last);
+        self.bytes.extend_from_slice(&other.bytes[position..]);
+        self.last = other.last;
+        self.len += other.len;
+    }
+
+    /// The documents of `corpus`, with their occurrences, into `out` (with room for
+    /// [`Self::bound`]).
+    fn decode(&self, corpus: &Corpus, out: &mut Room<'_, (u64, u16)>) {
+        // The representation's test hoisted out of the loop: a bit, or a member list walked
+        // forward with the postings (both ascending).
+        match &corpus.members {
+            Members::Bits(bits) => self.decode_where(out, |document| {
+                let word = (document / 64) as usize;
+                word < bits.len() && bits[word] >> (document % 64) & 1 == 1
+            }),
+            Members::Sorted(sorted) => {
+                let mut at = 0;
+                self.decode_where(out, |document| {
+                    at += sorted[at..].partition_point(|&member| member < document);
+                    sorted.get(at) == Some(&document)
+                })
+            }
+        }
+    }
+
+    /// The most documents of `corpus` it has.
+    fn bound(&self, corpus: &Corpus) -> usize {
+        (self.len as usize).min(corpus.documents as usize)
+    }
+
+    /// The documents `keep` takes (asked in ascending order), with their occurrences.
+    #[inline]
+    fn decode_where(&self, out: &mut Room<'_, (u64, u16)>, mut keep: impl FnMut(u64) -> bool) {
         let (mut position, mut document) = (0, 0u64);
         for _ in 0..self.len {
             document += get_varint(&self.bytes, &mut position);
             let count = get_varint(&self.bytes, &mut position) as u16;
-            out.push((document, count));
+            if keep(document) {
+                out.push((document, count));
+            }
         }
-        out
+    }
+}
+
+/// Threads for work under a lock ([`scoped`]).
+pub(crate) fn threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
+/// `f` of each of `parts`, in parallel on a pool of its own (not the global one): for work
+/// done while a lock is held, since its threads take on no job of the global pool's, which
+/// might wait for that lock. Its threads are made once (spawning them for each build cost
+/// more than the work on a cold index of a few hundred thousand terms). The caller waits
+/// without taking on work: a worker of a pool waiting in another pool's `install` runs its
+/// own pool's jobs meanwhile, one of which might want the lock it holds, so a worker waits
+/// on a thread of no pool. `f` takes no lock of the dictionary, a read included (with a
+/// writer queued, a new read waits behind it, and the writer behind the holder): it is
+/// handed what it reads.
+pub(crate) fn scoped<T: Send, R: Send>(parts: Vec<T>, f: impl Fn(T) -> R + Sync) -> Vec<R> {
+    static LOCKED: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    let pool = LOCKED.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads())
+            .thread_name(|i| format!("nrese-locked-{i}"))
+            .build()
+            .expect("the pool for work under a lock")
+    });
+    let run = || pool.install(|| parts.into_par_iter().map(&f).collect());
+    match rayon::current_thread_index() {
+        Some(_) => std::thread::scope(|scope| {
+            scope
+                .spawn(run)
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        }),
+        None => run(),
+    }
+}
+
+/// The numbers whose bits `bits` sets, ascending.
+fn ones(bits: &[u64]) -> impl Iterator<Item = u64> + '_ {
+    bits.iter().enumerate().flat_map(|(w, &word)| {
+        let mut rest = word;
+        std::iter::from_fn(move || {
+            (rest != 0).then(|| {
+                let bit = rest.trailing_zeros();
+                rest &= rest - 1;
+                w as u64 * 64 + u64::from(bit)
+            })
+        })
+    })
+}
+
+/// The documents a search ranks among (by number), with the statistics BM25 takes from
+/// them: built by the caller from what a reader sees ([`Corpus::finish`]). Its members are
+/// held on the budget they were charged to before they were allocated, until it drops.
+#[derive(Debug)]
+pub struct Corpus {
+    members: Members,
+    documents: u64,
+    total_words: u64,
+    _charge: Reservation,
+}
+
+/// A corpus being built: a bit per dictionary entry, charged to the building search's
+/// budget, with the count of its documents and their words.
+pub(crate) struct Bits {
+    pub(crate) bits: ChargedVec<u64>,
+    pub(crate) documents: u64,
+    pub(crate) total_words: u64,
+}
+
+impl Bits {
+    /// The documents whose bits `bits` sets (a bit per number below its span), with their
+    /// count and words: `length` gives a number's words (0: not a document, left out).
+    pub(crate) fn counted(mut bits: ChargedVec<u64>, length: impl Fn(u64) -> u16) -> Self {
+        let (mut documents, mut total_words) = (0u64, 0u64);
+        for (w, word) in bits.iter_mut().enumerate() {
+            let mut rest = *word;
+            while rest != 0 {
+                let bit = rest.trailing_zeros();
+                rest &= rest - 1;
+                match length(w as u64 * 64 + u64::from(bit)) {
+                    0 => *word &= !(1 << bit),
+                    length => {
+                        documents += 1;
+                        total_words += u64::from(length);
+                    }
+                }
+            }
+        }
+        Self {
+            bits,
+            documents,
+            total_words,
+        }
+    }
+
+    /// `base` with each document of `changes` a member or not (numbers below `span`;
+    /// numbers `length` gives no words stay out): its counts adjusted, not counted again.
+    pub(crate) fn derived(
+        base: &Corpus,
+        changes: &[(u64, bool)],
+        span: u64,
+        budget: &Arc<Budget>,
+        length: impl Fn(u64) -> u16,
+    ) -> Result<Self, BudgetExceeded> {
+        let mut bits = base.bits(span, budget)?;
+        let (mut documents, mut total_words) = (base.documents, base.total_words);
+        for &(document, member) in changes {
+            let (word, bit) = ((document / 64) as usize, document % 64);
+            let was = bits[word] >> bit & 1 == 1;
+            let length = length(document);
+            if member && !was && length > 0 {
+                bits[word] |= 1 << bit;
+                documents += 1;
+                total_words += u64::from(length);
+            } else if !member && was {
+                bits[word] &= !(1 << bit);
+                documents -= 1;
+                total_words -= u64::from(length);
+            }
+        }
+        Ok(Self {
+            bits,
+            documents,
+            total_words,
+        })
+    }
+}
+
+/// A corpus's documents: a sorted list where they are few against the numbers they span,
+/// else a bit per number.
+#[derive(Debug)]
+enum Members {
+    Sorted(Vec<u64>),
+    Bits(Vec<u64>),
+}
+
+impl Corpus {
+    /// Its documents (the indexed ones: literals with a word).
+    pub fn documents(&self) -> u64 {
+        self.documents
+    }
+
+    /// Its words, counted with repetition.
+    pub fn total_words(&self) -> u64 {
+        self.total_words
+    }
+
+    /// Whether `document` is one of its documents.
+    #[inline]
+    pub fn contains(&self, document: u64) -> bool {
+        match &self.members {
+            Members::Bits(bits) => {
+                let word = (document / 64) as usize;
+                word < bits.len() && bits[word] >> (document % 64) & 1 == 1
+            }
+            Members::Sorted(sorted) => sorted.binary_search(&document).is_ok(),
+        }
+    }
+
+    /// Its documents, ascending.
+    pub fn members(&self) -> Vec<u64> {
+        match &self.members {
+            Members::Sorted(sorted) => sorted.clone(),
+            Members::Bits(bits) => ones(bits).collect(),
+        }
+    }
+
+    /// Its documents as a bit per number below `span` (at least its own), charged to
+    /// `budget` before they are allocated.
+    fn bits(&self, span: u64, budget: &Arc<Budget>) -> Result<ChargedVec<u64>, BudgetExceeded> {
+        let words = match &self.members {
+            Members::Sorted(_) => span.div_ceil(64) as usize,
+            Members::Bits(bits) => (span.div_ceil(64) as usize).max(bits.len()),
+        };
+        let mut out = ChargedVec::with_capacity(Arc::clone(budget), words)?;
+        match &self.members {
+            Members::Sorted(sorted) => {
+                out.resize(words, 0)?;
+                for &document in sorted {
+                    out[(document / 64) as usize] |= 1 << (document % 64);
+                }
+            }
+            Members::Bits(bits) => {
+                out.extend_from_slice(bits)?;
+                out.resize(words, 0)?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The corpus of `bits` (a bit per number below `span`, every one a document), its
+    /// members charged to `budget` before they are allocated: a sorted list where that is
+    /// smaller than a bit per number.
+    pub(crate) fn finish(
+        bits: &Bits,
+        span: u64,
+        budget: &Arc<Budget>,
+    ) -> Result<Self, BudgetExceeded> {
+        let (members, charge) = match Self::finished_bytes(bits.documents, span) {
+            (true, _) => {
+                let mut out = ChargedVec::with_capacity(Arc::clone(budget), bits.bits.len())?;
+                out.extend_from_slice(&bits.bits)?;
+                let (members, charge) = out.into_parts();
+                (Members::Bits(members), charge)
+            }
+            (false, _) => {
+                let count = bits.documents as usize;
+                let out = ChargedVec::collect(Arc::clone(budget), count, ones(&bits.bits))?;
+                let (members, charge) = out.into_parts();
+                (Members::Sorted(members), charge)
+            }
+        };
+        Ok(Self {
+            members,
+            documents: bits.documents,
+            total_words: bits.total_words,
+            _charge: charge,
+        })
+    }
+
+    /// Whether a corpus of `documents` below `span` is kept as bits, and the bytes its
+    /// members take: what [`Self::finish`] charges.
+    pub(crate) fn finished_bytes(documents: u64, span: u64) -> (bool, usize) {
+        match documents * 64 > span {
+            true => (true, span.div_ceil(64) as usize * 8),
+            false => (false, documents as usize * 8),
+        }
     }
 }
 
@@ -227,8 +698,10 @@ pub(crate) struct TextIndex {
     covered: u64,
     /// Word → its postings, in the shard of its first byte.
     shards: Vec<BTreeMap<Box<str>, Postings>>,
-    /// Words per document, by document number (0: not indexed).
+    /// Words per document, by document number from `first` (0: not indexed).
     lengths: Vec<u16>,
+    /// The number of `lengths`' first entry: 0, but for a fragment ([`Self::fragment`]).
+    first: u64,
     documents: u64,
     total_words: u64,
     /// Distinct words so far: when it changed, the stem maps are stale.
@@ -243,6 +716,7 @@ impl Default for TextIndex {
             covered: 0,
             shards: vec![BTreeMap::new(); SHARDS],
             lengths: Vec::new(),
+            first: 0,
             documents: 0,
             total_words: 0,
             word_count: 0,
@@ -289,6 +763,7 @@ impl TextIndex {
         &self,
         out: &mut super::derived::Writer<W>,
     ) -> std::io::Result<()> {
+        debug_assert_eq!(self.first, 0, "fragments aren't written");
         out.u32(TEXT_FORMAT)?;
         out.u64(self.covered)?;
         out.u64(self.documents)?;
@@ -345,6 +820,7 @@ impl TextIndex {
             covered,
             shards,
             lengths,
+            first: 0,
             documents,
             total_words,
             word_count,
@@ -352,8 +828,90 @@ impl TextIndex {
         })
     }
 
+    /// An empty index of the dictionary's entries from `first` on: a fragment, extended
+    /// ([`Self::extend`]) and covered apart, for [`Self::absorb`] to take in.
+    pub(crate) fn starting_at(first: u64) -> Self {
+        Self {
+            first,
+            covered: first,
+            ..Self::default()
+        }
+    }
+
+    /// Takes in `fragment`, an index of the entries from this one's coverage on (built
+    /// apart, [`Self::starting_at`]): its documents' lengths, its words' postings after
+    /// theirs, its coverage. Into an empty index, a move; else the shards are merged on
+    /// threads of their own ([`scoped`]), since this runs under the index's lock.
+    pub(crate) fn absorb(&mut self, mut fragment: TextIndex) {
+        debug_assert_eq!(fragment.first, self.covered);
+        if self.documents == 0 && self.word_count == 0 {
+            // Numbered from 0 again, as a whole index is (and written); with room to grow,
+            // as the fragment's own lengths have (one commit's documents later would
+            // otherwise copy them all: 80 MB on DBpedia core).
+            let lengths = match fragment.first {
+                0 => std::mem::take(&mut fragment.lengths),
+                first => {
+                    let len = first as usize + fragment.lengths.len();
+                    let mut lengths = Vec::with_capacity(len + len / 4);
+                    lengths.resize(first as usize, 0);
+                    lengths.append(&mut fragment.lengths);
+                    lengths
+                }
+            };
+            *self = Self {
+                lengths,
+                first: 0,
+                stems: std::mem::take(&mut self.stems),
+                ..fragment
+            };
+            return;
+        }
+        let end = (fragment.first + fragment.lengths.len() as u64 - self.first) as usize;
+        if self.lengths.len() < end {
+            self.lengths.resize(end, 0);
+        }
+        let from = (fragment.first - self.first) as usize;
+        self.lengths[from..end].copy_from_slice(&fragment.lengths);
+        self.documents += fragment.documents;
+        self.total_words += fragment.total_words;
+        let per = SHARDS.div_ceil(threads());
+        let pairs: Vec<_> = self
+            .shards
+            .chunks_mut(per)
+            .zip(fragment.shards.chunks_mut(per))
+            .collect();
+        let new_words: usize = scoped(pairs, |(ours, theirs)| {
+            let mut new_words = 0;
+            for (shard, theirs) in ours.iter_mut().zip(theirs.iter_mut()) {
+                for (word, postings) in std::mem::take(theirs) {
+                    match shard.get_mut(&word) {
+                        Some(ours) => ours.append(postings),
+                        None => {
+                            shard.insert(word, postings);
+                            new_words += 1;
+                        }
+                    }
+                }
+            }
+            new_words
+        })
+        .into_iter()
+        .sum();
+        self.word_count += new_words;
+        self.covered = fragment.covered;
+    }
+
+    /// Words of document `document` (0: not indexed).
+    fn length_of(&self, document: u64) -> u16 {
+        document
+            .checked_sub(self.first)
+            .and_then(|i| self.lengths.get(i as usize))
+            .copied()
+            .unwrap_or(0)
+    }
+
     fn record_length(&mut self, document: u64, length: u16) {
-        let i = document as usize;
+        let i = (document - self.first) as usize;
         if self.lengths.len() <= i {
             self.lengths.resize(i + 1, 0);
         }
@@ -384,9 +942,10 @@ impl TextIndex {
     }
 
     /// Indexes `documents` (numbers ascending, after every one added before): tokenised in
-    /// parallel parts, then every shard filled in parallel from the parts in order.
-    pub(crate) fn extend(&mut self, documents: &[(u64, &str)]) {
-        if documents.len() < 2 * BUILD_PART {
+    /// parallel parts, then every shard filled in parallel from the parts in order, `part`
+    /// run at each part's start. Few documents: one at a time, on this thread.
+    pub(crate) fn extend(&mut self, documents: &[(u64, &str)], part: &(dyn Fn() + Sync)) {
+        if (documents.len() as u64) < SERIAL_DOCUMENTS {
             for &(document, text) in documents {
                 self.add(document, text);
             }
@@ -395,10 +954,11 @@ impl TextIndex {
         type Part = (Vec<(u64, u16)>, Vec<Vec<(Box<str>, u64, u16)>>);
         let parts: Vec<Part> = documents
             .par_chunks(BUILD_PART)
-            .map(|part| {
-                let mut lengths = Vec::with_capacity(part.len());
+            .map(|chunk| {
+                part();
+                let mut lengths = Vec::with_capacity(chunk.len());
                 let mut by_shard: Vec<Vec<(Box<str>, u64, u16)>> = vec![Vec::new(); SHARDS];
-                for &(document, text) in part {
+                for &(document, text) in chunk {
                     let (counts, length) = tokens(text);
                     if length == 0 {
                         continue;
@@ -421,6 +981,9 @@ impl TextIndex {
             .par_iter_mut()
             .enumerate()
             .map(|(s, shard)| {
+                if s % 64 == 0 {
+                    part();
+                }
                 let mut new_words = 0;
                 for (_, by_shard) in &parts {
                     for (word, document, count) in &by_shard[s] {
@@ -439,6 +1002,28 @@ impl TextIndex {
             })
             .sum();
         self.word_count += new_words;
+    }
+
+    /// The corpus of the documents whose bits `bits` sets (a bit per number below `span`;
+    /// numbers this index has no words for are left out), with their count and words. One
+    /// thread: it runs under the index's lock.
+    pub(crate) fn corpus(&self, bits: ChargedVec<u64>) -> Bits {
+        Bits::counted(bits, |document| self.length_of(document))
+    }
+
+    /// `base` with each document of `changes` a member or not (numbers below `span`;
+    /// numbers this index has no words for stay out): its counts adjusted, not counted
+    /// again.
+    pub(crate) fn derive(
+        &self,
+        base: &Corpus,
+        changes: &[(u64, bool)],
+        span: u64,
+        budget: &Arc<Budget>,
+    ) -> Result<Bits, BudgetExceeded> {
+        Bits::derived(base, changes, span, budget, |document| {
+            self.length_of(document)
+        })
     }
 
     /// Marks the dictionary entries below `covered` as looked at.
@@ -478,77 +1063,107 @@ impl TextIndex {
         );
     }
 
-    /// The postings of `word`: of the words it starts as a prefix, of the words within the
-    /// edits of a fuzzy match, of the words with its stem with `stems`, else its own; merged
-    /// by document (occurrences added up).
+    /// The postings of `word` in `corpus`: of the words it starts as a prefix, of the words
+    /// within the edits of a fuzzy match, of the words with its stem with `stems`, else its
+    /// own; merged by document (occurrences added up). Charged to `budget` first: the lists
+    /// found, and room for the most documents of the corpus each has.
     fn postings_of(
         &self,
         word: &str,
         matching: Match,
         stems: Option<(&Stemmer, &Stems)>,
-    ) -> Cow<'_, [(u64, u16)]> {
-        let lists: Vec<&Postings> = match (matching, stems) {
-            (Match::Fuzzy(edits), _) => self
-                .shards
-                .iter()
-                .flat_map(|shard| shard.iter())
-                .filter(|(key, _)| within_edits(key, word, usize::from(edits)))
-                .map(|(_, list)| list)
-                .collect(),
-            (Match::Prefix, _) => self.shards[shard_of(word)]
-                .range::<str, _>((std::ops::Bound::Included(word), std::ops::Bound::Unbounded))
-                .take_while(|(key, _)| key.starts_with(word))
-                .map(|(_, list)| list)
-                .collect(),
-            (Match::Exact, Some((stemmer, stems))) => stems
-                .groups
-                .get(stemmer.stem(word).as_ref())
-                .into_iter()
-                .flatten()
-                .filter_map(|word| self.shards[shard_of(word)].get(word))
-                .collect(),
-            (Match::Exact, None) => self.shards[shard_of(word)].get(word).into_iter().collect(),
-        };
-        match lists.as_slice() {
-            [] => Cow::Borrowed(&[]),
-            [list] => Cow::Owned(list.decode()),
-            _ => {
-                let mut merged: Vec<(u64, u16)> =
-                    lists.into_iter().flat_map(Postings::decode).collect();
-                merged.sort_unstable_by_key(|&(id, _)| id);
-                merged.dedup_by(|later, kept| {
-                    let same = later.0 == kept.0;
-                    if same {
-                        kept.1 = kept.1.saturating_add(later.1);
+        corpus: &Corpus,
+        budget: &Arc<Budget>,
+    ) -> Result<ChargedVec<(u64, u16)>, BudgetExceeded> {
+        let mut lists: ChargedVec<&Postings> = ChargedVec::new(Arc::clone(budget));
+        match (matching, stems) {
+            // Exact spelling, stemming or not.
+            (Match::Fuzzy(0), _) => {
+                if let Some(list) = self.shards[shard_of(word)].get(word) {
+                    lists.push(list)?;
+                }
+            }
+            (Match::Fuzzy(edits), _) => {
+                let mut compare = Edits::new(budget);
+                for (key, list) in self.shards.iter().flat_map(|shard| shard.iter()) {
+                    if compare.within(key, word, usize::from(edits))? {
+                        lists.push(list)?;
                     }
-                    same
-                });
-                Cow::Owned(merged)
+                }
+            }
+            (Match::Prefix, _) => {
+                for (_, list) in self.shards[shard_of(word)]
+                    .range::<str, _>((std::ops::Bound::Included(word), std::ops::Bound::Unbounded))
+                    .take_while(|(key, _)| key.starts_with(word))
+                {
+                    lists.push(list)?;
+                }
+            }
+            (Match::Exact, Some((stemmer, stems))) => {
+                let found = stems.groups.get(stemmer.stem(word).as_ref());
+                for word in found.into_iter().flatten() {
+                    if let Some(list) = self.shards[shard_of(word)].get(word) {
+                        lists.push(list)?;
+                    }
+                }
+            }
+            (Match::Exact, None) => {
+                if let Some(list) = self.shards[shard_of(word)].get(word) {
+                    lists.push(list)?;
+                }
             }
         }
+        let bound = lists.iter().map(|list| list.bound(corpus)).sum();
+        let mut merged = ChargedVec::with_capacity(Arc::clone(budget), bound)?;
+        merged.fill(bound, |room| {
+            for list in lists.iter() {
+                list.decode(corpus, room);
+            }
+        })?;
+        if lists.len() > 1 {
+            merged.sort_unstable_by_key(|&(id, _)| id);
+            // Repeats of a document as one, their occurrences added up, in place.
+            let mut len = 0;
+            for i in 0..merged.len() {
+                match len > 0 && merged[len - 1].0 == merged[i].0 {
+                    true => merged[len - 1].1 = merged[len - 1].1.saturating_add(merged[i].1),
+                    false => {
+                        merged[len] = merged[i];
+                        len += 1;
+                    }
+                }
+            }
+            merged.truncate(len);
+        }
+        Ok(merged)
     }
 
     /// Words per document (1 where unknown).
     fn length(&self, document: u64) -> f64 {
-        match self.lengths.get(document as usize) {
-            Some(&length) if length > 0 => f64::from(length),
-            _ => 1.0,
+        match self.length_of(document) {
+            0 => 1.0,
+            length => f64::from(length),
         }
     }
 
-    /// The literals matching `query`, best first (ties by id); `text_of` gives a literal's
-    /// text, to check phrases.
+    /// The literals of `corpus` matching `query`, best first (ties by id), scored with the
+    /// corpus's statistics; `text_of` gives a literal's text, to check phrases. Everything
+    /// it holds is charged to `budget` before it is allocated: the query's words (within a
+    /// bound from its length), each word's postings in the corpus, the phrases' checks, the
+    /// matches (returned with their charge). Scores are summed by a merge of the words'
+    /// and phrases' lists, each in document order: no table of scores.
     pub(crate) fn search(
         &self,
         query: &TextQuery,
-        text_of: &dyn Fn(u64) -> Option<String>,
-    ) -> Vec<TextMatch> {
-        let documents = self.documents as f64;
-        if documents == 0.0 {
-            return Vec::new();
-        }
-        let average = self.total_words as f64 / documents;
-        let (k1, b) = (1.2, 0.75);
+        corpus: &Corpus,
+        text_of: TextOf<'_>,
+        budget: &Arc<Budget>,
+    ) -> EngineResult<TextMatches> {
+        let documents = corpus.documents as f64;
+        // The query's words, parsed: bounded by its length (every word lower-cased, at most
+        // three bytes for two; lists of them; their stems).
+        let mut parsing = Reservation::new(Arc::clone(budget));
+        parsing.charge(query.text.len() * 160 + 1024)?;
         // Stemming, where the language has a stemmer and its stems are prepared.
         let stemming = query
             .stem
@@ -564,8 +1179,12 @@ impl TextIndex {
         };
         // Quoted parts are phrases; the rest are words, and the words to exclude.
         let mut terms: Vec<(String, Match)> = Vec::new();
-        let mut excluded: Vec<String> = Vec::new();
+        let mut excluded_words: Vec<String> = Vec::new();
         let mut phrases: Vec<Vec<String>> = Vec::new();
+        let invalid = |message: &str| EngineError::InvalidTextQuery(message.to_owned());
+        if !query.text.matches('"').count().is_multiple_of(2) {
+            return Err(invalid("unclosed phrase"));
+        }
         for (i, part) in query.text.split('"').enumerate() {
             if i % 2 == 1 {
                 let phrase: Vec<String> = words(part).collect();
@@ -577,13 +1196,34 @@ impl TextIndex {
                 continue;
             }
             for raw in part.split_whitespace() {
+                if raw == "*"
+                    || raw.contains('?')
+                    || raw.trim_end_matches('*').contains('*')
+                    || raw.ends_with("**")
+                {
+                    return Err(invalid("only a trailing prefix wildcard is supported"));
+                }
+                if raw == "-" || raw.starts_with("--") {
+                    return Err(invalid("negation requires a plain word"));
+                }
                 if let Some(rest) = raw.strip_prefix('-').filter(|rest| !rest.is_empty()) {
-                    excluded.extend(words(rest));
+                    if rest.contains(['*', '~', '?']) {
+                        return Err(invalid("negation supports plain words only"));
+                    }
+                    excluded_words.extend(words(rest));
                     continue;
                 }
                 let (raw, matching) = match raw.split_once('~') {
                     Some((word, edits)) => {
-                        let edits = edits.parse::<u8>().unwrap_or(2).min(2);
+                        if !word.chars().any(char::is_alphanumeric) || word.contains(['*', '?']) {
+                            return Err(invalid("fuzziness requires a plain word"));
+                        }
+                        let edits = match edits {
+                            "" | "2" => 2,
+                            "1" => 1,
+                            "0" => 0,
+                            _ => return Err(invalid("fuzzy distance must be 0, 1 or 2")),
+                        };
                         (word, Match::Fuzzy(edits))
                     }
                     None if query.prefix || raw.ends_with('*') => (raw, Match::Prefix),
@@ -596,104 +1236,162 @@ impl TextIndex {
                 }
             }
         }
-        if terms.is_empty() && phrases.is_empty() {
-            return Vec::new();
+        // Validated first: a malformed query is refused on an empty corpus too.
+        if documents == 0.0 || (terms.is_empty() && phrases.is_empty()) {
+            return Ok(TextMatches::empty(budget));
         }
-        // Per literal: its score, and how many of the query's terms it has.
-        let mut scores: HashMap<u64, (f64, usize)> = HashMap::new();
-        let bm25 = |list: &[(u64, u16)], out: &mut HashMap<u64, f64>| {
-            let frequency = list.len() as f64;
-            let idf = (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln();
-            for &(id, count) in list {
-                let length = self.length(id);
-                let tf = f64::from(count);
-                *out.entry(id).or_default() +=
-                    idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * length / average));
-            }
+        let average = corpus.total_words as f64 / documents;
+        let (k1, b) = (1.2, 0.75);
+        let score = |idf: f64, id: u64, count: u16| {
+            let length = self.length(id);
+            let tf = f64::from(count);
+            idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * length / average))
         };
+        let idf = |frequency: usize| {
+            let frequency = frequency as f64;
+            (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln()
+        };
+        // The lists merged below, each in document order: a word's postings, or a phrase's
+        // literals with their score.
+        let mut words_found: ChargedVec<(ChargedVec<(u64, u16)>, f64)> =
+            ChargedVec::with_capacity(Arc::clone(budget), terms.len())?;
+        let mut phrases_found: ChargedVec<ChargedVec<(u64, f64)>> =
+            ChargedVec::with_capacity(Arc::clone(budget), phrases.len())?;
         for phrase in &phrases {
-            let lists: Vec<Cow<'_, [(u64, u16)]>> = phrase
-                .iter()
-                .map(|word| self.postings_of(word, Match::Exact, stems))
-                .collect();
+            let mut lists: ChargedVec<ChargedVec<(u64, u16)>> =
+                ChargedVec::with_capacity(Arc::clone(budget), phrase.len())?;
+            for word in phrase {
+                lists.push(self.postings_of(word, Match::Exact, stems, corpus, budget)?)?;
+            }
             if lists.iter().any(|list| list.is_empty()) {
                 continue;
             }
-            let mut phrase_scores: HashMap<u64, f64> = HashMap::new();
-            for list in &lists {
-                bm25(list, &mut phrase_scores);
-            }
+            let idfs: ChargedVec<f64> = ChargedVec::collect(
+                Arc::clone(budget),
+                lists.len(),
+                lists.iter().map(|list| idf(list.len())),
+            )?;
             let phrase: Vec<String> = phrase.iter().map(|word| normal(word)).collect();
             // The literals with every word of the phrase, then with them in sequence.
             let rarest = lists
                 .iter()
                 .min_by_key(|list| list.len())
                 .expect("two words");
+            let mut found: ChargedVec<(u64, f64)> = ChargedVec::new(Arc::clone(budget));
+            let mut active: ChargedVec<bool> = ChargedVec::new(Arc::clone(budget));
+            active.resize(phrase.len(), false)?;
+            let stemmer = stemming.as_ref().map(|(stemmer, _)| stemmer);
             for &(id, _) in rarest.iter() {
-                let in_all = lists
-                    .iter()
-                    .all(|list| list.binary_search_by_key(&id, |&(i, _)| i).is_ok());
-                let in_sequence = in_all
-                    && text_of(id).is_some_and(|text| {
-                        let text: Vec<String> = words(&text).map(|word| normal(&word)).collect();
-                        text.windows(phrase.len())
-                            .any(|window| window == phrase.as_slice())
-                    });
-                if in_sequence {
-                    let entry = scores.entry(id).or_default();
-                    entry.0 += phrase_scores.get(&id).copied().unwrap_or(0.0);
-                    entry.1 += 1;
+                let mut total = 0.0;
+                let in_all = lists.iter().zip(idfs.iter()).all(|(list, &idf)| {
+                    match list.binary_search_by_key(&id, |&(i, _)| i) {
+                        Ok(at) => {
+                            total += score(idf, id, list[at].1);
+                            true
+                        }
+                        Err(_) => false,
+                    }
+                });
+                if !in_all {
+                    continue;
+                }
+                let mut held = Ok(false);
+                text_of(id, &mut |text| {
+                    held = holds_phrase(text, &phrase, stemmer, &mut active, budget);
+                })?;
+                if held? {
+                    found.push((id, total))?;
                 }
             }
+            phrases_found.push(found)?;
         }
         for (word, matching) in &terms {
-            let found = self.postings_of(word, *matching, stems);
-            let frequency = found.len() as f64;
-            let idf = (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln();
-            for &(id, count) in found.iter() {
-                let length = self.length(id);
-                let tf = f64::from(count);
-                let score = idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * length / average));
-                let entry = scores.entry(id).or_default();
-                entry.0 += score;
-                entry.1 += 1;
-            }
+            let list = self.postings_of(word, *matching, stems, corpus, budget)?;
+            let idf = idf(list.len());
+            words_found.push((list, idf))?;
         }
         let needed = if query.all_words {
             terms.len() + phrases.len()
         } else {
             1
         };
-        let excluded: std::collections::HashSet<u64> = excluded
-            .iter()
-            .flat_map(|word| {
-                self.postings_of(word, Match::Exact, stems)
-                    .iter()
-                    .map(|&(id, _)| id)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let mut matches: Vec<TextMatch> = scores
-            .into_iter()
-            .filter(|(id, (_, words))| *words >= needed && !excluded.contains(id))
-            .map(|(id, (score, _))| TextMatch {
-                id,
-                relevance: score,
-            })
-            .collect();
+        let mut excluded: ChargedVec<u64> = ChargedVec::new(Arc::clone(budget));
+        for word in &excluded_words {
+            let list = self.postings_of(word, Match::Exact, stems, corpus, budget)?;
+            excluded.extend_bounded(list.len(), list.iter().map(|&(id, _)| id))?;
+        }
+        excluded.sort_unstable();
+        // The merge: the next document of any list, its score summed over the lists that
+        // have it, kept where enough of the query's terms have it and no excluded word.
+        let mut word_at: ChargedVec<usize> =
+            ChargedVec::with_capacity(Arc::clone(budget), words_found.len())?;
+        word_at.resize(words_found.len(), 0)?;
+        let mut phrase_at: ChargedVec<usize> =
+            ChargedVec::with_capacity(Arc::clone(budget), phrases_found.len())?;
+        phrase_at.resize(phrases_found.len(), 0)?;
+        let mut excluded_at = 0;
+        let mut matches: ChargedVec<TextMatch> = ChargedVec::new(Arc::clone(budget));
+        loop {
+            let next_word = words_found
+                .iter()
+                .zip(word_at.iter())
+                .filter_map(|((list, _), &at)| list.get(at).map(|&(id, _)| id));
+            let next_phrase = phrases_found
+                .iter()
+                .zip(phrase_at.iter())
+                .filter_map(|(list, &at)| list.get(at).map(|&(id, _)| id));
+            let Some(id) = next_word.chain(next_phrase).min() else {
+                break;
+            };
+            // Summed in the query's order: its phrases, then its words.
+            let (mut total, mut have) = (0.0, 0);
+            for (list, at) in phrases_found.iter().zip(phrase_at.iter_mut()) {
+                if let Some(&(document, phrase_score)) = list.get(*at)
+                    && document == id
+                {
+                    total += phrase_score;
+                    have += 1;
+                    *at += 1;
+                }
+            }
+            for ((list, idf), at) in words_found.iter().zip(word_at.iter_mut()) {
+                if let Some(&(document, count)) = list.get(*at)
+                    && document == id
+                {
+                    total += score(*idf, id, count);
+                    have += 1;
+                    *at += 1;
+                }
+            }
+            excluded_at += excluded[excluded_at..].partition_point(|&e| e < id);
+            if have >= needed && excluded.get(excluded_at) != Some(&id) {
+                matches.push(TextMatch {
+                    id,
+                    relevance: total,
+                })?;
+            }
+        }
         let best = matches
             .iter()
             .map(|m| m.relevance)
             .fold(f64::MIN_POSITIVE, f64::max);
-        for m in &mut matches {
+        for m in matches.iter_mut() {
             m.relevance /= best;
         }
-        matches.sort_by(|a, b| {
+        matches.sort_unstable_by(|a, b| {
             b.relevance
                 .total_cmp(&a.relevance)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        matches
+        // What the parse and the lists hold goes before the matches leave.
+        drop((words_found, phrases_found, excluded, word_at, phrase_at));
+        drop((terms, excluded_words, phrases));
+        drop(parsing);
+        let (matches, charge) = matches.into_parts();
+        Ok(TextMatches {
+            matches,
+            _charge: charge,
+        })
     }
 }
 
@@ -709,8 +1407,50 @@ mod tests {
         index
     }
 
+    /// `index`'s search, with the texts `text_of` gives, unbounded.
+    fn search(
+        index: &TextIndex,
+        query: &TextQuery,
+        corpus: &Corpus,
+        text_of: &dyn Fn(u64) -> Option<String>,
+    ) -> TextMatches {
+        let budget = Arc::new(Budget::unlimited());
+        let text_of = |id: u64, visit: &mut dyn FnMut(&str)| {
+            if let Some(text) = text_of(id) {
+                visit(&text);
+            }
+            Ok(())
+        };
+        index
+            .search(query, corpus, &text_of, &budget)
+            .expect("no budget to exceed")
+    }
+
     fn ids(matches: &[TextMatch]) -> Vec<u64> {
         matches.iter().map(|m| m.id).collect()
+    }
+
+    /// The bits of `members` below `span`.
+    fn bits(members: &[u64], span: u64) -> Vec<u64> {
+        let mut bits = vec![0u64; span.div_ceil(64) as usize];
+        for &m in members {
+            bits[(m / 64) as usize] |= 1 << (m % 64);
+        }
+        bits
+    }
+
+    /// The corpus of `bits` (a bit per number below `span`), unbounded.
+    fn corpus_of(index: &TextIndex, bits: Vec<u64>, span: u64) -> Corpus {
+        let budget = Arc::new(Budget::unlimited());
+        let mut charged = ChargedVec::with_capacity(Arc::clone(&budget), bits.len()).unwrap();
+        charged.extend_from_slice(&bits).unwrap();
+        Corpus::finish(&index.corpus(charged), span, &budget).unwrap()
+    }
+
+    /// Every document the index holds.
+    fn every(index: &TextIndex) -> Corpus {
+        let span = index.lengths.len() as u64;
+        corpus_of(index, vec![u64::MAX; span.div_ceil(64) as usize], span)
     }
 
     #[test]
@@ -724,15 +1464,18 @@ mod tests {
             "brown, quick: the fox",
         ];
         let index = index(&texts);
+        let corpus = every(&index);
         let text_of = |id: u64| texts.get(id as usize).map(|t| (*t).to_owned());
         let query = |text: &str, all_words: bool, prefix: bool| {
-            index.search(
+            search(
+                &index,
                 &TextQuery {
                     text: text.to_owned(),
                     all_words,
                     prefix,
                     stem: None,
                 },
+                &corpus,
                 &text_of,
             )
         };
@@ -784,13 +1527,15 @@ mod tests {
         assert!(index.stems_ready("en-GB"));
         assert!(index.stems_ready("xx"));
         let query = |index: &TextIndex, text: &str, stem: Option<&str>| {
-            let mut found = ids(&index.search(
+            let mut found = ids(&search(
+                index,
                 &TextQuery {
                     text: text.to_owned(),
                     all_words: false,
                     prefix: false,
                     stem: stem.map(str::to_owned),
                 },
+                &every(index),
                 &text_of,
             ));
             found.sort_unstable();
@@ -799,6 +1544,7 @@ mod tests {
         assert_eq!(query(&index, "connect", None), Vec::<u64>::new());
         assert_eq!(query(&index, "connect", Some("en")), [0, 1, 2]);
         assert_eq!(query(&index, "connections", Some("en")), [0, 1, 2]);
+        assert_eq!(query(&index, "connected~0", Some("en")), [0]);
         assert_eq!(query(&index, "\"connected system\"", Some("en")), [0]);
         assert_eq!(query(&index, "\"connecting systems\"", Some("en")), [0]);
         assert_eq!(
@@ -842,15 +1588,18 @@ mod tests {
             "quickly",
         ];
         let index = index(&texts);
+        let corpus = every(&index);
         let text_of = |id: u64| texts.get(id as usize).map(|t| (*t).to_owned());
         let query = |text: &str| {
-            let mut found = ids(&index.search(
+            let mut found = ids(&search(
+                &index,
                 &TextQuery {
                     text: text.to_owned(),
                     all_words: false,
                     prefix: false,
                     stem: None,
                 },
+                &corpus,
                 &text_of,
             ));
             found.sort_unstable();
@@ -863,6 +1612,7 @@ mod tests {
         // Two edits: `quickly` (two letters more) and `duck` too.
         assert_eq!(query("quick~"), [0, 2, 3]);
         assert_eq!(query("quick~0"), [0]);
+        assert_eq!(query("quick~2"), query("quick~"));
         assert_eq!(query("quik~1"), [0]);
         assert!(within_edits("kitten", "sitting", 3));
         assert!(!within_edits("kitten", "sitting", 2));
@@ -889,7 +1639,7 @@ mod tests {
             .map(|(i, text)| (i as u64 * 2, text.as_str()))
             .collect();
         let mut parallel = TextIndex::default();
-        parallel.extend(&documents);
+        parallel.extend(&documents, &|| {});
         let mut sequential = TextIndex::default();
         for &(document, text) in &documents {
             sequential.add(document, text);
@@ -909,11 +1659,156 @@ mod tests {
                 prefix: false,
                 stem: None,
             };
-            let a = parallel.search(&query, &text_of);
-            let b = sequential.search(&query, &text_of);
+            let a = search(&parallel, &query, &every(&parallel), &text_of);
+            let b = search(&sequential, &query, &every(&sequential), &text_of);
             assert!(!a.is_empty(), "{text}");
             assert_eq!(a, b, "{text}");
         }
         assert_eq!(parallel.word_count, sequential.word_count);
+    }
+
+    /// An index extended by a fragment built apart ([`TextIndex::absorb`]) answers as one
+    /// built document by document: postings continue across the seam, lengths and counts
+    /// add up, words new to the fragment are found.
+    #[test]
+    fn an_absorbed_fragment_equals_documents_added_one_by_one() {
+        let texts: Vec<String> = (0..80_000u64)
+            .map(|i| {
+                format!(
+                    "word{} common w{} {}",
+                    i % 1000,
+                    i % 7,
+                    if i >= 50_000 { "late" } else { "" }
+                )
+            })
+            .collect();
+        let documents: Vec<(u64, &str)> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| (i as u64 + 3, text.as_str()))
+            .collect();
+        let mut sequential = TextIndex::default();
+        for &(document, text) in &documents {
+            sequential.add(document, text);
+        }
+        sequential.cover(80_003);
+        let (early, late) = documents.split_at(10_000);
+        let mut absorbed = TextIndex::default();
+        absorbed.extend(early, &|| {});
+        absorbed.cover(10_003);
+        let parts = std::sync::atomic::AtomicUsize::new(0);
+        let count = || {
+            parts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        };
+        // Into an empty index, a move that keeps room to grow.
+        let mut moved = TextIndex::default();
+        let mut whole = TextIndex::starting_at(0);
+        whole.extend(&documents, &|| {});
+        whole.cover(80_003);
+        moved.absorb(whole);
+        assert!(moved.lengths.capacity() > moved.lengths.len());
+        assert_eq!(moved.documents, sequential.documents);
+        let mut fragment = TextIndex::starting_at(10_003);
+        fragment.extend(late, &count);
+        fragment.cover(80_003);
+        absorbed.absorb(fragment);
+        assert!(parts.into_inner() > 1, "built in parallel parts");
+        assert_eq!(
+            (
+                absorbed.covered,
+                absorbed.documents,
+                absorbed.total_words,
+                absorbed.word_count
+            ),
+            (
+                sequential.covered,
+                sequential.documents,
+                sequential.total_words,
+                sequential.word_count
+            )
+        );
+        let text_of = |id: u64| texts.get(id as usize - 3).cloned();
+        for text in [
+            "word7",
+            "w3 late",
+            "\"common w3\"",
+            "word99*",
+            "commn~1",
+            "late -w2",
+        ] {
+            let query = TextQuery {
+                text: text.to_owned(),
+                all_words: true,
+                prefix: false,
+                stem: None,
+            };
+            let a = search(&absorbed, &query, &every(&absorbed), &text_of);
+            let b = search(&sequential, &query, &every(&sequential), &text_of);
+            assert!(!a.is_empty(), "{text}");
+            assert_eq!(a, b, "{text}");
+        }
+    }
+
+    /// A search in a corpus scores as an index of the corpus's documents alone would: the
+    /// other documents change no relevance and no order, in either representation.
+    #[test]
+    fn a_corpus_scores_as_its_documents_alone() {
+        let texts = [
+            "alpha one two",
+            "beta",
+            "beta extra",
+            "beta more extra",
+            "gamma alpha",
+            "filler",
+            "\"quoted\" alpha beta",
+            "beta three",
+            "beta four",
+            "beta five",
+        ];
+        let kept = [0u64, 1, 4, 5, 6];
+        let whole = index(&texts);
+        let mut alone = TextIndex::default();
+        for &i in &kept {
+            alone.add(i, texts[i as usize]);
+        }
+        let text_of = |id: u64| texts.get(id as usize).map(|t| (*t).to_owned());
+        let sparse = corpus_of(&whole, bits(&kept, 1 << 20), 1 << 20);
+        let dense = corpus_of(&whole, bits(&kept, texts.len() as u64), texts.len() as u64);
+        assert!(matches!(sparse.members, Members::Sorted(_)));
+        assert!(matches!(dense.members, Members::Bits(_)));
+        assert_eq!((dense.documents(), dense.total_words()), (5, 10));
+        for text in [
+            "alpha beta",
+            "beta",
+            "\"alpha beta\" gamma",
+            "ext*",
+            "bet~1",
+        ] {
+            let query = TextQuery {
+                text: text.to_owned(),
+                all_words: false,
+                prefix: false,
+                stem: None,
+            };
+            let expected = search(&alone, &query, &every(&alone), &text_of);
+            assert_eq!(
+                search(&whole, &query, &sparse, &text_of),
+                expected,
+                "{text}"
+            );
+            assert_eq!(search(&whole, &query, &dense, &text_of), expected, "{text}");
+        }
+        // Without the corpus's restriction, `beta`'s other literals put `alpha` ahead.
+        let query = TextQuery {
+            text: "alpha beta".to_owned(),
+            all_words: false,
+            prefix: false,
+            stem: None,
+        };
+        let place = |found: &[TextMatch], id: u64| found.iter().position(|m| m.id == id);
+        let kept_order = search(&whole, &query, &dense, &text_of);
+        assert!(place(&kept_order, 1) < place(&kept_order, 0));
+        let every_order = search(&whole, &query, &every(&whole), &text_of);
+        assert!(place(&every_order, 0) < place(&every_order, 1));
     }
 }

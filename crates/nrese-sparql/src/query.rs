@@ -9,9 +9,33 @@ use crate::results::{
 };
 use crate::view::ReadView;
 
+/// Effort spent choosing a join order; this changes planning work, not query answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannerOptions {
+    /// Approximate candidate estimates across greedy starts (default 524288); `None`
+    /// removes this effort bound. At least one complete greedy start is always tried.
+    /// The DP threshold and the maximum number of greedy starts are unchanged.
+    pub greedy_effort: Option<usize>,
+}
+
+impl PlannerOptions {
+    /// The established greedy effort bound, retained for default query plans.
+    pub const DEFAULT_GREEDY_EFFORT: usize = 1 << 19;
+}
+
+impl Default for PlannerOptions {
+    fn default() -> Self {
+        Self {
+            greedy_effort: Some(Self::DEFAULT_GREEDY_EFFORT),
+        }
+    }
+}
+
 /// What an evaluation may use while it runs, for queries and update `WHERE` clauses.
 #[derive(Clone, Default)]
 pub struct Resources {
+    /// Work spent choosing a join order, independently of result memory.
+    pub planner: PlannerOptions,
     /// Checked by the evaluator while it runs; the transport layer cancels it at the
     /// request deadline.
     pub cancellation: Option<CancellationToken>,

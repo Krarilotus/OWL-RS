@@ -1772,7 +1772,7 @@ mod tests {
     }
 
     /// [`snapshot_with`]'s statements in a store written to a checkpoint with its keys
-    /// compressed, and reopened. For a process of its own: the encoding is the process's.
+    /// compressed (the engine's [`EngineConfig::vocabulary`]), and reopened.
     fn reopened(
         graphs: &[GraphName],
         literal: impl Fn(usize) -> (&'static str, &'static str, String),
@@ -1780,9 +1780,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = EngineConfig {
             background_maintenance: false,
+            vocabulary: nrese_engine::VocabularyEncoding::Fsst,
             ..EngineConfig::default()
         };
-        nrese_engine::set_vocabulary_encoding(nrese_engine::VocabularyEncoding::Fsst);
         let engine = Engine::open(dir.path(), config.clone()).unwrap();
         insert(&engine, graphs, literal);
         engine.checkpoint().unwrap();

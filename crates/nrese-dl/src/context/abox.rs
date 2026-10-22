@@ -149,33 +149,35 @@ impl Compiler {
     }
 }
 
-/// The individuals' contexts and what is known of them, to a fixpoint.
-pub struct Individuals {
+/// The individuals' contexts and what is known of them, to a fixpoint. This result
+/// borrows its engine owner; its capacity estimate is released when it drops.
+pub struct Individuals<'engine> {
+    engine: &'engine Engine,
     /// The estimate held with the engine ([`Engine::hold`]).
     held: usize,
     type_count: usize,
     types: Vec<BTreeSet<ConceptId>>,
     edges: HashSet<(RoleId, u32, u32)>,
-    pub contexts: Vec<ContextId>,
+    contexts: Vec<ContextId>,
     pub consistent: bool,
 }
 
-impl Individuals {
+impl<'engine> Individuals<'engine> {
+    /// The contexts of this result, in individual order. Their storage belongs to the
+    /// engine borrowed by this result; the list cannot be grown outside its accounting.
+    pub fn contexts(&self) -> &[ContextId] {
+        &self.contexts
+    }
+
     /// Reports the estimate of what this holds to the engine; false once the budget ran
     /// out.
-    fn report(&mut self, engine: &Engine) -> bool {
+    fn report(&mut self) -> bool {
         // A `BTreeSet` doesn't say its capacity: 64 bytes an entry.
         let bytes = super::memory::vec(&self.types)
             + self.type_count * 64
             + super::memory::table::<(RoleId, u32, u32), ()>(self.edges.capacity())
             + super::memory::vec(&self.contexts);
-        engine.hold(&mut self.held, bytes)
-    }
-
-    /// Whether the assertions are consistent; gives the estimate back to the engine.
-    pub fn release(mut self, engine: &Engine) -> bool {
-        engine.hold(&mut self.held, 0);
-        self.consistent
+        self.engine.hold(&mut self.held, bytes)
     }
 
     fn insert_type(&mut self, at: usize, concept: ConceptId) -> bool {
@@ -186,8 +188,13 @@ impl Individuals {
 
     /// Saturates the individuals' contexts on `engine` and evaluates the clauses on the
     /// edges until nothing changes.
-    pub fn saturate(engine: &Engine, abox: &Abox, workers: &nrese_exec::workers::Workers) -> Self {
+    pub fn saturate(
+        engine: &'engine Engine,
+        abox: &Abox,
+        workers: &nrese_exec::workers::Workers,
+    ) -> Self {
         let mut me = Self {
+            engine,
             held: 0,
             type_count: abox.types.iter().map(Vec::len).sum(),
             types: abox
@@ -199,7 +206,7 @@ impl Individuals {
             contexts: Vec::new(),
             consistent: !abox.clash,
         };
-        if abox.clash || !me.report(engine) {
+        if !me.report() || abox.clash {
             return me;
         }
         loop {
@@ -221,7 +228,7 @@ impl Individuals {
                     id
                 })
                 .collect();
-            if !me.report(engine) {
+            if !me.report() {
                 return me;
             }
             engine.run(&seeds, workers);
@@ -246,7 +253,7 @@ impl Individuals {
                 }
                 Some(more) => changed |= more,
             }
-            if !me.report(engine) || !changed {
+            if !me.report() || !changed {
                 return me;
             }
         }
@@ -261,7 +268,7 @@ impl Individuals {
         let mut step = 0u32;
         while let Some((r, a, b)) = todo.pop() {
             step = step.wrapping_add(1);
-            if step.is_multiple_of(256) && (!self.report(engine) || engine.out_of_budget()) {
+            if step.is_multiple_of(256) && (!self.report() || engine.out_of_budget()) {
                 return Some(changed);
             }
             let slots = program.by_out[r as usize]
@@ -320,5 +327,81 @@ impl Individuals {
             BodyPat::Out(r, Var::Z(_)) => self.edges.contains(&(r, x, z)),
             BodyPat::In(r, _) => self.edges.contains(&(r, z, x)),
         })
+    }
+}
+
+impl Drop for Individuals<'_> {
+    fn drop(&mut self) {
+        self.engine.hold(&mut self.held, 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::{Budget, Strategy};
+    use nrese_exec::workers::Workers;
+
+    #[test]
+    fn retained_individuals_release_their_own_charge_on_drop_and_unwind() {
+        let normalised =
+            nrese_owl::normalise_with(&nrese_owl::Ontology::default(), Default::default());
+        let program = super::super::compile::compile(&normalised, &[1], false)
+            .unwrap()
+            .program;
+        let envelope = nrese_exec::Envelope::new(Some(64 << 20), None);
+        let engine = Engine::new(
+            program,
+            Strategy::Cautious,
+            false,
+            Budget {
+                task_memory: Some(64 << 20),
+                memory: Some(envelope.clone()),
+                ..Default::default()
+            },
+        );
+        let abox = Abox {
+            types: vec![vec![0]],
+            ..Default::default()
+        };
+        let first = Individuals::saturate(&engine, &abox, &Workers::serial());
+        assert!(first.consistent && !first.contexts().is_empty());
+        let first_bytes = first.held;
+        assert!(first_bytes > 0);
+        let second = Individuals::saturate(&engine, &abox, &Workers::serial());
+        let before = engine.task_memory_bytes().0;
+        drop(first);
+        assert_eq!(engine.task_memory_bytes().0, before - first_bytes);
+        let retained = engine.task_memory_bytes().0;
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let temporary = Individuals::saturate(&engine, &abox, &Workers::serial());
+            assert!(engine.task_memory_bytes().0 > retained);
+            assert!(temporary.consistent);
+            panic!("abandon a retained result");
+        }));
+        assert_eq!(
+            unwound.unwrap_err().downcast_ref::<&str>(),
+            Some(&"abandon a retained result")
+        );
+        assert_eq!(engine.task_memory_bytes().0, retained);
+        let second_bytes = second.held;
+        drop(second);
+        assert_eq!(engine.task_memory_bytes().0, retained - second_bytes);
+        let before_clash = engine.task_memory_bytes().0;
+        let clash = Individuals::saturate(
+            &engine,
+            &Abox {
+                clash: true,
+                ..abox
+            },
+            &Workers::serial(),
+        );
+        assert!(!clash.consistent && clash.held > 0);
+        assert_eq!(engine.task_memory_bytes().0, before_clash + clash.held);
+        drop(clash);
+        assert_eq!(engine.task_memory_bytes().0, before_clash);
+        drop(engine);
+        // The envelope's gauge reserves ahead; only owner drop guarantees full release.
+        assert_eq!(envelope.used(), 0);
     }
 }

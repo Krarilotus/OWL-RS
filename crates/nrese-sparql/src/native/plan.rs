@@ -8,9 +8,9 @@
 //! result is much smaller (the executor's rule). BGPs with more than [`DP_PATTERNS`]
 //! patterns are ordered greedily by the same model, from every start, or from the
 //! [`GREEDY_STARTS`] cheapest starts beyond [`GREEDY_ALL_STARTS`] patterns, and fewer where
-//! their estimates would exceed [`GREEDY_EFFORT`] (each start estimates up to n²/2
-//! extensions from the state as it is, and builds only the n it takes). The search asks
-//! for the query's cancellation at every step.
+//! their estimates would exceed [`crate::PlannerOptions::greedy_effort`] (each start
+//! estimates up to n²/2 extensions from the state as it is, and builds only the n it
+//! takes). The search asks for the query's cancellation at every step.
 //!
 //! Stars are estimated from the default graph's characteristic sets where they are known
 //! (`nrese_engine::engine::characteristic`): a pattern `?s p ?o` joined to patterns that
@@ -46,12 +46,6 @@ const GREEDY_ALL_STARTS: usize = 64;
 
 /// Starts tried, the cheapest first, for BGPs larger than [`GREEDY_ALL_STARTS`].
 const GREEDY_STARTS: usize = 16;
-
-/// The candidates the greedy search estimates over all its starts, about: a start estimates
-/// up to n²/2, so beyond about 250 patterns fewer starts are tried, down to one. A star of
-/// 1,000 patterns took 16 starts of 500,000 estimates each, twice per query (4.9 s in the
-/// test profile, 12 October 2026).
-const GREEDY_EFFORT: usize = 1 << 19;
 
 /// Cost of one index probe relative to reading one scanned row.
 const PROBE_COST: f64 = 4.0;
@@ -182,6 +176,7 @@ pub(super) fn order(
     variables: usize,
     probe_factor: u64,
     sets: Option<&CharacteristicSets>,
+    options: crate::PlannerOptions,
     stop: &dyn Fn() -> bool,
 ) -> Option<Plan> {
     #[cfg(test)]
@@ -193,7 +188,7 @@ pub(super) fn order(
         });
         stop()
     };
-    search(inputs, variables, probe_factor, sets, None, stop)
+    search(inputs, variables, probe_factor, sets, None, options, stop)
 }
 
 /// The estimates of joining `inputs` in the given `order` (all of them, each once), by the
@@ -205,9 +200,15 @@ pub(super) fn along(
     sets: Option<&CharacteristicSets>,
     order: &[usize],
 ) -> Plan {
-    search(inputs, variables, probe_factor, sets, Some(order), &|| {
-        false
-    })
+    search(
+        inputs,
+        variables,
+        probe_factor,
+        sets,
+        Some(order),
+        Default::default(),
+        &|| false,
+    )
     .expect("never stopped")
 }
 
@@ -219,6 +220,7 @@ fn search(
     probe_factor: u64,
     sets: Option<&CharacteristicSets>,
     fixed: Option<&[usize]>,
+    options: crate::PlannerOptions,
     stop: &dyn Fn() -> bool,
 ) -> Option<Plan> {
     // The characteristic sets know which predicates subjects have, not their objects.
@@ -424,7 +426,11 @@ fn search(
             true => GREEDY_STARTS,
             false => n,
         };
-        let kept = kept.min((GREEDY_EFFORT / (n * n / 2)).max(1));
+        // Always finish one start, even when it alone exceeds the effort. Unlimited
+        // removes this reduction, retaining the established DP/greedy strategy.
+        let kept = options.greedy_effort.map_or(kept, |effort| {
+            kept.min((effort / (n.saturating_mul(n) / 2)).max(1))
+        });
         if kept < n {
             starts.sort_by(|a, b| a.cost.total_cmp(&b.cost).then(a.order.cmp(&b.order)));
             starts.truncate(kept);
@@ -501,7 +507,7 @@ mod tests {
             input(300_000, &[(0, 100_000), (1, 2_000)]),
             input(5_000, &[(0, 5_000)]),
         ];
-        let plan = order(&inputs, 2, 32, None, &|| false).unwrap();
+        let plan = order(&inputs, 2, 32, None, Default::default(), &|| false).unwrap();
         assert_eq!(plan.order, vec![0, 2, 1]);
         assert_eq!(plan.rows.len(), 3);
     }
@@ -530,7 +536,7 @@ mod tests {
     #[test]
     fn disconnected_patterns_still_get_an_order() {
         let inputs = [input(10, &[(0, 10)]), input(3, &[(1, 3)])];
-        let plan = order(&inputs, 2, 32, None, &|| false).unwrap();
+        let plan = order(&inputs, 2, 32, None, Default::default(), &|| false).unwrap();
         assert_eq!(plan.order.len(), 2);
         assert!((plan.rows[1] - 30.0).abs() < 1e-9);
     }
@@ -580,7 +586,7 @@ mod tests {
             })
             .collect();
         STATISTICS.with(|c| c.set((0, 0)));
-        let plan = order(&inputs, 251, 32, Some(&sets), &|| false).unwrap();
+        let plan = order(&inputs, 251, 32, Some(&sets), Default::default(), &|| false).unwrap();
         assert_eq!(plan.order.len(), 250);
         let (reads, steps) = STATISTICS.with(|c| c.get());
         assert!(
@@ -592,7 +598,7 @@ mod tests {
             asked.set(asked.get() + 1);
             asked.get() > 3
         };
-        assert!(order(&inputs, 251, 32, Some(&sets), &stop).is_none());
+        assert!(order(&inputs, 251, 32, Some(&sets), Default::default(), &stop).is_none());
         assert_eq!(asked.get(), 4, "stopped at the first step after");
     }
 
@@ -606,14 +612,48 @@ mod tests {
                 .map(|i| input(1_000 + i as u64, &[(0, 900), (i + 1, 500)]))
                 .collect();
             STATISTICS.with(|c| c.set((0, 0)));
-            let plan = order(&inputs, n + 1, 32, None, &|| false).unwrap();
+            let plan = order(&inputs, n + 1, 32, None, Default::default(), &|| false).unwrap();
             assert_eq!(plan.order.len(), n);
             let (_, steps) = STATISTICS.with(|c| c.get());
             assert!(
-                steps <= GREEDY_EFFORT.max(n * n / 2) + n,
+                steps <= crate::PlannerOptions::DEFAULT_GREEDY_EFFORT.max(n * n / 2) + n,
                 "{n} patterns: {steps}"
             );
         }
+    }
+
+    #[test]
+    fn query_options_control_greedy_effort_without_losing_patterns() {
+        use crate::{PlannerOptions, QueryOptions};
+        // Just beyond where the default reduces the sixteen starts to fifteen.
+        let n = 257;
+        let inputs: Vec<Input> = (0..n)
+            .map(|i| input(1_000 + i as u64, &[(0, 900)]))
+            .collect();
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let snapshot = engine.snapshot();
+        for (effort, starts) in [
+            (Some(1), 1),
+            (Some(3 * (n * n / 2)), 3),
+            (Some(PlannerOptions::DEFAULT_GREEDY_EFFORT), 15),
+            (None, GREEDY_STARTS),
+        ] {
+            let mut options = QueryOptions::default();
+            options.resources.planner.greedy_effort = effort;
+            let ctx = super::super::Context::new(&snapshot, &options, None, None);
+            STATISTICS.with(|c| c.set((0, 0)));
+            let mut plan = ctx
+                .order_inputs(&inputs, 1)
+                .unwrap_or_else(|_| panic!("planning failed"));
+            let (_, steps) = STATISTICS.with(|c| c.get());
+            assert_eq!(steps, starts * n * (n - 1) / 2, "effort {effort:?}");
+            plan.order.sort_unstable();
+            assert_eq!(plan.order, (0..n).collect::<Vec<_>>());
+        }
+        let unlimited = PlannerOptions {
+            greedy_effort: None,
+        };
+        assert!(order(&inputs, 1, 32, None, unlimited, &|| true).is_none());
     }
 
     /// BGPs too large for the exact order get a greedy one: a star of 14 patterns, and
@@ -624,7 +664,7 @@ mod tests {
         let inputs: Vec<Input> = (0..14)
             .map(|i| input(100 + i, &[(0, 100), (i as usize + 1, 50)]))
             .collect();
-        let plan = order(&inputs, 15, 32, None, &|| false).unwrap();
+        let plan = order(&inputs, 15, 32, None, Default::default(), &|| false).unwrap();
         let mut sorted = plan.order.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, (0..14).collect::<Vec<_>>());
@@ -632,7 +672,7 @@ mod tests {
             let inputs: Vec<Input> = (0..n)
                 .map(|i| input(1_000 + i as u64, &[(i, 500), (i + 1, 500)]))
                 .collect();
-            let plan = order(&inputs, n + 1, 32, None, &|| false).unwrap();
+            let plan = order(&inputs, n + 1, 32, None, Default::default(), &|| false).unwrap();
             let mut sorted = plan.order.clone();
             sorted.sort_unstable();
             assert_eq!(sorted, (0..n).collect::<Vec<_>>());

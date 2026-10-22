@@ -301,12 +301,13 @@ fn existing(id: &str) -> bool {
 const TRASH: &str = "~trash-";
 
 impl Catalog {
-    /// The repositories of a server whose default store is `store`, reasoning with
-    /// `reasoner` where a repository's settings name none: the default with its stored
+    /// The repositories of a server whose default store is `store`, reasoning as
+    /// `reasoning` says where a repository's settings name none: the default with its stored
     /// settings (those changed through the engine API), and on disk the others found under
     /// `repositories/` of its data directory (one that fails to open is logged and left
     /// out).
-    pub fn open(store: StoreService, reasoner: ReasonerService) -> Result<Self, CatalogError> {
+    pub fn open(store: StoreService, reasoning: ReasonerConfig) -> Result<Self, CatalogError> {
+        let reasoner = ReasonerService::new(reasoning);
         let template = store.config().clone();
         let runtime = Arc::clone(store.runtime());
         let default_settings = stored_default_settings(&template)
@@ -317,7 +318,7 @@ impl Catalog {
             return Err(CatalogError::Store(repair(&file, &error.to_string())));
         }
         let default = Repository::new(
-            MutationPipeline::new(Arc::new(store), Arc::new(reasoner.clone())),
+            MutationPipeline::new(Arc::new(store), reasoner.config().clone()),
             default_settings,
         );
         let root = matches!(template.mode, StoreMode::OnDisk)
@@ -439,7 +440,7 @@ impl Catalog {
             }
         }
         Ok(Repository::new(
-            MutationPipeline::new(Arc::new(store), Arc::new(reasoner)),
+            MutationPipeline::new(Arc::new(store), reasoner.config().clone()),
             settings,
         ))
     }
@@ -646,7 +647,7 @@ impl Catalog {
             let restore = || {
                 *repository.pipeline.write() = Arc::new(MutationPipeline::new(
                     Arc::clone(&store),
-                    Arc::clone(previous.reasoner()),
+                    previous.reasoner().config().clone(),
                 ));
             };
             // Back to the old reasoning after the new inferences were published: they are
@@ -681,7 +682,7 @@ impl Catalog {
                 Err((error, false)) => return Err(roll_back(error)),
             }
             *repository.pipeline.write() =
-                Arc::new(MutationPipeline::new(store, Arc::new(reasoner)));
+                Arc::new(MutationPipeline::new(store, reasoner.config().clone()));
         } else {
             persist().map_err(|(error, _)| error)?;
         }
@@ -905,11 +906,7 @@ mod tests {
 
     fn on_disk(dir: &std::path::Path) -> super::Catalog {
         let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir)).unwrap();
-        super::Catalog::open(
-            store,
-            nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default()),
-        )
-        .unwrap()
+        super::Catalog::open(store, nrese_reasoner::ReasonerConfig::default()).unwrap()
     }
 
     /// A removal whose tombstone can't be removed (held or protected; a failed sync of the
@@ -1066,11 +1063,7 @@ mod tests {
         use super::{Catalog, RepositorySettings};
         let dir = tempfile::tempdir().unwrap();
         let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir.path())).unwrap();
-        let catalog = Catalog::open(
-            store,
-            nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default()),
-        )
-        .unwrap();
+        let catalog = Catalog::open(store, nrese_reasoner::ReasonerConfig::default()).unwrap();
         catalog
             .create("probe", RepositorySettings::default())
             .unwrap();

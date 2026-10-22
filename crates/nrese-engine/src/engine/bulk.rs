@@ -46,7 +46,7 @@ use crate::durability::checkpoint;
 use crate::error::{EngineError, EngineResult};
 use crate::index::keys::PackedKeys;
 use crate::index::run::{PermutationBuilder, Run};
-use crate::index::{IndexVersion, Layout};
+use crate::index::{IndexEncoding, IndexVersion, Layout};
 use crate::quad::{EncodedQuad, EncodedTriple, Permutation, QuadPattern};
 use crate::term::dictionary::{Base, BatchScratch};
 use crate::term::pending::Pending;
@@ -282,7 +282,11 @@ impl<'e> BulkLoad<'e> {
                 let layout = Layout::holding(&quads);
                 let next = Next::Streamed {
                     layout,
-                    builder: PermutationBuilder::planned(quads, layout.permutations()),
+                    builder: PermutationBuilder::planned(
+                        quads,
+                        layout.permutations(),
+                        shared.index_encoding,
+                    ),
                     revision: summary.revision,
                     dictionary_len: shared.dictionary.len(),
                 };
@@ -298,8 +302,12 @@ impl<'e> BulkLoad<'e> {
                 };
                 let next = Version {
                     content: super::Content::fresh(),
-                    asserted: IndexVersion::from_quads(Layout::holding(&quads), quads),
-                    inferred: IndexVersion::empty(Layout::DefaultGraph),
+                    asserted: IndexVersion::from_quads(
+                        Layout::holding(&quads),
+                        shared.index_encoding,
+                        quads,
+                    ),
+                    inferred: IndexVersion::empty(Layout::DefaultGraph, shared.index_encoding),
                     revision: summary.revision,
                     dictionary_len: shared.dictionary.len(),
                     equality: Default::default(),
@@ -333,7 +341,7 @@ impl<'e> BulkLoad<'e> {
                     Layout::Quads => current.asserted.with_quads_layout(),
                     Layout::DefaultGraph => current.asserted.clone(),
                 };
-                let run = Run::from_quads(asserted.layout(), inserts);
+                let run = Run::from_quads(asserted.layout(), asserted.encoding(), inserts);
                 let next = Version {
                     content: super::Content::fresh(),
                     asserted: asserted.with_run(run),
@@ -426,10 +434,15 @@ enum Source {
 }
 
 impl Source {
-    fn packed(&mut self, permutation: Permutation) -> EngineResult<PackedKeys> {
+    /// `permutation`, packed in `encoding` (an in-memory builder has its own).
+    fn packed(
+        &mut self,
+        permutation: Permutation,
+        encoding: IndexEncoding,
+    ) -> EngineResult<PackedKeys> {
         match self {
             Self::Memory(builder) => Ok(builder.packed(permutation)),
-            Self::Spilled(spill) => Ok(spill.merged(permutation)?),
+            Self::Spilled(spill) => Ok(spill.merged(permutation, encoding)?),
         }
     }
 }
@@ -486,7 +499,12 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
         durable,
         next.revision,
         || {
-            let written = checkpoint::write(durable.root(), &image, shared.admission.as_ref());
+            let written = checkpoint::write(
+                durable.root(),
+                &image,
+                shared.vocabulary,
+                shared.admission.as_ref(),
+            );
             drop(image);
             written
         },
@@ -494,25 +512,27 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
             if !durable.config.map_checkpoints {
                 return Ok((next, None));
             }
-            Ok(match checkpoint::map_written(written) {
-                Ok((dictionary, [asserted, inferred])) => (
-                    Arc::new(Version {
-                        // The same statements, mapped from the checkpoint.
-                        content: next.content,
-                        asserted,
-                        inferred,
-                        equality: Arc::clone(&next.equality),
-                        revision: next.revision,
-                        dictionary_len: next.dictionary_len,
-                        canonical: Default::default(),
-                    }),
-                    Some(dictionary),
-                ),
-                Err(error) => {
-                    tracing::warn!(%error, "checkpoint not mapped; data stays in memory");
-                    (next, None)
-                }
-            })
+            Ok(
+                match checkpoint::map_written(written, shared.index_encoding) {
+                    Ok((dictionary, [asserted, inferred])) => (
+                        Arc::new(Version {
+                            // The same statements, mapped from the checkpoint.
+                            content: next.content,
+                            asserted,
+                            inferred,
+                            equality: Arc::clone(&next.equality),
+                            revision: next.revision,
+                            dictionary_len: next.dictionary_len,
+                            canonical: Default::default(),
+                        }),
+                        Some(dictionary),
+                    ),
+                    Err(error) => {
+                        tracing::warn!(%error, "checkpoint not mapped; data stays in memory");
+                        (next, None)
+                    }
+                },
+            )
         },
     )
 }
@@ -532,14 +552,19 @@ fn publish_streamed(
         let packed = layout
             .permutations()
             .iter()
-            .map(|&permutation| Ok((permutation, source.packed(permutation)?)))
+            .map(|&permutation| {
+                Ok((
+                    permutation,
+                    source.packed(permutation, shared.index_encoding)?,
+                ))
+            })
             .collect::<EngineResult<Vec<_>>>()?;
-        let asserted =
-            IndexVersion::from_packed(packed).map_err(crate::error::EngineError::Corruption)?;
+        let asserted = IndexVersion::from_packed(packed, shared.index_encoding)
+            .map_err(crate::error::EngineError::Corruption)?;
         let next = Version {
             content: super::Content::fresh(),
             asserted,
-            inferred: IndexVersion::empty(Layout::DefaultGraph),
+            inferred: IndexVersion::empty(Layout::DefaultGraph, shared.index_encoding),
             revision,
             dictionary_len,
             equality: Default::default(),
@@ -556,7 +581,7 @@ fn publish_streamed(
         durable,
         revision,
         || {
-            let empty = PackedKeys::from_sorted(&[]);
+            let empty = PackedKeys::from_sorted(&[], shared.index_encoding);
             let written = checkpoint::write_parts(
                 durable.root(),
                 shared.admission.as_ref(),
@@ -564,10 +589,11 @@ fn publish_streamed(
                 &shared.dictionary,
                 dictionary_len,
                 [layout, Layout::DefaultGraph],
+                shared.vocabulary,
                 &mut |stack, permutation| {
                     Ok(match stack {
                         Stack::Asserted => {
-                            let packed = source.packed(permutation)?;
+                            let packed = source.packed(permutation, shared.index_encoding)?;
                             if permutation == Permutation::Spog {
                                 len = packed.len() as u64;
                             }
@@ -583,7 +609,8 @@ fn publish_streamed(
         },
         // Nothing else holds the data: if it can't be mapped, the load fails.
         |written| {
-            let (base, [asserted, inferred]) = checkpoint::map_written(written)?;
+            let (base, [asserted, inferred]) =
+                checkpoint::map_written(written, shared.index_encoding)?;
             let next = Arc::new(Version {
                 content: super::Content::fresh(),
                 asserted,
@@ -731,7 +758,11 @@ impl<'e> Rematerialisation<'e> {
         let next = Version {
             content: super::Content::fresh(),
             asserted: current.asserted.clone(),
-            inferred: IndexVersion::from_quads(Layout::DefaultGraph, quads),
+            inferred: IndexVersion::from_quads(
+                Layout::DefaultGraph,
+                current.inferred.encoding(),
+                quads,
+            ),
             revision: summary.revision,
             dictionary_len: shared.dictionary.len(),
             equality: Default::default(),
