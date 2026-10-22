@@ -31,12 +31,26 @@ use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
 /// Every public write of the store comes here: the commands of the protocols, and
 /// [`MutationCommand::Delta`] for any other front-end ([`crate::DeltaPlanner`]). The
 /// store's own writes outside it are crate-private (its system graphs, scratch stores);
+/// A principal's rejections ([`MutationPipeline::restricted_rejections`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestrictedRejections {
+    /// The user name, else the roles, of the requester; `anonymous` where none is known.
+    pub principal: String,
+    /// The first 16 hex digits of its SHA-256: for metrics' labels.
+    pub principal_hash: String,
+    pub rejections: u64,
+}
+
 /// bulk loads, rematerialisation and a replica's log are explicit operations of their own.
 #[derive(Debug)]
 pub struct MutationPipeline {
     store: Arc<StoreService>,
     reasoner: Arc<ReasonerService>,
     last_reasoning_run: RwLock<Option<ReasoningRunRecord>>,
+    /// Rejections of requesters who may not read every graph, by principal: whether such a
+    /// commit is accepted tells whether it conflicts with data the requester can't read
+    /// (D-1, the owner's recorded exception), so operators watch for probing.
+    restricted_rejections: std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
     /// Reasoner v2's ruleset compiled against the dictionary, on first use.
     program: std::sync::OnceLock<crate::reasoning::Program>,
     /// Reasoner v2's ground program and the committed revision it describes. Writers
@@ -62,6 +76,7 @@ impl MutationPipeline {
             store,
             reasoner,
             last_reasoning_run: RwLock::new(None),
+            restricted_rejections: std::sync::Mutex::default(),
             program: std::sync::OnceLock::new(),
             ground: std::sync::Mutex::new(None),
             retired: std::sync::atomic::AtomicBool::new(false),
@@ -149,8 +164,51 @@ impl MutationPipeline {
     }
 
     /// Applies `command` for `requester` unless a gate rejects it or `ticket` is cancelled
-    /// before the commit starts. Blocking; call it from a blocking context.
+    /// before the commit starts. Blocking; call it from a blocking context. A rejection of a
+    /// requester who may not read every graph is counted by its principal
+    /// ([`Self::restricted_rejections`]).
     pub fn apply(
+        &self,
+        command: MutationCommand,
+        requester: &crate::Requester,
+        ticket: &MutationTicket,
+    ) -> Result<MutationCommitReport, MutationError> {
+        let result = self.apply_gated(command, requester, ticket);
+        if matches!(result, Err(MutationError::Rejected(_)))
+            && matches!(requester.read, crate::ReadScope::Graphs(_))
+        {
+            let principal = requester.principal.as_deref().unwrap_or("anonymous");
+            *self
+                .restricted_rejections
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(principal.to_owned())
+                .or_default() += 1;
+        }
+        result
+    }
+
+    /// The rejections of requesters who may not read every graph so far, by principal
+    /// (`anonymous` where none is known), each with its principal's hash for labels that
+    /// mustn't carry the id.
+    pub fn restricted_rejections(&self) -> Vec<RestrictedRejections> {
+        use sha2::Digest;
+        self.restricted_rejections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .map(|(principal, &rejections)| RestrictedRejections {
+                principal: principal.clone(),
+                principal_hash: sha2::Sha256::digest(principal.as_bytes())[..8]
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+                rejections,
+            })
+            .collect()
+    }
+
+    fn apply_gated(
         &self,
         command: MutationCommand,
         requester: &crate::Requester,
@@ -237,7 +295,15 @@ impl MutationPipeline {
             let memory = self.store.memory_stop();
             let stop = || ticket.is_cancelled() || memory.exceeded();
             let (violations, materialisation, changed) =
-                crate::reasoning::apply_delta(program, cached, &mut tx, &stop).map_err(|_| {
+                // Its violations drawn from the request's envelope (a part of it).
+                crate::reasoning::apply_delta(
+                    program,
+                    cached,
+                    &mut tx,
+                    &stop,
+                    &Arc::new(envelope.part()),
+                )
+                .map_err(|_| {
                     memory
                         .error()
                         .map_or(MutationError::Cancelled, &store_error)
@@ -248,45 +314,76 @@ impl MutationPipeline {
                 materialisation.diagnostics_total,
                 "the commit leaves an ontology axiom unusable",
             );
-            if let Some(violation) = violations.first() {
-                // The committer sees the premises asserted in graphs it may read; the
-                // others are withheld, and counted (graph access: nothing from a graph a
-                // reader can't read reaches it).
-                let readable = |fact: nrese_reasoner::ir::Triple| match &requester.read {
-                    crate::ReadScope::Graphs(access) => crate::service::in_readable_graph(
-                        tx.quads_for_pattern_in(
-                            nrese_engine::ReadModel::Asserted,
-                            &crate::service::any_graph(fact),
-                        ),
-                        &|id| tx.decode(id),
-                        access,
+            if violations.inconsistent() {
+                // A committer who may read every graph sees the first violation and the count.
+                // One who may not sees one fixed reason (as the SHACL gate's): no premise,
+                // focus, rule or count, so nothing in the report depends on graphs it can't
+                // read, nor on what the operation's budget let it record (graph access, N12;
+                // readable-only evidence under a budget of its own is v2.0's, with item 18).
+                // That the commit is rejected at all is the gate's.
+                let (explanation, mut detail) = match &requester.read {
+                    crate::ReadScope::Graphs(_) => (
+                        super::restricted_explanation(),
+                        super::RESTRICTED_REJECTION.to_owned(),
                     ),
-                    _ => true,
+                    _ => {
+                        // Past the operation's memory budget the list stops: still rejected,
+                        // with as much as it holds.
+                        let count = match violations.complete() {
+                            true => violations.len().to_string(),
+                            false => format!("at least {}", violations.found()),
+                        };
+                        match violations.first() {
+                            Some(violation) => {
+                                let explanation =
+                                    crate::reasoning::explain_violation(violation, &tx);
+                                let detail = format!(
+                                    "mutation violates {count} consistency check(s); first: {}",
+                                    explanation.summary
+                                );
+                                (explanation, detail)
+                            }
+                            None => {
+                                let summary = String::from(
+                                    "the operation's memory budget had no room to record a violation",
+                                );
+                                let detail = format!(
+                                    "mutation violates {count} consistency check(s); {summary}"
+                                );
+                                let explanation = nrese_reasoner::RejectExplanation {
+                                    summary,
+                                    violated_constraint: String::new(),
+                                    focus_resource: String::new(),
+                                    evidence: Vec::new(),
+                                };
+                                (explanation, detail)
+                            }
+                        }
+                    }
                 };
-                let restricted = matches!(requester.read, crate::ReadScope::Graphs(_));
-                let explanation = crate::reasoning::explain_violation(
-                    program,
-                    violation,
-                    &tx,
-                    restricted.then_some(&readable as &dyn Fn(nrese_reasoner::ir::Triple) -> bool),
-                );
                 let attribution =
                     attribute_reject_delta(&explanation, &MutationDeltaPreview::of(&tx));
-                let mut detail = format!(
-                    "mutation violates {} consistency check(s); first: {}",
-                    violations.len(),
-                    explanation.summary
-                );
                 if let Some((s, p, o)) = attribution
                     .as_ref()
                     .and_then(super::attribution::RejectAttribution::likely_commit_trigger)
                 {
                     detail.push_str(&format!(" Likely commit-local trigger: <{s}> <{p}> <{o}>."));
                 }
+                // The administrators' diagnostics keep the whole first violation, whoever
+                // committed (admin access only): what a restricted committer isn't shown.
+                let diagnostic = match (&requester.read, violations.first()) {
+                    (crate::ReadScope::Graphs(_), Some(first)) => {
+                        let full = crate::reasoning::explain_violation(first, &tx);
+                        let attribution =
+                            attribute_reject_delta(&full, &MutationDeltaPreview::of(&tx));
+                        (full, attribution)
+                    }
+                    _ => (explanation.clone(), attribution.clone()),
+                };
                 self.record_run(ReasoningRunRecord::from_report(
                     &materialisation,
-                    Some(explanation.clone()),
-                    attribution.clone(),
+                    Some(diagnostic.0),
+                    diagnostic.1,
                 ));
                 return Err(MutationError::Rejected(Box::new(MutationReject {
                     detail,
@@ -315,6 +412,15 @@ impl MutationPipeline {
             if let Some((gate, _)) = &dl
                 && let Some(detail) = &gate.reject
             {
+                // A committer who may not read every graph: the RL gate's fixed reason, word
+                // for word (which gate rejected depends on the whole data too).
+                if matches!(requester.read, crate::ReadScope::Graphs(_)) {
+                    return Err(MutationError::Rejected(Box::new(MutationReject {
+                        detail: super::RESTRICTED_REJECTION.to_owned(),
+                        explanation: Some(super::restricted_explanation()),
+                        attribution: None,
+                    })));
+                }
                 return Err(MutationError::Rejected(Box::new(MutationReject {
                     detail: detail.clone(),
                     explanation: Some(nrese_reasoner::RejectExplanation {
@@ -328,7 +434,7 @@ impl MutationPipeline {
             }
             crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph, &shacl_resources)
                 .map_err(store_error)?;
-            self.shacl_gate(&tx, &shacl_resources, kind)?;
+            self.shacl_gate(&tx, &shacl_resources, kind, &requester.read)?;
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }
@@ -377,7 +483,7 @@ impl MutationPipeline {
         self.store.invalidate_reasoning().map_err(store_error)?;
         crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph, &shacl_resources)
             .map_err(store_error)?;
-        self.shacl_gate(&tx, &shacl_resources, kind)?;
+        self.shacl_gate(&tx, &shacl_resources, kind, &requester.read)?;
         if !ticket.begin_commit() {
             return Err(MutationError::Cancelled);
         }
@@ -389,12 +495,14 @@ impl MutationPipeline {
     }
 
     /// The SHACL commit gate (C2): validates what the transaction's changes can affect,
-    /// after reasoning, and rejects the commit if the policy says so.
+    /// after reasoning, and rejects the commit if the policy says so. Restricted readers
+    /// receive no result detail.
     fn shacl_gate(
         &self,
         tx: &nrese_engine::Transaction<'_>,
         resources: &nrese_sparql::Resources,
         kind: MutationKind,
+        reader: &crate::ReadScope,
     ) -> Result<(), MutationError> {
         let gate = self.store.config().shacl_gate;
         if gate == ShaclGate::Off {
@@ -419,17 +527,27 @@ impl MutationPipeline {
             "http://www.w3.org/ns/shacl#Warning" => GateSeverity::Warning,
             _ => GateSeverity::Violation,
         };
-        let first = report.results.first().map_or_else(String::new, |result| {
-            format!(
-                "; first: focus node {}, {}",
-                result.focus_node, result.component
-            )
-        });
-        let detail = format!(
-            "the commit introduces {} SHACL result(s) and {} failure(s){first}",
-            report.results.len(),
-            report.failures.len()
-        );
+        // A committer who may read every graph sees the counts and the first result; one
+        // who may not sees neither: which results there are, and how many, depends on data
+        // and shapes it may not read (graph access, N12). The full report is for readers of
+        // every graph. That the commit is rejected at all is the gate's.
+        let detail = match reader.access() {
+            Some(_) => "the commit introduces SHACL results; the validation report is for readers of every graph"
+                .to_owned(),
+            None => {
+                let first = report.results.first().map_or_else(String::new, |result| {
+                    format!(
+                        "; first: focus node {}, {}",
+                        result.focus_node, result.component
+                    )
+                });
+                format!(
+                    "the commit introduces {} SHACL result(s) and {} failure(s){first}",
+                    report.results.len(),
+                    report.failures.len()
+                )
+            }
+        };
         match gate {
             ShaclGate::Enforce(least)
                 if !report.failures.is_empty()

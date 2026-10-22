@@ -109,19 +109,29 @@ impl WriteScope {
 pub struct Requester {
     pub read: ReadScope,
     pub write: WriteScope,
+    /// Who it is (a user name, else roles), where the caller knows: what the rejections of
+    /// a requester who may not read every graph are counted by.
+    pub principal: Option<String>,
 }
 
 impl Requester {
     /// Reads and changes every graph: administrators and the server's own work.
     pub fn all() -> Self {
-        Self {
-            read: ReadScope::All,
-            write: WriteScope::All,
-        }
+        Self::new(ReadScope::All, WriteScope::All)
     }
 
     pub fn new(read: ReadScope, write: WriteScope) -> Self {
-        Self { read, write }
+        Self {
+            read,
+            write,
+            principal: None,
+        }
+    }
+
+    /// This requester, known as `principal`.
+    pub fn with_principal(mut self, principal: Option<String>) -> Self {
+        self.principal = principal;
+        self
     }
 }
 

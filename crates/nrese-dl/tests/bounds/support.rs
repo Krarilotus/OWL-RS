@@ -170,7 +170,7 @@ pub fn lower(table: &mut Table, input: &[Triple]) -> Closure {
     facts.dedup();
     Closure {
         facts,
-        violations: m.violations.into_iter().map(|v| v.rule).collect(),
+        violations: m.violations.iter().map(|v| v.rule.clone()).collect(),
         ..Closure::default()
     }
 }

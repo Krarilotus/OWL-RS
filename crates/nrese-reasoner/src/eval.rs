@@ -1807,6 +1807,9 @@ pub struct GroundProgram {
     heads: Dispatch,
     /// Ground consistency rules, each with the rule it came from.
     pub consistency: Vec<(Rule, Grounded)>,
+    /// Per ground consistency rule (parallel to `consistency`): whether its rule came from
+    /// a list axiom, whose list its body doesn't hold ([`super::ir::Violation::whole`]).
+    pub(crate) consistency_from_list: Vec<bool>,
     consistency_known: HashSet<(String, Vec<Option<u64>>, RuleKey)>,
     consistency_dispatch: Dispatch,
     /// The list axioms of the program's state that weren't instantiated.
@@ -1955,7 +1958,12 @@ impl GroundProgram {
     }
 
     /// Files one ground consistency rule (from `source`); returns its index if new.
-    fn add_consistency(&mut self, source: &Rule, grounded: Grounded) -> Option<usize> {
+    fn add_consistency(
+        &mut self,
+        source: &Rule,
+        grounded: Grounded,
+        extra: &[Triple],
+    ) -> Option<usize> {
         let key = (
             source.name.clone(),
             grounded.substitution.clone(),
@@ -1967,6 +1975,7 @@ impl GroundProgram {
         self.consistency_dispatch
             .push(self.consistency.len(), &grounded.rule);
         self.consistency.push((source.clone(), grounded));
+        self.consistency_from_list.push(!extra.is_empty());
         Some(self.consistency.len() - 1)
     }
 
@@ -1986,12 +1995,16 @@ impl GroundProgram {
         schema: &Schema,
         rules: &[Rule],
         delta: bool,
+        premises: Option<&[Vec<Triple>]>,
         stop: Stop<'_>,
     ) -> Result<(), super::delta::Interrupted> {
+        // Every rule is visited; supplied list evidence has the same order/cardinality.
+        assert!(premises.is_none_or(|extras| extras.len() == rules.len()));
         let mut poll = Poller::new(stop).ok_or(super::delta::Interrupted)?;
-        for rule in rules {
+        for (i, rule) in rules.iter().enumerate() {
             poll.work()?;
-            self.ground_one(source, schema, rule, delta, &[], &mut poll);
+            let extra = premises.map_or(&[][..], |extras| extras[i].as_slice());
+            self.ground_one(source, schema, rule, delta, extra, &mut poll);
             if poll.stopped() {
                 return Err(super::delta::Interrupted);
             }
@@ -2090,7 +2103,7 @@ impl GroundProgram {
         }
         for g in grounded {
             if rule.head == Head::Inconsistent {
-                checks.extend(self.add_consistency(rule, g));
+                checks.extend(self.add_consistency(rule, g, extra));
             } else {
                 let premises = rule
                     .body

@@ -96,15 +96,17 @@ pub async fn body_text(
     Ok(String::from_utf8(body.to_vec())?)
 }
 
-pub async fn readyz_text(app: axum::Router) -> Result<String, Box<dyn std::error::Error>> {
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/readyz")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
+/// `/dataset/info` (the store's revision and counts; `/readyz` says only the status), with
+/// `token` as the bearer where the app authenticates.
+pub async fn info_text(
+    app: axum::Router,
+    token: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut request = Request::builder().uri("/dataset/info").method(Method::GET);
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let response = app.oneshot(request.body(Body::empty())?).await?;
     body_text(response).await
 }
 

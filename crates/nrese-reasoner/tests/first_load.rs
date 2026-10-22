@@ -79,8 +79,14 @@ fn introduced_consistency_discards_a_report_after_a_transient_stop() {
         lists: None,
         schema: &schema,
     };
+    let budget = std::sync::Arc::new(nrese_exec::Budget::new(64 * 1024 * 1024));
     let complete =
-        delta::introduced_violations(&base, &[inserted], &[], rules, None, &|| false).unwrap();
+        delta::introduced_violations(&base, &[inserted], &[], rules, None, &|| false, &budget)
+            .unwrap();
+    assert!(
+        complete.complete(),
+        "the control has sufficient report budget"
+    );
     assert_eq!(complete.len(), (n * n) as usize, "complete fixture control");
     let complete_work = base.scanned.swap(0, Relaxed);
     let asks = AtomicUsize::new(0);
@@ -93,7 +99,7 @@ fn introduced_consistency_discards_a_report_after_a_transient_stop() {
             false
         }
     };
-    let report = delta::introduced_violations(&base, &[inserted], &[], rules, None, &stop);
+    let report = delta::introduced_violations(&base, &[inserted], &[], rules, None, &stop, &budget);
     let progress = pulse_progress.load(Relaxed);
     assert!(
         progress > 0 && progress < complete_work,

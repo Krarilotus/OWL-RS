@@ -51,7 +51,10 @@ fn local_heads_keep_original_proofs_and_delete_with_their_premise() {
     let program = delta::program(&base, spec);
     let proof = explain::explain_with(&base, &program, allowed, 64).unwrap();
     assert_eq!(proof.steps[0].rule.as_deref(), Some("local"));
-    assert!(explain::explain_with(&base, &program, blocked, 64).is_none());
+    assert!(matches!(
+        explain::explain_with(&base, &program, blocked, 64),
+        Err(explain::Unexplained::NoDerivation)
+    ));
     let after = delta::MemoryBase::new(&[], &result.derived);
     assert_eq!(
         delta::update(&after, &[], &[premise], spec, Some(&program)).remove,

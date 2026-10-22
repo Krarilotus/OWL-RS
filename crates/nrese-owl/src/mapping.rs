@@ -63,10 +63,35 @@ pub struct Statement {
 /// Where an axiom was read from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Source {
+    /// The graph its own triple (the first) was read from.
     pub graph: Term,
-    /// The triples of its RDF form: its own and those of the expressions it was the first
-    /// to read.
+    /// The triples of its RDF form: its own and those of its expressions.
     pub triples: Vec<[Term; 3]>,
+    /// The graphs of the triples not stated in `graph` alone ([`Elsewhere`]); `None`,
+    /// a null pointer and no allocation, where the whole form is in one graph. The axiom's
+    /// own triple has a source per graph it is in, unless it is structural too (an n-ary
+    /// axiom's type).
+    pub elsewhere: Option<Box<Elsewhere>>,
+}
+
+/// [`Source::elsewhere`]: by index into the source's `triples`, every graph each listed
+/// triple is stated in, sorted. Out of line, so a source in one graph (nearly every one)
+/// is as large as before graphs were recorded per triple (N12's timing: 16 bytes more on
+/// each of 150,120 sources showed as 4% more memory in dl-pipeline).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Elsewhere(pub Box<[(u32, Term)]>);
+
+impl Source {
+    /// The graphs the triple `triples[i]` is stated in, sorted.
+    pub fn graphs(&self, i: usize) -> impl Iterator<Item = Term> + '_ {
+        let elsewhere: &[(u32, Term)] = self.elsewhere.as_deref().map_or(&[], |e| &e.0);
+        let start = elsewhere.partition_point(|&(at, _)| (at as usize) < i);
+        let listed = elsewhere[start..]
+            .iter()
+            .take_while(move |&&(at, _)| at as usize == i);
+        let own = listed.clone().next().is_none().then_some(self.graph);
+        own.into_iter().chain(listed.map(|&(_, graph)| graph))
+    }
 }
 
 /// An ontology read from RDF.
@@ -291,6 +316,10 @@ struct Reader<'a> {
     statements: &'a [Statement],
     /// Per subject: (predicate, object, graph).
     by_subject: HashMap<Term, Vec<(Term, Term, Term)>>,
+    /// Whether every statement is in one graph: then no triple is stated in another, and
+    /// [`Self::elsewhere`] has nothing to look up. (A statement may still be given twice, and
+    /// an expression read again still needs its triples: Sol r3, F2 and F3.)
+    one_graph: bool,
     declared: BTreeMap<Term, Vec<EntityKind>>,
     /// Properties used with literal objects.
     used_with_literals: HashSet<Term>,
@@ -348,11 +377,15 @@ impl<'a> Reader<'a> {
                 _ => used_with_nodes.insert(p),
             };
         }
+        let one_graph = statements
+            .first()
+            .is_none_or(|first| statements.iter().all(|s| s.graph == first.graph));
         Self {
             v,
             terms,
             statements,
             by_subject,
+            one_graph,
             declared: BTreeMap::new(),
             used_with_literals,
             used_with_nodes,
@@ -382,18 +415,19 @@ impl<'a> Reader<'a> {
         self.terms.kind(term)
     }
 
-    /// The objects of `subject`'s `predicate` statements.
+    /// The objects of `subject`'s `predicate` statements, each once: the same statement
+    /// in two graphs is one value (RSH-05).
     fn objects(&self, subject: Term, predicate: Option<Term>) -> Vec<Term> {
         let Some(predicate) = predicate else {
             return Vec::new();
         };
-        self.by_subject
-            .get(&subject)
-            .into_iter()
-            .flatten()
-            .filter(|&&(p, _, _)| p == predicate)
-            .map(|&(_, o, _)| o)
-            .collect()
+        let mut objects = Vec::new();
+        for &(p, o, _) in self.by_subject.get(&subject).into_iter().flatten() {
+            if p == predicate && !objects.contains(&o) {
+                objects.push(o);
+            }
+        }
+        objects
     }
 
     /// The single object of `subject`'s `predicate`, collected as structural.
@@ -417,6 +451,56 @@ impl<'a> Reader<'a> {
     fn collect(&mut self, triple: [Term; 3]) {
         self.structural.insert(triple);
         self.collected.push(triple);
+    }
+
+    /// Collects again the structural triples of the expression on the blank node `node`,
+    /// read before (a memo hit): its own and those of the blank nodes it reaches.
+    fn recollect(&mut self, node: Term) {
+        let mut queue = vec![node];
+        let mut seen: HashSet<[Term; 3]> = HashSet::new();
+        while let Some(next) = queue.pop() {
+            for &(p, o, _) in self.by_subject.get(&next).into_iter().flatten() {
+                let triple = [next, p, o];
+                if self.structural.contains(&triple) && seen.insert(triple) {
+                    self.collected.push(triple);
+                    if self.terms.kind(o) == TermKind::Blank {
+                        queue.push(o);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The graphs of `triples` not stated in the axiom's graph alone ([`Source::elsewhere`]).
+    /// Only the structure's triples are looked up (their subjects are its nodes, with few
+    /// statements each), not the axiom's own triple: its subject may have many.
+    fn elsewhere(&self, triples: &[[Term; 3]]) -> Option<Box<Elsewhere>> {
+        if self.one_graph {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (i, &[s, p, o]) in triples.iter().enumerate() {
+            if i == 0 && !self.structural.contains(&[s, p, o]) {
+                continue;
+            }
+            let graphs = || {
+                self.by_subject
+                    .get(&s)
+                    .into_iter()
+                    .flatten()
+                    .filter(move |&&(q, x, _)| q == p && x == o)
+                    .map(|&(_, _, graph)| graph)
+            };
+            if graphs().all(|graph| graph == self.graph) {
+                continue;
+            }
+            let at = u32::try_from(i).expect("fewer than 2^32 triples in an axiom's form");
+            let start = out.len();
+            out.extend(graphs().map(|graph| (at, graph)));
+            out[start..].sort_unstable();
+            out.dedup();
+        }
+        (!out.is_empty()).then(|| Box::new(Elsewhere(out.into_boxed_slice())))
     }
 
     fn declared_as(&self, term: Term, kind: EntityKind) -> bool {
@@ -594,6 +678,9 @@ impl<'a> Reader<'a> {
             TermKind::Blank => {
                 self.used(term);
                 if let Some(&known) = self.class_memo.get(&term) {
+                    if known.is_some() {
+                        self.recollect(term);
+                    }
                     return known;
                 }
                 // Guards against a cycle through this node.
@@ -800,6 +887,9 @@ impl<'a> Reader<'a> {
             TermKind::Blank => {
                 self.used(term);
                 if let Some(&known) = self.range_memo.get(&term) {
+                    if known.is_some() {
+                        self.recollect(term);
+                    }
                     return known;
                 }
                 self.range_memo.insert(term, None);
@@ -884,14 +974,21 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// Files `axiom`, read from `triple` and the structure collected for it: copied, as
+    /// one statement can give several axioms (a disjointness's pairs).
     fn add(&mut self, axiom: Axiom, triple: [Term; 3]) {
-        let mut triples = vec![triple];
-        triples.append(&mut self.collected);
+        let mut triples = Vec::with_capacity(1 + self.collected.len());
+        triples.push(triple);
+        triples.extend_from_slice(&self.collected);
         let source = Source {
             graph: self.graph,
+            elsewhere: self.elsewhere(&triples),
             triples,
         };
-        let sources = self.axioms.entry(axiom).or_default();
+        let sources = self
+            .axioms
+            .entry(axiom)
+            .or_insert_with(|| Vec::with_capacity(1));
         if !sources.contains(&source) {
             sources.push(source);
         }

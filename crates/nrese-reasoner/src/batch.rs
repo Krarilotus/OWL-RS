@@ -35,7 +35,7 @@ use super::eval::{
     run_jobs_by_morsel,
 };
 use super::ir::{Head, Rule, Term};
-use super::ir::{Triple, Violation};
+use super::ir::{Triple, Violations};
 use super::lists::{ListVocabulary, instantiate};
 use super::representatives::EqualityClasses;
 use nrese_exec::heap;
@@ -284,8 +284,8 @@ fn merge_marked(open: &[Pair], marked: &[Pair]) -> (Vec<Pair>, Vec<u64>) {
 pub struct Materialisation {
     /// Facts derived beyond the input, sorted, without duplicates.
     pub derived: Vec<Triple>,
-    /// Consistency violations on the closure, sorted.
-    pub violations: Vec<Violation>,
+    /// Consistency violations on the closure, sorted, charged ([`Violations`]).
+    pub violations: Violations,
     pub diagnostics: Vec<super::lists::ListDiagnostic>,
     pub rounds: usize,
     /// Rules after grounding, at the end.
@@ -2234,21 +2234,25 @@ pub(crate) fn consistency_rules<S: Source + ?Sized>(
     source: &S,
     rules: &[Rule],
     lists: Option<&ListVocabulary>,
-) -> Vec<Rule> {
+) -> (Vec<Rule>, Vec<Vec<Triple>>) {
     let mut out: Vec<Rule> = rules
         .iter()
         .filter(|r| r.head == Head::Inconsistent)
         .cloned()
         .collect();
+    let mut premises = vec![Vec::new(); out.len()];
     if let Some(vocabulary) = lists {
-        let (list_rules, _) = instantiate(vocabulary, &AllFacts(source));
-        out.extend(
-            list_rules
-                .into_iter()
-                .filter(|r| r.head == Head::Inconsistent),
-        );
+        // A list rule with the list facts it comes from: its violations aren't whole.
+        let (list_rules, list_premises, _) =
+            super::lists::instantiate_with_premises(vocabulary, &AllFacts(source));
+        for (rule, facts) in list_rules.into_iter().zip(list_premises) {
+            if rule.head == Head::Inconsistent {
+                out.push(rule);
+                premises.push(facts);
+            }
+        }
     }
-    out
+    (out, premises)
 }
 
 /// The closure of `input` under `rules` (plus the list rules when `lists` is given).
@@ -2270,7 +2274,17 @@ pub fn materialise_owned(
 ) -> Materialisation {
     let clock = std::time::Instant::now();
     let store = Store::new(input);
-    run(store, clock.elapsed(), rules, lists, schema, None, NEVER).expect("never stopped")
+    run(
+        store,
+        clock.elapsed(),
+        rules,
+        lists,
+        schema,
+        None,
+        NEVER,
+        &unlimited(),
+    )
+    .expect("never stopped")
 }
 
 /// [`materialise_owned`], polling `stop` as [`materialise_grouped_until`] does.
@@ -2283,7 +2297,16 @@ pub fn materialise_owned_until(
 ) -> Result<Materialisation, Interrupted> {
     let clock = std::time::Instant::now();
     let store = Store::new(input);
-    run(store, clock.elapsed(), rules, lists, schema, None, stop)
+    run(
+        store,
+        clock.elapsed(),
+        rules,
+        lists,
+        schema,
+        None,
+        stop,
+        &unlimited(),
+    )
 }
 
 /// [`materialise`] over input already grouped the way the working set stores it: per
@@ -2308,9 +2331,30 @@ pub fn materialise_grouped_until(
     schema: &Schema,
     stop: super::eval::Stop<'_>,
 ) -> Result<Materialisation, Interrupted> {
+    materialise_grouped_within(input, rules, lists, schema, stop, &unlimited())
+}
+
+/// [`materialise_grouped_until`], its violations charged to `budget` ([`Violations`]).
+pub fn materialise_grouped_within(
+    input: Vec<(u64, Vec<(u64, u64)>)>,
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+    stop: super::eval::Stop<'_>,
+    budget: &Arc<nrese_exec::Budget>,
+) -> Result<Materialisation, Interrupted> {
     let clock = std::time::Instant::now();
     let store = Store::from_groups(input);
-    run(store, clock.elapsed(), rules, lists, schema, None, stop)
+    run(
+        store,
+        clock.elapsed(),
+        rules,
+        lists,
+        schema,
+        None,
+        stop,
+        budget,
+    )
 }
 
 /// The closure of `input` under `rules` with equality by representatives
@@ -2329,6 +2373,20 @@ pub fn materialise_representatives_until(
     listing: Listing,
     stop: super::eval::Stop<'_>,
 ) -> Result<Materialisation, Interrupted> {
+    materialise_representatives_within(input, rules, lists, schema, listing, stop, &unlimited())
+}
+
+/// [`materialise_representatives_until`], its violations charged to `budget`
+/// ([`Violations`]).
+pub fn materialise_representatives_within(
+    input: Input,
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+    listing: Listing,
+    stop: super::eval::Stop<'_>,
+    budget: &Arc<nrese_exec::Budget>,
+) -> Result<Materialisation, Interrupted> {
     let clock = std::time::Instant::now();
     let store = match input {
         Input::Facts(facts) => Store::new(facts),
@@ -2346,7 +2404,16 @@ pub fn materialise_representatives_until(
     if representatives.is_none() && listing == Listing::Representatives {
         // Every fact: the input's too.
         let input_facts = store.facts_where(&|_| true);
-        let mut result = run(store, clock.elapsed(), rules, lists, schema, None, stop)?;
+        let mut result = run(
+            store,
+            clock.elapsed(),
+            rules,
+            lists,
+            schema,
+            None,
+            stop,
+            budget,
+        )?;
         result.derived.extend(input_facts);
         result.derived.par_sort_unstable();
         result.derived.dedup();
@@ -2360,7 +2427,13 @@ pub fn materialise_representatives_until(
         schema,
         representatives,
         stop,
+        budget,
     )
+}
+
+/// A budget that refuses nothing, for the evaluations no caller charges.
+fn unlimited() -> Arc<nrese_exec::Budget> {
+    Arc::new(nrese_exec::Budget::unlimited())
 }
 
 /// The rules equality by representatives runs: without the ones the classes stand for.
@@ -2373,7 +2446,9 @@ fn under_representatives(rules: &[Rule]) -> Vec<Rule> {
 }
 
 /// Semi-naive evaluation to the fixpoint, from a store holding the input as its delta;
-/// with equality by representatives if `representatives` is given.
+/// with equality by representatives if `representatives` is given; its violations charged
+/// to `budget`.
+#[allow(clippy::too_many_arguments)]
 fn run(
     mut store: Store,
     load: std::time::Duration,
@@ -2382,6 +2457,7 @@ fn run(
     schema: &Schema,
     mut representatives: Option<Representatives>,
     stop: super::eval::Stop<'_>,
+    budget: &Arc<nrese_exec::Budget>,
 ) -> Result<Materialisation, Interrupted> {
     // The process's memory limit stops it too, whatever the caller polls; once either has
     // fired, the run stays stopped (an interrupted round is never taken as complete).
@@ -2474,7 +2550,7 @@ fn run(
             // The first round grounds everything; later ones through new schema facts
             // only (list rules in full, deduplicated).
             grounded_all = result.rounds == 1 || reground_all;
-            program.ground_until(&current, schema, &source, !grounded_all, stop)?;
+            program.ground_until(&current, schema, &source, !grounded_all, None, stop)?;
             reground_all = false;
             for &p in &program.transitive {
                 transitive.register(p);
@@ -2488,7 +2564,7 @@ fn run(
                 store: &store,
                 stale,
             };
-            program.ground_until(&current, schema, &guarded_schema, false, stop)?;
+            program.ground_until(&current, schema, &guarded_schema, false, None, stop)?;
         }
         // The object orders the rules can use, built where they became needed and
         // dropped where nothing reads them (P1-F11).
@@ -2689,12 +2765,12 @@ fn run(
             store: &store,
             stale,
         };
-        let checks = consistency_rules(&current, &rules, lists);
+        let (checks, premises) = consistency_rules(&current, &rules, lists);
         let checks = match &representatives {
             Some(reps) => reps.guarded(checks, stop)?,
             None => checks,
         };
-        program.ground_until(&current, schema, &checks, false, stop)?;
+        program.ground_until(&current, schema, &checks, false, Some(&premises), stop)?;
     }
     let reads = Reads::of(
         program.rules.iter().chain(
@@ -2708,7 +2784,7 @@ fn run(
         .as_ref()
         .is_some_and(|e| store.estimate([None, Some(e.same_as), None], Seg::All) > 0);
     store.objects(&|p| equal || reads.by_object(p) || schema.read_in_grounding(p));
-    let mut found = HashSet::new();
+    let mut found = Violations::new(Arc::clone(budget));
     check(
         &Current {
             store: &store,
@@ -2721,7 +2797,8 @@ fn run(
         stop,
     );
     check_stop()?;
-    result.violations = sorted(found);
+    found.finish();
+    result.violations = found;
     result.counters.lookups_without_order = store
         .relations
         .iter()
@@ -2839,13 +2916,6 @@ impl Reads {
     }
 }
 
-/// Violations sorted by rule and bindings.
-pub(crate) fn sorted(found: HashSet<Violation>) -> Vec<Violation> {
-    let mut violations: Vec<Violation> = found.into_iter().collect();
-    violations.sort_by(|a, b| (&a.rule, &a.bindings).cmp(&(&b.rule, &b.bindings)));
-    violations
-}
-
 /// Evaluates consistency instances into `found`: those in `full` over all facts, and the
 /// `(instance, atom)` semi-naive variants in `variants` through the delta. Polls `stop` as
 /// the rule jobs do ([`Poller`]); once it fires, the rest is skipped and `found` is
@@ -2855,27 +2925,23 @@ pub(crate) fn check<S: Source + ?Sized>(
     program: &GroundProgram,
     full: impl IntoIterator<Item = usize>,
     variants: &[(usize, usize)],
-    found: &mut HashSet<Violation>,
+    found: &mut Violations,
     stop: super::eval::Stop<'_>,
 ) {
     let Some(mut poll) = Poller::new(stop) else {
         return;
     };
-    let record = |c: usize, bindings: &[Option<u64>], found: &mut HashSet<Violation>| {
+    let record = |c: usize, bindings: &[Option<u64>], found: &mut Violations| {
         let (rule, grounded) = &program.consistency[c];
         // The job's bindings are sized for the grounded instance, which lacks the schema
-        // variables when one of them has the highest index.
-        let bindings = (0..rule.variables())
-            .map(|v| {
-                grounded.substitution[v]
-                    .or_else(|| bindings.get(v).copied().flatten())
-                    .unwrap_or(0)
-            })
-            .collect();
-        found.insert(Violation {
-            rule: rule.name.clone(),
-            bindings,
-        });
+        // variables when one of them has the highest index. On the stack: a firing
+        // allocates only the violation [`Violations::record`] reserves.
+        let mut all = [None; 1 << u8::BITS];
+        let all = &mut all[..rule.variables()];
+        for (v, slot) in all.iter_mut().enumerate() {
+            *slot = grounded.substitution[v].or_else(|| bindings.get(v).copied().flatten());
+        }
+        found.record(rule, all, !program.consistency_from_list[c]);
     };
     let mut jobs: Vec<(usize, Job<'_>)> = Vec::new();
     for c in full {
@@ -2886,7 +2952,7 @@ pub(crate) fn check<S: Source + ?Sized>(
                 &program.consistency[c].1.substitution,
                 &mut poll,
             ) {
-                Ok(true) => record(c, &vec![None; program.consistency[c].0.variables()], found),
+                Ok(true) => record(c, &[], found),
                 Ok(false) => {}
                 Err(_) => return,
             }
@@ -2970,6 +3036,7 @@ mod guard_stop_tests {
                 merges: 0,
             };
             let schema = Schema::owl(&mut crate::vocabulary::LocalVocabulary::default());
+            let budget = Arc::new(nrese_exec::Budget::new(64 * 1024 * 1024));
             let result = run(
                 Store::new(input),
                 std::time::Duration::ZERO,
@@ -2978,6 +3045,7 @@ mod guard_stop_tests {
                 &schema,
                 Some(reps),
                 &stop,
+                &budget,
             );
             assert!(
                 matches!(result, Err(Interrupted)),

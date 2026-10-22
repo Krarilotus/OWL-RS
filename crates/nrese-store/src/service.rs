@@ -1545,7 +1545,10 @@ impl StoreService {
     /// Within `scope`: the statement must be one the requester sees (an inferred statement
     /// where the scope shows inferences, an asserted one in a readable graph), else the
     /// answer is `None` as for a statement that doesn't hold (no existence oracle for
-    /// hidden statements); asserted premises in no readable graph are `hidden` steps.
+    /// hidden statements). The derivation is searched for within the requester's share
+    /// ([`crate::reasoning::ProofScope`]): the asserted statements of its graphs and the
+    /// inferred ones it sees (its view, by support where it sees them so), never through
+    /// what it can't read; `None` where there is none there.
     pub fn explain_statement(
         &self,
         program: impl Into<nrese_reasoner::RuleProgram>,
@@ -1554,6 +1557,27 @@ impl StoreService {
         predicate: nrese_rdf::TermRef<'_>,
         object: nrese_rdf::TermRef<'_>,
     ) -> StoreResult<Option<Vec<crate::reasoning::InferenceStep>>> {
+        Ok(
+            match self.explain_statement_outcome(program, scope, subject, predicate, object)? {
+                Some(crate::reasoning::Explained::Proof(steps)) => Some(steps),
+                Some(crate::reasoning::Explained::Incomplete(_)) | None => None,
+            },
+        )
+    }
+
+    /// [`Self::explain_statement`], telling a search its limits cut short
+    /// ([`crate::reasoning::Explained::Incomplete`]: the statement holds, its derivation
+    /// wasn't found within them) apart from a statement that doesn't hold. Within `scope`
+    /// the limits count only the requester's share, so that they ran out tells nothing of
+    /// the graphs it can't read.
+    pub fn explain_statement_outcome(
+        &self,
+        program: impl Into<nrese_reasoner::RuleProgram>,
+        scope: &crate::ReadScope,
+        subject: nrese_rdf::TermRef<'_>,
+        predicate: nrese_rdf::TermRef<'_>,
+        object: nrese_rdf::TermRef<'_>,
+    ) -> StoreResult<Option<crate::reasoning::Explained>> {
         let snapshot = self.engine.snapshot();
         let program = self.bound_program(&snapshot, program.into());
         let Some(fact) = Self::fact_of(&snapshot, [subject, predicate, object]) else {
@@ -1564,25 +1588,35 @@ impl StoreService {
                 &program, &snapshot, fact, None,
             ));
         };
-        let readable = |fact: [u64; 3]| readable_asserted(&snapshot, access, fact);
-        let Some(steps) =
-            crate::reasoning::explain_fact(&program, &snapshot, fact, Some(&readable))
+        let view = self.view_of(&snapshot, Some(access), &self.settings.envelope(None), None)?;
+        let graph = |graph: nrese_engine::TermId| access.allows_id(&snapshot, graph);
+        let scope = crate::reasoning::ProofScope {
+            graph: &graph,
+            inferred: access.inferred,
+        };
+        // The search starts only from a root in the requester's share (one it sees).
+        let Some(found) = crate::reasoning::explain_fact(&program, &view, fact, Some(&scope))
         else {
             return Ok(None);
         };
-        let visible = match steps.first().map(|step| step.origin) {
-            Some("inferred") => self.inferred_visible(&snapshot, access, fact)?,
-            Some("asserted") => true,
-            _ => false,
+        let visible = match &found {
+            crate::reasoning::Explained::Proof(steps) => {
+                match steps.first().map(|step| step.origin) {
+                    Some("inferred") => self.inferred_visible(&snapshot, access, fact)?,
+                    Some("asserted") => true,
+                    _ => false,
+                }
+            }
+            crate::reasoning::Explained::Incomplete(_) => true,
         };
-        Ok(visible.then_some(steps))
+        Ok(visible.then_some(found))
     }
 
     /// The justifications of the statement `subject predicate object` under `program`:
     /// minimal sets of asserted statements it follows from, as `mode` asks
     /// ([`crate::reasoning::justify_fact`]). `None` if it doesn't hold. Within `scope` as
     /// [`Self::explain_statement`]: a statement the requester doesn't see is `None`, and
-    /// asserted statements in no readable graph are `hidden`.
+    /// the justifications are those within its share, computed and checked there.
     pub fn justify_statement(
         &self,
         program: impl Into<nrese_reasoner::RuleProgram>,
@@ -1600,17 +1634,23 @@ impl StoreService {
                 &program, &snapshot, fact, mode, None,
             ));
         };
-        let readable = |fact: [u64; 3]| readable_asserted(&snapshot, access, fact);
-        let visible = readable(fact) || self.inferred_visible(&snapshot, access, fact)?;
+        let visible = readable_asserted(&snapshot, access, fact)
+            || self.inferred_visible(&snapshot, access, fact)?;
         if !visible {
             return Ok(None);
         }
+        let view = self.view_of(&snapshot, Some(access), &self.settings.envelope(None), None)?;
+        let graph = |graph: nrese_engine::TermId| access.allows_id(&snapshot, graph);
+        let scope = crate::reasoning::ProofScope {
+            graph: &graph,
+            inferred: access.inferred,
+        };
         Ok(crate::reasoning::justify_fact(
             &program,
-            &snapshot,
+            &view,
             fact,
             mode,
-            Some(&readable),
+            Some(&scope),
         ))
     }
 
@@ -1652,12 +1692,8 @@ impl StoreService {
         fact: [u64; 3],
     ) -> StoreResult<bool> {
         if by_support(access) {
-            let [s, p, o] = fact.map(nrese_engine::TermId::from_raw);
             let view = self.view_of(snapshot, Some(access), &self.settings.envelope(None), None)?;
-            Ok(view.contains_in(
-                ReadModel::Inferred,
-                &nrese_engine::EncodedQuad::new(s, p, o, nrese_engine::TermId::DEFAULT_GRAPH),
-            ))
+            Ok(view.contains_in(ReadModel::Inferred, &default_graph_quad(fact)))
         } else {
             Ok(access.inferred)
         }
@@ -1719,9 +1755,15 @@ impl StoreService {
                 .error()
                 .unwrap_or(crate::StoreError::MaterialisationCancelled)
         };
-        let closure =
-            crate::reasoning::materialise_until(&program, rematerialisation.base(), &stop)
-                .map_err(|_| stopped())?;
+        // Its violations charged to the operation's envelope, not the inferred stack's.
+        let violations = std::sync::Arc::new(self.envelope(None).part());
+        let closure = crate::reasoning::materialise_within(
+            &program,
+            rematerialisation.base(),
+            &stop,
+            &violations,
+        )
+        .map_err(|_| stopped())?;
         let inferred = closure.inferred.len() as u64;
         let base = rematerialisation.base();
         let reported = crate::reasoning::MaterialisationReport::default()
@@ -1750,13 +1792,13 @@ impl StoreService {
             rules,
             self.config.hide_unnamed_classes,
             self.config.equality_compact,
-            closure.violations.len(),
+            closure.violations.found(),
         ))
         .map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
-        if !closure.violations.is_empty() {
+        if closure.violations.inconsistent() {
             tracing::error!(
                 ruleset = %rules.name(),
-                violations = closure.violations.len(),
+                violations = closure.violations.found(),
                 "the data is inconsistent: the store is in quarantine until it is repaired"
             );
         }
@@ -1767,7 +1809,7 @@ impl StoreService {
             inferred,
             inferred_inserted = summary.inferred_inserted,
             inferred_deleted = summary.inferred_deleted,
-            violations = closure.violations.len(),
+            violations = closure.violations.found(),
             rounds = closure.rounds,
             ms = started.elapsed().as_millis() as u64,
             "inferred stack rematerialised"
@@ -1779,7 +1821,7 @@ impl StoreService {
             inferred,
             inferred_inserted: summary.inferred_inserted,
             inferred_deleted: summary.inferred_deleted,
-            violations: closure.violations.len(),
+            violations: closure.violations.found(),
             rounds: closure.rounds,
             elapsed: started.elapsed(),
             phases: closure.phases,
@@ -1844,6 +1886,12 @@ fn readable_asserted(
 ) -> bool {
     let quads = snapshot.quads_for_pattern_in(nrese_engine::ReadModel::Asserted, &any_graph(fact));
     in_readable_graph(quads, &|id| snapshot.decode(id), access)
+}
+
+/// `fact` as an inferred statement (they live in the default graph).
+fn default_graph_quad(fact: [u64; 3]) -> nrese_engine::EncodedQuad {
+    let [s, p, o] = fact.map(nrese_engine::TermId::from_raw);
+    nrese_engine::EncodedQuad::new(s, p, o, nrese_engine::TermId::DEFAULT_GRAPH)
 }
 
 /// The pattern of `fact` in any graph.

@@ -416,6 +416,11 @@ pub async fn session_rollback(
 struct Explanation {
     /// The statement first; each premise after the steps that use it.
     steps: Vec<ExplanationStep>,
+    /// Whether the answer is whole: false when a limit of the search cut it short (the
+    /// statement holds; `steps` is empty and `reason` says which limit), not a 404.
+    complete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
     /// Under `owl2-dl`, for a statement the rules don't derive but OWL 2 DL entails: a
     /// minimal set of the ontology's axioms it follows from (`steps` is then empty).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -570,14 +575,23 @@ pub async fn explain(
     let dl = state.store().dl().active();
     let found = tokio::task::spawn_blocking(move || {
         let statement = [subject.as_ref(), predicate.as_ref(), object.as_ref()];
-        let steps =
-            store.explain_statement(program, &scope, statement[0], statement[1], statement[2])?;
-        Ok::<_, nrese_store::StoreError>(match steps {
-            Some(steps) => Some((steps, None)),
+        let found = store.explain_statement_outcome(
+            program,
+            &scope,
+            statement[0],
+            statement[1],
+            statement[2],
+        )?;
+        Ok::<_, nrese_store::StoreError>(match found {
+            Some(nrese_store::reasoning::Explained::Proof(steps)) => Some((steps, None, None)),
+            // The rules derive it, past the search's limits: said, not a 404.
+            Some(nrese_store::reasoning::Explained::Incomplete(reason)) => {
+                Some((Vec::new(), None, Some(reason)))
+            }
             // Not derived by the rules: under owl2-dl, why OWL 2 DL entails it.
             None if dl => store
                 .explain_dl(&scope, statement)
-                .map(|e| (Vec::new(), Some(DlJustified::from(e)))),
+                .map(|e| (Vec::new(), Some(DlJustified::from(e)), None)),
             None => None,
         })
     })
@@ -585,7 +599,7 @@ pub async fn explain(
     .map_err(|error| ApiError::internal(error.to_string()))?
     .map_err(|error| super::sparql::map_query_error(&state.policy(), error))?
     .ok_or_else(|| ApiError::not_found("the statement doesn't hold"))?;
-    let (steps, owl2_dl) = found;
+    let (steps, owl2_dl, reason) = found;
     let steps: Vec<ExplanationStep> = steps
         .into_iter()
         .map(|step| ExplanationStep {
@@ -597,7 +611,13 @@ pub async fn explain(
             premises: step.premises,
         })
         .collect();
-    Ok(Json(Explanation { steps, owl2_dl }).into_response())
+    Ok(Json(Explanation {
+        steps,
+        complete: reason.is_none(),
+        reason,
+        owl2_dl,
+    })
+    .into_response())
 }
 
 /// The justifications of a statement (`explain?justifications=...`).

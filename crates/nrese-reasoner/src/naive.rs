@@ -199,12 +199,14 @@ pub fn materialise(input: &[Triple], rules: &[Rule], lists: Option<&ListVocabula
         if new.is_empty() {
             // Consistency rules on the final closure.
             let mut seen = HashSet::new();
-            for rule in program.iter().filter(|r| r.head == Head::Inconsistent) {
+            for (at, rule) in program.iter().enumerate() {
+                if rule.head != Head::Inconsistent {
+                    continue;
+                }
+                // The given rules list their premises whole; the list rules after them don't.
+                let whole = at < rules.len();
                 matches(rule, &index, &mut |bindings| {
-                    let violation = Violation {
-                        rule: rule.name.clone(),
-                        bindings: bindings.iter().map(|b| b.unwrap_or(0)).collect(),
-                    };
+                    let violation = Violation::of(rule, bindings, whole);
                     if seen.insert(violation.clone()) {
                         closure.violations.push(violation);
                     }
