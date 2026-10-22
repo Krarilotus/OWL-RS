@@ -19,9 +19,10 @@ name=$(basename "$PWD")
 
 index=$(mktemp)
 trap 'rm -f "$index"' EXIT
-GIT_INDEX_FILE=$index git read-tree HEAD
-GIT_INDEX_FILE=$index git -c core.safecrlf=false add -A
-tree=$(GIT_INDEX_FILE=$index git write-tree)
+no_snapshot() { echo "no snapshot of this working tree: $1 failed" >&2; exit 2; }
+GIT_INDEX_FILE=$index git read-tree HEAD || no_snapshot "git read-tree HEAD"
+GIT_INDEX_FILE=$index git -c core.safecrlf=false add -A || no_snapshot "git add -A"
+tree=$(GIT_INDEX_FILE=$index git write-tree) || no_snapshot "git write-tree"
 [ "${1:-}" = tree ] && { echo "$tree"; exit 0; }
 
 host=${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}

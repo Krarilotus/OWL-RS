@@ -42,6 +42,11 @@ impl Deref for Computed {
 }
 
 impl Computed {
+    /// Borrowed collision probe for response-local fresh blank-node identities.
+    pub(super) fn contains(&self, term: &Term) -> bool {
+        self.ids.contains_key(term)
+    }
+
     /// O(1) expected; one combined admission on a miss, before either clone/growth.
     pub(super) fn intern(
         &mut self,
