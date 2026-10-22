@@ -69,8 +69,8 @@ impl Values<'_> {
         }
     }
 
-    pub(super) fn expression(&self, expression: &Expression) -> Expression {
-        let e = |x: &Expression| Box::new(self.expression(x));
+    fn expression<const PRE_BOUND: bool>(&self, expression: &Expression) -> Expression {
+        let e = |x: &Expression| Box::new(self.expression::<PRE_BOUND>(x));
         match expression {
             Expression::Variable(v) => match self.constant(v) {
                 Some(Constant::Iri(n)) => Expression::NamedNode(n),
@@ -98,56 +98,44 @@ impl Values<'_> {
             Expression::UnaryPlus(a) => Expression::UnaryPlus(e(a)),
             Expression::UnaryMinus(a) => Expression::UnaryMinus(e(a)),
             Expression::Not(a) => Expression::Not(e(a)),
-            Expression::In(a, list) => {
-                Expression::In(e(a), list.iter().map(|x| self.expression(x)).collect())
-            }
+            Expression::In(a, list) => Expression::In(
+                e(a),
+                list.iter()
+                    .map(|x| self.expression::<PRE_BOUND>(x))
+                    .collect(),
+            ),
             Expression::If(a, b, c) => Expression::If(e(a), e(b), e(c)),
-            Expression::Coalesce(list) => {
-                Expression::Coalesce(list.iter().map(|x| self.expression(x)).collect())
-            }
+            Expression::Coalesce(list) => Expression::Coalesce(
+                list.iter()
+                    .map(|x| self.expression::<PRE_BOUND>(x))
+                    .collect(),
+            ),
             Expression::FunctionCall(function, args) => Expression::FunctionCall(
                 function.clone(),
-                args.iter().map(|x| self.expression(x)).collect(),
+                args.iter()
+                    .map(|x| self.expression::<PRE_BOUND>(x))
+                    .collect(),
             ),
-            Expression::Exists(pattern) => Expression::Exists(Box::new(self.pattern(pattern))),
+            Expression::Exists(pattern) => {
+                Expression::Exists(Box::new(self.pattern_with::<PRE_BOUND>(pattern)))
+            }
         }
     }
 
-    /// A whole query's pattern with the values put in: as [`Self::pattern`], except that
-    /// the query's own projection doesn't hide them (they are pre-bound for the whole
-    /// query); it only stops listing them.
+    /// SHACL pre-binding applies throughout the query, including subqueries whose
+    /// projections leave the pre-bound variables out. Projections stop listing them.
     pub(super) fn top(&self, pattern: &GraphPattern) -> GraphPattern {
-        match pattern {
-            GraphPattern::Slice {
-                inner,
-                start,
-                length,
-            } => GraphPattern::Slice {
-                inner: Box::new(self.top(inner)),
-                start: *start,
-                length: *length,
-            },
-            GraphPattern::Distinct { inner } => GraphPattern::Distinct {
-                inner: Box::new(self.top(inner)),
-            },
-            GraphPattern::Reduced { inner } => GraphPattern::Reduced {
-                inner: Box::new(self.top(inner)),
-            },
-            GraphPattern::Project { inner, variables } => GraphPattern::Project {
-                inner: Box::new(self.pattern(inner)),
-                variables: variables
-                    .iter()
-                    .filter(|v| !self.terms.contains_key(*v))
-                    .cloned()
-                    .collect(),
-            },
-            other => self.pattern(other),
-        }
+        self.pattern_with::<true>(pattern)
     }
 
     /// `pattern` with the values put in.
     pub(super) fn pattern(&self, pattern: &GraphPattern) -> GraphPattern {
-        let p = |x: &GraphPattern| Box::new(self.pattern(x));
+        self.pattern_with::<false>(pattern)
+    }
+
+    // The caller selects the projection rule once, outside the recursive traversal.
+    fn pattern_with<const PRE_BOUND: bool>(&self, pattern: &GraphPattern) -> GraphPattern {
+        let p = |x: &GraphPattern| Box::new(self.pattern_with::<PRE_BOUND>(x));
         let kept = |variables: &[Variable]| -> Vec<Variable> {
             variables
                 .iter()
@@ -182,10 +170,10 @@ impl Values<'_> {
             } => GraphPattern::LeftJoin {
                 left: p(left),
                 right: p(right),
-                expression: expression.as_ref().map(|x| self.expression(x)),
+                expression: expression.as_ref().map(|x| self.expression::<PRE_BOUND>(x)),
             },
             GraphPattern::Filter { expr, inner } => GraphPattern::Filter {
-                expr: self.expression(expr),
+                expr: self.expression::<PRE_BOUND>(expr),
                 inner: p(inner),
             },
             GraphPattern::Union { inputs } => GraphPattern::Union {
@@ -200,7 +188,7 @@ impl Values<'_> {
                 bindings
                     .iter()
                     .fold(*p(inner), |extended, (variable, expression)| {
-                        let expression = self.expression(expression);
+                        let expression = self.expression::<PRE_BOUND>(expression);
                         match self.constant(variable) {
                             Some(constant) => GraphPattern::Filter {
                                 expr: Expression::SameTerm(
@@ -256,21 +244,30 @@ impl Values<'_> {
                 expression: expression
                     .iter()
                     .map(|o| match o {
-                        OrderExpression::Asc(x) => OrderExpression::Asc(self.expression(x)),
-                        OrderExpression::Desc(x) => OrderExpression::Desc(self.expression(x)),
+                        OrderExpression::Asc(x) => {
+                            OrderExpression::Asc(self.expression::<PRE_BOUND>(x))
+                        }
+                        OrderExpression::Desc(x) => {
+                            OrderExpression::Desc(self.expression::<PRE_BOUND>(x))
+                        }
                     })
                     .collect(),
             },
-            // A subquery's variables are the outer ones only where it projects them.
+            // Correlation sees only projected variables; pre-binding crosses projections.
             GraphPattern::Project { inner, variables } => {
-                let visible: HashMap<Variable, Term> = self
-                    .terms
-                    .iter()
-                    .filter(|(v, _)| variables.contains(v))
-                    .map(|(v, t)| (v.clone(), t.clone()))
-                    .collect();
+                let inner = if PRE_BOUND {
+                    p(inner)
+                } else {
+                    let visible: HashMap<Variable, Term> = self
+                        .terms
+                        .iter()
+                        .filter(|(v, _)| variables.contains(v))
+                        .map(|(v, t)| (v.clone(), t.clone()))
+                        .collect();
+                    Box::new(Values { terms: &visible }.pattern(inner))
+                };
                 GraphPattern::Project {
-                    inner: Box::new(Values { terms: &visible }.pattern(inner)),
+                    inner,
                     variables: kept(variables),
                 }
             }
@@ -292,12 +289,13 @@ impl Values<'_> {
                 variables,
                 aggregates,
             } => GraphPattern::Group {
-                inner: Box::new(variables.iter().fold(self.pattern(inner), |grouped, v| {
-                    match self.constant(v) {
+                inner: Box::new(variables.iter().fold(
+                    self.pattern_with::<PRE_BOUND>(inner),
+                    |grouped, v| match self.constant(v) {
                         Some(constant) => grouped.extend(v.clone(), constant.expression()),
                         None => grouped,
-                    }
-                })),
+                    },
+                )),
                 variables: variables.clone(),
                 aggregates: aggregates
                     .iter()
@@ -314,7 +312,7 @@ impl Values<'_> {
                                 distinct,
                             } => AggregateExpression::FunctionCall {
                                 name: name.clone(),
-                                expr: self.expression(expr),
+                                expr: self.expression::<PRE_BOUND>(expr),
                                 distinct: *distinct,
                             },
                         };
