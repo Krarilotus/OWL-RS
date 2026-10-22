@@ -30,6 +30,10 @@ rust-stemmers = "1.2"
 thiserror.workspace = true
 tracing.workspace = true
 
+# Durable renames (src/durability/publish.rs): MoveFileExW with MOVEFILE_WRITE_THROUGH.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 # The canonical views' memory guard measures against budgets (tests/canonical_view_memory.rs),
