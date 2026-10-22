@@ -31,7 +31,9 @@ use super::publish::publish_or_fail;
 use super::sidecar;
 use crate::error::{EngineError, EngineResult};
 
+pub(crate) mod acquire;
 mod time;
+pub(crate) use acquire::open_segment;
 
 /// Version 2 added the inferred stack to commit records (roadmap E6); version 3 inlines
 /// `xsd:decimal`, `xsd:date` and `xsd:dateTime` (E1), which changes the ids of such terms;
@@ -107,15 +109,7 @@ pub(crate) enum Tail {
 /// can't be read or names a policy this engine doesn't know (recovery must not take it for
 /// a missing one and so be lenient).
 fn segment_policy(segment: &Path) -> EngineResult<Option<SyncPolicy>> {
-    match sidecar::read(segment, "sync")? {
-        None => Ok(None),
-        Some(word) => SyncPolicy::from_word(&word).map(Some).ok_or_else(|| {
-            EngineError::Corruption(format!(
-                "{}: unknown sync policy {word:?}",
-                sidecar::path_of(segment).display()
-            ))
-        }),
-    }
+    segment_facts(segment).policy
 }
 
 /// Removes what a crash left of a segment or sidecar being written under a temporary name
@@ -160,10 +154,7 @@ pub(crate) struct SegmentFacts {
 }
 
 pub(crate) fn segment_facts(path: &Path) -> SegmentFacts {
-    SegmentFacts {
-        time: time::read(path),
-        policy: segment_policy(path),
-    }
+    SegmentFacts::from_text(path, sidecar::read_text(path))
 }
 
 /// Read an already open segment while retaining recovery's revision bound. Replication
@@ -665,10 +656,8 @@ pub fn copy_log_segment(segment: &Path, dir: &Path) -> EngineResult<PathBuf> {
     let mut partial = target.clone().into_os_string();
     partial.push(".copying");
     let partial = PathBuf::from(partial);
-    fs::copy(segment, &partial)?;
-    // Read provenance after capturing the source bytes: an empty source may have made
-    // its first unknown transition while it was copied. Restore targets are stopped.
-    time::copy(segment, &target)?;
+    let metadata = acquire::copy_segment(segment, &partial)?;
+    time::copy_text(segment, &target, metadata.as_deref())?;
     publish_or_fail(&partial, &target)?;
     Ok(target)
 }
