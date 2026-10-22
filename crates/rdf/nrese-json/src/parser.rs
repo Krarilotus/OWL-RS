@@ -18,6 +18,10 @@ use std::ops::Range;
 use crate::error::{JsonParseError, JsonSyntaxError};
 use crate::value::{Object, Value};
 
+mod session;
+use session::{Control, Unchecked};
+pub use session::{JsonSessionCallbacks, SliceJsonSession};
+
 /// How deep arrays and objects may nest by default.
 pub const MAX_DEPTH: usize = 128;
 
@@ -131,13 +135,19 @@ impl Lexer {
         };
     }
 
-    fn open(&mut self, object: bool, at: usize) -> Result<(), JsonSyntaxError> {
+    fn open<P: Control>(
+        &mut self,
+        object: bool,
+        at: usize,
+        control: &mut P,
+    ) -> Result<(), P::Error> {
         if self.stack.len() >= self.max_depth {
-            return Err(self.error(
+            return Err(P::Error::from(self.error(
                 format!("nested deeper than {} arrays and objects", self.max_depth),
                 at,
-            ));
+            )));
         }
+        control.grow_stack(&mut self.stack)?;
         self.stack.push(object);
         self.expect = if object {
             Expect::KeyOrEnd
@@ -154,12 +164,13 @@ impl Lexer {
 
     /// The next event from `text` at `*pos`; `None` if the text ends inside a token and
     /// more may come (`eof` false).
-    fn step(
+    fn step<P: Control>(
         &mut self,
         text: &str,
         pos: &mut usize,
         eof: bool,
-    ) -> Result<Option<Raw>, JsonSyntaxError> {
+        control: &mut P,
+    ) -> Result<Option<Raw>, P::Error> {
         let bytes = text.as_bytes();
         loop {
             if self.expect == Expect::Done && self.single {
@@ -167,6 +178,7 @@ impl Lexer {
             }
             // Whitespace (the only place a line can end).
             while let Some(&b) = bytes.get(*pos) {
+                control.work(1)?;
                 match b {
                     b' ' | b'\t' | b'\r' => *pos += 1,
                     b'\n' => {
@@ -186,15 +198,19 @@ impl Lexer {
                 if self.expect == Expect::Done {
                     return Ok(Some(Raw::Eof));
                 }
-                return Err(self.error("the document ends early", at));
+                return Err(P::Error::from(self.error("the document ends early", at)));
             };
             match self.expect {
                 Expect::Done => {
-                    return Err(self.error("there is more after the document's value", at));
+                    return Err(P::Error::from(
+                        self.error("there is more after the document's value", at),
+                    ));
                 }
                 Expect::Colon => {
                     if b != b':' {
-                        return Err(self.error("a ':' should follow the key", at));
+                        return Err(P::Error::from(
+                            self.error("a ':' should follow the key", at),
+                        ));
                     }
                     *pos += 1;
                     self.expect = Expect::Value;
@@ -220,7 +236,9 @@ impl Lexer {
                         }
                         _ => {
                             let what = if object { "'}'" } else { "']'" };
-                            return Err(self.error(format!("a ',' or {what} should follow"), at));
+                            return Err(P::Error::from(
+                                self.error(format!("a ',' or {what} should follow"), at),
+                            ));
                         }
                     }
                 }
@@ -236,9 +254,11 @@ impl Lexer {
                 }
                 Expect::Key | Expect::KeyOrEnd => {
                     if b != b'"' {
-                        return Err(self.error("an object key should be a string", at));
+                        return Err(P::Error::from(
+                            self.error("an object key should be a string", at),
+                        ));
                     }
-                    let Some((end, escaped)) = self.string(bytes, at + 1, eof)? else {
+                    let Some((end, escaped)) = self.string(bytes, at + 1, eof, control)? else {
                         return Ok(None);
                     };
                     *pos = end + 1;
@@ -254,17 +274,17 @@ impl Lexer {
             // A value.
             let raw = match b {
                 b'{' => {
-                    self.open(true, at)?;
+                    self.open(true, at, control)?;
                     *pos += 1;
                     return Ok(Some(Raw::StartObject));
                 }
                 b'[' => {
-                    self.open(false, at)?;
+                    self.open(false, at, control)?;
                     *pos += 1;
                     return Ok(Some(Raw::StartArray));
                 }
                 b'"' => {
-                    let Some((end, escaped)) = self.string(bytes, at + 1, eof)? else {
+                    let Some((end, escaped)) = self.string(bytes, at + 1, eof, control)? else {
                         return Ok(None);
                     };
                     *pos = end + 1;
@@ -275,7 +295,7 @@ impl Lexer {
                     }
                 }
                 b'-' | b'0'..=b'9' => {
-                    let Some(end) = self.number(bytes, at, eof)? else {
+                    let Some(end) = self.number(bytes, at, eof, control)? else {
                         return Ok(None);
                     };
                     *pos = end;
@@ -292,12 +312,12 @@ impl Lexer {
                         return Ok(None);
                     }
                     if !rest.starts_with(word) {
-                        return Err(self.error("not a JSON value", at));
+                        return Err(P::Error::from(self.error("not a JSON value", at)));
                     }
                     *pos = at + word.len();
                     raw
                 }
-                _ => return Err(self.error("not a JSON value", at)),
+                _ => return Err(P::Error::from(self.error("not a JSON value", at))),
             };
             self.after_value();
             return Ok(Some(raw));
@@ -306,18 +326,21 @@ impl Lexer {
 
     /// The end of the string whose content starts at `start` (the closing quote's index),
     /// and whether it has escapes; `None` if the text ends first and more may come.
-    fn string(
+    fn string<P: Control>(
         &self,
         bytes: &[u8],
         start: usize,
         eof: bool,
-    ) -> Result<Option<(usize, bool)>, JsonSyntaxError> {
+        control: &mut P,
+    ) -> Result<Option<(usize, bool)>, P::Error> {
         let mut i = start;
         let mut escaped = false;
         loop {
-            let Some(j) = string_stop(bytes, i) else {
+            let Some(j) = string_stop_with(bytes, i, control)? else {
                 return if eof {
-                    Err(self.error("a string isn't closed", start - 1))
+                    Err(P::Error::from(
+                        self.error("a string isn't closed", start - 1),
+                    ))
                 } else {
                     Ok(None)
                 };
@@ -326,13 +349,18 @@ impl Lexer {
                 b'"' => return Ok(Some((j, escaped))),
                 b'\\' => {}
                 _ => {
-                    return Err(self.error("a control character in a string must be escaped", j));
+                    return Err(P::Error::from(
+                        self.error("a control character in a string must be escaped", j),
+                    ));
                 }
             }
+            control.work(6)?;
             escaped = true;
             let Some(&e) = bytes.get(j + 1) else {
                 return if eof {
-                    Err(self.error("a string isn't closed", start - 1))
+                    Err(P::Error::from(
+                        self.error("a string isn't closed", start - 1),
+                    ))
                 } else {
                     Ok(None)
                 };
@@ -342,49 +370,55 @@ impl Lexer {
                 b'u' => {
                     let Some(hex) = bytes.get(j + 2..j + 6) else {
                         return if eof {
-                            Err(self.error("a \\u escape needs four hexadecimal digits", j))
+                            Err(P::Error::from(
+                                self.error("a \\u escape needs four hexadecimal digits", j),
+                            ))
                         } else {
                             Ok(None)
                         };
                     };
                     if !hex.iter().all(u8::is_ascii_hexdigit) {
-                        return Err(self.error("a \\u escape needs four hexadecimal digits", j));
+                        return Err(P::Error::from(
+                            self.error("a \\u escape needs four hexadecimal digits", j),
+                        ));
                     }
                     j + 6
                 }
-                _ => return Err(self.error("not a JSON escape sequence", j)),
+                _ => return Err(P::Error::from(self.error("not a JSON escape sequence", j))),
             };
         }
     }
 
     /// The end of the number starting at `start`; `None` if the text ends where the
     /// number could go on and more may come.
-    fn number(
+    fn number<P: Control>(
         &self,
         bytes: &[u8],
         start: usize,
         eof: bool,
-    ) -> Result<Option<usize>, JsonSyntaxError> {
-        let digits = |mut i: usize| {
+        control: &mut P,
+    ) -> Result<Option<usize>, P::Error> {
+        let mut digits = |mut i: usize| -> Result<usize, P::Error> {
             while bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                control.work(1)?;
                 i += 1;
             }
-            i
+            Ok(i)
         };
-        let bad = || Err(self.error("not a JSON number", start));
+        let bad = || Err(P::Error::from(self.error("not a JSON number", start)));
         let mut i = start;
         if bytes[i] == b'-' {
             i += 1;
         }
         match bytes.get(i) {
             Some(b'0') => i += 1,
-            Some(b'1'..=b'9') => i = digits(i + 1),
+            Some(b'1'..=b'9') => i = digits(i + 1)?,
             Some(_) => return bad(),
             None if eof => return bad(),
             None => return Ok(None),
         }
         if bytes.get(i) == Some(&b'.') {
-            let end = digits(i + 1);
+            let end = digits(i + 1)?;
             if end == i + 1 {
                 return if end == bytes.len() && !eof {
                     Ok(None)
@@ -399,7 +433,7 @@ impl Lexer {
             if matches!(bytes.get(i), Some(b'+' | b'-')) {
                 i += 1;
             }
-            let end = digits(i);
+            let end = digits(i)?;
             if end == i {
                 return if end == bytes.len() && !eof {
                     Ok(None)
@@ -416,18 +450,23 @@ impl Lexer {
     }
 
     /// The event for `raw`, its strings borrowed from `text` unless they have escapes.
-    fn event<'t>(&self, text: &'t str, raw: Raw) -> Result<JsonEvent<'t>, JsonSyntaxError> {
+    fn event<'t, P: Control>(
+        &self,
+        text: &'t str,
+        raw: Raw,
+        control: &mut P,
+    ) -> Result<JsonEvent<'t>, P::Error> {
         Ok(match raw {
             Raw::String {
                 start,
                 end,
                 escaped,
-            } => JsonEvent::String(self.decoded(text, start, end, escaped)?),
+            } => JsonEvent::String(self.decoded(text, start, end, escaped, control)?),
             Raw::Key {
                 start,
                 end,
                 escaped,
-            } => JsonEvent::ObjectKey(self.decoded(text, start, end, escaped)?),
+            } => JsonEvent::ObjectKey(self.decoded(text, start, end, escaped, control)?),
             Raw::Number { start, end } => JsonEvent::Number(Cow::Borrowed(&text[start..end])),
             Raw::Boolean(b) => JsonEvent::Boolean(b),
             Raw::Null => JsonEvent::Null,
@@ -439,19 +478,23 @@ impl Lexer {
         })
     }
 
-    fn decoded<'t>(
+    fn decoded<'t, P: Control>(
         &self,
         text: &'t str,
         start: usize,
         end: usize,
         escaped: bool,
-    ) -> Result<Cow<'t, str>, JsonSyntaxError> {
+        control: &mut P,
+    ) -> Result<Cow<'t, str>, P::Error> {
         let content = &text[start..end];
         if !escaped {
             return Ok(Cow::Borrowed(content));
         }
+        control.text(content.len())?;
         let mut out = String::with_capacity(content.len());
-        unescape(content, &mut out).map_err(|(message, i)| self.error(message, start + i))?;
+        unescape(content, &mut out, control, |message, i| {
+            P::Error::from(self.error(message, start + i))
+        })?;
         Ok(Cow::Owned(out))
     }
 }
@@ -461,34 +504,50 @@ impl Lexer {
 /// search costs more than it saves): per byte, a high bit where it equals `"` or `\` or is
 /// below 0x20. Borrows can set bits above a byte that matches, never below the first one,
 /// so the lowest bit is exact.
+#[cfg(test)]
 fn string_stop(bytes: &[u8], from: usize) -> Option<usize> {
+    string_stop_with(bytes, from, &mut Unchecked).expect("unchecked")
+}
+
+fn string_stop_with<P: Control>(
+    bytes: &[u8],
+    from: usize,
+    control: &mut P,
+) -> Result<Option<usize>, P::Error> {
     const ONES: u64 = u64::from_ne_bytes([1; 8]);
     const HIGH: u64 = ONES << 7;
     let zero_byte = |x: u64| x.wrapping_sub(ONES) & !x & HIGH;
     let mut i = from;
     while let Some(word) = bytes.get(i..i + 8) {
+        control.work(8)?;
         let x = u64::from_le_bytes(word.try_into().expect("eight bytes"));
         let stops = zero_byte(x ^ (ONES * u64::from(b'"')))
             | zero_byte(x ^ (ONES * u64::from(b'\\')))
             | (x.wrapping_sub(ONES * 0x20) & !x & HIGH);
         if stops != 0 {
-            return Some(i + (stops.trailing_zeros() / 8) as usize);
+            return Ok(Some(i + (stops.trailing_zeros() / 8) as usize));
         }
         i += 8;
     }
-    bytes[i..]
+    Ok(bytes[i..]
         .iter()
         .position(|&b| b == b'"' || b == b'\\' || b < 0x20)
-        .map(|k| i + k)
+        .map(|k| i + k))
 }
 
 /// Decodes the escapes of a string's content (already checked to be well formed but for
 /// surrogates); an error is a message and the offset in `content`.
-fn unescape(content: &str, out: &mut String) -> Result<(), (&'static str, usize)> {
+fn unescape<P: Control>(
+    content: &str,
+    out: &mut String,
+    control: &mut P,
+    fail: impl Fn(&'static str, usize) -> P::Error,
+) -> Result<(), P::Error> {
     let bytes = content.as_bytes();
     let mut i = 0;
-    while let Some(k) = memchr::memchr(b'\\', &bytes[i..]) {
-        out.push_str(&content[i..i + k]);
+    while let Some(k) = session::slash(&bytes[i..], control)? {
+        session::copy(&content[i..i + k], out, control)?;
+        control.work(12)?;
         let j = i + k;
         let simple = match bytes[j + 1] {
             b'"' => Some('"'),
@@ -512,23 +571,23 @@ fn unescape(content: &str, out: &mut String) -> Result<(), (&'static str, usize)
             0xD800..=0xDBFF => {
                 // A high surrogate: a low one must follow.
                 if bytes.get(i..i + 2) != Some(b"\\u") {
-                    return Err(("a lone surrogate in a \\u escape", j));
+                    return Err(fail("a lone surrogate in a \\u escape", j));
                 }
                 let low = bytes
                     .get(i + 2..i + 6)
                     .filter(|h| h.iter().all(u8::is_ascii_hexdigit));
                 let Some(low) = low.map(hex4).filter(|l| (0xDC00..=0xDFFF).contains(l)) else {
-                    return Err(("a lone surrogate in a \\u escape", j));
+                    return Err(fail("a lone surrogate in a \\u escape", j));
                 };
                 i += 6;
                 char::from_u32(0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00))
             }
-            0xDC00..=0xDFFF => return Err(("a lone surrogate in a \\u escape", j)),
+            0xDC00..=0xDFFF => return Err(fail("a lone surrogate in a \\u escape", j)),
             _ => char::from_u32(unit),
         };
-        out.push(c.ok_or(("not a character", j))?);
+        out.push(c.ok_or_else(|| fail("not a character", j))?);
     }
-    out.push_str(&content[i..]);
+    session::copy(&content[i..], out, control)?;
     Ok(())
 }
 
@@ -643,9 +702,9 @@ impl<'a> SliceJsonParser<'a> {
     pub fn next_event(&mut self) -> Result<JsonEvent<'a>, JsonSyntaxError> {
         let raw = self
             .lexer
-            .step(self.text, &mut self.pos, true)?
+            .step(self.text, &mut self.pos, true, &mut Unchecked)?
             .expect("no more text to wait for");
-        self.lexer.event(self.text, raw)
+        self.lexer.event(self.text, raw, &mut Unchecked)
     }
 
     /// An error at the start of the last event's token.
@@ -719,12 +778,15 @@ impl<R: Read> ReaderJsonParser<R> {
 
     pub fn next_event(&mut self) -> Result<JsonEvent<'_>, JsonParseError> {
         let raw = loop {
-            match self.lexer.step(&self.buffer, &mut self.pos, self.eof)? {
+            match self
+                .lexer
+                .step(&self.buffer, &mut self.pos, self.eof, &mut Unchecked)?
+            {
                 Some(raw) => break raw,
                 None => self.fill()?,
             }
         };
-        Ok(self.lexer.event(&self.buffer, raw)?)
+        Ok(self.lexer.event(&self.buffer, raw, &mut Unchecked)?)
     }
 
     /// The next value as a tree (owned); `None` as for [`SliceJsonParser::next_value`].
