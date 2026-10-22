@@ -31,7 +31,7 @@ use super::batch::{self, Schema};
 use super::delta::Interrupted;
 use super::eval::Poller;
 use super::ir::{Atom, Guard, Head, Rule, SharedListIndex, Term};
-use super::ir::{Triple, Violation};
+use super::ir::{Triple, Violations};
 use super::lists::ListVocabulary;
 
 /// The `owl:sameAs` classes of a closure: each term's representative, and each
@@ -635,7 +635,7 @@ pub struct RepresentativeClosure {
     pub facts: Vec<Triple>,
     pub classes: EqualityClasses,
     /// Violations over representatives, sorted.
-    pub violations: Vec<Violation>,
+    pub violations: Violations,
     pub diagnostics: Vec<super::lists::ListDiagnostic>,
     /// Rounds of the closure, and in how many of them classes merged.
     pub rounds: usize,

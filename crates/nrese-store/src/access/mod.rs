@@ -262,6 +262,7 @@ impl AccessView {
     /// The user as a requester of writes, for the store's write methods.
     pub fn requester(&self) -> crate::Requester {
         crate::Requester::new(self.read_scope(), crate::WriteScope::of(self.write.clone()))
+            .with_principal(self.origin.clone())
     }
 }
 

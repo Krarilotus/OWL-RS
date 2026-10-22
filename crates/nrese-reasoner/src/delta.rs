@@ -1,4 +1,4 @@
-//! The delta executor (reasoner-v2 design §4.2 and §5): keeps a materialisation current
+//! The delta executor (reasoner-v2 design Â§4.2 and Â§5): keeps a materialisation current
 //! under changes to the asserted facts, at a cost that follows the change, not the
 //! dataset. It reads the state through [`Base`] (the store's indexes) and returns the
 //! changes to the inferred facts.
@@ -17,7 +17,7 @@
 //!    ([`GroundProgram::derivable`], which finds the candidate rules by head).
 //! 3. **Insert.** Semi-naive evaluation seeded with the rederived and the inserted facts.
 //!    Rule instances created by new schema or list facts are evaluated once over all
-//!    facts. Transitive properties are closed per new edge `(a, b)` as predecessors(a) ×
+//!    facts. Transitive properties are closed per new edge `(a, b)` as predecessors(a) Ã—
 //!    successors(b) over the already closed relation, edge by edge, so a batch of edges
 //!    costs the pairs it adds rather than a recomputation.
 //!
@@ -40,13 +40,13 @@ use std::borrow::Cow;
 use hashbrown::HashSet;
 use rayon::prelude::*;
 
-use super::batch::{Equality, EqualityRule, Store, check, sorted};
+use super::batch::{Equality, EqualityRule, Store, check};
 use super::eval::{
     AllFacts, GroundProgram, Job, NEVER, RuleKey, Schema, Seg, Source, Stop, instantiate_head,
     rule_key, run_jobs, run_jobs_acyclic, transitive_predicate,
 };
 use super::ir::{Head, Rule};
-use super::ir::{Triple, Violation};
+use super::ir::{Triple, Violations};
 use super::lists::{ListVocabulary, instantiate};
 
 /// The materialised state: asserted facts after the change, and inferred facts before it.
@@ -128,7 +128,7 @@ pub struct Update {
     /// Facts to remove from the inferred stack.
     pub remove: Vec<Triple>,
     /// Consistency violations that involve a fact the change added.
-    pub violations: Vec<Violation>,
+    pub violations: Violations,
     /// List axioms the change left uninstantiable (malformed, cyclic, oversized) that
     /// weren't before.
     pub diagnostics: Vec<super::lists::ListDiagnostic>,
@@ -258,6 +258,24 @@ pub fn update_with<B: Base + ?Sized>(
     cache: Option<&GroundProgram>,
     stop: Stop<'_>,
     policy: policy::Policy,
+) -> Result<Update, Interrupted> {
+    let unlimited = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+    update_within(
+        base, inserted, deleted, rules, cache, stop, policy, &unlimited,
+    )
+}
+
+/// [`update_with`], its violations charged to `budget` ([`Violations`]).
+#[allow(clippy::too_many_arguments)]
+pub fn update_within<B: Base + ?Sized>(
+    base: &B,
+    inserted: &[Triple],
+    deleted: &[Triple],
+    rules: Rules<'_>,
+    cache: Option<&GroundProgram>,
+    stop: Stop<'_>,
+    policy: policy::Policy,
+    budget: &std::sync::Arc<nrese_exec::Budget>,
 ) -> Result<Update, Interrupted> {
     // The process's memory limit stops it too, whatever the caller polls; once either has
     // fired, the update stays stopped (an interrupted round is never taken as complete).
@@ -911,7 +929,7 @@ pub fn update_with<B: Base + ?Sized>(
         .into_iter()
         .filter(|&(c, _)| c < settled_consistency)
         .collect();
-    let mut found = HashSet::new();
+    let mut found = Violations::new(std::sync::Arc::clone(budget));
     check(
         &state,
         &program,
@@ -921,7 +939,8 @@ pub fn update_with<B: Base + ?Sized>(
         stop,
     );
     check_stop()?;
-    result.violations = sorted(found);
+    found.finish();
+    result.violations = found;
     lap(4, &mut result);
     result.diagnostics = program
         .list_diagnostics
@@ -951,7 +970,8 @@ pub fn introduced_violations<B: Base + ?Sized>(
     rules: Rules<'_>,
     cache: Option<&GroundProgram>,
     stop: Stop<'_>,
-) -> Result<Vec<Violation>, Interrupted> {
+    budget: &std::sync::Arc<nrese_exec::Budget>,
+) -> Result<Violations, Interrupted> {
     let latch = super::eval::Latched::new(|| stop() || super::eval::over_memory_limit());
     let stop: Stop<'_> = &|| latch.stopped();
     let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
@@ -998,7 +1018,7 @@ pub fn introduced_violations<B: Base + ?Sized>(
         .into_iter()
         .filter(|&(c, _)| c < settled_consistency)
         .collect();
-    let mut found = HashSet::new();
+    let mut found = Violations::new(std::sync::Arc::clone(budget));
     check(
         &state,
         &program,
@@ -1010,7 +1030,8 @@ pub fn introduced_violations<B: Base + ?Sized>(
     if stop() {
         return Err(Interrupted);
     }
-    Ok(sorted(found))
+    found.finish();
+    Ok(found)
 }
 
 /// The facts of `base` that mention one of `terms`, in any position: each through its

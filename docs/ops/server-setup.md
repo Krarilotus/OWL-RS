@@ -353,7 +353,7 @@ A data directory written by an earlier NRESE opens as it is: no migration step. 
 
 1. Stop the server, and keep a copy of the data directory (or an image backup) and the old binary.
 2. Install the new binary and start it with the same configuration. The first start brings each inferred stack in line with the new rules: a stack whose rules didn't change (the reasoning marker's fingerprint, `reasoning.state`) is kept; one whose rules did is rebuilt before the server reports ready, which takes about as long as reasoning after a bulk load. From `main` (d9a4b24) to v2, `owl2-ql` and `owl-horst` stacks are rebuilt; `rdfs`, `owl2-rl` and repositories with their own rules are kept.
-3. Check `/readyz` (`revision`, `quad_count`) and a few known queries against the old server's answers.
+3. Check `/dataset/info` (`revision`, `quad_count`; as an administrator) and a few known queries against the old server's answers.
 
 What changes on purpose:
 - **Answers through existentials under `owl2-ql`:** the QL rewriting is on by default there (`reasoner.ql_rewriting = "auto"`), so queries can find individuals that only an existential axiom makes match (`Employee ⊑ ∃worksFor`: an employee without a stated employer now works for something). `reasoner.ql_rewriting = "off"`, or a repository's own `ql_rewriting`, keeps the earlier answers. Under `owl2-rl` nothing changes.

@@ -14,6 +14,16 @@ pub struct ReasoningDiagnosticsResponse {
     /// axiom it couldn't use.
     pub last_materialisation: Option<MaterialisationView>,
     pub reject_diagnostics: RejectDiagnosticsBaseline,
+    /// Rejections of principals who may not read every graph, by principal (D-1: whether
+    /// such a commit is accepted tells whether it conflicts with data they can't read).
+    pub restricted_rejections: Vec<RestrictedRejectionsView>,
+}
+
+/// A principal's rejections ([`nrese_store::RestrictedRejections`]).
+#[derive(Debug, Serialize)]
+pub struct RestrictedRejectionsView {
+    pub principal: String,
+    pub rejections: u64,
 }
 
 /// An ontology axiom the reasoner couldn't use (`nrese_store::OntologyDiagnostic`).

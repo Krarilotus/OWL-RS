@@ -38,11 +38,13 @@ use crate::lists::ListVocabulary;
 use crate::unnamed::UnnamedVocabulary;
 
 pub use explain::{
-    InferenceStep, JUSTIFICATIONS_AT_MOST, JustificationAnswer, JustificationMode,
-    JustifiedStatement, explain_fact, explain_violation, justify_fact,
+    Explained, InferenceStep, JUSTIFICATIONS_AT_MOST, JustificationAnswer, JustificationMode,
+    JustifiedStatement, ProofScope, explain_fact, explain_violation, justify_fact,
 };
-pub use maintain::{EngineBase, Maintenance, maintain};
-pub use materialise::{Closure, equality_report_until, materialise, materialise_until};
+pub use maintain::{EngineBase, Maintenance, maintain, maintain_within};
+pub use materialise::{
+    Closure, equality_report_until, materialise, materialise_until, materialise_within,
+};
 
 /// A rule program compiled against the engine dictionary: its rules, list vocabulary and
 /// schema vocabulary as engine ids. Ids never change once interned, so it is built once.

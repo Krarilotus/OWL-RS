@@ -86,7 +86,12 @@ pub fn ontology_bytes(ontology: &Ontology) -> usize {
                 vec(sources, sources.capacity())
                     + sources
                         .iter()
-                        .map(|s| vec(&s.triples, s.triples.capacity()))
+                        .map(|s| {
+                            vec(&s.triples, s.triples.capacity())
+                                + s.elsewhere.as_ref().map_or(0, |e| {
+                                    size_of::<nrese_owl::Elsewhere>() + vec(&e.0, e.0.len())
+                                })
+                        })
                         .sum::<usize>()
             })
             .sum::<usize>();
