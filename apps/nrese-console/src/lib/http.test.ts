@@ -53,8 +53,9 @@ describe("completeness", () => {
       ["complete; regime=owl2-ql", "complete"],
       ['sound-only; regime=owl2-dl; reasons="dl: open"', "sound-only"],
       ["unsound; regime=owl2-dl", "unsound"],
+      ["not-certified", "not-certified"],
       // A status this client doesn't know is never taken for complete.
-      ["provisional", "unsound"],
+      ["provisional", "not-certified"],
     ] as const) {
       const response = await fetchText(answered(header), "", "/q");
       expect(response.completeness).toEqual({ status, header });

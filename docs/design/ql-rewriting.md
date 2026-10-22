@@ -266,6 +266,21 @@ Tree witnesses can be exponential in the query: k independent ones give 2^k bran
 
 ## 7. Completeness, reported with every answer
 
+**Ordinary restricted-visible publication.** When the public query/configuration gate
+enables QL rewriting and a graph-restricted reader sees global inferences
+(`inferred="visible"`), the ordinary response publishes the fixed header
+`NRESE-Completeness: not-certified`. It certifies neither soundness nor completeness;
+answers may be missing or incorrect. It carries no regime, reasons, counts or bounds.
+This holds even with an empty schema, for cache hits and pending reads. Internal QL
+execution and its actual assessment/cache dependencies stay unchanged; the ordinary
+store result withholds its raw QL detail after that internal use. Supported readers,
+unrestricted readers, DL, non-QL and asserted-only reads retain their existing contracts.
+EXPLAIN's independent diagnostic/visibility contract is unchanged.
+
+`Completeness::not_certified()` is canonical and absorbing under merge; its false
+`sound`/`complete` fields assert neither guarantee, not a proven wrong answer. The added
+public marker requires out-of-tree exhaustive Rust literals/destructuring to be updated.
+
 The rewriting is complete for OWL 2 QL. Over the RL closure, axioms outside QL can meet
 the anonymous individuals it reasons about: a transitive property or a chain links them to
 other individuals, a functional property, key or cardinality makes one equal to a named

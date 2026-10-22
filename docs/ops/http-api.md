@@ -29,6 +29,22 @@ rules and the rewriting's existentials entail, not every certain answer under OW
 ([semantics](../spec/reasoning-semantics.md)).
 The answers are never changed for it ([design](../design/ql-rewriting.md) §7).
 
+For graph-restricted `inferred="visible"` readers where the public query/configuration
+gate enables QL rewriting, ordinary committed and pending answers instead carry exactly
+`NRESE-Completeness: not-certified`, even with an empty TBox or cached answer. Neither
+soundness nor completeness is certified: answers may be missing or incorrect. No
+schema-derived regime, reason, bound or count is published. Actual global-visible QL
+execution is unchanged. This changes neither unrestricted/supported/DL/non-QL reads nor
+asserted-only header absence, and does not change EXPLAIN's separate visibility contract.
+The server explicitly exposes this header for permitted cross-origin requests.
+
+Completeness-aware clients must warn on `not-certified` and nonempty unknown tokens;
+`--require-complete` exits 3 (HTTP failures still exit 1). Older N16 clients conservatively
+display the token as `unsound` while retaining its raw value and warning. Strict
+third-party enums need the fourth token; clients predating N16 that ignore the header
+cannot provide this warning guarantee. This is a token extension, not a result-body or
+stored-schema migration.
+
 | Parameter | Meaning |
 |---|---|
 | `default-graph-uri`, `named-graph-uri` (repeatable) | The query's dataset; replaces its `FROM` clauses |
