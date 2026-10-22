@@ -612,3 +612,133 @@ async fn graph_store_and_rdf4j_follow_the_policy() -> Result<(), Box<dyn std::er
     assert_eq!(status, StatusCode::OK);
     Ok(())
 }
+
+/// Restricted-visible ordinary QL certification reveals no hidden schema; real HTTP emission.
+#[tokio::test]
+async fn ordinary_query_certification_is_independent_of_hidden_schema()
+-> Result<(), Box<dyn std::error::Error>> {
+    let policy = POLICY.replace("inferred = \"hidden\"", "inferred = \"visible\"");
+    let mut observations = Vec::new();
+    let mut certificates = Vec::new();
+    let mut bodies = Vec::new();
+    for hidden in [false, true] {
+        let app = app_in(&policy, ReasoningMode::Owl2Ql)?;
+        let schema = if hidden {
+            format!(
+                "GRAPH <{EX}g/secret> {{
+                   <{EX}A> <http://www.w3.org/2000/01/rdf-schema#subClassOf> _:r .
+                   _:r a <http://www.w3.org/2002/07/owl#Restriction> ;
+                     <http://www.w3.org/2002/07/owl#onProperty> <{EX}p> ;
+                     <http://www.w3.org/2002/07/owl#someValuesFrom> <{EX}B> .
+                   <{EX}p> a <http://www.w3.org/2002/07/owl#TransitiveProperty> . }}"
+            )
+        } else {
+            String::new()
+        };
+        assert_eq!(
+            update(
+                &app,
+                &["nrese.admin"],
+                &format!(
+                    "INSERT DATA {{ GRAPH <{EX}g/pub/a> {{ <{EX}s> <{EX}q> <{EX}o> }} {schema} }}"
+                ),
+            )
+            .await?,
+            StatusCode::NO_CONTENT
+        );
+        // `send` intentionally discards headers. Use its existing token/Request/oneshot
+        // construction inline here to retain every value from the actual HTTP owner.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/dataset/query")
+                    .method(Method::POST)
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", token(&["nrese.read", "analyst"])),
+                    )
+                    .header(
+                        "accept",
+                        "application/sparql-results+json, application/n-quads;q=0.9, */*;q=0.1",
+                    )
+                    .header("content-type", "application/sparql-query")
+                    .body(Body::from(format!("ASK {{ ?x <{EX}p> ?y }}")))?,
+            )
+            .await?;
+        let status = response.status();
+        let headers: Vec<_> = response
+            .headers()
+            .keys()
+            .map(|name| {
+                (
+                    name.as_str().to_owned(),
+                    response
+                        .headers()
+                        .get_all(name)
+                        .iter()
+                        .map(|value| value.as_bytes().to_vec())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let certificate: Vec<_> = response
+            .headers()
+            .get_all("nrese-completeness")
+            .iter()
+            .map(|value| value.as_bytes().to_vec())
+            .collect();
+        let readable: Vec<_> = response
+            .headers()
+            .get_all("nrese-completeness")
+            .iter()
+            .map(|value| value.to_str().map(str::to_owned))
+            .collect::<Result<_, _>>()?;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await?
+            .to_vec();
+        observations.push(serde_json::json!({
+            "hidden": hidden, "status": status.as_u16(), "headers_bytes": headers,
+            "nrese_completeness": readable, "body_bytes": body,
+            "body_utf8": std::str::from_utf8(&body)?,
+        }));
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body)?["boolean"],
+            false
+        );
+        bodies.push(body);
+        certificates.push(certificate);
+    }
+    let evidence = serde_json::to_vec_pretty(&observations)?;
+    println!("ORDINARY_PAIR={}", std::str::from_utf8(&evidence)?);
+    if let Some(out) = std::env::var_os("FLEET_OUT") {
+        std::fs::write(
+            std::path::Path::new(&out).join("ordinary-pair.json"),
+            evidence,
+        )?;
+    }
+    // Establish identical actual answer bytes before comparing metadata.
+    assert_eq!(
+        bodies[0], bodies[1],
+        "answer bodies differ; no metadata-only witness"
+    );
+    assert!(!certificates[0].is_empty() && !certificates[1].is_empty());
+    assert_eq!(
+        certificates[0], certificates[1],
+        "hidden schema changed ordinary certification"
+    );
+    assert_eq!(certificates[0], vec![b"not-certified".to_vec()]);
+    for world in &observations {
+        assert!(
+            world["headers_bytes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|header| {
+                    header[0] == "access-control-expose-headers"
+                        && header[1] == serde_json::json!([b"nrese-completeness".to_vec()])
+                })
+        );
+    }
+    Ok(())
+}

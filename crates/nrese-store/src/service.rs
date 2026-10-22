@@ -731,6 +731,8 @@ impl StoreService {
     /// ([`crate::dl`]; the answers are then completed before the first byte), else the
     /// OWL 2 QL rewriting's where it applies, else a ruleset closure's
     /// ([`Self::status_without_dl`]). One status, [`nrese_sparql::Completeness`].
+    /// Restricted visible QL reads publish `not-certified`, without the schema-derived
+    /// assessment used internally. Seeing global inferences does not expose the schema.
     pub fn run_query_reporting(
         &self,
         prepared: &PreparedQuery,
@@ -829,6 +831,9 @@ impl StoreService {
             return Ok((Some(detail), None));
         }
         let snapshot = self.read_snapshot_within(prepared.access(), &memory, cancellation)?;
+        let restricted_visible = prepared
+            .access()
+            .is_some_and(|a| a.inferred && !a.inferred_by_support);
         let ql = run_query(
             &snapshot,
             prepared,
@@ -841,11 +846,19 @@ impl StoreService {
                     .map(|ql| ql.completeness.clone())
                     .or_else(|| self.status_without_dl(prepared));
                 let context = format!("{status:?}");
-                report(status);
+                // Some QL report is guaranteed by public query/config eligibility,
+                // including an empty TBox. Never test hazards, rewrites or spent work.
+                report(if restricted_visible && ql.is_some() {
+                    Some(nrese_sparql::Completeness::not_certified())
+                } else {
+                    status
+                });
                 context
             },
         )?;
-        Ok((None, ql))
+        // Raw QL detail has finished its execution/cache use; do not return its schema
+        // counters/reasons beside the published certificate on an ordinary read.
+        Ok((None, ql.filter(|_| !restricted_visible)))
     }
 
     /// Outside `owl2-dl`, the status of answers that read a ruleset's closure (`None`
@@ -1199,6 +1212,9 @@ impl StoreService {
             .register(prepared.text(), prepared.origin(), cancellation);
         let scope = crate::ReadScope::of(prepared.access().cloned());
         let in_dl = self.dl_mode(prepared).is_some();
+        let restricted_visible = prepared
+            .access()
+            .is_some_and(|a| a.inferred && !a.inferred_by_support);
         let deletes = pending
             .ops
             .iter()
@@ -1238,7 +1254,11 @@ impl StoreService {
                         );
                     }
                     // A transaction's pending state: never answered from the cache.
-                    report(status);
+                    report(if restricted_visible && ql.is_some() {
+                        Some(nrese_sparql::Completeness::not_certified())
+                    } else {
+                        status
+                    });
                     String::new()
                 },
             )
