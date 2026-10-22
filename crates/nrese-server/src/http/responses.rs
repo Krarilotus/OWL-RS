@@ -14,6 +14,15 @@ pub struct StatusResponse {
     pub status: &'static str,
 }
 
+/// The unauthenticated probe's answer (`/readyz`): the status and what is degraded, nothing
+/// that follows the data (its counts are `/info`'s, for readers of every graph).
+#[derive(Debug, Serialize)]
+pub struct ProbeResponse {
+    /// As [`ReadyResponse::status`].
+    pub status: &'static str,
+    pub degraded: Vec<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ReadyResponse {
     /// `ready`, `starting`, or `quarantined` (inconsistent data under the configured
@@ -182,13 +191,7 @@ pub fn build_ready_response(state: &AppState) -> Result<ReadyResponse, ApiError>
 
     let consistency = state.store().consistency();
     Ok(ReadyResponse {
-        status: if !state.is_started() {
-            "starting"
-        } else if state.is_quarantined() {
-            "quarantined"
-        } else {
-            "ready"
-        },
+        status: status_of(state),
         consistency: consistency.as_str(),
         violations: match consistency {
             nrese_store::ConsistencyStatus::Inconsistent { violations } => Some(violations),
@@ -228,6 +231,47 @@ pub fn build_ready_response(state: &AppState) -> Result<ReadyResponse, ApiError>
             }),
         degraded: state.degraded(),
     })
+}
+
+/// `starting`, `quarantined` or `ready`.
+fn status_of(state: &AppState) -> &'static str {
+    if !state.is_started() {
+        "starting"
+    } else if state.is_quarantined() {
+        "quarantined"
+    } else {
+        "ready"
+    }
+}
+
+/// The probe's answer: the status and what is degraded alone.
+pub fn build_probe_response(state: &AppState) -> ProbeResponse {
+    ProbeResponse {
+        status: status_of(state),
+        degraded: state.degraded(),
+    }
+}
+
+/// [`build_ready_response`] for a reader who may not read every graph (`/info`, N12): without
+/// the store-wide quad and named-graph counts, the violations' count, or the DL reason and
+/// engine (the engine is chosen by the whole ontology), each of which follows data it can't
+/// read. The status words are the service's health, kept.
+pub fn build_scoped_ready_response(state: &AppState) -> Result<serde_json::Value, ApiError> {
+    let mut info = serde_json::to_value(build_ready_response(state)?)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if let Some(info) = info.as_object_mut() {
+        for key in ["quad_count", "named_graph_count", "violations"] {
+            info.remove(key);
+        }
+        if let Some(dl) = info
+            .get_mut("dl")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            dl.remove("reason");
+            dl.remove("engine");
+        }
+    }
+    Ok(info)
 }
 
 pub fn build_version_response(state: &AppState) -> VersionResponse {

@@ -53,10 +53,19 @@ async fn inconsistent_data_is_quarantined_but_readable_and_repairable()
     let ready = app.clone().oneshot(get("/readyz")).await?;
     assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = body_text(ready).await?;
-    assert!(
-        body.contains("\"quarantined\"") && body.contains("\"violations\":1"),
-        "{body}"
-    );
+    // Not ready, the probe still says only its status and what is degraded.
+    let probe: serde_json::Value = serde_json::from_str(&body)?;
+    let mut keys: Vec<&str> = probe
+        .as_object()
+        .ok_or("an object")?
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["degraded", "status"], "{body}");
+    assert_eq!(probe["status"], "quarantined", "{body}");
+    let info = body_text(app.clone().oneshot(get("/dataset/info")).await?).await?;
+    assert!(info.contains("\"violations\":1"), "{info}");
 
     let query = format!("/dataset/query?query=ASK%20%7B%20%3C{EX}x%3E%20%3Fp%20%3Fo%20%7D");
     let answer = app.clone().oneshot(get(&query)).await?;

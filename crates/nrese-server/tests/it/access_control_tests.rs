@@ -54,6 +54,10 @@ fn app() -> Result<axum::Router, Box<dyn std::error::Error>> {
 }
 
 fn app_with(policy: &str) -> Result<axum::Router, Box<dyn std::error::Error>> {
+    app_in(policy, ReasoningMode::Rdfs)
+}
+
+fn app_in(policy: &str, mode: ReasoningMode) -> Result<axum::Router, Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("access.toml");
     std::fs::write(&path, policy)?;
@@ -69,7 +73,7 @@ fn app_with(policy: &str) -> Result<axum::Router, Box<dyn std::error::Error>> {
         access: Some(Arc::new(nrese_server::access::load(&path)?)),
         ..PolicyConfig::default()
     };
-    test_app_with_settings(policy, ReasonerConfig::for_mode(ReasoningMode::Rdfs))
+    test_app_with_settings(policy, ReasonerConfig::for_mode(mode))
 }
 
 async fn send(
@@ -164,6 +168,186 @@ async fn seeded() -> Result<axum::Router, Box<dyn std::error::Error>> {
 }
 
 const GRAPHS: &str = "SELECT DISTINCT ?x WHERE { GRAPH ?x { ?s ?p ?o } }";
+
+/// N12 (research round 11): a restricted reader's EXPLAIN, the plan alone and the analysed
+/// run, is the same whatever a graph it can't read holds: no plan node, estimate or time,
+/// all of which follow every graph. Here the hidden graph adds 500 matches of the query's
+/// pattern and a join partner for each.
+#[tokio::test]
+async fn explain_gives_a_restricted_reader_nothing_that_follows_hidden_graphs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let explain = |hidden: usize| async move {
+        let app = seeded().await?;
+        let secret: String = (0..hidden)
+            .map(|i| format!("<{EX}h{i}> <{EX}p> <{EX}o{i}> . <{EX}o{i}> <{EX}q> {i} . "))
+            .collect();
+        let status = update(
+            &app,
+            &["nrese.admin"],
+            &format!("INSERT DATA {{ GRAPH <{EX}g/secret> {{ {secret} }} }}"),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let mut bodies = Vec::new();
+        for mode in ["plan", "true"] {
+            let (status, body) = send(
+                &app,
+                &["nrese.read", "analyst"],
+                Method::POST,
+                &format!("/dataset/query?explain={mode}"),
+                Some("application/sparql-query"),
+                &format!("SELECT ?s ?z WHERE {{ ?s <{EX}p> ?o . ?o <{EX}q> ?z }}"),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let report: serde_json::Value = serde_json::from_str(&body)?;
+            assert!(report.get("steps").is_none(), "{report}");
+            bodies.push(report);
+        }
+        Ok::<Vec<serde_json::Value>, Box<dyn std::error::Error>>(bodies)
+    };
+    assert_eq!(explain(500).await?, explain(0).await?);
+    Ok(())
+}
+
+/// N12 (Sol r3, F1): the same under OWL 2 QL rewriting for a reader who sees every inference
+/// (`inferred = "visible"`, so the whole schema is compiled): an existential stated only in a
+/// graph it can't read changes the rewriting, its report and its completeness, not what the
+/// reader's EXPLAIN says. No instance of `A` anywhere, so the answers are the same.
+#[tokio::test]
+async fn explain_gives_a_restricted_reader_nothing_that_follows_hidden_schema()
+-> Result<(), Box<dyn std::error::Error>> {
+    let policy = POLICY.replace("inferred = \"hidden\"", "inferred = \"visible\"");
+    let explain = |hidden: bool| {
+        let policy = policy.clone();
+        async move {
+            let app = app_in(&policy, ReasoningMode::Owl2Ql)?;
+            let schema = match hidden {
+                true => format!(
+                    "GRAPH <{EX}g/secret> {{ <{EX}A> <http://www.w3.org/2000/01/rdf-schema#subClassOf> _:r .
+                       _:r a <http://www.w3.org/2002/07/owl#Restriction> ;
+                         <http://www.w3.org/2002/07/owl#onProperty> <{EX}p> ;
+                         <http://www.w3.org/2002/07/owl#someValuesFrom> <{EX}B> . }}"
+                ),
+                false => String::new(),
+            };
+            // The same public statement in both worlds; the schema differs only in secret.
+            let status = update(
+                &app,
+                &["nrese.admin"],
+                &format!(
+                    "INSERT DATA {{ GRAPH <{EX}g/pub/a> {{ <{EX}s> <{EX}q> <{EX}o> }} {schema} }}"
+                ),
+            )
+            .await?;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+            let mut bodies = Vec::new();
+            for mode in ["plan", "true"] {
+                let (status, body) = send(
+                    &app,
+                    &["nrese.read", "analyst"],
+                    Method::POST,
+                    &format!("/dataset/query?explain={mode}"),
+                    Some("application/sparql-query"),
+                    &format!("ASK {{ ?x <{EX}p> ?y }}"),
+                )
+                .await?;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                bodies.push(serde_json::from_str::<serde_json::Value>(&body)?);
+            }
+            Ok::<Vec<serde_json::Value>, Box<dyn std::error::Error>>(bodies)
+        }
+    };
+    assert_eq!(explain(true).await?, explain(false).await?);
+    Ok(())
+}
+
+/// N12 (Sol r2, R2-F1): under `owl2-dl`, a restricted reader's `/info` keeps the DL
+/// consistency word but neither its reason nor the engine that decided (chosen by the whole
+/// ontology); a reader of every graph gets both.
+#[tokio::test]
+async fn info_gives_a_restricted_reader_no_dl_engine_or_reason()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = app_in(POLICY, ReasoningMode::Owl2Dl)?;
+    let status = update(
+        &app,
+        &["nrese.admin"],
+        &format!(
+            "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {{ <{EX}a> a <{EX}C> . <{EX}C> rdfs:subClassOf <{EX}D> .
+                            GRAPH <{EX}g/secret> {{ <{EX}s1> a <{EX}C> }} }}"
+        ),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let info = |roles: &'static [&'static str]| {
+        let app = app.clone();
+        async move {
+            let (status, body) = send(&app, roles, Method::GET, "/dataset/info", None, "").await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            Ok::<serde_json::Value, Box<dyn std::error::Error>>(serde_json::from_str(&body)?)
+        }
+    };
+    let restricted = info(&["nrese.read", "analyst"]).await?;
+    let dl = restricted["dl"].as_object().ok_or("a dl status")?;
+    assert!(dl.contains_key("consistency"), "{restricted}");
+    assert!(
+        !dl.contains_key("engine") && !dl.contains_key("reason"),
+        "{restricted}"
+    );
+    let all = info(&["nrese.admin"]).await?;
+    assert!(all["dl"]["engine"].is_string(), "{all}");
+    Ok(())
+}
+
+/// N12 (the orchestrator's decision on `/readyz`): the unauthenticated probe answers its
+/// status and what is degraded alone, with no store-wide count; the counts are `/info`'s,
+/// for an authenticated reader of every graph.
+#[tokio::test]
+async fn the_unauthenticated_probe_carries_no_counts() -> Result<(), Box<dyn std::error::Error>> {
+    let app = seeded().await?;
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri("/readyz").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let probe: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    let mut keys: Vec<&str> = probe
+        .as_object()
+        .ok_or("an object")?
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["degraded", "status"], "{probe}");
+    assert_eq!(probe["status"], "ready");
+    Ok(())
+}
+
+/// N12 (attack review r1, P2-8): `/info` gives a reader who may not read every graph none
+/// of the store-wide counts, which follow graphs it can't read; a reader of every graph
+/// gets them.
+#[tokio::test]
+async fn info_gives_a_restricted_reader_no_store_wide_counts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = seeded().await?;
+    let info = |roles: &'static [&'static str]| {
+        let app = app.clone();
+        async move {
+            let (status, body) = send(&app, roles, Method::GET, "/dataset/info", None, "").await?;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            Ok::<serde_json::Value, Box<dyn std::error::Error>>(serde_json::from_str(&body)?)
+        }
+    };
+    let restricted = info(&["nrese.read", "analyst"]).await?;
+    for key in ["quad_count", "named_graph_count", "violations"] {
+        assert!(restricted.get(key).is_none(), "{key}: {restricted}");
+    }
+    assert!(restricted.get("status").is_some(), "{restricted}");
+    let all = info(&["nrese.admin"]).await?;
+    assert!(all["quad_count"].as_u64().is_some_and(|n| n > 0), "{all}");
+    Ok(())
+}
 
 #[tokio::test]
 async fn each_role_queries_its_own_dataset() -> Result<(), Box<dyn std::error::Error>> {

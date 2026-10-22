@@ -99,6 +99,17 @@ Deferred to v3 or later: GPU, distribution, worst-case-optimal joins inside rule
 - [ ] **Safety of the new reasoning paths:** (the QL rewriting's part done, 7 October, `ql/safety`: every rewriting path ends in a status at a budget, one work budget per query, the data check's and the printer's bounds; restricted readers get neither the data check nor another graph's schema under a negation; each shown by a test that fails without it, docs/design/ql-rewriting.md §1 and §5) every DL and rewriting path has a budget; access control applies to inferred and rewritten answers (no derivation from graphs the user can't read); read replicas give the same DL answers and completeness status as the primary.
 - [ ] **DL scope:** every W3C OWL 2 DL case decided, or documented as over budget with its cause. No deadlines (owner, 6 October): progress as fast as possible without compromising quality.
 
+### Approved exceptions (owner)
+
+- **D-1, the accept/reject bit of global gates** (owner, 20 October 2026). Scope: under the
+  global consistency gates (RL, DL) and the SHACL gate, whether a restricted principal's commit
+  is accepted reveals whether it conflicts with data it can't read, one bit per commit,
+  testable by guessing. Everything else of a restricted rejection is one fixed reason (N12).
+  Conditions: documented ([reasoning-semantics.md](../spec/reasoning-semantics.md), commit
+  rejection; [http-api.md](../ops/http-api.md), errors and metrics), and counted per principal
+  (`nrese_restricted_rejections_total`, the operator reasoning diagnostics). The fix: per-graph
+  reasoning scopes in v2.0 (winning plan item 18).
+
 **Timing:** the ESWC 2027 paper (deadline expected early December) needs v2's Draco runs; that informs priorities, not the quality bar.
 
 After the merge: the concise README and docs, the major refactoring (Miri over the unsafe

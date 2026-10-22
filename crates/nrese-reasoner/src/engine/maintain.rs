@@ -12,7 +12,7 @@ use rayon::prelude::*;
 use super::{Program, encode, pattern, storable, triple};
 use crate::delta::{self, Base, MemoryBase};
 use crate::eval::GroundProgram;
-use crate::ir::{Triple, Violation};
+use crate::ir::{Triple, Violations};
 use crate::lists::ListDiagnostic;
 
 /// A transaction's state as the delta executor reads it: the committed indexes (asserted
@@ -114,7 +114,7 @@ impl Base for EngineBase<'_> {
 #[derive(Debug, Default)]
 pub struct Maintenance {
     /// The consistency violations the change introduced.
-    pub violations: Vec<Violation>,
+    pub violations: Violations,
     pub inserted: u64,
     pub removed: u64,
     pub rounds: usize,
@@ -138,6 +138,19 @@ pub fn maintain(
     tx: &mut Transaction<'_>,
     stop: crate::eval::Stop<'_>,
 ) -> Result<Maintenance, delta::Interrupted> {
+    let unlimited = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+    maintain_within(program, ground, tx, stop, &unlimited)
+}
+
+/// [`maintain`], the violations it finds charged to `budget` (the commit's operation:
+/// [`Violations`]).
+pub fn maintain_within(
+    program: &Program,
+    ground: Option<&GroundProgram>,
+    tx: &mut Transaction<'_>,
+    stop: crate::eval::Stop<'_>,
+    budget: &std::sync::Arc<nrese_exec::Budget>,
+) -> Result<Maintenance, delta::Interrupted> {
     // Axioms the state lacks (a store that never rematerialised): added with this commit.
     let mut missing_axioms: Vec<Triple> = Vec::new();
     // Unnamed classes left out: as the commit leaves them; one it makes consumable
@@ -157,10 +170,11 @@ pub fn maintain(
     // Revived memberships must participate in the delta executor's introduced-only
     // consistency checks. Keep the batch result for installation below: no second run.
     let mut rebuilt = if revived {
-        Some(super::materialise_until(
+        Some(super::materialise_within(
             program,
             &tx.pending_snapshot(),
             stop,
+            budget,
         )?)
     } else {
         None
@@ -187,7 +201,7 @@ pub fn maintain(
         && tx.deleted().next().is_none()
         && tx.inserted().next().is_some();
     if first_load {
-        let closure = super::materialise_until(program, &tx.pending_snapshot(), stop)?;
+        let closure = super::materialise_within(program, &tx.pending_snapshot(), stop, budget)?;
         if closure.unstorable.is_empty() {
             rebuilt = Some(closure);
         } else {
@@ -241,7 +255,10 @@ pub fn maintain(
             split_rebuilds: program.stores_representatives(),
         };
         if inserted.is_empty() && deleted.is_empty() {
-            delta::Update::default()
+            delta::Update {
+                violations: Violations::new(std::sync::Arc::clone(budget)),
+                ..delta::Update::default()
+            }
         } else if let Some(closure) = rebuilt.as_ref().filter(|_| first_load) {
             // The new inferred facts, as the delta executor reports them (its `insert`): every
             // one storable (above), so the state tells which it held before.
@@ -256,7 +273,7 @@ pub fn maintain(
                 .collect();
             delta::Update {
                 violations: delta::introduced_violations(
-                    &base, &inserted, &derived, rules, ground, stop,
+                    &base, &inserted, &derived, rules, ground, stop, budget,
                 )?,
                 insert: derived,
                 policy: delta::policy::Counts {
@@ -266,16 +283,20 @@ pub fn maintain(
                 ..Default::default()
             }
         } else {
-            delta::update_with(&base, &inserted, &deleted, rules, ground, stop, policy)?
+            delta::update_within(
+                &base, &inserted, &deleted, rules, ground, stop, policy, budget,
+            )?
         }
     };
     let mut update = update;
-    update.violations.extend(super::datatypes::violations(
+    super::datatypes::violations(
         &update.insert,
         program.rdf_type,
         program.same_as,
         &|id| tx.decode(TermId::from_raw(id)),
-    ));
+        &mut update.violations,
+    );
+    update.violations.finish();
     let (mut inserted, mut removed) = (0, 0);
     // Over representatives, a change that may split a class is rebuilt (B3a: the
     // translation can't follow it; the representative view for the delta executor is B3b).
@@ -308,7 +329,7 @@ pub fn maintain(
     if rebuild {
         let mut closure = match rebuilt.take() {
             Some(closure) => closure,
-            None => super::materialise_until(program, &tx.pending_snapshot(), stop)?,
+            None => super::materialise_within(program, &tx.pending_snapshot(), stop, budget)?,
         };
         // An interruption drops the transaction, these changes with it.
         if stop() {

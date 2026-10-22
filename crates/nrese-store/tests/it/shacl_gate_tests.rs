@@ -90,6 +90,52 @@ fn enforce_rejects_what_a_commit_introduces_and_changes_nothing() {
     assert!(holds(&pipeline, "ex:b ex:name \"B\""));
 }
 
+/// N12 (the SHACL first focus; Sol r1, F3): a committer of `open` whose change breaks nodes
+/// of a graph it can't read is rejected with the same detail however many there are, and it
+/// names none of them (the first focus named a secret node, the count told how many).
+#[test]
+fn a_restricted_rejection_is_the_same_whatever_secret_graphs_hold() {
+    use nrese_sparql::GraphAccess;
+    use nrese_store::{ReadScope, Requester, WriteScope};
+    let detail = |friends: usize| {
+        let pipeline = pipeline(ShaclGate::Enforce(GateSeverity::Violation));
+        add_shapes(&pipeline);
+        let secret: String = (0..friends)
+            .map(|i| format!("ex:hiddenFriend{i} a ex:Person ; ex:name \"H\" ; ex:friend ex:b . "))
+            .collect();
+        update(
+            &pipeline,
+            &format!(
+                "INSERT DATA {{ GRAPH ex:secret {{ {secret} }}
+                               GRAPH ex:open {{ ex:b a ex:Person ; ex:name \"B\" }} }}"
+            ),
+        )
+        .expect("valid");
+        let access = Arc::new(GraphAccess {
+            graphs: vec!["http://example.com/open".to_owned()],
+            ..GraphAccess::default()
+        });
+        let committer = Requester::new(
+            ReadScope::Graphs(Arc::clone(&access)),
+            WriteScope::Graphs(access),
+        );
+        let rejected = pipeline.apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "{PREFIXES}DELETE DATA {{ GRAPH ex:open {{ ex:b a ex:Person }} }}"
+            ))),
+            &committer,
+            &MutationTicket::new(),
+        );
+        let Err(MutationError::Rejected(reject)) = rejected else {
+            panic!("expected a rejection, got {rejected:?}");
+        };
+        reject.detail
+    };
+    let one = detail(1);
+    assert!(!one.contains("hiddenFriend"), "{one}");
+    assert_eq!(detail(2), one);
+}
+
 #[test]
 fn data_that_was_invalid_before_does_not_block_other_commits() {
     let pipeline = pipeline(ShaclGate::Enforce(GateSeverity::Violation));
