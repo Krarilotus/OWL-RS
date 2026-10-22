@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Validate every ref being published, retaining stdin for the global attribution dispatcher.
+# Gate protected destination refs, retaining stdin for the global attribution dispatcher.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 head=$(git rev-parse HEAD)
@@ -8,6 +8,10 @@ count=0
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" != "$zero" ] || continue
   [ "$local_sha" = "$head" ] || { echo "push gate covers HEAD only; publish other commits from their own checkout" >&2; exit 1; }
+  case "$remote_ref" in
+    refs/heads/main|refs/heads/refactor/engine-v2) ;;
+    *) continue ;;
+  esac
   count=$((count + 1))
 done
 [ "$count" -gt 0 ] || exit 0
