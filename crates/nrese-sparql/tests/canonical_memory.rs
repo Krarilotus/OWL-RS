@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use nrese_engine::{EncodedTriple, Engine, EngineConfig};
-use nrese_exec::{Envelope, heap};
+use nrese_exec::{Budget, Envelope, heap};
 use nrese_rdf::{GraphName, NamedNode, Quad, Variable};
 use nrese_sparql::{
     CancellationToken, QueryOptions, QueryResults, Resources, ServiceClient, ServiceResults,
@@ -33,13 +33,20 @@ impl ServiceClient for Endpoint {
         &self,
         _endpoint: &str,
         query: &str,
-        _cancellation: Option<&CancellationToken>,
-    ) -> Result<ServiceResults, Box<dyn std::error::Error + Send + Sync>> {
+        budget: &Arc<Budget>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ServiceResults, nrese_sparql::QueryEvaluationError> {
+        if let Some(token) = cancellation {
+            token.check()?;
+        }
         *self.0.lock().unwrap() += query.matches(" ) (").count() + query.matches("VALUES").count();
-        Ok(ServiceResults {
-            variables: vec![Variable::new_unchecked("x"), Variable::new_unchecked("y")],
-            rows: vec![],
-        })
+        if let Some(token) = cancellation {
+            token.check()?;
+        }
+        Ok(ServiceResults::new(
+            vec![Variable::new_unchecked("x"), Variable::new_unchecked("y")],
+            budget,
+        ))
     }
 }
 

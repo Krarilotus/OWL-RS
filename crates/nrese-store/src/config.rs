@@ -199,6 +199,9 @@ pub struct FederationConfig {
     pub timeout_ms: u64,
     /// Rows one request may return.
     pub max_rows: usize,
+    /// Bytes one response may return. None or zero adds no byte-policy cap;
+    /// the actual invocation memory budget still applies.
+    pub max_response_bytes: Option<usize>,
 }
 
 impl Default for FederationConfig {
@@ -207,6 +210,7 @@ impl Default for FederationConfig {
             allow: Vec::new(),
             timeout_ms: 30_000,
             max_rows: 1_000_000,
+            max_response_bytes: None,
         }
     }
 }

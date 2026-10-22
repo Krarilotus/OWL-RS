@@ -5,8 +5,8 @@
 //! binary of its own.
 
 use nrese_engine::{Engine, EngineConfig, VocabularyEncoding};
-use nrese_exec::{Budget, measure};
-use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
+use nrese_exec::{Budget, Reservation, measure};
+use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term, Triple};
 
 #[global_allocator]
 static ALLOCATOR: measure::Measured<std::alloc::System> = measure::Measured(std::alloc::System);
@@ -58,4 +58,82 @@ fn a_read_charged_across_a_checkpoint_holds_no_more_than_its_charge() {
     });
     assert_eq!(decoded, Ok(Some(literal)));
     assert_eq!(excess, 0, "a decode held {excess} bytes beyond its charge");
+}
+
+/// The complete operation uses the held snapshot's shared dictionary after a compressed
+/// rebase, including recursively decoded objects. Both temporary realloc overlap and
+/// retained output count at every allocation/free event, not just at function return.
+#[test]
+fn complete_decode_compressed_snapshot_preserves_values_and_existing_reservation() {
+    if !measure::alone() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(
+        dir.path(),
+        EngineConfig {
+            background_maintenance: false,
+            vocabulary: VocabularyEncoding::Fsst,
+            ..EngineConfig::default()
+        },
+    )
+    .unwrap();
+    let atomic: Term =
+        Literal::new_simple_literal("compressed long lexical value ".repeat(4096)).into();
+    let mut triple = atomic.clone();
+    for _ in 0..4 {
+        triple = Triple::new(
+            NamedNode::new_unchecked("urn:s"),
+            NamedNode::new_unchecked("urn:p"),
+            triple,
+        )
+        .into();
+    }
+    let mut tx = engine.transaction();
+    let ids = [tx.intern(atomic.as_ref()), tx.intern(triple.as_ref())];
+    tx.insert(
+        Quad::new(
+            NamedNode::new_unchecked("urn:s"),
+            NamedNode::new_unchecked("urn:p"),
+            triple.clone(),
+            GraphName::DefaultGraph,
+        )
+        .as_ref(),
+    );
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    engine.checkpoint().unwrap();
+    for (id, expected) in ids.into_iter().zip([atomic, triple]) {
+        assert_eq!(snapshot.decode(id).as_ref(), Some(&expected));
+        let budget = Budget::unlimited();
+        let ((term, prior, held), excess) = measure::measure_within(&budget, || {
+            let mut held = Reservation::new(&budget);
+            held.charge(37).unwrap();
+            let prior = vec![0_u8; 37];
+            let term = snapshot.decode_within(id, &mut held).unwrap().unwrap();
+            (term, prior, held)
+        });
+        assert_eq!(term, expected);
+        assert_eq!(excess, 0, "compressed scratch/retained overlap");
+        assert_eq!(held.bytes(), 37 + term.heap_bytes());
+        println!(
+            "compressed_decode retained={} budget_peak={}",
+            term.heap_bytes(),
+            budget.peak()
+        );
+        drop((term, prior, held));
+        assert_eq!(budget.used(), 0);
+
+        let budget = Budget::new(37);
+        let ((result, held), allocated) = measure::measure(|| {
+            let mut held = Reservation::new(&budget);
+            held.charge(37).unwrap();
+            (snapshot.decode_within(id, &mut held), held)
+        });
+        assert!(result.is_err());
+        assert_eq!(allocated, 0);
+        assert_eq!(held.bytes(), 37);
+        drop(held);
+        assert_eq!(budget.used(), 0);
+    }
 }
