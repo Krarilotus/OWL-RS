@@ -13,7 +13,7 @@ export type Problem = {
 /** Whether a query's answers are sound and complete, as the server's `NRESE-Completeness`
  * header says: its status, and the header as sent (regime, bounds and reasons included). */
 export type Completeness = {
-  status: "complete" | "sound-only" | "unsound";
+  status: "complete" | "sound-only" | "unsound" | "not-certified";
   header: string;
 };
 
@@ -28,14 +28,15 @@ export type ResponseEnvelope = {
 };
 
 /** The completeness a response's `NRESE-Completeness` header states; a status this client
- * doesn't know reads as `unsound`, so nothing unknown passes as complete. */
+ * doesn't know reads as `not-certified`, so nothing unknown passes as complete. */
 export function readCompleteness(response: Response): Completeness | undefined {
   const header = response.headers?.get?.("nrese-completeness");
   if (!header) {
     return undefined;
   }
   const first = header.split(";", 1)[0].trim();
-  const status = first === "complete" || first === "sound-only" ? first : "unsound";
+  const status = first === "complete" || first === "sound-only" || first === "unsound"
+    ? first : "not-certified";
   return { status, header };
 }
 

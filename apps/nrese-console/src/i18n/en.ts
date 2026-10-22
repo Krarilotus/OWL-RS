@@ -76,6 +76,7 @@ export const en: AppStrings = {
   namedGraphLabel: "Named graph IRI",
   noOutput: "(no response yet)",
   incompleteAnswer: "Not shown to be complete: answers may be missing",
+  uncertifiedAnswer: "Soundness and completeness are not certified: answers may be missing or incorrect",
   searchTitle: "Find resources",
   searchHint: "Resources whose labels or names have words beginning with what you type.",
   searchPlaceholder: "albert ein",

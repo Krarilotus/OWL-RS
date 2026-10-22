@@ -8,12 +8,15 @@
 use std::fmt;
 
 /// A query's completeness. The default: sound and complete, nothing to say.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Completeness {
     /// Every answer is certain.
     pub sound: bool,
     /// Every certain answer is there.
     pub complete: bool,
+    /// Certification is withheld: neither guarantee is asserted. Published values are
+    /// canonical (`not_certified`); this is not an assessment that answers are wrong.
+    pub certification_withheld: bool,
     /// Why not, each from its source.
     pub reasons: Vec<Reason>,
     /// The bounds' counts, where a source knows them.
@@ -21,6 +24,23 @@ pub struct Completeness {
     /// What `complete` refers to: the semantics whose certain answers the answers are
     /// measured against, set by whoever produces the status.
     pub regime: Option<Regime>,
+}
+
+// Raw assessments form part of the store's output-cache context. Keep their existing
+// representation, without adding a field or allocation on the ordinary execution path.
+impl fmt::Debug for Completeness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut out = f.debug_struct("Completeness");
+        out.field("sound", &self.sound)
+            .field("complete", &self.complete)
+            .field("reasons", &self.reasons)
+            .field("bounds", &self.bounds)
+            .field("regime", &self.regime);
+        if self.certification_withheld {
+            out.field("certification_withheld", &true);
+        }
+        out.finish()
+    }
 }
 
 /// The semantics a status is relative to. `complete` under one is no claim under another:
@@ -95,6 +115,7 @@ impl Default for Completeness {
         Self {
             sound: true,
             complete: true,
+            certification_withheld: false,
             reasons: Vec::new(),
             bounds: None,
             regime: None,
@@ -106,6 +127,19 @@ impl Default for Completeness {
 const SHOWN: usize = 5;
 
 impl Completeness {
+    /// No soundness/completeness guarantee and no schema-derived detail. Publication
+    /// uses this independently of the actual assessment kept by query execution.
+    pub fn not_certified() -> Self {
+        Self {
+            sound: false,
+            complete: false,
+            certification_withheld: true,
+            reasons: Vec::new(),
+            bounds: None,
+            regime: None,
+        }
+    }
+
     /// Sound and complete under `regime`, nothing more to say.
     pub fn under(regime: Regime) -> Self {
         Self {
@@ -114,8 +148,11 @@ impl Completeness {
         }
     }
 
-    /// `complete`, `sound-only` or `unsound`.
+    /// `complete`, `sound-only`, `unsound` or `not-certified`.
     pub fn as_str(&self) -> &'static str {
+        if self.certification_withheld {
+            return "not-certified";
+        }
         match (self.sound, self.complete) {
             (true, true) => "complete",
             (true, false) => "sound-only",
@@ -125,6 +162,10 @@ impl Completeness {
 
     /// Notes that some certain answers may be missing, and why (each reason once).
     pub fn incomplete(&mut self, source: &'static str, text: String) {
+        if self.certification_withheld {
+            *self = Self::not_certified();
+            return;
+        }
         self.complete = false;
         if !self
             .reasons
@@ -144,6 +185,10 @@ impl Completeness {
     /// Both statuses at once: what either lacks, the other's reasons too; the regime is
     /// the first one set.
     pub fn merge(&mut self, other: Completeness) {
+        if self.certification_withheld || other.certification_withheld {
+            *self = Self::not_certified();
+            return;
+        }
         self.sound &= other.sound;
         self.complete &= other.complete;
         for r in other.reasons {
@@ -161,6 +206,9 @@ impl Completeness {
     /// `sound-only; regime=owl2-rl; reasons="ql: …; ql: …"`, with
     /// `; lower=…; upper=…; unresolved=…` where bounds are known.
     pub fn header(&self) -> String {
+        if self.certification_withheld {
+            return "not-certified".to_owned();
+        }
         let mut out = self.as_str().to_owned();
         if let Some(regime) = self.regime {
             out.push_str("; regime=");
@@ -235,5 +283,18 @@ mod tests {
             "deleted statements' inferences remain".to_owned(),
         );
         assert!(c.header().starts_with("unsound; regime=owl2-rl;"));
+        // Withholding is an absorbing absence of guarantees, never an assessment of
+        // unsoundness or a container for another source's private detail.
+        let withheld = Completeness::not_certified();
+        assert!(!withheld.sound && !withheld.complete);
+        assert_eq!(withheld.header(), "not-certified");
+        let mut left = c.clone();
+        left.merge(withheld.clone());
+        let mut right = withheld.clone();
+        right.merge(c);
+        assert_eq!(left, withheld);
+        assert_eq!(right, withheld);
+        right.unsound("transaction", "private detail".to_owned());
+        assert_eq!(right, withheld);
     }
 }

@@ -122,7 +122,13 @@ Do not:
 - Browser UI can target a non-same-origin backend through runtime config. The backend has no CORS policy of its
   own: the proxy in front of it answers the preflight and sends `Access-Control-Allow-Origin`. The backend marks
   `NRESE-Completeness` with `Access-Control-Expose-Headers` on every query answer that carries it, so the console
-  can tell a sound-only answer from a complete one on another origin too; a proxy that sets its own exposed
-  headers must keep that one.
+  can distinguish complete answers from sound-only, unsound and not-certified on another origin too; a proxy
+  that sets its own exposed headers must keep that explicit name (wildcard-only exposure is insufficient
+  with credentials).
+- `not-certified` and nonempty unrecognized completeness tokens warn that answers may be missing or
+  incorrect; neither guarantee is asserted. The CLI preserves stdout and exits 3 with `--require-complete`,
+  while HTTP failure remains exit 1. Older N16 maps the new token conservatively to `unsound` and retains
+  the raw header/warning; strict third-party enum consumers require an update. Pre-N16 clients that ignore
+  completeness do not provide this warning guarantee.
 - CLI can talk to the same backend without using browser code paths.
 - Endpoint paths and request construction remain centralized in one frontend client boundary.
