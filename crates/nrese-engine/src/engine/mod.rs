@@ -215,6 +215,8 @@ pub(crate) struct Version {
     pub(crate) asserted: IndexVersion,
     pub(crate) inferred: IndexVersion,
     pub(crate) revision: u64,
+    /// Snapshot's logical commit clock and sticky source-time provenance.
+    pub(crate) committed: crate::durability::history::CommitTime,
     /// Dictionary entries visible to this version; newer terms are hidden from lookups.
     pub(crate) dictionary_len: u64,
     /// Its `owl:sameAs` classes, once a read needs them ([`equality`]).
@@ -253,6 +255,7 @@ impl Version {
             asserted: IndexVersion::empty(Layout::DefaultGraph, encoding),
             inferred: IndexVersion::empty(Layout::DefaultGraph, encoding),
             revision: 0,
+            committed: crate::durability::history::CommitTime::fresh(),
             dictionary_len: 0,
             equality: Default::default(),
             content: Content::fresh(),
@@ -279,6 +282,7 @@ impl Version {
             asserted: self.asserted.clone(),
             inferred: self.inferred.clone(),
             revision: self.revision,
+            committed: self.committed,
             dictionary_len: self.dictionary_len,
             equality: Arc::clone(&self.equality),
             // Only compaction replaces a stack this way: the same statements.
@@ -479,8 +483,10 @@ impl Shared {
     /// copies in memory are freed once no snapshot holds them. A failure leaves everything
     /// in memory (the checkpoint is written either way).
     fn serve_mapped(&self, path: &Path, written: Snapshot) {
-        let (base, [asserted, inferred]) = match checkpoint::map_written(path, self.index_encoding)
-        {
+        let (base, [asserted, inferred], _) = match checkpoint::map_written(
+            path,
+            self.index_encoding,
+        ) {
             Ok(mapped) => mapped,
             Err(error) => {
                 tracing::warn!(%error, path = %path.display(), "checkpoint not mapped; data stays in memory");
@@ -504,6 +510,7 @@ impl Shared {
                     asserted: index(Stack::Asserted, &asserted),
                     inferred: index(Stack::Inferred, &inferred),
                     revision: current.revision,
+                    committed: current.committed,
                     dictionary_len: current.dictionary_len,
                     equality: Arc::clone(&current.equality),
                     content: current.content,

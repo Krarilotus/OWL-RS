@@ -302,6 +302,7 @@ impl<'e> BulkLoad<'e> {
                 };
                 let next = Version {
                     content: super::Content::fresh(),
+                    committed: current.committed.local(),
                     asserted: IndexVersion::from_quads(
                         Layout::holding(&quads),
                         shared.index_encoding,
@@ -344,6 +345,7 @@ impl<'e> BulkLoad<'e> {
                 let run = Run::from_quads(asserted.layout(), asserted.encoding(), inserts);
                 let next = Version {
                     content: super::Content::fresh(),
+                    committed: current.committed.local(),
                     asserted: asserted.with_run(run),
                     inferred: current.inferred.with_delta(&[], &explicit),
                     revision: summary.revision,
@@ -514,10 +516,11 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
             }
             Ok(
                 match checkpoint::map_written(written, shared.index_encoding) {
-                    Ok((dictionary, [asserted, inferred])) => (
+                    Ok((dictionary, [asserted, inferred], committed)) => (
                         Arc::new(Version {
                             // The same statements, mapped from the checkpoint.
                             content: next.content,
+                            committed,
                             asserted,
                             inferred,
                             equality: Arc::clone(&next.equality),
@@ -548,6 +551,7 @@ fn publish_streamed(
     dictionary_len: u64,
 ) -> EngineResult<u64> {
     let shared = &engine.shared;
+    let committed = shared.versions.load().committed.local();
     let Some(durable) = &shared.durable else {
         let packed = layout
             .permutations()
@@ -563,6 +567,7 @@ fn publish_streamed(
             .map_err(crate::error::EngineError::Corruption)?;
         let next = Version {
             content: super::Content::fresh(),
+            committed,
             asserted,
             inferred: IndexVersion::empty(Layout::DefaultGraph, shared.index_encoding),
             revision,
@@ -586,6 +591,7 @@ fn publish_streamed(
                 durable.root(),
                 shared.admission.as_ref(),
                 revision,
+                committed,
                 &shared.dictionary,
                 dictionary_len,
                 [layout, Layout::DefaultGraph],
@@ -609,10 +615,11 @@ fn publish_streamed(
         },
         // Nothing else holds the data: if it can't be mapped, the load fails.
         |written| {
-            let (base, [asserted, inferred]) =
+            let (base, [asserted, inferred], committed) =
                 checkpoint::map_written(written, shared.index_encoding)?;
             let next = Arc::new(Version {
                 content: super::Content::fresh(),
+                committed,
                 asserted,
                 inferred,
                 revision,
@@ -757,6 +764,7 @@ impl<'e> Rematerialisation<'e> {
         }
         let next = Version {
             content: super::Content::fresh(),
+            committed: current.committed.local(),
             asserted: current.asserted.clone(),
             inferred: IndexVersion::from_quads(
                 Layout::DefaultGraph,
