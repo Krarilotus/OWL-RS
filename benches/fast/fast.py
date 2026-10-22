@@ -1032,6 +1032,11 @@ def invocation_observation(case: dict, result: dict, stderr: str, identity: dict
             **({"batched": batched} if (batched := {q["name"]: q["batch"] for r in result.get("_repeats", [result])
                                                     for q in r.get("queries", []) if q.get("batch")}) else {}),
             "metric": metric_value(case, result), "counters": counters(case, result),
+            # Diagnostic metadata only: keep every process's actual object, including
+            # zero/error payloads and absent candidate metadata; infer no executions.
+            "common201": [{"query": q.get("name"),
+                           "metadata_status": "reported" if "common201" in q else "missing/unsupported",
+                           "payload": q.get("common201")} for q in result.get("queries", [])],
             **({"throughput": levels} if levels else {}),
             "rows": {q["name"]: q.get("rows") for q in result.get("queries", []) if "name" in q},
             "phase_peaks": phases, "peak_mib": peak, "memory_kind": "lifetime" if peak else "unknown",
