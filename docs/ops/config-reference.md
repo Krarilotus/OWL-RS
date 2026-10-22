@@ -198,7 +198,7 @@ api_key = "replace-me"
 - file key: `store.index_encoding`
 - env override: `NRESE_INDEX_ENCODING`
 - default: `fast`
-- how index blocks are encoded when they are built (loads, compactions, checkpoints): `fast` (frame of reference only, the fastest scans) or `compact` (a block position with few, far-apart values is stored as a palette of them; on the office PC DBpedia core's store is 3.3 % smaller with queries 7 % slower, Wikidata lexemes' 8.6 % smaller with queries even). Both are read either way, so switching needs no reload: blocks built later take the new encoding. Applies to every repository of the server. Checkpoints are format 11 (block offsets for the dictionary), which binaries before 2 October 2026 don't read; they read formats 8 to 10
+- how index blocks are encoded when they are built (loads, compactions, checkpoints): `fast` (frame of reference only, the fastest scans) or `compact` (a block position with few, far-apart values is stored as a palette of them; on the office PC DBpedia core's store is 3.3 % smaller with queries 7 % slower, Wikidata lexemes' 8.6 % smaller with queries even). Both are read either way, so switching needs no reload: blocks built later take the new encoding. Applies to every repository of the server. Checkpoints are format12, with the snapshot's commit clock and history provenance in the checksummed header. Older checkpoint formats are refused; use the existing export/reload path in [server setup](server-setup.md#131-upgrading-a-store-from-main-to-v2). Main cannot read format12 images.
 
 - file key: `store.vocabulary`
 - env override: `NRESE_VOCABULARY`

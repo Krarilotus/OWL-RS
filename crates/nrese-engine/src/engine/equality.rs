@@ -313,6 +313,7 @@ fn canonical_version(
         asserted,
         inferred: version.inferred.clone(),
         revision: version.revision,
+        committed: version.committed,
         dictionary_len: version.dictionary_len,
         equality: Arc::new(EqualityCell::holding(same_as, Arc::clone(classes))),
         content: version.content,
