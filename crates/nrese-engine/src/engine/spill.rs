@@ -33,8 +33,9 @@ use crate::index::run::PermutationBuilder;
 use crate::mapped;
 use crate::quad::{EncodedQuad, Key, Permutation};
 
-/// The directory spilled chunks go to, in the store's directory. A load that ended without
-/// removing it (a crash) leaves it behind; opening the store removes it.
+/// The directory spilled chunks go to, in the store's directory: each load has its own
+/// directory in it (`bulk-spill/<n>`), so no load can touch another's files. A load that
+/// ended without removing it (a crash) leaves it behind; opening the store removes it.
 pub(crate) const SPILL_DIR: &str = "bulk-spill";
 
 /// Chunks spilled to disk: as written (raw, until [`Spill::sort_raw`]), then per chunk one
@@ -48,9 +49,10 @@ pub(crate) struct Spill {
 }
 
 impl Spill {
-    /// A new, empty spill directory under `root` (an old one is removed first).
-    fn create(root: &Path) -> std::io::Result<Self> {
-        let dir = root.join(SPILL_DIR);
+    /// A new, empty spill directory: load `load`'s under `root` (an old one is removed
+    /// first).
+    fn create(root: &Path, load: u64) -> std::io::Result<Self> {
+        let dir = root.join(SPILL_DIR).join(load.to_string());
         if dir.exists() {
             fs::remove_dir_all(&dir)?;
         }
@@ -170,6 +172,10 @@ impl Spill {
 impl Drop for Spill {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
+        // And `bulk-spill` if no other load's directory is in it.
+        if let Some(parent) = self.dir.parent() {
+            let _ = fs::remove_dir(parent);
+        }
     }
 }
 
@@ -255,15 +261,21 @@ impl Iterator for Merge {
     }
 }
 
-/// The spilling thread of a bulk load, started with its first chunk.
+/// The spilling thread of a bulk load, started with its first chunk. Dropping it (a load
+/// aborted) waits for the thread, which removes the chunks: a load holds the writer slot
+/// until then ([`super::bulk::BulkLoad`]), so the next one can't start while it writes.
 pub(super) struct Spiller {
-    chunks: SyncSender<Vec<Vec<EncodedQuad>>>,
-    thread: JoinHandle<std::io::Result<Spill>>,
+    /// `None` once closed.
+    chunks: Option<SyncSender<Vec<Vec<EncodedQuad>>>>,
+    /// `None` once joined.
+    thread: Option<JoinHandle<std::io::Result<Spill>>>,
 }
 
 impl Spiller {
-    pub(super) fn start(root: &Path) -> std::io::Result<Self> {
-        let mut spill = Spill::create(root)?;
+    /// Starts load `load`'s spilling thread, its chunks in a directory of its own under
+    /// `root`.
+    pub(super) fn start(root: &Path, load: u64) -> std::io::Result<Self> {
+        let mut spill = Spill::create(root, load)?;
         // One chunk waits while the last is written: a full chunk in the sender's hands
         // blocks it.
         let (chunks, received) = sync_channel::<Vec<Vec<EncodedQuad>>>(0);
@@ -271,6 +283,8 @@ impl Spiller {
             .name("nrese-spill".into())
             .spawn(move || {
                 for batches in received {
+                    #[cfg(test)]
+                    tests::spill_pause(&spill.dir);
                     nrese_exec::heap::begin_step();
                     spill.write_raw(batches)?;
                     nrese_exec::heap::end_step("spill: a chunk written");
@@ -278,21 +292,42 @@ impl Spiller {
                 }
                 Ok(spill)
             })?;
-        Ok(Self { chunks, thread })
+        Ok(Self {
+            chunks: Some(chunks),
+            thread: Some(thread),
+        })
     }
 
     /// Hands a full chunk over, waiting while the last one is written. `false` if the
     /// thread stopped on an error ([`finish`](Self::finish) returns it).
     pub(super) fn send(&self, batches: Vec<Vec<EncodedQuad>>) -> bool {
-        self.chunks.send(batches).is_ok()
+        self.chunks
+            .as_ref()
+            .is_some_and(|chunks| chunks.send(batches).is_ok())
     }
 
     /// Waits for the last chunk to be written; the chunks, or the first error.
-    pub(super) fn finish(self) -> std::io::Result<Spill> {
-        drop(self.chunks);
-        self.thread
-            .join()
-            .unwrap_or_else(|_| Err(std::io::Error::other("the spilling thread panicked")))
+    pub(super) fn finish(mut self) -> std::io::Result<Spill> {
+        self.join()
+    }
+
+    fn join(&mut self) -> std::io::Result<Spill> {
+        drop(self.chunks.take());
+        match self.thread.take() {
+            Some(thread) => thread
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("the spilling thread panicked"))),
+            None => Err(std::io::Error::other("the spilling thread was joined")),
+        }
+    }
+}
+
+impl Drop for Spiller {
+    fn drop(&mut self) {
+        // The chunks go with the spill the thread returns.
+        if self.thread.is_some() {
+            let _ = self.join();
+        }
     }
 }
 
@@ -313,7 +348,7 @@ mod tests {
     #[test]
     fn raw_spill_preserves_batch_order_and_reports_write_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let spiller = Spiller::start(dir.path()).unwrap();
+        let spiller = Spiller::start(dir.path(), 0).unwrap();
         assert!(spiller.send(vec![
             vec![quad(4, 1, 2, 3)],
             Vec::new(),
@@ -327,10 +362,10 @@ mod tests {
         drop(spill);
         assert!(!dir.path().join(SPILL_DIR).exists());
 
-        let spiller = Spiller::start(dir.path()).unwrap();
+        let spiller = Spiller::start(dir.path(), 1).unwrap();
         // A directory at the next file's path fails on every platform, without relying
         // on permissions (which privileged test runners may bypass).
-        fs::create_dir(dir.path().join(SPILL_DIR).join("raw-00000.quads")).unwrap();
+        fs::create_dir(dir.path().join(SPILL_DIR).join("1").join("raw-00000.quads")).unwrap();
         assert!(spiller.send(vec![vec![quad(4, 1, 2, 3)]]));
         assert!(spiller.finish().is_err());
         assert!(!dir.path().join(SPILL_DIR).exists());
@@ -353,7 +388,7 @@ mod tests {
     fn merged_chunks_equal_one_sort() {
         for named in [false, true] {
             let dir = tempfile::tempdir().unwrap();
-            let mut spill = Spill::create(dir.path()).unwrap();
+            let mut spill = Spill::create(dir.path(), 0).unwrap();
             let mut all: Vec<EncodedQuad> = (0..5000u64)
                 .map(|i| quad(0, 1 + i % 97, 1 + i % 7, 1 + (i * 31) % 1009))
                 .collect();
@@ -386,5 +421,112 @@ mod tests {
             drop(spill);
             assert!(!dir.path().join(SPILL_DIR).exists());
         }
+    }
+
+    use std::sync::Mutex;
+
+    /// Stores whose spilling threads a test holds before their next chunk.
+    static HELD: Mutex<Vec<(PathBuf, std::sync::Arc<Gate>)>> = Mutex::new(Vec::new());
+
+    /// `entered`: a thread is held; `open`: let them go.
+    #[derive(Default)]
+    struct Gate {
+        state: Mutex<(bool, bool)>,
+        changed: std::sync::Condvar,
+    }
+
+    /// Called by every spilling thread before it writes a chunk to `dir`: waits while a
+    /// test holds the store it is in.
+    pub(super) fn spill_pause(dir: &Path) {
+        let gate = HELD
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(root, _)| dir.starts_with(root))
+            .map(|(_, gate)| std::sync::Arc::clone(gate));
+        let Some(gate) = gate else { return };
+        let mut state = gate.state.lock().unwrap();
+        state.0 = true;
+        gate.changed.notify_all();
+        while !state.1 {
+            state = gate.changed.wait(state).unwrap();
+        }
+    }
+
+    /// An aborted load that spilled keeps the writer slot until its spilling thread has
+    /// stopped and removed its chunks: a later load's spill can't be removed under it.
+    /// Its chunk write is held while the load is dropped; the next load must not start
+    /// before it is let go, and then loads and reopens whole.
+    #[test]
+    fn an_aborted_spilling_load_stops_its_thread_before_the_next_load() {
+        use crate::{BulkMode, DurabilityConfig, Engine, EngineConfig};
+        use nrese_rdf::{GraphName, NamedNode, Quad as RdfQuad};
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            background_maintenance: false,
+            durability: DurabilityConfig {
+                bulk_load_memory: Some(64 * 32), // past 21 quads, a chunk is spilled
+                ..DurabilityConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        let quads = |from: usize| -> Vec<RdfQuad> {
+            (from..from + 100)
+                .map(|i| {
+                    let iri = |s: String| NamedNode::new_unchecked(s);
+                    RdfQuad::new(
+                        iri(format!("http://s/{i}")),
+                        iri("http://p".into()),
+                        iri(format!("http://o/{i}")),
+                        GraphName::DefaultGraph,
+                    )
+                })
+                .collect()
+        };
+        let engine = Engine::open(dir.path(), config.clone()).unwrap();
+        let gate = std::sync::Arc::new(Gate::default());
+        HELD.lock()
+            .unwrap()
+            .push((dir.path().to_path_buf(), std::sync::Arc::clone(&gate)));
+        let aborted = engine.bulk_load(BulkMode::Replace);
+        aborted.add(&quads(0)); // the spilling thread starts, held before writing
+        {
+            let mut state = gate.state.lock().unwrap();
+            while !state.0 {
+                state = gate.changed.wait(state).unwrap();
+            }
+        }
+        let (early, inserted) = std::thread::scope(|scope| {
+            let (started_tx, started) = std::sync::mpsc::channel();
+            let engine = &engine;
+            let next = scope.spawn(move || {
+                let load = engine.bulk_load(BulkMode::Replace);
+                let _ = started_tx.send(());
+                load.add(&quads(1000));
+                load.finish().map(|summary| summary.inserted)
+            });
+            let (gate, dir) = (&gate, &dir);
+            let opener = scope.spawn(move || {
+                // Long enough for the next load to take a released slot.
+                let early = started
+                    .recv_timeout(std::time::Duration::from_millis(500))
+                    .is_ok();
+                HELD.lock().unwrap().retain(|(root, _)| root != dir.path());
+                let mut state = gate.state.lock().unwrap();
+                state.1 = true;
+                gate.changed.notify_all();
+                early
+            });
+            drop(aborted); // waits for its spilling thread
+            (opener.join().unwrap(), next.join().unwrap())
+        });
+        assert!(
+            !early,
+            "the next load started while the aborted one was still spilling"
+        );
+        assert_eq!(inserted.unwrap(), 100);
+        drop(engine);
+        let reopened = Engine::open(dir.path(), config).unwrap();
+        assert_eq!(reopened.stats().quads, 100);
     }
 }

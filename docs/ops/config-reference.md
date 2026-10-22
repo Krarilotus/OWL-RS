@@ -175,7 +175,7 @@ api_key = "replace-me"
 - file key: `store.verify_on_open`
 - env override: `NRESE_VERIFY_ON_OPEN`
 - default: `false`
-- on disk, the newest checkpoint is used in place from a memory map: opening reads only its structure, so a restart takes milliseconds and memory grows with what queries touch. `true` checks the whole checkpoint when opening (its CRC, every index block, every dictionary key): opening then reads the whole file once, and a damaged checkpoint is refused at once instead of failing when a query reaches the damage
+- on disk, the newest checkpoint is used in place from a memory map: opening reads only its structure, so a restart takes milliseconds and memory grows with what queries touch. With `false`, damage outside that structure is not detected later either: a query reaching it can return altered answers or empty text, or fail. `true` checks the whole checkpoint when opening (its CRC, every index block, every dictionary key): opening then reads the whole file once, and a damaged checkpoint is refused. Use it where integrity matters more than the time to open
 
 - file key: `store.map_checkpoints`
 - env override: `NRESE_MAP_CHECKPOINTS`
@@ -190,7 +190,7 @@ api_key = "replace-me"
 - file key: `store.wal_archive`
 - env override: `NRESE_WAL_ARCHIVE`
 - default: `false`
-- on disk, keep the WAL segments that checkpoints cover in `wal-archive/` of the data directory instead of deleting them. With an image backup they restore the store to any later revision (`nrese-server restore DIR --wal ARCHIVE --wal DATA/wal --until-revision N`). The archive grows until pruned (`nrese-server prune-archive R`, with `R` the oldest image backup's revision plus one). Sync it to another machine for recovery from a lost disk
+- on disk, keep the WAL segments that checkpoints cover in `wal-archive/` of the data directory instead of deleting them. With an image backup they restore the store to any later revision (`nrese-server restore DIR --wal ARCHIVE --wal DATA/wal --until-revision N`). The archive grows until pruned (`nrese-server prune-archive R`, with `R` the oldest image backup's revision plus one). Sync it to another machine for recovery from a lost disk, each segment with its `.wal.meta` file (the sync policy recovery reads; restore and prune carry it along)
 
 - file key: `store.index_encoding`
 - env override: `NRESE_INDEX_ENCODING`
