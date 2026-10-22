@@ -282,6 +282,7 @@ Read replicas ([replication.md](replication.md)); both sides need an on-disk sto
 - `federation.allow` (env `NRESE_FEDERATION_ALLOW`, comma-separated): the endpoints `SERVICE` may call, as full IRIs or prefixes (`https://query.wikidata.org/`), or `*` for any. Empty (the default): `SERVICE` is off, an error, and `SERVICE SILENT` one solution without bindings. Allowing `*` lets anyone who may query make the server fetch any URL
 - `federation.timeout` (env `NRESE_FEDERATION_TIMEOUT_MS`, units as in [Budgets](#budgets)): per request to an endpoint; default `30s`
 - `federation.max_rows` (env `NRESE_FEDERATION_MAX_ROWS`): rows one request may return; default 1,000,000
+- `federation.max_response_bytes` (env `NRESE_FEDERATION_MAX_RESPONSE_BYTES`): maximum response-body bytes collected per SERVICE request; unset or `0` adds no byte cap. The request's memory budget always applies.
 - a `SERVICE` joined to a pattern sends the pattern's distinct values as `VALUES`, 200 rows per request (up to 20,000 values; beyond, the block goes once, unbound); redirects are not followed; queries with `SERVICE` are never answered from the result cache
 
 ## Budgets
