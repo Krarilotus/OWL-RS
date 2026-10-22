@@ -277,3 +277,128 @@ fn the_report_is_an_rdf_graph() {
     assert_eq!(graph.len(), 2);
     assert!(empty.conforms());
 }
+
+/// `$PATH` is the property shape's path where it is a triple pattern's predicate, and only
+/// there (SHACL §5.2): a literal and a longer name keep their text, and any other use is
+/// ill-formed. A sequence path joins through its middle nodes as the path written there
+/// would: each solution is one result, so two ways to the same value are two results.
+#[test]
+fn path_is_substituted_only_as_a_predicate() {
+    let literal = "ex:a ex:p \"$PATH\" .";
+    let two_ways = "ex:a ex:p ex:m1, ex:m2 . ex:m1 ex:q ex:z . ex:m2 ex:q ex:z .";
+    for (data, path, query, expected) in [
+        (
+            literal,
+            "ex:p",
+            r#"SELECT $this ?value WHERE { $this $PATH ?value FILTER(STR(?value) != "$PATH") }"#,
+            Ok(0),
+        ),
+        (
+            literal,
+            "ex:p",
+            "SELECT $this ?value WHERE { $this $PATH ?value
+               OPTIONAL { ?value <http://example.com/q> ?PATHX } FILTER(!BOUND(?PATHX)) }",
+            Ok(1),
+        ),
+        (
+            literal,
+            "ex:p",
+            "SELECT $this ?value WHERE { $this $PATH ?value . ?value <http://example.com/q> $PATH }",
+            Err("other than as a predicate"),
+        ),
+        (
+            two_ways,
+            "( ex:p ex:q )",
+            "SELECT $this ?value WHERE { $this $PATH ?value }",
+            Ok(2),
+        ),
+    ] {
+        let engine = engine(
+            data,
+            &format!(
+                "ex:S sh:targetNode ex:a ; sh:property [ sh:path {path} ; sh:sparql [ sh:select '''{query}''' ] ] ."
+            ),
+        );
+        let snapshot = engine.snapshot();
+        match (compile(&snapshot, shapes_selection(&snapshot)), expected) {
+            (Ok(shapes), Ok(results)) => {
+                let report = validate(&snapshot, &shapes, DEFAULT);
+                assert!(report.failures.is_empty(), "{query}: {:?}", report.failures);
+                assert_eq!(report.results.len(), results, "{query}");
+            }
+            (Err(errors), Err(problem)) => assert!(
+                errors.iter().any(|error| error.message.contains(problem)),
+                "{query}: {errors:?}"
+            ),
+            (outcome, _) => panic!("{query}: {:?}", outcome.map(|shapes| shapes.len())),
+        }
+    }
+}
+
+/// SHACL-SPARQL reads the statements Core reads: a shapes graph left out of the data is
+/// left out of the queries' default graph too, so the two agree on a data-like statement in
+/// it, and `GRAPH $shapesGraph` still reads the shapes (RSH-06).
+#[test]
+fn sparql_constraints_read_the_data_core_reads() {
+    let engine = engine(
+        "ex:a ex:p ex:b .",
+        r#"ex:a ex:q ex:c .
+        ex:Core sh:targetNode ex:a ; sh:property [ sh:path ex:q ; sh:maxCount 0 ] .
+        ex:Sparql sh:targetNode ex:a ;
+            sh:sparql [ sh:select "SELECT $this WHERE { $this <http://example.com/q> ?o }" ] .
+        ex:Shapes sh:targetNode ex:a ; sh:sparql [ sh:select
+            "SELECT $this WHERE { GRAPH $shapesGraph { $this <http://example.com/q> ?o } }" ] ."#,
+    );
+    let snapshot = engine.snapshot();
+    let shapes = compiled(&snapshot);
+    let data = Selection::of(GraphSelector::Any).excluding(id(&snapshot, SHAPES_GRAPH));
+    let report = validate(&snapshot, &shapes, data);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let sources: Vec<String> = report
+        .results
+        .iter()
+        .map(|result| result.source_shape.to_string())
+        .collect();
+    assert_eq!(
+        sources,
+        [ex("Shapes")],
+        "only the query that reads the shapes graph"
+    );
+}
+
+/// A selection's form doesn't change what a SPARQL constraint reads: its own `FROM` or
+/// `FROM NAMED` is replaced by the selected data whatever the selection's form, so leaving
+/// out a graph that holds nothing changes nothing, and the default graph alone is pinned as
+/// every other selection is (review N11 r1, F2).
+#[test]
+fn a_constraints_dataset_is_the_selection_whatever_its_form() {
+    for clause in [
+        "FROM <http://example.com/shapes>",
+        "FROM NAMED <http://example.com/shapes>",
+    ] {
+        let engine = engine(
+            "ex:a ex:p ex:b .",
+            &format!(
+                "ex:Sparql sh:targetNode ex:a ; sh:sparql [ sh:select
+                  \"SELECT $this {clause} WHERE {{ $this <http://example.com/p> ?o }}\" ] ."
+            ),
+        );
+        let snapshot = engine.snapshot();
+        let shapes = compiled(&snapshot);
+        let results = |selection: Selection| {
+            let report = validate(&snapshot, &shapes, selection);
+            assert!(
+                report.failures.is_empty(),
+                "{clause}: {:?}",
+                report.failures
+            );
+            report.results.len()
+        };
+        // ex:p is a term, but no graph is named so: leaving it out leaves the data as it is.
+        let any = Selection::of(GraphSelector::Any);
+        let p = id(&snapshot, "http://example.com/p");
+        for selection in [any, any.excluding(p), DEFAULT] {
+            assert_eq!(results(selection), 1, "{clause}, {selection:?}");
+        }
+    }
+}

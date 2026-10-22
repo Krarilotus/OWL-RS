@@ -8,9 +8,9 @@
 //! result is much smaller (the executor's rule). BGPs with more than [`DP_PATTERNS`]
 //! patterns are ordered greedily by the same model, from every start, or from the
 //! [`GREEDY_STARTS`] cheapest starts beyond [`GREEDY_ALL_STARTS`] patterns, and fewer where
-//! their estimates would exceed [`GREEDY_EFFORT`] (each start estimates up to n²/2
-//! extensions from the state as it is, and builds only the n it takes). The search asks
-//! for the query's cancellation at every step.
+//! their estimates would exceed [`crate::PlannerOptions::greedy_effort`] (each start
+//! estimates up to n²/2 extensions from the state as it is, and builds only the n it
+//! takes). The search asks for the query's cancellation at every step.
 //!
 //! Stars are estimated from the default graph's characteristic sets where they are known
 //! (`nrese_engine::engine::characteristic`): a pattern `?s p ?o` joined to patterns that
@@ -46,12 +46,6 @@ const GREEDY_ALL_STARTS: usize = 64;
 
 /// Starts tried, the cheapest first, for BGPs larger than [`GREEDY_ALL_STARTS`].
 const GREEDY_STARTS: usize = 16;
-
-/// The candidates the greedy search estimates over all its starts, about: a start estimates
-/// up to n²/2, so beyond about 250 patterns fewer starts are tried, down to one. A star of
-/// 1,000 patterns took 16 starts of 500,000 estimates each, twice per query (4.9 s in the
-/// test profile, 12 October 2026).
-const GREEDY_EFFORT: usize = 1 << 19;
 
 /// Cost of one index probe relative to reading one scanned row.
 const PROBE_COST: f64 = 4.0;
@@ -159,6 +153,13 @@ thread_local! {
     pub(super) static STATISTICS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Run at every step the orderer asks whether to stop, before it asks: a test's measure
+    /// of planning work, and its way to cancel a query after a chosen amount of it.
+    pub(super) static STEP: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
 fn note_statistics(_reads: usize, _steps: usize) {
     #[cfg(test)]
     STATISTICS.with(|c| {
@@ -175,9 +176,19 @@ pub(super) fn order(
     variables: usize,
     probe_factor: u64,
     sets: Option<&CharacteristicSets>,
+    options: crate::PlannerOptions,
     stop: &dyn Fn() -> bool,
 ) -> Option<Plan> {
-    search(inputs, variables, probe_factor, sets, None, stop)
+    #[cfg(test)]
+    let stop = &|| {
+        STEP.with(|hook| {
+            if let Some(hook) = &*hook.borrow() {
+                hook();
+            }
+        });
+        stop()
+    };
+    search(inputs, variables, probe_factor, sets, None, options, stop)
 }
 
 /// The estimates of joining `inputs` in the given `order` (all of them, each once), by the
@@ -189,9 +200,15 @@ pub(super) fn along(
     sets: Option<&CharacteristicSets>,
     order: &[usize],
 ) -> Plan {
-    search(inputs, variables, probe_factor, sets, Some(order), &|| {
-        false
-    })
+    search(
+        inputs,
+        variables,
+        probe_factor,
+        sets,
+        Some(order),
+        Default::default(),
+        &|| false,
+    )
     .expect("never stopped")
 }
 
@@ -203,6 +220,7 @@ fn search(
     probe_factor: u64,
     sets: Option<&CharacteristicSets>,
     fixed: Option<&[usize]>,
+    options: crate::PlannerOptions,
     stop: &dyn Fn() -> bool,
 ) -> Option<Plan> {
     // The characteristic sets know which predicates subjects have, not their objects.
@@ -408,7 +426,11 @@ fn search(
             true => GREEDY_STARTS,
             false => n,
         };
-        let kept = kept.min((GREEDY_EFFORT / (n * n / 2)).max(1));
+        // Always finish one start, even when it alone exceeds the effort. Unlimited
+        // removes this reduction, retaining the established DP/greedy strategy.
+        let kept = options.greedy_effort.map_or(kept, |effort| {
+            kept.min((effort / (n.saturating_mul(n) / 2)).max(1))
+        });
         if kept < n {
             starts.sort_by(|a, b| a.cost.total_cmp(&b.cost).then(a.order.cmp(&b.order)));
             starts.truncate(kept);
@@ -485,7 +507,7 @@ mod tests {
             input(300_000, &[(0, 100_000), (1, 2_000)]),
             input(5_000, &[(0, 5_000)]),
         ];
-        let plan = order(&inputs, 2, 32, None, &|| false).unwrap();
+        let plan = order(&inputs, 2, 32, None, Default::default(), &|| false).unwrap();
         assert_eq!(plan.order, vec![0, 2, 1]);
         assert_eq!(plan.rows.len(), 3);
     }
@@ -514,7 +536,7 @@ mod tests {
     #[test]
     fn disconnected_patterns_still_get_an_order() {
         let inputs = [input(10, &[(0, 10)]), input(3, &[(1, 3)])];
-        let plan = order(&inputs, 2, 32, None, &|| false).unwrap();
+        let plan = order(&inputs, 2, 32, None, Default::default(), &|| false).unwrap();
         assert_eq!(plan.order.len(), 2);
         assert!((plan.rows[1] - 30.0).abs() < 1e-9);
     }
@@ -564,7 +586,7 @@ mod tests {
             })
             .collect();
         STATISTICS.with(|c| c.set((0, 0)));
-        let plan = order(&inputs, 251, 32, Some(&sets), &|| false).unwrap();
+        let plan = order(&inputs, 251, 32, Some(&sets), Default::default(), &|| false).unwrap();
         assert_eq!(plan.order.len(), 250);
         let (reads, steps) = STATISTICS.with(|c| c.get());
         assert!(
@@ -576,7 +598,7 @@ mod tests {
             asked.set(asked.get() + 1);
             asked.get() > 3
         };
-        assert!(order(&inputs, 251, 32, Some(&sets), &stop).is_none());
+        assert!(order(&inputs, 251, 32, Some(&sets), Default::default(), &stop).is_none());
         assert_eq!(asked.get(), 4, "stopped at the first step after");
     }
 
@@ -590,14 +612,48 @@ mod tests {
                 .map(|i| input(1_000 + i as u64, &[(0, 900), (i + 1, 500)]))
                 .collect();
             STATISTICS.with(|c| c.set((0, 0)));
-            let plan = order(&inputs, n + 1, 32, None, &|| false).unwrap();
+            let plan = order(&inputs, n + 1, 32, None, Default::default(), &|| false).unwrap();
             assert_eq!(plan.order.len(), n);
             let (_, steps) = STATISTICS.with(|c| c.get());
             assert!(
-                steps <= GREEDY_EFFORT.max(n * n / 2) + n,
+                steps <= crate::PlannerOptions::DEFAULT_GREEDY_EFFORT.max(n * n / 2) + n,
                 "{n} patterns: {steps}"
             );
         }
+    }
+
+    #[test]
+    fn query_options_control_greedy_effort_without_losing_patterns() {
+        use crate::{PlannerOptions, QueryOptions};
+        // Just beyond where the default reduces the sixteen starts to fifteen.
+        let n = 257;
+        let inputs: Vec<Input> = (0..n)
+            .map(|i| input(1_000 + i as u64, &[(0, 900)]))
+            .collect();
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let snapshot = engine.snapshot();
+        for (effort, starts) in [
+            (Some(1), 1),
+            (Some(3 * (n * n / 2)), 3),
+            (Some(PlannerOptions::DEFAULT_GREEDY_EFFORT), 15),
+            (None, GREEDY_STARTS),
+        ] {
+            let mut options = QueryOptions::default();
+            options.resources.planner.greedy_effort = effort;
+            let ctx = super::super::Context::new(&snapshot, &options, None, None);
+            STATISTICS.with(|c| c.set((0, 0)));
+            let mut plan = ctx
+                .order_inputs(&inputs, 1)
+                .unwrap_or_else(|_| panic!("planning failed"));
+            let (_, steps) = STATISTICS.with(|c| c.get());
+            assert_eq!(steps, starts * n * (n - 1) / 2, "effort {effort:?}");
+            plan.order.sort_unstable();
+            assert_eq!(plan.order, (0..n).collect::<Vec<_>>());
+        }
+        let unlimited = PlannerOptions {
+            greedy_effort: None,
+        };
+        assert!(order(&inputs, 1, 32, None, unlimited, &|| true).is_none());
     }
 
     /// BGPs too large for the exact order get a greedy one: a star of 14 patterns, and
@@ -608,7 +664,7 @@ mod tests {
         let inputs: Vec<Input> = (0..14)
             .map(|i| input(100 + i, &[(0, 100), (i as usize + 1, 50)]))
             .collect();
-        let plan = order(&inputs, 15, 32, None, &|| false).unwrap();
+        let plan = order(&inputs, 15, 32, None, Default::default(), &|| false).unwrap();
         let mut sorted = plan.order.clone();
         sorted.sort_unstable();
         assert_eq!(sorted, (0..14).collect::<Vec<_>>());
@@ -616,11 +672,110 @@ mod tests {
             let inputs: Vec<Input> = (0..n)
                 .map(|i| input(1_000 + i as u64, &[(i, 500), (i + 1, 500)]))
                 .collect();
-            let plan = order(&inputs, n + 1, 32, None, &|| false).unwrap();
+            let plan = order(&inputs, n + 1, 32, None, Default::default(), &|| false).unwrap();
             let mut sorted = plan.order.clone();
             sorted.sort_unstable();
             assert_eq!(sorted, (0..n).collect::<Vec<_>>());
             assert_eq!(plan.rows.len(), n);
+        }
+    }
+    /// A query's cancellation reaches the orderer while it plans the large patterns of
+    /// `tests/it/depth_tests.rs` (a path of 1,000 steps spelled out as triple patterns, stars
+    /// of 1,000 patterns, of 1,000 single-variable checks and of 250 triple terms; a
+    /// 1,000-step path planned for 28 s, a 250-pattern star for 114 s, unable to stop:
+    /// 12 October 2026). Cancelled halfway through the steps its planning takes, a query
+    /// stops at that step, refused with `Cancelled`.
+    #[test]
+    fn large_patterns_stop_planning_at_the_step_they_are_cancelled() {
+        use crate::{CancellationToken, QueryEvaluationError, QueryOptions, Resources};
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let node = |name: String| NamedNode::new_unchecked(format!("http://e/{name}"));
+        let mut tx = engine.transaction();
+        for s in 0..5 {
+            for i in 0..7 {
+                let quad = Quad::new(
+                    node(format!("s{s}")),
+                    node(format!("p{i}")),
+                    node(format!("s{}", (s + i) % 5)),
+                    GraphName::DefaultGraph,
+                );
+                tx.insert(quad.as_ref());
+            }
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let p = |i: usize| format!("<http://e/p{}>", i % 7);
+        let patterns = |n: usize, f: &dyn Fn(usize) -> String| (0..n).map(f).collect::<String>();
+        for (shape, text) in [
+            (
+                "chain",
+                format!(
+                    "SELECT * WHERE {{ ?s {} ?o }}",
+                    (0..1_000).map(p).collect::<Vec<_>>().join("/")
+                ),
+            ),
+            (
+                "star",
+                format!(
+                    "SELECT * WHERE {{ {} }}",
+                    patterns(1_000, &|i| format!("?s {} ?o{i} . ", p(i)))
+                ),
+            ),
+            (
+                "checks",
+                format!(
+                    "SELECT * WHERE {{ {} }}",
+                    patterns(1_000, &|i| format!("?s {} <http://e/s{}> . ", p(i), i % 5))
+                ),
+            ),
+            (
+                "triple-terms",
+                format!(
+                    "SELECT * WHERE {{ ?s ?q ?o . {} }}",
+                    patterns(250, &|i| format!(
+                        "?s {} <<( ?a{i} {} ?o )>> . ",
+                        p(i),
+                        p(i + 1)
+                    ))
+                ),
+            ),
+        ] {
+            let query = nrese_sparql_syntax::SparqlParser::new()
+                .parse_query(&text)
+                .unwrap();
+            let steps = Rc::new(Cell::new(0usize));
+            let count = Rc::clone(&steps);
+            STEP.set(Some(Box::new(move || count.set(count.get() + 1))));
+            let planned = crate::plan_query(&snapshot, &query, &QueryOptions::default());
+            let all = steps.replace(0);
+            assert!(planned.is_ok(), "{shape}: {:?}", planned.err());
+            assert!(all >= 100, "{shape}: planned in {all} steps");
+            let token = CancellationToken::new();
+            let (count, cancel) = (Rc::clone(&steps), token.clone());
+            STEP.set(Some(Box::new(move || {
+                count.set(count.get() + 1);
+                if count.get() == all / 2 {
+                    cancel.cancel();
+                }
+            })));
+            let options = QueryOptions {
+                resources: Resources {
+                    cancellation: Some(token),
+                    ..Resources::default()
+                },
+                ..QueryOptions::default()
+            };
+            let planned = crate::plan_query(&snapshot, &query, &options);
+            STEP.set(None);
+            assert!(
+                matches!(planned, Err(QueryEvaluationError::Cancelled)),
+                "{shape}: {:?}",
+                planned.err()
+            );
+            assert_eq!(steps.get(), all / 2, "{shape}: steps of {all}");
         }
     }
 }

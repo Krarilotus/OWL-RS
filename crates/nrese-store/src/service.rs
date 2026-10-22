@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 use nrese_engine::{Engine, EngineConfig, ReadModel, TermId};
 use nrese_sparql::CancellationToken;
 
-use crate::backup::{DatasetBackupArtifact, DatasetBackupFormat, export_dataset};
+use crate::backup::{DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, export_dataset};
 use crate::bulk_load::{BulkLoadReport, BulkLoadRequest, bulk_load};
 use crate::config::{StoreConfig, StoreMode};
 use crate::error::StoreResult;
-use crate::graph_store::{GraphReadRequest, GraphReadResult, GraphWriteReport, GraphWriteRequest};
-use crate::graph_store_executor::execute_graph_read;
+use crate::graph_store::{
+    GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport, GraphWriteRequest,
+};
+use crate::graph_store_executor::{graph_exists, write_graph};
 use crate::loader::preload_ontology;
 use crate::mutation::{MutationCommand, MutationCommitReport};
 use crate::query::{SerializedQueryResult, SparqlQueryRequest};
@@ -54,6 +56,10 @@ pub struct StoreService {
     supports: std::sync::Arc<crate::support::Supports>,
     /// The `owl2-dl` mode's state ([`crate::dl`]).
     dl: std::sync::Arc<crate::dl::Dl>,
+    /// Why the store can't serve any more until the server restarts, if it can't
+    /// ([`Self::unavailable`]): its state is neither the one before a failed change nor the
+    /// one after it. Set once.
+    unavailable: std::sync::Arc<std::sync::OnceLock<String>>,
 }
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
@@ -91,30 +97,37 @@ impl fmt::Debug for StoreService {
 
 impl StoreService {
     pub fn new(config: StoreConfig) -> StoreResult<Self> {
-        let runtime = std::sync::Arc::new(crate::Runtime::new(config.total_query_memory_bytes));
+        let runtime = std::sync::Arc::new(crate::Runtime::new(
+            config.process_memory_bytes,
+            config.total_query_memory_bytes,
+        ));
         Self::with_runtime(config, runtime)
     }
 
     /// Opens a store on resources shared with other stores. A catalog uses this for
     /// every repository; embedded applications can supply the same owner explicitly.
-    /// The runtime's budget applies, not `config.total_query_memory_bytes`.
+    /// The runtime's budgets apply, not `config.total_query_memory_bytes` or, for what is
+    /// charged, `config.process_memory_bytes` (which stays this store's watch).
     pub fn with_runtime(
         config: StoreConfig,
         runtime: std::sync::Arc<crate::Runtime>,
     ) -> StoreResult<Self> {
         config.validate()?;
-        nrese_engine::set_index_encoding(config.index_encoding);
-        nrese_engine::set_vocabulary_encoding(config.vocabulary);
         // Only switched off: on leaves what the process was started with (an operator's
         // `MIMALLOC_ALLOW_THP=0` switches them off the same way).
         if !config.huge_pages {
             nrese_exec::memory::set_transparent_huge_pages(false);
         }
         nrese_engine::memory::set_release_between_rounds(config.reasoning_release);
+        // The encodings are this store's: another store of the process may differ.
+        let defaults = EngineConfig {
+            index_encoding: config.index_encoding,
+            vocabulary: config.vocabulary,
+            ..EngineConfig::default()
+        };
         let engine = match config.mode {
-            StoreMode::InMemory => Engine::new(EngineConfig::default())?,
+            StoreMode::InMemory => Engine::new(defaults)?,
             StoreMode::OnDisk => {
-                let defaults = EngineConfig::default();
                 let engine_config = EngineConfig {
                     durability: nrese_engine::DurabilityConfig {
                         verify_on_open: config.verify_on_open,
@@ -151,28 +164,41 @@ impl StoreService {
             }),
             ql: std::sync::Arc::default(),
         };
+        let unavailable = std::sync::Arc::<std::sync::OnceLock<String>>::default();
         let namespaces = crate::namespaces::Namespaces::open(
             (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),
-        );
+            std::sync::Arc::clone(&unavailable),
+        )?;
         let quarantine = crate::quarantine::Quarantine::open(
             (config.mode == StoreMode::OnDisk).then_some(config.data_dir.as_path()),
         )?;
+        // The support graph sets and restricted views draw on the memory the queries do,
+        // as the canonical views.
+        let supports = crate::support::Supports::new(std::sync::Arc::new(
+            nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
+        ));
         let service = Self {
             settings,
             namespaces: std::sync::Arc::new(namespaces),
             quarantine: std::sync::Arc::new(quarantine),
             sessions: std::sync::Arc::default(),
             running: std::sync::Arc::default(),
-            supports: std::sync::Arc::default(),
+            supports: std::sync::Arc::new(supports),
             dl: std::sync::Arc::default(),
             config,
             engine,
             preloaded_ontology,
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            unavailable,
             materialised: std::sync::Arc::default(),
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             last_materialisation: std::sync::Arc::default(),
         };
+        // The planner's statistics are the store's, shared by its requests: an envelope of
+        // their own within the catalog's budget, as classification's.
+        service
+            .engine
+            .charge_statistics_to(std::sync::Arc::new(service.envelope(None).part()));
         if service.engine.snapshot().revision() != before {
             service.invalidate_reasoning()?;
         }
@@ -246,6 +272,25 @@ impl StoreService {
     /// The store's namespace prefixes ([`crate::namespaces`]).
     pub fn namespaces(&self) -> &crate::namespaces::Namespaces {
         &self.namespaces
+    }
+
+    /// Why the store can't serve until the server restarts, if it can't: a change failed
+    /// and its state couldn't be brought back to a known one (the reason says which file
+    /// and how to repair it). Its server answers every request to it with 503.
+    pub fn unavailable(&self) -> Option<&str> {
+        self.unavailable.get().map(String::as_str)
+    }
+
+    /// The store's [`Self::unavailable`], shared: a server reads it on every request
+    /// without taking the store.
+    pub fn unavailable_flag(&self) -> std::sync::Arc<std::sync::OnceLock<String>> {
+        std::sync::Arc::clone(&self.unavailable)
+    }
+
+    /// Makes the store unavailable until a restart, for `why` (the first reason stays).
+    pub(crate) fn make_unavailable(&self, why: String) {
+        tracing::error!(%why, "store unavailable until the server restarts");
+        let _ = self.unavailable.set(why);
     }
 
     /// The statements bulk loads couldn't read ([`crate::quarantine`]).
@@ -378,8 +423,19 @@ impl StoreService {
         export_dataset(&self.engine.snapshot(), format)
     }
 
+    /// An export of the latest snapshot, to be written as it is read
+    /// ([`DatasetExport::write`]); for a scope that reads every graph.
+    pub fn dataset_export(
+        &self,
+        scope: &crate::ReadScope,
+        format: DatasetBackupFormat,
+    ) -> StoreResult<DatasetExport> {
+        scope.require_all("an export")?;
+        Ok(DatasetExport::of(self.engine.snapshot(), format))
+    }
+
     /// What this store's updates are evaluated with.
-    fn update_context<'a>(
+    pub(crate) fn update_context<'a>(
         &'a self,
         cancellation: &'a CancellationToken,
     ) -> crate::mutation::command::UpdateContext<'a> {
@@ -411,27 +467,53 @@ impl StoreService {
     }
 
     /// The latest snapshot as a reader with `access` sees it (`None`: every graph): with
-    /// `inferred = "supported"`, only the inferred statements its graphs support
-    /// ([`crate::support`]).
+    /// `inferred = "supported"`, only the inferred statements its graphs derive
+    /// ([`crate::support`]). What making that view reads and builds is charged to the
+    /// queries' memory; `Err` if it has no room (never a partial view).
     pub fn read_snapshot(
         &self,
         access: Option<&std::sync::Arc<nrese_sparql::GraphAccess>>,
-    ) -> nrese_engine::Snapshot {
-        self.view_of(&self.engine.snapshot(), access)
+    ) -> StoreResult<nrese_engine::Snapshot> {
+        let snapshot = self.engine.snapshot();
+        match access {
+            Some(access) if needs_view(&snapshot, access) => {
+                self.view_of(&snapshot, Some(access), &self.settings.envelope(None), None)
+            }
+            _ => Ok(snapshot),
+        }
     }
 
-    /// [`Self::read_snapshot`] of `snapshot`, a committed revision.
+    /// [`Self::read_snapshot`] for a request, its view's working memory charged to the
+    /// request's envelope `memory`; cancelling the request (its time running out) stops
+    /// the view's computation with the request's cancellation error.
+    pub(crate) fn read_snapshot_within(
+        &self,
+        access: Option<&std::sync::Arc<nrese_sparql::GraphAccess>>,
+        memory: &nrese_exec::Envelope,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<nrese_engine::Snapshot> {
+        self.view_of(&self.engine.snapshot(), access, memory, Some(cancellation))
+    }
+
+    /// [`Self::read_snapshot_within`] of `snapshot`, a committed revision. The
+    /// unrestricted path (every graph, or no inferences, or every inference over every
+    /// named graph) is the snapshot itself: no support state is read.
     fn view_of(
         &self,
         snapshot: &nrese_engine::Snapshot,
         access: Option<&std::sync::Arc<nrese_sparql::GraphAccess>>,
-    ) -> nrese_engine::Snapshot {
+        memory: &nrese_exec::Envelope,
+        cancellation: Option<&CancellationToken>,
+    ) -> StoreResult<nrese_engine::Snapshot> {
         match access {
-            Some(access) if by_support(access) => {
-                self.supports
-                    .view(snapshot, access, self.support_compilation())
-            }
-            _ => snapshot.clone(),
+            Some(access) if needs_view(snapshot, access) => Ok(self.supports.view(
+                snapshot,
+                access,
+                self.support_compilation(),
+                memory,
+                cancellation,
+            )?),
+            _ => Ok(snapshot.clone()),
         }
     }
 
@@ -449,8 +531,11 @@ impl StoreService {
     /// when the policy turns to it; the store does it itself after a rematerialisation
     /// while readers use them). Returns at once.
     pub fn prepare_support_sets(&self) {
-        self.supports
-            .prepare(self.engine.snapshot(), self.support_compilation());
+        self.supports.prepare(
+            self.engine.snapshot(),
+            self.support_compilation(),
+            self.settings.envelope(None),
+        );
     }
 
     /// Inferred statements under graph access ([`crate::support`]): the mutation pipeline
@@ -672,7 +757,23 @@ impl StoreService {
         Ok(status.map(|s| (s, detail.unwrap_or_default())))
     }
 
+    /// Every query run but a transaction's pending one: its refusal as its reader may be
+    /// told it ([`for_its_reader`]; the answers are the reader's own).
     fn run_reporting(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+    ) -> StoreResult<(
+        Option<crate::dl::DlDetail>,
+        Option<nrese_sparql::ql::QlReport>,
+    )> {
+        let run = self.run_reporting_whole(prepared, cancellation, out, report);
+        for_its_reader(prepared, run, |_| {})
+    }
+
+    fn run_reporting_whole(
         &self,
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
@@ -705,7 +806,9 @@ impl StoreService {
                     Outcome::Stream(status, read, detail) => {
                         let snapshot = match read {
                             Read::Lower(snapshot) | Read::At(snapshot) => snapshot,
-                            Read::Latest => self.read_snapshot(prepared.access()),
+                            Read::Latest => {
+                                self.read_snapshot_within(prepared.access(), &memory, cancellation)?
+                            }
                         };
                         let context = format!("{dl} {status:?}");
                         run_query(
@@ -725,7 +828,7 @@ impl StoreService {
                 };
             return Ok((Some(detail), None));
         }
-        let snapshot = self.read_snapshot(prepared.access());
+        let snapshot = self.read_snapshot_within(prepared.access(), &memory, cancellation)?;
         let ql = run_query(
             &snapshot,
             prepared,
@@ -799,8 +902,25 @@ impl StoreService {
     }
 
     /// Runs a prepared query on the latest snapshot to completion and reports how it ran:
-    /// the executor, each operator with estimated and actual rows, and times.
+    /// the executor, each operator with estimated and actual rows, and times. To a reader
+    /// who may not read every graph, only what is its own ([`for_its_reader`]).
     pub fn explain_query(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<crate::Explanation> {
+        for_its_reader(
+            prepared,
+            self.explain_whole(prepared, cancellation),
+            |explanation| {
+                explanation.steps.clear();
+                explanation.rewrites.clear();
+                explanation.decoded = 0;
+            },
+        )
+    }
+
+    fn explain_whole(
         &self,
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
@@ -810,7 +930,7 @@ impl StoreService {
             .register(prepared.text(), prepared.origin(), cancellation);
         let memory = self.settings.query_envelope(prepared);
         let mut explanation = explain_prepared(
-            &self.read_snapshot(prepared.access()),
+            &self.read_snapshot_within(prepared.access(), &memory, cancellation)?,
             prepared,
             &self.settings,
             cancellation,
@@ -844,18 +964,37 @@ impl StoreService {
     }
 
     /// The plan `prepared` would run as, each node with its estimated rows, without
-    /// running it (EXPLAIN without ANALYZE). Planning stops with
-    /// [`nrese_sparql::QueryEvaluationError::Cancelled`] once `cancellation` is cancelled.
+    /// running it (EXPLAIN without ANALYZE), within the query's memory envelope. Planning
+    /// stops with [`nrese_sparql::QueryEvaluationError::Cancelled`] once `cancellation` is
+    /// cancelled. To a reader who may not read every graph, only what is its own
+    /// ([`for_its_reader`]).
     pub fn plan_query(
         &self,
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::PlannedQuery> {
+        for_its_reader(
+            prepared,
+            self.plan_whole(prepared, cancellation),
+            |planned| {
+                planned.steps.clear();
+                planned.rewrites.clear();
+            },
+        )
+    }
+
+    fn plan_whole(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<crate::PlannedQuery> {
+        let memory = self.settings.query_envelope(prepared);
         let mut planned = plan_prepared(
-            &self.read_snapshot(prepared.access()),
+            &self.read_snapshot(prepared.access())?,
             prepared,
             &self.settings,
             cancellation,
+            &memory,
         )?;
         planned.completeness = match self.dl_mode(prepared) {
             Some(_) => Some(crate::dl::query::plan_status(self, prepared)),
@@ -872,7 +1011,7 @@ impl StoreService {
     /// once, and the limit; `None` without a limit
     /// ([`StoreConfig::total_query_memory_bytes`]).
     pub fn query_memory(&self) -> Option<(usize, usize, usize)> {
-        let budget = self.settings.runtime.query_memory()?;
+        let budget = self.settings.runtime.query_pool()?;
         Some((budget.used(), budget.peak(), budget.limit()))
     }
 
@@ -886,7 +1025,7 @@ impl StoreService {
         form: nrese_sparql::ql::PrintForm,
     ) -> StoreResult<nrese_sparql::ql::Printed> {
         let query = nrese_sparql::compat::parse_query(query, None)?;
-        let snapshot = self.read_snapshot(None);
+        let snapshot = self.engine.snapshot();
         Ok(nrese_sparql::ql::print(&snapshot, &query, form)?)
     }
 
@@ -895,29 +1034,61 @@ impl StoreService {
         self.execute_query(&SparqlQueryRequest::new(query, crate::ReadScope::All))
     }
 
-    /// A graph (Graph Store Protocol `GET`) as the read sees it: a graph its scope doesn't
-    /// read doesn't exist for it.
+    /// A graph (Graph Store Protocol `GET`) as the read sees it, in memory: for callers that
+    /// want it so (tests, embedding); the server streams [`Self::write_graph`].
     pub fn execute_graph_read(
         &self,
         read: &crate::ReadContext<'_>,
         request: &GraphReadRequest,
     ) -> StoreResult<GraphReadResult> {
-        if let Some(access) = read.scope.access() {
-            let graph = request.target.graph_name()?;
-            if !access.allows_graph(&graph) {
-                return Ok(GraphReadResult {
-                    media_type: request.format.media_type(),
-                    payload: Vec::new(),
-                    exists: false,
-                });
-            }
+        let mut payload = Vec::new();
+        let exists = self.write_graph(read, request, &mut payload)?;
+        Ok(GraphReadResult {
+            media_type: request.format.media_type(),
+            payload,
+            exists,
+        })
+    }
+
+    /// A graph (Graph Store Protocol `GET`) as the read sees it, written to `out` as it is
+    /// read; `false` (nothing written) for a graph that doesn't exist for the read, as a
+    /// graph its scope doesn't read.
+    pub fn write_graph(
+        &self,
+        read: &crate::ReadContext<'_>,
+        request: &GraphReadRequest,
+        out: impl std::io::Write,
+    ) -> StoreResult<bool> {
+        if !self.readable(read, &request.target)? {
+            return Ok(false);
         }
-        execute_graph_read(
-            &self.read_snapshot(read.scope.access()),
-            request,
+        let view = self.read_snapshot(read.scope.access())?;
+        write_graph(&view, request, read.model(), &read.cancel, out)
+    }
+
+    /// Whether a graph exists as the read sees it (Graph Store Protocol `HEAD`), as
+    /// [`Self::write_graph`] would answer, with nothing decoded.
+    pub fn graph_exists(
+        &self,
+        read: &crate::ReadContext<'_>,
+        target: &GraphTarget,
+    ) -> StoreResult<bool> {
+        if !self.readable(read, target)? {
+            return Ok(false);
+        }
+        graph_exists(
+            &self.read_snapshot(read.scope.access())?,
+            target,
             read.model(),
-            &read.cancel,
         )
+    }
+
+    /// Whether the read's scope reads `target`: a graph it doesn't read doesn't exist for it.
+    fn readable(&self, read: &crate::ReadContext<'_>, target: &GraphTarget) -> StoreResult<bool> {
+        Ok(match read.scope.access() {
+            Some(access) => access.allows_graph(&target.graph_name()?),
+            None => true,
+        })
     }
 
     /// Runs `read` on the data as it would be after `pending` (an RDF4J transaction's
@@ -945,16 +1116,48 @@ impl StoreService {
             crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
         })?;
         let view = match scope.access() {
-            Some(access) if by_support(access) => {
+            Some(access) if needs_view(tx.base(), access) => {
                 // The operations aren't reasoned over: the base's inferred statements, as
-                // far as the reader sees them and the operations left them.
-                let base = self.view_of(tx.base(), Some(access));
-                let kept: Vec<nrese_engine::EncodedQuad> = base
-                    .quads_for_pattern_in(ReadModel::Inferred, &nrese_engine::QuadPattern::all())
-                    .filter(|quad| view_has(&tx, quad))
-                    .collect();
-                tx.pending_snapshot()
-                    .with_inferred_subset(nrese_engine::InferredSubset::Only(kept))
+                // far as the reader sees them and the operations left them, kept (charged)
+                // as the support views are. A statement the view adds (asserted only in
+                // graphs the reader can't read, and derived) stays unless the operations
+                // assert it where the reader reads it.
+                let memory = self.settings.envelope(None);
+                let base = self.view_of(tx.base(), Some(access), &memory, None)?;
+                let left = |quad: &nrese_engine::EncodedQuad| match tx
+                    .base()
+                    .contains_in(ReadModel::Inferred, quad)
+                {
+                    true => view_has(&tx, quad),
+                    false => !tx
+                        .quads_for_pattern_in(
+                            ReadModel::Asserted,
+                            &nrese_engine::QuadPattern {
+                                subject: Some(quad.subject),
+                                predicate: Some(quad.predicate),
+                                object: Some(quad.object),
+                                graph: nrese_engine::GraphSelector::Any,
+                            },
+                        )
+                        .any(|asserted| access.allows_id(&tx, asserted.graph)),
+                };
+                let budget = self.supports.kept();
+                let len = usize::try_from(base.len_in(ReadModel::Inferred)).unwrap_or(usize::MAX);
+                let mut kept: nrese_exec::ChargedVec<nrese_engine::EncodedQuad> =
+                    nrese_exec::ChargedVec::with_capacity(std::sync::Arc::clone(budget), len)?;
+                let mut scanning = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
+                scanning.charge(base.scan_bytes(ReadModel::Inferred))?;
+                kept.extend_bounded(
+                    len,
+                    base.quads_for_pattern_in(
+                        ReadModel::Inferred,
+                        &nrese_engine::QuadPattern::all(),
+                    )
+                    .filter(|quad| left(quad)),
+                )?;
+                drop(scanning);
+                kept.sort_unstable();
+                tx.pending_snapshot().with_inferred_only(&kept, budget)?
             }
             _ => tx.pending_snapshot(),
         };
@@ -1001,7 +1204,7 @@ impl StoreService {
             .iter()
             .any(|op| !matches!(op, crate::StatementOp::Add { .. }));
         let memory = self.settings.query_envelope(prepared);
-        self.with_pending(pending, &scope, cancellation, |snapshot| {
+        let run = self.with_pending(pending, &scope, cancellation, |snapshot| {
             run_query(
                 snapshot,
                 prepared,
@@ -1040,7 +1243,8 @@ impl StoreService {
                 },
             )
             .map(|_| ())
-        })
+        });
+        for_its_reader(prepared, run, |_| {})
     }
 
     /// The queries running now ([`crate::running`]).
@@ -1163,7 +1367,7 @@ impl StoreService {
         read: impl FnOnce(&nrese_engine::Snapshot) -> StoreResult<T>,
     ) -> StoreResult<T> {
         match context.pending {
-            None => read(&self.read_snapshot(context.scope.access())),
+            None => read(&self.read_snapshot(context.scope.access())?),
             Some(pending) => self.with_pending(pending, &context.scope, &context.cancel, read),
         }
     }
@@ -1215,7 +1419,8 @@ impl StoreService {
             read_model(infer),
             typed,
             limit,
-        ))
+        )
+        .map_err(nrese_sparql::QueryEvaluationError::from)?)
     }
 
     /// The named graphs `scope` reads (RDF4J's `/contexts`).
@@ -1348,21 +1553,29 @@ impl StoreService {
         subject: nrese_rdf::TermRef<'_>,
         predicate: nrese_rdf::TermRef<'_>,
         object: nrese_rdf::TermRef<'_>,
-    ) -> Option<Vec<crate::reasoning::InferenceStep>> {
+    ) -> StoreResult<Option<Vec<crate::reasoning::InferenceStep>>> {
         let snapshot = self.engine.snapshot();
         let program = self.bound_program(&snapshot, program.into());
-        let fact = Self::fact_of(&snapshot, [subject, predicate, object])?;
+        let Some(fact) = Self::fact_of(&snapshot, [subject, predicate, object]) else {
+            return Ok(None);
+        };
         let crate::ReadScope::Graphs(access) = scope else {
-            return crate::reasoning::explain_fact(&program, &snapshot, fact, None);
+            return Ok(crate::reasoning::explain_fact(
+                &program, &snapshot, fact, None,
+            ));
         };
         let readable = |fact: [u64; 3]| readable_asserted(&snapshot, access, fact);
-        let steps = crate::reasoning::explain_fact(&program, &snapshot, fact, Some(&readable))?;
+        let Some(steps) =
+            crate::reasoning::explain_fact(&program, &snapshot, fact, Some(&readable))
+        else {
+            return Ok(None);
+        };
         let visible = match steps.first().map(|step| step.origin) {
-            Some("inferred") => self.inferred_visible(&snapshot, access, fact),
+            Some("inferred") => self.inferred_visible(&snapshot, access, fact)?,
             Some("asserted") => true,
             _ => false,
         };
-        visible.then_some(steps)
+        Ok(visible.then_some(steps))
     }
 
     /// The justifications of the statement `subject predicate object` under `program`:
@@ -1376,19 +1589,29 @@ impl StoreService {
         scope: &crate::ReadScope,
         statement: [nrese_rdf::TermRef<'_>; 3],
         mode: crate::reasoning::JustificationMode,
-    ) -> Option<crate::reasoning::JustificationAnswer> {
+    ) -> StoreResult<Option<crate::reasoning::JustificationAnswer>> {
         let snapshot = self.engine.snapshot();
         let program = self.bound_program(&snapshot, program.into());
-        let fact = Self::fact_of(&snapshot, statement)?;
+        let Some(fact) = Self::fact_of(&snapshot, statement) else {
+            return Ok(None);
+        };
         let crate::ReadScope::Graphs(access) = scope else {
-            return crate::reasoning::justify_fact(&program, &snapshot, fact, mode, None);
+            return Ok(crate::reasoning::justify_fact(
+                &program, &snapshot, fact, mode, None,
+            ));
         };
         let readable = |fact: [u64; 3]| readable_asserted(&snapshot, access, fact);
-        let visible = readable(fact) || self.inferred_visible(&snapshot, access, fact);
+        let visible = readable(fact) || self.inferred_visible(&snapshot, access, fact)?;
         if !visible {
-            return None;
+            return Ok(None);
         }
-        crate::reasoning::justify_fact(&program, &snapshot, fact, mode, Some(&readable))
+        Ok(crate::reasoning::justify_fact(
+            &program,
+            &snapshot,
+            fact,
+            mode,
+            Some(&readable),
+        ))
     }
 
     /// `program` with its constants by the snapshot's ids, without the writer: a constant
@@ -1420,21 +1643,23 @@ impl StoreService {
         ])
     }
 
-    /// Whether the requester sees `fact` as an inferred statement.
+    /// Whether the requester sees `fact` as an inferred statement; `Err` if its view
+    /// couldn't be made.
     fn inferred_visible(
         &self,
         snapshot: &nrese_engine::Snapshot,
         access: &std::sync::Arc<nrese_sparql::GraphAccess>,
         fact: [u64; 3],
-    ) -> bool {
+    ) -> StoreResult<bool> {
         if by_support(access) {
             let [s, p, o] = fact.map(nrese_engine::TermId::from_raw);
-            self.view_of(snapshot, Some(access)).contains_in(
+            let view = self.view_of(snapshot, Some(access), &self.settings.envelope(None), None)?;
+            Ok(view.contains_in(
                 ReadModel::Inferred,
                 &nrese_engine::EncodedQuad::new(s, p, o, nrese_engine::TermId::DEFAULT_GRAPH),
-            )
+            ))
         } else {
-            access.inferred
+            Ok(access.inferred)
         }
     }
 
@@ -1520,12 +1745,14 @@ impl StoreService {
         let summary = rematerialisation.finish(closure.inferred)?;
         nrese_exec::heap::phase("store: done");
         nrese_engine::memory::release_all();
+        // From here the new inferences are published: a failure says so.
         self.record_reasoning(crate::ReasoningState::of_with(
             rules,
             self.config.hide_unnamed_classes,
             self.config.equality_compact,
             closure.violations.len(),
-        ))?;
+        ))
+        .map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
         if !closure.violations.is_empty() {
             tracing::error!(
                 ruleset = %rules.name(),
@@ -1585,6 +1812,17 @@ fn by_support(access: &nrese_sparql::GraphAccess) -> bool {
     access.inferred && access.inferred_by_support
 }
 
+/// Whether a reader with `access` reads `snapshot` through a view of its own
+/// ([`crate::support`]): by support, or seeing every inference while some named graph is
+/// out of its reach (a fact asserted only there, and derived, is shown to it as inferred).
+fn needs_view(snapshot: &nrese_engine::Snapshot, access: &nrese_sparql::GraphAccess) -> bool {
+    by_support(access)
+        || (access.inferred
+            && snapshot
+                .named_graphs()
+                .any(|graph| !access.allows_id(snapshot, graph)))
+}
+
 /// Whether the pending state of `tx` holds the inferred `quad`.
 fn view_has(tx: &nrese_engine::Transaction<'_>, quad: &nrese_engine::EncodedQuad) -> bool {
     tx.contains_in(ReadModel::Inferred, quad)
@@ -1636,4 +1874,28 @@ pub(crate) fn in_readable_graph(
         };
         access.allows_graph(&graph)
     })
+}
+
+/// A run or an EXPLAIN of `prepared` as its reader may be told it (round 13, R13-diag). A
+/// reader of every graph is told everything. Another is told only what comes from its query
+/// and its answer: `redact` takes an EXPLAIN's operators (their estimates, the order and the
+/// operators those chose, their rows, the dictionary work they report, their times) and its
+/// rewrites (an estimate decides some, as eager aggregation), all read from statistics and
+/// scans of every graph; and a memory refusal keeps its kind and limit but not the bytes
+/// held and asked for, which a scan of graphs it may not read sized.
+fn for_its_reader<T>(
+    prepared: &PreparedQuery,
+    whole: StoreResult<T>,
+    redact: impl FnOnce(&mut T),
+) -> StoreResult<T> {
+    if crate::ReadScope::of(prepared.access().cloned()).reads_everything() {
+        return whole;
+    }
+    match whole {
+        Ok(mut whole) => {
+            redact(&mut whole);
+            Ok(whole)
+        }
+        Err(error) => Err(error.without_amounts()),
+    }
 }

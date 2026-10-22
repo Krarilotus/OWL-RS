@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use nrese_engine::ReadModel;
 use nrese_reasoner::rulesets::Ruleset;
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_sparql::GraphAccess;
 use nrese_store::{
     BulkLoadRequest, GraphTarget, MutationCommand, MutationPipeline, MutationTicket, Requester,
@@ -70,10 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         started.elapsed().as_secs_f64(),
         report.inferred
     );
-    let pipeline = MutationPipeline::new(
-        Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode))),
-    );
+    let pipeline = MutationPipeline::new(Arc::clone(&store), ReasonerConfig::for_mode(mode));
     let access = Arc::new(GraphAccess {
         graphs: (0..graphs / 2).map(|g| format!("{GRAPH}{g}")).collect(),
         default_graph: true,
@@ -83,13 +80,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let read = |what: &str| {
         let started = Instant::now();
-        let view = store.read_snapshot(Some(&access));
+        let view = store
+            .read_snapshot(Some(&access))
+            .expect("room for the view");
         let elapsed = started.elapsed();
         println!(
             "{what}: {:.1} ms, {} of {} inferred visible",
             elapsed.as_secs_f64() * 1e3,
             view.len_in(ReadModel::Inferred),
-            store.read_snapshot(None).len_in(ReadModel::Inferred),
+            store
+                .read_snapshot(None)
+                .expect("unrestricted")
+                .len_in(ReadModel::Inferred),
         );
     };
     read("first restricted read");

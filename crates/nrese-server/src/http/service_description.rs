@@ -67,7 +67,7 @@ fn bool_literal(value: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use nrese_reasoner::{ReasonerConfig, ReasonerService};
+    use nrese_reasoner::ReasonerConfig;
     use nrese_store::{StoreConfig, StoreService};
 
     use crate::ai::AiSuggestionService;
@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn service_description_mentions_core_endpoints() {
         let store = StoreService::new(StoreConfig::default()).expect("store should initialize");
-        let reasoner = ReasonerService::new(ReasonerConfig::default());
+        let reasoner = ReasonerConfig::default();
         let state = AppState::new(
             store,
             reasoner,
@@ -103,7 +103,7 @@ mod tests {
     #[test]
     fn service_description_omits_disabled_optional_endpoints() {
         let store = StoreService::new(StoreConfig::default()).expect("store should initialize");
-        let reasoner = ReasonerService::new(ReasonerConfig::default());
+        let reasoner = ReasonerConfig::default();
         let state = AppState::new(
             store,
             reasoner,

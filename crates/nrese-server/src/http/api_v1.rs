@@ -23,25 +23,54 @@ struct RepositoryEntry {
     /// The path of its engine API.
     path: String,
     default: bool,
+    /// Set when it didn't open at start (its stored settings or files can't be read): it
+    /// answers 503 until repaired or removed. Operators see why, with the file and the
+    /// repair; others only that it is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable: Option<String>,
 }
 
 #[utoipa::path(get, path = "/api/v1/repositories", tag = "repositories",
-    responses((status = 200, description = "The repositories, the default one first", body = Vec<RepositoryEntry>)))]
-/// The repositories: the default one first, then the others.
+    responses((status = 200, description = "The repositories, the default one first, then the others, those unavailable included", body = Vec<RepositoryEntry>)))]
+/// The repositories: the default one first, then the others, with those that didn't open.
 pub async fn repositories(
     authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &authenticated).await?;
-    let entries: Vec<RepositoryEntry> = std::iter::once((DEFAULT_REPOSITORY.to_owned(), None))
-        .chain(state.repositories().list())
-        .map(|(id, title)| RepositoryEntry {
-            path: format!("/api/v1/repositories/{id}"),
-            title: title.unwrap_or_else(|| format!("NRESE: {id}")),
-            default: id == DEFAULT_REPOSITORY,
-            id,
-        })
-        .collect();
+    let operator = state
+        .authorize(crate::policy::PolicyAction::OperatorRead, &authenticated)
+        .is_ok();
+    let entry = |id: String, title: Option<String>, unavailable: Option<String>| RepositoryEntry {
+        path: format!("/api/v1/repositories/{id}"),
+        title: title.unwrap_or_else(|| format!("NRESE: {id}")),
+        default: id == DEFAULT_REPOSITORY,
+        id,
+        unavailable,
+    };
+    let catalog = state.repositories();
+    let default_unavailable = state.default_unavailable().map(|why| match operator {
+        true => why.to_owned(),
+        false => crate::state::UNAVAILABLE_UNTIL_RESTART.to_owned(),
+    });
+    let mut entries: Vec<RepositoryEntry> = vec![entry(
+        DEFAULT_REPOSITORY.to_owned(),
+        None,
+        default_unavailable,
+    )];
+    entries.extend(
+        catalog
+            .list()
+            .into_iter()
+            .map(|(id, title)| entry(id, title, None)),
+    );
+    entries.extend(catalog.unavailable_list().into_iter().map(|(id, why)| {
+        let why = match operator {
+            true => why,
+            false => crate::state::UNAVAILABLE.to_owned(),
+        };
+        entry(id, None, Some(why))
+    }));
     Ok(Json(entries).into_response())
 }
 
@@ -258,7 +287,7 @@ pub async fn session_update(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let access = guard::update_access(&state, &authenticated).await?;
-    let request = super::rdf4j::update(&raw, &headers, &body)?;
+    let request = super::rdf4j::update(&raw, &headers, &body, state.policy().limits.planner)?;
     add(
         &state,
         &session,
@@ -534,23 +563,27 @@ pub async fn explain(
         })
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?
+        .map_err(|error| super::sparql::map_query_error(&state.policy(), error))?
         .ok_or_else(|| ApiError::not_found("the statement doesn't hold"))?;
         return Ok(Json(Justified::from(answer)).into_response());
     }
     let dl = state.store().dl().active();
     let found = tokio::task::spawn_blocking(move || {
         let statement = [subject.as_ref(), predicate.as_ref(), object.as_ref()];
-        match store.explain_statement(program, &scope, statement[0], statement[1], statement[2]) {
+        let steps =
+            store.explain_statement(program, &scope, statement[0], statement[1], statement[2])?;
+        Ok::<_, nrese_store::StoreError>(match steps {
             Some(steps) => Some((steps, None)),
             // Not derived by the rules: under owl2-dl, why OWL 2 DL entails it.
             None if dl => store
                 .explain_dl(&scope, statement)
                 .map(|e| (Vec::new(), Some(DlJustified::from(e)))),
             None => None,
-        }
+        })
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(|error| super::sparql::map_query_error(&state.policy(), error))?
     .ok_or_else(|| ApiError::not_found("the statement doesn't hold"))?;
     let (steps, owl2_dl) = found;
     let steps: Vec<ExplanationStep> = steps

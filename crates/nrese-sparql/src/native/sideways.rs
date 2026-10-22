@@ -178,7 +178,7 @@ impl Context<'_> {
             self.consumed(seed);
             return Ok(Solutions {
                 vars,
-                table: IdTable::new(width),
+                table: IdTable::charged(width, 0, &self.budget)?,
                 ordered: false,
             });
         }
@@ -333,7 +333,7 @@ impl Context<'_> {
             return None;
         }
         let mut seen: HashSet<Vec<u64>> = HashSet::new();
-        let mut table = IdTable::new(columns.len());
+        let mut table = IdTable::charged(columns.len(), 0, &self.budget).ok()?;
         for r in 0..solutions.table.len() {
             let key: Vec<u64> = columns
                 .iter()

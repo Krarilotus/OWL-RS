@@ -420,3 +420,178 @@ fn service_is_a_privilege_of_its_own() {
         "{refused}"
     );
 }
+
+/// EXPLAIN and EXPLAIN ANALYZE tell a restricted reader nothing of the graphs it may not
+/// read: two stores that differ only in a secret graph answer its plan and its run alike
+/// (times aside). The planner's estimates, the order they choose and the operators' rows
+/// read every graph (round 13, R13-diag), so a restricted reader gets no operators; a reader
+/// of every graph still gets them all.
+#[test]
+fn explain_tells_a_restricted_reader_nothing_of_hidden_graphs() {
+    let with_secret = |secret: usize| {
+        let store = store();
+        let quads: String = (0..secret)
+            .map(|i| format!("<urn:s{i}> <urn:p> {i} . <urn:s{i}> <urn:q> <urn:o{i}> . "))
+            .collect();
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ GRAPH <urn:g:secret> {{ {quads} }} }}"
+            )))
+            .unwrap();
+        store
+    };
+    let query = "SELECT * WHERE { GRAPH ?g { ?s <urn:p> ?v . ?s <urn:q> ?o } }";
+    let explain = |store: &StoreService, scope: ReadScope| {
+        let prepared = store
+            .prepare_query(&SparqlQueryRequest::new(query, scope))
+            .unwrap();
+        let token = nrese_store::CancellationToken::new();
+        let plan = store.plan_query(&prepared, &token).unwrap();
+        store.clear_query_cache();
+        let mut run = store.explain_query(&prepared, &token).unwrap();
+        run.micros = 0;
+        for step in &mut run.steps {
+            step.micros = 0;
+        }
+        (plan, run)
+    };
+    let (small, large) = (with_secret(1), with_secret(2_000));
+    assert_eq!(explain(&small, public()), explain(&large, public()));
+    let (plan, run) = explain(&large, ReadScope::All);
+    assert!(!plan.steps.is_empty() && !run.steps.is_empty());
+}
+
+/// Nor do the rewrites: eager aggregation is chosen by an estimate, and a restricted reader's
+/// merged default graph is estimated over every graph (Sol's review of R13, r1 B-F1). Hidden
+/// prices make it pay in one store and not in the other; the answer, the plan and the run the
+/// reader is told are the same.
+#[test]
+fn restricted_rewrites_tell_nothing_of_hidden_statistics() {
+    let with_hidden_prices = |hidden: usize| {
+        let mut config = in_memory_store_config();
+        config.union_default_graph = true;
+        let store = StoreService::new(config).unwrap();
+        let visible: String = (0..10)
+            .map(|i| {
+                format!("<urn:product{i}> <urn:team> <urn:t> . <urn:offer{i}> <urn:product> <urn:product{i}> . ")
+            })
+            .collect();
+        let secret: String = (0..hidden)
+            .map(|i| format!("<urn:hidden{i}> <urn:price> {} . ", i + 2))
+            .collect();
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ {visible} <urn:visible-price> <urn:price> 1 .
+                   GRAPH <urn:g:public> {{ <urn:marker> <urn:present> 1 }}
+                   GRAPH <urn:g:secret> {{ <urn:hidden-marker> <urn:present> 1 . {secret} }} }}"
+            )))
+            .unwrap();
+        store
+    };
+    let query = "SELECT ?team (SUM(?price) AS ?total) WHERE { ?product <urn:team> ?team .
+                 ?offer <urn:product> ?product . ?x <urn:price> ?price } GROUP BY ?team";
+    let observe = |store: &StoreService| {
+        let request = SparqlQueryRequest::new(query, public());
+        let payload = store.execute_query(&request).unwrap().payload;
+        let prepared = store.prepare_query(&request).unwrap();
+        let token = nrese_store::CancellationToken::new();
+        let plan = store.plan_query(&prepared, &token).unwrap();
+        store.clear_query_cache();
+        let run = store.explain_query(&prepared, &token).unwrap();
+        (payload, plan.rewrites, run.rewrites)
+    };
+    assert_eq!(
+        observe(&with_hidden_prices(0)),
+        observe(&with_hidden_prices(20))
+    );
+}
+
+/// Nor does a refusal, of its EXPLAIN or of its run: a scan sized by a graph the reader may
+/// not read runs out of the query's memory, and the refusal it is told keeps its kind and
+/// limit, not the bytes (Sol's review of R13: r1 B-F2, they were in an EXPLAIN's message; r2
+/// S1, in a run's).
+#[test]
+fn restricted_refusals_tell_nothing_of_hidden_sizes() {
+    let refusal = |hidden: usize| {
+        let mut config = in_memory_store_config();
+        config.total_query_memory_bytes = 0;
+        let store = StoreService::new(config).unwrap();
+        let secret: String = (0..hidden)
+            .map(|i| format!("<urn:hidden{i}> <urn:p> {i} . "))
+            .collect();
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ GRAPH <urn:g:public> {{ <urn:visible> <urn:p> 1 }}
+                   GRAPH <urn:g:secret> {{ {secret} }} }}"
+            )))
+            .unwrap();
+        let mut request =
+            SparqlQueryRequest::new("SELECT * WHERE { GRAPH ?g { ?s <urn:p> ?o } }", public());
+        request.memory_limit = Some(64 << 10);
+        let prepared = store.prepare_query(&request).unwrap();
+        let token = nrese_store::CancellationToken::new();
+        let explained = store.explain_query(&prepared, &token).unwrap_err();
+        let run = store
+            .run_query(&prepared, &token, std::io::sink())
+            .unwrap_err();
+        for error in [&explained, &run] {
+            assert!(
+                error.is_memory_limit() && !error.is_server_memory_limit(),
+                "{error}"
+            );
+        }
+        (explained.to_string(), run.to_string())
+    };
+    assert_eq!(refusal(100_000), refusal(200_000));
+}
+
+/// Nor does an update's: the WHERE of a restricted requester's update runs out of the query
+/// memory on a scan sized by a graph it may not read, and the refusal it is told keeps its
+/// kind and limit, not the bytes (Sol's review of R13, r3 S1).
+#[test]
+fn restricted_update_refusals_tell_nothing_of_hidden_sizes() {
+    let refusal = |hidden: usize| {
+        let mut config = in_memory_store_config();
+        config.process_memory_bytes = 0;
+        config.total_query_memory_bytes = 64 << 10;
+        let pipeline = nrese_store::MutationPipeline::new(
+            Arc::new(StoreService::new(config).unwrap()),
+            nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Disabled),
+        );
+        let secret: String = (0..hidden)
+            .map(|i| format!("<urn:hidden{i}> <urn:p> {i} . "))
+            .collect();
+        pipeline
+            .execute_update_str(&format!(
+                "INSERT DATA {{ GRAPH <urn:g:public> {{ <urn:visible> <urn:p> 1 }}
+                   GRAPH <urn:g:secret> {{ {secret} }} }}"
+            ))
+            .unwrap();
+        let access = Arc::new(GraphAccess {
+            prefixes: vec!["urn:g:public".to_owned()],
+            ..GraphAccess::default()
+        });
+        let requester = Requester::new(
+            ReadScope::Graphs(Arc::clone(&access)),
+            WriteScope::Graphs(access),
+        );
+        let error = pipeline
+            .apply(
+                MutationCommand::Update(SparqlUpdateRequest::new(
+                    "INSERT { GRAPH <urn:g:public> { ?s <urn:copy> ?o } }
+                     WHERE { GRAPH ?g { ?s <urn:p> ?o } }",
+                )),
+                &requester,
+                &nrese_store::MutationTicket::new(),
+            )
+            .unwrap_err();
+        match &error {
+            nrese_store::MutationError::Store { source, .. } => {
+                assert!(source.is_server_memory_limit(), "{error}")
+            }
+            other => panic!("a memory refusal, not {other}"),
+        }
+        error.to_string()
+    };
+    assert_eq!(refusal(100_000), refusal(200_000));
+}
