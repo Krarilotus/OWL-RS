@@ -98,7 +98,7 @@ fn compression_study() {
     let Some(path) = std::env::var_os("NRESE_STUDY_CHECKPOINT") else {
         return;
     };
-    let (_, stacks) = crate::durability::checkpoint::map_written(
+    let (_, stacks, _) = crate::durability::checkpoint::map_written(
         std::path::Path::new(&path),
         crate::IndexEncoding::Fast,
     )
