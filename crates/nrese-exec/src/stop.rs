@@ -1,4 +1,4 @@
-//! Stopping long work at bounded checkpoints (the admission design's §2, W1 step 1).
+//! Stopping long work at bounded checkpoints (the admission design's Â§2, W1 step 1).
 //!
 //! A request has one [`StopSource`]: its cancellation flag and, optionally, a deadline. Each
 //! sequential loop or parallel task takes a [`Ticker`] from it and ticks the units of work it
@@ -196,35 +196,61 @@ mod tests {
         for stop_at in [1, 1000, 4095, 4096, 4097, 10_000] {
             let (flag, source) = flagged();
             let mut ticker = source.ticker().unwrap();
-            let mut units = 0u32;
-            let after = loop {
-                if units == stop_at {
+            let mut after = None;
+            for units in 1..=stop_at + POLL_UNITS {
+                if units - 1 == stop_at {
                     flag.store(true, Ordering::Relaxed);
                 }
-                units += 1;
-                if ticker.tick(1).is_err() {
-                    break units - stop_at;
+                if let Err(stop) = ticker.tick(1) {
+                    assert_eq!(stop, Stop::Cancelled);
+                    after = Some(units - stop_at);
+                    break;
                 }
-            };
+            }
+            let after = after.expect("periodic poll must stop within the bounded attempts");
             assert!(
                 after <= POLL_UNITS,
                 "stop at {stop_at}: {after} units after it"
             );
         }
-        let (flag, source) = flagged();
-        let mut ticker = source.ticker().unwrap();
-        assert_eq!(ticker.tick(3 * POLL_UNITS), Ok(()));
-        assert_eq!(
-            ticker.left(),
-            POLL_UNITS,
-            "one poll, then a fresh allowance"
-        );
-        flag.store(true, Ordering::Relaxed);
-        assert_eq!(
-            ticker.tick(1),
-            Ok(()),
-            "not polled before the allowance runs out"
-        );
+        // Count actual source calls, not just the final allowance: several polls could
+        // otherwise reset to the same value and escape the guard.
+        struct Counted<'a>(&'a StopSource, &'a std::sync::atomic::AtomicUsize);
+        impl StopCheck for Counted<'_> {
+            fn check(&self) -> Result<(), Stop> {
+                self.1.fetch_add(1, Ordering::Relaxed);
+                self.0.check()
+            }
+        }
+        for units in [3 * POLL_UNITS, u32::MAX] {
+            for stopped in [false, true] {
+                let (flag, source) = flagged();
+                let calls = std::sync::atomic::AtomicUsize::new(0);
+                let mut ticker = Ticker::new(Counted(&source, &calls)).unwrap();
+                assert_eq!(calls.load(Ordering::Relaxed), 1, "constructor checks once");
+                ticker.tick(POLL_UNITS - 1).unwrap();
+                assert_eq!(calls.load(Ordering::Relaxed), 1, "no early source call");
+                flag.store(stopped, Ordering::Relaxed);
+                let expected = if stopped {
+                    Err(Stop::Cancelled)
+                } else {
+                    Ok(())
+                };
+                assert_eq!(ticker.tick(units), expected);
+                assert_eq!(
+                    calls.load(Ordering::Relaxed),
+                    2,
+                    "oversized tick polls once"
+                );
+                assert_eq!(ticker.left(), POLL_UNITS);
+                assert_eq!(ticker.tick(units), expected);
+                assert_eq!(
+                    calls.load(Ordering::Relaxed),
+                    3,
+                    "already-stopped oversized tick polls once"
+                );
+            }
+        }
     }
 
     /// `ticker()` and `check()` check at once, and a deadline already passed stops the
@@ -260,19 +286,50 @@ mod tests {
     #[test]
     fn a_closure_backed_ticker_polls_the_closure() {
         let stopped = AtomicBool::new(false);
-        let check = || stopped.load(Ordering::Relaxed);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let check = || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            stopped.load(Ordering::Relaxed)
+        };
         let closure: &(dyn Fn() -> bool + Sync) = &check;
         assert_eq!(StopCheck::check(&closure), Ok(()));
         let mut ticker = Ticker::new(closure).unwrap();
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "direct and constructor checks"
+        );
         for _ in 0..1000 {
             ticker.tick(1).unwrap();
         }
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "no pre-checkpoint call");
         stopped.store(true, Ordering::Relaxed);
-        let mut after = 0;
-        while ticker.tick(1).is_ok() {
-            after += 1;
+        let mut after = None;
+        for units in 1..=POLL_UNITS {
+            if let Err(stop) = ticker.tick(1) {
+                assert_eq!(stop, Stop::Cancelled, "periodic error retains its reason");
+                after = Some(units);
+                break;
+            }
         }
-        assert!(after < POLL_UNITS, "{after} units after the stop");
+        assert_eq!(after, Some(POLL_UNITS - 1000), "bounded periodic stop");
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        stopped.store(false, Ordering::Relaxed);
+        assert_eq!(ticker.tick(u32::MAX), Ok(()));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            4,
+            "oversized closure tick polls once"
+        );
+        stopped.store(true, Ordering::Relaxed);
+        assert_eq!(ticker.tick(u32::MAX), Err(Stop::Cancelled));
+        assert_eq!(calls.load(Ordering::Relaxed), 5);
+        assert_eq!(ticker.tick(u32::MAX), Err(Stop::Cancelled));
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            6,
+            "already-stopped oversized tick polls once"
+        );
         assert_eq!(StopCheck::check(&closure), Err(Stop::Cancelled));
         assert!(matches!(Ticker::new(closure), Err(Stop::Cancelled)));
     }
