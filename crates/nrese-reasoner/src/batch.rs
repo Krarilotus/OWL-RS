@@ -31,7 +31,8 @@ use rayon::prelude::*;
 use super::delta::Interrupted;
 pub use super::eval::Schema;
 use super::eval::{
-    AllFacts, GroundProgram, Job, NEVER, Probes, Seg, Source, guards_hold, run_jobs_by_morsel,
+    AllFacts, GroundProgram, Job, NEVER, Poller, Probes, Seg, Source, guards_hold,
+    run_jobs_by_morsel,
 };
 use super::ir::{Head, Rule, Term};
 use super::ir::{Triple, Violation};
@@ -2314,8 +2315,10 @@ fn run(
     mut representatives: Option<Representatives>,
     stop: super::eval::Stop<'_>,
 ) -> Result<Materialisation, Interrupted> {
-    // The process's memory limit stops it too, whatever the caller polls.
-    let stop: super::eval::Stop<'_> = &|| stop() || super::eval::over_memory_limit();
+    // The process's memory limit stops it too, whatever the caller polls; once either has
+    // fired, the run stays stopped (an interrupted round is never taken as complete).
+    let latch = super::eval::Latched::new(|| stop() || super::eval::over_memory_limit());
+    let stop: super::eval::Stop<'_> = &|| latch.stopped();
     let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
     let mut phases = Phases {
         load,
@@ -2613,7 +2616,9 @@ fn run(
         0..program.consistency.len(),
         &[],
         &mut found,
+        stop,
     );
+    check_stop()?;
     result.violations = sorted(found);
     result.counters.lookups_without_order = store
         .relations
@@ -2735,13 +2740,16 @@ pub(crate) fn sorted(found: HashSet<Violation>) -> Vec<Violation> {
 }
 
 /// Evaluates consistency instances into `found`: those in `full` over all facts, and the
-/// `(instance, atom)` semi-naive variants in `variants` through the delta.
+/// `(instance, atom)` semi-naive variants in `variants` through the delta. Polls `stop` as
+/// the rule jobs do ([`Poller`]); once it fires, the rest is skipped and `found` is
+/// incomplete: the caller asks the stop again and discards it.
 pub(crate) fn check<S: Source + ?Sized>(
     source: &S,
     program: &GroundProgram,
     full: impl IntoIterator<Item = usize>,
     variants: &[(usize, usize)],
     found: &mut HashSet<Violation>,
+    stop: super::eval::Stop<'_>,
 ) {
     let record = |c: usize, bindings: &[Option<u64>], found: &mut HashSet<Violation>| {
         let (rule, grounded) = &program.consistency[c];
@@ -2774,10 +2782,16 @@ pub(crate) fn check<S: Source + ?Sized>(
         let ground_rule = &program.consistency[c].1.rule;
         jobs.extend(Job::variant(source, ground_rule, i).map(|job| (c, job)));
     }
+    let Some(mut poll) = Poller::new(stop) else {
+        return;
+    };
     for (c, job) in jobs {
-        job.run(source, 0..job.drivers(), &mut |bindings| {
+        job.run(source, 0..job.drivers(), &mut poll, &mut |bindings| {
             record(c, bindings, found)
         });
+        if poll.stopped() {
+            return;
+        }
     }
 }
 
