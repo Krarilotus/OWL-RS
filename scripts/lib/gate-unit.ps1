@@ -2,7 +2,9 @@
 # this wrapper owns its lifetime/deadline, not fleet's capacity/presence policy.
 param([Parameter(Mandatory=$true)][string]$ArgumentsJson)
 $ErrorActionPreference = 'Stop'
-$argv = @(ConvertFrom-Json $ArgumentsJson)
+# Windows PowerShell emits the JSON array as one pipeline object. Assign it
+# directly: @(... ) would wrap it again and join the whole argv as one string.
+$argv = ConvertFrom-Json $ArgumentsJson
 $n = [int]$env:FLEET_STEP - 1
 if (-not $env:FLEET_JOB -or $n -lt 0) { throw 'not an official fleet step' }
 $need = @(ConvertFrom-Json $env:NRESE_GATE_NEEDS)[$n]
@@ -72,6 +74,9 @@ $psi = New-Object Diagnostics.ProcessStartInfo
 # subsequent JobObject admission. Start the real process whose PID is capped.
 . (Join-Path $PSScriptRoot 'git-bash.ps1')
 $psi.FileName = Resolve-GitBash
+# This real Bash is not a login launcher. Its early cygpath/sleep/tee calls
+# need the selected installation on the child PATH, before the cap handshake.
+$psi.EnvironmentVariables['PATH'] = [IO.Path]::GetDirectoryName($psi.FileName) + ';' + $env:PATH
 $psi.Arguments = (($argv | ForEach-Object { QuoteArg ([string]$_) }) -join ' ')
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
