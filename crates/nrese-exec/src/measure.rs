@@ -211,7 +211,8 @@ fn require_measured() {
     let layout = Layout::new::<u8>();
     // SAFETY: a layout of non-zero size; the block, if one was made, is freed with it.
     unsafe {
-        let block = std::alloc::alloc(layout);
+        // Keep the probe observable: release optimization may elide an unused allocation.
+        let block = std::hint::black_box(std::alloc::alloc(layout));
         if !block.is_null() {
             std::alloc::dealloc(block, layout);
         }
