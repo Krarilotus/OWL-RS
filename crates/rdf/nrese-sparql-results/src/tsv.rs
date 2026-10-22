@@ -399,10 +399,9 @@ fn unescape(text: &str, string: bool) -> Result<String, String> {
                     .by_ref()
                     .take(if escaped == 'u' { 4 } else { 8 })
                     .collect();
-                let code = u32::from_str_radix(&digits, 16)
-                    .ok()
-                    .and_then(char::from_u32)
-                    .ok_or_else(|| format!("an invalid escape \\{escaped}{digits}"))?;
+                let escape = format!("\\{escaped}{digits}");
+                let code = nrese_rdf::escape::unicode_escape(escape.as_bytes(), 0)
+                    .ok_or_else(|| format!("an invalid escape {escape}"))?;
                 out.push(code);
             }
             't' if string => out.push('\t'),
@@ -506,5 +505,8 @@ mod tests {
             .is_err()
         );
         assert!(parse_row("\"x\"@en--LTR", 1, 1).is_err());
+        // A `\u` escape takes exactly four hex digits: never a shorter or signed code.
+        assert!(parse_row("\"\\u12\"", 1, 1).is_err());
+        assert!(parse_row("\"\\u+041\"", 1, 1).is_err());
     }
 }

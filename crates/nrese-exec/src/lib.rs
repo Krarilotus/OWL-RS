@@ -13,6 +13,8 @@
 //! - [`classes`]: equivalence classes by union (`owl:sameAs` classes)
 //! - [`budget`]: memory accounting: the server's budget, each request's envelope, its parts,
 //!   reservations and vectors charged before they grow
+//! - [`cell`]: a value built once per key while those who need it wait (helping with its
+//!   slices), never a Rayon worker waiting on parallel work it may hold
 //! - `measure` (tests, and the `measure` feature): holds what an operation allocates
 //!   against what it reserved
 //! - [`memory`]: the process's memory, and a watch for limits on long operations
@@ -31,6 +33,7 @@
 //! have no stored id.
 
 pub mod budget;
+pub mod cell;
 pub mod classes;
 pub mod graph;
 pub mod group;
@@ -58,7 +61,7 @@ static MEASURED: measure::Measured<std::alloc::System> = measure::Measured(std::
 pub use join::RowLimit;
 pub use narrow::RepresentationLimit;
 pub use region::{BoundTooLarge, Pages, Region, Settled};
-pub use stop::{POLL_UNITS, Stop, StopSource, Ticker};
+pub use stop::{POLL_UNITS, Stop, StopCheck, StopSource, Ticker};
 pub use table::IdTable;
 
 /// A hash map keyed by term ids, with the fast hasher the operators use.
