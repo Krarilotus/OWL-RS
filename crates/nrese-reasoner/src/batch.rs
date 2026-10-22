@@ -31,7 +31,7 @@ use rayon::prelude::*;
 use super::delta::Interrupted;
 pub use super::eval::Schema;
 use super::eval::{
-    AllFacts, GroundProgram, Job, NEVER, Poller, Probes, Seg, Source, guards_hold,
+    AllFacts, GroundProgram, Job, NEVER, Poller, Probes, Seg, Source, guards_hold_polled,
     run_jobs_by_morsel,
 };
 use super::ir::{Head, Rule, Term};
@@ -2361,6 +2361,10 @@ fn run(
     // Evaluate the rules with class guards again in full: classes merged, so bindings
     // they failed may hold now, with no new fact to match.
     let mut reevaluate = false;
+    // Only these source rules can have schema bindings a later class merge enables.
+    // Keep the sources, including ones that filed no instance; ordinary RL grounding
+    // stays semi-naive and carries no such obligation.
+    let mut guarded_schema = Vec::new();
     // Facts to add in the first round, checked against the store: the input's stale
     // facts rewritten, where the input asserts equalities.
     let mut pending: Vec<Triple> = Vec::new();
@@ -2399,6 +2403,7 @@ fn run(
         let stale = representatives.as_ref().map_or(&none, |r| &r.stale);
         // Rules from `evaluated` on were added this round: evaluated once in full.
         let evaluated = program.rules.len();
+        let mut grounded_all = false;
         if regrounding || reground_all {
             let current = Current {
                 store: &store,
@@ -2411,13 +2416,20 @@ fn run(
             if let Some(reps) = &representatives {
                 source = reps.guarded(source);
             }
+            guarded_schema = source
+                .iter()
+                .filter(|rule| {
+                    rule.guards
+                        .iter()
+                        .any(|guard| matches!(guard, super::ir::Guard::Classes(_)))
+                        && rule.body.iter().any(|atom| schema.is_schema_atom(atom))
+                })
+                .cloned()
+                .collect();
             // The first round grounds everything; later ones through new schema facts
             // only (list rules in full, deduplicated).
-            if result.rounds == 1 || reground_all {
-                program.ground(&current, schema, &source);
-            } else {
-                program.ground_delta(&current, schema, &source);
-            }
+            grounded_all = result.rounds == 1 || reground_all;
+            program.ground_until(&current, schema, &source, !grounded_all, stop)?;
             reground_all = false;
             for &p in &program.transitive {
                 transitive.register(p);
@@ -2425,6 +2437,13 @@ fn run(
             for (&p, &family) in &program.family_relations {
                 store.claim(p, family);
             }
+        }
+        if reevaluate && !grounded_all && !guarded_schema.is_empty() {
+            let current = Current {
+                store: &store,
+                stale,
+            };
+            program.ground_until(&current, schema, &guarded_schema, false, stop)?;
         }
         // The object orders the rules can use, built where they became needed and
         // dropped where nothing reads them (P1-F11).
@@ -2607,11 +2626,12 @@ fn run(
         phases.new_facts += new as u64;
         result.counters.store_bytes.push(store.bytes());
         reevaluate = merged
-            && program.rules.iter().any(|rule| {
-                rule.guards
-                    .iter()
-                    .any(|guard| matches!(guard, super::ir::Guard::Classes(_)))
-            });
+            && (!guarded_schema.is_empty()
+                || program.rules.iter().any(|rule| {
+                    rule.guards
+                        .iter()
+                        .any(|guard| matches!(guard, super::ir::Guard::Classes(_)))
+                }));
         if new == 0 && !reground_all && !reevaluate {
             break;
         }
@@ -2639,7 +2659,7 @@ fn run(
             Some(reps) => reps.guarded(checks),
             None => checks,
         };
-        program.ground(&current, schema, &checks);
+        program.ground_until(&current, schema, &checks, false, stop)?;
     }
     let reads = Reads::of(
         program.rules.iter().chain(
@@ -2803,6 +2823,9 @@ pub(crate) fn check<S: Source + ?Sized>(
     found: &mut HashSet<Violation>,
     stop: super::eval::Stop<'_>,
 ) {
+    let Some(mut poll) = Poller::new(stop) else {
+        return;
+    };
     let record = |c: usize, bindings: &[Option<u64>], found: &mut HashSet<Violation>| {
         let (rule, grounded) = &program.consistency[c];
         // The job's bindings are sized for the grounded instance, which lacks the schema
@@ -2823,8 +2846,14 @@ pub(crate) fn check<S: Source + ?Sized>(
     for c in full {
         let ground_rule = &program.consistency[c].1.rule;
         if ground_rule.body.is_empty() {
-            if guards_hold(&ground_rule.guards, &program.consistency[c].1.substitution) {
-                record(c, &vec![None; program.consistency[c].0.variables()], found);
+            match guards_hold_polled(
+                &ground_rule.guards,
+                &program.consistency[c].1.substitution,
+                &mut poll,
+            ) {
+                Ok(true) => record(c, &vec![None; program.consistency[c].0.variables()], found),
+                Ok(false) => {}
+                Err(_) => return,
             }
         } else {
             jobs.extend(Job::full(source, ground_rule).map(|job| (c, job)));
@@ -2834,15 +2863,96 @@ pub(crate) fn check<S: Source + ?Sized>(
         let ground_rule = &program.consistency[c].1.rule;
         jobs.extend(Job::variant(source, ground_rule, i).map(|job| (c, job)));
     }
-    let Some(mut poll) = Poller::new(stop) else {
-        return;
-    };
     for (c, job) in jobs {
         job.run(source, 0..job.drivers(), &mut poll, &mut |bindings| {
             record(c, bindings, found)
         });
         if poll.stopped() {
             return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod guard_stop_tests {
+    use super::*;
+    use crate::ir::{Atom, Guard};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    /// The old search is finite here (7!, not the 15! witness). A stop armed only while
+    /// the guard reads the classes proves polling inside both DFS and candidate work;
+    /// the materialisation must return Interrupted, never a completed negative result.
+    #[test]
+    fn exact_identity_work_observes_the_materialisation_stop() {
+        let (p, z, same_as, m, q) = (1_000_000, 1_000_001, 1_000_002, 1_000_003, 1_000_004);
+        for search in [true, false] {
+            let members = if search {
+                7
+            } else {
+                2 * nrese_exec::POLL_UNITS as u64
+            };
+            let variables = if search { 8u8 } else { 1 };
+            let mut guards = Vec::new();
+            if search {
+                for a in 0..variables {
+                    for b in a + 1..variables {
+                        guards.push(Guard::NotEqual(Term::Var(a), Term::Var(b)));
+                    }
+                }
+            } else {
+                guards.push(Guard::NotIn(Term::Var(0), 1, members));
+            }
+            let rule = Rule {
+                name: "guard-stop".to_owned(),
+                body: (0..variables)
+                    .map(|v| Atom([Term::Var(v), Term::Const(p), Term::Const(z)]))
+                    .collect(),
+                guards,
+                head: Head::Facts(vec![Atom([Term::Const(m), Term::Const(q), Term::Const(z)])]),
+            };
+            let mut input = vec![[1, p, z]];
+            input.extend((2..=members).map(|id| [1, same_as, id]));
+            let published = super::super::representatives::SharedClasses::default();
+            let inside = AtomicUsize::new(0);
+            let stop = || {
+                if matches!(
+                    published.try_write(),
+                    Err(std::sync::TryLockError::WouldBlock)
+                ) {
+                    inside.fetch_add(1, Relaxed);
+                    true
+                } else {
+                    false
+                }
+            };
+            let reps = Representatives {
+                same_as,
+                classes: Default::default(),
+                published: Arc::clone(&published),
+                stale: TermSet::default(),
+                shared: TermSet::default(),
+                listing: Listing::Representatives,
+                merges: 0,
+            };
+            let schema = Schema::owl(&mut crate::vocabulary::LocalVocabulary::default());
+            let result = run(
+                Store::new(input),
+                std::time::Duration::ZERO,
+                &[rule],
+                None,
+                &schema,
+                Some(reps),
+                &stop,
+            );
+            assert!(
+                matches!(result, Err(Interrupted)),
+                "search={search}: {result:?}"
+            );
+            assert_eq!(
+                inside.load(Relaxed),
+                1,
+                "stopped at the first in-guard poll"
+            );
         }
     }
 }

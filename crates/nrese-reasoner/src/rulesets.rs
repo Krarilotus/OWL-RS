@@ -61,6 +61,13 @@ pub const ALL: [Ruleset; 6] = [
 /// so stores materialised by an older build rebuild instead of trusting their state.
 pub const SEMANTICS_VERSION: u32 = 2;
 
+/// OWL value-space checking, including mapped ill-typed literals and identity guards
+/// over equality classes. Every built-in can type a literal through rdfs:range; custom
+/// programs need this feature only if a head can produce type/equality facts. Such a
+/// program also covers representative evaluation (its replacement heads have variable
+/// predicates). Unaffected custom programs retain their persisted fingerprint.
+pub(crate) const VALUE_CHECK_SEMANTICS: &[u8] = b"owl-value-and-identity-checks:1";
+
 impl Ruleset {
     /// Identifies what this ruleset derives: FNV-1a over [`SEMANTICS_VERSION`], the name,
     /// the rule text, and the name and text of every OWL 2 RL rule it adds (the bodies it
@@ -83,6 +90,7 @@ impl Ruleset {
             feed(rule.source.as_bytes());
         }
         feed(self.axioms().as_bytes());
+        feed(VALUE_CHECK_SEMANTICS);
         hash
     }
 
