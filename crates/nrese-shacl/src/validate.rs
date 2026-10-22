@@ -506,6 +506,8 @@ impl<'a, V: ReadView> Validator<'a, V> {
         check: &SparqlCheck,
         results: &mut Vec<RawResult>,
     ) {
+        let program = &self.shapes.programs[check.program];
+        let parameters = &self.shapes.parameter_values[check.parameters.clone()];
         let shape = &self.shapes.shapes[shape_ref];
         let (view, data) = self.graph.parts();
         let raw = |value: Option<TermId>, path: Option<Path>| RawResult {
@@ -513,9 +515,9 @@ impl<'a, V: ReadView> Validator<'a, V> {
             path,
             value,
             shape: shape_ref,
-            component: check.component,
-            source: Some(check.source),
-            messages: (!check.messages.is_empty()).then(|| check.messages.clone()),
+            component: program.component,
+            source: Some(program.source),
+            messages: (!program.messages.is_empty()).then(|| program.messages.clone()),
         };
         let failure = |problem: &str| {
             let at = self
@@ -530,7 +532,8 @@ impl<'a, V: ReadView> Validator<'a, V> {
         let outcome = sparql::run(
             view,
             data,
-            check,
+            program,
+            parameters,
             focus,
             values,
             shape.node,

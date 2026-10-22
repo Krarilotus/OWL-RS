@@ -124,6 +124,7 @@ fn incremental_validation_equals_the_difference_of_full_validations() {
         let shapes = compile(
             &before,
             Selection::asserted(GraphSelector::Exact(shapes_id)),
+            &Default::default(),
         )
         .unwrap_or_else(|errors| panic!("{errors:?}"));
         let data = Selection::of(GraphSelector::Exact(TermId::DEFAULT_GRAPH));

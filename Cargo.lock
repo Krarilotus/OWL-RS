@@ -1290,6 +1290,7 @@ name = "nrese-shacl"
 version = "0.1.0"
 dependencies = [
  "nrese-engine",
+ "nrese-exec",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-sparql",
