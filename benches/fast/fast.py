@@ -1252,6 +1252,12 @@ def cold_cache_command() -> str | None:
     return (config or {}).get("cold_cache")
 
 
+def unsupported_cache_dimensions(cases: list[dict]) -> dict:
+    """Declare unavailable cold series before executing a pass; keep the planned family intact."""
+    from measurement_support import unsupported_cold
+    return unsupported_cold(cases, case_manifest(cases)["series"], page_cache_modes)
+
+
 def drop_page_cache(record: dict) -> bool:
     """Empties the page cache (the host's cold_cache command); a failure ends the case's
     runs as a harness failure."""
@@ -1598,7 +1604,8 @@ def run(args) -> int:
               "git": manifest.git(ROOT), "machine": manifest.machine(RUNTIME, ROOT), "runtime": RUNTIME,
               "reps": args.reps, "planned_cases": [c["name"] for c in cases],
               "all_cases": [c["name"] for c in catalog], "case_manifest": case_manifest(catalog),
-              "options": dict(OPTIONS), "records": []}
+              "options": dict(OPTIONS), "records": [],
+              "unsupported_dimensions": unsupported_cache_dimensions(cases)}
     if prepared:
         report["prepared"] = {"manifest_sha256": prepared["sha256"], "files": len(prepared["files"])}
     # The host as the pass met it, and as it left it: a governor, boost or another user's work
@@ -1813,6 +1820,7 @@ def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict],
               "layout": args.layout, "planned_cases": [c["name"] for c in cases], "seed": seed,
               "orientation": [name for name, run in order if run == 1],
               "case_manifest": case_manifest(catalog), "host_state": host_state(),
+              "unsupported_dimensions": unsupported_cache_dimensions(cases),
               "prepared": {"manifest_sha256": prepared["sha256"], "files": len(prepared["files"])}}
     reports = {}
     for name, run in order:
