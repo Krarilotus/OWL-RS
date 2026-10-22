@@ -259,8 +259,10 @@ pub fn update_with<B: Base + ?Sized>(
     stop: Stop<'_>,
     policy: policy::Policy,
 ) -> Result<Update, Interrupted> {
-    // The process's memory limit stops it too, whatever the caller polls.
-    let stop: Stop<'_> = &|| stop() || super::eval::over_memory_limit();
+    // The process's memory limit stops it too, whatever the caller polls; once either has
+    // fired, the update stays stopped (an interrupted round is never taken as complete).
+    let latch = super::eval::Latched::new(|| stop() || super::eval::over_memory_limit());
+    let stop: Stop<'_> = &|| latch.stopped();
     let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
     let mut result = Update::default();
     if policy.rebuilds_at_once() {
@@ -566,7 +568,9 @@ pub fn update_with<B: Base + ?Sized>(
                 // Independent per candidate: in parallel.
                 candidates = candidates
                     .into_par_iter()
-                    .filter(|&f| stop() || !old_program.derivable_by(&left, f, &non_recursive))
+                    .filter(|&f| {
+                        stop() || !old_program.derivable_by(&left, f, &non_recursive, stop)
+                    })
                     .collect();
                 check_stop()?;
             }
@@ -584,6 +588,7 @@ pub fn update_with<B: Base + ?Sized>(
                 let fresh_prover = || Prover {
                     base,
                     program: old_program,
+                    stop,
                     proved: HashSet::new(),
                     failed: HashSet::new(),
                     active: HashSet::new(),
@@ -670,7 +675,7 @@ pub fn update_with<B: Base + ?Sized>(
             let by_rules: Vec<Triple> = open
                 .par_iter()
                 .copied()
-                .filter(|&f| !stop() && program.derivable_by(&remaining, f, &not_equality))
+                .filter(|&f| !stop() && program.derivable_by(&remaining, f, &not_equality, stop))
                 .collect();
             let by_rules: HashSet<Triple> = by_rules.into_iter().collect();
             check_stop()?;
@@ -738,7 +743,7 @@ pub fn update_with<B: Base + ?Sized>(
         .filter(|&fact| {
             !stop()
                 && !base.is_asserted(fact)
-                && settled.derivable_with(&remaining, fact, !recloses.contains(&fact[1]))
+                && settled.derivable_with(&remaining, fact, !recloses.contains(&fact[1]), stop)
         })
         .collect();
     rederived.extend(others);
@@ -897,6 +902,7 @@ pub fn update_with<B: Base + ?Sized>(
         settled_consistency..program.consistency.len(),
         &variants,
         &mut found,
+        stop,
     );
     check_stop()?;
     result.violations = sorted(found);
@@ -1002,6 +1008,9 @@ impl<S: Source + ?Sized> Source for Outside<'_, S> {
 struct Prover<'a, B: Base + ?Sized> {
     base: &'a B,
     program: &'a GroundProgram,
+    /// The update's stop, polled while derivations are searched: one search that finds
+    /// nothing can try a product of a body's matches.
+    stop: Stop<'a>,
     proved: HashSet<Triple>,
     failed: HashSet<Triple>,
     active: HashSet<Triple>,
@@ -1045,10 +1054,20 @@ impl<B: Base + ?Sized> Prover<'_, B> {
         if self.active.contains(&fact) || self.budget == 0 || depth > PROOF_DEPTH {
             return (false, true);
         }
+        // Stopped, nothing is decided: unproved and cut, so the failure isn't memoised (the
+        // update is interrupted anyway: its stop stays stopped).
+        let Some(mut poll) = super::eval::Poller::new(self.stop) else {
+            return (false, true);
+        };
         self.budget -= 1;
+        let mut bodies = self
+            .program
+            .derivation_bodies(state, fact, PROOF_BRANCHES, &mut poll);
+        if poll.stopped() {
+            return (false, true);
+        }
         self.active.insert(fact);
         let mut cut = false;
-        let mut bodies = self.program.derivation_bodies(state, fact, PROOF_BRANCHES);
         if self.program.bodiless.contains(&fact) {
             bodies.insert(0, self.program.bodiless_premises(fact).to_vec());
         }

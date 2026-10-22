@@ -317,7 +317,13 @@ pub fn guards_hold(guards: &[Guard], bindings: &[Option<u64>]) -> bool {
         .all(|guard| guard.holds(|term| value(term, bindings)))
 }
 
-/// Evaluates `order[depth..]` of `body`, calling `emit` for each complete binding.
+/// Evaluates `order[depth..]` of `body`, calling `emit` for each complete binding. Each
+/// fact it scans, bound or not, is one unit `poll` counts; once the stop has fired, the rest
+/// of each scan under way is passed over (a scan can't be stopped) and nothing deeper is
+/// scanned, so one driver's fan-out can't outlive the stop by more than [`POLL_UNITS`].
+///
+/// [`POLL_UNITS`]: nrese_exec::POLL_UNITS
+#[allow(clippy::too_many_arguments)]
 pub fn walk<S: Source + ?Sized>(
     source: &S,
     body: &[Atom],
@@ -325,6 +331,7 @@ pub fn walk<S: Source + ?Sized>(
     order: &[(usize, Seg)],
     depth: usize,
     bindings: &mut [Option<u64>],
+    poll: &mut Poller<'_>,
     emit: &mut dyn FnMut(&[Option<u64>]),
 ) {
     let Some(&(index, seg)) = order.get(depth) else {
@@ -335,8 +342,11 @@ pub fn walk<S: Source + ?Sized>(
     };
     let atom = &body[index];
     source.scan(pattern(atom, bindings), seg, &mut |fact| {
+        if poll.tick() {
+            return;
+        }
         if let Some(newly) = bind(atom, fact, bindings) {
-            walk(source, body, guards, order, depth + 1, bindings, emit);
+            walk(source, body, guards, order, depth + 1, bindings, poll, emit);
             unbind(atom, newly, bindings);
         }
     });
@@ -345,8 +355,10 @@ pub fn walk<S: Source + ?Sized>(
 /// [`walk`] that stops once `emit` returns true: the rest of a scan under way is passed
 /// over (a scan can't be stopped) and nothing deeper is scanned, so asking for one
 /// derivation doesn't enumerate the whole join (the review of 3 October 2026, P6).
-/// Returns whether `emit` stopped it. Kept apart from [`walk`], which materialisation
-/// runs and which never stops.
+/// Returns whether `emit` stopped it. It also stops at `poll`, as [`walk`] does: a search
+/// that finds nothing can try every partial binding of the body, a product of the
+/// atoms' matches (`poll.stopped()` then tells that nothing was decided).
+#[allow(clippy::too_many_arguments)]
 pub fn walk_until<S: Source + ?Sized>(
     source: &S,
     body: &[Atom],
@@ -354,6 +366,7 @@ pub fn walk_until<S: Source + ?Sized>(
     order: &[(usize, Seg)],
     depth: usize,
     bindings: &mut [Option<u64>],
+    poll: &mut Poller<'_>,
     emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
 ) -> bool {
     let Some(&(index, seg)) = order.get(depth) else {
@@ -362,11 +375,11 @@ pub fn walk_until<S: Source + ?Sized>(
     let atom = &body[index];
     let mut stopped = false;
     source.scan(pattern(atom, bindings), seg, &mut |fact| {
-        if stopped {
+        if stopped || poll.tick() {
             return;
         }
         if let Some(newly) = bind(atom, fact, bindings) {
-            stopped = walk_until(source, body, guards, order, depth + 1, bindings, emit);
+            stopped = walk_until(source, body, guards, order, depth + 1, bindings, poll, emit);
             unbind(atom, newly, bindings);
         }
     });
@@ -545,6 +558,8 @@ pub fn ground<S: Source + ?Sized>(
         &order,
         0,
         &mut bindings,
+        // Grounding runs to its end: a program grounded part-way would be kept as if whole.
+        &mut Poller::never(),
         &mut |substitution| {
             if let Some(grounded) = instance(rule, &instance_atoms, substitution) {
                 emit(grounded);
@@ -587,6 +602,7 @@ pub fn ground_delta<S: Source + ?Sized>(
             &order,
             0,
             &mut bindings,
+            &mut Poller::never(),
             &mut |substitution| {
                 if let Some(grounded) = instance(rule, &instance_atoms, substitution) {
                     emit(grounded);
@@ -708,16 +724,22 @@ impl<'r> Job<'r> {
         }
     }
 
-    /// Runs the variant for `drivers[range]`, calling `emit` with each complete binding.
+    /// Runs the variant for `drivers[range]`, calling `emit` with each complete binding,
+    /// counting each driver and each fact the walk scans on `poll` ([`walk`]): once it has
+    /// fired, the rest is passed over and `poll` says so.
     pub fn run<S: Source + ?Sized>(
         &self,
         source: &S,
         range: std::ops::Range<usize>,
+        poll: &mut Poller<'_>,
         emit: &mut dyn FnMut(&[Option<u64>]),
     ) {
         let mut bindings = vec![None; self.rule.variables()];
         let driver = &self.rule.body[self.order[0].0];
         let mut visit = |fact: Triple| {
+            if poll.tick() {
+                return;
+            }
             if let Some(newly) = bind(driver, fact, &mut bindings) {
                 walk(
                     source,
@@ -726,6 +748,7 @@ impl<'r> Job<'r> {
                     &self.order,
                     1,
                     &mut bindings,
+                    poll,
                     emit,
                 );
                 unbind(driver, newly, &mut bindings);
@@ -740,9 +763,51 @@ impl<'r> Job<'r> {
 
 /// Runs `jobs` in parallel morsels; returns the facts their heads derive that `keep`
 /// accepts (typically: not yet in the source).
-/// Asked between units of work: `true` means stop (the caller gave up). Polling it is an
-/// atomic load in practice, so it is checked per morsel.
+/// Asked between units of work: `true` means stop (the caller gave up). It is asked at each
+/// morsel's start and, through a [`Poller`], every [`POLL_UNITS`] facts a morsel scans.
+///
+/// [`POLL_UNITS`]: nrese_exec::POLL_UNITS
 pub type Stop<'a> = &'a (dyn Fn() -> bool + Sync);
+
+/// What [`walk`] and [`Job::run`] poll a [`Stop`] with: nrese-exec's [`Ticker`] over it, one
+/// unit per fact scanned, and whether it has fired. One per morsel (a rayon task).
+///
+/// [`Ticker`]: nrese_exec::Ticker
+pub struct Poller<'a> {
+    ticker: nrese_exec::Ticker<Stop<'a>>,
+    stopped: bool,
+}
+
+impl<'a> Poller<'a> {
+    /// A poller of `stop`, or `None` if it has fired already.
+    pub fn new(stop: Stop<'a>) -> Option<Self> {
+        nrese_exec::Ticker::new(stop).ok().map(|ticker| Self {
+            ticker,
+            stopped: false,
+        })
+    }
+
+    /// One that never fires, for work that has to run to its end (grounding: a program
+    /// grounded part-way would be kept as if whole).
+    pub fn never() -> Self {
+        Self::new(NEVER).expect("NEVER doesn't stop")
+    }
+
+    /// Whether the stop fired: what was found since is incomplete.
+    pub fn stopped(&self) -> bool {
+        self.stopped
+    }
+
+    /// Counts one unit; true once the stop has fired. The common path is a test of
+    /// `stopped` and the ticker's countdown: no call, no atomic.
+    #[inline]
+    fn tick(&mut self) -> bool {
+        if !self.stopped && self.ticker.tick(1).is_err() {
+            self.stopped = true;
+        }
+        self.stopped
+    }
+}
 
 fn never() -> bool {
     false
@@ -758,6 +823,39 @@ pub const NEVER: Stop<'static> = &never;
 /// deadline, 6 October 2026); the caller tells the two apart by asking this again.
 pub fn over_memory_limit() -> bool {
     nrese_exec::memory::process_limit_exceeded()
+}
+
+/// A [`Stop`] that stays stopped: once it has read true, it reads true for the rest of the
+/// operation it was made for. Interrupted work is found by asking the stop again
+/// ([`run_jobs`] skips what remains, its caller re-asks), and a stop the process's memory
+/// limit fires reads false again once memory is freed ([`over_memory_limit`]): without the
+/// latch, an interrupted round could pass as complete. The flag is read only when the stop
+/// is asked (between units of work, at a [`Poller`]'s poll), never per fact.
+pub struct Latched<F> {
+    stop: F,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+impl<F: Fn() -> bool + Sync> Latched<F> {
+    pub fn new(stop: F) -> Self {
+        Self {
+            stop,
+            fired: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the stop has fired, now or before.
+    pub fn stopped(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.fired.load(Relaxed) {
+            return true;
+        }
+        let stopped = (self.stop)();
+        if stopped {
+            self.fired.store(true, Relaxed);
+        }
+        stopped
+    }
 }
 
 /// Every fact `jobs` derive that `keep` accepts. If `stop` fires, the remaining morsels
@@ -886,12 +984,12 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
             let Head::Facts(heads) = &job.rule.head else {
                 return finish(*j, Vec::new());
             };
-            if stop() {
+            let Some(mut poll) = Poller::new(stop) else {
                 return finish(*j, Vec::new());
-            }
+            };
             let mut out = Vec::new();
             let mut enumerated = 0u64;
-            job.run(source, range.clone(), &mut |bindings| {
+            job.run(source, range.clone(), &mut poll, &mut |bindings| {
                 enumerated += 1;
                 for head in heads {
                     let fact = instantiate_head(head, bindings);
@@ -906,6 +1004,10 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
                     }
                 }
             });
+            // Stopped part-way: the caller discards the round (it asks the stop again).
+            if poll.stopped() {
+                return finish(*j, Vec::new());
+            }
             // The morsel's duplicates go before `keep` probes the source, and the probes
             // run in (predicate, subject, object) order: about half of an OWL 2 RL round's
             // candidates repeat within it, and sorted probes let a store read a relation's
@@ -942,6 +1044,7 @@ pub fn derivations<S: Source + ?Sized>(
     rule: &Rule,
     fact: Triple,
     seg: Seg,
+    poll: &mut Poller<'_>,
     emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
 ) {
     let Head::Facts(heads) = &rule.head else {
@@ -973,11 +1076,12 @@ pub fn derivations<S: Source + ?Sized>(
                 &order,
                 0,
                 &mut bindings,
+                poll,
                 emit,
             )
         };
         unbind(head, newly, &mut bindings);
-        if stop {
+        if stop || poll.stopped() {
             return;
         }
     }
@@ -1480,13 +1584,16 @@ impl GroundProgram {
     /// The bodies (instantiated premises, plus the schema facts the instance was grounded
     /// on) of up to `limit` one-step derivations of `fact` over `source`, by rules whose
     /// head matches it and transitivity. Bodiless instances are in [`Self::bodiless`].
+    /// The search polls `poll` ([`walk_until`]): once it has stopped, what was found is
+    /// incomplete, and finding nothing decides nothing.
     pub fn derivation_bodies<S: Source + ?Sized>(
         &self,
         source: &S,
         fact: Triple,
         limit: usize,
+        poll: &mut Poller<'_>,
     ) -> Vec<Vec<Triple>> {
-        self.named_derivations(source, fact, limit)
+        self.named_derivations_polled(source, fact, limit, poll)
             .into_iter()
             .map(|(_, body)| body)
             .collect()
@@ -1499,6 +1606,17 @@ impl GroundProgram {
         source: &S,
         fact: Triple,
         limit: usize,
+    ) -> Vec<(String, Vec<Triple>)> {
+        self.named_derivations_polled(source, fact, limit, &mut Poller::never())
+    }
+
+    /// [`Self::named_derivations`], polling `poll`.
+    fn named_derivations_polled<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        fact: Triple,
+        limit: usize,
+        poll: &mut Poller<'_>,
     ) -> Vec<(String, Vec<Triple>)> {
         let mut producers = Vec::new();
         self.heads.matching_fact(fact, &mut producers);
@@ -1519,7 +1637,7 @@ impl GroundProgram {
             .chain(transitive.as_ref().map(|rule| (rule, transitive_premises)));
         let mut bodies = Vec::new();
         for (rule, premises) in rules {
-            derivations(source, rule, fact, Seg::All, &mut |bindings| {
+            derivations(source, rule, fact, Seg::All, poll, &mut |bindings| {
                 let mut body: Vec<Triple> = rule
                     .body
                     .iter()
@@ -1529,7 +1647,7 @@ impl GroundProgram {
                 bodies.push((rule.name.clone(), body));
                 bodies.len() >= limit
             });
-            if bodies.len() >= limit {
+            if bodies.len() >= limit || poll.stopped() {
                 break;
             }
         }
@@ -1565,19 +1683,26 @@ impl GroundProgram {
         let mut bodies = Vec::new();
         for (rule, grounding) in rules {
             let alternatives = self.premise_alternatives(grounding);
-            derivations(source, rule, fact, Seg::All, &mut |bindings| {
-                let body: Vec<Triple> = rule
-                    .body
-                    .iter()
-                    .map(|atom| instantiate_head(atom, bindings))
-                    .collect();
-                for premises in &alternatives {
-                    let mut full = body.clone();
-                    full.extend_from_slice(premises);
-                    bodies.push((rule.name.clone(), full));
-                }
-                bodies.len() >= limit
-            });
+            derivations(
+                source,
+                rule,
+                fact,
+                Seg::All,
+                &mut Poller::never(),
+                &mut |bindings| {
+                    let body: Vec<Triple> = rule
+                        .body
+                        .iter()
+                        .map(|atom| instantiate_head(atom, bindings))
+                        .collect();
+                    for premises in &alternatives {
+                        let mut full = body.clone();
+                        full.extend_from_slice(premises);
+                        bodies.push((rule.name.clone(), full));
+                    }
+                    bodies.len() >= limit
+                },
+            );
             if bodies.len() >= limit {
                 break;
             }
@@ -1588,39 +1713,63 @@ impl GroundProgram {
     /// Whether `fact` has a one-step derivation from the facts of `source` (`Seg::All`):
     /// a bodiless instance, a rule whose head matches it, or transitivity.
     pub fn derivable<S: Source + ?Sized>(&self, source: &S, fact: Triple) -> bool {
-        self.derivable_with(source, fact, true)
+        self.derivable_with(source, fact, true, NEVER)
     }
 
     /// [`Self::derivable`], optionally without transitivity (whose closure the caller
-    /// recomputes).
+    /// recomputes), polling `stop` as rule jobs do: a search that finds nothing can try a
+    /// product of the body's matches. Once `stop` fires the answer is `false`, decided by
+    /// nothing; the caller asks `stop` again (it stays stopped, [`Latched`]) and discards
+    /// what it found.
     pub fn derivable_with<S: Source + ?Sized>(
         &self,
         source: &S,
         fact: Triple,
         transitivity_too: bool,
+        stop: Stop<'_>,
     ) -> bool {
         if self.bodiless.contains(&fact) {
             return true;
         }
+        let Some(mut poll) = Poller::new(stop) else {
+            return false;
+        };
         let mut producers = Vec::new();
         self.heads.matching_fact(fact, &mut producers);
         producers.sort_unstable();
         producers.dedup_by_key(|(r, _)| *r);
         let mut found = false;
         for (r, _) in producers {
-            derivations(source, &self.rules[r], fact, Seg::All, &mut |_| {
-                found = true;
-                true
-            });
+            derivations(
+                source,
+                &self.rules[r],
+                fact,
+                Seg::All,
+                &mut poll,
+                &mut |_| {
+                    found = true;
+                    true
+                },
+            );
             if found {
                 return true;
             }
+            if poll.stopped() {
+                return false;
+            }
         }
         if transitivity_too && self.transitive.contains(&fact[1]) {
-            derivations(source, &transitivity(fact[1]), fact, Seg::All, &mut |_| {
-                found = true;
-                true
-            });
+            derivations(
+                source,
+                &transitivity(fact[1]),
+                fact,
+                Seg::All,
+                &mut poll,
+                &mut |_| {
+                    found = true;
+                    true
+                },
+            );
         }
         found
     }
@@ -1661,13 +1810,18 @@ impl GroundProgram {
             .collect()
     }
 
-    /// Whether one of the rules `only` marks derives `fact` from `source` in one step.
+    /// Whether one of the rules `only` marks derives `fact` from `source` in one step,
+    /// polling `stop` as [`Self::derivable_with`] does.
     pub fn derivable_by<S: Source + ?Sized>(
         &self,
         source: &S,
         fact: Triple,
         only: &[bool],
+        stop: Stop<'_>,
     ) -> bool {
+        let Some(mut poll) = Poller::new(stop) else {
+            return false;
+        };
         let mut producers = Vec::new();
         self.heads.matching_fact(fact, &mut producers);
         producers.sort_unstable();
@@ -1677,12 +1831,22 @@ impl GroundProgram {
             if !only.get(r).copied().unwrap_or(false) {
                 continue;
             }
-            derivations(source, &self.rules[r], fact, Seg::All, &mut |_| {
-                found = true;
-                true
-            });
+            derivations(
+                source,
+                &self.rules[r],
+                fact,
+                Seg::All,
+                &mut poll,
+                &mut |_| {
+                    found = true;
+                    true
+                },
+            );
             if found {
                 return true;
+            }
+            if poll.stopped() {
+                return false;
             }
         }
         false
@@ -1761,6 +1925,45 @@ mod tests {
         }
     }
 
+    /// One driver whose body joins two atoms of `n` matches each is n² bindings in one
+    /// morsel. A stop that fires once the morsel has started ends it within `POLL_UNITS`
+    /// scanned facts (plus the scans under way), not after the whole product (RSH-18).
+    #[test]
+    fn a_morsel_stops_within_its_poll_interval() {
+        let n = 300u64;
+        let mut facts = vec![[1, 11, 2]];
+        facts.extend((0..n).map(|i| [100 + i, 12, 1000 + i]));
+        let source = Counting {
+            facts,
+            scans: AtomicUsize::new(0),
+            matches: AtomicUsize::new(0),
+        };
+        let var = Term::Var;
+        let rule = Rule {
+            name: "product".into(),
+            body: vec![
+                Atom([var(0), Term::Const(11), var(1)]),
+                Atom([var(2), Term::Const(12), var(3)]),
+                Atom([var(4), Term::Const(12), var(5)]),
+            ],
+            guards: vec![],
+            head: Head::Facts(vec![Atom([var(0), Term::Const(13), var(5)])]),
+        };
+        let jobs: Vec<Job<'_>> = Job::full(&source, &rule).into_iter().collect();
+        assert_eq!(jobs[0].drivers(), 1, "one driver, one morsel");
+        let asks = AtomicUsize::new(0);
+        // Not at the morsel's start; at every ask after it.
+        let stop = || asks.fetch_add(1, Ordering::Relaxed) >= 1;
+        let _ = run_jobs(&source, &jobs, &|_| true, &stop);
+        let scanned = source.matches.load(Ordering::Relaxed);
+        let bound = nrese_exec::POLL_UNITS as usize + 2 * n as usize;
+        assert!(
+            scanned <= bound,
+            "{scanned} facts scanned after a stop (bound {bound}; the product is {})",
+            n * n + n
+        );
+    }
+
     #[test]
     fn one_derivation_asked_for_scans_one_branch() {
         // (1 11 ?x), (?x 12 ?y) -> (1 13 2): 100 x's with 100 y's each. Asking for the
@@ -1785,10 +1988,17 @@ mod tests {
             head: Head::Facts(vec![Atom([1, 13, 2].map(Term::Const))]),
         };
         let mut emitted = 0;
-        derivations(&source, &rule, [1, 13, 2], Seg::All, &mut |_| {
-            emitted += 1;
-            true
-        });
+        derivations(
+            &source,
+            &rule,
+            [1, 13, 2],
+            Seg::All,
+            &mut Poller::never(),
+            &mut |_| {
+                emitted += 1;
+                true
+            },
+        );
         assert_eq!(emitted, 1);
         assert_eq!(
             source.scans.load(Ordering::Relaxed),
@@ -1802,10 +2012,17 @@ mod tests {
         );
         // Not stopping, every derivation.
         let mut all = 0;
-        derivations(&source, &rule, [1, 13, 2], Seg::All, &mut |_| {
-            all += 1;
-            false
-        });
+        derivations(
+            &source,
+            &rule,
+            [1, 13, 2],
+            Seg::All,
+            &mut Poller::never(),
+            &mut |_| {
+                all += 1;
+                false
+            },
+        );
         assert_eq!(all, 10_000);
     }
 }

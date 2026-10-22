@@ -270,3 +270,164 @@ fn equality_keeps_the_working_set_as_the_only_copy() {
 
 /// See [`relations_keep_no_object_order_their_rules_never_use`].
 const BYTES_PER_FACT: usize = 26;
+
+/// A transitive property `p` complete on `n` terms, self pairs included: its n² facts, all
+/// asserted in one graph, and the ground program of OWL 2 RL over them. Its transitivity
+/// has n³ instances for those n² facts.
+fn complete_relation(n: u64) -> (Vec<[u64; 3]>, nrese_reasoner::eval::GroundProgram) {
+    use nrese_reasoner::delta::{MemoryBase, Rules, program};
+    use nrese_reasoner::ir::Vocabulary;
+    let mut vocabulary = LocalVocabulary::default();
+    let rules = Ruleset::Owl2Rl
+        .rules(&mut vocabulary)
+        .expect("OWL 2 RL parses");
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let schema = Schema::owl(&mut vocabulary);
+    let p = vocabulary.iri("http://example.com/p");
+    let rdf_type = vocabulary.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    let transitive = vocabulary.iri("http://www.w3.org/2002/07/owl#TransitiveProperty");
+    let terms: Vec<u64> = (0..n)
+        .map(|i| vocabulary.iri(&format!("http://example.com/e{i}")))
+        .collect();
+    let mut facts = vec![[p, rdf_type, transitive]];
+    for &x in &terms {
+        for &y in &terms {
+            facts.push([x, p, y]);
+        }
+    }
+    facts.sort_unstable();
+    let derived = batch::materialise(&facts, &rules, Some(&lists), &schema).derived;
+    let compiled = Rules {
+        rules: &rules,
+        lists: Some(&lists),
+        schema: &schema,
+    };
+    let ground = program(&MemoryBase::new(&facts, &derived), compiled);
+    let mut all = facts;
+    all.extend(derived);
+    all.sort_unstable();
+    all.dedup();
+    (all, ground)
+}
+
+/// A closure's facts as a [`nrese_reasoner::eval::Source`], for an update's joins.
+struct Closure(Vec<[u64; 3]>);
+
+impl nrese_reasoner::eval::Source for Closure {
+    fn scan(
+        &self,
+        pattern: [Option<u64>; 3],
+        _: nrese_reasoner::eval::Seg,
+        f: &mut dyn FnMut([u64; 3]),
+    ) {
+        for &fact in &self.0 {
+            if (0..3).all(|i| pattern[i].is_none_or(|t| t == fact[i])) {
+                f(fact);
+            }
+        }
+    }
+
+    fn estimate(&self, pattern: [Option<u64>; 3], seg: nrese_reasoner::eval::Seg) -> usize {
+        let mut n = 0;
+        self.scan(pattern, seg, &mut |_| n += 1);
+        n
+    }
+
+    fn contains(&self, fact: [u64; 3]) -> bool {
+        self.0.binary_search(&fact).is_ok()
+    }
+}
+
+/// The peak bytes `work` holds beyond what was live before it, on one thread.
+fn peak_of<T>(work: impl FnOnce() -> T + Send, pool: &rayon::ThreadPool) -> (T, usize)
+where
+    T: Send,
+{
+    let before = heap::live();
+    heap::start("work");
+    let result = pool.install(work);
+    let phases = heap::finish();
+    (result, phases[0].peak.saturating_sub(before))
+}
+
+/// The support graph sets' evaluations hold what they derive, never one entry per
+/// derivation, and stop within a round (review r1 of N10, F1): over a transitive relation
+/// complete on n terms (n² facts, n³ instances of its transitivity), the peak of a full
+/// evaluation and of an update's cone grows with the facts (fourfold for twice the terms),
+/// not with the instances (eightfold); and a watch that refuses its first report inside the
+/// first round stops it there, holding less than the instances would take as bare
+/// triples.
+#[test]
+fn support_sets_hold_their_facts_not_their_derivations_and_stop_within_a_round() {
+    use nrese_reasoner::graph_sets::{
+        Annotation, Change, UNWATCHED, support_sets, update_support_sets,
+    };
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("a pool");
+    let one_graph = |_: [u64; 3]| vec![0u32];
+    let full = |n: u64| {
+        let (facts, ground) = complete_relation(n);
+        let (sets, peak) = peak_of(
+            || support_sets(&facts, &ground, &[], &one_graph, 1, UNWATCHED),
+            &pool,
+        );
+        assert_eq!(
+            sets.expect("unwatched").len(),
+            facts.len(),
+            "every fact has its set"
+        );
+        peak
+    };
+    let update = |n: u64| {
+        let (facts, ground) = complete_relation(n);
+        let previous = |_: [u64; 3]| Annotation {
+            sets: vec![nrese_reasoner::graph_sets::GraphSet::of(0)],
+            truncated: false,
+        };
+        let source = Closure(facts.clone());
+        let in_closure = |fact: [u64; 3]| facts.binary_search(&fact).is_ok();
+        let touched = [facts[facts.len() / 2]];
+        let change = Change {
+            source: &source,
+            in_closure: &in_closure,
+            touched: &touched,
+            previous: &previous,
+            limit: usize::MAX,
+        };
+        let (sets, peak) = peak_of(
+            || update_support_sets(&change, &ground, &[], &one_graph, 1, UNWATCHED),
+            &pool,
+        );
+        assert!(sets.expect("unwatched").is_some(), "no limit");
+        peak
+    };
+    for (name, run) in [
+        ("full", &full as &dyn Fn(u64) -> usize),
+        ("update", &update),
+    ] {
+        let (small, large) = (run(32), run(64));
+        assert!(
+            large < 6 * small,
+            "{name}: peak {small} bytes for 32 terms, {large} for 64: it grows with the instances"
+        );
+    }
+    // A watch that refuses its third report: the first is the evaluation's start, the
+    // second the first round's first task's; the third comes within that task's first
+    // interval of derivations, not after the round.
+    let (facts, ground) = complete_relation(64);
+    let reports = AtomicUsize::new(0);
+    let refuse_third = |_: usize| reports.fetch_add(1, Ordering::Relaxed) < 2;
+    let (stopped, peak) = peak_of(
+        || support_sets(&facts, &ground, &[], &one_graph, 1, &refuse_third),
+        &pool,
+    );
+    assert!(stopped.is_err(), "the refusal stops it");
+    let instances = 64usize.pow(3) * size_of::<[u64; 3]>();
+    assert!(
+        peak < instances,
+        "stopped holding {peak} bytes, past the {instances} the instances take as triples"
+    );
+}
