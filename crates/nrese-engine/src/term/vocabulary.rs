@@ -12,11 +12,9 @@
 //! once and compares compressed bytes; the hash table keeps the plain keys' hashes. Both
 //! the writer and every reader compress with a compressor rebuilt from the stored table.
 
-use std::ops::Deref;
-use std::sync::atomic::{AtomicU8, Ordering};
-
 use fsst::{Compressor, Symbol};
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
+use std::ops::Deref;
 
 /// How checkpoints store the dictionary's keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -42,21 +40,6 @@ impl VocabularyEncoding {
             "fsst" => Some(Self::Fsst),
             _ => None,
         }
-    }
-}
-
-static ENCODING: AtomicU8 = AtomicU8::new(0);
-
-/// How checkpoints written from now on store the dictionary's keys (for the process, as
-/// [`crate::set_index_encoding`]). Checkpoints already written are read as they are.
-pub fn set_vocabulary_encoding(encoding: VocabularyEncoding) {
-    ENCODING.store(encoding as u8, Ordering::Relaxed);
-}
-
-pub(crate) fn vocabulary_encoding() -> VocabularyEncoding {
-    match ENCODING.load(Ordering::Relaxed) {
-        0 => VocabularyEncoding::Plain,
-        _ => VocabularyEncoding::Fsst,
     }
 }
 

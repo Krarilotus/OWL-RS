@@ -6,7 +6,7 @@
 
 use nrese_engine::{
     DurabilityConfig, Engine, EngineConfig, Placement, QuadPattern, StringTest, TextQuery,
-    VocabularyEncoding, set_vocabulary_encoding,
+    VocabularyEncoding,
 };
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{BaseDirection, BlankNode, GraphName, Literal, NamedNode, Quad, Term, Triple};
@@ -83,7 +83,11 @@ fn check(engine: &Engine, quads: &[Quad]) {
 
 #[test]
 fn compressed_vocabularies_read_as_plain_ones() {
-    set_vocabulary_encoding(VocabularyEncoding::Fsst);
+    // This engine's checkpoints only: the other tests of this binary write plain ones.
+    let config = || EngineConfig {
+        vocabulary: VocabularyEncoding::Fsst,
+        ..config()
+    };
     let dir = tempfile::tempdir().unwrap();
     let first = quads(0);
     {
@@ -129,12 +133,14 @@ fn compressed_vocabularies_read_as_plain_ones() {
         assert_eq!(by_prefix.len(), 0);
         assert_eq!(anywhere.len(), expected);
         // Full-text search over the decoded strings.
-        let found = snapshot.text_search(&TextQuery {
-            text: "windm\u{fc}hle".to_owned(),
-            all_words: true,
-            prefix: false,
-            stem: None,
-        });
+        let found = snapshot
+            .text_search(&TextQuery {
+                text: "windm\u{fc}hle".to_owned(),
+                all_words: true,
+                prefix: false,
+                stem: None,
+            })
+            .unwrap();
         assert_eq!(
             found.len(),
             first.len() / 7 + usize::from(first.len() % 7 > 2)

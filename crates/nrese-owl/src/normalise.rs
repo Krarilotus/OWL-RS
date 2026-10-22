@@ -778,7 +778,7 @@ impl<'a> Normaliser<'a> {
             positive: true,
         });
         self.positive.insert(e, q);
-        self.gci(Vec::new(), vec![Item::NotFresh(q), Item::Expr(e)], source);
+        self.fresh_definition(e, Item::NotFresh(q), source);
         q
     }
 
@@ -807,8 +807,23 @@ impl<'a> Normaliser<'a> {
             return q;
         }
         let not = self.nnf_not(e);
-        self.gci(Vec::new(), vec![Item::Expr(not), Item::Fresh(q)], source);
+        self.fresh_definition(not, Item::Fresh(q), source);
         q
+    }
+
+    /// Queue `name ⊔ e`, splitting a conjunction in O(arity) GCIs. A definition must
+    /// not name its own conjunction again at the distribution cutoff (`Q → Q`). Each
+    /// conjunct is smaller; nested expressions still use the cached fresh names and
+    /// bounded distribution, without a Cartesian expansion of the whole definition.
+    fn fresh_definition(&mut self, e: ExprId, name: Item, source: usize) {
+        match self.get(e) {
+            ClassExpr::And(parts) => {
+                for part in parts {
+                    self.gci(Vec::new(), vec![name, Item::Expr(part)], source);
+                }
+            }
+            _ => self.gci(Vec::new(), vec![name, Item::Expr(e)], source),
+        }
     }
 
     /// Whether `c` (in negation normal form) clausifies into body atoms only: a negated

@@ -8,7 +8,6 @@ use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use nrese_exec::measure;
 use nrese_exec::memory::{process_limit, set_process_limit};
-use nrese_reasoner::ReasonerService;
 use nrese_server::ai::AiSuggestionService;
 use nrese_server::auth::{AuthConfig, StaticBearerConfig};
 use nrese_server::policy::PolicyConfig;
@@ -49,7 +48,7 @@ fn opening_repositories_and_system_stores_preserves_the_startup_policy() {
         assert_eq!(process_limit(), expected);
         let _state = AppState::try_new(
             store,
-            ReasonerService::new(config.reasoner.clone()),
+            config.reasoner.clone(),
             config.policy.clone(),
             AiSuggestionService::disabled(),
             config.deployment_posture,
@@ -81,7 +80,7 @@ fn opening_repositories_and_system_stores_preserves_the_startup_policy() {
 fn app_with(n: usize, runtime: &tokio::runtime::Runtime) -> axum::Router {
     let state = AppState::new(
         StoreService::new(StoreConfig::in_memory()).unwrap(),
-        ReasonerService::new(Default::default()),
+        Default::default(),
         PolicyConfig {
             auth: AuthConfig::BearerStatic(StaticBearerConfig {
                 read_token: None,
