@@ -113,7 +113,7 @@ impl<'a, V: ReadView> GraphView<'a, V> {
         Self { view, selection }
     }
 
-    fn scan(
+    pub(crate) fn scan(
         &self,
         subject: Option<TermId>,
         predicate: Option<TermId>,
