@@ -291,8 +291,11 @@ class Admission(unittest.TestCase):
         self.assertGreater(int(self.started("b", within=1)[0]), self.ended("a"), "b ran beside a's declared peak")
         # Room for fewer than 2 jobs: no build, however long it waits.
         self.free(18)
-        self.start("c")
+        waiting = self.start("c", NRESE_BUILD_SLOT_WAIT_S="15")
         self.assertIsNone(self.started("c", within=8))
+        # Let the waiter and its children finish before Windows removes their cwd.
+        self.assertEqual(waiting.wait(timeout=120), 75)
+        self.assertFalse((self.out / "c.started").exists())
 
     def test_no_more_runs_than_slots_however_much_memory_is_free(self):
         self.free(64)
