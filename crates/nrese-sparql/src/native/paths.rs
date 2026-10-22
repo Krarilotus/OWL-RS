@@ -29,12 +29,24 @@
 //! evaluation would give for them, without the rest. `?p a :Person . ?x owl:sameAs* ?p`
 //! then costs what the persons' identity groups cost, not one row per node of the graph.
 
+use super::{NativeError, NativeResult};
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::graph::{
-    Adjacency, closure, closure_sizes_until, reachable, transitive_closure_until,
+    Adjacency, closure, closure_counts_within, closure_sizes_until, cyclic_nodes_within, reachable,
+    transitive_closure_until,
 };
+use nrese_exec::{IdTable, Stop, Ticker};
 use nrese_sparql_syntax::algebra::PropertyPathExpression;
+
+fn graph_stopped(stop: Stop) -> NativeError {
+    match stop {
+        Stop::Memory(e) => e.into(),
+        Stop::Cancelled => crate::QueryEvaluationError::Cancelled.into(),
+        Stop::TooLarge(e) => crate::QueryEvaluationError::Unexpected(e.to_string()).into(),
+        Stop::Rows => unreachable!("these graph operations have no row limit"),
+    }
+}
 
 /// A path with its IRIs resolved to ids; `None` marks an IRI the store doesn't know (no
 /// edges).
@@ -274,24 +286,107 @@ impl PathEvaluator<'_> {
     /// The number of pairs [`Self::open`] gives for a closure (`p+`, `p*`), from the
     /// closure's size per node and, for `p*`, the number of nodes: no pair is built.
     /// `None` for other paths.
-    pub(crate) fn count_open(&self, path: &Path) -> Option<u64> {
+    pub(crate) fn count_open(&self, path: &Path) -> NativeResult<Option<u64>> {
         let (Path::OneOrMore(step) | Path::ZeroOrMore(step)) = path else {
-            return None;
+            return Ok(None);
         };
         self.closures.set(self.closures.get() + 1);
         let cancellation = self.cancellation;
         let stop = move || cancellation.is_some_and(crate::CancellationToken::is_cancelled);
-        let sizes = closure_sizes_until(&self.open(step), &stop)?;
-        if matches!(path, Path::OneOrMore(_)) {
-            return Some(sizes.iter().map(|&(_, reached, _)| reached).sum());
+        let mut work = Ticker::new(&stop).map_err(graph_stopped)?;
+        let (pairs, diagonal) = if let Some(edges) = self.direct_edges(step)? {
+            closure_counts_within(edges, 0, 1, self.budget, &stop).map_err(graph_stopped)?
+        } else {
+            // Complex inner paths keep the existing size shortcut until their owned
+            // input migration. Cancellation is terminal, never an unsupported shape.
+            let sizes = closure_sizes_until(&self.open(step), &stop).ok_or_else(|| {
+                if stop() {
+                    crate::QueryEvaluationError::Cancelled
+                } else {
+                    crate::QueryEvaluationError::Unexpected(
+                        "graph preparation exceeded its representation".into(),
+                    )
+                }
+            })?;
+            let (mut pairs, mut diagonal) = (0, 0);
+            for &(_, reached, on_cycle) in &sizes {
+                work.tick(1).map_err(graph_stopped)?;
+                pairs += reached;
+                diagonal += u64::from(on_cycle);
+            }
+            (pairs, diagonal)
+        };
+        let count = if matches!(path, Path::OneOrMore(_)) {
+            pairs
+        } else {
+            self.node_count() + pairs - diagonal
+        };
+        work.finish().map_err(graph_stopped)?;
+        Ok(Some(count))
+    }
+
+    /// COUNT and cyclic membership are invariant under reversal. Build a direct step
+    /// in its stored orientation, into its actual charged carrier, without a pair Vec.
+    fn direct_edges(&self, mut path: &Path) -> NativeResult<Option<IdTable>> {
+        while let Path::Reverse(inner) = path {
+            path = inner;
         }
-        // Every node with itself, plus what each start reaches besides itself. The starts
-        // are nodes: their pairs come from the graph's statements.
-        let beyond: u64 = sizes
-            .iter()
-            .map(|&(_, reached, on_cycle)| reached - u64::from(on_cycle))
-            .sum();
-        Some(self.node_count() + beyond)
+        let Path::Link(predicate) = path else {
+            return Ok(None);
+        };
+        let cancellation = self.cancellation;
+        let stop = move || cancellation.is_some_and(crate::CancellationToken::is_cancelled);
+        let mut work = Ticker::new(&stop).map_err(graph_stopped)?;
+        let mut edges = IdTable::charged(2, 0, self.budget)?;
+        if let Some(predicate) = predicate {
+            for (s, _, o) in self.quads(None, Some(*predicate), None) {
+                work.tick(1).map_err(graph_stopped)?;
+                edges.push_row(&[s, o], self.budget)?;
+            }
+        }
+        work.finish().map_err(graph_stopped)?;
+        Ok(Some(edges))
+    }
+
+    /// Pure closure diagonals are not general open pair relations. A star is precisely
+    /// the node domain; a plus is precisely the cyclic members of its step's SCCs.
+    /// Complex positive steps retain their old route until their charged input migration.
+    pub(crate) fn diagonal(&self, path: &Path) -> NativeResult<Option<IdTable>> {
+        match path {
+            Path::ZeroOrMore(_) => {
+                let cancellation = self.cancellation;
+                let stop = move || cancellation.is_some_and(crate::CancellationToken::is_cancelled);
+                let mut work = Ticker::new(&stop).map_err(graph_stopped)?;
+                // The existing node-domain engine bridge is unchanged and separately
+                // owned; this avoids evaluating the step or expanding its reach pairs.
+                let nodes = self.nodes();
+                work.check().map_err(graph_stopped)?;
+                let mut out = IdTable::charged(1, nodes.len(), self.budget)?;
+                for node in nodes {
+                    work.tick(1).map_err(graph_stopped)?;
+                    out.push_reserved(&[node]);
+                }
+                work.finish().map_err(graph_stopped)?;
+                Ok(Some(out))
+            }
+            Path::OneOrMore(step) => {
+                let Some(edges) = self.direct_edges(step)? else {
+                    return Ok(None);
+                };
+                self.closures.set(self.closures.get() + 1);
+                let cancellation = self.cancellation;
+                let stop = move || cancellation.is_some_and(crate::CancellationToken::is_cancelled);
+                let nodes =
+                    cyclic_nodes_within(edges, 0, 1, self.budget, &stop).map_err(graph_stopped)?;
+                let columns = nrese_exec::Columns::from_scratch(
+                    nodes.len(),
+                    [nodes].into_iter(),
+                    self.budget,
+                )?;
+                Ok(Some(IdTable::from_columns(columns)))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// How many nodes the closure `path` (`p+` or `p*`) reaches from `node` (`forward`) or
@@ -697,6 +792,110 @@ mod tests {
         assert!(evaluator.to(&plus, last).is_empty());
         assert!(evaluator.open(&two).is_empty());
         assert!(!evaluator.connects(&plus, first, last));
-        assert_eq!(evaluator.count_open(&plus), None);
+        assert!(matches!(
+            evaluator.count_open(&plus),
+            Err(NativeError::Evaluation(
+                crate::QueryEvaluationError::Cancelled
+            ))
+        ));
+    }
+    #[test]
+    fn scalar_and_diagonal_shortcuts_preserve_sets_domains_and_errors() {
+        fn success<T>(result: NativeResult<T>) -> T {
+            result.unwrap_or_else(|e| panic!("{}", crate::QueryEvaluationError::from(e)))
+        }
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let next = NamedNode::new_unchecked("http://e/next");
+        let other = NamedNode::new_unchecked("http://e/other");
+        let mut tx = engine.transaction();
+        for (a, b, p) in [
+            (0, 1, &next),
+            (1, 0, &next),
+            (1, 2, &next),
+            (3, 3, &next),
+            (4, 5, &other),
+        ] {
+            tx.insert(Quad::new(node(a), p.clone(), node(b), GraphName::DefaultGraph).as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let budget = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+        let token = crate::CancellationToken::new();
+        let evaluator = PathEvaluator {
+            snapshot: &snapshot,
+            model: ReadModel::default(),
+            graph: PathGraph::Default,
+            fixed: None,
+            cancellation: Some(&token),
+            closures: Default::default(),
+            budget: &budget,
+        };
+        let step = Path::Link(snapshot.lookup(next.as_ref().into()).map(TermId::raw));
+        let reverse = Path::Reverse(Box::new(Path::Link(
+            snapshot.lookup(next.as_ref().into()).map(TermId::raw),
+        )));
+        let complex = Path::Alternative(vec![
+            Path::Link(snapshot.lookup(next.as_ref().into()).map(TermId::raw)),
+            Path::Link(None),
+        ]);
+        for step in [step, reverse, complex] {
+            let path = Path::OneOrMore(Box::new(step));
+            let pairs = evaluator.open(&path);
+            assert_eq!(
+                success(evaluator.count_open(&path)),
+                Some(pairs.len() as u64)
+            );
+            if let Some(table) = success(evaluator.diagonal(&path)) {
+                let mut want: Vec<_> = pairs
+                    .into_iter()
+                    .filter_map(|(a, b)| (a == b).then_some(a))
+                    .collect();
+                want.sort_unstable();
+                want.dedup();
+                assert_eq!(table.column(0), &want);
+            }
+        }
+        // A complex star's diagonal is the whole graph node domain; no inner closure
+        // or reach expansion is required, even when its step has no matches.
+        let star = Path::ZeroOrMore(Box::new(Path::Sequence(vec![
+            Path::Link(None),
+            Path::Link(None),
+        ])));
+        let table = success(evaluator.diagonal(&star)).unwrap();
+        assert_eq!(table.column(0), &evaluator.nodes());
+        assert_eq!(table.len(), 6);
+        assert_eq!(success(evaluator.count_open(&star)), Some(6));
+        assert!(success(evaluator.count_open(&Path::Link(None))).is_none());
+        drop(table);
+        assert_eq!(budget.used(), 0);
+        token.cancel();
+        assert!(matches!(
+            evaluator.diagonal(&star),
+            Err(NativeError::Evaluation(
+                crate::QueryEvaluationError::Cancelled
+            ))
+        ));
+        assert!(matches!(
+            evaluator.count_open(&star),
+            Err(NativeError::Evaluation(
+                crate::QueryEvaluationError::Cancelled
+            ))
+        ));
+        let small = std::sync::Arc::new(nrese_exec::Budget::new(0));
+        let evaluator = PathEvaluator {
+            budget: &small,
+            cancellation: None,
+            ..evaluator
+        };
+        let plus = Path::OneOrMore(Box::new(Path::Link(Some(
+            snapshot.lookup(next.as_ref().into()).unwrap().raw(),
+        ))));
+        assert!(matches!(
+            evaluator.count_open(&plus),
+            Err(NativeError::Evaluation(
+                crate::QueryEvaluationError::MemoryLimit(_)
+            ))
+        ));
+        assert_eq!(small.used(), 0);
     }
 }
