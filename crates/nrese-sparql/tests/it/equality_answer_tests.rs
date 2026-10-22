@@ -138,22 +138,34 @@ impl ServiceClient for Endpoint {
         &self,
         _endpoint: &str,
         query: &str,
-        _cancellation: Option<&CancellationToken>,
-    ) -> Result<ServiceResults, Box<dyn std::error::Error + Send + Sync>> {
-        let parsed = SparqlParser::new().parse_query(query)?;
+        budget: &Arc<nrese_exec::Budget>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ServiceResults, QueryEvaluationError> {
+        let parsed = SparqlParser::new()
+            .parse_query(query)
+            .map_err(|e| QueryEvaluationError::Service(Box::new(e)))?;
+        let mut options = QueryOptions::default();
+        options.resources.memory = nrese_exec::Envelope::from_budget(Arc::clone(budget));
+        options.resources.cancellation = cancellation.cloned();
+        assert!(std::ptr::eq(&*options.resources.memory, &**budget));
         let snapshot = self.0.snapshot();
-        let QueryResults::Solutions(solutions) =
-            evaluate_query(&snapshot, &parsed, &QueryOptions::default())?
+        let QueryResults::Solutions(solutions) = evaluate_query(&snapshot, &parsed, &options)?
         else {
-            return Err("not a SELECT".into());
+            return Err(QueryEvaluationError::Service("not a SELECT".into()));
         };
-        let variables = solutions.variables().to_vec();
-        let mut rows = Vec::new();
-        for solution in solutions {
-            let solution = solution?;
-            rows.push(variables.iter().map(|v| solution.get(v).cloned()).collect());
+        let mut result = ServiceResults::new(solutions.variables().to_vec(), budget);
+        let stop = nrese_exec::StopSource::new(cancellation.map(CancellationToken::flag), None);
+        let mut solutions = solutions;
+        loop {
+            stop.check().map_err(QueryEvaluationError::from)?;
+            let next = solutions.next();
+            stop.check().map_err(QueryEvaluationError::from)?;
+            let Some(solution) = next else {
+                break;
+            };
+            result.push_row(solution?.values(), &stop)?;
         }
-        Ok(ServiceResults { variables, rows })
+        Ok(result)
     }
 }
 

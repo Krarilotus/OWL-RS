@@ -429,6 +429,12 @@ pub const SETTINGS: &[Setting] = &[
         Integer,
         "Rows one request may return (default 1000000).",
     ),
+    setting(
+        "federation.max_response_bytes",
+        names::FEDERATION_MAX_RESPONSE_BYTES,
+        Amount(Bytes),
+        "Bytes one endpoint response may return; 0 adds no cap (default). Memory admission always applies.",
+    ),
     // [budgets]
     setting(
         "budgets.planner_effort",
