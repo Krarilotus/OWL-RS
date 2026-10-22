@@ -1,6 +1,6 @@
 use std::sync::{Arc, RwLock};
 
-use nrese_reasoner::ReasonerService;
+use nrese_reasoner::{ReasonerConfig, ReasonerService};
 
 use super::attribution::attribute_reject_delta;
 use super::command::{MutationCommand, MutationCommitReport};
@@ -49,7 +49,10 @@ pub struct MutationPipeline {
 }
 
 impl MutationPipeline {
-    pub fn new(store: Arc<StoreService>, reasoner: Arc<ReasonerService>) -> Self {
+    /// The write path of `store`, reasoning as `reasoning` says: the pipeline builds its
+    /// reasoner from the typed configuration, so no caller constructs one.
+    pub fn new(store: Arc<StoreService>, reasoning: ReasonerConfig) -> Self {
+        let reasoner = Arc::new(ReasonerService::new(reasoning));
         store.use_reasoning_rules(reasoner.config().materialised_program());
         store.use_dl(
             reasoner.config().mode().is_dl(),

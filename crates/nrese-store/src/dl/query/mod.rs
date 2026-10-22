@@ -116,11 +116,11 @@ fn consistency_at(
     }
     let cancel = nrese_dl::tableau::Cancel::from_flag(cancellation.flag());
     let ontology = ontology_at(store, snapshot);
-    let budget = gate::budget(store, Some(cancel), memory).remaining(deadline);
+    let budget = gate::budget(store, Some(cancel), memory);
     if let Some(stopped) = stopped() {
         return stopped;
     }
-    let checked = consistency::check(&ontology, &budget);
+    let checked = consistency::check_until(&ontology, &budget, deadline);
     // Request-local cancellation, expiry or memory must not replace shared revision
     // status.
     if let Some(stopped) = stopped() {

@@ -1157,6 +1157,9 @@ struct Reader {
     snapshot: Snapshot,
     sets: Shared<SupportSets>,
     form: Form,
+    /// The view itself: the next view is noted as its continuation, so full-text
+    /// corpora derive from its (`Snapshot::continues`).
+    view: Snapshot,
 }
 
 /// What a reader misses: the statements it misses, as runs over the stack (when it sees
@@ -2108,6 +2111,7 @@ impl Supports {
             .find(|reader| *reader.access == **access)
             .cloned();
         let mut form = None;
+        let mut continued = None;
         if let Some(reader) = earlier
             && let Some(changes) =
                 sets.changes_since(snapshot, &reader.sets, &reader.snapshot, access, working)?
@@ -2122,6 +2126,10 @@ impl Supports {
                     Some(Form::Only(Shared::new(list, &self.kept)?))
                 }
             };
+            // Complete content changes remain usable even when the mask's representation
+            // is rebuilt below. Keep only the existing charged delta buffers through
+            // publication and the synchronous lineage call; no ancestor is cached.
+            continued = Some((reader, changes.hide, changes.show));
         }
         let form = match form {
             Some(form) => {
@@ -2153,6 +2161,7 @@ impl Supports {
                 snapshot: snapshot.clone(),
                 sets: sets.clone(),
                 form,
+                view: view.clone(),
             },
             &self.kept,
         )?;
@@ -2163,6 +2172,9 @@ impl Supports {
                 without_first(&mut state.readers);
             }
             state.readers.push(reader)?;
+        }
+        if let Some((earlier, hide, show)) = continued {
+            view.continues_delta(snapshot, &earlier.view, &earlier.snapshot, &hide, &show);
         }
         Counters::add(&self.counters.views, 1);
         Counters::add(&self.counters.viewing, started.elapsed().as_micros() as u64);

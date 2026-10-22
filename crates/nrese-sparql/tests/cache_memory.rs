@@ -65,8 +65,72 @@ fn queries() -> Vec<String> {
     queries
 }
 
+/// The tests of this binary one at a time: the allocator counts the whole process.
+static HEAP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A hit is charged before its copy is made (an independent audit, 13 Oct 2026: concurrent
+/// hits of a large part each copied it before their charge failed): a cached part of 27,000
+/// rows, about 650 KB, asked for again under a query budget of 128 KiB ends with a memory
+/// error, and the heap's peak while it runs stays below half the part.
+#[test]
+fn a_cache_hit_past_the_query_budget_copies_nothing() {
+    let _serial = HEAP.lock().unwrap_or_else(|p| p.into_inner());
+    let engine = engine();
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new()
+        .parse_query(&format!(
+            "SELECT ?a ?b ?c WHERE {{ ?a <{EX}knows> ?b . ?b <{EX}knows> ?c }}"
+        ))
+        .unwrap();
+    let cache = Arc::new(ResultCache::new(64 << 20).admitting_all());
+    let unlimited = QueryOptions {
+        result_cache: Some(Arc::clone(&cache)),
+        ..QueryOptions::default()
+    };
+    let rows = match evaluate_query(&snapshot, &query, &unlimited).unwrap() {
+        nrese_sparql::QueryResults::Solutions(solutions) => solutions.count(),
+        _ => unreachable!("a SELECT"),
+    };
+    assert_eq!(rows, 27_000);
+    // The whole answer's part, as columns of ids (the cache may hold its join's part too).
+    let part = 27_000 * 3 * 8;
+    assert!(cache.stats().bytes >= part, "{:?}", cache.stats());
+    let small = QueryOptions {
+        result_cache: Some(Arc::clone(&cache)),
+        resources: nrese_sparql::Resources {
+            memory: nrese_exec::Envelope::new(Some(128 << 10), None),
+            ..Default::default()
+        },
+        ..QueryOptions::default()
+    };
+    let hits = cache.stats().hits;
+    heap::start("hit");
+    let before = heap::live();
+    let outcome = evaluate_query(&snapshot, &query, &small).map(|results| match results {
+        nrese_sparql::QueryResults::Solutions(mut solutions) => solutions.find_map(Result::err),
+        _ => None,
+    });
+    let peak = heap::peak().saturating_sub(before);
+    heap::finish();
+    let error = match outcome {
+        Err(error) => error,
+        Ok(Some(error)) => error,
+        Ok(None) => panic!("the hit fit a budget of 128 KiB"),
+    };
+    assert!(
+        matches!(error, nrese_sparql::QueryEvaluationError::MemoryLimit(_)),
+        "{error}"
+    );
+    assert!(cache.stats().hits > hits, "{:?}", cache.stats());
+    assert!(
+        peak < part / 2,
+        "the hit's heap peaked {peak} bytes above the start for a part of {part}"
+    );
+}
+
 #[test]
 fn the_result_cache_holds_no_more_heap_than_its_budget() {
+    let _serial = HEAP.lock().unwrap_or_else(|p| p.into_inner());
     let engine = engine();
     let snapshot = engine.snapshot();
     let queries: Vec<_> = queries()

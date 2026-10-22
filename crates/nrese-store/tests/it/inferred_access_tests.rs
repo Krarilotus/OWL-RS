@@ -249,13 +249,11 @@ fn a_hidden_assertion_does_not_change_what_a_reader_derives() {
 /// and the re-derived facts are updated for the commits, the views made afresh.
 #[test]
 fn a_hidden_assertion_committed_later_does_not_change_what_a_reader_derives() {
-    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_reasoner::{ReasonerConfig, ReasoningMode};
     use nrese_store::{MutationCommand, MutationPipeline, MutationTicket, Requester};
     let pipeline = MutationPipeline::new(
         Arc::new(StoreService::new(in_memory_store_config()).unwrap()),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     );
     let apply = |update: &str| {
         pipeline
@@ -352,13 +350,11 @@ fn a_hidden_assertion_does_not_derive_itself() {
 /// removed fact doesn't reach `alice a C`: the update follows the whole forward cone.
 #[test]
 fn a_hidden_assertion_left_without_its_public_proof_leaves_the_view() {
-    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_reasoner::{ReasonerConfig, ReasoningMode};
     use nrese_store::{MutationCommand, MutationPipeline, MutationTicket, Requester};
     let pipeline = MutationPipeline::new(
         Arc::new(StoreService::new(in_memory_store_config()).unwrap()),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
     );
     let apply = |update: &str| {
         pipeline
@@ -431,6 +427,87 @@ fn without_rules_nothing_inferred_is_shown() {
     assert_eq!(classes(&store, &reader(false), "a"), ["<D>", "<E>", "<F>"]);
 }
 
+/// A known view delta survives a representation rebuild; an unknown delta gets no
+/// lineage edge. Corpus members always equal the actual restricted scans.
+#[test]
+fn supported_search_lineage_survives_mask_rebuilds_but_not_unknown_deltas() {
+    use nrese_engine::{GraphSelector, QuadPattern, ReadModel, TermId, TermKind, TextScope};
+    use nrese_reasoner::{ReasonerConfig, ReasoningMode};
+    use nrese_store::{MutationCommand, MutationPipeline, MutationTicket, Requester};
+
+    let pipeline = MutationPipeline::new(
+        Arc::new(StoreService::new(in_memory_store_config()).unwrap()),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+    );
+    let apply = |data: String| {
+        pipeline
+            .apply(
+                MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                    "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+                     INSERT DATA {{ {data} }}"
+                ))),
+                &Requester::all(),
+                &MutationTicket::new(),
+            )
+            .unwrap();
+    };
+    let public: String = (0..40)
+        .map(|i| format!("ex:s{i} ex:p \"word{i}\" . "))
+        .collect();
+    apply(format!(
+        "ex:p rdfs:subPropertyOf ex:q . GRAPH ex:open {{ {public} }}
+         GRAPH ex:secret {{ ex:hidden ex:p \"secret\" }}"
+    ));
+    let ReadScope::Graphs(access) = reader(true) else {
+        unreachable!();
+    };
+    let check = || {
+        let snapshot = pipeline.store().read_snapshot(Some(&access)).unwrap();
+        let model = ReadModel::Inferred;
+        let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
+        let mut expected: Vec<_> = snapshot
+            .quads_for_pattern_in(model, &pattern)
+            .filter(|quad| quad.object.kind() == TermKind::String)
+            .map(|quad| quad.object.payload())
+            .collect();
+        expected.sort_unstable();
+        expected.dedup();
+        let scope = TextScope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
+        let (members, documents, _) = snapshot.text_corpus_members(model, &scope, false);
+        assert_eq!(members, expected);
+        assert_eq!(documents, expected.len() as u64);
+        assert_eq!(documents, 40, "only the open graph's derived literals");
+    };
+    check();
+    let initial = pipeline.store().engine_stats().text_corpora;
+    let patched = pipeline.store().support_statistics().patched;
+    // Each newly hidden inference adds a mask run. Going past eight rebuilds the
+    // representation; the complete content delta must still derive the next corpus.
+    for i in 0..12 {
+        apply(format!(
+            "GRAPH ex:secret {{ ex:hidden{i} ex:p \"secret{i}\" }}"
+        ));
+        check();
+    }
+    let current = pipeline.store().engine_stats().text_corpora;
+    assert_eq!(current.walked, initial.walked, "no lost continuation");
+    assert_eq!(current.derived, initial.derived + 12);
+    let patched = pipeline.store().support_statistics().patched - patched;
+    assert!(
+        patched > 0 && patched < 12,
+        "mask rebuild reached: {patched}"
+    );
+
+    // A hidden assertion removes a publicly derivable fact from the global inferred
+    // stack. The view retains that derived extra, but changes_since cannot certify its
+    // delta. It must walk afresh, with the same exact visible corpus.
+    apply("GRAPH ex:secret { ex:s0 ex:q \"word0\" }".to_owned());
+    check();
+    let unknown = pipeline.store().engine_stats().text_corpora;
+    assert_eq!(unknown.walked, current.walked + 1);
+    assert_eq!(unknown.derived, current.derived);
+}
+
 /// Commits through the mutation pipeline update the sets instead of computing them
 /// afresh: after every commit, a reader sees what a store forced to compute them sees,
 /// and so does a reader of a store that keeps one set per statement (the cap's marks
@@ -438,7 +515,7 @@ fn without_rules_nothing_inferred_is_shown() {
 /// made afresh).
 #[test]
 fn updated_sets_equal_fresh_ones_across_commits() {
-    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_reasoner::{ReasonerConfig, ReasoningMode};
     use nrese_store::{MutationCommand, MutationPipeline, MutationTicket, Requester};
     let pipeline = |support_sets: usize| {
         MutationPipeline::new(
@@ -449,9 +526,7 @@ fn updated_sets_equal_fresh_ones_across_commits() {
                 })
                 .unwrap(),
             ),
-            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-                ReasoningMode::Owl2Rl,
-            ))),
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
         )
     };
     let default = in_memory_store_config().support_sets;

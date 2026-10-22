@@ -34,7 +34,7 @@ use crate::durability::checkpoint;
 use crate::error::{EngineError, EngineResult};
 use crate::index::keys::PackedKeys;
 use crate::index::run::{PermutationBuilder, Run};
-use crate::index::{IndexVersion, Layout};
+use crate::index::{IndexEncoding, IndexVersion, Layout};
 use crate::quad::{EncodedQuad, EncodedTriple, Permutation, QuadPattern};
 use crate::term::dictionary::BatchScratch;
 use crate::term::pending::Pending;
@@ -266,7 +266,11 @@ impl<'e> BulkLoad<'e> {
                 let layout = Layout::holding(&quads);
                 let next = Next::Streamed {
                     layout,
-                    builder: PermutationBuilder::planned(quads, layout.permutations()),
+                    builder: PermutationBuilder::planned(
+                        quads,
+                        layout.permutations(),
+                        shared.index_encoding,
+                    ),
                     revision: summary.revision,
                     dictionary_len: shared.dictionary.len(),
                 };
@@ -282,8 +286,12 @@ impl<'e> BulkLoad<'e> {
                 };
                 let next = Version {
                     content: super::Content::fresh(),
-                    asserted: IndexVersion::from_quads(Layout::holding(&quads), quads),
-                    inferred: IndexVersion::empty(Layout::DefaultGraph),
+                    asserted: IndexVersion::from_quads(
+                        Layout::holding(&quads),
+                        shared.index_encoding,
+                        quads,
+                    ),
+                    inferred: IndexVersion::empty(Layout::DefaultGraph, shared.index_encoding),
                     revision: summary.revision,
                     dictionary_len: shared.dictionary.len(),
                     equality: Default::default(),
@@ -317,7 +325,7 @@ impl<'e> BulkLoad<'e> {
                     Layout::Quads => current.asserted.with_quads_layout(),
                     Layout::DefaultGraph => current.asserted.clone(),
                 };
-                let run = Run::from_quads(asserted.layout(), inserts);
+                let run = Run::from_quads(asserted.layout(), asserted.encoding(), inserts);
                 let next = Version {
                     content: super::Content::fresh(),
                     asserted: asserted.with_run(run),
@@ -410,10 +418,15 @@ enum Source {
 }
 
 impl Source {
-    fn packed(&mut self, permutation: Permutation) -> EngineResult<PackedKeys> {
+    /// `permutation`, packed in `encoding` (an in-memory builder has its own).
+    fn packed(
+        &mut self,
+        permutation: Permutation,
+        encoding: IndexEncoding,
+    ) -> EngineResult<PackedKeys> {
         match self {
             Self::Memory(builder) => Ok(builder.packed(permutation)),
-            Self::Spilled(spill) => Ok(spill.merged(permutation)?),
+            Self::Spilled(spill) => Ok(spill.merged(permutation, encoding)?),
         }
     }
 }
@@ -464,7 +477,12 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                 None,
                 Arc::clone(&shared.views.read()),
             );
-            let path = checkpoint::write(durable.root(), &image, shared.admission.as_ref())?;
+            let path = checkpoint::write(
+                durable.root(),
+                &image,
+                shared.vocabulary,
+                shared.admission.as_ref(),
+            )?;
             shared
                 .checkpoints
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -473,7 +491,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
             let next = match durable
                 .config
                 .map_checkpoints
-                .then(|| checkpoint::map_written(&path))
+                .then(|| checkpoint::map_written(&path, shared.index_encoding))
             {
                 Some(Ok((dictionary, [asserted, inferred]))) => {
                     base = Some(dictionary);
@@ -527,14 +545,19 @@ fn publish_streamed(
         let packed = layout
             .permutations()
             .iter()
-            .map(|&permutation| Ok((permutation, source.packed(permutation)?)))
+            .map(|&permutation| {
+                Ok((
+                    permutation,
+                    source.packed(permutation, shared.index_encoding)?,
+                ))
+            })
             .collect::<EngineResult<Vec<_>>>()?;
-        let asserted =
-            IndexVersion::from_packed(packed).map_err(crate::error::EngineError::Corruption)?;
+        let asserted = IndexVersion::from_packed(packed, shared.index_encoding)
+            .map_err(crate::error::EngineError::Corruption)?;
         let next = Version {
             content: super::Content::fresh(),
             asserted,
-            inferred: IndexVersion::empty(Layout::DefaultGraph),
+            inferred: IndexVersion::empty(Layout::DefaultGraph, shared.index_encoding),
             revision,
             dictionary_len,
             equality: Default::default(),
@@ -545,7 +568,7 @@ fn publish_streamed(
         return Ok(len);
     };
     let _checkpoint = durable.checkpoint_slot.lock();
-    let empty = PackedKeys::from_sorted(&[]);
+    let empty = PackedKeys::from_sorted(&[], shared.index_encoding);
     // Every layout has SPOG: its length is the number of quads.
     let mut len = 0;
     let path = checkpoint::write_parts(
@@ -555,10 +578,11 @@ fn publish_streamed(
         &shared.dictionary,
         dictionary_len,
         [layout, Layout::DefaultGraph],
+        shared.vocabulary,
         &mut |stack, permutation| {
             Ok(match stack {
                 Stack::Asserted => {
-                    let packed = source.packed(permutation)?;
+                    let packed = source.packed(permutation, shared.index_encoding)?;
                     if permutation == Permutation::Spog {
                         len = packed.len() as u64;
                     }
@@ -573,7 +597,7 @@ fn publish_streamed(
     shared
         .checkpoints
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (base, [asserted, inferred]) = match checkpoint::map_written(&path) {
+    let (base, [asserted, inferred]) = match checkpoint::map_written(&path, shared.index_encoding) {
         Ok(mapped) => mapped,
         Err(error) => {
             // Nothing else holds the data: the load fails, and the checkpoint goes so that
@@ -701,7 +725,11 @@ impl<'e> Rematerialisation<'e> {
         let next = Version {
             content: super::Content::fresh(),
             asserted: current.asserted.clone(),
-            inferred: IndexVersion::from_quads(Layout::DefaultGraph, quads),
+            inferred: IndexVersion::from_quads(
+                Layout::DefaultGraph,
+                current.inferred.encoding(),
+                quads,
+            ),
             revision: summary.revision,
             dictionary_len: shared.dictionary.len(),
             equality: Default::default(),
