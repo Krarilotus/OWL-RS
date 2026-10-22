@@ -119,6 +119,43 @@ def slower(factor, series="q06", base=(4.8, 4.85, 4.8)):
 
 
 class Schedule(unittest.TestCase):
+    def test_predeclared_cold_capability_is_consistent_or_fails_closed(self):
+        case = next(c for c in gate_module.cases_registry.load() if c["name"] == "open-first-query")
+        with patch.object(fast, "cold_cache_command", return_value=None):
+            modes, why = fast.page_cache_modes(case)
+        cold = "time/cold/open"
+        unsupported = {case["name"]: {cold: {"kind": "unsupported", "capability": "cold_cache", "reason": why}}}
+        family = ["base|open-first-query|" + d for d in (cold, "time/warm/open")]
+        ps = passes(lambda side, n: [record(case="open-first-query", samples={"warm/open": [10, 11]})])
+        for p in ps:
+            p["report"]["unsupported_dimensions"] = copy.deepcopy(unsupported)
+        summary = run_gate(ps, family=family)
+        self.assertEqual(summary["errors"], [])
+        self.assertIn(family[0], summary["not_compared"])
+        self.assertIn(family[0], summary["family"])
+        # Losing the declaration on one pass, or a side, must not infer support from samples.
+        for indices in ([0], [i for i, p in enumerate(ps) if p["side"] == "base"]):
+            bad = copy.deepcopy(ps)
+            for i in indices:
+                bad[i]["report"].pop("unsupported_dimensions")
+            self.assertTrue(any(family[0] in e for e in run_gate(bad, family=family)["errors"]))
+        with patch.object(fast, "cold_cache_command", return_value=None):
+            self.assertEqual(fast.unsupported_cache_dimensions([case])[case["name"]][cold],
+                             unsupported[case["name"]][cold])
+        with patch.object(fast, "cold_cache_command", return_value="real configured command"):
+            self.assertEqual(fast.unsupported_cache_dimensions([case]), {})
+
+    def test_collected_zero_medians_are_diagnosed_without_an_inference_change(self):
+        blocks = [1, 2, 3]
+        for base, new, count in (([0, 0, 0], [0, 0, 0], 3), ([0, 0, 0], [1, 1, 1], 3),
+                                  ([0, 0, 1], [0, 0, 1], 2)):
+            d = gate_module.dimension([[v] for v in base], blocks, [[v] for v in new], blocks, {}, "ms")
+            self.assertEqual(d["nonpositive_blocks"], count)
+            self.assertEqual(d["status"], "incomplete")
+            if count == 3:
+                self.assertIsNone(d["ratio"])
+                self.assertIn("not missing executions", gate_module.describe(d))
+
     def test_identical_sides_pass(self):
         summary = run_gate(passes())
         self.assertEqual((summary["errors"], summary["blocking"], summary["flagged"]), ([], [], []))
