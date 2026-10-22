@@ -19,7 +19,7 @@
 //! Not done: dt-type1/2 and dt-eq (typing and equating literals by value), which would
 //! fold lexical forms into each other.
 
-use crate::ir::{Triple, Violation};
+use crate::ir::{Triple, Violations};
 use nrese_engine::{TermId, TermKind};
 use nrese_rdf::{Literal, Term};
 use nrese_xsd::owl::{Datatype, LiteralError, Value, ValueSet};
@@ -59,14 +59,14 @@ pub(crate) fn violations(
     rdf_type: u64,
     same_as: Option<u64>,
     decode: &dyn Fn(u64) -> Option<Term>,
-) -> Vec<Violation> {
+    out: &mut Violations,
+) {
     let literal = |id: u64| match decode(id) {
         Some(Term::Literal(l)) => Some(l),
         _ => None,
     };
     // Each range datatype's value space, made once per call.
     let mut spaces: HashMap<u64, Option<ValueSet>> = HashMap::new();
-    let mut out = Vec::new();
     for &[s, p, o] in facts {
         if !is_literal(s) {
             continue;
@@ -88,10 +88,7 @@ pub(crate) fn violations(
                 Judged::Unsupported => false,
             };
             if outside {
-                out.push(Violation {
-                    rule: "dt-not-type".to_owned(),
-                    bindings: vec![s, o],
-                });
+                out.record_check("dt-not-type", [s, o], [s, p, o]);
             }
         } else if Some(p) == same_as && is_literal(o) && s < o {
             let (Some(a), Some(b)) = (literal(s), literal(o)) else {
@@ -100,16 +97,10 @@ pub(crate) fn violations(
             if let (Judged::Value(x), Judged::Value(y)) = (judge(&a), judge(&b))
                 && x != y
             {
-                out.push(Violation {
-                    rule: "dt-diff".to_owned(),
-                    bindings: vec![s, o],
-                });
+                out.record_check("dt-diff", [s, o], [s, p, o]);
             }
         }
     }
-    out.sort_by(|a, b| (&a.rule, &a.bindings).cmp(&(&b.rule, &b.bindings)));
-    out.dedup();
-    out
 }
 
 #[cfg(test)]
@@ -146,7 +137,8 @@ mod tests {
                 });
             tx.commit().unwrap();
             let closure = super::super::materialise(&program, &engine.snapshot());
-            let mut rules: Vec<String> = closure.violations.into_iter().map(|v| v.rule).collect();
+            let mut rules: Vec<String> =
+                closure.violations.iter().map(|v| v.rule.clone()).collect();
             rules.sort();
             rules.dedup();
             rules

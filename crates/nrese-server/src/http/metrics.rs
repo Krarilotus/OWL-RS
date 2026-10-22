@@ -242,6 +242,20 @@ nrese_text_corpora_built_total{{how=\"derived\"}} {}
 ",
         corpora.bytes, corpora.budget, corpora.kept, corpora.walked, corpora.derived,
     ));
+    // D-1: rejections of principals who may not read every graph, labelled by a hash of the
+    // principal (its id is the operator diagnostics' alone).
+    body.push_str(
+        "# HELP nrese_restricted_rejections_total Commits of a principal who may not read every graph that a gate rejected, by a hash of the principal.
+# TYPE nrese_restricted_rejections_total counter
+",
+    );
+    for counted in state.pipeline().restricted_rejections() {
+        body.push_str(&format!(
+            "nrese_restricted_rejections_total{{principal=\"{}\"}} {}
+",
+            counted.principal_hash, counted.rejections
+        ));
+    }
     state.request_metrics().render(&mut body);
 
     let mut response = (StatusCode::OK, body).into_response();

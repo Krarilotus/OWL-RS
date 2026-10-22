@@ -281,7 +281,7 @@ async fn a_store_written_by_main_opens_with_its_data_answers_and_settings()
     let server = Server::start(&config, url).await?;
 
     // The data, with the WAL tail main never checkpointed.
-    let ready: serde_json::Value = serde_json::from_str(&server.get("/readyz").await?)?;
+    let ready: serde_json::Value = serde_json::from_str(&server.get("/dataset/info").await?)?;
     let main_ready: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
         fixture().join("expected/readyz.json"),
     )?)?;
@@ -369,7 +369,7 @@ async fn a_store_written_by_main_opens_with_its_data_answers_and_settings()
             .await?,
         ["?v", "\"v2\""]
     );
-    let ready: serde_json::Value = serde_json::from_str(&server.get("/readyz").await?)?;
+    let ready: serde_json::Value = serde_json::from_str(&server.get("/dataset/info").await?)?;
     assert_eq!(
         ready["quad_count"],
         main_ready["quad_count"].as_u64().unwrap() + 1

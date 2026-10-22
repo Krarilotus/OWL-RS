@@ -252,6 +252,22 @@ fn rejection(
     operation: &Budget,
     deadline: Deadline,
 ) -> Gate {
+    let decode = |t: u64| {
+        tx.decode(nrese_engine::TermId::from_raw(t))
+            .map_or_else(|| format!("#{t}"), |term| term.to_string())
+    };
+    if reader.access().is_some() {
+        // A committer who may not read every graph: one fixed reason, no evidence, count,
+        // engine or time, so the report depends neither on graphs it can't read nor on what
+        // the deadline left for evidence (graph access, N12; readable-only evidence under a
+        // budget of its own is v2.0's, with item 18). That the commit is rejected at all is
+        // the gate's.
+        return Gate {
+            checked,
+            reject: Some(crate::mutation::RESTRICTED_REJECTION.to_owned()),
+            evidence: Vec::new(),
+        };
+    }
     // Why: a minimal set of axioms that has no model, each by its source triples.
     let justification = super::explain::justify(
         ontology,
@@ -260,56 +276,27 @@ fn rejection(
         &operation.remaining(deadline),
         deadline,
     );
-    let decode = |t: u64| {
-        tx.decode(nrese_engine::TermId::from_raw(t))
-            .map_or_else(|| format!("#{t}"), |term| term.to_string())
-    };
-    // The committer sees the axioms of the graphs it may read; the others are withheld,
-    // and counted (graph access: nothing from a graph a reader can't read reaches it).
-    let readable = |graph: &Option<String>| match reader.access() {
-        None => true,
-        Some(access) => match graph {
-            None => access.default_graph,
-            // As the source gives it: `<iri>`.
-            Some(graph) => access.allows(graph.trim_start_matches('<').trim_end_matches('>')),
-        },
-    };
-    let mut withheld = 0usize;
     let mut evidence: Vec<nrese_reasoner::RejectEvidence> = Vec::new();
-    for axiom in justification
-        .iter()
-        .flat_map(|j| super::explain::explained(ontology, j, &decode))
-    {
-        for (graph, triples) in axiom.sources {
-            if !readable(&graph) {
-                withheld += triples.len();
-                continue;
+    for &axiom in justification.iter().flat_map(|j| &j.axioms) {
+        for source in &ontology.sources[axiom] {
+            for triple in &source.triples {
+                let [subject, predicate, object] = triple.map(decode);
+                evidence.push(nrese_reasoner::RejectEvidence {
+                    role: "axiom",
+                    subject,
+                    predicate,
+                    object,
+                    origin: "asserted".to_owned(),
+                });
             }
-            evidence.extend(
-                triples
-                    .into_iter()
-                    .map(|[s, p, o]| nrese_reasoner::RejectEvidence {
-                        role: "axiom",
-                        subject: s,
-                        predicate: p,
-                        object: o,
-                        origin: "asserted".to_owned(),
-                    }),
-            );
         }
     }
-    let axioms = justification.as_ref().map_or(0, |j| j.axioms.len());
-    let hidden = match withheld {
-        0 => String::new(),
-        n => format!(" ({n} of their statements are in graphs you can't read, not shown)"),
-    };
     let explanation = match &justification {
-        Some(_) => format!("{axioms} axiom(s) have no model together{hidden}"),
+        Some(j) => format!("{} axiom(s) have no model together", j.axioms.len()),
         None => "rejection evidence was not obtained within the operation's budget".to_owned(),
     };
     let reject = Some(format!(
-        "the mutation makes the data inconsistent under OWL 2 DL (found by the {} in {} ms); \
-         {explanation}",
+        "the mutation makes the data inconsistent under OWL 2 DL (found by the {} in {} ms); {explanation}",
         checked.engine,
         checked.elapsed.as_millis()
     ));

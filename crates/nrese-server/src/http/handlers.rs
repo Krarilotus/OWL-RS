@@ -159,17 +159,19 @@ pub async fn admin_restore_dataset(
     admin_dataset::restore(state, headers, body).await
 }
 
+/// The unauthenticated probe: its status code, and a body of the status and what is
+/// degraded alone. Nothing that follows the data reaches it (`/info` has the counts).
 pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    match build_ready_response(&state) {
-        Ok(response) if state.is_ready() => (StatusCode::OK, Json(response)).into_response(),
+    let response = crate::http::responses::build_probe_response(&state);
+    match state.is_ready() {
+        true => (StatusCode::OK, Json(response)).into_response(),
         // Not ready is a status document, not an error: probes read it as written.
-        Ok(response) => (
+        false => (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Extension(crate::error::Verbatim),
             Json(response),
         )
             .into_response(),
-        Err(error) => error.into_response(),
     }
 }
 
@@ -177,7 +179,12 @@ pub async fn dataset_info(
     authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
 ) -> Result<Response, ApiError> {
-    guard::enforce_service_description_read(&state, &authenticated).await?;
+    let identity = guard::enforce_service_description_read(&state, &authenticated).await?;
+    // A reader who may not read every graph: nothing that follows the data it can't read.
+    if guard::view(&state, &identity).read.is_some() {
+        let info = crate::http::responses::build_scoped_ready_response(&state)?;
+        return Ok((StatusCode::OK, Json(info)).into_response());
+    }
     Ok((StatusCode::OK, Json(build_ready_response(&state)?)).into_response())
 }
 

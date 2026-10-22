@@ -20,7 +20,11 @@ fn ontology(individuals: u64) -> Ontology {
     let union = ExprId(o.classes.intern(ClassExpr::Or(vec![b, c])));
     let add = |o: &mut Ontology, axiom: Axiom, triples: Vec<[u64; 3]>| {
         o.axioms.push(axiom);
-        o.sources.push(vec![Source { graph: 0, triples }]);
+        o.sources.push(vec![Source {
+            graph: 0,
+            triples,
+            elsewhere: None,
+        }]);
     };
     add(&mut o, Axiom::SubClassOf(a, union), vec![[1, 10, 11]; 3]);
     add(&mut o, Axiom::SubClassOf(b, d), vec![[2, 10, 4]]);
