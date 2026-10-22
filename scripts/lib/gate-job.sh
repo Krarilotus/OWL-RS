@@ -35,9 +35,11 @@ read -r cores ram < <(python - "$index" <<'PY'
 import json, os, sys
 n = json.loads(os.environ['NRESE_GATE_NEEDS'])[int(sys.argv[1])]
 assert n['cores'] > 0 and n['ram_gb'] > 0
-print(n['cores'], n['ram_gb'])
+ram = n['ram_gb']
+print(n['cores'], int(ram) if ram == int(ram) else ram)
 PY
 )
+ram=${ram%$'\r'}
 [ -n "${cores:-}" ] && [ -n "${ram:-}" ] || infra "resource request missing"
 export CARGO_BUILD_JOBS=$cores NEXTEST_TEST_THREADS=$cores RUST_TEST_THREADS=$cores
 export NRESE_MEMORY_CAP_GB=$ram NRESE_BUILD_PEAK_GB=$ram
