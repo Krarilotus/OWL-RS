@@ -130,9 +130,9 @@ build)
   # is part of the build's identity, build_identity).
   lab=$src/crates/nrese-store/examples/perf_lab/main.rs
   [ -f "$lab" ] || lab=$src/crates/nrese-store/examples/perf_lab.rs
-  patched=$(py benches/fast/patches/perf_lab_watchdog.py "$lab")
+  patched=$(py "$GATE_PATCHES/perf_lab_watchdog.py" "$lab")
   case $patched in applied|present) timing=watchdog ;; *) timing=spawn ;; esac
-  observed=$(py benches/fast/patches/perf_lab_reporting.py "$lab") || {
+  observed=$(py "$GATE_PATCHES/perf_lab_reporting.py" "$lab") || {
     log "reporting patch refused $rev: $observed"; exit 2;
   }
   case $observed in applied|present|native) ;; *) log "reporting patch refused $rev: $observed"; exit 2 ;; esac

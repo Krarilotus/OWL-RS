@@ -108,10 +108,24 @@ class FastComparison(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             scratch = Path(directory)
             peaks = iter([100, 200, 110, 210])
+            payloads = [
+                {"scalar_solutions_kind": True, "scalar_attempts": 1, "executions_completed": 4,
+                 "errors": [], "opaque": {"future": ["kept"]}},
+                {"scalar_solutions_kind": False, "scalar_attempts": 0, "executions_completed": 0,
+                 "errors": []},
+                {"scalar_solutions_kind": True, "scalar_attempts": 1, "executions_completed": 1,
+                 "errors": ["actual fixture refusal"]},
+                None,  # An unchanged modern candidate reports no common201 metadata.
+            ]
+            invocation_payloads = iter(payloads)
 
             def measured(*args, **kwargs):
+                payload = next(invocation_payloads)
+                query = {"name": "q", "first_ms": 5, "p50_ms": 2}
+                if payload is not None:
+                    query["common201"] = payload
                 (scratch / "cache.json").write_text(json.dumps({"open_s": 1, "peak_mib": next(peaks),
-                    "queries": [{"name": "q", "first_ms": 5, "p50_ms": 2}]}))
+                    "queries": [query]}))
                 return 0, "", "", 1
 
             with patch.object(fast, "SCRATCH", scratch), patch.object(fast, "container", measured), \
@@ -123,6 +137,13 @@ class FastComparison(unittest.TestCase):
         self.assertEqual([o["identity"] for o in record["observations"]], fast.invocation_plan(case))
         self.assertEqual([o["peak_mib"] for o in record["observations"]], [100, 200, 110, 210])
         self.assertEqual(fast.compact_record(record)["observations"], record["observations"])
+        expected = [[{"query": "q", "metadata_status": "reported" if p is not None else "missing/unsupported",
+                      "payload": p}] for p in payloads]
+        self.assertEqual([o.get("common201") for o in record["observations"]], expected,
+                         "all invocation diagnostic metadata must survive, not only last result")
+        self.assertEqual(record["common201"], expected[-1])
+        self.assertNotIn("common201", record["result"]["queries"]["q"])
+        self.assertEqual(record["counters"], {})  # Diagnostics introduce no statistical counters.
         self.assertEqual(record["metric"], 2010)  # original descriptive aggregate is unchanged
         for mode in ("warm", "cold"):
             self.assertEqual(record["samples"][f"{mode}/open"], [1000, 1000])
