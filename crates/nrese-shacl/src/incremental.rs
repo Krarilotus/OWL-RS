@@ -1,330 +1,388 @@
-//! Incremental validation (design §7, slice C2): the results a change introduces.
-//!
-//! A shape's results for a focus node depend only on the statements its paths reach from
-//! the node (and from nested shapes' value nodes), on those nodes' types, and on whether
-//! the node is a focus node. A changed statement `(s p o)` can therefore only change the
-//! results of focus nodes from which `s` or `o` is reachable along a prefix of a path the
-//! shape reads: they are found by following those prefixes backwards from `s` and `o`,
-//! before and after the change. Nested shapes (`sh:node`, `sh:property`, the logical and
-//! qualified components) work on value nodes: their affected nodes are carried back along
-//! the parent's path the same way.
-//!
-//! Only those focus nodes are validated, against the state before and after, and the
-//! results present after but not before are the change's. Data that was invalid before
-//! stays reported by full validation, not blamed on the change.
-//!
-//! Some shapes can't be bounded this way, and are validated whole: closed shapes (any
-//! predicate counts), SPARQL constraints (a query reads anything), and any shape when a
-//! changed statement is an `rdfs:subClassOf` (class membership of every node may move).
-//! So is a shape whose affected nodes pass [`MAX_AFFECTED`].
-
-use std::collections::BTreeSet;
-
-use nrese_engine::{EncodedQuad, GraphSelector, TermId};
-use nrese_sparql::ReadView;
-
-use crate::graph::{GraphView, Selection};
+//! Incremental raw set difference, retaining the existing affected-node and full-shape
+//! decisions. All work draws from one validation part of the request's Resources.
+use crate::graph::{GraphView, Selection, contains_within, sort_set, stopped};
 use crate::model::{Constraint, Path, ShapeRef, Shapes, Target};
 use crate::path;
+use crate::path_work::{normalised, prefixes};
 use crate::report::{ValidationReport, decode};
-use crate::validate::{RawResult, Validator};
-
-/// Affected focus nodes per shape beyond which the shape is validated whole: following
-/// that many nodes back costs about what a full validation does.
+use crate::validate::{RawBatch, RawChunk, RawResult, Validator, constrained, reserve_map};
+use nrese_engine::{EncodedQuad, GraphSelector, TermId};
+use nrese_exec::{Budget, ChargedVec, Reservation, Ticker};
+use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
+use std::collections::HashMap;
+use std::sync::Arc;
+type Result<T> = std::result::Result<T, QueryEvaluationError>;
 const MAX_AFFECTED: usize = 100_000;
-
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 const RDFS_SUB_CLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf";
 
-/// The results that `changed` (the statements inserted and deleted, asserted and inferred)
-/// introduce in `data`: validation of the focus nodes the change can affect, in `after`,
-/// minus the same validation in `before`. Both views must share one dictionary (a
-/// transaction and its base snapshot do), and `shapes` must be compiled from it.
 pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     before: &A,
     after: &B,
     shapes: &Shapes,
     data: Selection,
     changed: &[EncodedQuad],
-) -> ValidationReport {
-    let changed: Vec<EncodedQuad> = changed
-        .iter()
-        .copied()
-        .filter(|quad| in_selection(data, quad.graph))
-        .collect();
+    resources: &Resources,
+) -> Result<ValidationReport> {
+    resources.check()?;
+    let budget = Arc::new(resources.memory.part());
+    let mut ticker = resources.stop().ticker().map_err(stopped)?;
+    let mut selected = ChargedVec::new(&*budget);
+    for quad in changed {
+        ticker.tick(1).map_err(stopped)?;
+        if in_selection(data, quad.graph) {
+            selected.push(*quad)?;
+        }
+    }
     let graph_before = GraphView::new(before, data);
     let graph_after = GraphView::new(after, data);
     let sub_class_of = graph_after.iri(RDFS_SUB_CLASS_OF);
-    let classes_moved = sub_class_of.is_some_and(|p| changed.iter().any(|q| q.predicate == p));
-    let validator_before = Validator::new(before, shapes, data);
-    let validator_after = Validator::new(after, shapes, data);
-    let mut introduced: BTreeSet<RawResult> = BTreeSet::new();
-    let mut failures = Vec::new();
-    if !changed.is_empty() {
+    let mut classes_moved = false;
+    for quad in selected.iter() {
+        ticker.tick(1).map_err(stopped)?;
+        classes_moved |= Some(quad.predicate) == sub_class_of;
+    }
+    let validator_before = Validator::new(before, shapes, data, resources, budget.clone())?;
+    let validator_after = Validator::new(after, shapes, data, resources, budget.clone())?;
+    let mut introduced = ChargedVec::new(budget.clone());
+    let mut chunks = ChargedVec::new(budget.clone());
+    let mut seen = ChargedVec::new(&*budget);
+    let mut applies = false;
+    if !selected.is_empty() {
         let rdf_type = graph_after.iri(RDF_TYPE);
         for shape in shapes.targeted() {
+            ticker.tick(1).map_err(stopped)?;
             let affected = if classes_moved {
                 None
             } else {
-                let seeds = seeds(shapes, shape, &changed, rdf_type);
+                let seeds = seeds(shapes, shape, &selected, rdf_type, &budget, &mut ticker)?;
+                let mut stack = ChargedVec::new(&*budget);
                 affected(
                     shapes,
                     shape,
                     &seeds,
                     &graph_before,
                     &graph_after,
-                    &mut Vec::new(),
-                )
+                    &mut stack,
+                    &budget,
+                    &mut ticker,
+                )?
                 .filter(|nodes| nodes.len() <= MAX_AFFECTED)
             };
-            let focus = |validator_focus: Vec<TermId>| match &affected {
-                Some(nodes) => validator_focus
-                    .into_iter()
-                    .filter(|node| nodes.contains(node))
-                    .collect::<Vec<_>>(),
-                None => validator_focus,
-            };
-            let work = |nodes: Vec<TermId>| -> Vec<(ShapeRef, TermId)> {
-                nodes.into_iter().map(|node| (shape, node)).collect()
-            };
-            let after_results = validator_after.validate_all(&work(focus(
-                validator_after.focus_nodes(&shapes.shapes[shape]),
-            )));
-            if after_results.is_empty() {
-                continue;
+            let after_focus = validator_after.focus_nodes(&shapes.shapes[shape], &mut ticker)?;
+            let after_work = work(
+                shape,
+                &after_focus,
+                affected.as_deref(),
+                &budget,
+                &mut ticker,
+            )?;
+            if !applies && !after_work.is_empty() {
+                seen.clear();
+                applies = constrained(shapes, shape, &mut seen, &mut ticker)?;
             }
-            let before_results = validator_before.validate_all(&work(focus(
-                validator_before.focus_nodes(&shapes.shapes[shape]),
-            )));
-            let before: BTreeSet<RawResult> = before_results.into_iter().collect();
-            introduced.extend(after_results.into_iter().filter(|r| !before.contains(r)));
+            let mut after_results = validator_after.validate_all(&after_work)?;
+            if after_results.len() != 0 {
+                let before_focus =
+                    validator_before.focus_nodes(&shapes.shapes[shape], &mut ticker)?;
+                let before_work = work(
+                    shape,
+                    &before_focus,
+                    affected.as_deref(),
+                    &budget,
+                    &mut ticker,
+                )?;
+                let before_results = validator_before.validate_all(&before_work)?;
+                let mut earlier = rows(&before_results, &budget)?;
+                dedup_rows(&mut earlier, &mut ticker)?;
+                let mut later = rows(&after_results, &budget)?;
+                dedup_rows(&mut later, &mut ticker)?;
+                for row in later.iter() {
+                    ticker.tick(1).map_err(stopped)?;
+                    if earlier.binary_search(row).is_err() {
+                        introduced.push(row.clone())?;
+                    }
+                }
+            }
+            for chunk in after_results.chunks.iter_mut() {
+                chunk.discard_results();
+            }
+            let (parts, _slots) = after_results.chunks.into_parts();
+            for part in parts {
+                chunks.push(part)?;
+            }
         }
-        failures.extend(validator_after.into_failures());
     }
-    let raw: Vec<RawResult> = introduced.into_iter().collect();
-    decode(after, shapes, &raw, failures)
+    dedup_rows(&mut introduced, &mut ticker)?;
+    if !introduced.is_empty() {
+        let (results, held) = introduced.into_parts();
+        chunks.push(RawChunk {
+            results,
+            failures: Vec::new(),
+            held,
+            failure_held: None,
+        })?;
+    }
+    ticker.finish().map_err(stopped)?;
+    drop(validator_before);
+    drop(validator_after);
+    drop(selected);
+    drop(seen);
+    decode(
+        after,
+        shapes,
+        RawBatch {
+            chunks,
+            budget,
+            applicable: applies,
+        },
+        resources,
+    )
 }
 
+fn work<'b>(
+    shape: ShapeRef,
+    nodes: &[TermId],
+    affected: Option<&[TermId]>,
+    budget: &'b Budget,
+    ticker: &mut Ticker,
+) -> Result<ChargedVec<(ShapeRef, TermId), &'b Budget>> {
+    let mut out = ChargedVec::new(budget);
+    for &node in nodes {
+        ticker.tick(1).map_err(stopped)?;
+        if affected.is_none_or(|a| a.binary_search(&node).is_ok()) {
+            out.push((shape, node))?;
+        }
+    }
+    Ok(out)
+}
+fn rows<'s>(raw: &RawBatch<'s>, budget: &Arc<Budget>) -> Result<ChargedVec<RawResult<'s>>> {
+    let mut rows = ChargedVec::with_capacity(budget.clone(), raw.len())?;
+    for chunk in raw.chunks.iter() {
+        rows.extend_from_slice(&chunk.results)?;
+    }
+    Ok(rows)
+}
+fn dedup_rows(rows: &mut ChargedVec<RawResult<'_>>, ticker: &mut Ticker) -> Result<()> {
+    ticker.check().map_err(stopped)?;
+    rows.sort_unstable();
+    ticker.check().map_err(stopped)?;
+    let mut kept = 0;
+    for read in 0..rows.len() {
+        ticker.tick(1).map_err(stopped)?;
+        if kept == 0 || rows[read] != rows[kept - 1] {
+            rows.swap(kept, read);
+            kept += 1;
+        }
+    }
+    rows.truncate(kept);
+    Ok(())
+}
 fn in_selection(data: Selection, graph: TermId) -> bool {
     let selected = match data.graphs {
-        GraphSelector::Exact(selected) => graph == selected,
+        GraphSelector::Exact(g) => graph == g,
         GraphSelector::AnyNamed => !graph.is_default_graph(),
         _ => true,
     };
     selected && !data.excluded.contains(&Some(graph))
 }
-
-/// The nodes of the changed statements that can matter to `shape`: subjects and objects
-/// of statements whose predicate the shape (with its nested shapes) reads, or that decide
-/// its targets. `None` for any predicate.
-fn seeds(
+fn nested(constraint: &Constraint) -> impl Iterator<Item = ShapeRef> + '_ {
+    let (first, rest): (Option<ShapeRef>, &[ShapeRef]) = match constraint {
+        Constraint::Not(s) | Constraint::Node(s) | Constraint::Property(s) => (Some(*s), &[]),
+        Constraint::Logical(_, shapes) => (None, shapes),
+        Constraint::Qualified {
+            shape, siblings, ..
+        } => (Some(*shape), siblings),
+        _ => (None, &[]),
+    };
+    first.into_iter().chain(rest.iter().copied())
+}
+fn insert(
+    map: &mut HashMap<TermId, ()>,
+    held: &mut Reservation<&Budget>,
+    id: TermId,
+) -> Result<bool> {
+    if map.contains_key(&id) {
+        return Ok(false);
+    }
+    reserve_map(map, held)?;
+    map.insert(id, ());
+    Ok(true)
+}
+fn seeds<'b>(
     shapes: &Shapes,
     shape: ShapeRef,
     changed: &[EncodedQuad],
     rdf_type: Option<TermId>,
-) -> Vec<TermId> {
-    let mut read = BTreeSet::new();
-    let bounded = predicates(shapes, shape, &mut read, &mut Vec::new());
-    if let Some(rdf_type) = rdf_type {
-        read.insert(rdf_type);
+    budget: &'b Budget,
+    ticker: &mut Ticker,
+) -> Result<ChargedVec<TermId, &'b Budget>> {
+    let mut held = Reservation::new(budget);
+    let mut read = HashMap::new();
+    let mut seen = ChargedVec::new(budget);
+    let bounded = predicates(shapes, shape, &mut read, &mut held, &mut seen, ticker)?;
+    if let Some(id) = rdf_type {
+        insert(&mut read, &mut held, id)?;
     }
-    let mut nodes: Vec<TermId> = changed
-        .iter()
-        .filter(|quad| !bounded || read.contains(&quad.predicate))
-        .flat_map(|quad| [quad.subject, quad.object])
-        .collect();
-    nodes.sort_unstable();
-    nodes.dedup();
-    nodes
+    let mut nodes = ChargedVec::new(budget);
+    for quad in changed {
+        ticker.tick(1).map_err(stopped)?;
+        if !bounded || read.contains_key(&quad.predicate) {
+            nodes.extend_from_slice(&[quad.subject, quad.object])?;
+        }
+    }
+    let kept = sort_set(&mut nodes, ticker)?;
+    nodes.truncate(kept);
+    Ok(nodes)
 }
-
-/// Adds the predicates `shape` reads (paths, property pairs, targets) to `read`, through
-/// nested shapes; `false` if it can read any predicate (closed, SPARQL).
 fn predicates(
     shapes: &Shapes,
     shape: ShapeRef,
-    read: &mut BTreeSet<TermId>,
-    seen: &mut Vec<ShapeRef>,
-) -> bool {
-    if seen.contains(&shape) {
-        return true;
+    read: &mut HashMap<TermId, ()>,
+    held: &mut Reservation<&Budget>,
+    seen: &mut ChargedVec<ShapeRef, &Budget>,
+    ticker: &mut Ticker,
+) -> Result<bool> {
+    ticker.tick(1).map_err(stopped)?;
+    if contains_within(seen, &shape, ticker)? {
+        return Ok(true);
     }
-    seen.push(shape);
+    seen.push(shape)?;
     let shape_ = &shapes.shapes[shape];
     if let Some(path) = &shape_.path {
-        path_predicates(path, read);
+        path_predicates(path, read, held, ticker)?;
     }
     for target in &shape_.targets {
+        ticker.tick(1).map_err(stopped)?;
         if let Target::SubjectsOf(p) | Target::ObjectsOf(p) = target {
-            read.insert(*p);
+            insert(read, held, *p)?;
         }
     }
     let mut bounded = true;
     for constraint in &shape_.constraints {
+        ticker.tick(1).map_err(stopped)?;
         bounded &= match constraint {
             Constraint::Closed(_) | Constraint::Sparql(_) => false,
             Constraint::Equals(p)
             | Constraint::Disjoint(p)
             | Constraint::LessThan(p)
             | Constraint::LessThanOrEquals(p) => {
-                read.insert(*p);
+                insert(read, held, *p)?;
                 true
             }
-            _ => nested(constraint)
-                .iter()
-                .all(|&inner| predicates(shapes, inner, read, seen)),
+            _ => {
+                let mut all = true;
+                for inner in nested(constraint) {
+                    if !predicates(shapes, inner, read, held, seen, ticker)? {
+                        all = false;
+                        break;
+                    }
+                }
+                all
+            }
         };
     }
-    bounded
+    Ok(bounded)
 }
-
-fn path_predicates(path: &Path, read: &mut BTreeSet<TermId>) {
+fn path_predicates(
+    path: &Path,
+    read: &mut HashMap<TermId, ()>,
+    held: &mut Reservation<&Budget>,
+    ticker: &mut Ticker,
+) -> Result<()> {
+    ticker.tick(1).map_err(stopped)?;
     match path {
         Path::Predicate(p) => {
-            read.insert(*p);
+            insert(read, held, *p)?;
         }
-        Path::Inverse(inner)
-        | Path::ZeroOrMore(inner)
-        | Path::OneOrMore(inner)
-        | Path::ZeroOrOne(inner) => path_predicates(inner, read),
+        Path::Inverse(p) | Path::ZeroOrMore(p) | Path::OneOrMore(p) | Path::ZeroOrOne(p) => {
+            path_predicates(p, read, held, ticker)?
+        }
         Path::Sequence(parts) | Path::Alternative(parts) => {
-            parts.iter().for_each(|part| path_predicates(part, read));
+            for part in parts {
+                path_predicates(part, read, held, ticker)?;
+            }
         }
     }
+    Ok(())
 }
-
-/// The shapes a constraint validates value nodes against.
-fn nested(constraint: &Constraint) -> Vec<ShapeRef> {
-    match constraint {
-        Constraint::Not(shape) | Constraint::Node(shape) | Constraint::Property(shape) => {
-            vec![*shape]
-        }
-        Constraint::Logical(_, shapes) => shapes.clone(),
-        Constraint::Qualified {
-            shape, siblings, ..
-        } => std::iter::once(*shape)
-            .chain(siblings.iter().copied())
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// The nodes whose validation against `shape` (as a focus or value node) `seeds` can
-/// change, in either state; `None` if unbounded.
-fn affected<A: ReadView, B: ReadView>(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Existing before/after affected-node walk with shared borrowed admission and stop state."
+)]
+fn affected<'b, A: ReadView, B: ReadView>(
     shapes: &Shapes,
     shape: ShapeRef,
     seeds: &[TermId],
     before: &GraphView<'_, A>,
     after: &GraphView<'_, B>,
-    stack: &mut Vec<ShapeRef>,
-) -> Option<BTreeSet<TermId>> {
-    if stack.contains(&shape) {
-        // A recursive reference: the shape's own walk covers it.
-        return Some(BTreeSet::new());
+    stack: &mut ChargedVec<ShapeRef, &'b Budget>,
+    budget: &'b Budget,
+    ticker: &mut Ticker,
+) -> Result<Option<ChargedVec<TermId, &'b Budget>>> {
+    ticker.tick(1).map_err(stopped)?;
+    if contains_within(stack, &shape, ticker)? {
+        return Ok(Some(ChargedVec::new(budget)));
     }
-    stack.push(shape);
+    stack.push(shape)?;
     let shape_ = &shapes.shapes[shape];
-    // The nodes this shape's checks start from: the seeds themselves (a node's own
-    // statements), and, for nested shapes, their affected value nodes.
-    let mut reached: Vec<TermId> = seeds.to_vec();
+    let mut reached = ChargedVec::with_capacity(budget, seeds.len())?;
+    reached.extend_from_slice(seeds)?;
     for constraint in &shape_.constraints {
-        match constraint {
-            Constraint::Closed(_) | Constraint::Sparql(_) => {
-                stack.pop();
-                return None;
-            }
-            _ => {
-                for inner in nested(constraint) {
-                    let inner = affected(shapes, inner, seeds, before, after, stack);
-                    match inner {
-                        Some(nodes) => reached.extend(nodes),
-                        None => {
-                            stack.pop();
-                            return None;
-                        }
-                    }
+        ticker.tick(1).map_err(stopped)?;
+        if matches!(constraint, Constraint::Closed(_) | Constraint::Sparql(_)) {
+            stack.truncate(stack.len() - 1);
+            return Ok(None);
+        }
+        for inner in nested(constraint) {
+            match affected(shapes, inner, seeds, before, after, stack, budget, ticker)? {
+                Some(nodes) => reached.extend_from_slice(&nodes)?,
+                None => {
+                    stack.truncate(stack.len() - 1);
+                    return Ok(None);
                 }
             }
         }
     }
-    stack.pop();
-    reached.sort_unstable();
-    reached.dedup();
-    let mut out: BTreeSet<TermId> = seeds.iter().copied().collect();
+    stack.truncate(stack.len() - 1);
+    let kept = sort_set(&mut reached, ticker)?;
+    reached.truncate(kept);
+    let mut held = Reservation::new(budget);
+    let mut out = HashMap::new();
+    for &seed in seeds {
+        ticker.tick(1).map_err(stopped)?;
+        insert(&mut out, &mut held, seed)?;
+    }
     match &shape_.path {
-        // A node shape's value is its focus node.
-        None => out.extend(reached),
+        None => {
+            for &node in reached.iter() {
+                ticker.tick(1).map_err(stopped)?;
+                insert(&mut out, &mut held, node)?;
+            }
+        }
         Some(path) => {
-            // Value nodes affected, and the seeds anywhere along the path: back along every
-            // prefix of it, in both states.
-            for prefix in prefixes(&normalised(path)) {
-                for graph_nodes in [
-                    path::back(before, &prefix, &reached),
-                    path::back(after, &prefix, &reached),
-                ] {
-                    out.extend(graph_nodes);
+            let normalised = normalised(path, budget, ticker)?;
+            let prefixes = prefixes(&normalised.path, budget, ticker)?;
+            for prefix in prefixes.iter() {
+                let left = path::back(before, &prefix.path, &reached, budget, ticker)?;
+                let right = path::back(after, &prefix.path, &reached, budget, ticker)?;
+                for nodes in [&left, &right] {
+                    for &node in nodes.iter() {
+                        ticker.tick(1).map_err(stopped)?;
+                        insert(&mut out, &mut held, node)?;
+                    }
                     if out.len() > MAX_AFFECTED {
-                        return None;
+                        return Ok(None);
                     }
                 }
             }
         }
     }
-    Some(out)
-}
-
-/// `path` with inverses pushed down to predicates, so that its prefixes are sequences of
-/// forward and backward steps.
-fn normalised(path: &Path) -> Path {
-    fn inverse(path: &Path) -> Path {
-        match path {
-            Path::Predicate(_) => Path::Inverse(Box::new(path.clone())),
-            Path::Inverse(inner) => normalised(inner),
-            Path::Sequence(parts) => Path::Sequence(parts.iter().rev().map(inverse).collect()),
-            Path::Alternative(parts) => Path::Alternative(parts.iter().map(inverse).collect()),
-            Path::ZeroOrMore(inner) => Path::ZeroOrMore(Box::new(inverse(inner))),
-            Path::OneOrMore(inner) => Path::OneOrMore(Box::new(inverse(inner))),
-            Path::ZeroOrOne(inner) => Path::ZeroOrOne(Box::new(inverse(inner))),
-        }
+    let mut nodes = ChargedVec::with_capacity(budget, out.len())?;
+    for &node in out.keys() {
+        nodes.push(node)?;
     }
-    match path {
-        Path::Predicate(_) => path.clone(),
-        Path::Inverse(inner) => inverse(inner),
-        Path::Sequence(parts) => Path::Sequence(parts.iter().map(normalised).collect()),
-        Path::Alternative(parts) => Path::Alternative(parts.iter().map(normalised).collect()),
-        Path::ZeroOrMore(inner) => Path::ZeroOrMore(Box::new(normalised(inner))),
-        Path::OneOrMore(inner) => Path::OneOrMore(Box::new(normalised(inner))),
-        Path::ZeroOrOne(inner) => Path::ZeroOrOne(Box::new(normalised(inner))),
-    }
-}
-
-/// Every non-empty prefix of a (normalised) path: the paths along which a node can reach
-/// a statement the path reads.
-fn prefixes(path: &Path) -> Vec<Path> {
-    match path {
-        Path::Predicate(_) | Path::Inverse(_) => vec![path.clone()],
-        Path::Sequence(parts) => {
-            let mut out = Vec::new();
-            for (k, part) in parts.iter().enumerate() {
-                for tail in prefixes(part) {
-                    let mut steps = parts[..k].to_vec();
-                    steps.push(tail);
-                    out.push(if steps.len() == 1 {
-                        steps.pop().expect("one step")
-                    } else {
-                        Path::Sequence(steps)
-                    });
-                }
-            }
-            out
-        }
-        Path::Alternative(parts) => parts.iter().flat_map(prefixes).collect(),
-        // Any number of whole repetitions, then a prefix of one more.
-        Path::ZeroOrMore(inner) | Path::OneOrMore(inner) => prefixes(inner)
-            .into_iter()
-            .map(|tail| Path::Sequence(vec![Path::ZeroOrMore(inner.clone()), tail]))
-            .collect(),
-        Path::ZeroOrOne(inner) => prefixes(inner),
-    }
+    let kept = sort_set(&mut nodes, ticker)?;
+    nodes.truncate(kept);
+    Ok(Some(nodes))
 }

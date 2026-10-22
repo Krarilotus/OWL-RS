@@ -519,7 +519,7 @@ impl MutationPipeline {
         let Some(report) = report else {
             return Ok(());
         };
-        if report.results.is_empty() && report.failures.is_empty() {
+        if report.results().is_empty() && report.failures().is_empty() {
             return Ok(());
         }
         let severity = |iri: &str| match iri {
@@ -535,7 +535,7 @@ impl MutationPipeline {
             Some(_) => "the commit introduces SHACL results; the validation report is for readers of every graph"
                 .to_owned(),
             None => {
-                let first = report.results.first().map_or_else(String::new, |result| {
+                let first = report.results().first().map_or_else(String::new, |result| {
                     format!(
                         "; first: focus node {}, {}",
                         result.focus_node, result.component
@@ -543,16 +543,16 @@ impl MutationPipeline {
                 });
                 format!(
                     "the commit introduces {} SHACL result(s) and {} failure(s){first}",
-                    report.results.len(),
-                    report.failures.len()
+                    report.results().len(),
+                    report.failures().len()
                 )
             }
         };
         match gate {
             ShaclGate::Enforce(least)
-                if !report.failures.is_empty()
+                if !report.failures().is_empty()
                     || report
-                        .results
+                        .results()
                         .iter()
                         .any(|result| severity(result.severity.as_str()) >= least) =>
             {

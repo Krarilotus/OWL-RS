@@ -3,6 +3,9 @@
 //! A statement asserted in several graphs, or asserted and inferred, is one statement
 //! here: every accessor returns a sorted set of ids.
 
+use nrese_exec::{Budget, ChargedVec, Reservation, Stop, Ticker};
+use nrese_sparql::QueryEvaluationError;
+
 use nrese_engine::{EncodedQuad, GraphSelector, QuadPattern, ReadModel, TermId};
 use nrese_rdf::{GraphName, NamedNodeRef, Term};
 use nrese_sparql::{QueryDatasetSpecification, QueryOptions, ReadView};
@@ -54,37 +57,55 @@ impl Selection {
         &self,
         view: &V,
         options: &mut QueryOptions,
-    ) -> Result<(), String> {
-        let name = |graph: TermId| -> Result<GraphName, String> {
-            if graph.is_default_graph() {
-                return Ok(GraphName::DefaultGraph);
-            }
-            match view.decode(graph) {
-                Some(Term::NamedNode(name)) => Ok(GraphName::NamedNode(name)),
-                Some(Term::BlankNode(name)) => Ok(GraphName::BlankNode(name)),
-                _ => Err(format!("graph #{} isn't a graph name", graph.raw())),
-            }
-        };
-        let excluded: Vec<TermId> = self.excluded.iter().flatten().copied().collect();
-        let names = |graphs: &[TermId]| -> Result<Vec<GraphName>, String> {
-            graphs.iter().map(|&graph| name(graph)).collect()
-        };
+        held: &mut Reservation<&Budget>,
+        ticker: &mut Ticker,
+    ) -> Result<(), QueryEvaluationError> {
+        ticker.check().map_err(stopped)?;
         options.read_model = self.model;
+        let (ids, excluded) = match self.graphs {
+            GraphSelector::Exact(graph) if self.excluded.contains(&Some(graph)) => {
+                ([None; 3], false)
+            }
+            GraphSelector::Exact(graph) => ([Some(graph), None, None], false),
+            GraphSelector::Any => ([self.excluded[0], self.excluded[1], None], true),
+            GraphSelector::AnyNamed => (
+                [
+                    self.excluded[0],
+                    self.excluded[1],
+                    Some(TermId::DEFAULT_GRAPH),
+                ],
+                true,
+            ),
+        };
+        let count = ids.iter().flatten().count();
+        held.charge(count * size_of::<GraphName>())?;
+        let mut names = Vec::with_capacity(count);
+        for id in ids.into_iter().flatten() {
+            ticker.tick(1).map_err(stopped)?;
+            let name = if id.is_default_graph() {
+                GraphName::DefaultGraph
+            } else {
+                match view.decode_within(id, held)? {
+                    Some(Term::NamedNode(n)) => GraphName::NamedNode(n),
+                    Some(Term::BlankNode(n)) => GraphName::BlankNode(n),
+                    _ => {
+                        return Err(QueryEvaluationError::Unexpected(format!(
+                            "graph #{} isn't a graph name",
+                            id.raw()
+                        )));
+                    }
+                }
+            };
+            names.push(name);
+        }
         let mut dataset = QueryDatasetSpecification::new();
-        match self.graphs {
-            // A graph left out of itself: nothing.
-            GraphSelector::Exact(graph) if excluded.contains(&graph) => {
-                dataset.set_default_graph(Vec::new());
-            }
-            GraphSelector::Exact(graph) => dataset.set_default_graph(vec![name(graph)?]),
-            GraphSelector::Any => dataset.set_default_graph_excluding(names(&excluded)?),
-            GraphSelector::AnyNamed => {
-                let mut left_out = names(&excluded)?;
-                left_out.push(GraphName::DefaultGraph);
-                dataset.set_default_graph_excluding(left_out);
-            }
+        if excluded {
+            dataset.set_default_graph_excluding(names);
+        } else {
+            dataset.set_default_graph(names);
         }
         options.dataset = Some(dataset);
+        ticker.check().map_err(stopped)?;
         Ok(())
     }
 }
@@ -113,7 +134,7 @@ impl<'a, V: ReadView> GraphView<'a, V> {
         Self { view, selection }
     }
 
-    pub(crate) fn scan(
+    fn scan_unfiltered(
         &self,
         subject: Option<TermId>,
         predicate: Option<TermId>,
@@ -125,10 +146,111 @@ impl<'a, V: ReadView> GraphView<'a, V> {
             object,
             graph: self.selection.graphs,
         };
-        let excluded = self.selection.excluded;
         self.view
             .quads_for_pattern_in(self.selection.model, &pattern)
+    }
+
+    pub(crate) fn scan(
+        &self,
+        subject: Option<TermId>,
+        predicate: Option<TermId>,
+        object: Option<TermId>,
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a, V> {
+        let excluded = self.selection.excluded;
+        self.scan_unfiltered(subject, predicate, object)
             .filter(move |quad| !excluded.contains(&Some(quad.graph)))
+    }
+
+    // Compilation's existing accessors below keep their contract. Validation collects
+    // into admitted storage and counts every candidate before SHACL's exclusion filter.
+    fn collect_within<'b, T: Ord + Copy>(
+        &self,
+        subject: Option<TermId>,
+        predicate: Option<TermId>,
+        object: Option<TermId>,
+        value: impl Fn(EncodedQuad) -> T,
+        budget: &'b Budget,
+        ticker: &mut Ticker,
+    ) -> Result<ChargedVec<T, &'b Budget>, QueryEvaluationError> {
+        ticker.check().map_err(stopped)?;
+        let mut out = ChargedVec::new(budget);
+        for quad in self.scan_unfiltered(subject, predicate, object) {
+            ticker.tick(1).map_err(stopped)?;
+            if !self.selection.excluded.contains(&Some(quad.graph)) {
+                out.push(value(quad))?;
+            }
+        }
+        let kept = sort_set(&mut out, ticker)?;
+        out.truncate(kept);
+        Ok(out)
+    }
+
+    pub(crate) fn objects_within<'b>(
+        &self,
+        subject: TermId,
+        predicate: TermId,
+        budget: &'b Budget,
+        ticker: &mut Ticker,
+    ) -> Result<ChargedVec<TermId, &'b Budget>, QueryEvaluationError> {
+        self.collect_within(
+            Some(subject),
+            Some(predicate),
+            None,
+            |q| q.object,
+            budget,
+            ticker,
+        )
+    }
+
+    pub(crate) fn subjects_within<'b>(
+        &self,
+        predicate: TermId,
+        object: TermId,
+        budget: &'b Budget,
+        ticker: &mut Ticker,
+    ) -> Result<ChargedVec<TermId, &'b Budget>, QueryEvaluationError> {
+        self.collect_within(
+            None,
+            Some(predicate),
+            Some(object),
+            |q| q.subject,
+            budget,
+            ticker,
+        )
+    }
+
+    pub(crate) fn subjects_of_within<'b>(
+        &self,
+        predicate: TermId,
+        budget: &'b Budget,
+        ticker: &mut Ticker,
+    ) -> Result<ChargedVec<TermId, &'b Budget>, QueryEvaluationError> {
+        self.collect_within(None, Some(predicate), None, |q| q.subject, budget, ticker)
+    }
+
+    pub(crate) fn objects_of_within<'b>(
+        &self,
+        predicate: TermId,
+        budget: &'b Budget,
+        ticker: &mut Ticker,
+    ) -> Result<ChargedVec<TermId, &'b Budget>, QueryEvaluationError> {
+        self.collect_within(None, Some(predicate), None, |q| q.object, budget, ticker)
+    }
+
+    pub(crate) fn edges_within<'b>(
+        &self,
+        subject: TermId,
+        budget: &'b Budget,
+        ticker: &mut Ticker,
+    ) -> Result<ChargedVec<(TermId, TermId), &'b Budget>, QueryEvaluationError> {
+        self.collect_within(
+            Some(subject),
+            None,
+            None,
+            |q| (q.predicate, q.object),
+            budget,
+            ticker,
+        )
     }
 
     /// The objects of `(subject predicate ?)`.
@@ -158,26 +280,6 @@ impl<'a, V: ReadView> GraphView<'a, V> {
         )
     }
 
-    /// Every object of `predicate`.
-    pub(crate) fn objects_of(&self, predicate: TermId) -> Vec<TermId> {
-        sorted_set(
-            self.scan(None, Some(predicate), None)
-                .map(|quad| quad.object)
-                .collect(),
-        )
-    }
-
-    /// The `(predicate, object)` pairs of `subject`.
-    pub(crate) fn edges(&self, subject: TermId) -> Vec<(TermId, TermId)> {
-        let mut edges: Vec<(TermId, TermId)> = self
-            .scan(Some(subject), None, None)
-            .map(|quad| (quad.predicate, quad.object))
-            .collect();
-        edges.sort_unstable();
-        edges.dedup();
-        edges
-    }
-
     pub(crate) fn contains(&self, subject: TermId, predicate: TermId, object: TermId) -> bool {
         self.scan(Some(subject), Some(predicate), Some(object))
             .next()
@@ -201,4 +303,45 @@ impl<'a, V: ReadView> GraphView<'a, V> {
     pub(crate) fn parts(&self) -> (&'a V, Selection) {
         (self.view, self.selection)
     }
+}
+
+pub(crate) fn stopped(stop: Stop) -> QueryEvaluationError {
+    match stop {
+        Stop::Cancelled => QueryEvaluationError::Cancelled,
+        Stop::Memory(error) => QueryEvaluationError::MemoryLimit(error),
+        error => QueryEvaluationError::Unexpected(error.to_string()),
+    }
+}
+
+/// Sort/dedup in the admitted allocation. No replacement Vec or heap during the sort.
+pub(crate) fn sort_set<T: Ord + Copy>(
+    items: &mut [T],
+    ticker: &mut Ticker,
+) -> Result<usize, QueryEvaluationError> {
+    ticker.check().map_err(stopped)?;
+    items.sort_unstable();
+    ticker.check().map_err(stopped)?;
+    let mut kept = 0;
+    for read in 0..items.len() {
+        ticker.tick(1).map_err(stopped)?;
+        if kept == 0 || items[read] != items[kept - 1] {
+            items[kept] = items[read];
+            kept += 1;
+        }
+    }
+    Ok(kept)
+}
+
+pub(crate) fn contains_within<T: PartialEq>(
+    items: &[T],
+    item: &T,
+    ticker: &mut Ticker,
+) -> Result<bool, QueryEvaluationError> {
+    for candidate in items {
+        ticker.tick(1).map_err(stopped)?;
+        if candidate == item {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

@@ -24,6 +24,7 @@ mod graph;
 mod incremental;
 mod model;
 mod path;
+mod path_work;
 mod report;
 mod sparql;
 mod validate;
@@ -34,7 +35,7 @@ pub use incremental::validate_changes;
 pub use model::{Component, SH, Severity, ShapeRef, Shapes};
 pub use report::{PropertyPath, ValidationReport, ValidationResult};
 
-use nrese_sparql::ReadView;
+use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 
 /// Validates the statements of `data` against the targeted shapes of `shapes`.
 ///
@@ -43,15 +44,29 @@ use nrese_sparql::ReadView;
 /// Whether validating `data` against `shapes` checks anything: some active targeted shape
 /// has a focus node and a constraint. A report that conforms while nothing applies is a
 /// vacuous pass, which callers may need to tell apart from a real one.
-pub fn applicable<V: ReadView + Sync>(view: &V, shapes: &Shapes, data: Selection) -> bool {
-    validate::applicable(view, shapes, data)
+pub fn applicable<V: ReadView + Sync>(
+    view: &V,
+    shapes: &Shapes,
+    data: Selection,
+    resources: &Resources,
+) -> Result<bool, QueryEvaluationError> {
+    validate::applicable(view, shapes, data, resources)
 }
 
 pub fn validate<V: ReadView + Sync>(
     view: &V,
     shapes: &Shapes,
     data: Selection,
-) -> ValidationReport {
-    let (raw, failures) = validate::validate_raw(view, shapes, data);
-    report::decode(view, shapes, &raw, failures)
+    resources: &Resources,
+) -> Result<ValidationReport, QueryEvaluationError> {
+    let raw = validate::validate_raw(view, shapes, data, resources)?;
+    report::decode(view, shapes, raw, resources)
 }
+
+#[cfg(test)]
+mod resource_tests;
+
+#[cfg(test)]
+#[global_allocator]
+static MEASURED: nrese_exec::measure::Measured<std::alloc::System> =
+    nrese_exec::measure::Measured(std::alloc::System);
