@@ -21,6 +21,51 @@ use crate::durability::wal;
 use crate::error::{EngineError, EngineResult};
 use crate::index::Layout;
 
+/// How often [`open_segments`] lists the segments again when one moved (archived) or went
+/// (released) between listing and opening.
+const OPEN_ATTEMPTS: usize = 3;
+
+/// The log segments of the store at `root` that may hold `after + 1` or later, in order,
+/// archived ones first, each open. Segments are named after their first revision. `None`
+/// when they kept moving through every attempt: the log is being cut faster than it is read.
+fn open_segments(
+    root: &std::path::Path,
+    after: u64,
+) -> EngineResult<Option<Vec<(std::path::PathBuf, std::fs::File)>>> {
+    let mut attempt = 0;
+    'list: loop {
+        attempt += 1;
+        let mut segments = Vec::new();
+        for dir in [wal::archive_dir(root), wal::wal_dir(root)] {
+            if dir.is_dir() {
+                segments.extend(wal::list_segments(&dir)?);
+            }
+        }
+        segments.sort_by_key(|(first, _)| *first);
+        segments.dedup_by_key(|(first, _)| *first);
+        let start = segments
+            .iter()
+            .rposition(|(first, _)| *first <= after + 1)
+            .unwrap_or(0);
+        #[cfg(test)]
+        tests::between_listing_and_opening();
+        let mut open = Vec::with_capacity(segments.len() - start);
+        for (_, path) in segments.drain(start..) {
+            match std::fs::File::open(&path) {
+                Ok(file) => open.push((path, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match attempt < OPEN_ATTEMPTS {
+                        true => continue 'list,
+                        false => return Ok(None),
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        return Ok(Some(open));
+    }
+}
+
 /// Records of a primary's log ([`Engine::log_since`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogBatch {
@@ -41,6 +86,11 @@ impl Engine {
     /// [`EngineError::LogTruncated`] if the log no longer holds the record after `after`
     /// (a checkpoint covered it, or a bulk load or rematerialisation wrote none); an
     /// in-memory engine has no log at all.
+    ///
+    /// Only published records go: the batch stops at the revision published when it was
+    /// asked for, though the log may already hold a later complete record whose commit
+    /// is still syncing (or failed to). The segments are opened before they are read, so
+    /// that the log releasing or archiving one meanwhile doesn't take it away.
     pub fn log_since(&self, after: u64, max_bytes: usize) -> EngineResult<LogBatch> {
         let shared = &self.inner.shared;
         let latest = shared.versions.load().revision;
@@ -55,35 +105,23 @@ impl Engine {
         let Some(durable) = &shared.durable else {
             return Err(EngineError::LogTruncated { oldest: latest });
         };
-        // Segments are named after their first revision: those that may hold `after + 1`
-        // or later, in order, archived ones first.
-        let mut segments = Vec::new();
-        for dir in [
-            wal::archive_dir(durable.root()),
-            wal::wal_dir(durable.root()),
-        ] {
-            if dir.is_dir() {
-                segments.extend(wal::list_segments(&dir)?);
-            }
-        }
-        segments.sort_by_key(|(first, _)| *first);
-        segments.dedup_by_key(|(first, _)| *first);
-        let start = segments
-            .iter()
-            .rposition(|(first, _)| *first <= after + 1)
-            .unwrap_or(0);
+        // Segments that kept moving: the follower starts again from an image, as for a log a
+        // checkpoint has covered.
+        let Some(segments) = open_segments(durable.root(), after)? else {
+            return Err(EngineError::LogTruncated { oldest: latest });
+        };
         let mut expected = after + 1;
         let mut oldest = None;
-        'segments: for (_, path) in &segments[start..] {
-            // The active segment may grow while it is read: its complete records count.
-            // Its complete records only: how a damaged tail is classified doesn't matter here.
-            let contents = wal::read_segment(path, after)?;
+        'segments: for (path, mut file) in segments {
+            // The active segment may grow while it is read: its complete records count,
+            // up to `latest`.
+            let contents = wal::read_open_segment(&mut file, &path, after)?;
             for record in contents.records {
                 oldest.get_or_insert(record.revision);
                 if record.revision < expected {
                     continue;
                 }
-                if record.revision != expected {
+                if record.revision != expected || record.revision > latest {
                     break 'segments;
                 }
                 let before = batch.frames.len();
@@ -213,5 +251,110 @@ impl Engine {
         drop(_compaction);
         self.inner.after_commit(wal_bytes);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use crate::{DurabilityConfig, Engine, EngineConfig, EngineError, SyncPolicy};
+
+    thread_local! {
+        /// What a test does between the feed's listing of the segments and its opening them.
+        static BETWEEN: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    }
+
+    pub(super) fn between_listing_and_opening() {
+        BETWEEN.with(|between| {
+            if let Some(act) = between.borrow_mut().as_mut() {
+                act();
+            }
+        });
+    }
+
+    /// A durable engine with three commits (each in the active segment).
+    fn three_commits(dir: &std::path::Path) -> Engine {
+        let config = EngineConfig {
+            background_maintenance: false,
+            durability: DurabilityConfig {
+                sync: SyncPolicy::EveryCommit,
+                ..DurabilityConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        let engine = Engine::open(dir, config).unwrap();
+        for n in 0..3 {
+            let mut tx = engine.transaction();
+            let quad = nrese_rdf::Quad::new(
+                nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/s{n}")),
+                nrese_rdf::NamedNode::new_unchecked("http://example.com/p"),
+                nrese_rdf::NamedNode::new_unchecked("http://example.com/o"),
+                nrese_rdf::GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+            tx.commit().unwrap();
+        }
+        engine
+    }
+
+    /// Segments that move between every listing and opening (the log cut faster than the
+    /// feed reads it) send the follower back to an image, as a truncated log does: not an
+    /// error of the server's.
+    #[test]
+    fn segments_that_keep_moving_are_a_truncated_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = three_commits(dir.path());
+        let (wal, archive) = (
+            super::wal::wal_dir(dir.path()),
+            super::wal::archive_dir(dir.path()),
+        );
+        std::fs::create_dir_all(&archive).unwrap();
+        BETWEEN.with(|between| {
+            *between.borrow_mut() = Some(Box::new(move || {
+                // Whatever was listed moves: from the log to the archive, or back.
+                for (from, to) in [(&wal, &archive), (&archive, &wal)] {
+                    let listed = super::wal::list_segments(from).unwrap();
+                    if !listed.is_empty() {
+                        for (_, path) in listed {
+                            std::fs::rename(&path, to.join(path.file_name().unwrap())).unwrap();
+                        }
+                        return;
+                    }
+                }
+            }));
+        });
+        let result = engine.log_since(0, 1 << 20);
+        BETWEEN.with(|between| *between.borrow_mut() = None);
+        assert!(
+            matches!(result, Err(EngineError::LogTruncated { .. })),
+            "{result:?}"
+        );
+    }
+
+    /// A segment archived after the feed listed it and before it opened it is found in
+    /// the archive.
+    #[test]
+    fn a_segment_archived_while_the_feed_lists_is_still_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = three_commits(dir.path());
+        let (wal, archive) = (
+            super::wal::wal_dir(dir.path()),
+            super::wal::archive_dir(dir.path()),
+        );
+        let mut once = true;
+        BETWEEN.with(|between| {
+            *between.borrow_mut() = Some(Box::new(move || {
+                if std::mem::take(&mut once) {
+                    std::fs::create_dir_all(&archive).unwrap();
+                    for (_, path) in super::wal::list_segments(&wal).unwrap() {
+                        std::fs::rename(&path, archive.join(path.file_name().unwrap())).unwrap();
+                    }
+                }
+            }));
+        });
+        let batch = engine.log_since(0, 1 << 20).unwrap();
+        BETWEEN.with(|between| *between.borrow_mut() = None);
+        assert_eq!((batch.records, batch.last), (3, 3));
     }
 }

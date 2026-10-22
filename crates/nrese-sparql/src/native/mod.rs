@@ -919,42 +919,47 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
 /// that join them on `?graph` like on any variable.
 ///
 /// Anything else is evaluated graph by graph: a row without a scan (VALUES, an empty
-/// group, BIND alone), a property path (followed within one graph), a subquery or a nested
-/// GRAPH (their `?graph` is another variable), MINUS (the shared `?graph` would make rows
-/// with no other common variable remove each other) and a BIND to `?graph` itself.
-fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
-    fn only_scans(pattern: &GraphPattern, graph: &Variable) -> bool {
+/// group, BIND alone), a property path (followed within one graph), a GeoSPARQL relation
+/// computed from geometries (`spatial`: within one graph's geometries), a subquery or a
+/// nested GRAPH (their `?graph` is another variable), MINUS (the shared `?graph` would make
+/// rows with no other common variable remove each other) and a BIND to `?graph` itself.
+fn scans_everywhere(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> bool {
+    fn only_scans(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> bool {
         match pattern {
-            GraphPattern::Bgp { .. } => true,
+            GraphPattern::Bgp { patterns } => !spatial || !patterns.iter().any(spatial::is_spatial),
             GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
-                inputs.iter().all(|input| only_scans(input, graph))
+                inputs.iter().all(|input| only_scans(input, graph, spatial))
             }
             GraphPattern::LeftJoin {
                 left,
                 right,
                 expression,
             } => {
-                only_scans(left, graph)
-                    && only_scans(right, graph)
-                    && expression.as_ref().is_none_or(|e| filter(e, graph))
+                only_scans(left, graph, spatial)
+                    && only_scans(right, graph, spatial)
+                    && expression
+                        .as_ref()
+                        .is_none_or(|e| filter(e, graph, spatial))
             }
-            GraphPattern::Filter { inner, expr } => only_scans(inner, graph) && filter(expr, graph),
+            GraphPattern::Filter { inner, expr } => {
+                only_scans(inner, graph, spatial) && filter(expr, graph, spatial)
+            }
             GraphPattern::Extend { inner, bindings } => {
-                only_scans(inner, graph)
+                only_scans(inner, graph, spatial)
                     && bindings.iter().all(|(variable, expression)| {
-                        variable != graph && filter(expression, graph)
+                        variable != graph && filter(expression, graph, spatial)
                     })
             }
             _ => false,
         }
     }
     // `EXISTS` is a join on the shared variables, `?graph` among them.
-    fn filter(expression: &Expression, graph: &Variable) -> bool {
+    fn filter(expression: &Expression, graph: &Variable, spatial: bool) -> bool {
         match expression {
-            Expression::And(a, b) => filter(a, graph) && filter(b, graph),
-            Expression::Exists(pattern) => only_scans(pattern, graph),
+            Expression::And(a, b) => filter(a, graph, spatial) && filter(b, graph, spatial),
+            Expression::Exists(pattern) => only_scans(pattern, graph, spatial),
             Expression::Not(inner) if matches!(**inner, Expression::Exists(_)) => {
-                filter(inner, graph)
+                filter(inner, graph, spatial)
             }
             // An `EXISTS` anywhere else is not a join.
             other => !pushdown::per_solution(other) || !contains_any_exists(other),
@@ -1025,7 +1030,7 @@ fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
     if read_by_expressions(pattern, graph) && !bound_by_scans(pattern, graph) {
         return false;
     }
-    only_scans(pattern, graph) && rows_from_scans(pattern)
+    only_scans(pattern, graph, spatial) && rows_from_scans(pattern)
 }
 
 /// True if `expression` holds an `EXISTS` at any depth.
@@ -1196,6 +1201,9 @@ struct Context<'a> {
     numbers: RefCell<HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>>,
     cancellation: Option<CancellationToken>,
     budget: Arc<Budget>,
+    /// The request's envelope: what a part of the evaluation keeps beyond it (the spatial
+    /// index) draws from it ([`spatial`]).
+    memory: nrese_exec::Envelope,
     /// The operators run so far, for EXPLAIN; `None` when not explaining.
     trace: Option<RefCell<Vec<PlanStep>>>,
     /// Nesting depth of the operator being evaluated (for the trace).
@@ -1217,7 +1225,7 @@ struct Context<'a> {
     index_joins: Option<bool>,
     /// With a dataset of several default graphs (`FROM <a> FROM <b>`), the graphs whose
     /// merge the default graph is; the scope is then [`GraphScope::Union`].
-    merge_set: Option<Vec<TermId>>,
+    merge_set: Option<crate::dataset::GraphSet>,
     /// The graphs `GRAPH` may name, if the dataset lists them (`FROM NAMED`).
     named: Option<Vec<TermId>>,
     /// Numbers the columns the executor adds for itself ([`exists`]).
@@ -1237,6 +1245,9 @@ struct Context<'a> {
     /// Canonical answers' view refused by this query's budget too: the query's error
     /// ([`canonical`]).
     canonical_refused: Option<nrese_exec::BudgetExceeded>,
+    /// The reader's state refused by this query's budget ([`Snapshot::reading_within`]): the
+    /// query's error at its first check.
+    reads_refused: Option<nrese_exec::BudgetExceeded>,
     /// Whether GeoSPARQL relations in triple patterns are computed from geometries too
     /// (the query-rewrite extension; not [`QueryOptions::geosparql_stated_only`]).
     spatial_rewrite: bool,
@@ -1282,6 +1293,17 @@ impl Charged for Vec<Solutions> {
 /// What [`IdTable::concat`] of `parts`' tables allocates beyond them.
 fn concat_growth(parts: &[Solutions]) -> usize {
     IdTable::concat_growth(parts.iter().map(|p| &p.table))
+}
+
+/// What a context holds of its own before it evaluates anything (its reader's state,
+/// [`Snapshot::reading_within`]): tests that count a query's charges exactly add it.
+#[cfg(test)]
+pub(crate) fn own_bytes(snapshot: &Snapshot) -> usize {
+    let mut options = QueryOptions::default();
+    options.resources.memory = nrese_exec::Envelope::unlimited();
+    let memory = options.resources.memory.clone();
+    let _context = Context::new(snapshot, &options, None, None);
+    memory.used()
 }
 
 impl<'a> Context<'a> {
@@ -1349,6 +1371,17 @@ impl<'a> Context<'a> {
             },
             false => (None, None),
         };
+        // What the reads hold while they run (an equality expansion's waiting copies) is
+        // charged to the evaluation too; a read it refuses fails the query at its next check
+        // ([`Self::check`]), and so does the reader's state refused.
+        let unread = match &canonical {
+            Some((_, read)) => read,
+            None => snapshot,
+        };
+        let (read, reads_refused) = match unread.reading_within(Arc::clone(&budget)) {
+            Ok(read) => (read, None),
+            Err(refused) => (unread.clone(), Some(refused)),
+        };
         let named = match &canonical {
             // The graphs `FROM NAMED` lists, by the names canonical reads give them.
             Some((names, _)) => resolved.named.map(|graphs| names.graphs(graphs)),
@@ -1366,12 +1399,10 @@ impl<'a> Context<'a> {
                 true => None,
                 false => snapshot.expand_late(options.read_model),
             },
-            snapshot: match &canonical {
-                Some((_, read)) => Cow::Owned(read.clone()),
-                None => Cow::Borrowed(snapshot),
-            },
+            snapshot: Cow::Owned(read),
             canonical: canonical.map(|(names, _)| names),
             canonical_refused,
+            reads_refused,
             model: options.read_model,
             evaluator: Evaluator::with_base(base.cloned()),
             aliases: RefCell::default(),
@@ -1382,6 +1413,7 @@ impl<'a> Context<'a> {
             numbers: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
             budget,
+            memory: options.resources.memory.clone(),
             trace: None,
             depth: Cell::new(0),
             probed: Cell::default(),
@@ -1409,6 +1441,22 @@ impl<'a> Context<'a> {
 
     /// The id of a constant of a pattern: an alias IRI ([`substitute`]) stands for its
     /// blank node.
+    /// [`Self::lookup_const`], what the snapshot's lookup allocates charged to `held` first
+    /// ([`Snapshot::lookup_charged`]).
+    fn lookup_const_charged(
+        &self,
+        term: nrese_rdf::TermRef<'_>,
+        held: &mut Reservation<&nrese_exec::Budget>,
+    ) -> Result<Option<TermId>, nrese_exec::BudgetExceeded> {
+        if let nrese_rdf::TermRef::NamedNode(n) = term
+            && n.as_str().starts_with(substitute::ALIAS)
+        {
+            return Ok(self.lookup_const(term));
+        }
+        self.snapshot
+            .lookup_charged(term, |bytes| held.charge(bytes))
+    }
+
     fn lookup_const(&self, term: nrese_rdf::TermRef<'_>) -> Option<TermId> {
         if let nrese_rdf::TermRef::NamedNode(n) = term
             && n.as_str().starts_with(substitute::ALIAS)
@@ -1452,7 +1500,12 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Fails a cancelled query, and one a read refused memory to: what it read since may
+    /// be incomplete ([`Snapshot::reading_within`]).
     fn check(&self) -> NativeResult<()> {
+        if let Some(refused) = self.reads_refused.or_else(|| self.snapshot.read_refused()) {
+            return Err(QueryEvaluationError::MemoryLimit(refused).into());
+        }
         Ok(self
             .cancellation
             .as_ref()
@@ -1842,15 +1895,16 @@ impl<'a> Context<'a> {
                     let (early, late): (Vec<_>, Vec<_>) = all
                         .into_iter()
                         .partition(|c| !as_written && pushdown::movable(c));
-                    let spatial_seed = self.spatial_seed(&early, patterns);
+                    let spatial_seed = self.spatial_seed(&early, patterns)?;
                     let mut early: Vec<(&Expression, Vec<Variable>)> = early
                         .into_iter()
                         .map(|c| (c, expression_variables(c)))
                         .collect();
-                    // A spatial filter's candidates from the R-tree start the joins.
+                    // A spatial filter's literals from the index start the joins; they
+                    // decide its conjunct, and come charged.
                     let mut solutions = match spatial_seed {
-                        Some(seed) => {
-                            let seed = self.produced(seed)?;
+                        Some((seed, decided)) => {
+                            early.remove(decided);
                             self.bgp_from(seed, patterns, &mut early)?
                         }
                         None => self.bgp(patterns, &hints, &mut early)?,
@@ -2101,7 +2155,7 @@ impl<'a> Context<'a> {
             }
             NamedNodePattern::Variable(v) => v,
         };
-        if scans_everywhere(inner, variable) {
+        if scans_everywhere(inner, variable, self.spatial_rewrite) {
             // Every row comes from scans, which bind the variable: one evaluation for
             // all graphs.
             let mut solutions = self.in_graph(GraphScope::Variable(variable.clone()), inner)?;
@@ -2192,10 +2246,10 @@ impl<'a> Context<'a> {
     fn path_evaluator(&self) -> NativeResult<paths::PathEvaluator<'_>> {
         let graph = match &*self.graph.borrow() {
             GraphScope::Default => paths::PathGraph::Default,
-            GraphScope::Union => paths::PathGraph::Merged(self.merge_set.as_deref()),
+            GraphScope::Union => paths::PathGraph::Merged(self.merge_set.as_ref()),
             GraphScope::Named(id) => paths::PathGraph::Named(*id),
             // A graph the store doesn't hold: the merge of no graphs.
-            GraphScope::Missing => paths::PathGraph::Merged(Some(&[])),
+            GraphScope::Missing => paths::PathGraph::Merged(Some(&crate::dataset::NO_GRAPHS)),
             // `GRAPH ?g` sends patterns with paths graph by graph (`scans_everywhere`).
             GraphScope::Variable(_) => return unsupported("a path read in all graphs at once"),
         };
@@ -3831,7 +3885,7 @@ impl<'a> Context<'a> {
             key_columns: &key_columns,
             shared_positions: &shared_positions,
             positions: &positions,
-            graphs: self.merge_set.as_deref().filter(|_| scan.merged()),
+            graphs: self.merge_set.as_ref().filter(|_| scan.merged()),
             budget: &self.budget,
             width: vars.len(),
             max_rows: self.max_rows(vars.len()),
@@ -4083,7 +4137,7 @@ impl<'a> Context<'a> {
                 .scan_sorted_in(self.model, &scan.quad_pattern(), scan.permutation_for(None))
                 .expect("permutation_for returns a usable permutation");
             let mut previous: Option<[u64; 3]> = None;
-            let graphs = self.merge_set.as_deref();
+            let graphs = self.merge_set.as_ref();
             sorted.filter(move |quad| {
                 if graphs.is_some_and(|graphs| !graphs.contains(&quad.graph)) {
                     return false;
@@ -5373,7 +5427,7 @@ struct Probe<'a, 'b> {
     positions: &'a [Vec<usize>],
     /// For a merged default graph of listed graphs, the graphs ([`Context::merge_set`]):
     /// the index's matches in other graphs are skipped.
-    graphs: Option<&'a [TermId]>,
+    graphs: Option<&'a crate::dataset::GraphSet>,
     /// The query's budget: each chunk's output and scratch are charged to it before they
     /// grow.
     budget: &'b Budget,

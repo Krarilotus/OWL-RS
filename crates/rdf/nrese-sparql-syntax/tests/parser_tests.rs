@@ -317,3 +317,25 @@ fn a_blank_node_spans_a_filter_before_a_path() {
     let again = parser.parse_query(&printed).unwrap().to_string();
     assert_eq!(again, printed);
 }
+
+/// A path variable (SHACL's `$PATH`) reads as its path in the predicate position, as the
+/// path written there would (a sequence through fresh blank nodes), and nowhere else: a
+/// literal, a comment and a longer name keep their text.
+#[test]
+fn a_path_variable_reads_as_its_path_only_as_a_predicate() {
+    use nrese_sparql_syntax::algebra::PropertyPathExpression;
+    let (p, q) = (
+        NamedNode::new_unchecked("http://e/p"),
+        NamedNode::new_unchecked("http://e/q"),
+    );
+    let path = PropertyPathExpression::sequence(vec![
+        p.into(),
+        PropertyPathExpression::Reverse(Box::new(q.into())),
+    ]);
+    let parser = SparqlParser::new().with_path_variable(Variable::new_unchecked("PATH"), path);
+    let substituted = parser
+        .parse_query("SELECT * { ?s $PATH ?o . ?o ?PATHX \"$PATH\" } # $PATH")
+        .unwrap();
+    let written = parse("SELECT * { ?s <http://e/p>/^<http://e/q> ?o . ?o ?PATHX \"$PATH\" }");
+    assert_eq!(substituted, written);
+}

@@ -31,6 +31,15 @@ impl Resources {
             .as_ref()
             .map_or(Ok(()), CancellationToken::check)
     }
+
+    /// What long work polls ([`nrese_exec::Ticker`]): the cancellation's flag, no deadline of
+    /// its own (the transport cancels the token at its deadline).
+    pub fn stop(&self) -> nrese_exec::StopSource {
+        nrese_exec::StopSource::new(
+            self.cancellation.as_ref().map(CancellationToken::flag),
+            None,
+        )
+    }
 }
 
 /// Per-request query options (the transport layer fills these from the protocol request).
@@ -348,4 +357,25 @@ pub fn prepare_ql_query<'q, V: ReadView>(
 /// For coverage reports and tests; the decision itself is made per call.
 pub fn runs_natively(query: &Query) -> bool {
     crate::native::query_supported(query)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Resources;
+    use crate::results::CancellationToken;
+
+    /// The stop long work polls is the request's cancellation: cancelling the token stops it.
+    #[test]
+    fn the_stop_follows_the_cancellation() {
+        let token = CancellationToken::new();
+        let resources = Resources {
+            cancellation: Some(token.clone()),
+            ..Resources::default()
+        };
+        let stop = resources.stop();
+        assert_eq!(stop.check(), Ok(()));
+        token.cancel();
+        assert_eq!(stop.check(), Err(nrese_exec::Stop::Cancelled));
+        assert_eq!(Resources::default().stop().check(), Ok(()));
+    }
 }

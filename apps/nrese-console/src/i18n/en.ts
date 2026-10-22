@@ -75,6 +75,7 @@ export const en: AppStrings = {
   queryAcceptLabel: "Result format",
   namedGraphLabel: "Named graph IRI",
   noOutput: "(no response yet)",
+  incompleteAnswer: "Not shown to be complete: answers may be missing",
   searchTitle: "Find resources",
   searchHint: "Resources whose labels or names have words beginning with what you type.",
   searchPlaceholder: "albert ein",

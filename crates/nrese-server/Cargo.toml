@@ -14,6 +14,9 @@ async-trait.workspace = true
 axum = { version = "0.8.8", features = ["json", "query"] }
 dotenvy = "0.15.7"
 futures-util = { version = "0.3", default-features = false }
+# Streamed bodies with trailer frames (src/http/result_stream.rs); axum's own versions.
+http-body = "1.0.1"
+http-body-util = "0.1.3"
 jsonwebtoken = "9.3.1"
 mimalloc = { workspace = true }
 # mimalloc's `mi_collect`: memory given back after bulk loads and reasoning.
@@ -43,6 +46,10 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
+# Measured memory tests (tests/process_memory.rs).
+nrese-exec = { path = "../nrese-exec", features = ["measure"] }
+# The export's checksum computed independently (tests/it/admin_backup_api_tests.rs).
+sha2 = { workspace = true }
 tower = { version = "0.5.2", features = ["util"] }
 # A paused clock that tests advance themselves: deadlines decided without real time.
 tokio = { version = "1.48.0", features = ["test-util"] }
