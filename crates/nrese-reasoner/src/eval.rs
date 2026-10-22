@@ -1828,7 +1828,9 @@ impl GroundProgram {
     /// Files one ground fact rule; returns its index if it is new and has a body.
     pub fn add(&mut self, rule: Rule) -> Option<usize> {
         let equality_exempt = super::batch::equality_exempt(&rule);
+        let before = self.rules.len();
         self.add_with(rule, Vec::new(), None, equality_exempt)
+            .filter(|&r| r >= before)
     }
 
     /// Grounded eligibility comes from the source, not its current head representation.
@@ -1843,6 +1845,7 @@ impl GroundProgram {
 
     /// [`Self::add`], with the schema facts the instance was grounded on, and the closed
     /// family it is an instance of, if any ([`closed_family`]).
+    /// Also registers a retained replacement's first transition to generic execution.
     fn add_with(
         &mut self,
         rule: Rule,
@@ -1872,11 +1875,13 @@ impl GroundProgram {
             if let Some(&r) = self.known.get(&key) {
                 // RuleKey excludes names. Retain a grouped origin and any family
                 // regardless of which of those origins was filed first.
+                let newly_eligible = equality_exempt
+                    && self.equality_rule(r) == super::batch::EqualityRule::Replacement;
                 self.families[r].retain(family, equality_exempt);
                 if self.premises[r] != premises {
                     self.other(Grounding::Rule(r), premises);
                 }
-                return None;
+                return newly_eligible.then_some(r);
             }
             self.known.insert(key, self.rules.len());
             self.dispatch.push(self.rules.len(), &rule);
@@ -2010,8 +2015,9 @@ impl GroundProgram {
     }
 
     /// Grounds `rules` through the delta of `source` only (rules without schema atoms, list
-    /// rules among them, in full); returns the indices of the new fact rules and
-    /// consistency rules.
+    /// rules among them, in full); returns fact rules needing full evaluation (new
+    /// instances or retained replacements first becoming generic), and new consistency
+    /// rules. An eligibility transition is reported only once for a retained instance.
     pub fn ground_delta<S: Source + ?Sized>(
         &mut self,
         source: &S,
@@ -2781,5 +2787,51 @@ mod tests {
         ordinary.add_with(residual, vec![], Some(17), false);
         ordinary.transitive.insert(u64::MAX);
         assert_eq!(ordinary.closed_family(0), Some(u64::MAX));
+    }
+    #[test]
+    fn equality_transition_registers_only_once_and_keeps_public_add_contract() {
+        use crate::batch::EqualityRule;
+        let residual = Rule {
+            name: "eq-rep-p".into(),
+            body: vec![Atom([Term::Var(0), Term::Const(7), Term::Var(1)])],
+            guards: vec![],
+            head: Head::Facts(vec![Atom([Term::Var(0), Term::Const(8), Term::Var(1)])]),
+        };
+        for name in ["ordinary", "eq-sym", "eq-rep-p"] {
+            let mut rule = residual.clone();
+            rule.name = name.into();
+            let mut program = GroundProgram::default();
+            assert_eq!(program.add(rule.clone()), Some(0));
+            let key = rule_key(&rule);
+            let event = program.add_with(rule.clone(), vec![[1, 2, 3]], None, true);
+            assert_eq!(event, (name == "eq-rep-p").then_some(0));
+            assert_eq!(program.equality_rule(0), EqualityRule::Generic);
+            assert_eq!(program.add_with(rule, vec![[4, 5, 6]], None, true), None);
+            assert_eq!(program.rules.len(), 1);
+            assert_eq!(rule_key(&program.rules[0]), key);
+            assert_eq!(program.rules[0].name, name);
+            assert_eq!(program.premise_alternatives(Grounding::Rule(0)).len(), 3);
+        }
+        let mut program = GroundProgram::default();
+        assert_eq!(program.add(residual.clone()), Some(0));
+        let mut grouped = residual.clone();
+        let Head::Facts(heads) = grouped.head else {
+            unreachable!()
+        };
+        grouped.head = Head::Grouped(
+            vec![crate::ir::HeadGroup {
+                guards: vec![],
+                heads,
+            }]
+            .into_boxed_slice(),
+        );
+        assert_eq!(
+            program.add(grouped),
+            None,
+            "public add still reports only new rules"
+        );
+        assert_eq!(program.equality_rule(0), EqualityRule::Generic);
+        assert_eq!(program.rules.len(), 1);
+        assert_eq!(rule_key(&program.rules[0]), rule_key(&residual));
     }
 }
