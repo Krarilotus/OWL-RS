@@ -40,6 +40,20 @@ pub enum QueryEvaluationError {
     Unexpected(String),
 }
 
+/// The native stop contract. Memory/cancellation keep their typed causes;
+/// Rows/TooLarge have only an Unexpected String diagnostic in this error enum.
+impl From<nrese_exec::Stop> for QueryEvaluationError {
+    fn from(stop: nrese_exec::Stop) -> Self {
+        match stop {
+            nrese_exec::Stop::Memory(refused) => Self::MemoryLimit(refused),
+            nrese_exec::Stop::Cancelled => Self::Cancelled,
+            nrese_exec::Stop::Rows | nrese_exec::Stop::TooLarge(_) => {
+                Self::Unexpected(stop.to_string())
+            }
+        }
+    }
+}
+
 impl From<nrese_engine::EngineError> for QueryEvaluationError {
     fn from(error: nrese_engine::EngineError) -> Self {
         match error {

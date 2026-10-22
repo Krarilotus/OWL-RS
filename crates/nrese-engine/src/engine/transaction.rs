@@ -351,6 +351,17 @@ impl<'e> Transaction<'e> {
         self.engine.shared.dictionary.decode(id)
     }
 
+    /// [`Self::decode`] admitted before allocation, including this transaction's pending
+    /// interned IDs. Returned heap stays added to `held`; refusal/absence preserves its
+    /// previous bytes. Uses the actual dictionary rather than a base/pending snapshot.
+    pub fn decode_within<B: std::ops::Deref<Target = nrese_exec::Budget>>(
+        &self,
+        id: TermId,
+        held: &mut nrese_exec::Reservation<B>,
+    ) -> Result<Option<Term>, nrese_exec::BudgetExceeded> {
+        self.engine.shared.dictionary.decode_within(id, held)
+    }
+
     /// Asserts `quad`; returns `false` if it was already asserted.
     pub fn insert(&mut self, quad: QuadRef<'_>) -> bool {
         let encoded = self.engine.shared.dictionary.intern_quad(quad);

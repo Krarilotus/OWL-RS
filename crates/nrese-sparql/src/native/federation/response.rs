@@ -5,11 +5,12 @@
 use std::fmt::Write;
 use std::sync::Arc;
 
-use nrese_exec::{BudgetExceeded, ChargedVec, Reservation, StopSource, Ticker};
+use nrese_exec::{BudgetExceeded, ChargedVec, Reservation, Ticker};
 use nrese_rdf::{BlankNode, NamedOrBlankNode, Term, Triple};
 
 use super::super::{Context, NativeError, NativeResult};
-use crate::{CancellationToken, QueryEvaluationError, ServiceResults};
+use crate::service::Check;
+use crate::{QueryEvaluationError, ServiceResults};
 
 // A letter, a 128-bit namespace, and a 64-bit ordinal: exact ASCII output width.
 const FRESH_BYTES: usize = 1 + 32 + 16;
@@ -28,10 +29,9 @@ impl<'a> Scope<'a> {
         results: &'a ServiceResults,
     ) -> NativeResult<Option<Self>> {
         ctx.check()?;
-        let stop = StopSource::new(ctx.cancellation.as_ref().map(CancellationToken::flag), None);
-        let mut ticker = stop.ticker().map_err(|_| QueryEvaluationError::Cancelled)?;
+        let mut ticker = Ticker::new(Check(ctx)).map_err(QueryEvaluationError::from)?;
         let mut labels = ChargedVec::new(Arc::clone(&ctx.budget));
-        for term in results.rows.iter().flatten().flatten() {
+        for term in results.rows().iter().flatten().flatten() {
             collect(term, &mut labels, &mut ticker)?;
         }
         if labels.is_empty() {
@@ -55,9 +55,7 @@ impl<'a> Scope<'a> {
         };
         let namespace = rand::random::<u128>();
         for index in 0..scope.labels.len() {
-            ticker
-                .tick(1)
-                .map_err(|_| QueryEvaluationError::Cancelled)?;
+            ticker.tick(1).map_err(QueryEvaluationError::from)?;
             scope
                 ._text
                 .charge(FRESH_BYTES)
@@ -181,11 +179,9 @@ impl<'a> Scope<'a> {
 fn collect<'a>(
     term: &'a Term,
     labels: &mut ChargedVec<&'a BlankNode>,
-    ticker: &mut Ticker,
+    ticker: &mut Ticker<Check<'_>>,
 ) -> NativeResult<()> {
-    ticker
-        .tick(1)
-        .map_err(|_| QueryEvaluationError::Cancelled)?;
+    ticker.tick(1).map_err(QueryEvaluationError::from)?;
     match term {
         Term::BlankNode(node) => labels
             .push(node)
@@ -247,26 +243,27 @@ mod tests {
         let snapshot = engine.snapshot();
         let options = QueryOptions::default();
         let mut ctx = Context::new(&snapshot, &options, None, None);
-        let results = ServiceResults {
-            variables: vec![Variable::new_unchecked("x")],
-            rows: vec![vec![Some(
+        let row = vec![Some(
+            Triple::new(
+                BlankNode::new_unchecked("first"),
+                NamedNode::new_unchecked("urn:predicate"),
                 Triple::new(
-                    BlankNode::new_unchecked("first"),
-                    NamedNode::new_unchecked("urn:predicate"),
-                    Triple::new(
-                        BlankNode::new_unchecked("second"),
-                        NamedNode::new_unchecked("urn:another-predicate"),
-                        Literal::new_language_tagged_literal("é".repeat(512), "de").unwrap(),
-                    ),
-                )
-                .into(),
-            )]],
-        };
+                    BlankNode::new_unchecked("second"),
+                    NamedNode::new_unchecked("urn:another-predicate"),
+                    Literal::new_language_tagged_literal("é".repeat(512), "de").unwrap(),
+                ),
+            )
+            .into(),
+        )];
+        let mut results = ServiceResults::new(vec![Variable::new_unchecked("x")], &ctx.budget);
+        results
+            .push_row(&row, &nrese_exec::StopSource::none())
+            .unwrap();
         for limit in [1, 150, 1 << 20] {
             ctx.budget = Arc::new(Budget::new(limit));
             let (result, uncovered) = measure_within(&ctx.budget, || {
                 let scope = Scope::new(&ctx, &results)?.expect("the fixture has blank nodes");
-                scope.with_term(&ctx, results.rows[0][0].as_ref().unwrap(), |_| Ok(7))
+                scope.with_term(&ctx, results.rows()[0][0].as_ref().unwrap(), |_| Ok(7))
             });
             assert_eq!(
                 uncovered, 0,
@@ -303,19 +300,20 @@ mod tests {
         let snapshot = engine.snapshot();
         let options = QueryOptions::default();
         let mut ctx = Context::new(&snapshot, &options, None, None);
-        let results = ServiceResults {
-            variables: vec![Variable::new_unchecked("x")],
-            rows: vec![vec![Some(
-                Triple::new(
-                    BlankNode::new_unchecked("remote"),
-                    NamedNode::new_unchecked("urn:predicate"),
-                    Literal::new_simple_literal("payload"),
-                )
-                .into(),
-            )]],
-        };
+        let row = vec![Some(
+            Triple::new(
+                BlankNode::new_unchecked("remote"),
+                NamedNode::new_unchecked("urn:predicate"),
+                Literal::new_simple_literal("payload"),
+            )
+            .into(),
+        )];
+        let mut results = ServiceResults::new(vec![Variable::new_unchecked("x")], &ctx.budget);
+        results
+            .push_row(&row, &nrese_exec::StopSource::none())
+            .unwrap();
         let plain: Term = Literal::new_simple_literal("plain").into();
-        for term in [&plain, results.rows[0][0].as_ref().unwrap()] {
+        for term in [&plain, results.rows()[0][0].as_ref().unwrap()] {
             for cancelled in [false, true] {
                 ctx.budget = Arc::new(Budget::new(1 << 20));
                 let called = std::cell::Cell::new(false);

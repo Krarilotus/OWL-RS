@@ -196,17 +196,14 @@ impl Context<'_> {
                 base_iri: self.evaluator.base().cloned(),
             }
             .to_string();
-            let results = services
-                .0
-                .select(endpoint, &query, self.cancellation.as_ref());
-            // The old boxed client API can report a stop as an ordinary endpoint error.
-            // The caller's reason wins before SILENT may see either a result or an error.
-            self.check()?;
             let results =
-                results.map_err(|error| match error.downcast::<QueryEvaluationError>() {
-                    Ok(error) => *error,
-                    Err(error) => QueryEvaluationError::Service(error),
-                })?;
+                services
+                    .0
+                    .select(endpoint, &query, &self.budget, self.cancellation.as_ref());
+            // The caller's reason wins even when a custom client returns success
+            // or an endpoint failure after the invocation stopped.
+            self.check()?;
+            let results = results?;
             // The endpoint's terms as canonical answers name them.
             let table = match &self.canonical {
                 None => import(self, &results, |term| self.id(term))?,
@@ -217,7 +214,7 @@ impl Context<'_> {
                 })?,
             };
             let solutions = self.produced(Solutions {
-                vars: results.variables,
+                vars: results.into_variables(),
                 table,
                 ordered: false,
             })?;
@@ -237,9 +234,9 @@ fn import(
     id: impl Fn(&Term) -> NativeResult<u64>,
 ) -> NativeResult<IdTable> {
     let scope = response::Scope::new(ctx, results)?;
-    let mut table = IdTable::charged(results.variables.len(), 0, &ctx.budget)?;
-    let mut row = vec![UNDEF; results.variables.len()];
-    for values in &results.rows {
+    let mut table = IdTable::charged(results.variables().len(), 0, &ctx.budget)?;
+    let mut row = vec![UNDEF; results.variables().len()];
+    for values in results.rows() {
         ctx.check()?;
         if values.len() != row.len() {
             return Err(
