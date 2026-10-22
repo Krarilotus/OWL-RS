@@ -771,14 +771,24 @@ pub fn update_with<B: Base + ?Sized>(
             hidden: &hidden,
             extra: &extra,
         };
-        // Instances through new schema facts, and list rules from new list facts. They
-        // are appended, so the new ones are `evaluated..`.
+        // New instances are appended. A retained replacement can also first become
+        // generic through a newly grounded grouped origin and must read old data.
         let evaluated = program.rules.len();
+        let mut reactivated = Vec::new();
         let transitive_before = program.transitive.clone();
         let mut delta_facts = Vec::new();
         extra.scan([None, None, None], Seg::Delta, &mut |f| delta_facts.push(f));
         if delta_facts.iter().any(|&f| schema.is_schema_fact(f)) {
-            program.to_mut().ground_delta(&state, schema, &schema_rules);
+            reactivated = program
+                .to_mut()
+                .ground_delta(&state, schema, &schema_rules)
+                .0;
+            if module_equality {
+                reactivated.retain(|&r| r < evaluated);
+                reactivated.sort_unstable();
+            } else {
+                reactivated.clear();
+            }
         }
         if delta_facts.iter().any(|&f| rules.is_list_fact(f))
             && let Some(vocabulary) = rules.lists
@@ -798,12 +808,16 @@ pub fn update_with<B: Base + ?Sized>(
         let mut jobs = Vec::new();
         for (r, i) in program.variants(&extra) {
             if r < evaluated
+                && reactivated.binary_search(&r).is_err()
                 && !(module_equality && program.equality_rule(r) == EqualityRule::Replacement)
             {
                 jobs.extend(Job::variant(&state, &program.rules[r], i));
             }
         }
-        for r in evaluated..program.rules.len() {
+        for r in reactivated
+            .into_iter()
+            .chain(evaluated..program.rules.len())
+        {
             if !(module_equality && program.equality_rule(r) == EqualityRule::Replacement) {
                 jobs.extend(Job::full(&state, &program.rules[r]));
             }
