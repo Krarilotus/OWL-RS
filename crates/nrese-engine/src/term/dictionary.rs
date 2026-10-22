@@ -39,6 +39,8 @@ use crate::error::{EngineError, EngineResult};
 use crate::mapped::Mapped;
 use crate::quad::EncodedQuad;
 
+mod decode;
+
 /// Dictionary entries handed to the full-text index per batch while it is built.
 const TEXT_BATCH: u64 = 1 << 20;
 

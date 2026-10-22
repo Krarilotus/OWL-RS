@@ -38,6 +38,18 @@ pub trait ReadView {
 
     fn decode(&self, id: TermId) -> Option<Term>;
 
+    /// Value-equivalent to `decode`, with admission before allocating. Every inline,
+    /// stored/compressed and quoted-triple form accepted by `decode` must be supported.
+    /// This adds the returned term's heap to `held`; temporary charges are released only
+    /// after their buffers are freed. Absence/refusal preserves all pre-existing held
+    /// bytes. The caller keeps the added charge until it frees the returned term.
+    /// This does not add a graph-read or snapshot-membership boundary to `decode`.
+    fn decode_within<B: std::ops::Deref<Target = nrese_exec::Budget>>(
+        &self,
+        id: TermId,
+        held: &mut nrese_exec::Reservation<B>,
+    ) -> Result<Option<Term>, nrese_exec::BudgetExceeded>;
+
     /// Decodes a quad read from this view; `None` only for ids the view doesn't know.
     fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad>;
 
@@ -74,6 +86,14 @@ impl ReadView for Snapshot {
 
     fn decode(&self, id: TermId) -> Option<Term> {
         Snapshot::decode(self, id)
+    }
+
+    fn decode_within<B: std::ops::Deref<Target = nrese_exec::Budget>>(
+        &self,
+        id: TermId,
+        held: &mut nrese_exec::Reservation<B>,
+    ) -> Result<Option<Term>, nrese_exec::BudgetExceeded> {
+        Snapshot::decode_within(self, id, held)
     }
 
     fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad> {
@@ -114,6 +134,14 @@ impl<'e> ReadView for Transaction<'e> {
         Transaction::decode(self, id)
     }
 
+    fn decode_within<B: std::ops::Deref<Target = nrese_exec::Budget>>(
+        &self,
+        id: TermId,
+        held: &mut nrese_exec::Reservation<B>,
+    ) -> Result<Option<Term>, nrese_exec::BudgetExceeded> {
+        Transaction::decode_within(self, id, held)
+    }
+
     fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad> {
         Transaction::decode_quad(self, quad)
     }
@@ -123,6 +151,68 @@ impl<'e> ReadView for Transaction<'e> {
             Cow::Borrowed(self.base())
         } else {
             Cow::Owned(self.pending_snapshot())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nrese_engine::{Engine, EngineConfig};
+    use nrese_exec::{Budget, Reservation, measure};
+    use nrese_rdf::{Literal, NamedNode, Triple};
+
+    fn generic_decode(view: &impl ReadView, id: TermId, expected: &Term) {
+        assert_eq!(view.decode(id).as_ref(), Some(expected));
+        let budget = Budget::unlimited();
+        let ((term, prior, held), excess) = measure::measure_within(&budget, || {
+            let mut held = Reservation::new(&budget);
+            held.charge(37).unwrap();
+            let prior = vec![0_u8; 37];
+            let term = view.decode_within(id, &mut held).unwrap().unwrap();
+            (term, prior, held)
+        });
+        assert_eq!(&term, expected);
+        assert_eq!(excess, 0);
+        assert_eq!(held.bytes(), 37 + term.heap_bytes());
+        drop((term, prior, held));
+        assert_eq!(budget.used(), 0);
+        let budget = Budget::new(37);
+        let mut held = Reservation::new(&budget);
+        held.charge(37).unwrap();
+        assert!(view.decode_within(id, &mut held).is_err());
+        assert_eq!(held.bytes(), 37);
+    }
+
+    #[test]
+    fn complete_decode_generic_pending_and_snapshot_dictionary_domain() {
+        if !measure::alone() {
+            return;
+        }
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let snapshot = engine.snapshot();
+        let tx = engine.transaction();
+        let atomic: Term = Literal::new_simple_literal("pending ".repeat(4096)).into();
+        let triple: Term = Triple::new(
+            NamedNode::new_unchecked("urn:s"),
+            NamedNode::new_unchecked("urn:p"),
+            atomic.clone(),
+        )
+        .into();
+        for term in [atomic, triple, Literal::from(42_i64).into()] {
+            let id = tx.intern(term.as_ref());
+            generic_decode(&tx, id, &term);
+            // Ordinary Snapshot::decode knows these IDs despite its older version fence.
+            generic_decode(&snapshot, id, &term);
+            assert_eq!(
+                snapshot.decode_charged(id, |_| Ok::<_, ()>(())),
+                Ok(None),
+                "the intentionally partial fenced helper remains unchanged"
+            );
         }
     }
 }

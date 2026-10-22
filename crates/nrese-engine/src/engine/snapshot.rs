@@ -1688,6 +1688,19 @@ impl Snapshot {
         self.dictionary.decode(id)
     }
 
+    /// [`Self::decode`] with every allocation admitted before construction. The same
+    /// shared-dictionary ID domain as `decode`, including inline/triple terms; this is
+    /// not a snapshot-membership or graph visibility check. Returned heap remains added
+    /// to `held`; refusal/absence preserves its previous bytes. Unlike the older partial
+    /// [`Self::decode_charged`], this operation does not apply a dictionary-length fence.
+    pub fn decode_within<B: std::ops::Deref<Target = nrese_exec::Budget>>(
+        &self,
+        id: TermId,
+        held: &mut nrese_exec::Reservation<B>,
+    ) -> Result<Option<Term>, nrese_exec::BudgetExceeded> {
+        self.dictionary.decode_within(id, held)
+    }
+
     /// [`Self::decode`] of the dictionary term `id`, what it allocates charged first
     /// through `charge` ([`Dictionary::decode_charged`]: the bound and the decoding read one
     /// state of the dictionary). `Ok(None)` for inline ids, triple terms and ids this
