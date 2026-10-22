@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use nrese_exec::heap;
-use nrese_reasoner::{ReasonerConfig, ReasonerService};
+use nrese_reasoner::ReasonerConfig;
 use nrese_store::{
     CancellationToken, GraphResultFormat, GraphTarget, GraphWriteRequest, MutationCommand,
     MutationPipeline, MutationTicket, Requester, SparqlQueryRequest, SparqlUpdateRequest,
@@ -155,10 +155,7 @@ fn churn_over_a_bounded_pool_of_terms_holds_the_heap_level() {
     })
     .unwrap();
     let mut soak = Soak {
-        pipeline: MutationPipeline::new(
-            Arc::new(store),
-            Arc::new(ReasonerService::new(ReasonerConfig::default())),
-        ),
+        pipeline: MutationPipeline::new(Arc::new(store), ReasonerConfig::default()),
         rng: Rng(20_261_007),
     };
     // Every term of the pool in the dictionary first.

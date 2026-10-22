@@ -98,6 +98,9 @@ pub struct Options {
     pub equality: bool,
     /// How `nrese-owl` normalises (never with lazy definitions: see the default).
     pub normalise: nrese_owl::Options,
+    /// The phases as they start, on stderr, with the time since the classification began
+    /// (for the lab; off by default).
+    pub trace: bool,
 }
 
 impl Options {
@@ -153,6 +156,7 @@ impl Default for Options {
                 exact_provenance: false,
                 ..nrese_owl::Options::default()
             },
+            trace: false,
         }
     }
 }
@@ -227,12 +231,10 @@ impl Deadline {
     }
 }
 
-/// With `NRESE_CLASSIFY_TRACE` set, the phases as they start, on stderr (for the lab).
-pub(crate) fn trace(what: &str) {
-    static ON: std::sync::OnceLock<Option<Instant>> = std::sync::OnceLock::new();
-    if let Some(start) =
-        ON.get_or_init(|| std::env::var_os("NRESE_CLASSIFY_TRACE").map(|_| Instant::now()))
-    {
+/// The phases as they start, on stderr, timed from `start`: where [`Options::trace`] asks
+/// (for the lab).
+pub(crate) fn trace(start: Option<Instant>, what: &str) {
+    if let Some(start) = start {
         eprintln!(
             "trace {:>9.1} ms {what}",
             start.elapsed().as_secs_f64() * 1000.0
@@ -243,14 +245,15 @@ pub(crate) fn trace(what: &str) {
 /// Classifies `ontology`.
 pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
     let started = Instant::now();
+    let traced = options.trace.then_some(started);
     let deadline = Deadline::new(options.timeout);
     let classes = crate::context::signature(ontology);
     let t = Instant::now();
     let ontology = tableau::prepared(ontology);
-    trace("normalise");
+    trace(traced, "normalise");
     let (normalised, inlined) = clauses(&ontology, options);
     let normalise = t.elapsed();
-    trace("context core");
+    trace(traced, "context core");
     if options.context_core {
         let core = options.core(deadline.budget(options, None));
         let t = Instant::now();
@@ -280,8 +283,9 @@ pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
             };
         }
     }
-    trace("driver");
-    let mut taxonomy = classify_normalised(&ontology, &normalised, &classes, options, deadline);
+    trace(traced, "driver");
+    let mut taxonomy =
+        classify_normalised(&ontology, &normalised, &classes, options, deadline, traced);
     taxonomy.profile.normalise += normalise;
     taxonomy.profile.inlined = inlined;
     taxonomy.profile.total = started.elapsed();
@@ -306,8 +310,9 @@ pub(crate) fn classify_normalised(
     classes: &[Term],
     options: &Options,
     deadline: Deadline,
+    traced: Option<Instant>,
 ) -> Taxonomy {
-    driver::Driver::new(ontology, normalised, classes, options, deadline).classify()
+    driver::Driver::new(ontology, normalised, classes, options, deadline, traced).classify()
 }
 
 #[cfg(test)]

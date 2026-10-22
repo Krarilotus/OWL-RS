@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_sparql::Regime;
 use nrese_store::{
     CancellationToken, GraphResultFormat, MutationPipeline, RdfPayload, SparqlQueryRequest,
@@ -159,9 +159,7 @@ fn on_disk(dir: &std::path::Path) -> MutationPipeline {
     let store = StoreService::new(StoreConfig::on_disk(dir)).expect("store");
     MutationPipeline::new(
         Arc::new(store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Dl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
     )
 }
 

@@ -14,7 +14,7 @@
 
 use rayon::prelude::*;
 
-use super::keys::PackedKeys;
+use super::keys::{IndexEncoding, PackedKeys};
 use crate::quad::{Key, Permutation};
 
 /// Distinct values of the partitioning component beyond which the caller sorts instead:
@@ -136,18 +136,20 @@ impl Ordered<'_> {
         Some(out)
     }
 
-    /// The keys in `order`, packed.
-    pub(crate) fn packed(&self) -> PackedKeys {
+    /// The keys in `order`, packed in `encoding`.
+    pub(crate) fn packed(&self, encoding: IndexEncoding) -> PackedKeys {
         let (keys, base, to) = (self.keys, self.base, self.order);
         match self.positions {
-            None => PackedKeys::from_sorted(keys),
-            Some(positions) => PackedKeys::from_sorted_gathered(positions.len(), |range, out| {
-                out.extend(
-                    positions[range]
-                        .iter()
-                        .map(|&p| to.to_key(&base.key_to_quad(&keys[p as usize]))),
-                );
-            }),
+            None => PackedKeys::from_sorted(keys, encoding),
+            Some(positions) => {
+                PackedKeys::from_sorted_gathered(positions.len(), encoding, |range, out| {
+                    out.extend(
+                        positions[range]
+                            .iter()
+                            .map(|&p| to.to_key(&base.key_to_quad(&keys[p as usize]))),
+                    );
+                })
+            }
         }
     }
 }
@@ -204,6 +206,7 @@ mod tests {
             let mut builder = crate::index::run::PermutationBuilder::planned(
                 quads.clone(),
                 layout.permutations(),
+                IndexEncoding::Fast,
             );
             for &permutation in layout.permutations() {
                 let keys = builder.packed(permutation);
@@ -264,7 +267,7 @@ mod tests {
                         order: to,
                         positions: Some(&positions),
                     };
-                    let packed: Vec<Key> = derived.packed().iter().collect();
+                    let packed: Vec<Key> = derived.packed(IndexEncoding::Fast).iter().collect();
                     assert_eq!(packed, sorted(&quads, to), "{base:?} -> {to:?}");
                     // And one step further, from the derived positions.
                     for next in Permutation::ALL {
@@ -275,7 +278,8 @@ mod tests {
                                 order: next,
                                 positions: Some(&further),
                             };
-                            let packed: Vec<Key> = again.packed().iter().collect();
+                            let packed: Vec<Key> =
+                                again.packed(IndexEncoding::Fast).iter().collect();
                             assert_eq!(
                                 packed,
                                 sorted(&quads, next),

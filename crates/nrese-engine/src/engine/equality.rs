@@ -302,6 +302,7 @@ fn canonical_version(
     )?;
     let run = crate::index::run::Run::from_delta_within(
         asserted.layout(),
+        asserted.encoding(),
         &inserts,
         &renamed,
         &mut held,
@@ -830,7 +831,7 @@ mod tests {
             quad(20, 5, 10),
             quad(30, 5, 1),
         ];
-        let version = Version::empty();
+        let version = Version::empty(crate::IndexEncoding::Fast);
         let expanded: Vec<EncodedQuad> = Expand::new(
             stored.into_iter(),
             Arc::clone(&classes),

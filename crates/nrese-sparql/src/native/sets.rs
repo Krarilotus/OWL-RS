@@ -46,7 +46,7 @@ use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern,
 };
-use nrese_sparql_syntax::term::TriplePattern;
+use nrese_sparql_syntax::term::{TermPattern, TriplePattern};
 
 use super::{
     Agg, Context, NativeResult, Solutions, as_path, bound_variables, expression_variables,
@@ -92,7 +92,51 @@ pub(super) fn joins(pattern: &GraphPattern) -> bool {
 pub(super) fn in_scope(pattern: &GraphPattern) -> Vec<Variable> {
     let mut variables = Vec::new();
     bound_variables(pattern, &mut variables);
+    blank_nodes(pattern, &mut variables);
     variables
+}
+
+/// The blank nodes of `pattern`'s triple patterns and paths, as the columns the executor
+/// binds them to (`_bnode_…`): the translation of a sequence path (`?a p/q+ ?b`) joins its
+/// steps on a fresh one, and a set evaluation that dropped it lost the join (the path's
+/// other end's values came back as its answers).
+fn blank_nodes(pattern: &GraphPattern, out: &mut Vec<Variable>) {
+    let mut term = |t: &TermPattern| {
+        if let TermPattern::BlankNode(b) = t {
+            let v = Variable::new_unchecked(format!("_bnode_{}", b.as_str()));
+            if !out.contains(&v) {
+                out.push(v);
+            }
+        }
+    };
+    match pattern {
+        GraphPattern::Bgp { patterns } => {
+            for triple in patterns {
+                term(&triple.subject);
+                term(&triple.object);
+            }
+        }
+        GraphPattern::Path {
+            subject, object, ..
+        } => {
+            term(subject);
+            term(object);
+        }
+        GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+            for input in inputs {
+                blank_nodes(input, out);
+            }
+        }
+        GraphPattern::LeftJoin { left, right, .. } | GraphPattern::Lateral { left, right } => {
+            blank_nodes(left, out);
+            blank_nodes(right, out);
+        }
+        GraphPattern::Minus { left, .. } => blank_nodes(left, out),
+        GraphPattern::Filter { inner, .. }
+        | GraphPattern::Graph { inner, .. }
+        | GraphPattern::Extend { inner, .. } => blank_nodes(inner, out),
+        _ => {}
+    }
 }
 
 fn add(to: &mut Vec<Variable>, variables: impl IntoIterator<Item = Variable>) {
@@ -217,11 +261,23 @@ impl Context<'_> {
                 );
                 add(&mut keep, expression.iter().flat_map(expression_variables));
                 let left = self.eval_set(left, &keep)?;
-                let right = match as_path(right) {
-                    Some(path) => self.path_from(&left, &path)?,
-                    None => self.eval_set(right, &keep)?,
-                };
-                self.left_join(left, right, expression.as_ref())?
+                if left.table.is_empty() {
+                    // No right row can contribute; keep its scope, including path aliases.
+                    let mut vars = left.vars.clone();
+                    add(&mut vars, right_scope);
+                    self.consumed(left);
+                    Solutions {
+                        table: IdTable::new(vars.len()),
+                        vars,
+                        ordered: false,
+                    }
+                } else {
+                    let right = match as_path(right) {
+                        Some(path) => self.path_from(&left, &path)?,
+                        None => self.eval_set(right, &keep)?,
+                    };
+                    self.left_join(left, right, expression.as_ref())?
+                }
             }
             GraphPattern::Union { inputs } => {
                 let mut rows: Option<Solutions> = None;
@@ -482,18 +538,12 @@ impl Context<'_> {
         let key_table = IdTable::from_columns(key_columns);
         let groups = group_rows(&key_table, &(0..variables.len()).collect::<Vec<_>>());
         let group_count = groups.len();
-        let members_of = |group_of: &mut dyn Iterator<Item = usize>| {
-            let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
-            for (row, group) in group_of.enumerate() {
-                members[group].push(row);
-            }
-            members
-        };
+
         // Aggregates in the caller's order; each column is filled by the part that
         // computes it.
         let mut values: Vec<Option<Vec<u64>>> = vec![None; aggregates.len()];
         let compute = |solutions: &Solutions,
-                       members: &[Vec<usize>],
+                       members: &nrese_exec::group::Members,
                        selected: &[usize],
                        values: &mut Vec<Option<Vec<u64>>>|
          -> NativeResult<()> {
@@ -516,7 +566,10 @@ impl Context<'_> {
         let core_aggregates: Vec<usize> = (0..aggregates.len())
             .filter(|&a| branch_of(&arguments[a]).is_none())
             .collect();
-        let members = members_of(&mut groups.group_of.iter().map(|&g| g as usize));
+        let members = nrese_exec::group::Members::of(
+            groups.group_of.iter().map(|&g| g as usize),
+            group_count,
+        );
         let start = std::time::Instant::now();
         compute(&core, &members, &core_aggregates, &mut values)?;
         if self.trace.is_some() {
@@ -653,7 +706,10 @@ impl Context<'_> {
             let estimate = Some(left.table.len().max(right.table.len()) as u64);
             let joined = self.left_join(left, right, *expression)?;
             let column = joined.column(&group).expect("the left side's first column");
-            let members = members_of(&mut joined.table.column(column).iter().map(|&g| g as usize));
+            let members = nrese_exec::group::Members::of(
+                joined.table.column(column).iter().map(|&g| g as usize),
+                group_count,
+            );
             if self.trace.is_some() {
                 let detail = format!(
                     "a detached OPTIONAL joined to {} kept group(s)",
