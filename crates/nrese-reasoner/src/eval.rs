@@ -213,23 +213,22 @@ impl Schema {
         if self.hidden.is_empty() {
             return Some(rule);
         }
-        if let Head::Facts(atoms) = &mut rule.head {
-            atoms.retain_mut(|atom| match atom.0 {
-                [_, Term::Const(p), Term::Const(c)] if p == self.rdf_type => {
-                    match self.hidden.get(&c) {
-                        Some(true) => {
-                            atom.0[2] = Term::Const(self.thing);
-                            true
-                        }
-                        Some(false) => false,
-                        None => true,
+        rule.head.retain_atoms(|atom| match atom.0 {
+            [_, Term::Const(p), Term::Const(c)] if p == self.rdf_type => {
+                match self.hidden.get(&c) {
+                    Some(true) => {
+                        atom.0[2] = Term::Const(self.thing);
+                        true
                     }
+                    Some(false) => false,
+                    None => true,
                 }
-                _ => true,
-            });
-            if atoms.is_empty() {
-                return None;
             }
+            _ => true,
+        });
+        rule.factor_head_guards();
+        if rule.head != Head::Inconsistent && rule.head.atoms().next().is_none() {
+            return None;
         }
         Some(rule)
     }
@@ -335,6 +334,110 @@ pub(crate) fn guards_hold_polled(
     Ok(true)
 }
 
+pub(crate) fn guards_hold_prepared_polled(
+    guards: &[Guard],
+    bindings: &[Option<u64>],
+    poll: &mut Poller<'_>,
+    scratch: &mut super::representatives::GuardWorkspace,
+) -> Result<bool, super::delta::Interrupted> {
+    for guard in guards {
+        let holds = match guard {
+            Guard::Classes(g) => g.holds_prepared_polled(&|t| value(t, bindings), poll, scratch)?,
+            _ => {
+                poll.work()?;
+                guard.holds(|t| value(t, bindings))
+            }
+        };
+        if !holds {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+// Static leaf specialization. Ordinary entry retains only its existing dynamic emit.
+// No mode/callback is added per binding; recursive joins and driver scan are shared.
+trait Completion {
+    const EARLY: bool;
+    fn complete(
+        &mut self,
+        guards: &[Guard],
+        bindings: &[Option<u64>],
+        poll: &mut Poller<'_>,
+    ) -> bool;
+}
+struct PlainCompletion<'a>(&'a mut dyn FnMut(&[Option<u64>]));
+impl Completion for PlainCompletion<'_> {
+    const EARLY: bool = false;
+    fn complete(&mut self, g: &[Guard], b: &[Option<u64>], p: &mut Poller<'_>) -> bool {
+        if matches!(guards_hold_polled(g, b, p), Ok(true)) {
+            (self.0)(b);
+        }
+        false
+    }
+}
+struct UntilCompletion<'a>(&'a mut dyn FnMut(&[Option<u64>]) -> bool);
+impl Completion for UntilCompletion<'_> {
+    const EARLY: bool = true;
+    fn complete(&mut self, g: &[Guard], b: &[Option<u64>], p: &mut Poller<'_>) -> bool {
+        matches!(guards_hold_polled(g, b, p), Ok(true)) && (self.0)(b)
+    }
+}
+struct PreparedCompletion<'a, F, const EARLY: bool> {
+    scratch: &'a mut super::representatives::GuardWorkspace,
+    emit: F,
+}
+impl<F, const EARLY: bool> Completion for PreparedCompletion<'_, F, EARLY>
+where
+    F: FnMut(&[Option<u64>], &mut Poller<'_>, &mut super::representatives::GuardWorkspace) -> bool,
+{
+    const EARLY: bool = EARLY;
+    fn complete(&mut self, g: &[Guard], b: &[Option<u64>], p: &mut Poller<'_>) -> bool {
+        matches!(guards_hold_prepared_polled(g, b, p, self.scratch), Ok(true))
+            && (self.emit)(b, p, self.scratch)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_core<S: Source + ?Sized, C: Completion>(
+    source: &S,
+    body: &[Atom],
+    guards: &[Guard],
+    order: &[(usize, Seg)],
+    depth: usize,
+    bindings: &mut [Option<u64>],
+    poll: &mut Poller<'_>,
+    completion: &mut C,
+) -> bool {
+    let Some(&(index, seg)) = order.get(depth) else {
+        return completion.complete(guards, bindings, poll);
+    };
+    let atom = &body[index];
+    let mut stopped = false;
+    source.scan(pattern(atom, bindings), seg, &mut |fact| {
+        if (C::EARLY && stopped) || poll.tick() {
+            return;
+        }
+        if let Some(newly) = bind(atom, fact, bindings) {
+            let found = walk_core(
+                source,
+                body,
+                guards,
+                order,
+                depth + 1,
+                bindings,
+                poll,
+                completion,
+            );
+            if C::EARLY {
+                stopped = found;
+            }
+            unbind(atom, newly, bindings);
+        }
+    });
+    stopped
+}
+
 /// Evaluates `order[depth..]` of `body`, calling `emit` for each complete binding. Each
 /// fact it scans, bound or not, is one unit `poll` counts; once the stop has fired, the rest
 /// of each scan under way is passed over (a scan can't be stopped) and nothing deeper is
@@ -352,22 +455,16 @@ pub fn walk<S: Source + ?Sized>(
     poll: &mut Poller<'_>,
     emit: &mut dyn FnMut(&[Option<u64>]),
 ) {
-    let Some(&(index, seg)) = order.get(depth) else {
-        if matches!(guards_hold_polled(guards, bindings, poll), Ok(true)) {
-            emit(bindings);
-        }
-        return;
-    };
-    let atom = &body[index];
-    source.scan(pattern(atom, bindings), seg, &mut |fact| {
-        if poll.tick() {
-            return;
-        }
-        if let Some(newly) = bind(atom, fact, bindings) {
-            walk(source, body, guards, order, depth + 1, bindings, poll, emit);
-            unbind(atom, newly, bindings);
-        }
-    });
+    walk_core(
+        source,
+        body,
+        guards,
+        order,
+        depth,
+        bindings,
+        poll,
+        &mut PlainCompletion(emit),
+    );
 }
 
 /// [`walk`] that stops once `emit` returns true: the rest of a scan under way is passed
@@ -387,21 +484,16 @@ pub fn walk_until<S: Source + ?Sized>(
     poll: &mut Poller<'_>,
     emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
 ) -> bool {
-    let Some(&(index, seg)) = order.get(depth) else {
-        return matches!(guards_hold_polled(guards, bindings, poll), Ok(true)) && emit(bindings);
-    };
-    let atom = &body[index];
-    let mut stopped = false;
-    source.scan(pattern(atom, bindings), seg, &mut |fact| {
-        if stopped || poll.tick() {
-            return;
-        }
-        if let Some(newly) = bind(atom, fact, bindings) {
-            stopped = walk_until(source, body, guards, order, depth + 1, bindings, poll, emit);
-            unbind(atom, newly, bindings);
-        }
-    });
-    stopped
+    walk_core(
+        source,
+        body,
+        guards,
+        order,
+        depth,
+        bindings,
+        poll,
+        &mut UntilCompletion(emit),
+    )
 }
 
 /// Orders `atoms` after `first`: most bound positions first, then fewest matches.
@@ -489,25 +581,27 @@ pub struct Grounded {
 }
 
 /// The rule instance for one binding of the schema variables; `None` if a guard fails.
-fn instance(
-    rule: &Rule,
-    instance_atoms: &[usize],
+fn fold_guards_inner(
+    input: &[Guard],
     substitution: &[Option<u64>],
-) -> Option<Grounded> {
-    let mut guards = Vec::new();
-    for guard in &rule.guards {
+    out: &mut Vec<Guard>,
+    poll: &mut Poller<'_>,
+) -> Option<()> {
+    for guard in input {
+        poll.work().ok()?;
         match *guard {
+            Guard::NotEqual(a, b) if a == b => return None,
             Guard::NotEqual(a, b) => {
                 match (substitute(a, substitution), substitute(b, substitution)) {
                     (Term::Const(a), Term::Const(b)) if a == b => return None,
                     (Term::Const(_), Term::Const(_)) => {}
-                    (a, b) => guards.push(Guard::NotEqual(a, b)),
+                    (a, b) => out.push(Guard::NotEqual(a, b)),
                 }
             }
             Guard::NotIn(term, low, high) => match substitute(term, substitution) {
                 Term::Const(v) if (low..=high).contains(&v) => return None,
                 Term::Const(_) => {}
-                term => guards.push(Guard::NotIn(term, low, high)),
+                term => out.push(Guard::NotIn(term, low, high)),
             },
             Guard::SameList(a, b, ref index) => {
                 match (substitute(a, substitution), substitute(b, substitution)) {
@@ -515,16 +609,38 @@ fn instance(
                         return None;
                     }
                     (Term::Const(_), Term::Const(_)) => {}
-                    (a, b) => guards.push(Guard::SameList(a, b, index.clone())),
+                    (a, b) => out.push(Guard::SameList(a, b, index.clone())),
                 }
             }
             // Decided when the rule is evaluated: whether a class holds identities that
             // satisfy it changes as classes merge.
             Guard::Classes(ref class_guards) => {
-                guards.push(Guard::Classes(class_guards.ground(substitution)));
+                out.push(Guard::Classes(
+                    class_guards.ground_polled(substitution, poll).ok()?,
+                ));
             }
         }
     }
+    Some(())
+}
+
+fn fold_guards(
+    input: &[Guard],
+    substitution: &[Option<u64>],
+    poll: &mut Poller<'_>,
+) -> Option<Vec<Guard>> {
+    let mut guards = Vec::with_capacity(input.len());
+    fold_guards_inner(input, substitution, &mut guards, poll)?;
+    Some(guards)
+}
+
+fn instance(
+    rule: &Rule,
+    instance_atoms: &[usize],
+    substitution: &[Option<u64>],
+    poll: &mut Poller<'_>,
+) -> Option<Grounded> {
+    let guards = fold_guards(&rule.guards, substitution, poll)?;
     let head = match &rule.head {
         Head::Facts(atoms) => Head::Facts(
             atoms
@@ -532,9 +648,24 @@ fn instance(
                 .map(|a| substitute_atom(a, substitution))
                 .collect(),
         ),
+        Head::Grouped(groups) => Head::Grouped(
+            groups
+                .iter()
+                .filter_map(|g| {
+                    Some(super::ir::HeadGroup {
+                        guards: fold_guards(&g.guards, substitution, poll)?,
+                        heads: g
+                            .heads
+                            .iter()
+                            .map(|a| substitute_atom(a, substitution))
+                            .collect(),
+                    })
+                })
+                .collect(),
+        ),
         Head::Inconsistent => Head::Inconsistent,
     };
-    Some(Grounded {
+    let mut grounded = Grounded {
         rule: Rule {
             name: rule.name.clone(),
             body: instance_atoms
@@ -545,7 +676,12 @@ fn instance(
             head,
         },
         substitution: substitution.to_vec(),
-    })
+    };
+    grounded.rule.factor_head_guards();
+    if matches!(&grounded.rule.head, Head::Facts(atoms) if atoms.is_empty()) {
+        return None;
+    }
+    Some(grounded)
 }
 
 fn split_schema(schema: &Schema, rule: &Rule) -> (Vec<usize>, Vec<usize>) {
@@ -560,7 +696,14 @@ pub fn ground<S: Source + ?Sized>(
     rule: &Rule,
     emit: &mut dyn FnMut(Grounded),
 ) {
-    ground_polled(source, schema, rule, &mut Poller::never(), emit);
+    ground_polled(
+        source,
+        schema,
+        rule,
+        &mut Poller::never(),
+        &mut super::representatives::GuardWorkspace::default(),
+        emit,
+    );
 }
 
 fn ground_polled<S: Source + ?Sized>(
@@ -568,6 +711,7 @@ fn ground_polled<S: Source + ?Sized>(
     schema: &Schema,
     rule: &Rule,
     poll: &mut Poller<'_>,
+    scratch: &mut super::representatives::GuardWorkspace,
     emit: &mut dyn FnMut(Grounded),
 ) {
     let (schema_atoms, instance_atoms) = split_schema(schema, rule);
@@ -578,13 +722,16 @@ fn ground_polled<S: Source + ?Sized>(
         });
         return;
     }
+    if scratch.prepare_rule(rule, poll).is_err() {
+        return;
+    }
     let first = *schema_atoms
         .iter()
         .min_by_key(|&&i| source.estimate(constants(&rule.body[i]), Seg::All))
         .expect("not empty");
     let order = plan(source, rule, &schema_atoms, first, |_| Seg::All);
     let mut bindings = vec![None; rule.variables()];
-    walk(
+    walk_core(
         source,
         &rule.body,
         &rule.guards,
@@ -592,10 +739,16 @@ fn ground_polled<S: Source + ?Sized>(
         0,
         &mut bindings,
         poll,
-        &mut |substitution| {
-            if let Some(grounded) = instance(rule, &instance_atoms, substitution) {
-                emit(grounded);
-            }
+        &mut PreparedCompletion::<_, false> {
+            scratch,
+            emit: |substitution: &[Option<u64>],
+                   active: &mut Poller<'_>,
+                   _: &mut super::representatives::GuardWorkspace| {
+                if let Some(grounded) = instance(rule, &instance_atoms, substitution, active) {
+                    emit(grounded);
+                }
+                false
+            },
         },
     );
 }
@@ -609,7 +762,14 @@ pub fn ground_delta<S: Source + ?Sized>(
     rule: &Rule,
     emit: &mut dyn FnMut(Grounded),
 ) {
-    ground_delta_polled(source, schema, rule, &mut Poller::never(), emit);
+    ground_delta_polled(
+        source,
+        schema,
+        rule,
+        &mut Poller::never(),
+        &mut super::representatives::GuardWorkspace::default(),
+        emit,
+    );
 }
 
 fn ground_delta_polled<S: Source + ?Sized>(
@@ -617,13 +777,22 @@ fn ground_delta_polled<S: Source + ?Sized>(
     schema: &Schema,
     rule: &Rule,
     poll: &mut Poller<'_>,
+    scratch: &mut super::representatives::GuardWorkspace,
     emit: &mut dyn FnMut(Grounded),
 ) {
     let (schema_atoms, instance_atoms) = split_schema(schema, rule);
-    for (k, &first) in schema_atoms.iter().enumerate() {
-        if source.estimate(constants(&rule.body[first]), Seg::Delta) == 0 {
-            continue;
-        }
+    let mut variants = schema_atoms
+        .iter()
+        .enumerate()
+        .filter(|(_, first)| source.estimate(constants(&rule.body[**first]), Seg::Delta) != 0)
+        .peekable();
+    if variants.peek().is_none() {
+        return;
+    }
+    if scratch.prepare_rule(rule, poll).is_err() {
+        return;
+    }
+    for (k, &first) in variants {
         let seg_of = |i: usize| {
             let position = schema_atoms
                 .iter()
@@ -637,7 +806,7 @@ fn ground_delta_polled<S: Source + ?Sized>(
         };
         let order = plan(source, rule, &schema_atoms, first, seg_of);
         let mut bindings = vec![None; rule.variables()];
-        walk(
+        walk_core(
             source,
             &rule.body,
             &rule.guards,
@@ -645,16 +814,71 @@ fn ground_delta_polled<S: Source + ?Sized>(
             0,
             &mut bindings,
             poll,
-            &mut |substitution| {
-                if let Some(grounded) = instance(rule, &instance_atoms, substitution) {
-                    emit(grounded);
-                }
+            &mut PreparedCompletion::<_, false> {
+                scratch,
+                emit: |substitution: &[Option<u64>],
+                       active: &mut Poller<'_>,
+                       _: &mut super::representatives::GuardWorkspace| {
+                    if let Some(grounded) = instance(rule, &instance_atoms, substitution, active) {
+                        emit(grounded);
+                    }
+                    false
+                },
             },
         );
         if poll.stopped() {
             return;
         }
     }
+}
+
+/// Side consumers already own their body walk. This monomorphised helper adds no
+/// callback indirection/allocation; the primary morsel owner keeps its Facts closure.
+pub(crate) fn for_each_head(head: &Head, bindings: &[Option<u64>], mut emit: impl FnMut(&Atom)) {
+    match head {
+        Head::Facts(atoms) => {
+            for atom in atoms {
+                emit(atom);
+            }
+        }
+        Head::Grouped(groups) => {
+            for group in groups {
+                if guards_hold(&group.guards, bindings) {
+                    for atom in &group.heads {
+                        emit(atom);
+                    }
+                }
+            }
+        }
+        Head::Inconsistent => {}
+    }
+}
+
+pub(crate) fn for_each_head_prepared(
+    head: &Head,
+    bindings: &[Option<u64>],
+    poll: &mut Poller<'_>,
+    scratch: &mut super::representatives::GuardWorkspace,
+    mut emit: impl FnMut(&Atom),
+) -> Result<(), super::delta::Interrupted> {
+    match head {
+        Head::Facts(atoms) => {
+            for atom in atoms {
+                emit(atom);
+            }
+        }
+        Head::Grouped(groups) => {
+            for group in groups {
+                if guards_hold_prepared_polled(&group.guards, bindings, poll, scratch)? {
+                    for atom in &group.heads {
+                        emit(atom);
+                    }
+                }
+            }
+        }
+        Head::Inconsistent => {}
+    }
+    Ok(())
 }
 
 /// The fact a head atom derives under `bindings`.
@@ -779,6 +1003,38 @@ impl<'r> Job<'r> {
         poll: &mut Poller<'_>,
         emit: &mut dyn FnMut(&[Option<u64>]),
     ) {
+        self.run_core(source, range, poll, &mut PlainCompletion(emit));
+    }
+
+    pub(crate) fn run_prepared<S: Source + ?Sized, F>(
+        &self,
+        source: &S,
+        range: std::ops::Range<usize>,
+        poll: &mut Poller<'_>,
+        scratch: &mut super::representatives::GuardWorkspace,
+        emit: F,
+    ) where
+        F: FnMut(
+            &[Option<u64>],
+            &mut Poller<'_>,
+            &mut super::representatives::GuardWorkspace,
+        ) -> bool,
+    {
+        self.run_core(
+            source,
+            range,
+            poll,
+            &mut PreparedCompletion::<_, false> { scratch, emit },
+        );
+    }
+
+    fn run_core<S: Source + ?Sized, C: Completion>(
+        &self,
+        source: &S,
+        range: std::ops::Range<usize>,
+        poll: &mut Poller<'_>,
+        completion: &mut C,
+    ) {
         let mut bindings = vec![None; self.rule.variables()];
         let driver = &self.rule.body[self.order[0].0];
         let mut visit = |fact: Triple| {
@@ -786,7 +1042,7 @@ impl<'r> Job<'r> {
                 return;
             }
             if let Some(newly) = bind(driver, fact, &mut bindings) {
-                walk(
+                walk_core(
                     source,
                     &self.rule.body,
                     &self.rule.guards,
@@ -794,7 +1050,7 @@ impl<'r> Job<'r> {
                     1,
                     &mut bindings,
                     poll,
-                    emit,
+                    completion,
                 );
                 unbind(driver, newly, &mut bindings);
             }
@@ -847,6 +1103,20 @@ impl<'a> Poller<'a> {
     #[inline]
     pub(crate) fn work(&mut self) -> Result<(), super::delta::Interrupted> {
         if self.tick() {
+            Err(super::delta::Interrupted)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Before/after a cold opaque allocation, with this operation's latch and ticker.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn check(&mut self) -> Result<(), super::delta::Interrupted> {
+        if !self.stopped && self.ticker.check().is_err() {
+            self.stopped = true;
+        }
+        if self.stopped {
             Err(super::delta::Interrupted)
         } else {
             Ok(())
@@ -1036,29 +1306,98 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
         .par_iter()
         .map(|(j, range)| {
             let job = &jobs[*j];
-            let Head::Facts(heads) = &job.rule.head else {
-                return finish(*j, Vec::new());
-            };
             let Some(mut poll) = Poller::new(stop) else {
                 return finish(*j, Vec::new());
             };
             let mut out = Vec::new();
             let mut enumerated = 0u64;
-            job.run(source, range.clone(), &mut poll, &mut |bindings| {
-                enumerated += 1;
-                for head in heads {
-                    let fact = instantiate_head(head, bindings);
-                    let circular = acyclic
-                        && job
-                            .rule
-                            .body
-                            .iter()
-                            .any(|atom| instantiate_head(atom, bindings) == fact);
-                    if !circular {
-                        out.push(rewrite.map_or(fact, |rewrite| rewrite(fact)));
-                    }
+            match &job.rule.head {
+                Head::Facts(heads) if !job.rule.has_class_guards() => {
+                    job.run(source, range.clone(), &mut poll, &mut |bindings| {
+                        enumerated += 1;
+                        for head in heads {
+                            let fact = instantiate_head(head, bindings);
+                            let circular = acyclic
+                                && job
+                                    .rule
+                                    .body
+                                    .iter()
+                                    .any(|atom| instantiate_head(atom, bindings) == fact);
+                            if !circular {
+                                out.push(rewrite.map_or(fact, |rewrite| rewrite(fact)));
+                            }
+                        }
+                    });
                 }
-            });
+                Head::Facts(heads) => {
+                    let mut scratch = super::representatives::GuardWorkspace::default();
+                    if scratch.prepare_rule(job.rule, &mut poll).is_err() {
+                        return finish(*j, Vec::new());
+                    }
+                    job.run_prepared(
+                        source,
+                        range.clone(),
+                        &mut poll,
+                        &mut scratch,
+                        |bindings, _, _| {
+                            enumerated += 1;
+                            for head in heads {
+                                let fact = instantiate_head(head, bindings);
+                                let circular = acyclic
+                                    && job
+                                        .rule
+                                        .body
+                                        .iter()
+                                        .any(|atom| instantiate_head(atom, bindings) == fact);
+                                if !circular {
+                                    out.push(rewrite.map_or(fact, |rewrite| rewrite(fact)));
+                                }
+                            }
+                            false
+                        },
+                    );
+                }
+                Head::Grouped(groups) => {
+                    let mut scratch = super::representatives::GuardWorkspace::default();
+                    if scratch.prepare_rule(job.rule, &mut poll).is_err() {
+                        return finish(*j, Vec::new());
+                    }
+                    job.run_prepared(
+                        source,
+                        range.clone(),
+                        &mut poll,
+                        &mut scratch,
+                        |bindings, poll, scratch| {
+                            enumerated += 1;
+                            for group in groups {
+                                match guards_hold_prepared_polled(
+                                    &group.guards,
+                                    bindings,
+                                    poll,
+                                    scratch,
+                                ) {
+                                    Ok(true) => {}
+                                    Ok(false) => continue,
+                                    Err(_) => return false,
+                                }
+                                for head in &group.heads {
+                                    let fact = instantiate_head(head, bindings);
+                                    let circular =
+                                        acyclic
+                                            && job.rule.body.iter().any(|atom| {
+                                                instantiate_head(atom, bindings) == fact
+                                            });
+                                    if !circular {
+                                        out.push(rewrite.map_or(fact, |rewrite| rewrite(fact)));
+                                    }
+                                }
+                            }
+                            false
+                        },
+                    );
+                }
+                Head::Inconsistent => return finish(*j, Vec::new()),
+            }
             // Stopped part-way: the caller discards the round (it asks the stop again).
             if poll.stopped() {
                 return finish(*j, Vec::new());
@@ -1108,44 +1447,113 @@ pub fn derivations<S: Source + ?Sized>(
     poll: &mut Poller<'_>,
     emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
 ) {
+    let mut scratch = super::representatives::GuardWorkspace::default();
+    if scratch.prepare_rule(rule, poll).is_err() {
+        return;
+    }
+    let mut bindings = vec![None; rule.variables()];
+    if let Head::Grouped(groups) = &rule.head {
+        for group in groups {
+            if derivations_for_heads(
+                source,
+                rule,
+                &group.heads,
+                &group.guards,
+                fact,
+                seg,
+                poll,
+                &mut scratch,
+                &mut bindings,
+                emit,
+            ) {
+                return;
+            }
+        }
+        return;
+    }
     let Head::Facts(heads) = &rule.head else {
         return;
     };
-    let mut bindings = vec![None; rule.variables()];
+    derivations_for_heads(
+        source,
+        rule,
+        heads,
+        &[],
+        fact,
+        seg,
+        poll,
+        &mut scratch,
+        &mut bindings,
+        emit,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn derivations_for_heads<S: Source + ?Sized>(
+    source: &S,
+    rule: &Rule,
+    heads: &[Atom],
+    local_guards: &[Guard],
+    fact: Triple,
+    seg: Seg,
+    poll: &mut Poller<'_>,
+    scratch: &mut super::representatives::GuardWorkspace,
+    bindings: &mut [Option<u64>],
+    emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
+) -> bool {
     for head in heads {
-        let Some(newly) = bind(head, fact, &mut bindings) else {
+        let Some(newly) = bind(head, fact, bindings) else {
             continue;
         };
         let stop = if rule.body.is_empty() {
-            guards_hold(&rule.guards, &bindings) && emit(&bindings)
+            matches!(
+                guards_hold_prepared_polled(&rule.guards, bindings, poll, scratch),
+                Ok(true)
+            ) && matches!(
+                guards_hold_prepared_polled(local_guards, bindings, poll, scratch),
+                Ok(true)
+            ) && emit(bindings)
         } else {
             let bound: Vec<bool> = bindings.iter().map(Option::is_some).collect();
             let atoms: Vec<usize> = (0..rule.body.len()).collect();
             // Start from the atom with the most bound positions, then the fewest matches.
             let first = (0..rule.body.len())
                 .max_by_key(|&i| {
-                    let bound = pattern(&rule.body[i], &bindings);
+                    let bound = pattern(&rule.body[i], bindings);
                     let known = bound.iter().filter(|p| p.is_some()).count();
                     (known, std::cmp::Reverse(source.estimate(bound, seg)))
                 })
                 .expect("a body");
             let order = plan_bound(source, rule, &atoms, first, &bound, |_| seg);
-            walk_until(
+            walk_core(
                 source,
                 &rule.body,
                 &rule.guards,
                 &order,
                 0,
-                &mut bindings,
+                bindings,
                 poll,
-                emit,
+                // Borrow both conjunctions. ClassGuards already owns the joint term plan.
+                &mut PreparedCompletion::<_, true> {
+                    scratch,
+                    emit:
+                        |b: &[Option<u64>],
+                         active: &mut Poller<'_>,
+                         work: &mut super::representatives::GuardWorkspace| {
+                            matches!(
+                                guards_hold_prepared_polled(local_guards, b, active, work),
+                                Ok(true)
+                            ) && emit(b)
+                        },
+                },
             )
         };
-        unbind(head, newly, &mut bindings);
+        unbind(head, newly, bindings);
         if stop || poll.stopped() {
-            return;
+            return true;
         }
     }
+    false
 }
 
 /// The predicate `p` of a transitivity rule `(?x p ?y), (?y p ?z) -> (?x p ?z)`: `prp-trp`
@@ -1180,11 +1588,10 @@ pub fn transitive_predicate(rule: &Rule) -> Option<u64> {
 /// `(?x p ?y) → (?x p ?y)` under `prp-spo1`). Dropping it changes no closure and no
 /// well-founded proof, and saves re-deriving every type and property fact once more.
 fn without_tautologies(mut rule: Rule) -> Option<Rule> {
-    if let Head::Facts(heads) = &mut rule.head {
-        heads.retain(|head| !rule.body.contains(head));
-        if heads.is_empty() {
-            return None;
-        }
+    rule.head.retain_atoms(|head| !rule.body.contains(head));
+    rule.factor_head_guards();
+    if rule.head != Head::Inconsistent && rule.head.atoms().next().is_none() {
+        return None;
     }
     Some(rule)
 }
@@ -1394,8 +1801,8 @@ impl GroundProgram {
             self.transitive_with(p, premises);
             None
         } else if rule.body.is_empty() {
-            if let Head::Facts(heads) = &rule.head {
-                for head in heads {
+            if guards_hold(&rule.guards, &[]) {
+                for_each_head(&rule.head, &[], |head| {
                     let fact = instantiate_head(head, &[]);
                     if self.bodiless.insert(fact) {
                         self.facts.push(fact);
@@ -1403,7 +1810,7 @@ impl GroundProgram {
                     } else if self.bodiless_premises.get(&fact) != Some(&premises) {
                         self.other(Grounding::Bodiless(fact), premises.clone());
                     }
-                }
+                });
             }
             None
         } else {
@@ -1417,8 +1824,16 @@ impl GroundProgram {
             }
             self.known.insert(key, self.rules.len());
             self.dispatch.push(self.rules.len(), &rule);
-            if let Head::Facts(heads) = &rule.head {
-                self.heads.push_atoms(self.rules.len(), heads);
+            match &rule.head {
+                Head::Facts(heads) => self.heads.push_atoms(self.rules.len(), heads),
+                // Head positions are not body positions; backward dispatch consumes only
+                // the rule id. Index each group without imposing a new u8 total-head cap.
+                Head::Grouped(groups) => {
+                    for g in groups {
+                        self.heads.push_atoms(self.rules.len(), &g.heads);
+                    }
+                }
+                Head::Inconsistent => {}
             }
             self.rules.push(rule);
             self.premises.push(premises);
@@ -1584,6 +1999,7 @@ impl GroundProgram {
             return (facts, checks);
         }
         let mut grounded = Vec::new();
+        let mut scratch = super::representatives::GuardWorkspace::default();
         let has_schema_atoms = rule.body.iter().any(|a| schema.is_schema_atom(a));
         // Hidden unnamed classes rewrite heads (W7): the family's shape no longer holds.
         let family = closed_family(schema, rule).filter(|_| schema.hidden().is_empty());
@@ -1597,9 +2013,13 @@ impl GroundProgram {
             self.family_relations.entry(p).or_insert(family);
         }
         if delta && has_schema_atoms {
-            ground_delta_polled(source, schema, rule, poll, &mut |g| grounded.push(g));
+            ground_delta_polled(source, schema, rule, poll, &mut scratch, &mut |g| {
+                grounded.push(g)
+            });
         } else {
-            ground_polled(source, schema, rule, poll, &mut |g| grounded.push(g));
+            ground_polled(source, schema, rule, poll, &mut scratch, &mut |g| {
+                grounded.push(g)
+            });
         }
         if poll.stopped() {
             return (facts, checks);
@@ -1615,8 +2035,32 @@ impl GroundProgram {
                     .map(|a| instantiate_head(a, &g.substitution))
                     .chain(extra.iter().copied())
                     .collect();
-                if let Some(rule) = schema.rewrite_heads(g.rule) {
-                    facts.extend(self.add_with(rule, premises, family));
+                if let Some(mut instance) = schema.rewrite_heads(g.rule) {
+                    if instance.body.is_empty() {
+                        if scratch.prepare_rule(&instance, poll).is_err() {
+                            return (facts, checks);
+                        }
+                        if !matches!(
+                            guards_hold_prepared_polled(&instance.guards, &[], poll, &mut scratch),
+                            Ok(true)
+                        ) {
+                            if poll.stopped() {
+                                return (facts, checks);
+                            }
+                            continue;
+                        }
+                        let mut admitted = Vec::new();
+                        if for_each_head_prepared(&instance.head, &[], poll, &mut scratch, |head| {
+                            admitted.push(*head)
+                        })
+                        .is_err()
+                        {
+                            return (facts, checks);
+                        }
+                        instance.head = Head::Facts(admitted);
+                        instance.guards.clear();
+                    }
+                    facts.extend(self.add_with(instance, premises, family));
                 }
             }
         }
@@ -1658,14 +2102,16 @@ impl GroundProgram {
         let mut out = Vec::new();
         for (r, _) in refs {
             let rule = &self.rules[r];
-            let (1, Head::Facts(heads)) = (rule.body.len(), &rule.head) else {
+            if rule.body.len() != 1 {
                 continue;
-            };
+            }
             let mut bindings = vec![None; rule.variables()];
             if bind(&rule.body[0], fact, &mut bindings).is_some()
                 && guards_hold(&rule.guards, &bindings)
             {
-                out.extend(heads.iter().map(|h| instantiate_head(h, &bindings)));
+                for_each_head(&rule.head, &bindings, |h| {
+                    out.push(instantiate_head(h, &bindings))
+                });
             }
         }
         out
@@ -2153,5 +2599,54 @@ mod tests {
             },
         );
         assert_eq!(all, 10_000);
+    }
+
+    /// One original driver/body walk; a later local interruption discards its earlier
+    /// partial output. Group count must not multiply driver enumeration.
+    #[test]
+    fn grouped_heads_share_driver_work_and_discard_partial_stop() {
+        use super::super::ir::{Guard, HeadGroup};
+        let source = Counting {
+            facts: vec![[1, 12, 2], [3, 12, 4]],
+            scans: AtomicUsize::new(0),
+            matches: AtomicUsize::new(0),
+        };
+        let head = |p| Atom([Term::Var(0), Term::Const(p), Term::Var(1)]);
+        let mut rule = Rule {
+            name: "grouped".into(),
+            body: vec![Atom([Term::Var(0), Term::Const(12), Term::Var(1)])],
+            guards: vec![],
+            head: Head::Grouped(
+                vec![
+                    HeadGroup {
+                        guards: vec![],
+                        heads: vec![head(13)],
+                    },
+                    HeadGroup {
+                        guards: vec![Guard::NotEqual(Term::Var(0), Term::Const(99))],
+                        heads: vec![head(14)],
+                    },
+                ]
+                .into_boxed_slice(),
+            ),
+        };
+        let job = Job::full(&source, &rule).unwrap();
+        assert_eq!(job.drivers(), 2);
+        let probes = Probes::for_jobs(1);
+        let output = run_jobs_with(&source, &[job], &|_| true, false, NEVER, Some(&probes));
+        assert_eq!(output.len(), 4);
+        assert_eq!(probes.bindings[0].load(Ordering::Relaxed), 2);
+        let Head::Grouped(groups) = &mut rule.head else {
+            unreachable!()
+        };
+        groups[1].guards = vec![
+            Guard::NotEqual(Term::Const(1), Term::Const(2));
+            2 * nrese_exec::POLL_UNITS as usize
+        ];
+        let calls = AtomicUsize::new(0);
+        let stop = || calls.fetch_add(1, Ordering::Relaxed) >= 1;
+        let job = Job::full(&source, &rule).unwrap();
+        assert!(run_jobs(&source, &[job], &|_| true, &stop).is_empty());
+        assert!(calls.load(Ordering::Relaxed) >= 2);
     }
 }
