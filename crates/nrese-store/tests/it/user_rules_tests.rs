@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::support::in_memory_store_config;
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, RuleProgram, UserRules};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode, RuleProgram, UserRules};
 use nrese_store::{
     MutationCommand, MutationError, MutationPipeline, MutationTicket, SparqlUpdateRequest,
     StoreService,
@@ -34,7 +34,7 @@ fn pipeline(mode: ReasoningMode, text: &str) -> MutationPipeline {
     let config = ReasonerConfig::for_mode(mode)
         .with_rules(Some(rules(text)))
         .expect("a mode for the rules");
-    MutationPipeline::new(Arc::new(store), Arc::new(ReasonerService::new(config)))
+    MutationPipeline::new(Arc::new(store), config)
 }
 
 fn update(text: String) -> MutationCommand {
@@ -200,7 +200,7 @@ fn graphdb_rulesets_are_read_as_user_rules() {
     let config = ReasonerConfig::for_mode(ReasoningMode::Custom)
         .with_rules(Some(rules))
         .expect("custom rules");
-    let pipeline = MutationPipeline::new(Arc::new(store), Arc::new(ReasonerService::new(config)));
+    let pipeline = MutationPipeline::new(Arc::new(store), config);
     pipeline
         .apply(
             insert(&format!(

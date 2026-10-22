@@ -370,14 +370,46 @@ async fn autocomplete_finds_labels_and_local_names() {
     };
     // Every word begins a word; a note is not a label.
     assert_eq!(suggest("alb ein").await, ["q1"]);
+    for typed in ["alb-ein", "alb&ein", "\"alb ein", "alb~ ein", "-alb ein"] {
+        assert_eq!(suggest(typed).await, ["q1"], "{typed}");
+    }
+    assert!(suggest("!~*\"").await.is_empty());
     let mut albert = suggest("alb").await;
     albert.sort();
     assert_eq!(albert, ["q1", "q2"]);
     // Local names, split at camel case.
     assert_eq!(suggest("part").await, ["hasPart"]);
     assert_eq!(suggest("haspa").await, ["hasPart"]);
+    for typed in ["has-part", "\"has part", "has~ part"] {
+        assert_eq!(suggest(typed).await, ["hasPart"], "{typed}");
+    }
     let (status, _) = send(&app, Method::GET, "/dataset/autocomplete", None, None, "").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn invalid_text_search_is_bad_request_for_query_and_update() {
+    let app = test_app().unwrap();
+    for predicate in [
+        "http://www.bigdata.com/rdf/search#search",
+        "http://jena.apache.org/text#query",
+        "http://www.ontotext.com/owlim/lucene#labels",
+    ] {
+        let pattern = format!("?s <{predicate}> \"bridge~3\"");
+        for (path, content_type, operation) in [
+            ("/dataset/query", "application/sparql-query", "SELECT *"),
+            (
+                "/dataset/update",
+                "application/sparql-update",
+                "INSERT { <urn:s> <urn:p> ?s }",
+            ),
+        ] {
+            let request = format!("{operation} WHERE {{ {pattern} }}");
+            let (status, body) =
+                send(&app, Method::POST, path, Some(content_type), None, &request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{request}: {body}");
+        }
+    }
 }
 
 /// An on-disk store keeps its namespaces across a restart.
@@ -803,6 +835,77 @@ async fn transaction_locations_are_absolute() {
         let location = response.headers()[header::LOCATION].to_str().unwrap();
         assert!(location.starts_with(expected), "{location}");
     }
+}
+
+/// A transaction's begin may name its isolation level, in the form body (RDF4J's client) or
+/// the URL (graphdb.js), under the current name or the older one (whose value may carry the
+/// Sesame namespace). The levels this server's transactions meet begin; SNAPSHOT and
+/// SERIALIZABLE, which they don't, and unknown levels are refused at the begin with the
+/// reason as plain text, never given weaker in silence.
+#[tokio::test]
+async fn transaction_isolation_levels_are_met_or_refused_at_begin() {
+    const SETTING: &str =
+        "transaction-setting__org.eclipse.rdf4j.common.transaction.IsolationLevel";
+    const SESAME: &str = "http://www.openrdf.org/schema/sesame#";
+    let app = test_app().unwrap();
+    let names = [
+        (SETTING, ""),
+        ("isolation-level", ""),
+        ("isolation-level", SESAME),
+    ];
+    let mut wrong = Vec::new();
+    for (level, met) in [
+        ("NONE", true),
+        ("READ_UNCOMMITTED", true),
+        ("READ_COMMITTED", true),
+        ("SNAPSHOT_READ", true),
+        ("SNAPSHOT", false),
+        ("SERIALIZABLE", false),
+        ("snapshot_read", false), // RDF4J's names only, as its server reads them
+    ] {
+        for (name, prefix) in names {
+            let pair = encode(&[(name, &format!("{prefix}{level}"))]);
+            for in_body in [true, false] {
+                let request = Request::builder().method(Method::POST);
+                let request = if in_body {
+                    request
+                        .uri(format!("{REPO}/transactions"))
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from(pair.clone()))
+                } else {
+                    request
+                        .uri(format!("{REPO}/transactions?{pair}"))
+                        .body(Body::empty())
+                };
+                let response = app.clone().oneshot(request.unwrap()).await.unwrap();
+                let status = response.status();
+                let content_type = response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .map(|v| v.to_str().unwrap().to_owned());
+                let text = body_text(response).await.unwrap();
+                let as_expected = if met {
+                    status == StatusCode::CREATED
+                } else {
+                    status == StatusCode::BAD_REQUEST
+                        && content_type.as_deref() == Some("text/plain")
+                        && text.contains(level)
+                };
+                if !as_expected {
+                    let place = if in_body { "body" } else { "URL" };
+                    wrong.push(format!(
+                        "{pair} in the {place}: {status} {content_type:?} {text}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} begins answered wrongly:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
 }
 
 /// A transaction's DELETE takes statements as patterns, as RDF4J's client sends them

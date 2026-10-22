@@ -116,15 +116,37 @@ pub(crate) fn serialize_triples(
     Ok(writer.finish()?)
 }
 
-pub(crate) fn serialize_quads(
-    format: RdfFormat,
-    quads: impl IntoIterator<Item = Quad>,
-) -> StoreResult<Vec<u8>> {
-    let mut writer = RdfSerializer::from_format(format).for_writer(Vec::new());
-    for quad in quads {
-        writer.serialize_quad(&quad)?;
+/// The quads of `patterns` in `view` under `model`, written to `out` in `format` as they
+/// are read, one decoded at a time: a whole store in the serialiser's constant memory. With
+/// `graphs` each quad keeps its graph (a format without graphs refuses a named one);
+/// otherwise each is written as a triple. `cancel` stops it before any quad. Returns how
+/// many, and `out`.
+pub(crate) fn write_quads<W: std::io::Write>(
+    view: &impl nrese_sparql::ReadView,
+    model: nrese_engine::ReadModel,
+    patterns: &[nrese_engine::QuadPattern],
+    (format, graphs): (RdfFormat, bool),
+    cancel: &nrese_sparql::CancellationToken,
+    out: W,
+) -> StoreResult<(u64, W)> {
+    let mut writer = RdfSerializer::from_format(format).for_writer(out);
+    let mut written = 0;
+    for pattern in patterns {
+        for quad in crate::view::decoded_quads(view, model, pattern) {
+            cancel.check()?;
+            let quad = quad?;
+            match graphs {
+                true => writer.serialize_quad(&quad)?,
+                false => writer.serialize_triple(&Triple::new(
+                    quad.subject,
+                    quad.predicate,
+                    quad.object,
+                ))?,
+            }
+            written += 1;
+        }
     }
-    Ok(writer.finish()?)
+    Ok((written, writer.finish()?))
 }
 
 pub(crate) fn file_base_iri(path: &Path) -> StoreResult<String> {

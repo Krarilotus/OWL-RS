@@ -14,6 +14,13 @@
 //! policy (L3 `nrese-store`), transport (L4). Fix storage-layout, visibility and durability
 //! bugs here and nowhere else.
 
+/// The unit tests' allocator: the system's, counting what measured operations hold
+/// against their budgets ([`nrese_exec::measure`]), so that an allocation not charged to its
+/// budget fails a test.
+#[cfg(test)]
+#[global_allocator]
+static MEASURED: nrese_exec::measure::Measured<std::alloc::System> =
+    nrese_exec::measure::Measured(std::alloc::System);
 pub mod cpu;
 mod durability;
 pub mod engine;
@@ -24,20 +31,24 @@ pub mod memory;
 pub mod quad;
 pub mod term;
 
-pub use durability::{DurabilityConfig, SyncPolicy};
+pub use durability::checkpoint::image_revision;
+pub use durability::{
+    DurabilityConfig, SyncPolicy, copy_log_segment, place_file, remove_log_segment,
+};
 pub use engine::{
     BulkLoad, BulkMode, CommitSummary, Content, Engine, EngineConfig, EngineStats, EqualityClasses,
     ImageInfo, InferredMask, InferredSubset, LogBatch, ProbeCursor, ReadModel, Rematerialisation,
-    Seek, Snapshot, SnapshotIdentity, Transaction,
+    Seek, Snapshot, SnapshotIdentity, TextCorpusStats, TextScope, Transaction,
 };
 pub use error::{EngineError, EngineResult};
 pub use index::cursor::SeekStats;
-pub use index::{CompactionPolicy, IndexEncoding, set_index_encoding};
+pub use index::{CompactionPolicy, IndexEncoding};
 /// Vector literals, metrics and indexes ([`Snapshot::vector_search`]).
 pub use nrese_vector as vector;
 pub use quad::{EncodedQuad, EncodedTriple, GraphSelector, QuadPattern};
-pub use term::vocabulary::{VocabularyEncoding, set_vocabulary_encoding};
+pub use term::vocabulary::VocabularyEncoding;
 pub use term::{
     Dictionary, DictionaryStats, Placement, StringScan, StringTest, TermId, TermKind, TermView,
-    TextMatch, TextQuery, VectorQuery, VectorSearchReport, VectorStrategy,
+    TextMatch, TextMatches, TextQuery, VectorHits, VectorQuery, VectorSearchReport, VectorStop,
+    VectorStrategy,
 };

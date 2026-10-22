@@ -62,6 +62,16 @@ async fn change(
     reason: String,
 ) -> Result<Response, ApiError> {
     let by = requester(state, authenticated).await?;
+    apply_by(state, by, change, reason).await
+}
+
+/// Applies `change` by `by`; the change's record.
+async fn apply_by(
+    state: &AppState,
+    by: Principal,
+    change: Change,
+    reason: String,
+) -> Result<Response, ApiError> {
     let access = state.clone();
     let record = tokio::task::spawn_blocking(move || access.access().apply(&by, change, &reason))
         .await
@@ -376,24 +386,22 @@ pub async fn user_put(
     bytes: Bytes,
 ) -> Result<Response, ApiError> {
     let request: UserBody = body(&bytes)?;
-    let password_hash = match request.password {
-        None => None,
-        Some(password) => {
-            let access = state.clone();
-            Some(
-                tokio::task::spawn_blocking(move || access.access().password_hash(&password))
-                    .await
-                    .map_err(|error| ApiError::internal(error.to_string()))??,
-            )
-        }
-    };
-    let change_user = Change::PutUser {
-        name,
-        admin: request.admin,
-        roles: request.roles,
-        password_hash,
-    };
-    change(&state, &authenticated, change_user, request.reason).await
+    // Authorised before the password is hashed (Argon2 holds ~19 MiB for tens of ms).
+    let by = requester(&state, &authenticated).await?;
+    let access = state.clone();
+    let who = by.clone();
+    let change_user = tokio::task::spawn_blocking(move || {
+        access.access().put_user(
+            &who,
+            name,
+            request.admin,
+            request.roles,
+            request.password.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
+    apply_by(&state, by, change_user, request.reason).await
 }
 
 #[utoipa::path(delete, path = "/api/v1/access/users/{name}", tag = "access", params(("name" = String, Path), ("reason" = String, Query, description = "Why (required)")),
@@ -626,6 +634,7 @@ pub async fn login(
         Err(nrese_store::access::AccessError::Throttled(message)) => {
             Err(ApiError::too_many_requests(message))
         }
+        Err(nrese_store::access::AccessError::Busy(message)) => Err(ApiError::busy(message)),
         Err(_) => Err(ApiError::unauthorized("wrong user name or password")),
     }
 }

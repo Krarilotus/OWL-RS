@@ -259,8 +259,10 @@ pub fn update_with<B: Base + ?Sized>(
     stop: Stop<'_>,
     policy: policy::Policy,
 ) -> Result<Update, Interrupted> {
-    // The process's memory limit stops it too, whatever the caller polls.
-    let stop: Stop<'_> = &|| stop() || super::eval::over_memory_limit();
+    // The process's memory limit stops it too, whatever the caller polls; once either has
+    // fired, the update stays stopped (an interrupted round is never taken as complete).
+    let latch = super::eval::Latched::new(|| stop() || super::eval::over_memory_limit());
+    let stop: Stop<'_> = &|| latch.stopped();
     let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
     let mut result = Update::default();
     if policy.rebuilds_at_once() {
@@ -566,7 +568,9 @@ pub fn update_with<B: Base + ?Sized>(
                 // Independent per candidate: in parallel.
                 candidates = candidates
                     .into_par_iter()
-                    .filter(|&f| stop() || !old_program.derivable_by(&left, f, &non_recursive))
+                    .filter(|&f| {
+                        stop() || !old_program.derivable_by(&left, f, &non_recursive, stop)
+                    })
                     .collect();
                 check_stop()?;
             }
@@ -584,6 +588,7 @@ pub fn update_with<B: Base + ?Sized>(
                 let fresh_prover = || Prover {
                     base,
                     program: old_program,
+                    stop,
                     proved: HashSet::new(),
                     failed: HashSet::new(),
                     active: HashSet::new(),
@@ -670,7 +675,7 @@ pub fn update_with<B: Base + ?Sized>(
             let by_rules: Vec<Triple> = open
                 .par_iter()
                 .copied()
-                .filter(|&f| !stop() && program.derivable_by(&remaining, f, &not_equality))
+                .filter(|&f| !stop() && program.derivable_by(&remaining, f, &not_equality, stop))
                 .collect();
             let by_rules: HashSet<Triple> = by_rules.into_iter().collect();
             check_stop()?;
@@ -738,7 +743,7 @@ pub fn update_with<B: Base + ?Sized>(
         .filter(|&fact| {
             !stop()
                 && !base.is_asserted(fact)
-                && settled.derivable_with(&remaining, fact, !recloses.contains(&fact[1]))
+                && settled.derivable_with(&remaining, fact, !recloses.contains(&fact[1]), stop)
         })
         .collect();
     rederived.extend(others);
@@ -897,6 +902,7 @@ pub fn update_with<B: Base + ?Sized>(
         settled_consistency..program.consistency.len(),
         &variants,
         &mut found,
+        stop,
     );
     check_stop()?;
     result.violations = sorted(found);
@@ -913,6 +919,82 @@ pub fn update_with<B: Base + ?Sized>(
     }
     .or(computed);
     Ok(result)
+}
+
+/// The consistency violations a change that only inserts introduces, given the facts it
+/// adds: `inserted` (asserted, new to the state) and `derived` (inferred, not visible
+/// before). [`update_with`]'s own last phase without its insert rounds, for a caller that
+/// derived the new facts in bulk (a first load, [`crate::engine::maintain`]): the same
+/// report, through the new facts only, with the ground program extended by the instances of
+/// new schema and list facts as phase 3 extends it.
+/// An interrupted consistency check is discarded, as in [`update_with`].
+pub fn introduced_violations<B: Base + ?Sized>(
+    base: &B,
+    inserted: &[Triple],
+    derived: &[Triple],
+    rules: Rules<'_>,
+    cache: Option<&GroundProgram>,
+    stop: Stop<'_>,
+) -> Result<Vec<Violation>, Interrupted> {
+    let latch = super::eval::Latched::new(|| stop() || super::eval::over_memory_limit());
+    let stop: Stop<'_> = &|| latch.stopped();
+    let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
+    let empty = Store::default();
+    let computed: Option<GroundProgram> = cache.is_none().then(|| {
+        rules.program(&Overlay {
+            base,
+            hidden: &inserted_set,
+            extra: &empty,
+        })
+    });
+    let old_program: &GroundProgram = cache.or(computed.as_ref()).expect("one of them");
+    let settled_consistency = old_program.consistency.len();
+    let mut new_facts: Vec<Triple> = inserted.iter().chain(derived).copied().collect();
+    new_facts.sort_unstable();
+    new_facts.dedup();
+    let mut fresh = Store::new(Vec::new());
+    fresh.advance(new_facts);
+    let hidden = HashSet::new();
+    let state = Overlay {
+        base,
+        hidden: &hidden,
+        extra: &fresh,
+    };
+    let mut program: Cow<'_, GroundProgram> = Cow::Borrowed(old_program);
+    let mut delta_facts = Vec::new();
+    fresh.scan([None, None, None], Seg::Delta, &mut |f| delta_facts.push(f));
+    if delta_facts.iter().any(|&f| rules.schema.is_schema_fact(f)) {
+        program
+            .to_mut()
+            .ground_delta(&state, rules.schema, &rules.schema_rules());
+    }
+    if delta_facts.iter().any(|&f| rules.is_list_fact(f))
+        && let Some(vocabulary) = rules.lists
+    {
+        let (list_rules, premises, diagnostics) =
+            super::lists::instantiate_with_premises(vocabulary, &AllFacts(&state));
+        let program = program.to_mut();
+        program.ground_with_premises(&state, rules.schema, &list_rules, &premises);
+        program.list_diagnostics = diagnostics;
+    }
+    let variants: Vec<(usize, usize)> = program
+        .consistency_variants(&fresh)
+        .into_iter()
+        .filter(|&(c, _)| c < settled_consistency)
+        .collect();
+    let mut found = HashSet::new();
+    check(
+        &state,
+        &program,
+        settled_consistency..program.consistency.len(),
+        &variants,
+        &mut found,
+        stop,
+    );
+    if stop() {
+        return Err(Interrupted);
+    }
+    Ok(sorted(found))
 }
 
 /// The facts of `base` that mention one of `terms`, in any position: each through its
@@ -1002,6 +1084,9 @@ impl<S: Source + ?Sized> Source for Outside<'_, S> {
 struct Prover<'a, B: Base + ?Sized> {
     base: &'a B,
     program: &'a GroundProgram,
+    /// The update's stop, polled while derivations are searched: one search that finds
+    /// nothing can try a product of a body's matches.
+    stop: Stop<'a>,
     proved: HashSet<Triple>,
     failed: HashSet<Triple>,
     active: HashSet<Triple>,
@@ -1045,10 +1130,20 @@ impl<B: Base + ?Sized> Prover<'_, B> {
         if self.active.contains(&fact) || self.budget == 0 || depth > PROOF_DEPTH {
             return (false, true);
         }
+        // Stopped, nothing is decided: unproved and cut, so the failure isn't memoised (the
+        // update is interrupted anyway: its stop stays stopped).
+        let Some(mut poll) = super::eval::Poller::new(self.stop) else {
+            return (false, true);
+        };
         self.budget -= 1;
+        let mut bodies = self
+            .program
+            .derivation_bodies(state, fact, PROOF_BRANCHES, &mut poll);
+        if poll.stopped() {
+            return (false, true);
+        }
         self.active.insert(fact);
         let mut cut = false;
-        let mut bodies = self.program.derivation_bodies(state, fact, PROOF_BRANCHES);
         if self.program.bodiless.contains(&fact) {
             bodies.insert(0, self.program.bodiless_premises(fact).to_vec());
         }

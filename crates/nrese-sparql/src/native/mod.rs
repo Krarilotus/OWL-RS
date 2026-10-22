@@ -36,6 +36,7 @@ pub fn geometry_literal(term: &nrese_rdf::Term) -> Option<(String, ::geo::Geomet
     geo::parse(term).map(|shape| (shape.crs, shape.geometry))
 }
 mod output;
+mod owned_terms;
 mod path_joins;
 mod paths;
 mod plan;
@@ -50,6 +51,8 @@ mod budget_tests;
 mod cache_tests;
 #[cfg(test)]
 mod graph_tests;
+#[cfg(test)]
+mod ownership_tests;
 pub(crate) mod ql;
 mod ranges;
 mod search;
@@ -83,8 +86,8 @@ use nrese_exec::join::{
     left_join, outer_join_with_undef,
 };
 use nrese_exec::{
-    Budget, BudgetExceeded, ChargedVec, IdTable, Reservation, Scratch, UNDEF, computed_id,
-    computed_index, group::group_rows,
+    Budget, BudgetExceeded, ChargedVec, IdTable, Reservation, Scratch, UNDEF, computed_index,
+    group::group_rows,
 };
 use nrese_rdf::{Term, Variable};
 use nrese_sparql_syntax::Query;
@@ -94,6 +97,7 @@ use nrese_sparql_syntax::algebra::{
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use nrese_xsd::Integer;
 use numeric::Numeric;
+use owned_terms::{Computed, Decoded};
 use rayon::prelude::*;
 
 /// The most numbers kept per aggregate argument between groupings ([`Context::numeric_pass`]).
@@ -108,11 +112,11 @@ use std::borrow::Cow;
 
 use crate::query::{PlanStep, QueryOptions};
 use aggregate::{
-    Agg, Aggregator, Number, aggregate_in_one_pass, counts_rows, finish_total, integer, integer_agg,
+    Agg, Aggregator, Number, aggregate_in_one_pass, counts_rows, finish_total, integer,
+    integer_agg, number_of,
 };
 pub use aggregate::{average, group_concat, sum};
 use expr::Evaluator;
-use value::Value;
 
 /// A right side at least this many times larger than the running result is joined by
 /// probing the index once per result row instead of scanning it.
@@ -132,18 +136,6 @@ const MANY_RANGES: usize = 1024;
 /// Result rows per parallel task of an index nested-loop join; smaller results probe on
 /// one thread.
 const PROBE_CHUNK: usize = 4096;
-
-/// Decoded terms kept per query for repeated ids (ORDER BY, aggregates, expressions).
-const DECODE_CACHE_ENTRIES: usize = 1 << 18;
-
-/// What a hash map of `len` entries with room for `capacity` allocates to take one more:
-/// the bound of its next table (it about doubles), or 0 while it has room.
-fn grown_table<T>(len: usize, capacity: usize) -> usize {
-    match len < capacity {
-        true => 0,
-        false => nrese_exec::map_bytes::<T>(capacity.saturating_mul(2).max(3)),
-    }
-}
 
 pub(crate) enum NativeError {
     /// Something the executor doesn't implement.
@@ -247,47 +239,52 @@ fn run(
     };
     let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
     ctx.check()?;
-    let outcome = match form {
-        Form::Ask => Outcome::Boolean(!solutions.table.is_empty()),
-        Form::Describe => Outcome::Graph(ctx.describe(&solutions)?),
-        Form::Construct(template) => Outcome::Graph(
-            construct(snapshot, ctx.computed.take(), solutions, &template, || {
+    // Graph collection is still the separately scheduled SPR-09 reserve-first work.
+    // Its existing late charge has an exact graph owner, never the query's total remainder.
+    let graph = |triples: Vec<nrese_rdf::Triple>| -> Result<_, QueryEvaluationError> {
+        let mut result = Holding::new(triples, Reservation::new(Arc::clone(&ctx.budget)));
+        let bytes = result.capacity() * size_of::<nrese_rdf::Triple>()
+            + result
+                .iter()
+                .map(nrese_rdf::Triple::heap_bytes)
+                .sum::<usize>();
+        result._held.charge(bytes)?;
+        let Holding { items, _held } = result;
+        Ok((Outcome::Graph(items), _held))
+    };
+    let (outcome, held) = match form {
+        Form::Ask => (
+            Outcome::Boolean(!solutions.table.is_empty()),
+            Reservation::new(Arc::clone(&ctx.budget)),
+        ),
+        Form::Describe => graph(ctx.describe(&solutions)?)?,
+        Form::Construct(template) => graph(
+            construct(snapshot, ctx.take_computed(), solutions, &template, || {
                 ctx.check()
             })
             .collect::<NativeResult<_>>()?,
-        ),
-        Form::Select => Outcome::Solutions(solutions, ctx.computed.take()),
+        )?,
+        Form::Select => {
+            let Holding { items, _held } = ctx.take_computed();
+            (Outcome::Solutions(solutions, items), _held)
+        }
     };
     ctx.drop_decoded();
-    // The results take over what the query charged the budget directly (its computed
-    // terms); the table they keep holds its own charge.
-    let own = match &outcome {
-        Outcome::Solutions(solutions, _) => solutions.table.charge(),
-        Outcome::Graph(triples) => {
-            // The triples a graph result keeps, made outside any table: charged now, with
-            // what the query charged directly.
-            let bytes = triples.capacity() * size_of::<nrese_rdf::Triple>()
-                + triples
-                    .iter()
-                    .map(nrese_rdf::Triple::heap_bytes)
-                    .sum::<usize>();
-            ctx.budget
-                .charge(bytes)
-                .map_err(QueryEvaluationError::MemoryLimit)?;
-            0
-        }
-        Outcome::Boolean(_) => 0,
-    };
-    Ok((
-        outcome,
-        Reservation::adopt(Arc::clone(&ctx.budget), ctx.budget.used() - own),
-    ))
+    Ok((outcome, held))
 }
 
 /// An iterator that holds a reservation until it drops.
 struct Holding<I> {
     items: I,
     _held: Reservation,
+}
+
+impl<I> std::ops::Deref for Holding<I> {
+    type Target = I;
+
+    fn deref(&self) -> &I {
+        &self.items
+    }
 }
 
 impl<I> Holding<I> {
@@ -327,7 +324,7 @@ pub(crate) fn explain(
         Form::Select | Form::Ask => solutions.table.len(),
         Form::Describe => ctx.describe(&solutions)?.len(),
         Form::Construct(template) => {
-            construct(snapshot, ctx.computed.take(), solutions, &template, || {
+            construct(snapshot, ctx.take_computed(), solutions, &template, || {
                 ctx.check()
             })
             .try_fold(0usize, |count, triple| triple.map(|_| count + 1))?
@@ -417,7 +414,7 @@ pub(crate) fn write_results(
             Err(error) => Err(QueryEvaluationError::from(error).into()),
         });
     }
-    let computed = ctx.computed.into_inner();
+    let computed = ctx.take_computed();
     let cancelled = || options.resources.check().is_err();
     let alive = || {
         if cancelled() {
@@ -484,7 +481,7 @@ pub(crate) fn delete_insert(
     let ctx = Context::new(snapshot, options, using, base);
     let pattern = optimise(pattern.clone(), &mut Vec::new(), &ctx);
     let solutions = ctx.eval(&pattern)?;
-    let computed = ctx.computed.into_inner();
+    let computed = ctx.take_computed();
     let table = &solutions.table;
     let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
     for row in 0..table.len() {
@@ -704,7 +701,7 @@ enum TemplateTerm {
 /// nodes are emitted once (the memory of emitted triples is bounded).
 fn construct<'a>(
     snapshot: &'a Snapshot,
-    computed: Vec<Term>,
+    computed: Holding<Vec<Term>>,
     solutions: Solutions,
     template: &[TriplePattern],
     check: impl Fn() -> NativeResult<()> + 'a,
@@ -957,42 +954,47 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
 /// that join them on `?graph` like on any variable.
 ///
 /// Anything else is evaluated graph by graph: a row without a scan (VALUES, an empty
-/// group, BIND alone), a property path (followed within one graph), a subquery or a nested
-/// GRAPH (their `?graph` is another variable), MINUS (the shared `?graph` would make rows
-/// with no other common variable remove each other) and a BIND to `?graph` itself.
-fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
-    fn only_scans(pattern: &GraphPattern, graph: &Variable) -> bool {
+/// group, BIND alone), a property path (followed within one graph), a GeoSPARQL relation
+/// computed from geometries (`spatial`: within one graph's geometries), a subquery or a
+/// nested GRAPH (their `?graph` is another variable), MINUS (the shared `?graph` would make
+/// rows with no other common variable remove each other) and a BIND to `?graph` itself.
+fn scans_everywhere(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> bool {
+    fn only_scans(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> bool {
         match pattern {
-            GraphPattern::Bgp { .. } => true,
+            GraphPattern::Bgp { patterns } => !spatial || !patterns.iter().any(spatial::is_spatial),
             GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
-                inputs.iter().all(|input| only_scans(input, graph))
+                inputs.iter().all(|input| only_scans(input, graph, spatial))
             }
             GraphPattern::LeftJoin {
                 left,
                 right,
                 expression,
             } => {
-                only_scans(left, graph)
-                    && only_scans(right, graph)
-                    && expression.as_ref().is_none_or(|e| filter(e, graph))
+                only_scans(left, graph, spatial)
+                    && only_scans(right, graph, spatial)
+                    && expression
+                        .as_ref()
+                        .is_none_or(|e| filter(e, graph, spatial))
             }
-            GraphPattern::Filter { inner, expr } => only_scans(inner, graph) && filter(expr, graph),
+            GraphPattern::Filter { inner, expr } => {
+                only_scans(inner, graph, spatial) && filter(expr, graph, spatial)
+            }
             GraphPattern::Extend { inner, bindings } => {
-                only_scans(inner, graph)
+                only_scans(inner, graph, spatial)
                     && bindings.iter().all(|(variable, expression)| {
-                        variable != graph && filter(expression, graph)
+                        variable != graph && filter(expression, graph, spatial)
                     })
             }
             _ => false,
         }
     }
     // `EXISTS` is a join on the shared variables, `?graph` among them.
-    fn filter(expression: &Expression, graph: &Variable) -> bool {
+    fn filter(expression: &Expression, graph: &Variable, spatial: bool) -> bool {
         match expression {
-            Expression::And(a, b) => filter(a, graph) && filter(b, graph),
-            Expression::Exists(pattern) => only_scans(pattern, graph),
+            Expression::And(a, b) => filter(a, graph, spatial) && filter(b, graph, spatial),
+            Expression::Exists(pattern) => only_scans(pattern, graph, spatial),
             Expression::Not(inner) if matches!(**inner, Expression::Exists(_)) => {
-                filter(inner, graph)
+                filter(inner, graph, spatial)
             }
             // An `EXISTS` anywhere else is not a join.
             other => !pushdown::per_solution(other) || !contains_any_exists(other),
@@ -1063,7 +1065,7 @@ fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
     if read_by_expressions(pattern, graph) && !bound_by_scans(pattern, graph) {
         return false;
     }
-    only_scans(pattern, graph) && rows_from_scans(pattern)
+    only_scans(pattern, graph, spatial) && rows_from_scans(pattern)
 }
 
 /// True if `expression` holds an `EXISTS` at any depth.
@@ -1213,6 +1215,7 @@ impl Solutions {
 }
 
 struct Context<'a> {
+    planner: crate::PlannerOptions,
     /// The snapshot read; owned when it reads equality classes canonically
     /// ([`QueryOptions::equality_canonical`], [`Context::late_expansion`]).
     snapshot: Cow<'a, Snapshot>,
@@ -1221,17 +1224,8 @@ struct Context<'a> {
     /// Alias IRIs that stand for blank nodes put into a pattern ([`substitute`]).
     aliases: RefCell<HashMap<String, u64>>,
     evaluator: Evaluator,
-    computed: RefCell<Vec<Term>>,
-    computed_ids: RefCell<HashMap<Term, u64>>,
-    /// The bound of `computed_ids`' table charged to the budget (with `computed`'s
-    /// capacity and both copies of each term: charged before they grow, the query's like
-    /// its tables).
-    computed_table: Cell<usize>,
-    decoded: RefCell<HashMap<u64, Option<Term>>>,
-    /// What `decoded` holds charged to the budget: its terms, and its table's bound
-    /// (`decoded_table`), released when the cache is let go ([`Context::drop_decoded`]).
-    decoded_terms: Cell<usize>,
-    decoded_table: Cell<usize>,
+    computed: RefCell<Computed>,
+    decoded: RefCell<Decoded>,
     /// Stored terms decoded for expressions, orders and aggregates (EXPLAIN's `decoded`;
     /// the output's aren't counted).
     decodes: AtomicU64,
@@ -1242,6 +1236,9 @@ struct Context<'a> {
     numbers: RefCell<HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>>,
     cancellation: Option<CancellationToken>,
     budget: Arc<Budget>,
+    /// The request's envelope: what a part of the evaluation keeps beyond it (the spatial
+    /// index) draws from it ([`spatial`]).
+    memory: nrese_exec::Envelope,
     /// The operators run so far, for EXPLAIN; `None` when not explaining.
     trace: Option<RefCell<Vec<PlanStep>>>,
     /// Nesting depth of the operator being evaluated (for the trace).
@@ -1263,7 +1260,7 @@ struct Context<'a> {
     index_joins: Option<bool>,
     /// With a dataset of several default graphs (`FROM <a> FROM <b>`), the graphs whose
     /// merge the default graph is; the scope is then [`GraphScope::Union`].
-    merge_set: Option<Vec<TermId>>,
+    merge_set: Option<crate::dataset::GraphSet>,
     /// The graphs `GRAPH` may name, if the dataset lists them (`FROM NAMED`).
     named: Option<Vec<TermId>>,
     /// Numbers the columns the executor adds for itself ([`exists`]).
@@ -1283,6 +1280,9 @@ struct Context<'a> {
     /// Canonical answers' view refused by this query's budget too: the query's error
     /// ([`canonical`]).
     canonical_refused: Option<nrese_exec::BudgetExceeded>,
+    /// The reader's state refused by this query's budget ([`Snapshot::reading_within`]): the
+    /// query's error at its first check.
+    reads_refused: Option<nrese_exec::BudgetExceeded>,
     /// Whether GeoSPARQL relations in triple patterns are computed from geometries too
     /// (the query-rewrite extension; not [`QueryOptions::geosparql_stated_only`]).
     spatial_rewrite: bool,
@@ -1306,6 +1306,17 @@ enum GraphScope {
     Variable(Variable),
     /// `GRAPH <g>` for a graph the store doesn't know: nothing matches.
     Missing,
+}
+
+/// What a context holds of its own before it evaluates anything (its reader's state,
+/// [`Snapshot::reading_within`]): tests that count a query's charges exactly add it.
+#[cfg(test)]
+pub(crate) fn own_bytes(snapshot: &Snapshot) -> usize {
+    let mut options = QueryOptions::default();
+    options.resources.memory = nrese_exec::Envelope::unlimited();
+    let memory = options.resources.memory.clone();
+    let _context = Context::new(snapshot, &options, None, None);
+    memory.used()
 }
 
 impl<'a> Context<'a> {
@@ -1373,12 +1384,24 @@ impl<'a> Context<'a> {
             },
             false => (None, None),
         };
+        // What the reads hold while they run (an equality expansion's waiting copies) is
+        // charged to the evaluation too; a read it refuses fails the query at its next check
+        // ([`Self::check`]), and so does the reader's state refused.
+        let unread = match &canonical {
+            Some((_, read)) => read,
+            None => snapshot,
+        };
+        let (read, reads_refused) = match unread.reading_within(Arc::clone(&budget)) {
+            Ok(read) => (read, None),
+            Err(refused) => (unread.clone(), Some(refused)),
+        };
         let named = match &canonical {
             // The graphs `FROM NAMED` lists, by the names canonical reads give them.
             Some((names, _)) => resolved.named.map(|graphs| names.graphs(graphs)),
             None => resolved.named,
         };
         let mut ctx = Self {
+            planner: options.resources.planner,
             merge_set,
             named,
             as_written: options.as_written,
@@ -1390,25 +1413,20 @@ impl<'a> Context<'a> {
                 true => None,
                 false => snapshot.expand_late(options.read_model),
             },
-            snapshot: match &canonical {
-                Some((_, read)) => Cow::Owned(read.clone()),
-                None => Cow::Borrowed(snapshot),
-            },
+            snapshot: Cow::Owned(read),
             canonical: canonical.map(|(names, _)| names),
             canonical_refused,
+            reads_refused,
             model: options.read_model,
             evaluator: Evaluator::with_base(base.cloned()),
             aliases: RefCell::default(),
             computed: RefCell::default(),
-            computed_ids: RefCell::default(),
-            computed_table: Cell::new(0),
             decoded: RefCell::default(),
-            decoded_terms: Cell::new(0),
-            decoded_table: Cell::new(0),
             decodes: AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
             budget,
+            memory: options.resources.memory.clone(),
             trace: None,
             depth: Cell::new(0),
             probed: Cell::default(),
@@ -1436,6 +1454,22 @@ impl<'a> Context<'a> {
 
     /// The id of a constant of a pattern: an alias IRI ([`substitute`]) stands for its
     /// blank node.
+    /// [`Self::lookup_const`], what the snapshot's lookup allocates charged to `held` first
+    /// ([`Snapshot::lookup_charged`]).
+    fn lookup_const_charged(
+        &self,
+        term: nrese_rdf::TermRef<'_>,
+        held: &mut Reservation<&nrese_exec::Budget>,
+    ) -> Result<Option<TermId>, nrese_exec::BudgetExceeded> {
+        if let nrese_rdf::TermRef::NamedNode(n) = term
+            && n.as_str().starts_with(substitute::ALIAS)
+        {
+            return Ok(self.lookup_const(term));
+        }
+        self.snapshot
+            .lookup_charged(term, |bytes| held.charge(bytes))
+    }
+
     fn lookup_const(&self, term: nrese_rdf::TermRef<'_>) -> Option<TermId> {
         if let nrese_rdf::TermRef::NamedNode(n) = term
             && n.as_str().starts_with(substitute::ALIAS)
@@ -1479,7 +1513,12 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Fails a cancelled query, and one a read refused memory to: what it read since may
+    /// be incomplete ([`Snapshot::reading_within`]).
     fn check(&self) -> NativeResult<()> {
+        if let Some(refused) = self.reads_refused.or_else(|| self.snapshot.read_refused()) {
+            return Err(QueryEvaluationError::MemoryLimit(refused).into());
+        }
         Ok(self
             .cancellation
             .as_ref()
@@ -1605,69 +1644,26 @@ impl<'a> Context<'a> {
         }
         self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
         let term = self.snapshot.decode(TermId::from_raw(id));
-        // Bounded: a scan over millions of distinct labels must not keep them all. Kept
-        // only where the budget has room for it, charged first: the cache is optional, and
-        // a term not kept limits no answer.
-        if decoded.len() < DECODE_CACHE_ENTRIES {
-            let bytes = term.as_ref().map_or(0, Term::heap_bytes);
-            let table = grown_table::<(u64, Option<Term>)>(decoded.len(), decoded.capacity());
-            if bytes + table <= self.budget.remaining() && self.budget.charge(bytes + table).is_ok()
-            {
-                decoded.insert(id, term.clone());
-                self.decoded_terms.set(self.decoded_terms.get() + bytes);
-                if table > 0 {
-                    // The old table was freed as the new one took its entries.
-                    self.budget.release(self.decoded_table.replace(table));
-                }
-            }
-        }
+        decoded.keep(id, &term, &self.budget);
         term
     }
 
-    /// Lets the decode cache go, then releases its charge: before the query's charge is
-    /// handed to its results, which don't keep the cache.
+    /// The decode cache is context-only: free it before releasing its own reservation.
     fn drop_decoded(&self) {
-        drop(std::mem::take(&mut *self.decoded.borrow_mut()));
-        self.budget
-            .release(self.decoded_terms.take() + self.decoded_table.take());
+        drop(self.decoded.take());
     }
 
-    /// The id of `term`: its stored id if the snapshot knows it, else a computed id, the same
-    /// one for equal terms. A new computed term is charged before it is kept (twice: the
-    /// list's copy and the map's), and so is the room the list and the map grow to.
+    /// Move computed values with their own token, after freeing the interning map.
+    fn take_computed(&self) -> Holding<Vec<Term>> {
+        self.computed.take().into_values(&self.budget)
+    }
+
+    /// The stored id, or the query's stable computed id; admission precedes retention.
     fn id(&self, term: &Term) -> NativeResult<u64> {
         if let Some(id) = self.lookup_const(term.as_ref()) {
             return Ok(id.raw());
         }
-        let mut ids = self.computed_ids.borrow_mut();
-        if let Some(&id) = ids.get(term) {
-            return Ok(id);
-        }
-        let mut computed = self.computed.borrow_mut();
-        let old_list = computed.capacity() * size_of::<Term>();
-        let list = match computed.len() < computed.capacity() {
-            true => 0,
-            false => (computed.capacity() + computed.capacity().max(4)) * size_of::<Term>(),
-        };
-        let table = grown_table::<(Term, u64)>(ids.len(), ids.capacity());
-        self.budget
-            .charge(2 * term.heap_bytes() + list + table)
-            .map_err(QueryEvaluationError::MemoryLimit)?;
-        if list > 0 {
-            let more = computed.capacity().max(4);
-            computed.reserve_exact(more);
-        }
-        let id = computed_id(computed.len() as u64);
-        computed.push(term.clone());
-        ids.insert(term.clone(), id);
-        // What the list and the map grew from was freed as they moved.
-        if list > 0 {
-            self.budget.release(old_list);
-        }
-        if table > 0 {
-            self.budget.release(self.computed_table.replace(table));
-        }
-        Ok(id)
+        Ok(self.computed.borrow_mut().intern(term, &self.budget)?)
     }
 
     fn binding<'s>(
@@ -1932,15 +1928,16 @@ impl<'a> Context<'a> {
                     let (early, late): (Vec<_>, Vec<_>) = all
                         .into_iter()
                         .partition(|c| !as_written && pushdown::movable(c));
-                    let spatial_seed = self.spatial_seed(&early, patterns);
+                    let spatial_seed = self.spatial_seed(&early, patterns)?;
                     let mut early: Vec<(&Expression, Vec<Variable>)> = early
                         .into_iter()
                         .map(|c| (c, expression_variables(c)))
                         .collect();
-                    // A spatial filter's candidates from the R-tree start the joins.
+                    // A spatial filter's literals from the index start the joins; they
+                    // decide its conjunct, and come charged.
                     let mut solutions = match spatial_seed {
-                        Some(seed) => {
-                            let seed = self.produced(seed)?;
+                        Some((seed, decided)) => {
+                            early.remove(decided);
                             self.bgp_from(seed, patterns, &mut early)?
                         }
                         None => self.bgp(patterns, &hints, &mut early)?,
@@ -2022,7 +2019,7 @@ impl<'a> Context<'a> {
                 variables,
                 bindings,
             } => {
-                let mut table = IdTable::new(variables.len());
+                let mut table = IdTable::charged(variables.len(), 0, &self.budget)?;
                 for binding in bindings {
                     let row: Vec<u64> = binding
                         .iter()
@@ -2192,7 +2189,7 @@ impl<'a> Context<'a> {
                     None => {
                         let mut vars = Vec::new();
                         bound_variables(inner, &mut vars);
-                        let table = IdTable::new(vars.len());
+                        let table = IdTable::charged(vars.len(), 0, &self.budget)?;
                         Ok(Solutions {
                             vars,
                             table,
@@ -2203,7 +2200,7 @@ impl<'a> Context<'a> {
             }
             NamedNodePattern::Variable(v) => v,
         };
-        if scans_everywhere(inner, variable) {
+        if scans_everywhere(inner, variable, self.spatial_rewrite) {
             // Every row comes from scans, which bind the variable: one evaluation for
             // all graphs.
             let mut solutions = self.in_graph(GraphScope::Variable(variable.clone()), inner)?;
@@ -2255,7 +2252,7 @@ impl<'a> Context<'a> {
                 if !vars.contains(variable) {
                     vars.push(variable.clone());
                 }
-                let table = IdTable::new(vars.len());
+                let table = IdTable::charged(vars.len(), 0, &self.budget)?;
                 Ok(Solutions {
                     vars,
                     table,
@@ -2287,10 +2284,10 @@ impl<'a> Context<'a> {
     fn path_evaluator(&self) -> NativeResult<paths::PathEvaluator<'_>> {
         let graph = match &*self.graph.borrow() {
             GraphScope::Default => paths::PathGraph::Default,
-            GraphScope::Union => paths::PathGraph::Merged(self.merge_set.as_deref()),
+            GraphScope::Union => paths::PathGraph::Merged(self.merge_set.as_ref()),
             GraphScope::Named(id) => paths::PathGraph::Named(*id),
             // A graph the store doesn't hold: the merge of no graphs.
-            GraphScope::Missing => paths::PathGraph::Merged(Some(&[])),
+            GraphScope::Missing => paths::PathGraph::Merged(Some(&crate::dataset::NO_GRAPHS)),
             // `GRAPH ?g` sends patterns with paths graph by graph (`scans_everywhere`).
             GraphScope::Variable(_) => return unsupported("a path read in all graphs at once"),
         };
@@ -2509,7 +2506,8 @@ impl<'a> Context<'a> {
             return self.filter_bound(result, filters);
         }
         // Full-text searches start the joins (`search`).
-        if let Some((searches, rest)) = search::split(triples) {
+        if let Some(searches) = search::split(triples) {
+            let (searches, rest) = searches?;
             let mut result = Solutions::unit();
             for search in &searches {
                 let start = Instant::now();
@@ -2540,7 +2538,7 @@ impl<'a> Context<'a> {
                     let width = vars.len();
                     return Ok(Solutions {
                         vars,
-                        table: IdTable::new(width),
+                        table: IdTable::charged(width, 0, &self.budget)?,
                         ordered: false,
                     });
                 }
@@ -2945,7 +2943,7 @@ impl<'a> Context<'a> {
                     self.consumed(result);
                     return Ok(Solutions {
                         vars,
-                        table: IdTable::new(width),
+                        table: IdTable::charged(width, 0, &self.budget)?,
                         ordered: false,
                     });
                 }
@@ -3194,8 +3192,15 @@ impl<'a> Context<'a> {
                 .as_ref()
                 .is_some_and(CancellationToken::is_cancelled)
         };
-        plan::order(inputs, variables, PROBE_FACTOR, sets.as_deref(), &cancelled)
-            .ok_or_else(|| QueryEvaluationError::Cancelled.into())
+        plan::order(
+            inputs,
+            variables,
+            PROBE_FACTOR,
+            sets.as_deref(),
+            self.planner,
+            &cancelled,
+        )
+        .ok_or_else(|| QueryEvaluationError::Cancelled.into())
     }
 
     /// The join orderer's inputs for `scans` with their `counts`: distinct values per
@@ -3459,7 +3464,7 @@ impl<'a> Context<'a> {
         if counts.contains(&0) {
             return Ok(Some(Solutions {
                 vars,
-                table: IdTable::new(width),
+                table: IdTable::charged(width, 0, &self.budget)?,
                 ordered: false,
             }));
         }
@@ -3484,7 +3489,7 @@ impl<'a> Context<'a> {
                 return Err(self.too_large(query.max_rows.saturating_add(1), width));
             }
         };
-        let mut table = IdTable::new(width);
+        let mut table = IdTable::charged(width, 0, &self.budget)?;
         for row in rows.chunks_exact(width) {
             table.push_row(row, &self.budget)?;
         }
@@ -3735,7 +3740,7 @@ impl<'a> Context<'a> {
                 });
             }
         }
-        let mut table = IdTable::new(vars.len());
+        let mut table = IdTable::charged(vars.len(), 0, &self.budget)?;
         let mut row = vec![0u64; vars.len()];
         let quads = self
             .snapshot
@@ -3815,7 +3820,7 @@ impl<'a> Context<'a> {
             });
         }
         // Each range a block and a column at a time where the index can, else quad by quad.
-        let mut out = IdTable::new(vars.len());
+        let mut out = IdTable::charged(vars.len(), 0, &self.budget)?;
         let mut row = vec![0u64; vars.len()];
         for &(low, high) in ranges {
             self.check()?;
@@ -3939,7 +3944,7 @@ impl<'a> Context<'a> {
             key_columns: &key_columns,
             shared_positions: &shared_positions,
             positions: &positions,
-            graphs: self.merge_set.as_deref().filter(|_| scan.merged()),
+            graphs: self.merge_set.as_ref().filter(|_| scan.merged()),
             budget: &self.budget,
             width: vars.len(),
             max_rows: self.max_rows(vars.len()),
@@ -4142,7 +4147,7 @@ impl<'a> Context<'a> {
         let Some(scan) = self.scan_pattern(triple) else {
             let solutions = Solutions {
                 vars: vars_unique,
-                table: IdTable::new(width),
+                table: IdTable::charged(width, 0, &self.budget)?,
                 ordered: false,
             };
             return Ok(Some(match projection {
@@ -4157,15 +4162,13 @@ impl<'a> Context<'a> {
             .collect();
         // Both tables are charged before they grow, and hold their charge.
         let memory = QueryEvaluationError::MemoryLimit;
-        let (mut out, mut chunk) = (IdTable::new(width), IdTable::new(width));
+        let mut out = IdTable::charged(width, 0, &self.budget)?;
         // Without a filter, every row read is kept: no more than the limit are read at once.
         let chunk_rows = match filter {
             Some(_) => LIMIT_CHUNK,
             None => LIMIT_CHUNK.min(limit.max(1)),
         };
-        chunk
-            .reserve_rows_exact(chunk_rows, &self.budget)
-            .map_err(memory)?;
+        let mut chunk = IdTable::charged(width, chunk_rows, &self.budget).map_err(memory)?;
         let mut row = vec![0u64; width];
         // The merged default graph is read in a graph-last order, where the copies of a
         // statement are adjacent, and all but the first are skipped (of a merge of listed
@@ -4176,7 +4179,7 @@ impl<'a> Context<'a> {
                 .scan_sorted_in(self.model, &scan.quad_pattern(), scan.permutation_for(None))
                 .expect("permutation_for returns a usable permutation");
             let mut previous: Option<[u64; 3]> = None;
-            let graphs = self.merge_set.as_deref();
+            let graphs = self.merge_set.as_ref();
             sorted.filter(move |quad| {
                 if graphs.is_some_and(|graphs| !graphs.contains(&quad.graph)) {
                     return false;
@@ -4390,7 +4393,7 @@ impl<'a> Context<'a> {
     fn aggregate_groups(
         &self,
         solutions: &Solutions,
-        members: &[Vec<usize>],
+        members: &nrese_exec::group::Members,
         aggregates: &[(Variable, AggregateExpression)],
     ) -> NativeResult<Vec<Vec<Agg>>> {
         let per_group = |aggregator: &Aggregator<'_>, rows: &[usize]| -> Vec<Agg> {
@@ -4445,9 +4448,8 @@ impl<'a> Context<'a> {
                     numbers: RefCell::default(),
                 };
                 Some(
-                    members[window[0]..window[1]]
-                        .iter()
-                        .map(|rows| per_group(&aggregator, rows))
+                    (window[0]..window[1])
+                        .map(|group| per_group(&aggregator, members.get(group)))
                         .collect(),
                 )
             })
@@ -4706,11 +4708,11 @@ impl<'a> Context<'a> {
         {
             return self.group_streamed(plan, variables, aggregates);
         }
-        let before = self.budget.used();
         match self.group_direct(inner, variables, aggregates, having) {
             Err(error) if streamable.is_some() && stream::is_memory_limit(&error) => {
-                self.budget
-                    .release(self.budget.used().saturating_sub(before));
+                // Failed tables/scratch drop their own tokens. Optional decoded state
+                // may be discarded; computed IDs/capacity still referenced stay charged.
+                self.drop_decoded();
                 let plan = streamable.as_ref().expect("checked");
                 self.group_streamed(plan, variables, aggregates)
             }
@@ -4725,11 +4727,22 @@ impl<'a> Context<'a> {
         aggregates: &[(Variable, AggregateExpression)],
         having: Option<&Expression>,
     ) -> NativeResult<Solutions> {
-        // COUNT(*) of one triple pattern without GROUP BY: the index knows the answer.
+        // COUNT(*) of one triple pattern without GROUP BY, or COUNT(?v) of a variable it
+        // binds: the index knows the answer (Sparqloscope 100, `COUNT(?s)` of every
+        // statement, read all 605 M of them).
         if variables.is_empty()
-            && let [(target, AggregateExpression::CountSolutions { distinct: false })] = aggregates
+            && let [(target, aggregate)] = aggregates
             && let GraphPattern::Bgp { patterns } = inner
             && let [triple] = patterns.as_slice()
+            && match aggregate {
+                AggregateExpression::CountSolutions { distinct: false } => true,
+                AggregateExpression::FunctionCall {
+                    name: AggregateFunction::Count,
+                    expr: Expression::Variable(v),
+                    distinct: false,
+                } => triple_variables(triple).contains(v),
+                _ => false,
+            }
             && !search::is_search(triple, patterns)
             && !self.is_spatial(triple)
         {
@@ -4742,7 +4755,29 @@ impl<'a> Context<'a> {
                 Some(scan) => self.scan(&scan, None)?.table.len() as u64,
                 None => 0,
             };
-            let mut table = IdTable::new(1);
+            let mut table = IdTable::charged(1, 0, &self.budget)?;
+            table.push_row(&[self.id(&integer(count))?], &self.budget)?;
+            return Ok(Solutions {
+                vars: vec![target.clone()],
+                table,
+                ordered: false,
+            });
+        }
+        // COUNT(DISTINCT ?v) of one triple pattern: the groups of the index sorted on ?v,
+        // counted as they are walked (Sparqloscope 101 to 103, the subjects, predicates and
+        // objects of every statement, read all 605 M of them, two past 26 GB).
+        if variables.is_empty()
+            && let [(target, aggregate)] = aggregates
+            && let AggregateExpression::FunctionCall {
+                name: AggregateFunction::Count,
+                expr: Expression::Variable(key),
+                distinct: true,
+            } = aggregate
+            && let GraphPattern::Bgp { patterns } = inner
+            && let [triple] = patterns.as_slice()
+            && let Some(count) = self.distinct_count(triple, key)?
+        {
+            let mut table = IdTable::charged(1, 0, &self.budget)?;
             table.push_row(&[self.id(&integer(count))?], &self.budget)?;
             return Ok(Solutions {
                 vars: vec![target.clone()],
@@ -4758,7 +4793,7 @@ impl<'a> Context<'a> {
             && let GraphPattern::Bgp { patterns } = inner
             && let Some(count) = self.cyclic_count(patterns)?
         {
-            let mut table = IdTable::new(1);
+            let mut table = IdTable::charged(1, 0, &self.budget)?;
             table.push_row(&[self.id(&integer(count))?], &self.budget)?;
             return Ok(Solutions {
                 vars: vec![target.clone()],
@@ -4787,7 +4822,7 @@ impl<'a> Context<'a> {
                 let detail = format!("COUNT of {path} from the closure's size per component");
                 self.note("closure", detail, Some(1), 1, begun);
             }
-            let mut table = IdTable::new(1);
+            let mut table = IdTable::charged(1, 0, &self.budget)?;
             table.push_row(&[self.id(&integer(count))?], &self.budget)?;
             return Ok(Solutions {
                 vars: vec![target.clone()],
@@ -4857,9 +4892,13 @@ impl<'a> Context<'a> {
             return Ok(solutions);
         }
         // Aggregates that ignore duplicates let the pattern be evaluated as a set, and
-        // OPTIONALs that only feed them be aggregated apart from the rest (`sets`).
+        // OPTIONALs that only feed them be aggregated apart from the rest (`sets`). One
+        // pattern too: its values by a group walk (Sparqloscope 058, MIN of a name, folded
+        // 30.5 M rows for their distinct names).
+        let one_pattern = variables.is_empty()
+            && matches!(inner, GraphPattern::Bgp { patterns } if patterns.len() == 1);
         let solutions = match sets::insensitive_arguments(aggregates) {
-            Some(arguments) if sets::joins(inner) && !self.as_written => {
+            Some(arguments) if (sets::joins(inner) || one_pattern) && !self.as_written => {
                 if !variables.is_empty()
                     && let Some(solutions) =
                         self.group_detached(inner, variables, aggregates, &arguments, having)?
@@ -4877,6 +4916,49 @@ impl<'a> Context<'a> {
             _ => self.eval(inner)?,
         };
         self.group_solutions(solutions, variables, aggregates)
+    }
+
+    /// The distinct values of `key` in `triple`'s matches, from the index's groups
+    /// ([`Snapshot::distinct_count_in`]); `None` where the index can't say.
+    fn distinct_count(&self, triple: &TriplePattern, key: &Variable) -> NativeResult<Option<u64>> {
+        if self.as_written
+            || search::is_search(triple, std::slice::from_ref(triple))
+            || self.is_spatial(triple)
+        {
+            return Ok(None);
+        }
+        if !triple_variables(triple).contains(key) {
+            return Ok(None);
+        }
+        let Some(scan) = self.scan_pattern(triple) else {
+            // A constant the store doesn't know: no matches.
+            return Ok(Some(0));
+        };
+        let Some(component) = (0..3).find(|&c| scan.slots[c].is_var(key)) else {
+            return Ok(None);
+        };
+        if scan.repeats_variable() || scan.merged() || !matches!(scan.slots[3], Slot::Const(_)) {
+            return Ok(None);
+        }
+        let permutation = scan.permutation_for(Some(key));
+        if scan.first_free(permutation) != Some(component) {
+            return Ok(None);
+        }
+        let start = Instant::now();
+        let count = self
+            .snapshot
+            .distinct_count_in(self.model, &scan.quad_pattern(), permutation);
+        self.check()?;
+        if count.is_some() && self.trace.is_some() {
+            self.note(
+                "distinct count",
+                format!("{key} of {triple}: the index's groups counted"),
+                Some(1),
+                1,
+                start,
+            );
+        }
+        Ok(count)
     }
 
     /// GROUP BY over a cross product: (filters over) a join of two patterns that share no
@@ -4983,7 +5065,7 @@ impl<'a> Context<'a> {
             let mut vars = variables.to_vec();
             vars.extend(aggregates.iter().map(|(target, _)| target.clone()));
             return Ok(Some(Solutions {
-                table: IdTable::new(vars.len()),
+                table: IdTable::charged(vars.len(), 0, &self.budget)?,
                 vars,
                 ordered: false,
             }));
@@ -5086,10 +5168,7 @@ impl<'a> Context<'a> {
                 let binding = aggregator.binding(solutions, row);
                 match aggregator.evaluator.eval(expr, &binding) {
                     None => Number::Error,
-                    Some(term) => match Numeric::of(&Value::of(&term)) {
-                        Some(number) => Number::Value(number),
-                        None => Number::Other,
-                    },
+                    Some(term) => number_of(&term),
                 }
             };
             let found: Vec<(u64, Number)> = if missing.len() < 2 * PARALLEL_EXPRESSION_ROWS {
@@ -5256,10 +5335,10 @@ impl<'a> Context<'a> {
         let values = match one_pass {
             Some(values) => values,
             None => {
-                let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
-                for (row, &group) in groups.group_of.iter().enumerate() {
-                    members[group as usize].push(row);
-                }
+                let members = nrese_exec::group::Members::of(
+                    groups.group_of.iter().map(|&g| g as usize),
+                    group_count,
+                );
                 self.aggregate_groups(&solutions, &members, aggregates)?
             }
         };
@@ -5457,7 +5536,7 @@ struct Probe<'a, 'b> {
     positions: &'a [Vec<usize>],
     /// For a merged default graph of listed graphs, the graphs ([`Context::merge_set`]):
     /// the index's matches in other graphs are skipped.
-    graphs: Option<&'a [TermId]>,
+    graphs: Option<&'a crate::dataset::GraphSet>,
     /// The query's budget: each chunk's output and scratch are charged to it before they
     /// grow.
     budget: &'b Arc<Budget>,
@@ -5491,7 +5570,8 @@ impl<'b> Probe<'_, 'b> {
         let width = table.width();
         let stride = self.positions.len();
         let budget = &**self.budget;
-        let mut out = IdTable::new(self.width);
+        let mut out =
+            IdTable::charged(self.width, rows.len(), self.budget).map_err(ProbeStop::Memory)?;
         let mut cursor = self.snapshot.probe_cursor(self.model);
         // The new variables' values of each match of the current key, and their number
         // (a pattern binding nothing new matches without values).
@@ -5502,9 +5582,7 @@ impl<'b> Probe<'_, 'b> {
         // ([`distinct`]): scratch kept from key to key, charged only when it grows.
         let mut scratch = (self.scan.merged() && stride > 1)
             .then(|| (ChargedVec::new(budget), ChargedVec::new(budget)));
-        // A row a key to start with; below the room, a key's matches need no charge.
-        out.reserve_rows(rows.len(), self.budget)
-            .map_err(ProbeStop::Memory)?;
+        // A row per key is reserved already; below that room matches need no charge.
         // The row being assembled, charged too: one a chunk, and the chunks grow with the
         // input's rows.
         let mut row: Scratch<'_, u64> =

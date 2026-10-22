@@ -40,6 +40,16 @@ pub enum QueryEvaluationError {
     Unexpected(String),
 }
 
+impl From<nrese_engine::EngineError> for QueryEvaluationError {
+    fn from(error: nrese_engine::EngineError) -> Self {
+        match error {
+            nrese_engine::EngineError::InvalidTextQuery(message) => Self::Argument(message),
+            nrese_engine::EngineError::MemoryLimit(exceeded) => Self::MemoryLimit(exceeded),
+            error => Self::Dataset(Box::new(error)),
+        }
+    }
+}
+
 /// A flag a running query checks; cancelling it stops the query at its next check.
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken(Arc<AtomicBool>);
@@ -78,6 +88,10 @@ impl CancellationToken {
 pub struct QueryDatasetSpecification {
     default: Option<Vec<GraphName>>,
     named: Option<Vec<NamedOrBlankNode>>,
+    /// With `default` unset: the default graph as the merge of every graph but these
+    /// ([`Self::set_default_graph_excluding`]); `Some` of no graphs is the merge of every
+    /// graph, asked for, unlike `None`, which leaves the default graph as the store has it.
+    excluded: Option<Vec<GraphName>>,
 }
 
 impl QueryDatasetSpecification {
@@ -88,6 +102,21 @@ impl QueryDatasetSpecification {
     /// The graphs whose merge is the default graph.
     pub fn set_default_graph(&mut self, graphs: Vec<GraphName>) {
         self.default = Some(graphs);
+        self.excluded = None;
+    }
+
+    /// The default graph as the merge of every graph but `graphs` (SHACL's data graph: every
+    /// graph except those holding shapes). No protocol request says this; the named graphs
+    /// stay as they are.
+    pub fn set_default_graph_excluding(&mut self, graphs: Vec<GraphName>) {
+        self.default = None;
+        self.excluded = Some(graphs);
+    }
+
+    /// The graphs a default graph merged from every graph leaves out, if it is one
+    /// ([`Self::set_default_graph_excluding`]; none left out: every graph).
+    pub fn excluded_default_graphs(&self) -> Option<&[GraphName]> {
+        self.excluded.as_deref()
     }
 
     /// The named graphs `GRAPH` may read.
@@ -105,7 +134,7 @@ impl QueryDatasetSpecification {
 
     /// Whether it leaves the store's dataset as it is.
     pub fn is_default_dataset(&self) -> bool {
-        self.default.is_none() && self.named.is_none()
+        self.default.is_none() && self.named.is_none() && self.excluded.is_none()
     }
 }
 
@@ -116,6 +145,7 @@ impl From<QueryDataset> for QueryDatasetSpecification {
             named: dataset
                 .named
                 .map(|named| named.into_iter().map(Into::into).collect()),
+            excluded: None,
         }
     }
 }

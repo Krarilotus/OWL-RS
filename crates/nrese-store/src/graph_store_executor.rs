@@ -5,35 +5,40 @@ use nrese_sparql::ReadView;
 
 use crate::error::StoreResult;
 use crate::graph_store::{
-    GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
-    GraphWriteRequest,
+    GraphDeleteReport, GraphReadRequest, GraphTarget, GraphWriteReport, GraphWriteRequest,
 };
-use crate::rdf_io::{BlankNodes, parse_graph, serialize_triples};
-use crate::view::decoded_quads;
+use crate::rdf_io::{BlankNodes, parse_graph, write_quads};
 
-/// Reads the target graph; `cancel` stops it (a timeout, a client gone) between
-/// statements: a large graph read no longer runs on after its response gave up (the
-/// review of 3 October 2026, P5).
-pub fn execute_graph_read(
+/// Whether the target graph exists in `view` under `model`: the default graph always, a
+/// named graph while it holds a statement. Nothing is decoded (Graph Store Protocol `HEAD`).
+pub(crate) fn graph_exists(
+    view: &impl ReadView,
+    target: &GraphTarget,
+    model: ReadModel,
+) -> StoreResult<bool> {
+    let pattern = target.pattern_in(view)?;
+    Ok(matches!(target, GraphTarget::DefaultGraph)
+        || pattern.is_some_and(|p| view.quads_for_pattern_in(model, &p).next().is_some()))
+}
+
+/// Writes the target graph to `out` in the request's format as it is read, its statements
+/// as triples; `cancel` stops it (a timeout, a client gone) between statements. A graph
+/// that doesn't exist writes nothing and returns `false`, so a transport can still answer
+/// 404 (Graph Store Protocol §5.2).
+pub(crate) fn write_graph(
     view: &impl ReadView,
     request: &GraphReadRequest,
     model: ReadModel,
     cancel: &nrese_sparql::CancellationToken,
-) -> StoreResult<GraphReadResult> {
-    let mut triples: Vec<nrese_rdf::Triple> = Vec::new();
-    if let Some(pattern) = request.target.pattern_in(view)? {
-        for (index, quad) in decoded_quads(view, model, &pattern).enumerate() {
-            if index % 4096 == 0 {
-                cancel.check()?;
-            }
-            triples.push(quad?.into());
-        }
+    out: impl std::io::Write,
+) -> StoreResult<bool> {
+    if !graph_exists(view, &request.target, model)? {
+        return Ok(false);
     }
-    Ok(GraphReadResult {
-        media_type: request.format.media_type(),
-        exists: matches!(request.target, GraphTarget::DefaultGraph) || !triples.is_empty(),
-        payload: serialize_triples(request.format, triples)?,
-    })
+    let patterns: Vec<_> = request.target.pattern_in(view)?.into_iter().collect();
+    let format = (request.format.rdf_format(), false);
+    write_quads(view, model, &patterns, format, cancel, out)?;
+    Ok(true)
 }
 
 /// Adds (or, with `replace`, substitutes) the payload's triples in the target graph. The

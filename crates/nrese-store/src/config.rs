@@ -42,6 +42,8 @@ pub struct StoreConfig {
     /// reasoning of a commit) stops with [`StoreError::ProcessMemoryLimit`](crate::StoreError::ProcessMemoryLimit)
     /// instead of taking the machine; 0 is no limit. By default three quarters of what the
     /// process may use ([`default_process_memory_bytes`]).
+    /// It is also the limit of the process's budget ([`Runtime::memory`](crate::Runtime::memory)),
+    /// which what queries and maintenance charge draws on, the queries' budget within it.
     /// This is the store's watch policy, not a write to the global process limit.
     /// The server installs its process-wide fallback separately at startup. Disabling
     /// this watch does not bypass a fallback explicitly installed by the process owner.
@@ -82,12 +84,14 @@ pub struct StoreConfig {
     /// can't tell (stage C, `"late"`, the default). The same answers.
     pub equality_early_expansion: bool,
     /// Support graph sets kept per inferred statement for `inferred = "supported"` in the
-    /// access policy (`reasoner.support_sets`, at least 1): the smallest first. A set left
-    /// out can only hide a statement from a reader who could have seen it.
+    /// access policy (`reasoner.support_sets`, at least 1): the smallest first. A bound on
+    /// memory and work, not on what readers see: a reader none of a statement's kept sets
+    /// fits, where the cap left some out, is decided by the closure of its graphs.
     pub support_sets: usize,
     /// On disk: check the whole checkpoint when opening (see
     /// `nrese_engine::DurabilityConfig::verify_on_open`). Off: the checkpoint is used in
-    /// place and opening reads only its structure.
+    /// place and opening reads only its structure; damage outside it goes undetected, and a
+    /// query reaching it can return altered answers.
     pub verify_on_open: bool,
     /// On disk: serve the data from each checkpoint once written, freeing its copies in
     /// memory (see `nrese_engine::DurabilityConfig::map_checkpoints`).

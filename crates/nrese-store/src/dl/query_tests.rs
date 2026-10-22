@@ -5,7 +5,7 @@ fn lower_true_store() -> Arc<StoreService> {
     use crate::{
         MutationCommand, MutationPipeline, MutationTicket, Requester, SparqlUpdateRequest,
     };
-    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_reasoner::{ReasonerConfig, ReasoningMode};
     let store = Arc::new(
         StoreService::new(crate::StoreConfig {
             ..crate::StoreConfig::in_memory()
@@ -14,9 +14,7 @@ fn lower_true_store() -> Arc<StoreService> {
     );
     let pipeline = MutationPipeline::new(
         Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Dl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
     );
     pipeline
         .apply(
@@ -89,7 +87,7 @@ fn retained_dl_answers_honor_reporting_cancellation_before_writing() {
 #[test]
 fn cancelled_consistency_is_not_published_or_reused_by_another_request() {
     let store = StoreService::new(crate::StoreConfig::in_memory()).unwrap();
-    let snapshot = store.read_snapshot(None);
+    let snapshot = store.read_snapshot(None).unwrap();
     let deadline = Deadline::after(store.config().dl.timeout);
     let view = unproved_view(&snapshot);
     let token = CancellationToken::new();
@@ -178,7 +176,7 @@ fn unproved_view(snapshot: &Snapshot) -> View {
 #[test]
 fn expired_consistency_keeps_request_timeout_out_of_shared_status() {
     let store = StoreService::new(crate::StoreConfig::in_memory()).unwrap();
-    let snapshot = store.read_snapshot(None);
+    let snapshot = store.read_snapshot(None).unwrap();
     let view = unproved_view(&snapshot);
     let fresh = CancellationToken::new();
     let expired = Deadline::at(std::time::Instant::now());
@@ -241,7 +239,7 @@ fn expired_consistency_keeps_request_timeout_out_of_shared_status() {
 #[test]
 fn an_upper_bound_proof_survives_expiry_but_not_request_cancellation() {
     let store = StoreService::new(crate::StoreConfig::in_memory()).unwrap();
-    let snapshot = store.read_snapshot(None);
+    let snapshot = store.read_snapshot(None).unwrap();
     let mut view = unproved_view(&snapshot);
     view.proves_consistency = true;
     let token = CancellationToken::new();

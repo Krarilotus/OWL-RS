@@ -12,17 +12,32 @@
 //! [`Envelope::part`] is one part's, such as an evaluation, counted on its own so that
 //! what the part leaves behind can be handed to its result. Each level charges the one
 //! above it too, and returns what it holds when it ends, however it ends.
+//!
+//! A [`SharedBudget`] can itself lie within another ([`SharedBudget::within`]): the
+//! process's, which everything charged in it draws from (queries, maintenance), above the
+//! queries' and others'. Their limits may add up to more than the process's: it refuses
+//! what doesn't fit them all.
 
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-/// The memory all running queries may hold together.
+/// The memory a group of operations may hold together: all running queries, or the
+/// process's for everything it charges.
 #[derive(Debug)]
 pub struct SharedBudget {
     limit: usize,
     used: AtomicUsize,
     peak: AtomicUsize,
+    /// The budget this one lies within, charged first.
+    parent: Option<Arc<SharedBudget>>,
+}
+
+/// A shared budget's refusal: the limit of the level that refused, and its use then.
+#[derive(Debug, Clone, Copy)]
+struct Refused {
+    limit: usize,
+    used: usize,
 }
 
 impl SharedBudget {
@@ -31,7 +46,28 @@ impl SharedBudget {
             limit: limit_bytes,
             used: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
+            parent: None,
         })
+    }
+
+    /// `limit_bytes` within `parent`: a charge here is charged there too, first, and
+    /// refused where either refuses.
+    pub fn within(limit_bytes: usize, parent: Arc<SharedBudget>) -> Arc<Self> {
+        Arc::new(Self {
+            limit: limit_bytes,
+            used: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+            parent: Some(parent),
+        })
+    }
+
+    /// Bytes that may still be charged here: the own rest, and no more than the levels
+    /// above have left.
+    pub fn remaining(&self) -> usize {
+        let own = self.limit.saturating_sub(self.used());
+        self.parent
+            .as_ref()
+            .map_or(own, |parent| own.min(parent.remaining()))
     }
 
     pub fn limit(&self) -> usize {
@@ -47,11 +83,21 @@ impl SharedBudget {
         self.peak.load(Ordering::Relaxed)
     }
 
-    fn charge(&self, bytes: usize) -> Result<(), usize> {
+    /// Charges `bytes` above, then here; refused anywhere, nothing stays charged.
+    fn charge(&self, bytes: usize) -> Result<(), Refused> {
+        if let Some(parent) = &self.parent {
+            parent.charge(bytes)?;
+        }
         let mut used = self.used.load(Ordering::Relaxed);
         loop {
             let Some(next) = used.checked_add(bytes).filter(|&next| next <= self.limit) else {
-                return Err(used);
+                if let Some(parent) = &self.parent {
+                    parent.release(bytes);
+                }
+                return Err(Refused {
+                    limit: self.limit,
+                    used,
+                });
             };
             match self
                 .used
@@ -66,12 +112,17 @@ impl SharedBudget {
         }
     }
 
+    /// Releases `bytes` here, at most what is charged, and as much above.
     fn release(&self, bytes: usize) {
-        let _ = self
+        let before = self
             .used
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 Some(used.saturating_sub(bytes))
-            });
+            })
+            .unwrap_or_else(|used| used);
+        if let Some(parent) = &self.parent {
+            parent.release(bytes.min(before));
+        }
     }
 }
 
@@ -245,12 +296,14 @@ impl Budget {
             }
         }
         let above = match &self.parent {
-            Some(Parent::Server(shared)) => shared.charge(bytes).map_err(|in_use| BudgetExceeded {
-                limit: shared.limit,
-                requested: bytes,
-                used: in_use,
-                shared: true,
-            }),
+            Some(Parent::Server(shared)) => {
+                shared.charge(bytes).map_err(|refused| BudgetExceeded {
+                    limit: refused.limit,
+                    requested: bytes,
+                    used: refused.used,
+                    shared: true,
+                })
+            }
             Some(Parent::Envelope(envelope)) => envelope.take(bytes),
             None => Ok(()),
         };
@@ -324,7 +377,7 @@ impl Budget {
     pub fn remaining(&self) -> usize {
         let own = self.limit.saturating_sub(self.used());
         match &self.parent {
-            Some(Parent::Server(shared)) => own.min(shared.limit.saturating_sub(shared.used())),
+            Some(Parent::Server(shared)) => own.min(shared.remaining()),
             Some(Parent::Envelope(envelope)) => own.min(envelope.remaining()),
             None => own,
         }
@@ -343,7 +396,7 @@ impl Budget {
     pub fn bounded_by_shared(&self) -> bool {
         let own = self.limit.saturating_sub(self.used());
         match &self.parent {
-            Some(Parent::Server(shared)) => shared.limit.saturating_sub(shared.used()) < own,
+            Some(Parent::Server(shared)) => shared.remaining() < own,
             Some(Parent::Envelope(envelope)) => {
                 envelope.remaining() < own && envelope.bounded_by_shared()
             }
@@ -478,6 +531,17 @@ impl<B: Deref<Target = Budget>> Reservation<B> {
         }
     }
 
+    /// Combines one operation's tokens without changing their measurement origin.
+    /// Borrows `other` so a failed check leaves its payload/token pair intact.
+    pub(crate) fn absorb_same_origin(&mut self, other: &mut Reservation<B>) {
+        assert!(std::ptr::eq(self.budget(), other.budget()), "one budget");
+        #[cfg(any(test, feature = "measure"))]
+        assert_eq!(self.tag, other.tag, "one measurement origin");
+        let bytes = self.bytes.checked_add(other.bytes).expect("reserved bytes");
+        self.bytes = bytes;
+        other.bytes = 0;
+    }
+
     /// Hands the bytes to a holder that releases them itself (with [`Budget::release`]);
     /// nothing is released.
     pub fn transfer(mut self) -> usize {
@@ -488,6 +552,20 @@ impl<B: Deref<Target = Budget>> Reservation<B> {
             crate::measure::unreserved(&self.budget, self.tag, bytes);
         }
         bytes
+    }
+}
+
+impl Reservation<&Budget> {
+    /// Retains the exact budget and original measurement origin, without readmission.
+    /// Only the combined token is promoted at the Scratch-to-Columns handoff.
+    pub(crate) fn into_shared(mut self, budget: &Arc<Budget>) -> Reservation<Arc<Budget>> {
+        assert!(std::ptr::eq(self.budget(), &**budget), "one budget");
+        Reservation {
+            budget: Arc::clone(budget),
+            bytes: std::mem::take(&mut self.bytes),
+            #[cfg(any(test, feature = "measure"))]
+            tag: self.tag,
+        }
     }
 }
 
@@ -805,7 +883,83 @@ impl<T> Room<'_, T> {
         // SAFETY: the `n` slots after the items are written, within the capacity.
         unsafe { self.0.set_len(len + n) };
     }
+
+    /// [`Self::par_fill`] with items that can fail: the first `Err` stops the fill, every
+    /// worker seeing it (one relaxed load per item) before its next item. Every worker is
+    /// joined before it returns; on an error every item written is dropped once, the room
+    /// holds what it held, and the error of the lowest index observed is returned (workers
+    /// stopped early may skip lower items, so it needn't be the one a sequential fill would
+    /// meet first). A panic is handled as in [`Self::par_fill`].
+    pub fn try_par_fill<E: Send>(
+        &mut self,
+        n: usize,
+        item: impl Fn(usize) -> Result<T, E> + Sync,
+    ) -> Result<(), E>
+    where
+        T: Send,
+    {
+        use rayon::prelude::*;
+        let len = self.0.len();
+        assert!(n <= self.0.capacity() - len, "past the room reserved");
+        // As in `par_fill`: the only pointer to the slots until the length is published.
+        let slots = Slots(self.0.as_mut_ptr().wrapping_add(len));
+        let part = n.div_ceil(4 * rayon::current_num_threads()).max(1);
+        let failed = AtomicBool::new(false);
+        // One token per range, with the range's error: ranges stopped early aren't adjacent,
+        // so the tokens are kept apart, at most a few per worker.
+        let ranges: Vec<FillRange<T, E>> = (0..n.div_ceil(part))
+            .into_par_iter()
+            .map(|p| {
+                let mut written = Written::new(slots, p * part);
+                for i in p * part..(p * part + part).min(n) {
+                    if failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    match item(i) {
+                        Ok(value) => {
+                            // SAFETY: (`Slots`) slot `i` is this range's, and not yet written.
+                            unsafe { slots.0.add(i).write(value) };
+                            written.len += 1;
+                        }
+                        Err(error) => {
+                            failed.store(true, Ordering::Relaxed);
+                            return (written, Some((i, error)));
+                        }
+                    }
+                }
+                (written, None)
+            })
+            .collect();
+        let mut first: Option<(usize, E)> = None;
+        let mut complete = Vec::with_capacity(ranges.len());
+        for (written, error) in ranges {
+            complete.push(written);
+            if let Some((i, error)) = error
+                && first.as_ref().is_none_or(|(at, _)| i < *at)
+            {
+                first = Some((i, error));
+            }
+        }
+        if let Some((_, error)) = first {
+            // Dropping the tokens drops what each range wrote, once.
+            drop(complete);
+            return Err(error);
+        }
+        // No error, so no range stopped: one range of every item, in order.
+        let written = complete
+            .into_iter()
+            .fold(Written::new(slots, 0), Written::join);
+        assert_eq!((written.start, written.len), (0, n), "every slot written");
+        std::mem::forget(written);
+        // SAFETY: the `n` slots after the items are written, within the capacity.
+        unsafe { self.0.set_len(len + n) };
+        Ok(())
+    }
 }
+
+/// What one range of [`Room::try_par_fill`] leaves: the items it wrote, and the index and error
+/// of the item it stopped at, if one failed.
+type FillRange<T, E> = (Written<T>, Option<(usize, E)>);
 
 /// The spare slots [`Room::par_fill`] writes, by one pointer taken from the vector before
 /// the work splits.
@@ -938,6 +1092,68 @@ impl<B: Deref<Target = Budget>> Gauge<B> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_shared_rebind_keeps_the_actual_budget_and_its_charge_alive() {
+        let server = SharedBudget::new(60);
+        let budget = Arc::new(Budget::new(60).within(Some(Arc::clone(&server))));
+        let mut borrowed = Reservation::new(&*budget);
+        borrowed.charge(60).unwrap();
+        let shared = borrowed.into_shared(&budget);
+        assert!(std::ptr::eq(shared.budget(), &*budget));
+        assert_eq!((shared.bytes(), budget.used(), budget.peak()), (60, 60, 60));
+        assert_eq!(Arc::strong_count(&budget), 2);
+        drop(budget);
+        assert_eq!(server.used(), 60);
+        drop(shared);
+        assert_eq!(server.used(), 0);
+    }
+
+    #[test]
+    fn a_shared_rebind_rejects_a_sibling_budget_without_losing_its_token() {
+        let envelope = Envelope::unlimited();
+        let budget = Arc::new(envelope.part());
+        let sibling = Arc::new(envelope.part());
+        let mut unrelated = Reservation::new(&*budget);
+        unrelated.charge(7).unwrap();
+        let mut borrowed = Reservation::new(&*budget);
+        borrowed.charge(60).unwrap();
+        let failed = std::panic::catch_unwind(|| borrowed.into_shared(&sibling));
+        assert!(failed.is_err());
+        assert_eq!((budget.used(), sibling.used(), envelope.used()), (7, 0, 7));
+        assert_eq!(
+            (Arc::strong_count(&budget), Arc::strong_count(&sibling)),
+            (1, 1)
+        );
+        drop(unrelated);
+        assert_eq!(envelope.used(), 0);
+    }
+
+    /// A retagging transfer/adopt mutant gives an old token new credit and hides the
+    /// second deliberately uncharged probe. Compare separate measurements so the first
+    /// probe's peak cannot mask that false pass.
+    #[test]
+    fn a_shared_rebind_does_not_cover_a_new_probe_with_old_credit() {
+        if !crate::measure::alone() {
+            return;
+        }
+        let budget = Arc::new(Budget::new(4096));
+        let old = Scratch::<u8>::with_capacity(&*budget, 4096)
+            .unwrap()
+            .into_parts();
+        let probe = || {
+            let bytes = vec![0u8; 1024];
+            std::hint::black_box(&bytes);
+            drop(bytes);
+        };
+        let ((), before) = crate::measure::measure_within(&budget, probe);
+        let ((), after) = crate::measure::measure_within(&budget, || {
+            let pair = (old.0, old.1.into_shared(&budget));
+            probe();
+            drop(pair);
+        });
+        assert_eq!((before, after, budget.used()), (1024, 1024, 0));
+    }
+
     /// A worker that panics after other ranges are written leaves nothing behind: every
     /// item written is dropped once, the vector holds what it held, and the items' memory
     /// (charged to the budget, so a leak would stay charged) is all released. The text
@@ -988,6 +1204,151 @@ mod tests {
                 .unwrap();
         });
         assert_eq!((items.len(), excess), (101, 0));
+    }
+
+    /// A fill whose item fails stops its siblings and leaves nothing behind: every item
+    /// written is dropped once, the vector holds what it held, the items' memory is released,
+    /// and the error returned is the lowest index observed. Without a failure it publishes
+    /// every item.
+    #[test]
+    fn a_failing_parallel_fill_stops_and_drops_every_item_it_wrote() {
+        static MADE: AtomicUsize = AtomicUsize::new(0);
+        static DROPPED: AtomicUsize = AtomicUsize::new(0);
+        struct Item<'b>(#[allow(dead_code)] ChargedVec<u8, &'b Budget>);
+        impl Drop for Item<'_> {
+            fn drop(&mut self) {
+                DROPPED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let budget = Budget::unlimited();
+        let item = |i: usize, fails: &[usize]| {
+            if fails.contains(&i) {
+                return Err(i);
+            }
+            MADE.fetch_add(1, Ordering::SeqCst);
+            Ok(Item(ChargedVec::with_capacity(&budget, 100).unwrap()))
+        };
+        let fill = |threads: usize, fails: &[usize]| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let mut items: ChargedVec<Item<'_>, &Budget> = ChargedVec::new(&budget);
+            items.push(Item(ChargedVec::new(&budget))).unwrap();
+            let filled = items
+                .fill(100, |room| {
+                    pool.install(|| room.try_par_fill(100, |i| item(i, fails)))
+                })
+                .unwrap();
+            (filled, items.len())
+        };
+        // One thread: the ranges in order, so the failure at 60 stops everything after it.
+        assert_eq!(fill(1, &[60, 80]), (Err(60), 1));
+        assert_eq!(MADE.load(Ordering::SeqCst), 60);
+        assert_eq!(
+            DROPPED.load(Ordering::SeqCst),
+            60 + 1,
+            "each once, then the vector"
+        );
+        // Several threads: whichever failures were observed, the lowest is returned, and
+        // every item made is dropped once.
+        let made = MADE.load(Ordering::SeqCst);
+        let (filled, len) = fill(4, &[30, 70]);
+        assert!(matches!(filled, Err(30 | 70)), "{filled:?}");
+        assert_eq!(len, 1);
+        assert_eq!(
+            DROPPED.load(Ordering::SeqCst) - 61,
+            MADE.load(Ordering::SeqCst) - made + 1
+        );
+        assert_eq!(budget.used(), 0, "the items' memory released");
+        assert_eq!(fill(4, &[]), (Ok(()), 101));
+    }
+
+    /// Two failures both observed return the lower: items 2 and 6 of 8, a range each on two
+    /// workers (each half of the fill on its own), each waiting until the other has started,
+    /// for at most 5 seconds, so that neither stops the other first. And a worker that panics
+    /// while another fails unwinds out of the fill with every item made dropped once, the
+    /// vector as it was and the items' memory released (Sol, w1-step1 r1, F1).
+    #[test]
+    fn a_parallel_fill_returns_its_lowest_failure_and_unwinds_past_one() {
+        use std::time::{Duration, Instant};
+        static MADE: AtomicUsize = AtomicUsize::new(0);
+        static DROPPED: AtomicUsize = AtomicUsize::new(0);
+        struct Item<'b>(#[allow(dead_code)] ChargedVec<u8, &'b Budget>);
+        impl Drop for Item<'_> {
+            fn drop(&mut self) {
+                DROPPED.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let budget = Budget::unlimited();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let started = AtomicUsize::new(0);
+        let meet = || {
+            started.fetch_add(1, Ordering::SeqCst);
+            let since = Instant::now();
+            while started.load(Ordering::SeqCst) < 2 && since.elapsed() < Duration::from_secs(5) {
+                std::thread::yield_now();
+            }
+        };
+        let made = || {
+            MADE.fetch_add(1, Ordering::SeqCst);
+            Ok(Item(ChargedVec::with_capacity(&budget, 100).unwrap()))
+        };
+        let mut items: ChargedVec<Item<'_>, &Budget> = ChargedVec::new(&budget);
+        items.push(Item(ChargedVec::new(&budget))).unwrap();
+        let filled = items
+            .fill(8, |room| {
+                pool.install(|| {
+                    room.try_par_fill(8, |i| match i {
+                        2 | 6 => {
+                            meet();
+                            Err(i)
+                        }
+                        _ => made(),
+                    })
+                })
+            })
+            .unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 2, "both failures observed");
+        assert_eq!(filled, Err(2), "the lower of the two");
+        assert_eq!(items.len(), 1);
+        assert_eq!(DROPPED.load(Ordering::SeqCst), MADE.load(Ordering::SeqCst));
+        assert_eq!(budget.used(), items.charged(), "the items' memory released");
+        // Item 2 panics once item 6 has started, and item 6 fails.
+        started.store(0, Ordering::SeqCst);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            items.fill(8, |room| {
+                pool.install(|| {
+                    room.try_par_fill(8, |i| match i {
+                        2 => {
+                            meet();
+                            panic!("the worker at item 2 panics");
+                        }
+                        6 => {
+                            meet();
+                            Err(i)
+                        }
+                        _ => made(),
+                    })
+                })
+            })
+        }));
+        assert!(unwound.is_err(), "the panic unwinds out of the fill");
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            2,
+            "the failure observed too"
+        );
+        assert_eq!(items.len(), 1, "the vector as it was");
+        assert_eq!(
+            DROPPED.load(Ordering::SeqCst),
+            MADE.load(Ordering::SeqCst),
+            "each item made dropped once"
+        );
+        assert_eq!(budget.used(), items.charged(), "the items' memory released");
     }
 
     /// A charged vector never holds more than it was charged: every path that grows it
@@ -1084,6 +1445,42 @@ mod tests {
         assert_eq!(server.used(), 30);
         drop(second);
         assert_eq!((server.used(), server.peak()), (0, 100));
+    }
+
+    /// The process's budget above the queries' and maintenance's: each level refuses
+    /// what doesn't fit it, a refusal leaves nothing charged at any level, and what is
+    /// released is released all the way up.
+    #[test]
+    fn shared_budgets_nest_within_the_processs() {
+        let process = SharedBudget::new(100);
+        let queries = SharedBudget::within(80, Arc::clone(&process));
+        let query = Budget::new(usize::MAX).within(Some(Arc::clone(&queries)));
+        let maintenance = Budget::new(usize::MAX).within(Some(Arc::clone(&process)));
+        query.charge(70).unwrap();
+        assert_eq!((queries.used(), process.used()), (70, 70));
+        // The queries' own limit refuses, the process's is left as it was.
+        let err = query.charge(20).unwrap_err();
+        assert_eq!((err.shared, err.limit, err.used), (true, 80, 70));
+        assert_eq!((query.used(), queries.used(), process.used()), (70, 70, 70));
+        // Maintenance takes what the process has left; then the process refuses the
+        // queries what their own limit would allow.
+        maintenance.charge(25).unwrap();
+        assert_eq!((query.remaining(), queries.remaining()), (5, 5));
+        let err = query.charge(8).unwrap_err();
+        assert_eq!((err.shared, err.limit, err.used), (true, 100, 95));
+        assert_eq!(
+            (queries.used(), process.used()),
+            (70, 95),
+            "nothing charged"
+        );
+        assert!(query.bounded_by_shared());
+        // Released, and ended, all the way up.
+        query.release(30);
+        assert_eq!((queries.used(), process.used()), (40, 65));
+        drop(maintenance);
+        drop(query);
+        assert_eq!((queries.used(), process.used()), (0, 0));
+        assert_eq!((queries.peak(), process.peak()), (70, 95));
     }
 
     #[test]

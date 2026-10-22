@@ -16,6 +16,9 @@
 
 use std::borrow::Cow;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
 use rayon::prelude::*;
 
 /// A key as the dictionary hands it out: in place, or decoded ([`super::vocabulary`]).
@@ -54,11 +57,46 @@ pub(crate) fn text_of(key: &[u8]) -> Option<&[u8]> {
 /// sorted again by the next 8 bytes, until the runs are single entries or their texts end.
 /// RDF texts share long prefixes (`http://yago-knowledge.org/resource/`): a comparison
 /// sort met them in every one of its n·log n comparisons, reading both keys from the
-/// arena; here a prefix costs one read of each entry's key per 8 bytes. Transient memory:
-/// 16 bytes per entry (640 MB at DBpedia's 40 M terms), freed when the order is built.
+/// arena; here a prefix costs one read of each entry's key per 8 bytes, and a prefix a
+/// whole run shares is skipped at once ([`common`]). A run of at most [`FEW`] entries is
+/// finished by comparing the rest of its texts. The refinement loops along a run's texts
+/// rather than nesting a level per word (which overflowed the stack at texts of tens of
+/// kilobytes); runs split off are sorted in parallel, nested at most log2 of the entries
+/// deep ([`refine`]). Transient memory: 16 bytes per entry (640 MB at DBpedia's 40 M terms),
+/// freed when the order is built, and nothing per run; uncharged (a W1 site: the
+/// checkpoint's and the lazy order's build).
 pub(crate) fn sorted<'a, T>(
     range: std::ops::Range<u64>,
     key: &(dyn Fn(u64) -> Key<'a> + Sync),
+) -> Vec<T>
+where
+    T: Copy + Ord + Send + Into<u64> + TryFrom<u64>,
+{
+    sorted_reading(range, key, &Words::default())
+}
+
+/// The words of keys the refinement reads, counted under test only: the guard of
+/// [`refine`]'s bound. Product builds have nothing here and count nothing ([`count`]).
+#[cfg(test)]
+type Words = AtomicU64;
+#[cfg(not(test))]
+type Words = ();
+
+/// Adds `$n` words to the `Words` `$read`: under test; compiled out of product builds.
+macro_rules! count {
+    ($read:expr, $n:expr) => {
+        #[cfg(test)]
+        $read.fetch_add($n as u64, Relaxed);
+        #[cfg(not(test))]
+        let _: &Words = $read;
+    };
+}
+
+/// [`sorted`], the words of keys it reads added to `read`.
+fn sorted_reading<'a, T>(
+    range: std::ops::Range<u64>,
+    key: &(dyn Fn(u64) -> Key<'a> + Sync),
+    read: &Words,
 ) -> Vec<T>
 where
     T: Copy + Ord + Send + Into<u64> + TryFrom<u64>,
@@ -87,7 +125,8 @@ where
             Some(Entry::at(text, 0, index as u32, skip))
         })
         .collect();
-    refine(&mut entries, 0, key);
+    count!(read, entries.len());
+    refine(&mut entries, 0, key, read);
     entries
         .into_iter()
         .map(|entry| {
@@ -133,9 +172,35 @@ impl Entry {
     }
 }
 
-/// Sorts `entries`, whose texts agree on their first `depth · 8` bytes and whose words are
-/// those at `depth`.
-fn refine<'a>(entries: &mut [Entry], depth: usize, key: &(dyn Fn(u64) -> Key<'a> + Sync)) {
+/// The entries of a run that is finished by comparing its texts at any depth.
+const FEW: usize = 16;
+/// The entries from which a run's sort and its key reads go parallel.
+const PARALLEL: usize = 1 << 14;
+
+/// Sorts `run`, whose texts agree on their first `depth · 8` bytes and whose words are
+/// those at `depth`, by the rest of their texts, then their index; adds the words of keys
+/// it reads to `read`.
+///
+/// It loops along the run: the run sorted by its words, its runs of equal words whose
+/// texts go on are each sorted by their next words. The largest, if it holds more than
+/// half of the run, goes on in the loop; the others in parallel, each at most half of the
+/// run it came from, so nested at most log2 of the entries deep however long the texts
+/// (no depth limit and no stack per word). A run whose entries all share their word skips
+/// what they share at once ([`common`]).
+///
+/// Work: an entry's key is read for a word only while it is still in a run with another
+/// entry, so below its distinguishing prefix (the bytes up to where its text differs from
+/// every other, or ends); [`common`] reads at most about three times the words it skips.
+/// So O(Σ distinguishing prefixes) words of keys in all, read once each up to a constant,
+/// also for runs whose shared prefix shrinks a little at every level (a staircase of
+/// prefixes); plus each level's sort, O(m log m) comparisons of 16-byte entries for a run
+/// of m (texts that end in the same word compared by their length, a key read each).
+fn refine<'a>(
+    mut run: &mut [Entry],
+    mut depth: usize,
+    key: &(dyn Fn(u64) -> Key<'a> + Sync),
+    read: &Words,
+) {
     // Texts that end within this word come before those that go on (zero padding sorts
     // first); among equal words that both end, the shorter text first, then the index.
     let order = |a: &Entry, b: &Entry| {
@@ -150,27 +215,176 @@ fn refine<'a>(entries: &mut [Entry], depth: usize, key: &(dyn Fn(u64) -> Key<'a>
                 length(a).cmp(&length(b)).then(a.index.cmp(&b.index))
             })
     };
-    if entries.len() > 1 << 14 {
-        entries.par_sort_unstable_by(order);
-    } else {
-        entries.sort_unstable_by(order);
-    }
-    // Runs of equal words whose texts go on: by their next 8 bytes.
-    let runs: Vec<&mut [Entry]> = entries
-        .chunk_by_mut(|a, b| a.word == b.word && a.more() && b.more())
-        .filter(|run| run.len() > 1 && run[0].more())
-        .collect();
-    runs.into_par_iter().for_each(|run| {
-        for entry in run.iter_mut() {
-            let k = key(u64::from(entry.index));
-            *entry = Entry::at(
-                &k[entry.skip()..],
-                depth + 1,
-                entry.index,
-                entry.skip() as u32,
-            );
+    // Equal words whose texts go on: a run sorted by its next words.
+    let same = |a: &Entry, b: &Entry| a.word == b.word && a.more() && b.more();
+    while run.len() > 1 {
+        if run.len() > PARALLEL {
+            run.par_sort_unstable_by(order);
+        } else {
+            run.sort_unstable_by(order);
         }
-        refine(run, depth + 1, key);
+        if same(&run[0], &run[run.len() - 1]) {
+            depth = common(run, depth, key, read);
+            continue;
+        }
+        let largest = largest_run(run, same);
+        let at = run.as_ptr() as usize;
+        run.par_chunk_by_mut(same).for_each(|part| {
+            let start = (part.as_ptr() as usize - at) / size_of::<Entry>();
+            if part.len() > 1 && largest.is_none_or(|(first, _)| first != start) {
+                if part.len() <= FEW {
+                    finish(part, depth + 1, key);
+                } else {
+                    words_at(part, depth + 1, key, read);
+                    refine(part, depth + 1, key, read);
+                }
+            }
+        });
+        let Some((start, len)) = largest else {
+            return;
+        };
+        run = &mut std::mem::take(&mut run)[start..start + len];
+        depth += 1;
+        if run.len() <= FEW {
+            finish(run, depth, key);
+            return;
+        }
+        words_at(run, depth, key, read);
+    }
+}
+
+/// The run of `run`'s entries that `same` joins which holds more than half of them, if
+/// any: its start and length. Such a run holds the middle entry, so only the middle entry's
+/// run is measured, outward from it: not a pass over every run.
+fn largest_run(run: &[Entry], same: impl Fn(&Entry, &Entry) -> bool) -> Option<(usize, usize)> {
+    let middle = run.len() / 2;
+    let mut start = middle;
+    while start > 0 && same(&run[start - 1], &run[start]) {
+        start -= 1;
+    }
+    let mut end = middle + 1;
+    while end < run.len() && same(&run[end - 1], &run[end]) {
+        end += 1;
+    }
+    (2 * (end - start) > run.len()).then_some((start, end - start))
+}
+
+/// Reads the word at `depth` of every entry of `run` (each key once).
+fn words_at<'a>(
+    run: &mut [Entry],
+    depth: usize,
+    key: &(dyn Fn(u64) -> Key<'a> + Sync),
+    read: &Words,
+) {
+    let at = |entry: &mut Entry| {
+        let k = key(u64::from(entry.index));
+        *entry = Entry::at(&k[entry.skip()..], depth, entry.index, entry.skip() as u32);
+    };
+    if run.len() > PARALLEL {
+        run.par_iter_mut().for_each(at);
+    } else {
+        run.iter_mut().for_each(at);
+    }
+    count!(read, run.len());
+}
+
+/// [`words_at`], and whether the words are one and every text goes on, known in the same
+/// pass: each entry's word is compared with the first's as it is read.
+fn one_word_at<'a>(
+    run: &mut [Entry],
+    depth: usize,
+    key: &(dyn Fn(u64) -> Key<'a> + Sync),
+    read: &Words,
+) -> bool {
+    let at = |entry: &mut Entry| {
+        let k = key(u64::from(entry.index));
+        *entry = Entry::at(&k[entry.skip()..], depth, entry.index, entry.skip() as u32);
+    };
+    at(&mut run[0]);
+    let (word, more) = (run[0].word, run[0].more());
+    // Every word is read: the comparisons never stop the pass early.
+    let same = |entry: &mut Entry| {
+        at(entry);
+        entry.word == word && entry.more()
+    };
+    let one = match run.len() > PARALLEL {
+        true => run[1..]
+            .par_iter_mut()
+            .map(same)
+            .reduce(|| true, |a, b| a && b),
+        // Counted, not `all`: that would stop at the first other word, leaving the rest unread.
+        false => run[1..].iter_mut().map(same).filter(|&one| !one).count() == 0,
+    };
+    count!(read, run.len());
+    more && one
+}
+
+/// Skips the prefix every text of `run` shares, past its first `(depth + 1) · 8` bytes
+/// (its words, at `depth`, are one and its texts go on): returns the depth reached, the
+/// entries' words read at it. The next two words are read one at a time (most shared
+/// prefixes end in them); past them the texts are compared with the first entry's in
+/// windows of 16, 32, 64, … bytes until one differs, then the words past the shared bytes
+/// are read. The windows read at most about three times the bytes they skip, plus 16, per
+/// entry: never what an entry shares with the first one beyond the run's shared prefix,
+/// which a single pass to the first difference would read again at every level where the
+/// run's shared prefix shrinks by a word.
+fn common<'a>(
+    run: &mut [Entry],
+    mut depth: usize,
+    key: &(dyn Fn(u64) -> Key<'a> + Sync),
+    read: &Words,
+) -> usize {
+    for _ in 0..2 {
+        depth += 1;
+        if !one_word_at(run, depth, key, read) {
+            return depth;
+        }
+    }
+    let first = key(u64::from(run[0].index));
+    let theirs = &first[run[0].skip()..];
+    let mut known = (depth + 1) * 8;
+    let mut window = 16;
+    loop {
+        let window_of_theirs = &theirs[known..theirs.len().min(known + window)];
+        let shared = |entry: &Entry| {
+            let k = key(u64::from(entry.index));
+            let text = k.get(entry.skip() + known..).unwrap_or_default();
+            let shared = text
+                .iter()
+                .zip(window_of_theirs)
+                .take_while(|(a, b)| a == b)
+                .count();
+            // The words compared, the differing one included.
+            count!(read, shared / 8 + 1);
+            shared
+        };
+        let least = match run.len() > PARALLEL {
+            true => run.par_iter().map(&shared).min(),
+            false => run.iter().map(&shared).min(),
+        }
+        .unwrap_or(0);
+        known += least;
+        if least < window {
+            break;
+        }
+        window *= 2;
+    }
+    words_at(run, known / 8, key, read);
+    known / 8
+}
+
+/// Sorts `entries`, whose texts agree on their first `depth · 8` bytes and go on past them,
+/// by the rest of their texts, then their index: the order [`refine`] gives (a text that
+/// is a prefix of another comes first).
+fn finish<'a>(entries: &mut [Entry], depth: usize, key: &(dyn Fn(u64) -> Key<'a> + Sync)) {
+    fn rest<'k>(key: &'k [u8], entry: &Entry, depth: usize) -> &'k [u8] {
+        key.get(entry.skip() + depth * 8..).unwrap_or_default()
+    }
+    entries.sort_unstable_by(|a, b| {
+        let (ka, kb) = (key(u64::from(a.index)), key(u64::from(b.index)));
+        rest(&ka, a, depth)
+            .cmp(rest(&kb, b, depth))
+            .then(a.index.cmp(&b.index))
     });
 }
 
@@ -255,8 +469,9 @@ mod tests {
     use super::*;
 
     /// The radix refinement against a plain sort by (text, index): texts sharing long
-    /// prefixes, ending on and around 8-byte boundaries, containing zero bytes, and equal
-    /// texts under different tags; enough of them for the parallel branches.
+    /// prefixes (past the windows a run's shared prefix is skipped by), ending on and
+    /// around 8-byte boundaries, containing zero bytes, and equal texts under different
+    /// tags; enough of them for the parallel branches.
     #[test]
     fn the_word_radix_order_is_the_text_order() {
         let mut seed = 0x2026_1003_u64;
@@ -266,17 +481,19 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             (seed >> 33) % n
         };
-        let stems: [&[u8]; 4] = [
+        let long = b"http://e/".repeat(32);
+        let stems: [&[u8]; 5] = [
             b"http://yago-knowledge.org/resource/",
             b"http://e/",
             b"",
             b"ab\0",
+            &long,
         ];
         let tags: [&[u8]; 4] = [b"I", b"S", b"Len\0", b"Lde\0"];
         let mut keys: Vec<Vec<u8>> = Vec::new();
         for _ in 0..40_000 {
             let mut key = tags[next(4) as usize].to_vec();
-            key.extend_from_slice(stems[next(4) as usize]);
+            key.extend_from_slice(stems[next(5) as usize]);
             for _ in 0..next(20) {
                 key.push(b"ab\0z"[next(4) as usize]);
             }
@@ -294,6 +511,86 @@ mod tests {
                 .then(a.cmp(&b))
         });
         assert_eq!(got, expected);
+    }
+
+    /// A staircase of prefixes: texts leaving the run one by one, eight words apart, beside
+    /// a block sharing 512 words. The order is the text order, and the words of keys read
+    /// stay within a constant of the distinguishing prefixes, where reading to the first
+    /// difference at every level reads the block's shared prefix again at each step.
+    #[test]
+    fn a_staircase_of_prefixes_reads_each_word_a_bounded_number_of_times() {
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for i in 0..400 {
+            keys.push(
+                [
+                    &b"S"[..],
+                    &b"wwwwwwww".repeat(512),
+                    format!("{i:08}").as_bytes(),
+                ]
+                .concat(),
+            );
+        }
+        for k in 0..400 {
+            keys.push([&b"S"[..], &b"wwwwwwww".repeat(8 * k + 8), b"xxxxxxxx"].concat());
+        }
+        let key = |i: u64| Cow::Borrowed(keys[i as usize].as_slice());
+        let read = AtomicU64::new(0);
+        let got: Vec<u64> = sorted_reading(0..keys.len() as u64, &key, &read);
+        let read = read.into_inner();
+        let text = |i: u64| text_of(&keys[i as usize]).unwrap();
+        let mut expected: Vec<u64> = (0..keys.len() as u64).collect();
+        expected.sort_by(|&a, &b| text(a).cmp(text(b)).then(a.cmp(&b)));
+        assert_eq!(got, expected);
+        // Each text's distinguishing prefix: its words up to where it differs from both
+        // neighbours in the order.
+        let shared = |a: u64, b: u64| {
+            text(a)
+                .iter()
+                .zip(text(b))
+                .take_while(|(x, y)| x == y)
+                .count()
+        };
+        let distinguishing: usize = (0..got.len())
+            .map(|p| {
+                let before = p.checked_sub(1).map_or(0, |q| shared(got[q], got[p]));
+                let after = got.get(p + 1).map_or(0, |&next| shared(got[p], next));
+                before.max(after) / 8 + 1
+            })
+            .sum();
+        assert!(
+            read <= 4 * distinguishing as u64,
+            "{read} words read, {distinguishing} distinguishing"
+        );
+    }
+
+    /// The run holding more than half of a run's entries is found wherever it lies (the
+    /// refinement's nesting bound rests on it), and none where no run does.
+    #[test]
+    fn the_run_over_half_is_found_from_the_middle() {
+        let runs = |sizes: &[usize]| -> Vec<Entry> {
+            let words = sizes
+                .iter()
+                .enumerate()
+                .flat_map(|(w, &n)| std::iter::repeat_n(w as u64, n));
+            words
+                .map(|word| Entry {
+                    word,
+                    index: 0,
+                    skip: MORE,
+                })
+                .collect()
+        };
+        let same = |a: &Entry, b: &Entry| a.word == b.word && a.more() && b.more();
+        for (sizes, expected) in [
+            (&[6, 1, 2][..], Some((0, 6))),
+            (&[1, 6, 2], Some((1, 6))),
+            (&[2, 1, 6], Some((3, 6))),
+            (&[3, 3, 3], None),
+            (&[4, 4], None),
+            (&[1, 1, 1, 1, 1], None),
+        ] {
+            assert_eq!(largest_run(&runs(sizes), same), expected, "{sizes:?}");
+        }
     }
 
     #[test]

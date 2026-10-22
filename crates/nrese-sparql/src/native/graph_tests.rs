@@ -106,7 +106,7 @@ fn construct_checks_rows_and_wide_templates_even_when_no_triple_is_emitted() {
         };
         let template = vec![template[0].clone(); width];
         let checks = std::cell::Cell::new(0);
-        let mut triples = construct(&snapshot, ctx.computed.take(), solutions, &template, || {
+        let mut triples = construct(&snapshot, ctx.take_computed(), solutions, &template, || {
             checks.set(checks.get() + 1);
             if checks.get() == 3 {
                 Err(QueryEvaluationError::Cancelled.into())

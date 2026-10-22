@@ -1,6 +1,6 @@
 use std::sync::{Arc, RwLock};
 
-use nrese_reasoner::ReasonerService;
+use nrese_reasoner::{ReasonerConfig, ReasonerService};
 
 use super::attribution::attribute_reject_delta;
 use super::command::{MutationCommand, MutationCommitReport};
@@ -48,24 +48,11 @@ pub struct MutationPipeline {
     retired: std::sync::atomic::AtomicBool,
 }
 
-/// The statements `tx` inserts or deletes, asserted and inferred, as reasoner facts.
-fn touched(tx: &nrese_engine::Transaction<'_>) -> Vec<nrese_reasoner::ir::Triple> {
-    let quads = tx.inserted().chain(tx.deleted());
-    let mut facts: Vec<nrese_reasoner::ir::Triple> = quads
-        .map(|q| [q.subject.raw(), q.predicate.raw(), q.object.raw()])
-        .chain(
-            tx.inferred_inserted()
-                .chain(tx.inferred_deleted())
-                .map(|t| [t.subject.raw(), t.predicate.raw(), t.object.raw()]),
-        )
-        .collect();
-    facts.sort_unstable();
-    facts.dedup();
-    facts
-}
-
 impl MutationPipeline {
-    pub fn new(store: Arc<StoreService>, reasoner: Arc<ReasonerService>) -> Self {
+    /// The write path of `store`, reasoning as `reasoning` says: the pipeline builds its
+    /// reasoner from the typed configuration, so no caller constructs one.
+    pub fn new(store: Arc<StoreService>, reasoning: ReasonerConfig) -> Self {
+        let reasoner = Arc::new(ReasonerService::new(reasoning));
         store.use_reasoning_rules(reasoner.config().materialised_program());
         store.use_dl(
             reasoner.config().mode().is_dl(),
@@ -347,7 +334,7 @@ impl MutationPipeline {
             // What the commit touched, for the support graph sets kept for readers under
             // graph access (only while there are any).
             let supports = self.store.supports();
-            let touched = supports.wants_commits().then(|| touched(&tx));
+            let touched = supports.wants_commits().then(|| supports.touched(&tx));
             let before = tx.base().revision();
             let summary = tx.commit().map_err(|error| MutationError::Store {
                 kind,
