@@ -24,10 +24,16 @@
 //!
 //! Memory: an evaluation's working set (the closure's store, the sets, a round's
 //! derivations) is not charged before it is allocated; it reports its size to a
-//! [`Watch`] at round boundaries and stops when the watch refuses (the reading query's
-//! envelope), or when the process passes its memory limit. A temporary exemption, shared
-//! with the materialiser's working set, until the reasoner's working set is charged
-//! (notes/2026-10-20-executor-admission-design.md, W1 site "reasoner fixpoint").
+//! [`Watch`] and stops when the watch refuses (the reading query's envelope, which its
+//! cancellation stops too), or when the process passes its memory limit. A round merges
+//! what its derivations give per head as it is found, and its parallel tasks report
+//! between derivations, with room for what they can add before their next report
+//! ([`round`]): a round holds its heads' annotations, never one entry per derivation. A
+//! temporary exemption, shared with the materialiser's working set, until the reasoner's
+//! working set is charged (notes/2026-10-20-executor-admission-design.md, W1 site
+//! "reasoner fixpoint").
+
+mod round;
 
 use std::borrow::Cow;
 
@@ -36,7 +42,7 @@ use rayon::prelude::*;
 
 use super::batch::Store;
 use super::eval::{
-    GroundProgram, Grounding, Job, Seg, Source, derivations, instantiate_head, transitivity,
+    GroundProgram, Grounding, Job, Poller, Seg, Source, derivations, instantiate_head, transitivity,
 };
 use super::ir::{Head, Rule, Triple};
 
@@ -107,6 +113,15 @@ fn check(watch: Watch<'_>, bytes: usize) -> Result<(), Stopped> {
 /// The bytes a hash map of `capacity` entries of `(K, V)` holds in its table.
 fn table_bytes<K, V>(capacity: usize) -> usize {
     capacity * (size_of::<(K, V)>() + 1)
+}
+
+/// The most words past two any set of `sets` holds: a union holds no more than its
+/// longest part, so no set an evaluation from them makes holds more.
+fn set_heap<'a>(sets: impl Iterator<Item = &'a Annotation>) -> usize {
+    sets.flat_map(|annotation| annotation.sets.iter())
+        .map(GraphSet::heap_bytes)
+        .max()
+        .unwrap_or(0)
 }
 
 /// A set of graphs (indices into the caller's graph list) as a bitset: inline up to 128
@@ -261,7 +276,8 @@ fn minimal(mut sets: Vec<GraphSet>, cap: usize) -> Annotation {
 /// The support graph sets of every fact of the closure `facts` under `program`.
 /// `graphs_of` gives an asserted fact's graphs (none for an inferred one); `axioms`
 /// (sorted) hold in no graph, for every reader (a ruleset's axiomatic triples); `cap`
-/// bounds the sets kept per fact. `watch` sees the working set's bytes after each round.
+/// bounds the sets kept per fact. `watch` sees the working set's bytes during each round
+/// and after it ([`round`]).
 pub fn support_sets(
     facts: &[Triple],
     program: &GroundProgram,
@@ -346,6 +362,7 @@ pub fn support_sets(
         fixed + table_bytes::<Triple, Annotation>(sets.capacity()) + annotations
     };
     check(watch, held(&sets, annotations))?;
+    let unit = round::unit_bytes(set_heap(sets.values()));
     let mut changed: Vec<Triple> = sets.keys().copied().collect();
     let mut first = true;
     while !changed.is_empty() {
@@ -363,21 +380,36 @@ pub fn support_sets(
             changed: &delta,
         };
         // Every instance with a premise among the changed facts, with every premise's
-        // current sets (an instance found twice adds the same sets twice, harmlessly):
-        // jobs in parallel morsels, each emitting (head, set, whether the instance's sets
-        // are truncated) triples.
-        let mut found: Vec<(Triple, GraphSet, bool)> = Vec::new();
+        // current sets, merged per head as found ([`round::Heads`]): a set a kept one is
+        // contained in is no news, and only its mark (a new one) is kept.
+        let news = round::Heads::new(cap);
+        let sets_now = &sets;
+        let add = |part: &mut round::HeadsPart, fact: Triple, from: &Annotation| -> u32 {
+            let (kept, truncated) = sets_now
+                .get(&fact)
+                .map_or((&[][..], false), |a| (a.sets.as_slice(), a.truncated));
+            let mut units = 0;
+            for set in &from.sets {
+                if kept.iter().any(|k| k.is_subset(set)) {
+                    if from.truncated && !truncated {
+                        part.mark(fact);
+                    }
+                    continue;
+                }
+                part.add(fact, set.clone(), from.truncated, cap);
+                units += 1;
+            }
+            units
+        };
+        let mut bodiless_part = round::HeadsPart::default();
         for fact in delta_facts(&delta) {
             for &bodiless in bodiless_by_premise.get(&fact).into_iter().flatten() {
                 let grounding = Grounding::Bodiless(bodiless);
-                let from = grounding_sets(program, grounding, &sets, cap, &empty);
-                found.extend(
-                    from.sets
-                        .into_iter()
-                        .map(|set| (bodiless, set, from.truncated)),
-                );
+                let from = grounding_sets(program, grounding, sets_now, cap, &empty);
+                add(&mut bodiless_part, bodiless, &from);
             }
         }
+        round::Gather::absorb(&news, bodiless_part);
         let mut jobs: Vec<(Job<'_>, &[super::ir::Atom], Annotation)> = Vec::new();
         for (k, &(rule, grounding)) in rules.iter().enumerate() {
             // The schema facts' part, once per rule and round: the minimal sets over the
@@ -416,12 +448,23 @@ pub fn support_sets(
                     .map(move |start| (j, start..(start + MORSEL).min(job.drivers())))
             })
             .collect();
-        let sets_now = &sets;
-        found.par_extend(tasks.par_iter().flat_map_iter(|(j, range)| {
+        // What the round holds beside its tasks' parts: the sets, its delta and its jobs.
+        let base = held(sets_now, annotations)
+            + delta.bytes().total()
+            + jobs.capacity() * size_of::<(Job<'_>, &[super::ir::Atom], Annotation)>()
+            + tasks.capacity() * size_of::<(usize, std::ops::Range<usize>)>();
+        let polling = round::Polling::new(watch, base, unit);
+        round::run(&tasks, &news, &polling, &|(j, range), part, tick| {
+            let stop = || polling.stopped(&news);
+            let Some(mut poll) = Poller::new(&stop) else {
+                return;
+            };
             let (job, heads, schema) = &jobs[*j];
-            let mut out = Vec::new();
             let mut body = Vec::with_capacity(job.rule.body.len());
-            job.run(&source, range.clone(), &mut |bindings| {
+            job.run(&source, range.clone(), &mut poll, &mut |bindings| {
+                if tick.done() {
+                    return;
+                }
                 body.clear();
                 body.extend(
                     job.rule
@@ -430,63 +473,37 @@ pub fn support_sets(
                         .map(|atom| super::eval::instantiate_head(atom, bindings)),
                 );
                 let from = premise_sets_from(&body, schema, sets_now, cap);
+                let mut units = 1;
                 for head in heads.iter() {
                     let fact = super::eval::instantiate_head(head, bindings);
-                    out.extend(
-                        from.sets
-                            .iter()
-                            .map(|set| (fact, set.clone(), from.truncated)),
-                    );
+                    units += add(part, fact, &from);
                 }
+                tick.tick(units, part.bytes());
             });
-            out
-        }));
-        // The round's peak: its derivations and its delta beside the sets.
-        let round = found.capacity() * size_of::<(Triple, GraphSet, bool)>()
-            + found
-                .iter()
-                .map(|(_, set, _)| set.heap_bytes())
-                .sum::<usize>()
-            + delta.bytes().total()
-            + jobs.capacity() * size_of::<(Job<'_>, &[super::ir::Atom], Annotation)>()
-            + tasks.capacity() * size_of::<(usize, std::ops::Range<usize>)>();
-        check(watch, held(&sets, annotations) + round)?;
+        })
+        .map_err(stopped)?;
         drop((jobs, tasks));
-        // Per head: its new sets merged into its old ones.
-        found.par_sort_unstable();
-        found.dedup();
-        let mut starts: Vec<usize> = (0..found.len())
-            .filter(|&i| i == 0 || found[i - 1].0 != found[i].0)
-            .collect();
-        starts.push(found.len());
-        // In parallel against the sets as they are; then the changes written back. A
-        // change of the mark alone is news too: the facts derived from it are marked.
-        let updates: Vec<(Triple, Annotation)> = starts
-            .par_windows(2)
-            .filter_map(|w| {
-                let group = &found[w[0]..w[1]];
-                let fact = group[0].0;
+        // Per head: its new sets merged into its old ones, in parallel against the sets
+        // as they are; then the changes written back. A change of the mark alone is news
+        // too: the facts derived from it are marked.
+        let found: Vec<(Triple, Annotation)> = news.into_heads().collect();
+        let gathered = found.capacity() * size_of::<(Triple, Annotation)>()
+            + found.iter().map(|(_, a)| a.heap_bytes()).sum::<usize>();
+        check(watch, held(&sets, annotations) + gathered)?;
+        let updates: Vec<(Triple, Annotation)> = found
+            .into_par_iter()
+            .filter_map(|(fact, news)| {
                 let (kept, truncated) = sets
                     .get(&fact)
                     .map_or((&[][..], false), |a| (a.sets.as_slice(), a.truncated));
-                let marks = group.iter().any(|&(_, _, marked)| marked);
-                // Nothing new: every found set is covered by a kept one, no new mark.
-                if (truncated || !marks)
-                    && group
-                        .iter()
-                        .all(|(_, set, _)| kept.iter().any(|k| k.is_subset(set)))
-                {
-                    return None;
-                }
                 let mut all = kept.to_vec();
-                all.extend(group.iter().map(|(_, set, _)| set.clone()));
+                all.extend(news.sets);
                 let mut next = minimal(all, cap);
-                next.truncated |= truncated || marks;
+                next.truncated |= truncated || news.truncated;
                 (next.sets.as_slice() != kept || next.truncated != truncated)
                     .then_some((fact, next))
             })
             .collect();
-        drop((found, starts));
         for (fact, next) in updates {
             annotations += next.heap_bytes();
             if let Some(old) = sets.insert(fact, next) {
@@ -538,6 +555,16 @@ pub fn derived_otherwise<S: Source + ?Sized>(
     axioms: &[Triple],
     fact: Triple,
 ) -> bool {
+    derived_otherwise_polled(source, program, axioms, fact, &mut Poller::never())
+}
+
+fn derived_otherwise_polled<S: Source + ?Sized>(
+    source: &S,
+    program: &GroundProgram,
+    axioms: &[Triple],
+    fact: Triple,
+    poll: &mut Poller<'_>,
+) -> bool {
     if axioms.binary_search(&fact).is_ok() {
         return true;
     }
@@ -551,10 +578,10 @@ pub fn derived_otherwise<S: Source + ?Sized>(
     if program.bodiless.contains(&fact) && grounded(Grounding::Bodiless(fact)) {
         return true;
     }
-    let derives = |rule: &Rule| {
+    let mut derives = |rule: &Rule| {
         let mut found = false;
         let mut body = Vec::with_capacity(rule.body.len());
-        derivations(source, rule, fact, Seg::All, &mut |bindings| {
+        derivations(source, rule, fact, Seg::All, poll, &mut |bindings| {
             body.clear();
             body.extend(
                 rule.body
@@ -643,11 +670,26 @@ pub fn rederived<S: Source + Sync + ?Sized>(
     watch: Watch<'_>,
 ) -> Result<(Vec<Triple>, Vec<Triple>), Stopped> {
     check(watch, size_of_val(candidates))?;
-    let one_step: Vec<Triple> = candidates
-        .par_iter()
-        .copied()
-        .filter(|&fact| derived_otherwise(source, program, axioms, fact))
-        .collect();
+    let one_step = round::Facts::new(usize::MAX);
+    let chunks: Vec<&[Triple]> = candidates.chunks(MORSEL).collect();
+    let polling = round::Polling::new(watch, size_of_val(candidates), round::unit_bytes(0));
+    round::run(&chunks, &one_step, &polling, &|chunk, part, tick| {
+        let stop = || polling.stopped(&one_step);
+        let Some(mut poll) = Poller::new(&stop) else {
+            return;
+        };
+        for &fact in chunk.iter() {
+            if derived_otherwise_polled(source, program, axioms, fact, &mut poll) {
+                part.insert(fact);
+            }
+            if poll.stopped() || !tick.tick(1, table_bytes::<Triple, ()>(part.capacity())) {
+                return;
+            }
+        }
+    })
+    .map_err(stopped)?;
+    let mut one_step = one_step.into_facts();
+    one_step.par_sort_unstable();
     check(
         watch,
         (candidates.len() + 2 * one_step.capacity()) * size_of::<Triple>(),
@@ -715,7 +757,7 @@ fn body_rules(program: &GroundProgram) -> Vec<(std::borrow::Cow<'_, Rule>, Groun
 
 /// `touched` and every fact of `source` a derivation of which (by `rules`) uses one of
 /// them, transitively. `None` once it reaches a fact of `schema` or passes `limit` facts.
-/// `watch` sees `fixed` and what it holds after each round.
+/// `watch` sees `fixed` and what it holds during each round and after it ([`round`]).
 fn forward_cone<S: Source + Sync + ?Sized>(
     source: &S,
     rules: &[(&Rule, Grounding)],
@@ -729,6 +771,7 @@ fn forward_cone<S: Source + Sync + ?Sized>(
     if affected.iter().any(|fact| schema.contains(fact)) {
         return Ok(None);
     }
+    let unit = round::unit_bytes(0);
     let mut frontier: Vec<Triple> = affected.iter().copied().collect();
     while !frontier.is_empty() {
         frontier.sort_unstable();
@@ -737,32 +780,98 @@ fn forward_cone<S: Source + Sync + ?Sized>(
             all: source,
             changed: &delta,
         };
-        let heads = instances(&changed, rules, &|k, bindings, out| {
-            let rule = rules[k].0;
-            if let Head::Facts(heads) = &rule.head {
-                out.extend(heads.iter().map(|head| instantiate_head(head, bindings)));
-            }
+        let (jobs, tasks) = delta_jobs(&changed, rules);
+        // The heads not reached yet, each once, merged as found.
+        let reached = round::Facts::new(limit.saturating_sub(affected.len()));
+        let base = fixed + table_bytes::<Triple, ()>(affected.capacity()) + delta.bytes().total();
+        let polling = round::Polling::new(watch, base, unit);
+        let affected_now = &affected;
+        let ran = round::run(&tasks, &reached, &polling, &|(j, range), part, tick| {
+            let stop = || polling.stopped(&reached);
+            let Some(mut poll) = Poller::new(&stop) else {
+                return;
+            };
+            let (k, job) = &jobs[*j];
+            let Head::Facts(heads) = &rules[*k].0.head else {
+                return;
+            };
+            job.run(&changed, range.clone(), &mut poll, &mut |bindings| {
+                if tick.done() {
+                    return;
+                }
+                for head in heads {
+                    let fact = instantiate_head(head, bindings);
+                    if !affected_now.contains(&fact) {
+                        part.insert(fact);
+                    }
+                }
+                tick.tick(1, table_bytes::<Triple, ()>(part.capacity()));
+            });
         });
+        match ran {
+            Ok(()) => {}
+            Err(round::End::Over) => return Ok(None),
+            Err(round::End::Stopped(why)) => return Err(why),
+        }
+        for head in reached.into_facts() {
+            if schema.contains(&head) {
+                return Ok(None);
+            }
+            affected.insert(head);
+            frontier.push(head);
+        }
         check(
             watch,
-            fixed
-                + table_bytes::<Triple, ()>(affected.capacity())
-                + delta.bytes().total()
-                + heads.capacity() * size_of::<Triple>(),
+            fixed + table_bytes::<Triple, ()>(affected.capacity()),
         )?;
-        for head in heads {
-            if affected.insert(head) {
-                if schema.contains(&head) {
-                    return Ok(None);
-                }
-                frontier.push(head);
-            }
-        }
         if affected.len() > limit {
             return Ok(None);
         }
     }
     Ok(Some(affected))
+}
+
+/// How a round's work ended early, as an evaluation reports it: only a stop can (its
+/// state has no limit).
+fn stopped(end: round::End) -> Stopped {
+    match end {
+        round::End::Stopped(why) => why,
+        round::End::Over => unreachable!("a round without a limit"),
+    }
+}
+
+/// The jobs of every instance of `rules` (by index) with a premise among `source`'s delta
+/// facts, and their parallel tasks: morsels of a job's drivers.
+#[allow(clippy::type_complexity)]
+fn delta_jobs<'r, S: Source + ?Sized>(
+    source: &S,
+    rules: &[(&'r Rule, Grounding)],
+) -> (Vec<(usize, Job<'r>)>, Vec<(usize, std::ops::Range<usize>)>) {
+    let jobs: Vec<(usize, Job<'r>)> = rules
+        .iter()
+        .enumerate()
+        .flat_map(|(k, &(rule, _))| {
+            (0..rule.body.len()).filter_map(move |i| {
+                Job::new(
+                    source,
+                    rule,
+                    i,
+                    |j| if j == i { Seg::Delta } else { Seg::All },
+                )
+                .map(|job| (k, job))
+            })
+        })
+        .collect();
+    let tasks = jobs
+        .iter()
+        .enumerate()
+        .flat_map(|(j, (_, job))| {
+            (0..job.drivers())
+                .step_by(MORSEL)
+                .map(move |start| (j, start..(start + MORSEL).min(job.drivers())))
+        })
+        .collect();
+    (jobs, tasks)
 }
 
 /// A change of the closure, for [`update_support_sets`].
@@ -790,7 +899,7 @@ pub struct Change<'a, S: ?Sized> {
 /// same schema facts as the one before (the caller compares
 /// [`GroundProgram::schema_premises`]). `Ok(None)` when the change reaches a schema
 /// fact, or affects more than `change.limit` facts: then [`support_sets`] computes them
-/// all. `watch` sees the working set's bytes after each round.
+/// all. `watch` sees the working set's bytes during each round and after it ([`round`]).
 ///
 /// The affected facts start again from their own graphs, unmarked unless those alone
 /// pass the cap (a mark is a fact of one fixpoint: kept across a change, a mark whose
@@ -863,29 +972,41 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
         .map(|(k, &(_, grounding))| (grounding, k))
         .collect();
     let premises_in_closure = |body: &[Triple]| body.iter().all(|&p| (change.in_closure)(p));
-    // Every derivation of every affected fact, against the sets as they start.
-    let found: Vec<(Triple, Annotation)> = {
+    let unit = round::unit_bytes(set_heap(now.values()));
+    // Every derivation of every affected fact, against the sets as they start: chunks of
+    // the facts in parallel, each fact's sets merged as its derivations are found.
+    let found = round::Heads::new(cap);
+    {
         let lookup = Recomputing {
             now: &now,
             affected: &affected,
             previous: change.previous,
         };
         let list: Vec<Triple> = members.iter().copied().collect();
-        list.par_iter()
-            .map(|&fact| {
+        let chunks: Vec<&[Triple]> = list.chunks(MORSEL).collect();
+        let polling = round::Polling::new(watch, held(&now, annotations), unit);
+        round::run(&chunks, &found, &polling, &|chunk, part, tick| {
+            let stop = || polling.stopped(&found);
+            let Some(mut poll) = Poller::new(&stop) else {
+                return;
+            };
+            for &fact in chunk.iter() {
                 let mut from = Annotation::default();
+                let part_bytes = part.bytes();
                 let mut take = |found: Annotation| {
                     from.truncated |= found.truncated;
-                    from.sets.extend(found.sets);
+                    let units = found.sets.len() as u32 + 1;
+                    for set in found.sets {
+                        round::add_set(&mut from, set, cap);
+                    }
+                    tick.tick(units, part_bytes + from.heap_bytes())
                 };
                 if program.bodiless.contains(&fact) {
-                    take(grounding_sets(
-                        program,
-                        Grounding::Bodiless(fact),
-                        &lookup,
-                        cap,
-                        &empty,
-                    ));
+                    let found =
+                        grounding_sets(program, Grounding::Bodiless(fact), &lookup, cap, &empty);
+                    if !take(found) {
+                        return;
+                    }
                 }
                 let mut groundings: Vec<Grounding> = program
                     .producers(fact)
@@ -904,23 +1025,36 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
                         continue;
                     }
                     let mut body = Vec::with_capacity(rule.body.len());
-                    derivations(change.source, rule, fact, Seg::All, &mut |bindings| {
-                        body.clear();
-                        body.extend(
-                            rule.body
-                                .iter()
-                                .map(|atom| instantiate_head(atom, bindings)),
-                        );
-                        if premises_in_closure(&body) {
-                            take(premise_sets_from(&body, schema, &lookup, cap));
-                        }
-                        false
-                    });
+                    let mut going = true;
+                    derivations(
+                        change.source,
+                        rule,
+                        fact,
+                        Seg::All,
+                        &mut poll,
+                        &mut |bindings| {
+                            body.clear();
+                            body.extend(
+                                rule.body
+                                    .iter()
+                                    .map(|atom| instantiate_head(atom, bindings)),
+                            );
+                            if premises_in_closure(&body) {
+                                going = take(premise_sets_from(&body, schema, &lookup, cap));
+                            }
+                            !going
+                        },
+                    );
+                    if !going || poll.stopped() {
+                        return;
+                    }
                 }
-                (fact, from)
-            })
-            .collect()
-    };
+                part.put(fact, from, cap);
+            }
+        })
+        .map_err(stopped)?;
+    }
+    let found: Vec<(Triple, Annotation)> = found.into_heads().collect();
     check(
         watch,
         held(&now, annotations)
@@ -941,99 +1075,68 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
             all: change.source,
             changed: &delta,
         };
-        let found = {
+        // Every instance with a premise among the changed facts, merged per head as found.
+        let gathered = round::Heads::new(cap);
+        {
             let lookup = Recomputing {
                 now: &now,
                 affected: &affected,
                 previous: change.previous,
             };
-            instances(&source, &rules, &|k, bindings, out| {
-                let rule = rules[k].0;
-                let Head::Facts(heads) = &rule.head else {
+            let (jobs, tasks) = delta_jobs(&source, &rules);
+            let base = held(&now, annotations) + delta.bytes().total();
+            let polling = round::Polling::new(watch, base, unit);
+            round::run(&tasks, &gathered, &polling, &|(j, range), part, tick| {
+                let stop = || polling.stopped(&gathered);
+                let Some(mut poll) = Poller::new(&stop) else {
                     return;
                 };
-                let body: Vec<Triple> = rule
-                    .body
-                    .iter()
-                    .map(|atom| instantiate_head(atom, bindings))
-                    .collect();
-                if !premises_in_closure(&body) {
+                let (k, job) = &jobs[*j];
+                let Head::Facts(heads) = &rules[*k].0.head else {
                     return;
-                }
-                let from = premise_sets_from(&body, &schemas[k], &lookup, cap);
-                for head in heads {
-                    let fact = instantiate_head(head, bindings);
-                    if members.contains(&fact) && !from.is_empty() {
-                        out.push((fact, from.clone()));
+                };
+                let mut body = Vec::with_capacity(job.rule.body.len());
+                job.run(&source, range.clone(), &mut poll, &mut |bindings| {
+                    if tick.done() {
+                        return;
                     }
-                }
+                    body.clear();
+                    body.extend(
+                        job.rule
+                            .body
+                            .iter()
+                            .map(|atom| instantiate_head(atom, bindings)),
+                    );
+                    let mut units = 1;
+                    if premises_in_closure(&body) {
+                        let from = premise_sets_from(&body, &schemas[*k], &lookup, cap);
+                        for head in heads {
+                            let fact = instantiate_head(head, bindings);
+                            if members.contains(&fact) && !from.is_empty() {
+                                units += from.sets.len() as u32;
+                                part.put(fact, from.clone(), cap);
+                            }
+                        }
+                    }
+                    tick.tick(units, part.bytes());
+                });
             })
-        };
+            .map_err(stopped)?;
+        }
+        let found: Vec<(Triple, Annotation)> = gathered.into_heads().collect();
         check(
             watch,
             held(&now, annotations)
-                + delta.bytes().total()
                 + found.capacity() * size_of::<(Triple, Annotation)>()
                 + found.iter().map(|(_, a)| a.heap_bytes()).sum::<usize>(),
         )?;
-        let mut by_fact: HashMap<Triple, Annotation> = HashMap::new();
         for (fact, from) in found {
-            let entry = by_fact.entry(fact).or_default();
-            entry.truncated |= from.truncated;
-            entry.sets.extend(from.sets);
-        }
-        for (fact, from) in by_fact {
             if merge(&mut now, fact, from, cap, &mut annotations) {
                 changed.push(fact);
             }
         }
     }
     Ok(Some(now))
-}
-
-/// What `emit` makes of every instance of `rules` (by index) with a premise among
-/// `source`'s delta facts, the instances in parallel morsels.
-fn instances<S, T, E>(source: &S, rules: &[(&Rule, Grounding)], emit: &E) -> Vec<T>
-where
-    S: Source + Sync + ?Sized,
-    T: Send,
-    E: Fn(usize, &[Option<u64>], &mut Vec<T>) + Sync,
-{
-    let jobs: Vec<(usize, Job<'_>)> = rules
-        .iter()
-        .enumerate()
-        .flat_map(|(k, &(rule, _))| {
-            (0..rule.body.len()).filter_map(move |i| {
-                Job::new(
-                    source,
-                    rule,
-                    i,
-                    |j| if j == i { Seg::Delta } else { Seg::All },
-                )
-                .map(|job| (k, job))
-            })
-        })
-        .collect();
-    let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
-        .iter()
-        .enumerate()
-        .flat_map(|(j, (_, job))| {
-            (0..job.drivers())
-                .step_by(MORSEL)
-                .map(move |start| (j, start..(start + MORSEL).min(job.drivers())))
-        })
-        .collect();
-    tasks
-        .par_iter()
-        .flat_map_iter(|(j, range)| {
-            let (k, job) = &jobs[*j];
-            let mut out = Vec::new();
-            job.run(source, range.clone(), &mut |bindings| {
-                emit(*k, bindings, &mut out)
-            });
-            out
-        })
-        .collect()
 }
 
 /// Every fact of `store`.

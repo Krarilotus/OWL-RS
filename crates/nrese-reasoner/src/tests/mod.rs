@@ -1484,7 +1484,9 @@ fn delta_equality_equals_rematerialisation() {
 }
 
 /// A materialisation stops when asked, at any poll, and a stop that never fires
-/// changes nothing (completion plan 1.7).
+/// changes nothing (completion plan 1.7). A stop that fires at one poll only (the
+/// process's memory limit reads true, then false once memory is freed) never ends it as
+/// complete with less than the closure.
 #[test]
 fn materialisation_stops_when_asked() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1493,7 +1495,7 @@ fn materialisation_stops_when_asked() {
     // most do, and a seed that draws one that doesn't draws another (at most ten), so
     // that the test never depends on the seed's luck.
     let mut drawn = 0;
-    let (groups, rules, lists, schema, total) = loop {
+    let (groups, rules, lists, schema, total, full) = loop {
         drawn += 1;
         let lines = random_ontology(&mut next);
         let mut vocabulary = LocalVocabulary::default();
@@ -1523,7 +1525,7 @@ fn materialisation_stops_when_asked() {
         assert_eq!(again.derived, full.derived);
         let total = polls.load(Ordering::Relaxed);
         if total > 2 || drawn == 10 {
-            break (groups, rules, lists, schema, total);
+            break (groups, rules, lists, schema, total, full);
         }
     };
     assert!(total > 2, "{total} polls in {drawn} ontologies");
@@ -1535,6 +1537,18 @@ fn materialisation_stops_when_asked() {
                 .is_err(),
             "stopped at poll {at}"
         );
+    }
+    for at in 0..total {
+        let seen = AtomicUsize::new(0);
+        let once = || seen.fetch_add(1, Ordering::Relaxed) == at;
+        if let Ok(result) =
+            batch::materialise_grouped_until(groups.clone(), &rules, Some(&lists), &schema, &once)
+        {
+            assert_eq!(
+                result.derived, full.derived,
+                "stopped at poll {at} only, then not: published as complete"
+            );
+        }
     }
 }
 
@@ -2534,4 +2548,180 @@ _:l33a rdf:rest _:l33b"#,
             "{policy:?}: extra {extra:?}, missing {missing:?}"
         );
     }
+}
+
+/// A rederivation that finds nothing can try a product of the body's matches: the only
+/// derivation of a fact between two complete components is deleted, and its three-link chain
+/// joins every partial path inside one component before the last link fails. Once the
+/// update's stop fires, the search ends within its poll interval, not after the product
+/// (review N10 r1, F2).
+#[test]
+fn a_failing_rederivation_stops_within_its_poll_interval() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::delta::{Base, Interrupted, MemoryBase, Rules, update_until};
+    use super::ir::parse_rules;
+
+    /// A base that counts the facts its scans hand out.
+    struct Counting {
+        base: MemoryBase,
+        scanned: AtomicUsize,
+    }
+    impl Base for Counting {
+        fn scan(&self, pattern: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
+            self.base.scan(pattern, &mut |fact| {
+                self.scanned.fetch_add(1, Ordering::Relaxed);
+                f(fact);
+            });
+        }
+        fn estimate(&self, pattern: [Option<u64>; 3]) -> usize {
+            self.base.estimate(pattern)
+        }
+        fn contains(&self, fact: Triple) -> bool {
+            self.base.contains(fact)
+        }
+        fn is_asserted(&self, fact: Triple) -> bool {
+            self.base.is_asserted(fact)
+        }
+    }
+
+    let n = 100;
+    let mut vocabulary = LocalVocabulary::default();
+    let rules = parse_rules(
+        "chain: (?a rdfs:seeAlso ?b), (?b rdfs:seeAlso ?c), (?c rdfs:seeAlso ?d) -> (?a rdfs:isDefinedBy ?d)",
+        &mut vocabulary,
+    )
+    .unwrap();
+    let schema = Schema::owl(&mut vocabulary);
+    let compiled = Rules {
+        rules: &rules,
+        lists: None,
+        schema: &schema,
+    };
+    let mut text = Vec::new();
+    for component in ["a", "b"] {
+        for i in 0..n {
+            for j in 0..n {
+                text.push(format!("ex:{component}{i} rdfs:seeAlso ex:{component}{j}"));
+            }
+        }
+    }
+    let asserted = load(&mut vocabulary, &text.join("\n"));
+    let deleted = load(&mut vocabulary, "ex:a0 rdfs:isDefinedBy ex:b0");
+    let base = Counting {
+        base: MemoryBase::new(&asserted, &[]),
+        scanned: AtomicUsize::new(0),
+    };
+    let fires = 1000;
+    let stop = || base.scanned.load(Ordering::Relaxed) >= fires;
+    let result = update_until(&base, &[], &deleted, compiled, None, &stop);
+    assert_eq!(result.err(), Some(Interrupted));
+    let scanned = base.scanned.load(Ordering::Relaxed);
+    let bound = fires + nrese_exec::POLL_UNITS as usize + 3 * n;
+    assert!(
+        scanned <= bound,
+        "{scanned} facts scanned (bound {bound}; the failed search tries {})",
+        n + n * n
+    );
+}
+
+/// A backward proof (B/F deletion) that finds nothing can try a product of a body's matches
+/// too: deleting the seed of a fact between two complete components leaves it an
+/// overdeletion candidate, and the prover searches its chain derivation again over the old
+/// state. Once the update's stop fires during that search, the search ends within its poll
+/// interval (review N10 fix check, R1-F2's B/F path).
+#[test]
+fn a_failing_backward_proof_stops_within_its_poll_interval() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::delta::{Base, Interrupted, MemoryBase, Rules, update_until};
+    use super::ir::parse_rules;
+
+    /// A base that counts the facts its scans hand out.
+    struct Counting {
+        base: MemoryBase,
+        scanned: AtomicUsize,
+        target: Triple,
+        assertion_checks: AtomicUsize,
+        proving_at: AtomicUsize,
+    }
+    impl Base for Counting {
+        fn scan(&self, pattern: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
+            self.base.scan(pattern, &mut |fact| {
+                self.scanned.fetch_add(1, Ordering::Relaxed);
+                f(fact);
+            });
+        }
+        fn estimate(&self, pattern: [Option<u64>; 3]) -> usize {
+            self.base.estimate(pattern)
+        }
+        fn contains(&self, fact: Triple) -> bool {
+            self.base.contains(fact)
+        }
+        fn is_asserted(&self, fact: Triple) -> bool {
+            if fact == self.target && self.assertion_checks.fetch_add(1, Ordering::Relaxed) == 1 {
+                self.proving_at
+                    .store(self.scanned.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            self.base.is_asserted(fact)
+        }
+    }
+
+    let n = 100;
+    let mut vocabulary = LocalVocabulary::default();
+    let rules = parse_rules(
+        "chain: (?a rdfs:seeAlso ?b), (?b rdfs:seeAlso ?c), (?c rdfs:seeAlso ?d) -> (?a rdfs:isDefinedBy ?d)\n\
+         seed: (?a rdfs:comment ?b) -> (?a rdfs:isDefinedBy ?b)",
+        &mut vocabulary,
+    )
+    .unwrap();
+    let schema = Schema::owl(&mut vocabulary);
+    let compiled = Rules {
+        rules: &rules,
+        lists: None,
+        schema: &schema,
+    };
+    let mut text = Vec::new();
+    for component in ["a", "b"] {
+        for i in 0..n {
+            for j in 0..n {
+                text.push(format!("ex:{component}{i} rdfs:seeAlso ex:{component}{j}"));
+            }
+        }
+    }
+    let asserted = load(&mut vocabulary, &text.join("\n"));
+    let deleted = load(&mut vocabulary, "ex:a0 rdfs:comment ex:b0");
+    let inferred = load(&mut vocabulary, "ex:a0 rdfs:isDefinedBy ex:b0");
+    let base = || Counting {
+        base: MemoryBase::new(&asserted, &inferred),
+        scanned: AtomicUsize::new(0),
+        target: inferred[0],
+        assertion_checks: AtomicUsize::new(0),
+        proving_at: AtomicUsize::new(usize::MAX),
+    };
+    // The whole update: the overdeletion filter's search, then the prover's.
+    let whole = base();
+    update_until(&whole, &[], &deleted, compiled, None, &|| false).expect("never stopped");
+    let total = whole.scanned.load(Ordering::Relaxed);
+    assert!(total > 2 * n * n, "{total}: both searches run in full");
+    let proving_at = whole.proving_at.load(Ordering::Relaxed);
+    assert_ne!(proving_at, usize::MAX, "the inferred candidate reaches B/F");
+    eprintln!("B/F starts at {proving_at}, whole update scans {total}");
+    // The candidate is checked once for overdeletion and again by Prover::prove.
+    // Arm only at the latter check; a total/2 threshold can land in phase 2 instead.
+    let stopped = base();
+    let stop = || {
+        let at = stopped.proving_at.load(Ordering::Relaxed);
+        at != usize::MAX && stopped.scanned.load(Ordering::Relaxed) >= at + 1000
+    };
+    let result = update_until(&stopped, &[], &deleted, compiled, None, &stop);
+    assert_eq!(result.err(), Some(Interrupted));
+    let scanned = stopped.scanned.load(Ordering::Relaxed);
+    let at = stopped.proving_at.load(Ordering::Relaxed);
+    assert_ne!(at, usize::MAX, "the stopped update reaches B/F");
+    let bound = at + 1000 + nrese_exec::POLL_UNITS as usize + 3 * n;
+    assert!(
+        scanned <= bound,
+        "{scanned} facts scanned (bound {bound}; the whole update scans {total})"
+    );
 }
