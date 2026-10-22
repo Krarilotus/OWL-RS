@@ -407,7 +407,14 @@ impl Shared {
                 wal.rotate(snapshot.revision() + 1)?;
                 snapshot
             };
-            let path = checkpoint::write(durable.root(), &snapshot, self.admission.as_ref())?;
+            // A checkpoint copies a revision already committed: whether its file is in place
+            // or not, recovery reaches the same state, so a publication whose outcome is
+            // unknown returns its error without poisoning the WAL, and releases no segment
+            // (they stay the source of that revision). Only publishing a new revision
+            // poisons on an unknown outcome ([`super::bulk`]).
+            let path = checkpoint::write(durable.root(), &snapshot, self.admission.as_ref())?
+                .commit()
+                .map_err(checkpoint::Uncommitted::into_error)?;
             self.checkpoints.fetch_add(1, Ordering::Relaxed);
             durable.wal.lock().release_through(snapshot.revision())?;
             (snapshot, path)
@@ -750,7 +757,9 @@ impl Engine {
     pub fn write_image(&self, dir: &std::path::Path) -> EngineResult<ImageInfo> {
         let shared = &self.inner.shared;
         let snapshot = shared.snapshot();
-        let path = crate::durability::checkpoint::write(dir, &snapshot, shared.admission.as_ref())?;
+        let path = crate::durability::checkpoint::write(dir, &snapshot, shared.admission.as_ref())?
+            .commit()
+            .map_err(crate::durability::checkpoint::Uncommitted::into_error)?;
         let version = snapshot.version();
         Ok(ImageInfo {
             path,

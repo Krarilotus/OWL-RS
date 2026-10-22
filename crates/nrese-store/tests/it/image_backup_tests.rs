@@ -115,12 +115,61 @@ fn an_image_and_the_log_restore_a_later_revision() {
     assert_eq!(at, *revisions.last().unwrap());
 }
 
+/// A restore carries each segment's sidecar along: a segment written under EveryCommit whose
+/// synced last record is damaged is refused after the restore, as in place, not truncated
+/// as a write that never landed.
+#[test]
+fn a_restored_segment_keeps_its_sync_policy() {
+    let data = tempdir().unwrap();
+    let backups = tempdir().unwrap();
+    let store = StoreService::new(StoreConfig::on_disk(data.path())).unwrap();
+    let insert = |n: u32| {
+        store
+            .execute_update_str(&format!(
+                "INSERT DATA {{ <http://example.com/s{n}> <http://example.com/p> {n} }}"
+            ))
+            .unwrap()
+    };
+    insert(1);
+    let dir = backups.path().join("image");
+    store.backup_image(&dir).unwrap();
+    insert(2);
+    insert(3);
+    drop(store);
+    let wal = data.path().join("wal");
+    let segment = fs::read_dir(&wal)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "wal"))
+        .max()
+        .unwrap();
+    // A byte in the middle of the last frame (frames: `len u32 | crc u32 | payload`).
+    let mut bytes = fs::read(&segment).unwrap();
+    let (mut at, mut last) = (8, 8);
+    while at < bytes.len() {
+        last = at;
+        at += 8 + u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    }
+    bytes[last + 12] ^= 1;
+    fs::write(&segment, bytes).unwrap();
+    let target = backups.path().join("restored");
+    let restored = nrese_store::restore_until(&dir, &target, &[wal], None, None);
+    assert!(
+        restored
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("intact through revision")),
+        "{restored:?}"
+    );
+}
+
 /// Pruning the archive keeps what a restore after a revision needs.
 #[test]
 fn pruning_the_archive_keeps_the_segments_after_a_revision() {
     let archive = tempdir().unwrap();
     for first in [1u64, 5, 9, 14] {
         fs::write(archive.path().join(format!("{first:020}.wal")), b"x").unwrap();
+        // Its sidecar goes with it.
+        fs::write(archive.path().join(format!("{first:020}.wal.meta")), b"x").unwrap();
     }
     fs::write(archive.path().join("other.txt"), b"x").unwrap();
     // Revision 9 on: the segment from 9 and the newest stay; 1..=4 and 5..=8 go.
@@ -137,7 +186,9 @@ fn pruning_the_archive_keeps_the_segments_after_a_revision() {
         left,
         [
             "00000000000000000009.wal",
+            "00000000000000000009.wal.meta",
             "00000000000000000014.wal",
+            "00000000000000000014.wal.meta",
             "other.txt"
         ]
     );

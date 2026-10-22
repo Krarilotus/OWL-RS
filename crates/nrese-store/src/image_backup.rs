@@ -93,7 +93,10 @@ pub(crate) fn backup_image(
     let json = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| StoreError::Configuration(error.to_string()))?;
     let path = dir.join(MANIFEST);
-    fs::write(&path, json).map_err(|e| io(e, &path))?;
+    // Written beside it and placed durably, as the image is: a restore reads it first.
+    let partial = path.with_extension("json.tmp");
+    fs::write(&partial, json).map_err(|e| io(e, &partial))?;
+    nrese_engine::place_file(&partial, &path).map_err(|e| io(e, &path))?;
     Ok(manifest)
 }
 
@@ -164,8 +167,8 @@ pub fn restore_until(
             .get(i + 1)
             .is_none_or(|(next, _)| *next > manifest.revision + 1);
         if after_image {
-            let target = wal.join(path.file_name().expect("segment name"));
-            fs::copy(path, &target).map_err(|e| io(e, path))?;
+            // With its sidecar: the sync policy its recovery reads.
+            nrese_engine::copy_log_segment(path, &wal)?;
         }
     }
     let config = nrese_engine::EngineConfig {
@@ -235,7 +238,7 @@ pub fn place_image(
     let target = data_dir.join(&name);
     let partial = data_dir.join(format!("{name}.restoring"));
     fs::copy(image, &partial).map_err(|e| io(e, image))?;
-    fs::rename(&partial, &target).map_err(|e| io(e, &target))?;
+    nrese_engine::place_file(&partial, &target).map_err(|e| io(e, &target))?;
     Ok(manifest)
 }
 
@@ -262,7 +265,7 @@ pub fn prune_wal_archive(archive: &Path, revision: u64) -> StoreResult<usize> {
         // A segment's records end where the next segment's begin.
         let ((_, path), (next_first, _)) = (&pair[0], &pair[1]);
         if *next_first <= revision {
-            fs::remove_file(path).map_err(|e| io(e, path))?;
+            nrese_engine::remove_log_segment(path)?;
             removed += 1;
         }
     }

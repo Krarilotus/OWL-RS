@@ -115,7 +115,7 @@ impl Engine {
         'segments: for (path, mut file) in segments {
             // The active segment may grow while it is read: its complete records count,
             // up to `latest`.
-            let contents = wal::read_open_segment(&mut file, &path)?;
+            let contents = wal::read_open_segment(&mut file, &path, after)?;
             for record in contents.records {
                 oldest.get_or_insert(record.revision);
                 if record.revision < expected {
@@ -160,7 +160,7 @@ impl Engine {
                     record
                 }
                 Frame::End => break,
-                Frame::Invalid => {
+                Frame::Short | Frame::Damaged(_) => {
                     return Err(EngineError::Corruption(format!(
                         "an invalid log record at byte {pos} of a replicated batch"
                     )));

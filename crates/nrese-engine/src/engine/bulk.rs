@@ -20,6 +20,18 @@
 //! Instead, a checkpoint of the new revision is written *before* the revision is published,
 //! so nothing is ever visible that a crash could lose. Its cost is O(dataset), which is why
 //! small changes should use transactions.
+//!
+//! The commit point ([`commit_image`], shared by every bulk publication) is the
+//! checkpoint's rename into place with its directory synced; a restart recovers the new
+//! revision exactly from then on. Before it comes everything that can fail: the WAL starts
+//! a new segment (a failure poisons it), the image is written and synced under a temporary
+//! name, and mapped. A failure there is reported and commits nothing. A failed directory
+//! sync (or a failed rename with the file in place) leaves the outcome to the next open:
+//! the WAL is poisoned, so nothing can reuse the revision meanwhile, and the error is
+//! [`EngineError::CommitUnknown`]. After it, the version is installed and the load
+//! succeeds even if releasing covered WAL segments or removing older checkpoints fails
+//! (logged; a checkpoint of a later revision retries: one of the same revision finds its
+//! file in place and does nothing).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -36,7 +48,7 @@ use crate::index::keys::PackedKeys;
 use crate::index::run::{PermutationBuilder, Run};
 use crate::index::{IndexVersion, Layout};
 use crate::quad::{EncodedQuad, EncodedTriple, Permutation, QuadPattern};
-use crate::term::dictionary::BatchScratch;
+use crate::term::dictionary::{Base, BatchScratch};
 use crate::term::pending::Pending;
 
 /// Batches copied between releases of their memory ([`crate::memory`]): about 256 MiB at
@@ -58,13 +70,15 @@ pub enum BulkMode {
 /// it interned stay unreferenced in the dictionary, as with an aborted transaction.
 pub struct BulkLoad<'e> {
     engine: &'e Inner,
+    /// Started with the first spilled chunk; held while one is handed over. Declared
+    /// before `_slot`: fields drop in order, so an aborted load's spilling thread has
+    /// stopped (and removed its chunks) before the writer slot goes to the next load.
+    spiller: Mutex<Option<Spiller>>,
     _slot: MutexGuard<'e, ()>,
     mode: BulkMode,
     batches: Mutex<Batches>,
     /// Quads per spilled chunk, if the load spills past its memory budget.
     chunk: Option<usize>,
-    /// Started with the first spilled chunk; held while one is handed over.
-    spiller: Mutex<Option<Spiller>>,
     /// Spilling failed (setting it up, or the thread): the load fails at `finish`.
     spill_failed: Mutex<Option<std::io::Error>>,
     /// The new terms, numbered at `finish`.
@@ -96,11 +110,11 @@ impl<'e> BulkLoad<'e> {
             .map(|budget| (budget as usize / 3 / size_of::<EncodedQuad>()).max(1));
         Self {
             engine,
+            spiller: Mutex::new(None),
             _slot: slot,
             mode,
             batches: Mutex::default(),
             chunk,
-            spiller: Mutex::new(None),
             spill_failed: Mutex::new(None),
             pending: Pending::default(),
             added: std::sync::atomic::AtomicU32::new(0),
@@ -160,7 +174,7 @@ impl<'e> BulkLoad<'e> {
             return;
         }
         if spiller.is_none() {
-            match Spiller::start(durable.root()) {
+            match Spiller::start(durable.root(), durable.next_spill_load()) {
                 Ok(started) => *spiller = Some(started),
                 Err(error) => {
                     *self.spill_failed.lock() = Some(error);
@@ -191,12 +205,14 @@ impl<'e> BulkLoad<'e> {
         if self.spiller.lock().is_some() {
             self.spill(true);
         }
+        // Locals drop in reverse order: `spiller`, bound after `_slot`, stops first on an
+        // early return.
         let Self {
             engine,
             _slot,
+            spiller,
             mode,
             batches,
-            spiller,
             spill_failed,
             pending,
             scratch,
@@ -435,9 +451,10 @@ enum Next {
 }
 
 /// Installs `next` as the latest version, the bulk way: in durable mode a checkpoint of it
-/// is written first, so no WAL record is needed, and with `map_checkpoints` the version
-/// installed is the checkpoint's, mapped (same content: memory then holds what queries
-/// touch, as after a restart). The caller holds the writer and compaction slots.
+/// is written first ([`commit_image`]), so no WAL record is needed, and with
+/// `map_checkpoints` the version installed is the checkpoint's, mapped (same content:
+/// memory then holds what queries touch, as after a restart). The caller holds the writer
+/// and compaction slots.
 fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     let shared = &engine.shared;
     let next = match next {
@@ -453,63 +470,51 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
         }
     };
     let next = Arc::new(next);
-    match &shared.durable {
-        Some(durable) => {
-            let revision = next.revision;
-            let _checkpoint = durable.checkpoint_slot.lock();
-            let image = Snapshot::new(
-                Arc::clone(&next),
-                Arc::clone(&shared.dictionary),
-                Arc::clone(&shared.statistics),
-                None,
-                Arc::clone(&shared.views.read()),
-            );
-            let path = checkpoint::write(durable.root(), &image, shared.admission.as_ref())?;
-            shared
-                .checkpoints
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let Some(durable) = &shared.durable else {
+        shared.versions.install(next);
+        return Ok(());
+    };
+    let image = Snapshot::new(
+        Arc::clone(&next),
+        Arc::clone(&shared.dictionary),
+        Arc::clone(&shared.statistics),
+        None,
+        Arc::clone(&shared.views.read()),
+    );
+    commit_image(
+        engine,
+        durable,
+        next.revision,
+        || {
+            let written = checkpoint::write(durable.root(), &image, shared.admission.as_ref());
             drop(image);
-            let mut base = None;
-            let next = match durable
-                .config
-                .map_checkpoints
-                .then(|| checkpoint::map_written(&path))
-            {
-                Some(Ok((dictionary, [asserted, inferred]))) => {
-                    base = Some(dictionary);
+            written
+        },
+        |written| {
+            if !durable.config.map_checkpoints {
+                return Ok((next, None));
+            }
+            Ok(match checkpoint::map_written(written) {
+                Ok((dictionary, [asserted, inferred])) => (
                     Arc::new(Version {
                         // The same statements, mapped from the checkpoint.
                         content: next.content,
                         asserted,
                         inferred,
                         equality: Arc::clone(&next.equality),
-                        revision,
+                        revision: next.revision,
                         dictionary_len: next.dictionary_len,
                         canonical: Default::default(),
-                    })
-                }
-                Some(Err(error)) => {
+                    }),
+                    Some(dictionary),
+                ),
+                Err(error) => {
                     tracing::warn!(%error, "checkpoint not mapped; data stays in memory");
-                    next
+                    (next, None)
                 }
-                None => next,
-            };
-            // The checkpoint covers every logged revision: later commits start a new
-            // segment, and all older segments can go.
-            let mut wal = durable.wal.lock();
-            wal.rotate(revision + 1)?;
-            shared.versions.install(next);
-            release_covered(&mut wal, durable.root(), revision);
-            drop(wal);
-            if let Some(base) = base
-                && let Err(error) = shared.dictionary.rebase(base)
-            {
-                tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
-            }
-        }
-        None => shared.versions.install(next),
-    }
-    Ok(())
+            })
+        },
+    )
 }
 
 /// [`publish`] of [`Next::Streamed`]: the checkpoint written from `source`, the asserted
@@ -544,77 +549,102 @@ fn publish_streamed(
         publish(engine, Next::Built(next))?;
         return Ok(len);
     };
-    let _checkpoint = durable.checkpoint_slot.lock();
-    let empty = PackedKeys::from_sorted(&[]);
     // Every layout has SPOG: its length is the number of quads.
     let mut len = 0;
-    let path = checkpoint::write_parts(
-        durable.root(),
-        shared.admission.as_ref(),
+    commit_image(
+        engine,
+        durable,
         revision,
-        &shared.dictionary,
-        dictionary_len,
-        [layout, Layout::DefaultGraph],
-        &mut |stack, permutation| {
-            Ok(match stack {
-                Stack::Asserted => {
-                    let packed = source.packed(permutation)?;
-                    if permutation == Permutation::Spog {
-                        len = packed.len() as u64;
-                    }
-                    std::borrow::Cow::Owned(packed)
-                }
-                Stack::Inferred => std::borrow::Cow::Borrowed(&empty),
-            })
+        || {
+            let empty = PackedKeys::from_sorted(&[]);
+            let written = checkpoint::write_parts(
+                durable.root(),
+                shared.admission.as_ref(),
+                revision,
+                &shared.dictionary,
+                dictionary_len,
+                [layout, Layout::DefaultGraph],
+                &mut |stack, permutation| {
+                    Ok(match stack {
+                        Stack::Asserted => {
+                            let packed = source.packed(permutation)?;
+                            if permutation == Permutation::Spog {
+                                len = packed.len() as u64;
+                            }
+                            std::borrow::Cow::Owned(packed)
+                        }
+                        Stack::Inferred => std::borrow::Cow::Borrowed(&empty),
+                    })
+                },
+            );
+            // A spill's files go before the image is mapped.
+            drop(source);
+            written
         },
-    );
-    drop(source);
-    let path = path?;
-    shared
-        .checkpoints
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (base, [asserted, inferred]) = match checkpoint::map_written(&path) {
-        Ok(mapped) => mapped,
-        Err(error) => {
-            // Nothing else holds the data: the load fails, and the checkpoint goes so that
-            // a restart doesn't recover what was never published.
-            let _ = std::fs::remove_file(&path);
-            return Err(error);
-        }
-    };
-    let next = Arc::new(Version {
-        content: super::Content::fresh(),
-        asserted,
-        inferred,
-        revision,
-        dictionary_len,
-        equality: Default::default(),
-        canonical: Default::default(),
-    });
-    let mut wal = durable.wal.lock();
-    wal.rotate(revision + 1)?;
-    shared.versions.install(next);
-    release_covered(&mut wal, durable.root(), revision);
-    drop(wal);
-    if let Err(error) = shared.dictionary.rebase(base) {
-        tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
-    }
+        // Nothing else holds the data: if it can't be mapped, the load fails.
+        |written| {
+            let (base, [asserted, inferred]) = checkpoint::map_written(written)?;
+            let next = Arc::new(Version {
+                content: super::Content::fresh(),
+                asserted,
+                inferred,
+                revision,
+                dictionary_len,
+                equality: Default::default(),
+                canonical: Default::default(),
+            });
+            Ok((next, Some(base)))
+        },
+    )?;
     Ok(len)
 }
 
-/// Removes what a published checkpoint at `revision` covers: the log segments before it and
-/// the older checkpoints. After the version is installed this is cleanup, not part of the
-/// commit, which has happened (its checkpoint is written and synced): a failure keeps those
-/// files, which recovery skips (the newest checkpoint and the records after it count), and the
-/// next checkpoint that writes removes them. Returning it would report a published commit as
-/// failed.
-fn release_covered(wal: &mut crate::durability::wal::Wal, root: &std::path::Path, revision: u64) {
+/// The commit protocol of every bulk publication of `revision` (module docs): `write`
+/// writes the checkpoint under its temporary name, `prepare` makes the version to install
+/// from the written file (and the dictionary base to map, if any). The caller holds the
+/// writer and compaction slots, so nothing else commits or appends meanwhile.
+fn commit_image(
+    engine: &Inner,
+    durable: &crate::durability::Durable,
+    revision: u64,
+    write: impl FnOnce() -> EngineResult<checkpoint::Written>,
+    prepare: impl FnOnce(&std::path::Path) -> EngineResult<(Arc<Version>, Option<Base>)>,
+) -> EngineResult<()> {
+    let shared = &engine.shared;
+    let _checkpoint = durable.checkpoint_slot.lock();
+    // Later records go to a new segment whether this commits or not (its name is a lower
+    // bound): every older segment is then covered by the checkpoint.
+    durable.wal.lock().rotate(revision)?;
+    let written = write()?;
+    shared
+        .checkpoints
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (next, base) = prepare(written.tmp())?;
+    // The commit point.
+    match written.commit() {
+        Ok(_) => {}
+        Err(checkpoint::Uncommitted::No(error)) => return Err(error),
+        Err(checkpoint::Uncommitted::Unknown(cause)) => {
+            durable.wal.lock().poison();
+            return Err(EngineError::CommitUnknown { revision, cause });
+        }
+    }
+    let mut wal = durable.wal.lock();
+    shared.versions.install(next);
+    // Committed: what follows is housekeeping, retried by a checkpoint of a later revision.
     if let Err(error) = wal.release_through(revision) {
-        tracing::warn!(%error, revision, "log segments the checkpoint covers kept for now; the next checkpoint releases them");
+        tracing::warn!(%error, revision, "bulk load committed; covered WAL segments stay for now");
     }
-    if let Err(error) = checkpoint::remove_older_than(root, revision) {
-        tracing::warn!(%error, revision, "older checkpoints kept for now; the next checkpoint removes them");
+    drop(wal);
+    if let Some(base) = base
+        && let Err(error) = shared.dictionary.rebase(base)
+    {
+        tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
     }
+    if let Err(error) = checkpoint::remove_older_than(durable.root(), revision) {
+        tracing::warn!(%error, revision, "bulk load committed; older checkpoints stay for now");
+    }
+    Ok(())
 }
 
 /// A rematerialisation in progress: the reasoner reads [`base`](Self::base), computes the
@@ -718,5 +748,150 @@ impl<'e> Rematerialisation<'e> {
         );
         engine.after_commit(0);
         Ok(summary)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::durability::fault::{self, Step};
+    use crate::{BulkMode, Engine, EngineConfig, EngineError};
+    use nrese_rdf::{GraphName, NamedNode, Quad};
+
+    /// An explicit checkpoint whose publication's outcome is unknown copies a committed
+    /// revision either way: it fails, releases no WAL segment and leaves the WAL writable
+    /// (only publishing a new revision poisons). The scoped rule of Sol r1 R3.
+    #[test]
+    fn an_unknown_checkpoint_publication_fails_without_poisoning_or_releasing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        };
+        let engine = Engine::open(dir.path(), config.clone()).unwrap();
+        let mut tx = engine.transaction();
+        tx.insert(quad("before").as_ref());
+        tx.commit().unwrap();
+        let first_segment = dir.path().join("wal").join(format!("{:020}.wal", 1));
+        fault::fail_at(Step::DirSync);
+        assert!(engine.checkpoint().is_err());
+        assert!(
+            first_segment.exists(),
+            "the segment holding revision 1 was released"
+        );
+        let mut tx = engine.transaction();
+        tx.insert(quad("after").as_ref());
+        assert_eq!(tx.commit().unwrap().revision, 2);
+        drop(engine);
+        let reopened = Engine::open(dir.path(), config).unwrap();
+        assert_eq!(reopened.snapshot().revision(), 2);
+        assert_eq!(reopened.stats().quads, 2);
+    }
+
+    fn quad(name: &str) -> Quad {
+        let iri = |s: String| NamedNode::new_unchecked(s);
+        Quad::new(
+            iri(format!("http://s/{name}")),
+            iri("http://p".into()),
+            iri("http://o".into()),
+            GraphName::DefaultGraph,
+        )
+    }
+
+    /// How a bulk publication failing at a step must end.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Outcome {
+        /// An error; nothing changed, and the WAL takes the next commit.
+        NotCommitted,
+        /// As `NotCommitted`, but the WAL refuses commits until reopened.
+        NotCommittedPoisoned,
+        /// `CommitUnknown`: the WAL refuses commits, and the load shows on reopening.
+        Unknown,
+        /// Success: the load is live and durable.
+        Committed,
+    }
+
+    /// A fault at each step of the bulk commit protocol, for a built (an append to a
+    /// nonempty store) and a streamed (a replacement) publication: the response, the live
+    /// revision, whether the next ordinary commit is accepted, and that a restart recovers
+    /// exactly what was reported (the next commit included: no revision is used twice).
+    #[test]
+    fn a_fault_at_each_step_of_a_bulk_commit_ends_consistently() {
+        use Outcome::*;
+        let rows = [
+            (Step::Rotate, NotCommittedPoisoned, NotCommittedPoisoned),
+            (Step::Write, NotCommitted, NotCommitted),
+            // Built, the data stays in memory; streamed, nothing else holds it.
+            (Step::Map, Committed, NotCommitted),
+            (Step::Rename, NotCommitted, NotCommitted),
+            (Step::DirSync, Unknown, Unknown),
+            (Step::Release, Committed, Committed),
+            (Step::RemoveOlder, Committed, Committed),
+        ];
+        for (step, built, streamed) in rows {
+            for (mode, expected) in [(BulkMode::Append, built), (BulkMode::Replace, streamed)] {
+                let case = format!("{step:?} {mode:?}");
+                let dir = tempfile::tempdir().unwrap();
+                let config = EngineConfig {
+                    background_maintenance: false,
+                    ..EngineConfig::default()
+                };
+                let engine = Engine::open(dir.path(), config.clone()).unwrap();
+                let mut tx = engine.transaction();
+                tx.insert(quad("before").as_ref());
+                tx.commit().unwrap(); // revision 1, in the WAL
+                let load = engine.bulk_load(mode);
+                load.add(&[quad("a"), quad("b"), quad("c")]);
+                fault::fail_at(step);
+                let result = load.finish();
+                assert_eq!(fault::armed(), None, "{case}: the step was not reached");
+                let loaded = match mode {
+                    BulkMode::Append => 4,
+                    BulkMode::Replace => 3,
+                };
+                match expected {
+                    Committed => assert_eq!(result.unwrap().revision, 2, "{case}"),
+                    Unknown => assert!(
+                        matches!(result, Err(EngineError::CommitUnknown { revision: 2, .. })),
+                        "{case}: {result:?}"
+                    ),
+                    NotCommitted | NotCommittedPoisoned => {
+                        assert!(result.is_err(), "{case}: {result:?}")
+                    }
+                }
+                let live = engine.snapshot().revision();
+                assert_eq!(live, if expected == Committed { 2 } else { 1 }, "{case}");
+                let mut tx = engine.transaction();
+                tx.insert(quad("after").as_ref());
+                let next = tx.commit();
+                let accepted = matches!(expected, NotCommitted | Committed);
+                assert_eq!(next.is_ok(), accepted, "{case}: {next:?}");
+                drop(engine);
+                let reopened = Engine::open(dir.path(), config.clone()).unwrap();
+                let (revision, quads) = match expected {
+                    NotCommitted => (2, 2),
+                    NotCommittedPoisoned => (1, 1),
+                    Unknown => (2, loaded),
+                    Committed => (3, loaded + 1),
+                };
+                assert_eq!(reopened.snapshot().revision(), revision, "{case}");
+                assert_eq!(reopened.stats().quads, quads, "{case}");
+                if step == Step::Release {
+                    // The segment the failed release left is covered by the image: damage in
+                    // it doesn't stop the store from opening, nor cut the later commits.
+                    drop(reopened);
+                    let covered = dir.path().join("wal").join(format!("{:020}.wal", 1));
+                    let mut bytes = std::fs::read(&covered).unwrap();
+                    bytes[8 + 12] ^= 1;
+                    std::fs::write(&covered, bytes).unwrap();
+                    let reopened = Engine::open(dir.path(), config).unwrap();
+                    assert_eq!(
+                        reopened.snapshot().revision(),
+                        revision,
+                        "{case}: covered damage"
+                    );
+                    assert_eq!(reopened.stats().quads, quads, "{case}: covered damage");
+                }
+            }
+        }
     }
 }
