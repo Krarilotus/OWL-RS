@@ -109,6 +109,8 @@ pub(crate) struct Statistics {
     dir: Mutex<Option<std::path::PathBuf>>,
     /// Scans of the store for the sets begun: what the tests count.
     scans: AtomicU64,
+    #[cfg(test)]
+    pub(super) group_preparations: AtomicU64,
     /// Called once by the next build, its first scan published and not begun: what the
     /// tests hold a build with.
     #[cfg(test)]
@@ -155,6 +157,11 @@ type NodeCount = (Weak<Version>, ReadModel, GraphSelector, u64);
 const NODE_ENTRIES: usize = 64;
 
 impl Statistics {
+    #[cfg(test)]
+    pub(super) fn node_entries(&self) -> usize {
+        self.nodes.lock().len()
+    }
+
     /// The number of distinct subjects and objects of `graphs` in `model` at `version`:
     /// cached, or computed by `count` (`None`: it can't be, and nothing is kept).
     pub(crate) fn node_count(
@@ -164,21 +171,34 @@ impl Statistics {
         graphs: GraphSelector,
         count: impl FnOnce() -> Option<u64>,
     ) -> Option<u64> {
+        self.try_node_count(version, model, graphs, || {
+            Ok::<_, std::convert::Infallible>(count())
+        })
+        .unwrap_or_else(|never| match never {})
+    }
+
+    pub(crate) fn try_node_count<E>(
+        &self,
+        version: &Arc<Version>,
+        model: ReadModel,
+        graphs: GraphSelector,
+        count: impl FnOnce() -> Result<Option<u64>, E>,
+    ) -> Result<Option<u64>, E> {
         let found = self.nodes.lock().iter().find_map(|(weak, m, g, n)| {
             (*m == model && *g == graphs && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(version)))
                 .then_some(*n)
         });
         if found.is_some() {
-            return found;
+            return Ok(found);
         }
-        let n = count()?;
+        let Some(n) = count()? else { return Ok(None) };
         let mut nodes = self.nodes.lock();
         nodes.retain(|(weak, ..)| weak.strong_count() > 0);
         if nodes.len() >= NODE_ENTRIES {
             nodes.clear();
         }
         nodes.push((Arc::downgrade(version), model, graphs, n));
-        Some(n)
+        Ok(Some(n))
     }
 
     /// Statistics of an engine whose full-text corpora may hold `corpus_bytes`.
@@ -204,6 +224,8 @@ impl Statistics {
             corpora,
             dir: Default::default(),
             scans: AtomicU64::new(0),
+            #[cfg(test)]
+            group_preparations: AtomicU64::new(0),
             #[cfg(test)]
             hook: Default::default(),
         }
