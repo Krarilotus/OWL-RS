@@ -1022,6 +1022,12 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
                 .filter(|w| (w[0][1], w[0][0], w[0][2]) > (w[1][1], w[1][0], w[1][2]))
                 .count() as u64;
             keep(&mut out);
+            // What `keep` removed goes back now, not when every morsel is done: a round's
+            // morsels are all held until their results are collected. A commit whose
+            // round derived nothing new held 30,876 emptied buffers of 400 heads each,
+            // about 360 MiB, beside its jobs (DMW's subclass chain, fleet pm-dmwab-3,
+            // 21 Oct 2026).
+            out.shrink_to_fit();
             if let Some(probes) = probes {
                 use std::sync::atomic::Ordering::Relaxed;
                 probes.probes.fetch_add(asked, Relaxed);
@@ -1962,6 +1968,45 @@ mod tests {
             "{scanned} facts scanned after a stop (bound {bound}; the product is {})",
             n * n + n
         );
+    }
+
+    /// A morsel's results hold no more than `keep` left: a round whose heads are all known
+    /// returns empty buffers, not ones the size of what its morsels emitted.
+    #[test]
+    fn a_morsel_keeps_no_room_for_what_keep_removed() {
+        // (?x 11 ?y) -> (?x 12 ?y) over 10,000 pairs, every head already a fact: three
+        // morsels, each emitting up to MORSEL heads and keeping none.
+        let mut facts = Vec::new();
+        for x in 0..100 {
+            for y in 0..100 {
+                facts.extend([[x, 11, 1_000 + y], [x, 12, 1_000 + y]]);
+            }
+        }
+        let source = Counting {
+            facts,
+            scans: AtomicUsize::new(0),
+            matches: AtomicUsize::new(0),
+        };
+        let rule = Rule {
+            name: "copy".to_owned(),
+            body: vec![Atom([Term::Var(0), Term::Const(11), Term::Var(1)])],
+            guards: vec![],
+            head: Head::Facts(vec![Atom([Term::Var(0), Term::Const(12), Term::Var(1)])]),
+        };
+        let jobs: Vec<Job<'_>> = Job::full(&source, &rule).into_iter().collect();
+        let probes = Probes::default();
+        let capacities = run_jobs_by_morsel(
+            &source,
+            &jobs,
+            &|facts: &mut Vec<Triple>| facts.retain(|&f| !source.contains(f)),
+            None,
+            &|| false,
+            &probes,
+            &|_, facts| (facts.len(), facts.capacity()),
+        );
+        assert!(capacities.len() > 1, "several morsels");
+        assert_eq!(probes.emitted.load(Ordering::Relaxed), 10_000);
+        assert!(capacities.iter().all(|&c| c == (0, 0)), "{capacities:?}");
     }
 
     #[test]
