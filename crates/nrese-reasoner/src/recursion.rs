@@ -56,12 +56,34 @@ fn node(atom: &Atom, rdf_type: u64, head: bool) -> Node {
 /// Which rules of a ground program are non-recursive (by index into `rules`).
 /// `partners` gives the `owl:sameAs` partners of a term (other than itself): classes and
 /// properties with partners are linked to them (see the module docs).
+#[cfg(test)]
 pub fn non_recursive(
     rules: &[Rule],
     rdf_type: u64,
     partners: &dyn Fn(u64) -> Vec<u64>,
 ) -> Vec<bool> {
-    let counted = |rule: &Rule| !super::batch::is_replacement_rule(rule);
+    non_recursive_with(rules, rdf_type, partners, |r| {
+        !super::batch::is_replacement_rule(&rules[r])
+    })
+}
+
+/// A cached program retains source eligibility even after grouped heads collapse.
+pub(crate) fn non_recursive_program(
+    program: &super::eval::GroundProgram,
+    rdf_type: u64,
+    partners: &dyn Fn(u64) -> Vec<u64>,
+) -> Vec<bool> {
+    non_recursive_with(&program.rules, rdf_type, partners, |r| {
+        program.equality_rule(r) != super::batch::EqualityRule::Replacement
+    })
+}
+
+fn non_recursive_with(
+    rules: &[Rule],
+    rdf_type: u64,
+    partners: &dyn Fn(u64) -> Vec<u64>,
+    counted: impl Fn(usize) -> bool,
+) -> Vec<bool> {
     let mut index: HashMap<Node, usize> = HashMap::new();
     let id = |n: Node, index: &mut HashMap<Node, usize>| {
         let next = index.len();
@@ -69,8 +91,8 @@ pub fn non_recursive(
     };
     let mut edges: Vec<(usize, usize)> = Vec::new();
     let mut atoms_of: Vec<(Vec<usize>, Vec<usize>)> = Vec::with_capacity(rules.len());
-    for rule in rules {
-        let (body, head): (Vec<usize>, Vec<usize>) = match (&rule.head, counted(rule)) {
+    for (r, rule) in rules.iter().enumerate() {
+        let (body, head): (Vec<usize>, Vec<usize>) = match (&rule.head, counted(r)) {
             (head @ (Head::Facts(_) | Head::Grouped(_)), true) => (
                 rule.body
                     .iter()
@@ -91,7 +113,7 @@ pub fn non_recursive(
         // of its terms: the copy keeps the fact's key (or moves it to a partner key,
         // linked below), but it depends on the `sameAs` fact, which therefore feeds every
         // key.
-        if !counted(rule) {
+        if !counted(r) {
             for atom in &rule.body {
                 if let Node::Predicate(_) = node(atom, rdf_type, false) {
                     let same_as = id(node(atom, rdf_type, false), &mut index);
@@ -154,9 +176,9 @@ pub fn non_recursive(
     let component = components(index.len(), &edges);
     atoms_of
         .iter()
-        .zip(rules)
-        .map(|((body, head), rule)| {
-            counted(rule)
+        .enumerate()
+        .map(|(r, (body, head))| {
+            counted(r)
                 && !head.is_empty()
                 && !body.is_empty()
                 && head

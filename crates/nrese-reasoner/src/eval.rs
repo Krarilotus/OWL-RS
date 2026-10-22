@@ -1735,14 +1735,55 @@ impl Dispatch {
     }
 }
 
+/// Source scheduling metadata, parallel to the ground rules. The full family ID
+/// and the grouped-origin exemption coexist without becoming part of a semantic key.
+#[derive(Debug, Clone, Copy)]
+struct RuleOrigin {
+    family: u64,
+    has_family: bool,
+    equality_exempt: bool,
+}
+
+impl RuleOrigin {
+    fn new(family: Option<u64>, equality_exempt: bool) -> Self {
+        Self {
+            family: family.unwrap_or(0),
+            has_family: family.is_some(),
+            equality_exempt,
+        }
+    }
+
+    fn family(&self) -> Option<u64> {
+        self.has_family.then_some(self.family)
+    }
+
+    fn equality_exempt(&self) -> bool {
+        self.equality_exempt
+    }
+
+    fn retain(&mut self, family: Option<u64>, source_exempt: bool) {
+        if source_exempt || self.equality_exempt {
+            // Only affected grouped origins merge family metadata. Ordinary aliases
+            // keep the older first-origin family policy.
+            if !self.has_family
+                && let Some(family) = family
+            {
+                self.family = family;
+                self.has_family = true;
+            }
+            self.equality_exempt = true;
+        }
+    }
+}
+
 /// A ground program: the rule instances with a body (indexed by [`Dispatch`]), the
 /// transitive predicates (closed by a module instead of joins), the facts of bodiless
 /// instances, and the ground consistency rules.
 #[derive(Default, Clone)]
 pub struct GroundProgram {
     pub rules: Vec<Rule>,
-    /// Per rule: the closed family it is an instance of, if any ([`closed_family`]).
-    families: Vec<Option<u64>>,
+    /// Per rule: its closed family and any grouped-source equality exemption.
+    families: Vec<RuleOrigin>,
     /// The relations closed families read and produce by name (`cax-sco`'s `rdf:type`),
     /// each with its family: the family claims the relation's closed part.
     pub family_relations: std::collections::BTreeMap<u64, u64>,
@@ -1786,7 +1827,18 @@ impl std::fmt::Debug for GroundProgram {
 impl GroundProgram {
     /// Files one ground fact rule; returns its index if it is new and has a body.
     pub fn add(&mut self, rule: Rule) -> Option<usize> {
-        self.add_with(rule, Vec::new(), None)
+        let equality_exempt = super::batch::equality_exempt(&rule);
+        self.add_with(rule, Vec::new(), None, equality_exempt)
+    }
+
+    /// Grounded eligibility comes from the source, not its current head representation.
+    pub(crate) fn equality_rule(&self, r: usize) -> super::batch::EqualityRule {
+        let role = super::batch::equality_rule(&self.rules[r]);
+        if role != super::batch::EqualityRule::Generic && self.families[r].equality_exempt() {
+            super::batch::EqualityRule::Generic
+        } else {
+            role
+        }
     }
 
     /// [`Self::add`], with the schema facts the instance was grounded on, and the closed
@@ -1796,6 +1848,7 @@ impl GroundProgram {
         rule: Rule,
         premises: Vec<Triple>,
         family: Option<u64>,
+        equality_exempt: bool,
     ) -> Option<usize> {
         if let Some(p) = transitive_predicate(&rule) {
             self.transitive_with(p, premises);
@@ -1817,6 +1870,9 @@ impl GroundProgram {
             let rule = without_tautologies(rule)?;
             let key = rule_key(&rule);
             if let Some(&r) = self.known.get(&key) {
+                // RuleKey excludes names. Retain a grouped origin and any family
+                // regardless of which of those origins was filed first.
+                self.families[r].retain(family, equality_exempt);
                 if self.premises[r] != premises {
                     self.other(Grounding::Rule(r), premises);
                 }
@@ -1837,8 +1893,9 @@ impl GroundProgram {
             }
             self.rules.push(rule);
             self.premises.push(premises);
-            self.families.push(family);
-            Some(self.rules.len() - 1)
+            self.families.push(RuleOrigin::new(family, equality_exempt));
+            let r = self.rules.len() - 1;
+            Some(r)
         }
     }
 
@@ -1982,6 +2039,7 @@ impl GroundProgram {
         poll: &mut Poller<'_>,
     ) -> (Vec<usize>, Vec<usize>) {
         let (mut facts, mut checks) = (Vec::new(), Vec::new());
+        let equality_exempt = super::batch::equality_exempt(rule);
         // Source-level transitivity rules (`scm-sco`, `scm-spo`) don't depend on the
         // delta: full grounding registers them, delta grounding leaves them alone.
         if let Some(p) = transitive_predicate(rule) {
@@ -2060,7 +2118,7 @@ impl GroundProgram {
                         instance.head = Head::Facts(admitted);
                         instance.guards.clear();
                     }
-                    facts.extend(self.add_with(instance, premises, family));
+                    facts.extend(self.add_with(instance, premises, family, equality_exempt));
                 }
             }
         }
@@ -2318,8 +2376,7 @@ impl GroundProgram {
     pub fn closed_family(&self, r: usize) -> Option<u64> {
         self.families
             .get(r)
-            .copied()
-            .flatten()
+            .and_then(RuleOrigin::family)
             .filter(|link| self.transitive.contains(link))
     }
 
@@ -2648,5 +2705,81 @@ mod tests {
         let job = Job::full(&source, &rule).unwrap();
         assert!(run_jobs(&source, &[job], &|_| true, &stop).is_empty());
         assert!(calls.load(Ordering::Relaxed) >= 2);
+    }
+    #[test]
+    fn equality_origin_survives_dedup_and_clone_in_both_orders() {
+        use crate::batch::EqualityRule;
+        let residual = Rule {
+            name: "eq-rep-p".into(),
+            body: vec![Atom([Term::Var(0), Term::Const(7), Term::Var(1)])],
+            guards: vec![],
+            head: Head::Facts(vec![Atom([Term::Var(0), Term::Const(8), Term::Var(1)])]),
+        };
+        // Ordinary aliases keep the old name and first-origin family policy.
+        for alias_first in [false, true] {
+            let mut ordinary = GroundProgram::default();
+            let mut alias = residual.clone();
+            alias.name = "ordinary-alias".into();
+            for rule in if alias_first {
+                [alias, residual.clone()]
+            } else {
+                [residual.clone(), alias]
+            } {
+                ordinary.add(rule);
+            }
+            assert_eq!(ordinary.rules.len(), 1);
+            assert_eq!(
+                ordinary.equality_rule(0),
+                if alias_first {
+                    EqualityRule::Generic
+                } else {
+                    EqualityRule::Replacement
+                }
+            );
+            assert!(!ordinary.families[0].equality_exempt());
+            assert_eq!(ordinary.closed_family(0), None);
+        }
+        for exempt in [false, true] {
+            let empty = RuleOrigin::new(None, exempt);
+            assert_eq!(empty.family, 0, "absent payload is initialized");
+            assert_eq!(empty.family(), None);
+            assert_eq!(empty.equality_exempt(), exempt);
+        }
+        // Family IDs retain the complete u64 domain, including both endpoints.
+        for family in [0, 17, u64::MAX] {
+            for generic_first in [false, true] {
+                let mut program = GroundProgram::default();
+                let origins = if generic_first {
+                    [(None, true), (Some(family), false)]
+                } else {
+                    [(Some(family), false), (None, true)]
+                };
+                for (family, source_exempt) in origins {
+                    program.add_with(residual.clone(), vec![], family, source_exempt);
+                }
+                assert_eq!(program.rules.len(), 1);
+                assert_eq!(program.families[0].family(), Some(family));
+                assert!(program.families[0].equality_exempt());
+                assert_eq!(program.closed_family(0), None, "family must be closed");
+                program.transitive.insert(family);
+                assert_eq!(program.closed_family(0), Some(family));
+                assert_eq!(program.closed_family(usize::MAX), None);
+                let clone = program.clone();
+                assert_eq!(clone.equality_rule(0), EqualityRule::Generic);
+                assert_eq!(clone.closed_family(0), Some(family));
+                assert_eq!(program.rules[0].name, "eq-rep-p");
+                assert_eq!(rule_key(&program.rules[0]), rule_key(&residual));
+                assert!(crate::recursion::non_recursive_program(&program, 99, &|_| Vec::new())[0]);
+            }
+        }
+        let mut ordinary = GroundProgram::default();
+        ordinary.add_with(residual.clone(), vec![], None, false);
+        ordinary.add_with(residual.clone(), vec![], Some(17), false);
+        assert_eq!(ordinary.families[0].family(), None);
+        let mut ordinary = GroundProgram::default();
+        ordinary.add_with(residual.clone(), vec![], Some(u64::MAX), false);
+        ordinary.add_with(residual, vec![], Some(17), false);
+        ordinary.transitive.insert(u64::MAX);
+        assert_eq!(ordinary.closed_family(0), Some(u64::MAX));
     }
 }
