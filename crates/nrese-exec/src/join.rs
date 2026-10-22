@@ -30,6 +30,7 @@ use hashbrown::HashMap;
 use rayon::prelude::*;
 
 use crate::search::partition_range_from;
+use crate::stop::{Stop, StopCheck, Ticker};
 use crate::table::IdTable;
 use crate::{Budget, BudgetExceeded, ChargedVec, Reservation, Scratch, UNDEF, map_bytes};
 
@@ -89,7 +90,8 @@ impl std::error::Error for JoinStop {}
 
 /// How far a join may go: at most `max_rows` output rows, and no further once `stop` is set
 /// (the query was cancelled). Both are checked every [`LIMIT_STEP`] output rows, so a
-/// join that would run for hours stops within a few thousand rows of either.
+/// join that would run for hours stops within a few thousand rows of either. The nested
+/// UNDEF scans also check rejected comparisons, every [`crate::POLL_UNITS`] candidates.
 #[derive(Debug, Clone, Default)]
 pub struct RowLimit {
     pub max_rows: usize,
@@ -136,6 +138,27 @@ impl Limit {
             });
         }
         Ok(())
+    }
+}
+
+// The query owns the stop's meaning: joins have always returned Rows for cancellation.
+// Borrow the same flag; no Arc clone or atomic operation on the tick's common path.
+impl StopCheck for &Limit {
+    fn check(&self) -> Result<(), Stop> {
+        if self.stopped() {
+            Err(Stop::Rows)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Limit {
+    fn work_stopped(&self, _: Stop) -> JoinStop {
+        TooManyRows {
+            max_rows: self.max_rows,
+        }
+        .into()
     }
 }
 
@@ -689,7 +712,7 @@ fn hash_join(
 
 /// Left outer join (OPTIONAL): every left row once per accepted match, or once with UNDEF in
 /// the right payload columns if no match is accepted. `accept` sees the combined output row;
-/// it implements the filter of `OPTIONAL { … FILTER(…) }`.
+/// it implements the filter of `OPTIONAL { â€¦ FILTER(â€¦) }`.
 pub fn left_join(
     left: &IdTable,
     right: &IdTable,
@@ -1002,6 +1025,8 @@ pub fn join_with_undef(
     budget: &Arc<Budget>,
     limit: impl Into<RowLimit>,
 ) -> Result<IdTable, JoinStop> {
+    let limit = Limit::new(limit);
+    let mut work = Ticker::new(&limit).map_err(|e| limit.work_stopped(e))?;
     // The rows with every key bound, and those with one unbound, each copied (charged).
     let split = |t: &IdTable, keys: &[usize]| -> Result<_, BudgetExceeded> {
         let unbound = |row: usize| keys.iter().any(|&k| t.get(row, k) == UNDEF);
@@ -1013,48 +1038,83 @@ pub fn join_with_undef(
     };
     let (left_bound, left_open) = split(left, left_keys)?;
     let (right_bound, right_open) = split(right, right_keys)?;
-    let limit = limit.into();
     let joined = join(
         &left_bound,
         &right_bound,
         left_keys,
         right_keys,
         budget,
-        limit.clone(),
+        RowLimit {
+            max_rows: limit.max_rows,
+            stop: limit.stop.clone(),
+        },
     )?;
-    let limit = Limit::new(limit);
     limit.grow(joined.len())?;
+    // grow just checked the stop after the bound join, before nested work resumes.
     let payload = right_payload(right.width(), right_keys);
     let mut row = vec![0; joined.width()];
     let mut out = Sink::after(joined, &limit, budget);
-    let mut nested = |l_table: &IdTable, r_table: &IdTable| -> Result<(), JoinStop> {
-        for l in 0..l_table.len() {
-            'right: for r in 0..r_table.len() {
+    nested_undef(
+        &left_open, right, left_keys, right_keys, &payload, &mut row, &mut out, &mut work,
+    )?;
+    nested_undef(
+        &left_bound,
+        &right_open,
+        left_keys,
+        right_keys,
+        &payload,
+        &mut row,
+        &mut out,
+        &mut work,
+    )?;
+    // The sink's final count also checks the stop, including for short/no-output work.
+    out.finish()
+}
+
+/// A comparison chunk never exceeds the ticker's remaining allowance. Even a chunk that
+/// rejects every pair reaches its checkpoint; successful rows keep the sink's earlier
+/// row/memory refusals. Counting at chunk boundaries leaves the pair loop unchanged.
+#[allow(clippy::too_many_arguments)]
+fn nested_undef<C: StopCheck>(
+    left: &IdTable,
+    right: &IdTable,
+    left_keys: &[usize],
+    right_keys: &[usize],
+    payload: &[usize],
+    row: &mut [u64],
+    out: &mut Sink<'_>,
+    work: &mut Ticker<C>,
+) -> Result<(), JoinStop> {
+    for l in 0..left.len() {
+        let mut start = 0;
+        while start < right.len() {
+            let end = start + (right.len() - start).min(work.left() as usize);
+            'right: for r in start..end {
                 for (&lk, &rk) in left_keys.iter().zip(right_keys) {
-                    let (a, b) = (l_table.get(l, lk), r_table.get(r, rk));
+                    let (a, b) = (left.get(l, lk), right.get(r, rk));
                     if a != b && a != UNDEF && b != UNDEF {
                         continue 'right;
                     }
                 }
-                for (i, c) in l_table.columns().iter().enumerate() {
+                for (i, c) in left.columns().iter().enumerate() {
                     row[i] = c[l];
                 }
                 for (&lk, &rk) in left_keys.iter().zip(right_keys) {
                     if row[lk] == UNDEF {
-                        row[lk] = r_table.get(r, rk);
+                        row[lk] = right.get(r, rk);
                     }
                 }
                 for (i, &c) in payload.iter().enumerate() {
-                    row[left.width() + i] = r_table.get(r, c);
+                    row[left.width() + i] = right.get(r, c);
                 }
-                out.push(&row)?;
+                out.push(row)?;
             }
+            work.tick((end - start) as u32)
+                .map_err(|e| out.limit.work_stopped(e))?;
+            start = end;
         }
-        Ok(())
-    };
-    nested(&left_open, right)?;
-    nested(&left_bound, &right_open)?;
-    out.finish()
+    }
+    Ok(())
 }
 
 /// `right` for joins whose keys may be UNDEF: its rows with every key bound chained by key,
@@ -1105,10 +1165,12 @@ impl<'a> Compatible<'a> {
         &self,
         left: &IdTable,
         l: usize,
+        mut compared: impl FnMut() -> Result<(), JoinStop>,
         mut found: impl FnMut(usize) -> Result<bool, JoinStop>,
     ) -> Result<(), JoinStop> {
         if self.left_keys.iter().any(|&k| left.get(l, k) == UNDEF) {
             for r in 0..self.right.len() {
+                compared()?;
                 if self.agree(left, l, r) && !found(r)? {
                     return Ok(());
                 }
@@ -1117,12 +1179,14 @@ impl<'a> Compatible<'a> {
         }
         let mut r = self.bound.first(left, l, self.left_keys);
         while r != END {
+            compared()?;
             if !found(r as usize)? {
                 return Ok(());
             }
             r = self.bound.next[r as usize];
         }
         for &r in self.open.iter() {
+            compared()?;
             if self.agree(left, l, r as usize) && !found(r as usize)? {
                 return Ok(());
             }
@@ -1149,29 +1213,35 @@ pub fn outer_join_with_undef(
     let payload = right_payload(right.width(), right_keys);
     let width = left.width() + payload.len();
     let limit = Limit::new(limit);
+    let mut work = Ticker::new(&limit).map_err(|e| limit.work_stopped(e))?;
     let mut out = Sink::new(width, &limit, budget)?;
     let compatible = Compatible::new(right, left_keys, right_keys, budget)?;
     let mut row = vec![0; width];
     for l in 0..left.len() {
         let mut matched = false;
-        compatible.each(left, l, |r| {
-            for (i, c) in left.columns().iter().enumerate() {
-                row[i] = c[l];
-            }
-            for (&a, &b) in left_keys.iter().zip(right_keys) {
-                if row[a] == UNDEF {
-                    row[a] = right.get(r, b);
+        compatible.each(
+            left,
+            l,
+            || work.tick(1).map_err(|e| limit.work_stopped(e)),
+            |r| {
+                for (i, c) in left.columns().iter().enumerate() {
+                    row[i] = c[l];
                 }
-            }
-            for (i, &c) in payload.iter().enumerate() {
-                row[left.width() + i] = right.get(r, c);
-            }
-            if accept.is_none_or(|f| f(&row)) {
-                out.push(&row)?;
-                matched = true;
-            }
-            Ok(true)
-        })?;
+                for (&a, &b) in left_keys.iter().zip(right_keys) {
+                    if row[a] == UNDEF {
+                        row[a] = right.get(r, b);
+                    }
+                }
+                for (i, &c) in payload.iter().enumerate() {
+                    row[left.width() + i] = right.get(r, c);
+                }
+                if accept.is_none_or(|f| f(&row)) {
+                    out.push(&row)?;
+                    matched = true;
+                }
+                Ok(true)
+            },
+        )?;
         if !matched && keep_unmatched {
             for (i, c) in left.columns().iter().enumerate() {
                 row[i] = c[l];
@@ -1182,6 +1252,7 @@ pub fn outer_join_with_undef(
             out.push(&row)?;
         }
     }
+    // The sink checks short/no-output work at completion too.
     out.finish()
 }
 
@@ -1203,15 +1274,20 @@ pub fn compatible_mask(
     let compatible = Compatible::new(right, left_keys, right_keys, budget)?;
     for (l, any) in found.iter_mut().enumerate() {
         *any = false;
-        let _ = compatible.each(left, l, |r| {
-            let shares = !bound_in_both
-                || left_keys
-                    .iter()
-                    .zip(right_keys)
-                    .any(|(&a, &b)| left.get(l, a) != UNDEF && right.get(r, b) != UNDEF);
-            *any |= shares;
-            Ok(!*any)
-        });
+        let _ = compatible.each(
+            left,
+            l,
+            || Ok(()),
+            |r| {
+                let shares = !bound_in_both
+                    || left_keys
+                        .iter()
+                        .zip(right_keys)
+                        .any(|(&a, &b)| left.get(l, a) != UNDEF && right.get(r, b) != UNDEF);
+                *any |= shares;
+                Ok(!*any)
+            },
+        );
     }
     Ok(())
 }
@@ -1332,6 +1408,261 @@ mod tests {
                 "case {case}"
             );
         }
+    }
+
+    /// The actual comparison kernel must reach a failing checkpoint even when every
+    /// candidate disagrees on a bound key, before the sink can see any row. The finite
+    /// input is several intervals long, so removing work ticks fails without a timeout.
+    #[test]
+    fn undef_rejected_pairs_reach_the_remaining_checkpoint() {
+        use std::sync::atomic::AtomicUsize;
+        for left_remaining in [1, 17, crate::POLL_UNITS] {
+            let b = budget();
+            let mut unrelated = Reservation::new(b.clone());
+            unrelated.charge(13).unwrap();
+            let left = IdTable::from_rows(2, [&[UNDEF, 1][..]], &b).unwrap();
+            let right = IdTable::from_rows(
+                2,
+                std::iter::repeat_n(&[9, 2][..], 3 * crate::POLL_UNITS as usize + 17),
+                &b,
+            )
+            .unwrap();
+            let polls = AtomicUsize::new(0);
+            let check = || polls.fetch_add(1, AtomicOrdering::Relaxed) != 0;
+            let mut work = Ticker::new(&check).unwrap();
+            work.tick(crate::POLL_UNITS - left_remaining).unwrap();
+            let limit = Limit::new(usize::MAX);
+            let mut out = Sink::new(2, &limit, &b).unwrap();
+            let held = b.used();
+            let result = nested_undef(
+                &left,
+                &right,
+                &[0, 1],
+                &[0, 1],
+                &[],
+                &mut [0; 2],
+                &mut out,
+                &mut work,
+            );
+            assert_eq!(
+                result,
+                Err(JoinStop::Rows(TooManyRows {
+                    max_rows: usize::MAX
+                })),
+                "rejected pairs must reach their work checkpoint"
+            );
+            assert_eq!(polls.load(AtomicOrdering::Relaxed), 2);
+            assert_eq!(out.out.len(), 0);
+            assert_eq!(b.used(), held, "no rejected-row output growth");
+            drop(out);
+            drop(right);
+            drop(left);
+            assert_eq!(b.used(), 13, "failed work drops only its owners");
+            drop(unrelated);
+            assert_eq!(b.used(), 0);
+        }
+    }
+
+    /// Both nested compatibility scans count candidates rejected before `found`: a left
+    /// UNDEF scans all right rows; a bound left key scans the right UNDEF list.
+    #[test]
+    fn undef_compatibility_counts_key_rejections_before_found() {
+        for left_open in [false, true] {
+            let b = budget();
+            let flag = Arc::new(AtomicBool::new(false));
+            let limit = Limit::new(RowLimit {
+                max_rows: 7,
+                stop: Some(flag.clone()),
+            });
+            let left_key = if left_open { UNDEF } else { 9 };
+            let right_key = if left_open { 9 } else { UNDEF };
+            let left = IdTable::from_rows(2, [&[left_key, 1][..]], &b).unwrap();
+            let right = IdTable::from_rows(
+                2,
+                std::iter::repeat_n(&[right_key, 2][..], 3 * crate::POLL_UNITS as usize),
+                &b,
+            )
+            .unwrap();
+            let held = b.used();
+            {
+                let candidates = Compatible::new(&right, &[0, 1], &[0, 1], &b).unwrap();
+                let mut work = Ticker::new(&limit).unwrap();
+                let (mut compared, mut found) = (0, 0);
+                let result = candidates.each(
+                    &left,
+                    0,
+                    || {
+                        compared += 1;
+                        flag.store(true, AtomicOrdering::Relaxed);
+                        work.tick(1).map_err(|e| limit.work_stopped(e))
+                    },
+                    |_| {
+                        found += 1;
+                        Ok(true)
+                    },
+                );
+                assert_eq!(
+                    result,
+                    Err(JoinStop::Rows(TooManyRows { max_rows: 7 })),
+                    "key rejections must reach their work checkpoint"
+                );
+                assert_eq!(compared, crate::POLL_UNITS);
+                assert_eq!(found, 0);
+            }
+            assert_eq!(b.used(), held, "compatibility scratch drops on stop");
+            drop(left);
+            drop(right);
+            assert_eq!(b.used(), 0);
+        }
+    }
+
+    /// Public OPTIONAL cancellation is bounded even when its filter rejects every match.
+    /// The finite input also exposes a finish-only check: it stops too late to pass.
+    #[test]
+    fn undef_optional_stops_rejected_output_and_cleans_up() {
+        use std::cell::Cell;
+        for rows in [3, 3 * crate::POLL_UNITS as usize] {
+            for open_left in [false, true] {
+                let b = budget();
+                let mut unrelated = Reservation::new(b.clone());
+                unrelated.charge(13).unwrap();
+                let left_key = if open_left { UNDEF } else { 9 };
+                let left = IdTable::from_rows(1, [&[left_key][..]], &b).unwrap();
+                let right = IdTable::from_rows(1, std::iter::repeat_n(&[9][..], rows), &b).unwrap();
+                let held = b.used();
+                let flag = Arc::new(AtomicBool::new(false));
+                let seen = Cell::new(0);
+                let reject = |_: &[u64]| {
+                    seen.set(seen.get() + 1);
+                    flag.store(true, AtomicOrdering::Relaxed);
+                    false
+                };
+                let result = outer_join_with_undef(
+                    &left,
+                    &right,
+                    &[0],
+                    &[0],
+                    Some(&reject),
+                    false,
+                    &b,
+                    RowLimit {
+                        max_rows: 0,
+                        stop: Some(flag.clone()),
+                    },
+                );
+                assert_eq!(result, Err(JoinStop::Rows(TooManyRows { max_rows: 0 })));
+                assert!(
+                    seen.get() > 0 && seen.get() <= crate::POLL_UNITS as usize,
+                    "rejected output must stop within bounded comparison work: {}",
+                    seen.get()
+                );
+                assert_eq!(b.used(), held);
+                drop(left);
+                drop(right);
+                assert_eq!(b.used(), 13);
+                drop(unrelated);
+                assert_eq!(b.used(), 0);
+            }
+        }
+    }
+
+    /// Empty work still checks its supplied stop; without cancellation, empty/no-match
+    /// work is permitted at zero output rows, and the original memory error stays typed.
+    #[test]
+    fn undef_short_work_and_refusals_keep_their_meaning() {
+        for inner in [false, true] {
+            let b = budget();
+            let empty = IdTable::charged(2, 0, &b).unwrap();
+            let run = |limit: RowLimit| {
+                if inner {
+                    join_with_undef(&empty, &empty, &[0], &[0], &b, limit)
+                } else {
+                    outer_join_with_undef(&empty, &empty, &[0], &[0], None, false, &b, limit)
+                }
+            };
+            assert_eq!(run(0.into()).unwrap().len(), 0);
+            assert_eq!(
+                run(RowLimit {
+                    max_rows: 0,
+                    stop: Some(Arc::new(AtomicBool::new(true)))
+                }),
+                Err(JoinStop::Rows(TooManyRows { max_rows: 0 }))
+            );
+            drop(empty);
+            assert_eq!(b.used(), 0);
+
+            let inputs = budget();
+            let left = IdTable::from_rows(2, [&[UNDEF, 1][..]], &inputs).unwrap();
+            let right = IdTable::from_rows(2, [&[9, 2][..]], &inputs).unwrap();
+            let refused = Arc::new(Budget::new(1));
+            let result = if inner {
+                join_with_undef(&left, &right, &[0, 1], &[0, 1], &refused, 0)
+            } else {
+                outer_join_with_undef(&left, &right, &[0, 1], &[0, 1], None, false, &refused, 0)
+            };
+            assert!(matches!(result, Err(JoinStop::Memory(_))));
+            assert_eq!(refused.used(), 0);
+            let out = if inner {
+                join_with_undef(&left, &right, &[0, 1], &[0, 1], &inputs, 0)
+            } else {
+                outer_join_with_undef(&left, &right, &[0, 1], &[0, 1], None, false, &inputs, 0)
+            };
+            assert_eq!(
+                out.unwrap().len(),
+                0,
+                "rejected candidates are not output rows"
+            );
+            drop(left);
+            drop(right);
+            assert_eq!(inputs.used(), 0);
+        }
+    }
+
+    #[test]
+    fn undef_polling_preserves_order_bags_and_exact_row_limit() {
+        let b = budget();
+        let left = IdTable::from_rows(2, [&[UNDEF, 10][..], &[1, 11], &[1, 11]], &b).unwrap();
+        let right = IdTable::from_rows(2, [&[1, 20][..], &[UNDEF, 21], &[2, 22]], &b).unwrap();
+        let expected = vec![
+            vec![1, 10, 20],
+            vec![UNDEF, 10, 21],
+            vec![2, 10, 22],
+            vec![1, 11, 20],
+            vec![1, 11, 21],
+            vec![1, 11, 20],
+            vec![1, 11, 21],
+        ];
+        for flag in [None, Some(Arc::new(AtomicBool::new(false)))] {
+            let limit = RowLimit {
+                max_rows: expected.len(),
+                stop: flag.clone(),
+            };
+            let ordered =
+                outer_join_with_undef(&left, &right, &[0], &[0], None, false, &b, limit.clone())
+                    .unwrap();
+            assert_eq!(ordered.rows().collect::<Vec<_>>(), expected);
+            let inner = join_with_undef(&left, &right, &[0], &[0], &b, limit).unwrap();
+            assert_eq!(sorted_rows(&inner), naive(&left, &right, &[0], &[0]));
+            let limit = RowLimit {
+                max_rows: expected.len() - 1,
+                stop: flag,
+            };
+            assert_eq!(
+                join_with_undef(&left, &right, &[0], &[0], &b, limit.clone()),
+                Err(JoinStop::Rows(TooManyRows {
+                    max_rows: expected.len() - 1
+                }))
+            );
+            assert_eq!(
+                outer_join_with_undef(&left, &right, &[0], &[0], None, false, &b, limit),
+                Err(JoinStop::Rows(TooManyRows {
+                    max_rows: expected.len() - 1
+                }))
+            );
+        }
+        drop(left);
+        drop(right);
+        assert_eq!(b.used(), 0);
     }
 
     /// The joins over keys that may be unbound, against their definitions: every compatible
@@ -1624,7 +1955,7 @@ mod tests {
         })
     }
 
-    /// `rows` rows of distinct keys `0, step, 2·step, …` and a second column.
+    /// `rows` rows of distinct keys `0, step, 2Â·step, â€¦` and a second column.
     fn keyed(rows: usize, step: u64) -> IdTable {
         of(vec![
             (0..rows as u64).map(|i| i * step).collect(),
