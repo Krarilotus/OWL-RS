@@ -321,6 +321,21 @@ fn parse_federation(source: &dyn ConfigSource) -> Result<nrese_store::Federation
                 .with_context(|| format!("failed to parse {}", names::FEDERATION_MAX_ROWS))?,
             None => defaults.max_rows,
         },
+        max_response_bytes: source
+            .get(names::FEDERATION_MAX_RESPONSE_BYTES)
+            .map(|text| {
+                let bytes = super::units::parse_size(&text).with_context(|| {
+                    format!("failed to parse {}", names::FEDERATION_MAX_RESPONSE_BYTES)
+                })?;
+                usize::try_from(bytes).with_context(|| {
+                    format!(
+                        "{} exceeds this platform's response size",
+                        names::FEDERATION_MAX_RESPONSE_BYTES
+                    )
+                })
+            })
+            .transpose()?
+            .filter(|bytes| *bytes != 0),
     })
 }
 
@@ -409,6 +424,25 @@ mod tests {
 
     use super::super::source::KeyValueSource;
     use super::{names, parse_dl, parse_store_mode};
+
+    #[test]
+    fn n7_response_byte_cap_has_no_new_default_and_zero_removes_only_its_cap() {
+        let mut source = KeyValueSource::default();
+        assert_eq!(
+            super::parse_federation(&source).unwrap().max_response_bytes,
+            None
+        );
+        source.insert(names::FEDERATION_MAX_RESPONSE_BYTES, "1KiB");
+        assert_eq!(
+            super::parse_federation(&source).unwrap().max_response_bytes,
+            Some(1024)
+        );
+        source.insert(names::FEDERATION_MAX_RESPONSE_BYTES, "0");
+        source.insert(names::FEDERATION_MAX_ROWS, "0");
+        let config = super::parse_federation(&source).unwrap();
+        assert_eq!(config.max_response_bytes, None);
+        assert_eq!(config.max_rows, 0);
+    }
 
     #[test]
     fn dl_settings_parse_and_unknown_values_are_errors() {

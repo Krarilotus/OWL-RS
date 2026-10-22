@@ -18,6 +18,8 @@
 //!   test that now passes, so the list never goes stale. The full report is written to
 //!   `<target tmp>/w3c-sparql11-report.txt`.
 
+use std::sync::Arc;
+
 mod manifest;
 mod results;
 
@@ -29,8 +31,8 @@ use manifest::{GraphFile, Kind, Suite, Test};
 use nrese_engine::{Engine, EngineConfig, QuadPattern};
 use nrese_rdf::{BlankNode, Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Variable};
 use nrese_sparql::{
-    CancellationToken, QueryOptions, QueryResults, ServiceClient, ServiceResults, Services,
-    UpdateOptions, apply_update, evaluate_query,
+    CancellationToken, QueryEvaluationError, QueryOptions, QueryResults, ServiceClient,
+    ServiceResults, Services, UpdateOptions, apply_update, evaluate_query,
 };
 use nrese_sparql_results::{QueryResultsFormat, QueryResultsSerializer};
 use nrese_sparql_syntax::{Query, SparqlParser, Update};
@@ -206,30 +208,39 @@ impl ServiceClient for Endpoints {
         &self,
         endpoint: &str,
         query: &str,
-        _cancellation: Option<&CancellationToken>,
-    ) -> Result<ServiceResults, Box<dyn std::error::Error + Send + Sync>> {
-        let engine = self
-            .0
-            .get(endpoint)
-            .ok_or_else(|| format!("no endpoint {endpoint}"))?;
-        let parsed = SparqlParser::new().parse_query(query)?;
+        budget: &Arc<nrese_exec::Budget>,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<ServiceResults, QueryEvaluationError> {
+        let engine = self.0.get(endpoint).ok_or_else(|| {
+            QueryEvaluationError::Service(format!("no endpoint {endpoint}").into())
+        })?;
+        let parsed = SparqlParser::new()
+            .parse_query(query)
+            .map_err(|e| QueryEvaluationError::Service(Box::new(e)))?;
         let snapshot = engine.snapshot();
         // The endpoints reach each other too (a SERVICE nested in a SERVICE).
-        let options = QueryOptions {
-            services: Some(Services(std::sync::Arc::new(Self(self.0.clone())))),
-            ..QueryOptions::default()
-        };
+        let mut options = QueryOptions::default();
+        options.resources.memory = nrese_exec::Envelope::from_budget(Arc::clone(budget));
+        options.resources.cancellation = cancellation.cloned();
+        assert!(std::ptr::eq(&*options.resources.memory, &**budget));
+        options.services = Some(Services(Arc::new(Self(self.0.clone()))));
         let QueryResults::Solutions(solutions) = evaluate_query(&snapshot, &parsed, &options)?
         else {
-            return Err("not a SELECT".into());
+            return Err(QueryEvaluationError::Service("not a SELECT".into()));
         };
-        let variables = solutions.variables().to_vec();
-        let mut rows = Vec::new();
-        for solution in solutions {
-            let solution = solution?;
-            rows.push(variables.iter().map(|v| solution.get(v).cloned()).collect());
+        let mut result = ServiceResults::new(solutions.variables().to_vec(), budget);
+        let stop = nrese_exec::StopSource::new(cancellation.map(CancellationToken::flag), None);
+        let mut solutions = solutions;
+        loop {
+            stop.check().map_err(QueryEvaluationError::from)?;
+            let next = solutions.next();
+            stop.check().map_err(QueryEvaluationError::from)?;
+            let Some(solution) = next else {
+                break;
+            };
+            result.push_row(solution?.values(), &stop)?;
         }
-        Ok(ServiceResults { variables, rows })
+        Ok(result)
     }
 }
 

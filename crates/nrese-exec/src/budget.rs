@@ -153,6 +153,13 @@ enum Parent {
 pub struct Envelope(Arc<Budget>);
 
 impl Envelope {
+    /// Shares this exact existing owner, without allocating a new budget or
+    /// changing its limit or parent. Nested `part()` charges draw from it beside
+    /// the caller's live allocations, including results that escape the call.
+    pub fn from_budget(budget: Arc<Budget>) -> Self {
+        Self(budget)
+    }
+
     /// `limit` bytes (`None`: unlimited) within `server`'s budget.
     pub fn new(limit: Option<usize>, server: Option<Arc<SharedBudget>>) -> Self {
         Self(Arc::new(
@@ -1091,6 +1098,64 @@ impl<B: Deref<Target = Budget>> Gauge<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn n7_existing_budget_envelope_refuses_concurrent_overlap() {
+        let root = Arc::new(Budget::new(1000));
+        let envelope = Envelope::from_budget(Arc::clone(&root));
+        assert!(Arc::ptr_eq(&envelope.0, &root));
+        let mut caller = Reservation::new(&*root);
+        caller.charge(200).unwrap();
+        let barrier = std::sync::Barrier::new(3);
+        let accepted = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let envelope = &envelope;
+                let root = &root;
+                let barrier = &barrier;
+                let accepted = &accepted;
+                scope.spawn(move || {
+                    let child = envelope.part();
+                    let Some(Parent::Envelope(parent)) = &child.parent else {
+                        panic!("same owner")
+                    };
+                    assert!(Arc::ptr_eq(&parent.0, root));
+                    let mut live = Reservation::new(&child);
+                    barrier.wait();
+                    if live.charge(600).is_ok() {
+                        accepted.fetch_add(1, Ordering::SeqCst);
+                    }
+                    barrier.wait();
+                    barrier.wait();
+                    drop(live);
+                });
+            }
+            barrier.wait();
+            barrier.wait();
+            assert_eq!(accepted.load(Ordering::SeqCst), 1);
+            assert_eq!(root.used(), 800);
+            barrier.wait();
+        });
+        assert_eq!(root.used(), 200);
+        drop(caller);
+        assert_eq!(root.used(), 0);
+    }
+
+    #[test]
+    fn n7_existing_budget_envelope_keeps_escaping_result_charged() {
+        let root = Arc::new(Budget::new(1024));
+        let weak = Arc::downgrade(&root);
+        let envelope = Envelope::from_budget(Arc::clone(&root));
+        let child = Arc::new(envelope.part());
+        let result = ChargedVec::<u64>::with_capacity(child, 128).unwrap();
+        assert_eq!(root.used(), 1024); // One payload, not a duplicated charge.
+        assert!(root.charge(1).is_err());
+        drop(envelope);
+        drop(root);
+        assert_eq!(weak.upgrade().unwrap().used(), 1024);
+        drop(result);
+        assert!(weak.upgrade().is_none());
+    }
 
     #[test]
     fn a_shared_rebind_keeps_the_actual_budget_and_its_charge_alive() {
