@@ -445,10 +445,14 @@ fn options(raw: Vec<String>) -> Result<Options, String> {
 /// 2: `%` and `#` in either part percent-encoded (20 Oct 2026; 1: plain concatenation).
 pub(crate) const CONTEXT_NAMES: u32 = 2;
 
-/// Whether a `.pie` text may state a statement in a context (any `[Context` at all, comments
-/// included: a needless rebuild at worst).
+/// Whether a `.pie` text may state a statement in a context, using the parser's comment
+/// removal and option whitespace. A match inside a literal or IRI can only rebuild a
+/// closure unnecessarily; an accepted context option must never be missed.
 pub(crate) fn uses_contexts(text: &str) -> bool {
-    text.contains("[Context")
+    strip_comments(text)
+        .split('[')
+        .skip(1)
+        .any(|option| option.trim_start().starts_with("Context"))
 }
 
 /// The predicate a statement in `context` gets ([`compile`]'s docs): the pair's one name.

@@ -20,6 +20,8 @@ pub struct UserRules {
     name: String,
     text: String,
     format: RuleFormat,
+    /// Selected once with the validated text; fingerprint checks must not parse it again.
+    pie_contexts: bool,
 }
 
 /// The languages user rules are read in.
@@ -47,12 +49,14 @@ impl UserRules {
         text: impl Into<String>,
         format: RuleFormat,
     ) -> Result<Self, ParseError> {
-        let rules = Self {
+        let mut rules = Self {
             name: name.into(),
             text: text.into(),
             format,
+            pie_contexts: false,
         };
         rules.compile(&mut LocalVocabulary::default())?;
+        rules.pie_contexts = format == RuleFormat::Pie && super::pie::uses_contexts(&rules.text);
         Ok(rules)
     }
 
@@ -134,7 +138,7 @@ impl RuleProgram {
         feed(user.text.as_bytes());
         // A GraphDB ruleset with contexts derives relations named by the PIE compiler; a
         // change of those names is a change of what it derives. Others keep their value.
-        if user.format == RuleFormat::Pie && super::pie::uses_contexts(&user.text) {
+        if user.pie_contexts {
             feed(b"pie-context-names:");
             feed(&super::pie::CONTEXT_NAMES.to_le_bytes());
         }
@@ -245,7 +249,18 @@ Id: r
   x <e:q> y
 }
 ";
-        for (text, rebuilds) in [(with, true), (without, false)] {
+        let spaced = with.replace("[Context", "[ Context");
+        let tabbed = with.replace("[Context", "[\tContext");
+        let prefixed_comment = with.replace("[Context", "[/*gap*/Context");
+        let inner_comment = with.replace("[Context", "[Con/*gap*/text");
+        for (text, rebuilds) in [
+            (with, true),
+            (&spaced, true),
+            (&tabbed, true),
+            (&prefixed_comment, true),
+            (&inner_comment, true),
+            (without, false),
+        ] {
             let user = Arc::new(UserRules::pie("rules.pie", text).unwrap());
             let program = RuleProgram::new(None, Some(user)).unwrap();
             let stored = fingerprint_before_context_names(text);
