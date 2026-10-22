@@ -1309,6 +1309,7 @@ dependencies = [
  "md-5",
  "nrese-engine",
  "nrese-exec",
+ "nrese-json",
  "nrese-owl",
  "nrese-rdf",
  "nrese-rdf-io",

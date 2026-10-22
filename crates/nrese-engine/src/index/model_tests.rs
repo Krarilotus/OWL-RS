@@ -133,6 +133,27 @@ fn all_patterns() -> Vec<QuadPattern> {
     patterns
 }
 
+fn admitted_groups(
+    version: &IndexVersion,
+    plan: &AccessPlan,
+    bound: usize,
+) -> std::collections::BTreeMap<u64, i64> {
+    let budget = nrese_exec::Budget::new(64 * 1024 * 1024);
+    let stop = || false;
+    let mut groups = super::groups::Groups::new(&budget, &stop, version.runs().len()).unwrap();
+    groups.prepare(version, plan, bound, &stop).unwrap();
+    let got = groups
+        .by_ref()
+        .map(|r| {
+            let (id, n) = r.unwrap();
+            (id.raw(), n as i64)
+        })
+        .collect();
+    drop(groups);
+    assert_eq!(budget.used(), 0);
+    got
+}
+
 fn assert_matches_model(version: &IndexVersion, model: &BTreeSet<EncodedQuad>, context: &str) {
     assert_eq!(version.len(), model.len() as u64, "{context}: len");
     let all: BTreeSet<_> = version.scan(&QuadPattern::all()).collect();
@@ -194,6 +215,11 @@ fn assert_matches_model(version: &IndexVersion, model: &BTreeSet<EncodedQuad>, c
                         .entry(permutation.to_key(quad)[bound])
                         .or_insert(0i64) += 1;
                 }
+                assert_eq!(
+                    admitted_groups(version, &plan, bound),
+                    grouped,
+                    "{context}: admitted groups {pattern:?} in {permutation:?}"
+                );
                 assert_eq!(
                     totals, grouped,
                     "{context}: group counts of {pattern:?} in {permutation:?}"
@@ -421,6 +447,7 @@ fn group_counts_of_large_ranges_add_up_across_parts() {
     for quad in quads.iter().filter(|q| !deleted.contains(q)) {
         *expected.entry(quad.subject.raw()).or_insert(0i64) += 1;
     }
+    assert_eq!(admitted_groups(&version, &plan, 1), expected);
     assert_eq!(totals, expected);
 }
 
@@ -454,4 +481,33 @@ fn every_layout_keeps_every_access_plans_permutation() {
             }
         }
     }
+}
+
+/// Actual physical-work counters: a large constant group stays galloping/part-backed.
+#[test]
+fn admitted_group_parts_keep_group_skipping_and_release() {
+    let quads = (0..200_000)
+        .map(|i| EncodedQuad::new(term(1), term(2), term(100 + i), graph(0)))
+        .collect();
+    let version = IndexVersion::from_quads(Layout::DefaultGraph, IndexEncoding::Fast, quads);
+    let plan = AccessPlan::in_permutation(&QuadPattern::all(), Permutation::Spog).unwrap();
+    let budget = nrese_exec::Budget::new(1024 * 1024);
+    let stop = || false;
+    let mut groups = super::groups::Groups::new(&budget, &stop, 1).unwrap();
+    groups.prepare(&version, &plan, 0, &stop).unwrap();
+    eprintln!(
+        "group-work {:?}; retained={} peak={}",
+        groups.work,
+        budget.used(),
+        budget.peak()
+    );
+    assert_eq!(groups.work.parts, 4);
+    assert_eq!(groups.work.rows, 4);
+    assert!(
+        groups.work.units < 20_000,
+        "must skip constant groups, not decode all keys"
+    );
+    assert_eq!(groups.next().unwrap().unwrap(), (term(1), 200_000));
+    assert!(groups.next().is_none());
+    assert_eq!(budget.used(), 0);
 }

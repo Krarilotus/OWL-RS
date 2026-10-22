@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use nrese_exec::{Budget, StopCheck, StopSource};
 use nrese_sparql::{CancellationToken, QueryEvaluationError, ServiceClient, ServiceResults};
-use nrese_sparql_results::{QueryResultsFormat, QueryResultsParser, SliceQueryResultsParserOutput};
+use nrese_sparql_results::QueryResultsFormat;
 use nrese_store::FederationConfig;
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 
@@ -142,9 +142,8 @@ fn format_for(media_type: &str) -> QueryResultsFormat {
     }
 }
 
-/// Partial parser port: the existing L0 parser still owns unadmitted startup,
-/// lexical scratch and the source row. Only retained response copies are admitted
-/// here. A new shared L0 control surface must be selected before extending it.
+/// JSON uses the scoped same-reservation builder. Other formats retain the
+/// existing ordinary parser/copy path with their allocation boundary open.
 fn parse(
     format: QueryResultsFormat,
     body: &[u8],
@@ -152,38 +151,7 @@ fn parse(
     budget: &Arc<Budget>,
     stop: &dyn StopCheck,
 ) -> Result<ServiceResults, QueryEvaluationError> {
-    stop.check().map_err(QueryEvaluationError::from)?;
-    let parsed = QueryResultsParser::from_format(format)
-        .for_slice(body)
-        .map_err(endpoint_error);
-    stop.check().map_err(QueryEvaluationError::from)?;
-    match parsed? {
-        SliceQueryResultsParserOutput::Boolean(_) => Err(QueryEvaluationError::Service(
-            "the endpoint answered a boolean".into(),
-        )),
-        SliceQueryResultsParserOutput::Solutions(solutions) => {
-            let variables = solutions.variables().to_vec();
-            let mut result = ServiceResults::new(variables, budget);
-            let mut solutions = solutions;
-            loop {
-                stop.check().map_err(QueryEvaluationError::from)?;
-                let next = solutions.next();
-                stop.check().map_err(QueryEvaluationError::from)?;
-                let Some(solution) = next else {
-                    break;
-                };
-                if result.rows().len() == max_rows {
-                    return Err(QueryEvaluationError::Service(
-                        format!("more than {max_rows} rows (federation.max_rows)").into(),
-                    ));
-                }
-                let solution = solution.map_err(endpoint_error)?;
-                result.push_row(solution.values(), stop)?;
-            }
-            stop.check().map_err(QueryEvaluationError::from)?;
-            Ok(result)
-        }
-    }
+    ServiceResults::from_slice(format, body, max_rows, budget, stop)
 }
 
 #[cfg(test)]

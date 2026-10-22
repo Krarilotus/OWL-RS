@@ -28,7 +28,8 @@
 //!   rejected, like an OWL 2 RL violation.
 //! - Axioms: facts that hold whatever the data.
 //! - `[Constraint x != blank_node]`: `x` mustn't be a blank node; constraints may stand on
-//!   conclusions too (they apply to the rule).
+//!   conclusions too (inline guards apply to that statement).
+//!   Constraint-only physical lines retain their accepted block-wide behavior.
 //! - `[Context <g>]`: GraphDB's internal contexts for auxiliary statements (`onto:_allDiff`,
 //!   `onto:scm_int`). A statement in a context becomes one with a predicate of its own,
 //!   `urn:nrese:pie-context:<g>#<p>`, so rules that read the context see exactly what rules
@@ -46,7 +47,7 @@
 
 use std::collections::HashMap;
 
-use super::ir::{Atom, Guard, Head, ParseError, Rule, Term, Vocabulary};
+use super::ir::{Atom, Guard, Head, HeadGroup, ParseError, Rule, Term, Vocabulary};
 use super::n3::N3Program;
 
 /// Compiles `text`, a `.pie` document (`name` prefixes errors).
@@ -55,6 +56,15 @@ pub fn compile(
     text: &str,
     vocabulary: &mut impl Vocabulary,
 ) -> Result<N3Program, ParseError> {
+    compile_with_features(name, text, vocabulary).map(|(program, _)| program)
+}
+
+/// Parse-derived marker, before factoring/folding; no lexical heuristic or reparse.
+pub(crate) fn compile_with_features(
+    name: &str,
+    text: &str,
+    vocabulary: &mut impl Vocabulary,
+) -> Result<(N3Program, bool), ParseError> {
     // Errors name the line they are on (comments are stripped line for line, so the
     // numbers are the document's); 0 for the document as a whole.
     let error = |rule: &str, line: usize, message: String| {
@@ -115,14 +125,26 @@ pub fn compile(
         ]);
     }
     let mut rules = Vec::new();
+    let mut affected = false;
     for (kind, rule_name, body, number) in
         rule_blocks(&rules_text.0, rules_text.1).map_err(|m| error("", 0, m))?
     {
-        let rule = compile_rule(&kind, &rule_name, &body, &prefixes, vocabulary)
+        let mut rule = compile_rule(&kind, &rule_name, &body, &prefixes, vocabulary)
             .map_err(|m| error(&rule_name, number, m))?;
+        if let Head::Grouped(groups) = &rule.head {
+            // A marker only when old rule-wide lowering differs: single/equal-head
+            // conjunctions and standalone block-wide constraints retain their old ID.
+            affected |= groups.iter().any(|group| {
+                group.guards.iter().any(|guard| {
+                    !rule.guards.contains(guard)
+                        && groups.iter().any(|other| !other.guards.contains(guard))
+                })
+            });
+        }
+        rule.factor_head_guards();
         rules.push(rule);
     }
-    Ok(N3Program { rules, facts })
+    Ok((N3Program { rules, facts }, affected))
 }
 
 /// The non-empty lines of `text`, trimmed, with their line numbers in the document
@@ -502,14 +524,19 @@ fn compile_rule(
             other => constant(other, prefixes, vocabulary).map(Term::Const),
         }
     };
+    type StatementWithConstraints = ([Token; 3], Vec<String>);
     // Statements of a block of lines, with the lines' constraints.
-    let statements = |lines: &[String]| -> Result<(Vec<[Token; 3]>, Vec<String>), String> {
+    let statements = |lines: &[String],
+                      heads: bool|
+     -> Result<(Vec<StatementWithConstraints>, Vec<String>), String> {
         let mut statements = Vec::new();
         let mut constraints = Vec::new();
         for line in lines {
             let (terms, raw) = tokens(line)?;
             let options = options(raw)?;
-            constraints.extend(options.constraints);
+            if !heads || terms.is_empty() {
+                constraints.extend(options.constraints.iter().cloned());
+            }
             for triple in terms.chunks(3) {
                 let [s, p, o] = triple else {
                     return Err(format!("a statement isn't three terms: {line}"));
@@ -518,16 +545,23 @@ fn compile_rule(
                     Some(context) => context_predicate(context, p, prefixes)?,
                     None => p.clone(),
                 };
-                statements.push([s.clone(), p, o.clone()]);
+                statements.push((
+                    [s.clone(), p, o.clone()],
+                    if heads {
+                        options.constraints.clone()
+                    } else {
+                        Vec::new()
+                    },
+                ));
             }
         }
         Ok((statements, constraints))
     };
-    let (premises, mut constraints) = statements(&lines[..divider])?;
-    let (conclusions, more) = statements(&lines[divider + 1..])?;
+    let (premises, mut constraints) = statements(&lines[..divider], false)?;
+    let (conclusions, more) = statements(&lines[divider + 1..], true)?;
     constraints.extend(more);
     let mut body = Vec::new();
-    for [s, p, o] in &premises {
+    for ([s, p, o], _) in &premises {
         body.push(Atom([
             term(s, &mut variables, vocabulary)?,
             term(p, &mut variables, vocabulary)?,
@@ -535,38 +569,47 @@ fn compile_rule(
         ]));
     }
     let bound = variables.clone();
-    let mut guards = Vec::new();
-    for constraint in constraints {
-        let (left, right) = constraint
-            .split_once("!=")
-            .ok_or_else(|| format!("a constraint isn't 'a != b': {constraint}"))?;
-        let side = |text: &str, vocabulary: &mut _| -> Result<Term, String> {
-            let (tokens, _) = tokens(text.trim())?;
-            let [token] = tokens.as_slice() else {
-                return Err(format!("a constraint side isn't one term: {text}"));
+    fn compile_guards(
+        constraints: &[String],
+        bound: &HashMap<String, u8>,
+        prefixes: &HashMap<String, String>,
+        vocabulary: &mut impl Vocabulary,
+    ) -> Result<Vec<Guard>, String> {
+        let mut guards = Vec::new();
+        for constraint in constraints {
+            let (left, right) = constraint
+                .split_once("!=")
+                .ok_or_else(|| format!("a constraint isn't 'a != b': {constraint}"))?;
+            let side = |text: &str, vocabulary: &mut _| -> Result<Term, String> {
+                let (tokens, _) = tokens(text.trim())?;
+                let [token] = tokens.as_slice() else {
+                    return Err(format!("a constraint side isn't one term: {text}"));
+                };
+                match token {
+                    Token::Var(v) => bound
+                        .get(v)
+                        .map(|&v| Term::Var(v))
+                        .ok_or_else(|| format!("constraint variable {v} isn't in a premise")),
+                    other => constant(other, prefixes, vocabulary).map(Term::Const),
+                }
             };
-            match token {
-                Token::Var(v) => bound
-                    .get(v)
-                    .map(|&v| Term::Var(v))
-                    .ok_or_else(|| format!("constraint variable {v} isn't in a premise")),
-                other => constant(other, prefixes, vocabulary).map(Term::Const),
+            if right.trim() == "blank_node" {
+                let (low, high) = vocabulary
+                    .blank_node_ids()
+                    .ok_or("this store can't tell blank nodes in a rule")?;
+                guards.push(Guard::NotIn(side(left, vocabulary)?, low, high));
+            } else {
+                guards.push(Guard::NotEqual(
+                    side(left, vocabulary)?,
+                    side(right, vocabulary)?,
+                ));
             }
-        };
-        if right.trim() == "blank_node" {
-            let (low, high) = vocabulary
-                .blank_node_ids()
-                .ok_or("this store can't tell blank nodes in a rule")?;
-            guards.push(Guard::NotIn(side(left, vocabulary)?, low, high));
-        } else {
-            guards.push(Guard::NotEqual(
-                side(left, vocabulary)?,
-                side(right, vocabulary)?,
-            ));
         }
+        Ok(guards)
     }
-    let mut head_atoms = Vec::new();
-    for [s, p, o] in &conclusions {
+    let guards = compile_guards(&constraints, &bound, prefixes, vocabulary)?;
+    let mut groups: Vec<HeadGroup> = Vec::with_capacity(conclusions.len());
+    for ([s, p, o], local) in &conclusions {
         for token in [s, p, o] {
             if let Token::Var(v) = token
                 && !bound.contains_key(v)
@@ -574,17 +617,26 @@ fn compile_rule(
                 return Err(format!("conclusion variable {v} isn't bound by a premise"));
             }
         }
-        head_atoms.push(Atom([
+        let atom = Atom([
             term(s, &mut variables, vocabulary)?,
             term(p, &mut variables, vocabulary)?,
             term(o, &mut variables, vocabulary)?,
-        ]));
+        ]);
+        let local = compile_guards(local, &bound, prefixes, vocabulary)?;
+        if let Some(group) = groups.iter_mut().find(|g| g.guards == local) {
+            group.heads.push(atom);
+        } else {
+            groups.push(HeadGroup {
+                guards: local,
+                heads: vec![atom],
+            });
+        }
     }
     let head = match kind {
-        "Consistency" if head_atoms.is_empty() => Head::Inconsistent,
+        "Consistency" if groups.is_empty() => Head::Inconsistent,
         "Consistency" => return Err("a consistency check has conclusions".into()),
-        _ if head_atoms.is_empty() => return Err("a rule without conclusions".into()),
-        _ => Head::Facts(head_atoms),
+        _ if groups.is_empty() => return Err("a rule without conclusions".into()),
+        _ => Head::Grouped(groups.into_boxed_slice()),
     };
     if body.is_empty() {
         return Err("a rule without premises".into());

@@ -22,6 +22,7 @@ pub(crate) mod compaction;
 mod compression_study;
 pub(crate) mod cursor;
 mod derive;
+pub(crate) mod groups;
 pub(crate) mod keys;
 mod merge;
 pub(crate) mod run;
@@ -441,37 +442,28 @@ impl IndexVersion {
         let Some((perm, start, end)) = found else {
             return Some(0);
         };
-        // Per part: its groups, its first value and its last.
-        let walk = |start: usize, end: usize| {
-            let (mut groups, mut first, mut last) = (0u64, None, None);
-            perm.keys.groups(start, end, position, |value, _, _| {
-                groups += 1;
-                first.get_or_insert(value);
-                last = Some(value);
-            });
-            (groups, first, last)
+        let walk = |a: usize, b: usize| {
+            let mut groups = 0u64;
+            perm.keys.groups(a, b, position, |_, _, _| groups += 1);
+            // Each cut owns its first group only if it starts a different value.
+            groups
+                - u64::from(
+                    a > start && perm.keys.get(a - 1)[position] == perm.keys.get(a)[position],
+                )
         };
-        if end - start < 2 * GROUP_PART {
-            return Some(walk(start, end).0);
+        let parts = groups::parts(start, end);
+        if parts == 1 {
+            return Some(walk(start, end));
         }
-        let cuts: Vec<usize> = std::iter::once(start)
-            .chain((start / GROUP_PART + 1..end.div_ceil(GROUP_PART)).map(|p| p * GROUP_PART))
-            .chain(std::iter::once(end))
-            .collect();
-        let parts: Vec<(u64, Option<u64>, Option<u64>)> = cuts
-            .par_windows(2)
-            .map(|cut| walk(cut[0], cut[1]))
-            .collect();
-        let mut total = 0;
-        let mut previous: Option<u64> = None;
-        for (groups, first, last) in parts {
-            total += groups;
-            if previous.is_some() && previous == first {
-                total -= 1;
-            }
-            previous = last.or(previous);
-        }
-        Some(total)
+        Some(
+            (0..parts)
+                .into_par_iter()
+                .map(|p| {
+                    let (a, b) = groups::part(start, end, p);
+                    walk(a, b)
+                })
+                .sum(),
+        )
     }
 
     /// Appends the distinct values at key `position` of each run's range for `plan` (sorted

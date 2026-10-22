@@ -1767,16 +1767,45 @@ pub(crate) fn same_as_of(rules: &[Rule]) -> Option<u64> {
     Equality::for_rules(rules).map(|equality| equality.same_as)
 }
 
-/// The rules the equality module replaces.
+/// One eligibility policy for source rules and their retained grounding provenance.
+/// Generic producers must run even when their proof name resembles a module rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EqualityRule {
+    Generic,
+    Replacement,
+    Closure,
+}
+
+/// Source-origin exemption, distinct from ordinary rules that execute generically.
+pub(crate) fn equality_exempt(rule: &Rule) -> bool {
+    matches!(rule.head, Head::Grouped(_))
+}
+
+pub(crate) fn equality_rule(rule: &Rule) -> EqualityRule {
+    // Keep the older Facts name contract and its fingerprint unchanged. Grouped
+    // sources are newly affected and must not acquire a module role by normalization.
+    if equality_exempt(rule) {
+        return EqualityRule::Generic;
+    }
+    match rule.name.as_str() {
+        "eq-rep-s" | "eq-rep-p" | "eq-rep-o" => EqualityRule::Replacement,
+        "eq-sym" | "eq-trans" => EqualityRule::Closure,
+        _ => EqualityRule::Generic,
+    }
+}
+
+/// The source rules the equality module replaces.
 pub(crate) fn is_replacement_rule(rule: &Rule) -> bool {
-    matches!(rule.name.as_str(), "eq-rep-s" | "eq-rep-p" | "eq-rep-o")
+    equality_rule(rule) == EqualityRule::Replacement
 }
 
 impl Equality {
     /// The module for `rules`, if they include `eq-rep-s` (whose first atom names
     /// `owl:sameAs`).
     pub(crate) fn for_rules(rules: &[Rule]) -> Option<Self> {
-        let rule = rules.iter().find(|r| r.name == "eq-rep-s")?;
+        let rule = rules
+            .iter()
+            .find(|r| r.name == "eq-rep-s" && is_replacement_rule(r))?;
         match rule.body.first()?.0[1] {
             super::ir::Term::Const(same_as) => Some(Self {
                 same_as,
@@ -1985,10 +2014,22 @@ impl Representatives {
 
     /// The facts the merge that took the places of `lost` makes stale, rewritten.
     /// `rules` as they run over the classes: their term guards decided over them.
-    fn guarded(&self, rules: Vec<Rule>) -> Vec<Rule> {
+    fn guarded(
+        &self,
+        rules: Vec<Rule>,
+        stop: super::eval::Stop<'_>,
+    ) -> Result<Vec<Rule>, Interrupted> {
+        let mut poll = Poller::new(stop).ok_or(Interrupted)?;
         rules
             .into_iter()
-            .map(|rule| super::representatives::over_classes(rule, self.same_as, &self.published))
+            .map(|rule| {
+                super::representatives::over_classes_polled(
+                    rule,
+                    self.same_as,
+                    &self.published,
+                    &mut poll,
+                )
+            })
             .collect()
     }
 
@@ -2014,6 +2055,15 @@ fn rewrite_rule(rule: &Rule, classes: &EqualityClasses) -> Rule {
         guards: rule.guards.clone(),
         head: match &rule.head {
             Head::Facts(atoms) => Head::Facts(atoms.iter().map(atom).collect()),
+            Head::Grouped(groups) => Head::Grouped(
+                groups
+                    .iter()
+                    .map(|g| super::ir::HeadGroup {
+                        guards: g.guards.clone(),
+                        heads: g.heads.iter().map(atom).collect(),
+                    })
+                    .collect(),
+            ),
             Head::Inconsistent => Head::Inconsistent,
         },
     }
@@ -2021,10 +2071,7 @@ fn rewrite_rule(rule: &Rule, classes: &EqualityClasses) -> Rule {
 
 /// Whether a constant of `rule` is in `terms`.
 fn names_any(rule: &Rule, terms: &HashSet<u64>) -> bool {
-    let atoms = match &rule.head {
-        Head::Facts(atoms) => rule.body.iter().chain(atoms),
-        Head::Inconsistent => rule.body.iter().chain(&[]),
-    };
+    let atoms = rule.body.iter().chain(rule.head.atoms());
     atoms
         .flat_map(|atom| atom.0)
         .any(|t| matches!(t, Term::Const(c) if terms.contains(&c)))
@@ -2320,7 +2367,7 @@ pub fn materialise_representatives_until(
 fn under_representatives(rules: &[Rule]) -> Vec<Rule> {
     rules
         .iter()
-        .filter(|r| !is_replacement_rule(r) && !matches!(r.name.as_str(), "eq-sym" | "eq-trans"))
+        .filter(|r| equality_rule(r) == EqualityRule::Generic)
         .cloned()
         .collect()
 }
@@ -2414,14 +2461,12 @@ fn run(
                 source.retain(|r| !is_replacement_rule(r));
             }
             if let Some(reps) = &representatives {
-                source = reps.guarded(source);
+                source = reps.guarded(source, stop)?;
             }
             guarded_schema = source
                 .iter()
                 .filter(|rule| {
-                    rule.guards
-                        .iter()
-                        .any(|guard| matches!(guard, super::ir::Guard::Classes(_)))
+                    rule.has_class_guards()
                         && rule.body.iter().any(|atom| schema.is_schema_atom(atom))
                 })
                 .cloned()
@@ -2483,14 +2528,8 @@ fn run(
         // family derives goes to the family's part of the delta.
         let mut jobs = Vec::new();
         let mut families: Vec<Option<u64>> = Vec::new();
-        let in_full = |r: usize| {
-            r >= evaluated
-                || (reevaluate
-                    && program.rules[r]
-                        .guards
-                        .iter()
-                        .any(|guard| matches!(guard, super::ir::Guard::Classes(_))))
-        };
+        let in_full =
+            |r: usize| r >= evaluated || (reevaluate && program.rules[r].has_class_guards());
         for (r, i) in program.variants(&store) {
             if !in_full(r) {
                 let family = program.closed_family(r);
@@ -2627,11 +2666,7 @@ fn run(
         result.counters.store_bytes.push(store.bytes());
         reevaluate = merged
             && (!guarded_schema.is_empty()
-                || program.rules.iter().any(|rule| {
-                    rule.guards
-                        .iter()
-                        .any(|guard| matches!(guard, super::ir::Guard::Classes(_)))
-                }));
+                || program.rules.iter().any(|rule| rule.has_class_guards()));
         if new == 0 && !reground_all && !reevaluate {
             break;
         }
@@ -2656,7 +2691,7 @@ fn run(
         };
         let checks = consistency_rules(&current, &rules, lists);
         let checks = match &representatives {
-            Some(reps) => reps.guarded(checks),
+            Some(reps) => reps.guarded(checks, stop)?,
             None => checks,
         };
         program.ground_until(&current, schema, &checks, false, stop)?;
@@ -3161,6 +3196,38 @@ mod chunk_tests {
         assert_eq!(
             written, plain,
             "pairs the merges wrote, with a closed part and without"
+        );
+    }
+
+    /// A newly grouped rule must not be replaced merely by its reserved name.
+    /// User-local guards cannot be erased by the equality specialization.
+    #[test]
+    fn guarded_reserved_names_are_not_replacement_kernels() {
+        use crate::ir::{Guard, HeadGroup};
+        let mut v = crate::vocabulary::LocalVocabulary::default();
+        let mut rule = crate::ir::parse_rules(
+            "eq-rep-s: (?s owl:sameAs ?t), (?s ?p ?o) -> (?t ?p ?o)",
+            &mut v,
+        )
+        .unwrap()
+        .remove(0);
+        assert!(is_replacement_rule(&rule));
+        assert!(Equality::for_rules(&[rule.clone()]).is_some());
+        let Head::Facts(heads) = rule.head.clone() else {
+            unreachable!()
+        };
+        rule.head = Head::Grouped(
+            vec![HeadGroup {
+                heads,
+                guards: vec![Guard::NotEqual(Term::Var(0), Term::Var(0))],
+            }]
+            .into_boxed_slice(),
+        );
+        assert!(!is_replacement_rule(&rule));
+        assert!(Equality::for_rules(&[rule.clone()]).is_none());
+        assert_eq!(
+            crate::representatives::without_replacement(&[rule.clone()]),
+            vec![rule]
         );
     }
 }

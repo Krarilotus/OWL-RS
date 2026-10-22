@@ -31,7 +31,7 @@ pub use error::{QueryResultsParseError, QueryResultsSyntaxError, TextPosition};
 pub use format::QueryResultsFormat;
 pub use parser::{
     QueryResultsParser, ReaderQueryResultsParserOutput, ReaderSolutionsParser,
-    SliceQueryResultsParserOutput, SliceSolutionsParser,
+    SliceQueryResultsParserOutput, SliceSolutionsParser, SolutionsCallbacks,
 };
 pub use serializer::{QueryResultsSerializer, WriterSolutionsSerializer, write_term};
 pub use solution::{QuerySolution, SolutionIndex};

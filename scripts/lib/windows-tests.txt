@@ -31,8 +31,11 @@ nrese-reasoner:memory_guards
 nrese-engine:bulk_load_memory
 nrese-engine:expansion_memory
 nrese-engine:measure_without_its_allocator
+nrese-engine:corpus_measure
+nrese-engine:corpus_memory
 nrese-store:lib:test(/^metadata::tests::/)
 nrese-store:it:test(/^repository_catalog_tests::/)
 nrese-store:support_memory
 nrese-server:process_memory
+nrese-server:lib:test(/^federation::body::tests::/)
 nrese-rdf-io:binary_bounds
