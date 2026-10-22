@@ -46,7 +46,7 @@ use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern,
 };
-use nrese_sparql_syntax::term::{TermPattern, TriplePattern};
+use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use super::{
     Agg, Context, NativeResult, Solutions, as_path, bound_variables, expression_variables,
@@ -193,6 +193,32 @@ impl Context<'_> {
         needed: &[Variable],
     ) -> NativeResult<Solutions> {
         let solutions = match pattern {
+            // A variable SERVICE needs the local endpoint groups before projection or
+            // deduplication. Use the existing bound join owner, then keep a set here.
+            GraphPattern::Join { inputs }
+                if inputs.iter().any(|input| {
+                    matches!(
+                        input,
+                        GraphPattern::Service {
+                            name: NamedNodePattern::Variable(_),
+                            ..
+                        }
+                    )
+                }) =>
+            {
+                self.eval(pattern)?
+            }
+            GraphPattern::LeftJoin { right, .. }
+                if matches!(
+                    &**right,
+                    GraphPattern::Service {
+                        name: NamedNodePattern::Variable(_),
+                        ..
+                    }
+                ) =>
+            {
+                self.eval(pattern)?
+            }
             // Paths joined to triple patterns: ordered with them (`path_joins`).
             GraphPattern::Join { .. }
                 if !self.as_written && super::path_joins::PathJoin::of(pattern).is_some() =>

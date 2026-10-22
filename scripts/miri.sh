@@ -19,18 +19,22 @@ tests=(
   region::tests::a_region_is_charged_before_it_grows_and_returns_everything
   region::tests::a_region_holds_at_its_boundaries
 )
-if ! cargo +nightly miri --version > /dev/null 2>&1; then
+nightly=$(sed -n 's/^miri //p' scripts/lib/gate-tools.txt | tr -d '\r')
+if ! cargo "+$nightly" miri --version > /dev/null 2>&1; then
   echo "miri.sh: no nightly Miri; rustup toolchain install nightly --component miri" >&2
   exit 1
 fi
 export MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-ignore-leaks"
 # Nightly reports lints stable doesn't; the gate's lints are stable clippy's.
 export CARGO_BUILD_WARNINGS=warn
-export CARGO_TARGET_DIR=target/miri
+export CARGO_TARGET_DIR=${NRESE_MIRI_TARGET_DIR:-target/miri}
+if [ -n "${NRESE_MIRI_TARGET_DIR:-}" ]; then
+  export CARGO_BUILD_BUILD_DIR="$CARGO_TARGET_DIR"
+fi
 status=0
 # Through cargo-guarded.sh: Miri's compiles wait for room like any other (no CPU flag, as before).
 for test in "${tests[@]}"; do
-  NRESE_TARGET_CPU=portable bash scripts/cargo-guarded.sh +nightly miri test --locked -q \
+  NRESE_TARGET_CPU=portable bash scripts/cargo-guarded.sh "+$nightly" miri test --locked -q \
     --target x86_64-unknown-linux-gnu -p nrese-exec --lib \
     -- --exact "$test" || status=1
 done

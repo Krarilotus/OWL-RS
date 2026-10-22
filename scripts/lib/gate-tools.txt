@@ -1,0 +1,9 @@
+# The gate's tools, at these versions wherever it runs: scripts/check.sh fails a run whose tools
+# differ (scripts/lib/gate-key.sh gate_tools_check), scripts/lib/gate-job.sh installs them on a
+# fleet host, and a pass's identity includes this file and benches/suite/requirements.txt.
+#
+#   name version
+cargo-nextest 0.9.146
+# Miri's toolchain (scripts/miri.sh)
+miri nightly-2026-10-01
+cargo-deny 0.20.2

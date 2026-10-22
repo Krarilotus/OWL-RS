@@ -1862,8 +1862,7 @@ impl<'a> Context<'a> {
                     return self.vector_join(&local, inner);
                 }
                 let bound = self.eval(&local)?;
-                let found = self.service(name, inner, *silent, Some(&bound))?;
-                self.join(bound, found)
+                self.bound_service(name, inner, *silent, bound, federation::ServiceJoin::Inner)
             }
             GraphPattern::LeftJoin {
                 left,
@@ -1879,8 +1878,13 @@ impl<'a> Context<'a> {
                     unreachable!("matched above")
                 };
                 let left = self.eval(left)?;
-                let found = self.service(name, inner, *silent, Some(&left))?;
-                self.left_join(left, found, expression.as_ref())
+                self.bound_service(
+                    name,
+                    inner,
+                    *silent,
+                    left,
+                    federation::ServiceJoin::Left(expression.as_ref()),
+                )
             }
             GraphPattern::Path {
                 subject,
