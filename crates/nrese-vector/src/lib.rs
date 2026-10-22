@@ -276,8 +276,9 @@ pub fn scan_bytes(k: usize, eligible: usize) -> usize {
 /// most `bound` are eligible (the caller's bound, from what it may read): the space's chunks
 /// in at most [`SCAN_PARTS`] runs of chunks, each its best of at most `min(k, bound)`, kept
 /// from the first vector it takes on, so that what it holds ([`scan_bytes`]) depends on `k`
-/// and `bound` alone. Eligibility is tested once a
-/// vector. Each part checks `stop` before each chunk; a stopped scan's hits are incomplete
+/// and `bound` alone. Eligibility is tested once a vector, before `accept`; its concrete
+/// predicate is kept so callers' membership checks can be inlined into the scan.
+/// Each part checks `stop` before each chunk; a stopped scan's hits are incomplete
 /// (the caller checks the flag after it).
 #[allow(clippy::too_many_arguments)]
 pub fn exact_scan(
@@ -285,7 +286,7 @@ pub fn exact_scan(
     query: &[f32],
     k: usize,
     metric: Metric,
-    eligible: &(dyn Fn(u64) -> bool + Sync),
+    eligible: &(impl Fn(u64) -> bool + Sync + ?Sized),
     accept: &(dyn Fn(u64) -> bool + Sync),
     bound: usize,
     stop: Option<&AtomicBool>,
@@ -468,9 +469,89 @@ mod tests {
             exact_from_until(&vectors, 0, &query, 5, Metric::L2, &accept, Some(&stop)).is_empty()
         );
         assert_eq!(compared.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            exact_scan(
+                &vectors,
+                &query,
+                5,
+                Metric::L2,
+                &accept,
+                &accept,
+                vectors.len(),
+                Some(&stop),
+            ),
+            (Vec::new(), 0)
+        );
+        assert_eq!(compared.load(Ordering::Relaxed), 0);
         stop.store(false, Ordering::Relaxed);
         let found = exact_from_until(&vectors, 0, &query, 5, Metric::L2, &accept, Some(&stop));
         assert_eq!(found, exact(&vectors, &query, 5, Metric::L2, &|_| true));
+    }
+
+    /// Eligibility still counts every readable vector before the caller's filter, across
+    /// chunk boundaries, for concrete and dynamically dispatched predicates alike.
+    #[test]
+    fn scoped_scans_match_sorted_distances_and_count_before_filtering() {
+        use std::sync::atomic::AtomicUsize;
+
+        for n in [CHUNK - 1, CHUNK, CHUNK + 1, 3 * CHUNK] {
+            let vectors = random_vectors(n, 3, 7);
+            let query = Query::new(vectors.get(123));
+            let readable = |id: u64| !id.is_multiple_of(5);
+            let accepted = |id: u64| id.is_multiple_of(7);
+            let bound = vectors.iter().filter(|(id, _)| readable(*id)).count();
+            for metric in [Metric::Cosine, Metric::Dot, Metric::L2] {
+                let tested = AtomicUsize::new(0);
+                let filtered = AtomicUsize::new(0);
+                let eligible = |id| {
+                    tested.fetch_add(1, Ordering::Relaxed);
+                    readable(id)
+                };
+                let accept = |id| {
+                    assert!(readable(id));
+                    filtered.fetch_add(1, Ordering::Relaxed);
+                    accepted(id)
+                };
+                let mut truth: Vec<Hit> = (0..vectors.len() as u32)
+                    .filter(|&p| readable(vectors.id(p)) && accepted(vectors.id(p)))
+                    .map(|p| Hit {
+                        id: vectors.id(p),
+                        distance: vectors.distance(metric, &query, p),
+                    })
+                    .collect();
+                truth.sort_by(|a, b| a.distance.total_cmp(&b.distance).then(a.id.cmp(&b.id)));
+                truth.truncate(10);
+                let found = exact_scan(
+                    &vectors,
+                    query.vector,
+                    10,
+                    metric,
+                    &eligible,
+                    &accept,
+                    bound,
+                    None,
+                );
+                assert_eq!(found, (truth, bound), "{n}, {metric:?}");
+                assert_eq!(tested.load(Ordering::Relaxed), n);
+                assert_eq!(filtered.load(Ordering::Relaxed), bound);
+                let erased: &(dyn Fn(u64) -> bool + Sync) = &eligible;
+                assert_eq!(
+                    exact_scan(
+                        &vectors,
+                        query.vector,
+                        10,
+                        metric,
+                        erased,
+                        &accept,
+                        bound,
+                        None,
+                    ),
+                    found
+                );
+                assert_eq!(tested.load(Ordering::Relaxed), 2 * n);
+                assert_eq!(filtered.load(Ordering::Relaxed), 2 * bound);
+            }
+        }
     }
 
     /// Pseudo-random vectors, the same every run.

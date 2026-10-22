@@ -1110,7 +1110,7 @@ impl Dictionary {
         &self,
         query: &super::VectorQuery,
         known: u64,
-        eligible: &(dyn Fn(TermId) -> bool + Sync),
+        eligible: &(impl Fn(TermId) -> bool + Sync + ?Sized),
         bound: usize,
         accept: &(dyn Fn(TermId) -> bool + Sync),
         budget: &std::sync::Arc<nrese_exec::Budget>,
