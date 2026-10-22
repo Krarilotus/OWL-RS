@@ -167,6 +167,30 @@ result_cache = "256MiB"
     );
 }
 
+#[test]
+fn planner_effort_defaults_and_unlimited_reach_the_typed_policy() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    for (text, expected) in [
+        (
+            "",
+            Some(nrese_sparql::PlannerOptions::DEFAULT_GREEDY_EFFORT),
+        ),
+        ("[budgets]\nplanner_effort = 17\n", Some(17)),
+        ("[budgets]\nplanner_effort = 0\n", None),
+    ] {
+        fs::write(&path, text).unwrap();
+        let config = crate::config::ServerConfig::load_isolated(&path, &[]).unwrap();
+        assert_eq!(config.policy.limits.planner.greedy_effort, expected);
+        assert!(config.summary().contains(&format!(
+            "budgets.planner_effort = {}",
+            expected.unwrap_or(0)
+        )));
+    }
+    fs::write(&path, "[budgets]\nplanner_effort = -1\n").unwrap();
+    assert!(crate::config::ServerConfig::load_isolated(&path, &[]).is_err());
+}
+
 /// A value of the wrong kind names its key; the command line's `--set` goes over the file
 /// and the environment, and its keys are checked like the file's.
 #[test]

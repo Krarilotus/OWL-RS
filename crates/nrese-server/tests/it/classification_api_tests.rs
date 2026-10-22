@@ -47,7 +47,10 @@ async fn the_hierarchy_as_json_and_as_triples() -> Result<(), Box<dyn std::error
     )?;
     let response = app.clone().oneshot(get("application/json")?).await?;
     assert_eq!(response.status(), StatusCode::OK);
-    let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let json_text = body_text(response).await?;
+    let json: serde_json::Value = serde_json::from_str(&json_text)?;
+    assert_eq!(json_text, serde_json::to_string(&json)?);
     let pairs: Vec<(String, String)> = serde_json::from_value(json["subsumptions"].clone())?;
     let has = |a: &str, b: &str| {
         pairs.contains(&(
@@ -68,13 +71,24 @@ async fn the_hierarchy_as_json_and_as_triples() -> Result<(), Box<dyn std::error
     assert_eq!(json["complete"], true);
     assert_eq!(json["consistent"], true);
 
+    // The pre-selection renderer emitted these two lists, in this order. Compare the
+    // complete body (including order and final newlines), not selected substrings.
+    let mut expected_triples = String::new();
+    for (sub, sup) in &pairs {
+        expected_triples.push_str(&format!(
+            "<{sub}> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <{sup}> .\n"
+        ));
+    }
+    for class in serde_json::from_value::<Vec<String>>(json["unsatisfiable"].clone())? {
+        expected_triples.push_str(&format!(
+            "<{class}> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://www.w3.org/2002/07/owl#Nothing> .\n"
+        ));
+    }
     let response = app.clone().oneshot(get("application/n-triples")?).await?;
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/n-triples");
     let text = body_text(response).await?;
-    assert!(text.contains(
-        "<http://example.com/Dog> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://example.com/TailedThing> ."
-    ));
-    assert!(text.contains("<http://example.com/PetRock> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://www.w3.org/2002/07/owl#Nothing> ."));
+    assert_eq!(text, expected_triples);
 
     // Realisation: rex is an Odd, so a Mammal and an Animal.
     let response = app
@@ -82,7 +96,10 @@ async fn the_hierarchy_as_json_and_as_triples() -> Result<(), Box<dyn std::error
         .oneshot(get_at("/dataset/realisation", "application/json")?)
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
-    let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let json_text = body_text(response).await?;
+    let json: serde_json::Value = serde_json::from_str(&json_text)?;
+    assert_eq!(json_text, serde_json::to_string(&json)?);
     assert_eq!(json["complete"], true);
     let types: Vec<String> =
         serde_json::from_value(json["types"]["http://example.com/rex"].clone())?;
@@ -93,12 +110,22 @@ async fn the_hierarchy_as_json_and_as_triples() -> Result<(), Box<dyn std::error
         );
     }
     assert!(!types.contains(&"http://example.com/Dog".to_owned()));
+    let mut expected_triples = String::new();
+    let individuals: std::collections::BTreeMap<String, Vec<String>> =
+        serde_json::from_value(json["types"].clone())?;
+    for (individual, types) in individuals {
+        for class in types {
+            expected_triples.push_str(&format!(
+                "<{individual}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{class}> .\n"
+            ));
+        }
+    }
     let response = app
         .oneshot(get_at("/dataset/realisation", "application/n-triples")?)
         .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "application/n-triples");
     let text = body_text(response).await?;
-    assert!(text.contains(
-        "<http://example.com/rex> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/Animal> ."
-    ));
+    assert_eq!(text, expected_triples);
     Ok(())
 }

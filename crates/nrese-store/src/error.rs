@@ -87,6 +87,14 @@ pub enum StoreError {
     /// Graph-level access control refused the request; nothing of it is applied.
     #[error(transparent)]
     Forbidden(#[from] Refusal),
+    /// A query's memory refusal as a reader of some graphs is told it
+    /// ([`Self::without_amounts`]): the limit, not the bytes held and asked for.
+    #[error(
+        "{}: limit {} MiB (what the query held and asked for is not reported to a reader of some graphs)",
+        memory_refusal(.shared),
+        .limit >> 20
+    )]
+    MemoryLimitWithoutAmounts { limit: usize, shared: bool },
 }
 
 /// Why graph-level access control refused a request.
@@ -113,6 +121,21 @@ impl From<nrese_exec::BudgetExceeded> for StoreError {
 }
 
 impl StoreError {
+    /// This error with a memory refusal's bytes held and asked for left out (for a reader
+    /// of some graphs: a scan of graphs it may not read can size them); any other as it is.
+    pub(crate) fn without_amounts(self) -> Self {
+        let refused = match self.evaluation() {
+            Some(QueryEvaluationError::MemoryLimit(exceeded)) => {
+                Some((exceeded.limit, exceeded.shared))
+            }
+            _ => None,
+        };
+        match refused {
+            Some((limit, shared)) => Self::MemoryLimitWithoutAmounts { limit, shared },
+            None => self,
+        }
+    }
+
     /// The evaluation error, of a query or of an update's pattern: both are classified
     /// alike (the review of 3 October 2026, A6).
     fn evaluation(&self) -> Option<&QueryEvaluationError> {
@@ -126,20 +149,22 @@ impl StoreError {
     /// The query needed more memory than its limit
     /// ([`SparqlQueryRequest::memory_limit`](crate::SparqlQueryRequest::memory_limit)).
     pub fn is_memory_limit(&self) -> bool {
-        matches!(
-            self.evaluation(),
-            Some(QueryEvaluationError::MemoryLimit(_))
-        )
+        matches!(self, Self::MemoryLimitWithoutAmounts { .. })
+            || matches!(
+                self.evaluation(),
+                Some(QueryEvaluationError::MemoryLimit(_))
+            )
     }
 
     /// The query needed memory that other running queries hold: the server's budget for
     /// all queries ([`StoreConfig::total_query_memory_bytes`](crate::StoreConfig)) is
     /// used up. The same query may succeed later.
     pub fn is_server_memory_limit(&self) -> bool {
-        matches!(
-            self.evaluation(),
-            Some(QueryEvaluationError::MemoryLimit(exceeded)) if exceeded.shared
-        )
+        matches!(self, Self::MemoryLimitWithoutAmounts { shared: true, .. })
+            || matches!(
+                self.evaluation(),
+                Some(QueryEvaluationError::MemoryLimit(exceeded)) if exceeded.shared
+            )
     }
 
     /// True if the request is at fault (syntax, invalid IRIs or payloads, unsupported query
@@ -173,11 +198,21 @@ impl StoreError {
             | Self::MaterialisationCancelled
             | Self::InferencesNotRecorded(_)
             | Self::ProcessMemoryLimit { .. }
+            | Self::MemoryLimitWithoutAmounts { .. }
             | Self::LoadCancelled
             // Answered by the transport as what it is (the query is fine; its answers
             // can't be proven complete).
             | Self::Incomplete(_) => false,
         }
+    }
+}
+
+/// What a memory refusal says first: whose memory ran out ([`nrese_exec::BudgetExceeded`]'s
+/// words).
+fn memory_refusal(shared: &bool) -> &'static str {
+    match shared {
+        true => "the server's query memory is in use",
+        false => "query memory budget exceeded",
     }
 }
 
@@ -205,5 +240,17 @@ mod tests {
             assert_eq!(query.is_memory_limit(), update.is_memory_limit());
         }
         assert!(!StoreError::SparqlUpdate(UpdateError::Cancelled).is_request_error());
+    }
+
+    #[test]
+    fn invalid_text_queries_are_request_errors_through_select_and_update() {
+        let error =
+            || QueryEvaluationError::from(EngineError::InvalidTextQuery("bad suffix".into()));
+        assert!(matches!(error(), QueryEvaluationError::Argument(_)));
+        assert!(StoreError::SparqlEvaluation(error()).is_request_error());
+        assert!(StoreError::SparqlUpdate(UpdateError::Evaluation(error())).is_request_error());
+        let error = QueryEvaluationError::from(EngineError::Corruption("storage fault".into()));
+        assert!(matches!(error, QueryEvaluationError::Dataset(_)));
+        assert!(!StoreError::SparqlEvaluation(error).is_request_error());
     }
 }

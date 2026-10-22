@@ -5,7 +5,7 @@ fn lower_true_store() -> Arc<StoreService> {
     use crate::{
         MutationCommand, MutationPipeline, MutationTicket, Requester, SparqlUpdateRequest,
     };
-    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_reasoner::{ReasonerConfig, ReasoningMode};
     let store = Arc::new(
         StoreService::new(crate::StoreConfig {
             ..crate::StoreConfig::in_memory()
@@ -14,9 +14,7 @@ fn lower_true_store() -> Arc<StoreService> {
     );
     let pipeline = MutationPipeline::new(
         Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Dl,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
     );
     pipeline
         .apply(

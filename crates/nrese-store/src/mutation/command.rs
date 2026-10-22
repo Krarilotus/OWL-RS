@@ -185,27 +185,31 @@ impl UpdateContext<'_> {
         &self.namespaces
     }
 
-    /// What the executor evaluates a write's patterns with: the cancellation and the
-    /// request's memory envelope (within the catalog's budget, as its DL gate draws).
-    pub fn resources(&self) -> nrese_sparql::Resources {
+    /// What the executor evaluates a write's patterns with: the cancellation, the
+    /// request's memory envelope (within the catalog's budget, as its DL gate draws) and
+    /// the request's join-order effort (`planner`, as a query of the request gets it).
+    pub fn resources(&self, planner: nrese_sparql::PlannerOptions) -> nrese_sparql::Resources {
         nrese_sparql::Resources {
+            planner,
             cancellation: Some(self.cancellation.clone()),
             memory: self.memory.clone(),
             ..Default::default()
         }
     }
 
-    /// The options of a SPARQL update for `requester` over the `using` dataset: what a
-    /// write lowered to SPARQL Update's algebra runs [`nrese_sparql::apply_update`] with,
-    /// the requester's graph access included.
+    /// The options of a SPARQL update for `requester` over the `using` dataset, its
+    /// `WHERE` clauses planned with `planner`: what a write lowered to SPARQL Update's
+    /// algebra runs [`nrese_sparql::apply_update`] with, the requester's graph access
+    /// included.
     pub fn update_options(
         &self,
         requester: &crate::Requester,
         using: Option<nrese_sparql::QueryDatasetSpecification>,
+        planner: nrese_sparql::PlannerOptions,
     ) -> UpdateOptions {
         UpdateOptions {
             using,
-            resources: self.resources(),
+            resources: self.resources(planner),
             union_default_graph: self.union_default_graph,
             services: self.services.clone(),
             access: requester.read.access().cloned(),
@@ -216,6 +220,20 @@ impl UpdateContext<'_> {
 }
 
 /// Applies a SPARQL update request to `tx` for `requester`.
+/// What a SPARQL update request's `WHERE` clauses are evaluated with: the request's dataset
+/// and planner options, through the one context every write takes.
+fn sparql_update_options(
+    request: &SparqlUpdateRequest,
+    requester: &crate::Requester,
+    context: &UpdateContext<'_>,
+) -> Result<UpdateOptions, StoreError> {
+    let using = crate::query_executor::protocol_dataset(
+        &request.using_graphs,
+        &request.using_named_graphs,
+    )?;
+    Ok(context.update_options(requester, using, request.planner))
+}
+
 pub(crate) fn apply_sparql_update(
     tx: &mut Transaction<'_>,
     request: &SparqlUpdateRequest,
@@ -239,14 +257,14 @@ pub(crate) fn apply_sparql_update(
             parser.parse_update(&request.update).map_err(|_| error)?
         }
     };
-    let using = crate::query_executor::protocol_dataset(
-        &request.using_graphs,
-        &request.using_named_graphs,
-    )?;
-    let options = context.update_options(requester, using);
+    let options = sparql_update_options(request, requester, context)?;
     apply_update(tx, &update, &options).map_err(|error| match error {
         nrese_sparql::UpdateError::Forbidden(graph) => crate::Refusal::Write(graph).into(),
-        error => error.into(),
+        // A memory refusal of its WHERE as its reader may be told it: a scan of graphs a
+        // reader of some may not read sized what it held and asked for (round 13, R13-diag;
+        // the queries' own, `StoreService::run_reporting`).
+        error if requester.read.reads_everything() => error.into(),
+        error => StoreError::from(error).without_amounts(),
     })
 }
 
@@ -311,5 +329,34 @@ pub(crate) fn graph_name(
         Some(nrese_rdf::Term::NamedNode(node)) => nrese_rdf::GraphName::NamedNode(node),
         Some(nrese_rdf::Term::BlankNode(node)) => nrese_rdf::GraphName::BlankNode(node),
         _ => nrese_rdf::GraphName::DefaultGraph,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nrese_sparql::{CancellationToken, PlannerOptions};
+
+    use crate::{Requester, SparqlUpdateRequest, StoreConfig, StoreService};
+
+    /// A non-default planner setting reaches an update's `WHERE` clauses: the options a
+    /// SPARQL update is evaluated with carry the request's effort, a bound and `unlimited`
+    /// alike, through the one context every write takes; a request without one plans
+    /// with the default, as a query does.
+    #[test]
+    fn the_request_planner_reaches_an_updates_where_clauses() {
+        let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+        let cancellation = CancellationToken::new();
+        let context = store.update_context(&cancellation);
+        let mut request = SparqlUpdateRequest::new("DELETE WHERE { ?s ?p ?o }");
+        let options = super::sparql_update_options(&request, &Requester::all(), &context);
+        assert_eq!(
+            options.unwrap().resources.planner,
+            PlannerOptions::default()
+        );
+        for effort in [Some(17), None] {
+            request.planner.greedy_effort = effort;
+            let options = super::sparql_update_options(&request, &Requester::all(), &context);
+            assert_eq!(options.unwrap().resources.planner.greedy_effort, effort);
+        }
     }
 }

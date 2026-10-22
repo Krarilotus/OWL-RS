@@ -67,7 +67,7 @@ use parking_lot::Mutex;
 use crate::engine::{Stack, Version};
 use crate::error::{EngineError, EngineResult};
 use crate::index::compaction::merge_runs;
-use crate::index::{CompactionPolicy, IndexVersion, Layout};
+use crate::index::{CompactionPolicy, IndexEncoding, IndexVersion, Layout};
 use crate::term::Dictionary;
 use codec::CommitRecord;
 use wal::Wal;
@@ -185,6 +185,7 @@ impl Durable {
         dictionary: &Dictionary,
         policy: &CompactionPolicy,
         config: DurabilityConfig,
+        encoding: IndexEncoding,
     ) -> EngineResult<Recovered> {
         fs::create_dir_all(root)?;
         let lock = File::create(root.join("LOCK"))?;
@@ -208,7 +209,7 @@ impl Durable {
                 let (asserted, inferred) = match loaded.stacks {
                     checkpoint::Stacks::Packed([asserted, inferred]) => {
                         let index = |stack: Stack, packed| {
-                            checkpoint::stack_index(stack, packed).map_err(|error| {
+                            checkpoint::stack_index(stack, packed, encoding).map_err(|error| {
                                 EngineError::Corruption(format!("checkpoint: {error}"))
                             })
                         };
@@ -218,9 +219,10 @@ impl Durable {
                         )
                     }
                     checkpoint::Stacks::Quads { quads, inferred } => (
-                        IndexVersion::from_quads(Layout::holding(&quads), quads),
+                        IndexVersion::from_quads(Layout::holding(&quads), encoding, quads),
                         IndexVersion::from_quads(
                             Layout::DefaultGraph,
+                            encoding,
                             inferred
                                 .into_iter()
                                 .map(|triple| triple.in_default_graph())
@@ -238,7 +240,7 @@ impl Durable {
                     canonical: Default::default(),
                 }
             }
-            None => Version::empty(),
+            None => Version::empty(encoding),
         };
         tracing::debug!(
             seconds = clock.elapsed().as_secs_f64(),
@@ -417,7 +419,7 @@ fn replay(
         true => version.asserted.with_quads_layout(),
         false => version.asserted.clone(),
     };
-    let runs = record.runs(asserted.layout());
+    let runs = record.runs(asserted.layout(), asserted.encoding());
     version.asserted = asserted;
     for (stack, run) in Stack::ALL.into_iter().zip(runs) {
         let mut index = version.stack(stack).with_run(run);

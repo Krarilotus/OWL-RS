@@ -23,7 +23,7 @@ use std::time::Instant;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
-use nrese_reasoner::{ReasonerConfig, ReasonerService};
+use nrese_reasoner::ReasonerConfig;
 use nrese_server::ai::AiSuggestionService;
 use nrese_server::policy::PolicyConfig;
 use nrese_server::{AppState, DeploymentPosture, build_app};
@@ -110,9 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loaded?;
     let state = AppState::new(
         store,
-        ReasonerService::new(ReasonerConfig::for_mode(
-            nrese_reasoner::ReasoningMode::Disabled,
-        )),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Disabled),
         PolicyConfig::default(),
         AiSuggestionService::disabled(),
         DeploymentPosture::OpenWorkbench,

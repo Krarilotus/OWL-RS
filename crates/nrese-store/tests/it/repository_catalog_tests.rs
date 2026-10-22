@@ -2,14 +2,14 @@
 //! opened again and removed without a server.
 
 use crate::support::Writes;
-use nrese_reasoner::{ReasonerConfig, ReasonerService};
+use nrese_reasoner::ReasonerConfig;
 use nrese_store::catalog::{Catalog, CatalogError, DEFAULT_REPOSITORY, RepositorySettings};
 use nrese_store::{StoreConfig, StoreService};
 use std::sync::Arc;
 
 fn open(dir: &std::path::Path) -> Catalog {
     let store = StoreService::new(StoreConfig::on_disk(dir)).expect("store");
-    Catalog::open(store, ReasonerService::new(ReasonerConfig::default())).expect("catalogue")
+    Catalog::open(store, ReasonerConfig::default()).expect("catalogue")
 }
 
 fn titled(title: &str) -> RepositorySettings {
@@ -261,8 +261,7 @@ fn a_failed_reconfiguration_keeps_the_old_reasoning() {
                            <http://e/a> a <http://e/C> }",
         )
         .expect("written");
-    let catalog =
-        Catalog::open(store, ReasonerService::new(ReasonerConfig::default())).expect("catalogue");
+    let catalog = Catalog::open(store, ReasonerConfig::default()).expect("catalogue");
     let pipeline = || Arc::clone(&*catalog.default_repository().pipeline.read());
     let before = pipeline().reasoner().mode_name();
     assert_ne!(before, "rdfs");
@@ -287,8 +286,7 @@ fn a_failed_reconfiguration_keeps_the_old_reasoning() {
 #[test]
 fn concurrent_creations_of_one_id_make_one_repository() {
     let store = StoreService::new(StoreConfig::in_memory()).expect("store");
-    let catalog =
-        Catalog::open(store, ReasonerService::new(ReasonerConfig::default())).expect("catalogue");
+    let catalog = Catalog::open(store, ReasonerConfig::default()).expect("catalogue");
     let barrier = std::sync::Barrier::new(2);
     let results: Vec<_> = std::thread::scope(|scope| {
         let create = || {
@@ -351,8 +349,7 @@ fn settings_that_would_be_ignored_are_refused() {
         text: "@prefix : <urn:> . { ?x :p ?y } => { ?y :q ?x } .".to_owned(),
     };
     let store = StoreService::new(StoreConfig::in_memory()).expect("store");
-    let catalog =
-        Catalog::open(store, ReasonerService::new(ReasonerConfig::default())).expect("catalogue");
+    let catalog = Catalog::open(store, ReasonerConfig::default()).expect("catalogue");
     for (case, settings) in [
         (
             "unknown format",

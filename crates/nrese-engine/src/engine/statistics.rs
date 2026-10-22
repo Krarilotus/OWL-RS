@@ -32,6 +32,9 @@
 //!
 //! A scan stops once the slices have found more than
 //! [`MAX_SETS`](super::characteristic::MAX_SETS) sets between them.
+//!
+//! The corpora of full-text searches ([`super::corpora`]) are kept beside them, in a store
+//! the views made from a snapshot share with it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,6 +45,7 @@ use nrese_exec::cell::{self, Build, BuildCell, Builder, Claim, Kind, Scan};
 use parking_lot::Mutex;
 
 use super::characteristic::{CharacteristicSets, Gathered, PairCounts, Partial, SetCount};
+use super::corpora::CorpusStore;
 use super::{ReadModel, Snapshot, Version};
 use crate::quad::{GraphSelector, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
@@ -98,6 +102,9 @@ pub(crate) struct Statistics {
     building: BuildCell<ReadModel, CharacteristicSets>,
     /// What the sets kept are charged to (`None`: an unlimited budget of their own).
     budget: Mutex<Option<Arc<Budget>>>,
+    /// The full-text corpora ([`super::corpora`]): this engine's, shared with the views
+    /// made from its snapshots.
+    pub(crate) corpora: Arc<CorpusStore>,
     /// Where they are saved and read back (`derived/` of a durable engine).
     dir: Mutex<Option<std::path::PathBuf>>,
     /// Scans of the store for the sets begun: what the tests count.
@@ -172,6 +179,34 @@ impl Statistics {
         }
         nodes.push((Arc::downgrade(version), model, graphs, n));
         Some(n)
+    }
+
+    /// Statistics of an engine whose full-text corpora may hold `corpus_bytes`.
+    pub(crate) fn new(corpus_bytes: usize) -> Self {
+        Self::with_corpora(Arc::new(CorpusStore::new(corpus_bytes)))
+    }
+
+    /// Statistics of their own for a view made from a snapshot with `self`, sharing its
+    /// full-text corpora (they are kept by the statements' identity, which the view has
+    /// its own of).
+    pub(crate) fn for_view(&self) -> Self {
+        Self::with_corpora(Arc::clone(&self.corpora))
+    }
+
+    /// Fresh caches sharing the supplied corpus owner, without making a throwaway one.
+    fn with_corpora(corpora: Arc<CorpusStore>) -> Self {
+        Self {
+            distinct: Default::default(),
+            nodes: Default::default(),
+            sets: Default::default(),
+            building: Default::default(),
+            budget: Default::default(),
+            corpora,
+            dir: Default::default(),
+            scans: AtomicU64::new(0),
+            #[cfg(test)]
+            hook: Default::default(),
+        }
     }
 
     /// The characteristic sets of the default graph in `model` (see the module docs): kept

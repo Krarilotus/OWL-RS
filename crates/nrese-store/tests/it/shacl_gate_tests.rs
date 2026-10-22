@@ -4,7 +4,7 @@
 use std::io::Write as _;
 use std::sync::Arc;
 
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_store::{
     BulkLoadRequest, DEFAULT_SHAPES_GRAPH, GateSeverity, GraphTarget, MutationCommand,
     MutationError, MutationPipeline, MutationTicket, ShaclGate, SparqlUpdateRequest, StoreConfig,
@@ -20,9 +20,7 @@ fn pipeline(gate: ShaclGate) -> MutationPipeline {
     };
     MutationPipeline::new(
         Arc::new(StoreService::new(config).expect("store")),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Disabled,
-        ))),
+        ReasonerConfig::for_mode(ReasoningMode::Disabled),
     )
 }
 

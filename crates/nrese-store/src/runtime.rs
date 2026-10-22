@@ -60,11 +60,9 @@ mod tests {
         })
         .unwrap();
         let runtime = Arc::clone(store.runtime());
-        let catalog = crate::catalog::Catalog::open(
-            store,
-            nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default()),
-        )
-        .unwrap();
+        let catalog =
+            crate::catalog::Catalog::open(store, nrese_reasoner::ReasonerConfig::default())
+                .unwrap();
         catalog
             .create("second", crate::catalog::RepositorySettings::default())
             .unwrap();

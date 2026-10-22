@@ -8,7 +8,7 @@ use super::equality::{Classes as EqualityClasses, Expand, Visibility as CopyVisi
 use super::statistics::Statistics;
 use super::{ReadModel, Stack, Version};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
-use crate::term::{Dictionary, TermId};
+use crate::term::{Dictionary, TermId, TermKind};
 
 mod cursor;
 pub use cursor::{ProbeCursor, Seek};
@@ -256,8 +256,14 @@ impl InferredMask {
         let mut runs = Vec::with_capacity(runs_len);
         runs.extend(self.runs.iter().cloned());
         if new_run {
-            let layout = snapshot.version.inferred.layout();
-            let run = crate::index::run::Run::from_delta_within(layout, show, hide, &mut held)?;
+            let inferred = &snapshot.version.inferred;
+            let run = crate::index::run::Run::from_delta_within(
+                inferred.layout(),
+                inferred.encoding(),
+                show,
+                hide,
+                &mut held,
+            )?;
             runs.push(Arc::new(run));
         }
         Ok(Self {
@@ -556,7 +562,8 @@ impl Snapshot {
         let inferred = match subset {
             InferredSubset::Without(hidden) => self.version.inferred.with_delta(&[], &hidden),
             InferredSubset::Only(kept) => {
-                crate::index::IndexVersion::from_quads(self.version.inferred.layout(), kept)
+                let inferred = &self.version.inferred;
+                crate::index::IndexVersion::from_quads(inferred.layout(), inferred.encoding(), kept)
             }
         };
         self.restricted(inferred, self.held.clone())
@@ -571,8 +578,8 @@ impl Snapshot {
         kept: &[EncodedQuad],
         budget: &Arc<nrese_exec::Budget>,
     ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
-        let layout = self.version.inferred.layout();
-        let empty = crate::index::IndexVersion::empty(layout);
+        let stack = &self.version.inferred;
+        let empty = crate::index::IndexVersion::empty(stack.layout(), stack.encoding());
         let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
         held.charge(
             Self::restricted_bytes()
@@ -580,7 +587,13 @@ impl Snapshot {
                 + boxed(std::mem::size_of::<crate::index::run::Run>())
                 + Held::overhead(self.held.count()),
         )?;
-        let run = crate::index::run::Run::from_delta_within(layout, kept, &[], &mut held)?;
+        let run = crate::index::run::Run::from_delta_within(
+            stack.layout(),
+            stack.encoding(),
+            kept,
+            &[],
+            &mut held,
+        )?;
         let held = Held::new(self.held.with(0), held);
         let inferred = empty.with_run(run);
         Ok(self.restricted(inferred, held))
@@ -593,10 +606,18 @@ impl Snapshot {
     /// more run.
     pub fn with_inferred_added(&self, added: &[EncodedQuad]) -> Snapshot {
         // Other statements than this snapshot's, at its revision.
-        self.restricted(
+        let view = self.restricted(
             self.version.inferred.with_delta(added, &[]),
             self.held.clone(),
-        )
+        );
+        self.statistics.corpora.record(
+            self.version.content,
+            view.version.content,
+            added
+                .iter()
+                .map(|quad| (quad.subject, quad.predicate, quad.object)),
+        );
+        view
     }
 
     /// This snapshot with the inferred statements `mask` hides removed, as
@@ -654,11 +675,49 @@ impl Snapshot {
             reads: self.reads.clone(),
             version,
             dictionary: Arc::clone(&self.dictionary),
-            statistics: Arc::default(),
+            statistics: Arc::new(self.statistics.for_view()),
             equality: self.equality,
             canonical: self.canonical,
             held,
         }
+    }
+
+    /// Notes that this view of `base` (made by [`Self::with_inferred_subset`] or
+    /// [`Self::with_inferred_mask`]) is a reader's `earlier` view of `earlier_base` brought
+    /// forward: the commits between the bases, and `changed` (the inferred statements it
+    /// shows or hides now and didn't then), are all that differ. Full-text searches on it
+    /// then derive their corpora from the earlier view's ([`super::corpora`]) instead of
+    /// walking the store again. Nothing is noted where the engine no longer has the
+    /// commits between the bases.
+    pub fn continues(
+        &self,
+        base: &Snapshot,
+        earlier: &Snapshot,
+        earlier_base: &Snapshot,
+        changed: &[EncodedQuad],
+    ) {
+        self.continues_delta(base, earlier, earlier_base, changed, &[]);
+    }
+
+    /// [`Self::continues`] with the changed statements supplied as two borrowed slices:
+    /// their complete union, without allocating a joined list. The engine records touched
+    /// ids and predicates, so their order and which slice contains a statement do not matter.
+    pub fn continues_delta(
+        &self,
+        base: &Snapshot,
+        earlier: &Snapshot,
+        earlier_base: &Snapshot,
+        hide: &[EncodedQuad],
+        show: &[EncodedQuad],
+    ) {
+        self.statistics.corpora.record_view(
+            earlier.version.content,
+            earlier_base.version.content,
+            self.version.content,
+            base.version.content,
+            hide,
+            show,
+        );
     }
 
     /// The `owl:sameAs` classes reads expand, if equality by representatives is on.
@@ -1202,7 +1261,7 @@ impl Snapshot {
             .take_while(|(l, h)| l == h)
             .count();
         let supported = Stack::ALL.into_iter().all(|stack| {
-            !model.includes(stack) || self.version.stack(stack).layout().supports(permutation)
+            !model.includes(stack) || self.data(model).stack(stack).layout().supports(permutation)
         });
         if bound >= 4 || plan.exclude_default_graph || !supported {
             return None;
@@ -1210,6 +1269,48 @@ impl Snapshot {
         plan.low[bound] = low.raw();
         plan.high[bound] = high.raw();
         Some(plan)
+    }
+
+    /// The number of distinct values of the first unbound component of `pattern` in
+    /// `permutation`'s order among its matches in `model`: exact, counted while the index's
+    /// groups are walked without keeping them where one run of one stack holds the matches
+    /// and no deletion among them, else from [`Self::group_counts_in`]. `None` where that
+    /// can't answer. `COUNT(DISTINCT ?x)` of one triple pattern.
+    pub fn distinct_count_in(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+    ) -> Option<u64> {
+        if self.expanding(model, pattern).is_some() {
+            return None;
+        }
+        let plan = AccessPlan::in_permutation(pattern, permutation)?;
+        let bound = plan
+            .low
+            .iter()
+            .zip(&plan.high)
+            .take_while(|(l, h)| l == h)
+            .count();
+        let supported = Stack::ALL.into_iter().all(|stack| {
+            !model.includes(stack) || self.version.stack(stack).layout().supports(permutation)
+        });
+        if plan.exclude_default_graph || bound >= 4 || !supported {
+            return None;
+        }
+        let with: Vec<Stack> = Stack::ALL
+            .into_iter()
+            .filter(|&stack| model.includes(stack) && self.version.stack(stack).any_plan(&plan))
+            .collect();
+        let counted = match with.as_slice() {
+            [] => Some(0),
+            [stack] => self.version.stack(*stack).count_groups(&plan, bound),
+            _ => None,
+        };
+        counted.or_else(|| {
+            self.group_counts_in(model, pattern, permutation)
+                .map(|groups| groups.len() as u64)
+        })
     }
 
     /// For each distinct value of the first unbound component of `pattern` in `permutation`'s
@@ -1233,6 +1334,12 @@ impl Snapshot {
         if plan.exclude_default_graph {
             return None;
         }
+        self.group_counts_of(model, &plan)
+    }
+
+    /// [`Self::group_counts_in`] for `plan`: grouped by its first component not bound to
+    /// one value (the whole component, or a range of it: [`Self::range_plan`]).
+    fn group_counts_of(&self, model: ReadModel, plan: &AccessPlan) -> Option<Vec<(TermId, u64)>> {
         let bound = plan
             .low
             .iter()
@@ -1243,11 +1350,17 @@ impl Snapshot {
             return None;
         }
         let supported = Stack::ALL.into_iter().all(|stack| {
-            !model.includes(stack) || self.data(model).stack(stack).layout().supports(permutation)
+            !model.includes(stack)
+                || self
+                    .data(model)
+                    .stack(stack)
+                    .layout()
+                    .supports(plan.permutation)
         });
         if !supported {
             return None;
         }
+        let plan = *plan;
         let mut counts = Vec::new();
         let mut sources = 0;
         for stack in Stack::ALL {
@@ -1654,47 +1767,672 @@ impl Snapshot {
         self.dictionary.stats().arena_bytes
     }
 
-    /// The string literals this snapshot's dictionary holds that match `query`, best first
-    /// (whether statements still use them is the caller's to check).
-    pub fn text_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
-        let known = self.version.dictionary_len;
-        let mut matches = self.dictionary.text_search(query);
-        matches.retain(|m| TermId::from_raw(m.id).payload() < known);
-        matches
+    /// The string literals that are objects of statements this snapshot shows in
+    /// `scope`'s graphs in `model` (as its own scans do, equality classes expanded or
+    /// canonical as it reads them) and match `query`, best first, ranked among those
+    /// literals alone ([`Self::text_corpus`]): no literal outside them (another version's,
+    /// an open transaction's, a graph's outside the scope, one no visible statement has)
+    /// changes a score. What building the corpus takes is charged to `budget` while the
+    /// search holds it (the request's; `None`: unbounded), and what scoring takes, the
+    /// matches until they drop; a kept corpus is the engine's. Malformed or unsupported
+    /// operators return [`crate::EngineError::InvalidTextQuery`], a budget that has no room
+    /// [`crate::EngineError::MemoryLimit`].
+    pub fn text_search_in(
+        &self,
+        model: ReadModel,
+        scope: &TextScope,
+        query: &crate::TextQuery,
+        budget: Option<&Arc<nrese_exec::Budget>>,
+    ) -> crate::EngineResult<crate::TextMatches> {
+        let unbounded;
+        let request = match budget {
+            Some(budget) => budget,
+            None => {
+                unbounded = Arc::new(nrese_exec::Budget::unlimited());
+                &unbounded
+            }
+        };
+        // The corpus, the index covering it, then the search: no lock held across
+        // another's parallel parts ([`Dictionary::cover_text`](crate::Dictionary)).
+        let corpus = self.text_corpus(Documents::Literals, model, scope, Some(request))?;
+        self.dictionary.text_search(query, &corpus, request)
     }
 
-    /// The vector literals this snapshot's dictionary holds that are nearest to
-    /// `query.vector`, among those `accept` takes, nearest first, with how the search went
-    /// (whether statements still use them is the caller's to check, in `accept`).
+    /// [`Self::text_search_in`] over every graph, asserted and inferred, unbounded.
+    pub fn text_search(&self, query: &crate::TextQuery) -> crate::EngineResult<crate::TextMatches> {
+        self.text_search_in(ReadModel::Materialised, &TextScope::EVERY, query, None)
+    }
+
+    /// The vector literals that are objects of statements this snapshot shows in `scope`'s
+    /// graphs in `model` (its corpus of vectors, [`Self::text_corpus`]), among those
+    /// `accept` takes, nearest to `query.vector` first (ties by id), with how the search
+    /// went. Every one of them is compared (exact): no vector outside them (another
+    /// version's, an open transaction's, a deleted one, one in a graph outside the scope)
+    /// changes the answer. Building the corpus and the scan are charged to `budget` as
+    /// [`Self::text_search_in`]'s are; refused before it allocates past
+    /// [`crate::VectorQuery::max_hits`] or the budget, stopped by its `stop` flag
+    /// ([`crate::VectorStop`]).
+    pub fn vector_search_in(
+        &self,
+        model: ReadModel,
+        scope: &TextScope,
+        query: &crate::VectorQuery,
+        accept: &(dyn Fn(TermId) -> bool + Sync),
+        budget: Option<&Arc<nrese_exec::Budget>>,
+    ) -> Result<(crate::VectorHits, crate::VectorSearchReport), crate::VectorStop> {
+        let unbounded;
+        let request = match budget {
+            Some(budget) => budget,
+            None => {
+                unbounded = Arc::new(nrese_exec::Budget::unlimited());
+                &unbounded
+            }
+        };
+        // The corpus, the vectors covering it, then the scan: no lock held across another's
+        // parallel parts.
+        let corpus = self
+            .text_corpus(Documents::Vectors, model, scope, Some(request))
+            .map_err(crate::VectorStop::Memory)?;
+        // The corpus decides what the search admits, holds and reports; `accept` narrows
+        // its hits.
+        let eligible = |id: TermId| corpus.contains(id.payload());
+        let bound = usize::try_from(corpus.documents()).unwrap_or(usize::MAX);
+        self.dictionary.vector_search(
+            query,
+            self.version.dictionary_len,
+            &eligible,
+            bound,
+            accept,
+            request,
+        )
+    }
+
+    /// [`Self::vector_search_in`] over every graph, asserted and inferred.
     pub fn vector_search(
         &self,
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
-    ) -> (Vec<(TermId, f32)>, crate::VectorSearchReport) {
-        let (hits, report) =
-            self.dictionary
-                .vector_search(query, self.version.dictionary_len, accept);
-        let hits = hits
-            .into_iter()
-            .map(|hit| (TermId::from_raw(hit.id), hit.distance))
-            .collect();
-        (hits, report)
+    ) -> Result<(crate::VectorHits, crate::VectorSearchReport), crate::VectorStop> {
+        self.vector_search_in(
+            ReadModel::Materialised,
+            &TextScope::EVERY,
+            query,
+            accept,
+            None,
+        )
     }
 
-    /// Builds the graph searches like `query` use, covering every vector of its
-    /// dimension, before returning: a warm-up (searches build it themselves, a large one
-    /// on a thread of its own while they scan exactly).
-    pub fn prepare_vector_graph(&self, query: &crate::VectorQuery) {
-        self.dictionary.prepare_vector_graph(query);
+    /// Prepares what [`Self::vector_search`] reads before returning (a warm-up): the vectors
+    /// of the dictionary and the corpus of every graph's. Refused
+    /// ([`crate::EngineError::MemoryLimit`]) where the reader's budget refused a read
+    /// ([`Self::reading_within`]): what it read may be incomplete, so nothing is kept.
+    pub fn prepare_vector_search(&self) -> crate::EngineResult<()> {
+        self.text_corpus(
+            Documents::Vectors,
+            ReadModel::Materialised,
+            &TextScope::EVERY,
+            None,
+        )?;
+        Ok(())
     }
 
-    /// The IRIs this snapshot's dictionary holds whose local names match `query`, best
-    /// first (whether statements still use them is the caller's to check).
-    pub fn iri_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
-        let known = self.version.dictionary_len;
-        let mut matches = self.dictionary.iri_search(query);
-        matches.retain(|m| TermId::from_raw(m.id).payload() < known);
-        matches
+    /// The IRIs that are subjects of statements this snapshot shows in `scope`'s graphs
+    /// in `model` and whose local names match `query`, best first, ranked among those IRIs
+    /// alone (as [`Self::text_search_in`] ranks literals, `budget` as there). Read
+    /// canonically, a class is its representative, named by every identity: each
+    /// identity's local name is a document while the representative is a subject, and a
+    /// match is answered as the representative, each once, at its best identity's
+    /// relevance ([`Self::corpus_classes`]).
+    pub fn iri_search_in(
+        &self,
+        model: ReadModel,
+        scope: &TextScope,
+        query: &crate::TextQuery,
+        budget: Option<&Arc<nrese_exec::Budget>>,
+    ) -> crate::EngineResult<crate::TextMatches> {
+        let unbounded;
+        let request = match budget {
+            Some(budget) => budget,
+            None => {
+                unbounded = Arc::new(nrese_exec::Budget::unlimited());
+                &unbounded
+            }
+        };
+        let corpus = self.text_corpus(Documents::Subjects, model, scope, Some(request))?;
+        let mut found = self.dictionary.iri_search(query, &corpus, request)?;
+        if let Some((classes, true)) = self.corpus_classes(Documents::Subjects, model) {
+            found.as_representatives(|id| classes.representative(TermId::from_raw(id)).raw());
+        }
+        Ok(found)
+    }
+
+    /// The equality classes a corpus of `documents` in `model` reads by, and whether reads
+    /// are canonical: IRIs' corpora of a reader of equality classes in a model with
+    /// inferred statements, where a class of two or more identities exists. Expanded, its
+    /// scans show every identity of a class with a statement; canonical, its scans show
+    /// the representative, and its corpus holds every identity of a class whose
+    /// representative it holds (what a probe of an identity, normalised to the
+    /// representative, finds). Either way a statement touching one identity may change
+    /// every identity's membership.
+    fn corpus_classes(
+        &self,
+        documents: Documents,
+        model: ReadModel,
+    ) -> Option<(Arc<EqualityClasses>, bool)> {
+        if documents != Documents::Subjects || model == ReadModel::Asserted {
+            return None;
+        }
+        let same_as = self.equality?;
+        let classes = self.version.equality.classes(&self.version, same_as);
+        (!classes.is_empty()).then_some((classes, self.canonical))
+    }
+
+    /// The full-text corpora this snapshot's engine keeps, and how many were built by a
+    /// walk or derived from an ancestor's ([`super::corpora`]; performance.md §0).
+    pub fn text_corpus_stats(&self) -> super::TextCorpusStats {
+        self.statistics.corpora.stats()
+    }
+
+    /// The number of documents and words of [`Self::text_search_in`]'s corpus for `model`
+    /// and `scope` (with `iris`, of [`Self::iri_search_in`]'s), built (or found kept) as a
+    /// search does, charged to `budget` as there: what a search's corpus takes, without its
+    /// scoring.
+    #[doc(hidden)]
+    pub fn text_corpus_size(
+        &self,
+        model: ReadModel,
+        scope: &TextScope,
+        iris: bool,
+        budget: Option<&Arc<nrese_exec::Budget>>,
+    ) -> Result<(u64, u64), nrese_exec::BudgetExceeded> {
+        let documents = match iris {
+            false => Documents::Literals,
+            true => Documents::Subjects,
+        };
+        let corpus = self.text_corpus(documents, model, scope, budget)?;
+        Ok((corpus.documents(), corpus.total_words()))
+    }
+
+    /// The documents of [`Self::text_search_in`]'s corpus for `model` and `scope` (with
+    /// `iris`, of [`Self::iri_search_in`]'s): dictionary entries ascending, their number and
+    /// their words, as a search finds them (kept, derived or walked). For checks against
+    /// the statements this snapshot's scans show.
+    #[doc(hidden)]
+    pub fn text_corpus_members(
+        &self,
+        model: ReadModel,
+        scope: &TextScope,
+        iris: bool,
+    ) -> (Vec<u64>, u64, u64) {
+        let documents = match iris {
+            false => Documents::Literals,
+            true => Documents::Subjects,
+        };
+        let corpus = self
+            .text_corpus(documents, model, scope, None)
+            .expect("no budget to exceed");
+        (corpus.members(), corpus.documents(), corpus.total_words())
+    }
+
+    /// The members of [`Self::vector_search_in`]'s corpus for `model` and `scope`: the
+    /// typed literals that are objects of statements this snapshot shows there (the scan
+    /// reads the vectors among them).
+    #[doc(hidden)]
+    pub fn vector_corpus_members(&self, model: ReadModel, scope: &TextScope) -> Vec<u64> {
+        self.text_corpus(Documents::Vectors, model, scope, None)
+            .expect("no budget to exceed")
+            .members()
+    }
+
+    /// The documents of a full-text index this snapshot shows in `scope`, with their
+    /// statistics from the index (which covers them: [`Dictionary::cover_text`] first);
+    /// exact, kept by the statements' identity, model, graphs and how this snapshot reads
+    /// equality ([`super::corpora`]). Membership is what this snapshot's own scans show
+    /// (equality classes expanded or canonical, the visibility of their copies), never
+    /// the statements as stored. Derived from the nearest kept ancestor's where the
+    /// lineage has one: each term the steps since touched is probed, a member while a
+    /// visible statement in the scope has it (an IRI of a class: every identity of it,
+    /// [`Self::corpus_classes`]); else walked ([`Self::walk_corpus`]), and after a change
+    /// of a `sameAs` statement (the classes change). The probes and the walk hold no lock
+    /// of the dictionary (the walk runs on every core); only the counting does, on this
+    /// thread.
+    /// Nobody waits for another's build: a search that finds one under way builds its own
+    /// and doesn't keep it. What the build takes, and a corpus not kept, is charged to
+    /// `budget`, returned as the reservation the search holds until it is done.
+    fn text_corpus(
+        &self,
+        documents: Documents,
+        model: ReadModel,
+        scope: &TextScope,
+        budget: Option<&Arc<nrese_exec::Budget>>,
+    ) -> Result<super::corpora::CorpusRef, nrese_exec::BudgetExceeded> {
+        use super::corpora::{CorpusRef, Found};
+        use crate::term::text::{Bits, Corpus};
+        let unbounded;
+        let request = match budget {
+            Some(budget) => budget,
+            None => {
+                unbounded = Arc::new(nrese_exec::Budget::unlimited());
+                &unbounded
+            }
+        };
+        // Copied only where it isn't written the one way yet, charged then; the charge
+        // bound first, as bindings drop in reverse: the copy goes before its charge.
+        let (_scope_charge, scope) = scope.normalised(request)?;
+        let scope = &*scope;
+        let store = &self.statistics.corpora;
+        let kind = super::corpora::KindRef {
+            documents,
+            model,
+            scope,
+            equality: self.equality,
+            canonical: self.canonical,
+        };
+        let (from, keep) = match store.find(&self.version, kind, request)? {
+            Found::Kept(corpus) => {
+                self.cover(documents);
+                return Ok(CorpusRef::Kept(corpus));
+            }
+            Found::Build { from, keep } => (from, keep),
+        };
+        let iris = documents == Documents::Subjects;
+        let vectors = documents == Documents::Vectors;
+        // A touched IRI of a class stands for every identity of it (literals belong to no
+        // class): each is probed.
+        let classes = self.corpus_classes(documents, model);
+        let span = self.version.dictionary_len;
+        let built = match from {
+            Some((base, touched)) => {
+                self.cover(documents);
+                let mut changes =
+                    nrese_exec::ChargedVec::with_capacity(Arc::clone(request), touched.len())?;
+                for &raw in touched.iter() {
+                    let identities = match &classes {
+                        Some((classes, _)) => classes
+                            .class_of(TermId::from_raw(raw))
+                            .unwrap_or(std::slice::from_ref(&raw)),
+                        None => std::slice::from_ref(&raw),
+                    };
+                    for id in identities.iter().copied().map(TermId::from_raw) {
+                        if documents.holds(id.kind()) && id.payload() < span {
+                            let used = self.uses(model, scope, documents, id);
+                            changes.push((id.payload(), used))?;
+                        }
+                    }
+                }
+                store.built(true);
+                match vectors {
+                    // Every typed literal is a member (of one word): the scan reads the
+                    // vectors among them.
+                    true => Bits::derived(&base, &changes, span, request, |_| 1)?,
+                    false => self.dictionary.with_text_index(iris, |index| {
+                        index.derive(&base, &changes, span, request)
+                    })?,
+                }
+            }
+            None => {
+                store.built(false);
+                self.walk_corpus(documents, model, scope, request)?
+            }
+        };
+        // A read the reader's budget refused stopped early ([`Self::read_refused`]): what it
+        // built may miss members, so it is neither kept nor used.
+        if let Some(refused) = self.read_refused() {
+            return Err(refused);
+        }
+        // Kept: built on the store's budget. Else the search's, on its own.
+        let (_, bytes) = Corpus::finished_bytes(built.documents, span);
+        let kept = keep
+            .then(|| {
+                store.keep_built(&self.version, kind, bytes, |budget| {
+                    Corpus::finish(&built, span, budget)
+                })
+            })
+            .flatten();
+        Ok(match kept {
+            Some(corpus) => CorpusRef::Kept(corpus),
+            None => CorpusRef::Own(Corpus::finish(&built, span, request)?),
+        })
+    }
+
+    /// The corpus by a walk of the statements this snapshot shows in the documents'
+    /// kinds' ranges ([`Self::mark_values`]), with no lock of the dictionary held; then
+    /// counted under the index's, on this thread. Its bits, and the most the walk's
+    /// slices hold at once, are charged to `budget` first.
+    fn walk_corpus(
+        &self,
+        documents: Documents,
+        model: ReadModel,
+        scope: &TextScope,
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<crate::term::text::Bits, nrese_exec::BudgetExceeded> {
+        let span = self.version.dictionary_len;
+        let words = span.div_ceil(64) as usize;
+        let mut bits = nrese_exec::ChargedVec::with_capacity(Arc::clone(budget), words)?;
+        bits.resize(words, 0)?;
+        let mut scratch = nrese_exec::Reservation::new(Arc::clone(budget));
+        let (running, bytes) = self.walk_scratch(words, budget.remaining());
+        scratch.charge(bytes)?;
+        // Per graph, each kind's walk; a scan (where the index can't walk them) marks every
+        // kind at once. Only the count needs the index: on a pool thread it is covered
+        // while the statements are walked (the cover, on this thread, as it would be
+        // alone); elsewhere first.
+        let marks: &mut [u64] = &mut bits;
+        let mut walk = move || {
+            let mut mark = |graph: GraphSelector| {
+                for &kind in documents.kinds() {
+                    if self.mark_values(model, graph, documents, kind, marks, running) {
+                        break;
+                    }
+                }
+            };
+            match scope {
+                TextScope::Graphs(graphs) => mark(*graphs),
+                TextScope::Merge(graphs) => {
+                    for &graph in graphs {
+                        mark(GraphSelector::Exact(graph));
+                    }
+                }
+            }
+        };
+        match rayon::current_thread_index() {
+            Some(_) => {
+                rayon::join(|| self.cover(documents), walk);
+            }
+            None => {
+                self.cover(documents);
+                walk();
+            }
+        }
+        drop(scratch);
+        // Read canonically, a class whose representative is a member: each identity too.
+        if let Some((classes, true)) = self.corpus_classes(documents, model) {
+            let span = self.version.dictionary_len;
+            for (representative, identities) in classes.iter() {
+                // Each identity is of one class: setting a class's bits sets no other
+                // representative's.
+                let representative = TermId::from_raw(representative);
+                let at = representative.payload();
+                let member = documents.holds(representative.kind())
+                    && bits
+                        .get((at / 64) as usize)
+                        .is_some_and(|word| word >> (at % 64) & 1 == 1);
+                if !member {
+                    continue;
+                }
+                for id in identities.iter().copied().map(TermId::from_raw) {
+                    if documents.holds(id.kind()) && id.payload() < span {
+                        let at = id.payload();
+                        bits[(at / 64) as usize] |= 1 << (at % 64);
+                    }
+                }
+            }
+        }
+        Ok(match documents {
+            Documents::Vectors => crate::term::text::Bits::counted(bits, |_| 1),
+            Documents::Literals => self
+                .dictionary
+                .with_text_index(false, |index| index.corpus(bits)),
+            Documents::Subjects => self
+                .dictionary
+                .with_text_index(true, |index| index.corpus(bits)),
+        })
+    }
+
+    /// Extends the index of `documents` (the vectors, for vector literals) over the
+    /// dictionary's entries.
+    fn cover(&self, documents: Documents) {
+        match documents {
+            Documents::Literals => self.dictionary.cover_text(false),
+            Documents::Subjects => self.dictionary.cover_text(true),
+            Documents::Vectors => self.dictionary.cover_vectors(),
+        }
+    }
+
+    /// How many slices of a corpus walk over `words` words of bits run at once, and the most
+    /// they hold besides the bits: per slice its group counts (16 bytes a term, 64 terms a
+    /// word of the slice) from each run, and as many again where they are merged or
+    /// compared. As many at once as `room` holds, at least one, no more than the pool's
+    /// threads nor than there are slices.
+    fn walk_scratch(&self, words: usize, room: usize) -> (usize, usize) {
+        let runs = self.version.runs().count().max(1);
+        let per = slice_words(words);
+        let slice = per * 64 * 16 * runs * 2;
+        let most = words.div_ceil(per).min(rayon::current_num_threads()).max(1);
+        let running = (room / slice).clamp(1, most);
+        (running, running * slice)
+    }
+
+    /// Whether a statement this snapshot shows in `scope`'s graphs in `model` has `id` at
+    /// `documents`' position (object or subject): a probe as its scans read (equality
+    /// expanded or canonical), or for a merge of many graphs a scan of the term's
+    /// statements.
+    fn uses(&self, model: ReadModel, scope: &TextScope, documents: Documents, id: TermId) -> bool {
+        let pattern = |graph| match documents {
+            Documents::Literals | Documents::Vectors => QuadPattern {
+                object: Some(id),
+                graph,
+                ..QuadPattern::all()
+            },
+            Documents::Subjects => QuadPattern {
+                subject: Some(id),
+                graph,
+                ..QuadPattern::all()
+            },
+        };
+        match scope {
+            TextScope::Graphs(graphs) => self.exists_in(model, &pattern(*graphs)),
+            TextScope::Merge(graphs) if graphs.len() <= 8 => graphs
+                .iter()
+                .any(|&graph| self.exists_in(model, &pattern(GraphSelector::Exact(graph)))),
+            TextScope::Merge(graphs) => self
+                .quads_for_pattern_in(model, &pattern(GraphSelector::Any))
+                .any(|quad| graphs.binary_search(&quad.graph).is_ok()),
+        }
+    }
+
+    /// Sets the bit of the dictionary entry of each term of `kind` at `documents`' position
+    /// (object or subject) of the statements in `graphs` (one graph, every graph, or every
+    /// named graph) in `model`. The entries in slices of whole words, `running` at once on
+    /// the pool: each a walk over the index's groups in its range of ids, so no list of
+    /// every term is held.
+    /// Where the index can't walk them (a reader of equality classes), one scan of the
+    /// statements marks the terms of every kind of `documents`: then `true`.
+    fn mark_values(
+        &self,
+        model: ReadModel,
+        graphs: GraphSelector,
+        documents: Documents,
+        kind: TermKind,
+        bits: &mut [u64],
+        running: usize,
+    ) -> bool {
+        use rayon::prelude::*;
+        let per = slice_words(bits.len());
+        let wave = |at: usize, wave: &mut [u64]| {
+            wave.par_chunks_mut(per)
+                .enumerate()
+                .map(|(i, words)| {
+                    self.dictionary.part_started();
+                    let first = ((at + i) * per * 64) as u64;
+                    let last = first + words.len() as u64 * 64 - 1;
+                    let (low, high) = (TermId::new(kind, first), TermId::new(kind, last));
+                    let counts = |graphs| self.range_counts(model, graphs, documents, low, high);
+                    let mut mark = |value: TermId| {
+                        let at = value.payload() - first;
+                        words[(at / 64) as usize] |= 1 << (at % 64);
+                    };
+                    match graphs {
+                        GraphSelector::AnyNamed => {
+                            // Every graph's, less those only the default graph has.
+                            let every = counts(GraphSelector::Any)?;
+                            let default = counts(GraphSelector::Exact(TermId::DEFAULT_GRAPH))?;
+                            let mut j = 0;
+                            for (value, count) in every {
+                                while j < default.len() && default[j].0 < value {
+                                    j += 1;
+                                }
+                                let in_default = match default.get(j) {
+                                    Some(&(v, c)) if v == value => c,
+                                    _ => 0,
+                                };
+                                if count > in_default {
+                                    mark(value);
+                                }
+                            }
+                        }
+                        _ => counts(graphs)?
+                            .into_iter()
+                            .for_each(|(value, _)| mark(value)),
+                    }
+                    Some(())
+                })
+                .collect::<Option<()>>()
+        };
+        // In waves of `running` slices; one the index can't walk (as none of them then)
+        // goes to the scan.
+        let walked = bits
+            .chunks_mut(per * running)
+            .enumerate()
+            .try_for_each(|(w, words)| wave(w * running, words));
+        if walked.is_some() {
+            return false;
+        }
+        let pattern = QuadPattern {
+            graph: graphs,
+            ..QuadPattern::all()
+        };
+        for quad in self.quads_for_pattern_in(model, &pattern) {
+            let value = match documents {
+                Documents::Literals | Documents::Vectors => quad.object,
+                Documents::Subjects => quad.subject,
+            };
+            if documents.holds(value.kind()) {
+                let at = value.payload();
+                bits[(at / 64) as usize] |= 1 << (at % 64);
+            }
+        }
+        true
+    }
+
+    /// Per distinct term in `low..=high` at `documents`' position of the statements in
+    /// `graphs` (one graph, or every graph) in `model`, how many there are, in id order: a
+    /// walk over the index's groups. `None` where the index can't walk them.
+    fn range_counts(
+        &self,
+        model: ReadModel,
+        graphs: GraphSelector,
+        documents: Documents,
+        low: TermId,
+        high: TermId,
+    ) -> Option<Vec<(TermId, u64)>> {
+        let (pattern, permutation) = match (graphs, documents) {
+            (GraphSelector::Exact(graph), Documents::Literals | Documents::Vectors) => {
+                (QuadPattern::in_graph(graph), Permutation::Gosp)
+            }
+            (GraphSelector::Exact(graph), Documents::Subjects) => {
+                (QuadPattern::in_graph(graph), Permutation::Gspo)
+            }
+            (GraphSelector::Any, Documents::Literals | Documents::Vectors) => {
+                (QuadPattern::all(), Permutation::Ospg)
+            }
+            (GraphSelector::Any, Documents::Subjects) => (QuadPattern::all(), Permutation::Spog),
+            (GraphSelector::AnyNamed, _) => return None,
+        };
+        let plan = self.range_plan(model, &pattern, permutation, low, high)?;
+        self.group_counts_of(model, &plan)
+    }
+}
+
+/// Words of the bits each slice of a walk over `words` covers: four slices a thread of the
+/// pool, at most [`SLICE_WORDS`].
+fn slice_words(words: usize) -> usize {
+    words
+        .div_ceil(rayon::current_num_threads() * 4)
+        .clamp(1, SLICE_WORDS)
+}
+
+/// Words of the bits a slice of a corpus walk covers at most ([`Snapshot::mark_values`]):
+/// its group counts (16 bytes a term) are what the slice holds besides the bits.
+const SLICE_WORDS: usize = 1024;
+
+/// The graphs whose statements make the corpus of a full-text search
+/// ([`Snapshot::text_search_in`]): the literals that are their objects (the IRIs that are
+/// their subjects, for [`Snapshot::iri_search_in`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum TextScope {
+    /// One graph, every graph, or every named graph.
+    Graphs(GraphSelector),
+    /// The merge of these graphs (sorted, without repeats): a dataset's default graph of
+    /// several graphs, or the graphs a reader may read.
+    Merge(Vec<TermId>),
+}
+
+impl TextScope {
+    /// Every graph.
+    pub const EVERY: Self = Self::Graphs(GraphSelector::Any);
+
+    /// The same graphs, written one way: a merge sorted and without repeats, a merge of one
+    /// graph as that graph (so scopes of equal graph sets share a corpus). This scope where
+    /// it is written so; else a copy, charged to `budget` first (its reservation first).
+    fn normalised(
+        &self,
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<
+        (Option<nrese_exec::Reservation>, std::borrow::Cow<'_, Self>),
+        nrese_exec::BudgetExceeded,
+    > {
+        use std::borrow::Cow;
+        let Self::Merge(graphs) = self else {
+            return Ok((None, Cow::Borrowed(self)));
+        };
+        if graphs.len() != 1 && graphs.windows(2).all(|pair| pair[0] < pair[1]) {
+            return Ok((None, Cow::Borrowed(self)));
+        }
+        let mut copy = nrese_exec::ChargedVec::collect(
+            Arc::clone(budget),
+            graphs.len(),
+            graphs.iter().copied(),
+        )?;
+        copy.sort_unstable();
+        let mut len = 0;
+        for i in 0..copy.len() {
+            if len == 0 || copy[i] != copy[len - 1] {
+                copy[len] = copy[i];
+                len += 1;
+            }
+        }
+        copy.truncate(len);
+        let (graphs, charge) = copy.into_parts();
+        let scope = match graphs[..] {
+            [graph] => Self::Graphs(GraphSelector::Exact(graph)),
+            _ => Self::Merge(graphs),
+        };
+        Ok((Some(charge), Cow::Owned(scope)))
+    }
+}
+
+/// Which documents a corpus holds: string literals (objects) or IRIs by their local names
+/// (subjects), for full-text searches; vector literals (objects), for vector searches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Documents {
+    Literals,
+    Subjects,
+    Vectors,
+}
+
+impl Documents {
+    /// The kinds of term its documents are.
+    fn kinds(self) -> &'static [TermKind] {
+        match self {
+            Self::Literals => &[TermKind::String, TermKind::LangString],
+            Self::Subjects => &[TermKind::Iri],
+            Self::Vectors => &[TermKind::TypedLiteral],
+        }
+    }
+
+    fn holds(self, kind: TermKind) -> bool {
+        self.kinds().contains(&kind)
     }
 }
 
