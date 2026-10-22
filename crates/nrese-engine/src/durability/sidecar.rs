@@ -38,18 +38,12 @@ pub(crate) fn write_text(file: &Path, text: &str) -> EngineResult<()> {
     Ok(())
 }
 
-/// The value of `key` in the sidecar of `file`: `None` if there is no sidecar (or no such
-/// key). A sidecar that is there but can't be read is an error, never taken for a missing
-/// one.
-pub(crate) fn read(file: &Path, key: &str) -> std::io::Result<Option<String>> {
-    let text = match read_text(file)? {
-        Some(text) => text,
-        None => return Ok(None),
-    };
-    Ok(text.lines().find_map(|line| {
+/// A value from one captured sidecar snapshot; missing keys remain absent.
+pub(crate) fn value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    text.lines().find_map(|line| {
         let (name, value) = line.split_once('=')?;
-        (name == key).then(|| value.to_owned())
-    }))
+        (name == key).then_some(value)
+    })
 }
 
 pub(crate) fn read_text(file: &Path) -> std::io::Result<Option<String>> {

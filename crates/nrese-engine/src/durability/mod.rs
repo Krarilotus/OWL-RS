@@ -140,8 +140,8 @@ pub struct DurabilityConfig {
     /// the checkpoint is newer or the log ends before it.
     pub recover_until: Option<u64>,
     /// Recover the commits made up to this time only (microseconds since 1970), cut as
-    /// with `recover_until`; commits logged without a time (before WAL version 6) count as
-    /// earlier.
+    /// with `recover_until`. Refuses if the requested projection requires a checkpoint
+    /// or record whose time provenance is unknown; revision recovery remains available.
     pub recover_until_micros: Option<u64>,
 }
 

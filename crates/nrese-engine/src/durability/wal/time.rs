@@ -67,10 +67,12 @@ impl Fact {
 }
 
 pub(super) fn read(path: &Path) -> Fact {
-    sidecar::read(path, "time")
-        .ok()
-        .flatten()
-        .and_then(|value| Fact::decode(&value, segment_first_revision(path)))
+    from_text(path, sidecar::read_text(path).ok().flatten().as_deref())
+}
+
+pub(super) fn from_text(path: &Path, text: Option<&str>) -> Fact {
+    text.and_then(|text| sidecar::value(text, "time"))
+        .and_then(|value| Fact::decode(value, segment_first_revision(path)))
         .unwrap_or(Fact::UNKNOWN)
 }
 
@@ -96,7 +98,11 @@ pub(super) fn write(path: &Path, sync: SyncPolicy, fact: Fact) -> EngineResult<F
 /// The source is sealed, or (copying) its bytes have already been captured in a partial.
 pub(super) fn copy(from: &Path, to: &Path) -> EngineResult<()> {
     let text = sidecar::read_text(from)?;
-    let source = read(from);
+    copy_text(from, to, text.as_deref())
+}
+
+pub(super) fn copy_text(from: &Path, to: &Path, text: Option<&str>) -> EngineResult<()> {
+    let source = from_text(from, text);
     let fact = if to.try_exists()? {
         source.intersect(read(to))
     } else {

@@ -54,18 +54,17 @@ fn open_segments(root: &std::path::Path, after: u64) -> EngineResult<Option<Vec<
         tests::between_listing_and_opening();
         let mut open = Vec::with_capacity(segments.len() - start);
         for (_, path) in segments.drain(start..) {
-            match std::fs::File::open(&path) {
-                Ok(file) => {
-                    let facts = wal::segment_facts(&path);
+            match wal::open_segment(&path) {
+                Ok((file, facts)) => {
                     open.push(OpenedSegment { path, file, facts });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(EngineError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                     match attempt < OPEN_ATTEMPTS {
                         true => continue 'list,
                         false => return Ok(None),
                     }
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
         }
         return Ok(Some(open));
@@ -114,8 +113,8 @@ impl Engine {
         // Segments that kept moving: the follower starts again from an image, as for a log a
         // checkpoint has covered.
         let segments = {
-            // Pin the handle and its immutable nonempty-segment facts together. Creation,
-            // first-unknown rotation, archive and release all hold this same mutex.
+            // The mutex excludes the active segment's first-unknown transition. Stable
+            // metadata acquisition also detects the independent archive prune/copy owners.
             let _wal = durable.wal.lock();
             open_segments(durable.root(), after)?
         };
@@ -283,6 +282,9 @@ impl Engine {
 }
 
 #[cfg(test)]
+mod acquisition_tests;
+
+#[cfg(test)]
 mod tests {
     use std::cell::RefCell;
 
@@ -384,5 +386,6 @@ mod tests {
         let batch = engine.log_since(0, 1 << 20).unwrap();
         BETWEEN.with(|between| *between.borrow_mut() = None);
         assert_eq!((batch.records, batch.last), (3, 3));
+        super::acquisition_tests::facts_stay_associated_during_acquisition();
     }
 }
