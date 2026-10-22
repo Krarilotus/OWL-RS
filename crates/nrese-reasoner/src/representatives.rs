@@ -28,6 +28,8 @@
 use std::sync::{Arc, PoisonError, RwLock};
 
 use super::batch::{self, Schema};
+use super::delta::Interrupted;
+use super::eval::Poller;
 use super::ir::{Atom, Guard, Head, Rule, SharedListIndex, Term};
 use super::ir::{Triple, Violation};
 use super::lists::ListVocabulary;
@@ -96,6 +98,19 @@ pub fn guards_hold_over(
     value: impl Fn(Term) -> Option<Bound>,
     classes: &EqualityClasses,
 ) -> bool {
+    guards_hold_over_polled(guards, value, classes, &mut Poller::never())
+        .expect("the uncancelled guard check runs to completion")
+}
+
+/// The exact check with the operation's poller. Candidate filtering and each attempted
+/// identity/check are work too: an unsatisfiable constraint can explore factorially many
+/// assignments without scanning another fact. Interruption decides no guard result.
+pub(crate) fn guards_hold_over_polled(
+    guards: &[Guard],
+    value: impl Fn(Term) -> Option<Bound>,
+    classes: &EqualityClasses,
+    poll: &mut Poller<'_>,
+) -> Result<bool, Interrupted> {
     let mut slots: Vec<(Term, Bound)> = Vec::new();
     let mut slot = |term: Term| -> Option<usize> {
         if let Some(i) = slots.iter().position(|&(t, _)| t == term) {
@@ -106,6 +121,7 @@ pub fn guards_hold_over(
     };
     let mut checks = Vec::new();
     for guard in guards {
+        poll.work()?;
         let check = match guard {
             Guard::NotEqual(a, b) => slot(*a).zip(slot(*b)).map(|(a, b)| Check::Differ(a, b)),
             Guard::NotIn(term, low, high) => slot(*term).map(|t| Check::Outside(t, *low, *high)),
@@ -117,56 +133,97 @@ pub fn guards_hold_over(
         checks.extend(check);
     }
     let representatives: Vec<u64> = slots.iter().map(|&(_, bound)| bound.id()).collect();
-    if checks.iter().all(|check| check.holds(&representatives)) {
-        return true;
+    fn hold(
+        checks: &[Check<'_>],
+        chosen: &[u64],
+        poll: &mut Poller<'_>,
+    ) -> Result<bool, Interrupted> {
+        for check in checks {
+            poll.work()?;
+            if !check.holds(chosen) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
-    let candidates: Vec<Vec<u64>> = (0..slots.len())
-        .map(|i| {
-            let id = match slots[i].1 {
-                Bound::Term(id) => return vec![id],
-                Bound::Class(id) => id,
-            };
-            let members = classes.class_of(id).unwrap_or(std::slice::from_ref(&id));
-            let lists: Vec<&SharedListIndex> = checks
-                .iter()
-                .filter_map(|check| match *check {
-                    Check::Listed(a, b, index) if a == i || b == i => Some(index),
-                    _ => None,
-                })
-                .collect();
-            let allowed = |member: &&u64| {
-                checks.iter().all(|check| match *check {
-                    Check::Outside(slot, low, high) if slot == i => !(low..=high).contains(*member),
-                    _ => true,
-                }) && lists.iter().all(|index| index.contains(**member))
-            };
-            let differs = checks
-                .iter()
-                .filter(|check| matches!(**check, Check::Differ(a, b) if a == i || b == i))
-                .count();
-            let take = if lists.is_empty() {
-                differs + 1
-            } else {
-                usize::MAX
-            };
-            members.iter().filter(allowed).take(take).copied().collect()
-        })
-        .collect();
-    fn search(candidates: &[Vec<u64>], checks: &[Check<'_>], chosen: &mut Vec<u64>) -> bool {
+    if hold(&checks, &representatives, poll)? {
+        return Ok(true);
+    }
+    let mut candidates = Vec::with_capacity(slots.len());
+    for (i, &(_, bound)) in slots.iter().enumerate() {
+        poll.work()?;
+        let id = match bound {
+            Bound::Term(id) => {
+                candidates.push(vec![id]);
+                continue;
+            }
+            Bound::Class(id) => id,
+        };
+        let members = classes.class_of(id).unwrap_or(std::slice::from_ref(&id));
+        let mut lists = Vec::new();
+        let mut differs = 0;
+        for check in &checks {
+            poll.work()?;
+            match *check {
+                Check::Listed(a, b, index) if a == i || b == i => lists.push(index),
+                Check::Differ(a, b) if a == i || b == i => differs += 1,
+                _ => {}
+            }
+        }
+        let take = if lists.is_empty() {
+            differs + 1
+        } else {
+            usize::MAX
+        };
+        let mut options = Vec::new();
+        'members: for &member in members {
+            poll.work()?;
+            for check in &checks {
+                poll.work()?;
+                if matches!(*check, Check::Outside(slot, low, high)
+                    if slot == i && (low..=high).contains(&member))
+                {
+                    continue 'members;
+                }
+            }
+            for index in &lists {
+                poll.work()?;
+                if !index.contains(member) {
+                    continue 'members;
+                }
+            }
+            options.push(member);
+            if options.len() == take {
+                break;
+            }
+        }
+        candidates.push(options);
+    }
+    fn search(
+        candidates: &[Vec<u64>],
+        checks: &[Check<'_>],
+        chosen: &mut Vec<u64>,
+        poll: &mut Poller<'_>,
+    ) -> Result<bool, Interrupted> {
         let Some(options) = candidates.get(chosen.len()) else {
-            return true;
+            return Ok(true);
         };
         for &option in options {
+            poll.work()?;
             chosen.push(option);
-            if checks.iter().all(|check| check.holds(chosen)) && search(candidates, checks, chosen)
-            {
-                return true;
+            if hold(checks, chosen, poll)? && search(candidates, checks, chosen, poll)? {
+                return Ok(true);
             }
             chosen.pop();
         }
-        false
+        Ok(false)
     }
-    search(&candidates, &checks, &mut Vec::with_capacity(slots.len()))
+    search(
+        &candidates,
+        &checks,
+        &mut Vec::with_capacity(slots.len()),
+        poll,
+    )
 }
 
 /// The classes a materialisation has merged so far, shared with the guards that read them
@@ -189,6 +246,15 @@ impl ClassGuards {
     /// a representative; `None` while unbound). The representatives are checked first
     /// without the classes; only a binding they fail reads them.
     pub fn holds(&self, value: &dyn Fn(Term) -> Option<u64>) -> bool {
+        self.holds_polled(value, &mut Poller::never())
+            .expect("the uncancelled guard check runs to completion")
+    }
+
+    pub(crate) fn holds_polled(
+        &self,
+        value: &dyn Fn(Term) -> Option<u64>,
+        poll: &mut Poller<'_>,
+    ) -> Result<bool, Interrupted> {
         let bound = |term: Term| match term {
             Term::Const(id) => Some(Bound::Term(id)),
             Term::Var(v) => self
@@ -199,15 +265,22 @@ impl ClassGuards {
                 .or_else(|| value(term))
                 .map(Bound::Class),
         };
-        if self
-            .guards
-            .iter()
-            .all(|guard| guard.holds(|term| bound(term).map(Bound::id)))
-        {
-            return true;
+        let mut direct = true;
+        for guard in self.guards.iter() {
+            poll.work()?;
+            if !guard.holds(|term| bound(term).map(Bound::id)) {
+                direct = false;
+                break;
+            }
+        }
+        if direct {
+            return Ok(true);
         }
         let classes = self.classes.read().unwrap_or_else(PoisonError::into_inner);
-        !classes.is_empty() && guards_hold_over(&self.guards, bound, &classes)
+        if classes.is_empty() {
+            return Ok(false);
+        }
+        guards_hold_over_polled(&self.guards, bound, &classes, poll)
     }
 
     /// The guards with the schema variables' values of `substitution` (grounding).

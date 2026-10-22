@@ -12,6 +12,49 @@ use super::vocabulary::LocalVocabulary;
 
 const EX: &str = "http://example.com/";
 
+/// A failed schema guard has no filed instance to reevaluate. Class growth must revisit
+/// just that guarded grounding, including bodiless heads and a merge adding no new fact.
+#[test]
+fn class_growth_revisits_failed_schema_guard_bindings() {
+    for mixed in [false, true] {
+        for reflexive_already_present in [false, true] {
+            let mut vocabulary = LocalVocabulary::default();
+            let extra = if mixed {
+                ", (rdf:fixM rdf:fixR rdf:fixZ)"
+            } else {
+                ""
+            };
+            let rules = super::ir::parse_rules(
+                &format!(
+                    "eq-rep-s: (?s owl:sameAs ?t), (?s ?p ?o) -> (?t ?p ?o)\n\
+                 eq-rep-p: (?p owl:sameAs ?q), (?s ?p ?o) -> (?s ?q ?o)\n\
+                 eq-rep-o: (?o owl:sameAs ?t), (?s ?p ?o) -> (?s ?p ?t)\n\
+                 merge: (?k rdf:fixP ?x), (?k rdf:fixP ?y), ?x != ?y -> (?x owl:sameAs ?y)\n\
+                 guard: (?x rdfs:domain ?y){extra}, ?x != ?y -> (rdf:fixM rdf:fixQ rdf:fixZ)"
+                ),
+                &mut vocabulary,
+            )
+            .unwrap();
+            let schema = Schema::owl(&mut vocabulary);
+            let mut input = load(
+                &mut vocabulary,
+                "ex:a rdfs:domain ex:a\nex:k rdf:fixP ex:a\nex:k rdf:fixP ex:b\nrdf:fixM rdf:fixR rdf:fixZ",
+            );
+            if reflexive_already_present {
+                input.extend(load(&mut vocabulary, "ex:a owl:sameAs ex:a"));
+            }
+            let want = load(&mut vocabulary, "rdf:fixM rdf:fixQ rdf:fixZ")[0];
+            let replication = batch::materialise(&input, &rules, None, &schema);
+            assert!(replication.derived.contains(&want), "replication control");
+            let result = super::representatives::materialise(&input, &rules, None, &schema);
+            assert!(
+                result.facts.contains(&want),
+                "mixed={mixed}, no-new-fact merge={reflexive_already_present}: {result:?}"
+            );
+        }
+    }
+}
+
 /// Parses `s p o` lines of prefixed names (`ex:`, `rdf:`, `rdfs:`, `owl:`); `_:x` are
 /// blank nodes and `"…"^^<…>` literals (without spaces) are taken as they are.
 fn load(vocabulary: &mut LocalVocabulary, text: &str) -> Vec<Triple> {
