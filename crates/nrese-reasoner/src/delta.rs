@@ -411,9 +411,9 @@ pub fn update_with<B: Base + ?Sized>(
                             old.scan([None, Some(p), None], Seg::All, &mut |t| component.push(t));
                         }
                         None if rule.body.is_empty() => {
-                            if let Head::Facts(heads) = &rule.head {
-                                bodiless.extend(heads.iter().map(|h| instantiate_head(h, &[])));
-                            }
+                            super::eval::for_each_head(&rule.head, &[], |h| {
+                                bodiless.push(instantiate_head(h, &[]))
+                            });
                         }
                         None => fresh.push(rule.clone()),
                     }

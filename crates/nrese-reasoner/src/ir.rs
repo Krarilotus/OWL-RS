@@ -177,10 +177,19 @@ impl std::hash::Hash for SharedListIndex {
     }
 }
 
+/// A set of conclusions with the same residual, head-local conjunction.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HeadGroup {
+    pub guards: Vec<Guard>,
+    pub heads: Vec<Atom>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Head {
     /// Facts to derive.
     Facts(Vec<Atom>),
+    /// One body walk; each group is tested only at emission.
+    Grouped(Box<[HeadGroup]>),
     /// A consistency violation (OWL 2 RL rules with a `false` head).
     Inconsistent,
 }
@@ -194,13 +203,86 @@ pub struct Rule {
     pub head: Head,
 }
 
+impl Head {
+    pub(crate) fn retain_atoms(&mut self, mut keep: impl FnMut(&mut Atom) -> bool) {
+        match self {
+            Self::Facts(atoms) => atoms.retain_mut(&mut keep),
+            Self::Grouped(groups) => {
+                for group in groups.iter_mut() {
+                    group.heads.retain_mut(&mut keep);
+                }
+                // Normalization removes empty descriptors before the next freeze.
+            }
+            Self::Inconsistent => {}
+        }
+    }
+
+    /// Cold consumers (indexing, schema, recursion); execution selects its emitter first.
+    pub fn atoms(&self) -> impl Iterator<Item = &Atom> {
+        let (facts, groups): (&[Atom], &[HeadGroup]) = match self {
+            Self::Facts(facts) => (facts, &[]),
+            Self::Grouped(groups) => (&[], groups),
+            Self::Inconsistent => (&[], &[]),
+        };
+        facts
+            .iter()
+            .chain(groups.iter().flat_map(|group| &group.heads))
+    }
+}
+
 impl Rule {
+    /// Prepare once after compilation/grounding. Factor shared guards, merge equal
+    /// conjunctions, and recover Facts when all remaining checks are common.
+    pub(crate) fn factor_head_guards(&mut self) {
+        if !matches!(self.head, Head::Grouped(_)) {
+            return;
+        }
+        let Head::Grouped(groups) = std::mem::replace(&mut self.head, Head::Inconsistent) else {
+            unreachable!()
+        };
+        let mut groups = groups.into_vec();
+        groups.retain(|g| !g.heads.is_empty());
+        if let Some(first) = groups.first() {
+            let common: Vec<Guard> = first
+                .guards
+                .iter()
+                .filter(|guard| groups.iter().all(|g| g.guards.contains(guard)))
+                .filter(|guard| !self.guards.contains(guard))
+                .cloned()
+                .collect();
+            self.guards.extend(common);
+        }
+        let mut merged: Vec<HeadGroup> = Vec::with_capacity(groups.len());
+        for mut group in groups {
+            group.guards.retain(|guard| !self.guards.contains(guard));
+            if let Some(same) = merged.iter_mut().find(|g| g.guards == group.guards) {
+                same.heads.append(&mut group.heads);
+            } else {
+                merged.push(group);
+            }
+        }
+        self.head = if merged.iter().all(|g| g.guards.is_empty()) {
+            let mut heads = Vec::with_capacity(merged.iter().map(|g| g.heads.len()).sum());
+            for group in merged {
+                heads.extend(group.heads);
+            }
+            Head::Facts(heads)
+        } else {
+            for group in &mut merged {
+                group.guards.shrink_to_fit();
+                group.heads.shrink_to_fit();
+            }
+            Head::Grouped(merged.into_boxed_slice())
+        };
+    }
+
     /// Number of distinct variables (they are numbered densely from 0).
     pub fn variables(&self) -> usize {
         let mut max = None;
         let atoms = self.body.iter().chain(match &self.head {
             Head::Facts(atoms) => atoms.as_slice(),
             Head::Inconsistent => &[],
+            Head::Grouped(groups) => return self.grouped_variables(groups),
         });
         for atom in atoms {
             for term in atom.0 {
@@ -210,6 +292,26 @@ impl Rule {
             }
         }
         max.map_or(0, |m| usize::from(m) + 1)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grouped_variables(&self, groups: &[HeadGroup]) -> usize {
+        let mut max = None;
+        for atom in self.body.iter().chain(groups.iter().flat_map(|g| &g.heads)) {
+            for term in atom.0 {
+                if let Term::Var(v) = term {
+                    max = max.max(Some(v));
+                }
+            }
+        }
+        max.map_or(0, |m| usize::from(m) + 1)
+    }
+
+    pub(crate) fn has_class_guards(&self) -> bool {
+        self.guards.iter().any(|g| matches!(g, Guard::Classes(_)))
+            || matches!(&self.head, Head::Grouped(groups) if groups.iter().any(|g|
+                g.guards.iter().any(|g| matches!(g, Guard::Classes(_)))))
     }
 }
 

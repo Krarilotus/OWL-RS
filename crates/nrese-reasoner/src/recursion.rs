@@ -71,13 +71,12 @@ pub fn non_recursive(
     let mut atoms_of: Vec<(Vec<usize>, Vec<usize>)> = Vec::with_capacity(rules.len());
     for rule in rules {
         let (body, head): (Vec<usize>, Vec<usize>) = match (&rule.head, counted(rule)) {
-            (Head::Facts(atoms), true) => (
+            (head @ (Head::Facts(_) | Head::Grouped(_)), true) => (
                 rule.body
                     .iter()
                     .map(|a| id(node(a, rdf_type, false), &mut index))
                     .collect(),
-                atoms
-                    .iter()
+                head.atoms()
                     .map(|a| id(node(a, rdf_type, true), &mut index))
                     .collect(),
             ),

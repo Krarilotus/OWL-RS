@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use super::ir::{Head, ParseError, Rule, Term, Vocabulary};
+use super::ir::{ParseError, Rule, Term, Vocabulary};
 use super::n3::{self, N3Program};
 use super::rulesets::{Ruleset, SEMANTICS_VERSION};
 use super::vocabulary::LocalVocabulary;
@@ -25,6 +25,8 @@ pub struct UserRules {
     /// A head can produce generalized rdf:type/owl:sameAs facts. Parsed once with the
     /// rules, not while comparing a persisted state's fingerprint.
     value_checks: bool,
+    /// Parsed differing inline conclusions need head-local semantics on upgrade.
+    pie_head_guards: bool,
 }
 
 /// The languages user rules are read in.
@@ -58,9 +60,17 @@ impl UserRules {
             format,
             pie_contexts: false,
             value_checks: false,
+            pie_head_guards: false,
         };
         let mut vocabulary = LocalVocabulary::default();
-        let compiled = rules.compile(&mut vocabulary)?;
+        let compiled = if format == RuleFormat::Pie {
+            let (compiled, affected) =
+                super::pie::compile_with_features(&rules.name, &rules.text, &mut vocabulary)?;
+            rules.pie_head_guards = affected;
+            compiled
+        } else {
+            rules.compile(&mut vocabulary)?
+        };
         let rdf_type = vocabulary.iri(&format!("{}type", super::ir::RDF));
         let same_as = vocabulary.iri(&format!("{}sameAs", super::ir::OWL));
         let checked = |predicate: Term| {
@@ -68,13 +78,14 @@ impl UserRules {
                 || predicate == Term::Const(rdf_type)
                 || predicate == Term::Const(same_as)
         };
-        rules.value_checks = compiled.rules.iter().any(|rule| match &rule.head {
-            Head::Facts(heads) => heads.iter().any(|atom| checked(atom.0[1])),
-            Head::Inconsistent => false,
-        }) || compiled
-            .facts
+        rules.value_checks = compiled
+            .rules
             .iter()
-            .any(|fact| checked(Term::Const(fact[1])));
+            .any(|rule| rule.head.atoms().any(|atom| checked(atom.0[1])))
+            || compiled
+                .facts
+                .iter()
+                .any(|fact| checked(Term::Const(fact[1])));
         rules.pie_contexts = format == RuleFormat::Pie && super::pie::uses_contexts(&rules.text);
         Ok(rules)
     }
@@ -165,6 +176,10 @@ impl RuleProgram {
         // generalized type/equality facts keep their previous fingerprint.
         if self.base.is_none() && user.value_checks {
             feed(super::rulesets::VALUE_CHECK_SEMANTICS);
+        }
+        if user.pie_head_guards {
+            feed(b"pie-head-guards:");
+            feed(&1u32.to_le_bytes());
         }
         hash
     }
@@ -340,5 +355,68 @@ Id: r
         assert!(RuleProgram::closes_equality("rdfs-plus"));
         assert!(!RuleProgram::closes_equality("rdfs"));
         assert!(!RuleProgram::closes_equality("custom:x.n3"));
+    }
+
+    /// Marker eligibility is parsed before normalization, and does not replace either
+    /// Context-name or value-check invalidation. Unaffected rules keep old hashes.
+    #[test]
+    fn inline_head_marker_is_affected_only_and_composes() {
+        for contexts in [false, true] {
+            for values in [false, true] {
+                for affected in [false, true] {
+                    let context = if contexts { "[Context <urn:g#x>]" } else { "" };
+                    let constraint = if affected { "[Constraint x != x]" } else { "" };
+                    let value = if values {
+                        "x <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> y"
+                    } else {
+                        "x <urn:r> y"
+                    };
+                    let text = format!(
+                        "Prefices {{}}\nRules {{\nId: r\nx <urn:p> y\n---\nx <urn:q> y {constraint} {context}\n{value}\n}}\n"
+                    );
+                    let user = Arc::new(UserRules::pie("r.pie", &text).unwrap());
+                    assert_eq!(
+                        (user.pie_contexts, user.value_checks, user.pie_head_guards),
+                        (contexts, values, affected)
+                    );
+                    let program = RuleProgram::new(None, Some(user)).unwrap();
+                    let mut expected = fingerprint_before_context_names(&text);
+                    let mut feed = |bytes: &[u8]| {
+                        for &byte in bytes {
+                            expected ^= u64::from(byte);
+                            expected = expected.wrapping_mul(0x0000_0100_0000_01b3);
+                        }
+                    };
+                    if contexts {
+                        feed(b"pie-context-names:");
+                        feed(&super::super::pie::CONTEXT_NAMES.to_le_bytes());
+                    }
+                    if values {
+                        feed(super::super::rulesets::VALUE_CHECK_SEMANTICS);
+                    }
+                    if affected {
+                        feed(b"pie-head-guards:");
+                        feed(&1u32.to_le_bytes());
+                    }
+                    assert_eq!(program.fingerprint(), expected);
+                }
+            }
+        }
+        for heads in [
+            "x <urn:q> y [Constraint x != y]",
+            "x <urn:q> y [Constraint x != y]\nx <urn:r> y [Constraint x != y]",
+            "[Constraint x != x]\nx <urn:q> y\nx <urn:r> y",
+        ] {
+            let text = format!("Prefices {{}}\nRules {{\nId: r\nx <urn:p> y\n---\n{heads}\n}}\n");
+            let program = RuleProgram::new(
+                None,
+                Some(Arc::new(UserRules::pie("r.pie", &text).unwrap())),
+            )
+            .unwrap();
+            assert_eq!(
+                program.fingerprint(),
+                fingerprint_before_context_names(&text)
+            );
+        }
     }
 }
