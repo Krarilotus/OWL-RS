@@ -1,0 +1,38 @@
+# The tests whose evidence differs on Windows: a gate runs them on Windows whenever their crate's
+# tests run (scripts/check.sh, part `windows`), wherever the rest of the gate runs.
+#
+#   crate:target[:filter]   target: `lib` or a test target; filter: a nextest filter expression
+#                           narrowing it (all of the target without one)
+#
+# - Memory guards (owner, 20 Oct 2026): every test measured with nrese-exec's `measure` or a
+#   counting allocator. The system allocator behaves differently on Windows and under glibc,
+#   and these guards are the memory evidence.
+# - Code that differs by OS: cfg(windows), cfg(unix), target_os (memory readings, file system
+#   durability, CPU detection).
+# scripts/lib/windows-tests.py check fails for a source file of either kind that no line covers.
+
+# measure, its counting allocator, and memory readings per OS (memory.rs), Linux regions (region.rs)
+nrese-exec:lib
+nrese-exec:join_limits
+# CPU detection, durable renames and directory syncs (cfg(unix)), derived indexes on disk
+nrese-engine:lib:test(/^(cpu|durability|term::derived|engine::statistics)::/)
+nrese-engine:it:test(/^(durability_tests|derived_index_tests)::/)
+nrese-engine:canonical_view_memory
+nrese-engine:spill_memory
+nrese-engine:read_bounds_memory
+nrese-sparql:lib:test(/^native::(budget_tests|geo::tests|spatial::tests)::/)
+nrese-sparql:cache_memory
+nrese-sparql:canonical_memory
+nrese-store:memory_churn
+nrese-dl:scratch_memory
+nrese-reasoner:memory_guards
+
+# Guards/OS paths already present in the pinned finish tree (not new product tests).
+nrese-engine:bulk_load_memory
+nrese-engine:expansion_memory
+nrese-engine:measure_without_its_allocator
+nrese-store:lib:test(/^metadata::tests::/)
+nrese-store:it:test(/^repository_catalog_tests::/)
+nrese-store:support_memory
+nrese-server:process_memory
+nrese-rdf-io:binary_bounds

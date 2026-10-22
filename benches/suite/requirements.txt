@@ -1,0 +1,5 @@
+# The Python packages the suite contracts import (scripts/check.sh runs them), at the versions
+# the main PC has. A gate on a fleet host installs them into its own environment
+# (scripts/lib/gate-job.sh), never into the host's Python.
+scipy==1.17.1
+numpy==2.4.6
