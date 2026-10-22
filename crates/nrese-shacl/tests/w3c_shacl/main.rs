@@ -294,12 +294,17 @@ fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Outcome, String> 
         &snapshot,
         &shapes,
         Selection::of(GraphSelector::Exact(TermId::DEFAULT_GRAPH)),
-    );
-    if !report.failures.is_empty() {
-        return Err(format!("validation failed: {}", report.failures.join("; ")));
+        &Default::default(),
+    )
+    .map_err(|e| e.to_string())?;
+    if !report.failures().is_empty() {
+        return Err(format!(
+            "validation failed: {}",
+            report.failures().join("; ")
+        ));
     }
     let mut results: Vec<String> = report
-        .results
+        .results()
         .iter()
         .map(|result| {
             let term = |term: &Term| key(term.as_ref());
@@ -317,7 +322,7 @@ fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Outcome, String> 
     // The report's RDF form must state the same.
     let graph: Graph = report.to_triples().into_iter().collect();
     let count = graph.triples_for_predicate(&iri(SH, "result")).count();
-    if count != report.results.len() {
+    if count != report.results().len() {
         return Err(format!("the report graph has {count} results"));
     }
     Ok((report.conforms(), results))
