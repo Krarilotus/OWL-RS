@@ -4,6 +4,7 @@ mod ai;
 mod api_v1;
 pub(crate) mod authentication;
 mod cache_api;
+mod cancellable;
 mod classification;
 mod console;
 mod draft_check;

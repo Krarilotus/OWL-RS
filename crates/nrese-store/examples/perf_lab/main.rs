@@ -1275,6 +1275,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             let validation = store.validate_shacl(
                 &nrese_store::ReadScope::All,
                 &ShaclValidationRequest::default(),
+                &nrese_store::CancellationToken::new(),
             )?;
             times.push(started.elapsed());
             results = validation.report.results().len();

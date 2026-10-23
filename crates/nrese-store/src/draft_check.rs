@@ -186,7 +186,7 @@ pub fn run_draft_check(
     planner: nrese_sparql::PlannerOptions,
 ) -> DraftOutcome {
     let checked = match operation {
-        DraftOperation::Shacl => check_shacl(inputs, limits),
+        DraftOperation::Shacl => check_shacl(inputs, limits, cancellation, memory_limit, planner),
         DraftOperation::Query => check_query(inputs, limits, cancellation, memory_limit, planner),
         DraftOperation::Reasoning => check_reasoning(inputs, limits, cancellation),
     };
@@ -243,7 +243,16 @@ fn store_with(graphs: &[Option<&str>], limits: &DraftLimits) -> Result<StoreServ
     Ok(store)
 }
 
-fn check_shacl(inputs: &DraftInputs, limits: &DraftLimits) -> Checked {
+fn check_shacl(
+    inputs: &DraftInputs,
+    limits: &DraftLimits,
+    cancellation: &CancellationToken,
+    memory_limit: Option<usize>,
+    planner: nrese_sparql::PlannerOptions,
+) -> Checked {
+    cancellation
+        .check()
+        .map_err(|error| cancelled_or(cancellation, error.to_string()))?;
     let shapes = inputs
         .shapes
         .as_deref()
@@ -274,14 +283,25 @@ fn check_shacl(inputs: &DraftInputs, limits: &DraftLimits) -> Checked {
         graphs: ValidatedGraphs::Default,
         read_model: ReadModel::Asserted,
     };
+    let resources = nrese_sparql::Resources {
+        memory: store.envelope(memory_limit),
+        cancellation: Some(cancellation.clone()),
+        planner,
+        ..Default::default()
+    };
     let ShaclValidation {
         report, applicable, ..
-    } = match store.validate_shacl(&ReadScope::All, &request) {
+    } = match store.validate_shacl_in(&ReadScope::All, &request, &resources) {
         Ok(validation) => validation,
         Err(StoreError::ShaclShapes(problems)) => {
             return Err(failed(format!("invalid SHACL graph: {problems}")));
         }
-        Err(error) => return Err(failed(format!("SHACL validation failed: {error}"))),
+        Err(error) => {
+            return Err(cancelled_or(
+                cancellation,
+                format!("SHACL validation failed: {error}"),
+            ));
+        }
     };
     if !report.failures().is_empty() {
         return Err(failed(format!(

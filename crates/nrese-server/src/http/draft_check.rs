@@ -222,17 +222,14 @@ async fn run(
     let cancellation = CancellationToken::new();
     let (operation, inputs, limits) = (request.operation, request.inputs.clone(), request.limits);
     let token = cancellation.clone();
-    let task = tokio::task::spawn_blocking(move || {
+    let task = super::cancellable::blocking(seconds, cancellation, move || {
         run_draft_check(operation, &inputs, &limits, &token, memory, planner)
     });
-    match tokio::time::timeout(seconds, task).await {
+    match task.await {
         Ok(Ok(outcome)) => outcome,
         Ok(Err(error)) => {
             DraftOutcome::refused(DraftStatus::Failed, format!("the check stopped: {error}"))
         }
-        Err(_) => {
-            cancellation.cancel();
-            DraftOutcome::refused(DraftStatus::Timeout, "the check exceeded its time limit")
-        }
+        Err(_) => DraftOutcome::refused(DraftStatus::Timeout, "the check exceeded its time limit"),
     }
 }

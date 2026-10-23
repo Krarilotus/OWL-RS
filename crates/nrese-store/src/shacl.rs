@@ -20,6 +20,8 @@ use crate::query::GraphResultFormat;
 use crate::rdf_io::{BlankNodes, parse_graph, serialize_triples};
 use crate::service::StoreService;
 
+mod encode;
+
 /// Where a request's shapes stay while it runs. They are never committed.
 const REQUEST_SHAPES_GRAPH: &str = "https://nrese.dev/ns/graph#shacl-request-shapes";
 
@@ -66,7 +68,6 @@ impl Default for ShaclValidationRequest {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
 pub struct ShaclValidation {
     pub report: ValidationReport,
     /// The revision that was validated.
@@ -77,7 +78,30 @@ pub struct ShaclValidation {
     /// Whether anything was checked: some active targeted shape had a focus node and a
     /// constraint ([`nrese_shacl::applicable`]). A conforming report without it is vacuous.
     pub applicable: bool,
+    // Encoding uses this request's envelope and stop source after validation returns.
+    resources: Resources,
 }
+
+impl std::fmt::Debug for ShaclValidation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShaclValidation")
+            .field("report", &self.report)
+            .field("revision", &self.revision)
+            .field("shapes", &self.shapes)
+            .field("applicable", &self.applicable)
+            .finish()
+    }
+}
+
+impl PartialEq for ShaclValidation {
+    fn eq(&self, other: &Self) -> bool {
+        self.report == other.report
+            && self.revision == other.revision
+            && self.shapes == other.shapes
+            && self.applicable == other.applicable
+    }
+}
+impl Eq for ShaclValidation {}
 
 /// One validation result in plain text, for JSON reports: IRIs as they are, other terms
 /// in N-Triples form.
@@ -96,6 +120,12 @@ pub struct ShaclResultText {
 }
 
 impl ShaclValidation {
+    /// The existing JSON report, with output capacity admitted by this request's
+    /// envelope before growth. The returned bytes retain their reservation.
+    pub fn serialize_json(&self) -> StoreResult<ChargedVec<u8>> {
+        encode::json(self, &self.resources)
+    }
+
     /// The report as an RDF graph in `format`.
     pub fn serialize(&self, format: GraphResultFormat) -> StoreResult<Vec<u8>> {
         serialize_triples(format, self.report.to_triples())
@@ -284,13 +314,24 @@ impl StoreService {
         &self,
         scope: &crate::ReadScope,
         request: &ShaclValidationRequest,
+        cancellation: &nrese_sparql::CancellationToken,
     ) -> StoreResult<ShaclValidation> {
-        scope.require_all("validation")?;
-        // Compile slice only; approved transport token threading follows separately.
         let resources = Resources {
             memory: self.envelope(None),
+            cancellation: Some(cancellation.clone()),
             ..Default::default()
         };
+        self.validate_shacl_in(scope, request, &resources)
+    }
+
+    pub(crate) fn validate_shacl_in(
+        &self,
+        scope: &crate::ReadScope,
+        request: &ShaclValidationRequest,
+        resources: &Resources,
+    ) -> StoreResult<ShaclValidation> {
+        scope.require_all("validation")?;
+        resources.check()?;
         let stored = graph_iri(&self.config().shapes_graph)?;
         match &request.shapes {
             ShapesSource::Stored | ShapesSource::Graph(_) => {
@@ -304,13 +345,14 @@ impl StoreService {
                     snapshot.lookup(shapes_graph.as_ref().into()),
                     snapshot.lookup(stored.as_ref().into()),
                     request,
-                    &resources,
+                    resources,
                 )?;
                 Ok(ShaclValidation {
                     report,
                     revision: snapshot.revision(),
                     shapes,
                     applicable,
+                    resources: resources.clone(),
                 })
             }
             ShapesSource::Payload {
@@ -339,13 +381,14 @@ impl StoreService {
                     tx.lookup(scratch.into()),
                     tx.lookup(stored.as_ref().into()),
                     request,
-                    &resources,
+                    resources,
                 )?;
                 Ok(ShaclValidation {
                     report,
                     revision,
                     shapes,
                     applicable,
+                    resources: resources.clone(),
                 })
             }
         }
