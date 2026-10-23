@@ -111,3 +111,5 @@ fn n7_decoded_copy_refusal_and_partial_stop_release_payload() {
 }
 
 mod json_scope;
+
+mod xml_io;
