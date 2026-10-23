@@ -30,7 +30,7 @@ use nrese_sparql_syntax::algebra::{
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern};
 
 use nrese_exec::join::{
-    anti_join_in_place, compatible_mask, outer_join_with_undef, semi_join_in_place,
+    anti_join_in_place, compatible_mask_within, outer_join_with_undef, semi_join_in_place,
 };
 use nrese_exec::{ChargedVec, IdTable, Scratch, UNDEF};
 
@@ -451,7 +451,7 @@ impl Context<'_> {
             // An unbound variable isn't put into the pattern: any value matches.
             let mut mask = self.mask(solutions.table.len(), false)?;
             let table = &solutions.table;
-            compatible_mask(
+            compatible_mask_within(
                 table,
                 &found.table,
                 &lk,
@@ -459,8 +459,9 @@ impl Context<'_> {
                 false,
                 &self.budget,
                 &mut mask,
+                crate::service::Check(self),
             )
-            .map_err(QueryEvaluationError::MemoryLimit)?;
+            .map_err(QueryEvaluationError::from)?;
             self.consumed(found);
             let kept = mask.iter().filter(|m| **m == keep_matching).count();
             note(joined, detail, kept);
@@ -578,7 +579,7 @@ impl Context<'_> {
             let (lk, rk) = shared_columns(solutions, &found);
             let mut mask = self.mask(solutions.table.len(), false)?;
             let table = &solutions.table;
-            compatible_mask(
+            compatible_mask_within(
                 table,
                 &found.table,
                 &lk,
@@ -586,8 +587,9 @@ impl Context<'_> {
                 false,
                 &self.budget,
                 &mut mask,
+                crate::service::Check(self),
             )
-            .map_err(QueryEvaluationError::MemoryLimit)?;
+            .map_err(QueryEvaluationError::from)?;
             self.consumed(found);
             return Ok(mask);
         }
