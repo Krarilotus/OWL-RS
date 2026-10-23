@@ -121,11 +121,39 @@ impl ServiceResults {
     }
 }
 
-fn parse_error(error: QueryResultsParseError) -> QueryEvaluationError {
+pub(super) fn parse_error(error: QueryResultsParseError) -> QueryEvaluationError {
     match error {
         QueryResultsParseError::Io(error) => match error.downcast::<QueryEvaluationError>() {
             Ok(error) => error,
-            Err(error) => QueryEvaluationError::Service(Box::new(error)),
+            Err(error) => {
+                let mut cause: &(dyn std::error::Error + 'static) = &error;
+                loop {
+                    match cause.downcast_ref::<QueryEvaluationError>() {
+                        Some(QueryEvaluationError::MemoryLimit(refused)) => {
+                            return QueryEvaluationError::MemoryLimit(*refused);
+                        }
+                        Some(QueryEvaluationError::Cancelled) => {
+                            return QueryEvaluationError::Cancelled;
+                        }
+                        _ => {}
+                    }
+                    if let Some(Stop::Cancelled) = cause.downcast_ref::<Stop>() {
+                        return QueryEvaluationError::Cancelled;
+                    }
+                    if let Some(refused) = cause.downcast_ref::<nrese_exec::BudgetExceeded>() {
+                        return QueryEvaluationError::MemoryLimit(*refused);
+                    }
+                    let next = cause
+                        .downcast_ref::<io::Error>()
+                        .and_then(|error| {
+                            error.get_ref().map(|error| error as &dyn std::error::Error)
+                        })
+                        .or_else(|| cause.source());
+                    let Some(next) = next else { break };
+                    cause = next;
+                }
+                QueryEvaluationError::Service(Box::new(error))
+            }
         },
         error => QueryEvaluationError::Service(Box::new(error)),
     }

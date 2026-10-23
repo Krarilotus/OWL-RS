@@ -103,11 +103,28 @@ impl From<quick_xml::Error> for QueryResultsParseError {
     fn from(error: quick_xml::Error) -> Self {
         match error {
             quick_xml::Error::Io(error) => {
-                Self::Io(io::Error::new(error.kind(), error.to_string()))
+                Self::Io(io::Error::new(error.kind(), SharedIoError(error)))
             }
             error => Self::Syntax(QueryResultsSyntaxError::msg(format!(
                 "not valid XML: {error}"
             ))),
         }
+    }
+}
+
+// Keep the original io::Error itself visible: its source() can skip the custom
+// payload, while callers can inspect that payload through io::Error::get_ref().
+#[derive(Debug)]
+struct SharedIoError(std::sync::Arc<io::Error>);
+
+impl fmt::Display for SharedIoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&*self.0, f)
+    }
+}
+
+impl std::error::Error for SharedIoError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&*self.0)
     }
 }
