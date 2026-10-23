@@ -27,6 +27,7 @@ nrese-store:memory_churn
 nrese-dl:scratch_memory
 nrese-reasoner:memory_guards
 nrese-reasoner:violations_memory
+nrese-shacl:lib
 
 # Guards/OS paths already present in the pinned finish tree (not new product tests).
 nrese-engine:bulk_load_memory
