@@ -43,7 +43,8 @@ pub struct Classification {
     /// Named classes equivalent to `owl:Thing` (superclasses of it): every class is a
     /// subclass of them, which `subsumptions` doesn't repeat for each.
     pub top: Vec<u64>,
-    /// Axioms (by their predicate or class-expression kind) outside EL, skipped.
+    /// Omitted axioms (by predicate and reason), including unsupported expressions,
+    /// malformed lists and resource refusals. Their consequences may be missing.
     pub skipped: Vec<(u64, &'static str)>,
 }
 
@@ -270,6 +271,24 @@ impl Tbox {
     }
 }
 
+/// Why an EL RDF list could not be read. A resource stop says nothing about its tail.
+#[derive(Debug)]
+enum ListError {
+    Malformed,
+    Cyclic,
+    ResourceLimit,
+}
+
+impl ListError {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed list",
+            Self::Cyclic => "cyclic list",
+            Self::ResourceLimit => "list resource limit exceeded",
+        }
+    }
+}
+
 /// The triples of an ontology, indexed by subject.
 struct Graph<'a> {
     by_subject: HashMap<u64, Vec<(u64, u64)>>,
@@ -290,17 +309,25 @@ impl Graph<'_> {
         self.objects(subject, predicate).next()
     }
 
-    fn list(&self, mut node: u64) -> Option<Vec<u64>> {
+    fn list(&self, mut node: u64) -> Result<Vec<u64>, ListError> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         while node != self.names.nil {
-            if !seen.insert(node) || out.len() > 10_000 {
-                return None;
+            if !seen.insert(node) {
+                return Err(ListError::Cyclic);
             }
-            out.push(self.one(node, self.names.first)?);
-            node = self.one(node, self.names.rest)?;
+            if out.len() > 10_000 {
+                return Err(ListError::ResourceLimit);
+            }
+            out.push(
+                self.one(node, self.names.first)
+                    .ok_or(ListError::Malformed)?,
+            );
+            node = self
+                .one(node, self.names.rest)
+                .ok_or(ListError::Malformed)?;
         }
-        Some(out)
+        Ok(out)
     }
 
     /// The class expression `node` is; `Err` names what EL lacks.
@@ -317,7 +344,7 @@ impl Graph<'_> {
             return Ok(Expr::Named(node));
         }
         if let Some(list) = self.one(node, self.names.intersection_of) {
-            let members = self.list(list).ok_or("malformed list")?;
+            let members = self.list(list).map_err(ListError::reason)?;
             if members.is_empty() {
                 return Err("empty intersection");
             }
@@ -447,8 +474,16 @@ fn build(
                 }
             }
         } else if p == names.rdf_type && o == names.all_disjoint_classes {
-            let Some(members) = graph.one(s, names.members).and_then(|l| graph.list(l)) else {
-                continue;
+            let members = match graph
+                .one(s, names.members)
+                .ok_or(ListError::Malformed)
+                .and_then(|l| graph.list(l))
+            {
+                Ok(members) => members,
+                Err(error) => {
+                    skipped.push((p, error.reason()));
+                    continue;
+                }
             };
             let concepts: Vec<Concept> = members
                 .iter()
@@ -473,9 +508,12 @@ fn build(
             let r = tbox.role(Some(s));
             tbox.chains.push((r, r, r));
         } else if p == names.property_chain && named(s) {
-            let Some(links) = graph.list(o) else {
-                skipped.push((p, "malformed list"));
-                continue;
+            let links = match graph.list(o) {
+                Ok(links) => links,
+                Err(error) => {
+                    skipped.push((p, error.reason()));
+                    continue;
+                }
             };
             if links.len() < 2 || !links.iter().all(|&l| named(l)) {
                 skipped.push((p, "chain of inverse or fewer than two properties"));
@@ -1205,5 +1243,121 @@ mod tests {
              ex:E rdfs:subClassOf ex:F");
         assert_eq!(result.skipped.len(), 2, "{:?}", result.skipped);
         assert!(holds(&mut v, &result, "E", "F"));
+
+        // Spec: omitted input must be reported, with a resource refusal distinct from
+        // malformed/cyclic structure. Disjoint A/B with X below both makes X bottom.
+        let disjoint = |n: usize| {
+            let mut text = String::from(
+                "ex:X rdf:type owl:Class\n\
+                 _:d rdf:type owl:AllDisjointClasses\n\
+                 _:d owl:members _:l0\n\
+                 ex:X rdfs:subClassOf ex:A\n\
+                 ex:X rdfs:subClassOf ex:B\n",
+            );
+            for i in 0..n {
+                let member = match i {
+                    0 => "ex:A".to_owned(),
+                    1 => "ex:B".to_owned(),
+                    _ => format!("ex:F{}", i - 2),
+                };
+                let rest = if i + 1 == n {
+                    "rdf:nil".to_owned()
+                } else {
+                    format!("_:l{}", i + 1)
+                };
+                text.push_str(&format!(
+                    "{member} rdf:type owl:Class\n\
+                     _:l{i} rdf:first {member}\n_:l{i} rdf:rest {rest}\n"
+                ));
+            }
+            text
+        };
+        let small = disjoint(3);
+        let long = disjoint(10_002);
+        let head = "_:d rdf:type owl:AllDisjointClasses\n_:d owl:members _:l0\n";
+        let cases = [
+            ("D3", small.clone(), None, true),
+            (
+                "missing-rest",
+                small.replace("_:l2 rdf:rest rdf:nil\n", ""),
+                Some(("rdf:type", "malformed list")),
+                false,
+            ),
+            (
+                "cycle",
+                small.replace("_:l2 rdf:rest rdf:nil", "_:l2 rdf:rest _:l0"),
+                Some(("rdf:type", "cyclic list")),
+                false,
+            ),
+            (
+                "missing-members",
+                small.replace("_:d owl:members _:l0\n", ""),
+                Some(("rdf:type", "malformed list")),
+                false,
+            ),
+            (
+                "D10002",
+                long.clone(),
+                Some(("rdf:type", "list resource limit exceeded")),
+                false,
+            ),
+            (
+                "intersection-resource",
+                long.replace(
+                    head,
+                    "ex:X rdfs:subClassOf _:i\n_:i owl:intersectionOf _:l0\n",
+                ),
+                Some(("rdfs:subClassOf", "list resource limit exceeded")),
+                false,
+            ),
+            (
+                "chain-resource",
+                long.replace(head, "ex:r owl:propertyChainAxiom _:l0\n"),
+                Some(("owl:propertyChainAxiom", "list resource limit exceeded")),
+                false,
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (case, input, omitted, bottom) in cases {
+            let (mut v, actual) = run(&input);
+            let x = v.iri(&format!("{EX}X"));
+            let expected = Classification {
+                subsumptions: if bottom {
+                    Vec::new()
+                } else {
+                    let mut pairs =
+                        vec![(x, v.iri(&format!("{EX}A"))), (x, v.iri(&format!("{EX}B")))];
+                    pairs.sort_unstable();
+                    pairs
+                },
+                unsatisfiable: if bottom { vec![x] } else { Vec::new() },
+                top: Vec::new(),
+                skipped: omitted
+                    .map(|(predicate, reason)| {
+                        let mut parts = load(&mut v, &format!("ex:X {predicate} ex:X"));
+                        (parts.pop().unwrap()[1], reason)
+                    })
+                    .into_iter()
+                    .collect(),
+            };
+            if actual != expected {
+                failures.push(format!("{case}: expected {expected:?}, actual {actual:?}"));
+            }
+        }
+        // Check the exact accepted boundary through the reader only: pair expansion at
+        // 10,001 members is intentionally not part of this bounded regression.
+        let mut v = LocalVocabulary::default();
+        let triples = load(&mut v, &disjoint(10_001));
+        let names = Names::new(&mut v);
+        let mut by_subject: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+        for [s, p, o] in triples {
+            by_subject.entry(s).or_default().push((p, o));
+        }
+        let graph = Graph {
+            by_subject,
+            names: &names,
+        };
+        assert_eq!(graph.list(v.term("_:l0")).unwrap().len(), 10_001);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }
