@@ -386,18 +386,24 @@ impl<'v, 's, V: ReadView> Task<'v, 's, V> {
             }
         }
         self.stack.push((shape_ref, focus))?;
-        let values = match &shape.path {
-            None => ChargedVec::collect(&*validator.budget, 1, [focus])?,
-            Some(path) => path::values(
-                &validator.graph,
-                path,
-                focus,
-                &validator.budget,
-                &mut self.ticker,
-            )?,
+        // A node shape borrows its one focus value; paths own their result set.
+        let singleton = [focus];
+        let path_values;
+        let values: &[TermId] = match &shape.path {
+            None => &singleton,
+            Some(path) => {
+                path_values = path::values(
+                    &validator.graph,
+                    path,
+                    focus,
+                    &validator.budget,
+                    &mut self.ticker,
+                )?;
+                &path_values
+            }
         };
         for constraint in &shape.constraints {
-            self.check(shape_ref, focus, &values, constraint, results)?;
+            self.check(shape_ref, focus, values, constraint, results)?;
         }
         self.stack.truncate(self.stack.len() - 1);
         Ok(())
@@ -1061,3 +1067,7 @@ fn subclasses<V: ReadView>(
     // Reuse the BFS allocation as the final sorted class set, retaining its charge.
     Ok((nodes, token.into_shared(budget)))
 }
+
+#[cfg(test)]
+#[path = "validate/focus_value_tests.rs"]
+mod focus_value_tests;

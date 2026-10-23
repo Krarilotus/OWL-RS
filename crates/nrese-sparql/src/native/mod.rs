@@ -2992,11 +2992,15 @@ impl<'a> Context<'a> {
         let begun = Instant::now();
         let seed_rows = result.table.len();
         let mut estimated = seed_rows as f64;
-        let mut distinct: HashMap<Variable, f64> = result
-            .vars
-            .iter()
-            .map(|v| (v.clone(), estimated.max(1.0)))
-            .collect();
+        let mut distinct: HashMap<Variable, f64> = if self.trace.is_some() {
+            result
+                .vars
+                .iter()
+                .map(|v| (v.clone(), estimated.max(1.0)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         let mut left: Vec<usize> = (0..scans.len()).collect();
         while !left.is_empty() {
             let connected = |i: &usize| {
