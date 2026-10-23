@@ -176,6 +176,19 @@ def interleaved(pairs: list, runs: int) -> list[tuple[int, object]]:
     return plan
 
 
+def fleet_container_step(spec: Spec, case: dict) -> tuple[list[str], dict]:
+    """Bind the canonical create argv in Fleet's typed per-step Docker plan.
+
+    Fleet resolves its three placeholders once. The driver receives the resolved
+    argv in the agent-written request; successful completion requires consumption.
+    """
+    import json
+    argv = DockerRuntime(SCRATCH, port=0).args(spec, detached=False, bound=True)
+    step = ["python3", "-B", "benches/breadth/era-shacl/run.py", "consume", "--case",
+            json.dumps(case, separators=(",", ":"))]
+    return step, dict(cores=1, ram_gb=16, docker=dict(ram_gb=12, argv=argv))
+
+
 def stamp(results: Path, argv: list[str], images: list[str], datasets: list[Path], protocol: dict) -> dict:
     """The run's manifest entry (benches/suite/suitekit/manifest.py's fields)."""
     return {

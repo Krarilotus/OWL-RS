@@ -25,7 +25,7 @@ owns its tests, and benchmarks never run in a gate.
 | Tier | When | What |
 |---|---|---|
 | `commit` | the pre-commit hook | rustfmt; clippy (warnings are errors) on every target of changed crates; compile their dependents' libraries; run the changed crates' fast tests |
-| `push` | the pre-push hook | changes since the upstream branch: rustfmt and clippy on changed crates; all their tests (slow suites too), dependents' fast tests, additional random seeds for changed crates, and the lock check |
+| `push` | the pre-push hook | the committed delta from `scripts/lib/push-base.txt`: complete Linux and native Windows Fleet parts, with source/tool identity and required test inventory checked by the producer |
 | `all` | milestones, merges to `main`, CI | everything: both Cargo workspaces, doc tests, the lock check, `cargo-deny` (licences, advisories, bans, sources; `deny.toml`), benchmark-suite contract tests, the console's typecheck and tests |
 
 - A crate declares its slow test binaries (conformance suites, fuzz campaigns: over ~15 s)
@@ -37,19 +37,25 @@ owns its tests, and benchmarks never run in a gate.
 
 ## Building and measuring
 
-Rust builds run on the build host ([benches/hosts.toml](benches/hosts.toml)): with
-`git config nrese.buildHost <ssh alias>`, the hooks and `scripts/lib/remote.sh check|run`
-send the working tree there and run the command in a worktree of its own (`NRESE_BUILD_HOST=local`
-builds on this machine instead). A tier that passed
-for the same tree and files doesn't run again, so run `scripts/check.sh push` before a long
-push: the hook then passes at once. Build through
-`scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most `NRESE_BUILD_SLOTS`
-builds at once per machine). Validate in batches: quick checks while
-working, the push tier once per batch. Measure counts first; time only to answer a stated
-question, inside `scripts/quiet-slot.sh`, on `release` (`--profile lab` to iterate). A slot
-holds one short measurement, since builds wait for it; long comparison runs go to a machine of
-their own. Every number names the commit its binary was built from and whether the tree was
-clean; a binary kept for comparison is rebuilt after its source changes or is reverted.
+Fleet is the execution entrypoint for builds, tests and measurements on fleet hosts.
+The [tooling operations guide](docs/dev/fleet-operations.md) covers preparation,
+submission, collection and recovery. Its Fleet job guide owns current host rules and
+notices; `benches/hosts.toml` and old SSH/queue recipes do not override them.
+
+Run `bash scripts/check.sh push` from the intended committed checkout. It submits
+both platform parts and returns 75 while they are pending or lack a valid verdict.
+After completion, invoke the same command to collect and validate the saved request;
+it does not submit a duplicate merely because the operator checks again. It returns
+0 only for the matching complete evidence, or 1 for a validated check failure.
+There is no direct-host or local fallback for this ordinary push path. Keep the
+normal commit hooks and their existing local admission contract.
+
+Build through `scripts/cargo-guarded.sh` inside the admitted execution path. Validate
+coherent changes together; use narrow checks to choose and verify a repair. Measure
+work counts first, then use [ABBA](benches/abba/README.md) for targeted timing
+certification through Fleet. A diagnostic run is not release qualification. Every
+number names the binary's source, compiler, settings, inputs and actual host. Retain
+a compatible existing binary while its planned comparisons still need it.
 
 Keep a separate Cargo target directory for each worktree; share downloaded registry
 dependencies through `CARGO_HOME`, never build artifacts of different revisions.

@@ -9,6 +9,7 @@ import base64
 import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 LIB = ROOT / 'scripts/lib'
@@ -62,8 +64,24 @@ def fixture(part='rest'):
           'memory_cap_gb': spec['step_needs'][i]['ram_gb'], 'memory_job': 'nrese-build-real'})
         attempts.append({'step': i, 'host': 'native-host', 'started': 100, 'ended': 130, 'exit': 0, 'failure': None})
     for row in rows:
+        if part == 'windows':
+            # Synthetic selected setup, never host discovery or compiler execution.
+            compiler = 'C:/fixture/VC/Tools/MSVC/14/bin/Hostx64/x64/cl.exe'
+            row['native_toolchain'] = {'version': 1, 'target': row['target'],
+                'installation': 'C:/fixture', 'toolset_version': '14',
+                'vswhere': {'path': 'C:/vswhere.exe', 'sha256': '1'*64},
+                'devcmd': {'path': 'C:/fixture/Common7/Tools/VsDevCmd.bat', 'sha256': '2'*64},
+                'selected': {'compiler': compiler, 'compiler_sha256': '3'*64,
+                    'helper': compiler.replace('cl.exe', 'VCTIP.EXE'), 'helper_sha256': '4'*64,
+                    'target': row['target'], 'selection': 'synthetic fixture'},
+                'sdk': {'root': 'C:/sdk', 'version': '10', 'ucrt_root': 'C:/sdk', 'ucrt_version': '10'},
+                'environment': {**{k: compiler for k in ('NRESE_MSVC_COMPILER', 'CC', 'CXX',
+                    'HOST_CC', 'HOST_CXX', 'TARGET_CC', 'TARGET_CXX',
+                    'CC_X86_64_PC_WINDOWS_MSVC', 'CXX_X86_64_PC_WINDOWS_MSVC')},
+                    'NRESE_MSVC_TARGET': row['target'], 'PATH': 'C:/fixture/bin',
+                    'INCLUDE': 'C:/sdk/include', 'LIB': 'C:/sdk/lib'}}
         row['artifact_key'] = protocol.artifact_key(r['tree'], r['release'], r['rustc_commit'],
-                                                    r['flags'], row['target'], row['cpu'])
+            r['flags'], row['target'], row['cpu'], row.get('native_toolchain'))
         row['artifact_target'] = ('target-gate-win-' if part == 'windows' else 'target-gate-') + row['artifact_key']
     job = {'spec': spec, 'state': 'done', 'next_step': len(rows), 'attempts': attempts}
     return r, rows, job
@@ -199,6 +217,251 @@ class Evidence(unittest.TestCase):
                          ['kraris-gptler','other-native','test-native'])
         explicit=copy.deepcopy(spec); explicit['requires']['roles']=['test']
         self.assertEqual(client.confirmation_hosts(explicit,catalog),['test-native'])
+
+
+class RawResults(unittest.TestCase):
+    """Spec: owner task, 2026-10-23: preserve raw results before optional readers/cleanup."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix='gate-raw-results-')
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.out = self.root/'out'; self.out.mkdir()
+        if os.environ.get('FLEET_OUT'):
+            self.addCleanup(lambda: shutil.copytree(self.out,
+                Path(os.environ['FLEET_OUT'])/self.root.name, dirs_exist_ok=True))
+
+    def test_client_keeps_full_bytes_before_error_summary_or_json_reader(self):
+        stdout = b'actual stdout\r\n' + b'x'*4096
+        stderr = b'original cause\r\n' + b'y'*4096 + b'\xff'
+        for code in (0, 42):
+            folder = self.out/str(code); folder.mkdir()
+            program = folder/'producer.py'
+            program.write_text(f'import os; os.write(1,{stdout!r}); os.write(2,{stderr!r}); raise SystemExit({code})')
+            argv = [sys.executable, str(program)]
+            messages = io.StringIO()
+            with contextlib.redirect_stderr(messages):
+                with self.assertRaises(json.JSONDecodeError if code == 0 else protocol.NoVerdict):
+                    json.loads(client.command(argv, {**CLEAN, 'SECRET_TOKEN': 'never-dump-env',
+                                                     'FLEET_OUT': str(folder)}))
+            records = list(folder.glob('command-*/result.json'))
+            self.assertEqual(len(records), 1)
+            record = json.loads(records[0].read_text())
+            self.assertEqual(record['returncode'], code)
+            self.assertEqual(record['argv'][-len(argv):], argv)
+            self.assertEqual((records[0].parent/'stdout').read_bytes(), stdout)
+            self.assertEqual((records[0].parent/'stderr').read_bytes(), stderr)
+            self.assertIn(str(records[0].parent), messages.getvalue())
+            self.assertNotIn('never-dump-env', records[0].read_text())
+            if os.name != 'nt':
+                self.assertEqual(records[0].parent.stat().st_mode & 0o077, 0)
+
+    def test_client_deadline_retains_partial_output_and_actual_exit(self):
+        argv = [sys.executable, '-u', '-c',
+                'import sys,time; print("before timeout"); print("timeout cause",file=sys.stderr); time.sleep(30)']
+        for watchdog in (False, True):
+            folder = self.out/str(watchdog); folder.mkdir()
+            with self.assertRaises(subprocess.TimeoutExpired if watchdog else protocol.NoVerdict):
+                if watchdog:
+                    client.captured(argv, CLEAN, seconds=1, artifacts=folder)
+                else:
+                    client.command(argv, {**CLEAN, 'FLEET_OUT': str(folder)}, seconds=1)
+            record = next(folder.glob('command-*/result.json'))
+            result = json.loads(record.read_text())
+            self.assertNotEqual(result['returncode'], 0)
+            if watchdog and os.name == 'nt':
+                # Owner continuation keeps communicate's existing metadata buffer.
+                # Native Python supplies no partial bytes before its readers see EOF.
+                self.assertIs(result['capture_complete'], False)
+                self.assertIs(result['stdout_available'], False)
+                self.assertIs(result['stderr_available'], False)
+            else:
+                self.assertIn(b'before timeout', (record.parent/'stdout').read_bytes())
+                self.assertIn(b'timeout cause', (record.parent/'stderr').read_bytes())
+        partial = self.out/'reported-partial'; partial.mkdir()
+        communicate = subprocess.Popen.communicate
+        def reported_partial(process, *args, **kwargs):
+            try:
+                return communicate(process, *args, **kwargs)
+            except subprocess.TimeoutExpired as error:
+                error.output, error.stderr = b'partial\xff', b'original cause'
+                raise
+        with patch.object(subprocess.Popen, 'communicate', reported_partial):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                client.captured(argv, CLEAN, seconds=1, artifacts=partial)
+        record = next(partial.glob('command-*/result.json'))
+        self.assertEqual((record.parent/'stdout').read_bytes(), b'partial\xff')
+        self.assertEqual((record.parent/'stderr').read_bytes(), b'original cause')
+        self.assertIs(json.loads(record.read_text())['capture_complete'], False)
+
+    def test_collected_output_location_survives_missing_or_invalid_unit_metadata(self):
+        r, rows, job = fixture()
+        c = client.Client({**CLEAN, 'FLEET_OWNER': 't3:fixture'})
+        for value in (None, '{invalid'):
+            with self.subTest(value=value):
+                if value is not None:
+                    (self.out/'unit-0.json').write_text(value)
+                with patch.object(c, 'fleet', side_effect=[job, {'path': str(self.out)}]):
+                    with self.assertRaises((OSError, ValueError)):
+                        c.collect(r, 'rest', self.root)
+                receipt = json.loads((self.root/'rest-results.json').read_text())
+                self.assertEqual(receipt['path'], str(self.out))
+
+    def test_client_drains_inherited_writers_before_reading_or_times_out_incomplete(self):
+        # Spec: owner continuation, 2026-10-23: exit alone is not capture completion.
+        for delay, deadline in ((0.3, 5), (2, 1)):
+            folder = self.out/str(delay); folder.mkdir()
+            closed = folder/'writer-closed'
+            writer = folder/'writer.py'
+            writer.write_text(f'''import os,time
+from pathlib import Path
+time.sleep({delay})
+try:
+    os.write(1,b'7}}\\n'); os.write(2,b'delayed cause\\n')
+except BrokenPipeError:
+    pass
+finally:
+    os.close(1); os.close(2)
+    Path({str(closed)!r}).touch()
+''')
+            producer = folder/'producer.py'
+            producer.write_text(f'''import os,subprocess,sys
+os.write(1,b'{{"answer":')
+subprocess.Popen([sys.executable,{str(writer)!r}],stdout=sys.stdout,stderr=sys.stderr)
+''')
+            try:
+                if delay < deadline:
+                    raw = client.captured([sys.executable, str(producer)], CLEAN, deadline, folder)
+                    self.assertEqual(json.loads(raw), {'answer': 7})
+                else:
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        client.captured([sys.executable, str(producer)], CLEAN, deadline, folder)
+                result = next(folder.glob('command-*/result.json'))
+                record = json.loads(result.read_text())
+                self.assertEqual(record['returncode'], 0, 'retain the immediate command exit')
+                self.assertIs(record['capture_complete'], delay < deadline)
+                if delay < deadline:
+                    self.assertEqual((result.parent/'stderr').read_bytes(), b'delayed cause\n')
+                else:
+                    self.assertIn('TimeoutExpired', record['error'])
+            finally:
+                limit = time.monotonic() + 5
+                while not closed.exists() and time.monotonic() < limit:
+                    time.sleep(0.01)
+                self.assertTrue(closed.exists(), 'owned fixture writer did not close its handles')
+
+    def test_client_failed_drain_cannot_mark_capture_complete(self):
+        # A disk writer failure is independent of the command's successful exit.
+        original = Path.open
+        class BrokenSink:
+            def __init__(self, stream): self.stream = stream
+            def __getattr__(self, name): return getattr(self.stream, name)
+            def write(self, data): raise OSError('fixture disk write failed')
+        @contextlib.contextmanager
+        def open_sink(path, *args, **kwargs):
+            with original(path, *args, **kwargs) as stream:
+                yield BrokenSink(stream) if path.name == 'stderr' and args == ('wb',) else stream
+        with patch.object(Path, 'open', open_sink):
+            with self.assertRaisesRegex(OSError, 'fixture disk write failed'):
+                client.captured([sys.executable, '-c', 'import os; os.write(2,b"cause")'],
+                                CLEAN, 5, self.out)
+        result = next(self.out.glob('command-*/result.json'))
+        record = json.loads(result.read_text())
+        self.assertEqual(record['returncode'], 0)
+        self.assertIs(record['capture_complete'], False)
+        self.assertIn('fixture disk write failed', record['error'])
+
+    def test_shell_capture_completion_requires_both_drains_including_quiet(self):
+        for mode, drain_failure in (('quiet', False), ('live', False), ('quiet', True), ('live', True)):
+            folder = self.out/f'{mode}-{drain_failure}'; folder.mkdir()
+            script = 'set -euo pipefail\nout="$FLEET_OUT"; index=0\n' + self.shell_helpers() + '''
+tee() { command tee "$@"; [ "$FAIL_DRAIN" = 0 ]; }
+fixture() { printf 'prefix'; (sleep 0.2; printf ' delayed stdout'; printf 'delayed stderr' >&2) & return 23; }
+status=0
+record "$MODE" fixture || status=$?
+printf '%s' "$status" > "$out/record-status"
+cat "$log/stdout" > "$out/observed-stdout"
+'''
+            done = self.bash(script, FLEET_OUT=folder.as_posix(), MODE=mode,
+                             FAIL_DRAIN=str(int(drain_failure)))
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            result = next(folder.glob('unit-0-command-*'))
+            self.assertEqual((folder/'observed-stdout').read_bytes(), b'prefix delayed stdout')
+            self.assertEqual((result/'stderr').read_bytes(), b'delayed stderr')
+            self.assertEqual((result/'exit').read_text().strip(), '23')
+            self.assertEqual((folder/'record-status').read_text(), '75' if drain_failure else '23')
+            self.assertEqual((result/'capture-complete').exists(), not drain_failure)
+
+    def shell_helpers(self):
+        source = (LIB/'gate-job.sh').read_text()
+        # Execute the production capture/quiet definitions, without provisioning tools.
+        start = source.index('record()') if 'record()' in source else source.index('quiet()')
+        return source[start:source.index('channel=', start)]
+
+    def bash(self, script, **extra):
+        bash = client.windows_tools(CLEAN['PATH'], os.environ['SystemRoot'])['bash'] if os.name == 'nt' else shutil.which('bash')
+        return subprocess.run([bash, '-c', script], cwd=self.root,
+            env={**CLEAN, 'PATH': str(Path(bash).parent)+os.pathsep+CLEAN['PATH'],
+                 'FLEET_OUT': self.out.as_posix(), **extra},
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=20)
+
+    def test_quiet_keeps_success_and_early_failure_output_after_cleanup(self):
+        for code in (0, 42):
+            folder = self.out/str(code); folder.mkdir()
+            script = 'set -euo pipefail\nout="$FLEET_OUT"; index=0\n' + self.shell_helpers() + '''
+fixture() { printf 'first stdout\n'; printf 'original cause\n' >&2; for ((i=0;i<40;i++)); do echo later >&2; done; return "$CODE"; }
+quiet fixture
+'''
+            done = self.bash(script, CODE=str(code), FLEET_OUT=folder.as_posix())
+            self.assertEqual(done.returncode, 0 if code == 0 else 1, done.stdout + done.stderr)
+            records = list(folder.glob('unit-0-command-*/exit'))
+            self.assertEqual(len(records), 1, done.stdout + done.stderr)
+            result = records[0].parent
+            self.assertEqual(records[0].read_text().strip(), str(code))
+            self.assertEqual((result/'argv').read_bytes(), b'fixture\0')
+            self.assertEqual((result/'stdout').read_bytes(), b'first stdout\n')
+            self.assertEqual((result/'stderr').read_bytes(), b'original cause\n' + b'later\n'*40)
+
+    def test_unit_raw_exit_survives_failed_metadata_reader_and_workdir_removal(self):
+        scripts = self.root/'scripts/lib'; scripts.mkdir(parents=True)
+        (self.root/'scripts/check.sh').write_text('''printf 'unit stdout\n'
+printf 'real workload cause\n' >&2
+printf '%s' "$SELECTION" > "$NRESE_GATE_SELECTION"
+exit "$CODE"
+''')
+        (scripts/'remote.sh').write_text('echo tree\n')
+        source = (LIB/'gate-job.sh').read_text()
+        script = '''set -euo pipefail
+out="$FLEET_OUT"; index=0; part=rest; key=request; cache="$PWD/private-cache"; mkdir -p "$cache"
+files="$cache/files"; unit=all; tree="$TEST_TREE"; base=base; list_hash=list; flags=flags
+attempt=fixture-attempt; began=1; actual_commit=compiler; release=release; target=target; cpu=cpu
+artifact=identity; CARGO_TARGET_DIR="$cache/target-gate-$artifact"; memory_job=''; ram=1
+infra() { echo "gate-job: no verdict: $*" >&2; exit 75; }
+git() { :; }
+'''+self.shell_helpers()+'\n'+source[source.index('unit=all\n'):]
+        for code, metadata in ((0, '{}'), (1, '{}'), (0, '{invalid'), (1, '{invalid'), (75, '{invalid')):
+            folder = self.out/f'{code}-{len(metadata)}'; folder.mkdir()
+            done = self.bash(script, CODE=str(code), SELECTION=metadata, FLEET_OUT=folder.as_posix(),
+                PYTHONPATH=str(LIB), NRESE_GATE_REQUEST='request', NRESE_GATE_HEAD='head',
+                FLEET_JOB='fixture-job', FLEET_HOST='fixture-host',
+                GIT_DIR=protocol.git('rev-parse', '--absolute-git-dir').decode().strip(),
+                TEST_TREE=protocol.git('rev-parse', 'HEAD^{tree}').decode().strip())
+            self.assertEqual(done.returncode, code if metadata == '{}' else 75, done.stdout + done.stderr)
+            if metadata != '{}' and code in (0, 1):
+                self.assertIn(b'JSONDecodeError', done.stderr)
+            shutil.rmtree(self.root/'private-cache')
+            records = list(folder.glob('unit-0-command-*/exit'))
+            self.assertEqual(len(records), 1, done.stdout + done.stderr)
+            result = records[0].parent
+            self.assertEqual(records[0].read_text().strip(), str(code))
+            self.assertEqual((result/'argv').read_bytes(), b'bash\0scripts/check.sh\0push\0')
+            self.assertEqual((result/'stdout').read_bytes(), b'unit stdout\n')
+            self.assertEqual((result/'stderr').read_bytes(), b'real workload cause\n')
+            self.assertEqual((folder/'unit-0-selection.json').read_text(), metadata)
+            if metadata == '{}':
+                self.assertEqual(json.loads((folder/'unit-0.json').read_text())['code'], code)
+            else:
+                self.assertFalse((folder/'unit-0.json').exists())
 
 
 class Selection(unittest.TestCase):
@@ -538,7 +801,7 @@ else: sys.exit(3)
                 row.update(request=request['key'], job=spec['id'], required=required, selection=s,
                            memory_cap_gb=spec['step_needs'][i]['ram_gb'], snapshot_after=request['tree'])
                 row['artifact_key'] = protocol.artifact_key(request['tree'], request['release'],
-                    request['rustc_commit'], request['flags'], row['target'], row['cpu'])
+                    request['rustc_commit'], request['flags'], row['target'], row['cpu'], row.get('native_toolchain'))
                 row['artifact_target'] = ('target-gate-win-' if part == 'windows' else 'target-gate-') + row['artifact_key']
                 row['steps'] = [{'name': name, 'code': 0} for name in required]
                 (out/f'unit-{i}.json').write_text(json.dumps(row))

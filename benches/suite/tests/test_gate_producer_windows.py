@@ -104,7 +104,37 @@ sys.exit(0)
                 self.assertEqual(request['files'],['change.txt','scripts/lib/push-base.txt'])
                 self.assertRegex(request['rustc_commit'],r'^[0-9a-f]{40}$')
                 self.assertEqual(request['key'],protocol.digest({k:v for k,v in request.items() if k!='key'}))
-                self.assertFalse((repo/'.git/nrese-gate-requests').exists())
+                # Spec: retained-diagnostics owner contract, 23 Oct: preparation
+                # retains complete raw commands, never a reusable request/pass.
+                diagnostics = repo/'.git/nrese-gate-requests'
+                commands = list(diagnostics.iterdir())
+                self.assertGreaterEqual(len(commands), 3)
+                observed = {}
+                for folder in commands:
+                    self.assertTrue(folder.is_dir() and folder.name.startswith('command-'))
+                    self.assertEqual({p.name for p in folder.iterdir()}, {'result.json', 'stdout', 'stderr'})
+                    record = json.loads((folder/'result.json').read_text())
+                    self.assertEqual(record['cwd'], str(repo))
+                    self.assertEqual(record['returncode'], 0)
+                    self.assertIs(record['capture_complete'], True)
+                    self.assertIs(record['stdout_available'], True)
+                    self.assertIs(record['stderr_available'], True)
+                    self.assertGreaterEqual(record['ended'], record['started'])
+                    self.assertNotIn('error', record)
+                    self.assertNotIn('cleanup_error', record)
+                    argv = record['argv']
+                    self.assertTrue(argv)
+                    output = (folder/'stdout').read_text().rstrip('\r\n')
+                    if argv[-2:] == ['scripts/lib/remote.sh', 'tree']:
+                        observed['tree'] = output
+                    elif argv[-2:] == ['rustc', '-vV']:
+                        observed['compiler'] = output
+                    elif argv[-2:] == ['scripts/cargo-guarded.sh', '--print-rustflags']:
+                        observed['flags'] = output
+                self.assertEqual(observed['tree'], tree)
+                self.assertEqual(observed['flags'], '-C debuginfo=1')
+                self.assertIn('commit-hash: '+request['rustc_commit'], observed['compiler'].splitlines())
+                self.assertIn('release: '+request['release'], observed['compiler'].splitlines())
                 self.assertFalse((repo/'target').exists())
                 (repo/'untracked.txt').write_text('must prevent submission\n')
                 with self.assertRaisesRegex(protocol.NoVerdict,'complete committed source snapshot'):
