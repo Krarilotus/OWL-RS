@@ -39,6 +39,8 @@ use nrese_exec::graph::{
 use nrese_exec::{IdTable, Stop, Ticker};
 use nrese_sparql_syntax::algebra::PropertyPathExpression;
 
+mod domain;
+
 fn graph_stopped(stop: Stop) -> NativeError {
     match stop {
         Stop::Memory(e) => e.into(),
@@ -224,26 +226,6 @@ impl PathEvaluator<'_> {
         nodes
     }
 
-    /// The number of [`Self::nodes`], without collecting them (from the engine's
-    /// statistics where the graph is one graph or all of them).
-    fn node_count(&self) -> u64 {
-        let graphs = match self.graph {
-            PathGraph::Default => Some(GraphSelector::Exact(TermId::DEFAULT_GRAPH)),
-            PathGraph::Named(graph) => Some(GraphSelector::Exact(graph)),
-            PathGraph::Merged(None) => Some(GraphSelector::Any),
-            PathGraph::Merged(Some(_)) => None,
-        };
-        if let Some(count) =
-            graphs.and_then(|graphs| self.snapshot.node_count_in(self.model, graphs))
-        {
-            return count;
-        }
-        let (subjects, objects) = self.subjects_and_objects();
-        let mut count = 0;
-        merge_union(&subjects, &objects, |_| count += 1);
-        count
-    }
-
     /// The distinct subjects and the distinct objects of the graph, each sorted.
     fn subjects_and_objects(&self) -> (Vec<u64>, Vec<u64>) {
         // Reads the statements: for a set of graphs, which the walks don't know, and where
@@ -257,19 +239,8 @@ impl PathEvaluator<'_> {
             }
             (subjects, objects)
         };
-        let (pattern, by_subject, by_object) = match self.graph {
-            PathGraph::Merged(None) => (QuadPattern::all(), Permutation::Spog, Permutation::Ospg),
-            PathGraph::Merged(Some(_)) => return read(),
-            PathGraph::Default => (
-                QuadPattern::in_graph(TermId::DEFAULT_GRAPH),
-                Permutation::Gspo,
-                Permutation::Gosp,
-            ),
-            PathGraph::Named(graph) => (
-                QuadPattern::in_graph(graph),
-                Permutation::Gspo,
-                Permutation::Gosp,
-            ),
+        let Some((pattern, by_subject, by_object)) = self.node_group_plan() else {
+            return read();
         };
         let distinct = |permutation| -> Option<Vec<u64>> {
             let counts = self
@@ -319,7 +290,7 @@ impl PathEvaluator<'_> {
         let count = if matches!(path, Path::OneOrMore(_)) {
             pairs
         } else {
-            self.node_count() + pairs - diagonal
+            self.node_count()? + pairs - diagonal
         };
         work.finish().map_err(graph_stopped)?;
         Ok(Some(count))
@@ -354,11 +325,13 @@ impl PathEvaluator<'_> {
     pub(crate) fn diagonal(&self, path: &Path) -> NativeResult<Option<IdTable>> {
         match path {
             Path::ZeroOrMore(_) => {
+                if let Some(out) = self.star_domain_within()? {
+                    return Ok(Some(out));
+                }
                 let cancellation = self.cancellation;
                 let stop = move || cancellation.is_some_and(crate::CancellationToken::is_cancelled);
                 let mut work = Ticker::new(&stop).map_err(graph_stopped)?;
-                // The existing node-domain engine bridge is unchanged and separately
-                // owned; this avoids evaluating the step or expanding its reach pairs.
+                // Unsupported filtered/equality scopes keep their existing route.
                 let nodes = self.nodes();
                 work.check().map_err(graph_stopped)?;
                 let mut out = IdTable::charged(1, nodes.len(), self.budget)?;
@@ -733,6 +706,10 @@ fn merge_union(a: &[u64], b: &[u64], mut f: impl FnMut(u64)) {
     }
     a[i..].iter().chain(&b[j..]).for_each(|&x| f(x));
 }
+
+#[cfg(test)]
+#[path = "paths/engine_tests.rs"]
+mod engine_tests;
 
 #[cfg(test)]
 mod tests {
