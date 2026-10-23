@@ -351,14 +351,15 @@ def quantum(sides: list[list[list[float]]]) -> float:
     return 0.0
 
 
-def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], floor: dict | None = None) -> dict:
+def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], floor: dict | None = None,
+                 *, base_off_route_ok: bool = True) -> dict:
     """The candidate's case against one baseline's, dimension by dimension, by blocks; `floor`:
     the case's A-A' noise floor on this host, per dimension (read_floor()). `not_compared`: each
     dimension deliberately not tested, with its reason (one this baseline doesn't support, or one
     whose loss of evidence blocks); gate() holds every other untested hypothesis an error."""
     floor = floor or {}
     row = {"comparable": True, "dimensions": {}, "notes": [], "blocks": [], "reported": {}, "not_compared": {}}
-    base_state = state(base, off_route_ok=True)
+    base_state = state(base, off_route_ok=base_off_route_ok)
     if state(base) == "known" and state(cand) == "known":
         return {**row, "comparable": False, "reason": "a known issue on both sides (no timing verdict)"}
     if state(cand) == "known":
@@ -761,7 +762,8 @@ def fmt(x) -> str:
 def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: list[str], harness: str,
          min_blocks: int = CAMPAIGN_BLOCKS, diagnostic: bool = False, not_run: dict | None = None,
          tradeoffs: list[dict] | None = None, catalog: list[dict] | None = None, elsewhere: dict | None = None,
-         context: dict | None = None, family: list[str] | None = None, floor: dict | None = None) -> dict:
+         context: dict | None = None, family: list[str] | None = None, floor: dict | None = None,
+         route_baselines: dict[str, str] | None = None) -> dict:
     """One round of one timed part: the schedule and provenance checked, every comparison's
     blocks tested; each declared hypothesis's p-value (untested: 1). The decision over the family
     and the rounds is verdict()'s. `floor`: the host's A-A' noise floor (read_floor())."""
@@ -808,22 +810,28 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     by_side = {s: sorted([p for p in passes if p["side"] == s], key=lambda p: p["n"]) for s in sides}
     checks = {c["name"]: {path.split(".")[1] for path in c.get("check", {}) if path.startswith("q.")}
               for c in (catalog or [])}
+    # Explicit baseline arm AND declared revision; AA orientation never changes the role.
+    # None preserves ordinary release-gate candidate/baseline behavior.
+    candidate_route_ok = route_baselines is not None and route_baselines.get(candidate) == sides[candidate]
     for case in planned:
         cand = evidence(by_side[candidate], case)
-        if state(cand) == "failed":
+        cand_state = state(cand, off_route_ok=candidate_route_ok)
+        if cand_state == "failed":
             why = cand["failed_checks"][:3] + cand["failed_routes"][:2] + cand["notes"][-1:]
             summary["candidate_failures"][case] = f"statuses {', '.join(map(str, cand['status']))}; " + "; ".join(why)
-        elif state(cand) == "known":
+        elif cand_state == "known":
             summary["known_issues"][case] = ", ".join(sorted(set(cand["status"])))
         elif any(x != "ok" for x in cand["expected"]):
             summary["fixed"][case] = ", ".join(sorted(set(cand["expected"]) - {"ok"}))
-        if cand["unchecked"] and state(cand) != "failed":
+        if cand["unchecked"] and cand_state != "failed":
             summary["candidate_failures"][case] = f"{cand['unchecked']} checks unchecked on the candidate"
         for side in baselines:
-            if state(cand) == "failed" or side in aliases:
+            if cand_state == "failed" or side in aliases:
                 continue
             row = compare_case(cand, evidence(by_side[side], case), side, checks.get(case, set()),
-                               ((floor or {}).get("cases") or {}).get(case))
+                               ((floor or {}).get("cases") or {}).get(case),
+                               base_off_route_ok=(route_baselines is None
+                                                  or route_baselines.get(side) == sides[side]))
             summary["comparisons"].setdefault(side, {})[case] = row
     summary["case_seconds"] = {}
     for p in passes:

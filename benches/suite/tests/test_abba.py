@@ -124,6 +124,49 @@ class Abba(unittest.TestCase):
         self.family["cases"][0]["min_samples"] = 4  # every series has 3 samples a pass
         self.assertEqual(self.verdict(self.round_(records(), name="few"))[0], abba.NO_VERDICT)
 
+        # Spec: Johannes/root baseline contract, 23 Oct: correct generic GROUP on declared
+        # A/A2 stays eligible through completeness and BOTH own AA directions. B is strict
+        # even at A's revision; wrong answers, unchecked evidence and missing samples refuse.
+        self.family["cases"][0]["min_samples"] = 3
+        cases = (("both generic baselines", "ok", False, abba.NO_LOSS),
+                 ("candidate route", "candidate-route", False, abba.NO_VERDICT),
+                 ("candidate at baseline revision", "candidate-route", True, abba.NO_VERDICT),
+                 ("baseline answer", "answer", False, abba.NO_VERDICT),
+                 ("baseline unchecked", "unchecked", False, abba.NO_VERDICT),
+                 ("baseline samples", "samples", False, abba.NO_VERDICT),
+                 ("baseline source", "source", False, abba.NO_VERDICT))
+        for number, (name, damage, same_revision, expected) in enumerate(cases):
+            with self.subTest(baseline_route_contract=name):
+                def generic(side, n):
+                    out = records()(side, n)
+                    rec = out[0]
+                    if side in ("a", "a2") or damage == "candidate-route" and side == "b":
+                        rec["status"] = "off-route"
+                        rec["routes"] = [{"path": "q.q01-point-lookup.operators",
+                                          "expected": "has group count", "got": ["project", "bind", "group"],
+                                          "ok": False}]
+                        for observation in rec["observations"]:
+                            observation["routes"] = [dict(r) for r in rec["routes"]]
+                    if side == "a2" and damage in ("answer", "unchecked"):
+                        rec["checks"][0].update(got=-1 if damage == "answer" else None,
+                                                ok=False if damage == "answer" else None)
+                        for observation in rec["observations"]:
+                            observation["checks"] = [dict(c) for c in rec["checks"]]
+                    if side == "a2" and damage == "samples":
+                        rec["samples"] = {}
+                    return out
+                saved = self.family["sides"]["b"]
+                self.family["sides"]["b"] = A if same_revision else B
+                try:
+                    with patch.dict(fixture.REVS, b=self.family["sides"]["b"],
+                                    a2=B if damage == "source" else A):
+                        code, text = self.verdict(self.round_(generic, name=f"route-{number}"))
+                    self.assertEqual(code, expected,
+                                     "baseline generic GROUP must remain eligible through both own AA directions; "
+                                     "candidate routes and baseline guards stay strict: " + name + "\n" + text)
+                finally:
+                    self.family["sides"]["b"] = saved
+
     def test_a_family_may_name_its_sides_by_short_ids(self):
         """lcp-passes (21 Oct 2026): sides named by 8 digits got "no verdict" on every pass of a
         complete run, the passes recording the full revisions."""
