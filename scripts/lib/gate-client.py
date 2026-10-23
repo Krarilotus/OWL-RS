@@ -14,11 +14,85 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
 from gate_protocol import (NoVerdict, PUBLISHED_BASE, UNITS, atomic_json, check_overrides,
                            clean_env, digest, git, scope, tooling, validate_part, validate_unit)
+
+
+def captured(args, env, seconds, artifacts=None, **options):
+    # Metadata/control commands retain their established in-memory communicate()
+    # boundary. Persist bytes before decoding/optional readers, without an env dump.
+    # These diagnostics are never reusable pass/build evidence.
+    root = artifacts or env.get('FLEET_OUT') or os.environ.get('FLEET_OUT')
+    if root is None:
+        root = Path(git('rev-parse', '--path-format=absolute', '--git-common-dir').decode().strip()) / 'nrese-gate-requests'
+    root = Path(root).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    folder = Path(tempfile.mkdtemp(prefix='command-', dir=root))  # private (0700 on POSIX)
+    record = {'argv': list(args), 'cwd': str(Path.cwd()), 'timeout_s': seconds,
+              'returncode': None, 'capture_complete': False,
+              'stdout_available': False, 'stderr_available': False, 'started': time.time()}
+    atomic_json(folder/'result.json', record)
+    print(f'gate command raw result: {folder}', file=sys.stderr)
+    process = None
+    communicated = False
+    try:
+        with (folder/'stdout').open('wb') as stdout, (folder/'stderr').open('wb') as stderr:
+            process = subprocess.Popen(args, env=env, stdout=subprocess.PIPE,
+                                       stderr=subprocess.PIPE, **options)
+            try:
+                output, errors = process.communicate(timeout=seconds)
+                communicated = True
+            except subprocess.TimeoutExpired as e:
+                # Windows communicate may not supply partial bytes before EOF.
+                # Unavailable is distinct from a successfully captured empty stream.
+                record['stdout_available'] = e.output is not None
+                record['stderr_available'] = e.stderr is not None
+                stdout.write(e.output or b'')
+                stderr.write(e.stderr or b'')
+                raise
+            record['stdout_available'] = record['stderr_available'] = True
+            stdout.write(output)
+            stderr.write(errors)
+        # Both EOFs and successful file close/flush are required, independently of exit.
+        record['capture_complete'] = True
+    except (OSError, subprocess.SubprocessError) as e:
+        record['error'] = f'{type(e).__name__}: {e}'
+        raise  # Preserve the caller's existing transport/launch failure handling.
+    finally:
+        try:
+            if process is not None:
+                record['returncode'] = process.poll()
+                if record['returncode'] is not None:
+                    atomic_json(folder/'result.json', record)  # Before pipe cleanup.
+                if process.poll() is None:
+                    process.kill()
+                    # Reaping cannot turn a stream timeout into an unbounded join.
+                    process.wait(timeout=seconds)
+                # Never close/join a Windows communicate reader still waiting on an
+                # inherited writer: its daemon reader closes the pipe at EOF. The
+                # failing CLI exits; no second, unbounded communicate() is attempted.
+                if communicated or os.name != 'nt':
+                    process.stdout.close()
+                    process.stderr.close()
+        except (OSError, subprocess.SubprocessError) as e:
+            record['cleanup_error'] = f'{type(e).__name__}: {e}'
+            raise
+        finally:
+            if process is not None:
+                record['returncode'] = process.poll()
+            record['ended'] = time.time()
+            atomic_json(folder/'result.json', record)
+    if record['returncode']:
+        with (folder/'stderr').open('rb') as stderr:
+            stderr.seek(max(0, stderr.seek(0, os.SEEK_END) - 2000))
+            tail = stderr.read().decode(errors='replace')
+        raise NoVerdict(f'{args[0]} {args[1:2]} exit {record["returncode"]}: {tail}; raw result {folder}')
+    return (folder/'stdout').read_text()
+
 
 @functools.lru_cache(maxsize=4)
 def windows_tools(path, system_root):
@@ -36,20 +110,17 @@ if (-not (Test-Path -LiteralPath $timeout -PathType Leaf)) {{
 @{{bash=$bash; timeout=$timeout}} | ConvertTo-Json -Compress
 """
     powershell = str(Path(system_root)/'System32/WindowsPowerShell/v1.0/powershell.exe')
-    p = subprocess.run([powershell, '-NoProfile', '-NonInteractive', '-EncodedCommand',
-                        base64.b64encode(script.encode('utf-16le')).decode()],
-                       env={**os.environ, 'PATH': path}, stdin=subprocess.DEVNULL,
-                       capture_output=True, text=True, timeout=20)
-    if p.returncode:
-        raise NoVerdict('native producer tools: ' + p.stderr[-2000:])
-    tools = json.loads(p.stdout)
+    raw = captured([powershell, '-NoProfile', '-NonInteractive', '-EncodedCommand',
+                    base64.b64encode(script.encode('utf-16le')).decode()],
+                   {**os.environ, 'PATH': path}, 20, stdin=subprocess.DEVNULL)
+    tools = json.loads(raw)
     if any(not Path(tools[name]).is_absolute() or not Path(tools[name]).is_file()
            for name in ('bash', 'timeout')):
         raise NoVerdict('native producer tools must be existing absolute selected-Git paths')
     return tools
 
 
-def command(args, env, seconds=60):
+def command(args, env, seconds=60, artifacts=None):
     # GNU timeout owns the whole process group, escalating TERM. Do not wrap this in a
     # pipeline that discards transport/producer failures. Available in the existing Git Bash route.
     timeout = 'timeout'
@@ -60,11 +131,8 @@ def command(args, env, seconds=60):
         if args[0] in ('bash', 'bash.exe'):
             args = [tools['bash'], *args[1:]]
         options['stdin'] = subprocess.DEVNULL  # Actual EOF even at a detached native boundary.
-    p = subprocess.run([timeout, '--kill-after=10', str(seconds), *args], env=env,
-                       capture_output=True, text=True, timeout=seconds + 20, **options)
-    if p.returncode:
-        raise NoVerdict(f'{args[0]} {args[1:2]} exit {p.returncode}: {p.stderr[-2000:]}')
-    return p.stdout.rstrip('\r\n')
+    return captured([timeout, '--kill-after=10', str(seconds), *args], env,
+                    seconds + 20, artifacts, **options).rstrip('\r\n')
 
 def build_request(env):
     check_overrides(env)
@@ -145,8 +213,8 @@ class Client:
         self.runenv['FLEET_OWNER'] = self.owner
         self.bin = env.get('NRESE_FLEET_BIN', 'C:/Users/Johannes/Documents/fleet-scheduler/state/owlrs/bin/fleet.exe')
 
-    def fleet(self, *args, seconds=60):
-        return json.loads(command([self.bin, *args, '--json'], self.runenv, seconds))
+    def fleet(self, *args, seconds=60, artifacts=None):
+        return json.loads(command([self.bin, *args, '--json'], self.runenv, seconds, artifacts))
 
     def submit(self, request, part, folder, hosts=None):
         spec = make_spec(request, part, self.owner, Path.cwd().as_posix(), self.env, hosts)
@@ -154,19 +222,21 @@ class Client:
         atomic_json(folder / 'request.json', request)  # Persist intended id before submission.
         path = folder / f'{spec["id"]}.json'
         atomic_json(path, spec)
-        reply = self.fleet('submit', str(path))
+        reply = self.fleet('submit', str(path), artifacts=folder)
         if reply.get('submitted') != [spec['id']]:
             raise NoVerdict('submission not acknowledged; retained id must be inspected, never blindly resubmitted')
         print(f'fleet gate {part}: submitted {spec["id"]}', file=sys.stderr)
 
     def collect(self, request, part, folder):
         spec = request['jobs'][part]
-        job = self.fleet('show', spec['id'])
+        job = self.fleet('show', spec['id'], artifacts=folder)
         atomic_json(folder / f'{part}-fleet.json', job)
         if job['state'] not in ('done', 'failed'):
             raise NoVerdict(f'{spec["id"]}: {job["state"]}; no verdict')
-        response = self.fleet('results', spec['id'], seconds=300)
+        response = self.fleet('results', spec['id'], seconds=300, artifacts=folder)
+        atomic_json(folder / f'{part}-results.json', response)
         out = Path(response['path'])  # Installed CLI returns the output directory itself.
+        print(f'fleet gate {part}: collected raw output {out}', file=sys.stderr)
         records = []
         for i in range(1):
             record = json.loads((out / f'unit-{i}.json').read_text(encoding='utf-8'))
@@ -228,7 +298,7 @@ def main():
                         raise NoVerdict('confirmation is still on the unconfirmed physical host')
                     request['first_failures'][part] = {'job': job, 'records': records}
                     atomic_json(folder / 'request.json', request)
-                    hosts = client.fleet('hosts')
+                    hosts = client.fleet('hosts', artifacts=folder)
                     if not isinstance(hosts, list):
                         raise NoVerdict('fleet host catalog shape is unknown; cannot broaden a confirmation')
                     eligible = confirmation_hosts(request['jobs'][part], hosts)

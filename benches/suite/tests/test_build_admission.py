@@ -31,8 +31,8 @@ class Admission(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
         self.repo = self.root / "repo"
-        for rel in ("scripts/cargo-guarded.sh", "scripts/lib/disk.sh", "scripts/lib/target-cpu.sh",
-                    "scripts/lib/prune-stale.py", "scripts/lib/memory-cap.ps1"):
+        for rel in ("scripts/cargo-guarded.sh", "scripts/check.sh", "scripts/lib/disk.sh", "scripts/lib/target-cpu.sh",
+                    "scripts/lib/prune-stale.py", "scripts/lib/memory-cap.ps1", "scripts/lib/msvc-finalize.py"):
             (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(ROOT / rel, self.repo / rel)
         self.stubs = self.root / "stubs"
@@ -121,6 +121,11 @@ class Admission(unittest.TestCase):
 [IO.File]::WriteAllText((Join-Path $env:OUT ($env:RUN+'.cap')), $LimitGB.ToString([Globalization.CultureInfo]::InvariantCulture))
 Write-Output 'fixture-memory-job'
 ''' + f"# {self.root.name}\n", encoding="utf-8")
+        # This admission-only fixture has no actual JobObject. Match its fake cap
+        # boundary with a fake compiler finalizer; real membership is covered below.
+        (self.repo / "scripts/lib/msvc-finalize.py").write_text(
+            "import sys\nfrom pathlib import Path\nif sys.argv[1] == 'prepare':\n"
+            " Path(sys.argv[sys.argv.index('--state')+1]+'.env').write_bytes(b'')\n print('fixture-binding')\n")
         self.stub("cargo", 'cat "$NRESE_BUILD_SLOT_DIR"/run/*/peak > "$OUT/$RUN.peak"\n' +
                   (self.stubs / "cargo").read_text())
         transport = self.root / "transport"
@@ -176,6 +181,338 @@ source scripts/lib/gate-job.sh "$@"
         finally:
             if os.environ.get("FLEET_OUT"):
                 shutil.copytree(self.out, Path(os.environ["FLEET_OUT"]) / ("resource-fixture-" + self.root.name), dirs_exist_ok=True)
+
+    @unittest.skipUnless(os.name == "nt", "native MSVC helper lifetime uses Windows JobObjects")
+    def test_compiler_completion_disposes_only_the_prebound_owned_helper(self):
+        # Spec: root's bounded alternative B (23 Oct 2026): after synchronous Cargo,
+        # stop only the pre-bound compiler-install helper in this exact build job;
+        # foreign and unselected-install/test workers survive, unknowns refuse
+        # completion, and a Cargo failure remains primary. Root review r1 adds:
+        # selection reaches Cargo; conflicting target selectors refuse before it.
+        import _winapi
+        import ctypes
+
+        installation = self.root / "compiler"
+        outsider = self.root / "not-the-compiler"
+        for directory in (installation, outsider):
+            directory.mkdir()
+            shutil.copyfile(sys.executable, directory / "VCTIP.EXE")
+            for dll in Path(sys.base_prefix).glob("python3*.dll"):
+                shutil.copyfile(dll, directory / dll.name)
+                (directory / (dll.stem + "._pth")).write_text(str(Path(sys.base_prefix) / "Lib") + "\n")
+            shutil.copyfile(sys.executable, directory / "cl.exe")
+        sleeper = ["-I", "-c", "import time; time.sleep(120)"]
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        get_times = kernel.GetProcessTimes
+        get_times.argtypes = [ctypes.c_void_p] + [ctypes.POINTER(ctypes.c_uint64)] * 4
+        get_times.restype = ctypes.c_int
+        kernel.OpenJobObjectW.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_wchar_p]
+        kernel.OpenJobObjectW.restype = ctypes.c_void_p
+        kernel.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        kernel.AssignProcessToJobObject.restype = ctypes.c_int
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        controller = self.root / "fake-cargo.py"
+        controller.write_text('''import json,os,subprocess,sys,time
+from pathlib import Path
+out=Path(os.environ['OUT']); run=os.environ['RUN']
+images=[str(Path(os.environ.get('CC') or os.environ['NRESE_MSVC_COMPILER']).with_name('VCTIP.EXE'))]
+if os.environ['UNKNOWN']=='1': images += [os.environ['OTHER_IMAGE'],sys.executable]
+children=[subprocess.Popen([image,'-I','-c','import time; time.sleep(120)'],
+    stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL) for image in images]
+ready=out/(run+'.workers'); temp=ready.with_suffix('.tmp')
+temp.write_text(json.dumps({'pids':[p.pid for p in children], 'job':os.environ['NRESE_BUILD_JOB'],
+    'compiler_environment':{k:os.environ.get(k) for k in ('CC','CXX','HOST_CC','TARGET_CXX',
+        'CC_x86_64_pc_windows_msvc','CXX_x86_64_pc_windows_msvc','INCLUDE','LIB',
+        'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER')}})); temp.replace(ready)
+deadline=time.monotonic()+45
+while not (out/(run+'.held')).exists():
+    if time.monotonic()>deadline: sys.exit(98)
+    time.sleep(.05)
+sys.exit(int(os.environ['CODE']))
+''')
+        self.stub("cargo", 'exec python "$CONTROLLER"')
+        observations = []
+        try:
+            for run, unknown, cargo_code, expected in (("known", "0", 0, 0),
+                                                       ("unknown", "1", 0, 75),
+                                                       ("cargo-failed", "1", 19, 19)):
+                with self.subTest(run=run):
+                    handles = []
+                    foreign = None
+                    unrelated_bash = None
+                    build = self.start(run, stderr=subprocess.PIPE, CONTROLLER=str(controller), UNKNOWN=unknown,
+                        OTHER_IMAGE=str(outsider / "VCTIP.EXE"), CODE=str(cargo_code),
+                        NRESE_MSVC_COMPILER=str(installation / "cl.exe"),
+                        INCLUDE=str(installation), LIB=str(installation), CC=None, CXX=None,
+                        CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER='rust-lld.exe')
+                    try:
+                        ready = self.out / (run + ".workers")
+                        deadline = time.monotonic() + 60
+                        while not ready.exists() and build.poll() is None and time.monotonic() < deadline:
+                            time.sleep(.05)
+                        self.assertTrue(ready.exists(), "Cargo fixture never started")
+                        observed = json.loads(ready.read_text())
+                        pids = observed['pids']
+                        # Cargo has started only after prepare, and cannot return before
+                        # our acknowledgement. The same-image foreign process therefore
+                        # falls inside the disposal time window: only membership protects it.
+                        foreign = subprocess.Popen([str(installation / "VCTIP.EXE"), *sleeper],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        times = [ctypes.c_uint64() for _ in range(4)]
+                        self.assertTrue(get_times(int(foreign._handle), *(ctypes.byref(t) for t in times)))
+                        foreign_creation = times[0].value
+                        if unknown == '1':
+                            # Same image and creation window as the execution caller,
+                            # but explicitly a worker in this job. Its held stdin keeps
+                            # the Bash builtin blocked without creating another child.
+                            unrelated_bash = subprocess.Popen([BASH, '-c', 'read -r -t 120 line'],
+                                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            member_job = kernel.OpenJobObjectW(1, False, observed['job'])
+                            self.assertTrue(member_job)
+                            try:
+                                self.assertTrue(kernel.AssignProcessToJobObject(member_job, int(unrelated_bash._handle)))
+                            finally:
+                                kernel.CloseHandle(member_job)
+                            self.assertTrue(get_times(int(unrelated_bash._handle), *(ctypes.byref(t) for t in times)))
+                            bash_creation = times[0].value
+                        # The fixture Cargo waits for this acknowledgement: these handles
+                        # refer to its still-live children, and remain held across finalization.
+                        for pid in pids:
+                            handle = _winapi.OpenProcess(0x100000 | 0x1000 | 1, False, pid)
+                            handles.append(handle)
+                            self.assertEqual(_winapi.WaitForSingleObject(handle, 0), 258)
+                        (self.out / (run + ".held")).touch()
+                        _, err = build.communicate(timeout=60)
+                        (self.out / (run + ".log")).write_text(err)
+                        observation = {'case': run, 'code': build.returncode,
+                            'selected_compiler': str(installation / 'cl.exe'),
+                            'cargo_environment': observed['compiler_environment'],
+                            'helper_alive': _winapi.WaitForSingleObject(handles[0], 0) == 258,
+                            'helper_exit': _winapi.GetExitCodeProcess(handles[0]),
+                            'foreign_pid': foreign.pid, 'foreign_alive': foreign.poll() is None,
+                            'foreign_creation': foreign_creation,
+                            'unrelated_bash_pid': unrelated_bash.pid if unrelated_bash else None,
+                            'unrelated_bash_alive': unrelated_bash.poll() is None if unrelated_bash else None,
+                            'unknowns_alive': [_winapi.WaitForSingleObject(h, 0) == 258 for h in handles[1:]]}
+                        completion_path = self.repo / 'tmp' / ('msvc-' + observed['job'] + '.completion.json')
+                        observation['completion'] = json.loads(completion_path.read_text()) if completion_path.exists() else None
+                        observations.append(observation)  # Preserve violated behavior even if an earlier assertion fails.
+                        self.assertEqual(_winapi.WaitForSingleObject(handles[0], 0), 0,
+                                         "owned compiler helper survived synchronous Cargo completion")
+                        self.assertEqual(_winapi.GetExitCodeProcess(handles[0]), 75)
+                        for handle in handles[1:]:
+                            self.assertEqual(_winapi.WaitForSingleObject(handle, 0), 258,
+                                             "unknown/test worker was terminated")
+                        self.assertIsNone(foreign.poll(), "same-image foreign process was terminated")
+                        if unrelated_bash:
+                            self.assertIsNone(unrelated_bash.poll(), 'unrelated same-image Bash worker was terminated')
+                        self.assertEqual(build.returncode, expected, err)
+                        for key in ('CC', 'CXX', 'HOST_CC', 'TARGET_CXX',
+                                    'CC_x86_64_pc_windows_msvc', 'CXX_x86_64_pc_windows_msvc'):
+                            value = observed['compiler_environment'][key]
+                            self.assertEqual(Path(value) if value else None, installation / 'cl.exe',
+                                             'Cargo did not receive the selected compiler')
+                        for key in ('INCLUDE', 'LIB'):
+                            self.assertEqual(observed['compiler_environment'][key], str(installation))
+                        self.assertEqual(observed['compiler_environment']['CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER'],
+                                         'rust-lld.exe', 'the existing Rust linker changed')
+                        binding = json.loads((self.repo / 'tmp' / ('msvc-' + observed['job'] + '.binding.json')).read_text())
+                        self.assertGreater(foreign_creation, binding['prepared_filetime'])
+                        receipts = list((self.repo / "tmp").glob("msvc-*.completion.json"))
+                        receipt = next(json.loads(p.read_text()) for p in receipts
+                            if any(row['identity']['pid'] == pids[0] for row in json.loads(p.read_text())['disposals']))
+                        self.assertEqual(receipt['cargo_exit'], cargo_code)
+                        self.assertEqual(receipt['finalization_exit'], 75 if unknown == "1" else 0)
+                        self.assertEqual(len(receipt['disposals']), 1)
+                        self.assertEqual(len(receipt['pairs']), 1, 'an unselected installation gained disposal authority')
+                        disposal = receipt['disposals'][0]
+                        self.assertEqual(Path(disposal['matched_pair']['helper']), installation / "VCTIP.EXE")
+                        self.assertEqual(disposal['status'], 'disposed_and_handle_signaled')
+                        caller_path = self.repo / 'tmp' / ('msvc-' + observed['job'] + '.binding.json.caller.json')
+                        caller_raw = caller_path.read_bytes()
+                        caller = json.loads(caller_raw)
+                        self.assertEqual(receipt['execution_caller_binding'], hashlib.sha256(caller_raw).hexdigest())
+                        self.assertEqual(caller['binding'], receipt['binding'])
+                        self.assertEqual(caller['job'], receipt['job'])
+                        execution_caller = receipt['execution_caller']
+                        self.assertEqual(execution_caller, caller['caller'])
+                        self.assertTrue(execution_caller['live'] and execution_caller['member'])
+                        self.assertNotIn(execution_caller['pid'], [receipt['caller']['pid'], receipt['inspector']['pid'], *pids])
+                        self.assertEqual(Path(execution_caller['image']), Path(receipt['caller']['image']))
+                        self.assertGreaterEqual(execution_caller['creation_filetime'], binding['prepared_filetime'])
+                        self.assertIn(execution_caller, receipt['remaining'])
+                        if unrelated_bash:
+                            self.assertGreater(bash_creation, binding['prepared_filetime'])
+                            unrelated = next(row for row in receipt['remaining'] if row['pid'] == unrelated_bash.pid)
+                            self.assertEqual(unrelated['creation_filetime'], bash_creation)
+                            self.assertEqual(Path(unrelated['image']), Path(execution_caller['image']))
+                            self.assertTrue(unrelated['member'] and unrelated['live'])
+                            self.assertNotEqual(unrelated, execution_caller)
+                        observation.update(receipt=receipt, prepared_filetime=binding['prepared_filetime'], caller_record=caller)
+                    finally:
+                        (self.out / (run + ".held")).touch()
+                        for handle in handles:
+                            if _winapi.WaitForSingleObject(handle, 0) == 258:
+                                _winapi.TerminateProcess(handle, 99)
+                                _winapi.WaitForSingleObject(handle, 10000)
+                            _winapi.CloseHandle(handle)
+                        if build.poll() is None:
+                            build.terminate()
+                            build.wait(timeout=10)
+                        if foreign is not None and foreign.poll() is None:
+                            foreign.terminate()
+                            foreign.wait(timeout=10)
+                        if unrelated_bash is not None:
+                            if unrelated_bash.poll() is None:
+                                unrelated_bash.terminate()
+                                unrelated_bash.wait(timeout=10)
+                            unrelated_bash.stdin.close()
+            # An explicit finalizer selection alone must not allow Cargo's higher
+            # precedence target selector to choose another installed compiler.
+            self.stub('cargo', 'echo started > "$OUT/conflict.started"')
+            with self.subTest(run='conflicting-selection'):
+                build = self.start('conflict', stderr=subprocess.PIPE,
+                    NRESE_MSVC_COMPILER=str(installation / 'cl.exe'), INCLUDE=str(installation), LIB=str(installation),
+                    CC_x86_64_pc_windows_msvc=str(outsider / 'cl.exe'))
+                _, err = build.communicate(timeout=60)
+                observations.append({'case': 'conflicting-selection', 'code': build.returncode,
+                    'cargo_started': (self.out / 'conflict.started').exists()})
+                self.assertEqual(build.returncode, 75, 'conflicting compiler selection was admitted: ' + err)
+                self.assertFalse((self.out / 'conflict.started').exists(), 'Cargo ran with ambiguous compiler ownership')
+        finally:
+            (self.out / "compiler-completion.json").write_text(json.dumps(observations, indent=2))
+            preserved = self.out / 'finalizer-records'
+            preserved.mkdir(exist_ok=True)
+            for record in (self.repo / 'tmp').glob('msvc-*'):
+                shutil.copy2(record, preserved / record.name)
+            if os.environ.get("FLEET_OUT"):
+                shutil.copytree(self.out, Path(os.environ["FLEET_OUT"]) / ("compiler-fixture-" + self.root.name), dirs_exist_ok=True)
+
+    def test_compilation_authority_respects_option_values_and_test_argument_separator(self):
+        # Spec: root's second review (23 Oct 2026): only an actual compilation-only
+        # command grants disposal; a flag-looking value/test argument does not.
+        import runpy
+        classify = runpy.run_path(str(self.repo / 'scripts/lib/msvc-finalize.py'))['compilation_only']
+        for args, expected in ((['build'], True), (['test', '--no-run'], True),
+                (['test', '--', '--no-run'], False), (['test', '--test', '--no-run'], False),
+                (['test'], False), (['nextest', 'run', '--no-run'], False),
+                (['nextest', 'list', '--list-type', 'binaries-only'], True),
+                (['nextest', 'list', '-E', '--list-type=binaries-only'], False),
+                (['nextest', 'list', '--', '--list-type=binaries-only'], False),
+                (['nextest', 'list', '--list-type=full'], False),
+                (['nextest', 'list', '--unknown', '--list-type=binaries-only'], False)):
+            with self.subTest(args=args):
+                self.assertEqual(classify(args), expected)
+
+    @unittest.skipUnless(os.name == "nt", "native build/test ownership uses Windows JobObjects")
+    def test_build_finalizes_before_tests_and_test_helpers_have_no_disposal_authority(self):
+        # Spec: root's second review (23 Oct 2026): Windows tests consume the exact
+        # binaries-only build after its helper has stopped; a selected-image helper
+        # born during mixed Cargo/test execution stays alive and refuses completion.
+        import _winapi
+        installation = self.root / 'compiler'
+        installation.mkdir()
+        for name in ('cl.exe', 'VCTIP.EXE'):
+            shutil.copyfile(sys.executable, installation / name)
+        for dll in Path(sys.base_prefix).glob('python3*.dll'):
+            shutil.copyfile(dll, installation / dll.name)
+            (installation / (dll.stem + '._pth')).write_text(str(Path(sys.base_prefix) / 'Lib') + '\n')
+        controller = self.root / 'phase-cargo.py'
+        controller.write_text('''import json,os,subprocess,sys,time
+from pathlib import Path
+args=sys.argv[1:]; phase='build' if args[:2]==['nextest','list'] else 'test'
+if args[:1]==['metadata']:
+    assert args==['metadata','--locked','--format-version','1']
+    print('{}');sys.exit(0)
+out=Path(os.environ['OUT']); prefix=os.environ['RUN']+'.'+phase
+if '--binaries-metadata' in args:
+    metadata=json.loads(Path(args[args.index('--binaries-metadata')+1]).read_text())
+    assert metadata['phase']=='build' and metadata['run']==os.environ['RUN']
+child=subprocess.Popen([str(Path(os.environ['NRESE_MSVC_COMPILER']).with_name('VCTIP.EXE')),
+    '-I','-c','import time;time.sleep(120)'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+row={'pid':child.pid,'phase':phase,'run':os.environ['RUN'],'argv':args,'job':os.environ['NRESE_BUILD_JOB']}
+ready=out/(prefix+'.ready'); temporary=ready.with_suffix('.tmp')
+temporary.write_text(json.dumps(row));temporary.replace(ready)
+deadline=time.monotonic()+45
+while not (out/(prefix+'.held')).exists():
+    if time.monotonic()>deadline:sys.exit(98)
+    time.sleep(.05)
+if phase=='build':print(json.dumps(row))
+sys.exit(0 if phase=='build' else int(os.environ['CODE']))
+''')
+        self.stub('cargo', 'exec python "$CONTROLLER" "$@"')
+        check = (self.repo / 'scripts/check.sh').read_text()
+        seam = check[check.index('windows_tests() {'):check.index('windows_part() {')]
+        wrapper = self.repo / 'windows-test-seam.sh'
+        wrapper.write_text('guarded=scripts/cargo-guarded.sh\n' +
+            'package_args() { local name; for name in "$@"; do printf -- "-p %s " "$name"; done; }\n' +
+            seam + '\nwindows_tests "$@"\n')
+        observations = []
+        try:
+            for label, args, code in (('cargo-test', ['test', '--locked'], 0),
+                    ('nextest-run', ['nextest', 'run', '--locked'], 19),
+                    ('windows-split', None, 0)):
+                with self.subTest(run=label):
+                    handles = []
+                    command = [BASH, 'scripts/cargo-guarded.sh', *args] if args else [
+                        BASH, str(wrapper), 'binary_id(chosen)', 'chosen']
+                    proc = subprocess.Popen(command, cwd=self.repo, env=self.env(label,
+                        CONTROLLER=str(controller), CODE=str(code),
+                        NRESE_MSVC_COMPILER=str(installation / 'cl.exe'),
+                        INCLUDE=str(installation), LIB=str(installation), CC=None, CXX=None),
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                    rows = []
+                    try:
+                        for phase in (('build', 'test') if args is None else ('test',)):
+                            ready = self.out / (label + '.' + phase + '.ready')
+                            deadline = time.monotonic() + 60
+                            while not ready.exists() and proc.poll() is None and time.monotonic() < deadline:
+                                time.sleep(.05)
+                            self.assertTrue(ready.exists(), 'expected build/test phase did not start')
+                            row = json.loads(ready.read_text()); rows.append(row)
+                            handle = _winapi.OpenProcess(0x100000 | 0x1000 | 1, False, row['pid'])
+                            handles.append(handle)
+                            self.assertEqual(_winapi.WaitForSingleObject(handle, 0), 258)
+                            if phase == 'test' and args is None:
+                                self.assertEqual(_winapi.WaitForSingleObject(handles[0], 0), 0,
+                                                 'compiler helper survived into test execution')
+                                self.assertEqual(_winapi.GetExitCodeProcess(handles[0]), 75)
+                                self.assertEqual(row['argv'], ['nextest', 'run', '--binaries-metadata',
+                                    row['argv'][3], '--cargo-metadata', row['argv'][5],
+                                    '--no-fail-fast', '-E', 'binary_id(chosen)'])
+                                self.assertEqual(rows[0]['argv'], ['nextest', 'list', '--locked', '-p', 'chosen',
+                                    '--cargo-metadata', row['argv'][5], '--list-type', 'binaries-only', '--message-format', 'json'])
+                            (self.out / (label + '.' + phase + '.held')).touch()
+                        _, err = proc.communicate(timeout=60)
+                        (self.out / (label + '.log')).write_text(err)
+                        self.assertEqual(_winapi.WaitForSingleObject(handles[-1], 0), 258,
+                                         'test-created selected-image worker was terminated')
+                        self.assertEqual(proc.returncode, code or 75, err)
+                        receipts = [json.loads((self.repo / 'tmp' / ('msvc-' + row['job'] + '.completion.json')).read_text())
+                                    for row in rows]
+                        self.assertFalse(receipts[-1]['compilation_only'])
+                        self.assertEqual(receipts[-1]['disposals'], [])
+                        self.assertEqual(receipts[-1]['cargo_exit'], code)
+                        self.assertEqual(receipts[-1]['finalization_exit'], 75)
+                        if args is None:
+                            self.assertTrue(receipts[0]['compilation_only'])
+                            self.assertEqual(receipts[0]['finalization_exit'], 0)
+                        observations.append({'case': label, 'rows': rows, 'receipts': receipts,
+                                             'test_helper_alive': True, 'exit': proc.returncode})
+                    finally:
+                        for phase in ('build', 'test'):
+                            (self.out / (label + '.' + phase + '.held')).touch()
+                        for handle in handles:
+                            if _winapi.WaitForSingleObject(handle, 0) == 258:
+                                _winapi.TerminateProcess(handle, 99)
+                                _winapi.WaitForSingleObject(handle, 10000)
+                            _winapi.CloseHandle(handle)
+                        if proc.poll() is None:
+                            proc.terminate(); proc.wait(timeout=10)
+        finally:
+            (self.out / 'build-test-completion.json').write_text(json.dumps(observations, indent=2))
+            if os.environ.get('FLEET_OUT'):
+                shutil.copytree(self.out, Path(os.environ['FLEET_OUT']) / ('build-test-fixture-' + self.root.name), dirs_exist_ok=True)
 
     def test_a_build_that_fits_above_the_floor_runs_though_the_machine_is_busy(self):
         # The orchestrator, 20 Oct 2026: BUSY stayed set for hours under the agents' own load. 12 GB

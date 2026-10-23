@@ -26,12 +26,13 @@ import collections
 import csv
 import hashlib
 import json
+import os
 import re
 import shutil
 import statistics
 import time
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
@@ -317,6 +318,227 @@ def reproduce(args) -> int:
     return 0
 
 
+# Verified Office cache receipts from the owner handover (23 October 2026).
+# Preparation is metadata only; consume verifies input bytes and agent image/caps.
+FLEET_IMAGES = {
+    "jena": "sha256:c88bcf570c4cf08f050602959cbcf75222c1b02cdf898aca866af6c1e4f9685b",
+    "topbraid": "sha256:154a627af361c698219c7ef3b1847b3355497f5b4b8d96de88e94c2e29a8bbf9",
+    "rdf4j": "sha256:ced44d534388370b857d898bbe46db540dd5067e4589819cef37c476649d2ea7",
+}
+FLEET_INPUTS = {
+    "ES.ttl": (257045697, "f88964ed364b9daa7c58e12f1a822ee6a8bb955a9544c25964b8c63d3d5ea990"),
+    "shapes/tds_shapes.ttl": (27809, "68ea89a9ce281931317d959c79fa9d3773bd16a40f5b7859a628631d5b93e7f2"),
+    "shapes/core_shapes.ttl": (193439, "184ffddefff1c4027a15b962874bf6e44d5b6916cac669efac18531e87db6025"),
+}
+
+
+def fleet_job(args) -> dict:
+    """One engine or converter per step, using the existing canonical renderer."""
+    data, out = PurePosixPath(args.data), PurePosixPath(args.results)
+    if any(not p.is_absolute() or '..' in p.parts or ':' in str(p) for p in (data, out)):
+        raise ValueError("Fleet data/results must be absolute POSIX host paths without ':' or '..'")
+    if not re.fullmatch(r'[0-9a-f]{40}', args.source_rev):
+        raise ValueError("source-rev must be a full immutable commit")
+    if args.converter_image and not re.fullmatch(r'sha256:[0-9a-f]{64}', args.converter_image):
+        raise ValueError("converter needs an immutable cached image ID")
+    if not re.fullmatch(r'\d+(?:-\d+)?(?:,\d+(?:-\d+)?)*', args.cpu_pool):
+        raise ValueError('an explicit nonempty allowed CPU pool is required')
+    engines, subsets, shapes = (getattr(args, k).split(',') for k in ('engines', 'subsets', 'shapes'))
+    native = None
+    if 'nrese' in engines:
+        if not getattr(args, 'native_manifest', None):
+            raise ValueError('NRESE requires --native-manifest with verified binary/identity/image receipts')
+        native = json.loads(Path(args.native_manifest).read_text(encoding='utf-8'))
+        if (native.get('host') != args.host or not re.fullmatch(r'[0-9a-f]{40}', native.get('source', '')) or
+                not re.fullmatch(r'sha256:[0-9a-f]{64}', native.get('image', ''))):
+            raise ValueError('native manifest requires exact host, source and immutable runtime image')
+        for key in ('binary', 'identity'):
+            artifact = native.get(key, {})
+            path = PurePosixPath(artifact.get('path', ''))
+            if (not path.is_absolute() or '..' in path.parts or ':' in str(path) or
+                    not re.fullmatch(r'[0-9a-f]{64}', artifact.get('sha256', ''))):
+                raise ValueError('native manifest requires exact readonly ' + key + ' path/digest')
+        native = dict(native, script_sha256=kit.sha256(HERE / 'nrese-era.sh'),
+                      packaging='native prebuilt + canonical adapter mounted read-only in immutable Debian runtime')
+    if (not set(engines) <= FLEET_IMAGES.keys() | {'nrese'} or subsets != ['ES'] or
+            not set(shapes) <= {'tds', 'core'} or args.runs < 1):
+        raise ValueError("prepared cache supports ES, tds/core and jena/topbraid/rdf4j/nrese")
+    steps, needs = [], []
+    for rep, (subset, shape, engine) in kit.interleaved(
+            [(d, s, e) for d in subsets for s in shapes for e in engines], args.runs):
+        name = f'{engine}-{subset}-{shape}-r{rep}'
+        case = dict(name=name, engine=engine, subset=subset, shape=shape, rep=rep,
+                    data=str(data), results=str(out), source=args.source_rev, timeout_s=2700,
+                    inputs={p: FLEET_INPUTS[p] for p in (f'{subset}.ttl', f'shapes/{shape}_shapes.ttl')},
+                    report_count='separate bound converter' if args.converter_image else
+                                 'unavailable: no qualified cached riot image supplied')
+        spec = kit.Spec(name=name, image=native['image'] if engine == 'nrese' else FLEET_IMAGES[engine],
+            memory='12g', entrypoint=True,
+            command=[f'/data/{subset}.ttl', f'/data/shapes/{shape}_shapes.ttl', f'/reports/{name}.ttl'],
+            env={'JAVA_OPTS': '-Xms1g -Xmx8g -XX:ActiveProcessorCount=1'},
+            mounts=[kit.Mount(str(data), '/data'), kit.Mount(str(out / 'reports'), '/reports', readonly=False)])
+        if engine == 'nrese':
+            case['native'] = native
+            # Same perf_lab and canonical adapter/flags as nrese.Dockerfile. The
+            # runtime image supplies libc; ldd is retained and must succeed before
+            # the adapter starts, with no missing dynamic libraries.
+            abi = f'/reports/{name}.ldd'
+            spec.entrypoint = False
+            spec.command = ['/bin/sh', '-c',
+                f'set -eu; ldd /usr/local/bin/perf_lab > {abi} 2>&1; cat {abi} >&2; '
+                f'if grep -q "not found" {abi}; then exit 126; fi; '
+                'exec /bin/sh /usr/local/bin/nrese-era.sh "$@"',
+                'era-native', *spec.command]
+            spec.env = {'RAYON_NUM_THREADS': '1'}
+            spec.mounts += [kit.Mount(native['binary']['path'], '/usr/local/bin/perf_lab'),
+                           kit.Mount(str(out / 'native/nrese-era.sh'), '/usr/local/bin/nrese-era.sh')]
+        step, need = kit.fleet_container_step(spec, dict(case, phase='engine', image=spec.image))
+        steps.append(step)
+        needs.append(need)
+        if args.converter_image:
+            converter = kit.Spec(name=name, image=args.converter_image, memory='12g',
+                command=['riot', '--output=nt', f'/reports/{name}.ttl'],
+                mounts=[kit.Mount(str(out / 'reports'), '/reports')])
+            step, need = kit.fleet_container_step(converter, dict(case, phase='convert', image=converter.image))
+            steps.append(step)
+            needs.append(need)
+    return dict(spec=7, id=args.job_id, owner=args.owner, group='era-tooling-diagnostic',
+        kind='owlrs.any', **{'class': 'shareable'}, priority=650,
+        priority_reason='One-case ERA tooling diagnostic; no comparative timing claim', est_min=5,
+        pin_reason='Verified immutable ERA image/data cache locality',
+        requires=dict(os='linux', hosts=[args.host], roles=[], has=['docker'], cores=1, ram_gb=16, disk_gb=20),
+        env=dict(FLEET_CPU_POOL=args.cpu_pool, PYTHONIOENCODING='utf-8'),
+        inputs=[dict(name='checkout', source=dict(git=args.source_git, rev=args.source_rev))],
+        steps=steps, step_needs=needs, on_failure=[dict(when='any', action='give-up', max=1)])
+
+
+def fleet_prepare(args) -> int:
+    Path(args.job).write_text(json.dumps(fleet_job(args), indent=2) + '\n', encoding='utf-8')
+    return 0
+
+
+def fleet_consume(args) -> int:
+    """One attempt, no implicit converter or RETREAT replay; raw evidence survives failure."""
+    from datetime import datetime, timezone
+    case = json.loads(args.case)
+    request = json.loads(Path(os.environ['FLEET_CONTAINER_REQUEST']).read_text(encoding='utf-8'))
+    argv = request['argv']
+    if case['phase'] not in ('engine', 'convert') or case['image'] not in argv:
+        raise ValueError('received plan disagrees with the case image/phase')
+    out = Path(case['results'])
+    attempt = out / 'attempts' / os.environ['FLEET_CONTAINER_NAME']
+    attempt.mkdir(parents=True, exist_ok=False)  # replay is never a fresh binding
+    (out / 'reports').mkdir(exist_ok=True)
+    record = dict(case=case, argv=argv, started_epoch=time.time(), report_count=case['report_count'])
+    log, report = attempt / 'container.log', out / 'reports' / (case['name'] + '.ttl')
+    current_report = prepared = False
+    try:
+        record['git'] = kit.manifest.git(kit.ROOT)
+        if record['git']['commit'] != case['source'] or record['git']['dirty'] != 0:
+            raise ValueError('consumer checkout does not match the clean submitted source')
+        record['driver_affinity'] = sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None
+        boot = Path('/proc/sys/kernel/random/boot_id')
+        record['boot_id'] = boot.read_text().strip() if boot.exists() else None
+        if case['phase'] == 'engine':
+            # Retain a previous attempt rather than accepting its stale report.
+            for suffix in ('.ttl', '.nt', '.ldd'):
+                previous = report.with_suffix(suffix)
+                if previous.exists():
+                    previous.rename(attempt / ('previous-report' + suffix))
+            prepared = True
+            if case.get('native'):
+                native = case['native']
+                for key in ('binary', 'identity'):
+                    artifact = native[key]
+                    if kit.sha256(Path(artifact['path'])) != artifact['sha256']:
+                        raise ValueError('native ' + key + ' digest mismatch')
+                identity = Path(native['identity']['path']).read_text(encoding='utf-8')
+                if (f"revision {native['source']}" not in identity.splitlines() or
+                        not all(any(line.startswith(k + ' ') for line in identity.splitlines())
+                                for k in ('toolchain', 'rustc', 'rustflags', 'profile', 'linker'))):
+                    raise ValueError('native identity lacks source/compiler/build settings')
+                (attempt / 'native-IDENTITY').write_text(identity, encoding='utf-8')
+                script = HERE / 'nrese-era.sh'
+                if kit.sha256(script) != native['script_sha256']:
+                    raise ValueError('canonical native adapter digest mismatch')
+                target = out / 'native/nrese-era.sh'
+                target.parent.mkdir(exist_ok=True)
+                if target.exists() and kit.sha256(target) != native['script_sha256']:
+                    raise ValueError('existing native adapter has another identity; use new results directory')
+                if not target.exists():
+                    target.write_bytes(script.read_bytes())
+            for relative, (size, digest) in case['inputs'].items():
+                path = Path(case['data']) / relative
+                if path.stat().st_size != size or kit.sha256(path) != digest:
+                    raise ValueError('canonical input mismatch: ' + relative)
+        elif not report.is_file():
+            raise ValueError('converter report unavailable')
+        started = time.time()
+        measured = kit.DockerRuntime(attempt / 'scratch', port=0).run_bound(
+            argv, log, case['timeout_s'], lambda: kit.retreated_since(started))
+        record['measured'] = vars(measured)
+        if case.get('native') and case['phase'] == 'engine':
+            native = case['native']
+            if kit.sha256(Path(native['binary']['path'])) != native['binary']['sha256']:
+                raise ValueError('native binary changed during execution')
+        if kit.retreated_since(started):
+            raise InterruptedError('RETREAT after bound completion; a new Fleet attempt is required')
+        current_report = report.is_file()
+        if case['phase'] == 'convert':
+            if not measured.ok:
+                return measured.rc or 1
+            raw = log.with_suffix('.log.container.stdout').read_bytes()
+            nt = report.with_suffix('.nt')
+            nt.write_bytes(raw)
+            (attempt / 'report.nt').write_bytes(raw)
+            triples_read = []
+            for line in raw.decode('utf-8').splitlines():
+                if not line.strip() or line.lstrip().startswith('#'):
+                    continue
+                terms = TERM.findall(line)
+                if len(terms) != 3 or not line.rstrip().endswith('.'):
+                    raise ValueError('converted report has unreadable N-Triples; count unavailable')
+                triples_read.append(terms)
+            if not any(t[1:] == [f'<{RDF_TYPE}>', f'<{SH}ValidationReport>'] for t in triples_read):
+                raise ValueError('converted graph has no ValidationReport; count unavailable')
+            count = sum(t[1:] == [f'<{RDF_TYPE}>', f'<{SH}ValidationResult>'] for t in triples_read)
+            record.update(rows=count, report_count='separate bound riot; not oracle equivalence')
+            return 0
+        got = parse(log.read_text(encoding='utf-8', errors='replace'))
+        status = 'timeout' if measured.timed_out else 'ok' if measured.ok and 'validate_s' in got and current_report else 'failed'
+        base = dict(date=datetime.now(timezone.utc).isoformat(), host=os.environ.get('FLEET_HOST', ''),
+                    runtime='docker', system=SYSTEM.get(case['engine'], case['engine']),
+                    version=case['native']['source'] if case.get('native') else ENGINES[case['engine']][2],
+                    publish='free', workload='era-shacl',
+                    tier=case['subset'], regime='none', run=case['rep'], status=status)
+        writer = kit.Writer(attempt / 'results.csv', echo=print)
+        writer.write(kit.Result(**base, task='load', ms=got['load_s']*1000 if 'load_s' in got else '',
+                     peak_mib=measured.peak_mib or '', rows=int(got.get('statements', 0)) or '',
+                     note=f'bound diagnostic; exit {measured.rc}; {attempt}'))
+        writer.write(kit.Result(**base, task='validate', item=case['shape'],
+                     ms=got['validate_s']*1000 if 'validate_s' in got else '', rows='',
+                     peak_mib=measured.peak_mib or '', note=case['report_count']))
+        return 0 if status == 'ok' else measured.rc or 1
+    except InterruptedError as error:
+        record['interrupted'] = str(error)
+        return 130
+    except BaseException as error:
+        record['error'] = f'{type(error).__name__}: {error}'
+        raise
+    finally:
+        abi = report.with_suffix('.ldd')
+        if prepared and case.get('native') and abi.exists():
+            shutil.copyfile(abi, attempt / 'native-ldd.txt')
+        if (prepared or case['phase'] == 'convert') and report.is_file():
+            shutil.copyfile(report, attempt / 'report.ttl')
+            record['report_sha256'] = kit.sha256(attempt / 'report.ttl')
+        (attempt / 'invocation.json').write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
+        if os.environ.get('FLEET_OUT'):
+            destination = Path(os.environ['FLEET_OUT']) / 'era-attempts' / attempt.name
+            if destination.resolve() != attempt.resolve():
+                shutil.copytree(attempt, destination, dirs_exist_ok=True)
+
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
@@ -338,8 +560,22 @@ def main(argv: list[str]) -> int:
     c.add_argument("--reference", default="topbraid")
     e = sub.add_parser("reproduce")
     e.add_argument("results")
+    f = sub.add_parser('prepare', help='render the actual spec7 bound diagnostic; does not submit or launch')
+    for flag in ('job', 'job-id', 'owner', 'source-git', 'source-rev', 'data', 'results'):
+        f.add_argument('--' + flag, required=True)
+    f.add_argument('--engines', default='jena')
+    f.add_argument('--subsets', default='ES')
+    f.add_argument('--shapes', default='tds')
+    f.add_argument('--runs', type=int, default=1)
+    f.add_argument('--converter-image')
+    f.add_argument('--native-manifest', help='exact native binary/IDENTITY/runtime image receipts for nrese')
+    f.add_argument('--host', default='office-pc')
+    f.add_argument('--cpu-pool', default='8-15,24-31')
+    c = sub.add_parser('consume', help='execute exactly one agent-bound phase')
+    c.add_argument('--case', required=True)
     args = p.parse_args(argv)
-    return {"images": images, "run": steps, "check": check, "reproduce": reproduce}[args.command](args)
+    return {"images": images, "run": steps, "check": check, "reproduce": reproduce,
+            "prepare": fleet_prepare, "consume": fleet_consume}[args.command](args)
 
 
 if __name__ == "__main__":

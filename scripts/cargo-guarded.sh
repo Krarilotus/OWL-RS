@@ -449,6 +449,32 @@ guard_notices() {
       }
     }' "$killed" 2> /dev/null || true
 }
+# NRESE_MSVC_COMPILER selects one native compiler, with caller-qualified INCLUDE/LIB.
+# Preserve this repo's Rust linker/flags. No explicit selection grants no disposal
+# authority; installing additional Visual Studio versions never grants permission.
+# Bind optional MSVC telemetry to selected tool bytes before Cargo can start it.
+# The finalizer never adopts unknown/test workers or changes the outer gate policy.
+# Mixed compile/execute commands have no disposal authority. check.sh uses nextest's
+# binaries-only build and metadata-only run to finalize before any test is queried.
+native_binding="" native_state="" native_receipt=""
+if [ -r "/proc/$$/winpid" ]; then
+  native_out="${FLEET_OUT:-$ROOT/tmp}"
+  native_out=$(cygpath -u "$native_out")
+  mkdir -p "$native_out"
+  native_state="$native_out/msvc-$JOB.binding.json"
+  native_receipt="$native_out/msvc-$JOB.completion.json"
+  native_binding=$(python "$ROOT/scripts/lib/msvc-finalize.py" prepare --job "$NRESE_BUILD_JOB" \
+    --state "$native_state" --cargo "$@") || exit 75
+  native_binding=${native_binding%$'\r'}
+  while IFS= read -r -d '' native_key && IFS= read -r -d '' native_value; do
+    export "$native_key=$native_value"
+  done < "$native_state.env"
+fi
+uptime_cs() {
+  local up
+  read -r up _ < /proc/uptime
+  printf '%s\n' $(( 10#${up%.*} * 100 + 10#${up#*.} ))
+}
 started=$EPOCHSECONDS
 set +e
 if command -v nice >/dev/null 2>&1; then
@@ -457,18 +483,32 @@ else
   cargo "$@"
 fi
 code=$?
+deadline=$(( $(uptime_cs) + ${NRESE_GUARD_NOTICE_WAIT_S:-10} * 100 ))
 set -e
+if [ -n "$native_binding" ]; then
+  native_code=0
+  (
+    # MSYS keeps the exec'ing shell alive beside native Python. Bind this exact
+    # subshell before exec; $$ or a command-substitution BASHPID names another one.
+    native_caller=""
+    read -r native_caller < "/proc/$BASHPID/winpid" || :
+    native_caller_record="$native_state.caller.json"
+    native_caller_binding=$(python "$ROOT/scripts/lib/msvc-finalize.py" bind-caller \
+      --state "$native_state" --binding "$native_binding" --pid "$native_caller" \
+      --record "$native_caller_record") || native_caller_binding=""
+    native_caller_binding=${native_caller_binding%$'\r'}
+    exec python "$ROOT/scripts/lib/msvc-finalize.py" finish --state "$native_state" --binding "$native_binding" \
+      --receipt "$native_receipt" --cargo-exit "$code" --timeout "${NRESE_NATIVE_FINALIZE_S:-10}" \
+      --caller-record "$native_caller_record" --caller-binding "$native_caller_binding"
+  ) || native_code=$?
+  # Cargo's failure stays primary; the receipt preserves both results.
+  if [ "$code" -eq 0 ] && [ "$native_code" -ne 0 ]; then code=75; fi
+fi
 killed="${NRESE_GUARD_KILLED:-$HOME/owlrs-guard/killed.log}"
 if [ "$code" -ne 0 ] && { [ -f "$killed" ] || [ -f "$BUSY" ]; }; then
   # A deadline by a clock that only moves forward (/proc/uptime, in hundredths of a second: Linux's
   # and Git Bash's alike), checked after every look at the notices, the first included: what is
   # first seen after it doesn't count, however late a look ran (Sol, 20 Oct 2026).
-  uptime_cs() {
-    local up
-    read -r up _ < /proc/uptime
-    printf '%s\n' $(( 10#${up%.*} * 100 + 10#${up#*.} ))
-  }
-  deadline=$(( $(uptime_cs) + ${NRESE_GUARD_NOTICE_WAIT_S:-10} * 100 ))
   notices=""
   while :; do
     seen=$(guard_notices)

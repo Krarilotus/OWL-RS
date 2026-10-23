@@ -15,6 +15,7 @@ list wins and the lower one is corrected in the same change.
 | What does reasoning compute? | [spec/reasoning-semantics.md](spec/reasoning-semantics.md) |
 | Where do we stand against QLever and GraphDB? | [spec/06-target-capability-matrix.md](spec/06-target-capability-matrix.md) |
 | How is it run and configured? | [ops/](#operations) |
+| How are builds, checks and benchmarks submitted and recovered? | [dev/fleet-operations.md](dev/fleet-operations.md) |
 | How is it measured? | [benches/README.md](../benches/README.md) (the four levels, hosts), the rules in [benches/PROTOCOL.md](../benches/PROTOCOL.md) |
 | What should research find out next? | [plan/2026-10-05-research-tasks.md](plan/2026-10-05-research-tasks.md) |
 
