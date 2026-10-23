@@ -95,6 +95,36 @@ fn a_conforming_shacl_check_is_complete_applicable_and_meta_validated() {
     assert_eq!(outcome.shacl_conforms, Some(true));
     assert_eq!(outcome.shacl_applicable, Some(true));
     assert_eq!(outcome.shacl_meta_validated, Some(true));
+
+    // SHACL uses the same draft memory/token contract already accepted for queries.
+    let inputs = DraftInputs {
+        data: Some(data),
+        shapes: Some(name_required("Person")),
+        ..Default::default()
+    };
+    let refused = run_draft_check(
+        DraftOperation::Shacl,
+        &inputs,
+        &LIMITS,
+        &CancellationToken::new(),
+        Some(1),
+        Default::default(),
+    );
+    assert_eq!(refused.terminal_status, DraftStatus::Failed, "{refused:?}");
+    assert!(!refused.complete);
+    assert!(refused.detail.contains("memory"), "{refused:?}");
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let stopped = run_draft_check(
+        DraftOperation::Shacl,
+        &inputs,
+        &LIMITS,
+        &cancellation,
+        None,
+        Default::default(),
+    );
+    assert_eq!(stopped.terminal_status, DraftStatus::Timeout, "{stopped:?}");
+    assert!(!stopped.complete);
 }
 
 #[test]

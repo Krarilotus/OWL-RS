@@ -134,16 +134,19 @@ pub async fn pin_put(
     let store = state.store();
     let cancellation = nrese_store::CancellationToken::new();
     let token = cancellation.clone();
-    let pinning = tokio::task::spawn_blocking(move || store.pin_query(&name, &request, &token));
-    let pinned = match tokio::time::timeout(policy.timeouts.query, pinning).await {
-        Ok(joined) => joined.map_err(|error| ApiError::internal(error.to_string()))?,
-        Err(_) => {
-            cancellation.cancel();
-            return Err(ApiError::timeout(
-                "pinning ran the query past the policy timeout",
-            ));
-        }
-    };
+    let pinned =
+        match super::cancellable::blocking(policy.timeouts.query, cancellation, move || {
+            store.pin_query(&name, &request, &token)
+        })
+        .await
+        {
+            Ok(joined) => joined.map_err(|error| ApiError::internal(error.to_string()))?,
+            Err(_) => {
+                return Err(ApiError::timeout(
+                    "pinning ran the query past the policy timeout",
+                ));
+            }
+        };
     let pinned = pinned.map_err(|error| super::sparql::map_query_error(&policy, error))?;
     Ok(Json(PinView::from(pinned)).into_response())
 }
