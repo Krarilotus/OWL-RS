@@ -598,6 +598,26 @@ impl<'b> BuildTable<'b> {
         budget: &'b Budget,
         include: impl Fn(usize) -> bool,
     ) -> Result<Self, BudgetExceeded> {
+        Self::with_progress(
+            build,
+            keys,
+            budget,
+            include,
+            &mut || Ok(()),
+            |next, rows, _| next.resize(rows, END),
+        )
+    }
+
+    // The memory-only adapter keeps its bulk initialization; checked callers use the
+    // same admitted build with fallible initialization and every visited row counted.
+    fn with_progress<E: From<BudgetExceeded>, P: FnMut() -> Result<(), E>>(
+        build: &IdTable,
+        keys: &[usize],
+        budget: &'b Budget,
+        include: impl Fn(usize) -> bool,
+        progress: &mut P,
+        initialize: impl FnOnce(&mut Scratch<'b, u32>, usize, &mut P) -> Result<(), E>,
+    ) -> Result<Self, E> {
         assert!(build.len() < END as usize, "join input exceeds u32 rows");
         let rows = build.len();
         let one_key = keys.len() == 1;
@@ -608,7 +628,7 @@ impl<'b> BuildTable<'b> {
             false => map_bytes::<(Vec<u64>, u32)>(rows).saturating_add(rows * key_bytes),
         })?;
         let mut next = ChargedVec::with_capacity(budget, rows)?;
-        next.resize(rows, END)?;
+        initialize(&mut next, rows, progress)?;
         let mut table = Self {
             heads: HashMap::with_capacity_and_hasher(
                 if one_key { 0 } else { rows },
@@ -623,7 +643,11 @@ impl<'b> BuildTable<'b> {
             held,
         };
         // Insert in reverse so chains list rows in input order.
-        for row in (0..rows).rev().filter(|&row| include(row)) {
+        for row in (0..rows).rev() {
+            progress()?;
+            if !include(row) {
+                continue;
+            }
             let head = if one_key {
                 table.single.entry(build.get(row, keys[0])).or_insert(END)
             } else {
@@ -1134,14 +1158,52 @@ impl<'a> Compatible<'a> {
         right_keys: &'a [usize],
         budget: &'a Budget,
     ) -> Result<Self, BudgetExceeded> {
-        let unbound = |r: usize| right_keys.iter().any(|&k| right.get(r, k) == UNDEF);
-        let bound = BuildTable::new(right, right_keys, budget, |r| !unbound(r))?;
-        let open_rows = (0..right.len()).filter(|&r| unbound(r)).count();
-        let open = ChargedVec::collect(
+        Self::with_progress(
+            right,
+            left_keys,
+            right_keys,
             budget,
-            open_rows,
-            (0..right.len()).filter(|&r| unbound(r)).map(|r| r as u32),
+            &mut || Ok(()),
+            |next, rows, _| next.resize(rows, END),
+        )
+    }
+
+    fn with_progress<E: From<BudgetExceeded>, P: FnMut() -> Result<(), E>>(
+        right: &'a IdTable,
+        left_keys: &'a [usize],
+        right_keys: &'a [usize],
+        budget: &'a Budget,
+        progress: &mut P,
+        initialize: impl FnOnce(&mut Scratch<'a, u32>, usize, &mut P) -> Result<(), E>,
+    ) -> Result<Self, E> {
+        let unbound = |r: usize| right_keys.iter().any(|&k| right.get(r, k) == UNDEF);
+        let bound = BuildTable::with_progress(
+            right,
+            right_keys,
+            budget,
+            |r| !unbound(r),
+            progress,
+            initialize,
         )?;
+        let mut open_rows = 0;
+        for r in 0..right.len() {
+            progress()?;
+            open_rows += usize::from(unbound(r));
+        }
+        let mut open = ChargedVec::with_capacity(budget, open_rows)?;
+        open.fill(open_rows, |room| {
+            let mut r = 0;
+            // Like the former filtered take(open_rows), stop after the last open row;
+            // zero open rows need no second scan. Rejected rows in that prefix count.
+            while room.len() < open_rows {
+                progress()?;
+                if unbound(r) {
+                    room.push(r as u32);
+                }
+                r += 1;
+            }
+            Ok::<_, E>(())
+        })??;
         Ok(Self {
             right,
             left_keys,
@@ -1161,13 +1223,13 @@ impl<'a> Compatible<'a> {
 
     /// Calls `found` with each right row compatible with left row `l`, in right order for
     /// a left row with an unbound key; stops when `found` returns `false`.
-    fn each(
+    fn each<E>(
         &self,
         left: &IdTable,
         l: usize,
-        mut compared: impl FnMut() -> Result<(), JoinStop>,
-        mut found: impl FnMut(usize) -> Result<bool, JoinStop>,
-    ) -> Result<(), JoinStop> {
+        mut compared: impl FnMut() -> Result<(), E>,
+        mut found: impl FnMut(usize) -> Result<bool, E>,
+    ) -> Result<(), E> {
         if self.left_keys.iter().any(|&k| left.get(l, k) == UNDEF) {
             for r in 0..self.right.len() {
                 compared()?;
@@ -1270,26 +1332,107 @@ pub fn compatible_mask(
     budget: &Budget,
     found: &mut [bool],
 ) -> Result<(), BudgetExceeded> {
+    compatible_mask_work(
+        left,
+        right,
+        left_keys,
+        right_keys,
+        bound_in_both,
+        budget,
+        found,
+        &mut || Ok(()),
+        |next, rows, _| next.resize(rows, END),
+    )
+}
+
+/// [`compatible_mask`] with the caller's original stop condition. Preparation, including
+/// rejected build rows and chain initialization, and left-row/candidate work reach a
+/// checkpoint every [`crate::POLL_UNITS`] units. Allocator/hash calls and a row's key work
+/// are not individually preemptible. An error leaves no completed mask to publish.
+#[allow(clippy::too_many_arguments)]
+pub fn compatible_mask_within<C: StopCheck>(
+    left: &IdTable,
+    right: &IdTable,
+    left_keys: &[usize],
+    right_keys: &[usize],
+    bound_in_both: bool,
+    budget: &Budget,
+    found: &mut [bool],
+    stop: C,
+) -> Result<(), Stop> {
+    let mut work = Ticker::new(stop)?;
+    compatible_mask_work(
+        left,
+        right,
+        left_keys,
+        right_keys,
+        bound_in_both,
+        budget,
+        found,
+        &mut || work.tick(1),
+        initialize_chains,
+    )?;
+    work.finish()
+}
+
+// Use the admitted writer: partial initialization on an error remains a valid prefix
+// and drops before its reservation. The legacy adapter retains its single bulk resize.
+fn initialize_chains<E: From<BudgetExceeded>, P: FnMut() -> Result<(), E>>(
+    next: &mut Scratch<'_, u32>,
+    rows: usize,
+    progress: &mut P,
+) -> Result<(), E> {
+    next.fill(rows, |room| {
+        for _ in 0..rows {
+            progress()?;
+            room.push(END);
+        }
+        Ok::<_, E>(())
+    })??;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compatible_mask_work<'a, E: From<BudgetExceeded>, P: FnMut() -> Result<(), E>>(
+    left: &IdTable,
+    right: &'a IdTable,
+    left_keys: &'a [usize],
+    right_keys: &'a [usize],
+    bound_in_both: bool,
+    budget: &'a Budget,
+    found: &mut [bool],
+    progress: &mut P,
+    initialize: impl FnOnce(&mut Scratch<'a, u32>, usize, &mut P) -> Result<(), E>,
+) -> Result<(), E> {
     assert_eq!(found.len(), left.len(), "mask length");
-    let compatible = Compatible::new(right, left_keys, right_keys, budget)?;
-    for (l, any) in found.iter_mut().enumerate() {
-        *any = false;
-        let _ = compatible.each(
-            left,
-            l,
-            || Ok(()),
-            |r| {
-                let shares = !bound_in_both
-                    || left_keys
-                        .iter()
-                        .zip(right_keys)
-                        .any(|(&a, &b)| left.get(l, a) != UNDEF && right.get(r, b) != UNDEF);
+    let compatible =
+        Compatible::with_progress(right, left_keys, right_keys, budget, progress, initialize)?;
+    compatible.mask(left, bound_in_both, found, progress)
+}
+
+impl Compatible<'_> {
+    fn mask<E>(
+        &self,
+        left: &IdTable,
+        bound_in_both: bool,
+        found: &mut [bool],
+        progress: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        for (l, any) in found.iter_mut().enumerate() {
+            progress()?;
+            *any = false;
+            self.each(left, l, &mut *progress, |r| {
+                let shares =
+                    !bound_in_both
+                        || self.left_keys.iter().zip(self.right_keys).any(|(&a, &b)| {
+                            left.get(l, a) != UNDEF && self.right.get(r, b) != UNDEF
+                        });
                 *any |= shares;
                 Ok(!*any)
-            },
-        );
+            })?;
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1581,6 +1724,32 @@ mod tests {
                 }
             };
             assert_eq!(run(0.into()).unwrap().len(), 0);
+            if inner {
+                compatible_mask_within(
+                    &empty,
+                    &empty,
+                    &[0],
+                    &[0],
+                    true,
+                    &b,
+                    &mut [],
+                    crate::StopSource::none(),
+                )
+                .unwrap();
+                assert_eq!(
+                    compatible_mask_within(
+                        &empty,
+                        &empty,
+                        &[0],
+                        &[0],
+                        true,
+                        &b,
+                        &mut [],
+                        crate::StopSource::new(Some(Arc::new(AtomicBool::new(true))), None),
+                    ),
+                    Err(Stop::Cancelled),
+                );
+            }
             assert_eq!(
                 run(RowLimit {
                     max_rows: 0,
@@ -1602,6 +1771,22 @@ mod tests {
             };
             assert!(matches!(result, Err(JoinStop::Memory(_))));
             assert_eq!(refused.used(), 0);
+            if inner {
+                assert!(matches!(
+                    compatible_mask_within(
+                        &left,
+                        &right,
+                        &[0, 1],
+                        &[0, 1],
+                        true,
+                        &refused,
+                        &mut [false],
+                        crate::StopSource::none(),
+                    ),
+                    Err(Stop::Memory(_)),
+                ));
+                assert_eq!(refused.used(), 0);
+            }
             let out = if inner {
                 join_with_undef(&left, &right, &[0, 1], &[0, 1], &inputs, 0)
             } else {
@@ -1774,6 +1959,22 @@ mod tests {
                 assert_eq!(
                     found, expected,
                     "mask (bound in both: {bound_in_both}), case {case}"
+                );
+                found.fill(true);
+                compatible_mask_within(
+                    &left,
+                    &right,
+                    &lk,
+                    &rk,
+                    bound_in_both,
+                    &budget(),
+                    &mut found,
+                    crate::StopSource::none(),
+                )
+                .unwrap();
+                assert_eq!(
+                    found, expected,
+                    "checked mask (bound in both: {bound_in_both}), case {case}"
                 );
             }
         }
@@ -2084,3 +2285,7 @@ mod tests {
         assert_eq!(held(10_000), held(100_000));
     }
 }
+
+#[cfg(test)]
+#[path = "join/mask_tests.rs"]
+mod mask_tests;

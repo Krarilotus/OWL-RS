@@ -82,8 +82,8 @@ use crate::results::{
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::join::{
-    JoinStop, anti_join_in_place, compatible_mask, join, join_keeping_left_order, join_with_undef,
-    left_join, outer_join_with_undef,
+    JoinStop, anti_join_in_place, compatible_mask_within, join, join_keeping_left_order,
+    join_with_undef, left_join, outer_join_with_undef,
 };
 use nrese_exec::{
     Budget, BudgetExceeded, ChargedVec, IdTable, Reservation, Scratch, UNDEF, computed_index,
@@ -2008,7 +2008,7 @@ impl<'a> Context<'a> {
                 if has_undef(&table, &lk) || has_undef(&right.table, &rk) {
                     // A row goes if a compatible row shares a variable both bind.
                     let mut removed = self.mask(table.len(), false)?;
-                    compatible_mask(
+                    compatible_mask_within(
                         &table,
                         &right.table,
                         &lk,
@@ -2016,8 +2016,9 @@ impl<'a> Context<'a> {
                         true,
                         &self.budget,
                         &mut removed,
+                        crate::service::Check(self),
                     )
-                    .map_err(QueryEvaluationError::MemoryLimit)?;
+                    .map_err(QueryEvaluationError::from)?;
                     removed.iter_mut().for_each(|r| *r = !*r);
                     table.retain_mask(&removed);
                 } else {
