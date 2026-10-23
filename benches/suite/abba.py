@@ -252,7 +252,8 @@ def completeness(family: dict, manifest: dict | None, passes: list[dict]) -> lis
             continue
         for case in planned:
             e = rg.evidence(mine, case)
-            if rg.state(e) != "ok" or e["unchecked"]:
+            baseline_route_ok = side in ("a", "a2") and revs[side] == family["sides"]["a"]
+            if rg.state(e, off_route_ok=baseline_route_ok) != "ok" or e["unchecked"]:
                 why = e["failed_checks"][:2] + e["failed_routes"][:1] + e["notes"][-1:]
                 problems.append(f"{case} on {side}: {', '.join(map(str, sorted(set(e['status']))))}"
                                 + (f" ({'; '.join(why)})" if why else "")
@@ -288,6 +289,7 @@ def judge(family: dict, results: Path) -> tuple[list[str], dict | None, dict | N
     if problems:
         return problems, None, None, host
     a = family["sides"]["a"]
+    route_baselines = {"a": a, "a2": a}
     harness = manifest["harness"]
     context = {"host": host, "round": manifest.get("round", 1) - 1}
     of = lambda *names: [p for p in passes if p["side"] in names]  # noqa: E731
@@ -295,9 +297,10 @@ def judge(family: dict, results: Path) -> tuple[list[str], dict | None, dict | N
     # The A-A' arm: A' against A and A against A', each over the family's dimensions; any
     # difference Holm finds there is the instrument's, and the round says nothing.
     aa = rg.gate(of("a", "a2"), {"a2": a, "a": a}, "a2", ["a"], harness, family["blocks"], catalog=catalog,
-                 context=context, family=family["hypotheses"])
+                 context=context, family=family["hypotheses"], route_baselines=route_baselines)
     back = rg.gate(of("a", "a2"), {"a": a, "a2": a}, "a", ["a2"], harness, family["blocks"], catalog=catalog,
-                   context=context, family=[h.replace("a|", "a2|", 1) for h in family["hypotheses"]])
+                   context=context, family=[h.replace("a|", "a2|", 1) for h in family["hypotheses"]],
+                   route_baselines=route_baselines)
     problems += [f"A-A' arm: {e}" for e in aa["errors"] + back["errors"]]
     rejected = gatestats.holm({**{("aa", h): p for h, p in aa["pvalues"].items()},
                                **{("back", h): p for h, p in back["pvalues"].items()}})
@@ -313,7 +316,8 @@ def judge(family: dict, results: Path) -> tuple[list[str], dict | None, dict | N
              "cases": {case: {d: max(sd, hosts.get(case, {}).get(d, 0.0)) for d, sd in dims.items()}
                        for case, dims in own.items()}}
     ab = rg.gate(of("a", "b"), {"b": family["sides"]["b"], "a": a}, "b", ["a"], harness, family["blocks"],
-                 catalog=catalog, context=context, family=family["hypotheses"], floor=floor)
+                 catalog=catalog, context=context, family=family["hypotheses"], floor=floor,
+                 route_baselines=route_baselines)
     problems += ab["errors"] + ab["blocking"]
     return problems, aa, ab, host
 
