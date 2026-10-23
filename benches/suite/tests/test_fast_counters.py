@@ -18,6 +18,31 @@ spec.loader.exec_module(fast)
 
 
 class FastCounters(unittest.TestCase):
+    def test_declared_quantile_owns_raw_samples_without_fallback(self):
+        cases = [
+            ("durable.p90_ms", {"durable": {"samples_ms": [], "p50_ms": 1, "p90_ms": 9}}, {"_": [9]}),
+            ("commits.p99_ms", {"commits": {"samples_ms": [1, 1, 99], "p50_ms": 1, "p99_ms": 99}}, {"_": [99]}),
+            ("commits.read_p99_ms", {"commits": {"samples_ms": [1, 1, 99], "read_p99_ms": 500}}, {"_": [500]}),
+            ("commits.read_p50_ms", {"commits": {"samples_ms": [1, 1, 99], "read_p50_ms": 8}}, {"_": [8]}),
+            ("commits.p99_ms", {"commits": {"samples_ms": [1, 1, 99], "p50_ms": 1}}, {"_": []}),
+            ("durable.p50_ms", {"durable": {"samples_ms": [], "p50_ms": 0}}, {"_": [0]}),
+            ("durable.p90_ms", {"_repeats": [{"durable": {"p90_ms": 8}},
+                                               {"durable": {"p90_ms": 10}}]}, {"_": [8, 10]}),
+            # IB2156 limits scalar ownership; unrelated reason repeats still pool.
+            ("reason.p50_ms", {"reason": {"samples_ms": [3, 3, 3], "p50_ms": 3},
+                               "_repeats": [
+                                   {"reason": {"samples_ms": [1, 1, 100], "p50_ms": 1}},
+                                   {"reason": {"samples_ms": [2, 2, 100], "p50_ms": 2}},
+                                   {"reason": {"samples_ms": [3, 3, 3], "p50_ms": 3}}]},
+             {"_": [1, 1, 100, 2, 2, 100, 3, 3, 3]}),
+            ("load_s", {"load_s": 1.5}, {"_": [1500.0]}),
+            ("commits.whole_s", {"commits": {"whole_s": 9, "samples_ms": [1, 2]}}, {"_": [9000.0]}),
+            ("sum_p50_ms", {"queries": [{"name": "q", "p50_ms": 4, "samples_ms": [3, 5]}]}, {"q": [3, 5]}),
+        ]
+        for metric, result, expected in cases:
+            with self.subTest(metric=metric, result=result):
+                self.assertEqual(fast.samples({"metric": metric}, result), expected)
+
     def test_unchanged_nested_metadata(self):
         values = {"q.a.rewrites": [[{"rules": ["r1"]}]] * 3}
         self.assertEqual(fast.counter_changes(values, values), (False, []))
