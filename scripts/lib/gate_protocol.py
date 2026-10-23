@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 
 PUBLISHED_BASE = '37263eb909e4a8a50b5f9298a53b29ec7534fff2'
@@ -86,10 +87,37 @@ def check_external_cargo_config(root, env=os.environ):
             if (directory/name).is_file():
                 raise NoVerdict(f'external Cargo configuration is not a snapshot input: {directory/name}')
 
-def artifact_key(tree, release, rustc_commit, flags, target, cpu):
+def artifact_key(tree, release, rustc_commit, flags, target, cpu, native_toolchain=None):
     # HEAD plus exit-zero Cargo cannot identify an old executable (RSH probe).
-    return digest({'tree': tree, 'release': release, 'rustc_commit': rustc_commit,
-                   'flags': flags, 'target': target, 'cpu': cpu})
+    inputs = {'tree': tree, 'release': release, 'rustc_commit': rustc_commit,
+              'flags': flags, 'target': target, 'cpu': cpu}
+    if '-windows-' in target:
+        try:
+            native = native_toolchain
+            pair = native['selected']
+            env = native['environment']
+            hashes = [native[k]['sha256'] for k in ('vswhere', 'devcmd')]
+            hashes.append(pair['compiler_sha256'])
+            if pair['helper'] is not None:
+                hashes.append(pair['helper_sha256'])
+            valid = (native['version'] == 1 and native['target'] == pair['target'] == target
+                and native['installation'] and native['toolset_version']
+                and all(native['sdk'][k] for k in ('root', 'version', 'ucrt_root', 'ucrt_version'))
+                and all(env[k] for k in ('PATH', 'INCLUDE', 'LIB'))
+                and env['NRESE_MSVC_TARGET'] == target
+                and all(env[k] == pair['compiler'] for k in (
+                    'NRESE_MSVC_COMPILER', 'CC', 'CXX', 'HOST_CC', 'HOST_CXX', 'TARGET_CC', 'TARGET_CXX',
+                    'CC_' + target.upper().replace('-', '_'), 'CXX_' + target.upper().replace('-', '_')))
+                and all(isinstance(h, str) and re.fullmatch('[0-9a-f]{64}', h) for h in hashes)
+                and (pair['helper'] is not None or pair['helper_sha256'] is None))
+        except (KeyError, TypeError):
+            valid = False
+        if not valid:
+            raise NoVerdict('missing or invalid selected native toolchain provenance')
+        inputs['native_toolchain'] = native_toolchain
+    elif native_toolchain is not None:
+        raise NoVerdict('native toolchain provenance on a non-Windows target')
+    return digest(inputs)
 
 def required_for(request, part, selection):
     files = request['files']
@@ -182,7 +210,7 @@ def validate_unit(request, part, index, record, job):
     if not record.get('attempt') or not record.get('cpu') or not record.get('target'):
         raise NoVerdict('incomplete runtime provenance')
     artifact = artifact_key(request['tree'], request['release'], request['rustc_commit'],
-                            request['flags'], record['target'], record['cpu'])
+                            request['flags'], record['target'], record['cpu'], record.get('native_toolchain'))
     prefix = 'target-gate-win-' if part == 'windows' else 'target-gate-'
     if record.get('artifact_key') != artifact or record.get('artifact_target') != prefix + artifact:
         raise NoVerdict('workspace artifacts are not isolated by complete source/tool identity')

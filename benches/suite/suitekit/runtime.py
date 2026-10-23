@@ -144,8 +144,14 @@ class DockerStats:
     """The peak of a container's memory from one streaming `docker stats` (a reading per
     second or so). A stopped container reads 0: not a reading."""
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, reader=None):
         self.peak: int | None = None
+        self.reader, self.error = reader, None
+        self.stopped = threading.Event()
+        if reader is not None:
+            self.thread = threading.Thread(target=self.read_bound, daemon=True)
+            self.thread.start()
+            return
         self.process = subprocess.Popen(["docker", "stats", "--format", "{{.MemUsage}}", name],
                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
                                         errors="replace")
@@ -166,7 +172,28 @@ class DockerStats:
                 if value:
                     self.peak = value if self.peak is None else max(self.peak, value)
 
+    def read_bound(self):
+        # The agent binds each no-stream observation to its daemon and CID. The
+        # cadence includes the observation latency, unlike legacy streaming stats.
+        while not self.stopped.is_set():
+            try:
+                value = mib(self.reader())
+                if value:
+                    self.peak = max(self.peak or 0, value)
+            except BaseException as error:
+                self.error = error
+                return
+            self.stopped.wait(SAMPLE_S)
+
     def stop(self) -> int | None:
+        if self.reader is not None:
+            self.stopped.set()
+            self.thread.join(timeout=45)
+            if self.thread.is_alive():
+                raise RuntimeError("agent stats read did not settle")
+            if self.error is not None:
+                raise self.error
+            return self.peak
         if self.process.poll() is None:
             self.process.terminate()
         try:
@@ -427,13 +454,215 @@ class DockerRuntime(Runtime):
         super().__init__(scratch, port, echo)
         self.containers: dict[str, Server] = {}
 
-    def args(self, spec: Spec, detached: bool) -> list[str]:
-        args = [ns.executable(), "run", *ns.name_args(spec.name, ROOT, OWNER), "--init"]
+    def run_bound(self, argv: list[str], log: Path, timeout_s: float = 2700,
+                  interrupted=lambda: False) -> Measured:
+        """Consume one Fleet-admitted create, using its agent for every operation.
+
+        Agent state, not this object, owns the single-use grant and finality. A
+        missing/refused close acknowledgement is an error even after engine exit0.
+        Legacy run/start/cleanup are unchanged and must not service this path.
+        """
+        if getattr(self, "_bound_consumed", False) or self.containers:
+            raise RuntimeError("bound launch already consumed or runtime busy")
+        self._bound_consumed = True
+        name, owner, cpu = (os.environ[k] for k in
+                            ("FLEET_CONTAINER_NAME", "FLEET_CONTAINER_OWNER", "FLEET_CPU"))
+        request = json.loads(Path(os.environ["FLEET_CONTAINER_REQUEST"]).read_text(encoding="utf-8"))
+        agent = os.environ["FLEET_CONTAINER_AGENT"]
+        if not name or not owner or not cpu.isdigit() or request.get("owner") != owner:
+            raise ValueError("missing or mismatched exact Fleet binding")
+        if request.get("argv") != argv:
+            raise ValueError("launch differs from the agent's resolved admitted plan")
+        if not math.isfinite(timeout_s) or not 0 < timeout_s <= 2700:
+            raise ValueError("bound wait must be positive and at most 2700s")
+        if (len(argv) < 5 or not argv[0].startswith('/') or argv[1] != '--host' or
+                not argv[2].startswith('unix://') or argv[3] != 'create'):
+            raise ValueError("bound argv must be the agent-resolved local Docker create")
+        for flag, value in (("--name", name), ("--cpuset-cpus", cpu), ("--memory", "12g"),
+                            ("--memory-swap", "12g"), ("--cpus", "1")):
+            if argv.count(flag) != 1 or argv[argv.index(flag) + 1:argv.index(flag) + 2] != [value]:
+                raise ValueError("bound argv disagrees with " + flag)
+        if "fleet.owner=" + owner not in argv:
+            raise ValueError("bound argv owner mismatch")
+        if '--pull=never' not in argv:
+            raise ValueError('bound create must use cached images without pulling')
+        log.parent.mkdir(parents=True, exist_ok=True)
+        record = dict(argv=list(argv), name=name, owner=owner, cpu=cpu, attempt=request["attempt"],
+                      timeout_s=timeout_s, phase_closed=False, phases=[], cleanup_errors=[],
+                      boundary="monotonic before gated create; includes inspect/start acknowledgement",
+                      stats="agent no-stream; next sample after response plus SAMPLE_S")
+        evidence = log.with_suffix(log.suffix + ".bound.json")
+        lock = threading.RLock()
+        cid = daemon = None
+
+        def save():
+            with lock:
+                evidence.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+
+        def payload(phase, read=None):
+            sent = {k: request[k] for k in ("fleet_dir", "job", "step", "attempt", "owner")}
+            sent.update(op="container_phase", phase=phase)
+            if phase == "launch":
+                sent["argv"] = list(argv)
+            if read:
+                sent.update(read=read, timeout_s=timeout_s if read == "wait" else 30)
+                if read == "stats":
+                    sent["format"] = "{{.MemUsage}}"
+            return sent
+
+        def answer(sent, raw, stderr, code):
+            nonlocal daemon
+            with lock:
+                label = f"agent-{len(record['phases']):04d}-{sent['phase']}-{sent.get('read', '')}"
+                log.with_suffix(log.suffix + f".{label}.stdout").write_bytes(raw or b"")
+                log.with_suffix(log.suffix + f".{label}.stderr").write_bytes(stderr or b"")
+                record["phases"].append(dict(phase=sent["phase"], read=sent.get("read"),
+                                             transport_exit=code, artifact=label))
+                save()
+            if code:
+                raise RuntimeError(f"agent transport exit {code}: {stderr!r}; stdout={raw!r}")
+            result = json.loads(raw.decode("utf-8"))
+            if (not isinstance(result, dict) or result.get("ack") is not True or result.get("error") or
+                    result.get("owner") != owner or result.get("attempt") != request["attempt"] or
+                    result.get("phase") != sent["phase"] or not result.get("daemon_id")):
+                raise RuntimeError(f"unknown or mismatched agent acknowledgement: {result!r}")
+            if daemon is not None and result["daemon_id"] != daemon:
+                raise RuntimeError("agent daemon binding changed")
+            daemon = result["daemon_id"]
+            if cid is not None and result.get("container_id") != cid:
+                raise RuntimeError("agent container binding changed")
+            if sent.get("read") and result.get("read") != sent["read"]:
+                raise RuntimeError("agent read binding changed")
+            if sent["phase"] == "close" and result.get("phase_closed") is not True:
+                raise RuntimeError("agent did not confirm phase closure")
+            wait_timeout = (sent.get("read") == "wait" and result.get("returncode") == 124
+                            and result.get("timed_out") is True)
+            if result.get("returncode") != 0 and not wait_timeout:
+                raise RuntimeError(f"agent operation failed: {result!r}")
+            if not isinstance(result.get("stdout"), str) or not isinstance(result.get("stderr"), str):
+                raise RuntimeError("agent omitted raw operation output")
+            return result
+
+        def phase(value, read=None):
+            sent = payload(value, read)
+            try:
+                raw = subprocess.run([sys.executable, agent], input=json.dumps(sent).encode("utf-8"),
+                                     capture_output=True, timeout=40 if read else 120)
+            except subprocess.TimeoutExpired as error:
+                answer(sent, error.stdout, error.stderr, 124)
+                raise
+            return answer(sent, raw.stdout, raw.stderr, raw.returncode)
+
+        primary = sampler = waiter = measured = None
+        started = time.monotonic()
+        save()
+        try:
+            if interrupted():
+                raise InterruptedError("RETREAT before bound launch")
+            launch = phase("launch")
+            cid = launch.get("container_id")
+            record.update(container_id=cid, daemon_id=daemon)
+            if not isinstance(cid, str) or not re.fullmatch(r"[0-9a-f]{64}", cid) or launch["stdout"].strip() != cid:
+                raise RuntimeError("agent launch CID mismatch")
+            inspected = json.loads(phase("read", "inspect")["stdout"])
+            inspected = inspected[0] if isinstance(inspected, list) and len(inspected) == 1 else {}
+            config = inspected.get("HostConfig", {})
+            if (inspected.get("Name") != "/" + name or inspected.get("Id") != cid or
+                    inspected.get("Config", {}).get("Labels", {}).get("fleet.owner") != owner or
+                    config.get("Memory") != 12 * 1024**3 or config.get("MemorySwap") != 12 * 1024**3 or
+                    config.get("NanoCpus") != 1_000_000_000 or config.get("CpusetCpus") != cpu):
+                raise RuntimeError("agent inspected name/owner/CID/limits mismatch")
+            record["host_config"] = config
+            phase("start")
+            sampler = DockerStats(cid, reader=lambda: phase("read", "stats")["stdout"])
+            sent = payload("read", "wait")
+            waiter = subprocess.Popen([sys.executable, agent], stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            wait_input = json.dumps(sent).encode("utf-8")
+            deadline = time.monotonic() + timeout_s
+            timed_out = False
+            while True:
+                if interrupted():
+                    raise InterruptedError("RETREAT during bound attempt; a new Fleet attempt is required")
+                if sampler.error is not None:
+                    raise sampler.error
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out, rc = True, 124
+                    break
+                try:
+                    stdout, stderr = waiter.communicate(input=wait_input, timeout=min(SAMPLE_S, remaining))
+                except subprocess.TimeoutExpired:
+                    wait_input = None  # poll this same child, never resend a wait request
+                    continue
+                waited = answer(sent, stdout, stderr, waiter.returncode)
+                timed_out = waited.get("timed_out") is True
+                rc = 124 if timed_out else int(waited["stdout"].strip())
+                break
+            measured = Measured((time.monotonic() - started) * 1000, sampler.stop(), rc, timed_out)
+            sampler = None
+            record["measured"] = vars(measured)
+        except BaseException as error:
+            primary = error
+            record["primary_error"] = f"{type(error).__name__}: {error}"
+        finally:
+            errors = []
+            def cleanup(action):
+                try:
+                    action()
+                except BaseException as error:
+                    errors.append(f"{type(error).__name__}: {error}")
+            def settle_wait():
+                if waiter is not None:
+                    if waiter.poll() is None:
+                        waiter.terminate()  # observation client only; close owns container effects
+                    try:
+                        stdout, stderr = waiter.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        waiter.kill()
+                        stdout, stderr = waiter.communicate(timeout=5)
+                    if measured is None or measured.timed_out:
+                        log.with_suffix(log.suffix + ".wait.stdout").write_bytes(stdout or b"")
+                        log.with_suffix(log.suffix + ".wait.stderr").write_bytes(stderr or b"")
+            cleanup(settle_wait)
+            if sampler is not None:
+                cleanup(sampler.stop)
+            def logs():
+                if cid is not None:
+                    result = phase("read", "logs")
+                    for stream in ("stdout", "stderr"):
+                        log.with_suffix(log.suffix + ".container." + stream).write_text(result[stream], encoding="utf-8")
+                    log.write_text(result["stdout"] + result["stderr"], encoding="utf-8")
+            cleanup(logs)
+            def close():
+                record["phase_closed"] = phase("close")["phase_closed"]
+            cleanup(close)
+            record["cleanup_errors"] = errors
+            record["finality_pending"] = not record["phase_closed"]
+            save()
+            # An unconsumed plan cannot close while this driver is alive. Keep
+            # RETREAT's exit130; the controller finalizes after driver quiescence.
+            # This is no success/closure verdict, and cleanup diagnostics remain.
+            if errors and not isinstance(primary, InterruptedError):
+                raise RuntimeError(f"bound phase failed: primary={primary!r}; cleanup={errors!r}") from primary
+        if primary is not None:
+            raise primary
+        return measured
+
+    def args(self, spec: Spec, detached: bool, *, bound: bool = False) -> list[str]:
+        if bound:
+            if (not re.fullmatch(r"sha256:[0-9a-f]{64}", spec.image or "") or spec.memory != "12g"
+                    or detached or spec.port is not None or spec.keep_stdin):
+                raise ValueError("bound create requires immutable image, 12g and a batch container")
+            args = ["docker", "create", "--name", "@FLEET_CONTAINER_NAME@", "--label",
+                    "fleet.owner=@FLEET_CONTAINER_OWNER@", "--init", "--network", "none", "--pull=never"]
+        else:
+            args = [ns.executable(), "run", *ns.name_args(spec.name, ROOT, OWNER), "--init"]
         # A measurement's own container: the quiet slot's watcher pauses the others.
-        if os.environ.get("NRESE_QUIET_TOKEN"):
+        if not bound and os.environ.get("NRESE_QUIET_TOKEN"):
             args += ["--label", f"nrese.quiet={os.environ['NRESE_QUIET_TOKEN']}"]
         # A queue job's containers: its host's guard stops them with the job (suite/queue.py).
-        if os.environ.get("QUEUE_JOB"):
+        if not bound and os.environ.get("QUEUE_JOB"):
             args += ["--label", f"nrese.queue={os.environ['QUEUE_JOB']}"]
         if detached:
             args.append("-d")
@@ -446,7 +675,9 @@ class DockerRuntime(Runtime):
         if spec.memory:
             args += ["--memory", spec.memory, "--memory-swap", spec.memory]
         # Every system on the same CPUs when a run asks for it (DOCKER_CPUS, e.g. "8").
-        if os.environ.get("DOCKER_CPUS"):
+        if bound:
+            args += ["--cpus", "1", "--cpuset-cpus", "@FLEET_CPU@"]
+        elif os.environ.get("DOCKER_CPUS"):
             args += ["--cpus", os.environ["DOCKER_CPUS"]]
         for key, value in spec.env.items():
             args += ["-e", f"{key}={value}"]
@@ -459,7 +690,7 @@ class DockerRuntime(Runtime):
             args += ["--entrypoint", command.pop(0)]
         # The image by the ID pinned at the job's start (pin): a retag while the job runs can't
         # change what a later system or repetition runs; a tag not pinned is an error, never run.
-        return args + [ns.image_id(spec.image, ROOT) if self.by_id else spec.image] + command
+        return args + [ns.image_id(spec.image, ROOT) if self.by_id and not bound else spec.image] + command
 
     def remove(self, name: str):
         if name not in self.containers:

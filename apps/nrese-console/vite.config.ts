@@ -30,6 +30,14 @@ export default defineConfig(({ mode }) => {
       environment: "jsdom",
       globals: true,
       setupFiles: "./src/test/setup.ts",
+      poolOptions: {
+        forks: {
+          // Let jsdom supply browser storage when Node also exposes Web Storage.
+          execArgv: process.allowedNodeEnvironmentFlags.has("--no-experimental-webstorage")
+            ? ["--no-experimental-webstorage"]
+            : [],
+        },
+      },
     },
   };
 });

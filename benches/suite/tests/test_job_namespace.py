@@ -220,6 +220,43 @@ class JobNamespaces(unittest.TestCase):
 
 @unittest.skipUnless(BASH, "needs bash")
 class NameLint(unittest.TestCase):
+    def test_only_the_owned_bound_route_accepts_the_exact_fleet_placeholders(self):
+        """Spec: tooling owner, 24 Oct: only Fleet's paired bound argv may name a container."""
+        source = (ROOT / "benches/suite/suitekit/runtime.py").read_text()
+        cases = {
+            "bound": (source, "benches/suite/suitekit/runtime.py", 0),
+            "literal": (source.replace('"@FLEET_CONTAINER_NAME@"', '"shared-name"'),
+                        "benches/suite/suitekit/runtime.py", 1),
+            "foreign-owner": (source.replace('"fleet.owner=@FLEET_CONTAINER_OWNER@"', '"fleet.owner=foreign"'),
+                              "benches/suite/suitekit/runtime.py", 1),
+            "unpaired": (source.replace('"fleet.owner=@FLEET_CONTAINER_OWNER@", ', ''),
+                         "benches/suite/suitekit/runtime.py", 1),
+            "unbound": (source.replace('        if bound:\n', '        if not bound:\n'),
+                        "benches/suite/suitekit/runtime.py", 1),
+            "foreign-route": (source.replace('class DockerRuntime(Runtime):', 'class ForeignRuntime(Runtime):'),
+                              "benches/suite/suitekit/runtime.py", 1),
+            "foreign-file": (source, "benches/foreign.py", 1),
+            "extra-name": (source.replace('"--pull=never"]', '"--pull=never", "--name", "shared"]'),
+                           "benches/suite/suitekit/runtime.py", 1),
+            "same-line-foreign": (source.replace(
+                '"--label",\n                    "fleet.owner=', '"--label", "fleet.owner=').replace(
+                '"--pull=never"]', '"--pull=never"]; other = ["--name", "shared"]'),
+                "benches/suite/suitekit/runtime.py", 1),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "scripts").mkdir()
+            lint = root / "scripts/check-names.sh"
+            shutil.copyfile(ROOT / "scripts/check-names.sh", lint)
+            for label, (text, relative, expected) in cases.items():
+                with self.subTest(case=label):
+                    target = root / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(text, newline="\n")
+                    done = subprocess.run([BASH, lint.as_posix(), relative], cwd=root,
+                                          capture_output=True, text=True, timeout=10)
+                    self.assertEqual(done.returncode, expected, done.stdout + done.stderr)
+
     def test_the_lint_fires_on_a_literal_name_and_passes_the_helpers(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)

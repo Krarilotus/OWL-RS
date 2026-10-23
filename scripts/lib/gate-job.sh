@@ -106,8 +106,52 @@ from pathlib import Path
 from gate_protocol import check_external_cargo_config
 check_external_cargo_config(Path.cwd())
 PY
-quiet() { local log; log=$(mktemp); if "$@" > "$log" 2>&1; then rm -f "$log"; else tail -30 "$log"; rm -f "$log"; return 1; fi; }
+record() {
+  # Raw diagnostics are durable Fleet output, not reusable build/pass evidence.
+  # mktemp keeps each attempt private; no environment dump or retained worktree.
+  local display=$1 code=0 stdout_fd stderr_fd stdout_pid stderr_pid stdout_code=0 stderr_code=0
+  shift
+  log=$(mktemp -d "$out/unit-$index-command-XXXXXX") || return 75
+  printf '%s\0' "$@" > "$log/argv" || return 75
+  pwd > "$log/cwd" || return 75
+  echo "gate-job: raw command result $log" >&2
+  if [ "$display" = quiet ]; then
+    exec {stdout_fd}> >(tee "$log/stdout" > /dev/null); stdout_pid=$!
+    exec {stderr_fd}> >(tee "$log/stderr" > /dev/null); stderr_pid=$!
+  else
+    exec {stdout_fd}> >(tee "$log/stdout"); stdout_pid=$!
+    exec {stderr_fd}> >(tee "$log/stderr" >&2); stderr_pid=$!
+  fi
+  "$@" >&$stdout_fd 2>&$stderr_fd || code=$?
+  exec {stdout_fd}>&- {stderr_fd}>&-
+  printf '%s\n' "$code" > "$log/exit" || return 75
+  # The existing whole-part timeout bounds these drains, including inherited
+  # writers. An exit file may exist even if a timeout interrupts this capture.
+  wait "$stdout_pid" || stdout_code=$?
+  wait "$stderr_pid" || stderr_code=$?
+  printf '%s\tstdout\n%s\tstderr\n' "$stdout_code" "$stderr_code" > "$log/capture-status" || return 75
+  [ "$stdout_code" -eq 0 ] && [ "$stderr_code" -eq 0 ] || return 75
+  : > "$log/capture-complete" || return 75
+  return "$code"
+}
+quiet() {
+  local log
+  if record quiet "$@"; then return 0; else
+    [ -z "${log:-}" ] || tail -30 "$log/stdout" "$log/stderr"
+    return 1
+  fi
+}
 channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+# Native MSVC setup: external override checks above precede this internal selection.
+native_toolchain=""
+if [ "$part" = windows ]; then
+  native_toolchain="$out/unit-$index-native-toolchain.json"
+  native_exports="$out/unit-$index-native-toolchain.env"
+  quiet python scripts/lib/msvc-setup.py "$native_toolchain" "$native_exports" || infra "selected native compiler setup"
+  while IFS= read -r -d '' native_name && IFS= read -r -d '' native_value; do
+    export "$native_name=$native_value"
+  done < "$native_exports"
+fi
 if ! command -v rustup >/dev/null; then
   [ "$part" = rest ] || infra "no native rustup"
   # Original Linux adapter's private bootstrap; never change the host's default setup.
@@ -166,10 +210,12 @@ target=$(printf '%s\n' "$info" | sed -n 's/^host: //p')
 [ "$(bash scripts/cargo-guarded.sh --print-rustflags)" = "$flags" ] || infra "effective flags differ"
 cpu=$(gate_cpu)
 [ -n "$cpu" ] || infra "native CPU identity missing"
-artifact=$(python - "$tree" "$release" "$rustc_commit" "$flags" "$target" "$cpu" <<'PY'
-import sys
+artifact=$(python - "$tree" "$release" "$rustc_commit" "$flags" "$target" "$cpu" "$native_toolchain" <<'PY'
+import json, sys
+from pathlib import Path
 from gate_protocol import artifact_key
-print(artifact_key(*sys.argv[1:]))
+native = json.loads(Path(sys.argv[7]).read_text()) if sys.argv[7] else None
+print(artifact_key(*sys.argv[1:7], native_toolchain=native))
 PY
 ) || infra "artifact identity failed"
 # Owner-authorized bounded exception to host-cache section 3: the shared mutable
@@ -190,12 +236,13 @@ for entry in "$CARGO_TARGET_DIR" "$py" "${NRESE_MIRI_TARGET_DIR:-}"; do
   [ -z "$entry" ] || { mkdir -p "$entry"; echo "$EPOCHSECONDS" > "$entry/.last-used"; }
 done
 unit=all
-export NRESE_GATE_REQUIRED="$cache/required-$part" NRESE_GATE_STEPS="$cache/steps-$part"
-export NRESE_GATE_SELECTION="$cache/selection-$part-$key.json"
+export NRESE_GATE_REQUIRED="$out/unit-$index-required" NRESE_GATE_STEPS="$out/unit-$index-steps"
+export NRESE_GATE_SELECTION="$out/unit-$index-selection.json"
 : > "$NRESE_GATE_REQUIRED"; : > "$NRESE_GATE_STEPS"
+rm -f -- "$NRESE_GATE_SELECTION"
 set +e
 NRESE_GATE_INNER=unit NRESE_ON_BUILD_HOST=1 NRESE_GATE_PART="$part" NRESE_GATE_UNIT="$unit" \
-  NRESE_FILES_FROM="$files" bash scripts/check.sh push < /dev/null
+  NRESE_FILES_FROM="$files" record live bash scripts/check.sh push < /dev/null
 code=$?
 set -e
 [ "$code" -eq 0 ] || [ "$code" -eq 1 ] || infra "unit did not produce a test verdict (exit $code)"
@@ -205,6 +252,7 @@ export GATE_CODE=$code GATE_ATTEMPT=$attempt GATE_BEGAN=$began GATE_PART=$part G
 export GATE_UNIT=$unit GATE_TREE=$tree GATE_BASE=$base GATE_LIST=$list_hash GATE_FLAGS=$flags
 export GATE_RUSTC=$actual_commit GATE_RELEASE=$release GATE_TARGET=$target GATE_CPU=$cpu
 export GATE_ARTIFACT=$artifact GATE_ARTIFACT_TARGET="${CARGO_TARGET_DIR##*/}"
+export GATE_NATIVE_TOOLCHAIN="${native_toolchain:-}"
 export GATE_AFTER=$after GATE_CHANGED=$changed GATE_MEMORY_JOB=$memory_job GATE_RAM=$ram
 python - "$out/unit-$index.json" <<'PY' || infra "evidence publication failed"
 import json, os, time, sys
@@ -224,6 +272,8 @@ record = {'request': e['NRESE_GATE_REQUEST'], 'head': e['NRESE_GATE_HEAD'], 'tre
     'selection': json.loads(Path(e['NRESE_GATE_SELECTION']).read_text()),
     'steps': [{'name': name, 'code': int(code)} for code, name in rows],
     'memory_cap_gb': float(e['GATE_RAM']), 'memory_job': e['GATE_MEMORY_JOB']}
+if e['GATE_PART'] == 'windows':
+    record['native_toolchain'] = json.loads(Path(e['GATE_NATIVE_TOOLCHAIN']).read_text())
 atomic_json(sys.argv[1], record)
 PY
 # Preserve existing shared caches. The owned targets carry .last-used for the

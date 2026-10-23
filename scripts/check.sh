@@ -240,6 +240,31 @@ console() {
 }
 
 # The Windows workload is the existing native OS/measure adapter, through guarded cargo.
+windows_tests() {
+  local expr=$1 binaries metadata code
+  shift
+  mkdir -p tmp || return 75
+  binaries=$(mktemp "$PWD/tmp/nextest-binaries.XXXXXX.json") || return 75
+  metadata=$(mktemp "$PWD/tmp/nextest-cargo.XXXXXX.json") || { rm -f -- "$binaries"; return 75; }
+  # Reuse mode cannot take Cargo build options, including --locked. Capture its
+  # graph under the existing lock contract too, so test execution resolves nothing.
+  cargo metadata --locked --format-version 1 > "$metadata"
+  code=$?
+  # binaries-only does not query test executables. Returning through guarded Cargo
+  # finalizes compilation before nextest can list or run a test. Reusing this exact
+  # metadata is nextest's supported no-rebuild interface, not a warm-build guess.
+  if [ "$code" -eq 0 ]; then
+    "$guarded" nextest list --locked $(package_args "$@") --cargo-metadata "$metadata" \
+      --list-type binaries-only --message-format json > "$binaries"
+    code=$?
+  fi
+  if [ "$code" -eq 0 ]; then
+    "$guarded" nextest run --binaries-metadata "$binaries" --cargo-metadata "$metadata" --no-fail-fast -E "$expr"
+    code=$?
+  fi
+  rm -f -- "$binaries" "$metadata"
+  return "$code"
+}
 windows_part() {
   local os packages expr
   step "Windows tests list" python scripts/lib/windows-tests.py check
@@ -248,7 +273,7 @@ windows_part() {
   expr=$(python scripts/lib/windows-tests.py expr "$@") || exit 75
   os=${os//$'\r'/}; packages=${packages//$'\r'/}; expr=${expr//$'\r'/}
   [ -z "$os" ] || step "clippy (Windows)" "$guarded" clippy --locked $(package_args $os) --all-targets
-  [ -z "$packages" ] || { [ -n "$expr" ] || exit 75; step "tests (Windows)" "$guarded" nextest run --locked --no-fail-fast $(package_args $packages) -E "$expr"; }
+  [ -z "$packages" ] || { [ -n "$expr" ] || exit 75; step "tests (Windows)" windows_tests "$expr" $packages; }
   if printf '%s\n' "${files[@]}" | grep -qE '^apps/nrese-console/'; then console; fi
 }
 push_summary() {
