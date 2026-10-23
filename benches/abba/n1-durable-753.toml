@@ -1,0 +1,268 @@
+# DECLARATION ONLY: H review/adoption, native/input/host/floor checks pending.
+# Host is proposed only; GATE_BATCH=0; bind shared profile SHA from manifest.
+name = "n1-durable-a0-literal"
+host = "office-pc"
+blocks = 3
+[sides]
+a = "f9b515e81f013ecd8c3811f3e9c65e91450ee44c"
+b = "a0edb6d9740499c0ac3a006d4d4e51f180889465"
+
+[[case]]
+name = "n1-commit-every-2000-p50"
+area = "maintenance"
+what = "commit-every-2000: per-process p50 of the existing measured operation"
+semantics = "none"
+data = "none"
+queries = ""
+tool = "perf_lab"
+args = [
+  "--durable",
+  "commit-every-2000",
+  "--store",
+  "{scratch}/store",
+  "--runs",
+  "1",
+]
+metric = "durable.p50_ms"
+check = { "durable.verified" = true, "durable.statements" = 2000, "durable.revision" = 2000, "durable.runs" = 1, "durable.count" = 2000 }
+pinned = "Original six-path workload and decoded content/revision oracle; canonical-LF module 68047251ab544ad6c3968687e7188b1ee097aaca5445c246fe5ac63bce237bd7"
+cap_gb = 8
+timeout_s = 900
+repeat = 1
+systems = []
+dimensions = ["time/_", "memory/anon_kernel"]
+min_samples = 1
+
+[[case]]
+name = "n1-commit-every-2000-p90"
+area = "maintenance"
+what = "commit-every-2000: per-process p90 of the existing measured operation"
+semantics = "none"
+data = "none"
+queries = ""
+tool = "perf_lab"
+args = [
+  "--durable",
+  "commit-every-2000",
+  "--store",
+  "{scratch}/store",
+  "--runs",
+  "1",
+]
+metric = "durable.p90_ms"
+check = { "durable.verified" = true, "durable.statements" = 2000, "durable.revision" = 2000, "durable.runs" = 1, "durable.count" = 2000 }
+pinned = "Original six-path workload and decoded content/revision oracle; canonical-LF module 68047251ab544ad6c3968687e7188b1ee097aaca5445c246fe5ac63bce237bd7"
+cap_gb = 8
+timeout_s = 900
+repeat = 1
+systems = []
+dimensions = ["time/_", "memory/anon_kernel"]
+min_samples = 1
+
+[[case]]
+name = "n1-commit-every-2000-p99"
+area = "maintenance"
+what = "commit-every-2000: per-process p99 of the existing measured operation"
+semantics = "none"
+data = "none"
+queries = ""
+tool = "perf_lab"
+args = [
+  "--durable",
+  "commit-every-2000",
+  "--store",
+  "{scratch}/store",
+  "--runs",
+  "1",
+]
+metric = "durable.p99_ms"
+check = { "durable.verified" = true, "durable.statements" = 2000, "durable.revision" = 2000, "durable.runs" = 1, "durable.count" = 2000 }
+pinned = "Original six-path workload and decoded content/revision oracle; canonical-LF module 68047251ab544ad6c3968687e7188b1ee097aaca5445c246fe5ac63bce237bd7"
+cap_gb = 8
+timeout_s = 900
+repeat = 1
+systems = []
+dimensions = ["time/_", "memory/anon_kernel"]
+min_samples = 1
+
+[[case]]
+name = "n1-commit-buffered-20000-p50"
+area = "maintenance"
+what = "commit-buffered-20000: per-process p50 of the existing measured operation"
+semantics = "none"
+data = "none"
+queries = ""
+tool = "perf_lab"
+args = [
+  "--durable",
+  "commit-buffered-20000",
+  "--store",
+  "{scratch}/store",
+  "--runs",
+  "1",
+]
+metric = "durable.p50_ms"
+check = { "durable.verified" = true, "durable.statements" = 20000, "durable.revision" = 20000, "durable.runs" = 1, "durable.count" = 20000 }
+pinned = "Original six-path workload and decoded content/revision oracle; canonical-LF module 68047251ab544ad6c3968687e7188b1ee097aaca5445c246fe5ac63bce237bd7"
+cap_gb = 8
+timeout_s = 900
+repeat = 1
+systems = []
+dimensions = ["time/_", "memory/anon_kernel"]
+min_samples = 1
+
+[[case]]
+name = "n1-commit-buffered-20000-p90"
+area = "maintenance"
+what = "commit-buffered-20000: per-process p90 of the existing measured operation"
+semantics = "none"
+data = "none"
+queries = ""
+tool = "perf_lab"
+args = [
+  "--durable",
+  "commit-buffered-20000",
+  "--store",
+  "{scratch}/store",
+  "--runs",
+  "1",
+]
+metric = "durable.p90_ms"
+check = { "durable.verified" = true, "durable.statements" = 20000, "durable.revision" = 20000, "durable.runs" = 1, "durable.count" = 20000 }
+pinned = "Original six-path workload and decoded content/revision oracle; canonical-LF module 68047251ab544ad6c3968687e7188b1ee097aaca5445c246fe5ac63bce237bd7"
+cap_gb = 8
+timeout_s = 900
+repeat = 1
+systems = []
+dimensions = ["time/_", "memory/anon_kernel"]
+min_samples = 1
+
+[[case]]
+name = "n1-commit-buffered-20000-p99"
+area = "maintenance"
+what = "commit-buffered-20000: per-process p99 of the existing measured operation"
+semantics = "none"
+data = "none"
+queries = ""
+tool = "perf_lab"
+args = [
+  "--durable",
+  "commit-buffered-20000",
+  "--store",
+  "{scratch}/store",
+  "--runs",
+  "1",
+]
+metric = "durable.p99_ms"
+check = { "durable.verified" = true, "durable.statements" = 20000, "durable.revision" = 20000, "durable.runs" = 1, "durable.count" = 20000 }
+pinned = "Original six-path workload and decoded content/revision oracle; canonical-LF module 68047251ab544ad6c3968687e7188b1ee097aaca5445c246fe5ac63bce237bd7"
+cap_gb = 8
+timeout_s = 900
+repeat = 1
+systems = []
+dimensions = ["time/_", "memory/anon_kernel"]
+min_samples = 1
+
+[[case]]
+name = "n1-checkpoint-2000000-p50"
+area = "maintenance"
+what = "checkpoint-2000000: per-process p50 of the existing measured operation"
+semantics = "none"
+data = "none"
+queries = ""
+tool = "perf_lab"
+args = [
+  "--durable",
+  "checkpoint-2000000",
+  "--store",
+  "{scratch}/store",
+  "--runs",
+  "1",
+]
+metric = "durable.p50_ms"
+check = { "durable.verified" = true, "durable.statements" = 2000001, "durable.revision" = 2, "durable.runs" = 1, "durable.count" = 1 }
+pinned = "Original six-path workload and decoded content/revision oracle; canonical-LF module 68047251ab544ad6c3968687e7188b1ee097aaca5445c246fe5ac63bce237bd7"
+cap_gb = 8
+timeout_s = 900
+repeat = 1
+systems = []
+dimensions = ["time/_", "memory/anon_kernel"]
+min_samples = 1
+
+[[case]]
+name = "n1-open-256-100-p50"
+area = "maintenance"
+what = "open-256-100: per-process p50 of the existing measured operation"
+semantics = "none"
+data = "none"
+queries = ""
+tool = "perf_lab"
+args = [
+  "--durable",
+  "open-256-100",
+  "--store",
+  "{scratch}/store",
+  "--runs",
+  "1",
+]
+metric = "durable.p50_ms"
+check = { "durable.verified" = true, "durable.statements" = 25600, "durable.revision" = 256, "durable.runs" = 1, "durable.count" = 1 }
+pinned = "Original six-path workload and decoded content/revision oracle; canonical-LF module 68047251ab544ad6c3968687e7188b1ee097aaca5445c246fe5ac63bce237bd7"
+cap_gb = 8
+timeout_s = 900
+repeat = 1
+systems = []
+dimensions = ["time/_", "memory/anon_kernel"]
+min_samples = 1
+
+[[case]]
+name = "n1-load-2000000-p50"
+area = "maintenance"
+what = "load-2000000: per-process p50 of the existing measured operation"
+semantics = "none"
+data = "none"
+queries = ""
+tool = "perf_lab"
+args = [
+  "--durable",
+  "load-2000000",
+  "--store",
+  "{scratch}/store",
+  "--runs",
+  "1",
+]
+metric = "durable.p50_ms"
+check = { "durable.verified" = true, "durable.statements" = 2000000, "durable.revision" = 1, "durable.runs" = 1, "durable.count" = 1 }
+pinned = "Original six-path workload and decoded content/revision oracle; canonical-LF module 68047251ab544ad6c3968687e7188b1ee097aaca5445c246fe5ac63bce237bd7"
+cap_gb = 8
+timeout_s = 900
+repeat = 1
+systems = []
+dimensions = ["time/_", "memory/anon_kernel"]
+min_samples = 1
+
+[[case]]
+name = "n1-load-spill-2000000-p50"
+area = "maintenance"
+what = "load-spill-2000000: per-process p50 of the existing measured operation"
+semantics = "none"
+data = "none"
+queries = ""
+tool = "perf_lab"
+args = [
+  "--durable",
+  "load-spill-2000000",
+  "--store",
+  "{scratch}/store",
+  "--runs",
+  "1",
+]
+metric = "durable.p50_ms"
+check = { "durable.verified" = true, "durable.statements" = 2000000, "durable.revision" = 1, "durable.runs" = 1, "durable.count" = 1 }
+pinned = "Original six-path workload and decoded content/revision oracle; canonical-LF module 68047251ab544ad6c3968687e7188b1ee097aaca5445c246fe5ac63bce237bd7"
+cap_gb = 8
+timeout_s = 900
+repeat = 1
+systems = []
+dimensions = ["time/_", "memory/anon_kernel"]
+min_samples = 1

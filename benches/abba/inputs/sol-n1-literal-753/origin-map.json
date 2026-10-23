@@ -1,0 +1,536 @@
+[
+  {
+    "name": "n1-commit-every-2000-p50",
+    "origin": "durable/commit-every-2000",
+    "metric": "durable.p50_ms",
+    "partition": "durable",
+    "source": "declarations.json durable.cases",
+    "preserved_body_sha256": "648eb897b47ae54b3e787d5156c59c959beaff7c858c8c6411a5957ca9284ec1"
+  },
+  {
+    "name": "n1-commit-every-2000-p90",
+    "origin": "durable/commit-every-2000",
+    "metric": "durable.p90_ms",
+    "partition": "durable",
+    "source": "declarations.json durable.cases",
+    "preserved_body_sha256": "07f8a75331ee4e035e902f52258ee12b825f6b9e83e40d3dbc8669b81a933ae3"
+  },
+  {
+    "name": "n1-commit-every-2000-p99",
+    "origin": "durable/commit-every-2000",
+    "metric": "durable.p99_ms",
+    "partition": "durable",
+    "source": "declarations.json durable.cases",
+    "preserved_body_sha256": "3278536cbc1825841bb5740e26ac61824bff147a00730ba787a6999d8cef02df"
+  },
+  {
+    "name": "n1-commit-buffered-20000-p50",
+    "origin": "durable/commit-buffered-20000",
+    "metric": "durable.p50_ms",
+    "partition": "durable",
+    "source": "declarations.json durable.cases",
+    "preserved_body_sha256": "cb2633d7f14badb24865985841c8767022cbc1f56b01511f9c28dd4003461b0c"
+  },
+  {
+    "name": "n1-commit-buffered-20000-p90",
+    "origin": "durable/commit-buffered-20000",
+    "metric": "durable.p90_ms",
+    "partition": "durable",
+    "source": "declarations.json durable.cases",
+    "preserved_body_sha256": "d147b282f908153428c9d826dee5298ff54ab5229a920eccc46113edbd612ec1"
+  },
+  {
+    "name": "n1-commit-buffered-20000-p99",
+    "origin": "durable/commit-buffered-20000",
+    "metric": "durable.p99_ms",
+    "partition": "durable",
+    "source": "declarations.json durable.cases",
+    "preserved_body_sha256": "95db5e87f06d6434143bbd8d6705f34b161221fdb9839c081bd4bac6abb49475"
+  },
+  {
+    "name": "n1-checkpoint-2000000-p50",
+    "origin": "durable/checkpoint-2000000",
+    "metric": "durable.p50_ms",
+    "partition": "durable",
+    "source": "declarations.json durable.cases",
+    "preserved_body_sha256": "578af8969e9249b59f47052a71b0a74e48fca19db96e1caba60453106c10c68a"
+  },
+  {
+    "name": "n1-open-256-100-p50",
+    "origin": "durable/open-256-100",
+    "metric": "durable.p50_ms",
+    "partition": "durable",
+    "source": "declarations.json durable.cases",
+    "preserved_body_sha256": "9a41866fe4716cf44cd1e5d03f71da9096e6aefe5170251a518c9ec4c89b7d96"
+  },
+  {
+    "name": "n1-load-2000000-p50",
+    "origin": "durable/load-2000000",
+    "metric": "durable.p50_ms",
+    "partition": "durable",
+    "source": "declarations.json durable.cases",
+    "preserved_body_sha256": "eeda6938bb9e5f1fbf068332450cd684a01d86173f309d185ff4510d168376fc"
+  },
+  {
+    "name": "n1-load-spill-2000000-p50",
+    "origin": "durable/load-spill-2000000",
+    "metric": "durable.p50_ms",
+    "partition": "durable",
+    "source": "declarations.json durable.cases",
+    "preserved_body_sha256": "f7394534f26442458ead0f8e603ef1676fa818c6c747d6a8ca19ca06578fb38d"
+  },
+  {
+    "name": "n1-lock-rl-sameas",
+    "origin": "rl-sameas",
+    "original_name": "rl-sameas",
+    "metric": "reason.p50_ms",
+    "tail": false,
+    "partition": "main",
+    "preserved_fields": [
+      "area",
+      "what",
+      "semantics",
+      "data",
+      "args",
+      "queries",
+      "metric",
+      "check",
+      "route",
+      "cap_gb",
+      "systems",
+      "guards",
+      "rewrite"
+    ],
+    "declared_args": [
+      "--reason",
+      "owl2-rl",
+      "--reason-runs",
+      "16"
+    ],
+    "declared_repeat": "existing default1; no override",
+    "declared_warmup": "literal --warmup flag if present; absent remains absent",
+    "source": "declarations.json lock_original_rows"
+  },
+  {
+    "name": "n1-lock-rl-lubm100",
+    "origin": "rl-lubm100",
+    "original_name": "rl-lubm100",
+    "metric": "reason.p50_ms",
+    "tail": false,
+    "partition": "main",
+    "preserved_fields": [
+      "area",
+      "what",
+      "semantics",
+      "data",
+      "extra",
+      "args",
+      "queries",
+      "metric",
+      "check",
+      "route",
+      "cap_gb",
+      "systems",
+      "guards",
+      "pinned"
+    ],
+    "declared_args": [
+      "--reason",
+      "owl2-rl",
+      "--runs",
+      "3"
+    ],
+    "declared_repeat": "existing default1; no override",
+    "declared_warmup": "literal --warmup flag if present; absent remains absent",
+    "source": "declarations.json lock_original_rows"
+  },
+  {
+    "name": "n1-lock-commits-rdfs",
+    "origin": "commits-rdfs",
+    "original_name": "commits-rdfs",
+    "metric": "commits.p50_ms",
+    "tail": false,
+    "partition": "main",
+    "preserved_fields": [
+      "area",
+      "what",
+      "semantics",
+      "data",
+      "args",
+      "queries",
+      "metric",
+      "check",
+      "route",
+      "cap_gb",
+      "systems"
+    ],
+    "declared_args": [
+      "--reason",
+      "rdfs",
+      "--commits",
+      "{data}.commits.ru"
+    ],
+    "declared_repeat": "existing default1; no override",
+    "declared_warmup": "literal --warmup flag if present; absent remains absent",
+    "source": "declarations.json lock_original_rows"
+  },
+  {
+    "name": "n1-lock-commits-readers",
+    "origin": "commits-readers",
+    "original_name": "commits-readers",
+    "metric": "commits.p50_ms",
+    "tail": false,
+    "partition": "main",
+    "preserved_fields": [
+      "area",
+      "what",
+      "semantics",
+      "data",
+      "args",
+      "queries",
+      "metric",
+      "check",
+      "route",
+      "cap_gb",
+      "systems"
+    ],
+    "declared_args": [
+      "--reason",
+      "owl2-rl",
+      "--commits",
+      "{data}.commits.ru",
+      "--readers",
+      "8"
+    ],
+    "declared_repeat": "existing default1; no override",
+    "declared_warmup": "literal --warmup flag if present; absent remains absent",
+    "source": "declarations.json lock_original_rows"
+  },
+  {
+    "name": "n1-lock-dlmode-lubm1",
+    "origin": "dlmode-lubm1",
+    "original_name": "dlmode-lubm1",
+    "metric": "sum_p50_ms",
+    "tail": false,
+    "partition": "reference372",
+    "preserved_fields": [
+      "area",
+      "what",
+      "semantics",
+      "data",
+      "extra",
+      "args",
+      "queries",
+      "metric",
+      "check",
+      "route",
+      "cap_gb",
+      "systems",
+      "guards",
+      "pinned",
+      "repeat"
+    ],
+    "declared_args": [
+      "--reason",
+      "owl2-dl",
+      "--runs",
+      "20"
+    ],
+    "declared_repeat": 6,
+    "declared_warmup": "literal --warmup flag if present; absent remains absent",
+    "source": "declarations.json lock_original_rows"
+  },
+  {
+    "name": "n1-lock-lks-dlmode-readers",
+    "origin": "lks-dlmode-readers",
+    "original_name": "lks-dlmode-readers",
+    "metric": "commits.p50_ms",
+    "tail": false,
+    "partition": "reference372",
+    "preserved_fields": [
+      "area",
+      "what",
+      "semantics",
+      "data",
+      "args",
+      "queries",
+      "metric",
+      "check",
+      "route",
+      "cap_gb",
+      "systems"
+    ],
+    "declared_args": [
+      "--reason",
+      "owl2-dl",
+      "--commits",
+      "{data}.commits.ru",
+      "--readers",
+      "8"
+    ],
+    "declared_repeat": "existing default1; no override",
+    "declared_warmup": "literal --warmup flag if present; absent remains absent",
+    "source": "declarations.json lock_original_rows"
+  },
+  {
+    "name": "n1-lock-lks-durable-lubm100",
+    "origin": "lks-durable-lubm100",
+    "original_name": "lks-durable-lubm100",
+    "metric": "reason.p50_ms",
+    "tail": false,
+    "partition": "main",
+    "preserved_fields": [
+      "area",
+      "what",
+      "semantics",
+      "data",
+      "extra",
+      "args",
+      "queries",
+      "metric",
+      "check",
+      "cap_gb",
+      "systems"
+    ],
+    "declared_args": [
+      "--store",
+      "{scratch}/store",
+      "--reason",
+      "owl2-rl",
+      "--runs",
+      "3"
+    ],
+    "declared_repeat": "existing default1; no override",
+    "declared_warmup": "literal --warmup flag if present; absent remains absent",
+    "source": "declarations.json lock_original_rows"
+  },
+  {
+    "name": "n1-lock-commits-rdfs-p99",
+    "origin": "commits-rdfs",
+    "original_name": "n1-lock-commits-rdfs-p99",
+    "metric": "commits.p99_ms",
+    "tail": true,
+    "partition": "main",
+    "preserved_fields": [
+      "area",
+      "what",
+      "semantics",
+      "data",
+      "args",
+      "queries",
+      "metric",
+      "check",
+      "route",
+      "cap_gb",
+      "systems",
+      "dimensions"
+    ],
+    "declared_args": [
+      "--reason",
+      "rdfs",
+      "--commits",
+      "{data}.commits.ru"
+    ],
+    "declared_repeat": "existing default1; no override",
+    "declared_warmup": "literal --warmup flag if present; absent remains absent",
+    "source": "declarations.json lock_tail_variants"
+  },
+  {
+    "name": "n1-lock-commits-readers-p99",
+    "origin": "commits-readers",
+    "original_name": "n1-lock-commits-readers-p99",
+    "metric": "commits.p99_ms",
+    "tail": true,
+    "partition": "main",
+    "preserved_fields": [
+      "area",
+      "what",
+      "semantics",
+      "data",
+      "args",
+      "queries",
+      "metric",
+      "check",
+      "route",
+      "cap_gb",
+      "systems",
+      "dimensions"
+    ],
+    "declared_args": [
+      "--reason",
+      "owl2-rl",
+      "--commits",
+      "{data}.commits.ru",
+      "--readers",
+      "8"
+    ],
+    "declared_repeat": "existing default1; no override",
+    "declared_warmup": "literal --warmup flag if present; absent remains absent",
+    "source": "declarations.json lock_tail_variants"
+  },
+  {
+    "name": "n1-lock-commits-readers-read-p50",
+    "origin": "commits-readers",
+    "original_name": "n1-lock-commits-readers-read-p50",
+    "metric": "commits.read_p50_ms",
+    "tail": true,
+    "partition": "main",
+    "preserved_fields": [
+      "area",
+      "what",
+      "semantics",
+      "data",
+      "args",
+      "queries",
+      "metric",
+      "check",
+      "route",
+      "cap_gb",
+      "systems",
+      "dimensions"
+    ],
+    "declared_args": [
+      "--reason",
+      "owl2-rl",
+      "--commits",
+      "{data}.commits.ru",
+      "--readers",
+      "8"
+    ],
+    "declared_repeat": "existing default1; no override",
+    "declared_warmup": "literal --warmup flag if present; absent remains absent",
+    "source": "declarations.json lock_tail_variants"
+  },
+  {
+    "name": "n1-lock-commits-readers-read-p99",
+    "origin": "commits-readers",
+    "original_name": "n1-lock-commits-readers-read-p99",
+    "metric": "commits.read_p99_ms",
+    "tail": true,
+    "partition": "main",
+    "preserved_fields": [
+      "area",
+      "what",
+      "semantics",
+      "data",
+      "args",
+      "queries",
+      "metric",
+      "check",
+      "route",
+      "cap_gb",
+      "systems",
+      "dimensions"
+    ],
+    "declared_args": [
+      "--reason",
+      "owl2-rl",
+      "--commits",
+      "{data}.commits.ru",
+      "--readers",
+      "8"
+    ],
+    "declared_repeat": "existing default1; no override",
+    "declared_warmup": "literal --warmup flag if present; absent remains absent",
+    "source": "declarations.json lock_tail_variants"
+  },
+  {
+    "name": "n1-lock-lks-dlmode-readers-p99",
+    "origin": "lks-dlmode-readers",
+    "original_name": "n1-lock-lks-dlmode-readers-p99",
+    "metric": "commits.p99_ms",
+    "tail": true,
+    "partition": "reference372",
+    "preserved_fields": [
+      "area",
+      "what",
+      "semantics",
+      "data",
+      "args",
+      "queries",
+      "metric",
+      "check",
+      "route",
+      "cap_gb",
+      "systems",
+      "dimensions"
+    ],
+    "declared_args": [
+      "--reason",
+      "owl2-dl",
+      "--commits",
+      "{data}.commits.ru",
+      "--readers",
+      "8"
+    ],
+    "declared_repeat": "existing default1; no override",
+    "declared_warmup": "literal --warmup flag if present; absent remains absent",
+    "source": "declarations.json lock_tail_variants"
+  },
+  {
+    "name": "n1-lock-lks-dlmode-readers-read-p50",
+    "origin": "lks-dlmode-readers",
+    "original_name": "n1-lock-lks-dlmode-readers-read-p50",
+    "metric": "commits.read_p50_ms",
+    "tail": true,
+    "partition": "reference372",
+    "preserved_fields": [
+      "area",
+      "what",
+      "semantics",
+      "data",
+      "args",
+      "queries",
+      "metric",
+      "check",
+      "route",
+      "cap_gb",
+      "systems",
+      "dimensions"
+    ],
+    "declared_args": [
+      "--reason",
+      "owl2-dl",
+      "--commits",
+      "{data}.commits.ru",
+      "--readers",
+      "8"
+    ],
+    "declared_repeat": "existing default1; no override",
+    "declared_warmup": "literal --warmup flag if present; absent remains absent",
+    "source": "declarations.json lock_tail_variants"
+  },
+  {
+    "name": "n1-lock-lks-dlmode-readers-read-p99",
+    "origin": "lks-dlmode-readers",
+    "original_name": "n1-lock-lks-dlmode-readers-read-p99",
+    "metric": "commits.read_p99_ms",
+    "tail": true,
+    "partition": "reference372",
+    "preserved_fields": [
+      "area",
+      "what",
+      "semantics",
+      "data",
+      "args",
+      "queries",
+      "metric",
+      "check",
+      "route",
+      "cap_gb",
+      "systems",
+      "dimensions"
+    ],
+    "declared_args": [
+      "--reason",
+      "owl2-dl",
+      "--commits",
+      "{data}.commits.ru",
+      "--readers",
+      "8"
+    ],
+    "declared_repeat": "existing default1; no override",
+    "declared_warmup": "literal --warmup flag if present; absent remains absent",
+    "source": "declarations.json lock_tail_variants"
+  }
+]

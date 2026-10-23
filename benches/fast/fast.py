@@ -1335,6 +1335,12 @@ def samples(case: dict, result: dict) -> dict:
     section = metric.split(".")[0]
     # Repeated processes (`repeat`) pool their samples, as the queries' above.
     runs = result.get("_repeats", [result])
+    # Durable and commit/read declarations own one scalar per process, including
+    # empty raw streams. Other sections retain their existing raw-sample pooling.
+    if metric in ("durable.p50_ms", "durable.p90_ms", "durable.p99_ms",
+                  "commits.p50_ms", "commits.p99_ms",
+                  "commits.read_p50_ms", "commits.read_p99_ms"):
+        return {"_": [value for r in runs if (value := lookup(metric, r)) is not None]}
     if isinstance(result.get(section), dict) and "samples_ms" in result[section]:
         return {"_": [s for r in runs for s in (r.get(section) or {}).get("samples_ms", [])]}
     if "samples_ms" in result:

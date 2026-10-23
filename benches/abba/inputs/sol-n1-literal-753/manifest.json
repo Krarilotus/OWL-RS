@@ -1,0 +1,87 @@
+{
+  "status": "a0 identity-only normal composition from root-accepted twelve-path source; actual normal/native receipts pending",
+  "product_B": "a0edb6d9740499c0ac3a006d4d4e51f180889465",
+  "tree": "a7ee04b1287742fa94fabcff8b36c43a5c7d9c45",
+  "main": "f9b515e81f013ecd8c3811f3e9c65e91450ee44c",
+  "capable_DL_reference": "37263eb909e4a8a50b5f9298a53b29ec7534fff2",
+  "shared_profile": {
+    "path": "benches/fast/measure.toml",
+    "source": "a0edb6d9740499c0ac3a006d4d4e51f180889465",
+    "sha256": "3a9e298f4ae625bbae5a79d9182e655e40d9b8ffd79bf72e95fc0dd13811a0a1",
+    "blob": "0319fe603460835bd21e1a32d7388bcdbde2a3ee",
+    "unchanged": true,
+    "toml_table": "case",
+    "all_scoped_names_absent": [
+      "n1-commit-every-2000-p50",
+      "n1-commit-every-2000-p90",
+      "n1-commit-every-2000-p99",
+      "n1-commit-buffered-20000-p50",
+      "n1-commit-buffered-20000-p90",
+      "n1-commit-buffered-20000-p99",
+      "n1-checkpoint-2000000-p50",
+      "n1-open-256-100-p50",
+      "n1-load-2000000-p50",
+      "n1-load-spill-2000000-p50",
+      "n1-lock-rl-sameas",
+      "n1-lock-rl-lubm100",
+      "n1-lock-commits-rdfs",
+      "n1-lock-commits-readers",
+      "n1-lock-lks-durable-lubm100",
+      "n1-lock-commits-rdfs-p99",
+      "n1-lock-commits-readers-p99",
+      "n1-lock-commits-readers-read-p50",
+      "n1-lock-commits-readers-read-p99",
+      "n1-lock-dlmode-lubm1",
+      "n1-lock-lks-dlmode-readers",
+      "n1-lock-lks-dlmode-readers-p99",
+      "n1-lock-lks-dlmode-readers-read-p50",
+      "n1-lock-lks-dlmode-readers-read-p99"
+    ],
+    "H_and_execution_requirement": "same SHA and absent names; mismatch refuses until reconciled"
+  },
+  "GATE_BATCH": "0",
+  "families": [
+    {
+      "path": "benches/abba/n1-durable-753.toml",
+      "sha256": "61fcc4f9c8632955a1ae1254dce5dceaeedf8bfd293bc51a8f19242a381013e8",
+      "cases": 10,
+      "declared_dimension_entries": 20,
+      "declared_processes_per_six_pass_block": 60,
+      "case_metadata_roundtrip": "exact; not canonical schema/execution",
+      "original_literal845_sha256": "31fd1fe88198f4091f0246085452e7b685bfd163c20486b44b4db09d6739fa93"
+    },
+    {
+      "path": "benches/abba/n1-main-753.toml",
+      "sha256": "34134d20b80407e0b899db007d4afb46adf2a163d4edc4b788962d122b7bd9d5",
+      "cases": 9,
+      "declared_dimension_entries": 18,
+      "declared_processes_per_six_pass_block": 54,
+      "case_metadata_roundtrip": "exact; not canonical schema/execution",
+      "original_literal845_sha256": "35de90e557662002024f623ec14a7bea9e4f1811d6a7ddd7e2c6ffe4d6de9881"
+    },
+    {
+      "path": "benches/abba/n1-reference372-753.toml",
+      "sha256": "3b8f8673d0548fb62134cb0a64145c39054e75628311159b30bb58ab30ec773a",
+      "cases": 5,
+      "declared_dimension_entries": 23,
+      "declared_processes_per_six_pass_block": 60,
+      "case_metadata_roundtrip": "exact; not canonical schema/execution",
+      "original_literal845_sha256": "582b4365959e67af33614472baa18053d0d0e8a0644abb26cb39d02b1770a492"
+    }
+  ],
+  "origin_map_sha256": "864fd6f866e65d4aff43d14f56550a3b01436e883418fc821238cdd81e953860",
+  "source_declarations_sha256": "9e77af0d33e15df369e4df7ecbf47adcbd9c8bbb15231915af14618ee73fc1b9",
+  "formatter_reused": {
+    "path": "benches/suite/suitekit/ledger.py",
+    "sha256": "f1d140966b0e97c31d4e501afd306318226ae2aaa804127986dfd515cfbf5f0b",
+    "function": "toml_value"
+  },
+  "total_declared_dimensions": 61,
+  "total_declared_processes_per_six_pass_block": 174,
+  "statistics": "existing official per-family procedure only; no new pooling/campaign/gate waiver",
+  "actual_execution": "none; native argv/effective runs/warmup/repeat/batch/query/check/route/caps must later match declarations",
+  "corrected_preparation_identity": "Retained reviewed twelve path names. Only family header names and sides.b pins retarget753 to actual producta0; all case bodies/origins/profile are byte-identical. No native alias.",
+  "whole_s": "root N1H-R1-2 composition preserves current72f expected[9000.0]; no old full-file overwrite here",
+  "coverage_rows": "retain OLD coverage-obligations.json unknown-transition/feed/copy; no extra rows/jobs now",
+  "tests": "none written/changed; spec/red N/A metadata only; tomllib packaging not execution"
+}

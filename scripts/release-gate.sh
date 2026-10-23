@@ -130,6 +130,14 @@ build)
   # is part of the build's identity, build_identity).
   lab=$src/crates/nrese-store/examples/perf_lab/main.rs
   [ -f "$lab" ] || lab=$src/crates/nrese-store/examples/perf_lab.rs
+  # Private N1 measurement recipe; the peer owns the two source-directory callsites.
+  n1=absent
+  if [ -f "$GATE_PATCHES/perf_lab_n1.py" ]; then
+    n1=$(py "$GATE_PATCHES/perf_lab_n1.py" "$lab") || {
+      log "N1 measurement patch refused $rev: $n1"; exit 2;
+    }
+    case $n1 in applied|present) ;; *) log "N1 measurement patch refused $rev: $n1"; exit 2 ;; esac
+  fi
   patched=$(py "$GATE_PATCHES/perf_lab_watchdog.py" "$lab")
   case $patched in applied|present) timing=watchdog ;; *) timing=spawn ;; esac
   observed=$(py "$GATE_PATCHES/perf_lab_reporting.py" "$lab") || {
@@ -164,6 +172,7 @@ build)
   printf 'routes=%s\nempty_queries=%s\nbatch=%s\ntiming=%s\n' "$routes" "$empty" "$batch" "$timing" > "$part/CAPABILITIES"
   echo "$rev" > "$part/REVISION"
   { echo "revision $rev"; (cd "$src" && rustc -V); echo "missing at this revision: ${missing[*]:-none}";
+    echo "measurement patch perf_lab_n1: $n1";
     echo "measurement patch perf_lab_watchdog: $patched";
     echo "measurement patch perf_lab_reporting: $observed";
     cat "$part/CAPABILITIES"; } > "$part/BUILD.txt"
