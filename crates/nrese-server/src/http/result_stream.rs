@@ -38,6 +38,7 @@ use nrese_store::CancellationToken;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use super::cancellable::CancelOnDrop;
 use crate::error::ApiError;
 
 const CHUNK_BYTES: usize = 64 * 1024;
@@ -202,17 +203,6 @@ impl io::Write for ChannelWriter {
     }
 }
 
-/// Cancels the token when dropped, i.e. when the response body is dropped: at the end of
-/// the stream (harmless) or when the client disconnects; and stops the deadline's timer.
-struct CancelOnDrop(CancellationToken, tokio::task::AbortHandle);
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        self.0.cancel();
-        self.1.abort();
-    }
-}
-
 /// Runs `produce` on a blocking thread and streams what it writes as the response body,
 /// within `pace`. `produce` must honour `cancellation`.
 pub async fn stream_blocking(
@@ -257,7 +247,7 @@ pub async fn stream_blocking(
     })
     .abort_handle();
 
-    let guard = CancelOnDrop(cancellation, watchdog);
+    let guard = CancelOnDrop(cancellation, Some(watchdog));
     let first = match tokio::time::timeout_at(deadline, receiver.recv()).await {
         Err(_elapsed) => return Err(ApiError::timeout(timeout_message)), // guard cancels
         Ok(Some(frame)) => Some(frame),

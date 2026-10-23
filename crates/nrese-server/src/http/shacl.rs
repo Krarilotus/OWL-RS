@@ -6,8 +6,9 @@ use axum::body::Bytes;
 use axum::extract::RawQuery;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use nrese_exec::{ChargedVec, Reservation};
 use nrese_store::{
-    GraphResultFormat, ReadModel, ShaclValidation, ShaclValidationRequest, ShapesSource,
+    CancellationToken, GraphResultFormat, ReadModel, ShaclValidationRequest, ShapesSource,
     ValidatedGraphs,
 };
 
@@ -110,34 +111,35 @@ pub async fn validate(
     }
 
     let store = state.store();
-    let validation = tokio::time::timeout(
-        state.policy().timeouts.query,
-        tokio::task::spawn_blocking(move || store.validate_shacl(&scope, &request)),
-    )
-    .await
-    .map_err(|_| ApiError::timeout("validation exceeded policy timeout"))?
-    .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| {
-        if error.is_request_error() {
-            ApiError::bad_request(error.to_string())
-        } else {
-            ApiError::internal(error.to_string())
-        }
-    })?;
-
-    let (media_type, body) = match format {
-        ReportFormat::Json => (
-            "application/json",
-            serde_json::to_vec(&report_json(&validation))
-                .map_err(|error| ApiError::internal(error.to_string()))?,
-        ),
-        ReportFormat::Rdf(format) => (
-            format.media_type(),
-            validation
-                .serialize(format)
-                .map_err(|error| ApiError::internal(error.to_string()))?,
-        ),
-    };
+    let cancellation = CancellationToken::new();
+    let token = cancellation.clone();
+    let (media_type, body) =
+        super::cancellable::blocking(state.policy().timeouts.query, cancellation, move || {
+            let validation = store
+                .validate_shacl(&scope, &request, &token)
+                .map_err(|error| {
+                    if error.is_request_error() {
+                        ApiError::bad_request(error.to_string())
+                    } else {
+                        ApiError::internal(error.to_string())
+                    }
+                })?;
+            // Encoding is part of the same cancellable worker, not async runtime work.
+            match format {
+                ReportFormat::Json => validation
+                    .serialize_json()
+                    .and_then(report_bytes)
+                    .map(|body| ("application/json", body)),
+                // RDF serializer-internal admission remains its owner's separate slice.
+                ReportFormat::Rdf(format) => validation
+                    .serialize(format)
+                    .map(|body| (format.media_type(), Bytes::from(body))),
+            }
+            .map_err(|error| ApiError::internal(error.to_string()))
+        })
+        .await
+        .map_err(|_| ApiError::timeout("validation exceeded policy timeout"))?
+        .map_err(|error| ApiError::internal(error.to_string()))??;
     let mut response = (StatusCode::OK, body).into_response();
     response
         .headers_mut()
@@ -145,32 +147,36 @@ pub async fn validate(
     Ok(response)
 }
 
-/// The JSON report: `conforms`, what was validated, one object per result with SHACL's
-/// property names, and the failures (SPARQL-based constraints that couldn't be
-/// evaluated; `conforms` is then false).
-fn report_json(validation: &ShaclValidation) -> serde_json::Value {
-    let results: Vec<serde_json::Value> = validation
-        .results_text()
-        .into_iter()
-        .map(|result| {
-            serde_json::json!({
-                "focusNode": result.focus_node,
-                "resultPath": result.path,
-                "value": result.value,
-                "sourceShape": result.source_shape,
-                "sourceConstraintComponent": result.component,
-                "resultSeverity": result.severity,
-                "resultMessage": result.messages,
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "conforms": validation.report.conforms(),
-        "revision": validation.revision,
-        "shapes": validation.shapes,
-        "results": results,
-        "failures": validation.report.failures(),
-    })
+// Bytes owns this backing, including its lease, through every slice/clone/frame. A
+// response extension would release the lease before detached body data is consumed.
+struct ReportBytes {
+    bytes: Vec<u8>,
+    _payload: Reservation,
+    _backing: Reservation,
+}
+
+impl AsRef<[u8]> for ReportBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+fn report_bytes(bytes: ChargedVec<u8>) -> nrese_store::StoreResult<Bytes> {
+    let (bytes, payload) = bytes.into_parts();
+    let backing = Reservation::new(payload.handle().clone());
+    // Keep the payload and its lease together on header-admission refusal too.
+    let mut owner = ReportBytes {
+        bytes,
+        _payload: payload,
+        _backing: backing,
+    };
+    // Pinned bytes 1.11.1 uses repr(C) Owned<T> { AtomicUsize, owner: T }.
+    // Admit its one backing allocation before Bytes::from_owner allocates it.
+    let (layout, _) = std::alloc::Layout::new::<std::sync::atomic::AtomicUsize>()
+        .extend(std::alloc::Layout::new::<ReportBytes>())
+        .expect("fixed report backing layout");
+    owner._backing.charge(layout.pad_to_align().size())?;
+    Ok(Bytes::from_owner(owner))
 }
 
 #[cfg(test)]
@@ -178,6 +184,51 @@ mod tests {
     use nrese_store::{ReadModel, ShapesSource, ValidatedGraphs};
 
     use super::request_from;
+
+    /// The output lease follows detached frames and slices; a failed backing admission
+    /// frees the original payload before releasing its charge.
+    #[tokio::test]
+    async fn report_body_holds_its_bytes_until_the_last_slice_drops() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use nrese_exec::{
+            Budget, ChargedVec, Envelope,
+            measure::{alone, measure_within},
+        };
+
+        if !alone() {
+            return;
+        }
+        let memory = Envelope::new(Some(1024), None);
+        let mut bytes = ChargedVec::new(std::sync::Arc::new(memory.part()));
+        bytes.extend_from_slice(b"report").unwrap();
+        let mut body = Body::from(super::report_bytes(bytes).unwrap());
+        assert!(memory.used() >= 6);
+        let data = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        drop(body);
+        assert!(memory.used() >= 6, "a detached frame still owns its bytes");
+        let slice = data.slice(1..);
+        let copy = slice.clone();
+        drop(data);
+        drop(slice);
+        assert_eq!(&copy[..], b"eport");
+        assert!(memory.used() >= 6, "the last slice still owns the backing");
+        drop(copy);
+        assert_eq!(memory.used(), 0);
+
+        let budget = std::sync::Arc::new(Budget::new(6));
+        let (error, uncovered) = measure_within(&budget, || {
+            let mut bytes = ChargedVec::new(std::sync::Arc::clone(&budget));
+            bytes.extend_from_slice(b"report").unwrap();
+            super::report_bytes(bytes).unwrap_err()
+        });
+        assert!(error.is_memory_limit());
+        assert_eq!(budget.used(), 0, "partial output was freed after refusal");
+        assert_eq!(
+            uncovered, 0,
+            "refusal must free the payload before releasing its reservation"
+        );
+    }
 
     #[test]
     fn parameters_select_what_is_validated() {
