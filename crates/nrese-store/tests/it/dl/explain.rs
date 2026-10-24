@@ -21,6 +21,97 @@ fn named(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("{EX}{local}"))
 }
 
+/// Spec: selected v1.5 operation contract, 23 October: B <= D, C <= D,
+/// w : (B or C) entails w : D by cases; a spent *initial* explanation test
+/// is unknown, whereas an unspent countermodel establishes non-entailment.
+#[test]
+fn an_initial_dl_stop_is_unknown_through_the_store_operation() {
+    use nrese_store::dl::explain::DlExplanationOutcome;
+    for (tests, expected) in [(Some(0), "unknown"), (None, "entailed")] {
+        let dl = super::pipeline_with(nrese_store::DlConfig {
+            explanation_tests: tests,
+            ..nrese_store::DlConfig::default()
+        });
+        insert(&dl, DATA).expect("consistent hand-worked union ontology");
+        let (w, d) = (named("w"), named("D"));
+        let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+        let outcome = dl
+            .store()
+            .explain_dl_outcome(
+                &ReadScope::All,
+                [
+                    w.as_ref().into(),
+                    rdf_type.as_ref().into(),
+                    d.as_ref().into(),
+                ],
+            )
+            .unwrap();
+        match (expected, outcome) {
+            ("unknown", DlExplanationOutcome::Unknown(why)) => {
+                assert!(why.contains("explanation_tests"), "{why}")
+            }
+            ("entailed", DlExplanationOutcome::Explained(proof)) => {
+                assert!(proof.minimal && proof.verified);
+                assert_eq!(proof.axioms.len(), 3);
+            }
+            (_, other) => panic!("{expected}, got {other:?}"),
+        }
+        if tests.is_none() {
+            // Model: choose w in C and outside E; the B <= E axiom does not apply.
+            let e = named("E");
+            assert!(matches!(
+                dl.store()
+                    .explain_dl_outcome(
+                        &ReadScope::All,
+                        [
+                            w.as_ref().into(),
+                            rdf_type.as_ref().into(),
+                            e.as_ref().into(),
+                        ]
+                    )
+                    .unwrap(),
+                DlExplanationOutcome::DoesNotHold
+            ));
+
+            // Spec: the selected truthful-outcome contract requires an actual
+            // countermodel before DoesNotHold. A restricted input and a missing term
+            // are incapable inputs, not negative entailment results. A fresh subject
+            // is nevertheless an owl:Thing in OWL semantics (independent tautology).
+            // RED against the former outcome branches / GREEN: UNRUN.
+            let restricted = ReadScope::Graphs(Arc::new(GraphAccess {
+                default_graph: true,
+                inferred: true,
+                ..GraphAccess::default()
+            }));
+            let fresh = named("not-in-the-dictionary");
+            let thing = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#Thing");
+            let mut reasons = Vec::new();
+            for (scope, subject, object) in
+                [(&restricted, &w, &d), (&ReadScope::All, &fresh, &thing)]
+            {
+                let statement = [
+                    subject.as_ref().into(),
+                    rdf_type.as_ref().into(),
+                    object.as_ref().into(),
+                ];
+                match dl.store().explain_dl_outcome(scope, statement).unwrap() {
+                    DlExplanationOutcome::Unknown(why) => reasons.push(why),
+                    other => panic!("no negative entailment test ran: {other:?}"),
+                }
+                assert!(
+                    dl.store().explain_dl(scope, statement).is_none(),
+                    "legacy optional wrapper stays compatible"
+                );
+            }
+            assert_eq!(
+                reasons[0], reasons[1],
+                "incapable inputs use one generic reason"
+            );
+            assert!(!reasons[0].contains(EX), "no term or graph disclosure");
+        }
+    }
+}
+
 #[test]
 fn a_dl_answer_is_explained_by_a_minimal_set_of_axioms() {
     let dl = pipeline();
