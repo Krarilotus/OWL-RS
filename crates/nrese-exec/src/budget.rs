@@ -744,7 +744,7 @@ impl<T, B: Deref<Target = Budget>> ChargedVec<T, B> {
         fill: impl FnOnce(&mut Room<'_, T>) -> R,
     ) -> Result<R, BudgetExceeded> {
         self.reserve(bound)?;
-        Ok(fill(&mut Room(&mut self.items)))
+        Ok(fill(&mut Room(&mut self.items, self.held.budget())))
     }
 
     pub fn truncate(&mut self, len: usize) {
@@ -814,7 +814,7 @@ pub type Scratch<'b, T> = ChargedVec<T, &'b Budget>;
 /// The room a [`ChargedVec`] lends a writer ([`ChargedVec::fill`]): items are added within
 /// the capacity reserved, which it never grows.
 #[derive(Debug)]
-pub struct Room<'v, T>(&'v mut Vec<T>);
+pub struct Room<'v, T>(&'v mut Vec<T>, &'v Budget);
 
 impl<T> Room<'_, T> {
     pub fn len(&self) -> usize {
@@ -900,8 +900,10 @@ impl<T> Room<'_, T> {
     /// joined before it returns; on an error every item written is dropped once, the room
     /// holds what it held, and the error of the lowest index observed is returned (workers
     /// stopped early may skip lower items, so it needn't be the one a sequential fill would
-    /// meet first). A panic is handled as in [`Self::par_fill`].
-    pub fn try_par_fill<E: Send>(
+    /// meet first). A panic is handled as in [`Self::par_fill`]. Scratch headers draw on
+    /// the destination's exact budget, admitted before allocation or dispatch. A refusal
+    /// is converted to `E` before any item runs.
+    pub fn try_par_fill<E: Send + From<BudgetExceeded>>(
         &mut self,
         n: usize,
         item: impl Fn(usize) -> Result<T, E> + Sync,
@@ -909,62 +911,7 @@ impl<T> Room<'_, T> {
     where
         T: Send,
     {
-        use rayon::prelude::*;
-        let len = self.0.len();
-        assert!(n <= self.0.capacity() - len, "past the room reserved");
-        // As in `par_fill`: the only pointer to the slots until the length is published.
-        let slots = Slots(self.0.as_mut_ptr().wrapping_add(len));
-        let part = n.div_ceil(4 * rayon::current_num_threads()).max(1);
-        let failed = AtomicBool::new(false);
-        // One token per range, with the range's error: ranges stopped early aren't adjacent,
-        // so the tokens are kept apart, at most a few per worker.
-        let ranges: Vec<FillRange<T, E>> = (0..n.div_ceil(part))
-            .into_par_iter()
-            .map(|p| {
-                let mut written = Written::new(slots, p * part);
-                for i in p * part..(p * part + part).min(n) {
-                    if failed.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    match item(i) {
-                        Ok(value) => {
-                            // SAFETY: (`Slots`) slot `i` is this range's, and not yet written.
-                            unsafe { slots.0.add(i).write(value) };
-                            written.len += 1;
-                        }
-                        Err(error) => {
-                            failed.store(true, Ordering::Relaxed);
-                            return (written, Some((i, error)));
-                        }
-                    }
-                }
-                (written, None)
-            })
-            .collect();
-        let mut first: Option<(usize, E)> = None;
-        let mut complete = Vec::with_capacity(ranges.len());
-        for (written, error) in ranges {
-            complete.push(written);
-            if let Some((i, error)) = error
-                && first.as_ref().is_none_or(|(at, _)| i < *at)
-            {
-                first = Some((i, error));
-            }
-        }
-        if let Some((_, error)) = first {
-            // Dropping the tokens drops what each range wrote, once.
-            drop(complete);
-            return Err(error);
-        }
-        // No error, so no range stopped: one range of every item, in order.
-        let written = complete
-            .into_iter()
-            .fold(Written::new(slots, 0), Written::join);
-        assert_eq!((written.start, written.len), (0, n), "every slot written");
-        std::mem::forget(written);
-        // SAFETY: the `n` slots after the items are written, within the capacity.
-        unsafe { self.0.set_len(len + n) };
-        Ok(())
+        parallel::try_fill(self, n, item)
     }
 }
 
@@ -1101,6 +1048,7 @@ impl<B: Deref<Target = Budget>> Gauge<B> {
 
 #[cfg(test)]
 mod tests {
+    use super::fill_tests::FillError;
     use super::*;
 
     #[test]
@@ -1281,6 +1229,10 @@ mod tests {
     /// every item.
     #[test]
     fn a_failing_parallel_fill_stops_and_drops_every_item_it_wrote() {
+        if !crate::measure::alone() {
+            return;
+        }
+        super::fill_tests::header_admission_and_lifetimes();
         static MADE: AtomicUsize = AtomicUsize::new(0);
         static DROPPED: AtomicUsize = AtomicUsize::new(0);
         struct Item<'b>(#[allow(dead_code)] ChargedVec<u8, &'b Budget>);
@@ -1292,7 +1244,7 @@ mod tests {
         let budget = Budget::unlimited();
         let item = |i: usize, fails: &[usize]| {
             if fails.contains(&i) {
-                return Err(i);
+                return Err(FillError::Item(i));
             }
             MADE.fetch_add(1, Ordering::SeqCst);
             Ok(Item(ChargedVec::with_capacity(&budget, 100).unwrap()))
@@ -1312,7 +1264,7 @@ mod tests {
             (filled, items.len())
         };
         // One thread: the ranges in order, so the failure at 60 stops everything after it.
-        assert_eq!(fill(1, &[60, 80]), (Err(60), 1));
+        assert_eq!(fill(1, &[60, 80]), (Err(FillError::Item(60)), 1));
         assert_eq!(MADE.load(Ordering::SeqCst), 60);
         assert_eq!(
             DROPPED.load(Ordering::SeqCst),
@@ -1323,7 +1275,10 @@ mod tests {
         // every item made is dropped once.
         let made = MADE.load(Ordering::SeqCst);
         let (filled, len) = fill(4, &[30, 70]);
-        assert!(matches!(filled, Err(30 | 70)), "{filled:?}");
+        assert!(
+            matches!(filled, Err(FillError::Item(30 | 70))),
+            "{filled:?}"
+        );
         assert_eq!(len, 1);
         assert_eq!(
             DROPPED.load(Ordering::SeqCst) - 61,
@@ -1374,7 +1329,7 @@ mod tests {
                     room.try_par_fill(8, |i| match i {
                         2 | 6 => {
                             meet();
-                            Err(i)
+                            Err(FillError::Item(i))
                         }
                         _ => made(),
                     })
@@ -1382,7 +1337,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(started.load(Ordering::SeqCst), 2, "both failures observed");
-        assert_eq!(filled, Err(2), "the lower of the two");
+        assert_eq!(filled, Err(FillError::Item(2)), "the lower of the two");
         assert_eq!(items.len(), 1);
         assert_eq!(DROPPED.load(Ordering::SeqCst), MADE.load(Ordering::SeqCst));
         assert_eq!(budget.used(), items.charged(), "the items' memory released");
@@ -1398,7 +1353,7 @@ mod tests {
                         }
                         6 => {
                             meet();
-                            Err(i)
+                            Err(FillError::Item(i))
                         }
                         _ => made(),
                     })
@@ -1614,3 +1569,10 @@ mod tests {
         assert_eq!(request.used(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "budget/fill_tests.rs"]
+mod fill_tests;
+
+#[path = "budget/parallel.rs"]
+mod parallel;
