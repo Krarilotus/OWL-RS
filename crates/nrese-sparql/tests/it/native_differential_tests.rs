@@ -4421,6 +4421,543 @@ fn joins_over_graph_sets_by_probes_and_by_scans_equal_the_reference() {
     );
 }
 
+/// Spec: SPARQL1.1 §18.6 and the24Oct SHACL-owner contract: a few stored outer
+/// bindings keep their literal/reference bag and scope under EXISTS without retaining
+/// the full unrelated inner predicate relation. Its16384 two-column rows alone need
+/// 262144 bytes, exceeding this guard's predeclared128KiB query budget. The five-row
+/// outer relation and one charged boolean mask do not grow with that fanout. This
+/// scaled guard does not change SHACL's retained40MiB budget or required full report.
+#[test]
+fn selective_merged_exists_preserves_scoped_bags_without_inner_materialization() {
+    use nrese_exec::{Envelope, SharedBudget};
+    use nrese_sparql::{
+        CancellationToken, QueryDatasetSpecification, QueryEvaluationError, Resources,
+    };
+    use std::sync::Arc;
+
+    let node = |name: &str| NamedNode::new_unchecked(format!("urn:{name}"));
+    let engine = Engine::new(EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let data = GraphName::from(node("data"));
+    let shapes = GraphName::from(node("shapes"));
+    let mut tx = engine.transaction();
+    for i in 0..16384 {
+        tx.insert(
+            Quad::new(
+                node(&format!("student:{i}")),
+                node("takes"),
+                node("hit"),
+                data.clone(),
+            )
+            .as_ref(),
+        );
+    }
+    for (s, p, o, graph) in [
+        ("student:0", "takes", "hit", GraphName::DefaultGraph),
+        (
+            "defaultStudent",
+            "takes",
+            "default",
+            GraphName::DefaultGraph,
+        ),
+        ("shapesStudent", "takes", "shape", shapes.clone()),
+        ("catalog", "known", "miss", data.clone()),
+        ("loopNode", "loop", "loopNode", data.clone()),
+        ("a", "wrong", "b", data.clone()),
+        ("c", "wrong", "c", shapes.clone()),
+    ] {
+        tx.insert(Quad::new(node(s), node(p), node(o), graph).as_ref());
+    }
+    tx.insert(
+        Quad::new(
+            node("catalog"),
+            node("label"),
+            Literal::new_simple_literal("needle"),
+            data.clone(),
+        )
+        .as_ref(),
+    );
+    let bds = NamedNode::new_unchecked("http://www.bigdata.com/rdf/search#search");
+    tx.insert(
+        Quad::new(
+            node("catalog"),
+            bds,
+            Literal::new_simple_literal("other"),
+            data.clone(),
+        )
+        .as_ref(),
+    );
+    let inferred = EncodedTriple {
+        subject: tx.intern(node("inferredStudent").as_ref().into()),
+        predicate: tx.intern(node("takes").as_ref().into()),
+        object: tx.intern(node("inferred").as_ref().into()),
+    };
+    tx.insert_inferred(inferred);
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let mut excluded = QueryDatasetSpecification::new();
+    excluded.set_default_graph_excluding(vec![shapes.clone()]);
+    let mut included = QueryDatasetSpecification::new();
+    included.set_default_graph(vec![GraphName::DefaultGraph, data.clone()]);
+    let outer = "VALUES ?course { <urn:hit> <urn:miss> <urn:hit> <urn:shape> <urn:default> }";
+    let exists = format!(
+        "SELECT ?course WHERE {{ {outer} FILTER EXISTS {{ ?student <urn:takes> ?course }} }}"
+    );
+    let not_exists = format!(
+        "SELECT ?course WHERE {{ {outer} FILTER NOT EXISTS {{ ?student <urn:takes> ?course }} }}"
+    );
+    let boolean = format!(
+        "SELECT ?course WHERE {{ {outer} BIND(EXISTS {{ ?student <urn:takes> ?course }} AS ?yes) FILTER(?yes) }}"
+    );
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        (&exists, vec!["<urn:default>", "<urn:hit>", "<urn:hit>"]),
+        (&not_exists, vec!["<urn:miss>", "<urn:shape>"]),
+        (&boolean, vec!["<urn:default>", "<urn:hit>", "<urn:hit>"]),
+        (
+            "SELECT ?course WHERE { VALUES (?student ?course) { (<urn:student:0> <urn:hit>) (<urn:student:0> <urn:miss>) (<urn:student:0> <urn:hit>) } FILTER EXISTS { ?student <urn:takes> ?course } }",
+            vec!["<urn:hit>", "<urn:hit>"],
+        ),
+        (
+            "SELECT ?course WHERE { VALUES ?course { <urn:loop> <urn:wrong> <urn:loop> } FILTER EXISTS { ?x ?course ?x } }",
+            vec!["<urn:loop>", "<urn:loop>"],
+        ),
+        (
+            "SELECT ?x WHERE { VALUES ?x { <urn:loopNode> <urn:a> } FILTER EXISTS { ?x <urn:loop> ?x } }",
+            vec!["<urn:loopNode>"],
+        ),
+        (
+            "SELECT ?course WHERE { VALUES ?course { UNDEF <urn:hit> } FILTER EXISTS { ?s <urn:takes> ?course } }",
+            vec!["<urn:hit>", "UNDEF"],
+        ),
+        (
+            "SELECT ?course WHERE { BIND(IRI('urn:computed-only') AS ?course) FILTER EXISTS { ?s <urn:takes> ?course } }",
+            vec![],
+        ),
+        (
+            "SELECT ?course WHERE { VALUES (?course ?wanted) { (<urn:hit> <urn:hit>) (<urn:miss> <urn:hit>) } FILTER EXISTS { ?s <urn:takes> ?course FILTER(?course = ?wanted) } }",
+            vec!["<urn:hit>"],
+        ),
+        (
+            "SELECT ?g WHERE { GRAPH ?g { VALUES ?course { <urn:shape> } FILTER EXISTS { ?s <urn:takes> ?course } } }",
+            vec!["<urn:shapes>"],
+        ),
+        (
+            "SELECT ?course WHERE { VALUES ?course { } FILTER EXISTS { ?s <urn:takes> ?course } }",
+            vec![],
+        ),
+        (
+            "SELECT ?course WHERE { VALUES ?course { <urn:hit> } FILTER EXISTS { ?s <urn:unknownPredicate> ?course } }",
+            vec![],
+        ),
+    ];
+    // Same meaningful answer table on the chooser and its two existing forced modes;
+    // fallbacks remain observable without asserting that any internal helper ran.
+    for dataset in [&excluded, &included] {
+        for index_joins in [None, Some(false), Some(true)] {
+            let options = QueryOptions {
+                dataset: Some(dataset.clone()),
+                index_joins,
+                ..Default::default()
+            };
+            for (text, literal) in &cases {
+                let query = SparqlParser::new().parse_query(text).unwrap();
+                let oracle = rows(reference(&snapshot, &query, &options).unwrap(), false);
+                let literal: Vec<_> = literal.iter().map(|s| s.to_string()).collect();
+                assert_eq!(
+                    oracle, literal,
+                    "independent literal/reference oracle: {text}"
+                );
+                let actual = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+                assert_eq!(actual, literal, "{index_joins:?}: {text}");
+            }
+            let ordered = SparqlParser::new()
+                .parse_query(&format!("{exists} ORDER BY DESC(?course)"))
+                .unwrap();
+            let expected = vec![
+                "<urn:hit>".to_owned(),
+                "<urn:hit>".to_owned(),
+                "<urn:default>".to_owned(),
+            ];
+            assert_eq!(
+                rows(reference(&snapshot, &ordered, &options).unwrap(), true),
+                expected
+            );
+            assert_eq!(
+                rows(evaluate_query(&snapshot, &ordered, &options).unwrap(), true),
+                expected
+            );
+        }
+    }
+    for read_model in [
+        ReadModel::Asserted,
+        ReadModel::Materialised,
+        ReadModel::Inferred,
+    ] {
+        let query = SparqlParser::new().parse_query("SELECT ?course WHERE { VALUES ?course { <urn:inferred> } FILTER EXISTS { ?s <urn:takes> ?course } }").unwrap();
+        let options = QueryOptions {
+            dataset: Some(excluded.clone()),
+            read_model,
+            index_joins: Some(true),
+            ..Default::default()
+        };
+        let expected = if read_model == ReadModel::Asserted {
+            vec![]
+        } else {
+            vec!["<urn:inferred>".to_owned()]
+        };
+        assert_eq!(
+            rows(reference(&snapshot, &query, &options).unwrap(), false),
+            expected
+        );
+        assert_eq!(
+            rows(evaluate_query(&snapshot, &query, &options).unwrap(), false),
+            expected
+        );
+    }
+    // Default and one named graph retain their existing routes, as does as_written.
+    for (dataset, literal) in [
+        (None, vec!["<urn:default>", "<urn:hit>", "<urn:hit>"]),
+        (
+            Some({
+                let mut only = QueryDatasetSpecification::new();
+                only.set_default_graph(vec![data]);
+                only
+            }),
+            vec!["<urn:hit>", "<urn:hit>"],
+        ),
+    ] {
+        for as_written in [false, true] {
+            let options = QueryOptions {
+                dataset: dataset.clone(),
+                as_written,
+                ..Default::default()
+            };
+            let query = SparqlParser::new().parse_query(&exists).unwrap();
+            let expected: Vec<_> = literal.iter().map(|s| s.to_string()).collect();
+            assert_eq!(
+                rows(evaluate_query(&snapshot, &query, &options).unwrap(), false),
+                expected
+            );
+            assert_eq!(
+                rows(reference(&snapshot, &query, &options).unwrap(), false),
+                expected
+            );
+        }
+    }
+    // A virtual search has extension semantics, not an ordinary stored triple match.
+    let virtual_query = SparqlParser::new().parse_query("SELECT ?v WHERE { VALUES ?v { 'needle' } FILTER EXISTS { ?v <http://www.bigdata.com/rdf/search#search> 'needle' } }").unwrap();
+    let options = QueryOptions {
+        dataset: Some(excluded.clone()),
+        index_joins: Some(true),
+        ..Default::default()
+    };
+    assert_eq!(
+        rows(
+            evaluate_query(&snapshot, &virtual_query, &options).unwrap(),
+            false
+        ),
+        vec!["\"needle\"".to_owned()]
+    );
+    let query = SparqlParser::new().parse_query(&exists).unwrap();
+    let token = CancellationToken::new();
+    token.cancel();
+    let shared = SharedBudget::new(1 << 20);
+    let stopped = QueryOptions {
+        dataset: Some(excluded.clone()),
+        resources: Resources {
+            memory: Envelope::new(None, Some(shared.clone())),
+            cancellation: Some(token),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(matches!(
+        evaluate_query(&snapshot, &query, &stopped),
+        Err(QueryEvaluationError::Cancelled)
+    ));
+    assert_eq!(shared.used(), 0);
+    let refused = QueryOptions {
+        resources: Resources {
+            memory: Envelope::new(Some(1), None),
+            ..Default::default()
+        },
+        ..options.clone()
+    };
+    assert!(matches!(
+        evaluate_query(&snapshot, &query, &refused),
+        Err(QueryEvaluationError::MemoryLimit(_))
+    ));
+    // The positive equality fixture returns a complete literal answer at32KiB.
+    // A separate source-derived companion below forces a genuine reader refusal.
+    let equality = Engine::new(EngineConfig {
+        background_maintenance: false,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut tx = equality.transaction();
+    let rep = tx.intern(node("rep").as_ref().into());
+    let same_as = tx.intern(node("sameAs").as_ref().into());
+    for i in 1..1000 {
+        let alias = tx.intern(node(&format!("alias:{i}")).as_ref().into());
+        tx.insert_inferred(EncodedTriple {
+            subject: alias,
+            predicate: same_as,
+            object: rep,
+        });
+    }
+    tx.insert(
+        Quad::new(
+            node("rep"),
+            node("p"),
+            node("object"),
+            GraphName::DefaultGraph,
+        )
+        .as_ref(),
+    );
+    tx.commit().unwrap();
+    equality.set_equality(Some(same_as));
+    let expanded = SparqlParser::new().parse_query("SELECT ?object WHERE { VALUES ?object { <urn:object> } FILTER EXISTS { ?s <urn:p> ?object } }").unwrap();
+    let shared = SharedBudget::new(1 << 20);
+    let options = QueryOptions {
+        equality_early_expansion: true,
+        union_default_graph: true,
+        index_joins: Some(true),
+        resources: Resources {
+            memory: Envelope::new(Some(1 << 15), Some(shared.clone())),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // Spec:24Oct Astra disposition: this positive32KiB fixture must return the
+    // complete independent one-row literal, not reproduce an unlocated old-plan refusal.
+    let equality_snapshot = equality.snapshot();
+    let QueryResults::Solutions(mut complete) =
+        evaluate_query(&equality_snapshot, &expanded, &options).unwrap()
+    else {
+        panic!("equality positive fixture must return solutions");
+    };
+    let row = complete
+        .next()
+        .expect("the one literal solution")
+        .expect("no late error before the literal solution");
+    assert_eq!(row.get("object").unwrap().to_string(), "<urn:object>");
+    assert_eq!(row.len(), 1);
+    assert!(
+        complete.next().is_none(),
+        "exactly one solution and no late error"
+    );
+    drop(complete);
+    assert_eq!(shared.used(), 0);
+    eprintln!(
+        "EXISTS_EQUALITY_POSITIVE literal=<urn:object> multiplicity=1 exhausted=true limit=32768 final=0"
+    );
+
+    // Spec: an ACTUALLY INCURRED reader refusal must remain the same typed stop,
+    // even when the probe's iterator ends without yielding a match.
+    // Expand::pull -> room(copies) on an empty heap charges copies * size_of::<Key>()
+    // before allocation. Engine Key is [u64;4], so1025 copies need32800B, greater
+    // than this entire unchanged32768B budget, independent of other live charges.
+    const READ_LIMIT: usize = 1 << 15;
+    const READ_MEMBERS: usize = READ_LIMIT / std::mem::size_of::<[u64; 4]>() + 1;
+    const READ_REQUEST: usize = READ_MEMBERS * std::mem::size_of::<[u64; 4]>();
+    let mut tx = equality.transaction();
+    for i in 1000..READ_MEMBERS {
+        let alias = tx.intern(node(&format!("alias:{i}")).as_ref().into());
+        tx.insert_inferred(EncodedTriple {
+            subject: alias,
+            predicate: same_as,
+            object: rep,
+        });
+    }
+    tx.commit().unwrap();
+    let refused_snapshot = equality.snapshot();
+    assert_eq!(
+        refused_snapshot
+            .equality_classes()
+            .unwrap()
+            .class_of(rep)
+            .unwrap()
+            .len(),
+        READ_MEMBERS
+    );
+    let read_budget = Arc::new(nrese_exec::Budget::new(READ_LIMIT));
+    let reader = refused_snapshot
+        .reading_within(Arc::clone(&read_budget))
+        .unwrap();
+    let bound = nrese_engine::QuadPattern {
+        subject: None,
+        predicate: Some(reader.lookup(node("p").as_ref().into()).unwrap()),
+        object: Some(reader.lookup(node("object").as_ref().into()).unwrap()),
+        graph: nrese_engine::GraphSelector::Any,
+    };
+    let mut quads = reader
+        .scan_sorted_in(
+            ReadModel::Materialised,
+            &bound,
+            nrese_engine::quad::Permutation::Posg,
+        )
+        .expect("the bound predicate/object pattern uses POSG");
+    assert!(
+        quads.next().is_none(),
+        "incurred refusal gives no partial match"
+    );
+    drop(quads);
+    let owner_refusal = reader
+        .read_refused()
+        .expect("the reader actually refused its charge");
+    assert_eq!(owner_refusal.limit, READ_LIMIT);
+    assert_eq!(owner_refusal.requested, READ_REQUEST);
+    assert!(!owner_refusal.shared);
+    drop(reader);
+    assert_eq!(read_budget.used(), 0);
+    let shared_refusal = SharedBudget::new(1 << 20);
+    let refused_options = QueryOptions {
+        resources: Resources {
+            memory: Envelope::new(Some(READ_LIMIT), Some(shared_refusal.clone())),
+            ..Default::default()
+        },
+        ..options.clone()
+    };
+    let query_error = evaluate_query(&refused_snapshot, &expanded, &refused_options)
+        .expect_err("an incurred probe read refusal must not become false or partial success");
+    let QueryEvaluationError::MemoryLimit(query_refusal) = query_error else {
+        panic!("incurred probe read lost its typed resource stop: {query_error:?}");
+    };
+    assert_eq!(
+        (
+            query_refusal.limit,
+            query_refusal.requested,
+            query_refusal.shared
+        ),
+        (
+            owner_refusal.limit,
+            owner_refusal.requested,
+            owner_refusal.shared
+        )
+    );
+    assert_eq!(shared_refusal.used(), 0);
+    eprintln!(
+        "EXISTS_INCURRED_READ members={READ_MEMBERS} request={READ_REQUEST} limit={READ_LIMIT} owner={owner_refusal:?} query={query_refusal:?} final=0"
+    );
+    eprintln!(
+        "EXISTS_PROBE_CONTROLS_PASSED literal-reference=72 ordered=6 read-model=3 fallback=4 virtual=1 typed-stop=3"
+    );
+    // Keep the same full inner relation,131072B cap and five-row witness below.
+    // Selected B makes its probe strategy explicit; automatic multirow is tested
+    // separately against the prior materialization path at this same cap.
+    const LIMIT: usize = 128 * 1024;
+    const INNER_PAYLOAD: usize = 16384 * 2 * std::mem::size_of::<u64>();
+    // Spec: selected B limits automatic probes to one selective outer row;
+    // forcedtrue admits multiple rows, while forcedfalse/automatic multirow keep
+    // prior materialization. The unchanged131072B cap cannot hold even the inner
+    // relation's262144B payload. This observes strategy through real admission,
+    // with independent complete literal/reference bags, not a helper call counter.
+    let strategy_cases = [
+        (
+            "one",
+            "SELECT ?course WHERE { VALUES ?course { <urn:hit> } FILTER EXISTS { ?student <urn:takes> ?course } }",
+            vec!["<urn:hit>".to_owned()],
+            [true, true, false],
+        ),
+        (
+            "duplicate",
+            "SELECT ?course WHERE { VALUES ?course { <urn:hit> <urn:hit> } FILTER EXISTS { ?student <urn:takes> ?course } }",
+            vec!["<urn:hit>".to_owned(), "<urn:hit>".to_owned()],
+            [false, true, false],
+        ),
+        (
+            "multirow",
+            "SELECT ?course WHERE { VALUES ?course { <urn:hit> <urn:miss> } FILTER NOT EXISTS { ?student <urn:takes> ?course } }",
+            vec!["<urn:miss>".to_owned()],
+            [false, true, false],
+        ),
+    ];
+    for (name, text, literal, admissions) in strategy_cases {
+        let query = SparqlParser::new().parse_query(text).unwrap();
+        let oracle_options = QueryOptions {
+            dataset: Some(excluded.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            rows(
+                reference(&snapshot, &query, &oracle_options).unwrap(),
+                false
+            ),
+            literal
+        );
+        for (index_joins, expected_admission) in
+            [None, Some(true), Some(false)].into_iter().zip(admissions)
+        {
+            let shared = SharedBudget::new(1 << 20);
+            let options = QueryOptions {
+                dataset: Some(excluded.clone()),
+                index_joins,
+                resources: Resources {
+                    memory: Envelope::new(Some(LIMIT), Some(shared.clone())),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let admitted = match evaluate_query(&snapshot, &query, &options) {
+                Ok(answer) => {
+                    assert_eq!(
+                        rows(answer, false),
+                        literal,
+                        "{name}, {index_joins:?}: complete literal bag"
+                    );
+                    true
+                }
+                Err(QueryEvaluationError::MemoryLimit(refused)) => {
+                    assert_eq!(refused.limit, LIMIT);
+                    assert!(!refused.shared);
+                    false
+                }
+                Err(other) => {
+                    panic!("unexpected strategy outcome {name}, {index_joins:?}: {other:?}")
+                }
+            };
+            assert_eq!(shared.used(), 0);
+            assert_eq!(
+                admitted, expected_admission,
+                "EXISTS_SELECTOR_STRATEGY_BOUNDARY name={name} mode={index_joins:?}: automatic duplicate/multirow must retain prior evaluation"
+            );
+            eprintln!(
+                "EXISTS_SELECTOR_CASE name={name} mode={index_joins:?} admitted={admitted} final=0"
+            );
+        }
+    }
+    eprintln!(
+        "EXISTS_SELECTOR_GUARD cases=9 automatic-one=admitted automatic-duplicate=MemoryLimit automatic-multirow=MemoryLimit forced-true=admitted forced-false=MemoryLimit final=0"
+    );
+    let shared = SharedBudget::new(1 << 20);
+    let options = QueryOptions {
+        dataset: Some(excluded),
+        index_joins: Some(true),
+        resources: Resources {
+            memory: Envelope::new(Some(LIMIT), Some(Arc::clone(&shared))),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let query = SparqlParser::new().parse_query(&not_exists).unwrap();
+    let answer = evaluate_query(&snapshot, &query, &options).unwrap_or_else(|error| match error {
+        QueryEvaluationError::MemoryLimit(refused) => panic!("selective EXISTS must not materialize the full inner relation: original MemoryLimit: {refused}"),
+        other => panic!("unexpected selective EXISTS witness failure: {other}"),
+    });
+    assert_eq!(
+        rows(answer, false),
+        vec!["<urn:miss>".to_owned(), "<urn:shape>".to_owned()]
+    );
+    let peak = shared.peak();
+    assert_eq!(shared.used(), 0);
+    eprintln!(
+        "EXISTS_PROBE_GUARD outer=5 inner=16384 payload_min={INNER_PAYLOAD} limit={LIMIT} request_peak={peak} final=0 bag=2 controls=literal-reference-scope-repeats-fallback-stop"
+    );
+}
+
 /// An `EXISTS` for [`exists_equal_the_reference`]: over any pattern, correlated with the outer
 /// solution through the variables it binds, through filters at its top, or deeper (inside
 /// an OPTIONAL, MINUS or BIND, where the native executor hands the query back).
