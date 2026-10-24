@@ -21,6 +21,8 @@
 
 use std::collections::HashMap;
 
+mod probe;
+
 use crate::QueryEvaluationError;
 
 use nrese_rdf::{Literal, Term, Variable};
@@ -401,6 +403,22 @@ impl Context<'_> {
         } else {
             "anti join"
         };
+        if let Some(mut mask) = probe::try_mask(self, &solutions, pattern)? {
+            if !keep_matching {
+                for matched in mask.iter_mut() {
+                    *matched = !*matched;
+                }
+            }
+            solutions.table.retain_mask(&mask);
+            if self.trace.is_some() {
+                note(
+                    joined,
+                    "EXISTS by bound index existence probes".to_owned(),
+                    solutions.table.len(),
+                );
+            }
+            return Ok(solutions);
+        }
         let (conjuncts, inner) = top_filters(pattern);
         let correlated = conjuncts
             .iter()
@@ -566,6 +584,9 @@ impl Context<'_> {
     ) -> NativeResult<Scratch<'_, bool>> {
         if solutions.table.is_empty() {
             return Ok(ChargedVec::new(&*self.budget));
+        }
+        if let Some(mask) = probe::try_mask(self, solutions, pattern)? {
+            return Ok(mask);
         }
         let (conjuncts, inner) = top_filters(pattern);
         if !correlation_safe(inner, &solutions.vars) {
