@@ -27,6 +27,81 @@ fn get(query: &str, extra: &str) -> Result<Request<Body>, axum::http::Error> {
         .body(Body::empty())
 }
 
+/// Spec: selected v1.5 contract: the actual /explain DL fallback must never
+/// turn an undecided initial test into 404. B <= D, C <= D, w : B or C
+/// entails w : D by cases, independently of either production proof algorithm.
+#[tokio::test]
+async fn an_initial_dl_test_stop_is_not_an_http_nonentailment()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("union.ttl");
+    std::fs::write(&path, format!("{ONTOLOGY}\n:B rdfs:subClassOf :E ."))?;
+    // Establish the enough-budget positive and countermodel controls before the stopped case.
+    for tests in [None, Some(0)] {
+        let app = test_app_with_store_config(
+            StoreConfig {
+                dl: nrese_store::DlConfig {
+                    explanation_tests: tests,
+                    ..Default::default()
+                },
+                ..StoreConfig::in_memory().with_ontology(path.clone())
+            },
+            PolicyConfig::default(),
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
+        )?;
+        let parameters = serde_urlencoded::to_string([
+            ("subj", "<http://example.com/w>"),
+            ("pred", "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>"),
+            ("obj", "<http://example.com/D>"),
+        ])?;
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/repositories/nrese/explain?{parameters}"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let status = response.status();
+        let body = body_text(response).await?;
+        if tests.is_some() {
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            let problem: serde_json::Value = serde_json::from_str(&body)?;
+            assert_eq!(
+                problem["type"],
+                "https://nrese.dev/problems/incomplete-answer"
+            );
+            assert!(body.contains("explanation_tests"), "{body}");
+        } else {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let answer: serde_json::Value = serde_json::from_str(&body)?;
+            assert_eq!(
+                answer["owl2_dl"]["axioms"].as_array().map(Vec::len),
+                Some(3)
+            );
+            assert_eq!(answer["owl2_dl"]["verified"], true);
+            let nonentailed = serde_urlencoded::to_string([
+                ("subj", "<http://example.com/w>"),
+                ("pred", "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>"),
+                ("obj", "<http://example.com/E>"),
+            ])?;
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/repositories/nrese/explain?{nonentailed}"))
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "a model may put w in C and outside E"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn answers_carry_their_status() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
