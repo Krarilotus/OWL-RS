@@ -1538,6 +1538,30 @@ impl StoreService {
         bulk_load(&self.engine, request, progress, invalid, &self.quarantine)
     }
 
+    /// Loads files while retaining their actual blank-node/source correspondence.
+    /// Capture uses this request's existing resources, without invoking caller code.
+    /// The owned capture is exposed only after all workers and the load writer end.
+    /// A capture failure aborts before finish; later engine/quarantine errors keep
+    /// their existing commit/CommitUnknown semantics. Export errors after success
+    /// invalidate qualification, not the acknowledged load.
+    pub fn bulk_load_observed(
+        &self,
+        request: &BulkLoadRequest,
+        progress: &crate::LoadProgress,
+        resources: &nrese_sparql::Resources,
+    ) -> StoreResult<(BulkLoadReport, crate::LoadIdentities)> {
+        self.invalidate_reasoning()?;
+        let invalid = request.invalid.unwrap_or(self.config.invalid_statements);
+        crate::bulk_load::observed(
+            &self.engine,
+            request,
+            progress,
+            invalid,
+            &self.quarantine,
+            resources,
+        )
+    }
+
     /// Builds the query planner's statistics of the store as it is now and saves them
     /// beside its checkpoint ([`nrese_engine::Engine::prepare_statistics`]): the last step
     /// of a load, so that queries after a start neither wait for them nor share the

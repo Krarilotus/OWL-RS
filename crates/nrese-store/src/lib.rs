@@ -49,7 +49,7 @@ pub use backup::{
     DIGEST_PREFIX, DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, DatasetRestoreReport,
     DatasetRestoreRequest,
 };
-pub use bulk_load::{BulkLoadReport, BulkLoadRequest, LoadProgress};
+pub use bulk_load::{BulkLoadReport, BulkLoadRequest, LoadIdentities, LoadProgress};
 pub use classification::{ClassificationReport, RealisationReport};
 pub use config::{
     DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, GateSeverity,

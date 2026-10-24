@@ -34,6 +34,9 @@ use crate::graph_store::GraphTarget;
 use crate::quarantine::{Collector, InvalidStatements, LoadFile, Quarantine, QuarantinedStatement};
 use crate::rdf_io::file_base_iri;
 
+mod capture;
+pub use capture::LoadIdentities;
+
 /// Quads per interning batch: large enough to amortise the dictionary lock, small enough
 /// to keep all cores busy.
 const BATCH: usize = 32 * 1024;
@@ -131,6 +134,37 @@ pub(crate) fn bulk_load(
     invalid: InvalidStatements,
     quarantine: &Quarantine,
 ) -> StoreResult<BulkLoadReport> {
+    bulk_load_inner::<false>(engine, request, progress, invalid, quarantine, None)
+}
+
+pub(crate) fn observed(
+    engine: &Engine,
+    request: &BulkLoadRequest,
+    progress: &LoadProgress,
+    invalid: InvalidStatements,
+    quarantine: &Quarantine,
+    resources: &nrese_sparql::Resources,
+) -> StoreResult<(BulkLoadReport, LoadIdentities)> {
+    let capture = capture::Capture::new(&request.files, resources, progress)?;
+    let result = bulk_load_inner::<true>(
+        engine,
+        request,
+        progress,
+        invalid,
+        quarantine,
+        Some(&capture),
+    );
+    capture.finish(result)
+}
+
+fn bulk_load_inner<const OBSERVED: bool>(
+    engine: &Engine,
+    request: &BulkLoadRequest,
+    progress: &LoadProgress,
+    invalid: InvalidStatements,
+    quarantine: &Quarantine,
+    capture: Option<&capture::Capture<'_>>,
+) -> StoreResult<BulkLoadReport> {
     let started = Instant::now();
     let sources = request
         .files
@@ -144,6 +178,12 @@ pub(crate) fn bulk_load(
     };
     let load = engine.bulk_load(mode);
     let blank_nodes = BlankNodeScope::new(engine.snapshot().revision());
+    if OBSERVED {
+        capture
+            .expect("observed owner")
+            .set_scope(&blank_nodes.prefix)
+            .map_err(|()| StoreError::LoadCancelled)?;
+    }
     let collector = match invalid {
         InvalidStatements::Strict => None,
         InvalidStatements::Quarantine => Some(
@@ -176,13 +216,27 @@ pub(crate) fn bulk_load(
         let skipping = collector
             .as_ref()
             .map(|collector| Skipping { collector, file });
-        let quads = source.load_into(&load, &mut next_chunk, &graph, &blank_nodes, skipping)?;
+        let quads = source.load_into::<OBSERVED>(
+            &load,
+            &mut next_chunk,
+            &graph,
+            &blank_nodes,
+            skipping,
+            file,
+            capture,
+        )?;
         parsed += quads;
         progress.parsed.fetch_add(quads, Ordering::Relaxed);
         progress.files_done.fetch_add(1, Ordering::Relaxed);
     }
     if progress.is_cancelled() {
         return Err(StoreError::LoadCancelled);
+    }
+    if OBSERVED {
+        capture
+            .expect("observed owner")
+            .checkpoint()
+            .map_err(|()| StoreError::LoadCancelled)?;
     }
     let summary = load.finish();
     memory::release_all();
@@ -233,14 +287,26 @@ impl<'a> Source<'a> {
 
     /// Parses the file into `load`, its chunks numbered from `next_chunk` on (which moves
     /// past them); returns the number of quads parsed.
-    fn load_into(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "existing load state plus actual observation identity"
+    )]
+    fn load_into<const OBSERVED: bool>(
         &self,
         load: &BulkLoad<'_>,
         next_chunk: &mut u32,
         graph: &GraphName,
         blank_nodes: &BlankNodeScope,
         skipping: Option<Skipping<'_, '_>>,
+        file: usize,
+        capture: Option<&capture::Capture<'_>>,
     ) -> StoreResult<u64> {
+        if OBSERVED {
+            capture
+                .expect("observed owner")
+                .checkpoint()
+                .map_err(|()| StoreError::LoadCancelled)?;
+        }
         let threads = rayon::current_num_threads();
         let recovering = |parser: RdfParser| match skipping {
             Some(_) => parser.recovering(),
@@ -266,7 +332,15 @@ impl<'a> Source<'a> {
                     .enumerate()
                     .map(|(i, chunk)| {
                         let chunk_number = first + i as u32;
-                        feed(load, chunk_number, chunk, blank_nodes, skipping)
+                        feed::<OBSERVED>(
+                            load,
+                            chunk_number,
+                            chunk,
+                            blank_nodes,
+                            skipping,
+                            file,
+                            capture,
+                        )
                     })
                     .sum()
             }
@@ -295,7 +369,13 @@ impl<'a> Source<'a> {
                             }
                             (Err(error), None) => return Err(error.into()),
                         };
-                        batch.push(blank_nodes.scope(quad));
+                        batch.push(if OBSERVED {
+                            blank_nodes
+                                .scope_observed(quad, capture.expect("observed owner"), file)
+                                .map_err(|()| StoreError::LoadCancelled)?
+                        } else {
+                            blank_nodes.scope(quad)
+                        });
                         if batch.len() == BATCH {
                             parsed += batch.len() as u64;
                             let full = std::mem::replace(&mut batch, Vec::with_capacity(BATCH));
@@ -322,12 +402,14 @@ impl<'a> Source<'a> {
 
 /// Parses `quads` (a file's chunk `chunk`) in batches into `load` on the current thread,
 /// the batches numbered in order; returns the count.
-fn feed(
+fn feed<const OBSERVED: bool>(
     load: &BulkLoad<'_>,
     chunk: u32,
     quads: impl Iterator<Item = Result<Quad, RdfParseError>>,
     blank_nodes: &BlankNodeScope,
     skipping: Option<Skipping<'_, '_>>,
+    file: usize,
+    capture: Option<&capture::Capture<'_>>,
 ) -> StoreResult<u64> {
     let mut batch = Vec::with_capacity(BATCH);
     let mut parsed = 0;
@@ -341,7 +423,13 @@ fn feed(
             }
             (Err(error), None) => return Err(error.into()),
         };
-        batch.push(blank_nodes.scope(quad));
+        batch.push(if OBSERVED {
+            blank_nodes
+                .scope_observed(quad, capture.expect("observed owner"), file)
+                .map_err(|()| StoreError::LoadCancelled)?
+        } else {
+            blank_nodes.scope(quad)
+        });
         if batch.len() == BATCH {
             load.add_at(chunk, number, &batch);
             number += 1;
@@ -416,5 +504,85 @@ impl BlankNodeScope {
                 other => other,
             },
         }
+    }
+
+    fn node_observed(
+        &self,
+        input: &BlankNode,
+        capture: &capture::Capture<'_>,
+        file: usize,
+        graph: &GraphName,
+    ) -> Result<BlankNode, ()> {
+        capture.checkpoint()?;
+        let scoped = self.node(input);
+        capture.record(file, input, &scoped, graph)?;
+        Ok(scoped)
+    }
+
+    fn term_observed(
+        &self,
+        term: Term,
+        capture: &capture::Capture<'_>,
+        file: usize,
+        graph: &GraphName,
+    ) -> Result<Term, ()> {
+        capture.checkpoint()?;
+        Ok(match term {
+            Term::BlankNode(node) => self.node_observed(&node, capture, file, graph)?.into(),
+            Term::Triple(triple) => {
+                let triple = *triple;
+                nrese_rdf::Triple::new(
+                    match triple.subject {
+                        NamedOrBlankNode::BlankNode(node) => {
+                            self.node_observed(&node, capture, file, graph)?.into()
+                        }
+                        named => named,
+                    },
+                    triple.predicate,
+                    self.term_observed(triple.object, capture, file, graph)?,
+                )
+                .into()
+            }
+            other => other,
+        })
+    }
+
+    fn scope_observed(
+        &self,
+        quad: Quad,
+        capture: &capture::Capture<'_>,
+        file: usize,
+    ) -> Result<Quad, ()> {
+        capture.checkpoint()?;
+        let Quad {
+            subject,
+            predicate,
+            object,
+            graph_name,
+        } = quad;
+        let graph_name = match graph_name {
+            GraphName::BlankNode(input) => {
+                let scoped = self.node(&input);
+                let graph = GraphName::BlankNode(scoped);
+                if let GraphName::BlankNode(scoped) = &graph {
+                    capture.record(file, &input, scoped, &graph)?;
+                }
+                graph
+            }
+            other => other,
+        };
+        let subject = match subject {
+            NamedOrBlankNode::BlankNode(node) => self
+                .node_observed(&node, capture, file, &graph_name)?
+                .into(),
+            named => named,
+        };
+        let object = self.term_observed(object, capture, file, &graph_name)?;
+        Ok(Quad {
+            subject,
+            predicate,
+            object,
+            graph_name,
+        })
     }
 }
