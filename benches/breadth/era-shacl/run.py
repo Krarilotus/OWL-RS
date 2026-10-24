@@ -30,6 +30,7 @@ import os
 import re
 import shutil
 import statistics
+import subprocess
 import time
 import sys
 from pathlib import Path, PurePosixPath
@@ -228,7 +229,138 @@ def canonical(path: Path) -> collections.Counter:
     return bag
 
 
+
+def structured_attempt(out: Path, row: dict) -> tuple[Path, dict]:
+    """Bind an existing consumer attempt; absence/ambiguity is not provenance."""
+    if row.get("status") != "ok":
+        raise ValueError("execution status is " + str(row.get("status")))
+    matches = []
+    for retained in sorted((out / "attempts").glob("*/results.csv")):
+        with open(retained, encoding="utf-8", newline="") as stream:
+            matches.extend((retained.parent, candidate) for candidate in csv.DictReader(stream)
+                           if candidate == row)
+    if len(matches) != 1:
+        raise ValueError("no unique exact owning attempt row")
+    attempt = matches[0][0].resolve()
+    if not attempt.is_relative_to((out / "attempts").resolve()):
+        raise ValueError("attempt outside retained results")
+    invocation_path, observation_path = attempt / "invocation.json", attempt / "observation.json"
+    invocation_raw, observation_raw = invocation_path.read_bytes(), observation_path.read_bytes()
+    invocation, observation = json.loads(invocation_raw), json.loads(observation_raw)
+    if not isinstance(invocation, dict) or not isinstance(observation, dict):
+        raise ValueError("unsupported invocation/observation format")
+    measured = invocation.get("measured", {})
+    if not isinstance(measured, dict):
+        raise ValueError("unsupported measured outcome format")
+    if (invocation.get("error") or invocation.get("interrupted") or
+            type(measured.get("rc")) is not int or measured["rc"] != 0 or
+            measured.get("timed_out") is not False):
+        raise ValueError("owning invocation did not return a successful report")
+    engine = next(e for e in ENGINES if SYSTEM.get(e, e) == row["system"])
+    name = f"{engine}-{row['tier']}-{row['item']}-r{row['run']}"
+    case = invocation.get("case", {})
+    if not isinstance(case, dict):
+        raise ValueError("unsupported owning case format")
+    if any(str(case.get(k)) != str(v) for k, v in
+           {"name": name, "engine": engine, "subset": row["tier"], "shape": row["item"],
+            "rep": row["run"], "phase": "engine"}.items()):
+        raise ValueError("owning invocation case differs from execution row")
+    # Current consumer has no call/export observation producer. Missing actual
+    # call binding stays unsupported; fixture-authored values certify only units.
+    call = invocation.get("call_id")
+    if not isinstance(call, str) or not call or observation.get("call_id") != call:
+        raise ValueError("missing or stale owning call binding")
+    operational = observation.get("operational_outcome", {})
+    if not isinstance(operational, dict) or operational.get("kind") != "validation-returned":
+        raise ValueError("captured operational outcome did not return a report")
+    report = observation.get("report", {})
+    if not isinstance(report, dict) or not isinstance(report.get("path"), str):
+        raise ValueError("unsupported report binding format")
+    report_path = (attempt / report.get("path", "")).resolve()
+    if not report_path.is_relative_to(attempt) or report.get("complete") is not True:
+        raise ValueError("report is incomplete or outside owning attempt")
+    report_hash = hashlib.sha256(report_path.read_bytes()).hexdigest()
+    if report_hash != report.get("sha256") or report_hash != invocation.get("report_sha256"):
+        raise ValueError("owning invocation/report digest mismatch")
+    return observation_path, dict(attempt=str(attempt), call_id=call,
+        invocation=invocation, invocation_sha256=hashlib.sha256(invocation_raw).hexdigest(),
+        observation_sha256=hashlib.sha256(observation_raw).hexdigest(), report_sha256=report_hash)
+
+
+def structured_check(args) -> int:
+    """Keep execution evidence distinct from artifact equality, on both sides."""
+    out = Path(args.results).resolve()
+    with open(out / "results.csv", encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    evidence = out / "structured-check"
+    evidence.mkdir(exist_ok=True)
+    comparisons = []
+    for index, row in enumerate(rows):
+        if row["task"] != "validate":
+            continue
+        engine = next(e for e in ENGINES if SYSTEM.get(e, e) == row["system"])
+        name = f"{engine}-{row['tier']}-{row['item']}-r{row['run']}"
+        refs = [r for r in rows if r.get("task") == "validate" and
+                r.get("system") == SYSTEM.get(args.reference, args.reference) and
+                all(r.get(k) == row.get(k) for k in ("tier", "item", "run"))]
+        result = dict(comparison_kind="anchored-report-and-typed-artifact-comparison",
+            completeness="unqualified", projection="none", verdict="UNQUALIFIED",
+            reason="unbound execution/capture")
+        record = dict(name=name, row_index=index, candidate_row=row, reference_rows=refs,
+                      bridge=dict(command=None, exit=None, stdout=None, stderr=None, outcome="not-run"))
+        try:
+            if len(refs) != 1:
+                raise ValueError("no unique reference execution row for this repetition")
+            mine, record["candidate_binding"] = structured_attempt(out, row)
+            reference, record["reference_binding"] = structured_attempt(out, refs[0])
+            if not args.bridge_program:
+                raise ValueError("no qualified existing bridge binary supplied")
+            stem = f"row{index}-{name}"
+            target = evidence / f"{stem}.json"
+            if target.exists():
+                target.unlink()
+            command = [str(Path(args.bridge_program).resolve()), "era-report-compare",
+                "--left-observation", str(reference), "--right-observation", str(mine),
+                "--out", str(target)]
+            stdout_path, stderr_path = evidence / f"{stem}.stdout", evidence / f"{stem}.stderr"
+            record["bridge"].update(command=command, stdout=str(stdout_path), stderr=str(stderr_path), outcome="started")
+            with open(evidence / f"{stem}.command.json", "w", encoding="utf-8") as stream:
+                json.dump(command, stream, ensure_ascii=False)
+            with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
+                done = subprocess.run(command, stdout=stdout, stderr=stderr, timeout=60, check=False)
+            record["bridge"].update(exit=done.returncode, outcome="returned")
+            if done.returncode:
+                raise ValueError(f"bridge operational exit {done.returncode}; raw stderr retained")
+            if not target.is_file() or target.stat().st_size > 4 * 1024 * 1024:
+                raise ValueError("missing/over-cap complete bridge JSON")
+            with open(target, encoding="utf-8") as stream:
+                received = json.load(stream)
+            required = {"comparison_kind", "completeness", "projection", "verdict"}
+            if (not isinstance(received, dict) or not required.issubset(received) or
+                    received["verdict"] not in {"MATCH", "DIFFERENT", "UNQUALIFIED"}):
+                raise ValueError("invalid bridge result schema")
+            result = received
+        except (OSError, ValueError, StopIteration, subprocess.TimeoutExpired) as error:
+            result["reason"] = f"{type(error).__name__}: {error}"
+            if record["bridge"]["outcome"] == "started":
+                record["bridge"].update(outcome="operational-error", error=str(error))
+        record["comparison"] = result
+        # A list retains duplicate/failed rows instead of overwriting by case name.
+        comparisons.append(record)
+        print(f"{name:<32} {result['verdict']:<12} {result['comparison_kind']} "
+              f"execution={row.get('status')} completeness={result['completeness']}")
+        with open(evidence / f"row{index}-{name}.outcome.json", "w", encoding="utf-8") as stream:
+            json.dump(record, stream, ensure_ascii=False, indent=2)
+    with open(evidence / "comparisons.json", "w", encoding="utf-8") as stream:
+        json.dump(comparisons, stream, ensure_ascii=False, indent=2)
+    return 0
+
+
 def check(args) -> int:
+    if args.comparison == "structured":
+        return structured_check(args)
+    print("comparison_kind=legacy-five-field-projection completeness=partial "
+          "projection=focus/path/value/component/severity; not full report equality")
     out = Path(args.results).resolve()
     rows = list(csv.DictReader(open(out / "results.csv", encoding="utf-8")))
     reports = out / "reports"
@@ -558,6 +690,8 @@ def main(argv: list[str]) -> int:
     c = sub.add_parser("check")
     c.add_argument("results")
     c.add_argument("--reference", default="topbraid")
+    c.add_argument("--comparison", choices=("legacy-five-field", "structured"), default="legacy-five-field")
+    c.add_argument("--bridge-program", help="qualified existing nrese-bench-harness binary")
     e = sub.add_parser("reproduce")
     e.add_argument("results")
     f = sub.add_parser('prepare', help='render the actual spec7 bound diagnostic; does not submit or launch')

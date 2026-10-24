@@ -1,0 +1,5 @@
+<urn:era-tiny:a> <urn:era-tiny:link> _:item <urn:era-tiny:data> .
+_:item <urn:era-tiny:label> "étiquette"@fr <urn:era-tiny:data> .
+_:item <urn:era-tiny:code> "01"^^<http://www.w3.org/2001/XMLSchema#integer> _:graph .
+<urn:era-tiny:b> <urn:era-tiny:link> _:other <urn:era-tiny:data> .
+_:other <urn:era-tiny:code> "distinct" _:graph .

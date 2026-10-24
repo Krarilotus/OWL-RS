@@ -1,3 +1,5 @@
+pub(crate) mod era;
+
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, anyhow};

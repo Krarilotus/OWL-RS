@@ -68,6 +68,31 @@ python() {
   else echo "the gate needs python (or python3)" >&2; return 127; fi
 }
 
+# Select only when this caller will compile. Official native push units and
+# explicitly selected callers already carry a selection: guarded Cargo validates
+# it without rediscovery. Keep receipt/diagnostics, discard only our NUL staging.
+native_setup() {
+  [ -r "/proc/$$/winpid" ] && [ -z "${NRESE_MSVC_COMPILER:-}" ] || return 0
+  local directory name value code=0
+  directory=$(cygpath -u "${FLEET_OUT:-$PWD/tmp}") || return 75
+  mkdir -p "$directory" || return 75
+  directory=$(mktemp -d "$directory/msvc-setup.XXXXXX") || return 75
+  echo "=== native compiler setup: $directory"
+  python scripts/lib/msvc-setup.py "$directory/toolchain.json" "$directory/environment" \
+    > "$directory/stdout" 2> "$directory/stderr" || code=$?
+  printf '%s\n' "$code" > "$directory/exit" || return 75
+  if [ "$code" -ne 0 ]; then
+    cat "$directory/stdout" "$directory/stderr" >&2
+    rm -f -- "$directory/environment"
+    return 75
+  fi
+  while IFS= read -r -d '' name && IFS= read -r -d '' value; do
+    export "$name=$value" || return 75
+  done < "$directory/environment"
+  rm -f -- "$directory/environment" || return 75
+  [ -n "${NRESE_MSVC_COMPILER:-}" ] || return 75
+}
+
 # The workspace crates (directories with a Cargo.toml under crates/) that `files` touch.
 crates_of() {
   local file dir name
@@ -222,6 +247,7 @@ side_steps() {
 harness() {
   local manifest=benches/nrese-bench-harness/Cargo.toml
   step "fmt (bench harness)" cargo fmt --manifest-path $manifest --all --check
+  native_setup || exit 75
   step "clippy (bench harness)" "$guarded" clippy --locked --manifest-path $manifest \
     --all-targets
   step "test (bench harness)" "$guarded" test --locked --manifest-path $manifest --no-fail-fast
@@ -272,6 +298,7 @@ windows_part() {
   packages=$(python scripts/lib/windows-tests.py packages "$@") || exit 75
   expr=$(python scripts/lib/windows-tests.py expr "$@") || exit 75
   os=${os//$'\r'/}; packages=${packages//$'\r'/}; expr=${expr//$'\r'/}
+  [ -z "$os$packages" ] || native_setup || exit 75
   [ -z "$os" ] || step "clippy (Windows)" "$guarded" clippy --locked $(package_args $os) --all-targets
   [ -z "$packages" ] || { [ -n "$expr" ] || exit 75; step "tests (Windows)" windows_tests "$expr" $packages; }
   if printf '%s\n' "${files[@]}" | grep -qE '^apps/nrese-console/'; then console; fi
@@ -374,6 +401,7 @@ case "$mode" in
     echo "=== changed: ${changed[*]:-none}; depending on them: ${dependents[*]:-none}"
     step fmt cargo fmt --all --check
     if [ ${#changed[@]} -gt 0 ]; then
+      native_setup || exit 75
       # Lints where code changed: every target of the changed crates. A dependent's code didn't
       # change, so its lints can't either; what can break there is compiling against the new
       # API. At commit that is checked on the dependents' libraries only; at push the
@@ -403,6 +431,7 @@ case "$mode" in
     ;;
   all)
     step fmt cargo fmt --all --check
+    native_setup || exit 75
     step clippy "$guarded" clippy --locked --workspace --all-targets
     mapfile -t everything < <(cargo metadata --no-deps --format-version 1 --offline \
       | python -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))" \

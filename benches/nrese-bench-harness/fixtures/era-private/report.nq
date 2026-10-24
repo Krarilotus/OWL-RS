@@ -1,0 +1,16 @@
+_:root <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#ValidationReport> .
+_:root <http://www.w3.org/ns/shacl#conforms> "false"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+_:root <http://www.w3.org/ns/shacl#result> _:result .
+_:result <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#ValidationResult> .
+_:result <http://www.w3.org/ns/shacl#focusNode> _:item .
+_:result <http://www.w3.org/ns/shacl#resultPath> _:path0 .
+_:result <http://www.w3.org/ns/shacl#value> "01"^^<http://www.w3.org/2001/XMLSchema#integer> .
+_:result <http://www.w3.org/ns/shacl#sourceShape> _:shape .
+_:result <http://www.w3.org/ns/shacl#sourceConstraintComponent> <http://www.w3.org/ns/shacl#MinCountConstraintComponent> .
+_:result <http://www.w3.org/ns/shacl#sourceConstraint> _:other .
+_:result <http://www.w3.org/ns/shacl#resultSeverity> <http://www.w3.org/ns/shacl#Violation> .
+_:result <http://www.w3.org/ns/shacl#resultMessage> "étiquette requise"@fr .
+_:path0 <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> <urn:era-tiny:link> .
+_:path0 <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> _:path1 .
+_:path1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> <urn:era-tiny:label> .
+_:path1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> .
