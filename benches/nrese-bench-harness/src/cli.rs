@@ -30,6 +30,22 @@ pub fn parse_cli(args: Vec<String>) -> Result<Cli> {
     let options = collect_options(&args[2..])?;
 
     match command_name {
+        "era-report-compare" => Ok(Cli {
+            command: Command::EraReportCompare {
+                left: options
+                    .get("--left-observation")
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow!("missing --left-observation"))?,
+                right: options
+                    .get("--right-observation")
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow!("missing --right-observation"))?,
+                output: options
+                    .get("--out")
+                    .map(PathBuf::from)
+                    .ok_or_else(|| anyhow!("missing --out"))?,
+            },
+        }),
         "bench" => Ok(Cli {
             command: Command::Bench(BenchConfig {
                 nrese: nrese_connection(&options)?,

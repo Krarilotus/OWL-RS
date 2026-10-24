@@ -1,0 +1,21 @@
+{
+  "name": "era-interoperability-tiny-v1",
+  "origin": "independently authored private checker unit fixture",
+  "runtime_validation": false,
+  "original_ERA_trace": false,
+  "N11_fixture_copy": false,
+  "spec": "N11 eight-field export contract plus Root structured checker/source anchoring instructions",
+  "expected": {
+    "identity": "MATCH",
+    "generated_node_rename": "MATCH",
+    "original_message_language_change": "DIFFERENT",
+    "typed_duplicate_result": "DIFFERENT",
+    "source_sharing_change": "DIFFERENT",
+    "missing_anchor": "UNQUALIFIED"
+  },
+  "source_identity_policy": "AsWritten source labels intentionally share one authored parser scope across both source documents; actual parser outputs must exactly exhaust the bindings. This is unit parser observation, not a bulk-load/runtime anchor receipt.",
+  "report_policy": "Hand-authored transport specimen exposing all eight fields; no claim an engine validated it or produced sourceConstraint/value in this shape case.",
+  "metadata_policy": "Full-post-state, introduced and persistent-after-rollback are distinct authored observations, not calls to MutationPipeline or validate_changes.",
+  "optional_detail": "Absent in N11 typed model; this fixture invents no typed detail.",
+  "execution": "UNRUN until an official qualified proof; source generation is not fixture execution"
+}

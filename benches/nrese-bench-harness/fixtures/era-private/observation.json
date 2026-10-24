@@ -1,0 +1,54 @@
+{
+  "schema": "era-private-v1",
+  "capture_kind": "authored-parser-unit",
+  "complete": true,
+  "call_id": "authored-unit-not-engine-validation",
+  "observation_role": "full-post-state",
+  "projection": "none",
+  "operational_outcome": {
+    "kind": "validation-returned",
+    "origin": "independently-authored-contract-value-not-engine-execution"
+  },
+  "revision": 7,
+  "shapes": 1,
+  "applicable": true,
+  "report_applicable": true,
+  "conforms": false,
+  "failures": [],
+  "results": [
+    {
+      "focus_node": "_:item",
+      "path": {
+        "kind": "Sequence",
+        "items": [
+          {
+            "kind": "Predicate",
+            "iri": "<urn:era-tiny:link>"
+          },
+          {
+            "kind": "Predicate",
+            "iri": "<urn:era-tiny:label>"
+          }
+        ]
+      },
+      "value": "\"01\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+      "source_shape": "_:shape",
+      "component": "<http://www.w3.org/ns/shacl#MinCountConstraintComponent>",
+      "source_constraint": "_:other",
+      "severity": "<http://www.w3.org/ns/shacl#Violation>",
+      "messages": [
+        "\"étiquette requise\"@fr"
+      ]
+    }
+  ],
+  "report": {
+    "path": "report.nq",
+    "sha256": "ba95b60ca2dac7b8c9f46fb01009c2ddad261ca3095022f8bbed472061966704",
+    "format": "nquads",
+    "complete": true
+  },
+  "anchors": {
+    "path": "anchors.json",
+    "sha256": "d361f43d0f17ef6ebbe8c742ac94a1b951228dfa39b97d6eebd433a11863b467"
+  }
+}

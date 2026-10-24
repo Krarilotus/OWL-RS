@@ -989,12 +989,14 @@ name = "nrese-bench-harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "nrese-json",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-store",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "toml",

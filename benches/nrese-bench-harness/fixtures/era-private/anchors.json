@@ -1,0 +1,66 @@
+{
+  "schema": "era-private-anchors-v1",
+  "capture_kind": "authored-parser-unit",
+  "call_id": "authored-unit-not-engine-validation",
+  "complete": true,
+  "sources": [
+    {
+      "path": "data.nq",
+      "sha256": "57bc10ae776af85e3a91f27b7cc976e362e60c643b760a63a6580683f78dcbf0",
+      "format": "nquads",
+      "scope": "tiny-shared-as-written",
+      "role": "data"
+    },
+    {
+      "path": "shapes.ttl",
+      "sha256": "d48f28e3fb19c32d30b3c6eac2cdc715ce39c1841b1886eb128174d11d5f8439",
+      "format": "turtle",
+      "scope": "tiny-shared-as-written",
+      "role": "shapes"
+    }
+  ],
+  "bindings": [
+    {
+      "scope": "tiny-shared-as-written",
+      "input_blank": "item",
+      "runtime_blank": "item",
+      "anchor": "tiny:item"
+    },
+    {
+      "scope": "tiny-shared-as-written",
+      "input_blank": "other",
+      "runtime_blank": "other",
+      "anchor": "tiny:other"
+    },
+    {
+      "scope": "tiny-shared-as-written",
+      "input_blank": "graph",
+      "runtime_blank": "graph",
+      "anchor": "tiny:graph"
+    },
+    {
+      "scope": "tiny-shared-as-written",
+      "input_blank": "shape",
+      "runtime_blank": "shape",
+      "anchor": "tiny:shape"
+    },
+    {
+      "scope": "tiny-shared-as-written",
+      "input_blank": "shapePath0",
+      "runtime_blank": "shapePath0",
+      "anchor": "tiny:shapePath0"
+    },
+    {
+      "scope": "tiny-shared-as-written",
+      "input_blank": "shapePath1",
+      "runtime_blank": "shapePath1",
+      "anchor": "tiny:shapePath1"
+    }
+  ],
+  "fresh_report_nodes": [
+    "root",
+    "result",
+    "path0",
+    "path1"
+  ]
+}

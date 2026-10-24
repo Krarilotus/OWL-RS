@@ -27,6 +27,16 @@ async fn main() -> Result<()> {
     let cli = parse_cli(env::args().collect())?;
 
     match cli.command {
+        Command::EraReportCompare {
+            left,
+            right,
+            output,
+        } => {
+            let result = normalize::era::compare_paths(&left, &right).to_string();
+            anyhow::ensure!(result.len() <= 4 * 1024 * 1024, "ERA comparison output cap");
+            std::fs::write(output, result)?;
+            Ok(())
+        }
         Command::Bench(config) => {
             runner::run_bench(config).await?;
             Ok(())

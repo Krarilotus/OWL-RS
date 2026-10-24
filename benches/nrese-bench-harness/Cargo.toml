@@ -12,6 +12,8 @@ anyhow = "1.0.100"
 nrese-store = { path = "../../crates/nrese-store" }
 nrese-rdf = { path = "../../crates/rdf/nrese-rdf" }
 nrese-rdf-io = { path = "../../crates/rdf/nrese-rdf-io" }
+nrese-json = { path = "../../crates/rdf/nrese-json" }
+sha2 = "0.10.9"
 # rustls only (no OpenSSL: the binary needs no system TLS library), trusting the bundled
 # roots and the machine's CA store (an identity provider with an internal certificate).
 reqwest = { version = "0.12.24", default-features = false, features = ["charset", "http2", "json", "rustls-tls", "rustls-tls-native-roots"] }
