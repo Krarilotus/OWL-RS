@@ -12,6 +12,11 @@ pub struct Cli {
 
 #[derive(Debug, Clone)]
 pub enum Command {
+    EraReportCompare {
+        left: PathBuf,
+        right: PathBuf,
+        output: PathBuf,
+    },
     Bench(BenchConfig),
     CatalogSync(CatalogSyncConfig),
     Compat(CompatConfig),

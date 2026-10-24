@@ -94,7 +94,9 @@ sys.stdout.reconfigure(newline='\\r\\n' if os.environ['SELECT_ENDING']=='CRLF' e
 ''', encoding='utf-8')
             (root/'files').write_text('crates/nrese-engine/src/lib.rs\n')
             out = root/'out'
-            env = {**CLEAN, 'PATH':str(Path(sys.executable).parent)+os.pathsep+str(Path(bash).parent)+os.pathsep+CLEAN['PATH'],
+            # Spec: Root F1, 24 Oct: this dispatcher models an already-selected
+            # official unit; Cargo witnesses must not trigger native discovery.
+            env = {**CLEAN, 'NRESE_MSVC_COMPILER':'C:/fixture/selected/cl.exe', 'PATH':str(Path(sys.executable).parent)+os.pathsep+str(Path(bash).parent)+os.pathsep+CLEAN['PATH'],
                 'PYTHONPATH':(root/'transport').as_posix(), 'SELECT_ROOT':root.as_posix(),
                 'SELECT_OUT':out.as_posix(), 'SELECT_ENDING':ending,
                 'NRESE_GATE_INNER':'unit','NRESE_GATE_UNIT':'all','NRESE_GATE_PART':'windows',

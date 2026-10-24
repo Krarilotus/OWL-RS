@@ -1,0 +1,9 @@
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+_:shape a sh:PropertyShape ;
+  sh:targetNode _:item ;
+  sh:path _:shapePath0 ;
+  sh:minCount 2 ;
+  sh:message "étiquette requise"@fr .
+_:shapePath0 rdf:first <urn:era-tiny:link> ; rdf:rest _:shapePath1 .
+_:shapePath1 rdf:first <urn:era-tiny:label> ; rdf:rest rdf:nil .

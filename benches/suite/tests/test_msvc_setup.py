@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -160,6 +161,113 @@ class SelectedSetup(unittest.TestCase):
 
 
 class GateSetupHandoff(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'normal native caller handoff')
+    def test_normal_native_caller_selects_before_compiling_and_preserves_selection(self):
+        # Spec: normal caller owner, 2026-10-24: future compilation gets selection
+        # before guarded preparation; setup failure stops compilation. Existing
+        # selection is forwarded for the unchanged finalizer to validate. Execute
+        # the whole caller, as the existing normal-commit fixture does, with only
+        # setup/Cargo replaced by witnesses. No toolchain or Rust workload runs.
+        from test_gate_fleet_push import CLEAN, client
+        bash = client.windows_tools(CLEAN['PATH'], os.environ['SystemRoot'])['bash']
+        keys = ('NRESE_MSVC_COMPILER', 'CC', 'CXX', 'INCLUDE', 'LIB', 'RUSTFLAGS')
+        chosen = dict(zip(keys, ('C:/chosen/cl.exe', 'C:/chosen/cl.exe', 'C:/chosen/cl.exe',
+                                'C:/chosen/include', 'C:/chosen/lib', '-C target-cpu=native')))
+        cases = [('rust', 'commit', 'crates/a/src/lib.rs', None, 0),
+                 ('harness', 'commit', 'benches/nrese-bench-harness/src/main.rs', None, 0),
+                 ('all', 'all', '', None, 0),
+                 ('failure', 'commit', 'crates/a/src/lib.rs', None, 42),
+                 ('selected', 'commit', 'crates/a/src/lib.rs', chosen, 0),
+                 ('conflicting', 'commit', 'crates/a/src/lib.rs', {**chosen, 'CC': 'C:/other/cl.exe'}, 0),
+                 ('gate', 'push', 'crates/a/src/lib.rs', chosen, 0),
+                 ('documents', 'commit', 'docs/readme.md', None, 0)]
+        for label, mode, changed, selected, setup_exit in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory(prefix='normal-msvc-caller-') as temporary:
+                root = Path(temporary)
+                for name in ('scripts/lib', '.githooks', 'crates/a/src', 'out'):
+                    (root/name).mkdir(parents=True)
+                shutil.copyfile(ROOT/'scripts/check.sh', root/'scripts/check.sh')
+                shutil.copyfile(ROOT/'.githooks/pre-commit', root/'.githooks/pre-commit')
+                (root/'scripts/check.sh').chmod(0o755)
+                (root/'crates/a/Cargo.toml').write_text('[package]\nname = "a"\nversion = "0.1.0"\n', newline='\n')
+                (root/'files').write_text(changed + '\n', newline='\n')
+                witness = root/'witness.py'
+                witness.write_text('''import json,os,sys
+from pathlib import Path
+kind,*args=sys.argv[1:]
+row={'kind':kind,'args':args,'environment':{k:os.environ.get(k) for k in json.loads(os.environ['WITNESS_KEYS'])}}
+with Path(os.environ['WITNESS_EVENTS']).open('a') as f: f.write(json.dumps(row)+'\\n')
+if kind=='setup':
+ print('setup stdout retained'); print('setup stderr retained',file=sys.stderr)
+ if int(os.environ['WITNESS_SETUP_EXIT']): sys.exit(int(os.environ['WITNESS_SETUP_EXIT']))
+ Path(args[0]).write_text(json.dumps({'fixture_selection':True}))
+ Path(args[1]).write_bytes(b''.join(k.encode()+b'\\0'+v.encode()+b'\\0' for k,v in json.loads(os.environ['WITNESS_CHOSEN']).items() if k!='RUSTFLAGS'))
+elif kind=='cargo':
+ if args[:1]==['tree']: print('a v0.1.0\\nb v0.1.0')
+ elif args[:1]==['metadata']: print(json.dumps({'packages':[{'name':'a','metadata':{},'targets':[{'name':'a','kind':['lib']}]}]}))
+ elif args==['nextest','--version']: print('cargo-nextest 0.9.146')
+''')
+                (root/'scripts/lib/msvc-setup.py').write_text(
+                    "import os,runpy,sys\nsys.argv.insert(1,'setup')\nrunpy.run_path(os.environ['FIXTURE_WITNESS'],run_name='__main__')\n")
+                (root/'scripts/cargo-guarded.sh').write_text(
+                    '#!/usr/bin/env bash\nexec "$FIXTURE_PYTHON" "$FIXTURE_WITNESS" guarded "$@"\n', newline='\n')
+                (root/'scripts/cargo-guarded.sh').chmod(0o755)
+                for name in ('check-names.sh', 'check-locks.sh', 'miri.sh'):
+                    (root/'scripts'/name).write_text('exit 0\n', newline='\n')
+                (root/'scripts/lib/gate-key.sh').write_text('gate_tools_check() { return 0; }\n', newline='\n')
+                (root/'scripts/lib/test-targets.py').write_text('print("")\n')
+                (root/'scripts/lib/windows-tests.py').write_text(
+                    "import sys\nprint({'check':'','os-crates':'a','packages':'a','expr':'all()'}[sys.argv[1]])\n")
+                (root/'scripts/lib/gate-selection.py').write_text(
+                    "import json,sys\njson.dump({'changed':['a'],'dependents':[]},open(sys.argv[2],'w'))\n")
+                (root/'benches/suite/tests').mkdir(parents=True)
+                (root/'benches/suite/tests/isolation.py').write_text('pass\n')
+                shell_env = root/'bash-env'
+                shell_env.write_text('cargo() { "$FIXTURE_PYTHON" "$FIXTURE_WITNESS" cargo "$@"; }\n', newline='\n')
+                env = {**CLEAN, 'PATH':os.pathsep.join((str(Path(bash).parent), str(Path(sys.executable).parent), CLEAN['PATH'])),
+                    'BASH_ENV':shell_env.as_posix(), 'FIXTURE_PYTHON':Path(sys.executable).as_posix(),
+                    'FIXTURE_WITNESS':witness.as_posix(), 'WITNESS_EVENTS':str(root/'events.jsonl'),
+                    'WITNESS_KEYS':json.dumps(keys), 'WITNESS_CHOSEN':json.dumps(chosen),
+                    'WITNESS_SETUP_EXIT':str(setup_exit), 'NRESE_BUILD_HOST':'local',
+                    'NRESE_ON_BUILD_HOST':'1', 'NRESE_FILES_FROM':(root/'files').as_posix(),
+                    'NRESE_W3C_OPTIONAL':'1', 'RUSTFLAGS':chosen['RUSTFLAGS'],
+                    'FLEET_OUT':str(root/'out'), 'FLEET_JOB':'caller-fixture', 'FLEET_STEP':'1',
+                    'NRESE_GATE_INNER':'unit', 'NRESE_GATE_UNIT':'all', 'NRESE_GATE_PART':'windows',
+                    **{f'NRESE_GATE_{name}':str(root/name.lower()) for name in ('REQUIRED','STEPS','SELECTION')},
+                    **(selected or {})}
+                argv = [bash, '.githooks/pre-commit'] if mode == 'commit' else [bash, 'scripts/check.sh', mode]
+                result = subprocess.run(argv, cwd=root, env=env, capture_output=True, timeout=45)
+                # Persist raw exit/streams before examining optional events/receipts.
+                if os.environ.get('FLEET_OUT'):
+                    kept = Path(os.environ['FLEET_OUT'])/'normal-caller'/label
+                    kept.mkdir(parents=True, exist_ok=True)
+                    (kept/'stdout').write_bytes(result.stdout); (kept/'stderr').write_bytes(result.stderr)
+                    (kept/'exit').write_text(str(result.returncode)+'\n')
+                    if (root/'events.jsonl').exists(): shutil.copyfile(root/'events.jsonl', kept/'events.jsonl')
+                    shutil.copytree(root/'out', kept/'setup', dirs_exist_ok=True)
+                events = [json.loads(line) for line in (root/'events.jsonl').read_text().splitlines()]
+                setups = [row for row in events if row['kind']=='setup']
+                compiled = [row for row in events if row['kind']=='guarded']
+                needs_setup = selected is None and label != 'documents'
+                self.assertEqual(len(setups), int(needs_setup), 'normal compilation must select exactly once')
+                self.assertEqual(result.returncode, 75 if setup_exit else 0, result.stdout+result.stderr)
+                if setup_exit:
+                    self.assertFalse(compiled, 'setup failure must stop before compiling Cargo')
+                    stage = next((root/'out').glob('msvc-setup.*'))
+                    self.assertEqual((stage/'exit').read_text().strip(), str(setup_exit))
+                    self.assertIn('setup stderr retained', (stage/'stderr').read_text())
+                    self.assertIn(b'setup stderr retained', result.stderr)
+                elif label != 'documents':
+                    self.assertTrue(compiled, 'fixture must reach existing guarded Cargo boundary')
+                    if needs_setup:
+                        self.assertLess(events.index(setups[0]), events.index(compiled[0]))
+                    for row in compiled:
+                        self.assertEqual(row['environment'], selected or chosen,
+                                         'selected environment must reach every guarded Cargo unchanged')
+                else:
+                    self.assertFalse(compiled)
+                self.assertFalse(list((root/'out').glob('msvc-setup.*/environment')))
+
     def test_ordinary_setup_exports_selected_env_before_existing_cargo_owner(self):
         # Run the real setup block with a fake Microsoft setup result. No native
         # developer environment, compiler, Cargo, Fleet, or repository is invoked.
