@@ -589,9 +589,24 @@ pub async fn explain(
                 Some((Vec::new(), None, Some(reason)))
             }
             // Not derived by the rules: under owl2-dl, why OWL 2 DL entails it.
-            None if dl => store
-                .explain_dl(&scope, statement)
-                .map(|e| (Vec::new(), Some(DlJustified::from(e)), None)),
+            None if dl => match store.explain_dl_outcome(&scope, statement)? {
+                nrese_store::dl::explain::DlExplanationOutcome::Explained(answer) => {
+                    Some((Vec::new(), Some(DlJustified::from(answer)), None))
+                }
+                nrese_store::dl::explain::DlExplanationOutcome::DoesNotHold => None,
+                nrese_store::dl::explain::DlExplanationOutcome::Unknown(why) => {
+                    let mut status = nrese_sparql::completeness::Completeness::under(
+                        nrese_sparql::Regime::Owl2Dl,
+                    );
+                    status.incomplete("dl", why);
+                    return Err(nrese_store::StoreError::Incomplete(Box::new(
+                        nrese_store::IncompleteAnswer {
+                            status,
+                            unresolved: Vec::new(),
+                        },
+                    )));
+                }
+            },
             None => None,
         })
     })

@@ -55,27 +55,30 @@ struct Search<'a> {
     tests: usize,
     deadline: Deadline,
     spent: bool,
+    unknown: Option<String>,
 }
 
 impl Search<'_> {
     /// Whether the axioms `subset` (with the background) give the goal; a test past the
     /// budget counts as "no" (so the axioms stay in), and marks the search spent.
     fn holds(&mut self, subset: &[usize]) -> bool {
-        if self
-            .budget
-            .explanation_tests
-            .is_some_and(|most| self.tests >= most)
-            || self.deadline.passed()
-            || self
-                .budget
-                .cancel
-                .as_ref()
-                .is_some_and(|c| c.is_cancelled())
-        {
+        let stopped = self.budget.stopped(self.deadline).or_else(|| {
+            self.budget
+                .explanation_tests
+                .is_some_and(|most| self.tests >= most)
+                .then(|| "dl.explanation_tests reached before the entailment test".to_owned())
+        });
+        if let Some(why) = stopped {
             self.spent = true;
+            self.unknown = Some(why);
             return false;
         }
-        self.tests += 1;
+        let Some(tests) = self.tests.checked_add(1) else {
+            self.spent = true;
+            self.unknown = Some("explanation test count is unrepresentable".to_owned());
+            return false;
+        };
+        self.tests = tests;
         let mut o = Ontology {
             axioms: Vec::new(),
             sources: Vec::new(),
@@ -90,8 +93,9 @@ impl Search<'_> {
                 match consistency::check_until(&o, self.budget, self.deadline).verdict {
                     Verdict::Inconsistent => true,
                     Verdict::Consistent => false,
-                    Verdict::Unknown(_) => {
+                    Verdict::Unknown(why) => {
                         self.spent = true;
+                        self.unknown = Some(why);
                         false
                     }
                 }
@@ -100,8 +104,9 @@ impl Search<'_> {
                 match entailment::entails_until(&o, axiom, self.fresh, self.budget, self.deadline) {
                     Entailed::Yes => true,
                     Entailed::No => false,
-                    Entailed::Unknown(_) => {
+                    Entailed::Unknown(why) => {
                         self.spent = true;
+                        self.unknown = Some(why);
                         false
                     }
                 }
@@ -163,6 +168,19 @@ pub(crate) fn justify(
     budget: &Budget,
     deadline: Deadline,
 ) -> Option<Justification> {
+    justify_outcome(ontology, goal, fresh, budget, deadline)
+        .ok()
+        .flatten()
+}
+
+/// `Ok(None)` is definitive non-entailment; `Err` preserves an initial unknown.
+pub(crate) fn justify_outcome(
+    ontology: &Ontology,
+    goal: &Goal,
+    fresh: &[u64],
+    budget: &Budget,
+    deadline: Deadline,
+) -> Result<Option<Justification>, String> {
     let (background, candidates): (Vec<usize>, Vec<usize>) = (0..ontology.axioms.len())
         .partition(|&i| matches!(ontology.axioms[i], Axiom::Declaration(..)));
     let mut search = Search {
@@ -174,15 +192,19 @@ pub(crate) fn justify(
         tests: 0,
         deadline,
         spent: false,
+        unknown: None,
     };
     if !search.holds(&candidates) {
-        return None;
+        return match search.unknown {
+            Some(why) => Err(why),
+            None => Ok(None),
+        };
     }
     let axioms = match candidates.is_empty() {
         true => Vec::new(),
         false => search.qx(&[], false, &candidates),
     };
-    Some(search.finish(candidates, axioms))
+    Ok(Some(search.finish(candidates, axioms)))
 }
 
 /// An axiom of a justification, as the store holds it.
@@ -204,6 +226,19 @@ pub struct DlExplanation {
     pub tests: usize,
     pub micros: u64,
 }
+
+/// A bounded search which never established truth is not non-entailment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DlExplanationOutcome {
+    Explained(DlExplanation),
+    DoesNotHold,
+    Unknown(String),
+}
+
+// The same statement-independent wording for an incapable read scope and an input
+// the snapshot cannot represent. Neither branch established a countermodel, and
+// neither may disclose private graphs or distinguish hidden from missing terms.
+const INPUT_UNDECIDED: &str = "the DL explanation cannot be decided from the available input";
 
 /// The justification's axioms with their sources, decoded.
 pub(crate) fn explained(
@@ -254,38 +289,51 @@ fn by_graph(
 }
 
 impl crate::StoreService {
-    /// Why the statement `subject predicate object` holds under OWL 2 DL: a minimal set
-    /// of the asserted ontology's axioms entailing it, with where each was read from
-    /// (the module docs). `None` if it doesn't hold (or that wasn't decided), or the
-    /// reader doesn't see every graph (DL answers are only theirs). On a replica, `None`
-    /// where the entailment tests' terms haven't arrived.
+    /// Compatibility wrapper: an initial unknown has no explanation. Outcome-sensitive
+    /// consumers use explain_dl_outcome to distinguish it from non-entailment.
     pub fn explain_dl(
         &self,
         scope: &crate::ReadScope,
         statement: [nrese_rdf::TermRef<'_>; 3],
     ) -> Option<DlExplanation> {
+        match self.explain_dl_outcome(scope, statement).ok()? {
+            DlExplanationOutcome::Explained(answer) => Some(answer),
+            DlExplanationOutcome::DoesNotHold | DlExplanationOutcome::Unknown(_) => None,
+        }
+    }
+
+    /// Legacy DL construction with a truthful initial outcome. This compatibility
+    /// method does not claim full checked mapper/import/output resource ownership.
+    pub fn explain_dl_outcome(
+        &self,
+        scope: &crate::ReadScope,
+        statement: [nrese_rdf::TermRef<'_>; 3],
+    ) -> crate::StoreResult<DlExplanationOutcome> {
         use nrese_engine::TermId;
         use nrese_rdf::NamedNodeRef;
         if !matches!(scope, crate::ReadScope::All) {
-            return None;
+            return Ok(DlExplanationOutcome::Unknown(INPUT_UNDECIDED.to_owned()));
         }
         let started = Instant::now();
         let snapshot = self.engine().snapshot();
         let [s, p, o] = statement.map(|t| snapshot.lookup(t).map(TermId::raw));
-        let (s, p, o) = (s?, p?, o?);
+        let (Some(s), Some(p), Some(o)) = (s, p, o) else {
+            return Ok(DlExplanationOutcome::Unknown(INPUT_UNDECIDED.to_owned()));
+        };
         let base = super::query::ontology_at(self, &snapshot);
         // The request's envelope: its copy of the premise, and the tests' engines.
         let memory = self.envelope(None);
         let mut scratch = nrese_dl::memory::Scratch::new(Some(&memory));
-        scratch
-            .charge(|| nrese_dl::memory::ontology_bytes(&base))
-            .ok()?;
+        scratch.charge(|| nrese_dl::memory::ontology_bytes(&base))?;
         let mut ontology = (*base).clone();
         let ids = super::query::Ids::of(&snapshot);
-        let axiom = super::query::ground_axiom(&mut ontology, &snapshot, [s, p, o], ids).ok()?;
+        let axiom = match super::query::ground_axiom(&mut ontology, &snapshot, [s, p, o], ids) {
+            Ok(axiom) => axiom,
+            Err(why) => return Ok(DlExplanationOutcome::Unknown(why)),
+        };
         let tx = self.engine().speculative();
         let replica = self.dl().replica();
-        let fresh: Vec<u64> = (0..super::source::FRESH)
+        let fresh: Option<Vec<u64>> = (0..super::source::FRESH)
             .map(|i| {
                 super::source::resolve(
                     replica,
@@ -294,31 +342,41 @@ impl crate::StoreService {
                 )
                 .map(TermId::raw)
             })
-            .collect::<Option<_>>()?;
+            .collect();
+        let Some(fresh) = fresh else {
+            return Ok(DlExplanationOutcome::Unknown(
+                "replica entailment terms have not arrived".to_owned(),
+            ));
+        };
         let deadline = Deadline::after(self.config().dl.timeout);
         // An entailment oracle can contain several consistency checks. The shared
         // token also stops those inner tests at this operation's deadline.
         let justification = super::gate::cancellable(&|| deadline.passed(), |cancel| {
-            justify(
+            justify_outcome(
                 &ontology,
                 &Goal::Entails(axiom),
                 &fresh,
                 &super::gate::budget(self, Some(cancel), &memory),
                 deadline,
             )
-        })?;
+        });
+        let justification = match justification {
+            Ok(Some(answer)) => answer,
+            Ok(None) => return Ok(DlExplanationOutcome::DoesNotHold),
+            Err(why) => return Ok(DlExplanationOutcome::Unknown(why)),
+        };
         let decode = |t: u64| {
             snapshot
                 .decode(TermId::from_raw(t))
                 .map_or_else(|| format!("#{t}"), |term| term.to_string())
         };
-        Some(DlExplanation {
+        Ok(DlExplanationOutcome::Explained(DlExplanation {
             axioms: explained(&ontology, &justification, &decode),
             minimal: justification.minimal,
             verified: justification.verified,
             tests: justification.tests,
-            micros: started.elapsed().as_micros() as u64,
-        })
+            micros: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        }))
     }
 }
 
@@ -353,6 +411,7 @@ mod tests {
                 tests: 0,
                 deadline: Deadline::after(budget.timeout),
                 spent: false,
+                unknown: None,
             };
             assert!(
                 search.holds(&[0]),
