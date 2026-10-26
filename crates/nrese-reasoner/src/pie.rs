@@ -48,6 +48,7 @@ use std::collections::HashMap;
 
 use super::ir::{Atom, Guard, Head, ParseError, Rule, Term, Vocabulary};
 use super::n3::N3Program;
+use super::vocabulary::LocalVocabulary;
 
 /// Compiles `text`, a `.pie` document (`name` prefixes errors).
 pub fn compile(
@@ -439,20 +440,26 @@ fn options(raw: Vec<String>) -> Result<Options, String> {
     Ok(out)
 }
 
-/// The version of [`context_predicate`]'s names, part of a `[Context]` ruleset's fingerprint
-/// ([`crate::RuleProgram::fingerprint`]): change it with any change to those names, so stores
-/// materialised under the old ones rebuild instead of keeping relations nothing derives now.
-/// 2: `%` and `#` in either part percent-encoded (20 Oct 2026; 1: plain concatenation).
-pub(crate) const CONTEXT_NAMES: u32 = 2;
+/// What the relations of statements in a context are named by ([`context_predicate`]).
+const CONTEXT_PREFIX: &str = "urn:nrese:pie-context:";
 
-/// Whether a `.pie` text may state a statement in a context, using the parser's comment
-/// removal and option whitespace. A match inside a literal or IRI can only rebuild a
-/// closure unnecessarily; an accepted context option must never be missed.
-pub(crate) fn uses_contexts(text: &str) -> bool {
-    strip_comments(text)
-        .split('[')
-        .skip(1)
-        .any(|option| option.trim_start().starts_with("Context"))
+/// The context relations a compiled ruleset's rules read or derive, sorted, each once. They
+/// are part of its fingerprint ([`crate::RuleProgram::fingerprint`]): a build that names
+/// them otherwise derives other relations, so its stores rebuild.
+pub(crate) fn context_relations(program: &N3Program, vocabulary: &LocalVocabulary) -> Vec<String> {
+    let atoms = program.rules.iter().flat_map(|rule| match &rule.head {
+        Head::Facts(heads) => rule.body.iter().chain(heads),
+        Head::Inconsistent => rule.body.iter().chain(&[]),
+    });
+    let mut names: Vec<String> = atoms
+        .filter_map(|atom| super::eval::constants(atom)[1])
+        .map(|predicate| vocabulary.text(predicate))
+        .filter(|name| name.trim_start_matches('<').starts_with(CONTEXT_PREFIX))
+        .map(str::to_owned)
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// The predicate a statement in `context` gets ([`compile`]'s docs): the pair's one name.
@@ -470,7 +477,7 @@ fn context_predicate(
     };
     match (context, predicate) {
         (Token::Iri(context), Token::Iri(predicate)) => Ok(Token::Iri(format!(
-            "urn:nrese:pie-context:{}#{}",
+            "{CONTEXT_PREFIX}{}#{}",
             part(context),
             part(predicate)
         ))),

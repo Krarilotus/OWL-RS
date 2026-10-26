@@ -20,8 +20,9 @@ pub struct UserRules {
     name: String,
     text: String,
     format: RuleFormat,
-    /// Selected once with the validated text; fingerprint checks must not parse it again.
-    pie_contexts: bool,
+    /// The relations a GraphDB ruleset's contexts compile to, taken from the validating
+    /// compile: part of the fingerprint.
+    context_relations: Vec<String>,
 }
 
 /// The languages user rules are read in.
@@ -53,10 +54,13 @@ impl UserRules {
             name: name.into(),
             text: text.into(),
             format,
-            pie_contexts: false,
+            context_relations: Vec::new(),
         };
-        rules.compile(&mut LocalVocabulary::default())?;
-        rules.pie_contexts = format == RuleFormat::Pie && super::pie::uses_contexts(&rules.text);
+        let mut vocabulary = LocalVocabulary::default();
+        let compiled = rules.compile(&mut vocabulary)?;
+        if format == RuleFormat::Pie {
+            rules.context_relations = super::pie::context_relations(&compiled, &vocabulary);
+        }
         Ok(rules)
     }
 
@@ -119,7 +123,8 @@ impl RuleProgram {
     }
 
     /// Identifies what the program derives: the built-in ruleset's fingerprint, and
-    /// FNV-1a over the user rules' text. Stable across builds and platforms.
+    /// FNV-1a over [`SEMANTICS_VERSION`], the user rules' text and the relations their
+    /// contexts compile to. Stable across builds and platforms.
     pub fn fingerprint(&self) -> u64 {
         let Some(user) = &self.user else {
             return self.base.map_or(0, Ruleset::fingerprint);
@@ -136,11 +141,12 @@ impl RuleProgram {
         feed(&SEMANTICS_VERSION.to_le_bytes());
         feed(b"custom:");
         feed(user.text.as_bytes());
-        // A GraphDB ruleset with contexts derives relations named by the PIE compiler; a
-        // change of those names is a change of what it derives. Others keep their value.
-        if user.pie_contexts {
-            feed(b"pie-context-names:");
-            feed(&super::pie::CONTEXT_NAMES.to_le_bytes());
+        // A GraphDB ruleset with contexts derives relations the PIE compiler names, so a
+        // build that names them otherwise derives other relations. Others keep their value.
+        for name in &user.context_relations {
+            feed(b"pie-context:");
+            feed(name.as_bytes());
+            feed(&[0]);
         }
         hash
     }
@@ -227,11 +233,8 @@ mod tests {
         hash
     }
 
-    /// A GraphDB ruleset with contexts no longer matches the state a build with the old
-    /// context names stored, so the store rebuilds its closure; other rulesets keep theirs.
-    #[test]
-    fn changed_context_names_make_older_closures_stale() {
-        let with = "Prefices { e : http://e/ }
+    /// A GraphDB ruleset whose conclusion is in a context.
+    const IN_A_CONTEXT: &str = "Prefices { e : http://e/ }
 Rules
 {
 Id: r
@@ -240,32 +243,41 @@ Id: r
   x <e:q> y [Context <e:g#x>]
 }
 ";
-        let without = "Prefices { e : http://e/ }
-Rules
-{
-Id: r
-  x <e:p> y
-  ---
-  x <e:q> y
-}
-";
-        let spaced = with.replace("[Context", "[ Context");
-        let tabbed = with.replace("[Context", "[\tContext");
-        let prefixed_comment = with.replace("[Context", "[/*gap*/Context");
-        let inner_comment = with.replace("[Context", "[Con/*gap*/text");
-        for (text, rebuilds) in [
-            (with, true),
-            (&spaced, true),
-            (&tabbed, true),
-            (&prefixed_comment, true),
-            (&inner_comment, true),
-            (without, false),
-        ] {
+
+    /// A GraphDB ruleset with contexts no longer matches the state a build with the old
+    /// context names stored, so the store rebuilds its closure; other rulesets keep theirs.
+    /// `[ Context` is an accepted spelling (fix check 1 of R1-F1).
+    #[test]
+    fn changed_context_names_make_older_closures_stale() {
+        let without = IN_A_CONTEXT.replace(" [Context <e:g#x>]", "");
+        let spaced = IN_A_CONTEXT.replace("[Context", "[ Context");
+        for (text, rebuilds) in [(IN_A_CONTEXT, true), (&spaced, true), (&without, false)] {
             let user = Arc::new(UserRules::pie("rules.pie", text).unwrap());
             let program = RuleProgram::new(None, Some(user)).unwrap();
             let stored = fingerprint_before_context_names(text);
             assert_eq!(program.fingerprint() != stored, rebuilds, "{text}");
         }
+    }
+
+    /// The names the rules' context relations compile to are part of the fingerprint: a
+    /// build that names them otherwise, as the plain concatenation before 20 Oct did,
+    /// rebuilds what this one stored, with no version to change by hand (review of PR #29,
+    /// R1-OL1).
+    #[test]
+    fn renamed_context_relations_change_the_fingerprint() {
+        let user = UserRules::pie("rules.pie", IN_A_CONTEXT).unwrap();
+        assert_eq!(
+            user.context_relations,
+            ["<urn:nrese:pie-context:http://e/g%23x#http://e/q>"]
+        );
+        let mut renamed = user.clone();
+        renamed.context_relations = vec!["<urn:nrese:pie-context:http://e/g#x#http://e/q>".into()];
+        let fingerprint = |user: UserRules| {
+            RuleProgram::new(None, Some(Arc::new(user)))
+                .unwrap()
+                .fingerprint()
+        };
+        assert_ne!(fingerprint(user), fingerprint(renamed));
     }
 
     #[test]
