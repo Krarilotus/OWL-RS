@@ -2,7 +2,7 @@
 //! at least once, and the cases the Horn stage gives up.
 
 use nrese_dl::context::Unsupported;
-use nrese_owl::{Axiom, Characteristic, ClassExpr, ObjProp};
+use nrese_owl::{Axiom, Characteristic, ClassExpr, ExprId, ObjProp};
 
 use super::support::{Build, Table, classify, holds, unsat};
 
@@ -338,4 +338,30 @@ fn parallel_equals_sequential_on_the_examples() {
         );
     }
     assert!(!one.subsumptions.is_empty());
+}
+
+/// A clause body wider than a slot's positions (review A-1401): `Cᵢ ⊑ Cᵢ₊₁` and
+/// `C₀ ⊓ … ⊓ Cₙ₋₁ ⊑ D` entail `C₀ ⊑ D`. At 256 atoms, the most a slot names, it is found;
+/// at 257 it is found, or the Horn stage refuses: never left out.
+#[test]
+fn a_wide_clause_body_is_never_misread() {
+    for n in [256, 257] {
+        let mut table = Table::default();
+        let mut b = Build::new(&mut table);
+        let cs: Vec<ExprId> = (0..n).map(|i| b.c(&format!("C{i}"))).collect();
+        for pair in cs.windows(2) {
+            b.sub(pair[0], pair[1]);
+        }
+        let all = b.and(&cs);
+        let d = b.c("D");
+        b.sub(all, d);
+        match (n, classify(&b.done(), 1)) {
+            (_, Ok(c)) => assert!(
+                holds(&mut table, &c, "C0", "D"),
+                "{n} atoms: C0 ⊑ D left out"
+            ),
+            (256, Err(why)) => panic!("256 atoms refused: {why:?}"),
+            (_, Err(_)) => {}
+        }
+    }
 }
