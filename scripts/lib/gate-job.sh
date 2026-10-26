@@ -17,9 +17,7 @@
 # nextest and Python's under the cache directory. No step reaches a Docker daemon.
 #
 # Results ($FLEET_OUT): gate.log, the run's output; check.log, check.sh's; attempt, this
-# attempt's name; gate.json, what it was (tier, tree, file list, toolchain and flags, the CPU
-# `native` resolved to, the host (its name and the fleet's), the job and attempt, each step's exit
-# code and seconds from check.sh's summary, and whether the run left tracked files changed).
+# attempt's name; gate.json, what it was (scripts/lib/gate-record.py).
 # Exit: check.sh's; 3 when the run couldn't be made (no verdict: the push waits).
 set -u
 mode=$1 tree=$2 list_hash=$3
@@ -208,27 +206,6 @@ GATE_TIER=$mode GATE_TREE=$tree GATE_LIST=$list_hash GATE_IDENTITY=$identity GAT
   GATE_CPU=$(gate_cpu) GATE_HOST=$(hostname) GATE_NEXTEST=$(cargo nextest --version 2> /dev/null | head -1) \
   GATE_CHANGED=$(git status --porcelain --untracked-files=no) GATE_SECONDS=$((SECONDS - began)) GATE_PEAK=$peak \
   GATE_JOB=${FLEET_JOB:-} GATE_FLEET_HOST=${FLEET_HOST:-} GATE_ATTEMPT=$attempt \
-  python3 - "$out" << 'EOF'
-import json, os, re, sys
-e, out = os.environ, sys.argv[1]
-# The steps as check.sh's summary lists them: `  <code>  <name> (<seconds> s)` after `=== summary`.
-steps, summary = [], False
-for line in open(f"{out}/check.log", encoding="utf-8", errors="replace"):
-    if line.startswith("=== summary"):
-        summary, steps = True, []
-        continue
-    m = re.match(r"^  (\d+)  (.*) \((\d+) s\)$", line.rstrip("\n")) if summary else None
-    if m:
-        steps.append({"name": m.group(2), "code": int(m.group(1)), "seconds": int(m.group(3))})
-json.dump({
-    "tier": e["GATE_TIER"], "tree": e["GATE_TREE"], "list_hash": e["GATE_LIST"],
-    "identity": e["GATE_IDENTITY"], "w3c_optional": bool(e.get("NRESE_W3C_OPTIONAL")),
-    "cpu": e["GATE_CPU"], "host": e["GATE_HOST"], "nextest": e["GATE_NEXTEST"],
-    "job": e["GATE_JOB"], "fleet_host": e["GATE_FLEET_HOST"], "attempt": e["GATE_ATTEMPT"],
-    "summary": summary, "steps": steps, "code": int(e["GATE_CODE"]), "tracked_changes": e["GATE_CHANGED"],
-    "seconds": int(e["GATE_SECONDS"]),
-    "memory_peak_gb": round(int(e["GATE_PEAK"]) / 2**30, 2) if e.get("GATE_PEAK") else None,
-}, open(f"{out}/gate.json", "w"), indent=1)
-EOF
+  python3 "$tool/scripts/lib/gate-record.py" "$out"
 sweep
 exit $code

@@ -46,8 +46,9 @@ job (`FLEET_OWNER` names your thread), and only a verified fleet result lets the
 verdict, no push. A pass is remembered for the same tree, files and toolchain, so run
 `scripts/check.sh push` (it gates HEAD) before a long push: the hook then passes at once. A push
 that only deletes refs needs no gate. The merge check's Windows part runs the same way:
-`scripts/check.sh windows [COMMIT]` builds COMMIT (default HEAD, which must hold it) whole on a
-Windows fleet host and runs all its tests, its doc tests and the suite contracts; a commit whose
+`scripts/check.sh windows [COMMIT]` (default HEAD) runs COMMIT's own `windows` tier on a Windows
+fleet host: the whole workspace built, all its tests, its doc tests and the suite contracts. A
+commit whose
 inputs (every file but the docs no other file names, `scripts/lib/gate-key.sh`) passed before
 carries that pass.
 Build through `scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most `NRESE_BUILD_SLOTS`

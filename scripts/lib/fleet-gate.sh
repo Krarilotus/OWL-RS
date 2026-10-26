@@ -8,9 +8,9 @@
 # COMMIT (its tree TREE) with the changed files of LIST. The job yields to timed work: never
 # started beside it, stopped when a timed job of higher priority wants its host. It runs on a
 # Linux host with the test role.
-# MODE windows (LIST empty): a job of kind owlrs.any (kraris-gptler has no test role) on a Windows
-# host, from this checkout's HEAD, which must hold COMMIT: HEAD's scripts/lib/windows-job.ps1
-# checks COMMIT out there and runs it whole (scripts/lib/windows-job.sh).
+# MODE windows (LIST empty): a job of kind owlrs.any on a Windows host that can run the OWL-RS
+# Windows suite (`has = ["owlrs-windows-suite"]`, declared in the fleet's config), which runs the
+# commit's own scripts/lib/windows-job.ps1 and through it its scripts/check.sh windows.
 # NRESE_GATE_HOSTS: only these hosts. It follows the job and reads its result: valid only when it
 # is for TREE, LIST_HASH, this tier and IDENTITY (the toolchain and the flags,
 # scripts/lib/gate-key.sh) and left no tracked file changed.
@@ -26,8 +26,9 @@
 # 75 no verdict: no FLEET_OWNER, the fleet refused or didn't answer, no host started it within
 # NRESE_GATE_START_S (default 180 s; again after a host stopped it), it ran past NRESE_GATE_MAX_S
 # (default 10800 s), or its result is missing or for something else. The job is cancelled then,
-# and nothing runs here instead: no verdict, no push. For windows the start window is 1800 s: the
-# fleet counts the main PC's own load, and kraris-gptler took 7 min to free 8 cores (26 Oct 2026).
+# and nothing runs here instead: no verdict, no push. For windows the start window is 1800 s and
+# the ask 6 cores: the fleet counts the main PC's own load, and kraris-gptler didn't free 8 cores
+# within 30 min on 26 Oct 2026.
 set -u
 mode=$1 list=$2 tree=$3 list_hash=$4 identity=$5 where=$6 commit=$7
 cd "$(git rev-parse --show-toplevel)" || exit 75
@@ -46,13 +47,6 @@ no_verdict() {
 
 fleet_ready || no_verdict "no fleet to ask"
 [ "$(git rev-parse "$commit^{tree}" 2> /dev/null)" = "$tree" ] || no_verdict "commit $commit isn't tree $tree"
-# The job's checkout: the commit itself; for windows HEAD, whose history the fleet sends with it.
-input=$commit
-if [ "$mode" = windows ]; then
-  input=$(git rev-parse HEAD)
-  git merge-base --is-ancestor "$commit" "$input" \
-    || no_verdict "HEAD doesn't hold $commit (the job runs HEAD's scripts on it): check it from a checkout that does"
-fi
 
 # What a tier asks for (cores also bound its compilers; the step's slice caps its memory on
 # Linux, scripts/cargo-guarded.sh's job object on Windows).
@@ -61,7 +55,7 @@ reason="the $mode gate of a pushed commit (scripts/check.sh); no push without it
 case $mode in
   push) cores=${NRESE_GATE_CORES:-8} ram=${NRESE_GATE_RAM_GB:-12} est=${NRESE_GATE_EST_MIN:-40} ;;
   windows)
-    cores=${NRESE_GATE_CORES:-8} ram=${NRESE_GATE_RAM_GB:-16} est=${NRESE_GATE_EST_MIN:-30}
+    cores=${NRESE_GATE_CORES:-6} ram=${NRESE_GATE_RAM_GB:-16} est=${NRESE_GATE_EST_MIN:-30}
     os=windows kind=owlrs.any confirm=kraris-gptler start_s=${NRESE_GATE_START_S:-1800}
     reason="the merge check's Windows part (scripts/check.sh windows); no merge without it" ;;
   *) cores=${NRESE_GATE_CORES:-2} ram=${NRESE_GATE_RAM_GB:-4} est=${NRESE_GATE_EST_MIN:-10} ;;
@@ -81,8 +75,8 @@ gate() {
     echo "priority_reason = $(q "${NRESE_GATE_REASON:-$reason}")"
     echo "est_min = $est"
     if [ "$mode" = windows ]; then
-      printf 'steps = [["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", %s, %s, %s]]\n' \
-        '"scripts/lib/windows-job.ps1"' "$(q "$commit")" "$(q "$tree")"
+      printf 'steps = [["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", %s, %s]]\n' \
+        '"scripts/lib/windows-job.ps1"' "$(q "$tree")"
     else
       printf 'steps = [["bash", "scripts/lib/gate-job.sh", %s, %s, %s, "--"' "$(q "$mode")" "$(q "$tree")" "$(q "$list_hash")"
       while IFS= read -r file; do printf ', %s' "$(q "$file")"; done < "$list"
@@ -103,6 +97,8 @@ gate() {
     echo "os = $(q "$os")"
     echo "cores = $cores"
     echo "ram_gb = $ram"
+    # A host that can run the suite there (its Python packages, Git Bash), which its config declares.
+    [ "$mode" != windows ] || echo 'has = ["owlrs-windows-suite"]'
     if [ -n "$1" ]; then
       printf 'hosts = ['
       local h sep=""
@@ -111,7 +107,7 @@ gate() {
     fi
     echo '[[inputs]]'
     echo 'name = "checkout"'
-    echo "source = { git = $(q "$(fleet_repo)"), rev = $(q "$input") }"
+    echo "source = { git = $(q "$(fleet_repo)"), rev = $(q "$commit") }"
   } > "$job"
   fleet_submit "$job" || no_verdict "the fleet refused the job"
   fleet_say "submitted (priority $priority, asks $cores cores and $ram GB${1:+, on $1})"
