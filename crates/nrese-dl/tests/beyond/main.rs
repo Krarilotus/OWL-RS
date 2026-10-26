@@ -192,6 +192,42 @@ fn an_exact_classification_settles_each_class() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// SWRL's comparisons (SWRL §8.1): an inclusive one holds for equal values of any type, so
+/// `lessThanOrEqual(true, true) → a ≠ a` has no model (review A-1607); a strict one on equal
+/// values doesn't hold, so its rule never fires; `lessThan(false, true)` holds, so its rule
+/// has no model either, and where the order isn't evaluated nothing is certified.
+#[test]
+fn comparisons_hold_as_swrl_defines_them() {
+    for (body, consistent) in [
+        (
+            "lessThanOrEqual \"true\"^^xsd:boolean \"true\"^^xsd:boolean",
+            false,
+        ),
+        (
+            "greaterThanOrEqual \"true\"^^xsd:boolean \"true\"^^xsd:boolean",
+            false,
+        ),
+        ("lessThan \"true\"^^xsd:boolean \"true\"^^xsd:boolean", true),
+        (
+            "lessThan \"false\"^^xsd:boolean \"true\"^^xsd:boolean",
+            false,
+        ),
+    ] {
+        let (o, _) = read_with_rules(&format!(
+            "{PREFIXES}Ontology(Declaration(NamedIndividual(:a)) ClassAssertion(owl:Thing :a) \
+             DLSafeRule(Body(BuiltInAtom(swrlb:{body})) \
+             Head(DifferentIndividualsAtom(:a :a))))"
+        ))
+        .expect("reads");
+        let verdict = consistency(&o, &Options::default()).verdict;
+        assert_eq!(
+            matches!(verdict, Verdict::Consistent { .. }),
+            consistent,
+            "{body}: {verdict:?}"
+        );
+    }
+}
+
 /// A built-in outside SWRL's (SWRLTab's `abox:hasClass` in ORE's 10860) has no meaning
 /// NRESE knows: its rule is left out and named; "inconsistent" from the rest still holds,
 /// "consistent" isn't claimed.

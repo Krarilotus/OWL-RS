@@ -163,13 +163,26 @@ pub fn built_in(iri: &str, first: Option<&Value>, rest: &[Value]) -> Result<Opti
         .strip_prefix(SWRLB)
         .ok_or_else(|| format!("the built-in {iri} isn't one of SWRL's"))?;
     let unknown = || format!("the built-in swrlb:{name} isn't evaluated here");
-    // Comparisons: every argument bound.
+    // Comparisons: every argument bound. Equal values are equal whatever their type (an
+    // inclusive comparison holds); two values of one type `order` doesn't rank aren't
+    // evaluated here; values of two types have no order between them (SWRL §8.1).
     let compare = |test: fn(std::cmp::Ordering) -> bool| -> Result<Option<Value>, String> {
         let a = first.ok_or_else(|| format!("swrlb:{name} with its first argument unbound"))?;
         let [b] = rest else {
             return Err(format!("swrlb:{name} takes two arguments"));
         };
-        Ok(order(a, b).is_some_and(test).then(|| a.clone()))
+        let ordering = if a == b {
+            Some(std::cmp::Ordering::Equal)
+        } else {
+            order(a, b)
+        };
+        match ordering {
+            Some(o) => Ok(test(o).then(|| a.clone())),
+            None if std::mem::discriminant(a) == std::mem::discriminant(b) => Err(format!(
+                "swrlb:{name} on {a:?} and {b:?}: their order isn't evaluated here"
+            )),
+            None => Ok(None),
+        }
     };
     let computed: Value = match name {
         "equal" => {

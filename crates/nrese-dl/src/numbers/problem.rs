@@ -6,11 +6,12 @@
 //!
 //! The fragment: singleton nominals; named and `⊤` classes; `∃R.B` with `B` named or `⊤`;
 //! unqualified `≥ n R`, `≤ n R` and `= n R`; inclusions and equivalences between these;
-//! inverse pairs, functional and inverse-functional properties, domains and ranges (named
-//! or `⊤`); class assertions of these expressions. Anything else (chains, transitivity and
-//! the other characteristics, sub- and equivalent properties, `Self`, keys, qualified
-//! cardinalities, unions, negation, data, property assertions, equality and inequality of
-//! individuals) is outside, and so are axioms the reader left out.
+//! inverse pairs (one partner per property), functional and inverse-functional properties,
+//! domains and ranges (named or `⊤`); class assertions of these expressions. Anything else
+//! (the built-in properties, chains, transitivity and the other characteristics, sub- and
+//! equivalent properties, `Self`, keys, qualified cardinalities, unions, negation, data,
+//! property assertions, equality and inequality of individuals) is outside, and so are
+//! axioms the reader left out.
 
 use hashbrown::{HashMap, HashSet};
 use nrese_owl::{Axiom, Characteristic, ClassExpr, ExprId, ObjProp, Ontology, Term};
@@ -81,22 +82,25 @@ impl NumberProblem {
     /// The expression `e` in the fragment, if it is.
     fn expr(&self, o: &Ontology, e: ExprId) -> Option<Expr> {
         let thing = |f: ExprId| matches!(o.classes.get(f.0), ClassExpr::Thing);
+        // The built-in properties are fixed relations, outside the fragment here too.
+        let fixed = [o.builtin.top_object, o.builtin.bottom_object];
+        let dir = |r: ObjProp| (!fixed.contains(&Some(r.named()))).then(|| self.dir(r));
         Some(match *o.classes.get(e.0) {
             ClassExpr::Thing => Expr::Thing,
             ClassExpr::Class(a) => Expr::Class(a),
             ClassExpr::OneOf(ref xs) if xs.len() == 1 => Expr::Nominal(xs[0]),
             ClassExpr::Some(r, f) => match *o.classes.get(f.0) {
-                ClassExpr::Thing => Expr::Some(self.dir(r), None),
-                ClassExpr::Class(b) => Expr::Some(self.dir(r), Some(b)),
+                ClassExpr::Thing => Expr::Some(dir(r)?, None),
+                ClassExpr::Class(b) => Expr::Some(dir(r)?, Some(b)),
                 _ => return None,
             },
             ClassExpr::Min(1, r, f) if !thing(f) => match *o.classes.get(f.0) {
-                ClassExpr::Class(b) => Expr::Some(self.dir(r), Some(b)),
+                ClassExpr::Class(b) => Expr::Some(dir(r)?, Some(b)),
                 _ => return None,
             },
-            ClassExpr::Min(n, r, f) if thing(f) => Expr::AtLeast(n, self.dir(r)),
-            ClassExpr::Max(n, r, f) if thing(f) => Expr::AtMost(n, self.dir(r)),
-            ClassExpr::Exact(n, r, f) if thing(f) => Expr::Exact(n, self.dir(r)),
+            ClassExpr::Min(n, r, f) if thing(f) => Expr::AtLeast(n, dir(r)?),
+            ClassExpr::Max(n, r, f) if thing(f) => Expr::AtMost(n, dir(r)?),
+            ClassExpr::Exact(n, r, f) if thing(f) => Expr::Exact(n, dir(r)?),
             _ => return None,
         })
     }
@@ -108,10 +112,13 @@ pub fn extract(o: &Ontology) -> NumberProblem {
     if o.diagnostics.iter().any(|d| d.is_fatal()) {
         p.outside.push((usize::MAX, "axioms the reader left out"));
     }
-    // The inverse pairs first: every direction is folded by them.
+    // The inverse pairs first: every direction is folded by them. One partner per
+    // property: a pair overlapping an earlier one is outside (below).
     for axiom in &o.axioms {
         if let Axiom::InverseObjectProperties(ObjProp::Named(a), ObjProp::Named(b)) = *axiom
             && a != b
+            && !p.inverse.contains_key(&a)
+            && !p.inverse.contains_key(&b)
         {
             p.inverse.insert(a, b);
             p.inverse.insert(b, a);
@@ -135,7 +142,11 @@ pub fn extract(o: &Ontology) -> NumberProblem {
         let out = |p: &mut NumberProblem, why| p.outside.push((i, why));
         match axiom {
             Axiom::Declaration(..) => {}
-            Axiom::InverseObjectProperties(ObjProp::Named(a), ObjProp::Named(b)) if a != b => {}
+            Axiom::InverseObjectProperties(ObjProp::Named(a), ObjProp::Named(b)) if a != b => {
+                if p.inverse.get(a) != Some(b) {
+                    out(&mut p, "overlapping inverse pairs");
+                }
+            }
             Axiom::SubClassOf(a, b) => match (p.expr(o, *a), p.expr(o, *b)) {
                 (Some(sub), Some(sup)) => p.inclusions.push(Inclusion { sub, sup, axiom: i }),
                 _ => out(&mut p, "a class expression outside the fragment"),
@@ -204,6 +215,7 @@ fn axiom_mentions_property(axiom: &Axiom, t: Term) -> bool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::tableau::{Answer, Config, consistency};
     use nrese_owl::DataRange;
 
     /// DL-906's shape at `(n, m, k)` (`nrese_owl::fuzz::multiplication`).
@@ -324,5 +336,69 @@ pub(crate) mod tests {
             assert_eq!(p.outside.len(), 1, "{what}: {:?}", p.outside);
             assert!(p.inclusions.len() >= 14, "{what}: the rest is still read");
         }
+    }
+
+    /// The answer the tableau gives `o` under its defaults, the number module first.
+    fn answer(o: &Ontology) -> Answer {
+        consistency(o, &Config::default()).answer
+    }
+
+    /// Guard (A-1603): `owl:topObjectProperty` U relates every element to `d`, so
+    /// `∃U.⊤ ⊑ only-d` leaves one element, `d`; but `only-d ≡ (= 2 p⁻)` needs two
+    /// p-predecessors. The product `(2, 3, 6)` with it is inconsistent.
+    #[test]
+    fn a_built_in_property_inside_an_expression_is_no_model() {
+        let ([only_d, ..], _, _) = nrese_owl::fuzz::MULTIPLICATION_TERMS;
+        let top = 501;
+        let mut o = product(2, 3, 6);
+        o.builtin.top_object = Some(top);
+        let mut e = |x| ExprId(o.classes.intern(x));
+        let thing = e(ClassExpr::Thing);
+        let some = e(ClassExpr::Some(ObjProp::Named(top), thing));
+        let only_d = e(ClassExpr::Class(only_d));
+        o.axioms.push(Axiom::SubClassOf(some, only_d));
+        o.sources.push(Vec::new());
+        // Outside the shortcut the search would take long: within a budget, giving up is
+        // a refusal too.
+        let config = Config {
+            max_branch_points: Some(20_000),
+            ..Config::default()
+        };
+        let answer = consistency(&o, &config).answer;
+        assert_ne!(answer, Answer::Consistent, "∃U.⊤ ⊑ only-d was missed");
+    }
+
+    /// Guard (A-1604): `A ≡ {a}`, `B ≡ {b}`, `A ⊑ = 1 q`, `B ⊑ = 1 q⁻`, q from A to B, and
+    /// `inverse(p, q)` then `inverse(q, r)`. a's q-successor y is in B, and `p(y, a)` by
+    /// the first pair, which `B ⊑ ≤ 0 p` forbids: inconsistent.
+    #[test]
+    fn overlapping_inverse_pairs_are_no_model() {
+        let ([a, b], [ia, ib], [p, q, r]) = ([1, 2], [100, 101], [10, 11, 12]);
+        let mut o = Ontology::default();
+        let mut e = |x| ExprId(o.classes.intern(x));
+        let thing = e(ClassExpr::Thing);
+        let [ca, cb] = [a, b].map(|t| e(ClassExpr::Class(t)));
+        let [na, nb] = [ia, ib].map(|t| e(ClassExpr::OneOf(vec![t])));
+        let one_q = e(ClassExpr::Exact(1, ObjProp::Named(q), thing));
+        let one_back = e(ClassExpr::Exact(1, ObjProp::Inverse(q), thing));
+        let no_p = e(ClassExpr::Max(0, ObjProp::Named(p), thing));
+        let named = ObjProp::Named;
+        o.axioms = vec![
+            Axiom::EquivalentClasses(vec![ca, na]),
+            Axiom::EquivalentClasses(vec![cb, nb]),
+            Axiom::SubClassOf(ca, one_q),
+            Axiom::SubClassOf(cb, one_back),
+            Axiom::ObjectPropertyDomain(named(q), ca),
+            Axiom::ObjectPropertyRange(named(q), cb),
+            Axiom::InverseObjectProperties(named(p), named(q)),
+            Axiom::InverseObjectProperties(named(q), named(r)),
+            Axiom::SubClassOf(cb, no_p),
+        ];
+        o.sources = vec![Vec::new(); o.axioms.len()];
+        assert_ne!(
+            answer(&o),
+            Answer::Consistent,
+            "inverse(q, r) hid inverse(p, q)"
+        );
     }
 }
