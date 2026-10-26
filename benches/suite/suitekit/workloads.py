@@ -2,16 +2,19 @@
 them: datasets under /data, a workload's own checkout under /rggs), its queries and their
 expected answer counts, the regimes it prefers, and how its data is made.
 
-A workload is one of three kinds:
+A workload is one of these kinds:
 - a cycle (load, reason, serve, queries) on every system that can run it;
 - a kit command (a conformance suite of NRESE's, run on the host);
-- a write benchmark (the harness's write-scaling, against NRESE or GraphDB).
+- a write benchmark (the harness's write-scaling, against NRESE or GraphDB);
+- a kit's own driver (Plan.driver), such as the catalogue's cases of a workload run by the
+  case runner (`catalogued`).
 Workloads without a definition here are planned: the driver skips them and says so.
 """
 from __future__ import annotations
 
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -310,6 +313,35 @@ def fast_answers(case: dict, semantics: str, settings: dict) -> dict[str, dict]:
     return out
 
 
+def catalogued(workload: str):
+    """A workload whose cases are in the catalogue (benches/cases/: their `workload` and `tier`):
+    each tier's cases run by the case runner (benches/fast/fast.py run: NRESE's perf lab, each
+    case's checks before its time counts), whose records are the run's rows (`--rows`). The
+    systems without the workload's capabilities are skipped and say so, as for any workload;
+    the case runner finds the frozen data itself (benches/hosts.toml inputs). The definition:
+    the plan of a tier, and the tiers (every tier the cases name, by default)."""
+    def cases_of(root: Path) -> list[dict]:
+        from . import cases as registry
+        return [c for c in registry.load(root / "benches/cases") if c.get("workload") == workload]
+
+    def make(root: Path, tier: str, settings: dict) -> Plan:
+        names = [c["name"] for c in cases_of(root) if c.get("tier") == tier]
+        plan = Plan(workload, tier, kind="driver", systems={"nrese"},
+                    note="the catalogue's cases, by benches/fast/fast.py run")
+        if not names:
+            plan.unavailable = f"no case of benches/cases/ is {workload} {tier}"
+            return plan
+        plan.driver = [[sys.executable, "benches/fast/fast.py", "run", "--cases", ",".join(names),
+                        "--reps", "{runs}", "--out", f"{{results}}/{workload}-{{tier}}.json",
+                        "--rows", "{results}/results.csv"]]
+        return plan
+
+    def tiers(root: Path) -> list[str]:
+        return list(dict.fromkeys(c["tier"] for c in cases_of(root)))
+
+    return make, tiers
+
+
 # workload -> (the plan of a tier, the default tiers)
 DEFINITIONS = {
     "lubm": (lubm, ["1"]),
@@ -326,6 +358,7 @@ DEFINITIONS = {
     "write-scaling": (write_scaling, ["1m"]),
     "clients": (clients, ["-"]),
     "fast": (fast, []),
+    "support-stress": catalogued("support-stress"),
 }
 
 
@@ -345,4 +378,4 @@ def plans(root: Path, workload: str, tiers: list[str] | None, settings: dict) ->
     if definition is None:
         return None
     make, default = definition
-    return [make(root, tier, settings) for tier in (tiers or default)]
+    return [make(root, tier, settings) for tier in (tiers or (default(root) if callable(default) else default))]
