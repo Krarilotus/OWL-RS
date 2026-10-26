@@ -6,7 +6,9 @@
 #
 #   <tier>[ w3c-optional] <tree> <file list> rustc-<release>-<commit> flags=<rustflags> tools=<id> fleet
 #
-# - tree: the pushed (or checked) commit's tree, what was tested, byte for byte;
+# - tree: the pushed commit's tree, what was tested, byte for byte; for `windows`, the hash of the
+#   checked commit's inputs (windows_inputs), so a pass carries to a later commit with the same
+#   inputs;
 # - file list: the hash of the files the tier was selected from (the pushed range's; none for
 #   `windows`, which runs everything);
 # - the toolchain rustc -vV reports (the tree's rust-toolchain.toml picks it; a host with
@@ -52,15 +54,42 @@ gate_key() {
   printf '%s%s %s %s %s fleet\n' "$1" "${NRESE_W3C_OPTIONAL:+ w3c-optional}" "$2" "$3" "$4"
 }
 
-gate_passed_file() { printf '%s/nrese-gate-passed\n' "$(git rev-parse --git-common-dir)"; }
-
-# gate_passed KEY: whether a pass is recorded for KEY.
-gate_passed() {
-  [ -z "${NRESE_GATE_RERUN:-}" ] \
-    && awk -v k="$1 |" 'index($0, k) == 1 { found = 1 } END { exit !found }' "$(gate_passed_file)" 2> /dev/null
+# windows_inputs COMMIT: the hash of what the Windows part may read at COMMIT: every tracked file
+# but the documentation (docs/, the top level's *.md) no other file names. Any file but those can
+# be read (a crate's tests read the Dockerfile and ops/: Sol, 26 Oct 2026), and a doc that code,
+# a test or a comment names by its path may be (docs/ops/config-reference.md, compiled into
+# nrese-server), so it stays an input.
+windows_inputs() {
+  local files docs named
+  files=$(git ls-tree -r --full-tree "$1") || return 1
+  docs=$(printf '%s\n' "$files" | awk -F '\t' '$2 ~ /^docs\// || $2 ~ /^[^\/]*\.md$/ { print $2 }')
+  if [ -n "$docs" ]; then
+    # Bare matches whatever the user's settings (line numbers, columns, colour, files taken for
+    # binary, which give "Binary file ... matches": Sol, 26 Oct 2026).
+    named=$(printf '%s\n' "$docs" | git grep -a --no-line-number --no-column --no-color -h -o -F -f - "$1" -- . \
+      ':(exclude)docs' ':(exclude,glob)*.md')
+    [ $? -le 1 ] || return 1
+  fi
+  printf '%s\n' "$files" | awk -F '\t' -v named="${named:-}" '
+    BEGIN { n = split(named, list, "\n"); for (i = 1; i <= n; i++) kept[list[i]] = 1 }
+    ($2 ~ /^docs\// || $2 ~ /^[^\/]*\.md$/) && !($2 in kept) { next }
+    { print }' | git hash-object --stdin
 }
 
-# gate_record KEY WHERE: KEY passed (WHERE: the fleet job, its host and CPU).
+gate_passed_file() { printf '%s/nrese-gate-passed\n' "$(git rev-parse --git-common-dir)"; }
+
+# gate_pass KEY: the record of a pass for KEY (where it ran), if one is recorded.
+gate_pass() {
+  [ -z "${NRESE_GATE_RERUN:-}" ] && awk -v k="$1 |" \
+    'index($0, k) == 1 { print substr($0, length(k) + 2); found = 1; exit } END { exit !found }' \
+    "$(gate_passed_file)" 2> /dev/null
+}
+
+# gate_passed KEY: whether a pass is recorded for KEY.
+gate_passed() { gate_pass "$1" > /dev/null; }
+
+# gate_record KEY WHERE: KEY passed (WHERE: the fleet job, its host and CPU; for windows first the
+# commit it ran on).
 gate_record() {
   printf '%s | %s\n' "$1" "$2" >> "$(gate_passed_file)"
 }

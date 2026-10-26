@@ -457,6 +457,54 @@ class WindowsCheck(Repo):
         self.assertEqual((pushed.returncode != 0, len(self.submitted())), (True, 2),
                          f"SPEC tier-key: the Windows pass let a push through\n{pushed.stderr}")
 
+    def passed(self):
+        """A commit that passed the Windows part: a crate naming one doc (as nrese-server compiles
+        docs/ops/config-reference.md in), a doc nothing names, and files a crate's tests may read;
+        the fleet answers no more."""
+        for path, text in {"crates/x/src/lib.rs": 'pub const R: &str = include_str!("../../../docs/named.md");\n',
+                           "docs/named.md": "read by code\n", "docs/note.md": "words only\n",
+                           "Dockerfile": "ARG RUST_VERSION=1.98.1\n", "ops/compose.yml": "endpoint: /dataset/sparql\n"
+                           }.items():
+            (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / path).write_text(text, newline="\n")
+        self.git(self.repo, "add", "-A")
+        self.git(self.repo, "commit", "-qm", "passed")
+        passed = self.git(self.repo, "rev-parse", "HEAD")
+        self.fleet("done", self.tree(passed), [], tier="windows")
+        self.assertEqual(self.check(passed).returncode, 0)
+        self.fleet("pending")
+        return passed
+
+    def changed(self, base, path):
+        """A commit on BASE that changes PATH, checked out."""
+        self.git(self.repo, "checkout", "-q", "--detach", base)
+        (self.repo / path).write_text("changed\n", newline="\n")
+        self.git(self.repo, "commit", "-qam", f"change {path}")
+        return self.git(self.repo, "rev-parse", "HEAD")
+
+    def test_a_commit_that_changes_only_docs_no_code_names_carries_the_pass(self):
+        """A commit whose inputs are a passed commit's carries that pass with its record, and asks
+        nothing of the fleet."""
+        passed = self.passed()
+        done = self.check(self.changed(passed, "docs/note.md"))
+        self.assertEqual((done.returncode, len(self.submitted())), (0, 1), f"SPEC windows-carry\n{done.stderr}")
+        self.assertIn(f"carried from {passed} fleet:gate-1@office-pc cpu=znver3", done.stdout, "SPEC windows-carry")
+
+    def test_a_commit_that_changes_an_input_runs_again(self):
+        """Rust code, any file but documentation (a crate's tests read the Dockerfile and ops/), and a
+        doc that code names are inputs: a change to one runs the Windows part again (Sol, 26 Oct), also
+        when the user's settings decorate git's grep output or take files for binary."""
+        for key in ("grep.lineNumber", "grep.column", "diff.default.binary"):
+            self.git(self.repo, "config", "--global", key, "true")
+        self.git(self.repo, "config", "--global", "color.grep", "always")
+        passed = self.passed()
+        for path in ("crates/x/src/lib.rs", "Dockerfile", "ops/compose.yml", "docs/named.md"):
+            with self.subTest(path):
+                before = len(self.submitted())
+                done = self.check(self.changed(passed, path))
+                self.assertEqual((done.returncode != 0, len(self.submitted())), (True, before + 1),
+                                 f"SPEC windows-inputs: a change to {path} carried {passed}'s pass\n{done.stdout}")
+
     def test_a_commit_head_doesnt_hold_is_refused_before_any_job(self):
         self.git(self.repo, "checkout", "-q", "-b", "side")
         side = self.commit("a.txt", "side\n")

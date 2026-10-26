@@ -47,8 +47,10 @@ verdict, no push. A pass is remembered for the same tree, files and toolchain, s
 `scripts/check.sh push` (it gates HEAD) before a long push: the hook then passes at once. A push
 that only deletes refs needs no gate. The merge check's Windows part runs the same way:
 `scripts/check.sh windows [COMMIT]` builds COMMIT (default HEAD, which must hold it) whole on a
-Windows fleet host and runs all its tests, its doc tests and the suite contracts. Build through
-`scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most `NRESE_BUILD_SLOTS`
+Windows fleet host and runs all its tests, its doc tests and the suite contracts; a commit whose
+inputs (every file but the docs no other file names, `scripts/lib/gate-key.sh`) passed before
+carries that pass.
+Build through `scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most `NRESE_BUILD_SLOTS`
 builds at once per machine). Validate in batches: quick checks while
 working, the push tier once per batch. Measure counts first; time only to answer a stated
 question, inside `scripts/quiet-slot.sh`, on `release` (`--profile lab` to iterate). A slot

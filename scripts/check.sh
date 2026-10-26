@@ -21,7 +21,9 @@
 #                                  (scripts/lib/fleet-gate.sh windows): COMMIT (default HEAD)
 #                                  built whole, all its tests and doc tests, the suite
 #                                  contracts. HEAD must hold COMMIT: the job runs HEAD's
-#                                  scripts/lib/windows-job.sh on it.
+#                                  scripts/lib/windows-job.sh on it. A commit whose inputs
+#                                  (scripts/lib/gate-key.sh windows_inputs) passed before
+#                                  carries that pass: "carried from <commit>".
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
 #                                  doc tests, cargo-deny, the console.
 #
@@ -286,14 +288,25 @@ if [ "$mode" = windows ] || { [ "$mode" = push ] && [ -z "${NRESE_ON_BUILD_HOST:
   tree=$(git rev-parse "$push_commit^{tree}")
   list_hash=$(git hash-object "$list")
   identity=$(gate_identity) || { echo "the gate can't name its toolchain and flags (above): no $mode pass" >&2; exit 2; }
-  key=$(gate_key "$mode" "$tree" "$list_hash" "$identity")
-  if gate_passed "$key"; then
-    echo "=== $mode: $(git rev-parse --short "$push_commit") passed on the fleet before (its tree, these files)"
+  # The Windows part's pass belongs to the commit's inputs, not its tree: a later commit with the
+  # same inputs carries it (scripts/lib/gate-key.sh windows_inputs), and its record names the commit.
+  keyed=$tree on=""
+  if [ "$mode" = windows ]; then
+    keyed=inputs-$(windows_inputs "$push_commit") || { echo "no inputs of $push_commit to key its pass" >&2; exit 2; }
+    on="$push_commit "
+  fi
+  key=$(gate_key "$mode" "$keyed" "$list_hash" "$identity")
+  if record=$(gate_pass "$key"); then
+    if [ "$mode" = windows ]; then
+      echo "=== windows: $(git rev-parse --short "$push_commit") carried from $record (the same inputs)"
+    else
+      echo "=== $mode: $(git rev-parse --short "$push_commit") passed on the fleet before (its tree, these files)"
+    fi
     exit 0
   fi
   bash scripts/lib/fleet-gate.sh "$mode" "$list" "$tree" "$list_hash" "$identity" "$where" "$push_commit"
   case $? in
-    0) gate_record "$key" "$(cat "$where")"; exit 0 ;;
+    0) gate_record "$key" "$on$(cat "$where")"; exit 0 ;;
     1) exit 1 ;;
     *) echo "no fleet verdict for $(git rev-parse --short "$push_commit") (tree $tree): no $mode pass; the $mode" \
          "tier runs on the fleet only" >&2
