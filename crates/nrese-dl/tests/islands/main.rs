@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use nrese_dl::islands::{self, Split};
 use nrese_dl::tableau::{self, Answer, Config};
 use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
-use nrese_owl::{Axiom, ClassExpr, ExprId, Ontology, Term};
+use nrese_owl::{Axiom, Characteristic, ClassExpr, ExprId, ObjProp, Ontology, Term};
 
 fn env(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|v| v.parse().ok())
@@ -250,6 +250,129 @@ fn stopped_island_requests_do_not_split_or_start_search() {
             assert_eq!(out.telemetry.peak_nodes, 0);
         }
     }
+}
+
+/// A key's data property `d` has values beyond its own assertions (OWL 2 Direct
+/// Semantics, keys, over the property's extension): a sub-property's, also two inclusions
+/// down, or one a class gives. Under `HasKey(⊤ () (d))` two individuals with the value 0
+/// so are one, which `A(a)`, `B(b)` with `A`, `B` disjoint contradicts: inconsistent,
+/// though each alone is consistent and fills a batch of its own. The same holds for a key
+/// over a transitive `R` (PR #33 review, R1) with `R(a, a)`, `R(b, a)`: `a` is a named
+/// `R`-value of both, alone or with `d`; and for a key of no property, which makes every
+/// named member of its class one (`C(a)`, `C(b)`). Without `b`'s last assertion the ontology is
+/// consistent (`b` has no value), so the touched islands of adding it say inconsistent or
+/// leave it to the whole ABox.
+#[test]
+fn key_values_the_tbox_gives_keep_their_individuals_together() {
+    let (a, b, d, e, f, r, zero) = (1, 2, 10, 11, 12, 13, 20);
+    let mut base = Ontology::default();
+    let class = |o: &mut Ontology, t: Term| ExprId(o.classes.intern(ClassExpr::Class(t)));
+    let (ca, cb, cc) = (
+        class(&mut base, 3),
+        class(&mut base, 4),
+        class(&mut base, 5),
+    );
+    let thing = ExprId(base.classes.intern(ClassExpr::Thing));
+    let zero_of_d = ExprId(base.classes.intern(ClassExpr::DataHasValue(d, zero)));
+    base.data.literals.insert(
+        zero,
+        nrese_owl::Literal {
+            lexical: "0".into(),
+            datatype: Some("http://www.w3.org/2001/XMLSchema#integer".into()),
+            language: None,
+        },
+    );
+    let data_key = Axiom::HasKey(thing, Vec::new(), vec![d]);
+    let transitive = Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(r));
+    let edge = |x: Term, y: Term| Axiom::ObjectPropertyAssertion(r, x, y);
+    base.axioms.extend([
+        Axiom::DisjointClasses(vec![ca, cb]),
+        Axiom::ClassAssertion(ca, a),
+        Axiom::ClassAssertion(cb, b),
+    ]);
+    // Classes nothing reads, so that each individual's island fills a batch.
+    let batch = islands::BATCH as Term;
+    for i in 0..batch {
+        let (p, q) = (
+            class(&mut base, 1000 + i),
+            class(&mut base, 1000 + batch + i),
+        );
+        base.axioms.push(Axiom::ClassAssertion(p, a));
+        base.axioms.push(Axiom::ClassAssertion(q, b));
+    }
+    let zero_at = |p: Term, x: Term| Axiom::DataPropertyAssertion(p, x, zero);
+    let config = Config {
+        timeout: Some(std::time::Duration::from_secs(60)),
+        ..Config::default()
+    };
+    let mut failures = Vec::new();
+    for (case, tbox, at_a, at_b) in [
+        (
+            "e ⊑ d",
+            vec![data_key.clone(), Axiom::SubDataPropertyOf(e, d)],
+            zero_at(e, a),
+            zero_at(e, b),
+        ),
+        (
+            "f ⊑ e ⊑ d",
+            vec![
+                data_key.clone(),
+                Axiom::SubDataPropertyOf(f, e),
+                Axiom::SubDataPropertyOf(e, d),
+            ],
+            zero_at(f, a),
+            zero_at(d, b),
+        ),
+        (
+            "C ⊑ ∃d.{0}",
+            vec![data_key.clone(), Axiom::SubClassOf(cc, zero_of_d)],
+            Axiom::ClassAssertion(cc, a),
+            Axiom::ClassAssertion(cc, b),
+        ),
+        (
+            "HasKey(⊤ (R) (d)), R transitive",
+            vec![
+                Axiom::HasKey(thing, vec![ObjProp::Named(r)], vec![d]),
+                transitive.clone(),
+                edge(a, a),
+                edge(b, a),
+            ],
+            zero_at(d, a),
+            zero_at(d, b),
+        ),
+        (
+            "HasKey(⊤ (R) ()), R transitive",
+            vec![
+                Axiom::HasKey(thing, vec![ObjProp::Named(r)], Vec::new()),
+                transitive.clone(),
+            ],
+            edge(a, a),
+            edge(b, a),
+        ),
+        (
+            "HasKey(C () ())",
+            vec![Axiom::HasKey(cc, Vec::new(), Vec::new())],
+            Axiom::ClassAssertion(cc, a),
+            Axiom::ClassAssertion(cc, b),
+        ),
+    ] {
+        let mut o = base.clone();
+        o.axioms.extend(tbox);
+        o.axioms.extend([at_a, at_b]);
+        o.axioms.sort();
+        o.axioms.dedup();
+        o.sources = vec![Vec::new(); o.axioms.len()];
+        let answer = islands::by_islands(&o, &config).answer;
+        if answer != Answer::Inconsistent {
+            failures.push(format!("{case}: by islands {answer:?}"));
+        }
+        let touched = std::collections::HashSet::from([b]);
+        let answer = islands::after_assertions(&o, &touched, &config).map(|out| out.answer);
+        if !matches!(answer, None | Some(Answer::Inconsistent)) {
+            failures.push(format!("{case}: the touched islands {answer:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 fn decided(answer: &Answer) -> Option<bool> {
