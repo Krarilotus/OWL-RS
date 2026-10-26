@@ -59,6 +59,15 @@ pub enum Guard {
     /// individuals) as one rule whose pairs are checked here, instead of a rule per pair
     /// ([`super::lists`]; its rules are symmetric in the two terms).
     SameList(Term, Term, SharedListIndex),
+    /// A rule's guards where it runs over representatives of `owl:sameAs` classes: they
+    /// hold where members of the classes of their variables' values, and their constants
+    /// themselves, satisfy all of them together ([`super::representatives::over_classes`]).
+    /// `bound` holds the values grounding gave variables of schema atoms.
+    OverClasses {
+        guards: Vec<Guard>,
+        bound: Vec<(u8, u64)>,
+        classes: SharedClasses,
+    },
 }
 
 impl Guard {
@@ -74,7 +83,66 @@ impl Guard {
                 (Some(a), Some(b)) => a < b && index.together(a, b),
                 _ => true,
             },
+            Guard::OverClasses {
+                guards,
+                bound,
+                classes,
+            } => {
+                let value = |term: Term| match term {
+                    Term::Var(v) => bound
+                        .iter()
+                        .find(|&&(b, _)| b == v)
+                        .map(|&(_, id)| id)
+                        .or_else(|| value(term)),
+                    constant => value(constant),
+                };
+                // As `&dyn Fn`, so that the guards inside don't instantiate `holds` anew.
+                let value: &dyn Fn(Term) -> Option<u64> = &value;
+                // The representatives are members of their classes: where they satisfy
+                // the guards, members do.
+                guards.iter().all(|guard| guard.holds(value))
+                    || super::representatives::members_satisfy(guards, value, classes)
+            }
         }
+    }
+
+    /// The terms the guard tests.
+    pub fn terms(&self) -> Vec<Term> {
+        match self {
+            Guard::NotEqual(a, b) | Guard::SameList(a, b, _) => vec![*a, *b],
+            Guard::NotIn(term, _, _) => vec![*term],
+            Guard::OverClasses { guards, .. } => guards.iter().flat_map(Guard::terms).collect(),
+        }
+    }
+}
+
+/// The `owl:sameAs` classes a run over representatives has so far, shared by its rules'
+/// guards ([`Guard::OverClasses`]); the run replaces them after a merge. Compared by
+/// identity: one run, one set of classes.
+#[derive(Debug, Clone, Default)]
+pub struct SharedClasses(std::sync::Arc<std::sync::RwLock<nrese_exec::classes::Classes>>);
+
+impl SharedClasses {
+    pub fn set(&self, classes: &nrese_exec::classes::Classes) {
+        *self.0.write().expect("classes lock") = classes.clone();
+    }
+
+    pub fn read(&self) -> std::sync::RwLockReadGuard<'_, nrese_exec::classes::Classes> {
+        self.0.read().expect("classes lock")
+    }
+}
+
+impl PartialEq for SharedClasses {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SharedClasses {}
+
+impl std::hash::Hash for SharedClasses {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::sync::Arc::as_ptr(&self.0).hash(state);
     }
 }
 

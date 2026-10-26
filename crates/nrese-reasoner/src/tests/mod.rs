@@ -1351,6 +1351,87 @@ fn chains_over_equal_properties_close_under_representatives() {
     assert_eq!(expanded, expected);
 }
 
+/// A rule's guards over representatives hold where members of their classes satisfy them
+/// together, as over the replicated closure: `?x log:notEqualTo ?y` holds for a class of
+/// two (its members differ), whether the class is there from the start or forms in a
+/// later round, and three terms that differ pairwise don't fit in it. The representative
+/// closure expanded is the replicated closure and the same consistency rules fire, so
+/// maintenance (DRed, over every identity) equals full rematerialisation
+/// (reasoning-semantics.md, "Maintenance"; Sol's review of DMW-AB-mem, r1 S1).
+#[test]
+fn guards_over_a_class_hold_where_its_members_satisfy_them() {
+    use super::representatives;
+    let prefixes = "@prefix ex: <http://example.com/> . \
+        @prefix log: <http://www.w3.org/2000/10/swap/log#> . \
+        @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .";
+    let one_class = "ex:a owl:sameAs ex:b\nex:a ex:p ex:b";
+    // `ex:a ex:p ex:a` holds before the functional property makes ex:a and ex:b one class.
+    let later = "ex:a ex:p ex:a
+        ex:fp rdf:type owl:FunctionalProperty
+        ex:s ex:fp ex:a
+        ex:s ex:fp ex:b";
+    // The same over a schema fact, which grounding reads (Sol's review, r1 S2).
+    let later_schema = "ex:a rdfs:subClassOf ex:a
+        ex:fp rdf:type owl:FunctionalProperty
+        ex:s ex:fp ex:a
+        ex:s ex:fp ex:b";
+    for (rule, data) in [
+        (
+            "{ ?x ex:p ?y . ?x log:notEqualTo ?y } => { ex:bad a owl:Nothing } .",
+            one_class,
+        ),
+        (
+            "{ ?x ex:p ?y . ?x log:notEqualTo ?y } => false .",
+            one_class,
+        ),
+        (
+            "{ ?x ex:p ?y . ?x log:notEqualTo ?y } => { ?x ex:twin ?y } .",
+            later,
+        ),
+        (
+            "{ ?x rdfs:subClassOf ex:a . ?x log:notEqualTo ex:a } => { ex:bad a owl:Nothing } .",
+            later_schema,
+        ),
+        (
+            "{ ?x ex:p ?y . ?y ex:p ?z .
+               ?x log:notEqualTo ?y . ?y log:notEqualTo ?z . ?x log:notEqualTo ?z }
+             => { ex:bad a owl:Nothing } .",
+            one_class,
+        ),
+    ] {
+        let mut vocabulary = LocalVocabulary::default();
+        let input = load(&mut vocabulary, data);
+        let mut rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+        let text = format!("{prefixes}\n{rule}\n");
+        rules.extend(
+            super::n3::compile("guards.n3", &text, &mut vocabulary)
+                .unwrap()
+                .rules,
+        );
+        let lists = ListVocabulary::new(&mut vocabulary);
+        let schema = Schema::owl(&mut vocabulary);
+        let replicated = batch::materialise(&input, &rules, Some(&lists), &schema);
+        let mut expected: HashSet<Triple> = input.iter().copied().collect();
+        expected.extend(replicated.derived.iter().copied());
+        let closure = representatives::materialise(&input, &rules, Some(&lists), &schema);
+        let expanded: HashSet<Triple> = closure
+            .facts
+            .iter()
+            .flat_map(|&f| closure.classes.expand(f))
+            .collect();
+        assert_eq!(expanded, expected, "{rule}");
+        let fired = |v: &[Violation]| -> std::collections::BTreeSet<String> {
+            v.iter().map(|v| v.rule.clone()).collect()
+        };
+        assert_eq!(
+            fired(&closure.violations),
+            fired(&replicated.violations),
+            "{rule}"
+        );
+    }
+}
+
 /// Equality-heavy data: the batch executor's equality module equals the generic
 /// `eq-rep-*` rules of the naive evaluator (chains of `sameAs` that merge classes over
 /// several rounds, equal predicates, equal objects).
