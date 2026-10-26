@@ -540,6 +540,10 @@ impl Compiler {
             match b {
                 BodyAtom::Concept(c, OwlVar::X) => pats.push(BodyPat::Concept(self.concept_id(*c))),
                 BodyAtom::Role(r, a, b) => {
+                    // Before a neighbour is numbered: the check below sees the last one.
+                    if vars.len() > Var::MAX {
+                        return Err(shape);
+                    }
                     let r = self.role(*r);
                     let next = vars.len() as u8 - 1;
                     match (*a, *b) {
@@ -560,7 +564,7 @@ impl Compiler {
                 _ => return Err(shape),
             }
         }
-        if vars.len() > 200 || pats.len() > Slot::MAX_BODY {
+        if vars.len() > Var::MAX || pats.len() > Slot::MAX_BODY {
             return Err(shape);
         }
         Ok((pats, vars))

@@ -17,6 +17,12 @@ pub enum Var {
     Z(u8),
 }
 
+impl Var {
+    /// The most variables a clause body may have, `X` included: within a `u8`, which
+    /// numbers the neighbours (`Z`) and counts them (`z + 1`, [`Program::index`]).
+    pub const MAX: usize = 200;
+}
+
 /// A body atom of a DL-clause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BodyPat {

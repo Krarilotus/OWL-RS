@@ -365,3 +365,28 @@ fn a_wide_clause_body_is_never_misread() {
         }
     }
 }
+
+/// A clause body with more neighbours than a slot's variables name (review r1, R1-C1):
+/// `A ⊑ ∃rᵢ.⊤` and `⊤ ⊑ ∀r₀.⊥ ⊔ … ⊔ ∀rₙ₋₁.⊥` make `A` unsatisfiable. It is found, or the
+/// Horn stage refuses: never a crash, never left out.
+#[test]
+fn many_neighbours_are_never_misread() {
+    for n in [256, 257] {
+        let mut table = Table::default();
+        let mut b = Build::new(&mut table);
+        let a = b.c("A");
+        let (thing, nothing) = (b.e(ClassExpr::Thing), b.e(ClassExpr::Nothing));
+        let mut none = Vec::new();
+        for i in 0..n {
+            let r = b.r(&format!("r{i}"));
+            let some = b.some(r, thing);
+            b.sub(a, some);
+            none.push(b.all(r, nothing));
+        }
+        let union = b.or(&none);
+        b.sub(thing, union);
+        if let Ok(c) = classify(&b.done(), 1) {
+            assert!(unsat(&mut table, &c, "A"), "{n}: A ⊑ ⊥ left out");
+        }
+    }
+}
