@@ -576,9 +576,13 @@ impl Compiler<'_> {
     /// The clauses whose Skolem data value a rule compares become unchecked: the constant
     /// stands for some value of the range, not the one a negative assertion or a key
     /// compares, so their contradiction derives no clash. A value of `e` is also one of
-    /// every property a rule moves it to (`x e y → x d y`).
+    /// every property a rule moves it to (`x e y → x d y`). A rule that moves it out of
+    /// an object position (`x e y → y r x`, inverses the reader accepts on data properties
+    /// outside OWL 2 DL) counts as comparing it: the closure follows objects only.
     fn compared_values(&mut self) {
         self.program.find_compared();
+        // The properties whose values a rule compares, there or where they are moved.
+        let mut read: HashSet<Term> = self.program.compared_predicates().clone();
         // The properties whose values a rule moves to each property.
         let mut into: HashMap<Term, Vec<Term>> = HashMap::new();
         for rule in &self.program.rules {
@@ -586,18 +590,20 @@ impl Compiler<'_> {
                 let [_, Slot::Const(e), value @ Slot::Var(_)] = from.0 else {
                     continue;
                 };
-                for to in &rule.head {
-                    if let [_, Slot::Const(d), v] = to.0
-                        && v == value
-                        && d != e
-                    {
-                        into.entry(d).or_default().push(e);
+                for to in rule.head.iter().filter(|to| to.0.contains(&value)) {
+                    match to.0 {
+                        [s, Slot::Const(d), _] if s != value => {
+                            if d != e {
+                                into.entry(d).or_default().push(e);
+                            }
+                        }
+                        _ => {
+                            read.insert(e);
+                        }
                     }
                 }
             }
         }
-        // The properties whose values a rule compares, there or where they are moved.
-        let mut read: HashSet<Term> = self.program.compared_predicates().clone();
         let mut todo: Vec<Term> = read.iter().copied().collect();
         while let Some(d) = todo.pop() {
             for &e in into.get(&d).into_iter().flatten() {

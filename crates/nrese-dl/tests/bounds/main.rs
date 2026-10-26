@@ -468,7 +468,9 @@ fn a_key_over_the_universal_property_equates() {
 ///   Semantics, §2.2), so its element is in `A`, which has none;
 /// - a value a defined datatype forces (`D ≡ {0}`) that a negative assertion excludes, or
 ///   that a key shares with an individual in a disjoint class (Direct Semantics, §2.3.5);
-///   also where the negative assertion is on a super-property, which has the value too.
+///   also where the negative assertion is on a super-property, which has the value too, or
+///   on a property the value reaches through inverses, which the reader accepts on data
+///   properties outside OWL 2 DL (`d⁻ = r`, `r⁻ = q`: `q` = `d`; F1's review, W1).
 ///
 /// With one, the proof stands: a defined datatype with values (`xsd:integer[≥ 0]`, PR #30
 /// review), a datatype outside the map, whose values a model may choose (§4), and the
@@ -518,6 +520,14 @@ fn a_proof_of_consistency_needs_a_model() {
         (
             "a forced value a negative assertion on a super-property excludes",
             format!("{} :d rdfs:subPropertyOf :q .", not_zero(":q")),
+            false,
+        ),
+        (
+            "a forced value a negative assertion through inverses excludes",
+            format!(
+                "{} :r a owl:ObjectProperty . :d owl:inverseOf :r . :r owl:inverseOf :q .",
+                not_zero(":q")
+            ),
             false,
         ),
         (
