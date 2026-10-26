@@ -506,11 +506,12 @@ fn restricted_rewrites_tell_nothing_of_hidden_statistics() {
     );
 }
 
-/// Nor does a refusal: a scan sized by a graph the reader may not read runs out of the
-/// query's memory, and the refusal it is told keeps its kind and limit, not the bytes (Sol's
-/// review of R13, r1 B-F2: they were in the message).
+/// Nor does a refusal, of its EXPLAIN or of its run: a scan sized by a graph the reader may
+/// not read runs out of the query's memory, and the refusal it is told keeps its kind and
+/// limit, not the bytes (Sol's review of R13: r1 B-F2, they were in an EXPLAIN's message; r2
+/// S1, in a run's).
 #[test]
-fn restricted_explain_refusals_tell_nothing_of_hidden_sizes() {
+fn restricted_refusals_tell_nothing_of_hidden_sizes() {
     let refusal = |hidden: usize| {
         let mut config = in_memory_store_config();
         config.total_query_memory_bytes = 0;
@@ -528,14 +529,18 @@ fn restricted_explain_refusals_tell_nothing_of_hidden_sizes() {
             SparqlQueryRequest::new("SELECT * WHERE { GRAPH ?g { ?s <urn:p> ?o } }", public());
         request.memory_limit = Some(64 << 10);
         let prepared = store.prepare_query(&request).unwrap();
-        let error = store
-            .explain_query(&prepared, &nrese_store::CancellationToken::new())
+        let token = nrese_store::CancellationToken::new();
+        let explained = store.explain_query(&prepared, &token).unwrap_err();
+        let run = store
+            .run_query(&prepared, &token, std::io::sink())
             .unwrap_err();
-        assert!(
-            error.is_memory_limit() && !error.is_server_memory_limit(),
-            "{error}"
-        );
-        error.to_string()
+        for error in [&explained, &run] {
+            assert!(
+                error.is_memory_limit() && !error.is_server_memory_limit(),
+                "{error}"
+            );
+        }
+        (explained.to_string(), run.to_string())
     };
     assert_eq!(refusal(100_000), refusal(200_000));
 }

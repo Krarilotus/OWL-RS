@@ -720,7 +720,23 @@ impl StoreService {
         Ok(status.map(|s| (s, detail.unwrap_or_default())))
     }
 
+    /// Every query run but a transaction's pending one: its refusal as its reader may be
+    /// told it ([`for_its_reader`]; the answers are the reader's own).
     fn run_reporting(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+    ) -> StoreResult<(
+        Option<crate::dl::DlDetail>,
+        Option<nrese_sparql::ql::QlReport>,
+    )> {
+        let run = self.run_reporting_whole(prepared, cancellation, out, report);
+        for_its_reader(prepared, run, |_| {})
+    }
+
+    fn run_reporting_whole(
         &self,
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
@@ -1117,7 +1133,7 @@ impl StoreService {
             .iter()
             .any(|op| !matches!(op, crate::StatementOp::Add { .. }));
         let memory = self.settings.query_envelope(prepared);
-        self.with_pending(pending, &scope, cancellation, |snapshot| {
+        let run = self.with_pending(pending, &scope, cancellation, |snapshot| {
             run_query(
                 snapshot,
                 prepared,
@@ -1156,7 +1172,8 @@ impl StoreService {
                 },
             )
             .map(|_| ())
-        })
+        });
+        for_its_reader(prepared, run, |_| {})
     }
 
     /// The queries running now ([`crate::running`]).
@@ -1756,13 +1773,13 @@ pub(crate) fn in_readable_graph(
     })
 }
 
-/// An EXPLAIN of `prepared` as its reader may be told it (round 13, R13-diag). A reader of
-/// every graph is told everything. Another is told only what comes from its query and its
-/// answer: `redact` takes the operators (their estimates, the order and the operators those
-/// chose, their rows, the dictionary work they report, their times) and the rewrites (an
-/// estimate decides some, as eager aggregation), all read from statistics and scans of every
-/// graph; and a memory refusal keeps its kind and limit but not the bytes held and asked
-/// for, which a scan of graphs it may not read sized.
+/// A run or an EXPLAIN of `prepared` as its reader may be told it (round 13, R13-diag). A
+/// reader of every graph is told everything. Another is told only what comes from its query
+/// and its answer: `redact` takes an EXPLAIN's operators (their estimates, the order and the
+/// operators those chose, their rows, the dictionary work they report, their times) and its
+/// rewrites (an estimate decides some, as eager aggregation), all read from statistics and
+/// scans of every graph; and a memory refusal keeps its kind and limit but not the bytes
+/// held and asked for, which a scan of graphs it may not read sized.
 fn for_its_reader<T>(
     prepared: &PreparedQuery,
     whole: StoreResult<T>,
