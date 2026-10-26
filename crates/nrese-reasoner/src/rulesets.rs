@@ -56,12 +56,37 @@ pub const ALL: [Ruleset; 6] = [
     Ruleset::Owl2Rl,
 ];
 
-/// Version of the evaluation semantics beyond the rule text: list compilation, equality
-/// handling, modules. Bump it with any change that alters what a ruleset derives or rejects,
-/// so stores materialised by an older build rebuild instead of trusting their state. A
-/// fingerprint covers it, the rule text, and the relations a GraphDB ruleset's contexts
-/// compile to ([`crate::RuleProgram::fingerprint`]); a change of those names needs no bump.
+/// The evaluation semantics beyond the rule text, as versioned parts: the one place that
+/// decides which stores rebuild after a build changes what rules derive or reject.
+/// - The base, this version, covers what every program depends on: list compilation,
+///   equality handling, modules. Every fingerprint feeds it, so bumping it rebuilds every
+///   store.
+/// - A [`SemanticPart`] covers what only some user rulesets use. A user ruleset's
+///   fingerprint feeds the version of each part its validating compile reports using
+///   ([`crate::RuleProgram::fingerprint`]), so bumping a part rebuilds only those stores.
+///   A new part starts at 1.
+///
+/// The fingerprint also covers the rule text and the relations a GraphDB ruleset's contexts
+/// compile to; a change of those names needs no bump.
 pub const SEMANTICS_VERSION: u32 = 2;
+
+/// A part of the evaluation semantics only some user rulesets use ([`SEMANTICS_VERSION`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticPart {
+    /// Rules with guards, run over representatives of `owl:sameAs` classes. 1 (26 Oct 2026):
+    /// the guards hold where members of the classes satisfy them, not the representatives
+    /// alone (`representatives::over_classes`).
+    GuardsOverClasses,
+}
+
+impl SemanticPart {
+    /// The part's name and version, as fingerprints feed them.
+    pub fn version(self) -> (&'static str, u32) {
+        match self {
+            Self::GuardsOverClasses => ("guards-over-classes", 1),
+        }
+    }
+}
 
 impl Ruleset {
     /// Identifies what this ruleset derives: FNV-1a over [`SEMANTICS_VERSION`], the name,

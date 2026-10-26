@@ -121,10 +121,10 @@ OWL 2 DL with arbitrary rules is undecidable; rules whose variables bind to name
 
 The reasoning state (`reasoning.state` in the data directory) records:
 - the ruleset;
-- its **semantic fingerprint** (the rule text, `SEMANTICS_VERSION`, and the relations a GraphDB ruleset's `[Context]` statements compile to);
+- its **semantic fingerprint** (the rule text, the base `SEMANTICS_VERSION`, the relations a GraphDB ruleset's `[Context]` statements compile to, and the version of each semantic part the user rules use, such as guards over `owl:sameAs` classes);
 - the violation count.
 
-Startup skips rematerialisation only if the ruleset and the fingerprint match. A new build that changes what a ruleset derives rebuilds once. `nrese-server check-config` prints the fingerprint. Writes that don't maintain the inferred stack (bulk load, ungated tools, commits with reasoning off, a store changed while opening) drop the state, and the next reasoning write or startup rematerialises.
+Startup skips rematerialisation only if the ruleset and the fingerprint match. A new build that changes what a ruleset derives rebuilds once: a change of the base rebuilds every store, a change of a semantic part only the stores whose rules use it (`crates/nrese-reasoner/src/rulesets.rs`). `nrese-server check-config` prints the fingerprint. Writes that don't maintain the inferred stack (bulk load, ungated tools, commits with reasoning off, a store changed while opening) drop the state, and the next reasoning write or startup rematerialises.
 
 ## Maintenance
 
