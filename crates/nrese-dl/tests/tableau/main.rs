@@ -1052,31 +1052,61 @@ fn keyed_plans_run_on_a_self_loop() {
     assert_eq!(out.answer, Answer::Inconsistent, "{}", out.telemetry);
 }
 
-/// A clause body wider than a join plan's positions (review A-1501): `C₀ ⊓ … ⊓ C₂₅₆ ⊑ D`
-/// with `¬D(a)`. With `a` in all but one `Cᵢ` it has a model (that `Cᵢ` and `D` empty),
-/// so it is never refuted, whichever `Cᵢ` that is; with `a` in every `Cᵢ` it has none, so
-/// it is never consistent.
+/// A clause body wider than a join plan's positions (review A-1501): `C₀ ⊓ … ⊓ Cₙ₋₁ ⊑ D`
+/// with `¬D(a)`. With `a` in all but one `Cᵢ` it has a model (that `Cᵢ` and `D` empty);
+/// with `a` in every `Cᵢ` it has none. At 256 atoms, the most a plan names, both answers
+/// are decided; at 257 it is never refuted, whichever `Cᵢ` is left out, and never
+/// consistent with none left out.
 #[test]
 fn a_wide_clause_body_is_never_misread() {
-    let n = 257;
-    for left_out in (0..n).map(Some).chain([None]) {
-        let mut b = Build::default();
-        let cs: Vec<ExprId> = (0..n).map(|i| b.class(1000 + i)).collect();
-        let all = b.and(&cs);
-        let d = b.class(1);
-        b.sub(all, d);
-        let not_d = b.not(d);
-        b.assert(not_d, 100);
-        for (i, &c) in cs.iter().enumerate() {
-            if left_out != Some(i as u64) {
-                b.assert(c, 100);
+    for (n, left_outs) in [
+        (256, vec![Some(0), Some(255), None]),
+        (257, (0..257).map(Some).chain([None]).collect()),
+    ] {
+        for left_out in left_outs {
+            let mut b = Build::default();
+            let cs: Vec<ExprId> = (0..n).map(|i| b.class(1000 + i)).collect();
+            let all = b.and(&cs);
+            let d = b.class(1);
+            b.sub(all, d);
+            let not_d = b.not(d);
+            b.assert(not_d, 100);
+            for (i, &c) in cs.iter().enumerate() {
+                if left_out != Some(i as u64) {
+                    b.assert(c, 100);
+                }
+            }
+            let answer = consistency(&b.o, &Config::default()).answer;
+            match (n, left_out) {
+                (256, Some(i)) => assert_eq!(answer, Answer::Consistent, "{n}: C{i} left out"),
+                (256, None) => assert_eq!(answer, Answer::Inconsistent, "{n}: none left out"),
+                (_, Some(i)) => assert_ne!(answer, Answer::Inconsistent, "{n}: C{i} left out"),
+                (_, None) => assert_ne!(answer, Answer::Consistent, "{n}: none left out"),
             }
         }
+    }
+}
+
+/// A clause head wider than a plan's head positions (PR #28 review, B1): `A ⊑ ≤ 1 R.B ⊔
+/// {a₁ … aₖ} ⊔ ∃d.rdfs:Literal` with `A(a)`, `R(a, b)`, `B(b)` has a model (`a` with a `d`
+/// value), with 255 individuals (a 257-atom head) as with 254.
+#[test]
+fn a_wide_clause_head_is_never_misread() {
+    for k in [254, 255] {
+        let mut b = Build::default();
+        let r = ObjProp::Named(200);
+        let (a, bb) = (b.class(1), b.class(2));
+        let at_most = b.e(ClassExpr::Max(1, r, bb));
+        let one_of = b.e(ClassExpr::OneOf((0..k).map(|i| 2000 + i).collect()));
+        let literal = b.range(DataRange::Literal);
+        let value = b.e(ClassExpr::DataSome(400, literal));
+        let head = b.or(&[at_most, one_of, value]);
+        b.sub(a, head);
+        b.assert(a, 100);
+        b.role_assertion(200, 100, 101);
+        b.assert(bb, 101);
         let answer = consistency(&b.o, &Config::default()).answer;
-        match left_out {
-            Some(i) => assert_ne!(answer, Answer::Inconsistent, "C{i} left out"),
-            None => assert_ne!(answer, Answer::Consistent),
-        }
+        assert_eq!(answer, Answer::Consistent, "{k} individuals");
     }
 }
 
