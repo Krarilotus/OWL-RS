@@ -25,7 +25,8 @@
 # not the tree's failure).
 set -u
 commit=$1 tree=$2
-out=$(cygpath -m "${FLEET_OUT:?a fleet job}" 2> /dev/null || printf '%s' "$FLEET_OUT")
+: "${FLEET_OUT:?a fleet job}"
+out=$(cygpath -m "$FLEET_OUT" 2> /dev/null || printf '%s' "$FLEET_OUT")
 
 python() {
   if type -P python > /dev/null; then command python "$@"; else command python3 "$@"; fi
@@ -56,7 +57,7 @@ run() {
   python -c 'import os; os.fstat(0)' 2> /dev/null || stdin=invalid
   exec < /dev/null
   # This attempt's own result only (as gate-job.sh's).
-  rm -f -- "$out/gate.json"
+  rm -f -- "${out:?}/gate.json"
   local attempt="${FLEET_JOB:-none}:${FLEET_STEP:-0}:${EPOCHREALTIME/[.,]/}:$$"
   echo "$attempt" > "$out/attempt"
 
