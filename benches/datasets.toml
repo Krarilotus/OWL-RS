@@ -473,3 +473,399 @@ source = "https://sparql.dblp.org/download/dblp_KG_with_associated_data.tar fetc
 bytes = 77730471996
 sha256 = "8541232ced4933f65e2f8b4ef01cea8cd6b39975b2764dd801f7df48bad93934"
 frozen = "2026-10-12"
+
+[[dataset]]
+file = "support-stress/copies-8.nq"
+workload = "support-stress"
+tier = "copies-8"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-8.nq shape=copies sets=8 subjects=5000 seed=1"
+source = "OWL-RS crates/nrese-store/examples/perf_lab/support_family.rs (blob 83934f83) and generate.rs (blob c65c4b7c), built at proof d789ebe8 (tree 947b5002), run by benches/fast/prepare-support-stress.py on phuoc-yu"
+bytes = 6151234
+sha256 = "3ea787ea6baba830d06956273414fd5eae53685bf6f02a8361d80aa242b846c0"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/copies-8.nq.reader"
+workload = "support-stress"
+tier = "copies-8"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-8.nq shape=copies sets=8 subjects=5000 seed=1"
+source = "the generate command's: the named graphs of one target's set, drawn from the seed"
+bytes = 34
+sha256 = "6ef4dc82bb240edda6ffffecc3c6a964fd8764bb3bb42ec0f3af80486945b907"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/copies-8.nq.commits.ru"
+workload = "support-stress"
+tier = "copies-8"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-8.nq shape=copies sets=8 subjects=5000 seed=1"
+source = "the generate command's: one statement, then 1,000, of new subjects, one SPARQL update a line"
+bytes = 162194
+sha256 = "cbfd64f540b1d0239ff2369afde8395b1636567268ef58d628665bc92cdb10eb"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/copies-16.nq"
+workload = "support-stress"
+tier = "copies-16"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-16.nq shape=copies sets=16 subjects=5000 seed=1"
+source = "OWL-RS crates/nrese-store/examples/perf_lab/support_family.rs (blob 83934f83) and generate.rs (blob c65c4b7c), built at proof d789ebe8 (tree 947b5002), run by benches/fast/prepare-support-stress.py on phuoc-yu"
+bytes = 12302354
+sha256 = "2e1451ee8a77155061643a0f1422db1d6649ece84c5efc32fcce5ce68c88b86a"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/copies-16.nq.reader"
+workload = "support-stress"
+tier = "copies-16"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-16.nq shape=copies sets=16 subjects=5000 seed=1"
+source = "the generate command's: the named graphs of one target's set, drawn from the seed"
+bytes = 34
+sha256 = "8273eca341687795ef43e69d42857b4146c7a1f3f3222f9c394983069ee32388"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/copies-16.nq.commits.ru"
+workload = "support-stress"
+tier = "copies-16"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-16.nq shape=copies sets=16 subjects=5000 seed=1"
+source = "the generate command's: one statement, then 1,000, of new subjects, one SPARQL update a line"
+bytes = 162194
+sha256 = "7238d656938763c8e8fc33d102613628c8d5190e75f3d0ae2ce9d55281f0030a"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/copies-17.nq"
+workload = "support-stress"
+tier = "copies-17"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-17.nq shape=copies sets=17 subjects=5000 seed=1"
+source = "OWL-RS crates/nrese-store/examples/perf_lab/support_family.rs (blob 83934f83) and generate.rs (blob c65c4b7c), built at proof d789ebe8 (tree 947b5002), run by benches/fast/prepare-support-stress.py on phuoc-yu"
+bytes = 13071244
+sha256 = "10d15995a9cfd0a69c303f03de514afde83957c87b43852af9093e39a6d72240"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/copies-17.nq.reader"
+workload = "support-stress"
+tier = "copies-17"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-17.nq shape=copies sets=17 subjects=5000 seed=1"
+source = "the generate command's: the named graphs of one target's set, drawn from the seed"
+bytes = 34
+sha256 = "709a3715dd7af80fb93eafd6ca8c77a377169af18a939c5d94c80f3fca7b9bcc"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/copies-17.nq.commits.ru"
+workload = "support-stress"
+tier = "copies-17"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-17.nq shape=copies sets=17 subjects=5000 seed=1"
+source = "the generate command's: one statement, then 1,000, of new subjects, one SPARQL update a line"
+bytes = 162194
+sha256 = "996a8de82248196e15bd5c5fe8221fc033da92859824e413d6577e6930ad523d"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/copies-256.nq"
+workload = "support-stress"
+tier = "copies-256"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-256.nq shape=copies sets=256 subjects=1000 seed=1"
+source = "OWL-RS crates/nrese-store/examples/perf_lab/support_family.rs (blob 83934f83) and generate.rs (blob c65c4b7c), built at proof d789ebe8 (tree 947b5002), run by benches/fast/prepare-support-stress.py on phuoc-yu"
+bytes = 39139954
+sha256 = "170980a37204dbd4bb22034b54e6e7bc7567cb9366d7fb086536fa87e1068e15"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/copies-256.nq.reader"
+workload = "support-stress"
+tier = "copies-256"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-256.nq shape=copies sets=256 subjects=1000 seed=1"
+source = "the generate command's: the named graphs of one target's set, drawn from the seed"
+bytes = 34
+sha256 = "0757c0cda0378c3e41fbdf153f85d3a6f7be2e6bcdc3d91e854f7a150bc811d9"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/copies-256.nq.commits.ru"
+workload = "support-stress"
+tier = "copies-256"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-256.nq shape=copies sets=256 subjects=1000 seed=1"
+source = "the generate command's: one statement, then 1,000, of new subjects, one SPARQL update a line"
+bytes = 162194
+sha256 = "9f6cd6b09a04e9ead9b182782d5122db9b2fce76bcafe6bc5566e8f61a720530"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/product-64.nq"
+workload = "support-stress"
+tier = "product-64"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-64.nq shape=product a=8 b=8 subjects=5000 seed=1"
+source = "OWL-RS crates/nrese-store/examples/perf_lab/support_family.rs (blob 83934f83) and generate.rs (blob c65c4b7c), built at proof d789ebe8 (tree 947b5002), run by benches/fast/prepare-support-stress.py on phuoc-yu"
+bytes = 6152320
+sha256 = "a635e5cccf253feac55ec388878585cdee6b4ca21651888f03b3a0f12b46968a"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/product-64.nq.reader"
+workload = "support-stress"
+tier = "product-64"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-64.nq shape=product a=8 b=8 subjects=5000 seed=1"
+source = "the generate command's: the named graphs of one target's set, drawn from the seed"
+bytes = 68
+sha256 = "a46793f8c4492c492eff892aebb0ce8c32f17e3b5ce5d128168ec4418788ec97"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/product-64.nq.commits.ru"
+workload = "support-stress"
+tier = "product-64"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-64.nq shape=product a=8 b=8 subjects=5000 seed=1"
+source = "the generate command's: one statement, then 1,000, of new subjects, one SPARQL update a line"
+bytes = 162194
+sha256 = "ecd46934e5ab598cf52c813e1b73fe9e91669c531c0eaa86806822b715cbc494"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/product-256.nq"
+workload = "support-stress"
+tier = "product-256"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-256.nq shape=product a=16 b=16 subjects=2000 seed=1"
+source = "OWL-RS crates/nrese-store/examples/perf_lab/support_family.rs (blob 83934f83) and generate.rs (blob c65c4b7c), built at proof d789ebe8 (tree 947b5002), run by benches/fast/prepare-support-stress.py on phuoc-yu"
+bytes = 4912640
+sha256 = "8194da36c9e39bd8af56e9b0c3c54d434588fd8c785e378d4db123b1b012c1e3"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/product-256.nq.reader"
+workload = "support-stress"
+tier = "product-256"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-256.nq shape=product a=16 b=16 subjects=2000 seed=1"
+source = "the generate command's: the named graphs of one target's set, drawn from the seed"
+bytes = 68
+sha256 = "9004b663c78d956eeffdfe7358e3341b25de1b37929a2732d7146f7dca442849"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/product-256.nq.commits.ru"
+workload = "support-stress"
+tier = "product-256"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-256.nq shape=product a=16 b=16 subjects=2000 seed=1"
+source = "the generate command's: one statement, then 1,000, of new subjects, one SPARQL update a line"
+bytes = 162194
+sha256 = "f79c52b67c10d424a864994f78c9afd40b130218e03248570d98883d43fa3a7c"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/product-1024.nq"
+workload = "support-stress"
+tier = "product-1024"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-1024.nq shape=product a=32 b=32 subjects=1000 seed=1"
+source = "OWL-RS crates/nrese-store/examples/perf_lab/support_family.rs (blob 83934f83) and generate.rs (blob c65c4b7c), built at proof d789ebe8 (tree 947b5002), run by benches/fast/prepare-support-stress.py on phuoc-yu"
+bytes = 4897280
+sha256 = "a8232edbb66be3dc239a776617f72a8deeb1bdab18dce709d087c566e5d52d1e"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/product-1024.nq.reader"
+workload = "support-stress"
+tier = "product-1024"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-1024.nq shape=product a=32 b=32 subjects=1000 seed=1"
+source = "the generate command's: the named graphs of one target's set, drawn from the seed"
+bytes = 68
+sha256 = "9ba5e57f094e97d459c2b6fa7f2e965c9900c68e5d730a4140f19db6dca64016"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/product-1024.nq.commits.ru"
+workload = "support-stress"
+tier = "product-1024"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-1024.nq shape=product a=32 b=32 subjects=1000 seed=1"
+source = "the generate command's: one statement, then 1,000, of new subjects, one SPARQL update a line"
+bytes = 162194
+sha256 = "7cf23ebc48071b8a7adbee4f9e0615aa1d7ac57bb042c399d61a14c05c6785fe"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/product-4096.nq"
+workload = "support-stress"
+tier = "product-4096"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-4096.nq shape=product a=64 b=64 subjects=500 seed=1"
+source = "OWL-RS crates/nrese-store/examples/perf_lab/support_family.rs (blob 83934f83) and generate.rs (blob c65c4b7c), built at proof d789ebe8 (tree 947b5002), run by benches/fast/prepare-support-stress.py on phuoc-yu"
+bytes = 4898560
+sha256 = "11c665e63d0829447403b5416e7231b1ec6a6a157609c070337c90ca9e2e4c03"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/product-4096.nq.reader"
+workload = "support-stress"
+tier = "product-4096"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-4096.nq shape=product a=64 b=64 subjects=500 seed=1"
+source = "the generate command's: the named graphs of one target's set, drawn from the seed"
+bytes = 68
+sha256 = "d25d6faf03ab5a686a83b5a893dac41f28639a696ea7aa8d6540cc8be14ff292"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/product-4096.nq.commits.ru"
+workload = "support-stress"
+tier = "product-4096"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-4096.nq shape=product a=64 b=64 subjects=500 seed=1"
+source = "the generate command's: one statement, then 1,000, of new subjects, one SPARQL update a line"
+bytes = 161193
+sha256 = "50b56983d31b52d38d283d44109a077803bf3267d5c7c0da9d222df28d654df3"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/product-4096-limit.nq"
+workload = "support-stress"
+tier = "product-4096"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-4096-limit.nq shape=product a=64 b=64 subjects=8000 seed=1"
+source = "OWL-RS crates/nrese-store/examples/perf_lab/support_family.rs (blob 83934f83) and generate.rs (blob c65c4b7c), built at proof d789ebe8 (tree 947b5002), run by benches/fast/prepare-support-stress.py on phuoc-yu"
+bytes = 78786560
+sha256 = "de312ecbebfd18b70f3862b6a4e4cbb79b2db7ba381791f96f42886e5b5898bc"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/product-4096-limit.nq.reader"
+workload = "support-stress"
+tier = "product-4096"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-4096-limit.nq shape=product a=64 b=64 subjects=8000 seed=1"
+source = "the generate command's: the named graphs of one target's set, drawn from the seed"
+bytes = 68
+sha256 = "d25d6faf03ab5a686a83b5a893dac41f28639a696ea7aa8d6540cc8be14ff292"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/product-4096-limit.nq.commits.ru"
+workload = "support-stress"
+tier = "product-4096"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-4096-limit.nq shape=product a=64 b=64 subjects=8000 seed=1"
+source = "the generate command's: one statement, then 1,000, of new subjects, one SPARQL update a line"
+bytes = 162194
+sha256 = "83e68dabdfff8d4e61ec2b4e4b0b9888f6b4851ac6ef98c9611da682170cc605"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/ladder-16.nq"
+workload = "support-stress"
+tier = "ladder-16"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/ladder-16.nq shape=ladder width=2 length=4 subjects=2000 seed=1"
+source = "OWL-RS crates/nrese-store/examples/perf_lab/support_family.rs (blob 83934f83) and generate.rs (blob c65c4b7c), built at proof d789ebe8 (tree 947b5002), run by benches/fast/prepare-support-stress.py on phuoc-yu"
+bytes = 2659244
+sha256 = "c2ef8c6cf60de0f888d7e885beda686c8f68ac7d2f311cb11fdad3363dfaaca3"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/ladder-16.nq.reader"
+workload = "support-stress"
+tier = "ladder-16"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/ladder-16.nq shape=ladder width=2 length=4 subjects=2000 seed=1"
+source = "the generate command's: the named graphs of one target's set, drawn from the seed"
+bytes = 136
+sha256 = "19fda987481eee6d3bac701b6072f6dc324693a4d37846e75c05ef10a1b7e3e0"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/ladder-16.nq.commits.ru"
+workload = "support-stress"
+tier = "ladder-16"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/ladder-16.nq shape=ladder width=2 length=4 subjects=2000 seed=1"
+source = "the generate command's: one statement, then 1,000, of new subjects, one SPARQL update a line"
+bytes = 156047
+sha256 = "01cef22242c2b02daac6d724c8910dab653eec46b7cac9d45d3809fe55caed90"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/ladder-256.nq"
+workload = "support-stress"
+tier = "ladder-256"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/ladder-256.nq shape=ladder width=2 length=8 subjects=500 seed=1"
+source = "OWL-RS crates/nrese-store/examples/perf_lab/support_family.rs (blob 83934f83) and generate.rs (blob c65c4b7c), built at proof d789ebe8 (tree 947b5002), run by benches/fast/prepare-support-stress.py on phuoc-yu"
+bytes = 1261484
+sha256 = "1c9e3b848e83215d299bed1ce226ace47515c726f1a9384ec5912d1964d73df2"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/ladder-256.nq.reader"
+workload = "support-stress"
+tier = "ladder-256"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/ladder-256.nq shape=ladder width=2 length=8 subjects=500 seed=1"
+source = "the generate command's: the named graphs of one target's set, drawn from the seed"
+bytes = 272
+sha256 = "4656b12ea61f8553e758ec7dcfda1112b8f36dc730c1633c5a227c27341edfe8"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/ladder-256.nq.commits.ru"
+workload = "support-stress"
+tier = "ladder-256"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/ladder-256.nq shape=ladder width=2 length=8 subjects=500 seed=1"
+source = "the generate command's: one statement, then 1,000, of new subjects, one SPARQL update a line"
+bytes = 156542
+sha256 = "8fc81efb437d23b76513f8382d8c9e572f4a94230b1166355d7994fed06a4bff"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/ladder-4096.nq"
+workload = "support-stress"
+tier = "ladder-4096"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/ladder-4096.nq shape=ladder width=2 length=12 subjects=100 seed=1"
+source = "OWL-RS crates/nrese-store/examples/perf_lab/support_family.rs (blob 83934f83) and generate.rs (blob c65c4b7c), built at proof d789ebe8 (tree 947b5002), run by benches/fast/prepare-support-stress.py on phuoc-yu"
+bytes = 369324
+sha256 = "2c09cba4dcd43e682f3b392f8b5b8c6517ca1e69284105dda8749603b4b10d1e"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/ladder-4096.nq.reader"
+workload = "support-stress"
+tier = "ladder-4096"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/ladder-4096.nq shape=ladder width=2 length=12 subjects=100 seed=1"
+source = "the generate command's: the named graphs of one target's set, drawn from the seed"
+bytes = 408
+sha256 = "344841f1d87d65a84b6b93cdf792a37c57f21a955f31aa8462ff12be45a66242"
+frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/ladder-4096.nq.commits.ru"
+workload = "support-stress"
+tier = "ladder-4096"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/ladder-4096.nq shape=ladder width=2 length=12 subjects=100 seed=1"
+source = "the generate command's: one statement, then 1,000, of new subjects, one SPARQL update a line"
+bytes = 157672
+sha256 = "a0e89656c725e9c211a3a14ef611447e4925264f6b3f387590dd40b3cc3d1c36"
+frozen = "2026-10-26"
