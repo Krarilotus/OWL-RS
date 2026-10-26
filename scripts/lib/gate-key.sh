@@ -85,9 +85,6 @@ gate_pass() {
     "$(gate_passed_file)" 2> /dev/null
 }
 
-# gate_passed KEY: whether a pass is recorded for KEY.
-gate_passed() { gate_pass "$1" > /dev/null; }
-
 # gate_record KEY WHERE: KEY passed (WHERE: the fleet job, its host and CPU; for windows first the
 # commit it ran on).
 gate_record() {

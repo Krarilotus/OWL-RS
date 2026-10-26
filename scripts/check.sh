@@ -20,17 +20,21 @@
 #                                  the merge check's Windows part, on the fleet only
 #                                  (scripts/lib/fleet-gate.sh windows): COMMIT (default HEAD)
 #                                  built whole, all its tests and doc tests, the suite
-#                                  contracts. HEAD must hold COMMIT: the job runs HEAD's
-#                                  scripts/lib/windows-job.sh on it. A commit whose inputs
-#                                  (scripts/lib/gate-key.sh windows_inputs) passed before
-#                                  carries that pass: "carried from <commit>".
+#                                  contracts, by its own tier here, which its own
+#                                  scripts/lib/windows-job.sh runs on a Windows host. A commit
+#                                  whose inputs (scripts/lib/gate-key.sh windows_inputs)
+#                                  passed before carries that pass: "carried from <commit>".
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
 #                                  doc tests, cargo-deny, the console.
 #
 # Tests run under cargo-nextest when it is installed (every test of every binary in
 # parallel; `cargo install --locked cargo-nextest`), else under cargo test, crate by
 # crate. Builds go through scripts/cargo-guarded.sh. Every step runs; the summary lists
-# each one's exit code, and the script fails if any failed.
+# each one's exit code.
+#
+# Exit: 0 passed, 1 failed; 75 no verdict: the fleet gave none (push, windows), or the PC's
+# guard held or stopped a build (scripts/cargo-guarded.sh's 75), which isn't the tree's
+# failure; 2 a usage error, or nothing to check.
 #
 # The W3C suites run with their test data required (NRESE_W3C_REQUIRED=1, the data fetched
 # first by scripts/fetch-w3c-tests.sh): a suite without its data fails instead of passing by
@@ -97,6 +101,13 @@ dependents_of() {
 }
 
 package_args() { local name; for name in "$@"; do printf -- '-p %s ' "$name"; done; }
+
+# The workspace's packages, by name.
+workspace_packages() {
+  cargo metadata --no-deps --format-version 1 --offline \
+    | python -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))" \
+    | tr -d '\r'
+}
 
 # Tests of `all` crates, with the slow binaries of `fast_only` left out. Python's output is
 # read without carriage returns: Windows writes them, and cargo rejects names with them.
@@ -265,10 +276,12 @@ if [ "$mode" = push ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
     || git merge-base "$push_commit" refs/remotes/origin/refactor/engine-v2 2> /dev/null)}
   [ -n "$push_base" ] || { echo "no base for the push range: no upstream, and no origin/refactor/engine-v2" >&2; exit 2; }
 fi
-# The Windows part checks one commit, whole: COMMIT, else HEAD. It has no build-host side, so the
-# build-host variables change nothing here.
-if [ "$mode" = windows ]; then
+# The Windows part checks one commit, whole: COMMIT, else HEAD, by its own tier, so a commit from
+# before the tier can't be checked.
+if [ "$mode" = windows ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
   push_commit=$(git rev-parse -q --verify "${2:-HEAD}^{commit}") || { echo "no commit ${2:-HEAD} to check" >&2; exit 2; }
+  git cat-file -e "$push_commit:scripts/lib/windows-job.ps1" 2> /dev/null \
+    || { echo "$(git rev-parse --short "$push_commit") has no Windows tier (scripts/lib/windows-job.ps1): it can't be checked" >&2; exit 2; }
 fi
 
 # The push tier and the Windows part run on the fleet only (scripts/lib/fleet-gate.sh), for the
@@ -276,7 +289,7 @@ fi
 # verified fleet result, remembered by content (scripts/lib/gate-key.sh: the tier, the tree, the
 # files, the toolchain), and only check.sh writes it. No verdict, no pass (no push): nothing runs
 # here instead.
-if [ "$mode" = windows ] || { [ "$mode" = push ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; }; then
+if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
   # shellcheck source=lib/gate-key.sh
   . scripts/lib/gate-key.sh
   list=$(mktemp)
@@ -310,7 +323,7 @@ if [ "$mode" = windows ] || { [ "$mode" = push ] && [ -z "${NRESE_ON_BUILD_HOST:
     1) exit 1 ;;
     *) echo "no fleet verdict for $(git rev-parse --short "$push_commit") (tree $tree): no $mode pass; the $mode" \
          "tier runs on the fleet only" >&2
-       exit 1 ;;
+       exit 75 ;;
   esac
 fi
 
@@ -390,12 +403,21 @@ case "$mode" in
     fi
     side_steps "${files[@]}"
     ;;
+  windows)
+    # Inside its fleet job only, which readies the Windows host (scripts/lib/windows-job.sh).
+    [ -n "${FLEET_OUT:-}" ] || { echo "check.sh windows runs inside its fleet job only (scripts/lib/windows-job.sh): not run" >&2; exit 2; }
+    mapfile -t everything < <(workspace_packages)
+    [ ${#everything[@]} -gt 0 ] || { echo "no workspace packages found" >&2; exit 2; }
+    w3c_data
+    step build "$guarded" build --locked --workspace --all-targets
+    step test run_tests "${everything[@]}"
+    step "doc tests" "$guarded" test --locked --workspace --doc --no-fail-fast
+    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
+    ;;
   all)
     step fmt cargo fmt --all --check
     step clippy "$guarded" clippy --locked --workspace --all-targets
-    mapfile -t everything < <(cargo metadata --no-deps --format-version 1 --offline \
-      | python -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))" \
-      | tr -d '\r')
+    mapfile -t everything < <(workspace_packages)
     [ ${#everything[@]} -gt 0 ] || { echo "no workspace packages found" >&2; exit 2; }
     w3c_data
     step test run_tests "${everything[@]}"
@@ -424,6 +446,11 @@ echo "=== summary"
 failed=0
 for result in "${results[@]}"; do
   echo "  $result"
-  [ "${result%% *}" = 0 ] || failed=1
+  case ${result%% *} in
+    0) ;;
+    75) failed=75 ;;
+    *) [ $failed -eq 75 ] || failed=1 ;;
+  esac
 done
+[ $failed -ne 75 ] || echo "the PC's guard held or stopped a build (exit 75): no verdict, not the tree's failure"
 exit $failed

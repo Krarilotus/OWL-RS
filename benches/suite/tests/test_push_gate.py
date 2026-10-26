@@ -31,6 +31,7 @@ ZERO = "0" * 40
 COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", "scripts/lib/disk.sh",
           "scripts/lib/target-cpu.sh", "scripts/lib/remote.sh", "scripts/lib/gate-key.sh",
           "scripts/lib/fleet-gate.sh", "scripts/lib/fleet-job.sh", "scripts/lib/gate-tools.txt",
+          "scripts/lib/gate-record.py", "scripts/lib/windows-job.ps1", "scripts/lib/windows-job.sh",
           "benches/suite/requirements.txt")
 # A stand-in for the fleet's CLI: each submit keeps its job file; status, results and cancel as told.
 FLEET = """#!/bin/sh
@@ -425,23 +426,26 @@ class WindowsCheck(Repo):
     def submitted(self):
         return sorted(self.fake.glob("job-*.toml"))
 
-    def test_it_is_a_job_on_a_windows_host_for_the_commits_own_tree_from_heads_scripts(self):
-        """Without a verdict there is no pass: the job is cancelled, nothing runs here. The job runs
-        HEAD's launcher on COMMIT and its tree, from a checkout of HEAD (which holds COMMIT), held to
-        its memory ask."""
+    def test_it_is_the_commits_own_job_on_a_host_that_can_run_the_suite(self):
+        """Without a verdict there is no pass, and the exit says so (75, not a failure's 1): the job
+        is cancelled and nothing runs here. The job is COMMIT's own (its checkout, its launcher, its
+        tree); it states what it needs (a host that can run the suite, 6 cores, its memory held to
+        the ask) and picks no host."""
         older = self.commit("a.txt", "a changed\n")
-        head = self.commit("b.txt", "b changed\n")
+        self.commit("b.txt", "b changed\n")
         self.fleet("pending")
         done = self.check(older)
-        self.assertEqual((done.returncode != 0, len(self.submitted()), (self.fake / "cancelled").exists()),
-                         (True, 1, True), f"SPEC windows-no-verdict\n{done.stdout}{done.stderr}")
+        self.assertEqual((done.returncode, len(self.submitted()), (self.fake / "cancelled").exists()),
+                         (75, 1, True), f"SPEC windows-no-verdict\n{done.stdout}{done.stderr}")
         self.assertNotIn("=== ", done.stdout, "a step ran here")
         text = self.submitted()[0].read_text()
         steps = json.loads(re.search(r"^steps = (.*)$", text, re.M).group(1))
         self.assertEqual(steps, [["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
-                                  "scripts/lib/windows-job.ps1", older, self.tree(older)]], "SPEC windows-job")
-        for line in ('os = "windows"', 'kind = "owlrs.any"', f'rev = "{head}"', 'NRESE_MEMORY_CAP_GB = "16"'):
+                                  "scripts/lib/windows-job.ps1", self.tree(older)]], "SPEC windows-job")
+        for line in ('os = "windows"', 'kind = "owlrs.any"', 'has = ["owlrs-windows-suite"]', "cores = 6",
+                     f'rev = "{older}"', 'NRESE_MEMORY_CAP_GB = "16"'):
             self.assertIn(line, text, "SPEC windows-job")
+        self.assertNotIn("hosts =", text, "SPEC windows-job: the tool picked a host")
 
     def test_a_verified_result_passes_once_and_never_opens_a_push(self):
         """A whole, consistent Windows result for the tree passes and is remembered; it is the
@@ -505,25 +509,26 @@ class WindowsCheck(Repo):
                 self.assertEqual((done.returncode != 0, len(self.submitted())), (True, before + 1),
                                  f"SPEC windows-inputs: a change to {path} carried {passed}'s pass\n{done.stdout}")
 
-    def test_a_commit_head_doesnt_hold_is_refused_before_any_job(self):
-        self.git(self.repo, "checkout", "-q", "-b", "side")
-        side = self.commit("a.txt", "side\n")
-        self.git(self.repo, "checkout", "-q", "main")
-        self.commit("b.txt", "main\n")
+    def test_a_commit_from_before_the_windows_tier_is_refused_before_any_job(self):
+        self.git(self.repo, "rm", "-q", "scripts/lib/windows-job.ps1")
+        self.git(self.repo, "commit", "-qm", "no windows tier")
         self.fleet("pending")
-        done = self.check(side)
-        self.assertEqual((done.returncode != 0, self.submitted(), "HEAD doesn't hold" in done.stderr), (True, [], True),
-                         f"SPEC windows-held\n{done.stderr}")
+        done = self.check(self.git(self.repo, "rev-parse", "HEAD"))
+        self.assertEqual((done.returncode, self.submitted(), "has no Windows tier" in done.stderr), (2, [], True),
+                         f"SPEC windows-tier\n{done.stderr}")
 
 
 class WindowsJob(Repo):
-    """scripts/lib/windows-job.sh, the Windows part's step on its host, run from a copy as
-    scripts/lib/windows-job.ps1 runs it, with stand-ins for the tree's scripts and the toolchain."""
+    """scripts/lib/windows-job.sh, the Windows part's step on its host, in the job's checkout of the
+    commit: it readies the host and runs the tree's own check.sh windows, with stand-ins for the
+    tree's build and test tools and for the toolchain."""
 
-    def test_it_checks_out_the_commit_runs_every_step_and_says_what_it_was(self):
+    def test_it_runs_the_trees_own_windows_tier_and_says_what_it_was(self):
         stubs = self.root / "stubs"
         stubs.mkdir()
-        (stubs / "cargo").write_text("#!/bin/sh\nexit 1\n", newline="\n")  # no cargo-nextest: cargo test
+        # One workspace package, and no cargo-nextest: cargo test, crate by crate.
+        (stubs / "cargo").write_text('#!/bin/sh\n[ "$1" = metadata ] || exit 1\necho \'{"packages": [{"name": "x"}]}\'\n',
+                                     newline="\n")
         # rustup's proxy where STUB_NO_TOOLCHAIN is set: the tree's toolchain isn't installed, and the
         # proxy installs it (STUB_NO_TOOLCHAIN, a file, says so) unless RUSTUP_AUTO_INSTALL=0.
         (stubs / "rustc").write_text(
@@ -533,7 +538,7 @@ class WindowsJob(Repo):
             (stubs / name).chmod(0o755)
         # The tree's cargo-guarded.sh: needs a usable stdin, as Python's subprocess and coreutils do,
         # says where it builds, and fails as STUB_FAIL says (<its first argument>:<exit>).
-        guarded = ('case "$1" in --print-rustflags) echo "-C target-cpu=native"; exit 0 ;; esac\n'
+        guarded = ('#!/bin/sh\ncase "$1" in --print-rustflags) echo "-C target-cpu=native"; exit 0 ;; esac\n'
                    f'"{Path(sys.executable).as_posix()}" -c "import os; os.fstat(0)" || exit 9\n'
                    'printf %s "$CARGO_TARGET_DIR" > "$FLEET_OUT/target-dir"\n'
                    '[ "${STUB_FAIL%%:*}" != "$1" ] || exit "${STUB_FAIL#*:}"\n')
@@ -541,33 +546,26 @@ class WindowsJob(Repo):
                           "benches/suite/tests/isolation.py": "import sys\nsys.exit(0)\n"}.items():
             (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.repo / rel).write_text(body, newline="\n")
+        (self.repo / "scripts/cargo-guarded.sh").chmod(0o755)
         self.git(self.repo, "add", "-A")
         self.git(self.repo, "commit", "-q", "-m", "the commit under test")
-        commit, tree = self.git(self.repo, "rev-parse", "HEAD"), self.tree("HEAD")
-        # The job's checkout, HEAD: that commit and the job's script.
-        shutil.copy(ROOT / "scripts/lib/windows-job.sh", self.repo / "scripts/lib/windows-job.sh")
-        self.git(self.repo, "add", "-A")
-        self.git(self.repo, "commit", "-q", "-m", "the job's script")
-        tool = self.git(self.repo, "rev-parse", "HEAD")
+        tree = self.tree("HEAD")
         empty = self.git(self.repo, "hash-object", "/dev/null")
         cases = [  # tree sent, STUB_FAIL, stdin closed, toolchain missing -> exit, the build step's exit, stdin
             (tree, "", False, False, 0, 0, "valid"),
             ("0" * 40, "", False, False, 3, None, None),         # another tree checked out: no verdict
             (tree, "build:101", False, False, 1, 101, "valid"),  # a step fails: the tree fails
-            (tree, "build:75", False, False, 3, 75, "valid"),    # the PC guard stopped a build: no verdict
+            (tree, "build:75", False, False, 75, 75, "valid"),   # the PC guard stopped a build: no verdict
             (tree, "", True, False, 0, 0, "invalid"),            # no usable stdin (fleet I14): said, steps get /dev/null
             (tree, "", False, True, 3, None, None),              # no toolchain for the tree: no verdict, none installed
         ]
         for case, (sent, fail, closed, missing, code, build, stdin) in enumerate(cases):
-            self.git(self.repo, "checkout", "-q", "main")
-            (self.repo / "tmp" / "windows-job").mkdir(parents=True, exist_ok=True)
-            shutil.copy(ROOT / "scripts/lib/windows-job.sh", self.repo / "tmp/windows-job/windows-job.sh")
             out = self.root / f"out-{case}"
             out.mkdir()
             installed = self.root / f"installed-{case}"
             run = ("exec 0<&-; " if closed else "") + 'exec bash "$@"'
             done = subprocess.run(
-                [BASH, "-c", run, "-", "tmp/windows-job/windows-job.sh", commit, sent], cwd=self.repo,
+                [BASH, "-c", run, "-", "scripts/lib/windows-job.sh", sent], cwd=self.repo,
                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120,
                 env={**self.env, "PATH": stubs.as_posix() + os.pathsep + self.env["PATH"], "FLEET_OUT": str(out),
                      "FLEET_JOB": f"win-{case}", "FLEET_STEP": "1", "FLEET_HOST": "kraris-gptler", "STUB_FAIL": fail,
@@ -583,9 +581,9 @@ class WindowsJob(Repo):
                             f"SPEC windows-target: built in {built}, not its checkout's own target directory")
             result = json.loads((out / "gate.json").read_text())
             self.assertEqual(
-                {k: result[k] for k in ("tier", "tree", "list_hash", "code", "tool", "stdin", "tracked_changes", "job",
+                {k: result[k] for k in ("tier", "tree", "list_hash", "code", "stdin", "tracked_changes", "job",
                                         "fleet_host", "summary")},
-                {"tier": "windows", "tree": tree, "list_hash": empty, "code": code, "tool": tool, "stdin": stdin,
+                {"tier": "windows", "tree": tree, "list_hash": empty, "code": code, "stdin": stdin,
                  "tracked_changes": "", "job": f"win-{case}", "fleet_host": "kraris-gptler", "summary": True},
                 f"SPEC windows-record: case {case}")
             self.assertEqual([(s["name"], s["code"]) for s in result["steps"]],
@@ -594,7 +592,6 @@ class WindowsJob(Repo):
             self.assertEqual(result["attempt"], (out / "attempt").read_text().strip())
             self.assertRegex(result["identity"],
                              r"^rustc-1\.98\.1-abcdef123456 flags=-C_target-cpu=native tools=[0-9a-f]{12}$")
-            self.assertEqual(self.git(self.repo, "rev-parse", "HEAD"), commit, "SPEC windows-run: not the commit sent")
 
 
 if __name__ == "__main__":
