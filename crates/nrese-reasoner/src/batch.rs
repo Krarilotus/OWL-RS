@@ -33,10 +33,10 @@ pub use super::eval::Schema;
 use super::eval::{
     AllFacts, GroundProgram, Job, NEVER, Probes, Seg, Source, guards_hold, run_jobs_by_morsel,
 };
-use super::ir::{Head, Rule, Term};
+use super::ir::{Guard, Head, Rule, SharedClasses, Term};
 use super::ir::{Triple, Violation};
 use super::lists::{ListVocabulary, instantiate};
-use super::representatives::EqualityClasses;
+use super::representatives::{EqualityClasses, Guarded, over_classes};
 use nrese_exec::heap;
 use nrese_exec::search::Finger;
 
@@ -2303,6 +2303,27 @@ fn under_representatives(rules: &[Rule]) -> Vec<Rule> {
         .collect()
 }
 
+/// [`over_classes`] on `rules`, sharing the classes as they are now when it first changes
+/// a rule (later merges replace them).
+fn give_classes(
+    rules: &mut [Rule],
+    reps: &Representatives,
+    classes: &SharedClasses,
+    guarded: &mut Guarded,
+) {
+    let now = over_classes(rules, reps.same_as, classes);
+    if now.rules && !guarded.rules {
+        classes.set(&reps.classes);
+    }
+    guarded.rules |= now.rules;
+    guarded.facts |= now.facts;
+}
+
+/// Whether the rule's guards see the classes ([`Guard::OverClasses`]).
+fn sees_classes(rule: &Rule) -> bool {
+    matches!(rule.guards.as_slice(), [Guard::OverClasses { .. }])
+}
+
 /// Semi-naive evaluation to the fixpoint, from a store holding the input as its delta;
 /// with equality by representatives if `representatives` is given.
 fn run(
@@ -2334,6 +2355,12 @@ fn run(
     let mut regrounding = true;
     // Ground every rule again (rules whose constants were merged, rewritten).
     let mut reground_all = false;
+    // Over representatives: the classes the rules' guards see, and which rules were given
+    // them (super::representatives::over_classes). A merge can make such a guard hold for
+    // facts already joined, so the rules concluding facts run in full after one.
+    let guard_classes = SharedClasses::default();
+    let mut guarded = Guarded::default();
+    let mut reevaluate = false;
     // Facts to add in the first round, checked against the store: the input's stale
     // facts rewritten, where the input asserts equalities.
     let mut pending: Vec<Triple> = Vec::new();
@@ -2372,7 +2399,7 @@ fn run(
         let stale = representatives.as_ref().map_or(&none, |r| &r.stale);
         // Rules from `evaluated` on were added this round: evaluated once in full.
         let evaluated = program.rules.len();
-        if regrounding || reground_all {
+        if regrounding || reground_all || reevaluate {
             let current = Current {
                 store: &store,
                 stale,
@@ -2381,12 +2408,21 @@ fn run(
             if equality.is_some() {
                 source.retain(|r| !is_replacement_rule(r));
             }
+            if let Some(reps) = &representatives {
+                give_classes(&mut source, reps, &guard_classes, &mut guarded);
+            }
             // The first round grounds everything; later ones through new schema facts
             // only (list rules in full, deduplicated).
             if result.rounds == 1 || reground_all {
                 program.ground(&current, schema, &source);
             } else {
                 program.ground_delta(&current, schema, &source);
+                if reevaluate {
+                    // After a merge, a guard that sees the classes can hold for an instance
+                    // grounding left out: those rules ground again in full.
+                    source.retain(sees_classes);
+                    program.ground(&current, schema, &source);
+                }
             }
             reground_all = false;
             for &p in &program.transitive {
@@ -2434,8 +2470,10 @@ fn run(
         // family derives goes to the family's part of the delta.
         let mut jobs = Vec::new();
         let mut families: Vec<Option<u64>> = Vec::new();
+        // After a merge, the rules whose guards see the classes run in full.
+        let again = |rule: &Rule| reevaluate && sees_classes(rule);
         for (r, i) in program.variants(&store) {
-            if r < evaluated {
+            if r < evaluated && !again(&program.rules[r]) {
                 let family = program.closed_family(r);
                 let delta = family.map_or(Seg::Delta, Seg::DeltaNotBy);
                 if let Some(job) = Job::variant_reading(&current, &program.rules[r], i, delta) {
@@ -2449,6 +2487,17 @@ fn run(
                 jobs.push(job);
                 families.push(program.closed_family(r));
             }
+        }
+        if reevaluate {
+            for (r, rule) in program.rules.iter().enumerate().take(evaluated) {
+                if sees_classes(rule)
+                    && let Some(job) = Job::full(&current, rule)
+                {
+                    jobs.push(job);
+                    families.push(program.closed_family(r));
+                }
+            }
+            reevaluate = false;
         }
         let probes = Probes::for_jobs(jobs.len());
         let starts = std::sync::atomic::AtomicU64::new(0);
@@ -2545,6 +2594,10 @@ fn run(
                 // Rewritten: no longer what a family produced.
                 candidates.push((None, segments(moved)));
                 merged = true;
+                if guarded.rules {
+                    guard_classes.set(&reps.classes);
+                }
+                reevaluate = guarded.facts;
                 if rules.iter().any(|rule| names_any(rule, &lost)) {
                     rules = rules
                         .iter()
@@ -2563,7 +2616,7 @@ fn run(
         phases.merge += clock.elapsed();
         phases.new_facts += new as u64;
         result.counters.store_bytes.push(store.bytes());
-        if new == 0 && !reground_all {
+        if new == 0 && !reground_all && !reevaluate {
             break;
         }
         transitive.observe(&store);
@@ -2585,11 +2638,11 @@ fn run(
             store: &store,
             stale,
         };
-        program.ground(
-            &current,
-            schema,
-            &consistency_rules(&current, &rules, lists),
-        );
+        let mut checks = consistency_rules(&current, &rules, lists);
+        if let Some(reps) = &representatives {
+            give_classes(&mut checks, reps, &guard_classes, &mut guarded);
+        }
+        program.ground(&current, schema, &checks);
     }
     let reads = Reads::of(
         program.rules.iter().chain(

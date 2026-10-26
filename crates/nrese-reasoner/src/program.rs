@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use super::ir::{ParseError, Rule, Vocabulary};
 use super::n3::{self, N3Program};
-use super::rulesets::{Ruleset, SEMANTICS_VERSION};
+use super::rulesets::{Ruleset, SEMANTICS_VERSION, SemanticPart};
 use super::vocabulary::LocalVocabulary;
 
 /// User rules: their name (the file's, usually), their text, and its format.
@@ -23,6 +23,8 @@ pub struct UserRules {
     /// The relations a GraphDB ruleset's contexts compile to, taken from the validating
     /// compile: part of the fingerprint.
     context_relations: Vec<String>,
+    /// The semantic parts the rules use, from the same compile: part of the fingerprint.
+    parts: Vec<SemanticPart>,
 }
 
 /// The languages user rules are read in.
@@ -55,11 +57,15 @@ impl UserRules {
             text: text.into(),
             format,
             context_relations: Vec::new(),
+            parts: Vec::new(),
         };
         let mut vocabulary = LocalVocabulary::default();
         let compiled = rules.compile(&mut vocabulary)?;
         if format == RuleFormat::Pie {
             rules.context_relations = super::pie::context_relations(&compiled, &vocabulary);
+        }
+        if compiled.rules.iter().any(|rule| !rule.guards.is_empty()) {
+            rules.parts.push(SemanticPart::GuardsOverClasses);
         }
         Ok(rules)
     }
@@ -123,8 +129,9 @@ impl RuleProgram {
     }
 
     /// Identifies what the program derives: the built-in ruleset's fingerprint, and
-    /// FNV-1a over [`SEMANTICS_VERSION`], the user rules' text and the relations their
-    /// contexts compile to. Stable across builds and platforms.
+    /// FNV-1a over [`SEMANTICS_VERSION`], the user rules' text, the relations their
+    /// contexts compile to and the versions of the semantic parts they use. Stable across
+    /// builds and platforms.
     pub fn fingerprint(&self) -> u64 {
         let Some(user) = &self.user else {
             return self.base.map_or(0, Ruleset::fingerprint);
@@ -147,6 +154,12 @@ impl RuleProgram {
             feed(b"pie-context:");
             feed(name.as_bytes());
             feed(&[0]);
+        }
+        // The versions of the semantic parts the rules use ([`SemanticPart`]).
+        for part in &user.parts {
+            let (name, version) = part.version();
+            feed(name.as_bytes());
+            feed(&version.to_le_bytes());
         }
         hash
     }
@@ -218,8 +231,9 @@ mod tests {
         { ?x :parent ?y . ?y :parent ?z } => { ?x :grandparent ?z } .
         :parent :is :relation .";
 
-    /// What a build before the PIE context names changed stored for a user ruleset.
-    fn fingerprint_before_context_names(user: &str) -> u64 {
+    /// What a build stored for a user ruleset before its context names and semantic parts
+    /// entered the fingerprint.
+    fn stored_before(user: &str) -> u64 {
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for &byte in SEMANTICS_VERSION
             .to_le_bytes()
@@ -270,7 +284,24 @@ Id: r
         ] {
             let user = Arc::new(UserRules::pie("rules.pie", text).unwrap());
             let program = RuleProgram::new(None, Some(user)).unwrap();
-            let stored = fingerprint_before_context_names(text);
+            let stored = stored_before(text);
+            assert_eq!(program.fingerprint() != stored, rebuilds, "{text}");
+        }
+    }
+
+    /// A user ruleset with a guard no longer matches the state a build stored before guards
+    /// read the classes over representatives, so the store rebuilds its closure; others keep
+    /// theirs (reasoning-semantics.md, "Freshness": a build that changes what a ruleset
+    /// derives rebuilds once; Sol's review of the guard fix, r1 S3).
+    #[test]
+    fn guarded_user_rules_make_older_closures_stale() {
+        let guarded = "@prefix : <http://e/> .
+            @prefix log: <http://www.w3.org/2000/10/swap/log#> .
+            { ?x :p ?y . ?x log:notEqualTo ?y } => { ?x :q ?y } .";
+        for (text, rebuilds) in [(guarded, true), (RULES, false)] {
+            let user = Arc::new(UserRules::n3("rules.n3", text).unwrap());
+            let program = RuleProgram::new(None, Some(user)).unwrap();
+            let stored = stored_before(text);
             assert_eq!(program.fingerprint() != stored, rebuilds, "{text}");
         }
     }

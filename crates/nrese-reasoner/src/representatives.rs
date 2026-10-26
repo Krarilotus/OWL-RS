@@ -20,7 +20,7 @@
 //! same consistency rules fire.
 
 use super::batch::{self, Schema};
-use super::ir::Rule;
+use super::ir::{Atom, Guard, Head, Rule, SharedClasses, Term};
 use super::ir::{Triple, Violation};
 use super::lists::ListVocabulary;
 
@@ -64,6 +64,116 @@ pub fn without_replacement(rules: &[Rule]) -> Vec<Rule> {
         .filter(|r| !batch::is_replacement_rule(r))
         .cloned()
         .collect()
+}
+
+/// What [`over_classes`] changed: any rule, and a rule that concludes facts.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Guarded {
+    pub rules: bool,
+    pub facts: bool,
+}
+
+/// `rules` as they run over representatives: their guards hold where members of the
+/// classes satisfy them ([`Guard::OverClasses`]). Over representatives a guard sees one
+/// term per class, so `?x != ?y` failed for two members of one class, and a rule needing
+/// them to differ missed what the replicated closure derives (Sol's review of DMW-AB-mem,
+/// r1 S1). Left as they are, so the built-in rulesets run as before:
+/// - rules whose one guard is `?a != ?b` and whose every conclusion is `?a owl:sameAs ?b`
+///   (`prp-fp`, `prp-ifp`, `cls-maxc2`, `cls-maxqc3/4`, `prp-key`): with `?a` and `?b` in
+///   one class they would conclude what the class holds;
+/// - the long lists' rules ([`Guard::SameList`]): their index is built from the lists as
+///   the run reads them, over representatives, so it names no other member of a class.
+pub(crate) fn over_classes(rules: &mut [Rule], same_as: u64, classes: &SharedClasses) -> Guarded {
+    let mut guarded = Guarded::default();
+    for rule in rules {
+        let lists = rule.guards.iter().any(|g| matches!(g, Guard::SameList(..)));
+        if rule.guards.is_empty() || lists || concludes_its_inequality_equal(rule, same_as) {
+            continue;
+        }
+        let guards = std::mem::take(&mut rule.guards);
+        rule.guards = vec![Guard::OverClasses {
+            guards,
+            bound: Vec::new(),
+            classes: classes.clone(),
+        }];
+        guarded.rules = true;
+        guarded.facts |= matches!(rule.head, Head::Facts(_));
+    }
+    guarded
+}
+
+/// Whether the rule's one guard is `?a != ?b` and each conclusion `?a owl:sameAs ?b`.
+fn concludes_its_inequality_equal(rule: &Rule, same_as: u64) -> bool {
+    let ([Guard::NotEqual(a, b)], Head::Facts(heads)) = (rule.guards.as_slice(), &rule.head) else {
+        return false;
+    };
+    heads.iter().all(|&Atom([s, p, o])| {
+        p == Term::Const(same_as) && ((s, o) == (*a, *b) || (s, o) == (*b, *a))
+    })
+}
+
+/// Whether members of the classes of the guards' variables' values (a constant stands for
+/// itself, an unbound term is decided later) can be chosen, one per term, so that every
+/// guard holds.
+pub(crate) fn members_satisfy(
+    guards: &[Guard],
+    value: &dyn Fn(Term) -> Option<u64>,
+    classes: &SharedClasses,
+) -> bool {
+    let classes = classes.read();
+    let mut terms: Vec<Term> = Vec::new();
+    for term in guards.iter().flat_map(Guard::terms) {
+        if !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    let choices: Vec<Vec<Option<u64>>> = terms
+        .iter()
+        .map(|&term| match (term, value(term)) {
+            (Term::Var(_), Some(id)) => classes.class_of(id).map_or_else(
+                || vec![Some(id)],
+                |members| members.iter().map(|&m| Some(m)).collect(),
+            ),
+            (_, id) => vec![id],
+        })
+        .collect();
+    // Each guard is checked as soon as its terms are chosen.
+    let mut checks: Vec<Vec<&Guard>> = vec![Vec::new(); terms.len()];
+    for guard in guards {
+        let last = guard
+            .terms()
+            .iter()
+            .filter_map(|t| terms.iter().position(|u| u == t))
+            .max();
+        checks[last.unwrap_or(0)].push(guard);
+    }
+    fn choose(
+        depth: usize,
+        terms: &[Term],
+        choices: &[Vec<Option<u64>>],
+        checks: &[Vec<&Guard>],
+        chosen: &mut [Option<u64>],
+    ) -> bool {
+        if depth == terms.len() {
+            return true;
+        }
+        for &choice in &choices[depth] {
+            chosen[depth] = choice;
+            let value = |term: Term| {
+                terms
+                    .iter()
+                    .position(|&t| t == term)
+                    .and_then(|i| chosen[i])
+            };
+            if checks[depth].iter().all(|guard| guard.holds(value))
+                && choose(depth + 1, terms, choices, checks, chosen)
+            {
+                return true;
+            }
+        }
+        false
+    }
+    choose(0, &terms, &choices, &checks, &mut vec![None; terms.len()])
 }
 
 /// The closure of `input` under `rules` over representatives of `owl:sameAs` classes.
