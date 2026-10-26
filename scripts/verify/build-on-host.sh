@@ -7,9 +7,10 @@
 # Harness/notes/2026-10-20-host-cache-contract.md): ~/fleet/cache/owlrs-gate, one build or gate at a
 # time (its lock). The binary goes to <cache>/bin-<sha12>/ (nrese-server, REVISION, SHA256SUMS) for
 # the run jobs on this host; a binary already there whose checksum holds is reused, not rebuilt.
-# It builds in the gates' target directory for this toolchain (<cache>/target-<release>, the same
-# flags), kept within the gates' NRESE_GATE_BUDGET_GB (40) by scripts/cargo-guarded.sh: one budget
-# for a shared directory, or each user would prune it to its own.
+# It builds in its own checkout's target directory, which goes with the job, never in a target
+# another checkout builds in (the gates' or another build's): cargo decides freshness by mtimes,
+# so another checkout's build could stand in for this commit's code. A cold build: 119 s at -j2
+# (scripts/verify/verifykit/jobs.py).
 #
 # Deadlines (seconds; past one the step stops with exit 3, and the phase's command with every
 # process it started is killed: timeout signals its whole process group):
@@ -19,8 +20,8 @@
 # The contract's one sweep, under the lock after every build or reuse: entries bin-* unused for 7
 # days and target-* and py-* unused for 14 go, then the least recently used until the cache fits
 # NRESE_HOST_CACHE_GB (40), by each entry's .last-used (written by whoever builds in or uses it);
-# never this commit's binary or this toolchain's target directory, never wt (but its legacy
-# wt/target, an older gate tree's Miri build, as the gates sweep it), bin, rustup or cargo. Exact
+# never this commit's binary, never wt (but its legacy wt/target, an older gate tree's Miri build,
+# as the gates sweep it), bin, rustup or cargo. Exact
 # paths under the cache only. The entries of the cache /verify had before (~/fleet/cache/owlrs-verify)
 # go at every build, unless a build of the old kind holds that cache's lock, which stays.
 #
@@ -114,17 +115,13 @@ bounded "${NRESE_VERIFY_TOOLCHAIN_S:-900}" "installing toolchain $channel" \
   rustup toolchain install "$channel" --no-self-update --profile minimal > /dev/null 2>&1 \
   || { echo "no toolchain $channel" >&2; exit 3; }
 release=$(rustc -vV | sed -n 's/^release: //p')
-target=$cache/target-$release
 if [ -x "$bin/nrese-server" ] && (cd "$bin" && sha256sum --quiet -c SHA256SUMS) \
   && [ "$(cat "$bin/REVISION")" = "$sha" ]; then
   built=false
   echo "reusing $bin/nrese-server (its checksum holds)"
 else
   built=true
-  export CARGO_TARGET_DIR=$target
-  export NRESE_TARGET_BUDGET_GB=${NRESE_GATE_BUDGET_GB:-40}  # the gates' budget for the shared directory
-  mkdir -p "$target"
-  date +%s > "$target/.last-used"
+  export CARGO_TARGET_DIR=$PWD/target
   echo "=== building nrese-server (debug) at $sha with $release, $CARGO_BUILD_JOBS jobs"
   bounded "${NRESE_VERIFY_BUILD_S:-3600}" "the build" \
     bash scripts/cargo-guarded.sh build --locked -p nrese-server --bin nrese-server
@@ -141,13 +138,13 @@ fi
 date +%s > "$bin/.last-used"
 kill "$sampler" 2> /dev/null || true
 
-VERIFY_SHA=$sha VERIFY_BIN=$bin VERIFY_TARGET=$target VERIFY_CACHE=$cache VERIFY_BUILT=$built \
+VERIFY_SHA=$sha VERIFY_BIN=$bin VERIFY_CACHE=$cache VERIFY_BUILT=$built \
   VERIFY_SECONDS=$(($(date +%s) - start)) VERIFY_CACHE_GB=${NRESE_HOST_CACHE_GB:-40} VERIFY_MIGRATED=$migrated \
   VERIFY_RUSTC=$(rustc -vV | tr '\n' ';') VERIFY_HOST=$(hostname) VERIFY_CGROUP=$cgroup \
   VERIFY_PYTHON=$(python3 -c 'import sys; print(sys.version.split()[0])' 2>&1 || echo none) python3 - "$out" << 'EOF'
 import glob, json, os, shutil, sys, time
 e, out = os.environ, sys.argv[1]
-cache, binary_dir, target = e["VERIFY_CACHE"], e["VERIFY_BIN"], e["VERIFY_TARGET"]
+cache, binary_dir = e["VERIFY_CACHE"], e["VERIFY_BIN"]
 budget, now = int(float(e["VERIFY_CACHE_GB"]) * 2**30), time.time()
 
 
@@ -181,9 +178,10 @@ def mib(path):
 
 
 # The contract's sweep (Harness/notes/2026-10-20-host-cache-contract.md §6), as gate-job.sh runs it:
-# never what this build uses; wt, bin, rustup and cargo match none of the patterns. The gates' legacy
-# wt/target (an older gate tree's Miri build in the worktree) is an entry too, as they sweep it.
-kept = {binary_dir, target}
+# never what this build uses (its binary; it builds outside the cache); wt, bin, rustup and cargo
+# match none of the patterns. The gates' legacy wt/target (an older gate tree's Miri build in the
+# worktree) is an entry too, as they sweep it.
+kept = {binary_dir}
 candidates = [p for pattern in ("bin-*", "target-*", "py-*") for p in glob.glob(os.path.join(cache, pattern))]
 candidates.append(os.path.join(cache, "wt", "target"))
 entries = [p for p in candidates if os.path.isdir(p) and p not in kept]
