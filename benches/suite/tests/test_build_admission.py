@@ -9,10 +9,13 @@ the behaviour they asked for.
 Run: python -m unittest discover -s benches/suite/tests -p test_build_admission.py
 """
 
+import contextlib
+import ctypes
 import hashlib
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -22,6 +25,42 @@ import unittest
 ROOT = Path(__file__).resolve().parents[3]
 BASH = shutil.which("bash")
 GB = 1024 * 1024  # kB
+
+
+def owned(command, **popen):
+    """`command` started with all it will start in one unit the test can end: a process group on
+    POSIX; on Windows a job object, joined before it runs (started suspended). Ending the bash
+    alone left its slot poll's `sleep` in the test's directory, which Windows then can't remove
+    (found by PR 27's commit hook, 26 Oct 2026). Returns (process, end): end kills them all and
+    returns once none is left."""
+    if os.name != "nt":
+        process = subprocess.Popen(command, start_new_session=True, **popen)
+
+        def end():
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        return process, end
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.restype = kernel32.OpenProcess.restype = ctypes.c_void_p
+    job = ctypes.c_void_p(kernel32.CreateJobObjectW(None, None))
+    process = subprocess.Popen(command, creationflags=0x00000004, **popen)  # CREATE_SUSPENDED
+    handle = ctypes.c_void_p(kernel32.OpenProcess(0x1F0FFF, False, process.pid))
+    if not kernel32.AssignProcessToJobObject(job, handle) or ctypes.WinDLL("ntdll").NtResumeProcess(handle):
+        raise OSError(ctypes.get_last_error(), "the build's job object")
+    kernel32.CloseHandle(handle)
+
+    def end():
+        kernel32.TerminateJobObject(job, 1)
+        counts = (ctypes.c_uint32 * 12)()  # JOBOBJECT_BASIC_ACCOUNTING_INFORMATION; [10] ActiveProcesses
+        deadline = time.monotonic() + 30
+        while kernel32.QueryInformationJobObject(job, 1, counts, ctypes.sizeof(counts), None) and counts[10]:
+            if time.monotonic() > deadline:
+                raise RuntimeError("the build's processes didn't end in 30 s")
+            time.sleep(0.05)
+        process.wait()
+        kernel32.CloseHandle(job)
+    return process, end
 
 
 class Admission(unittest.TestCase):
@@ -87,9 +126,9 @@ class Admission(unittest.TestCase):
         return {k: v for k, v in merged.items() if v is not None}
 
     def start(self, run, stderr=subprocess.DEVNULL, **env):
-        build = subprocess.Popen([BASH, "scripts/cargo-guarded.sh", "build"], cwd=self.repo,
-                                 env=self.env(run, **env), stdout=subprocess.DEVNULL, stderr=stderr, text=True)
-        self.addCleanup(lambda: build.poll() is not None or (build.kill(), build.wait()))
+        build, end = owned([BASH, "scripts/cargo-guarded.sh", "build"], cwd=self.repo, env=self.env(run, **env),
+                           stdout=subprocess.DEVNULL, stderr=stderr, text=True)
+        self.addCleanup(end)
         return build
 
     def started(self, run, within):
