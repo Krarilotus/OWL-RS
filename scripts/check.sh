@@ -8,11 +8,14 @@
 # Usage: scripts/check.sh commit   pre-commit hook: the crates changed against HEAD
 #                                  (staged or not). fmt; clippy on them; their
 #                                  dependents' libraries compile; their fast tests.
-#        scripts/check.sh push     pre-push hook: the crates changed since the upstream
-#                                  branch. fmt; clippy on them; all their tests, the
-#                                  dependents' fast tests; random tests on new seeds; the
-#                                  lock check; nrese-exec's unsafe code under Miri and its
-#                                  doc tests when it changed (scripts/miri.sh).
+#        scripts/check.sh push     pre-push hook (.githooks/pre-push): the crates a pushed
+#                                  commit changes in the pushed range, on the fleet only
+#                                  (scripts/lib/fleet-gate.sh). fmt; clippy on them; all their
+#                                  tests, the dependents' fast tests; random tests on new
+#                                  seeds; the lock check; nrese-exec's unsafe code under Miri
+#                                  and its doc tests when it changed (scripts/miri.sh). By
+#                                  hand: HEAD, from its upstream (else from where it left
+#                                  origin's refactor/engine-v2), so a push then finds the pass.
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
 #                                  doc tests, cargo-deny, the console.
 #
@@ -227,7 +230,8 @@ exec_changed() {
 
 # The files a commit or push changes. A merge commit: a file the same as on one side was
 # tested on that side; new is what differs from both (resolved conflicts, files both sides
-# changed). A push: everything since the upstream branch.
+# changed). A push: the pushed range, from the base the remote has to the pushed commit
+# (push_base, push_commit); never the work tree, which a push doesn't send.
 
 changed_files() {
   if [ "$1" = commit ] && git rev-parse -q --verify MERGE_HEAD > /dev/null; then
@@ -235,13 +239,51 @@ changed_files() {
   elif [ "$1" = commit ]; then
     git diff --name-only HEAD
   else
-    local base
-    base=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || echo HEAD~1)
-    git diff --name-only "$base"...HEAD
-    git diff --name-only HEAD
+    git diff --name-only "$push_base" "$push_commit"
+    return
   fi
   git ls-files --others --exclude-standard
 }
+
+# A push gates one commit, from the base the remote has: .githooks/pre-push names both
+# (NRESE_PUSH_COMMIT, NRESE_PUSH_BASE); by hand, HEAD from its upstream, else from where it left
+# origin's refactor/engine-v2. Never the last commit alone.
+if [ "$mode" = push ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
+  push_commit=$(git rev-parse -q --verify "${NRESE_PUSH_COMMIT:-HEAD}^{commit}") \
+    || { echo "no commit ${NRESE_PUSH_COMMIT:-HEAD} to gate" >&2; exit 2; }
+  push_base=${NRESE_PUSH_BASE:-$(git rev-parse -q --verify '@{upstream}' 2> /dev/null \
+    || git merge-base "$push_commit" refs/remotes/origin/refactor/engine-v2 2> /dev/null)}
+  [ -n "$push_base" ] || { echo "no base for the push range: no upstream, and no origin/refactor/engine-v2" >&2; exit 2; }
+fi
+
+# The push tier runs on the fleet only (scripts/lib/fleet-gate.sh), for the pushed commit's own
+# tree and the pushed range's files. A pass is a verified fleet result, remembered by content
+# (scripts/lib/gate-key.sh: the tree, the files, the toolchain), and only check.sh writes it. No
+# verdict, no push: nothing runs here instead.
+if [ "$mode" = push ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
+  # shellcheck source=lib/gate-key.sh
+  . scripts/lib/gate-key.sh
+  list=$(mktemp)
+  where=$(mktemp)
+  trap 'rm -f "$list" "$where"' EXIT
+  changed_files push > "$list" || { echo "the push range $push_base..$push_commit isn't all here: fetch, then push" >&2; exit 2; }
+  tree=$(git rev-parse "$push_commit^{tree}")
+  list_hash=$(git hash-object "$list")
+  identity=$(gate_identity) || { echo "the gate can't name its toolchain and flags (above): not pushed" >&2; exit 2; }
+  key=$(gate_key "$tree" "$list_hash" "$identity")
+  if gate_passed "$key"; then
+    echo "=== push: $(git rev-parse --short "$push_commit") passed on the fleet before (its tree, these files)"
+    exit 0
+  fi
+  bash scripts/lib/fleet-gate.sh push "$list" "$tree" "$list_hash" "$identity" "$where" "$push_commit"
+  case $? in
+    0) gate_record "$key" "$(cat "$where")"; exit 0 ;;
+    1) exit 1 ;;
+    *) echo "no fleet verdict for $(git rev-parse --short "$push_commit") (tree $tree): not pushed; the push tier" \
+         "runs on the fleet only" >&2
+       exit 1 ;;
+  esac
+fi
 
 # This machine selects the changed files. With a build host (scripts/lib/remote.sh), the host
 # runs every step on a snapshot of this working tree; without one, or with NRESE_BUILD_HOST=local,
