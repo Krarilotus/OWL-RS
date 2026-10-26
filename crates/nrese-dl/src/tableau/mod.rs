@@ -48,6 +48,7 @@ pub use crate::Cancel;
 pub use model::Model;
 pub use probe::{At, Base, From, Label, Labels, Prepared, Probe, ProbeOutcome, Want};
 pub use program::left_out;
+pub(crate) use program::non_simple;
 pub use telemetry::Telemetry;
 
 use engine::Engine;

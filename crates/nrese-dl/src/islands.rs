@@ -27,8 +27,9 @@
 //!
 //! **The whole ABox instead:** with a nominal in a clause's head (`C ⊑ ∃R.{o}`: an
 //! individual every island may reach), the universal property (every pair of
-//! individuals), or a value a clause's head gives a key's data property (`C ⊑ ∃d.{0}`: a
-//! value individuals in any island may share). A nominal in a body only reads an
+//! individuals), a value a clause's head gives a key's data property (`C ⊑ ∃d.{0}`: a
+//! value individuals in any island may share), or a key over a non-simple property (every
+//! individual its chains reach is a value). A nominal in a body only reads an
 //! individual's identity: the role atoms beside it read across their edges, so their
 //! assertions join its island.
 //!
@@ -45,9 +46,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use nrese_owl::{
-    Axiom, BodyAtom, ClassExpr, ExprId, HeadAtom, ObjProp, Ontology, SafeRule, Term, Var,
-};
+use nrese_owl::{Axiom, BodyAtom, ClassExpr, ExprId, HeadAtom, ObjProp, Ontology, Term, Var};
 use nrese_xsd::owl::{Datatype, Value};
 
 use crate::tableau;
@@ -362,11 +361,28 @@ fn unsplittable(ontology: &Ontology) -> Result<(HashSet<Term>, KeyData), String>
             }
         }
     }
-    // A key's object properties connect the individuals it may equate.
-    for rule in &normalised.rules {
-        out.extend(key_roles(rule));
+    // A key's properties as its axiom writes them: the normalisation's key rules exist only
+    // for the individuals the analysed TBox names. Its object properties connect the
+    // individuals it may equate; over a non-simple one (the universal one too) every
+    // individual a chain reaches is a value, which no island bounds.
+    let non_simple = tableau::non_simple(ontology);
+    let mut keyed = Vec::new();
+    for axiom in &ontology.axioms {
+        let Axiom::HasKey(_, objects, data) = axiom else {
+            continue;
+        };
+        if objects.is_empty() && data.is_empty() {
+            return Err("a key of no property (every named member of its class is one)".into());
+        }
+        for r in objects {
+            if non_simple.contains(&r.named()) {
+                return Err("a key over a non-simple property (what its chains reach)".into());
+            }
+            out.insert(r.named());
+        }
+        keyed.extend(data);
     }
-    let keys = key_data(&normalised.rules, &data_inclusions);
+    let keys = key_data(&keyed, &data_inclusions);
     if valued.iter().any(|p| keys.contains_key(p)) {
         return Err(
             "a class gives a key's data property a value (one individuals in any island may share)"
@@ -490,34 +506,20 @@ fn role_index(atoms: &[(bool, Vec<Var>)], i: usize) -> usize {
         .map_or(usize::MAX, |(j, _)| j)
 }
 
-/// The object properties of a key's rule.
-fn key_roles(rule: &SafeRule) -> Vec<Term> {
-    rule.body
-        .iter()
-        .filter_map(|a| match a {
-            BodyAtom::Role(r, _, _) => Some(*r),
-            _ => None,
-        })
-        .collect()
-}
-
 /// For each data property, the keys' data properties its values are values of.
 type KeyData = HashMap<Term, Vec<Term>>;
 
-/// The data properties of the keys' rules for each of those and the properties under it
-/// (data `inclusions`, `sub → sup`, transitively).
-fn key_data(rules: &[SafeRule], inclusions: &[(Term, Term)]) -> KeyData {
+/// The keys' data properties `keyed` for each of those and the properties under it (data
+/// `inclusions`, `sub → sup`, transitively).
+fn key_data(keyed: &[Term], inclusions: &[(Term, Term)]) -> KeyData {
     let mut subs: HashMap<Term, Vec<Term>> = HashMap::new();
     for &(sub, sup) in inclusions {
         subs.entry(sup).or_default().push(sub);
     }
     let mut out = KeyData::new();
-    let mut keyed: HashSet<Term> = HashSet::new();
-    for atom in rules.iter().flat_map(|r| &r.body) {
-        let &BodyAtom::Data(d, _, _) = atom else {
-            continue;
-        };
-        if !keyed.insert(d) {
+    let mut done: HashSet<Term> = HashSet::new();
+    for &d in keyed {
+        if !done.insert(d) {
             continue;
         }
         let mut seen = HashSet::from([d]);
