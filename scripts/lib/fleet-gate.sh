@@ -26,7 +26,8 @@
 # 75 no verdict: no FLEET_OWNER, the fleet refused or didn't answer, no host started it within
 # NRESE_GATE_START_S (default 180 s; again after a host stopped it), it ran past NRESE_GATE_MAX_S
 # (default 10800 s), or its result is missing or for something else. The job is cancelled then,
-# and nothing runs here instead: no verdict, no push.
+# and nothing runs here instead: no verdict, no push. For windows the start window is 1800 s: the
+# fleet counts the main PC's own load, and kraris-gptler took 7 min to free 8 cores (26 Oct 2026).
 set -u
 mode=$1 list=$2 tree=$3 list_hash=$4 identity=$5 where=$6 commit=$7
 cd "$(git rev-parse --show-toplevel)" || exit 75
@@ -61,7 +62,7 @@ case $mode in
   push) cores=${NRESE_GATE_CORES:-8} ram=${NRESE_GATE_RAM_GB:-12} est=${NRESE_GATE_EST_MIN:-40} ;;
   windows)
     cores=${NRESE_GATE_CORES:-8} ram=${NRESE_GATE_RAM_GB:-16} est=${NRESE_GATE_EST_MIN:-30}
-    os=windows kind=owlrs.any confirm=kraris-gptler
+    os=windows kind=owlrs.any confirm=kraris-gptler start_s=${NRESE_GATE_START_S:-1800}
     reason="the merge check's Windows part (scripts/check.sh windows); no merge without it" ;;
   *) cores=${NRESE_GATE_CORES:-2} ram=${NRESE_GATE_RAM_GB:-4} est=${NRESE_GATE_EST_MIN:-10} ;;
 esac
