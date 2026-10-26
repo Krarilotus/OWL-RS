@@ -1,5 +1,27 @@
 #!/usr/bin/env bash
-# The push tier: the crates changed since the upstream branch, all their tests, and the
-# fast tests of the crates depending on them. Milestones run scripts/check.sh all.
-# Enable the hooks with: git config core.hooksPath .githooks
-exec scripts/check.sh push
+# The push tier for each pushed commit, on the fleet (scripts/check.sh push): the commit's own
+# tree, with the files from where the remote has its branch (new there: where it left
+# refactor/engine-v2) to the commit. A ref the push only deletes has no tree to gate. Milestones
+# run scripts/check.sh all. Enable the hooks with: git config core.hooksPath .githooks
+#
+# Git's lines on stdin: <local ref> <local sha> <remote ref> <remote sha>; $1 is the remote.
+cd "$(git rev-parse --show-toplevel)" || exit 2
+remote=${1:-origin}
+code=0 gated=0
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [[ $local_sha =~ ^0+$ ]] && continue  # a deletion
+  gated=$((gated + 1))
+  if [[ $remote_sha =~ ^0+$ ]]; then
+    if ! base=$(git merge-base "$local_sha" "refs/remotes/$remote/refactor/engine-v2" 2> /dev/null); then
+      echo "pre-push: $remote_ref is new on $remote, and $local_ref shares no history with" \
+        "$remote/refactor/engine-v2 here: no range to gate" >&2
+      code=1
+      continue
+    fi
+  else
+    base=$remote_sha
+  fi
+  NRESE_PUSH_COMMIT=$local_sha NRESE_PUSH_BASE=$base bash scripts/check.sh push < /dev/null || code=1
+done
+[ $gated -gt 0 ] || echo "pre-push: deletions only, nothing to gate" >&2
+exit $code

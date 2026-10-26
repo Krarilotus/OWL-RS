@@ -38,11 +38,14 @@ owns its tests, and benchmarks never run in a gate.
 ## Building and measuring
 
 Rust builds run on the build host ([benches/hosts.toml](benches/hosts.toml)): with
-`git config nrese.buildHost <ssh alias>`, the hooks and `scripts/lib/remote.sh check|run`
+`git config nrese.buildHost <ssh alias>`, the commit hook and `scripts/lib/remote.sh check|run`
 send the working tree there and run the command in a worktree of its own (`NRESE_BUILD_HOST=local`
-builds on this machine instead). A tier that passed
-for the same tree and files doesn't run again, so run `scripts/check.sh push` before a long
-push: the hook then passes at once. Build through
+builds on this machine instead). The push tier runs on the fleet only: `.githooks/pre-push` gates
+each pushed commit, by its own tree and the files from where the remote has its branch, as a fleet
+job (`FLEET_OWNER` names your thread), and only a verified fleet result lets the push through. No
+verdict, no push. A pass is remembered for the same tree, files and toolchain, so run
+`scripts/check.sh push` (it gates HEAD) before a long push: the hook then passes at once. A push
+that only deletes refs needs no gate. Build through
 `scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most `NRESE_BUILD_SLOTS`
 builds at once per machine). Validate in batches: quick checks while
 working, the push tier once per batch. Measure counts first; time only to answer a stated
