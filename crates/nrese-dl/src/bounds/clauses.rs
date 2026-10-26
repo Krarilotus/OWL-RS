@@ -69,12 +69,9 @@ impl Compiler<'_> {
                     let s = b.get(*v);
                     out.push(self.type_atom(s, self.concept(*c)));
                 }
-                // `owl:topObjectProperty` holds for every pair (Direct Semantics, §2.3):
-                // its atom is that both ends exist.
-                BodyAtom::Role(p, x, y) if *p == self.top_object => {
-                    let thing = self.program.names.thing;
+                BodyAtom::Role(p, x, y) => {
                     let (x, y) = (b.get(*x), b.get(*y));
-                    out.extend([self.type_atom(x, thing), self.type_atom(y, thing)]);
+                    self.push_role(&mut out, ObjProp::Named(*p), x, y);
                 }
                 // `owl:topDataProperty` holds for every element and value: where another
                 // atom binds the value, its atom is that the element exists.
@@ -86,7 +83,7 @@ impl Compiler<'_> {
                     let s = b.get(*x);
                     out.push(self.type_atom(s, self.program.names.thing));
                 }
-                BodyAtom::Role(p, x, y) | BodyAtom::Data(p, x, y) => {
+                BodyAtom::Data(p, x, y) => {
                     let (x, y) = (b.get(*x), b.get(*y));
                     out.push(Atom([x, Slot::Const(*p), y]));
                 }
@@ -177,7 +174,7 @@ impl Compiler<'_> {
                     range,
                     var,
                 } => {
-                    if self.is_empty(*range) {
+                    if self.ranges.eval(*range).over.is_empty() {
                         // `≥ n` (n ≥ 1) over no values: a false disjunct.
                         false_atoms += 1;
                         continue;
@@ -192,13 +189,18 @@ impl Compiler<'_> {
                     if !self.has_values(*n, *range) {
                         unchecked
                             .get_or_insert("a data existential over a range that may be too small");
+                    } else if skolem && self.compares_values {
+                        // A Skolem value stands for some value of the range, not the one a
+                        // negative assertion or a key compares.
+                        unchecked.get_or_insert("a data existential's value a comparison reads");
                     }
                 }
                 HeadAtom::DataIn(range, _) => {
-                    if self.is_empty(*range) {
+                    let values = self.ranges.eval(*range);
+                    if values.over.is_empty() {
                         // A value in no values (`≤ 0 d`, `∀ d.⊥`): a false disjunct.
                         false_atoms += 1;
-                    } else if !self.holds_all(*range) {
+                    } else if !values.under.complement().is_empty() {
                         approx.data = true;
                         unchecked.get_or_insert("data values tested against a data range");
                     }
@@ -241,12 +243,7 @@ impl Compiler<'_> {
             let mut successor = |body: &mut Vec<Atom>| {
                 let y = Slot::Var(next);
                 next += 1;
-                if role.named() == self.top_object {
-                    let thing = self.program.names.thing;
-                    body.extend([self.type_atom(centre, thing), self.type_atom(y, thing)]);
-                } else {
-                    body.push(Self::edge(role, centre, y));
-                }
+                self.push_role(body, role, centre, y);
                 if let Filler::Is(c) = filler {
                     body.push(self.type_atom(y, self.concept(c)));
                 }
@@ -338,33 +335,17 @@ impl Compiler<'_> {
         collapsed
     }
 
-    /// Whether `range` holds every data value (`rdfs:Literal`), so that a value can't
-    /// contradict it.
-    fn holds_all(&self, range: RangeId) -> bool {
-        matches!(self.normalised.ranges.get(range.0), DataRange::Datatype(t) if *t == self.literal)
-    }
-
-    /// Whether `range` surely has no value: the complement of `rdfs:Literal`, an empty
-    /// enumeration, an intersection with an empty range, a union of empty ranges.
-    fn is_empty(&self, range: RangeId) -> bool {
-        match self.normalised.ranges.get(range.0) {
-            DataRange::Not(r) => self.holds_all(*r),
-            DataRange::OneOf(values) => values.is_empty(),
-            DataRange::And(rs) => rs.iter().any(|&r| self.is_empty(r)),
-            DataRange::Or(rs) => rs.iter().all(|&r| self.is_empty(r)),
-            _ => false,
-        }
-    }
-
     /// Whether `range` surely has `n` values, so that `≥ n` over it can't be a
-    /// contradiction: every datatype has at least one value, `rdfs:Literal` infinitely
-    /// many, a one-value enumeration one.
+    /// contradiction: as the datatype theory evaluates it. A datatype outside the map that
+    /// no definition gives has no fixed values, so a model can give it the one value an
+    /// existential needs (its other value constraints are unchecked).
     fn has_values(&self, n: u32, range: RangeId) -> bool {
-        match self.normalised.ranges.get(range.0) {
-            DataRange::Datatype(t) => n <= 1 || *t == self.literal,
-            DataRange::OneOf(values) => n <= 1 && !values.is_empty(),
-            _ => false,
-        }
+        let values = self.ranges.eval(range);
+        values.under.count().at_least(u64::from(n))
+            || (n <= 1
+                && values.approximate.is_some()
+                && matches!(self.ranges.get(range), DataRange::Datatype(t)
+                    if !self.normalised.definitions.iter().any(|(d, _)| d == t)))
     }
 
     /// The values a data existential derives, and whether they are a Skolem constant:

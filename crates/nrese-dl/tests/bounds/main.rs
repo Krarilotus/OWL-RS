@@ -428,3 +428,120 @@ fn chains_nominals_cardinalities_and_keys() {
         e.program.incomplete
     );
 }
+
+/// A key over `owl:topObjectProperty` (review A-1704): named `a`, `b` in `K` share a named
+/// value (`a` itself) by the universal property, so the key makes them equal (OWL 2 Direct
+/// Semantics, §2.3.5) and `b : A` follows; with `a ≠ b` asserted, there is no model.
+#[test]
+fn a_key_over_the_universal_property_equates() {
+    for different in [false, true] {
+        let mut text = String::from(
+            r#"
+@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+:K a owl:Class . :A a owl:Class .
+:a a owl:NamedIndividual . :b a owl:NamedIndividual .
+:K owl:hasKey ( owl:topObjectProperty ) .
+:a a :K , :A . :b a :K .
+"#,
+        );
+        if different {
+            text.push_str(":a owl:differentFrom :b .\n");
+        }
+        let mut e = example(&text);
+        let clash = e.upper.facts.iter().any(|f| f[1] == e.program.names.clash);
+        if different {
+            assert!(clash, "a ≠ b against the key");
+        } else {
+            let (b, a) = (ex(&mut e.table, "b"), ex(&mut e.table, "A"));
+            let fact = [b, e.program.names.rdf_type, a];
+            assert!(e.upper.facts.binary_search(&fact).is_ok(), "b : A");
+        }
+    }
+}
+
+/// U1 proves an ontology consistent only where it has a model. Without one:
+/// - a data existential over a defined datatype with no value (review A-1705): `xsd:string`
+///   and `xsd:integer` have disjoint value spaces (OWL 2 Structural Specification, §4), so
+///   `D` is empty and `a : A` has no `d` value in it;
+/// - a TBox alone, `⊤ ⊑ A ⊑ ⊥` (review A-1703): the domain is never empty (OWL 2 Direct
+///   Semantics, §2.2), so its element is in `A`, which has none;
+/// - a value a defined datatype forces (`D ≡ {0}`) that a negative assertion excludes, or
+///   that a key shares with an individual in a disjoint class (Direct Semantics, §2.3.5).
+///
+/// With one, the proof stands: a defined datatype with values (`xsd:integer[≥ 0]`, PR #30
+/// review), and a datatype outside the map, whose values a model may choose (§4).
+#[test]
+fn a_proof_of_consistency_needs_a_model() {
+    let data = ":A a owl:Class . :d a owl:DatatypeProperty . :a a :A .";
+    let some = |range: &str| {
+        format!(
+            "{data} :A rdfs:subClassOf \
+             [ a owl:Restriction ; owl:onProperty :d ; owl:someValuesFrom {range} ] ."
+        )
+    };
+    let defined = |definition: &str| {
+        format!(
+            "{} :D a rdfs:Datatype ; owl:equivalentClass [ a rdfs:Datatype ; {definition} ] .",
+            some(":D")
+        )
+    };
+    let zero = defined("owl:oneOf ( \"0\"^^xsd:integer )");
+    let cases = [
+        (
+            "an empty defined datatype",
+            defined("owl:intersectionOf ( xsd:string xsd:integer )"),
+            false,
+        ),
+        (
+            "a forced value a negative assertion excludes",
+            format!(
+                "{zero} [] a owl:NegativePropertyAssertion ; owl:sourceIndividual :a ; \
+                 owl:assertionProperty :d ; owl:targetValue \"0\"^^xsd:integer ."
+            ),
+            false,
+        ),
+        (
+            "a forced value a key shares",
+            format!(
+                "{zero} owl:Thing owl:hasKey ( :d ) . :B a owl:Class ; owl:disjointWith :A . \
+                 :b a :B ; :d \"0\"^^xsd:integer ."
+            ),
+            false,
+        ),
+        (
+            "a TBox alone",
+            ":A a owl:Class . owl:Thing rdfs:subClassOf :A . :A rdfs:subClassOf owl:Nothing ."
+                .to_owned(),
+            false,
+        ),
+        (
+            "an inhabited defined datatype",
+            defined(
+                "owl:onDatatype xsd:integer ; \
+                 owl:withRestrictions ( [ xsd:minInclusive \"0\"^^xsd:integer ] )",
+            ),
+            true,
+        ),
+        ("a datatype outside the map", some("xsd:date"), true),
+    ];
+    let mut wrong = Vec::new();
+    for (name, axioms, proved) in cases {
+        let e = example(&format!(
+            "@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+{axioms}"
+        ));
+        let clash = e.upper.facts.iter().any(|f| f[1] == e.program.names.clash);
+        if (!clash && e.program.proves_consistency()) != proved {
+            let unchecked = &e.program.unchecked;
+            wrong.push(format!(
+                "{name}: proved {}, clash {clash}, unchecked {unchecked:?}",
+                !proved
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

@@ -144,6 +144,25 @@ impl Ranges {
         }
     }
 
+    /// The ranges of `normalised` with only the literals they name: for a reader of the
+    /// ranges alone (the upper bound), not a copy of every literal the input asserts.
+    pub fn of_ranges(ontology: &Ontology, normalised: &Normalised) -> Self {
+        let mut ranges = Self::new(&Ontology::default(), normalised);
+        ranges.data.iris = ontology.data.iris.clone();
+        for id in 0..normalised.ranges.len() as u32 {
+            let named: Vec<Term> = match normalised.ranges.get(id) {
+                DataRange::OneOf(values) => values.clone(),
+                DataRange::Restriction(_, facets) => facets.iter().map(|&(_, v)| v).collect(),
+                _ => continue,
+            };
+            let literals = named
+                .into_iter()
+                .filter_map(|t| Some((t, ontology.data.literals.get(&t)?.clone())));
+            ranges.data.literals.extend(literals);
+        }
+        ranges
+    }
+
     /// Ranges from their parts (the theory's tests build them so).
     pub fn from_parts(
         table: Interner<DataRange>,
