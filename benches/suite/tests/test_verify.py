@@ -15,6 +15,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import re
 import shutil
 import socket
@@ -281,6 +282,48 @@ class Migration(unittest.TestCase):
             time.sleep(0.05)
         self.migrate(old)
         self.assertTrue((old / "target-1.98.1").is_dir())
+
+
+@unittest.skipUnless(shutil.which("flock") and Path("/proc/self/cgroup").exists(), "a Linux fleet host's step")
+class OwnTarget(unittest.TestCase):
+    """build-on-host.sh compiles in its own checkout's target directory, whatever the host sets, never
+    in one another checkout builds in (the gates', shared until 26 Oct 2026, or another build's):
+    cargo decides freshness by mtimes, and its unit hashes don't depend on the checkout's path, so
+    another checkout's build there could stand in for this commit's code."""
+
+    def test_each_build_compiles_in_its_own_checkout(self):
+        root = Path(tempfile.mkdtemp(prefix="verify-target-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        cache, stubs, seen = root / "cache", root / "stubs", root / "seen"
+        stubs.mkdir()
+        for name, body in {"rustup": "exit 0", "rustc": 'echo "release: 1.98.1"'}.items():
+            (stubs / name).write_text(f"#!/bin/sh\n{body}\n")
+            (stubs / name).chmod(0o755)
+        # The tree's cargo-guarded.sh: says where it builds and leaves the binary there.
+        guarded = ('echo "$CARGO_TARGET_DIR" >> "$SEEN"\nmkdir -p "$CARGO_TARGET_DIR/debug"\n'
+                   'echo "$PWD" > "$CARGO_TARGET_DIR/debug/nrese-server"\n')
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "NRESE_", "FLEET_", "CARGO_"))}
+        env.update(HOME=str(root), PATH=f"{stubs}:{env['PATH']}", NRESE_VERIFY_CACHE=str(cache), SEEN=str(seen),
+                   CARGO_TARGET_DIR=str(cache / "target-1.98.1"))  # a host's own setting: the shared directory
+        checkouts = [root / "a", root / "b"]
+        for n, repo in enumerate(checkouts):  # two commits, so neither reuses the other's binary
+            (repo / "scripts").mkdir(parents=True)
+            (repo / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.98.1"\n')
+            (repo / "scripts" / "cargo-guarded.sh").write_text(guarded)
+            (repo / "src.rs").write_text(f"// commit {n}\n")
+            for args in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c"]):
+                subprocess.run(["git", *args], cwd=repo, env=env, check=True, capture_output=True, timeout=60)
+            out = root / f"out-{n}"
+            out.mkdir()
+            done = subprocess.run(["bash", str(ROOT / "scripts/verify/build-on-host.sh")], cwd=repo,
+                                  env={**env, "FLEET_OUT": str(out)}, capture_output=True, text=True, timeout=120)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        built = [Path(line) for line in seen.read_text().split()]
+        self.assertEqual(len(built), 2)
+        for path, repo in zip(built, checkouts):
+            self.assertTrue(path.name == "target" and path.parent.samefile(repo),
+                            f"SPEC own-target: built in {path}, not {repo}'s own target directory")
+        self.assertEqual(list(cache.glob("target*")), [], "SPEC own-target: a build compiled in the host's cache")
 
 
 class Launch(unittest.TestCase):

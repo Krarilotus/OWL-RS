@@ -8,9 +8,10 @@
 # (~/fleet/cache/owlrs-gate/wt: only what changed gets new mtimes, so builds stay incremental),
 # after checking that its checkout is TREE and its file list hashes to LIST_HASH. One gate at a
 # time per host (a lock): gates share the host's one cache with /verify
-# (Harness/notes/2026-10-20-host-cache-contract.md): a target directory per toolchain release
-# (target-<release>, kept within NRESE_GATE_BUDGET_GB by scripts/cargo-guarded.sh), each entry's
-# last use recorded, one sweep for the whole cache (NRESE_HOST_CACHE_GB).
+# (Harness/notes/2026-10-20-host-cache-contract.md): a target directory of the gates' own per
+# toolchain release (target-gate-<release>, kept within NRESE_GATE_BUDGET_GB by
+# scripts/cargo-guarded.sh), each entry's last use recorded, one sweep for the whole cache
+# (NRESE_HOST_CACHE_GB).
 #
 # Its tools: the tree's toolchain (rust-toolchain.toml), the pinned cargo-nextest and Miri
 # nightly (scripts/lib/gate-tools.txt) and the suite's Python packages, all installed once,
@@ -145,9 +146,11 @@ identity=$(gate_identity) || infra "no rustc"
 
 # The host's one cache (Harness/notes/2026-10-20-host-cache-contract.md, shared with /verify): a
 # target directory per toolchain release, each entry's last use recorded, one sweep for all, run
-# after the work so it counts what the work added.
+# after the work so it counts what the work added. The target is the gates' alone: cargo decides
+# freshness by mtimes, so a build from another checkout in it (/verify's, which wrote
+# target-<release> until 26 Oct 2026) could stand in for the tree's own code.
 release=$(rustc -vV | sed -n 's/^release: //p')
-export CARGO_TARGET_DIR="$cache/target-$release"
+export CARGO_TARGET_DIR="$cache/target-gate-$release"
 export NRESE_TARGET_BUDGET_GB=${NRESE_GATE_BUDGET_GB:-40}
 used=("$CARGO_TARGET_DIR" "$py")
 for entry in "${used[@]}"; do mkdir -p "$entry" && echo "$EPOCHSECONDS" > "$entry/.last-used"; done
