@@ -1102,10 +1102,13 @@ impl StoreService {
     /// writer slot is taken.
     /// In a session, the result is kept for its next read on the same data
     /// ([`crate::sessions`]); `scope` is the reader's, by which the operations were scoped.
+    /// What making the reader's view reads and builds is charged to `memory`, the reading
+    /// query's envelope ([`Self::read_snapshot_within`]).
     fn with_pending<T>(
         &self,
         pending: &crate::StatementsRequest,
         scope: &crate::ReadScope,
+        memory: &nrese_exec::Envelope,
         cancellation: &CancellationToken,
         read: impl FnOnce(&nrese_engine::Snapshot) -> StoreResult<T>,
     ) -> StoreResult<T> {
@@ -1128,8 +1131,7 @@ impl StoreService {
                 // as the support views are. A statement the view adds (asserted only in
                 // graphs the reader can't read, and derived) stays unless the operations
                 // assert it where the reader reads it.
-                let memory = self.settings.envelope(None);
-                let base = self.view_of(tx.base(), Some(access), &memory, None)?;
+                let base = self.view_of(tx.base(), Some(access), memory, None)?;
                 let left = |quad: &nrese_engine::EncodedQuad| match tx
                     .base()
                     .contains_in(ReadModel::Inferred, quad)
@@ -1210,7 +1212,7 @@ impl StoreService {
             .iter()
             .any(|op| !matches!(op, crate::StatementOp::Add { .. }));
         let memory = self.settings.query_envelope(prepared);
-        let run = self.with_pending(pending, &scope, cancellation, |snapshot| {
+        let run = self.with_pending(pending, &scope, &memory, cancellation, |snapshot| {
             run_query(
                 snapshot,
                 prepared,
@@ -1374,7 +1376,13 @@ impl StoreService {
     ) -> StoreResult<T> {
         match context.pending {
             None => read(&self.read_snapshot(context.scope.access())?),
-            Some(pending) => self.with_pending(pending, &context.scope, &context.cancel, read),
+            Some(pending) => self.with_pending(
+                pending,
+                &context.scope,
+                &self.settings.envelope(None),
+                &context.cancel,
+                read,
+            ),
         }
     }
 
