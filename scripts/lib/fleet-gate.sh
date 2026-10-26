@@ -55,7 +55,9 @@ reason="the $mode gate of a pushed commit (scripts/check.sh); no push without it
 case $mode in
   push) cores=${NRESE_GATE_CORES:-8} ram=${NRESE_GATE_RAM_GB:-12} est=${NRESE_GATE_EST_MIN:-40} ;;
   windows)
-    cores=${NRESE_GATE_CORES:-6} ram=${NRESE_GATE_RAM_GB:-16} est=${NRESE_GATE_EST_MIN:-30}
+    # 9 GB: the suite took at most 7.5 GB over five runs on kraris-gptler (the fleet's owner,
+    # 26 Oct 2026), a 1.5 GB margin; 16 GB kept checks waiting while 11-15 GB was free.
+    cores=${NRESE_GATE_CORES:-6} ram=${NRESE_GATE_RAM_GB:-9} est=${NRESE_GATE_EST_MIN:-30}
     os=windows kind=owlrs.any confirm=kraris-gptler start_s=${NRESE_GATE_START_S:-1800}
     reason="the merge check's Windows part (scripts/check.sh windows); no merge without it" ;;
   *) cores=${NRESE_GATE_CORES:-2} ram=${NRESE_GATE_RAM_GB:-4} est=${NRESE_GATE_EST_MIN:-10} ;;
