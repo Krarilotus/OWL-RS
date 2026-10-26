@@ -155,13 +155,19 @@ pub fn classify(o: &Ontology, options: &Options, with: &classify::Options) -> Cl
                     .to_owned(),
             ];
             why.extend(t.incomplete.iter().cloned());
-            let (classification, open) = refine(o, &decision, t.classification, options, deadline);
+            let (classification, open, unsettled) =
+                refine(o, &decision, t.classification, options, deadline);
             if open > 0 {
                 why.push(format!("{open} pairs of classes open"));
             }
+            if unsettled > 0 {
+                why.push(format!(
+                    "{unsettled} classes open (satisfiable? equivalent to owl:Thing?)"
+                ));
+            }
             Classified {
                 classification,
-                exact: open == 0,
+                exact: open == 0 && unsettled == 0,
                 why,
                 decision,
             }
@@ -235,7 +241,11 @@ fn with_witness(
 /// The classification of a consistent input completed past `lower` (the DL part's with
 /// the rule instances, entailed): a pair is refuted by the certified model of the input
 /// (an element in `A ∖ B`), then by one with a witness in `A`, then by one in `A ⊓ ¬B`; a
-/// witness that has no model makes the subsumption entailed. How many pairs stay open (the
+/// witness that has no model makes the subsumption entailed. A class's place is settled
+/// apart from its pairs: its satisfiability by `lower`, by an element of the certified
+/// model, or by a witness with a model (in `A`, or in `A ⊓ ¬B`), and a class with no pair
+/// open is tested for it too; whether it is `owl:Thing` by `lower`, or by an element of
+/// such a model outside it. How many pairs, and how many classes' places, stay open (the
 /// budgets `options.max_tests` and `deadline`, the whole classification's; undecided
 /// tests).
 fn refine(
@@ -244,7 +254,7 @@ fn refine(
     mut lower: Classification,
     options: &Options,
     deadline: Option<std::time::Instant>,
-) -> (Classification, usize) {
+) -> (Classification, usize, usize) {
     let classes = lower.classes.clone();
     let mut known: HashSet<(nrese_owl::Term, nrese_owl::Term)> =
         lower.subsumptions.iter().copied().collect();
@@ -254,6 +264,9 @@ fn refine(
         a == b || unsat.contains(&a) || top.contains(&b) || known.contains(&(a, b))
     };
     let mut refuted: HashSet<(nrese_owl::Term, nrese_owl::Term)> = HashSet::new();
+    let mut satisfiable: HashSet<nrese_owl::Term> = HashSet::new();
+    // The classes an element of a model of the input is outside: none of them is `owl:Thing`.
+    let mut not_top: HashSet<nrese_owl::Term> = HashSet::new();
     // The certified model of the input.
     if let Some(m) = &decision.model {
         for e in 0..m.size {
@@ -265,6 +278,8 @@ fn refine(
                     }
                 }
             }
+            not_top.extend(classes.iter().filter(|&&b| !here.contains(&b)));
+            satisfiable.extend(here);
         }
     }
     let open = |known: &HashSet<_>, refuted: &HashSet<_>, a| {
@@ -288,7 +303,10 @@ fn refine(
     };
     let mut newly_unsat: Vec<nrese_owl::Term> = Vec::new();
     for &a in &classes {
-        if unsat.contains(&a) || open(&known, &refuted, a).is_empty() || tests >= budget || spent()
+        if unsat.contains(&a)
+            || (satisfiable.contains(&a) && open(&known, &refuted, a).is_empty())
+            || tests >= budget
+            || spent()
         {
             continue;
         }
@@ -296,11 +314,13 @@ fn refine(
         let d = with_witness(o, a, None, &test_options());
         match (&d.verdict, &d.model) {
             (Verdict::Consistent { .. }, Some(m)) => {
+                satisfiable.insert(a);
                 if let Some(&w) = m.individuals.get(&WITNESS) {
                     let here = classes_of(m, w);
                     for &b in &classes {
                         if !here.contains(&b) {
                             refuted.insert((a, b));
+                            not_top.insert(b);
                         }
                     }
                 }
@@ -320,7 +340,9 @@ fn refine(
             tests += 1;
             match with_witness(o, a, Some(b), &test_options()).verdict {
                 Verdict::Consistent { .. } => {
+                    satisfiable.insert(a);
                     refuted.insert((a, b));
+                    not_top.insert(b);
                 }
                 Verdict::Inconsistent { .. } => {
                     known.insert((a, b));
@@ -330,9 +352,14 @@ fn refine(
         }
     }
     let mut remaining = 0;
+    let mut unsettled = 0;
     for &a in &classes {
         if !newly_unsat.contains(&a) {
             remaining += open(&known, &refuted, a).len();
+            let placed = top.contains(&a) || not_top.contains(&a);
+            if !unsat.contains(&a) && (!satisfiable.contains(&a) || !placed) {
+                unsettled += 1;
+            }
         }
     }
     lower.unsatisfiable.extend(newly_unsat);
@@ -345,5 +372,5 @@ fn refine(
         .collect();
     subs.sort_unstable();
     lower.subsumptions = subs;
-    (lower, remaining)
+    (lower, remaining, unsettled)
 }

@@ -88,6 +88,87 @@ fn an_inequality_of_one_individual_is_false() {
     assert!(is_consistent(&d));
 }
 
+/// The instance budget limits how many rule instances a round grounds, not which rules
+/// are checked: `⊤(x) → x ≠ x` over the named `a` is false in every model, so a round that
+/// may ground none can't certify one (A-1701).
+#[test]
+fn a_zero_instance_budget_certifies_no_model() {
+    let (o, _) = read_with_rules(&format!(
+        "{PREFIXES}Ontology(Declaration(NamedIndividual(:a)) ClassAssertion(owl:Thing :a) \
+         DLSafeRule(Body(ClassAtom(owl:Thing Variable(:x))) \
+         Head(DifferentIndividualsAtom(Variable(:x) Variable(:x)))))"
+    ))
+    .expect("reads");
+    let options = Options {
+        max_instances: Some(0),
+        ..Options::default()
+    };
+    let d = consistency(&o, &options);
+    assert!(
+        !matches!(d.verdict, Verdict::Consistent { .. }),
+        "certified consistent: {:?}\n{:#?}",
+        d.verdict,
+        d.tried
+    );
+}
+
+/// An exact classification settles each class's place, not only its pairs (A-1702):
+/// - `A ⊑ {a}` and `A(x) → ⊥`: an element of `A` is `a`, which the rule keeps out of `A`, so
+///   `A` is unsatisfiable though it has no pair of classes to test; with no test budget it
+///   is listed so;
+/// - `⊤ ⊑ {a}`, `⊤ ⊑ A ⊔ B` and `B(x) → ⊥`: every element is `a`, which the rule keeps out of
+///   `B`, so `A` is `⊤`.
+///
+/// A classification that doesn't list it isn't exact.
+#[test]
+fn an_exact_classification_settles_each_class() {
+    // (case, axioms, whether A is unsatisfiable rather than ⊤)
+    let cases = [
+        (
+            "A ⊑ {a}",
+            "Declaration(Class(:A)) Declaration(NamedIndividual(:a)) \
+             SubClassOf(:A ObjectOneOf(:a)) \
+             DLSafeRule(Body(ClassAtom(:A Variable(:x))) Head())",
+            true,
+        ),
+        (
+            "⊤ ⊑ A ⊔ B",
+            "Declaration(Class(:A)) Declaration(Class(:B)) Declaration(NamedIndividual(:a)) \
+             SubClassOf(owl:Thing ObjectOneOf(:a)) SubClassOf(owl:Thing ObjectUnionOf(:A :B)) \
+             DLSafeRule(Body(ClassAtom(:B Variable(:x))) Head())",
+            false,
+        ),
+    ];
+    for (case, axioms, unsatisfiable) in cases {
+        let (o, names) = read_with_rules(&format!("{PREFIXES}Ontology({axioms})")).expect("reads");
+        let a = names.classes[0];
+        for max_tests in [None, Some(0)] {
+            let options = Options {
+                max_tests,
+                ..Options::default()
+            };
+            let c = nrese_dl::beyond::classify::classify(
+                &o,
+                &options,
+                &nrese_dl::classify::Options::default(),
+            );
+            let listed = if unsatisfiable {
+                c.classification.unsatisfiable.contains(&a)
+            } else {
+                c.classification.top.contains(&a)
+            };
+            assert!(
+                listed || !c.exact,
+                "{case}, max_tests {max_tests:?}: A not listed, and exact\n{:#?}",
+                c.why
+            );
+            if unsatisfiable && max_tests.is_none() {
+                assert!(listed, "{case}: A not unsatisfiable\n{:#?}", c.why);
+            }
+        }
+    }
+}
+
 /// A built-in outside SWRL's (SWRLTab's `abox:hasClass` in ORE's 10860) has no meaning
 /// NRESE knows: its rule is left out and named; "inconsistent" from the rest still holds,
 /// "consistent" isn't claimed.
