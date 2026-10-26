@@ -1,12 +1,14 @@
-# A push gate's passes, remembered by content (sourced by scripts/check.sh and scripts/lib/gate-job.sh).
+# A fleet gate's passes, remembered by content (sourced by scripts/check.sh, scripts/lib/gate-job.sh
+# and scripts/lib/windows-job.sh).
 #
-# A tree that passed the push tier on the fleet never needs it again. The key is what the result
-# depends on:
+# A tree that passed the push tier (or the merge check's Windows part, `windows`) on the fleet
+# never needs it again. The key is what the result depends on:
 #
-#   push[ w3c-optional] <tree> <file list> rustc-<release>-<commit> flags=<rustflags> tools=<id> fleet
+#   <tier>[ w3c-optional] <tree> <file list> rustc-<release>-<commit> flags=<rustflags> tools=<id> fleet
 #
-# - tree: the pushed commit's tree, what was tested, byte for byte;
-# - file list: the hash of the files the tier was selected from (the pushed range's);
+# - tree: the pushed (or checked) commit's tree, what was tested, byte for byte;
+# - file list: the hash of the files the tier was selected from (the pushed range's; none for
+#   `windows`, which runs everything);
 # - the toolchain rustc -vV reports (the tree's rust-toolchain.toml picks it; a host with
 #   another install or an override doesn't match), and the flags rustc gets
 #   (scripts/cargo-guarded.sh --print-rustflags: `-C target-cpu=native` means each machine's own
@@ -45,9 +47,9 @@ gate_cpu() {
   rustc --print target-cpus 2> /dev/null | tr -d '\r' | sed -n 's/.*currently \([^)]*\)).*/\1/p' | head -1
 }
 
-# gate_key TREE LIST_HASH IDENTITY
+# gate_key TIER TREE LIST_HASH IDENTITY
 gate_key() {
-  printf 'push%s %s %s %s fleet\n' "${NRESE_W3C_OPTIONAL:+ w3c-optional}" "$1" "$2" "$3"
+  printf '%s%s %s %s %s fleet\n' "$1" "${NRESE_W3C_OPTIONAL:+ w3c-optional}" "$2" "$3" "$4"
 }
 
 gate_passed_file() { printf '%s/nrese-gate-passed\n' "$(git rev-parse --git-common-dir)"; }
