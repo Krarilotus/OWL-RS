@@ -109,6 +109,8 @@ pub struct Slot {
 
 impl Slot {
     pub const NO_GUARD: u32 = u32::MAX;
+    /// The most atoms a clause body may have: a slot names them by `u8` position.
+    pub const MAX_BODY: usize = u8::MAX as usize + 1;
 }
 
 /// The compiled ontology, immutable while the contexts saturate.

@@ -33,7 +33,9 @@ use nrese_owl::{
 use super::abox::Abox;
 use super::atoms::{ConceptId, FuncId, Kind, MAX_ID, RoleId, TermOrder};
 use super::horn;
-use super::program::{AtMostOne, BodyPat, DlClause, Func, HeadPat, KindPat, Program, TermPat, Var};
+use super::program::{
+    AtMostOne, BodyPat, DlClause, Func, HeadPat, KindPat, Program, Slot, TermPat, Var,
+};
 pub use super::unsupported::Unsupported;
 
 /// What the compilation did, for the profile.
@@ -205,6 +207,13 @@ fn admissible<'n>(
             });
         }
         if clause.flags.equality && !(equality && at_most_one(clause).is_some()) {
+            return Err(Unsupported::Equality {
+                axiom: axiom_of(clause),
+            });
+        }
+        // The Eq rule merges a context's own successors; asserted edges between named
+        // individuals never reach it, so it would leave `r(a, b)`, `r(a, c)` unmerged.
+        if clause.flags.equality && !facts.roles.is_empty() {
             return Err(Unsupported::Equality {
                 axiom: axiom_of(clause),
             });
@@ -551,7 +560,7 @@ impl Compiler {
                 _ => return Err(shape),
             }
         }
-        if vars.len() > 200 {
+        if vars.len() > 200 || pats.len() > Slot::MAX_BODY {
             return Err(shape);
         }
         Ok((pats, vars))
