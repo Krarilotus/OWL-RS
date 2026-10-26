@@ -43,6 +43,9 @@ pub type RoleId = u32;
 /// The most variables a clause may have (`x` and the `y`s).
 pub const MAX_VARS: usize = 24;
 
+/// The most atoms a clause body may have: a join plan names them by `u8` position.
+const MAX_BODY: usize = u8::MAX as usize + 1;
+
 /// What a concept id stands for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConceptName {
@@ -643,6 +646,9 @@ impl Program {
 
     /// One DL-clause as an HT-clause.
     fn clause(&mut self, clause: &Clause, source: u32) -> Result<HtClause, String> {
+        if clause.body.len() > MAX_BODY {
+            return Err(format!("more than {MAX_BODY} body atoms"));
+        }
         let mut vars: Vec<Var> = vec![Var::X];
         let mut body = Vec::new();
         for atom in &clause.body {
