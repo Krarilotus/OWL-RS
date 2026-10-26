@@ -86,6 +86,22 @@ impl Terms for Table {
             .get(&RdfTerm::NamedNode(NamedNode::new_unchecked(iri)))
             .copied()
     }
+
+    // A literal's datatype and language, as the store gives them (`dl/source.rs`): the
+    // datatype theory needs them for its value.
+    fn datatype(&self, term: Term) -> Option<String> {
+        match &self.terms[term as usize] {
+            RdfTerm::Literal(l) => Some(l.datatype().as_str().to_owned()),
+            _ => None,
+        }
+    }
+
+    fn language(&self, term: Term) -> Option<String> {
+        match &self.terms[term as usize] {
+            RdfTerm::Literal(l) => l.language().map(str::to_owned),
+            _ => None,
+        }
+    }
 }
 
 impl Make for Table {
