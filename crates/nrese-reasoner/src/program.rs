@@ -244,14 +244,30 @@ Id: r
 }
 ";
 
+    /// [`IN_A_CONTEXT`] with a prefix `urn` declared, which a relation's name (`urn:nrese:…`)
+    /// must not be expanded by.
+    fn with_urn_prefix() -> String {
+        IN_A_CONTEXT.replace(
+            "Prefices { e : http://e/ }",
+            "Prefices\n{\n  e : http://e/\n  urn : http://alias/\n}",
+        )
+    }
+
     /// A GraphDB ruleset with contexts no longer matches the state a build with the old
     /// context names stored, so the store rebuilds its closure; other rulesets keep theirs.
-    /// `[ Context` is an accepted spelling (fix check 1 of R1-F1).
+    /// `[ Context` is an accepted spelling (fix check 1 of R1-F1), and a declared `urn` prefix
+    /// hides no relation (Sol's review of R1-OL1's fix, S1).
     #[test]
     fn changed_context_names_make_older_closures_stale() {
         let without = IN_A_CONTEXT.replace(" [Context <e:g#x>]", "");
         let spaced = IN_A_CONTEXT.replace("[Context", "[ Context");
-        for (text, rebuilds) in [(IN_A_CONTEXT, true), (&spaced, true), (&without, false)] {
+        let urn = with_urn_prefix();
+        for (text, rebuilds) in [
+            (IN_A_CONTEXT, true),
+            (&spaced, true),
+            (&urn, true),
+            (&without, false),
+        ] {
             let user = Arc::new(UserRules::pie("rules.pie", text).unwrap());
             let program = RuleProgram::new(None, Some(user)).unwrap();
             let stored = fingerprint_before_context_names(text);
@@ -265,11 +281,15 @@ Id: r
     /// R1-OL1).
     #[test]
     fn renamed_context_relations_change_the_fingerprint() {
+        for text in [IN_A_CONTEXT, &with_urn_prefix()] {
+            let user = UserRules::pie("rules.pie", text).unwrap();
+            assert_eq!(
+                user.context_relations,
+                ["<urn:nrese:pie-context:http://e/g%23x#http://e/q>"],
+                "{text}"
+            );
+        }
         let user = UserRules::pie("rules.pie", IN_A_CONTEXT).unwrap();
-        assert_eq!(
-            user.context_relations,
-            ["<urn:nrese:pie-context:http://e/g%23x#http://e/q>"]
-        );
         let mut renamed = user.clone();
         renamed.context_relations = vec!["<urn:nrese:pie-context:http://e/g#x#http://e/q>".into()];
         let fingerprint = |user: UserRules| {

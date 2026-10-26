@@ -272,6 +272,9 @@ fn rule_blocks(
 enum Token {
     Var(String),
     Iri(String),
+    /// An IRI already expanded, a context relation's name ([`context_predicate`]): taken as
+    /// it is, so a declared prefix (`urn`) can't rewrite it.
+    Expanded(String),
     Literal {
         lexical: String,
         datatype: Option<String>,
@@ -394,6 +397,7 @@ fn constant(
     Ok(match token {
         Token::Var(v) => return Err(format!("{v} isn't a constant")),
         Token::Iri(iri) => vocabulary.iri(&expand(iri, prefixes)),
+        Token::Expanded(iri) => vocabulary.iri(iri),
         Token::Literal {
             lexical,
             language: Some(language),
@@ -476,7 +480,7 @@ fn context_predicate(
             .replace('#', "%23")
     };
     match (context, predicate) {
-        (Token::Iri(context), Token::Iri(predicate)) => Ok(Token::Iri(format!(
+        (Token::Iri(context), Token::Iri(predicate)) => Ok(Token::Expanded(format!(
             "{CONTEXT_PREFIX}{}#{}",
             part(context),
             part(predicate)
@@ -684,7 +688,7 @@ Consistency: self_friend
         let name = |context: &str, predicate: &str| {
             let iri = |text: &str| Token::Iri(text.to_owned());
             match context_predicate(&iri(context), &iri(predicate), &prefixes).unwrap() {
-                Token::Iri(name) => name,
+                Token::Expanded(name) => name,
                 other => panic!("{other:?}"),
             }
         };
