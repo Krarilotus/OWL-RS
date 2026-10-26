@@ -159,6 +159,22 @@ class PushGate(Repo):
                          (True, 1, True), f"SPEC no-verdict: the fleet wasn't asked, or the push went\n{done.stderr}")
         self.assertNotIn("=== fmt", done.stdout + done.stderr, "a tier ran here")
 
+    def test_a_build_host_variable_in_the_pushers_environment_changes_nothing(self):
+        """NRESE_ON_BUILD_HOST, the gate's own mark for a run on a build host, in the pusher's
+        environment doesn't open a push: it is gated on the fleet as any push, and with no verdict
+        it is refused, with no tier run here (review PR 27 r1, B1: the push went through on an
+        empty file list, fmt alone)."""
+        cargo = self.fake / "bin" / "cargo"  # a formatted tree's `cargo fmt --check`: the empty tier passes
+        cargo.write_text("#!/bin/sh\nexit 0\n", newline="\n")
+        cargo.chmod(0o755)
+        tip = self.commit("a.txt", "a changed\n")
+        self.fleet("pending")
+        self.env["NRESE_ON_BUILD_HOST"] = "1"
+        done = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
+        self.assertEqual((done.returncode != 0, len(self.jobs()), "=== fmt" in done.stdout + done.stderr),
+                         (True, 1, False), "SPEC build-host-env: the push skipped the fleet gate, or a tier ran here\n"
+                                           f"{done.stdout}{done.stderr}")
+
     def test_a_verified_fleet_result_for_the_tree_lets_the_push_through(self):
         """A whole, consistent passing result of the fleet's gate for exactly the pushed tree and
         files lets the push through and is remembered: the next push of that tree needs no job."""
