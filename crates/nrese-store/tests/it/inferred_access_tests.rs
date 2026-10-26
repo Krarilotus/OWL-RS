@@ -422,6 +422,51 @@ fn a_cancelled_restricted_read_fails_and_leaves_nothing_behind() {
     assert_eq!(classes(&store, &scope, "a"), ["<D>", "<E>", "<F>"]);
 }
 
+/// A read inside a transaction charges the view it makes to its query's memory, as a read
+/// outside one does (sol-loop r1 of item 18 part 1, S2). 5,000 facts in the reader's graph
+/// give its supported view sets well past 64 KiB, which the query itself fits (a reader of
+/// every graph, with no view, answers): the reader's read fails with the query's memory
+/// limit. Nothing of it is kept, so the same read without a limit answers.
+#[test]
+fn a_pending_read_charges_its_view_to_the_query() {
+    use nrese_store::{CancellationToken, PreparedQuery, StatementOp, StatementsRequest};
+    let store = StoreService::new(in_memory_store_config()).unwrap();
+    let facts: String = (0..5_000).map(|i| format!("ex:i{i} a ex:C . ")).collect();
+    store
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {{ GRAPH ex:open {{ ex:C rdfs:subClassOf ex:D . {facts} }} }}"
+        )))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    let pending = StatementsRequest::new(vec![StatementOp::Update(SparqlUpdateRequest::new(
+        format!("PREFIX ex: <{EX}> INSERT DATA {{ GRAPH ex:open {{ ex:z a ex:C }} }}"),
+    ))]);
+    let ask = |scope: ReadScope, query: &str, limit: Option<usize>| {
+        let mut request = SparqlQueryRequest::new(format!("PREFIX ex: <{EX}> {query}"), scope);
+        request.memory_limit = limit;
+        let prepared = PreparedQuery::parse(&request).unwrap();
+        let mut out = Vec::new();
+        store
+            .run_query_pending(&pending, &prepared, &CancellationToken::new(), &mut out)
+            .map(|()| String::from_utf8(out).unwrap())
+    };
+    let limit = Some(64 * 1024);
+    let unrestricted = ask(ReadScope::All, "ASK {}", limit);
+    assert!(unrestricted.is_ok(), "the query alone: {unrestricted:?}");
+    let restricted = ask(reader(true), "ASK {}", limit);
+    assert!(
+        matches!(&restricted, Err(error) if error.is_memory_limit()),
+        "{restricted:?}"
+    );
+    let again = ask(reader(true), "ASK { ex:i0 a ex:D }", None);
+    assert!(
+        again.as_ref().is_ok_and(|a| a.contains("true")),
+        "{again:?}"
+    );
+}
+
 /// Without rules registered the sets can't be computed: no inferred statement is shown.
 #[test]
 fn without_rules_nothing_inferred_is_shown() {
