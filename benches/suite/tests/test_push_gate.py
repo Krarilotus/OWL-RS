@@ -443,7 +443,7 @@ class WindowsCheck(Repo):
         self.assertEqual(steps, [["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
                                   "scripts/lib/windows-job.ps1", self.tree(older)]], "SPEC windows-job")
         for line in ('os = "windows"', 'kind = "owlrs.any"', 'has = ["owlrs-windows-suite"]', "cores = 6",
-                     f'rev = "{older}"', "ram_gb = 9", 'NRESE_MEMORY_CAP_GB = "9"'):
+                     f'rev = "{older}"', "ram_gb = 12", 'NRESE_MEMORY_CAP_GB = "12"'):
             self.assertIn(line, text, "SPEC windows-job")
         self.assertNotIn("hosts =", text, "SPEC windows-job: the tool picked a host")
 
