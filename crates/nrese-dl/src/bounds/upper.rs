@@ -460,7 +460,9 @@ impl Compiler<'_> {
     }
 
     /// `owl:Thing` (PAGOdA §2.2): every member of a class, both ends of an object
-    /// property, the subject of a data property, and every declared individual.
+    /// property, the subject of a data property, and every declared individual; and one
+    /// element of U1's own, since the domain is never empty (Direct Semantics, §2.2): a
+    /// TBox alone (`⊤ ⊑ A`, `A ⊑ ⊥`) clashes at it.
     fn thing(&mut self, named_individual: Term) {
         let (x, y) = (Slot::Var(0), Slot::Var(1));
         let thing = self.program.names.thing;
@@ -469,6 +471,9 @@ impl Compiler<'_> {
             sources: Vec::new(),
             approximations: Approximations::default(),
         };
+        let domain = self.skolem(&format!("{U1}domain"));
+        let fact = [domain, self.program.names.rdf_type, thing];
+        self.program.facts.push((fact, provenance.clone()));
         let sig = self.program.signature.clone();
         let classes = sig
             .classes
