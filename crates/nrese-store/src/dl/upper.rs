@@ -248,36 +248,6 @@ impl Values {
     }
 }
 
-/// The predicates whose object values U1's rules compare: in a rule body, with a constant
-/// object or an object variable another atom reads (a key's values, a `hasValue`). Other
-/// literals are never compared, so they needn't be read by value (LUBM's names, e-mail
-/// addresses and telephone numbers: 107,410 literals at LUBM(10)). The equality rules'
-/// atoms with a variable predicate join only over `owl:sameAs`, which no literal has in U1.
-fn compared_predicates(program: &bounds::Program) -> HashSet<u64> {
-    let mut out = HashSet::new();
-    for rule in &program.rules {
-        for (i, atom) in rule.body.iter().enumerate() {
-            let [_, bounds::Slot::Const(p), object] = atom.0 else {
-                continue;
-            };
-            let compared = match object {
-                bounds::Slot::Const(_) => true,
-                bounds::Slot::Var(v) => {
-                    rule.body
-                        .iter()
-                        .enumerate()
-                        .any(|(j, other)| j != i && other.0.contains(&bounds::Slot::Var(v)))
-                        || atom.0[..2].contains(&bounds::Slot::Var(v))
-                }
-            };
-            if compared {
-                out.insert(p);
-            }
-        }
-    }
-    out
-}
-
 /// The OWL 2 data value of the literal `id`; `None` for anything else, or a literal whose
 /// value can't be read.
 fn value_of(view: &Snapshot, id: u64) -> Option<nrese_xsd::owl::Value> {
@@ -443,7 +413,10 @@ pub struct Upper {
     /// literals are noted when its change is computed: a representative stays one
     /// whether the commit happens or not.
     values: Mutex<Values>,
-    /// The predicates whose values U1's rules compare ([`compared_predicates`]).
+    /// The predicates whose values U1's rules compare
+    /// ([`bounds::Program::compared_predicates`]). Other literals are never compared, so
+    /// they needn't be read by value (LUBM's names, e-mail addresses and telephone
+    /// numbers: 107,410 literals at LUBM(10)).
     compared: HashSet<u64>,
     /// The `owl:sameAs` classes, by representative: the stack is over them.
     classes: nrese_reasoner::representatives::EqualityClasses,
@@ -537,7 +510,7 @@ impl Upper {
             ));
         }
         // The literals U1 compares, by value: of the view, the program's facts, its rules.
-        let compared = compared_predicates(&program);
+        let compared = program.compared_predicates().clone();
         let mut values = Values::default();
         let mut input = view_facts(view, stop)?;
         values.add_objects(view, &input, &compared);
