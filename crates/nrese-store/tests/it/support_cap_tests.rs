@@ -9,10 +9,7 @@
 //! every statement's sets (`usize::MAX`); the cap's own contract (config.rs,
 //! `StoreConfig::support_sets`) is that it bounds memory and work, not what readers see: a
 //! reader none of a statement's kept sets fits, where the cap left some out, is decided by the
-//! closure of its graphs.
-//!
-//! The two tests of the default configuration are red while its cap is 16: they are the
-//! specification an exact default must meet, run with `--ignored`.
+//! closure of its graphs. So every cap, the default's included, answers as the oracle.
 
 use std::sync::Arc;
 
@@ -169,10 +166,10 @@ fn exact_reads_equal_the_oracle() {
     }
 }
 
-/// Red while the default cap is 16: a reader whose graphs hold only a set the cap left out is
-/// denied a statement the oracle shows (the 17 sets of `copies 17`, and more).
+/// The default configuration (cap 16) answers as the oracle on the suite's inputs: a reader
+/// whose graphs hold only a set the cap left out (the 17 sets of `copies 17`, and more) is
+/// decided by the closure of its graphs.
 #[test]
-#[ignore = "red while the default cap is 16 (C-310); the specification of an exact default"]
 fn default_reads_equal_the_oracle() {
     let wrong: Vec<String> = catalogued()
         .iter()
@@ -237,10 +234,9 @@ fn exact_reads_ignore_hidden_supports() {
     assert_eq!(hidden_supports(|| capped(EXACT)), [(true, 1); 2]);
 }
 
-/// Red while the default cap is 16: the hidden supports push the reader's out of the 16 kept,
-/// and its answers change with graphs it may not read.
+/// The default configuration: the hidden supports push the reader's set out of the 16 kept,
+/// and its answers stay what they are without them.
 #[test]
-#[ignore = "red while the default cap is 16 (C-310); the specification of an exact default"]
 fn default_reads_ignore_hidden_supports() {
     assert_eq!(hidden_supports(in_memory_store_config), [(true, 1); 2]);
 }
