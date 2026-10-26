@@ -16,6 +16,12 @@
 #                                  and its doc tests when it changed (scripts/miri.sh). By
 #                                  hand: HEAD, from its upstream (else from where it left
 #                                  origin's refactor/engine-v2), so a push then finds the pass.
+#        scripts/check.sh windows [COMMIT]
+#                                  the merge check's Windows part, on the fleet only
+#                                  (scripts/lib/fleet-gate.sh windows): COMMIT (default HEAD)
+#                                  built whole, all its tests and doc tests, the suite
+#                                  contracts. HEAD must hold COMMIT: the job runs HEAD's
+#                                  scripts/lib/windows-job.sh on it.
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
 #                                  doc tests, cargo-deny, the console.
 #
@@ -257,32 +263,40 @@ if [ "$mode" = push ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
     || git merge-base "$push_commit" refs/remotes/origin/refactor/engine-v2 2> /dev/null)}
   [ -n "$push_base" ] || { echo "no base for the push range: no upstream, and no origin/refactor/engine-v2" >&2; exit 2; }
 fi
+# The Windows part checks one commit, whole: COMMIT, else HEAD. It has no build-host side, so the
+# build-host variables change nothing here.
+if [ "$mode" = windows ]; then
+  push_commit=$(git rev-parse -q --verify "${2:-HEAD}^{commit}") || { echo "no commit ${2:-HEAD} to check" >&2; exit 2; }
+fi
 
-# The push tier runs on the fleet only (scripts/lib/fleet-gate.sh), for the pushed commit's own
-# tree and the pushed range's files. A pass is a verified fleet result, remembered by content
-# (scripts/lib/gate-key.sh: the tree, the files, the toolchain), and only check.sh writes it. No
-# verdict, no push: nothing runs here instead.
-if [ "$mode" = push ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
+# The push tier and the Windows part run on the fleet only (scripts/lib/fleet-gate.sh), for the
+# commit's own tree and the pushed range's files (Windows: none, everything runs). A pass is a
+# verified fleet result, remembered by content (scripts/lib/gate-key.sh: the tier, the tree, the
+# files, the toolchain), and only check.sh writes it. No verdict, no pass (no push): nothing runs
+# here instead.
+if [ "$mode" = windows ] || { [ "$mode" = push ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; }; then
   # shellcheck source=lib/gate-key.sh
   . scripts/lib/gate-key.sh
   list=$(mktemp)
   where=$(mktemp)
   trap 'rm -f "$list" "$where"' EXIT
-  changed_files push > "$list" || { echo "the push range $push_base..$push_commit isn't all here: fetch, then push" >&2; exit 2; }
+  if [ "$mode" = push ]; then
+    changed_files push > "$list" || { echo "the push range $push_base..$push_commit isn't all here: fetch, then push" >&2; exit 2; }
+  fi
   tree=$(git rev-parse "$push_commit^{tree}")
   list_hash=$(git hash-object "$list")
-  identity=$(gate_identity) || { echo "the gate can't name its toolchain and flags (above): not pushed" >&2; exit 2; }
-  key=$(gate_key "$tree" "$list_hash" "$identity")
+  identity=$(gate_identity) || { echo "the gate can't name its toolchain and flags (above): no $mode pass" >&2; exit 2; }
+  key=$(gate_key "$mode" "$tree" "$list_hash" "$identity")
   if gate_passed "$key"; then
-    echo "=== push: $(git rev-parse --short "$push_commit") passed on the fleet before (its tree, these files)"
+    echo "=== $mode: $(git rev-parse --short "$push_commit") passed on the fleet before (its tree, these files)"
     exit 0
   fi
-  bash scripts/lib/fleet-gate.sh push "$list" "$tree" "$list_hash" "$identity" "$where" "$push_commit"
+  bash scripts/lib/fleet-gate.sh "$mode" "$list" "$tree" "$list_hash" "$identity" "$where" "$push_commit"
   case $? in
     0) gate_record "$key" "$(cat "$where")"; exit 0 ;;
     1) exit 1 ;;
-    *) echo "no fleet verdict for $(git rev-parse --short "$push_commit") (tree $tree): not pushed; the push tier" \
-         "runs on the fleet only" >&2
+    *) echo "no fleet verdict for $(git rev-parse --short "$push_commit") (tree $tree): no $mode pass; the $mode" \
+         "tier runs on the fleet only" >&2
        exit 1 ;;
   esac
 fi
@@ -387,7 +401,7 @@ case "$mode" in
     console
     ;;
   *)
-    echo "usage: scripts/check.sh commit|push|all" >&2
+    echo "usage: scripts/check.sh commit|push|windows [COMMIT]|all" >&2
     exit 2
     ;;
 esac
