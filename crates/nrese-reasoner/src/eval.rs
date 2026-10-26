@@ -487,6 +487,36 @@ fn instance(
                     (a, b) => guards.push(Guard::SameList(a, b, index.clone())),
                 }
             }
+            // Kept with the schema variables' values, which stand for their classes: the
+            // classes can still grow. An instance without body atoms concludes now, so its
+            // guards are decided now.
+            Guard::OverClasses {
+                guards: ref over,
+                ref bound,
+                ref classes,
+            } => {
+                let mut bound = bound.clone();
+                for term in over.iter().flat_map(Guard::terms) {
+                    if let Term::Var(v) = term
+                        && let Some(id) = substitution[usize::from(v)]
+                        && !bound.iter().any(|&(b, _)| b == v)
+                    {
+                        bound.push((v, id));
+                    }
+                }
+                let guard = Guard::OverClasses {
+                    guards: over.clone(),
+                    bound,
+                    classes: classes.clone(),
+                };
+                if instance_atoms.is_empty()
+                    && matches!(rule.head, Head::Facts(_))
+                    && !guard.holds(|term| value(term, substitution))
+                {
+                    return None;
+                }
+                guards.push(guard);
+            }
         }
     }
     let head = match &rule.head {
