@@ -995,7 +995,10 @@ fn heads_after(clause: &HtClause, trigger: usize, steps: &[Step]) -> Vec<Vec<u8>
             .enumerate()
             .filter_map(|(i, h)| {
                 let vars = head_vars(h)?;
-                (vars & !bound == 0 && vars & !before != 0).then_some(i as u8)
+                // Only what a `u8` names: this is a prune, and the final head check
+                // reads every head.
+                let i = u8::try_from(i).ok()?;
+                (vars & !bound == 0 && vars & !before != 0).then_some(i)
             })
             .collect();
         out.push(ready);
