@@ -2,14 +2,15 @@
 //!
 //! - **inconsistent:** every class is unsatisfiable (exact);
 //! - **consistent, the DL part's TBox without nominals and the universal property (but as
-//!   a superproperty: a tautology):** the classification is the DL part's (exact). Proof:
-//!   for named classes `A`, `B` with
+//!   a superproperty: a tautology), and no assertion or rule over that property:** the
+//!   classification is the DL part's (exact). Proof: for named classes `A`, `B` with
 //!   `A ⋢ B` in the TBox, a model `I₁` of the TBox has an element in `A ∖ B`; the disjoint
 //!   union of `I₁` and a model `I₂` of the whole input, the individuals in `I₂`, is a model
 //!   of the whole input. TBox axioms hold in a disjoint union where no expression names an
 //!   individual or relates everything; assertions, keys and DL-safe rules concern named
-//!   individuals only, which `I₂` interprets as before. So the input entails `A ⊑ B` iff
-//!   the TBox does, and so does the consistent DL part;
+//!   individuals and what their properties reach in `I₂`, which it interprets as before,
+//!   unless the universal property reaches `I₁` too (`a : ∀U.{a}`). So the input entails
+//!   `A ⊑ B` iff the TBox does, and so does the consistent DL part;
 //! - **otherwise:** the subsumptions of the DL part with the rule instances grounded (each
 //!   entailed by the input), a lower bound; what isn't in it is open, and said so.
 
@@ -32,8 +33,9 @@ pub struct Classified {
     pub why: Vec<String>,
 }
 
-/// Whether a class expression names an individual or uses `owl:topObjectProperty`.
-fn nominal(o: &Ontology, e: ExprId) -> bool {
+/// Whether a class expression uses `owl:topObjectProperty` or, with `nominals`, names an
+/// individual.
+fn global(o: &Ontology, e: ExprId, nominals: bool) -> bool {
     let top = o.builtin.top_object;
     let mut stack = vec![e];
     let mut seen = std::collections::HashSet::new();
@@ -42,7 +44,9 @@ fn nominal(o: &Ontology, e: ExprId) -> bool {
             continue;
         }
         let p = match o.classes.get(e.0) {
-            ClassExpr::OneOf(_) | ClassExpr::HasValue(..) => return true,
+            ClassExpr::OneOf(_) if nominals => return true,
+            ClassExpr::HasValue(..) if nominals => return true,
+            ClassExpr::HasValue(p, _) => *p,
             ClassExpr::And(xs) | ClassExpr::Or(xs) => {
                 stack.extend(xs);
                 continue;
@@ -69,10 +73,24 @@ fn nominal(o: &Ontology, e: ExprId) -> bool {
     false
 }
 
-/// Whether the TBox and RBox (every axiom but the assertions) use no nominal and not the
-/// universal property.
-fn tbox_without_nominals(o: &Ontology) -> bool {
+/// Whether a model of the TBox joins any model of the input as a disjoint union (the module
+/// docs): the TBox and RBox (every axiom but the assertions) use no nominal and not the
+/// universal property, and no assertion or rule uses that property (it would reach every
+/// element, a joined one's too).
+fn separable(o: &Ontology) -> bool {
     let top = o.builtin.top_object;
+    let asserted = o.axioms.iter().filter_map(|a| match a {
+        Axiom::ClassAssertion(c, _) => Some(*c),
+        _ => None,
+    });
+    let in_rules = o.rules.iter().flat_map(|r| r.body.iter().chain(&r.head));
+    let in_rules = in_rules.filter_map(|a| match a {
+        nrese_owl::rules::Atom::Class(c, _) => Some(*c),
+        _ => None,
+    });
+    if asserted.chain(in_rules).any(|c| global(o, c, false)) {
+        return false;
+    }
     o.axioms.iter().filter(|a| !a.is_assertion()).all(|a| {
         let exprs: Vec<ExprId> = match a {
             Axiom::SubClassOf(x, y) => vec![*x, *y],
@@ -98,7 +116,8 @@ fn tbox_without_nominals(o: &Ontology) -> bool {
             Axiom::HasKey(_, ps, _) => ps.clone(),
             _ => Vec::new(),
         };
-        exprs.iter().all(|&e| !nominal(o, e)) && properties.iter().all(|p| Some(p.named()) != top)
+        exprs.iter().all(|&e| !global(o, e, true))
+            && properties.iter().all(|p| Some(p.named()) != top)
     })
 }
 
@@ -129,7 +148,7 @@ pub fn classify(o: &Ontology, options: &Options, with: &classify::Options) -> Cl
             why: vec!["inconsistent: every class is unsatisfiable".into()],
             decision,
         },
-        Verdict::Consistent { .. } if tbox_without_nominals(o) => {
+        Verdict::Consistent { .. } if separable(o) => {
             let t = classify::classify(&dl_part(o), with);
             let exact = t.complete();
             let mut why = vec![
@@ -155,13 +174,19 @@ pub fn classify(o: &Ontology, options: &Options, with: &classify::Options) -> Cl
                     .to_owned(),
             ];
             why.extend(t.incomplete.iter().cloned());
-            let (classification, open) = refine(o, &decision, t.classification, options, deadline);
+            let (classification, open, unsettled) =
+                refine(o, &decision, t.classification, options, deadline);
             if open > 0 {
                 why.push(format!("{open} pairs of classes open"));
             }
+            if unsettled > 0 {
+                why.push(format!(
+                    "{unsettled} classes open (satisfiable? equivalent to owl:Thing?)"
+                ));
+            }
             Classified {
                 classification,
-                exact: open == 0,
+                exact: open == 0 && unsettled == 0,
                 why,
                 decision,
             }
@@ -235,7 +260,11 @@ fn with_witness(
 /// The classification of a consistent input completed past `lower` (the DL part's with
 /// the rule instances, entailed): a pair is refuted by the certified model of the input
 /// (an element in `A ∖ B`), then by one with a witness in `A`, then by one in `A ⊓ ¬B`; a
-/// witness that has no model makes the subsumption entailed. How many pairs stay open (the
+/// witness that has no model makes the subsumption entailed. A class's place is settled
+/// apart from its pairs: its satisfiability by `lower`, by an element of the certified
+/// model, or by a witness with a model (in `A`, or in `A ⊓ ¬B`), and a class with no pair
+/// open is tested for it too; whether it is `owl:Thing` by `lower`, or by an element of
+/// such a model outside it. How many pairs, and how many classes' places, stay open (the
 /// budgets `options.max_tests` and `deadline`, the whole classification's; undecided
 /// tests).
 fn refine(
@@ -244,7 +273,7 @@ fn refine(
     mut lower: Classification,
     options: &Options,
     deadline: Option<std::time::Instant>,
-) -> (Classification, usize) {
+) -> (Classification, usize, usize) {
     let classes = lower.classes.clone();
     let mut known: HashSet<(nrese_owl::Term, nrese_owl::Term)> =
         lower.subsumptions.iter().copied().collect();
@@ -254,6 +283,9 @@ fn refine(
         a == b || unsat.contains(&a) || top.contains(&b) || known.contains(&(a, b))
     };
     let mut refuted: HashSet<(nrese_owl::Term, nrese_owl::Term)> = HashSet::new();
+    let mut satisfiable: HashSet<nrese_owl::Term> = HashSet::new();
+    // The classes an element of a model of the input is outside: none of them is `owl:Thing`.
+    let mut not_top: HashSet<nrese_owl::Term> = HashSet::new();
     // The certified model of the input.
     if let Some(m) = &decision.model {
         for e in 0..m.size {
@@ -265,6 +297,8 @@ fn refine(
                     }
                 }
             }
+            not_top.extend(classes.iter().filter(|&&b| !here.contains(&b)));
+            satisfiable.extend(here);
         }
     }
     let open = |known: &HashSet<_>, refuted: &HashSet<_>, a| {
@@ -288,7 +322,10 @@ fn refine(
     };
     let mut newly_unsat: Vec<nrese_owl::Term> = Vec::new();
     for &a in &classes {
-        if unsat.contains(&a) || open(&known, &refuted, a).is_empty() || tests >= budget || spent()
+        if unsat.contains(&a)
+            || (satisfiable.contains(&a) && open(&known, &refuted, a).is_empty())
+            || tests >= budget
+            || spent()
         {
             continue;
         }
@@ -296,11 +333,13 @@ fn refine(
         let d = with_witness(o, a, None, &test_options());
         match (&d.verdict, &d.model) {
             (Verdict::Consistent { .. }, Some(m)) => {
+                satisfiable.insert(a);
                 if let Some(&w) = m.individuals.get(&WITNESS) {
                     let here = classes_of(m, w);
                     for &b in &classes {
                         if !here.contains(&b) {
                             refuted.insert((a, b));
+                            not_top.insert(b);
                         }
                     }
                 }
@@ -320,7 +359,9 @@ fn refine(
             tests += 1;
             match with_witness(o, a, Some(b), &test_options()).verdict {
                 Verdict::Consistent { .. } => {
+                    satisfiable.insert(a);
                     refuted.insert((a, b));
+                    not_top.insert(b);
                 }
                 Verdict::Inconsistent { .. } => {
                     known.insert((a, b));
@@ -330,9 +371,14 @@ fn refine(
         }
     }
     let mut remaining = 0;
+    let mut unsettled = 0;
     for &a in &classes {
         if !newly_unsat.contains(&a) {
             remaining += open(&known, &refuted, a).len();
+            let placed = top.contains(&a) || not_top.contains(&a);
+            if !unsat.contains(&a) && (!satisfiable.contains(&a) || !placed) {
+                unsettled += 1;
+            }
         }
     }
     lower.unsatisfiable.extend(newly_unsat);
@@ -345,5 +391,5 @@ fn refine(
         .collect();
     subs.sort_unstable();
     lower.subsumptions = subs;
-    (lower, remaining)
+    (lower, remaining, unsettled)
 }

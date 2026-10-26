@@ -506,8 +506,10 @@ pub fn consistency(o: &Ontology, options: &Options) -> Decision {
             Ok((i, lifted)) => (i, lifted, None),
             Err(why) => (certificate::candidate(&work, &model), false, Some(why)),
         };
+        // The budget bounds what a round grounds, not what it checks: at least one instance
+        // is asked for, so none found means every rule holds.
         let max = options.max_instances.unwrap_or(usize::MAX);
-        let violations = match certificate::violations(&work, &i, max) {
+        let violations = match certificate::violations(&work, &i, max.max(1)) {
             Ok(v) => v,
             Err(why) => {
                 d.work = work;
@@ -536,6 +538,14 @@ pub fn consistency(o: &Ontology, options: &Options) -> Decision {
             };
             d.model = Some(i);
             return d;
+        }
+        if violations.len() > max {
+            d.work = work;
+            let round = d.rounds;
+            return d.undecided(format!(
+                "round {round}: the model breaks a rule instance, and the instance budget \
+                 ({max} a round) grounds none"
+            ));
         }
         let new = match ground_all(&mut work, &mut grounder, &violations, &i) {
             Ok(n) => n,
