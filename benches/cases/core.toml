@@ -294,6 +294,568 @@ route = { "commits.incremental" = "== true" }
 cap_gb = 6
 systems = ["graphdb:owl2-rl"]
 
+# --- support graph sets: the cap under strain (C-310) -----------------------------------------
+# A reader of one target's set of graphs with inferred = "supported" (perf_lab --support-reader):
+# the sets computed and its first view, then commits of 1 and 1,000 statements each followed by a
+# read. The data are frozen (benches/datasets.toml, made by perf_lab generate support-stress); the
+# reader and the commits beside each file are its declared extra inputs, which the perf lab reads
+# itself (only the data is loaded). Each size twice: every set kept, its answers the generator's
+# oracle's (the closure of what the reader may read), pinned; and capped at 4 and 16, whose
+# contract is to hide only, so its count is at most the oracle's. Shapes: copies (k graphs, k
+# sets), product (a schema and b data graphs, a·b), ladder (sameAs links in w graphs each, w^l).
+
+[[case]]
+name = "support-copies-8"
+area = "access"
+workload = "support-stress"
+tier = "copies-8"
+what = "support sets: 5,000 subjects, each target derivable from 8 graphs alone (8 sets), every set kept"
+semantics = "owl2-rl"
+data = "volume:support-stress/copies-8.nq"
+extra = ["volume:support-stress/copies-8.nq.reader", "volume:support-stress/copies-8.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.probe.value" = "true", "q.count.value" = 5125 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
+route = {}
+cap_gb = 6
+est_min = 3
+systems = []
+
+[[case]]
+name = "support-copies-8-capped"
+area = "access"
+workload = "support-stress"
+tier = "copies-8"
+what = "support sets: 5,000 subjects, each target derivable from 8 graphs alone (8 sets), capped at 4 and 16"
+semantics = "owl2-rl"
+data = "volume:support-stress/copies-8.nq"
+extra = ["volume:support-stress/copies-8.nq.reader", "volume:support-stress/copies-8.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+sweep = [["--support-sets", "4"], ["--support-sets", "16"]]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.count.value" = "<= 5125" }
+pinned = "at most the oracle's count: a cap only hides (StoreConfig::support_sets); where it leaves the reader's set out the probe is false"
+route = {}
+cap_gb = 6
+est_min = 3
+systems = []
+
+[[case]]
+name = "support-copies-16"
+area = "access"
+workload = "support-stress"
+tier = "copies-16"
+what = "support sets: 5,000 subjects, each target derivable from 16 graphs alone (16 sets: the default cap), every set kept"
+semantics = "owl2-rl"
+data = "volume:support-stress/copies-16.nq"
+extra = ["volume:support-stress/copies-16.nq.reader", "volume:support-stress/copies-16.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.probe.value" = "true", "q.count.value" = 5063 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
+route = {}
+cap_gb = 6
+est_min = 3
+systems = []
+
+[[case]]
+name = "support-copies-16-capped"
+area = "access"
+workload = "support-stress"
+tier = "copies-16"
+what = "support sets: 5,000 subjects, each target derivable from 16 graphs alone (16 sets: the default cap), capped at 4 and 16"
+semantics = "owl2-rl"
+data = "volume:support-stress/copies-16.nq"
+extra = ["volume:support-stress/copies-16.nq.reader", "volume:support-stress/copies-16.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+sweep = [["--support-sets", "4"], ["--support-sets", "16"]]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.count.value" = "<= 5063" }
+pinned = "at most the oracle's count: a cap only hides (StoreConfig::support_sets); where it leaves the reader's set out the probe is false"
+route = {}
+cap_gb = 6
+est_min = 3
+systems = []
+
+[[case]]
+name = "support-copies-17"
+area = "access"
+workload = "support-stress"
+tier = "copies-17"
+what = "support sets: 5,000 subjects, each target derivable from 17 graphs alone (one past the default cap), every set kept"
+semantics = "owl2-rl"
+data = "volume:support-stress/copies-17.nq"
+extra = ["volume:support-stress/copies-17.nq.reader", "volume:support-stress/copies-17.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.probe.value" = "true", "q.count.value" = 5059 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
+route = {}
+cap_gb = 6
+est_min = 3
+systems = []
+
+[[case]]
+name = "support-copies-17-capped"
+area = "access"
+workload = "support-stress"
+tier = "copies-17"
+what = "support sets: 5,000 subjects, each target derivable from 17 graphs alone (one past the default cap), capped at 4 and 16"
+semantics = "owl2-rl"
+data = "volume:support-stress/copies-17.nq"
+extra = ["volume:support-stress/copies-17.nq.reader", "volume:support-stress/copies-17.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+sweep = [["--support-sets", "4"], ["--support-sets", "16"]]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.count.value" = "<= 5059" }
+pinned = "at most the oracle's count: a cap only hides (StoreConfig::support_sets); where it leaves the reader's set out the probe is false"
+route = {}
+cap_gb = 6
+est_min = 3
+systems = []
+
+[[case]]
+name = "support-copies-256"
+area = "access"
+workload = "support-stress"
+tier = "copies-256"
+what = "support sets: 1,000 subjects, each target derivable from 256 graphs alone (256 sets), every set kept"
+semantics = "owl2-rl"
+data = "volume:support-stress/copies-256.nq"
+extra = ["volume:support-stress/copies-256.nq.reader", "volume:support-stress/copies-256.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.probe.value" = "true", "q.count.value" = 1004 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
+route = {}
+cap_gb = 6
+est_min = 5
+systems = []
+
+[[case]]
+name = "support-copies-256-capped"
+area = "access"
+workload = "support-stress"
+tier = "copies-256"
+what = "support sets: 1,000 subjects, each target derivable from 256 graphs alone (256 sets), capped at 4 and 16"
+semantics = "owl2-rl"
+data = "volume:support-stress/copies-256.nq"
+extra = ["volume:support-stress/copies-256.nq.reader", "volume:support-stress/copies-256.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+sweep = [["--support-sets", "4"], ["--support-sets", "16"]]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.count.value" = "<= 1004" }
+pinned = "at most the oracle's count: a cap only hides (StoreConfig::support_sets); where it leaves the reader's set out the probe is false"
+route = {}
+cap_gb = 6
+est_min = 5
+systems = []
+
+[[case]]
+name = "support-product-64"
+area = "access"
+workload = "support-stress"
+tier = "product-64"
+what = "support sets: 5,000 subjects, the schema in 8 graphs and each subject's type in 8 others (64 sets), every set kept"
+semantics = "owl2-rl"
+data = "volume:support-stress/product-64.nq"
+extra = ["volume:support-stress/product-64.nq.reader", "volume:support-stress/product-64.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.probe.value" = "true", "q.count.value" = 5126 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
+route = {}
+cap_gb = 6
+est_min = 3
+systems = []
+
+[[case]]
+name = "support-product-64-capped"
+area = "access"
+workload = "support-stress"
+tier = "product-64"
+what = "support sets: 5,000 subjects, the schema in 8 graphs and each subject's type in 8 others (64 sets), capped at 4 and 16"
+semantics = "owl2-rl"
+data = "volume:support-stress/product-64.nq"
+extra = ["volume:support-stress/product-64.nq.reader", "volume:support-stress/product-64.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+sweep = [["--support-sets", "4"], ["--support-sets", "16"]]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.count.value" = "<= 5126" }
+pinned = "at most the oracle's count: a cap only hides (StoreConfig::support_sets); where it leaves the reader's set out the probe is false"
+route = {}
+cap_gb = 6
+est_min = 3
+systems = []
+
+[[case]]
+name = "support-product-256"
+area = "access"
+workload = "support-stress"
+tier = "product-256"
+what = "support sets: 2,000 subjects, the schema in 16 graphs and each subject's type in 16 others (256 sets), every set kept"
+semantics = "owl2-rl"
+data = "volume:support-stress/product-256.nq"
+extra = ["volume:support-stress/product-256.nq.reader", "volume:support-stress/product-256.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.probe.value" = "true", "q.count.value" = 2062 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
+route = {}
+cap_gb = 6
+est_min = 3
+systems = []
+
+[[case]]
+name = "support-product-256-capped"
+area = "access"
+workload = "support-stress"
+tier = "product-256"
+what = "support sets: 2,000 subjects, the schema in 16 graphs and each subject's type in 16 others (256 sets), capped at 4 and 16"
+semantics = "owl2-rl"
+data = "volume:support-stress/product-256.nq"
+extra = ["volume:support-stress/product-256.nq.reader", "volume:support-stress/product-256.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+sweep = [["--support-sets", "4"], ["--support-sets", "16"]]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.count.value" = "<= 2062" }
+pinned = "at most the oracle's count: a cap only hides (StoreConfig::support_sets); where it leaves the reader's set out the probe is false"
+route = {}
+cap_gb = 6
+est_min = 3
+systems = []
+
+[[case]]
+name = "support-product-1024"
+area = "access"
+workload = "support-stress"
+tier = "product-1024"
+what = "support sets: 1,000 subjects, the schema in 32 graphs and each subject's type in 32 others (1,024 sets), every set kept"
+semantics = "owl2-rl"
+data = "volume:support-stress/product-1024.nq"
+extra = ["volume:support-stress/product-1024.nq.reader", "volume:support-stress/product-1024.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.probe.value" = "true", "q.count.value" = 1032 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
+route = {}
+cap_gb = 6
+est_min = 5
+systems = []
+
+[[case]]
+name = "support-product-1024-capped"
+area = "access"
+workload = "support-stress"
+tier = "product-1024"
+what = "support sets: 1,000 subjects, the schema in 32 graphs and each subject's type in 32 others (1,024 sets), capped at 4 and 16"
+semantics = "owl2-rl"
+data = "volume:support-stress/product-1024.nq"
+extra = ["volume:support-stress/product-1024.nq.reader", "volume:support-stress/product-1024.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+sweep = [["--support-sets", "4"], ["--support-sets", "16"]]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.count.value" = "<= 1032" }
+pinned = "at most the oracle's count: a cap only hides (StoreConfig::support_sets); where it leaves the reader's set out the probe is false"
+route = {}
+cap_gb = 6
+est_min = 5
+systems = []
+
+[[case]]
+name = "support-product-4096"
+area = "access"
+workload = "support-stress"
+tier = "product-4096"
+what = "support sets: 500 subjects, the schema in 64 graphs and each subject's type in 64 others (4,096 sets), every set kept"
+semantics = "owl2-rl"
+data = "volume:support-stress/product-4096.nq"
+extra = ["volume:support-stress/product-4096.nq.reader", "volume:support-stress/product-4096.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.probe.value" = "true", "q.count.value" = 515 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
+route = {}
+cap_gb = 6
+timeout_s = 300
+est_min = 10
+systems = []
+
+[[case]]
+name = "support-product-4096-capped"
+area = "access"
+workload = "support-stress"
+tier = "product-4096"
+what = "support sets: 500 subjects, the schema in 64 graphs and each subject's type in 64 others (4,096 sets), capped at 4 and 16"
+semantics = "owl2-rl"
+data = "volume:support-stress/product-4096.nq"
+extra = ["volume:support-stress/product-4096.nq.reader", "volume:support-stress/product-4096.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+sweep = [["--support-sets", "4"], ["--support-sets", "16"]]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.count.value" = "<= 515" }
+pinned = "at most the oracle's count: a cap only hides (StoreConfig::support_sets); where it leaves the reader's set out the probe is false"
+route = {}
+cap_gb = 6
+timeout_s = 300
+est_min = 10
+systems = []
+
+[[case]]
+name = "support-product-4096-limit"
+area = "access"
+workload = "support-stress"
+tier = "product-4096"
+what = "support sets: 8,000 subjects with 4,096 sets each under a 3 GB cap: where keeping every set passes the memory limit, every set kept"
+semantics = "owl2-rl"
+data = "volume:support-stress/product-4096-limit.nq"
+extra = ["volume:support-stress/product-4096-limit.nq.reader", "volume:support-stress/product-4096-limit.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.probe.value" = "true", "q.count.value" = 8015 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
+outcome = "memory-limit"
+known = "C-310: computing every set is charged to no budget and passes the 3 GB cap (killed at the first restricted read, both rounds of cap-stress-timed-p2-13efe625); capped at 16 it completes"
+route = {}
+cap_gb = 3
+timeout_s = 300
+est_min = 15
+systems = []
+
+[[case]]
+name = "support-product-4096-limit-capped"
+area = "access"
+workload = "support-stress"
+tier = "product-4096"
+what = "support sets: 8,000 subjects with 4,096 sets each under a 3 GB cap: where keeping every set passes the memory limit, capped at 16"
+semantics = "owl2-rl"
+data = "volume:support-stress/product-4096-limit.nq"
+extra = ["volume:support-stress/product-4096-limit.nq.reader", "volume:support-stress/product-4096-limit.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+sweep = [["--support-sets", "16"]]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.count.value" = "<= 8015" }
+pinned = "at most the oracle's count: a cap only hides (StoreConfig::support_sets); where it leaves the reader's set out the probe is false"
+route = {}
+cap_gb = 3
+timeout_s = 300
+est_min = 15
+systems = []
+
+[[case]]
+name = "support-ladder-16"
+area = "access"
+workload = "support-stress"
+tier = "ladder-16"
+what = "support sets: 2,000 sameAs chains of 4 links, each link in 2 graphs (16 sets), every set kept"
+semantics = "owl2-rl"
+data = "volume:support-stress/ladder-16.nq"
+extra = ["volume:support-stress/ladder-16.nq.reader", "volume:support-stress/ladder-16.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.probe.value" = "true", "q.count.value" = 10556 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
+route = {}
+cap_gb = 6
+est_min = 3
+systems = []
+
+[[case]]
+name = "support-ladder-16-capped"
+area = "access"
+workload = "support-stress"
+tier = "ladder-16"
+what = "support sets: 2,000 sameAs chains of 4 links, each link in 2 graphs (16 sets), capped at 4 and 16"
+semantics = "owl2-rl"
+data = "volume:support-stress/ladder-16.nq"
+extra = ["volume:support-stress/ladder-16.nq.reader", "volume:support-stress/ladder-16.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+sweep = [["--support-sets", "4"], ["--support-sets", "16"]]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.count.value" = "<= 10556" }
+pinned = "at most the oracle's count: a cap only hides (StoreConfig::support_sets); where it leaves the reader's set out the probe is false"
+route = {}
+cap_gb = 6
+est_min = 3
+systems = []
+
+[[case]]
+name = "support-ladder-256"
+area = "access"
+workload = "support-stress"
+tier = "ladder-256"
+what = "support sets: 500 sameAs chains of 8 links, each link in 2 graphs (256 sets), every set kept"
+semantics = "owl2-rl"
+data = "volume:support-stress/ladder-256.nq"
+extra = ["volume:support-stress/ladder-256.nq.reader", "volume:support-stress/ladder-256.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.probe.value" = "true", "q.count.value" = 5030 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
+outcome = "memory-limit"
+known = "C-310: computing every set is charged to no budget and passes the 6 GB cap on 1.3 MB of sameAs chains (killed at the first restricted read, both rounds of cap-stress-timed-p2-13efe625); capped at 16 it completes"
+route = {}
+cap_gb = 6
+est_min = 5
+systems = []
+
+[[case]]
+name = "support-ladder-256-capped"
+area = "access"
+workload = "support-stress"
+tier = "ladder-256"
+what = "support sets: 500 sameAs chains of 8 links, each link in 2 graphs (256 sets), capped at 4 and 16"
+semantics = "owl2-rl"
+data = "volume:support-stress/ladder-256.nq"
+extra = ["volume:support-stress/ladder-256.nq.reader", "volume:support-stress/ladder-256.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+sweep = [["--support-sets", "4"], ["--support-sets", "16"]]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.count.value" = "<= 5030" }
+pinned = "at most the oracle's count: a cap only hides (StoreConfig::support_sets); where it leaves the reader's set out the probe is false"
+route = {}
+cap_gb = 6
+est_min = 5
+systems = []
+
+[[case]]
+name = "support-ladder-4096"
+area = "access"
+workload = "support-stress"
+tier = "ladder-4096"
+what = "support sets: 100 sameAs chains of 12 links, each link in 2 graphs (4,096 sets), every set kept"
+semantics = "owl2-rl"
+data = "volume:support-stress/ladder-4096.nq"
+extra = ["volume:support-stress/ladder-4096.nq.reader", "volume:support-stress/ladder-4096.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.probe.value" = "true", "q.count.value" = 1821 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
+outcome = "memory-limit"
+known = "C-310: computing every set is charged to no budget and passes the 6 GB cap on 0.4 MB of sameAs chains (killed at the first restricted read, both rounds of cap-stress-timed-p2-13efe625); capped at 16 it completes"
+route = {}
+cap_gb = 6
+timeout_s = 300
+est_min = 10
+systems = []
+
+[[case]]
+name = "support-ladder-4096-capped"
+area = "access"
+workload = "support-stress"
+tier = "ladder-4096"
+what = "support sets: 100 sameAs chains of 12 links, each link in 2 graphs (4,096 sets), capped at 4 and 16"
+semantics = "owl2-rl"
+data = "volume:support-stress/ladder-4096.nq"
+extra = ["volume:support-stress/ladder-4096.nq.reader", "volume:support-stress/ladder-4096.nq.commits.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+sweep = [["--support-sets", "4"], ["--support-sets", "16"]]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.first.read_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.count.value" = "<= 1821" }
+pinned = "at most the oracle's count: a cap only hides (StoreConfig::support_sets); where it leaves the reader's set out the probe is false"
+route = {}
+cap_gb = 6
+timeout_s = 300
+est_min = 10
+systems = []
+
 # --- OWL 2 DL and EL ---------------------------------------------------------------------------
 
 [[case]]

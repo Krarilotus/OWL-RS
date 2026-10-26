@@ -29,8 +29,9 @@ def family_cases(path: str | Path) -> list[dict]:
             for e in entries if "catalog" not in e]
 
 # The vocabulary (benches/cases/README.md explains each).
-AREAS = {"cache", "concurrency", "dl", "kernel", "layout", "load", "maintenance", "memory", "operator", "parse",
-         "plan", "query", "reasoning", "rules", "service", "shacl", "geo", "text", "vector", "federation", "rdf12"}
+AREAS = {"access", "cache", "concurrency", "dl", "kernel", "layout", "load", "maintenance", "memory", "operator",
+         "parse", "plan", "query", "reasoning", "rules", "service", "shacl", "geo", "text", "vector", "federation",
+         "rdf12"}
 SEMANTICS = {"none", "rdfs", "rdfs-full", "rdfs-plus", "owl-horst", "owl2-ql", "owl2-rl", "owl2-el", "owl2-dl",
              "custom", "el", "dl", "canonical"}
 # What a comparator computes: the same data without reasoning (plain), NRESE's closure, NRESE's

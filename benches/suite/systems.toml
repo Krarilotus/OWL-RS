@@ -23,6 +23,8 @@
 #   rdf12                        statements about statements: RDF 1.2 triple terms and
 #                                reifiers, or RDF-star's quoted triples (SPARQL-star)
 #   vector                       k-nearest-neighbour search over embeddings
+#   graph-access-inference       per-graph read access under which a reader sees an inferred
+#                                statement exactly when it follows from the graphs it may read
 #
 # `publish`: free = results may be published; permission = only with the vendor's written
 # consent (benches/competitors/README.md). `runs`: how the suite can start it
@@ -45,7 +47,7 @@ capabilities = [
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
   "reason-custom-rules", "reason-incremental", "consistency", "explain",
   "shacl-core", "shacl-sparql", "fulltext", "federation", "geosparql", "classify",
-  "rdf12", "vector",
+  "rdf12", "vector", "graph-access-inference",
 ]
 # What the suite needs and NRESE lacks; each names its step in the parity plan.
 # (reason-custom-rules: user rules in Notation3 since 2026-10-01; builtins and .pie import
@@ -70,7 +72,7 @@ capabilities = [
   "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
   "reason-custom-rules", "reason-incremental", "consistency", "explain",
   "shacl-core", "shacl-sparql", "fulltext", "federation", "geosparql", "classify",
-  "rdf12", "vector",
+  "rdf12", "vector", "graph-access-inference",
 ]
 missing = {}
 
