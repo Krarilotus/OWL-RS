@@ -460,12 +460,18 @@ fn a_key_over_the_universal_property_equates() {
     }
 }
 
-/// A data existential over a defined datatype with no value (review A-1705): `xsd:string`
-/// and `xsd:integer` have disjoint value spaces (OWL 2 Structural Specification, §4), so
-/// `D` is empty and `a : A` has no `d` value in it. U1 may not prove consistency.
+/// Ontologies without a model, which U1 may not prove consistent:
+/// - a data existential over a defined datatype with no value (review A-1705): `xsd:string`
+///   and `xsd:integer` have disjoint value spaces (OWL 2 Structural Specification, §4), so
+///   `D` is empty and `a : A` has no `d` value in it;
+/// - a TBox alone, `⊤ ⊑ A ⊑ ⊥` (review A-1703): the domain is never empty (OWL 2 Direct
+///   Semantics, §2.2), so its element is in `A`, which has none.
 #[test]
-fn an_empty_defined_datatype_is_no_proof_of_consistency() {
-    let text = r#"
+fn ontologies_without_a_model_get_no_proof_of_consistency() {
+    let cases = [
+        (
+            "an empty defined datatype",
+            r#"
 @prefix : <http://example.org/kex#> .
 @prefix owl: <http://www.w3.org/2002/07/owl#> .
 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
@@ -475,12 +481,27 @@ fn an_empty_defined_datatype_is_no_proof_of_consistency() {
     owl:equivalentClass [ a rdfs:Datatype ; owl:intersectionOf ( xsd:string xsd:integer ) ] .
 :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :d ; owl:someValuesFrom :D ] .
 :a a :A .
-"#;
-    let e = example(text);
-    let clash = e.upper.facts.iter().any(|f| f[1] == e.program.names.clash);
-    assert!(
-        clash || !e.program.proves_consistency(),
-        "unchecked: {:?}",
-        e.program.unchecked
-    );
+"#,
+        ),
+        (
+            "a TBox alone",
+            r#"
+@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:A a owl:Class .
+owl:Thing rdfs:subClassOf :A .
+:A rdfs:subClassOf owl:Nothing .
+"#,
+        ),
+    ];
+    for (name, text) in cases {
+        let e = example(text);
+        let clash = e.upper.facts.iter().any(|f| f[1] == e.program.names.clash);
+        assert!(
+            clash || !e.program.proves_consistency(),
+            "{name}: no clash, unchecked {:?}",
+            e.program.unchecked
+        );
+    }
 }
