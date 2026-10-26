@@ -428,3 +428,59 @@ fn chains_nominals_cardinalities_and_keys() {
         e.program.incomplete
     );
 }
+
+/// A key over `owl:topObjectProperty` (review A-1704): named `a`, `b` in `K` share a named
+/// value (`a` itself) by the universal property, so the key makes them equal (OWL 2 Direct
+/// Semantics, §2.3.5) and `b : A` follows; with `a ≠ b` asserted, there is no model.
+#[test]
+fn a_key_over_the_universal_property_equates() {
+    for different in [false, true] {
+        let mut text = String::from(
+            r#"
+@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+:K a owl:Class . :A a owl:Class .
+:a a owl:NamedIndividual . :b a owl:NamedIndividual .
+:K owl:hasKey ( owl:topObjectProperty ) .
+:a a :K , :A . :b a :K .
+"#,
+        );
+        if different {
+            text.push_str(":a owl:differentFrom :b .\n");
+        }
+        let mut e = example(&text);
+        let clash = e.upper.facts.iter().any(|f| f[1] == e.program.names.clash);
+        if different {
+            assert!(clash, "a ≠ b against the key");
+        } else {
+            let (b, a) = (ex(&mut e.table, "b"), ex(&mut e.table, "A"));
+            let fact = [b, e.program.names.rdf_type, a];
+            assert!(e.upper.facts.binary_search(&fact).is_ok(), "b : A");
+        }
+    }
+}
+
+/// A data existential over a defined datatype with no value (review A-1705): `xsd:string`
+/// and `xsd:integer` have disjoint value spaces (OWL 2 Structural Specification, §4), so
+/// `D` is empty and `a : A` has no `d` value in it. U1 may not prove consistency.
+#[test]
+fn an_empty_defined_datatype_is_no_proof_of_consistency() {
+    let text = r#"
+@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+:A a owl:Class . :d a owl:DatatypeProperty .
+:D a rdfs:Datatype ;
+    owl:equivalentClass [ a rdfs:Datatype ; owl:intersectionOf ( xsd:string xsd:integer ) ] .
+:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :d ; owl:someValuesFrom :D ] .
+:a a :A .
+"#;
+    let e = example(text);
+    let clash = e.upper.facts.iter().any(|f| f[1] == e.program.names.clash);
+    assert!(
+        clash || !e.program.proves_consistency(),
+        "unchecked: {:?}",
+        e.program.unchecked
+    );
+}

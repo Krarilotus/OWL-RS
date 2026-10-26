@@ -357,11 +357,15 @@ impl Compiler<'_> {
     }
 
     /// Whether `range` surely has `n` values, so that `≥ n` over it can't be a
-    /// contradiction: every datatype has at least one value, `rdfs:Literal` infinitely
-    /// many, a one-value enumeration one.
+    /// contradiction: every datatype has at least one value (but one a definition gives
+    /// needn't: `xsd:string ⊓ xsd:integer` has none), `rdfs:Literal` infinitely many, a
+    /// one-value enumeration one.
     fn has_values(&self, n: u32, range: RangeId) -> bool {
         match self.normalised.ranges.get(range.0) {
-            DataRange::Datatype(t) => n <= 1 || *t == self.literal,
+            DataRange::Datatype(t) => {
+                let defined = self.normalised.definitions.iter().any(|(d, _)| d == t);
+                (n <= 1 && !defined) || *t == self.literal
+            }
             DataRange::OneOf(values) => n <= 1 && !values.is_empty(),
             _ => false,
         }

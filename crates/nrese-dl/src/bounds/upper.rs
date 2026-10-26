@@ -135,8 +135,9 @@ pub fn compile_with(
         top_object,
         top_data,
     };
-    // Datatype definitions only refine data ranges, which U1 doesn't read; keys are rules
-    // here (`axiom`), which the clauses leave to the engines that apply them.
+    // Datatype definitions only refine data ranges, which U1 doesn't read (a clause that
+    // needs a defined datatype's value is unchecked instead); keys are rules here
+    // (`axiom`), which the clauses leave to the engines that apply them.
     c.program.incomplete = normalised
         .unsupported
         .iter()
@@ -326,6 +327,13 @@ impl Compiler<'_> {
                 }
                 let mut next = 2u8;
                 for &r in objects {
+                    // `owl:topObjectProperty` relates both to every element, `x` itself
+                    // among them: as in a clause body, its atoms are that both exist.
+                    if r.named() == self.top_object {
+                        let thing = self.program.names.thing;
+                        body.extend([self.type_atom(x, thing), self.type_atom(y, thing)]);
+                        continue;
+                    }
                     let z = Slot::Var(next);
                     next = next.saturating_add(1);
                     body.push(Self::edge(r, x, z));
