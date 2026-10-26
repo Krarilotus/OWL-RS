@@ -299,22 +299,25 @@ systems = ["graphdb:owl2-rl"]
 # the sets computed and its first view, then commits of 1 and 1,000 statements each followed by a
 # read. The data are frozen (benches/datasets.toml, made by perf_lab generate support-stress); the
 # reader and the commits beside each file are its declared extra inputs, which the perf lab reads
-# itself (only the data is loaded). Each size twice: every set kept, its answers the generator's
-# oracle's (the closure of what the reader may read), pinned; and capped at 4 and 16, whose
-# contract is to hide only, so its count is at most the oracle's. Shapes: copies (k graphs, k
-# sets), product (a schema and b data graphs, a·b), ladder (sameAs links in w graphs each, w^l).
+# itself (only the data is loaded). Each size twice: every set kept, and capped at 16 where that
+# keeps all of them (8 and 16 sets), its answers the generator's oracle's (the closure of what the
+# reader may read), pinned; and capped where the cap cuts (4, and 16 past 16 sets), whose contract
+# is to hide only, so its count is at most the oracle's. Shapes: copies (k graphs, k sets),
+# product (a schema and b data graphs, a·b), ladder (sameAs links in w graphs each, w^l). The
+# suite runs them per tier (suite.py run --workloads support-stress; suitekit/workloads.py).
 
 [[case]]
 name = "support-copies-8"
 area = "access"
 workload = "support-stress"
 tier = "copies-8"
-what = "support sets: 5,000 subjects, each target derivable from 8 graphs alone (8 sets), every set kept"
+what = "support sets: 5,000 subjects, each target derivable from 8 graphs alone (8 sets), capped at 16 (all kept) and every set kept"
 semantics = "owl2-rl"
 data = "volume:support-stress/copies-8.nq"
 extra = ["volume:support-stress/copies-8.nq.reader", "volume:support-stress/copies-8.nq.commits.ru"]
 tool_loads = false
-args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+sweep = [["--support-sets", "16"], ["--support-sets", "off"]]
 page_cache = ["warm", "cold"]
 queries = "support-stress"
 metric = "support.first.read_ms"
@@ -331,13 +334,13 @@ name = "support-copies-8-capped"
 area = "access"
 workload = "support-stress"
 tier = "copies-8"
-what = "support sets: 5,000 subjects, each target derivable from 8 graphs alone (8 sets), capped at 4 and 16"
+what = "support sets: 5,000 subjects, each target derivable from 8 graphs alone (8 sets), capped at 4"
 semantics = "owl2-rl"
 data = "volume:support-stress/copies-8.nq"
 extra = ["volume:support-stress/copies-8.nq.reader", "volume:support-stress/copies-8.nq.commits.ru"]
 tool_loads = false
 args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
-sweep = [["--support-sets", "4"], ["--support-sets", "16"]]
+sweep = [["--support-sets", "4"]]
 page_cache = ["warm", "cold"]
 queries = "support-stress"
 metric = "support.first.read_ms"
@@ -354,12 +357,13 @@ name = "support-copies-16"
 area = "access"
 workload = "support-stress"
 tier = "copies-16"
-what = "support sets: 5,000 subjects, each target derivable from 16 graphs alone (16 sets: the default cap), every set kept"
+what = "support sets: 5,000 subjects, each target derivable from 16 graphs alone (16 sets: the default cap), capped at 16 (all kept) and every set kept"
 semantics = "owl2-rl"
 data = "volume:support-stress/copies-16.nq"
 extra = ["volume:support-stress/copies-16.nq.reader", "volume:support-stress/copies-16.nq.commits.ru"]
 tool_loads = false
-args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+sweep = [["--support-sets", "16"], ["--support-sets", "off"]]
 page_cache = ["warm", "cold"]
 queries = "support-stress"
 metric = "support.first.read_ms"
@@ -376,13 +380,13 @@ name = "support-copies-16-capped"
 area = "access"
 workload = "support-stress"
 tier = "copies-16"
-what = "support sets: 5,000 subjects, each target derivable from 16 graphs alone (16 sets: the default cap), capped at 4 and 16"
+what = "support sets: 5,000 subjects, each target derivable from 16 graphs alone (16 sets: the default cap), capped at 4"
 semantics = "owl2-rl"
 data = "volume:support-stress/copies-16.nq"
 extra = ["volume:support-stress/copies-16.nq.reader", "volume:support-stress/copies-16.nq.commits.ru"]
 tool_loads = false
 args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
-sweep = [["--support-sets", "4"], ["--support-sets", "16"]]
+sweep = [["--support-sets", "4"]]
 page_cache = ["warm", "cold"]
 queries = "support-stress"
 metric = "support.first.read_ms"
@@ -684,7 +688,7 @@ counters = ["support.inferred", "support.first.visible"]
 check = { "q.probe.value" = "true", "q.count.value" = 8015 }
 pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
 outcome = "memory-limit"
-known = "C-310: computing every set is charged to no budget and passes the 3 GB cap (killed at the first restricted read, both rounds of cap-stress-timed-p2-13efe625); capped at 16 it completes"
+known = "C-310, observed 26 Oct 2026 on 3dc5ab46 (cap-stress-timed-p2-13efe625, both rounds): computing every set was charged to no budget then, passed the 3 GB cap and was killed at the first restricted read; capped at 16 it completes. Re-qualify once O4 charges it"
 route = {}
 cap_gb = 3
 timeout_s = 300
@@ -720,12 +724,13 @@ name = "support-ladder-16"
 area = "access"
 workload = "support-stress"
 tier = "ladder-16"
-what = "support sets: 2,000 sameAs chains of 4 links, each link in 2 graphs (16 sets), every set kept"
+what = "support sets: 2,000 sameAs chains of 4 links, each link in 2 graphs (16 sets), capped at 16 (all kept) and every set kept"
 semantics = "owl2-rl"
 data = "volume:support-stress/ladder-16.nq"
 extra = ["volume:support-stress/ladder-16.nq.reader", "volume:support-stress/ladder-16.nq.commits.ru"]
 tool_loads = false
-args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
+sweep = [["--support-sets", "16"], ["--support-sets", "off"]]
 page_cache = ["warm", "cold"]
 queries = "support-stress"
 metric = "support.first.read_ms"
@@ -742,13 +747,13 @@ name = "support-ladder-16-capped"
 area = "access"
 workload = "support-stress"
 tier = "ladder-16"
-what = "support sets: 2,000 sameAs chains of 4 links, each link in 2 graphs (16 sets), capped at 4 and 16"
+what = "support sets: 2,000 sameAs chains of 4 links, each link in 2 graphs (16 sets), capped at 4"
 semantics = "owl2-rl"
 data = "volume:support-stress/ladder-16.nq"
 extra = ["volume:support-stress/ladder-16.nq.reader", "volume:support-stress/ladder-16.nq.commits.ru"]
 tool_loads = false
 args = ["--load", "{data}", "--reason", "owl2-rl", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru"]
-sweep = [["--support-sets", "4"], ["--support-sets", "16"]]
+sweep = [["--support-sets", "4"]]
 page_cache = ["warm", "cold"]
 queries = "support-stress"
 metric = "support.first.read_ms"
@@ -778,7 +783,7 @@ counters = ["support.inferred", "support.first.visible"]
 check = { "q.probe.value" = "true", "q.count.value" = 5030 }
 pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
 outcome = "memory-limit"
-known = "C-310: computing every set is charged to no budget and passes the 6 GB cap on 1.3 MB of sameAs chains (killed at the first restricted read, both rounds of cap-stress-timed-p2-13efe625); capped at 16 it completes"
+known = "C-310, observed 26 Oct 2026 on 3dc5ab46 (cap-stress-timed-p2-13efe625, both rounds): computing every set was charged to no budget then, passed the 6 GB cap on 1.3 MB of sameAs chains and was killed at the first restricted read; capped at 16 it completes. Re-qualify once O4 charges it"
 route = {}
 cap_gb = 6
 est_min = 5
@@ -825,7 +830,7 @@ counters = ["support.inferred", "support.first.visible"]
 check = { "q.probe.value" = "true", "q.count.value" = 1821 }
 pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by)"
 outcome = "memory-limit"
-known = "C-310: computing every set is charged to no budget and passes the 6 GB cap on 0.4 MB of sameAs chains (killed at the first restricted read, both rounds of cap-stress-timed-p2-13efe625); capped at 16 it completes"
+known = "C-310, observed 26 Oct 2026 on 3dc5ab46 (cap-stress-timed-p2-13efe625, both rounds): computing every set was charged to no budget then, passed the 6 GB cap on 0.4 MB of sameAs chains and was killed at the first restricted read; capped at 16 it completes. Re-qualify once O4 charges it"
 route = {}
 cap_gb = 6
 timeout_s = 300
