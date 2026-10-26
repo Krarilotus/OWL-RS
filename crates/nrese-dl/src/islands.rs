@@ -21,13 +21,16 @@
 //!
 //! **What connects individuals:** an assertion of an unsplittable role, `sameAs`,
 //! `differentFrom`, a negative property assertion, and a key: individuals with a value in
-//! common (OWL 2's identity of data values) for one of its data properties, or an object
-//! of its object properties (those are unsplittable).
+//! common (OWL 2's identity of data values) for one of its data properties, asserted or
+//! through a sub-property's assertion (`e ⊑ d`, transitively), or an object of its object
+//! properties (those are unsplittable).
 //!
 //! **The whole ABox instead:** with a nominal in a clause's head (`C ⊑ ∃R.{o}`: an
-//! individual every island may reach) or the universal property (every pair of
-//! individuals). A nominal in a body only reads an individual's identity: the role atoms
-//! beside it read across their edges, so their assertions join its island.
+//! individual every island may reach), the universal property (every pair of
+//! individuals), or a value a clause's head gives a key's data property (`C ⊑ ∃d.{0}`: a
+//! value individuals in any island may share). A nominal in a body only reads an
+//! individual's identity: the role atoms beside it read across their edges, so their
+//! assertions join its island.
 //!
 //! Islands are packed into batches of about [`BATCH`] assertions (fewer where the node
 //! budget is smaller: a quarter of it, so a batch fits where the whole ABox didn't), each
@@ -94,12 +97,11 @@ fn split_into(ontology: &Ontology, batch: usize, touched: Option<&HashSet<Term>>
     // compose, so the analysis must see it too.
     let prepared = tableau::prepared(ontology);
     let ontology = prepared.as_ref();
-    let roles = match unsplittable(ontology) {
-        Ok(roles) => roles,
+    let (roles, keys) = match unsplittable(ontology) {
+        Ok(analysis) => analysis,
         Err(why) => return Split::Whole(why),
     };
     let mut parts = Parts::default();
-    let keys = keys(ontology);
     for axiom in ontology.axioms.iter().filter(|a| a.is_assertion()) {
         match axiom {
             Axiom::ClassAssertion(_, a)
@@ -123,16 +125,20 @@ fn split_into(ontology: &Ontology, batch: usize, touched: Option<&HashSet<Term>>
             _ => {}
         }
     }
-    // A key equates individuals with a value in common: they meet in one island.
+    // A key equates individuals with a value in common for one of its data properties,
+    // asserted or a sub-property's: they meet in one island.
     let mut by_value: HashMap<(Term, KeyValue), Term> = HashMap::new();
     for axiom in &ontology.axioms {
-        if let Axiom::DataPropertyAssertion(d, a, v) = axiom
-            && keys.contains(d)
+        if let Axiom::DataPropertyAssertion(p, a, v) = axiom
+            && let Some(of) = keys.get(p)
         {
-            match by_value.entry((*d, key_value(ontology, *v))) {
-                std::collections::hash_map::Entry::Occupied(e) => parts.join(*e.get(), *a),
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(*a);
+            let value = key_value(ontology, *v);
+            for &d in of {
+                match by_value.entry((d, value.clone())) {
+                    std::collections::hash_map::Entry::Occupied(e) => parts.join(*e.get(), *a),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(*a);
+                    }
                 }
             }
         }
@@ -264,13 +270,17 @@ fn decide(
 }
 
 /// The roles whose assertions carry information between their individuals (the module
-/// docs), or why the ABox can't split at all.
-fn unsplittable(ontology: &Ontology) -> Result<HashSet<Term>, String> {
+/// docs) and the keys' data properties each data property's values are values of
+/// ([`key_data`]), or why the ABox can't split at all.
+fn unsplittable(ontology: &Ontology) -> Result<(HashSet<Term>, KeyData), String> {
     let normalised = nrese_owl::normalise(&analysed(ontology));
     let top = ontology.builtin.top_object;
     let mut out: HashSet<Term> = HashSet::new();
     // `sub → sup`: a role inclusion (an atom over the same pair in the head).
     let mut inclusions: Vec<(Term, Term)> = Vec::new();
+    // `sub → sup` over data properties, and the data properties a head gives a value
+    // otherwise (`C ⊑ ∃d.{0}`).
+    let (mut data_inclusions, mut valued): (Vec<(Term, Term)>, Vec<Term>) = Default::default();
     for clause in &normalised.clauses {
         // A nominal in a head makes some term equal to the individual: what a member of
         // any island implies about it (`C ⊑ ∃R.({o} ⊓ D)`: `D(o)` if anything is a `C`).
@@ -283,13 +293,27 @@ fn unsplittable(ontology: &Ontology) -> Result<HashSet<Term>, String> {
         {
             return Err("a nominal in a conclusion (an individual every island may reach)".into());
         }
+        // `e(x, v) → d(x, v)`: the inclusion of the data property `e` in `d`.
+        if let ([BodyAtom::Data(e, x, v)], [HeadAtom::DataRole(d, y, w)]) =
+            (clause.body.as_slice(), clause.head.as_slice())
+            && (x, v) == (y, w)
+        {
+            data_inclusions.push((*e, *d));
+            continue;
+        }
         let roles = role_atoms(&clause.body, &clause.head);
         if roles.iter().any(|&(r, _, _)| Some(r) == top) {
             return Err("the ontology uses the universal property".into());
         }
         for atom in &clause.head {
-            if let HeadAtom::AtMost { role, .. } = atom {
-                out.insert(term_of(*role));
+            match atom {
+                HeadAtom::AtMost { role, .. } => {
+                    out.insert(term_of(*role));
+                }
+                HeadAtom::DataAtLeast { property, .. } | HeadAtom::DataRole(property, ..) => {
+                    valued.push(*property);
+                }
+                _ => {}
             }
         }
         // `R(x, y) → S(x, y)` (or `S(y, x)`): the inclusion of `R` in `S`.
@@ -342,6 +366,13 @@ fn unsplittable(ontology: &Ontology) -> Result<HashSet<Term>, String> {
     for rule in &normalised.rules {
         out.extend(key_roles(rule));
     }
+    let keys = key_data(&normalised.rules, &data_inclusions);
+    if valued.iter().any(|p| keys.contains_key(p)) {
+        return Err(
+            "a class gives a key's data property a value (one individuals in any island may share)"
+                .into(),
+        );
+    }
     // A role is unsplittable if a super-role is.
     loop {
         let before = out.len();
@@ -351,7 +382,7 @@ fn unsplittable(ontology: &Ontology) -> Result<HashSet<Term>, String> {
             }
         }
         if out.len() == before {
-            return Ok(out);
+            return Ok((out, keys));
         }
     }
 }
@@ -470,17 +501,34 @@ fn key_roles(rule: &SafeRule) -> Vec<Term> {
         .collect()
 }
 
-/// The data properties of the ontology's keys.
-fn keys(ontology: &Ontology) -> HashSet<Term> {
-    ontology
-        .axioms
-        .iter()
-        .filter_map(|a| match a {
-            Axiom::HasKey(_, _, data) => Some(data.iter().copied()),
-            _ => None,
-        })
-        .flatten()
-        .collect()
+/// For each data property, the keys' data properties its values are values of.
+type KeyData = HashMap<Term, Vec<Term>>;
+
+/// The data properties of the keys' rules for each of those and the properties under it
+/// (data `inclusions`, `sub → sup`, transitively).
+fn key_data(rules: &[SafeRule], inclusions: &[(Term, Term)]) -> KeyData {
+    let mut subs: HashMap<Term, Vec<Term>> = HashMap::new();
+    for &(sub, sup) in inclusions {
+        subs.entry(sup).or_default().push(sub);
+    }
+    let mut out = KeyData::new();
+    let mut keyed: HashSet<Term> = HashSet::new();
+    for atom in rules.iter().flat_map(|r| &r.body) {
+        let &BodyAtom::Data(d, _, _) = atom else {
+            continue;
+        };
+        if !keyed.insert(d) {
+            continue;
+        }
+        let mut seen = HashSet::from([d]);
+        let mut next = vec![d];
+        while let Some(p) = next.pop() {
+            out.entry(p).or_default().push(d);
+            let under = subs.get(&p).into_iter().flatten().copied();
+            next.extend(under.filter(|&s| seen.insert(s)));
+        }
+    }
+    out
 }
 
 /// A key's value as a key compares it: OWL 2's identity of data values, or, for a literal
