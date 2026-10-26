@@ -2,14 +2,15 @@
 //!
 //! - **inconsistent:** every class is unsatisfiable (exact);
 //! - **consistent, the DL part's TBox without nominals and the universal property (but as
-//!   a superproperty: a tautology):** the classification is the DL part's (exact). Proof:
-//!   for named classes `A`, `B` with
+//!   a superproperty: a tautology), and no assertion or rule over that property:** the
+//!   classification is the DL part's (exact). Proof: for named classes `A`, `B` with
 //!   `A ⋢ B` in the TBox, a model `I₁` of the TBox has an element in `A ∖ B`; the disjoint
 //!   union of `I₁` and a model `I₂` of the whole input, the individuals in `I₂`, is a model
 //!   of the whole input. TBox axioms hold in a disjoint union where no expression names an
 //!   individual or relates everything; assertions, keys and DL-safe rules concern named
-//!   individuals only, which `I₂` interprets as before. So the input entails `A ⊑ B` iff
-//!   the TBox does, and so does the consistent DL part;
+//!   individuals and what their properties reach in `I₂`, which it interprets as before,
+//!   unless the universal property reaches `I₁` too (`a : ∀U.{a}`). So the input entails
+//!   `A ⊑ B` iff the TBox does, and so does the consistent DL part;
 //! - **otherwise:** the subsumptions of the DL part with the rule instances grounded (each
 //!   entailed by the input), a lower bound; what isn't in it is open, and said so.
 
@@ -32,8 +33,9 @@ pub struct Classified {
     pub why: Vec<String>,
 }
 
-/// Whether a class expression names an individual or uses `owl:topObjectProperty`.
-fn nominal(o: &Ontology, e: ExprId) -> bool {
+/// Whether a class expression uses `owl:topObjectProperty` or, with `nominals`, names an
+/// individual.
+fn global(o: &Ontology, e: ExprId, nominals: bool) -> bool {
     let top = o.builtin.top_object;
     let mut stack = vec![e];
     let mut seen = std::collections::HashSet::new();
@@ -42,7 +44,9 @@ fn nominal(o: &Ontology, e: ExprId) -> bool {
             continue;
         }
         let p = match o.classes.get(e.0) {
-            ClassExpr::OneOf(_) | ClassExpr::HasValue(..) => return true,
+            ClassExpr::OneOf(_) if nominals => return true,
+            ClassExpr::HasValue(..) if nominals => return true,
+            ClassExpr::HasValue(p, _) => *p,
             ClassExpr::And(xs) | ClassExpr::Or(xs) => {
                 stack.extend(xs);
                 continue;
@@ -69,10 +73,24 @@ fn nominal(o: &Ontology, e: ExprId) -> bool {
     false
 }
 
-/// Whether the TBox and RBox (every axiom but the assertions) use no nominal and not the
-/// universal property.
-fn tbox_without_nominals(o: &Ontology) -> bool {
+/// Whether a model of the TBox joins any model of the input as a disjoint union (the module
+/// docs): the TBox and RBox (every axiom but the assertions) use no nominal and not the
+/// universal property, and no assertion or rule uses that property (it would reach every
+/// element, a joined one's too).
+fn separable(o: &Ontology) -> bool {
     let top = o.builtin.top_object;
+    let asserted = o.axioms.iter().filter_map(|a| match a {
+        Axiom::ClassAssertion(c, _) => Some(*c),
+        _ => None,
+    });
+    let in_rules = o.rules.iter().flat_map(|r| r.body.iter().chain(&r.head));
+    let in_rules = in_rules.filter_map(|a| match a {
+        nrese_owl::rules::Atom::Class(c, _) => Some(*c),
+        _ => None,
+    });
+    if asserted.chain(in_rules).any(|c| global(o, c, false)) {
+        return false;
+    }
     o.axioms.iter().filter(|a| !a.is_assertion()).all(|a| {
         let exprs: Vec<ExprId> = match a {
             Axiom::SubClassOf(x, y) => vec![*x, *y],
@@ -98,7 +116,8 @@ fn tbox_without_nominals(o: &Ontology) -> bool {
             Axiom::HasKey(_, ps, _) => ps.clone(),
             _ => Vec::new(),
         };
-        exprs.iter().all(|&e| !nominal(o, e)) && properties.iter().all(|p| Some(p.named()) != top)
+        exprs.iter().all(|&e| !global(o, e, true))
+            && properties.iter().all(|p| Some(p.named()) != top)
     })
 }
 
@@ -129,7 +148,7 @@ pub fn classify(o: &Ontology, options: &Options, with: &classify::Options) -> Cl
             why: vec!["inconsistent: every class is unsatisfiable".into()],
             decision,
         },
-        Verdict::Consistent { .. } if tbox_without_nominals(o) => {
+        Verdict::Consistent { .. } if separable(o) => {
             let t = classify::classify(&dl_part(o), with);
             let exact = t.complete();
             let mut why = vec![

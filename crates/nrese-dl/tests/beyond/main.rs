@@ -117,28 +117,50 @@ fn a_zero_instance_budget_certifies_no_model() {
 ///   `A` is unsatisfiable though it has no pair of classes to test; with no test budget it
 ///   is listed so;
 /// - `⊤ ⊑ {a}`, `⊤ ⊑ A ⊔ B` and `B(x) → ⊥`: every element is `a`, which the rule keeps out of
-///   `B`, so `A` is `⊤`.
+///   `B`, so `A` is `⊤`;
+/// - the same with `a : ∀U.{a}` (`U` the universal property) in place of `⊤ ⊑ {a}`, asserted
+///   or concluded by a rule (PR #32 review, R1): it reaches every element, so no model of the
+///   TBox alone joins the input's.
 ///
 /// A classification that doesn't list it isn't exact.
 #[test]
 fn an_exact_classification_settles_each_class() {
+    let only_a = "ObjectAllValuesFrom(owl:topObjectProperty ObjectOneOf(:a))";
+    let asserted = format!("ClassAssertion({only_a} :a)");
+    let concluded = format!(
+        "ClassAssertion(owl:Thing :a) \
+         DLSafeRule(Body(ClassAtom(owl:Thing :a)) Head(ClassAtom({only_a} :a)))"
+    );
+    let empty_a = "Declaration(Class(:A)) Declaration(NamedIndividual(:a)) \
+                   DLSafeRule(Body(ClassAtom(:A Variable(:x))) Head())";
+    let top_a = "Declaration(Class(:A)) Declaration(Class(:B)) Declaration(NamedIndividual(:a)) \
+                 SubClassOf(owl:Thing ObjectUnionOf(:A :B)) \
+                 DLSafeRule(Body(ClassAtom(:B Variable(:x))) Head())";
     // (case, axioms, whether A is unsatisfiable rather than ⊤)
     let cases = [
         (
             "A ⊑ {a}",
-            "Declaration(Class(:A)) Declaration(NamedIndividual(:a)) \
-             SubClassOf(:A ObjectOneOf(:a)) \
-             DLSafeRule(Body(ClassAtom(:A Variable(:x))) Head())",
+            format!("{empty_a} SubClassOf(:A ObjectOneOf(:a))"),
             true,
         ),
         (
-            "⊤ ⊑ A ⊔ B",
-            "Declaration(Class(:A)) Declaration(Class(:B)) Declaration(NamedIndividual(:a)) \
-             SubClassOf(owl:Thing ObjectOneOf(:a)) SubClassOf(owl:Thing ObjectUnionOf(:A :B)) \
-             DLSafeRule(Body(ClassAtom(:B Variable(:x))) Head())",
+            "⊤ ⊑ {a}, ⊤ ⊑ A ⊔ B",
+            format!("{top_a} SubClassOf(owl:Thing ObjectOneOf(:a))"),
+            false,
+        ),
+        ("a : ∀U.{a}", format!("{empty_a} {asserted}"), true),
+        (
+            "a : ∀U.{a} by a rule",
+            format!("{empty_a} {concluded}"),
+            true,
+        ),
+        (
+            "a : ∀U.{a}, ⊤ ⊑ A ⊔ B",
+            format!("{top_a} {asserted}"),
             false,
         ),
     ];
+    let mut wrong = Vec::new();
     for (case, axioms, unsatisfiable) in cases {
         let (o, names) = read_with_rules(&format!("{PREFIXES}Ontology({axioms})")).expect("reads");
         let a = names.classes[0];
@@ -157,16 +179,17 @@ fn an_exact_classification_settles_each_class() {
             } else {
                 c.classification.top.contains(&a)
             };
-            assert!(
-                listed || !c.exact,
-                "{case}, max_tests {max_tests:?}: A not listed, and exact\n{:#?}",
-                c.why
-            );
-            if unsatisfiable && max_tests.is_none() {
-                assert!(listed, "{case}: A not unsatisfiable\n{:#?}", c.why);
+            if !listed && c.exact {
+                wrong.push(format!(
+                    "{case}, max_tests {max_tests:?}: A not listed, and exact"
+                ));
+            }
+            if unsatisfiable && max_tests.is_none() && !listed {
+                wrong.push(format!("{case}: A not unsatisfiable"));
             }
         }
     }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// A built-in outside SWRL's (SWRLTab's `abox:hasClass` in ORE's 10860) has no meaning
