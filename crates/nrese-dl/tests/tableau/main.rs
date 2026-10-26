@@ -1052,6 +1052,34 @@ fn keyed_plans_run_on_a_self_loop() {
     assert_eq!(out.answer, Answer::Inconsistent, "{}", out.telemetry);
 }
 
+/// A clause body wider than a join plan's positions (review A-1501): `C₀ ⊓ … ⊓ C₂₅₆ ⊑ D`
+/// with `¬D(a)`. With `a` in all but one `Cᵢ` it has a model (that `Cᵢ` and `D` empty),
+/// so it is never refuted, whichever `Cᵢ` that is; with `a` in every `Cᵢ` it has none, so
+/// it is never consistent.
+#[test]
+fn a_wide_clause_body_is_never_misread() {
+    let n = 257;
+    for left_out in (0..n).map(Some).chain([None]) {
+        let mut b = Build::default();
+        let cs: Vec<ExprId> = (0..n).map(|i| b.class(1000 + i)).collect();
+        let all = b.and(&cs);
+        let d = b.class(1);
+        b.sub(all, d);
+        let not_d = b.not(d);
+        b.assert(not_d, 100);
+        for (i, &c) in cs.iter().enumerate() {
+            if left_out != Some(i as u64) {
+                b.assert(c, 100);
+            }
+        }
+        let answer = consistency(&b.o, &Config::default()).answer;
+        match left_out {
+            Some(i) => assert_ne!(answer, Answer::Inconsistent, "C{i} left out"),
+            None => assert_ne!(answer, Answer::Consistent),
+        }
+    }
+}
+
 /// Guard (small-scope cases 623, 677, 732, 786, 12 October 2026): operands of a
 /// disjointness that the universal property's rewriting makes equal (`∃U.{a}` and `⊤`
 /// are both `⊤`) make it empty; dropping the repeat answered "consistent".
