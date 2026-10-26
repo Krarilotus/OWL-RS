@@ -58,7 +58,9 @@ pub const ALL: [Ruleset; 6] = [
 
 /// Version of the evaluation semantics beyond the rule text: list compilation, equality
 /// handling, modules. Bump it with any change that alters what a ruleset derives or rejects,
-/// so stores materialised by an older build rebuild instead of trusting their state.
+/// so stores materialised by an older build rebuild instead of trusting their state. A
+/// fingerprint covers it, the rule text, and the relations a GraphDB ruleset's contexts
+/// compile to ([`crate::RuleProgram::fingerprint`]); a change of those names needs no bump.
 pub const SEMANTICS_VERSION: u32 = 2;
 
 impl Ruleset {
