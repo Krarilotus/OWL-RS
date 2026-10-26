@@ -21,7 +21,10 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   else
     base=$remote_sha
   fi
-  NRESE_PUSH_COMMIT=$local_sha NRESE_PUSH_BASE=$base bash scripts/check.sh push < /dev/null || code=1
+  # The build-host variables are the gate's own (check.sh, gate-job.sh, remote.sh): from the pusher's
+  # environment they would pick the in-job branch, which runs a sent list here, not the fleet gate.
+  env -u NRESE_ON_BUILD_HOST -u NRESE_FILES_FROM NRESE_PUSH_COMMIT="$local_sha" NRESE_PUSH_BASE="$base" \
+    bash scripts/check.sh push < /dev/null || code=1
 done
 [ $gated -gt 0 ] || echo "pre-push: deletions only, nothing to gate" >&2
 exit $code

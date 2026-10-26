@@ -231,7 +231,8 @@ exec_changed() {
 # The files a commit or push changes. A merge commit: a file the same as on one side was
 # tested on that side; new is what differs from both (resolved conflicts, files both sides
 # changed). A push: the pushed range, from the base the remote has to the pushed commit
-# (push_base, push_commit); never the work tree, which a push doesn't send.
+# (push_base, push_commit); never the work tree, which a push doesn't send. Without a range it
+# fails: an empty list would gate nothing.
 
 changed_files() {
   if [ "$1" = commit ] && git rev-parse -q --verify MERGE_HEAD > /dev/null; then
@@ -239,6 +240,7 @@ changed_files() {
   elif [ "$1" = commit ]; then
     git diff --name-only HEAD
   else
+    [ -n "${push_base:-}" ] && [ -n "${push_commit:-}" ] || return 2
     git diff --name-only "$push_base" "$push_commit"
     return
   fi
@@ -321,6 +323,11 @@ case "$mode" in
   commit | push)
     if [ -n "${NRESE_FILES_FROM:-}" ]; then
       mapfile -t files < "$NRESE_FILES_FROM"
+    elif [ "$mode" = push ]; then
+      # A push tier on a build host runs the list its gate sent (gate-job.sh, remote.sh), never
+      # one it selects itself: here it has no pushed range.
+      echo "check.sh push on a build host needs the gate's file list (NRESE_FILES_FROM): not run" >&2
+      exit 2
     else
       mapfile -t files < <(changed_files "$mode")
     fi
