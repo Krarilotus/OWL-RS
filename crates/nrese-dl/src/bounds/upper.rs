@@ -44,13 +44,13 @@
 //!   transitivity as rules (PAGOdA's (O9)), so the role atoms they entail are in U1.
 //! - Keys aren't clauses. U1 adds them as rules over every term, not only named ones
 //!   (more equalities: still an upper bound).
-//! - Data ranges have no theory here. Head atoms over them (`DataIn`, data equality,
+//! - Data values have no theory here: what a range surely holds is the datatype theory's
+//!   evaluation (`datatypes::Ranges`). Head atoms over values (`DataIn`, data equality,
 //!   data at-most) are dropped: no body reads them, so no class, role or data property
 //!   atom is lost. A data existential derives its value if that is one literal, else a
-//!   Skolem constant. A contradiction among data values (a literal outside a range, two
-//!   values of a functional data property, an empty range) then derives no clash: such
-//!   clauses are listed in [`Program::unchecked`], and a clash-free U1 proves
-//!   consistency only without them ([`Program::proves_consistency`]).
+//!   Skolem constant. A contradiction among data values the evaluation doesn't rule out
+//!   then derives no clash: such clauses are listed in [`Program::unchecked`], and a
+//!   clash-free U1 proves consistency only without them ([`Program::proves_consistency`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -59,9 +59,9 @@ use nrese_owl::{Axiom, Characteristic, ClassExpr, Normalised, ObjProp, Ontology,
 use super::program::{
     Approximations, Atom, Names, Origin, Program, Provenance, Rule, Signature, Slot,
 };
+use crate::datatypes::Ranges;
 
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
-const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
 const OWL: &str = "http://www.w3.org/2002/07/owl#";
 /// The namespace of U1's own terms (fresh classes, Skolem constants, the clash).
 pub const U1: &str = "urn:nrese:u1:";
@@ -117,7 +117,8 @@ pub fn compile_with(
         projections: Vec::new(),
     };
     let named_individual = iri(&format!("{OWL}NamedIndividual"));
-    let literal = iri(&format!("{RDFS}Literal"));
+    let mut ranges = Ranges::of_ranges(ontology, normalised);
+    ranges.finish();
     let [top_object, top_data, bottom_object, bottom_data] = [
         "topObjectProperty",
         "topDataProperty",
@@ -131,13 +132,15 @@ pub fn compile_with(
         iri,
         nominals: HashMap::new(),
         max_skolems: options.max_skolems.max(Options::MIN_SKOLEMS),
-        literal,
+        ranges,
+        compares_values: !normalised.facts.not_data.is_empty()
+            || (ontology.axioms.iter())
+                .any(|a| matches!(a, Axiom::HasKey(_, _, data) if !data.is_empty())),
         top_object,
         top_data,
     };
-    // Datatype definitions only refine data ranges, which U1 doesn't read (a clause that
-    // needs a defined datatype's value is unchecked instead); keys are rules here
-    // (`axiom`), which the clauses leave to the engines that apply them.
+    // Datatype definitions only refine data ranges, which `ranges` evaluates; keys are
+    // rules here (`axiom`), which the clauses leave to the engines that apply them.
     c.program.incomplete = normalised
         .unsupported
         .iter()
@@ -171,8 +174,11 @@ pub(super) struct Compiler<'a> {
     nominals: HashMap<Term, Term>,
     /// [`Options::max_skolems`], at least [`Options::MIN_SKOLEMS`].
     pub(super) max_skolems: u32,
-    /// `rdfs:Literal`, the data range that holds every value.
-    pub(super) literal: Term,
+    /// The data ranges, as the datatype theory evaluates them (definitions included).
+    pub(super) ranges: Ranges,
+    /// Whether data values are compared (negative data assertions, keys over data
+    /// properties): U1 compares them by term.
+    pub(super) compares_values: bool,
     /// `owl:topObjectProperty` and `owl:topDataProperty`, which hold for every pair.
     pub(super) top_object: Term,
     pub(super) top_data: Term,
@@ -212,6 +218,17 @@ impl Compiler<'_> {
         match role {
             ObjProp::Named(p) => Atom([from, Slot::Const(p), to]),
             ObjProp::Inverse(p) => Atom([to, Slot::Const(p), from]),
+        }
+    }
+
+    /// `role(from, to)` in a rule body: its edge; over `owl:topObjectProperty`, which
+    /// holds for every pair (Direct Semantics, §2.3), that both ends exist.
+    pub(super) fn push_role(&self, body: &mut Vec<Atom>, role: ObjProp, from: Slot, to: Slot) {
+        if role.named() == self.top_object {
+            let thing = self.program.names.thing;
+            body.extend([self.type_atom(from, thing), self.type_atom(to, thing)]);
+        } else {
+            body.push(Self::edge(role, from, to));
         }
     }
 
@@ -327,11 +344,9 @@ impl Compiler<'_> {
                 }
                 let mut next = 2u8;
                 for &r in objects {
-                    // `owl:topObjectProperty` relates both to every element, `x` itself
-                    // among them: as in a clause body, its atoms are that both exist.
+                    // Over `owl:topObjectProperty` the shared value can be `x` itself.
                     if r.named() == self.top_object {
-                        let thing = self.program.names.thing;
-                        body.extend([self.type_atom(x, thing), self.type_atom(y, thing)]);
+                        self.push_role(&mut body, r, x, y);
                         continue;
                     }
                     let z = Slot::Var(next);
