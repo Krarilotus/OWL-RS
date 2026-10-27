@@ -476,6 +476,71 @@ fn a_pending_read_charges_its_view_to_the_query() {
     );
 }
 
+/// A read inside a transaction whose query is cancelled (its time running out cancels it too)
+/// fails as cancelled and keeps no view, as one outside it does
+/// (`a_cancelled_restricted_read_fails_and_leaves_nothing_behind`; Sol's review of O4's
+/// boundary round, S2). Cold, the base's view stops at its first round, so nothing of it is
+/// made. With the base's view made, what the operations leave of it isn't gathered either, so
+/// the read isn't refused for that list's memory instead (64 KiB, which the list passes:
+/// `a_pending_read_charges_its_view_to_the_query`). 5,000 facts in the reader's graph give
+/// its view sets to compute; the transaction holds one RDF4J `ADD`.
+#[test]
+fn a_cancelled_pending_read_fails_and_keeps_no_view() {
+    use nrese_store::{
+        CancellationToken, GraphResultFormat, PreparedQuery, QueryEvaluationError, RdfPayload,
+        StatementOp, StatementsRequest, StoreError, StoreResult,
+    };
+    let store = StoreService::new(in_memory_store_config()).unwrap();
+    let facts: String = (0..5_000).map(|i| format!("ex:i{i} a ex:C . ")).collect();
+    store
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {{ GRAPH ex:open {{ ex:C rdfs:subClassOf ex:D . {facts} }} }}"
+        )))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    let pending = StatementsRequest::new(vec![StatementOp::Add {
+        data: RdfPayload {
+            payload: format!("<{EX}z> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{EX}C> .")
+                .into_bytes(),
+            format: GraphResultFormat::NTriples,
+            base_iri: None,
+        },
+        contexts: Vec::new(),
+    }]);
+    let ask = |cancellation: &CancellationToken, limit: Option<usize>| {
+        let mut request = SparqlQueryRequest::new("ASK {}", reader(true));
+        request.memory_limit = limit;
+        let prepared = PreparedQuery::parse(&request).unwrap();
+        store.run_query_pending(&pending, &prepared, cancellation, &mut Vec::new())
+    };
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let is_cancelled = |result: &StoreResult<()>| {
+        matches!(
+            result,
+            Err(StoreError::SparqlEvaluation(
+                QueryEvaluationError::Cancelled
+            ))
+        )
+    };
+    let cold = store.support_statistics();
+    let result = ask(&cancelled, None);
+    assert!(is_cancelled(&result), "cold: {result:?}");
+    assert_eq!(store.support_statistics(), cold, "the view was computed");
+    // A read that runs makes the base's view.
+    let ran = ask(&CancellationToken::new(), None);
+    assert!(ran.is_ok(), "{ran:?}");
+    let made = store.support_statistics();
+    let result = ask(&cancelled, Some(64 * 1024));
+    assert!(
+        is_cancelled(&result),
+        "with the base's view made: {result:?}"
+    );
+    assert_eq!(store.support_statistics(), made);
+}
+
 /// A planned read (EXPLAIN without running) charges the view it makes to its query's memory,
 /// as a run does (Sol's review of O4's boundary round, S1). With the query's limit at 1 byte,
 /// a supported reader whose view is past it is refused by that limit, not by the server's

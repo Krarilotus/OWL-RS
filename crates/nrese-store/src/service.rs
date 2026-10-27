@@ -1146,7 +1146,7 @@ impl StoreService {
                 // work, charged to its envelope. A statement the view adds (asserted only in
                 // graphs the reader can't read, and derived) stays unless the operations
                 // assert it where the reader reads it.
-                let base = self.view_of(tx.base(), Some(access), memory, None)?;
+                let base = self.view_of(tx.base(), Some(access), memory, Some(cancellation))?;
                 let left = |quad: &nrese_engine::EncodedQuad| match tx
                     .base()
                     .contains_in(ReadModel::Inferred, quad)
@@ -1164,6 +1164,9 @@ impl StoreService {
                         )
                         .any(|asserted| access.allows_id(&tx, asserted.graph)),
                 };
+                // The query's cancellation stops the gathering as it stops the base's view
+                // (a view made before isn't computed again): nothing more is read or kept.
+                cancellation.check()?;
                 let working = std::sync::Arc::new(memory.part());
                 let len = usize::try_from(base.len_in(ReadModel::Inferred)).unwrap_or(usize::MAX);
                 let mut kept: nrese_exec::ChargedVec<nrese_engine::EncodedQuad> =
@@ -1176,9 +1179,11 @@ impl StoreService {
                         ReadModel::Inferred,
                         &nrese_engine::QuadPattern::all(),
                     )
+                    .take_while(|_| !cancellation.is_cancelled())
                     .filter(|quad| left(quad)),
                 )?;
                 drop(scanning);
+                cancellation.check()?;
                 kept.sort_unstable();
                 tx.pending_snapshot()
                     .with_inferred_only(&kept, self.supports.kept())?
