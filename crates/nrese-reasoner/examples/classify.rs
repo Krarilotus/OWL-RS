@@ -14,7 +14,8 @@
 //! `owl:Thing<TAB>super` for classes equivalent to `owl:Thing`, and prints the time and
 //! what was skipped, then, as its last line, the profile (`nrese_reasoner::classify::Profile`)
 //! as `name=value` pairs: the phases in milliseconds (reading and writing included) and the
-//! counters, which the DL lab records (`benches/reasoning/dl/nrese.py`).
+//! counters, which the DL lab records (`benches/reasoning/dl/nrese.py`). Omitted input
+//! returns an error before writing a taxonomy, so callers cannot record it as complete.
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufWriter, Write};
@@ -87,6 +88,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         threads,
     );
     let elapsed = started.elapsed();
+    let mut skipped: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, kind) in &result.skipped {
+        *skipped.entry(kind).or_default() += 1;
+    }
+    if !skipped.is_empty() {
+        return Err(format!("EL classification omitted input: {skipped:?}").into());
+    }
     let started = Instant::now();
     let text = |id: u64| vocabulary.text(id).trim_matches(['<', '>']).to_owned();
     let mut file = BufWriter::new(std::fs::File::create(&out)?);
@@ -101,10 +109,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     file.flush()?;
     let write = started.elapsed();
-    let mut skipped: BTreeMap<&str, usize> = BTreeMap::new();
-    for (_, kind) in &result.skipped {
-        *skipped.entry(kind).or_default() += 1;
-    }
     eprintln!(
         "{} triples read in {:.3} s; classified in {:.3} s: {} subsumptions, {} unsatisfiable; skipped {:?}",
         triples.len(),
