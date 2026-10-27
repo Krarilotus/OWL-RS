@@ -195,10 +195,37 @@ fn an_exact_classification_settles_each_class() {
 /// SWRL's comparisons (SWRL §8.1): an inclusive one holds for equal values of any type, so
 /// `lessThanOrEqual(true, true) → a ≠ a` has no model (review A-1607); a strict one on equal
 /// values doesn't hold, so its rule never fires; `lessThan(false, true)` holds, so its rule
-/// has no model either, and where the order isn't evaluated nothing is certified.
+/// has no model either, and where the order isn't evaluated nothing is certified. Floats and
+/// doubles compare as numbers, not by identity (XQuery's `op:numeric-equal`, PR #38 review,
+/// R1-1): NaN equals nothing, itself included, and `0` equals `-0`. Numbers of two types
+/// compare as XPath promotes them: an integer or decimal to the nearest float (`0.1` is
+/// `0.1f`; `16777217` ties to even, `16777216f`), a float exactly to a double (`0.1f` is
+/// above `0.1d`); `1/3` (`owl:rational`) has no XPath type, so nothing is certified. One
+/// instant at two offsets is one date-time to XPath (`op:dateTime-equal`), not to identity:
+/// nothing is certified there either.
 #[test]
 fn comparisons_hold_as_swrl_defines_them() {
+    let mut wrong = Vec::new();
     for (body, consistent) in [
+        (
+            "equal \"2020-01-01T00:00:00Z\"^^xsd:dateTime \
+             \"2020-01-01T01:00:00+01:00\"^^xsd:dateTime",
+            false,
+        ),
+        ("lessThan \"1\"^^xsd:integer \"2.5\"^^xsd:float", false),
+        ("equal \"0.1\"^^xsd:decimal \"0.1\"^^xsd:float", false),
+        (
+            "equal \"16777217\"^^xsd:integer \"16777216\"^^xsd:float",
+            false,
+        ),
+        ("greaterThan \"0.1\"^^xsd:float \"0.1\"^^xsd:double", false),
+        ("lessThan \"1/3\"^^owl:rational \"0.5\"^^xsd:float", false),
+        (
+            "lessThanOrEqual \"NaN\"^^xsd:float \"NaN\"^^xsd:float",
+            true,
+        ),
+        ("equal \"NaN\"^^xsd:double \"NaN\"^^xsd:double", true),
+        ("equal \"0\"^^xsd:float \"-0\"^^xsd:float", false),
         (
             "lessThanOrEqual \"true\"^^xsd:boolean \"true\"^^xsd:boolean",
             false,
@@ -220,12 +247,11 @@ fn comparisons_hold_as_swrl_defines_them() {
         ))
         .expect("reads");
         let verdict = consistency(&o, &Options::default()).verdict;
-        assert_eq!(
-            matches!(verdict, Verdict::Consistent { .. }),
-            consistent,
-            "{body}: {verdict:?}"
-        );
+        if matches!(verdict, Verdict::Consistent { .. }) != consistent {
+            wrong.push(format!("{body}: {verdict:?}"));
+        }
     }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// A built-in outside SWRL's (SWRLTab's `abox:hasClass` in ORE's 10860) has no meaning
