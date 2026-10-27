@@ -15,8 +15,9 @@
 use std::collections::HashMap;
 
 use nrese_owl::{
-    Axiom, BodyAtom, Characteristic, ClassExpr, Clause, Concept, EntityKind, ExprId, Filler,
-    FreshOf, HeadAtom, Interner, Normalised, ObjProp, Ontology, Options, Term, Var, normalise_with,
+    Axiom, BodyAtom, Characteristic, ClassExpr, Clause, Concept, DataRange, EntityKind, ExprId,
+    Filler, FreshOf, HeadAtom, Interner, Normalised, ObjProp, Ontology, Options, RangeId, Term,
+    Var, normalise_with,
 };
 
 /// Picks a role from the random source.
@@ -960,4 +961,268 @@ fn an_inverse_pair_with_a_transitive_role_is_regular() {
         "{:?}",
         normalised.unsupported
     );
+}
+
+/// A cardinality whose negation is past `u32` (review A-1201): `a : ¬(≤ 4294967295 r)`,
+/// `a : ¬(= 4294967295 r)` and their data forms need `≥ 4294967296`. Over a two-valued
+/// datatype the data one has no model; wrapped to `≥ 0` it would hold everywhere. The
+/// normalisation leaves those axioms out; one below, their negation `≥ 4294967295` stays.
+/// Unnegated, `≤ 4294967295` and `= 4294967295` need no `+ 1`: they stay, their at-most
+/// atoms counting 4294967295 exactly (PR #40 review, R1).
+#[test]
+fn only_a_negation_past_u32_is_left_out() {
+    let mut wrong = Vec::new();
+    for (n, negated, left_out) in [
+        (u32::MAX - 1, true, 0),
+        (u32::MAX, true, 4),
+        (u32::MAX, false, 0),
+    ] {
+        let mut o = Ontology::default();
+        let range = RangeId(o.ranges.intern(DataRange::Datatype(30)));
+        let mut e = |x| ExprId(o.classes.intern(x));
+        let thing = e(ClassExpr::Thing);
+        let restrictions = [
+            ClassExpr::Max(n, ObjProp::Named(10), thing),
+            ClassExpr::Exact(n, ObjProp::Named(10), thing),
+            ClassExpr::DataMax(n, 20, range),
+            ClassExpr::DataExact(n, 20, range),
+        ]
+        .map(|x| {
+            let x = e(x);
+            if negated { e(ClassExpr::Not(x)) } else { x }
+        });
+        o.axioms = restrictions.map(|c| Axiom::ClassAssertion(c, 100)).to_vec();
+        o.sources = vec![Vec::new(); o.axioms.len()];
+        let normalised = normalise_with(&o, Options::default());
+        let heads: Vec<&HeadAtom> = normalised.clauses.iter().flat_map(|c| &c.head).collect();
+        let has = |test: fn(&HeadAtom) -> bool| heads.iter().any(|h| test(h));
+        let counted = [
+            has(|h| matches!(h, HeadAtom::AtMost { n: u32::MAX, .. })),
+            has(|h| matches!(h, HeadAtom::DataAtMost { n: u32::MAX, .. })),
+        ];
+        if normalised.unsupported.len() != left_out || (!negated && counted != [true, true]) {
+            wrong.push(format!(
+                "≤ {n}, negated {negated}: {:?} {counted:?}",
+                normalised.unsupported
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The count is refused exactly where the negation normal form needs it (PR #40's sol-loop,
+/// S1 and S2): `a : ≤ 1 r.¬(≤ 4294967295 s)` puts the filler in negation normal form, which
+/// is `≥ 4294967296 s`: left out; `b : ¬(≥ 0 r.(≤ 4294967295 s))` is `b : ⊥` whatever the
+/// filler, which is never negated: kept; `¬(≤ 4294967295 s) ⊑ A` goes in as
+/// `⊤ ⊑ (≤ 4294967295 s) ⊔ A`, its subclass negated (the second round, S1): kept.
+#[test]
+fn a_nested_negation_past_u32_is_left_out() {
+    let mut o = Ontology::default();
+    let mut e = |x| ExprId(o.classes.intern(x));
+    let thing = e(ClassExpr::Thing);
+    let a = e(ClassExpr::Class(1));
+    let most = e(ClassExpr::Max(u32::MAX, ObjProp::Named(11), thing));
+    let not_most = e(ClassExpr::Not(most));
+    let one_not_most = e(ClassExpr::Max(1, ObjProp::Named(10), not_most));
+    let none = e(ClassExpr::Min(0, ObjProp::Named(10), most));
+    let not_none = e(ClassExpr::Not(none));
+    o.axioms = vec![
+        Axiom::ClassAssertion(one_not_most, 100),
+        Axiom::ClassAssertion(not_none, 101),
+        Axiom::SubClassOf(not_most, a),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let unsupported = normalise_with(&o, Options::default()).unsupported;
+    let left_out: Vec<usize> = unsupported.iter().map(|&(i, _)| i).collect();
+    assert_eq!(left_out, [0], "{unsupported:?}");
+}
+
+/// A fresh name's definition that needs a count past `u32` (PR #40's sol-loop, second
+/// round, S2): `a : ≤ 1 r.(≤ 4294967295 s)` and `b : ≤ 1 r.(≤ 4294967295 s)` share the name
+/// of the restriction, whose definition negates the filler only when it is clausified, after
+/// both took the name. Neither assertion is complete without it: both are left out.
+#[test]
+fn a_shared_definition_past_u32_leaves_out_every_user() {
+    let mut o = Ontology::default();
+    let mut e = |x| ExprId(o.classes.intern(x));
+    let thing = e(ClassExpr::Thing);
+    let most = e(ClassExpr::Max(u32::MAX, ObjProp::Named(11), thing));
+    let one_most = e(ClassExpr::Max(1, ObjProp::Named(10), most));
+    o.axioms = vec![
+        Axiom::ClassAssertion(one_most, 100),
+        Axiom::ClassAssertion(one_most, 101),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let unsupported = normalise_with(&o, Options::default()).unsupported;
+    let mut left_out: Vec<usize> = unsupported.iter().map(|&(i, _)| i).collect();
+    left_out.sort_unstable();
+    assert_eq!(left_out, [0, 1], "{unsupported:?}");
+}
+
+/// A shared definition that needs more variables than a `u16` numbers, and a universal over
+/// an irregular role: every axiom that takes the name is left out, not only one (the name is
+/// cached, so each other taker is weaker without its definition). Axioms that don't take it
+/// stay: the Horn lower bound reads them.
+#[test]
+fn a_shared_definition_that_fails_leaves_out_every_user() {
+    let mut wrong = Vec::new();
+    // `B ⊑ ∃r.D` and `C ⊑ ∃s.D`, `D` a union of 65,537 universals; `B ⊑ C` takes nothing.
+    let mut o = Ontology::default();
+    let mut e = |x| ExprId(o.classes.intern(x));
+    let a = e(ClassExpr::Class(1));
+    let alls = (0..65_537)
+        .map(|p| e(ClassExpr::All(ObjProp::Named(1_000 + p), a)))
+        .collect();
+    let d = e(ClassExpr::Or(alls));
+    let (b, c) = (e(ClassExpr::Class(2)), e(ClassExpr::Class(3)));
+    let rd = e(ClassExpr::Some(ObjProp::Named(10), d));
+    let sd = e(ClassExpr::Some(ObjProp::Named(11), d));
+    o.axioms = vec![
+        Axiom::SubClassOf(b, rd),
+        Axiom::SubClassOf(c, sd),
+        Axiom::SubClassOf(b, c),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let unsupported = normalise_with(&o, Options::default()).unsupported;
+    let mut left_out: Vec<usize> = unsupported.iter().map(|&(i, _)| i).collect();
+    left_out.sort_unstable();
+    if left_out != [0, 1] {
+        wrong.push(format!("too wide: {unsupported:?}"));
+    }
+    // `A ⊑ ∀R.C` and `B ⊑ ∀R.C` with `R ∘ S ⊑ S` and `S ∘ R ⊑ R` (irregular), and
+    // `B ⊑ ∃T.(∀R.C ⊓ A)` and `A ⊑ ∃U.(∀R.C ⊓ A)`, which share a name whose definition
+    // takes the automaton; `A ⊑ B` takes nothing.
+    let mut o = Ontology::default();
+    let mut e = |x| ExprId(o.classes.intern(x));
+    let (r, s) = (ObjProp::Named(10), ObjProp::Named(11));
+    let (a, b, c) = (
+        e(ClassExpr::Class(1)),
+        e(ClassExpr::Class(2)),
+        e(ClassExpr::Class(3)),
+    );
+    let all = e(ClassExpr::All(r, c));
+    let both = e(ClassExpr::And(vec![all, a]));
+    let t_both = e(ClassExpr::Some(ObjProp::Named(12), both));
+    let u_both = e(ClassExpr::Some(ObjProp::Named(13), both));
+    o.axioms = vec![
+        Axiom::SubObjectPropertyOf(vec![r, s], s),
+        Axiom::SubObjectPropertyOf(vec![s, r], r),
+        Axiom::SubClassOf(a, all),
+        Axiom::SubClassOf(b, all),
+        Axiom::SubClassOf(b, t_both),
+        Axiom::SubClassOf(a, u_both),
+        Axiom::SubClassOf(a, b),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let unsupported = normalise_with(&o, Options::default()).unsupported;
+    let mut left_out: Vec<usize> = unsupported.iter().map(|&(i, _)| i).collect();
+    left_out.sort_unstable();
+    if left_out != [2, 3, 4, 5] {
+        wrong.push(format!("irregular: {unsupported:?}"));
+    }
+    // `A ⊑ ∀R.C ⊔ ∀T.⊤` is a tautology: it takes nothing and stays, whatever is read first
+    // (Sol r1 S1 of the fix: the automaton `B` failed was taken before `∀T.⊤` was seen).
+    let mut o = Ontology::default();
+    let mut e = |x| ExprId(o.classes.intern(x));
+    let (r, s) = (ObjProp::Named(10), ObjProp::Named(11));
+    let (a, b, c) = (
+        e(ClassExpr::Class(1)),
+        e(ClassExpr::Class(2)),
+        e(ClassExpr::Class(3)),
+    );
+    let thing = e(ClassExpr::Thing);
+    let all = e(ClassExpr::All(r, c));
+    let any = e(ClassExpr::All(ObjProp::Named(12), thing));
+    let either = e(ClassExpr::Or(vec![all, any]));
+    o.axioms = vec![
+        Axiom::SubObjectPropertyOf(vec![r, s], s),
+        Axiom::SubObjectPropertyOf(vec![s, r], r),
+        Axiom::SubClassOf(a, either),
+        Axiom::SubClassOf(b, all),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let unsupported = normalise_with(&o, Options::default()).unsupported;
+    let left_out: Vec<usize> = unsupported.iter().map(|&(i, _)| i).collect();
+    if left_out != [3] {
+        wrong.push(format!("tautology: {unsupported:?}"));
+    }
+    // `A ⊑ ≤ 0 T.(∃R.⊥)` and `B ⊑ ≤ 0 U.(∃R.⊥)` are tautologies too: the name of `∃R.⊥`
+    // needs no definition, so takes no automaton (Sol r2 S2). And a key over `R` with no
+    // named individual has no rule and takes nothing: only the keys' own mark (S3).
+    let mut o = Ontology::default();
+    let mut e = |x| ExprId(o.classes.intern(x));
+    let (a, b, c) = (
+        e(ClassExpr::Class(1)),
+        e(ClassExpr::Class(2)),
+        e(ClassExpr::Class(3)),
+    );
+    let nothing = e(ClassExpr::Nothing);
+    let none = e(ClassExpr::Some(r, nothing));
+    let t_none = e(ClassExpr::Max(0, ObjProp::Named(12), none));
+    let u_none = e(ClassExpr::Max(0, ObjProp::Named(13), none));
+    let some_c = e(ClassExpr::Some(r, c));
+    o.axioms = vec![
+        Axiom::SubObjectPropertyOf(vec![r, s], s),
+        Axiom::SubObjectPropertyOf(vec![s, r], r),
+        Axiom::SubClassOf(a, t_none),
+        Axiom::SubClassOf(b, u_none),
+        Axiom::HasKey(some_c, vec![r], Vec::new()),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let unsupported = normalise_with(&o, Options::default()).unsupported;
+    if unsupported
+        .iter()
+        .any(|&(i, why)| i != 4 || why.contains("irregular"))
+    {
+        wrong.push(format!("needed nothing: {unsupported:?}"));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Clause and key variables past `u16` (review A-1203): a key over 65,537 data properties
+/// or 65,536 object properties, and `⊤ ⊑ ∀p₀.A ⊔ … ⊔ ∀p₆₅₅₃₆.A`, need one variable more
+/// than a `u16` numbers, so two would be one. The normalisation leaves such an axiom out;
+/// one data property or universal fewer is normalised. (A key of 65,535 object properties,
+/// the last that fits, builds its rule in time quadratic in them: `variables`'s own test.)
+#[test]
+fn clauses_and_keys_past_u16_are_left_out() {
+    let key = |objects: u64, data: u64| {
+        let mut o = Ontology::default();
+        let thing = ExprId(o.classes.intern(ClassExpr::Thing));
+        let objects = (0..objects).map(|p| ObjProp::Named(1_000 + p)).collect();
+        let data = (0..data).map(|d| 200_000 + d).collect();
+        o.axioms = vec![Axiom::HasKey(thing, objects, data)];
+        o.sources = vec![Vec::new()];
+        o
+    };
+    let universals = |m: u64| {
+        let mut o = Ontology::default();
+        let mut e = |x| ExprId(o.classes.intern(x));
+        let (thing, a) = (e(ClassExpr::Thing), e(ClassExpr::Class(1)));
+        let alls = (0..m)
+            .map(|p| e(ClassExpr::All(ObjProp::Named(1_000 + p), a)))
+            .collect();
+        let or = e(ClassExpr::Or(alls));
+        o.axioms = vec![Axiom::SubClassOf(thing, or)];
+        o.sources = vec![Vec::new()];
+        o
+    };
+    let mut wrong = Vec::new();
+    for (what, o, too_wide) in [
+        ("a key of 65,536 data properties", key(0, 65_536), false),
+        ("a key of 65,537 data properties", key(0, 65_537), true),
+        ("65,537 universals", universals(65_537), true),
+        ("65,536 universals", universals(65_536), false),
+        ("a key of 65,536 object properties", key(65_536, 0), true),
+    ] {
+        let unsupported = normalise_with(&o, Options::default()).unsupported;
+        if unsupported
+            .iter()
+            .any(|(_, why)| why.contains("65535 variables"))
+            != too_wide
+        {
+            wrong.push(format!("{what}: {unsupported:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
