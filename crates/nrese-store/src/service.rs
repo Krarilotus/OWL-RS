@@ -998,7 +998,7 @@ impl StoreService {
     ) -> StoreResult<crate::PlannedQuery> {
         let memory = self.settings.query_envelope(prepared);
         let mut planned = plan_prepared(
-            &self.read_snapshot(prepared.access())?,
+            &self.read_snapshot_within(prepared.access(), &memory, cancellation)?,
             prepared,
             &self.settings,
             cancellation,
