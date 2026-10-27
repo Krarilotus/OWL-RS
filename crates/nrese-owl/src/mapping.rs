@@ -132,24 +132,12 @@ impl Ontology {
     pub fn named_individuals(&self) -> Vec<Term> {
         let mut out: Vec<Term> = Vec::new();
         for a in &self.axioms {
-            match a {
-                Axiom::Declaration(crate::model::EntityKind::NamedIndividual, t)
-                | Axiom::ClassAssertion(_, t)
-                | Axiom::DataPropertyAssertion(_, t, _)
-                | Axiom::NegativeDataPropertyAssertion(_, t, _) => out.push(*t),
-                Axiom::ObjectPropertyAssertion(_, a, b)
-                | Axiom::NegativeObjectPropertyAssertion(_, a, b) => out.extend([*a, *b]),
-                Axiom::SameIndividual(v) | Axiom::DifferentIndividuals(v) => out.extend(v),
-                _ => {}
+            if let Axiom::Declaration(crate::model::EntityKind::NamedIndividual, t) = a {
+                out.push(*t);
             }
+            out.extend(individuals(a));
         }
-        for id in 0..self.classes.len() as u32 {
-            match self.classes.get(id) {
-                ClassExpr::OneOf(v) => out.extend(v),
-                ClassExpr::HasValue(_, t) => out.push(*t),
-                _ => {}
-            }
-        }
+        out.extend(in_expressions(self));
         out.retain(|t| !self.anonymous.contains(t));
         out.sort_unstable();
         out.dedup();
@@ -176,13 +164,22 @@ pub fn read(statements: &[Statement], terms: &dyn Terms) -> Ontology {
 pub(crate) fn complete(ontology: &mut Ontology, terms: &dyn Terms) {
     crate::diagnostics::leave_out_reserved(ontology, terms);
     ontology.data = data_terms(ontology, terms);
-    ontology.anonymous = ontology
-        .axioms
-        .iter()
+    // Wherever a blank node stands for an individual, it is an anonymous one.
+    ontology.anonymous = (ontology.axioms.iter())
         .flat_map(individuals)
+        .chain(in_expressions(ontology))
         .filter(|&t| terms.kind(t) == TermKind::Blank)
         .collect();
     crate::diagnostics::check_global_restrictions(ontology);
+}
+
+/// The individuals class expressions name: in nominals and `hasValue`.
+pub(crate) fn in_expressions(ontology: &Ontology) -> impl Iterator<Item = Term> + '_ {
+    (0..ontology.classes.len() as u32).flat_map(|id| match ontology.classes.get(id) {
+        ClassExpr::OneOf(v) => v.clone(),
+        ClassExpr::HasValue(_, t) => vec![*t],
+        _ => Vec::new(),
+    })
 }
 
 /// The individuals an assertion is about.
@@ -960,10 +957,11 @@ impl<'a> Reader<'a> {
     fn nary(&mut self, node: Term, class: Term, triple: [Term; 3]) {
         let v = self.v;
         self.collected.clear();
+        let without = |what| Diagnostic::Malformed { node, what };
         if is(class, v.owl_all_disjoint_classes) {
             self.collect(triple);
             let Some(list) = self.one(node, v.owl_members) else {
-                return;
+                return self.report(without("an n-ary axiom without its members"));
             };
             if let Some(members) = self.list(list)
                 && let Some(classes) = self.classes(&members)
@@ -973,7 +971,7 @@ impl<'a> Reader<'a> {
         } else if is(class, v.owl_all_disjoint_properties) {
             self.collect(triple);
             let Some(list) = self.one(node, v.owl_members) else {
-                return;
+                return self.report(without("an n-ary axiom without its members"));
             };
             if let Some(members) = self.list(list) {
                 if members.iter().all(|&p| self.kind(p) == TermKind::Iri)
@@ -993,9 +991,10 @@ impl<'a> Reader<'a> {
             let list = self
                 .one(node, v.owl_members)
                 .or_else(|| self.one(node, v.owl_distinct_members));
-            if let Some(list) = list
-                && let Some(members) = self.list(list)
-            {
+            let Some(list) = list else {
+                return self.report(without("an n-ary axiom without its members"));
+            };
+            if let Some(members) = self.list(list) {
                 self.disjoint(Disjoint::Individuals(members), triple);
             }
         } else if is(class, v.owl_negative_property_assertion) {
@@ -1026,6 +1025,8 @@ impl<'a> Reader<'a> {
                     None => return,
                 };
                 self.add(axiom, triple);
+            } else {
+                self.report(without("a negative property assertion without its target"));
             }
         } else if is(class, v.owl_axiom) || is(class, v.owl_annotation) {
             // An annotated axiom's reification (the axiom itself is stated as well), or an
@@ -1082,7 +1083,12 @@ impl<'a> Reader<'a> {
                     .map(|&m| self.object_property(m))
                     .collect::<Option<Vec<_>>>()
             });
-            if let (Some(chain), Some(sup)) = (chain, self.object_property(s)) {
+            if chain.as_ref().is_some_and(Vec::is_empty) {
+                self.report(Diagnostic::Malformed {
+                    node: s,
+                    what: "a property chain without a property",
+                });
+            } else if let (Some(chain), Some(sup)) = (chain, self.object_property(s)) {
                 self.add(Axiom::SubObjectPropertyOf(chain, sup), triple);
             }
         } else if is(p, v.owl_equivalent_property) || is(p, v.owl_property_disjoint_with) {

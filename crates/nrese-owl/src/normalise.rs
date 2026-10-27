@@ -130,6 +130,10 @@ pub fn normalise_with(ontology: &Ontology, options: Options) -> Normalised {
             n.out.unsupported.push((index, UNIVERSAL));
             continue;
         }
+        if n.uncounted(axiom) {
+            n.out.unsupported.push((index, UNCOUNTED));
+            continue;
+        }
         n.axiom(index, axiom);
     }
     if let Some(r) = &rewritten {
@@ -158,6 +162,24 @@ const MAX_DISTRIBUTED: usize = 16;
 
 /// Why an axiom over a universal property is left out.
 const UNIVERSAL: &str = "the universal data property (owl:topDataProperty)";
+
+/// Why an axiom with a cardinality past `u32` in its negation is left out.
+const UNCOUNTED: &str = "a cardinality whose negation is past 4294967295";
+
+/// Why an axiom whose clause or key needs more variables than a `u16` numbers is left out.
+const TOO_WIDE: &str = "a clause or key with more than 65535 variables";
+
+/// `count` clause variables numbered from `*next` on; `next` moves past them. `None` where
+/// a `u16` doesn't number them all: two would be one.
+fn variables(next: &mut u32, count: usize) -> Option<Vec<u16>> {
+    let end = next.checked_add(u32::try_from(count).ok()?)?;
+    let numbers = (*next..end)
+        .map(u16::try_from)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    *next = end;
+    Some(numbers)
+}
 
 /// The roles equivalent to one, each with the inclusions that make it a subrole of it.
 type Members = Vec<(ObjProp, Vec<usize>)>;
@@ -424,6 +446,36 @@ impl<'a> Normaliser<'a> {
             return false;
         };
         crate::properties::mentions(self.ontology, axiom, &|t| t == top)
+    }
+
+    /// Whether `axiom` holds `≤ n` or `= n` whose negation `≥ n + 1` has no `u32` count,
+    /// directly or in a definition it unfolds.
+    fn uncounted(&self, axiom: &Axiom) -> bool {
+        let mut stack: Vec<ExprId> = (crate::diagnostics::expressions_of(axiom).into_iter())
+            .map(ExprId)
+            .collect();
+        let mut seen = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            match self.get(id) {
+                ClassExpr::Max(u32::MAX, ..)
+                | ClassExpr::Exact(u32::MAX, ..)
+                | ClassExpr::DataMax(u32::MAX, ..)
+                | ClassExpr::DataExact(u32::MAX, ..) => return true,
+                ClassExpr::Class(a) => stack.extend(self.unfolded.by_class.get(&a)),
+                ClassExpr::And(xs) | ClassExpr::Or(xs) => stack.extend(xs),
+                ClassExpr::Not(x)
+                | ClassExpr::Some(_, x)
+                | ClassExpr::All(_, x)
+                | ClassExpr::Min(_, _, x)
+                | ClassExpr::Max(_, _, x)
+                | ClassExpr::Exact(_, _, x) => stack.push(x),
+                _ => {}
+            }
+        }
+        false
     }
 
     /// The bottom properties relate nothing: `⊤ ⊑ ∀R.⊥` for the object property (a GCI,
@@ -704,6 +756,14 @@ impl<'a> Normaliser<'a> {
     /// the automaton) per non-simple key property. An edge alone missed `r(a, c)` from
     /// `r(a, b)`, `r(b, c)` with `r` transitive (HermiT reads edges too; Openllet doesn't).
     fn key(&mut self, index: usize, class: ExprId, objects: &[ObjProp], data: &[Term]) {
+        // A value per data property; a shared target per object property, after `y`.
+        let (Some(values), Some(targets)) = (
+            variables(&mut 0, data.len()),
+            variables(&mut 1, objects.len()),
+        ) else {
+            self.out.unsupported.push((index, TOO_WIDE));
+            return;
+        };
         let (x, y) = (Var::X, Var::Y(0));
         let mut body = Vec::new();
         let c = self.nnf(class);
@@ -716,15 +776,15 @@ impl<'a> Normaliser<'a> {
             body.push(BodyAtom::Concept(concept, x));
             body.push(BodyAtom::Concept(concept, y));
         }
-        for (j, &d) in data.iter().enumerate() {
-            let v = Var::V(j as u16);
+        for (&d, v) in data.iter().zip(values) {
+            let v = Var::V(v);
             body.push(BodyAtom::Data(d, x, v));
             body.push(BodyAtom::Data(d, y, v));
         }
         // Each object property's alternatives: its edges, or one reach name per named
         // individual.
         let mut alternatives: Vec<Vec<Vec<BodyAtom>>> = Vec::new();
-        for (i, &p) in objects.iter().enumerate() {
+        for (&p, target) in objects.iter().zip(targets) {
             if self.non_simple.contains(&p.named()) {
                 let mut each = Vec::new();
                 for z in self.ontology.named_individuals() {
@@ -735,7 +795,7 @@ impl<'a> Normaliser<'a> {
                 }
                 alternatives.push(each);
             } else {
-                let z = Var::Y(i as u16 + 1);
+                let z = Var::Y(target);
                 alternatives.push(vec![vec![Self::edge(p, x, z), Self::edge(p, y, z)]]);
             }
         }
@@ -901,7 +961,7 @@ impl<'a> Normaliser<'a> {
             })
             .flatten()
             .filter_map(|v| match v {
-                Var::Y(i) => Some(i + 1),
+                Var::Y(i) => Some(u32::from(i) + 1),
                 _ => None,
             })
             .max()
@@ -909,7 +969,7 @@ impl<'a> Normaliser<'a> {
         let mut next_v = body
             .iter()
             .filter_map(|b| match b {
-                BodyAtom::Data(_, _, Var::V(i)) => Some(i + 1),
+                BodyAtom::Data(_, _, Var::V(i)) => Some(u32::from(*i) + 1),
                 _ => None,
             })
             .max()
@@ -987,8 +1047,10 @@ impl<'a> Normaliser<'a> {
                         head.push(HeadAtom::Concept(Concept::Fresh(start), Var::X));
                         continue;
                     }
-                    let y = Var::Y(next_y);
-                    next_y += 1;
+                    let Some(ys) = variables(&mut next_y, 1) else {
+                        return self.out.unsupported.push((gci.source, TOO_WIDE));
+                    };
+                    let y = Var::Y(ys[0]);
                     body.push(Self::edge(r, Var::X, y));
                     self.at(c, y, &mut body, &mut head, gci.source);
                 }
@@ -1007,8 +1069,10 @@ impl<'a> Normaliser<'a> {
                         });
                         continue;
                     }
-                    let ys: Vec<Var> = (0..=n).map(|i| Var::Y(next_y + i as u16)).collect();
-                    next_y += n as u16 + 1;
+                    let Some(ys) = variables(&mut next_y, n as usize + 1) else {
+                        return self.out.unsupported.push((gci.source, TOO_WIDE));
+                    };
+                    let ys: Vec<Var> = ys.into_iter().map(Var::Y).collect();
                     for &y in &ys {
                         body.push(Self::edge(r, Var::X, y));
                         if let Some(concept) = filler {
@@ -1035,8 +1099,10 @@ impl<'a> Normaliser<'a> {
                     var: Var::X,
                 }),
                 ClassExpr::DataAll(d, r) => {
-                    let v = Var::V(next_v);
-                    next_v += 1;
+                    let Some(vs) = variables(&mut next_v, 1) else {
+                        return self.out.unsupported.push((gci.source, TOO_WIDE));
+                    };
+                    let v = Var::V(vs[0]);
                     body.push(BodyAtom::Data(d, Var::X, v));
                     head.push(HeadAtom::DataIn(r, v));
                 }
@@ -1049,8 +1115,10 @@ impl<'a> Normaliser<'a> {
                     })
                 }
                 ClassExpr::DataMax(n, d, r) => {
-                    let vs: Vec<Var> = (0..=n).map(|i| Var::V(next_v + i as u16)).collect();
-                    next_v += n as u16 + 1;
+                    let Some(vs) = variables(&mut next_v, n as usize + 1) else {
+                        return self.out.unsupported.push((gci.source, TOO_WIDE));
+                    };
+                    let vs: Vec<Var> = vs.into_iter().map(Var::V).collect();
                     let outside = self.range_not(r);
                     for &v in &vs {
                         body.push(BodyAtom::Data(d, Var::X, v));
@@ -1521,5 +1589,23 @@ impl<'a> Normaliser<'a> {
         out.classes = self.classes;
         out.ranges = self.ranges;
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::variables;
+
+    /// Guard (review A-1203): variables are numbered up to a `u16`'s last number, never past
+    /// it. A key's 65,535 shared targets after `y` fit, 65,536 don't; 65,536 values fit,
+    /// 65,537 don't; after the last number nothing does.
+    #[test]
+    fn variables_end_at_the_last_number_of_a_u16() {
+        let targets = variables(&mut 1, 65_535).expect("fits");
+        assert_eq!((targets[0], targets[targets.len() - 1]), (1, u16::MAX));
+        assert_eq!(variables(&mut 1, 65_536), None);
+        assert_eq!(variables(&mut 0, 65_536).map(|v| v.len()), Some(65_536));
+        assert_eq!(variables(&mut 0, 65_537), None);
+        assert_eq!(variables(&mut 65_536, 1), None);
     }
 }
