@@ -71,9 +71,10 @@ cap_gb = 16; est_min = 20
 | `rewrite`, `hangs`, `tracks` | what rewriting can express (`expressible`, `per-query`, `not-expressible`); comparator pairs known to hang (`"system:semantics" = "why"`, not run again); comparator settings tracks (defaults, best configuration) |
 | `guards` | the wins of docs/design/performance.md §0 the case measures |
 
-Areas: `cache`, `concurrency`, `dl`, `federation`, `geo`, `kernel`, `layout`, `load`,
+Areas: `access`, `cache`, `concurrency`, `dl`, `federation`, `geo`, `kernel`, `layout`, `load`,
 `maintenance`, `memory`, `operator`, `parse`, `plan`, `query`, `rdf12`, `reasoning`,
-`rules`, `service`, `shacl`, `text`, `vector`.
+`rules`, `service`, `shacl`, `text`, `vector`. `access` is reasoning under access control: what
+a restricted reader may see of the inferred statements.
 
 Paths in a perf-lab result: `reason.inferred`, `reason.rounds`, `reason.p50_ms`,
 `commits.p50_ms`, `commits.incremental`, `closure_after_commits.equal`, `loaded`, `load_s`,

@@ -408,7 +408,24 @@ mod tests {
     use nrese_store::{DlAnswers, DlConfig, DlConsistency, StoreMode};
 
     use super::super::source::KeyValueSource;
-    use super::{names, parse_dl, parse_store_mode};
+    use super::{names, parse_dl, parse_store_config, parse_store_mode};
+
+    /// Spec: docs/ops/config-reference.md, `reasoner.support_sets` (env
+    /// `NRESE_REASONING_SUPPORT_SETS`, default 16): the store keeps the value given, the
+    /// largest included (no statement has that many sets: the cap is off).
+    #[test]
+    fn the_support_sets_setting_reaches_the_store() {
+        let cap = |value: Option<&str>| {
+            let mut source = KeyValueSource::default();
+            if let Some(value) = value {
+                source.insert(names::REASONING_SUPPORT_SETS, value);
+            }
+            parse_store_config(&source).unwrap().support_sets
+        };
+        assert_eq!(cap(None), 16);
+        assert_eq!(cap(Some("4")), 4);
+        assert_eq!(cap(Some(usize::MAX.to_string().as_str())), usize::MAX);
+    }
 
     #[test]
     fn dl_settings_parse_and_unknown_values_are_errors() {

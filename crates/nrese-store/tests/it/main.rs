@@ -2,6 +2,8 @@
 //! file. Each file is a module; `support` holds what they share.
 
 mod support;
+#[path = "../../examples/perf_lab/support_family.rs"]
+mod support_family;
 
 mod backup_restore_tests;
 mod bulk_load_tests;
@@ -27,5 +29,6 @@ mod repository_catalog_tests;
 mod scope_tests;
 mod shacl_gate_tests;
 mod store_service_tests;
+mod support_cap_tests;
 mod user_rules_tests;
 mod write_path_tests;
