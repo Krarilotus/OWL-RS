@@ -12,7 +12,7 @@
 //! individual, that hold where a path along the property reaches it: the two individuals
 //! need one name of the property's group in common (`KeyRule::reach`).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use super::depset::DepSetId;
 use super::engine::{Engine, Lit, Step};
@@ -31,7 +31,11 @@ impl Engine<'_> {
         }
         let p = self.p;
         for key in &p.keys {
-            if self.apply_key(key)? {
+            // A step of the heap profile: what one key's evaluation holds (`tests/key_scratch.rs`).
+            nrese_exec::heap::begin_step();
+            let acted = self.apply_key(key);
+            nrese_exec::heap::end_step("dl: a key evaluated");
+            if acted? {
                 return Ok(true);
             }
         }
@@ -85,115 +89,135 @@ impl Engine<'_> {
         named.dedup();
         members.sort_unstable_by_key(|&(x, _)| x);
         members.dedup_by_key(|&mut (x, _)| x);
-        // Per member and non-simple property, the names of its group it has.
-        let held: Vec<Vec<Vec<(ConceptId, DepSetId)>>> = members
-            .iter()
-            .map(|&(x, _)| {
-                let g = &self.g;
-                let has = |&c: &ConceptId| g.concept(x, c).map(|f| (c, g.unary[f as usize].dep));
+        // Per member and non-simple property, the names of its group it has (a group has a
+        // name per named individual: the time is checked per member, here and below).
+        let mut held: Vec<Vec<Vec<(ConceptId, DepSetId)>>> = Vec::with_capacity(members.len());
+        for &(x, _) in &members {
+            self.check_time()?;
+            let g = &self.g;
+            let has = |&c: &ConceptId| g.concept(x, c).map(|f| (c, g.unary[f as usize].dep));
+            held.push(
                 key.reach
                     .iter()
                     .map(|group| group.iter().filter_map(has).collect())
-                    .collect()
-            })
-            .collect();
-        // The pairs: every two members, or with a non-simple property those with a name of
-        // its group in common (as many as a rule per named individual tried).
-        let shared: Option<BTreeSet<(usize, usize)>> = (!key.reach.is_empty()).then(|| {
-            let mut by_name: HashMap<ConceptId, Vec<usize>> = HashMap::new();
-            for (i, groups) in held.iter().enumerate() {
-                for &(c, _) in &groups[0] {
-                    by_name.entry(c).or_default().push(i);
-                }
+                    .collect(),
+            );
+        }
+        // Per name of the first non-simple property's group, the members that have it, in order.
+        let mut by_name: HashMap<ConceptId, Vec<usize>> = HashMap::new();
+        for (i, groups) in held.iter().enumerate() {
+            for &(c, _) in groups.first().into_iter().flatten() {
+                by_name.entry(c).or_default().push(i);
             }
-            let mut pairs = BTreeSet::new();
-            for at in by_name.values() {
-                for (k, &i) in at.iter().enumerate() {
-                    pairs.extend(at[k + 1..].iter().map(|&j| (i, j)));
-                }
-            }
-            pairs
-        });
+        }
+        // The scratch, charged before any pair is tried: linear in the members and their
+        // names, with the partners of one member at a time (every later member, or the
+        // buckets of its names), never one entry per pair. Storing the pairs came to 3 GB for
+        // 20,000 members that share a name (PR #48's review, F1).
         let n = members.len();
-        let pairs: Box<dyn Iterator<Item = (usize, usize)> + '_> = match &shared {
-            Some(pairs) => Box::new(pairs.iter().copied()),
-            None => Box::new((0..n).flat_map(move |i| (i + 1..n).map(move |j| (i, j)))),
-        };
-        'pairs: for (i, j) in pairs {
-            let ((x, dx), (y, dy)) = (members[i], members[j]);
-            let mut premise = self.deps.union(dx, dy);
-            // A name both have in each non-simple property's group.
-            for (hx, hy) in held[i].iter().zip(&held[j]) {
-                let common = hx
-                    .iter()
-                    .find_map(|&(c, d)| hy.iter().find(|&&(w, _)| w == c).map(|&(_, e)| (d, e)));
-                let Some((d, e)) = common else {
-                    continue 'pairs;
-                };
-                premise = self.deps.union(premise, d);
-                premise = self.deps.union(premise, e);
-            }
-            // A common named Pᵢ-neighbour for each object property.
-            for &role in &key.objects {
-                let ax = self.along(x, role, &named);
-                let ay = self.along(y, role, &named);
-                let common = ax
-                    .iter()
-                    .find_map(|&(z, d)| ay.iter().find(|&&(w, _)| w == z).map(|&(_, e)| (d, e)));
-                let Some((d, e)) = common else {
-                    continue 'pairs;
-                };
-                premise = self.deps.union(premise, d);
-                premise = self.deps.union(premise, e);
-            }
-            // Each combination of the Dⱼ-values of the two.
-            let mut values: Vec<Vec<ValuePair>> = Vec::new();
-            for &d in &key.data {
-                let role = RoleExpr {
-                    role: d,
-                    inverse: false,
-                };
-                let vx: Vec<(u32, DepSetId)> = self
-                    .g
-                    .out_edges(x)
-                    .filter(|(_, e)| e.role == role.role && self.g.live(e.to))
-                    .map(|(_, e)| (e.to, e.dep))
-                    .collect();
-                let vy: Vec<(u32, DepSetId)> = self
-                    .g
-                    .out_edges(y)
-                    .filter(|(_, e)| e.role == role.role && self.g.live(e.to))
-                    .map(|(_, e)| (e.to, e.dep))
-                    .collect();
-                if vx.is_empty() || vy.is_empty() {
-                    continue 'pairs;
-                }
-                let mut pairs = Vec::new();
-                for &a in &vx {
-                    for &b in &vy {
-                        pairs.push((a, b));
+        let names: usize = held.iter().flatten().map(Vec::len).sum();
+        let in_buckets: usize = by_name.values().map(Vec::len).sum();
+        let scratch = named.capacity() * size_of::<u32>()
+            + members.capacity() * size_of::<(u32, DepSetId)>()
+            + held.len() * (key.reach.len() + 1) * size_of::<Vec<()>>()
+            + names * size_of::<(ConceptId, DepSetId)>()
+            + crate::memory::table(by_name.len(), size_of::<(ConceptId, Vec<usize>)>())
+            + (in_buckets + n.max(in_buckets)) * size_of::<usize>();
+        self.check_memory_with(scratch)?;
+        let mut partners: Vec<usize> = Vec::new();
+        for i in 0..n {
+            self.check_time()?;
+            // i's pairs, each once: every later member, or with a non-simple property the later
+            // ones with a name of its first group in common (as many as a rule per named
+            // individual tried).
+            partners.clear();
+            match held[i].first() {
+                None => partners.extend(i + 1..n),
+                Some(own) => {
+                    for (c, _) in own {
+                        let at = &by_name[c];
+                        partners.extend_from_slice(&at[at.partition_point(|&j| j <= i)..]);
                     }
+                    partners.sort_unstable();
+                    partners.dedup();
                 }
-                values.push(pairs);
             }
-            // Every combination: x ≈ y or one pair of values differs.
-            let mut combination = vec![0usize; values.len()];
-            loop {
-                if self.key_instance(x, y, premise, &values, &combination, key.source)? {
-                    return Ok(true);
+            'pairs: for &j in &partners {
+                let ((x, dx), (y, dy)) = (members[i], members[j]);
+                let mut premise = self.deps.union(dx, dy);
+                // A name both have in each non-simple property's group.
+                for (hx, hy) in held[i].iter().zip(&held[j]) {
+                    let common = hx.iter().find_map(|&(c, d)| {
+                        hy.iter().find(|&&(w, _)| w == c).map(|&(_, e)| (d, e))
+                    });
+                    let Some((d, e)) = common else {
+                        continue 'pairs;
+                    };
+                    premise = self.deps.union(premise, d);
+                    premise = self.deps.union(premise, e);
                 }
-                // The next combination.
-                let mut k = 0;
-                loop {
-                    if k == values.len() {
+                // A common named Pᵢ-neighbour for each object property.
+                for &role in &key.objects {
+                    let ax = self.along(x, role, &named);
+                    let ay = self.along(y, role, &named);
+                    let common = ax.iter().find_map(|&(z, d)| {
+                        ay.iter().find(|&&(w, _)| w == z).map(|&(_, e)| (d, e))
+                    });
+                    let Some((d, e)) = common else {
+                        continue 'pairs;
+                    };
+                    premise = self.deps.union(premise, d);
+                    premise = self.deps.union(premise, e);
+                }
+                // Each combination of the Dⱼ-values of the two.
+                let mut values: Vec<Vec<ValuePair>> = Vec::new();
+                for &d in &key.data {
+                    let role = RoleExpr {
+                        role: d,
+                        inverse: false,
+                    };
+                    let vx: Vec<(u32, DepSetId)> = self
+                        .g
+                        .out_edges(x)
+                        .filter(|(_, e)| e.role == role.role && self.g.live(e.to))
+                        .map(|(_, e)| (e.to, e.dep))
+                        .collect();
+                    let vy: Vec<(u32, DepSetId)> = self
+                        .g
+                        .out_edges(y)
+                        .filter(|(_, e)| e.role == role.role && self.g.live(e.to))
+                        .map(|(_, e)| (e.to, e.dep))
+                        .collect();
+                    if vx.is_empty() || vy.is_empty() {
                         continue 'pairs;
                     }
-                    combination[k] += 1;
-                    if combination[k] < values[k].len() {
-                        break;
+                    let mut pairs = Vec::new();
+                    for &a in &vx {
+                        for &b in &vy {
+                            pairs.push((a, b));
+                        }
                     }
-                    combination[k] = 0;
-                    k += 1;
+                    values.push(pairs);
+                }
+                // Every combination: x ≈ y or one pair of values differs.
+                let mut combination = vec![0usize; values.len()];
+                loop {
+                    if self.key_instance(x, y, premise, &values, &combination, key.source)? {
+                        return Ok(true);
+                    }
+                    // The next combination.
+                    let mut k = 0;
+                    loop {
+                        if k == values.len() {
+                            continue 'pairs;
+                        }
+                        combination[k] += 1;
+                        if combination[k] < values[k].len() {
+                            break;
+                        }
+                        combination[k] = 0;
+                        k += 1;
+                    }
                 }
             }
         }
