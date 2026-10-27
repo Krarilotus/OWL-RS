@@ -16,7 +16,10 @@
 //! marked truncated: its kept sets are each a real derivation's, but maybe not all. A
 //! reader one of them fits sees the fact; a reader none fits sees it only if the fact is
 //! unmarked; for a marked one, [`closure_within`] decides, exactly. So the cap bounds the
-//! work and the memory, never what a reader sees.
+//! work and the memory, never what a reader sees. A second mark says whether a set other
+//! than one graph that asserts the fact may be missing ([`Annotation::beyond_own`]): a
+//! fact asserted in more graphs than the cap is marked truncated (its dependents may lack
+//! sets through it), but a reader who reads none of its graphs depends on the second only.
 //!
 //! After a change, [`update_support_sets`] recomputes only the facts it can affect (the
 //! forward closure of the facts it touched), from what the others keep: each starts
@@ -51,6 +54,11 @@ const MORSEL: usize = 4096;
 pub struct Annotation {
     pub sets: Vec<GraphSet>,
     pub truncated: bool,
+    /// Whether a set other than one graph that asserts the fact may be missing, here or in
+    /// a premise's: what a reader who reads none of those graphs depends on. Implies
+    /// `truncated`, which also marks a fact whose own graphs alone pass the cap (and passes
+    /// to what is derived from it); equal to it for a fact only inferred.
+    pub beyond_own: bool,
 }
 
 impl Annotation {
@@ -59,6 +67,7 @@ impl Annotation {
         Self {
             sets: vec![GraphSet::default()],
             truncated: false,
+            beyond_own: false,
         }
     }
 
@@ -231,30 +240,52 @@ impl Lookup for Recomputing<'_> {
 pub fn initial_sets(graphs: Vec<u32>, axiom: bool, cap: usize) -> Annotation {
     match axiom {
         true => Annotation::empty_set(),
-        false => minimal(graphs.into_iter().map(GraphSet::of).collect(), cap),
+        false => minimal(graphs.into_iter().map(GraphSet::of).collect(), cap, &|_| {
+            true
+        }),
     }
 }
 
 /// `sets` without those that contain another, the smallest first, at most `cap`; marked
-/// truncated if the cap left out a set that no kept one is contained in.
-fn minimal(mut sets: Vec<GraphSet>, cap: usize) -> Annotation {
+/// truncated if the cap left out a set that no kept one is contained in, and beyond its own
+/// graphs if one of those isn't `own` (one graph that asserts the fact).
+fn minimal(mut sets: Vec<GraphSet>, cap: usize, own: &dyn Fn(&GraphSet) -> bool) -> Annotation {
     sets.sort_unstable_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
     sets.dedup();
     let mut out: Vec<GraphSet> = Vec::new();
-    let mut truncated = false;
+    let (mut truncated, mut beyond_own) = (false, false);
     for set in sets {
         if out.iter().any(|kept| kept.is_subset(&set)) {
             continue;
         }
         if out.len() == cap {
             truncated = true;
-            break;
+            if !own(&set) {
+                beyond_own = true;
+                break;
+            }
+            continue;
         }
         out.push(set);
     }
     Annotation {
         sets: out,
         truncated,
+        beyond_own,
+    }
+}
+
+/// Whether a set is one graph that asserts `fact`, its graphs looked up once, when first
+/// asked ([`minimal`]'s `own`).
+fn own_graph_of(
+    fact: Triple,
+    graphs_of: &(dyn Fn(Triple) -> Vec<u32> + Sync),
+) -> impl Fn(&GraphSet) -> bool + '_ {
+    let graphs = std::cell::OnceCell::new();
+    move |set: &GraphSet| {
+        let mut members = set.graphs();
+        matches!((members.next(), members.next()), (Some(graph), None)
+            if graphs.get_or_init(|| graphs_of(fact)).contains(&graph))
     }
 }
 
@@ -296,7 +327,7 @@ pub fn support_sets(
             }
         }
         let from = grounding_sets(program, grounding, &sets, cap, &empty);
-        merge(&mut sets, fact, from, cap, &mut annotations);
+        merge(&mut sets, fact, from, cap, graphs_of, &mut annotations);
     }
     // The rules with their schema premises; transitivity as a rule here (the module's
     // closure has no instances to annotate).
@@ -466,12 +497,14 @@ pub fn support_sets(
             .filter_map(|w| {
                 let group = &found[w[0]..w[1]];
                 let fact = group[0].0;
-                let (kept, truncated) = sets
-                    .get(&fact)
-                    .map_or((&[][..], false), |a| (a.sets.as_slice(), a.truncated));
+                let (kept, truncated, beyond_own) =
+                    sets.get(&fact).map_or((&[][..], false, false), |a| {
+                        (a.sets.as_slice(), a.truncated, a.beyond_own)
+                    });
                 let marks = group.iter().any(|&(_, _, marked)| marked);
-                // Nothing new: every found set is covered by a kept one, no new mark.
-                if (truncated || !marks)
+                // Nothing new: every found set is covered by a kept one, no new mark (a
+                // derivation's mark is one beyond the head's own graphs, so both).
+                if (beyond_own || !marks)
                     && group
                         .iter()
                         .all(|(_, set, _)| kept.iter().any(|k| k.is_subset(set)))
@@ -480,9 +513,12 @@ pub fn support_sets(
                 }
                 let mut all = kept.to_vec();
                 all.extend(group.iter().map(|(_, set, _)| set.clone()));
-                let mut next = minimal(all, cap);
+                let mut next = minimal(all, cap, &own_graph_of(fact, graphs_of));
                 next.truncated |= truncated || marks;
-                (next.sets.as_slice() != kept || next.truncated != truncated)
+                next.beyond_own |= beyond_own || marks;
+                (next.sets.as_slice() != kept
+                    || next.truncated != truncated
+                    || next.beyond_own != beyond_own)
                     .then_some((fact, next))
             })
             .collect();
@@ -604,7 +640,7 @@ pub fn independently_derived<S: Source + Sync + ?Sized>(
 ) -> Result<Option<bool>, Stopped> {
     let derivable = Annotation {
         sets: vec![GraphSet::of(0)],
-        truncated: false,
+        ..Annotation::default()
     };
     let empty = Annotation::empty_set();
     let previous = |other: Triple| match axioms.binary_search(&other).is_ok() {
@@ -929,7 +965,7 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
     )?;
     let mut changed: Vec<Triple> = Vec::new();
     for (fact, from) in found {
-        if merge(&mut now, fact, from, cap, &mut annotations) {
+        if merge(&mut now, fact, from, cap, graphs_of, &mut annotations) {
             changed.push(fact);
         }
     }
@@ -983,7 +1019,7 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
             entry.sets.extend(from.sets);
         }
         for (fact, from) in by_fact {
-            if merge(&mut now, fact, from, cap, &mut annotations) {
+            if merge(&mut now, fact, from, cap, graphs_of, &mut annotations) {
                 changed.push(fact);
             }
         }
@@ -1059,8 +1095,10 @@ fn grounding_sets<L: Lookup + ?Sized>(
         truncated |= found.truncated;
         all.extend(found.sets);
     }
-    let mut out = minimal(all, cap);
+    // A derivation's sets: whatever they lack is beyond the head's own graphs.
+    let mut out = minimal(all, cap, &|_| false);
     out.truncated |= truncated;
+    out.beyond_own |= truncated;
     out
 }
 
@@ -1096,6 +1134,7 @@ fn premise_sets_from<L: Lookup + ?Sized>(
             return Annotation {
                 sets: vec![one],
                 truncated,
+                beyond_own: truncated,
             };
         }
     }
@@ -1111,8 +1150,9 @@ fn premise_sets_from<L: Lookup + ?Sized>(
             }
         }
         let truncated = product.truncated || own.truncated;
-        product = minimal(next, cap);
+        product = minimal(next, cap, &|_| false);
         product.truncated |= truncated;
+        product.beyond_own |= truncated;
     }
     // A premise without sets yet: the instance gives nothing now, whatever was cut.
     match product.is_empty() {
@@ -1121,20 +1161,22 @@ fn premise_sets_from<L: Lookup + ?Sized>(
     }
 }
 
-/// Adds `from` to `fact`'s sets, `annotations` following the heap bytes; whether its sets
-/// or its mark changed (either is news for the facts derived from it).
+/// Adds `from` (derivations of `fact`) to `fact`'s sets, `annotations` following the heap
+/// bytes; whether its sets or its marks changed (news for the facts derived from it).
 fn merge(
     sets: &mut HashMap<Triple, Annotation>,
     fact: Triple,
     from: Annotation,
     cap: usize,
+    graphs_of: &(dyn Fn(Triple) -> Vec<u32> + Sync),
     annotations: &mut usize,
 ) -> bool {
     let current = sets.entry(fact).or_default();
     let mut all = current.sets.clone();
     all.extend(from.sets);
-    let mut next = minimal(all, cap);
+    let mut next = minimal(all, cap, &own_graph_of(fact, graphs_of));
     next.truncated |= current.truncated || from.truncated;
+    next.beyond_own |= current.beyond_own || from.truncated;
     if next == *current {
         return false;
     }

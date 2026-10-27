@@ -608,12 +608,14 @@ impl SupportSets {
         };
         let previous = |fact: Triple| -> Annotation {
             match self.record(fact) {
+                // The record keeps one mark: the second taken to be as wide.
                 Record::Kept(entries, truncated) => Annotation {
                     sets: entries
                         .iter()
                         .map(|&(_, id)| self.sets.sets[id as usize].clone())
                         .collect(),
                     truncated,
+                    beyond_own: truncated,
                 },
                 Record::Own => self.initial(fact, graphs_of(fact), cap),
             }
@@ -1212,10 +1214,12 @@ fn patched(
     Ok(next)
 }
 
-/// Whether `found` are the sets a fact starts with and all of them: the empty set for an
-/// axiom, else one per graph that holds it (`holds` of them, `own` telling which),
-/// unmarked. A fact the cap cut is recorded however its kept sets look: a set it left out
-/// may lie in a reader's graphs ([`SupportSets::split`]). Allocates nothing.
+/// Whether `found` are the sets a fact starts with and all that matter: the empty set for
+/// an axiom, else one per graph that holds it (`holds` of them, at most `cap`, `own`
+/// telling which), with no set beyond those graphs left out. A fact the cap cut beyond its
+/// own graphs is recorded however its kept sets look: a set it left out may lie in a
+/// reader's graphs ([`SupportSets::split`]). One the cap cut only among its own graphs
+/// isn't: a reader who reads none of them derives it from none. Allocates nothing.
 fn starts_with(
     found: &Annotation,
     axiom: bool,
@@ -1226,9 +1230,8 @@ fn starts_with(
     if axiom {
         return !found.truncated && found.sets.len() == 1 && found.sets[0].is_empty();
     }
-    !found.truncated
-        && holds <= cap
-        && found.sets.len() == holds
+    !found.beyond_own
+        && found.sets.len() == holds.min(cap)
         && found.sets.iter().all(|set| {
             let mut members = set.graphs();
             matches!((members.next(), members.next()), (Some(graph), None) if own(graph))

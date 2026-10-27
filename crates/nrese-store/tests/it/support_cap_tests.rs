@@ -203,6 +203,33 @@ fn readers_equal_the_oracle_at_every_cap() {
     }
 }
 
+/// Spec: config.rs (`StoreConfig::support_sets`): the cap bounds memory and work, not what
+/// readers see, also for a statement asserted in more graphs than the cap. `ex:x a ex:D` is
+/// asserted in two graphs (a cap of 1 keeps one), and follows from `ex:x a ex:C` in a third
+/// with `C ⊑ D` (a set the cap leaves out, past the two single graphs): the reader of that
+/// third graph, who reads neither asserting graph, sees it as the oracle does, at caps 1, 2
+/// and off.
+#[test]
+fn a_statement_its_own_graphs_put_past_the_cap_is_still_derived() {
+    let derives = format!("{EX}derives");
+    let quads = vec![
+        Quad::typed("x", "D", Some(&format!("{EX}own-1"))),
+        Quad::typed("x", "D", Some(&format!("{EX}own-2"))),
+        Quad::typed("x", "C", Some(derives.as_str())),
+        Quad::sub_class("C", "D", None),
+    ];
+    let (readable, probe) = ([derives], format!("{EX}x"));
+    assert_eq!(oracle(&quads, &readable, &probe), (true, 1));
+    for cap in [1, 2, EXACT] {
+        let store = store(&quads, capped(cap));
+        assert_eq!(
+            answers(&store, &reader(&readable), &probe),
+            (true, 1),
+            "cap {cap}"
+        );
+    }
+}
+
 /// C-310's witness: `ex:x a ex:D` follows from two graphs the reader may read (`ex:x a ex:C`
 /// in one, the schema in the other); 16 graphs it may not read each hold `ex:yi owl:sameAs
 /// ex:x` and `ex:yi a ex:D`, a support of one graph, smaller than the reader's. The reader's
