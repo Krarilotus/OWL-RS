@@ -1303,7 +1303,9 @@ def samples(case: dict, result: dict) -> dict:
             if value is not None:
                 series.setdefault(r.get("_sweep") or "-", []).append(value * scale)
         return series
-    if result.get("phase_samples") and any(result["phase_samples"].values()):
+    # The DL tools' series are their phases (case_manifest plans them so); a perf lab's phases
+    # (its support mode) are not its series: those are the metric's (`_`) or the sweep's.
+    if case.get("tool", "perf_lab") != "perf_lab" and result.get("phase_samples") and any(result["phase_samples"].values()):
         return {k: v for k, v in result["phase_samples"].items() if v}
     if metric == "cold_ms":
         return cold_series(result, detailed=True)

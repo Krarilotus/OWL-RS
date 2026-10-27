@@ -66,6 +66,32 @@ class Rows(unittest.TestCase):
                          {("nrese", "support-stress", "copies-8", "query", "2026-10-27T01:02")})
 
 
+class Series(unittest.TestCase):
+    """Spec: abba.py and the release gate need samples of every series the catalogue plans for
+    a case (fast.case_manifest, declared before any result); the case runner keeps a perf lab
+    run's samples by fast.samples (O4's timing: support-copies-17 had none of `_`)."""
+
+    maxDiff = None
+
+    def test_every_planned_series_is_filled_warm_and_cold_or_warm_only(self):
+        catalog = cases.load()
+        planned = fast.case_manifest(catalog)["series"]
+        phases = ("sets", "view", "first_read", "commit_1", "read_1", "commit_2", "read_2")
+        empty = []
+        for case in (c for c in catalog if c.get("workload") == "support-stress"):
+            sweep = case.get("sweep", [[]])
+            for modes in (["warm", "cold"], ["warm"]):
+                # Each invocation's perf lab report as measure() keeps it: the last, with every
+                # invocation's in `_repeats` where there are several.
+                runs = [{"support": {"first": {"read_ms": 1.0}}, "phase_samples": {p: [1.0] for p in phases},
+                         "_sweep": " ".join(sweep[i["sweep"]]), "_page_cache": i["cache"]}
+                        for i in fast.invocation_plan(case, modes)]
+                result = {**runs[-1], **({"_repeats": runs} if len(runs) > 1 else {})}
+                got = fast.samples(case, result)
+                empty += [f"{case['name']} {'+'.join(modes)}: {s}" for s in planned[case["name"]] if not got.get(s)]
+        self.assertEqual(empty, [])
+
+
 class Qualification(unittest.TestCase):
     """Spec: StoreConfig::support_sets keeps that many sets per statement, so at a cap of at
     least an input's sets per target nothing is hidden and a reader's answers are the oracle's
