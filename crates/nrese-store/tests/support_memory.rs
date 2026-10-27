@@ -41,6 +41,7 @@ fn evaluation(facts: u64) -> Evaluation {
                     pair(g, (g + 3) % GRAPHS),
                 ],
                 truncated: i % 4 == 0,
+                beyond_own: i % 4 == 0,
             },
         );
         let fact = [1, 3, 1_000 + i];
@@ -49,6 +50,7 @@ fn evaluation(facts: u64) -> Evaluation {
             Annotation {
                 sets: vec![GraphSet::of(g)],
                 truncated: false,
+                beyond_own: false,
             },
         );
         asserted.push((fact, g));
