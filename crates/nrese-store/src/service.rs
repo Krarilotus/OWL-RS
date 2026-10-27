@@ -1112,7 +1112,13 @@ impl StoreService {
         cancellation: &CancellationToken,
         read: impl FnOnce(&nrese_engine::Snapshot) -> StoreResult<T>,
     ) -> StoreResult<T> {
-        if let Some(view) = self.sessions.view(&self.engine.snapshot(), scope, pending) {
+        // The rules the view is decided under, read before it is made: one made under later
+        // rules is kept as of these, never the reverse.
+        let epoch = self.supports.epoch();
+        if let Some(view) = self
+            .sessions
+            .view(&self.engine.snapshot(), scope, pending, epoch)
+        {
             return read(&view);
         }
         // Never committed: no writer slot, so other clients commit meanwhile. The operations
@@ -1171,8 +1177,14 @@ impl StoreService {
             }
             _ => tx.pending_snapshot(),
         };
-        self.sessions
-            .keep_view(tx.base().clone(), scope, pending, view.clone());
+        self.sessions.keep_view(
+            tx.base().clone(),
+            scope,
+            pending,
+            view.clone(),
+            epoch,
+            self.supports.epoch(),
+        );
         read(&view)
     }
 

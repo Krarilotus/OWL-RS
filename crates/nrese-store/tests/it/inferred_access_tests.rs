@@ -485,6 +485,46 @@ fn without_rules_nothing_inferred_is_shown() {
     assert_eq!(classes(&store, &reader(false), "a"), ["<D>", "<E>", "<F>"]);
 }
 
+/// A read inside a session answers by the rules in place, as one outside it does
+/// (`without_rules_nothing_inferred_is_shown`; review of O4's fix round, S1): the session's
+/// kept view of its first read is no answer once the rules are switched off. A supported
+/// reader asks for `ex:a a ex:D` inside a session with one unrelated operation, before and
+/// after; outside the session it is no longer shown, and inside it neither.
+#[test]
+fn a_session_read_follows_a_change_of_the_rules() {
+    use nrese_store::{CancellationToken, PreparedQuery, StatementOp, StatementsRequest};
+    let store = store();
+    let sessions = store.sessions();
+    let id = sessions.begin(None).unwrap();
+    assert!(sessions.add(
+        &id,
+        None,
+        vec![StatementOp::Update(SparqlUpdateRequest::new(format!(
+            "PREFIX ex: <{EX}> INSERT DATA {{ GRAPH ex:open {{ ex:z a ex:Z }} }}"
+        )))]
+    ));
+    let in_session = StatementsRequest {
+        ops: sessions.pending(&id, None).unwrap(),
+        session: Some(id.clone()),
+    };
+    let ask = |pending: &StatementsRequest| {
+        let prepared = PreparedQuery::parse(&SparqlQueryRequest::new(
+            format!("PREFIX ex: <{EX}> ASK {{ ex:a a ex:D }}"),
+            reader(true),
+        ))
+        .unwrap();
+        let mut out = Vec::new();
+        store
+            .run_query_pending(pending, &prepared, &CancellationToken::new(), &mut out)
+            .unwrap();
+        String::from_utf8(out).unwrap().contains("true")
+    };
+    assert!(ask(&in_session), "derived under the rules");
+    store.use_reasoning_rules(None);
+    assert!(!ask(&StatementsRequest::default()), "outside the session");
+    assert!(!ask(&in_session), "inside the session");
+}
+
 /// Commits through the mutation pipeline update the sets instead of computing them
 /// afresh: after every commit, a reader sees what a store forced to compute them sees,
 /// and so does a reader of a store that keeps one set per statement (the cap's marks

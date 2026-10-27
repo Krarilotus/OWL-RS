@@ -1679,6 +1679,12 @@ impl Supports {
         &self.kept
     }
 
+    /// How many times the rules were set ([`Self::use_rules`]): what a read decided under
+    /// them, a session's kept view included ([`crate::sessions`]), holds while it is the same.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.state().generation.epoch
+    }
+
     /// Whether readers used sets since the rules were set.
     pub(crate) fn in_use(&self) -> bool {
         self.in_use.load(std::sync::atomic::Ordering::Relaxed)
