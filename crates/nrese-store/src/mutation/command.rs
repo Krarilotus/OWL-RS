@@ -244,14 +244,13 @@ pub(crate) fn apply_sparql_update(
         &request.using_named_graphs,
     )?;
     let options = context.update_options(requester, using);
-    apply_update(tx, &update, &options).map_err(|error| match error {
-        nrese_sparql::UpdateError::Forbidden(graph) => crate::Refusal::Write(graph).into(),
-        // A memory refusal of its WHERE as its reader may be told it: a scan of graphs a
-        // reader of some may not read sized what it held and asked for (round 13, R13-diag;
-        // the queries' own, `StoreService::run_reporting`).
-        error if requester.read.reads_everything() => error.into(),
-        error => StoreError::from(error).without_amounts(),
-    })
+    // Its WHERE's memory refusal as its reader may be told it (`ReadScope::told`).
+    requester.read.told(
+        apply_update(tx, &update, &options).map_err(|error| match error {
+            nrese_sparql::UpdateError::Forbidden(graph) => crate::Refusal::Write(graph).into(),
+            error => StoreError::from(error),
+        }),
+    )
 }
 
 impl MutationCommitReport {

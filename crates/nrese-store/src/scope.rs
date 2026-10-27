@@ -55,6 +55,17 @@ impl ReadScope {
             Self::Graphs(_) => Err(Refusal::ReadAll(what.to_owned()).into()),
         }
     }
+
+    /// `result` as this read's requester may be told it, the one boundary every read and
+    /// update entry point returns through. A reader of every graph is told everything; a
+    /// reader of some, a memory refusal's kind and limit but not the bytes held and asked
+    /// for, which a scan of graphs it may not read can size (round 13, R13-diag).
+    pub(crate) fn told<T>(&self, result: StoreResult<T>) -> StoreResult<T> {
+        match result {
+            Err(error) if !self.reads_everything() => Err(error.without_amounts()),
+            result => result,
+        }
+    }
 }
 
 /// The graphs a write may change.
