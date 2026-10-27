@@ -217,7 +217,7 @@ pub(crate) fn check_global_restrictions(ontology: &mut Ontology) {
 }
 
 /// The class expressions an axiom holds directly.
-pub(crate) fn expressions_of(axiom: &Axiom) -> Vec<u32> {
+fn expressions_of(axiom: &Axiom) -> Vec<u32> {
     match axiom {
         Axiom::SubClassOf(a, b) => vec![a.0, b.0],
         Axiom::EquivalentClasses(xs) | Axiom::DisjointClasses(xs) => {
