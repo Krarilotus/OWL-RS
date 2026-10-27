@@ -482,8 +482,10 @@ fn a_pending_read_charges_its_view_to_the_query() {
 /// boundary round, S2). Cold, the base's view stops at its first round, so nothing of it is
 /// made. With the base's view made, what the operations leave of it isn't gathered either, so
 /// the read isn't refused for that list's memory instead (64 KiB, which the list passes:
-/// `a_pending_read_charges_its_view_to_the_query`). 5,000 facts in the reader's graph give
-/// its view sets to compute; the transaction holds one RDF4J `ADD`.
+/// `a_pending_read_charges_its_view_to_the_query`). With the sets made, a reader of other
+/// graphs, whose view is new, doesn't build it either, nor charge for it (Sol's round 3).
+/// 5,000 facts in the reader's graph give its view sets to compute; the transaction holds
+/// one RDF4J `ADD`.
 #[test]
 fn a_cancelled_pending_read_fails_and_keeps_no_view() {
     use nrese_store::{
@@ -509,8 +511,8 @@ fn a_cancelled_pending_read_fails_and_keeps_no_view() {
         },
         contexts: Vec::new(),
     }]);
-    let ask = |cancellation: &CancellationToken, limit: Option<usize>| {
-        let mut request = SparqlQueryRequest::new("ASK {}", reader(true));
+    let ask = |scope: ReadScope, cancellation: &CancellationToken, limit: Option<usize>| {
+        let mut request = SparqlQueryRequest::new("ASK {}", scope);
         request.memory_limit = limit;
         let prepared = PreparedQuery::parse(&request).unwrap();
         store.run_query_pending(&pending, &prepared, cancellation, &mut Vec::new())
@@ -526,19 +528,38 @@ fn a_cancelled_pending_read_fails_and_keeps_no_view() {
         )
     };
     let cold = store.support_statistics();
-    let result = ask(&cancelled, None);
+    let result = ask(reader(true), &cancelled, None);
     assert!(is_cancelled(&result), "cold: {result:?}");
     assert_eq!(store.support_statistics(), cold, "the view was computed");
-    // A read that runs makes the base's view.
-    let ran = ask(&CancellationToken::new(), None);
+    // A read that runs makes the sets and the base's view.
+    let ran = ask(reader(true), &CancellationToken::new(), None);
     assert!(ran.is_ok(), "{ran:?}");
     let made = store.support_statistics();
-    let result = ask(&cancelled, Some(64 * 1024));
+    let result = ask(reader(true), &cancelled, Some(64 * 1024));
     assert!(
         is_cancelled(&result),
         "with the base's view made: {result:?}"
     );
     assert_eq!(store.support_statistics(), made);
+    let other = ReadScope::Graphs(Arc::new(GraphAccess {
+        graphs: vec![format!("{EX}open"), format!("{EX}unused")],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..GraphAccess::default()
+    }));
+    let result = ask(other.clone(), &cancelled, None);
+    assert!(is_cancelled(&result), "a new reader: {result:?}");
+    assert_eq!(
+        store.support_statistics(),
+        made,
+        "a new reader's view was built"
+    );
+    let result = ask(other, &cancelled, Some(64 * 1024));
+    assert!(
+        is_cancelled(&result),
+        "a new reader within 64 KiB: {result:?}"
+    );
 }
 
 /// A planned read (EXPLAIN without running) charges the view it makes to its query's memory,
