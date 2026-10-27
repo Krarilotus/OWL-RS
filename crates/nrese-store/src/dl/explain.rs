@@ -14,9 +14,10 @@
 //!
 //! All tests, including final verification, share one deadline and cancellation token.
 //! Past `dl.explanation_tests` or `dl.timeout`, return a known-entailing set marked not `minimal`
-//! or `verified`; no fresh verification timeout is granted.
+//! or `verified`; no fresh verification timeout is granted. A first test that isn't decided
+//! leaves the explanation undecided, never "doesn't hold".
 
-use nrese_dl::limits::Deadline;
+use nrese_dl::limits::{Deadline, Limit};
 use std::time::Instant;
 
 use nrese_owl::{Axiom, Ontology, ProofGraph};
@@ -54,25 +55,27 @@ struct Search<'a> {
     background: Vec<usize>,
     tests: usize,
     deadline: Deadline,
-    spent: bool,
+    /// Why the search stopped short: the first budget it reached, or the first test the
+    /// engines didn't decide.
+    stopped: Option<String>,
 }
 
 impl Search<'_> {
     /// Whether the axioms `subset` (with the background) give the goal; a test past the
-    /// budget counts as "no" (so the axioms stay in), and marks the search spent.
+    /// budget, or one the engines don't decide, counts as "no" (so the axioms stay in), and
+    /// stops the search.
     fn holds(&mut self, subset: &[usize]) -> bool {
-        if self
-            .budget
-            .explanation_tests
-            .is_some_and(|most| self.tests >= most)
-            || self.deadline.passed()
-            || self
-                .budget
-                .cancel
-                .as_ref()
-                .is_some_and(|c| c.is_cancelled())
-        {
-            self.spent = true;
+        let cancel = self.budget.cancel.as_ref();
+        let stop = match self.budget.explanation_tests {
+            Some(most) if self.tests >= most => {
+                Some(Limit::ExplanationTests.reached(format!("{most} tests")))
+            }
+            _ if self.deadline.passed() => Some(Limit::Time.reached("no time left")),
+            _ if cancel.is_some_and(|c| c.is_cancelled()) => Some("cancelled".to_owned()),
+            _ => None,
+        };
+        if let Some(why) = stop {
+            self.stopped.get_or_insert(why);
             return false;
         }
         self.tests += 1;
@@ -90,16 +93,16 @@ impl Search<'_> {
             Goal::Inconsistent => match consistency::check(&o, &budget).verdict {
                 Verdict::Inconsistent => true,
                 Verdict::Consistent => false,
-                Verdict::Unknown(_) => {
-                    self.spent = true;
+                Verdict::Unknown(why) => {
+                    self.stopped.get_or_insert(why);
                     false
                 }
             },
             Goal::Entails(axiom) => match entailment::entails(&o, axiom, self.fresh, &budget) {
                 Entailed::Yes => true,
                 Entailed::No => false,
-                Entailed::Unknown(_) => {
-                    self.spent = true;
+                Entailed::Unknown(why) => {
+                    self.stopped.get_or_insert(why);
                     false
                 }
             },
@@ -112,7 +115,7 @@ impl Search<'_> {
         if tested && self.holds(base) {
             return Vec::new();
         }
-        if self.spent {
+        if self.stopped.is_some() {
             return candidates.to_vec();
         }
         if candidates.len() == 1 {
@@ -131,7 +134,7 @@ impl Search<'_> {
     /// Verify with the time and test count still left, or return the full set whose
     /// entailment was established before minimisation. Never restart a spent search.
     fn finish(&mut self, candidates: Vec<usize>, mut axioms: Vec<usize>) -> Justification {
-        let mut minimal = !self.spent;
+        let mut minimal = self.stopped.is_none();
         let verified = self.holds(&axioms);
         if !verified {
             axioms = candidates;
@@ -150,16 +153,16 @@ impl Search<'_> {
     }
 }
 
-/// A justification of `goal` in `ontology`, or `None` where it doesn't hold (or that
-/// can't be decided within the budget). All nested checks and verification use the
-/// caller's absolute deadline.
+/// A justification of `goal` in `ontology`, `None` where it doesn't hold, or why that
+/// wasn't decided: the first test, with every axiom, stopped at a budget or the engines
+/// didn't decide it. All nested checks and verification use the caller's absolute deadline.
 pub(crate) fn justify(
     ontology: &Ontology,
     goal: &Goal,
     fresh: &[u64],
     budget: &Budget,
     deadline: Deadline,
-) -> Option<Justification> {
+) -> Result<Option<Justification>, String> {
     let (background, candidates): (Vec<usize>, Vec<usize>) = (0..ontology.axioms.len())
         .partition(|&i| matches!(ontology.axioms[i], Axiom::Declaration(..)));
     let mut search = Search {
@@ -170,16 +173,16 @@ pub(crate) fn justify(
         background,
         tests: 0,
         deadline,
-        spent: false,
+        stopped: None,
     };
     if !search.holds(&candidates) {
-        return None;
+        return search.stopped.map_or(Ok(None), Err);
     }
     let axioms = match candidates.is_empty() {
         true => Vec::new(),
         false => search.qx(&[], false, &candidates),
     };
-    Some(search.finish(candidates, axioms))
+    Ok(Some(search.finish(candidates, axioms)))
 }
 
 /// An axiom of a justification, as the store holds it.
@@ -226,36 +229,54 @@ pub(crate) fn explained(
         .collect()
 }
 
+/// An explanation OWL 2 DL didn't decide, for `why`: an answer that can't be proven
+/// complete, never "doesn't hold".
+fn undecided(why: String) -> crate::StoreError {
+    let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
+    status.incomplete("dl", why);
+    crate::StoreError::Incomplete(Box::new(crate::IncompleteAnswer {
+        status,
+        unresolved: Vec::new(),
+    }))
+}
+
 impl crate::StoreService {
     /// Why the statement `subject predicate object` holds under OWL 2 DL: a minimal set
     /// of the asserted ontology's axioms entailing it, with where each was read from
-    /// (the module docs). `None` if it doesn't hold (or that wasn't decided), or the
-    /// reader doesn't see every graph (DL answers are only theirs). On a replica, `None`
-    /// where the entailment tests' terms haven't arrived.
+    /// (the module docs); `None` if it doesn't hold. [`crate::StoreError::Incomplete`]
+    /// where that isn't decided: the first entailment test stopped at a budget or the
+    /// engines didn't decide it, the statement isn't an OWL 2 DL axiom over the store's
+    /// terms, or a replica hasn't received the tests' terms yet. Refused to a reader who
+    /// doesn't see every graph (DL answers are only theirs).
     pub fn explain_dl(
         &self,
         scope: &crate::ReadScope,
         statement: [nrese_rdf::TermRef<'_>; 3],
-    ) -> Option<DlExplanation> {
+    ) -> crate::StoreResult<Option<DlExplanation>> {
         use nrese_engine::TermId;
         use nrese_rdf::NamedNodeRef;
-        if !matches!(scope, crate::ReadScope::All) {
-            return None;
-        }
+        // Before any term is looked up: the refusal is the same whatever the statement, so
+        // the reader can't tell a term of a hidden graph from one the store doesn't hold.
+        scope.require_all("an explanation under OWL 2 DL")?;
         let started = Instant::now();
         let snapshot = self.engine().snapshot();
         let [s, p, o] = statement.map(|t| snapshot.lookup(t).map(TermId::raw));
-        let (s, p, o) = (s?, p?, o?);
+        // A term the store doesn't hold can still be in an entailed statement (every
+        // individual is an owl:Thing); the tests have no id to ask with.
+        let (Some(s), Some(p), Some(o)) = (s, p, o) else {
+            return Err(undecided(
+                "the statement names a term the store doesn't hold".to_owned(),
+            ));
+        };
         let base = super::query::ontology_at(self, &snapshot);
         // The request's envelope: its copy of the premise, and the tests' engines.
         let memory = self.envelope(None);
         let mut scratch = nrese_dl::memory::Scratch::new(Some(&memory));
-        scratch
-            .charge(|| nrese_dl::memory::ontology_bytes(&base))
-            .ok()?;
+        scratch.charge(|| nrese_dl::memory::ontology_bytes(&base))?;
         let mut ontology = (*base).clone();
         let ids = super::query::Ids::of(&snapshot);
-        let axiom = super::query::ground_axiom(&mut ontology, &snapshot, [s, p, o], ids).ok()?;
+        let axiom = super::query::ground_axiom(&mut ontology, &snapshot, [s, p, o], ids)
+            .map_err(undecided)?;
         let tx = self.engine().speculative();
         let replica = self.dl().replica();
         let fresh: Vec<u64> = (0..super::source::FRESH)
@@ -267,7 +288,10 @@ impl crate::StoreService {
                 )
                 .map(TermId::raw)
             })
-            .collect::<Option<_>>()?;
+            .collect::<Option<_>>()
+            .ok_or_else(|| {
+                undecided("the replica hasn't received the entailment tests' terms yet".to_owned())
+            })?;
         let deadline = Deadline::after(self.config().dl.timeout);
         // An entailment oracle can contain several consistency checks. The shared
         // token also stops those inner tests at this operation's deadline.
@@ -279,19 +303,23 @@ impl crate::StoreService {
                 &super::gate::budget(self, Some(cancel), &memory),
                 deadline,
             )
-        })?;
+        })
+        .map_err(undecided)?;
+        let Some(justification) = justification else {
+            return Ok(None);
+        };
         let decode = |t: u64| {
             snapshot
                 .decode(TermId::from_raw(t))
                 .map_or_else(|| format!("#{t}"), |term| term.to_string())
         };
-        Some(DlExplanation {
+        Ok(Some(DlExplanation {
             axioms: explained(&ontology, &justification, &decode),
             minimal: justification.minimal,
             verified: justification.verified,
             tests: justification.tests,
             micros: started.elapsed().as_micros() as u64,
-        })
+        }))
     }
 }
 
@@ -325,7 +353,7 @@ mod tests {
                 background: Vec::new(),
                 tests: 0,
                 deadline: Deadline::after(budget.timeout),
-                spent: false,
+                stopped: None,
             };
             assert!(
                 search.holds(&[0]),

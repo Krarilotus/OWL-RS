@@ -253,8 +253,8 @@ fn plan_json(planned: &nrese_store::PlannedQuery) -> serde_json::Value {
     })
 }
 
-/// Query errors caused by the request are 400s; a cancelled evaluation is a timeout;
-/// anything else is the server's fault.
+/// Query errors caused by the request are 400s, a refusal by graph access a 403; a
+/// cancelled evaluation is a timeout; anything else is the server's fault.
 pub(crate) fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiError {
     match error {
         // The policy deadline cancels a query, and so may an operator
@@ -272,6 +272,8 @@ pub(crate) fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiEr
         error if error.is_memory_limit() => ApiError::payload_too_large(format!(
             "{error} (budgets.query_memory, NRESE_MAX_QUERY_MEMORY_BYTES)"
         )),
+        // Graph access refused it: a read of every graph by a reader of some.
+        error @ StoreError::Forbidden(_) => ApiError::forbidden(error.to_string()),
         error if error.is_request_error() => {
             policy.bad_request_for_sparql_parse_error(error.to_string())
         }

@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use nrese_sparql::GraphAccess;
 use nrese_store::{
-    DlConfig, MutationCommand, MutationError, MutationTicket, ReadScope, Requester,
-    SparqlUpdateRequest, WriteScope,
+    DlConfig, MutationCommand, MutationError, MutationTicket, ReadScope, Refusal, Requester,
+    SparqlUpdateRequest, StoreError, WriteScope,
 };
 
 use super::queries::query;
@@ -84,7 +84,8 @@ fn a_spent_classification_budget_leaves_the_reports_incomplete() {
 }
 
 /// Explanations: a justification the engines can't decide within the budget is no
-/// explanation (never a wrong one); with the budget, a minimal one.
+/// explanation, an undecided one (never a wrong one, nor "doesn't hold"); with the budget,
+/// a minimal one.
 #[test]
 fn a_spent_explanation_budget_gives_no_explanation() {
     let data = ":A owl:equivalentClass [ owl:unionOf ( :B :C ) ] . :B rdfs:subClassOf :D . \
@@ -106,10 +107,16 @@ fn a_spent_explanation_budget_gives_no_explanation() {
         ..DlConfig::default()
     });
     insert(&spent, data).expect("data");
-    assert!(statement(&spent).is_none());
+    let answer = statement(&spent);
+    assert!(
+        matches!(answer, Err(StoreError::Incomplete(_))),
+        "{answer:?}"
+    );
     let decided = pipeline();
     insert(&decided, data).expect("data");
-    let explained = statement(&decided).expect("an explanation");
+    let explained = statement(&decided)
+        .expect("decided")
+        .expect("an explanation");
     assert!(explained.minimal, "{explained:?}");
 }
 
@@ -124,7 +131,8 @@ fn open_reader() -> ReadScope {
     }))
 }
 
-/// Explanations: OWL 2 DL justifications are only for readers of every graph.
+/// Explanations: OWL 2 DL justifications are only for readers of every graph. Another
+/// reader is refused, the same for a term of a graph it can't read as for one in no graph.
 #[test]
 fn explanations_are_only_for_readers_of_every_graph() {
     let dl = pipeline();
@@ -140,8 +148,27 @@ fn explanations_are_only_for_readers_of_every_graph() {
         nrese_rdf::NamedNode::new_unchecked(format!("{EX}D")),
     );
     let statement = [w.as_ref().into(), ty.as_ref().into(), d.as_ref().into()];
-    assert!(dl.store().explain_dl(&ReadScope::All, statement).is_some());
-    assert!(dl.store().explain_dl(&open_reader(), statement).is_none());
+    assert!(matches!(
+        dl.store().explain_dl(&ReadScope::All, statement),
+        Ok(Some(_))
+    ));
+    // D is only in the secret graph; Missing is in none.
+    let missing = nrese_rdf::NamedNode::new_unchecked(format!("{EX}Missing"));
+    let hidden = dl.store().explain_dl(&open_reader(), statement);
+    let absent = dl.store().explain_dl(
+        &open_reader(),
+        [
+            w.as_ref().into(),
+            ty.as_ref().into(),
+            missing.as_ref().into(),
+        ],
+    );
+    let (Err(StoreError::Forbidden(hidden)), Err(StoreError::Forbidden(absent))) = (hidden, absent)
+    else {
+        panic!("refused to the open reader");
+    };
+    assert!(matches!(hidden, Refusal::ReadAll(_)), "{hidden:?}");
+    assert_eq!(hidden, absent);
 }
 
 /// Consistency on commit (and the islands deciding it): a committer who may read and

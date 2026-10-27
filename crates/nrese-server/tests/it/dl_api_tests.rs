@@ -119,3 +119,55 @@ async fn answers_carry_their_status() -> Result<(), Box<dyn std::error::Error>> 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     Ok(())
 }
+
+/// Spec (C-501): an OWL 2 DL explanation whose first entailment test a budget stops is
+/// undecided: 422, the incomplete-answer problem under owl2-dl with the budget as its
+/// reason, never a 404 (w a D holds: `answers_carry_their_status`).
+#[tokio::test]
+async fn an_undecided_dl_explanation_is_an_incomplete_answer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("union.ttl");
+    std::fs::write(&path, ONTOLOGY)?;
+    let app = test_app_with_store_config(
+        StoreConfig {
+            dl: nrese_store::DlConfig {
+                explanation_tests: Some(0),
+                ..Default::default()
+            },
+            ..StoreConfig::in_memory().with_ontology(path)
+        },
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
+    )?;
+    let explain = serde_urlencoded::to_string([
+        ("subj", "<http://example.com/w>"),
+        ("pred", "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>"),
+        ("obj", "<http://example.com/D>"),
+    ])?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/repositories/nrese/explain?{explain}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    let status = response.status();
+    let body = body_text(response).await?;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let problem: serde_json::Value = serde_json::from_str(&body)?;
+    assert_eq!(
+        problem["type"],
+        "https://nrese.dev/problems/incomplete-answer"
+    );
+    assert_eq!(problem["regime"], "owl2-dl");
+    let reasons = problem["reasons"].as_array().cloned().unwrap_or_default();
+    assert!(
+        reasons.iter().any(|r| r["source"] == "dl"
+            && r["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("dl.explanation_tests"))),
+        "{body}"
+    );
+    Ok(())
+}

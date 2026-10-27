@@ -80,8 +80,9 @@ pub enum StoreError {
     /// ([`crate::quarantine`]).
     #[error("{0}")]
     Quarantine(String),
-    /// Under `owl2-dl` with exact answers asked for (`dl.answers = exact`): the store
-    /// can't prove the answers complete, for the reasons given.
+    /// Under `owl2-dl` with exact answers asked for (`dl.answers = exact`), or for an OWL 2
+    /// DL explanation that wasn't decided: the store can't prove the answers complete, for
+    /// the reasons given.
     #[error("the answers can't be proven complete under OWL 2 DL: {0}")]
     Incomplete(Box<IncompleteAnswer>),
     /// Graph-level access control refused the request; nothing of it is applied.

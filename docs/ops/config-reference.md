@@ -256,7 +256,7 @@ api_key = "replace-me"
     | `dl.max_nodes` (`NRESE_DL_MAX_NODES`) | none | A deterministic budget of one hypertableau run, for reproducible runs and tests; time and memory bound a run otherwise |
     | `dl.max_branch_points` (`NRESE_DL_MAX_BRANCH_POINTS`) | none | As `dl.max_nodes`: so that a decision doesn't depend on the machine's speed where that matters |
     | `dl.max_merges` (`NRESE_DL_MAX_MERGES`) | none | As `dl.max_nodes`, for a search whose work is merging |
-    | `dl.explanation_tests` (`NRESE_DL_EXPLANATION_TESTS`) | none | The entailment tests one explanation or a rejection's evidence runs; past them the justification is known-entailing, not minimal. `dl.timeout` bounds it otherwise |
+    | `dl.explanation_tests` (`NRESE_DL_EXPLANATION_TESTS`) | none | The entailment tests one explanation or a rejection's evidence runs; past them the justification is known-entailing, not minimal (an explanation is undecided if none could run). `dl.timeout` bounds it otherwise |
     | `dl.lower_bound_timeout` (`NRESE_DL_LOWER_BOUND_TIMEOUT_MS`) | 60s | A route threshold, not a budget: past it a classification's Horn lower bound stops and the hypertableau tests the classes; never more than half of what is left of `dl.timeout` (`unlimited`: only that half). 60 s because ORE's ore_ont_7127 (65 k classes) needs 3.9 s for it and then no test, where 65 k tests take 43 s |
     | `dl.max_join` (`NRESE_DL_MAX_JOIN`), `dl.max_join_steps` (`NRESE_DL_MAX_JOIN_STEPS`) | 1048576, 65536 | Route thresholds of the context core: a join past them goes to the hypertableau, which is cheaper there than finishing it (the ORE development set) |
 - with any mode but `disabled`:

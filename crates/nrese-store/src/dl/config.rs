@@ -91,7 +91,8 @@ pub struct DlConfig {
     /// The most merges one hypertableau run may make (`dl.max_merges`). Default none.
     pub max_merges: Option<u64>,
     /// The entailment tests one explanation runs at most (`dl.explanation_tests`); past
-    /// them the justification is known-entailing, not minimal. Default none.
+    /// them the justification is known-entailing, not minimal (undecided if none could
+    /// run). Default none.
     pub explanation_tests: Option<usize>,
     /// Route thresholds, not budgets: past them the work goes to the hypertableau, no
     /// answer is lost. The Horn lower bound's time in a classification
