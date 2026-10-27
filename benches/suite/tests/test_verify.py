@@ -296,6 +296,62 @@ class Provenance(unittest.TestCase):
         self.assertEqual(wrong, [], "SPEC provenance: --server-rev runs exactly the isolated builds")
 
 
+class AdmittedBytes(unittest.TestCase):
+    """What --server-rev runs is the build it admitted, whatever happens to bin-<sha12> after (PR
+    #47, fix check 1): a sweep can take the entry, and a builder from an older harness put another
+    commit's code there under this commit's REVISION with a valid checksum and no PROVENANCE, while
+    the record is read or before the server starts (and restarts, from the same command)."""
+
+    def test_what_runs_is_the_build_admitted_or_nothing(self):
+        revision = "0123456789ab" + "0" * 28
+        admitted, other = b"#!/bin/sh\n# this commit's code\n", b"#!/bin/sh\n# another commit's code\n"
+
+        def entry(build: Path, code: bytes, record: bool) -> None:
+            build.mkdir()
+            (build / "nrese-server").write_bytes(code)
+            digest = verify.sha256_of(build / "nrese-server")
+            (build / "SHA256SUMS").write_bytes(f"{digest}  nrese-server\n".encode())
+            (build / "REVISION").write_bytes(f"{revision}\n".encode())
+            if record:
+                isolated_build(build, revision, digest)
+
+        wrong = []
+        for when in ("while its record is read", "after it was chosen"):
+            root = Path(tempfile.mkdtemp(prefix="verify-admitted-"))
+            self.addCleanup(shutil.rmtree, root, True)
+            build = root / "bin-0123456789ab"
+            entry(build, admitted, True)
+            replaced = []
+
+            def replace():  # the sweep, then the older builder's publication
+                shutil.rmtree(build)
+                entry(build, other, False)
+                replaced.append(when)
+
+            read_text = Path.read_text
+
+            def reading(path, *args, **kwargs):
+                text = read_text(path, *args, **kwargs)
+                if path.name == "PROVENANCE" and when == "while its record is read" and not replaced:
+                    replace()
+                return text
+
+            original, verify.CACHE, Path.read_text = verify.CACHE, root, reading
+            try:
+                target = verify.target_of(argparse.Namespace(url=None, server_rev=revision, server=None))
+            except LaunchError:
+                target = None
+            finally:
+                verify.CACHE, Path.read_text = original, read_text
+            if when == "after it was chosen":
+                replace()
+            ran = Path(target["command"][0]).read_bytes() if target else None
+            if not replaced or ran not in (admitted, None) or (when == "after it was chosen" and ran is None):
+                wrong.append(f"{when}: {'nothing' if ran is None else 'another commit' if ran == other else ran}")
+        self.assertEqual(wrong, [], "SPEC provenance: what runs is the bytes admitted (or, while they "
+                                    "are read, nothing)")
+
+
 @unittest.skipUnless(shutil.which("flock") and shutil.which("bash"), "needs flock (Linux)")
 class Migration(unittest.TestCase):
     """build-on-host.sh's migration of /verify's old cache, the block as written: its lock file stays
