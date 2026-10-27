@@ -694,6 +694,8 @@ impl StoreService {
     /// ([`crate::dl`]; the answers are then completed before the first byte), else the
     /// OWL 2 QL rewriting's where it applies, else a ruleset closure's
     /// ([`Self::status_without_dl`]). One status, [`nrese_sparql::Completeness`].
+    /// A reader of some graphs who sees every inference is told `not-certified` where the
+    /// rewriting ran: its assessment reads the schema of every graph.
     pub fn run_query_reporting(
         &self,
         prepared: &PreparedQuery,
@@ -801,12 +803,13 @@ impl StoreService {
                 let status = ql
                     .map(|ql| ql.completeness.clone())
                     .or_else(|| self.status_without_dl(prepared));
+                // The cache's context is the whole assessment, not what the reader is told.
                 let context = format!("{status:?}");
-                report(status);
+                report(status_for_its_reader(prepared, status, ql.is_some()));
                 context
             },
         )?;
-        Ok((None, ql))
+        Ok((None, ql.filter(|_| !withholds_certification(prepared))))
     }
 
     /// Outside `owl2-dl`, the status of answers that read a ruleset's closure (`None`
@@ -877,6 +880,11 @@ impl StoreService {
                 explanation.steps.clear();
                 explanation.rewrites.clear();
                 explanation.decoded = 0;
+                certification_for_its_reader(
+                    prepared,
+                    &mut explanation.completeness,
+                    &mut explanation.ql,
+                );
             },
         )
     }
@@ -940,6 +948,7 @@ impl StoreService {
             |planned| {
                 planned.steps.clear();
                 planned.rewrites.clear();
+                certification_for_its_reader(prepared, &mut planned.completeness, &mut planned.ql);
             },
         )
     }
@@ -1167,7 +1176,7 @@ impl StoreService {
                         );
                     }
                     // A transaction's pending state: never answered from the cache.
-                    report(status);
+                    report(status_for_its_reader(prepared, status, ql.is_some()));
                     String::new()
                 },
             )
@@ -1774,13 +1783,51 @@ pub(crate) fn in_readable_graph(
     })
 }
 
+/// The status of its answers that `prepared`'s reader is told (round 13, R13-diag). A
+/// reader of some graphs who sees every inference (`inferred = "visible"`) is told
+/// `not-certified` wherever the OWL 2 QL rewriting ran: its assessment reads the schema of
+/// every graph. Whether the rewriting runs depends on the query and the configuration, not
+/// on the schema, so the token tells nothing of hidden data.
+fn status_for_its_reader(
+    prepared: &PreparedQuery,
+    status: Option<nrese_sparql::Completeness>,
+    rewritten: bool,
+) -> Option<nrese_sparql::Completeness> {
+    match rewritten && withholds_certification(prepared) {
+        true => Some(nrese_sparql::Completeness::not_certified()),
+        false => status,
+    }
+}
+
+/// [`status_for_its_reader`] for an answer that carries the rewriting's report too, as an
+/// EXPLAIN does: the status as its reader is told it, and no report where that is withheld.
+fn certification_for_its_reader(
+    prepared: &PreparedQuery,
+    completeness: &mut Option<nrese_sparql::Completeness>,
+    ql: &mut Option<nrese_sparql::ql::QlReport>,
+) {
+    *completeness = status_for_its_reader(prepared, completeness.take(), ql.is_some());
+    if withholds_certification(prepared) {
+        *ql = None;
+    }
+}
+
+/// Whether `prepared`'s reader is told no assessment of the rewriting, neither its status
+/// nor its report ([`status_for_its_reader`]).
+fn withholds_certification(prepared: &PreparedQuery) -> bool {
+    prepared
+        .access()
+        .is_some_and(|access| access.inferred && !access.inferred_by_support)
+}
+
 /// A run or an EXPLAIN of `prepared` as its reader may be told it (round 13, R13-diag). A
 /// reader of every graph is told everything. Another is told only what comes from its query
 /// and its answer: `redact` takes an EXPLAIN's operators (their estimates, the order and the
 /// operators those chose, their rows, the dictionary work they report, their times) and its
 /// rewrites (an estimate decides some, as eager aggregation), all read from statistics and
-/// scans of every graph; and a memory refusal goes through the scope's boundary
-/// ([`crate::ReadScope::told`]).
+/// scans of every graph, and its QL rewriting's status and report where they would read
+/// the schema of every graph ([`certification_for_its_reader`]); and a memory refusal goes
+/// through the scope's boundary ([`crate::ReadScope::told`]).
 fn for_its_reader<T>(
     prepared: &PreparedQuery,
     whole: StoreResult<T>,
