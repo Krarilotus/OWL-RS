@@ -1462,6 +1462,7 @@ impl StoreService {
                 &program,
                 self.config.hide_unnamed_classes,
                 self.config.equality_compact,
+                || crate::reasoning_state::nil_equated(&self.engine.snapshot()),
             )
         })
     }

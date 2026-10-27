@@ -27,6 +27,12 @@ pub struct ReasoningState {
     /// The inferred stack holds the closure over representatives of the `owl:sameAs`
     /// classes, which reads expand (`reasoner.equality = "compact"`).
     pub compact_equality: bool,
+    /// The closure reads lists through `rdf:nil`'s equality class, as the replacement rules
+    /// do (`nrese_reasoner::batch::Materialisation::nil_merged`): every state written since
+    /// 27 Oct 2026 except a compact stack's, which keeps the old reading. A state without it
+    /// is current only for data that doesn't equate `rdf:nil` with another term, so only a
+    /// store whose data does rebuilds, once.
+    pub nil_lists: bool,
 }
 
 /// Whether the stored data is consistent under the configured ruleset.
@@ -74,6 +80,33 @@ pub(crate) fn fingerprint(
         }
 }
 
+/// Whether `snapshot` equates `rdf:nil` with another term, asserted or inferred
+/// ([`ReasoningState::nil_lists`]).
+pub(crate) fn nil_equated(snapshot: &nrese_engine::Snapshot) -> bool {
+    use nrese_engine::{GraphSelector, QuadPattern, ReadModel};
+    use nrese_rdf::vocab::{owl, rdf};
+    let (Some(nil), Some(same_as)) = (
+        snapshot.lookup(rdf::NIL.into()),
+        snapshot.lookup(owl::SAME_AS.into()),
+    ) else {
+        return false;
+    };
+    let pattern = |subject, object| QuadPattern {
+        subject,
+        predicate: Some(same_as),
+        object,
+        graph: GraphSelector::Any,
+    };
+    [ReadModel::Asserted, ReadModel::Inferred]
+        .into_iter()
+        .any(|model| {
+            (snapshot.quads_for_pattern_in(model, &pattern(Some(nil), None)))
+                .any(|quad| quad.object != nil)
+                || (snapshot.quads_for_pattern_in(model, &pattern(None, Some(nil))))
+                    .any(|quad| quad.subject != nil)
+        })
+}
+
 impl ReasoningState {
     #[cfg(test)]
     pub(crate) fn of(program: &RuleProgram, violations: usize) -> Self {
@@ -91,25 +124,30 @@ impl ReasoningState {
             fingerprint: fingerprint(program, hide_unnamed_classes, compact_equality),
             violations,
             compact_equality,
+            nil_lists: !compact_equality,
         }
     }
 
-    /// Whether the inferred stack is exactly `program`'s closure of the asserted data.
+    /// Whether the inferred stack is exactly `program`'s closure of the asserted data. Not
+    /// knowing the data, a state without [`Self::nil_lists`] is taken as stale.
     pub fn is_current_for(&self, program: impl Into<RuleProgram>) -> bool {
-        self.is_current_with(&program.into(), false, false)
+        self.is_current_with(&program.into(), false, false, || true)
     }
 
-    /// [`Self::is_current_for`] with unnamed classes' memberships left out or not, and
-    /// equality stored compactly or not.
+    /// [`Self::is_current_for`] with unnamed classes' memberships left out or not and
+    /// equality stored compactly or not; `nil_equated` tells whether the data equates
+    /// `rdf:nil` with another term, asked only of a state without [`Self::nil_lists`].
     pub fn is_current_with(
         &self,
         program: &RuleProgram,
         hide_unnamed_classes: bool,
         compact_equality: bool,
+        nil_equated: impl FnOnce() -> bool,
     ) -> bool {
         self.ruleset == program.name()
             && self.fingerprint == fingerprint(program, hide_unnamed_classes, compact_equality)
             && self.compact_equality == compact_equality
+            && (compact_equality || self.nil_lists || !nil_equated())
     }
 
     pub fn consistency(&self) -> ConsistencyStatus {
@@ -128,6 +166,9 @@ impl ReasoningState {
         if self.compact_equality {
             text.push_str("equality compact\n");
         }
+        if self.nil_lists {
+            text.push_str("lists nil-class\n");
+        }
         text
     }
 
@@ -135,7 +176,7 @@ impl ReasoningState {
     /// marker that held only the ruleset name (the store then rematerialises once).
     pub(crate) fn from_text(text: &str) -> Option<Self> {
         let (mut ruleset, mut fingerprint, mut violations) = (None, None, None);
-        let mut compact_equality = false;
+        let (mut compact_equality, mut nil_lists) = (false, false);
         for line in text.lines() {
             let (key, value) = line.split_once(' ')?;
             match key {
@@ -143,6 +184,7 @@ impl ReasoningState {
                 "fingerprint" => fingerprint = u64::from_str_radix(value, 16).ok(),
                 "violations" => violations = value.parse().ok(),
                 "equality" => compact_equality = value == "compact",
+                "lists" => nil_lists = value == "nil-class",
                 _ => {}
             }
         }
@@ -151,6 +193,7 @@ impl ReasoningState {
             fingerprint: fingerprint?,
             violations: violations?,
             compact_equality,
+            nil_lists,
         })
     }
 }
@@ -182,5 +225,58 @@ mod tests {
             ..state
         };
         assert!(!stale.is_current_for(Ruleset::Owl2Rl));
+    }
+
+    /// A state written before [`ReasoningState::nil_lists`] stays current for a store whose
+    /// data doesn't equate `rdf:nil` with another term and is stale for one whose data does:
+    /// only that store rebuilds. A state written since stays current when a commit equates
+    /// it, so the next write doesn't rebuild.
+    #[test]
+    fn only_data_equating_nil_makes_an_older_state_stale() {
+        use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+        use std::sync::Arc;
+        let config = || ReasonerConfig::for_mode(ReasoningMode::Owl2Rl);
+        let program = config().materialised_program().unwrap();
+        for (other, older_is_current) in [
+            ("urn:m", true),
+            ("http://www.w3.org/1999/02/22-rdf-syntax-ns#nil", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let open = || {
+                let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir.path()));
+                crate::MutationPipeline::new(
+                    Arc::new(store.unwrap()),
+                    Arc::new(ReasonerService::new(config())),
+                )
+            };
+            let pipeline = open();
+            let update = format!(
+                "INSERT DATA {{ <urn:l> <http://www.w3.org/2002/07/owl#sameAs> <{other}> }}"
+            );
+            pipeline
+                .apply(
+                    crate::MutationCommand::Update(crate::SparqlUpdateRequest::new(update)),
+                    &crate::Requester::all(),
+                    &crate::MutationTicket::new(),
+                )
+                .unwrap();
+            let current = |pipeline: &crate::MutationPipeline| {
+                pipeline.store().reasoning_is_current(&program)
+            };
+            assert!(current(&pipeline), "{other}: a state written since");
+            drop(pipeline);
+            // As the store wrote it before.
+            let older = format!(
+                "ruleset {}\nfingerprint {:016x}\nviolations 0\n",
+                program.name(),
+                program.fingerprint()
+            );
+            std::fs::write(dir.path().join("reasoning.state"), older).unwrap();
+            assert_eq!(
+                current(&open()),
+                older_is_current,
+                "{other}: a state written before"
+            );
+        }
     }
 }
