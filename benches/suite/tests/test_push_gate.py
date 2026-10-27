@@ -1,7 +1,8 @@
 """The push gate (.githooks/pre-push, scripts/check.sh push, scripts/lib/fleet-gate.sh): a pushed
 commit is gated on the fleet, by its own tree and the files of the pushed range, and only a verified
 fleet result for exactly that tree lets it through. No verdict means no push: nothing runs here
-instead. A push of deletions alone has no tree to gate.
+instead. A push of deletions alone has no tree to gate. The merge check's Windows part
+(scripts/check.sh windows, scripts/lib/windows-job.sh) is gated the same way, on a Windows host.
 
 Run: python -m unittest discover -s benches/suite/tests -p test_push_gate.py
 An assertion tagged `SPEC <tag>` states the behaviour its test is for.
@@ -13,21 +14,24 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
 BASH = shutil.which("bash")
 # Run from a git hook or inside a gate job, the caller's variables (git's own, the gate's, the
-# fleet's, the thread counts) would make the gates these tests run behave as their caller does.
+# fleet's, the thread counts, the Windows job's RUSTUP_AUTO_INSTALL) would make the gates these tests
+# run behave as their caller does.
 LEAKS = ("GIT_", "NRESE_", "FLEET_", "NEXTEST_", "CARGO_BUILD_", "CARGO_TARGET_DIR", "CARGO_ENCODED_RUSTFLAGS",
-         "RUSTFLAGS", "RUST_TEST_THREADS")
+         "RUSTFLAGS", "RUST_TEST_THREADS", "RUSTUP_AUTO_INSTALL")
 CLEAN = {k: v for k, v in os.environ.items() if not k.startswith(LEAKS)}
 ZERO = "0" * 40
 # The scripts a push runs, copied into each scratch repository (those that exist).
 COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", "scripts/lib/disk.sh",
           "scripts/lib/target-cpu.sh", "scripts/lib/remote.sh", "scripts/lib/gate-key.sh",
           "scripts/lib/fleet-gate.sh", "scripts/lib/fleet-job.sh", "scripts/lib/gate-tools.txt",
+          "scripts/lib/gate-record.py", "scripts/lib/windows-job.ps1", "scripts/lib/windows-job.sh",
           "benches/suite/requirements.txt")
 # A stand-in for the fleet's CLI: each submit keeps its job file; status, results and cancel as told.
 FLEET = """#!/bin/sh
@@ -101,9 +105,9 @@ class Repo(unittest.TestCase):
         return subprocess.CompletedProcess(done.args, done.returncode, done.stdout.decode(errors="replace"),
                                            done.stderr.decode(errors="replace"))
 
-    def fleet(self, state, tree=None, files=()):
+    def fleet(self, state, tree=None, files=(), tier="push"):
         """The fleet's answer: the job's state and, with TREE, a whole, consistent passing result
-        of its gate for TREE and FILES."""
+        of its gate (TIER) for TREE and FILES."""
         (self.fake / "status").write_text(json.dumps({"state": state, "host": "office-pc"}))
         out = self.fake / "results" / "out"
         for name in ("gate.json", "attempt", "gate.log"):
@@ -117,7 +121,7 @@ class Repo(unittest.TestCase):
         identity = subprocess.run([BASH, "-c", ". scripts/lib/gate-key.sh && gate_identity"], cwd=self.repo,
                                   capture_output=True, text=True, env=self.env).stdout.strip()
         (out / "gate.json").write_text(json.dumps({
-            "tier": "push", "part": "rest", "tree": tree, "list_hash": list_hash, "identity": identity,
+            "tier": tier, "part": "rest", "tree": tree, "list_hash": list_hash, "identity": identity,
             "w3c_optional": False, "tracked_changes": "", "code": 0, "host": "office-pc", "cpu": "znver3",
             "job": "gate-1", "fleet_host": "office-pc", "attempt": "gate-1:0:1:1", "summary": True,
             "steps": [{"name": "fmt", "code": 0, "seconds": 1}]}))
@@ -251,11 +255,11 @@ esac
         (out / "attempt").write_text(f"gate-{n}:1\n")
         (out / "gate.log").write_text("=== summary\n  0  test (1 s)\n")
 
-    def gate(self):
+    def gate(self, mode="push"):
         """(exit, where it passed, jobs submitted, stderr) of one fleet-gate.sh run for the tip."""
         where = self.fake / "where"
         done = subprocess.run(
-            [BASH, "scripts/lib/fleet-gate.sh", "push", "/dev/null", self.tree(self.tip), "L", "ID", where.as_posix(),
+            [BASH, "scripts/lib/fleet-gate.sh", mode, "/dev/null", self.tree(self.tip), "L", "ID", where.as_posix(),
              self.tip], cwd=self.repo, capture_output=True, text=True, env=self.env, timeout=120)
         submitted = int((self.fake / "n").read_text()) if (self.fake / "n").exists() else 0
         return done.returncode, where.read_text().strip() if where.exists() else "", submitted, done.stderr
@@ -317,6 +321,18 @@ esac
             if again is not None:
                 self.assertIn(f"unconfirmed ({first})", err)
                 self.assertIn('hosts = ["office-pc", "phuoc-yu", "gamergrill"]', (self.fake / "job-2.toml").read_text())
+
+    def test_a_windows_failure_on_khaleesi_is_checked_again_on_a_windows_host(self):
+        """The Windows part's re-check after an unconfirmed failure goes to kraris-gptler: a Linux host
+        would never start it."""
+        failing = {"code": 1, "steps": [{"name": "test", "code": 1, "seconds": 1}]}
+        self.job(1, "khaleesi", "failed", tier="windows", **failing)
+        self.job(2, "kraris-gptler", "done", tier="windows")
+        got, where, n, err = self.gate("windows")
+        self.assertEqual(
+            (got, where, n, 'hosts = ["kraris-gptler"]' in (self.fake / "job-2.toml").read_text()),
+            (0, "fleet:gate-2@kraris-gptler cpu=znver3 re-checking fleet:gate-1@khaleesi (failed there)", 2, True),
+            f"SPEC windows-unconfirmed\n{err}")
 
     def test_no_gate_under_flags_its_identity_doesnt_name(self):
         """Sol, review-remote-gates-r1-20261020 (ENCODED_RUSTFLAGS): two encoded cfgs gave one identity."""
@@ -398,6 +414,184 @@ class GateJob(Repo):
             # The sweep after the run, not before.
             self.assertEqual(seen.read_text().split(), ["old=there"])
             self.assertFalse(old.exists(), "the stale entry wasn't swept after the run")
+
+
+class WindowsCheck(Repo):
+    """scripts/check.sh windows COMMIT, with the stand-in fleet."""
+
+    def check(self, commit):
+        return subprocess.run([BASH, "scripts/check.sh", "windows", commit], cwd=self.repo, capture_output=True,
+                              text=True, env=self.env, timeout=120)
+
+    def submitted(self):
+        return sorted(self.fake.glob("job-*.toml"))
+
+    def test_it_is_the_commits_own_job_on_a_host_that_can_run_the_suite(self):
+        """Without a verdict there is no pass, and the exit says so (75, not a failure's 1): the job
+        is cancelled and nothing runs here. The job is COMMIT's own (its checkout, its launcher, its
+        tree); it states what it needs (a host that can run the suite, 6 cores, its memory held to
+        the ask) and picks no host."""
+        older = self.commit("a.txt", "a changed\n")
+        self.commit("b.txt", "b changed\n")
+        self.fleet("pending")
+        done = self.check(older)
+        self.assertEqual((done.returncode, len(self.submitted()), (self.fake / "cancelled").exists()),
+                         (75, 1, True), f"SPEC windows-no-verdict\n{done.stdout}{done.stderr}")
+        self.assertNotIn("=== ", done.stdout, "a step ran here")
+        text = self.submitted()[0].read_text()
+        steps = json.loads(re.search(r"^steps = (.*)$", text, re.M).group(1))
+        self.assertEqual(steps, [["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
+                                  "scripts/lib/windows-job.ps1", self.tree(older)]], "SPEC windows-job")
+        for line in ('os = "windows"', 'kind = "owlrs.any"', 'has = ["owlrs-windows-suite"]', "cores = 6",
+                     f'rev = "{older}"', "ram_gb = 9", 'NRESE_MEMORY_CAP_GB = "9"'):
+            self.assertIn(line, text, "SPEC windows-job")
+        self.assertNotIn("hosts =", text, "SPEC windows-job: the tool picked a host")
+
+    def test_a_verified_result_passes_once_and_never_opens_a_push(self):
+        """A whole, consistent Windows result for the tree passes and is remembered; it is the
+        Windows part's pass only: a push of the same tree is gated as any push."""
+        tip = self.commit("a.txt", "a changed\n")
+        self.fleet("done", self.tree(tip), [], tier="windows")
+        done = self.check(tip)
+        self.assertEqual(done.returncode, 0, f"SPEC windows-verified\n{done.stderr}")
+        self.fleet("pending")
+        again = self.check(tip)
+        self.assertEqual((again.returncode, len(self.submitted())), (0, 1), f"SPEC windows-verified\n{again.stderr}")
+        pushed = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", tip))  # nothing new in its range
+        self.assertEqual((pushed.returncode != 0, len(self.submitted())), (True, 2),
+                         f"SPEC tier-key: the Windows pass let a push through\n{pushed.stderr}")
+
+    def passed(self):
+        """A commit that passed the Windows part: a crate naming one doc (as nrese-server compiles
+        docs/ops/config-reference.md in), a doc nothing names, and files a crate's tests may read;
+        the fleet answers no more."""
+        for path, text in {"crates/x/src/lib.rs": 'pub const R: &str = include_str!("../../../docs/named.md");\n',
+                           "docs/named.md": "read by code\n", "docs/note.md": "words only\n",
+                           "Dockerfile": "ARG RUST_VERSION=1.98.1\n", "ops/compose.yml": "endpoint: /dataset/sparql\n"
+                           }.items():
+            (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / path).write_text(text, newline="\n")
+        self.git(self.repo, "add", "-A")
+        self.git(self.repo, "commit", "-qm", "passed")
+        passed = self.git(self.repo, "rev-parse", "HEAD")
+        self.fleet("done", self.tree(passed), [], tier="windows")
+        self.assertEqual(self.check(passed).returncode, 0)
+        self.fleet("pending")
+        return passed
+
+    def changed(self, base, path):
+        """A commit on BASE that changes PATH, checked out."""
+        self.git(self.repo, "checkout", "-q", "--detach", base)
+        (self.repo / path).write_text("changed\n", newline="\n")
+        self.git(self.repo, "commit", "-qam", f"change {path}")
+        return self.git(self.repo, "rev-parse", "HEAD")
+
+    def test_a_commit_that_changes_only_docs_no_code_names_carries_the_pass(self):
+        """A commit whose inputs are a passed commit's carries that pass with its record, and asks
+        nothing of the fleet."""
+        passed = self.passed()
+        done = self.check(self.changed(passed, "docs/note.md"))
+        self.assertEqual((done.returncode, len(self.submitted())), (0, 1), f"SPEC windows-carry\n{done.stderr}")
+        self.assertIn(f"carried from {passed} fleet:gate-1@office-pc cpu=znver3", done.stdout, "SPEC windows-carry")
+
+    def test_a_commit_that_changes_an_input_runs_again(self):
+        """Rust code, any file but documentation (a crate's tests read the Dockerfile and ops/), and a
+        doc that code names are inputs: a change to one runs the Windows part again (Sol, 26 Oct), also
+        when the user's settings decorate git's grep output or take files for binary."""
+        for key in ("grep.lineNumber", "grep.column", "diff.default.binary"):
+            self.git(self.repo, "config", "--global", key, "true")
+        self.git(self.repo, "config", "--global", "color.grep", "always")
+        passed = self.passed()
+        for path in ("crates/x/src/lib.rs", "Dockerfile", "ops/compose.yml", "docs/named.md"):
+            with self.subTest(path):
+                before = len(self.submitted())
+                done = self.check(self.changed(passed, path))
+                self.assertEqual((done.returncode != 0, len(self.submitted())), (True, before + 1),
+                                 f"SPEC windows-inputs: a change to {path} carried {passed}'s pass\n{done.stdout}")
+
+    def test_a_commit_from_before_the_windows_tier_is_refused_before_any_job(self):
+        self.git(self.repo, "rm", "-q", "scripts/lib/windows-job.ps1")
+        self.git(self.repo, "commit", "-qm", "no windows tier")
+        self.fleet("pending")
+        done = self.check(self.git(self.repo, "rev-parse", "HEAD"))
+        self.assertEqual((done.returncode, self.submitted(), "has no Windows tier" in done.stderr), (2, [], True),
+                         f"SPEC windows-tier\n{done.stderr}")
+
+
+class WindowsJob(Repo):
+    """scripts/lib/windows-job.sh, the Windows part's step on its host, in the job's checkout of the
+    commit: it readies the host and runs the tree's own check.sh windows, with stand-ins for the
+    tree's build and test tools and for the toolchain."""
+
+    def test_it_runs_the_trees_own_windows_tier_and_says_what_it_was(self):
+        stubs = self.root / "stubs"
+        stubs.mkdir()
+        # One workspace package, and no cargo-nextest: cargo test, crate by crate.
+        (stubs / "cargo").write_text('#!/bin/sh\n[ "$1" = metadata ] || exit 1\necho \'{"packages": [{"name": "x"}]}\'\n',
+                                     newline="\n")
+        # rustup's proxy where STUB_NO_TOOLCHAIN is set: the tree's toolchain isn't installed, and the
+        # proxy installs it (STUB_NO_TOOLCHAIN, a file, says so) unless RUSTUP_AUTO_INSTALL=0.
+        (stubs / "rustc").write_text(
+            '#!/bin/sh\nif [ -n "$STUB_NO_TOOLCHAIN" ]; then\n  [ "$RUSTUP_AUTO_INSTALL" != 0 ] || exit 1\n'
+            f'  : > "$STUB_NO_TOOLCHAIN"\nfi\nexec "{(self.fake / "bin" / "rustc").as_posix()}" "$@"\n', newline="\n")
+        for name in ("cargo", "rustc"):
+            (stubs / name).chmod(0o755)
+        # The tree's cargo-guarded.sh: needs a usable stdin, as Python's subprocess and coreutils do,
+        # says where it builds, and fails as STUB_FAIL says (<its first argument>:<exit>).
+        guarded = ('#!/bin/sh\ncase "$1" in --print-rustflags) echo "-C target-cpu=native"; exit 0 ;; esac\n'
+                   f'"{Path(sys.executable).as_posix()}" -c "import os; os.fstat(0)" || exit 9\n'
+                   'printf %s "$CARGO_TARGET_DIR" > "$FLEET_OUT/target-dir"\n'
+                   '[ "${STUB_FAIL%%:*}" != "$1" ] || exit "${STUB_FAIL#*:}"\n')
+        for rel, body in {"scripts/cargo-guarded.sh": guarded, "scripts/fetch-w3c-tests.sh": "exit 0\n",
+                          "benches/suite/tests/isolation.py": "import sys\nsys.exit(0)\n"}.items():
+            (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / rel).write_text(body, newline="\n")
+        (self.repo / "scripts/cargo-guarded.sh").chmod(0o755)
+        self.git(self.repo, "add", "-A")
+        self.git(self.repo, "commit", "-q", "-m", "the commit under test")
+        tree = self.tree("HEAD")
+        empty = self.git(self.repo, "hash-object", "/dev/null")
+        cases = [  # tree sent, STUB_FAIL, stdin closed, toolchain missing -> exit, the build step's exit, stdin
+            (tree, "", False, False, 0, 0, "valid"),
+            ("0" * 40, "", False, False, 3, None, None),         # another tree checked out: no verdict
+            (tree, "build:101", False, False, 1, 101, "valid"),  # a step fails: the tree fails
+            (tree, "build:75", False, False, 75, 75, "valid"),   # the PC guard stopped a build: no verdict
+            (tree, "", True, False, 0, 0, "invalid"),            # no usable stdin (fleet I14): said, steps get /dev/null
+            (tree, "", False, True, 3, None, None),              # no toolchain for the tree: no verdict, none installed
+        ]
+        for case, (sent, fail, closed, missing, code, build, stdin) in enumerate(cases):
+            out = self.root / f"out-{case}"
+            out.mkdir()
+            installed = self.root / f"installed-{case}"
+            run = ("exec 0<&-; " if closed else "") + 'exec bash "$@"'
+            done = subprocess.run(
+                [BASH, "-c", run, "-", "scripts/lib/windows-job.sh", sent], cwd=self.repo,
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120,
+                env={**self.env, "PATH": stubs.as_posix() + os.pathsep + self.env["PATH"], "FLEET_OUT": str(out),
+                     "FLEET_JOB": f"win-{case}", "FLEET_STEP": "1", "FLEET_HOST": "kraris-gptler", "STUB_FAIL": fail,
+                     "STUB_NO_TOOLCHAIN": installed.as_posix() if missing else "",
+                     "CARGO_TARGET_DIR": (self.root / "shared-target").as_posix()})  # a host's shared one
+            self.assertEqual(done.returncode, code, f"SPEC windows-run: case {case}\n{done.stdout}{done.stderr}")
+            self.assertFalse(installed.exists(), "SPEC windows-toolchain: a toolchain was installed")
+            if build is None:
+                self.assertFalse((out / "gate.json").exists(), f"case {case}")
+                continue
+            built = Path((out / "target-dir").read_text())
+            self.assertTrue(built.name == "target" and os.path.samefile(built.parent, self.repo),
+                            f"SPEC windows-target: built in {built}, not its checkout's own target directory")
+            result = json.loads((out / "gate.json").read_text())
+            self.assertEqual(
+                {k: result[k] for k in ("tier", "tree", "list_hash", "code", "stdin", "tracked_changes", "job",
+                                        "fleet_host", "summary")},
+                {"tier": "windows", "tree": tree, "list_hash": empty, "code": code, "stdin": stdin,
+                 "tracked_changes": "", "job": f"win-{case}", "fleet_host": "kraris-gptler", "summary": True},
+                f"SPEC windows-record: case {case}")
+            self.assertEqual([(s["name"], s["code"]) for s in result["steps"]],
+                             [("W3C data", 0), ("build", build), ("test", 0), ("doc tests", 0), ("suite contracts", 0)],
+                             f"SPEC windows-run: case {case}")
+            self.assertEqual(result["attempt"], (out / "attempt").read_text().strip())
+            self.assertRegex(result["identity"],
+                             r"^rustc-1\.98\.1-abcdef123456 flags=-C_target-cpu=native tools=[0-9a-f]{12}$")
 
 
 if __name__ == "__main__":

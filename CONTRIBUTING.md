@@ -45,8 +45,13 @@ each pushed commit, by its own tree and the files from where the remote has its 
 job (`FLEET_OWNER` names your thread), and only a verified fleet result lets the push through. No
 verdict, no push. A pass is remembered for the same tree, files and toolchain, so run
 `scripts/check.sh push` (it gates HEAD) before a long push: the hook then passes at once. A push
-that only deletes refs needs no gate. Build through
-`scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most `NRESE_BUILD_SLOTS`
+that only deletes refs needs no gate. The merge check's Windows part runs the same way:
+`scripts/check.sh windows [COMMIT]` (default HEAD) runs COMMIT's own `windows` tier on a Windows
+fleet host: the whole workspace built, all its tests, its doc tests and the suite contracts. A
+commit whose
+inputs (every file but the docs no other file names, `scripts/lib/gate-key.sh`) passed before
+carries that pass.
+Build through `scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most `NRESE_BUILD_SLOTS`
 builds at once per machine). Validate in batches: quick checks while
 working, the push tier once per batch. Measure counts first; time only to answer a stated
 question, inside `scripts/quiet-slot.sh`, on `release` (`--profile lab` to iterate). A slot
