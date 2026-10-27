@@ -163,28 +163,36 @@ pub fn built_in(iri: &str, first: Option<&Value>, rest: &[Value]) -> Result<Opti
         .strip_prefix(SWRLB)
         .ok_or_else(|| format!("the built-in {iri} isn't one of SWRL's"))?;
     let unknown = || format!("the built-in swrlb:{name} isn't evaluated here");
-    // Comparisons: every argument bound.
+    // Comparisons: every argument bound, related as `relate` says.
     let compare = |test: fn(std::cmp::Ordering) -> bool| -> Result<Option<Value>, String> {
         let a = first.ok_or_else(|| format!("swrlb:{name} with its first argument unbound"))?;
         let [b] = rest else {
             return Err(format!("swrlb:{name} takes two arguments"));
         };
-        Ok(order(a, b).is_some_and(test).then(|| a.clone()))
+        match relate(a, b) {
+            Relation::Ordered(o) => Ok(test(o).then(|| a.clone())),
+            Relation::Unordered => Ok(None),
+            Relation::Unequal | Relation::Unknown => Err(format!(
+                "swrlb:{name} on {a:?} and {b:?}: their order isn't evaluated here"
+            )),
+        }
     };
     let computed: Value = match name {
-        "equal" => {
+        "equal" | "notEqual" => {
             let a = first.ok_or_else(|| format!("swrlb:{name} with its first argument unbound"))?;
             let [b] = rest else {
                 return Err(format!("swrlb:{name} takes two arguments"));
             };
-            return Ok((a == b).then(|| a.clone()));
-        }
-        "notEqual" => {
-            let a = first.ok_or_else(|| format!("swrlb:{name} with its first argument unbound"))?;
-            let [b] = rest else {
-                return Err(format!("swrlb:{name} takes two arguments"));
+            let equal = match relate(a, b) {
+                Relation::Ordered(o) => o.is_eq(),
+                Relation::Unordered | Relation::Unequal => false,
+                Relation::Unknown => {
+                    return Err(format!(
+                        "swrlb:{name} on {a:?} and {b:?}: their equality isn't evaluated here"
+                    ));
+                }
             };
-            return Ok((a != b).then(|| a.clone()));
+            return Ok((equal == (name == "equal")).then(|| a.clone()));
         }
         "lessThan" => return compare(|o| o.is_lt()),
         "lessThanOrEqual" => return compare(|o| o.is_le()),
@@ -277,14 +285,77 @@ pub fn built_in(iri: &str, first: Option<&Value>, rest: &[Value]) -> Result<Opti
     })
 }
 
-/// The order of two values where both are numbers of `owl:real` or both strings (else
-/// unordered).
-fn order(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+/// How SWRL's comparisons relate two values ([`relate`]).
+enum Relation {
+    /// Equal, or one below the other.
+    Ordered(std::cmp::Ordering),
+    /// Neither equal nor ordered.
+    Unordered,
+    /// Not equal; their order isn't evaluated here.
+    Unequal,
+    /// Not evaluated here.
+    Unknown,
+}
+
+/// How SWRL's comparisons relate two values (§8.1, by XPath's operators). Numbers of
+/// `owl:real` and strings by their order; floats and doubles as IEEE numbers, not by their
+/// identity (NaN relates to nothing, `0` equals `-0`); numbers of two types as XPath
+/// promotes them (`op:numeric-less-than`, `op:numeric-equal`: a decimal to the nearest
+/// float or double, a float to a double); other values of two types not at all. Other
+/// values of one type are equal where identical, else unequal, but for date-times: one
+/// instant at two offsets is one date-time to XPath.
+fn relate(a: &Value, b: &Value) -> Relation {
+    use Value::{DateTime, Double, Float, Real};
+    let ieee = |o: Option<std::cmp::Ordering>| o.map_or(Relation::Unordered, Relation::Ordered);
     match (a, b) {
-        (Value::Real(x), Value::Real(y)) => Some(x.cmp(y)),
-        (Value::String(x), Value::String(y)) => Some(x.cmp(y)),
-        _ => None,
+        (Real(x), Real(y)) => Relation::Ordered(x.cmp(y)),
+        (Value::String(x), Value::String(y)) => Relation::Ordered(x.cmp(y)),
+        (Float(x), Float(y)) => ieee(f32::from_bits(*x).partial_cmp(&f32::from_bits(*y))),
+        (Double(x), Double(y)) => ieee(f64::from_bits(*x).partial_cmp(&f64::from_bits(*y))),
+        (Real(_) | Float(_) | Double(_), Real(_) | Float(_) | Double(_)) => {
+            let double = matches!(a, Double(_)) || matches!(b, Double(_));
+            match (promote(a, double), promote(b, double)) {
+                (Some(x), Some(y)) => ieee(x.partial_cmp(&y)),
+                _ => Relation::Unknown,
+            }
+        }
+        _ if std::mem::discriminant(a) != std::mem::discriminant(b) => Relation::Unordered,
+        _ if a == b => Relation::Ordered(std::cmp::Ordering::Equal),
+        (DateTime(..), _) => Relation::Unknown,
+        _ => Relation::Unequal,
     }
+}
+
+/// A number as XPath promotes it to a double (`double`) or a float, widened exactly to an
+/// `f64`; `None` for a number of `owl:real` with no decimal expansion (no XPath type).
+fn promote(v: &Value, double: bool) -> Option<f64> {
+    Some(match v {
+        Value::Real(r) if double => decimal(*r)?.parse::<f64>().ok()?,
+        Value::Real(r) => f64::from(decimal(*r)?.parse::<f32>().ok()?),
+        Value::Float(x) => f64::from(f32::from_bits(*x)),
+        Value::Double(x) => f64::from_bits(*x),
+        _ => return None,
+    })
+}
+
+/// The exact decimal numeral of an `xsd:decimal` value (Rust's parser rounds it to the
+/// nearest float, ties to even, as XPath's cast does); `None` without a finite expansion.
+fn decimal(r: Rational) -> Option<String> {
+    if !r.is_decimal() {
+        return None;
+    }
+    let (n, d) = (r.numerator().unsigned_abs(), r.denominator().unsigned_abs());
+    let sign = if r.numerator() < 0 { "-" } else { "" };
+    let (mut digits, mut rest) = (String::new(), n % d);
+    while rest != 0 {
+        rest = rest.checked_mul(10)?;
+        digits.push(char::from_digit(u32::try_from(rest / d).ok()?, 10)?);
+        rest %= d;
+    }
+    if digits.is_empty() {
+        digits.push('0');
+    }
+    Some(format!("{sign}{}.{digits}", n / d))
 }
 
 fn real(v: &Value, name: &str) -> Result<Rational, String> {
