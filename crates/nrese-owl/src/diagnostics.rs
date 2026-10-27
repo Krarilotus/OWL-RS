@@ -2,7 +2,7 @@
 //! involved, never dropped silently. A task an affected axiom takes part in is answered
 //! `unsupported` (docs/design/owl2-dl.md §2).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::mapping::{Ontology, Terms};
 use crate::model::{Axiom, Characteristic, ClassExpr, ObjProp, Term};
@@ -36,6 +36,9 @@ pub enum Diagnostic {
         axiom: usize,
         what: &'static str,
     },
+    /// A global restriction of OWL 2 DL broken: an anonymous individual in a nominal or a
+    /// `hasValue`, which take named ones only (*OWL 2 Structural Specification* §11.2).
+    AnonymousIndividual { node: Term },
     /// Text the functional-syntax reader can't read (`crate::ofn`), where it is (from 1;
     /// the column in characters): the axiom it is in is left out.
     Syntax {
@@ -71,6 +74,7 @@ impl Diagnostic {
             ),
             Self::Unused { node } => (node, "unused"),
             Self::NonSimpleProperty { property, what, .. } => (property, what),
+            Self::AnonymousIndividual { node } => (node, "anonymous individual"),
             Self::Syntax { line, column, what } => {
                 ((u64::from(line) << 32) | u64::from(column), what)
             }
@@ -102,6 +106,15 @@ impl Diagnostic {
 /// `owl:topObjectProperty`. (§11.1 makes `owl:bottomObjectProperty` composite too; it
 /// relates nothing, so nothing above it gets a pair from it, and it isn't counted.)
 pub(crate) fn check_global_restrictions(ontology: &mut Ontology) {
+    // Nominals and `hasValue` take named individuals only (§11.2).
+    let anonymous: BTreeSet<Term> = crate::mapping::in_expressions(ontology)
+        .filter(|t| ontology.anonymous.contains(t))
+        .collect();
+    for node in anonymous {
+        ontology
+            .diagnostics
+            .push(Diagnostic::AnonymousIndividual { node });
+    }
     let mut supers: HashMap<Term, Vec<Term>> = HashMap::new();
     let mut seeds: Vec<Term> = ontology.builtin.top_object.into_iter().collect();
     for axiom in &ontology.axioms {
@@ -204,7 +217,7 @@ pub(crate) fn check_global_restrictions(ontology: &mut Ontology) {
 }
 
 /// The class expressions an axiom holds directly.
-fn expressions_of(axiom: &Axiom) -> Vec<u32> {
+pub(crate) fn expressions_of(axiom: &Axiom) -> Vec<u32> {
     match axiom {
         Axiom::SubClassOf(a, b) => vec![a.0, b.0],
         Axiom::EquivalentClasses(xs) | Axiom::DisjointClasses(xs) => {

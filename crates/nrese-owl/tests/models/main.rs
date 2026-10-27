@@ -15,8 +15,9 @@
 use std::collections::HashMap;
 
 use nrese_owl::{
-    Axiom, BodyAtom, Characteristic, ClassExpr, Clause, Concept, EntityKind, ExprId, Filler,
-    FreshOf, HeadAtom, Interner, Normalised, ObjProp, Ontology, Options, Term, Var, normalise_with,
+    Axiom, BodyAtom, Characteristic, ClassExpr, Clause, Concept, DataRange, EntityKind, ExprId,
+    Filler, FreshOf, HeadAtom, Interner, Normalised, ObjProp, Ontology, Options, RangeId, Term,
+    Var, normalise_with,
 };
 
 /// Picks a role from the random source.
@@ -960,4 +961,84 @@ fn an_inverse_pair_with_a_transitive_role_is_regular() {
         "{:?}",
         normalised.unsupported
     );
+}
+
+/// A cardinality whose negation is past `u32` (review A-1201): `a : ¬(≤ 4294967295 r)`,
+/// `a : ¬(= 4294967295 r)` and their data forms need `≥ 4294967296`. Over a two-valued
+/// datatype the data one has no model; wrapped to `≥ 0` it would hold everywhere. The
+/// normalisation leaves those axioms out; one below, their negation `≥ 4294967295` stays.
+#[test]
+fn a_negation_past_u32_is_left_out() {
+    let mut wrong = Vec::new();
+    for (n, left_out) in [(u32::MAX - 1, 0), (u32::MAX, 4)] {
+        let mut o = Ontology::default();
+        let range = RangeId(o.ranges.intern(DataRange::Datatype(30)));
+        let mut e = |x| ExprId(o.classes.intern(x));
+        let thing = e(ClassExpr::Thing);
+        let negated = [
+            ClassExpr::Max(n, ObjProp::Named(10), thing),
+            ClassExpr::Exact(n, ObjProp::Named(10), thing),
+            ClassExpr::DataMax(n, 20, range),
+            ClassExpr::DataExact(n, 20, range),
+        ]
+        .map(|x| {
+            let x = e(x);
+            e(ClassExpr::Not(x))
+        });
+        o.axioms = negated.map(|c| Axiom::ClassAssertion(c, 100)).to_vec();
+        o.sources = vec![Vec::new(); o.axioms.len()];
+        let unsupported = normalise_with(&o, Options::default()).unsupported;
+        if unsupported.len() != left_out {
+            wrong.push(format!("≤ {n}: {unsupported:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Clause and key variables past `u16` (review A-1203): a key over 65,537 data properties
+/// or 65,536 object properties, and `⊤ ⊑ ∀p₀.A ⊔ … ⊔ ∀p₆₅₅₃₆.A`, need one variable more
+/// than a `u16` numbers, so two would be one. The normalisation leaves such an axiom out;
+/// one data property or universal fewer is normalised. (A key of 65,535 object properties,
+/// the last that fits, builds its rule in time quadratic in them: `variables`'s own test.)
+#[test]
+fn clauses_and_keys_past_u16_are_left_out() {
+    let key = |objects: u64, data: u64| {
+        let mut o = Ontology::default();
+        let thing = ExprId(o.classes.intern(ClassExpr::Thing));
+        let objects = (0..objects).map(|p| ObjProp::Named(1_000 + p)).collect();
+        let data = (0..data).map(|d| 200_000 + d).collect();
+        o.axioms = vec![Axiom::HasKey(thing, objects, data)];
+        o.sources = vec![Vec::new()];
+        o
+    };
+    let universals = |m: u64| {
+        let mut o = Ontology::default();
+        let mut e = |x| ExprId(o.classes.intern(x));
+        let (thing, a) = (e(ClassExpr::Thing), e(ClassExpr::Class(1)));
+        let alls = (0..m)
+            .map(|p| e(ClassExpr::All(ObjProp::Named(1_000 + p), a)))
+            .collect();
+        let or = e(ClassExpr::Or(alls));
+        o.axioms = vec![Axiom::SubClassOf(thing, or)];
+        o.sources = vec![Vec::new()];
+        o
+    };
+    let mut wrong = Vec::new();
+    for (what, o, too_wide) in [
+        ("a key of 65,536 data properties", key(0, 65_536), false),
+        ("a key of 65,537 data properties", key(0, 65_537), true),
+        ("65,537 universals", universals(65_537), true),
+        ("65,536 universals", universals(65_536), false),
+        ("a key of 65,536 object properties", key(65_536, 0), true),
+    ] {
+        let unsupported = normalise_with(&o, Options::default()).unsupported;
+        if unsupported
+            .iter()
+            .any(|(_, why)| why.contains("65535 variables"))
+            != too_wide
+        {
+            wrong.push(format!("{what}: {unsupported:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }

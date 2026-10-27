@@ -617,9 +617,13 @@ impl<'t, 'm> Parser<'t, 'm> {
             }
             "SubObjectPropertyOf" => {
                 let chain = if matches!(self.peek(), Tok::Name("ObjectPropertyChain")) {
+                    let at = self.here();
                     self.take();
                     self.open()?;
                     let chain = self.object_properties()?;
+                    if chain.is_empty() {
+                        return fail(at, "a property chain without a property");
+                    }
                     self.close()?;
                     chain
                 } else {

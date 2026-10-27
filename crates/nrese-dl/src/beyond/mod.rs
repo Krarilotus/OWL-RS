@@ -103,6 +103,10 @@ fn restriction(d: &Diagnostic) -> Option<(&'static str, bool)> {
             "OWL 2 Structural Specification §11.1-11.2: a simple property required",
             true,
         ),
+        Diagnostic::AnonymousIndividual { .. } => (
+            "OWL 2 Structural Specification §11.2: a named individual in a nominal or hasValue",
+            true,
+        ),
         Diagnostic::AmbiguousProperty { .. } => (
             "OWL 2 Structural Specification §5.8.1: typing constraints (one IRI as two kinds of property)",
             false,
