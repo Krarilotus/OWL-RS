@@ -476,22 +476,35 @@ impl SupportSets {
                 cap,
             )
         };
+        let asserts = |fact: Triple| !in_order(asserted, fact).is_empty();
+        // Each fact's record decided once, in the map's order (the map is unchanged by the
+        // passes below, so they meet its facts in the same order): 0 not kept (its sets are
+        // those it starts with), 1 kept, 2 kept and asserted.
+        let mut records: Kept<u8> = ChargedVec::with_capacity(Arc::clone(kept), by_fact.len())?;
+        let (mut entries, mut marked, mut also) = (0, 0, 0);
+        for (&fact, found) in by_fact {
+            let record = match !found.is_empty() && !starts(fact, found) {
+                true => 1 + u8::from(asserts(fact)),
+                false => 0,
+            };
+            if record > 0 {
+                entries += found.sets.len();
+                marked += usize::from(found.truncated);
+                also += usize::from(record == 2);
+            }
+            records.push(record)?;
+        }
         let recorded = || {
             by_fact
                 .iter()
-                .filter(move |&(&fact, found)| !found.is_empty() && !starts(fact, found))
+                .zip(records.iter())
+                .filter(|&(_, &record)| record > 0)
+                .map(|((fact, found), &record)| (*fact, found, record == 2))
         };
-        let asserts = |fact: Triple| !in_order(asserted, fact).is_empty();
-        let (mut entries, mut marked, mut also) = (0, 0, 0);
-        for (&fact, found) in recorded() {
-            entries += found.sets.len();
-            marked += usize::from(found.truncated);
-            also += usize::from(asserts(fact));
-        }
         // The distinct sets, in their order.
         let mut distinct: ChargedVec<&GraphSet, Arc<Budget>> =
             ChargedVec::with_capacity(Arc::clone(kept), entries)?;
-        for (_, found) in recorded() {
+        for (_, found, _) in recorded() {
             for set in &found.sets {
                 distinct.push(set)?;
             }
@@ -503,17 +516,18 @@ impl SupportSets {
         let mut base: Kept<(Triple, u32)> = ChargedVec::with_capacity(Arc::clone(kept), entries)?;
         let mut cut: Kept<Triple> = ChargedVec::with_capacity(Arc::clone(kept), marked)?;
         let mut elsewhere: Kept<Triple> = ChargedVec::with_capacity(Arc::clone(kept), also)?;
-        for (&fact, found) in recorded() {
+        for (fact, found, asserted) in recorded() {
             for set in &found.sets {
                 base.push((fact, sets.find(set).expect("interned")))?;
             }
             if found.truncated {
                 cut.push(fact)?;
             }
-            if asserts(fact) {
+            if asserted {
                 elsewhere.push(fact)?;
             }
         }
+        drop(records);
         base.sort_unstable();
         cut.sort_unstable();
         elsewhere.sort_unstable();
