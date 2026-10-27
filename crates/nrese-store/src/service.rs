@@ -1779,21 +1779,17 @@ pub(crate) fn in_readable_graph(
 /// and its answer: `redact` takes an EXPLAIN's operators (their estimates, the order and the
 /// operators those chose, their rows, the dictionary work they report, their times) and its
 /// rewrites (an estimate decides some, as eager aggregation), all read from statistics and
-/// scans of every graph; and a memory refusal keeps its kind and limit but not the bytes
-/// held and asked for, which a scan of graphs it may not read sized.
+/// scans of every graph; and a memory refusal goes through the scope's boundary
+/// ([`crate::ReadScope::told`]).
 fn for_its_reader<T>(
     prepared: &PreparedQuery,
     whole: StoreResult<T>,
     redact: impl FnOnce(&mut T),
 ) -> StoreResult<T> {
-    if crate::ReadScope::of(prepared.access().cloned()).reads_everything() {
-        return whole;
+    let scope = crate::ReadScope::of(prepared.access().cloned());
+    let mut whole = scope.told(whole)?;
+    if !scope.reads_everything() {
+        redact(&mut whole);
     }
-    match whole {
-        Ok(mut whole) => {
-            redact(&mut whole);
-            Ok(whole)
-        }
-        Err(error) => Err(error.without_amounts()),
-    }
+    Ok(whole)
 }

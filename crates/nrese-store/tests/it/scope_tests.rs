@@ -12,9 +12,9 @@ use nrese_rdf::GraphName;
 use nrese_sparql::GraphAccess;
 use nrese_store::{
     DatasetBackupFormat, DatasetRestoreRequest, GraphReadRequest, GraphResultFormat, GraphTarget,
-    GraphWriteRequest, MutationCommand, ReadContext, ReadScope, Refusal, Requester,
-    SparqlQueryRequest, SparqlUpdateRequest, StatementOp, StatementPattern, StatementsRequest,
-    StoreService, TellRequest, WriteScope,
+    GraphWriteRequest, MutationCommand, MutationPipeline, ReadContext, ReadScope, Refusal,
+    Requester, SparqlQueryRequest, SparqlUpdateRequest, StatementOp, StatementPattern,
+    StatementsRequest, StoreService, TellRequest, WriteScope,
 };
 
 fn store() -> StoreService {
@@ -506,55 +506,90 @@ fn restricted_rewrites_tell_nothing_of_hidden_statistics() {
     );
 }
 
-/// Nor does a refusal, of its EXPLAIN or of its run: a scan sized by a graph the reader may
-/// not read runs out of the query's memory, and the refusal it is told keeps its kind and
-/// limit, not the bytes (Sol's review of R13: r1 B-F2, they were in an EXPLAIN's message; r2
-/// S1, in a run's).
+/// Nor does a memory refusal, at any entry point that reads: a scan sized by a graph the
+/// requester may not read runs out of the query memory, and the refusal it is told keeps its
+/// kind and limit, not the bytes held and asked for. A requester of every graph is told the
+/// bytes. One row per read and update entry point; a new one gets a row (Sol's review of
+/// R13: r1 B-F2, an EXPLAIN's; r2 S1, a run's; r3 S1, an update's WHERE; review of PR #39:
+/// F2, a run with operations pending).
 #[test]
-fn restricted_refusals_tell_nothing_of_hidden_sizes() {
-    let refusal = |hidden: usize| {
-        let mut config = in_memory_store_config();
-        config.total_query_memory_bytes = 0;
-        let store = StoreService::new(config).unwrap();
-        let secret: String = (0..hidden)
-            .map(|i| format!("<urn:hidden{i}> <urn:p> {i} . "))
-            .collect();
-        store
-            .execute_update(&SparqlUpdateRequest::new(format!(
-                "INSERT DATA {{ GRAPH <urn:g:public> {{ <urn:visible> <urn:p> 1 }}
-                   GRAPH <urn:g:secret> {{ {secret} }} }}"
-            )))
-            .unwrap();
-        let mut request =
-            SparqlQueryRequest::new("SELECT * WHERE { GRAPH ?g { ?s <urn:p> ?o } }", public());
-        request.memory_limit = Some(64 << 10);
-        let prepared = store.prepare_query(&request).unwrap();
-        let token = nrese_store::CancellationToken::new();
-        let explained = store.explain_query(&prepared, &token).unwrap_err();
-        let run = store
-            .run_query(&prepared, &token, std::io::sink())
-            .unwrap_err();
-        for error in [&explained, &run] {
-            assert!(
-                error.is_memory_limit() && !error.is_server_memory_limit(),
-                "{error}"
-            );
-        }
-        (explained.to_string(), run.to_string())
+fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
+    let query = "SELECT * WHERE { GRAPH ?g { ?s <urn:p> ?o } }";
+    let memory_limit = |error: &nrese_store::StoreError| {
+        assert!(error.is_memory_limit(), "a memory refusal, not {error}");
+        error.to_string()
     };
-    assert_eq!(refusal(100_000), refusal(200_000));
-}
-
-/// Nor does an update's: the WHERE of a restricted requester's update runs out of the query
-/// memory on a scan sized by a graph it may not read, and the refusal it is told keeps its
-/// kind and limit, not the bytes (Sol's review of R13, r3 S1).
-#[test]
-fn restricted_update_refusals_tell_nothing_of_hidden_sizes() {
-    let refusal = |hidden: usize| {
+    let run = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        let store = pipeline.store();
+        let prepared = store
+            .prepare_query(&SparqlQueryRequest::new(query, scope.clone()))
+            .unwrap();
+        let token = nrese_store::CancellationToken::new();
+        memory_limit(
+            &store
+                .run_query(&prepared, &token, std::io::sink())
+                .unwrap_err(),
+        )
+    };
+    let pending_run = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        let store = pipeline.store();
+        let prepared = store
+            .prepare_query(&SparqlQueryRequest::new(query, scope.clone()))
+            .unwrap();
+        let add = StatementOp::Add {
+            data: nrese_store::RdfPayload {
+                payload: b"<urn:pending> <urn:p> \"2\" .".to_vec(),
+                format: GraphResultFormat::NTriples,
+                base_iri: None,
+            },
+            contexts: Vec::new(),
+        };
+        let token = nrese_store::CancellationToken::new();
+        let pending = StatementsRequest::new(vec![add]);
+        memory_limit(
+            &store
+                .run_query_pending(&pending, &prepared, &token, std::io::sink())
+                .unwrap_err(),
+        )
+    };
+    let explain = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        let store = pipeline.store();
+        let prepared = store
+            .prepare_query(&SparqlQueryRequest::new(query, scope.clone()))
+            .unwrap();
+        let token = nrese_store::CancellationToken::new();
+        memory_limit(&store.explain_query(&prepared, &token).unwrap_err())
+    };
+    let update_where = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        let requester = match scope {
+            ReadScope::All => Requester::all(),
+            ReadScope::Graphs(_) => public_writer(),
+        };
+        let update = SparqlUpdateRequest::new(
+            "INSERT { GRAPH <urn:g:public> { ?s <urn:copy> ?o } }
+             WHERE { GRAPH ?g { ?s <urn:p> ?o } }",
+        );
+        let ticket = nrese_store::MutationTicket::new();
+        match pipeline
+            .apply(MutationCommand::Update(update), &requester, &ticket)
+            .unwrap_err()
+        {
+            nrese_store::MutationError::Store { source, .. } => memory_limit(&source),
+            other => panic!("a memory refusal, not {other}"),
+        }
+    };
+    type Entry<'a> = &'a dyn Fn(&MutationPipeline, &ReadScope) -> String;
+    let entries: [(&str, Entry<'_>); 4] = [
+        ("run", &run),
+        ("run with operations pending", &pending_run),
+        ("EXPLAIN", &explain),
+        ("an update's WHERE", &update_where),
+    ];
+    let store = |hidden: usize| {
         let mut config = in_memory_store_config();
         config.process_memory_bytes = 0;
         config.total_query_memory_bytes = 64 << 10;
-        let pipeline = nrese_store::MutationPipeline::new(
+        let pipeline = MutationPipeline::new(
             Arc::new(StoreService::new(config).unwrap()),
             Arc::new(nrese_reasoner::ReasonerService::new(
                 nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Disabled),
@@ -569,31 +604,14 @@ fn restricted_update_refusals_tell_nothing_of_hidden_sizes() {
                    GRAPH <urn:g:secret> {{ {secret} }} }}"
             ))
             .unwrap();
-        let access = Arc::new(GraphAccess {
-            prefixes: vec!["urn:g:public".to_owned()],
-            ..GraphAccess::default()
-        });
-        let requester = Requester::new(
-            ReadScope::Graphs(Arc::clone(&access)),
-            WriteScope::Graphs(access),
-        );
-        let error = pipeline
-            .apply(
-                MutationCommand::Update(SparqlUpdateRequest::new(
-                    "INSERT { GRAPH <urn:g:public> { ?s <urn:copy> ?o } }
-                     WHERE { GRAPH ?g { ?s <urn:p> ?o } }",
-                )),
-                &requester,
-                &nrese_store::MutationTicket::new(),
-            )
-            .unwrap_err();
-        match &error {
-            nrese_store::MutationError::Store { source, .. } => {
-                assert!(source.is_server_memory_limit(), "{error}")
-            }
-            other => panic!("a memory refusal, not {other}"),
-        }
-        error.to_string()
+        pipeline
     };
-    assert_eq!(refusal(100_000), refusal(200_000));
+    let (small, large) = (store(100_000), store(200_000));
+    for (name, entry) in entries {
+        let public = public();
+        assert_eq!(entry(&small, &public), entry(&large, &public), "{name}");
+        let all = ReadScope::All;
+        let (small_all, large_all) = (entry(&small, &all), entry(&large, &all));
+        assert_ne!(small_all, large_all, "{name}: every graph");
+    }
 }
