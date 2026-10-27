@@ -39,7 +39,20 @@ pub fn materialise_until(
     let (input, axioms) = input_of(program, snapshot);
     let schema = program.schema_for(snapshot);
     let result = match program.same_as.filter(|_| program.by_representatives) {
-        Some(same_as) => by_representatives(program, input, same_as, &schema, stop)?,
+        Some(same_as) => match by_representatives(program, input, same_as, &schema, stop)? {
+            // A class holding rdf:nil reads every list through it as empty: computed again
+            // by replication. A compact stack keeps the closure over representatives.
+            result if result.nil_merged && !program.store_representatives => {
+                batch::materialise_grouped_until(
+                    input_of(program, snapshot).0,
+                    &program.rules,
+                    program.lists.as_ref(),
+                    &schema,
+                    stop,
+                )?
+            }
+            result => result,
+        },
         None => batch::materialise_grouped_until(
             input,
             &program.rules,

@@ -74,6 +74,11 @@ impl ListVocabulary {
         }
     }
 
+    /// `rdf:nil`, where every list ends.
+    pub(crate) fn nil(&self) -> u64 {
+        self.nil
+    }
+
     /// Whether `fact` is list structure or a list axiom: the facts [`instantiate`] reads.
     pub fn is_list_fact(&self, [_, p, o]: [u64; 3]) -> bool {
         [
