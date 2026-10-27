@@ -435,12 +435,29 @@ async fn graph_store_and_rdf4j_follow_the_policy() -> Result<(), Box<dyn std::er
 
 /// A reader of some graphs who sees every inference is told the same over HTTP whether or
 /// not a graph it can't read holds schema the OWL 2 QL rewriting would use: the same
-/// answer, and the completeness `not-certified`, which other origins may read (R13-diag).
+/// answer, and the completeness `not-certified`, which other origins may read; and from
+/// an EXPLAIN, run or plan only, the same completeness and no QL report (R13-diag).
 #[tokio::test]
 async fn query_certification_tells_nothing_of_a_hidden_schema()
 -> Result<(), Box<dyn std::error::Error>> {
     let policy = POLICY.replace("inferred = \"hidden\"", "inferred = \"visible\"");
+    let query = |uri: &str| {
+        Request::builder()
+            .uri(uri)
+            .method(Method::POST)
+            .header(
+                "authorization",
+                format!("Bearer {}", token(&["nrese.read", "analyst"])),
+            )
+            .header(
+                "accept",
+                "application/sparql-results+json, application/n-quads;q=0.9, */*;q=0.1",
+            )
+            .header("content-type", "application/sparql-query")
+            .body(Body::from(format!("ASK {{ ?x <{EX}p> ?y }}")))
+    };
     let mut told = Vec::new();
+    let mut explained = Vec::new();
     for hidden in [false, true] {
         let app = app_in(&policy, ReasoningMode::Owl2Ql)?;
         let schema = if hidden {
@@ -466,24 +483,22 @@ async fn query_certification_tells_nothing_of_a_hidden_schema()
             .await?,
             StatusCode::NO_CONTENT
         );
+        for mode in ["true", "plan"] {
+            let response = app
+                .clone()
+                .oneshot(query(&format!("/dataset/query?explain={mode}"))?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK, "explain={mode}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+            let explanation: serde_json::Value = serde_json::from_slice(&body)?;
+            explained.push((
+                mode,
+                explanation["completeness"].clone(),
+                explanation["ql"].clone(),
+            ));
+        }
         // Not `send`: it drops the headers.
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/dataset/query")
-                    .method(Method::POST)
-                    .header(
-                        "authorization",
-                        format!("Bearer {}", token(&["nrese.read", "analyst"])),
-                    )
-                    .header(
-                        "accept",
-                        "application/sparql-results+json, application/n-quads;q=0.9, */*;q=0.1",
-                    )
-                    .header("content-type", "application/sparql-query")
-                    .body(Body::from(format!("ASK {{ ?x <{EX}p> ?y }}")))?,
-            )
-            .await?;
+        let response = app.oneshot(query("/dataset/query")?).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let header = |name: &str| -> Vec<Vec<u8>> {
             response
@@ -507,5 +522,14 @@ async fn query_certification_tells_nothing_of_a_hidden_schema()
         "a hidden schema changed what the reader is told"
     );
     assert_eq!(told[0].1, [b"not-certified".to_vec()]);
+    let (without, with) = explained.split_at(2);
+    assert_eq!(
+        without, with,
+        "a hidden schema changed what an EXPLAIN tells the reader"
+    );
+    for (mode, completeness, ql) in without {
+        assert_eq!(completeness["status"], "not-certified", "explain={mode}");
+        assert!(ql.is_null(), "explain={mode}: {ql}");
+    }
     Ok(())
 }
