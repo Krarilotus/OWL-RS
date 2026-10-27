@@ -620,7 +620,13 @@ impl<'a> Engine<'a> {
     }
 
     pub fn check_memory(&self) -> Step<()> {
-        let used = self.bytes();
+        self.check_memory_with(0)
+    }
+
+    /// The memory check with `scratch` bytes a rule holds beside the engine (a key's names
+    /// and candidates, `keys.rs`).
+    pub(super) fn check_memory_with(&self, scratch: usize) -> Step<()> {
+        let used = self.bytes().saturating_add(scratch);
         if let Some(most) = self.config.max_memory
             && used > most
         {
