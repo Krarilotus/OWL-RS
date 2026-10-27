@@ -246,6 +246,7 @@ pub(crate) fn apply_sparql_update(
     let options = context.update_options(requester, using);
     // Its WHERE's memory refusal as its reader may be told it (`ReadScope::told`).
     requester.read.told(
+        crate::EntryPoint::UpdateWhere,
         apply_update(tx, &update, &options).map_err(|error| match error {
             nrese_sparql::UpdateError::Forbidden(graph) => crate::Refusal::Write(graph).into(),
             error => StoreError::from(error),

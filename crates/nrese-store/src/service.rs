@@ -769,7 +769,7 @@ impl StoreService {
         Option<nrese_sparql::ql::QlReport>,
     )> {
         let run = self.run_reporting_whole(prepared, cancellation, out, report);
-        for_its_reader(prepared, run, |_| {})
+        for_its_reader(prepared, crate::EntryPoint::Run, run, |_| {})
     }
 
     fn run_reporting_whole(
@@ -911,6 +911,7 @@ impl StoreService {
     ) -> StoreResult<crate::Explanation> {
         for_its_reader(
             prepared,
+            crate::EntryPoint::Explain,
             self.explain_whole(prepared, cancellation),
             |explanation| {
                 explanation.steps.clear();
@@ -980,6 +981,7 @@ impl StoreService {
     ) -> StoreResult<crate::PlannedQuery> {
         for_its_reader(
             prepared,
+            crate::EntryPoint::Plan,
             self.plan_whole(prepared, cancellation),
             |planned| {
                 planned.steps.clear();
@@ -1065,11 +1067,14 @@ impl StoreService {
         request: &GraphReadRequest,
         out: impl std::io::Write,
     ) -> StoreResult<bool> {
-        if !self.readable(read, &request.target)? {
-            return Ok(false);
-        }
-        let view = self.read_snapshot(read.scope.access())?;
-        write_graph(&view, request, read.model(), &read.cancel, out)
+        let whole = || -> StoreResult<bool> {
+            if !self.readable(read, &request.target)? {
+                return Ok(false);
+            }
+            let view = self.read_snapshot(read.scope.access())?;
+            write_graph(&view, request, read.model(), &read.cancel, out)
+        };
+        read.scope.told(crate::EntryPoint::GraphRead, whole())
     }
 
     /// Whether a graph exists as the read sees it (Graph Store Protocol `HEAD`), as
@@ -1079,14 +1084,17 @@ impl StoreService {
         read: &crate::ReadContext<'_>,
         target: &GraphTarget,
     ) -> StoreResult<bool> {
-        if !self.readable(read, target)? {
-            return Ok(false);
-        }
-        graph_exists(
-            &self.read_snapshot(read.scope.access())?,
-            target,
-            read.model(),
-        )
+        let whole = || -> StoreResult<bool> {
+            if !self.readable(read, target)? {
+                return Ok(false);
+            }
+            graph_exists(
+                &self.read_snapshot(read.scope.access())?,
+                target,
+                read.model(),
+            )
+        };
+        read.scope.told(crate::EntryPoint::GraphExists, whole())
     }
 
     /// Whether the read's scope reads `target`: a graph it doesn't read doesn't exist for it.
@@ -1266,7 +1274,7 @@ impl StoreService {
             )
             .map(|_| ())
         });
-        for_its_reader(prepared, run, |_| {})
+        for_its_reader(prepared, crate::EntryPoint::RunPending, run, |_| {})
     }
 
     /// The queries running now ([`crate::running`]).
@@ -1338,7 +1346,7 @@ impl StoreService {
         read: &crate::ReadContext<'_>,
         pattern: &crate::StatementPattern,
     ) -> StoreResult<Vec<nrese_rdf::Quad>> {
-        self.on_data(read, |snapshot| {
+        self.on_data(crate::EntryPoint::Statements, read, |snapshot| {
             crate::statements::read_statements(snapshot, read.model(), pattern, &read.scope)
         })
     }
@@ -1352,7 +1360,7 @@ impl StoreService {
         format: crate::GraphResultFormat,
         out: impl std::io::Write,
     ) -> StoreResult<u64> {
-        self.on_data(read, |snapshot| {
+        self.on_data(crate::EntryPoint::Statements, read, |snapshot| {
             crate::statements::write_statements(
                 snapshot,
                 read.model(),
@@ -1371,7 +1379,7 @@ impl StoreService {
         read: &crate::ReadContext<'_>,
         pattern: &crate::StatementPattern,
     ) -> StoreResult<u64> {
-        self.on_data(read, |snapshot| {
+        self.on_data(crate::EntryPoint::Size, read, |snapshot| {
             Ok(crate::statements::count_statements(
                 snapshot,
                 read.model(),
@@ -1382,14 +1390,17 @@ impl StoreService {
     }
 
     /// Runs `read` on the latest snapshot, or on the data as the context's pending changes
-    /// would leave it.
+    /// would leave it, for `entry`: what it returns as its reader may be told it.
     fn on_data<T>(
         &self,
+        entry: crate::EntryPoint,
         context: &crate::ReadContext<'_>,
         read: impl FnOnce(&nrese_engine::Snapshot) -> StoreResult<T>,
     ) -> StoreResult<T> {
-        match context.pending {
-            None => read(&self.read_snapshot(context.scope.access())?),
+        let whole = match context.pending {
+            None => self
+                .read_snapshot(context.scope.access())
+                .and_then(|view| read(&view)),
             Some(pending) => self.with_pending(
                 pending,
                 &context.scope,
@@ -1397,7 +1408,8 @@ impl StoreService {
                 &context.cancel,
                 read,
             ),
-        }
+        };
+        context.scope.told(entry, whole)
     }
 
     /// Writes an image backup of the latest snapshot into `dir` ([`crate::image_backup`]).
@@ -1582,9 +1594,20 @@ impl StoreService {
         predicate: nrese_rdf::TermRef<'_>,
         object: nrese_rdf::TermRef<'_>,
     ) -> StoreResult<Option<Vec<crate::reasoning::InferenceStep>>> {
+        let whole =
+            self.explain_statement_whole(program.into(), scope, [subject, predicate, object]);
+        scope.told(crate::EntryPoint::ExplainStatement, whole)
+    }
+
+    fn explain_statement_whole(
+        &self,
+        program: nrese_reasoner::RuleProgram,
+        scope: &crate::ReadScope,
+        statement: [nrese_rdf::TermRef<'_>; 3],
+    ) -> StoreResult<Option<Vec<crate::reasoning::InferenceStep>>> {
         let snapshot = self.engine.snapshot();
-        let program = self.bound_program(&snapshot, program.into());
-        let Some(fact) = Self::fact_of(&snapshot, [subject, predicate, object]) else {
+        let program = self.bound_program(&snapshot, program);
+        let Some(fact) = Self::fact_of(&snapshot, statement) else {
             return Ok(None);
         };
         let crate::ReadScope::Graphs(access) = scope else {
@@ -1618,8 +1641,19 @@ impl StoreService {
         statement: [nrese_rdf::TermRef<'_>; 3],
         mode: crate::reasoning::JustificationMode,
     ) -> StoreResult<Option<crate::reasoning::JustificationAnswer>> {
+        let whole = self.justify_statement_whole(program.into(), scope, statement, mode);
+        scope.told(crate::EntryPoint::JustifyStatement, whole)
+    }
+
+    fn justify_statement_whole(
+        &self,
+        program: nrese_reasoner::RuleProgram,
+        scope: &crate::ReadScope,
+        statement: [nrese_rdf::TermRef<'_>; 3],
+        mode: crate::reasoning::JustificationMode,
+    ) -> StoreResult<Option<crate::reasoning::JustificationAnswer>> {
         let snapshot = self.engine.snapshot();
-        let program = self.bound_program(&snapshot, program.into());
+        let program = self.bound_program(&snapshot, program);
         let Some(fact) = Self::fact_of(&snapshot, statement) else {
             return Ok(None);
         };
@@ -1948,14 +1982,15 @@ fn withholds_certification(prepared: &PreparedQuery) -> bool {
 /// rewrites (an estimate decides some, as eager aggregation), all read from statistics and
 /// scans of every graph, and its QL rewriting's status and report where they would read
 /// the schema of every graph ([`certification_for_its_reader`]); and a memory refusal goes
-/// through the scope's boundary ([`crate::ReadScope::told`]).
+/// through the scope's boundary ([`crate::ReadScope::told`]) as `entry`'s.
 fn for_its_reader<T>(
     prepared: &PreparedQuery,
+    entry: crate::EntryPoint,
     whole: StoreResult<T>,
     redact: impl FnOnce(&mut T),
 ) -> StoreResult<T> {
     let scope = crate::ReadScope::of(prepared.access().cloned());
-    let mut whole = scope.told(whole)?;
+    let mut whole = scope.told(entry, whole)?;
     if !scope.reads_everything() {
         redact(&mut whole);
     }
