@@ -376,8 +376,19 @@ def _target_of(args) -> dict:
         if not binary.is_file() or not sums.is_file():
             raise LaunchError(f"no build of {args.server_rev[:12]} at {binary.parent} "
                               "(submit its build job: verify.py jobs)")
-        if sums.read_text().split()[0] != sha256_of(binary):
+        digest = sha256_of(binary)
+        if sums.read_text().split()[0] != digest:
             raise LaunchError(f"{binary}: its checksum doesn't hold (SHA256SUMS): build it again")
+        # Only an isolated build of the commit writes its PROVENANCE (build-on-host.sh). A build
+        # without it is from before 26 Oct 2026, when a shared cargo target could leave another
+        # commit's code under this one's name with a valid checksum and REVISION (PR #47, Sol r1 F1).
+        record = binary.parent / "PROVENANCE"
+        fields = dict(line.split(" ", 1) for line in record.read_text(encoding="utf-8").splitlines()
+                      if " " in line) if record.is_file() else {}
+        if (fields.get("contract") != "isolated-build/1" or fields.get("sha256") != digest
+                or not fields.get("revision", "").startswith(args.server_rev)):
+            raise LaunchError(f"{binary.parent}: not an isolated build of {args.server_rev[:12]} (its "
+                              "PROVENANCE): build it again (verify.py jobs)")
         # Its use, for the host cache's sweep (Harness/notes/2026-10-20-host-cache-contract.md §5).
         (binary.parent / ".last-used").write_text(f"{int(time.time())}\n", encoding="utf-8")
     else:
