@@ -467,13 +467,19 @@ fn a_key_over_the_universal_property_equates() {
 /// - a TBox alone, `⊤ ⊑ A ⊑ ⊥` (review A-1703): the domain is never empty (OWL 2 Direct
 ///   Semantics, §2.2), so its element is in `A`, which has none;
 /// - a value a defined datatype forces (`D ≡ {0}`) that a negative assertion excludes, or
-///   that a key shares with an individual in a disjoint class (Direct Semantics, §2.3.5).
+///   that a key shares with an individual in a disjoint class (Direct Semantics, §2.3.5);
+///   also where the negative assertion is on a super-property, which has the value too, or
+///   on a property the value reaches through inverses, which the reader accepts on data
+///   properties outside OWL 2 DL (`d⁻ = r`, `r⁻ = q`: `q` = `d`; F1's review, W1).
 ///
 /// With one, the proof stands: a defined datatype with values (`xsd:integer[≥ 0]`, PR #30
-/// review), and a datatype outside the map, whose values a model may choose (§4).
+/// review), a datatype outside the map, whose values a model may choose (§4), and the
+/// forced value where the negative assertion or the key is on another property (PR #30
+/// fix check, F1).
 #[test]
 fn a_proof_of_consistency_needs_a_model() {
-    let data = ":A a owl:Class . :d a owl:DatatypeProperty . :a a :A .";
+    let data = ":A a owl:Class . :d a owl:DatatypeProperty . :q a owl:DatatypeProperty . \
+                :a a :A .";
     let some = |range: &str| {
         format!(
             "{data} :A rdfs:subClassOf \
@@ -487,6 +493,18 @@ fn a_proof_of_consistency_needs_a_model() {
         )
     };
     let zero = defined("owl:oneOf ( \"0\"^^xsd:integer )");
+    let not_zero = |property: &str| {
+        format!(
+            "{zero} [] a owl:NegativePropertyAssertion ; owl:sourceIndividual :a ; \
+             owl:assertionProperty {property} ; owl:targetValue \"0\"^^xsd:integer ."
+        )
+    };
+    let key = |property: &str| {
+        format!(
+            "{zero} owl:Thing owl:hasKey ( {property} ) . :B a owl:Class ; \
+             owl:disjointWith :A . :b a :B ; {property} \"0\"^^xsd:integer ."
+        )
+    };
     let cases = [
         (
             "an empty defined datatype",
@@ -495,20 +513,29 @@ fn a_proof_of_consistency_needs_a_model() {
         ),
         (
             "a forced value a negative assertion excludes",
+            not_zero(":d"),
+            false,
+        ),
+        ("a forced value a key shares", key(":d"), false),
+        (
+            "a forced value a negative assertion on a super-property excludes",
+            format!("{} :d rdfs:subPropertyOf :q .", not_zero(":q")),
+            false,
+        ),
+        (
+            "a forced value a negative assertion through inverses excludes",
             format!(
-                "{zero} [] a owl:NegativePropertyAssertion ; owl:sourceIndividual :a ; \
-                 owl:assertionProperty :d ; owl:targetValue \"0\"^^xsd:integer ."
+                "{} :r a owl:ObjectProperty . :d owl:inverseOf :r . :r owl:inverseOf :q .",
+                not_zero(":q")
             ),
             false,
         ),
         (
-            "a forced value a key shares",
-            format!(
-                "{zero} owl:Thing owl:hasKey ( :d ) . :B a owl:Class ; owl:disjointWith :A . \
-                 :b a :B ; :d \"0\"^^xsd:integer ."
-            ),
-            false,
+            "a negative assertion on another property",
+            not_zero(":q"),
+            true,
         ),
+        ("a key on another property", key(":q"), true),
         (
             "a TBox alone",
             ":A a owl:Class . owl:Thing rdfs:subClassOf :A . :A rdfs:subClassOf owl:Nothing ."
