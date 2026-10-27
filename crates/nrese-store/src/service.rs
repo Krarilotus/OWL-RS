@@ -1128,7 +1128,8 @@ impl StoreService {
             Some(access) if needs_view(tx.base(), access) => {
                 // The operations aren't reasoned over: the base's inferred statements, as
                 // far as the reader sees them and the operations left them, kept (charged)
-                // as the support views are. A statement the view adds (asserted only in
+                // as the support views are; the list they are gathered in is the read's
+                // work, charged to its envelope. A statement the view adds (asserted only in
                 // graphs the reader can't read, and derived) stays unless the operations
                 // assert it where the reader reads it.
                 let base = self.view_of(tx.base(), Some(access), memory, None)?;
@@ -1149,11 +1150,11 @@ impl StoreService {
                         )
                         .any(|asserted| access.allows_id(&tx, asserted.graph)),
                 };
-                let budget = self.supports.kept();
+                let working = std::sync::Arc::new(memory.part());
                 let len = usize::try_from(base.len_in(ReadModel::Inferred)).unwrap_or(usize::MAX);
                 let mut kept: nrese_exec::ChargedVec<nrese_engine::EncodedQuad> =
-                    nrese_exec::ChargedVec::with_capacity(std::sync::Arc::clone(budget), len)?;
-                let mut scanning = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
+                    nrese_exec::ChargedVec::with_capacity(std::sync::Arc::clone(&working), len)?;
+                let mut scanning = nrese_exec::Reservation::new(std::sync::Arc::clone(&working));
                 scanning.charge(base.scan_bytes(ReadModel::Inferred))?;
                 kept.extend_bounded(
                     len,
@@ -1165,7 +1166,8 @@ impl StoreService {
                 )?;
                 drop(scanning);
                 kept.sort_unstable();
-                tx.pending_snapshot().with_inferred_only(&kept, budget)?
+                tx.pending_snapshot()
+                    .with_inferred_only(&kept, self.supports.kept())?
             }
             _ => tx.pending_snapshot(),
         };
