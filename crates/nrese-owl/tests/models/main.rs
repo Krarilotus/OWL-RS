@@ -967,15 +967,21 @@ fn an_inverse_pair_with_a_transitive_role_is_regular() {
 /// `a : ¬(= 4294967295 r)` and their data forms need `≥ 4294967296`. Over a two-valued
 /// datatype the data one has no model; wrapped to `≥ 0` it would hold everywhere. The
 /// normalisation leaves those axioms out; one below, their negation `≥ 4294967295` stays.
+/// Unnegated, `≤ 4294967295` and `= 4294967295` need no `+ 1`: they stay, their at-most
+/// atoms counting 4294967295 exactly (PR #40 review, R1).
 #[test]
-fn a_negation_past_u32_is_left_out() {
+fn only_a_negation_past_u32_is_left_out() {
     let mut wrong = Vec::new();
-    for (n, left_out) in [(u32::MAX - 1, 0), (u32::MAX, 4)] {
+    for (n, negated, left_out) in [
+        (u32::MAX - 1, true, 0),
+        (u32::MAX, true, 4),
+        (u32::MAX, false, 0),
+    ] {
         let mut o = Ontology::default();
         let range = RangeId(o.ranges.intern(DataRange::Datatype(30)));
         let mut e = |x| ExprId(o.classes.intern(x));
         let thing = e(ClassExpr::Thing);
-        let negated = [
+        let restrictions = [
             ClassExpr::Max(n, ObjProp::Named(10), thing),
             ClassExpr::Exact(n, ObjProp::Named(10), thing),
             ClassExpr::DataMax(n, 20, range),
@@ -983,16 +989,73 @@ fn a_negation_past_u32_is_left_out() {
         ]
         .map(|x| {
             let x = e(x);
-            e(ClassExpr::Not(x))
+            if negated { e(ClassExpr::Not(x)) } else { x }
         });
-        o.axioms = negated.map(|c| Axiom::ClassAssertion(c, 100)).to_vec();
+        o.axioms = restrictions.map(|c| Axiom::ClassAssertion(c, 100)).to_vec();
         o.sources = vec![Vec::new(); o.axioms.len()];
-        let unsupported = normalise_with(&o, Options::default()).unsupported;
-        if unsupported.len() != left_out {
-            wrong.push(format!("≤ {n}: {unsupported:?}"));
+        let normalised = normalise_with(&o, Options::default());
+        let heads: Vec<&HeadAtom> = normalised.clauses.iter().flat_map(|c| &c.head).collect();
+        let has = |test: fn(&HeadAtom) -> bool| heads.iter().any(|h| test(h));
+        let counted = [
+            has(|h| matches!(h, HeadAtom::AtMost { n: u32::MAX, .. })),
+            has(|h| matches!(h, HeadAtom::DataAtMost { n: u32::MAX, .. })),
+        ];
+        if normalised.unsupported.len() != left_out || (!negated && counted != [true, true]) {
+            wrong.push(format!(
+                "≤ {n}, negated {negated}: {:?} {counted:?}",
+                normalised.unsupported
+            ));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The count is refused exactly where the negation normal form needs it (PR #40's sol-loop,
+/// S1 and S2): `a : ≤ 1 r.¬(≤ 4294967295 s)` puts the filler in negation normal form, which
+/// is `≥ 4294967296 s`: left out; `b : ¬(≥ 0 r.(≤ 4294967295 s))` is `b : ⊥` whatever the
+/// filler, which is never negated: kept; `¬(≤ 4294967295 s) ⊑ A` goes in as
+/// `⊤ ⊑ (≤ 4294967295 s) ⊔ A`, its subclass negated (the second round, S1): kept.
+#[test]
+fn a_nested_negation_past_u32_is_left_out() {
+    let mut o = Ontology::default();
+    let mut e = |x| ExprId(o.classes.intern(x));
+    let thing = e(ClassExpr::Thing);
+    let a = e(ClassExpr::Class(1));
+    let most = e(ClassExpr::Max(u32::MAX, ObjProp::Named(11), thing));
+    let not_most = e(ClassExpr::Not(most));
+    let one_not_most = e(ClassExpr::Max(1, ObjProp::Named(10), not_most));
+    let none = e(ClassExpr::Min(0, ObjProp::Named(10), most));
+    let not_none = e(ClassExpr::Not(none));
+    o.axioms = vec![
+        Axiom::ClassAssertion(one_not_most, 100),
+        Axiom::ClassAssertion(not_none, 101),
+        Axiom::SubClassOf(not_most, a),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let unsupported = normalise_with(&o, Options::default()).unsupported;
+    let left_out: Vec<usize> = unsupported.iter().map(|&(i, _)| i).collect();
+    assert_eq!(left_out, [0], "{unsupported:?}");
+}
+
+/// A fresh name's definition that needs a count past `u32` (PR #40's sol-loop, second
+/// round, S2): `a : ≤ 1 r.(≤ 4294967295 s)` and `b : ≤ 1 r.(≤ 4294967295 s)` share the name
+/// of the restriction, whose definition negates the filler only when it is clausified, after
+/// both took the name. Neither assertion is complete without it: both are left out.
+#[test]
+fn a_shared_definition_past_u32_leaves_out_every_user() {
+    let mut o = Ontology::default();
+    let mut e = |x| ExprId(o.classes.intern(x));
+    let thing = e(ClassExpr::Thing);
+    let most = e(ClassExpr::Max(u32::MAX, ObjProp::Named(11), thing));
+    let one_most = e(ClassExpr::Max(1, ObjProp::Named(10), most));
+    o.axioms = vec![
+        Axiom::ClassAssertion(one_most, 100),
+        Axiom::ClassAssertion(one_most, 101),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let unsupported = normalise_with(&o, Options::default()).unsupported;
+    let left_out: Vec<usize> = unsupported.iter().map(|&(i, _)| i).collect();
+    assert_eq!(left_out, [0, 1], "{unsupported:?}");
 }
 
 /// Clause and key variables past `u16` (review A-1203): a key over 65,537 data properties
