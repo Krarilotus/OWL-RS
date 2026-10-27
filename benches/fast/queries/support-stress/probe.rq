@@ -1,0 +1,1 @@
+SELECT (EXISTS { { <http://example.org/support/x0> a <http://example.org/support/D> } UNION { GRAPH ?g { <http://example.org/support/x0> a <http://example.org/support/D> } } } AS ?seen) WHERE { }

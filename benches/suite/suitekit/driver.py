@@ -686,8 +686,10 @@ class Suite:
 
     def driver(self, plan, keys: list[str]):
         """A kit's own driver (Plan.driver) for `keys` on one tier: its steps in order, then
-        every results.csv they wrote below {results} into the run's results.csv."""
-        out = self.results / "driver" / slug(f"{plan.workload}-{plan.tier}")
+        every results.csv they wrote below {results} into the run's results.csv. {results} is
+        this run's own (its stamp): kits append, and an earlier run into the same results
+        directory would be imported again."""
+        out = self.results / "driver" / slug(f"{self.stamp}-{plan.workload}-{plan.tier}")
         logs = self.results / "logs" / slug(f"{self.stamp}-driver-{plan.workload}-{plan.tier}")
         values = {"results": str(out), "systems": ",".join(keys), "tier": plan.tier, "runs": str(self.args.runs)}
         self.say(f"\n{','.join(keys)} / {plan.workload} {plan.tier}: the kit's driver")
@@ -750,7 +752,9 @@ class Suite:
                     self.skips.append(f"{name} {plan.tier}: {plan.unavailable}")
                     continue
                 for key in systems:
-                    if plan.systems is not None and key not in plan.systems:
+                    # A kit runs its own systems; one that lacks the workload's capabilities is
+                    # still reported as unable (below), never dropped.
+                    if plan.systems is not None and key not in plan.systems and not verdict(self.systems[key], workload):
                         continue
                     # A vendor that refused us an evaluation is never measured (systems.toml refused).
                     if self.systems[key].get("refused"):
