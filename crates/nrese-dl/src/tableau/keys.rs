@@ -89,17 +89,36 @@ impl Engine<'_> {
         named.dedup();
         members.sort_unstable_by_key(|&(x, _)| x);
         members.dedup_by_key(|&mut (x, _)| x);
-        // Per member and non-simple property, the names of its group it has (a group has a
-        // name per named individual: the time is checked per member, here and below).
+        // Per member and non-simple property, the names of its group it has, the cheaper way
+        // round: asking the member for each name of the group, or reading its labels, whichever
+        // are fewer. They are counted only as far as the group's size, and dead ones count,
+        // since reading walks them too: a group never costs more than about three times its
+        // names. A group has a name per named individual, so asking made a key round cost
+        // members × individuals; a key over many properties gives a member many labels, so
+        // reading them for each group would cost groups × labels (PR #48's review). The time is
+        // checked per member, here and below.
         let mut held: Vec<Vec<Vec<(ConceptId, DepSetId)>>> = Vec::with_capacity(members.len());
         for &(x, _) in &members {
             self.check_time()?;
             let g = &self.g;
-            let has = |&c: &ConceptId| g.concept(x, c).map(|f| (c, g.unary[f as usize].dep));
             held.push(
                 key.reach
                     .iter()
-                    .map(|group| group.iter().filter_map(has).collect())
+                    .map(
+                        |group| match g.label_entries(x).nth(group.len()).is_some() {
+                            true => group
+                                .iter()
+                                .filter_map(|&c| {
+                                    g.concept(x, c).map(|f| (c, g.unary[f as usize].dep))
+                                })
+                                .collect(),
+                            false => g
+                                .labels(x)
+                                .filter(|u| group.binary_search(&u.concept).is_ok())
+                                .map(|u| (u.concept, u.dep))
+                                .collect(),
+                        },
+                    )
                     .collect(),
             );
         }
