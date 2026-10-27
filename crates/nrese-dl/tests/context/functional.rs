@@ -144,3 +144,37 @@ fn what_the_eq_rule_leaves_out() {
         Err(Unsupported::Equality { .. })
     ));
 }
+
+/// Functionality over asserted edges (review A-1402): `r` functional with `r(a, b)`,
+/// `r(a, c)` makes `b = c` (no unique names), which `b ≠ c`, or `B(b)`, `C(c)` with
+/// `B ⊓ C ⊑ ⊥`, contradicts. The Horn stage with the Eq rule never calls it consistent.
+#[test]
+fn functionality_over_asserted_edges_is_never_left_out() {
+    for different in [true, false] {
+        let mut table = Table::default();
+        let mut b = Build::new(&mut table);
+        let r = b.r("r");
+        let ObjProp::Named(rt) = r else {
+            unreachable!()
+        };
+        let (a, x, y) = (b.t("a"), b.t("b"), b.t("c"));
+        b.axiom(Axiom::ObjectCharacteristic(Characteristic::Functional, r));
+        b.axiom(Axiom::ObjectPropertyAssertion(rt, a, x));
+        b.axiom(Axiom::ObjectPropertyAssertion(rt, a, y));
+        if different {
+            b.axiom(Axiom::DifferentIndividuals(vec![x.min(y), x.max(y)]));
+        } else {
+            let (bb, c) = (b.c("B"), b.c("C"));
+            let both = b.and(&[bb, c]);
+            let nothing = b.e(ClassExpr::Nothing);
+            b.sub(both, nothing);
+            b.axiom(Axiom::ClassAssertion(bb, x));
+            b.axiom(Axiom::ClassAssertion(c, y));
+        }
+        let answer = classify(&b.done(), 1);
+        assert!(
+            !matches!(&answer, Ok(c) if c.consistent),
+            "b ≠ c asserted: {different}: {answer:?}"
+        );
+    }
+}
