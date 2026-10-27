@@ -46,6 +46,8 @@ pub struct Telemetry {
     /// Components of data values checked, and key rule instances applied.
     pub data_checks: u64,
     pub key_firings: u64,
+    /// The most bytes one evaluation of a key was charged (its scratch, `keys.rs`).
+    pub key_scratch: u64,
     /// The hot node's size (one cache line) and the amortised bytes per node at the peak
     /// (every table, index and the trail, by capacity).
     pub bytes_per_hot_node: u64,
@@ -85,6 +87,7 @@ impl Telemetry {
             key_firings
         );
         self.peak_nodes = self.peak_nodes.max(other.peak_nodes);
+        self.key_scratch = self.key_scratch.max(other.key_scratch);
         self.bytes_per_hot_node = self.bytes_per_hot_node.max(other.bytes_per_hot_node);
         self.bytes_per_node = self.bytes_per_node.max(other.bytes_per_node);
         self.dependency_sets = self.dependency_sets.max(other.dependency_sets);

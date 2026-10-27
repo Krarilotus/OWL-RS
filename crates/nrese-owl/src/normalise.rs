@@ -810,9 +810,11 @@ impl<'a> Normaliser<'a> {
     /// transitivity compose, not only its edges. So for a non-simple property `P` the rule
     /// reads, for each named individual `z`, the fresh name `Q` of `∃P.{z} ⊑ Q`, derived
     /// through `P`'s automaton (`{z} ⊑ ∀P⁻.Q`, deterministic: `Q` holds exactly where a
-    /// `P`-path reaches `z`): a rule per combination of such individuals, O(individuals ×
-    /// the automaton) per non-simple key property. An edge alone missed `r(a, c)` from
-    /// `r(a, b)`, `r(b, c)` with `r` transitive (HermiT reads edges too; Openllet doesn't).
+    /// `P`-path reaches `z`), O(individuals × the automaton) per non-simple key property.
+    /// The names are the rule's `reach`, a group per property: one rule per key (a rule per
+    /// combination of individuals was their number to the power of the properties, review
+    /// A-1205). An edge alone missed `r(a, c)` from `r(a, b)`, `r(b, c)` with `r`
+    /// transitive (HermiT reads edges too; Openllet doesn't).
     fn key(&mut self, index: usize, class: ExprId, objects: &[ObjProp], data: &[Term]) {
         // A value per data property; a shared target per object property, after `y`.
         let (Some(values), Some(targets)) = (
@@ -851,47 +853,33 @@ impl<'a> Normaliser<'a> {
             body.push(BodyAtom::Data(d, x, v));
             body.push(BodyAtom::Data(d, y, v));
         }
-        // Each object property's alternatives: its edges, or one reach name per named
+        // Each object property: its edges to a shared target, or a reach name per named
         // individual.
-        let mut alternatives: Vec<Vec<Vec<BodyAtom>>> = Vec::new();
+        let mut reach = Vec::new();
         for (&p, target) in objects.iter().zip(targets) {
             if self.non_simple.contains(&p.named()) {
-                let mut each = Vec::new();
+                let mut group = Vec::new();
                 for z in self.ontology.named_individuals() {
                     let one = self.e(ClassExpr::OneOf(vec![z]));
                     let some = self.e(ClassExpr::Some(p, one));
                     let Some(q) = self.fresh_negative(some, index) else {
                         return self.uncounted(index);
                     };
-                    let q = Concept::Fresh(q);
-                    each.push(vec![BodyAtom::Concept(q, x), BodyAtom::Concept(q, y)]);
+                    group.push(Concept::Fresh(q));
                 }
-                alternatives.push(each);
+                reach.push(group);
             } else {
                 let z = Var::Y(target);
-                alternatives.push(vec![vec![Self::edge(p, x, z), Self::edge(p, y, z)]]);
+                body.push(Self::edge(p, x, z));
+                body.push(Self::edge(p, y, z));
             }
         }
-        let mut rules: Vec<Vec<BodyAtom>> = vec![body];
-        for each in alternatives {
-            rules = rules
-                .iter()
-                .flat_map(|r| {
-                    each.iter().map(move |atoms| {
-                        let mut r = r.clone();
-                        r.extend(atoms.iter().cloned());
-                        r
-                    })
-                })
-                .collect();
-        }
-        for body in rules {
-            self.out.rules.push(SafeRule {
-                body,
-                head: vec![HeadAtom::Equal(x, y)],
-                source: index,
-            });
-        }
+        self.out.rules.push(SafeRule {
+            body,
+            head: vec![HeadAtom::Equal(x, y)],
+            source: index,
+            reach,
+        });
     }
 
     // Fresh names ----------------------------------------------------------------------

@@ -8,14 +8,16 @@
 //! nodes, the rule says the individuals are equal unless the values differ (HermiT's
 //! encoding): a choice the datatype theory then decides. A class that isn't a name is
 //! the normalisation's fresh name `Q` with `C ⊑ Q`, which holds wherever `C` does in the
-//! model the graph stands for. A non-simple property is read as a class too: the name
-//! that holds where a path along the property reaches one named individual (the
-//! normalisation's rule per individual).
+//! model the graph stands for. A non-simple property is read through names, one per named
+//! individual, that hold where a path along the property reaches it: the two individuals
+//! need one name of the property's group in common (`KeyRule::reach`).
+
+use std::collections::HashMap;
 
 use super::depset::DepSetId;
 use super::engine::{Engine, Lit, Step};
 use super::graph::Annot;
-use super::program::{KeyRule, RoleExpr};
+use super::program::{ConceptId, KeyRule, RoleExpr};
 
 /// A data value of `x` and one of `y` for one data property, each with its edge's
 /// dependencies.
@@ -29,7 +31,11 @@ impl Engine<'_> {
         }
         let p = self.p;
         for key in &p.keys {
-            if self.apply_key(key)? {
+            // A step of the heap profile: what one key's evaluation holds (`tests/key_scratch.rs`).
+            nrese_exec::heap::begin_step();
+            let acted = self.apply_key(key);
+            nrese_exec::heap::end_step("dl: a key evaluated");
+            if acted? {
                 return Ok(true);
             }
         }
@@ -83,9 +89,100 @@ impl Engine<'_> {
         named.dedup();
         members.sort_unstable_by_key(|&(x, _)| x);
         members.dedup_by_key(|&mut (x, _)| x);
-        for (i, &(x, dx)) in members.iter().enumerate() {
-            'pairs: for &(y, dy) in &members[i + 1..] {
+        // Per member and non-simple property, the names of its group it has, the cheaper way
+        // round: asking the member for each name of the group, or reading its labels, whichever
+        // are fewer. They are counted only as far as the group's size, and dead ones count,
+        // since reading walks them too: a group never costs more than about three times its
+        // names. A group has a name per named individual, so asking made a key round cost
+        // members × individuals; a key over many properties gives a member many labels, so
+        // reading them for each group would cost groups × labels (PR #48's review). The time is
+        // checked per member, here and below.
+        let mut held: Vec<Vec<Vec<(ConceptId, DepSetId)>>> = Vec::with_capacity(members.len());
+        for &(x, _) in &members {
+            self.check_time()?;
+            let g = &self.g;
+            held.push(
+                key.reach
+                    .iter()
+                    .map(
+                        |group| match g.label_entries(x).nth(group.len()).is_some() {
+                            true => group
+                                .iter()
+                                .filter_map(|&c| {
+                                    g.concept(x, c).map(|f| (c, g.unary[f as usize].dep))
+                                })
+                                .collect(),
+                            false => g
+                                .labels(x)
+                                .filter(|u| group.binary_search(&u.concept).is_ok())
+                                .map(|u| (u.concept, u.dep))
+                                .collect(),
+                        },
+                    )
+                    .collect(),
+            );
+        }
+        // Per name of the first non-simple property's group, the members that have it, in order.
+        let mut by_name: HashMap<ConceptId, Vec<usize>> = HashMap::new();
+        for (i, groups) in held.iter().enumerate() {
+            for &(c, _) in groups.first().into_iter().flatten() {
+                by_name.entry(c).or_default().push(i);
+            }
+        }
+        // The scratch, charged before any pair is tried, every list by its capacity as allocated
+        // (a one-name list holds four: PR #48's fix check), the partners' list made after the
+        // charge with the most it can hold. It is linear in the members and their names, with
+        // the partners of one member at a time (every later member, or the buckets of its
+        // names), never one entry per pair: storing the pairs came to 3 GB for 20,000 members
+        // that share a name (PR #48's review, F1).
+        let n = members.len();
+        let most_partners = n.max(by_name.values().map(Vec::len).sum());
+        let held_bytes = |groups: &Vec<Vec<(ConceptId, DepSetId)>>| {
+            let names: usize = groups.iter().map(Vec::capacity).sum();
+            groups.capacity() * size_of::<Vec<(ConceptId, DepSetId)>>()
+                + names * size_of::<(ConceptId, DepSetId)>()
+        };
+        let scratch = named.capacity() * size_of::<u32>()
+            + members.capacity() * size_of::<(u32, DepSetId)>()
+            + held.capacity() * size_of::<Vec<Vec<(ConceptId, DepSetId)>>>()
+            + held.iter().map(held_bytes).sum::<usize>()
+            + crate::memory::table(by_name.capacity(), size_of::<(ConceptId, Vec<usize>)>())
+            + by_name.values().map(Vec::capacity).sum::<usize>() * size_of::<usize>()
+            + most_partners * size_of::<usize>();
+        self.stats.key_scratch = self.stats.key_scratch.max(scratch as u64);
+        self.check_memory_with(scratch)?;
+        let mut partners: Vec<usize> = Vec::with_capacity(most_partners);
+        for i in 0..n {
+            self.check_time()?;
+            // i's pairs, each once: every later member, or with a non-simple property the later
+            // ones with a name of its first group in common (as many as a rule per named
+            // individual tried).
+            partners.clear();
+            match held[i].first() {
+                None => partners.extend(i + 1..n),
+                Some(own) => {
+                    for (c, _) in own {
+                        let at = &by_name[c];
+                        partners.extend_from_slice(&at[at.partition_point(|&j| j <= i)..]);
+                    }
+                    partners.sort_unstable();
+                    partners.dedup();
+                }
+            }
+            'pairs: for &j in &partners {
+                let ((x, dx), (y, dy)) = (members[i], members[j]);
                 let mut premise = self.deps.union(dx, dy);
+                // A name both have in each non-simple property's group.
+                for (hx, hy) in held[i].iter().zip(&held[j]) {
+                    let common = hx.iter().find_map(|&(c, d)| {
+                        hy.iter().find(|&&(w, _)| w == c).map(|&(_, e)| (d, e))
+                    });
+                    let Some((d, e)) = common else {
+                        continue 'pairs;
+                    };
+                    premise = self.deps.union(premise, d);
+                    premise = self.deps.union(premise, e);
+                }
                 // A common named Pᵢ-neighbour for each object property.
                 for &role in &key.objects {
                     let ax = self.along(x, role, &named);

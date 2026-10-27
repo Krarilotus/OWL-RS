@@ -730,6 +730,19 @@ impl Graph {
         })
     }
 
+    /// The entries of `node`'s concept list as [`labels`](Self::labels) walks them, a dead
+    /// one as `None`: what a walk costs, for a caller that bounds it.
+    pub fn label_entries(&self, node: u32) -> impl Iterator<Item = Option<&Unary>> {
+        let mut at = self.nodes[node as usize].label;
+        std::iter::from_fn(move || {
+            (at != NONE).then(|| {
+                let i = at as usize;
+                at = self.unary[i].next;
+                (!self.dead.unary[i]).then(|| &self.unary[i])
+            })
+        })
+    }
+
     pub fn out_edges(&self, node: u32) -> impl Iterator<Item = (u32, &Edge)> {
         let mut at = self.nodes[node as usize].first_out;
         std::iter::from_fn(move || {

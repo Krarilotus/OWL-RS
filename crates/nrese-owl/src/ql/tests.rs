@@ -434,6 +434,30 @@ fn an_equating_hazard_is_not_hidden_by_another_on_the_same_role() {
     );
 }
 
+/// An equating hazard on a term the axioms lead an anonymous individual to: every term.
+/// `P ⊑ ∃S.L`, `L ⊑ A`, `A ⊑ {a}` with `L` a left side the TBox doesn't read (`∃R.C`, or
+/// `≥ 2 R.⊤` since A-1202): `P`'s `S`-successor is an `A`, so `a`, and `S(p, a)` follows
+/// for every `P` `p`, unread.
+#[test]
+fn an_equating_hazard_the_axioms_lead_to_reaches_every_term() {
+    let mut wrong = Vec::new();
+    for left in [
+        "ObjectSomeValuesFrom(:R :C)",
+        "ObjectMinCardinality(2 :R owl:Thing)",
+    ] {
+        let axioms = format!(
+            "SubClassOf(:P ObjectSomeValuesFrom(:S {left}))
+            SubClassOf({left} :A)
+            SubClassOf(:A ObjectOneOf(:a))"
+        );
+        let found = concerns(&axioms, "S(?x :a)");
+        if found != ["S: A is contained in an enumeration"] {
+            wrong.push(format!("{left}: {found:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A TBox where every anonymous element has ten successor types, and a chain of twelve
 /// existential arms ending in a class none of them has: the witness search would try
 /// about 10^11 places before failing.
@@ -475,6 +499,64 @@ fn a_data_existential_on_the_left_needs_rdfs_literal() {
         rewritten(literal, "Adult(?x)", &[]),
         ["{Adult(?x) | P(?x) | age(?x _)}"]
     );
+}
+
+/// A minimum cardinality on the left (review A-1202):
+/// - `≥ 2 R.⊤ ⊑ A` with `P ⊑ ∃R` makes neither a `P` nor an individual with one `R` edge an
+///   `A` (`{u, v}`, `P = {u}`, `R = {(u, v)}`, `A = ∅` is a model): neither is an
+///   alternative, and `A` has a hazard;
+/// - `≥ 1 R.⊤ ⊑ A` is `∃R ⊑ A`: an `R` edge is an alternative;
+/// - `≥ 0 R.C ⊑ A` is `⊤ ⊑ A`: rewritten as `owl:Thing ⊑ A` is, so an anonymous `S`-successor
+///   is an `A` too. Inside an intersection on the left it isn't read, and `A` has a hazard
+///   from its role (with `P ⊑ ∃R`, `P`'s anonymous `R`-successor is an `A`) and from its
+///   filler (with `P ⊑ ∃S.C`, `P`'s anonymous `S`-successor, a `C`, is an `A`).
+#[test]
+fn a_minimum_cardinality_on_the_left_is_read_as_it_counts() {
+    let mut wrong = Vec::new();
+    let hazard = ["A: a minimum cardinality on R on the left of an axiom"];
+    let two = "SubClassOf(:P ObjectSomeValuesFrom(:R owl:Thing))
+        SubClassOf(ObjectMinCardinality(2 :R owl:Thing) :A)";
+    let out = rewritten(two, "A(?x)", &[]);
+    if out.iter().any(|b| b.contains("R(") || b.contains("P(")) {
+        wrong.push(format!("≥ 2: {out:?}"));
+    }
+    let found = concerns(two, "A(?x)");
+    if found != hazard {
+        wrong.push(format!("≥ 2 hazard: {found:?}"));
+    }
+    let one = rewritten(
+        "SubClassOf(ObjectMinCardinality(1 :R owl:Thing) :A)",
+        "A(?x)",
+        &[],
+    );
+    if !one.iter().any(|b| b.contains("R(?x _)")) {
+        wrong.push(format!("≥ 1: {one:?}"));
+    }
+    let generating = "SubClassOf(:P ObjectSomeValuesFrom(:S owl:Thing))";
+    let [zero, thing] = ["ObjectMinCardinality(0 :R :C)", "owl:Thing"].map(|left| {
+        let axioms = format!("{generating}\nSubClassOf({left} :A)");
+        rewritten(&axioms, "S(?x ?y), A(?y)", &["y"])
+    });
+    if zero != thing || zero == rewritten(generating, "S(?x ?y), A(?y)", &["y"]) {
+        wrong.push(format!("≥ 0: {zero:?}, as ⊤: {thing:?}"));
+    }
+    let inside = "SubClassOf(ObjectIntersectionOf(ObjectMinCardinality(0 :R :C)
+        ObjectMinCardinality(0 :R :D)) :A)";
+    let found = concerns(
+        &format!("SubClassOf(:P ObjectSomeValuesFrom(:R owl:Thing))\n{inside}"),
+        "A(?x)",
+    );
+    if found != hazard {
+        wrong.push(format!("≥ 0 inside: {found:?}"));
+    }
+    let found = concerns(
+        &format!("SubClassOf(:P ObjectSomeValuesFrom(:S :C))\n{inside}"),
+        "A(?x)",
+    );
+    if found != ["A: C in a complex class expression on the left"] {
+        wrong.push(format!("≥ 0 inside, by the filler: {found:?}"));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// One query's patterns share one work budget (`Limits::query_work`): many patterns can't
