@@ -122,7 +122,9 @@ Do not:
 - Browser UI can target a non-same-origin backend through runtime config. The backend has no CORS policy of its
   own: the proxy in front of it answers the preflight and sends `Access-Control-Allow-Origin`. The backend marks
   `NRESE-Completeness` with `Access-Control-Expose-Headers` on every query answer that carries it, so the console
-  can tell a sound-only answer from a complete one on another origin too; a proxy that sets its own exposed
-  headers must keep that one.
+  can tell complete answers from sound-only, unsound and not-certified ones on another origin too; a proxy
+  that sets its own exposed headers must name that one (a wildcard doesn't cover requests with credentials).
+- `not-certified`, and any other token the client doesn't know, warns that answers may be missing or wrong.
+  With `--require-complete` the CLI still writes the answers and exits 3; an HTTP failure stays exit 1.
 - CLI can talk to the same backend without using browser code paths.
 - Endpoint paths and request construction remain centralized in one frontend client boundary.

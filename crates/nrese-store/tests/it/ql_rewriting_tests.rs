@@ -1191,6 +1191,8 @@ fn existentials_feeding_a_transitive_role_miss_with_the_flag() {
 /// the RL closure the reader sees was computed: a reader who sees the inferences its graphs
 /// support (`inferred = "supported"`) gets the existentials of readable graphs only, one who
 /// sees every inference (`"visible"`) all of them, one who sees none no rewriting.
+/// The one who sees every inference is told `not-certified` and no QL report, since the
+/// assessment reads the schema of every graph (R13-diag).
 #[test]
 fn rewritten_answers_follow_the_readers_graph_access() {
     use std::sync::Arc;
@@ -1232,18 +1234,40 @@ fn rewritten_answers_follow_the_readers_graph_access() {
         request.solutions_format = SolutionsResultFormat::Tsv;
         let result = store.execute_query(&request).unwrap();
         let text = String::from_utf8(result.payload).unwrap();
-        let status = result.ql.map(|r| r.completeness.as_str());
-        (text.contains("<http://e/bob>"), status)
+        let published = result.completeness.as_ref().map(|c| c.as_str());
+        let raw = result.ql.as_ref().map(|r| r.completeness.as_str());
+        (text.contains("<http://e/bob>"), published, raw)
     };
-    // Everything readable: through the existential.
-    assert_eq!(ask(ReadScope::All), (true, Some("complete")));
-    // The axiom is in a graph the reader may not read, and it sees only supported
-    // inferences: not through it.
-    assert_eq!(ask(reader(true, true)), (false, Some("complete")));
-    // It sees every inference, so the schema they come from too.
-    assert_eq!(ask(reader(true, false)), (true, Some("complete")));
-    // It sees no inferences: no rewriting, no status.
-    assert_eq!(ask(reader(false, false)), (false, None));
+    let answers = [
+        // Everything readable: through the existential.
+        ask(ReadScope::All),
+        // The axiom is unreadable; only supported inferences: not through it.
+        ask(reader(true, true)),
+        // Every inference is visible, using even the unreadable schema.
+        ask(reader(true, false)),
+        // No inferences: no rewriting or certification.
+        ask(reader(false, false)),
+    ];
+    assert_eq!(
+        answers.map(|(answer, _, _)| answer),
+        [true, false, true, false],
+        "reader-scoped answers"
+    );
+    assert_eq!(
+        answers.map(|(_, published, _)| published),
+        [
+            Some("complete"),
+            Some("complete"),
+            Some("not-certified"),
+            None
+        ],
+        "public certification by reader scope"
+    );
+    assert_eq!(
+        answers.map(|(_, _, raw)| raw),
+        [Some("complete"), Some("complete"), None, None],
+        "raw QL detail by reader scope"
+    );
 }
 
 /// The printer (design §8): each query printed as standard SPARQL 1.1, in both forms, and
