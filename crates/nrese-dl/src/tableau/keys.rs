@@ -129,21 +129,29 @@ impl Engine<'_> {
                 by_name.entry(c).or_default().push(i);
             }
         }
-        // The scratch, charged before any pair is tried: linear in the members and their
-        // names, with the partners of one member at a time (every later member, or the
-        // buckets of its names), never one entry per pair. Storing the pairs came to 3 GB for
-        // 20,000 members that share a name (PR #48's review, F1).
+        // The scratch, charged before any pair is tried, every list by its capacity as allocated
+        // (a one-name list holds four: PR #48's fix check), the partners' list made after the
+        // charge with the most it can hold. It is linear in the members and their names, with
+        // the partners of one member at a time (every later member, or the buckets of its
+        // names), never one entry per pair: storing the pairs came to 3 GB for 20,000 members
+        // that share a name (PR #48's review, F1).
         let n = members.len();
-        let names: usize = held.iter().flatten().map(Vec::len).sum();
-        let in_buckets: usize = by_name.values().map(Vec::len).sum();
+        let most_partners = n.max(by_name.values().map(Vec::len).sum());
+        let held_bytes = |groups: &Vec<Vec<(ConceptId, DepSetId)>>| {
+            let names: usize = groups.iter().map(Vec::capacity).sum();
+            groups.capacity() * size_of::<Vec<(ConceptId, DepSetId)>>()
+                + names * size_of::<(ConceptId, DepSetId)>()
+        };
         let scratch = named.capacity() * size_of::<u32>()
             + members.capacity() * size_of::<(u32, DepSetId)>()
-            + held.len() * (key.reach.len() + 1) * size_of::<Vec<()>>()
-            + names * size_of::<(ConceptId, DepSetId)>()
-            + crate::memory::table(by_name.len(), size_of::<(ConceptId, Vec<usize>)>())
-            + (in_buckets + n.max(in_buckets)) * size_of::<usize>();
+            + held.capacity() * size_of::<Vec<Vec<(ConceptId, DepSetId)>>>()
+            + held.iter().map(held_bytes).sum::<usize>()
+            + crate::memory::table(by_name.capacity(), size_of::<(ConceptId, Vec<usize>)>())
+            + by_name.values().map(Vec::capacity).sum::<usize>() * size_of::<usize>()
+            + most_partners * size_of::<usize>();
+        self.stats.key_scratch = self.stats.key_scratch.max(scratch as u64);
         self.check_memory_with(scratch)?;
-        let mut partners: Vec<usize> = Vec::new();
+        let mut partners: Vec<usize> = Vec::with_capacity(most_partners);
         for i in 0..n {
             self.check_time()?;
             // i's pairs, each once: every later member, or with a non-simple property the later
