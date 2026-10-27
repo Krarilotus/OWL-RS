@@ -343,11 +343,10 @@ pub(crate) mod tests {
         consistency(o, &Config::default()).answer
     }
 
-    /// Guard (A-1603): `owl:topObjectProperty` U relates every element to `d`, so
+    /// A-1603's witness: `owl:topObjectProperty` U relates every element to `d`, so
     /// `∃U.⊤ ⊑ only-d` leaves one element, `d`; but `only-d ≡ (= 2 p⁻)` needs two
     /// p-predecessors. The product `(2, 3, 6)` with it is inconsistent.
-    #[test]
-    fn a_built_in_property_inside_an_expression_is_no_model() {
+    pub(crate) fn top_over_product() -> Ontology {
         let ([only_d, ..], _, _) = nrese_owl::fuzz::MULTIPLICATION_TERMS;
         let top = 501;
         let mut o = product(2, 3, 6);
@@ -358,21 +357,14 @@ pub(crate) mod tests {
         let only_d = e(ClassExpr::Class(only_d));
         o.axioms.push(Axiom::SubClassOf(some, only_d));
         o.sources.push(Vec::new());
-        // Outside the shortcut the search would take long: within a budget, giving up is
-        // a refusal too.
-        let config = Config {
-            max_branch_points: Some(20_000),
-            ..Config::default()
-        };
-        let answer = consistency(&o, &config).answer;
-        assert_ne!(answer, Answer::Consistent, "∃U.⊤ ⊑ only-d was missed");
+        o
     }
 
-    /// Guard (A-1604): `A ≡ {a}`, `B ≡ {b}`, `A ⊑ = 1 q`, `B ⊑ = 1 q⁻`, q from A to B, and
-    /// `inverse(p, q)` then `inverse(q, r)`. a's q-successor y is in B, and `p(y, a)` by
-    /// the first pair, which `B ⊑ ≤ 0 p` forbids: inconsistent.
-    #[test]
-    fn overlapping_inverse_pairs_are_no_model() {
+    /// A-1604's witness: `A ≡ {a}`, `B ≡ {b}`, `A ⊑ = 1 q`, `B ⊑ = 1 q⁻`, q from A to B,
+    /// and `inverse(p, q)` then `inverse(q, r)`. a's q-successor y is in B, and `p(y, a)`
+    /// by the first pair, which `B ⊑ ≤ 0 p` forbids: inconsistent. Classes 1 and 2,
+    /// individuals 100 and 101, properties 10, 11 and 12.
+    pub(crate) fn overlapping_inverses() -> Ontology {
         let ([a, b], [ia, ib], [p, q, r]) = ([1, 2], [100, 101], [10, 11, 12]);
         let mut o = Ontology::default();
         let mut e = |x| ExprId(o.classes.intern(x));
@@ -395,6 +387,27 @@ pub(crate) mod tests {
             Axiom::SubClassOf(cb, no_p),
         ];
         o.sources = vec![Vec::new(); o.axioms.len()];
+        o
+    }
+
+    /// Guard (A-1603): [`top_over_product`] has no model.
+    #[test]
+    fn a_built_in_property_inside_an_expression_is_no_model() {
+        let o = top_over_product();
+        // Outside the shortcut the search would take long: within a budget, giving up is
+        // a refusal too.
+        let config = Config {
+            max_branch_points: Some(20_000),
+            ..Config::default()
+        };
+        let answer = consistency(&o, &config).answer;
+        assert_ne!(answer, Answer::Consistent, "∃U.⊤ ⊑ only-d was missed");
+    }
+
+    /// Guard (A-1604): [`overlapping_inverses`] has no model.
+    #[test]
+    fn overlapping_inverse_pairs_are_no_model() {
+        let o = overlapping_inverses();
         assert_ne!(
             answer(&o),
             Answer::Consistent,
