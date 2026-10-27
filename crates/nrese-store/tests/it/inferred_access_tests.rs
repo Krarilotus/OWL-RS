@@ -423,10 +423,12 @@ fn a_cancelled_restricted_read_fails_and_leaves_nothing_behind() {
 }
 
 /// A read inside a transaction charges the view it makes to its query's memory, as a read
-/// outside one does (sol-loop r1 of item 18 part 1, S2). 5,000 facts in the reader's graph
-/// give its supported view sets well past 64 KiB, which the query itself fits (a reader of
-/// every graph, with no view, answers): the reader's read fails with the query's memory
-/// limit. Nothing of it is kept, so the same read without a limit answers.
+/// outside one does (sol-loop r1 of item 18 part 1, S2), whether the base's view is made
+/// already or not (review r1 of O4, M). 5,000 facts in the reader's graph give its
+/// supported view sets, and the list of what the operations leave of it, well past 64 KiB,
+/// which the query itself fits (a reader of every graph, with no view, answers): the
+/// reader's read fails with the query's memory limit, cold and then with the base's view
+/// made. Nothing of it is kept, so the same read without a limit answers.
 #[test]
 fn a_pending_read_charges_its_view_to_the_query() {
     use nrese_store::{CancellationToken, PreparedQuery, StatementOp, StatementsRequest};
@@ -464,6 +466,13 @@ fn a_pending_read_charges_its_view_to_the_query() {
     assert!(
         again.as_ref().is_ok_and(|a| a.contains("true")),
         "{again:?}"
+    );
+    // The base's view is made now (the read without a limit made it): what the read keeps
+    // of it for the operations is the read's own, and still past its limit.
+    let warm = ask(reader(true), "ASK {}", limit);
+    assert!(
+        matches!(&warm, Err(error) if error.is_memory_limit()),
+        "with the base's view made: {warm:?}"
     );
 }
 

@@ -58,6 +58,10 @@ use nrese_sparql::{CancellationToken, GraphAccess};
 
 use crate::reasoning::Program;
 
+#[cfg(test)]
+#[path = "support_tests.rs"]
+mod tests;
+
 /// Restricted views kept per revision.
 const VIEWS: usize = 32;
 
@@ -1480,9 +1484,7 @@ type Earlier = (u64, Shared<SupportSets>, Kept<Triple>);
 /// The store's support graph sets and restricted views, for the latest revision read.
 #[derive(Debug)]
 pub(crate) struct Supports {
-    /// The rules the inferred stack is maintained with
-    /// ([`crate::StoreService::use_reasoning_rules`]).
-    rules: Mutex<Option<RuleProgram>>,
+    /// The rules in place and what was computed under them.
     state: Mutex<State>,
     counters: Counters,
     /// Whether sets were computed since the rules were set: readers use them, so
@@ -1528,8 +1530,20 @@ pub struct SupportStatistics {
     pub viewing_us: u64,
 }
 
+/// The rules the inferred stack is maintained with ([`crate::StoreService::use_reasoning_rules`])
+/// and how many times they had been set: what a computation takes its cells under. Sets,
+/// re-derived facts and views are made with these rules, and kept only while they are
+/// still in place (the epoch unchanged): a computation that outlives a change of the rules
+/// answers its own read by the rules it began with, and leaves the state of the new ones.
+#[derive(Debug, Clone, Default)]
+struct Generation {
+    rules: Option<RuleProgram>,
+    epoch: u64,
+}
+
 #[derive(Debug)]
 struct State {
+    generation: Generation,
     /// The latest revision read, its sets, its re-derived facts and its readers' views.
     latest: Option<Latest>,
     /// The last sets computed, and the revision they are of.
@@ -1543,8 +1557,9 @@ struct State {
 }
 
 impl State {
-    fn new(kept: &Arc<Budget>) -> Self {
+    fn new(kept: &Arc<Budget>, generation: Generation) -> Self {
         Self {
+            generation,
             latest: None,
             computed: None,
             rederived: None,
@@ -1627,8 +1642,7 @@ impl Supports {
     /// Sets and views kept on `kept`.
     pub(crate) fn new(kept: Arc<Budget>) -> Self {
         Self {
-            rules: Mutex::default(),
-            state: Mutex::new(State::new(&kept)),
+            state: Mutex::new(State::new(&kept, Generation::default())),
             counters: Counters::default(),
             in_use: std::sync::atomic::AtomicBool::default(),
             kept,
@@ -1636,9 +1650,11 @@ impl Supports {
     }
 
     pub(crate) fn use_rules(&self, rules: Option<RuleProgram>) {
-        *self.rules.lock().unwrap_or_else(|p| p.into_inner()) = rules;
-        // Sets and views of other rules are stale.
-        *self.state() = State::new(&self.kept);
+        // Sets and views of other rules are stale, and so is what is being computed under
+        // them: the rules and their state change together.
+        let mut state = self.state();
+        let epoch = state.generation.epoch + 1;
+        *state = State::new(&self.kept, Generation { rules, epoch });
     }
 
     /// What the sets and views keep is charged to.
@@ -1661,8 +1677,8 @@ impl Supports {
         compilation: Compilation,
         memory: Envelope,
     ) {
-        let cell = match self.cell_for(&snapshot) {
-            Ok(cell) => cell,
+        let (cell, generation) = match self.cell_for(&snapshot) {
+            Ok(taken) => taken,
             Err(error) => {
                 tracing::warn!(?error, "support graph sets not prepared");
                 return;
@@ -1679,7 +1695,9 @@ impl Supports {
                     budget: Arc::new(memory.part()),
                     cancellation: None,
                 };
-                let sets = cell.get_or_init(|| supports.compute(&snapshot, compilation, &working));
+                let sets = cell.get_or_init(|| {
+                    supports.compute(&snapshot, &generation, compilation, &working)
+                });
                 if let Err(error) = sets {
                     tracing::warn!(?error, "support graph sets not prepared");
                     supports.drop_failed(&snapshot, &cell, None, None);
@@ -1690,11 +1708,13 @@ impl Supports {
         }
     }
 
-    /// The cell of `snapshot`'s sets, which becomes the latest revision's.
-    fn cell_for(&self, snapshot: &Snapshot) -> Result<Cell, BudgetExceeded> {
+    /// The cell of `snapshot`'s sets, which becomes the latest revision's, and the rules
+    /// it is computed under.
+    fn cell_for(&self, snapshot: &Snapshot) -> Result<(Cell, Generation), BudgetExceeded> {
         let mut state = self.state();
+        let generation = state.generation.clone();
         let (_, cell, ..) = state.latest_for(snapshot, &self.kept)?;
-        Ok(cell.clone())
+        Ok((cell.clone(), generation))
     }
 
     pub(crate) fn statistics(&self) -> SupportStatistics {
@@ -1807,8 +1827,9 @@ impl Supports {
         memory: &Envelope,
         cancellation: Option<&CancellationToken>,
     ) -> Result<Snapshot, Unavailable> {
-        let (cell, rederiving, view) = {
+        let (cell, rederiving, view, generation) = {
             let mut state = self.state();
+            let generation = state.generation.clone();
             let (_, cell, rederiving, views) = state.latest_for(snapshot, &self.kept)?;
             let view = match views.iter().find(|(seen, _)| **seen == **access) {
                 Some((_, view)) => view.clone(),
@@ -1821,7 +1842,7 @@ impl Supports {
                     view
                 }
             };
-            (cell.clone(), rederiving.clone(), view)
+            (cell.clone(), rederiving.clone(), view, generation)
         };
         let working = Work {
             budget: Arc::new(memory.part()),
@@ -1830,18 +1851,31 @@ impl Supports {
         let made = view
             .get_or_init(|| match access.inferred_by_support {
                 true => {
-                    let sets = cell.get_or_init(|| self.compute(snapshot, compilation, &working));
-                    match sets {
-                        Ok(Some(sets)) => {
-                            self.build_view(snapshot, access, sets, compilation, &working)
+                    let sets = cell
+                        .get_or_init(|| self.compute(snapshot, &generation, compilation, &working));
+                    // The cell's sets were computed under its state's rules, `generation`'s:
+                    // the closure deciding what they leave open is by the same rules.
+                    match (sets, &generation.rules) {
+                        (Ok(Some(sets)), Some(rules)) => {
+                            let within =
+                                || self.within(snapshot, access, rules, compilation, &working);
+                            self.build_view(
+                                snapshot,
+                                access,
+                                sets,
+                                within,
+                                generation.epoch,
+                                &working,
+                            )
                         }
-                        Ok(None) => Ok(snapshot.with_inferred_only(&[], &self.kept)?),
-                        Err(unavailable) => Err(*unavailable),
+                        (Ok(_), _) => Ok(snapshot.with_inferred_only(&[], &self.kept)?),
+                        (Err(unavailable), _) => Err(*unavailable),
                     }
                 }
                 false => {
-                    let found = rederiving
-                        .get_or_init(|| self.compute_rederived(snapshot, compilation, &working));
+                    let found = rederiving.get_or_init(|| {
+                        self.compute_rederived(snapshot, &generation, compilation, &working)
+                    });
                     match found {
                         Ok(found) => self.visible_view(snapshot, access, found, &working),
                         Err(unavailable) => Err(*unavailable),
@@ -1899,16 +1933,17 @@ impl Supports {
     fn compute_rederived(
         &self,
         snapshot: &Snapshot,
+        generation: &Generation,
         compilation: Compilation,
         working: &Work,
     ) -> Result<Shared<Rederived>, Unavailable> {
-        let Some(rules) = self.rules.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
+        let Some(rules) = &generation.rules else {
             return Ok(Shared::new(Rederived::empty(&self.kept), &self.kept)?);
         };
         if compilation.compact {
             return Ok(Shared::new(Rederived::empty(&self.kept), &self.kept)?);
         }
-        let program = self.program(&rules, snapshot, compilation);
+        let program = self.program(rules, snapshot, compilation);
         let ground = program.ground_program(snapshot);
         let schema = ground.schema_premises();
         let mut axioms: Kept<Triple> =
@@ -1960,9 +1995,14 @@ impl Supports {
         let earlier = {
             let state = self.state();
             match &state.rederived {
-                Some((from, earlier)) if earlier.grounded_on(&schema, &axioms) => state
-                    .touched_between(*from, revision, working)?
-                    .map(|touched| (earlier.clone(), touched)),
+                Some((from, earlier))
+                    if state.generation.epoch == generation.epoch
+                        && earlier.grounded_on(&schema, &axioms) =>
+                {
+                    state
+                        .touched_between(*from, revision, working)?
+                        .map(|touched| (earlier.clone(), touched))
+                }
                 _ => None,
             }
         };
@@ -2047,10 +2087,11 @@ impl Supports {
             &self.kept,
         )?;
         let mut state = self.state();
-        if state
-            .rederived
-            .as_ref()
-            .is_none_or(|(at, _)| *at < revision)
+        if state.generation.epoch == generation.epoch
+            && state
+                .rederived
+                .as_ref()
+                .is_none_or(|(at, _)| *at < revision)
         {
             state.rederived = Some((revision, found.clone()));
             if let Some(oldest) = state.oldest() {
@@ -2091,22 +2132,31 @@ impl Supports {
 
     /// The view of `snapshot` for `access` under `sets`: from the reader's last one where
     /// the sets were updated from its revision and they decide every changed statement,
-    /// else from the whole stack.
+    /// else from the whole stack, `within` (the reader's closure, by the sets' rules)
+    /// deciding what the sets leave open. The sets are of the rules set `epoch` times: the
+    /// reader's last view is taken, and this one kept, only while they are in place.
     fn build_view(
         &self,
         snapshot: &Snapshot,
         access: &Arc<GraphAccess>,
         sets: &Shared<SupportSets>,
-        compilation: Compilation,
+        within: impl FnOnce() -> Result<Kept<Triple>, Unavailable>,
+        epoch: u64,
         working: &Work,
     ) -> Result<Snapshot, Unavailable> {
         let started = std::time::Instant::now();
-        let earlier = self
-            .state()
-            .readers
-            .iter()
-            .find(|reader| *reader.access == **access)
-            .cloned();
+        let earlier = {
+            let state = self.state();
+            (state.generation.epoch == epoch)
+                .then(|| {
+                    state
+                        .readers
+                        .iter()
+                        .find(|reader| *reader.access == **access)
+                        .cloned()
+                })
+                .flatten()
+        };
         let mut form = None;
         if let Some(reader) = earlier
             && let Some(changes) =
@@ -2131,7 +2181,7 @@ impl Supports {
             None => {
                 let within = || {
                     Counters::add(&self.counters.closures, 1);
-                    self.within(snapshot, access, compilation, working)
+                    within()
                 };
                 match sets.split(snapshot, access, &self.kept, working, within)? {
                     Split::Mask { hide, show } => Form::Mask(
@@ -2158,11 +2208,13 @@ impl Supports {
         )?;
         {
             let mut state = self.state();
-            state.readers.retain(|reader| *reader.access != **access);
-            if state.readers.len() >= VIEWS {
-                without_first(&mut state.readers);
+            if state.generation.epoch == epoch {
+                state.readers.retain(|reader| *reader.access != **access);
+                if state.readers.len() >= VIEWS {
+                    without_first(&mut state.readers);
+                }
+                state.readers.push(reader)?;
             }
-            state.readers.push(reader)?;
         }
         Counters::add(&self.counters.views, 1);
         Counters::add(&self.counters.viewing, started.elapsed().as_micros() as u64);
@@ -2190,22 +2242,17 @@ impl Supports {
     }
 
     /// The closure of the statements a reader with `access` reads in `snapshot`, sorted,
-    /// by the evaluation that gives the sets: what decides the statements its kept sets
-    /// leave open. Charged to `working`.
+    /// by the evaluation that gives the sets, under `rules` (the sets' own): what decides
+    /// the statements its kept sets leave open. Charged to `working`.
     fn within(
         &self,
         snapshot: &Snapshot,
         access: &GraphAccess,
+        rules: &RuleProgram,
         compilation: Compilation,
         working: &Work,
     ) -> Result<Kept<Triple>, Unavailable> {
-        let rules = self
-            .rules
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-            .expect("sets were computed with rules");
-        let program = self.program(&rules, snapshot, compilation);
+        let program = self.program(rules, snapshot, compilation);
         let mut axioms: Kept<Triple> =
             ChargedVec::with_capacity(Arc::clone(working), program.axioms().len())?;
         axioms.extend_from_slice(program.axioms())?;
@@ -2237,27 +2284,29 @@ impl Supports {
         Ok(facts)
     }
 
-    /// The sets of `snapshot`: the last ones updated by the commits since, where they
-    /// lead there, else computed afresh. What computing them reads charged to `working`.
+    /// The sets of `snapshot` under `generation`'s rules: the last ones updated by the
+    /// commits since, where they lead there, else computed afresh. What computing them
+    /// reads charged to `working`.
     fn compute(
         &self,
         snapshot: &Snapshot,
+        generation: &Generation,
         compilation: Compilation,
         working: &Work,
     ) -> Result<Option<Shared<SupportSets>>, Unavailable> {
-        let Some(rules) = self.rules.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
+        let Some(rules) = &generation.rules else {
             return Ok(None);
         };
         if compilation.compact {
             return Ok(None);
         }
-        let program = self.program(&rules, snapshot, compilation);
+        let program = self.program(rules, snapshot, compilation);
         let cap = compilation.cap.max(1);
         let revision = snapshot.revision();
         self.in_use
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let started = std::time::Instant::now();
-        let updated = match self.base_for(revision, working)? {
+        let updated = match self.base_for(revision, generation.epoch, working)? {
             Some((from, earlier, touched)) => {
                 earlier.updated(&program, snapshot, from, &touched, cap, &self.kept, working)?
             }
@@ -2297,7 +2346,9 @@ impl Supports {
         }
         let sets = Shared::new(sets, &self.kept)?;
         let mut state = self.state();
-        if state.computed.as_ref().is_none_or(|(at, _)| *at < revision) {
+        if state.generation.epoch == generation.epoch
+            && state.computed.as_ref().is_none_or(|(at, _)| *at < revision)
+        {
             state.computed = Some((revision, sets.clone()));
             if let Some(oldest) = state.oldest() {
                 state.commits.retain(|&(_, to, _)| to > oldest);
@@ -2307,13 +2358,18 @@ impl Supports {
     }
 
     /// The last sets computed, their revision, and the facts the reported commits
-    /// touched from there to `revision` (sorted, on `working`), if the commits lead there.
+    /// touched from there to `revision` (sorted, on `working`), if the commits lead there
+    /// and the rules set `epoch` times are still in place.
     fn base_for(
         &self,
         revision: u64,
+        epoch: u64,
         working: &Arc<Budget>,
     ) -> Result<Option<Earlier>, BudgetExceeded> {
         let state = self.state();
+        if state.generation.epoch != epoch {
+            return Ok(None);
+        }
         let Some((from, sets)) = state.computed.clone() else {
             return Ok(None);
         };
