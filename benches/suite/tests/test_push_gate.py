@@ -362,8 +362,10 @@ class GateJob(Repo):
             (stubs / name).write_text("#!/bin/sh\n" + body + "\n")
             (stubs / name).chmod(0o755)
         cache, seen = self.root / "cache", self.root / "seen"
-        # check.sh: says whether an old cache entry was still there while it ran, and prints its summary.
+        # check.sh: says whether an old cache entry was still there while it ran, where it builds, and
+        # prints its summary.
         check = ('echo "old=$(test -d "$NRESE_GATE_CACHE/target-old" && echo there)" > "$SEEN"\n'
+                 'echo "target=$CARGO_TARGET_DIR" >> "$SEEN"\n'
                  'printf "=== summary\\n  0  fmt (1 s)\\n"\n')
         for rel, body in {"scripts/check.sh": check, "scripts/cargo-guarded.sh": 'echo "-C target-cpu=native"\n',
                           "rust-toolchain.toml": '[toolchain]\nchannel = "1.98.1"\n',
@@ -411,9 +413,15 @@ class GateJob(Repo):
             self.assertRegex(result["identity"],
                              r"^rustc-1\.98\.1-abcdef123456 flags=-C_target-cpu=native tools=[0-9a-f]{12}$")
             self.assertEqual(result["steps"], [{"name": "fmt", "code": 0, "seconds": 1}])
+            said = dict(line.split("=", 1) for line in seen.read_text().split())
             # The sweep after the run, not before.
-            self.assertEqual(seen.read_text().split(), ["old=there"])
+            self.assertEqual(said["old"], "there")
             self.assertFalse(old.exists(), "the stale entry wasn't swept after the run")
+            # A target of the gates' own in the cache, not target-<release>, which /verify's builds
+            # from other checkouts shared until 26 Oct 2026 (cargo decides freshness by mtimes).
+            target = Path(said["target"])
+            self.assertTrue(target.parent == cache and target.name != "target-1.98.1",
+                            f"SPEC gate-target: the gate builds in {target}")
 
 
 class WindowsCheck(Repo):

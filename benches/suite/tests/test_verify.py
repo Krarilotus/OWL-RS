@@ -11,10 +11,12 @@ scenario that would check less than it says is refused before anything starts. N
 """
 from __future__ import annotations
 
+import argparse
 import contextlib
 import importlib.util
 import io
 import json
+import os
 import re
 import shutil
 import socket
@@ -222,6 +224,12 @@ class Resolution(unittest.TestCase):
         self.assertEqual(sock.getpeername()[1], port)
 
 
+def isolated_build(build: Path, revision: str, digest: str, contract: str = "isolated-build/1") -> None:
+    """The PROVENANCE build-on-host.sh writes after an isolated build of `revision`."""
+    (build / "PROVENANCE").write_bytes(f"contract {contract}\nrevision {revision}\ntree {'1' * 40}\n"
+                                       f"rustc 1.98.1\nsha256 {digest}\n".encode())
+
+
 class SweptBuild(unittest.TestCase):
     def test_a_build_swept_while_it_is_chosen_is_a_launch_failure_with_a_summary(self):
         root = Path(tempfile.mkdtemp(prefix="verify-test-"))
@@ -230,6 +238,7 @@ class SweptBuild(unittest.TestCase):
         build.mkdir(parents=True)
         (build / "nrese-server").write_bytes(b"x")
         (build / "SHA256SUMS").write_text(f"{verify.sha256_of(build / 'nrese-server')}  nrese-server\n")
+        isolated_build(build, "0123456789ab" + "0" * 28, verify.sha256_of(build / "nrese-server"))
         (build / ".last-used").mkdir()  # its mark can't be written, as when a sweep took the directory
         scenario_file = root / "one.toml"
         scenario_file.write_text('[[step]]\nname = "health"\npath = "/healthz"\nexpect = { status = 200 }\n')
@@ -243,6 +252,104 @@ class SweptBuild(unittest.TestCase):
         self.assertEqual(code, 3)
         summary = json.loads((root / "evidence" / "summary.json").read_text(encoding="utf-8"))
         self.assertTrue(summary["scenarios"][0]["error"].startswith("launch: reading the server's build failed"))
+
+
+class Provenance(unittest.TestCase):
+    """--server-rev runs only an isolated build of the commit it names (PR #47, Sol r1 F1). A
+    bin-<sha12> from before the builds were isolated (26 Oct 2026) can hold another commit's code
+    under this one's name, its REVISION and checksum valid: only the PROVENANCE build-on-host.sh
+    writes after an isolated build tells them apart."""
+
+    def test_only_an_isolated_build_of_the_commit_is_run(self):
+        revision = "0123456789ab" + "0" * 28
+        other = "0123456789ab" + "f" * 28  # the same bin-<sha12>
+        cases = {  # name: its PROVENANCE, or None for none; whether it may run
+            "an isolated build": (lambda b, d: isolated_build(b, revision, d), True),
+            "a build from before (the witness)": (None, False),
+            "another commit's record": (lambda b, d: isolated_build(b, other, d), False),
+            "another binary's record": (lambda b, d: isolated_build(b, revision, "0" * 64), False),
+            "another contract": (lambda b, d: isolated_build(b, revision, d, "isolated-build/0"), False),
+            "an empty record": (lambda b, d: (b / "PROVENANCE").write_bytes(b""), False),
+        }
+        wrong = []
+        for name, (record, admitted) in cases.items():
+            root = Path(tempfile.mkdtemp(prefix="verify-provenance-"))
+            self.addCleanup(shutil.rmtree, root, True)
+            build = root / "bin-0123456789ab"
+            build.mkdir()
+            (build / "nrese-server").write_bytes(b"#!/bin/sh\n# a commit's code\n")
+            digest = verify.sha256_of(build / "nrese-server")
+            (build / "SHA256SUMS").write_bytes(f"{digest}  nrese-server\n".encode())
+            (build / "REVISION").write_bytes(f"{revision}\n".encode())
+            if record:
+                record(build, digest)
+            original, verify.CACHE = verify.CACHE, root
+            try:
+                target = verify.target_of(argparse.Namespace(url=None, server_rev=revision, server=None))
+                ran = target["binary"]["sha256"] == digest
+            except LaunchError:
+                ran = False
+            finally:
+                verify.CACHE = original
+            if ran != admitted:
+                wrong.append(f"{name}: {'run' if ran else 'refused'}")
+        self.assertEqual(wrong, [], "SPEC provenance: --server-rev runs exactly the isolated builds")
+
+
+class AdmittedBytes(unittest.TestCase):
+    """What --server-rev runs is the build it admitted, whatever happens to bin-<sha12> after (PR
+    #47, fix check 1): a sweep can take the entry, and a builder from an older harness put another
+    commit's code there under this commit's REVISION with a valid checksum and no PROVENANCE, while
+    the record is read or before the server starts (and restarts, from the same command)."""
+
+    def test_what_runs_is_the_build_admitted_or_nothing(self):
+        revision = "0123456789ab" + "0" * 28
+        admitted, other = b"#!/bin/sh\n# this commit's code\n", b"#!/bin/sh\n# another commit's code\n"
+
+        def entry(build: Path, code: bytes, record: bool) -> None:
+            build.mkdir()
+            (build / "nrese-server").write_bytes(code)
+            digest = verify.sha256_of(build / "nrese-server")
+            (build / "SHA256SUMS").write_bytes(f"{digest}  nrese-server\n".encode())
+            (build / "REVISION").write_bytes(f"{revision}\n".encode())
+            if record:
+                isolated_build(build, revision, digest)
+
+        wrong = []
+        for when in ("while its record is read", "after it was chosen"):
+            root = Path(tempfile.mkdtemp(prefix="verify-admitted-"))
+            self.addCleanup(shutil.rmtree, root, True)
+            build = root / "bin-0123456789ab"
+            entry(build, admitted, True)
+            replaced = []
+
+            def replace():  # the sweep, then the older builder's publication
+                shutil.rmtree(build)
+                entry(build, other, False)
+                replaced.append(when)
+
+            read_text = Path.read_text
+
+            def reading(path, *args, **kwargs):
+                text = read_text(path, *args, **kwargs)
+                if path.name == "PROVENANCE" and when == "while its record is read" and not replaced:
+                    replace()
+                return text
+
+            original, verify.CACHE, Path.read_text = verify.CACHE, root, reading
+            try:
+                target = verify.target_of(argparse.Namespace(url=None, server_rev=revision, server=None))
+            except LaunchError:
+                target = None
+            finally:
+                verify.CACHE, Path.read_text = original, read_text
+            if when == "after it was chosen":
+                replace()
+            ran = Path(target["command"][0]).read_bytes() if target else None
+            if not replaced or ran not in (admitted, None) or (when == "after it was chosen" and ran is None):
+                wrong.append(f"{when}: {'nothing' if ran is None else 'another commit' if ran == other else ran}")
+        self.assertEqual(wrong, [], "SPEC provenance: what runs is the bytes admitted (or, while they "
+                                    "are read, nothing)")
 
 
 @unittest.skipUnless(shutil.which("flock") and shutil.which("bash"), "needs flock (Linux)")
@@ -281,6 +388,79 @@ class Migration(unittest.TestCase):
             time.sleep(0.05)
         self.migrate(old)
         self.assertTrue((old / "target-1.98.1").is_dir())
+
+
+@unittest.skipUnless(shutil.which("flock") and Path("/proc/self/cgroup").exists(), "a Linux fleet host's step")
+class OwnTarget(unittest.TestCase):
+    """build-on-host.sh compiles in its own checkout's target directory, whatever the host sets, never
+    in one another checkout builds in (the gates', shared until 26 Oct 2026, or another build's):
+    cargo decides freshness by mtimes, and its unit hashes don't depend on the checkout's path, so
+    another checkout's build there could stand in for this commit's code."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="verify-target-"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.cache, stubs, self.seen = self.root / "cache", self.root / "stubs", self.root / "seen"
+        stubs.mkdir()
+        for name, body in {"rustup": "exit 0", "rustc": 'echo "release: 1.98.1"'}.items():
+            (stubs / name).write_text(f"#!/bin/sh\n{body}\n")
+            (stubs / name).chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "NRESE_", "FLEET_", "CARGO_"))}
+        env.update(HOME=str(self.root), PATH=f"{stubs}:{env['PATH']}", NRESE_VERIFY_CACHE=str(self.cache),
+                   SEEN=str(self.seen),
+                   CARGO_TARGET_DIR=str(self.cache / "target-1.98.1"))  # a host's own setting: the shared directory
+        self.env = env
+
+    def commit(self, name: str) -> Path:
+        """A checkout of one commit of its own, whose cargo-guarded.sh says where it builds and
+        leaves a binary there (its checkout's path, executable)."""
+        repo = self.root / name
+        (repo / "scripts").mkdir(parents=True)
+        (repo / "rust-toolchain.toml").write_text('[toolchain]\nchannel = "1.98.1"\n')
+        (repo / "scripts" / "cargo-guarded.sh").write_text(
+            'echo "$CARGO_TARGET_DIR" >> "$SEEN"\nmkdir -p "$CARGO_TARGET_DIR/debug"\n'
+            'echo "$PWD" > "$CARGO_TARGET_DIR/debug/nrese-server"\nchmod +x "$CARGO_TARGET_DIR/debug/nrese-server"\n')
+        (repo / "src.rs").write_text(f"// commit {name}\n")
+        for args in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "c"]):
+            subprocess.run(["git", *args], cwd=repo, env=self.env, check=True, capture_output=True, timeout=60)
+        return repo
+
+    def build(self, repo: Path, run: str) -> dict:
+        """build-on-host.sh in `repo`, as a fleet step: its build.json."""
+        out = self.root / f"out-{run}"
+        out.mkdir()
+        done = subprocess.run(["bash", str(ROOT / "scripts/verify/build-on-host.sh")], cwd=repo,
+                              env={**self.env, "FLEET_OUT": str(out)}, capture_output=True, text=True, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        return json.loads((out / "build.json").read_text(encoding="utf-8"))
+
+    def test_each_build_compiles_in_its_own_checkout(self):
+        checkouts = [self.commit("a"), self.commit("b")]  # two commits, so neither reuses the other's binary
+        for repo in checkouts:
+            self.build(repo, repo.name)
+        built = [Path(line) for line in self.seen.read_text().split()]
+        self.assertEqual(len(built), 2)
+        for path, repo in zip(built, checkouts):
+            self.assertTrue(path.name == "target" and path.parent.samefile(repo),
+                            f"SPEC own-target: built in {path}, not {repo}'s own target directory")
+        self.assertEqual(list(self.cache.glob("target*")), [], "SPEC own-target: a build compiled in the host's cache")
+
+    def test_a_build_from_before_isolated_builds_is_built_again(self):
+        """A bin-<sha12> from the shared target can hold another commit's code under this one's
+        name, its REVISION and checksum valid (PR #47, Sol r1 F1): it is built again, and the
+        isolated build it leaves is reused."""
+        repo = self.commit("a")
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, env=self.env, check=True,
+                             capture_output=True, text=True, timeout=60).stdout.strip()
+        legacy = self.cache / f"bin-{sha[:12]}"
+        legacy.mkdir(parents=True)
+        (legacy / "nrese-server").write_bytes(b"#!/bin/sh\n# another commit's code\n")
+        (legacy / "nrese-server").chmod(0o755)
+        (legacy / "SHA256SUMS").write_bytes(f"{verify.sha256_of(legacy / 'nrese-server')}  nrese-server\n".encode())
+        (legacy / "REVISION").write_bytes(f"{sha}\n".encode())
+        self.assertTrue(self.build(repo, "first")["built"], "SPEC provenance: a build from before was reused")
+        self.assertEqual((legacy / "nrese-server").read_text().strip(), str(repo), "not this checkout's build")
+        self.assertFalse(self.build(repo, "second")["built"], "an isolated build of this tree is built again")
 
 
 class Launch(unittest.TestCase):
