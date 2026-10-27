@@ -54,6 +54,10 @@ fn app() -> Result<axum::Router, Box<dyn std::error::Error>> {
 }
 
 fn app_with(policy: &str) -> Result<axum::Router, Box<dyn std::error::Error>> {
+    app_in(policy, ReasoningMode::Rdfs)
+}
+
+fn app_in(policy: &str, mode: ReasoningMode) -> Result<axum::Router, Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("access.toml");
     std::fs::write(&path, policy)?;
@@ -69,7 +73,7 @@ fn app_with(policy: &str) -> Result<axum::Router, Box<dyn std::error::Error>> {
         access: Some(Arc::new(nrese_server::access::load(&path)?)),
         ..PolicyConfig::default()
     };
-    test_app_with_settings(policy, ReasonerConfig::for_mode(ReasoningMode::Rdfs))
+    test_app_with_settings(policy, ReasonerConfig::for_mode(mode))
 }
 
 async fn send(
@@ -298,6 +302,55 @@ async fn updates_change_only_writable_graphs() -> Result<(), Box<dyn std::error:
         update(&app, &["public"], &insert("pub/1")).await?,
         StatusCode::FORBIDDEN
     );
+    Ok(())
+}
+
+/// Spec (S4, `ReadScope::require_all`): an explanation under OWL 2 DL reads every graph, so
+/// a reader of some graphs is refused it (403), though it sees inferred statements; a
+/// reader of every graph gets it.
+#[tokio::test]
+async fn an_owl2_dl_explanation_is_refused_to_a_reader_of_some_graphs()
+-> Result<(), Box<dyn std::error::Error>> {
+    const READER: &str = r#"
+default = "deny"
+inferred = "visible"
+
+[[role]]
+name = "reader"
+read = ["http://example.com/g/pub/*"]
+default_graph = "read"
+"#;
+    let app = app_in(READER, ReasoningMode::Owl2Dl)?;
+    let status = update(
+        &app,
+        &["nrese.admin"],
+        &format!(
+            "PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {{
+               <{EX}B> rdfs:subClassOf <{EX}D> . <{EX}C> rdfs:subClassOf <{EX}D> .
+               <{EX}w> a [ owl:unionOf ( <{EX}B> <{EX}C> ) ]
+             }}"
+        ),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let explain = format!(
+        "/api/v1/repositories/nrese/explain?{}",
+        serde_urlencoded::to_string([
+            ("subj", format!("<{EX}w>")),
+            (
+                "pred",
+                "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_owned(),
+            ),
+            ("obj", format!("<{EX}D>")),
+        ])?
+    );
+    let (status, body) = send(&app, &["reader"], Method::GET, &explain, None, "").await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("reads every graph"), "{body}");
+    let (status, body) = send(&app, &["nrese.admin"], Method::GET, &explain, None, "").await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
     Ok(())
 }
 
