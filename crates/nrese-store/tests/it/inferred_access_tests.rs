@@ -476,6 +476,40 @@ fn a_pending_read_charges_its_view_to_the_query() {
     );
 }
 
+/// A planned read (EXPLAIN without running) charges the view it makes to its query's memory,
+/// as a run does (Sol's review of O4's boundary round, S1). With the query's limit at 1 byte,
+/// a supported reader whose view is past it is refused by that limit, not by the server's
+/// query memory (64 KiB here), which the view passes too.
+#[test]
+fn a_planned_read_charges_its_view_to_the_query() {
+    use nrese_store::{CancellationToken, StoreConfig};
+    let store = StoreService::new(StoreConfig {
+        total_query_memory_bytes: 64 * 1024,
+        ..in_memory_store_config()
+    })
+    .unwrap();
+    let facts: String = (0..5_000).map(|i| format!("ex:i{i} a ex:C . ")).collect();
+    store
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {{ GRAPH ex:open {{ ex:C rdfs:subClassOf ex:D . {facts} }} }}"
+        )))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    let mut request = SparqlQueryRequest::new(
+        format!("PREFIX ex: <{EX}> ASK {{ ex:i0 a ex:D }}"),
+        reader(true),
+    );
+    request.memory_limit = Some(1);
+    let prepared = store.prepare_query(&request).unwrap();
+    let planned = store.plan_query(&prepared, &CancellationToken::new());
+    assert!(
+        matches!(&planned, Err(error) if error.is_memory_limit() && !error.is_server_memory_limit()),
+        "{planned:?}"
+    );
+}
+
 /// Without rules registered the sets can't be computed: no inferred statement is shown.
 #[test]
 fn without_rules_nothing_inferred_is_shown() {
