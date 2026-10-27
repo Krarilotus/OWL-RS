@@ -165,6 +165,9 @@ const UNCOUNTED: &str = "a cardinality whose negation is past 4294967295";
 /// Why an axiom whose clause or key needs more variables than a `u16` numbers is left out.
 const TOO_WIDE: &str = "a clause or key with more than 65535 variables";
 
+/// Why an axiom whose universal needs an automaton of an irregular role is left out.
+const IRREGULAR: &str = "an irregular role hierarchy";
+
 /// `count` clause variables numbered from `*next` on; `next` moves past them. `None` where
 /// a `u16` doesn't number them all: two would be one.
 fn variables(next: &mut u32, count: usize) -> Option<Vec<u16>> {
@@ -189,14 +192,21 @@ enum Item {
     NotFresh(u32),
 }
 
+/// What takes a shared name from the caches (a fresh name, or an automaton's start state):
+/// an axiom, or the definition of another shared name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Taker {
+    Axiom(usize),
+    Name(u32),
+}
+
 /// A GCI waiting to be clausified: extra body atoms and its disjuncts.
 struct Gci {
     body: Vec<BodyAtom>,
     items: Vec<Item>,
     source: usize,
-    /// A fresh name's or an automaton state's definition, which the caches give other
-    /// axioms too (`Normaliser::refuse`).
-    shared: bool,
+    /// Its axiom's, or the shared name's it defines.
+    taker: Taker,
 }
 
 struct Normaliser<'a> {
@@ -229,6 +239,12 @@ struct Normaliser<'a> {
     expand_up_to: u32,
     /// Definitions unfolded lazily (`Options::lazy_definitions`).
     unfolded: crate::definitions::Unfolded,
+    /// What is being read (an axiom, or a queued GCI's taker): what takes a shared name now.
+    taker: Taker,
+    /// Per shared name, what took it.
+    takers: HashMap<u32, Vec<Taker>>,
+    /// The shared names whose definitions can't be read in full, with why.
+    failed: HashMap<u32, &'static str>,
 }
 
 impl<'a> Normaliser<'a> {
@@ -254,6 +270,9 @@ impl<'a> Normaliser<'a> {
             clause_index: HashMap::default(),
             expand_up_to: Options::default().expand_at_most_up_to,
             unfolded: Default::default(),
+            taker: Taker::Axiom(0),
+            takers: HashMap::new(),
+            failed: HashMap::new(),
         };
         n.role_inclusions(extra);
         n
@@ -398,17 +417,18 @@ impl<'a> Normaliser<'a> {
             body,
             items,
             source,
-            shared: false,
+            taker: Taker::Axiom(source),
         });
     }
 
-    /// A fresh name's or an automaton state's definition (`Gci::shared`).
-    fn define(&mut self, body: Vec<BodyAtom>, items: Vec<Item>, source: usize) {
+    /// The definition of the shared name `name` (a fresh name, or an automaton's start
+    /// state for its end state's).
+    fn define(&mut self, name: u32, body: Vec<BodyAtom>, items: Vec<Item>, source: usize) {
         self.queue.push(Gci {
             body,
             items,
             source,
-            shared: true,
+            taker: Taker::Name(name),
         });
     }
 
@@ -435,21 +455,36 @@ impl<'a> Normaliser<'a> {
     /// Axiom `source` needs `≥ n + 1` past a `u32` count (`nnf_not`): what it gave until
     /// then holds, the rest is left out, and the axiom is unsupported.
     fn uncounted(&mut self, source: usize) {
-        if !self.out.unsupported.contains(&(source, UNCOUNTED)) {
-            self.out.unsupported.push((source, UNCOUNTED));
+        self.fail(Taker::Axiom(source), UNCOUNTED);
+    }
+
+    /// The current taker takes the shared name `name` from the caches; if `name`'s
+    /// definition can't be read in full, neither can the taker.
+    fn take(&mut self, name: u32) {
+        self.takers.entry(name).or_default().push(self.taker);
+        if let Some(&why) = self.failed.get(&name) {
+            self.fail(self.taker, why);
         }
     }
 
-    /// A GCI of axiom `source` needs a count past `u32` while it is clausified. A shared
-    /// definition (`Gci::shared`) has reached other axioms through the caches by then,
-    /// each weaker without it: every axiom is unsupported. (Only a count of 4294967295
-    /// that an at-most's filler holds gets here.)
-    fn refuse(&mut self, source: usize, shared: bool) {
-        if !shared {
-            return self.uncounted(source);
-        }
-        for index in 0..self.ontology.axioms.len() {
-            self.uncounted(index);
+    /// `taker` can't be read in full (`why`): what it gave until then holds, the rest is
+    /// left out. An axiom is unsupported; a shared name's definition fails, and so does
+    /// everything that took the name, then or later (`take`): each is weaker without it.
+    fn fail(&mut self, taker: Taker, why: &'static str) {
+        let mut todo = vec![taker];
+        while let Some(taker) = todo.pop() {
+            match taker {
+                Taker::Axiom(index) => {
+                    if !self.out.unsupported.contains(&(index, why)) {
+                        self.out.unsupported.push((index, why));
+                    }
+                }
+                Taker::Name(name) => {
+                    if self.failed.insert(name, why).is_none() {
+                        todo.extend(self.takers.get(&name).into_iter().flatten());
+                    }
+                }
+            }
         }
     }
 
@@ -512,6 +547,7 @@ impl<'a> Normaliser<'a> {
     }
 
     fn axiom(&mut self, index: usize, axiom: &Axiom) {
+        self.taker = Taker::Axiom(index);
         let (x, y) = (Var::X, Var::Y(0));
         match axiom {
             Axiom::Declaration(..) => {}
@@ -786,6 +822,13 @@ impl<'a> Normaliser<'a> {
             self.out.unsupported.push((index, TOO_WIDE));
             return;
         };
+        // A non-simple property with no named individual to reach: no pair the key merges,
+        // no rule, and no name taken.
+        if objects.iter().any(|p| self.non_simple.contains(&p.named()))
+            && self.ontology.named_individuals().is_empty()
+        {
+            return;
+        }
         let (x, y) = (Var::X, Var::Y(0));
         let mut body = Vec::new();
         let Some(c) = self.nnf(class) else {
@@ -861,6 +904,7 @@ impl<'a> Normaliser<'a> {
     /// A fresh `Q ⊑ e` (`e` in negation normal form).
     fn fresh_positive(&mut self, e: ExprId, source: usize) -> u32 {
         if let Some(&q) = self.positive.get(&e) {
+            self.take(q);
             return q;
         }
         let q = self.new_fresh(FreshOf::Expr {
@@ -868,7 +912,13 @@ impl<'a> Normaliser<'a> {
             positive: true,
         });
         self.positive.insert(e, q);
-        self.define(Vec::new(), vec![Item::NotFresh(q), Item::Expr(e)], source);
+        self.take(q);
+        self.define(
+            q,
+            Vec::new(),
+            vec![Item::NotFresh(q), Item::Expr(e)],
+            source,
+        );
         q
     }
 
@@ -876,6 +926,7 @@ impl<'a> Normaliser<'a> {
     /// past a `u32` count (`nnf_not`), and then no name is made.
     fn fresh_negative(&mut self, e: ExprId, source: usize) -> Option<u32> {
         if let Some(&q) = self.negative.get(&e) {
+            self.take(q);
             return Some(q);
         }
         let through = match self.get(e) {
@@ -889,18 +940,27 @@ impl<'a> Normaliser<'a> {
             positive: false,
         });
         self.negative.insert(e, q);
+        self.take(q);
         if let Some((r, _)) = through {
             // `∃R.D ⊑ Q` as `D ⊑ ∀R⁻.Q`: Horn through R⁻'s automaton where D is a
-            // literal (`∀R.¬D ⊔ Q` would put R's start state beside Q in a head).
+            // literal (`∀R.¬D ⊔ Q` would put R's start state beside Q in a head). Q's
+            // definition takes the automaton; with `¬D` a tautology (`D` is `⊥`) it holds
+            // as it is, and takes nothing.
+            if self.flatten(vec![Item::Expr(not)]).is_none() {
+                return Some(q);
+            }
+            let outer = std::mem::replace(&mut self.taker, Taker::Name(q));
             let start = self.automaton(r.inverse(), Item::Fresh(q), source);
+            self.taker = outer;
             self.define(
+                q,
                 Vec::new(),
                 vec![Item::Expr(not), Item::Fresh(start)],
                 source,
             );
             return Some(q);
         }
-        self.define(Vec::new(), vec![Item::Expr(not), Item::Fresh(q)], source);
+        self.define(q, Vec::new(), vec![Item::Expr(not), Item::Fresh(q)], source);
         Some(q)
     }
 
@@ -922,18 +982,25 @@ impl<'a> Normaliser<'a> {
 
     fn drain(&mut self) {
         while let Some(gci) = self.queue.pop() {
-            self.clausify(gci);
+            self.taker = gci.taker;
+            if let Err(why) = self.clausify(gci) {
+                self.fail(self.taker, why);
+            }
         }
     }
 
-    /// The disjuncts of `items`, flattened; `None` if one is `⊤` (a tautology).
+    /// The disjuncts of `items`, flattened; `None` if one is `⊤` (a tautology): `⊤`, `∀R.⊤`,
+    /// `≥ 0 R.C`. Before `clausify` takes any shared name, so a tautology takes none.
     fn flatten(&mut self, items: Vec<Item>) -> Option<Vec<Item>> {
         let mut out = Vec::new();
         let mut stack = items;
         while let Some(item) = stack.pop() {
             match item {
                 Item::Expr(e) => match self.get(e) {
-                    ClassExpr::Thing => return None,
+                    ClassExpr::Thing | ClassExpr::Min(0, ..) | ClassExpr::DataMin(0, ..) => {
+                        return None;
+                    }
+                    ClassExpr::All(_, c) if matches!(self.get(c), ClassExpr::Thing) => return None,
                     ClassExpr::Nothing => {}
                     ClassExpr::Or(xs) => stack.extend(xs.into_iter().map(Item::Expr)),
                     _ => out.push(item),
@@ -946,9 +1013,10 @@ impl<'a> Normaliser<'a> {
         Some(out)
     }
 
-    fn clausify(&mut self, gci: Gci) {
+    /// The clause of `gci`, or why it can't be read in full (`drain` fails its taker).
+    fn clausify(&mut self, gci: Gci) -> Result<(), &'static str> {
         let Some(items) = self.flatten(gci.items) else {
-            return;
+            return Ok(());
         };
         // A conjunction among the disjuncts: a GCI per conjunct, `(A ⊓ B) ⊔ R` as
         // `A ⊔ R` and `B ⊔ R`, so that `A ⊔ B ⊑ C` gives the Horn clauses `A → C` and
@@ -984,10 +1052,10 @@ impl<'a> Normaliser<'a> {
                     body: gci.body.clone(),
                     items: split,
                     source: gci.source,
-                    shared: gci.shared,
+                    taker: gci.taker,
                 });
             }
-            return;
+            return Ok(());
         }
         let mut body = gci.body;
         let mut head = Vec::new();
@@ -1054,7 +1122,6 @@ impl<'a> Normaliser<'a> {
                         var: Var::X,
                     });
                 }
-                ClassExpr::Min(0, _, _) => return,
                 ClassExpr::Min(n, r, c) => {
                     let filler = self.filler(c, gci.source);
                     head.push(HeadAtom::AtLeast {
@@ -1065,9 +1132,6 @@ impl<'a> Normaliser<'a> {
                     });
                 }
                 ClassExpr::All(r, c) => {
-                    if matches!(self.get(c), ClassExpr::Thing) {
-                        return;
-                    }
                     if self.non_simple.contains(&r.named()) {
                         // `∀R.¬D` beside other disjuncts: `¬P` for a name `∃R.D ⊑ P`, which
                         // goes through R⁻'s automaton as `D ⊑ ∀R⁻.P` and stays Horn (the
@@ -1075,11 +1139,11 @@ impl<'a> Normaliser<'a> {
                         // disjunction `A → B ∨ Q`; 4 October 2026).
                         if many && self.negative_filler(c) {
                             let Some(d) = self.nnf_not(c) else {
-                                return self.refuse(gci.source, gci.shared);
+                                return Err(UNCOUNTED);
                             };
                             let some = self.e(ClassExpr::Some(r, d));
                             let Some(p) = self.fresh_negative(some, gci.source) else {
-                                return self.refuse(gci.source, gci.shared);
+                                return Err(UNCOUNTED);
                             };
                             body.push(BodyAtom::Concept(Concept::Fresh(p), Var::X));
                             continue;
@@ -1090,7 +1154,7 @@ impl<'a> Normaliser<'a> {
                         continue;
                     }
                     let Some(ys) = variables(&mut next_y, 1) else {
-                        return self.out.unsupported.push((gci.source, TOO_WIDE));
+                        return Err(TOO_WIDE);
                     };
                     let y = Var::Y(ys[0]);
                     body.push(Self::edge(r, Var::X, y));
@@ -1102,7 +1166,7 @@ impl<'a> Normaliser<'a> {
                         ClassExpr::Class(a) => Some(Concept::Named(a)),
                         _ => match self.fresh_negative(c, gci.source) {
                             Some(q) => Some(Concept::Fresh(q)),
-                            None => return self.refuse(gci.source, gci.shared),
+                            None => return Err(UNCOUNTED),
                         },
                     };
                     if n > self.expand_up_to {
@@ -1115,7 +1179,7 @@ impl<'a> Normaliser<'a> {
                         continue;
                     }
                     let Some(ys) = variables(&mut next_y, n as usize + 1) else {
-                        return self.out.unsupported.push((gci.source, TOO_WIDE));
+                        return Err(TOO_WIDE);
                     };
                     let ys: Vec<Var> = ys.into_iter().map(Var::Y).collect();
                     for &y in &ys {
@@ -1136,7 +1200,6 @@ impl<'a> Normaliser<'a> {
                     range: r,
                     var: Var::X,
                 }),
-                ClassExpr::DataMin(0, _, _) => return,
                 ClassExpr::DataMin(n, d, r) => head.push(HeadAtom::DataAtLeast {
                     n,
                     property: d,
@@ -1145,7 +1208,7 @@ impl<'a> Normaliser<'a> {
                 }),
                 ClassExpr::DataAll(d, r) => {
                     let Some(vs) = variables(&mut next_v, 1) else {
-                        return self.out.unsupported.push((gci.source, TOO_WIDE));
+                        return Err(TOO_WIDE);
                     };
                     let v = Var::V(vs[0]);
                     body.push(BodyAtom::Data(d, Var::X, v));
@@ -1161,7 +1224,7 @@ impl<'a> Normaliser<'a> {
                 }
                 ClassExpr::DataMax(n, d, r) => {
                     let Some(vs) = variables(&mut next_v, n as usize + 1) else {
-                        return self.out.unsupported.push((gci.source, TOO_WIDE));
+                        return Err(TOO_WIDE);
                     };
                     let vs: Vec<Var> = vs.into_iter().map(Var::V).collect();
                     let outside = self.range_not(r);
@@ -1182,6 +1245,7 @@ impl<'a> Normaliser<'a> {
             }
         }
         self.add(body, head, gci.source);
+        Ok(())
     }
 
     /// The filler of an at-least atom for `c`.
@@ -1512,6 +1576,7 @@ impl<'a> Normaliser<'a> {
     /// The start state's fresh name of `∀ role. filler` along `role`'s automaton.
     fn automaton(&mut self, role: ObjProp, filler: Item, source: usize) -> u32 {
         if let Some(&start) = self.automata.get(&(role, filler)) {
+            self.take(start);
             return start;
         }
         let nfa = match self.nfas.get(&role) {
@@ -1534,19 +1599,19 @@ impl<'a> Normaliser<'a> {
             }
         };
         let Some(nfa) = nfa else {
-            self.out
-                .unsupported
-                .push((source, "an irregular role hierarchy"));
-            // Read as over the role alone (sound for what it derives).
+            // A state with no clauses (sound for what it derives); what takes it is left out.
             let q = self.new_fresh(FreshOf::State { role, state: 0 });
             self.automata.insert((role, filler), q);
+            self.take(q);
+            self.fail(Taker::Name(q), IRREGULAR);
             return q;
         };
         let names: Vec<u32> = (0..nfa.states)
             .map(|state| self.new_fresh(FreshOf::State { role, state }))
             .collect();
-        self.automata
-            .insert((role, filler), names[nfa.start as usize]);
+        let start = names[nfa.start as usize];
+        self.automata.insert((role, filler), start);
+        self.take(start);
         let state = |s: u32| Concept::Fresh(names[s as usize]);
         // A transition needs the universal and the role inclusions of its edge together
         // (justifications through a role hierarchy or chain name them: found by the
@@ -1572,13 +1637,14 @@ impl<'a> Normaliser<'a> {
                 ),
             }
         }
-        // The end state: the filler holds.
+        // The end state: the filler holds (taken as the automaton, by its start state).
         self.define(
+            start,
             Vec::new(),
             vec![Item::NotFresh(names[nfa.end as usize]), filler],
             source,
         );
-        names[nfa.start as usize]
+        start
     }
 
     /// The automaton less the transitions another transition between the same states

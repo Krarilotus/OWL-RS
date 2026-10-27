@@ -1054,8 +1054,129 @@ fn a_shared_definition_past_u32_leaves_out_every_user() {
     ];
     o.sources = vec![Vec::new(); o.axioms.len()];
     let unsupported = normalise_with(&o, Options::default()).unsupported;
-    let left_out: Vec<usize> = unsupported.iter().map(|&(i, _)| i).collect();
+    let mut left_out: Vec<usize> = unsupported.iter().map(|&(i, _)| i).collect();
+    left_out.sort_unstable();
     assert_eq!(left_out, [0, 1], "{unsupported:?}");
+}
+
+/// A shared definition that needs more variables than a `u16` numbers, and a universal over
+/// an irregular role: every axiom that takes the name is left out, not only one (the name is
+/// cached, so each other taker is weaker without its definition). Axioms that don't take it
+/// stay: the Horn lower bound reads them.
+#[test]
+fn a_shared_definition_that_fails_leaves_out_every_user() {
+    let mut wrong = Vec::new();
+    // `B ⊑ ∃r.D` and `C ⊑ ∃s.D`, `D` a union of 65,537 universals; `B ⊑ C` takes nothing.
+    let mut o = Ontology::default();
+    let mut e = |x| ExprId(o.classes.intern(x));
+    let a = e(ClassExpr::Class(1));
+    let alls = (0..65_537)
+        .map(|p| e(ClassExpr::All(ObjProp::Named(1_000 + p), a)))
+        .collect();
+    let d = e(ClassExpr::Or(alls));
+    let (b, c) = (e(ClassExpr::Class(2)), e(ClassExpr::Class(3)));
+    let rd = e(ClassExpr::Some(ObjProp::Named(10), d));
+    let sd = e(ClassExpr::Some(ObjProp::Named(11), d));
+    o.axioms = vec![
+        Axiom::SubClassOf(b, rd),
+        Axiom::SubClassOf(c, sd),
+        Axiom::SubClassOf(b, c),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let unsupported = normalise_with(&o, Options::default()).unsupported;
+    let mut left_out: Vec<usize> = unsupported.iter().map(|&(i, _)| i).collect();
+    left_out.sort_unstable();
+    if left_out != [0, 1] {
+        wrong.push(format!("too wide: {unsupported:?}"));
+    }
+    // `A ⊑ ∀R.C` and `B ⊑ ∀R.C` with `R ∘ S ⊑ S` and `S ∘ R ⊑ R` (irregular), and
+    // `B ⊑ ∃T.(∀R.C ⊓ A)` and `A ⊑ ∃U.(∀R.C ⊓ A)`, which share a name whose definition
+    // takes the automaton; `A ⊑ B` takes nothing.
+    let mut o = Ontology::default();
+    let mut e = |x| ExprId(o.classes.intern(x));
+    let (r, s) = (ObjProp::Named(10), ObjProp::Named(11));
+    let (a, b, c) = (
+        e(ClassExpr::Class(1)),
+        e(ClassExpr::Class(2)),
+        e(ClassExpr::Class(3)),
+    );
+    let all = e(ClassExpr::All(r, c));
+    let both = e(ClassExpr::And(vec![all, a]));
+    let t_both = e(ClassExpr::Some(ObjProp::Named(12), both));
+    let u_both = e(ClassExpr::Some(ObjProp::Named(13), both));
+    o.axioms = vec![
+        Axiom::SubObjectPropertyOf(vec![r, s], s),
+        Axiom::SubObjectPropertyOf(vec![s, r], r),
+        Axiom::SubClassOf(a, all),
+        Axiom::SubClassOf(b, all),
+        Axiom::SubClassOf(b, t_both),
+        Axiom::SubClassOf(a, u_both),
+        Axiom::SubClassOf(a, b),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let unsupported = normalise_with(&o, Options::default()).unsupported;
+    let mut left_out: Vec<usize> = unsupported.iter().map(|&(i, _)| i).collect();
+    left_out.sort_unstable();
+    if left_out != [2, 3, 4, 5] {
+        wrong.push(format!("irregular: {unsupported:?}"));
+    }
+    // `A ⊑ ∀R.C ⊔ ∀T.⊤` is a tautology: it takes nothing and stays, whatever is read first
+    // (Sol r1 S1 of the fix: the automaton `B` failed was taken before `∀T.⊤` was seen).
+    let mut o = Ontology::default();
+    let mut e = |x| ExprId(o.classes.intern(x));
+    let (r, s) = (ObjProp::Named(10), ObjProp::Named(11));
+    let (a, b, c) = (
+        e(ClassExpr::Class(1)),
+        e(ClassExpr::Class(2)),
+        e(ClassExpr::Class(3)),
+    );
+    let thing = e(ClassExpr::Thing);
+    let all = e(ClassExpr::All(r, c));
+    let any = e(ClassExpr::All(ObjProp::Named(12), thing));
+    let either = e(ClassExpr::Or(vec![all, any]));
+    o.axioms = vec![
+        Axiom::SubObjectPropertyOf(vec![r, s], s),
+        Axiom::SubObjectPropertyOf(vec![s, r], r),
+        Axiom::SubClassOf(a, either),
+        Axiom::SubClassOf(b, all),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let unsupported = normalise_with(&o, Options::default()).unsupported;
+    let left_out: Vec<usize> = unsupported.iter().map(|&(i, _)| i).collect();
+    if left_out != [3] {
+        wrong.push(format!("tautology: {unsupported:?}"));
+    }
+    // `A ⊑ ≤ 0 T.(∃R.⊥)` and `B ⊑ ≤ 0 U.(∃R.⊥)` are tautologies too: the name of `∃R.⊥`
+    // needs no definition, so takes no automaton (Sol r2 S2). And a key over `R` with no
+    // named individual has no rule and takes nothing: only the keys' own mark (S3).
+    let mut o = Ontology::default();
+    let mut e = |x| ExprId(o.classes.intern(x));
+    let (a, b, c) = (
+        e(ClassExpr::Class(1)),
+        e(ClassExpr::Class(2)),
+        e(ClassExpr::Class(3)),
+    );
+    let nothing = e(ClassExpr::Nothing);
+    let none = e(ClassExpr::Some(r, nothing));
+    let t_none = e(ClassExpr::Max(0, ObjProp::Named(12), none));
+    let u_none = e(ClassExpr::Max(0, ObjProp::Named(13), none));
+    let some_c = e(ClassExpr::Some(r, c));
+    o.axioms = vec![
+        Axiom::SubObjectPropertyOf(vec![r, s], s),
+        Axiom::SubObjectPropertyOf(vec![s, r], r),
+        Axiom::SubClassOf(a, t_none),
+        Axiom::SubClassOf(b, u_none),
+        Axiom::HasKey(some_c, vec![r], Vec::new()),
+    ];
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let unsupported = normalise_with(&o, Options::default()).unsupported;
+    if unsupported
+        .iter()
+        .any(|&(i, why)| i != 4 || why.contains("irregular"))
+    {
+        wrong.push(format!("needed nothing: {unsupported:?}"));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// Clause and key variables past `u16` (review A-1203): a key over 65,537 data properties
