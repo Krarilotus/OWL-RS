@@ -880,6 +880,11 @@ impl StoreService {
                 explanation.steps.clear();
                 explanation.rewrites.clear();
                 explanation.decoded = 0;
+                certification_for_its_reader(
+                    prepared,
+                    &mut explanation.completeness,
+                    &mut explanation.ql,
+                );
             },
         )
     }
@@ -943,6 +948,7 @@ impl StoreService {
             |planned| {
                 planned.steps.clear();
                 planned.rewrites.clear();
+                certification_for_its_reader(prepared, &mut planned.completeness, &mut planned.ql);
             },
         )
     }
@@ -1792,6 +1798,19 @@ fn status_for_its_reader(
     }
 }
 
+/// [`status_for_its_reader`] for an answer that carries the rewriting's report too, as an
+/// EXPLAIN does: the status as its reader is told it, and no report where that is withheld.
+fn certification_for_its_reader(
+    prepared: &PreparedQuery,
+    completeness: &mut Option<nrese_sparql::Completeness>,
+    ql: &mut Option<nrese_sparql::ql::QlReport>,
+) {
+    *completeness = status_for_its_reader(prepared, completeness.take(), ql.is_some());
+    if withholds_certification(prepared) {
+        *ql = None;
+    }
+}
+
 /// Whether `prepared`'s reader is told no assessment of the rewriting, neither its status
 /// nor its report ([`status_for_its_reader`]).
 fn withholds_certification(prepared: &PreparedQuery) -> bool {
@@ -1805,8 +1824,9 @@ fn withholds_certification(prepared: &PreparedQuery) -> bool {
 /// and its answer: `redact` takes an EXPLAIN's operators (their estimates, the order and the
 /// operators those chose, their rows, the dictionary work they report, their times) and its
 /// rewrites (an estimate decides some, as eager aggregation), all read from statistics and
-/// scans of every graph; and a memory refusal goes through the scope's boundary
-/// ([`crate::ReadScope::told`]).
+/// scans of every graph, and its QL rewriting's status and report where they would read
+/// the schema of every graph ([`certification_for_its_reader`]); and a memory refusal goes
+/// through the scope's boundary ([`crate::ReadScope::told`]).
 fn for_its_reader<T>(
     prepared: &PreparedQuery,
     whole: StoreResult<T>,

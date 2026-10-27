@@ -32,7 +32,7 @@ The answers are never changed for it ([design](../design/ql-rewriting.md) §7).
 A reader of some graphs with `inferred = "visible"` gets `NRESE-Completeness: not-certified`
 wherever the QL rewriting runs, inside a transaction too: the status would be read from the
 schema of every graph. Answers may then be missing or wrong, and no regime, reason or count
-is given. Other readers get the status as before. Clients warn on `not-certified` and on any
+is given. Its EXPLAIN (`explain=true` or `plan`) says the same and has no `ql`. Other readers get the status as before. Clients warn on `not-certified` and on any
 token they don't know; the console's CLI exits 3 under `--require-complete`.
 
 | Parameter | Meaning |
