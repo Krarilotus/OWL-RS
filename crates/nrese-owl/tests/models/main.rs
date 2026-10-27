@@ -1179,6 +1179,27 @@ fn a_shared_definition_that_fails_leaves_out_every_user() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A key over non-simple properties (review A-1205) is read through one name per property
+/// and named individual (`∃P.{z} ⊑ Q_z`), in one rule: its size is the individuals times the
+/// properties. A rule per combination of individuals made 6⁴ = 1,296 rules here, and 32⁸
+/// for 32 individuals and 8 transitive properties: memory ran out.
+#[test]
+fn a_key_over_non_simple_properties_is_one_rule() {
+    let mut o = Ontology::default();
+    let c = ExprId(o.classes.intern(ClassExpr::Class(1)));
+    let properties: Vec<ObjProp> = (0..4).map(|p| ObjProp::Named(1_000 + p)).collect();
+    for &p in &properties {
+        o.axioms
+            .push(Axiom::ObjectCharacteristic(Characteristic::Transitive, p));
+    }
+    for i in 0..6 {
+        o.axioms.push(Axiom::ClassAssertion(c, 100 + i));
+    }
+    o.axioms.push(Axiom::HasKey(c, properties, Vec::new()));
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    assert_eq!(normalise_with(&o, Options::default()).rules.len(), 1);
+}
+
 /// Clause and key variables past `u16` (review A-1203): a key over 65,537 data properties
 /// or 65,536 object properties, and `⊤ ⊑ ∀p₀.A ⊔ … ⊔ ∀p₆₅₅₃₆.A`, need one variable more
 /// than a `u16` numbers, so two would be one. The normalisation leaves such an axiom out;

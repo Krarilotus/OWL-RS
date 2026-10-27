@@ -203,13 +203,18 @@ pub struct Facts {
 /// 2005): its object variables bind to named individuals only, its data variables to data
 /// values of theirs. What a key becomes: `HasKey(C (P…) (D…))` is
 /// `C(x) ∧ C(y₀) ∧ ⋀ Pᵢ(x, yᵢ) ∧ Pᵢ(y₀, yᵢ) ∧ ⋀ Dⱼ(x, vⱼ) ∧ Dⱼ(y₀, vⱼ) → x ≈ y₀`
-/// (`C` a fresh name `Q` with `C ⊑ Q` where it isn't one; no class atom for `owl:Thing`).
+/// (`C` a fresh name `Q` with `C ⊑ Q` where it isn't one; no class atom for `owl:Thing`),
+/// a non-simple `Pᵢ` read through `reach`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SafeRule {
     pub body: Vec<BodyAtom>,
     pub head: Vec<HeadAtom>,
     /// The axiom it comes from.
     pub source: usize,
+    /// Per non-simple key property `P`, the names `Q_z` of `∃P.{z} ⊑ Q_z`, one per named
+    /// individual `z`: the rule holds for `x` and `y₀` only where each group has a name
+    /// that holds at both (a `z` that `P` reaches from each).
+    pub reach: Vec<Vec<Concept>>,
 }
 
 /// An ontology in DL-clauses.

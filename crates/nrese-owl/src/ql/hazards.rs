@@ -29,6 +29,9 @@ pub enum Hazard {
     SelfRestriction(Term),
     /// Under a qualified `someValuesFrom` on the left of an axiom.
     LeftExistential(Term),
+    /// Under a minimum cardinality on the left of an axiom that isn't read: above 1, or 0
+    /// inside a complex left side.
+    LeftMinimum(Term),
     /// In an intersection, a filler or a complex expression on the left of an axiom.
     LeftClass(Term),
     /// A class contained in a union or an enumeration.
@@ -53,6 +56,7 @@ impl Hazard {
             | Self::Value(t)
             | Self::SelfRestriction(t)
             | Self::LeftExistential(t)
+            | Self::LeftMinimum(t)
             | Self::LeftClass(t)
             | Self::Union(t)
             | Self::Enumeration(t)
@@ -84,6 +88,9 @@ impl Hazard {
             Self::SelfRestriction(_) => format!("a hasSelf restriction on {t}"),
             Self::LeftExistential(_) => {
                 format!("a qualified someValuesFrom on {t} on the left of an axiom")
+            }
+            Self::LeftMinimum(_) => {
+                format!("a minimum cardinality on {t} on the left of an axiom")
             }
             Self::LeftClass(_) => format!("{t} in a complex class expression on the left"),
             Self::Union(_) => format!("{t} is contained in a union"),
@@ -162,6 +169,15 @@ impl Collect<'_> {
                 self.walk(*inner, Place::Left);
             }
             ClassExpr::OneOf(_) => partial(self),
+            // On the left, `≥ 0 R.C` is `⊤` and `≥ n R.C` for n ≥ 2 isn't read (`Tbox`'s
+            // left sides). `≥ 0 R.C` as a whole left side is read exactly; inside one, it
+            // is marked with its filler, as an existential there is.
+            ClassExpr::Min(n, p, f) if *n != 1 && matches!(place, Place::LeftTop | Place::Left) => {
+                if *n >= 2 || place == Place::Left {
+                    self.found.push(Hazard::LeftMinimum(p.named()));
+                    self.walk(*f, Place::Left);
+                }
+            }
             ClassExpr::Some(p, f) | ClassExpr::Min(_, p, f) => {
                 let thing = matches!(o.class(*f), ClassExpr::Thing);
                 match place {
@@ -442,6 +458,11 @@ pub(crate) fn hazards(o: &Ontology, types: &[Type], basic: &dyn Fn(u32) -> Basic
         }
     }
     while let Some((t, h)) = queue.pop_front() {
+        // An anonymous individual may be in `t` unread, and `t`'s own hazard can equate it
+        // with another: any fact may follow, as for the types' terms above.
+        if global.is_none() {
+            global = equating.get(&t).copied();
+        }
         for &u in next.get(&t).into_iter().flatten() {
             if let std::collections::hash_map::Entry::Vacant(e) = affected.entry(u) {
                 e.insert(h);

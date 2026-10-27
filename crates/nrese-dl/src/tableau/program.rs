@@ -171,11 +171,13 @@ pub struct DataProgram {
 #[derive(Debug, Clone)]
 pub struct KeyRule {
     /// What both individuals must be: the key's class (a name, or the normalisation's
-    /// fresh name of a complex one) and, for a non-simple property, the name of reaching
-    /// one named individual along it.
+    /// fresh name of a complex one).
     pub classes: Vec<ConceptId>,
     pub objects: Vec<RoleExpr>,
     pub data: Vec<RoleId>,
+    /// Per non-simple property, the names of reaching each named individual along it:
+    /// both individuals must have one of them (`SafeRule::reach`).
+    pub reach: Vec<Vec<ConceptId>>,
     pub source: u32,
 }
 
@@ -467,10 +469,24 @@ impl Program {
             .into_keys()
             .map(|c| self.concept(ConceptName::Clause(c)))
             .collect();
+        let reach = rule
+            .reach
+            .iter()
+            .map(|group| {
+                let mut names: Vec<ConceptId> = group
+                    .iter()
+                    .map(|&c| self.concept(ConceptName::Clause(c)))
+                    .collect();
+                // Sorted: `apply_key` looks a member's labels up in it.
+                names.sort_unstable();
+                names
+            })
+            .collect();
         let mut key = KeyRule {
             classes,
             objects: Vec::new(),
             data: Vec::new(),
+            reach,
             source: rule.source as u32,
         };
         for (_, pair) in objects {

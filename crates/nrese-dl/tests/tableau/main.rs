@@ -1187,3 +1187,33 @@ fn keys_read_the_pairs_a_transitive_property_composes() {
     b.different(100, 103);
     assert_eq!(answer(&b.o), Answer::Inconsistent);
 }
+
+/// A key over two transitive properties and a simple one (review A-1205) needs a shared value
+/// of each: `a` and `d` share `c` along `r` (composed), `g` along `t`, but no `s`-value until
+/// `s(f, e)` composes `s(d, e)` with `s(a, e)`.
+#[test]
+fn a_key_over_two_transitive_properties_needs_a_value_of_each() {
+    let (r, s, t) = (
+        ObjProp::Named(200),
+        ObjProp::Named(201),
+        ObjProp::Named(202),
+    );
+    let mut b = Build::default();
+    let c = b.class(1);
+    b.characteristic(Characteristic::Transitive, r);
+    b.characteristic(Characteristic::Transitive, s);
+    b.axiom(Axiom::HasKey(c, vec![r, s, t], Vec::new()));
+    b.role_assertion(200, 100, 101);
+    b.role_assertion(200, 101, 102);
+    b.role_assertion(200, 103, 102);
+    b.role_assertion(201, 100, 104);
+    b.role_assertion(201, 103, 105);
+    b.role_assertion(202, 100, 106);
+    b.role_assertion(202, 103, 106);
+    b.assert(c, 100);
+    b.assert(c, 103);
+    b.different(100, 103);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.role_assertion(201, 105, 104);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
