@@ -240,7 +240,7 @@ impl State {
     }
 
     fn rerank(&mut self, key: &Key) {
-        let Some(entry) = self.entries.get(key) else {
+        let Some((resident, entry)) = self.entries.get_key_value(key) else {
             return;
         };
         let (cost, hits, bytes, old) = (entry.cost, entry.hits, entry.bytes, entry.rank);
@@ -249,11 +249,15 @@ impl State {
         }
         let rank = match self.pinned(&key.part) {
             true => None,
-            false => Some(self.rank(cost, hits, bytes)),
+            false => {
+                // The entry's own key: the caller's holds a context of its own, which the
+                // budget doesn't count.
+                let resident = resident.clone();
+                let rank = self.rank(cost, hits, bytes);
+                self.ranking.insert(rank, resident);
+                Some(rank)
+            }
         };
-        if let Some(rank) = rank {
-            self.ranking.insert(rank, key.clone());
-        }
         if let Some(entry) = self.entries.get_mut(key) {
             entry.rank = rank;
         }
