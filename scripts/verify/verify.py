@@ -35,6 +35,7 @@ interrupted.
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import platform
@@ -43,6 +44,7 @@ import shutil
 import signal
 import socket
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -356,10 +358,10 @@ def summarise(evidence: Path, results: list[dict], target: dict, title: str, ext
 # --- the commands ------------------------------------------------------------------------------
 
 def target_of(args) -> dict:
-    """Where the server comes from: --url (running), --server (a binary), --server-rev (a
-    fleet host's build, its checksum checked). Runs take no lock on the host's cache, so a sweep
-    may remove the build while it is chosen: any file error here is a launch failure, with its
-    failing summary, never an escape without one (Sol r3, finding 4)."""
+    """Where the server comes from: --url (running), --server (a binary), --server-rev (a copy of
+    a fleet host's build, its checksum and provenance checked). Runs take no lock on the host's
+    cache, so a sweep may remove the build while it is chosen: any file error here is a launch
+    failure, with its failing summary, never an escape without one (Sol r3, finding 4)."""
     try:
         return _target_of(args)
     except OSError as e:
@@ -371,15 +373,36 @@ def _target_of(args) -> dict:
     if args.url:
         return {"url": args.url}
     if args.server_rev:
-        binary = CACHE / f"bin-{args.server_rev[:12]}" / "nrese-server"
-        sums = binary.parent / "SHA256SUMS"
-        if not binary.is_file() or not sums.is_file():
-            raise LaunchError(f"no build of {args.server_rev[:12]} at {binary.parent} "
+        entry = CACHE / f"bin-{args.server_rev[:12]}"
+        sums = entry / "SHA256SUMS"
+        if not (entry / "nrese-server").is_file() or not sums.is_file():
+            raise LaunchError(f"no build of {args.server_rev[:12]} at {entry} "
                               "(submit its build job: verify.py jobs)")
-        if sums.read_text().split()[0] != sha256_of(binary):
-            raise LaunchError(f"{binary}: its checksum doesn't hold (SHA256SUMS): build it again")
+        # The server runs from a copy of the run's own, and that copy is what is checked: a sweep
+        # and an older harness's builder can replace the entry before the server starts or restarts
+        # (PR #47, fix check 1). The copy goes when the run ends.
+        (ROOT / "tmp").mkdir(exist_ok=True)
+        own = Path(tempfile.mkdtemp(prefix="verify-server-", dir=ROOT / "tmp"))
+        atexit.register(shutil.rmtree, own, True)
+        binary = own / "nrese-server"
+        shutil.copy(entry / "nrese-server", binary)
+        digest = sha256_of(binary)
+        if sums.read_text().split()[0] != digest:
+            raise LaunchError(f"{entry}: its checksum doesn't hold (SHA256SUMS): build it again")
+        # Only an isolated build of the commit writes its PROVENANCE (build-on-host.sh). A build
+        # without it is from before 26 Oct 2026, when a shared cargo target could leave another
+        # commit's code under this one's name with a valid checksum and REVISION (PR #47, Sol r1 F1).
+        record = entry / "PROVENANCE"
+        fields = dict(line.split(" ", 1) for line in record.read_text(encoding="utf-8").splitlines()
+                      if " " in line) if record.is_file() else {}
+        if (fields.get("contract") != "isolated-build/1" or fields.get("sha256") != digest
+                or not fields.get("revision", "").startswith(args.server_rev)):
+            raise LaunchError(f"{entry}: not an isolated build of {args.server_rev[:12]} (its "
+                              "PROVENANCE): build it again (verify.py jobs)")
         # Its use, for the host cache's sweep (Harness/notes/2026-10-20-host-cache-contract.md §5).
-        (binary.parent / ".last-used").write_text(f"{int(time.time())}\n", encoding="utf-8")
+        (entry / ".last-used").write_text(f"{int(time.time())}\n", encoding="utf-8")
+        return {"command": [str(binary)],
+                "binary": {"path": str(binary), "sha256": digest, "revision": fields["revision"]}}
     else:
         binary = Path(args.server).expanduser().resolve()
         if not binary.is_file():
