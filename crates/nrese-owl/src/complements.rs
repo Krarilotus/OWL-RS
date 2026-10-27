@@ -53,7 +53,8 @@ impl Filler {
     }
 }
 
-/// `x` as a key and whether it says at least (`true`) or its negation (`false`).
+/// `x` as a key and whether it says at least (`true`) or its negation (`false`); `None`
+/// for `≤ n` whose negation `≥ n + 1` has no `u32` count.
 fn key(o: &Ontology, x: ExprId) -> Option<(Key, bool)> {
     Some(match *o.classes.get(x.0) {
         ClassExpr::Not(y) => {
@@ -62,12 +63,12 @@ fn key(o: &Ontology, x: ExprId) -> Option<(Key, bool)> {
         }
         ClassExpr::Some(r, f) => (Key::Object(r, Filler::of(o, f), 1), true),
         ClassExpr::Min(n, r, f) if n > 0 => (Key::Object(r, Filler::of(o, f), n), true),
-        ClassExpr::Max(n, r, f) => (Key::Object(r, Filler::of(o, f), n.saturating_add(1)), false),
+        ClassExpr::Max(n, r, f) => (Key::Object(r, Filler::of(o, f), n.checked_add(1)?), false),
         ClassExpr::Exact(0, r, f) => (Key::Object(r, Filler::of(o, f), 1), false),
         ClassExpr::All(r, g) => (Key::Object(r, Filler::complement(o, g), 1), false),
         ClassExpr::DataSome(p, d) => (Key::Data(p, d, 1), true),
         ClassExpr::DataMin(n, p, d) if n > 0 => (Key::Data(p, d, n), true),
-        ClassExpr::DataMax(n, p, d) => (Key::Data(p, d, n.saturating_add(1)), false),
+        ClassExpr::DataMax(n, p, d) => (Key::Data(p, d, n.checked_add(1)?), false),
         ClassExpr::DataExact(0, p, d) => (Key::Data(p, d, 1), false),
         ClassExpr::DataAll(p, d) => match o.ranges.get(d.0) {
             DataRange::Not(e) => (Key::Data(p, *e, 1), false),
@@ -393,5 +394,21 @@ mod tests {
         assert!(matches!(&r.axioms[0], Axiom::EquivalentClasses(_)));
         assert!(matches!(&r.axioms[2], Axiom::EquivalentClasses(_)));
         assert_eq!(on_every_node(&o), 0);
+    }
+
+    /// `≥ 4294967295 R` and `≤ 4294967295 R` aren't complements (review A-1201): both hold
+    /// with exactly 4294967295 successors, and `≤`'s negation `≥ 4294967296` has no `u32`
+    /// count. Neither definition is rewritten as the other's negation.
+    #[test]
+    fn counts_past_u32_have_no_complement() {
+        let mut o = Ontology::default();
+        let thing = e(&mut o, ClassExpr::Thing);
+        let most = e(&mut o, ClassExpr::Max(u32::MAX, ObjProp::Named(8), thing));
+        let least = e(&mut o, ClassExpr::Min(u32::MAX, ObjProp::Named(8), thing));
+        for (x, y) in [(1, least), (2, most)] {
+            let xc = e(&mut o, ClassExpr::Class(x));
+            push(&mut o, Axiom::EquivalentClasses(vec![xc, y]));
+        }
+        assert!(rewrite(&o).is_none(), "{:?}", rewrite(&o).map(|r| r.axioms));
     }
 }

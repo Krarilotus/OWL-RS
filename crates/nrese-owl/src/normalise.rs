@@ -159,6 +159,27 @@ const MAX_DISTRIBUTED: usize = 16;
 /// Why an axiom over a universal property is left out.
 const UNIVERSAL: &str = "the universal data property (owl:topDataProperty)";
 
+/// Why an axiom with a cardinality past `u32` in its negation is left out.
+const UNCOUNTED: &str = "a cardinality whose negation is past 4294967295";
+
+/// Why an axiom whose clause or key needs more variables than a `u16` numbers is left out.
+const TOO_WIDE: &str = "a clause or key with more than 65535 variables";
+
+/// Why an axiom whose universal needs an automaton of an irregular role is left out.
+const IRREGULAR: &str = "an irregular role hierarchy";
+
+/// `count` clause variables numbered from `*next` on; `next` moves past them. `None` where
+/// a `u16` doesn't number them all: two would be one.
+fn variables(next: &mut u32, count: usize) -> Option<Vec<u16>> {
+    let end = next.checked_add(u32::try_from(count).ok()?)?;
+    let numbers = (*next..end)
+        .map(u16::try_from)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    *next = end;
+    Some(numbers)
+}
+
 /// The roles equivalent to one, each with the inclusions that make it a subrole of it.
 type Members = Vec<(ObjProp, Vec<usize>)>;
 
@@ -171,11 +192,21 @@ enum Item {
     NotFresh(u32),
 }
 
+/// What takes a shared name from the caches (a fresh name, or an automaton's start state):
+/// an axiom, or the definition of another shared name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Taker {
+    Axiom(usize),
+    Name(u32),
+}
+
 /// A GCI waiting to be clausified: extra body atoms and its disjuncts.
 struct Gci {
     body: Vec<BodyAtom>,
     items: Vec<Item>,
     source: usize,
+    /// Its axiom's, or the shared name's it defines.
+    taker: Taker,
 }
 
 struct Normaliser<'a> {
@@ -208,6 +239,12 @@ struct Normaliser<'a> {
     expand_up_to: u32,
     /// Definitions unfolded lazily (`Options::lazy_definitions`).
     unfolded: crate::definitions::Unfolded,
+    /// What is being read (an axiom, or a queued GCI's taker): what takes a shared name now.
+    taker: Taker,
+    /// Per shared name, what took it.
+    takers: HashMap<u32, Vec<Taker>>,
+    /// The shared names whose definitions can't be read in full, with why.
+    failed: HashMap<u32, &'static str>,
 }
 
 impl<'a> Normaliser<'a> {
@@ -233,6 +270,9 @@ impl<'a> Normaliser<'a> {
             clause_index: HashMap::default(),
             expand_up_to: Options::default().expand_at_most_up_to,
             unfolded: Default::default(),
+            taker: Taker::Axiom(0),
+            takers: HashMap::new(),
+            failed: HashMap::new(),
         };
         n.role_inclusions(extra);
         n
@@ -252,25 +292,26 @@ impl<'a> Normaliser<'a> {
         RangeId(self.ranges.intern(DataRange::Not(r)))
     }
 
-    /// The negation normal form of `id`.
-    fn nnf(&mut self, id: ExprId) -> ExprId {
+    /// The negation normal form of `id`; `None` where it needs `≥ n + 1` past a `u32`
+    /// count (`nnf_not`).
+    fn nnf(&mut self, id: ExprId) -> Option<ExprId> {
         let expr = self.get(id);
         let out = match expr {
             ClassExpr::Not(x) => return self.nnf_not(x),
             ClassExpr::And(xs) => {
-                let xs: Vec<ExprId> = xs.iter().map(|&x| self.nnf(x)).collect();
-                ClassExpr::And(crate::model::canonical(xs))
+                let xs: Option<Vec<ExprId>> = xs.iter().map(|&x| self.nnf(x)).collect();
+                ClassExpr::And(crate::model::canonical(xs?))
             }
             ClassExpr::Or(xs) => {
-                let xs: Vec<ExprId> = xs.iter().map(|&x| self.nnf(x)).collect();
-                ClassExpr::Or(crate::model::canonical(xs))
+                let xs: Option<Vec<ExprId>> = xs.iter().map(|&x| self.nnf(x)).collect();
+                ClassExpr::Or(crate::model::canonical(xs?))
             }
-            ClassExpr::Some(r, x) => ClassExpr::Some(r, self.nnf(x)),
-            ClassExpr::All(r, x) => ClassExpr::All(r, self.nnf(x)),
-            ClassExpr::Min(n, r, x) => ClassExpr::Min(n, r, self.nnf(x)),
-            ClassExpr::Max(n, r, x) => ClassExpr::Max(n, r, self.nnf(x)),
+            ClassExpr::Some(r, x) => ClassExpr::Some(r, self.nnf(x)?),
+            ClassExpr::All(r, x) => ClassExpr::All(r, self.nnf(x)?),
+            ClassExpr::Min(n, r, x) => ClassExpr::Min(n, r, self.nnf(x)?),
+            ClassExpr::Max(n, r, x) => ClassExpr::Max(n, r, self.nnf(x)?),
             ClassExpr::Exact(n, r, x) => {
-                let x = self.nnf(x);
+                let x = self.nnf(x)?;
                 let min = self.e(ClassExpr::Min(n, r, x));
                 let max = self.e(ClassExpr::Max(n, r, x));
                 ClassExpr::And(crate::model::canonical(vec![min, max]))
@@ -290,11 +331,13 @@ impl<'a> Normaliser<'a> {
             }
             other => other,
         };
-        self.e(out)
+        Some(self.e(out))
     }
 
-    /// The negation normal form of `¬id`.
-    fn nnf_not(&mut self, id: ExprId) -> ExprId {
+    /// The negation normal form of `¬id`; `None` where it needs `≥ n + 1` for `≤ n` or
+    /// `= n` past a `u32` count, which nothing can stand for: the caller emits nothing of
+    /// it, and its axiom is unsupported.
+    fn nnf_not(&mut self, id: ExprId) -> Option<ExprId> {
         let expr = self.get(id);
         let out = match expr {
             ClassExpr::Class(a) if self.unfolded.by_class.contains_key(&a) => {
@@ -312,7 +355,7 @@ impl<'a> Normaliser<'a> {
                     })
                     .collect();
                 if parts.len() == 1 {
-                    return parts[0];
+                    return Some(parts[0]);
                 }
                 ClassExpr::And(crate::model::canonical(parts))
             }
@@ -320,41 +363,41 @@ impl<'a> Normaliser<'a> {
             ClassExpr::Nothing => ClassExpr::Thing,
             ClassExpr::Not(x) => return self.nnf(x),
             ClassExpr::And(xs) => {
-                let xs: Vec<ExprId> = xs.iter().map(|&x| self.nnf_not(x)).collect();
-                ClassExpr::Or(crate::model::canonical(xs))
+                let xs: Option<Vec<ExprId>> = xs.iter().map(|&x| self.nnf_not(x)).collect();
+                ClassExpr::Or(crate::model::canonical(xs?))
             }
             ClassExpr::Or(xs) => {
-                let xs: Vec<ExprId> = xs.iter().map(|&x| self.nnf_not(x)).collect();
-                ClassExpr::And(crate::model::canonical(xs))
+                let xs: Option<Vec<ExprId>> = xs.iter().map(|&x| self.nnf_not(x)).collect();
+                ClassExpr::And(crate::model::canonical(xs?))
             }
-            ClassExpr::Some(r, x) => ClassExpr::All(r, self.nnf_not(x)),
-            ClassExpr::All(r, x) => ClassExpr::Some(r, self.nnf_not(x)),
+            ClassExpr::Some(r, x) => ClassExpr::All(r, self.nnf_not(x)?),
+            ClassExpr::All(r, x) => ClassExpr::Some(r, self.nnf_not(x)?),
             ClassExpr::Min(0, _, _) => ClassExpr::Nothing,
-            ClassExpr::Min(n, r, x) => ClassExpr::Max(n - 1, r, self.nnf(x)),
-            ClassExpr::Max(n, r, x) => ClassExpr::Min(n + 1, r, self.nnf(x)),
+            ClassExpr::Min(n, r, x) => ClassExpr::Max(n - 1, r, self.nnf(x)?),
+            ClassExpr::Max(n, r, x) => ClassExpr::Min(n.checked_add(1)?, r, self.nnf(x)?),
             ClassExpr::Exact(n, r, x) => {
-                let x = self.nnf(x);
-                let more = self.e(ClassExpr::Min(n + 1, r, x));
+                let x = self.nnf(x)?;
+                let more = self.e(ClassExpr::Min(n.checked_add(1)?, r, x));
                 if n == 0 {
-                    return more;
+                    return Some(more);
                 }
                 let fewer = self.e(ClassExpr::Max(n - 1, r, x));
                 ClassExpr::Or(crate::model::canonical(vec![fewer, more]))
             }
             ClassExpr::HasValue(r, a) => {
                 let nominal = self.e(ClassExpr::OneOf(vec![a]));
-                let not = self.nnf_not(nominal);
+                let not = self.nnf_not(nominal)?;
                 ClassExpr::All(r, not)
             }
             ClassExpr::DataSome(d, r) => ClassExpr::DataAll(d, self.range_not(r)),
             ClassExpr::DataAll(d, r) => ClassExpr::DataSome(d, self.range_not(r)),
             ClassExpr::DataMin(0, _, _) => ClassExpr::Nothing,
             ClassExpr::DataMin(n, d, r) => ClassExpr::DataMax(n - 1, d, r),
-            ClassExpr::DataMax(n, d, r) => ClassExpr::DataMin(n + 1, d, r),
+            ClassExpr::DataMax(n, d, r) => ClassExpr::DataMin(n.checked_add(1)?, d, r),
             ClassExpr::DataExact(n, d, r) => {
-                let more = self.e(ClassExpr::DataMin(n + 1, d, r));
+                let more = self.e(ClassExpr::DataMin(n.checked_add(1)?, d, r));
                 if n == 0 {
-                    return more;
+                    return Some(more);
                 }
                 let fewer = self.e(ClassExpr::DataMax(n - 1, d, r));
                 ClassExpr::Or(crate::model::canonical(vec![fewer, more]))
@@ -364,7 +407,7 @@ impl<'a> Normaliser<'a> {
                 ClassExpr::DataAll(d, self.range_not(one))
             }
         };
-        self.e(out)
+        Some(self.e(out))
     }
 
     // Axioms ---------------------------------------------------------------------------
@@ -374,6 +417,18 @@ impl<'a> Normaliser<'a> {
             body,
             items,
             source,
+            taker: Taker::Axiom(source),
+        });
+    }
+
+    /// The definition of the shared name `name` (a fresh name, or an automaton's start
+    /// state for its end state's).
+    fn define(&mut self, name: u32, body: Vec<BodyAtom>, items: Vec<Item>, source: usize) {
+        self.queue.push(Gci {
+            body,
+            items,
+            source,
+            taker: Taker::Name(name),
         });
     }
 
@@ -383,15 +438,54 @@ impl<'a> Normaliser<'a> {
         // Read as `∀R.¬D ⊔ E`, R's start state stands beside E in a head with an empty
         // body, a disjunction at every node (ore_ont_10212: definitions `C ≡ ∃has_part.D`
         // over the transitive has_part grew the model without end; HermiT 0.2 s).
-        let nnf_sub = self.nnf(sub);
-        if let ClassExpr::Some(r, d) = self.get(nnf_sub)
+        // Only the shape is read here: `sub` itself goes in negated, below.
+        if let Some(nnf_sub) = self.nnf(sub)
+            && let ClassExpr::Some(r, d) = self.get(nnf_sub)
             && self.non_simple.contains(&r.named())
         {
             let all = self.e(ClassExpr::All(r.inverse(), sup));
             return self.sub(d, all, source);
         }
-        let (a, b) = (self.nnf_not(sub), self.nnf(sup));
+        let (Some(a), Some(b)) = (self.nnf_not(sub), self.nnf(sup)) else {
+            return self.uncounted(source);
+        };
         self.gci(Vec::new(), vec![Item::Expr(a), Item::Expr(b)], source);
+    }
+
+    /// Axiom `source` needs `≥ n + 1` past a `u32` count (`nnf_not`): what it gave until
+    /// then holds, the rest is left out, and the axiom is unsupported.
+    fn uncounted(&mut self, source: usize) {
+        self.fail(Taker::Axiom(source), UNCOUNTED);
+    }
+
+    /// The current taker takes the shared name `name` from the caches; if `name`'s
+    /// definition can't be read in full, neither can the taker.
+    fn take(&mut self, name: u32) {
+        self.takers.entry(name).or_default().push(self.taker);
+        if let Some(&why) = self.failed.get(&name) {
+            self.fail(self.taker, why);
+        }
+    }
+
+    /// `taker` can't be read in full (`why`): what it gave until then holds, the rest is
+    /// left out. An axiom is unsupported; a shared name's definition fails, and so does
+    /// everything that took the name, then or later (`take`): each is weaker without it.
+    fn fail(&mut self, taker: Taker, why: &'static str) {
+        let mut todo = vec![taker];
+        while let Some(taker) = todo.pop() {
+            match taker {
+                Taker::Axiom(index) => {
+                    if !self.out.unsupported.contains(&(index, why)) {
+                        self.out.unsupported.push((index, why));
+                    }
+                }
+                Taker::Name(name) => {
+                    if self.failed.insert(name, why).is_none() {
+                        todo.extend(self.takers.get(&name).into_iter().flatten());
+                    }
+                }
+            }
+        }
     }
 
     /// `role(x, y)` as a body atom.
@@ -453,6 +547,7 @@ impl<'a> Normaliser<'a> {
     }
 
     fn axiom(&mut self, index: usize, axiom: &Axiom) {
+        self.taker = Taker::Axiom(index);
         let (x, y) = (Var::X, Var::Y(0));
         match axiom {
             Axiom::Declaration(..) => {}
@@ -460,7 +555,10 @@ impl<'a> Normaliser<'a> {
             Axiom::EquivalentClasses(_) if self.unfolded.by_axiom.contains_key(&index) => {
                 // `A ⊑ D` only, with `¬A` as a literal (elsewhere it unfolds to `¬D`).
                 let (a, d) = self.unfolded.by_axiom[&index];
-                let (not_a, d) = (self.e(ClassExpr::Not(a)), self.nnf(d));
+                let not_a = self.e(ClassExpr::Not(a));
+                let Some(d) = self.nnf(d) else {
+                    return self.uncounted(index);
+                };
                 self.gci(Vec::new(), vec![Item::Expr(not_a), Item::Expr(d)], index);
             }
             Axiom::EquivalentClasses(xs) => {
@@ -472,7 +570,9 @@ impl<'a> Normaliser<'a> {
             Axiom::DisjointClasses(xs) => {
                 for (i, &a) in xs.iter().enumerate() {
                     for &b in &xs[i + 1..] {
-                        let (na, nb) = (self.nnf_not(a), self.nnf_not(b));
+                        let (Some(na), Some(nb)) = (self.nnf_not(a), self.nnf_not(b)) else {
+                            return self.uncounted(index);
+                        };
                         self.gci(Vec::new(), vec![Item::Expr(na), Item::Expr(nb)], index);
                     }
                 }
@@ -484,7 +584,9 @@ impl<'a> Normaliser<'a> {
                 self.sub(union, named, index);
                 for (i, &a) in xs.iter().enumerate() {
                     for &b in &xs[i + 1..] {
-                        let (na, nb) = (self.nnf_not(a), self.nnf_not(b));
+                        let (Some(na), Some(nb)) = (self.nnf_not(a), self.nnf_not(b)) else {
+                            return self.uncounted(index);
+                        };
                         self.gci(Vec::new(), vec![Item::Expr(na), Item::Expr(nb)], index);
                     }
                 }
@@ -497,12 +599,16 @@ impl<'a> Normaliser<'a> {
                 // `⊤ ⊑ C ⊔ ∀R.⊥` made every such domain disjunctive (found by the U1 bound,
                 // whose split turned the disjunction into typing everything C: LUBM's
                 // transitive subOrganizationOf; 3 October 2026).
-                let c = self.nnf(*c);
+                let Some(c) = self.nnf(*c) else {
+                    return self.uncounted(index);
+                };
                 let all = self.e(ClassExpr::All(r.inverse(), c));
                 self.gci(Vec::new(), vec![Item::Expr(all)], index);
             }
             Axiom::ObjectPropertyRange(r, c) => {
-                let c = self.nnf(*c);
+                let Some(c) = self.nnf(*c) else {
+                    return self.uncounted(index);
+                };
                 let all = self.e(ClassExpr::All(*r, c));
                 self.gci(Vec::new(), vec![Item::Expr(all)], index);
             }
@@ -626,7 +732,9 @@ impl<'a> Normaliser<'a> {
                 }
             }
             Axiom::DataPropertyDomain(d, c) => {
-                let c = self.nnf(*c);
+                let Some(c) = self.nnf(*c) else {
+                    return self.uncounted(index);
+                };
                 self.gci(
                     vec![BodyAtom::Data(*d, x, Var::V(0))],
                     vec![Item::Expr(c)],
@@ -660,7 +768,9 @@ impl<'a> Normaliser<'a> {
                 self.key(index, *c, objects, data);
             }
             Axiom::ClassAssertion(c, a) => {
-                let c = self.nnf(*c);
+                let Some(c) = self.nnf(*c) else {
+                    return self.uncounted(index);
+                };
                 let concept = match self.get(c) {
                     ClassExpr::Class(name) => Concept::Named(name),
                     ClassExpr::Thing => return,
@@ -704,38 +814,61 @@ impl<'a> Normaliser<'a> {
     /// the automaton) per non-simple key property. An edge alone missed `r(a, c)` from
     /// `r(a, b)`, `r(b, c)` with `r` transitive (HermiT reads edges too; Openllet doesn't).
     fn key(&mut self, index: usize, class: ExprId, objects: &[ObjProp], data: &[Term]) {
+        // A value per data property; a shared target per object property, after `y`.
+        let (Some(values), Some(targets)) = (
+            variables(&mut 0, data.len()),
+            variables(&mut 1, objects.len()),
+        ) else {
+            self.out.unsupported.push((index, TOO_WIDE));
+            return;
+        };
+        // A non-simple property with no named individual to reach: no pair the key merges,
+        // no rule, and no name taken.
+        if objects.iter().any(|p| self.non_simple.contains(&p.named()))
+            && self.ontology.named_individuals().is_empty()
+        {
+            return;
+        }
         let (x, y) = (Var::X, Var::Y(0));
         let mut body = Vec::new();
-        let c = self.nnf(class);
+        let Some(c) = self.nnf(class) else {
+            return self.uncounted(index);
+        };
         let concept = match self.get(c) {
             ClassExpr::Thing => None,
             ClassExpr::Class(a) => Some(Concept::Named(a)),
-            _ => Some(Concept::Fresh(self.fresh_negative(c, index))),
+            _ => match self.fresh_negative(c, index) {
+                Some(q) => Some(Concept::Fresh(q)),
+                None => return self.uncounted(index),
+            },
         };
         if let Some(concept) = concept {
             body.push(BodyAtom::Concept(concept, x));
             body.push(BodyAtom::Concept(concept, y));
         }
-        for (j, &d) in data.iter().enumerate() {
-            let v = Var::V(j as u16);
+        for (&d, v) in data.iter().zip(values) {
+            let v = Var::V(v);
             body.push(BodyAtom::Data(d, x, v));
             body.push(BodyAtom::Data(d, y, v));
         }
         // Each object property's alternatives: its edges, or one reach name per named
         // individual.
         let mut alternatives: Vec<Vec<Vec<BodyAtom>>> = Vec::new();
-        for (i, &p) in objects.iter().enumerate() {
+        for (&p, target) in objects.iter().zip(targets) {
             if self.non_simple.contains(&p.named()) {
                 let mut each = Vec::new();
                 for z in self.ontology.named_individuals() {
                     let one = self.e(ClassExpr::OneOf(vec![z]));
                     let some = self.e(ClassExpr::Some(p, one));
-                    let q = Concept::Fresh(self.fresh_negative(some, index));
+                    let Some(q) = self.fresh_negative(some, index) else {
+                        return self.uncounted(index);
+                    };
+                    let q = Concept::Fresh(q);
                     each.push(vec![BodyAtom::Concept(q, x), BodyAtom::Concept(q, y)]);
                 }
                 alternatives.push(each);
             } else {
-                let z = Var::Y(i as u16 + 1);
+                let z = Var::Y(target);
                 alternatives.push(vec![vec![Self::edge(p, x, z), Self::edge(p, y, z)]]);
             }
         }
@@ -771,6 +904,7 @@ impl<'a> Normaliser<'a> {
     /// A fresh `Q ⊑ e` (`e` in negation normal form).
     fn fresh_positive(&mut self, e: ExprId, source: usize) -> u32 {
         if let Some(&q) = self.positive.get(&e) {
+            self.take(q);
             return q;
         }
         let q = self.new_fresh(FreshOf::Expr {
@@ -778,37 +912,56 @@ impl<'a> Normaliser<'a> {
             positive: true,
         });
         self.positive.insert(e, q);
-        self.gci(Vec::new(), vec![Item::NotFresh(q), Item::Expr(e)], source);
+        self.take(q);
+        self.define(
+            q,
+            Vec::new(),
+            vec![Item::NotFresh(q), Item::Expr(e)],
+            source,
+        );
         q
     }
 
-    /// A fresh `e ⊑ Q` (`e` in negation normal form).
-    fn fresh_negative(&mut self, e: ExprId, source: usize) -> u32 {
+    /// A fresh `e ⊑ Q` (`e` in negation normal form); `None` where `¬e` needs `≥ n + 1`
+    /// past a `u32` count (`nnf_not`), and then no name is made.
+    fn fresh_negative(&mut self, e: ExprId, source: usize) -> Option<u32> {
         if let Some(&q) = self.negative.get(&e) {
-            return q;
+            self.take(q);
+            return Some(q);
         }
+        let through = match self.get(e) {
+            ClassExpr::Some(r, d) if self.non_simple.contains(&r.named()) => Some((r, d)),
+            _ => None,
+        };
+        // The negation first: a name is made, and kept for `e`, only with its definition.
+        let not = self.nnf_not(through.map_or(e, |(_, d)| d))?;
         let q = self.new_fresh(FreshOf::Expr {
             expr: e,
             positive: false,
         });
         self.negative.insert(e, q);
-        if let ClassExpr::Some(r, d) = self.get(e)
-            && self.non_simple.contains(&r.named())
-        {
+        self.take(q);
+        if let Some((r, _)) = through {
             // `∃R.D ⊑ Q` as `D ⊑ ∀R⁻.Q`: Horn through R⁻'s automaton where D is a
-            // literal (`∀R.¬D ⊔ Q` would put R's start state beside Q in a head).
+            // literal (`∀R.¬D ⊔ Q` would put R's start state beside Q in a head). Q's
+            // definition takes the automaton; with `¬D` a tautology (`D` is `⊥`) it holds
+            // as it is, and takes nothing.
+            if self.flatten(vec![Item::Expr(not)]).is_none() {
+                return Some(q);
+            }
+            let outer = std::mem::replace(&mut self.taker, Taker::Name(q));
             let start = self.automaton(r.inverse(), Item::Fresh(q), source);
-            let not_d = self.nnf_not(d);
-            self.gci(
+            self.taker = outer;
+            self.define(
+                q,
                 Vec::new(),
-                vec![Item::Expr(not_d), Item::Fresh(start)],
+                vec![Item::Expr(not), Item::Fresh(start)],
                 source,
             );
-            return q;
+            return Some(q);
         }
-        let not = self.nnf_not(e);
-        self.gci(Vec::new(), vec![Item::Expr(not), Item::Fresh(q)], source);
-        q
+        self.define(q, Vec::new(), vec![Item::Expr(not), Item::Fresh(q)], source);
+        Some(q)
     }
 
     /// Whether `c` (in negation normal form) clausifies into body atoms only: a negated
@@ -829,18 +982,25 @@ impl<'a> Normaliser<'a> {
 
     fn drain(&mut self) {
         while let Some(gci) = self.queue.pop() {
-            self.clausify(gci);
+            self.taker = gci.taker;
+            if let Err(why) = self.clausify(gci) {
+                self.fail(self.taker, why);
+            }
         }
     }
 
-    /// The disjuncts of `items`, flattened; `None` if one is `⊤` (a tautology).
+    /// The disjuncts of `items`, flattened; `None` if one is `⊤` (a tautology): `⊤`, `∀R.⊤`,
+    /// `≥ 0 R.C`. Before `clausify` takes any shared name, so a tautology takes none.
     fn flatten(&mut self, items: Vec<Item>) -> Option<Vec<Item>> {
         let mut out = Vec::new();
         let mut stack = items;
         while let Some(item) = stack.pop() {
             match item {
                 Item::Expr(e) => match self.get(e) {
-                    ClassExpr::Thing => return None,
+                    ClassExpr::Thing | ClassExpr::Min(0, ..) | ClassExpr::DataMin(0, ..) => {
+                        return None;
+                    }
+                    ClassExpr::All(_, c) if matches!(self.get(c), ClassExpr::Thing) => return None,
                     ClassExpr::Nothing => {}
                     ClassExpr::Or(xs) => stack.extend(xs.into_iter().map(Item::Expr)),
                     _ => out.push(item),
@@ -853,9 +1013,10 @@ impl<'a> Normaliser<'a> {
         Some(out)
     }
 
-    fn clausify(&mut self, gci: Gci) {
+    /// The clause of `gci`, or why it can't be read in full (`drain` fails its taker).
+    fn clausify(&mut self, gci: Gci) -> Result<(), &'static str> {
         let Some(items) = self.flatten(gci.items) else {
-            return;
+            return Ok(());
         };
         // A conjunction among the disjuncts: a GCI per conjunct, `(A ⊓ B) ⊔ R` as
         // `A ⊔ R` and `B ⊔ R`, so that `A ⊔ B ⊑ C` gives the Horn clauses `A → C` and
@@ -887,9 +1048,14 @@ impl<'a> Normaliser<'a> {
                     .filter(|i| *i != Item::Expr(e))
                     .collect();
                 split.push(Item::Expr(x));
-                self.gci(gci.body.clone(), split, gci.source);
+                self.queue.push(Gci {
+                    body: gci.body.clone(),
+                    items: split,
+                    source: gci.source,
+                    taker: gci.taker,
+                });
             }
-            return;
+            return Ok(());
         }
         let mut body = gci.body;
         let mut head = Vec::new();
@@ -901,7 +1067,7 @@ impl<'a> Normaliser<'a> {
             })
             .flatten()
             .filter_map(|v| match v {
-                Var::Y(i) => Some(i + 1),
+                Var::Y(i) => Some(u32::from(i) + 1),
                 _ => None,
             })
             .max()
@@ -909,7 +1075,7 @@ impl<'a> Normaliser<'a> {
         let mut next_v = body
             .iter()
             .filter_map(|b| match b {
-                BodyAtom::Data(_, _, Var::V(i)) => Some(i + 1),
+                BodyAtom::Data(_, _, Var::V(i)) => Some(u32::from(*i) + 1),
                 _ => None,
             })
             .max()
@@ -956,7 +1122,6 @@ impl<'a> Normaliser<'a> {
                         var: Var::X,
                     });
                 }
-                ClassExpr::Min(0, _, _) => return,
                 ClassExpr::Min(n, r, c) => {
                     let filler = self.filler(c, gci.source);
                     head.push(HeadAtom::AtLeast {
@@ -967,18 +1132,19 @@ impl<'a> Normaliser<'a> {
                     });
                 }
                 ClassExpr::All(r, c) => {
-                    if matches!(self.get(c), ClassExpr::Thing) {
-                        return;
-                    }
                     if self.non_simple.contains(&r.named()) {
                         // `∀R.¬D` beside other disjuncts: `¬P` for a name `∃R.D ⊑ P`, which
                         // goes through R⁻'s automaton as `D ⊑ ∀R⁻.P` and stays Horn (the
                         // start state of R's own automaton made `A ⊓ ∃R.D ⊑ B` the
                         // disjunction `A → B ∨ Q`; 4 October 2026).
                         if many && self.negative_filler(c) {
-                            let d = self.nnf_not(c);
+                            let Some(d) = self.nnf_not(c) else {
+                                return Err(UNCOUNTED);
+                            };
                             let some = self.e(ClassExpr::Some(r, d));
-                            let p = self.fresh_negative(some, gci.source);
+                            let Some(p) = self.fresh_negative(some, gci.source) else {
+                                return Err(UNCOUNTED);
+                            };
                             body.push(BodyAtom::Concept(Concept::Fresh(p), Var::X));
                             continue;
                         }
@@ -987,8 +1153,10 @@ impl<'a> Normaliser<'a> {
                         head.push(HeadAtom::Concept(Concept::Fresh(start), Var::X));
                         continue;
                     }
-                    let y = Var::Y(next_y);
-                    next_y += 1;
+                    let Some(ys) = variables(&mut next_y, 1) else {
+                        return Err(TOO_WIDE);
+                    };
+                    let y = Var::Y(ys[0]);
                     body.push(Self::edge(r, Var::X, y));
                     self.at(c, y, &mut body, &mut head, gci.source);
                 }
@@ -996,7 +1164,10 @@ impl<'a> Normaliser<'a> {
                     let filler = match self.get(c) {
                         ClassExpr::Thing => None,
                         ClassExpr::Class(a) => Some(Concept::Named(a)),
-                        _ => Some(Concept::Fresh(self.fresh_negative(c, gci.source))),
+                        _ => match self.fresh_negative(c, gci.source) {
+                            Some(q) => Some(Concept::Fresh(q)),
+                            None => return Err(UNCOUNTED),
+                        },
                     };
                     if n > self.expand_up_to {
                         head.push(HeadAtom::AtMost {
@@ -1007,8 +1178,10 @@ impl<'a> Normaliser<'a> {
                         });
                         continue;
                     }
-                    let ys: Vec<Var> = (0..=n).map(|i| Var::Y(next_y + i as u16)).collect();
-                    next_y += n as u16 + 1;
+                    let Some(ys) = variables(&mut next_y, n as usize + 1) else {
+                        return Err(TOO_WIDE);
+                    };
+                    let ys: Vec<Var> = ys.into_iter().map(Var::Y).collect();
                     for &y in &ys {
                         body.push(Self::edge(r, Var::X, y));
                         if let Some(concept) = filler {
@@ -1027,7 +1200,6 @@ impl<'a> Normaliser<'a> {
                     range: r,
                     var: Var::X,
                 }),
-                ClassExpr::DataMin(0, _, _) => return,
                 ClassExpr::DataMin(n, d, r) => head.push(HeadAtom::DataAtLeast {
                     n,
                     property: d,
@@ -1035,8 +1207,10 @@ impl<'a> Normaliser<'a> {
                     var: Var::X,
                 }),
                 ClassExpr::DataAll(d, r) => {
-                    let v = Var::V(next_v);
-                    next_v += 1;
+                    let Some(vs) = variables(&mut next_v, 1) else {
+                        return Err(TOO_WIDE);
+                    };
+                    let v = Var::V(vs[0]);
                     body.push(BodyAtom::Data(d, Var::X, v));
                     head.push(HeadAtom::DataIn(r, v));
                 }
@@ -1049,8 +1223,10 @@ impl<'a> Normaliser<'a> {
                     })
                 }
                 ClassExpr::DataMax(n, d, r) => {
-                    let vs: Vec<Var> = (0..=n).map(|i| Var::V(next_v + i as u16)).collect();
-                    next_v += n as u16 + 1;
+                    let Some(vs) = variables(&mut next_v, n as usize + 1) else {
+                        return Err(TOO_WIDE);
+                    };
+                    let vs: Vec<Var> = vs.into_iter().map(Var::V).collect();
                     let outside = self.range_not(r);
                     for &v in &vs {
                         body.push(BodyAtom::Data(d, Var::X, v));
@@ -1069,6 +1245,7 @@ impl<'a> Normaliser<'a> {
             }
         }
         self.add(body, head, gci.source);
+        Ok(())
     }
 
     /// The filler of an at-least atom for `c`.
@@ -1399,6 +1576,7 @@ impl<'a> Normaliser<'a> {
     /// The start state's fresh name of `∀ role. filler` along `role`'s automaton.
     fn automaton(&mut self, role: ObjProp, filler: Item, source: usize) -> u32 {
         if let Some(&start) = self.automata.get(&(role, filler)) {
+            self.take(start);
             return start;
         }
         let nfa = match self.nfas.get(&role) {
@@ -1421,19 +1599,19 @@ impl<'a> Normaliser<'a> {
             }
         };
         let Some(nfa) = nfa else {
-            self.out
-                .unsupported
-                .push((source, "an irregular role hierarchy"));
-            // Read as over the role alone (sound for what it derives).
+            // A state with no clauses (sound for what it derives); what takes it is left out.
             let q = self.new_fresh(FreshOf::State { role, state: 0 });
             self.automata.insert((role, filler), q);
+            self.take(q);
+            self.fail(Taker::Name(q), IRREGULAR);
             return q;
         };
         let names: Vec<u32> = (0..nfa.states)
             .map(|state| self.new_fresh(FreshOf::State { role, state }))
             .collect();
-        self.automata
-            .insert((role, filler), names[nfa.start as usize]);
+        let start = names[nfa.start as usize];
+        self.automata.insert((role, filler), start);
+        self.take(start);
         let state = |s: u32| Concept::Fresh(names[s as usize]);
         // A transition needs the universal and the role inclusions of its edge together
         // (justifications through a role hierarchy or chain name them: found by the
@@ -1459,13 +1637,14 @@ impl<'a> Normaliser<'a> {
                 ),
             }
         }
-        // The end state: the filler holds.
-        self.gci(
+        // The end state: the filler holds (taken as the automaton, by its start state).
+        self.define(
+            start,
             Vec::new(),
             vec![Item::NotFresh(names[nfa.end as usize]), filler],
             source,
         );
-        names[nfa.start as usize]
+        start
     }
 
     /// The automaton less the transitions another transition between the same states
@@ -1521,5 +1700,23 @@ impl<'a> Normaliser<'a> {
         out.classes = self.classes;
         out.ranges = self.ranges;
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::variables;
+
+    /// Guard (review A-1203): variables are numbered up to a `u16`'s last number, never past
+    /// it. A key's 65,535 shared targets after `y` fit, 65,536 don't; 65,536 values fit,
+    /// 65,537 don't; after the last number nothing does.
+    #[test]
+    fn variables_end_at_the_last_number_of_a_u16() {
+        let targets = variables(&mut 1, 65_535).expect("fits");
+        assert_eq!((targets[0], targets[targets.len() - 1]), (1, u16::MAX));
+        assert_eq!(variables(&mut 1, 65_536), None);
+        assert_eq!(variables(&mut 0, 65_536).map(|v| v.len()), Some(65_536));
+        assert_eq!(variables(&mut 0, 65_537), None);
+        assert_eq!(variables(&mut 65_536, 1), None);
     }
 }
