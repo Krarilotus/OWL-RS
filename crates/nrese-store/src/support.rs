@@ -169,6 +169,21 @@ struct Work {
     cancellation: Option<CancellationToken>,
 }
 
+impl Work {
+    /// Fails once the reading query is cancelled: what polls it stops there, before it
+    /// charges or keeps more.
+    fn go_on(&self) -> Result<(), Unavailable> {
+        match self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            true => Err(Unavailable::Cancelled),
+            false => Ok(()),
+        }
+    }
+}
+
 impl std::ops::Deref for Work {
     type Target = Arc<Budget>;
 
@@ -953,23 +968,29 @@ impl SupportSets {
     /// only in graphs the reader can't read that its graphs derive (the stack has no copy of
     /// them: an inferred statement is suppressed while it is asserted anywhere), so what the
     /// reader sees doesn't depend on what such a graph asserts. The side kept is charged to
-    /// `kept`, the rest to `working`.
+    /// `kept`, the rest to `working`, whose query's cancellation stops it between its scans
+    /// and while it decides.
     fn split(
         &self,
         snapshot: &Snapshot,
         access: &GraphAccess,
         kept: &Arc<Budget>,
-        working: &Arc<Budget>,
+        working: &Work,
         within: impl FnOnce() -> Result<Kept<Triple>, Unavailable>,
     ) -> Result<Split, Unavailable> {
         let visible_sets = self.visible_sets(snapshot, access, working)?;
         let quads = sorted_quads(snapshot, ReadModel::Inferred, working)?;
+        working.go_on()?;
         let mut decisions: Kept<Decision> =
             ChargedVec::with_capacity(Arc::clone(working), quads.len())?;
-        for quad in quads.iter() {
+        for (i, quad) in quads.iter().enumerate() {
+            if i.is_multiple_of(4096) {
+                working.go_on()?;
+            }
             decisions.push(self.decide(triple(*quad), &visible_sets))?;
         }
         let elsewhere = self.asserted_elsewhere(snapshot, access, working)?;
+        working.go_on()?;
         let mut derived: Kept<Decision> =
             ChargedVec::with_capacity(Arc::clone(working), elsewhere.len())?;
         for &fact in elsewhere.iter() {
@@ -2157,7 +2178,10 @@ impl Supports {
     /// the sets were updated from its revision and they decide every changed statement,
     /// else from the whole stack, `within` (the reader's closure, by the sets' rules)
     /// deciding what the sets leave open. The sets are of the rules set `epoch` times: the
-    /// reader's last view is taken, and this one kept, only while they are in place.
+    /// reader's last view is taken, and this one kept, only while they are in place. The
+    /// reading query's cancellation stops it before it charges anything, while it splits,
+    /// and before it keeps the view: a cancelled read builds and keeps nothing, though the
+    /// sets were made before.
     fn build_view(
         &self,
         snapshot: &Snapshot,
@@ -2167,6 +2191,7 @@ impl Supports {
         epoch: u64,
         working: &Work,
     ) -> Result<Snapshot, Unavailable> {
+        working.go_on()?;
         let started = std::time::Instant::now();
         let earlier = {
             let state = self.state();
@@ -2220,6 +2245,7 @@ impl Supports {
                 .expect("a mask built for this stack's layout"),
             Form::Only(list) => snapshot.with_inferred_only(list, &self.kept)?,
         };
+        working.go_on()?;
         let reader = Shared::new(
             Reader {
                 access: Arc::clone(access),
