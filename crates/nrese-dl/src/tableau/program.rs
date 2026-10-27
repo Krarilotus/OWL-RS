@@ -473,10 +473,13 @@ impl Program {
             .reach
             .iter()
             .map(|group| {
-                group
+                let mut names: Vec<ConceptId> = group
                     .iter()
                     .map(|&c| self.concept(ConceptName::Clause(c)))
-                    .collect()
+                    .collect();
+                // Sorted: `apply_key` looks a member's labels up in it.
+                names.sort_unstable();
+                names
             })
             .collect();
         let mut key = KeyRule {
