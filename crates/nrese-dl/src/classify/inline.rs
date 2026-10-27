@@ -198,6 +198,11 @@ fn blocked(n: &Normalised) -> HashSet<u32> {
                 out.insert(*k);
             }
         }
+        for c in r.reach.iter().flatten() {
+            if let Concept::Fresh(k) = c {
+                out.insert(*k);
+            }
+        }
     }
     out
 }
