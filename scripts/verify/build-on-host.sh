@@ -5,8 +5,9 @@
 #
 # The cache is the host's one cache, shared with the gates (scripts/lib/gate-job.sh;
 # Harness/notes/2026-10-20-host-cache-contract.md): ~/fleet/cache/owlrs-gate, one build or gate at a
-# time (its lock). The binary goes to <cache>/bin-<sha12>/ (nrese-server, REVISION, SHA256SUMS) for
-# the run jobs on this host; a binary already there whose checksum holds is reused, not rebuilt.
+# time (its lock). The binary goes to <cache>/bin-<sha12>/ (nrese-server, REVISION, SHA256SUMS,
+# PROVENANCE) for the run jobs on this host. A binary already there is reused, not rebuilt, only with
+# the PROVENANCE an isolated build of this tree writes (verify.py runs it only with that, too).
 # It builds in its own checkout's target directory, which goes with the job, never in a target
 # another checkout builds in (the gates' or another build's): cargo decides freshness by mtimes,
 # so another checkout's build could stand in for this commit's code. A cold build: 119 s at -j2
@@ -29,7 +30,7 @@
 # the binary's SHA-256 and size, python3's version for the run job, the step's memory: its
 # cgroup's peak, page cache included, and the highest anonymous memory sampled each second, what
 # the build holds; the cache before and after, what went and the bytes reclaimed) and, for a
-# fresh build, server/ (the binary with REVISION and SHA256SUMS), fetched back with the job.
+# fresh build, server/ (the binary with REVISION, SHA256SUMS and PROVENANCE), fetched back with the job.
 set -euo pipefail
 out=${FLEET_OUT:?a fleet job}
 cache=${NRESE_VERIFY_CACHE:-$HOME/fleet/cache/owlrs-gate}
@@ -115,10 +116,19 @@ bounded "${NRESE_VERIFY_TOOLCHAIN_S:-900}" "installing toolchain $channel" \
   rustup toolchain install "$channel" --no-self-update --profile minimal > /dev/null 2>&1 \
   || { echo "no toolchain $channel" >&2; exit 3; }
 release=$(rustc -vV | sed -n 's/^release: //p')
+tree=$(git rev-parse 'HEAD^{tree}')
+# What only an isolated build of this tree writes beside its binary ($1: the binary's SHA-256). A
+# bin-<sha12> without it is from before the builds were isolated (26 Oct 2026), when a shared cargo
+# target could leave another commit's code under this one's name with a valid checksum and REVISION
+# (PR #47, Sol r1 F1): it is built again.
+provenance() {
+  printf 'contract isolated-build/1\nrevision %s\ntree %s\nrustc %s\nsha256 %s\n' "$sha" "$tree" "$release" "$1"
+}
 if [ -x "$bin/nrese-server" ] && (cd "$bin" && sha256sum --quiet -c SHA256SUMS) \
-  && [ "$(cat "$bin/REVISION")" = "$sha" ]; then
+  && [ "$(cat "$bin/REVISION")" = "$sha" ] \
+  && [ "$(cat "$bin/PROVENANCE" 2> /dev/null)" = "$(provenance "$(cut -d' ' -f1 "$bin/SHA256SUMS")")" ]; then
   built=false
-  echo "reusing $bin/nrese-server (its checksum holds)"
+  echo "reusing $bin/nrese-server (an isolated build of this tree; its checksum holds)"
 else
   built=true
   export CARGO_TARGET_DIR=$PWD/target
@@ -130,10 +140,11 @@ else
   cp "$CARGO_TARGET_DIR/debug/nrese-server" "$bin.tmp/nrese-server"
   echo "$sha" > "$bin.tmp/REVISION"
   (cd "$bin.tmp" && sha256sum nrese-server > SHA256SUMS)
+  provenance "$(cut -d' ' -f1 "$bin.tmp/SHA256SUMS")" > "$bin.tmp/PROVENANCE"
   rm -rf -- "$bin"
   mv "$bin.tmp" "$bin"
   mkdir -p "$out/server"
-  cp "$bin/nrese-server" "$bin/REVISION" "$bin/SHA256SUMS" "$out/server/"
+  cp "$bin/nrese-server" "$bin/REVISION" "$bin/SHA256SUMS" "$bin/PROVENANCE" "$out/server/"
 fi
 date +%s > "$bin/.last-used"
 kill "$sampler" 2> /dev/null || true
