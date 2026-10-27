@@ -713,6 +713,50 @@ mod tests {
         assert_eq!(reported[0], reported[1]);
     }
 
+    /// A list cell equated with `rdf:nil` keeps its members. Under the replacement rules,
+    /// every identity as DRed maintains it, `ex:C owl:oneOf ex:l` with `ex:l` the list
+    /// `(ex:a)` makes `ex:a` a C, and with C below owl:Nothing the state is inconsistent. A
+    /// materialisation by representatives reads every list through the class of `rdf:nil` as
+    /// empty, so it found the state consistent. It reports what the replacement rules
+    /// report: maintenance equals full rematerialisation (reasoning-semantics.md,
+    /// "Maintenance"; Sol's review of DMW-AB-mem, r2 S2).
+    #[test]
+    fn a_list_cell_equated_with_nil_keeps_its_members() {
+        for representatives in [false, true] {
+            let engine = Engine::new(EngineConfig {
+                background_maintenance: false,
+                ..EngineConfig::default()
+            })
+            .unwrap();
+            let mut tx = engine.transaction();
+            let program =
+                Program::compile(&crate::rulesets::Ruleset::Owl2Rl.into(), &|t| tx.intern(t))
+                    .by_representatives(representatives);
+            let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+            let rdf = |l: &str| iri(&format!("http://www.w3.org/1999/02/22-rdf-syntax-ns#{l}"));
+            let (first, rest, nil) = (rdf("first"), rdf("rest"), rdf("nil"));
+            let owl = |l: &str| iri(&format!("http://www.w3.org/2002/07/owl#{l}"));
+            let (one_of, nothing, same_as) = (owl("oneOf"), owl("Nothing"), owl("sameAs"));
+            let sub_class_of = iri("http://www.w3.org/2000/01/rdf-schema#subClassOf");
+            let [c, l, a] = ["C", "l", "a"].map(|n| iri(&format!("http://example.com/{n}")));
+            for fact in [
+                [c, one_of, l],
+                [c, sub_class_of, nothing],
+                [l, first, a],
+                [l, rest, nil],
+                [l, same_as, nil],
+            ] {
+                tx.insert_encoded(encode(fact).in_default_graph());
+            }
+            let closure = super::super::materialise(&program, &tx.pending_snapshot());
+            assert!(
+                closure.violations.iter().any(|v| v.rule == "cls-nothing2"),
+                "by representatives {representatives}: {:?}",
+                closure.violations
+            );
+        }
+    }
+
     #[test]
     fn cancelling_a_split_or_revival_discards_the_prospective_closure() {
         for revive in [false, true] {

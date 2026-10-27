@@ -299,6 +299,10 @@ pub struct Materialisation {
     /// `owl:sameAs` classes, and in how many rounds (the start included) they merged.
     pub classes: EqualityClasses,
     pub merges: usize,
+    /// With equality by representatives: a class holds `rdf:nil`, so every list through it
+    /// read as empty, where the replacement rules keep a list cell's members. The closure
+    /// isn't the replicated one's; the caller computes it by replication.
+    pub nil_merged: bool,
 }
 
 /// A materialisation's input: facts, or facts grouped as the store streams them (each
@@ -2685,6 +2689,10 @@ fn run(
     result.counters.merged_pairs = store.merged;
     phases.consistency = clock.elapsed();
     result.phases = phases;
+    result.nil_merged = representatives
+        .as_ref()
+        .zip(lists)
+        .is_some_and(|(reps, lists)| reps.classes.class_of(lists.nil()).is_some());
     heap::phase("reasoner: derived");
     let mut derived = match representatives {
         None => store.into_derived(),
