@@ -720,7 +720,23 @@ impl StoreService {
         Ok(status.map(|s| (s, detail.unwrap_or_default())))
     }
 
+    /// Every query run but a transaction's pending one: its refusal as its reader may be
+    /// told it ([`for_its_reader`]; the answers are the reader's own).
     fn run_reporting(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+        out: impl std::io::Write,
+        report: impl FnOnce(Option<nrese_sparql::Completeness>),
+    ) -> StoreResult<(
+        Option<crate::dl::DlDetail>,
+        Option<nrese_sparql::ql::QlReport>,
+    )> {
+        let run = self.run_reporting_whole(prepared, cancellation, out, report);
+        for_its_reader(prepared, run, |_| {})
+    }
+
+    fn run_reporting_whole(
         &self,
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
@@ -847,8 +863,25 @@ impl StoreService {
     }
 
     /// Runs a prepared query on the latest snapshot to completion and reports how it ran:
-    /// the executor, each operator with estimated and actual rows, and times.
+    /// the executor, each operator with estimated and actual rows, and times. To a reader
+    /// who may not read every graph, only what is its own ([`for_its_reader`]).
     pub fn explain_query(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<crate::Explanation> {
+        for_its_reader(
+            prepared,
+            self.explain_whole(prepared, cancellation),
+            |explanation| {
+                explanation.steps.clear();
+                explanation.rewrites.clear();
+                explanation.decoded = 0;
+            },
+        )
+    }
+
+    fn explain_whole(
         &self,
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
@@ -892,18 +925,37 @@ impl StoreService {
     }
 
     /// The plan `prepared` would run as, each node with its estimated rows, without
-    /// running it (EXPLAIN without ANALYZE). Planning stops with
-    /// [`nrese_sparql::QueryEvaluationError::Cancelled`] once `cancellation` is cancelled.
+    /// running it (EXPLAIN without ANALYZE), within the query's memory envelope. Planning
+    /// stops with [`nrese_sparql::QueryEvaluationError::Cancelled`] once `cancellation` is
+    /// cancelled. To a reader who may not read every graph, only what is its own
+    /// ([`for_its_reader`]).
     pub fn plan_query(
         &self,
         prepared: &PreparedQuery,
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::PlannedQuery> {
+        for_its_reader(
+            prepared,
+            self.plan_whole(prepared, cancellation),
+            |planned| {
+                planned.steps.clear();
+                planned.rewrites.clear();
+            },
+        )
+    }
+
+    fn plan_whole(
+        &self,
+        prepared: &PreparedQuery,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<crate::PlannedQuery> {
+        let memory = self.settings.query_envelope(prepared);
         let mut planned = plan_prepared(
             &self.read_snapshot(prepared.access()),
             prepared,
             &self.settings,
             cancellation,
+            &memory,
         )?;
         planned.completeness = match self.dl_mode(prepared) {
             Some(_) => Some(crate::dl::query::plan_status(self, prepared)),
@@ -1081,7 +1133,7 @@ impl StoreService {
             .iter()
             .any(|op| !matches!(op, crate::StatementOp::Add { .. }));
         let memory = self.settings.query_envelope(prepared);
-        self.with_pending(pending, &scope, cancellation, |snapshot| {
+        let run = self.with_pending(pending, &scope, cancellation, |snapshot| {
             run_query(
                 snapshot,
                 prepared,
@@ -1120,7 +1172,8 @@ impl StoreService {
                 },
             )
             .map(|_| ())
-        })
+        });
+        for_its_reader(prepared, run, |_| {})
     }
 
     /// The queries running now ([`crate::running`]).
@@ -1718,4 +1771,28 @@ pub(crate) fn in_readable_graph(
         };
         access.allows_graph(&graph)
     })
+}
+
+/// A run or an EXPLAIN of `prepared` as its reader may be told it (round 13, R13-diag). A
+/// reader of every graph is told everything. Another is told only what comes from its query
+/// and its answer: `redact` takes an EXPLAIN's operators (their estimates, the order and the
+/// operators those chose, their rows, the dictionary work they report, their times) and its
+/// rewrites (an estimate decides some, as eager aggregation), all read from statistics and
+/// scans of every graph; and a memory refusal keeps its kind and limit but not the bytes
+/// held and asked for, which a scan of graphs it may not read sized.
+fn for_its_reader<T>(
+    prepared: &PreparedQuery,
+    whole: StoreResult<T>,
+    redact: impl FnOnce(&mut T),
+) -> StoreResult<T> {
+    if crate::ReadScope::of(prepared.access().cloned()).reads_everything() {
+        return whole;
+    }
+    match whole {
+        Ok(mut whole) => {
+            redact(&mut whole);
+            Ok(whole)
+        }
+        Err(error) => Err(error.without_amounts()),
+    }
 }
