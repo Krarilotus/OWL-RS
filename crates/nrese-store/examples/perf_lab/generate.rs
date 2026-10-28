@@ -5,7 +5,9 @@
 //! named graphs, `ex:graph0` to `ex:graph3`), and computes here, independently of the store, the
 //! answers the suite checks before a time counts. They go to standard output as one JSON
 //! object (`expect`), with the statement count and the parameters used. Kinds that need
-//! commits also write `OUT.commits.ru`: one SPARQL update per line, one commit each.
+//! commits also write `OUT.commits.ru`: one SPARQL update per line, one commit each;
+//! `support-stress` also writes its reader (`OUT.reader`) and that reader's own updates
+//! (`OUT.updates.ru`, one request per line).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -1472,6 +1474,19 @@ fn support_stress(p: &Params, nt: &mut Nt, out: &str, commits: &str) -> std::io:
     std::fs::write(
         commits,
         format!("{}\n{}\n", update(&one), update(&thousand)),
+    )?;
+    // The reader's own updates (`perf_lab --support-updates`), into the first of its graphs:
+    // u1 reads the committed state (every `ex:D` it derives); u2's second `WHERE` reads the
+    // state its first operation left. They write markers only, so `ex:D` stays as it is.
+    let own = &reader[0];
+    std::fs::write(
+        format!("{out}.updates.ru"),
+        format!(
+            "INSERT {{ GRAPH <{own}> {{ ?x <{EX}marked> true }} }} WHERE {{ ?x a <{EX}D> }}\n\
+             INSERT DATA {{ GRAPH <{own}> {{ <{EX}probe> <{EX}step> 1 }} }} ; \
+             INSERT {{ GRAPH <{own}> {{ ?x <{EX}seen> true }} }} \
+             WHERE {{ GRAPH <{own}> {{ <{EX}probe> <{EX}step> 1 }} ?x a <{EX}D> }}\n"
+        ),
     )?;
     quads.extend(one);
     quads.extend(thousand);
