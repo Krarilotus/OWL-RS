@@ -28,6 +28,9 @@
 #   release-gate.sh verdict TIMED_DIR... CHECKS_DIR   every part together, each host's rounds combined
 #   release-gate.sh jobs CAND [OPTIONS]     the fleet jobs of a whole gate (release_gate.py jobs --help)
 #   release-gate.sh clean                   the gate's worktrees and build trees (binaries and data stay)
+#   release-gate.sh clean --patch-keyed [--remove]   the builds of a perf lab patched before T0, listed
+#                                           (FLEET_OUT/patch-keyed-builds.tsv); with --remove their binaries
+#                                           go, unless a gate used them within GATE_LIVE_HOURS (default 24)
 #
 # One harness for every side: HARNESS's fast suite (its cases, checks, generator and data);
 # only the engine's binaries differ. A side whose perf lab predates --routes (main) runs with
@@ -106,6 +109,10 @@ MEASURE=benches/fast/measure.toml
 case ${1:-} in
 build)
   rev=$(git rev-parse "$2") || exit 2
+  # The commit built and timed for this side: the revision, or its measurement commit, a
+  # reviewed commit on it that changes only its perf lab (benches/fast/measurement-sides.toml).
+  # Any other is refused; the side's REVISION and pointer stay the revision's.
+  at=$(py benches/fast/release_gate.py measured-at "$rev") || { log "build $rev: refused"; exit 2; }
   export PATH=$HOME/.cargo/bin:$PATH
   # The gate's flags replace a host's (its ~/.cargo/config.toml rustflags), before the identity
   # is taken: the identity hashes the flags the build gets.
@@ -114,25 +121,18 @@ build)
   # Each layout's build by its identity: one there from before counts, the others are built.
   todo=()
   for L in $(seq 1 "$LAYOUTS"); do
-    lbin=$(identity_dir "$rev" "$L")
+    lbin=$(identity_dir "$at" "$L")
     if build_verified "$lbin" "$rev"; then point "$rev" "$lbin" "$L"; else todo+=("$L"); fi
   done
-  bin=$(identity_dir "$rev" 1)
+  bin=$(identity_dir "$at" 1)
   if [ ${#todo[@]} -eq 0 ]; then
     cp "$bin/BUILD.txt" "$OUT/build-$(short "$rev").txt"
     log "build $rev: verified binaries of its identity there from before ($bin, $LAYOUTS layouts)"; exit 0
   fi
   # The source and build trees are this gate's own; the build is published under its identity.
-  mkdir -p "$GATE/build" && src=$(worktree "$rev" "$GATE/build") || exit 2
-  export CARGO_TARGET_DIR=$GATE/build/target-$(short "$rev")
-  # Every side's perf lab times alike: no thread started inside the timed window (the
-  # watchdog, applied to the revision's own perf lab source; the engine untouched; the patch
-  # is part of the build's identity, build_identity).
-  lab=$src/crates/nrese-store/examples/perf_lab/main.rs
-  [ -f "$lab" ] || lab=$src/crates/nrese-store/examples/perf_lab.rs
-  patched=$(py benches/fast/patches/perf_lab_watchdog.py "$lab")
-  case $patched in applied|present) timing=watchdog ;; *) timing=spawn ;; esac
-  log "build $rev ($(cd "$src" && rustc -V 2>/dev/null)); layouts to build: ${todo[*]}"
+  mkdir -p "$GATE/build" && src=$(worktree "$at" "$GATE/build") || exit 2
+  export CARGO_TARGET_DIR=$GATE/build/target-$(short "$at")
+  log "build $rev at $at ($(cd "$src" && rustc -V 2>/dev/null)); layouts to build: ${todo[*]}"
   missing=()
   if [ "${todo[0]}" = 1 ]; then
   part=$bin.partial-$$
@@ -151,21 +151,23 @@ build)
   (cd "$src" && bash scripts/cargo-guarded.sh build --release --locked --quiet -p nrese-server) \
     || { log "build of nrese-server failed at $rev"; exit 1; }
   cp "$CARGO_TARGET_DIR/release/nrese-server" "$part/release/"
-  # What the revision's perf lab can do, from its source: route reports (--routes) and
-  # whether it requires --queries (main's, f9b515e8: neither, and no samples per run).
-  routes=1 empty=0 batch=0
-  git grep -q -e '"--routes"' "$rev" -- crates/nrese-store/examples || routes=0
-  git grep -q -e 'queries DIR is required' "$rev" -- crates/nrese-store/examples && empty=1
-  git grep -q -e '"--batch"' "$rev" -- crates/nrese-store/examples && batch=1
+  # What the built perf lab can do, from its source: route reports (--routes), whether it
+  # requires --queries (main's, f9b515e8: neither, and no samples per run), and whether its
+  # timed window starts no thread (the watchdog; PROTOCOL.md §5).
+  routes=1 empty=0 batch=0 timing=spawn
+  git grep -q -e '"--routes"' "$at" -- crates/nrese-store/examples || routes=0
+  git grep -q -e 'queries DIR is required' "$at" -- crates/nrese-store/examples && empty=1
+  git grep -q -e '"--batch"' "$at" -- crates/nrese-store/examples && batch=1
+  git grep -q -e 'mod perf_lab_watchdog' "$at" -- crates/nrese-store/examples && timing=watchdog
   printf 'routes=%s\nempty_queries=%s\nbatch=%s\ntiming=%s\n' "$routes" "$empty" "$batch" "$timing" > "$part/CAPABILITIES"
   echo "$rev" > "$part/REVISION"
-  { echo "revision $rev"; (cd "$src" && rustc -V); echo "missing at this revision: ${missing[*]:-none}";
-    echo "measurement patch perf_lab_watchdog: $patched";
+  { echo "revision $rev"; [ "$at" = "$rev" ] || echo "measurement commit $at (its parent: $rev)";
+    (cd "$src" && rustc -V); echo "missing at this revision: ${missing[*]:-none}";
     cat "$part/CAPABILITIES"; } > "$part/BUILD.txt"
   lld=$(lld_of "$part") || { log "build $rev: not linked by the toolchain's LLD"; exit 1; }
   echo "linker $lld" >> "$part/BUILD.txt"
   (cd "$part" && find release -type f | sort | xargs sha256sum > SHA256SUMS)
-  { build_identity "$rev" 1; echo "linker $lld"; } > "$part/IDENTITY"
+  { build_identity "$at" 1; echo "linker $lld"; } > "$part/IDENTITY"
   publish "$part" "$bin" || { log "build $rev: $bin is there but doesn't verify"; exit 1; }
   point "$rev" "$bin" 1
   fi
@@ -174,7 +176,7 @@ build)
   # rest copied from layout 1. A linker that isn't LLD refuses the option: the build fails.
   for L in "${todo[@]}"; do
     [ "$L" -gt 1 ] || continue
-    lbin=$(identity_dir "$rev" "$L")
+    lbin=$(identity_dir "$at" "$L")
     lpart=$lbin.partial-$$
     rm -rf "$lpart" && cp -a "$bin" "$lpart" && rm -rf "$lpart/SHA256SUMS" "$lpart/IDENTITY" "$lpart/.refs"
     for spec in nrese-store:perf_lab nrese-dl:tableau_consistency nrese-dl:context_classify nrese-reasoner:classify; do
@@ -189,7 +191,7 @@ build)
     lld=$(lld_of "$lpart") || { log "build $rev, layout $L: not linked by the toolchain's LLD"; exit 1; }
     echo "layout $L: the timed tools linked with --shuffle-sections=.text*=$L" >> "$lpart/BUILD.txt"
     (cd "$lpart" && find release -type f | sort | xargs sha256sum > SHA256SUMS)
-    { build_identity "$rev" "$L"; echo "linker $lld"; } > "$lpart/IDENTITY"
+    { build_identity "$at" "$L"; echo "linker $lld"; } > "$lpart/IDENTITY"
     cmp -s "$bin/release/examples/perf_lab" "$lpart/release/examples/perf_lab" \
       && { log "layout $L of $rev is byte-identical to layout 1: the shuffle didn't take"; exit 1; }
     publish "$lpart" "$lbin" || { log "build $rev, layout $L: $lbin is there but doesn't verify"; exit 1; }
@@ -313,8 +315,7 @@ block)
       log "block $n: $name is the same build as another side ($(basename "$bin")): timed once"; continue
     fi
     [ "$name" = cand ] || timed+=("$bin")
-    [ "$(cat "$bin/REVISION" 2>/dev/null)" = "$rev" ] && (cd "$bin" && sha256sum -c --quiet SHA256SUMS) \
-      || { log "block $n: no verified build of $rev, layout $layout"; exit 2; }
+    build_verified "$bin" "$rev" || { log "block $n: no verified build of $rev, layout $layout"; exit 2; }
     routes=1 empty_queries=0 timing=spawn
     # shellcheck disable=SC1091
     . "$bin/CAPABILITIES"
@@ -633,6 +634,7 @@ unpack)
         || { log "unpack: $bin/$f is not an ELF binary"; exit 2; }
     done
     grep -q '^linker LLD ' "$aside/$bin/IDENTITY" 2>/dev/null || { log "unpack: $bin has no build identity"; exit 2; }
+    ! patch_keyed "$aside/$bin" || { log "unpack: $bin is a build of a perf lab patched before T0: build it again"; exit 2; }
     rev=$(cat "$aside/$bin/REVISION")
     publish "$aside/$bin" "$GATE_BIN/$bin" || { log "unpack: $GATE_BIN/$bin is there but doesn't verify"; exit 2; }
     point "$rev" "$GATE_BIN/$bin" "$(cat "$GATE_BIN/$bin/LAYOUT" 2>/dev/null || echo 1)"
@@ -688,6 +690,12 @@ jobs)
   ;;
 
 clean)
+  if [ "${2:-}" = --patch-keyed ]; then
+    # The builds of a perf lab patched at build time (before T0, 28 Oct 2026), which no gate after
+    # T0 can reuse (their identity has the patch): listed, and with --remove their binaries go.
+    sweep_patch_keyed "${3:-}" | tee "$OUT/patch-keyed-builds.tsv"
+    exit "${PIPESTATUS[0]}"
+  fi
   # This gate's worktrees, build trees and scratch go (never the shared binaries' directory:
   # other gates build and read there); the data view, the prepared data and every result stay
   # for the gate's next run. Builds no gate used for GATE_BIN_AGE_DAYS go (sweep_builds).
@@ -707,7 +715,7 @@ clean)
   ;;
 
 *)
-  sed -n '2,31p' "$0"
+  sed -n '2,34p' "$0"
   exit 2
   ;;
 esac
