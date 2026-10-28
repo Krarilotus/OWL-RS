@@ -87,6 +87,25 @@ FAULTS = PRECEDENCE[:5]
 # Those whose time no report takes: not the reference's answer, or not known to be (a capture
 # that failed after the timed runs included: incomplete).
 UNTIMED = FAULTS
+# An answer incomplete because no reference answered: nobody checked it.
+UNCHECKED = "unchecked"
+
+
+def timing_verdict(entry: dict) -> str:
+    """A system's verdict on a query (Recorder.verdicts) as timing reads it: `unchecked` where
+    it is incomplete because no reference answered (the answer may be right; nothing showed it),
+    else its verdict."""
+    if entry["verdict"] == "incomplete" and entry.get("note", "").startswith("no reference"):
+        return UNCHECKED
+    return entry["verdict"]
+
+
+def timed(verdict: str | None) -> bool:
+    """Whether a query's time may count with this answer verdict (timing_verdict): not one of
+    UNTIMED, and not unchecked, since an answer nobody checked earns no time (T8 PR #56 R3).
+    The reports that name winners (versus, compete) decide it here. No verdict at all (answers
+    not captured) leaves it to the answer counts, as before."""
+    return verdict is None or (verdict not in UNTIMED and verdict != UNCHECKED)
 # F&O 3.1 §4.2: a decimal division SHOULD give at least 18 significant digits.
 DIVISION_DIGITS = 18
 
