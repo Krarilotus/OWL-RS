@@ -25,10 +25,11 @@
 //! restrictions, complements, cardinalities, inverses, nominals) or not (property
 //! characteristics other than transitivity, disjoint properties, disjoint unions, named
 //! class expressions, the top and bottom properties, datatypes where a class is read,
-//! restrictions on data properties): the hierarchy is then complete for the part read
-//! only. A data property's range, which says nothing about classes without such a
-//! restriction, assertions about individuals, and keys, which constrain only
-//! individuals, are not read: an inconsistency among them goes unseen.
+//! restrictions on data properties, nodes that state two expressions): the hierarchy is
+//! then complete for the part read only. A data property's domain and range, which say
+//! nothing about classes without such a restriction, assertions about individuals, and
+//! keys, which constrain only individuals, are not read: an inconsistency among them goes
+//! unseen.
 
 use std::time::{Duration, Instant};
 
@@ -471,12 +472,25 @@ impl Graph<'_> {
         if named(node) {
             return Ok(Expr::Named(node));
         }
-        // A value given twice is no constructor's: decided before any is tried.
-        let one = |predicate| {
-            self.one(node, predicate)
-                .map_err(|Repeated| "malformed class expression")
-        };
-        if let Some(list) = one(self.names.intersection_of)? {
+        // One node, one expression: a field given twice, or the fields of two constructors,
+        // say two things. Decided over every field before a constructor is read, so none
+        // is read while the node says something else as well.
+        let constructors = [self.names.intersection_of, self.names.some_values_from]
+            .into_iter()
+            .chain(self.names.outside_el.iter().map(|&(p, _)| p));
+        let mut present = 0;
+        for field in constructors {
+            match self.one(node, field) {
+                Err(Repeated) => return Err("malformed class expression"),
+                Ok(Some(_)) => present += 1,
+                Ok(None) => {}
+            }
+        }
+        if present > 1 || self.one(node, self.names.on_property).is_err() {
+            return Err("malformed class expression");
+        }
+        let one = |predicate| self.one(node, predicate).ok().flatten();
+        if let Some(list) = one(self.names.intersection_of) {
             let members = self.list(list).map_err(ListError::reason)?;
             if members.is_empty() {
                 return Err("empty intersection");
@@ -488,8 +502,8 @@ impl Graph<'_> {
                 .map(Expr::And);
         }
         if let (Some(filler), Some(role)) = (
-            one(self.names.some_values_from)?,
-            one(self.names.on_property)?,
+            one(self.names.some_values_from),
+            one(self.names.on_property),
         ) {
             self.names.role(role, named)?;
             if self.data_properties.contains(&role) {
@@ -663,6 +677,12 @@ fn build(
             }
             tbox.chains.push((roles[0], roles[1], target));
         } else if p == names.domain && role(s) {
+            // A data property's domain and range say nothing about classes but through a
+            // restriction on the property, which is reported (the top and bottom data
+            // properties, which do, aren't roles).
+            if graph.data_properties.contains(&s) {
+                continue;
+            }
             let Some(c) = expr(o, p, &mut skipped) else {
                 continue;
             };
@@ -670,9 +690,8 @@ fn build(
             let some = tbox.some(r, thing);
             tbox.sub(some, c);
         } else if p == names.range && role(s) {
-            // A data property's range says nothing about classes but through a restriction
-            // on the property, which is reported. A datatype as an object property's range
-            // is a datatype read as a class: `expr` reports it.
+            // As a data property's domain. A datatype as an object property's range is a
+            // datatype read as a class: `expr` reports it.
             if graph.data_properties.contains(&s) {
                 continue;
             }
@@ -1396,15 +1415,17 @@ mod tests {
     /// bottom property read as a role (`owl:topObjectProperty rdfs:domain B` gives `B ≡
     /// owl:Thing`; `A ⊑ ∃owl:bottomObjectProperty.C`, `A ⊑ ⊥`), a datatype read as a class
     /// or a restriction on a data property (`A ⊑ ∃p.xsd:integer` with `p`'s range
-    /// `xsd:string`: `A ⊑ ⊥`), and an expression with two values where the mapping has one.
-    /// Declarations, annotations, the ontology's header, a data property's range (nothing
-    /// about classes without a restriction), and assertions about individuals and keys,
-    /// which the classifier doesn't read, omit no such axiom.
+    /// `xsd:string`: `A ⊑ ⊥`), and a node that states two things: a field given twice, or
+    /// the fields of two constructors (I26 Sol r2). Declarations, annotations, the
+    /// ontology's header, a data property's domain and range (nothing about classes without
+    /// a restriction; the top data property's domain makes its class `owl:Thing`, and is
+    /// reported), and assertions about individuals and keys, which the classifier doesn't
+    /// read, omit no such axiom.
     #[test]
     fn axioms_without_a_rule_are_reported_as_omitted() {
         /// `(predicate, reason)` omitted, or `(sub, super)` derived.
         type Pairs = &'static [(&'static str, &'static str)];
-        let cases: [(&str, &str, Pairs, Pairs); 15] = [
+        let cases: [(&str, &str, Pairs, Pairs); 21] = [
             (
                 "reflexive",
                 "ex:r rdf:type owl:ReflexiveProperty
@@ -1534,6 +1555,76 @@ mod tests {
                 &[],
             ),
             (
+                "intersection-and-two-fillers",
+                "ex:A rdfs:subClassOf _:e
+                 _:e owl:intersectionOf _:l
+                 _:l rdf:first ex:B
+                 _:l rdf:rest _:m
+                 _:m rdf:first ex:C
+                 _:m rdf:rest rdf:nil
+                 _:e owl:onProperty ex:r
+                 _:e owl:someValuesFrom ex:D
+                 _:e owl:someValuesFrom ex:E",
+                &[("rdfs:subClassOf", "malformed class expression")],
+                &[],
+            ),
+            (
+                "intersection-and-existential",
+                "ex:A rdfs:subClassOf _:e
+                 _:e owl:intersectionOf _:l
+                 _:l rdf:first ex:B
+                 _:l rdf:rest _:m
+                 _:m rdf:first ex:C
+                 _:m rdf:rest rdf:nil
+                 _:e owl:onProperty ex:r
+                 _:e owl:someValuesFrom ex:D",
+                &[("rdfs:subClassOf", "malformed class expression")],
+                &[],
+            ),
+            (
+                "qualified-cardinality",
+                "ex:A rdfs:subClassOf _:e
+                 _:e owl:onProperty ex:r
+                 _:e owl:qualifiedCardinality ex:n
+                 _:e owl:onClass ex:B",
+                &[("rdfs:subClassOf", "cardinality")],
+                &[],
+            ),
+            (
+                "data-domain",
+                "ex:p rdf:type owl:DatatypeProperty
+                 ex:p rdfs:domain _:u
+                 _:u owl:unionOf _:l
+                 _:l rdf:first ex:A
+                 _:l rdf:rest _:m
+                 _:m rdf:first ex:B
+                 _:m rdf:rest rdf:nil",
+                &[],
+                &[],
+            ),
+            (
+                "data-domain-and-restriction",
+                "ex:p rdf:type owl:DatatypeProperty
+                 ex:p rdfs:domain _:u
+                 _:u owl:unionOf _:l
+                 _:l rdf:first ex:A
+                 _:l rdf:rest _:m
+                 _:m rdf:first ex:B
+                 _:m rdf:rest rdf:nil
+                 ex:C rdfs:subClassOf _:e
+                 _:e owl:onProperty ex:p
+                 _:e owl:someValuesFrom xsd:integer",
+                &[("rdfs:subClassOf", "data restriction")],
+                &[],
+            ),
+            (
+                "top-data-domain",
+                "owl:topDataProperty rdf:type owl:DatatypeProperty
+                 owl:topDataProperty rdfs:domain ex:B",
+                &[("rdfs:domain", "top or bottom property")],
+                &[],
+            ),
+            (
                 "no-axiom",
                 "ex:o rdf:type owl:Ontology
                  ex:A rdf:type owl:Class
@@ -1561,7 +1652,7 @@ mod tests {
             ),
         ];
         let mut failures = Vec::new();
-        for (case, input, omitted, subsumptions) in cases {
+        let mut check = |case: &str, input: &str, omitted: Pairs, subsumptions: Pairs| {
             let (mut v, actual) = run(input);
             let mut subsumptions: Vec<(u64, u64)> = subsumptions
                 .iter()
@@ -1583,6 +1674,37 @@ mod tests {
             if actual != expected {
                 failures.push(format!("{case}: expected {expected:?}, actual {actual:?}"));
             }
+        };
+        for (case, input, omitted, subsumptions) in cases {
+            check(case, input, omitted, subsumptions);
+        }
+        // Each field an expression is read by, given twice, makes its node malformed,
+        // whatever the node would otherwise be read as (I26 Sol r2 S3).
+        for field in [
+            "intersectionOf",
+            "someValuesFrom",
+            "onProperty",
+            "unionOf",
+            "complementOf",
+            "oneOf",
+            "allValuesFrom",
+            "hasValue",
+            "cardinality",
+            "minCardinality",
+            "maxCardinality",
+            "qualifiedCardinality",
+            "minQualifiedCardinality",
+            "maxQualifiedCardinality",
+            "inverseOf",
+        ] {
+            let input =
+                format!("ex:A rdfs:subClassOf _:e\n_:e owl:{field} ex:X\n_:e owl:{field} ex:Y");
+            check(
+                &format!("two owl:{field}"),
+                &input,
+                &[("rdfs:subClassOf", "malformed class expression")],
+                &[],
+            );
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
