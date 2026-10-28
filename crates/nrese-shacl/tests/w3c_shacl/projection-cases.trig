@@ -1,0 +1,400 @@
+# The cases every reader of the W3C SHACL test suite's report comparison passes
+# (projection.rs): each an expected report, an actual one, and whether the suite counts them
+# the same. The default graph describes the cases; each case's reports are named graphs.
+
+@prefix c: <http://w3c.test/shacl/projection-cases#> .
+@prefix ex: <http://example.org/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix sh: <http://www.w3.org/ns/shacl#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+c:identical rdfs:label "the same report, other blank nodes" ;
+    c:same true ; c:expected c:identical-expected ; c:actual c:identical-actual .
+c:identical-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ] .
+}
+c:identical-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ] .
+}
+
+c:distinct-blank-focus rdfs:label "two results on two blank focus nodes against both on one" ;
+    c:same false ; c:expected c:distinct-blank-focus-expected ; c:actual c:distinct-blank-focus-actual .
+c:distinct-blank-focus-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode _:f1 ; sh:resultSeverity sh:Violation ;
+                sh:sourceConstraintComponent sh:ClassConstraintComponent ; sh:sourceShape ex:S ] ,
+            [ a sh:ValidationResult ; sh:focusNode _:f2 ; sh:resultSeverity sh:Violation ;
+                sh:sourceConstraintComponent sh:ClassConstraintComponent ; sh:sourceShape ex:S ] .
+}
+c:distinct-blank-focus-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode _:g1 ; sh:resultSeverity sh:Violation ;
+                sh:sourceConstraintComponent sh:ClassConstraintComponent ; sh:sourceShape ex:S ] ,
+            [ a sh:ValidationResult ; sh:focusNode _:g1 ; sh:resultSeverity sh:Violation ;
+                sh:sourceConstraintComponent sh:ClassConstraintComponent ; sh:sourceShape ex:S ] .
+}
+
+c:coreference rdfs:label "one result's blank value is the other's focus, against two blank nodes" ;
+    c:same false ; c:expected c:coreference-expected ; c:actual c:coreference-actual .
+c:coreference-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode _:h1 ; sh:value _:h2 ; sh:resultSeverity sh:Violation ;
+                sh:sourceConstraintComponent sh:NodeConstraintComponent ; sh:sourceShape ex:S ] ,
+            [ a sh:ValidationResult ; sh:focusNode _:h2 ; sh:value ex:v ; sh:resultSeverity sh:Violation ;
+                sh:sourceConstraintComponent sh:NodeConstraintComponent ; sh:sourceShape ex:S ] .
+}
+c:coreference-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode _:i1 ; sh:value _:i2 ; sh:resultSeverity sh:Violation ;
+                sh:sourceConstraintComponent sh:NodeConstraintComponent ; sh:sourceShape ex:S ] ,
+            [ a sh:ValidationResult ; sh:focusNode _:i3 ; sh:value ex:v ; sh:resultSeverity sh:Violation ;
+                sh:sourceConstraintComponent sh:NodeConstraintComponent ; sh:sourceShape ex:S ] .
+}
+
+c:source-constraint rdfs:label "another sh:sourceConstraint" ;
+    c:same false ; c:expected c:source-constraint-expected ; c:actual c:source-constraint-actual .
+c:source-constraint-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultSeverity sh:Violation ;
+            sh:sourceConstraintComponent sh:SPARQLConstraintComponent ; sh:sourceShape ex:S ;
+            sh:sourceConstraint ex:C1 ] .
+}
+c:source-constraint-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultSeverity sh:Violation ;
+            sh:sourceConstraintComponent sh:SPARQLConstraintComponent ; sh:sourceShape ex:S ;
+            sh:sourceConstraint ex:C2 ] .
+}
+
+c:message-missing rdfs:label "the message the expected report has is missing" ;
+    c:same false ; c:expected c:message-missing-expected ; c:actual c:message-missing-actual .
+c:message-missing-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ; sh:resultMessage "Too few names" ] .
+}
+c:message-missing-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ] .
+}
+
+c:message-extra rdfs:label "a message beside the expected one is dropped" ;
+    c:same true ; c:expected c:message-extra-expected ; c:actual c:message-extra-actual .
+c:message-extra-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ; sh:resultMessage "Too few names" ] .
+}
+c:message-extra-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ; sh:resultMessage "Too few names" , "Zu wenige Namen"@de ] .
+}
+
+c:message-unexpected rdfs:label "a message where the expected report has none is dropped" ;
+    c:same true ; c:expected c:message-unexpected-expected ; c:actual c:message-unexpected-actual .
+c:message-unexpected-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ] .
+}
+c:message-unexpected-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ; sh:resultMessage "Value count is below 1" ] .
+}
+
+c:message-language rdfs:label "the expected message has a language tag the actual one lacks" ;
+    c:same false ; c:expected c:message-language-expected ; c:actual c:message-language-actual .
+c:message-language-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ; sh:resultMessage "Too few names"@en ] .
+}
+c:message-language-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ; sh:resultMessage "Too few names" ] .
+}
+
+c:shared-path rdfs:label "two results share one path structure; the expected report clones it" ;
+    c:same true ; c:expected c:shared-path-expected ; c:actual c:shared-path-actual .
+c:shared-path-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ; sh:resultPath [ sh:inversePath ex:knows ] ;
+                sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+                sh:sourceShape ex:S ] ,
+            [ a sh:ValidationResult ; sh:focusNode ex:b ; sh:resultPath [ sh:inversePath ex:knows ] ;
+                sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+                sh:sourceShape ex:S ] .
+}
+c:shared-path-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ; sh:resultPath _:p ;
+                sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+                sh:sourceShape ex:S ] ,
+            [ a sh:ValidationResult ; sh:focusNode ex:b ; sh:resultPath _:p ;
+                sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+                sh:sourceShape ex:S ] .
+    _:p sh:inversePath ex:knows .
+}
+
+c:iri-nodes rdfs:label "the report and its result as IRIs" ;
+    c:same true ; c:expected c:iri-nodes-expected ; c:actual c:iri-nodes-actual .
+c:iri-nodes-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ] .
+}
+c:iri-nodes-actual {
+    ex:report a sh:ValidationReport ; sh:conforms false ; sh:result ex:result1 .
+    ex:result1 a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+        sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+        sh:sourceShape ex:PersonShape-name .
+}
+
+c:subclass-type rdfs:label "a result typed with a subclass of sh:ValidationResult" ;
+    c:same true ; c:expected c:subclass-type-expected ; c:actual c:subclass-type-actual .
+c:subclass-type-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ] .
+}
+c:subclass-type-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a ex:CountResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ] .
+}
+
+c:nested-detail rdfs:label "a result nested through sh:detail is dropped" ;
+    c:same true ; c:expected c:nested-detail-expected ; c:actual c:nested-detail-actual .
+c:nested-detail-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:value ex:bob ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:NodeConstraintComponent ;
+            sh:sourceShape ex:S ] .
+}
+c:nested-detail-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:value ex:bob ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:NodeConstraintComponent ;
+            sh:sourceShape ex:S ;
+            sh:detail [ a sh:ValidationResult ; sh:focusNode ex:bob ; sh:resultPath ex:name ;
+                sh:resultSeverity sh:Violation ;
+                sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+                sh:sourceShape ex:PersonShape-name ] ] .
+}
+
+c:vendor-predicates rdfs:label "a processor's own predicates on the report and a result are dropped" ;
+    c:same true ; c:expected c:vendor-predicates-expected ; c:actual c:vendor-predicates-actual .
+c:vendor-predicates-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ] .
+}
+c:vendor-predicates-actual {
+    [] a sh:ValidationReport ; sh:conforms false ; ex:truncated false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ; ex:shapesGraph ex:shapes ] .
+}
+
+c:conforms rdfs:label "another sh:conforms" ;
+    c:same false ; c:expected c:conforms-expected ; c:actual c:conforms-actual .
+c:conforms-expected {
+    [] a sh:ValidationReport ; sh:conforms true .
+}
+c:conforms-actual {
+    [] a sh:ValidationReport ; sh:conforms false .
+}
+
+c:value-datatype rdfs:label "the value 1 as xsd:int, not xsd:integer" ;
+    c:same false ; c:expected c:value-datatype-expected ; c:actual c:value-datatype-actual .
+c:value-datatype-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:age ; sh:value 1 ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinInclusiveConstraintComponent ;
+            sh:sourceShape ex:PersonShape-age ] .
+}
+c:value-datatype-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:alice ; sh:resultPath ex:age ; sh:value "1"^^xsd:int ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinInclusiveConstraintComponent ;
+            sh:sourceShape ex:PersonShape-age ] .
+}
+
+c:result-missing rdfs:label "one of two results missing" ;
+    c:same false ; c:expected c:result-missing-expected ; c:actual c:result-missing-actual .
+c:result-missing-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ; sh:resultPath ex:name ;
+                sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+                sh:sourceShape ex:PersonShape-name ] ,
+            [ a sh:ValidationResult ; sh:focusNode ex:b ; sh:resultPath ex:name ;
+                sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+                sh:sourceShape ex:PersonShape-name ] .
+}
+c:result-missing-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ] .
+}
+
+c:result-extra rdfs:label "a result more than expected" ;
+    c:same false ; c:expected c:result-extra-expected ; c:actual c:result-extra-actual .
+c:result-extra-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ; sh:resultPath ex:name ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:PersonShape-name ] .
+}
+c:result-extra-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ; sh:resultPath ex:name ;
+                sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+                sh:sourceShape ex:PersonShape-name ] ,
+            [ a sh:ValidationResult ; sh:focusNode ex:b ; sh:resultPath ex:name ;
+                sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+                sh:sourceShape ex:PersonShape-name ] .
+}
+
+c:sequence-order rdfs:label "a sequence path's members in another order" ;
+    c:same false ; c:expected c:sequence-order-expected ; c:actual c:sequence-order-actual .
+c:sequence-order-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ; sh:resultPath ( ex:p ex:q ) ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:S ] .
+}
+c:sequence-order-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ; sh:resultPath ( ex:q ex:p ) ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:S ] .
+}
+
+c:alternative-path rdfs:label "the same alternative path in other nodes" ;
+    c:same true ; c:expected c:alternative-path-expected ; c:actual c:alternative-path-actual .
+c:alternative-path-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ;
+            sh:resultPath [ sh:alternativePath ( ex:p [ sh:zeroOrMorePath ex:q ] ) ] ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:S ] .
+}
+c:alternative-path-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ;
+            sh:resultPath [ sh:alternativePath ( ex:p [ sh:zeroOrMorePath ex:q ] ) ] ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:S ] .
+}
+
+c:malformed-path rdfs:label "a path node with two path predicates is refused, not read as one" ;
+    c:same false ; c:expected c:malformed-path-expected ; c:actual c:malformed-path-actual .
+c:malformed-path-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ; sh:resultPath [ sh:inversePath ex:p ] ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:S ] .
+}
+c:malformed-path-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ;
+            sh:resultPath [ sh:inversePath ex:p ; sh:zeroOrMorePath ex:q ] ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:S ] .
+}
+
+c:result-is-focus rdfs:label "a result that is its own focus node, against one whose focus is another blank node" ;
+    c:same false ; c:expected c:result-is-focus-expected ; c:actual c:result-is-focus-actual .
+c:result-is-focus-expected {
+    [] a sh:ValidationReport ; sh:conforms false ; sh:result _:self .
+    _:self a sh:ValidationResult ; sh:focusNode _:self ; sh:resultSeverity sh:Violation ;
+        sh:sourceConstraintComponent sh:ClassConstraintComponent ; sh:sourceShape ex:S .
+}
+c:result-is-focus-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode _:other ; sh:resultSeverity sh:Violation ;
+            sh:sourceConstraintComponent sh:ClassConstraintComponent ; sh:sourceShape ex:S ] .
+}
+
+c:cyclic-list-path rdfs:label "a path list that comes back to itself is refused, not followed" ;
+    c:same false ; c:expected c:cyclic-list-path-expected ; c:actual c:cyclic-list-path-actual .
+c:cyclic-list-path-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ; sh:resultPath _:loop ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:S ] .
+    _:loop rdf:first ex:p ; rdf:rest _:loop .
+}
+c:cyclic-list-path-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ; sh:resultPath ( ex:p ex:p ) ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:S ] .
+}
+
+c:path-within-itself rdfs:label "an inverse path of itself is refused, not followed" ;
+    c:same false ; c:expected c:path-within-itself-expected ; c:actual c:path-within-itself-actual .
+c:path-within-itself-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ; sh:resultPath _:inverse ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:S ] .
+    _:inverse sh:inversePath _:inverse .
+}
+c:path-within-itself-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ; sh:resultPath [ sh:inversePath ex:p ] ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:S ] .
+}
+
+c:shared-path-part rdfs:label "one path node used twice in a path, without a cycle, is read" ;
+    c:same true ; c:expected c:shared-path-part-expected ; c:actual c:shared-path-part-actual .
+c:shared-path-part-expected {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ; sh:resultPath ( _:twice _:twice ) ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:S ] .
+    _:twice sh:inversePath ex:p .
+}
+c:shared-path-part-actual {
+    [] a sh:ValidationReport ; sh:conforms false ;
+        sh:result [ a sh:ValidationResult ; sh:focusNode ex:a ;
+            sh:resultPath ( [ sh:inversePath ex:p ] [ sh:inversePath ex:p ] ) ;
+            sh:resultSeverity sh:Violation ; sh:sourceConstraintComponent sh:MinCountConstraintComponent ;
+            sh:sourceShape ex:S ] .
+}
+
+c:two-reports rdfs:label "a graph with two reports is refused" ;
+    c:same false ; c:expected c:two-reports-expected ; c:actual c:two-reports-actual .
+c:two-reports-expected {
+    [] a sh:ValidationReport ; sh:conforms true .
+}
+c:two-reports-actual {
+    [] a sh:ValidationReport ; sh:conforms true .
+    [] a sh:ValidationReport ; sh:conforms true .
+}
