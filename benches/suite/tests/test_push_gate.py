@@ -423,6 +423,18 @@ class MeasurementRefs(Repo):
         self.assertIn("full revisions", done.stdout + done.stderr)
         self.assertEqual(self.jobs(), [])
 
+    def test_a_measurement_ref_whose_side_is_on_no_remote_is_refused(self):
+        """T0, 28 Oct 2026: main's and v1.5's sides were ids from before the history rewrite, on no
+        remote ref; the ref's push would have published them with it."""
+        unpublished = self.add({"a.txt": "only here\n"}, "a side no remote has", self.side)
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "its measurement side", unpublished)
+        ref = f"refs/measure/old-{unpublished[:8]}"
+        self.declare(unpublished, ref, commit)
+        done = self.pushed(ref, commit)
+        self.assertNotEqual(done.returncode, 0, f"SPEC measurement ref: an unpublished side went\n{done.stderr}")
+        self.assertIn("the side must be published", done.stdout + done.stderr)
+        self.assertEqual(self.jobs(), [])
+
 
 @unittest.skipUnless(shutil.which("flock"), "the gate job runs on Linux fleet hosts (flock)")
 class GateJob(Repo):
