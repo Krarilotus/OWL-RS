@@ -361,7 +361,9 @@ arises, the same for every side:
   times it for that side ([fast/measurement-sides.toml](fast/measurement-sides.toml), pushed as
   `refs/measure/*`, and only once its side is on a remote ref: the push refuses an unpublished
   side). `release-gate.sh build` refuses one whose parent isn't the side's revision
-  or that changes anything else; nothing is patched at build time. `BUILD.txt` names the
+  or that changes anything else; nothing is patched at build time. From that check to the
+  checkout it compiles, every git call reads the objects as stored: no replace ref and no
+  graft stands in for them. `BUILD.txt` names the
   commit built, `CAPABILITIES` its timing, and the report refuses sides timed differently.
   `probes/timing-loop.py` measures what the loop adds.
 - *Nothing timed that the gate doesn't judge.* A gate's pass doesn't rerun a case past its

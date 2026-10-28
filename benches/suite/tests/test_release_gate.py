@@ -1176,22 +1176,68 @@ class MeasurementSides(unittest.TestCase):
         self.assertEqual(gate_module.measured_at(self.repo, self.side, {self.side: loop}), loop,
                          "SPEC measurement side: its perf lab alone is still built for it")
 
-    def test_a_checkout_that_replaces_objects_builds_no_side(self):
+    def test_a_replace_ref_changes_nothing_the_check_reads(self):
         """Sol, PR #54 R1 fix review D1 and D2: a replace ref stands other objects in for the
-        stored ones. Standing the side's tree in for an engine change hid the change from the
-        check (D1); read as stored, a valid measurement commit's tree passed the check while the
-        checkout compiled the tree standing in for it, another engine (D2)."""
+        stored ones; standing the side's tree in for an engine change hid the change (D1). The
+        check reads the objects as stored (STORED_OBJECTS): the change is refused, and a valid
+        commit is admitted whatever stands in for its tree, which the gate's checkout doesn't read
+        either (test_the_build_compiles_the_commit_checked)."""
         loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
         engine = self.commit({self.ENGINE: "pub fn engine() { faster() }\n"}, "the engine", self.side)
         tree = lambda commit: self.git("rev-parse", f"{commit}^{{tree}}")
-        for name, commit, replaced, by in (("an engine change hidden", engine, engine, self.side),
-                                           ("another engine compiled", loop, loop, engine)):
-            with self.subTest(name):
-                self.git("replace", tree(replaced), tree(by))
-                with self.assertRaisesRegex(SystemExit, "replaces objects"):
-                    gate_module.measured_at(self.repo, self.side, {self.side: commit})
-                self.git("replace", "-d", tree(replaced))
+        self.git("replace", tree(engine), tree(self.side))
+        with self.assertRaisesRegex(SystemExit, "changes more than its perf lab .*crates/nrese-store/src/lib.rs"):
+            gate_module.measured_at(self.repo, self.side, {self.side: engine})
+        self.git("replace", "-d", tree(engine))
+        self.git("replace", tree(loop), tree(engine))
         self.assertEqual(gate_module.measured_at(self.repo, self.side, {self.side: loop}), loop)
+
+    def test_the_build_compiles_the_commit_checked(self):
+        """PR #54 fix check 1 (D2's other half): a replace ref made after the check returned stood
+        another engine in for the checked commit's in the checkout the build compiles, and HEAD
+        and a clean status didn't show it. release-gate.sh build, from the check to the checkout,
+        reads the objects as stored: with no replace ref (the control) and with one made right
+        after the check, its worktree holds the commit checked."""
+        bash = shutil.which("bash")
+        if bash is None or shutil.which("flock") is None:
+            self.skipTest("the gate builds on Linux hosts (bash, flock)")
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        engine = self.commit({self.ENGINE: "pub fn engine() { faster() }\n"}, "another engine", self.side)
+        # The gate's scripts beside the commits, not in them.
+        for rel in ("scripts/release-gate.sh", "benches/fast/release_gate.py"):
+            Path(self.repo, rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(ROOT / rel, Path(self.repo, rel))
+        shutil.copytree(ROOT / "scripts/lib", Path(self.repo, "scripts/lib"), ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(ROOT / "benches/suite/suitekit", Path(self.repo, "benches/suite/suitekit"),
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        Path(self.repo, "benches/fast/measurement-sides.toml").write_text(
+            f'[side.{self.side}]\ncommit = "{loop}"\nref = "refs/measure/t-{self.side[:8]}"\n', encoding="utf-8")
+        tmp = Path(tempfile.mkdtemp(prefix="measurement-build-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        # The check as it is; right after it (INJECT), a replace ref standing another engine in.
+        (tmp / "shim").mkdir()
+        (tmp / "shim" / "python3").write_text(f"""#!/usr/bin/env bash
+out=$("{Path(sys.executable).as_posix()}" "$@"); code=$?
+case " $* " in *" benches/fast/release_gate.py measured-at "*) [ -z "${{INJECT:-}}" ] || git replace $INJECT ;; esac
+printf '%s\\n' "$out"; exit $code
+""", encoding="utf-8", newline="\n")
+        (tmp / "shim" / "python3").chmod(0o755)
+        tree = lambda commit: self.git("rev-parse", f"{commit}^{{tree}}")
+        got = {}
+        for name, inject in (("no replace ref", ""), ("one made after the check", f"{tree(loop)} {tree(engine)}")):
+            gate = tmp / name.replace(" ", "-")
+            env = {**os.environ, "NRESE_GATE_DIR": (gate / "gate").as_posix(), "GATE_BIN": (gate / "bin").as_posix(),
+                   "FLEET_OUT": (gate / "out").as_posix(), "INJECT": inject,
+                   "PATH": (tmp / "shim").as_posix() + os.pathsep + os.environ.get("PATH", "")}
+            done = subprocess.run([bash, "scripts/release-gate.sh", "build", self.side], cwd=self.repo, env=env,
+                                  capture_output=True, text=True)
+            src = gate / "gate" / "build" / f"src-{loop[:8]}"
+            got[name] = tuple((src / p).read_text(encoding="utf-8") if (src / p).exists() else done.stdout + done.stderr
+                              for p in (self.ENGINE, self.PERF_LAB))
+            if inject:
+                self.git("replace", "-d", tree(loop))
+        self.assertEqual(got, {name: ("pub fn engine() {}\n", "fn main() { arm(); }\n") for name in got},
+                         "SPEC measurement side: the gate compiles the commit it checked")
 
     def test_a_message_in_another_encoding_is_no_error(self):
         """Sol, PR #54 R1 fix review r3 D4: the commit object was decoded in the locale's encoding, so
