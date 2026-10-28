@@ -251,8 +251,6 @@ async fn run() -> Result<()> {
     .context("nrese-server terminated unexpectedly")
 }
 
-/// `nrese-server query`: one query on the configured store as it is (no reasoning first),
-/// its results on standard output.
 /// Reasoner v2: brings the inferred stack in line with the configured rules, unless the
 /// recorded state says it already is (same rules and semantics). Without reasoning, a
 /// leftover stack is cleared so reads never see stale inferences. Before the first read of
@@ -287,6 +285,8 @@ fn bring_inferences_up_to_date(
     Ok(())
 }
 
+/// `nrese-server query`: one query on the configured store, its inferences first brought up
+/// to date ([`bring_inferences_up_to_date`]), its results on standard output.
 fn query_once(store: &StoreService, command: QueryCommand) -> Result<()> {
     use std::io::Write as _;
     let text = match (command.query, command.file) {
