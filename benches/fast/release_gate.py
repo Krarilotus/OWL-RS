@@ -1344,8 +1344,19 @@ MEASUREMENT_SIDES = HERE / "measurement-sides.toml"
 PERF_LAB = "crates/nrese-store/examples/"
 
 
+def measurement_table(path: Path = MEASUREMENT_SIDES) -> dict[str, dict]:
+    """The sides table, by side. Sides and commits are full revisions: an abbreviated side would
+    miss the lookup by full revision, and its side would be built as itself (Sol, T0 refs r1 S1)."""
+    table = tomllib.loads(path.read_text(encoding="utf-8"))["side"]
+    full = re.compile(r"[0-9a-f]{40}")
+    bad = [rev for rev, side in table.items() if not full.fullmatch(rev) or not full.fullmatch(str(side.get("commit")))]
+    if bad:
+        raise SystemExit(f"{path.name}: a side and its commit are full revisions, not: {', '.join(bad)}")
+    return table
+
+
 def measurement_sides(path: Path = MEASUREMENT_SIDES) -> dict[str, str]:
-    return {rev: side["commit"] for rev, side in tomllib.loads(path.read_text(encoding="utf-8"))["side"].items()}
+    return {rev: side["commit"] for rev, side in measurement_table(path).items()}
 
 
 def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str:
@@ -1382,6 +1393,27 @@ def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str
         raise SystemExit(f"the measurement commit {commit[:12]} of {rev[:12]} changes more than its perf lab "
                          f"({PERF_LAB}): {', '.join(outside)}")
     return commit
+
+
+def measurement_ref(repo: str, ref: str, commit: str, path: Path = MEASUREMENT_SIDES) -> str:
+    """A pushed refs/measure/* ref (.githooks/pre-push, check.sh push): the ref a side of the table
+    declares, named for that side, at that side's declared commit, which measured_at admits for it.
+    The side; anything else is refused."""
+    table = measurement_table(path)
+    declaring = [rev for rev, side in table.items() if side.get("ref") == ref]
+    if not declaring:
+        raise SystemExit(f"{ref}: no side of {path.name} declares this measurement ref")
+    rev = declaring[0]
+    if not ref.endswith(f"-{rev[:8]}"):
+        raise SystemExit(f"{ref}: its name doesn't name its side {rev[:8]} (refs/measure/<name>-{rev[:8]})")
+    import subprocess
+    done = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", f"{commit}^{{commit}}"],
+                          capture_output=True, text=True, timeout=60)
+    if done.returncode != 0 or done.stdout.strip() != table[rev]["commit"]:
+        raise SystemExit(f"{ref}: pushes {commit[:12]}, but {path.name} declares {table[rev]['commit'][:12]}")
+    if measured_at(repo, rev, {rev: table[rev]["commit"]}) != table[rev]["commit"]:
+        raise SystemExit(f"{ref}: {table[rev]['commit'][:12]} isn't admitted as the measurement commit of {rev[:12]}")
+    return rev
 
 
 def measurement_inputs(checkout: str, revs: list[str], sides: dict[str, str] | None = None) -> list[dict]:
@@ -1732,10 +1764,17 @@ def main() -> int:
     s.add_argument("--out", type=Path)
     s = sub.add_parser("measured-at", help="the commit a side is built and timed from (release-gate.sh build)")
     s.add_argument("rev")
+    s = sub.add_parser("measurement-ref", help="a pushed refs/measure/* ref and its commit, checked (check.sh push)")
+    s.add_argument("ref")
+    s.add_argument("commit")
     args = p.parse_args()
 
     if args.command == "measured-at":
         print(measured_at(str(ROOT), args.rev))
+        return 0
+    if args.command == "measurement-ref":
+        side = measurement_ref(str(ROOT), args.ref, args.commit)
+        print(f"{args.ref}: the measurement commit of {side[:12]}, admitted (benches/fast/measurement-sides.toml)")
         return 0
     if args.command == "plan":
         catalog = cases_registry.load()
