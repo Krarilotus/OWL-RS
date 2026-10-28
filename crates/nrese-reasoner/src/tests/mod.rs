@@ -1432,6 +1432,82 @@ fn guards_over_a_class_hold_where_its_members_satisfy_them() {
     }
 }
 
+/// Maintenance keeps what schema facts alone derive, under every plan: after a split, the
+/// recomputed region gets back a fact whose rule instance has no body (`ex:C ⊑ ex:C` gives
+/// `ex:C ≡ ex:C` by scm-eqc2), as DRed and rematerialisation do (reasoning-semantics.md,
+/// "Maintenance"). Recompute lost it: its check whether what remains derives a fact asked
+/// only the rules with a body.
+#[test]
+fn maintenance_keeps_what_schema_facts_alone_derive() {
+    use super::delta::policy::{Plan, Policy};
+    use super::delta::{MemoryBase, Rules, update_with};
+
+    let mut vocabulary = LocalVocabulary::default();
+    let mut asserted = load(
+        &mut vocabulary,
+        "ex:C rdfs:subClassOf ex:C\nex:C owl:sameAs ex:D",
+    );
+    asserted.sort_unstable();
+    let equality = load(&mut vocabulary, "ex:C owl:sameAs ex:D")[0];
+    let kept = load(&mut vocabulary, "ex:C owl:equivalentClass ex:C")[0];
+    let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let schema = Schema::owl(&mut vocabulary);
+    let compiled = Rules {
+        rules: &rules,
+        lists: Some(&lists),
+        schema: &schema,
+    };
+    let closure =
+        |asserted: &[Triple]| batch::materialise(asserted, &rules, Some(&lists), &schema).derived;
+    let before = closure(&asserted);
+    let after: Vec<Triple> = asserted
+        .iter()
+        .copied()
+        .filter(|&t| t != equality)
+        .collect();
+    let expected = closure(&after);
+    assert!(expected.binary_search(&kept).is_ok(), "rematerialised");
+    for force in [None, Some(Plan::Recompute), Some(Plan::Dred)] {
+        let stack: Vec<Triple> = before
+            .iter()
+            .copied()
+            .filter(|t| after.binary_search(t).is_err())
+            .collect();
+        let base = MemoryBase::new(&after, &stack);
+        let policy = Policy {
+            force,
+            ..Policy::default()
+        };
+        let result = update_with(
+            &base,
+            &[],
+            std::slice::from_ref(&equality),
+            compiled,
+            None,
+            crate::eval::NEVER,
+            policy,
+        )
+        .expect("never stopped");
+        if let Some(plan) = force {
+            assert_eq!(result.policy.plan, plan, "the plan forced");
+        }
+        let removal: HashSet<Triple> = result.remove.iter().copied().collect();
+        let mut maintained: Vec<Triple> = stack
+            .into_iter()
+            .filter(|t| !removal.contains(t))
+            .chain(result.insert)
+            .collect();
+        maintained.sort_unstable();
+        maintained.dedup();
+        assert_eq!(
+            maintained, expected,
+            "{force:?} (plan {:?})",
+            result.policy.plan
+        );
+    }
+}
+
 /// Equality-heavy data: the batch executor's equality module equals the generic
 /// `eq-rep-*` rules of the naive evaluator (chains of `sameAs` that merge classes over
 /// several rounds, equal predicates, equal objects).
