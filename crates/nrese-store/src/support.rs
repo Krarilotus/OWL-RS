@@ -1750,10 +1750,11 @@ impl Reading {
 
     /// What `tx` holds, its base and its pending changes, as this reader reads it: with
     /// nothing pending, its base ([`Self::committed`]). The changes aren't reasoned over until
-    /// the commit: the base's inferred statements as far as the reader sees them and the
-    /// changes left them, kept (charged) as the support views are; the list they are gathered
-    /// in is the read's work. A statement the view adds (asserted only in graphs the reader
-    /// can't read, and derived) stays unless the changes assert it where the reader reads it.
+    /// the commit, so what they change of the reader's view is the statements they assert
+    /// and delete (`Transaction::pending_over`) and, of the statements the view adds (asserted
+    /// only in graphs the reader can't read, and derived), those they assert where the reader
+    /// reads: the view of the base, kept, with the delta applied. O(d log n) for d pending
+    /// changes; nothing of the view is scanned or copied.
     pub(crate) fn pending(&self, tx: &Transaction<'_>) -> Result<Snapshot, Unavailable> {
         if tx.pending() == (0, 0) && tx.inferred_pending() == (0, 0) {
             return self.committed(tx.base());
@@ -1761,34 +1762,31 @@ impl Reading {
         if !self.through_view(tx.base()) {
             return Ok(tx.pending_snapshot());
         }
-        let base = self.committed(tx.base())?;
-        let left = |quad: &EncodedQuad| match tx.base().contains_in(ReadModel::Inferred, quad) {
-            true => tx.contains_in(ReadModel::Inferred, quad),
-            false => asserted(tx, &self.access, triple(*quad)) != Asserted::InReach,
-        };
-        // The read's cancellation stops the gathering as it stops the base's view (a view
-        // made before isn't computed again): nothing more is read or kept.
+        let view = self.committed(tx.base())?;
+        // A view made before isn't made again: the read's cancellation still stops it here.
         let working = Work {
             budget: Arc::new(self.memory.part()),
             cancellation: self.cancellation.clone(),
         };
         working.go_on()?;
-        let len = usize::try_from(base.len_in(ReadModel::Inferred)).unwrap_or(usize::MAX);
-        let mut kept: Kept<EncodedQuad> = ChargedVec::with_capacity(Arc::clone(&working), len)?;
-        let mut scanning = Reservation::new(Arc::clone(&working));
-        scanning.charge(base.scan_bytes(ReadModel::Inferred))?;
-        kept.extend_bounded(
-            len,
-            base.quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
-                .take_while(|_| working.go_on().is_ok())
-                .filter(|quad| left(quad)),
-        )?;
-        drop(scanning);
-        working.go_on()?;
-        kept.sort_unstable();
-        Ok(tx
-            .pending_snapshot()
-            .with_inferred_only(&kept, &self.supports.kept)?)
+        let mut hidden: Kept<EncodedQuad> = ChargedVec::new(Arc::clone(&working));
+        for quad in tx.inserted() {
+            let fact = EncodedQuad::new(
+                quad.subject,
+                quad.predicate,
+                quad.object,
+                TermId::DEFAULT_GRAPH,
+            );
+            if self.access.allows_id(tx, quad.graph)
+                && view.contains_in(ReadModel::Inferred, &fact)
+                && !tx.base().contains_in(ReadModel::Inferred, &fact)
+            {
+                hidden.push(fact)?;
+            }
+        }
+        hidden.sort_unstable();
+        dedup(&mut hidden);
+        Ok(tx.pending_over(&view, &hidden))
     }
 }
 
