@@ -110,7 +110,7 @@ fn an_updates_read_source_stops_with_its_cancellation() {
     let store = past_the_cap();
     let cancelled = CancellationToken::new();
     cancelled.cancel();
-    let context = store.update_context(&cancelled);
+    let context = store.update_context(store.envelope(None), &cancelled);
     let reader = crate::Requester::new(
         crate::ReadScope::Graphs(Arc::new(GraphAccess {
             graphs: vec![format!("{EX}g16")],

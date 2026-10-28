@@ -431,13 +431,15 @@ impl StoreService {
         Ok(DatasetExport::of(self.engine.snapshot(), format))
     }
 
-    /// What this store's updates are evaluated with.
+    /// What this store's updates are evaluated with, drawing on `memory`: the request's
+    /// envelope, or for a transaction's operations replayed for a read, the reading query's.
     pub(crate) fn update_context<'a>(
         &'a self,
+        memory: nrese_exec::Envelope,
         cancellation: &'a CancellationToken,
     ) -> crate::mutation::command::UpdateContext<'a> {
         crate::mutation::command::UpdateContext {
-            memory: self.envelope(None),
+            memory,
             cancellation,
             union_default_graph: self.config.union_default_graph,
             geosparql_stated_only: self.config.geosparql_stated_only,
@@ -1133,8 +1135,8 @@ impl StoreService {
     /// writer slot is taken.
     /// In a session, the result is kept for its next read on the same data
     /// ([`crate::sessions`]); `scope` is the reader's, by which the operations were scoped.
-    /// What making the reader's view reads and builds is charged to `memory`, the reading
-    /// query's envelope ([`Self::read_snapshot_within`]).
+    /// What the operations' replay and the reader's view read and build is charged to
+    /// `memory`, the reading query's envelope ([`Self::read_snapshot_within`]).
     fn with_pending<T>(
         &self,
         pending: &crate::StatementsRequest,
@@ -1156,7 +1158,7 @@ impl StoreService {
         // read as the reader may; what they change is checked at the commit (the view is
         // the reader's own, and shows the graphs it may read only).
         let mut tx = self.engine.speculative();
-        let context = self.update_context(cancellation);
+        let context = self.update_context(memory.clone(), cancellation);
         let requester = crate::Requester::new(scope.clone(), crate::WriteScope::All);
         crate::statements::apply_statements(&mut tx, pending, &requester, &mut |tx, request| {
             crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
@@ -1474,7 +1476,7 @@ impl StoreService {
         self.invalidate_reasoning()?;
         let mut tx = self.engine.transaction();
         let cancellation = CancellationToken::new();
-        let context = self.update_context(&cancellation);
+        let context = self.update_context(self.envelope(None), &cancellation);
         let report = command.apply(&mut tx, requester, &context)?;
         let summary = tx.commit()?;
         Ok(report.committed(summary.revision))
