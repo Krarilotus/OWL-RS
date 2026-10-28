@@ -4,14 +4,15 @@ Markdown report.
 
     benches/oracle/compare.py <dump> [--report report.md]
 
-A query agrees when NRESE's rows equal Jena's on the dataset as NRESE loaded it, or on the
-copy with numbers in canonical lexical forms (NRESE's STR of "07"^^xsd:integer is "7": a
-known deviation, README.md). Rows are compared as multisets, and in order where
-q<M>.ordered exists. Terms are compared as the answer contract compares them
-(benches/suite/suitekit/answers.py, its `value` level): the same datatype and value, language
-tags in any case, plain literals as xsd:string. Blank nodes, results of a decimal division
-(AVG, `/`) and numbers equal only across datatypes are never an agreement: the report names
-them (blank-nodes, division, cross-type) as the contract classifies them.
+A query agrees when the answer contract (benches/suite/suitekit/answers.py) finds NRESE's
+answer the same as Jena's (`ok`) on the dataset as NRESE loaded it, or on the copy with
+numbers in canonical lexical forms (NRESE's STR of "07"^^xsd:integer is "7": a known
+deviation, README.md); equal rows are no agreement on their own. Rows are compared as
+multisets, and in order where q<M>.ordered exists; terms by the same datatype and value,
+language tags in any case, plain literals as xsd:string. Blank nodes, results of a decimal
+division (AVG, `/`), numbers equal only across datatypes and a COUNT not in xsd:integer are
+never an agreement: the report names them (blank-nodes, division, cross-type) as the
+contract classifies them.
 
 A difference is explained when one of the rules below says why the standard allows both
 answers, or names a known deviation; the report groups them by rule. Exit 1 if an
@@ -118,7 +119,7 @@ RULES = {
     # The answer contract's own classes (benches/suite/suitekit/answers.py): not agreements.
     "blank-nodes": "blank nodes: the answers need an isomorphism check, which this comparison doesn't make (answers.py: unqualified)",
     "division": "the rows agree but for the decimal results of a division (AVG, /), which only an exact oracle decides, and none is given here; their digits don't rule each other out (answers.py: unqualified)",
-    "cross-type": "the same numbers in other datatypes (answers.py: deviates): reported, not the same answer",
+    "cross-type": "the same numbers in other datatypes, or a COUNT not in xsd:integer (answers.py: deviates): reported, not the same answer",
 }
 
 DATE = re.compile(r'^"(-?\d{4,}-\d\d-\d\d(?:T[0-9:.]+)?)(Z|[+-]\d\d:\d\d)?"\^\^<http://www\.w3\.org/2001/XMLSchema#date(?:Time)?>$')
@@ -136,18 +137,22 @@ def answer_of(variables: list[str], rows: list[str]) -> contract.Answer:
     return contract.Answer(tuple(sorted(names)), [dict(zip(names, map(as_term, line.split("\t")))) for line in rows])
 
 
-def classify(query: str, variables: list[str], our_rows: list[str], ours: list[str], raw: list[list[str]],
-             answers: list[list[str]], ordered: bool) -> str | None:
-    """The answer contract's class of a query whose rows aren't simply equal: blank nodes (never
-    an agreement here), decimal division results only an exact oracle decides (unqualified), or
-    the same numbers across datatypes (deviates). A wrong answer is none of them."""
+def classify(query: str, variables: list[str], our_rows: list[str], raw: list[list[str]], ordered: bool) -> str | None:
+    """The answer contract's verdict on a query, as the report names it: an agreement with Jena's
+    rows (`agree`) or with Jena's on the canonical copy (`agree on canonical numbers`), blank
+    nodes (never an agreement here), decimal division results only an exact oracle decides
+    (`division`), or a deviation (`cross-type`: numbers equal across datatypes, a COUNT not in
+    xsd:integer). None for a difference, which the rules may explain. Equal rows agree only
+    where the contract says so (T8 PR #56 R1)."""
     if any(t.startswith("_:") for rows in [our_rows, *raw] for line in rows for t in line.split("\t")):
         return "blank-nodes"
-    if any(same(ours, theirs, ordered) for theirs in answers):
-        return None
     mine, ops = answer_of(variables, our_rows), contract.operators(query)
-    verdicts = {contract.compare(mine, answer_of(variables, rows), "sequence" if ordered else "bag", ops=ops)["verdict"]
-                for rows in raw}
+    verdicts = [contract.compare(mine, answer_of(variables, rows), "sequence" if ordered else "bag", ops=ops)["verdict"]
+                for rows in raw]
+    if verdicts[0] == "ok":
+        return "agree"
+    if verdicts[1:] == ["ok"]:
+        return "agree on canonical numbers"
     return "division" if "unqualified" in verdicts else "cross-type" if "deviates" in verdicts else None
 
 
@@ -220,16 +225,13 @@ def main(argv):
             their_vars, their_rows = table(f)
             raw.append(aligned(their_vars, their_rows, our_vars))
         answers = [[row(l) for l in rows] for rows in raw]
-        contract_class = classify(query, our_vars, our_rows, ours, raw, answers, ordered)
+        contract_class = classify(query, our_vars, our_rows, raw, ordered)
+        if contract_class in ("agree", "agree on canonical numbers"):
+            counts[contract_class] += 1
+            continue
         if contract_class:
             counts["explained"] += 1
             explained[contract_class].append(where)
-            continue
-        if same(ours, answers[0], ordered):
-            counts["agree"] += 1
-            continue
-        if len(answers) > 1 and same(ours, answers[1], ordered):
-            counts["agree on canonical numbers"] += 1
             continue
         canonical_file = stem.with_suffix(".nrese-canonical")
         ours_canonical = None
