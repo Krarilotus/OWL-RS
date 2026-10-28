@@ -17,6 +17,9 @@ import copy
 import importlib.util
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1099,6 +1102,258 @@ class Instances(unittest.TestCase):
         self.assertEqual(flagged(1.15, floor), {"base", "main"})
         with self.assertRaises(ValueError):  # a gate of two revisions is no A-A' run
             gate_module.noise_floor(run_gate(passes()))
+
+
+class MeasurementSides(unittest.TestCase):
+    """A side is built and timed from its revision, or from its measurement commit: a commit on
+    that revision alone that changes nothing but its perf lab (PROTOCOL.md §5). T0, 28 Oct 2026:
+    until then the gate patched main's and v1.5's perf lab at build time, code no commit held."""
+
+    PERF_LAB = "crates/nrese-store/examples/perf_lab.rs"
+    ENGINE = "crates/nrese-store/src/lib.rs"
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp(prefix="measurement-sides-")
+        self.addCleanup(shutil.rmtree, self.repo, True)
+        self.git("init", "-q")
+        self.side = self.commit({self.ENGINE: "pub fn engine() {}\n", self.PERF_LAB: "fn main() { spawn(); }\n",
+                                 "Cargo.lock": "# the side's\n"}, "the side")
+        self.later = self.commit({"README.md": "later\n"}, "a later revision")
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(["git", "-C", self.repo, *args], capture_output=True, text=True, check=True).stdout.strip()
+
+    def commit(self, changes: dict, message: str, on: str | None = None) -> str:
+        """A commit of `changes` (path: text, or None to delete) on `on` (else the current HEAD)."""
+        if on:
+            self.git("checkout", "-q", "--detach", on)
+        for path, text in changes.items():
+            file = Path(self.repo, path)
+            if text is None:
+                file.unlink()
+            else:
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text(text, encoding="utf-8")
+        self.git("add", "-A")
+        self.git("-c", "user.name=t", "-c", "user.email=t@example.org", "commit", "-q", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def test_only_a_commit_on_the_side_that_changes_just_its_perf_lab_is_built_for_it(self):
+        loop = {self.PERF_LAB: "fn main() { arm(); }\n"}
+        outside, parent = "changes more than its perf lab", "isn't a commit on"
+        cases = {  # name: (its changes, the revision it is on, None if built for the side, else why not)
+            "its perf lab": (loop, self.side, None),
+            "the engine as well": ({**loop, self.ENGINE: "pub fn engine() { faster() }\n"}, self.side, outside),
+            "its lockfile": ({**loop, "Cargo.lock": "# another\n"}, self.side, outside),
+            "the engine moved into the perf lab": ({self.ENGINE: None,
+                                                    "crates/nrese-store/examples/lib.rs": "pub fn engine() {}\n"},
+                                                   self.side, outside),
+            "on another revision": (loop, self.later, parent),
+        }
+        wrong = []
+        for name, (changes, on, why) in cases.items():
+            commit = self.commit(changes, name, on)
+            try:
+                got = "built" if gate_module.measured_at(self.repo, self.side, {self.side: commit}) == commit else "?"
+            except SystemExit as e:
+                got = str(e)
+            if (got == "built") != (why is None) or (why and why not in got):
+                wrong.append(f"{name}: {got}")
+        self.assertEqual(wrong, [], "SPEC measurement side: its only parent is the side, and it changes "
+                                    "nothing outside the perf lab's sources")
+
+    def test_a_change_outside_the_perf_lab_is_seen_whatever_the_diff_configuration(self):
+        """Sol, PR #54 r1 R1: under a user's diff.ignoreSubmodules=all, `git diff` left a gitlink
+        added outside the perf lab out of its paths, and the commit was built for the side."""
+        self.git("config", "diff.ignoreSubmodules", "all")
+        self.git("checkout", "-q", "--detach", self.side)
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{self.side},outside-submodule")
+        self.git("-c", "user.name=t", "-c", "user.email=t@example.org", "commit", "-q", "-m", "a gitlink outside")
+        gitlink = self.git("rev-parse", "HEAD")
+        with self.assertRaisesRegex(SystemExit, "changes more than its perf lab .*outside-submodule"):
+            gate_module.measured_at(self.repo, self.side, {self.side: gitlink})
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        self.assertEqual(gate_module.measured_at(self.repo, self.side, {self.side: loop}), loop,
+                         "SPEC measurement side: its perf lab alone is still built for it")
+
+    def test_a_replace_ref_changes_nothing_the_check_reads(self):
+        """Sol, PR #54 R1 fix review D1 and D2: a replace ref stands other objects in for the
+        stored ones; standing the side's tree in for an engine change hid the change (D1). The
+        check reads the objects as stored (STORED_OBJECTS): the change is refused, and a valid
+        commit is admitted whatever stands in for its tree, which the gate's checkout doesn't read
+        either (test_the_build_compiles_the_commit_checked)."""
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        engine = self.commit({self.ENGINE: "pub fn engine() { faster() }\n"}, "the engine", self.side)
+        tree = lambda commit: self.git("rev-parse", f"{commit}^{{tree}}")
+        self.git("replace", tree(engine), tree(self.side))
+        with self.assertRaisesRegex(SystemExit, "changes more than its perf lab .*crates/nrese-store/src/lib.rs"):
+            gate_module.measured_at(self.repo, self.side, {self.side: engine})
+        self.git("replace", "-d", tree(engine))
+        self.git("replace", tree(loop), tree(engine))
+        self.assertEqual(gate_module.measured_at(self.repo, self.side, {self.side: loop}), loop)
+
+    def test_the_build_compiles_the_commit_checked(self):
+        """PR #54 fix check 1 (D2's other half): a replace ref made after the check returned stood
+        another engine in for the checked commit's in the checkout the build compiles, and HEAD
+        and a clean status didn't show it. release-gate.sh build, from the check to the checkout,
+        reads the objects as stored: with no replace ref (the control) and with one made right
+        after the check, its worktree holds the commit checked."""
+        bash = shutil.which("bash")
+        if bash is None or shutil.which("flock") is None:
+            self.skipTest("the gate builds on Linux hosts (bash, flock)")
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        engine = self.commit({self.ENGINE: "pub fn engine() { faster() }\n"}, "another engine", self.side)
+        # The gate's scripts beside the commits, not in them.
+        for rel in ("scripts/release-gate.sh", "benches/fast/release_gate.py"):
+            Path(self.repo, rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(ROOT / rel, Path(self.repo, rel))
+        shutil.copytree(ROOT / "scripts/lib", Path(self.repo, "scripts/lib"), ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(ROOT / "benches/suite/suitekit", Path(self.repo, "benches/suite/suitekit"),
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        Path(self.repo, "benches/fast/measurement-sides.toml").write_text(
+            f'[side.{self.side}]\ncommit = "{loop}"\nref = "refs/measure/t-{self.side[:8]}"\n', encoding="utf-8")
+        tmp = Path(tempfile.mkdtemp(prefix="measurement-build-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        # The check as it is; right after it (INJECT), a replace ref standing another engine in.
+        (tmp / "shim").mkdir()
+        (tmp / "shim" / "python3").write_text(f"""#!/usr/bin/env bash
+out=$("{Path(sys.executable).as_posix()}" "$@"); code=$?
+case " $* " in *" benches/fast/release_gate.py measured-at "*) [ -z "${{INJECT:-}}" ] || git replace $INJECT ;; esac
+printf '%s\\n' "$out"; exit $code
+""", encoding="utf-8", newline="\n")
+        (tmp / "shim" / "python3").chmod(0o755)
+        tree = lambda commit: self.git("rev-parse", f"{commit}^{{tree}}")
+        got = {}
+        for name, inject in (("no replace ref", ""), ("one made after the check", f"{tree(loop)} {tree(engine)}")):
+            gate = tmp / name.replace(" ", "-")
+            env = {**os.environ, "NRESE_GATE_DIR": (gate / "gate").as_posix(), "GATE_BIN": (gate / "bin").as_posix(),
+                   "FLEET_OUT": (gate / "out").as_posix(), "INJECT": inject,
+                   "PATH": (tmp / "shim").as_posix() + os.pathsep + os.environ.get("PATH", "")}
+            done = subprocess.run([bash, "scripts/release-gate.sh", "build", self.side], cwd=self.repo, env=env,
+                                  capture_output=True, text=True)
+            src = gate / "gate" / "build" / f"src-{loop[:8]}"
+            got[name] = tuple((src / p).read_text(encoding="utf-8") if (src / p).exists() else done.stdout + done.stderr
+                              for p in (self.ENGINE, self.PERF_LAB))
+            if inject:
+                self.git("replace", "-d", tree(loop))
+        self.assertEqual(got, {name: ("pub fn engine() {}\n", "fn main() { arm(); }\n") for name in got},
+                         "SPEC measurement side: the gate compiles the commit it checked")
+
+    def test_a_message_in_another_encoding_is_no_error(self):
+        """Sol, PR #54 R1 fix review r3 D4: the commit object was decoded in the locale's encoding, so
+        a measurement commit whose message is ISO-8859-1 stopped the check with UnicodeDecodeError."""
+        message = Path(tempfile.mkdtemp(prefix="measurement-message-"), "message")
+        self.addCleanup(shutil.rmtree, message.parent, True)
+        message.write_bytes(b"its perf lab, caf\xe9\n")
+        self.git("checkout", "-q", "--detach", self.side)
+        Path(self.repo, self.PERF_LAB).write_text("fn main() { arm(); }\n", encoding="utf-8")
+        self.git("add", self.PERF_LAB)
+        self.git("-c", "user.name=t", "-c", "user.email=t@example.org", "-c", "i18n.commitEncoding=ISO-8859-1",
+                 "commit", "-q", "-F", str(message))
+        commit = self.git("rev-parse", "HEAD")
+        self.assertEqual(gate_module.measured_at(self.repo, self.side, {self.side: commit}), commit)
+
+    def test_a_graft_or_a_shallow_boundary_moves_no_parent(self):
+        """Sol, PR #54 R1 fix review D3: the parent query walked history, so a graft or a shallow
+        boundary refused a valid measurement commit; its parent is the one its object names."""
+        commit = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        git_dir = Path(self.git("rev-parse", "--absolute-git-dir"))
+        for name, text in (("info/grafts", f"{commit} {self.later}\n"), ("shallow", f"{commit}\n")):
+            with self.subTest(name):
+                (git_dir / name).parent.mkdir(exist_ok=True)
+                (git_dir / name).write_text(text, encoding="utf-8")
+                try:
+                    self.assertEqual(gate_module.measured_at(self.repo, self.side, {self.side: commit}), commit)
+                finally:
+                    (git_dir / name).unlink()
+
+    def test_a_side_without_a_measurement_commit_is_built_from_itself(self):
+        self.assertEqual(gate_module.measured_at(self.repo, self.later, {}), self.later)
+
+    def test_a_measurement_commit_is_built_only_as_its_side(self):
+        """Sol r1 S1: built as a side of its own, it would share its side's build directory under
+        another REVISION, and the second of the two builds would be refused."""
+        commit = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        with self.assertRaisesRegex(SystemExit, f"is the measurement commit of {self.side[:12]}"):
+            gate_module.measured_at(self.repo, commit, {self.side: commit})
+
+    def test_a_job_that_builds_a_side_takes_its_measurement_commit_as_an_input(self):
+        commit = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        inputs = gate_module.measurement_inputs(self.repo, [self.side, self.later, self.side],
+                                                {self.side: commit})
+        self.assertEqual(inputs, [{"name": f"measure-{self.side[:8]}", "source": {"git": self.repo, "rev": commit}}])
+
+    def test_main_and_v1_5_are_measured_at_their_commits(self):
+        table = gate_module.tomllib.loads(gate_module.MEASUREMENT_SIDES.read_text(encoding="utf-8"))["side"]
+        self.assertTrue({gate_module.MAIN, gate_module.BASE} <= set(table))
+        for rev, side in table.items():
+            with self.subTest(side=rev):
+                self.assertRegex(rev, r"^[0-9a-f]{40}$")
+                self.assertRegex(side["commit"], r"^[0-9a-f]{40}$")
+                self.assertTrue(re.fullmatch(rf"refs/measure/[a-z0-9]+-{rev[:8]}", side["ref"]), side["ref"])
+
+
+class PatchKeyedBuilds(unittest.TestCase):
+    """The builds of a perf lab patched at build time (before T0) can't be reused after it: their
+    identity names the patch. `clean --patch-keyed` lists them, and with --remove their binaries go
+    unless a gate used them within GATE_LIVE_HOURS; their IDENTITY, BUILD.txt and SHA256SUMS stay."""
+
+    def test_only_an_unused_patch_keyed_build_loses_its_binaries_and_only_when_asked(self):
+        bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("needs bash")
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp).as_posix()
+            setup = f'''
+make() {{  # NAME IDENTITY-LINE REF-AGE
+  b={t}/bin/$1; mkdir -p "$b/release/examples" "$b/.refs"; echo tool > "$b/release/examples/perf_lab"
+  printf 'revision x\\n%s\\nlayout 1\\n' "$2" > "$b/IDENTITY"; echo built > "$b/BUILD.txt"
+  (cd "$b" && sha256sum release/examples/perf_lab > SHA256SUMS); touch -d "$3" "$b/.refs/gate-$1"
+}}
+make bin-unused 'patch perf_lab_watchdog.py 0123456789abcdef' '3 days ago'
+make bin-live 'patch perf_lab_watchdog.py 0123456789abcdef' 'now'
+make bin-after 'profile release --locked' '3 days ago'
+'''
+            env = {**os.environ, "NRESE_GATE_DIR": f"{t}/gate", "GATE_BIN": f"{t}/bin", "FLEET_OUT": f"{t}/out"}
+            subprocess.run([bash, "-c", setup], env=env, check=True, capture_output=True)
+
+            def clean(*args: str) -> dict[str, str]:
+                done = subprocess.run([bash, "scripts/release-gate.sh", "clean", "--patch-keyed", *args], cwd=ROOT,
+                                      env=env, capture_output=True, text=True, encoding="utf-8")
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                return {line.split("\t")[1]: line.split("\t")[0] for line in done.stdout.splitlines()}
+
+            def binaries() -> set[str]:
+                return {d.name for d in Path(tmp, "bin").iterdir() if (d / "release").is_dir()}
+
+            self.assertEqual(clean(), {"bin-unused": "would-release", "bin-live": "kept-live"})
+            self.assertEqual(binaries(), {"bin-unused", "bin-live", "bin-after"}, "SPEC: a dry run removes nothing")
+            self.assertEqual(clean("--remove"), {"bin-unused": "released-now", "bin-live": "kept-live"})
+            self.assertEqual(binaries(), {"bin-live", "bin-after"})
+            self.assertEqual({p.name for p in Path(tmp, "bin", "bin-unused").iterdir() if p.is_file()},
+                             {"IDENTITY", "BUILD.txt", "SHA256SUMS"}, "SPEC: the record stays")
+            self.assertEqual(clean(), {"bin-unused": "released", "bin-live": "kept-live"})
+            self.assertTrue(Path(tmp, "out", "patch-keyed-builds.tsv").is_file())
+
+    def test_a_patch_keyed_build_is_never_a_verified_build(self):
+        """Sol r1 S2: a gate's pointer or an archive from before T0 could hand a block a build of
+        patched source; build_verified, which block, reuse and pack go through, refuses it."""
+        bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("needs bash")
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp).as_posix()
+            script = f'''
+. scripts/lib/gate-publish.sh
+for kind in patched plain; do
+  b={t}/bin-$kind; mkdir -p "$b/release"; echo tool > "$b/release/tool"; echo r > "$b/REVISION"
+  (cd "$b" && sha256sum release/tool > SHA256SUMS)
+  [ $kind = patched ] && echo "patch perf_lab_watchdog.py 0123456789abcdef" > "$b/IDENTITY" || echo "layout 1" > "$b/IDENTITY"
+  build_verified "$b" r && echo "$kind verified" || echo "$kind refused"
+done
+'''
+            done = subprocess.run([bash, "-c", script], cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(done.stdout.split("\n")[:2], ["patched refused", "plain verified"], done.stderr)
 
 
 if __name__ == "__main__":

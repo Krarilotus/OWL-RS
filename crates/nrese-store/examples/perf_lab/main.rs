@@ -485,7 +485,7 @@ fn run_once(
 ) -> Result<(u64, Duration), String> {
     let token = CancellationToken::new();
     // The process's watchdog cancels at the timeout: armed before the timed window, disarmed
-    // after it, so that no thread starts inside it (benches/fast/patches/perf_lab_watchdog.py).
+    // after it, so that no thread starts inside it (benches/PROTOCOL.md §5).
     let armed = perf_lab_watchdog::arm(&token, timeout);
     let mut sink = CountingSink::default();
     let started = Instant::now();
@@ -1589,10 +1589,10 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// The timeout of every timed run, by one thread for the whole process (release gate harness:
-/// benches/fast/patches/perf_lab_watchdog.py): started once, before any timing, and running
-/// before it returns; it polls every 10 ms and takes the slot's lock only then, which the timed
-/// call never takes.
+/// The timeout of every timed run, by one thread for the whole process (benches/PROTOCOL.md §5;
+/// main's and v1.5's measurement commits have the same): started once, before any timing, and
+/// running before it returns; it polls every 10 ms and takes the slot's lock only then, which
+/// the timed call never takes.
 mod perf_lab_watchdog {
     use super::CancellationToken;
     use std::sync::{Mutex, OnceLock, mpsc};
