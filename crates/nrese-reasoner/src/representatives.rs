@@ -66,10 +66,10 @@ pub fn without_replacement(rules: &[Rule]) -> Vec<Rule> {
         .collect()
 }
 
-/// What [`over_classes`] changed: any rule, and a rule that concludes facts.
+/// What [`over_classes`] changed: a rule that concludes facts. Whether it changed any is
+/// whether the run has classes.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct Guarded {
-    pub rules: bool,
     pub facts: bool,
 }
 
@@ -83,7 +83,13 @@ pub(crate) struct Guarded {
 ///   one class they would conclude what the class holds;
 /// - the long lists' rules ([`Guard::SameList`]): their index is built from the lists as
 ///   the run reads them, over representatives, so it names no other member of a class.
-pub(crate) fn over_classes(rules: &mut [Rule], same_as: u64, classes: &SharedClasses) -> Guarded {
+///
+/// `classes` are the run's, made with the first rule changed: a run with none has none.
+pub(crate) fn over_classes(
+    rules: &mut [Rule],
+    same_as: u64,
+    classes: &mut Option<SharedClasses>,
+) -> Guarded {
     let mut guarded = Guarded::default();
     for rule in rules {
         let lists = rule.guards.iter().any(|g| matches!(g, Guard::SameList(..)));
@@ -94,9 +100,8 @@ pub(crate) fn over_classes(rules: &mut [Rule], same_as: u64, classes: &SharedCla
         rule.guards = vec![Guard::OverClasses {
             guards,
             bound: Vec::new(),
-            classes: classes.clone(),
+            classes: classes.get_or_insert_with(SharedClasses::default).clone(),
         }];
-        guarded.rules = true;
         guarded.facts |= matches!(rule.head, Head::Facts(_));
     }
     guarded

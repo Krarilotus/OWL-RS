@@ -1,6 +1,6 @@
 # Reasoning: supported semantics
 
-This is the contract for what NRESE's reasoning computes, as implemented on 30 September 2026 (`SEMANTICS_VERSION` 2). A mode name alone doesn't state it; this page does. The source of truth is `crates/nrese-reasoner/src/rulesets.rs` (the rule text) and `lists.rs` (list axioms).
+This is the contract for what NRESE's reasoning computes, as implemented on 30 September 2026 (`SEMANTICS_VERSION` 3 since 28 October 2026: closures version 2's maintenance wrote are rebuilt once). A mode name alone doesn't state it; this page does. The source of truth is `crates/nrese-reasoner/src/rulesets.rs` (the rule text) and `lists.rs` (list axioms).
 
 ## Modes
 

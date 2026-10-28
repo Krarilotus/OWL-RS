@@ -71,3 +71,6 @@ primary, only bulk loads and rematerialisations send replicas back to an image.
   the records it applies, not incrementally.
 - **Re-bootstrap:** a replica doesn't yet take a new image by itself when the log no longer
   serves it.
+- **Reasoning semantics 3:** a replica computes no inferences, so it keeps a closure an older
+  build's maintenance wrote; after upgrading to reasoning semantics 3, start it again from an
+  empty data directory.
