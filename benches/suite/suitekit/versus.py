@@ -27,6 +27,7 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
+from .answers import UNTIMED
 from .compare import bootstrap_ratio, thin
 from .schema import read
 
@@ -142,7 +143,7 @@ def versus(directory: Path, home_turfs: dict[str, str] | None = None) -> list[di
         for who, s in (("nrese", nrese), (system, other)):
             for q in both:
                 verdict = verdicts.get((tier, Path(q).stem, who))
-                if verdict not in (None, "ok", "reference"):
+                if verdict in UNTIMED or verdict == "unchecked":
                     problems.append(f"{q} {verdict} ({who})")
                 elif s["status"][q] != {"ok"}:
                     problems.append(f"{q} {'/'.join(sorted(s['status'][q] - {'ok'}))} ({who})")

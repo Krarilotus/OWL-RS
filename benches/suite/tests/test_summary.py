@@ -253,6 +253,21 @@ class CompetitorCompleteness(unittest.TestCase):
         self.assertEqual(verdict["query_winner"], "other")
         self.assertEqual(verdict["publish"], "permission")
 
+    def test_an_answer_the_contract_doesnt_time_excludes_winners(self):
+        """T8 Sol r1 S6: a COUNT in xsd:int for xsd:integer has the same row count, but its answer
+        deviates (answers.json): no time comes from it, nor from a wrong or undecided one. Sol r2
+        S7: nor from one whose answer capture failed after its timed runs (incomplete)."""
+        rows = [load(), load(system="other"), query("q1", 10), query("q1", 1, system="other")]
+        for verdict, winner in (("ok", "other"), ("deviates", None), ("wrong", None), ("unqualified", None),
+                                ("incomplete", None)):
+            with patch("suitekit.summary.adjudications", return_value={}):
+                summary = compete.summarise_suite(rows, {("t", "q1", "other"): verdict})
+            got = compete.verdicts(summary)["other"]
+            with self.subTest(verdict=verdict):
+                self.assertEqual(got["query_winner"], winner, f"SPEC answer contract: {got['answers']}")
+                if winner is None:
+                    self.assertIn(verdict, got["answers"])
+
 
 if __name__ == "__main__":
     unittest.main()

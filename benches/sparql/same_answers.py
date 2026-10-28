@@ -7,8 +7,9 @@ qualification against Docker).
 
 RUN-A and RUN-B are suite result directories with answers.json (`suite.py run --answers
 full`). Per system and query: `same` where the captured results are identical, else the
-suite's own comparison of the two as bags (suitekit/answers.py: strict and value matches);
-a capture missing or failed on one side is listed. Exit status 1 when any answer differs.
+suite's own comparison of the two as bags (suitekit/answers.py, with the query's operators
+as the run recorded them); a capture missing or failed on one side is listed. Exit status 1
+when any answer differs.
 """
 from __future__ import annotations
 
@@ -30,12 +31,20 @@ def captures(run: Path) -> dict[tuple[str, str], dict]:
     return out
 
 
+def operators(run: Path) -> dict[str, dict[str, str]]:
+    """Each query's COUNT and division variables as the run recorded them, by query file; a
+    query whose run didn't record them (before T8) is left out: unknown, not none."""
+    data = json.loads((run / "answers.json").read_text(encoding="utf-8"))
+    return {i["item"][-1]: i["operators"] for i in data.get("items", []) if i.get("operators") is not None}
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 3:
         print(__doc__)
         return 2
     a_dir, b_dir = Path(argv[1]), Path(argv[2])
     a, b = captures(a_dir), captures(b_dir)
+    ops = operators(b_dir) | operators(a_dir)
     same = differ = missing = 0
     for key in sorted(set(a) | set(b)):
         system, query = key
@@ -50,7 +59,7 @@ def main(argv: list[str]) -> int:
             continue
         answer_a = parse((a_dir / x["path"]).read_text(encoding="utf-8"))
         answer_b = parse((b_dir / y["path"]).read_text(encoding="utf-8"))
-        result = compare(answer_a, answer_b, "bag")
+        result = compare(answer_a, answer_b, "bag", ops=ops.get(query))
         if result["verdict"] == "ok":
             same += 1
             if not result["strict_match"]:

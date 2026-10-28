@@ -19,7 +19,9 @@ Who runs what:
 Answer counts must match NRESE's before a time counts: a differing count is reported as
 `differs`, never as a time. Every suite run also captures each system's full answers and
 classifies them against the reference systems (ANSWER_REFERENCES, in order; the case's own
-checks of single answers are the known answers): benches/suite/suitekit/answers.py. Results:
+checks of single answers are the known answers): benches/suite/suitekit/answers.py; a query
+whose answer the contract doesn't time (UNTIMED: wrong, unqualified, deviates, incomplete,
+unsupported) gives no time either. Results:
 benches/fast/results/<stamp>/compete.json, and answers.json with one verdict per distinct
 query over all the runs.
 """
@@ -37,8 +39,10 @@ import time
 from pathlib import Path
 
 import fast
+from suitekit.answers import UNTIMED
 from suitekit.workloads import FAST_REGIMES, fast_data_name
 from suitekit.summary import summarise
+from suitekit.versus import answer_verdicts
 
 DL_TIMEOUT_S = 120  # per reference reasoner and task in the comparisons
 # The reference image starts its JVM with -Xmx8g: its container gets that and room around it,
@@ -173,8 +177,9 @@ def export_closure(case: dict) -> str | None:
 
 def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: str,
               queries: Path | None = None, track: str = "", settings: dict | None = None,
-              cache: str = "off", expect: dict | None = None) -> list[dict]:
-    """The suite's driver on tier CASE~SEMANTICS for NRESE and `systems`; its rows. A track
+              cache: str = "off", expect: dict | None = None) -> tuple[list[dict], dict[tuple, str]]:
+    """The suite's driver on tier CASE~SEMANTICS for NRESE and `systems`; its rows and its
+    answer verdicts (answers.json: (tier, query, system) -> verdict). A track
     (the case's `tracks`) adds its settings, such as how many queries a store answers at
     once; `cache` the result-cache modes of the systems that have one (`off,on` for a
     replayed log)."""
@@ -208,13 +213,14 @@ def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: 
     path = out / "results.csv"
     if not path.exists():
         print(f"  no results; see {log}")
-        return []
-    return list(csv.DictReader(open(path, encoding="utf-8")))
+        return [], {}
+    return list(csv.DictReader(open(path, encoding="utf-8"))), answer_verdicts(out)
 
 
-def summarise_suite(rows: list[dict]) -> dict[str, dict]:
-    """Per system: load (with reasoning), statements, per-query median ms and rows, status.
-    With its result cache on, a system is its own entry (`qlever (cache on)`)."""
+def summarise_suite(rows: list[dict], answered: dict[tuple, str] | None = None) -> dict[str, dict]:
+    """Per system: load (with reasoning), statements, per-query median ms, rows, answer verdict
+    (ANSWERED, from suite_run), status. With its result cache on, a system is its own entry
+    (`qlever (cache on)`)."""
     # Completed client counts measure throughput, not equal query answers.
     pairs = summarise([r for r in rows if not (r["task"] == "query" and r["item"].startswith("clients-"))])
     out: dict[str, dict] = {}
@@ -241,7 +247,8 @@ def summarise_suite(rows: list[dict]) -> dict[str, dict]:
         # Rows count even without a time: a closure-only system's answers (Nemo's, answered
         # by Oxigraph over its closure) are compared, though not timed.
         if r["task"] == "query" and r["repeat"] not in ("0", ""):
-            q = s["queries"].setdefault(r["item"], {"ms": [], "rows": r["rows"], "executions": []})
+            q = s["queries"].setdefault(r["item"], {"ms": [], "rows": r["rows"], "executions": [], "answer": (
+                answered or {}).get((r["tier"], Path(r["item"]).stem, r["system"]))})
             q["executions"].append((r["run"], r["repeat"]))
             q["_cache"] = r.get("cache") or "-"
             if r["ms"]:
@@ -275,7 +282,11 @@ def verdicts(summary: dict[str, dict]) -> dict[str, dict]:
             continue
         shared = [q for q in s["queries"] if q in nrese["queries"]]
         differ = [q for q in shared if str(s["queries"][q]["rows"]) != str(nrese["queries"][q]["rows"])]
-        same = [q for q in shared if q not in differ and s["queries"][q].get("complete", False)
+        # The same count isn't the same answer: no time from one the contract doesn't time.
+        untimed = {q: [f"{side['queries'][q]['answer']} ({who})" for who, side in (("nrese", nrese), (system, s))
+                       if side["queries"][q].get("answer") in UNTIMED] for q in shared if q not in differ}
+        untimed = {q: why for q, why in untimed.items() if why}
+        same = [q for q in shared if q not in differ and q not in untimed and s["queries"][q].get("complete", False)
                 and nrese["queries"][q].get("complete", False)
                 and s["queries"][q]["executions"] == nrese["queries"][q]["executions"]]
         eligible = (s.get("complete", False) and nrese.get("complete", False)
@@ -285,6 +296,8 @@ def verdicts(summary: dict[str, dict]) -> dict[str, dict]:
         theirs = sum(s["queries"][q]["median_ms"] for q in timed)
         ours = sum(nrese["queries"][q]["median_ms"] for q in timed)
         answers = "differ: " + ",".join(differ) if differ else ("match" if same else "none compared")
+        if untimed:
+            answers += "; not timed: " + "; ".join(f"{q} {', '.join(why)}" for q, why in untimed.items())
         if not eligible:
             answers += "; incomplete, disputed or incompatible comparison"
         v = {"status": s["status"], "answers": answers,
@@ -547,9 +560,9 @@ def compete(args) -> int:
                     result["no_runner"].append(f"rewritten-{form}: no printed query with NRESE's rows")
                     continue
                 copy_volume_files(case)
-                rows = suite_run(case, "plain", rewritten, args.runs, stamp, directory, f"rewritten-{form}",
-                                 expect=expects.get(case["name"]))
-                summary = summarise_suite(rows)
+                rows, answered = suite_run(case, "plain", rewritten, args.runs, stamp, directory, f"rewritten-{form}",
+                                           expect=expects.get(case["name"]))
+                summary = summarise_suite(rows, answered)
                 result["comparisons"][f"rewritten-{form}"] = {"summary": summary, "verdicts": verdicts(summary)}
         if "nemo:custom" in result["comparisons"]:
             metric, record = nrese_metric(case)
@@ -571,11 +584,11 @@ def compete(args) -> int:
         # A case's tracks (defaults, best configuration) each run with their own settings.
         tracks = first.get("tracks") or {"": {}}
         for track, settings in tracks.items():
-            rows = suite_run(first, semantics, sorted(group["systems"]), args.runs, stamp, queries,
-                             track, {k: str(v) for k, v in settings.items()},
-                             "off,on" if first.get("queries") == "@cache-log" else "off",
-                             expect=expects.get(first["name"]))
-            summary = summarise_suite(rows)
+            rows, answered = suite_run(first, semantics, sorted(group["systems"]), args.runs, stamp, queries,
+                                       track, {k: str(v) for k, v in settings.items()},
+                                       "off,on" if first.get("queries") == "@cache-log" else "off",
+                                       expect=expects.get(first["name"]))
+            summary = summarise_suite(rows, answered)
             label = f"{semantics}@{track}" if track else semantics
             for case in group["cases"]:
                 mine = split(summary, case["name"]) if queries else summary
