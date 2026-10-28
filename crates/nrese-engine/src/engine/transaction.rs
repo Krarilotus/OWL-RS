@@ -185,6 +185,46 @@ impl<'e> Transaction<'e> {
         self.base.with_version(version)
     }
 
+    /// [`Self::pending_snapshot`] as a reader of `view` reads it: `view` is a restricted
+    /// snapshot of this transaction's base (its asserted statements, a subset of its
+    /// inferred ones and statements added to them: [`Snapshot::with_inferred_only`],
+    /// [`Snapshot::with_inferred_mask`]). The result is `view` with the pending asserted
+    /// changes, and without the inferred statements the pending changes delete, assert, or
+    /// that `hidden` names. The pending inferred inserts aren't in it: only the reasoner
+    /// writes them, for the commit. O(d log d + h) for d pending changes and h hidden
+    /// statements: the view's runs are shared, never copied or scanned.
+    pub fn pending_over(&self, view: &Snapshot, hidden: &[EncodedQuad]) -> Snapshot {
+        let seen = view.version();
+        let mut gone: Vec<EncodedQuad> = self
+            .inferred
+            .deletes
+            .iter()
+            .chain(self.asserted.inserts.iter())
+            .chain(hidden)
+            .filter(|quad| seen.inferred.contains(quad))
+            .copied()
+            .collect();
+        gone.sort_unstable();
+        gone.dedup();
+        let asserted_inserts: Vec<EncodedQuad> = self.asserted.inserts.iter().copied().collect();
+        let asserted_deletes: Vec<EncodedQuad> = self.asserted.deletes.iter().copied().collect();
+        let version = Version {
+            content: super::Content::fresh(),
+            asserted: seen
+                .asserted
+                .with_delta(&asserted_inserts, &asserted_deletes),
+            inferred: seen.inferred.with_delta(&[], &gone),
+            revision: seen.revision,
+            dictionary_len: self.engine.shared.dictionary.len(),
+            equality: match self.changes_equality() {
+                true => Default::default(),
+                false => std::sync::Arc::clone(&seen.equality),
+            },
+            canonical: Default::default(),
+        };
+        view.with_version(version)
+    }
+
     /// Whether the pending changes touch an `owl:sameAs` statement while reads expand
     /// equality classes: then the next version computes its classes anew.
     fn changes_equality(&self) -> bool {

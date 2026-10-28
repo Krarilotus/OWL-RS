@@ -442,6 +442,72 @@ est_min = 3
 systems = []
 
 [[case]]
+name = "support-update-committed"
+area = "access"
+workload = "support-stress"
+tier = "copies-17"
+what = "a supported reader's own INSERT … WHERE on the committed state (u1: every ex:D it derives, read through its view), applied through the pipeline"
+semantics = "owl2-rl"
+data = "volume:support-stress/copies-17.nq"
+extra = ["volume:support-stress/copies-17.nq.reader", "volume:support-stress/copies-17.nq.commits.ru", "volume:support-stress/copies-17.nq.updates.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru", "--support-updates", "{data}.updates.ru"]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.updates.u1.update_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.probe.value" = "true", "q.count.value" = 5059, "support.updates.u1.applied.marked" = 5059 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by); the updates write markers only, one per member of ex:D each (the expect's marked and seen)"
+route = {}
+cap_gb = 6
+est_min = 3
+systems = []
+
+[[case]]
+name = "support-update-pending"
+area = "access"
+workload = "support-stress"
+tier = "copies-17"
+what = "a supported reader's own two-operation request (u2): its second WHERE reads the state the first left, through its view, applied through the pipeline"
+semantics = "owl2-rl"
+data = "volume:support-stress/copies-17.nq"
+extra = ["volume:support-stress/copies-17.nq.reader", "volume:support-stress/copies-17.nq.commits.ru", "volume:support-stress/copies-17.nq.updates.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru", "--support-updates", "{data}.updates.ru"]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.updates.u2.update_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.probe.value" = "true", "q.count.value" = 5059, "support.updates.u2.applied.seen" = 5059 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by); the updates write markers only, one per member of ex:D each (the expect's marked and seen)"
+route = {}
+cap_gb = 6
+est_min = 3
+systems = []
+
+[[case]]
+name = "support-pending-read"
+area = "access"
+workload = "support-stress"
+tier = "copies-17"
+what = "a supported reader's tally of ex:D and its markers in a client transaction with u2 pending: its operations replayed on its view, the tally on the state they leave"
+semantics = "owl2-rl"
+data = "volume:support-stress/copies-17.nq"
+extra = ["volume:support-stress/copies-17.nq.reader", "volume:support-stress/copies-17.nq.commits.ru", "volume:support-stress/copies-17.nq.updates.ru"]
+tool_loads = false
+args = ["--load", "{data}", "--reason", "owl2-rl", "--support-sets", "off", "--support-reader", "{data}.reader", "--support-commits", "{data}.commits.ru", "--support-updates", "{data}.updates.ru"]
+page_cache = ["warm", "cold"]
+queries = "support-stress"
+metric = "support.updates.u2.pending_ms"
+counters = ["support.inferred", "support.first.visible"]
+check = { "q.probe.value" = "true", "q.count.value" = 5059, "support.updates.u2.pending.d" = 5059, "support.updates.u2.pending.seen" = 5059 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by); the updates write markers only, one per member of ex:D each (the expect's marked and seen); u2's seen markers exist only where its operations ran in order"
+route = {}
+cap_gb = 6
+est_min = 3
+systems = []
+
+[[case]]
 name = "support-copies-256"
 area = "access"
 workload = "support-stress"

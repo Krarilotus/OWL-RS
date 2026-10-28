@@ -2,8 +2,9 @@
 """The support-stress suite's datasets (benches/suite/workloads.toml `support-stress`) into a
 dataset directory: every `.nq` file benches/datasets.toml catalogues for that workload, made by
 its `made_by` command (`perf_lab generate support-stress FILE key=value ...`) with the binary
-PERF_LAB, and its sidecars beside it (FILE.reader, FILE.commits.ru). Each is generated into a
-staging directory beside its target and published whole. A file already there must come out
+PERF_LAB, and its sidecars beside it (FILE.reader, FILE.commits.ru, FILE.updates.ru). Each is
+generated into a staging directory beside its target and published whole. A file already there
+must come out
 byte for byte the same (a regeneration that differs is a new release, frozen anew); it is left
 as it is. The generator's answers, its oracle's for each file's reader, go to ANSWERS: the cases
 pin them.
@@ -24,7 +25,7 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-SIDECARS = (".reader", ".commits.ru")
+SIDECARS = (".reader", ".commits.ru", ".updates.ru")
 
 
 def digest(path: Path) -> str:
