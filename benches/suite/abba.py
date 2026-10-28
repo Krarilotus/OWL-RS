@@ -76,17 +76,17 @@ def family_path(path: str | Path) -> str:
         raise Invalid([f"{path}: a family lives in the repository (benches/abba/), not outside it"])
 
 
-def full_ids(sides: dict[str, str]) -> tuple[dict[str, str], list[str]]:
-    """The sides as full commit ids, resolved against this checkout (the harness's). A pass records
-    its binary's full revision and the gate compares it exactly, so a short id gave every pass of
-    a complete run "no verdict" (lcp-passes, 21 Oct 2026). A short id that names no commit here, or
-    more than one, is refused; a full one is taken as it is (its build checks it)."""
+def full_ids(sides: dict[str, str], repo: Path) -> tuple[dict[str, str], list[str]]:
+    """The sides as full commit ids, resolved against the checkout `repo` (the harness's). A pass
+    records its binary's full revision and the gate compares it exactly, so a short id gave every
+    pass of a complete run "no verdict" (lcp-passes, 21 Oct 2026). A short id that names no commit
+    there, or more than one, is refused; a full one is taken as it is (its build checks it)."""
     out, problems = {}, []
     for side, rev in sides.items():
         if len(rev) == 40:
             out[side] = rev
             continue
-        found = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], cwd=ROOT,
+        found = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}"], cwd=repo,
                                capture_output=True, text=True)
         if found.returncode == 0 and REV.match(found.stdout.strip()):
             out[side] = found.stdout.strip()
@@ -95,9 +95,10 @@ def full_ids(sides: dict[str, str]) -> tuple[dict[str, str], list[str]]:
     return out, problems
 
 
-def load_family(path: str | Path) -> dict:
-    """The family, resolved and validated: its cases (catalogue or its own, each with a content
-    check), its hypotheses (b vs a, per case and declared dimension). Raises Invalid."""
+def load_family(path: str | Path, repo: Path) -> dict:
+    """The family, resolved and validated: its sides as full ids of the checkout `repo`
+    (full_ids()), its cases (catalogue or its own, each with a content check), its hypotheses (b
+    vs a, per case and declared dimension). Raises Invalid."""
     rel = family_path(path)
     raw = (ROOT / rel).read_bytes()
     data = tomllib.loads(raw.decode("utf-8"))
@@ -115,7 +116,7 @@ def load_family(path: str | Path) -> dict:
     if set(sides) != {"a", "b"} or not all(isinstance(v, str) and REV.match(v) for v in sides.values()):
         problems.append("sides: exactly a and b, each a commit id (7 to 40 hex digits)")
     else:
-        sides, unresolved = full_ids(sides)
+        sides, unresolved = full_ids(sides, repo)
         problems += unresolved
     entries = data.get("case", [])
     if not entries:
@@ -159,8 +160,10 @@ def manifest_of(family: dict, harness: str, round_: int, host: str, job: str = "
         "harness": harness, "round": round_, "host": host, "session": uuid.uuid4().hex, "job": job}
 
 
-def git(*args: str, cwd: Path = ROOT) -> str:
-    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True).stdout.strip()
+def git(repo: Path, *args: str) -> str:
+    """git in the checkout `repo`, named by every caller (a test's own repository, never this one's
+    history by default)."""
+    return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True, check=True).stdout.strip()
 
 
 # --- jobs --------------------------------------------------------------------------------------
@@ -419,7 +422,7 @@ def main() -> int:
     s.add_argument("--out", type=Path)
     args = ap.parse_args()
     try:
-        family = load_family(args.family)
+        family = load_family(args.family, ROOT)
     except (Invalid, OSError, tomllib.TOMLDecodeError) as error:
         problems = error.args[0] if isinstance(error, Invalid) else [str(error)]
         print("\n".join(f"invalid family {args.family}: {p}" for p in problems), file=sys.stderr)
@@ -428,14 +431,14 @@ def main() -> int:
         print(f"{family['name']}: {len(family['hypotheses'])} hypotheses, {len(family['cases'])} cases, "
               f"{family['blocks']} blocks (whole squares of A, A' and B) on {family['host']}")
         if os.environ.get("FLEET_OUT"):  # in a job: the manifest its report holds the results to
-            harness = os.environ.get("ABBA_HARNESS") or git("rev-parse", "HEAD")
+            harness = os.environ.get("ABBA_HARNESS") or git(ROOT, "rev-parse", "HEAD")
             manifest = manifest_of(family, harness, int(os.environ.get("ABBA_ROUND", "1")),
                                    os.environ.get("GATE_HOST") or family["host"], os.environ.get("FLEET_JOB", ""))
             (Path(os.environ["FLEET_OUT"]) / "abba-manifest.json").write_text(json.dumps(manifest, indent=1),
                                                                               encoding="utf-8")
         return 0
     if args.command == "jobs":
-        harness = git("rev-parse", args.harness or family["sides"]["b"], cwd=Path(args.checkout))
+        harness = git(Path(args.checkout), "rev-parse", args.harness or family["sides"]["b"])
         found = jobs(family, harness, args.checkout, args.host or family["host"], args.round)
         args.out.mkdir(parents=True, exist_ok=True)
         for name, job in found.items():
