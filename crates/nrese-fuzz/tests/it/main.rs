@@ -1,7 +1,7 @@
-//! The fuzz targets on stable Rust: each target reads its corpus (the pinned W3C test suites
-//! `scripts/fetch-w3c-tests.sh` fetches, and the seeds below) and mutations of it, drawn from
-//! `NRESE_FUZZ_SEED`. A failing input is saved under `tmp/fuzz-findings/` (the target's name
-//! and a hash) and the test fails with the list.
+//! The fuzz targets on stable Rust: each target reads its corpus (the corpora
+//! `scripts/fetch-w3c-tests.sh` pins, declared in `CORPORA`, and the seeds below) and
+//! mutations of it, drawn from `NRESE_FUZZ_SEED`. A failing input is saved under
+//! `tmp/fuzz-findings/` (the target's name and a hash) and the test fails with the list.
 //!
 //! `NRESE_FUZZ_CASES` sets the mutations per corpus file (default 8), `NRESE_FUZZ_FILES`
 //! the corpus files per target (default 300; 0, the seeds alone), `NRESE_FUZZ_TARGET` one
@@ -87,25 +87,54 @@ fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The target's corpus: the files of its kinds every pinned W3C checkout holds under the paths
-/// the fetch script fetches, admitted in full (w3c.rs); `limit` of them spread over the
-/// checkouts, with their number in all. None where a checkout isn't there and the W3C data
-/// isn't required; a broken one, or a missing one where it is required, fails the run.
+/// The corpora the campaign draws on, as the fetch script names its pins, each with what it
+/// brings. Every pin is declared here and every one declared is pinned: no corpus joins or
+/// leaves the campaign unseen (PR #61 fix check 1: a filter by repository had dropped the
+/// GeoSPARQL benchmark and the OWL 2 test cases).
+const CORPORA: [(&str, &str); 7] = [
+    (
+        "w3c/rdf-tests",
+        "the RDF syntaxes' and SPARQL's suites: documents, queries, updates, results",
+    ),
+    ("w3c/json-ld-api", "JSON-LD 1.1's suite"),
+    (
+        "w3c/data-shapes",
+        "SHACL's suite: shapes and data in Turtle",
+    ),
+    ("w3c/N3", "Notation3's suite"),
+    ("w3c/rdf-canon", "RDF canonicalisation's suite: N-Quads"),
+    (
+        "OpenLinkSoftware/GeoSPARQLBenchmark",
+        "GeoSPARQL's compliance benchmark: queries, results, RDF/XML data",
+    ),
+    (
+        "OWL_TESTS",
+        "the OWL 2 test cases: one large RDF/XML document",
+    ),
+];
+
+/// The target's corpus: the files of its kinds every declared corpus holds as pinned, admitted
+/// in full (w3c.rs); `limit` of them spread over the corpora, with their number in all. None
+/// where a corpus isn't there and the W3C data isn't required; a broken one, or a missing one
+/// where it is required, fails the run.
 fn corpus(target: Target, limit: usize) -> Option<(Vec<Vec<u8>>, usize)> {
-    let checkouts = w3c::checkouts().unwrap_or_else(|why| panic!("{why}"));
+    let pins = w3c::pins().unwrap_or_else(|why| panic!("{why}"));
+    let mut pinned: Vec<&str> = pins.iter().map(w3c::Pin::name).collect();
+    let mut declared: Vec<&str> = CORPORA.iter().map(|(name, _)| *name).collect();
+    pinned.sort_unstable();
+    declared.sort_unstable();
+    assert_eq!(
+        pinned, declared,
+        "the fetch script's pins and the campaign's corpora (CORPORA) differ"
+    );
     let mut files = Vec::new();
-    for checkout in &checkouts {
-        let dirs: Vec<&str> = checkout.paths.iter().map(String::as_str).collect();
-        files.extend(w3c::admitted(w3c::pinned(
-            checkout,
-            &dirs,
-            target.extensions(),
-        ))?);
+    for pin in &pins {
+        files.extend(w3c::admitted(pin.files(target.extensions()))?);
     }
     if limit == 0 {
         return Some((Vec::new(), files.len()));
     }
-    // Spread over the checkouts rather than the first directory's files.
+    // Spread over the corpora rather than the first directory's files.
     let step = files.len().div_ceil(limit).max(1);
     let read = files
         .iter()
@@ -259,26 +288,21 @@ fn fuzz(target: Target, seed: u64, cases: usize, files: usize) -> (usize, Vec<St
     let mut inputs: Vec<Vec<u8>> = seeds(target).into_iter().map(<[u8]>::to_vec).collect();
     let (name, seeded) = (target.name(), inputs.len());
     match corpus(target, files) {
-        // A corpus is there when the target has files in it (`NRESE_FUZZ_FILES=0` still
-        // reads none of them, by choice).
-        Some((read, all)) if all > 0 => {
+        // Admitted, every target has files of its kinds (`NRESE_FUZZ_FILES=0` still reads
+        // none of them, by choice): none would be the seeds alone, called qualified.
+        Some((read, all)) => {
+            assert!(
+                all > 0,
+                "{name}: no file of its kinds in the pinned corpora"
+            );
             eprintln!(
                 "{name}: {seeded} seeds, {} of {all} corpus files",
                 read.len()
             );
             inputs.extend(read);
         }
-        found => {
-            let why = match found {
-                Some(_) => "no file of its kinds in the pinned W3C suites",
-                None => "the pinned W3C suites aren't there (scripts/fetch-w3c-tests.sh)",
-            };
-            assert!(
-                !w3c::required(),
-                "NRESE_W3C_REQUIRED is set, but {name}: {why}"
-            );
-            eprintln!("{name}: {seeded} seeds alone, {why}: not qualified");
-        }
+        // Not there and not required: the admission (w3c.rs) decided, and said so.
+        None => eprintln!("{name}: {seeded} seeds alone: not qualified"),
     }
     let mut rng = Rng((seed ^ 0x9e37_79b9_7f4a_7c15).wrapping_mul(target as u64 + 1) | 1);
     let (mut runs, mut findings) = (0, Vec::new());
