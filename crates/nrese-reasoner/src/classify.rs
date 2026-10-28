@@ -226,26 +226,42 @@ impl Names {
         }
     }
 
-    /// Why `s p o`, which no rule of [`build`] read, is a class or property axiom left
-    /// out; `None` when it states none: a declaration, an annotation, a part of an
-    /// expression or list, or an assertion about individuals.
+    /// The property axiom of the rules `s p o` states; `Err` why it is left out, a property
+    /// it relates being no role; `None` when it states none. The one place that decides it:
+    /// [`build`] reads what this returns and reports what it refuses.
+    fn property_axiom(
+        &self,
+        [s, p, o]: Triple,
+        named: &dyn Fn(u64) -> bool,
+    ) -> Option<Result<PropertyAxiom, &'static str>> {
+        let axiom = if p == self.sub_property_of {
+            PropertyAxiom::Sub { equivalent: false }
+        } else if p == self.equivalent_property {
+            PropertyAxiom::Sub { equivalent: true }
+        } else if p == self.rdf_type && o == self.transitive {
+            PropertyAxiom::Transitive
+        } else if p == self.property_chain {
+            PropertyAxiom::Chain
+        } else if p == self.domain {
+            PropertyAxiom::Domain
+        } else if p == self.range {
+            PropertyAxiom::Range
+        } else {
+            return None;
+        };
+        // The subject is a property; a sub- or equivalent property's object is one too.
+        let roles = self.role(s, named).and_then(|()| match axiom {
+            PropertyAxiom::Sub { .. } => self.role(o, named),
+            _ => Ok(()),
+        });
+        Some(roles.map(|()| axiom))
+    }
+
+    /// Why `s p o`, which no rule of [`build`] read and which is no property axiom of the
+    /// rules ([`Self::property_axiom`]), is a class or property axiom left out; `None` when
+    /// it states none: a declaration, an annotation, a part of an expression or list, or an
+    /// assertion about individuals.
     fn unread(&self, [s, p, o]: Triple, named: &dyn Fn(u64) -> bool) -> Option<&'static str> {
-        let property_axioms = [
-            self.sub_property_of,
-            self.equivalent_property,
-            self.property_chain,
-            self.domain,
-            self.range,
-        ];
-        if property_axioms.contains(&p) || (p == self.rdf_type && o == self.transitive) {
-            // Read where the properties are roles: here one isn't.
-            let roles: &[u64] = if p == self.sub_property_of || p == self.equivalent_property {
-                &[s, o]
-            } else {
-                &[s]
-            };
-            return roles.iter().find_map(|&r| self.role(r, named).err());
-        }
         let term = if p == self.rdf_type { o } else { p };
         if let Some(&(_, kind)) = self.unread.iter().find(|&&(t, _)| t == term) {
             return Some(kind);
@@ -259,6 +275,20 @@ impl Names {
         };
         named(s).then_some(kind)
     }
+}
+
+/// A property axiom the rules read ([`Names::property_axiom`]), between roles.
+#[derive(Debug, Clone, Copy)]
+enum PropertyAxiom {
+    /// `s ⊑ o`, and `o ⊑ s` where they are equivalent.
+    Sub {
+        equivalent: bool,
+    },
+    Transitive,
+    /// `s` from the chain of the list `o`.
+    Chain,
+    Domain,
+    Range,
 }
 
 /// A class expression, as far as EL has it.
@@ -609,7 +639,6 @@ fn build(
 ) -> Built {
     let names = Names::new(vocabulary);
     let graph = Graph::new(triples, &names);
-    let role = |p: u64| names.role(p, named).is_ok();
     let mut tbox = Tbox::default();
     let thing = tbox.concept(Some(names.thing));
     let nothing = tbox.concept(Some(names.nothing));
@@ -667,67 +696,69 @@ fn build(
                     tbox.and_sub(a, b, nothing);
                 }
             }
-        } else if (p == names.sub_property_of || p == names.equivalent_property)
-            && role(s)
-            && role(o)
-        {
-            let (r, t) = (tbox.role(Some(s)), tbox.role(Some(o)));
-            tbox.sub_roles.push((r, t));
-            if p == names.equivalent_property {
-                tbox.sub_roles.push((t, r));
-            }
-        } else if p == names.rdf_type && o == names.transitive && role(s) {
-            let r = tbox.role(Some(s));
-            tbox.chains.push((r, r, r));
-        } else if p == names.property_chain && role(s) {
-            let links = match graph.list(o) {
-                Ok(links) => links,
-                Err(error) => {
-                    skipped.push((p, error.reason()));
-                    continue;
+        } else if let Some(axiom) = names.property_axiom([s, p, o], named) {
+            match axiom {
+                Err(kind) => skipped.push((p, kind)),
+                Ok(PropertyAxiom::Sub { equivalent }) => {
+                    let (r, t) = (tbox.role(Some(s)), tbox.role(Some(o)));
+                    tbox.sub_roles.push((r, t));
+                    if equivalent {
+                        tbox.sub_roles.push((t, r));
+                    }
                 }
-            };
-            if links.len() < 2 {
-                skipped.push((p, "chain of fewer than two properties"));
-                continue;
+                Ok(PropertyAxiom::Transitive) => {
+                    let r = tbox.role(Some(s));
+                    tbox.chains.push((r, r, r));
+                }
+                Ok(PropertyAxiom::Chain) => {
+                    let links = match graph.list(o) {
+                        Ok(links) => links,
+                        Err(error) => {
+                            skipped.push((p, error.reason()));
+                            continue;
+                        }
+                    };
+                    if links.len() < 2 {
+                        skipped.push((p, "chain of fewer than two properties"));
+                        continue;
+                    }
+                    if let Some(kind) = links.iter().find_map(|&l| names.role(l, named).err()) {
+                        skipped.push((p, kind));
+                        continue;
+                    }
+                    let target = tbox.role(Some(s));
+                    let mut roles: Vec<Role> = links.iter().map(|&l| tbox.role(Some(l))).collect();
+                    // r1 ∘ r2 ∘ … ∘ rn ⊑ s as (((r1 ∘ r2) ∘ r3) …) with fresh roles.
+                    while roles.len() > 2 {
+                        let fresh = tbox.role(None);
+                        tbox.chains.push((roles[0], roles[1], fresh));
+                        roles.splice(0..2, [fresh]);
+                    }
+                    tbox.chains.push((roles[0], roles[1], target));
+                }
+                // A data property's domain and range say nothing about classes but through a
+                // restriction on the property, which is reported (the top and bottom data
+                // properties, which do, aren't roles).
+                Ok(PropertyAxiom::Domain | PropertyAxiom::Range)
+                    if graph.data_properties.contains(&s) => {}
+                Ok(PropertyAxiom::Domain) => {
+                    let Some(c) = expr(o, p, &mut skipped) else {
+                        continue;
+                    };
+                    let (r, c) = (tbox.role(Some(s)), tbox.name(&c));
+                    let some = tbox.some(r, thing);
+                    tbox.sub(some, c);
+                }
+                // A datatype as an object property's range is a datatype read as a class:
+                // `expr` reports it.
+                Ok(PropertyAxiom::Range) => {
+                    let Some(c) = expr(o, p, &mut skipped) else {
+                        continue;
+                    };
+                    let (r, c) = (tbox.role(Some(s)), tbox.name(&c));
+                    tbox.ranges.push((r, c));
+                }
             }
-            if let Some(kind) = links.iter().find_map(|&l| names.role(l, named).err()) {
-                skipped.push((p, kind));
-                continue;
-            }
-            let target = tbox.role(Some(s));
-            let mut roles: Vec<Role> = links.iter().map(|&l| tbox.role(Some(l))).collect();
-            // r1 ∘ r2 ∘ … ∘ rn ⊑ s as (((r1 ∘ r2) ∘ r3) …) with fresh roles.
-            while roles.len() > 2 {
-                let fresh = tbox.role(None);
-                tbox.chains.push((roles[0], roles[1], fresh));
-                roles.splice(0..2, [fresh]);
-            }
-            tbox.chains.push((roles[0], roles[1], target));
-        } else if p == names.domain && role(s) {
-            // A data property's domain and range say nothing about classes but through a
-            // restriction on the property, which is reported (the top and bottom data
-            // properties, which do, aren't roles).
-            if graph.data_properties.contains(&s) {
-                continue;
-            }
-            let Some(c) = expr(o, p, &mut skipped) else {
-                continue;
-            };
-            let (r, c) = (tbox.role(Some(s)), tbox.name(&c));
-            let some = tbox.some(r, thing);
-            tbox.sub(some, c);
-        } else if p == names.range && role(s) {
-            // As a data property's domain. A datatype as an object property's range is a
-            // datatype read as a class: `expr` reports it.
-            if graph.data_properties.contains(&s) {
-                continue;
-            }
-            let Some(c) = expr(o, p, &mut skipped) else {
-                continue;
-            };
-            let (r, c) = (tbox.role(Some(s)), tbox.name(&c));
-            tbox.ranges.push((r, c));
         } else if let Some(kind) = names.unread([s, p, o], named) {
             skipped.push((p, kind));
         }
@@ -1442,7 +1473,9 @@ mod tests {
     /// `r`-successor, so `∃r.A ⊑ B` gives `A ⊑ B`; unread, `A ⊑ B` is missing and the
     /// omission says so. So are the axioms the rules would misread (I26 Sol r1): a top or
     /// bottom property read as a role (`owl:topObjectProperty rdfs:domain B` gives `B ≡
-    /// owl:Thing`; `A ⊑ ∃owl:bottomObjectProperty.C`, `A ⊑ ⊥`), a datatype read as a class
+    /// owl:Thing`; `A ⊑ ∃owl:bottomObjectProperty.C`, `A ⊑ ⊥`), and like an inverse wherever
+    /// a property axiom names it (a chain's subject, an equivalent property's object), a
+    /// datatype read as a class
     /// or a restriction on a data property (`A ⊑ ∃p.xsd:integer` with `p`'s range
     /// `xsd:string`: `A ⊑ ⊥`), and a node that states two things: a field given twice, or
     /// two constructors, EL's or not (I26 Sol r2; PR #53 r1 F1, an existential beside a self
@@ -1454,7 +1487,7 @@ mod tests {
     fn axioms_without_a_rule_are_reported_as_omitted() {
         /// `(predicate, reason)` omitted, or `(sub, super)` derived.
         type Pairs = &'static [(&'static str, &'static str)];
-        let cases: [(&str, &str, Pairs, Pairs); 26] = [
+        let cases: [(&str, &str, Pairs, Pairs); 27] = [
             (
                 "reflexive",
                 "ex:r rdf:type owl:ReflexiveProperty
@@ -1541,6 +1574,21 @@ mod tests {
                     ("owl:propertyChainAxiom", "top or bottom property"),
                     ("rdfs:range", "top or bottom property"),
                     ("owl:equivalentProperty", "top or bottom property"),
+                ],
+                &[],
+            ),
+            (
+                "unread-property-operands",
+                "owl:topObjectProperty owl:propertyChainAxiom _:c
+                 _:c rdf:first ex:r
+                 _:c rdf:rest _:d
+                 _:d rdf:first ex:s
+                 _:d rdf:rest rdf:nil
+                 _:i owl:inverseOf ex:q
+                 ex:p owl:equivalentProperty _:i",
+                &[
+                    ("owl:propertyChainAxiom", "top or bottom property"),
+                    ("owl:equivalentProperty", "inverse property"),
                 ],
                 &[],
             ),
