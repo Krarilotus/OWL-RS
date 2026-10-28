@@ -348,19 +348,21 @@ arises, the same for every side:
   rust-lld (x86_64-unknown-linux-gnu's default since Rust 1.90; every side names 1.98.1),
   through `cc`, never a host's configured one (RUSTFLAGS replaces a config's, the linker
   variable is pinned); each build reads it back from its binaries (`Linker: LLD 22.1.8`) and
-  fails for any other. A build lives in the directory of its identity (revision, toolchain and
-  `rustc -vV`, the flags rustc gets, linker driver, profile, layout, measurement patch), so
-  binaries from before are reused only when all of it matches; its `IDENTITY` adds the linker
-  read back.
+  fails for any other. A build lives in the directory of its identity (the commit built,
+  toolchain and `rustc -vV`, the flags rustc gets, linker driver, profile, layout), so binaries
+  from before are reused only when all of it matches; its `IDENTITY` adds the linker read back.
 - *No thread started in a timed window.* Every revision's perf lab started a canceller thread
   per run just before its timer, and the thread's start ran inside the timed call (1-5 µs on
   microsecond queries, against 0.3-0.45 µs between the engines in a clean loop). One watchdog
   thread for the whole process, started and running before any timing, armed before the timer
-  and disarmed after, replaces it: in the head's perf lab, and in v1.5's and main's at the gate's
-  build ([fast/patches/perf_lab_watchdog.py](fast/patches/perf_lab_watchdog.py), applied to the
-  revision's own source, the engine untouched; `BUILD.txt` and `CAPABILITIES` say so). The
-  report refuses sides timed differently; `test_perf_lab_timing.py` guards the window on every
-  side. `probes/timing-loop.py` measures what the loop adds.
+  and disarmed after, replaces it: in the head's perf lab, and in v1.5's and main's through
+  their *measurement commits*. A measurement commit is a reviewed commit on a side's revision
+  that changes nothing but its perf lab (`crates/nrese-store/examples/`); the gate builds and
+  times it for that side ([fast/measurement-sides.toml](fast/measurement-sides.toml), pushed as
+  `refs/measure/*`). `release-gate.sh build` refuses one whose parent isn't the side's revision
+  or that changes anything else; nothing is patched at build time. `BUILD.txt` names the
+  commit built, `CAPABILITIES` its timing, and the report refuses sides timed differently.
+  `probes/timing-loop.py` measures what the loop adds.
 - *Nothing timed that the gate doesn't judge.* A gate's pass doesn't rerun a case past its
   limit (the frontier rerun: 226 s of a 1,018 s pass), and a case with a declared outcome (a
   known limit, whose status the gate checks but never times) runs in the first block only.

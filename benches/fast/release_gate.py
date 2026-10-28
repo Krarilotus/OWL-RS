@@ -203,7 +203,7 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
     if len(measures) > 1:
         errors.append("the passes measured with different calibrations (fast.py --measure)")
     # Every side's perf lab keeps its timed window alike (a thread started in it on one side
-    # only is a bias of microseconds: perf_lab_watchdog.py).
+    # only is a bias of microseconds: PROTOCOL.md §5, measurement-sides.toml).
     timings = {(p["report"].get("options") or {}).get("timing") for p in passes}
     if len(timings) > 1:
         errors.append("the sides' perf labs time differently: " + ", ".join(sorted(map(str, timings))))
@@ -1337,6 +1337,66 @@ def read_measure(text: str | None) -> dict:
 BASE = "0f465633d33374bc56ab9ec33157cfa10ebf2d40"  # v1.5, the last recorded run's base
 MAIN = "f9b515e81f013ecd8c3811f3e9c65e91450ee44c"  # main
 
+# The sides measured at a reviewed commit on top of them (benches/PROTOCOL.md §5, "No thread
+# started in a timed window"): a side's revision → that commit.
+MEASUREMENT_SIDES = HERE / "measurement-sides.toml"
+# All a measurement commit may change: the perf lab's sources.
+PERF_LAB = "crates/nrese-store/examples/"
+
+
+def measurement_sides(path: Path = MEASUREMENT_SIDES) -> dict[str, str]:
+    return {rev: side["commit"] for rev, side in tomllib.loads(path.read_text(encoding="utf-8"))["side"].items()}
+
+
+def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str:
+    """The commit a side is built and timed from: its revision, or its measurement commit. That
+    commit's only parent is the revision, and it changes nothing outside the perf lab's sources:
+    the engine, its lockfile and its toolchain are the side's. Anything else is refused."""
+    import subprocess
+
+    def git(*args: str) -> str:
+        done = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, timeout=60)
+        if done.returncode != 0:
+            raise SystemExit(f"git {' '.join(args)}: {done.stderr.strip()}")
+        return done.stdout
+    rev = git("rev-parse", "--verify", f"{rev}^{{commit}}").strip()
+    sides = measurement_sides() if sides is None else sides
+    # A measurement commit is built only as its side's, under one name (its build is the side's).
+    of = [side for side, commit in sides.items() if commit == rev]
+    if of:
+        raise SystemExit(f"{rev[:12]} is the measurement commit of {of[0][:12]}: build {of[0][:12]}")
+    commit = sides.get(rev)
+    if commit is None:
+        return rev
+    try:
+        parents = git("rev-list", "--parents", "-n", "1", f"{commit}^{{commit}}").split()[1:]
+    except SystemExit as e:
+        raise SystemExit(f"the measurement commit {commit[:12]} of {rev[:12]} isn't in this checkout ({e}): "
+                         "a job that builds it takes it as an input (measurement_inputs)") from None
+    if parents != [rev]:
+        raise SystemExit(f"the measurement commit {commit[:12]} isn't a commit on {rev[:12]} alone: its parents "
+                         f"are {', '.join(p[:12] for p in parents) or 'none'}")
+    outside = [p for p in git("diff", "--no-renames", "--name-only", rev, commit).splitlines()
+               if not p.startswith(PERF_LAB)]
+    if outside:
+        raise SystemExit(f"the measurement commit {commit[:12]} of {rev[:12]} changes more than its perf lab "
+                         f"({PERF_LAB}): {', '.join(outside)}")
+    return commit
+
+
+def measurement_inputs(checkout: str, revs: list[str], sides: dict[str, str] | None = None) -> list[dict]:
+    """The measurement commits of these sides as a job's git inputs: a job's checkout holds only
+    its own revision's history, and release-gate.sh build needs them in it."""
+    import subprocess
+    sides = measurement_sides() if sides is None else sides
+    inputs = []
+    for rev in dict.fromkeys(revs):
+        full = subprocess.run(["git", "-C", checkout, "rev-parse", "--verify", f"{rev}^{{commit}}"],
+                              capture_output=True, text=True, timeout=60).stdout.strip()
+        if full in sides:
+            inputs.append({"name": f"measure-{full[:8]}", "source": {"git": checkout, "rev": sides[full]}})
+    return inputs
+
 
 def toml_job(job: dict) -> str:
     def value(v):
@@ -1416,7 +1476,8 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
         "est_min": 25 * len(dict.fromkeys([base, main, candidate, harness])) + (10 if small else 30), "env": env,
         "steps": [[*gate_, "build", rev] for rev in dict.fromkeys([base, main, candidate, harness])]
         + [[*gate_, "prepare", harness]] + ([[*gate_, "pack", base, main, candidate, harness]] if big_host else []),
-        "requires": {"hosts": [timed_host], "cores": 16, "ram_gb": 12}, "inputs": source,
+        "requires": {"hosts": [timed_host], "cores": 16, "ram_gb": 12},
+        "inputs": source + measurement_inputs(checkout, [base, main, candidate, harness]),
         **({"outputs": [{"name": "binaries", "path": "binaries"}]} if big_host else {})}}
     # minutes, the three sides' two runs of every case (a main that is the base isn't timed again)
     sides = 2 + (main != base)
@@ -1669,8 +1730,13 @@ def main() -> int:
     s.add_argument("--w3c", type=Path, required=True)
     s.add_argument("--guards", type=Path, required=True)
     s.add_argument("--out", type=Path)
+    s = sub.add_parser("measured-at", help="the commit a side is built and timed from (release-gate.sh build)")
+    s.add_argument("rev")
     args = p.parse_args()
 
+    if args.command == "measured-at":
+        print(measured_at(str(ROOT), args.rev))
+        return 0
     if args.command == "plan":
         catalog = cases_registry.load()
         run, not_run, elsewhere = plan(catalog, args.max_gb, args.cases.split(",") if args.cases else None,

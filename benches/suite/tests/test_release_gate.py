@@ -17,6 +17,9 @@ import copy
 import importlib.util
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1099,6 +1102,153 @@ class Instances(unittest.TestCase):
         self.assertEqual(flagged(1.15, floor), {"base", "main"})
         with self.assertRaises(ValueError):  # a gate of two revisions is no A-A' run
             gate_module.noise_floor(run_gate(passes()))
+
+
+class MeasurementSides(unittest.TestCase):
+    """A side is built and timed from its revision, or from its measurement commit: a commit on
+    that revision alone that changes nothing but its perf lab (PROTOCOL.md §5). T0, 28 Oct 2026:
+    until then the gate patched main's and v1.5's perf lab at build time, code no commit held."""
+
+    PERF_LAB = "crates/nrese-store/examples/perf_lab.rs"
+    ENGINE = "crates/nrese-store/src/lib.rs"
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp(prefix="measurement-sides-")
+        self.addCleanup(shutil.rmtree, self.repo, True)
+        self.git("init", "-q")
+        self.side = self.commit({self.ENGINE: "pub fn engine() {}\n", self.PERF_LAB: "fn main() { spawn(); }\n",
+                                 "Cargo.lock": "# the side's\n"}, "the side")
+        self.later = self.commit({"README.md": "later\n"}, "a later revision")
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(["git", "-C", self.repo, *args], capture_output=True, text=True, check=True).stdout.strip()
+
+    def commit(self, changes: dict, message: str, on: str | None = None) -> str:
+        """A commit of `changes` (path: text, or None to delete) on `on` (else the current HEAD)."""
+        if on:
+            self.git("checkout", "-q", "--detach", on)
+        for path, text in changes.items():
+            file = Path(self.repo, path)
+            if text is None:
+                file.unlink()
+            else:
+                file.parent.mkdir(parents=True, exist_ok=True)
+                file.write_text(text, encoding="utf-8")
+        self.git("add", "-A")
+        self.git("-c", "user.name=t", "-c", "user.email=t@example.org", "commit", "-q", "-m", message)
+        return self.git("rev-parse", "HEAD")
+
+    def test_only_a_commit_on_the_side_that_changes_just_its_perf_lab_is_built_for_it(self):
+        loop = {self.PERF_LAB: "fn main() { arm(); }\n"}
+        outside, parent = "changes more than its perf lab", "isn't a commit on"
+        cases = {  # name: (its changes, the revision it is on, None if built for the side, else why not)
+            "its perf lab": (loop, self.side, None),
+            "the engine as well": ({**loop, self.ENGINE: "pub fn engine() { faster() }\n"}, self.side, outside),
+            "its lockfile": ({**loop, "Cargo.lock": "# another\n"}, self.side, outside),
+            "the engine moved into the perf lab": ({self.ENGINE: None,
+                                                    "crates/nrese-store/examples/lib.rs": "pub fn engine() {}\n"},
+                                                   self.side, outside),
+            "on another revision": (loop, self.later, parent),
+        }
+        wrong = []
+        for name, (changes, on, why) in cases.items():
+            commit = self.commit(changes, name, on)
+            try:
+                got = "built" if gate_module.measured_at(self.repo, self.side, {self.side: commit}) == commit else "?"
+            except SystemExit as e:
+                got = str(e)
+            if (got == "built") != (why is None) or (why and why not in got):
+                wrong.append(f"{name}: {got}")
+        self.assertEqual(wrong, [], "SPEC measurement side: its only parent is the side, and it changes "
+                                    "nothing outside the perf lab's sources")
+
+    def test_a_side_without_a_measurement_commit_is_built_from_itself(self):
+        self.assertEqual(gate_module.measured_at(self.repo, self.later, {}), self.later)
+
+    def test_a_measurement_commit_is_built_only_as_its_side(self):
+        """Sol r1 S1: built as a side of its own, it would share its side's build directory under
+        another REVISION, and the second of the two builds would be refused."""
+        commit = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        with self.assertRaisesRegex(SystemExit, f"is the measurement commit of {self.side[:12]}"):
+            gate_module.measured_at(self.repo, commit, {self.side: commit})
+
+    def test_a_job_that_builds_a_side_takes_its_measurement_commit_as_an_input(self):
+        commit = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        inputs = gate_module.measurement_inputs(self.repo, [self.side, self.later, self.side],
+                                                {self.side: commit})
+        self.assertEqual(inputs, [{"name": f"measure-{self.side[:8]}", "source": {"git": self.repo, "rev": commit}}])
+
+    def test_main_and_v1_5_are_measured_at_their_commits(self):
+        table = gate_module.tomllib.loads(gate_module.MEASUREMENT_SIDES.read_text(encoding="utf-8"))["side"]
+        self.assertTrue({gate_module.MAIN, gate_module.BASE} <= set(table))
+        for rev, side in table.items():
+            with self.subTest(side=rev):
+                self.assertRegex(rev, r"^[0-9a-f]{40}$")
+                self.assertRegex(side["commit"], r"^[0-9a-f]{40}$")
+                self.assertTrue(re.fullmatch(rf"refs/measure/[a-z0-9]+-{rev[:8]}", side["ref"]), side["ref"])
+
+
+class PatchKeyedBuilds(unittest.TestCase):
+    """The builds of a perf lab patched at build time (before T0) can't be reused after it: their
+    identity names the patch. `clean --patch-keyed` lists them, and with --remove their binaries go
+    unless a gate used them within GATE_LIVE_HOURS; their IDENTITY, BUILD.txt and SHA256SUMS stay."""
+
+    def test_only_an_unused_patch_keyed_build_loses_its_binaries_and_only_when_asked(self):
+        bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("needs bash")
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp).as_posix()
+            setup = f'''
+make() {{  # NAME IDENTITY-LINE REF-AGE
+  b={t}/bin/$1; mkdir -p "$b/release/examples" "$b/.refs"; echo tool > "$b/release/examples/perf_lab"
+  printf 'revision x\\n%s\\nlayout 1\\n' "$2" > "$b/IDENTITY"; echo built > "$b/BUILD.txt"
+  (cd "$b" && sha256sum release/examples/perf_lab > SHA256SUMS); touch -d "$3" "$b/.refs/gate-$1"
+}}
+make bin-unused 'patch perf_lab_watchdog.py 0123456789abcdef' '3 days ago'
+make bin-live 'patch perf_lab_watchdog.py 0123456789abcdef' 'now'
+make bin-after 'profile release --locked' '3 days ago'
+'''
+            env = {**os.environ, "NRESE_GATE_DIR": f"{t}/gate", "GATE_BIN": f"{t}/bin", "FLEET_OUT": f"{t}/out"}
+            subprocess.run([bash, "-c", setup], env=env, check=True, capture_output=True)
+
+            def clean(*args: str) -> dict[str, str]:
+                done = subprocess.run([bash, "scripts/release-gate.sh", "clean", "--patch-keyed", *args], cwd=ROOT,
+                                      env=env, capture_output=True, text=True, encoding="utf-8")
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                return {line.split("\t")[1]: line.split("\t")[0] for line in done.stdout.splitlines()}
+
+            def binaries() -> set[str]:
+                return {d.name for d in Path(tmp, "bin").iterdir() if (d / "release").is_dir()}
+
+            self.assertEqual(clean(), {"bin-unused": "would-release", "bin-live": "kept-live"})
+            self.assertEqual(binaries(), {"bin-unused", "bin-live", "bin-after"}, "SPEC: a dry run removes nothing")
+            self.assertEqual(clean("--remove"), {"bin-unused": "released-now", "bin-live": "kept-live"})
+            self.assertEqual(binaries(), {"bin-live", "bin-after"})
+            self.assertEqual({p.name for p in Path(tmp, "bin", "bin-unused").iterdir() if p.is_file()},
+                             {"IDENTITY", "BUILD.txt", "SHA256SUMS"}, "SPEC: the record stays")
+            self.assertEqual(clean(), {"bin-unused": "released", "bin-live": "kept-live"})
+            self.assertTrue(Path(tmp, "out", "patch-keyed-builds.tsv").is_file())
+
+    def test_a_patch_keyed_build_is_never_a_verified_build(self):
+        """Sol r1 S2: a gate's pointer or an archive from before T0 could hand a block a build of
+        patched source; build_verified, which block, reuse and pack go through, refuses it."""
+        bash = shutil.which("bash")
+        if not bash:
+            self.skipTest("needs bash")
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp).as_posix()
+            script = f'''
+. scripts/lib/gate-publish.sh
+for kind in patched plain; do
+  b={t}/bin-$kind; mkdir -p "$b/release"; echo tool > "$b/release/tool"; echo r > "$b/REVISION"
+  (cd "$b" && sha256sum release/tool > SHA256SUMS)
+  [ $kind = patched ] && echo "patch perf_lab_watchdog.py 0123456789abcdef" > "$b/IDENTITY" || echo "layout 1" > "$b/IDENTITY"
+  build_verified "$b" r && echo "$kind verified" || echo "$kind refused"
+done
+'''
+            done = subprocess.run([bash, "-c", script], cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(done.stdout.split("\n")[:2], ["patched refused", "plain verified"], done.stderr)
 
 
 if __name__ == "__main__":
