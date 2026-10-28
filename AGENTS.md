@@ -35,8 +35,7 @@ Read [docs/README.md](docs/README.md) (which document answers what),
   shareable jobs side by side and gives timed ones the host alone.
 - `literature/` is read-only. Results of licensed systems are never committed.
 - Write files with the editor tools; the shell mangles backslashes.
-- Commit messages carry no AI co-author trailers (`Co-Authored-By: Claude …` and the like);
-  the `commit-msg` hook removes them.
+- Commit-message rules: [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Reporting
 
