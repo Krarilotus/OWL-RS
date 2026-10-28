@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import abba  # noqa: E402
+import isolation  # noqa: E402
 import test_release_gate as fixture  # noqa: E402  (the gate's pass fixtures)
 
 A, B = "a" * 40, "b" * 40
@@ -55,13 +56,24 @@ def records(b=1.0, a2=1.0, broken=None, checked=True):
 
 
 class Abba(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # The commits a family's sides name: a repository of the tests' own (isolation.repo).
+        own = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(own.cleanup)
+        cls.repo = Path(own.name)
+        cls.commits = isolation.repo(cls.repo, 2)
+
     def setUp(self):
         (ROOT / "tmp").mkdir(exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(dir=ROOT / "tmp")  # a family lives in the repository
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "t.toml"
         self.path.write_text(FAMILY, encoding="utf-8")
-        self.family = abba.load_family(self.path)
+        self.family = self.load()
+
+    def load(self):
+        return abba.load_family(self.path, self.repo)
 
     def round_(self, records_of, name="r1", drop=lambda p: False, manifest=True, host="phuoc-yu", k=1):
         """Round k's results as its job leaves them: the manifest of its check, its passes (after
@@ -126,18 +138,19 @@ class Abba(unittest.TestCase):
 
     def test_a_family_may_name_its_sides_by_short_ids(self):
         """lcp-passes (21 Oct 2026): sides named by 8 digits got "no verdict" on every pass of a
-        complete run, the passes recording the full revisions. The sides are revisions every
-        checkout has: fixed ids from before the 26 Oct rewrite are gone from pruned hosts."""
-        a, b = (abba.git("rev-parse", rev) for rev in ("HEAD", "HEAD^"))
+        complete run, the passes recording the full revisions. The sides are commits of the tests'
+        own repository: fixed ids from before the 26 Oct rewrite were gone from pruned hosts, and a
+        shallow checkout has no HEAD^."""
+        a, b = self.commits
         self.path.write_text(FAMILY.replace(A, a[:8]).replace(B, b[:8]), encoding="utf-8")
-        family = abba.load_family(self.path)
+        family = self.load()
         self.assertEqual(family["sides"], {"a": a, "b": b})
         self.family = family
         with patch.dict(fixture.REVS, {"a": a, "a2": a, "b": b}):
             self.assertEqual(self.verdict(self.round_(records(), name="short"))[0], abba.NO_LOSS)
         self.path.write_text(FAMILY.replace(A, "abcdef1"), encoding="utf-8")
         with self.assertRaises(abba.Invalid) as refused:
-            abba.load_family(self.path)
+            self.load()
         self.assertIn("side a: abcdef1 names no single commit", "\n".join(refused.exception.args[0]))
 
     def test_a_family_with_a_case_without_a_content_check_is_refused(self):
@@ -153,7 +166,7 @@ cap_gb = 1
 systems = []
 ''', encoding="utf-8")
         with self.assertRaises(abba.Invalid) as refused:
-            abba.load_family(self.path)
+            self.load()
         self.assertIn("no content check", "\n".join(refused.exception.args[0]))
 
     def test_a_loss_is_shown_in_one_round_and_confirmed_by_another(self):
@@ -178,15 +191,15 @@ systems = []
 
     def test_the_jobs_time_every_block_on_one_host_with_the_a_a_arm(self):
         self.path.write_text(FAMILY.replace("blocks = 6", "blocks = 8"), encoding="utf-8")
-        eight = abba.load_family(self.path)  # Sol r1: whole squares of A, A' and B
+        eight = self.load()  # Sol r1: whole squares of A, A' and B
         self.assertEqual(sum("block" in s for s in abba.jobs(eight, B, ROOT.as_posix(), "office-pc")["abba-t-bbbbbbbb"]["steps"]), 9)
         # One whole square is the least a family may ask (a long, flat case needs no more), fewer
         # is refused: N11 found 6 hard-coded.
         self.path.write_text(FAMILY.replace("blocks = 6", "blocks = 3"), encoding="utf-8")
-        self.assertEqual(abba.load_family(self.path)["blocks"], 3)
+        self.assertEqual(self.load()["blocks"], 3)
         self.path.write_text(FAMILY.replace("blocks = 6", "blocks = 2"), encoding="utf-8")
         with self.assertRaises(abba.Invalid):
-            abba.load_family(self.path)
+            self.load()
         self.path.write_text(FAMILY, encoding="utf-8")
         found = abba.jobs(self.family, B, ROOT.as_posix(), "office-pc")
         timed = found["abba-t-bbbbbbbb"]

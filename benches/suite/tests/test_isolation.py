@@ -28,6 +28,15 @@ class Inner(unittest.TestCase):
             self.assertEqual(git("config", "user.name"), "suite test")
             self.assertTrue(git("config", "core.hooksPath").endswith("/hooks"))
 '''
+INNER_FINDS_NO_REPOSITORY = '''
+import os, subprocess, tempfile, unittest
+
+class Inner(unittest.TestCase):
+    def test_finds_no_repository(self):
+        for where in (tempfile.mkdtemp(), os.getcwd()):
+            found = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=where, capture_output=True, text=True)
+            self.assertNotEqual(found.returncode, 0, (where, found.stdout))
+'''
 
 
 class Isolation(unittest.TestCase):
@@ -64,6 +73,24 @@ class Isolation(unittest.TestCase):
                                   capture_output=True, text=True, timeout=120)
             self.assertFalse(marker.exists(), "an outside hook ran in a test's repository")
             self.assertEqual(state(), before)
+            self.assertEqual(done.returncode, 0, done.stderr[-800:])
+
+    def test_a_test_reaches_no_repository_it_did_not_name_or_make(self):
+        """27 Oct 2026: a test read the history of the checkout it ran in and failed on hosts
+        that had pruned it. Run from a checkout whose temporary directory lies inside it (a job
+        directory's), a test's own directory and the one it runs in find no repository."""
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        with tempfile.TemporaryDirectory() as tmp:
+            outer, inner = Path(tmp) / "outer", Path(tmp) / "inner"
+            for d in (outer / "tmp", inner):
+                d.mkdir(parents=True)
+            for args in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "outer"]):
+                subprocess.run(["git", "-C", str(outer), "-c", "user.name=t", "-c", "user.email=t@t",
+                                "-c", "core.hooksPath=", *args], env=clean, check=True, capture_output=True, timeout=60)
+            (inner / "test_inner.py").write_text(INNER_FINDS_NO_REPOSITORY, encoding="utf-8")
+            done = subprocess.run([sys.executable, str(ISOLATION), "discover", "-s", str(inner)], cwd=outer,
+                                  env={**clean, "TMPDIR": str(outer / "tmp"), "TEMP": str(outer / "tmp"),
+                                       "TMP": str(outer / "tmp")}, capture_output=True, text=True, timeout=120)
             self.assertEqual(done.returncode, 0, done.stderr[-800:])
 
 
