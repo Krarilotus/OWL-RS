@@ -10,7 +10,7 @@
 //!     [--readers 0] [--clients N --duration-s 10] [--threads N] [--export FILE]
 //!     [--canonicalize FILE]... [--prepare-vector-graph DIM:METRIC] [--read-graphs IRI,...]
 //!     [--replication COMMITS:QUADS [--store DIR] [--replication-probe swap-one]]
-//!     [--support-sets K|off] [--support-reader FILE [--support-commits FILE]]
+//!     [--support-sets K|off] [--support-reader FILE [--support-commits FILE] [--support-updates FILE]]
 //! cargo run --release -p nrese-store --example perf_lab -- generate KIND OUT [key=value]...
 //! ```
 //!
@@ -73,7 +73,8 @@
 //!   `--support-sets K` caps the support graph sets per statement (`off`: none), and
 //!   `--support-reader FILE` times a reader of the default graph and FILE's named graphs with
 //!   `inferred = "supported"`: its first read, then `--support-commits` each followed by a
-//!   read (`support.rs`); the queries run as that reader.
+//!   read, then `--support-updates` each read pending and applied by that reader
+//!   (`support.rs`); the queries run as that reader.
 //!   `generate` writes the suite's data (`generate.rs`). A failure still writes the report, with
 //!   its `error`.
 //!
@@ -278,6 +279,7 @@ struct Args {
     support_sets: Option<usize>,
     support_reader: Option<Arc<nrese_sparql::GraphAccess>>,
     support_commits: Option<PathBuf>,
+    support_updates: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -324,6 +326,7 @@ fn parse_args() -> Result<Args, String> {
         support_sets: None,
         support_reader: None,
         support_commits: None,
+        support_updates: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -412,6 +415,7 @@ fn parse_args() -> Result<Args, String> {
                 args.support_reader = Some(support::reader(std::path::Path::new(&value()?))?)
             }
             "--support-commits" => args.support_commits = Some(value()?.into()),
+            "--support-updates" => args.support_updates = Some(value()?.into()),
             "--prepare-vector-graph" => {
                 let input = value()?;
                 let (dimension, metric) = input
@@ -1275,6 +1279,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             &reasoner,
             access,
             args.support_commits.as_deref(),
+            args.support_updates.as_deref(),
             &mut phases,
         )?);
     }

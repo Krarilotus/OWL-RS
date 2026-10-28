@@ -869,3 +869,135 @@ source = "the generate command's: one statement, then 1,000, of new subjects, on
 bytes = 157672
 sha256 = "a0e89656c725e9c211a3a14ef611447e4925264f6b3f387590dd40b3cc3d1c36"
 frozen = "2026-10-26"
+
+[[dataset]]
+file = "support-stress/copies-8.nq.updates.ru"
+workload = "support-stress"
+tier = "copies-8"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-8.nq shape=copies sets=8 subjects=5000 seed=1"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
+bytes = 544
+sha256 = "3194e33f472a86fdcf3c2c3e7d7de77837dba5c968327afdb23e3f03579f503b"
+frozen = "2026-10-28"
+
+[[dataset]]
+file = "support-stress/copies-16.nq.updates.ru"
+workload = "support-stress"
+tier = "copies-16"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-16.nq shape=copies sets=16 subjects=5000 seed=1"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
+bytes = 544
+sha256 = "bb27f7b2362bba6a39545bc26aa26758eb1224213c58ebd9d42d16a97a8accee"
+frozen = "2026-10-28"
+
+[[dataset]]
+file = "support-stress/copies-17.nq.updates.ru"
+workload = "support-stress"
+tier = "copies-17"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-17.nq shape=copies sets=17 subjects=5000 seed=1"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
+bytes = 544
+sha256 = "dea23a473ede897e3deffa10237e22894b7f610d909ff2e3d93778230f36204b"
+frozen = "2026-10-28"
+
+[[dataset]]
+file = "support-stress/copies-256.nq.updates.ru"
+workload = "support-stress"
+tier = "copies-256"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/copies-256.nq shape=copies sets=256 subjects=1000 seed=1"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
+bytes = 544
+sha256 = "12970870c0f17009274c1a0072ef55d6fb6cc7fc40ad9c33c76def0bb0cafd1d"
+frozen = "2026-10-28"
+
+[[dataset]]
+file = "support-stress/product-64.nq.updates.ru"
+workload = "support-stress"
+tier = "product-64"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-64.nq shape=product a=8 b=8 subjects=5000 seed=1"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
+bytes = 544
+sha256 = "bb27f7b2362bba6a39545bc26aa26758eb1224213c58ebd9d42d16a97a8accee"
+frozen = "2026-10-28"
+
+[[dataset]]
+file = "support-stress/product-256.nq.updates.ru"
+workload = "support-stress"
+tier = "product-256"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-256.nq shape=product a=16 b=16 subjects=2000 seed=1"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
+bytes = 544
+sha256 = "70aa6a6cb7524290643b7f7241ad37994ab96966f053c256b3808a19ef20b235"
+frozen = "2026-10-28"
+
+[[dataset]]
+file = "support-stress/product-1024.nq.updates.ru"
+workload = "support-stress"
+tier = "product-1024"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-1024.nq shape=product a=32 b=32 subjects=1000 seed=1"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
+bytes = 544
+sha256 = "196901414e129bce8e0d44c2633e887c535de923cdf1bf57343efc20bbb48fa4"
+frozen = "2026-10-28"
+
+[[dataset]]
+file = "support-stress/product-4096.nq.updates.ru"
+workload = "support-stress"
+tier = "product-4096"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-4096.nq shape=product a=64 b=64 subjects=500 seed=1"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
+bytes = 544
+sha256 = "3fce2f3769cf358c599e05f8a3597c4123c16b1a13f8f3ce5b300cd2bc40fc04"
+frozen = "2026-10-28"
+
+[[dataset]]
+file = "support-stress/product-4096-limit.nq.updates.ru"
+workload = "support-stress"
+tier = "product-4096"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/product-4096-limit.nq shape=product a=64 b=64 subjects=8000 seed=1"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
+bytes = 544
+sha256 = "3fce2f3769cf358c599e05f8a3597c4123c16b1a13f8f3ce5b300cd2bc40fc04"
+frozen = "2026-10-28"
+
+[[dataset]]
+file = "support-stress/ladder-16.nq.updates.ru"
+workload = "support-stress"
+tier = "ladder-16"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/ladder-16.nq shape=ladder width=2 length=4 subjects=2000 seed=1"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
+bytes = 544
+sha256 = "3194e33f472a86fdcf3c2c3e7d7de77837dba5c968327afdb23e3f03579f503b"
+frozen = "2026-10-28"
+
+[[dataset]]
+file = "support-stress/ladder-256.nq.updates.ru"
+workload = "support-stress"
+tier = "ladder-256"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/ladder-256.nq shape=ladder width=2 length=8 subjects=500 seed=1"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
+bytes = 544
+sha256 = "bb27f7b2362bba6a39545bc26aa26758eb1224213c58ebd9d42d16a97a8accee"
+frozen = "2026-10-28"
+
+[[dataset]]
+file = "support-stress/ladder-4096.nq.updates.ru"
+workload = "support-stress"
+tier = "ladder-4096"
+role = "core"
+made_by = "perf_lab generate support-stress support-stress/ladder-4096.nq shape=ladder width=2 length=12 subjects=100 seed=1"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
+bytes = 544
+sha256 = "ba7cb1f95404d832006f0a533417e4411a3d9ebe61821362409ef767bcdd4347"
+frozen = "2026-10-28"

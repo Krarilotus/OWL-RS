@@ -76,14 +76,17 @@ class Series(unittest.TestCase):
     def test_every_planned_series_is_filled_warm_and_cold_or_warm_only(self):
         catalog = cases.load()
         planned = fast.case_manifest(catalog)["series"]
-        phases = ("sets", "view", "first_read", "commit_1", "read_1", "commit_2", "read_2")
+        phases = ("sets", "view", "first_read", "commit_1", "read_1", "commit_2", "read_2",
+                  "pending_1", "update_1", "pending_2", "update_2")
+        updates = {u: {"pending_ms": 1.0, "update_ms": 1.0, "read_ms": 1.0} for u in ("u1", "u2")}
         empty = []
         for case in (c for c in catalog if c.get("workload") == "support-stress"):
             sweep = case.get("sweep", [[]])
             for modes in (["warm", "cold"], ["warm"]):
                 # Each invocation's perf lab report as measure() keeps it: the last, with every
                 # invocation's in `_repeats` where there are several.
-                runs = [{"support": {"first": {"read_ms": 1.0}}, "phase_samples": {p: [1.0] for p in phases},
+                runs = [{"support": {"first": {"read_ms": 1.0}, "updates": updates},
+                         "phase_samples": {p: [1.0] for p in phases},
                          "_sweep": " ".join(sweep[i["sweep"]]), "_page_cache": i["cache"]}
                         for i in fast.invocation_plan(case, modes)]
                 result = {**runs[-1], **({"_repeats": runs} if len(runs) > 1 else {})}
