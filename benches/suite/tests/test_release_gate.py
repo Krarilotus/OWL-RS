@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -1324,8 +1325,9 @@ class MeasurementSides(unittest.TestCase):
     def test_no_bytecode_from_before_the_run_is_executed(self):
         """Sol, PR #60 r1 R2: the gate kept Python's caches in $GATE/pycache, where they outlive a
         run and no check reads them: an unchecked-hash .pyc planted there for suitekit/cases.py ran
-        in place of the source the gate had checked. No cache older than a run runs in it: not one
-        there, in an earlier run's caches, or beside the source."""
+        in place of the source the gate had checked. No cache older than a run runs in it: an
+        earlier run's go with it, and one planted where they were kept, or beside the source, isn't
+        read."""
         bash = shutil.which("bash")
         if bash is None or shutil.which("flock") is None:
             self.skipTest("the gate builds on Linux hosts (bash, flock)")
@@ -1339,8 +1341,8 @@ class MeasurementSides(unittest.TestCase):
         source = str(Path(self.repo, "benches/suite/suitekit/cases.py").resolve())
         body = tmp / "planted.py"
         body.write_text('raise RuntimeError("PR60 planted bytecode executed")\n', encoding="utf-8")
-        earlier = list((gate / "gate" / "pycache").rglob("cases.*.pyc"))
-        planted = list(earlier)
+        self.assertEqual(list((gate / "gate" / "run").iterdir()), [], "SPEC an earlier run's caches go with it")
+        planted = []
         for prefix in ((gate / "gate" / "pycache").as_posix(), None):
             held, sys.pycache_prefix = sys.pycache_prefix, prefix
             try:
@@ -1353,7 +1355,6 @@ class MeasurementSides(unittest.TestCase):
         output = build()
         self.assertNotIn("PR60 planted bytecode executed", output, "SPEC the gate runs the source it checked")
         self.assertIn(went, output)
-        self.assertTrue(earlier, "the earlier run's caches were planted too")
 
     def test_nothing_the_launching_checkout_holds_beside_its_commit_runs(self):
         """Sol, PR #60 fix checks 1 and 2: files in the checkout the gate was launched from, beside
@@ -1417,7 +1418,8 @@ class MeasurementSides(unittest.TestCase):
         """Sol, PR #60 fix 3's sol-loop S1: scripts/lib/ns.sh, sourced from the launching checkout,
         named that checkout's suite for the Python it starts: where there is no flock it locks with
         suitekit/lock.py, and a changed one there ran in `clean --patch-keyed --remove`. The
-        libraries' Python is the checked checkout's, which `clean` keeps until its last lock."""
+        libraries' Python is the launching commit's: the checked checkout's, or for `clean`, which
+        makes none, its lock helper's bytes alone."""
         bash = shutil.which("bash")
         if bash is None:
             self.skipTest("needs bash")
@@ -1436,13 +1438,13 @@ find "$b" -maxdepth 2 -exec touch -d "$4" {} +'''
                         "patch perf_lab_watchdog.py 0123456789abcdef", "3 days ago"], check=True)
         output = self.run_gate(tmp, "keyed", "clean", "--patch-keyed", "--remove", path=path)
         self.assertNotIn(ran, output, "SPEC no Python of the launching checkout runs")
-        self.assertIn("released-now\tbin-unused", output, "SPEC the build goes, under the checked checkout's lock")
+        self.assertIn("released-now\tbin-unused", output, "SPEC the build goes, under the launching commit's lock")
         subprocess.run([bash, "-c", make, "make", (tmp / "clean" / "bin").as_posix(), "bin-old",
                         "profile release --locked", "30 days ago"], check=True)
         output = self.run_gate(tmp, "clean", "clean", path=path)
         self.assertNotIn(ran, output, "SPEC no Python of the launching checkout runs")
-        self.assertIn("unused builds removed: bin-old", output, "SPEC clean locks with the checked checkout's Python")
-        self.assertEqual(list((tmp / "clean" / "gate").glob("src-*")), [], "SPEC and then removes that checkout")
+        self.assertIn("unused builds removed: bin-old", output, "SPEC clean locks with the launching commit's Python")
+        self.assertEqual(list((tmp / "clean" / "gate" / "run").iterdir()), [], "SPEC and leaves nothing of its own")
 
     def test_a_callers_paths_are_the_launching_checkouts(self):
         """Sol, PR #60 fix 3's sol-loop S2: the gate runs its code from a checkout of its own, and
@@ -1468,10 +1470,97 @@ find "$b" -maxdepth 2 -exec touch -d "$4" {} +'''
                 self.assertEqual(Path(repository).resolve(), Path(self.repo).resolve(),
                                  f"SPEC the jobs' repository is the launching checkout: {file.name}")
 
-    def run_gate(self, tmp: Path, name: str, *command: str, path: str | None = None) -> str:
-        """release-gate.sh COMMAND from the test's checkout, its gate, binaries and results under
-        TMP/NAME, its python3 this Python (bytecode planted for it carries its tag), then PATH (this
-        process's by default); the output."""
+    def test_callers_at_once_share_no_code_checkout(self):
+        """Sol, PR #60 fix check 3 (R3): the code checkout, shared under the launching commit's name,
+        had no owner: of two `jobs` started at once on one gate directory, one met the other's
+        checkout half made (a directory, not yet a checkout) and both failed. Each invocation makes,
+        checks and removes its own: one paused while making it stops no other, neither leaves
+        anything behind, and a clean and a restart after them run."""
+        if shutil.which("bash") is None:
+            self.skipTest("needs bash")
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        # The jobs place their parts by the host registry, which the gate's commit holds.
+        Path(self.repo, "benches").mkdir(exist_ok=True)
+        shutil.copy(ROOT / "benches/hosts.toml", Path(self.repo, "benches/hosts.toml"))
+        tmp = self.gate_beside(loop)
+        # git, but the first `worktree add` makes its directory and waits there until released.
+        signals = tmp / "signals"
+        signals.mkdir()
+        hold = tmp / "hold" / "git"
+        hold.parent.mkdir()
+        hold.write_text(f'''#!/usr/bin/env bash
+case " $* " in
+  *" worktree add "*)
+    if mkdir "{signals.as_posix()}/claimed" 2>/dev/null; then
+      mkdir -p "${{@: -2:1}}" && touch "{signals.as_posix()}/made"
+      while [ ! -e "{signals.as_posix()}/go" ]; do sleep 0.05; done
+    fi ;;
+esac
+exec "{Path(shutil.which("git")).as_posix()}" "$@"
+''', encoding="utf-8", newline="\n")
+        hold.chmod(0o755)
+        path = hold.parent.as_posix() + os.pathsep + os.environ.get("PATH", "")
+        jobs = lambda out: ("jobs", "HEAD", "--base", "HEAD", "--main", "HEAD", "--no-checks", "--out", out)
+        start = lambda out: subprocess.Popen(
+            [shutil.which("bash"), "scripts/release-gate.sh", *jobs(out)], cwd=self.repo,
+            env=self.gate_env(tmp, "at-once", path), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        first = start("jobs-a")
+        self.addCleanup(lambda: first.poll() is None and first.kill())
+        try:
+            deadline = time.monotonic() + 120
+            while not (signals / "made").exists():
+                self.assertIsNone(first.poll(), "the first caller ended before making its checkout")
+                self.assertLess(time.monotonic(), deadline, "the first caller made no checkout")
+                time.sleep(0.05)
+            second = start("jobs-b")
+            self.addCleanup(lambda: second.poll() is None and second.kill())
+            output = second.communicate(timeout=300)[0]
+            self.assertEqual(second.returncode, 0, f"SPEC a caller beside a half-made checkout runs:\n{output}")
+        finally:
+            (signals / "go").touch()
+        output = first.communicate(timeout=300)[0]
+        self.assertEqual(first.returncode, 0, f"SPEC so does the one paused while making it:\n{output}")
+        for out in ("jobs-a", "jobs-b"):
+            self.assertTrue(list(Path(self.repo, out).glob("*.toml")), f"{out}: no jobs written")
+        self.assertEqual(list((tmp / "at-once" / "gate" / "run").iterdir()), [], "SPEC each removes its own")
+        self.assertIn("MiB reclaimed", self.run_gate(tmp, "at-once", "clean"), "SPEC a clean after them runs")
+        output = self.run_gate(tmp, "at-once", *jobs("jobs-c"))
+        self.assertTrue(list(Path(self.repo, "jobs-c").glob("*.toml")), f"SPEC and a restart:\n{output}")
+        listed = self.git("worktree", "list", "--porcelain")
+        self.assertEqual(listed.count("worktree "), 1, f"SPEC no checkout stays registered:\n{listed}")
+
+    def test_what_a_dead_run_left_stops_neither_clean_nor_build(self):
+        """Sol, PR #60 fix check 3 (R3): a code checkout left half made (a directory, not a checkout)
+        stopped `build` and `clean` alike, clean behind the bootstrap that refused it. `clean` makes
+        no code checkout: it removes what dead invocations left, keeps a live one's, and the build
+        runs after it."""
+        bash = shutil.which("bash")
+        if bash is None or shutil.which("flock") is None:
+            self.skipTest("the gate builds on Linux hosts (bash, flock)")
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        tmp = self.gate_beside(loop)
+        gate = tmp / "stale" / "gate"
+        head = self.git("rev-parse", "--short=8", "HEAD")
+        # A dead invocation's pid, and a live one's, as the gate's shell numbers them.
+        dead = subprocess.run([bash, "-c", "echo $$"], capture_output=True, text=True, check=True).stdout.strip()
+        live = subprocess.Popen([bash, "-c", "echo $$; exec sleep 300"], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(live.wait)
+        self.addCleanup(live.kill)
+        alive = live.stdout.readline().strip()
+        for pid in (dead, alive):
+            (gate / "run" / f"{pid}-abcdef" / f"src-{head}").mkdir(parents=True)
+        (gate / f"src-{head}").mkdir()  # 47e5cee7's shared code checkout, half made (Sol's case)
+        output = self.run_gate(tmp, "stale", "clean")
+        self.assertIn("MiB reclaimed", output, f"SPEC clean runs:\n{output}")
+        self.assertFalse((gate / "run" / f"{dead}-abcdef").exists(), "SPEC what a dead invocation left goes")
+        self.assertTrue((gate / "run" / f"{alive}-abcdef").exists(), "SPEC a live one's stays")
+        output = self.run_gate(tmp, "stale", "build", self.side)
+        self.assertIn(f"build {self.side} at {loop}", output, f"SPEC and the build runs:\n{output}")
+
+    def gate_env(self, tmp: Path, name: str, path: str | None = None) -> dict[str, str]:
+        """A release-gate.sh run's environment: its gate, binaries and results under TMP/NAME, its
+        python3 this Python (bytecode planted for it carries its tag), then PATH (this process's by
+        default)."""
         shim = tmp / "shim" / "python3"
         if not shim.exists():
             shim.parent.mkdir()
@@ -1479,11 +1568,14 @@ find "$b" -maxdepth 2 -exec touch -d "$4" {} +'''
                             encoding="utf-8", newline="\n")
             shim.chmod(0o755)
         gate = tmp / name
-        env = {**os.environ, "NRESE_GATE_DIR": (gate / "gate").as_posix(), "GATE_BIN": (gate / "bin").as_posix(),
-               "FLEET_OUT": (gate / "out").as_posix(),
-               "PATH": shim.parent.as_posix() + os.pathsep + (path or os.environ.get("PATH", ""))}
-        done = subprocess.run([shutil.which("bash"), "scripts/release-gate.sh", *command], cwd=self.repo, env=env,
-                              capture_output=True, text=True)
+        return {**os.environ, "NRESE_GATE_DIR": (gate / "gate").as_posix(), "GATE_BIN": (gate / "bin").as_posix(),
+                "FLEET_OUT": (gate / "out").as_posix(),
+                "PATH": shim.parent.as_posix() + os.pathsep + (path or os.environ.get("PATH", ""))}
+
+    def run_gate(self, tmp: Path, name: str, *command: str, path: str | None = None) -> str:
+        """release-gate.sh COMMAND from the test's checkout in gate_env's environment; the output."""
+        done = subprocess.run([shutil.which("bash"), "scripts/release-gate.sh", *command], cwd=self.repo,
+                              env=self.gate_env(tmp, name, path), capture_output=True, text=True)
         return done.stdout + done.stderr
 
     def test_the_build_compiles_the_commit_checked(self):
