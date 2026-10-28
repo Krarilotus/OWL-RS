@@ -876,9 +876,9 @@ workload = "support-stress"
 tier = "copies-8"
 role = "core"
 made_by = "perf_lab generate support-stress support-stress/copies-8.nq shape=copies sets=8 subjects=5000 seed=1"
-source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
-bytes = 544
-sha256 = "3194e33f472a86fdcf3c2c3e7d7de77837dba5c968327afdb23e3f03579f503b"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left; each WHERE reads ex:D as the count query does, so each update leaves one marker per member"
+bytes = 670
+sha256 = "dc604aedfa6547e39d8adef9d6c8ca4780de1056f03f602eed50e7f1be3bcf94"
 frozen = "2026-10-28"
 
 [[dataset]]
@@ -887,9 +887,9 @@ workload = "support-stress"
 tier = "copies-16"
 role = "core"
 made_by = "perf_lab generate support-stress support-stress/copies-16.nq shape=copies sets=16 subjects=5000 seed=1"
-source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
-bytes = 544
-sha256 = "bb27f7b2362bba6a39545bc26aa26758eb1224213c58ebd9d42d16a97a8accee"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left; each WHERE reads ex:D as the count query does, so each update leaves one marker per member"
+bytes = 670
+sha256 = "7bbe96107147739336629e31bafa132827d0a1af3cc4156685d7ae9d64ae3fc8"
 frozen = "2026-10-28"
 
 [[dataset]]
@@ -898,9 +898,9 @@ workload = "support-stress"
 tier = "copies-17"
 role = "core"
 made_by = "perf_lab generate support-stress support-stress/copies-17.nq shape=copies sets=17 subjects=5000 seed=1"
-source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
-bytes = 544
-sha256 = "dea23a473ede897e3deffa10237e22894b7f610d909ff2e3d93778230f36204b"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left; each WHERE reads ex:D as the count query does, so each update leaves one marker per member"
+bytes = 670
+sha256 = "c067e118037e3686ceec8bbf7b12a36c19b65d845af0bc3dd453799ce84b831a"
 frozen = "2026-10-28"
 
 [[dataset]]
@@ -909,9 +909,9 @@ workload = "support-stress"
 tier = "copies-256"
 role = "core"
 made_by = "perf_lab generate support-stress support-stress/copies-256.nq shape=copies sets=256 subjects=1000 seed=1"
-source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
-bytes = 544
-sha256 = "12970870c0f17009274c1a0072ef55d6fb6cc7fc40ad9c33c76def0bb0cafd1d"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left; each WHERE reads ex:D as the count query does, so each update leaves one marker per member"
+bytes = 670
+sha256 = "9491cf32067b96c92092f18d73dcc3b95cb3b40757ec78df6d93d03585e178e6"
 frozen = "2026-10-28"
 
 [[dataset]]
@@ -920,9 +920,9 @@ workload = "support-stress"
 tier = "product-64"
 role = "core"
 made_by = "perf_lab generate support-stress support-stress/product-64.nq shape=product a=8 b=8 subjects=5000 seed=1"
-source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
-bytes = 544
-sha256 = "bb27f7b2362bba6a39545bc26aa26758eb1224213c58ebd9d42d16a97a8accee"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left; each WHERE reads ex:D as the count query does, so each update leaves one marker per member"
+bytes = 670
+sha256 = "7bbe96107147739336629e31bafa132827d0a1af3cc4156685d7ae9d64ae3fc8"
 frozen = "2026-10-28"
 
 [[dataset]]
@@ -931,9 +931,9 @@ workload = "support-stress"
 tier = "product-256"
 role = "core"
 made_by = "perf_lab generate support-stress support-stress/product-256.nq shape=product a=16 b=16 subjects=2000 seed=1"
-source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
-bytes = 544
-sha256 = "70aa6a6cb7524290643b7f7241ad37994ab96966f053c256b3808a19ef20b235"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left; each WHERE reads ex:D as the count query does, so each update leaves one marker per member"
+bytes = 670
+sha256 = "bed0834727ba153a4e7644e7bf187bba72a460a28b95725e618c4db5f20c1e69"
 frozen = "2026-10-28"
 
 [[dataset]]
@@ -942,9 +942,9 @@ workload = "support-stress"
 tier = "product-1024"
 role = "core"
 made_by = "perf_lab generate support-stress support-stress/product-1024.nq shape=product a=32 b=32 subjects=1000 seed=1"
-source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
-bytes = 544
-sha256 = "196901414e129bce8e0d44c2633e887c535de923cdf1bf57343efc20bbb48fa4"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left; each WHERE reads ex:D as the count query does, so each update leaves one marker per member"
+bytes = 670
+sha256 = "22b4c795a8878e5b2da7fc89703b5c045ffeac15b202a601aa80ae98a07d632e"
 frozen = "2026-10-28"
 
 [[dataset]]
@@ -953,9 +953,9 @@ workload = "support-stress"
 tier = "product-4096"
 role = "core"
 made_by = "perf_lab generate support-stress support-stress/product-4096.nq shape=product a=64 b=64 subjects=500 seed=1"
-source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
-bytes = 544
-sha256 = "3fce2f3769cf358c599e05f8a3597c4123c16b1a13f8f3ce5b300cd2bc40fc04"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left; each WHERE reads ex:D as the count query does, so each update leaves one marker per member"
+bytes = 670
+sha256 = "c7e97932c293f36269304355b33ae426c935b680e89cd08c5368a02c1a641ab3"
 frozen = "2026-10-28"
 
 [[dataset]]
@@ -964,9 +964,9 @@ workload = "support-stress"
 tier = "product-4096"
 role = "core"
 made_by = "perf_lab generate support-stress support-stress/product-4096-limit.nq shape=product a=64 b=64 subjects=8000 seed=1"
-source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
-bytes = 544
-sha256 = "3fce2f3769cf358c599e05f8a3597c4123c16b1a13f8f3ce5b300cd2bc40fc04"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left; each WHERE reads ex:D as the count query does, so each update leaves one marker per member"
+bytes = 670
+sha256 = "c7e97932c293f36269304355b33ae426c935b680e89cd08c5368a02c1a641ab3"
 frozen = "2026-10-28"
 
 [[dataset]]
@@ -975,9 +975,9 @@ workload = "support-stress"
 tier = "ladder-16"
 role = "core"
 made_by = "perf_lab generate support-stress support-stress/ladder-16.nq shape=ladder width=2 length=4 subjects=2000 seed=1"
-source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
-bytes = 544
-sha256 = "3194e33f472a86fdcf3c2c3e7d7de77837dba5c968327afdb23e3f03579f503b"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left; each WHERE reads ex:D as the count query does, so each update leaves one marker per member"
+bytes = 670
+sha256 = "dc604aedfa6547e39d8adef9d6c8ca4780de1056f03f602eed50e7f1be3bcf94"
 frozen = "2026-10-28"
 
 [[dataset]]
@@ -986,9 +986,9 @@ workload = "support-stress"
 tier = "ladder-256"
 role = "core"
 made_by = "perf_lab generate support-stress support-stress/ladder-256.nq shape=ladder width=2 length=8 subjects=500 seed=1"
-source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
-bytes = 544
-sha256 = "bb27f7b2362bba6a39545bc26aa26758eb1224213c58ebd9d42d16a97a8accee"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left; each WHERE reads ex:D as the count query does, so each update leaves one marker per member"
+bytes = 670
+sha256 = "7bbe96107147739336629e31bafa132827d0a1af3cc4156685d7ae9d64ae3fc8"
 frozen = "2026-10-28"
 
 [[dataset]]
@@ -997,7 +997,7 @@ workload = "support-stress"
 tier = "ladder-4096"
 role = "core"
 made_by = "perf_lab generate support-stress support-stress/ladder-4096.nq shape=ladder width=2 length=12 subjects=100 seed=1"
-source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left"
-bytes = 544
-sha256 = "ba7cb1f95404d832006f0a533417e4411a3d9ebe61821362409ef767bcdd4347"
+source = "the generate command's: the reader's own updates (perf_lab --support-updates), one request a line, into its first graph: u1 on the committed state, u2's second WHERE on the state its first operation left; each WHERE reads ex:D as the count query does, so each update leaves one marker per member"
+bytes = 670
+sha256 = "211088b2d3ef6e664b6020eafd36b67742287551c2148ec53d04c1babb2f598d"
 frozen = "2026-10-28"

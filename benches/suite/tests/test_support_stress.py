@@ -23,6 +23,21 @@ from suitekit import cases  # noqa: E402
 from suitekit.schema import problems  # noqa: E402
 
 
+def report(probe, count, members: int, zero: str = "") -> dict:
+    """A support-stress perf lab report as fast.py checks it: the probe's and the count's
+    answers, and the tallies of the reader's updates (examples/perf_lab/support.rs), pending and
+    applied, with one marker per member of ex:D (`members`) of each kind an update has written
+    by then: u1 `marked`, u2 also `seen`. `zero` (UPDATE.WHEN.FIELD) is answered 0."""
+    tallies = {"u1": {"d": members, "marked": members, "seen": 0},
+               "u2": {"d": members, "marked": members, "seen": members}}
+    updates = {u: {when: dict(tally) for when in ("pending", "applied")} for u, tally in tallies.items()}
+    if zero:
+        update, when, field = zero.split(".")
+        updates[update][when][field] = 0
+    return {"queries": [{"name": "probe", "value": probe}, {"name": "count", "value": count}],
+            "support": {"updates": updates}}
+
+
 class FromTheCatalogue(unittest.TestCase):
     """Spec: the owner's bench intent (run at any level, pruned by capability, the systems
     that can't express it reported, never dropped); review r1 R1."""
@@ -110,8 +125,6 @@ class Qualification(unittest.TestCase):
                                                    "ladder": lambda: int(p["width"]) ** int(p["length"])}[p["shape"]]()
         suite = [c for c in cases.load() if c.get("workload") == "support-stress"]
         oracle = {c["data"]: c["check"]["q.count.value"] for c in suite if isinstance(c["check"].get("q.count.value"), int)}
-        answer = lambda probe, count: {"queries": [{"name": "probe", "value": probe},  # noqa: E731
-                                                   {"name": "count", "value": count}]}
         checked = []
         for case in suite:
             for entry in case.get("sweep", [[]]):
@@ -121,9 +134,30 @@ class Qualification(unittest.TestCase):
                     continue
                 right = oracle[case["data"]]
                 verdicts = lambda result: [fast.check(p, w, result, {}, {})["ok"] for p, w in case["check"].items()]  # noqa: E731
-                self.assertTrue(all(verdicts(answer("true", right))), f"{case['name']} {entry}")
+                self.assertTrue(all(verdicts(report("true", right, right))), f"{case['name']} {entry}")
                 for probe, count in (("false", right), ("true", right - 1), ("false", 0)):
-                    self.assertIn(False, verdicts(answer(probe, count)), f"{case['name']} {entry}: {probe}, {count}")
+                    self.assertIn(False, verdicts(report(probe, count, right)), f"{case['name']} {entry}: {probe}, {count}")
                 checked.append(cap)
         self.assertIn("16", checked, "an arm capped at 16 on at most 16 sets is checked")
         self.assertIn("off", checked)
+
+
+class Updates(unittest.TestCase):
+    """Spec: a case timing the reader's updates checks what its timed step did (Sol's review r1
+    of the D6 harness, H1 and H2): the markers the update leaves, one per member of ex:D, and
+    for the pending read its own answer, where u2's `seen` markers exist only if its operations
+    ran in order. An update that matches nothing, or a pending read that ignores its operations
+    or answers 0, fails its case's check."""
+
+    def test_an_update_case_fails_where_its_step_does_nothing(self):
+        suite = {c["name"]: c for c in cases.load() if c.get("metric", "").startswith("support.updates.")}
+        nothing = {"support-update-committed": ["u1.applied.marked"],
+                   "support-update-pending": ["u2.applied.seen"],
+                   "support-pending-read": ["u2.pending.seen", "u2.pending.d"]}
+        self.assertEqual(sorted(suite), sorted(nothing))
+        for name, case in suite.items():
+            right = case["check"]["q.count.value"]
+            verdicts = lambda result: [fast.check(p, w, result, {}, {})["ok"] for p, w in case["check"].items()]  # noqa: E731
+            self.assertTrue(all(verdicts(report("true", right, right))), name)
+            for zero in nothing[name]:
+                self.assertIn(False, verdicts(report("true", right, right, zero)), f"{name}: {zero} answered 0")
