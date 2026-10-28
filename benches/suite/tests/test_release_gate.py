@@ -811,7 +811,8 @@ esac
 """, encoding="utf-8", newline="\n")
                 (shim / "python3").chmod(0o755)
                 # git, faked: the revision is a fixed id, its tree empty, a worktree an empty
-                # directory; anything else the step asks fails loudly (no real repository is touched).
+                # directory; the index of the checkout the gate runs from (this one) the real one's,
+                # read only; anything else the step asks fails loudly (no repository is changed).
                 (shim / "git").write_text(f"""#!/usr/bin/env bash
 while [ "$1" = -c ] || [ "$1" = -C ]; do shift 2; done
 case "$1 $2" in
@@ -819,6 +820,7 @@ case "$1 $2" in
   "rev-parse --show-object-format") echo sha1 ;;
   "rev-parse HEAD") echo {head} ;;
   "ls-tree -r") ;;
+  "ls-files -z") exec "{Path(shutil.which("git")).as_posix()}" "$@" ;;
   "worktree add") mkdir -p "${{@: -2:1}}" ;;
   "status --porcelain") ;;
   *) if [ "$1" = rev-parse ] && [ $# -eq 2 ]; then echo "$2"; else echo "fake git: $*" >&2; exit 99; fi ;;
@@ -1198,9 +1200,10 @@ class MeasurementSides(unittest.TestCase):
         self.assertEqual(gate_module.measured_at(self.repo, self.side, {self.side: loop}), loop)
 
     def gate_beside(self, loop: str) -> Path:
-        """The gate's scripts beside the commits, not in them, its side measured at LOOP; a scratch
-        directory for its runs."""
-        for rel in ("scripts/release-gate.sh", "benches/fast/release_gate.py"):
+        """The gate's scripts beside the commits, not in them, its side measured at LOOP: in the
+        index of the checkout it runs from, which ignores what the repository ignores and holds
+        nothing it ignores (checkout.py --launching); a scratch directory for its runs."""
+        for rel in ("scripts/release-gate.sh", "benches/fast/release_gate.py", ".gitignore"):
             Path(self.repo, rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(ROOT / rel, Path(self.repo, rel))
         shutil.copytree(ROOT / "scripts/lib", Path(self.repo, "scripts/lib"), ignore=shutil.ignore_patterns("__pycache__"))
@@ -1208,6 +1211,7 @@ class MeasurementSides(unittest.TestCase):
                         ignore=shutil.ignore_patterns("__pycache__"))
         Path(self.repo, "benches/fast/measurement-sides.toml").write_text(
             f'[side.{self.side}]\ncommit = "{loop}"\nref = "refs/measure/t-{self.side[:8]}"\n', encoding="utf-8")
+        self.git("add", ".gitignore", "scripts", "benches")
         tmp = Path(tempfile.mkdtemp(prefix="measurement-build-"))
         self.addCleanup(shutil.rmtree, tmp, True)
         return tmp
@@ -1328,20 +1332,7 @@ class MeasurementSides(unittest.TestCase):
         loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
         tmp = self.gate_beside(loop)
         gate = tmp / "planted"
-        # The gate's python3 is this one, so the planted caches carry its tag.
-        (tmp / "shim").mkdir()
-        (tmp / "shim" / "python3").write_text(f'#!/usr/bin/env bash\nexec "{Path(sys.executable).as_posix()}" "$@"\n',
-                                              encoding="utf-8", newline="\n")
-        (tmp / "shim" / "python3").chmod(0o755)
-        env = {**os.environ, "NRESE_GATE_DIR": (gate / "gate").as_posix(), "GATE_BIN": (gate / "bin").as_posix(),
-               "FLEET_OUT": (gate / "out").as_posix(),
-               "PATH": (tmp / "shim").as_posix() + os.pathsep + os.environ.get("PATH", "")}
-
-        def build() -> str:
-            done = subprocess.run([bash, "scripts/release-gate.sh", "build", self.side], cwd=self.repo, env=env,
-                                  capture_output=True, text=True)
-            return done.stdout + done.stderr
-
+        build = lambda: self.run_gate(tmp, "planted", "build", self.side)
         went = f"build {self.side} at {loop}"
         self.assertIn(went, build(), "an earlier run")
         source = str(Path(self.repo, "benches/suite/suitekit/cases.py").resolve())
@@ -1362,6 +1353,61 @@ class MeasurementSides(unittest.TestCase):
         self.assertNotIn("PR60 planted bytecode executed", output, "SPEC the gate runs the source it checked")
         self.assertIn(went, output)
         self.assertTrue(earlier, "the earlier run's caches were planted too")
+
+    def test_nothing_beside_the_gates_own_files_runs_before_they_are_checked(self):
+        """Sol, PR #60 fix check 1: a sourceless package benches/suite/suitekit/cases/__init__.pyc
+        beside the checked cases.py, in the checkout the gate runs from, ran at the validator's
+        first import, before anything was checked: git clean -fd keeps it (*.py[cod] is ignored),
+        and no cache prefix reaches it. The gate refuses that checkout before any of its Python
+        imports from it; Python's caches, cargo's builds, the gate's scratch and a file git shows,
+        untracked (one the commit a hook checks adds), are no reason."""
+        if shutil.which("bash") is None or shutil.which("flock") is None:
+            self.skipTest("the gate builds on Linux hosts (bash, flock)")
+        import py_compile
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        tmp = self.gate_beside(loop)
+        went = f"build {self.side} at {loop}"
+        for inert in ("benches/suite/suitekit/__pycache__/cases.cpython-312.pyc", "target/debug/build.log",
+                      "tmp/scratch.txt", "benches/suite/suitekit/added.py"):
+            Path(self.repo, inert).parent.mkdir(parents=True, exist_ok=True)
+            Path(self.repo, inert).write_bytes(b"not the revision's\n")
+        self.assertIn(went, self.run_gate(tmp, "inert", "build", self.side), "SPEC caches, builds, scratch")
+        body = tmp / "planted.py"
+        body.write_text('raise RuntimeError("PR60 SOURCELESS STARTUP EXECUTED")\n', encoding="utf-8")
+        package = Path(self.repo, "benches/suite/suitekit/cases/__init__.pyc")
+        package.parent.mkdir()
+        py_compile.compile(str(body), cfile=str(package), doraise=True)
+        output = self.run_gate(tmp, "sourceless", "build", self.side)
+        self.assertNotIn("PR60 SOURCELESS STARTUP EXECUTED", output, "SPEC nothing beside the gate's files runs")
+        self.assertIn("benches/suite/suitekit/cases/__init__.pyc", output)
+        self.assertNotIn(went, output)
+        # Sol, fix 2 r1 S1: the same package in a directory the check can't list but Python can
+        # open a file in by its name (mode 0111). Root lists it all the same.
+        if os.name == "nt" or os.geteuid() == 0:
+            self.skipTest("a directory only searchable needs a non-root POSIX user")
+        os.chmod(package.parent, 0o111)
+        self.addCleanup(os.chmod, package.parent, 0o755)
+        output = self.run_gate(tmp, "unlisted", "build", self.side)
+        self.assertNotIn("PR60 SOURCELESS STARTUP EXECUTED", output, "SPEC what can't be listed isn't admitted")
+        self.assertIn("benches/suite/suitekit/cases (not listed", output)
+        self.assertNotIn(went, output)
+
+    def run_gate(self, tmp: Path, name: str, *command: str) -> str:
+        """release-gate.sh COMMAND from the test's checkout, its gate, binaries and results under
+        TMP/NAME, its python3 this Python (bytecode planted for it carries its tag); the output."""
+        shim = tmp / "shim" / "python3"
+        if not shim.exists():
+            shim.parent.mkdir()
+            shim.write_text(f'#!/usr/bin/env bash\nexec "{Path(sys.executable).as_posix()}" "$@"\n',
+                            encoding="utf-8", newline="\n")
+            shim.chmod(0o755)
+        gate = tmp / name
+        env = {**os.environ, "NRESE_GATE_DIR": (gate / "gate").as_posix(), "GATE_BIN": (gate / "bin").as_posix(),
+               "FLEET_OUT": (gate / "out").as_posix(),
+               "PATH": shim.parent.as_posix() + os.pathsep + os.environ.get("PATH", "")}
+        done = subprocess.run([shutil.which("bash"), "scripts/release-gate.sh", *command], cwd=self.repo, env=env,
+                              capture_output=True, text=True)
+        return done.stdout + done.stderr
 
     def test_the_build_compiles_the_commit_checked(self):
         """PR #54 fix check 1 (D2's other half): a replace ref made after the check returned stood

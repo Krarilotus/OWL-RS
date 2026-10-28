@@ -76,6 +76,13 @@ py() { PYTHONIOENCODING=utf-8 python3 "$@"; }
 # lane-d-pr60-r1-startup2-c600217b). `clean` removes the directories (about 2 MiB a run).
 mkdir -p "$GATE/pycache" && PYTHONPYCACHEPREFIX=$(mktemp -d "$GATE/pycache/run-XXXXXX") || exit 2
 export PYTHONPYCACHEPREFIX
+# No Python of the gate imports from the checkout it runs from before that checkout is shown to
+# hold nothing besides its files but scratch and what none of them reads (checkout.py --launching).
+# The check imports nothing of the repository (python3 -I): a sourceless
+# suitekit/cases/__init__.pyc there ran in the validator before anything was checked (Sol, PR #60
+# fix check 1).
+python3 -I benches/suite/suitekit/checkout.py --launching . \
+  || { echo "release gate: the checkout it runs from ($PWD) holds files not in its index" >&2; exit 2; }
 
 worktree() {  # REV [DIR [built]]: a clean worktree of the revision, made once, holding its stored
   # bytes; one to be built holds nothing else
@@ -96,7 +103,7 @@ worktree() {  # REV [DIR [built]]: a clean worktree of the revision, made once, 
     only=(--nothing-else)
   fi
   # HEAD and a clean status trust the index and the attributes; the bytes are the proof.
-  py benches/fast/release_gate.py checkout "$rev" "$dir" ${only[@]+"${only[@]}"} \
+  python3 -I benches/suite/suitekit/checkout.py "$rev" "$dir" ${only[@]+"${only[@]}"} \
     || { echo "the worktree $dir doesn't hold $rev's bytes" >&2; return 2; }
   echo "$dir"
 }
