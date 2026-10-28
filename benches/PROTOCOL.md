@@ -155,7 +155,9 @@ only approve tradeoffs"). With it: every guard of
 [docs/design/performance.md §0](../docs/design/performance.md) green, and every W3C suite at
 its required counts. `fast/release_gate.py` decides; `scripts/release-gate.sh` runs it as fleet
 steps; `release-gate.sh jobs HEAD` writes the jobs. Each part's verdict is `passed` only when
-nothing blocks; `verdict` passes only when every part does.
+nothing blocks; `verdict` passes only when every part does. Every command runs the code of the
+commit it is launched from, never changes not committed: run by hand, `w3c` or `guards` checks
+that commit, not the working tree (only the gate's own shell scripts and checker start from it).
 
 **The passes.** One harness for every side: the head's fast suite (its cases, checks and
 generator); only the engine's binaries differ, each built by its own revision and toolchain
