@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import statistics
 import sys
@@ -1344,6 +1345,11 @@ MAIN = "a0020134c20a33eabe8ead0402f814585b9c7fd0"  # main
 MEASUREMENT_SIDES = HERE / "measurement-sides.toml"
 # All a measurement commit may change: the perf lab's sources.
 PERF_LAB = "crates/nrese-store/examples/"
+# The objects as stored, for every git call that decides what a side is built from or whether its
+# measurement ref may go: no replace ref stands another object in, no graft another parent.
+# release-gate.sh exports the same for a whole gate, so the check and the checkout it builds read
+# the same objects (PR #54 review: D1-D3, and fix check 1: a replace ref made after the check).
+STORED_OBJECTS = {"GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull}
 
 
 def measurement_table(path: Path = MEASUREMENT_SIDES) -> dict[str, dict]:
@@ -1364,25 +1370,19 @@ def measurement_sides(path: Path = MEASUREMENT_SIDES) -> dict[str, str]:
 def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str:
     """The commit a side is built and timed from: its revision, or its measurement commit. That
     commit's only parent is the revision, and it changes nothing outside the perf lab's sources:
-    the engine, its lockfile and its toolchain are the side's. Anything else is refused, and so is
-    a checkout that replaces objects."""
+    the engine, its lockfile and its toolchain are the side's. Anything else is refused. It reads
+    the objects as stored (STORED_OBJECTS), as the gate's checkout does."""
     import subprocess
 
     def git(*args: str) -> str:
         # Bytes git doesn't promise as UTF-8 (a commit message in another encoding, a path) stay
         # readable (Sol, PR #54 R1 fix review r3 D4).
         done = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, encoding="utf-8",
-                              errors="surrogateescape", timeout=60)
+                              errors="surrogateescape", timeout=60, env={**os.environ, **STORED_OBJECTS})
         if done.returncode != 0:
             raise SystemExit(f"git {' '.join(args)}: {done.stderr.strip()}")
         return done.stdout
     rev = git("rev-parse", "--verify", f"{rev}^{{commit}}").strip()
-    # A replace ref stands other objects in for the stored ones, in this check or in the checkout a
-    # build compiles: neither would be the commit checked (Sol, PR #54 R1 fix review D1, D2).
-    replaced = git("replace", "-l").split()
-    if replaced:
-        raise SystemExit(f"this checkout replaces objects ({', '.join(r[:12] for r in replaced)}): a side is built "
-                         "only from its objects as stored")
     sides = measurement_sides() if sides is None else sides
     # A measurement commit is built only as its side's, under one name (its build is the side's).
     of = [side for side, commit in sides.items() if commit == rev]
@@ -1426,12 +1426,14 @@ def measurement_ref(repo: str, ref: str, commit: str, path: Path = MEASUREMENT_S
     import subprocess
     # The ref's push sends its side's history along, so only a side that is already out may go (T0,
     # 28 Oct 2026: main's and v1.5's sides were ids from before the history rewrite, on no remote).
+    stored = {**os.environ, **STORED_OBJECTS}
     published = subprocess.run(["git", "-C", repo, "for-each-ref", "--count=1", "--format=%(refname)",
-                                "--contains", rev, "refs/remotes"], capture_output=True, text=True, timeout=60)
+                                "--contains", rev, "refs/remotes"], capture_output=True, text=True, timeout=60,
+                               env=stored)
     if published.returncode != 0 or not published.stdout.strip():
         raise SystemExit(f"{ref}: its side {rev[:12]} is on no remote ref: the side must be published")
     done = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", f"{commit}^{{commit}}"],
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, text=True, timeout=60, env=stored)
     if done.returncode != 0 or done.stdout.strip() != table[rev]["commit"]:
         raise SystemExit(f"{ref}: pushes {commit[:12]}, but {path.name} declares {table[rev]['commit'][:12]}")
     if measured_at(repo, rev, {rev: table[rev]["commit"]}) != table[rev]["commit"]:

@@ -48,6 +48,10 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export PATH=$HOME/.cargo/bin:$PATH
+# Every git call of a gate reads the objects as stored, from the measurement check (release_gate.py
+# measured-at, STORED_OBJECTS) to the checkout a build compiles and its identity: no replace ref,
+# made before the check or after it, stands another object in, and no graft another parent.
+export GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null
 GATE=${NRESE_GATE_DIR:-$HOME/owlrs/${GATE_NAME:-gate-v2}}
 # Binaries by build identity, shared by every gate (v1.5's and main's are built once):
 # published whole, never replaced (scripts/lib/gate-publish.sh).

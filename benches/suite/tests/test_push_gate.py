@@ -435,6 +435,23 @@ class MeasurementRefs(Repo):
         self.assertIn("the side must be published", done.stdout + done.stderr)
         self.assertEqual(self.jobs(), [])
 
+    def test_a_graft_publishes_no_side(self):
+        """PR #54 fix check 1, the check's other walk: whether the side is on a remote ref was
+        asked of a history walk, which a graft changes; a graft putting an unpublished side under
+        the remote branch let its ref go, and the push would have published the side. The check
+        reads the objects as stored (release_gate.py STORED_OBJECTS)."""
+        unpublished = self.add({"a.txt": "only here\n"}, "a side no remote has", self.base)
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "its measurement side", unpublished)
+        self.git(self.repo, "checkout", "-q", "--detach", self.side)  # the push's own scripts, which base lacks
+        git_dir = Path(self.git(self.repo, "rev-parse", "--absolute-git-dir"))
+        (git_dir / "info").mkdir(exist_ok=True)
+        (git_dir / "info" / "grafts").write_text(f"{self.side} {unpublished}\n", encoding="utf-8")
+        ref = f"refs/measure/old-{unpublished[:8]}"
+        self.declare(unpublished, ref, commit)
+        done = self.pushed(ref, commit)
+        self.assertNotEqual(done.returncode, 0, f"SPEC measurement ref: a grafted side went\n{done.stderr}")
+        self.assertIn("the side must be published", done.stdout + done.stderr)
+
 
 @unittest.skipUnless(shutil.which("flock"), "the gate job runs on Linux fleet hosts (flock)")
 class GateJob(Repo):
