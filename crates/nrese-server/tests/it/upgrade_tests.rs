@@ -17,8 +17,10 @@
 //! backup restoring.
 
 use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use nrese_reasoner::rulesets::Ruleset;
@@ -44,63 +46,206 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The configuration `make.sh` gave main, on a free port, over `data`.
-fn configure(dir: &Path, data: &Path) -> std::io::Result<(PathBuf, String)> {
-    let port = std::net::TcpListener::bind("127.0.0.1:0")?
-        .local_addr()?
-        .port();
+/// The longest a server may take to open main's store and say where it listens.
+const START: Duration = Duration::from_secs(120);
+/// The longest one request to the server may take.
+const REQUEST: Duration = Duration::from_secs(120);
+/// The longest `nrese-server restore` may take.
+const RESTORE: Duration = Duration::from_secs(300);
+/// The longest `nrese-server query` may take, its inferences brought up to date first.
+const QUERY: Duration = Duration::from_secs(300);
+
+/// The configuration `make.sh` gave main, over `data`, on port 0: the server binds a free
+/// port and says which.
+fn configure(dir: &Path, data: &Path) -> std::io::Result<PathBuf> {
     let data = data.display().to_string().replace('\\', "/");
-    let file = dir.join(format!("config-{port}.toml"));
+    let file = dir.join("config.toml");
     std::fs::write(
         &file,
         format!(
-            "[server]\nbind_addr = \"127.0.0.1:{port}\"\ndeployment_posture = \"internal-authenticated\"\n\
+            "[server]\nbind_addr = \"127.0.0.1:0\"\ndeployment_posture = \"internal-authenticated\"\n\
              [store]\nmode = \"on-disk\"\ndata_dir = \"{data}\"\nwal_archive = true\n\
              [reasoner]\nmode = \"owl2-rl\"\n\
              [auth]\nmode = \"bearer-static\"\n\
              [auth.bearer_static]\nadmin_token = \"{TOKEN}\"\nread_token = \"fixture-read\"\n"
         ),
     )?;
-    Ok((file, format!("http://127.0.0.1:{port}")))
+    Ok(file)
+}
+
+/// A process of this build's binary, killed and reaped when dropped. What it writes is
+/// kept for the failure messages, and its lines are passed on as they come.
+struct Process {
+    child: Child,
+    output: Arc<Mutex<String>>,
+    /// Closed once both its standard output and its standard error are.
+    lines: mpsc::Receiver<String>,
+}
+
+impl Process {
+    fn spawn(command: &mut Command) -> std::io::Result<Self> {
+        let mut child = command
+            // Plain log lines, without terminal colours.
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let output = Arc::<Mutex<String>>::default();
+        let (sender, lines) = mpsc::channel();
+        let stdout = child.stdout.take().expect("piped");
+        let stderr = child.stderr.take().expect("piped");
+        for stream in [
+            Box::new(stdout) as Box<dyn std::io::Read + Send>,
+            Box::new(stderr),
+        ] {
+            let output = Arc::clone(&output);
+            let sender = sender.clone();
+            std::thread::spawn(move || {
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { break };
+                    let mut kept = output.lock().unwrap_or_else(|p| p.into_inner());
+                    kept.push_str(&line);
+                    kept.push('\n');
+                    drop(kept);
+                    let _ = sender.send(line);
+                }
+            });
+        }
+        Ok(Self {
+            child,
+            output,
+            lines,
+        })
+    }
+
+    fn output(&self) -> String {
+        self.output
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// The first line `pick` takes, within `limit`; an error, with the output, if the
+    /// process ends first or nothing comes in time.
+    fn first_line<T>(
+        &mut self,
+        limit: Duration,
+        pick: impl Fn(&str) -> Option<T>,
+    ) -> Result<T, Box<dyn std::error::Error>> {
+        let until = Instant::now() + limit;
+        loop {
+            match self
+                .lines
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+            {
+                Ok(line) => {
+                    if let Some(found) = pick(&line) {
+                        return Ok(found);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    // Both streams closed: the process has ended.
+                    let status = self.child.wait()?;
+                    return Err(format!("ended ({status}):\n{}", self.output()).into());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(format!("nothing in {limit:?}:\n{}", self.output()).into());
+                }
+            }
+        }
+    }
+
+    /// Waits, within `limit`, for the process to end: its status and output.
+    fn finish(
+        mut self,
+        limit: Duration,
+    ) -> Result<(std::process::ExitStatus, String), Box<dyn std::error::Error>> {
+        let until = Instant::now() + limit;
+        loop {
+            match self
+                .lines
+                .recv_timeout(until.saturating_duration_since(Instant::now()))
+            {
+                Ok(_) => {}
+                // Both streams closed: the process has ended.
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Ok((self.child.wait()?, self.output()));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(format!("still running after {limit:?}:\n{}", self.output()).into());
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// This build's server, stopped (by its own handle) when dropped.
 struct Server {
-    child: Child,
+    process: Process,
     url: String,
     http: reqwest::Client,
 }
 
 impl Server {
-    async fn start(config: &Path, url: String) -> Result<Self, Box<dyn std::error::Error>> {
-        let child = Command::new(env!("CARGO_BIN_EXE_nrese-server"))
-            .arg("--config")
-            .arg(config)
-            .env("RUST_LOG", "warn")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-        let server = Self {
-            child,
-            url,
-            http: reqwest::Client::new(),
-        };
-        let started = Instant::now();
-        loop {
-            if let Ok(response) = server
-                .http
-                .get(format!("{}/readyz", server.url))
-                .send()
-                .await
-                && response.status().is_success()
-            {
-                return Ok(server);
-            }
-            if started.elapsed() > Duration::from_secs(120) {
-                return Err("the server didn't become ready in 120 s".into());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    /// Starts the server with `config` and waits for the address it reports once it
+    /// serves, then for it to answer ready there.
+    async fn start(config: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut process = Process::spawn(
+            Command::new(env!("CARGO_BIN_EXE_nrese-server"))
+                .arg("--config")
+                .arg(config)
+                .env("RUST_LOG", "warn,nrese_server=info"),
+        )?;
+        let address = process
+            .first_line(START, |line| {
+                line.contains("nrese-server bootstrap complete")
+                    .then(|| {
+                        line.split_whitespace()
+                            .find_map(|field| field.strip_prefix("bind_address="))
+                            .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+                    })
+                    .flatten()
+            })
+            .map_err(|error| format!("the server reported no address: {error}"))?;
+        if address.port() == 0 {
+            return Err(format!(
+                "the server reported its configured address ({address}), not the one it bound:\n{}",
+                process.output()
+            )
+            .into());
         }
+        let server = Self {
+            process,
+            url: format!("http://{address}"),
+            http: reqwest::Client::builder().timeout(REQUEST).build()?,
+        };
+        let ready = server
+            .http
+            .get(format!("{}/readyz", server.url))
+            .send()
+            .await
+            .map_err(|error| server.failed(&format!("/readyz: {error}")))?;
+        if !ready.status().is_success() {
+            return Err(server.failed(&format!("/readyz: {}", ready.status())));
+        }
+        Ok(server)
+    }
+
+    /// `what` failed, with what the server wrote.
+    fn failed(&self, what: &str) -> Box<dyn std::error::Error> {
+        format!(
+            "{what}\n--- the server's output:\n{}",
+            self.process.output()
+        )
+        .into()
     }
 
     async fn get(&self, path: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -109,11 +254,15 @@ impl Server {
             .get(format!("{}{path}", self.url))
             .bearer_auth(TOKEN)
             .send()
-            .await?;
+            .await
+            .map_err(|error| self.failed(&format!("GET {path}: {error}")))?;
         let status = response.status();
-        let text = response.text().await?;
+        let text = response
+            .text()
+            .await
+            .map_err(|error| self.failed(&format!("GET {path}: {error}")))?;
         if !status.is_success() {
-            return Err(format!("GET {path}: {status} {text}").into());
+            return Err(self.failed(&format!("GET {path}: {status} {text}")));
         }
         Ok(text)
     }
@@ -131,11 +280,15 @@ impl Server {
             .header("Accept", "text/tab-separated-values")
             .form(&[("query", query)])
             .send()
-            .await?;
+            .await
+            .map_err(|error| self.failed(&format!("{repo}: {query}: {error}")))?;
         let status = response.status();
-        let text = response.text().await?;
+        let text = response
+            .text()
+            .await
+            .map_err(|error| self.failed(&format!("{repo}: {query}: {error}")))?;
         if !status.is_success() {
-            return Err(format!("{repo}: {query}: {status} {text}").into());
+            return Err(self.failed(&format!("{repo}: {query}: {status} {text}")));
         }
         Ok(sorted(&text))
     }
@@ -148,18 +301,12 @@ impl Server {
             .header("Content-Type", "application/sparql-update")
             .body(update.to_owned())
             .send()
-            .await?;
+            .await
+            .map_err(|error| self.failed(&format!("{repo}: {update}: {error}")))?;
         if !response.status().is_success() {
-            return Err(format!("{repo}: {update}: {}", response.status()).into());
+            return Err(self.failed(&format!("{repo}: {update}: {}", response.status())));
         }
         Ok(())
-    }
-}
-
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
     }
 }
 
@@ -276,8 +423,8 @@ async fn a_store_written_by_main_opens_with_its_data_answers_and_settings()
                 )
             })
             .collect();
-    let (config, url) = configure(dir.path(), &data)?;
-    let server = Server::start(&config, url).await?;
+    let config = configure(dir.path(), &data)?;
+    let server = Server::start(&config).await?;
 
     // The data, with the WAL tail main never checkpointed.
     let ready: serde_json::Value = serde_json::from_str(&server.get("/readyz").await?)?;
@@ -360,8 +507,7 @@ async fn a_store_written_by_main_opens_with_its_data_answers_and_settings()
         )
         .await?;
     drop(server);
-    let (config, url) = configure(dir.path(), &data)?;
-    let server = Server::start(&config, url).await?;
+    let server = Server::start(&config).await?;
     assert_eq!(
         server
             .query(
@@ -388,20 +534,18 @@ async fn an_image_backup_written_by_main_restores() -> Result<(), Box<dyn std::e
     let backup = dir.path().join("backup");
     copy_dir(&fixture().join("backup"), &backup)?;
     let data = dir.path().join("data");
-    let (config, url) = configure(dir.path(), &data)?;
-    let restored = Command::new(env!("CARGO_BIN_EXE_nrese-server"))
-        .arg("restore")
-        .arg(&backup)
-        .arg("--config")
-        .arg(&config)
-        .env("RUST_LOG", "warn")
-        .output()?;
-    assert!(
-        restored.status.success(),
-        "{}",
-        String::from_utf8_lossy(&restored.stderr)
-    );
-    let server = Server::start(&config, url).await?;
+    let config = configure(dir.path(), &data)?;
+    let (status, output) = Process::spawn(
+        Command::new(env!("CARGO_BIN_EXE_nrese-server"))
+            .arg("restore")
+            .arg(&backup)
+            .arg("--config")
+            .arg(&config)
+            .env("RUST_LOG", "warn"),
+    )?
+    .finish(RESTORE)?;
+    assert!(status.success(), "{status}:\n{output}");
+    let server = Server::start(&config).await?;
     // An image holds the store, not its namespaces (`ex:` of the `prefixed` query), in
     // main as here.
     same_answers(&server, Some("nrese"), &["prefixed"]).await
@@ -439,20 +583,17 @@ fn query_brings_a_closure_an_older_semantics_wrote_up_to_date()
         })?;
     }
     std::fs::write(data.join("reasoning.state"), VERSION_2)?;
-    let (config, _) = configure(dir.path(), &data)?;
-    let answered = Command::new(env!("CARGO_BIN_EXE_nrese-server"))
-        .arg("query")
-        .arg("--config")
-        .arg(&config)
-        .arg("ASK { <urn:C> <http://www.w3.org/2002/07/owl#equivalentClass> <urn:C> }")
-        .env("RUST_LOG", "warn")
-        .output()?;
-    assert!(
-        answered.status.success(),
-        "{}",
-        String::from_utf8_lossy(&answered.stderr)
-    );
-    let answer = String::from_utf8(answered.stdout)?;
-    assert!(answer.contains("true"), "{answer}");
+    let config = configure(dir.path(), &data)?;
+    let (status, output) = Process::spawn(
+        Command::new(env!("CARGO_BIN_EXE_nrese-server"))
+            .arg("query")
+            .arg("--config")
+            .arg(&config)
+            .arg("ASK { <urn:C> <http://www.w3.org/2002/07/owl#equivalentClass> <urn:C> }")
+            .env("RUST_LOG", "warn"),
+    )?
+    .finish(QUERY)?;
+    assert!(status.success(), "{status}:\n{output}");
+    assert!(output.contains("true"), "{output}");
     Ok(())
 }

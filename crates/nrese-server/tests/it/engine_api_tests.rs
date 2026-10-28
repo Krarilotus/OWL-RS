@@ -7,10 +7,11 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use tower::util::ServiceExt;
 
-use crate::support::{body_text, test_app_with_store_config};
+use crate::support::held_service::{HANG, HeldEndpoint};
+use crate::support::{body_text, test_app_with_store, test_app_with_store_config};
 use nrese_reasoner::ReasonerConfig;
-use nrese_server::policy::PolicyConfig;
-use nrese_store::StoreConfig;
+use nrese_server::policy::{PolicyConfig, RequestTimeouts};
+use nrese_store::{StoreConfig, StoreService};
 
 async fn send(
     app: &Router,
@@ -667,28 +668,24 @@ async fn graphs_are_listed_with_their_sizes() {
 /// an error instead of results.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn running_queries_are_listed_and_cancelled() {
-    let app = test_app_with_store_config(
-        StoreConfig::in_memory(),
-        PolicyConfig::default(),
-        ReasonerConfig::default(),
-    )
-    .unwrap();
-    let data: String = (0..300)
-        .map(|i| format!("<urn:s{i}> <urn:p> {i} . "))
-        .collect();
-    let (status, _) = send(
-        &app,
-        Method::POST,
-        "/api/v1/repositories/nrese/update",
-        Some("application/sparql-update"),
-        &format!("INSERT DATA {{ {data} }}"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    // 300³ rows, each compared: minutes, unless cancelled.
-    let slow = "SELECT (COUNT(*) AS ?n) WHERE { ?a <urn:p> ?x . ?b <urn:p> ?y . ?c <urn:p> ?z \
-                FILTER(?x + ?y != ?z * 1000) }";
-    let running = {
+    // A query held in a SERVICE call that never answers, under a deadline (an hour) this
+    // test never reaches: only the cancellation can stop it.
+    let endpoint = HeldEndpoint::bind().await.unwrap();
+    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+    store.set_service_client(endpoint.client().unwrap());
+    let policy = PolicyConfig {
+        timeouts: RequestTimeouts {
+            query: std::time::Duration::from_secs(3_600),
+            ..RequestTimeouts::default()
+        },
+        ..PolicyConfig::default()
+    };
+    let app = test_app_with_store(store, policy, ReasonerConfig::default()).unwrap();
+    let held = format!(
+        "SELECT * WHERE {{ SERVICE <{}> {{ ?s ?p ?o }} }}",
+        endpoint.url()
+    );
+    let mut running = {
         let app = app.clone();
         tokio::spawn(async move {
             send(
@@ -696,31 +693,28 @@ async fn running_queries_are_listed_and_cancelled() {
                 Method::POST,
                 "/api/v1/repositories/nrese/query",
                 Some("application/sparql-query"),
-                slow,
+                &held,
             )
             .await
         })
     };
-    let mut id = None;
-    for _ in 0..200 {
-        let (_, text) = send(
-            &app,
-            Method::GET,
-            "/api/v1/repositories/nrese/queries",
-            None,
-            "",
-        )
-        .await;
-        let list: serde_json::Value = serde_json::from_str(&text).unwrap();
-        if let Some(query) = list.as_array().unwrap().first() {
-            assert!(query["query"].as_str().unwrap().contains("COUNT(*)"));
-            assert_eq!(query["origin"], "roles: anonymous");
-            id = query["id"].as_u64();
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let id = id.expect("the query was listed while it ran");
+    // Registered before it is evaluated: listed once its SERVICE call has connected.
+    let call = endpoint.call(&mut running).await.unwrap();
+    let (_, text) = send(
+        &app,
+        Method::GET,
+        "/api/v1/repositories/nrese/queries",
+        None,
+        "",
+    )
+    .await;
+    let list: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let [query] = list.as_array().unwrap().as_slice() else {
+        panic!("one running query: {list}");
+    };
+    assert!(query["query"].as_str().unwrap().contains(endpoint.url()));
+    assert_eq!(query["origin"], "roles: anonymous");
+    let id = query["id"].as_u64().expect("an id");
     let (status, _) = send(
         &app,
         Method::DELETE,
@@ -730,11 +724,12 @@ async fn running_queries_are_listed_and_cancelled() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let (status, _) = tokio::time::timeout(std::time::Duration::from_secs(30), running)
+    let (status, _) = tokio::time::timeout(HANG, running)
         .await
         .expect("the cancelled query stops")
         .unwrap();
     assert!(!status.is_success(), "{status}");
+    call.closed().await.unwrap();
     let (_, text) = send(
         &app,
         Method::GET,
