@@ -338,13 +338,21 @@ class OneVerdictPerQuery(unittest.TestCase):
                 "compete": compete.verdicts(summary)["other"]["query_winner"] == "other"}
 
     def test_the_worst_record_of_a_query_decides_in_either_order(self):
-        # `match`: answers.json's ok before 12 Oct, in a run pooled with a newer one.
-        for failure, passed, order in itertools.product(("wrong", "incomplete"), ("ok", "match"),
-                                                        ("bad first", "bad last")):
-            runs = [[(failure, "queries/q1.rq")], [(passed, "queries/q1.rq")]]
-            with self.subTest(failure=failure, passed=passed, order=order):
-                got = self.timed(f"{failure}-{passed}-{order}", "q1", runs if order == "bad first" else runs[::-1])
+        for failure, order in itertools.product(("wrong", "incomplete"), ("bad first", "bad last")):
+            runs = [[(failure, "queries/q1.rq")], [("ok", "queries/q1.rq")]]
+            with self.subTest(failure=failure, order=order):
+                got = self.timed(f"{failure}-{order}", "q1", runs if order == "bad first" else runs[::-1])
                 self.assertEqual(got, dict.fromkeys(self.REPORTS, False), "SPEC a later ok hides no fault")
+
+    def test_a_verdict_the_contract_doesnt_know_is_not_timed(self):
+        # answers.json before 12 Oct named an answer match or mismatch (a wrong one): timing fails
+        # closed on a name it doesn't know, alone or beside an ok record (PR #56 fix round 2, F6).
+        mismatch, ok = ("mismatch", "queries/q1.rq"), ("ok", "queries/q1.rq")
+        for name, runs in (("mismatch", [[mismatch]]), ("mismatch-then-ok", [[mismatch], [ok]]),
+                           ("ok-then-mismatch", [[ok], [mismatch]]), ("match", [[("match", "queries/q1.rq")]])):
+            with self.subTest(records=name):
+                self.assertEqual(self.timed(name, "q1", runs), dict.fromkeys(self.REPORTS, False),
+                                 "SPEC a verdict the contract doesn't know earns no time")
 
     def test_a_query_file_ending_in_rq_twice_joins_its_result_id(self):
         for verdict, timed in (("wrong", False), ("incomplete", False), ("ok", True)):

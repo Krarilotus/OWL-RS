@@ -84,9 +84,10 @@ UNSUPPORTED = re.compile(r"unsupported|not supported|not implemented", re.I)
 PRECEDENCE = ("wrong", "unqualified", "deviates", "incomplete", "unsupported", "reference", "ok")
 # Those a group names its systems for.
 FAULTS = PRECEDENCE[:5]
-# Those whose time no report takes: not the reference's answer, or not known to be (a capture
-# that failed after the timed runs included: incomplete).
-UNTIMED = FAULTS
+# The only ones whose time a report takes: the reference's answer and one shown to be it. No
+# other is (a capture that failed after the timed runs included: incomplete), nor a name this
+# module doesn't know (answers.json before 12 Oct: match, mismatch).
+TIMED = PRECEDENCE[len(FAULTS):]
 # An answer incomplete because no reference answered: nobody checked it.
 UNCHECKED = "unchecked"
 # A query its run recorded no verdict for, though it recorded some for the query's workload,
@@ -116,21 +117,22 @@ def worst_verdict(entries) -> dict:
     """The worst of verdicts on one thing, whatever their order: a system's on a query over its
     captures (Recorder.verdict), a query's over its records (TimingVerdicts). PRECEDENCE first;
     of two incomplete ones, a fault before one no reference checked; a name PRECEDENCE doesn't
-    know (answers.json before 12 Oct: match, mismatch) after all, so it hides no fault it knows
-    (Sol, PR #56 fix round 2)."""
-    def rank(entry: dict) -> tuple[int, bool]:
+    know (answers.json before 12 Oct: match, mismatch) right after the faults: untimed, so an ok
+    beside it doesn't hide it, and no fault it knows hides behind it (PR #56 fix round 2)."""
+    def rank(entry: dict) -> tuple[int, int, bool]:
         verdict = entry["verdict"]
-        return (PRECEDENCE.index(verdict) if verdict in PRECEDENCE else len(PRECEDENCE),
-                timing_verdict(entry) == UNCHECKED)
+        place = (PRECEDENCE.index(verdict), 0) if verdict in PRECEDENCE else (len(FAULTS), -1)
+        return (*place, timing_verdict(entry) == UNCHECKED)
     return min(entries, key=rank)
 
 
 def timed(verdict: str | None) -> bool:
-    """Whether a query's time may count with this answer verdict (TimingVerdicts.of): not one
-    of UNTIMED, not unchecked, since an answer nobody checked earns no time, and not missing
-    (T8 PR #56 R3). The reports that time (compare, versus, compete) decide it here. No verdict
-    at all (answers not captured) leaves it to the answer counts, as before."""
-    return verdict is None or (verdict not in UNTIMED and verdict not in (UNCHECKED, MISSING))
+    """Whether a query's time may count with this answer verdict (TimingVerdicts.of): only one
+    of TIMED. A fault, unchecked (an answer nobody checked), missing and a name this module
+    doesn't know earn none: it fails closed (T8 PR #56 R3). The reports that time (compare,
+    versus, compete) decide it here. No verdict at all (answers not captured) leaves it to the
+    answer counts, as before."""
+    return verdict is None or verdict in TIMED
 
 
 class TimingVerdicts:
