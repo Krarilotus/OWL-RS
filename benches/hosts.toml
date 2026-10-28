@@ -109,7 +109,8 @@ scratch = "S:/nrese-scratch: at most 1 TB, emptied the same day"
 # any day never while the console session isn't idle: scripts/hosts/khaleesi-guard.py
 # (Task Scheduler, every minute) writes the retreat file and stops a running timed job, its
 # partial results kept. The runner is a scheduled task too (pythonw queue.py work --log).
-queue = { dir = "S:/nrese-scratch/queue", repo = "S:/nrese-scratch/repo.git", results = "S:/nrese-scratch/results", windows = ["04:30-21:30"], weekend_windows = ["00:00-24:00"], retreat = "S:/nrese-scratch/RETREAT", keep = "same-day", python = "python", receive_pack = "powershell -NoProfile -Command git-receive-pack" }
+# free: the owner's FREE-UNTIL, which the guard reads (while it holds, nobody counts as present).
+queue = { dir = "S:/nrese-scratch/queue", repo = "S:/nrese-scratch/repo.git", results = "S:/nrese-scratch/results", windows = ["04:30-21:30"], weekend_windows = ["00:00-24:00"], retreat = "S:/nrese-scratch/RETREAT", free = "S:/nrese-scratch/FREE-UNTIL", keep = "same-day", python = "python", receive_pack = "powershell -NoProfile -Command git-receive-pack" }
 
 [[host.khaleesi.config]]
 since = "2026-10-12"
