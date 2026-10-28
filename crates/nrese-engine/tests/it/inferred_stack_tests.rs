@@ -708,3 +708,52 @@ fn a_canonical_view_counts_a_statement_renamed_onto_an_asserted_one_once() {
     assert_eq!(stored.count_in(model, &in_g), 2, "stored");
     assert_eq!(stored.quads_for_pattern_in(model, &in_g).count(), 2);
 }
+
+/// Columns of both stacks, merged, come in the order [`Snapshot::scan_sorted_in`] yields
+/// their quads, or not at all (the caller then reads quads): merged on the projected
+/// columns alone, rows whose order an unprojected column decides came out by the
+/// projected ones (review B-202). A projection that holds every varying column up to its
+/// last keeps the column read, through both entry points.
+#[test]
+fn merged_columns_keep_the_scan_order_or_are_refused() {
+    let engine = engine();
+    let (s1, s2, p, o1, o100) = (id(1), id(2), id(4), id(5), id(9));
+    let mut tx = engine.transaction();
+    assert!(tx.insert_encoded(EncodedTriple::new(s1, p, o100).in_default_graph()));
+    assert!(tx.insert_inferred(EncodedTriple::new(s2, p, o1)));
+    tx.commit().expect("commit");
+    let snapshot = engine.snapshot();
+    let model = ReadModel::Materialised;
+    let all = QuadPattern::all();
+    // In subject order the objects are o100, o1: the subject, not projected, decides.
+    let scanned: Vec<u64> = snapshot
+        .scan_sorted_in(model, &all, Permutation::Spog)
+        .expect("sorted scan")
+        .map(|q| q.object.raw())
+        .collect();
+    assert_eq!(scanned, [o100.raw(), o1.raw()]);
+    let columns = snapshot.scan_columns_in(model, &all, Permutation::Spog, &[2]);
+    assert!(
+        columns.as_ref().is_none_or(|c| c[0] == scanned),
+        "columns {columns:?}, scan {scanned:?}"
+    );
+    let ranged = snapshot.scan_range_columns_in(model, &all, Permutation::Spog, s1, s2, &[2]);
+    assert!(
+        ranged.as_ref().is_none_or(|c| c[0] == scanned),
+        "range columns {ranged:?}, scan {scanned:?}"
+    );
+    // The predicate bound, the object is the first varying column: merged on it.
+    let by_predicate = QuadPattern {
+        predicate: Some(p),
+        ..QuadPattern::all()
+    };
+    let in_order = vec![vec![o1.raw(), o100.raw()]];
+    assert_eq!(
+        snapshot.scan_columns_in(model, &by_predicate, Permutation::Posg, &[2]),
+        Some(in_order.clone())
+    );
+    assert_eq!(
+        snapshot.scan_range_columns_in(model, &by_predicate, Permutation::Posg, o1, o100, &[2]),
+        Some(in_order)
+    );
+}
