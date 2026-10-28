@@ -663,6 +663,90 @@ fn find_close(s: &str, open: usize) -> Option<usize> {
     None
 }
 
+/// `&&` and `||` as the n-ary operators they are: every `And(…)` and `Or(…)` nest becomes
+/// `All[…]` and `Any[…]` of its operands in order. Both are associative in SPARQL's logic of
+/// true, false and error; nrese builds them as balanced trees (`Expression::balanced`,
+/// ADR-0012) where spargebra folds them left, and parentheses group them either way: the
+/// tree's shape is no difference.
+fn flatten_logic(debug: &str) -> String {
+    let mut out = String::with_capacity(debug.len());
+    let (mut i, mut in_string, mut escaped) = (0, false, false);
+    while let Some(c) = debug[i..].chars().next() {
+        if in_string {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_string = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            in_string = true;
+        } else if let Some(op) = ["And(", "Or("]
+            .into_iter()
+            .find(|op| debug[i..].starts_with(op))
+            && debug[..i]
+                .chars()
+                .next_back()
+                .is_none_or(|before| !(before.is_alphanumeric() || before == '_'))
+        {
+            let open = i + op.len() - 1;
+            let close = find_close(debug, open).expect("a closed bracket");
+            let mut operands = Vec::new();
+            splice(&debug[open + 1..close], op, &mut operands);
+            out.push_str(if op == "And(" { "All[" } else { "Any[" });
+            out.push_str(&operands.join(", "));
+            out.push(']');
+            i = close + 1;
+            continue;
+        }
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+/// The operands of an `op` node from its two arguments: an argument that is itself an `op`
+/// node gives its own operands, any other is one operand (flattened within).
+fn splice(arguments: &str, op: &str, operands: &mut Vec<String>) {
+    for argument in top_level(arguments) {
+        let argument = argument.trim();
+        let whole = find_close(argument, op.len() - 1) == Some(argument.len() - 1);
+        match argument.strip_prefix(op) {
+            Some(inner) if whole => splice(&inner[..inner.len() - 1], op, operands),
+            _ => operands.push(flatten_logic(argument)),
+        }
+    }
+}
+
+/// The comma-separated parts of a call's inside, at its top level.
+fn top_level(inside: &str) -> Vec<&str> {
+    let (mut depth, mut in_string, mut escaped, mut start) = (0, false, false, 0);
+    let mut parts = Vec::new();
+    for (i, c) in inside.char_indices() {
+        if in_string {
+            match (escaped, c) {
+                (true, _) => escaped = false,
+                (false, '\\') => escaped = true,
+                (false, '"') => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&inside[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&inside[start..]);
+    parts
+}
+
 /// The repository's own queries and updates (`.rq`, `.ru` under `crates`, `benches` and
 /// `docs`): its name relative to the repository, its path. A directory that can't be read
 /// fails the test.
@@ -689,6 +773,23 @@ fn repository() -> Vec<(String, PathBuf)> {
     }
     files.sort();
     files
+}
+
+/// Where two normalised algebras part: after how many characters, and each from shortly
+/// before that point.
+fn divergence(ours: &str, theirs: &str) -> String {
+    let same = ours
+        .chars()
+        .zip(theirs.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let start = same.saturating_sub(120);
+    let show = |algebra: &str| algebra.chars().skip(start).take(600).collect::<String>();
+    format!(
+        "  they part after {same} characters\n  nrese:     ...{}\n  spargebra: ...{}",
+        show(ours),
+        show(theirs)
+    )
 }
 
 fn file_iri(path: &Path) -> String {
@@ -725,6 +826,8 @@ fn every_query_parses_to_the_same_algebra() {
             (name, path, bytes)
         }));
     let mut outcome: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    // The two normalised algebras of each file whose algebra differs, for the report.
+    let mut algebras: BTreeMap<String, (String, String)> = BTreeMap::new();
     for (name, path, bytes) in inputs {
         // Neither parser reads bytes: a file that isn't UTF-8 is counted, not compared.
         let Ok(text) = String::from_utf8(bytes) else {
@@ -761,9 +864,12 @@ fn every_query_parses_to_the_same_algebra() {
         };
         let key = match (ours, theirs) {
             (Ok(a), Ok(b)) => {
-                if normalised(&fold_signs(a)) == normalised(&fold_signs(b)) {
+                let canonical = |debug: String| normalised(&flatten_logic(&fold_signs(debug)));
+                let (a, b) = (canonical(a), canonical(b));
+                if a == b {
                     "same algebra"
                 } else {
+                    algebras.insert(name.clone(), (a, b));
                     "different algebra"
                 }
             }
@@ -791,7 +897,10 @@ fn every_query_parses_to_the_same_algebra() {
         .filter(|(k, _)| !matches!(**k, "same algebra" | "both reject" | "not UTF-8"))
         .flat_map(|(key, files)| files.iter().map(move |file| (key, file)))
         .filter(|(key, file)| !explained(file, key))
-        .map(|(key, file)| format!("{file}: {key}"))
+        .map(|(key, file)| match algebras.get(file.as_str()) {
+            Some((ours, theirs)) => format!("{file}: {key}\n{}", divergence(ours, theirs)),
+            None => format!("{file}: {key}"),
+        })
         .collect();
     let unseen: Vec<String> = if suites.is_empty() {
         Vec::new()
@@ -808,7 +917,8 @@ fn every_query_parses_to_the_same_algebra() {
     };
     assert!(
         unexplained.is_empty() && unseen.is_empty(),
-        "unexplained differences: {unexplained:#?}\nexplained but not seen so: {unseen:#?}"
+        "unexplained differences:\n{}\nexplained but not seen so: {unseen:#?}",
+        unexplained.join("\n")
     );
 }
 
