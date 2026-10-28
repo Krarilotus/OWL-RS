@@ -127,7 +127,7 @@ class Abba(unittest.TestCase):
     def test_a_family_may_name_its_sides_by_short_ids(self):
         """lcp-passes (21 Oct 2026): sides named by 8 digits got "no verdict" on every pass of a
         complete run, the passes recording the full revisions. The sides are revisions every
-        checkout has (test_fixed_revisions.py)."""
+        checkout has: fixed ids from before the 26 Oct rewrite are gone from pruned hosts."""
         a, b = (abba.git("rev-parse", rev) for rev in ("HEAD", "HEAD^"))
         self.path.write_text(FAMILY.replace(A, a[:8]).replace(B, b[:8]), encoding="utf-8")
         family = abba.load_family(self.path)
