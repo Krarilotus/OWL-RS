@@ -11,7 +11,8 @@ use anyhow::{Result, bail};
 /// the same data directory; the engine's directory lock enforces that); statements it can't
 /// read are quarantined, or with `--strict` stop it (`store.invalid_statements`);
 /// `nrese-server query [--config PATH] [--format F] (QUERY | --file PATH)` answers one query
-/// from the configured store on standard output (the same lock);
+/// from the configured store on standard output (the same lock), its inferences first
+/// brought up to date as the server's start does;
 /// `nrese-server print-query [--config PATH] [--form paths|values] [--schema FILE]...
 /// (QUERY | --file PATH)` prints the query as standard SPARQL 1.1 that answers, on a store
 /// without reasoning holding the same statements, as NRESE answers it under `owl2-rl` with

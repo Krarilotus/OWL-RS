@@ -406,3 +406,53 @@ async fn an_image_backup_written_by_main_restores() -> Result<(), Box<dyn std::e
     // main as here.
     same_answers(&server, Some("nrese"), &["prefixed"]).await
 }
+
+/// `nrese-server query` reads inferences, so on a store whose closure an older semantics
+/// version wrote it brings them up to date first, as the server's start does (it answered
+/// from that closure: PR #58, lane M's sol-loop). The store: `C rdfs:subClassOf C` and a
+/// closure without `C owl:equivalentClass C` (materialised first, the axiom bulk-loaded
+/// after, which doesn't maintain the inferred stack), and the marker version 2 wrote,
+/// pinned as written (nrese-store's `reasoning_state` test, tests audit DC-09).
+#[test]
+fn query_brings_a_closure_an_older_semantics_wrote_up_to_date()
+-> Result<(), Box<dyn std::error::Error>> {
+    const VERSION_2: &str =
+        "ruleset owl2-rl\nfingerprint 9ba81328ee5cf5c7\nviolations 0\nlists nil-class\n";
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("data");
+    {
+        let store = nrese_store::StoreService::new(nrese_store::StoreConfig::on_disk(&data))?;
+        let rules = nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl)
+            .materialised_program()
+            .expect("rules");
+        store.rematerialise(&rules)?;
+        let axiom = dir.path().join("axiom.nt");
+        std::fs::write(
+            &axiom,
+            "<urn:C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:C> .\n",
+        )?;
+        store.bulk_load(&nrese_store::BulkLoadRequest {
+            files: vec![axiom],
+            replace: false,
+            graph: nrese_store::GraphTarget::DefaultGraph,
+            invalid: None,
+        })?;
+    }
+    std::fs::write(data.join("reasoning.state"), VERSION_2)?;
+    let (config, _) = configure(dir.path(), &data)?;
+    let answered = Command::new(env!("CARGO_BIN_EXE_nrese-server"))
+        .arg("query")
+        .arg("--config")
+        .arg(&config)
+        .arg("ASK { <urn:C> <http://www.w3.org/2002/07/owl#equivalentClass> <urn:C> }")
+        .env("RUST_LOG", "warn")
+        .output()?;
+    assert!(
+        answered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+    let answer = String::from_utf8(answered.stdout)?;
+    assert!(answer.contains("true"), "{answer}");
+    Ok(())
+}
