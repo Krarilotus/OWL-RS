@@ -10,6 +10,8 @@ from __future__ import annotations
 import contextlib
 import csv
 import io
+import itertools
+import json
 import sys
 import tempfile
 import unittest
@@ -99,6 +101,27 @@ class Contracts(unittest.TestCase):
         self.assertIn("1 not comparable", text)
         text = output(report.main, [str(new)])
         self.assertNotIn("| 1.0 |", text)
+
+    def test_an_answer_the_contract_doesnt_time_enters_no_speed_verdict(self):
+        """T8 PR #56 (Sol's fix review, P2): the run comparison took a query's time on its CSV
+        status alone and read answers.json only for a verdict that changed, so a query wrong in
+        both runs, by the same row count, came out faster. answers.timed decides, as for versus
+        and compete: a wrong or unchecked answer earns no time."""
+        # Sol, PR #56 compare r1: an item is its query's name already; a dotted one (geographica2's
+        # synthetic tier) keeps its dots, or no verdict is found and the time counts.
+        for (verdict, note), item in itertools.product((("wrong", ""), ("incomplete", "no reference answered")),
+                                                       ("q1", "00-Synthetic_Selection_Intersects_1_1.0")):
+            with self.subTest(verdict=verdict, item=item):
+                runs = []
+                for name, ms in (("base", 100), ("new", 1)):
+                    path = write(self.dir / verdict / item / name, [load(), query(item, ms)])
+                    (path.parent / "answers.json").write_text(json.dumps({"verdicts": [
+                        {"workload": "w", "tier": "t", "regime": "none", "query": f"queries/{item}.rq",
+                         "system": "nrese", "verdict": verdict, "note": note}]}), encoding="utf-8")
+                    runs.append(str(path))
+                text = output(compare.main, runs)
+                self.assertIn("0 faster", text, "SPEC answer contract: no time from an answer it doesn't time")
+                self.assertIn("1 not comparable", text)
 
     def test_b4_report_and_compare_estimate_alike(self):
         rows = [load(1), load(2), load(3)]

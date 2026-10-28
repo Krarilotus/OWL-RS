@@ -43,6 +43,7 @@ import statistics
 from pathlib import Path
 
 from . import hosts
+from .answers import query_name, timed as answer_timed, timing_verdict
 from .schema import read
 from .summary import Item, Pair, estimate, summarise
 
@@ -560,14 +561,14 @@ def manifest_identities(paths: list[Path]) -> list[dict | None]:
 
 
 def verdicts(paths: list[Path]) -> dict[tuple, str]:
-    """(workload, tier, regime, query, system) -> its answer verdict, from the answers.json
-    beside each results file."""
+    """(workload, tier, regime, query file stem, system) -> its answer verdict as timing reads it
+    (answers.timing_verdict), from the answers.json beside each results file."""
     out = {}
     for path in dict.fromkeys(p.resolve() for p in paths):
         answers = path.parent / "answers.json"
         if answers.exists():
             for v in json.loads(answers.read_text(encoding="utf-8")).get("verdicts", []):
-                out[(v["workload"], v["tier"], v["regime"], v["query"], v["system"])] = v["verdict"]
+                out[(v["workload"], v["tier"], v["regime"], query_name(v["query"]), v["system"])] = timing_verdict(v)
     return out
 
 
@@ -666,6 +667,16 @@ def compare_pairs(base: dict[tuple, Pair], new: dict[tuple, Pair], threshold: fl
                     out.add("Answers and completeness",
                             f"- {title}: {name}{label}: answers differ between systems in the new run (disputed)")
                 if not (eligible(ib, name, b) and eligible(inn, name, n)):
+                    totals["not comparable"] += 1
+                    continue
+                # An answer the contract doesn't time earns no time, in either run: wrong,
+                # unchecked or another fault, also where the verdict didn't change (T8 PR #56).
+                answer = {run: found.get((key[0], key[1], pair.regime, query_name(name), key[2]))
+                          for run, pair, found in (("base", b, answers[0]), ("new", n, answers[1]))}
+                untimed = [f"{a} in the {run} run" for run, a in answer.items() if not answer_timed(a)]
+                if untimed:
+                    out.add("Answers and completeness", f"- {title}: {name}{label}: not timed, its answer "
+                            + " and ".join(untimed))
                     totals["not comparable"] += 1
                     continue
                 sb, sn = ib.estimate(), inn.estimate()

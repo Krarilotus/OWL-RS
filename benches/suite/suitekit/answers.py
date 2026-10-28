@@ -91,6 +91,14 @@ UNTIMED = FAULTS
 UNCHECKED = "unchecked"
 
 
+def query_name(name: str) -> str:
+    """A query as answers.json and the results' items both name it, the key every timing report
+    matches them by: its file's name without a directory and without `.rq`. An item is that
+    already, and a dotted one keeps its dots (geographica2's `…_1_1.0`; Sol, PR #56 compare r1)."""
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    return name[:-3] if name.endswith(".rq") else name
+
+
 def timing_verdict(entry: dict) -> str:
     """A system's verdict on a query (Recorder.verdicts) as timing reads it: `unchecked` where
     it is incomplete because no reference answered (the answer may be right; nothing showed it),

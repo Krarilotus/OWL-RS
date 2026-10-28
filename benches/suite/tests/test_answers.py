@@ -70,6 +70,16 @@ class Levels(unittest.TestCase):
         self.assertEqual(wrong, [], "SPEC answer contract (rule.owl-rs-answer-comparison)")
 
 
+class QueryNames(unittest.TestCase):
+    def test_a_query_is_named_alike_from_its_file_and_from_a_results_item(self):
+        """Every timing report matches answers.json's verdicts to the results' items by
+        answers.query_name: a file loses its directory and .rq, an item stays as it is, dots kept
+        (Sol, PR #56 compare r1: geographica2's `…_1_1.0` lost its `.0` and found no verdict)."""
+        dotted = "00-Synthetic_Selection_Intersects_1_1.0"
+        self.assertEqual([answers.query_name(n) for n in (f"queries/{dotted}.rq", dotted, "q1.rq", "q1")],
+                         [dotted, dotted, "q1", "q1"], "SPEC one name per query")
+
+
 class OracleCompare(unittest.TestCase):
     """benches/oracle/compare.py (NRESE against Jena on the differential tests' queries) compares
     terms through the contract: its own integer folding and 18-digit decimal truncation agreed
