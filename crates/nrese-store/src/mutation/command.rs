@@ -172,6 +172,9 @@ pub struct UpdateContext<'a> {
     /// The repository's namespaces: what a prefix an update uses without declaring it
     /// means (as for queries, [`crate::PreparedQuery::parse_with`]).
     pub(crate) namespaces: crate::NamespaceMap,
+    /// What a requester's `WHERE` clauses read ([`crate::support::Reading`], as its queries).
+    pub(crate) supports: Arc<crate::support::Supports>,
+    pub(crate) compilation: crate::support::Compilation,
 }
 
 impl UpdateContext<'_> {
@@ -197,12 +200,21 @@ impl UpdateContext<'_> {
 
     /// The options of a SPARQL update for `requester` over the `using` dataset: what a
     /// write lowered to SPARQL Update's algebra runs [`nrese_sparql::apply_update`] with,
-    /// the requester's graph access included.
+    /// the requester's graph access included, and what its `WHERE` clauses read: the data as
+    /// its queries read it, model and view ([`crate::support::Reading::of`]), its views
+    /// charged to the request's envelope and stopped by its cancellation.
     pub fn update_options(
         &self,
         requester: &crate::Requester,
         using: Option<nrese_sparql::QueryDatasetSpecification>,
     ) -> UpdateOptions {
+        let (read_model, read) = crate::support::Reading::of(
+            &self.supports,
+            self.compilation,
+            &requester.read,
+            &self.memory,
+            Some(self.cancellation),
+        );
         UpdateOptions {
             using,
             resources: self.resources(),
@@ -211,6 +223,8 @@ impl UpdateContext<'_> {
             access: requester.read.access().cloned(),
             writable: requester.write.access().cloned(),
             geosparql_stated_only: self.geosparql_stated_only,
+            read_model,
+            read: read.map(|read| Arc::new(read) as Arc<dyn nrese_sparql::ReadSource>),
         }
     }
 }
@@ -246,6 +260,7 @@ pub(crate) fn apply_sparql_update(
     let options = context.update_options(requester, using);
     // Its WHERE's memory refusal as its reader may be told it (`ReadScope::told`).
     requester.read.told(
+        crate::EntryPoint::UpdateWhere,
         apply_update(tx, &update, &options).map_err(|error| match error {
             nrese_sparql::UpdateError::Forbidden(graph) => crate::Refusal::Write(graph).into(),
             error => StoreError::from(error),

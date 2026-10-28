@@ -14,8 +14,10 @@
 //! `owl:Thing<TAB>super` for classes equivalent to `owl:Thing`, and prints the time and
 //! what was skipped, then, as its last line, the profile (`nrese_reasoner::classify::Profile`)
 //! as `name=value` pairs: the phases in milliseconds (reading and writing included) and the
-//! counters, which the DL lab records (`benches/reasoning/dl/nrese.py`). Omitted input
-//! returns an error before writing a taxonomy, so callers cannot record it as complete.
+//! counters, which the DL lab records (`benches/reasoning/dl/nrese.py`). An omitted class
+//! or property axiom returns an error before writing a taxonomy, so callers cannot record
+//! a partial one as complete; assertions about individuals are not read
+//! (`nrese_reasoner::classify`).
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufWriter, Write};

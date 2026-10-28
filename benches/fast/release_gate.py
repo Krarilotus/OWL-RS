@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import statistics
 import sys
@@ -203,7 +204,7 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
     if len(measures) > 1:
         errors.append("the passes measured with different calibrations (fast.py --measure)")
     # Every side's perf lab keeps its timed window alike (a thread started in it on one side
-    # only is a bias of microseconds: perf_lab_watchdog.py).
+    # only is a bias of microseconds: PROTOCOL.md §5, measurement-sides.toml).
     timings = {(p["report"].get("options") or {}).get("timing") for p in passes}
     if len(timings) > 1:
         errors.append("the sides' perf labs time differently: " + ", ".join(sorted(map(str, timings))))
@@ -1334,8 +1335,124 @@ def read_measure(text: str | None) -> dict:
 
 # --- the fleet jobs ----------------------------------------------------------------------------
 
-BASE = "0f465633d33374bc56ab9ec33157cfa10ebf2d40"  # v1.5, the last recorded run's base
-MAIN = "f9b515e81f013ecd8c3811f3e9c65e91450ee44c"  # main
+# Runs and notes from before 26 Oct 2026 name these sides by their ids before that day's history
+# rewrite, 0f465633 and f9b515e8: the same trees.
+BASE = "d348a8a1a9e40cd23381df1faa726d3ffa44948c"  # v1.5, the last recorded run's base
+MAIN = "a0020134c20a33eabe8ead0402f814585b9c7fd0"  # main
+
+# The sides measured at a reviewed commit on top of them (benches/PROTOCOL.md §5, "No thread
+# started in a timed window"): a side's revision → that commit.
+MEASUREMENT_SIDES = HERE / "measurement-sides.toml"
+# All a measurement commit may change: the perf lab's sources.
+PERF_LAB = "crates/nrese-store/examples/"
+# The objects as stored, for every git call that decides what a side is built from or whether its
+# measurement ref may go: no replace ref stands another object in, no graft another parent.
+# release-gate.sh exports the same for a whole gate, so the check and the checkout it builds read
+# the same objects (PR #54 review: D1-D3, and fix check 1: a replace ref made after the check).
+STORED_OBJECTS = {"GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull}
+
+
+def measurement_table(path: Path = MEASUREMENT_SIDES) -> dict[str, dict]:
+    """The sides table, by side. Sides and commits are full revisions: an abbreviated side would
+    miss the lookup by full revision, and its side would be built as itself (Sol, T0 refs r1 S1)."""
+    table = tomllib.loads(path.read_text(encoding="utf-8"))["side"]
+    full = re.compile(r"[0-9a-f]{40}")
+    bad = [rev for rev, side in table.items() if not full.fullmatch(rev) or not full.fullmatch(str(side.get("commit")))]
+    if bad:
+        raise SystemExit(f"{path.name}: a side and its commit are full revisions, not: {', '.join(bad)}")
+    return table
+
+
+def measurement_sides(path: Path = MEASUREMENT_SIDES) -> dict[str, str]:
+    return {rev: side["commit"] for rev, side in measurement_table(path).items()}
+
+
+def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str:
+    """The commit a side is built and timed from: its revision, or its measurement commit. That
+    commit's only parent is the revision, and it changes nothing outside the perf lab's sources:
+    the engine, its lockfile and its toolchain are the side's. Anything else is refused. It reads
+    the objects as stored (STORED_OBJECTS), as the gate's checkout does."""
+    import subprocess
+
+    def git(*args: str) -> str:
+        # Bytes git doesn't promise as UTF-8 (a commit message in another encoding, a path) stay
+        # readable (Sol, PR #54 R1 fix review r3 D4).
+        done = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, encoding="utf-8",
+                              errors="surrogateescape", timeout=60, env={**os.environ, **STORED_OBJECTS})
+        if done.returncode != 0:
+            raise SystemExit(f"git {' '.join(args)}: {done.stderr.strip()}")
+        return done.stdout
+    rev = git("rev-parse", "--verify", f"{rev}^{{commit}}").strip()
+    sides = measurement_sides() if sides is None else sides
+    # A measurement commit is built only as its side's, under one name (its build is the side's).
+    of = [side for side, commit in sides.items() if commit == rev]
+    if of:
+        raise SystemExit(f"{rev[:12]} is the measurement commit of {of[0][:12]}: build {of[0][:12]}")
+    commit = sides.get(rev)
+    if commit is None:
+        return rev
+    try:
+        # The parents its object names: a graft or a shallow boundary changes what a walk reports
+        # (Sol, PR #54 R1 fix review D3).
+        header = git("cat-file", "commit", f"{commit}^{{commit}}").split("\n\n", 1)[0]
+        parents = [line.split()[1] for line in header.splitlines() if line.startswith("parent ")]
+    except SystemExit as e:
+        raise SystemExit(f"the measurement commit {commit[:12]} of {rev[:12]} isn't in this checkout ({e}): "
+                         "a job that builds it takes it as an input (measurement_inputs)") from None
+    if parents != [rev]:
+        raise SystemExit(f"the measurement commit {commit[:12]} isn't a commit on {rev[:12]} alone: its parents "
+                         f"are {', '.join(p[:12] for p in parents) or 'none'}")
+    # Every path the two trees differ in, by plumbing: no diff configuration of the user's may
+    # hide one (Sol, PR #54 r1 R1: diff.ignoreSubmodules=all dropped an added gitlink).
+    changed = git("diff-tree", "-r", "-z", "--no-renames", "--ignore-submodules=none", "--name-only", rev, commit)
+    outside = [p for p in changed.split("\0") if p and not p.startswith(PERF_LAB)]
+    if outside:
+        raise SystemExit(f"the measurement commit {commit[:12]} of {rev[:12]} changes more than its perf lab "
+                         f"({PERF_LAB}): {', '.join(outside)}")
+    return commit
+
+
+def measurement_ref(repo: str, ref: str, commit: str, path: Path = MEASUREMENT_SIDES) -> str:
+    """A pushed refs/measure/* ref (.githooks/pre-push, check.sh push): the ref a side of the table
+    declares, named for that side, whose side is already on a remote ref, at that side's declared
+    commit, which measured_at admits for it. The side; anything else is refused."""
+    table = measurement_table(path)
+    declaring = [rev for rev, side in table.items() if side.get("ref") == ref]
+    if not declaring:
+        raise SystemExit(f"{ref}: no side of {path.name} declares this measurement ref")
+    rev = declaring[0]
+    if not ref.endswith(f"-{rev[:8]}"):
+        raise SystemExit(f"{ref}: its name doesn't name its side {rev[:8]} (refs/measure/<name>-{rev[:8]})")
+    import subprocess
+    # The ref's push sends its side's history along, so only a side that is already out may go (T0,
+    # 28 Oct 2026: main's and v1.5's sides were ids from before the history rewrite, on no remote).
+    stored = {**os.environ, **STORED_OBJECTS}
+    published = subprocess.run(["git", "-C", repo, "for-each-ref", "--count=1", "--format=%(refname)",
+                                "--contains", rev, "refs/remotes"], capture_output=True, text=True, timeout=60,
+                               env=stored)
+    if published.returncode != 0 or not published.stdout.strip():
+        raise SystemExit(f"{ref}: its side {rev[:12]} is on no remote ref: the side must be published")
+    done = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", f"{commit}^{{commit}}"],
+                          capture_output=True, text=True, timeout=60, env=stored)
+    if done.returncode != 0 or done.stdout.strip() != table[rev]["commit"]:
+        raise SystemExit(f"{ref}: pushes {commit[:12]}, but {path.name} declares {table[rev]['commit'][:12]}")
+    if measured_at(repo, rev, {rev: table[rev]["commit"]}) != table[rev]["commit"]:
+        raise SystemExit(f"{ref}: {table[rev]['commit'][:12]} isn't admitted as the measurement commit of {rev[:12]}")
+    return rev
+
+
+def measurement_inputs(checkout: str, revs: list[str], sides: dict[str, str] | None = None) -> list[dict]:
+    """The measurement commits of these sides as a job's git inputs: a job's checkout holds only
+    its own revision's history, and release-gate.sh build needs them in it."""
+    import subprocess
+    sides = measurement_sides() if sides is None else sides
+    inputs = []
+    for rev in dict.fromkeys(revs):
+        full = subprocess.run(["git", "-C", checkout, "rev-parse", "--verify", f"{rev}^{{commit}}"],
+                              capture_output=True, text=True, timeout=60).stdout.strip()
+        if full in sides:
+            inputs.append({"name": f"measure-{full[:8]}", "source": {"git": checkout, "rev": sides[full]}})
+    return inputs
 
 
 def toml_job(job: dict) -> str:
@@ -1416,7 +1533,8 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
         "est_min": 25 * len(dict.fromkeys([base, main, candidate, harness])) + (10 if small else 30), "env": env,
         "steps": [[*gate_, "build", rev] for rev in dict.fromkeys([base, main, candidate, harness])]
         + [[*gate_, "prepare", harness]] + ([[*gate_, "pack", base, main, candidate, harness]] if big_host else []),
-        "requires": {"hosts": [timed_host], "cores": 16, "ram_gb": 12}, "inputs": source,
+        "requires": {"hosts": [timed_host], "cores": 16, "ram_gb": 12},
+        "inputs": source + measurement_inputs(checkout, [base, main, candidate, harness]),
         **({"outputs": [{"name": "binaries", "path": "binaries"}]} if big_host else {})}}
     # minutes, the three sides' two runs of every case (a main that is the base isn't timed again)
     sides = 2 + (main != base)
@@ -1669,8 +1787,20 @@ def main() -> int:
     s.add_argument("--w3c", type=Path, required=True)
     s.add_argument("--guards", type=Path, required=True)
     s.add_argument("--out", type=Path)
+    s = sub.add_parser("measured-at", help="the commit a side is built and timed from (release-gate.sh build)")
+    s.add_argument("rev")
+    s = sub.add_parser("measurement-ref", help="a pushed refs/measure/* ref and its commit, checked (check.sh push)")
+    s.add_argument("ref")
+    s.add_argument("commit")
     args = p.parse_args()
 
+    if args.command == "measured-at":
+        print(measured_at(str(ROOT), args.rev))
+        return 0
+    if args.command == "measurement-ref":
+        side = measurement_ref(str(ROOT), args.ref, args.commit)
+        print(f"{args.ref}: the measurement commit of {side[:12]}, admitted (benches/fast/measurement-sides.toml)")
+        return 0
     if args.command == "plan":
         catalog = cases_registry.load()
         run, not_run, elsewhere = plan(catalog, args.max_gb, args.cases.split(",") if args.cases else None,

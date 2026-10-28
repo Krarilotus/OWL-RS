@@ -160,10 +160,10 @@ impl PreparedQuery {
             query,
             text: request.query.clone(),
             dataset: protocol_dataset(&request.default_graphs, &request.named_graphs)?,
-            read_model: match !request.scope.sees_inferred() {
+            read_model: match request.scope.model() {
                 // Without the inferred statements: what was asserted, whatever was asked.
-                true => ReadModel::Asserted,
-                false => request
+                ReadModel::Asserted => ReadModel::Asserted,
+                _ => request
                     .read_model
                     .or(from_protocol)
                     .or(from_query)
