@@ -20,9 +20,9 @@ Answer counts must match NRESE's before a time counts: a differing count is repo
 `differs`, never as a time. Every suite run also captures each system's full answers and
 classifies them against the reference systems (ANSWER_REFERENCES, in order; the case's own
 checks of single answers are the known answers): benches/suite/suitekit/answers.py; a query
-whose answer the contract doesn't time (answers.timed: wrong, unqualified, deviates,
-incomplete, unsupported, unchecked, which no reference answered, and missing, which its run
-recorded no verdict for) gives no time either.
+whose answer the contract doesn't time (answers.timed: any but ok and the reference's own, so
+also unchecked, which no reference answered, missing, which its run recorded no verdict for,
+and a name it doesn't know) gives no time either.
 Results:
 benches/fast/results/<stamp>/compete.json, and answers.json with one verdict per distinct
 query over all the runs.
