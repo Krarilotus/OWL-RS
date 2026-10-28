@@ -8,7 +8,6 @@
 
 use std::fmt::Write;
 use std::hint::black_box;
-use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const ROUNDS: usize = 9;
@@ -45,28 +44,6 @@ fn report(
         b * 1e3,
         a / b
     );
-}
-
-/// The `.rq` and `.ru` files of the W3C suites.
-fn corpus() -> Vec<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cache/rdf-tests/sparql");
-    let mut files = Vec::new();
-    let mut stack = vec![root];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rq" || e == "ru") {
-                files.push(path);
-            }
-        }
-    }
-    files.sort();
-    files
 }
 
 const BASE: &str = "http://example.org/base/";
@@ -124,20 +101,30 @@ fn long_expression() -> String {
 
 fn main() {
     let filter = std::env::args().nth(1);
-    // The corpus: what both parse, with each file's kind.
+    // The corpus: the pinned W3C suites in full (no W3C case is timed without them), and of
+    // them what both parse, with each file's kind.
+    let files = oxigraph_comparison::w3c::sparql(&["rq", "ru"]).unwrap_or_else(|why| {
+        eprintln!("{why}: no W3C case is timed");
+        std::process::exit(2)
+    });
     let mut queries = Vec::new();
     let mut updates = Vec::new();
-    for path in corpus() {
-        let Ok(text) = std::fs::read_to_string(&path) else {
+    for file in files {
+        // Neither parser reads bytes: a file that isn't UTF-8 is no case.
+        let Ok(text) = String::from_utf8(file.bytes) else {
             continue;
         };
-        if path.extension().is_some_and(|e| e == "ru") {
+        if file.path.extension().is_some_and(|e| e == "ru") {
             if ours().parse_update(&text).is_ok() && theirs().parse_update(&text).is_ok() {
                 updates.push(text);
             }
         } else if ours().parse_query(&text).is_ok() && theirs().parse_query(&text).is_ok() {
             queries.push(text);
         }
+    }
+    if queries.is_empty() || updates.is_empty() {
+        eprintln!("no W3C query or no update both parsers accept: nothing to time as W3C cases");
+        std::process::exit(2);
     }
     let bytes = |texts: &[String]| texts.iter().map(String::len).sum::<usize>();
     println!(

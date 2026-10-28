@@ -1,6 +1,8 @@
-//! nrese-sparql-syntax against spargebra: every query and update of the W3C SPARQL 1.0,
-//! 1.1 and 1.2 suites (and the repository's own `.rq`/`.ru` files) parsed by both, their
-//! algebra compared after converting spargebra's into nrese's.
+//! nrese-sparql-syntax against spargebra: every query and update of the pinned W3C SPARQL
+//! 1.0, 1.1 and 1.2 suites (and the repository's own `.rq`/`.ru` files) parsed by both, their
+//! algebra compared after converting spargebra's into nrese's. Without the suites in full the
+//! test fails where they are required (`NRESE_W3C_REQUIRED`) and else compares the
+//! repository's files alone, saying it doesn't qualify.
 //!
 //! What may differ, and is normalised before comparing:
 //! - generated names (spargebra's are random 128-bit numbers, nrese's are numbered);
@@ -27,6 +29,7 @@ use nrese_sparql_syntax::term::{
     TriplePattern,
 };
 use nrese_sparql_syntax::{GraphUpdateOperation as U, Query, SparqlParser, Update};
+use oxigraph_comparison::w3c;
 use spargebra::algebra as sa;
 use spargebra::term as st;
 
@@ -660,28 +663,27 @@ fn find_close(s: &str, open: usize) -> Option<usize> {
     None
 }
 
-fn corpus() -> Vec<PathBuf> {
+/// The repository's own queries and updates (`.rq`, `.ru` under `crates`, `benches` and
+/// `docs`): its name relative to the repository, its path. A directory that can't be read
+/// fails the test.
+fn repository() -> Vec<(String, PathBuf)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
-    let mut stack = vec![
-        root.join(".cache/rdf-tests/sparql"),
-        root.join("crates"),
-        root.join("benches"),
-        root.join("docs"),
-    ];
+    let mut stack = vec![root.join("crates"), root.join("benches"), root.join("docs")];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+                .path();
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             if path.is_dir() {
-                if name != "target" && !name.starts_with('.') || name == ".cache" {
+                if name != "target" && !name.starts_with('.') {
                     stack.push(path);
                 }
             } else if name.ends_with(".rq") || name.ends_with(".ru") {
-                files.push(path);
+                let relative = path.strip_prefix(&root).unwrap();
+                files.push((relative.to_string_lossy().replace('\\', "/"), path));
             }
         }
     }
@@ -705,20 +707,33 @@ fn file_iri(path: &Path) -> String {
 
 #[test]
 fn every_query_parses_to_the_same_algebra() {
-    let files = corpus();
-    if files.len() < 100 {
-        eprintln!("skipped: no W3C suites (scripts/fetch-w3c-tests.sh)");
-        return;
-    }
+    // The pinned W3C suites in full, or (where they aren't required) the repository's own
+    // files alone, said to qualify nothing.
+    let suites = w3c::admitted(w3c::sparql(&["rq", "ru"])).unwrap_or_default();
+    let own = repository();
+    eprintln!(
+        "W3C files: {} ({}); the repository's own: {}",
+        suites.len(),
+        w3c::counts(&suites),
+        own.len()
+    );
+    let inputs = suites
+        .iter()
+        .map(|file| (file.name.clone(), file.path.clone(), file.bytes.clone()))
+        .chain(own.into_iter().map(|(name, path)| {
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+            (name, path, bytes)
+        }));
     let mut outcome: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for path in &files {
-        let Ok(text) = std::fs::read_to_string(path) else {
+    for (name, path, bytes) in inputs {
+        // Neither parser reads bytes: a file that isn't UTF-8 is counted, not compared.
+        let Ok(text) = String::from_utf8(bytes) else {
+            outcome.entry("not UTF-8").or_default().push(name);
             continue;
         };
+        let path = path.as_path();
         let base = file_iri(path);
         let update = path.extension().is_some_and(|e| e == "ru");
-        let name = path.to_string_lossy().replace('\\', "/");
-        let name = name.split("/sparql/").last().unwrap_or(&name).to_owned();
         let ours = SparqlParser::new().with_base_iri(base.as_str()).unwrap();
         let theirs = spargebra::SparqlParser::new()
             .with_base_iri(base.as_str())
@@ -766,51 +781,79 @@ fn every_query_parses_to_the_same_algebra() {
             }
         }
     }
-    let unexplained: Vec<&String> = outcome
+    // A difference is explained only by an entry naming its file and this outcome; and with
+    // the suites read, every entry is seen with its outcome (none stands for a file that
+    // now agrees, or differs otherwise).
+    let explained =
+        |file: &str, key: &str| EXPLAINED.iter().any(|(f, k, _)| *f == file && *k == key);
+    let unexplained: Vec<String> = outcome
         .iter()
-        .filter(|(k, _)| **k != "same algebra" && **k != "both reject")
-        .flat_map(|(_, files)| files)
-        .filter(|f| !EXPLAINED.iter().any(|(e, _)| f.ends_with(e)))
+        .filter(|(k, _)| !matches!(**k, "same algebra" | "both reject" | "not UTF-8"))
+        .flat_map(|(key, files)| files.iter().map(move |file| (key, file)))
+        .filter(|(key, file)| !explained(file, key))
+        .map(|(key, file)| format!("{file}: {key}"))
         .collect();
+    let unseen: Vec<String> = if suites.is_empty() {
+        Vec::new()
+    } else {
+        EXPLAINED
+            .iter()
+            .filter(|(file, key, _)| {
+                !outcome
+                    .get(key)
+                    .is_some_and(|files| files.iter().any(|f| f == file))
+            })
+            .map(|(file, key, _)| format!("{file}: {key}"))
+            .collect()
+    };
     assert!(
-        unexplained.is_empty(),
-        "unexplained differences: {unexplained:#?}"
+        unexplained.is_empty() && unseen.is_empty(),
+        "unexplained differences: {unexplained:#?}\nexplained but not seen so: {unseen:#?}"
     );
 }
 
-/// Differences with their reasons: in each, nrese follows the specification.
-const EXPLAINED: &[(&str, &str)] = &[
+/// Differences, each with the outcome it has and its reason: in each, nrese follows the
+/// specification.
+const EXPLAINED: &[(&str, &str, &str)] = &[
     (
         "sparql10/expr-ops/query-add-literals.rq",
+        "different algebra",
         "spargebra reads `a + b + c` as `a + (b + c)`; the grammar's rule 116 associates to the left",
     ),
     (
         "sparql10/i18n/normalization-02.rq",
+        "different algebra",
         "an absolute IRI with dot segments: nrese resolves it as RFC 3986 section 5.2.2 says \
          (and as nrese-rdf-io does for data), spargebra (oxiri) keeps the segments",
     ),
     (
         "sparql10/expr-builtin/case-insensitive-booleans.rq",
+        "only nrese accepts",
         "TRUE and FALSE: keywords are case-insensitive (SPARQL 1.1 section 19.3), spargebra rejects them",
     ),
     (
         "sparql12/grouping/select-variable-reuse.rq",
+        "only nrese accepts",
         "W3C SPARQL 1.2 positive test: a select expression may use an earlier one's variable",
     ),
     (
         "sparql10/syntax-sparql3/syn-bad-26.rq",
+        "only spargebra accepts",
         "W3C negative test: by the longest-token rule `<?a&&?b>` is an IRI, not `<` and `&&`",
     ),
     (
         "sparql12/syntax/nested-aggregate-functions.rq",
+        "only spargebra accepts",
         "W3C negative test: an aggregate's argument holds no aggregate",
     ),
     (
         "sparql12/syntax-triple-terms-negative/tripleterm-subject-03.rq",
+        "only spargebra accepts",
         "W3C negative test: a triple term in an expression has no triple term as subject",
     ),
     (
         "sparql12/syntax-triple-terms-negative/tripleterm-subject-06.rq",
+        "only spargebra accepts",
         "W3C negative test: a triple term in an expression has no literal as subject",
     ),
 ];
