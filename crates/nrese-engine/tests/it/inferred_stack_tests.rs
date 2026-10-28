@@ -668,3 +668,43 @@ fn inferred_masks_stack_across_commits() {
     drop(view);
     assert_eq!(budget.used(), 0);
 }
+
+/// A canonical view is an exact delta over the asserted stack (`index/run.rs`): a
+/// named-graph statement it renames onto one that is asserted too is one statement, which
+/// every read counts once, while the stored snapshot keeps both (review B-201: the renamed
+/// statement was inserted again, so counts, the length and group counts found two where a
+/// scan found one).
+#[test]
+fn a_canonical_view_counts_a_statement_renamed_onto_an_asserted_one_once() {
+    let engine = engine();
+    let (rep, alias, same_as, p, o, g) = (id(1), id(2), id(3), id(4), id(5), id(10));
+    let mut tx = engine.transaction();
+    assert!(tx.insert_inferred(EncodedTriple::new(alias, same_as, rep)));
+    for subject in [alias, rep] {
+        assert!(tx.insert_encoded(EncodedQuad::new(subject, p, o, g)));
+    }
+    tx.commit().expect("commit");
+    engine.set_equality(Some(same_as));
+    let stored = engine.snapshot();
+    let canonical = stored.with_canonical_equality();
+    let in_g = QuadPattern::in_graph(g);
+    let named = QuadPattern {
+        graph: GraphSelector::AnyNamed,
+        ..QuadPattern::all()
+    };
+    // Canonical reads are those with inferred statements (asserted ones read as stored).
+    let model = ReadModel::Materialised;
+    let read: Vec<_> = canonical.quads_for_pattern_in(model, &in_g).collect();
+    assert_eq!(read, [EncodedQuad::new(rep, p, o, g)]);
+    assert_eq!(canonical.count_in(model, &in_g), 1, "count in the graph");
+    assert_eq!(canonical.count_in(model, &named), 1, "named graphs");
+    // The named statement and the inferred `alias sameAs rep`.
+    assert_eq!(canonical.len_in(model), 2, "length");
+    assert_eq!(
+        canonical.group_counts_in(model, &in_g, Permutation::Gspo),
+        Some(vec![(rep, 1)]),
+        "subjects counted"
+    );
+    assert_eq!(stored.count_in(model, &in_g), 2, "stored");
+    assert_eq!(stored.quads_for_pattern_in(model, &in_g).count(), 2);
+}
