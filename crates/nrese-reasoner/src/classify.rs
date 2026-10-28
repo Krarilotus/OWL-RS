@@ -404,8 +404,10 @@ impl ListError {
 /// Two different objects where the mapping has one subject and predicate say one thing.
 struct Repeated;
 
-/// The triples of an ontology, indexed by subject.
+/// The triples of an ontology, indexed by subject and predicate.
 struct Graph<'a> {
+    /// Each subject's `(predicate, object)` pairs, sorted: a lookup is a binary search, not a
+    /// scan of every triple of the subject (a node many axioms name has as many).
     by_subject: HashMap<u64, Vec<(u64, u64)>>,
     names: &'a Names,
     /// What is about data values, which no rule reads: the datatypes (OWL 2's datatype
@@ -430,18 +432,21 @@ impl<'a> Graph<'a> {
                 graph.data_properties.insert(s);
             }
         }
+        for pairs in graph.by_subject.values_mut() {
+            pairs.sort_unstable();
+        }
         graph
     }
 }
 
 impl Graph<'_> {
     fn objects(&self, subject: u64, predicate: u64) -> impl Iterator<Item = u64> + '_ {
-        self.by_subject
-            .get(&subject)
-            .into_iter()
-            .flatten()
-            .filter(move |(p, _)| *p == predicate)
-            .map(|(_, o)| *o)
+        let pairs = self.by_subject.get(&subject).map_or(&[][..], Vec::as_slice);
+        let start = pairs.partition_point(|&(p, _)| p < predicate);
+        pairs[start..]
+            .iter()
+            .take_while(move |&&(p, _)| p == predicate)
+            .map(|&(_, o)| o)
     }
 
     /// The object of `subject predicate` where the mapping has at most one; two different
@@ -1784,6 +1789,18 @@ mod tests {
                 &[],
             );
         }
+        // A restriction many axioms share as their subject (PR #53 sol-loop S1): read for
+        // each, nothing to report, no subsumption between named classes. Its cost is the
+        // counting probe's question, not this test's.
+        let shared: String = (0..1_000)
+            .map(|i| format!("_:e rdfs:subClassOf ex:C{i}\n"))
+            .collect();
+        check(
+            "shared-restriction",
+            &format!("_:e owl:onProperty ex:r\n_:e owl:someValuesFrom owl:Thing\n{shared}"),
+            &[],
+            &[],
+        );
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
