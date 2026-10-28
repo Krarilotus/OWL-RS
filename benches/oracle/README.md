@@ -16,7 +16,7 @@ benches/oracle/run.sh                     # dump, answer, compare; the report in
 |---|---|
 | dump | `NRESE_ORACLE_DUMP=<dir>` makes the random-query, pushed-filter and computed-value tests write each dataset (`data.nq`, and `data.canonical.nq` with numbers in canonical lexical forms) and each compared query with NRESE's rows (`q<M>.rq`, `q<M>.nrese`, `q<M>.ordered`): about 9,400 queries over 270 datasets |
 | answer | `jena/Oracle.java` (Jena 6.2.0, in `nrese-bench/jena-oracle`) answers every query on both copies of its dataset: `q<M>.jena`, `q<M>.jena-canonical` |
-| compare | `compare.py`: rows as multisets (in order where the query orders every column), numbers by value, columns aligned by name; a query agrees if it matches Jena on either copy |
+| compare | `compare.py`: rows as multisets (in order where the query orders every column), terms as the answer contract compares them (`suite/suitekit/answers.py`: the same datatype and value), columns aligned by name; a query agrees if it matches Jena on either copy. Blank nodes, decimal division without an oracle and numbers equal only across datatypes are reported apart (`blank-nodes`, `division`, `cross-type`), never as agreement |
 
 The oracle workflow (`.github/workflows/oracle.yml`, run at milestones with `gh workflow run oracle.yml --ref <branch>`) runs the same steps and keeps the report. It fails when a difference is left unexplained.
 
