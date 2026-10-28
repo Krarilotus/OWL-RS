@@ -11,8 +11,9 @@ console session however long nobody touches it (13 Oct 2026: "none" for a consol
 minutes by its last input; the guard never released in ten hours). Where the last input
 can't be read, `query user`'s idle time decides.
 Then:
-- the queue's retreat file (benches/hosts.toml khaleesi queue.retreat) is written, with the
-  time: the measurement queue starts no timed job while it exists;
+- the queue's retreat file (benches/hosts.toml khaleesi queue.retreat) is written: its first
+  line `present`, or `unknown: <why>` where `query user` couldn't say (the fleet's format,
+  fleet-issues.md F31), then the time. The measurement queue starts no timed job while it exists;
 - every running timed job is stopped, its whole process tree (taskkill /T /F), by the pid
   file the runner keeps (queue/running/<id>.pid); the runner sees it stopped with the owner
   present, keeps its partial results and queues it again.
@@ -22,7 +23,8 @@ here; the runner starts the job again in the next window.
 The owner can free the machine whatever the console shows (13 Oct 2026): while the free file
 (hosts.toml khaleesi queue.free, S:/nrese-scratch/FREE-UNTIL) holds a time that hasn't passed
 (HH:MM today, or ISO; empty: until it's removed), nobody counts as present, and the runner
-takes timed jobs outside its windows too. A passed time removes the file.
+takes timed jobs outside its windows too. A passed time removes the file. The release lifts a
+known reading only: while `query user` can't say, RETREAT stays.
 
     pythonw scripts/hosts/khaleesi-guard.py          once (Task Scheduler: every minute)
 """
@@ -62,22 +64,41 @@ UNREADABLE = -1
 HEADERS = ("username", "benutzername")
 
 
+# A row's logon time: a date and a time, with AM or PM where the locale has them.
+LOGON = re.compile(r"\d{1,4}[./-]\d{1,2}[./-]\d{1,4} \d{1,2}:\d{2}(?: [AaPp][Mm])?")
+
+
+def row(line: str) -> tuple[str | None, int] | None:
+    """One session of `query user`'s table: its session name (None for a disconnected one, which has none)
+    and its idle minutes; None if the line isn't a whole row. The columns: user, session, id, state, idle
+    time, logon time."""
+    fields = line.lstrip(">").split()
+    if len(fields) >= 2 and fields[1].isdigit():
+        session, rest = None, fields[2:]
+    elif len(fields) >= 3 and fields[2].isdigit():
+        session, rest = fields[1], fields[3:]
+    else:
+        return None
+    if len(rest) < 4 or not rest[0].isalpha() or not LOGON.fullmatch(" ".join(rest[2:])):
+        return None
+    minutes = idle_minutes(rest[1])
+    return None if minutes is None else (session, minutes)
+
+
 def console_idle(output: str) -> int | None:
-    """The console session's idle minutes from `query user`'s table, UNREADABLE if they can't be read
-    (its idle time isn't one, its row is cut short, or the output isn't the table), or None if no one
-    is at the console ("" : nobody logged on). The columns: user, session, id, state, idle time, logon
-    time."""
+    """The console session's idle minutes from `query user`'s table, UNREADABLE if the output isn't a
+    whole table (its header, then one or more whole rows), or None if no one is at the console (""
+    : nobody logged on, or a whole table without a console row). PR #52 review F1: a header alone, a
+    row cut short or a row that isn't one says nothing about the console."""
     lines = [l for l in output.splitlines() if l.strip()]
     if not lines:
         return None
-    if not lines[0].strip().lower().startswith(HEADERS):
+    if not lines[0].strip().lower().startswith(HEADERS) or len(lines) < 2:
         return UNREADABLE
-    for line in lines[1:]:
-        fields = line.lstrip(">").split()
-        if len(fields) >= 2 and fields[1].lower() == "console":
-            idle = idle_minutes(fields[4]) if len(fields) >= 5 else None
-            return UNREADABLE if idle is None else idle
-    return None
+    sessions = [row(line) for line in lines[1:]]
+    if None in sessions:
+        return UNREADABLE
+    return next((idle for session, idle in sessions if (session or "").lower() == "console"), None)
 
 
 def query_user() -> str | None:
@@ -88,8 +109,9 @@ def query_user() -> str | None:
                               creationflags=HIDDEN, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return None
+    # Success with nothing on stdout is a missing reading, not "nobody logged on" (PR #52 review F1).
     if done.returncode == 0:
-        return done.stdout
+        return done.stdout if done.stdout.strip() else None
     said = f"{done.stdout}\n{done.stderr}".lower()
     # Nobody logged on: it says so and exits 1 ("No User exists for *", "Kein Benutzer ...").
     if done.returncode == 1 and ("no user exists" in said or "kein benutzer" in said):
@@ -116,28 +138,39 @@ def last_input_minutes() -> float | None:
         return None
 
 
+def unknown(output: str | None) -> str | None:
+    """Why `query user` couldn't say who is at the console (no answer, or not a whole table), or None if it
+    could."""
+    if output is None:
+        return "query user gave no answer"
+    if console_idle(output) == UNREADABLE:
+        return "query user's answer isn't a whole table"
+    return None
+
+
 def present(output: str | None, input_idle: float | None = None) -> bool:
     """Someone at the console (`query user`), and their last input less than IDLE_MINUTES ago
-    (`input_idle`, minutes; else `query user`'s idle column). Unknown is present: `query user`
-    couldn't say (None), or the console's idle time can't be read."""
-    if output is None:
+    (`input_idle`, minutes; else `query user`'s idle column). Unknown is present."""
+    # Unknown before the last input's word (Sol r14 C1: it may speak of another session).
+    if unknown(output):
         return True
     idle = console_idle(output)
     if idle is None:
         return False
-    # Unknown before the last input's word (Sol r14 C1: it may speak of another session).
-    if idle == UNREADABLE:
-        return True
     return (input_idle if input_idle is not None else idle) < IDLE_MINUTES
 
 
 def free_until(settings: dict) -> str | None:
-    """The time the owner freed the machine until, while it hasn't passed (the free file)."""
+    """The time the owner freed the machine until, while it hasn't passed (the free file). A file that
+    can't be read, or a time it can't compare (one with an offset), is no release (PR #52 review F3)."""
     import datetime
     path = Path(settings.get("free", "")) if settings.get("free") else None
-    if path is None or not path.exists():
+    if path is None:
         return None
-    text = path.read_text(encoding="utf-8").strip()
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):  # no file is no release, and so is one that can't be read
+        return None
     if not text:
         return "the file's removal"
     now = datetime.datetime.now()
@@ -146,8 +179,13 @@ def free_until(settings: dict) -> str | None:
                  else datetime.datetime.fromisoformat(text))
     except ValueError:
         return None
+    if until.tzinfo is not None:
+        return None
     if now >= until:
-        path.unlink(missing_ok=True)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return None
     return text
 
@@ -172,6 +210,27 @@ def stop_timed(directory: Path, say) -> None:
         say(f"stopped {job.stem} (pid {pid}): {done.returncode}")
 
 
+def publish(retreat: Path, text: str, say) -> None:
+    """RETREAT's new text: written beside it and renamed, so no reader sees half of it. Where the rename is
+    denied (Windows: a reader holds RETREAT open), written in place; a reader then sees at worst a partial first
+    line, which the fleet takes as unknown. Never raises: timed jobs are stopped either way (sol-loop r4 S1)."""
+    written = retreat.with_name(retreat.name + ".new")
+    try:
+        written.write_text(text, encoding="utf-8")
+        os.replace(written, retreat)
+        return
+    except OSError:
+        pass
+    try:
+        written.unlink(missing_ok=True)
+    except OSError:
+        pass
+    try:
+        retreat.write_text(text, encoding="utf-8")
+    except OSError as e:
+        say(f"RETREAT couldn't be written ({e}): the next run tries again")
+
+
 def main() -> int:
     settings = queue_settings()
     directory = Path(settings["dir"])
@@ -183,22 +242,26 @@ def main() -> int:
 
     query = query_user()
     now = int(time.time())
-    freed = free_until(settings)
+    why = unknown(query)
+    # The owner's release lifts a known reading only: an unknown one keeps RETREAT (PR #52 review F2).
+    freed = None if why else free_until(settings)
     if freed:
         if retreat.exists():
             retreat.unlink()
             say(f"back: the owner freed the machine until {freed}")
         return 0
     if present(query, last_input_minutes()):
+        # Its first line is the reading's state, the fleet's to read (fleet-issues.md F31); then the time. Written
+        # beside it and renamed, so no reader sees half of it.
+        state = f"unknown: {why}" if why else "present"
         if not retreat.exists():
-            say("retreat: " + ("the owner is at the console" if query is not None
-                               else "query user couldn't say: counted as present"))
-        retreat.write_text(str(now), encoding="utf-8")
+            say("retreat: " + ("the owner is at the console" if not why else f"{why}: counted as present"))
+        publish(retreat, f"{state}\n{now}\n", say)
         stop_timed(directory, say)
     elif retreat.exists():
         try:
-            last = int(retreat.read_text(encoding="utf-8").split()[0])
-        except (ValueError, IndexError):
+            last = next((int(l) for l in retreat.read_text(encoding="utf-8").split() if l.isdigit()), 0)
+        except (OSError, ValueError):
             last = 0
         if now - last >= IDLE_MINUTES * 60:
             retreat.unlink()
