@@ -1,0 +1,173 @@
+{
+  "contract": "benches/suite/suitekit/answers.py (rule.owl-rs-answer-comparison): every answer comparator passes these cases; none keeps a copy or a policy of its own",
+  "compare": [
+    {
+      "name": "q02 weight: two spellings of one double (NRESE against Jena)",
+      "query": "SELECT ?a ?weight WHERE { ?a <http://example.org/weight> ?weight }",
+      "answer": {"head": {"vars": ["a", "weight"]}, "results": {"bindings": [{"a": {"type": "uri", "value": "http://example.org/AbdullahUstaoglu"}, "weight": {"type": "literal", "value": "63", "datatype": "http://www.w3.org/2001/XMLSchema#double"}}]}},
+      "reference": {"head": {"vars": ["a", "weight"]}, "results": {"bindings": [{"a": {"type": "uri", "value": "http://example.org/AbdullahUstaoglu"}, "weight": {"type": "literal", "value": "63.0e0", "datatype": "http://www.w3.org/2001/XMLSchema#double"}}]}},
+      "expected": {"verdict": "ok", "level": "value"}
+    },
+    {
+      "name": "q02 weight: a double answered as a decimal (QLever against Jena)",
+      "query": "SELECT ?a ?weight WHERE { ?a <http://example.org/weight> ?weight }",
+      "answer": {"head": {"vars": ["a", "weight"]}, "results": {"bindings": [{"a": {"type": "uri", "value": "http://example.org/AbdullahUstaoglu"}, "weight": {"type": "literal", "value": "63.0", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "reference": {"head": {"vars": ["a", "weight"]}, "results": {"bindings": [{"a": {"type": "uri", "value": "http://example.org/AbdullahUstaoglu"}, "weight": {"type": "literal", "value": "63.0e0", "datatype": "http://www.w3.org/2001/XMLSchema#double"}}]}},
+      "expected": {"verdict": "deviates", "level": "cross-type", "note": "datatypes differ"}
+    },
+    {
+      "name": "q13 AVG: NRESE's 18 fractional digits against Jena's 24, with the exact quotient 7987/305",
+      "query": "SELECT ?games (AVG(?age) AS ?avg) (COUNT(?a) AS ?n) WHERE { ?a <http://example.org/games> ?games ; <http://example.org/age> ?age } GROUP BY ?games",
+      "answer": {"head": {"vars": ["games", "avg", "n"]}, "results": {"bindings": [{"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "avg": {"type": "literal", "value": "26.186885245901639344", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}]}},
+      "reference": {"head": {"vars": ["games", "avg", "n"]}, "results": {"bindings": [{"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "avg": {"type": "literal", "value": "26.186885245901639344262295", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}]}},
+      "oracle": {"avg": [{"row": {"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}, "quotient": "7987/305"}]},
+      "expected": {"verdict": "ok", "level": "division"}
+    },
+    {
+      "name": "q13 AVG: Jena's 24 fractional digits against NRESE's, with the exact quotient",
+      "query": "SELECT ?games (AVG(?age) AS ?avg) (COUNT(?a) AS ?n) WHERE { ?a <http://example.org/games> ?games ; <http://example.org/age> ?age } GROUP BY ?games",
+      "answer": {"head": {"vars": ["games", "avg", "n"]}, "results": {"bindings": [{"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "avg": {"type": "literal", "value": "26.186885245901639344262295", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}]}},
+      "reference": {"head": {"vars": ["games", "avg", "n"]}, "results": {"bindings": [{"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "avg": {"type": "literal", "value": "26.186885245901639344", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}]}},
+      "oracle": {"avg": [{"row": {"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}, "quotient": "7987/305"}]},
+      "expected": {"verdict": "ok", "level": "division"}
+    },
+    {
+      "name": "q13 AVG: QLever's 12 significant digits are the quotient at its digits, short of the SHOULD",
+      "query": "SELECT ?games (AVG(?age) AS ?avg) (COUNT(?a) AS ?n) WHERE { ?a <http://example.org/games> ?games ; <http://example.org/age> ?age } GROUP BY ?games",
+      "answer": {"head": {"vars": ["games", "avg", "n"]}, "results": {"bindings": [{"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "avg": {"type": "literal", "value": "26.1868852459", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}]}},
+      "reference": {"head": {"vars": ["games", "avg", "n"]}, "results": {"bindings": [{"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "avg": {"type": "literal", "value": "26.186885245901639344262295", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}]}},
+      "oracle": {"avg": [{"row": {"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}, "quotient": "7987/305"}]},
+      "expected": {"verdict": "ok", "level": "division", "note": "12 significant digits"}
+    },
+    {
+      "name": "q13 COUNT: QLever's xsd:int for a COUNT",
+      "query": "SELECT ?games (AVG(?age) AS ?avg) (COUNT(?a) AS ?n) WHERE { ?a <http://example.org/games> ?games ; <http://example.org/age> ?age } GROUP BY ?games",
+      "answer": {"head": {"vars": ["games", "avg", "n"]}, "results": {"bindings": [{"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "avg": {"type": "literal", "value": "26.186885245901639344262295", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#int"}}]}},
+      "reference": {"head": {"vars": ["games", "avg", "n"]}, "results": {"bindings": [{"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "avg": {"type": "literal", "value": "26.186885245901639344262295", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}]}},
+      "expected": {"verdict": "deviates", "level": "cross-type", "note": "COUNT not xsd:integer"}
+    },
+    {
+      "name": "a COUNT in xsd:int deviates even where the reference has the same term",
+      "query": "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }",
+      "answer": {"head": {"vars": ["n"]}, "results": {"bindings": [{"n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#int"}}]}},
+      "reference": {"head": {"vars": ["n"]}, "results": {"bindings": [{"n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#int"}}]}},
+      "expected": {"verdict": "deviates", "level": "cross-type", "note": "COUNT not xsd:integer"}
+    },
+    {
+      "name": "q13 AVG without an oracle: two conformant results differ, and nothing decides",
+      "query": "SELECT ?games (AVG(?age) AS ?avg) WHERE { ?a <http://example.org/games> ?games ; <http://example.org/age> ?age } GROUP BY ?games",
+      "answer": {"head": {"vars": ["games", "avg"]}, "results": {"bindings": [{"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "avg": {"type": "literal", "value": "26.186885245901639344", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "reference": {"head": {"vars": ["games", "avg"]}, "results": {"bindings": [{"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "avg": {"type": "literal", "value": "26.186885245901639344262295", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "expected": {"verdict": "unqualified", "level": null, "note": "without an exact oracle"}
+    },
+    {
+      "name": "check-a2 §6 A: 0.334000000000000000 for 1/3 is wrong against the exact quotient (a pairwise rule would pass it)",
+      "query": "SELECT ?x (?num / ?den AS ?q) WHERE { ?x <http://example.org/num> ?num ; <http://example.org/den> ?den }",
+      "answer": {"head": {"vars": ["x", "q"]}, "results": {"bindings": [{"x": {"type": "uri", "value": "http://example.org/x"}, "q": {"type": "literal", "value": "0.334000000000000000", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "reference": {"head": {"vars": ["x", "q"]}, "results": {"bindings": [{"x": {"type": "uri", "value": "http://example.org/x"}, "q": {"type": "literal", "value": "0.334000000000000001", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "oracle": {"q": [{"row": {"x": {"type": "uri", "value": "http://example.org/x"}}, "quotient": "1/3"}]},
+      "expected": {"verdict": "wrong", "level": null}
+    },
+    {
+      "name": "a negative quotient truncated toward zero, and one rounded half-even",
+      "query": "SELECT ?x (?num / ?den AS ?q) WHERE { ?x <http://example.org/num> ?num ; <http://example.org/den> ?den }",
+      "answer": {"head": {"vars": ["x", "q"]}, "results": {"bindings": [{"x": {"type": "uri", "value": "http://example.org/x"}, "q": {"type": "literal", "value": "-0.666666666666666666", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}, {"x": {"type": "uri", "value": "http://example.org/y"}, "q": {"type": "literal", "value": "-0.666666666666666667", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "reference": {"head": {"vars": ["x", "q"]}, "results": {"bindings": [{"x": {"type": "uri", "value": "http://example.org/x"}, "q": {"type": "literal", "value": "-0.6666666666666666666667", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}, {"x": {"type": "uri", "value": "http://example.org/y"}, "q": {"type": "literal", "value": "-0.6666666666666666666666", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "oracle": {"q": [{"row": {"x": {"type": "uri", "value": "http://example.org/x"}}, "quotient": "-2/3"}, {"row": {"x": {"type": "uri", "value": "http://example.org/y"}}, "quotient": "-2/3"}]},
+      "expected": {"verdict": "ok", "level": "division"}
+    },
+    {
+      "name": "a quotient that terminates, written short, is exact: no precision note (the oracle decides, not the reference)",
+      "query": "SELECT ?x (AVG(?v) AS ?m) WHERE { ?x <http://example.org/v> ?v } GROUP BY ?x",
+      "answer": {"head": {"vars": ["x", "m"]}, "results": {"bindings": [{"x": {"type": "uri", "value": "http://example.org/x"}, "m": {"type": "literal", "value": "0.5", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "reference": {"head": {"vars": ["x", "m"]}, "results": {"bindings": [{"x": {"type": "uri", "value": "http://example.org/x"}, "m": {"type": "literal", "value": "0.500000000000000000001", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "oracle": {"m": [{"row": {"x": {"type": "uri", "value": "http://example.org/x"}}, "quotient": "1/2"}]},
+      "expected": {"verdict": "ok", "level": "division", "note": ""}
+    },
+    {
+      "name": "integers and decimals by value within their datatype; across them, deviates",
+      "query": "SELECT ?i ?d WHERE { ?s <http://example.org/i> ?i ; <http://example.org/d> ?d }",
+      "answer": {"head": {"vars": ["i", "d"]}, "results": {"bindings": [{"i": {"type": "literal", "value": "03", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "d": {"type": "literal", "value": "1.0", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "reference": {"head": {"vars": ["i", "d"]}, "results": {"bindings": [{"i": {"type": "literal", "value": "3", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "d": {"type": "literal", "value": "1.00", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "expected": {"verdict": "ok", "level": "value"}
+    },
+    {
+      "name": "an integer for a decimal of the same value deviates",
+      "query": "SELECT ?d WHERE { ?s <http://example.org/d> ?d }",
+      "answer": {"head": {"vars": ["d"]}, "results": {"bindings": [{"d": {"type": "literal", "value": "1", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}]}},
+      "reference": {"head": {"vars": ["d"]}, "results": {"bindings": [{"d": {"type": "literal", "value": "1.0", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "expected": {"verdict": "deviates", "level": "cross-type"}
+    },
+    {
+      "name": "plain and xsd:string, booleans 1 and true, language tags in any case",
+      "query": "SELECT ?s ?b ?l WHERE { ?x <http://example.org/s> ?s ; <http://example.org/b> ?b ; <http://example.org/l> ?l }",
+      "answer": {"head": {"vars": ["s", "b", "l"]}, "results": {"bindings": [{"s": {"type": "literal", "value": "a"}, "b": {"type": "literal", "value": "1", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "l": {"type": "literal", "value": "x", "xml:lang": "EN"}}]}},
+      "reference": {"head": {"vars": ["s", "b", "l"]}, "results": {"bindings": [{"s": {"type": "literal", "value": "a", "datatype": "http://www.w3.org/2001/XMLSchema#string"}, "b": {"type": "literal", "value": "true", "datatype": "http://www.w3.org/2001/XMLSchema#boolean"}, "l": {"type": "literal", "value": "x", "xml:lang": "en"}}]}},
+      "expected": {"verdict": "ok", "level": "value"}
+    },
+    {
+      "name": "a different value is wrong",
+      "query": "SELECT ?d WHERE { ?s <http://example.org/d> ?d }",
+      "answer": {"head": {"vars": ["d"]}, "results": {"bindings": [{"d": {"type": "literal", "value": "2", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}]}},
+      "reference": {"head": {"vars": ["d"]}, "results": {"bindings": [{"d": {"type": "literal", "value": "1", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}]}},
+      "expected": {"verdict": "wrong", "level": null}
+    },
+    {
+      "name": "q13 as QLever answered it, AVG at 12 digits and COUNT as xsd:int, without an oracle: nothing decides the AVG (T8 Sol r1 S1)",
+      "query": "SELECT ?games (AVG(?age) AS ?avg) (COUNT(?a) AS ?n) WHERE { ?a <http://example.org/games> ?games ; <http://example.org/age> ?age } GROUP BY ?games",
+      "answer": {"head": {"vars": ["games", "avg", "n"]}, "results": {"bindings": [{"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "avg": {"type": "literal", "value": "26.1868852459", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#int"}}]}},
+      "reference": {"head": {"vars": ["games", "avg", "n"]}, "results": {"bindings": [{"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "avg": {"type": "literal", "value": "26.186885245901639344262295", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}]}},
+      "expected": {"verdict": "unqualified", "level": null, "note": "without an exact oracle"}
+    },
+    {
+      "name": "q13 as QLever answered it, with the exact quotient: the AVG holds, the COUNT deviates (T8 Sol r1 S1)",
+      "query": "SELECT ?games (AVG(?age) AS ?avg) (COUNT(?a) AS ?n) WHERE { ?a <http://example.org/games> ?games ; <http://example.org/age> ?age } GROUP BY ?games",
+      "answer": {"head": {"vars": ["games", "avg", "n"]}, "results": {"bindings": [{"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "avg": {"type": "literal", "value": "26.1868852459", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#int"}}]}},
+      "reference": {"head": {"vars": ["games", "avg", "n"]}, "results": {"bindings": [{"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "avg": {"type": "literal", "value": "26.186885245901639344262295", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}]}},
+      "oracle": {"avg": [{"row": {"games": {"type": "uri", "value": "http://example.org/1896/Summer"}, "n": {"type": "literal", "value": "305", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}}, "quotient": "7987/305"}]},
+      "expected": {"verdict": "deviates", "level": "cross-type", "note": "COUNT not xsd:integer"}
+    },
+    {
+      "name": "an AVG over doubles is a double, compared by value: a different one is wrong (T8 Sol r1 S2)",
+      "query": "SELECT (AVG(?w) AS ?avg) WHERE { ?s <http://example.org/weight> ?w }",
+      "answer": {"head": {"vars": ["avg"]}, "results": {"bindings": [{"avg": {"type": "literal", "value": "3.25E0", "datatype": "http://www.w3.org/2001/XMLSchema#double"}}]}},
+      "reference": {"head": {"vars": ["avg"]}, "results": {"bindings": [{"avg": {"type": "literal", "value": "2.25E0", "datatype": "http://www.w3.org/2001/XMLSchema#double"}}]}},
+      "expected": {"verdict": "wrong", "level": null}
+    },
+    {
+      "name": "two decimal AVGs that can't both be one quotient at their own digits: wrong without an oracle",
+      "query": "SELECT (AVG(?n) AS ?avg) WHERE { ?s <http://example.org/n> ?n }",
+      "answer": {"head": {"vars": ["avg"]}, "results": {"bindings": [{"avg": {"type": "literal", "value": "3.25", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "reference": {"head": {"vars": ["avg"]}, "results": {"bindings": [{"avg": {"type": "literal", "value": "2.25", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "expected": {"verdict": "wrong", "level": null}
+    },
+    {
+      "name": "a COUNT divided is a division, not a COUNT's own result (T8 Sol r1 S3)",
+      "query": "SELECT (COUNT(*) / 2 AS ?half) WHERE { VALUES ?x { 1 } }",
+      "answer": {"head": {"vars": ["half"]}, "results": {"bindings": [{"half": {"type": "literal", "value": "0.5", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "reference": {"head": {"vars": ["half"]}, "results": {"bindings": [{"half": {"type": "literal", "value": "0.5", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}}]}},
+      "expected": {"verdict": "ok", "level": "exact"}
+    },
+    {
+      "name": "two spellings of one xsd:float, a binary32 value (T8 Sol r1 S4)",
+      "query": "SELECT ?f WHERE { ?s <http://example.org/f> ?f }",
+      "answer": {"head": {"vars": ["f"]}, "results": {"bindings": [{"f": {"type": "literal", "value": "0.1", "datatype": "http://www.w3.org/2001/XMLSchema#float"}}]}},
+      "reference": {"head": {"vars": ["f"]}, "results": {"bindings": [{"f": {"type": "literal", "value": "0.10000000149011612", "datatype": "http://www.w3.org/2001/XMLSchema#float"}}]}},
+      "expected": {"verdict": "ok", "level": "value"}
+    },
+    {
+      "name": "an xsd:float just above a binary32 midpoint is the value above it, not rounded twice (T8 Sol r2 S4)",
+      "query": "SELECT ?f WHERE { ?s <http://example.org/f> ?f }",
+      "answer": {"head": {"vars": ["f"]}, "results": {"bindings": [{"f": {"type": "literal", "value": "1.0000000596046448", "datatype": "http://www.w3.org/2001/XMLSchema#float"}}]}},
+      "reference": {"head": {"vars": ["f"]}, "results": {"bindings": [{"f": {"type": "literal", "value": "1.0000001", "datatype": "http://www.w3.org/2001/XMLSchema#float"}}]}},
+      "expected": {"verdict": "ok", "level": "value"}
+    }
+  ],
+  "known": [
+    {"name": "a count by its integer value", "term": {"type": "literal", "value": "7", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "known": 7, "expected": "value"},
+    {"name": "a count as a decimal of the same value", "term": {"type": "literal", "value": "7", "datatype": "http://www.w3.org/2001/XMLSchema#decimal"}, "known": 7, "expected": "cross-type"},
+    {"name": "a count as an xsd:int", "term": {"type": "literal", "value": "7", "datatype": "http://www.w3.org/2001/XMLSchema#int"}, "known": "7", "expected": "cross-type"},
+    {"name": "another count", "term": {"type": "literal", "value": "8", "datatype": "http://www.w3.org/2001/XMLSchema#integer"}, "known": 7, "expected": null},
+    {"name": "a string by its text", "term": {"type": "literal", "value": "Berlin"}, "known": "Berlin", "expected": "value"}
+  ]
+}

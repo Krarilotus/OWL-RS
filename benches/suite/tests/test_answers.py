@@ -8,6 +8,8 @@ adjudicated count; and the host registry (suitekit/hosts.py).
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -40,22 +42,139 @@ def parse(*args) -> answers.Answer:
     return answers.parse(select(*args))
 
 
+FIXTURES = Path(__file__).resolve().parent.parent / "fixtures" / "answer-levels.json"
+
+
+class Levels(unittest.TestCase):
+    """The answer contract's shared cases (fixtures/answer-levels.json, the one set every
+    comparator passes): R16 check-a2's q02/q13 witnesses and its 1/3 counterexample, the COUNT
+    datatype, decimal division with and without its exact oracle, the known-value route."""
+
+    def test_every_case_of_the_contract(self):
+        cases = json.loads(FIXTURES.read_text(encoding="utf-8"))
+        wrong = []
+        for case in cases["compare"]:
+            order, limit = answers.order_of(case["query"])
+            got = answers.compare(answers.parse(json.dumps(case["answer"])), answers.parse(json.dumps(case["reference"])),
+                                  order, limit, ops=answers.operators(case["query"]),
+                                  oracle=answers.oracle_of(case["oracle"]) if "oracle" in case else None)
+            expected = case["expected"]
+            note = expected.get("note")
+            if (got["verdict"], got["level"]) != (expected["verdict"], expected["level"]) \
+                    or (note is not None and (note not in got["note"] if note else got["note"])):
+                wrong.append(f"{case['name']}: {got['verdict']}/{got['level']} ({got['note']!r})")
+        for case in cases["known"]:
+            got = answers.same_value(case["term"], case["known"])
+            if got != case["expected"]:
+                wrong.append(f"{case['name']}: {got}")
+        self.assertEqual(wrong, [], "SPEC answer contract (rule.owl-rs-answer-comparison)")
+
+
+class OracleCompare(unittest.TestCase):
+    """benches/oracle/compare.py (NRESE against Jena on the differential tests' queries) compares
+    terms through the contract: its own integer folding and 18-digit decimal truncation agreed
+    where the contract says cross-type and decimal division without an oracle."""
+
+    def test_the_differential_comparison_classifies_as_the_contract_does(self):
+        spec_ = importlib.util.spec_from_file_location(
+            "oracle_compare", Path(__file__).resolve().parents[2] / "oracle" / "compare.py")
+        oracle_compare = importlib.util.module_from_spec(spec_)
+        spec_.loader.exec_module(oracle_compare)
+        x = "http://www.w3.org/2001/XMLSchema#"
+        cases = {  # name: (query, NRESE's rows, Jena's rows)
+            "q1": ("SELECT ?n WHERE { ?s <http://e/p> ?n }", f'"7"^^<{x}int>', f'"7"^^<{x}integer>'),
+            "q2": ("SELECT ?g (AVG(?a) AS ?m) WHERE { ?s <http://e/g> ?g ; <http://e/a> ?a } GROUP BY ?g",
+                   f'<http://e/1896>\t"26.186885245901639344"^^<{x}decimal>',
+                   f'<http://e/1896>\t"26.186885245901639344262295"^^<{x}decimal>'),
+            "q3": ("SELECT ?n WHERE { ?s <http://e/p> ?n }", f'"7"^^<{x}integer>', f'"8"^^<{x}integer>'),
+            # T8 Sol r1 S2: an AVG over doubles is compared by value; two decimal AVGs that can't
+            # both be one quotient at their own digits are no division to leave to an oracle.
+            "q4": ("SELECT ?g (AVG(?w) AS ?m) WHERE { ?s <http://e/g> ?g ; <http://e/w> ?w } GROUP BY ?g",
+                   f'<http://e/1896>\t"3.25E0"^^<{x}double>', f'<http://e/1896>\t"2.25E0"^^<{x}double>'),
+            "q5": ("SELECT ?g (AVG(?a) AS ?m) WHERE { ?s <http://e/g> ?g ; <http://e/a> ?a } GROUP BY ?g",
+                   f'<http://e/1896>\t"3.25"^^<{x}decimal>', f'<http://e/1896>\t"2.25"^^<{x}decimal>'),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            where = Path(tmp) / "dump" / "suite" / "case"
+            where.mkdir(parents=True)
+            for name, (query, nrese, jena) in cases.items():
+                header = "?g\t?m" if "\t" in nrese else "?n"
+                (where / f"{name}.rq").write_text(query + "\n", encoding="utf-8")
+                (where / f"{name}.nrese").write_text(f"{header}\n{nrese}\n", encoding="utf-8")
+                (where / f"{name}.jena").write_text(f"{header}\n{jena}\n", encoding="utf-8")
+            report = Path(tmp) / "report.md"
+            with patch("sys.stdout"):
+                code = oracle_compare.main([str(Path(tmp) / "dump"), "--report", str(report)])
+            text = report.read_text(encoding="utf-8")
+        self.assertEqual(code, 1, "q3's different value stays unexplained")
+        self.assertIn("**cross-type** (1)", text, "SPEC answer contract: an xsd:int for an xsd:integer isn't agreement")
+        self.assertIn("**division** (1)", text, "SPEC answer contract: no 18-digit truncation qualifies a division")
+        unexplained = text.split("## Unexplained")[1]
+        self.assertEqual([q for q in ("q3", "q4", "q5") if f"suite/case/{q}" not in unexplained], [],
+                         "SPEC answer contract: a different value is unexplained, a division's result too")
+
+
+class SameAnswers(unittest.TestCase):
+    """benches/sparql/same_answers.py (two runs' answers, system by system) compares through the
+    contract with each query's operators (T8 Sol r1 S5): without them two conformant lengths of
+    one AVG read as a wrong answer. Operators a run didn't record (answers.json from before T8)
+    are unknown, not absent (Sol r2 S5): such a difference stays undecided."""
+
+    def test_two_runs_compare_with_the_querys_operators(self):
+        spec_ = importlib.util.spec_from_file_location(
+            "same_answers", Path(__file__).resolve().parents[2] / "sparql" / "same_answers.py")
+        same_answers = importlib.util.module_from_spec(spec_)
+        spec_.loader.exec_module(same_answers)
+        item = ["w", "t", "none", "q13.rq"]
+        records = {"recorded": ({"items": [{"item": item, "operators": {"avg": "division"}}]}, "unqualified"),
+                   "not recorded": ({"items": [{"item": item}]}, "unqualified"),
+                   "no items": ({}, "unqualified"),
+                   "recorded as none": ({"items": [{"item": item, "operators": {}}]}, "wrong")}
+        got = {}
+        for name, (record, _) in records.items():
+            with tempfile.TemporaryDirectory() as tmp:
+                runs = []
+                for side, avg in (("a", "26.186885245901639344"), ("b", "26.186885245901639344262295")):
+                    run = Path(tmp) / side
+                    run.mkdir()
+                    body = select(["games", "avg"], [iri("1896"), lit(avg, "decimal")])
+                    (run / "q13.json").write_text(body, encoding="utf-8")
+                    (run / "answers.json").write_text(json.dumps(record | {
+                        "captures": [{"item": item, "system": "nrese", "cache": "off", "run": 1, "path": "q13.json",
+                                      "sha256": hashlib.sha256(body.encode()).hexdigest()}]}), encoding="utf-8")
+                    runs.append(str(run))
+                with patch("sys.stdout", new_callable=io.StringIO) as out:
+                    same_answers.main(["same_answers.py", *runs])
+            line = next(l for l in out.getvalue().splitlines() if "q13.rq" in l)
+            got[name] = line.split("q13.rq: ")[1].split()[0]
+        self.assertEqual(got, {name: verdict for name, (_, verdict) in records.items()},
+                         "SPEC answer contract: an AVG without its oracle is undecided, also where the operators "
+                         "are unknown; known to have none, the decimals are data and differ")
+
+
 class Compare(unittest.TestCase):
-    def test_an_int_count_matches_by_value_and_names_the_datatype(self):
+    def test_an_int_count_deviates_and_names_the_datatype(self):
         reference = parse(["n"], [lit(300, "integer")])
         qlever = parse(["n"], [lit(300, "int")])
-        verdict = answers.compare(qlever, reference)
-        self.assertEqual(verdict["verdict"], "ok")
-        self.assertTrue(verdict["value_match"])
-        self.assertFalse(verdict["strict_match"])
-        self.assertIn("xsd:int for xsd:integer", verdict["note"])
+        verdict = answers.compare(qlever, reference, ops=answers.operators("SELECT (COUNT(*) AS ?n) { ?s ?p ?o }"))
+        self.assertEqual((verdict["verdict"], verdict["value_match"]), ("deviates", False))
+        self.assertIn("COUNT not xsd:integer: ?n xsd:int", verdict["note"])
 
-    def test_values_compare_within_a_primitive_type_only(self):
+    def test_values_compare_within_one_datatype(self):
         integer = parse(["n"], [lit(1, "integer")])
-        self.assertTrue(answers.compare(parse(["n"], [lit("1.0", "decimal")]), integer)["value_match"])
-        self.assertFalse(answers.compare(parse(["n"], [lit("1.0E0", "double")]), integer)["value_match"])
-        self.assertFalse(answers.compare(parse(["n"], [lit(2, "int")]), integer)["value_match"])
+        self.assertEqual(answers.compare(parse(["n"], [lit("01", "integer")]), integer)["level"], "value")
+        self.assertEqual(answers.compare(parse(["n"], [lit("1.0", "decimal")]), integer)["verdict"], "deviates")
+        self.assertEqual(answers.compare(parse(["n"], [lit("1.0E0", "double")]), integer)["verdict"], "deviates")
+        self.assertEqual(answers.compare(parse(["n"], [lit(2, "int")]), integer)["verdict"], "wrong")
         self.assertTrue(answers.compare(parse(["s"], [lit("a", "string")]), parse(["s"], [lit("a")]))["value_match"])
+
+    def test_the_operators_of_a_query(self):
+        query = ('SELECT ?g (COUNT(DISTINCT ?a) AS ?n) (AVG(?age) AS ?avg) (?x / 2 AS ?half) (STR(<http://a/b>) AS ?s)'
+                 ' WHERE { ?a <http://e/g> ?g }')
+        self.assertEqual(answers.operators(query), {"n": "count", "avg": "division", "half": "division"})
+        # T8 Sol r1 S3: only a COUNT's own result must be xsd:integer.
+        self.assertEqual(answers.operators("SELECT (COUNT(*) / 2 AS ?half) (COUNT(?x) + 1 AS ?m) WHERE { }"),
+                         {"half": "division"}, "SPEC answer contract: a COUNT divided is a division")
 
     def test_a_bag_ignores_order_a_sequence_does_not(self):
         a, b = [iri("a")], [iri("b")]
@@ -325,8 +444,10 @@ class Groups(unittest.TestCase):
             self.assertEqual(group["verdict"], "wrong")
             self.assertEqual(group["wrong"], ["virtuoso"])
             self.assertEqual(group["unsupported"], ["rdfox"])
-            self.assertIn("xsd:int for xsd:integer", group["strict_differs"]["qlever"])
-            self.assertIn("virtuoso", answers.table(groups))
+            # The same number in another datatype: deviates, named, not timed (the answer contract).
+            self.assertEqual(group["deviates"], ["qlever"])
+            self.assertIn("xsd:int for xsd:integer", group["systems"]["qlever"]["note"])
+            self.assertIn("deviates: qlever", answers.table(groups))
 
     def test_captures_read_back_classify_the_same(self):
         with tempfile.TemporaryDirectory() as tmp:

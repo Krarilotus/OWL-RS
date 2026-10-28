@@ -21,20 +21,31 @@ is `ok` when confirmed (by the second reference or an adjudicated count), else `
 
 | Verdict | Meaning |
 |---|---|
-| `ok` | the answer equals the reference's by value (`value_match`); `strict_match` says whether the terms are also the same as written, and `note` names the datatypes that differ |
+| `ok` | the same answer as the reference's (`level`: `exact`, `value` or `division`, below); `strict_match` says whether the terms are also the same as written |
 | `wrong` | the values differ: the system's answer is wrong (the reference is checked as above) |
+| `deviates` | the same values only across datatypes (`cross-type`), or a COUNT not typed `xsd:integer`: reported, not timed, not disqualifying |
 | `incomplete` | no answer: an error, a timeout, not JSON, not captured; or no reference answered |
 | `unsupported` | the system can't run the query (the suite skipped the pair, or the system says so) |
-| `unqualified` | the comparison can't decide: blank nodes (they need an isomorphism), or the references disagree |
+| `unqualified` | the comparison can't decide: blank nodes (they need an isomorphism), a decimal division without an exact oracle, or the references disagree |
 | `reference` | the reference's own answer, not confirmed by a second reference or a count |
 
-A group's verdict is its worst system's, in that order of precedence: `wrong` (naming
-whose), `unqualified`, `incomplete`, `unsupported`, then `ok`. One deviating system never
-disqualifies the others.
+A group's verdict is its worst system's, in that order of precedence (PRECEDENCE, the one list
+every report reads): `wrong` (naming whose), `unqualified`, `deviates`, `incomplete`,
+`unsupported`, then `ok`. One deviating system never disqualifies the others.
 
-A value match takes numeric literals by their value within one XSD primitive type
-(`"3"^^xsd:int` is the integer 3, as `"3"^^xsd:integer` is; `xsd:double` is apart), plain
-literals as `xsd:string`, and language tags case-insensitively. The order compared:
+**The levels** (rule.owl-rs-answer-comparison: the same datatype and value counts as the same
+answer for timing; a numeric match across types is diagnostic only; only wrong answers
+disqualify), each binding at the first that holds and the answer at its worst:
+
+| Level | Holds when |
+|---|---|
+| `exact` | the RDF terms are identical |
+| `value` | the same datatype IRI and the same value in its value space: integers and decimals exactly, doubles and floats by IEEE value, booleans `1`/`true`, plain literals as `xsd:string`, language tags case-insensitively; other datatypes as written |
+| `division` | a computed decimal division (AVG, `/`) equal to its exact quotient (an oracle, by row) rounded half-even or truncated at its own last digit; fewer than 18 significant digits is a note (F&O 3.1 §4.2's SHOULD), not a fault. Without an oracle a difference there is `unqualified`: no output length, scale or tolerance qualifies it; it is `wrong` where the two results' own digits rule out one quotient. Only an `xsd:decimal` result: a division's double or float is compared by value |
+| `cross-type` | the same numbers across datatypes: `deviates` |
+
+A COUNT's variable must be `xsd:integer` (SPARQL 1.1 §18.5.1.2), whatever the reference says:
+otherwise the answer is at best `deviates`, and no reference. The order compared:
 
 | Query | Compared as |
 |---|---|
@@ -52,10 +63,12 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from pathlib import Path
 
 XSD = "http://www.w3.org/2001/XMLSchema#"
-# Primitive XSD types and the types derived from them whose values compare across.
+INTEGER = XSD + "integer"
+# XSD's decimal and the types derived from it (the integers), and its two floating types.
 DECIMAL_TYPES = {XSD + t for t in (
     "decimal", "integer", "int", "long", "short", "byte", "nonNegativeInteger", "positiveInteger",
     "nonPositiveInteger", "negativeInteger", "unsignedLong", "unsignedInt", "unsignedShort", "unsignedByte")}
@@ -65,8 +78,16 @@ ORDERED = re.compile(r"\bORDER\s+BY\b", re.I)
 FINAL_LIMIT = re.compile(r"\s+(?:OFFSET\s+\d+\s+)?LIMIT\s+(\d+)(?:\s+OFFSET\s+\d+)?\s*$", re.I)
 UNSUPPORTED = re.compile(r"unsupported|not supported|not implemented", re.I)
 
-# A group's verdict is its worst system's.
-PRECEDENCE = ("wrong", "unqualified", "incomplete", "unsupported", "reference", "ok")
+# The verdicts, worst first: a group's verdict is its worst system's. Every report reads them
+# from here.
+PRECEDENCE = ("wrong", "unqualified", "deviates", "incomplete", "unsupported", "reference", "ok")
+# Those a group names its systems for.
+FAULTS = PRECEDENCE[:5]
+# Those whose time no report takes: not the reference's answer, or not known to be (a capture
+# that failed after the timed runs included: incomplete).
+UNTIMED = FAULTS
+# F&O 3.1 §4.2: a decimal division SHOULD give at least 18 significant digits.
+DIVISION_DIGITS = 18
 
 
 def short(datatype: str | None) -> str:
@@ -75,30 +96,134 @@ def short(datatype: str | None) -> str:
     return "xsd:" + datatype[len(XSD):] if datatype.startswith(XSD) else datatype
 
 
+def number(term: dict) -> Fraction | None:
+    """A numeric literal's exact value (a double's binary64 one, a float's binary32 one); None
+    for anything else, NaN or an ill-typed literal."""
+    if term.get("type") not in ("literal", "typed-literal") or "xml:lang" in term:
+        return None
+    datatype, text = term.get("datatype"), term.get("value", "").strip()
+    try:
+        if datatype in DECIMAL_TYPES:
+            return Fraction(Decimal(text))
+        if datatype == XSD + "float":
+            return binary32(Fraction(Decimal(text)))
+        if datatype in FLOAT_TYPES:
+            return Fraction(float(text.replace("INF", "inf")))
+    except (InvalidOperation, ValueError, OverflowError):
+        pass
+    return None
+
+
+def binary32(value: Fraction) -> Fraction:
+    """VALUE rounded to the nearest IEEE binary32 value, ties to even: an xsd:float's value from
+    its exact literal (through a binary64 it would round twice); OverflowError past the largest."""
+    if value == 0:
+        return value
+    magnitude = abs(value)
+    exponent = magnitude.numerator.bit_length() - magnitude.denominator.bit_length()
+    if magnitude < Fraction(2) ** exponent:
+        exponent -= 1  # 2^exponent <= magnitude < 2^(exponent + 1)
+    unit = Fraction(2) ** (max(exponent, -126) - 23)  # 24 significant bits; subnormals below 2^-126
+    rounded = round(magnitude / unit) * unit
+    if rounded >= Fraction(2) ** 128:
+        raise OverflowError("beyond binary32")
+    return rounded if value > 0 else -rounded
+
+
 def value_key(term: dict) -> tuple:
-    """A term by its value: what `value_match` compares."""
+    """A term by its datatype and value: the `value` level."""
     kind = term.get("type")
     if kind in ("literal", "typed-literal"):
         datatype, text = term.get("datatype"), term.get("value", "")
         if "xml:lang" in term:
             return ("lang", text, term["xml:lang"].lower())
-        try:
-            if datatype in DECIMAL_TYPES:
-                return ("decimal", Decimal(text.strip()))
-            if datatype in FLOAT_TYPES:
-                return ("double", float(text.strip()))
-        except (InvalidOperation, ValueError):
-            pass  # an ill-typed literal compares as written
         if datatype in (None, XSD + "string"):
             return ("string", text)
+        if datatype in FLOAT_TYPES and text.strip() == "NaN":
+            return ("number", datatype, "NaN")
+        value = number(term)
+        if value is not None:
+            return ("number", datatype, value)
         if datatype == XSD + "boolean" and text.strip() in ("true", "false", "1", "0"):
             return ("boolean", text.strip() in ("true", "1"))
-        return ("literal", text, datatype)
+        return ("literal", text, datatype)  # also an ill-typed literal: as written
     return (kind, term.get("value"))
+
+
+def cross_key(term: dict) -> tuple:
+    """A term by its value across numeric datatypes: the `cross-type` level, diagnostic only."""
+    value = number(term)
+    return ("number", value) if value is not None else value_key(term)
 
 
 def strict_key(term: dict) -> str:
     return json.dumps(term, sort_keys=True, separators=(",", ":"))
+
+
+def select_expressions(query: str) -> dict[str, str]:
+    """Each projected `(EXPRESSION AS ?v)` of a query, by variable (IRIs and strings blanked, so
+    their characters don't count as operators)."""
+    text = re.sub(r"<[^<>\s]*>|\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'", "<>", query)
+    out = {}
+    for m in re.finditer(r"\bAS\s+\?(\w+)\s*\)", text, re.I):
+        depth, i = 0, m.start()
+        while i > 0:
+            i -= 1
+            if text[i] == ")":
+                depth += 1
+            elif text[i] == "(":
+                if depth == 0:
+                    break
+                depth -= 1
+        out[m.group(1)] = text[i + 1:m.start()].strip()
+    return out
+
+
+def called(expression: str) -> str | None:
+    """The function an expression is one call of (`COUNT(*)`, not `COUNT(*) / 2`), upper case."""
+    m = re.match(r"(\w+)\s*\(", expression)
+    if not m:
+        return None
+    depth = 0
+    for i in range(m.end() - 1, len(expression)):
+        depth += {"(": 1, ")": -1}.get(expression[i], 0)
+        if depth == 0:
+            return m.group(1).upper() if i == len(expression) - 1 else None
+    return None
+
+
+def operators(query: str) -> dict[str, str]:
+    """The variables whose datatype the query's operator fixes or makes approximate: `count` (a
+    COUNT's own result, so xsd:integer) and `division` (AVG or `/` in it: decimal division,
+    exact only by an oracle)."""
+    out = {}
+    for v, expression in select_expressions(query).items():
+        if called(expression) == "COUNT":
+            out[v] = "count"
+        elif re.search(r"\bAVG\s*\(", expression, re.I) or "/" in expression:
+            out[v] = "division"
+    return out
+
+
+def count_faults(answer: Answer, ops: dict[str, str]) -> list[str]:
+    """The COUNT variables an answer gives in another datatype than xsd:integer."""
+    return sorted({f"?{v} {short(t.get('datatype'))}" for row in answer.rows for v, t in row.items()
+                   if ops.get(v) == "count" and t.get("datatype") != INTEGER})
+
+
+def division_holds(term: dict, quotient: Fraction) -> tuple[bool, str]:
+    """Whether a decimal division's result is its exact quotient rounded half-even or truncated
+    at its own last digit; a note when it has fewer significant digits than F&O 3.1 asks."""
+    if term.get("datatype") != XSD + "decimal" or number(term) is None:
+        return False, ""
+    value = Decimal(term["value"].strip())
+    scale = 10 ** max(0, -value.as_tuple().exponent)
+    if Fraction(value) not in (Fraction(int(quotient * scale), scale), Fraction(round(quotient * scale), scale)):
+        return False, ""
+    significant = len(value.normalize().as_tuple().digits)
+    exact = (quotient * scale).denominator == 1
+    return True, "" if exact or significant >= DIVISION_DIGITS else \
+        f"{significant} significant digits, fewer than F&O 3.1 §4.2's {DIVISION_DIGITS}"
 
 
 @dataclass
@@ -110,9 +235,6 @@ class Answer:
     @property
     def blank(self) -> bool:
         return any(t.get("type") == "bnode" for row in self.rows for t in row.values())
-
-    def keys(self, key) -> list[tuple]:
-        return [tuple(sorted((v, key(t)) for v, t in row.items())) for row in self.rows]
 
 
 def parse(body: str) -> Answer:
@@ -149,8 +271,19 @@ def datatypes(answer: Answer) -> dict[str, Counter]:
     return out
 
 
+def decimal(term: dict) -> bool:
+    return term.get("datatype") == XSD + "decimal" and number(term) is not None
+
+
+def row_keys(answer: Answer, key, masked=frozenset()) -> list[tuple]:
+    """Each row by KEY, the decimal results of the MASKED variables (divisions) left to their
+    oracle: compared only as being such results. Any other result of theirs is compared by KEY."""
+    return [tuple(sorted((v, ("decimal division",) if v in masked and decimal(t) else key(t)) for v, t in row.items()))
+            for row in answer.rows]
+
+
 def agree(answer: Answer, reference: Answer, order: str, limit: int | None, full: Answer | None,
-          key) -> bool:
+          key, masked=frozenset()) -> bool:
     if (answer.boolean is None) != (reference.boolean is None):
         return False
     if answer.boolean is not None:
@@ -158,37 +291,126 @@ def agree(answer: Answer, reference: Answer, order: str, limit: int | None, full
     if answer.variables != reference.variables:
         return False
     if order == "sequence":
-        return answer.keys(key) == reference.keys(key)
+        return row_keys(answer, key, masked) == row_keys(reference, key, masked)
     if order == "limit":
-        pool = Counter(full.keys(key))
-        got = Counter(answer.keys(key))
+        pool = Counter(row_keys(full, key, masked))
+        got = Counter(row_keys(answer, key, masked))
         return sum(got.values()) == min(limit, sum(pool.values())) and not (got - pool)
-    return Counter(answer.keys(key)) == Counter(reference.keys(key))
+    return Counter(row_keys(answer, key, masked)) == Counter(row_keys(reference, key, masked))
+
+
+def oracle_of(spec: dict) -> dict:
+    """An oracle as the fixtures write it (benches/suite/fixtures/answer-levels.json: per
+    variable, each row's other columns and its quotient "n/d"), as `compare` takes it."""
+    return {v: {other_columns(e["row"], ()): Fraction(e["quotient"]) for e in entries} for v, entries in spec.items()}
+
+
+def other_columns(row: dict, columns) -> tuple:
+    """A row by its bindings outside the division COLUMNS, by value across datatypes: which row
+    a division's result belongs to (a datatype deviation there is reported on its own)."""
+    return tuple(sorted((v, cross_key(t)) for v, t in row.items() if v not in columns))
+
+
+def divisions(answer: Answer, columns: set[str], oracle: dict | None) -> tuple[bool | None, str]:
+    """Whether every decimal result of the division COLUMNS is its exact quotient (the oracle:
+    per variable, by the row's other columns); None when there is no oracle for one. Any other
+    result of theirs was compared by value (`row_keys`)."""
+    if not oracle or any(v not in oracle for v in columns):
+        return None, ""
+    notes = set()
+    for row in answer.rows:
+        other = other_columns(row, columns)
+        for v in sorted(c for c in columns if c not in row or decimal(row[c])):
+            quotient = oracle[v].get(other)
+            if v not in row or quotient is None:
+                return None, ""
+            holds, note = division_holds(row[v], quotient)
+            if not holds:
+                return False, f"?{v} {row[v].get('value')} isn't the exact quotient {quotient} at its own digits"
+            if note:
+                notes.add(f"?{v}: {note}")
+    return True, "; ".join(sorted(notes))
+
+
+def apart(a: dict, b: dict) -> bool:
+    """Whether two decimal division results can't both be one quotient rounded or truncated at
+    their own last digits: each is less than a unit in its last place from it."""
+    x, y = (Decimal(t["value"].strip()) for t in (a, b))
+    return abs(Fraction(x) - Fraction(y)) >= sum(Fraction(1, 10 ** max(0, -d.as_tuple().exponent)) for d in (x, y))
+
+
+def refuted(answer: Answer, reference: Answer, columns: set[str]) -> str:
+    """A decimal result of the division COLUMNS that the reference's, in the one row equal but
+    for those results, rules out (`apart`); '' where none does. Without an oracle this tells a
+    wrong answer from an undecided one; it never qualifies one."""
+    theirs: dict[tuple, list[dict]] = {}
+    for key, row in zip(row_keys(reference, cross_key, columns), reference.rows):
+        theirs.setdefault(key, []).append(row)
+    for key, row in zip(row_keys(answer, cross_key, columns), answer.rows):
+        paired = theirs.get(key, [])
+        for v in sorted(columns) if len(paired) == 1 else ():
+            a, b = row.get(v), paired[0].get(v)
+            if a and b and decimal(a) and decimal(b) and apart(a, b):
+                return f"?{v} {a['value']} and the reference's {b['value']} can't both be one quotient at their digits"
+    return ""
 
 
 def compare(answer: Answer, reference: Answer, order: str = "bag", limit: int | None = None,
-            full: Answer | None = None) -> dict:
-    """One answer against the reference's: verdict (ok, wrong, incomplete, unqualified),
-    strict_match, value_match, note."""
+            full: Answer | None = None, ops: dict[str, str] | None = None, oracle: dict | None = None) -> dict:
+    """One answer against the reference's, each binding at the first level that holds (the
+    module's table) and the answer at its worst: verdict (ok, wrong, deviates, incomplete,
+    unqualified), level, strict_match, value_match, note. OPS: the query's operators
+    (`operators`), None where they are unknown (any decimal result may then be a division's);
+    ORACLE: the exact quotients of its divisions."""
+    def result(verdict, level=None, strict=None, value=None, note=""):
+        return dict(verdict=verdict, level=level, strict_match=strict, value_match=value, note=note)
+
+    def agrees(key, masked=frozenset()):
+        return agree(answer, reference, order, limit, full, key, masked)
     if answer.blank or reference.blank:
-        return dict(verdict="unqualified", strict_match=None, value_match=None,
-                    note="blank nodes: the answers need an isomorphism check")
+        return result("unqualified", note="blank nodes: the answers need an isomorphism check")
     if order == "limit" and full is None:
-        return dict(verdict="incomplete", strict_match=None, value_match=None,
-                    note="no reference answer without the LIMIT")
-    strict = agree(answer, reference, order, limit, full, strict_key)
-    value = strict or agree(answer, reference, order, limit, full, value_key)
-    note = ""
-    if value and not strict:
-        mine, theirs = datatypes(answer), datatypes(reference)
-        differing = [f"?{v} {', '.join(sorted(mine.get(v, {})))} for {', '.join(sorted(theirs.get(v, {})))}"
-                     for v in sorted(set(mine) | set(theirs)) if set(mine.get(v, {})) != set(theirs.get(v, {}))]
-        note = "datatypes differ: " + "; ".join(differing) if differing else "terms differ as written"
-    elif not value and order == "sequence" and Counter(answer.keys(value_key)) == Counter(reference.keys(value_key)):
+        return result("incomplete", note="no reference answer without the LIMIT")
+    known = ops is not None
+    ops = ops or {}
+    faults = count_faults(answer, ops)
+    strict = agrees(strict_key)
+    value = strict or agrees(value_key)
+    cross = value or agrees(cross_key)
+    level, note = ("exact" if strict else "value") if value else None, ""
+    mine, theirs = datatypes(answer), datatypes(reference)
+    differing = "; ".join(f"?{v} {', '.join(sorted(mine.get(v, {})))} for {', '.join(sorted(theirs.get(v, {})))}"
+                          for v in sorted(set(mine) | set(theirs)) if set(mine.get(v, {})) != set(theirs.get(v, {})))
+    why = [f"COUNT not xsd:integer: {', '.join(faults)}"] if faults else []
+    division = {v for v, op in ops.items() if op == "division"} if known else set(answer.variables)
+    if not cross and division and agrees(cross_key, division):
+        # Every other binding agrees, at most across datatypes: the divisions' decimal results
+        # are their exact quotients' to decide.
+        held, note = divisions(answer, division, oracle)
+        if held is None:
+            note = refuted(answer, full if order == "limit" else reference, division)
+            if note:
+                return result("wrong", None, False, False, note)
+            what = f"decimal division ({', '.join('?' + v for v in sorted(division))})" if known \
+                else "decimal results, any of them a division's (the query's operators unknown),"
+            return result("unqualified", strict=False, value=False, note="; ".join([
+                f"{what} without an exact oracle: no output length, scale or tolerance qualifies it", *why]))
+        if not held:
+            return result("wrong", None, False, False, note)
+        cross, value = True, agrees(value_key, division)
+        level = "division" if value else None
+    if value and not faults:
+        if level == "value":
+            note = note or "terms differ as written"
+        return result("ok", level, strict, True, note)
+    if cross:
+        why += [f"datatypes differ: {differing}"] if differing and not value else []
+        return result("deviates", "cross-type", strict, False, "; ".join(why + ([note] if note else [])))
+    if order == "sequence" and Counter(row_keys(answer, value_key)) == Counter(row_keys(reference, value_key)):
         note = "same rows in another order (ties in the sort key are not told apart)"
-    elif not value and answer.boolean is None and reference.boolean is None:
-        note = f"{len(answer.rows)} rows for the reference's {len(reference.rows)}"
-    return dict(verdict="ok" if value else "wrong", strict_match=strict, value_match=value, note=note)
+    elif answer.boolean is None and reference.boolean is None:
+        note = note or f"{len(answer.rows)} rows for the reference's {len(reference.rows)}"
+    return result("wrong", None, False, False, note)
 
 
 @dataclass
@@ -234,17 +456,30 @@ def capped_post(url: str, data: dict, timeout: float = 30) -> tuple[int, str]:
         return 0, ""
 
 
-def same_value(term: dict, known) -> bool:
-    """A term against a known value: numerically when both are numbers, else as written."""
-    text = term.get("value", "")
-    try:
-        return Decimal(text.strip()) == Decimal(str(known).strip())
-    except (InvalidOperation, ValueError):
-        return text == str(known)
+def known_term(known) -> dict:
+    """A known value as the term it stands for: an integer is xsd:integer (a count), another
+    number xsd:decimal, anything else a plain literal."""
+    text = str(known).strip()
+    for datatype, parse_ in ((INTEGER, int), (XSD + "decimal", Decimal)):
+        try:
+            parse_(text)
+            return {"type": "literal", "value": text, "datatype": datatype}
+        except (ValueError, InvalidOperation):
+            continue
+    return {"type": "literal", "value": str(known)}
 
 
-def entry(verdict: str, note: str = "", strict=None, value=None) -> dict:
-    return dict(verdict=verdict, strict_match=strict, value_match=value, note=note)
+def same_value(term: dict, known) -> str | None:
+    """A term against a known value: `value` (same datatype and value), `cross-type` (the same
+    number in another datatype: deviates) or None."""
+    expected = known_term(known)
+    if value_key(term) == value_key(expected):
+        return "value"
+    return "cross-type" if cross_key(term) == cross_key(expected) else None
+
+
+def entry(verdict: str, note: str = "", strict=None, value=None, level=None) -> dict:
+    return dict(verdict=verdict, level=level, strict_match=strict, value_match=value, note=note)
 
 
 class Recorder:
@@ -258,6 +493,7 @@ class Recorder:
         self.captures: list[Capture] = []
         self.queries: dict[tuple, str] = {}  # item -> the query's SHA-256
         self.orders: dict[tuple, tuple[str, int | None]] = {}
+        self.operators: dict[tuple, dict[str, str] | None] = {}  # item -> its COUNT and division variables
         self.data: dict[tuple, tuple[str, ...]] = {}  # item -> the inputs it ran on
         self.expected: set[tuple[tuple, str]] = set()
         self.skipped: dict[tuple[tuple, str], tuple[str, str]] = {}
@@ -275,20 +511,27 @@ class Recorder:
             out.setdefault("rows", int(count))
         return out
 
-    def holds(self, item: tuple, answer: Answer) -> tuple[bool | None, bool, str]:
-        """Whether an answer agrees with the oracle: (agrees, None without an oracle; decisive,
-        whether that settles the whole answer; a note)."""
+    def holds(self, item: tuple, answer: Answer) -> tuple[str | None, bool, str]:
+        """How an answer stands to the oracle: (`holds`, `contradicts`, `deviates` (the known
+        value only across datatypes), or None without an oracle; decisive, whether that settles
+        the whole answer; a note)."""
         known = self.oracle(item)
         order, _ = self.orders.get(item, ("bag", None))
         if not known or answer.boolean is not None or order == "limit":
             return None, False, ""
         if "value" in known:
             cells = [t for row in answer.rows for t in row.values()]
-            agrees = len(answer.rows) == 1 and len(cells) == 1 and same_value(cells[0], known["value"])
-            got = cells[0].get("value") if len(cells) == 1 else f"{len(answer.rows)} rows"
-            return agrees, True, "" if agrees else f"{got} for the known value {known['value']}"
-        agrees = len(answer.rows) == int(known["rows"])
-        return agrees, False, "" if agrees else f"{len(answer.rows)} rows for the known {known['rows']}"
+            level = same_value(cells[0], known["value"]) if len(answer.rows) == 1 and len(cells) == 1 else None
+            got = f"{cells[0].get('value')} ({short(cells[0].get('datatype'))})" if len(cells) == 1 \
+                else f"{len(answer.rows)} rows"
+            if level == "value":
+                return "holds", True, ""
+            if level == "cross-type":
+                return "deviates", True, f"{got} for the known {known['value']} ({short(known_term(known['value']).get('datatype'))})"
+            return "contradicts", True, f"{got} for the known value {known['value']}"
+        if len(answer.rows) == int(known["rows"]):
+            return "holds", False, ""
+        return "contradicts", False, f"{len(answer.rows)} rows for the known {known['rows']}"
 
     @property
     def reference(self) -> str:
@@ -312,6 +555,7 @@ class Recorder:
         text = query.read_text(encoding="utf-8")
         self.queries[item] = hashlib.sha256(text.encode()).hexdigest()
         self.orders[item] = order_of(text)
+        self.operators[item] = operators(text)
         if prior_error:
             # Preserve this invocation's failure; answer collection is not an implicit
             # second attempt with the same settings. A recovery run has its own identity.
@@ -366,9 +610,12 @@ class Recorder:
         full = pool if order == "limit" else first
         if any(not compare(c.answer, first, order, limit, full)["strict_match"] for c in own[1:]):
             return None, None, f"{system}'s captures differ among themselves"
-        agrees, _, note = self.holds(item, first)
-        if agrees is False:
-            return None, None, f"{system}'s answer contradicts the known answer: {note}"
+        state, _, note = self.holds(item, first)
+        if state in ("contradicts", "deviates"):
+            return None, None, f"{system}'s answer {state} the known answer: {note}"
+        faults = count_faults(first, self.operators.get(item) or {})
+        if faults:
+            return None, None, f"{system}'s COUNT is not xsd:integer: {', '.join(faults)}"
         return first, pool, ""
 
     def reference_of(self, item: tuple) -> dict:
@@ -392,12 +639,12 @@ class Recorder:
             second, other, other_pool = found[1]
             # A limit is confirmed on the pools, which both references answered in full.
             mine, theirs = (pool, other_pool) if order == "limit" else (answer, other)
-            check = compare(theirs, mine, "bag" if order == "limit" else order)
+            check = compare(theirs, mine, "bag" if order == "limit" else order, ops=self.operators.get(item))
             if check["verdict"] == "ok":
                 out["confirmed"] = second
             else:
                 out["dispute"] = f"the references {system} and {second} disagree ({check['note']}): adjudicate"
-        if self.holds(item, answer)[0] and not out["dispute"]:
+        if self.holds(item, answer)[0] == "holds" and not out["dispute"]:
             out["confirmed"] = out["confirmed"] or "the known answer"
         return out
 
@@ -412,11 +659,12 @@ class Recorder:
             errors = "; ".join(dict.fromkeys(c.error for c in failed if c.error))
             return entry("unsupported" if UNSUPPORTED.search(errors) else "incomplete", errors)
         held = [self.holds(item, c.answer) for c in own]
-        if any(agrees is False for agrees, _, _ in held):
-            return entry("wrong", next(note for agrees, _, note in held if agrees is False), False, False)
+        for state, verdict in (("contradicts", "wrong"), ("deviates", "deviates")):
+            if any(s == state for s, _, _ in held):
+                return entry(verdict, next(note for s, _, note in held if s == state), False, False)
         if reference["system"] is None:
             why = reference["why"]
-            if held and all(agrees for agrees, _, _ in held):
+            if held and all(s == "holds" for s, _, _ in held):
                 if all(decisive for _, decisive, _ in held):
                     return entry("ok", f"the known answer (no reference answered: {why})", None, True)
                 return entry("unqualified", f"the known row count holds, the bindings are unchecked; {why}")
@@ -428,11 +676,13 @@ class Recorder:
             return entry("ok" if confirmed else "reference",
                          f"confirmed by {confirmed}" if confirmed else "the reference, unconfirmed", True, True)
         order, limit = self.orders.get(item, ("bag", None))
-        each = [compare(c.answer, reference["answer"], order, limit, reference["pool"]) for c in own]
+        each = [compare(c.answer, reference["answer"], order, limit, reference["pool"], self.operators.get(item))
+                for c in own]
         bad = [e for e in each if e["verdict"] != "ok"]
         if bad:
-            return bad[0]
-        return dict(verdict="ok", value_match=True, strict_match=all(e["strict_match"] for e in each),
+            return min(bad, key=lambda e: PRECEDENCE.index(e["verdict"]))
+        return dict(verdict="ok", level=max((e["level"] for e in each), key=("exact", "value", "division").index),
+                    value_match=True, strict_match=all(e["strict_match"] for e in each),
                     note=next((e["note"] for e in each if e["note"]), ""))
 
     def items(self) -> list[tuple]:
@@ -474,7 +724,7 @@ class Recorder:
             # Whose: the systems that gave no usable answer, not those left without a reference.
             whose = {kind: sorted(s for s, v in systems.items() if v["verdict"] == kind
                                   and not v["note"].startswith("no reference"))
-                     for kind in ("wrong", "unqualified", "incomplete", "unsupported")}
+                     for kind in FAULTS}
             strict = {s: v["note"] for s, v in systems.items() if v["verdict"] == "ok" and v["strict_match"] is False}
             items = sorted({f"{v['tier']}/{v['query']}" for v in members})
             out.append(dict(group=items[0], items=items, regime=key[0], data=list(key[1]),
@@ -501,8 +751,8 @@ class Recorder:
         path.write_text(json.dumps(dict(
             references=self.references,
             items=[dict(item=list(i), query_sha256=self.queries.get(i), order=self.orders.get(i, ("bag", None))[0],
-                        limit=self.orders.get(i, ("bag", None))[1], data=list(self.data.get(i, ())),
-                        known=self.known.get(i))
+                        limit=self.orders.get(i, ("bag", None))[1], operators=self.operators.get(i, {}),
+                        data=list(self.data.get(i, ())), known=self.known.get(i))
                    for i in self.items()],
             captures=[dict(item=list(c.item), system=c.system, cache=c.cache, run=c.run, path=where(c.path),
                            sha256=c.sha256, error=c.error or None, unlimited=c.unlimited) for c in self.captures],
@@ -531,6 +781,7 @@ class Recorder:
                 recorder.check(item, i.get("known"))
                 recorder.queries[item] = i.get("query_sha256")
                 recorder.orders[item] = (i.get("order") or "bag", i.get("limit"))
+                recorder.operators[item] = i.get("operators")  # None: not recorded (before T8), unknown
                 if i.get("data"):
                     recorder.data[item] = tuple(i["data"])
             for e in record.get("expected", []):
@@ -554,8 +805,7 @@ def table(groups: list[dict]) -> str:
     """The groups as a Markdown table, worst first."""
     lines = ["| Group | Order | Reference | Verdict | Whose | Strict differences |", "|---|---|---|---|---|---|"]
     for g in sorted(groups, key=lambda g: (PRECEDENCE.index(g["verdict"]), g["group"])):
-        whose = "; ".join(f"{kind}: {', '.join(g[kind])}" for kind in ("wrong", "unqualified", "incomplete", "unsupported")
-                          if g[kind])
+        whose = "; ".join(f"{kind}: {', '.join(g[kind])}" for kind in FAULTS if g.get(kind))
         strict = "; ".join(f"{s}: {note.removeprefix('datatypes differ: ')}" for s, note in sorted(g["strict_differs"].items()))
         repeats = f" (×{len(g['items'])})" if len(g["items"]) > 1 else ""
         whose = whose or ("no reference answered" if g["verdict"] == "incomplete" else "-")
