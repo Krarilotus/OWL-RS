@@ -141,3 +141,130 @@ fn the_pinned_tree_is_the_corpus_whatever_the_index_or_the_files_say() {
     ));
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+/// In a partial clone a pinned object not fetched yet breaks the corpus, and admission starts
+/// no fetch: one runs over the network with no deadline (Sol, PR #61 fix check 1).
+#[test]
+fn an_object_not_fetched_breaks_the_corpus_and_starts_no_fetch() {
+    let base: PathBuf = std::env::temp_dir().join(format!("w3c-partial-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let origin = base.join("origin");
+    for name in ["sparql10/a.srx", "sparql11/b.srx", "sparql12/c.srx"] {
+        let path = origin.join("sparql").join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, name).unwrap();
+    }
+    git(&origin, &["init", "-q"], "");
+    git(&origin, &["add", "-A"], "");
+    git(&origin, &["commit", "-q", "-m", "the pin"], "");
+    git(&origin, &["config", "uploadpack.allowFilter", "true"], "");
+    let url = origin.to_string_lossy().replace('\\', "/");
+    let url = format!(
+        "file://{}{url}",
+        if url.starts_with('/') { "" } else { "/" }
+    );
+    git(
+        &base,
+        &[
+            "clone",
+            "-q",
+            "--no-checkout",
+            "--filter=blob:none",
+            url.as_str(),
+            "clone",
+        ],
+        "",
+    );
+    let clone = base.join("clone");
+    // A fetch runs the remote's upload-pack: this one leaves a mark and fails.
+    let mark = base.join("fetched");
+    let upload = base.join("upload-pack.sh");
+    let marked = mark.to_string_lossy().replace('\\', "/");
+    std::fs::write(&upload, format!("#!/bin/sh\ntouch '{marked}'\nexit 1\n")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&upload, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let upload = upload.to_string_lossy().replace('\\', "/");
+    git(
+        &clone,
+        &["config", "remote.origin.uploadpack", upload.as_str()],
+        "",
+    );
+    let checkout = Checkout {
+        repository: "fixture".to_owned(),
+        commit: git(&origin, &["rev-parse", "HEAD"], ""),
+        root: clone,
+        paths: vec!["sparql".to_owned()],
+    };
+    let corpus = w3c::pinned(&checkout, &DIRS, &["srx"]);
+    assert!(!mark.exists(), "SPEC admission starts no fetch");
+    assert!(
+        matches!(corpus, Err(Unqualified::Broken(_))),
+        "SPEC a pinned object not fetched breaks the corpus"
+    );
+    std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// A file the fetch script pins by its SHA-256 is admitted by it: with its digest, its bytes;
+/// with other bytes, broken; not there, absent.
+#[test]
+fn a_file_pinned_by_its_digest_is_admitted_by_it() {
+    let root: PathBuf = std::env::temp_dir().join(format!("w3c-digest-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("all.rdf");
+    let pin = |sha256: &str| {
+        w3c::Pin::Digest(w3c::Digested {
+            name: "OWL_TESTS".to_owned(),
+            path: path.clone(),
+            sha256: sha256.to_owned(),
+        })
+    };
+    // FIPS 180-4's examples: one block, and two.
+    let examples = [
+        (
+            "abc",
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        ),
+        (
+            "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+        ),
+    ];
+    for (text, sha256) in examples {
+        std::fs::write(&path, text).unwrap();
+        match pin(sha256).files(&["rdf"]) {
+            Ok(blobs) => {
+                let read: Vec<(&str, &[u8])> = blobs
+                    .iter()
+                    .map(|blob| (blob.name.as_str(), blob.bytes.as_slice()))
+                    .collect();
+                assert_eq!(read, [("OWL_TESTS", text.as_bytes())], "SPEC its bytes");
+            }
+            Err(why) => panic!("SPEC a file with its pinned digest is admitted: {why}"),
+        }
+        assert!(
+            matches!(pin(sha256).files(&["srx"]), Ok(blobs) if blobs.is_empty()),
+            "SPEC not a kind asked for"
+        );
+    }
+    let other = "0".repeat(64);
+    assert!(
+        matches!(
+            pin(other.as_str()).files(&["rdf"]),
+            Err(Unqualified::Broken(_))
+        ),
+        "SPEC other bytes than the pinned ones break the corpus"
+    );
+    std::fs::remove_file(&path).unwrap();
+    assert!(
+        matches!(
+            pin(other.as_str()).files(&["rdf"]),
+            Err(Unqualified::Absent(_))
+        ),
+        "SPEC no file is an absent corpus"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
