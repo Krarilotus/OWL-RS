@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import time
@@ -96,19 +97,34 @@ def short(datatype: str | None) -> str:
     return "xsd:" + datatype[len(XSD):] if datatype.startswith(XSD) else datatype
 
 
-def number(term: dict) -> Fraction | None:
-    """A numeric literal's exact value (a double's binary64 one, a float's binary32 one); None
-    for anything else, NaN or an ill-typed literal."""
+# XSD 1.1's lexical forms of a float's or double's infinities.
+INFINITIES = {"INF": math.inf, "+INF": math.inf, "-INF": -math.inf}
+FLOATING = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?")
+
+
+def number(term: dict) -> Fraction | float | None:
+    """A numeric literal's exact value (a double's binary64 one, a float's binary32 one), or a
+    float's or double's infinity of either sign: INF, +INF, -INF, or a numeral beyond the type's
+    range, which XSD 1.1 maps to the infinity of its sign (T8 PR #56 R2). None for anything else,
+    NaN or an ill-typed literal."""
     if term.get("type") not in ("literal", "typed-literal") or "xml:lang" in term:
         return None
     datatype, text = term.get("datatype"), term.get("value", "").strip()
     try:
         if datatype in DECIMAL_TYPES:
             return Fraction(Decimal(text))
+        if datatype in FLOAT_TYPES and text in INFINITIES:
+            return INFINITIES[text]
+        if datatype in FLOAT_TYPES and not FLOATING.fullmatch(text):
+            return None
         if datatype == XSD + "float":
-            return binary32(Fraction(Decimal(text)))
+            try:
+                return binary32(Fraction(Decimal(text)))
+            except OverflowError:
+                return math.copysign(math.inf, Decimal(text))
         if datatype in FLOAT_TYPES:
-            return Fraction(float(text.replace("INF", "inf")))
+            value = float(text)
+            return Fraction(value) if math.isfinite(value) else value
     except (InvalidOperation, ValueError, OverflowError):
         pass
     return None

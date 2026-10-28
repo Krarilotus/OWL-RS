@@ -161,6 +161,41 @@
       "answer": {"head": {"vars": ["f"]}, "results": {"bindings": [{"f": {"type": "literal", "value": "1.0000000596046448", "datatype": "http://www.w3.org/2001/XMLSchema#float"}}]}},
       "reference": {"head": {"vars": ["f"]}, "results": {"bindings": [{"f": {"type": "literal", "value": "1.0000001", "datatype": "http://www.w3.org/2001/XMLSchema#float"}}]}},
       "expected": {"verdict": "ok", "level": "value"}
+    },
+    {
+      "name": "+INF and INF are one xsd:double, positive infinity (XSD 1.1 lexical mapping; T8 PR #56 R2)",
+      "query": "SELECT ?x WHERE { ?s <http://example.org/x> ?x }",
+      "answer": {"head": {"vars": ["x"]}, "results": {"bindings": [{"x": {"type": "literal", "value": "+INF", "datatype": "http://www.w3.org/2001/XMLSchema#double"}}]}},
+      "reference": {"head": {"vars": ["x"]}, "results": {"bindings": [{"x": {"type": "literal", "value": "INF", "datatype": "http://www.w3.org/2001/XMLSchema#double"}}]}},
+      "expected": {"verdict": "ok", "level": "value"}
+    },
+    {
+      "name": "+INF and INF are one xsd:float too (T8 PR #56 R2)",
+      "query": "SELECT ?x WHERE { ?s <http://example.org/x> ?x }",
+      "answer": {"head": {"vars": ["x"]}, "results": {"bindings": [{"x": {"type": "literal", "value": "+INF", "datatype": "http://www.w3.org/2001/XMLSchema#float"}}]}},
+      "reference": {"head": {"vars": ["x"]}, "results": {"bindings": [{"x": {"type": "literal", "value": "INF", "datatype": "http://www.w3.org/2001/XMLSchema#float"}}]}},
+      "expected": {"verdict": "ok", "level": "value"}
+    },
+    {
+      "name": "a numeral beyond binary64's range is a double's positive infinity (T8 PR #56 R2)",
+      "query": "SELECT ?x WHERE { ?s <http://example.org/x> ?x }",
+      "answer": {"head": {"vars": ["x"]}, "results": {"bindings": [{"x": {"type": "literal", "value": "1e400", "datatype": "http://www.w3.org/2001/XMLSchema#double"}}]}},
+      "reference": {"head": {"vars": ["x"]}, "results": {"bindings": [{"x": {"type": "literal", "value": "INF", "datatype": "http://www.w3.org/2001/XMLSchema#double"}}]}},
+      "expected": {"verdict": "ok", "level": "value"}
+    },
+    {
+      "name": "a float's infinity for a double's deviates, the same value across datatypes (T8 PR #56 R2)",
+      "query": "SELECT ?x WHERE { ?s <http://example.org/x> ?x }",
+      "answer": {"head": {"vars": ["x"]}, "results": {"bindings": [{"x": {"type": "literal", "value": "INF", "datatype": "http://www.w3.org/2001/XMLSchema#float"}}]}},
+      "reference": {"head": {"vars": ["x"]}, "results": {"bindings": [{"x": {"type": "literal", "value": "INF", "datatype": "http://www.w3.org/2001/XMLSchema#double"}}]}},
+      "expected": {"verdict": "deviates", "level": "cross-type", "note": "datatypes differ"}
+    },
+    {
+      "name": "the two infinities are two values: INF is no answer for -INF (T8 PR #56 R2)",
+      "query": "SELECT ?x WHERE { ?s <http://example.org/x> ?x }",
+      "answer": {"head": {"vars": ["x"]}, "results": {"bindings": [{"x": {"type": "literal", "value": "INF", "datatype": "http://www.w3.org/2001/XMLSchema#double"}}]}},
+      "reference": {"head": {"vars": ["x"]}, "results": {"bindings": [{"x": {"type": "literal", "value": "-INF", "datatype": "http://www.w3.org/2001/XMLSchema#double"}}]}},
+      "expected": {"verdict": "wrong", "level": null}
     }
   ],
   "known": [

@@ -113,6 +113,49 @@ class OracleCompare(unittest.TestCase):
         self.assertEqual([q for q in ("q3", "q4", "q5") if f"suite/case/{q}" not in unexplained], [],
                          "SPEC answer contract: a different value is unexplained, a division's result too")
 
+    def test_every_shared_case_an_oracle_doesnt_decide(self):
+        """T8 PR #56 R1: equal rows counted as an agreement before the contract saw them, so a COUNT
+        in xsd:int agreed. Every shared case without an exact oracle (which this comparison has
+        none of) goes through it: its agreements, deviations, divisions and differences are the
+        contract's."""
+        spec_ = importlib.util.spec_from_file_location(
+            "oracle_compare", Path(__file__).resolve().parents[2] / "oracle" / "compare.py")
+        oracle_compare = importlib.util.module_from_spec(spec_)
+        spec_.loader.exec_module(oracle_compare)
+
+        def nt(term: dict) -> str:
+            if term["type"] == "uri":
+                return f"<{term['value']}>"
+            if term["type"] == "bnode":
+                return f"_:{term['value']}"
+            if "xml:lang" in term:
+                return f'"{term["value"]}"@{term["xml:lang"]}'
+            return f'"{term["value"]}"^^<{term["datatype"]}>' if term.get("datatype") else f'"{term["value"]}"'
+
+        bucket = {"ok": "agree", "deviates": "cross-type", "unqualified": "division", "wrong": "a difference"}
+        wrong = []
+        for case in json.loads(FIXTURES.read_text(encoding="utf-8"))["compare"]:
+            if "oracle" in case:
+                continue
+            names = case["answer"]["head"]["vars"]
+            rows = lambda answer: "\n".join("\t".join(nt(b[v]) for v in names) for b in answer["results"]["bindings"])
+            with tempfile.TemporaryDirectory() as tmp:
+                where = Path(tmp) / "dump" / "suite" / "case"
+                where.mkdir(parents=True)
+                header = "\t".join(f"?{v}" for v in names)
+                (where / "q1.rq").write_text(case["query"] + "\n", encoding="utf-8")
+                (where / "q1.nrese").write_text(f"{header}\n{rows(case['answer'])}\n", encoding="utf-8")
+                (where / "q1.jena").write_text(f"{header}\n{rows(case['reference'])}\n", encoding="utf-8")
+                report = Path(tmp) / "report.md"
+                with patch("sys.stdout"):
+                    oracle_compare.main([str(Path(tmp) / "dump"), "--report", str(report)])
+                text = report.read_text(encoding="utf-8")
+            got = next((b for b in ("cross-type", "division", "blank-nodes") if f"**{b}** (1)" in text), None) \
+                or ("agree" if "1 agree" in text.split("## Explained")[0] else "a difference")
+            if got != bucket[case["expected"]["verdict"]]:
+                wrong.append(f"{case['name']}: {got}")
+        self.assertEqual(wrong, [], "SPEC answer contract: the oracle's verdicts are the contract's")
+
 
 class SameAnswers(unittest.TestCase):
     """benches/sparql/same_answers.py (two runs' answers, system by system) compares through the
