@@ -1,5 +1,2 @@
 # W3C SHACL-SPARQL tests that are known to fail, one per line: `<test IRI> # reason`.
 # The run fails on a failure that is not listed and on a listed test that passes.
-<http://w3c.test/shacl/sparql/component/optional-001> # each result names the component's validator as sh:sourceConstraint (compile.rs, component_constraints); the expected report has none. Put to nrese-shacl's report owner
-<http://w3c.test/shacl/sparql/component/propertyValidator-select-001> # as optional-001: the validator as sh:sourceConstraint
-<http://w3c.test/shacl/sparql/component/validator-001> # as optional-001: the validator as sh:sourceConstraint
