@@ -22,6 +22,8 @@
 #   point REV DIR [LAYOUT]        this gate uses DIR for REV (and stamps a reference); a layout
 #                                 other than 1 has a pointer of its own
 #   sweep_builds                  identity directories no gate used for GATE_BIN_AGE_DAYS
+#   sweep_patch_keyed [--remove]  the builds of a patched perf lab, listed; their binaries go
+#                                 with --remove, unless a gate used them within GATE_LIVE_HOURS
 
 . "$(dirname "${BASH_SOURCE[0]}")/ns.sh"
 
@@ -67,9 +69,6 @@ effective_rustflags() {
   printf '%s' "$out"
 }
 
-# The gate's measurement patches (part of every build's identity), found from this file.
-GATE_PATCHES=${GATE_PATCHES:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/benches/fast/patches}
-
 build_identity() {
   local channel flags
   channel=$(git show "$1:rust-toolchain.toml" 2>/dev/null | sed -n 's/^channel *= *"\(.*\)"/\1/p')
@@ -86,11 +85,6 @@ build_identity() {
   esac
   echo "linker ${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER:-cc} $(cc --version 2>/dev/null | head -1)"
   echo "profile release --locked"
-  # The measurement patches release-gate.sh applies to every side's perf lab source.
-  local patch
-  for patch in "$GATE_PATCHES"/*.py; do
-    [ -f "$patch" ] && echo "patch $(basename "$patch") $(sha256sum < "$patch" | cut -c1-16)"
-  done
   echo "layout ${2:-1}"
 }
 
@@ -98,8 +92,12 @@ identity_dir() {
   echo "$GATE_BIN/bin-$(git rev-parse --short=8 "$1")-$(build_identity "$1" "${2:-1}" | sha256sum | cut -c1-12)"
 }
 
+# DIR: a build of a perf lab patched at build time, before T0 (28 Oct 2026): its timed code is in no
+# commit, so it is never reused, timed or imported (its IDENTITY names the patch).
+patch_keyed() { grep -q '^patch perf_lab_watchdog' "$1/IDENTITY" 2>/dev/null; }
+
 build_verified() {  # DIR REV
-  [ "$(cat "$1/REVISION" 2>/dev/null)" = "$2" ] && (cd "$1" && sha256sum -c --quiet SHA256SUMS)
+  [ "$(cat "$1/REVISION" 2>/dev/null)" = "$2" ] && ! patch_keyed "$1" && (cd "$1" && sha256sum -c --quiet SHA256SUMS)
 }
 
 publish() {
@@ -113,7 +111,7 @@ publish() {
   build_verified "$dir" "$rev"
 }
 
-gate_lock() { NS_LOCK_VARS="GATE GATE_BIN GATE_PATCHES" ns_locked "$GATE_BIN/.lock" "$@"; }
+gate_lock() { NS_LOCK_VARS="GATE GATE_BIN" ns_locked "$GATE_BIN/.lock" "$@"; }
 
 # DIR: a reference from this gate, under the lock; fails when the build is gone (never made anew).
 stamp() { [ -d "$1/release" ] && mkdir -p "$1/.refs" && touch "$1/.refs/$(basename "$GATE")"; }
@@ -154,6 +152,40 @@ sweep_builds() {
     case $dir in *.partial-*) [ -n "$(find "$dir" -maxdepth 0 -mmin +1440)" ] && rm -rf "$dir"; continue ;; esac
     old_build "$dir" || continue
     gate_lock remove_if_old "$dir" && basename "$dir"
+  done
+  return 0
+}
+
+# DIR: a gate used it within GATE_LIVE_HOURS (default 24): every block stamps the builds it times.
+live_build() { [ -n "$(find "$1/.refs" -mindepth 1 -maxdepth 1 -mmin -$(( ${GATE_LIVE_HOURS:-24} * 60 )) 2>/dev/null | head -1)" ]; }
+
+# DIR: its binaries go if, checked again under the lock, no gate is using it; its IDENTITY,
+# BUILD.txt and SHA256SUMS stay as the record (a build of that identity no longer verifies).
+release_unused() {
+  live_build "$1" && return 1
+  [ -d "$1/release" ] || return 0
+  mv -T "$1/release" "$1/.release-gone-$$" && rm -rf "$1/.release-gone-$$"
+}
+
+# The builds of a perf lab patched at build time (before T0, 28 Oct 2026: their IDENTITY names
+# `patch perf_lab_watchdog`), one line each: the outcome, the directory, its bytes, its release/
+# bytes, and its references (gate@time). Their binaries go with --remove, else nothing does; a
+# build a live gate references stays.
+sweep_patch_keyed() {
+  local dir refs bytes binaries outcome
+  for dir in "$GATE_BIN"/bin-*; do
+    case $dir in *.partial-*) continue ;; esac
+    patch_keyed "$dir" || continue
+    bytes=$(du -sb "$dir" | cut -f1)
+    binaries=$(du -sb "$dir/release" 2>/dev/null | cut -f1)
+    refs=$(find "$dir/.refs" -mindepth 1 -maxdepth 1 -printf '%f@%TY-%Tm-%Td %TH:%TM ' 2>/dev/null)
+    if [ ! -d "$dir/release" ]; then outcome=released
+    elif live_build "$dir"; then outcome=kept-live
+    elif [ "${1:-}" != --remove ]; then outcome=would-release
+    elif gate_lock release_unused "$dir"; then outcome=released-now
+    else outcome=kept-live
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$outcome" "$(basename "$dir")" "$bytes" "${binaries:-0}" "${refs:-none}"
   done
   return 0
 }

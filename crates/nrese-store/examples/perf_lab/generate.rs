@@ -5,7 +5,9 @@
 //! named graphs, `ex:graph0` to `ex:graph3`), and computes here, independently of the store, the
 //! answers the suite checks before a time counts. They go to standard output as one JSON
 //! object (`expect`), with the statement count and the parameters used. Kinds that need
-//! commits also write `OUT.commits.ru`: one SPARQL update per line, one commit each.
+//! commits also write `OUT.commits.ru`: one SPARQL update per line, one commit each;
+//! `support-stress` also writes its reader (`OUT.reader`) and that reader's own updates
+//! (`OUT.updates.ru`, one request per line).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -1473,6 +1475,13 @@ fn support_stress(p: &Params, nt: &mut Nt, out: &str, commits: &str) -> std::io:
         commits,
         format!("{}\n{}\n", update(&one), update(&thousand)),
     )?;
+    // The reader's own updates (`perf_lab --support-updates`), into the first of its graphs,
+    // after the commits: they write markers only, so `ex:D` stays as it is, and each leaves one
+    // marker per member of it (`marked`, `seen`: the count after the commits).
+    std::fs::write(
+        format!("{out}.updates.ru"),
+        crate::support::updates(&reader[0]),
+    )?;
     quads.extend(one);
     quads.extend(thousand);
     let (seen_after, count_after) = answers(&quads);
@@ -1484,5 +1493,7 @@ fn support_stress(p: &Params, nt: &mut Nt, out: &str, commits: &str) -> std::io:
     e.insert("count".into(), json!(count));
     e.insert("probe_after_commits".into(), json!(seen_after));
     e.insert("count_after_commits".into(), json!(count_after));
+    e.insert("marked".into(), json!(count_after));
+    e.insert("seen".into(), json!(count_after));
     Ok(e)
 }

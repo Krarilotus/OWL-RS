@@ -48,22 +48,6 @@ pub struct MutationPipeline {
     retired: std::sync::atomic::AtomicBool,
 }
 
-/// The statements `tx` inserts or deletes, asserted and inferred, as reasoner facts.
-fn touched(tx: &nrese_engine::Transaction<'_>) -> Vec<nrese_reasoner::ir::Triple> {
-    let quads = tx.inserted().chain(tx.deleted());
-    let mut facts: Vec<nrese_reasoner::ir::Triple> = quads
-        .map(|q| [q.subject.raw(), q.predicate.raw(), q.object.raw()])
-        .chain(
-            tx.inferred_inserted()
-                .chain(tx.inferred_deleted())
-                .map(|t| [t.subject.raw(), t.predicate.raw(), t.object.raw()]),
-        )
-        .collect();
-    facts.sort_unstable();
-    facts.dedup();
-    facts
-}
-
 impl MutationPipeline {
     pub fn new(store: Arc<StoreService>, reasoner: Arc<ReasonerService>) -> Self {
         store.use_reasoning_rules(reasoner.config().materialised_program());
@@ -222,6 +206,8 @@ impl MutationPipeline {
             geosparql_stated_only: self.store.config().geosparql_stated_only,
             services: self.store.services(),
             namespaces: self.store.namespaces().all(),
+            supports: Arc::clone(self.store.supports()),
+            compilation: self.store.support_compilation(),
         };
         let report = command
             .apply(&mut tx, requester, &context)
@@ -265,14 +251,10 @@ impl MutationPipeline {
                 // others are withheld, and counted (graph access: nothing from a graph a
                 // reader can't read reaches it).
                 let readable = |fact: nrese_reasoner::ir::Triple| match &requester.read {
-                    crate::ReadScope::Graphs(access) => crate::service::in_readable_graph(
-                        tx.quads_for_pattern_in(
-                            nrese_engine::ReadModel::Asserted,
-                            &crate::service::any_graph(fact),
-                        ),
-                        &|id| tx.decode(id),
-                        access,
-                    ),
+                    crate::ReadScope::Graphs(access) => {
+                        crate::support::asserted(&tx, access, fact)
+                            == crate::support::Asserted::InReach
+                    }
                     _ => true,
                 };
                 let restricted = matches!(requester.read, crate::ReadScope::Graphs(_));
@@ -347,7 +329,7 @@ impl MutationPipeline {
             // What the commit touched, for the support graph sets kept for readers under
             // graph access (only while there are any).
             let supports = self.store.supports();
-            let touched = supports.wants_commits().then(|| touched(&tx));
+            let touched = supports.wants_commits().then(|| supports.touched(&tx));
             let before = tx.base().revision();
             let summary = tx.commit().map_err(|error| MutationError::Store {
                 kind,

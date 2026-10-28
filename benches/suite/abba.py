@@ -191,7 +191,8 @@ def jobs(family: dict, harness: str, checkout: str, host: str, round_: int = 1) 
             "est_min": 25 * len(revisions) + 10,
             "steps": [[*abba, "check", family["path"]]] + [[*gate_, "build", r] for r in revisions]
             + [[*gate_, "prepare", harness]],
-            "requires": {"hosts": [host], "cores": 16, "ram_gb": 12}, "inputs": source},
+            "requires": {"hosts": [host], "cores": 16, "ram_gb": 12},
+            "inputs": source + rg.measurement_inputs(checkout, revisions)},
         prefix: {
             "id": prefix, "group": "abba", "kind": "owlrs.timed", "class": "exclusive", "after": [f"{prefix}-build"],
             "env": env, "est_min": round(family["blocks"] * (6 * seconds / 60 + 1) + 5), "stall_after_min": 60,

@@ -72,21 +72,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let started = Instant::now();
-    let sets = nrese_reasoner::graph_sets::support_sets(&all, &ground, &[], &graph_of, cap);
+    let sets = nrese_reasoner::graph_sets::support_sets(
+        &all,
+        &ground,
+        &[],
+        &graph_of,
+        cap,
+        nrese_reasoner::graph_sets::UNWATCHED,
+    )
+    .map_err(|stopped| format!("{stopped:?}"))?;
     let elapsed = started.elapsed();
     let per_fact: usize = inferred
         .iter()
-        .map(|f| sets.get(f).map_or(0, Vec::len))
+        .map(|f| sets.get(f).map_or(0, |a| a.sets.len()))
         .sum();
     let without = inferred.iter().filter(|f| !sets.contains_key(*f)).count();
+    let truncated = sets.values().filter(|a| a.truncated).count();
     println!(
-        "{} asserted, {} inferred; materialisation {:.0} ms; support sets {:.0} ms ({:.2} per inferred fact, {} without)",
+        "{} asserted, {} inferred; materialisation {:.0} ms; support sets {:.0} ms ({:.2} per inferred fact, {} without, {} truncated)",
         asserted.len(),
         inferred.len(),
         materialised.as_secs_f64() * 1000.0,
         elapsed.as_secs_f64() * 1000.0,
         per_fact as f64 / inferred.len().max(1) as f64,
-        without
+        without,
+        truncated
     );
     Ok(())
 }
