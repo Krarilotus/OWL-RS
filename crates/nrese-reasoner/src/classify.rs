@@ -20,9 +20,13 @@
 //! `owl:AllDisjointClasses`, `owl:intersectionOf`, `owl:someValuesFrom` restrictions,
 //! `owl:Thing`, `owl:Nothing`, `rdfs:subPropertyOf`, `owl:equivalentProperty`,
 //! `owl:propertyChainAxiom`, `owl:TransitiveProperty`, `rdfs:domain`, and `rdfs:range`
-//! (applied where a class axiom creates the edge). Axioms outside EL (unions, universal
-//! restrictions, complements, cardinalities, inverses, nominals) are skipped and
-//! counted: the hierarchy is then complete for the EL part only.
+//! (applied where a class axiom creates the edge). Every other class or property axiom is
+//! skipped and counted, outside EL (unions, universal restrictions, complements,
+//! cardinalities, inverses, nominals) or not (property characteristics other than
+//! transitivity, disjoint properties, disjoint unions, named class expressions): the
+//! hierarchy is then complete for the part read only. Assertions about individuals, and
+//! keys, which constrain only individuals, are not read: an inconsistency among them goes
+//! unseen.
 
 use std::time::{Duration, Instant};
 
@@ -99,6 +103,8 @@ struct Names {
     domain: u64,
     range: u64,
     outside_el: Vec<(u64, &'static str)>,
+    /// Class and property axioms no rule reads, by predicate or `rdf:type` object.
+    unread: Vec<(u64, &'static str)>,
 }
 
 impl Names {
@@ -145,7 +151,56 @@ impl Names {
             .into_iter()
             .map(|(local, kind)| (owl(&mut iri, local), kind))
             .collect(),
+            unread: [
+                ("FunctionalProperty", "functional property"),
+                ("InverseFunctionalProperty", "inverse-functional property"),
+                ("ReflexiveProperty", "reflexive property"),
+                ("IrreflexiveProperty", "irreflexive property"),
+                ("SymmetricProperty", "symmetric property"),
+                ("AsymmetricProperty", "asymmetric property"),
+                ("propertyDisjointWith", "disjoint properties"),
+                ("AllDisjointProperties", "disjoint properties"),
+                ("disjointUnionOf", "disjoint union"),
+            ]
+            .into_iter()
+            .map(|(local, kind)| (owl(&mut iri, local), kind))
+            .collect(),
         }
+    }
+
+    /// Why `s p o`, which no rule of [`build`] read, is a class or property axiom left
+    /// out; `None` when it states none: a declaration, an annotation, a part of an
+    /// expression or list, or an assertion about individuals.
+    fn unread(&self, [s, p, o]: Triple, named: &dyn Fn(u64) -> bool) -> Option<&'static str> {
+        let property_axioms = [
+            self.sub_property_of,
+            self.equivalent_property,
+            self.property_chain,
+            self.domain,
+            self.range,
+        ];
+        if property_axioms.contains(&p) || (p == self.rdf_type && o == self.transitive) {
+            // Read where the properties are named: here one is an expression, an inverse.
+            return Some("inverse property");
+        }
+        let term = if p == self.rdf_type { o } else { p };
+        if let Some(&(_, kind)) = self.unread.iter().find(|&&(t, _)| t == term) {
+            return Some(kind);
+        }
+        // An expression's triples hang off its blank node and are read through the axiom
+        // that uses it; on a named subject they define that class (or, `owl:inverseOf`,
+        // relate two properties).
+        let el_parts = [
+            self.intersection_of,
+            self.some_values_from,
+            self.on_property,
+        ];
+        let kind = match self.outside_el.iter().find(|&&(t, _)| t == p) {
+            Some(&(_, kind)) => kind,
+            None if el_parts.contains(&p) => "named class expression",
+            None => return None,
+        };
+        named(s).then_some(kind)
     }
 }
 
@@ -305,8 +360,12 @@ impl Graph<'_> {
             .map(|(_, o)| *o)
     }
 
+    /// The object of `subject predicate` where the mapping has one: `None` when there is
+    /// none, or two different ones (the same triple twice is one).
     fn one(&self, subject: u64, predicate: u64) -> Option<u64> {
-        self.objects(subject, predicate).next()
+        let mut objects = self.objects(subject, predicate);
+        let first = objects.next()?;
+        objects.all(|o| o == first).then_some(first)
     }
 
     fn list(&self, mut node: u64) -> Result<Vec<u64>, ListError> {
@@ -541,6 +600,8 @@ fn build(
             };
             let (r, c) = (tbox.role(Some(s)), tbox.name(&c));
             tbox.ranges.push((r, c));
+        } else if let Some(kind) = names.unread([s, p, o], named) {
+            skipped.push((p, kind));
         }
     }
     (tbox, thing, nothing, skipped)
@@ -1245,9 +1306,126 @@ mod tests {
         assert!(holds(&mut v, &result, "E", "F"));
     }
 
-    /// An axiom whose list can't be read is reported as omitted, with why: malformed,
-    /// cyclic, or past the reader's 10,000 members (a resource stop, which says nothing of
-    /// the list's tail). Below disjoint `A` and `B`, `X` is unsatisfiable; where their
+    /// A class or property axiom the reader has no rule for is reported as omitted, never
+    /// dropped (review s15-el-omissions r1 F1). With `r` reflexive, an `A` is its own
+    /// `r`-successor, so `∃r.A ⊑ B` gives `A ⊑ B`; unread, `A ⊑ B` is missing and the
+    /// omission says so. Declarations, annotations, the ontology's header, and assertions
+    /// about individuals and keys, which the classifier doesn't read, omit no such axiom.
+    #[test]
+    fn axioms_without_a_rule_are_reported_as_omitted() {
+        /// `(predicate, reason)` omitted, or `(sub, super)` derived.
+        type Pairs = &'static [(&'static str, &'static str)];
+        let cases: [(&str, &str, Pairs, Pairs); 8] = [
+            (
+                "reflexive",
+                "ex:r rdf:type owl:ReflexiveProperty
+                 _:e owl:onProperty ex:r
+                 _:e owl:someValuesFrom ex:A
+                 _:e rdfs:subClassOf ex:B",
+                &[("rdf:type", "reflexive property")],
+                &[],
+            ),
+            (
+                "disjoint-union",
+                "ex:A owl:disjointUnionOf _:l0
+                 _:l0 rdf:first ex:B
+                 _:l0 rdf:rest _:l1
+                 _:l1 rdf:first ex:C
+                 _:l1 rdf:rest rdf:nil",
+                &[("owl:disjointUnionOf", "disjoint union")],
+                &[],
+            ),
+            (
+                "inverse-axiom",
+                "ex:p owl:inverseOf ex:q",
+                &[("owl:inverseOf", "inverse property")],
+                &[],
+            ),
+            (
+                "inverse-sub-property",
+                "_:i owl:inverseOf ex:p
+                 _:i rdfs:subPropertyOf ex:q",
+                &[("rdfs:subPropertyOf", "inverse property")],
+                &[],
+            ),
+            (
+                "inverse-transitive",
+                "_:i owl:inverseOf ex:p
+                 _:i rdf:type owl:TransitiveProperty",
+                &[("rdf:type", "inverse property")],
+                &[],
+            ),
+            (
+                "named-complement",
+                "ex:C owl:complementOf ex:A",
+                &[("owl:complementOf", "complement")],
+                &[],
+            ),
+            (
+                "named-restriction",
+                "ex:R owl:onProperty ex:r
+                 ex:R owl:someValuesFrom ex:A",
+                &[
+                    ("owl:onProperty", "named class expression"),
+                    ("owl:someValuesFrom", "named class expression"),
+                ],
+                &[],
+            ),
+            (
+                "no-axiom",
+                "ex:o rdf:type owl:Ontology
+                 ex:A rdf:type owl:Class
+                 ex:A rdfs:label ex:l
+                 ex:r rdf:type owl:ObjectProperty
+                 ex:A rdfs:subClassOf ex:B
+                 _:x rdf:type owl:Axiom
+                 _:x owl:annotatedSource ex:A
+                 _:x owl:annotatedProperty rdfs:subClassOf
+                 _:x owl:annotatedTarget ex:B
+                 _:x rdfs:comment ex:l
+                 ex:A owl:hasKey _:k
+                 _:k rdf:first ex:r
+                 _:k rdf:rest rdf:nil
+                 ex:a rdf:type owl:NamedIndividual
+                 ex:a rdf:type ex:A
+                 ex:a ex:r ex:b
+                 ex:a owl:sameAs ex:c
+                 ex:a owl:differentFrom ex:b",
+                &[],
+                &[("A", "B")],
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (case, input, omitted, subsumptions) in cases {
+            let (mut v, actual) = run(input);
+            let mut subsumptions: Vec<(u64, u64)> = subsumptions
+                .iter()
+                .map(|(a, b)| (v.iri(&format!("{EX}{a}")), v.iri(&format!("{EX}{b}"))))
+                .collect();
+            subsumptions.sort_unstable();
+            let skipped = omitted
+                .iter()
+                .map(|&(predicate, reason)| {
+                    let mut parts = load(&mut v, &format!("ex:X {predicate} ex:X"));
+                    (parts.pop().unwrap()[1], reason)
+                })
+                .collect();
+            let expected = Classification {
+                subsumptions,
+                skipped,
+                ..Classification::default()
+            };
+            if actual != expected {
+                failures.push(format!("{case}: expected {expected:?}, actual {actual:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// An axiom whose list can't be read is reported as omitted, with why: malformed (a
+    /// value missing, or two different ones where the mapping has one), cyclic, or past
+    /// the reader's 10,001 members (a resource stop, which says nothing of the list's
+    /// tail). The same triple twice is one. Below disjoint `A` and `B`, `X` is unsatisfiable; where their
     /// `AllDisjointClasses` can't be read, `X` stays satisfiable and the omission is
     /// reported, so no caller takes the result as complete.
     #[test]
@@ -1300,6 +1478,34 @@ mod tests {
                 small.replace("_:d owl:members _:l0\n", ""),
                 Some(("rdf:type", "malformed list")),
                 false,
+            ),
+            (
+                "two-members",
+                small.replace(
+                    "_:d owl:members _:l0\n",
+                    "_:d owl:members _:l0\n_:d owl:members _:m0\n\
+                     _:m0 rdf:first ex:A\n_:m0 rdf:rest rdf:nil\n",
+                ),
+                Some(("rdf:type", "malformed list")),
+                false,
+            ),
+            (
+                "two-firsts",
+                small.replace(
+                    "_:l0 rdf:first ex:A\n",
+                    "_:l0 rdf:first ex:A\n_:l0 rdf:first ex:C\n",
+                ),
+                Some(("rdf:type", "malformed list")),
+                false,
+            ),
+            (
+                "a-triple-twice",
+                small.replace(
+                    "_:l0 rdf:first ex:A\n",
+                    "_:l0 rdf:first ex:A\n_:l0 rdf:first ex:A\n",
+                ),
+                None,
+                true,
             ),
             (
                 "D10002",
