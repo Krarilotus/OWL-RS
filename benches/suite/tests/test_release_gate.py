@@ -562,9 +562,11 @@ class Parts(unittest.TestCase):
         A-B-B-A of two (the agents' confirmation rounds) never completed."""
         import shutil
         import subprocess
-        bash, python = shutil.which("bash"), shutil.which("python3")
-        if bash is None or python is None:
-            self.skipTest("no bash or python3")
+        # Every python3 call the gate makes goes to this test's own interpreter: a gate host's is
+        # 3.11 or later (tomllib), a machine running the suite may have an older python3.
+        bash, python = shutil.which("bash"), sys.executable
+        if bash is None:
+            self.skipTest("no bash")
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
         with tempfile.TemporaryDirectory() as tmp:
             t = Path(tmp).as_posix()
@@ -727,7 +729,7 @@ printf "no linker" > "$d/release/other"; lld_of "$d" 2>/dev/null || echo not-lld
         (the watcher's --resume is the real one); no repository is touched."""
         import shutil
         import subprocess
-        bash, python = shutil.which("bash"), shutil.which("python3")
+        bash, python = shutil.which("bash"), sys.executable  # as above: this test's own interpreter
         head = "a" * 40
         reports = [f"pass-{k}-x{k}.json" for k in range(1, 5)]
         complete = {r: '{"finished_ns": 1}' for r in reports}
@@ -808,12 +810,15 @@ case " $* " in
 esac
 """, encoding="utf-8", newline="\n")
                 (shim / "python3").chmod(0o755)
-                # git, faked: the revision is a fixed id, a worktree an empty directory; anything
-                # else the step asks fails loudly (no real repository is touched).
+                # git, faked: the revision is a fixed id, its tree empty, a worktree an empty
+                # directory; anything else the step asks fails loudly (no real repository is touched).
                 (shim / "git").write_text(f"""#!/usr/bin/env bash
+while [ "$1" = -c ] || [ "$1" = -C ]; do shift 2; done
 case "$1 $2" in
   "rev-parse --short=8") echo "${{3:0:8}}" ;;
+  "rev-parse --show-object-format") echo sha1 ;;
   "rev-parse HEAD") echo {head} ;;
+  "ls-tree -r") ;;
   "worktree add") mkdir -p "${{@: -2:1}}" ;;
   "status --porcelain") ;;
   *) if [ "$1" = rev-parse ] && [ $# -eq 2 ]; then echo "$2"; else echo "fake git: $*" >&2; exit 99; fi ;;
@@ -1192,6 +1197,103 @@ class MeasurementSides(unittest.TestCase):
         self.git("replace", tree(loop), tree(engine))
         self.assertEqual(gate_module.measured_at(self.repo, self.side, {self.side: loop}), loop)
 
+    def gate_beside(self, loop: str) -> Path:
+        """The gate's scripts beside the commits, not in them, its side measured at LOOP; a scratch
+        directory for its runs."""
+        for rel in ("scripts/release-gate.sh", "benches/fast/release_gate.py"):
+            Path(self.repo, rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(ROOT / rel, Path(self.repo, rel))
+        shutil.copytree(ROOT / "scripts/lib", Path(self.repo, "scripts/lib"), ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(ROOT / "benches/suite/suitekit", Path(self.repo, "benches/suite/suitekit"),
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        Path(self.repo, "benches/fast/measurement-sides.toml").write_text(
+            f'[side.{self.side}]\ncommit = "{loop}"\nref = "refs/measure/t-{self.side[:8]}"\n', encoding="utf-8")
+        tmp = Path(tempfile.mkdtemp(prefix="measurement-build-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return tmp
+
+    def test_the_build_compiles_the_revisions_bytes(self):
+        """Sol, PR #54 fix check 1 S1: worktree() took HEAD and a clean status for the revision's
+        source, and both trust the index and the attributes. A smudge filter (info/attributes) made
+        the checkout other bytes, and a reused checkout changed under core.checkStat=minimal with its
+        size and mtime kept stayed clean: the build went on with either. Now it refuses both, and a
+        checkout as stored still builds."""
+        bash = shutil.which("bash")
+        if bash is None or shutil.which("flock") is None:
+            self.skipTest("the gate builds on Linux hosts (bash, flock)")
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        tmp = self.gate_beside(loop)
+        git_dir = Path(self.git("rev-parse", "--absolute-git-dir"))
+
+        def build(gate: str) -> str:
+            env = {**os.environ, "NRESE_GATE_DIR": (tmp / gate / "gate").as_posix(),
+                   "GATE_BIN": (tmp / gate / "bin").as_posix(), "FLEET_OUT": (tmp / gate / "out").as_posix()}
+            done = subprocess.run([bash, "scripts/release-gate.sh", "build", self.side], cwd=self.repo, env=env,
+                                  capture_output=True, text=True)
+            return done.stdout + done.stderr
+
+        went = f"build {self.side} at {loop}"
+        # A filter pair rewrites the engine at checkout and back for status: HEAD and a clean
+        # status agree with the rewritten bytes.
+        self.git("config", "filter.other.smudge", "sed s/engine/rival/")
+        self.git("config", "filter.other.clean", "sed s/rival/engine/")
+        (git_dir / "info").mkdir(exist_ok=True)
+        (git_dir / "info" / "attributes").write_text("*.rs filter=other\n", encoding="utf-8")
+        smudged = build("smudged")
+        (git_dir / "info" / "attributes").unlink()
+        self.git("config", "--remove-section", "filter.other")
+        # A checkout as stored builds. Its engine then changed, size and mtime kept, under a stat
+        # cache that compares only those, its entry older than the index (not racily clean).
+        stored = build("stat")
+        src = tmp / "stat" / "gate" / "build" / f"src-{loop[:8]}"
+        engine = src / self.ENGINE
+        old = os.stat(engine).st_mtime_ns - 10**10
+        os.utime(engine, ns=(old, old))
+        self.git("-C", src.as_posix(), "update-index", "-q", "--refresh")
+        engine.write_text(engine.read_text(encoding="utf-8").replace("engine", "engin3"), encoding="utf-8")
+        os.utime(engine, ns=(old, old))
+        self.git("config", "core.checkStat", "minimal")
+        self.git("config", "core.trustctime", "false")
+        changed = build("stat")
+        self.git("config", "--unset", "core.checkStat")
+        self.git("config", "--unset", "core.trustctime")
+        # A checkout as stored, plus a file the repository ignores, which status doesn't show and
+        # a build may read (nrese-server's build.rs embeds apps/nrese-console/dist/; Sol, S1 r1):
+        # it builds without it (Sol, S1 r2: the gate's own leftovers go the same way).
+        clean = build("ignored")
+        (git_dir / "info" / "exclude").write_text("dist/\n", encoding="utf-8")
+        extra = tmp / "ignored" / "gate" / "build" / f"src-{loop[:8]}" / "dist" / "index.html"
+        extra.parent.mkdir(parents=True)
+        extra.write_text("<p>not the revision's</p>\n", encoding="utf-8")
+        ignored = build("ignored")
+        self.assertEqual((went in smudged, went in stored, went in changed, went in clean, went in ignored,
+                          extra.exists()), (False, True, False, True, True, False),
+                         f"SPEC the gate builds the revision's stored bytes and nothing else\n--- smudged\n"
+                         f"{smudged}\n--- changed\n{changed}\n--- ignored\n{ignored}")
+        self.assertIn("doesn't hold", smudged + changed)
+
+    def test_the_gates_own_checkout_may_hold_its_scratch_a_built_one_not(self):
+        """Sol, S1 r2: the gate writes ignored scratch into its own harness checkout (fast.py's
+        tmp/fast/queries, the watcher's __pycache__, cargo-guarded's tmp logs) and checks that
+        checkout again before each block: only a checkout to be built must hold nothing else."""
+        self.git("checkout", "-q", "--detach", self.side)
+        scratch = Path(self.repo, "tmp", "fast", "queries", "q.rq")
+        scratch.parent.mkdir(parents=True)
+        scratch.write_text("SELECT * {}\n", encoding="utf-8")
+        self.assertEqual(gate_module.checkout_differs(self.repo, self.side), [],
+                         "SPEC the harness's checkout: its stored bytes, the gate's scratch beside them")
+        self.assertIn("tmp/fast/queries/q.rq (not in the revision)",
+                      gate_module.checkout_differs(self.repo, self.side, nothing_else=True),
+                      "SPEC a checkout to be built: nothing else")
+        # Sol, S1 r3: code the harness would import isn't scratch: a sourceless benches/suite/csv.pyc
+        # (ignored as *.py[cod]) loads before the standard library's csv.
+        planted = Path(self.repo, "benches", "suite", "csv.pyc")
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        planted.write_bytes(b"\x00not the revision's\n")
+        self.assertEqual(gate_module.checkout_differs(self.repo, self.side),
+                         ["benches/suite/csv.pyc (code not in the revision)"],
+                         "SPEC the harness's checkout: no code but the revision's")
+
     def test_the_build_compiles_the_commit_checked(self):
         """PR #54 fix check 1 (D2's other half): a replace ref made after the check returned stood
         another engine in for the checked commit's in the checkout the build compiles, and HEAD
@@ -1203,17 +1305,7 @@ class MeasurementSides(unittest.TestCase):
             self.skipTest("the gate builds on Linux hosts (bash, flock)")
         loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
         engine = self.commit({self.ENGINE: "pub fn engine() { faster() }\n"}, "another engine", self.side)
-        # The gate's scripts beside the commits, not in them.
-        for rel in ("scripts/release-gate.sh", "benches/fast/release_gate.py"):
-            Path(self.repo, rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(ROOT / rel, Path(self.repo, rel))
-        shutil.copytree(ROOT / "scripts/lib", Path(self.repo, "scripts/lib"), ignore=shutil.ignore_patterns("__pycache__"))
-        shutil.copytree(ROOT / "benches/suite/suitekit", Path(self.repo, "benches/suite/suitekit"),
-                        ignore=shutil.ignore_patterns("__pycache__"))
-        Path(self.repo, "benches/fast/measurement-sides.toml").write_text(
-            f'[side.{self.side}]\ncommit = "{loop}"\nref = "refs/measure/t-{self.side[:8]}"\n', encoding="utf-8")
-        tmp = Path(tempfile.mkdtemp(prefix="measurement-build-"))
-        self.addCleanup(shutil.rmtree, tmp, True)
+        tmp = self.gate_beside(loop)
         # The check as it is; right after it (INJECT), a replace ref standing another engine in.
         (tmp / "shim").mkdir()
         (tmp / "shim" / "python3").write_text(f"""#!/usr/bin/env bash

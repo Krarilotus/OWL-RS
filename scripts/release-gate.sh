@@ -68,16 +68,31 @@ for dir in "$GATE" "$GATE_BIN"; do [ -e "$dir/.trackerignore" ] || echo "release
 log() { echo "$(date '+%F %T') $*" | tee -a "$OUT/gate.log"; }
 short() { git rev-parse --short=8 "$1"; }
 py() { PYTHONIOENCODING=utf-8 python3 -B "$@"; }
+# Every Python the gate starts keeps its caches here, never in a checkout, where a planted one
+# would be read (worktree() refuses code that isn't the revision's; Sol, S1 r3).
+export PYTHONPYCACHEPREFIX=$GATE/pycache
 
-worktree() {  # REV [DIR]: a clean worktree of the revision, made once
-  local rev dir
+worktree() {  # REV [DIR [built]]: a clean worktree of the revision, made once, holding its stored
+  # bytes; one to be built holds nothing else
+  local rev dir only=()
   rev=$(git rev-parse "$1") || return 2
   dir=${2:-$GATE}/src-$(short "$rev")
   if [ ! -d "$dir" ]; then
-    git worktree add -q --detach "$dir" "$rev" || { echo "no worktree of $rev" >&2; return 2; }
+    # Line ends as stored: a host's settings convert none (only .gitattributes does).
+    git -c core.autocrlf=false -c core.eol=lf worktree add -q --detach "$dir" "$rev" \
+      || { echo "no worktree of $rev" >&2; return 2; }
   fi
   (cd "$dir" && [ "$(git rev-parse HEAD)" = "$rev" ] && [ -z "$(git status --porcelain)" ]) \
     || { echo "the worktree $dir is not $rev, clean" >&2; return 2; }
+  # A build reads ignored files too (nrese-server's build.rs embeds apps/nrese-console/dist/): a
+  # worktree to be built loses every file not in the revision, the last build's leftovers with them.
+  if [ "${3:-}" = built ]; then
+    git -C "$dir" clean -ffdxq || { echo "the worktree $dir can't be cleaned" >&2; return 2; }
+    only=(--nothing-else)
+  fi
+  # HEAD and a clean status trust the index and the attributes; the bytes are the proof.
+  py benches/fast/release_gate.py checkout "$rev" "$dir" ${only[@]+"${only[@]}"} \
+    || { echo "the worktree $dir doesn't hold $rev's bytes" >&2; return 2; }
   echo "$dir"
 }
 
@@ -134,7 +149,7 @@ build)
     log "build $rev: verified binaries of its identity there from before ($bin, $LAYOUTS layouts)"; exit 0
   fi
   # The source and build trees are this gate's own; the build is published under its identity.
-  mkdir -p "$GATE/build" && src=$(worktree "$at" "$GATE/build") || exit 2
+  mkdir -p "$GATE/build" && src=$(worktree "$at" "$GATE/build" built) || exit 2
   export CARGO_TARGET_DIR=$GATE/build/target-$(short "$at")
   log "build $rev at $at ($(cd "$src" && rustc -V 2>/dev/null)); layouts to build: ${todo[*]}"
   missing=()
