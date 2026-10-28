@@ -24,10 +24,11 @@
 //! other class or property axiom is skipped and counted, outside EL (unions, universal
 //! restrictions, complements, cardinalities, inverses, nominals) or not (property
 //! characteristics other than transitivity, disjoint properties, disjoint unions, named
-//! class expressions, the top and bottom properties, data ranges and data restrictions):
-//! the hierarchy is then complete for the part read only. Assertions about individuals,
-//! and keys, which constrain only individuals, are not read: an inconsistency among them
-//! goes unseen.
+//! class expressions, the top and bottom properties, datatypes where a class is read,
+//! restrictions on data properties): the hierarchy is then complete for the part read
+//! only. A data property's range, which says nothing about classes without such a
+//! restriction, assertions about individuals, and keys, which constrain only
+//! individuals, are not read: an inconsistency among them goes unseen.
 
 use std::time::{Duration, Instant};
 
@@ -669,9 +670,10 @@ fn build(
             let some = tbox.some(r, thing);
             tbox.sub(some, c);
         } else if p == names.range && role(s) {
-            // A datatype as the range is a data range too: `expr` says so.
+            // A data property's range says nothing about classes but through a restriction
+            // on the property, which is reported. A datatype as an object property's range
+            // is a datatype read as a class: `expr` reports it.
             if graph.data_properties.contains(&s) {
-                skipped.push((p, "data range"));
                 continue;
             }
             let Some(c) = expr(o, p, &mut skipped) else {
@@ -1392,11 +1394,12 @@ mod tests {
     /// `r`-successor, so `∃r.A ⊑ B` gives `A ⊑ B`; unread, `A ⊑ B` is missing and the
     /// omission says so. So are the axioms the rules would misread (I26 Sol r1): a top or
     /// bottom property read as a role (`owl:topObjectProperty rdfs:domain B` gives `B ≡
-    /// owl:Thing`; `A ⊑ ∃owl:bottomObjectProperty.C`, `A ⊑ ⊥`), a data range or
-    /// restriction read as a class (`A ⊑ ∃p.xsd:integer` with `p`'s range `xsd:string`:
-    /// `A ⊑ ⊥`), and an expression with two values where the mapping has one.
-    /// Declarations, annotations, the ontology's header, and assertions about individuals
-    /// and keys, which the classifier doesn't read, omit no such axiom.
+    /// owl:Thing`; `A ⊑ ∃owl:bottomObjectProperty.C`, `A ⊑ ⊥`), a datatype read as a class
+    /// or a restriction on a data property (`A ⊑ ∃p.xsd:integer` with `p`'s range
+    /// `xsd:string`: `A ⊑ ⊥`), and an expression with two values where the mapping has one.
+    /// Declarations, annotations, the ontology's header, a data property's range (nothing
+    /// about classes without a restriction), and assertions about individuals and keys,
+    /// which the classifier doesn't read, omit no such axiom.
     #[test]
     fn axioms_without_a_rule_are_reported_as_omitted() {
         /// `(predicate, reason)` omitted, or `(sub, super)` derived.
@@ -1498,10 +1501,7 @@ mod tests {
                  ex:A rdfs:subClassOf _:e
                  _:e owl:onProperty ex:p
                  _:e owl:someValuesFrom xsd:integer",
-                &[
-                    ("rdfs:range", "data range"),
-                    ("rdfs:subClassOf", "data restriction"),
-                ],
+                &[("rdfs:subClassOf", "data restriction")],
                 &[],
             ),
             (
@@ -1540,6 +1540,7 @@ mod tests {
                  ex:A rdfs:label ex:l
                  ex:r rdf:type owl:ObjectProperty
                  ex:d rdf:type owl:DatatypeProperty
+                 ex:d rdfs:range xsd:string
                  ex:D rdf:type rdfs:Datatype
                  ex:A rdfs:subClassOf ex:B
                  _:x rdf:type owl:Axiom
