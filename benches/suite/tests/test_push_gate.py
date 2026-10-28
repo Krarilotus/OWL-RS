@@ -343,6 +343,87 @@ esac
             self.assertIn("CARGO_ENCODED_RUSTFLAGS", done.stderr)
 
 
+class MeasurementRefs(Repo):
+    """A pushed refs/measure/* ref is a commit on an old side's tree (benches/PROTOCOL.md §5), which
+    engine-v2's push tier isn't for: check.sh push checks it by the measurement rule against the
+    declared sides (release_gate.py measurement-ref), and refuses anything else. T0, 28 Oct 2026: the
+    tier ran on main's and v1.5's measurement commits and both gates failed, so neither ref could go."""
+
+    PERF_LAB = "crates/nrese-store/examples/perf_lab.rs"
+
+    def setUp(self):
+        super().setUp()
+        (self.repo / "benches/fast").mkdir(parents=True, exist_ok=True)
+        shutil.copy(ROOT / "benches/fast/release_gate.py", self.repo / "benches/fast/release_gate.py")
+        shutil.copytree(ROOT / "benches/suite/suitekit", self.repo / "benches/suite/suitekit",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        self.side = self.add({self.PERF_LAB: "fn main() { spawn(); }\n",
+                              "crates/nrese-store/src/lib.rs": "pub fn engine() {}\n"}, "an old side")
+        self.git(self.repo, "push", "-q", "origin", "HEAD:refs/heads/refactor/engine-v2")
+
+    def add(self, changes: dict, message: str, on: str | None = None) -> str:
+        if on:
+            self.git(self.repo, "checkout", "-q", "--detach", on)
+        for path, text in changes.items():
+            (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / path).write_text(text, newline="\n")
+        self.git(self.repo, "add", "-A")
+        self.git(self.repo, "commit", "-q", "-m", message)
+        return self.git(self.repo, "rev-parse", "HEAD")
+
+    def declare(self, side: str, ref: str, commit: str):
+        """The sides table of the pushing checkout: SIDE measured at COMMIT, pushed as REF."""
+        (self.repo / "benches/fast/measurement-sides.toml").write_text(
+            f'[side.{side}]\ncommit = "{commit}"\nref = "{ref}"\n', newline="\n")
+
+    def pushed(self, ref: str, commit: str):
+        self.fleet("pending")
+        return self.push((ref, commit, ref, ZERO))
+
+    def test_a_declared_measurement_ref_goes_without_the_push_tier(self):
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "its measurement side", self.side)
+        ref = f"refs/measure/old-{self.side[:8]}"
+        self.declare(self.side, ref, commit)
+        done = self.pushed(ref, commit)
+        self.assertEqual((done.returncode, self.jobs()), (0, []), f"SPEC measurement ref: {done.stderr}")
+
+    def test_a_measurement_ref_whose_commit_touches_the_engine_is_refused(self):
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n",
+                           "crates/nrese-store/src/lib.rs": "pub fn engine() { faster() }\n"}, "more", self.side)
+        ref = f"refs/measure/old-{self.side[:8]}"
+        self.declare(self.side, ref, commit)
+        done = self.pushed(ref, commit)
+        self.assertNotEqual(done.returncode, 0, "SPEC measurement ref: a commit touching the engine went")
+        self.assertIn("changes more than its perf lab", done.stdout + done.stderr)
+        self.assertEqual(self.jobs(), [], "the push tier ran instead")
+
+    def test_a_measurement_ref_that_doesnt_name_its_commits_parent_is_refused(self):
+        later = self.add({"a.txt": "later\n"}, "a later revision", self.side)
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "on the later revision", later)
+        ref = f"refs/measure/old-{self.side[:8]}"
+        self.declare(self.side, ref, commit)  # the ref names the side; the commit's parent is another
+        wrong_parent = self.pushed(ref, commit)
+        self.declare(self.side, ref, commit)
+        undeclared = self.pushed(f"refs/measure/old-{later[:8]}", commit)
+        self.assertEqual((wrong_parent.returncode != 0, undeclared.returncode != 0), (True, True),
+                         f"SPEC measurement ref: went\n{wrong_parent.stderr}\n{undeclared.stderr}")
+        self.assertIn(f"isn't a commit on {self.side[:12]} alone", wrong_parent.stdout + wrong_parent.stderr)
+        self.assertIn("declares this measurement ref", undeclared.stdout + undeclared.stderr)
+        self.assertEqual(self.jobs(), [])
+
+    def test_a_table_with_an_abbreviated_side_admits_nothing(self):
+        """Sol, T0 refs r1 S1: with the side abbreviated, the lookup by full revision missed, the
+        parent and path checks never ran, and a commit changing the lockfile went."""
+        later = self.add({"a.txt": "later\n"}, "a later revision", self.side)
+        commit = self.add({"Cargo.lock": "# another\n"}, "not a measurement side", later)
+        ref = f"refs/measure/old-{self.side[:8]}"
+        self.declare(self.side[:8], ref, commit)
+        done = self.pushed(ref, commit)
+        self.assertNotEqual(done.returncode, 0, f"SPEC measurement ref: went\n{done.stderr}")
+        self.assertIn("full revisions", done.stdout + done.stderr)
+        self.assertEqual(self.jobs(), [])
+
+
 @unittest.skipUnless(shutil.which("flock"), "the gate job runs on Linux fleet hosts (flock)")
 class GateJob(Repo):
     """scripts/lib/gate-job.sh, the job's step on its host, with stand-ins for its tools. Ported with the
