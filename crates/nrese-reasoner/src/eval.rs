@@ -1507,19 +1507,36 @@ impl GroundProgram {
         out
     }
 
-    /// The bodies (instantiated premises, plus the schema facts the instance was grounded
-    /// on) of up to `limit` one-step derivations of `fact` over `source`, by rules whose
-    /// head matches it and transitivity. Bodiless instances are in [`Self::bodiless`].
+    /// The bodies of one-step derivations of `fact` over `source`: a bodiless instance's
+    /// schema facts first ([`Self::bodiless_bodies`]), then up to `limit` by rules whose
+    /// head matches it and transitivity (instantiated premises, plus the schema facts the
+    /// instance was grounded on).
     pub fn derivation_bodies<S: Source + ?Sized>(
         &self,
         source: &S,
         fact: Triple,
         limit: usize,
     ) -> Vec<Vec<Triple>> {
-        self.named_derivations(source, fact, limit)
+        self.bodiless_bodies(fact)
             .into_iter()
-            .map(|(_, body)| body)
+            .map(<[Triple]>::to_vec)
+            .chain(
+                self.named_derivations(source, fact, limit)
+                    .into_iter()
+                    .map(|(_, body)| body),
+            )
             .collect()
+    }
+
+    /// The schema facts a bodiless instance of `fact` was grounded on, in each of its
+    /// alternatives (none if `fact` is no bodiless fact): each is a one-step derivation of
+    /// it, as a rule instance's body is.
+    fn bodiless_bodies(&self, fact: Triple) -> Vec<&[Triple]> {
+        if self.bodiless.contains(&fact) {
+            self.premise_alternatives(Grounding::Bodiless(fact))
+        } else {
+            Vec::new()
+        }
     }
 
     /// [`Self::derivation_bodies`], each with the name of the rule it instantiates
@@ -1629,7 +1646,27 @@ impl GroundProgram {
         fact: Triple,
         transitivity_too: bool,
     ) -> bool {
-        if self.bodiless.contains(&fact) {
+        self.derivable_through(source, fact, &|_| true, true, transitivity_too)
+    }
+
+    /// The one answer to whether `fact` has a one-step derivation from `source`, by the
+    /// kinds the caller names: an instance of a rule `rule` admits (by index); with
+    /// `bodiless_too`, a bodiless instance whose schema facts `source` holds; with
+    /// `transitivity_too`, transitivity.
+    fn derivable_through<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        fact: Triple,
+        rule: &dyn Fn(usize) -> bool,
+        bodiless_too: bool,
+        transitivity_too: bool,
+    ) -> bool {
+        if bodiless_too
+            && self
+                .bodiless_bodies(fact)
+                .iter()
+                .any(|body| body.iter().all(|&g| source.contains(g)))
+        {
             return true;
         }
         let mut producers = Vec::new();
@@ -1638,6 +1675,9 @@ impl GroundProgram {
         producers.dedup_by_key(|(r, _)| *r);
         let mut found = false;
         for (r, _) in producers {
+            if !rule(r) {
+                continue;
+            }
             derivations(source, &self.rules[r], fact, Seg::All, &mut |_| {
                 found = true;
                 true
@@ -1691,31 +1731,23 @@ impl GroundProgram {
             .collect()
     }
 
-    /// Whether one of the rules `only` marks derives `fact` from `source` in one step.
+    /// Whether one of the rules `only` marks, or with `bodiless_too` a bodiless instance,
+    /// derives `fact` from `source` in one step ([`Self::derivable_through`], without
+    /// transitivity).
     pub fn derivable_by<S: Source + ?Sized>(
         &self,
         source: &S,
         fact: Triple,
         only: &[bool],
+        bodiless_too: bool,
     ) -> bool {
-        let mut producers = Vec::new();
-        self.heads.matching_fact(fact, &mut producers);
-        producers.sort_unstable();
-        producers.dedup_by_key(|(r, _)| *r);
-        let mut found = false;
-        for (r, _) in producers {
-            if !only.get(r).copied().unwrap_or(false) {
-                continue;
-            }
-            derivations(source, &self.rules[r], fact, Seg::All, &mut |_| {
-                found = true;
-                true
-            });
-            if found {
-                return true;
-            }
-        }
-        false
+        self.derivable_through(
+            source,
+            fact,
+            &|r| only.get(r).copied().unwrap_or(false),
+            bodiless_too,
+            false,
+        )
     }
 }
 

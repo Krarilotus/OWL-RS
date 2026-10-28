@@ -2308,18 +2308,18 @@ fn under_representatives(rules: &[Rule]) -> Vec<Rule> {
 }
 
 /// [`over_classes`] on `rules`, sharing the classes as they are now when it first changes
-/// a rule (later merges replace them).
+/// a rule and makes them (later merges replace them).
 fn give_classes(
     rules: &mut [Rule],
     reps: &Representatives,
-    classes: &SharedClasses,
+    classes: &mut Option<SharedClasses>,
     guarded: &mut Guarded,
 ) {
+    let first = classes.is_none();
     let now = over_classes(rules, reps.same_as, classes);
-    if now.rules && !guarded.rules {
+    if first && let Some(classes) = classes {
         classes.set(&reps.classes);
     }
-    guarded.rules |= now.rules;
     guarded.facts |= now.facts;
 }
 
@@ -2359,10 +2359,11 @@ fn run(
     let mut regrounding = true;
     // Ground every rule again (rules whose constants were merged, rewritten).
     let mut reground_all = false;
-    // Over representatives: the classes the rules' guards see, and which rules were given
-    // them (super::representatives::over_classes). A merge can make such a guard hold for
-    // facts already joined, so the rules concluding facts run in full after one.
-    let guard_classes = SharedClasses::default();
+    // Over representatives: the classes the rules' guards see, made with the first rule
+    // given them (super::representatives::over_classes), and whether one concludes facts.
+    // A merge can make such a guard hold for facts already joined, so the rules concluding
+    // facts run in full after one.
+    let mut guard_classes: Option<SharedClasses> = None;
     let mut guarded = Guarded::default();
     let mut reevaluate = false;
     // Facts to add in the first round, checked against the store: the input's stale
@@ -2413,7 +2414,7 @@ fn run(
                 source.retain(|r| !is_replacement_rule(r));
             }
             if let Some(reps) = &representatives {
-                give_classes(&mut source, reps, &guard_classes, &mut guarded);
+                give_classes(&mut source, reps, &mut guard_classes, &mut guarded);
             }
             // The first round grounds everything; later ones through new schema facts
             // only (list rules in full, deduplicated).
@@ -2598,8 +2599,8 @@ fn run(
                 // Rewritten: no longer what a family produced.
                 candidates.push((None, segments(moved)));
                 merged = true;
-                if guarded.rules {
-                    guard_classes.set(&reps.classes);
+                if let Some(classes) = &guard_classes {
+                    classes.set(&reps.classes);
                 }
                 reevaluate = guarded.facts;
                 if rules.iter().any(|rule| names_any(rule, &lost)) {
@@ -2644,7 +2645,7 @@ fn run(
         };
         let mut checks = consistency_rules(&current, &rules, lists);
         if let Some(reps) = &representatives {
-            give_classes(&mut checks, reps, &guard_classes, &mut guarded);
+            give_classes(&mut checks, reps, &mut guard_classes, &mut guarded);
         }
         program.ground(&current, schema, &checks);
     }
