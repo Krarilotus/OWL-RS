@@ -2,7 +2,7 @@
 # The push tier for each pushed commit, on the fleet (scripts/check.sh push): the commit's own
 # tree, with the files from where the remote has its branch (new there: where it left
 # refactor/engine-v2) to the commit. A ref the push only deletes has no tree to gate. Milestones
-# run scripts/check.sh all. Enable the hooks with: git config core.hooksPath .githooks
+# run scripts/check.sh all. Enabling the hooks: CONTRIBUTING.md.
 #
 # Git's lines on stdin: <local ref> <local sha> <remote ref> <remote sha>; $1 is the remote.
 cd "$(git rev-parse --show-toplevel)" || exit 2

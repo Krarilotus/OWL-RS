@@ -135,7 +135,7 @@ roles = ["prepare"]
 has = []
 assets = false
 note = "a user is logged in: light tasks only, in its WSL Ubuntu (wsl -e bash -lc ...): downloads, data preparation, answer checks; no timing. No Rust, no Docker, no Java"
-queue = { dir = "/home/schmiddihhh/owlrs/queue", repo = "/home/schmiddihhh/owlrs/repo.git", results = "/home/schmiddihhh/owlrs/results", windows = ["00:00-24:00"], timing = false, keep = "7-days", python = "wsl -e python3", receive_pack = "wsl git-receive-pack" }
+queue = { dir = "/home/krarilotus/owlrs/queue", repo = "/home/krarilotus/owlrs/repo.git", results = "/home/krarilotus/owlrs/results", windows = ["00:00-24:00"], timing = false, keep = "7-days", python = "wsl -e python3", receive_pack = "wsl git-receive-pack" }
 
 [host.kraris-gptler]
 hostname = "Kraris-GPTler"
