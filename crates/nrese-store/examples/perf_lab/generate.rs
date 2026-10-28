@@ -1475,18 +1475,12 @@ fn support_stress(p: &Params, nt: &mut Nt, out: &str, commits: &str) -> std::io:
         commits,
         format!("{}\n{}\n", update(&one), update(&thousand)),
     )?;
-    // The reader's own updates (`perf_lab --support-updates`), into the first of its graphs:
-    // u1 reads the committed state (every `ex:D` it derives); u2's second `WHERE` reads the
-    // state its first operation left. They write markers only, so `ex:D` stays as it is.
-    let own = &reader[0];
+    // The reader's own updates (`perf_lab --support-updates`), into the first of its graphs,
+    // after the commits: they write markers only, so `ex:D` stays as it is, and each leaves one
+    // marker per member of it (`marked`, `seen`: the count after the commits).
     std::fs::write(
         format!("{out}.updates.ru"),
-        format!(
-            "INSERT {{ GRAPH <{own}> {{ ?x <{EX}marked> true }} }} WHERE {{ ?x a <{EX}D> }}\n\
-             INSERT DATA {{ GRAPH <{own}> {{ <{EX}probe> <{EX}step> 1 }} }} ; \
-             INSERT {{ GRAPH <{own}> {{ ?x <{EX}seen> true }} }} \
-             WHERE {{ GRAPH <{own}> {{ <{EX}probe> <{EX}step> 1 }} ?x a <{EX}D> }}\n"
-        ),
+        crate::support::updates(&reader[0]),
     )?;
     quads.extend(one);
     quads.extend(thousand);
@@ -1499,5 +1493,7 @@ fn support_stress(p: &Params, nt: &mut Nt, out: &str, commits: &str) -> std::io:
     e.insert("count".into(), json!(count));
     e.insert("probe_after_commits".into(), json!(seen_after));
     e.insert("count_after_commits".into(), json!(count_after));
+    e.insert("marked".into(), json!(count_after));
+    e.insert("seen".into(), json!(count_after));
     Ok(e)
 }

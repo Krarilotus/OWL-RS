@@ -456,8 +456,8 @@ page_cache = ["warm", "cold"]
 queries = "support-stress"
 metric = "support.updates.u1.update_ms"
 counters = ["support.inferred", "support.first.visible"]
-check = { "q.probe.value" = "true", "q.count.value" = 5059 }
-pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by); the updates write markers only"
+check = { "q.probe.value" = "true", "q.count.value" = 5059, "support.updates.u1.applied.marked" = 5059 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by); the updates write markers only, one per member of ex:D each (the expect's marked and seen)"
 route = {}
 cap_gb = 6
 est_min = 3
@@ -478,8 +478,8 @@ page_cache = ["warm", "cold"]
 queries = "support-stress"
 metric = "support.updates.u2.update_ms"
 counters = ["support.inferred", "support.first.visible"]
-check = { "q.probe.value" = "true", "q.count.value" = 5059 }
-pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by); the updates write markers only"
+check = { "q.probe.value" = "true", "q.count.value" = 5059, "support.updates.u2.applied.seen" = 5059 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by); the updates write markers only, one per member of ex:D each (the expect's marked and seen)"
 route = {}
 cap_gb = 6
 est_min = 3
@@ -490,7 +490,7 @@ name = "support-pending-read"
 area = "access"
 workload = "support-stress"
 tier = "copies-17"
-what = "a supported reader's count of ex:D in a client transaction with u2 pending: its operations replayed on its view, the count on the state they leave"
+what = "a supported reader's tally of ex:D and its markers in a client transaction with u2 pending: its operations replayed on its view, the tally on the state they leave"
 semantics = "owl2-rl"
 data = "volume:support-stress/copies-17.nq"
 extra = ["volume:support-stress/copies-17.nq.reader", "volume:support-stress/copies-17.nq.commits.ru", "volume:support-stress/copies-17.nq.updates.ru"]
@@ -500,8 +500,8 @@ page_cache = ["warm", "cold"]
 queries = "support-stress"
 metric = "support.updates.u2.pending_ms"
 counters = ["support.inferred", "support.first.visible"]
-check = { "q.probe.value" = "true", "q.count.value" = 5059 }
-pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by); the updates write markers only"
+check = { "q.probe.value" = "true", "q.count.value" = 5059, "support.updates.u2.pending.d" = 5059, "support.updates.u2.pending.seen" = 5059 }
+pinned = "the generator's oracle for the case's reader after both commits (benches/datasets.toml made_by); the updates write markers only, one per member of ex:D each (the expect's marked and seen); u2's seen markers exist only where its operations ran in order"
 route = {}
 cap_gb = 6
 est_min = 3

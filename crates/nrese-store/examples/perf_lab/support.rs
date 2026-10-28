@@ -9,10 +9,12 @@
 //!   pipeline, each followed by a restricted read: the commit's time, then the read's (the
 //!   sets updated, or computed afresh, and the view rebuilt from the reader's last one).
 //! - **The reader's updates** (`--support-updates FILE`, one SPARQL update request per line,
-//!   `u1`, `u2`, …), after the commits: each first pending in a client transaction while the
-//!   reader counts `ex:D` (`pending_ms`: its operations replayed, their `WHERE` clauses on the
-//!   reader's view, and the count on the state they leave), then applied by the reader, who
-//!   writes its named graphs, through the pipeline (`update_ms`), then a restricted read.
+//!   `u1`, `u2`, …; [`updates`]), after the commits: each first pending in a client
+//!   transaction while the reader tallies `ex:D` and its markers (`pending_ms`: its operations
+//!   replayed, their `WHERE` clauses on the reader's view, and the tally on the state they
+//!   leave), then applied by the reader, who writes its named graphs, through the pipeline
+//!   (`update_ms`), then a restricted read and the tally again. Both tallies are reported
+//!   (`pending`, `applied`), so the suite checks what the updates did.
 //!
 //! The queries then run as that reader, so the suite checks its answers.
 
@@ -26,8 +28,8 @@ use nrese_sparql::GraphAccess;
 use nrese_store::support::SupportStatistics;
 use nrese_store::{
     CancellationToken, MutationCommand, MutationPipeline, MutationTicket, PreparedQuery, ReadScope,
-    Requester, SparqlQueryRequest, SparqlUpdateRequest, StatementOp, StatementsRequest,
-    StoreResult, StoreService, WriteScope,
+    Requester, SolutionsResultFormat, SparqlQueryRequest, SparqlUpdateRequest, StatementOp,
+    StatementsRequest, StoreResult, StoreService, WriteScope,
 };
 
 use crate::Phase;
@@ -113,6 +115,61 @@ const UPDATE_PHASES: [&str; 4] = [
     "support_update_4",
 ];
 
+/// The reader's own updates, one request a line, into `own`, the first of its graphs (`perf_lab
+/// generate support-stress` writes them to `OUT.updates.ru`): u1 marks every `ex:D` it reads
+/// (`marked`); u2 inserts a probe, then marks every `ex:D` its second `WHERE` reads with the
+/// probe in place (`seen`), so it reads the state its first operation left. Each `WHERE` reads
+/// `ex:D` as the count query does ([`crate::support_family::count`]): each update leaves one
+/// marker per member, the count's answer, and none where it reads nothing or out of order.
+pub fn updates(own: &str) -> String {
+    use crate::support_family::EX;
+    let d = format!("{{ ?x a <{EX}D> }} UNION {{ GRAPH ?g {{ ?x a <{EX}D> }} }}");
+    format!(
+        "INSERT {{ GRAPH <{own}> {{ ?x <{EX}marked> true }} }} WHERE {{ {d} }}\n\
+         INSERT DATA {{ GRAPH <{own}> {{ <{EX}probe> <{EX}step> 1 }} }} ; \
+         INSERT {{ GRAPH <{own}> {{ ?x <{EX}seen> true }} }} \
+         WHERE {{ GRAPH <{own}> {{ <{EX}probe> <{EX}step> 1 }} {d} }}\n"
+    )
+}
+
+/// One row: the subjects in `ex:D` (`d`, read as the count query reads) and those the
+/// reader's markers of each kind name, in any graph it reads ([`updates`]).
+fn tally() -> String {
+    use crate::support_family::EX;
+    format!(
+        "SELECT (COUNT(DISTINCT ?s) AS ?d) (COUNT(DISTINCT ?m) AS ?marked) \
+         (COUNT(DISTINCT ?n) AS ?seen) WHERE {{ {{ ?s a <{EX}D> }} UNION {{ GRAPH ?g {{ ?s a <{EX}D> }} }} \
+         UNION {{ GRAPH ?g {{ ?m <{EX}marked> true }} }} UNION {{ GRAPH ?g {{ ?n <{EX}seen> true }} }} }}"
+    )
+}
+
+/// The tally's answer (a TSV row of three counts) as the report's object.
+fn tallied(answer: &[u8]) -> Result<String, String> {
+    let text = String::from_utf8_lossy(answer);
+    let counts: Vec<u64> = text
+        .lines()
+        .nth(1)
+        .ok_or_else(|| format!("the tally answered no row: {text:?}"))?
+        .split('\t')
+        .map(|cell| {
+            // `"12"^^<…#integer>` or a plain term: the lexical form.
+            let lexical = cell
+                .strip_prefix('"')
+                .and_then(|c| c.split('"').next())
+                .unwrap_or(cell);
+            lexical
+                .parse()
+                .map_err(|_| format!("the tally's {cell:?} isn't a count"))
+        })
+        .collect::<Result<_, _>>()?;
+    match counts[..] {
+        [d, marked, seen] => Ok(format!(
+            "{{\"d\": {d}, \"marked\": {marked}, \"seen\": {seen}}}"
+        )),
+        _ => Err(format!("the tally's row isn't three counts: {text:?}")),
+    }
+}
+
 /// The non-empty lines of `file`, at most `most` (`what` names the option).
 fn lines(file: Option<&Path>, most: usize, what: &str) -> Result<Vec<String>, String> {
     let text = match file {
@@ -178,7 +235,8 @@ pub fn measure(
             after.json()
         ));
     }
-    // The reader writes its own named graphs; it counts `ex:D` as the suite's count query does.
+    // The reader writes its own named graphs; it tallies `ex:D` as the suite's count query
+    // counts it, and its markers.
     let scope = ReadScope::Graphs(Arc::clone(access));
     let writer = Requester::new(
         scope.clone(),
@@ -187,19 +245,20 @@ pub fn measure(
             ..GraphAccess::default()
         })),
     );
-    let count = PreparedQuery::parse(&SparqlQueryRequest::new(
-        crate::support_family::count(),
-        scope,
-    ))?;
+    let mut request = SparqlQueryRequest::new(tally(), scope);
+    request.solutions_format = SolutionsResultFormat::Tsv;
+    let tally = PreparedQuery::parse(&request)?;
     let mut applied = Vec::new();
     let updates = lines(updates, UPDATE_PHASES.len(), "--support-updates")?;
     for (k, update) in updates.into_iter().enumerate() {
         let phase = Phase::start();
         let pending =
             StatementsRequest::new(vec![StatementOp::Update(SparqlUpdateRequest::new(&update))]);
+        let mut answer = Vec::new();
         let started = Instant::now();
-        store.run_query_pending(&pending, &count, &CancellationToken::new(), std::io::sink())?;
+        store.run_query_pending(&pending, &tally, &CancellationToken::new(), &mut answer)?;
         let pending_ms = started.elapsed().as_secs_f64() * 1e3;
+        let on_pending = tallied(&answer)?;
         let started = Instant::now();
         pipeline.apply(
             MutationCommand::Update(SparqlUpdateRequest::new(update)),
@@ -208,16 +267,21 @@ pub fn measure(
         )?;
         let update_ms = started.elapsed().as_secs_f64() * 1e3;
         let after = Read::of(store, access)?;
+        let mut answer = Vec::new();
+        store.run_query(&tally, &CancellationToken::new(), &mut answer)?;
+        let on_applied = tallied(&answer)?;
         phases.push((UPDATE_PHASES[k], phase.json()));
         eprintln!(
-            "support: update u{} pending {pending_ms:.1} ms, applied {update_ms:.1} ms, then {}",
+            "support: update u{} pending {pending_ms:.1} ms {on_pending}, applied \
+             {update_ms:.1} ms {on_applied}, then {}",
             k + 1,
             after.json()
         );
         samples.push(format!("\"pending_{}\": [{pending_ms:.3}]", k + 1));
         samples.push(format!("\"update_{}\": [{update_ms:.3}]", k + 1));
         applied.push(format!(
-            "\"u{}\": {{\"pending_ms\": {pending_ms:.3}, \"update_ms\": {update_ms:.3}, {}}}",
+            "\"u{}\": {{\"pending_ms\": {pending_ms:.3}, \"update_ms\": {update_ms:.3}, \
+             \"pending\": {on_pending}, \"applied\": {on_applied}, {}}}",
             k + 1,
             after.json()
         ));
