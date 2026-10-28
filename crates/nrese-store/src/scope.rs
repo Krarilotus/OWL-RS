@@ -42,6 +42,16 @@ impl ReadScope {
         self.access().is_none_or(|access| access.inferred)
     }
 
+    /// The statements a read in this scope reads at most: the inferred ones too where it sees
+    /// them, else the asserted ones only. Queries, statement reads and updates' `WHERE` clauses
+    /// take their model from here ([`crate::support::Reading::of`]).
+    pub fn model(&self) -> nrese_engine::ReadModel {
+        match self.sees_inferred() {
+            true => nrese_engine::ReadModel::Materialised,
+            false => nrese_engine::ReadModel::Asserted,
+        }
+    }
+
     /// Whether the read sees every graph.
     pub fn reads_everything(&self) -> bool {
         matches!(self, Self::All)
@@ -57,15 +67,66 @@ impl ReadScope {
     }
 
     /// `result` as this read's requester may be told it, the one boundary every read and
-    /// update entry point returns through. A reader of every graph is told everything; a
-    /// reader of some, a memory refusal's kind and limit but not the bytes held and asked
-    /// for, which a scan of graphs it may not read can size (round 13, R13-diag).
-    pub(crate) fn told<T>(&self, result: StoreResult<T>) -> StoreResult<T> {
+    /// update entry point returns through, naming itself (`_entry`: each has a row in the
+    /// table that checks this boundary, [`EntryPoint`]). A reader of every graph is told
+    /// everything; a reader of some, a memory refusal's kind and limit but not the bytes held
+    /// and asked for, which a scan or a view of graphs it may not read can size (round 13,
+    /// R13-diag).
+    pub(crate) fn told<T>(&self, _entry: EntryPoint, result: StoreResult<T>) -> StoreResult<T> {
         match result {
             Err(error) if !self.reads_everything() => Err(error.without_amounts()),
             result => result,
         }
     }
+}
+
+/// Declares [`EntryPoint`] and [`EntryPoint::ALL`] from one list, so that the list holds
+/// every entry point.
+macro_rules! entry_points {
+    ($($(#[doc = $doc:literal])+ $name:ident,)+) => {
+        /// The read and update entry points that return through [`ReadScope::told`], each
+        /// naming itself there. The test of that boundary (`scope_tests`,
+        /// `memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes`) builds its
+        /// rows by a match over these, so one without a row doesn't compile.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum EntryPoint {
+            $($(#[doc = $doc])+ $name,)+
+        }
+
+        impl EntryPoint {
+            /// Every entry point.
+            pub const ALL: &'static [Self] = &[$(Self::$name,)+];
+        }
+    };
+}
+
+entry_points! {
+    /// A query run to completion ([`crate::StoreService::run_query`] and the others that
+    /// run one).
+    Run,
+    /// A query run on a transaction's pending operations
+    /// ([`crate::StoreService::run_query_pending`]).
+    RunPending,
+    /// EXPLAIN ANALYZE ([`crate::StoreService::explain_query`]).
+    Explain,
+    /// EXPLAIN, without running ([`crate::StoreService::plan_query`]).
+    Plan,
+    /// An update's `WHERE` ([`crate::MutationCommand::Update`]).
+    UpdateWhere,
+    /// Graph Store Protocol `GET` ([`crate::StoreService::write_graph`],
+    /// [`crate::StoreService::execute_graph_read`]).
+    GraphRead,
+    /// Graph Store Protocol `HEAD` ([`crate::StoreService::graph_exists`]).
+    GraphExists,
+    /// RDF4J's `GET /statements` ([`crate::StoreService::write_statements`],
+    /// [`crate::StoreService::statements`]).
+    Statements,
+    /// RDF4J's `/size` ([`crate::StoreService::count`]).
+    Size,
+    /// Why the rules derive a statement ([`crate::StoreService::explain_statement`]).
+    ExplainStatement,
+    /// A statement's justifications ([`crate::StoreService::justify_statement`]).
+    JustifyStatement,
 }
 
 /// The graphs a write may change.
@@ -186,8 +247,8 @@ impl<'a> ReadContext<'a> {
 
     /// The statements read: inferred ones only where both the read and its scope want them.
     pub fn model(&self) -> nrese_engine::ReadModel {
-        match self.infer && self.scope.sees_inferred() {
-            true => nrese_engine::ReadModel::Materialised,
+        match self.infer {
+            true => self.scope.model(),
             false => nrese_engine::ReadModel::Asserted,
         }
     }

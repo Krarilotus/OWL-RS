@@ -7,10 +7,9 @@
 //! an inferred statement when one of its derivations uses graphs it may read alone, that is,
 //! exactly what the closure of the statements it may read holds. Exact here means a cap past
 //! every statement's sets (`usize::MAX`); the cap's own contract (config.rs,
-//! `StoreConfig::support_sets`) is that it keeps that many sets per statement.
-//!
-//! The two tests of the default configuration are red while its cap is 16: they are the
-//! specification an exact default must meet, run with `--ignored`.
+//! `StoreConfig::support_sets`) is that it bounds memory and work, not what readers see: a
+//! reader none of a statement's kept sets fits, where the cap left some out, is decided by the
+//! closure of its graphs. So every cap, the default's included, answers as the oracle.
 
 use std::sync::Arc;
 
@@ -167,10 +166,10 @@ fn exact_reads_equal_the_oracle() {
     }
 }
 
-/// Red while the default cap is 16: a reader whose graphs hold only a set the cap left out is
-/// denied a statement the oracle shows (the 17 sets of `copies 17`, and more).
+/// The default configuration (cap 16) answers as the oracle on the suite's inputs: a reader
+/// whose graphs hold only a set the cap left out (the 17 sets of `copies 17`, and more) is
+/// decided by the closure of its graphs.
 #[test]
-#[ignore = "red while the default cap is 16 (C-310); the specification of an exact default"]
 fn default_reads_equal_the_oracle() {
     let wrong: Vec<String> = catalogued()
         .iter()
@@ -183,11 +182,13 @@ fn default_reads_equal_the_oracle() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Spec: config.rs (`StoreConfig::support_sets`): the cap keeps that many sets per statement,
-/// at least 1. A target derivable from each of k graphs alone has k sets: of the k readers of
-/// one graph each, k - cap are denied it, none when nothing is capped.
+/// Spec: config.rs (`StoreConfig::support_sets`): the cap bounds memory and work, not what
+/// readers see; a reader none of a statement's kept sets fits, where the cap left some out,
+/// is decided by the closure of its graphs. A target derivable from each of k graphs alone
+/// has k sets: at caps 1, 4, 16 and off (every set kept), with k at the cap and one past it,
+/// every reader answers as the oracle, the k readers of one graph each among them.
 #[test]
-fn the_cap_keeps_as_many_sets_as_it_is_set_to() {
+fn readers_equal_the_oracle_at_every_cap() {
     for (cap, k) in [
         (1, 1),
         (1, 2),
@@ -197,16 +198,34 @@ fn the_cap_keeps_as_many_sets_as_it_is_set_to() {
         (16, 17),
         (EXACT, 17),
     ] {
-        let family = Family::new(Shape::Copies(k), 1, 7);
-        let store = store(&family.quads(), capped(cap));
-        let probe = format!("{EX}x0");
-        let denied = (0..u64::from(k))
-            .filter(|&i| !answers(&store, &reader(&family.support(i)), &probe).0)
-            .count();
+        let wrong = mismatches(&Family::new(Shape::Copies(k), 1, 7), capped(cap));
+        assert!(wrong.is_empty(), "cap {cap}, {k} sets: {wrong:#?}");
+    }
+}
+
+/// Spec: config.rs (`StoreConfig::support_sets`): the cap bounds memory and work, not what
+/// readers see, also for a statement asserted in more graphs than the cap. `ex:x a ex:D` is
+/// asserted in two graphs (a cap of 1 keeps one), and follows from `ex:x a ex:C` in a third
+/// with `C ⊑ D` (a set the cap leaves out, past the two single graphs): the reader of that
+/// third graph, who reads neither asserting graph, sees it as the oracle does, at caps 1, 2
+/// and off.
+#[test]
+fn a_statement_its_own_graphs_put_past_the_cap_is_still_derived() {
+    let derives = format!("{EX}derives");
+    let quads = vec![
+        Quad::typed("x", "D", Some(&format!("{EX}own-1"))),
+        Quad::typed("x", "D", Some(&format!("{EX}own-2"))),
+        Quad::typed("x", "C", Some(derives.as_str())),
+        Quad::sub_class("C", "D", None),
+    ];
+    let (readable, probe) = ([derives], format!("{EX}x"));
+    assert_eq!(oracle(&quads, &readable, &probe), (true, 1));
+    for cap in [1, 2, EXACT] {
+        let store = store(&quads, capped(cap));
         assert_eq!(
-            denied,
-            (k as usize).saturating_sub(cap),
-            "cap {cap}, {k} sets"
+            answers(&store, &reader(&readable), &probe),
+            (true, 1),
+            "cap {cap}"
         );
     }
 }
@@ -242,10 +261,9 @@ fn exact_reads_ignore_hidden_supports() {
     assert_eq!(hidden_supports(|| capped(EXACT)), [(true, 1); 2]);
 }
 
-/// Red while the default cap is 16: the hidden supports push the reader's out of the 16 kept,
-/// and its answers change with graphs it may not read.
+/// The default configuration: the hidden supports push the reader's set out of the 16 kept,
+/// and its answers stay what they are without them.
 #[test]
-#[ignore = "red while the default cap is 16 (C-310); the specification of an exact default"]
 fn default_reads_ignore_hidden_supports() {
     assert_eq!(hidden_supports(in_memory_store_config), [(true, 1); 2]);
 }

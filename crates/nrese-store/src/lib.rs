@@ -100,7 +100,7 @@ pub use reasoning::{InferenceStep, MaterialisationReport, OntologyDiagnostic};
 pub use reasoning_state::{ConsistencyStatus, ReasoningState};
 pub use running::{RunningQueries, RunningQuery};
 pub use runtime::Runtime;
-pub use scope::{ReadContext, ReadScope, Requester, WriteScope};
+pub use scope::{EntryPoint, ReadContext, ReadScope, Requester, WriteScope};
 pub use service::StoreService;
 pub use sessions::{SESSION_IDLE, Sessions};
 pub use shacl::{
