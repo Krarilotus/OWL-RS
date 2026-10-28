@@ -8,6 +8,8 @@ use tower::util::ServiceExt;
 use nrese_server::policy::PolicyConfig;
 use nrese_server::{AppState, DeploymentPosture, build_app};
 
+pub mod held_service;
+
 pub fn test_app() -> Result<axum::Router, Box<dyn std::error::Error>> {
     test_app_with_settings(PolicyConfig::default(), ReasonerConfig::default())
 }
@@ -48,8 +50,22 @@ pub fn test_app_with_store_config(
     policy: PolicyConfig,
     reasoner_config: ReasonerConfig,
 ) -> Result<axum::Router, Box<dyn std::error::Error>> {
+    Ok(build_app(test_state_with_store_config(
+        store_config,
+        policy,
+        reasoner_config,
+    )?))
+}
+
+/// The state [`test_app_with_store_config`] serves, for a test that reaches the
+/// repositories behind the app (`build_app(state.clone())`).
+pub fn test_state_with_store_config(
+    store_config: StoreConfig,
+    policy: PolicyConfig,
+    reasoner_config: ReasonerConfig,
+) -> Result<AppState, Box<dyn std::error::Error>> {
     let store = started(StoreService::new(store_config)?, &reasoner_config)?;
-    test_app_with_store(store, policy, reasoner_config)
+    Ok(test_state_with_store(store, policy, reasoner_config))
 }
 
 /// `store` as the server starts it: the inferred stack materialised for the configured
@@ -72,6 +88,18 @@ pub fn test_app_with_store(
     policy: PolicyConfig,
     reasoner_config: ReasonerConfig,
 ) -> Result<axum::Router, Box<dyn std::error::Error>> {
+    Ok(build_app(test_state_with_store(
+        store,
+        policy,
+        reasoner_config,
+    )))
+}
+
+fn test_state_with_store(
+    store: StoreService,
+    policy: PolicyConfig,
+    reasoner_config: ReasonerConfig,
+) -> AppState {
     let reasoner = ReasonerService::new(reasoner_config);
     let state = AppState::new(
         store,
@@ -81,7 +109,7 @@ pub fn test_app_with_store(
         DeploymentPosture::OpenWorkbench,
     );
     state.mark_ready();
-    Ok(build_app(state))
+    state
 }
 
 pub fn minimal_fixture_path() -> std::path::PathBuf {
