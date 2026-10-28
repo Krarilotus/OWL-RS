@@ -554,6 +554,8 @@ class Parts(unittest.TestCase):
             done = subprocess.run([bash, "-c", f'PATH="$(cygpath -u "{shim}" 2>/dev/null || echo "{shim}"):$PATH" '
                                    f'exec bash scripts/release-gate.sh unpack'], cwd=ROOT, env=env,
                                   capture_output=True, text=True, encoding="utf-8")
+        # The gate's own checkout (of this checkout's commit) was under the scratch directory.
+        subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertIn("is not Linux", done.stdout)
 
@@ -811,8 +813,7 @@ esac
 """, encoding="utf-8", newline="\n")
                 (shim / "python3").chmod(0o755)
                 # git, faked: the revision is a fixed id, its tree empty, a worktree an empty
-                # directory; the index of the checkout the gate runs from (this one) the real one's,
-                # read only; anything else the step asks fails loudly (no repository is changed).
+                # directory; anything else the step asks fails loudly (no repository is touched).
                 (shim / "git").write_text(f"""#!/usr/bin/env bash
 while [ "$1" = -c ] || [ "$1" = -C ]; do shift 2; done
 case "$1 $2" in
@@ -820,7 +821,6 @@ case "$1 $2" in
   "rev-parse --show-object-format") echo sha1 ;;
   "rev-parse HEAD") echo {head} ;;
   "ls-tree -r") ;;
-  "ls-files -z") exec "{Path(shutil.which("git")).as_posix()}" "$@" ;;
   "worktree add") mkdir -p "${{@: -2:1}}" ;;
   "status --porcelain") ;;
   *) if [ "$1" = rev-parse ] && [ $# -eq 2 ]; then echo "$2"; else echo "fake git: $*" >&2; exit 99; fi ;;
@@ -1200,9 +1200,9 @@ class MeasurementSides(unittest.TestCase):
         self.assertEqual(gate_module.measured_at(self.repo, self.side, {self.side: loop}), loop)
 
     def gate_beside(self, loop: str) -> Path:
-        """The gate's scripts beside the commits, not in them, its side measured at LOOP: in the
-        index of the checkout it runs from, which ignores what the repository ignores and holds
-        nothing it ignores (checkout.py --launching); a scratch directory for its runs."""
+        """The gate's scripts beside the side's commits, in a commit of their own on HEAD, its side
+        measured at LOOP: the commit the gate is launched from, whose checkout its code runs from
+        (release-gate.sh); a scratch directory for its runs."""
         for rel in ("scripts/release-gate.sh", "benches/fast/release_gate.py", ".gitignore"):
             Path(self.repo, rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(ROOT / rel, Path(self.repo, rel))
@@ -1212,6 +1212,7 @@ class MeasurementSides(unittest.TestCase):
         Path(self.repo, "benches/fast/measurement-sides.toml").write_text(
             f'[side.{self.side}]\ncommit = "{loop}"\nref = "refs/measure/t-{self.side[:8]}"\n', encoding="utf-8")
         self.git("add", ".gitignore", "scripts", "benches")
+        self.git("-c", "user.name=t", "-c", "user.email=t@example.org", "commit", "-q", "-m", "the gate")
         tmp = Path(tempfile.mkdtemp(prefix="measurement-build-"))
         self.addCleanup(shutil.rmtree, tmp, True)
         return tmp
@@ -1354,47 +1355,123 @@ class MeasurementSides(unittest.TestCase):
         self.assertIn(went, output)
         self.assertTrue(earlier, "the earlier run's caches were planted too")
 
-    def test_nothing_beside_the_gates_own_files_runs_before_they_are_checked(self):
-        """Sol, PR #60 fix check 1: a sourceless package benches/suite/suitekit/cases/__init__.pyc
-        beside the checked cases.py, in the checkout the gate runs from, ran at the validator's
-        first import, before anything was checked: git clean -fd keeps it (*.py[cod] is ignored),
-        and no cache prefix reaches it. The gate refuses that checkout before any of its Python
-        imports from it; Python's caches, cargo's builds, the gate's scratch and a file git shows,
-        untracked (one the commit a hook checks adds), are no reason."""
+    def test_nothing_the_launching_checkout_holds_beside_its_commit_runs(self):
+        """Sol, PR #60 fix checks 1 and 2: files in the checkout the gate was launched from, beside
+        its commit's, ran in the validator before anything was checked: a sourceless
+        suitekit/cases/__init__.pyc (git clean -fd keeps it), an untracked suitekit/cases/__init__.py
+        or benches/suite/csv.py (no rule of what may lie there tells one from a commit hook's new
+        file). The gate's code runs from a checked checkout of the launching commit: nothing else
+        in the launching checkout runs, nor stops the gate."""
         if shutil.which("bash") is None or shutil.which("flock") is None:
             self.skipTest("the gate builds on Linux hosts (bash, flock)")
         import py_compile
         loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
         tmp = self.gate_beside(loop)
         went = f"build {self.side} at {loop}"
-        for inert in ("benches/suite/suitekit/__pycache__/cases.cpython-312.pyc", "target/debug/build.log",
-                      "tmp/scratch.txt", "benches/suite/suitekit/added.py"):
-            Path(self.repo, inert).parent.mkdir(parents=True, exist_ok=True)
-            Path(self.repo, inert).write_bytes(b"not the revision's\n")
-        self.assertIn(went, self.run_gate(tmp, "inert", "build", self.side), "SPEC caches, builds, scratch")
+        ran = "PR60 A LAUNCHING CHECKOUT FILE RAN"
         body = tmp / "planted.py"
-        body.write_text('raise RuntimeError("PR60 SOURCELESS STARTUP EXECUTED")\n', encoding="utf-8")
-        package = Path(self.repo, "benches/suite/suitekit/cases/__init__.pyc")
-        package.parent.mkdir()
-        py_compile.compile(str(body), cfile=str(package), doraise=True)
+        body.write_text(f'raise RuntimeError("{ran}")\n', encoding="utf-8")
+        planted = []
+        for name in ("benches/suite/suitekit/cases/__init__.py", "benches/suite/csv.py",
+                     "benches/suite/target/__init__.pyc", "benches/suite/__pycache__/__init__.pyc"):
+            path = Path(self.repo, name)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if name.endswith(".pyc"):
+                py_compile.compile(str(body), cfile=str(path), doraise=True)
+            else:
+                shutil.copy(body, path)
+            planted.append(path)
+        output = self.run_gate(tmp, "sources", "build", self.side)
+        self.assertNotIn(ran, output, "SPEC nothing beside the launching commit's files runs")
+        self.assertIn(went, output, "SPEC nor stops the gate")
+        # Sol, fix check 1: the sourceless package, also in a directory no walk can list (0111).
+        planted[0].unlink()
+        py_compile.compile(str(body), cfile=str(planted[0].with_suffix(".pyc")), doraise=True)
         output = self.run_gate(tmp, "sourceless", "build", self.side)
-        self.assertNotIn("PR60 SOURCELESS STARTUP EXECUTED", output, "SPEC nothing beside the gate's files runs")
-        self.assertIn("benches/suite/suitekit/cases/__init__.pyc", output)
-        self.assertNotIn(went, output)
-        # Sol, fix 2 r1 S1: the same package in a directory the check can't list but Python can
-        # open a file in by its name (mode 0111). Root lists it all the same.
+        self.assertNotIn(ran, output, "SPEC nothing beside the launching commit's files runs")
+        self.assertIn(went, output, "SPEC nor stops the gate")
         if os.name == "nt" or os.geteuid() == 0:
             self.skipTest("a directory only searchable needs a non-root POSIX user")
-        os.chmod(package.parent, 0o111)
-        self.addCleanup(os.chmod, package.parent, 0o755)
+        os.chmod(planted[0].parent, 0o111)
+        self.addCleanup(os.chmod, planted[0].parent, 0o755)
         output = self.run_gate(tmp, "unlisted", "build", self.side)
-        self.assertNotIn("PR60 SOURCELESS STARTUP EXECUTED", output, "SPEC what can't be listed isn't admitted")
-        self.assertIn("benches/suite/suitekit/cases (not listed", output)
-        self.assertNotIn(went, output)
+        self.assertNotIn(ran, output, "SPEC nothing beside the launching commit's files runs")
+        self.assertIn(went, output, "SPEC nor stops the gate")
 
-    def run_gate(self, tmp: Path, name: str, *command: str) -> str:
+    def without_flock(self, tmp: Path) -> str:
+        """A PATH of this one's commands but flock, as on a host without it (Git Bash): ns.sh then
+        locks with suitekit/lock.py."""
+        if shutil.which("flock") is None:
+            return os.environ.get("PATH", "")
+        farm = tmp / "no-flock"
+        farm.mkdir()
+        for entry in os.environ.get("PATH", "").split(os.pathsep):
+            for name in os.listdir(entry) if os.path.isdir(entry) else ():
+                target = Path(entry, name)
+                if name != "flock" and not os.path.lexists(farm / name) and target.is_file() \
+                        and os.access(target, os.X_OK):
+                    (farm / name).symlink_to(target)
+        return farm.as_posix()
+
+    def test_no_python_of_the_launching_checkout_runs_in_the_libraries(self):
+        """Sol, PR #60 fix 3's sol-loop S1: scripts/lib/ns.sh, sourced from the launching checkout,
+        named that checkout's suite for the Python it starts: where there is no flock it locks with
+        suitekit/lock.py, and a changed one there ran in `clean --patch-keyed --remove`. The
+        libraries' Python is the checked checkout's, which `clean` keeps until its last lock."""
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("needs bash")
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        tmp = self.gate_beside(loop)
+        ran = "PR60 A LAUNCHING CHECKOUT LOCK RAN"
+        Path(self.repo, "benches/suite/suitekit/lock.py").write_text(f'raise RuntimeError("{ran}")\n',
+                                                                     encoding="utf-8")
+        path = self.without_flock(tmp)
+        # BIN NAME IDENTITY-LINE AGE: a build there, its files and references AGE old.
+        make = r'''b=$1/$2; mkdir -p "$b/release/examples" "$b/.refs"; echo tool > "$b/release/examples/perf_lab"
+printf 'revision x\n%s\nlayout 1\n' "$3" > "$b/IDENTITY"; echo built > "$b/BUILD.txt"
+(cd "$b" && sha256sum release/examples/perf_lab > SHA256SUMS); touch "$b/.refs/gate-$2"
+find "$b" -maxdepth 2 -exec touch -d "$4" {} +'''
+        subprocess.run([bash, "-c", make, "make", (tmp / "keyed" / "bin").as_posix(), "bin-unused",
+                        "patch perf_lab_watchdog.py 0123456789abcdef", "3 days ago"], check=True)
+        output = self.run_gate(tmp, "keyed", "clean", "--patch-keyed", "--remove", path=path)
+        self.assertNotIn(ran, output, "SPEC no Python of the launching checkout runs")
+        self.assertIn("released-now\tbin-unused", output, "SPEC the build goes, under the checked checkout's lock")
+        subprocess.run([bash, "-c", make, "make", (tmp / "clean" / "bin").as_posix(), "bin-old",
+                        "profile release --locked", "30 days ago"], check=True)
+        output = self.run_gate(tmp, "clean", "clean", path=path)
+        self.assertNotIn(ran, output, "SPEC no Python of the launching checkout runs")
+        self.assertIn("unused builds removed: bin-old", output, "SPEC clean locks with the checked checkout's Python")
+        self.assertEqual(list((tmp / "clean" / "gate").glob("src-*")), [], "SPEC and then removes that checkout")
+
+    def test_a_callers_paths_are_the_launching_checkouts(self):
+        """Sol, PR #60 fix 3's sol-loop S2: the gate runs its code from a checkout of its own, and
+        `jobs HEAD --out jobs` wrote its jobs into that checkout, named it their repository, and
+        left it unclean, so the gate's next start refused it. A caller's paths, and the jobs'
+        repository, are the launching checkout's."""
+        if shutil.which("bash") is None:
+            self.skipTest("needs bash")
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        # The jobs place their parts by the host registry, which the gate's commit holds.
+        Path(self.repo, "benches").mkdir(exist_ok=True)
+        shutil.copy(ROOT / "benches/hosts.toml", Path(self.repo, "benches/hosts.toml"))
+        tmp = self.gate_beside(loop)
+        for start in ("first", "next"):
+            output = self.run_gate(tmp, "jobs", "jobs", "HEAD", "--base", "HEAD", "--main", "HEAD", "--no-checks",
+                                   "--out", "jobs")
+            written = sorted(Path(self.repo, "jobs").glob("*.toml"))
+            self.assertTrue(written, f"SPEC the {start} start writes the jobs where the caller said:\n{output}")
+        for file in written:
+            repositories = re.findall(r'git = "([^"]+)"', file.read_text(encoding="utf-8"))
+            self.assertTrue(repositories, file.name)
+            for repository in repositories:
+                self.assertEqual(Path(repository).resolve(), Path(self.repo).resolve(),
+                                 f"SPEC the jobs' repository is the launching checkout: {file.name}")
+
+    def run_gate(self, tmp: Path, name: str, *command: str, path: str | None = None) -> str:
         """release-gate.sh COMMAND from the test's checkout, its gate, binaries and results under
-        TMP/NAME, its python3 this Python (bytecode planted for it carries its tag); the output."""
+        TMP/NAME, its python3 this Python (bytecode planted for it carries its tag), then PATH (this
+        process's by default); the output."""
         shim = tmp / "shim" / "python3"
         if not shim.exists():
             shim.parent.mkdir()
@@ -1404,7 +1481,7 @@ class MeasurementSides(unittest.TestCase):
         gate = tmp / name
         env = {**os.environ, "NRESE_GATE_DIR": (gate / "gate").as_posix(), "GATE_BIN": (gate / "bin").as_posix(),
                "FLEET_OUT": (gate / "out").as_posix(),
-               "PATH": shim.parent.as_posix() + os.pathsep + os.environ.get("PATH", "")}
+               "PATH": shim.parent.as_posix() + os.pathsep + (path or os.environ.get("PATH", ""))}
         done = subprocess.run([shutil.which("bash"), "scripts/release-gate.sh", *command], cwd=self.repo, env=env,
                               capture_output=True, text=True)
         return done.stdout + done.stderr
@@ -1541,6 +1618,8 @@ make bin-after 'profile release --locked' '3 days ago'
                              {"IDENTITY", "BUILD.txt", "SHA256SUMS"}, "SPEC: the record stays")
             self.assertEqual(clean(), {"bin-unused": "released", "bin-live": "kept-live"})
             self.assertTrue(Path(tmp, "out", "patch-keyed-builds.tsv").is_file())
+        # The gate's own checkout (of this checkout's commit) was under the scratch directory.
+        subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
 
     def test_a_patch_keyed_build_is_never_a_verified_build(self):
         """Sol r1 S2: a gate's pointer or an archive from before T0 could hand a block a build of
