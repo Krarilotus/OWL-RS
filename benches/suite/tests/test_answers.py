@@ -71,13 +71,14 @@ class Levels(unittest.TestCase):
 
 
 class QueryNames(unittest.TestCase):
-    def test_a_query_is_named_alike_from_its_file_and_from_a_results_item(self):
-        """Every timing report matches answers.json's verdicts to the results' items by
-        answers.query_name: a file loses its directory and .rq, an item stays as it is, dots kept
-        (Sol, PR #56 compare r1: geographica2's `…_1_1.0` lost its `.0` and found no verdict)."""
+    def test_a_recorded_query_file_is_its_results_item(self):
+        """answers.json records a query by its file, the results by the file's stem (the driver's
+        item): answers.query_id turns the one into the other, without a directory, one `.rq`
+        and nothing else (Sol, PR #56 compare r1: geographica2's `…_1_1.0` lost its `.0`; fix
+        check 1: `q1.rq.rq` lost both)."""
         dotted = "00-Synthetic_Selection_Intersects_1_1.0"
-        self.assertEqual([answers.query_name(n) for n in (f"queries/{dotted}.rq", dotted, "q1.rq", "q1")],
-                         [dotted, dotted, "q1", "q1"], "SPEC one name per query")
+        self.assertEqual([answers.query_id(n) for n in (f"queries/{dotted}.rq", "queries\\q1.rq.rq", "q1.rq")],
+                         [dotted, "q1.rq", "q1"], "SPEC the item is the query file's stem")
 
 
 class OracleCompare(unittest.TestCase):

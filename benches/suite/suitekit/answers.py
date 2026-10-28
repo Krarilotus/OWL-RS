@@ -89,13 +89,17 @@ FAULTS = PRECEDENCE[:5]
 UNTIMED = FAULTS
 # An answer incomplete because no reference answered: nobody checked it.
 UNCHECKED = "unchecked"
+# A query its run recorded no verdict for, though it recorded some for the query's workload,
+# tier, regime and system: the join failed, and nothing shows its answer (T8 PR #56 R3).
+MISSING = "missing"
 
 
-def query_name(name: str) -> str:
-    """A query as answers.json and the results' items both name it, the key every timing report
-    matches them by: its file's name without a directory and without `.rq`. An item is that
-    already, and a dotted one keeps its dots (geographica2's `…_1_1.0`; Sol, PR #56 compare r1)."""
-    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+def query_id(query: str) -> str:
+    """The results' item for a query file answers.json records (`query`): the file's stem, as
+    the driver names its items, without a directory. Only a file goes through here; an item is
+    its id already, so `q1.rq.rq` is `q1.rq`, and a dotted one keeps its dots (geographica2's
+    `…_1_1.0`; Sol, PR #56 compare r1 and fix check 1)."""
+    name = query.replace("\\", "/").rsplit("/", 1)[-1]
     return name[:-3] if name.endswith(".rq") else name
 
 
@@ -108,12 +112,60 @@ def timing_verdict(entry: dict) -> str:
     return entry["verdict"]
 
 
+def worst_verdict(entries) -> dict:
+    """The worst of verdicts on one thing, whatever their order: a system's on a query over its
+    captures (Recorder.verdict), a query's over its records (TimingVerdicts). PRECEDENCE first;
+    of two incomplete ones, a fault before one no reference checked; a name PRECEDENCE doesn't
+    know (answers.json before 12 Oct: match, mismatch) after all, so it hides no fault it knows
+    (Sol, PR #56 fix round 2)."""
+    def rank(entry: dict) -> tuple[int, bool]:
+        verdict = entry["verdict"]
+        return (PRECEDENCE.index(verdict) if verdict in PRECEDENCE else len(PRECEDENCE),
+                timing_verdict(entry) == UNCHECKED)
+    return min(entries, key=rank)
+
+
 def timed(verdict: str | None) -> bool:
-    """Whether a query's time may count with this answer verdict (timing_verdict): not one of
-    UNTIMED, and not unchecked, since an answer nobody checked earns no time (T8 PR #56 R3).
-    The reports that name winners (versus, compete) decide it here. No verdict at all (answers
-    not captured) leaves it to the answer counts, as before."""
-    return verdict is None or (verdict not in UNTIMED and verdict != UNCHECKED)
+    """Whether a query's time may count with this answer verdict (TimingVerdicts.of): not one
+    of UNTIMED, not unchecked, since an answer nobody checked earns no time, and not missing
+    (T8 PR #56 R3). The reports that time (compare, versus, compete) decide it here. No verdict
+    at all (answers not captured) leaves it to the answer counts, as before."""
+    return verdict is None or (verdict not in UNTIMED and verdict not in (UNCHECKED, MISSING))
+
+
+class TimingVerdicts:
+    """Answer verdicts (answers.json's records, of one run or several) as the reports that time
+    read them: per query, by workload, tier, regime, result id and system, the worst of every
+    record of it, so no order of records or runs decides (T8 PR #56 R3)."""
+
+    def __init__(self, records=()):
+        found: dict[tuple, list[dict]] = {}
+        for v in records:
+            found.setdefault((v["workload"], v["tier"], v["regime"], query_id(v["query"]), v["system"]), []).append(v)
+        self.by_query = {key: worst_verdict(entries) for key, entries in found.items()}
+        self.scopes = {(workload, tier, regime, system) for workload, tier, regime, _, system in found}
+
+    def __bool__(self) -> bool:
+        """Whether any verdict was recorded: answers captured, not counts only."""
+        return bool(self.by_query)
+
+    def of(self, workload: str, tier: str, regime: str, item: str, system: str) -> str | None:
+        """A results item's verdict as timing reads it (timing_verdict); MISSING where its run
+        recorded verdicts for its workload, tier, regime and system but none for it. None where
+        it recorded none (answers not captured) or the item names no query: the driver's `*`,
+        a client level's `clients-N`."""
+        found = self.by_query.get((workload, tier, regime, item, system))
+        if found is not None:
+            return timing_verdict(found)
+        if item == "*" or item.startswith("clients-") or (workload, tier, regime, system) not in self.scopes:
+            return None
+        return MISSING
+
+    def verdicts(self) -> dict[tuple, str]:
+        """Every query's verdict as timing reads it, by (workload, tier, regime, result id, system)."""
+        return {key: timing_verdict(entry) for key, entry in self.by_query.items()}
+
+
 # F&O 3.1 §4.2: a decimal division SHOULD give at least 18 significant digits.
 DIVISION_DIGITS = 18
 
@@ -723,7 +775,7 @@ class Recorder:
                 for c in own]
         bad = [e for e in each if e["verdict"] != "ok"]
         if bad:
-            return min(bad, key=lambda e: PRECEDENCE.index(e["verdict"]))
+            return worst_verdict(bad)
         return dict(verdict="ok", level=max((e["level"] for e in each), key=("exact", "value", "division").index),
                     value_match=True, strict_match=all(e["strict_match"] for e in each),
                     note=next((e["note"] for e in each if e["note"]), ""))

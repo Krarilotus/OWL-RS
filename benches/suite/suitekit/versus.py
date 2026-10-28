@@ -27,7 +27,7 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
-from .answers import query_name, timed as answer_timed, timing_verdict
+from .answers import TimingVerdicts, timed as answer_timed
 from .compare import bootstrap_ratio, thin
 from .schema import read
 
@@ -41,14 +41,14 @@ def number(text) -> float | None:
         return None
 
 
-def answer_verdicts(directory: Path) -> dict[tuple, str]:
-    """(tier, query file stem, system) -> the answer verdict, from answers.json; `unchecked`
-    where no reference answered (the answer may be right; nothing showed it). A batch's
-    captures are classified together: the references may have answered in another run."""
+def answer_verdicts(directory: Path) -> TimingVerdicts:
+    """The answer verdicts of a run or a batch, from answers.json, as timing reads them
+    (answers.TimingVerdicts). A batch's captures are classified together: the references may
+    have answered in another run."""
     from .ledger import run_directories
     paths = [d / "answers.json" for d in run_directories(directory) if (d / "answers.json").exists()]
     if not paths:
-        return {}
+        return TimingVerdicts()
     from .answers import Recorder
     from .summary import adjudications
     data = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
@@ -58,7 +58,7 @@ def answer_verdicts(directory: Path) -> dict[tuple, str]:
         # Captures without their classification: classify them (answers.py).
         found = [v for d, path in zip(data, paths)
                  for v in (d["verdicts"] if "verdicts" in d else Recorder.load([path], None, adjudications()).verdicts())]
-    return {(v["tier"], query_name(v["query"]), v["system"]): timing_verdict(v) for v in found}
+    return TimingVerdicts(found)
 
 
 def side(rows: list[dict], cache: str) -> dict:
@@ -138,11 +138,14 @@ def versus(directory: Path, home_turfs: dict[str, str] | None = None) -> list[di
         name = case if workload == "fast" else f"{workload} {tier}"
         both = sorted(set(nrese["status"]) & set(other["status"]))
         problems = []
-        for who, s in (("nrese", nrese), (system, other)):
+        for who, s, own in (("nrese", nrese, ours), (system, other, mine)):
             for q in both:
-                verdict = verdicts.get((tier, query_name(q), who))
-                if not answer_timed(verdict):
-                    problems.append(f"{q} {verdict} ({who})")
+                # Its answer in the regime of each row of it (the driver runs a system in one).
+                found = {verdicts.of(workload, tier, r["regime"], q, who)
+                         for r in own if r["task"] == "query" and r["item"] == q}
+                untimed = sorted(v for v in found if not answer_timed(v))
+                if untimed:
+                    problems.append(f"{q} {'/'.join(untimed)} ({who})")
                 elif s["status"][q] != {"ok"}:
                     problems.append(f"{q} {'/'.join(sorted(s['status'][q] - {'ok'}))} ({who})")
             # Answers before time: a rule engine whose counts failed their check isn't timed.
