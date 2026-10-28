@@ -4,7 +4,10 @@
 //! `tmp/fuzz-findings/` (the target's name and a hash) and the test fails with the list.
 //!
 //! `NRESE_FUZZ_CASES` sets the mutations per corpus file (default 8), `NRESE_FUZZ_FILES`
-//! the corpus files per target (default 300), `NRESE_FUZZ_TARGET` one target by name.
+//! the corpus files per target (default 300; 0, the seeds alone), `NRESE_FUZZ_TARGET` one
+//! target by name. A setting that isn't a number, or a name that is no target, refuses the
+//! run. Without `.cache` the run says it has the seeds alone, and fails where the W3C data
+//! is required (`NRESE_W3C_REQUIRED`). A run that ran nothing fails.
 
 use std::path::{Path, PathBuf};
 
@@ -59,27 +62,40 @@ fn seeds(target: Target) -> Vec<&'static [u8]> {
     }
 }
 
+/// A setting: its value, or `default` when unset or empty. A value that isn't a number
+/// refuses the run: it would otherwise run a campaign nobody asked for.
 fn env(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(default)
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => default,
+        Ok(value) if value.trim().is_empty() => default,
+        Ok(value) => value
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{name}={value:?} isn't a number")),
+        Err(e) => panic!("{name}: {e}"),
+    }
 }
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The target's corpus files under `.cache`, sorted, at most `limit`.
-fn corpus(target: Target, limit: usize) -> Vec<Vec<u8>> {
+/// The target's corpus files under `.cache`, sorted, `limit` of them spread over the suites
+/// (with their number in all); None without `.cache`. A file or directory that can't be read
+/// fails the run.
+fn corpus(target: Target, limit: usize) -> Option<(Vec<Vec<u8>>, usize)> {
+    let cache = root().join(".cache");
+    if !cache.is_dir() {
+        return None;
+    }
     let mut files = Vec::new();
-    let mut stack = vec![root().join(".cache")];
+    let mut stack = vec![cache];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+                .path();
             if path.is_dir() {
                 if path.file_name().is_some_and(|n| n != ".git") {
                     stack.push(path);
@@ -94,13 +110,17 @@ fn corpus(target: Target, limit: usize) -> Vec<Vec<u8>> {
         }
     }
     files.sort();
+    if limit == 0 {
+        return Some((Vec::new(), files.len()));
+    }
     // Spread over the suites rather than the first directory's files.
-    let step = files.len().div_ceil(limit.max(1)).max(1);
-    files
+    let step = files.len().div_ceil(limit).max(1);
+    let read = files
         .iter()
         .step_by(step)
-        .filter_map(|path| std::fs::read(path).ok())
-        .collect()
+        .map(|path| std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
+        .collect();
+    Some((read, files.len()))
 }
 
 /// A xorshift generator.
@@ -220,15 +240,16 @@ fn mutate(rng: &mut Rng, input: &[u8], other: &[u8]) -> Vec<u8> {
     out
 }
 
-fn save(target: Target, input: &[u8]) -> PathBuf {
+/// Where the failing input is saved for replay, or why it couldn't be.
+fn save(target: Target, input: &[u8]) -> Result<PathBuf, String> {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     input.hash(&mut hasher);
     let dir = root().join("tmp/fuzz-findings");
-    let _ = std::fs::create_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join(format!("{}-{:016x}.bin", target.name(), hasher.finish()));
-    let _ = std::fs::write(&path, input);
-    path
+    std::fs::write(&path, input).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// The stack each target runs on: a release build's parsers stay within 1 MiB at their
@@ -244,7 +265,27 @@ const STACK: usize = if cfg!(debug_assertions) {
 /// and the findings (saved inputs).
 fn fuzz(target: Target, seed: u64, cases: usize, files: usize) -> (usize, Vec<String>) {
     let mut inputs: Vec<Vec<u8>> = seeds(target).into_iter().map(<[u8]>::to_vec).collect();
-    inputs.extend(corpus(target, files));
+    let (name, seeded) = (target.name(), inputs.len());
+    match corpus(target, files) {
+        // A corpus is there when the target has files in it (`NRESE_FUZZ_FILES=0` still
+        // reads none of them, by choice).
+        Some((read, all)) if all > 0 => {
+            eprintln!(
+                "{name}: {seeded} seeds, {} of {all} corpus files",
+                read.len()
+            );
+            inputs.extend(read);
+        }
+        found => {
+            let why = match found {
+                Some(_) => "no corpus file of its kinds in .cache (scripts/fetch-w3c-tests.sh)",
+                None => "no .cache (scripts/fetch-w3c-tests.sh)",
+            };
+            let required = std::env::var_os("NRESE_W3C_REQUIRED").is_some_and(|v| !v.is_empty());
+            assert!(!required, "NRESE_W3C_REQUIRED is set, but {name}: {why}");
+            eprintln!("{name}: {seeded} seeds alone, {why}: not qualified");
+        }
+    }
     let mut rng = Rng((seed ^ 0x9e37_79b9_7f4a_7c15).wrapping_mul(target as u64 + 1) | 1);
     let (mut runs, mut findings) = (0, Vec::new());
     for (i, input) in inputs.iter().enumerate() {
@@ -256,11 +297,11 @@ fn fuzz(target: Target, seed: u64, cases: usize, files: usize) -> (usize, Vec<St
             let outcome =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| target.run(&candidate)));
             if outcome.is_err() {
-                findings.push(format!(
-                    "{} (corpus input {i}): {}",
-                    target.name(),
-                    save(target, &candidate).display()
-                ));
+                let saved = match save(target, &candidate) {
+                    Ok(path) => path.display().to_string(),
+                    Err(e) => format!("not saved: {e}"),
+                };
+                findings.push(format!("{} (corpus input {i}): {saved}", target.name()));
             }
         }
     }
@@ -272,7 +313,17 @@ fn parsers_hold_on_their_corpora_and_mutations() {
     let seed = env("NRESE_FUZZ_SEED", 0);
     let cases = env("NRESE_FUZZ_CASES", 8) as usize;
     let files = env("NRESE_FUZZ_FILES", 300) as usize;
-    let only = std::env::var("NRESE_FUZZ_TARGET").ok();
+    let only = std::env::var("NRESE_FUZZ_TARGET")
+        .ok()
+        .filter(|name| !name.trim().is_empty());
+    if let Some(name) = &only {
+        let names: Vec<&str> = Target::ALL.iter().map(|target| target.name()).collect();
+        assert!(
+            names.contains(&name.as_str()),
+            "NRESE_FUZZ_TARGET={name:?} is no target: {}",
+            names.join(", ")
+        );
+    }
     let (mut runs, mut findings) = (0, Vec::new());
     for target in Target::ALL {
         if only.as_deref().is_some_and(|name| name != target.name()) {
@@ -288,6 +339,10 @@ fn parsers_hold_on_their_corpora_and_mutations() {
         runs += n;
         findings.extend(found);
     }
+    assert!(
+        runs > 0,
+        "nothing ran (seed {seed}): no work qualifies nothing"
+    );
     assert!(
         findings.is_empty(),
         "{} findings in {runs} runs (seed {seed}):
