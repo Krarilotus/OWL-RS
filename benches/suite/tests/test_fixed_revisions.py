@@ -16,6 +16,8 @@ import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# The repository, named: the suite's git search stops at its top (isolation.py).
+ROOT = HERE.parents[2]
 HEX = re.compile(r"(?<![0-9a-fA-F])[0-9a-f]{7,40}(?![0-9a-fA-F])")
 
 
@@ -35,7 +37,7 @@ class FixedRevisions(unittest.TestCase):
         found = [(path.name, line, token) for path in sorted(HERE.glob("*.py"))
                  for line, text in strings(path) for token in HEX.findall(text)]
         tokens = sorted({token for _, _, token in found})
-        named = subprocess.run(["git", "-C", str(HERE), "cat-file", "--batch-check"], capture_output=True, text=True,
+        named = subprocess.run(["git", "-C", str(ROOT), "cat-file", "--batch-check"], capture_output=True, text=True,
                                input="".join(f"{token}^{{commit}}\n" for token in tokens), timeout=60, check=True)
         commits = {token for token, out in zip(tokens, named.stdout.splitlines()) if out.split()[1:2] == ["commit"]}
         self.assertEqual([f"{name}:{line} {token}" for name, line, token in found if token in commits], [],
