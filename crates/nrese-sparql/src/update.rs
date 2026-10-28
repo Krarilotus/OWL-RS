@@ -3,9 +3,10 @@
 //! Every operation of a request is applied to the same transaction, in order, and each
 //! `WHERE` clause reads the transaction's state before its operation (base plus earlier
 //! operations): as it is, or, with [`UpdateOptions::read`], as that [`ReadSource`] gives it
-//! for the update's reader. The caller decides whether to commit: this module never
-//! publishes anything, which is what lets the mutation pipeline validate the delta and check
-//! the deadline before the commit.
+//! for the update's reader, in the statements [`UpdateOptions::read_model`] names (a reader
+//! who sees no inferred statement reads the asserted ones). The caller decides whether to
+//! commit: this module never publishes anything, which is what lets the mutation pipeline
+//! validate the delta and check the deadline before the commit.
 //!
 //! Graph existence follows ADR-0002: a named graph exists iff it holds a quad. `CREATE GRAPH`
 //! therefore only fails (without `SILENT`) on a non-empty graph and otherwise stores
@@ -62,6 +63,9 @@ pub struct UpdateOptions {
     /// earlier operations included. [`Self::access`] still restricts the graphs it reads.
     /// `None`: the state as it is.
     pub read: Option<Arc<dyn ReadSource>>,
+    /// Which statements each `WHERE` clause reads ([`crate::QueryOptions::read_model`]): the
+    /// asserted ones only for a reader who sees no inferred statement. Default: both.
+    pub read_model: nrese_engine::ReadModel,
 }
 
 impl UpdateOptions {
@@ -174,6 +178,7 @@ fn apply_operation(
                 services: options.services.clone(),
                 access: options.access.clone(),
                 geosparql_stated_only: options.geosparql_stated_only,
+                read_model: options.read_model,
                 ..crate::query::QueryOptions::default()
             };
             let (deletes, inserts) = crate::native::delete_insert(

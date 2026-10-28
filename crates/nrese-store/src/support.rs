@@ -1703,25 +1703,30 @@ pub(crate) struct Reading {
 }
 
 impl Reading {
-    /// The reading of a reader with `access` (`None`: every graph), if it reads anything but
-    /// the data as stored: a reader of some graphs who sees inferred statements, by their
-    /// support or every one. `None` for a reader of every graph, or one who sees no
-    /// inferred statement (its reads leave them out).
+    /// What a read in `scope` reads, the one decision of it: its model
+    /// ([`crate::ReadScope::model`]: the inferred statements only where it sees them) and,
+    /// for a reader of some graphs who sees them, by their support or every one, its reading.
+    /// No reading for a reader of every graph, or one who sees no inferred statement (its
+    /// model leaves them out).
     pub(crate) fn of(
         supports: &Arc<Supports>,
         compilation: Compilation,
-        access: Option<&Arc<GraphAccess>>,
+        scope: &crate::ReadScope,
         memory: &Envelope,
         cancellation: Option<&CancellationToken>,
-    ) -> Option<Self> {
-        let access = access.filter(|access| access.inferred)?;
-        Some(Self {
-            supports: Arc::clone(supports),
-            compilation,
-            access: Arc::clone(access),
-            memory: memory.clone(),
-            cancellation: cancellation.cloned(),
-        })
+    ) -> (ReadModel, Option<Self>) {
+        let model = scope.model();
+        let reading = scope
+            .access()
+            .filter(|_| model == ReadModel::Materialised)
+            .map(|access| Self {
+                supports: Arc::clone(supports),
+                compilation,
+                access: Arc::clone(access),
+                memory: memory.clone(),
+                cancellation: cancellation.cloned(),
+            });
+        (model, reading)
     }
 
     /// Whether this reader reads `snapshot` through a view of its own: by support, or

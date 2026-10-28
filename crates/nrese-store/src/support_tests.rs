@@ -278,10 +278,11 @@ fn a_pending_read_is_the_gathered_one() {
         let reading = Reading::of(
             store.supports(),
             store.support_compilation(),
-            Some(&access),
+            &crate::ReadScope::Graphs(Arc::clone(&access)),
             &store.envelope(None),
             None,
         )
+        .1
         .unwrap();
         let mut tx = store.engine().speculative();
         let view = reading.committed(tx.base()).unwrap();

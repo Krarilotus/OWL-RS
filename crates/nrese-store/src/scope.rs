@@ -42,6 +42,16 @@ impl ReadScope {
         self.access().is_none_or(|access| access.inferred)
     }
 
+    /// The statements a read in this scope reads at most: the inferred ones too where it sees
+    /// them, else the asserted ones only. Queries, statement reads and updates' `WHERE` clauses
+    /// take their model from here ([`crate::support::Reading::of`]).
+    pub fn model(&self) -> nrese_engine::ReadModel {
+        match self.sees_inferred() {
+            true => nrese_engine::ReadModel::Materialised,
+            false => nrese_engine::ReadModel::Asserted,
+        }
+    }
+
     /// Whether the read sees every graph.
     pub fn reads_everything(&self) -> bool {
         matches!(self, Self::All)
@@ -237,8 +247,8 @@ impl<'a> ReadContext<'a> {
 
     /// The statements read: inferred ones only where both the read and its scope want them.
     pub fn model(&self) -> nrese_engine::ReadModel {
-        match self.infer && self.scope.sees_inferred() {
-            true => nrese_engine::ReadModel::Materialised,
+        match self.infer {
+            true => self.scope.model(),
             false => nrese_engine::ReadModel::Asserted,
         }
     }
