@@ -1334,8 +1334,10 @@ def read_measure(text: str | None) -> dict:
 
 # --- the fleet jobs ----------------------------------------------------------------------------
 
-BASE = "0f465633d33374bc56ab9ec33157cfa10ebf2d40"  # v1.5, the last recorded run's base
-MAIN = "f9b515e81f013ecd8c3811f3e9c65e91450ee44c"  # main
+# Runs and notes from before 26 Oct 2026 name these sides by their ids before that day's history
+# rewrite, 0f465633 and f9b515e8: the same trees.
+BASE = "d348a8a1a9e40cd23381df1faa726d3ffa44948c"  # v1.5, the last recorded run's base
+MAIN = "a0020134c20a33eabe8ead0402f814585b9c7fd0"  # main
 
 # The sides measured at a reviewed commit on top of them (benches/PROTOCOL.md §5, "No thread
 # started in a timed window"): a side's revision → that commit.
@@ -1397,8 +1399,8 @@ def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str
 
 def measurement_ref(repo: str, ref: str, commit: str, path: Path = MEASUREMENT_SIDES) -> str:
     """A pushed refs/measure/* ref (.githooks/pre-push, check.sh push): the ref a side of the table
-    declares, named for that side, at that side's declared commit, which measured_at admits for it.
-    The side; anything else is refused."""
+    declares, named for that side, whose side is already on a remote ref, at that side's declared
+    commit, which measured_at admits for it. The side; anything else is refused."""
     table = measurement_table(path)
     declaring = [rev for rev, side in table.items() if side.get("ref") == ref]
     if not declaring:
@@ -1407,6 +1409,12 @@ def measurement_ref(repo: str, ref: str, commit: str, path: Path = MEASUREMENT_S
     if not ref.endswith(f"-{rev[:8]}"):
         raise SystemExit(f"{ref}: its name doesn't name its side {rev[:8]} (refs/measure/<name>-{rev[:8]})")
     import subprocess
+    # The ref's push sends its side's history along, so only a side that is already out may go (T0,
+    # 28 Oct 2026: main's and v1.5's sides were ids from before the history rewrite, on no remote).
+    published = subprocess.run(["git", "-C", repo, "for-each-ref", "--count=1", "--format=%(refname)",
+                                "--contains", rev, "refs/remotes"], capture_output=True, text=True, timeout=60)
+    if published.returncode != 0 or not published.stdout.strip():
+        raise SystemExit(f"{ref}: its side {rev[:12]} is on no remote ref: the side must be published")
     done = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", f"{commit}^{{commit}}"],
                           capture_output=True, text=True, timeout=60)
     if done.returncode != 0 or done.stdout.strip() != table[rev]["commit"]:

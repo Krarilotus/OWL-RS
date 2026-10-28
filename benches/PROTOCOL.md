@@ -359,7 +359,8 @@ arises, the same for every side:
   their *measurement commits*. A measurement commit is a reviewed commit on a side's revision
   that changes nothing but its perf lab (`crates/nrese-store/examples/`); the gate builds and
   times it for that side ([fast/measurement-sides.toml](fast/measurement-sides.toml), pushed as
-  `refs/measure/*`). `release-gate.sh build` refuses one whose parent isn't the side's revision
+  `refs/measure/*`, and only once its side is on a remote ref: the push refuses an unpublished
+  side). `release-gate.sh build` refuses one whose parent isn't the side's revision
   or that changes anything else; nothing is patched at build time. `BUILD.txt` names the
   commit built, `CAPABILITIES` its timing, and the report refuses sides timed differently.
   `probes/timing-loop.py` measures what the loop adds.
