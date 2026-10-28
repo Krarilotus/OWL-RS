@@ -1412,6 +1412,68 @@ def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str
     return commit
 
 
+# Where the gate's own scratch lives in its harness checkout: git-ignored, on no import path.
+SCRATCH = ("tmp", ".cache")
+# What Python imports or loads from a directory on its path, a cache or a .pth included.
+IMPORTABLE = (".py", ".pyc", ".pyo", ".pyd", ".so", ".pth")
+
+
+def checkout_differs(checkout: str, rev: str, nothing_else: bool = False) -> list[str]:
+    """The files of `rev`'s tree that the checkout at `checkout` doesn't hold as stored (missing, not a
+    regular file, of other bytes, or of a mode the gate doesn't build from), and every file besides
+    them that could change what runs: with `nothing_else` (a checkout to be built) any, else code
+    outside the gate's scratch (SCRATCH) and every linked directory. HEAD and a clean status trust
+    the index and the attributes: a smudge filter, or a change a stat cache can't see
+    (core.checkStat=minimal), leaves other bytes behind them (Sol, PR #54 fix check 1 S1), and an
+    ignored file isn't shown at all: one a build reads (nrese-server's build.rs embeds
+    apps/nrese-console/dist/; Sol, S1 r1), or a module the harness imports (benches/suite/csv.pyc
+    before the standard library's; Sol, S1 r3). The harness's checkout keeps the gate's scratch
+    (Sol, S1 r2). Each file is hashed here as git hashes a blob, so no filter applies."""
+    import hashlib
+    import stat
+    import subprocess
+    stored = {**os.environ, **STORED_OBJECTS}
+    run = lambda *args: subprocess.run(["git", "-C", checkout, *args], capture_output=True, check=True,
+                                       timeout=120, env=stored).stdout
+    algorithm = run("rev-parse", "--show-object-format").decode().strip()
+    differ, tracked = [], set()
+    for record in run("ls-tree", "-r", "-z", "--full-tree", rev).split(b"\0"):
+        if not record:
+            continue
+        meta, path = record.split(b"\t", 1)
+        mode, _, blob = meta.split()
+        name = path.decode("utf-8", "surrogateescape")
+        tracked.add(name)
+        if mode not in (b"100644", b"100755"):
+            differ.append(f"{name} (mode {mode.decode()})")
+            continue
+        file = os.path.join(checkout, os.fsdecode(path))
+        try:
+            regular = stat.S_ISREG(os.lstat(file).st_mode)
+            data = Path(file).read_bytes() if regular else b""
+        except FileNotFoundError:
+            differ.append(f"{name} (missing)")
+            continue
+        digest = hashlib.new(algorithm, b"blob %d\0" % len(data) + data).hexdigest()
+        if not regular or digest != blob.decode():
+            differ.append(name)
+    # Nothing besides them that could change what runs, ignored or not; a linked directory isn't
+    # walked, so it counts itself.
+    for top, directories, files in os.walk(checkout):
+        here = os.path.relpath(top, checkout)
+        relative = lambda entry: os.path.normpath(os.path.join(here, entry)).replace(os.sep, "/")
+        if here == ".":
+            directories[:] = [d for d in directories if d != ".git" and (nothing_else or d not in SCRATCH)]
+            files = [f for f in files if f != ".git"]  # a worktree's link to its repository
+        differ += [f"{relative(d)} (a linked directory)" for d in directories if os.path.islink(os.path.join(top, d))]
+        for extra in (relative(f) for f in files if relative(f) not in tracked):
+            if nothing_else:
+                differ.append(f"{extra} (not in the revision)")
+            elif extra.endswith(IMPORTABLE) or "__pycache__" in extra.split("/"):
+                differ.append(f"{extra} (code not in the revision)")
+    return differ
+
+
 def stop_tree(process) -> str | None:
     """Stops `process` and everything it started, at once (benches/suite/queue.py's stop, without its
     grace): on Windows taskkill /T, elsewhere its process group, which it must lead; then the
@@ -1863,11 +1925,22 @@ def main() -> int:
     s.add_argument("ref")
     s.add_argument("commit")
     s.add_argument("--remote", help="the remote the ref is pushed to, whose branches must have its side")
+    s = sub.add_parser("checkout", help="whether a worktree holds a revision's stored bytes (release-gate.sh)")
+    s.add_argument("rev")
+    s.add_argument("dir")
+    s.add_argument("--nothing-else", action="store_true", help="and no other file: a checkout to be built")
     args = p.parse_args()
 
     if args.command == "measured-at":
         print(measured_at(str(ROOT), args.rev))
         return 0
+    if args.command == "checkout":
+        differ = checkout_differs(args.dir, args.rev, args.nothing_else)
+        for name in differ[:20]:
+            print(f"{args.dir}: {name} isn't {args.rev[:12]}'s as stored", file=sys.stderr)
+        if len(differ) > 20:
+            print(f"... and {len(differ) - 20} more", file=sys.stderr)
+        return 1 if differ else 0
     if args.command == "measurement-ref":
         side = measurement_ref(str(ROOT), args.ref, args.commit, args.remote)
         print(f"{args.ref}: the measurement commit of {side[:12]}, admitted (benches/fast/measurement-sides.toml)")
