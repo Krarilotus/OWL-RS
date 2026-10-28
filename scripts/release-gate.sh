@@ -27,7 +27,8 @@
 #                                           runs it
 #   release-gate.sh verdict TIMED_DIR... CHECKS_DIR   every part together, each host's rounds combined
 #   release-gate.sh jobs CAND [OPTIONS]     the fleet jobs of a whole gate (release_gate.py jobs --help)
-#   release-gate.sh clean                   the gate's worktrees and build trees (binaries and data stay)
+#   release-gate.sh clean                   the gate's worktrees and build trees, and what dead invocations
+#                                           left (binaries and data stay; a live invocation's own stays)
 #   release-gate.sh clean --patch-keyed [--remove]   the builds of a perf lab patched before T0, listed
 #                                           (FLEET_OUT/patch-keyed-builds.tsv); with --remove their binaries
 #                                           go, unless a gate used them within GATE_LIVE_HOURS (default 24)
@@ -73,13 +74,27 @@ for dir in "$GATE" "$GATE_BIN"; do [ -e "$dir/.trackerignore" ] || echo "release
 log() { echo "$(date '+%F %T') $*" | tee -a "$OUT/gate.log"; }
 short() { git rev-parse --short=8 "$1"; }
 py() { PYTHONIOENCODING=utf-8 python3 "$@"; }
-# Every Python the gate starts reads and writes bytecode only in a cache directory of this run's,
-# made empty here: no cache older than the run, in a checkout (Sol, S1 r3), beside one or in an
-# earlier run's directory (PR #60 r1 R2), stands in for a source the gate checked. A prefix holds
-# every cache, the standard library's too, so the run compiles that once (0.3 s; then 0.08 s a
-# start, against 0.1 s with the installed caches and the tree compiled each time: job
-# lane-d-pr60-r1-startup2-c600217b). `clean` removes the directories (about 2 MiB a run).
-mkdir -p "$GATE/pycache" && PYTHONPYCACHEPREFIX=$(mktemp -d "$GATE/pycache/run-XXXXXX") || exit 2
+# Each invocation's own directory, made empty here and removed when it exits, by it alone: its
+# bytecode cache and its code checkout (below). No other invocation makes or reads what is in it
+# (Sol, PR #60 fix check 3: a code checkout shared by revision had no owner, and two callers met
+# in its making). Its name begins with the pid, which `clean` asks before it removes what a dead
+# one left: a gate directory is one host's, one pid space.
+launch=$PWD
+mkdir -p "$GATE/run" && RUN=$(mktemp -d "$GATE/run/$$-XXXXXX") || exit 2
+finish() {
+  local dir
+  cd "$launch" 2>/dev/null || cd /
+  for dir in "$RUN"/src-*; do [ ! -d "$dir" ] || git worktree remove --force "$dir" 2>/dev/null; done
+  rm -rf "$RUN"
+}
+trap finish EXIT
+# Every Python the gate starts reads and writes bytecode only there: no cache older than the run,
+# in a checkout (Sol, S1 r3), beside one or in an earlier run's directory (PR #60 r1 R2), stands in
+# for a source the gate checked. A prefix holds every cache, the standard library's too, so the run
+# compiles that once (0.3 s; then 0.08 s a start, against 0.1 s with the installed caches and the
+# tree compiled each time: job lane-d-pr60-r1-startup2-c600217b).
+PYTHONPYCACHEPREFIX=$RUN/pycache
+mkdir "$PYTHONPYCACHEPREFIX" || exit 2
 export PYTHONPYCACHEPREFIX
 # The check of every checkout the gate makes: one of the launching checkout's scripts, as this one
 # is, which imports nothing of any checkout (python3 -I), so it can check the gate's own code first.
@@ -139,18 +154,59 @@ planned() { py -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))[
 # harness's, for every side alike.
 MEASURE=benches/fast/measure.toml
 
+# `clean` makes no code checkout, so that it runs when none can be made (no space, a broken one):
+# what it removes runs no project Python but its locks', which where there is no flock is ns.sh's
+# suitekit/lock.py, here the launching commit's bytes written alone into this run's directory.
+if [ "${1:-}" = clean ]; then
+  mkdir -p "$RUN/suite/suitekit" \
+    && git cat-file blob HEAD:benches/suite/suitekit/lock.py > "$RUN/suite/suitekit/lock.py" \
+    || { echo "release gate: no lock helper of the launching commit" >&2; exit 2; }
+  NS_SUITE=$RUN/suite
+  if [ "${2:-}" = --patch-keyed ]; then
+    # The builds of a perf lab patched at build time (before T0, 28 Oct 2026), which no gate after
+    # T0 can reuse (their identity has the patch): listed, and with --remove their binaries go.
+    sweep_patch_keyed "${3:-}" | tee "$OUT/patch-keyed-builds.tsv"
+    exit "${PIPESTATUS[0]}"
+  fi
+  # This gate's worktrees, build trees and scratch go (never the shared binaries' directory:
+  # other gates build and read there); the data view, the prepared data and every result stay
+  # for the gate's next run. Builds no gate used for GATE_BIN_AGE_DAYS go (sweep_builds).
+  before=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
+  # What invocations that died left in their own directories goes; a live one's stays.
+  for run in "$GATE"/run/*; do
+    [ -d "$run" ] && [ "$run" != "$RUN" ] || continue
+    pid=${run##*/}
+    ! kill -0 "${pid%%-*}" 2>/dev/null || continue
+    for dir in "$run"/src-*; do [ ! -d "$dir" ] || git worktree remove --force "$dir" 2>/dev/null; done
+    rm -rf "$run"
+  done
+  for dir in "$GATE"/src-* "$GATE"/build/src-*; do [ -d "$dir" ] && git worktree remove --force "$dir"; done
+  # pycache: the bytecode of the gates before each invocation had its own directory.
+  rm -rf "$GATE"/target-* "$GATE"/build "$GATE"/reports "$GATE"/compact "$GATE"/pycache
+  # Block copies are removed by their block; what a killed one left is named, not swept.
+  rmdir "$GATE/instances" 2>/dev/null || { [ -d "$GATE/instances" ] \
+    && log "clean: block copies left by an interrupted block, not removed: $(ls "$GATE/instances" | tr '\n' ' ')"; }
+  swept=$(sweep_builds | tr '\n' ' ')
+  [ -z "$swept" ] || log "clean: unused builds removed: $swept"
+  git worktree prune
+  # Shared prepared data no gate has linked for two days (its last link's removal set its ctime).
+  [ -d "$SHARED/blobs" ] && find "$SHARED/blobs" -type f -links 1 -cmin +2880 -delete
+  after=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
+  log "clean: $(( (before - after) / 1048576 )) MiB reclaimed; kept the binaries, the data view, the prepared data, the results"
+  exit
+fi
+
 # The gate's own code runs from a checkout of the commit it is launched from, made from the
-# repository's objects and checked as every checkout of the gate is (worktree), never from the
-# launching checkout: files there beside the commit's, an untracked suitekit/cases/__init__.py or a
-# csv.py before the standard library's, ran in the validator (Sol, PR #60 fix checks 1 and 2), and
-# no rule of what may lie there holds for every caller. From here every relative path, and every
-# Python the gate starts, is that checkout's or a harness checkout's; only the launching checkout's
-# shell scripts (this one, scripts/lib), the checker and objects are read. Launched from a checkout
-# with changes not committed (a commit hook's), the gate runs its commit's Python, never the
-# changes. The commands that take a caller's paths (jobs, confirm, verdict) run in the launching
-# checkout, their Python by path from this one.
-launch=$PWD
-CODE=$(worktree HEAD) || { echo "release gate: no checked checkout of the launching commit" >&2; exit 2; }
+# repository's objects into this run's directory and checked as every checkout of the gate is
+# (worktree), never from the launching checkout: files there beside the commit's, an untracked
+# suitekit/cases/__init__.py or a csv.py before the standard library's, ran in the validator (Sol,
+# PR #60 fix checks 1 and 2), and no rule of what may lie there holds for every caller. From here
+# every relative path, and every Python the gate starts, is that checkout's or a harness
+# checkout's; only the launching checkout's shell scripts (this one, scripts/lib), the checker and
+# objects are read. Launched from a checkout with changes not committed (a commit hook's), the gate
+# runs its commit's Python, never the changes. The commands that take a caller's paths (jobs,
+# confirm, verdict) run in the launching checkout, their Python by path from this one.
+CODE=$(worktree HEAD "$RUN") || { echo "release gate: no checked checkout of the launching commit" >&2; exit 2; }
 cd "$CODE" || exit 2
 # The libraries' Python too (ns.sh's suitekit/lock.py where there is no flock): ns.sh, sourced
 # above, named the launching checkout's (Sol, PR #60 fix 3's sol-loop S1).
@@ -454,7 +510,7 @@ if os.name != "nt":  # a directory is synced on POSIX; Windows can not open one 
     # block_copies(): a cached instance's offset is the block's, not the round's; lks-aa-20). The
     # directory is made here for it alone, and only it is removed, also if fast.py dies.
     mkdir -p "$GATE/instances" && copies=$(mktemp -d "$GATE/instances/block-$n-XXXXXX") || exit 2
-    trap 'rm -rf "$copies"' EXIT
+    trap 'rm -rf "$copies"; finish' EXIT
     # The host kept quiet while the block runs (scripts/lib/quiet-watch.py, as the measurement
     # queue's timed chunks: the job's own other busy work suspended, anything else recorded as
     # disturbing it); its verdict kept with the block. GATE_QUIET=0: unwatched.
@@ -473,7 +529,7 @@ if os.name != "nt":  # a directory is synced on POSIX; Windows can not open one 
     (cd "$tree" && py benches/fast/fast.py block --block "$n" --layout "$layout" --cases "$cases" \
        --out "$OUT/passes" "${sides[@]}" "${opts[@]}" --fresh-copies "$copies") > "$OUT/passes/block-$n.log" 2>&1
     code=$?
-    rm -rf "$copies" && trap - EXIT
+    rm -rf "$copies" && trap finish EXIT
     if [ -n "$watcher" ]; then
       kill -TERM "$watcher" 2>/dev/null
       wait "$watcher"
@@ -742,38 +798,6 @@ jobs)
   cd "$launch" || exit 2
   # As confirm's: the launching checkout, unless the caller names one.
   py "$CODE/benches/fast/release_gate.py" jobs --checkout "$launch" "$@"
-  ;;
-
-clean)
-  if [ "${2:-}" = --patch-keyed ]; then
-    # The builds of a perf lab patched at build time (before T0, 28 Oct 2026), which no gate after
-    # T0 can reuse (their identity has the patch): listed, and with --remove their binaries go.
-    sweep_patch_keyed "${3:-}" | tee "$OUT/patch-keyed-builds.tsv"
-    exit "${PIPESTATUS[0]}"
-  fi
-  # This gate's worktrees, build trees and scratch go (never the shared binaries' directory:
-  # other gates build and read there); the data view, the prepared data and every result stay
-  # for the gate's next run. Builds no gate used for GATE_BIN_AGE_DAYS go (sweep_builds). Its own
-  # code's checkout and bytecode go too, last: the step leaves the checkout first, and sweep_builds
-  # may lock with its Python (ns.sh).
-  cd "$launch" || exit 2
-  before=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
-  for dir in "$GATE"/src-* "$GATE"/build/src-*; do
-    [ -d "$dir" ] && [ "$dir" != "$CODE" ] && git worktree remove --force "$dir"
-  done
-  rm -rf "$GATE"/target-* "$GATE"/build "$GATE"/reports "$GATE"/compact
-  # Block copies are removed by their block; what a killed one left is named, not swept.
-  rmdir "$GATE/instances" 2>/dev/null || { [ -d "$GATE/instances" ] \
-    && log "clean: block copies left by an interrupted block, not removed: $(ls "$GATE/instances" | tr '\n' ' ')"; }
-  swept=$(sweep_builds | tr '\n' ' ')
-  [ -z "$swept" ] || log "clean: unused builds removed: $swept"
-  git worktree remove --force "$CODE"
-  rm -rf "$GATE"/pycache
-  git worktree prune
-  # Shared prepared data no gate has linked for two days (its last link's removal set its ctime).
-  [ -d "$SHARED/blobs" ] && find "$SHARED/blobs" -type f -links 1 -cmin +2880 -delete
-  after=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
-  log "clean: $(( (before - after) / 1048576 )) MiB reclaimed; kept the binaries, the data view, the prepared data, the results"
   ;;
 
 *)
