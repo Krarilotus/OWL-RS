@@ -667,7 +667,10 @@ fn find_close(s: &str, open: usize) -> Option<usize> {
 /// `docs`): its name relative to the repository, its path. A directory that can't be read
 /// fails the test.
 fn repository() -> Vec<(String, PathBuf)> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
     let mut files = Vec::new();
     let mut stack = vec![root.join("crates"), root.join("benches"), root.join("docs")];
     while let Some(dir) = stack.pop() {
@@ -692,11 +695,9 @@ fn repository() -> Vec<(String, PathBuf)> {
 }
 
 fn file_iri(path: &Path) -> String {
-    let path = path
-        .canonicalize()
-        .unwrap()
-        .to_string_lossy()
-        .replace('\\', "/");
+    // An absolute path as given (w3c.rs and repository() make them from canonical roots): the
+    // file itself may be gone, its bytes being the pinned ones.
+    let path = path.to_string_lossy().replace('\\', "/");
     let path = path.trim_start_matches("//?/");
     if path.starts_with('/') {
         format!("file://{path}")
@@ -784,8 +785,7 @@ fn every_query_parses_to_the_same_algebra() {
     // A difference is explained only by an entry naming its file and this outcome; and with
     // the suites read, every entry is seen with its outcome (none stands for a file that
     // now agrees, or differs otherwise).
-    let explained =
-        |file: &str, key: &str| EXPLAINED.iter().any(|(f, k, _)| *f == file && *k == key);
+    let explained = |file: &str, key: &str| explains(EXPLAINED, file, key);
     let unexplained: Vec<String> = outcome
         .iter()
         .filter(|(k, _)| !matches!(**k, "same algebra" | "both reject" | "not UTF-8"))
@@ -796,15 +796,7 @@ fn every_query_parses_to_the_same_algebra() {
     let unseen: Vec<String> = if suites.is_empty() {
         Vec::new()
     } else {
-        EXPLAINED
-            .iter()
-            .filter(|(file, key, _)| {
-                !outcome
-                    .get(key)
-                    .is_some_and(|files| files.iter().any(|f| f == file))
-            })
-            .map(|(file, key, _)| format!("{file}: {key}"))
-            .collect()
+        not_seen(&outcome, EXPLAINED)
     };
     assert!(
         unexplained.is_empty() && unseen.is_empty(),
@@ -872,4 +864,43 @@ fn subtraction_associates_to_the_left_in_nrese_only() {
     assert!(theirs.contains("Subtract(Literal(Literal { value: \"10\""), "{theirs}");
     // nrese: the left operand of the outer subtraction is `10 - 5`.
     assert!(ours.contains("Subtract(Subtract(Literal(Literal { value: \"10\""), "{ours}");
+}
+
+/// Whether an entry of `list` explains `file`'s difference `key`: one naming the file and
+/// that outcome (D-106: the file's name alone explained any outcome it came to have).
+fn explains(list: &[(&str, &str, &str)], file: &str, key: &str) -> bool {
+    list.iter().any(|(f, k, _)| *f == file && *k == key)
+}
+
+/// The entries of `list` the outcome doesn't show, each as `file: outcome`: an entry stands
+/// for a difference that is there, as it is.
+fn not_seen(outcome: &BTreeMap<&str, Vec<String>>, list: &[(&str, &str, &str)]) -> Vec<String> {
+    list.iter()
+        .filter(|(file, key, _)| {
+            !outcome
+                .get(key)
+                .is_some_and(|files| files.iter().any(|f| f == file))
+        })
+        .map(|(file, key, _)| format!("{file}: {key}"))
+        .collect()
+}
+
+#[test]
+fn an_explanation_holds_for_its_file_and_outcome_alone() {
+    // D-106 (Sol, PR #61 r1: a witness the existing differences don't mask): an explained file
+    // whose outcome changed is a difference again, and its entry stands unseen.
+    let list = [("a.rq", "only nrese accepts", "why")];
+    let changed = BTreeMap::from([("different algebra", vec!["a.rq".to_owned()])]);
+    assert!(
+        !explains(&list, "a.rq", "different algebra"),
+        "SPEC the file's name alone explains nothing"
+    );
+    assert_eq!(
+        not_seen(&changed, &list),
+        ["a.rq: only nrese accepts"],
+        "SPEC the entry isn't seen so"
+    );
+    let kept = BTreeMap::from([("only nrese accepts", vec!["a.rq".to_owned()])]);
+    assert!(explains(&list, "a.rq", "only nrese accepts"));
+    assert!(not_seen(&kept, &list).is_empty());
 }

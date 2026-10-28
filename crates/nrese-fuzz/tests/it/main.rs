@@ -1,17 +1,24 @@
-//! The fuzz targets on stable Rust: each target reads its corpus (the W3C test suites in
-//! `.cache`, fetched by `scripts/fetch-w3c-tests.sh`, and the seeds below) and mutations
-//! of it, drawn from `NRESE_FUZZ_SEED`. A failing input is saved under
-//! `tmp/fuzz-findings/` (the target's name and a hash) and the test fails with the list.
+//! The fuzz targets on stable Rust: each target reads its corpus (the pinned W3C test suites
+//! `scripts/fetch-w3c-tests.sh` fetches, and the seeds below) and mutations of it, drawn from
+//! `NRESE_FUZZ_SEED`. A failing input is saved under `tmp/fuzz-findings/` (the target's name
+//! and a hash) and the test fails with the list.
 //!
 //! `NRESE_FUZZ_CASES` sets the mutations per corpus file (default 8), `NRESE_FUZZ_FILES`
 //! the corpus files per target (default 300; 0, the seeds alone), `NRESE_FUZZ_TARGET` one
 //! target by name. A setting that isn't a number, or a name that is no target, refuses the
-//! run. Without `.cache` the run says it has the seeds alone, and fails where the W3C data
-//! is required (`NRESE_W3C_REQUIRED`). A run that ran nothing fails.
+//! run. The corpus is admitted as the comparators admit theirs (benches/oxigraph-comparison
+//! `w3c.rs`, its one owner): without the suites the run says it has the seeds alone, and
+//! fails where the W3C data is required (`NRESE_W3C_REQUIRED`). A run that ran nothing fails.
 
 use std::path::{Path, PathBuf};
 
 use nrese_fuzz::Target;
+
+/// The corpus's admission, shared with the comparators (Sol, PR #61 F2: a second one here
+/// counted any file under `.cache` as the W3C data).
+#[allow(dead_code)]
+#[path = "../../../../benches/oxigraph-comparison/src/w3c.rs"]
+mod w3c;
 
 /// Inputs every target starts from, besides the W3C files: small documents that reach the
 /// interesting parts of each grammar.
@@ -80,45 +87,30 @@ fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The target's corpus files under `.cache`, sorted, `limit` of them spread over the suites
-/// (with their number in all); None without `.cache`. A file or directory that can't be read
-/// fails the run.
+/// The target's corpus: the files of its kinds every pinned W3C checkout holds under the paths
+/// the fetch script fetches, admitted in full (w3c.rs); `limit` of them spread over the
+/// checkouts, with their number in all. None where a checkout isn't there and the W3C data
+/// isn't required; a broken one, or a missing one where it is required, fails the run.
 fn corpus(target: Target, limit: usize) -> Option<(Vec<Vec<u8>>, usize)> {
-    let cache = root().join(".cache");
-    if !cache.is_dir() {
-        return None;
-    }
+    let checkouts = w3c::checkouts().unwrap_or_else(|why| panic!("{why}"));
     let mut files = Vec::new();
-    let mut stack = vec![cache];
-    while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-        for entry in entries {
-            let path = entry
-                .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
-                .path();
-            if path.is_dir() {
-                if path.file_name().is_some_and(|n| n != ".git") {
-                    stack.push(path);
-                }
-            } else if path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| target.extensions().contains(&e))
-            {
-                files.push(path);
-            }
-        }
+    for checkout in &checkouts {
+        let dirs: Vec<&str> = checkout.paths.iter().map(String::as_str).collect();
+        files.extend(w3c::admitted(w3c::pinned(
+            checkout,
+            &dirs,
+            target.extensions(),
+        ))?);
     }
-    files.sort();
     if limit == 0 {
         return Some((Vec::new(), files.len()));
     }
-    // Spread over the suites rather than the first directory's files.
+    // Spread over the checkouts rather than the first directory's files.
     let step = files.len().div_ceil(limit).max(1);
     let read = files
         .iter()
         .step_by(step)
-        .map(|path| std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display())))
+        .map(|file| file.bytes.clone())
         .collect();
     Some((read, files.len()))
 }
@@ -278,11 +270,13 @@ fn fuzz(target: Target, seed: u64, cases: usize, files: usize) -> (usize, Vec<St
         }
         found => {
             let why = match found {
-                Some(_) => "no corpus file of its kinds in .cache (scripts/fetch-w3c-tests.sh)",
-                None => "no .cache (scripts/fetch-w3c-tests.sh)",
+                Some(_) => "no file of its kinds in the pinned W3C suites",
+                None => "the pinned W3C suites aren't there (scripts/fetch-w3c-tests.sh)",
             };
-            let required = std::env::var_os("NRESE_W3C_REQUIRED").is_some_and(|v| !v.is_empty());
-            assert!(!required, "NRESE_W3C_REQUIRED is set, but {name}: {why}");
+            assert!(
+                !w3c::required(),
+                "NRESE_W3C_REQUIRED is set, but {name}: {why}"
+            );
             eprintln!("{name}: {seeded} seeds alone, {why}: not qualified");
         }
     }
