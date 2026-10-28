@@ -33,7 +33,8 @@ owns its tests, and benchmarks never run in a gate.
 - Tests run under `cargo-nextest` where it is installed (`cargo install --locked
   cargo-nextest`): every test of every binary in parallel. Without it, `cargo test` runs
   crate by crate.
-- Enable the hooks with `git config core.hooksPath .githooks`.
+- The hooks: if `core.hooksPath` isn't set, set it with `git config core.hooksPath .githooks`;
+  if it is already set, keep it and make sure the hooks it runs also run `.githooks`.
 - Commit messages carry no AI-attribution trailers (`Co-Authored-By` naming a model,
   "Generated with" lines); a maintainer check refuses them.
 
