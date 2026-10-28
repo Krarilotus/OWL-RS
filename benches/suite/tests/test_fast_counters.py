@@ -306,6 +306,11 @@ class FastComparison(unittest.TestCase):
             self.assertIn("QPS: NOT COMPARABLE", text)
 
     def test_runs_across_a_host_configuration_change_are_refused_unless_flagged(self):
+        # A host registry of the test's own: hosts.toml's epochs are operational records.
+        registry = {"host": {"phuoc-yu": {"hostname": "Phuoc-Yu", "config": [{"since": "2026-10-09"},
+                                                                             {"since": "2026-10-12T13:00"}]}}}
+        self.enterContext(patch.object(fast.hosts, "load", return_value=registry))
+
         def on(started, governor=None):
             data = report(1)
             data["machine"] = {"host": "Phuoc-Yu", **({"governor": governor} if governor else {})}
