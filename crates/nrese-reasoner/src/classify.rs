@@ -432,34 +432,34 @@ impl<'a> Graph<'a> {
                 graph.data_properties.insert(s);
             }
         }
+        // The same triple twice is one: each predicate's range holds distinct objects.
         for pairs in graph.by_subject.values_mut() {
             pairs.sort_unstable();
+            pairs.dedup();
         }
         graph
     }
 }
 
 impl Graph<'_> {
-    fn objects(&self, subject: u64, predicate: u64) -> impl Iterator<Item = u64> + '_ {
+    /// The subject's pairs from `predicate` on, by binary search: the predicate's objects
+    /// first, distinct.
+    fn pairs_from(&self, subject: u64, predicate: u64) -> &[(u64, u64)] {
         let pairs = self.by_subject.get(&subject).map_or(&[][..], Vec::as_slice);
-        let start = pairs.partition_point(|&(p, _)| p < predicate);
-        pairs[start..]
-            .iter()
-            .take_while(move |&&(p, _)| p == predicate)
-            .map(|&(_, o)| o)
+        &pairs[pairs.partition_point(|&(p, _)| p < predicate)..]
+    }
+
+    fn has(&self, subject: u64, predicate: u64) -> bool {
+        matches!(self.pairs_from(subject, predicate), [(p, _), ..] if *p == predicate)
     }
 
     /// The object of `subject predicate` where the mapping has at most one; two different
-    /// ones are [`Repeated`] (the same triple twice is one).
+    /// ones are [`Repeated`].
     fn one(&self, subject: u64, predicate: u64) -> Result<Option<u64>, Repeated> {
-        let mut objects = self.objects(subject, predicate);
-        let Some(first) = objects.next() else {
-            return Ok(None);
-        };
-        if objects.all(|o| o == first) {
-            Ok(Some(first))
-        } else {
-            Err(Repeated)
+        match self.pairs_from(subject, predicate) {
+            [(p, _), (q, _), ..] if *p == predicate && *q == predicate => Err(Repeated),
+            [(p, o), ..] if *p == predicate => Ok(Some(*o)),
+            _ => Ok(None),
         }
     }
 
@@ -542,7 +542,7 @@ impl Graph<'_> {
         }
         for &(predicate, part) in &self.names.expression {
             if let Part::Unread(kind) = part
-                && self.objects(node, predicate).next().is_some()
+                && self.has(node, predicate)
             {
                 return Err(kind);
             }
@@ -1799,6 +1799,34 @@ mod tests {
             "shared-restriction",
             &format!("_:e owl:onProperty ex:r\n_:e owl:someValuesFrom owl:Thing\n{shared}"),
             &[],
+            &[],
+        );
+        // The same triple many times is one value (PR #53 sol-loop S2): a shared restriction
+        // whose onProperty is repeated reads as the restriction; two different intersection
+        // lists stay malformed for every axiom, however often the first is repeated.
+        let referring: String = (0..200)
+            .map(|i| format!("_:e rdfs:subClassOf ex:C{i}\n"))
+            .collect();
+        let copies = |triple: &str| triple.repeat(200);
+        check(
+            "repeated-onProperty",
+            &format!(
+                "{}_:e owl:someValuesFrom owl:Thing\n{referring}",
+                copies("_:e owl:onProperty ex:r\n")
+            ),
+            &[],
+            &[],
+        );
+        let malformed: Pairs = vec![("rdfs:subClassOf", "malformed class expression"); 200].leak();
+        check(
+            "two-intersections-repeated",
+            &format!(
+                "_:e owl:intersectionOf _:l\n_:e owl:intersectionOf _:m\n{}\
+                 _:l rdf:first ex:B\n_:l rdf:rest rdf:nil\n_:m rdf:first ex:D\n_:m rdf:rest rdf:nil\n\
+                 {referring}",
+                copies("_:e owl:intersectionOf _:l\n")
+            ),
+            malformed,
             &[],
         );
         assert!(failures.is_empty(), "{}", failures.join("\n"));
