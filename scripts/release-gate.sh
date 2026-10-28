@@ -67,10 +67,15 @@ mkdir -p "$GATE" "$GATE_BIN" "$OUT"
 for dir in "$GATE" "$GATE_BIN"; do [ -e "$dir/.trackerignore" ] || echo "release gate: not indexed" > "$dir/.trackerignore"; done
 log() { echo "$(date '+%F %T') $*" | tee -a "$OUT/gate.log"; }
 short() { git rev-parse --short=8 "$1"; }
-py() { PYTHONIOENCODING=utf-8 python3 -B "$@"; }
-# Every Python the gate starts keeps its caches here, never in a checkout, where a planted one
-# would be read (worktree() refuses code that isn't the revision's; Sol, S1 r3).
-export PYTHONPYCACHEPREFIX=$GATE/pycache
+py() { PYTHONIOENCODING=utf-8 python3 "$@"; }
+# Every Python the gate starts reads and writes bytecode only in a cache directory of this run's,
+# made empty here: no cache older than the run, in a checkout (Sol, S1 r3), beside one or in an
+# earlier run's directory (PR #60 r1 R2), stands in for a source the gate checked. A prefix holds
+# every cache, the standard library's too, so the run compiles that once (0.3 s; then 0.08 s a
+# start, against 0.1 s with the installed caches and the tree compiled each time: job
+# lane-d-pr60-r1-startup2-c600217b). `clean` removes the directories (about 2 MiB a run).
+mkdir -p "$GATE/pycache" && PYTHONPYCACHEPREFIX=$(mktemp -d "$GATE/pycache/run-XXXXXX") || exit 2
+export PYTHONPYCACHEPREFIX
 
 worktree() {  # REV [DIR [built]]: a clean worktree of the revision, made once, holding its stored
   # bytes; one to be built holds nothing else
@@ -720,7 +725,7 @@ clean)
   # for the gate's next run. Builds no gate used for GATE_BIN_AGE_DAYS go (sweep_builds).
   before=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
   for dir in "$GATE"/src-* "$GATE"/build/src-*; do [ -d "$dir" ] && git worktree remove --force "$dir"; done
-  rm -rf "$GATE"/target-* "$GATE"/build "$GATE"/reports "$GATE"/compact
+  rm -rf "$GATE"/target-* "$GATE"/build "$GATE"/reports "$GATE"/compact "$GATE"/pycache
   # Block copies are removed by their block; what a killed one left is named, not swept.
   rmdir "$GATE/instances" 2>/dev/null || { [ -d "$GATE/instances" ] \
     && log "clean: block copies left by an interrupted block, not removed: $(ls "$GATE/instances" | tr '\n' ' ')"; }

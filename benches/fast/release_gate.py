@@ -1412,23 +1412,24 @@ def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str
     return commit
 
 
-# Where the gate's own scratch lives in its harness checkout: git-ignored, on no import path.
+# Where the gate's own scratch lives in its harness checkout: git-ignored directories at its root,
+# on no import path.
 SCRATCH = ("tmp", ".cache")
-# What Python imports or loads from a directory on its path, a cache or a .pth included.
-IMPORTABLE = (".py", ".pyc", ".pyo", ".pyd", ".so", ".pth")
 
 
 def checkout_differs(checkout: str, rev: str, nothing_else: bool = False) -> list[str]:
     """The files of `rev`'s tree that the checkout at `checkout` doesn't hold as stored (missing, not a
-    regular file, of other bytes, or of a mode the gate doesn't build from), and every file besides
-    them that could change what runs: with `nothing_else` (a checkout to be built) any, else code
-    outside the gate's scratch (SCRATCH) and every linked directory. HEAD and a clean status trust
-    the index and the attributes: a smudge filter, or a change a stat cache can't see
-    (core.checkStat=minimal), leaves other bytes behind them (Sol, PR #54 fix check 1 S1), and an
-    ignored file isn't shown at all: one a build reads (nrese-server's build.rs embeds
-    apps/nrese-console/dist/; Sol, S1 r1), or a module the harness imports (benches/suite/csv.pyc
-    before the standard library's; Sol, S1 r3). The harness's checkout keeps the gate's scratch
-    (Sol, S1 r2). Each file is hashed here as git hashes a blob, so no filter applies."""
+    regular file, of other bytes, or of a mode the gate doesn't build from), and every file and
+    linked directory besides them, whatever its name: in a harness checkout outside the gate's
+    scratch (SCRATCH, the checkout's own directories, not links), with `nothing_else` (a checkout to
+    be built) anywhere. HEAD and a clean status trust the index and the attributes: a smudge
+    filter, or a change a stat cache can't see (core.checkStat=minimal), leaves other bytes behind
+    them (Sol, PR #54 fix check 1 S1), and an ignored file isn't shown at all: one a build reads
+    (nrese-server's build.rs embeds apps/nrese-console/dist/; Sol, S1 r1), a module the harness
+    imports (benches/suite/csv.pyc before the standard library's; Sol, S1 r3; csv.PYC on Windows),
+    or a file it reads (the catalogue loads every benches/cases/*.toml; Sol, PR #60 r1 R1). The
+    harness's checkout keeps the gate's scratch (Sol, S1 r2). Each file is hashed here as git
+    hashes a blob, so no filter applies."""
     import hashlib
     import stat
     import subprocess
@@ -1457,20 +1458,21 @@ def checkout_differs(checkout: str, rev: str, nothing_else: bool = False) -> lis
         digest = hashlib.new(algorithm, b"blob %d\0" % len(data) + data).hexdigest()
         if not regular or digest != blob.decode():
             differ.append(name)
-    # Nothing besides them that could change what runs, ignored or not; a linked directory isn't
-    # walked, so it counts itself.
+    # Nothing besides them, ignored or not. A linked directory (a junction on Windows) isn't
+    # walked, so it counts itself, a scratch root's link too: it's looked at before the scratch
+    # is left out.
+    junction = getattr(os.path, "isjunction", lambda _: False)
+    scratch = () if nothing_else else SCRATCH
     for top, directories, files in os.walk(checkout):
         here = os.path.relpath(top, checkout)
         relative = lambda entry: os.path.normpath(os.path.join(here, entry)).replace(os.sep, "/")
         if here == ".":
-            directories[:] = [d for d in directories if d != ".git" and (nothing_else or d not in SCRATCH)]
+            directories[:] = [d for d in directories if d != ".git"]
             files = [f for f in files if f != ".git"]  # a worktree's link to its repository
-        differ += [f"{relative(d)} (a linked directory)" for d in directories if os.path.islink(os.path.join(top, d))]
-        for extra in (relative(f) for f in files if relative(f) not in tracked):
-            if nothing_else:
-                differ.append(f"{extra} (not in the revision)")
-            elif extra.endswith(IMPORTABLE) or "__pycache__" in extra.split("/"):
-                differ.append(f"{extra} (code not in the revision)")
+        links = [d for d in directories if os.path.islink(os.path.join(top, d)) or junction(os.path.join(top, d))]
+        differ += [f"{relative(d)} (a linked directory)" for d in links]
+        directories[:] = [d for d in directories if d not in links and not (here == "." and d in scratch)]
+        differ += [f"{extra} (not in the revision)" for extra in map(relative, files) if extra not in tracked]
     return differ
 
 

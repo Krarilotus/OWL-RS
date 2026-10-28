@@ -1291,8 +1291,77 @@ class MeasurementSides(unittest.TestCase):
         planted.parent.mkdir(parents=True, exist_ok=True)
         planted.write_bytes(b"\x00not the revision's\n")
         self.assertEqual(gate_module.checkout_differs(self.repo, self.side),
-                         ["benches/suite/csv.pyc (code not in the revision)"],
+                         ["benches/suite/csv.pyc (not in the revision)"],
                          "SPEC the harness's checkout: no code but the revision's")
+
+    def test_the_gates_own_checkout_holds_nothing_else_outside_its_scratch(self):
+        """Sol, PR #60 r1 R1: the harness's checkout refused only names that looked like code, by a
+        case-sensitive suffix. An ignored benches/cases/private.toml put an unreviewed case in the
+        plan (the catalogue reads every *.toml), and Windows imports benches/suite/csv.PYC as
+        csv.pyc. A scratch root that was a link was left out before links were looked at."""
+        self.git("checkout", "-q", "--detach", self.side)
+        named = lambda: [d.split(" (")[0] for d in gate_module.checkout_differs(self.repo, self.side)]
+        for planted in ("benches/cases/private.toml", "benches/suite/csv.PYC"):
+            path = Path(self.repo, planted)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"not the revision's\n")
+            with self.subTest(planted=planted):
+                self.assertEqual(named(), [planted], "SPEC the harness's checkout: its revision and its scratch")
+            path.unlink()
+        elsewhere = tempfile.mkdtemp(prefix="linked-scratch-")
+        self.addCleanup(shutil.rmtree, elsewhere, True)
+        try:
+            os.symlink(elsewhere, Path(self.repo, "tmp"), target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"no directory link here: {error}")
+        self.assertEqual(named(), ["tmp"], "SPEC the scratch is the checkout's own directory")
+
+    def test_no_bytecode_from_before_the_run_is_executed(self):
+        """Sol, PR #60 r1 R2: the gate kept Python's caches in $GATE/pycache, where they outlive a
+        run and no check reads them: an unchecked-hash .pyc planted there for suitekit/cases.py ran
+        in place of the source the gate had checked. No cache older than a run runs in it: not one
+        there, in an earlier run's caches, or beside the source."""
+        bash = shutil.which("bash")
+        if bash is None or shutil.which("flock") is None:
+            self.skipTest("the gate builds on Linux hosts (bash, flock)")
+        import py_compile
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        tmp = self.gate_beside(loop)
+        gate = tmp / "planted"
+        # The gate's python3 is this one, so the planted caches carry its tag.
+        (tmp / "shim").mkdir()
+        (tmp / "shim" / "python3").write_text(f'#!/usr/bin/env bash\nexec "{Path(sys.executable).as_posix()}" "$@"\n',
+                                              encoding="utf-8", newline="\n")
+        (tmp / "shim" / "python3").chmod(0o755)
+        env = {**os.environ, "NRESE_GATE_DIR": (gate / "gate").as_posix(), "GATE_BIN": (gate / "bin").as_posix(),
+               "FLEET_OUT": (gate / "out").as_posix(),
+               "PATH": (tmp / "shim").as_posix() + os.pathsep + os.environ.get("PATH", "")}
+
+        def build() -> str:
+            done = subprocess.run([bash, "scripts/release-gate.sh", "build", self.side], cwd=self.repo, env=env,
+                                  capture_output=True, text=True)
+            return done.stdout + done.stderr
+
+        went = f"build {self.side} at {loop}"
+        self.assertIn(went, build(), "an earlier run")
+        source = str(Path(self.repo, "benches/suite/suitekit/cases.py").resolve())
+        body = tmp / "planted.py"
+        body.write_text('raise RuntimeError("PR60 planted bytecode executed")\n', encoding="utf-8")
+        earlier = list((gate / "gate" / "pycache").rglob("cases.*.pyc"))
+        planted = list(earlier)
+        for prefix in ((gate / "gate" / "pycache").as_posix(), None):
+            held, sys.pycache_prefix = sys.pycache_prefix, prefix
+            try:
+                planted.append(importlib.util.cache_from_source(source))
+            finally:
+                sys.pycache_prefix = held
+        for cached in planted:
+            py_compile.compile(str(body), cfile=str(cached), dfile=source, doraise=True,
+                               invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)
+        output = build()
+        self.assertNotIn("PR60 planted bytecode executed", output, "SPEC the gate runs the source it checked")
+        self.assertIn(went, output)
+        self.assertTrue(earlier, "the earlier run's caches were planted too")
 
     def test_the_build_compiles_the_commit_checked(self):
         """PR #54 fix check 1 (D2's other half): a replace ref made after the check returned stood
