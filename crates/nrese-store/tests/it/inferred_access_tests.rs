@@ -562,6 +562,93 @@ fn a_cancelled_pending_read_fails_and_keeps_no_view() {
     );
 }
 
+/// A statement or graph read whose read is cancelled (its time running out cancels it too)
+/// fails as cancelled and keeps no view, as a query does (Sol's review of O4's boundary
+/// round, round 4, S5). With the sets made, a reader whose view is new doesn't build it: RDF4J's
+/// statements (its size goes through the same read) and the Graph Store's GET and HEAD, each
+/// for a reader of its own. 5,000 facts in the readers' graph give their views sets to build
+/// from.
+#[test]
+fn a_cancelled_statement_read_fails_and_keeps_no_view() {
+    use nrese_store::{
+        CancellationToken, GraphReadRequest, GraphResultFormat, GraphTarget, QueryEvaluationError,
+        StoreError, StoreResult,
+    };
+    let store = StoreService::new(in_memory_store_config()).unwrap();
+    let facts: String = (0..5_000).map(|i| format!("ex:i{i} a ex:C . ")).collect();
+    store
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {{ GRAPH ex:open {{ ex:C rdfs:subClassOf ex:D . {facts} }} }}"
+        )))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    // A read that runs makes the sets (and its reader's view).
+    assert!(classes(&store, &reader(true), "i0").contains(&"<D>".to_owned()));
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    // A reader of `open` and one more graph: its view is new.
+    let new_reader = |i: usize| {
+        ReadScope::Graphs(Arc::new(GraphAccess {
+            graphs: vec![format!("{EX}open"), format!("{EX}unused{i}")],
+            default_graph: true,
+            inferred: true,
+            inferred_by_support: true,
+            ..GraphAccess::default()
+        }))
+    };
+    let open = || GraphTarget::NamedGraph(format!("{EX}open"));
+    let statements = |read: &ReadContext<'_>| {
+        store
+            .write_statements(
+                read,
+                &StatementPattern::default(),
+                GraphResultFormat::NQuads,
+                std::io::sink(),
+            )
+            .map(|_| ())
+    };
+    let get = |read: &ReadContext<'_>| {
+        let request = GraphReadRequest {
+            target: open(),
+            format: GraphResultFormat::NTriples,
+        };
+        store
+            .write_graph(read, &request, std::io::sink())
+            .map(|_| ())
+    };
+    let head = |read: &ReadContext<'_>| store.graph_exists(read, &open()).map(|_| ());
+    type Row<'a> = &'a dyn Fn(&ReadContext<'_>) -> StoreResult<()>;
+    let rows: [(&str, Row<'_>); 3] = [
+        ("RDF4J statements", &statements),
+        ("GSP GET", &get),
+        ("GSP HEAD", &head),
+    ];
+    let mut read_on = Vec::new();
+    for (i, (name, row)) in rows.into_iter().enumerate() {
+        let before = store.support_statistics();
+        let result = row(&ReadContext::new(new_reader(i)).cancelled_by(cancelled.clone()));
+        let after = store.support_statistics();
+        let stopped = matches!(
+            result,
+            Err(StoreError::SparqlEvaluation(
+                QueryEvaluationError::Cancelled
+            ))
+        );
+        if !stopped || after != before {
+            read_on.push(format!(
+                "{name}: {result:?}, views {} → {}",
+                before.views, after.views
+            ));
+        }
+    }
+    assert!(
+        read_on.is_empty(),
+        "read past their cancellation: {read_on:#?}"
+    );
+}
+
 /// A planned read (EXPLAIN without running) charges the view it makes to its query's memory,
 /// as a run does (Sol's review of O4's boundary round, S1). With the query's limit at 1 byte,
 /// a supported reader whose view is past it is refused by that limit, not by the server's
