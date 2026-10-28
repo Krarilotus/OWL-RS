@@ -1,27 +1,10 @@
-//! Every W3C SPARQL 1.1 and 1.2 result file (JSON, XML, TSV) read by `nrese-sparql-results`
-//! and by `sparesults` (with `sparql-12`): the same variables and solutions, or both
-//! refusing the file. Terms are compared in N-Triples form.
+//! Every result file (JSON, XML, TSV) of the pinned W3C SPARQL 1.0, 1.1 and 1.2 suites read
+//! by `nrese-sparql-results` and by `sparesults` (with `sparql-12`): the same variables and
+//! solutions, or both refusing the file. Terms are compared in N-Triples form. Without the
+//! suites in full the test fails where they are required (`NRESE_W3C_REQUIRED`) and else
+//! says it doesn't qualify.
 
-use std::path::{Path, PathBuf};
-
-fn root() -> Option<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.cache/rdf-tests/sparql");
-    root.join("sparql12").is_dir().then_some(root)
-}
-
-fn files(dir: &Path, out: &mut Vec<PathBuf>) {
-    for entry in std::fs::read_dir(dir).unwrap().flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            files(&path, out);
-        } else if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("srj" | "srx" | "tsv")
-        ) {
-            out.push(path);
-        }
-    }
-}
+use oxigraph_comparison::w3c;
 
 /// Variables, and per solution its bindings as `name=term` in N-Triples form (sorted).
 type Read = Result<(Vec<String>, Vec<Vec<String>>), String>;
@@ -84,17 +67,13 @@ fn theirs(format: sparesults::QueryResultsFormat, bytes: &[u8]) -> Read {
 
 #[test]
 fn w3c_result_files_read_alike() {
-    let Some(root) = root() else {
-        eprintln!("skipped: run scripts/fetch-w3c-tests.sh");
+    let Some(files) = w3c::admitted(w3c::sparql(&["srj", "srx", "tsv"])) else {
         return;
     };
-    let mut paths = Vec::new();
-    files(&root, &mut paths);
-    assert!(paths.len() > 300, "only {} result files", paths.len());
     let (mut same, mut both_refuse, mut differences) = (0, 0, Vec::new());
-    for path in &paths {
-        let bytes = std::fs::read(path).unwrap();
-        let (a, b) = match path.extension().and_then(|e| e.to_str()) {
+    for file in &files {
+        let bytes = file.bytes.as_slice();
+        let (a, b) = match file.path.extension().and_then(|e| e.to_str()) {
             Some("srj") => (
                 ours(nrese_sparql_results::QueryResultsFormat::Json, &bytes),
                 theirs(sparesults::QueryResultsFormat::Json, &bytes),
@@ -113,13 +92,14 @@ fn w3c_result_files_read_alike() {
             (Err(_), Err(_)) => both_refuse += 1,
             _ => differences.push(format!(
                 "{}:\n  nrese:     {a:?}\n  sparesults: {b:?}",
-                path.strip_prefix(&root).unwrap().display()
+                file.name
             )),
         }
     }
     println!(
-        "{} result files: {same} read alike, {both_refuse} refused by both, {} differ",
-        paths.len(),
+        "{} result files ({}): {same} read alike, {both_refuse} refused by both, {} differ",
+        files.len(),
+        w3c::counts(&files),
         differences.len()
     );
     for difference in &differences {
