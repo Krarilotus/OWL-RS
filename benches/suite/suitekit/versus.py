@@ -27,7 +27,7 @@ import statistics
 from collections import defaultdict
 from pathlib import Path
 
-from .answers import UNTIMED
+from .answers import timed as answer_timed, timing_verdict
 from .compare import bootstrap_ratio, thin
 from .schema import read
 
@@ -58,9 +58,7 @@ def answer_verdicts(directory: Path) -> dict[tuple, str]:
         # Captures without their classification: classify them (answers.py).
         found = [v for d, path in zip(data, paths)
                  for v in (d["verdicts"] if "verdicts" in d else Recorder.load([path], None, adjudications()).verdicts())]
-    return {(v["tier"], Path(v["query"]).stem, v["system"]):
-            "unchecked" if v["verdict"] == "incomplete" and v.get("note", "").startswith("no reference")
-            else v["verdict"] for v in found}
+    return {(v["tier"], Path(v["query"]).stem, v["system"]): timing_verdict(v) for v in found}
 
 
 def side(rows: list[dict], cache: str) -> dict:
@@ -143,7 +141,7 @@ def versus(directory: Path, home_turfs: dict[str, str] | None = None) -> list[di
         for who, s in (("nrese", nrese), (system, other)):
             for q in both:
                 verdict = verdicts.get((tier, Path(q).stem, who))
-                if verdict in UNTIMED or verdict == "unchecked":
+                if not answer_timed(verdict):
                     problems.append(f"{q} {verdict} ({who})")
                 elif s["status"][q] != {"ok"}:
                     problems.append(f"{q} {'/'.join(sorted(s['status'][q] - {'ok'}))} ({who})")

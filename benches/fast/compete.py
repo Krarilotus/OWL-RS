@@ -20,8 +20,9 @@ Answer counts must match NRESE's before a time counts: a differing count is repo
 `differs`, never as a time. Every suite run also captures each system's full answers and
 classifies them against the reference systems (ANSWER_REFERENCES, in order; the case's own
 checks of single answers are the known answers): benches/suite/suitekit/answers.py; a query
-whose answer the contract doesn't time (UNTIMED: wrong, unqualified, deviates, incomplete,
-unsupported) gives no time either. Results:
+whose answer the contract doesn't time (answers.timed: wrong, unqualified, deviates,
+incomplete, unsupported, and unchecked, which no reference answered) gives no time either.
+Results:
 benches/fast/results/<stamp>/compete.json, and answers.json with one verdict per distinct
 query over all the runs.
 """
@@ -39,7 +40,7 @@ import time
 from pathlib import Path
 
 import fast
-from suitekit.answers import UNTIMED
+from suitekit.answers import timed as answer_timed
 from suitekit.workloads import FAST_REGIMES, fast_data_name
 from suitekit.summary import summarise
 from suitekit.versus import answer_verdicts
@@ -284,7 +285,7 @@ def verdicts(summary: dict[str, dict]) -> dict[str, dict]:
         differ = [q for q in shared if str(s["queries"][q]["rows"]) != str(nrese["queries"][q]["rows"])]
         # The same count isn't the same answer: no time from one the contract doesn't time.
         untimed = {q: [f"{side['queries'][q]['answer']} ({who})" for who, side in (("nrese", nrese), (system, s))
-                       if side["queries"][q].get("answer") in UNTIMED] for q in shared if q not in differ}
+                       if not answer_timed(side["queries"][q].get("answer"))] for q in shared if q not in differ}
         untimed = {q: why for q, why in untimed.items() if why}
         same = [q for q in shared if q not in differ and q not in untimed and s["queries"][q].get("complete", False)
                 and nrese["queries"][q].get("complete", False)
