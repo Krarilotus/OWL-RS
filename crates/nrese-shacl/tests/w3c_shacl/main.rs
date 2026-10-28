@@ -10,7 +10,8 @@
 //!   severity). Blank nodes compare equal to each other; messages aren't compared (the
 //!   specification leaves them free).
 //! - **Failures.** A test whose result is `sht:Failure` passes if the shapes graph is
-//!   refused as ill-formed, or validation reports a failure.
+//!   refused as ill-formed, or validation reports a failure. A suite file that can't be
+//!   read or parsed, or an error of the harness's own, fails it.
 //! - **Expected failures.** Every known failure is listed with its reason in
 //!   `expected-failures.txt` (Core) and `expected-failures-sparql.txt` (SHACL-SPARQL). The run fails on any failure not in the list, and on any
 //!   listed test that now passes. The full report is written to
@@ -248,7 +249,30 @@ fn result_key(
     )
 }
 
-fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Outcome, String> {
+/// Why a run gave no outcome.
+enum Refusal {
+    /// The processor's own: the shapes graph is ill-formed, or validation failed. What a
+    /// `sht:Failure` test expects.
+    Processor(String),
+    /// Anything else: a suite file, the engine, the report graph. No test expects it.
+    Harness(String),
+}
+
+impl From<String> for Refusal {
+    fn from(why: String) -> Self {
+        Self::Harness(why)
+    }
+}
+
+impl From<Refusal> for String {
+    fn from(refusal: Refusal) -> Self {
+        match refusal {
+            Refusal::Processor(why) | Refusal::Harness(why) => why,
+        }
+    }
+}
+
+fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Outcome, Refusal> {
     let triples = |graph: &NamedNode| -> Result<Vec<Triple>, String> {
         if *graph == test.file {
             Ok(file.to_vec())
@@ -282,11 +306,11 @@ fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Outcome, String> 
     let snapshot = engine.snapshot();
     let shapes_selector = match snapshot.lookup(shapes_graph.into()) {
         Some(graph) => GraphSelector::Exact(graph),
-        None => return Err("empty shapes graph".to_owned()),
+        None => return Err("empty shapes graph".to_owned().into()),
     };
     let shapes = compile(&snapshot, Selection::asserted(shapes_selector)).map_err(|errors| {
         let errors: Vec<String> = errors.iter().map(ToString::to_string).collect();
-        format!("ill-formed shapes: {}", errors.join("; "))
+        Refusal::Processor(format!("ill-formed shapes: {}", errors.join("; ")))
     })?;
     let report = validate(
         &snapshot,
@@ -294,7 +318,10 @@ fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Outcome, String> 
         Selection::of(GraphSelector::Exact(TermId::DEFAULT_GRAPH)),
     );
     if !report.failures.is_empty() {
-        return Err(format!("validation failed: {}", report.failures.join("; ")));
+        return Err(Refusal::Processor(format!(
+            "validation failed: {}",
+            report.failures.join("; ")
+        )));
     }
     let mut results: Vec<String> = report
         .results
@@ -316,7 +343,7 @@ fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Outcome, String> 
     let graph: Graph = report.to_triples().into_iter().collect();
     let count = graph.triples_for_predicate(&iri(SH, "result")).count();
     if count != report.results.len() {
-        return Err(format!("the report graph has {count} results"));
+        return Err(format!("the report graph has {count} results").into());
     }
     Ok((report.conforms(), results))
 }
@@ -327,7 +354,8 @@ fn run(root: &Path, test: &Test) -> Result<(), String> {
     let graph: Graph = file.iter().cloned().collect();
     let Some(expected) = expected(&graph, test)? else {
         return match actual(root, test, &file) {
-            Err(_) => Ok(()),
+            Err(Refusal::Processor(_)) => Ok(()),
+            Err(Refusal::Harness(why)) => Err(format!("expected a failure, but {why}")),
             Ok(_) => Err("expected a failure (ill-formed shapes or a validation failure)".into()),
         };
     };
