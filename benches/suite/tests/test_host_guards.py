@@ -126,6 +126,30 @@ class Main(unittest.TestCase):
             self.assertEqual(self.lines()[0], first)
             self.assertEqual(list(self.retreat.parent.glob("RETREAT.*")), [])
 
+    # PR #52 fix check 1 F4: a Windows account name may hold a space; the fix read rows by token count, so whole
+    # tables with `other user` became unknown and RETREAT stayed forever. The reviewer's tables
+    # (notes/review-pr52-guard-port-fix1/complete_names.py), English and German.
+    LOCALES = ((ENGLISH.splitlines()[0], "Active", "Disc", "10/12/2026 9:02 AM"),
+               (GERMAN.splitlines()[0], "Aktiv", "Getrennt", "12.10.2026 09:02"))
+
+    def test_a_user_name_with_a_space_in_another_session_is_nobody_at_the_console(self):
+        for header, active, disconnected, logon in self.LOCALES:
+            for user, session, state in (("other user", "rdp-tcp#1", active), ("other user", None, disconnected),
+                                         ("x console", None, disconnected)):  # a name's word is no session
+                table = f"{header}\n {user:<22}{session or '':<19}2  {state:<8} none  {logon}\n"
+                self.assertEqual(self.run_main(table, input_idle=0.5), (False, False), table)
+
+    def test_a_user_name_with_a_space_at_the_console_is_known_presence(self):
+        for header, active, _, logon in self.LOCALES:
+            console = f"{header}\n>{'other user':<22}{'console':<19}2  {active:<8} none  {logon}\n"
+            self.assertEqual(self.run_main(console, input_idle=0.5), (True, True), console)
+            self.assertEqual(self.lines()[0], "present", console)
+            self.assertEqual(self.run_main(console, free="2999-01-01T00:00:00", input_idle=0.5), (False, False))
+        # A row off the header's columns (the reviewer's mixed table): a console session is still one, never a
+        # user called "owner console".
+        mixed = ENGLISH.splitlines()[0] + "\n other 3 Disc 1:05 10/12/2026 9:02 PM\n>owner console 1 Active none 10/12/2026 9:02 AM\n"
+        self.assertEqual(self.run_main(mixed, input_idle=0.5), (True, True), mixed)
+
     def test_the_quiet_time_is_read_from_retreats_time_line(self):
         # Nobody at the console: a RETREAT written just now stays its 15 minutes, one from long ago goes.
         nobody = ENGLISH.splitlines()[0] + "\n other   rdp-tcp#1   2  Active  none  10/12/2026 9:02 AM\n"
