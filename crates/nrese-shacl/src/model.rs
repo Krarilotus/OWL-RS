@@ -159,8 +159,10 @@ pub(crate) enum Constraint {
 /// A SPARQL query that checks a focus node (SHACL §5, §6).
 #[derive(Debug)]
 pub(crate) struct SparqlCheck {
-    /// `sh:sourceConstraint`: the `sh:sparql` value, or the component's validator.
-    pub(crate) source: TermId,
+    /// `sh:sourceConstraint`: the `sh:sparql` value. None for a SPARQL-based constraint
+    /// component's: its validator is shared by every shape that uses the component, and no
+    /// constraint of one.
+    pub(crate) source: Option<TermId>,
     /// `sh:SPARQLConstraintComponent`, or the custom component.
     pub(crate) component: Component,
     /// The query, with its prefixes and `$PATH` put in.
