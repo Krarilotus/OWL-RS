@@ -40,7 +40,7 @@ import time
 from pathlib import Path
 
 import fast
-from suitekit.answers import timed as answer_timed
+from suitekit.answers import query_name, timed as answer_timed
 from suitekit.workloads import FAST_REGIMES, fast_data_name
 from suitekit.summary import summarise
 from suitekit.versus import answer_verdicts
@@ -249,7 +249,7 @@ def summarise_suite(rows: list[dict], answered: dict[tuple, str] | None = None) 
         # by Oxigraph over its closure) are compared, though not timed.
         if r["task"] == "query" and r["repeat"] not in ("0", ""):
             q = s["queries"].setdefault(r["item"], {"ms": [], "rows": r["rows"], "executions": [], "answer": (
-                answered or {}).get((r["tier"], Path(r["item"]).stem, r["system"]))})
+                answered or {}).get((r["tier"], query_name(r["item"]), r["system"]))})
             q["executions"].append((r["run"], r["repeat"]))
             q["_cache"] = r.get("cache") or "-"
             if r["ms"]:
