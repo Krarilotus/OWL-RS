@@ -22,11 +22,11 @@
 //! `owl:propertyChainAxiom`, `owl:TransitiveProperty`, `rdfs:domain`, and `rdfs:range`
 //! (applied where a class axiom creates the edge), between named object properties. Every
 //! other class or property axiom is skipped and counted, outside EL (unions, universal
-//! restrictions, complements, cardinalities, inverses, nominals) or not (property
-//! characteristics other than transitivity, disjoint properties, disjoint unions, named
-//! class expressions, the top and bottom properties, datatypes where a class is read,
-//! restrictions on data properties, nodes that state two expressions): the hierarchy is
-//! then complete for the part read only. A data property's domain and range, which say
+//! restrictions, complements, cardinalities, inverses, nominals, data ranges) or not
+//! (property characteristics other than transitivity, disjoint properties, disjoint unions,
+//! self restrictions, named class expressions, the top and bottom properties, datatypes
+//! where a class is read, restrictions on data properties, nodes that state two
+//! expressions): the hierarchy is then complete for the part read only. A data property's domain and range, which say
 //! nothing about classes without such a restriction, assertions about individuals, and
 //! keys, which constrain only individuals, are not read: an inconsistency among them goes
 //! unseen.
@@ -83,6 +83,18 @@ pub struct Profile {
     pub threads: usize,
 }
 
+/// What a predicate of the RDF mapping's class expressions and data ranges is to the reader.
+#[derive(Debug, Clone, Copy)]
+enum Part {
+    /// A constructor EL reads (`owl:intersectionOf`, `owl:someValuesFrom`).
+    Read,
+    /// A constructor EL doesn't read, and the kind of omission.
+    Unread(&'static str),
+    /// A constructor's field; with a kind where EL reads no restriction it makes
+    /// (`owl:onProperties`).
+    Field(Option<&'static str>),
+}
+
 struct Names {
     sub_class_of: u64,
     equivalent_class: u64,
@@ -106,7 +118,10 @@ struct Names {
     transitive: u64,
     domain: u64,
     range: u64,
-    outside_el: Vec<(u64, &'static str)>,
+    /// Every predicate of the mapping's class expressions and data ranges (OWL 2 Mapping to
+    /// RDF Graphs, Tables 1 to 3): the constructors a node has one of, their fields, and
+    /// what EL makes of each. The one list the expression reader and [`Self::unread`] read.
+    expression: Vec<(u64, Part)>,
     /// Class and property axioms no rule reads, by predicate or `rdf:type` object.
     unread: Vec<(u64, &'static str)>,
     /// `owl:topObjectProperty` and the other three, whose meaning no rule has.
@@ -145,22 +160,32 @@ impl Names {
             transitive: owl(&mut iri, "TransitiveProperty"),
             domain: iri(&format!("{RDFS}domain")),
             range: iri(&format!("{RDFS}range")),
-            outside_el: [
-                ("unionOf", "union"),
-                ("allValuesFrom", "universal restriction"),
-                ("complementOf", "complement"),
-                ("oneOf", "nominal"),
-                ("hasValue", "nominal"),
-                ("cardinality", "cardinality"),
-                ("minCardinality", "cardinality"),
-                ("maxCardinality", "cardinality"),
-                ("qualifiedCardinality", "cardinality"),
-                ("minQualifiedCardinality", "cardinality"),
-                ("maxQualifiedCardinality", "cardinality"),
-                ("inverseOf", "inverse property"),
+            expression: [
+                ("intersectionOf", Part::Read),
+                ("someValuesFrom", Part::Read),
+                ("unionOf", Part::Unread("union")),
+                ("complementOf", Part::Unread("complement")),
+                ("oneOf", Part::Unread("nominal")),
+                ("hasValue", Part::Unread("nominal")),
+                ("allValuesFrom", Part::Unread("universal restriction")),
+                ("hasSelf", Part::Unread("self restriction")),
+                ("cardinality", Part::Unread("cardinality")),
+                ("minCardinality", Part::Unread("cardinality")),
+                ("maxCardinality", Part::Unread("cardinality")),
+                ("qualifiedCardinality", Part::Unread("cardinality")),
+                ("minQualifiedCardinality", Part::Unread("cardinality")),
+                ("maxQualifiedCardinality", Part::Unread("cardinality")),
+                ("inverseOf", Part::Unread("inverse property")),
+                ("datatypeComplementOf", Part::Unread("data range")),
+                ("onDatatype", Part::Unread("data range")),
+                ("onProperty", Part::Field(None)),
+                ("onClass", Part::Field(None)),
+                ("onDataRange", Part::Field(None)),
+                ("withRestrictions", Part::Field(None)),
+                ("onProperties", Part::Field(Some("n-ary data restriction"))),
             ]
             .into_iter()
-            .map(|(local, kind)| (owl(&mut iri, local), kind))
+            .map(|(local, part)| (owl(&mut iri, local), part))
             .collect(),
             unread: [
                 ("FunctionalProperty", "functional property"),
@@ -228,15 +253,9 @@ impl Names {
         // An expression's triples hang off its blank node and are read through the axiom
         // that uses it; on a named subject they define that class (or, `owl:inverseOf`,
         // relate two properties).
-        let el_parts = [
-            self.intersection_of,
-            self.some_values_from,
-            self.on_property,
-        ];
-        let kind = match self.outside_el.iter().find(|&&(t, _)| t == p) {
-            Some(&(_, kind)) => kind,
-            None if el_parts.contains(&p) => "named class expression",
-            None => return None,
+        let kind = match self.expression.iter().find(|&&(t, _)| t == p)?.1 {
+            Part::Unread(kind) | Part::Field(Some(kind)) => kind,
+            Part::Read | Part::Field(None) => "named class expression",
         };
         named(s).then_some(kind)
     }
@@ -472,22 +491,24 @@ impl Graph<'_> {
         if named(node) {
             return Ok(Expr::Named(node));
         }
-        // One node, one expression: a field given twice, or the fields of two constructors,
-        // say two things. Decided over every field before a constructor is read, so none
-        // is read while the node says something else as well.
-        let constructors = [self.names.intersection_of, self.names.some_values_from]
-            .into_iter()
-            .chain(self.names.outside_el.iter().map(|&(p, _)| p));
-        let mut present = 0;
-        for field in constructors {
-            match self.one(node, field) {
-                Err(Repeated) => return Err("malformed class expression"),
-                Ok(Some(_)) => present += 1,
-                Ok(None) => {}
+        // One node, one expression: a field given twice, or two constructors, read or not,
+        // say two things; a field EL reads no restriction of says one it lacks. Decided over
+        // the mapping's whole vocabulary before a constructor is read, so none is read while
+        // the node says something else as well.
+        let (mut constructors, mut unreadable) = (0, None);
+        for &(predicate, part) in &self.names.expression {
+            match (self.one(node, predicate), part) {
+                (Err(Repeated), _) => return Err("malformed class expression"),
+                (Ok(None), _) => {}
+                (Ok(Some(_)), Part::Field(kind)) => unreadable = unreadable.or(kind),
+                (Ok(Some(_)), Part::Read | Part::Unread(_)) => constructors += 1,
             }
         }
-        if present > 1 || self.one(node, self.names.on_property).is_err() {
+        if constructors > 1 {
             return Err("malformed class expression");
+        }
+        if let Some(kind) = unreadable {
+            return Err(kind);
         }
         let one = |predicate| self.one(node, predicate).ok().flatten();
         if let Some(list) = one(self.names.intersection_of) {
@@ -514,8 +535,10 @@ impl Graph<'_> {
                 Box::new(self.expr(filler, named, depth + 1)?),
             ));
         }
-        for &(predicate, kind) in &self.names.outside_el {
-            if self.objects(node, predicate).next().is_some() {
+        for &(predicate, part) in &self.names.expression {
+            if let Part::Unread(kind) = part
+                && self.objects(node, predicate).next().is_some()
+            {
                 return Err(kind);
             }
         }
@@ -1226,10 +1249,11 @@ mod tests {
 
     const EX: &str = "http://example.com/";
 
-    /// Loads `s p o` lines of prefixed names (`ex:`, `rdf:`, `rdfs:`, `owl:`, `xsd:`, `_:b`).
+    /// Loads `s p o` lines of prefixed names (`ex:`, `rdf:`, `rdfs:`, `owl:`, `xsd:`, `_:b`);
+    /// `"…"^^<…>` literals (without spaces) are taken as they are.
     fn load(v: &mut LocalVocabulary, text: &str) -> Vec<Triple> {
         let mut term = |t: &str| -> u64 {
-            if t.starts_with("_:") {
+            if t.starts_with("_:") || t.starts_with('"') {
                 return v.term(t);
             }
             let (prefix, local) = t.split_once(':').unwrap();
@@ -1416,16 +1440,16 @@ mod tests {
     /// owl:Thing`; `A ⊑ ∃owl:bottomObjectProperty.C`, `A ⊑ ⊥`), a datatype read as a class
     /// or a restriction on a data property (`A ⊑ ∃p.xsd:integer` with `p`'s range
     /// `xsd:string`: `A ⊑ ⊥`), and a node that states two things: a field given twice, or
-    /// the fields of two constructors (I26 Sol r2). Declarations, annotations, the
-    /// ontology's header, a data property's domain and range (nothing about classes without
-    /// a restriction; the top data property's domain makes its class `owl:Thing`, and is
-    /// reported), and assertions about individuals and keys, which the classifier doesn't
-    /// read, omit no such axiom.
+    /// two constructors, EL's or not (I26 Sol r2; PR #53 r1 F1, an existential beside a self
+    /// restriction). Declarations, annotations, the ontology's header, a data property's
+    /// domain and range (nothing about classes without a restriction; the top data
+    /// property's domain makes its class `owl:Thing`, and is reported), and assertions about
+    /// individuals and keys, which the classifier doesn't read, omit no such axiom.
     #[test]
     fn axioms_without_a_rule_are_reported_as_omitted() {
         /// `(predicate, reason)` omitted, or `(sub, super)` derived.
         type Pairs = &'static [(&'static str, &'static str)];
-        let cases: [(&str, &str, Pairs, Pairs); 21] = [
+        let cases: [(&str, &str, Pairs, Pairs); 26] = [
             (
                 "reflexive",
                 "ex:r rdf:type owl:ReflexiveProperty
@@ -1591,6 +1615,52 @@ mod tests {
                 &[],
             ),
             (
+                "existential-and-self",
+                "ex:A rdfs:subClassOf _:e
+                 _:e owl:onProperty ex:r
+                 _:e owl:someValuesFrom ex:B
+                 _:e owl:hasSelf \"true\"^^<http://www.w3.org/2001/XMLSchema#boolean>",
+                &[("rdfs:subClassOf", "malformed class expression")],
+                &[],
+            ),
+            (
+                "intersection-and-data-complement",
+                "ex:A rdfs:subClassOf _:e
+                 _:e owl:intersectionOf _:l
+                 _:l rdf:first ex:B
+                 _:l rdf:rest _:m
+                 _:m rdf:first ex:C
+                 _:m rdf:rest rdf:nil
+                 _:e owl:datatypeComplementOf ex:D",
+                &[("rdfs:subClassOf", "malformed class expression")],
+                &[],
+            ),
+            (
+                "existential-and-n-ary",
+                "ex:A rdfs:subClassOf _:e
+                 _:e owl:onProperty ex:r
+                 _:e owl:someValuesFrom ex:B
+                 _:e owl:onProperties _:l
+                 _:l rdf:first ex:r
+                 _:l rdf:rest rdf:nil",
+                &[("rdfs:subClassOf", "n-ary data restriction")],
+                &[],
+            ),
+            (
+                "self-alone",
+                "ex:A rdfs:subClassOf _:e
+                 _:e owl:onProperty ex:r
+                 _:e owl:hasSelf \"true\"^^<http://www.w3.org/2001/XMLSchema#boolean>",
+                &[("rdfs:subClassOf", "self restriction")],
+                &[],
+            ),
+            (
+                "named-self",
+                "ex:S owl:hasSelf \"true\"^^<http://www.w3.org/2001/XMLSchema#boolean>",
+                &[("owl:hasSelf", "self restriction")],
+                &[],
+            ),
+            (
                 "data-domain",
                 "ex:p rdf:type owl:DatatypeProperty
                  ex:p rdfs:domain _:u
@@ -1678,8 +1748,9 @@ mod tests {
         for (case, input, omitted, subsumptions) in cases {
             check(case, input, omitted, subsumptions);
         }
-        // Each field an expression is read by, given twice, makes its node malformed,
-        // whatever the node would otherwise be read as (I26 Sol r2 S3).
+        // Each predicate of the mapping's class expressions and data ranges, given twice,
+        // makes its node malformed, whatever the node would otherwise be read as (I26 Sol r2
+        // S3; PR #53 r1 F1: the constructors EL doesn't read and their fields too).
         for field in [
             "intersectionOf",
             "someValuesFrom",
@@ -1689,13 +1760,20 @@ mod tests {
             "oneOf",
             "allValuesFrom",
             "hasValue",
+            "hasSelf",
             "cardinality",
             "minCardinality",
             "maxCardinality",
             "qualifiedCardinality",
             "minQualifiedCardinality",
             "maxQualifiedCardinality",
+            "onClass",
+            "onDataRange",
+            "onProperties",
             "inverseOf",
+            "datatypeComplementOf",
+            "onDatatype",
+            "withRestrictions",
         ] {
             let input =
                 format!("ex:A rdfs:subClassOf _:e\n_:e owl:{field} ex:X\n_:e owl:{field} ex:Y");
