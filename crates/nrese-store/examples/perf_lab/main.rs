@@ -364,24 +364,14 @@ fn run_once(
     timeout: Duration,
 ) -> Result<(u64, Duration), String> {
     let token = CancellationToken::new();
-    let canceller = {
-        let token = token.clone();
-        let (done, wait) = std::sync::mpsc::channel::<()>();
-        (
-            std::thread::spawn(move || {
-                if wait.recv_timeout(timeout).is_err() {
-                    token.cancel();
-                }
-            }),
-            done,
-        )
-    };
+    // The process's watchdog cancels at the timeout: armed before the timed window, disarmed
+    // after it, so that no thread starts inside it (benches/fast/patches/perf_lab_watchdog.py).
+    let armed = perf_lab_watchdog::arm(&token, timeout);
     let mut sink = CountingSink::default();
     let started = Instant::now();
     let result = store.run_query(prepared, &token, &mut sink);
     let elapsed = started.elapsed();
-    let _ = canceller.1.send(());
-    let _ = canceller.0.join();
+    drop(armed);
     result.map_err(|e| {
         if elapsed >= timeout {
             format!("timeout after {} s", timeout.as_secs())
@@ -1361,4 +1351,58 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         println!("memory: peak {peak} MiB, resident {rss} MiB");
     }
     Ok(())
+}
+
+/// The timeout of every timed run, by one thread for the whole process (release gate harness:
+/// benches/fast/patches/perf_lab_watchdog.py): started once, before any timing, and running
+/// before it returns; it polls every 10 ms and takes the slot's lock only then, which the timed
+/// call never takes.
+mod perf_lab_watchdog {
+    use super::CancellationToken;
+    use std::sync::{Mutex, OnceLock, mpsc};
+    use std::time::{Duration, Instant};
+
+    type Slot = Mutex<Option<(Instant, CancellationToken)>>;
+    const POLL: Duration = Duration::from_millis(10);
+
+    fn slot() -> &'static Slot {
+        static SLOT: OnceLock<Slot> = OnceLock::new();
+        static STARTED: OnceLock<()> = OnceLock::new();
+        let slot: &'static Slot = SLOT.get_or_init(|| Mutex::new(None));
+        STARTED.get_or_init(|| {
+            let (ready, started) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = ready.send(());
+                loop {
+                    std::thread::sleep(POLL);
+                    let mut armed = slot.lock().unwrap_or_else(|e| e.into_inner());
+                    if armed
+                        .as_ref()
+                        .is_some_and(|(deadline, _)| Instant::now() >= *deadline)
+                        && let Some((_, token)) = armed.take()
+                    {
+                        token.cancel();
+                    }
+                }
+            });
+            let _ = started.recv();
+        });
+        slot
+    }
+
+    /// Disarms the watchdog when dropped.
+    pub struct Armed;
+
+    impl Drop for Armed {
+        fn drop(&mut self) {
+            *slot().lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// Cancels `token` once `timeout` has passed, unless the guard is dropped first.
+    pub fn arm(token: &CancellationToken, timeout: Duration) -> Armed {
+        *slot().lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now() + timeout, token.clone()));
+        Armed
+    }
 }
