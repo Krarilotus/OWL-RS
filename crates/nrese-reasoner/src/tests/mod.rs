@@ -1508,6 +1508,153 @@ fn maintenance_keeps_what_schema_facts_alone_derive() {
     }
 }
 
+/// Maintenance of rules whose guards see `owl:sameAs` classes equals rematerialisation,
+/// which runs over representatives (startup, the catalog, the draft check), after every
+/// change of random deletes and re-inserts, under each plan of the maintenance policy:
+/// classes that hold from the start, form through a functional property, and split when an
+/// equality or the fact that formed one goes; an equality between the property a guarded
+/// rule joins on and another; a guard on a variable that grounding binds from a schema fact,
+/// alone (decided while grounding) and against one a later join binds (decided then, with
+/// the value grounding kept), also for a term in no class (`ex:F`). DRed maintains every
+/// identity, so its closure is the replicated one, and the representative closure expanded
+/// must be that too (reasoning-semantics.md, "Maintenance"; review of the guard fix
+/// f2b7a4a4, r1, follow-up 2).
+#[test]
+fn guarded_maintenance_equals_rematerialisation_over_representatives() {
+    use super::delta::policy::{Plan, Policy};
+    use super::delta::{MemoryBase, Rules, update_with};
+    use super::representatives;
+
+    let mut vocabulary = LocalVocabulary::default();
+    let pool = load(
+        &mut vocabulary,
+        "ex:a owl:sameAs ex:b
+         ex:b owl:sameAs ex:c
+         ex:a ex:p ex:b
+         ex:c ex:q ex:a
+         ex:q owl:sameAs ex:p
+         ex:fp rdf:type owl:FunctionalProperty
+         ex:s ex:fp ex:d
+         ex:s ex:fp ex:e
+         ex:d ex:p ex:d
+         ex:C rdfs:subClassOf ex:C
+         ex:C owl:sameAs ex:D
+         ex:E rdfs:subClassOf ex:D
+         ex:C ex:in ex:C
+         ex:F rdfs:subClassOf ex:F
+         ex:F ex:in ex:F",
+    );
+    let guarded = "@prefix ex: <http://example.com/> . \
+        @prefix log: <http://www.w3.org/2000/10/swap/log#> . \
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        { ?x ex:p ?y . ?x log:notEqualTo ?y } => { ?x ex:twin ?y } .
+        { ?x rdfs:subClassOf ?c . ?x log:notEqualTo ?c } => { ?x ex:strictly ?c } .
+        { ?c rdfs:subClassOf ?d . ?x ex:in ?c . ?x log:notEqualTo ?c } => { ?x ex:under ?d } .";
+    let mut rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+    rules.extend(
+        super::n3::compile("guards.n3", guarded, &mut vocabulary)
+            .unwrap()
+            .rules,
+    );
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let schema = Schema::owl(&mut vocabulary);
+    let same_as = vocabulary.iri(&format!("{}sameAs", super::ir::OWL));
+    let (twin, strictly, under) = (
+        vocabulary.iri(&format!("{EX}twin")),
+        vocabulary.iri(&format!("{EX}strictly")),
+        vocabulary.iri(&format!("{EX}under")),
+    );
+    let compiled = Rules {
+        rules: &rules,
+        lists: Some(&lists),
+        schema: &schema,
+    };
+    let replicated =
+        |asserted: &[Triple]| batch::materialise(asserted, &rules, Some(&lists), &schema).derived;
+    let over_representatives = |asserted: &[Triple]| -> Vec<Triple> {
+        let closure = representatives::materialise(asserted, &rules, Some(&lists), &schema);
+        let mut inferred: Vec<Triple> = closure
+            .facts
+            .iter()
+            .flat_map(|&f| closure.classes.expand(f))
+            .filter(|t| asserted.binary_search(t).is_err())
+            .collect();
+        inferred.sort_unstable();
+        inferred.dedup();
+        inferred
+    };
+    // Steps that deleted an equality, and that changed what the guarded rules conclude.
+    let (mut splits, mut guarded_changes) = (0, 0);
+    for policy in [
+        Policy::default(),
+        Policy::forcing(Plan::Dred),
+        Policy::forcing(Plan::Recompute),
+    ] {
+        let mut next = rng(0x2026_1028_0022);
+        let mut asserted: Vec<Triple> = pool.clone();
+        asserted.sort_unstable();
+        let mut inferred = replicated(&asserted);
+        for step in 0..40 {
+            let fact = pool[next(pool.len())];
+            let deleting = asserted.binary_search(&fact).is_ok();
+            let mut after: Vec<Triple> = asserted.iter().copied().filter(|&t| t != fact).collect();
+            if !deleting {
+                after.push(fact);
+                after.sort_unstable();
+            }
+            let stack: Vec<Triple> = inferred
+                .iter()
+                .copied()
+                .filter(|t| after.binary_search(t).is_err())
+                .collect();
+            let base = MemoryBase::new(&after, &stack);
+            let new = !deleting && inferred.binary_search(&fact).is_err();
+            let (ins, del): (&[Triple], &[Triple]) = if deleting {
+                (&[], std::slice::from_ref(&fact))
+            } else if new {
+                (std::slice::from_ref(&fact), &[])
+            } else {
+                (&[], &[])
+            };
+            let result = update_with(&base, ins, del, compiled, None, crate::eval::NEVER, policy)
+                .expect("never stopped");
+            let removal: HashSet<Triple> = result.remove.iter().copied().collect();
+            let mut maintained: Vec<Triple> = stack
+                .into_iter()
+                .filter(|t| !removal.contains(t))
+                .chain(result.insert)
+                .collect();
+            maintained.sort_unstable();
+            maintained.dedup();
+            assert_eq!(
+                maintained,
+                replicated(&after),
+                "{policy:?}, step {step}: against the replicated closure"
+            );
+            assert_eq!(
+                maintained,
+                over_representatives(&after),
+                "{policy:?}, step {step}: against the representative closure"
+            );
+            splits += usize::from(deleting && fact[1] == same_as);
+            let concluded = |closure: &[Triple]| -> Vec<Triple> {
+                closure
+                    .iter()
+                    .copied()
+                    .filter(|t| [twin, strictly, under].contains(&t[1]))
+                    .collect()
+            };
+            guarded_changes += usize::from(concluded(&maintained) != concluded(&inferred));
+            inferred = maintained;
+            asserted = after;
+        }
+    }
+    assert!(
+        splits >= 3 && guarded_changes >= 3,
+        "{splits} splits, {guarded_changes} changes of the guarded conclusions"
+    );
+}
+
 /// Equality-heavy data: the batch executor's equality module equals the generic
 /// `eq-rep-*` rules of the naive evaluator (chains of `sameAs` that merge classes over
 /// several rounds, equal predicates, equal objects).
