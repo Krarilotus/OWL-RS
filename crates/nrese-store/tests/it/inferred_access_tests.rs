@@ -699,6 +699,86 @@ fn a_pending_read_charges_its_view_to_the_query() {
     assert!(warm.is_ok(), "with the base's view made: {warm:?}");
 }
 
+/// A read inside a transaction charges what its operations' replay reads and builds to its
+/// query's memory, as it charges the read itself (sol-loop of PR #50 over F1, D5 and D7, S1;
+/// G1's I37). Each row: a control that answers within the query's limit, then the read whose
+/// replay takes it past that limit, refused with the query's memory limit, not the server's.
+/// - The view: the replay's `WHERE` reads through the reader's view, so the reader's first
+///   read makes it there (5,000 facts in its graph: well past 64 KiB, as in
+///   `a_pending_read_charges_its_view_to_the_query`). The control: a reader of every graph,
+///   who has no view.
+/// - The `WHERE`'s solutions: 10,000 statements matched by a reader of every graph, at 16 KiB
+///   (`ASK {}` itself needs 64 bytes). The control: a `WHERE` that matches nothing.
+#[test]
+fn a_pending_reads_replay_is_charged_to_the_query() {
+    use nrese_store::{
+        CancellationToken, PreparedQuery, StatementOp, StatementsRequest, StoreResult,
+    };
+    let ask = |store: &StoreService, scope: ReadScope, update: &str, limit: usize| {
+        let mut request = SparqlQueryRequest::new("ASK {}", scope);
+        request.memory_limit = Some(limit);
+        let prepared = PreparedQuery::parse(&request).unwrap();
+        let pending =
+            StatementsRequest::new(vec![StatementOp::Update(SparqlUpdateRequest::new(update))]);
+        store.run_query_pending(
+            &pending,
+            &prepared,
+            &CancellationToken::new(),
+            &mut Vec::new(),
+        )
+    };
+    let supported = || {
+        let store = StoreService::new(in_memory_store_config()).unwrap();
+        let facts: String = (0..5_000).map(|i| format!("ex:i{i} a ex:C . ")).collect();
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+                 INSERT DATA {{ GRAPH ex:open {{ ex:C rdfs:subClassOf ex:D . {facts} }} }}"
+            )))
+            .unwrap();
+        store.rematerialise(Ruleset::Owl2Rl).unwrap();
+        store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+        store
+    };
+    let marker =
+        format!("PREFIX ex: <{EX}> INSERT {{ GRAPH ex:open {{ ex:m ex:p ex:o }} }} WHERE {{}}");
+    let matched = StoreService::new(in_memory_store_config()).unwrap();
+    let facts: String = (0..10_000)
+        .map(|i| format!("<urn:s{i}> <urn:p> {i} . "))
+        .collect();
+    matched
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "INSERT DATA {{ GRAPH <urn:open> {{ {facts} }} }}"
+        )))
+        .unwrap();
+    let copy = |p: &str| {
+        format!(
+            "INSERT {{ GRAPH <urn:open> {{ ?s <urn:q> ?o }} }} WHERE {{ GRAPH <urn:open> {{ ?s <{p}> ?o }} }}"
+        )
+    };
+    let rows: [(&str, StoreResult<()>, StoreResult<()>); 2] = [
+        (
+            "the view",
+            ask(&supported(), ReadScope::All, &marker, 64 * 1024),
+            ask(&supported(), reader(true), &marker, 64 * 1024),
+        ),
+        (
+            "the WHERE's solutions",
+            ask(&matched, ReadScope::All, &copy("urn:none"), 16 * 1024),
+            ask(&matched, ReadScope::All, &copy("urn:p"), 16 * 1024),
+        ),
+    ];
+    let wrong: Vec<String> = rows
+        .iter()
+        .filter(|(_, control, read)| {
+            !(control.is_ok()
+                && matches!(read, Err(error) if error.is_memory_limit() && !error.is_server_memory_limit()))
+        })
+        .map(|(row, control, read)| format!("{row}: control {control:?}, read {read:?}"))
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A read inside a transaction whose query is cancelled (its time running out cancels it too)
 /// fails as cancelled and keeps no view, as one outside it does
 /// (`a_cancelled_restricted_read_fails_and_leaves_nothing_behind`; Sol's review of O4's
