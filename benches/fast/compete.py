@@ -21,7 +21,8 @@ Answer counts must match NRESE's before a time counts: a differing count is repo
 classifies them against the reference systems (ANSWER_REFERENCES, in order; the case's own
 checks of single answers are the known answers): benches/suite/suitekit/answers.py; a query
 whose answer the contract doesn't time (answers.timed: wrong, unqualified, deviates,
-incomplete, unsupported, and unchecked, which no reference answered) gives no time either.
+incomplete, unsupported, unchecked, which no reference answered, and missing, which its run
+recorded no verdict for) gives no time either.
 Results:
 benches/fast/results/<stamp>/compete.json, and answers.json with one verdict per distinct
 query over all the runs.
@@ -40,7 +41,7 @@ import time
 from pathlib import Path
 
 import fast
-from suitekit.answers import query_name, timed as answer_timed
+from suitekit.answers import TimingVerdicts, timed as answer_timed
 from suitekit.workloads import FAST_REGIMES, fast_data_name
 from suitekit.summary import summarise
 from suitekit.versus import answer_verdicts
@@ -178,9 +179,9 @@ def export_closure(case: dict) -> str | None:
 
 def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: str,
               queries: Path | None = None, track: str = "", settings: dict | None = None,
-              cache: str = "off", expect: dict | None = None) -> tuple[list[dict], dict[tuple, str]]:
+              cache: str = "off", expect: dict | None = None) -> tuple[list[dict], TimingVerdicts]:
     """The suite's driver on tier CASE~SEMANTICS for NRESE and `systems`; its rows and its
-    answer verdicts (answers.json: (tier, query, system) -> verdict). A track
+    answer verdicts (answers.json, as answers.TimingVerdicts). A track
     (the case's `tracks`) adds its settings, such as how many queries a store answers at
     once; `cache` the result-cache modes of the systems that have one (`off,on` for a
     replayed log)."""
@@ -214,11 +215,11 @@ def suite_run(case: dict, semantics: str, systems: list[str], runs: int, stamp: 
     path = out / "results.csv"
     if not path.exists():
         print(f"  no results; see {log}")
-        return [], {}
+        return [], TimingVerdicts()
     return list(csv.DictReader(open(path, encoding="utf-8"))), answer_verdicts(out)
 
 
-def summarise_suite(rows: list[dict], answered: dict[tuple, str] | None = None) -> dict[str, dict]:
+def summarise_suite(rows: list[dict], answered: TimingVerdicts | None = None) -> dict[str, dict]:
     """Per system: load (with reasoning), statements, per-query median ms, rows, answer verdict
     (ANSWERED, from suite_run), status. With its result cache on, a system is its own entry
     (`qlever (cache on)`)."""
@@ -249,7 +250,7 @@ def summarise_suite(rows: list[dict], answered: dict[tuple, str] | None = None) 
         # by Oxigraph over its closure) are compared, though not timed.
         if r["task"] == "query" and r["repeat"] not in ("0", ""):
             q = s["queries"].setdefault(r["item"], {"ms": [], "rows": r["rows"], "executions": [], "answer": (
-                answered or {}).get((r["tier"], query_name(r["item"]), r["system"]))})
+                answered or TimingVerdicts()).of(r["workload"], r["tier"], r["regime"], r["item"], r["system"])})
             q["executions"].append((r["run"], r["repeat"]))
             q["_cache"] = r.get("cache") or "-"
             if r["ms"]:

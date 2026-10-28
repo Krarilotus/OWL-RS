@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from suitekit import compare, report, status  # noqa: E402
+from suitekit import answers, compare, report, status, versus  # noqa: E402
 from suitekit.schema import Result  # noqa: E402
 from suitekit.summary import summarise  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fast"))
@@ -284,13 +284,86 @@ class CompetitorCompleteness(unittest.TestCase):
         rows = [load(), load(system="other"), query("q1", 10), query("q1", 1, system="other")]
         for verdict, winner in (("ok", "other"), ("deviates", None), ("wrong", None), ("unqualified", None),
                                 ("incomplete", None), ("unchecked", None)):
+            record = {"workload": "w", "tier": "t", "regime": "none", "query": "queries/q1.rq", "system": "other",
+                      "verdict": "incomplete" if verdict == "unchecked" else verdict,
+                      "note": "no reference answered" if verdict == "unchecked" else ""}
             with patch("suitekit.summary.adjudications", return_value={}):
-                summary = compete.summarise_suite(rows, {("t", "q1", "other"): verdict})
+                summary = compete.summarise_suite(rows, answers.TimingVerdicts([record]))
             got = compete.verdicts(summary)["other"]
             with self.subTest(verdict=verdict):
                 self.assertEqual(got["query_winner"], winner, f"SPEC answer contract: {got['answers']}")
                 if winner is None:
                     self.assertIn(verdict, got["answers"])
+
+
+def recorded(path: Path, records: list[tuple[str, str]], systems=("nrese",)) -> Path:
+    """answers.json beside a results file: each (verdict, query file) for each system; an
+    incomplete one because no reference answered (unchecked)."""
+    (path.parent / "answers.json").write_text(json.dumps({"verdicts": [
+        {"workload": "w", "tier": "t", "regime": "none", "query": query_file, "system": system, "verdict": verdict,
+         "note": "no reference answered" if verdict == "incomplete" else ""}
+        for verdict, query_file in records for system in systems]}), encoding="utf-8")
+    return path
+
+
+class OneVerdictPerQuery(unittest.TestCase):
+    """T8 PR #56 R3 (Sol's fix check 1): the reports that time (compare, versus, compete) read one
+    verdict per query from the contract: the worst of every record of it, in any order; joined by
+    the query's result id, its file's stem (the driver's: `q1.rq.rq` is `q1.rq`); and a query its
+    run recorded no verdict for, where the run recorded others, isn't timed."""
+
+    REPORTS = ("compare", "versus", "compete")
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.dir = Path(temporary.name)
+
+    def timed(self, name: str, item: str, runs: list[list[tuple[str, str]]]) -> dict[str, bool]:
+        """Whether each report times `item` at 100 ms against 1 ms (compare: a base run against a
+        new one; versus and compete: nrese against `other` in one run), over runs whose answers.json
+        holds `runs[i]`'s (verdict, query file) records."""
+        sides, batch, rows = {"base": [], "new": []}, self.dir / name / "batch", []
+        for i, records in enumerate(runs):
+            for side, ms in (("base", 100), ("new", 1)):
+                sides[side].append(str(recorded(write(self.dir / name / side / str(i), [load(), query(item, ms)]),
+                                                records)))
+            rows = [load(), load(system="other"), query(item, 100), query(item, 1, system="other")]
+            recorded(write(batch / str(i), rows), records, ("nrese", "other"))
+        text = output(compare.main, [",".join(sides["base"]), ",".join(sides["new"])])
+        entry = {e["system"]: e for e in versus.versus(batch)}["other"]
+        with patch("suitekit.summary.adjudications", return_value={}):
+            summary = compete.summarise_suite(rows, versus.answer_verdicts(batch))
+        return {"compare": "1 faster" in text, "versus": entry["timed"] == "1/1",
+                "compete": compete.verdicts(summary)["other"]["query_winner"] == "other"}
+
+    def test_the_worst_record_of_a_query_decides_in_either_order(self):
+        # `match`: answers.json's ok before 12 Oct, in a run pooled with a newer one.
+        for failure, passed, order in itertools.product(("wrong", "incomplete"), ("ok", "match"),
+                                                        ("bad first", "bad last")):
+            runs = [[(failure, "queries/q1.rq")], [(passed, "queries/q1.rq")]]
+            with self.subTest(failure=failure, passed=passed, order=order):
+                got = self.timed(f"{failure}-{passed}-{order}", "q1", runs if order == "bad first" else runs[::-1])
+                self.assertEqual(got, dict.fromkeys(self.REPORTS, False), "SPEC a later ok hides no fault")
+
+    def test_a_query_file_ending_in_rq_twice_joins_its_result_id(self):
+        for verdict, timed in (("wrong", False), ("incomplete", False), ("ok", True)):
+            with self.subTest(verdict=verdict):
+                got = self.timed(f"suffix-{verdict}", "q1.rq", [[(verdict, "queries/q1.rq.rq")]])
+                self.assertEqual(got, dict.fromkeys(self.REPORTS, timed), "SPEC the item is the file's stem")
+
+    def test_a_query_its_run_recorded_no_verdict_for_is_not_timed(self):
+        got = self.timed("unjoined", "q1", [[("ok", "queries/q2.rq")]])
+        self.assertEqual(got, dict.fromkeys(self.REPORTS, False), "SPEC a failed join isn't counts only")
+        # A run that recorded no answers at all is timed by its counts, as before.
+        self.assertEqual(self.timed("unrecorded", "q1", [[]]), dict.fromkeys(self.REPORTS, True))
+
+    def test_a_client_level_has_no_answer_to_join(self):
+        runs = []
+        for name, ms in (("base", 100), ("new", 1)):
+            path = write(self.dir / name, [load(), query("q1", ms), query("clients-8", ms, rows=100)])
+            runs.append(str(recorded(path, [("ok", "queries/q1.rq")])))
+        self.assertIn("2 faster", output(compare.main, runs))
 
 
 if __name__ == "__main__":
