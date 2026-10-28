@@ -20,17 +20,19 @@
 //! `owl:AllDisjointClasses`, `owl:intersectionOf`, `owl:someValuesFrom` restrictions,
 //! `owl:Thing`, `owl:Nothing`, `rdfs:subPropertyOf`, `owl:equivalentProperty`,
 //! `owl:propertyChainAxiom`, `owl:TransitiveProperty`, `rdfs:domain`, and `rdfs:range`
-//! (applied where a class axiom creates the edge). Every other class or property axiom is
-//! skipped and counted, outside EL (unions, universal restrictions, complements,
-//! cardinalities, inverses, nominals) or not (property characteristics other than
-//! transitivity, disjoint properties, disjoint unions, named class expressions): the
-//! hierarchy is then complete for the part read only. Assertions about individuals, and
-//! keys, which constrain only individuals, are not read: an inconsistency among them goes
-//! unseen.
+//! (applied where a class axiom creates the edge), between named object properties. Every
+//! other class or property axiom is skipped and counted, outside EL (unions, universal
+//! restrictions, complements, cardinalities, inverses, nominals) or not (property
+//! characteristics other than transitivity, disjoint properties, disjoint unions, named
+//! class expressions, the top and bottom properties, data ranges and data restrictions):
+//! the hierarchy is then complete for the part read only. Assertions about individuals,
+//! and keys, which constrain only individuals, are not read: an inconsistency among them
+//! goes unseen.
 
 use std::time::{Duration, Instant};
 
 use hashbrown::{HashMap, HashSet};
+use nrese_xsd::owl::Datatype;
 
 use super::ir::{OWL, RDF, RDFS, Vocabulary};
 
@@ -105,6 +107,13 @@ struct Names {
     outside_el: Vec<(u64, &'static str)>,
     /// Class and property axioms no rule reads, by predicate or `rdf:type` object.
     unread: Vec<(u64, &'static str)>,
+    /// `owl:topObjectProperty` and the other three, whose meaning no rule has.
+    top_and_bottom: [u64; 4],
+    /// The datatypes of OWL 2's datatype map; and the declarations of others, and of data
+    /// properties.
+    datatype_map: Vec<u64>,
+    datatype: u64,
+    datatype_property: u64,
 }
 
 impl Names {
@@ -165,6 +174,28 @@ impl Names {
             .into_iter()
             .map(|(local, kind)| (owl(&mut iri, local), kind))
             .collect(),
+            top_and_bottom: [
+                "topObjectProperty",
+                "bottomObjectProperty",
+                "topDataProperty",
+                "bottomDataProperty",
+            ]
+            .map(|local| owl(&mut iri, local)),
+            datatype_map: Datatype::ALL.iter().map(|d| iri(&d.iri())).collect(),
+            datatype: iri(&format!("{RDFS}Datatype")),
+            datatype_property: owl(&mut iri, "DatatypeProperty"),
+        }
+    }
+
+    /// Whether the rules can read `p` as a role, `Err` why not: it is an expression (an
+    /// inverse), or a top or bottom property.
+    fn role(&self, p: u64, named: &dyn Fn(u64) -> bool) -> Result<(), &'static str> {
+        if !named(p) {
+            Err("inverse property")
+        } else if self.top_and_bottom.contains(&p) {
+            Err("top or bottom property")
+        } else {
+            Ok(())
         }
     }
 
@@ -180,8 +211,13 @@ impl Names {
             self.range,
         ];
         if property_axioms.contains(&p) || (p == self.rdf_type && o == self.transitive) {
-            // Read where the properties are named: here one is an expression, an inverse.
-            return Some("inverse property");
+            // Read where the properties are roles: here one isn't.
+            let roles: &[u64] = if p == self.sub_property_of || p == self.equivalent_property {
+                &[s, o]
+            } else {
+                &[s]
+            };
+            return roles.iter().find_map(|&r| self.role(r, named).err());
         }
         let term = if p == self.rdf_type { o } else { p };
         if let Some(&(_, kind)) = self.unread.iter().find(|&&(t, _)| t == term) {
@@ -344,10 +380,37 @@ impl ListError {
     }
 }
 
+/// Two different objects where the mapping has one subject and predicate say one thing.
+struct Repeated;
+
 /// The triples of an ontology, indexed by subject.
 struct Graph<'a> {
     by_subject: HashMap<u64, Vec<(u64, u64)>>,
     names: &'a Names,
+    /// What is about data values, which no rule reads: the datatypes (OWL 2's datatype
+    /// map and those declared `rdfs:Datatype`) and the declared data properties.
+    datatypes: HashSet<u64>,
+    data_properties: HashSet<u64>,
+}
+
+impl<'a> Graph<'a> {
+    fn new(triples: &[Triple], names: &'a Names) -> Self {
+        let mut graph = Graph {
+            by_subject: HashMap::new(),
+            names,
+            datatypes: names.datatype_map.iter().copied().collect(),
+            data_properties: HashSet::new(),
+        };
+        for &[s, p, o] in triples {
+            graph.by_subject.entry(s).or_default().push((p, o));
+            if p == names.rdf_type && o == names.datatype {
+                graph.datatypes.insert(s);
+            } else if p == names.rdf_type && o == names.datatype_property {
+                graph.data_properties.insert(s);
+            }
+        }
+        graph
+    }
 }
 
 impl Graph<'_> {
@@ -360,12 +423,18 @@ impl Graph<'_> {
             .map(|(_, o)| *o)
     }
 
-    /// The object of `subject predicate` where the mapping has one: `None` when there is
-    /// none, or two different ones (the same triple twice is one).
-    fn one(&self, subject: u64, predicate: u64) -> Option<u64> {
+    /// The object of `subject predicate` where the mapping has at most one; two different
+    /// ones are [`Repeated`] (the same triple twice is one).
+    fn one(&self, subject: u64, predicate: u64) -> Result<Option<u64>, Repeated> {
         let mut objects = self.objects(subject, predicate);
-        let first = objects.next()?;
-        objects.all(|o| o == first).then_some(first)
+        let Some(first) = objects.next() else {
+            return Ok(None);
+        };
+        if objects.all(|o| o == first) {
+            Ok(Some(first))
+        } else {
+            Err(Repeated)
+        }
     }
 
     fn list(&self, mut node: u64) -> Result<Vec<u64>, ListError> {
@@ -378,13 +447,9 @@ impl Graph<'_> {
             if out.len() > 10_000 {
                 return Err(ListError::ResourceLimit);
             }
-            out.push(
-                self.one(node, self.names.first)
-                    .ok_or(ListError::Malformed)?,
-            );
-            node = self
-                .one(node, self.names.rest)
-                .ok_or(ListError::Malformed)?;
+            let one = move |predicate| self.one(node, predicate).ok().flatten();
+            out.push(one(self.names.first).ok_or(ListError::Malformed)?);
+            node = one(self.names.rest).ok_or(ListError::Malformed)?;
         }
         Ok(out)
     }
@@ -399,10 +464,18 @@ impl Graph<'_> {
         if depth > 64 {
             return Err("too deeply nested");
         }
+        if self.datatypes.contains(&node) {
+            return Err("data range");
+        }
         if named(node) {
             return Ok(Expr::Named(node));
         }
-        if let Some(list) = self.one(node, self.names.intersection_of) {
+        // A value given twice is no constructor's: decided before any is tried.
+        let one = |predicate| {
+            self.one(node, predicate)
+                .map_err(|Repeated| "malformed class expression")
+        };
+        if let Some(list) = one(self.names.intersection_of)? {
             let members = self.list(list).map_err(ListError::reason)?;
             if members.is_empty() {
                 return Err("empty intersection");
@@ -414,11 +487,12 @@ impl Graph<'_> {
                 .map(Expr::And);
         }
         if let (Some(filler), Some(role)) = (
-            self.one(node, self.names.some_values_from),
-            self.one(node, self.names.on_property),
+            one(self.names.some_values_from)?,
+            one(self.names.on_property)?,
         ) {
-            if !named(role) {
-                return Err("inverse property");
+            self.names.role(role, named)?;
+            if self.data_properties.contains(&role) {
+                return Err("data restriction");
             }
             return Ok(Expr::Some(
                 role,
@@ -426,7 +500,7 @@ impl Graph<'_> {
             ));
         }
         for &(predicate, kind) in &self.names.outside_el {
-            if self.one(node, predicate).is_some() {
+            if self.objects(node, predicate).next().is_some() {
                 return Err(kind);
             }
         }
@@ -491,14 +565,8 @@ fn build(
     named: &dyn Fn(u64) -> bool,
 ) -> Built {
     let names = Names::new(vocabulary);
-    let mut by_subject: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
-    for &[s, p, o] in triples {
-        by_subject.entry(s).or_default().push((p, o));
-    }
-    let graph = Graph {
-        by_subject,
-        names: &names,
-    };
+    let graph = Graph::new(triples, &names);
+    let role = |p: u64| names.role(p, named).is_ok();
     let mut tbox = Tbox::default();
     let thing = tbox.concept(Some(names.thing));
     let nothing = tbox.concept(Some(names.nothing));
@@ -535,6 +603,8 @@ fn build(
         } else if p == names.rdf_type && o == names.all_disjoint_classes {
             let members = match graph
                 .one(s, names.members)
+                .ok()
+                .flatten()
                 .ok_or(ListError::Malformed)
                 .and_then(|l| graph.list(l))
             {
@@ -555,18 +625,18 @@ fn build(
                 }
             }
         } else if (p == names.sub_property_of || p == names.equivalent_property)
-            && named(s)
-            && named(o)
+            && role(s)
+            && role(o)
         {
             let (r, t) = (tbox.role(Some(s)), tbox.role(Some(o)));
             tbox.sub_roles.push((r, t));
             if p == names.equivalent_property {
                 tbox.sub_roles.push((t, r));
             }
-        } else if p == names.rdf_type && o == names.transitive && named(s) {
+        } else if p == names.rdf_type && o == names.transitive && role(s) {
             let r = tbox.role(Some(s));
             tbox.chains.push((r, r, r));
-        } else if p == names.property_chain && named(s) {
+        } else if p == names.property_chain && role(s) {
             let links = match graph.list(o) {
                 Ok(links) => links,
                 Err(error) => {
@@ -574,8 +644,12 @@ fn build(
                     continue;
                 }
             };
-            if links.len() < 2 || !links.iter().all(|&l| named(l)) {
-                skipped.push((p, "chain of inverse or fewer than two properties"));
+            if links.len() < 2 {
+                skipped.push((p, "chain of fewer than two properties"));
+                continue;
+            }
+            if let Some(kind) = links.iter().find_map(|&l| names.role(l, named).err()) {
+                skipped.push((p, kind));
                 continue;
             }
             let target = tbox.role(Some(s));
@@ -587,14 +661,19 @@ fn build(
                 roles.splice(0..2, [fresh]);
             }
             tbox.chains.push((roles[0], roles[1], target));
-        } else if p == names.domain && named(s) {
+        } else if p == names.domain && role(s) {
             let Some(c) = expr(o, p, &mut skipped) else {
                 continue;
             };
             let (r, c) = (tbox.role(Some(s)), tbox.name(&c));
             let some = tbox.some(r, thing);
             tbox.sub(some, c);
-        } else if p == names.range && named(s) {
+        } else if p == names.range && role(s) {
+            // A datatype as the range is a data range too: `expr` says so.
+            if graph.data_properties.contains(&s) {
+                skipped.push((p, "data range"));
+                continue;
+            }
             let Some(c) = expr(o, p, &mut skipped) else {
                 continue;
             };
@@ -1121,11 +1200,12 @@ fn saturate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::XSD;
     use crate::vocabulary::LocalVocabulary;
 
     const EX: &str = "http://example.com/";
 
-    /// Loads `s p o` lines of prefixed names (`ex:`, `rdf:`, `rdfs:`, `owl:`, `_:b`).
+    /// Loads `s p o` lines of prefixed names (`ex:`, `rdf:`, `rdfs:`, `owl:`, `xsd:`, `_:b`).
     fn load(v: &mut LocalVocabulary, text: &str) -> Vec<Triple> {
         let mut term = |t: &str| -> u64 {
             if t.starts_with("_:") {
@@ -1137,6 +1217,7 @@ mod tests {
                 "rdf" => RDF,
                 "rdfs" => RDFS,
                 "owl" => OWL,
+                "xsd" => XSD,
                 other => panic!("{other}"),
             };
             v.iri(&format!("{ns}{local}"))
@@ -1309,13 +1390,18 @@ mod tests {
     /// A class or property axiom the reader has no rule for is reported as omitted, never
     /// dropped (review s15-el-omissions r1 F1). With `r` reflexive, an `A` is its own
     /// `r`-successor, so `∃r.A ⊑ B` gives `A ⊑ B`; unread, `A ⊑ B` is missing and the
-    /// omission says so. Declarations, annotations, the ontology's header, and assertions
-    /// about individuals and keys, which the classifier doesn't read, omit no such axiom.
+    /// omission says so. So are the axioms the rules would misread (I26 Sol r1): a top or
+    /// bottom property read as a role (`owl:topObjectProperty rdfs:domain B` gives `B ≡
+    /// owl:Thing`; `A ⊑ ∃owl:bottomObjectProperty.C`, `A ⊑ ⊥`), a data range or
+    /// restriction read as a class (`A ⊑ ∃p.xsd:integer` with `p`'s range `xsd:string`:
+    /// `A ⊑ ⊥`), and an expression with two values where the mapping has one.
+    /// Declarations, annotations, the ontology's header, and assertions about individuals
+    /// and keys, which the classifier doesn't read, omit no such axiom.
     #[test]
     fn axioms_without_a_rule_are_reported_as_omitted() {
         /// `(predicate, reason)` omitted, or `(sub, super)` derived.
         type Pairs = &'static [(&'static str, &'static str)];
-        let cases: [(&str, &str, Pairs, Pairs); 8] = [
+        let cases: [(&str, &str, Pairs, Pairs); 15] = [
             (
                 "reflexive",
                 "ex:r rdf:type owl:ReflexiveProperty
@@ -1372,11 +1458,89 @@ mod tests {
                 &[],
             ),
             (
+                "top-domain",
+                "owl:topObjectProperty rdfs:domain ex:B",
+                &[("rdfs:domain", "top or bottom property")],
+                &[],
+            ),
+            (
+                "bottom-restriction",
+                "ex:A rdfs:subClassOf _:e
+                 _:e owl:onProperty owl:bottomObjectProperty
+                 _:e owl:someValuesFrom ex:C",
+                &[("rdfs:subClassOf", "top or bottom property")],
+                &[],
+            ),
+            (
+                "top-and-bottom-roles",
+                "ex:p rdfs:subPropertyOf owl:topObjectProperty
+                 owl:bottomObjectProperty rdf:type owl:TransitiveProperty
+                 ex:r owl:propertyChainAxiom _:c
+                 _:c rdf:first ex:s
+                 _:c rdf:rest _:d
+                 _:d rdf:first owl:topDataProperty
+                 _:d rdf:rest rdf:nil
+                 owl:topDataProperty rdfs:range ex:C
+                 owl:bottomDataProperty owl:equivalentProperty ex:q",
+                &[
+                    ("rdfs:subPropertyOf", "top or bottom property"),
+                    ("rdf:type", "top or bottom property"),
+                    ("owl:propertyChainAxiom", "top or bottom property"),
+                    ("rdfs:range", "top or bottom property"),
+                    ("owl:equivalentProperty", "top or bottom property"),
+                ],
+                &[],
+            ),
+            (
+                "data-property",
+                "ex:p rdf:type owl:DatatypeProperty
+                 ex:p rdfs:range xsd:string
+                 ex:A rdfs:subClassOf _:e
+                 _:e owl:onProperty ex:p
+                 _:e owl:someValuesFrom xsd:integer",
+                &[
+                    ("rdfs:range", "data range"),
+                    ("rdfs:subClassOf", "data restriction"),
+                ],
+                &[],
+            ),
+            (
+                "datatype-filler",
+                "ex:A rdfs:subClassOf _:e
+                 _:e owl:onProperty ex:q
+                 _:e owl:someValuesFrom xsd:integer",
+                &[("rdfs:subClassOf", "data range")],
+                &[],
+            ),
+            (
+                "declared-datatype",
+                "ex:D rdf:type rdfs:Datatype
+                 ex:q rdfs:range ex:D",
+                &[("rdfs:range", "data range")],
+                &[],
+            ),
+            (
+                "two-intersections",
+                "ex:A rdfs:subClassOf _:e
+                 _:e owl:intersectionOf _:l
+                 _:e owl:intersectionOf _:m
+                 _:l rdf:first ex:C
+                 _:l rdf:rest rdf:nil
+                 _:m rdf:first ex:D
+                 _:m rdf:rest rdf:nil
+                 _:e owl:onProperty ex:r
+                 _:e owl:someValuesFrom ex:B",
+                &[("rdfs:subClassOf", "malformed class expression")],
+                &[],
+            ),
+            (
                 "no-axiom",
                 "ex:o rdf:type owl:Ontology
                  ex:A rdf:type owl:Class
                  ex:A rdfs:label ex:l
                  ex:r rdf:type owl:ObjectProperty
+                 ex:d rdf:type owl:DatatypeProperty
+                 ex:D rdf:type rdfs:Datatype
                  ex:A rdfs:subClassOf ex:B
                  _:x rdf:type owl:Axiom
                  _:x owl:annotatedSource ex:A
@@ -1561,14 +1725,7 @@ mod tests {
         let mut v = LocalVocabulary::default();
         let triples = load(&mut v, &disjoint(10_001));
         let names = Names::new(&mut v);
-        let mut by_subject: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
-        for [s, p, o] in triples {
-            by_subject.entry(s).or_default().push((p, o));
-        }
-        let graph = Graph {
-            by_subject,
-            names: &names,
-        };
+        let graph = Graph::new(&triples, &names);
         assert_eq!(graph.list(v.term("_:l0")).unwrap().len(), 10_001);
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
