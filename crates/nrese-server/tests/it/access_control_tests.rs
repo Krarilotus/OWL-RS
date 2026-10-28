@@ -582,3 +582,125 @@ async fn query_certification_tells_nothing_of_a_hidden_schema()
     }
     Ok(())
 }
+
+/// An ASK's answer in a SPARQL JSON result.
+fn boolean(body: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let json: serde_json::Value = serde_json::from_str(body)?;
+    Ok(json["boolean"]
+        .as_bool()
+        .ok_or_else(|| format!("no boolean: {body}"))?)
+}
+
+/// The answer of the ASK `query` as `roles` read.
+async fn ask(
+    app: &axum::Router,
+    roles: &[&str],
+    query: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let (status, body) = send(
+        app,
+        roles,
+        Method::POST,
+        "/dataset/query",
+        Some("application/sparql-query"),
+        query,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    boolean(&body)
+}
+
+/// An update's WHERE reads what its requester reads, as its queries do (review r1 of PR #50,
+/// F1). For a reader of what its graphs support (`inferred = "supported"`), `open` derives
+/// `alice a Patient` whether or not `secret`, which it can't read, asserts it; so a marker its
+/// update inserts where that holds lands either way: through SPARQL UPDATE, and through an
+/// RDF4J transaction's UPDATE, read inside the transaction before any commit.
+#[tokio::test]
+async fn an_updates_where_reads_what_its_requester_reads() -> Result<(), Box<dyn std::error::Error>>
+{
+    const SUPPORTED: &str = r#"
+default = "deny"
+inferred = "supported"
+
+[[role]]
+name = "editor"
+read = ["http://example.com/g/open"]
+write = ["http://example.com/g/open"]
+default_graph = "read"
+"#;
+    let editor = &["editor"];
+    let marker = |name: &str| format!("<{EX}{name}> <{EX}observed> true");
+    let insert = |name: &str| {
+        format!(
+            "INSERT {{ GRAPH <{EX}g/open> {{ {} }} }} WHERE {{ <{EX}alice> a <{EX}Patient> }}",
+            marker(name)
+        )
+    };
+    let holds = |name: &str| format!("ASK {{ GRAPH <{EX}g/open> {{ {} }} }}", marker(name));
+    let mut seen = Vec::new();
+    for hidden in [false, true] {
+        let app = app_in(SUPPORTED, ReasoningMode::Owl2Rl)?;
+        let secret = match hidden {
+            true => format!("GRAPH <{EX}g/secret> {{ <{EX}alice> a <{EX}Patient> }}"),
+            false => String::new(),
+        };
+        let data = format!(
+            "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {{ GRAPH <{EX}g/open> {{ <{EX}alice> a <{EX}Human> .
+                            <{EX}Human> rdfs:subClassOf <{EX}Patient> }} {secret} }}"
+        );
+        assert_eq!(
+            update(&app, &["nrese.admin"], &data).await?,
+            StatusCode::NO_CONTENT
+        );
+        let derived = ask(
+            &app,
+            editor,
+            &format!("ASK {{ <{EX}alice> a <{EX}Patient> }}"),
+        )
+        .await?;
+        assert_eq!(
+            update(&app, editor, &insert("committed")).await?,
+            StatusCode::NO_CONTENT
+        );
+        let committed = ask(&app, editor, &holds("committed")).await?;
+        // An RDF4J transaction: its UPDATE pending, read inside it.
+        let begin = Request::builder()
+            .method(Method::POST)
+            .uri("/repositories/nrese/transactions")
+            .header("authorization", format!("Bearer {}", token(editor)))
+            .body(Body::empty())?;
+        let response = app.clone().oneshot(begin).await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let tx = response.headers()[axum::http::header::LOCATION]
+            .to_str()?
+            .to_owned();
+        let (status, body) = send(
+            &app,
+            editor,
+            Method::PUT,
+            &format!("{tx}?action=UPDATE"),
+            Some("application/x-www-form-urlencoded"),
+            &serde_urlencoded::to_string([("update", insert("pending"))])?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = send(
+            &app,
+            editor,
+            Method::PUT,
+            &format!(
+                "{tx}?action=QUERY&{}",
+                serde_urlencoded::to_string([("query", holds("pending"))])?
+            ),
+            None,
+            "",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        seen.push((derived, committed, boolean(&body)?));
+    }
+    assert_eq!(seen[0], (true, true, true), "derived from open");
+    assert_eq!(seen[1], seen[0], "alice a Patient asserted in secret");
+    Ok(())
+}

@@ -24,6 +24,8 @@
 //!   most): every read path (counts, sorted scans, equality, the query cache keyed by
 //!   access) sees the subset alone. Views are kept per revision and access set; the next
 //!   revision's view is the last one's list corrected for the facts the update recomputed.
+//!   [`Reading`] is the one place that decides which data a read sees, of a revision or of
+//!   a transaction's pending state, for every read and every update's `WHERE`.
 //! - **Not computable** (no reasoner v2 rules registered, or the stack over
 //!   representatives of `reasoner.equality = "compact"`): the reader sees no inferred
 //!   statement, the safe side.
@@ -44,7 +46,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use hashbrown::{HashMap, HashSet};
 use nrese_engine::quad::Permutation;
 use nrese_engine::{
-    EncodedQuad, GraphSelector, InferredMask, QuadPattern, ReadModel, Snapshot, TermId,
+    EncodedQuad, GraphSelector, InferredMask, QuadPattern, ReadModel, Snapshot, TermId, Transaction,
 };
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Envelope, Reservation};
 use nrese_reasoner::RuleProgram;
@@ -54,7 +56,7 @@ use nrese_reasoner::graph_sets::{
     rederived_candidates, support_sets, update_support_sets,
 };
 use nrese_reasoner::ir::Triple;
-use nrese_sparql::{CancellationToken, GraphAccess};
+use nrese_sparql::{CancellationToken, GraphAccess, ReadView};
 
 use crate::reasoning::Program;
 
@@ -951,7 +953,7 @@ impl SupportSets {
             .chain(self.overlay.elsewhere.iter())
             .chain(self.axioms.iter());
         for &fact in candidates {
-            if asserted_out_of_reach(snapshot, access, fact) {
+            if asserted(snapshot, access, fact) == Asserted::OutOfReach {
                 found.push(fact)?;
             }
         }
@@ -1082,8 +1084,8 @@ impl SupportSets {
         let extra = |fact: Triple| {
             (earlier.decide(fact, &visible_before) != Decision::Hidden
                 || self.decide(fact, &visible_now) != Decision::Hidden)
-                && (asserted_out_of_reach(before, access, fact)
-                    || asserted_out_of_reach(snapshot, access, fact))
+                && (asserted(before, access, fact) == Asserted::OutOfReach
+                    || asserted(snapshot, access, fact) == Asserted::OutOfReach)
         };
         if changed.iter().any(|&fact| extra(fact)) {
             return Ok(None);
@@ -1259,18 +1261,28 @@ fn starts_with(
         })
 }
 
-/// Whether `fact` is asserted in `snapshot`, in no graph a reader with `access` may read.
-fn asserted_out_of_reach(snapshot: &Snapshot, access: &GraphAccess, fact: Triple) -> bool {
-    let mut asserted = false;
-    for quad in
-        snapshot.quads_for_pattern_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any))
-    {
-        if access.allows_id(snapshot, quad.graph) {
-            return false;
+/// Where a statement is asserted, for one reader ([`asserted`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Asserted {
+    Nowhere,
+    /// In a graph the reader may read.
+    InReach,
+    /// Only in graphs the reader may not read.
+    OutOfReach,
+}
+
+/// Where `fact` is asserted in `view` (a snapshot, or a transaction with its pending
+/// changes), for a reader with `access`: the one test of whether a reader may know a
+/// statement is asserted, for its views, its pending reads and what it is told.
+pub(crate) fn asserted(view: &impl ReadView, access: &GraphAccess, fact: Triple) -> Asserted {
+    let mut found = Asserted::Nowhere;
+    for quad in view.quads_for_pattern_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any)) {
+        if access.allows_id(view, quad.graph) {
+            return Asserted::InReach;
         }
-        asserted = true;
+        found = Asserted::OutOfReach;
     }
-    asserted
+    found
 }
 
 /// `known` followed by the named graphs of `snapshot` it lacks, in IRI order, kept on
@@ -1676,6 +1688,123 @@ pub(crate) struct Compilation {
     pub(crate) cap: usize,
 }
 
+/// What one read sees of the store, the one decision of it ([`Reading::of`]): of a committed
+/// revision ([`Self::committed`]) or of a transaction's pending state ([`Self::pending`]).
+/// Queries, EXPLAIN, statement and graph reads, explanations and reads in a client
+/// transaction ask it, and so do an update's `WHERE` clauses ([`nrese_sparql::ReadSource`]).
+/// What making a view reads and builds is charged to the read's envelope, and its
+/// cancellation stops it.
+pub(crate) struct Reading {
+    supports: Arc<Supports>,
+    compilation: Compilation,
+    access: Arc<GraphAccess>,
+    memory: Envelope,
+    cancellation: Option<CancellationToken>,
+}
+
+impl Reading {
+    /// The reading of a reader with `access` (`None`: every graph), if it reads anything but
+    /// the data as stored: a reader of some graphs who sees inferred statements, by their
+    /// support or every one. `None` for a reader of every graph, or one who sees no
+    /// inferred statement (its reads leave them out).
+    pub(crate) fn of(
+        supports: &Arc<Supports>,
+        compilation: Compilation,
+        access: Option<&Arc<GraphAccess>>,
+        memory: &Envelope,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<Self> {
+        let access = access.filter(|access| access.inferred)?;
+        Some(Self {
+            supports: Arc::clone(supports),
+            compilation,
+            access: Arc::clone(access),
+            memory: memory.clone(),
+            cancellation: cancellation.cloned(),
+        })
+    }
+
+    /// Whether this reader reads `snapshot` through a view of its own: by support, or
+    /// seeing every inference while a named graph is out of its reach (a fact asserted only
+    /// there, and derived, is shown to it as inferred).
+    fn through_view(&self, snapshot: &Snapshot) -> bool {
+        self.access.inferred_by_support
+            || snapshot
+                .named_graphs()
+                .any(|graph| !self.access.allows_id(snapshot, graph))
+    }
+
+    /// `snapshot`, a committed revision, as this reader reads it.
+    pub(crate) fn committed(&self, snapshot: &Snapshot) -> Result<Snapshot, Unavailable> {
+        match self.through_view(snapshot) {
+            true => self.supports.view(
+                snapshot,
+                &self.access,
+                self.compilation,
+                &self.memory,
+                self.cancellation.as_ref(),
+            ),
+            false => Ok(snapshot.clone()),
+        }
+    }
+
+    /// What `tx` holds, its base and its pending changes, as this reader reads it: with
+    /// nothing pending, its base ([`Self::committed`]). The changes aren't reasoned over until
+    /// the commit: the base's inferred statements as far as the reader sees them and the
+    /// changes left them, kept (charged) as the support views are; the list they are gathered
+    /// in is the read's work. A statement the view adds (asserted only in graphs the reader
+    /// can't read, and derived) stays unless the changes assert it where the reader reads it.
+    pub(crate) fn pending(&self, tx: &Transaction<'_>) -> Result<Snapshot, Unavailable> {
+        if tx.pending() == (0, 0) && tx.inferred_pending() == (0, 0) {
+            return self.committed(tx.base());
+        }
+        if !self.through_view(tx.base()) {
+            return Ok(tx.pending_snapshot());
+        }
+        let base = self.committed(tx.base())?;
+        let left = |quad: &EncodedQuad| match tx.base().contains_in(ReadModel::Inferred, quad) {
+            true => tx.contains_in(ReadModel::Inferred, quad),
+            false => asserted(tx, &self.access, triple(*quad)) != Asserted::InReach,
+        };
+        // The read's cancellation stops the gathering as it stops the base's view (a view
+        // made before isn't computed again): nothing more is read or kept.
+        let working = Work {
+            budget: Arc::new(self.memory.part()),
+            cancellation: self.cancellation.clone(),
+        };
+        working.go_on()?;
+        let len = usize::try_from(base.len_in(ReadModel::Inferred)).unwrap_or(usize::MAX);
+        let mut kept: Kept<EncodedQuad> = ChargedVec::with_capacity(Arc::clone(&working), len)?;
+        let mut scanning = Reservation::new(Arc::clone(&working));
+        scanning.charge(base.scan_bytes(ReadModel::Inferred))?;
+        kept.extend_bounded(
+            len,
+            base.quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+                .take_while(|_| working.go_on().is_ok())
+                .filter(|quad| left(quad)),
+        )?;
+        drop(scanning);
+        working.go_on()?;
+        kept.sort_unstable();
+        Ok(tx
+            .pending_snapshot()
+            .with_inferred_only(&kept, &self.supports.kept)?)
+    }
+}
+
+/// An update's `WHERE` clauses read the transaction's state as its requester's queries
+/// would ([`Reading::pending`]); the failure as the store's error for it says
+/// ([`From<Unavailable>`](crate::StoreError)).
+impl nrese_sparql::ReadSource for Reading {
+    fn state(&self, tx: &Transaction<'_>) -> Result<Snapshot, nrese_sparql::QueryEvaluationError> {
+        self.pending(tx)
+            .map_err(|unavailable| match crate::StoreError::from(unavailable) {
+                crate::StoreError::SparqlEvaluation(error) => error,
+                error => nrese_sparql::QueryEvaluationError::Dataset(Box::new(error)),
+            })
+    }
+}
+
 impl Supports {
     /// Sets and views kept on `kept`.
     pub(crate) fn new(kept: Arc<Budget>) -> Self {
@@ -1693,11 +1822,6 @@ impl Supports {
         let mut state = self.state();
         let epoch = state.generation.epoch + 1;
         *state = State::new(&self.kept, Generation { rules, epoch });
-    }
-
-    /// What the sets and views keep is charged to.
-    pub(crate) fn kept(&self) -> &Arc<Budget> {
-        &self.kept
     }
 
     /// How many times the rules were set ([`Self::use_rules`]): what a read decided under
@@ -1948,7 +2072,7 @@ impl Supports {
         scanning.charge(snapshot.scan_bytes(ReadModel::Asserted))?;
         let mut show: Kept<EncodedQuad> = ChargedVec::new(Arc::clone(working));
         for &fact in found.facts.iter() {
-            if asserted_out_of_reach(snapshot, access, fact) {
+            if asserted(snapshot, access, fact) == Asserted::OutOfReach {
                 let [s, p, o] = fact.map(TermId::from_raw);
                 show.push(EncodedQuad::new(s, p, o, TermId::DEFAULT_GRAPH))?;
             }
