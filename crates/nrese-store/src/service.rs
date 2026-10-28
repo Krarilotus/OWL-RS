@@ -492,6 +492,20 @@ impl StoreService {
         self.view_of(&self.engine.snapshot(), access, memory, Some(cancellation))
     }
 
+    /// [`Self::read_snapshot`] for a statement or graph read (RDF4J, the Graph Store): its
+    /// view stops with the read's cancellation. Such a read has no envelope of its own, so
+    /// its view's working memory is the queries', as [`Self::read_snapshot`]'s is.
+    fn read_snapshot_for(
+        &self,
+        read: &crate::ReadContext<'_>,
+    ) -> StoreResult<nrese_engine::Snapshot> {
+        self.read_snapshot_within(
+            read.scope.access(),
+            &self.settings.envelope(None),
+            &read.cancel,
+        )
+    }
+
     /// [`Self::read_snapshot_within`] of `snapshot`, a committed revision. The
     /// unrestricted path (every graph, or no inferences, or every inference over every
     /// named graph) is the snapshot itself: no support state is read.
@@ -1071,7 +1085,7 @@ impl StoreService {
             if !self.readable(read, &request.target)? {
                 return Ok(false);
             }
-            let view = self.read_snapshot(read.scope.access())?;
+            let view = self.read_snapshot_for(read)?;
             write_graph(&view, request, read.model(), &read.cancel, out)
         };
         read.scope.told(crate::EntryPoint::GraphRead, whole())
@@ -1088,11 +1102,7 @@ impl StoreService {
             if !self.readable(read, target)? {
                 return Ok(false);
             }
-            graph_exists(
-                &self.read_snapshot(read.scope.access())?,
-                target,
-                read.model(),
-            )
+            graph_exists(&self.read_snapshot_for(read)?, target, read.model())
         };
         read.scope.told(crate::EntryPoint::GraphExists, whole())
     }
@@ -1403,9 +1413,7 @@ impl StoreService {
         read: impl FnOnce(&nrese_engine::Snapshot) -> StoreResult<T>,
     ) -> StoreResult<T> {
         let whole = match context.pending {
-            None => self
-                .read_snapshot(context.scope.access())
-                .and_then(|view| read(&view)),
+            None => self.read_snapshot_for(context).and_then(|view| read(&view)),
             Some(pending) => self.with_pending(
                 pending,
                 &context.scope,
