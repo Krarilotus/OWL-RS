@@ -68,20 +68,39 @@ HEADERS = ("username", "benutzername")
 LOGON = re.compile(r"\d{1,4}[./-]\d{1,2}[./-]\d{1,4} \d{1,2}:\d{2}(?: [AaPp][Mm])?")
 
 
-def row(line: str) -> tuple[str | None, int] | None:
+# A session name by its form (where the columns don't say): the console, services, or a protocol's `name#N`.
+SESSION = re.compile(r"console|services|[\w.-]+#\d+", re.IGNORECASE)
+
+
+def row(line: str, session_at: int, id_at: int) -> tuple[str | None, int] | None:
     """One session of `query user`'s table: its session name (None for a disconnected one, which has none)
     and its idle minutes; None if the line isn't a whole row. The columns: user, session, id, state, idle
-    time, logon time."""
-    fields = line.lstrip(">").split()
-    if len(fields) >= 2 and fields[1].isdigit():
-        session, rest = None, fields[2:]
-    elif len(fields) >= 3 and fields[2].isdigit():
-        session, rest = fields[1], fields[3:]
+    time, logon time. From the right each is one word, the logon time two or three (AM or PM). Left of the
+    id, a user name may hold spaces (PR #52 fix check 1 F4) and a session name has none:
+    - a row whose id sits in the header's id column (`id_at`) is read by the header's columns: the session
+      starts at `session_at`, and a user name reaching into that column isn't a row;
+    - in any other row the word before the id is the session only if it has a session name's form, so
+      that a name read wrongly can only make a console session, never hide one."""
+    words = [(m.start(), m.group()) for m in re.finditer(r"\S+", line)]
+    logon = 3 if words and words[-1][1].upper() in ("AM", "PM") else 2
+    if len(words) < logon + 4:
+        return None
+    tail = words[-logon - 3:]
+    (id_from, sid), (_, state), (_, idle) = tail[:3]
+    if not sid.isdigit() or not state.isalpha() or not LOGON.fullmatch(" ".join(w for _, w in tail[3:])):
+        return None
+    left = words[:-logon - 3]
+    if abs(id_from - id_at) <= 2:
+        session = left[-1][1] if left and left[-1][0] >= session_at else None
+        user = left[:-1] if session else left
+        if any(at >= session_at for at, _ in user):
+            return None
     else:
+        session = left[-1][1] if len(left) >= 2 and SESSION.fullmatch(left[-1][1]) else None
+        user = left[:-1] if session else left
+    if not user:
         return None
-    if len(rest) < 4 or not rest[0].isalpha() or not LOGON.fullmatch(" ".join(rest[2:])):
-        return None
-    minutes = idle_minutes(rest[1])
+    minutes = idle_minutes(idle)
     return None if minutes is None else (session, minutes)
 
 
@@ -93,9 +112,10 @@ def console_idle(output: str) -> int | None:
     lines = [l for l in output.splitlines() if l.strip()]
     if not lines:
         return None
-    if not lines[0].strip().lower().startswith(HEADERS) or len(lines) < 2:
+    header = [m.start() for m in re.finditer(r"\S+", lines[0])]
+    if not lines[0].strip().lower().startswith(HEADERS) or len(header) < 3 or len(lines) < 2:
         return UNREADABLE
-    sessions = [row(line) for line in lines[1:]]
+    sessions = [row(line, header[1], header[2]) for line in lines[1:]]
     if None in sessions:
         return UNREADABLE
     return next((idle for session, idle in sessions if (session or "").lower() == "console"), None)
