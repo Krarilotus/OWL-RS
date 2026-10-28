@@ -1283,8 +1283,9 @@ impl Snapshot {
     /// matching `pattern` in `model`, as columns in `permutation`'s order: what
     /// [`scan_sorted_in`](Self::scan_sorted_in) yields, decoded a block and a column at a
     /// time instead of a quad at a time. `None` where that can't answer: the matches lie
-    /// in both stacks, or in several runs or a run with deletions, which must be merged
-    /// quad by quad; or the plan needs a post-filter.
+    /// in several runs or a run with deletions, which must be merged quad by quad, or in
+    /// both stacks with columns that can't order them ([`Self::columns_of_stacks`]); or
+    /// the plan needs a post-filter.
     pub fn scan_columns_in(
         &self,
         model: ReadModel,
@@ -1313,7 +1314,9 @@ impl Snapshot {
     /// decoded a block and a column at a time, and merged in `permutation`'s order where
     /// both stacks have matches (they hold no quad twice): asserted and inferred
     /// statements of one pattern, as reasoning gives them. `None` where a stack can't be
-    /// decoded so (several runs, deletions).
+    /// decoded so (several runs, deletions), or where both have matches and the columns
+    /// can't order them: rows compare on the columns alone, so every column the plan lets
+    /// vary must be among them up to the last of them in `permutation`'s order.
     fn columns_of_stacks(
         &self,
         model: ReadModel,
@@ -1321,15 +1324,24 @@ impl Snapshot {
         permutation: Permutation,
         components: &[usize],
     ) -> Option<Vec<Vec<u64>>> {
+        let matching = Stack::ALL
+            .map(|stack| model.includes(stack) && self.data(model).stack(stack).any_plan(plan));
+        let order = permutation.order();
+        let projected = |position: usize| components.contains(&order[position]);
+        let last = (0..4).rev().find(|&position| projected(position));
+        let ordered = last.is_none_or(|last| {
+            (0..last)
+                .all(|position| plan.low[position] == plan.high[position] || projected(position))
+        });
+        if matching.iter().all(|&matches| matches) && !ordered {
+            return None;
+        }
         let mut parts: Vec<Vec<Vec<u64>>> = Vec::new();
-        for stack in Stack::ALL {
-            if !model.includes(stack) {
+        for (stack, matches) in Stack::ALL.into_iter().zip(matching) {
+            if !matches {
                 continue;
             }
             let index = self.data(model).stack(stack);
-            if !index.any_plan(plan) {
-                continue;
-            }
             let mut out = vec![Vec::new(); components.len()];
             if !index.scan_columns(plan, components, &mut out) {
                 return None;
