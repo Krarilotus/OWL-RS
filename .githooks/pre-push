@@ -4,9 +4,11 @@
 # refactor/engine-v2) to the commit. A ref the push only deletes has no tree to gate. Milestones
 # run scripts/check.sh all. Enabling the hooks: CONTRIBUTING.md.
 #
-# Git's lines on stdin: <local ref> <local sha> <remote ref> <remote sha>; $1 is the remote.
+# Git's lines on stdin: <local ref> <local sha> <remote ref> <remote sha>; $1 is the remote, $2 its
+# URL, which a measurement ref's check asks for its branches (NRESE_PUSH_REMOTE).
 cd "$(git rev-parse --show-toplevel)" || exit 2
 remote=${1:-origin}
+url=${2:-$remote}
 code=0 gated=0
 while read -r local_ref local_sha remote_ref remote_sha; do
   [[ $local_sha =~ ^0+$ ]] && continue  # a deletion
@@ -24,7 +26,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # The build-host variables are the gate's own (check.sh, gate-job.sh, remote.sh): from the pusher's
   # environment they would pick the in-job branch, which runs a sent list here, not the fleet gate.
   env -u NRESE_ON_BUILD_HOST -u NRESE_FILES_FROM NRESE_PUSH_COMMIT="$local_sha" NRESE_PUSH_BASE="$base" \
-    NRESE_PUSH_REF="$remote_ref" bash scripts/check.sh push < /dev/null || code=1
+    NRESE_PUSH_REF="$remote_ref" NRESE_PUSH_REMOTE="$url" bash scripts/check.sh push < /dev/null || code=1
 done
 [ $gated -gt 0 ] || echo "pre-push: deletions only, nothing to gate" >&2
 exit $code

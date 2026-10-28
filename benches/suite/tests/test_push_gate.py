@@ -452,6 +452,62 @@ class MeasurementRefs(Repo):
         self.assertNotEqual(done.returncode, 0, f"SPEC measurement ref: a grafted side went\n{done.stderr}")
         self.assertIn("the side must be published", done.stdout + done.stderr)
 
+    def test_a_remote_tracking_ref_made_here_publishes_no_side(self):
+        """Sol, PR #54 fix check 1 S2: the check took any refs/remotes/* ref for the remote's word, and
+        any local process can write one; a side no remote has went with a ref made here. Only the
+        remote's own list of its branches counts."""
+        unpublished = self.add({"a.txt": "only here\n"}, "a side no remote has", self.side)
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "its measurement side", unpublished)
+        self.git(self.repo, "update-ref", "refs/remotes/origin/planted", unpublished)
+        ref = f"refs/measure/old-{unpublished[:8]}"
+        self.declare(unpublished, ref, commit)
+        done = self.pushed(ref, commit)
+        self.assertNotEqual(done.returncode, 0, f"SPEC measurement ref: a side published by a local ref went\n"
+                                                f"{done.stderr}")
+        self.assertIn("the side must be published", done.stdout + done.stderr)
+        self.assertEqual(self.jobs(), [])
+
+    def test_a_remote_that_cant_be_asked_publishes_no_side(self):
+        """The check asks the remote the push goes to; a remote that doesn't answer proves nothing, even
+        for a side its branches have."""
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "its measurement side", self.side)
+        ref = f"refs/measure/old-{self.side[:8]}"
+        self.declare(self.side, ref, commit)
+        self.fleet("pending")
+        gone = (self.root / "gone.git").as_posix()
+        done = subprocess.run([BASH, ".githooks/pre-push", "origin", gone], cwd=self.repo,
+                              input=f"{ref} {commit} {ref} {ZERO}\n".encode(), capture_output=True, env=self.env,
+                              timeout=120)
+        self.assertNotEqual(done.returncode, 0, "SPEC measurement ref: went without the remote's answer")
+        self.assertIn(b"couldn't be asked", done.stdout + done.stderr)
+        self.assertEqual(self.jobs(), [])
+
+    @unittest.skipUnless(shutil.which("setsid"), "a process left behind in its own session (setsid)")
+    def test_a_process_a_remote_leaves_behind_doesnt_hold_the_answer(self):
+        """Sol, S2 r1 D1: git's output was read from pipes, drained without a bound, so a transport
+        helper's process left behind holding stderr (an ssh master, say) kept the check waiting after
+        git had failed. Only git's exit counts: the push is refused at once."""
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "its measurement side", self.side)
+        ref = f"refs/measure/old-{self.side[:8]}"
+        self.declare(self.side, ref, commit)
+        self.fleet("pending")
+        helper, pidfile = self.root / "helper.sh", self.root / "helper.pid"
+        helper.write_text(f"setsid sh -c 'echo $$ > {pidfile.as_posix()}; exec sleep 100' >&2 &\nexit 1\n",
+                          newline="\n")
+        self.git(self.repo, "config", "protocol.ext.allow", "always")
+        try:
+            done = subprocess.run([BASH, ".githooks/pre-push", "origin", f"ext::sh {helper.as_posix()}"],
+                                  cwd=self.repo, input=f"{ref} {commit} {ref} {ZERO}\n".encode(),
+                                  capture_output=True, env=self.env, timeout=45)
+        finally:
+            if pidfile.exists():
+                try:
+                    os.kill(int(pidfile.read_text()), 9)
+                except (ValueError, ProcessLookupError):
+                    pass
+        self.assertNotEqual(done.returncode, 0, "SPEC measurement ref: went without the remote's answer")
+        self.assertIn(b"couldn't be asked", done.stdout + done.stderr)
+
 
 @unittest.skipUnless(shutil.which("flock"), "the gate job runs on Linux fleet hosts (flock)")
 class GateJob(Repo):
