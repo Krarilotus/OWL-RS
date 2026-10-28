@@ -1364,15 +1364,25 @@ def measurement_sides(path: Path = MEASUREMENT_SIDES) -> dict[str, str]:
 def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str:
     """The commit a side is built and timed from: its revision, or its measurement commit. That
     commit's only parent is the revision, and it changes nothing outside the perf lab's sources:
-    the engine, its lockfile and its toolchain are the side's. Anything else is refused."""
+    the engine, its lockfile and its toolchain are the side's. Anything else is refused, and so is
+    a checkout that replaces objects."""
     import subprocess
 
     def git(*args: str) -> str:
-        done = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, timeout=60)
+        # Bytes git doesn't promise as UTF-8 (a commit message in another encoding, a path) stay
+        # readable (Sol, PR #54 R1 fix review r3 D4).
+        done = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, encoding="utf-8",
+                              errors="surrogateescape", timeout=60)
         if done.returncode != 0:
             raise SystemExit(f"git {' '.join(args)}: {done.stderr.strip()}")
         return done.stdout
     rev = git("rev-parse", "--verify", f"{rev}^{{commit}}").strip()
+    # A replace ref stands other objects in for the stored ones, in this check or in the checkout a
+    # build compiles: neither would be the commit checked (Sol, PR #54 R1 fix review D1, D2).
+    replaced = git("replace", "-l").split()
+    if replaced:
+        raise SystemExit(f"this checkout replaces objects ({', '.join(r[:12] for r in replaced)}): a side is built "
+                         "only from its objects as stored")
     sides = measurement_sides() if sides is None else sides
     # A measurement commit is built only as its side's, under one name (its build is the side's).
     of = [side for side, commit in sides.items() if commit == rev]
@@ -1382,15 +1392,20 @@ def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str
     if commit is None:
         return rev
     try:
-        parents = git("rev-list", "--parents", "-n", "1", f"{commit}^{{commit}}").split()[1:]
+        # The parents its object names: a graft or a shallow boundary changes what a walk reports
+        # (Sol, PR #54 R1 fix review D3).
+        header = git("cat-file", "commit", f"{commit}^{{commit}}").split("\n\n", 1)[0]
+        parents = [line.split()[1] for line in header.splitlines() if line.startswith("parent ")]
     except SystemExit as e:
         raise SystemExit(f"the measurement commit {commit[:12]} of {rev[:12]} isn't in this checkout ({e}): "
                          "a job that builds it takes it as an input (measurement_inputs)") from None
     if parents != [rev]:
         raise SystemExit(f"the measurement commit {commit[:12]} isn't a commit on {rev[:12]} alone: its parents "
                          f"are {', '.join(p[:12] for p in parents) or 'none'}")
-    outside = [p for p in git("diff", "--no-renames", "--name-only", rev, commit).splitlines()
-               if not p.startswith(PERF_LAB)]
+    # Every path the two trees differ in, by plumbing: no diff configuration of the user's may
+    # hide one (Sol, PR #54 r1 R1: diff.ignoreSubmodules=all dropped an added gitlink).
+    changed = git("diff-tree", "-r", "-z", "--no-renames", "--ignore-submodules=none", "--name-only", rev, commit)
+    outside = [p for p in changed.split("\0") if p and not p.startswith(PERF_LAB)]
     if outside:
         raise SystemExit(f"the measurement commit {commit[:12]} of {rev[:12]} changes more than its perf lab "
                          f"({PERF_LAB}): {', '.join(outside)}")

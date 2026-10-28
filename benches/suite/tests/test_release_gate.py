@@ -1162,6 +1162,65 @@ class MeasurementSides(unittest.TestCase):
         self.assertEqual(wrong, [], "SPEC measurement side: its only parent is the side, and it changes "
                                     "nothing outside the perf lab's sources")
 
+    def test_a_change_outside_the_perf_lab_is_seen_whatever_the_diff_configuration(self):
+        """Sol, PR #54 r1 R1: under a user's diff.ignoreSubmodules=all, `git diff` left a gitlink
+        added outside the perf lab out of its paths, and the commit was built for the side."""
+        self.git("config", "diff.ignoreSubmodules", "all")
+        self.git("checkout", "-q", "--detach", self.side)
+        self.git("update-index", "--add", "--cacheinfo", f"160000,{self.side},outside-submodule")
+        self.git("-c", "user.name=t", "-c", "user.email=t@example.org", "commit", "-q", "-m", "a gitlink outside")
+        gitlink = self.git("rev-parse", "HEAD")
+        with self.assertRaisesRegex(SystemExit, "changes more than its perf lab .*outside-submodule"):
+            gate_module.measured_at(self.repo, self.side, {self.side: gitlink})
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        self.assertEqual(gate_module.measured_at(self.repo, self.side, {self.side: loop}), loop,
+                         "SPEC measurement side: its perf lab alone is still built for it")
+
+    def test_a_checkout_that_replaces_objects_builds_no_side(self):
+        """Sol, PR #54 R1 fix review D1 and D2: a replace ref stands other objects in for the
+        stored ones. Standing the side's tree in for an engine change hid the change from the
+        check (D1); read as stored, a valid measurement commit's tree passed the check while the
+        checkout compiled the tree standing in for it, another engine (D2)."""
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        engine = self.commit({self.ENGINE: "pub fn engine() { faster() }\n"}, "the engine", self.side)
+        tree = lambda commit: self.git("rev-parse", f"{commit}^{{tree}}")
+        for name, commit, replaced, by in (("an engine change hidden", engine, engine, self.side),
+                                           ("another engine compiled", loop, loop, engine)):
+            with self.subTest(name):
+                self.git("replace", tree(replaced), tree(by))
+                with self.assertRaisesRegex(SystemExit, "replaces objects"):
+                    gate_module.measured_at(self.repo, self.side, {self.side: commit})
+                self.git("replace", "-d", tree(replaced))
+        self.assertEqual(gate_module.measured_at(self.repo, self.side, {self.side: loop}), loop)
+
+    def test_a_message_in_another_encoding_is_no_error(self):
+        """Sol, PR #54 R1 fix review r3 D4: the commit object was decoded in the locale's encoding, so
+        a measurement commit whose message is ISO-8859-1 stopped the check with UnicodeDecodeError."""
+        message = Path(tempfile.mkdtemp(prefix="measurement-message-"), "message")
+        self.addCleanup(shutil.rmtree, message.parent, True)
+        message.write_bytes(b"its perf lab, caf\xe9\n")
+        self.git("checkout", "-q", "--detach", self.side)
+        Path(self.repo, self.PERF_LAB).write_text("fn main() { arm(); }\n", encoding="utf-8")
+        self.git("add", self.PERF_LAB)
+        self.git("-c", "user.name=t", "-c", "user.email=t@example.org", "-c", "i18n.commitEncoding=ISO-8859-1",
+                 "commit", "-q", "-F", str(message))
+        commit = self.git("rev-parse", "HEAD")
+        self.assertEqual(gate_module.measured_at(self.repo, self.side, {self.side: commit}), commit)
+
+    def test_a_graft_or_a_shallow_boundary_moves_no_parent(self):
+        """Sol, PR #54 R1 fix review D3: the parent query walked history, so a graft or a shallow
+        boundary refused a valid measurement commit; its parent is the one its object names."""
+        commit = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        git_dir = Path(self.git("rev-parse", "--absolute-git-dir"))
+        for name, text in (("info/grafts", f"{commit} {self.later}\n"), ("shallow", f"{commit}\n")):
+            with self.subTest(name):
+                (git_dir / name).parent.mkdir(exist_ok=True)
+                (git_dir / name).write_text(text, encoding="utf-8")
+                try:
+                    self.assertEqual(gate_module.measured_at(self.repo, self.side, {self.side: commit}), commit)
+                finally:
+                    (git_dir / name).unlink()
+
     def test_a_side_without_a_measurement_commit_is_built_from_itself(self):
         self.assertEqual(gate_module.measured_at(self.repo, self.later, {}), self.later)
 
