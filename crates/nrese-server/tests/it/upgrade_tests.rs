@@ -22,6 +22,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use nrese_reasoner::rulesets::Ruleset;
+use nrese_reasoner::{RuleProgram, UserRules};
 
 const TOKEN: &str = "fixture-admin";
 
@@ -317,20 +318,33 @@ async fn a_store_written_by_main_opens_with_its_data_answers_and_settings()
         .await?;
     assert!(login.status().is_success(), "{}", login.status());
 
-    // Each inferred stack is current under this build's rules: kept where the rules are
-    // unchanged (owl2-rl, rdfs, the N3 rules), rebuilt where they changed (owl2-ql,
-    // owl-horst).
+    // Each inferred stack is current under this build's rules: kept where neither the rules
+    // nor the base semantics version changed since main, rebuilt where one did (this build's
+    // version 3 isn't main's 2, so here every one is).
     for (id, before) in &main_markers {
         let after = marker(&data.join("repositories").join(id));
         assert_eq!(after["ruleset"], before["ruleset"], "{id}");
-        match Ruleset::from_name(&after["ruleset"]) {
-            Some(ruleset) => assert_eq!(
-                after["fingerprint"],
-                format!("{:016x}", ruleset.fingerprint()),
-                "{id}: not current"
-            ),
-            None => assert_eq!(after["fingerprint"], before["fingerprint"], "{id}"),
-        }
+        let program = match Ruleset::from_name(&after["ruleset"]) {
+            Some(ruleset) => RuleProgram::builtin(ruleset),
+            // User rules: the program this build makes of the repository's rules.
+            None => {
+                let repository: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(
+                        fixture().join(format!("expected/repositories_{id}.json")),
+                    )?)?;
+                let rules = &repository["settings"]["rules"];
+                assert_eq!(rules["format"], "n3", "{id}");
+                let text = |key: &str| rules[key].as_str().expect("rules text").to_owned();
+                let user = UserRules::n3(text("name"), text("text"))?;
+                let base = Ruleset::from_name(repository["reasoning"].as_str().expect("mode"));
+                RuleProgram::new(base, Some(std::sync::Arc::new(user))).expect("a program")
+            }
+        };
+        assert_eq!(
+            after["fingerprint"],
+            format!("{:016x}", program.fingerprint()),
+            "{id}: not current"
+        );
     }
     let default = marker(&data);
     assert_eq!(
