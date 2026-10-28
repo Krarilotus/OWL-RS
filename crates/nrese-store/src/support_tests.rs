@@ -141,3 +141,187 @@ fn an_updates_read_source_stops_with_its_cancellation() {
     );
     assert_eq!(store.support_statistics(), before, "the view was made");
 }
+
+/// A seeded generator (splitmix64), for the property tests.
+struct Seeded(u64);
+
+impl Seeded {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        (z ^ (z >> 31)) % n
+    }
+}
+
+/// The spec of a pending read (D5; what `Reading::pending` gathered before it was delta-sized):
+/// the pending snapshot, its inferred statements those of the reader's view of the base the
+/// changes leave: a base-inferred one while the transaction still holds it as inferred, one the
+/// view adds while no change asserts it where the reader reads it. Every statement scanned.
+fn gathered(reading: &Reading, tx: &Transaction<'_>) -> Snapshot {
+    if tx.pending() == (0, 0) && tx.inferred_pending() == (0, 0) {
+        return reading.committed(tx.base()).unwrap();
+    }
+    if !reading.through_view(tx.base()) {
+        return tx.pending_snapshot();
+    }
+    let view = reading.committed(tx.base()).unwrap();
+    let mut kept: Vec<EncodedQuad> = view
+        .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+        .filter(
+            |quad| match tx.base().contains_in(ReadModel::Inferred, quad) {
+                true => tx.contains_in(ReadModel::Inferred, quad),
+                false => asserted(tx, &reading.access, triple(*quad)) != Asserted::InReach,
+            },
+        )
+        .collect();
+    kept.sort_unstable();
+    tx.pending_snapshot()
+        .with_inferred_only(&kept, &Arc::new(Budget::unlimited()))
+        .unwrap()
+}
+
+/// A snapshot's asserted and inferred statements, sorted, each list checked against the count
+/// the snapshot keeps of it.
+fn statements(snapshot: &Snapshot) -> [Vec<EncodedQuad>; 2] {
+    [ReadModel::Asserted, ReadModel::Inferred].map(|model| {
+        let mut quads: Vec<EncodedQuad> = snapshot
+            .quads_for_pattern_in(model, &QuadPattern::all())
+            .collect();
+        quads.sort_unstable();
+        assert_eq!(
+            snapshot.len_in(model),
+            quads.len() as u64,
+            "{model:?}: the count kept"
+        );
+        quads
+    })
+}
+
+/// Spec (D5, review r1 of PR #50): a pending read costs its delta, and reads exactly what the
+/// gathering read (`gathered`), by support and seeing every inference. Seeded stores of 10 to 90
+/// subjects typed in a class chain (`C0 ⊑ … ⊑ C4`, in the default graph) across five graphs,
+/// some memberships also asserted in a graph the reader can't read (its own graphs derive them:
+/// the view adds them). Each store gets three rounds of changes, checked after each (a request's
+/// later operations): inserts and deletes of memberships in every graph and the default graph,
+/// among them base-inferred statements asserted now, view-added ones asserted where the reader
+/// reads, and deletions; each kind must occur.
+#[test]
+fn a_pending_read_is_the_gathered_one() {
+    use nrese_rdf::{GraphName, NamedNode, Quad};
+    let iri = |local: String| NamedNode::new_unchecked(format!("urn:t:{local}"));
+    let graph = |g: u64| match g {
+        0 => GraphName::DefaultGraph,
+        g => GraphName::NamedNode(iri(format!("g{g}"))),
+    };
+    let member = |s: u64, c: u64, g: u64| {
+        Quad::new(
+            iri(format!("s{s}")),
+            NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            iri(format!("C{c}")),
+            graph(g),
+        )
+    };
+    let [mut base_inferred, mut view_added, mut deleted] = [0_usize; 3];
+    for seed in 0..48_u64 {
+        let mut rng = Seeded(seed);
+        let subjects = 10 + 10 * (seed % 9);
+        // Graphs 1 to 5; the reader reads 1, 2 and the default graph.
+        let mut data: Vec<Quad> = Vec::new();
+        for s in 0..subjects {
+            for _ in 0..1 + rng.below(3) {
+                data.push(member(s, rng.below(3), 1 + rng.below(5)));
+            }
+            if rng.below(3) == 0 {
+                // Asserted out of reach: the view adds it where the reader's graphs derive it.
+                data.push(member(s, 3 + rng.below(2), 3 + rng.below(3)));
+            }
+        }
+        let schema: String = (0..4)
+            .map(|c| {
+                format!(
+                    "<urn:t:C{c}> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:t:C{}> . ",
+                    c + 1
+                )
+            })
+            .collect();
+        let quads: String = data
+            .iter()
+            .map(|q| {
+                let triple = format!("{} {} {}", q.subject, q.predicate, q.object);
+                match &q.graph_name {
+                    GraphName::DefaultGraph => format!("{triple} . "),
+                    named => format!("GRAPH {named} {{ {triple} }} "),
+                }
+            })
+            .collect();
+        let store = crate::StoreService::new(crate::StoreConfig::in_memory()).unwrap();
+        let reasoner =
+            nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default());
+        crate::MutationPipeline::new(Arc::new(store.clone()), Arc::new(reasoner))
+            .execute_update(&crate::SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ {schema} {quads} }}"
+            )))
+            .unwrap();
+        store
+            .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
+            .unwrap();
+        store.use_reasoning_rules(Some(nrese_reasoner::rulesets::Ruleset::Owl2Rl.into()));
+        let access = Arc::new(GraphAccess {
+            graphs: vec!["urn:t:g1".to_owned(), "urn:t:g2".to_owned()],
+            default_graph: true,
+            inferred: true,
+            inferred_by_support: seed % 2 == 0,
+            ..GraphAccess::default()
+        });
+        let reading = Reading::of(
+            store.supports(),
+            store.support_compilation(),
+            Some(&access),
+            &store.envelope(None),
+            None,
+        )
+        .unwrap();
+        let mut tx = store.engine().speculative();
+        let view = reading.committed(tx.base()).unwrap();
+        for round in 0..3 {
+            for _ in 0..1 + rng.below(2 + 4 * (seed % 5)) {
+                if rng.below(4) == 0 && !data.is_empty() {
+                    let gone = data.swap_remove(rng.below(data.len() as u64) as usize);
+                    deleted += usize::from(tx.remove(gone.as_ref()));
+                    continue;
+                }
+                let quad = member(rng.below(subjects), rng.below(5), rng.below(6));
+                if let Some(fact) = (|| {
+                    let id = |term| tx.lookup(term);
+                    Some(EncodedQuad::new(
+                        id(quad.subject.as_ref().into())?,
+                        id(quad.predicate.as_ref().into())?,
+                        id(quad.object.as_ref())?,
+                        TermId::DEFAULT_GRAPH,
+                    ))
+                })() {
+                    let in_view = view.contains_in(ReadModel::Inferred, &fact);
+                    let of_base = tx.base().contains_in(ReadModel::Inferred, &fact);
+                    let readable = access.allows_graph(&quad.graph_name);
+                    base_inferred +=
+                        usize::from(in_view && of_base && quad.graph_name.is_default_graph());
+                    view_added += usize::from(in_view && !of_base && readable);
+                }
+                tx.insert(quad.as_ref());
+                data.push(quad);
+            }
+            assert_eq!(
+                statements(&reading.pending(&tx).unwrap()),
+                statements(&gathered(&reading, &tx)),
+                "seed {seed}, round {round}"
+            );
+        }
+    }
+    assert!(
+        base_inferred > 0 && view_added > 0 && deleted > 0,
+        "the kinds of change covered: base-inferred asserted {base_inferred}, view-added \
+         asserted in reach {view_added}, deletions {deleted}"
+    );
+}
