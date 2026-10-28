@@ -514,7 +514,8 @@ fn restricted_rewrites_tell_nothing_of_hidden_statistics() {
 /// without a row doesn't compile (Sol's review of R13: r1 B-F2, an EXPLAIN's; r2 S1, a run's;
 /// r3 S1, an update's WHERE; review of PR #39: F2, a run with operations pending, F1, the
 /// Graph Store's and RDF4J's reads; review of PR #45, I30: EXPLAIN without running, and each
-/// row's kind and limit).
+/// row's kind and limit; review of PR #50, F1: an update's WHERE reads a supported reader's
+/// view, refused while it is made).
 #[test]
 fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
     use nrese_reasoner::rulesets::Ruleset;
@@ -562,15 +563,26 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
         let prepared = prepare(pipeline, scope);
         pipeline.store().plan_query(&prepared, &token()).map(|_| ())
     };
+    // A reader of what its graphs support asks for a statement they derive: its WHERE reads
+    // its view of them, which the secret graph sizes (review r1 of PR #50, F1). Another copies
+    // what it scans.
     let update_where = |pipeline: &MutationPipeline, scope: &ReadScope| {
-        let requester = match scope {
-            ReadScope::All => Requester::all(),
-            ReadScope::Graphs(_) => public_writer(),
+        let scan = "INSERT { GRAPH <urn:g:public> { ?s <urn:copy> ?o } }
+                    WHERE { GRAPH ?g { ?s <urn:p> ?o } }";
+        let derived = "INSERT { GRAPH <urn:g:public> { <urn:visible> <urn:marked> true } }
+                       WHERE { <urn:visible> <urn:q> <urn:o> }";
+        let (requester, update) = match scope {
+            ReadScope::All => (Requester::all(), scan),
+            ReadScope::Graphs(access) => (
+                Requester::new(scope.clone(), public_writer().write),
+                if access.inferred_by_support {
+                    derived
+                } else {
+                    scan
+                },
+            ),
         };
-        let update = SparqlUpdateRequest::new(
-            "INSERT { GRAPH <urn:g:public> { ?s <urn:copy> ?o } }
-             WHERE { GRAPH ?g { ?s <urn:p> ?o } }",
-        );
+        let update = SparqlUpdateRequest::new(update);
         let ticket = nrese_store::MutationTicket::new();
         match pipeline.apply(MutationCommand::Update(update), &requester, &ticket) {
             Ok(_) => Ok(()),
@@ -692,7 +704,8 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
     let server_memory = Some((true, 64 << 10));
     // What the secret graph sizes in a row: the scan of a reader of the public graphs, or the
     // view of one that sees the inferred statements they support (`inferred = "supported"`),
-    // which a reader of every graph doesn't make.
+    // which a reader of every graph doesn't make. An update's WHERE has both.
+    #[derive(Debug)]
     enum By {
         Scan,
         View,
@@ -700,46 +713,52 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
     type Entry<'a> = &'a dyn Fn(&MutationPipeline, &ReadScope) -> StoreResult<()>;
     let mut told = Vec::new();
     for &entry in EntryPoint::ALL {
-        let (by, read): (By, Entry<'_>) = match entry {
-            EntryPoint::Run => (By::Scan, &run),
-            EntryPoint::RunPending => (By::Scan, &pending_run),
-            EntryPoint::Explain => (By::Scan, &explain),
-            EntryPoint::Plan => (By::View, &plan),
-            EntryPoint::UpdateWhere => (By::Scan, &update_where),
-            EntryPoint::GraphRead => (By::View, &graph_read),
-            EntryPoint::GraphExists => (By::View, &graph_exists),
-            EntryPoint::Statements => (By::View, &statements),
-            EntryPoint::Size => (By::View, &size),
-            EntryPoint::ExplainStatement => (By::View, &explain_statement),
-            EntryPoint::JustifyStatement => (By::View, &justify_statement),
+        let (bys, read): (&[By], Entry<'_>) = match entry {
+            EntryPoint::Run => (&[By::Scan], &run),
+            EntryPoint::RunPending => (&[By::Scan], &pending_run),
+            EntryPoint::Explain => (&[By::Scan], &explain),
+            EntryPoint::Plan => (&[By::View], &plan),
+            EntryPoint::UpdateWhere => (&[By::Scan, By::View], &update_where),
+            EntryPoint::GraphRead => (&[By::View], &graph_read),
+            EntryPoint::GraphExists => (&[By::View], &graph_exists),
+            EntryPoint::Statements => (&[By::View], &statements),
+            EntryPoint::Size => (&[By::View], &size),
+            EntryPoint::ExplainStatement => (&[By::View], &explain_statement),
+            EntryPoint::JustifyStatement => (&[By::View], &justify_statement),
         };
-        let (stores, restricted) = match by {
-            By::Scan => (&scans, public()),
-            By::View => (&views, supported.clone()),
-        };
-        let refused = |scope: &ReadScope| {
-            stores
-                .each_ref()
-                .map(|pipeline| match read(pipeline, scope) {
-                    Err(error) => {
-                        assert_eq!(kind_and_limit(&error), server_memory, "{entry:?}: {error}");
-                        error
-                    }
-                    Ok(()) => panic!("{entry:?}: not refused"),
-                })
-        };
-        // Told alike in every field, the bytes held and asked for included.
-        let [small, large] = refused(&restricted);
-        if format!("{small:?}") != format!("{large:?}") {
-            told.push(format!("{entry:?}: {small:?} against {large:?}"));
-        }
-        if matches!(by, By::Scan) {
-            let [small, large] = refused(&ReadScope::All);
-            assert_ne!(
-                small.to_string(),
-                large.to_string(),
-                "{entry:?}: every graph"
-            );
+        for by in bys {
+            let (stores, restricted) = match by {
+                By::Scan => (&scans, public()),
+                By::View => (&views, supported.clone()),
+            };
+            let refused = |scope: &ReadScope| {
+                stores
+                    .each_ref()
+                    .map(|pipeline| match read(pipeline, scope) {
+                        Err(error) => {
+                            assert_eq!(
+                                kind_and_limit(&error),
+                                server_memory,
+                                "{entry:?} by {by:?}: {error}"
+                            );
+                            error
+                        }
+                        Ok(()) => panic!("{entry:?} by {by:?}: not refused"),
+                    })
+            };
+            // Told alike in every field, the bytes held and asked for included.
+            let [small, large] = refused(&restricted);
+            if format!("{small:?}") != format!("{large:?}") {
+                told.push(format!("{entry:?} by {by:?}: {small:?} against {large:?}"));
+            }
+            if matches!(by, By::Scan) {
+                let [small, large] = refused(&ReadScope::All);
+                assert_ne!(
+                    small.to_string(),
+                    large.to_string(),
+                    "{entry:?}: every graph"
+                );
+            }
         }
     }
     assert!(told.is_empty(), "told the hidden sizes: {told:#?}");

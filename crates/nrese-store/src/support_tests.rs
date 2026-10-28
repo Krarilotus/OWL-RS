@@ -100,3 +100,44 @@ fn a_rule_change_during_a_read_leaves_it_its_rules_and_keeps_nothing_of_it() {
         "kept for the rules now in place"
     );
 }
+
+/// Spec: an update's `WHERE` reads what its requester's queries read ([`Reading`], review r1 of
+/// PR #50, F1), under the update's cancellation (the orchestrator's case 3 of F1). Its read
+/// source, cancelled while it makes the requester's view, fails as cancelled and keeps
+/// nothing; a requester of every graph reads the data as stored, and has none.
+#[test]
+fn an_updates_read_source_stops_with_its_cancellation() {
+    let store = past_the_cap();
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    let context = store.update_context(&cancelled);
+    let reader = crate::Requester::new(
+        crate::ReadScope::Graphs(Arc::new(GraphAccess {
+            graphs: vec![format!("{EX}g16")],
+            default_graph: true,
+            inferred: true,
+            inferred_by_support: true,
+            ..GraphAccess::default()
+        })),
+        crate::WriteScope::All,
+    );
+    assert!(
+        context
+            .update_options(&crate::Requester::all(), None)
+            .read
+            .is_none()
+    );
+    let read = context
+        .update_options(&reader, None)
+        .read
+        .expect("a reader by support reads its view");
+    let before = store.support_statistics();
+    let tx = store.engine().speculative();
+    let state = nrese_sparql::ReadSource::state(&*read, &tx);
+    assert!(
+        matches!(state, Err(nrese_sparql::QueryEvaluationError::Cancelled)),
+        "{:?}",
+        state.map(|_| ())
+    );
+    assert_eq!(store.support_statistics(), before, "the view was made");
+}

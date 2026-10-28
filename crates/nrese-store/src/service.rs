@@ -432,7 +432,7 @@ impl StoreService {
     }
 
     /// What this store's updates are evaluated with.
-    fn update_context<'a>(
+    pub(crate) fn update_context<'a>(
         &'a self,
         cancellation: &'a CancellationToken,
     ) -> crate::mutation::command::UpdateContext<'a> {
@@ -443,6 +443,8 @@ impl StoreService {
             geosparql_stated_only: self.config.geosparql_stated_only,
             services: self.services(),
             namespaces: self.namespaces.all(),
+            supports: std::sync::Arc::clone(&self.supports),
+            compilation: self.support_compilation(),
         }
     }
 
@@ -471,13 +473,12 @@ impl StoreService {
         &self,
         access: Option<&std::sync::Arc<nrese_sparql::GraphAccess>>,
     ) -> StoreResult<nrese_engine::Snapshot> {
-        let snapshot = self.engine.snapshot();
-        match access {
-            Some(access) if needs_view(&snapshot, access) => {
-                self.view_of(&snapshot, Some(access), &self.settings.envelope(None), None)
-            }
-            _ => Ok(snapshot),
-        }
+        self.view_of(
+            &self.engine.snapshot(),
+            access,
+            &self.settings.envelope(None),
+            None,
+        )
     }
 
     /// [`Self::read_snapshot`] for a request, its view's working memory charged to the
@@ -506,9 +507,10 @@ impl StoreService {
         )
     }
 
-    /// [`Self::read_snapshot_within`] of `snapshot`, a committed revision. The
-    /// unrestricted path (every graph, or no inferences, or every inference over every
-    /// named graph) is the snapshot itself: no support state is read.
+    /// [`Self::read_snapshot_within`] of `snapshot`, a committed revision
+    /// ([`crate::support::Reading::committed`]). The unrestricted path (every graph, or no
+    /// inferences, or every inference over every named graph) is the snapshot itself: no
+    /// support state is read.
     fn view_of(
         &self,
         snapshot: &nrese_engine::Snapshot,
@@ -516,19 +518,29 @@ impl StoreService {
         memory: &nrese_exec::Envelope,
         cancellation: Option<&CancellationToken>,
     ) -> StoreResult<nrese_engine::Snapshot> {
-        match access {
-            Some(access) if needs_view(snapshot, access) => Ok(self.supports.view(
-                snapshot,
-                access,
-                self.support_compilation(),
-                memory,
-                cancellation,
-            )?),
-            _ => Ok(snapshot.clone()),
+        match self.reading(access, memory, cancellation) {
+            Some(reading) => Ok(reading.committed(snapshot)?),
+            None => Ok(snapshot.clone()),
         }
     }
 
-    fn support_compilation(&self) -> crate::support::Compilation {
+    /// What a read by a reader with `access` sees ([`crate::support::Reading::of`]).
+    fn reading(
+        &self,
+        access: Option<&std::sync::Arc<nrese_sparql::GraphAccess>>,
+        memory: &nrese_exec::Envelope,
+        cancellation: Option<&CancellationToken>,
+    ) -> Option<crate::support::Reading> {
+        crate::support::Reading::of(
+            &self.supports,
+            self.support_compilation(),
+            access,
+            memory,
+            cancellation,
+        )
+    }
+
+    pub(crate) fn support_compilation(&self) -> crate::support::Compilation {
         crate::support::Compilation {
             hide_unnamed_classes: self.config.hide_unnamed_classes,
             by_representatives: self.config.equality_by_representatives,
@@ -551,7 +563,7 @@ impl StoreService {
 
     /// Inferred statements under graph access ([`crate::support`]): the mutation pipeline
     /// reports its commits to it.
-    pub(crate) fn supports(&self) -> &crate::support::Supports {
+    pub(crate) fn supports(&self) -> &std::sync::Arc<crate::support::Supports> {
         &self.supports
     }
 
@@ -1148,57 +1160,9 @@ impl StoreService {
         crate::statements::apply_statements(&mut tx, pending, &requester, &mut |tx, request| {
             crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
         })?;
-        let view = match scope.access() {
-            Some(access) if needs_view(tx.base(), access) => {
-                // The operations aren't reasoned over: the base's inferred statements, as
-                // far as the reader sees them and the operations left them, kept (charged)
-                // as the support views are; the list they are gathered in is the read's
-                // work, charged to its envelope. A statement the view adds (asserted only in
-                // graphs the reader can't read, and derived) stays unless the operations
-                // assert it where the reader reads it.
-                let base = self.view_of(tx.base(), Some(access), memory, Some(cancellation))?;
-                let left = |quad: &nrese_engine::EncodedQuad| match tx
-                    .base()
-                    .contains_in(ReadModel::Inferred, quad)
-                {
-                    true => view_has(&tx, quad),
-                    false => !tx
-                        .quads_for_pattern_in(
-                            ReadModel::Asserted,
-                            &nrese_engine::QuadPattern {
-                                subject: Some(quad.subject),
-                                predicate: Some(quad.predicate),
-                                object: Some(quad.object),
-                                graph: nrese_engine::GraphSelector::Any,
-                            },
-                        )
-                        .any(|asserted| access.allows_id(&tx, asserted.graph)),
-                };
-                // The query's cancellation stops the gathering as it stops the base's view
-                // (a view made before isn't computed again): nothing more is read or kept.
-                cancellation.check()?;
-                let working = std::sync::Arc::new(memory.part());
-                let len = usize::try_from(base.len_in(ReadModel::Inferred)).unwrap_or(usize::MAX);
-                let mut kept: nrese_exec::ChargedVec<nrese_engine::EncodedQuad> =
-                    nrese_exec::ChargedVec::with_capacity(std::sync::Arc::clone(&working), len)?;
-                let mut scanning = nrese_exec::Reservation::new(std::sync::Arc::clone(&working));
-                scanning.charge(base.scan_bytes(ReadModel::Inferred))?;
-                kept.extend_bounded(
-                    len,
-                    base.quads_for_pattern_in(
-                        ReadModel::Inferred,
-                        &nrese_engine::QuadPattern::all(),
-                    )
-                    .take_while(|_| !cancellation.is_cancelled())
-                    .filter(|quad| left(quad)),
-                )?;
-                drop(scanning);
-                cancellation.check()?;
-                kept.sort_unstable();
-                tx.pending_snapshot()
-                    .with_inferred_only(&kept, self.supports.kept())?
-            }
-            _ => tx.pending_snapshot(),
+        let view = match self.reading(scope.access(), memory, Some(cancellation)) {
+            Some(reading) => reading.pending(&tx)?,
+            None => tx.pending_snapshot(),
         };
         self.sessions.keep_view(
             tx.base().clone(),
@@ -1628,7 +1592,10 @@ impl StoreService {
                 &program, &snapshot, fact, None,
             ));
         };
-        let readable = |fact: [u64; 3]| readable_asserted(&snapshot, access, fact);
+        let readable = |fact: [u64; 3]| {
+            crate::support::asserted(&snapshot, access.as_ref(), fact)
+                == crate::support::Asserted::InReach
+        };
         let Some(steps) =
             crate::reasoning::explain_fact(&program, &snapshot, fact, Some(&readable))
         else {
@@ -1675,7 +1642,10 @@ impl StoreService {
                 &program, &snapshot, fact, mode, None,
             ));
         };
-        let readable = |fact: [u64; 3]| readable_asserted(&snapshot, access, fact);
+        let readable = |fact: [u64; 3]| {
+            crate::support::asserted(&snapshot, access.as_ref(), fact)
+                == crate::support::Asserted::InReach
+        };
         let visible = readable(fact) || self.inferred_visible(&snapshot, access, fact)?;
         if !visible {
             return Ok(None);
@@ -1726,15 +1696,15 @@ impl StoreService {
         access: &std::sync::Arc<nrese_sparql::GraphAccess>,
         fact: [u64; 3],
     ) -> StoreResult<bool> {
-        if by_support(access) {
-            let [s, p, o] = fact.map(nrese_engine::TermId::from_raw);
-            let view = self.view_of(snapshot, Some(access), &self.settings.envelope(None), None)?;
-            Ok(view.contains_in(
-                ReadModel::Inferred,
-                &nrese_engine::EncodedQuad::new(s, p, o, nrese_engine::TermId::DEFAULT_GRAPH),
-            ))
-        } else {
-            Ok(access.inferred)
+        match self.reading(Some(access), &self.settings.envelope(None), None) {
+            Some(reading) if access.inferred_by_support => {
+                let [s, p, o] = fact.map(nrese_engine::TermId::from_raw);
+                Ok(reading.committed(snapshot)?.contains_in(
+                    ReadModel::Inferred,
+                    &nrese_engine::EncodedQuad::new(s, p, o, nrese_engine::TermId::DEFAULT_GRAPH),
+                ))
+            }
+            _ => Ok(access.inferred),
         }
     }
 
@@ -1881,74 +1851,12 @@ impl StoreService {
     }
 }
 
-/// Whether a reader with `access` sees the inferred statements by their support graph
-/// sets ([`crate::support`]).
-fn by_support(access: &nrese_sparql::GraphAccess) -> bool {
-    access.inferred && access.inferred_by_support
-}
-
-/// Whether a reader with `access` reads `snapshot` through a view of its own
-/// ([`crate::support`]): by support, or seeing every inference while some named graph is
-/// out of its reach (a fact asserted only there, and derived, is shown to it as inferred).
-fn needs_view(snapshot: &nrese_engine::Snapshot, access: &nrese_sparql::GraphAccess) -> bool {
-    by_support(access)
-        || (access.inferred
-            && snapshot
-                .named_graphs()
-                .any(|graph| !access.allows_id(snapshot, graph)))
-}
-
-/// Whether the pending state of `tx` holds the inferred `quad`.
-fn view_has(tx: &nrese_engine::Transaction<'_>, quad: &nrese_engine::EncodedQuad) -> bool {
-    tx.contains_in(ReadModel::Inferred, quad)
-}
-
 /// The read model of RDF4J's `infer` parameter.
 fn read_model(infer: bool) -> crate::ReadModel {
     match infer {
         true => crate::ReadModel::Materialised,
         false => crate::ReadModel::Asserted,
     }
-}
-
-/// Whether `fact` is asserted in a graph `access` may read.
-fn readable_asserted(
-    snapshot: &nrese_engine::Snapshot,
-    access: &nrese_sparql::GraphAccess,
-    fact: [u64; 3],
-) -> bool {
-    let quads = snapshot.quads_for_pattern_in(nrese_engine::ReadModel::Asserted, &any_graph(fact));
-    in_readable_graph(quads, &|id| snapshot.decode(id), access)
-}
-
-/// The pattern of `fact` in any graph.
-pub(crate) fn any_graph([s, p, o]: [u64; 3]) -> nrese_engine::QuadPattern {
-    let id = nrese_engine::TermId::from_raw;
-    nrese_engine::QuadPattern {
-        subject: Some(id(s)),
-        predicate: Some(id(p)),
-        object: Some(id(o)),
-        graph: nrese_engine::GraphSelector::Any,
-    }
-}
-
-/// Whether one of `quads` is in a graph `access` may read (`decode` names the graphs).
-pub(crate) fn in_readable_graph(
-    quads: impl IntoIterator<Item = nrese_engine::EncodedQuad>,
-    decode: &dyn Fn(nrese_engine::TermId) -> Option<nrese_rdf::Term>,
-    access: &nrese_sparql::GraphAccess,
-) -> bool {
-    quads.into_iter().any(|quad| {
-        let graph = if quad.graph.is_default_graph() {
-            nrese_rdf::GraphName::DefaultGraph
-        } else {
-            match decode(quad.graph) {
-                Some(nrese_rdf::Term::NamedNode(n)) => nrese_rdf::GraphName::NamedNode(n),
-                _ => return false,
-            }
-        };
-        access.allows_graph(&graph)
-    })
 }
 
 /// The status of its answers that `prepared`'s reader is told (round 13, R13-diag). A

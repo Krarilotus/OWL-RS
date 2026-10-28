@@ -206,6 +206,8 @@ impl MutationPipeline {
             geosparql_stated_only: self.store.config().geosparql_stated_only,
             services: self.store.services(),
             namespaces: self.store.namespaces().all(),
+            supports: Arc::clone(self.store.supports()),
+            compilation: self.store.support_compilation(),
         };
         let report = command
             .apply(&mut tx, requester, &context)
@@ -249,14 +251,10 @@ impl MutationPipeline {
                 // others are withheld, and counted (graph access: nothing from a graph a
                 // reader can't read reaches it).
                 let readable = |fact: nrese_reasoner::ir::Triple| match &requester.read {
-                    crate::ReadScope::Graphs(access) => crate::service::in_readable_graph(
-                        tx.quads_for_pattern_in(
-                            nrese_engine::ReadModel::Asserted,
-                            &crate::service::any_graph(fact),
-                        ),
-                        &|id| tx.decode(id),
-                        access,
-                    ),
+                    crate::ReadScope::Graphs(access) => {
+                        crate::support::asserted(&tx, access, fact)
+                            == crate::support::Asserted::InReach
+                    }
                     _ => true,
                 };
                 let restricted = matches!(requester.read, crate::ReadScope::Graphs(_));

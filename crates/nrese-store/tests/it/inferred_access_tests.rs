@@ -244,6 +244,231 @@ fn a_hidden_assertion_does_not_change_what_a_reader_derives() {
     }
 }
 
+/// An update's WHERE reads what its requester reads, as its queries do (review r1 of PR #50,
+/// F1): a supported reader of `open` finds what `open` derives whether or not `secret`
+/// asserts it (`a_hidden_assertion_does_not_change_what_a_reader_derives`), so a marker its
+/// update inserts where that holds lands either way. Through the mutation pipeline, and in a
+/// transaction's pending operations, read before any commit.
+#[test]
+fn an_updates_where_reads_what_its_requester_reads() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_store::{
+        CancellationToken, MutationCommand, MutationPipeline, MutationTicket, PreparedQuery,
+        Requester, StatementOp, StatementsRequest, WriteScope,
+    };
+    let marker = |name: &str| format!("ex:{name} ex:observed true");
+    let insert = |name: &str| {
+        format!(
+            "PREFIX ex: <{EX}> INSERT {{ GRAPH ex:open {{ {} }} }} WHERE {{ ex:alice a ex:Patient }}",
+            marker(name)
+        )
+    };
+    let observed = |hidden: bool| {
+        let pipeline = MutationPipeline::new(
+            Arc::new(StoreService::new(in_memory_store_config()).unwrap()),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Owl2Rl,
+            ))),
+        );
+        let secret = match hidden {
+            true => "GRAPH ex:secret { ex:alice a ex:Patient }",
+            false => "",
+        };
+        pipeline
+            .apply(
+                MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                    "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+                     INSERT DATA {{ GRAPH ex:open {{ ex:alice a ex:Human .
+                                    ex:Human rdfs:subClassOf ex:Patient }} {secret} }}"
+                ))),
+                &Requester::all(),
+                &MutationTicket::new(),
+            )
+            .unwrap();
+        let writer = Requester::new(
+            reader(true),
+            WriteScope::Graphs(Arc::new(GraphAccess {
+                graphs: vec![format!("{EX}open")],
+                ..GraphAccess::default()
+            })),
+        );
+        let store = pipeline.store();
+        let derived = select(store, &reader(true), "ASK { ex:alice a ex:Patient }");
+        pipeline
+            .apply(
+                MutationCommand::Update(SparqlUpdateRequest::new(insert("committed"))),
+                &writer,
+                &MutationTicket::new(),
+            )
+            .unwrap();
+        let committed = select(
+            store,
+            &reader(true),
+            &format!("ASK {{ GRAPH ex:open {{ {} }} }}", marker("committed")),
+        );
+        let pending = StatementsRequest::new(vec![StatementOp::Update(SparqlUpdateRequest::new(
+            insert("pending"),
+        ))]);
+        let prepared = PreparedQuery::parse(&SparqlQueryRequest::new(
+            format!(
+                "PREFIX ex: <{EX}> ASK {{ GRAPH ex:open {{ {} }} }}",
+                marker("pending")
+            ),
+            reader(true),
+        ))
+        .unwrap();
+        let mut out = Vec::new();
+        store
+            .run_query_pending(&pending, &prepared, &CancellationToken::new(), &mut out)
+            .unwrap();
+        (derived, committed, String::from_utf8(out).unwrap())
+    };
+    let public = observed(false);
+    assert!(
+        public.0.contains("true") && public.1.contains("true") && public.2.contains("true"),
+        "derived from open: {public:?}"
+    );
+    assert_eq!(
+        observed(true),
+        public,
+        "ex:alice a ex:Patient asserted in secret"
+    );
+}
+
+/// A pipeline over `open` (`alice a Human`, `Human ⊑ Patient`) and `secret` (`bob a Human`,
+/// and `alice a Patient` where `secret_alice`), its closure made, and the writer of `open`
+/// who reads it by support: `alice a Patient` is derived from `open` alone, `bob a Patient`
+/// only with `secret`.
+fn patients(
+    secret_alice: bool,
+) -> (
+    nrese_store::MutationPipeline,
+    nrese_store::Requester,
+    impl Fn(&nrese_store::MutationPipeline, &str, &nrese_store::Requester),
+) {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_store::{MutationCommand, MutationPipeline, MutationTicket, Requester, WriteScope};
+    let pipeline = MutationPipeline::new(
+        Arc::new(StoreService::new(in_memory_store_config()).unwrap()),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    );
+    let apply = |pipeline: &MutationPipeline, update: &str, requester: &Requester| {
+        pipeline
+            .apply(
+                MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                    "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {update}"
+                ))),
+                requester,
+                &MutationTicket::new(),
+            )
+            .unwrap();
+    };
+    let alice = match secret_alice {
+        true => "ex:alice a ex:Patient .",
+        false => "",
+    };
+    apply(
+        &pipeline,
+        &format!(
+            "INSERT DATA {{ GRAPH ex:open {{ ex:alice a ex:Human . ex:Human rdfs:subClassOf ex:Patient }}
+                            GRAPH ex:secret {{ ex:bob a ex:Human . {alice} }} }}"
+        ),
+        &Requester::all(),
+    );
+    let writer = Requester::new(
+        reader(true),
+        WriteScope::Graphs(Arc::new(GraphAccess {
+            graphs: vec![format!("{EX}open")],
+            ..GraphAccess::default()
+        })),
+    );
+    (pipeline, writer, apply)
+}
+
+/// Each `WHERE` of a request reads the state before its operation, the earlier operations
+/// included, as its requester reads it (the orchestrator's case 1 of F1): after a first
+/// operation, the transaction holds changes, and a later `WHERE` that depends on them reads
+/// that pending state through the requester's view too. It sees `alice a Patient`, derived
+/// from `open`, whether or not `secret` asserts it, and not `bob a Patient`, which only
+/// `secret` supports. Through the mutation pipeline, and replayed in a transaction's reads.
+#[test]
+fn an_updates_later_where_reads_the_earlier_operations_as_its_requester_reads() {
+    use nrese_store::{CancellationToken, PreparedQuery, StatementOp, StatementsRequest};
+    let request = |tag: &str| {
+        format!(
+            "INSERT DATA {{ GRAPH ex:open {{ ex:{tag} ex:step 1 }} }} ;
+             INSERT {{ GRAPH ex:open {{ ex:{tag}-bob ex:observed true }} }}
+             WHERE {{ GRAPH ex:open {{ ex:{tag} ex:step 1 }} ex:bob a ex:Patient }} ;
+             INSERT {{ GRAPH ex:open {{ ex:{tag}-alice ex:observed true }} }}
+             WHERE {{ GRAPH ex:open {{ ex:{tag} ex:step 1 }} ex:alice a ex:Patient }}"
+        )
+    };
+    let markers = |tag: &str| {
+        format!(
+            "SELECT ?m WHERE {{ GRAPH ex:open {{ ?m ex:observed true }}
+                                FILTER(STRSTARTS(STR(?m), \"{EX}{tag}-\")) }} ORDER BY ?m"
+        )
+    };
+    for secret_alice in [false, true] {
+        let (pipeline, writer, apply) = patients(secret_alice);
+        apply(&pipeline, &request("committed"), &writer);
+        let committed = select(pipeline.store(), &reader(true), &markers("committed"));
+        let pending = StatementsRequest::new(vec![StatementOp::Update(SparqlUpdateRequest::new(
+            format!(
+                "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {}",
+                request("pending")
+            ),
+        ))]);
+        let prepared = PreparedQuery::parse(&SparqlQueryRequest::new(
+            format!("PREFIX ex: <{EX}> {}", markers("pending")),
+            reader(true),
+        ))
+        .unwrap();
+        let mut out = Vec::new();
+        pipeline
+            .store()
+            .run_query_pending(&pending, &prepared, &CancellationToken::new(), &mut out)
+            .unwrap();
+        let pending = String::from_utf8(out).unwrap();
+        for (how, answers, tag) in [
+            ("committed", &committed, "committed"),
+            ("pending", &pending, "pending"),
+        ] {
+            assert!(
+                answers.contains(&format!("{EX}{tag}-alice"))
+                    && !answers.contains(&format!("{EX}{tag}-bob")),
+                "{how}, alice a Patient asserted in secret: {secret_alice}: {answers}"
+            );
+        }
+    }
+}
+
+/// An update's `WHERE` reads the graphs its requester may read only, its view of the inferred
+/// statements notwithstanding (the orchestrator's case 2 of F1: graph access and the read
+/// source both apply): copying every statement of every graph into `open` copies none of
+/// `secret`'s.
+#[test]
+fn an_updates_where_reads_the_graphs_its_requester_reads_only() {
+    let (pipeline, writer, apply) = patients(true);
+    apply(
+        &pipeline,
+        "INSERT { GRAPH ex:open { ?s ex:copied ?o } } WHERE { GRAPH ?g { ?s ?p ?o } }",
+        &writer,
+    );
+    let copied = select(
+        pipeline.store(),
+        &ReadScope::All,
+        "SELECT ?s WHERE { GRAPH ex:open { ?s ex:copied ?o } }",
+    );
+    assert!(copied.contains(&format!("{EX}alice")), "{copied}");
+    assert!(
+        !copied.contains(&format!("{EX}bob")),
+        "secret's copied: {copied}"
+    );
+}
+
 /// The same across commits, live: an unrestricted writer asserts the statement in `secret`
 /// and later retracts it; after each commit a reader's answers are what they were. The sets
 /// and the re-derived facts are updated for the commits, the views made afresh.
