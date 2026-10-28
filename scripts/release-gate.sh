@@ -2,7 +2,9 @@
 # The release gate (benches/PROTOCOL.md §5, "The release gate"): does a head regress, beyond
 # noise, on any workload, in time or memory, against the v1.5 baseline and against main? Are
 # the §0 guards green and the W3C suites' counts as required? Each command is a fleet step;
-# `jobs` writes the jobs (benches/fast/release_gate.py jobs).
+# `jobs` writes the jobs (benches/fast/release_gate.py jobs). Every command runs the code of the
+# commit it is launched from, never changes not committed (only this script, scripts/lib and the
+# checker start from the working tree).
 #
 #   release-gate.sh build REV               REV's binaries, by REV's own toolchain, into GATE_BIN/bin-REV8-IDENTITY
 #   release-gate.sh prepare HARNESS         the plan, the data view and the cases' data, once, by
@@ -28,7 +30,8 @@
 #   release-gate.sh verdict TIMED_DIR... CHECKS_DIR   every part together, each host's rounds combined
 #   release-gate.sh jobs CAND [OPTIONS]     the fleet jobs of a whole gate (release_gate.py jobs --help)
 #   release-gate.sh clean                   the gate's worktrees and build trees, and what dead invocations
-#                                           left (binaries and data stay; a live invocation's own stays)
+#                                           of its process space left (binaries and data stay; a live
+#                                           invocation's own, and another process space's, stay)
 #   release-gate.sh clean --patch-keyed [--remove]   the builds of a perf lab patched before T0, listed
 #                                           (FLEET_OUT/patch-keyed-builds.tsv); with --remove their binaries
 #                                           go, unless a gate used them within GATE_LIVE_HOURS (default 24)
@@ -77,14 +80,33 @@ py() { PYTHONIOENCODING=utf-8 python3 "$@"; }
 # Each invocation's own directory, made empty here and removed when it exits, by it alone: its
 # bytecode cache and its code checkout (below). No other invocation makes or reads what is in it
 # (Sol, PR #60 fix check 3: a code checkout shared by revision had no owner, and two callers met
-# in its making). Its name begins with the pid, which `clean` asks before it removes what a dead
-# one left: a gate directory is one host's, one pid space.
+# in its making). It lies in its process space's directory under its pid, which `clean` asks only
+# there: a pid means nothing in another space, as WSL's in Git Bash on one host (Sol, PR #60 fix
+# check 4). So does every checkout the gate makes (the harness's, a build's): a path another space
+# uses is never one of its (Sol, R4 sol-loop S1, S5, S6). The space: the kernel's boot, pid and
+# mount namespaces where Linux names them, else the system, host and runtime (Git Bash's MSYS,
+# whose pids no other runtime knows).
 launch=$PWD
-mkdir -p "$GATE/run" && RUN=$(mktemp -d "$GATE/run/$$-XXXXXX") || exit 2
+if [ -r /proc/sys/kernel/random/boot_id ] && space=$(readlink /proc/self/ns/pid /proc/self/ns/mnt 2>/dev/null); then
+  space="$(cat /proc/sys/kernel/random/boot_id) $space"
+else
+  space="$(uname -s) $(hostname) $(cygpath -m / 2>/dev/null)"
+fi
+SPACE=$GATE/run/space-$(printf '%s' "$space" | cksum | cut -d' ' -f1)
+mkdir -p "$SPACE" && RUN=$(mktemp -d "$SPACE/$$-XXXXXX") || exit 2
+# DIR, a checkout of this space's, removed with its registration: by git, else (its .git gone: a
+# removal killed halfway) its directory, then its registration by the path, which git drops for
+# a missing directory. Never `prune`: a registration git finds missing here may be another
+# process space's live checkout (Sol, PR #60 R4 sol-loop S1).
+drop_checkout() {
+  git worktree remove --force "$1" 2>/dev/null && return
+  rm -rf "$1" && git worktree remove --force "$1" 2>/dev/null
+  return 0
+}
 finish() {
   local dir
   cd "$launch" 2>/dev/null || cd /
-  for dir in "$RUN"/src-*; do [ ! -d "$dir" ] || git worktree remove --force "$dir" 2>/dev/null; done
+  for dir in "$RUN"/src-*; do [ ! -d "$dir" ] || drop_checkout "$dir"; done
   rm -rf "$RUN"
 }
 trap finish EXIT
@@ -101,13 +123,15 @@ export PYTHONPYCACHEPREFIX
 CHECKER=$PWD/benches/suite/suitekit/checkout.py
 
 worktree() {  # REV [DIR [built]]: a clean worktree of the revision, made once, holding its stored
-  # bytes; one to be built holds nothing else
+  # bytes; one to be built holds nothing else. DIR is this process space's (default $SPACE).
   local rev dir only=()
   rev=$(git rev-parse "$1") || return 2
-  dir=${2:-$GATE}/src-$(short "$rev")
+  dir=${2:-$SPACE}/src-$(short "$rev")
   if [ ! -d "$dir" ]; then
-    # Line ends as stored: a host's settings convert none (only .gitattributes does).
-    git -c core.autocrlf=false -c core.eol=lf worktree add -q --detach "$dir" "$rev" \
+    # Line ends as stored: a host's settings convert none (only .gitattributes does). -f: a
+    # registration of this space's path whose directory went without git (a clean killed between
+    # the two) stops nothing; no other space has this path (Sol, PR #60 R4 sol-loop S5).
+    git -c core.autocrlf=false -c core.eol=lf worktree add -f -q --detach "$dir" "$rev" \
       || { echo "no worktree of $rev" >&2; return 2; }
   fi
   (cd "$dir" && [ "$(git rev-parse HEAD)" = "$rev" ] && [ -z "$(git status --porcelain)" ]) \
@@ -172,23 +196,31 @@ if [ "${1:-}" = clean ]; then
   # other gates build and read there); the data view, the prepared data and every result stay
   # for the gate's next run. Builds no gate used for GATE_BIN_AGE_DAYS go (sweep_builds).
   before=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
-  # What invocations that died left in their own directories goes; a live one's stays.
-  for run in "$GATE"/run/*; do
+  # What invocations of this process space that died left in their own directories goes; a live
+  # one's stays, and so does every other space's, whose pids this one can't ask.
+  for run in "$SPACE"/[0-9]*-*; do
     [ -d "$run" ] && [ "$run" != "$RUN" ] || continue
     pid=${run##*/}
     ! kill -0 "${pid%%-*}" 2>/dev/null || continue
-    for dir in "$run"/src-*; do [ ! -d "$dir" ] || git worktree remove --force "$dir" 2>/dev/null; done
+    for dir in "$run"/src-*; do [ ! -d "$dir" ] || drop_checkout "$dir"; done
     rm -rf "$run"
   done
+  foreign=$(( $(find "$GATE"/run/space-* -mindepth 1 -maxdepth 1 -name '[0-9]*-*' ! -path "$SPACE/*" 2>/dev/null | wc -l)
+    + $(find "$GATE/run" -mindepth 1 -maxdepth 1 ! -name 'space-*' 2>/dev/null | wc -l) ))
+  [ "$foreign" = 0 ] || log "clean: $foreign runs of another process space kept"
+  # This space's harness and build checkouts (no other space has their paths) and build trees.
+  for dir in "$SPACE"/src-* "$SPACE"/build/src-*; do [ ! -d "$dir" ] || drop_checkout "$dir"; done
+  rm -rf "$SPACE"/build
+  # Those of the gates before checkouts were each space's ($GATE/src-*, $GATE/build), removed as
+  # they were then, by git; pycache: their bytecode, before each invocation had its own directory.
   for dir in "$GATE"/src-* "$GATE"/build/src-*; do [ -d "$dir" ] && git worktree remove --force "$dir"; done
-  # pycache: the bytecode of the gates before each invocation had its own directory.
   rm -rf "$GATE"/target-* "$GATE"/build "$GATE"/reports "$GATE"/compact "$GATE"/pycache
   # Block copies are removed by their block; what a killed one left is named, not swept.
   rmdir "$GATE/instances" 2>/dev/null || { [ -d "$GATE/instances" ] \
     && log "clean: block copies left by an interrupted block, not removed: $(ls "$GATE/instances" | tr '\n' ' ')"; }
   swept=$(sweep_builds | tr '\n' ' ')
   [ -z "$swept" ] || log "clean: unused builds removed: $swept"
-  git worktree prune
+  # No `git worktree prune` (drop_checkout): what is removed here deregistered itself.
   # Shared prepared data no gate has linked for two days (its last link's removal set its ctime).
   [ -d "$SHARED/blobs" ] && find "$SHARED/blobs" -type f -links 1 -cmin +2880 -delete
   after=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
@@ -236,8 +268,8 @@ build)
     log "build $rev: verified binaries of its identity there from before ($bin, $LAYOUTS layouts)"; exit 0
   fi
   # The source and build trees are this gate's own; the build is published under its identity.
-  mkdir -p "$GATE/build" && src=$(worktree "$at" "$GATE/build" built) || exit 2
-  export CARGO_TARGET_DIR=$GATE/build/target-$(short "$at")
+  mkdir -p "$SPACE/build" && src=$(worktree "$at" "$SPACE/build" built) || exit 2
+  export CARGO_TARGET_DIR=$SPACE/build/target-$(short "$at")
   log "build $rev at $at ($(cd "$src" && rustc -V 2>/dev/null)); layouts to build: ${todo[*]}"
   missing=()
   if [ "${todo[0]}" = 1 ]; then
@@ -801,7 +833,8 @@ jobs)
   ;;
 
 *)
-  sed -n '2,34p' "$0"
+  # The help: the head comment up to its paragraph after the commands.
+  awk 'NR > 1 && /^# One harness/ {exit} NR > 1' "$0"
   exit 2
   ;;
 esac

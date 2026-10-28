@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -608,8 +609,8 @@ echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
                                  f'exec bash scripts/release-gate.sh block 3 {head} 1 - a={head} a2={head} b={head}'],
                                 cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
             reports = len(list(Path(tmp).glob("out/passes/pass-*.json"))) - 4  # block 2's: base and cand
-            subprocess.run(["git", "worktree", "remove", "--force", f"{t}/gate/src-{head[:8]}"], cwd=ROOT,
-                           capture_output=True)
+            for tree in Path(t, "gate", "run").glob(f"space-*/src-{head[:8]}"):  # the harness's checkout
+                subprocess.run(["git", "worktree", "remove", "--force", tree.as_posix()], cwd=ROOT, capture_output=True)
         subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("block 2: done", done.stdout)
@@ -1251,7 +1252,7 @@ class MeasurementSides(unittest.TestCase):
         # A checkout as stored builds. Its engine then changed, size and mtime kept, under a stat
         # cache that compares only those, its entry older than the index (not racily clean).
         stored = build("stat")
-        src = tmp / "stat" / "gate" / "build" / f"src-{loop[:8]}"
+        src = self.space(tmp / "stat" / "gate") / "build" / f"src-{loop[:8]}"
         engine = src / self.ENGINE
         old = os.stat(engine).st_mtime_ns - 10**10
         os.utime(engine, ns=(old, old))
@@ -1268,7 +1269,7 @@ class MeasurementSides(unittest.TestCase):
         # it builds without it (Sol, S1 r2: the gate's own leftovers go the same way).
         clean = build("ignored")
         (git_dir / "info" / "exclude").write_text("dist/\n", encoding="utf-8")
-        extra = tmp / "ignored" / "gate" / "build" / f"src-{loop[:8]}" / "dist" / "index.html"
+        extra = self.space(tmp / "ignored" / "gate") / "build" / f"src-{loop[:8]}" / "dist" / "index.html"
         extra.parent.mkdir(parents=True)
         extra.write_text("<p>not the revision's</p>\n", encoding="utf-8")
         ignored = build("ignored")
@@ -1341,7 +1342,7 @@ class MeasurementSides(unittest.TestCase):
         source = str(Path(self.repo, "benches/suite/suitekit/cases.py").resolve())
         body = tmp / "planted.py"
         body.write_text('raise RuntimeError("PR60 planted bytecode executed")\n', encoding="utf-8")
-        self.assertEqual(list((gate / "gate" / "run").iterdir()), [], "SPEC an earlier run's caches go with it")
+        self.assertEqual(list((gate / "gate" / "run").glob("*/[0-9]*-*")), [], "SPEC an earlier run's caches go with it")
         planted = []
         for prefix in ((gate / "gate" / "pycache").as_posix(), None):
             held, sys.pycache_prefix = sys.pycache_prefix, prefix
@@ -1444,7 +1445,7 @@ find "$b" -maxdepth 2 -exec touch -d "$4" {} +'''
         output = self.run_gate(tmp, "clean", "clean", path=path)
         self.assertNotIn(ran, output, "SPEC no Python of the launching checkout runs")
         self.assertIn("unused builds removed: bin-old", output, "SPEC clean locks with the launching commit's Python")
-        self.assertEqual(list((tmp / "clean" / "gate" / "run").iterdir()), [], "SPEC and leaves nothing of its own")
+        self.assertEqual(list((tmp / "clean" / "gate" / "run").glob("*/[0-9]*-*")), [], "SPEC and leaves no run of its own")
 
     def test_a_callers_paths_are_the_launching_checkouts(self):
         """Sol, PR #60 fix 3's sol-loop S2: the gate runs its code from a checkout of its own, and
@@ -1522,7 +1523,7 @@ exec "{Path(shutil.which("git")).as_posix()}" "$@"
         self.assertEqual(first.returncode, 0, f"SPEC so does the one paused while making it:\n{output}")
         for out in ("jobs-a", "jobs-b"):
             self.assertTrue(list(Path(self.repo, out).glob("*.toml")), f"{out}: no jobs written")
-        self.assertEqual(list((tmp / "at-once" / "gate" / "run").iterdir()), [], "SPEC each removes its own")
+        self.assertEqual(list((tmp / "at-once" / "gate" / "run").glob("*/[0-9]*-*")), [], "SPEC each removes its own")
         self.assertIn("MiB reclaimed", self.run_gate(tmp, "at-once", "clean"), "SPEC a clean after them runs")
         output = self.run_gate(tmp, "at-once", *jobs("jobs-c"))
         self.assertTrue(list(Path(self.repo, "jobs-c").glob("*.toml")), f"SPEC and a restart:\n{output}")
@@ -1547,15 +1548,152 @@ exec "{Path(shutil.which("git")).as_posix()}" "$@"
         self.addCleanup(live.wait)
         self.addCleanup(live.kill)
         alive = live.stdout.readline().strip()
+        # This process space's run directory: the one a first start (its help) leaves.
+        self.run_gate(tmp, "stale")
+        space, = (gate / "run").iterdir()
         for pid in (dead, alive):
-            (gate / "run" / f"{pid}-abcdef" / f"src-{head}").mkdir(parents=True)
+            (space / f"{pid}-abcdef" / f"src-{head}").mkdir(parents=True)
         (gate / f"src-{head}").mkdir()  # 47e5cee7's shared code checkout, half made (Sol's case)
         output = self.run_gate(tmp, "stale", "clean")
         self.assertIn("MiB reclaimed", output, f"SPEC clean runs:\n{output}")
-        self.assertFalse((gate / "run" / f"{dead}-abcdef").exists(), "SPEC what a dead invocation left goes")
-        self.assertTrue((gate / "run" / f"{alive}-abcdef").exists(), "SPEC a live one's stays")
+        self.assertFalse((space / f"{dead}-abcdef").exists(), "SPEC what a dead invocation left goes")
+        self.assertTrue((space / f"{alive}-abcdef").exists(), "SPEC a live one's stays")
         output = self.run_gate(tmp, "stale", "build", self.side)
         self.assertIn(f"build {self.side} at {loop}", output, f"SPEC and the build runs:\n{output}")
+
+    def test_clean_asks_only_its_own_process_space(self):
+        """Sol, PR #60 fix check 4 (R4): clean took a pid it couldn't find for a dead run's, and a
+        live WSL caller's, asked from Git Bash on the same host and gate directory, lost its code
+        checkout under it. Clean asks only its own process space: another space's run stays and is
+        reported; what a killed run of its own left goes, its checkout's registration with it."""
+        bash = shutil.which("bash")
+        if bash is None or os.name == "nt":
+            self.skipTest("a killed process group: POSIX")
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        tmp = self.gate_beside(loop)
+        gate = tmp / "spaces" / "gate"
+        head = self.git("rev-parse", "--short=8", "HEAD")
+        # git, but `worktree add` waits once its checkout is made, until the run is killed there.
+        signals = tmp / "signals"
+        signals.mkdir()
+        hold = tmp / "hold" / "git"
+        hold.parent.mkdir()
+        git = Path(shutil.which("git")).as_posix()
+        hold.write_text(f'''#!/usr/bin/env bash
+case " $* " in
+  *" worktree add "*)
+    "{git}" "$@" || exit
+    touch "{signals.as_posix()}/made"
+    while :; do sleep 0.05; done ;;
+esac
+exec "{git}" "$@"
+''', encoding="utf-8", newline="\n")
+        hold.chmod(0o755)
+        path = hold.parent.as_posix() + os.pathsep + os.environ.get("PATH", "")
+        run = subprocess.Popen([bash, "scripts/release-gate.sh"], cwd=self.repo, start_new_session=True,
+                               env=self.gate_env(tmp, "spaces", path),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: run.poll() is None and os.killpg(run.pid, signal.SIGKILL))
+        deadline = time.monotonic() + 120
+        while not (signals / "made").exists():
+            self.assertIsNone(run.poll(), "the run ended before making its checkout")
+            self.assertLess(time.monotonic(), deadline, "the run made no checkout")
+            time.sleep(0.05)
+        os.killpg(run.pid, signal.SIGKILL)
+        run.wait()
+        killed = [checkout.parent for checkout in (gate / "run").rglob(f"src-{head}")]
+        self.assertEqual(len(killed), 1, f"the killed run left its checkout: {killed}")
+        # Another space's run, live there, under a pid this space doesn't have; its checkout is
+        # registered under a path this space can't see (WSL's /mnt/c/... from Git Bash): moved away.
+        foreign = gate / "run" / "space-elsewhere" / f"{run.pid}-abcdef"
+        checkout = foreign / f"src-{head}"
+        foreign.mkdir(parents=True)
+        self.git("worktree", "add", "-q", "--detach", str(checkout), "HEAD")
+        checkout.rename(foreign / "out-of-view")
+        output = self.run_gate(tmp, "spaces", "clean")
+        self.assertTrue(foreign.exists(), f"SPEC another process space's run stays:\n{output}")
+        self.assertIn("clean: 1 runs of another process space kept", output, "SPEC and is reported")
+        self.assertFalse(killed[0].exists(), f"SPEC what a killed run of this space left goes:\n{output}")
+        (foreign / "out-of-view").rename(checkout)
+        back = subprocess.run(["git", "-C", str(checkout), "rev-parse", "HEAD"], capture_output=True, text=True)
+        self.assertEqual(back.stdout.strip(), self.git("rev-parse", "HEAD"),
+                         f"SPEC another space's checkout stays registered (Sol, R4 sol-loop S1):\n{back.stderr}")
+        listed = self.git("worktree", "list", "--porcelain")
+        self.assertEqual(listed.count("worktree "), 2,
+                         f"SPEC the killed run's registration goes, the main's and the other space's stay:\n{listed}")
+
+    def test_a_registration_left_without_its_checkout_stops_no_build(self):
+        """Sol, PR #60 R4 sol-loop S5 (rounds 2 and 4): clean prunes no repository-wide
+        registrations (another process space's live checkouts are among them), and a build
+        checkout of this space's left registered without its directory (a removal killed after its
+        .git went, or a clean killed between removing and deregistering) stopped the next build of
+        that revision there. Clean deregisters what it removes itself, and the build makes its own
+        space's path again over a registration left there: no other space has that path."""
+        if shutil.which("bash") is None or shutil.which("flock") is None:
+            self.skipTest("the gate builds on Linux hosts (bash, flock)")
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        tmp = self.gate_beside(loop)
+        self.run_gate(tmp, "left")  # its help: this process space's directory
+        build = self.space(tmp / "left" / "gate") / "build" / f"src-{loop[:8]}"
+        build.parent.mkdir(parents=True)
+        self.git("worktree", "add", "-q", "--detach", str(build), loop)
+        (build / ".git").unlink()  # its removal killed halfway, the .git file gone first
+        self.run_gate(tmp, "left", "clean")
+        self.assertFalse(build.exists(), "clean removed the build directory")
+        listed = self.git("worktree", "list", "--porcelain")
+        self.assertNotIn(build.name, listed, f"SPEC and its registration with it:\n{listed}")
+        # A clean killed between the two: the directory gone, its registration left.
+        build.parent.mkdir(parents=True, exist_ok=True)
+        self.git("worktree", "add", "-q", "--detach", str(build), loop)
+        shutil.rmtree(build)
+        output = self.run_gate(tmp, "left", "build", self.side)
+        self.assertIn(f"build {self.side} at {loop}", output, f"SPEC the next build makes its checkout:\n{output}")
+
+    def test_a_registration_missing_here_is_never_taken_over(self):
+        """Sol, PR #60 R4 sol-loop S6: `worktree add -f` at a path shared by revision took over a
+        registration whose directory was missing here, which may be another process space's live
+        checkout under the same path (another mount namespace sharing the repository). The build
+        makes its checkout under its own space's path: the other checkout stays registered and
+        works."""
+        if shutil.which("bash") is None or shutil.which("flock") is None:
+            self.skipTest("the gate builds on Linux hosts (bash, flock)")
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        tmp = self.gate_beside(loop)
+        other = tmp / "elsewhere" / "gate" / "build" / f"src-{loop[:8]}"
+        other.parent.mkdir(parents=True)
+        self.git("worktree", "add", "-q", "--detach", str(other), loop)
+        away = other.with_name("out-of-view")
+        other.rename(away)
+        output = self.run_gate(tmp, "elsewhere", "build", self.side)
+        self.assertIn(f"build {self.side} at {loop}", output, f"the build makes its own checkout:\n{output}")
+        away.rename(other)
+        back = subprocess.run(["git", "-C", str(other), "rev-parse", "HEAD"], capture_output=True, text=True)
+        self.assertEqual(back.stdout.strip(), loop, f"SPEC the other checkout stays registered:\n{back.stderr}")
+
+    def test_clean_never_deletes_a_checkout_it_cannot_remove(self):
+        """Sol, PR #60 R4 sol-loop S1 (round 4): where git couldn't remove a checkout, clean's
+        fallback deleted it: on shared storage another process space's live harness checkout,
+        whose .git names that space's repository mount. Clean deletes only its own space's
+        checkouts so; any other it removes by git, or leaves."""
+        if shutil.which("bash") is None:
+            self.skipTest("needs bash")
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        tmp = self.gate_beside(loop)
+        head = self.git("rev-parse", "--short=8", "HEAD")
+        other = tmp / "shared" / "gate" / f"src-{head}"
+        other.parent.mkdir(parents=True)
+        self.git("worktree", "add", "-q", "--detach", str(other), "HEAD")
+        (other / ".git").unlink()  # Git for Windows hides it, and Windows won't overwrite a hidden file
+        (other / ".git").write_text("gitdir: /elsewhere/repository/.git/worktrees/other\n", encoding="utf-8")
+        output = self.run_gate(tmp, "shared", "clean")
+        self.assertIn("MiB reclaimed", output, f"clean ran:\n{output}")
+        self.assertTrue((other / ".gitignore").is_file(), f"SPEC another space's checkout stays:\n{output}")
+
+    def space(self, gate: Path) -> Path:
+        """This process space's directory in GATE (release-gate.sh's $SPACE), where the gate's
+        runs and checkouts lie."""
+        space, = (gate / "run").glob("space-*")
+        return space
 
     def gate_env(self, tmp: Path, name: str, path: str | None = None) -> dict[str, str]:
         """A release-gate.sh run's environment: its gate, binaries and results under TMP/NAME, its
@@ -1607,7 +1745,7 @@ printf '%s\\n' "$out"; exit $code
                    "PATH": (tmp / "shim").as_posix() + os.pathsep + os.environ.get("PATH", "")}
             done = subprocess.run([bash, "scripts/release-gate.sh", "build", self.side], cwd=self.repo, env=env,
                                   capture_output=True, text=True)
-            src = gate / "gate" / "build" / f"src-{loop[:8]}"
+            src = self.space(gate / "gate") / "build" / f"src-{loop[:8]}"
             got[name] = tuple((src / p).read_text(encoding="utf-8") if (src / p).exists() else done.stdout + done.stderr
                               for p in (self.ENGINE, self.PERF_LAB))
             if inject:
