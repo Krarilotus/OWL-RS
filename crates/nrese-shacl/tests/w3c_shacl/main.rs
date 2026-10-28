@@ -5,10 +5,10 @@
 //!   `scripts/fetch-w3c-tests.sh` into `.cache/data-shapes`, or wherever
 //!   `NRESE_W3C_SHACL_TESTS` points (the suite's `tests` directory). Without it the test is
 //!   skipped, unless `NRESE_W3C_REQUIRED` is set (as in CI).
-//! - **Comparison.** A test passes if the report's `sh:conforms` and its results equal the
-//!   expected ones as multisets of (focus node, path, value, source shape, component,
-//!   severity). Blank nodes compare equal to each other; messages aren't compared (the
-//!   specification leaves them free).
+//! - **Comparison.** A test passes if the report graph is the expected report as the suite
+//!   compares them ([`projection`]): isomorphic once only the compared fields are kept, with
+//!   a message only where the expected report has it. Every test's report graph is written
+//!   to `<target tmp>/w3c-shacl-reports/`.
 //! - **Failures.** A test whose result is `sht:Failure` passes if the shapes graph is
 //!   refused as ill-formed, or validation reports a failure. A suite file that can't be
 //!   read or parsed, or an error of the harness's own, fails it.
@@ -24,11 +24,13 @@ use std::path::{Path, PathBuf};
 
 use nrese_engine::{Engine, EngineConfig, GraphSelector, TermId};
 use nrese_rdf::{
-    Graph, GraphNameRef, NamedNode, NamedNodeRef, NamedOrBlankNodeRef, QuadRef, Term, TermRef,
+    Graph, GraphName, GraphNameRef, NamedNode, NamedNodeRef, NamedOrBlankNodeRef, QuadRef, TermRef,
     Triple,
 };
 use nrese_rdf_io::{RdfFormat, RdfParser};
-use nrese_shacl::{PropertyPath, Selection, compile, validate};
+use nrese_shacl::{Selection, compile, validate};
+
+mod projection;
 
 const EXPECTED_FAILURES: &str = include_str!("expected-failures.txt");
 const EXPECTED_FAILURES_SPARQL: &str = include_str!("expected-failures-sparql.txt");
@@ -149,106 +151,6 @@ fn tests(root: &Path, manifest: &NamedNode, out: &mut Vec<Test>) -> Result<(), S
     Ok(())
 }
 
-/// A term as results are compared: blank nodes are all alike.
-fn key(term: TermRef<'_>) -> String {
-    match term {
-        TermRef::BlankNode(_) => "_:".to_owned(),
-        other => other.to_string(),
-    }
-}
-
-/// The path an expected report gives as `sh:resultPath`.
-fn expected_path(graph: &Graph, term: TermRef<'_>) -> Result<PropertyPath, String> {
-    let blank = match term {
-        TermRef::NamedNode(predicate) => {
-            return Ok(PropertyPath::Predicate(predicate.into_owned()));
-        }
-        TermRef::BlankNode(blank) => NamedOrBlankNodeRef::from(blank),
-        TermRef::Literal(_) | TermRef::Triple(_) => {
-            return Err("a literal or triple term as path".to_owned());
-        }
-    };
-    let inner = |local: &str| {
-        object(graph, blank, &iri(SH, local))
-            .map(|inner| expected_path(graph, inner).map(Box::new))
-            .transpose()
-    };
-    let members = |head: TermRef<'_>| -> Result<Vec<PropertyPath>, String> {
-        list(graph, head)
-            .into_iter()
-            .map(|member| expected_path(graph, member))
-            .collect()
-    };
-    if let Some(path) = inner("inversePath")? {
-        Ok(PropertyPath::Inverse(path))
-    } else if let Some(path) = inner("zeroOrMorePath")? {
-        Ok(PropertyPath::ZeroOrMore(path))
-    } else if let Some(path) = inner("oneOrMorePath")? {
-        Ok(PropertyPath::OneOrMore(path))
-    } else if let Some(path) = inner("zeroOrOnePath")? {
-        Ok(PropertyPath::ZeroOrOne(path))
-    } else if let Some(head) = object(graph, blank, &iri(SH, "alternativePath")) {
-        Ok(PropertyPath::Alternative(members(head)?))
-    } else {
-        Ok(PropertyPath::Sequence(members(term)?))
-    }
-}
-
-/// `sh:conforms` and the sorted result keys.
-type Outcome = (bool, Vec<String>);
-
-/// `None` if the test expects a failure (`sht:Failure`).
-fn expected(graph: &Graph, test: &Test) -> Result<Option<Outcome>, String> {
-    let entry = NamedNode::new_unchecked(test.id.trim_matches(['<', '>']));
-    let result = object(graph, entry.as_ref().into(), &iri(MF, "result")).ok_or("no mf:result")?;
-    if result == TermRef::NamedNode(iri(SHT, "Failure").as_ref()) {
-        return Ok(None);
-    }
-    let report = node(result).ok_or("no mf:result")?;
-    let conforms = match object(graph, report, &iri(SH, "conforms")) {
-        Some(TermRef::Literal(literal)) => literal.value() == "true",
-        _ => return Err("no sh:conforms".to_owned()),
-    };
-    let mut results = Vec::new();
-    for result in graph.objects_for_subject_predicate(report, &iri(SH, "result")) {
-        let result = node(result).ok_or("a literal as result")?;
-        let field = |local: &str| object(graph, result, &iri(SH, local));
-        let path = field("resultPath")
-            .map(|path| expected_path(graph, path))
-            .transpose()?;
-        results.push(result_key(
-            field("focusNode").map(key),
-            path.as_ref(),
-            field("value").map(key),
-            field("sourceShape").map(key),
-            field("sourceConstraintComponent").map(key),
-            field("resultSeverity").map(key),
-        ));
-    }
-    results.sort();
-    Ok(Some((conforms, results)))
-}
-
-fn result_key(
-    focus: Option<String>,
-    path: Option<&PropertyPath>,
-    value: Option<String>,
-    shape: Option<String>,
-    component: Option<String>,
-    severity: Option<String>,
-) -> String {
-    let text = |part: Option<String>| part.unwrap_or_else(|| "-".to_owned());
-    format!(
-        "focus {} | path {} | value {} | shape {} | {} | {}",
-        text(focus),
-        text(path.map(ToString::to_string)),
-        text(value),
-        text(shape),
-        text(component),
-        text(severity)
-    )
-}
-
 /// Why a run gave no outcome.
 enum Refusal {
     /// The processor's own: the shapes graph is ill-formed, or validation failed. What a
@@ -272,7 +174,8 @@ impl From<Refusal> for String {
     }
 }
 
-fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Outcome, Refusal> {
+/// The report graph of validating the test's data graph against its shapes graph.
+fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Graph, Refusal> {
     let triples = |graph: &NamedNode| -> Result<Vec<Triple>, String> {
         if *graph == test.file {
             Ok(file.to_vec())
@@ -323,67 +226,100 @@ fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Outcome, Refusal>
             report.failures.join("; ")
         )));
     }
-    let mut results: Vec<String> = report
-        .results
-        .iter()
-        .map(|result| {
-            let term = |term: &Term| key(term.as_ref());
-            result_key(
-                Some(term(&result.focus_node)),
-                result.path.as_ref(),
-                result.value.as_ref().map(term),
-                Some(term(&result.source_shape)),
-                Some(format!("<{}>", result.component.as_str())),
-                Some(result.severity.to_string()),
-            )
-        })
-        .collect();
-    results.sort();
-    // The report's RDF form must state the same.
-    let graph: Graph = report.to_triples().into_iter().collect();
-    let count = graph.triples_for_predicate(&iri(SH, "result")).count();
-    if count != report.results.len() {
-        return Err(format!("the report graph has {count} results").into());
-    }
-    Ok((report.conforms(), results))
+    Ok(report.to_triples().into_iter().collect())
 }
 
-/// `Ok` if the test passes, else what differs.
-fn run(root: &Path, test: &Test) -> Result<(), String> {
+/// `Ok` if the test passes, else what differs. The report graph, if any, is written to
+/// `reports`.
+fn run(root: &Path, test: &Test, reports: &Path) -> Result<(), String> {
     let file = parse(root, test.file.as_ref())?;
     let graph: Graph = file.iter().cloned().collect();
-    let Some(expected) = expected(&graph, test)? else {
-        return match actual(root, test, &file) {
+    let entry = NamedNode::new_unchecked(test.id.trim_matches(['<', '>']));
+    let expected =
+        object(&graph, entry.as_ref().into(), &iri(MF, "result")).ok_or("no mf:result")?;
+    let actual = actual(root, test, &file);
+    if let Ok(report) = &actual {
+        let name = test.id.trim_matches(['<', '>']);
+        let name = name
+            .strip_prefix(BASE)
+            .unwrap_or(name)
+            .replace(['/', ':', '#'], "_");
+        let lines: String = report
+            .iter()
+            .map(|triple| format!("{triple} .\n"))
+            .collect();
+        std::fs::write(reports.join(format!("{name}.nt")), lines)
+            .map_err(|error| format!("the report graph not kept: {error}"))?;
+    }
+    if expected == TermRef::NamedNode(iri(SHT, "Failure").as_ref()) {
+        return match actual {
             Err(Refusal::Processor(_)) => Ok(()),
             Err(Refusal::Harness(why)) => Err(format!("expected a failure, but {why}")),
             Ok(_) => Err("expected a failure (ill-formed shapes or a validation failure)".into()),
         };
+    }
+    let expected = node(expected).ok_or("no mf:result")?;
+    projection::compare(&graph, expected, &actual?)
+}
+
+/// The cases every reader of the suite's report comparison passes (`projection-cases.trig`):
+/// each an expected and an actual report graph, and whether the suite counts them the same.
+#[test]
+fn report_projection_cases() {
+    const CASES: &str = "http://w3c.test/shacl/projection-cases#";
+    let quads: Vec<_> = RdfParser::from_format(RdfFormat::TriG)
+        .for_slice(include_bytes!("projection-cases.trig"))
+        .collect::<Result<_, _>>()
+        .expect("projection-cases.trig");
+    let graph = |name: TermRef<'_>| -> Graph {
+        let TermRef::NamedNode(name) = name else {
+            panic!("{name} names no graph");
+        };
+        quads
+            .iter()
+            .filter(|quad| quad.graph_name == GraphName::NamedNode(name.into_owned()))
+            .map(|quad| {
+                Triple::new(
+                    quad.subject.clone(),
+                    quad.predicate.clone(),
+                    quad.object.clone(),
+                )
+            })
+            .collect()
     };
-    let actual = actual(root, test, &file)?;
-    if expected == actual {
-        return Ok(());
-    }
-    let mut difference = format!("conforms: expected {}, got {}", expected.0, actual.0);
-    for line in &expected.1 {
-        if !actual.1.contains(line) {
-            write!(difference, "\n    missing   {line}").unwrap();
+    let cases: Graph = quads
+        .iter()
+        .filter(|quad| quad.graph_name == GraphName::DefaultGraph)
+        .map(|quad| {
+            Triple::new(
+                quad.subject.clone(),
+                quad.predicate.clone(),
+                quad.object.clone(),
+            )
+        })
+        .collect();
+    let mut wrong = Vec::new();
+    let mut count = 0;
+    for case in cases.triples_for_predicate(&iri(CASES, "same")) {
+        count += 1;
+        let named = |local: &str| {
+            let name = object(&cases, case.subject, &iri(CASES, local));
+            graph(name.unwrap_or_else(|| panic!("{}: no {local}", case.subject)))
+        };
+        let (expected, actual) = (named("expected"), named("actual"));
+        let root = projection::report_node(&expected).expect("the expected report's node");
+        let verdict = projection::compare(&expected, root, &actual);
+        let same = matches!(case.object, TermRef::Literal(same) if same.value() == "true");
+        if verdict.is_ok() != same {
+            wrong.push(format!("{}: {verdict:?}", case.subject));
         }
     }
-    for line in &actual.1 {
-        if !expected.1.contains(line) {
-            write!(difference, "\n    unexpected {line}").unwrap();
-        }
-    }
-    if expected.1.len() != actual.1.len() {
-        write!(
-            difference,
-            "\n    expected {} results, got {}",
-            expected.1.len(),
-            actual.1.len()
-        )
-        .unwrap();
-    }
-    Err(difference)
+    assert!(count >= 25, "only {count} cases");
+    assert!(
+        wrong.is_empty(),
+        "cases the comparison gets wrong:\n{}",
+        wrong.join("\n")
+    );
 }
 
 #[test]
@@ -416,17 +352,21 @@ fn suite(manifest: &str, name: &str, at_least: usize, expected_failures: &str, r
             std::env::var_os("NRESE_W3C_REQUIRED").is_none_or(|value| value.is_empty()),
             "W3C data-shapes tests not found; run scripts/fetch-w3c-tests.sh"
         );
-        eprintln!("skipped: W3C data-shapes tests not found (run scripts/fetch-w3c-tests.sh)");
+        eprintln!(
+            "not qualified: W3C data-shapes tests not found (run scripts/fetch-w3c-tests.sh)"
+        );
         return;
     };
     let mut all = Vec::new();
     tests(&root, &iri(BASE, manifest), &mut all).expect("manifests");
     assert!(all.len() >= at_least, "only {} tests found", all.len());
+    let reports = Path::new(env!("CARGO_TARGET_TMPDIR")).join("w3c-shacl-reports");
+    std::fs::create_dir_all(&reports).expect("the reports' directory");
 
     let outcomes: Vec<(&Test, Result<(), String>)> = all
         .iter()
         .map(|test| {
-            let outcome = catch_unwind(AssertUnwindSafe(|| run(&root, test)))
+            let outcome = catch_unwind(AssertUnwindSafe(|| run(&root, test, &reports)))
                 .unwrap_or_else(|_| Err("panicked".to_owned()));
             (test, outcome)
         })
