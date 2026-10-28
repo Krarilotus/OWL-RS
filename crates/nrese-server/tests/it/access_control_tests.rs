@@ -704,3 +704,59 @@ default_graph = "read"
     assert_eq!(seen[1], seen[0], "alice a Patient asserted in secret");
     Ok(())
 }
+
+/// An update's WHERE reads no inferred statement its requester's queries don't show (review r1
+/// of PR #50, D7): with `inferred = "hidden"`, `open` derives `alice a Patient`, which the
+/// editor's ASK doesn't see, and its update inserts no marker where it holds.
+#[tokio::test]
+async fn an_updates_where_reads_no_inferred_statement_its_requester_doesnt_see()
+-> Result<(), Box<dyn std::error::Error>> {
+    const HIDDEN: &str = r#"
+default = "deny"
+inferred = "hidden"
+
+[[role]]
+name = "editor"
+read = ["http://example.com/g/open"]
+write = ["http://example.com/g/open"]
+default_graph = "read"
+"#;
+    let editor = &["editor"];
+    let app = app_in(HIDDEN, ReasoningMode::Owl2Rl)?;
+    let data = format!(
+        "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+         INSERT DATA {{ GRAPH <{EX}g/open> {{ <{EX}alice> a <{EX}Human> .
+                        <{EX}Human> rdfs:subClassOf <{EX}Patient> }} }}"
+    );
+    assert_eq!(
+        update(&app, &["nrese.admin"], &data).await?,
+        StatusCode::NO_CONTENT
+    );
+    let derived = format!("ASK {{ <{EX}alice> a <{EX}Patient> }}");
+    assert!(
+        ask(&app, &["nrese.admin"], &derived).await?,
+        "the store derives it"
+    );
+    assert!(
+        !ask(&app, editor, &derived).await?,
+        "the editor doesn't see it"
+    );
+    assert_eq!(
+        update(
+            &app,
+            editor,
+            &format!(
+                "INSERT {{ GRAPH <{EX}g/open> {{ <{EX}marker> <{EX}observed> true }} }}
+                 WHERE {{ <{EX}alice> a <{EX}Patient> }}"
+            )
+        )
+        .await?,
+        StatusCode::NO_CONTENT
+    );
+    let marked = format!("ASK {{ GRAPH <{EX}g/open> {{ <{EX}marker> <{EX}observed> true }} }}");
+    assert!(
+        !ask(&app, &["nrese.admin"], &marked).await?,
+        "the update's WHERE read an inferred statement the editor doesn't see"
+    );
+    Ok(())
+}

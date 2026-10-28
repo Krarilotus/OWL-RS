@@ -534,10 +534,11 @@ impl StoreService {
         crate::support::Reading::of(
             &self.supports,
             self.support_compilation(),
-            access,
+            &crate::ReadScope::of(access.cloned()),
             memory,
             cancellation,
         )
+        .1
     }
 
     pub(crate) fn support_compilation(&self) -> crate::support::Compilation {

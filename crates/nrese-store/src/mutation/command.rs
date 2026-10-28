@@ -201,17 +201,17 @@ impl UpdateContext<'_> {
     /// The options of a SPARQL update for `requester` over the `using` dataset: what a
     /// write lowered to SPARQL Update's algebra runs [`nrese_sparql::apply_update`] with,
     /// the requester's graph access included, and what its `WHERE` clauses read: the data as
-    /// its queries read it ([`crate::support::Reading`]), its views charged to the request's
-    /// envelope and stopped by its cancellation.
+    /// its queries read it, model and view ([`crate::support::Reading::of`]), its views
+    /// charged to the request's envelope and stopped by its cancellation.
     pub fn update_options(
         &self,
         requester: &crate::Requester,
         using: Option<nrese_sparql::QueryDatasetSpecification>,
     ) -> UpdateOptions {
-        let read = crate::support::Reading::of(
+        let (read_model, read) = crate::support::Reading::of(
             &self.supports,
             self.compilation,
-            requester.read.access(),
+            &requester.read,
             &self.memory,
             Some(self.cancellation),
         );
@@ -223,6 +223,7 @@ impl UpdateContext<'_> {
             access: requester.read.access().cloned(),
             writable: requester.write.access().cloned(),
             geosparql_stated_only: self.geosparql_stated_only,
+            read_model,
             read: read.map(|read| Arc::new(read) as Arc<dyn nrese_sparql::ReadSource>),
         }
     }
