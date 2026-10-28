@@ -5,14 +5,12 @@ agent, like the office PC's ~/owlrs/guard.sh.
 
 The owner counts as present while someone is at the console and its last input (mouse,
 keyboard) is less than IDLE_MINUTES ago. The last input is the session's own
-(GetLastInputInfo: the task runs in the owner's interactive session); `query user` only says
-whether someone is at the console, because its idle column stays "none" for an active
-console session however long nobody touches it (13 Oct 2026: "none" for a console idle 21
-minutes by its last input; the guard never released in ten hours). Where the last input
-can't be read, `query user`'s idle time decides.
+(GetLastInputInfo: the task runs in the owner's interactive session); Windows' session API
+(WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW) says whether a user is at the
+console. Where the last input can't be read, a user at the console counts as present.
 Then:
 - the queue's retreat file (benches/hosts.toml khaleesi queue.retreat) is written: its first
-  line `present`, or `unknown: <why>` where `query user` couldn't say (the fleet's format,
+  line `present`, or `unknown: <why>` where the session API couldn't say (the fleet's format,
   fleet-issues.md F31), then the time. The measurement queue starts no timed job while it exists;
 - every running timed job is stopped, its whole process tree (taskkill /T /F), by the pid
   file the runner keeps (queue/running/<id>.pid); the runner sees it stopped with the owner
@@ -24,7 +22,7 @@ The owner can free the machine whatever the console shows (13 Oct 2026): while t
 (hosts.toml khaleesi queue.free, S:/nrese-scratch/FREE-UNTIL) holds a time that hasn't passed
 (HH:MM today, or ISO; empty: until it's removed), nobody counts as present, and the runner
 takes timed jobs outside its windows too. A passed time removes the file. The release lifts a
-known reading only: while `query user` can't say, RETREAT stays.
+known reading only: while the session API can't say, RETREAT stays.
 
     pythonw scripts/hosts/khaleesi-guard.py          once (Task Scheduler: every minute)
 """
@@ -43,100 +41,79 @@ HIDDEN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 HOSTS = Path(__file__).resolve().parents[2] / "benches" / "hosts.toml"
 
 
-def idle_minutes(text: str) -> int | None:
-    """`query user`'s idle time as minutes ("none" or "Kein" or ".": 0; "5"; "1:02";
-    "1+02:03"), or None if it isn't one."""
-    value = text.strip().lower()
-    if value in ("none", "kein", ".", "keine"):
-        return 0
-    m = re.fullmatch(r"(?:(\d+)\+)?(?:(\d+):)?(\d+)", value)
-    if not m:
-        return None
-    days, hours, minutes = (int(x) if x else 0 for x in m.groups())
-    return days * 1440 + hours * 60 + minutes
+# Windows' session API (WtsApi32): the console session's state and user, as data (the orchestrator, 28 Oct 2026,
+# PR #52's outer view: three rounds of `query user` text parsing each certified "nobody" wrongly, F1, F4, F5).
+CONNECT_STATE, USER_NAME = 8, 5  # WTS_INFO_CLASS
+ACTIVE, CONNECTED, DISCONNECTED, IDLE = 0, 1, 4, 5  # WTS_CONNECTSTATE_CLASS
+NO_CONSOLE = 0xFFFFFFFF  # WTSGetActiveConsoleSessionId: no session attached to the console
 
 
-# A console idle time that can't be read: it counts as present (round 14 check-b).
-UNREADABLE = -1
+def console_session_id() -> int:
+    """The session attached to the physical console, NO_CONSOLE if none; raises OSError where it can't say."""
+    import ctypes
+    from ctypes import wintypes
+
+    get = ctypes.WinDLL("kernel32").WTSGetActiveConsoleSessionId
+    get.restype = wintypes.DWORD
+    return get()
 
 
-# `query user`'s header, English or German: output without it isn't its table.
-HEADERS = ("username", "benutzername")
+def session_info(session: int, info: int) -> int | str:
+    """WTSQuerySessionInformationW of `session` on this PC: CONNECT_STATE as a number, USER_NAME as text ("" for
+    none); raises OSError where the call fails."""
+    import ctypes
+    from ctypes import wintypes
 
-
-# A row's logon time: a date and a time, with AM or PM where the locale has them.
-LOGON = re.compile(r"\d{1,4}[./-]\d{1,2}[./-]\d{1,4} \d{1,2}:\d{2}(?: [AaPp][Mm])?")
-
-
-# A session name by its form (where the columns don't say): the console, services, or a protocol's `name#N`.
-SESSION = re.compile(r"console|services|[\w.-]+#\d+", re.IGNORECASE)
-
-
-def row(line: str, session_at: int, id_at: int) -> tuple[str | None, int] | None:
-    """One session of `query user`'s table: its session name (None for a disconnected one, which has none)
-    and its idle minutes; None if the line isn't a whole row. The columns: user, session, id, state, idle
-    time, logon time. From the right each is one word, the logon time two or three (AM or PM). Left of the
-    id, a user name may hold spaces (PR #52 fix check 1 F4) and a session name has none:
-    - a row whose id sits in the header's id column (`id_at`) is read by the header's columns: the session
-      starts at `session_at`, and a user name reaching into that column isn't a row;
-    - in any other row the word before the id is the session only if it has a session name's form, so
-      that a name read wrongly can only make a console session, never hide one."""
-    words = [(m.start(), m.group()) for m in re.finditer(r"\S+", line)]
-    logon = 3 if words and words[-1][1].upper() in ("AM", "PM") else 2
-    if len(words) < logon + 4:
-        return None
-    tail = words[-logon - 3:]
-    (id_from, sid), (_, state), (_, idle) = tail[:3]
-    if not sid.isdigit() or not state.isalpha() or not LOGON.fullmatch(" ".join(w for _, w in tail[3:])):
-        return None
-    left = words[:-logon - 3]
-    if abs(id_from - id_at) <= 2:
-        session = left[-1][1] if left and left[-1][0] >= session_at else None
-        user = left[:-1] if session else left
-        if any(at >= session_at for at, _ in user):
-            return None
-    else:
-        session = left[-1][1] if len(left) >= 2 and SESSION.fullmatch(left[-1][1]) else None
-        user = left[:-1] if session else left
-    if not user:
-        return None
-    minutes = idle_minutes(idle)
-    return None if minutes is None else (session, minutes)
-
-
-def console_idle(output: str) -> int | None:
-    """The console session's idle minutes from `query user`'s table, UNREADABLE if the output isn't a
-    whole table (its header, then one or more whole rows), or None if no one is at the console (""
-    : nobody logged on, or a whole table without a console row). PR #52 review F1: a header alone, a
-    row cut short or a row that isn't one says nothing about the console."""
-    lines = [l for l in output.splitlines() if l.strip()]
-    if not lines:
-        return None
-    header = [m.start() for m in re.finditer(r"\S+", lines[0])]
-    if not lines[0].strip().lower().startswith(HEADERS) or len(header) < 3 or len(lines) < 2:
-        return UNREADABLE
-    sessions = [row(line, header[1], header[2]) for line in lines[1:]]
-    if None in sessions:
-        return UNREADABLE
-    return next((idle for session, idle in sessions if (session or "").lower() == "console"), None)
-
-
-def query_user() -> str | None:
-    """`query user`'s table ("" when nobody is logged on), or None when it couldn't say (no answer
-    within its deadline, another failure): None counts as present (round 14 check-b)."""
+    wts = ctypes.WinDLL("wtsapi32", use_last_error=True)
+    query = wts.WTSQuerySessionInformationW
+    query.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p),
+                      ctypes.POINTER(wintypes.DWORD)]
+    query.restype = wintypes.BOOL
+    buffer, size = ctypes.c_void_p(), wintypes.DWORD()
+    if not query(None, session, info, ctypes.byref(buffer), ctypes.byref(size)):
+        raise ctypes.WinError(ctypes.get_last_error())
     try:
-        done = subprocess.run(["query", "user"], capture_output=True, text=True, encoding="oem", errors="replace",
-                              creationflags=HIDDEN, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    # Success with nothing on stdout is a missing reading, not "nobody logged on" (PR #52 review F1).
-    if done.returncode == 0:
-        return done.stdout if done.stdout.strip() else None
-    said = f"{done.stdout}\n{done.stderr}".lower()
-    # Nobody logged on: it says so and exits 1 ("No User exists for *", "Kein Benutzer ...").
-    if done.returncode == 1 and ("no user exists" in said or "kein benutzer" in said):
-        return ""
-    return None
+        if not buffer.value:
+            raise OSError("an empty answer")
+        return ctypes.wstring_at(buffer.value) if info == USER_NAME else ctypes.c_int.from_address(buffer.value).value
+    finally:
+        wts.WTSFreeMemory(buffer)
+
+
+def own_session_id() -> int:
+    """The session this guard runs in, whose last input GetLastInputInfo reads; raises OSError where it can't say."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    session = wintypes.DWORD()
+    if not kernel.ProcessIdToSessionId(kernel.GetCurrentProcessId(), ctypes.byref(session)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return session.value
+
+
+def console() -> tuple[bool | None, str | None]:
+    """Whether a user is at the console (True), nobody is (False), or None and why it can't say. Nobody: no
+    session at the console, or one without a user that is connected (the logon screen, as `query user` said:
+    no console row), disconnected or idle. Any failed call or other state is unknown, and so is a user at the
+    console in another session than the guard's, whose last input it can't read (fast user switching; sol-loop
+    r1 S1). A remote (RDP) session is never the console's."""
+    try:
+        session = console_session_id()
+        if session == NO_CONSOLE:
+            return False, None
+        state, user = session_info(session, CONNECT_STATE), session_info(session, USER_NAME)
+        someone = state in (ACTIVE, CONNECTED) and bool(user)
+        own = own_session_id() if someone else session
+    except (OSError, AttributeError, ValueError) as e:  # AttributeError: not Windows
+        return None, " ".join(f"the console session can't be read ({e})".split())
+    if someone and own != session:
+        return None, f"the console session ({session}) isn't the guard's ({own}): its last input can't be read"
+    if someone:
+        return True, None
+    if not user and state in (CONNECTED, DISCONNECTED, IDLE):
+        return False, None
+    return None, f"the console session is in state {state}, {'with' if user else 'without'} a user"
 
 
 def last_input_minutes() -> float | None:
@@ -158,26 +135,12 @@ def last_input_minutes() -> float | None:
         return None
 
 
-def unknown(output: str | None) -> str | None:
-    """Why `query user` couldn't say who is at the console (no answer, or not a whole table), or None if it
-    could."""
-    if output is None:
-        return "query user gave no answer"
-    if console_idle(output) == UNREADABLE:
-        return "query user's answer isn't a whole table"
-    return None
-
-
-def present(output: str | None, input_idle: float | None = None) -> bool:
-    """Someone at the console (`query user`), and their last input less than IDLE_MINUTES ago
-    (`input_idle`, minutes; else `query user`'s idle column). Unknown is present."""
-    # Unknown before the last input's word (Sol r14 C1: it may speak of another session).
-    if unknown(output):
+def present(someone: bool | None, input_idle: float | None) -> bool:
+    """A user at the console (`someone`, from console()) whose last input was less than IDLE_MINUTES ago
+    (`input_idle`, minutes; where it can't be read, present). Unknown is present."""
+    if someone is None:
         return True
-    idle = console_idle(output)
-    if idle is None:
-        return False
-    return (input_idle if input_idle is not None else idle) < IDLE_MINUTES
+    return someone and (input_idle is None or input_idle < IDLE_MINUTES)
 
 
 def free_until(settings: dict) -> str | None:
@@ -260,9 +223,8 @@ def main() -> int:
     def say(text: str):
         log.write(f"{time.strftime('%F %T')} {text}\n")
 
-    query = query_user()
+    someone, why = console()
     now = int(time.time())
-    why = unknown(query)
     # The owner's release lifts a known reading only: an unknown one keeps RETREAT (PR #52 review F2).
     freed = None if why else free_until(settings)
     if freed:
@@ -270,7 +232,7 @@ def main() -> int:
             retreat.unlink()
             say(f"back: the owner freed the machine until {freed}")
         return 0
-    if present(query, last_input_minutes()):
+    if present(someone, last_input_minutes()):
         # Its first line is the reading's state, the fleet's to read (fleet-issues.md F31); then the time. Written
         # beside it and renamed, so no reader sees half of it.
         state = f"unknown: {why}" if why else "present"
