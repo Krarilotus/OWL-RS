@@ -37,6 +37,7 @@ from suitekit import gatestats  # noqa: E402
 from suitekit.compare import counter_changes  # noqa: E402
 from suitekit import hosts as hosts_registry  # noqa: E402
 from suitekit.hosts import run_identity  # noqa: E402
+from suitekit.checkout import STORED_OBJECTS, checkout_differs  # noqa: E402,F401
 
 CAMPAIGN_BLOCKS = 2  # blocks a round at least (each: every case on every side, twice, as a palindrome)
 PASS_FILE = re.compile(r"pass-(\d+)-([A-Za-z0-9_.-]+)\.json$")
@@ -1345,11 +1346,6 @@ MAIN = "a0020134c20a33eabe8ead0402f814585b9c7fd0"  # main
 MEASUREMENT_SIDES = HERE / "measurement-sides.toml"
 # All a measurement commit may change: the perf lab's sources.
 PERF_LAB = "crates/nrese-store/examples/"
-# The objects as stored, for every git call that decides what a side is built from or whether its
-# measurement ref may go: no replace ref stands another object in, no graft another parent.
-# release-gate.sh exports the same for a whole gate, so the check and the checkout it builds read
-# the same objects (PR #54 review: D1-D3, and fix check 1: a replace ref made after the check).
-STORED_OBJECTS = {"GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull}
 
 
 def measurement_table(path: Path = MEASUREMENT_SIDES) -> dict[str, dict]:
@@ -1412,10 +1408,82 @@ def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str
     return commit
 
 
-def measurement_ref(repo: str, ref: str, commit: str, path: Path = MEASUREMENT_SIDES) -> str:
+def stop_tree(process) -> str | None:
+    """Stops `process` and everything it started, at once (benches/suite/queue.py's stop, without its
+    grace): on Windows taskkill /T, elsewhere its process group, which it must lead; then the
+    process itself, whatever the tree's stop did. What may still run, or None (Sol, S2 D2)."""
+    import subprocess
+    left = None
+    if os.name == "nt":
+        if process.poll() is not None:  # ended at the deadline: taskkill /T can't find its tree
+            left = f"git (pid {process.pid}) ended at the deadline; a process it started may still run"
+        else:
+            try:
+                done = subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True,
+                                      timeout=60)
+                if done.returncode != 0:
+                    why = done.stderr.decode("utf-8", "replace").strip() or f"exit {done.returncode}"
+                    left = f"pid {process.pid}'s process tree may still run (taskkill: {why})"
+            except subprocess.TimeoutExpired:
+                left = f"pid {process.pid}'s process tree may still run (taskkill didn't finish in 60 s)"
+    else:
+        import signal
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    process.kill()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        return "; ".join(filter(None, [f"git (pid {process.pid}) still runs after its stop", left]))
+    return left
+
+
+def published(repo: str, rev: str, remote: str | None, deadline_s: float = 60) -> str | None:
+    """The branch of `remote` whose head has `rev` in its history: the heads the remote names now
+    (git ls-remote), read through this checkout's objects as stored. None if no head has it. Only
+    the remote's word counts: a refs/remotes/* ref is anyone's to write here (Sol, PR #54 fix check
+    1 S2). No remote, a failure or no answer within the deadline (its process tree stopped) is a
+    SystemExit; a head this checkout hasn't fetched proves nothing."""
+    import subprocess
+    import tempfile
+    if not remote:
+        raise SystemExit("no remote to ask whether the side is published (.githooks/pre-push names it)")
+    # Its output into files, not pipes: a transport helper's process left behind (an ssh master,
+    # say) may hold them open after git has answered, and only git's own exit is waited for (Sol,
+    # S2 r1 D1).
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        asking = subprocess.Popen(["git", "-C", repo, "ls-remote", "--heads", remote], stdout=out, stderr=err,
+                                  env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, start_new_session=os.name != "nt")
+        try:
+            asking.wait(timeout=deadline_s)
+        except subprocess.TimeoutExpired:
+            left = stop_tree(asking)
+            raise SystemExit("; ".join(filter(None, [
+                f"{remote} didn't say within {deadline_s:.0f} s which branches it has", left]))) from None
+        out.seek(0)
+        err.seek(0)
+        heads, error = (f.read().decode("utf-8", "replace") for f in (out, err))
+    if asking.returncode != 0:
+        raise SystemExit(f"{remote} couldn't be asked which branches it has: {error.strip()}")
+    stored = {**os.environ, **STORED_OBJECTS}
+    for line in heads.splitlines():
+        head, _, branch = line.partition("\t")
+        here = subprocess.run(["git", "-C", repo, "cat-file", "-e", f"{head}^{{commit}}"], capture_output=True,
+                              timeout=60, env=stored)
+        if here.returncode == 0 and subprocess.run(["git", "-C", repo, "merge-base", "--is-ancestor", rev, head],
+                                                   capture_output=True, timeout=60, env=stored).returncode == 0:
+            return branch
+    return None
+
+
+def measurement_ref(repo: str, ref: str, commit: str, remote: str | None,
+                    path: Path = MEASUREMENT_SIDES) -> str:
     """A pushed refs/measure/* ref (.githooks/pre-push, check.sh push): the ref a side of the table
-    declares, named for that side, whose side is already on a remote ref, at that side's declared
-    commit, which measured_at admits for it. The side; anything else is refused."""
+    declares, named for that side, whose side is already on a branch of the remote it goes to, at
+    that side's declared commit, which measured_at admits for it. The side; anything else is
+    refused."""
     table = measurement_table(path)
     declaring = [rev for rev, side in table.items() if side.get("ref") == ref]
     if not declaring:
@@ -1426,12 +1494,10 @@ def measurement_ref(repo: str, ref: str, commit: str, path: Path = MEASUREMENT_S
     import subprocess
     # The ref's push sends its side's history along, so only a side that is already out may go (T0,
     # 28 Oct 2026: main's and v1.5's sides were ids from before the history rewrite, on no remote).
+    if published(repo, rev, remote) is None:
+        raise SystemExit(f"{ref}: its side {rev[:12]} is on no branch of {remote} (as fetched here): "
+                         "the side must be published")
     stored = {**os.environ, **STORED_OBJECTS}
-    published = subprocess.run(["git", "-C", repo, "for-each-ref", "--count=1", "--format=%(refname)",
-                                "--contains", rev, "refs/remotes"], capture_output=True, text=True, timeout=60,
-                               env=stored)
-    if published.returncode != 0 or not published.stdout.strip():
-        raise SystemExit(f"{ref}: its side {rev[:12]} is on no remote ref: the side must be published")
     done = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", f"{commit}^{{commit}}"],
                           capture_output=True, text=True, timeout=60, env=stored)
     if done.returncode != 0 or done.stdout.strip() != table[rev]["commit"]:
@@ -1792,13 +1858,14 @@ def main() -> int:
     s = sub.add_parser("measurement-ref", help="a pushed refs/measure/* ref and its commit, checked (check.sh push)")
     s.add_argument("ref")
     s.add_argument("commit")
+    s.add_argument("--remote", help="the remote the ref is pushed to, whose branches must have its side")
     args = p.parse_args()
 
     if args.command == "measured-at":
         print(measured_at(str(ROOT), args.rev))
         return 0
     if args.command == "measurement-ref":
-        side = measurement_ref(str(ROOT), args.ref, args.commit)
+        side = measurement_ref(str(ROOT), args.ref, args.commit, args.remote)
         print(f"{args.ref}: the measurement commit of {side[:12]}, admitted (benches/fast/measurement-sides.toml)")
         return 0
     if args.command == "plan":
