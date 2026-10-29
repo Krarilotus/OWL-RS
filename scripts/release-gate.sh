@@ -56,6 +56,14 @@ export PATH=$HOME/.cargo/bin:$PATH
 # measured-at, STORED_OBJECTS) to the checkout a build compiles and its identity: no replace ref,
 # made before the check or after it, stands another object in, and no graft another parent.
 export GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null
+# And writes, reads and removes every path of its checkouts, however long: they lie a few
+# directories down (a run's, a space's), and with a deep work directory a tree's path (123
+# characters) passes Windows' 260, which Git for Windows refuses without core.longpaths (the
+# Windows merge check of PR #60's R4; git elsewhere ignores the key). Added to a caller's own
+# GIT_CONFIG_COUNT settings, never in their place. Python reads such paths where Windows' long
+# paths are on (LongPathsEnabled: KRARIS-GPTLER); where not, the check fails closed.
+configs=${GIT_CONFIG_COUNT:-0}
+export GIT_CONFIG_COUNT=$((configs + 1)) "GIT_CONFIG_KEY_$configs=core.longpaths" "GIT_CONFIG_VALUE_$configs=true"
 GATE=${NRESE_GATE_DIR:-$HOME/owlrs/${GATE_NAME:-gate-v2}}
 # Binaries by build identity, shared by every gate (v1.5's and main's are built once):
 # published whole, never replaced (scripts/lib/gate-publish.sh).

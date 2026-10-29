@@ -1689,6 +1689,33 @@ exec "{git}" "$@"
         self.assertIn("MiB reclaimed", output, f"clean ran:\n{output}")
         self.assertTrue((other / ".gitignore").is_file(), f"SPEC another space's checkout stays:\n{output}")
 
+    def test_a_checkout_past_windows_path_limit_is_made_and_removed(self):
+        """The Windows merge check of PR #60's R4 (gate-windows-6e6f0dd18d-1793236830): the gate's
+        checkouts lie a few directories down, and under the job's work directory the tree's longest
+        path (123 characters) passed Windows' 260: Git for Windows refused to write it, and the gate
+        had no checkout to run from. Its checkouts are made, checked and removed whatever the length
+        of the paths in them. (A checkout's own root stays within git's: an explicit GIT_DIR, which
+        `worktree add` gives its child, must be shorter than PATH_MAX - 40, 220 on Windows,
+        core.longpaths or not.) Only Windows has the limit: elsewhere this holds as it is."""
+        if shutil.which("bash") is None:
+            self.skipTest("needs bash")
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        tmp = self.gate_beside(loop)
+        # A 193-character path in the gate's commit, by plumbing: never in this checkout's files.
+        long = "benches/" + "p" * 90 + "/" + "q" * 90 + ".txt"
+        blob = subprocess.run(["git", "-C", self.repo, "hash-object", "-w", "--stdin"], input="a long path\n",
+                              capture_output=True, text=True, check=True).stdout.strip()
+        self.git("update-index", "--add", "--cacheinfo", f"100644,{blob},{long}")
+        commit = self.git("-c", "user.name=t", "-c", "user.email=t@example.org", "commit-tree", self.git("write-tree"),
+                          "-p", "HEAD", "-m", "a long path")
+        self.git("update-ref", "HEAD", commit)
+        name = "long"
+        output = self.run_gate(tmp, name)
+        self.assertIn("release-gate.sh build REV", output, f"SPEC the code checkout is made and checked:\n{output}")
+        self.assertEqual(list((tmp / name / "gate" / "run").glob("*/[0-9]*-*")), [], "SPEC and removed")
+        listed = self.git("worktree", "list", "--porcelain")
+        self.assertEqual(listed.count("worktree "), 1, f"SPEC its registration with it:\n{listed}")
+
     def space(self, gate: Path) -> Path:
         """This process space's directory in GATE (release-gate.sh's $SPACE), where the gate's
         runs and checkouts lie."""
