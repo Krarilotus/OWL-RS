@@ -30,6 +30,8 @@ now = [
   "era-shacl",
   # the fast cases on their comparators: the answer qualification
   "fast",
+  # property graphs: the storage measurements that decide v2.0's format (30 Oct 2026)
+  "ldbc-snb-interactive-v2",
 ]
 
 backlog = [

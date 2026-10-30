@@ -1,0 +1,100 @@
+# Property graphs (group pg): LDBC SNB Interactive v2 mapped to RDF 1.2, its edge properties on
+# reifiers (benches/property-graphs/README.md: the mapping, its variants A and B, the kit). The
+# storage measurements that decide v2.0's format for traversal: what a load holds (M0) and where
+# a hop's time goes (M1), over the engine's snapshot, work counters before times. NRESE only;
+# not an LDBC benchmark result. The schema: benches/cases/README.md.
+
+[[case]]
+name = "pg-snb-counts-sf1"
+area = "property-graphs"
+what = "M0, counts only: SNB SF1 loaded as variant A (edges with properties reified) and B (every edge): statements per predicate and class, reifiers and triple terms, runs, index and dictionary bytes, the store's size and the load's peak memory; checked against the CSV's counts"
+workload = "ldbc-snb-interactive-v2"
+tier = "sf1"
+levels = ["focused"]
+semantics = "none"
+data = "input:snb/rdf/sf1/snb-a.nt"
+data_alt = "input:snb/rdf/sf1/snb-b.nt"
+tool = "pg_hops"
+args = ["bash", "benches/property-graphs/pg-m0.sh", "1"]
+metric = "quads"
+check = { "check" = "PASSED" }
+pinned = "the mapping's counts (counts.json beside the data)"
+cap_gb = 24
+est_min = 15
+systems = []
+
+[[case]]
+name = "pg-snb-counts-sf3"
+area = "property-graphs"
+what = "M0 at SF3, as pg-snb-counts-sf1: the scaling of keys, dictionary and store size that says whether SF10 fits a host"
+workload = "ldbc-snb-interactive-v2"
+tier = "sf3"
+levels = ["focused"]
+semantics = "none"
+data = "input:snb/rdf/sf3/snb-a.nt"
+data_alt = "input:snb/rdf/sf3/snb-b.nt"
+tool = "pg_hops"
+args = ["bash", "benches/property-graphs/pg-m0.sh", "3"]
+metric = "quads"
+check = { "check" = "PASSED" }
+pinned = "the mapping's counts (counts.json beside the data)"
+cap_gb = 24
+est_min = 30
+systems = []
+
+[[case]]
+name = "pg-hop-out-neighbours"
+area = "property-graphs"
+what = "M1 (a): every person's out-neighbours under knows and incoming hasCreator (its messages), per pattern by quads_for_pattern_in (a search from the root per run) against a ProbeCursor in random and ascending order; runs = 1 and 4"
+workload = "ldbc-snb-interactive-v2"
+tier = "sf1"
+semantics = "none"
+data = "input:snb/rdf/sf1/snb-a.nt"
+data_alt = "input:snb/rdf/sf1/snb-b.nt"
+tool = "pg_hops"
+args = ["m1", "{scratch}/store", "--runs", "1", "--reps", "5", "--only", "a.out.scan.random"]
+page_cache = ["warm", "cold"]
+metric = "phases.ns"
+counters = ["probes", "results", "seeks", "root_searches"]
+check = { "phases.a.out.check" = "equal across access paths" }
+cap_gb = 16
+est_min = 15
+systems = []
+
+[[case]]
+name = "pg-hop-edge-property"
+area = "property-graphs"
+what = "M1 (b): knows.creationDate per edge, forward and backward (clustering helps one direction only), by triple-term composition: the hash probe, the reifier's POSG search, the value's SPOG search, the decoding, each alone and as a nested loop of scans against batched cursors; runs = 1 and 4"
+workload = "ldbc-snb-interactive-v2"
+tier = "sf1"
+semantics = "none"
+data = "input:snb/rdf/sf1/snb-a.nt"
+data_alt = "input:snb/rdf/sf1/snb-b.nt"
+tool = "pg_hops"
+args = ["m1", "{scratch}/store", "--runs", "1", "--reps", "5", "--only", "b.fwd.scan"]
+page_cache = ["warm", "cold"]
+metric = "phases.ns"
+counters = ["probes", "results", "seeks", "root_searches", "hash_probes", "hash_misses", "decoded"]
+check = { "phases.b.fwd.check" = "equal across access paths" }
+cap_gb = 16
+est_min = 15
+systems = []
+
+[[case]]
+name = "pg-hop-bfs"
+area = "property-graphs"
+what = "M1 (c): breadth-first search over knows (both directions), 1-4 hops from 8 seeded people: per node by scan, as the path steps read, against per sorted frontier by cursor; runs = 1 and 4"
+workload = "ldbc-snb-interactive-v2"
+tier = "sf1"
+semantics = "none"
+data = "input:snb/rdf/sf1/snb-a.nt"
+data_alt = "input:snb/rdf/sf1/snb-b.nt"
+tool = "pg_hops"
+args = ["m1", "{scratch}/store", "--runs", "1", "--reps", "5", "--only", "c.bfs.scan"]
+page_cache = ["warm", "cold"]
+metric = "phases.ns"
+counters = ["probes", "results", "seeks", "root_searches"]
+check = { "phases.c.check" = "equal across access paths" }
+cap_gb = 16
+est_min = 15
+systems = []

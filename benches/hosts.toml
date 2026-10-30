@@ -36,7 +36,8 @@ evidence = "/home/krarilotus/nrese-prep-20261009-4e8bd38"
 images = "manifests/image-load-verification.json"
 
 [inputs]
-# Paths under assets.root, on every host with assets = true; the variable overrides.
+# Paths under assets.root (or an entry's own `root`), on every host with assets = true; the
+# variable overrides.
 data = { path = "snapshots/windows/nrese-data", env = "BENCH_DATA", what = "the suite's datasets (suite.py run --data)" }
 general = { path = "snapshots/docker-volumes/nrese-bench-data", env = "BENCH_GENERAL_DATA", what = "the general Docker data volume's contents" }
 fast = { path = "snapshots/docker-volumes/nrese-fast-data", env = "NRESE_FAST_INPUTS", what = "the fast suite's converted ORE ontologies (ore/) and reference taxonomies (ref/)" }
@@ -45,6 +46,9 @@ ore_archive = { path = "snapshots/windows/original-cache-ore2015/ore2015_sample.
 licences = { path = "snapshots/windows/nrese-bench/licenses", env = "NRESE_LICENSES", what = "licence files of restricted systems (never committed)" }
 fuseki = { path = "snapshots/windows/original-cache-tools/apache-jena-fuseki-6.0.0", env = "FUSEKI_HOME", what = "Apache Jena Fuseki for the Jena oracle" }
 images = { path = "images/nrese-bench-source-tags.docker.tar", env = "", what = "the benchmark images; loaded on office-pc as nrese-preserved/*" }
+# A set of its own beside the preserved one: `root` names it, `path` is under it. Read-only,
+# its receipt (SHA256SUMS) and manifest at its root; made by benches/property-graphs (README.md).
+snb = { root = "/home/krarilotus/nrese-assets/ldbc-snb-20261030", path = ".", env = "SNB_ASSETS", what = "LDBC SNB Interactive v2 initial data sets, SF1 and SF3: the published CSV and its RDF 1.2 mappings (variants A and B)" }
 
 [volumes]
 # The Docker volumes the drivers use on a host with Docker; the variable names another for a

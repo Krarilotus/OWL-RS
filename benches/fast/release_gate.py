@@ -54,6 +54,9 @@ def plan(catalog: list[dict], max_gb: float, selection: list[str] | None = None,
     for case in catalog:
         if selection is not None and case["name"] not in selection:
             continue
+        if case.get("tool") in cases_registry.KIT_TOOLS:
+            not_run[case["name"]] = f"run by its kit ({cases_registry.KIT_TOOLS[case['tool']]}), not fast.py"
+            continue
         cap = case["cap_gb"]
         if cap <= min_gb:
             continue
