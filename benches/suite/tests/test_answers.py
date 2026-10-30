@@ -578,9 +578,14 @@ class Hosts(unittest.TestCase):
         self.assertIsNone(hosts.input_path("ore", self.REGISTRY, "khaleesi", {}))
         self.assertIsNone(hosts.input_path("ore", self.REGISTRY, "laptop", {}))
 
-    def test_an_input_with_a_root_of_its_own_is_under_it(self):
-        registry = {**self.REGISTRY, "inputs": {"snb": {"root": "/sets/snb", "path": "rdf"}}}
+    def test_an_input_of_a_set_is_only_on_the_hosts_holding_the_set(self):
+        registry = {"assets": {"root": "/assets", "sets": {"ldbc-snb": "/sets/snb"}},
+                    "inputs": {"snb": {"set": "ldbc-snb", "path": "rdf"}},
+                    "host": {"office-pc": {"hostname": "sus-ai", "assets": True, "sets": ["ldbc-snb"]},
+                             "phuoc-yu": {"hostname": "Phuoc-Yu", "assets": True}}}
         self.assertEqual(hosts.input_path("snb", registry, "sus-ai", {}), Path("/sets/snb/rdf"))
+        # A host with the preserved assets but without the set doesn't have its data.
+        self.assertIsNone(hosts.input_path("snb", registry, "Phuoc-Yu", {}))
 
     def test_a_host_without_docker_is_refused_an_unknown_one_is_not(self):
         self.assertEqual(hosts.lacking(["docker"], self.REGISTRY, "Phuoc-Yu"), ["docker"])
@@ -624,8 +629,13 @@ class Hosts(unittest.TestCase):
     def test_the_repository_registry_reads(self):
         registry = hosts.load()
         self.assertIn("build", registry["host"]["office-pc"]["roles"])
+        sets = registry["assets"].get("sets", {})
         for entry in registry["inputs"].values():
-            self.assertFalse(entry["path"].startswith("/"), "inputs are relative to assets.root")
+            self.assertFalse(entry["path"].startswith("/"), "inputs are relative to assets.root or their set's root")
+            if "set" in entry:
+                self.assertIn(entry["set"], sets, "an input's set is one of assets.sets")
+        for host in registry["host"].values():
+            self.assertLessEqual(set(host.get("sets", [])), set(sets), "a host holds sets of assets.sets")
 
 
 if __name__ == "__main__":

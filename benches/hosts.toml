@@ -34,10 +34,14 @@ evidence = "/home/krarilotus/nrese-prep-20261009-4e8bd38"
 # each alias with its original tags and image ID. A driver asking for an original tag that
 # Docker lacks gets the alias whose ID matches (suitekit/hosts.py image()).
 images = "manifests/image-load-verification.json"
+# Verified datasets beside the preserved copies, each its own root, read-only, its receipt
+# (SHA256SUMS) and manifest at the root: name = directory. A host holds the sets it lists in
+# `sets`, once its copy is verified there; an input of a set is nowhere else.
+sets = { ldbc-snb = "/home/krarilotus/nrese-assets/ldbc-snb-20261030" }
 
 [inputs]
-# Paths under assets.root (or an entry's own `root`), on every host with assets = true; the
-# variable overrides.
+# Paths under assets.root, on every host with assets = true; an input with a `set`: under that
+# set's root, on the hosts listing it. The variable overrides.
 data = { path = "snapshots/windows/nrese-data", env = "BENCH_DATA", what = "the suite's datasets (suite.py run --data)" }
 general = { path = "snapshots/docker-volumes/nrese-bench-data", env = "BENCH_GENERAL_DATA", what = "the general Docker data volume's contents" }
 fast = { path = "snapshots/docker-volumes/nrese-fast-data", env = "NRESE_FAST_INPUTS", what = "the fast suite's converted ORE ontologies (ore/) and reference taxonomies (ref/)" }
@@ -46,9 +50,7 @@ ore_archive = { path = "snapshots/windows/original-cache-ore2015/ore2015_sample.
 licences = { path = "snapshots/windows/nrese-bench/licenses", env = "NRESE_LICENSES", what = "licence files of restricted systems (never committed)" }
 fuseki = { path = "snapshots/windows/original-cache-tools/apache-jena-fuseki-6.0.0", env = "FUSEKI_HOME", what = "Apache Jena Fuseki for the Jena oracle" }
 images = { path = "images/nrese-bench-source-tags.docker.tar", env = "", what = "the benchmark images; loaded on office-pc as nrese-preserved/*" }
-# A set of its own beside the preserved one: `root` names it, `path` is under it. Read-only,
-# its receipt (SHA256SUMS) and manifest at its root; made by benches/property-graphs (README.md).
-snb = { root = "/home/krarilotus/nrese-assets/ldbc-snb-20261030", path = ".", env = "SNB_ASSETS", what = "LDBC SNB Interactive v2 initial data sets, SF1 and SF3: the published CSV and its RDF 1.2 mappings (variants A and B)" }
+snb = { set = "ldbc-snb", path = ".", env = "SNB_ASSETS", what = "LDBC SNB Interactive v2 initial data sets, SF1 and SF3: the published CSV and its RDF 1.2 mappings (variants A and B), made by benches/property-graphs" }
 
 [volumes]
 # The Docker volumes the drivers use on a host with Docker; the variable names another for a
@@ -64,6 +66,8 @@ machine = "AMD Ryzen 9 5950X, 32 threads, 31 GiB"
 roles = ["build", "test", "measure"]
 has = ["docker", "java"]
 assets = true
+# Verified by snb-receipt.sh (pgm-d3-office-1, 30 Oct 2026).
+sets = ["ldbc-snb"]
 queue = { dir = "~/owlrs/queue", windows = ["21:00-06:00"], free = "~/owlrs/FREE", retreat = "~/owlrs/RETREAT", path = ["~/nrese-bench/py312/bin", "~/.cargo/bin"], python = "~/nrese-bench/py312/bin/python3" }
 
 [[host.office-pc.config]]
@@ -81,6 +85,8 @@ machine = "AMD Ryzen 7 7800X3D, 16 threads, 29 GiB"
 roles = ["measure"]
 has = []
 assets = true
+# Verified by snb-receipt.sh (pgm-d3-phuoc-1, 30 Oct 2026).
+sets = ["ldbc-snb"]
 binaries = "office-pc builds; record the source revision and binary SHA-256 and check CPU features and glibc symbols before use"
 queue = { dir = "~/owlrs/queue", windows = ["00:00-24:00"], path = ["~/.cargo/bin"], chunk_min = 30, max_job_min = 240 }
 
