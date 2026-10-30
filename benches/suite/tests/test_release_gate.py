@@ -482,6 +482,13 @@ class Parts(unittest.TestCase):
         run, not_run, elsewhere = gate_module.plan(catalog, 28, min_gb=24)  # the big host's share
         self.assertEqual(run, ["bsbm-bi-100m"])
 
+    def test_plan_leaves_a_kits_cases_to_their_kit(self):
+        # A case of a tool fast.py doesn't run (suitekit/cases.py KIT_TOOLS) is never planned.
+        catalog = [{"name": "small", "cap_gb": 4}, {"name": "pg-hop-bfs", "cap_gb": 4, "tool": "pg_hops"}]
+        run, not_run, _ = gate_module.plan(catalog, 24)
+        self.assertEqual(run, ["small"])
+        self.assertIn("run by its kit (benches/property-graphs)", not_run["pg-hop-bfs"])
+
     def test_guards_are_read_from_performance_md_and_must_each_pass(self):
         names = gate_module.guard_names((ROOT / "docs/design/performance.md").read_text(encoding="utf-8"))
         self.assertIn("ordered_dedup_uses_any_complete_sort_order_without_gathering", names)

@@ -578,6 +578,10 @@ class Hosts(unittest.TestCase):
         self.assertIsNone(hosts.input_path("ore", self.REGISTRY, "khaleesi", {}))
         self.assertIsNone(hosts.input_path("ore", self.REGISTRY, "laptop", {}))
 
+    def test_an_input_with_a_root_of_its_own_is_under_it(self):
+        registry = {**self.REGISTRY, "inputs": {"snb": {"root": "/sets/snb", "path": "rdf"}}}
+        self.assertEqual(hosts.input_path("snb", registry, "sus-ai", {}), Path("/sets/snb/rdf"))
+
     def test_a_host_without_docker_is_refused_an_unknown_one_is_not(self):
         self.assertEqual(hosts.lacking(["docker"], self.REGISTRY, "Phuoc-Yu"), ["docker"])
         self.assertEqual(hosts.lacking(["docker"], self.REGISTRY, "sus-ai"), [])

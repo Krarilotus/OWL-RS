@@ -117,6 +117,10 @@ def select(cases: list[dict], args) -> list[dict]:
         if unknown:
             sys.exit(f"unknown cases: {', '.join(sorted(unknown))}")
         cases = [c for c in cases if c["name"] in wanted]
+        kit = [c["name"] for c in cases if c.get("tool") in cases_registry.KIT_TOOLS]
+        if kit:
+            sys.exit(f"run by their kits, not fast.py: {', '.join(kit)} (suitekit/cases.py KIT_TOOLS)")
+    cases = [c for c in cases if c.get("tool") not in cases_registry.KIT_TOOLS]
     if getattr(args, "areas", None):
         cases = [c for c in cases if c["area"] in args.areas.split(",")]
     return cases
