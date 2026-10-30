@@ -98,3 +98,35 @@ check = { "phases.c.check" = "equal across access paths" }
 cap_gb = 16
 est_min = 15
 systems = []
+
+[[case]]
+name = "pg-occurrence-marking"
+area = "property-graphs"
+what = "M5, counts only: what marking edge occurrences costs: the reifiers' dictionary entries (the mapped data less a copy whose reifier IRIs are their edges' subjects) and the store with a marking statement per reifier; the store with a minted, text-free occurrence kind follows by arithmetic"
+workload = "ldbc-snb-interactive-v2"
+tier = "sf1"
+semantics = "none"
+data = "input:snb/rdf/sf1/snb-a.nt"
+data_alt = "input:snb/rdf/sf1/snb-b.nt"
+tool = "pg_hops"
+args = ["bash", "benches/property-graphs/pg-m5.sh", "1"]
+metric = "dictionary_mapped_bytes"
+cap_gb = 16
+est_min = 15
+systems = []
+
+[[case]]
+name = "pg-placement"
+area = "property-graphs"
+what = "M6, counts only: every statement placed over 4, 16 and 64 ranges by the anchor rule (contiguous id ranges and hashed) and by a hash per term; the forward and backward edge-property hops that cross a range, and the statements an in-edge mirror would hold"
+workload = "ldbc-snb-interactive-v2"
+tier = "sf1"
+semantics = "none"
+data = "input:snb/rdf/sf1/snb-a.nt"
+data_alt = "input:snb/rdf/sf1/snb-b.nt"
+tool = "pg_hops"
+args = ["bash", "benches/property-graphs/pg-m6.sh", "1"]
+metric = "placements.backward_crossing"
+cap_gb = 16
+est_min = 10
+systems = []

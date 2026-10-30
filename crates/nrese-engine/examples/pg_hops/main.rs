@@ -9,7 +9,12 @@
 //! cargo run --release -p nrese-engine --example pg_hops -- update STORE [--seed S] > update.json
 //! cargo run --release -p nrese-engine --example pg_hops -- m1 STORE --runs 1|4
 //!     [--seed S] [--reps R] [--bfs-starts N] [--only PHASE]                         > m1.json
+//! cargo run --release -p nrese-engine --example pg_hops -- m6 STORE                 > m6.json
 //! ```
+//!
+//! - `m6` (counts only) places every statement under the anchor rule in contiguous ranges, the
+//!   anchor rule hashed, and a hash of each term, for 4, 16 and 64 ranges, and counts the
+//!   edge-property hops that cross a range and what an in-edge mirror would hold ([`m6`]).
 //!
 //! - `load` bulk-loads the N-Triples file into a durable store (a checkpoint, one run).
 //! - `m0` opens it and counts: quads, runs, index and dictionary bytes, the store on disk,
@@ -77,6 +82,7 @@ fn main() {
             j.done()
         }
         Some("m1") => m1(&args[1..]),
+        Some("m6") => m6(Path::new(&args[1]), &[4, 16, 64]),
         _ => {
             eprintln!(
                 "usage: pg_hops load DATA STORE | m0 STORE [--probe IRI]... | update STORE | m1 STORE --runs N ..."
@@ -196,6 +202,18 @@ fn m0(store: &Path, probes: &[String]) -> String {
         .num("store_bytes", directory_bytes(store))
         .num("reifier_statements", reifiers)
         .num("reified_triple_terms", terms.len() as u64);
+    // The store's files (checkpoint, log), by name: which bytes are the checkpoint's.
+    let mut files: Vec<(String, u64)> = std::fs::read_dir(store)
+        .expect("read the store's directory")
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| {
+            let bytes = e.metadata().map_or(0, |m| m.len());
+            (e.file_name().to_string_lossy().into_owned(), bytes)
+        })
+        .collect();
+    files.sort();
+    j.map("files", &files);
     let mut sorted: Vec<_> = predicates.iter().map(|(&p, &n)| (name(p), n)).collect();
     sorted.sort();
     j.map("predicates", &sorted);
@@ -552,6 +570,222 @@ fn update(engine: &Engine, rng: &mut SplitMix) -> Work {
         results: deleted.len() as u64,
         ..Work::default()
     }
+}
+
+/// An edge occurrence: a reifier `r` of the asserted triple `(s p o)` through the triple term `t`.
+#[derive(Clone, Copy)]
+struct Occurrence {
+    r: u64,
+    t: u64,
+    s: u64,
+    p: u64,
+    o: u64,
+}
+
+/// What M6 counts per placement scheme and range count: the edge-property hops that cross a
+/// range, forward (from `s`) and backward (from `o`), the statements an in-edge mirror would
+/// hold, and the ranges' balance (largest range's placed keys over the mean).
+#[derive(Default, Clone, Copy)]
+struct Crossing {
+    forward: u64,
+    backward: u64,
+    mirrored_occurrences: u64,
+    mirrored_statements: u64,
+}
+
+/// M6, counts only: the placement of every statement under three schemes, for each range
+/// count in `ranges`:
+/// - `anchor`: the anchor rule (an occurrence and a triple term at their edge's subject, every
+///   other term at itself), anchors in contiguous id ranges of equal placed keys;
+/// - `anchor-hash`: the anchor rule, anchors placed by a hash;
+/// - `term-hash`: every term at a hash of itself (no anchor rule).
+///
+/// A statement's keys are placed by the leading node component of each permutation of the
+/// asserted layout: the subject for SPOG, GSPO and GPSO (3 keys), the object for POSG, OSPG,
+/// GPOS and GOSP (4). A forward hop from `s` reads `s`'s out-edge, the triple term, `r rdf:reifies
+/// t` and `r`'s properties; it crosses where any of them is placed away from `s`. A backward hop
+/// from `o` reads `o`'s in-edge and the same three; it crosses where any is away from `o`, and an
+/// in-edge mirror would then hold `r`'s properties at `o`.
+fn m6(store: &Path, ranges: &[u64]) -> String {
+    let engine = Engine::open(store, config()).expect("open the store");
+    let stats = engine.stats();
+    let snapshot = engine.snapshot();
+    let reifies = lookup(&snapshot, REIFIES).expect("rdf:reifies");
+    // The occurrences: reifiers of asserted triples.
+    let mut occurrences: Vec<Occurrence> = Vec::new();
+    let mut unasserted = 0u64;
+    for q in snapshot.quads_for_pattern_in(hops::MODEL, &pattern(None, Some(reifies), None)) {
+        let [s, p, o] = snapshot
+            .components(q.object)
+            .expect("rdf:reifies has a triple term");
+        if snapshot.exists_in(hops::MODEL, &pattern(Some(s), Some(p), Some(o))) {
+            occurrences.push(Occurrence {
+                r: q.subject.raw(),
+                t: q.object.raw(),
+                s: s.raw(),
+                p: p.raw(),
+                o: o.raw(),
+            });
+        } else {
+            unasserted += 1;
+        }
+    }
+    occurrences.par_sort_unstable_by_key(|x| x.r);
+    let mut terms: Vec<(u64, u64)> = occurrences.iter().map(|x| (x.t, x.s)).collect();
+    terms.par_sort_unstable();
+    terms.dedup();
+    let reifier = |id: u64| occurrences.binary_search_by_key(&id, |x| x.r).ok();
+    let anchor = |id: u64| match reifier(id) {
+        Some(i) => occurrences[i].s,
+        None => terms
+            .binary_search_by_key(&id, |x| x.0)
+            .map_or(id, |i| terms[i].1),
+    };
+    let hash = |id: u64, p: u64| {
+        let mut z = id.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        (z ^ (z >> 31)) % p
+    };
+    // Every statement's placed keys at its anchors (and, for the hash per term, at its own
+    // subject's and object's hash), and each occurrence's properties.
+    let mut subjects = Vec::with_capacity(stats.quads as usize);
+    let mut objects = Vec::with_capacity(stats.quads as usize);
+    let mut termed: Vec<Vec<u64>> = ranges.iter().map(|&p| vec![0; p as usize]).collect();
+    let mut properties = vec![0u32; occurrences.len()];
+    for q in snapshot.quads_for_pattern_in(hops::MODEL, &pattern(None, None, None)) {
+        let (s, o) = (q.subject.raw(), q.object.raw());
+        subjects.push(anchor(s));
+        objects.push(anchor(o));
+        for (loads, &p) in termed.iter_mut().zip(ranges) {
+            loads[hash(s, p) as usize] += 3;
+            loads[hash(o, p) as usize] += 4;
+        }
+        if q.predicate != reifies
+            && let Some(i) = reifier(s)
+        {
+            properties[i] += 1;
+        }
+    }
+    subjects.par_sort_unstable();
+    objects.par_sort_unstable();
+    // Per distinct anchor, its keys: 3 per statement it leads by subject, 4 by object.
+    let mut weights: Vec<(u64, u64)> = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < subjects.len() || j < objects.len() {
+        let next = match (subjects.get(i), objects.get(j)) {
+            (Some(&a), Some(&b)) => a.min(b),
+            (Some(&a), None) => a,
+            (None, Some(&b)) => b,
+            (None, None) => unreachable!("the loop ends first"),
+        };
+        let mut w = 0;
+        while subjects.get(i) == Some(&next) {
+            w += 3;
+            i += 1;
+        }
+        while objects.get(j) == Some(&next) {
+            w += 4;
+            j += 1;
+        }
+        weights.push((next, w));
+    }
+    drop((subjects, objects));
+    let total: u64 = weights.iter().map(|w| w.1).sum();
+    // The object's anchor per occurrence (its subject's, the triple term's and the reifier's
+    // anchor is `s` by the rule).
+    let objects: Vec<u64> = occurrences.par_iter().map(|x| anchor(x.o)).collect();
+    let mut rows = Vec::new();
+    for (&p, termed) in ranges.iter().zip(&termed) {
+        // Contiguous ranges of anchors, each closed once it holds its share of the keys.
+        let mut cuts = vec![0u64];
+        let mut loads = vec![0u64];
+        let mut acc = 0;
+        for &(id, w) in &weights {
+            if acc >= total * cuts.len() as u64 / p && (cuts.len() as u64) < p {
+                cuts.push(id);
+                loads.push(0);
+            }
+            acc += w;
+            *loads.last_mut().expect("one range at least") += w;
+        }
+        let range = |id: u64| (cuts.partition_point(|&c| c <= id) - 1) as u64;
+        let mut hashed = vec![0u64; p as usize];
+        for &(id, w) in &weights {
+            hashed[hash(id, p) as usize] += w;
+        }
+        let balance =
+            |loads: &[u64]| *loads.iter().max().expect("ranges") as f64 / (total as f64 / p as f64);
+        let schemes: [(&str, f64); 3] = [
+            ("anchor", balance(&loads)),
+            ("anchor-hash", balance(&hashed)),
+            ("term-hash", balance(termed)),
+        ];
+        for (k, (name, balanced)) in schemes.into_iter().enumerate() {
+            let mut c = Crossing::default();
+            let mut by_label: std::collections::BTreeMap<u64, (u64, u64, u64)> = Default::default();
+            for ((x, &n), &ao) in occurrences.iter().zip(&properties).zip(&objects) {
+                // Where the subject, the object, the triple term and the reifier are placed.
+                let [s, o, t, r] = match k {
+                    0 => [range(x.s), range(ao), range(x.s), range(x.s)],
+                    1 => [hash(x.s, p), hash(ao, p), hash(x.s, p), hash(x.s, p)],
+                    _ => [hash(x.s, p), hash(x.o, p), hash(x.t, p), hash(x.r, p)],
+                };
+                // Forward: s's out-edge at s, then t and r; backward: o's in-edge at o, then t and r.
+                let forward = t != s || r != s;
+                let backward = t != o || r != o;
+                c.forward += u64::from(forward);
+                c.backward += u64::from(backward);
+                // A mirror is of the anchor rule: under a hash per term the backward hop also
+                // reads the triple term at its own hash, which a copy of r's properties at o
+                // wouldn't bring there.
+                if backward && k < 2 {
+                    c.mirrored_occurrences += 1;
+                    c.mirrored_statements += u64::from(n);
+                }
+                let e = by_label.entry(x.p).or_default();
+                e.0 += 1;
+                e.1 += u64::from(forward);
+                e.2 += u64::from(backward);
+            }
+            let mut row = Json::new();
+            row.num("ranges", p)
+                .str("scheme", name)
+                .num("occurrences", occurrences.len() as u64)
+                .num("forward_crossing", c.forward)
+                .num("backward_crossing", c.backward)
+                .float("largest_range_over_mean", balanced);
+            if k < 2 {
+                row.num("mirrored_occurrences", c.mirrored_occurrences)
+                    .num("mirrored_statements", c.mirrored_statements);
+            }
+            let labels: Vec<String> = by_label
+                .iter()
+                .map(|(&label, &(n, f, b))| {
+                    let name = snapshot
+                        .decode(TermId::from_raw(label))
+                        .map_or_else(|| format!("?{label}"), |t| t.to_string());
+                    format!("{}:[{n},{f},{b}]", quote(&name))
+                })
+                .collect();
+            row.raw("by_label", &format!("{{{}}}", labels.join(",")));
+            rows.push(row.done());
+        }
+    }
+    let mut j = Json::new();
+    j.num("quads", stats.quads)
+        .num("index_mapped_bytes", stats.index_mapped_bytes)
+        .num("store_bytes", directory_bytes(store))
+        .num("occurrences", occurrences.len() as u64)
+        .num("unasserted_reifiers", unasserted)
+        .num(
+            "occurrence_properties",
+            properties.iter().map(|&n| u64::from(n)).sum(),
+        )
+        .num("anchors", weights.len() as u64)
+        .num("placed_keys", total)
+        .raw("placements", &format!("[{}]", rows.join(",")));
+    j.done()
 }
 
 fn lookup(snapshot: &Snapshot, iri: &str) -> Option<TermId> {
