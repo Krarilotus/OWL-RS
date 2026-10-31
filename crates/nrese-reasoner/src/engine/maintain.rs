@@ -174,25 +174,29 @@ pub fn maintain(
     // a round that derived nothing, where a materialisation holds about 140 (DMW's A/B,
     // fleet pm-dmwab-3, 21 Oct 2026). Not over a compact stack: its closure lists
     // equalities over representatives, which the datatype checks don't read as the delta's
-    // expanded ones (Sol r1 F1). Nor where the closure concludes a fact no store holds (a
-    // literal subject): whether the change derives such a fact anew can't be told from a
+    // expanded ones (Sol r1 F1). A fact no store holds (a literal subject) is new to the
+    // state where the axioms' own closure concludes none, as the state before held only
+    // that closure: such facts of the load's closure are reported with its others. Where
+    // the axioms conclude one, whether the change derives it anew can't be told from a
     // state that can't hold it, so the delta executor, which follows the derivations,
-    // decides those (Sol r2 F1, r3 F1).
-    let mut first_load = !revived
+    // takes the change; either is decided before any run (Sol r2 F1, r3 F1; review r1 F1).
+    let first_load = !revived
         && !program.stores_representatives()
         && program
             .plan
             .is_none_or(|plan| plan == delta::policy::Plan::Rebuild)
         && tx.base().len_in(ReadModel::Asserted) == 0
         && tx.deleted().next().is_none()
-        && tx.inserted().next().is_some();
+        && tx.inserted().next().is_some()
+        && program.axioms_conclude_only_storable(tx.base(), stop)?;
+    let mut unstorable: Vec<Triple> = Vec::new();
     if first_load {
-        let closure = super::materialise_until(program, &tx.pending_snapshot(), stop)?;
-        if closure.unstorable.is_empty() {
-            rebuilt = Some(closure);
-        } else {
-            first_load = false;
-        }
+        rebuilt = Some(super::materialise::materialise_with_unstorable_until(
+            program,
+            &tx.pending_snapshot(),
+            stop,
+            &mut unstorable,
+        )?);
     }
     let update = {
         let base = EngineBase::new(tx, &program.axioms);
@@ -243,8 +247,8 @@ pub fn maintain(
         if inserted.is_empty() && deleted.is_empty() {
             delta::Update::default()
         } else if let Some(closure) = rebuilt.as_ref().filter(|_| first_load) {
-            // The new inferred facts, as the delta executor reports them (its `insert`): every
-            // one storable (above), so the state tells which it held before.
+            // The new inferred facts, as the delta executor reports them (its `insert`): the
+            // state tells which storable ones it held before, and none it can't hold (above).
             let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
             let derived: Vec<Triple> = closure
                 .inferred
@@ -253,6 +257,7 @@ pub fn maintain(
                 .filter(|&f| {
                     !base.is_asserted(f) && !(base.contains(f) && !inserted_set.contains(&f))
                 })
+                .chain(unstorable.drain(..))
                 .collect();
             delta::Update {
                 violations: delta::introduced_violations(&base, &inserted, &derived, rules, ground),
