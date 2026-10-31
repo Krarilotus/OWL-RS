@@ -9,7 +9,9 @@
 # the hooks: CONTRIBUTING.md.
 #
 # Git's lines on stdin: <local ref> <local sha> <remote ref> <remote sha>; $1 is the remote, $2 its
-# URL, which a measurement ref's check asks for its branches (NRESE_PUSH_REMOTE).
+# URL, which a measurement ref's check asks for its branches (NRESE_PUSH_REMOTE). Both tiers are
+# told the ref the commit goes to (NRESE_PUSH_REF), each ref's own over whatever the pusher's
+# environment holds: refactor/engine-v2's makes their jobs merge gates on the fleet.
 cd "$(git rev-parse --show-toplevel)" || exit 2
 remote=${1:-origin}
 url=${2:-$remote}
@@ -35,7 +37,8 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     continue
   fi
   if [ "$remote_ref" = refs/heads/refactor/engine-v2 ]; then
-    env -u NRESE_ON_BUILD_HOST -u NRESE_FILES_FROM bash scripts/check.sh windows "$local_sha" < /dev/null || code=1
+    env -u NRESE_ON_BUILD_HOST -u NRESE_FILES_FROM NRESE_PUSH_REF="$remote_ref" \
+      bash scripts/check.sh windows "$local_sha" < /dev/null || code=1
   fi
 done
 [ $gated -gt 0 ] || echo "pre-push: deletions only, nothing to gate" >&2

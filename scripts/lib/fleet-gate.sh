@@ -16,10 +16,11 @@
 # scripts/lib/gate-key.sh) and left no tracked file changed.
 #
 # The merge check's jobs are the fleet's merge gates (`priority_class = "merge-gate"`, a class its
-# config ranks): the Windows part always, the push tier when COMMIT is for refactor/engine-v2, i.e.
-# NRESE_PUSH_REF, the ref it goes to, is refs/heads/refactor/engine-v2: the pre-push hook's, or by
-# hand the caller's word (a merge check run before its push states it). A package's push isn't one,
-# a merge among its commits or not (Sol, merge-gate-class r1), nor a check by hand that names no ref.
+# config ranks): either tier's job when COMMIT is for refactor/engine-v2, i.e. NRESE_PUSH_REF, the
+# ref it goes to, is refs/heads/refactor/engine-v2: the pre-push hook's, or by hand the caller's
+# word (a merge check run before its push states it for both tiers). A package's push or Windows
+# check isn't one, a merge among its commits or not (Sol, merge-gate-class r1; PR #69 r1 R1), nor a
+# check by hand that names no ref.
 #
 # A failure on a host whose failures don't count alone (NRESE_GATE_UNCONFIRMED_HOSTS, default
 # khaleesi and khaleesi-wsl: the owner, 20 Oct 2026, its RAM never formally verified) is reported
@@ -72,9 +73,9 @@ case $mode in
   *) cores=${NRESE_GATE_CORES:-2} ram=${NRESE_GATE_RAM_GB:-4} est=${NRESE_GATE_EST_MIN:-10} ;;
 esac
 priority=${NRESE_GATE_PRIORITY:-600}
-# The merge check's jobs (above): the Windows part, and the push tier of a commit for engine-v2.
+# The merge check's jobs (above): either tier's, for a commit that goes to engine-v2.
 class=""
-if [ "$mode" = windows ] || { [ "$mode" = push ] && [ "${NRESE_PUSH_REF:-}" = refs/heads/refactor/engine-v2 ]; }; then
+if [ "${NRESE_PUSH_REF:-}" = refs/heads/refactor/engine-v2 ]; then
   class=merge-gate
 fi
 job=$(mktemp)
