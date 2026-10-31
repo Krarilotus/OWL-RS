@@ -921,6 +921,74 @@ pub fn update_with<B: Base + ?Sized>(
     Ok(result)
 }
 
+/// The consistency violations a change that only inserts introduces, given the facts it
+/// adds: `inserted` (asserted, new to the state) and `derived` (inferred, not visible
+/// before). [`update_with`]'s own last phase without its insert rounds, for a caller that
+/// derived the new facts in bulk (a first load, [`crate::engine::maintain`]): the same
+/// report, through the new facts only, with the ground program extended by the instances of
+/// new schema and list facts as phase 3 extends it.
+pub fn introduced_violations<B: Base + ?Sized>(
+    base: &B,
+    inserted: &[Triple],
+    derived: &[Triple],
+    rules: Rules<'_>,
+    cache: Option<&GroundProgram>,
+) -> Vec<Violation> {
+    let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
+    let empty = Store::default();
+    let computed: Option<GroundProgram> = cache.is_none().then(|| {
+        rules.program(&Overlay {
+            base,
+            hidden: &inserted_set,
+            extra: &empty,
+        })
+    });
+    let old_program: &GroundProgram = cache.or(computed.as_ref()).expect("one of them");
+    let settled_consistency = old_program.consistency.len();
+    let mut new_facts: Vec<Triple> = inserted.iter().chain(derived).copied().collect();
+    new_facts.sort_unstable();
+    new_facts.dedup();
+    let mut fresh = Store::new(Vec::new());
+    fresh.advance(new_facts);
+    let hidden = HashSet::new();
+    let state = Overlay {
+        base,
+        hidden: &hidden,
+        extra: &fresh,
+    };
+    let mut program: Cow<'_, GroundProgram> = Cow::Borrowed(old_program);
+    let mut delta_facts = Vec::new();
+    fresh.scan([None, None, None], Seg::Delta, &mut |f| delta_facts.push(f));
+    if delta_facts.iter().any(|&f| rules.schema.is_schema_fact(f)) {
+        program
+            .to_mut()
+            .ground_delta(&state, rules.schema, &rules.schema_rules());
+    }
+    if delta_facts.iter().any(|&f| rules.is_list_fact(f))
+        && let Some(vocabulary) = rules.lists
+    {
+        let (list_rules, premises, diagnostics) =
+            super::lists::instantiate_with_premises(vocabulary, &AllFacts(&state));
+        let program = program.to_mut();
+        program.ground_with_premises(&state, rules.schema, &list_rules, &premises);
+        program.list_diagnostics = diagnostics;
+    }
+    let variants: Vec<(usize, usize)> = program
+        .consistency_variants(&fresh)
+        .into_iter()
+        .filter(|&(c, _)| c < settled_consistency)
+        .collect();
+    let mut found = HashSet::new();
+    check(
+        &state,
+        &program,
+        settled_consistency..program.consistency.len(),
+        &variants,
+        &mut found,
+    );
+    sorted(found)
+}
+
 /// The facts of `base` that mention one of `terms`, in any position: each through its
 /// first position that holds one of them, so once (more often only if the base reports it
 /// more often, asserted in several graphs; every use takes it as a set).
