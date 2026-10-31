@@ -17,6 +17,7 @@ unique across all of them; its group is its file's name.
 | `reasoning.toml` | reasoning | the rule reasoners on theirs: RDFox, GraphDB, Nemo, VLog, Soufflé; Claros, SSPE, SPB, Datalog programs, OWL2Bench RL and QL |
 | `dl.toml` | dl | the DL reasoners and OBDA on theirs: Konclude, HermiT, Openllet, ELK, PAGOdA, Ontop; ORE 2015, OWL2Bench EL and DL, NPD |
 | `breadth.toml` | breadth | SHACL, GeoSPARQL, text, RDF 1.2, federation, vectors, larger than memory |
+| `pg.toml` | pg | property graphs: LDBC SNB mapped to RDF 1.2, the storage measurements (load counts, a hop's micro-costs) |
 
 A benchmark family (BSBM, WatDiv, LUBM, ...) is an entry in
 [suite/workloads.toml](../suite/workloads.toml): its source, licence, tiers and state, for
@@ -54,10 +55,10 @@ cap_gb = 16; est_min = 20
 | `needs` | `docker`, `java`, `apptainer`: what the host must have; a runner refuses a host without |
 | `scenario` | `native` (default; each system as its documentation tunes it), `matched` (the same CPUs and memory for all) or `frontier` (one dimension swept) |
 | `semantics` | what NRESE computes: `none`, `rdfs`, `rdfs-full`, `rdfs-plus`, `owl-horst`, `owl2-ql`, `owl2-rl`, `owl2-el`, `owl2-dl`, `custom` (N3 rules), `el`, `dl`, `canonical`. Required |
-| `data` | `KIND key=value ...` for `perf_lab generate` (seeded, with its own answers in `.expect.json`), `volume:FILE` (the datasets: a full-level case's file is frozen in [../datasets.toml](../datasets.toml)), `ore:ID` (an ORE 2015 ontology), `concat:A+B`, or `none`. Required |
+| `data` | `KIND key=value ...` for `perf_lab generate` (seeded, with its own answers in `.expect.json`), `volume:FILE` (the datasets: a full-level case's file is frozen in [../datasets.toml](../datasets.toml)), `input:NAME/PATH` (a file of a verified shared input, [../hosts.toml](../hosts.toml) `[inputs]`, its receipts beside it), `ore:ID` (an ORE 2015 ontology), `concat:A+B`, or `none`. Required |
 | `extra`, `data_alt` | more data specs loaded with it; a second file the DL tools check |
 | `queries` | a directory of `.rq` files: `NAME` (benches/fast/queries/NAME), `@FAMILY` (benches/competitors/queries/FAMILY), `lubm` or `owl2bench` (benches/reasoning/queries), or a generated set (`@vectors`, `@parse`, `@cache-log`) |
-| `tool`, `args`, `env`, `setup`, `repeat`, `sweep`, `tool_loads` | how NRESE measures it: `perf_lab` (default), `tableau`, `classify-el`, `classify-horn`; their arguments (`{data}`, `{scratch}` substituted), environment, a one-time setup, fresh-process repetitions, argument sweeps |
+| `tool`, `args`, `env`, `setup`, `repeat`, `sweep`, `tool_loads` | how NRESE measures it: `perf_lab` (default), `tableau`, `classify-el`, `classify-horn`, `pg_hops` (nrese-engine's example: a property graph's load counts and hop micro-costs, run by benches/property-graphs); their arguments (`{data}`, `{scratch}` substituted), environment, a one-time setup, fresh-process repetitions, argument sweeps |
 | `page_cache` | `["warm"]` (default) or `["warm", "cold"]`: fresh processes alternate, the page cache emptied before each cold one by the host's `cold_cache` command; a host without one runs warm and says so |
 | `timeout_s`, `cap_gb` | the time limit of a DL tool; the memory cap without swap (required) |
 | `metric`, `counters` | the number the case is timed by (a path in the result: `sum_p50_ms`, `reason.p50_ms`, `load_s`, `cold_ms`, `whole_ms`, `clients.p99_ms`, ...); further work counters to compare exactly. `metric` is required |
@@ -72,9 +73,10 @@ cap_gb = 16; est_min = 20
 | `guards` | the wins of docs/design/performance.md §0 the case measures |
 
 Areas: `access`, `cache`, `concurrency`, `dl`, `federation`, `geo`, `kernel`, `layout`, `load`,
-`maintenance`, `memory`, `operator`, `parse`, `plan`, `query`, `rdf12`, `reasoning`,
-`rules`, `service`, `shacl`, `text`, `vector`. `access` is reasoning under access control: what
-a restricted reader may see of the inferred statements.
+`maintenance`, `memory`, `operator`, `parse`, `plan`, `property-graphs`, `query`, `rdf12`,
+`reasoning`, `rules`, `service`, `shacl`, `text`, `vector`. `access` is reasoning under access
+control: what a restricted reader may see of the inferred statements. `property-graphs` is a
+property graph stored as RDF 1.2 (edges with properties reified): its storage, hops and paths.
 
 Paths in a perf-lab result: `reason.inferred`, `reason.rounds`, `reason.p50_ms`,
 `commits.p50_ms`, `commits.incremental`, `closure_after_commits.equal`, `loaded`, `load_s`,
