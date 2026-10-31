@@ -17,9 +17,6 @@ use crate::lists::ListDiagnostic;
 pub struct Closure {
     /// The storable inferred statements (in the default graph).
     pub inferred: Vec<EncodedTriple>,
-    /// The derived facts no store can hold (a literal subject, a non-IRI predicate). A
-    /// first load whose closure has any takes the delta executor ([`super::maintain`]).
-    pub unstorable: Vec<Triple>,
     pub violations: Vec<Violation>,
     /// List axioms that weren't instantiated.
     pub diagnostics: Vec<ListDiagnostic>,
@@ -37,6 +34,48 @@ pub fn materialise_until(
     program: &Program,
     snapshot: &Snapshot,
     stop: crate::eval::Stop<'_>,
+) -> Result<Closure, delta::Interrupted> {
+    closure_until(program, snapshot, stop, None)
+}
+
+/// [`materialise_until`], with the derived facts no store can hold (a literal subject, a
+/// non-IRI predicate) appended to `unstorable`, for a first load that reports them
+/// ([`super::maintain`]). Nothing else keeps them: a rematerialisation would hold them
+/// through its heap's peak.
+pub(super) fn materialise_with_unstorable_until(
+    program: &Program,
+    snapshot: &Snapshot,
+    stop: crate::eval::Stop<'_>,
+    unstorable: &mut Vec<Triple>,
+) -> Result<Closure, delta::Interrupted> {
+    closure_until(program, snapshot, stop, Some(unstorable))
+}
+
+impl Program {
+    /// Whether the closure of the axioms alone concludes only facts a store can hold, read
+    /// from `empty`, a snapshot with no asserted statement: then each such fact a first
+    /// load's closure holds is new to the state (review r1 F1, [`super::maintain`]).
+    /// Computed once for the program; `Err` if `stop` fired first.
+    pub(super) fn axioms_conclude_only_storable(
+        &self,
+        empty: &Snapshot,
+        stop: crate::eval::Stop<'_>,
+    ) -> Result<bool, delta::Interrupted> {
+        if let Some(&known) = self.axioms_storable.get() {
+            return Ok(known);
+        }
+        debug_assert_eq!(empty.len_in(ReadModel::Asserted), 0);
+        let mut unstorable = Vec::new();
+        closure_until(self, empty, stop, Some(&mut unstorable))?;
+        Ok(*self.axioms_storable.get_or_init(|| unstorable.is_empty()))
+    }
+}
+
+fn closure_until(
+    program: &Program,
+    snapshot: &Snapshot,
+    stop: crate::eval::Stop<'_>,
+    mut unstorable: Option<&mut Vec<Triple>>,
 ) -> Result<Closure, delta::Interrupted> {
     nrese_exec::heap::phase("reasoner: input");
     let (input, axioms) = input_of(program, snapshot);
@@ -76,17 +115,15 @@ pub fn materialise_until(
     // At its exact size: collected by doubling, the list held up to twice the facts, and
     // at a doubling three times, beside them (LUBM 1000: 6.6 GB at this step's peak).
     let mut inferred = Vec::with_capacity(result.derived.len() + axioms.len());
-    let mut unstorable = Vec::new();
     for t in result.derived.into_iter().chain(axioms) {
         if storable(t) {
             inferred.push(encode(t));
-        } else {
+        } else if let Some(unstorable) = unstorable.as_deref_mut() {
             unstorable.push(t);
         }
     }
     Ok(Closure {
         inferred,
-        unstorable,
         violations,
         diagnostics: result.diagnostics,
         rounds: result.rounds,

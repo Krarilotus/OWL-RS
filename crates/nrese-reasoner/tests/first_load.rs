@@ -14,7 +14,9 @@ use nrese_reasoner::{
 const PREFIX: &str = "@prefix ex: <http://example.com/> . @prefix owl: <http://www.w3.org/2002/07/owl#> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . @prefix xsd: <http://www.w3.org/2001/XMLSchema#> . ";
 
 /// Each fixture under every equality mode and plan: the same violations and diagnostics,
-/// and the recomputed stack where it commits.
+/// and the recomputed stack where it commits. Where the stack holds every identity, the
+/// cheapest plan materialises the load once, a literal's conclusion included (review r1
+/// F1: it ran the batch, dropped it and ran the delta executor).
 #[test]
 fn a_first_load_reports_what_every_plan_reports() {
     let fixtures = [
@@ -81,6 +83,13 @@ fn a_first_load_reports_what_every_plan_reports() {
                         tx.insert(quad.unwrap().as_ref());
                     }
                     let done = maintain(&program, None, &mut tx, &|| false).unwrap();
+                    if plan.is_none() && !compact {
+                        assert_eq!(
+                            done.work.plan,
+                            Plan::Rebuild,
+                            "{name} reps={representatives}: a first load is materialised once"
+                        );
+                    }
                     let mut violations = done
                         .violations
                         .iter()
@@ -230,10 +239,11 @@ fn a_first_load_tolerates_a_datatype_violation_the_axioms_had_before() {
 }
 
 /// A new assertion that derives again a conclusion no store holds (`ex:new ex:age -1` beside
-/// the axiom's `ex:old ex:age -1`): new to the delta, which reports its `dt-not-type`. Such
-/// a closure takes the delta executor, and the verdicts agree (Sol r3 F1).
+/// the axiom's `ex:old ex:age -1`): new to the delta, which reports its `dt-not-type`. Where
+/// the axioms' own closure concludes such a fact, the load takes the delta executor, and the
+/// verdicts agree (Sol r3 F1).
 #[test]
-fn a_first_load_that_concludes_an_unstorable_fact_takes_the_delta() {
+fn a_first_load_whose_axioms_conclude_an_unstorable_fact_takes_the_delta() {
     use nrese_reasoner::{RuleProgram, UserRules};
     let user = std::sync::Arc::new(
         UserRules::n3(
