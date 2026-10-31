@@ -1,7 +1,8 @@
 """The commit tier (.githooks/pre-commit, scripts/check.sh commit): checks of a few seconds on this
 machine, with no build, lint or test and no build host (process review 20 Oct 2026 §3A, the owner's
 yes: "branches may hold unchecked commits; only checked trees land"). The compile, the lints and the
-tests run on the fleet, by the tree that is pushed (test_push_gate.py). What the tier keeps still
+tests run on the fleet before a tree lands: the push tier for that exact tree, the Windows part for
+its Windows inputs (scripts/lib/gate-key.sh windows_inputs; test_push_gate.py). What the tier keeps still
 refuses a commit: rustfmt, a stale lock file, a Docker name outside the job namespace.
 
 Run: python benches/suite/tests/isolation.py discover -s benches/suite/tests -p test_commit_tier.py

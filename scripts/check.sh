@@ -8,8 +8,9 @@
 # Usage: scripts/check.sh commit   pre-commit hook, here, in seconds: fmt; for the files
 #                                  changed against HEAD (staged or not), their lock files
 #                                  and Docker names. Nothing is built, linted or tested: a
-#                                  branch may hold unchecked commits, and only checked
-#                                  trees land (the push tier and the merge check, below).
+#                                  branch may hold unchecked commits; a tree lands only
+#                                  when its push tier passed for that exact tree, and its
+#                                  Windows inputs passed the Windows check (below).
 #        scripts/check.sh push     pre-push hook (.githooks/pre-push): the crates a pushed
 #                                  commit changes in the pushed range, on the fleet only
 #                                  (scripts/lib/fleet-gate.sh). fmt; clippy on them; all their
@@ -375,8 +376,9 @@ case "$mode" in
   commit)
     # Checks of a few seconds, with no build: rustfmt, and for the files changed against HEAD
     # their lock files, Docker names and the bench harness's format. The compile, the lints and
-    # the tests run on the fleet before anything lands: the push tier for the pushed commit's own
-    # tree, the merge check's Windows part for the merged one (process review 20 Oct 2026, §3A).
+    # the tests run on the fleet before anything lands: the push tier for the pushed commit's exact
+    # tree, the merge check's Windows part for its Windows inputs (scripts/lib/gate-key.sh
+    # windows_inputs; process review 20 Oct 2026, §3A).
     mapfile -t files < <(changed_files commit)
     step fmt cargo fmt --all --check
     if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
