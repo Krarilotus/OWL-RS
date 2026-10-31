@@ -618,6 +618,67 @@ echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
         self.assertEqual((aa.returncode, reports), (0, 6), aa.stdout + aa.stderr)  # a, a2, b: twice each
         self.assertNotIn("same build", aa.stdout)
 
+    def test_prepare_refuses_an_input_that_isnt_its_freeze(self):
+        """Sol, #50's D6 harness review r1 H3 (IB0556-0730): prepare linked an input whose hash
+        isn't its freeze (benches/datasets.toml) into the data view, recorded "NOT the freeze" and
+        went on, and the passes read it. Witness: copies-17's update script altered."""
+        import shutil
+        import subprocess
+        bash, python = shutil.which("bash"), shutil.which("python3")
+        if bash is None or python is None:
+            self.skipTest("no bash or python3")
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+        with tempfile.TemporaryDirectory() as tmp:
+            t = Path(tmp).as_posix()
+            try:
+                (Path(tmp) / "link").symlink_to(tmp)
+            except OSError:
+                self.skipTest("the data view is symlinks: the gate prepares on a Linux host")
+            # The plan runs copies-17 alone; fast.py prepare leaves a mark; every other python3 call the real one.
+            shim = Path(tmp) / "shim"
+            shim.mkdir()
+            (shim / "python3").write_text(f"""#!/usr/bin/env bash
+case " $* " in
+  *" benches/fast/release_gate.py plan "*) echo '{{"run": ["support-copies-17"], "not_run": [], "elsewhere": []}}' ;;
+  *" benches/fast/fast.py prepare "*) touch "{t}/prepared" ;;
+  *) exec "{Path(python).as_posix()}" "$@" ;;
+esac
+""", encoding="utf-8", newline="\n")
+            (shim / "python3").chmod(0o755)
+            inputs = Path(tmp) / "inputs" / "support-stress"
+            inputs.mkdir(parents=True)
+            for name in ("copies-17.nq", "copies-17.nq.reader"):
+                (inputs / name).write_text("", encoding="utf-8")
+            (inputs / "copies-17.nq.commits.ru").write_text(
+                "INSERT DATA { <http://example.org/s> a <http://example.org/Absent> }\n", encoding="utf-8")
+            view = Path(tmp) / "gate" / "data" / "support-stress"
+            view.mkdir(parents=True)
+            (view / "copies-17.nq.commits.ru").symlink_to(inputs / "copies-17.nq.commits.ru")  # an earlier view's
+            setup = f'''
+. scripts/lib/gate-publish.sh
+GATE={t}/gate GATE_BIN={t}/bin
+b=$GATE_BIN/bin-test; mkdir -p "$b/release" {t}/out
+echo tool > "$b/release/tool"; echo {head} > "$b/REVISION"; echo timing=watchdog > "$b/CAPABILITIES"
+(cd "$b" && sha256sum release/tool > SHA256SUMS)
+point {head} "$b"
+'''
+            env = {**os.environ, "NRESE_GATE_DIR": f"{t}/gate", "GATE_BIN": f"{t}/bin", "FLEET_OUT": f"{t}/out",
+                   "BENCH_GENERAL_DATA": (Path(tmp) / "inputs").as_posix(), "SPARQL_DATA": f"{t}/sparql",
+                   "NRESE_FAST_SHARED": f"{t}/shared"}
+            subprocess.run([bash, "-c", setup], cwd=ROOT, env=env, check=True, capture_output=True)
+            done = subprocess.run([bash, "-c", f'PATH="$(cygpath -u "{shim}" 2>/dev/null || echo "{shim}"):$PATH" '
+                                   f'exec bash scripts/release-gate.sh prepare {head}'],
+                                  cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
+            linked = sorted(p.name for p in view.iterdir())
+            prepared = (Path(tmp) / "prepared").exists()
+            for tree in Path(t, "gate", "run").glob(f"space-*/src-{head[:8]}"):  # the harness's checkout
+                subprocess.run(["git", "worktree", "remove", "--force", tree.as_posix()], cwd=ROOT, capture_output=True)
+        subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
+        self.assertNotEqual(done.returncode, 0, f"SPEC frozen inputs: prepare went on\n{done.stdout}{done.stderr}")
+        self.assertIn("NOT the freeze support-stress/copies-17.nq.commits.ru", done.stdout + done.stderr)
+        self.assertEqual((linked, prepared), ([], False),
+                         "SPEC frozen inputs: no input that isn't its freeze in the view, and no data prepared")
+
     def test_a_main_that_is_the_base_is_timed_once_and_declared_once(self):
         """Orchestrator, 20 Oct 2026: the jobs require a main, so a confirmation passes the base
         twice and every block timed it twice. The gate takes the base's runs for it, and its
