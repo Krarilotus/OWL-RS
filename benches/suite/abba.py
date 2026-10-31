@@ -67,11 +67,11 @@ class Invalid(Exception):
     """A family that can't be run: its problems, one line each."""
 
 
-def family_path(path: str | Path) -> str:
-    """The family's path as the jobs and NRESE_FAMILY name it: relative to the repository."""
+def family_path(path: str | Path, repo: Path) -> str:
+    """The family's path as the jobs and NRESE_FAMILY name it: relative to the checkout `repo`."""
     resolved = Path(path).resolve()
     try:
-        return resolved.relative_to(ROOT).as_posix()
+        return resolved.relative_to(Path(repo).resolve()).as_posix()
     except ValueError:
         raise Invalid([f"{path}: a family lives in the repository (benches/abba/), not outside it"])
 
@@ -96,11 +96,12 @@ def full_ids(sides: dict[str, str], repo: Path) -> tuple[dict[str, str], list[st
 
 
 def load_family(path: str | Path, repo: Path) -> dict:
-    """The family, resolved and validated: its sides as full ids of the checkout `repo`
-    (full_ids()), its cases (catalogue or its own, each with a content check), its hypotheses (b
-    vs a, per case and declared dimension). Raises Invalid."""
-    rel = family_path(path)
-    raw = (ROOT / rel).read_bytes()
+    """The family, resolved and validated: a file of the checkout `repo` (main's is ROOT), its
+    sides as full ids of that checkout (full_ids()), its cases (its own, or the catalogue's: the
+    one beside this module, benches/cases of the tree under test, whatever `repo` is; each with a
+    content check), its hypotheses (b vs a, per case and declared dimension). Raises Invalid."""
+    rel = family_path(path, repo)
+    raw = (Path(repo).resolve() / rel).read_bytes()
     data = tomllib.loads(raw.decode("utf-8"))
     problems = []
     name, host, blocks = data.get("name", ""), data.get("host", ""), data.get("blocks", MIN_BLOCKS)
@@ -121,7 +122,7 @@ def load_family(path: str | Path, repo: Path) -> dict:
     entries = data.get("case", [])
     if not entries:
         problems.append("no [[case]]")
-    catalog = cases_registry.load(family=rel)
+    catalog = cases_registry.load(family=Path(repo).resolve() / rel)
     by_name = {c["name"]: c for c in catalog}
     cases, hypotheses = [], []
     for i, entry in enumerate(entries):
