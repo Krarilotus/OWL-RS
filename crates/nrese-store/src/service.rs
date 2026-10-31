@@ -1288,7 +1288,10 @@ impl StoreService {
                             graph: GraphSelector::Exact(graph),
                             ..QuadPattern::all()
                         };
-                        (graph, snapshot.count_in(ReadModel::Asserted, &pattern))
+                        (
+                            graph,
+                            snapshot.count_in(ReadModel::Asserted, &pattern).at_least(),
+                        )
                     })
                     .collect()
             });

@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use nrese_engine::{
-    EncodedQuad, EncodedTriple, Engine, EngineConfig, GraphSelector, QuadPattern, ReadModel,
+    Count, EncodedQuad, EncodedTriple, Engine, EngineConfig, GraphSelector, QuadPattern, ReadModel,
     Snapshot, TermId, Transaction, quad::Permutation,
 };
 use nrese_rdf::NamedNode;
@@ -391,7 +391,7 @@ fn assert_snapshot(snapshot: &Snapshot, model: &Model, context: &str) {
                 .collect();
             assert_eq!(
                 snapshot.count_in(read_model, &pattern),
-                expected.len() as u64,
+                Count::Exact(expected.len() as u64),
                 "{context}: count {read_model:?} {pattern:?}"
             );
             for permutation in Permutation::ALL {
@@ -551,7 +551,10 @@ fn inferred_subsets_restrict_every_read() {
             subject: Some(id(1)),
             ..QuadPattern::all()
         };
-        assert_eq!(restricted.count_in(ReadModel::Materialised, &pattern), 3);
+        assert_eq!(
+            restricted.count_in(ReadModel::Materialised, &pattern),
+            Count::Exact(3)
+        );
         let sorted: Vec<EncodedQuad> = restricted
             .scan_sorted_in(ReadModel::Materialised, &pattern, Permutation::Spog)
             .expect("sorted scan")
@@ -581,7 +584,10 @@ fn inferred_additions_are_read_by_that_snapshot_alone() {
         subject: Some(id(1)),
         ..QuadPattern::all()
     };
-    assert_eq!(extended.count_in(ReadModel::Materialised, &pattern), 5);
+    assert_eq!(
+        extended.count_in(ReadModel::Materialised, &pattern),
+        Count::Exact(5)
+    );
     let sorted: Vec<EncodedQuad> = extended
         .scan_sorted_in(ReadModel::Materialised, &pattern, Permutation::Spog)
         .expect("sorted scan")
@@ -652,7 +658,10 @@ fn inferred_masks_stack_across_commits() {
         subject: Some(id(1)),
         ..QuadPattern::all()
     };
-    assert_eq!(view.count_in(ReadModel::Inferred, &pattern), 4);
+    assert_eq!(
+        view.count_in(ReadModel::Inferred, &pattern),
+        Count::Exact(4)
+    );
     assert!(!view.contains_in(ReadModel::Materialised, &quad(6)));
     assert!(!view.contains_in(ReadModel::Materialised, &quad(7)));
     assert!(view.contains_in(ReadModel::Materialised, &quad(8)));
@@ -700,8 +709,16 @@ fn a_canonical_view_counts_a_statement_renamed_onto_an_asserted_one_once() {
     let model = ReadModel::Materialised;
     let read: Vec<_> = canonical.quads_for_pattern_in(model, &in_g).collect();
     assert_eq!(read, [EncodedQuad::new(rep, p, o, g)]);
-    assert_eq!(canonical.count_in(model, &in_g), 1, "count in the graph");
-    assert_eq!(canonical.count_in(model, &named), 1, "named graphs");
+    assert_eq!(
+        canonical.count_in(model, &in_g),
+        Count::Exact(1),
+        "count in the graph"
+    );
+    assert_eq!(
+        canonical.count_in(model, &named),
+        Count::Exact(1),
+        "named graphs"
+    );
     // What canonical reads see: the named statement and `rep sameAs rep`, nothing expanded;
     // the inferred `alias sameAs rep` is held but not visible, so the length, which counts
     // what the stacks hold, is one more (PR #65 r1 F1; PR #70 r1).
@@ -711,18 +728,22 @@ fn a_canonical_view_counts_a_statement_renamed_onto_an_asserted_one_once() {
         2,
         "scan"
     );
-    assert_eq!(canonical.count_in(model, &all), 2, "count");
+    assert_eq!(canonical.count_in(model, &all), Count::Exact(2), "count");
     assert_eq!(canonical.len_in(model), 3, "held");
     // Expanding reads see more than is held: both named statements and `sameAs` between
     // every pair of the two identities, of the four held.
-    assert_eq!(stored.count_in(model, &all), 6, "expanded count");
+    assert_eq!(
+        stored.count_in(model, &all),
+        Count::Exact(6),
+        "expanded count"
+    );
     assert_eq!(stored.len_in(model), 4, "held, expanding");
     assert_eq!(
         canonical.group_counts_in(model, &in_g, Permutation::Gspo),
         Some(vec![(rep, 1)]),
         "subjects counted"
     );
-    assert_eq!(stored.count_in(model, &in_g), 2, "stored");
+    assert_eq!(stored.count_in(model, &in_g), Count::Exact(2), "stored");
     assert_eq!(stored.quads_for_pattern_in(model, &in_g).count(), 2);
 }
 
@@ -749,7 +770,7 @@ fn equality_subset_emptiness_agrees_with_reads() {
     ] {
         assert_eq!(view.len_in(model), 1, "{name}: held");
         assert_eq!(view.quads_for_pattern_in(model, &all).count(), 0, "{name}");
-        assert_eq!(view.count_in(model, &all), 0, "{name}");
+        assert_eq!(view.count_in(model, &all), Count::Exact(0), "{name}");
         assert!(view.is_empty(), "{name}");
     }
     assert!(!engine.snapshot().is_empty(), "the whole class reads");

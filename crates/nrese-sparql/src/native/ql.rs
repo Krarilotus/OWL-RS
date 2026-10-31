@@ -619,17 +619,20 @@ impl Rewriter<'_> {
                 }
                 _ => None,
             };
-            self.snapshot.count_in(
-                model,
-                &QuadPattern {
-                    subject: None,
-                    predicate,
-                    object,
-                    graph: GraphSelector::Any,
-                },
-            )
+            self.snapshot
+                .count_in(
+                    model,
+                    &QuadPattern {
+                        subject: None,
+                        predicate,
+                        object,
+                        graph: GraphSelector::Any,
+                    },
+                )
+                .at_least()
         };
-        let tree_reads: u64 = tree.iter().map(reads).sum();
+        // A count's bound reads as `u64::MAX` past that (`Count::at_least`): the sum saturates.
+        let tree_reads: u64 = tree.iter().map(reads).fold(0, u64::saturating_add);
         for &alternative in probe.alternatives {
             let Some(root) = term(probe.root) else {
                 return false;
