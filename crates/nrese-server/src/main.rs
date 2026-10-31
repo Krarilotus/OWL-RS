@@ -223,8 +223,12 @@ async fn run() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", config.bind_address))?;
 
+    // The address bound, not the one configured: port 0 names the port the system chose.
+    let bound_address = listener
+        .local_addr()
+        .with_context(|| format!("reading the address bound for {}", config.bind_address))?;
     tracing::info!(
-        bind_address = %config.bind_address,
+        bind_address = %bound_address,
         deployment_posture = config.deployment_posture.as_str(),
         data_dir = %store.config().data_dir.display(),
         reasoning_mode = ?reasoner.config().mode(),

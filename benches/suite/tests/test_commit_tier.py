@@ -17,12 +17,14 @@ import subprocess
 import tempfile
 import unittest
 
+import isolation  # the suite's git environment policy (inherit())
+
 ROOT = Path(__file__).resolve().parents[3]
 BASH = shutil.which("bash")
-# Run from a git hook or inside a gate job, the caller's variables (git's own, the gate's, the slot's)
-# would make the tier these tests run behave as their caller's does.
-LEAKS = ("GIT_", "NRESE_", "FLEET_", "CARGO_BUILD_", "CARGO_TARGET_DIR")
-CLEAN = {k: v for k, v in os.environ.items() if not k.startswith(LEAKS)}
+# Run from a git hook or inside a gate job, the caller's variables (git's own: isolation.inherit()
+# drops them; the gate's, the slot's, cargo's: these) would make the tier these tests run behave as
+# their caller's does.
+LEAKS = ("NRESE_", "FLEET_", "CARGO_BUILD_", "CARGO_TARGET_DIR")
 # The tier's own scripts, copied into each scratch repository.
 COPIED = (".githooks/pre-commit", "scripts/check.sh", "scripts/check-locks.sh", "scripts/check-names.sh")
 # Stand-ins, each call one line in $FAKE/calls. cargo: fmt fails for a manifest listed in
@@ -68,9 +70,12 @@ class CommitTier(unittest.TestCase):
         gitconfig = self.root / "gitconfig"
         gitconfig.write_text("[user]\n\tname = t\n\temail = t@t\n[core]\n\tautocrlf = false\n"
                              "[init]\n\tdefaultBranch = main\n")
-        self.env = {**CLEAN, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": gitconfig.as_posix(),
-                    "PATH": (self.fake / "bin").as_posix() + os.pathsep + CLEAN.get("PATH", ""),
-                    "FAKE": self.fake.as_posix()}
+        # Its own git configuration in place of the suite's (isolation.inherit's `git`): the repo's
+        # own hooks run, as in the main checkout, which the suite's core.hooksPath would outrank.
+        self.env = isolation.inherit(
+            *LEAKS, git={"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": gitconfig.as_posix()},
+            PATH=(self.fake / "bin").as_posix() + os.pathsep + os.environ.get("PATH", ""),
+            FAKE=self.fake.as_posix())
         self.repo = self.root / "repo"
         self.git(self.root, "init", "-q", str(self.repo))
         for rel in COPIED:

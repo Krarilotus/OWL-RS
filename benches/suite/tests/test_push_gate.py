@@ -19,14 +19,15 @@ import sys
 import tempfile
 import unittest
 
+import isolation
+
 ROOT = Path(__file__).resolve().parents[3]
 BASH = shutil.which("bash")
-# Run from a git hook or inside a gate job, the caller's variables (git's own, the gate's, the
-# fleet's, the thread counts, the Windows job's RUSTUP_AUTO_INSTALL) would make the gates these tests
-# run behave as their caller does.
-LEAKS = ("GIT_", "NRESE_", "FLEET_", "NEXTEST_", "CARGO_BUILD_", "CARGO_TARGET_DIR", "CARGO_ENCODED_RUSTFLAGS",
+# Run from a git hook or inside a gate job, the caller's variables (git's own: isolation.inherit()
+# drops them; the gate's, the fleet's, the thread counts, the Windows job's RUSTUP_AUTO_INSTALL)
+# would make the gates these tests run behave as their caller does.
+LEAKS = ("NRESE_", "FLEET_", "NEXTEST_", "CARGO_BUILD_", "CARGO_TARGET_DIR", "CARGO_ENCODED_RUSTFLAGS",
          "RUSTFLAGS", "RUST_TEST_THREADS", "RUSTUP_AUTO_INSTALL")
-CLEAN = {k: v for k, v in os.environ.items() if not k.startswith(LEAKS)}
 ZERO = "0" * 40
 # The scripts a push runs, copied into each scratch repository (those that exist).
 COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", "scripts/lib/disk.sh",
@@ -67,10 +68,13 @@ class Repo(unittest.TestCase):
         gitconfig = self.root / "gitconfig"
         gitconfig.write_text("[user]\n\tname = t\n\temail = t@t\n[core]\n\tautocrlf = false\n"
                              "[init]\n\tdefaultBranch = main\n")
-        self.env = {**CLEAN, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": gitconfig.as_posix(),
-                    "PATH": (self.fake / "bin").as_posix() + os.pathsep + CLEAN.get("PATH", ""),
-                    "FAKE": self.fake.as_posix(), "NRESE_FLEET_BIN": (self.fake / "fleet").as_posix(),
-                    "FLEET_OWNER": "t3:test", "NRESE_GATE_START_S": "0", "NRESE_GATE_POLL_S": "0"}
+        # Its own git configuration in place of the suite's (identity, autocrlf, the default
+        # branch); the hook it runs is the copied .githooks/pre-push, called by path.
+        self.env = isolation.inherit(
+            *LEAKS, git={"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": gitconfig.as_posix()},
+            PATH=(self.fake / "bin").as_posix() + os.pathsep + os.environ.get("PATH", ""),
+            FAKE=self.fake.as_posix(), NRESE_FLEET_BIN=(self.fake / "fleet").as_posix(),
+            FLEET_OWNER="t3:test", NRESE_GATE_START_S="0", NRESE_GATE_POLL_S="0")
         self.origin = self.root / "origin.git"
         self.git(self.root, "init", "-q", "--bare", str(self.origin))
         self.repo = self.root / "repo"
@@ -163,6 +167,40 @@ class PushGate(Repo):
         self.assertEqual((done.returncode != 0, len(self.jobs()), (self.fake / "cancelled").exists()),
                          (True, 1, True), f"SPEC no-verdict: the fleet wasn't asked, or the push went\n{done.stderr}")
         self.assertNotIn("=== fmt", done.stdout + done.stderr, "a tier ran here")
+
+    def test_a_push_to_engine_v2_is_a_merge_gate_and_a_packages_isnt(self):
+        """The hook names the ref each commit goes to: the push tier of refactor/engine-v2's is a merge
+        gate on the fleet, a package's isn't (the orchestrator, 31 Oct 2026; Sol, merge-gate-class r1)."""
+        tip = self.commit("a.txt", "a changed\n")
+        self.fleet("pending")
+        self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
+        self.push(("refs/heads/v2", tip, "refs/heads/refactor/engine-v2", self.base))
+        classes = [re.findall(r"^priority_class = .*$", path.read_text(), re.M)
+                   for path in sorted(self.fake.glob("job-*.toml"))]
+        self.assertEqual(classes, [[], ['priority_class = "merge-gate"']], "SPEC merge-gate: by the hook")
+
+    def test_the_hook_tells_both_tiers_their_ref(self):
+        """PR #69 r1 R1: one predicate for both tiers. The hook tells each ref's push tier, and
+        refactor/engine-v2's Windows check, the ref the commit goes to, over whatever the pusher's
+        environment holds: a package's push beside engine-v2's stays unclassed, and engine-v2's
+        Windows check is a merge gate with nothing in the environment too."""
+        gate = 'priority_class = "merge-gate"'
+        tip = self.commit("a.txt", "a changed\n")
+        self.fleet("done", self.tree(tip), ["a.txt"])  # the push tier passes, so the Windows check follows
+        self.env["NRESE_PUSH_REF"] = "refs/heads/refactor/engine-v2"  # left in the pusher's environment
+        self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO),
+                  ("refs/heads/v2", tip, "refs/heads/refactor/engine-v2", self.base))
+        del self.env["NRESE_PUSH_REF"]
+        tip = self.commit("b.txt", "b changed\n")
+        self.fleet("done", self.tree(tip), ["a.txt", "b.txt"])
+        self.push(("refs/heads/v2", tip, "refs/heads/refactor/engine-v2", self.base))
+        jobs = [("windows" if "windows-job.ps1" in path.read_text() else "push",
+                 re.findall(r"^priority_class = .*$", path.read_text(), re.M))
+                for path in sorted(self.fake.glob("job-*.toml"))]
+        # The package's push tier; engine-v2's passed before for this tree, then its Windows check;
+        # the next push's two.
+        self.assertEqual(jobs, [("push", []), ("windows", [gate]), ("push", [gate]), ("windows", [gate])],
+                         "SPEC merge-gate: by the hook, each check told its own ref")
 
     def test_a_build_host_variable_in_the_pushers_environment_changes_nothing(self):
         """NRESE_ON_BUILD_HOST, the gate's own mark for a run on a build host, in the pusher's
@@ -326,6 +364,43 @@ esac
             self.assertIn(f'{var} = "8"', job, "SPEC job-cores")
         self.assertIn("cores = 8", job)
         self.assertIn(f'rev = "{self.tip}"', job, "the job isn't for the commit")
+
+    def test_the_merge_checks_jobs_are_merge_gates(self):
+        """The orchestrator, 31 Oct 2026: the merge check's jobs go ahead as the fleet's merge gates, either
+        tier's for a commit that goes to refactor/engine-v2, as its caller states (NRESE_PUSH_REF). Sol,
+        merge-gate-class r1: told by the parents instead, a merge check of merges chained before their
+        push wasn't one, and a package that merges another was. PR #69 r1 R1: every Windows check was
+        one, a package's own included."""
+        package = self.tip
+        self.git(self.repo, "checkout", "-q", "-b", "other", self.base)
+        other = self.commit("b.txt", "b changed\n")
+        # engine-v2 as a merge check meets it: two merges on the base, neither pushed yet
+        self.git(self.repo, "checkout", "-q", "-b", "v2", self.base)
+        self.git(self.repo, "merge", "-q", "--no-ff", "-m", "merge a package", package)
+        self.git(self.repo, "merge", "-q", "--no-ff", "-m", "merge another", other)
+        chained = self.git(self.repo, "rev-parse", "HEAD")
+        # a package that takes another in, from engine-v2's head
+        self.git(self.repo, "checkout", "-q", "-b", "integrated", self.base)
+        self.git(self.repo, "merge", "-q", "--no-ff", "-m", "take a package in", package)
+        integrated = self.git(self.repo, "rev-parse", "HEAD")
+        v2, gate = "refs/heads/refactor/engine-v2", 'priority_class = "merge-gate"'
+        cases = [  # tier, commit, the ref it goes to -> its job's class
+            ("windows", package, None, None),  # a package's own Windows check
+            ("windows", chained, v2, gate),
+            ("push", chained, v2, gate),
+            ("push", integrated, "refs/heads/pkg/integrated", None),
+            ("push", chained, None, None),  # by hand, naming no ref
+        ]
+        for mode, commit, ref, want in cases:
+            self.reset()
+            (self.fake / "status-gate-1").write_text(json.dumps({"state": "pending", "host": "-"}))
+            self.tip = commit
+            self.env.pop("NRESE_PUSH_REF", None)
+            if ref:
+                self.env["NRESE_PUSH_REF"] = ref
+            self.gate(mode)
+            got = re.findall(r"^priority_class = .*$", (self.fake / "job-1.toml").read_text(), re.M)
+            self.assertEqual(got, [want] if want else [], f"SPEC merge-gate: {mode} {commit} for {ref}")
 
     def test_a_failure_on_an_unconfirmed_host_counts_only_when_another_host_fails_too(self):
         cases = [  # first host, its code, the re-run's code -> exit, recorded pass, jobs submitted
@@ -645,6 +720,18 @@ class WindowsCheck(Repo):
                      f'rev = "{older}"', "ram_gb = 9", 'NRESE_MEMORY_CAP_GB = "9"'):
             self.assertIn(line, text, "SPEC windows-job")
         self.assertNotIn("hosts =", text, "SPEC windows-job: the tool picked a host")
+
+    def test_only_the_merge_checks_windows_part_is_a_merge_gate(self):
+        """PR #69 r1 R1: every Windows check got the merge-gate class, a package's own proof included.
+        It is one only when its caller says the commit goes to refactor/engine-v2 (NRESE_PUSH_REF)."""
+        tip = self.commit("a.txt", "a changed\n")
+        self.fleet("pending")
+        self.check(tip)  # a package's proof: no ref named
+        self.env["NRESE_PUSH_REF"] = "refs/heads/refactor/engine-v2"  # the merge check states it
+        self.check(tip)
+        classes = [re.findall(r"^priority_class = .*$", path.read_text(), re.M) for path in self.submitted()]
+        self.assertEqual(classes, [[], ['priority_class = "merge-gate"']],
+                         "SPEC merge-gate: through check.sh windows")
 
     def test_a_verified_result_passes_once_and_never_opens_a_push(self):
         """A whole, consistent Windows result for the tree passes and is remembered; it is the
