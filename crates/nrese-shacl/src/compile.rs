@@ -718,7 +718,7 @@ impl<V: ReadView> Compiler<'_, V> {
                 continue;
             };
             out.push(Constraint::Sparql(Box::new(SparqlCheck {
-                source: constraint,
+                source: Some(constraint),
                 component: Component::Sparql,
                 query,
                 ask: false,
@@ -860,7 +860,7 @@ impl<V: ReadView> Compiler<'_, V> {
             }
             for parameters in combinations {
                 out.push(Constraint::Sparql(Box::new(SparqlCheck {
-                    source: validator,
+                    source: None,
                     component: Component::Custom(component.node),
                     query: query.clone(),
                     ask,

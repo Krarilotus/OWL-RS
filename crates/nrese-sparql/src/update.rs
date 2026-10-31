@@ -1,9 +1,12 @@
 //! SPARQL 1.1 Update execution into one engine [`Transaction`].
 //!
 //! Every operation of a request is applied to the same transaction, in order, and each
-//! `WHERE` clause reads the transaction (base plus earlier operations). The caller decides
-//! whether to commit: this module never publishes anything, which is what lets the mutation
-//! pipeline validate the delta and check the deadline before the commit.
+//! `WHERE` clause reads the transaction's state before its operation (base plus earlier
+//! operations): as it is, or, with [`UpdateOptions::read`], as that [`ReadSource`] gives it
+//! for the update's reader, in the statements [`UpdateOptions::read_model`] names (a reader
+//! who sees no inferred statement reads the asserted ones). The caller decides whether to
+//! commit: this module never publishes anything, which is what lets the mutation pipeline
+//! validate the delta and check the deadline before the commit.
 //!
 //! Graph existence follows ADR-0002: a named graph exists iff it holds a quad. `CREATE GRAPH`
 //! therefore only fails (without `SILENT`) on a non-empty graph and otherwise stores
@@ -18,7 +21,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nrese_engine::{GraphSelector, QuadPattern, TermId, Transaction};
+use nrese_engine::{GraphSelector, QuadPattern, Snapshot, TermId, Transaction};
 use nrese_rdf::{BlankNode, GraphName as OxGraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use nrese_sparql_syntax::algebra::GraphTarget;
 use nrese_sparql_syntax::term::{GraphName, GroundQuad, Quad as DataQuad};
@@ -26,6 +29,15 @@ use nrese_sparql_syntax::{GraphUpdateOperation, Update};
 use thiserror::Error;
 
 use crate::results::{QueryDatasetSpecification, QueryEvaluationError};
+
+/// What an update's `WHERE` clauses read, for its reader: the caller's decision of which
+/// statements that reader sees ([`UpdateOptions::read`]).
+pub trait ReadSource: Send + Sync {
+    /// The data a `WHERE` clause reads: `tx`'s state before its operation (its base, with
+    /// the request's earlier operations), as the update's reader sees it. An error fails the
+    /// operation as the clause's evaluation would.
+    fn state(&self, tx: &Transaction<'_>) -> Result<Snapshot, QueryEvaluationError>;
+}
 
 #[derive(Clone, Default)]
 pub struct UpdateOptions {
@@ -46,6 +58,14 @@ pub struct UpdateOptions {
     /// GeoSPARQL relations in `WHERE` clauses read the asserted statements only
     /// ([`crate::QueryOptions::geosparql_stated_only`]).
     pub geosparql_stated_only: bool,
+    /// What each `WHERE` clause reads in place of the transaction's state as it is: asked
+    /// once per `DELETE`/`INSERT … WHERE` operation, on the state before it, the request's
+    /// earlier operations included. [`Self::access`] still restricts the graphs it reads.
+    /// `None`: the state as it is.
+    pub read: Option<Arc<dyn ReadSource>>,
+    /// Which statements each `WHERE` clause reads ([`crate::QueryOptions::read_model`]): the
+    /// asserted ones only for a reader who sees no inferred statement. Default: both.
+    pub read_model: nrese_engine::ReadModel,
 }
 
 impl UpdateOptions {
@@ -139,10 +159,18 @@ fn apply_operation(
             pattern,
         } => {
             // On the committed state, or after earlier operations of the request changed
-            // something, on a snapshot of the pending state. The whole WHERE result is
-            // computed against the state before this operation.
-            let pending = (tx.pending() != (0, 0) || tx.inferred_pending() != (0, 0))
+            // something, on a snapshot of the pending state; as the reader's read source
+            // gives it, where there is one. The whole WHERE result is computed against the
+            // state before this operation.
+            let read = options
+                .read
+                .as_ref()
+                .map(|read| read.state(tx))
+                .transpose()?;
+            let pending = (read.is_none()
+                && (tx.pending() != (0, 0) || tx.inferred_pending() != (0, 0)))
                 .then(|| tx.pending_snapshot());
+            let state = read.as_ref().or(pending.as_ref()).unwrap_or(tx.base());
             let query_options = crate::query::QueryOptions {
                 resources: options.resources.clone(),
                 union_default_graph: options.union_default_graph,
@@ -150,10 +178,11 @@ fn apply_operation(
                 services: options.services.clone(),
                 access: options.access.clone(),
                 geosparql_stated_only: options.geosparql_stated_only,
+                read_model: options.read_model,
                 ..crate::query::QueryOptions::default()
             };
             let (deletes, inserts) = crate::native::delete_insert(
-                pending.as_ref().unwrap_or(tx.base()),
+                state,
                 pattern,
                 delete,
                 insert,

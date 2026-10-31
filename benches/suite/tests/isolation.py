@@ -6,14 +6,24 @@ locating variables set; they take precedence over `git -C DIR`, so a test that r
 script that does (release-gate.sh's worktrees), acted on the commit being made (20 Oct 2026: two
 commits emptied and a branch moved by tests under the hook). A caller's configuration reaches a
 test repository too (GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG_COUNT: a core.hooksPath ran
-an outside hook in a test's own repository; Sol, 20 Oct 2026). So importing this module, once
-for the whole run, for the tests and every process they start:
+an outside hook in a test's own repository; Sol, 20 Oct 2026). And a test that read this
+repository's history passed where the history was kept and failed where it wasn't (27 Oct 2026:
+commit ids from before a rewrite, on fleet hosts that had pruned them). So importing this module,
+once for the whole run, for the tests and every process they start:
 
-- removes every GIT_* variable but ALLOWED (none: a test sets what it needs itself);
+- removes every GIT_* variable but ALLOWED (none: a test sets what it needs itself), and the
+  scope settings a calling suite run passes its workers (SUITE_SCOPE_*: runtime.scope_argv
+  reads them by default, so a caller's SUITE_SCOPE_STOP_S=bad failed every scoped runtime test);
 - gives git a configuration of the suite's own: no system file (GIT_CONFIG_NOSYSTEM), an empty
   global file this module owns (GIT_CONFIG_GLOBAL), and through GIT_CONFIG_COUNT a test identity
   and core.hooksPath on an empty directory it owns, so no test repository runs our hooks or the
-  user's. Both go when the run ends.
+  user's. Both go when the run ends;
+- stops git's search for a repository at the temporary directory and at this repository
+  (GIT_CEILING_DIRECTORIES): git started in a test's temporary directory, or below the
+  repository's top, finds none above it, so a test reaches this repository only by naming it.
+
+The tests run in a scratch directory of the module's own (SCRATCH), not in the checkout the run
+started in. A test that needs commits makes them in a repository of its own (repo()).
 
     pytest:    tests/conftest.py imports it
     unittest:  python benches/suite/tests/isolation.py discover -s benches/suite/tests
@@ -24,31 +34,92 @@ from __future__ import annotations
 import atexit
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ALLOWED: frozenset[str] = frozenset()
 CONFIG = (("user.name", "suite test"), ("user.email", "suite-test@localhost"))
+ROOT = Path(__file__).resolve().parents[3]
+START = Path.cwd()
 
 
 def isolate(environ=os.environ) -> Path:
-    """The caller's GIT_* variables out, the suite's git configuration in; the directory holding
-    that configuration (its global file and its empty hooks directory)."""
-    for name in [k for k in environ if k.startswith("GIT_") and k not in ALLOWED]:
+    """The caller's GIT_* and SUITE_SCOPE_* variables out, the suite's git configuration and ceilings in; the
+    directory holding that configuration (its global file and its empty hooks directory) and
+    the scratch directory the tests run in."""
+    for name in [k for k in environ if k.startswith(("GIT_", "SUITE_SCOPE_")) and k not in ALLOWED]:
         del environ[name]
     own = Path(tempfile.mkdtemp(prefix="suite-git-"))
     (own / "gitconfig").write_text("", encoding="utf-8")
     (own / "hooks").mkdir()
+    (own / "cwd").mkdir()
     config = (*CONFIG, ("core.hooksPath", (own / "hooks").as_posix()))
+    ceilings = (Path(os.path.realpath(tempfile.gettempdir())), ROOT)
     environ.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": (own / "gitconfig").as_posix(),
-                    "GIT_CONFIG_COUNT": str(len(config))})
+                    "GIT_CONFIG_COUNT": str(len(config)),
+                    "GIT_CEILING_DIRECTORIES": os.pathsep.join(c.as_posix() for c in ceilings)})
     for i, (key, value) in enumerate(config):
         environ[f"GIT_CONFIG_KEY_{i}"], environ[f"GIT_CONFIG_VALUE_{i}"] = key, value
     return own
 
 
-atexit.register(shutil.rmtree, isolate(), True)
+LAUNCH = ("PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "HOME", "USERPROFILE", "TEMP", "TMP",
+          "TMPDIR", "LANG", "LC_ALL")
+
+
+def environment(**values: str) -> dict[str, str]:
+    """A process environment of the test's own: what the OS needs to launch a program (LAUNCH),
+    the suite's git isolation, and `values`; nothing else of the caller's (an inherited
+    NRESE_DOCKER took a cleanup test past its fake Docker)."""
+    return {**{k: v for k, v in os.environ.items() if k in LAUNCH or k.startswith("GIT_")}, **values}
+
+
+def checkout(dest: Path, *paths: str) -> Path:
+    """A private checkout at `dest` holding copies of this repository's `paths`: a script that
+    finds its repository from its own location acts on this one, not on the checkout the run
+    started in (bench-cleanup.sh removes files there)."""
+    for rel in paths:
+        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / rel, dest / rel)
+    return dest
+
+
+def repo(path: Path, commits: int) -> list[str]:
+    """A repository of the test's own at `path` with `commits` empty commits in a line: their full
+    ids, oldest first. A test that needs commits makes them here, never reads this repository's
+    history (a fleet checkout may be shallow or pruned)."""
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, check=True,
+                              timeout=60).stdout.strip()
+    path.mkdir(parents=True, exist_ok=True)
+    git("init", "-q")
+    for n in range(commits):
+        git("commit", "-q", "--allow-empty", "-m", f"commit {n + 1}")
+    return git("rev-list", "--reverse", "HEAD").split()
+
 
 if __name__ == "__main__":
-    unittest.main(module=None)
+    sys.modules["isolation"] = sys.modules["__main__"]  # one isolation, however a test imports it
+OWN = isolate()
+SCRATCH = OWN / "cwd"
+
+
+@atexit.register
+def _remove() -> None:
+    os.chdir(START)
+    shutil.rmtree(OWN, True)
+
+
+class Program(unittest.TestProgram):
+    """unittest's main: discovery reads its paths where the run started, the tests run in SCRATCH."""
+
+    def runTests(self):
+        os.chdir(SCRATCH)
+        super().runTests()
+
+
+if __name__ == "__main__":
+    Program(module=None)

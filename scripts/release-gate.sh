@@ -2,7 +2,9 @@
 # The release gate (benches/PROTOCOL.md §5, "The release gate"): does a head regress, beyond
 # noise, on any workload, in time or memory, against the v1.5 baseline and against main? Are
 # the §0 guards green and the W3C suites' counts as required? Each command is a fleet step;
-# `jobs` writes the jobs (benches/fast/release_gate.py jobs).
+# `jobs` writes the jobs (benches/fast/release_gate.py jobs). Every command runs the code of the
+# commit it is launched from, never changes not committed (only this script, scripts/lib and the
+# checker start from the working tree).
 #
 #   release-gate.sh build REV               REV's binaries, by REV's own toolchain, into GATE_BIN/bin-REV8-IDENTITY
 #   release-gate.sh prepare HARNESS         the plan, the data view and the cases' data, once, by
@@ -27,7 +29,12 @@
 #                                           runs it
 #   release-gate.sh verdict TIMED_DIR... CHECKS_DIR   every part together, each host's rounds combined
 #   release-gate.sh jobs CAND [OPTIONS]     the fleet jobs of a whole gate (release_gate.py jobs --help)
-#   release-gate.sh clean                   the gate's worktrees and build trees (binaries and data stay)
+#   release-gate.sh clean                   the gate's worktrees and build trees, and what dead invocations
+#                                           of its process space left (binaries and data stay; a live
+#                                           invocation's own, and another process space's, stay)
+#   release-gate.sh clean --patch-keyed [--remove]   the builds of a perf lab patched before T0, listed
+#                                           (FLEET_OUT/patch-keyed-builds.tsv); with --remove their binaries
+#                                           go, unless a gate used them within GATE_LIVE_HOURS (default 24)
 #
 # One harness for every side: HARNESS's fast suite (its cases, checks, generator and data);
 # only the engine's binaries differ. A side whose perf lab predates --routes (main) runs with
@@ -45,6 +52,18 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 export PATH=$HOME/.cargo/bin:$PATH
+# Every git call of a gate reads the objects as stored, from the measurement check (release_gate.py
+# measured-at, STORED_OBJECTS) to the checkout a build compiles and its identity: no replace ref,
+# made before the check or after it, stands another object in, and no graft another parent.
+export GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null
+# And writes, reads and removes every path of its checkouts, however long: they lie a few
+# directories down (a run's, a space's), and with a deep work directory a tree's path (123
+# characters) passes Windows' 260, which Git for Windows refuses without core.longpaths (the
+# Windows merge check of PR #60's R4; git elsewhere ignores the key). Added to a caller's own
+# GIT_CONFIG_COUNT settings, never in their place. Python reads such paths where Windows' long
+# paths are on (LongPathsEnabled: KRARIS-GPTLER); where not, the check fails closed.
+configs=${GIT_CONFIG_COUNT:-0}
+export GIT_CONFIG_COUNT=$((configs + 1)) "GIT_CONFIG_KEY_$configs=core.longpaths" "GIT_CONFIG_VALUE_$configs=true"
 GATE=${NRESE_GATE_DIR:-$HOME/owlrs/${GATE_NAME:-gate-v2}}
 # Binaries by build identity, shared by every gate (v1.5's and main's are built once):
 # published whole, never replaced (scripts/lib/gate-publish.sh).
@@ -53,6 +72,11 @@ OUT=${FLEET_OUT:-$GATE/results}
 SPARQL_DATA=${SPARQL_DATA:-$HOME/owlrs/sparql-data}
 SHARED=${NRESE_FAST_SHARED:-$HOME/owlrs/fast-data-shared}
 MAX_GB=${GATE_MAX_GB:-24}
+# A directory the caller names relative to the launching checkout stays there: the gate runs its
+# code from a checkout of its own (below; Sol, PR #60 fix 3's sol-loop S2).
+anchored() { case $1 in /* | [A-Za-z]:[/\\]*) printf '%s' "$1" ;; *) printf '%s/%s' "$PWD" "$1" ;; esac; }
+GATE=$(anchored "$GATE") GATE_BIN=$(anchored "$GATE_BIN") OUT=$(anchored "$OUT")
+SPARQL_DATA=$(anchored "$SPARQL_DATA") SHARED=$(anchored "$SHARED")
 mkdir -p "$GATE" "$GATE_BIN" "$OUT"
 # A desktop's file indexer (GNOME's localsearch on phuoc-yu indexes all of $HOME) reads every
 # file the gate writes, during the passes: these directories are excluded from it (Tracker's
@@ -60,17 +84,76 @@ mkdir -p "$GATE" "$GATE_BIN" "$OUT"
 for dir in "$GATE" "$GATE_BIN"; do [ -e "$dir/.trackerignore" ] || echo "release gate: not indexed" > "$dir/.trackerignore"; done
 log() { echo "$(date '+%F %T') $*" | tee -a "$OUT/gate.log"; }
 short() { git rev-parse --short=8 "$1"; }
-py() { PYTHONIOENCODING=utf-8 python3 -B "$@"; }
+py() { PYTHONIOENCODING=utf-8 python3 "$@"; }
+# Each invocation's own directory, made empty here and removed when it exits, by it alone: its
+# bytecode cache and its code checkout (below). No other invocation makes or reads what is in it
+# (Sol, PR #60 fix check 3: a code checkout shared by revision had no owner, and two callers met
+# in its making). It lies in its process space's directory under its pid, which `clean` asks only
+# there: a pid means nothing in another space, as WSL's in Git Bash on one host (Sol, PR #60 fix
+# check 4). So does every checkout the gate makes (the harness's, a build's): a path another space
+# uses is never one of its (Sol, R4 sol-loop S1, S5, S6). The space: the kernel's boot, pid and
+# mount namespaces where Linux names them, else the system, host and runtime (Git Bash's MSYS,
+# whose pids no other runtime knows).
+launch=$PWD
+if [ -r /proc/sys/kernel/random/boot_id ] && space=$(readlink /proc/self/ns/pid /proc/self/ns/mnt 2>/dev/null); then
+  space="$(cat /proc/sys/kernel/random/boot_id) $space"
+else
+  space="$(uname -s) $(hostname) $(cygpath -m / 2>/dev/null)"
+fi
+SPACE=$GATE/run/space-$(printf '%s' "$space" | cksum | cut -d' ' -f1)
+mkdir -p "$SPACE" && RUN=$(mktemp -d "$SPACE/$$-XXXXXX") || exit 2
+# DIR, a checkout of this space's, removed with its registration: by git, else (its .git gone: a
+# removal killed halfway) its directory, then its registration by the path, which git drops for
+# a missing directory. Never `prune`: a registration git finds missing here may be another
+# process space's live checkout (Sol, PR #60 R4 sol-loop S1).
+drop_checkout() {
+  git worktree remove --force "$1" 2>/dev/null && return
+  rm -rf "$1" && git worktree remove --force "$1" 2>/dev/null
+  return 0
+}
+finish() {
+  local dir
+  cd "$launch" 2>/dev/null || cd /
+  for dir in "$RUN"/src-*; do [ ! -d "$dir" ] || drop_checkout "$dir"; done
+  rm -rf "$RUN"
+}
+trap finish EXIT
+# Every Python the gate starts reads and writes bytecode only there: no cache older than the run,
+# in a checkout (Sol, S1 r3), beside one or in an earlier run's directory (PR #60 r1 R2), stands in
+# for a source the gate checked. A prefix holds every cache, the standard library's too, so the run
+# compiles that once (0.3 s; then 0.08 s a start, against 0.1 s with the installed caches and the
+# tree compiled each time: job lane-d-pr60-r1-startup2-c600217b).
+PYTHONPYCACHEPREFIX=$RUN/pycache
+mkdir "$PYTHONPYCACHEPREFIX" || exit 2
+export PYTHONPYCACHEPREFIX
+# The check of every checkout the gate makes: one of the launching checkout's scripts, as this one
+# is, which imports nothing of any checkout (python3 -I), so it can check the gate's own code first.
+CHECKER=$PWD/benches/suite/suitekit/checkout.py
 
-worktree() {  # REV [DIR]: a clean worktree of the revision, made once
-  local rev dir
+worktree() {  # REV [DIR [built]]: a clean worktree of the revision, made once, holding its stored
+  # bytes; one to be built holds nothing else. DIR is this process space's (default $SPACE).
+  local rev dir only=()
   rev=$(git rev-parse "$1") || return 2
-  dir=${2:-$GATE}/src-$(short "$rev")
+  dir=${2:-$SPACE}/src-$(short "$rev")
   if [ ! -d "$dir" ]; then
-    git worktree add -q --detach "$dir" "$rev" || { echo "no worktree of $rev" >&2; return 2; }
+    # Line ends as stored: a host's settings convert none (only .gitattributes does). -f: a
+    # registration of this space's path whose directory went without git (a clean killed between
+    # the two) stops nothing; no other space has this path (Sol, PR #60 R4 sol-loop S5).
+    git -c core.autocrlf=false -c core.eol=lf worktree add -f -q --detach "$dir" "$rev" \
+      || { echo "no worktree of $rev" >&2; return 2; }
   fi
   (cd "$dir" && [ "$(git rev-parse HEAD)" = "$rev" ] && [ -z "$(git status --porcelain)" ]) \
     || { echo "the worktree $dir is not $rev, clean" >&2; return 2; }
+  # A build reads ignored files too (nrese-server's build.rs embeds apps/nrese-console/dist/): a
+  # worktree to be built loses every file not in the revision, the last build's leftovers with them.
+  if [ "${3:-}" = built ]; then
+    git -C "$dir" clean -ffdxq || { echo "the worktree $dir can't be cleaned" >&2; return 2; }
+    only=(--nothing-else)
+  fi
+  # HEAD and a clean status trust the index and the attributes; the bytes are the proof. Its
+  # output is diagnostics: the function's own is the directory alone.
+  python3 -I "$CHECKER" "$rev" "$dir" ${only[@]+"${only[@]}"} >&2 \
+    || { echo "the worktree $dir doesn't hold $rev's bytes" >&2; return 2; }
   echo "$dir"
 }
 
@@ -103,9 +186,79 @@ planned() { py -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))[
 # harness's, for every side alike.
 MEASURE=benches/fast/measure.toml
 
+# `clean` makes no code checkout, so that it runs when none can be made (no space, a broken one):
+# what it removes runs no project Python but its locks', which where there is no flock is ns.sh's
+# suitekit/lock.py, here the launching commit's bytes written alone into this run's directory.
+if [ "${1:-}" = clean ]; then
+  mkdir -p "$RUN/suite/suitekit" \
+    && git cat-file blob HEAD:benches/suite/suitekit/lock.py > "$RUN/suite/suitekit/lock.py" \
+    || { echo "release gate: no lock helper of the launching commit" >&2; exit 2; }
+  NS_SUITE=$RUN/suite
+  if [ "${2:-}" = --patch-keyed ]; then
+    # The builds of a perf lab patched at build time (before T0, 28 Oct 2026), which no gate after
+    # T0 can reuse (their identity has the patch): listed, and with --remove their binaries go.
+    sweep_patch_keyed "${3:-}" | tee "$OUT/patch-keyed-builds.tsv"
+    exit "${PIPESTATUS[0]}"
+  fi
+  # This gate's worktrees, build trees and scratch go (never the shared binaries' directory:
+  # other gates build and read there); the data view, the prepared data and every result stay
+  # for the gate's next run. Builds no gate used for GATE_BIN_AGE_DAYS go (sweep_builds).
+  before=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
+  # What invocations of this process space that died left in their own directories goes; a live
+  # one's stays, and so does every other space's, whose pids this one can't ask.
+  for run in "$SPACE"/[0-9]*-*; do
+    [ -d "$run" ] && [ "$run" != "$RUN" ] || continue
+    pid=${run##*/}
+    ! kill -0 "${pid%%-*}" 2>/dev/null || continue
+    for dir in "$run"/src-*; do [ ! -d "$dir" ] || drop_checkout "$dir"; done
+    rm -rf "$run"
+  done
+  foreign=$(( $(find "$GATE"/run/space-* -mindepth 1 -maxdepth 1 -name '[0-9]*-*' ! -path "$SPACE/*" 2>/dev/null | wc -l)
+    + $(find "$GATE/run" -mindepth 1 -maxdepth 1 ! -name 'space-*' 2>/dev/null | wc -l) ))
+  [ "$foreign" = 0 ] || log "clean: $foreign runs of another process space kept"
+  # This space's harness and build checkouts (no other space has their paths) and build trees.
+  for dir in "$SPACE"/src-* "$SPACE"/build/src-*; do [ ! -d "$dir" ] || drop_checkout "$dir"; done
+  rm -rf "$SPACE"/build
+  # Those of the gates before checkouts were each space's ($GATE/src-*, $GATE/build), removed as
+  # they were then, by git; pycache: their bytecode, before each invocation had its own directory.
+  for dir in "$GATE"/src-* "$GATE"/build/src-*; do [ -d "$dir" ] && git worktree remove --force "$dir"; done
+  rm -rf "$GATE"/target-* "$GATE"/build "$GATE"/reports "$GATE"/compact "$GATE"/pycache
+  # Block copies are removed by their block; what a killed one left is named, not swept.
+  rmdir "$GATE/instances" 2>/dev/null || { [ -d "$GATE/instances" ] \
+    && log "clean: block copies left by an interrupted block, not removed: $(ls "$GATE/instances" | tr '\n' ' ')"; }
+  swept=$(sweep_builds | tr '\n' ' ')
+  [ -z "$swept" ] || log "clean: unused builds removed: $swept"
+  # No `git worktree prune` (drop_checkout): what is removed here deregistered itself.
+  # Shared prepared data no gate has linked for two days (its last link's removal set its ctime).
+  [ -d "$SHARED/blobs" ] && find "$SHARED/blobs" -type f -links 1 -cmin +2880 -delete
+  after=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
+  log "clean: $(( (before - after) / 1048576 )) MiB reclaimed; kept the binaries, the data view, the prepared data, the results"
+  exit
+fi
+
+# The gate's own code runs from a checkout of the commit it is launched from, made from the
+# repository's objects into this run's directory and checked as every checkout of the gate is
+# (worktree), never from the launching checkout: files there beside the commit's, an untracked
+# suitekit/cases/__init__.py or a csv.py before the standard library's, ran in the validator (Sol,
+# PR #60 fix checks 1 and 2), and no rule of what may lie there holds for every caller. From here
+# every relative path, and every Python the gate starts, is that checkout's or a harness
+# checkout's; only the launching checkout's shell scripts (this one, scripts/lib), the checker and
+# objects are read. Launched from a checkout with changes not committed (a commit hook's), the gate
+# runs its commit's Python, never the changes. The commands that take a caller's paths (jobs,
+# confirm, verdict) run in the launching checkout, their Python by path from this one.
+CODE=$(worktree HEAD "$RUN") || { echo "release gate: no checked checkout of the launching commit" >&2; exit 2; }
+cd "$CODE" || exit 2
+# The libraries' Python too (ns.sh's suitekit/lock.py where there is no flock): ns.sh, sourced
+# above, named the launching checkout's (Sol, PR #60 fix 3's sol-loop S1).
+NS_SUITE=$CODE/benches/suite
+
 case ${1:-} in
 build)
   rev=$(git rev-parse "$2") || exit 2
+  # The commit built and timed for this side: the revision, or its measurement commit, a
+  # reviewed commit on it that changes only its perf lab (benches/fast/measurement-sides.toml).
+  # Any other is refused; the side's REVISION and pointer stay the revision's.
+  at=$(py benches/fast/release_gate.py measured-at "$rev") || { log "build $rev: refused"; exit 2; }
   export PATH=$HOME/.cargo/bin:$PATH
   # The gate's flags replace a host's (its ~/.cargo/config.toml rustflags), before the identity
   # is taken: the identity hashes the flags the build gets.
@@ -114,25 +267,18 @@ build)
   # Each layout's build by its identity: one there from before counts, the others are built.
   todo=()
   for L in $(seq 1 "$LAYOUTS"); do
-    lbin=$(identity_dir "$rev" "$L")
+    lbin=$(identity_dir "$at" "$L")
     if build_verified "$lbin" "$rev"; then point "$rev" "$lbin" "$L"; else todo+=("$L"); fi
   done
-  bin=$(identity_dir "$rev" 1)
+  bin=$(identity_dir "$at" 1)
   if [ ${#todo[@]} -eq 0 ]; then
     cp "$bin/BUILD.txt" "$OUT/build-$(short "$rev").txt"
     log "build $rev: verified binaries of its identity there from before ($bin, $LAYOUTS layouts)"; exit 0
   fi
   # The source and build trees are this gate's own; the build is published under its identity.
-  mkdir -p "$GATE/build" && src=$(worktree "$rev" "$GATE/build") || exit 2
-  export CARGO_TARGET_DIR=$GATE/build/target-$(short "$rev")
-  # Every side's perf lab times alike: no thread started inside the timed window (the
-  # watchdog, applied to the revision's own perf lab source; the engine untouched; the patch
-  # is part of the build's identity, build_identity).
-  lab=$src/crates/nrese-store/examples/perf_lab/main.rs
-  [ -f "$lab" ] || lab=$src/crates/nrese-store/examples/perf_lab.rs
-  patched=$(py benches/fast/patches/perf_lab_watchdog.py "$lab")
-  case $patched in applied|present) timing=watchdog ;; *) timing=spawn ;; esac
-  log "build $rev ($(cd "$src" && rustc -V 2>/dev/null)); layouts to build: ${todo[*]}"
+  mkdir -p "$SPACE/build" && src=$(worktree "$at" "$SPACE/build" built) || exit 2
+  export CARGO_TARGET_DIR=$SPACE/build/target-$(short "$at")
+  log "build $rev at $at ($(cd "$src" && rustc -V 2>/dev/null)); layouts to build: ${todo[*]}"
   missing=()
   if [ "${todo[0]}" = 1 ]; then
   part=$bin.partial-$$
@@ -151,21 +297,23 @@ build)
   (cd "$src" && bash scripts/cargo-guarded.sh build --release --locked --quiet -p nrese-server) \
     || { log "build of nrese-server failed at $rev"; exit 1; }
   cp "$CARGO_TARGET_DIR/release/nrese-server" "$part/release/"
-  # What the revision's perf lab can do, from its source: route reports (--routes) and
-  # whether it requires --queries (main's, f9b515e8: neither, and no samples per run).
-  routes=1 empty=0 batch=0
-  git grep -q -e '"--routes"' "$rev" -- crates/nrese-store/examples || routes=0
-  git grep -q -e 'queries DIR is required' "$rev" -- crates/nrese-store/examples && empty=1
-  git grep -q -e '"--batch"' "$rev" -- crates/nrese-store/examples && batch=1
+  # What the built perf lab can do, from its source: route reports (--routes), whether it
+  # requires --queries (main's, f9b515e8: neither, and no samples per run), and whether its
+  # timed window starts no thread (the watchdog; PROTOCOL.md §5).
+  routes=1 empty=0 batch=0 timing=spawn
+  git grep -q -e '"--routes"' "$at" -- crates/nrese-store/examples || routes=0
+  git grep -q -e 'queries DIR is required' "$at" -- crates/nrese-store/examples && empty=1
+  git grep -q -e '"--batch"' "$at" -- crates/nrese-store/examples && batch=1
+  git grep -q -e 'mod perf_lab_watchdog' "$at" -- crates/nrese-store/examples && timing=watchdog
   printf 'routes=%s\nempty_queries=%s\nbatch=%s\ntiming=%s\n' "$routes" "$empty" "$batch" "$timing" > "$part/CAPABILITIES"
   echo "$rev" > "$part/REVISION"
-  { echo "revision $rev"; (cd "$src" && rustc -V); echo "missing at this revision: ${missing[*]:-none}";
-    echo "measurement patch perf_lab_watchdog: $patched";
+  { echo "revision $rev"; [ "$at" = "$rev" ] || echo "measurement commit $at (its parent: $rev)";
+    (cd "$src" && rustc -V); echo "missing at this revision: ${missing[*]:-none}";
     cat "$part/CAPABILITIES"; } > "$part/BUILD.txt"
   lld=$(lld_of "$part") || { log "build $rev: not linked by the toolchain's LLD"; exit 1; }
   echo "linker $lld" >> "$part/BUILD.txt"
   (cd "$part" && find release -type f | sort | xargs sha256sum > SHA256SUMS)
-  { build_identity "$rev" 1; echo "linker $lld"; } > "$part/IDENTITY"
+  { build_identity "$at" 1; echo "linker $lld"; } > "$part/IDENTITY"
   publish "$part" "$bin" || { log "build $rev: $bin is there but doesn't verify"; exit 1; }
   point "$rev" "$bin" 1
   fi
@@ -174,7 +322,7 @@ build)
   # rest copied from layout 1. A linker that isn't LLD refuses the option: the build fails.
   for L in "${todo[@]}"; do
     [ "$L" -gt 1 ] || continue
-    lbin=$(identity_dir "$rev" "$L")
+    lbin=$(identity_dir "$at" "$L")
     lpart=$lbin.partial-$$
     rm -rf "$lpart" && cp -a "$bin" "$lpart" && rm -rf "$lpart/SHA256SUMS" "$lpart/IDENTITY" "$lpart/.refs"
     for spec in nrese-store:perf_lab nrese-dl:tableau_consistency nrese-dl:context_classify nrese-reasoner:classify; do
@@ -189,7 +337,7 @@ build)
     lld=$(lld_of "$lpart") || { log "build $rev, layout $L: not linked by the toolchain's LLD"; exit 1; }
     echo "layout $L: the timed tools linked with --shuffle-sections=.text*=$L" >> "$lpart/BUILD.txt"
     (cd "$lpart" && find release -type f | sort | xargs sha256sum > SHA256SUMS)
-    { build_identity "$rev" "$L"; echo "linker $lld"; } > "$lpart/IDENTITY"
+    { build_identity "$at" "$L"; echo "linker $lld"; } > "$lpart/IDENTITY"
     cmp -s "$bin/release/examples/perf_lab" "$lpart/release/examples/perf_lab" \
       && { log "layout $L of $rev is byte-identical to layout 1: the shuffle didn't take"; exit 1; }
     publish "$lpart" "$lbin" || { log "build $rev, layout $L: $lbin is there but doesn't verify"; exit 1; }
@@ -313,8 +461,7 @@ block)
       log "block $n: $name is the same build as another side ($(basename "$bin")): timed once"; continue
     fi
     [ "$name" = cand ] || timed+=("$bin")
-    [ "$(cat "$bin/REVISION" 2>/dev/null)" = "$rev" ] && (cd "$bin" && sha256sum -c --quiet SHA256SUMS) \
-      || { log "block $n: no verified build of $rev, layout $layout"; exit 2; }
+    build_verified "$bin" "$rev" || { log "block $n: no verified build of $rev, layout $layout"; exit 2; }
     routes=1 empty_queries=0 timing=spawn
     # shellcheck disable=SC1091
     . "$bin/CAPABILITIES"
@@ -403,7 +550,7 @@ if os.name != "nt":  # a directory is synced on POSIX; Windows can not open one 
     # block_copies(): a cached instance's offset is the block's, not the round's; lks-aa-20). The
     # directory is made here for it alone, and only it is removed, also if fast.py dies.
     mkdir -p "$GATE/instances" && copies=$(mktemp -d "$GATE/instances/block-$n-XXXXXX") || exit 2
-    trap 'rm -rf "$copies"' EXIT
+    trap 'rm -rf "$copies"; finish' EXIT
     # The host kept quiet while the block runs (scripts/lib/quiet-watch.py, as the measurement
     # queue's timed chunks: the job's own other busy work suspended, anything else recorded as
     # disturbing it); its verdict kept with the block. GATE_QUIET=0: unwatched.
@@ -422,7 +569,7 @@ if os.name != "nt":  # a directory is synced on POSIX; Windows can not open one 
     (cd "$tree" && py benches/fast/fast.py block --block "$n" --layout "$layout" --cases "$cases" \
        --out "$OUT/passes" "${sides[@]}" "${opts[@]}" --fresh-copies "$copies") > "$OUT/passes/block-$n.log" 2>&1
     code=$?
-    rm -rf "$copies" && trap - EXIT
+    rm -rf "$copies" && trap finish EXIT
     if [ -n "$watcher" ]; then
       kill -TERM "$watcher" 2>/dev/null
       wait "$watcher"
@@ -583,6 +730,7 @@ guards)
 verdict)
   # The timed parts' results directories (the timed host's, the big host's), then the checks'.
   shift
+  cd "$launch" || exit 2
   args=()
   while [ $# -gt 1 ]; do
     for f in "$1"/*/release-gate.json "$1"/release-gate.json; do [ -f "$f" ] && args+=(--timed "$f"); done
@@ -590,7 +738,7 @@ verdict)
   done
   w3c=$(ls "$1"/w3c.json "$1"/*/w3c.json 2>/dev/null | head -1)
   guards=$(ls "$1"/guards.json "$1"/*/guards.json 2>/dev/null | head -1)
-  py benches/fast/release_gate.py verdict "${args[@]}" --w3c "$w3c" --guards "$guards" --out "$OUT/verdict.md"
+  py "$CODE/benches/fast/release_gate.py" verdict "${args[@]}" --w3c "$w3c" --guards "$guards" --out "$OUT/verdict.md"
   ;;
 
 pack)
@@ -633,6 +781,7 @@ unpack)
         || { log "unpack: $bin/$f is not an ELF binary"; exit 2; }
     done
     grep -q '^linker LLD ' "$aside/$bin/IDENTITY" 2>/dev/null || { log "unpack: $bin has no build identity"; exit 2; }
+    ! patch_keyed "$aside/$bin" || { log "unpack: $bin is a build of a perf lab patched before T0: build it again"; exit 2; }
     rev=$(cat "$aside/$bin/REVISION")
     publish "$aside/$bin" "$GATE_BIN/$bin" || { log "unpack: $GATE_BIN/$bin is there but doesn't verify"; exit 2; }
     point "$rev" "$GATE_BIN/$bin" "$(cat "$GATE_BIN/$bin/LAYOUT" 2>/dev/null || echo 1)"
@@ -671,6 +820,7 @@ EOF
 confirm)
   # From the first run's results (and earlier confirmations'), each host's next confirmation.
   shift
+  cd "$launch" || exit 2
   reports=() rest=()
   while [ $# -gt 0 ]; do
     case $1 in
@@ -679,35 +829,20 @@ confirm)
     esac
   done
   [ ${#reports[@]} -gt 0 ] || { echo "no release-gate.json in the given directories" >&2; exit 2; }
-  py benches/fast/release_gate.py confirm --reports "${reports[@]}" "${rest[@]}"
+  # The jobs' repository: the launching checkout, unless the caller names one (a later --checkout wins).
+  py "$CODE/benches/fast/release_gate.py" confirm --checkout "$launch" --reports "${reports[@]}" "${rest[@]}"
   ;;
 
 jobs)
   shift
-  py benches/fast/release_gate.py jobs "$@"
-  ;;
-
-clean)
-  # This gate's worktrees, build trees and scratch go (never the shared binaries' directory:
-  # other gates build and read there); the data view, the prepared data and every result stay
-  # for the gate's next run. Builds no gate used for GATE_BIN_AGE_DAYS go (sweep_builds).
-  before=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
-  for dir in "$GATE"/src-* "$GATE"/build/src-*; do [ -d "$dir" ] && git worktree remove --force "$dir"; done
-  rm -rf "$GATE"/target-* "$GATE"/build "$GATE"/reports "$GATE"/compact
-  # Block copies are removed by their block; what a killed one left is named, not swept.
-  rmdir "$GATE/instances" 2>/dev/null || { [ -d "$GATE/instances" ] \
-    && log "clean: block copies left by an interrupted block, not removed: $(ls "$GATE/instances" | tr '\n' ' ')"; }
-  swept=$(sweep_builds | tr '\n' ' ')
-  [ -z "$swept" ] || log "clean: unused builds removed: $swept"
-  git worktree prune
-  # Shared prepared data no gate has linked for two days (its last link's removal set its ctime).
-  [ -d "$SHARED/blobs" ] && find "$SHARED/blobs" -type f -links 1 -cmin +2880 -delete
-  after=$(du -sb "$GATE" "$GATE_BIN" 2>/dev/null | awk '{s += $1} END {print s}')
-  log "clean: $(( (before - after) / 1048576 )) MiB reclaimed; kept the binaries, the data view, the prepared data, the results"
+  cd "$launch" || exit 2
+  # As confirm's: the launching checkout, unless the caller names one.
+  py "$CODE/benches/fast/release_gate.py" jobs --checkout "$launch" "$@"
   ;;
 
 *)
-  sed -n '2,31p' "$0"
+  # The help: the head comment up to its paragraph after the commands.
+  awk 'NR > 1 && /^# One harness/ {exit} NR > 1' "$0"
   exit 2
   ;;
 esac

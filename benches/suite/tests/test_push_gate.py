@@ -343,6 +343,172 @@ esac
             self.assertIn("CARGO_ENCODED_RUSTFLAGS", done.stderr)
 
 
+class MeasurementRefs(Repo):
+    """A pushed refs/measure/* ref is a commit on an old side's tree (benches/PROTOCOL.md §5), which
+    engine-v2's push tier isn't for: check.sh push checks it by the measurement rule against the
+    declared sides (release_gate.py measurement-ref), and refuses anything else. T0, 28 Oct 2026: the
+    tier ran on main's and v1.5's measurement commits and both gates failed, so neither ref could go."""
+
+    PERF_LAB = "crates/nrese-store/examples/perf_lab.rs"
+
+    def setUp(self):
+        super().setUp()
+        (self.repo / "benches/fast").mkdir(parents=True, exist_ok=True)
+        shutil.copy(ROOT / "benches/fast/release_gate.py", self.repo / "benches/fast/release_gate.py")
+        shutil.copytree(ROOT / "benches/suite/suitekit", self.repo / "benches/suite/suitekit",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        self.side = self.add({self.PERF_LAB: "fn main() { spawn(); }\n",
+                              "crates/nrese-store/src/lib.rs": "pub fn engine() {}\n"}, "an old side")
+        self.git(self.repo, "push", "-q", "origin", "HEAD:refs/heads/refactor/engine-v2")
+
+    def add(self, changes: dict, message: str, on: str | None = None) -> str:
+        if on:
+            self.git(self.repo, "checkout", "-q", "--detach", on)
+        for path, text in changes.items():
+            (self.repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / path).write_text(text, newline="\n")
+        self.git(self.repo, "add", "-A")
+        self.git(self.repo, "commit", "-q", "-m", message)
+        return self.git(self.repo, "rev-parse", "HEAD")
+
+    def declare(self, side: str, ref: str, commit: str):
+        """The sides table of the pushing checkout: SIDE measured at COMMIT, pushed as REF."""
+        (self.repo / "benches/fast/measurement-sides.toml").write_text(
+            f'[side.{side}]\ncommit = "{commit}"\nref = "{ref}"\n', newline="\n")
+
+    def pushed(self, ref: str, commit: str):
+        self.fleet("pending")
+        return self.push((ref, commit, ref, ZERO))
+
+    def test_a_declared_measurement_ref_goes_without_the_push_tier(self):
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "its measurement side", self.side)
+        ref = f"refs/measure/old-{self.side[:8]}"
+        self.declare(self.side, ref, commit)
+        done = self.pushed(ref, commit)
+        self.assertEqual((done.returncode, self.jobs()), (0, []), f"SPEC measurement ref: {done.stderr}")
+
+    def test_a_measurement_ref_whose_commit_touches_the_engine_is_refused(self):
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n",
+                           "crates/nrese-store/src/lib.rs": "pub fn engine() { faster() }\n"}, "more", self.side)
+        ref = f"refs/measure/old-{self.side[:8]}"
+        self.declare(self.side, ref, commit)
+        done = self.pushed(ref, commit)
+        self.assertNotEqual(done.returncode, 0, "SPEC measurement ref: a commit touching the engine went")
+        self.assertIn("changes more than its perf lab", done.stdout + done.stderr)
+        self.assertEqual(self.jobs(), [], "the push tier ran instead")
+
+    def test_a_measurement_ref_that_doesnt_name_its_commits_parent_is_refused(self):
+        later = self.add({"a.txt": "later\n"}, "a later revision", self.side)
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "on the later revision", later)
+        ref = f"refs/measure/old-{self.side[:8]}"
+        self.declare(self.side, ref, commit)  # the ref names the side; the commit's parent is another
+        wrong_parent = self.pushed(ref, commit)
+        self.declare(self.side, ref, commit)
+        undeclared = self.pushed(f"refs/measure/old-{later[:8]}", commit)
+        self.assertEqual((wrong_parent.returncode != 0, undeclared.returncode != 0), (True, True),
+                         f"SPEC measurement ref: went\n{wrong_parent.stderr}\n{undeclared.stderr}")
+        self.assertIn(f"isn't a commit on {self.side[:12]} alone", wrong_parent.stdout + wrong_parent.stderr)
+        self.assertIn("declares this measurement ref", undeclared.stdout + undeclared.stderr)
+        self.assertEqual(self.jobs(), [])
+
+    def test_a_table_with_an_abbreviated_side_admits_nothing(self):
+        """Sol, T0 refs r1 S1: with the side abbreviated, the lookup by full revision missed, the
+        parent and path checks never ran, and a commit changing the lockfile went."""
+        later = self.add({"a.txt": "later\n"}, "a later revision", self.side)
+        commit = self.add({"Cargo.lock": "# another\n"}, "not a measurement side", later)
+        ref = f"refs/measure/old-{self.side[:8]}"
+        self.declare(self.side[:8], ref, commit)
+        done = self.pushed(ref, commit)
+        self.assertNotEqual(done.returncode, 0, f"SPEC measurement ref: went\n{done.stderr}")
+        self.assertIn("full revisions", done.stdout + done.stderr)
+        self.assertEqual(self.jobs(), [])
+
+    def test_a_measurement_ref_whose_side_is_on_no_remote_is_refused(self):
+        """T0, 28 Oct 2026: main's and v1.5's sides were ids from before the history rewrite, on no
+        remote ref; the ref's push would have published them with it."""
+        unpublished = self.add({"a.txt": "only here\n"}, "a side no remote has", self.side)
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "its measurement side", unpublished)
+        ref = f"refs/measure/old-{unpublished[:8]}"
+        self.declare(unpublished, ref, commit)
+        done = self.pushed(ref, commit)
+        self.assertNotEqual(done.returncode, 0, f"SPEC measurement ref: an unpublished side went\n{done.stderr}")
+        self.assertIn("the side must be published", done.stdout + done.stderr)
+        self.assertEqual(self.jobs(), [])
+
+    def test_a_graft_publishes_no_side(self):
+        """PR #54 fix check 1, the check's other walk: whether the side is on a remote ref was
+        asked of a history walk, which a graft changes; a graft putting an unpublished side under
+        the remote branch let its ref go, and the push would have published the side. The check
+        reads the objects as stored (release_gate.py STORED_OBJECTS)."""
+        unpublished = self.add({"a.txt": "only here\n"}, "a side no remote has", self.base)
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "its measurement side", unpublished)
+        self.git(self.repo, "checkout", "-q", "--detach", self.side)  # the push's own scripts, which base lacks
+        git_dir = Path(self.git(self.repo, "rev-parse", "--absolute-git-dir"))
+        (git_dir / "info").mkdir(exist_ok=True)
+        (git_dir / "info" / "grafts").write_text(f"{self.side} {unpublished}\n", encoding="utf-8")
+        ref = f"refs/measure/old-{unpublished[:8]}"
+        self.declare(unpublished, ref, commit)
+        done = self.pushed(ref, commit)
+        self.assertNotEqual(done.returncode, 0, f"SPEC measurement ref: a grafted side went\n{done.stderr}")
+        self.assertIn("the side must be published", done.stdout + done.stderr)
+
+    def test_a_remote_tracking_ref_made_here_publishes_no_side(self):
+        """Sol, PR #54 fix check 1 S2: the check took any refs/remotes/* ref for the remote's word, and
+        any local process can write one; a side no remote has went with a ref made here. Only the
+        remote's own list of its branches counts."""
+        unpublished = self.add({"a.txt": "only here\n"}, "a side no remote has", self.side)
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "its measurement side", unpublished)
+        self.git(self.repo, "update-ref", "refs/remotes/origin/planted", unpublished)
+        ref = f"refs/measure/old-{unpublished[:8]}"
+        self.declare(unpublished, ref, commit)
+        done = self.pushed(ref, commit)
+        self.assertNotEqual(done.returncode, 0, f"SPEC measurement ref: a side published by a local ref went\n"
+                                                f"{done.stderr}")
+        self.assertIn("the side must be published", done.stdout + done.stderr)
+        self.assertEqual(self.jobs(), [])
+
+    def test_a_remote_that_cant_be_asked_publishes_no_side(self):
+        """The check asks the remote the push goes to; a remote that doesn't answer proves nothing, even
+        for a side its branches have."""
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "its measurement side", self.side)
+        ref = f"refs/measure/old-{self.side[:8]}"
+        self.declare(self.side, ref, commit)
+        self.fleet("pending")
+        gone = (self.root / "gone.git").as_posix()
+        done = subprocess.run([BASH, ".githooks/pre-push", "origin", gone], cwd=self.repo,
+                              input=f"{ref} {commit} {ref} {ZERO}\n".encode(), capture_output=True, env=self.env,
+                              timeout=120)
+        self.assertNotEqual(done.returncode, 0, "SPEC measurement ref: went without the remote's answer")
+        self.assertIn(b"couldn't be asked", done.stdout + done.stderr)
+        self.assertEqual(self.jobs(), [])
+
+    @unittest.skipUnless(shutil.which("setsid"), "a process left behind in its own session (setsid)")
+    def test_a_process_a_remote_leaves_behind_doesnt_hold_the_answer(self):
+        """Sol, S2 r1 D1: git's output was read from pipes, drained without a bound, so a transport
+        helper's process left behind holding stderr (an ssh master, say) kept the check waiting after
+        git had failed. Only git's exit counts: the push is refused at once."""
+        commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "its measurement side", self.side)
+        ref = f"refs/measure/old-{self.side[:8]}"
+        self.declare(self.side, ref, commit)
+        self.fleet("pending")
+        helper, pidfile = self.root / "helper.sh", self.root / "helper.pid"
+        helper.write_text(f"setsid sh -c 'echo $$ > {pidfile.as_posix()}; exec sleep 100' >&2 &\nexit 1\n",
+                          newline="\n")
+        self.git(self.repo, "config", "protocol.ext.allow", "always")
+        try:
+            done = subprocess.run([BASH, ".githooks/pre-push", "origin", f"ext::sh {helper.as_posix()}"],
+                                  cwd=self.repo, input=f"{ref} {commit} {ref} {ZERO}\n".encode(),
+                                  capture_output=True, env=self.env, timeout=45)
+        finally:
+            if pidfile.exists():
+                try:
+                    os.kill(int(pidfile.read_text()), 9)
+                except (ValueError, ProcessLookupError):
+                    pass
+        self.assertNotEqual(done.returncode, 0, "SPEC measurement ref: went without the remote's answer")
+        self.assertIn(b"couldn't be asked", done.stdout + done.stderr)
+
+
 @unittest.skipUnless(shutil.which("flock"), "the gate job runs on Linux fleet hosts (flock)")
 class GateJob(Repo):
     """scripts/lib/gate-job.sh, the job's step on its host, with stand-ins for its tools. Ported with the

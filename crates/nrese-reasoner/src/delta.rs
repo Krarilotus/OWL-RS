@@ -307,7 +307,9 @@ pub fn update_with<B: Base + ?Sized>(
     // The ground rules that are non-recursive ([`super::recursion`]): a candidate for
     // overdeletion that one of them still derives in one step from what is left keeps
     // that derivation (its premises are below it: if one goes later in the commit, its
-    // loss brings the candidate back), without a proof search.
+    // loss brings the candidate back), without a proof search. Bodiless instances aren't
+    // among them: their schema facts may come from the candidate (scm-eqc1 and scm-eqc2
+    // derive each other's).
     let non_recursive = {
         let before = Overlay {
             base,
@@ -566,7 +568,9 @@ pub fn update_with<B: Base + ?Sized>(
                 // Independent per candidate: in parallel.
                 candidates = candidates
                     .into_par_iter()
-                    .filter(|&f| stop() || !old_program.derivable_by(&left, f, &non_recursive))
+                    .filter(|&f| {
+                        stop() || !old_program.derivable_by(&left, f, &non_recursive, false)
+                    })
                     .collect();
                 check_stop()?;
             }
@@ -667,10 +671,12 @@ pub fn update_with<B: Base + ?Sized>(
                 .iter()
                 .map(|rule| !is_equality_rule(rule))
                 .collect();
+            // Bodiless instances too: their schema facts are what remains, every open fact
+            // hidden.
             let by_rules: Vec<Triple> = open
                 .par_iter()
                 .copied()
-                .filter(|&f| !stop() && program.derivable_by(&remaining, f, &not_equality))
+                .filter(|&f| !stop() && program.derivable_by(&remaining, f, &not_equality, true))
                 .collect();
             let by_rules: HashSet<Triple> = by_rules.into_iter().collect();
             check_stop()?;
@@ -1048,11 +1054,7 @@ impl<B: Base + ?Sized> Prover<'_, B> {
         self.budget -= 1;
         self.active.insert(fact);
         let mut cut = false;
-        let mut bodies = self.program.derivation_bodies(state, fact, PROOF_BRANCHES);
-        if self.program.bodiless.contains(&fact) {
-            bodies.insert(0, self.program.bodiless_premises(fact).to_vec());
-        }
-        for body in bodies {
+        for body in self.program.derivation_bodies(state, fact, PROOF_BRANCHES) {
             if body.iter().any(|&g| gone.contains(g)) {
                 continue;
             }
