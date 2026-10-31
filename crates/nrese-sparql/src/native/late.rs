@@ -152,17 +152,19 @@ impl super::Context<'_> {
     /// Every row of `solutions` with each value replaced by each identity of its class,
     /// independently per column (a value outside every class stays), up to `limit` rows.
     /// Column by column: each row's combinations in odometer order (the last column
-    /// fastest), each column written in one pass.
+    /// fastest), each column written in one pass. What the columns hold is charged before
+    /// any of it is made, so an expansion past the query's budget, or past what memory
+    /// holds, fails as [`MemoryLimit`](crate::QueryEvaluationError::MemoryLimit).
     fn expand_classes(
         &self,
-        mut solutions: super::Solutions,
+        solutions: super::Solutions,
         classes: &nrese_engine::EqualityClasses,
         limit: Option<usize>,
     ) -> super::NativeResult<super::Solutions> {
         let (width, rows) = (solutions.table.width(), solutions.table.len());
         let limit = limit.unwrap_or(usize::MAX);
         let size = |id: u64| classes.members_of(&id).len();
-        // Each row's number of combinations.
+        // Each row's number of combinations (`usize::MAX`: that many or more).
         let mut factor = vec![1usize; rows];
         for c in 0..width {
             for (f, &id) in factor.iter_mut().zip(solutions.table.column(c)) {
@@ -172,20 +174,42 @@ impl super::Context<'_> {
         if factor.iter().all(|&f| f == 1) && rows <= limit {
             return Ok(solutions);
         }
-        // The rows whose combinations fit the limit (the last one maybe in part).
+        // The rows whose combinations fit the limit (the last one maybe in part), each
+        // written whole: a column holds `total` ids until it is cut to the limit. Without
+        // columns every row is one combination, so `total` is at most the rows.
         let mut total = 0usize;
         let mut kept = 0;
         while kept < rows && total < limit {
             total = total.saturating_add(factor[kept]);
             kept += 1;
         }
+        // The columns charged before they are made, with the input's charge. A size past
+        // `usize` (a saturated total included) is charged as the most bytes there are, which
+        // no budget holding the input grants.
+        let mut held =
+            nrese_exec::Reservation::adopt(&*self.budget, solutions.table.memory_bytes());
+        // Declared after `held`: freed before its charge is released.
+        let mut solutions = solutions;
+        let bytes = total.checked_mul(width).and_then(|ids| ids.checked_mul(8));
+        held.charge(bytes.unwrap_or(usize::MAX))
+            .map_err(crate::QueryEvaluationError::MemoryLimit)?;
         self.check()?;
         let mut columns: Vec<Vec<u64>> = vec![Vec::new(); width];
         // Products of the later columns' sizes, per row, built from the last column back.
         let mut stride = vec![1usize; kept];
         for c in (0..width).rev() {
             let column = solutions.table.column(c);
-            let mut out = Vec::with_capacity(total);
+            let mut out = Vec::new();
+            // A budget without a limit grants any size: the allocator may still refuse it.
+            if out.try_reserve_exact(total).is_err() {
+                let refused = nrese_exec::BudgetExceeded {
+                    limit: self.budget.limit(),
+                    requested: total * 8,
+                    used: self.budget.used(),
+                    shared: false,
+                };
+                return Err(crate::QueryEvaluationError::MemoryLimit(refused).into());
+            }
             for r in 0..kept {
                 let members = classes.members_of(&column[r]);
                 let repeat = stride[r];
@@ -207,8 +231,12 @@ impl super::Context<'_> {
             nrese_exec::IdTable::from_columns(columns)
         };
         let vars = std::mem::take(&mut solutions.vars);
-        self.consumed(solutions);
-        self.produced(super::Solutions {
+        drop(solutions);
+        self.check()?;
+        held.resize(out.memory_bytes())
+            .map_err(crate::QueryEvaluationError::MemoryLimit)?;
+        held.transfer();
+        Ok(super::Solutions {
             vars,
             table: out,
             ordered: false,
