@@ -436,3 +436,89 @@ fn a_measurement_that_should_panic_panics_alone() {
     }
     measure(|| panic!("measured and panicked"));
 }
+
+/// How long [`hangs_alone`] sleeps in its child: far past the deadline it runs under.
+const HANG_SECS: u64 = 30;
+
+/// Run by [`a_child_past_its_deadline_is_stopped`] under a deadline of one second.
+#[test]
+#[ignore = "run by a_child_past_its_deadline_is_stopped"]
+fn hangs_alone() {
+    if !alone() {
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_secs(HANG_SECS));
+}
+
+/// Spec: a call to another process has a deadline and kills its child when it expires
+/// (project rule; tests audit E14, A-904): a test whose child runs past [`alone`]'s
+/// deadline fails at the deadline, naming it, and its child is gone.
+#[test]
+fn a_child_past_its_deadline_is_stopped() {
+    let started = std::time::Instant::now();
+    let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args([
+            "measure::tests::hangs_alone",
+            "--exact",
+            "--include-ignored",
+        ])
+        .args(["--test-threads=1", "--nocapture"])
+        .env("NRESE_MEASURE_ALONE_SECS", "1")
+        .env_remove("NRESE_MEASURE_ALONE")
+        .output()
+        .expect("the test binary runs");
+    let elapsed = started.elapsed();
+    let printed = String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the child ran its {HANG_SECS} s to the end, in {elapsed:?}: {printed}"
+    );
+    assert!(
+        elapsed.as_secs() < HANG_SECS / 2,
+        "stopped after {elapsed:?}, not at its deadline"
+    );
+    let message = printed
+        .split_once("measure::tests::hangs_alone, run alone (process ")
+        .unwrap_or_else(|| panic!("no deadline named: {printed}"))
+        .1;
+    let (process, rest) = message
+        .split_once(')')
+        .expect("the process, then the deadline");
+    assert!(
+        rest.starts_with(", passed its deadline of 1 s"),
+        "{printed}"
+    );
+    assert!(process.parse::<u32>().is_ok(), "{printed}");
+    // Linux: a process that runs has its directory; a stopped one, waited for, has none.
+    #[cfg(target_os = "linux")]
+    assert!(
+        !std::path::Path::new(&format!("/proc/{process}")).exists(),
+        "process {process} still runs"
+    );
+}
+
+/// Spec: no hard-coded limits, every budget a setting with an unlimited value and a
+/// documented default (owner's design principles): unset, ten minutes; `0` and
+/// `unlimited`, none; whole seconds as given.
+#[test]
+fn the_deadline_is_whole_seconds_or_none() {
+    use std::time::Duration;
+    let cases = [
+        (None, Some(Duration::from_secs(600))),
+        (Some("0"), None),
+        (Some("unlimited"), None),
+        (Some(" Unlimited "), None),
+        (Some("1"), Some(Duration::from_secs(1))),
+        (
+            Some("18446744073709551615"),
+            Some(Duration::from_secs(u64::MAX)),
+        ),
+    ];
+    for (value, deadline) in cases {
+        assert_eq!(alone_deadline(value), deadline, "{value:?}");
+    }
+    for refused in ["", "-1", "1.5", "10s", "18446744073709551616"] {
+        let refusal = std::panic::catch_unwind(|| alone_deadline(Some(refused)));
+        assert!(refusal.is_err(), "{refused:?} taken");
+    }
+}

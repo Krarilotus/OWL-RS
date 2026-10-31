@@ -771,12 +771,17 @@ mod tests {
     use super::*;
 
     /// The process limit is read as set, holds past it, and doesn't latch: under a limit
-    /// no process meets again, it no longer holds.
+    /// no process meets again, it no longer holds. In a process of its own ([`alone`]), as
+    /// the limit is the process's; the limit it found is set again.
+    ///
+    /// [`alone`]: crate::measure::alone
     #[test]
     fn the_process_limit_follows_the_process() {
-        if process_bytes().is_none() {
+        if !crate::measure::alone() {
             return;
         }
+        process_bytes().expect("the platform reports the process's memory");
+        let incoming = process_limit().unwrap_or(0);
         set_process_limit(1);
         assert_eq!(process_limit(), Some(1));
         assert!(process_limit_exceeded(), "one byte is exceeded");
@@ -785,6 +790,8 @@ mod tests {
         set_process_limit(0);
         assert_eq!(process_limit(), None);
         assert!(!process_limit_exceeded());
+        set_process_limit(incoming);
+        assert_eq!(process_limit().unwrap_or(0), incoming);
     }
 
     #[test]
@@ -979,7 +986,10 @@ mod tests {
 
     /// A job object's memory limit counts as the memory the process may use: the test puts
     /// its own process into a job with a limit below the machine's memory (it becomes the
-    /// innermost job) and reads it back.
+    /// innermost job) and reads it back. In a process of its own ([`alone`]): a process
+    /// stays in its job for life, and the processes it starts are in it too.
+    ///
+    /// [`alone`]: crate::measure::alone
     #[cfg(windows)]
     #[test]
     fn a_job_objects_memory_limit_counts_as_the_memory_available() {
@@ -989,20 +999,20 @@ mod tests {
             SetInformationJobObject,
         };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
-        let machine = available_bytes().expect("the platform reports the memory it may use");
-        // Above what the tests use, below the machine; whole pages, as Windows keeps it.
-        let limit = (machine / 4 * 3).max(4 << 30) & !0xFFF;
-        if limit >= machine {
+        if !crate::measure::alone() {
             return;
         }
+        let machine = available_bytes().expect("the platform reports the memory it may use");
+        // Below the machine, whole pages, as Windows keeps it; far above the little more than
+        // COMMITTED this process holds, alone.
+        let limit = (machine / 4 * 3) & !0xFFF;
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_JOB_MEMORY;
         info.JobMemoryLimit = usize::try_from(limit).expect("a limit that fits");
         let size = u32::try_from(std::mem::size_of_val(&info)).expect("a small struct");
         // SAFETY: a fresh unnamed job; `info` is a valid JOBOBJECT_EXTENDED_LIMIT_INFORMATION
         // of `size` bytes; the current process's pseudo-handle needs no closing. The job
-        // handle stays open for the process's life, so the job lives as long as the test
-        // binary.
+        // handle stays open for the process's life, so the job lives as long as this child.
         let assigned = unsafe {
             let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
             !job.is_null()
@@ -1051,12 +1061,24 @@ mod tests {
         follows("after a violation");
     }
 
-    /// A phase's peak is its window's or none: where no window starts (Windows keeps one peak
-    /// for the process's life), the lifetime's peak isn't reported as the phase's.
+    /// A phase's peak is its window's or none: on Linux a window starts and has a peak;
+    /// elsewhere none starts (Windows keeps one peak for the process's life), and the
+    /// lifetime's peak isn't reported as the phase's. In a process of its own ([`alone`]):
+    /// a window resets the kernel's mark for the whole process.
+    ///
+    /// [`alone`]: crate::measure::alone
     #[test]
     fn a_phase_peak_is_its_windows_or_none() {
-        let started = start_peak_window();
-        assert_eq!(window_peak_bytes().is_some(), started);
+        if !crate::measure::alone() {
+            return;
+        }
+        let linux = cfg!(target_os = "linux");
+        assert_eq!(start_peak_window(), linux, "a window started");
+        assert_eq!(
+            window_peak_bytes().is_some(),
+            linux,
+            "the window has a peak"
+        );
     }
 
     #[test]
@@ -1083,39 +1105,54 @@ mod tests {
 
     /// A phase's window starts at what the process holds, and the lifetime peak keeps what
     /// came before it: perf lab reports reset the kernel's mark per phase, and a fast
-    /// suite's case peak read after the last phase was that phase's alone.
+    /// suite's case peak read after the last phase was that phase's alone. In a process of
+    /// its own ([`alone`]): the window resets the kernel's mark for the whole process, and
+    /// another test's memory would count in it.
+    ///
+    /// [`alone`]: crate::measure::alone
     #[cfg(target_os = "linux")]
     #[test]
     fn a_peak_window_keeps_the_lifetime_peak() {
         const HELD: usize = 256 << 20;
+        if !crate::measure::alone() {
+            return;
+        }
         let pages = std::hint::black_box(vec![1u8; HELD]);
         drop(pages);
         let before = peak_process_bytes().unwrap();
         assert!(start_peak_window());
         let window = window_peak_bytes().unwrap();
         assert!(peak_process_bytes().unwrap() >= before);
-        // Other tests of this binary hold at most 64 MiB at once.
         assert!(
             window + (HELD as u64) / 2 < before,
             "window {window} B, lifetime {before} B"
         );
     }
 
-    /// Switched off, the kernel shows the process's huge pages off, and on again.
+    /// Switched off, the kernel shows the process's huge pages off, and on again. In a
+    /// process of its own ([`alone`]), as the setting is the process's; the one it found is
+    /// set again.
+    ///
+    /// [`alone`]: crate::measure::alone
     #[cfg(target_os = "linux")]
     #[test]
     fn transparent_huge_pages_switch_for_the_process() {
+        if !crate::measure::alone() {
+            return;
+        }
+        // Shown from Linux 5.0 on.
         let state = || {
             let status = std::fs::read_to_string("/proc/self/status").unwrap();
-            let line = status.lines().find(|l| l.starts_with("THP_enabled:"))?;
+            let line = status.lines().find(|l| l.starts_with("THP_enabled:"));
+            let line = line.expect("the kernel shows the process's huge pages");
             line.split_whitespace().nth(1).map(str::to_owned)
         };
-        if state().is_none() {
-            return; // a kernel before 5.0 doesn't say
-        }
+        let incoming = state();
         assert!(set_transparent_huge_pages(false));
         assert_eq!(state().as_deref(), Some("0"));
         assert!(set_transparent_huge_pages(true));
         assert_eq!(state().as_deref(), Some("1"));
+        assert!(set_transparent_huge_pages(incoming.as_deref() == Some("1")));
+        assert_eq!(state(), incoming);
     }
 }
