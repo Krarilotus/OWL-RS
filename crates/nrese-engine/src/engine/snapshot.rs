@@ -814,9 +814,13 @@ impl Snapshot {
                 count += match visibility.shows_all(touching) {
                     true => classes.multiplicity(&quad, pattern),
                     false => {
-                        let mut copies = 0;
+                        let (mut copies, wanted) = (0, limit - count);
                         classes.expand(&quad, pattern, &mut |copy| {
                             copies += u64::from(visibility.shows(&copy, touching));
+                            match copies >= wanted {
+                                true => std::ops::ControlFlow::Break(()),
+                                false => std::ops::ControlFlow::Continue(()),
+                            }
                         });
                         copies
                     }

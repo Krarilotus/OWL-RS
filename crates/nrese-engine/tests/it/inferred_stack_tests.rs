@@ -781,6 +781,9 @@ fn emptiness_under_equality_makes_no_copies() {
         .reading_within(std::sync::Arc::new(nrese_exec::Budget::new(256 << 10)))
         .expect("a reader's budget");
     assert!(view.exists_in(ReadModel::Materialised, &QuadPattern::all()));
+    // Inferred reads show a copy only where it isn't asserted, so they look at the copies:
+    // the first shown one answers (r2 S2).
+    assert!(view.exists_in(ReadModel::Inferred, &QuadPattern::all()));
     assert!(!view.is_empty());
     assert!(view.read_refused().is_none(), "nothing refused");
 }
