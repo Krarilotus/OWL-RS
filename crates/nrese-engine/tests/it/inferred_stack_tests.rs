@@ -668,3 +668,92 @@ fn inferred_masks_stack_across_commits() {
     drop(view);
     assert_eq!(budget.used(), 0);
 }
+
+/// A canonical view is an exact delta over the asserted stack (`index/run.rs`): a
+/// named-graph statement it renames onto one that is asserted too is one statement, which
+/// every read counts once, while the stored snapshot keeps both (review B-201: the renamed
+/// statement was inserted again, so counts, the length and group counts found two where a
+/// scan found one).
+#[test]
+fn a_canonical_view_counts_a_statement_renamed_onto_an_asserted_one_once() {
+    let engine = engine();
+    let (rep, alias, same_as, p, o, g) = (id(1), id(2), id(3), id(4), id(5), id(10));
+    let mut tx = engine.transaction();
+    assert!(tx.insert_inferred(EncodedTriple::new(alias, same_as, rep)));
+    for subject in [alias, rep] {
+        assert!(tx.insert_encoded(EncodedQuad::new(subject, p, o, g)));
+    }
+    tx.commit().expect("commit");
+    engine.set_equality(Some(same_as));
+    let stored = engine.snapshot();
+    let canonical = stored.with_canonical_equality();
+    let in_g = QuadPattern::in_graph(g);
+    let named = QuadPattern {
+        graph: GraphSelector::AnyNamed,
+        ..QuadPattern::all()
+    };
+    // Canonical reads are those with inferred statements (asserted ones read as stored).
+    let model = ReadModel::Materialised;
+    let read: Vec<_> = canonical.quads_for_pattern_in(model, &in_g).collect();
+    assert_eq!(read, [EncodedQuad::new(rep, p, o, g)]);
+    assert_eq!(canonical.count_in(model, &in_g), 1, "count in the graph");
+    assert_eq!(canonical.count_in(model, &named), 1, "named graphs");
+    // The named statement and the inferred `alias sameAs rep`.
+    assert_eq!(canonical.len_in(model), 2, "length");
+    assert_eq!(
+        canonical.group_counts_in(model, &in_g, Permutation::Gspo),
+        Some(vec![(rep, 1)]),
+        "subjects counted"
+    );
+    assert_eq!(stored.count_in(model, &in_g), 2, "stored");
+    assert_eq!(stored.quads_for_pattern_in(model, &in_g).count(), 2);
+}
+
+/// Columns of both stacks, merged, come in the order [`Snapshot::scan_sorted_in`] yields
+/// their quads, or not at all (the caller then reads quads): merged on the projected
+/// columns alone, rows whose order an unprojected column decides came out by the
+/// projected ones (review B-202). A projection that holds every varying column up to its
+/// last keeps the column read, through both entry points.
+#[test]
+fn merged_columns_keep_the_scan_order_or_are_refused() {
+    let engine = engine();
+    let (s1, s2, p, o1, o100) = (id(1), id(2), id(4), id(5), id(9));
+    let mut tx = engine.transaction();
+    assert!(tx.insert_encoded(EncodedTriple::new(s1, p, o100).in_default_graph()));
+    assert!(tx.insert_inferred(EncodedTriple::new(s2, p, o1)));
+    tx.commit().expect("commit");
+    let snapshot = engine.snapshot();
+    let model = ReadModel::Materialised;
+    let all = QuadPattern::all();
+    // In subject order the objects are o100, o1: the subject, not projected, decides.
+    let scanned: Vec<u64> = snapshot
+        .scan_sorted_in(model, &all, Permutation::Spog)
+        .expect("sorted scan")
+        .map(|q| q.object.raw())
+        .collect();
+    assert_eq!(scanned, [o100.raw(), o1.raw()]);
+    let columns = snapshot.scan_columns_in(model, &all, Permutation::Spog, &[2]);
+    assert!(
+        columns.as_ref().is_none_or(|c| c[0] == scanned),
+        "columns {columns:?}, scan {scanned:?}"
+    );
+    let ranged = snapshot.scan_range_columns_in(model, &all, Permutation::Spog, s1, s2, &[2]);
+    assert!(
+        ranged.as_ref().is_none_or(|c| c[0] == scanned),
+        "range columns {ranged:?}, scan {scanned:?}"
+    );
+    // The predicate bound, the object is the first varying column: merged on it.
+    let by_predicate = QuadPattern {
+        predicate: Some(p),
+        ..QuadPattern::all()
+    };
+    let in_order = vec![vec![o1.raw(), o100.raw()]];
+    assert_eq!(
+        snapshot.scan_columns_in(model, &by_predicate, Permutation::Posg, &[2]),
+        Some(in_order.clone())
+    );
+    assert_eq!(
+        snapshot.scan_range_columns_in(model, &by_predicate, Permutation::Posg, o1, o100, &[2]),
+        Some(in_order)
+    );
+}

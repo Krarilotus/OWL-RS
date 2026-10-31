@@ -370,8 +370,9 @@ from suitekit import hosts; print(hosts.input_path("general") or "")')
   cases=$(planned)
   log "plan: $(py -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["run"]), "cases;", len(d["not_run"]), "not run;", len(d["elsewhere"]), "on the big host")' "$GATE/plan.json")"
   # The data view: each dataset a planned case reads, from the host's general inputs or the
-  # SPARQL data; checked against its freeze (datasets.toml) and recorded either way.
-  (cd "$tree" && py - "$cases" "$general" "$SPARQL_DATA" "$GATE/data" > "$OUT/inputs.txt") <<'EOF' || exit 2
+  # SPARQL data, recorded with its hash. One that isn't its freeze (datasets.toml), or has none,
+  # is refused and leaves the view, and preparation stops.
+  (cd "$tree" && py - "$cases" "$general" "$SPARQL_DATA" "$GATE/data" > "$OUT/inputs.txt") <<'EOF' || { tee -a "$OUT/gate.log" < "$OUT/inputs.txt"; exit 2; }
 import hashlib, os, subprocess, sys, tomllib
 from pathlib import Path
 sys.path.insert(0, "benches/suite")
@@ -391,7 +392,13 @@ for name in files:
         print(f"MISSING {name}: neither in {general} nor in {sparql}"); failed = True; continue
     target, sha = view / name, digest(source)
     entry = frozen.get(name, {})
-    status = "frozen" if sha == entry.get("sha256") else f"NOT the freeze ({entry.get('sha256', 'none')[:12]})"
+    if sha != entry.get("sha256"):
+        if target.is_symlink() or target.exists():
+            target.unlink()  # an earlier preparation's
+        print(f"NOT the freeze {name}: {source} sha256 {sha}, frozen {entry.get('sha256', 'none')[:12]}")
+        failed = True
+        continue
+    status = "frozen"
     target.parent.mkdir(parents=True, exist_ok=True)
     if entry.get("n_triples") or name.startswith("bsbm-"):
         # Not N-Triples as frozen (BSBM's Turtle doubles): converted once per source, which
