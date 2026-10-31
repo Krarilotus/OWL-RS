@@ -13,7 +13,10 @@
 //! - **Round trips.** Every document that parses is written with the N3 writer and read
 //!   again: the same statements.
 //! - **Streaming.** Every document is also read through a reader that gives one byte per
-//!   call: the same statements, or the same failure.
+//!   call: the same statements, or a syntax error too.
+//! - **Rejection.** A negative test passes only when both readers reject the document's
+//!   content (a syntax error). A fixture that can't be read, a setup error, an I/O error or
+//!   the two readers disagreeing fails the test, whatever its kind.
 //! - **Nesting.** One test nests formulas 1,080 deep; the parser's default limit (128, a
 //!   guard for servers) is raised to 2,048 here, and the suite runs on a thread with a
 //!   stack to match.
@@ -23,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use nrese_rdf::{BlankNode, Dataset, NamedNode, NamedOrBlankNode, Quad, Term};
 use nrese_rdf_io::n3::{N3Parser, N3Quad, N3Serializer, N3Term};
-use nrese_rdf_io::{RdfFormat, RdfParser};
+use nrese_rdf_io::{RdfFormat, RdfParseError, RdfParser, RdfSyntaxError};
 
 const BASE: &str = "https://w3c.github.io/N3/tests/N3Tests/";
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
@@ -207,30 +210,40 @@ fn canonical(quads: &[N3Quad]) -> Dataset {
     dataset
 }
 
-fn parse(root: &Path, iri: &str) -> Result<Vec<N3Quad>, String> {
-    let bytes = std::fs::read(file(root, iri)).map_err(|e| e.to_string())?;
+/// A document's statements, or the syntax error both readers reject its content with.
+type Verdict = Result<Vec<N3Quad>, RdfSyntaxError>;
+
+/// The verdict on a document, read from a slice and through a trickling reader. `Err` when
+/// there is none: the fixture can't be read, the parser can't be set up, or the readers
+/// disagree.
+fn parse(root: &Path, iri: &str) -> Result<Verdict, String> {
+    let path = file(root, iri);
+    let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let parser = N3Parser::new()
         .with_base_iri(iri)
-        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("the base IRI {iri}: {e}"))?
         .with_max_nesting(2048);
-    let from_slice: Result<Vec<N3Quad>, String> = parser
-        .clone()
-        .for_slice(&bytes)
-        .collect::<Result<_, _>>()
-        .map_err(|e| e.to_string());
-    let from_reader: Result<Vec<N3Quad>, String> = parser
-        .for_reader(Trickle(&bytes))
-        .collect::<Result<_, _>>()
-        .map_err(|e| e.to_string());
-    match (&from_slice, &from_reader) {
-        (Ok(a), Ok(b)) if canonical(a) != canonical(b) => {
-            return Err("a slice and a trickling reader give different statements".to_owned());
+    let from_slice = parser.clone().for_slice(&bytes).collect();
+    agree(from_slice, parser.for_reader(Trickle(&bytes)).collect())
+}
+
+/// One verdict of the slice's and the reader's: the same statements up to blank node
+/// names, or a syntax error from both. An I/O error is never a verdict.
+fn agree(
+    from_slice: Result<Vec<N3Quad>, RdfParseError>,
+    from_reader: Result<Vec<N3Quad>, RdfParseError>,
+) -> Result<Verdict, String> {
+    match (from_slice, from_reader) {
+        (Ok(a), Ok(b)) if canonical(&a) == canonical(&b) => Ok(Ok(a)),
+        (Ok(_), Ok(_)) => {
+            Err("a slice and a trickling reader give different statements".to_owned())
         }
-        (Ok(_), Err(e)) => return Err(format!("only the trickling reader fails: {e}")),
-        (Err(e), Ok(_)) => return Err(format!("only the slice fails: {e}")),
-        _ => {}
+        (Err(RdfParseError::Syntax(e)), Err(RdfParseError::Syntax(_))) => Ok(Err(e)),
+        (Err(RdfParseError::Io(e)), _) => Err(format!("the slice fails to read: {e}")),
+        (_, Err(RdfParseError::Io(e))) => Err(format!("the trickling reader fails to read: {e}")),
+        (Ok(_), Err(e)) => Err(format!("only the trickling reader fails: {e}")),
+        (Err(e), Ok(_)) => Err(format!("only the slice fails: {e}")),
     }
-    from_slice
 }
 
 fn round_trip(quads: &[N3Quad]) -> Result<(), String> {
@@ -254,15 +267,16 @@ fn round_trip(quads: &[N3Quad]) -> Result<(), String> {
 }
 
 fn run(root: &Path, test: &Test) -> Result<(), String> {
-    let action = parse(root, &test.action);
+    let action = parse(root, &test.action)?;
+    let statements = |verdict: Verdict| verdict.map_err(|e| e.to_string());
     match test.kind {
-        Kind::Positive => round_trip(&action?),
+        Kind::Positive => round_trip(&statements(action)?),
         Kind::Negative => match action {
             Ok(_) => Err("parsed, but must not".to_owned()),
             Err(_) => Ok(()),
         },
         Kind::Eval => {
-            let actual = action?;
+            let actual = statements(action)?;
             round_trip(&actual)?;
             let result = test
                 .result
@@ -270,7 +284,9 @@ fn run(root: &Path, test: &Test) -> Result<(), String> {
                 .ok_or("an evaluation test without result")?;
             // N3 is a superset of N-Triples (some expected results have literal subjects).
             let expected: Vec<N3Quad> = if !result.ends_with(".nq") {
-                parse(root, result).map_err(|e| format!("expected result: {e}"))?
+                parse(root, result)
+                    .and_then(statements)
+                    .map_err(|e| format!("expected result: {e}"))?
             } else {
                 let bytes = std::fs::read(file(root, result)).map_err(|e| e.to_string())?;
                 RdfParser::from_format(RdfFormat::NQuads)
@@ -362,4 +378,65 @@ fn suites() {
         unexpected.len(),
         unexpected.join("\n")
     );
+}
+
+/// A negative test passes on a syntax error from both readers, and on nothing else: a
+/// fixture that is missing, or whose IRI can't be the base, fails a test of any kind.
+#[test]
+fn negative_tests_pass_only_on_a_content_rejection() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("w3c-n3-harness-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    // An unclosed formula, and a statement without an object: not N3.
+    for (name, text) in [
+        ("formula.n3", "{ <http://e/s> <http://e/p> <http://e/o> .\n"),
+        ("object.n3", "<http://e/s> <http://e/p> .\n"),
+        ("a b.n3", "<http://e/s> <http://e/p> .\n"),
+    ] {
+        std::fs::write(root.join(name), text).unwrap();
+    }
+    let test = |kind, name: &str| Test {
+        iri: name.to_owned(),
+        kind,
+        action: format!("{BASE}{name}"),
+        result: None,
+    };
+    for name in ["formula.n3", "object.n3"] {
+        assert_eq!(run(&root, &test(Kind::Negative, name)), Ok(()), "{name}");
+    }
+    for name in ["absent.n3", "a b.n3"] {
+        for kind in [Kind::Negative, Kind::Positive] {
+            let outcome = run(&root, &test(kind, name));
+            assert!(outcome.is_err(), "{name} {kind:?}: {outcome:?}");
+        }
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// The slice and the reader give one verdict, or none: one rejecting what the other reads,
+/// different statements, or an I/O error on either side is a harness failure.
+#[test]
+fn readers_that_disagree_give_no_verdict() {
+    let read = |text: &str| -> Result<Vec<N3Quad>, RdfParseError> {
+        N3Parser::new().for_slice(text.as_bytes()).collect()
+    };
+    let quads = || read("<http://e/s> <http://e/p> <http://e/o> .\n");
+    let other = || read("<http://e/s> <http://e/p> <http://e/x> .\n");
+    let rejected = || read("<http://e/s> <http://e/p> .\n");
+    let unreadable = || -> Result<Vec<N3Quad>, RdfParseError> {
+        Err(std::io::Error::other("unreadable").into())
+    };
+    for (case, from_slice, from_reader) in [
+        ("only the reader rejects", quads(), rejected()),
+        ("only the slice rejects", rejected(), quads()),
+        ("different statements", quads(), other()),
+        ("the slice can't read", unreadable(), rejected()),
+        ("the reader can't read", rejected(), unreadable()),
+    ] {
+        let verdict = agree(from_slice, from_reader);
+        assert!(verdict.is_err(), "{case}: {verdict:?}");
+    }
+    assert!(matches!(agree(rejected(), rejected()), Ok(Err(_))));
+    let expected = quads().unwrap();
+    assert_eq!(agree(quads(), quads()), Ok(Ok(expected)));
 }
