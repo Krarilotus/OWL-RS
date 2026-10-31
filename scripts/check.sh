@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # The gate, in three tiers. A test runs where it matters: each crate owns its tests, so a
-# change runs the tests of the crates it touches, and the crates that depend on them are
-# only compiled (commit) or run their fast tests (push). Slow suites (conformance, fuzz
-# campaigns) are declared by their crate (`[package.metadata.nrese] slow-tests`) and run
-# when that crate changed, or at a milestone. Benchmarks never run here.
+# change runs the tests of the crates it touches, and the crates that depend on them run
+# their fast tests (push). Slow suites (conformance, fuzz campaigns) are declared by their
+# crate (`[package.metadata.nrese] slow-tests`) and run when that crate changed, or at a
+# milestone. Benchmarks never run here.
 #
-# Usage: scripts/check.sh commit   pre-commit hook: the crates changed against HEAD
-#                                  (staged or not). fmt; clippy on them; their
-#                                  dependents' libraries compile; their fast tests.
+# Usage: scripts/check.sh commit   pre-commit hook, here, in seconds: fmt; for the files
+#                                  changed against HEAD (staged or not), their lock files
+#                                  and Docker names. Nothing is built, linted or tested: a
+#                                  branch may hold unchecked commits; a tree lands only
+#                                  when its push tier passed for that exact tree, and its
+#                                  Windows inputs passed the Windows check (below).
 #        scripts/check.sh push     pre-push hook (.githooks/pre-push): the crates a pushed
 #                                  commit changes in the pushed range, on the fleet only
 #                                  (scripts/lib/fleet-gate.sh). fmt; clippy on them; all their
@@ -15,7 +18,11 @@
 #                                  seeds; the lock check; nrese-exec's unsafe code under Miri
 #                                  and its doc tests when it changed (scripts/miri.sh). By
 #                                  hand: HEAD, from its upstream (else from where it left
-#                                  origin's refactor/engine-v2), so a push then finds the pass.
+#                                  origin's refactor/engine-v2), so a push then finds the pass;
+#                                  NRESE_PUSH_REF names the ref it will go to, as the hook's
+#                                  does (a merge check: refs/heads/refactor/engine-v2, which
+#                                  makes its job a merge gate on the fleet). A value the
+#                                  caller's environment already holds is that caller's word.
 #        scripts/check.sh windows [COMMIT]
 #                                  the merge check's Windows part, on the fleet only
 #                                  (scripts/lib/fleet-gate.sh windows): COMMIT (default HEAD)
@@ -24,6 +31,8 @@
 #                                  scripts/lib/windows-job.sh runs on a Windows host. A commit
 #                                  whose inputs (scripts/lib/gate-key.sh windows_inputs)
 #                                  passed before carries that pass: "carried from <commit>".
+#                                  NRESE_PUSH_REF as for push: the merge check's Windows part
+#                                  for refactor/engine-v2 is a merge gate, a package's isn't.
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
 #                                  doc tests, cargo-deny, the console.
 #
@@ -335,16 +344,18 @@ if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HO
   esac
 fi
 
-# This machine selects the changed files. With a build host (scripts/lib/remote.sh), the host
-# runs every step on a snapshot of this working tree; without one, or with NRESE_BUILD_HOST=local,
-# this script runs them here. Either way a passed tier is remembered.
-build_host=${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}
-# A machine's guard marks it busy (low memory or disk); then a local build goes to the build host.
-if [ "$build_host" = local ] && [ -f "${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}" ]; then
-  echo "this machine is busy ($(cat "${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}")); building on the build host" >&2
-  build_host=$(git config --get nrese.buildHost)
-fi
-if [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
+# The commit tier runs here, always: it builds nothing, so no build host or guard applies to it.
+# For the other tiers this machine selects the changed files. With a build host
+# (scripts/lib/remote.sh), the host runs every step on a snapshot of this working tree; without
+# one, or with NRESE_BUILD_HOST=local, this script runs them here. Either way a passed tier is
+# remembered.
+if [ "$mode" != commit ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
+  build_host=${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}
+  # A machine's guard marks it busy (low memory or disk); then a local build goes to the build host.
+  if [ "$build_host" = local ] && [ -f "${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}" ]; then
+    echo "this machine is busy ($(cat "${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}")); building on the build host" >&2
+    build_host=$(git config --get nrese.buildHost)
+  fi
   list=$(mktemp)
   [ "$mode" = all ] || changed_files "$mode" > "$list"
   # A tier that passed for this exact tree and file list doesn't run again. So the gate can
@@ -368,17 +379,33 @@ if [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
 fi
 
 case "$mode" in
-  commit | push)
-    if [ -n "${NRESE_FILES_FROM:-}" ]; then
-      mapfile -t files < "$NRESE_FILES_FROM"
-    elif [ "$mode" = push ]; then
-      # A push tier on a build host runs the list its gate sent (gate-job.sh, remote.sh), never
-      # one it selects itself: here it has no pushed range.
+  commit)
+    # Checks of a few seconds, with no build: rustfmt, and for the files changed against HEAD
+    # their lock files, Docker names and the bench harness's format. The compile, the lints and
+    # the tests run on the fleet before anything lands: the push tier for the pushed commit's exact
+    # tree, the merge check's Windows part for its Windows inputs (scripts/lib/gate-key.sh
+    # windows_inputs; process review 20 Oct 2026, §3A).
+    mapfile -t files < <(changed_files commit)
+    step fmt cargo fmt --all --check
+    if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
+      step locks bash scripts/check-locks.sh
+    fi
+    # Docker names only from the job namespace (scripts/check-names.sh).
+    if printf '%s\n' "${files[@]}" | grep -qE '^(benches|scripts)/'; then
+      step names bash scripts/check-names.sh
+    fi
+    if printf '%s\n' "${files[@]}" | grep -qE '^benches/nrese-bench-harness/'; then
+      step "fmt (bench harness)" cargo fmt --manifest-path benches/nrese-bench-harness/Cargo.toml --all --check
+    fi
+    ;;
+  push)
+    # A push tier on a build host runs the list its gate sent (gate-job.sh, remote.sh), never one
+    # it selects itself: here it has no pushed range.
+    if [ -z "${NRESE_FILES_FROM:-}" ]; then
       echo "check.sh push on a build host needs the gate's file list (NRESE_FILES_FROM): not run" >&2
       exit 2
-    else
-      mapfile -t files < <(changed_files "$mode")
     fi
+    mapfile -t files < "$NRESE_FILES_FROM"
     mapfile -t changed < <(crates_of "${files[@]}")
     mapfile -t dependents < <([ ${#changed[@]} -gt 0 ] && dependents_of "${changed[@]}")
     echo "=== changed: ${changed[*]:-none}; depending on them: ${dependents[*]:-none}"
@@ -386,26 +413,17 @@ case "$mode" in
     if [ ${#changed[@]} -gt 0 ]; then
       # Lints where code changed: every target of the changed crates. A dependent's code didn't
       # change, so its lints can't either; what can break there is compiling against the new
-      # API. At commit that is checked on the dependents' libraries only; at push the
-      # dependents' tests are built and run anyway, which checks every target of theirs.
+      # API, and the dependents' tests are built and run, which checks every target of theirs.
       # shellcheck disable=SC2046
       step clippy "$guarded" clippy --locked $(package_args "${changed[@]}") --all-targets
-      if [ "$mode" = commit ] && [ ${#dependents[@]} -gt 0 ]; then
-        # shellcheck disable=SC2046
-        step "dependents compile" "$guarded" check --locked -q $(package_args "${dependents[@]}") --lib
-      fi
       w3c_data
-      if [ "$mode" = commit ]; then
-        step test run_tests "${changed[@]}" -- "${changed[@]}"
-      else
-        step test run_tests "${changed[@]}" "${dependents[@]}" -- "${dependents[@]}"
-        step seeds run_seeds "${changed[@]}"
-        step locks bash scripts/check-locks.sh
-      fi
+      step test run_tests "${changed[@]}" "${dependents[@]}" -- "${dependents[@]}"
+      step seeds run_seeds "${changed[@]}"
+      step locks bash scripts/check-locks.sh
     fi
     # nrese-exec's unsafe primitives under Miri (scripts/miri.sh), and its doc tests: the
     # compile-fail rows that keep their misuse unwritable (a settled region grows).
-    if [ "$mode" = push ] && exec_changed; then
+    if exec_changed; then
       step miri bash scripts/miri.sh
       step "doc tests (nrese-exec)" "$guarded" test --locked --doc -p nrese-exec
     fi
