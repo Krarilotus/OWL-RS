@@ -15,7 +15,10 @@
 #                                  seeds; the lock check; nrese-exec's unsafe code under Miri
 #                                  and its doc tests when it changed (scripts/miri.sh). By
 #                                  hand: HEAD, from its upstream (else from where it left
-#                                  origin's refactor/engine-v2), so a push then finds the pass.
+#                                  origin's refactor/engine-v2), so a push then finds the pass;
+#                                  NRESE_PUSH_REF names the ref it will go to, as the hook's
+#                                  does (a merge check: refs/heads/refactor/engine-v2, which
+#                                  makes its job a merge gate on the fleet).
 #        scripts/check.sh windows [COMMIT]
 #                                  the merge check's Windows part, on the fleet only
 #                                  (scripts/lib/fleet-gate.sh windows): COMMIT (default HEAD)
