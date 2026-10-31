@@ -14,6 +14,8 @@ import subprocess
 import tempfile
 import unittest
 
+import isolation
+
 
 # Also works unchanged under benches/suite/tests when integrated for discovery.
 FETCH_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "fetch-w3c-tests.sh"
@@ -26,11 +28,8 @@ def shell_path(path: Path) -> str:
 
 
 def fixture_environment() -> dict[str, str]:
-    # As in test_queue.fixture_environment(): never let a hook redirect fixture setup.
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
-               GIT_ALLOW_PROTOCOL="file", GIT_TERMINAL_PROMPT="0")
-    return env
+    # The suite's git policy (never let a hook redirect fixture setup), offline.
+    return isolation.inherit(GIT_ALLOW_PROTOCOL="file", GIT_TERMINAL_PROMPT="0")
 
 
 class FetchGitEnvironment(unittest.TestCase):
