@@ -679,7 +679,11 @@ fn a_canonical_view_counts_a_statement_renamed_onto_an_asserted_one_once() {
     let engine = engine();
     let (rep, alias, same_as, p, o, g) = (id(1), id(2), id(3), id(4), id(5), id(10));
     let mut tx = engine.transaction();
+    // The class's statements in the default graph: the alias's marker, and the
+    // representative's own `sameAs`, which canonical reads give once and expanding reads
+    // give for every pair of identities.
     assert!(tx.insert_inferred(EncodedTriple::new(alias, same_as, rep)));
+    assert!(tx.insert_inferred(EncodedTriple::new(rep, same_as, rep)));
     for subject in [alias, rep] {
         assert!(tx.insert_encoded(EncodedQuad::new(subject, p, o, g)));
     }
@@ -698,8 +702,21 @@ fn a_canonical_view_counts_a_statement_renamed_onto_an_asserted_one_once() {
     assert_eq!(read, [EncodedQuad::new(rep, p, o, g)]);
     assert_eq!(canonical.count_in(model, &in_g), 1, "count in the graph");
     assert_eq!(canonical.count_in(model, &named), 1, "named graphs");
-    // The named statement and the inferred `alias sameAs rep`.
-    assert_eq!(canonical.len_in(model), 2, "length");
+    // What canonical reads see: the named statement and `rep sameAs rep`, nothing expanded;
+    // the inferred `alias sameAs rep` is held but not visible, so the length, which counts
+    // what the stacks hold, is one more (PR #65 r1 F1; PR #70 r1).
+    let all = QuadPattern::all();
+    assert_eq!(
+        canonical.quads_for_pattern_in(model, &all).count(),
+        2,
+        "scan"
+    );
+    assert_eq!(canonical.count_in(model, &all), 2, "count");
+    assert_eq!(canonical.len_in(model), 3, "held");
+    // Expanding reads see more than is held: both named statements and `sameAs` between
+    // every pair of the two identities, of the four held.
+    assert_eq!(stored.count_in(model, &all), 6, "expanded count");
+    assert_eq!(stored.len_in(model), 4, "held, expanding");
     assert_eq!(
         canonical.group_counts_in(model, &in_g, Permutation::Gspo),
         Some(vec![(rep, 1)]),
@@ -707,6 +724,68 @@ fn a_canonical_view_counts_a_statement_renamed_onto_an_asserted_one_once() {
     );
     assert_eq!(stored.count_in(model, &in_g), 2, "stored");
     assert_eq!(stored.quads_for_pattern_in(model, &in_g).count(), 2);
+}
+
+/// A snapshot is empty when reads see nothing, even where its stacks hold quads equality
+/// hides: a subset holding only an alias's marker reads as empty, expanded or canonical
+/// (PR #70 r1 F1: `is_empty` answered from the held length).
+#[test]
+fn equality_subset_emptiness_agrees_with_reads() {
+    let engine = engine();
+    let (rep, alias, same_as) = (id(1), id(2), id(3));
+    let mut tx = engine.transaction();
+    assert!(tx.insert_inferred(EncodedTriple::new(rep, same_as, rep)));
+    assert!(tx.insert_inferred(EncodedTriple::new(alias, same_as, rep)));
+    tx.commit().expect("commit");
+    engine.set_equality(Some(same_as));
+    let marker = EncodedTriple::new(alias, same_as, rep).in_default_graph();
+    let subset = engine
+        .snapshot()
+        .with_inferred_subset(nrese_engine::InferredSubset::Only(vec![marker]));
+    let (all, model) = (QuadPattern::all(), ReadModel::Materialised);
+    for (name, view) in [
+        ("expanding", subset.clone()),
+        ("canonical", subset.with_canonical_equality()),
+    ] {
+        assert_eq!(view.len_in(model), 1, "{name}: held");
+        assert_eq!(view.quads_for_pattern_in(model, &all).count(), 0, "{name}");
+        assert_eq!(view.count_in(model, &all), 0, "{name}");
+        assert!(view.is_empty(), "{name}");
+    }
+    assert!(!engine.snapshot().is_empty(), "the whole class reads");
+}
+
+/// Whether a read under equality finds a first quad makes none of a class's copies: over a
+/// class of 301 identities, a snapshot reading within 256 KiB isn't empty and refused
+/// nothing (PR #70 r1 S1: existence reserved every copy of `rep sameAs rep` first, so the
+/// read was refused and the snapshot looked empty).
+#[test]
+fn emptiness_under_equality_makes_no_copies() {
+    let engine = engine();
+    let mut tx = engine.transaction();
+    let terms: Vec<TermId> = (0..=301)
+        .map(|n| {
+            let iri = NamedNode::new_unchecked(format!("http://example.com/class/{n}"));
+            tx.intern(iri.as_ref().into())
+        })
+        .collect();
+    let (same_as, rep, aliases) = (terms[0], terms[1], &terms[2..]);
+    assert!(tx.insert_inferred(EncodedTriple::new(rep, same_as, rep)));
+    for &alias in aliases {
+        assert!(tx.insert_inferred(EncodedTriple::new(alias, same_as, rep)));
+    }
+    tx.commit().expect("commit");
+    engine.set_equality(Some(same_as));
+    let view = engine
+        .snapshot()
+        .reading_within(std::sync::Arc::new(nrese_exec::Budget::new(256 << 10)))
+        .expect("a reader's budget");
+    assert!(view.exists_in(ReadModel::Materialised, &QuadPattern::all()));
+    // Inferred reads show a copy only where it isn't asserted, so they look at the copies:
+    // the first shown one answers (r2 S2).
+    assert!(view.exists_in(ReadModel::Inferred, &QuadPattern::all()));
+    assert!(!view.is_empty());
+    assert!(view.read_refused().is_none(), "nothing refused");
 }
 
 /// Columns of both stacks, merged, come in the order [`Snapshot::scan_sorted_in`] yields
