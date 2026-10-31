@@ -17,11 +17,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 import isolation
 
 ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT / "benches" / "suite"))
+from suitekit.lock import lock  # noqa: E402
+
 BASH = shutil.which("bash")
 # Run from a git hook or inside a gate job, the caller's variables (git's own: isolation.inherit()
 # drops them; the gate's, the fleet's, the thread counts, the Windows job's RUSTUP_AUTO_INSTALL)
@@ -34,7 +38,7 @@ COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", 
           "scripts/lib/target-cpu.sh", "scripts/lib/remote.sh", "scripts/lib/gate-key.sh",
           "scripts/lib/fleet-gate.sh", "scripts/lib/fleet-job.sh", "scripts/lib/gate-tools.txt",
           "scripts/lib/gate-record.py", "scripts/lib/windows-job.ps1", "scripts/lib/windows-job.sh",
-          "benches/suite/requirements.txt")
+          "scripts/lib/suite-python.sh", "scripts/lib/ns.sh", "benches/suite/requirements.txt")
 # A stand-in for the fleet's CLI: each submit keeps its job file; status, results and cancel as told.
 FLEET = """#!/bin/sh
 case "$1" in
@@ -703,7 +707,7 @@ class WindowsCheck(Repo):
     def test_it_is_the_commits_own_job_on_a_host_that_can_run_the_suite(self):
         """Without a verdict there is no pass, and the exit says so (75, not a failure's 1): the job
         is cancelled and nothing runs here. The job is COMMIT's own (its checkout, its launcher, its
-        tree); it states what it needs (a host that can run the suite, 6 cores, its memory held to
+        tree); it states what it needs (a host that can run the suite, 4 cores, its memory held to
         the ask) and picks no host."""
         older = self.commit("a.txt", "a changed\n")
         self.commit("b.txt", "b changed\n")
@@ -716,8 +720,8 @@ class WindowsCheck(Repo):
         steps = json.loads(re.search(r"^steps = (.*)$", text, re.M).group(1))
         self.assertEqual(steps, [["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
                                   "scripts/lib/windows-job.ps1", self.tree(older)]], "SPEC windows-job")
-        for line in ('os = "windows"', 'kind = "owlrs.any"', 'has = ["owlrs-windows-suite"]', "cores = 6",
-                     f'rev = "{older}"', "ram_gb = 9", 'NRESE_MEMORY_CAP_GB = "9"'):
+        for line in ('os = "windows"', 'kind = "owlrs.any"', 'has = ["owlrs-windows-suite"]', "cores = 4",
+                     'CARGO_BUILD_JOBS = "4"', f'rev = "{older}"', "ram_gb = 9", 'NRESE_MEMORY_CAP_GB = "9"'):
             self.assertIn(line, text, "SPEC windows-job")
         self.assertNotIn("hosts =", text, "SPEC windows-job: the tool picked a host")
 
@@ -837,15 +841,27 @@ class WindowsJob(Repo):
         self.git(self.repo, "commit", "-q", "-m", "the commit under test")
         tree = self.tree("HEAD")
         empty = self.git(self.repo, "hash-object", "/dev/null")
-        cases = [  # tree sent, STUB_FAIL, stdin closed, toolchain missing -> exit, the build step's exit, stdin
-            (tree, "", False, False, 0, 0, "valid"),
-            ("0" * 40, "", False, False, 3, None, None),         # another tree checked out: no verdict
-            (tree, "build:101", False, False, 1, 101, "valid"),  # a step fails: the tree fails
-            (tree, "build:75", False, False, 75, 75, "valid"),   # the PC guard stopped a build: no verdict
-            (tree, "", True, False, 0, 0, "invalid"),            # no usable stdin (fleet I14): said, steps get /dev/null
-            (tree, "", False, True, 3, None, None),              # no toolchain for the tree: no verdict, none installed
+        # The suite's own Python environment in the host's cache, made already (the tree's
+        # requirements'): its python says what it runs.
+        cache, seen = self.root / "cache", self.root / "suite-python"
+        requirements = self.git(self.repo, "hash-object", "benches/suite/requirements.txt")
+        own = cache / f"py-{requirements[:12]}" / "bin"
+        own.mkdir(parents=True)
+        (own / "python").write_text(f'#!/bin/sh\necho "$*" >> "{seen.as_posix()}"\n'
+                                    f'exec "{Path(sys.executable).as_posix()}" "$@"\n', newline="\n")
+        (own / "python").chmod(0o755)
+        cases = [  # tree sent, STUB_FAIL, stdin closed, toolchain missing -> exit, a record, stdin
+            (tree, "", False, False, 0, True, "valid"),
+            ("0" * 40, "", False, False, 3, False, None),         # another tree checked out: no verdict
+            (tree, "build:101", False, False, 1, True, "valid"),  # a step fails: the tree fails
+            # A lint of code only Windows compiles (cfg(windows)) fails the tree there (PR #68's review,
+            # R68-F2: the Windows tier built and tested it, and linted nothing).
+            (tree, "clippy:101", False, False, 1, True, "valid"),
+            (tree, "build:75", False, False, 75, True, "valid"),  # the PC guard stopped a build: no verdict
+            (tree, "", True, False, 0, True, "invalid"),          # no usable stdin (fleet I14): said, steps get /dev/null
+            (tree, "", False, True, 3, False, None),              # no toolchain for the tree: no verdict, none installed
         ]
-        for case, (sent, fail, closed, missing, code, build, stdin) in enumerate(cases):
+        for case, (sent, fail, closed, missing, code, recorded, stdin) in enumerate(cases):
             out = self.root / f"out-{case}"
             out.mkdir()
             installed = self.root / f"installed-{case}"
@@ -856,10 +872,11 @@ class WindowsJob(Repo):
                 env={**self.env, "PATH": stubs.as_posix() + os.pathsep + self.env["PATH"], "FLEET_OUT": str(out),
                      "FLEET_JOB": f"win-{case}", "FLEET_STEP": "1", "FLEET_HOST": "kraris-gptler", "STUB_FAIL": fail,
                      "STUB_NO_TOOLCHAIN": installed.as_posix() if missing else "",
+                     "NRESE_GATE_CACHE": cache.as_posix(),
                      "CARGO_TARGET_DIR": (self.root / "shared-target").as_posix()})  # a host's shared one
             self.assertEqual(done.returncode, code, f"SPEC windows-run: case {case}\n{done.stdout}{done.stderr}")
             self.assertFalse(installed.exists(), "SPEC windows-toolchain: a toolchain was installed")
-            if build is None:
+            if not recorded:
                 self.assertFalse((out / "gate.json").exists(), f"case {case}")
                 continue
             built = Path((out / "target-dir").read_text())
@@ -872,12 +889,132 @@ class WindowsJob(Repo):
                 {"tier": "windows", "tree": tree, "list_hash": empty, "code": code, "stdin": stdin,
                  "tracked_changes": "", "job": f"win-{case}", "fleet_host": "kraris-gptler", "summary": True},
                 f"SPEC windows-record: case {case}")
+            failed = dict([fail.split(":")]) if fail else {}
             self.assertEqual([(s["name"], s["code"]) for s in result["steps"]],
-                             [("W3C data", 0), ("build", build), ("test", 0), ("doc tests", 0), ("suite contracts", 0)],
+                             [("W3C data", 0), ("build", int(failed.get("build", 0))),
+                              ("clippy", int(failed.get("clippy", 0))), ("test", 0), ("doc tests", 0),
+                              ("suite contracts", 0)],
                              f"SPEC windows-run: case {case}")
             self.assertEqual(result["attempt"], (out / "attempt").read_text().strip())
             self.assertRegex(result["identity"],
                              r"^rustc-1\.98\.1-abcdef123456 flags=-C_target-cpu=native tools=[0-9a-f]{12}$")
+            ran = seen.read_text() if seen.exists() else ""
+            self.assertIn("benches/suite/tests/isolation.py", ran,
+                          f"SPEC windows-python: the suite contracts ran with the host's Python: case {case}")
+            seen.unlink()
+
+
+class SuitePython(unittest.TestCase):
+    """scripts/lib/suite-python.sh, the gate jobs' one step for the suite's Python packages: an
+    environment of their own per version of the requirements, made from the host's Python under the
+    cache's lock, aside, and moved into place whole, so that no job meets another's half-made one or
+    loses the one it uses to another."""
+
+    def setUp(self):
+        if BASH is None:
+            self.skipTest("needs bash")
+        temp = tempfile.TemporaryDirectory(prefix="nrese-suite-python-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.cache, self.seen = self.root / "cache", self.root / "seen"
+        requirements = self.root / "requirements.txt"
+        requirements.write_text("scipy==1.17.1\n", newline="\n")
+        # The host's Python: `-m venv DIR` makes DIR/bin/python (itself; with LAYOUT=windows
+        # DIR/Scripts/python.exe, and Scripts/python as Git Bash finds python.exe), its `-m pip install`
+        # fails where FAIL is set, and anything else (suitekit/lock.py, where there is no flock) is the
+        # real Python's. WAITING, where set, is made as the job comes to the cache's lock: here, or in
+        # flock's stand-in where there is a flock.
+        self.host = self.root / "python"
+        self.host.write_text('#!/bin/sh\ncase "$1 $2" in\n'
+                             '  "-m venv") echo "$1 $2" >> "$SEEN"\n'
+                             '    if [ "$LAYOUT" = windows ]; then\n'
+                             '      mkdir -p "$3/Scripts" && cp "$0" "$3/Scripts/python.exe" && cp "$0" "$3/Scripts/python"\n'
+                             '    else mkdir -p "$3/bin" && cp "$0" "$3/bin/python"; fi ;;\n'
+                             '  "-m pip") echo "$1 $2" >> "$SEEN"; [ -z "$FAIL" ] ;;\n'
+                             '  *) [ -z "$WAITING" ] || : > "$WAITING"; exec "$PYTHON" "$@" ;;\nesac\n',
+                             newline="\n")
+        self.host.chmod(0o755)
+        self.path = CLEAN.get("PATH", "")
+        flock = shutil.which("flock")
+        if flock:
+            stand_in = self.root / "stand-ins" / "flock"
+            stand_in.parent.mkdir()
+            stand_in.write_text(f'#!/bin/sh\n[ -z "$WAITING" ] || : > "$WAITING"\nexec "{flock}" "$@"\n',
+                                newline="\n")
+            stand_in.chmod(0o755)
+            self.path = f"{stand_in.parent}{os.pathsep}{self.path}"
+        self.command = [BASH, "-c", '. scripts/lib/suite-python.sh && suite_python "$@"', "-",
+                        self.cache.as_posix(), requirements.as_posix(), self.host.as_posix()]
+        digest = subprocess.run(["git", "hash-object", str(requirements)], capture_output=True, text=True,
+                                check=True).stdout.strip()
+        self.env = self.cache / f"py-{digest[:12]}"
+
+    def environment(self, **extra: str) -> dict:
+        return {**CLEAN, "PATH": self.path, "SEEN": self.seen.as_posix(), "PYTHON": sys.executable, **extra}
+
+    def made(self, **extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run(self.command, cwd=ROOT, capture_output=True, text=True, timeout=60,
+                              env=self.environment(**extra))
+
+    def left(self) -> list:
+        """The environments in the cache, whole or half."""
+        return sorted(p.name for p in self.cache.glob("py-*"))
+
+    def test_an_environment_is_made_once_and_only_whole(self):
+        done = self.made(FAIL="1")
+        self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn("the suite's Python packages didn't install", done.stderr)
+        self.assertEqual(self.left(), [], "SPEC suite-python: a failed install leaves no environment, whole or half")
+        done = self.made()
+        self.assertEqual((done.returncode, Path(done.stdout.strip())), (0, self.env / "bin"), done.stderr)
+        self.assertEqual(self.left(), [self.env.name], "SPEC suite-python: the environment, moved into place")
+        made_once = self.seen.read_text()
+        self.assertEqual((self.made().stdout.strip(), self.seen.read_text()), (done.stdout.strip(), made_once),
+                         "SPEC suite-python: an environment there is used as it is, never made again")
+
+    def test_a_job_that_waited_for_the_lock_uses_the_environment_made_meanwhile(self):
+        """Sol (windows-job-python r1, S1): a job that found no environment removed the one another job
+        had made meanwhile, while that job was about to use it."""
+        waiting = self.root / "waiting"
+        with lock(self.cache / "py.lock"):  # another job, making it
+            job = subprocess.Popen(self.command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, env=self.environment(WAITING=waiting.as_posix()))
+            self.addCleanup(job.kill)
+            deadline = time.monotonic() + 30  # a bound for a job that never comes to the lock
+            while not waiting.exists() and job.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(waiting.exists(), "SPEC suite-python: a job that finds none waits for the cache's lock")
+            (self.env / "bin").mkdir(parents=True)
+            shutil.copy(self.host, self.env / "bin" / "python")
+            (self.env / "theirs").touch()
+        out, err = job.communicate(timeout=60)
+        self.assertEqual((job.returncode, Path(out.strip())), (0, self.env / "bin"), err)
+        self.assertTrue((self.env / "theirs").exists(),
+                        "SPEC suite-python: then uses the one made meanwhile, never removing it")
+        self.assertFalse(self.seen.exists(), "SPEC suite-python: and makes none itself")
+
+    def test_what_a_killed_job_left_goes_under_the_lock(self):
+        """Sol (windows-job-python r1, S2): a job killed while making one left its `.partial-*`, which
+        nothing removed (no cache sweep runs on Windows)."""
+        (self.cache / f"{self.env.name}.partial-a1b2c3" / "Lib").mkdir(parents=True)
+        (self.env / "Lib").mkdir(parents=True)  # and one without a Python, no environment
+        done = self.made()
+        self.assertEqual((done.returncode, Path(done.stdout.strip())), (0, self.env / "bin"), done.stderr)
+        self.assertEqual(self.left(), [self.env.name],
+                         "SPEC suite-python: what a killed job left goes, once the next job holds the lock")
+
+    def test_on_windows_its_python3_is_the_suites_too(self):
+        """The environment's programs held python.exe alone, so a script's or a test's `python3`
+        reached the host's, on one Windows host the Store's stub (windows-job-python, 31 Oct 2026). The
+        environment carries python3.exe, a copy of its launcher, and one made without it is made again."""
+        scripts = self.env / "Scripts"
+        scripts.mkdir(parents=True)
+        shutil.copy(self.host, scripts / "python.exe")  # one made before, without python3.exe
+        done = self.made(LAYOUT="windows")
+        self.assertEqual((done.returncode, Path(done.stdout.strip())), (0, scripts), done.stderr)
+        self.assertTrue((scripts / "python3.exe").exists(), "SPEC suite-python: python3 is the suite's on Windows")
+        self.assertEqual((scripts / "python3.exe").read_bytes(), (scripts / "python.exe").read_bytes(),
+                         "SPEC suite-python: python3.exe is the environment's own launcher")
 
 
 if __name__ == "__main__":

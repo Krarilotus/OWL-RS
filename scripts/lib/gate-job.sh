@@ -120,23 +120,12 @@ if grep -q 'cargo +nightly' scripts/miri.sh 2> /dev/null; then
   chmod +x "$cache/shim/cargo"
   export PATH="$cache/shim:$PATH"
 fi
-# The suite contracts' Python packages (benches/suite/requirements.txt), in an environment of
-# their own, one per version of that file. Without the host's venv module's pip (Debian's
-# python3-venv), pip comes from its own bootstrap, into that environment only.
-py="$cache/py-$(git hash-object "$tool/benches/suite/requirements.txt" | cut -c1-12)"
-if [ ! -x "$py/bin/python" ]; then
-  rm -rf -- "$py"
-  if ! quiet python3 -m venv "$py"; then
-    rm -rf -- "$py"
-    { quiet python3 -m venv --without-pip "$py" \
-        && curl -fsSL --max-time 300 https://bootstrap.pypa.io/get-pip.py -o "$cache/get-pip.py" \
-        && quiet "$py/bin/python" "$cache/get-pip.py"; } \
-      || { rm -rf -- "$py"; infra "no Python environment for the suite (venv, pip)"; }
-  fi
-  quiet "$py/bin/python" -m pip install -r "$tool/benches/suite/requirements.txt" \
-    || { rm -rf -- "$py"; infra "the suite's Python packages didn't install"; }
-fi
-export PATH="$py/bin:$PATH"
+# The suite contracts' Python packages, in an environment of their own (scripts/lib/suite-python.sh).
+# shellcheck source=suite-python.sh
+. "$tool/scripts/lib/suite-python.sh"
+pybin=$(suite_python "$cache" "$tool/benches/suite/requirements.txt" python3) || infra "no Python for the suite"
+py=${pybin%/*}
+export PATH="$pybin:$PATH"
 
 # shellcheck source=gate-key.sh
 . "$tool/scripts/lib/gate-key.sh"

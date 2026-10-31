@@ -26,8 +26,8 @@
 #        scripts/check.sh windows [COMMIT]
 #                                  the merge check's Windows part, on the fleet only
 #                                  (scripts/lib/fleet-gate.sh windows): COMMIT (default HEAD)
-#                                  built whole, all its tests and doc tests, the suite
-#                                  contracts, by its own tier here, which its own
+#                                  built whole, clippy on it all, all its tests and doc tests,
+#                                  the suite contracts, by its own tier here, which its own
 #                                  scripts/lib/windows-job.sh runs on a Windows host. A commit
 #                                  whose inputs (scripts/lib/gate-key.sh windows_inputs)
 #                                  passed before carries that pass: "carried from <commit>".
@@ -436,6 +436,9 @@ case "$mode" in
     [ ${#everything[@]} -gt 0 ] || { echo "no workspace packages found" >&2; exit 2; }
     w3c_data
     step build "$guarded" build --locked --workspace --all-targets
+    # Lints of the code only Windows compiles (cfg(windows)), which no Linux tier sees: the push
+    # tier lints the changed crates on Linux alone (PR #68's review, R68-F2).
+    step clippy "$guarded" clippy --locked --workspace --all-targets
     step test run_tests "${everything[@]}"
     step "doc tests" "$guarded" test --locked --workspace --doc --no-fail-fast
     step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
