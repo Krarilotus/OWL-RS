@@ -3452,7 +3452,8 @@ impl<'a> Context<'a> {
 
     /// `COUNT(*)` of a BGP that is cyclic ([`Self::cyclic_patterns`]), by its
     /// worst-case-optimal join counting instead of producing its solutions
-    /// ([`wcoj::Query::count_solutions`]); `None` if it isn't one.
+    /// ([`wcoj::Query::count_solutions`]); `None` if it isn't one. Past what a `u64` holds,
+    /// [`QueryEvaluationError::CountBeyondRange`].
     fn cyclic_count(&self, triples: &[TriplePattern]) -> NativeResult<Option<u64>> {
         if triples
             .iter()
@@ -3482,7 +3483,7 @@ impl<'a> Context<'a> {
             .map(|rows| rows.round() as u64);
         let mut stats = wcoj::Stats::default();
         let count = if counts.contains(&0) {
-            0
+            nrese_engine::Count::Exact(0)
         } else {
             let patterns: Vec<[wcoj::Pos; 3]> = patterns
                 .into_iter()
@@ -3499,11 +3500,12 @@ impl<'a> Context<'a> {
             }
         };
         if self.trace.is_some() {
-            self.wcoj_step(&vars, &stats, estimate, count);
+            self.wcoj_step(&vars, &stats, estimate, count.at_least());
             let detail = triples.iter().map(ToString::to_string).collect::<Vec<_>>();
-            self.note("wcoj", detail.join(" . "), estimate, count as usize, start);
+            let rows = count.at_least() as usize;
+            self.note("wcoj", detail.join(" . "), estimate, rows, start);
         }
-        Ok(Some(count))
+        exact_count(count).map(Some)
     }
 
     /// EXPLAIN's step for a worst-case-optimal join: its variable order with each one's
