@@ -1291,6 +1291,11 @@ impl Snapshot {
         min: u64,
     ) -> Option<Arc<[(TermId, u64)]>> {
         let read = *self.read_pattern(model, pattern);
+        // As `group_counts_in` decides, before the list kept: a stored read of this version
+        // keeps one under the same key.
+        if self.expanding(model, &read).is_some() {
+            return None;
+        }
         self.statistics
             .heavy_groups(self.data(model), model, read, permutation, min, || {
                 let groups = self.group_counts_in(model, pattern, permutation)?;
