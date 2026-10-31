@@ -781,13 +781,15 @@ impl Snapshot {
             .expect("every layout keeps the permutation of a pattern's access plan")
     }
 
-    /// The number of quads matching `pattern` in `model`, expanded: the stored matches over
-    /// representatives weighted by how many quads each stands for.
+    /// The number of quads matching `pattern` in `model`, expanded, counted up to `limit`:
+    /// the stored matches over representatives weighted by how many quads each stands for,
+    /// without making the copies. With `limit` 1, whether a read finds one (PR #70 r1 S1).
     fn expanded_count(
         &self,
         classes: &EqualityClasses,
         model: ReadModel,
         pattern: &QuadPattern,
+        limit: u64,
     ) -> u64 {
         let data = self.data(model);
         let normalised = classes.normalised(pattern);
@@ -795,6 +797,9 @@ impl Snapshot {
         let mut count = 0;
         for stack in Stack::ALL {
             for quad in data.stack(stack).scan(&normalised) {
+                if count >= limit {
+                    return count;
+                }
                 if !quad.graph.is_default_graph() {
                     count += u64::from(
                         model == ReadModel::Materialised
@@ -818,7 +823,8 @@ impl Snapshot {
                 };
             }
         }
-        if model == ReadModel::Materialised
+        if count < limit
+            && model == ReadModel::Materialised
             && pattern.graph == GraphSelector::Any
             && normalised != *pattern
             && !self.canonical
@@ -828,6 +834,7 @@ impl Snapshot {
                 .asserted
                 .scan(pattern)
                 .filter(|quad| !quad.graph.is_default_graph())
+                .take(usize::try_from(limit - count).unwrap_or(usize::MAX))
                 .count() as u64;
         }
         count
@@ -914,7 +921,7 @@ impl Snapshot {
         }
     }
 
-    /// Number of asserted and inferred quads. O(1).
+    /// Number of asserted and inferred quads the stacks hold ([`Self::len_in`]). O(1).
     pub fn len(&self) -> u64 {
         self.len_in(ReadModel::Materialised)
     }
@@ -934,8 +941,13 @@ impl Snapshot {
             .sum()
     }
 
+    /// Whether reads see no quad. O(1) where reads take the stacks as they are; under
+    /// equality, which can hide every quad the stacks hold, whether a read finds a first one
+    /// ([`Self::exists_in`]: a scan up to it, making no copies) (PR #70 r1 F1, S1).
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+            || (self.equality.is_some()
+                && !self.exists_in(ReadModel::Materialised, &QuadPattern::all()))
     }
 
     pub fn contains(&self, quad: &EncodedQuad) -> bool {
@@ -1035,7 +1047,7 @@ impl Snapshot {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
-            return self.expanded_count(&classes, model, pattern);
+            return self.expanded_count(&classes, model, pattern, u64::MAX);
         }
         if pattern.graph == GraphSelector::AnyNamed {
             // Every graph minus the default graph: two range counts instead of a scan.
@@ -1063,7 +1075,7 @@ impl Snapshot {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
-            return self.expanded(classes, model, pattern).next().is_some();
+            return self.expanded_count(&classes, model, pattern, 1) > 0;
         }
         if pattern.graph == GraphSelector::AnyNamed {
             return self.count_in(model, pattern) > 0;
