@@ -652,7 +652,10 @@ impl<'a> Graph<'a> {
             }
         }
         // A datatype read as a class is a data range, whatever else its node says. The
-        // datatype map's are IRIs, and `named` is asked of the input's terms only.
+        // datatype map's are IRIs, and `named` is asked of the input's terms only. Each
+        // declared datatype is held once, however often its declaration repeats.
+        declared.sort_unstable();
+        declared.dedup();
         let (named_declared, blank_declared): (Vec<u64>, Vec<u64>) =
             declared.into_iter().partition(|&datatype| named(datatype));
         graph.datatypes = names
@@ -2296,5 +2299,21 @@ mod tests {
         let graph = Graph::new(&triples, &names, &named);
         assert_eq!(graph.list(v.term("_:l0")).unwrap().len(), 10_001);
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A datatype declared many times is one datatype: the reader holds as many as one
+    /// declaration makes it hold, however often the declaration repeats (the input keeps
+    /// duplicate lines).
+    #[test]
+    fn a_datatype_declared_many_times_is_held_once() {
+        let held = |copies: usize| {
+            let mut v = LocalVocabulary::default();
+            let triples = load(&mut v, &"ex:D rdf:type rdfs:Datatype\n".repeat(copies));
+            let names = Names::new(&mut v);
+            let snapshot = v.clone();
+            let named = move |id: u64| snapshot.text(id).starts_with('<');
+            Graph::new(&triples, &names, &named).datatypes.slots.len()
+        };
+        assert_eq!(held(1_000), held(1));
     }
 }
