@@ -1702,6 +1702,32 @@ systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "qlever:rewritten", "oxigraph:rewr
 guards = ["Store-2: equality by class ids; a deletion splits a class (B/F style)"]
 rewrite = "not-expressible"
 [[case]]
+name = "first-load-chain"
+area = "maintenance"
+what = "a first commit into an empty store: a 250-class subclass chain and 400 members of its last class, as one INSERT DATA (DMW's A/B chain; 21 Oct 2026: the repository route held 854-862 MiB VmHWM, main 518-558)"
+semantics = "owl2-rl"
+data = "first-load classes=250 individuals=400"
+args = ["--reason", "owl2-rl", "--commits", "{data}.commits.ru"]
+queries = "first-load"
+metric = "commits.p50_ms"
+check = { "closure_after_commits.equal" = "true", "q.members.value" = "expect.members" }
+cap_gb = 4
+repeat = 5
+systems = []
+[[case]]
+name = "first-load-chain-ranged"
+area = "maintenance"
+what = "first-load-chain plus a ranged property with one literal value, whose conclusion (the literal's type) no store holds (PR #46 review r1 F1: such a load ran the batch, dropped it and ran the delta executor)"
+semantics = "owl2-rl"
+data = "first-load classes=250 individuals=400 ranged=1"
+args = ["--reason", "owl2-rl", "--commits", "{data}.commits.ru"]
+queries = "first-load"
+metric = "commits.p50_ms"
+check = { "closure_after_commits.equal" = "true", "q.members.value" = "expect.members" }
+cap_gb = 4
+repeat = 5
+systems = []
+[[case]]
 name = "deletes-tail"
 area = "maintenance"
 what = "3,000 people of the data deleted one per commit under OWL 2 RL: the tail of deletion latency (p99)"

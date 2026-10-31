@@ -139,6 +139,7 @@ pub fn main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "eq-addon" => eq_addon(&params, &mut nt)?,
         "fed-chain" => fed_chain(&params, &mut nt)?,
         "sameas-giant" => sameas_giant(&params, &mut nt, &commits)?,
+        "first-load" => first_load(&params, &commits)?,
         "dense" => dense(&params, &mut rng, &mut nt)?,
         "chain" => chain(&params, &mut nt)?,
         "layered" => layered(&params, &mut rng, &mut nt, &commits)?,
@@ -1270,6 +1271,38 @@ fn sameas_giant(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expec
         json!(2 * half * half + groups * 100),
     );
     e.insert("giant_values".into(), json!(size));
+    Ok(e)
+}
+
+/// A first commit into an empty store, as DMW loads its ontologies (its A/B harness's
+/// subclass chain, 21 Oct 2026): `classes` classes in a `rdfs:subClassOf` chain and
+/// `individuals` members of the last, as one INSERT DATA; with `ranged=1`, also a property
+/// with a range and one literal value, whose conclusion (the literal's type) no store holds
+/// (PR #46 review r1 F1). The data file stays empty.
+fn first_load(p: &Params, commits: &str) -> std::io::Result<Expect> {
+    let (classes, individuals) = (p.get("classes", 250), p.get("individuals", 400));
+    let t = |s: &str, p: &str, o: &str| format!("{s} {p} {o} .");
+    let mut statements = Vec::new();
+    for n in 0..classes {
+        let class = ex(format!("C{n}"));
+        statements.push(t(&class, &rdf("type"), &owl("Class")));
+        if n > 0 {
+            statements.push(t(&class, &rdfs("subClassOf"), &ex(format!("C{}", n - 1))));
+        }
+    }
+    let last = ex(format!("C{}", classes - 1));
+    for i in 0..individuals {
+        statements.push(t(&ex(format!("i{i}")), &rdf("type"), &last));
+    }
+    if p.get("ranged", 0) == 1 {
+        statements.push(t(&ex("note"), &rdfs("range"), &format!("<{XSD}string>")));
+        statements.push(t(&ex("i0"), &ex("note"), "\"x\""));
+    }
+    let mut out = BufWriter::new(File::create(commits)?);
+    writeln!(out, "INSERT DATA {{ {} }}", statements.join(" "))?;
+    out.flush()?;
+    let mut e = Expect::new();
+    e.insert("members".into(), json!(individuals));
     Ok(e)
 }
 
