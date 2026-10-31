@@ -310,7 +310,12 @@ impl Base for UpperBase<'_> {
 
     fn estimate(&self, bound: [Option<u64>; 3]) -> usize {
         let view = self.view.count_in(ReadModel::Materialised, &pattern(bound));
-        usize::try_from(view).unwrap_or(usize::MAX) + self.stack.estimate(bound) + self.facts.len()
+        // An expanded count past `u64` reads as its maximum (`Snapshot::count_in`): the sum
+        // saturates too, never wrapping to a smaller estimate.
+        usize::try_from(view)
+            .unwrap_or(usize::MAX)
+            .saturating_add(self.stack.estimate(bound))
+            .saturating_add(self.facts.len())
     }
 
     fn contains(&self, fact: Triple) -> bool {

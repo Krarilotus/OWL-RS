@@ -811,7 +811,8 @@ impl Snapshot {
                     continue;
                 }
                 let touching = classes.touches(&quad);
-                count += match visibility.shows_all(touching) {
+                // A multiplicity past `u64` reads as its maximum, and so does the sum.
+                count = count.saturating_add(match visibility.shows_all(touching) {
                     true => classes.multiplicity(&quad, pattern),
                     false => {
                         let (mut copies, wanted) = (0, limit - count);
@@ -824,7 +825,7 @@ impl Snapshot {
                         });
                         copies
                     }
-                };
+                });
             }
         }
         if count < limit
@@ -1046,7 +1047,8 @@ impl Snapshot {
 
     /// Exact number of quads matching `pattern` in `model`, without producing them: O(r log n)
     /// per stack when the matching runs hold no tombstones in range (see
-    /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up.
+    /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up. Under
+    /// equality, a count of `u64::MAX` or more reads as `u64::MAX`.
     pub fn count_in(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
@@ -1054,7 +1056,9 @@ impl Snapshot {
             return self.expanded_count(&classes, model, pattern, u64::MAX);
         }
         if pattern.graph == GraphSelector::AnyNamed {
-            // Every graph minus the default graph: two range counts instead of a scan.
+            // Every graph minus the default graph: two range counts instead of a scan, both
+            // as held. Named graphs are read as held, never expanded, so neither count is an
+            // expanded one, which can read as `u64::MAX` (PR #70 F2 round, sol-loop r1 S1).
             let every = QuadPattern {
                 graph: GraphSelector::Any,
                 ..*pattern
@@ -1063,8 +1067,13 @@ impl Snapshot {
                 graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
                 ..*pattern
             };
-            return self.count_in(model, &every) - self.count_in(model, &default);
+            return self.held_count(model, &every) - self.held_count(model, &default);
         }
+        self.held_count(model, pattern)
+    }
+
+    /// The quads `model`'s stacks hold that match `pattern`: range counts, no expansion.
+    fn held_count(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
         let plan = AccessPlan::for_pattern(pattern);
         Stack::ALL
             .into_iter()
