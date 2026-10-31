@@ -515,12 +515,13 @@ impl Classes {
             .saturating_mul(count(pattern.object, quad.object))
     }
 
-    /// The quads a canonical stored quad stands for, the pattern's constants in place.
+    /// The quads a canonical stored quad stands for, the pattern's constants in place, until
+    /// `out` breaks (an existence question has its answer at the first one it counts).
     pub(crate) fn expand(
         &self,
         quad: &EncodedQuad,
         pattern: &QuadPattern,
-        out: &mut impl FnMut(EncodedQuad),
+        out: &mut impl FnMut(EncodedQuad) -> std::ops::ControlFlow<()>,
     ) {
         let values = |bound: Option<TermId>, id: TermId| -> Values<'_> {
             match bound {
@@ -540,7 +541,9 @@ impl Classes {
         for &s in s.as_slice() {
             for &p in p.as_slice() {
                 for &o in o.as_slice() {
-                    out(EncodedQuad::from_components([s, p, o, graph]));
+                    if out(EncodedQuad::from_components([s, p, o, graph])).is_break() {
+                        return;
+                    }
                 }
             }
         }
@@ -748,6 +751,7 @@ impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
             if all || visibility.shows(&quad, touching) {
                 pending.push(Reverse(permutation.to_key(&quad)));
             }
+            std::ops::ControlFlow::Continue(())
         });
         true
     }
