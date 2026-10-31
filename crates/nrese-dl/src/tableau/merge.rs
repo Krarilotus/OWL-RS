@@ -1,6 +1,7 @@
 //! The ≈-rule (JAIR 2009, Table 5): merging one node into another. The direction is the
 //! calculus's: into a named individual, into a root from a node that isn't named, into an
-//! ancestor; otherwise the other way round. The merged node's descendants are pruned,
+//! ancestor; otherwise the other way round. Of two named individuals, which the calculus
+//! leaves open, the smaller class goes into the larger. The merged node's descendants are pruned,
 //! its facts are copied to the target with the equality's dependencies added, and it
 //! points at the target from then on. Everything changed in place goes on the trail, so
 //! a backtrack undoes the merge (no path compression).
@@ -46,11 +47,18 @@ impl Engine<'_> {
         Ok(())
     }
 
-    /// `(from, into)` by the calculus's order.
+    /// `(from, into)` by the calculus's order. It leaves two named individuals either way:
+    /// the smaller class goes into the larger, so a fact moves O(log n) times however many
+    /// merges its class takes (I35: a key's members, each merged into the last, copied the
+    /// whole class at every merge, memory quadratic in them).
     fn direction(&self, s: u32, t: u32) -> (u32, u32) {
         let node = |n: u32| &self.g.nodes[n as usize];
         let named = |n: u32| node(n).named != NONE;
         let root = |n: u32| node(n).flags & flag::ROOT != 0;
+        if named(s) && named(t) {
+            let size = |n: u32| self.g.class_sizes[n as usize];
+            return if size(s) <= size(t) { (s, t) } else { (t, s) };
+        }
         if named(t) || (root(t) && !named(s)) || self.g.descends(s, t) {
             (s, t)
         } else {

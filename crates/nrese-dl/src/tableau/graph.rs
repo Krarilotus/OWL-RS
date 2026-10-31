@@ -219,6 +219,9 @@ pub struct Graph {
     /// By node: what its merge into its representative depended on (read only while the
     /// node is merged).
     pub merge_deps: Vec<DepSetId>,
+    /// By node: the nodes its class holds, itself and those merged into it (read while it
+    /// represents one), so that of two named nodes the smaller class goes into the larger.
+    pub class_sizes: Vec<u32>,
     /// By node: what its creation depended on (a successor's: its at-least fact's).
     pub born: Vec<DepSetId>,
     /// Retracted facts, by table index (dynamic backtracking).
@@ -280,6 +283,7 @@ impl Graph {
             blocking_hash: 0,
         });
         self.merge_deps.push(DepSetId::EMPTY);
+        self.class_sizes.push(1);
         self.born.push(DepSetId::EMPTY);
         id
     }
@@ -326,6 +330,7 @@ impl Graph {
         self.trail.push(Undo::Representative { node, old, old_dep });
         self.nodes[node as usize].representative = to;
         self.merge_deps[node as usize] = dep;
+        self.class_sizes[to as usize] += self.class_sizes[node as usize];
     }
 
     // Membership -------------------------------------------------------------------------
@@ -510,6 +515,9 @@ impl Graph {
                     self.nodes[node as usize].flags = old | kept
                 }
                 Some(Undo::Representative { node, old, old_dep }) => {
+                    // The trail undoes in reverse: what joined the class since is gone again.
+                    let to = self.nodes[node as usize].representative;
+                    self.class_sizes[to as usize] -= self.class_sizes[node as usize];
                     self.nodes[node as usize].representative = old;
                     self.merge_deps[node as usize] = old_dep;
                 }
@@ -605,6 +613,7 @@ impl Graph {
         self.equalities.truncate(mark.equalities as usize);
         self.nodes.truncate(alive);
         self.merge_deps.truncate(alive);
+        self.class_sizes.truncate(alive);
         self.born.truncate(alive);
         let d = &mut self.dead;
         d.unary.truncate(mark.unary as usize);
@@ -841,6 +850,7 @@ impl Graph {
             + self.equalities.capacity() * size_of::<Equality>()
             + self.trail.capacity() * size_of::<Undo>()
             + self.merge_deps.capacity() * size_of::<DepSetId>()
+            + self.class_sizes.capacity() * size_of::<u32>()
             + (self.unary_ix.capacity() + self.negative_ix.capacity()) * 12
             + self.edge_ix.capacity() * 16
             + (self.number_ix.capacity() + self.inequality_ix.capacity()) * 12
