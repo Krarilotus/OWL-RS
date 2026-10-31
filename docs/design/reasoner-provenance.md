@@ -10,7 +10,7 @@
 - The inferred stack holds the closure with set semantics: a fact is there or not.
 - Commits maintain it by DRed with backward/forward proofs (B/F; `nrese_reasoner::delta`). Overdeletion asks the prover whether a candidate keeps a proof avoiding the deleted facts. It restarts as plain DRed when a schema or list fact changes.
 - Explanations are searched backwards on demand.
-- Inferred statements under graph access: all-or-nothing per access policy (`GraphAccess::inferred`), or, with `inferred = "supported"`, visible to a reader when one of their minimal support graph sets is readable. The sets are computed in memory (`nrese_reasoner::graph_sets`, kept per revision by `nrese-store/src/support.rs` in heap and `Arc` structures and updated per commit); they are not in the WAL or checkpoints, so a restart computes them again.
+- Inferred statements under graph access: all-or-nothing per access policy (`GraphAccess::inferred`), or, with `inferred = "supported"`, visible to a reader exactly when the graphs it may read derive them: one of their minimal support graph sets is readable, or, past the cap on sets (`reasoner.support_sets`), the reader's closure holds them. A statement asserted only in graphs the reader can't read, and derived, is shown as inferred on the same terms (`"visible"`: whenever it follows from the other statements without its own assertion, `nrese_reasoner::graph_sets::rederived`), as the stack keeps no inferred copy of a statement asserted anywhere. The sets are computed in memory (`nrese_reasoner::graph_sets`, kept per revision by `nrese-store/src/support.rs` in heap and `Arc` structures and updated per commit); they are not in the WAL or checkpoints, so a restart computes them again.
 
 ## What the field does (the state to reach)
 
@@ -67,7 +67,7 @@ The engine still has two stacks (`nrese-engine/src/engine/mod.rs`); today's sets
 - **Visible sets:** for a reader with readable graphs R, the set ids S with S ⊆ R are computed lazily per (policy epoch, R) as a bitmap over set ids.
 - **Visible facts:** an inferred fact is visible iff one of its `Set` entries is in the bitmap. Inferred scans join the support stack on the fact's key, which is sorted the same way.
 - **No filter needed** for readers who may read every graph, and in the compatibility mode (`GraphAccess::inferred` as today).
-- **The cap:** per fact at most `reasoner.support_sets` minimal sets are kept (default 4, the smallest first). Beyond the cap, a fact may stay hidden from a reader one of whose derivations it could see. That is the safe direction, and it is documented and counted.
+- **The cap:** per fact at most `reasoner.support_sets` minimal sets are kept (default 16, the smallest first). A fact whose sets the cap cut, or one of whose premises' it cut on the way, is marked (`graph_sets::Annotation::truncated`; marked on a fact's own graphs too, on products, schema alternatives and merges, and a change of the mark alone propagates). Unmarked, the kept sets are all of them. A reader one of them fits sees the fact; a reader none fits, of an unmarked fact, doesn't; of a marked one, the closure of the statements it reads decides (`graph_sets::closure_within`, the same evaluation with every readable statement in one graph), once per view and only where such a fact is open for it. Exact for every reader (20 October; it was the safe direction, hiding what a reader could derive, before).
 
 ## Measured (3 October): counts aren't needed for maintenance
 

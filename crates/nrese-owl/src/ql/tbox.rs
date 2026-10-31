@@ -512,11 +512,12 @@ impl Builder {
             ClassExpr::Some(property, filler) if matches!(o.class(*filler), ClassExpr::Thing) => {
                 vec![(self.basic(Basic::Exists(*property)), true)]
             }
-            ClassExpr::Min(n, property, filler)
-                if *n >= 1 && matches!(o.class(*filler), ClassExpr::Thing) =>
-            {
+            // `≥ 1 R.⊤` is `∃R`, `≥ 0 R.C` is `⊤`. `≥ n R` for n ≥ 2 is no basic concept, and
+            // `∃R` would say more than the axiom: nothing (the hazards mark it).
+            ClassExpr::Min(1, property, filler) if matches!(o.class(*filler), ClassExpr::Thing) => {
                 vec![(self.basic(Basic::Exists(*property)), false)]
             }
+            ClassExpr::Min(0, ..) => vec![(self.basic(Basic::Thing), false)],
             // OWL 2 QL allows a data existential on the left over `rdfs:Literal` only: with
             // another range, having some value isn't enough.
             ClassExpr::DataSome(property, range)

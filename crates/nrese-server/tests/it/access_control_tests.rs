@@ -54,6 +54,10 @@ fn app() -> Result<axum::Router, Box<dyn std::error::Error>> {
 }
 
 fn app_with(policy: &str) -> Result<axum::Router, Box<dyn std::error::Error>> {
+    app_in(policy, ReasoningMode::Rdfs)
+}
+
+fn app_in(policy: &str, mode: ReasoningMode) -> Result<axum::Router, Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("access.toml");
     std::fs::write(&path, policy)?;
@@ -69,7 +73,7 @@ fn app_with(policy: &str) -> Result<axum::Router, Box<dyn std::error::Error>> {
         access: Some(Arc::new(nrese_server::access::load(&path)?)),
         ..PolicyConfig::default()
     };
-    test_app_with_settings(policy, ReasonerConfig::for_mode(ReasoningMode::Rdfs))
+    test_app_with_settings(policy, ReasonerConfig::for_mode(mode))
 }
 
 async fn send(
@@ -301,6 +305,55 @@ async fn updates_change_only_writable_graphs() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+/// Spec (S4, `ReadScope::require_all`): an explanation under OWL 2 DL reads every graph, so
+/// a reader of some graphs is refused it (403), though it sees inferred statements; a
+/// reader of every graph gets it.
+#[tokio::test]
+async fn an_owl2_dl_explanation_is_refused_to_a_reader_of_some_graphs()
+-> Result<(), Box<dyn std::error::Error>> {
+    const READER: &str = r#"
+default = "deny"
+inferred = "visible"
+
+[[role]]
+name = "reader"
+read = ["http://example.com/g/pub/*"]
+default_graph = "read"
+"#;
+    let app = app_in(READER, ReasoningMode::Owl2Dl)?;
+    let status = update(
+        &app,
+        &["nrese.admin"],
+        &format!(
+            "PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {{
+               <{EX}B> rdfs:subClassOf <{EX}D> . <{EX}C> rdfs:subClassOf <{EX}D> .
+               <{EX}w> a [ owl:unionOf ( <{EX}B> <{EX}C> ) ]
+             }}"
+        ),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let explain = format!(
+        "/api/v1/repositories/nrese/explain?{}",
+        serde_urlencoded::to_string([
+            ("subj", format!("<{EX}w>")),
+            (
+                "pred",
+                "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>".to_owned(),
+            ),
+            ("obj", format!("<{EX}D>")),
+        ])?
+    );
+    let (status, body) = send(&app, &["reader"], Method::GET, &explain, None, "").await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("reads every graph"), "{body}");
+    let (status, body) = send(&app, &["nrese.admin"], Method::GET, &explain, None, "").await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn graph_store_and_rdf4j_follow_the_policy() -> Result<(), Box<dyn std::error::Error>> {
     let app = seeded().await?;
@@ -426,5 +479,284 @@ async fn graph_store_and_rdf4j_follow_the_policy() -> Result<(), Box<dyn std::er
     )
     .await?;
     assert_eq!(status, StatusCode::OK);
+    Ok(())
+}
+
+/// A reader of some graphs who sees every inference is told the same over HTTP whether or
+/// not a graph it can't read holds schema the OWL 2 QL rewriting would use: the same
+/// answer, and the completeness `not-certified`, which other origins may read; and from
+/// an EXPLAIN, run or plan only, the same completeness and no QL report (R13-diag).
+#[tokio::test]
+async fn query_certification_tells_nothing_of_a_hidden_schema()
+-> Result<(), Box<dyn std::error::Error>> {
+    let policy = POLICY.replace("inferred = \"hidden\"", "inferred = \"visible\"");
+    let query = |uri: &str| {
+        Request::builder()
+            .uri(uri)
+            .method(Method::POST)
+            .header(
+                "authorization",
+                format!("Bearer {}", token(&["nrese.read", "analyst"])),
+            )
+            .header(
+                "accept",
+                "application/sparql-results+json, application/n-quads;q=0.9, */*;q=0.1",
+            )
+            .header("content-type", "application/sparql-query")
+            .body(Body::from(format!("ASK {{ ?x <{EX}p> ?y }}")))
+    };
+    let mut told = Vec::new();
+    let mut explained = Vec::new();
+    for hidden in [false, true] {
+        let app = app_in(&policy, ReasoningMode::Owl2Ql)?;
+        let schema = if hidden {
+            format!(
+                "GRAPH <{EX}g/secret> {{
+                   <{EX}A> <http://www.w3.org/2000/01/rdf-schema#subClassOf> _:r .
+                   _:r a <http://www.w3.org/2002/07/owl#Restriction> ;
+                     <http://www.w3.org/2002/07/owl#onProperty> <{EX}p> ;
+                     <http://www.w3.org/2002/07/owl#someValuesFrom> <{EX}B> .
+                   <{EX}p> a <http://www.w3.org/2002/07/owl#TransitiveProperty> . }}"
+            )
+        } else {
+            String::new()
+        };
+        assert_eq!(
+            update(
+                &app,
+                &["nrese.admin"],
+                &format!(
+                    "INSERT DATA {{ GRAPH <{EX}g/pub/a> {{ <{EX}s> <{EX}q> <{EX}o> }} {schema} }}"
+                ),
+            )
+            .await?,
+            StatusCode::NO_CONTENT
+        );
+        for mode in ["true", "plan"] {
+            let response = app
+                .clone()
+                .oneshot(query(&format!("/dataset/query?explain={mode}"))?)
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK, "explain={mode}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+            let explanation: serde_json::Value = serde_json::from_slice(&body)?;
+            explained.push((
+                mode,
+                explanation["completeness"].clone(),
+                explanation["ql"].clone(),
+            ));
+        }
+        // Not `send`: it drops the headers.
+        let response = app.oneshot(query("/dataset/query")?).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let header = |name: &str| -> Vec<Vec<u8>> {
+            response
+                .headers()
+                .get_all(name)
+                .iter()
+                .map(|value| value.as_bytes().to_vec())
+                .collect()
+        };
+        let completeness = header("nrese-completeness");
+        assert_eq!(
+            header("access-control-expose-headers"),
+            [b"nrese-completeness".to_vec()],
+            "hidden {hidden}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        told.push((body, completeness));
+    }
+    assert_eq!(
+        told[0], told[1],
+        "a hidden schema changed what the reader is told"
+    );
+    assert_eq!(told[0].1, [b"not-certified".to_vec()]);
+    let (without, with) = explained.split_at(2);
+    assert_eq!(
+        without, with,
+        "a hidden schema changed what an EXPLAIN tells the reader"
+    );
+    for (mode, completeness, ql) in without {
+        assert_eq!(completeness["status"], "not-certified", "explain={mode}");
+        assert!(ql.is_null(), "explain={mode}: {ql}");
+    }
+    Ok(())
+}
+
+/// An ASK's answer in a SPARQL JSON result.
+fn boolean(body: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let json: serde_json::Value = serde_json::from_str(body)?;
+    Ok(json["boolean"]
+        .as_bool()
+        .ok_or_else(|| format!("no boolean: {body}"))?)
+}
+
+/// The answer of the ASK `query` as `roles` read.
+async fn ask(
+    app: &axum::Router,
+    roles: &[&str],
+    query: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let (status, body) = send(
+        app,
+        roles,
+        Method::POST,
+        "/dataset/query",
+        Some("application/sparql-query"),
+        query,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    boolean(&body)
+}
+
+/// An update's WHERE reads what its requester reads, as its queries do (review r1 of PR #50,
+/// F1). For a reader of what its graphs support (`inferred = "supported"`), `open` derives
+/// `alice a Patient` whether or not `secret`, which it can't read, asserts it; so a marker its
+/// update inserts where that holds lands either way: through SPARQL UPDATE, and through an
+/// RDF4J transaction's UPDATE, read inside the transaction before any commit.
+#[tokio::test]
+async fn an_updates_where_reads_what_its_requester_reads() -> Result<(), Box<dyn std::error::Error>>
+{
+    const SUPPORTED: &str = r#"
+default = "deny"
+inferred = "supported"
+
+[[role]]
+name = "editor"
+read = ["http://example.com/g/open"]
+write = ["http://example.com/g/open"]
+default_graph = "read"
+"#;
+    let editor = &["editor"];
+    let marker = |name: &str| format!("<{EX}{name}> <{EX}observed> true");
+    let insert = |name: &str| {
+        format!(
+            "INSERT {{ GRAPH <{EX}g/open> {{ {} }} }} WHERE {{ <{EX}alice> a <{EX}Patient> }}",
+            marker(name)
+        )
+    };
+    let holds = |name: &str| format!("ASK {{ GRAPH <{EX}g/open> {{ {} }} }}", marker(name));
+    let mut seen = Vec::new();
+    for hidden in [false, true] {
+        let app = app_in(SUPPORTED, ReasoningMode::Owl2Rl)?;
+        let secret = match hidden {
+            true => format!("GRAPH <{EX}g/secret> {{ <{EX}alice> a <{EX}Patient> }}"),
+            false => String::new(),
+        };
+        let data = format!(
+            "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {{ GRAPH <{EX}g/open> {{ <{EX}alice> a <{EX}Human> .
+                            <{EX}Human> rdfs:subClassOf <{EX}Patient> }} {secret} }}"
+        );
+        assert_eq!(
+            update(&app, &["nrese.admin"], &data).await?,
+            StatusCode::NO_CONTENT
+        );
+        let derived = ask(
+            &app,
+            editor,
+            &format!("ASK {{ <{EX}alice> a <{EX}Patient> }}"),
+        )
+        .await?;
+        assert_eq!(
+            update(&app, editor, &insert("committed")).await?,
+            StatusCode::NO_CONTENT
+        );
+        let committed = ask(&app, editor, &holds("committed")).await?;
+        // An RDF4J transaction: its UPDATE pending, read inside it.
+        let begin = Request::builder()
+            .method(Method::POST)
+            .uri("/repositories/nrese/transactions")
+            .header("authorization", format!("Bearer {}", token(editor)))
+            .body(Body::empty())?;
+        let response = app.clone().oneshot(begin).await?;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let tx = response.headers()[axum::http::header::LOCATION]
+            .to_str()?
+            .to_owned();
+        let (status, body) = send(
+            &app,
+            editor,
+            Method::PUT,
+            &format!("{tx}?action=UPDATE"),
+            Some("application/x-www-form-urlencoded"),
+            &serde_urlencoded::to_string([("update", insert("pending"))])?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = send(
+            &app,
+            editor,
+            Method::PUT,
+            &format!(
+                "{tx}?action=QUERY&{}",
+                serde_urlencoded::to_string([("query", holds("pending"))])?
+            ),
+            None,
+            "",
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        seen.push((derived, committed, boolean(&body)?));
+    }
+    assert_eq!(seen[0], (true, true, true), "derived from open");
+    assert_eq!(seen[1], seen[0], "alice a Patient asserted in secret");
+    Ok(())
+}
+
+/// An update's WHERE reads no inferred statement its requester's queries don't show (review r1
+/// of PR #50, D7): with `inferred = "hidden"`, `open` derives `alice a Patient`, which the
+/// editor's ASK doesn't see, and its update inserts no marker where it holds.
+#[tokio::test]
+async fn an_updates_where_reads_no_inferred_statement_its_requester_doesnt_see()
+-> Result<(), Box<dyn std::error::Error>> {
+    const HIDDEN: &str = r#"
+default = "deny"
+inferred = "hidden"
+
+[[role]]
+name = "editor"
+read = ["http://example.com/g/open"]
+write = ["http://example.com/g/open"]
+default_graph = "read"
+"#;
+    let editor = &["editor"];
+    let app = app_in(HIDDEN, ReasoningMode::Owl2Rl)?;
+    let data = format!(
+        "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+         INSERT DATA {{ GRAPH <{EX}g/open> {{ <{EX}alice> a <{EX}Human> .
+                        <{EX}Human> rdfs:subClassOf <{EX}Patient> }} }}"
+    );
+    assert_eq!(
+        update(&app, &["nrese.admin"], &data).await?,
+        StatusCode::NO_CONTENT
+    );
+    let derived = format!("ASK {{ <{EX}alice> a <{EX}Patient> }}");
+    assert!(
+        ask(&app, &["nrese.admin"], &derived).await?,
+        "the store derives it"
+    );
+    assert!(
+        !ask(&app, editor, &derived).await?,
+        "the editor doesn't see it"
+    );
+    assert_eq!(
+        update(
+            &app,
+            editor,
+            &format!(
+                "INSERT {{ GRAPH <{EX}g/open> {{ <{EX}marker> <{EX}observed> true }} }}
+                 WHERE {{ <{EX}alice> a <{EX}Patient> }}"
+            )
+        )
+        .await?,
+        StatusCode::NO_CONTENT
+    );
+    let marked = format!("ASK {{ GRAPH <{EX}g/open> {{ <{EX}marker> <{EX}observed> true }} }}");
+    assert!(
+        !ask(&app, &["nrese.admin"], &marked).await?,
+        "the update's WHERE read an inferred statement the editor doesn't see"
+    );
     Ok(())
 }

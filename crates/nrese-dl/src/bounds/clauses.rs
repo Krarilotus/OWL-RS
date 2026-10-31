@@ -189,10 +189,9 @@ impl Compiler<'_> {
                     if !self.has_values(*n, *range) {
                         unchecked
                             .get_or_insert("a data existential over a range that may be too small");
-                    } else if skolem && self.compares_values {
-                        // A Skolem value stands for some value of the range, not the one a
-                        // negative assertion or a key compares.
-                        unchecked.get_or_insert("a data existential's value a comparison reads");
+                    } else if skolem {
+                        // Whether a rule compares it is known once all rules are compiled.
+                        self.skolem_data.push((index, *property));
                     }
                 }
                 HeadAtom::DataIn(range, _) => {

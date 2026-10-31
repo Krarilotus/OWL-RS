@@ -22,6 +22,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use nrese_reasoner::rulesets::Ruleset;
+use nrese_reasoner::{RuleProgram, UserRules};
 
 const TOKEN: &str = "fixture-admin";
 
@@ -317,20 +318,33 @@ async fn a_store_written_by_main_opens_with_its_data_answers_and_settings()
         .await?;
     assert!(login.status().is_success(), "{}", login.status());
 
-    // Each inferred stack is current under this build's rules: kept where the rules are
-    // unchanged (owl2-rl, rdfs, the N3 rules), rebuilt where they changed (owl2-ql,
-    // owl-horst).
+    // Each inferred stack is current under this build's rules: kept where neither the rules
+    // nor the base semantics version changed since main, rebuilt where one did (this build's
+    // version 3 isn't main's 2, so here every one is).
     for (id, before) in &main_markers {
         let after = marker(&data.join("repositories").join(id));
         assert_eq!(after["ruleset"], before["ruleset"], "{id}");
-        match Ruleset::from_name(&after["ruleset"]) {
-            Some(ruleset) => assert_eq!(
-                after["fingerprint"],
-                format!("{:016x}", ruleset.fingerprint()),
-                "{id}: not current"
-            ),
-            None => assert_eq!(after["fingerprint"], before["fingerprint"], "{id}"),
-        }
+        let program = match Ruleset::from_name(&after["ruleset"]) {
+            Some(ruleset) => RuleProgram::builtin(ruleset),
+            // User rules: the program this build makes of the repository's rules.
+            None => {
+                let repository: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(
+                        fixture().join(format!("expected/repositories_{id}.json")),
+                    )?)?;
+                let rules = &repository["settings"]["rules"];
+                assert_eq!(rules["format"], "n3", "{id}");
+                let text = |key: &str| rules[key].as_str().expect("rules text").to_owned();
+                let user = UserRules::n3(text("name"), text("text"))?;
+                let base = Ruleset::from_name(repository["reasoning"].as_str().expect("mode"));
+                RuleProgram::new(base, Some(std::sync::Arc::new(user))).expect("a program")
+            }
+        };
+        assert_eq!(
+            after["fingerprint"],
+            format!("{:016x}", program.fingerprint()),
+            "{id}: not current"
+        );
     }
     let default = marker(&data);
     assert_eq!(
@@ -391,4 +405,54 @@ async fn an_image_backup_written_by_main_restores() -> Result<(), Box<dyn std::e
     // An image holds the store, not its namespaces (`ex:` of the `prefixed` query), in
     // main as here.
     same_answers(&server, Some("nrese"), &["prefixed"]).await
+}
+
+/// `nrese-server query` reads inferences, so on a store whose closure an older semantics
+/// version wrote it brings them up to date first, as the server's start does (it answered
+/// from that closure: PR #58, lane M's sol-loop). The store: `C rdfs:subClassOf C` and a
+/// closure without `C owl:equivalentClass C` (materialised first, the axiom bulk-loaded
+/// after, which doesn't maintain the inferred stack), and the marker version 2 wrote,
+/// pinned as written (nrese-store's `reasoning_state` test, tests audit DC-09).
+#[test]
+fn query_brings_a_closure_an_older_semantics_wrote_up_to_date()
+-> Result<(), Box<dyn std::error::Error>> {
+    const VERSION_2: &str =
+        "ruleset owl2-rl\nfingerprint 9ba81328ee5cf5c7\nviolations 0\nlists nil-class\n";
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("data");
+    {
+        let store = nrese_store::StoreService::new(nrese_store::StoreConfig::on_disk(&data))?;
+        let rules = nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl)
+            .materialised_program()
+            .expect("rules");
+        store.rematerialise(&rules)?;
+        let axiom = dir.path().join("axiom.nt");
+        std::fs::write(
+            &axiom,
+            "<urn:C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <urn:C> .\n",
+        )?;
+        store.bulk_load(&nrese_store::BulkLoadRequest {
+            files: vec![axiom],
+            replace: false,
+            graph: nrese_store::GraphTarget::DefaultGraph,
+            invalid: None,
+        })?;
+    }
+    std::fs::write(data.join("reasoning.state"), VERSION_2)?;
+    let (config, _) = configure(dir.path(), &data)?;
+    let answered = Command::new(env!("CARGO_BIN_EXE_nrese-server"))
+        .arg("query")
+        .arg("--config")
+        .arg(&config)
+        .arg("ASK { <urn:C> <http://www.w3.org/2002/07/owl#equivalentClass> <urn:C> }")
+        .env("RUST_LOG", "warn")
+        .output()?;
+    assert!(
+        answered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+    let answer = String::from_utf8(answered.stdout)?;
+    assert!(answer.contains("true"), "{answer}");
+    Ok(())
 }

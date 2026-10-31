@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 sys.path.insert(0, str(ROOT / "benches" / "fast"))
 import fast  # noqa: E402
+import isolation  # noqa: E402
+from test_job_namespace import cleanup_checkout  # noqa: E402
 
 
 class SharedPreparedData(unittest.TestCase):
@@ -59,6 +61,11 @@ class CleanupCache(unittest.TestCase):
             tmp = Path(tmp)
             log = tmp / "docker.log"
             stub = tmp / "docker"
+            root, outside = cleanup_checkout(tmp / "work"), tmp / "outside"
+            leftovers = ("benches/reasoning/results/r/x.inferred.nt", "tmp/bench-run-1/scratch")
+            for path in (base / rel for base in (root, outside) for rel in leftovers):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("")
             stub.write_text(f"""#!/usr/bin/env bash
 case "$1 $2" in
   "info "*) exit 0 ;;
@@ -71,15 +78,18 @@ case "$1 $2" in
 esac
 """, newline="\n")
             stub.chmod(0o755)
-            env = {**os.environ, "PATH": f"{tmp.as_posix()}{os.pathsep}{os.environ['PATH']}", "NRESE_BENCH_KEEP": "1",
-                   "NRESE_BENCH_LOCAL": str(tmp / "local")}
-            done = subprocess.run([BASH, (ROOT / "scripts" / "bench-cleanup.sh").as_posix()], env=env, capture_output=True,
+            env = isolation.environment(NRESE_DOCKER=stub.as_posix(), NRESE_BENCH_KEEP="1",
+                                        NRESE_BENCH_LOCAL=str(tmp / "local"))
+            done = subprocess.run([BASH, (root / "scripts" / "bench-cleanup.sh").as_posix()], env=env, capture_output=True,
                                   text=True, timeout=120)
             self.assertEqual(done.returncode, 0, done.stderr)
             calls = log.read_text().splitlines()
             self.assertIn("builder prune -f --keep-storage 10GB", calls)
             self.assertFalse([c for c in calls if ("prune" in c and "builder" not in c) or c.startswith("volume rm")],
                              calls)
+            # Its own checkout's run leftovers go; another directory's stay.
+            self.assertEqual([(base / rel).exists() for base in (root, outside) for rel in leftovers],
+                             [False, False, True, True])
 
 
 if __name__ == "__main__":

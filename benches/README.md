@@ -72,11 +72,15 @@ Answers are compared by [suite/suitekit/answers.py](suite/suitekit/answers.py)
 one reference, never by majority. The reference is the first listed system with a complete,
 stable answer, confirmed by the next one or by a known answer (an adjudicated count, a fast
 case's own check); two references that disagree leave the query to adjudication.
-`strict_match` and `value_match` are kept apart (a `COUNT` typed `xsd:int` is the same
-value as `xsd:integer`, and the datatype difference is recorded); an unordered final
-`LIMIT` is checked as a legal subset of the reference's unlimited answer. Each distinct
-query on the same data is one group, classified `ok`, `wrong` (whose), `incomplete` or
-`unsupported`; `suite.py answers DIR...` classifies captured runs again, without running.
+Terms compare at the contract's levels (the same datatype and value counts; the same number
+across datatypes, or a `COUNT` not typed `xsd:integer`, `deviates`: reported, not timed, not
+disqualifying; a decimal division needs an exact oracle, else it is `unqualified`, or `wrong`
+where the two results' own digits rule out one quotient); the
+shared cases are [suite/fixtures/answer-levels.json](suite/fixtures/answer-levels.json). An
+unordered final `LIMIT` is checked as a legal subset of the reference's unlimited answer.
+Each distinct query on the same data is one group, classified `ok`, `wrong` (whose),
+`unqualified`, `deviates`, `incomplete` or `unsupported`; `suite.py answers DIR...` classifies
+captured runs again, without running.
 
 ### Where this stands
 

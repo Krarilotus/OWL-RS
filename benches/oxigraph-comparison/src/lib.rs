@@ -1,8 +1,10 @@
 //! Input generators shared by the differential tests and the benchmarks. Everything is
-//! seeded, so a run is repeatable.
+//! seeded, so a run is repeatable. The W3C suites they read come from `w3c`.
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+
+pub mod w3c;
 
 pub fn rng(seed: u64) -> StdRng {
     StdRng::seed_from_u64(seed)

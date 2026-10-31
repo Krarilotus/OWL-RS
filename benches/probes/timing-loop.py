@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""What the perf lab's timing loop adds to microsecond queries (benches/fast/patches/
-perf_lab_watchdog.py): perf labs of two or more revisions, each with the canceller thread started
+"""What the perf lab's timing loop adds to microsecond queries (benches/PROTOCOL.md §5, "No
+thread started in a timed window"): perf labs of two or more revisions, each with the canceller thread started
 per run ("spawn") and with the watchdog ("watchdog"), run interleaved in fresh processes on the
 same data and queries. Per query: each variant's process p50s, their noise (sd of the logs), and
 between the revisions the gap of medians with each loop; the bias the loop adds to a revision

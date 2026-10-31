@@ -63,6 +63,9 @@ backlog = [
   "reactome-uniprot",
   "chasebench",
   "uobm",
+  # access: restricted readers' inferred visibility, NRESE alone (no other system documents
+  # it); the cap decision of C-310 reads it (26 Oct 2026)
+  "support-stress",
 ]
 
 last = [

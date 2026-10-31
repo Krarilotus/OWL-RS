@@ -54,6 +54,28 @@ class DriverKind(unittest.TestCase):
             failed = [r for r in read(results / "results.csv") if r["status"] == "failed"]
             self.assertEqual(sorted(r["system"] for r in failed), ["nrese", "souffle"])
 
+    def test_a_second_run_into_the_same_results_imports_only_its_own_rows(self):
+        """Spec: suitekit/schema.py, a row per measured step: a run's results.csv holds each
+        run's rows once (fix round r1 S1: kits append to their results.csv)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            results = Path(tmp)
+            writes = ("import pathlib, sys; from suitekit.schema import Result, Writer; "
+                      "Writer(pathlib.Path(sys.argv[1]) / 'results.csv').write(Result(date='d', host='h', "
+                      "runtime='docker', system='souffle', version='-', publish='free', workload='claros', tier='l', "
+                      "regime='custom', run=1, task='reason', ms=5.0))")
+            plan = workloads.Plan("claros", "l", kind="driver",
+                                  driver=[[sys.executable, "-c", f"import sys; sys.path.insert(0, 'benches/suite'); {writes}",
+                                           "{results}"]])
+            for stamp in ("run-1", "run-2"):
+                suite = SimpleNamespace(results=results, stamp=stamp, date="d", host="h", say=lambda *a: None,
+                                        written=[], args=SimpleNamespace(dry_run=False, runs=1), root=ROOT,
+                                        publish=lambda k: "free")
+                suite.writer = Writer(results / "results.csv")
+                suite.host_command = lambda command, log=None, suite=suite: Suite.host_command(suite, command, log)
+                suite.emit = lambda base, suite=suite, **fields: Suite.emit(suite, base, **fields)
+                Suite.driver(suite, plan, ["souffle"])
+            self.assertEqual(len(read(results / "results.csv")), 2)
+
     def test_the_reasoning_workloads_have_driver_plans(self):
         plans = {name: workloads.plans(ROOT, name, None, {}) for name in ("claros", "datalog-graphs", "commit-latency")}
         for name, found in plans.items():

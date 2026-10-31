@@ -10,7 +10,6 @@ import importlib.util
 import io
 import itertools
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,15 +34,28 @@ sweep = load("seed_sweep", ROOT / "scripts/seed-sweep.py")
 chunk = load("capped_chunk", ROOT / "scripts/capped-chunk.py")
 
 
+# No systemd scope: whether the host has a usable one is the cap test's question (below), not the
+# runner's. A path lookup doesn't answer it (a container has systemd-run without a user manager).
+NO_SCOPE = SimpleNamespace(which=lambda name: None)
+# The same for capped-chunk.py run as its own process: `python -c NO_SCOPE_CHUNK capped-chunk.py ARGS...`.
+NO_SCOPE_CHUNK = ("import runpy, shutil, sys; shutil.which = lambda name: None; sys.argv = sys.argv[1:]; "
+                  "runpy.run_path(sys.argv[0], run_name='__main__')")
+# The kernel's cap needs a working user scope and memory controller: required where they are
+# promised, a fleet step on Linux (its slice, FLEET_SLICE), or the native lifecycle checks.
+SCOPES = sys.platform == "linux" and bool(os.environ.get("FLEET_SLICE")
+                                          or os.environ.get("NRESE_TEST_NATIVE_CLEANUP") == "1")
+
+
 class CappedChunk(unittest.TestCase):
-    def run_chunk(self, budget_min, code):
-        return subprocess.run([sys.executable, str(ROOT / "scripts/capped-chunk.py"), "--memory-mib", "512",
-                               "--budget-min", str(budget_min), "--", sys.executable, "-c", code],
-                              capture_output=True, text=True, timeout=60)
+    def run_chunk(self, *argv):
+        output = io.StringIO()
+        with patch.object(sys, "argv", ["capped-chunk.py", "--memory-mib", "512", *argv]), \
+                patch.object(chunk, "shutil", NO_SCOPE), redirect_stdout(output):
+            return chunk.main(), output.getvalue()
 
     def test_the_commands_exit_status_and_the_budget_ending_a_chunk(self):
-        done = self.run_chunk(1, "raise SystemExit(3)")
-        self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
+        code, output = self.run_chunk("--budget-min", "1", "--", sys.executable, "-c", "raise SystemExit(3)")
+        self.assertEqual(code, 3, output)
         # The budget ends on a clock the test moves (20 s a reading, 60 s of budget), and each
         # timed wait for the real child reports its poll interval over at once; the child,
         # asleep for 30 s, is stopped and reaped for real.
@@ -65,6 +77,7 @@ class CappedChunk(unittest.TestCase):
         output, ended = io.StringIO(), []
         with ExitStack() as patched:
             patched.enter_context(patch.object(sys, "argv", argv))
+            patched.enter_context(patch.object(chunk, "shutil", NO_SCOPE))
             patched.enter_context(patch.object(chunk, "subprocess",
                                                SimpleNamespace(**{**vars(subprocess), "Popen": Child})))
             patched.enter_context(patch.object(chunk, "time", SimpleNamespace(monotonic=lambda: next(clock))))
@@ -83,10 +96,9 @@ class CappedChunk(unittest.TestCase):
         self.assertNotIn(child.returncode, (None, 0), "the child was stopped and reaped")
 
     def test_a_resumable_chunk_may_end_at_its_budget_with_zero_when_it_says_so(self):
-        done = subprocess.run([sys.executable, str(ROOT / "scripts/capped-chunk.py"), "--memory-mib", "512",
-                               "--budget-min", "0.05", "--budget-ok", "--", sys.executable, "-c",
-                               "import time; time.sleep(30)"], capture_output=True, text=True, timeout=60)
-        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        code, output = self.run_chunk("--budget-min", "0.05", "--budget-ok", "--", sys.executable, "-c",
+                                      "import time; time.sleep(30)")
+        self.assertEqual(code, 0, output)
 
     def test_the_cap_is_the_kernels_oom_kill_not_a_peak_reading(self):
         # Defect 4: on Linux the peak read as 0, so an OOM kill became FAILED(137).
@@ -96,7 +108,7 @@ class CappedChunk(unittest.TestCase):
         self.assertEqual(chunk.outcome(1, oom_kills=None, peak_mib=3990, cap_mib=4000), chunk.CAP_REACHED)  # Windows job
         self.assertEqual(chunk.outcome(1, oom_kills=None, peak_mib=1000, cap_mib=4000), 1)
 
-    @unittest.skipUnless(shutil.which("systemd-run") and shutil.which("systemctl"), "needs systemd user scopes")
+    @unittest.skipUnless(SCOPES, "systemd user scopes are promised in a Linux fleet step or the native lifecycle checks")
     def test_a_linux_command_past_its_cap_is_cap_reached(self):
         done = subprocess.run([sys.executable, str(ROOT / "scripts/capped-chunk.py"), "--memory-mib", "64",
                                "--budget-min", "1", "--", sys.executable, "-c",
@@ -154,7 +166,7 @@ class SweepResume(unittest.TestCase):
         dispatch = (f"import os; exec({commands!r}.get(int(os.environ['NRESE_FUZZ_SEED']), 'pass'))")
 
         def capped(t, extra, default_mib, budget_min):
-            return [sys.executable, str(ROOT / "scripts/capped-chunk.py"), "--memory-mib", "512",
+            return [sys.executable, "-c", NO_SCOPE_CHUNK, str(ROOT / "scripts/capped-chunk.py"), "--memory-mib", "512",
                     "--budget-min", "0.02", "--", sys.executable, "-c", dispatch]
         with patch.object(sweep, "capped", capped):
             return sweep.run(self.args)

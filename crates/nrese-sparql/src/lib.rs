@@ -63,7 +63,7 @@ pub use results::{
     QuerySolution, QuerySolutionIter, QueryTripleIter,
 };
 pub use service::{ServiceClient, ServiceResults, Services};
-pub use update::{UpdateError, UpdateOptions, apply_update, graph_label};
+pub use update::{ReadSource, UpdateError, UpdateOptions, apply_update, graph_label};
 pub use view::ReadView;
 
 /// The unit tests' allocator: the system's, counting what a measured operation holds live

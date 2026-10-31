@@ -514,7 +514,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
             value,
             shape: shape_ref,
             component: check.component,
-            source: Some(check.source),
+            source: check.source,
             messages: (!check.messages.is_empty()).then(|| check.messages.clone()),
         };
         let failure = |problem: &str| {

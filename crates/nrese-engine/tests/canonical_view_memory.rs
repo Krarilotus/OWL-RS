@@ -1,11 +1,15 @@
-//! Guard of the canonical views' memory (canonical equality answers, research-designs §1):
-//! a view is reserved before it is made, on the store's view budget or else on its reader's
+//! Guard of the views' memory: the canonical views (canonical equality answers,
+//! research-designs §1) and the restricted inferred views (`inferred = "supported"`). A
+//! view is reserved before it is made, on the store's view budget or else on its reader's
 //! own, and holds its charge until its last holder lets it go. Measured against those
 //! budgets (`nrese_exec::measure`), so this file is a test binary of its own.
 
 use std::sync::{Arc, Barrier, Mutex};
 
-use nrese_engine::{EncodedTriple, Engine, EngineConfig, QuadPattern, ReadModel, Snapshot};
+use nrese_engine::{
+    EncodedQuad, EncodedTriple, Engine, EngineConfig, InferredMask, QuadPattern, ReadModel,
+    Snapshot,
+};
 use nrese_exec::{Budget, measure};
 use nrese_rdf::{NamedNode, Quad};
 
@@ -178,4 +182,132 @@ fn a_view_both_budgets_refuse_is_never_made() {
     assert!(made.is_err());
     assert_eq!(excess, 0, "made before it was refused");
     assert_eq!((views.used(), query.used()), (0, 0));
+}
+
+/// A restricted inferred view (`inferred = "supported"`), a list of what a reader sees or a
+/// mask over the stack of what it misses, is charged for all it makes before it is made,
+/// and holds it until the last of the masks and views over it goes. The charge follows
+/// the view's size.
+#[test]
+fn inferred_views_are_charged_for_all_they_hold() {
+    if !measure::alone() {
+        return;
+    }
+    let mut charged = Vec::new();
+    for size in [500, 4_000] {
+        let store = Engine::new(quiet()).unwrap();
+        let mut tx = store.transaction();
+        let s = tx.intern(node("s").as_ref().into());
+        let p = tx.intern(node("p").as_ref().into());
+        for i in 0..size {
+            let o = tx.intern(node(&format!("o{i}")).as_ref().into());
+            tx.insert_inferred(EncodedTriple {
+                subject: s,
+                predicate: p,
+                object: o,
+            });
+        }
+        tx.commit().unwrap();
+        let snapshot = store.snapshot();
+        let mut quads: Vec<EncodedQuad> = snapshot
+            .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+            .collect();
+        quads.sort_unstable();
+        let (seen, missed) = quads.split_at(size / 2);
+        let budget = Arc::new(Budget::unlimited());
+        let (used, excess) = measure::measure_within(&budget, || {
+            let only = snapshot.with_inferred_only(seen, &budget).unwrap();
+            let mask = InferredMask::hiding(&snapshot, missed, &budget).unwrap();
+            let masked = snapshot
+                .with_inferred_mask(&mask, &budget)
+                .unwrap()
+                .expect("the stack's layout");
+            assert_eq!(only.len_in(ReadModel::Inferred), seen.len() as u64);
+            assert_eq!(masked.len_in(ReadModel::Inferred), seen.len() as u64);
+            let used = budget.used();
+            drop((only, mask, masked));
+            used
+        });
+        assert_eq!(
+            excess, 0,
+            "{size} statements: {excess} bytes beyond the charge"
+        );
+        assert_eq!(budget.used(), 0, "{size} statements: still charged");
+        charged.push(used);
+    }
+    assert!(charged[1] > 4 * charged[0], "{charged:?}");
+}
+
+/// A view or mask refused anywhere in its making holds nothing past its charge, and nothing
+/// once refused: every budget from none to what it needs, for a view of kept statements, a
+/// mask stacked on an earlier one, and the view of such a mask. Its charge is taken before
+/// anything it covers is made, so no refusal releases it while the caller still owns a run
+/// (review r1 of item 18 part 1, F5). What the earlier masks hold is charged elsewhere and
+/// made before the measurement.
+#[test]
+fn inferred_views_refused_anywhere_free_before_they_release() {
+    if !measure::alone() {
+        return;
+    }
+    let store = Engine::new(quiet()).unwrap();
+    let mut tx = store.transaction();
+    let s = tx.intern(node("s").as_ref().into());
+    let p = tx.intern(node("p").as_ref().into());
+    for i in 0..200 {
+        let o = tx.intern(node(&format!("o{i}")).as_ref().into());
+        tx.insert_inferred(EncodedTriple {
+            subject: s,
+            predicate: p,
+            object: o,
+        });
+    }
+    tx.commit().unwrap();
+    let snapshot = store.snapshot();
+    let mut quads: Vec<EncodedQuad> = snapshot
+        .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+        .collect();
+    quads.sort_unstable();
+    let (seen, missed) = quads.split_at(100);
+    let (earlier, later) = missed.split_at(50);
+    let unlimited = Arc::new(Budget::unlimited());
+    // The masks a later one stacks on and a view reads, charged elsewhere.
+    let first = InferredMask::hiding(&snapshot, earlier, &unlimited).unwrap();
+    let second = first.changed(&snapshot, later, &[], &unlimited).unwrap();
+    let only = |budget: &Arc<Budget>| snapshot.with_inferred_only(seen, budget).map(drop);
+    let stacked = |budget: &Arc<Budget>| first.changed(&snapshot, later, &[], budget).map(drop);
+    let viewed = |budget: &Arc<Budget>| {
+        snapshot
+            .with_inferred_mask(&second, budget)
+            .map(|view| drop(view.expect("the stack's layout")))
+    };
+    type Make<'a> = &'a dyn Fn(&Arc<Budget>) -> Result<(), nrese_exec::BudgetExceeded>;
+    let makes: [(&str, Make); 3] = [("only", &only), ("stacked", &stacked), ("viewed", &viewed)];
+    for (name, make) in makes {
+        // The most it charges at once: every budget below it refuses somewhere.
+        let needed = {
+            let budget = Arc::new(Budget::unlimited());
+            make(&budget).unwrap();
+            budget.peak()
+        };
+        let (mut refused, mut made) = (0, 0);
+        for limit in (0..=needed + 8).step_by(4) {
+            let budget = Arc::new(Budget::new(limit));
+            let (result, excess) = measure::measure_within(&budget, || make(&budget));
+            refused += usize::from(result.is_err());
+            made += usize::from(result.is_ok());
+            assert_eq!(
+                excess, 0,
+                "{name} within {limit} bytes: {excess} past the charge"
+            );
+            assert_eq!(
+                budget.used(),
+                0,
+                "{name} within {limit} bytes: still charged"
+            );
+        }
+        assert!(
+            refused > 0 && made > 0,
+            "{name}: {refused} refused, {made} made"
+        );
+    }
 }

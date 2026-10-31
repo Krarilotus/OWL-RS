@@ -47,7 +47,7 @@ export function useConsoleActions(strings: AppStrings, runtimeRefs: RuntimeRefs)
       setOutput({
         title: `${title} (${response.status}, ${completeness.status})`,
         status: "incomplete",
-        body: `${strings.incompleteAnswer} (${completeness.header})\n\n${body}`,
+        body: `${completeness.status === "sound-only" ? strings.incompleteAnswer : strings.uncertifiedAnswer} (${completeness.header})\n\n${body}`,
       });
     } else {
       setOutput({

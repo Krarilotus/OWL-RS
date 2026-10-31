@@ -637,3 +637,36 @@ fn a_merging_commit_stores_the_representative_form_of_what_it_asserts() {
         }
     }
 }
+
+/// A commit that deletes an equality keeps what schema facts alone derive about the class
+/// it splits (`ex:C ⊑ ex:C` gives `ex:C ≡ ex:C`), in every equality mode. A store keeping
+/// every copy maintains the split by recomputing its region, which lost such a fact; a
+/// compact store rebuilds. The filler makes a rebuild dearer than the recomputation, as
+/// in a store of any size.
+#[test]
+fn a_split_keeps_what_schema_facts_alone_derive() {
+    use nrese_reasoner::delta::policy::Plan;
+    let filler: String = (0..200)
+        .map(|i| format!("ex:f{i} ex:filler ex:g{i} . "))
+        .collect();
+    for mode in [Mode::Replicate, Mode::Representatives, Mode::Compact] {
+        let pipeline = pipeline(mode);
+        update(
+            &pipeline,
+            &format!(
+                "INSERT DATA {{ ex:C rdfs:subClassOf ex:C . ex:C owl:sameAs ex:D . {filler} }}"
+            ),
+        );
+        let kept = "ASK { ex:C owl:equivalentClass ex:C }";
+        assert!(answer(&pipeline, kept).contains("true"), "{mode:?}: before");
+        update(&pipeline, "DELETE DATA { ex:C owl:sameAs ex:D }");
+        let plan = pipeline.last_reasoning_run().expect("recorded").work.plan;
+        assert!(
+            answer(&pipeline, kept).contains("true"),
+            "{mode:?}: after the split (plan {plan:?})"
+        );
+        if mode != Mode::Compact {
+            assert_eq!(plan, Plan::Recompute, "{mode:?}: the path under test");
+        }
+    }
+}

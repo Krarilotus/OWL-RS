@@ -527,6 +527,20 @@ kit = "benches/reasoning/maintenance"
 check = "every change is undone, so the closure must hash back to the one the load materialised"
 note = "Over the SPARQL protocol on every system (the suite's adapters): batches of 1, 100 and 10,000 inserts and deletes, a schema axiom removed and restored, single-triple commits under 0, 1, 8 and 64 readers. GraphDB Free serves two queries at once, so more readers measure its queueing; RDFox waits for a licence. The fast cases commits-readers and writes-under-readers cover NRESE in process"
 
+[support-stress]
+title = "Restricted readers' inferred visibility under many alternative supports"
+kind = "performance"
+tasks = ["RT3", "RT2"]
+needs = ["load", "query", "reason-owl2-rl", "graph-access-inference"]
+scales = "targets with 8 to 4,096 minimal graph sets (copies, products, sameAs ladders), 100 to 8,000 subjects"
+source = "ours: perf_lab generate support-stress (crates/nrese-store/examples/perf_lab/support_family.rs), seeded"
+licence = "ours"
+tiers = ["copies-8", "copies-16", "copies-17", "copies-256", "product-64", "product-256", "product-1024", "product-4096", "ladder-16", "ladder-256", "ladder-4096"]
+state = "ready"
+kit = "benches/fast"
+check = "a reader's answer counts against the generator's oracle: the closure of the statements it may read, computed by brute force (spec: docs/STATUS.md, Inferences and graph access; nrese_store::support)"
+note = "The sets, the first restricted read, and commits of 1 and 1,000 statements, at the support-set caps 4, 16 and off (C-310). No other system documents reads that show an inference by the graphs its derivations use; they are listed as unable"
+
 [elk-ontologies]
 title = "Classification of large EL and near-EL ontologies: GO, ChEBI, NCIt, GALEN"
 kind = "performance"

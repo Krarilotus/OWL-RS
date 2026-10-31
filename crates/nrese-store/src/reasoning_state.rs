@@ -279,4 +279,70 @@ mod tests {
             );
         }
     }
+
+    /// A closure semantics version 2 wrote is recomputed by a build of another version, at
+    /// the first write after opening (PR #58 review r1 W1): version 2's maintenance could
+    /// recompute an `owl:sameAs` split without what schema statements alone derive, here
+    /// `C owl:equivalentClass C` from `C rdfs:subClassOf C`. The marker is the one version 2
+    /// wrote for this store, as it wrote it (tests audit DC-09: never recomputed from
+    /// today's constants).
+    #[test]
+    fn a_closure_version_2_wrote_is_recomputed_after_opening() {
+        use nrese_engine::EncodedTriple;
+        use nrese_rdf::NamedNode;
+        use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+        use std::sync::Arc;
+        /// The marker of an on-disk OWL 2 RL store under semantics version 2 (dfe8b71f,
+        /// fleet lane-m-g2-w1-marker-probe).
+        const VERSION_2: &str =
+            "ruleset owl2-rl\nfingerprint 9ba81328ee5cf5c7\nviolations 0\nlists nil-class\n";
+        const OWL: &str = "http://www.w3.org/2002/07/owl#";
+        let dir = tempfile::tempdir().unwrap();
+        let open = || {
+            let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir.path()));
+            crate::MutationPipeline::new(
+                Arc::new(store.unwrap()),
+                Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                    ReasoningMode::Owl2Rl,
+                ))),
+            )
+        };
+        let update = |pipeline: &crate::MutationPipeline, text: &str| {
+            pipeline
+                .apply(
+                    crate::MutationCommand::Update(crate::SparqlUpdateRequest::new(format!(
+                        "PREFIX owl: <{OWL}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {text}"
+                    ))),
+                    &crate::Requester::all(),
+                    &crate::MutationTicket::new(),
+                )
+                .unwrap();
+        };
+        let kept = |pipeline: &crate::MutationPipeline| {
+            let ask = format!("ASK {{ <urn:C> <{OWL}equivalentClass> <urn:C> }}");
+            let result = pipeline.store().execute_query_str(&ask).unwrap();
+            String::from_utf8(result.payload).unwrap().contains("true")
+        };
+        let pipeline = open();
+        update(
+            &pipeline,
+            "INSERT DATA { <urn:C> rdfs:subClassOf <urn:C> . <urn:C> owl:sameAs <urn:D> }",
+        );
+        update(&pipeline, "DELETE DATA { <urn:C> owl:sameAs <urn:D> }");
+        assert!(kept(&pipeline), "today's maintenance keeps it");
+        // The closure version 2 left: the same, without `C owl:equivalentClass C`.
+        {
+            let mut tx = pipeline.store().engine().transaction();
+            let id = |iri: &str| tx.intern(NamedNode::new_unchecked(iri).as_ref().into());
+            let (c, equivalent) = (id("urn:C"), id(&format!("{OWL}equivalentClass")));
+            assert!(tx.remove_inferred(EncodedTriple::new(c, equivalent, c)));
+            tx.commit().unwrap();
+        }
+        assert!(!kept(&pipeline), "the closure version 2 left");
+        drop(pipeline);
+        std::fs::write(dir.path().join("reasoning.state"), VERSION_2).unwrap();
+        let pipeline = open();
+        update(&pipeline, "INSERT DATA { <urn:x> <urn:p> <urn:y> }");
+        assert!(kept(&pipeline), "recomputed after opening");
+    }
 }

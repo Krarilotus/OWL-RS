@@ -147,7 +147,7 @@ Later goals, from QLever's other strengths (catalogue rows only; no work now):
 | Benchmark | Measures; who publishes | Check | Shows about NRESE | Mark | Now |
 |---|---|---|---|---|---|
 | LDBC SPB 2.0 (BBC) | editorial updates under an RDFS-to-OWL 2 RL ontology with concurrent aggregation agents; GraphDB publishes audited results | the official validator (query results and inference) | per-commit maintenance under readers against GraphDB's design; also needs full-text and GeoSPARQL in the advanced mix | core | planned |
-| Commit latency under readers (ours, report item 20) | commit p50/p99 under 0, 1, 8, 64 readers with the closure complete at every commit; nobody publishes it | committed state equals rematerialisation | the claim of the ESWC paper | core | partial: `local-bulk.sh` (no readers) |
+| Commit latency under readers (ours, report item 20) | commit p50/p99 under 0, 1, 8, 64 readers with the closure complete at every commit; nobody publishes it | committed state equals rematerialisation | the paper's claim | core | partial: `local-bulk.sh` (no readers) |
 | BSBM explore and update | the explore mix with updates interleaved, multi-client | qualification mode | write throughput without reasoning against others | representative | probes only |
 | Write scaling | single and batch writes at 1 M, 10 M | statements read back | P1 gate (< 5 ms at 10 M) | covered | ready |
 | Concurrency scorecard | throughput with concurrent clients, writes under read load | counts | | covered | `competitors/scorecard.sh` |

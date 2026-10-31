@@ -11,7 +11,7 @@ use nrese_owl::{
 };
 use nrese_rdf::{BlankNode, Literal, NamedNode, Term as RdfTerm};
 
-use super::{Table, assert_round_trip, rendered};
+use super::{Table, assert_round_trip, load, rendered};
 
 impl Intern for Table {
     fn iri_id(&mut self, iri: &str) -> Term {
@@ -175,11 +175,14 @@ AnnotationPropertyRange(:note xsd:string)
 "#;
 
 /// Every construct of the functional syntax, read as the RDF reader reads its RDF form.
+/// `_:x` in a nominal is the syntax's, and breaks a global restriction of OWL 2 DL
+/// (*OWL 2 Structural Specification* §11.2): its one diagnostic.
 #[test]
 fn every_functional_construct_is_read() {
     let mut table = Table::default();
     let (o, header) = read_functional(EVERYTHING, &mut table);
-    assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+    let x = table.ids[&RdfTerm::BlankNode(BlankNode::new_unchecked("x"))];
+    assert_eq!(o.diagnostics, [Diagnostic::AnonymousIndividual { node: x }]);
     assert_eq!(header.iri.as_deref(), Some("http://example.com/o"));
     assert_eq!(header.version.as_deref(), Some("http://example.com/o/1"));
     assert_eq!(header.imports, vec!["http://example.com/other".to_owned()]);
@@ -211,7 +214,6 @@ fn every_functional_construct_is_read() {
         );
     }
     // The inverse's assertion is stored swapped, over the anonymous individual.
-    let x = table.ids[&RdfTerm::BlankNode(BlankNode::new_unchecked("x"))];
     let r = table.iri_id("http://example.com/r");
     let a = table.iri_id("http://example.com/a");
     assert!(o.axioms.contains(&Axiom::ObjectPropertyAssertion(r, x, a)));
@@ -286,6 +288,79 @@ DataPropertyAssertion(:d :c \"open)
             "ClassAssertion(ex:C ex:c)".to_owned(),
             "SubClassOf(ex:A ex:B)".to_owned()
         ]
+    );
+}
+
+/// A property chain of no property (review A-1101) is no axiom: the functional syntax
+/// reports a syntax error, RDF (`owl:propertyChainAxiom rdf:nil`) a malformed structure,
+/// and both read what follows.
+#[test]
+fn an_empty_property_chain_is_reported_and_left_out() {
+    let what = "a property chain without a property";
+    let mut table = Table::default();
+    let (o, _) = read_functional(
+        "Prefix(:=<http://example.com/>)
+Ontology(
+SubObjectPropertyOf(ObjectPropertyChain() :p)
+SubClassOf(:A :B)
+)",
+        &mut table,
+    );
+    let syntax = |d: &Diagnostic| matches!(d, Diagnostic::Syntax { what: w, .. } if *w == what);
+    let malformed =
+        |d: &Diagnostic| matches!(d, Diagnostic::Malformed { what: w, .. } if *w == what);
+    let mut wrong = Vec::new();
+    if !o.diagnostics.iter().any(syntax) {
+        wrong.push(format!("functional: {:?}", o.diagnostics));
+    }
+    if rendered(&o, &table) != ["SubClassOf(ex:A ex:B)"] {
+        wrong.push(format!("functional: {:?}", rendered(&o, &table)));
+    }
+    let mut table = Table::default();
+    let statements = load(
+        &mut table,
+        "ex:p owl:propertyChainAxiom () . ex:A rdfs:subClassOf ex:B .",
+    );
+    let o = read(&statements, &table);
+    if !o.diagnostics.iter().any(malformed) {
+        wrong.push(format!("RDF: {:?}", o.diagnostics));
+    }
+    if rendered(&o, &table) != ["SubClassOf(ex:A ex:B)"] {
+        wrong.push(format!("RDF: {:?}", rendered(&o, &table)));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// An anonymous individual only in a nominal or a `hasValue` (review A-1102) stays
+/// anonymous: not among the named individuals (so no key or rule binds it), and reported,
+/// since OWL 2 DL takes named individuals there (*OWL 2 Structural Specification* §11.2).
+#[test]
+fn an_anonymous_individual_in_a_nominal_stays_anonymous() {
+    let mut table = Table::default();
+    let (o, _) = read_functional(
+        "Prefix(:=<http://example.com/>)
+Ontology(
+SubClassOf(:C ObjectOneOf(_:x))
+SubClassOf(:D ObjectHasValue(:r _:y))
+ClassAssertion(:C :a)
+)",
+        &mut table,
+    );
+    let named: Vec<String> = (o.named_individuals().into_iter())
+        .map(|t| table.name(t))
+        .collect();
+    assert_eq!(named, ["ex:a"]);
+    assert_eq!(o.anonymous.len(), 2, "{:?}", o.anonymous);
+    let reported: Vec<Term> = (o.diagnostics.iter())
+        .filter_map(|d| match d {
+            Diagnostic::AnonymousIndividual { node } => Some(*node),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        reported.len() == 2 && reported.iter().all(|t| o.anonymous.contains(t)),
+        "{:?}",
+        o.diagnostics
     );
 }
 

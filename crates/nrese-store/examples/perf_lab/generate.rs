@@ -5,7 +5,9 @@
 //! named graphs, `ex:graph0` to `ex:graph3`), and computes here, independently of the store, the
 //! answers the suite checks before a time counts. They go to standard output as one JSON
 //! object (`expect`), with the statement count and the parameters used. Kinds that need
-//! commits also write `OUT.commits.ru`: one SPARQL update per line, one commit each.
+//! commits also write `OUT.commits.ru`: one SPARQL update per line, one commit each;
+//! `support-stress` also writes its reader (`OUT.reader`) and that reader's own updates
+//! (`OUT.updates.ru`, one request per line).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -156,6 +158,7 @@ pub fn main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "dl-roles" => dl_roles(&params, &mut nt)?,
         "el" => el(&params, &mut rng, &mut nt)?,
         "horn" => horn(&params, &mut rng, &mut nt)?,
+        "support-stress" => support_stress(&params, &mut nt, out, &commits)?,
         other => return Err(format!("unknown kind {other}").into()),
     };
     nt.out.flush()?;
@@ -1426,5 +1429,71 @@ fn fed_chain(p: &Params, nt: &mut Nt) -> std::io::Result<Expect> {
     }
     let mut e = Expect::new();
     e.insert("pairs".into(), json!(chains * length * (length + 1) / 2));
+    Ok(e)
+}
+
+/// Support graph sets under strain (`support_family`, shared with the store's tests), as
+/// N-Quads, from the parameters `Family::from_params` reads. `OUT.reader` names the graphs of
+/// one of the targets' sets, drawn from the seed; `OUT.commits.ru` adds a statement, then
+/// 1,000, of new subjects. The answers are the family's oracle's for that reader, before and
+/// after the commits.
+fn support_stress(p: &Params, nt: &mut Nt, out: &str, commits: &str) -> std::io::Result<Expect> {
+    use crate::support_family::{EX, Family, Quad, members_of_d};
+    let params = p.0.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+    let family = Family::from_params(params)
+        .ok_or_else(|| std::io::Error::other("support-stress: a parameter isn't a number"))?;
+    let (shape, subjects) = (family.shape, family.subjects);
+    let mut quads = family.quads();
+    for quad in &quads {
+        writeln!(nt.out, "{}", quad.nquad())?;
+        nt.count += 1;
+    }
+    let reader = family.reader();
+    let lines: String = reader.iter().map(|graph| format!("{graph}\n")).collect();
+    std::fs::write(format!("{out}.reader"), lines)?;
+    let probe = format!("{EX}x0");
+    let answers = |quads: &[Quad]| {
+        let members = members_of_d(quads, &reader);
+        (members.contains(&probe).to_string(), members.len())
+    };
+    let (seen, count) = answers(&quads);
+    // New subjects' statements: the first alone, then the next thousand.
+    let mut new = (subjects..).flat_map(|j| family.subject(j));
+    let one: Vec<Quad> = new.by_ref().take(1).collect();
+    let thousand: Vec<Quad> = new.take(1000).collect();
+    let update = |quads: &[Quad]| -> String {
+        let data: String = quads
+            .iter()
+            .map(|q| match &q.g {
+                Some(g) => format!("GRAPH <{g}> {{ <{}> <{}> <{}> }} ", q.s, q.p, q.o),
+                None => format!("<{}> <{}> <{}> . ", q.s, q.p, q.o),
+            })
+            .collect();
+        format!("INSERT DATA {{ {data}}}")
+    };
+    std::fs::write(
+        commits,
+        format!("{}\n{}\n", update(&one), update(&thousand)),
+    )?;
+    // The reader's own updates (`perf_lab --support-updates`), into the first of its graphs,
+    // after the commits: they write markers only, so `ex:D` stays as it is, and each leaves one
+    // marker per member of it (`marked`, `seen`: the count after the commits).
+    std::fs::write(
+        format!("{out}.updates.ru"),
+        crate::support::updates(&reader[0]),
+    )?;
+    quads.extend(one);
+    quads.extend(thousand);
+    let (seen_after, count_after) = answers(&quads);
+    let mut e = Expect::new();
+    e.insert("sets".into(), json!(shape.sets()));
+    e.insert("graphs".into(), json!(family.graphs.len()));
+    e.insert("reader_graphs".into(), json!(reader.len()));
+    e.insert("probe".into(), json!(seen));
+    e.insert("count".into(), json!(count));
+    e.insert("probe_after_commits".into(), json!(seen_after));
+    e.insert("count_after_commits".into(), json!(count_after));
+    e.insert("marked".into(), json!(count_after));
+    e.insert("seen".into(), json!(count_after));
     Ok(e)
 }

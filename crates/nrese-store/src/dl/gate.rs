@@ -252,14 +252,17 @@ fn rejection(
     operation: &Budget,
     deadline: Deadline,
 ) -> Gate {
-    // Why: a minimal set of axioms that has no model, each by its source triples.
+    // Why: a minimal set of axioms that has no model, each by its source triples. One
+    // not decided within the budget leaves the rejection without axioms.
     let justification = super::explain::justify(
         ontology,
         &super::explain::Goal::Inconsistent,
         &[],
         &operation.remaining(deadline),
         deadline,
-    );
+    )
+    .ok()
+    .flatten();
     let decode = |t: u64| {
         tx.decode(nrese_engine::TermId::from_raw(t))
             .map_or_else(|| format!("#{t}"), |term| term.to_string())

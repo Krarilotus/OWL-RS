@@ -18,6 +18,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "benches" / "suite"))
 from suitekit import ns  # noqa: E402
+import isolation  # noqa: E402
 
 # A POSIX bash: Git's on Windows, not WSL's launcher.
 BASH = next((b for b in (["C:/Program Files/Git/bin/bash.exe"] if os.name == "nt" else []) if Path(b).is_file()),
@@ -142,7 +143,17 @@ def fake_docker(tmp: Path) -> tuple[dict, dict]:
         python_side = {**state, "NRESE_DOCKER": str(cmd)}
     else:
         python_side = {**state, "NRESE_DOCKER": str(sh)}
-    return python_side, {**os.environ, **state, "NRESE_DOCKER": sh.as_posix()}
+    return python_side, isolation.environment(**state, NRESE_DOCKER=sh.as_posix())
+
+
+CLEANUP = ("scripts/bench-cleanup.sh", "scripts/lib/disk.sh", "scripts/lib/ns.sh")
+
+
+def cleanup_checkout(root: Path) -> Path:
+    """A job's checkout at `root` holding bench-cleanup.sh and what it sources. The cleanup
+    removes run leftovers in the checkout it lies in, so a test runs it from one of its own."""
+    (root / "benches" / "suite").mkdir(parents=True, exist_ok=True)  # ns.sh's NS_SUITE
+    return isolation.checkout(root, *CLEANUP)
 
 
 def state(tmp: Path) -> dict:
@@ -171,10 +182,11 @@ class JobNamespaces(unittest.TestCase):
                 # Job a's own cleanup (fast.py clean --build) while job b's is the host's bench-cleanup
                 # run in job b's namespace: at once.
                 a_root, a_env, *_ = jobs["job-a"]
+                cleanup = (cleanup_checkout(jobs["job-b"][0]) / "scripts" / "bench-cleanup.sh").as_posix()
                 cleaned = {}
                 thread = threading.Thread(target=lambda: cleaned.update(a=ns.clean(a_root, "fast", environ=a_env)))
                 thread.start()
-                done = subprocess.run([BASH, (ROOT / "scripts" / "bench-cleanup.sh").as_posix(), "--owner", "nobody"],
+                done = subprocess.run([BASH, cleanup, "--owner", "nobody"],
                                       env={**shell_side, "FLEET_JOB": "job-b"}, capture_output=True, text=True,
                                       timeout=120)
                 thread.join()
@@ -184,7 +196,7 @@ class JobNamespaces(unittest.TestCase):
             self.assertEqual([c["name"] for c in left["containers"].values()], [jobs["job-b"][3]])
             self.assertEqual(len(cleaned["a"]), 2)
             # Job b's whole cleanup takes b's and nothing else.
-            done = subprocess.run([BASH, (ROOT / "scripts" / "bench-cleanup.sh").as_posix(), "--job"],
+            done = subprocess.run([BASH, cleanup, "--job"],
                                   env={**shell_side, "FLEET_JOB": "job-b"}, capture_output=True, text=True, timeout=120)
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertEqual((state(tmp)["volumes"], state(tmp)["containers"]), ({}, {}))
@@ -202,7 +214,8 @@ class JobNamespaces(unittest.TestCase):
                     ns.docker(ns.volume("create", ns.name("target", root, env), root, "fast", env), check=True)
                 ns.docker(["volume", "create", "nrese-target-work"], check=True)  # from before the labels
             shutil.rmtree(ended)  # its job ended; fleet removed its directory
-            done = subprocess.run([BASH, (ROOT / "scripts" / "bench-cleanup.sh").as_posix()],
+            this = cleanup_checkout(tmp / "jobs" / "this-job" / "work")
+            done = subprocess.run([BASH, (this / "scripts" / "bench-cleanup.sh").as_posix()],
                                   env={**shell_side, "FLEET_JOB": "this-job"}, capture_output=True, text=True, timeout=120)
             self.assertEqual(done.returncode, 0, done.stderr)
             self.assertEqual(sorted(state(tmp)["volumes"]),
@@ -374,7 +387,8 @@ FLEET_JOB=mine ns_clean "$1" "" all
             self.assertEqual(state(tmp)["networks"][ns.name("npd-net", ended, {"FLEET_JOB": "ended"})]["labels"]["nrese.ns"],
                              "ended")
             shutil.rmtree(ended)
-            done = subprocess.run([BASH, (ROOT / "scripts" / "bench-cleanup.sh").as_posix()],
+            this = cleanup_checkout(tmp / "this")
+            done = subprocess.run([BASH, (this / "scripts" / "bench-cleanup.sh").as_posix()],
                                   env={**shell_side, "FLEET_JOB": "this-job"}, capture_output=True, text=True, timeout=120)
             self.assertEqual((done.returncode, state(tmp)["networks"]), (0, {}), done.stderr)
 

@@ -418,6 +418,42 @@ fn malformed_input_is_reported() {
     assert!(lines.contains(&"ObjectPropertyAssertion(ex:undeclared ex:x ex:y)".to_owned()));
 }
 
+/// An n-ary structure without its members, and a negative assertion without its target
+/// (review A-1103), are reported, never dropped silently; what is well-formed beside them
+/// is read.
+#[test]
+fn malformed_n_ary_structures_are_reported() {
+    let mut table = Table::default();
+    let statements = load(
+        &mut table,
+        r#"
+        ex:p a owl:ObjectProperty .
+        [] a owl:AllDisjointClasses .
+        [] a owl:AllDisjointProperties .
+        [] a owl:AllDifferent .
+        [] a owl:NegativePropertyAssertion ; owl:sourceIndividual ex:a ;
+           owl:assertionProperty ex:p .
+        ex:A rdfs:subClassOf ex:B .
+        "#,
+    );
+    let ontology = read(&statements, &table);
+    let reported = |what: &str| {
+        (ontology.diagnostics.iter())
+            .filter(|d| matches!(d, Diagnostic::Malformed { what: w, .. } if *w == what))
+            .count()
+    };
+    assert_eq!(
+        [
+            reported("an n-ary axiom without its members"),
+            reported("a negative property assertion without its target"),
+        ],
+        [3, 1],
+        "{:?}",
+        ontology.diagnostics
+    );
+    assert!(rendered(&ontology, &table).contains(&"SubClassOf(ex:A ex:B)".to_owned()));
+}
+
 /// What the W3C OWL 2 DL tests showed read wrongly or dropped silently: a cardinality over
 /// a data property where the source has no term for `rdfs:Literal` (DL-601: the axiom was
 /// dropped without a diagnostic), RDF's `rdfs:Class`, `rdf:Property` and `rdf:List`
@@ -644,12 +680,18 @@ fn assert_round_trip(ontology: &Ontology, table: &mut Table) {
         .map(|triple| Statement { triple, graph: 0 })
         .collect();
     let back = read(&statements, table);
-    // Random ontologies may break OWL 2 DL's restriction to simple properties: reported
-    // on both sides, not a matter of the mapping.
+    // Ontologies may break OWL 2 DL's global restrictions (simple properties, named
+    // individuals in nominals): reported on both sides, not a matter of the mapping.
+    let restriction = |d: &Diagnostic| {
+        matches!(
+            d,
+            Diagnostic::NonSimpleProperty { .. } | Diagnostic::AnonymousIndividual { .. }
+        )
+    };
     assert!(
         back.diagnostics
             .iter()
-            .all(|d| !d.is_fatal() || matches!(d, Diagnostic::NonSimpleProperty { .. })),
+            .all(|d| !d.is_fatal() || restriction(d)),
         "{:?}",
         back.diagnostics
     );

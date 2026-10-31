@@ -10,6 +10,8 @@ from __future__ import annotations
 import contextlib
 import csv
 import io
+import itertools
+import json
 import sys
 import tempfile
 import unittest
@@ -18,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from suitekit import compare, report, status  # noqa: E402
+from suitekit import answers, compare, report, status, versus  # noqa: E402
 from suitekit.schema import Result  # noqa: E402
 from suitekit.summary import summarise  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fast"))
@@ -99,6 +101,27 @@ class Contracts(unittest.TestCase):
         self.assertIn("1 not comparable", text)
         text = output(report.main, [str(new)])
         self.assertNotIn("| 1.0 |", text)
+
+    def test_an_answer_the_contract_doesnt_time_enters_no_speed_verdict(self):
+        """T8 PR #56 (Sol's fix review, P2): the run comparison took a query's time on its CSV
+        status alone and read answers.json only for a verdict that changed, so a query wrong in
+        both runs, by the same row count, came out faster. answers.timed decides, as for versus
+        and compete: a wrong or unchecked answer earns no time."""
+        # Sol, PR #56 compare r1: an item is its query's name already; a dotted one (geographica2's
+        # synthetic tier) keeps its dots, or no verdict is found and the time counts.
+        for (verdict, note), item in itertools.product((("wrong", ""), ("incomplete", "no reference answered")),
+                                                       ("q1", "00-Synthetic_Selection_Intersects_1_1.0")):
+            with self.subTest(verdict=verdict, item=item):
+                runs = []
+                for name, ms in (("base", 100), ("new", 1)):
+                    path = write(self.dir / verdict / item / name, [load(), query(item, ms)])
+                    (path.parent / "answers.json").write_text(json.dumps({"verdicts": [
+                        {"workload": "w", "tier": "t", "regime": "none", "query": f"queries/{item}.rq",
+                         "system": "nrese", "verdict": verdict, "note": note}]}), encoding="utf-8")
+                    runs.append(str(path))
+                text = output(compare.main, runs)
+                self.assertIn("0 faster", text, "SPEC answer contract: no time from an answer it doesn't time")
+                self.assertIn("1 not comparable", text)
 
     def test_b4_report_and_compare_estimate_alike(self):
         rows = [load(1), load(2), load(3)]
@@ -252,6 +275,103 @@ class CompetitorCompleteness(unittest.TestCase):
         self.assertTrue(summary["other"]["complete"])
         self.assertEqual(verdict["query_winner"], "other")
         self.assertEqual(verdict["publish"], "permission")
+
+    def test_an_answer_the_contract_doesnt_time_excludes_winners(self):
+        """T8 Sol r1 S6: a COUNT in xsd:int for xsd:integer has the same row count, but its answer
+        deviates (answers.json): no time comes from it, nor from a wrong or undecided one. Sol r2
+        S7: nor from one whose answer capture failed after its timed runs (incomplete). PR #56 R3:
+        nor from one no reference checked (unchecked): one rule (answers.timed) for every report."""
+        rows = [load(), load(system="other"), query("q1", 10), query("q1", 1, system="other")]
+        for verdict, winner in (("ok", "other"), ("deviates", None), ("wrong", None), ("unqualified", None),
+                                ("incomplete", None), ("unchecked", None)):
+            record = {"workload": "w", "tier": "t", "regime": "none", "query": "queries/q1.rq", "system": "other",
+                      "verdict": "incomplete" if verdict == "unchecked" else verdict,
+                      "note": "no reference answered" if verdict == "unchecked" else ""}
+            with patch("suitekit.summary.adjudications", return_value={}):
+                summary = compete.summarise_suite(rows, answers.TimingVerdicts([record]))
+            got = compete.verdicts(summary)["other"]
+            with self.subTest(verdict=verdict):
+                self.assertEqual(got["query_winner"], winner, f"SPEC answer contract: {got['answers']}")
+                if winner is None:
+                    self.assertIn(verdict, got["answers"])
+
+
+def recorded(path: Path, records: list[tuple[str, str]], systems=("nrese",)) -> Path:
+    """answers.json beside a results file: each (verdict, query file) for each system; an
+    incomplete one because no reference answered (unchecked)."""
+    (path.parent / "answers.json").write_text(json.dumps({"verdicts": [
+        {"workload": "w", "tier": "t", "regime": "none", "query": query_file, "system": system, "verdict": verdict,
+         "note": "no reference answered" if verdict == "incomplete" else ""}
+        for verdict, query_file in records for system in systems]}), encoding="utf-8")
+    return path
+
+
+class OneVerdictPerQuery(unittest.TestCase):
+    """T8 PR #56 R3 (Sol's fix check 1): the reports that time (compare, versus, compete) read one
+    verdict per query from the contract: the worst of every record of it, in any order; joined by
+    the query's result id, its file's stem (the driver's: `q1.rq.rq` is `q1.rq`); and a query its
+    run recorded no verdict for, where the run recorded others, isn't timed."""
+
+    REPORTS = ("compare", "versus", "compete")
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.dir = Path(temporary.name)
+
+    def timed(self, name: str, item: str, runs: list[list[tuple[str, str]]]) -> dict[str, bool]:
+        """Whether each report times `item` at 100 ms against 1 ms (compare: a base run against a
+        new one; versus and compete: nrese against `other` in one run), over runs whose answers.json
+        holds `runs[i]`'s (verdict, query file) records."""
+        sides, batch, rows = {"base": [], "new": []}, self.dir / name / "batch", []
+        for i, records in enumerate(runs):
+            for side, ms in (("base", 100), ("new", 1)):
+                sides[side].append(str(recorded(write(self.dir / name / side / str(i), [load(), query(item, ms)]),
+                                                records)))
+            rows = [load(), load(system="other"), query(item, 100), query(item, 1, system="other")]
+            recorded(write(batch / str(i), rows), records, ("nrese", "other"))
+        text = output(compare.main, [",".join(sides["base"]), ",".join(sides["new"])])
+        entry = {e["system"]: e for e in versus.versus(batch)}["other"]
+        with patch("suitekit.summary.adjudications", return_value={}):
+            summary = compete.summarise_suite(rows, versus.answer_verdicts(batch))
+        return {"compare": "1 faster" in text, "versus": entry["timed"] == "1/1",
+                "compete": compete.verdicts(summary)["other"]["query_winner"] == "other"}
+
+    def test_the_worst_record_of_a_query_decides_in_either_order(self):
+        for failure, order in itertools.product(("wrong", "incomplete"), ("bad first", "bad last")):
+            runs = [[(failure, "queries/q1.rq")], [("ok", "queries/q1.rq")]]
+            with self.subTest(failure=failure, order=order):
+                got = self.timed(f"{failure}-{order}", "q1", runs if order == "bad first" else runs[::-1])
+                self.assertEqual(got, dict.fromkeys(self.REPORTS, False), "SPEC a later ok hides no fault")
+
+    def test_a_verdict_the_contract_doesnt_know_is_not_timed(self):
+        # answers.json before 12 Oct named an answer match or mismatch (a wrong one): timing fails
+        # closed on a name it doesn't know, alone or beside an ok record (PR #56 fix round 2, F6).
+        mismatch, ok = ("mismatch", "queries/q1.rq"), ("ok", "queries/q1.rq")
+        for name, runs in (("mismatch", [[mismatch]]), ("mismatch-then-ok", [[mismatch], [ok]]),
+                           ("ok-then-mismatch", [[ok], [mismatch]]), ("match", [[("match", "queries/q1.rq")]])):
+            with self.subTest(records=name):
+                self.assertEqual(self.timed(name, "q1", runs), dict.fromkeys(self.REPORTS, False),
+                                 "SPEC a verdict the contract doesn't know earns no time")
+
+    def test_a_query_file_ending_in_rq_twice_joins_its_result_id(self):
+        for verdict, timed in (("wrong", False), ("incomplete", False), ("ok", True)):
+            with self.subTest(verdict=verdict):
+                got = self.timed(f"suffix-{verdict}", "q1.rq", [[(verdict, "queries/q1.rq.rq")]])
+                self.assertEqual(got, dict.fromkeys(self.REPORTS, timed), "SPEC the item is the file's stem")
+
+    def test_a_query_its_run_recorded_no_verdict_for_is_not_timed(self):
+        got = self.timed("unjoined", "q1", [[("ok", "queries/q2.rq")]])
+        self.assertEqual(got, dict.fromkeys(self.REPORTS, False), "SPEC a failed join isn't counts only")
+        # A run that recorded no answers at all is timed by its counts, as before.
+        self.assertEqual(self.timed("unrecorded", "q1", [[]]), dict.fromkeys(self.REPORTS, True))
+
+    def test_a_client_level_has_no_answer_to_join(self):
+        runs = []
+        for name, ms in (("base", 100), ("new", 1)):
+            path = write(self.dir / name, [load(), query("q1", ms), query("clients-8", ms, rows=100)])
+            runs.append(str(recorded(path, [("ok", "queries/q1.rq")])))
+        self.assertIn("2 faster", output(compare.main, runs))
 
 
 if __name__ == "__main__":

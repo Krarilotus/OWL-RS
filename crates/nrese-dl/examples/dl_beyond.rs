@@ -33,6 +33,7 @@ fn kind(d: &Diagnostic) -> String {
         Diagnostic::NotOwl { .. } => "NotOwl".into(),
         Diagnostic::Unused { .. } => "Unused".into(),
         Diagnostic::NonSimpleProperty { what, .. } => format!("NonSimpleProperty:{what}"),
+        Diagnostic::AnonymousIndividual { .. } => "AnonymousIndividual".into(),
         Diagnostic::Syntax { what, .. } => format!("Syntax:{what}"),
         Diagnostic::Rule { .. } => "Rule".into(),
         Diagnostic::RepeatedOperand => "RepeatedOperand".into(),

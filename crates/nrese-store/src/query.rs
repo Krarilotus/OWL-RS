@@ -141,9 +141,11 @@ pub struct SerializedQueryResult {
     pub media_type: &'static str,
     pub payload: Vec<u8>,
     /// What the OWL 2 QL rewriting did and whether the answers are complete; `None` where
-    /// it doesn't apply.
+    /// it doesn't apply, or where its reader is told no assessment of it (a reader of some
+    /// graphs who sees every inference).
     pub ql: Option<nrese_sparql::ql::QlReport>,
     /// Whether the answers are complete, where a reasoning path can leave some out (the
-    /// status [`crate::StoreService::run_query_reporting`] reports).
+    /// status [`crate::StoreService::run_query_reporting`] reports; `not-certified` for
+    /// that reader where the rewriting ran).
     pub completeness: Option<nrese_sparql::Completeness>,
 }

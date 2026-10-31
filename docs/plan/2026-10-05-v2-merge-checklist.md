@@ -99,7 +99,7 @@ Deferred to v3 or later: GPU, distribution, worst-case-optimal joins inside rule
 - [ ] **Safety of the new reasoning paths:** (the QL rewriting's part done, 7 October, `ql/safety`: every rewriting path ends in a status at a budget, one work budget per query, the data check's and the printer's bounds; restricted readers get neither the data check nor another graph's schema under a negation; each shown by a test that fails without it, docs/design/ql-rewriting.md §1 and §5) every DL and rewriting path has a budget; access control applies to inferred and rewritten answers (no derivation from graphs the user can't read); read replicas give the same DL answers and completeness status as the primary.
 - [ ] **DL scope:** every W3C OWL 2 DL case decided, or documented as over budget with its cause. No deadlines (owner, 6 October): progress as fast as possible without compromising quality.
 
-**Timing:** the ESWC 2027 paper (deadline expected early December) needs v2's Draco runs; that informs priorities, not the quality bar.
+**Timing:** the paper needs v2's Draco runs; that informs priorities, not the quality bar.
 
 After the merge: the concise README and docs, the major refactoring (Miri over the unsafe
 code, measured test coverage, duplicate dependency versions, the last typed error, the R1

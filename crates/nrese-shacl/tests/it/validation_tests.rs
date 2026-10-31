@@ -402,3 +402,27 @@ fn a_constraints_dataset_is_the_selection_whatever_its_form() {
         }
     }
 }
+
+/// Pre-binding puts `$currentShape` and `$shapesGraph` in throughout the query (SHACL
+/// Appendix A: every basic graph pattern is joined with the pre-bound values), subqueries
+/// included, though a subquery needn't project them (§5.6.2): unprojected, they are still
+/// bound inside it (research round 12, R12-2).
+#[test]
+fn current_shape_and_shapes_graph_are_bound_in_subqueries() {
+    for query in [
+        "SELECT $this WHERE { { SELECT $this WHERE {
+           $this <http://example.com/p> ?v FILTER(sameTerm($currentShape, <http://example.com/S>)) } } }",
+        "SELECT $this WHERE { { SELECT $this WHERE {
+           $this <http://example.com/p> ?v GRAPH $shapesGraph { $currentShape a <http://www.w3.org/ns/shacl#NodeShape> } } } }",
+    ] {
+        let engine = engine(
+            "ex:a ex:p ex:b .",
+            &format!("ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select '''{query}''' ] ."),
+        );
+        let snapshot = engine.snapshot();
+        let shapes = compiled(&snapshot);
+        let report = validate(&snapshot, &shapes, DEFAULT);
+        assert!(report.failures.is_empty(), "{query}: {:?}", report.failures);
+        assert_eq!(report.results.len(), 1, "{query}");
+    }
+}

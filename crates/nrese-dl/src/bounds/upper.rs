@@ -52,7 +52,7 @@
 //!   then derives no clash: such clauses are listed in [`Program::unchecked`], and a
 //!   clash-free U1 proves consistency only without them ([`Program::proves_consistency`]).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use nrese_owl::{Axiom, Characteristic, ClassExpr, Normalised, ObjProp, Ontology, Term};
 
@@ -133,9 +133,7 @@ pub fn compile_with(
         nominals: HashMap::new(),
         max_skolems: options.max_skolems.max(Options::MIN_SKOLEMS),
         ranges,
-        compares_values: !normalised.facts.not_data.is_empty()
-            || (ontology.axioms.iter())
-                .any(|a| matches!(a, Axiom::HasKey(_, _, data) if !data.is_empty())),
+        skolem_data: Vec::new(),
         top_object,
         top_data,
     };
@@ -160,6 +158,7 @@ pub fn compile_with(
     c.thing(named_individual);
     c.bottom([bottom_object, bottom_data]);
     c.equality();
+    c.compared_values();
     c.program.incomplete.sort_unstable();
     c.program.incomplete.dedup();
     c.program
@@ -176,9 +175,9 @@ pub(super) struct Compiler<'a> {
     pub(super) max_skolems: u32,
     /// The data ranges, as the datatype theory evaluates them (definitions included).
     pub(super) ranges: Ranges,
-    /// Whether data values are compared (negative data assertions, keys over data
-    /// properties): U1 compares them by term.
-    pub(super) compares_values: bool,
+    /// The clauses whose data existential derives a Skolem constant, with its property
+    /// ([`Compiler::compared_values`]).
+    pub(super) skolem_data: Vec<(usize, Term)>,
     /// `owl:topObjectProperty` and `owl:topDataProperty`, which hold for every pair.
     pub(super) top_object: Term,
     pub(super) top_data: Term,
@@ -571,6 +570,59 @@ impl Compiler<'_> {
                 approximations: Approximations::default(),
             };
             self.push(name.to_owned(), body, vec![head], provenance);
+        }
+    }
+
+    /// The clauses whose Skolem data value a rule compares become unchecked: the constant
+    /// stands for some value of the range, not the one a negative assertion or a key
+    /// compares, so their contradiction derives no clash. A value of `e` is also one of
+    /// every property a rule moves it to (`x e y → x d y`). A rule that moves it out of
+    /// an object position (`x e y → y r x`, inverses the reader accepts on data properties
+    /// outside OWL 2 DL) counts as comparing it: the closure follows objects only.
+    fn compared_values(&mut self) {
+        self.program.find_compared();
+        // The properties whose values a rule compares, there or where they are moved.
+        let mut read: HashSet<Term> = self.program.compared_predicates().clone();
+        // The properties whose values a rule moves to each property.
+        let mut into: HashMap<Term, Vec<Term>> = HashMap::new();
+        for rule in &self.program.rules {
+            for from in &rule.body {
+                let [_, Slot::Const(e), value @ Slot::Var(_)] = from.0 else {
+                    continue;
+                };
+                for to in rule.head.iter().filter(|to| to.0.contains(&value)) {
+                    match to.0 {
+                        [s, Slot::Const(d), _] if s != value => {
+                            if d != e {
+                                into.entry(d).or_default().push(e);
+                            }
+                        }
+                        _ => {
+                            read.insert(e);
+                        }
+                    }
+                }
+            }
+        }
+        let mut todo: Vec<Term> = read.iter().copied().collect();
+        while let Some(d) = todo.pop() {
+            for &e in into.get(&d).into_iter().flatten() {
+                if read.insert(e) {
+                    todo.push(e);
+                }
+            }
+        }
+        // One entry a clause, in clause order, as the clauses' compile lists them.
+        let unchecked = &mut self.program.unchecked;
+        for &(clause, property) in &self.skolem_data {
+            if read.contains(&property)
+                && let Err(at) = unchecked.binary_search_by_key(&clause, |&(c, _)| c)
+            {
+                unchecked.insert(
+                    at,
+                    (clause, "a data existential's value a comparison reads"),
+                );
+            }
         }
     }
 }

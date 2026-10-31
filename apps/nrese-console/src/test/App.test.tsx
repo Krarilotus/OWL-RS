@@ -100,12 +100,12 @@ test("renders console sections", async () => {
   expect(screen.getByText(/Inferred statements/i)).toBeInTheDocument();
 });
 
-test("answers not shown to be complete don't read as a success", async () => {
+test.each(["sound-only", "unsound", "not-certified"] as const)("%s answers don't read as a success", async (status) => {
   vi.mocked(api.runQuery).mockResolvedValueOnce({
     ok: true,
     status: 200,
     body: "false",
-    completeness: { status: "sound-only", header: 'sound-only; regime=owl2-dl; reasons="dl: open"' },
+    completeness: { status, header: status },
   });
   render(
     <QueryClientProvider client={new QueryClient()}>
@@ -114,5 +114,5 @@ test("answers not shown to be complete don't read as a success", async () => {
   );
   fireEvent.click(await screen.findByRole("button", { name: /Run query/i }));
   expect(await screen.findByText("incomplete")).toBeInTheDocument();
-  expect(screen.getByText(/answers may be missing/i)).toBeInTheDocument();
+  expect(screen.getByText(status === "sound-only" ? /answers may be missing/i : /answers may be missing or incorrect/i)).toBeInTheDocument();
 });

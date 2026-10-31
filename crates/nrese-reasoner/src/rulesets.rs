@@ -68,7 +68,11 @@ pub const ALL: [Ruleset; 6] = [
 ///
 /// The fingerprint also covers the rule text and the relations a GraphDB ruleset's contexts
 /// compile to; a change of those names needs no bump.
-pub const SEMANTICS_VERSION: u32 = 2;
+///
+/// 3 (28 Oct 2026): version 2's maintenance could recompute a split without what schema
+/// statements alone derive (`C owl:equivalentClass C` from `C rdfs:subClassOf C` once
+/// `C owl:sameAs D` went), so a closure it wrote is no longer read as current.
+pub const SEMANTICS_VERSION: u32 = 3;
 
 /// A part of the evaluation semantics only some user rulesets use ([`SEMANTICS_VERSION`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

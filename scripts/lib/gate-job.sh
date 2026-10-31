@@ -8,18 +8,17 @@
 # (~/fleet/cache/owlrs-gate/wt: only what changed gets new mtimes, so builds stay incremental),
 # after checking that its checkout is TREE and its file list hashes to LIST_HASH. One gate at a
 # time per host (a lock): gates share the host's one cache with /verify
-# (Harness/notes/2026-10-20-host-cache-contract.md): a target directory per toolchain release
-# (target-<release>, kept within NRESE_GATE_BUDGET_GB by scripts/cargo-guarded.sh), each entry's
-# last use recorded, one sweep for the whole cache (NRESE_HOST_CACHE_GB).
+# (Harness/notes/2026-10-20-host-cache-contract.md): a target directory of the gates' own per
+# toolchain release (target-gate-<release>, kept within NRESE_GATE_BUDGET_GB by
+# scripts/cargo-guarded.sh), each entry's last use recorded, one sweep for the whole cache
+# (NRESE_HOST_CACHE_GB).
 #
 # Its tools: the tree's toolchain (rust-toolchain.toml), the pinned cargo-nextest and Miri
 # nightly (scripts/lib/gate-tools.txt) and the suite's Python packages, all installed once,
 # nextest and Python's under the cache directory. No step reaches a Docker daemon.
 #
 # Results ($FLEET_OUT): gate.log, the run's output; check.log, check.sh's; attempt, this
-# attempt's name; gate.json, what it was (tier, tree, file list, toolchain and flags, the CPU
-# `native` resolved to, the host (its name and the fleet's), the job and attempt, each step's exit
-# code and seconds from check.sh's summary, and whether the run left tracked files changed).
+# attempt's name; gate.json, what it was (scripts/lib/gate-record.py).
 # Exit: check.sh's; 3 when the run couldn't be made (no verdict: the push waits).
 set -u
 mode=$1 tree=$2 list_hash=$3
@@ -145,9 +144,11 @@ identity=$(gate_identity) || infra "no rustc"
 
 # The host's one cache (Harness/notes/2026-10-20-host-cache-contract.md, shared with /verify): a
 # target directory per toolchain release, each entry's last use recorded, one sweep for all, run
-# after the work so it counts what the work added.
+# after the work so it counts what the work added. The target is the gates' alone: cargo decides
+# freshness by mtimes, so a build from another checkout in it (/verify's, which wrote
+# target-<release> until 26 Oct 2026) could stand in for the tree's own code.
 release=$(rustc -vV | sed -n 's/^release: //p')
-export CARGO_TARGET_DIR="$cache/target-$release"
+export CARGO_TARGET_DIR="$cache/target-gate-$release"
 export NRESE_TARGET_BUDGET_GB=${NRESE_GATE_BUDGET_GB:-40}
 used=("$CARGO_TARGET_DIR" "$py")
 for entry in "${used[@]}"; do mkdir -p "$entry" && echo "$EPOCHSECONDS" > "$entry/.last-used"; done
@@ -208,27 +209,6 @@ GATE_TIER=$mode GATE_TREE=$tree GATE_LIST=$list_hash GATE_IDENTITY=$identity GAT
   GATE_CPU=$(gate_cpu) GATE_HOST=$(hostname) GATE_NEXTEST=$(cargo nextest --version 2> /dev/null | head -1) \
   GATE_CHANGED=$(git status --porcelain --untracked-files=no) GATE_SECONDS=$((SECONDS - began)) GATE_PEAK=$peak \
   GATE_JOB=${FLEET_JOB:-} GATE_FLEET_HOST=${FLEET_HOST:-} GATE_ATTEMPT=$attempt \
-  python3 - "$out" << 'EOF'
-import json, os, re, sys
-e, out = os.environ, sys.argv[1]
-# The steps as check.sh's summary lists them: `  <code>  <name> (<seconds> s)` after `=== summary`.
-steps, summary = [], False
-for line in open(f"{out}/check.log", encoding="utf-8", errors="replace"):
-    if line.startswith("=== summary"):
-        summary, steps = True, []
-        continue
-    m = re.match(r"^  (\d+)  (.*) \((\d+) s\)$", line.rstrip("\n")) if summary else None
-    if m:
-        steps.append({"name": m.group(2), "code": int(m.group(1)), "seconds": int(m.group(3))})
-json.dump({
-    "tier": e["GATE_TIER"], "tree": e["GATE_TREE"], "list_hash": e["GATE_LIST"],
-    "identity": e["GATE_IDENTITY"], "w3c_optional": bool(e.get("NRESE_W3C_OPTIONAL")),
-    "cpu": e["GATE_CPU"], "host": e["GATE_HOST"], "nextest": e["GATE_NEXTEST"],
-    "job": e["GATE_JOB"], "fleet_host": e["GATE_FLEET_HOST"], "attempt": e["GATE_ATTEMPT"],
-    "summary": summary, "steps": steps, "code": int(e["GATE_CODE"]), "tracked_changes": e["GATE_CHANGED"],
-    "seconds": int(e["GATE_SECONDS"]),
-    "memory_peak_gb": round(int(e["GATE_PEAK"]) / 2**30, 2) if e.get("GATE_PEAK") else None,
-}, open(f"{out}/gate.json", "w"), indent=1)
-EOF
+  python3 "$tool/scripts/lib/gate-record.py" "$out"
 sweep
 exit $code

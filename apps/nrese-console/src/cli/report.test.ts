@@ -50,6 +50,16 @@ describe("completeness", () => {
       warnings: ["completeness=sound-only; regime=owl2-dl"],
       exitCode: 0,
     });
+    const uncertified = { ...soundOnly, completeness: { status: "not-certified" as const, header: "not-certified" } };
+    expect(textReport(uncertified)).toEqual({
+      lines: ["status=200", "false"],
+      warnings: ["completeness=not-certified; soundness and completeness are not certified; answers may be missing or incorrect"],
+      exitCode: 0,
+    });
+    expect(textReport(uncertified, true).exitCode).toBe(3);
+    expect(textReport({ ...uncertified, ok: false, status: 400 }, true)).toEqual({
+      lines: ["status=400", "false"], exitCode: 1,
+    });
   });
 
   test("--require-complete fails on it, with its own exit status", () => {

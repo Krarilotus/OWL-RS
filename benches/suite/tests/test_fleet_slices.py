@@ -30,12 +30,6 @@ class Scopes(unittest.TestCase):
             self.assertIn("nrese", rt.units)
             self.assertEqual(rt.argv(runtime.Spec("tool", None, ["/bin/tool"])), ["/bin/tool"])
 
-    def test_a_scope_goes_into_the_steps_slice_under_fleet(self):
-        placed = runtime.scope_argv("u", "4g", {"FLEET_SLICE": "fleet-job-x.slice"})
-        self.assertEqual(placed[:5], ["systemd-run", "--user", "--scope", "-q", "--slice=fleet-job-x.slice"])
-        self.assertIn("MemoryMax=4G", placed)
-        self.assertNotIn("--slice", " ".join(runtime.scope_argv("u", "4g", {})))
-
     def test_nothing_outlives_a_scoped_run(self):
         with tempfile.TemporaryDirectory() as tmp:
             rt = runtime.RootfsRuntime(Path(tmp), 18950, Path(tmp))

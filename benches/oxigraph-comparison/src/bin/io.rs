@@ -267,6 +267,7 @@ fn main() {
                 RdfFormat::RdfXml => oxrdfxml::RdfXmlParser::new().for_slice(bytes).count_ok(),
                 RdfFormat::JsonLd => oxjsonld::JsonLdParser::new().for_slice(bytes).count_ok(),
                 RdfFormat::N3 => oxttl::N3Parser::new().for_slice(bytes).count_ok(),
+                RdfFormat::BinaryRdf => unreachable!("not compared: Oxigraph reads no Binary RDF"),
             }
         };
         let theirs_reader = |bytes: &[u8]| -> usize {
@@ -282,6 +283,7 @@ fn main() {
                 RdfFormat::RdfXml => oxrdfxml::RdfXmlParser::new().for_reader(reader).count_ok(),
                 RdfFormat::JsonLd => oxjsonld::JsonLdParser::new().for_reader(reader).count_ok(),
                 RdfFormat::N3 => oxttl::N3Parser::new().for_reader(reader).count_ok(),
+                RdfFormat::BinaryRdf => unreachable!("not compared: Oxigraph reads no Binary RDF"),
             }
         };
         let name = format.name();

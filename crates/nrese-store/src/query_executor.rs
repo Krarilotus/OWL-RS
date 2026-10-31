@@ -160,10 +160,10 @@ impl PreparedQuery {
             query,
             text: request.query.clone(),
             dataset: protocol_dataset(&request.default_graphs, &request.named_graphs)?,
-            read_model: match !request.scope.sees_inferred() {
+            read_model: match request.scope.model() {
                 // Without the inferred statements: what was asserted, whatever was asked.
-                true => ReadModel::Asserted,
-                false => request
+                ReadModel::Asserted => ReadModel::Asserted,
+                _ => request
                     .read_model
                     .or(from_protocol)
                     .or(from_query)
@@ -599,19 +599,15 @@ pub(crate) fn explain_prepared(
 }
 
 /// The plan `prepared` would run as on `view`, with estimated rows, without running it
-/// (EXPLAIN).
+/// (EXPLAIN), drawing from the request's envelope `memory` as its run would.
 pub(crate) fn plan_prepared(
     view: &impl ReadView,
     prepared: &PreparedQuery,
     store: &StoreSettings,
     cancellation: &CancellationToken,
+    memory: &nrese_exec::Envelope,
 ) -> StoreResult<PlannedQuery> {
-    let options = query_options(
-        prepared,
-        store,
-        cancellation,
-        &nrese_exec::Envelope::unlimited(),
-    );
+    let options = query_options(prepared, store, cancellation, memory);
     Ok(plan_query(view, &prepared.query, &options)?)
 }
 

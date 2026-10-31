@@ -1303,7 +1303,9 @@ def samples(case: dict, result: dict) -> dict:
             if value is not None:
                 series.setdefault(r.get("_sweep") or "-", []).append(value * scale)
         return series
-    if result.get("phase_samples") and any(result["phase_samples"].values()):
+    # The DL tools' series are their phases (case_manifest plans them so); a perf lab's phases
+    # (its support mode) are not its series: those are the metric's (`_`) or the sweep's.
+    if case.get("tool", "perf_lab") != "perf_lab" and result.get("phase_samples") and any(result["phase_samples"].values()):
         return {k: v for k, v in result["phase_samples"].items() if v}
     if metric == "cold_ms":
         return cold_series(result, detailed=True)
@@ -1553,6 +1555,45 @@ def not_as_expected(records: list[dict], off_route_ok: bool = False) -> list[dic
             if r["status"] != r.get("expected_outcome", "ok") and r["status"] not in tolerated]
 
 
+def suite_rows(report: dict, cases: list[dict]) -> list:
+    """A run's records as the suite's result rows (suitekit/schema.py; `run --rows`, for a
+    workload the suite runs through its catalogued cases: suitekit/workloads.py `catalogued`):
+    per invocation a `query` row, item the case and its sweep entry, with its metric and peak,
+    `wrong` where a check failed; and for a run that ended without its report, a `failed` or
+    `timeout` row for that invocation, its status and known issue in the note."""
+    from suitekit.schema import Result
+    from suitekit.workloads import FAST_REGIMES
+    by_name = {c["name"]: c for c in cases}
+    base = dict(date=report["started"][:16], host=report["machine"].get("host", ""),
+                runtime="process" if report["runtime"] == "native" else "docker", system="nrese",
+                version=(report["git"].get("commit") or "-")[:12], publish="free", task="query")
+    rows = []
+    for record in report["records"]:
+        case = by_name[record["case"]]
+        where = dict(base, workload=case.get("workload", "fast"), tier=case.get("tier", case["name"]),
+                     regime=FAST_REGIMES.get(case["semantics"], "custom"), run=record["rep"])
+        sweep = case.get("sweep", [[]])
+        observations = record.get("observations", [])
+        for o in observations:
+            checks = o.get("checks", [])
+            status = "wrong" if any(c["ok"] is False for c in checks) else "ok" if o.get("exit") == 0 else "failed"
+            note = "; ".join([f"page cache {o['identity']['cache']}",
+                              *(f"{c['path']} {c['got']} (expected {c['expected']})" for c in checks)])
+            rows.append(Result(**where, item=" ".join([case["name"], *sweep[o["identity"]["sweep"]]]),
+                               status=status, ms="" if o.get("metric") is None else o["metric"],
+                               peak_mib=o.get("peak_mib") or "", note=note))
+        if record["status"] in ("ok", "wrong", "off-route"):
+            continue
+        planned = invocation_plan(case, record.get("page_cache"))
+        ended = planned[len(observations)] if len(observations) < len(planned) else None
+        issue = record.get("verdict", {}).get("issue")
+        note = "; ".join([*([f"page cache {ended['cache']}"] if ended else []), record["status"],
+                          *([f"expected: {issue}"] if issue else []), *record.get("notes", [])])
+        rows.append(Result(**where, item=" ".join([case["name"], *(sweep[ended["sweep"]] if ended else [])]),
+                           status="timeout" if record["status"] == "timeout" else "failed", note=note[:300]))
+    return rows
+
+
 def run(args) -> int:
     if RUNTIME == "native":
         try:
@@ -1594,6 +1635,7 @@ def run(args) -> int:
     REPORTS.mkdir(parents=True, exist_ok=True)
     BASELINES.mkdir(parents=True, exist_ok=True)
     out = (Path(args.out) if args.out else REPORTS / f"{started:%Y-%m-%d}-{label}.json").resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
     report = {"label": label, "started": started.isoformat(timespec="seconds"), "started_ns": time.time_ns(),
               "git": manifest.git(ROOT), "machine": manifest.machine(RUNTIME, ROOT), "runtime": RUNTIME,
               "reps": args.reps, "planned_cases": [c["name"] for c in cases],
@@ -1657,6 +1699,11 @@ def run(args) -> int:
     report["duration_s"] = round((datetime.datetime.now() - started).total_seconds(), 1)
     out.write_text(json.dumps(report, indent=1), encoding="utf-8")
     kept = write_compact(out, BASELINES / out.name)
+    if getattr(args, "rows", None):
+        from suitekit.schema import Writer
+        writer = Writer(Path(args.rows))
+        for row in suite_rows(report, cases):
+            writer.write(row)
     bad = not_as_expected(report["records"], getattr(args, "off_route_ok", False))
     # A run of nothing measured nothing (an A/B's side whose binary refused every case).
     if not report["records"]:
@@ -1993,6 +2040,9 @@ def main() -> int:
             s.add_argument("--reps", type=int, default=2)
             s.add_argument("--label")
             s.add_argument("--out")
+            s.add_argument("--rows", metavar="CSV",
+                           help="also the records as the suite's result rows, appended to CSV (a catalogued "
+                                "workload's kit step: suitekit/workloads.py catalogued)")
             s.add_argument("--off-route-ok", action="store_true",
                            help="an A/B's base: a case off its expected route (an operator the base "
                                 "hasn't) is a measured run, not a failure; failed, wrong or missing "

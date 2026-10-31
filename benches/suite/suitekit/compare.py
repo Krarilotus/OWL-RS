@@ -43,6 +43,7 @@ import statistics
 from pathlib import Path
 
 from . import hosts
+from .answers import TimingVerdicts, timed as answer_timed
 from .schema import read
 from .summary import Item, Pair, estimate, summarise
 
@@ -559,16 +560,15 @@ def manifest_identities(paths: list[Path]) -> list[dict | None]:
     return out
 
 
-def verdicts(paths: list[Path]) -> dict[tuple, str]:
-    """(workload, tier, regime, query, system) -> its answer verdict, from the answers.json
-    beside each results file."""
-    out = {}
+def verdicts(paths: list[Path]) -> TimingVerdicts:
+    """The answer verdicts of the answers.json beside each results file, all of them, as timing
+    reads them (answers.TimingVerdicts)."""
+    records = []
     for path in dict.fromkeys(p.resolve() for p in paths):
         answers = path.parent / "answers.json"
         if answers.exists():
-            for v in json.loads(answers.read_text(encoding="utf-8")).get("verdicts", []):
-                out[(v["workload"], v["tier"], v["regime"], v["query"], v["system"])] = v["verdict"]
-    return out
+            records += json.loads(answers.read_text(encoding="utf-8")).get("verdicts", [])
+    return TimingVerdicts(records)
 
 
 def verdict(base, new, threshold: float, min_abs: float) -> str:
@@ -593,8 +593,10 @@ def eligible(item: Item, name: str, pair: Pair) -> bool:
 
 
 def compare_pairs(base: dict[tuple, Pair], new: dict[tuple, Pair], threshold: float, min_ms: float, out: Out,
-                  kinds: tuple[dict, dict] = ({}, {}), answers: tuple[dict, dict] = ({}, {})) -> dict[str, int]:
+                  kinds: tuple[dict, dict] = ({}, {}),
+                  answers: tuple[TimingVerdicts, TimingVerdicts] | None = None) -> dict[str, int]:
     """Suite pairs, pair by pair, with summary.py's estimator; the query verdicts' totals."""
+    answers = answers or (TimingVerdicts(), TimingVerdicts())
     totals = {"slower": 0, "faster": 0, "=": 0, "not comparable": 0}
     for k in sorted(k for k, pair in base.items() if pair.live and (k not in new or not new[k].live)):
         out.add("Missing", f"**Lost: pairs the baseline ran and the new run didn't:** {' '.join(k)}", True)
@@ -668,6 +670,16 @@ def compare_pairs(base: dict[tuple, Pair], new: dict[tuple, Pair], threshold: fl
                 if not (eligible(ib, name, b) and eligible(inn, name, n)):
                     totals["not comparable"] += 1
                     continue
+                # An answer the contract doesn't time earns no time, in either run: wrong,
+                # unchecked or another fault, also where the verdict didn't change (T8 PR #56).
+                answer = {run: found.of(key[0], key[1], pair.regime, name, key[2])
+                          for run, pair, found in (("base", b, answers[0]), ("new", n, answers[1]))}
+                untimed = [f"{a} in the {run} run" for run, a in answer.items() if not answer_timed(a)]
+                if untimed:
+                    out.add("Answers and completeness", f"- {title}: {name}{label}: not timed, its answer "
+                            + " and ".join(untimed))
+                    totals["not comparable"] += 1
+                    continue
                 sb, sn = ib.estimate(), inn.estimate()
                 if not (sb and sn):
                     totals["not comparable"] += 1
@@ -690,8 +702,9 @@ def compare_pairs(base: dict[tuple, Pair], new: dict[tuple, Pair], threshold: fl
                 out.add("Time", f"  - {name}{label}: {fmt(sb[0])} -> {fmt(sn[0])} ms ({ratio:.2f}x, {v}; noise {noise})",
                         v == "slower")
     # Each system's answers against its reference (answers.json), where both runs have them.
-    for k in sorted(set(answers[0]) & set(answers[1])):
-        before, after = answers[0][k], answers[1][k]
+    recorded = [found.verdicts() for found in answers]
+    for k in sorted(set(recorded[0]) & set(recorded[1])):
+        before, after = recorded[0][k], recorded[1][k]
         if before != after:
             worse = before == "ok" and after != "ok"
             out.add("Answers and completeness", f"- {k[4]} {k[0]} {k[1]} {k[3]}: answer verdict {before} -> {after}"
