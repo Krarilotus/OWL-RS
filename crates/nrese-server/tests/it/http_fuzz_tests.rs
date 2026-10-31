@@ -9,7 +9,7 @@
 //! small seeds (SPARQL, RDF in each syntax, JSON, forms) and their mutations. No seed
 //! reaches the network: no `SERVICE`, no `LOAD`, no URLs to import.
 //!
-//! `NRESE_FUZZ_CASES` (default 1,500) and `NRESE_FUZZ_SEED` (`scripts/fuzz-campaign.sh`
+//! `NRESE_FUZZ_CASES` (default 1,500; 0 is refused) and `NRESE_FUZZ_SEED` (`scripts/fuzz-campaign.sh`
 //! varies it) replay a run.
 
 use std::collections::BTreeMap;
@@ -411,6 +411,8 @@ async fn random_requests_with_tokens_get_answers_not_server_errors() {
 async fn fuzz(policy: nrese_server::policy::PolicyConfig, tokens: &[&str], stream: u64) {
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
     let cases = env("NRESE_FUZZ_CASES").unwrap_or(1500);
+    // A campaign of no requests would pass on its two liveness checks alone.
+    assert!(cases > 0, "NRESE_FUZZ_CASES=0: no request to send");
     let seed = env("NRESE_FUZZ_SEED").unwrap_or(0x2026_1005_1700);
     let mut rng = Rng(seed ^ stream.wrapping_mul(0x9E37_79B9_7F4A_7C15));
     let paths = paths();
@@ -428,6 +430,7 @@ async fn fuzz(policy: nrese_server::policy::PolicyConfig, tokens: &[&str], strea
     .unwrap();
     let mut by_status: BTreeMap<u16, usize> = BTreeMap::new();
     let mut failures = Vec::new();
+    let mut sent = 0u64;
     for case in 0..cases {
         let mut request = request(&mut rng, &paths);
         if !tokens.is_empty() {
@@ -438,6 +441,7 @@ async fn fuzz(policy: nrese_server::policy::PolicyConfig, tokens: &[&str], strea
         }
         let head = request.method() == Method::HEAD;
         let line = format!("case {case}: {} {}", request.method(), request.uri());
+        sent += 1;
         let answer =
             tokio::time::timeout(Duration::from_secs(30), app.clone().oneshot(request)).await;
         let Ok(response) = answer else {
@@ -488,7 +492,7 @@ async fn fuzz(policy: nrese_server::policy::PolicyConfig, tokens: &[&str], strea
             }
         }
     }
-    eprintln!("{cases} requests (seed {seed:#x}), by status: {by_status:?}");
+    eprintln!("{sent} of {cases} requests sent (seed {seed:#x}), by status: {by_status:?}");
     // Still serving.
     for uri in [
         "/readyz",
