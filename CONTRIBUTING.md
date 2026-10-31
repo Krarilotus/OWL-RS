@@ -53,7 +53,8 @@ that only deletes refs needs no gate. The merge check's Windows part runs the sa
 fleet host: the whole workspace built, all its tests, its doc tests and the suite contracts. A
 commit whose
 inputs (every file but the docs no other file names, `scripts/lib/gate-key.sh`) passed before
-carries that pass.
+carries that pass. A push to `refactor/engine-v2` needs both: the hook runs the Windows part for
+the pushed commit too, so run it first (the merge check does): its pass then serves at once.
 Build through `scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most `NRESE_BUILD_SLOTS`
 builds at once per machine). Validate in batches: quick checks while
 working, the push tier once per batch. Measure counts first; time only to answer a stated
