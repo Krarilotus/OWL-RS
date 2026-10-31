@@ -492,15 +492,16 @@ impl Classes {
     }
 
     /// How many quads a canonical stored quad stands for, given the pattern's constants
-    /// (a constant stands for itself).
+    /// (a constant stands for itself); `u64::MAX` for that many or more, never a wrapped
+    /// smaller number (PR #70 fix check 1 F2: a class of 2^22 identities wrapped to 0).
     pub(crate) fn multiplicity(&self, quad: &EncodedQuad, pattern: &QuadPattern) -> u64 {
         let size = |bound: Option<TermId>, id: TermId| match bound {
             Some(_) => 1,
             None => self.expansion(id.raw()).map_or(1, |m| m.len() as u64),
         };
         size(pattern.subject, quad.subject)
-            * size(pattern.predicate, quad.predicate)
-            * size(pattern.object, quad.object)
+            .saturating_mul(size(pattern.predicate, quad.predicate))
+            .saturating_mul(size(pattern.object, quad.object))
     }
 
     /// How many copies [`Self::expand`] gives `quad` for `pattern`: the product of its
@@ -877,5 +878,22 @@ mod tests {
         assert_eq!(expanded.len(), 3 + 1);
         assert!(expanded.iter().all(|q| q.subject.raw() == 30));
         assert_eq!(classes.multiplicity(&quad(10, 5, 20), &pattern), 3);
+    }
+
+    /// One class of 2^22 identities in all three places stands for 2^66 quads, more than a
+    /// `u64` holds: the count reads as `u64::MAX`, not as a wrapped smaller one (it wrapped
+    /// to 0, so a snapshot holding such a class read as empty: PR #70 fix check 1 F2).
+    #[test]
+    fn multiplicity_past_u64_reads_as_the_maximum() {
+        let r = 1;
+        let mut classes = Classes::default();
+        classes.members.insert(r, (r..r + (1 << 22)).collect());
+        let all = QuadPattern::all();
+        assert_eq!(classes.multiplicity(&quad(r, r, r), &all), u64::MAX);
+        let bound = QuadPattern {
+            subject: Some(TermId::from_raw(r)),
+            ..all
+        };
+        assert_eq!(classes.multiplicity(&quad(r, r, r), &bound), 1 << 44);
     }
 }
