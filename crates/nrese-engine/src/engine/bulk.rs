@@ -292,18 +292,29 @@ impl<'e> BulkLoad<'e> {
                 (Next::Built(next), summary)
             }
             BulkMode::Append => {
-                let inserts: Vec<EncodedQuad> = quads
-                    .into_par_iter()
-                    .filter(|quad| !base.stack_contains(Stack::Asserted, quad))
-                    .collect();
+                // Into a store asserting nothing every quad is new: moved, not filtered into
+                // a copy, a second array of 32 bytes a quad beside the first while the
+                // index is built (DBpedia core's load peaked 2 GB higher, as on main;
+                // fleet pm-ib1801-1, 21 Oct 2026).
+                let inserts: Vec<EncodedQuad> = match current.asserted.len() {
+                    0 => quads,
+                    _ => quads
+                        .into_par_iter()
+                        .filter(|quad| !base.stack_contains(Stack::Asserted, quad))
+                        .collect(),
+                };
                 // Disjointness: newly asserted statements leave the inferred stack.
-                let explicit: Vec<EncodedQuad> = inserts
-                    .par_iter()
-                    .filter(|quad| {
-                        quad.graph.is_default_graph() && base.stack_contains(Stack::Inferred, quad)
-                    })
-                    .copied()
-                    .collect();
+                let explicit: Vec<EncodedQuad> = match current.inferred.len() {
+                    0 => Vec::new(),
+                    _ => inserts
+                        .par_iter()
+                        .filter(|quad| {
+                            quad.graph.is_default_graph()
+                                && base.stack_contains(Stack::Inferred, quad)
+                        })
+                        .copied()
+                        .collect(),
+                };
                 let summary = CommitSummary {
                     revision: current.revision + 1,
                     inserted: inserts.len() as u64,
