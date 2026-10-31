@@ -17,7 +17,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-SUITE = Path(__file__).resolve().parent.parent
+import isolation
+
+SUITE =Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("queue_runner", SUITE / "queue.py")
 queue = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(queue)
@@ -36,11 +38,9 @@ def job(**changes):
 
 
 def fixture_environment():
-    """A foreign repository must never inherit the caller's hook-local Git context."""
-    discovery = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    local = subprocess.check_output(["git", "rev-parse", "--local-env-vars"],
-                                    env=discovery, text=True).splitlines()
-    return {k: v for k, v in os.environ.items() if k not in local}
+    """A foreign repository must never inherit the caller's hook-local Git context: the suite's
+    git policy, whatever a test has set in os.environ since."""
+    return isolation.inherit()
 
 
 class Windows(unittest.TestCase):
