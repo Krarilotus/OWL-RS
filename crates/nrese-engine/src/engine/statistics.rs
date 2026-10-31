@@ -91,6 +91,10 @@ pub(crate) struct Statistics {
     /// is the same version (a transaction's pending snapshot shares its base's revision
     /// number, not its content).
     nodes: Mutex<Vec<NodeCount>>,
+    /// Heavy groups of patterns at versions, exact, held as the node counts are.
+    heavy: Mutex<Vec<HeavyGroups>>,
+    /// Walks for heavy groups begun: what the tests count.
+    heavy_walks: AtomicU64,
     /// Per read model, the default graph's characteristic sets.
     sets: Mutex<HashMap<ReadModel, Sets>>,
     /// Per read model, the build of its sets under way: one at a time, and planners that
@@ -147,6 +151,20 @@ type NodeCount = (Weak<Version>, ReadModel, GraphSelector, u64);
 /// Node counts kept; the cache is cleared when it fills up.
 const NODE_ENTRIES: usize = 64;
 
+/// A version (held weakly), what was read of it (the pattern as read, in a permutation, the
+/// groups past a match count), and those groups.
+type HeavyGroups = (
+    Weak<Version>,
+    ReadModel,
+    QuadPattern,
+    Permutation,
+    u64,
+    Arc<[(TermId, u64)]>,
+);
+
+/// Heavy-group lists kept; the cache is cleared when it fills up.
+const HEAVY_ENTRIES: usize = 256;
+
 impl Statistics {
     /// The number of distinct subjects and objects of `graphs` in `model` at `version`:
     /// cached, or computed by `count` (`None`: it can't be, and nothing is kept).
@@ -172,6 +190,57 @@ impl Statistics {
         }
         nodes.push((Arc::downgrade(version), model, graphs, n));
         Some(n)
+    }
+
+    /// The groups of `pattern` (as read) in `permutation` at `version` in `model` that more
+    /// than `min` quads match: kept, or walked by `walk` (`None`: it can't be, and nothing
+    /// is kept).
+    pub(crate) fn heavy_groups(
+        &self,
+        version: &Arc<Version>,
+        model: ReadModel,
+        pattern: QuadPattern,
+        permutation: Permutation,
+        min: u64,
+        walk: impl FnOnce() -> Option<Vec<(TermId, u64)>>,
+    ) -> Option<Arc<[(TermId, u64)]>> {
+        let found = self
+            .heavy
+            .lock()
+            .iter()
+            .find_map(|(weak, m, p, perm, n, groups)| {
+                (*m == model
+                    && *p == pattern
+                    && *perm == permutation
+                    && *n == min
+                    && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(version)))
+                .then(|| Arc::clone(groups))
+            });
+        if found.is_some() {
+            return found;
+        }
+        self.heavy_walks.fetch_add(1, Ordering::Relaxed);
+        let groups: Arc<[(TermId, u64)]> = walk()?.into();
+        let mut heavy = self.heavy.lock();
+        heavy.retain(|(weak, ..)| weak.strong_count() > 0);
+        if heavy.len() >= HEAVY_ENTRIES {
+            heavy.clear();
+        }
+        heavy.push((
+            Arc::downgrade(version),
+            model,
+            pattern,
+            permutation,
+            min,
+            Arc::clone(&groups),
+        ));
+        Some(groups)
+    }
+
+    /// Walks for heavy groups begun ([`Self::heavy_groups`]).
+    #[cfg(test)]
+    pub(crate) fn heavy_walks(&self) -> u64 {
+        self.heavy_walks.load(Ordering::Relaxed)
     }
 
     /// The characteristic sets of the default graph in `model` (see the module docs): kept
@@ -528,6 +597,81 @@ mod tests {
             }
         }
         tx.commit().unwrap();
+    }
+
+    /// A read that expands equality classes has no heavy groups (its groups aren't the
+    /// index's), also where a read of the same version as stored walked and kept them: a
+    /// kept list answered both, and an empty one turned an expanding count's budget off
+    /// (Sol, P2 sol-loop r1 S1).
+    #[test]
+    fn an_expanding_read_has_no_heavy_groups_kept_for_a_stored_one() {
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let node = |name: &str| NamedNode::new_unchecked(format!("http://example.com/{name}"));
+        let mut tx = engine.transaction();
+        let rep = tx.intern(node("rep").as_ref().into());
+        let same_as = tx.intern(node("sameAs").as_ref().into());
+        let alias = tx.intern(node("alias").as_ref().into());
+        tx.insert_inferred(crate::EncodedTriple {
+            subject: alias,
+            predicate: same_as,
+            object: rep,
+        });
+        for i in 0..3 {
+            let object = node(&format!("o{i}"));
+            tx.insert(Quad::new(node("rep"), node("p"), object, GraphName::DefaultGraph).as_ref());
+        }
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let snapshot = engine.snapshot();
+        let heavy = |snapshot: &Snapshot| {
+            snapshot.heavy_groups_in(
+                ReadModel::Materialised,
+                &QuadPattern::all(),
+                Permutation::Spog,
+                1,
+            )
+        };
+        assert!(heavy(&snapshot.stored()).is_some_and(|groups| !groups.is_empty()));
+        assert_eq!(
+            heavy(&snapshot),
+            None,
+            "an expanding read walks no index groups"
+        );
+    }
+
+    /// A pattern's heavy groups are walked once per version: asked again, of the same
+    /// snapshot or another of the same version, they are the ones kept; a commit's version
+    /// walks again and finds what it holds. Walked per query, they made counting uniform
+    /// triangles 0.3 % more instructions than without them (fleet pm-p2-count-2, 31 Oct
+    /// 2026).
+    #[test]
+    fn heavy_groups_are_walked_once_per_version() {
+        let model = ReadModel::default();
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        // Subjects with three quads: every third, those past a minimum of two.
+        add(&engine, 0..300);
+        let statistics = Arc::clone(&engine.inner.shared.statistics);
+        let heavy = |snapshot: &Snapshot| {
+            snapshot
+                .heavy_groups_in(model, &QuadPattern::all(), Permutation::Spog, 2)
+                .expect("the default graph's subjects can be walked")
+        };
+        let snapshot = engine.snapshot();
+        let first = heavy(&snapshot);
+        assert_eq!(first.len(), 100);
+        assert!(first.iter().all(|&(_, n)| n == 3));
+        assert!(Arc::ptr_eq(&first, &heavy(&snapshot)));
+        assert!(Arc::ptr_eq(&first, &heavy(&engine.snapshot())));
+        assert_eq!(statistics.heavy_walks(), 1);
+        add(&engine, 300..330);
+        assert_eq!(heavy(&engine.snapshot()).len(), 110);
+        assert_eq!(statistics.heavy_walks(), 2);
+        assert_eq!(heavy(&snapshot).len(), 100, "the old version keeps its own");
+        assert_eq!(statistics.heavy_walks(), 2);
     }
 
     /// Holds the next build once its first scan is published: `planners` start, and the
