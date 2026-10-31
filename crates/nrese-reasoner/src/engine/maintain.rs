@@ -260,7 +260,7 @@ pub fn maintain(
         };
         // An interruption drops the transaction, these changes with it.
         if stop() {
-            return Err(delta::Interrupted);
+            return Err(delta::Interrupted::default());
         }
         // Only the difference is applied: O(stored + rebuilt closure) to sort and walk,
         // and a transaction update per fact that changed. A stored snapshot shares the old
@@ -310,7 +310,7 @@ pub fn maintain(
         }
         update.program = Some(after);
         if stop() {
-            return Err(delta::Interrupted);
+            return Err(delta::Interrupted::default());
         }
     }
     Ok(Maintenance {

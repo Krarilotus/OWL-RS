@@ -7,13 +7,13 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use nrese_exec::measure;
-use nrese_exec::memory::{process_limit, set_process_limit};
+use nrese_exec::memory::{READS_MEMORY, process_limit, set_process_limit};
 use nrese_reasoner::ReasonerService;
 use nrese_server::ai::AiSuggestionService;
 use nrese_server::auth::{AuthConfig, StaticBearerConfig};
 use nrese_server::policy::PolicyConfig;
 use nrese_server::{AppState, DeploymentPosture, ServerConfig, build_app};
-use nrese_store::{StoreConfig, StoreService};
+use nrese_store::{ProcessMemory, StoreConfig, StoreService};
 use tower::util::ServiceExt;
 
 #[global_allocator]
@@ -40,8 +40,15 @@ fn opening_repositories_and_system_stores_preserves_the_startup_policy() {
     // A nondefault ceiling, and then explicit disable. Neither may be replaced by a
     // default policy while AppState opens the system/access store.
     for limit in [u64::MAX, 0] {
-        config.store.process_memory_bytes = limit;
-        config.install_process_memory_policy();
+        config.store.process_memory_bytes = ProcessMemory::Bytes(limit);
+        let installed = config.install_process_memory_policy();
+        if limit != 0 && !READS_MEMORY {
+            // A limit this target can't read is refused at start-up, naming its setting.
+            let message = format!("{:#}", installed.unwrap_err());
+            assert!(message.contains("NRESE_PROCESS_MEMORY_BYTES"), "{message}");
+            continue;
+        }
+        installed.unwrap();
         let expected = (limit != 0).then_some(limit);
         let store = StoreService::new(config.store.clone()).unwrap();
         assert_eq!(process_limit(), expected);
@@ -58,21 +65,25 @@ fn opening_repositories_and_system_stores_preserves_the_startup_policy() {
         assert_eq!(process_limit(), expected, "system store reset the ceiling");
     }
     // Disabling an embedded watch does not bypass the host's explicit fallback.
-    config.store.process_memory_bytes = 1;
-    config.install_process_memory_policy();
+    config.store.process_memory_bytes = ProcessMemory::Bytes(1);
+    let installed = config.install_process_memory_policy();
+    if !READS_MEMORY {
+        let message = format!("{:#}", installed.unwrap_err());
+        assert!(message.contains("NRESE_PROCESS_MEMORY_BYTES"), "{message}");
+        return;
+    }
+    installed.unwrap();
     let store = StoreService::new(StoreConfig {
-        process_memory_bytes: 0,
+        process_memory_bytes: ProcessMemory::Bytes(0),
         ..StoreConfig::in_memory()
     })
     .unwrap();
     assert_eq!(process_limit(), Some(1));
-    if nrese_exec::memory::process_bytes().is_some() {
-        assert!(
-            store
-                .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
-                .is_err()
-        );
-    }
+    assert!(
+        store
+            .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
+            .is_err()
+    );
 }
 
 /// An app over an in-memory store whose graph `urn:n8:g` holds `n` statements about `n`

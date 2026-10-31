@@ -220,13 +220,18 @@ pub fn update<B: Base + ?Sized>(
 ) -> Update {
     match update_until(base, inserted, deleted, rules, cache, NEVER) {
         Ok(update) => update,
-        Err(Interrupted) => unreachable!("NEVER doesn't stop"),
+        Err(_) => unreachable!("NEVER doesn't stop"),
     }
 }
 
-/// [`update`] stopped by `stop` (the caller gave up, a deadline passed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Interrupted;
+/// [`update`] stopped by `stop` (the caller gave up, a deadline passed), or by the
+/// process's memory limit ([`super::eval::OperationStop`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Interrupted {
+    /// Why the process's memory limit stopped it, if that is what stopped it: past the
+    /// limit, or the memory unreadable.
+    pub memory: Option<nrese_exec::memory::MemoryStopCause>,
+}
 
 /// [`update`], polling `stop` between rounds and per job morsel. When it fires, the work
 /// so far is discarded: nothing has been applied, so the state stays as it was.
@@ -259,9 +264,38 @@ pub fn update_with<B: Base + ?Sized>(
     stop: Stop<'_>,
     policy: policy::Policy,
 ) -> Result<Update, Interrupted> {
-    // The process's memory limit stops it too, whatever the caller polls.
-    let stop: Stop<'_> = &|| stop() || super::eval::over_memory_limit();
-    let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
+    // The process's memory limit stops it too, whatever the caller polls; once stopped it
+    // stays stopped, so no morsel skipped is taken for done.
+    let stop = super::eval::OperationStop::new(stop);
+    update_body(
+        base,
+        inserted,
+        deleted,
+        rules,
+        cache,
+        &|| stop.fired(),
+        policy,
+    )
+    .map_err(|_| stop.interrupted())
+}
+
+/// [`update_with`]'s work, under the operation's latched `stop`.
+fn update_body<B: Base + ?Sized>(
+    base: &B,
+    inserted: &[Triple],
+    deleted: &[Triple],
+    rules: Rules<'_>,
+    cache: Option<&GroundProgram>,
+    stop: Stop<'_>,
+    policy: policy::Policy,
+) -> Result<Update, Interrupted> {
+    let check_stop = || {
+        if stop() {
+            Err(Interrupted::default())
+        } else {
+            Ok(())
+        }
+    };
     let mut result = Update::default();
     if policy.rebuilds_at_once() {
         result.policy.plan = policy::Plan::Rebuild;
@@ -485,7 +519,7 @@ pub fn update_with<B: Base + ?Sized>(
                         });
                     }
                     nrese_exec::graph::transitive_closure_until(&edges, stop)
-                        .ok_or(Interrupted)?
+                        .ok_or_else(Interrupted::default)?
                         .into_iter()
                         .collect()
                 } else {
@@ -825,7 +859,7 @@ pub fn update_with<B: Base + ?Sized>(
                 });
                 produced.extend(
                     nrese_exec::graph::transitive_closure_until(&all, stop)
-                        .ok_or(Interrupted)?
+                        .ok_or_else(Interrupted::default)?
                         .into_iter()
                         .map(|(s, o)| [s, p, o])
                         .filter(|&f| !state.contains(f)),

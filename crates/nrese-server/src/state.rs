@@ -471,11 +471,7 @@ fn open_access(
 ) -> anyhow::Result<nrese_store::access::AccessControl> {
     use anyhow::Context;
     use nrese_store::access::{AccessControl, Change, Principal};
-    let config = match template.mode {
-        StoreMode::OnDisk => nrese_store::StoreConfig::on_disk(template.data_dir.join("system")),
-        StoreMode::InMemory => nrese_store::StoreConfig::in_memory(),
-    };
-    let store = StoreService::with_runtime(config, Arc::clone(runtime))
+    let store = StoreService::with_runtime(access_config(template), Arc::clone(runtime))
         .context("the system store (access state)")?;
     let access = AccessControl::open(store, &policy.workspace_base)
         .map_err(|error| anyhow::anyhow!("the access state: {error}"))?;
@@ -501,4 +497,47 @@ fn open_access(
         }
     }
     Ok(access)
+}
+
+/// The system store's settings beside a default store with `template`'s: its memory policy
+/// is the default store's (the operator's setting, resolved as it opened), never a default
+/// of its own that no setting reaches.
+fn access_config(template: &nrese_store::StoreConfig) -> nrese_store::StoreConfig {
+    let config = match template.mode {
+        StoreMode::OnDisk => nrese_store::StoreConfig::on_disk(template.data_dir.join("system")),
+        StoreMode::InMemory => nrese_store::StoreConfig::in_memory(),
+    };
+    nrese_store::StoreConfig {
+        process_memory_bytes: template.process_memory_bytes,
+        ..config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nrese_store::memory::Unread;
+    use nrese_store::{ProcessMemory, StoreConfig};
+
+    /// DC-07 S1 (Sol, round 1): the system store takes the default store's memory policy.
+    /// With the limit switched off (0) it needs no reading, so a server whose memory can't
+    /// be read, and whose limits are all 0, opens its system store too.
+    #[test]
+    fn the_system_store_takes_the_default_stores_memory_policy() {
+        for template in [
+            StoreConfig::in_memory(),
+            StoreConfig::on_disk(std::path::PathBuf::from("unused")),
+        ] {
+            let template = StoreConfig {
+                process_memory_bytes: ProcessMemory::Bytes(0),
+                ..template
+            };
+            let policy = super::access_config(&template).process_memory_bytes;
+            assert_eq!(policy, ProcessMemory::Bytes(0), "{:?}", template.mode);
+            assert_eq!(
+                policy.resolve_with(true, || Err(Unread::Failed)).ok(),
+                Some(0),
+                "opens where memory isn't read"
+            );
+        }
+    }
 }
