@@ -698,8 +698,16 @@ fn a_canonical_view_counts_a_statement_renamed_onto_an_asserted_one_once() {
     assert_eq!(read, [EncodedQuad::new(rep, p, o, g)]);
     assert_eq!(canonical.count_in(model, &in_g), 1, "count in the graph");
     assert_eq!(canonical.count_in(model, &named), 1, "named graphs");
-    // The named statement and the inferred `alias sameAs rep`.
-    assert_eq!(canonical.len_in(model), 2, "length");
+    // What reads see: the named statement; the inferred `alias sameAs rep` is held but not
+    // visible, so the length, which counts what the stacks hold, is one more (PR #65 r1 F1).
+    let all = QuadPattern::all();
+    assert_eq!(
+        canonical.quads_for_pattern_in(model, &all).count(),
+        1,
+        "scan"
+    );
+    assert_eq!(canonical.count_in(model, &all), 1, "count");
+    assert_eq!(canonical.len_in(model), 2, "held");
     assert_eq!(
         canonical.group_counts_in(model, &in_g, Permutation::Gspo),
         Some(vec![(rep, 1)]),

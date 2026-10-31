@@ -919,7 +919,13 @@ impl Snapshot {
         self.len_in(ReadModel::Materialised)
     }
 
-    /// Number of quads visible in `model`. O(1); exact because the stacks are disjoint.
+    /// Number of quads `model`'s stacks hold. O(1); exact because the stacks are disjoint.
+    /// It is the number visible in `model` where reads take the stacks as they are. Under
+    /// equality ([`crate::Engine::set_equality`]) they don't: reads skip the default graph's
+    /// statements that name an alias (the inferred `alias sameAs representative` among
+    /// them) and expand what representatives hold to every identity, so the visible number
+    /// may be lower or higher; over [`Self::with_canonical_equality`], which expands
+    /// nothing, it is at most this one. [`Self::count_in`] counts what reads see.
     pub fn len_in(&self, model: ReadModel) -> u64 {
         Stack::ALL
             .into_iter()
