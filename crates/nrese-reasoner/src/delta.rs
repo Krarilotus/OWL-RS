@@ -187,7 +187,8 @@ impl<B: Base + ?Sized> Source for Overlay<'_, B> {
         let seg = seg.plain();
         let extra = self.extra.estimate(pattern, seg);
         match seg {
-            Seg::Old | Seg::All => extra + self.base.estimate(pattern),
+            // The base's estimate saturates (`Snapshot::count_in`), so the sum does too.
+            Seg::Old | Seg::All => extra.saturating_add(self.base.estimate(pattern)),
             _ => extra,
         }
     }
