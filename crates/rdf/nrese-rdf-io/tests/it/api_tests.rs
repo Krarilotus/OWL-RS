@@ -253,17 +253,18 @@ fn errors_say_where() {
     assert_eq!(quad.object, Term::from(NamedNode::new_unchecked("o")));
 }
 
+/// `next_ref` gives the document's quads, borrowed, in order: each one the quad written.
 #[test]
-fn borrowed_quads_need_no_allocation_per_term() {
-    let text = write(RdfFormat::NQuads, &sample());
+fn borrowed_quads_are_the_documents() {
+    let quads = sample();
+    let text = write(RdfFormat::NQuads, &quads);
     let mut parser = RdfParser::from_format(RdfFormat::NQuads).for_slice(&text);
-    let mut count = 0;
+    let mut expected = quads.iter();
     while let Some(quad) = parser.next_ref() {
-        let quad = quad.unwrap();
-        assert!(!quad.predicate.as_str().is_empty());
-        count += 1;
+        let written = expected.next().expect("no more quads than written");
+        assert_eq!(quad.unwrap(), written.as_ref());
     }
-    assert_eq!(count, sample().len());
+    assert_eq!(expected.next(), None, "as many quads as written");
 }
 
 /// RDF 1.2's `VERSION` directive: written first when asked for, and read back in every
