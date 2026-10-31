@@ -714,8 +714,93 @@ fn stopped_updates_are_interrupted() {
         let seen = AtomicUsize::new(0);
         let stop = || seen.fetch_add(1, Ordering::Relaxed) >= k;
         let result = update_until(&base, &added, &[], compiled, None, &stop);
-        assert_eq!(result.err(), Some(Interrupted), "stop at poll {k} of {n}");
+        assert_eq!(
+            result.err(),
+            Some(Interrupted::default()),
+            "stop at poll {k} of {n}"
+        );
     }
+}
+
+/// DC-07 S2 (Sol, round 1): the process limit's stop holds for the rest of the
+/// materialisation. One reading over the limit, or unread, then readings under it, at any
+/// poll: the run ends with that cause, or (past the last poll) has the join's fact; never a
+/// result without the fact a skipped morsel would have made.
+#[test]
+fn a_memory_stop_holds_for_the_rest_of_the_materialisation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::eval::{NEVER, OperationStop};
+    use super::ir::parse_rules;
+    use nrese_exec::memory::MemoryStopCause;
+    let mut vocabulary = LocalVocabulary::default();
+    let input = load(&mut vocabulary, "ex:a rdfs:p ex:b\nex:b rdfs:r ex:c");
+    let rules = parse_rules(
+        "join: (?s rdfs:p ?o), (?o rdfs:r ?z) -> (?s rdfs:q ?z)",
+        &mut vocabulary,
+    )
+    .unwrap();
+    let schema = Schema::owl(&mut vocabulary);
+    let fact = load(&mut vocabulary, "ex:a rdfs:q ex:c")[0];
+    let polls = AtomicUsize::new(0);
+    let counting = || {
+        polls.fetch_add(1, Ordering::Relaxed);
+        None
+    };
+    let whole = batch::materialise_owned_with(
+        input.clone(),
+        &rules,
+        None,
+        &schema,
+        &OperationStop::with_poll(NEVER, &counting),
+    )
+    .expect("runs");
+    assert!(whole.derived.contains(&fact));
+    let n = polls.load(Ordering::Relaxed);
+    assert!(n > 2, "{n} polls");
+    for cause in [MemoryStopCause::OverLimit, MemoryStopCause::Unread] {
+        for k in 0..=n {
+            let seen = AtomicUsize::new(0);
+            let once = || (seen.fetch_add(1, Ordering::Relaxed) == k).then_some(cause);
+            let stop = OperationStop::with_poll(NEVER, &once);
+            match batch::materialise_owned_with(input.clone(), &rules, None, &schema, &stop) {
+                Ok(closure) => assert!(
+                    closure.derived.contains(&fact),
+                    "{cause:?} at poll {k} of {n}: finished without the join's fact"
+                ),
+                Err(stopped) => assert_eq!(stopped.memory, Some(cause), "poll {k} of {n}"),
+            }
+        }
+    }
+}
+
+/// DC-07 S2: an operation's stop keeps the memory's cause of the moment it fired, whatever
+/// the limit reads since; one its caller fired has none.
+#[test]
+fn an_operation_keeps_the_cause_that_stopped_it() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::eval::{NEVER, OperationStop};
+    use nrese_exec::memory::MemoryStopCause;
+    let readings = [
+        Some(MemoryStopCause::Unread),
+        None,
+        Some(MemoryStopCause::OverLimit),
+    ];
+    let at = AtomicUsize::new(0);
+    let poll = || readings[at.fetch_add(1, Ordering::Relaxed).min(2)];
+    let stop = OperationStop::with_poll(NEVER, &poll);
+    assert!(stop.fired(), "unread: stopped");
+    assert!(
+        stop.fired(),
+        "and stays stopped when the next reading is under"
+    );
+    assert!(stop.fired());
+    assert_eq!(stop.interrupted().memory, Some(MemoryStopCause::Unread));
+    let cancelled = || true;
+    let stop = OperationStop::with_poll(&cancelled, &poll);
+    assert!(stop.fired());
+    assert_eq!(stop.interrupted().memory, None, "its caller stopped it");
 }
 
 /// A commit reports the list axioms it made uninstantiable, and only those: a broken

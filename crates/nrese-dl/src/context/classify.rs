@@ -197,25 +197,25 @@ pub fn saturate_normalised(
         engine.hold(&mut held, abox.bytes());
     }
     if engine.out_of_budget() {
-        return Err(Unsupported::Budget);
+        return Err(engine.budget_stop());
     }
     let query: Vec<ContextId> = (0..named)
         .take_while(|_| !engine.exhausted())
         .map(|c| engine.context_for(&[Atom::concept(c, CTerm::X)]).0)
         .collect();
     if engine.out_of_budget() {
-        return Err(Unsupported::Budget);
+        return Err(engine.budget_stop());
     }
     let (top, _) = engine.context_for(&[]);
     let mut seeds = query.clone();
     seeds.push(top);
     engine.run(&seeds, &workers);
     if engine.out_of_budget() {
-        return Err(Unsupported::Budget);
+        return Err(engine.budget_stop());
     }
     let assertions_consistent = Individuals::saturate(&engine, &abox, &workers).release(&engine);
     if engine.out_of_budget() {
-        return Err(Unsupported::Budget);
+        return Err(engine.budget_stop());
     }
     profile.saturate = started.elapsed();
     profile.contexts_created = engine.count();
