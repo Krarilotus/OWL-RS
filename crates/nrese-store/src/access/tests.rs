@@ -482,8 +482,9 @@ fn local_logins_check_passwords_open_sessions_and_throttle_failures() {
 
 /// Failed logins are counted per user name and client address (the milestone review's
 /// R2-R4): guesses from one address don't lock the user out elsewhere; an address that
-/// guesses many names waits too; the counts are bounded, names without a login counted
-/// like the others; and refusing a name without a login takes as long as a wrong password.
+/// guesses many names waits too; and the counts are bounded, names without a login counted
+/// like the others. That refusing a name without a login does a wrong password's work is
+/// `login::tests::unknown_names_are_refused_like_wrong_passwords`.
 #[test]
 fn failed_logins_slow_down_the_guesser_not_the_user() {
     use std::net::IpAddr;
@@ -553,19 +554,6 @@ fn failed_logins_slow_down_the_guesser_not_the_user() {
     }
     let (pairs, addresses) = control.login_failures_tracked();
     assert!(pairs <= 5 && addresses <= 5, "{pairs} {addresses}");
-    // A name without a login is refused after as much work as a wrong password.
-    let time = |name: &str, client| {
-        let start = std::time::Instant::now();
-        let _ = control.login(name, "guess", client);
-        start.elapsed()
-    };
-    let _ = time("nobody", address("10.1.0.1"));
-    let unknown = time("nobody", address("10.1.0.2"));
-    let known = time("alice", address("10.1.0.3"));
-    assert!(
-        unknown * 4 >= known,
-        "unknown name {unknown:?}, wrong password {known:?}"
-    );
 }
 
 /// A user name with a character an IRI can't hold (`|`) has a personal space for queries
