@@ -25,10 +25,19 @@ def load_fast():
 
 
 class ScopeLifetime(unittest.TestCase):
-    def test_unbounded_existing_prefix_is_unchanged(self):
-        self.assertEqual(runtime.scope_argv("case-1", "6g", {"FLEET_SLICE": "fleet-example.slice"}),
-            ["systemd-run", "--user", "--scope", "-q", "--slice=fleet-example.slice", "--unit=case-1",
-             "-p", "MemoryMax=6G", "-p", "MemorySwapMax=0", "-p", "OOMPolicy=continue", "--"])
+    def test_an_unbounded_scope_joins_the_fleet_slice_where_there_is_one(self):
+        """The kit rule of 14 Oct 2026 (a whole-host OOM): a scope joins the fleet step's slice
+        where FLEET_SLICE is set and the user's default slice where not, from the environment
+        given or else the process's own."""
+        def prefix(*placed):
+            return ["systemd-run", "--user", "--scope", "-q", *placed, "--unit=case-1", "-p", "MemoryMax=6G",
+                    "-p", "MemorySwapMax=0", "-p", "OOMPolicy=continue", "--"]
+        for environ, expected in (({"FLEET_SLICE": "fleet-example.slice"}, prefix("--slice=fleet-example.slice")),
+                                  ({}, prefix())):
+            with self.subTest(environ=environ):
+                self.assertEqual(runtime.scope_argv("case-1", "6g", environ), expected)
+                with patch.dict(os.environ, environ, clear=True):
+                    self.assertEqual(runtime.scope_argv("case-1", "6g"), expected)
 
     def test_rules_interval_reserves_shutdown_without_cutting_engine_allowance(self):
         argv = runtime.scope_argv("rules-block-1", "14g", {"FLEET_SLICE": "fleet-example.slice"},

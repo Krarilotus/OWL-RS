@@ -41,6 +41,9 @@ struct View {
     ops: usize,
     /// Whose: the operations read as the reader may.
     scope: ReadScope,
+    /// The rules its inferred statements were decided under: how many times the store's
+    /// rules had been set when its read began ([`crate::support::Supports::epoch`]).
+    epoch: u64,
     snapshot: Snapshot,
 }
 
@@ -159,27 +162,36 @@ impl Sessions {
     }
 
     /// The data as `request` (the session's operations so far, scoped for a reader in
-    /// `scope`) leaves the committed data `latest`, if a read computed it before.
+    /// `scope`) leaves the committed data `latest` under the rules set `epoch` times, if a
+    /// read computed it before.
     pub(crate) fn view(
         &self,
         latest: &Snapshot,
         scope: &ReadScope,
         request: &StatementsRequest,
+        epoch: u64,
     ) -> Option<Snapshot> {
         let id = request.session.as_deref()?;
         let open = self.lock();
         let view = open.get(id)?.view.as_ref()?;
-        (view.base.same_version(latest) && view.ops == request.ops.len() && view.scope == *scope)
+        (view.base.same_version(latest)
+            && view.ops == request.ops.len()
+            && view.scope == *scope
+            && view.epoch == epoch)
             .then(|| view.snapshot.clone())
     }
 
-    /// Keeps `snapshot`, the data as `request` leaves `base`, for the session's next read.
+    /// Keeps `snapshot`, the data as `request` leaves `base` under the rules set `epoch`
+    /// times when its read began, for the session's next read; only while those are still
+    /// the rules (`current`): a read that outlived a change of them keeps nothing.
     pub(crate) fn keep_view(
         &self,
         base: Snapshot,
         scope: &ReadScope,
         request: &StatementsRequest,
         snapshot: Snapshot,
+        epoch: u64,
+        current: u64,
     ) {
         let Some(id) = request.session.as_deref() else {
             return;
@@ -188,11 +200,13 @@ impl Sessions {
         // Only for the operations the session still has (none were added meanwhile).
         if let Some(session) = open.get_mut(id)
             && session.ops.len() == request.ops.len()
+            && epoch == current
         {
             session.view = Some(View {
                 base,
                 ops: request.ops.len(),
                 scope: scope.clone(),
+                epoch,
                 snapshot,
             });
         }
@@ -237,6 +251,51 @@ mod tests {
         let gone = short.begin(None).unwrap();
         short.begin(None).unwrap();
         assert!(!short.ping(&gone, None));
+    }
+
+    /// Spec: a session's kept view holds for the rules it was decided under (review of O4's
+    /// fix round, S1): it is served only while they are the store's, and a read that began
+    /// under earlier rules and ends after a change of them keeps nothing.
+    #[test]
+    fn a_view_is_kept_and_served_for_its_rules_only() {
+        let store = crate::StoreService::new(crate::StoreConfig::in_memory()).unwrap();
+        let snapshot = store.read_snapshot(None).unwrap();
+        let sessions = Sessions::default();
+        let id = sessions.begin(None).unwrap();
+        assert!(sessions.add(
+            &id,
+            None,
+            vec![StatementOp::RemoveMatching(StatementPattern::default())]
+        ));
+        let request = StatementsRequest {
+            ops: sessions.pending(&id, None).unwrap(),
+            session: Some(id),
+        };
+        let keep = |epoch, current| {
+            let view = snapshot.clone();
+            sessions.keep_view(
+                snapshot.clone(),
+                &ReadScope::All,
+                &request,
+                view,
+                epoch,
+                current,
+            );
+        };
+        let served = |epoch| {
+            sessions
+                .view(&snapshot, &ReadScope::All, &request, epoch)
+                .is_some()
+        };
+        // A read that began under the rules set once ends after they were set again.
+        keep(1, 2);
+        assert!(
+            !served(1) && !served(2),
+            "kept by a read that outlived its rules"
+        );
+        keep(2, 2);
+        assert!(served(2), "kept under the rules in place");
+        assert!(!served(3), "served after the rules changed");
     }
 
     #[test]

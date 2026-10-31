@@ -83,13 +83,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let read = |what: &str| {
         let started = Instant::now();
-        let view = store.read_snapshot(Some(&access));
+        let view = store
+            .read_snapshot(Some(&access))
+            .expect("room for the view");
         let elapsed = started.elapsed();
         println!(
             "{what}: {:.1} ms, {} of {} inferred visible",
             elapsed.as_secs_f64() * 1e3,
             view.len_in(ReadModel::Inferred),
-            store.read_snapshot(None).len_in(ReadModel::Inferred),
+            store
+                .read_snapshot(None)
+                .expect("unrestricted")
+                .len_in(ReadModel::Inferred),
         );
     };
     read("first restricted read");

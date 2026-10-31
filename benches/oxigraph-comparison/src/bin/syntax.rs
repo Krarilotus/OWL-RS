@@ -24,8 +24,18 @@ fn seconds(mut work: impl FnMut() -> usize) -> f64 {
     times[ROUNDS / 2]
 }
 
+/// The comparisons the filter selects, and of them those timed: a run that times none, or
+/// fewer than it selects, didn't do what it was asked (Sol, PR #61 F3: a filter matching no
+/// comparison timed nothing and succeeded).
+#[derive(Default)]
+struct Receipt {
+    selected: Vec<String>,
+    timed: usize,
+}
+
 fn report(
     filter: &Option<String>,
+    receipt: &mut Receipt,
     name: &str,
     bytes: usize,
     ours: impl FnMut() -> usize,
@@ -34,6 +44,7 @@ fn report(
     if filter.as_ref().is_some_and(|f| !name.contains(f.as_str())) {
         return;
     }
+    receipt.selected.push(name.to_owned());
     let (a, b) = (seconds(ours), seconds(theirs));
     let mb = bytes as f64 / 1e6;
     println!(
@@ -44,6 +55,7 @@ fn report(
         b * 1e3,
         a / b
     );
+    receipt.timed += 1;
 }
 
 const BASE: &str = "http://example.org/base/";
@@ -101,6 +113,7 @@ fn long_expression() -> String {
 
 fn main() {
     let filter = std::env::args().nth(1);
+    let mut receipt = Receipt::default();
     // The corpus: the pinned W3C suites in full (no W3C case is timed without them), and of
     // them what both parse, with each file's kind.
     let files = oxigraph_comparison::w3c::sparql(&["rq", "ru"]).unwrap_or_else(|why| {
@@ -134,6 +147,7 @@ fn main() {
     );
     report(
         &filter,
+        &mut receipt,
         "W3C queries",
         bytes(&queries),
         || {
@@ -152,6 +166,7 @@ fn main() {
     );
     report(
         &filter,
+        &mut receipt,
         "W3C updates",
         bytes(&updates),
         || {
@@ -176,6 +191,7 @@ fn main() {
         assert!(ours().parse_query(&text).is_ok() && theirs().parse_query(&text).is_ok());
         report(
             &filter,
+            &mut receipt,
             name,
             text.len(),
             || ours().parse_query(&text).is_ok() as usize,
@@ -194,6 +210,7 @@ fn main() {
         .collect();
     report(
         &filter,
+        &mut receipt,
         "write W3C queries",
         bytes(&queries),
         || ours_parsed.iter().map(|q| q.to_string().len()).sum(),
@@ -206,9 +223,19 @@ fn main() {
     );
     report(
         &filter,
+        &mut receipt,
         "write BGP of 6,000 patterns",
         big.len(),
         || a.to_string().len(),
         || b.to_string().len(),
     );
+    if receipt.timed == 0 || receipt.timed < receipt.selected.len() {
+        eprintln!(
+            "{} of {} selected comparisons timed ({:?}; filter {filter:?}): less than asked",
+            receipt.timed,
+            receipt.selected.len(),
+            receipt.selected
+        );
+        std::process::exit(2);
+    }
 }

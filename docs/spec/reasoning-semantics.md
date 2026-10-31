@@ -1,6 +1,6 @@
 # Reasoning: supported semantics
 
-This is the contract for what NRESE's reasoning computes, as implemented on 30 September 2026 (`SEMANTICS_VERSION` 2). A mode name alone doesn't state it; this page does. The source of truth is `crates/nrese-reasoner/src/rulesets.rs` (the rule text) and `lists.rs` (list axioms).
+This is the contract for what NRESE's reasoning computes, as implemented on 30 September 2026 (`SEMANTICS_VERSION` 3 since 28 October 2026: closures version 2's maintenance wrote are rebuilt once). A mode name alone doesn't state it; this page does. The source of truth is `crates/nrese-reasoner/src/rulesets.rs` (the rule text) and `lists.rs` (list axioms).
 
 ## Modes
 
@@ -97,8 +97,9 @@ OWL 2 DL with arbitrary rules is undecidable; rules whose variables bind to name
 
 - Rules match over the **union of all graphs** (default and named).
 - Inferred statements go to the **default graph**.
-- An inferred statement is suppressed while it is asserted in any graph.
+- An inferred statement is suppressed while it is asserted in any graph: the stored inferred stack holds no copy of it.
 - A named graph is **not** a reasoning boundary: there's no per-graph isolation or placement of inferences yet (planned for v2.0: [Named graphs as a reasoning boundary](../STATUS.md#engine-gaps)). Which graphs an inferred statement came from is known: under `inferred = "supported"` a reader sees it when one of its support graph sets is readable ([reasoner-provenance.md](../design/reasoner-provenance.md); the sets are computed in memory per revision, not stored).
+- **Suppression per reader.** For a reader who may not read every graph (`inferred = "supported"` or `"visible"`), suppression follows what that reader can read, not the physical stack. An assertion in a graph the reader reads suppresses the inferred row: the reader sees the fact as asserted, in that graph. An assertion only in graphs it can't read suppresses nothing: the fact is shown to it as inferred, in the default graph, where it follows without that assertion. Under `"supported"` that means from the graphs the reader reads; under `"visible"` from the other statements. A cycle back through the fact itself is no derivation. So adding or removing an assertion the reader can't see changes none of its answers. As a reader's permissions grow, a fact can move from its inferred rows to the asserted rows of a graph it now reads. A read that includes that graph (a union default graph, `GRAPH`, `FROM`) still has the fact; inferred-only and default-graph-only reads lose the row. This is NRESE's rule, not another store's: GraphDB, for instance, keeps explicit and implicit as independent flags of one statement. Not yet with `reasoner.equality = "compact"`, an approved v1.5 exception.
 
 ## Reads
 
