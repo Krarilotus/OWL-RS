@@ -103,8 +103,8 @@ subproperty, and err on bottom properties, nominal disjoint unions and `≥ 0 r.
 NRESE's checked model refuting the reference where it has one. The campaign found and
 fixed four defects (disjoint operands U's rewriting made equal; keys over transitive
 properties; keys over U alone in the context core and in realisation). In the gate: the
-scope `3,3` (35,505 cases) against the recorded references in the push tier, its 8,578
-one-axiom cases in the commit tier.
+scope `3,3` (35,505 cases) against the recorded references in the push tier; its 8,578
+one-axiom cases also when only a crate nrese-dl depends on changes.
 
 **Certificates** ([design](design/owl2-dl.md) §10): "consistent", satisfiable classes and
 non-entailments of the hypertableau come with a model the independent checker
@@ -194,7 +194,7 @@ follow from their rules); nothing is assumed.
 | A2 `Decoded::keep` without the moved `Box` | done | Raw pointers with a `Drop`; a test |
 | A2 Miri over the engine's unsafe code | deferred | Never ran (Miri isn't installed on the main PC). Planned with the refactoring after the merge to `main` ([roadmap](ROADMAP.md) step 4) |
 | A2 Dead wildcard arms | done | Four deleted; six covered real variants and name them |
-| A3 `scripts/check.sh` gate, pre-commit and pre-push hooks | done | The pre-commit gate tests the changed crates and every crate depending on them |
+| A3 `scripts/check.sh` gate, pre-commit and pre-push hooks | done | The pre-push gate tests the changed crates and every crate depending on them, on the fleet; the pre-commit hook checks format, lock files and Docker names |
 | A3 Workspace lints, resolver 3, `rust-version`, `publish = false` | done | Every suppression is an `#[expect]`; no `#[allow]` left |
 | A3 Dependencies declared once in the workspace | done | Every external dependency two or more crates use (20 workspace entries) |
 | A3 Duplicate dependency versions | partly | Our direct dependencies are aligned; duplicates pulled in by third-party crates remain (`rand` 0.9/0.10, `getrandom` 0.2/0.3/0.4, `digest` 0.10/0.11, `syn` 2/3, `thiserror` 1/2, `winnow` 0.7/1.0) |

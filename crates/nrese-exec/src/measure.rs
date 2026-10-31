@@ -101,7 +101,8 @@
 //! of a pool is entering one, and a measuring thread holds no lock a pool's job needs. In the
 //! suite's own runs it did not occur: 0 hangs in 91 runs of this module's tests recorded from
 //! 19 to 21 October 2026 (commit hooks, push gates and fleet proofs). A preparation that
-//! waits on no pool is the follow-up.
+//! waits on no pool is the follow-up. Such a hang ends at [`alone`]'s deadline: the child
+//! is stopped and the test fails, naming it.
 //!
 //! Counts are `i128`: a `usize` converts exactly, and no sum of them reaches its bounds.
 //! A realloc counts the new block, then frees the old: it may move the bytes. Measurements
@@ -657,6 +658,76 @@ pub fn measure_within<T>(budget: &Budget, work: impl FnOnce() -> T) -> (T, usize
 /// The variable that tells a test process it runs one test alone.
 const ALONE: &str = "NRESE_MEASURE_ALONE";
 
+/// The variable that sets how long [`alone`]'s child may run: whole seconds, or `0` or
+/// `unlimited` for no deadline; unset, [`ALONE_DEADLINE_SECS`].
+const ALONE_DEADLINE: &str = "NRESE_MEASURE_ALONE_SECS";
+
+/// How long [`alone`]'s child may run by default: ten minutes, ten times the slowest run
+/// alone seen (a guard slowed past a minute by a loaded machine, 20 Oct).
+const ALONE_DEADLINE_SECS: u64 = 600;
+
+/// The deadline [`ALONE_DEADLINE`] sets (`value`, `None` if unset); `None`: no deadline.
+/// Anything but whole seconds, `0` or `unlimited` is refused, naming the variable.
+fn alone_deadline(value: Option<&str>) -> Option<std::time::Duration> {
+    let secs = match value.map(str::trim) {
+        None => ALONE_DEADLINE_SECS,
+        Some(value) if value.eq_ignore_ascii_case("unlimited") => 0,
+        Some(value) => value.parse().unwrap_or_else(|_| {
+            panic!("{ALONE_DEADLINE}: whole seconds, 0 or unlimited, not {value:?}")
+        }),
+    };
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// What `test` printed and how it ended, run alone in a child of this binary
+/// ([`alone_args`]); `None` for how it ended if it ran past `deadline`: then it was
+/// stopped, and its process waited for, before this returns.
+fn run_alone(
+    test: &str,
+    deadline: Option<std::time::Duration>,
+) -> (Option<std::process::ExitStatus>, u32, Vec<u8>, Vec<u8>) {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    // Both pipes are read as the child writes, or a child that fills one would wait for it.
+    fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes)
+                .expect("the child's output reads");
+            bytes
+        })
+    }
+    let started = Instant::now();
+    let mut child = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args(alone_args(test))
+        .env(ALONE, test)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the test binary runs");
+    let stdout = drain(child.stdout.take().expect("piped"));
+    let stderr = drain(child.stderr.take().expect("piped"));
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the child's state") {
+            break Some(status);
+        }
+        let left = deadline.map(|deadline| deadline.saturating_sub(started.elapsed()));
+        if left == Some(Duration::ZERO) {
+            child.kill().expect("the child stops");
+            child.wait().expect("the stopped child is waited for");
+            break None;
+        }
+        std::thread::sleep(left.map_or(Duration::from_millis(5), |left| {
+            left.min(Duration::from_millis(5))
+        }));
+    };
+    let stdout = stdout.join().expect("the child's output");
+    let stderr = stderr.join().expect("the child's output");
+    (status, child.id(), stdout, stderr)
+}
+
 /// The arguments [`alone`] runs `test` with, in a child of its own: that test alone, on one
 /// test thread (the harness's main thread).
 fn alone_args(test: &str) -> [&str; 5] {
@@ -676,7 +747,12 @@ fn alone_args(test: &str) -> [&str; 5] {
 /// test that panicked there panics with its message. One that didn't panic there ends this
 /// binary with a failure, as a panic would pass it. The test is the calling thread's, which
 /// the test harness names after it; what the run printed is printed (where the harness
-/// shows it).
+/// shows it). A child still running at its deadline ([`ALONE_DEADLINE`], ten minutes
+/// unless set) is stopped and waited for, and the test fails, naming its process.
+///
+/// A test that changes the process's state (a job object, a memory limit, the kernel's
+/// peak) runs alone for the same reason: in a process of its own, nothing else sees the
+/// change, and it ends with the process.
 ///
 /// Under cargo-nextest too, though it runs a process per test: there the harness runs the
 /// test on a thread of its own, and its main thread, past 60 seconds, writes that the test
@@ -697,15 +773,24 @@ pub fn alone() -> bool {
     if std::env::var(ALONE).is_ok_and(|t| t == test) && started_alone() {
         return true;
     }
-    let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
-        .args(alone_args(test))
-        .env(ALONE, test)
-        .output()
-        .expect("the test binary runs");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let variable = std::env::var(ALONE_DEADLINE);
+    let deadline = alone_deadline(match &variable {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(not_unicode) => panic!("{ALONE_DEADLINE}: {not_unicode}"),
+    });
+    let (status, process, stdout, stderr) = run_alone(test, deadline);
+    let stdout = String::from_utf8_lossy(&stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
     eprint!("{stdout}{stderr}");
-    let passed = output.status.success() && stdout.contains("test result: ok. 1 passed");
+    let Some(status) = status else {
+        let secs = deadline.map_or(0, |deadline| deadline.as_secs());
+        panic!(
+            "{test}, run alone (process {process}), passed its deadline of {secs} s \
+             ({ALONE_DEADLINE}): stopped"
+        );
+    };
+    let passed = status.success() && stdout.contains("test result: ok. 1 passed");
     if stdout.contains(&format!("test {test} - should panic ...")) {
         if !passed {
             eprintln!("{test}, run alone, did not panic");
