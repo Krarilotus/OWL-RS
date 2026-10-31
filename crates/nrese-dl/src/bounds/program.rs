@@ -281,6 +281,8 @@ pub struct Program {
     pub unchecked: Vec<(usize, &'static str)>,
     /// U1's own terms, for [`Program::is_internal`].
     internal: HashSet<Term>,
+    /// [`Program::compared_predicates`], read once the rules are complete.
+    compared: HashSet<Term>,
 }
 
 /// A program that has no Notation3 form.
@@ -330,6 +332,39 @@ impl Program {
     /// the clash predicate): facts over it are U1's machinery, never answers.
     pub fn is_internal(&self, term: Term) -> bool {
         self.internal.contains(&term)
+    }
+
+    /// The predicates whose object values the rules compare by term: in a rule body, with
+    /// a constant object or an object variable another atom reads (a key's values, a
+    /// negative assertion's, a `hasValue`'s). Other objects are only carried, never
+    /// compared. The equality rules' atoms with a variable predicate join only over
+    /// `owl:sameAs`, which no literal has in U1.
+    pub fn compared_predicates(&self) -> &HashSet<Term> {
+        &self.compared
+    }
+
+    /// Reads [`Program::compared_predicates`] from the rules, which must be complete.
+    pub(crate) fn find_compared(&mut self) {
+        let mut compared = HashSet::new();
+        for rule in &self.rules {
+            for (i, atom) in rule.body.iter().enumerate() {
+                let [_, Slot::Const(p), object] = atom.0 else {
+                    continue;
+                };
+                let read = match object {
+                    Slot::Const(_) => true,
+                    Slot::Var(_) => {
+                        atom.0[..2].contains(&object)
+                            || (rule.body.iter().enumerate())
+                                .any(|(j, other)| j != i && other.0.contains(&object))
+                    }
+                };
+                if read {
+                    compared.insert(p);
+                }
+            }
+        }
+        self.compared = compared;
     }
 
     /// Whether a clash-free U1 proves the ontology consistent (PAGOdA, Theorem 5.5 (i)):

@@ -30,7 +30,8 @@ pub struct ValidationResult {
     /// `sh:sourceConstraintComponent`: a built-in component, or a SPARQL-based one of the
     /// shapes graph.
     pub component: NamedNode,
-    /// `sh:sourceConstraint`: the SPARQL constraint or validator that found it.
+    /// `sh:sourceConstraint`: the `sh:sparql` constraint that found it; none for a
+    /// SPARQL-based constraint component's results.
     pub source_constraint: Option<Term>,
     /// `sh:Violation`, `sh:Warning`, `sh:Info` or the shape's own severity IRI.
     pub severity: NamedNode,

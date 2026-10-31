@@ -168,6 +168,11 @@ const NOT_BUDGETS: &[(&str, &str, &str)] = &[
     ("context/engine.rs", "BASE", "the arena's first segment"),
     ("context/engine.rs", "SEGMENTS", "the arena's segments"),
     (
+        "context/program.rs",
+        "MAX: usize",
+        "variables per clause body, numbered by a u8",
+    ),
+    (
         "datatypes/theory.rs",
         "STOP_EVERY",
         "how often the theory checks its stop",

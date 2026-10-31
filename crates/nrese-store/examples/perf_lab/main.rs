@@ -10,6 +10,7 @@
 //!     [--readers 0] [--clients N --duration-s 10] [--threads N] [--export FILE]
 //!     [--canonicalize FILE]... [--prepare-vector-graph DIM:METRIC] [--read-graphs IRI,...]
 //!     [--replication COMMITS:QUADS [--store DIR] [--replication-probe swap-one]]
+//!     [--support-sets K|off] [--support-reader FILE [--support-commits FILE] [--support-updates FILE]]
 //! cargo run --release -p nrese-store --example perf_lab -- generate KIND OUT [key=value]...
 //! ```
 //!
@@ -69,6 +70,11 @@
 //!   QUADS statements on a durable primary, then per run a fresh follower catching up from
 //!   its image through the feed (`log_since`) and the apply (`apply_log`), timed apart, with
 //!   the catch-up's peak memory (`modes::replication`; under `--store DIR` when given).
+//!   `--support-sets K` caps the support graph sets per statement (`off`: none), and
+//!   `--support-reader FILE` times a reader of the default graph and FILE's named graphs with
+//!   `inferred = "supported"`: its first read, then `--support-commits` each followed by a
+//!   read, then `--support-updates` each read pending and applied by that reader
+//!   (`support.rs`); the queries run as that reader.
 //!   `generate` writes the suite's data (`generate.rs`). A failure still writes the report, with
 //!   its `error`.
 //!
@@ -80,6 +86,9 @@ use std::collections::BTreeMap;
 use std::io::Write;
 mod generate;
 mod modes;
+mod support;
+#[allow(dead_code)]
+mod support_family;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -267,6 +276,10 @@ struct Args {
     classify: bool,
     prepare_vector_graph: Option<(usize, nrese_engine::vector::Metric)>,
     read_graphs: Vec<String>,
+    support_sets: Option<usize>,
+    support_reader: Option<Arc<nrese_sparql::GraphAccess>>,
+    support_commits: Option<PathBuf>,
+    support_updates: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -310,6 +323,10 @@ fn parse_args() -> Result<Args, String> {
         classify: false,
         prepare_vector_graph: None,
         read_graphs: Vec::new(),
+        support_sets: None,
+        support_reader: None,
+        support_commits: None,
+        support_updates: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -388,6 +405,17 @@ fn parse_args() -> Result<Args, String> {
             },
             "--classify" => args.classify = true,
             "--read-graphs" => args.read_graphs = value()?.split(',').map(str::to_owned).collect(),
+            "--support-sets" => {
+                args.support_sets = Some(match value()?.as_str() {
+                    "off" => usize::MAX,
+                    cap => cap.parse().map_err(|e| format!("--support-sets: {e}"))?,
+                })
+            }
+            "--support-reader" => {
+                args.support_reader = Some(support::reader(std::path::Path::new(&value()?))?)
+            }
+            "--support-commits" => args.support_commits = Some(value()?.into()),
+            "--support-updates" => args.support_updates = Some(value()?.into()),
             "--prepare-vector-graph" => {
                 let input = value()?;
                 let (dimension, metric) = input
@@ -461,7 +489,7 @@ fn run_once(
 ) -> Result<(u64, Duration), String> {
     let token = CancellationToken::new();
     // The process's watchdog cancels at the timeout: armed before the timed window, disarmed
-    // after it, so that no thread starts inside it (benches/fast/patches/perf_lab_watchdog.py).
+    // after it, so that no thread starts inside it (benches/PROTOCOL.md §5).
     let armed = perf_lab_watchdog::arm(&token, timeout);
     let mut sink = CountingSink::default();
     let started = Instant::now();
@@ -979,6 +1007,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let _ = SCOPE.set(nrese_store::ReadScope::of(Some(Arc::new(access))));
     }
+    if let Some(access) = &args.support_reader {
+        if !args.read_graphs.is_empty() {
+            return Err("--read-graphs or --support-reader, not both".into());
+        }
+        let _ = SCOPE.set(nrese_store::ReadScope::of(Some(Arc::clone(access))));
+    }
     let mut report = Report::default();
     let result = run(&args, &mut report);
     if let Err(error) = &result {
@@ -1043,6 +1077,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             "NRESE_REASONING_QL_REWRITING",
         ))
         .unwrap_or_default(),
+        support_sets: args.support_sets.unwrap_or(config.support_sets),
         ..config
     };
     COUNT_ALLOCATIONS.store(args.count_allocations, Ordering::Relaxed);
@@ -1238,6 +1273,16 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             ),
         ));
     }
+    if let Some(access) = &args.support_reader {
+        report.sections.extend(support::measure(
+            &store,
+            &reasoner,
+            access,
+            args.support_commits.as_deref(),
+            args.support_updates.as_deref(),
+            &mut phases,
+        )?);
+    }
     let mut files: Vec<PathBuf> = if args.queries.as_os_str().is_empty() {
         Vec::new()
     } else {
@@ -1389,7 +1434,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     if let Some((dimension, metric)) = args.prepare_vector_graph {
         let phase = Phase::start();
         let started = Instant::now();
-        let snapshot = store.read_snapshot(None);
+        let snapshot = store.read_snapshot(None)?;
         let mut query = nrese_engine::VectorQuery::new(vec![0.0; dimension], 1);
         query.vector[0] = 1.0;
         query.metric = metric;
@@ -1549,10 +1594,10 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// The timeout of every timed run, by one thread for the whole process (release gate harness:
-/// benches/fast/patches/perf_lab_watchdog.py): started once, before any timing, and running
-/// before it returns; it polls every 10 ms and takes the slot's lock only then, which the timed
-/// call never takes.
+/// The timeout of every timed run, by one thread for the whole process (benches/PROTOCOL.md §5;
+/// main's and v1.5's measurement commits have the same): started once, before any timing, and
+/// running before it returns; it polls every 10 ms and takes the slot's lock only then, which
+/// the timed call never takes.
 mod perf_lab_watchdog {
     use super::CancellationToken;
     use std::sync::{Mutex, OnceLock, mpsc};

@@ -154,13 +154,16 @@ async fn run() -> Result<()> {
         );
         return Ok(());
     }
+    let program = config.reasoner.materialised_program();
     if let CliCommand::Query(query) = cli.command {
+        bring_inferences_up_to_date(&store, program.as_ref(), replica)?;
         return query_once(&store, query);
     }
     if let CliCommand::PrintQuery(print) = cli.command {
+        // Its schema and its equality check read the asserted statements alone: no
+        // inference to bring up to date.
         return print_query(&store, print);
     }
-    let program = config.reasoner.materialised_program();
     if let CliCommand::Load(load) = cli.command {
         bulk_load(&store, load)?;
         if let Some(program) = &program {
@@ -187,31 +190,7 @@ async fn run() -> Result<()> {
         );
         return Ok(());
     }
-    // Reasoner v2: bring the inferred stack in line with the configured rules, unless the
-    // recorded state says it already is (same rules and semantics). Without reasoning, a
-    // leftover stack is cleared so reads never see stale inferences.
-    match program {
-        // A replica's inferences come with the primary's records.
-        _ if replica => {
-            tracing::info!("read replica: no reasoning here, the primary's log carries it");
-        }
-        Some(program) if store.reasoning_is_current(&program) => {
-            tracing::info!(ruleset = %program.name(), "inferred stack is current");
-        }
-        Some(program) => {
-            store
-                .rematerialise(&program)
-                .context("startup reasoning failed")?;
-        }
-        None => {
-            let cleared = store
-                .clear_inferred()
-                .context("clearing inferences failed")?;
-            if cleared > 0 {
-                tracing::info!(cleared, "reasoning is off: inferred stack cleared");
-            }
-        }
-    }
+    bring_inferences_up_to_date(&store, program.as_ref(), replica)?;
     if config.store.federation.enabled() {
         let client = nrese_server::federation::HttpServiceClient::new(
             config.store.federation.clone(),
@@ -272,8 +251,42 @@ async fn run() -> Result<()> {
     .context("nrese-server terminated unexpectedly")
 }
 
-/// `nrese-server query`: one query on the configured store as it is (no reasoning first),
-/// its results on standard output.
+/// Reasoner v2: brings the inferred stack in line with the configured rules, unless the
+/// recorded state says it already is (same rules and semantics). Without reasoning, a
+/// leftover stack is cleared so reads never see stale inferences. Before the first read of
+/// whatever reads inferences: the server, and `query`.
+fn bring_inferences_up_to_date(
+    store: &StoreService,
+    program: Option<&nrese_reasoner::RuleProgram>,
+    replica: bool,
+) -> Result<()> {
+    match program {
+        // A replica's inferences come with the primary's records.
+        _ if replica => {
+            tracing::info!("read replica: no reasoning here, the primary's log carries it");
+        }
+        Some(program) if store.reasoning_is_current(program) => {
+            tracing::info!(ruleset = %program.name(), "inferred stack is current");
+        }
+        Some(program) => {
+            store
+                .rematerialise(program)
+                .context("startup reasoning failed")?;
+        }
+        None => {
+            let cleared = store
+                .clear_inferred()
+                .context("clearing inferences failed")?;
+            if cleared > 0 {
+                tracing::info!(cleared, "reasoning is off: inferred stack cleared");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `nrese-server query`: one query on the configured store, its inferences first brought up
+/// to date ([`bring_inferences_up_to_date`]), its results on standard output.
 fn query_once(store: &StoreService, command: QueryCommand) -> Result<()> {
     use std::io::Write as _;
     let text = match (command.query, command.file) {
