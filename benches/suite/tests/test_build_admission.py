@@ -126,8 +126,11 @@ class Admission(unittest.TestCase):
         return {k: v for k, v in merged.items() if v is not None}
 
     def start(self, run, stderr=subprocess.DEVNULL, **env):
+        # What a build says, whatever the host's language: PowerShell's own errors come in the
+        # console's code page, which the locale's encoding may not decode (a German Windows's), and a
+        # failed decode left `communicate` with no stderr at all.
         build, end = owned([BASH, "scripts/cargo-guarded.sh", "build"], cwd=self.repo, env=self.env(run, **env),
-                           stdout=subprocess.DEVNULL, stderr=stderr, text=True)
+                           stdout=subprocess.DEVNULL, stderr=stderr, text=True, encoding="utf-8", errors="replace")
         self.addCleanup(end)
         return build
 

@@ -34,8 +34,10 @@
 # NRESE_GATE_START_S (default 180 s; again after a host stopped it), it ran past NRESE_GATE_MAX_S
 # (default 10800 s), or its result is missing or for something else. The job is cancelled then,
 # and nothing runs here instead: no verdict, no push. For windows the start window is 1800 s and
-# the ask 6 cores: the fleet counts the main PC's own load, and kraris-gptler didn't free 8 cores
-# within 30 min on 26 Oct 2026.
+# the ask 4 cores, measured: a 4-core run took 899 s and started within 11 min, where a 6-core
+# one hadn't started in 25 (PR #66's, 31 Oct 2026: the host's console cap gives the fleet 8 of its
+# 16 threads, its owner's own load 2-6 of those); 6 cores took 696 s. The build and the tests are
+# what more cores speed up, not the suite contracts (466 s of the 899).
 set -u
 mode=$1 list=$2 tree=$3 list_hash=$4 identity=$5 where=$6 commit=$7
 cd "$(git rev-parse --show-toplevel)" || exit 75
@@ -67,7 +69,8 @@ case $mode in
     # 9 GB job admitted at 16 GB that peaks at 7.5 GB still leaves 8.5 GB, clear of the 4 GB
     # eviction floor (the fleet's owner, 27 Oct 2026). 16 GB kept checks waiting while 11-15 GB
     # was free.
-    cores=${NRESE_GATE_CORES:-6} ram=${NRESE_GATE_RAM_GB:-9} est=${NRESE_GATE_EST_MIN:-30}
+    # est: the 4-core run's 899 s with clippy's 38 s, x 1.5.
+    cores=${NRESE_GATE_CORES:-4} ram=${NRESE_GATE_RAM_GB:-9} est=${NRESE_GATE_EST_MIN:-24}
     os=windows kind=owlrs.any confirm=kraris-gptler start_s=${NRESE_GATE_START_S:-1800}
     reason="the merge check's Windows part (scripts/check.sh windows); no merge without it" ;;
   *) cores=${NRESE_GATE_CORES:-2} ram=${NRESE_GATE_RAM_GB:-4} est=${NRESE_GATE_EST_MIN:-10} ;;

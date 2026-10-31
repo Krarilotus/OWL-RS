@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -30,6 +31,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "scripts/verify"))
+sys.path.append(str(ROOT / "benches/suite"))  # suitekit, after the standard modules (queue.py)
 spec = importlib.util.spec_from_file_location("verify_runner", ROOT / "scripts/verify/verify.py")
 verify = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verify)
@@ -38,9 +40,25 @@ from verifykit.server import LaunchError, Server  # noqa: E402
 
 # nrese-server's routes the self-test and the doctor read, answered as it answers them (compact
 # JSON), its words when its port is taken, and with VERIFY_STAND_IN=never-ready a /readyz of 503.
+# With VERIFY_STAND_IN=behind-a-launcher it is a launcher, as a Windows venv's python.exe is: the
+# server is its child, which it waits for (the child's pid in child.pid beside the script);
+# behind-a-launcher-stubborn, the same with a child that ignores SIGTERM; and
+# behind-a-launcher-that-leaves, a launcher that goes at once and leaves its child serving.
 STAND_IN = r'''
 import json, os, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+mode = os.environ.get("VERIFY_STAND_IN", "")
+if mode.startswith("behind-a-launcher"):
+    import subprocess
+    child_mode = "stubborn" if mode.endswith("-stubborn") else ""
+    child = subprocess.Popen([sys.executable, *sys.argv], env={**os.environ, "VERIFY_STAND_IN": child_mode})
+    with open(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), "child.pid"), "w") as f:
+        f.write(str(child.pid))
+    sys.exit(0 if mode.endswith("-that-leaves") else child.wait())
+if mode == "stubborn":
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 host, port = next(a.split("=", 1)[1] for a in sys.argv if a.startswith("server.bind_address=")).rsplit(":", 1)
 ROWS = {"head": {"vars": ["x"]}, "results": {"bindings": [{"x": {"type": "literal", "value": v}} for v in "ab"]}}
@@ -103,6 +121,14 @@ class StandIn:
 
     def remove(self):
         shutil.rmtree(self.dir, ignore_errors=True)
+
+
+def kill(pid: int) -> None:
+    """Ends one process of the test's own, if it is still there."""
+    try:
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    except OSError:
+        pass
 
 
 def refused(port: int) -> bool:
@@ -472,6 +498,39 @@ class Launch(unittest.TestCase):
         server = Server(self.stand_in.target["command"], {}, env, self.stand_in.dir / "server.log", start_timeout=5)
         self.addCleanup(server.cleanup)
         return server
+
+    def test_a_stop_ends_what_the_server_started(self):
+        """The merge check's Windows part under the suite's own venv (lane-d-wjp-windows2-4fff13fc):
+        the server's command was a launcher whose child held the port, and a stop ended the
+        launcher alone. A stop ends the server with all it started, a child that ignores SIGTERM
+        too (Sol, windows-job-python r3: the grace ended with the launcher, not its group)."""
+        for mode in ("behind-a-launcher", "behind-a-launcher-stubborn"):
+            with self.subTest(mode=mode):
+                server = self.server(VERIFY_STAND_IN=mode)
+                server.start()
+                self.addCleanup(kill, int((self.stand_in.dir / "child.pid").read_text()))  # if it stayed
+                port = server.attempts[-1]["port"]
+                server.stop()
+                deadline = time.monotonic() + 5  # a bound for an exit under way, not a speed
+                while not refused(port) and time.monotonic() < deadline:
+                    time.sleep(0.1)
+                self.assertTrue(refused(port), f"SPEC verify-stop: the server's child still holds its port ({mode})")
+
+    @unittest.skipIf(os.name == "nt", "Windows finds a tree through its live parent (taskkill /T): what a gone "
+                                      "parent left isn't found")
+    def test_a_stop_ends_what_a_gone_launcher_left(self):
+        """Sol, windows-job-python r3: a stop passed over a server whose own process had gone, so a
+        launcher that left its child left it serving. The stop takes the process group."""
+        server = self.server(VERIFY_STAND_IN="behind-a-launcher-that-leaves")
+        with self.assertRaisesRegex(LaunchError, "exited with code 0 before it was ready"):
+            server.start()
+        self.addCleanup(kill, int((self.stand_in.dir / "child.pid").read_text()))  # if it stayed
+        port = server.attempts[-1]["port"]
+        # A child left serving binds within this bound; a stopped one never does.
+        deadline = time.monotonic() + 5
+        while refused(port) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        self.assertTrue(refused(port), "SPEC verify-stop: a gone launcher's child serves on")
 
     def test_a_start_whose_port_was_taken_is_reaped_then_retried(self):
         with socket.socket() as taken:

@@ -9,7 +9,8 @@
 # checkout, once the checkout is TREE: the host's toolchain only (the tree's rust-toolchain.toml;
 # never one rustup would install: no verdict without it), a target directory of its own in the
 # checkout, never a shared one, and its temporary files in the checkout's tmp/windows-job: both go
-# with the checkout.
+# with the checkout. The suite contracts' Python packages come from an environment of their own in
+# the host's cache, as the Linux gate's do (scripts/lib/suite-python.sh), never the host's Python.
 #
 # The fleet starts a Windows step without a usable stdin (fleet backlog I14): Python's subprocess
 # and coreutils fail on it. The job says so after check.sh's summary, records it (`stdin` in
@@ -47,6 +48,17 @@ run() {
   local identity
   identity=$(gate_identity) || infra "no toolchain here for the tree's rust-toolchain.toml"
   echo "=== windows part of tree $tree on $(hostname) ($identity)"
+
+  # The suite's own Python environment, from the host's `python` (Windows' `python3` may be the
+  # Store's stub): first on PATH, so check.sh's suite contracts and the record run with it.
+  local cache=${NRESE_GATE_CACHE:-$HOME/fleet/cache/owlrs-gate} pybin
+  # Git Bash's form (/c/…): a `C:/…` entry in PATH would split at its colon.
+  cache=$(cygpath -u "$cache" 2> /dev/null || printf '%s' "$cache")
+  # shellcheck source=suite-python.sh
+  . scripts/lib/suite-python.sh
+  pybin=$(suite_python "$cache" benches/suite/requirements.txt python) || infra "no Python for the suite"
+  echo "$EPOCHSECONDS" > "${pybin%/*}/.last-used"
+  export PATH="$pybin:$PATH"
 
   local temp
   mkdir -p tmp/windows-job/temp
