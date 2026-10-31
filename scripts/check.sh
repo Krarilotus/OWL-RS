@@ -21,7 +21,8 @@
 #                                  origin's refactor/engine-v2), so a push then finds the pass;
 #                                  NRESE_PUSH_REF names the ref it will go to, as the hook's
 #                                  does (a merge check: refs/heads/refactor/engine-v2, which
-#                                  makes its job a merge gate on the fleet).
+#                                  makes its job a merge gate on the fleet). A value the
+#                                  caller's environment already holds is that caller's word.
 #        scripts/check.sh windows [COMMIT]
 #                                  the merge check's Windows part, on the fleet only
 #                                  (scripts/lib/fleet-gate.sh windows): COMMIT (default HEAD)
@@ -30,6 +31,8 @@
 #                                  scripts/lib/windows-job.sh runs on a Windows host. A commit
 #                                  whose inputs (scripts/lib/gate-key.sh windows_inputs)
 #                                  passed before carries that pass: "carried from <commit>".
+#                                  NRESE_PUSH_REF as for push: the merge check's Windows part
+#                                  for refactor/engine-v2 is a merge gate, a package's isn't.
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
 #                                  doc tests, cargo-deny, the console.
 #
