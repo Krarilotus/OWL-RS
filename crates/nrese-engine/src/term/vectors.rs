@@ -10,8 +10,8 @@
 //! and scans the newer ones exactly (a base and a delta, as FreshDiskANN keeps them).
 //!
 //! - **Building:** a space under [`SYNC_BUILD`] vectors gets its graph at once (under a
-//!   second); a larger one on a thread of its own, the search scanning exactly until it
-//!   is there. Once the vectors no graph covers pass a tenth of those it does, a copy of
+//!   second); a larger one on a thread of its own (or the engine's [`VectorBuilder`]),
+//!   the search scanning exactly until it is there. Once the vectors no graph covers pass a tenth of those it does, a copy of
 //!   the graph is extended with them, again on a thread of its own, and replaces it.
 //! - **Keeping:** the vectors and graphs are written with the other derived indexes after
 //!   a checkpoint ([`super::derived`]) and read at the first search after a start.
@@ -86,6 +86,8 @@ pub(crate) struct VectorIndex {
     /// Dictionary entries up to here are in the spaces.
     covered: u64,
     spaces: BTreeMap<usize, Space>,
+    /// The last reservation a background build was given ([`Work::Background`]).
+    reservations: u64,
 }
 
 #[derive(Debug, Default)]
@@ -100,8 +102,10 @@ struct Slot {
     metric: Metric,
     /// Covers the space's first `graph.len()` vectors.
     graph: Option<Arc<Hnsw>>,
-    /// A thread is building or extending it.
-    building: bool,
+    /// The background build building or extending it, by its reservation: only that
+    /// build's end (installed, or dropped unrun) ends it, so a warm-up's install or another
+    /// build's end can't release a build still holding it (PR #79 review, R79-01).
+    reserved: Option<u64>,
 }
 
 /// What a search needs done to the graph first.
@@ -109,8 +113,8 @@ pub(crate) enum Work {
     None,
     /// Build or extend it now.
     Now,
-    /// Build or extend it on a thread of its own.
-    Background,
+    /// Build or extend it on a thread of its own, under this reservation.
+    Background(u64),
 }
 
 impl VectorIndex {
@@ -137,8 +141,9 @@ impl VectorIndex {
     }
 
     /// What the graph `query` uses needs before the search: nothing, building or
-    /// extending now (a small space), or on a thread (a large one; marked as building).
+    /// extending now (a small space), or on a thread (a large one; reserved for that build).
     pub(crate) fn work_for(&mut self, query: &VectorQuery) -> Work {
+        let reservation = self.reservations + 1;
         let Some(space) = self.spaces.get_mut(&query.vector.len()) else {
             return Work::None;
         };
@@ -148,7 +153,7 @@ impl VectorIndex {
         let len = space.vectors.len();
         let slot = slot(space, query.metric);
         let covered = slot.graph.as_ref().map_or(0, |g| g.len());
-        if covered == len || slot.building {
+        if covered == len || slot.reserved.is_some() {
             return Work::None;
         }
         let behind = len - covered;
@@ -159,8 +164,9 @@ impl VectorIndex {
         if covered > 0 && behind * 10 < covered {
             return Work::None;
         }
-        slot.building = true;
-        Work::Background
+        slot.reserved = Some(reservation);
+        self.reservations = reservation;
+        Work::Background(reservation)
     }
 
     /// The vectors and graph to build on (a cheap copy of the vectors, shared chunks).
@@ -175,13 +181,22 @@ impl VectorIndex {
     }
 
     /// Installs `graph` for `metric` in the space of `dimension`, unless it already has
-    /// one covering more.
-    pub(crate) fn install(&mut self, dimension: usize, metric: Metric, graph: Hnsw) {
+    /// one covering more; a background build's `reservation` ends with it (a warm-up's
+    /// build, `None`, holds none and ends none).
+    pub(crate) fn install(
+        &mut self,
+        dimension: usize,
+        metric: Metric,
+        graph: Hnsw,
+        reservation: Option<u64>,
+    ) {
         let Some(space) = self.spaces.get_mut(&dimension) else {
             return;
         };
         let slot = slot(space, metric);
-        slot.building = false;
+        if reservation.is_some() && slot.reserved == reservation {
+            slot.reserved = None;
+        }
         if slot.graph.as_ref().is_none_or(|g| g.len() < graph.len()) {
             slot.graph = Some(Arc::new(graph));
         }
@@ -196,7 +211,7 @@ impl VectorIndex {
         uses_graph(space, query)
             && !space.graphs.iter().any(|slot| {
                 slot.metric == query.metric
-                    && (slot.building
+                    && (slot.reserved.is_some()
                         || slot
                             .graph
                             .as_ref()
@@ -204,10 +219,14 @@ impl VectorIndex {
             })
     }
 
-    /// A build of the graph for `metric` in the space of `dimension` ended without one.
-    fn release(&mut self, dimension: usize, metric: Metric) {
+    /// The build holding `reservation` for `metric` in the space of `dimension` ended
+    /// without a graph: its reservation ends, and no other's.
+    fn release(&mut self, dimension: usize, metric: Metric, reservation: u64) {
         if let Some(space) = self.spaces.get_mut(&dimension) {
-            slot(space, metric).building = false;
+            let slot = slot(space, metric);
+            if slot.reserved == Some(reservation) {
+                slot.reserved = None;
+            }
         }
     }
 
@@ -406,12 +425,16 @@ impl VectorIndex {
                 graphs.push(Slot {
                     metric,
                     graph: Some(Arc::new(graph)),
-                    building: false,
+                    reserved: None,
                 });
             }
             spaces.insert(dimension, Space { vectors, graphs });
         }
-        input.is_done().then_some(Self { covered, spaces })
+        input.is_done().then_some(Self {
+            covered,
+            spaces,
+            reservations: 0,
+        })
     }
 }
 
@@ -443,7 +466,7 @@ fn slot(space: &mut Space, metric: Metric) -> &mut Slot {
             space.graphs.push(Slot {
                 metric,
                 graph: None,
-                building: false,
+                reserved: None,
             });
             space.graphs.len() - 1
         }
@@ -467,8 +490,9 @@ fn uses_graph(space: &Space, query: &VectorQuery) -> bool {
 }
 
 /// Builds or extends the graph `query` uses, from what `index` holds now, and installs
-/// it.
-pub(crate) fn build(index: &RwLock<VectorIndex>, query: &VectorQuery) {
+/// it, ending `reservation` if it still holds the space (a background build's; a warm-up
+/// or a small space's build has none).
+pub(crate) fn build(index: &RwLock<VectorIndex>, query: &VectorQuery, reservation: Option<u64>) {
     let Some((vectors, base)) = index.read().build_inputs(query) else {
         return;
     };
@@ -489,22 +513,190 @@ pub(crate) fn build(index: &RwLock<VectorIndex>, query: &VectorQuery) {
     );
     index
         .write()
-        .install(vectors.dimension(), query.metric, graph);
+        .install(vectors.dimension(), query.metric, graph, reservation);
 }
 
-/// [`build`] on a thread of its own.
-pub(crate) fn build_in_background(index: Arc<RwLock<VectorIndex>>, query: VectorQuery) {
-    let spawned = std::thread::Builder::new()
-        .name("nrese-vector-graph".to_owned())
-        .spawn(move || {
-            let built =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&index, &query)));
-            if built.is_err() {
-                tracing::error!("building a vector graph failed; searches stay exact");
-                index.write().release(query.vector.len(), query.metric);
-            }
-        });
-    if let Err(error) = spawned {
+/// Runs the graph builds searches start in the background: each [`VectorBuild`] it is
+/// handed, now or later, or refuses it with an error. Without one, each build gets a
+/// thread of its own ([`crate::Engine::run_vector_builds_with`]).
+pub type VectorBuilder = Arc<dyn Fn(VectorBuild) -> std::io::Result<()> + Send + Sync>;
+
+/// A graph build a search started, holding its space's reservation meanwhile:
+/// [`Self::run`] builds the graph and installs it. However it ends (run, refused, its
+/// build panicked), its own reservation ends with it, and no other's: a later search
+/// may start another.
+pub struct VectorBuild {
+    index: Arc<RwLock<VectorIndex>>,
+    query: VectorQuery,
+    reservation: u64,
+}
+
+impl VectorBuild {
+    /// Builds the graph from what the index holds now and installs it, on this thread.
+    pub fn run(self) {
+        build(&self.index, &self.query, Some(self.reservation));
+    }
+}
+
+impl Drop for VectorBuild {
+    fn drop(&mut self) {
+        // Nothing if its install ended the reservation already.
+        let mut index = self.index.write();
+        index.release(self.query.vector.len(), self.query.metric, self.reservation);
+    }
+}
+
+/// [`build`] under `reservation` ([`Work::Background`]), through `builder` or on a thread
+/// of its own.
+pub(crate) fn build_in_background(
+    index: Arc<RwLock<VectorIndex>>,
+    query: VectorQuery,
+    reservation: u64,
+    builder: Option<&VectorBuilder>,
+) {
+    let job = VectorBuild {
+        index,
+        query,
+        reservation,
+    };
+    let started = match builder {
+        Some(builder) => builder(job),
+        None => std::thread::Builder::new()
+            .name("nrese-vector-graph".to_owned())
+            .spawn(move || {
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()));
+                if built.is_err() {
+                    tracing::error!("building a vector graph failed; searches stay exact");
+                }
+            })
+            .map(drop),
+    };
+    if let Err(error) = started {
         tracing::warn!(%error, "vector graph not built");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A space of [`SYNC_BUILD`] one-dimensional vectors (its graph built in the
+    /// background), and a search that uses its graph.
+    fn large_space() -> (Arc<RwLock<VectorIndex>>, VectorQuery) {
+        let literals: Vec<String> = (0..SYNC_BUILD)
+            .map(|i| nrese_vector::lexical(&[i as f32]))
+            .collect();
+        let entries: Vec<(u64, &str)> = literals
+            .iter()
+            .enumerate()
+            .map(|(id, literal)| (id as u64, literal.as_str()))
+            .collect();
+        let mut index = VectorIndex::default();
+        index.extend(&entries, entries.len() as u64);
+        (Arc::new(RwLock::new(index)), VectorQuery::new(vec![1.0], 1))
+    }
+
+    /// A background build holds its space's reservation until it ends, and only its own
+    /// end releases it (PR #79 review, R79-01). The schedule of the public calls: a
+    /// search starts background build A; a warm-up builds the graph meanwhile; more
+    /// vectors arrive, and a search finds the graph behind again; A is cancelled. No
+    /// second build starts while A holds the reservation (the warm-up's install doesn't
+    /// end it), and after A's cancellation exactly one does, B, beside which no third
+    /// starts until B ends. B installs its graph; more vectors arrive and a search starts
+    /// C before B's end (its drop) runs, which leaves C's reservation standing (Sol r1).
+    #[test]
+    fn a_build_s_reservation_is_ended_by_that_build_alone() {
+        let (index, query) = large_space();
+        let held: Arc<parking_lot::Mutex<Vec<VectorBuild>>> = Arc::default();
+        let builder: VectorBuilder = {
+            let held = Arc::clone(&held);
+            Arc::new(move |build| {
+                held.lock().push(build);
+                Ok(())
+            })
+        };
+        // A search that needs the graph: what search_vectors does.
+        let search = || {
+            let work = index.write().work_for(&query);
+            if let Work::Background(reservation) = work {
+                build_in_background(
+                    Arc::clone(&index),
+                    query.clone(),
+                    reservation,
+                    Some(&builder),
+                );
+            }
+        };
+        search();
+        assert_eq!(held.lock().len(), 1, "build A starts");
+        // A warm-up (prepare_vector_graph) builds and installs the graph on its own.
+        build(&index, &query, None);
+        // A tenth more vectors: the graph is behind enough to be extended.
+        let grow = || {
+            let start = index.read().covered();
+            let more: Vec<String> = (start..start + start / 10 + 1)
+                .map(|i| nrese_vector::lexical(&[i as f32]))
+                .collect();
+            let entries: Vec<(u64, &str)> = more
+                .iter()
+                .enumerate()
+                .map(|(at, literal)| (start + at as u64, literal.as_str()))
+                .collect();
+            index.write().extend(&entries, start + entries.len() as u64);
+        };
+        grow();
+        search();
+        assert_eq!(
+            held.lock().len(),
+            1,
+            "no build beside A, whose reservation stands"
+        );
+        drop(held.lock().remove(0));
+        search();
+        assert_eq!(held.lock().len(), 1, "A cancelled: build B starts");
+        search();
+        assert_eq!(held.lock().len(), 1, "no build C beside B");
+        // B's run up to its end: its install.
+        let b = held.lock().remove(0);
+        build(&b.index, &b.query, Some(b.reservation));
+        grow();
+        search();
+        assert_eq!(held.lock().len(), 1, "B installed: build C starts");
+        drop(b);
+        search();
+        assert_eq!(held.lock().len(), 1, "B's end leaves C's reservation: no D");
+        held.lock().remove(0).run();
+        assert!(
+            !index.read().may_need_work(&query),
+            "C's graph covers the space"
+        );
+    }
+
+    /// A background build that couldn't start, or ended without a graph, leaves the space
+    /// to the next search to start another (B-401: a refused spawn kept it marked as
+    /// building, and no later search built its graph).
+    #[test]
+    fn a_build_that_ends_without_a_graph_is_started_again() {
+        let (index, query) = large_space();
+        let refuse: VectorBuilder = Arc::new(|_| Err(std::io::Error::other("no thread")));
+        let abandon: VectorBuilder = Arc::new(|build| {
+            drop(build);
+            Ok(())
+        });
+        for (builder, ended) in [(refuse, "refused"), (abandon, "abandoned")] {
+            let Work::Background(reservation) = index.write().work_for(&query) else {
+                panic!("{ended}: a build starts");
+            };
+            build_in_background(
+                Arc::clone(&index),
+                query.clone(),
+                reservation,
+                Some(&builder),
+            );
+            assert!(
+                index.read().may_need_work(&query),
+                "{ended}: the next search starts another"
+            );
+        }
     }
 }

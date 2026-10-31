@@ -1,11 +1,13 @@
 //! Derived indexes kept on disk (`term/derived.rs`): the text indexes and the vector
 //! index are written after a checkpoint and read at their first use after a reopen, then
 //! extended with the terms interned since; a file that doesn't fit is ignored. And the
-//! vector graph of a large space built on a thread while searches scan.
+//! vector graph of a large space built in the background while searches scan.
 
+use nrese_engine::term::vectors::VectorBuild;
 use nrese_engine::vector::{DATATYPE, Metric, lexical};
 use nrese_engine::{
-    DurabilityConfig, Engine, EngineConfig, SyncPolicy, TextQuery, VectorQuery, VectorStrategy,
+    DurabilityConfig, Engine, EngineConfig, SyncPolicy, TextQuery, VectorQuery, VectorSearchReport,
+    VectorStrategy,
 };
 use nrese_rdf::{GraphNameRef, Literal, NamedNode, QuadRef};
 
@@ -133,15 +135,22 @@ fn files_of_another_store_are_ignored() {
     assert_eq!(engine.stats().dictionary.derived_loaded, 0);
 }
 
-/// A space past the size built at once: the first search scans while a thread builds
-/// the graph; later searches use it.
+/// A space past the size built at once: the first search starts the graph's build in the
+/// background and answers exactly; searches while it is pending start no other and stay
+/// exact; once it has run, searches use the graph.
 #[test]
-fn large_graphs_are_built_on_a_thread() {
+fn large_graphs_are_built_in_the_background() {
     let engine = Engine::new(EngineConfig {
         background_maintenance: false,
         ..EngineConfig::default()
     })
     .unwrap();
+    // The engine's builds are held here until the test runs them.
+    let (held, builds) = std::sync::mpsc::channel::<VectorBuild>();
+    engine.run_vector_builds_with(std::sync::Arc::new(move |build| {
+        held.send(build)
+            .map_err(|_| std::io::Error::other("the test has ended"))
+    }));
     let mut tx = engine.transaction();
     for i in 0..60_000usize {
         let a = (i as f32 * 0.37).sin();
@@ -159,21 +168,37 @@ fn large_graphs_are_built_on_a_thread() {
         ..VectorQuery::new(vec![0.3, 0.4, 5.0], 5)
     };
     let snapshot = engine.snapshot();
-    let (first, report) = snapshot.vector_search(&query, &|_| true);
-    assert!(!report.graph && report.scanned == 60_000, "{report:?}");
-    let mut waited = 0;
-    loop {
+    let exact = VectorQuery {
+        strategy: VectorStrategy::Exact,
+        ..query.clone()
+    };
+    let (nearest, _) = snapshot.vector_search(&exact, &|_| true);
+    let scanned = VectorSearchReport {
+        space: 60_000,
+        graph: false,
+        scanned: 60_000,
+    };
+    // Pending: every search scans and answers exactly; the first started the one build.
+    for search in ["first", "second"] {
         let (found, report) = snapshot.vector_search(&query, &|_| true);
-        if report.graph {
-            let shared = found
-                .iter()
-                .filter(|(id, _)| first.iter().any(|(f, _)| f == id))
-                .count();
-            assert!(shared >= 4, "{shared} of 5");
-            break;
-        }
-        waited += 1;
-        assert!(waited < 600, "no graph after a minute");
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(report, scanned, "{search} search");
+        assert_eq!(found, nearest, "{search} search");
     }
+    let build = builds.try_recv().expect("the first search started a build");
+    assert!(builds.try_recv().is_err(), "one build while it is pending");
+    build.run();
+    let (found, report) = snapshot.vector_search(&query, &|_| true);
+    assert_eq!(
+        report,
+        VectorSearchReport {
+            graph: true,
+            scanned: 0,
+            ..scanned
+        }
+    );
+    let shared = found
+        .iter()
+        .filter(|(id, _)| nearest.iter().any(|(f, _)| f == id))
+        .count();
+    assert!(shared >= 4, "{shared} of the 5 nearest");
 }

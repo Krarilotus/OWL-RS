@@ -516,6 +516,9 @@ pub struct Dictionary {
     /// The vector literals, built at the first vector search and extended at later ones
     /// ([`super::vectors`]).
     vectors: std::sync::Arc<RwLock<super::vectors::VectorIndex>>,
+    /// Runs the vector graph builds searches start in the background; unset, each gets a
+    /// thread of its own.
+    vector_builder: RwLock<Option<super::vectors::VectorBuilder>>,
     /// The text order of the entries the mapped base doesn't order ([`super::order`]).
     order: RwLock<super::order::TextOrder>,
     /// Integer-derived literals (`xsd:int`, ...) are dictionary entries, not inline
@@ -984,11 +987,16 @@ impl Dictionary {
             let work = self.vectors.write().work_for(query);
             match work {
                 super::vectors::Work::None => {}
-                super::vectors::Work::Now => super::vectors::build(&self.vectors, query),
-                super::vectors::Work::Background => super::vectors::build_in_background(
-                    std::sync::Arc::clone(&self.vectors),
-                    query.clone(),
-                ),
+                super::vectors::Work::Now => super::vectors::build(&self.vectors, query, None),
+                super::vectors::Work::Background(reservation) => {
+                    let builder = self.vector_builder.read().clone();
+                    super::vectors::build_in_background(
+                        std::sync::Arc::clone(&self.vectors),
+                        query.clone(),
+                        reservation,
+                        builder.as_ref(),
+                    );
+                }
             }
         }
         let accept = |raw: u64| {
@@ -1008,8 +1016,14 @@ impl Dictionary {
             ..query.clone()
         };
         if self.vectors.read().may_need_work(&query) {
-            super::vectors::build(&self.vectors, &query);
+            // A warm-up holds no reservation, and ends none a background build holds.
+            super::vectors::build(&self.vectors, &query, None);
         }
+    }
+
+    /// Runs the vector graph builds searches start from now on through `builder`.
+    pub(crate) fn set_vector_builder(&self, builder: super::vectors::VectorBuilder) {
+        *self.vector_builder.write() = Some(builder);
     }
 
     /// The vector index, from its file at the first use, then with the vector literals
