@@ -27,6 +27,21 @@ pub fn pattern(s: Option<TermId>, p: Option<TermId>, o: Option<TermId>) -> QuadP
     }
 }
 
+/// The keys one statement places at its subject's anchor and at its object's, over the store's
+/// permutations (`orders`, [`Snapshot::asserted_key_orders`]): a permutation is placed by its
+/// first node component, subject or object; predicate and graph never place (the storage
+/// proposal's anchor rule, §3).
+pub fn anchor_keys(orders: &[[usize; 4]]) -> (u64, u64) {
+    let mut keys = (0, 0);
+    for order in orders {
+        match order.iter().find(|&&c| c == 0 || c == 2) {
+            Some(0) => keys.0 += 1,
+            _ => keys.1 += 1,
+        }
+    }
+    keys
+}
+
 /// What a step cost.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Work {

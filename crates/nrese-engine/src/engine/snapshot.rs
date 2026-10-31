@@ -902,6 +902,14 @@ impl Snapshot {
         self.version.revision
     }
 
+    /// The permutations the asserted stack holds, each as its key order: the components
+    /// (subject 0, predicate 1, object 2, graph 3) from the key's first position to its last.
+    /// Every asserted statement is one key in each.
+    pub fn asserted_key_orders(&self) -> Vec<[usize; 4]> {
+        let layout = self.version.asserted.layout();
+        layout.permutations().iter().map(|p| p.order()).collect()
+    }
+
     /// What this snapshot reads, for caches of results computed on it: two snapshots with
     /// the same identity answer every read alike. A transaction's pending state or a
     /// masked view has an identity of its own, though it keeps its base's revision.
