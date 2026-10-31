@@ -599,6 +599,50 @@ mod tests {
         tx.commit().unwrap();
     }
 
+    /// A read that expands equality classes has no heavy groups (its groups aren't the
+    /// index's), also where a read of the same version as stored walked and kept them: a
+    /// kept list answered both, and an empty one turned an expanding count's budget off
+    /// (Sol, P2 sol-loop r1 S1).
+    #[test]
+    fn an_expanding_read_has_no_heavy_groups_kept_for_a_stored_one() {
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let node = |name: &str| NamedNode::new_unchecked(format!("http://example.com/{name}"));
+        let mut tx = engine.transaction();
+        let rep = tx.intern(node("rep").as_ref().into());
+        let same_as = tx.intern(node("sameAs").as_ref().into());
+        let alias = tx.intern(node("alias").as_ref().into());
+        tx.insert_inferred(crate::EncodedTriple {
+            subject: alias,
+            predicate: same_as,
+            object: rep,
+        });
+        for i in 0..3 {
+            let object = node(&format!("o{i}"));
+            tx.insert(Quad::new(node("rep"), node("p"), object, GraphName::DefaultGraph).as_ref());
+        }
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let snapshot = engine.snapshot();
+        let heavy = |snapshot: &Snapshot| {
+            snapshot.heavy_groups_in(
+                ReadModel::Materialised,
+                &QuadPattern::all(),
+                Permutation::Spog,
+                1,
+            )
+        };
+        assert!(heavy(&snapshot.stored()).is_some_and(|groups| !groups.is_empty()));
+        assert_eq!(
+            heavy(&snapshot),
+            None,
+            "an expanding read walks no index groups"
+        );
+    }
+
     /// A pattern's heavy groups are walked once per version: asked again, of the same
     /// snapshot or another of the same version, they are the ones kept; a commit's version
     /// walks again and finds what it holds. Walked per query, they made counting uniform
