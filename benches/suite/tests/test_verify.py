@@ -29,6 +29,8 @@ import time
 import unittest
 from pathlib import Path
 
+import isolation
+
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "scripts/verify"))
 sys.path.append(str(ROOT / "benches/suite"))  # suitekit, after the standard modules (queue.py)
@@ -431,11 +433,10 @@ class OwnTarget(unittest.TestCase):
         for name, body in {"rustup": "exit 0", "rustc": 'echo "release: 1.98.1"'}.items():
             (stubs / name).write_text(f"#!/bin/sh\n{body}\n")
             (stubs / name).chmod(0o755)
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "NRESE_", "FLEET_", "CARGO_"))}
-        env.update(HOME=str(self.root), PATH=f"{stubs}:{env['PATH']}", NRESE_VERIFY_CACHE=str(self.cache),
-                   SEEN=str(self.seen),
-                   CARGO_TARGET_DIR=str(self.cache / "target-1.98.1"))  # a host's own setting: the shared directory
-        self.env = env
+        self.env = isolation.inherit(
+            "NRESE_", "FLEET_", "CARGO_", HOME=str(self.root), PATH=f"{stubs}:{os.environ['PATH']}",
+            NRESE_VERIFY_CACHE=str(self.cache), SEEN=str(self.seen),
+            CARGO_TARGET_DIR=str(self.cache / "target-1.98.1"))  # a host's own setting: the shared directory
 
     def commit(self, name: str) -> Path:
         """A checkout of one commit of its own, whose cargo-guarded.sh says where it builds and
