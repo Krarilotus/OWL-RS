@@ -84,24 +84,29 @@ struct Process {
 
 impl Process {
     fn spawn(command: &mut Command) -> std::io::Result<Self> {
-        let mut child = command
+        let child = command
             // Plain log lines, without terminal colours.
             .env("NO_COLOR", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()?;
-        let output = Arc::<Mutex<String>>::default();
         let (sender, lines) = mpsc::channel();
-        let stdout = child.stdout.take().expect("piped");
-        let stderr = child.stderr.take().expect("piped");
+        // Owned from here on: whatever fails below kills and reaps the child (Drop).
+        let mut process = Self {
+            child,
+            output: Arc::default(),
+            lines,
+        };
+        let stdout = process.child.stdout.take().expect("piped");
+        let stderr = process.child.stderr.take().expect("piped");
         for stream in [
             Box::new(stdout) as Box<dyn std::io::Read + Send>,
             Box::new(stderr),
         ] {
-            let output = Arc::clone(&output);
+            let output = Arc::clone(&process.output);
             let sender = sender.clone();
-            std::thread::spawn(move || {
+            std::thread::Builder::new().spawn(move || {
                 for line in BufReader::new(stream).lines() {
                     let Ok(line) = line else { break };
                     let mut kept = output.lock().unwrap_or_else(|p| p.into_inner());
@@ -110,13 +115,9 @@ impl Process {
                     drop(kept);
                     let _ = sender.send(line);
                 }
-            });
+            })?;
         }
-        Ok(Self {
-            child,
-            output,
-            lines,
-        })
+        Ok(process)
     }
 
     fn output(&self) -> String {
