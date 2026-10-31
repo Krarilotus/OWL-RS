@@ -810,7 +810,7 @@ pub fn update_with<B: Base + ?Sized>(
         candidates.extend(run_jobs(&state, &jobs, &|fact| !state.contains(fact), stop));
         check_stop()?;
         if let Some(equality) = &mut equality {
-            candidates.extend(equality.run(&state));
+            candidates.extend(equality.run(&state)?);
         }
         drop(jobs);
         // Transitive properties: newly declared ones closed in full (SCC condensation), the

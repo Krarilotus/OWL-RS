@@ -1803,11 +1803,16 @@ impl Equality {
     }
 
     /// The expansions of the delta of `store` (see the type's docs), not yet in it.
-    pub(crate) fn run<S: Source + ?Sized>(&mut self, store: &S) -> Vec<Triple> {
+    /// [`Interrupted`] where they don't fit what the process may still take at the round's
+    /// start ([`super::eval::memory_room`]), charged before each allocation of them.
+    pub(crate) fn run<S: Source + ?Sized>(
+        &mut self,
+        store: &S,
+    ) -> Result<Vec<Triple>, Interrupted> {
         let equalities = store.estimate([None, Some(self.same_as), None], Seg::All);
         if equalities == 0 {
             self.produced.clear();
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let same_as = self.same_as;
         // A fact mentioning no term with a partner expands to itself only (#12 of the
@@ -1871,9 +1876,14 @@ impl Equality {
         seeds.par_sort_unstable();
         seeds.dedup();
         self.member_scans += 3 * seeds.len() as u64;
-        let out: Vec<Triple> = seeds
+        let room = super::eval::memory_room();
+        let room = nrese_exec::Budget::new(usize::try_from(room).unwrap_or(usize::MAX));
+        let charge = |bytes: usize| room.charge(bytes).is_ok();
+        let release = |bytes: usize| room.release(bytes);
+        let fact_bytes = size_of::<Triple>();
+        let lists: Vec<Vec<Triple>> = seeds
             .par_iter()
-            .flat_map_iter(|&[s, p, o]| {
+            .map(|&[s, p, o]| {
                 let (ms, mp, mo) = (
                     self.members(store, s),
                     self.members(store, p),
@@ -1885,16 +1895,39 @@ impl Equality {
                         for &o in &mo {
                             let fact = [s, p, o];
                             if !store.contains(fact) {
-                                facts.push(fact);
+                                // A full list moves to a buffer twice its size, at least 4.
+                                if facts.len() == facts.capacity() {
+                                    let old = facts.capacity() * fact_bytes;
+                                    if !charge((2 * facts.capacity()).max(4) * fact_bytes) {
+                                        return Err(Interrupted);
+                                    }
+                                    facts.push(fact);
+                                    release(old);
+                                } else {
+                                    facts.push(fact);
+                                }
                             }
                         }
                     }
                 }
-                facts
+                Ok(facts)
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
+        // The round's list beside the seeds' lists; then, those freed, its set: under three
+        // slots a fact (a power of two, filled to 7/8), each a fact and a control byte.
+        let total: usize = lists.iter().map(Vec::len).sum();
+        let held: usize = lists.iter().map(|list| list.capacity() * fact_bytes).sum();
+        if !charge(total * fact_bytes) {
+            return Err(Interrupted);
+        }
+        let out = lists.concat();
+        drop(lists);
+        release(held);
+        if !charge(total * 3 * (fact_bytes + 1)) {
+            return Err(Interrupted);
+        }
         self.produced = out.iter().copied().collect();
-        out
+        Ok(out)
     }
 }
 
@@ -2557,7 +2590,7 @@ fn run(
         ));
         result.counters.closure_pairs.push(transitive.read);
         if let Some(equality) = &mut equality {
-            candidates.push((None, segments(equality.run(&store))));
+            candidates.push((None, segments(equality.run(&store)?)));
         }
         let mut merged = false;
         // New equalities merge classes: the round's candidates and the stored facts that
@@ -2698,7 +2731,7 @@ fn run(
     let mut derived = match representatives {
         None => store.into_derived(),
         Some(reps) => {
-            let derived = list(store, &reps);
+            let derived = list(store, &reps)?;
             result.classes = reps.classes;
             result.merges = reps.merges;
             derived
@@ -2711,10 +2744,12 @@ fn run(
 }
 
 /// What a materialisation with equality by representatives lists ([`Listing`]).
-fn list(store: Store, reps: &Representatives) -> Vec<Triple> {
+/// [`Interrupted`] where the expanded closure doesn't fit what the process may still take
+/// ([`super::eval::memory_room`]).
+fn list(store: Store, reps: &Representatives) -> Result<Vec<Triple>, Interrupted> {
     let (stale, shared) = (&reps.stale, &reps.shared);
     let current = |fact: Triple| !stale.mentioned(fact);
-    match reps.listing {
+    Ok(match reps.listing {
         Listing::Representatives => store.into_listed(&current, &current, Vec::new()),
         // Without classes, what was added.
         Listing::Stored | Listing::Expanded if reps.classes.is_empty() => store.into_derived(),
@@ -2725,24 +2760,52 @@ fn list(store: Store, reps: &Representatives) -> Vec<Triple> {
         ),
         Listing::Expanded => {
             // The facts that mention a class, expanded while the input is there to leave
-            // its facts out; the others as they are.
-            let expanded: Vec<Triple> = store
-                .facts_where(&|fact| current(fact) && shared.mentioned(fact))
+            // its facts out; the others as they are. The copies are counted and admitted
+            // before any is made, twice over: the parallel collection holds its parts and
+            // the list at once.
+            let facts = store.facts_where(&|fact| current(fact) && shared.mentioned(fact));
+            let size = |id: u64| {
+                reps.classes
+                    .class_of(id)
+                    .map_or(1, |class| class.len() as u64)
+            };
+            let copies = facts.iter().try_fold(0u64, |sum, fact| {
+                let copies = fact
+                    .iter()
+                    .try_fold(1u64, |n, &id| n.checked_mul(size(id)))?;
+                sum.checked_add(copies)
+            });
+            let bytes =
+                copies.and_then(|copies| copies.checked_mul(2 * size_of::<Triple>() as u64));
+            if !bytes.is_some_and(|bytes| bytes <= super::eval::memory_room()) {
+                return Err(Interrupted);
+            }
+            // A fact's copies the allocator refuses end the listing too.
+            let refused = std::sync::atomic::AtomicBool::new(false);
+            let expanded: Vec<Triple> = facts
                 .into_par_iter()
-                .flat_map_iter(|fact| reps.classes.expand(fact))
+                .flat_map_iter(|fact| {
+                    reps.classes.expand(fact).unwrap_or_else(|| {
+                        refused.store(true, std::sync::atomic::Ordering::Relaxed);
+                        Vec::new()
+                    })
+                })
                 .filter(|&[s, p, o]| {
                     !store
                         .relation(p)
                         .is_some_and(|relation| relation.input.contains(s, o))
                 })
                 .collect();
+            if refused.into_inner() {
+                return Err(Interrupted);
+            }
             store.into_listed(
                 &|_| false,
                 &|fact| current(fact) && !shared.mentioned(fact),
                 expanded,
             )
         }
-    }
+    })
 }
 
 /// What ground rules read of the relations: which relations they can look up by object
