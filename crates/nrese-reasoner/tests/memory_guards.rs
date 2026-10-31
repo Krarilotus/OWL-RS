@@ -270,3 +270,71 @@ fn equality_keeps_the_working_set_as_the_only_copy() {
 
 /// See [`relations_keep_no_object_order_their_rules_never_use`].
 const BYTES_PER_FACT: usize = 26;
+
+/// The equality copies a materialisation adds (by replication) or lists (by
+/// representatives, expanded) are admitted against the process's memory limit before they
+/// are made: past it, the materialisation stops while the heap holds a fraction of what
+/// they would take. One class of 300 identities and one fact over it in all three places
+/// are 27 M copies, about 650 MB, under a limit 64 MiB above what the process holds.
+#[test]
+fn equality_copies_past_the_memory_limit_stop_before_they_are_made() {
+    use nrese_reasoner::ir::{OWL, Vocabulary};
+
+    /// The process's memory limit cleared when the test ends, however it ends.
+    struct Unlimited;
+    impl Drop for Unlimited {
+        fn drop(&mut self) {
+            nrese_exec::memory::set_process_limit(0);
+        }
+    }
+
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let mut vocabulary = LocalVocabulary::default();
+    let rules = Ruleset::Owl2Rl
+        .rules(&mut vocabulary)
+        .expect("OWL 2 RL parses");
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let schema = Schema::owl(&mut vocabulary);
+    let same_as = vocabulary.iri(&format!("{OWL}sameAs"));
+    let rep = vocabulary.iri("http://example.com/rep");
+    let mut facts = vec![[rep, rep, rep]];
+    for i in 1..300 {
+        let identity = vocabulary.iri(&format!("http://example.com/i{i}"));
+        facts.push([identity, same_as, rep]);
+    }
+    let held = nrese_exec::memory::process_bytes().expect("the process's memory reads here");
+    let _unlimited = Unlimited;
+    nrese_exec::memory::set_process_limit(held + (64 << 20));
+    for replicate in [false, true] {
+        let input = grouped(facts.clone());
+        let before = heap::live();
+        heap::start("input");
+        let result = match replicate {
+            true => batch::materialise_grouped_until(
+                input,
+                &rules,
+                Some(&lists),
+                &schema,
+                nrese_reasoner::eval::NEVER,
+            ),
+            false => batch::materialise_representatives_until(
+                batch::Input::Grouped(input),
+                &rules,
+                Some(&lists),
+                &schema,
+                batch::Listing::Expanded,
+                nrese_reasoner::eval::NEVER,
+            ),
+        };
+        let phases = heap::finish();
+        let peak = phases.iter().map(|phase| phase.peak).max().expect("phases") - before;
+        assert!(
+            result.is_err(),
+            "replicate {replicate}: the copies were made"
+        );
+        assert!(
+            peak < 64 << 20,
+            "replicate {replicate}: {peak} bytes at the heap's peak"
+        );
+    }
+}

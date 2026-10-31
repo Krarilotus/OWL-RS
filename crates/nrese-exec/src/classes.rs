@@ -98,14 +98,17 @@ impl Classes {
     }
 
     /// Every fact a fact over representatives stands for: each combination of its ids'
-    /// members.
-    pub fn expand(&self, [s, p, o]: [u64; 3]) -> Vec<[u64; 3]> {
+    /// members. `None` where they are more than a `usize` counts or the allocator gives,
+    /// refused before any is made.
+    pub fn expand(&self, [s, p, o]: [u64; 3]) -> Option<Vec<[u64; 3]>> {
         let (ms, mp, mo) = (
             self.class_of(s).unwrap_or(std::slice::from_ref(&s)),
             self.class_of(p).unwrap_or(std::slice::from_ref(&p)),
             self.class_of(o).unwrap_or(std::slice::from_ref(&o)),
         );
-        let mut out = Vec::with_capacity(ms.len() * mp.len() * mo.len());
+        let copies = ms.len().checked_mul(mp.len())?.checked_mul(mo.len())?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(copies).ok()?;
         for &s in ms {
             for &p in mp {
                 for &o in mo {
@@ -113,7 +116,7 @@ impl Classes {
                 }
             }
         }
-        out
+        Some(out)
     }
 
     /// Merges the classes of `a` and `b`; returns the representative that lost its place
@@ -187,7 +190,10 @@ mod tests {
         assert!(classes.is_representative(3) && !classes.is_representative(5));
         assert!(classes.is_representative(42));
         assert_eq!(classes.rewrite([9, 1, 42]), [3, 1, 42]);
-        assert_eq!(classes.expand([3, 1, 42]).len(), 4);
+        assert_eq!(
+            classes.expand([3, 1, 42]).map(|copies| copies.len()),
+            Some(4)
+        );
         // The representative that lost its place is reported, whichever side is larger.
         assert_eq!(classes.union(2, 7), Some(3));
         assert_eq!(classes.members(9), &[2, 3, 5, 7, 9]);
@@ -210,5 +216,15 @@ mod tests {
         }
         assert_eq!(classes.representative(n), 0);
         assert_eq!(classes.class_of(n).map(<[u64]>::len), Some(n as usize + 1));
+    }
+
+    /// Copies past what a `usize` counts are refused before any is made. One class of 2^22
+    /// members built directly (32 MB): a fact over it in all three places is 2^66 copies.
+    #[test]
+    fn copies_past_a_usize_are_refused_before_they_are_made() {
+        let mut classes = Classes::default();
+        classes.parent.insert(0, 0);
+        classes.roots.insert(0, (0, (0..1 << 22).collect()));
+        assert_eq!(classes.expand([0, 0, 0]), None);
     }
 }

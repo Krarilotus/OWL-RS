@@ -790,6 +790,20 @@ pub fn over_memory_limit() -> bool {
     nrese_exec::memory::process_limit_exceeded()
 }
 
+/// What the process may still take now: what its memory limit leaves, if one is set (less
+/// what it holds, as [`over_memory_limit`] reads it), and at most what the system leaves
+/// it. A reading that can't be taken leaves no room. Read once before allocations whose
+/// size is known, which the polls of [`over_memory_limit`] would only see once they are
+/// made.
+pub(crate) fn memory_room() -> u64 {
+    use nrese_exec::memory;
+    let limit_room = match memory::process_limit() {
+        Some(limit) => memory::process_bytes().map_or(0, |held| limit.saturating_sub(held)),
+        None => u64::MAX,
+    };
+    memory::remaining_bytes().map_or(0, |remaining| limit_room.min(remaining))
+}
+
 /// Every fact `jobs` derive that `keep` accepts. If `stop` fires, the remaining morsels
 /// are skipped and the result is incomplete: the caller must check `stop` and discard it.
 pub fn run_jobs<S: Source + ?Sized>(
