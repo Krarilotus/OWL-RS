@@ -2,7 +2,8 @@
 commit is gated on the fleet, by its own tree and the files of the pushed range, and only a verified
 fleet result for exactly that tree lets it through. No verdict means no push: nothing runs here
 instead. A push of deletions alone has no tree to gate. The merge check's Windows part
-(scripts/check.sh windows, scripts/lib/windows-job.sh) is gated the same way, on a Windows host.
+(scripts/check.sh windows, scripts/lib/windows-job.sh) is gated the same way, on a Windows host, and
+a push to refactor/engine-v2 needs it too.
 
 Run: python -m unittest discover -s benches/suite/tests -p test_push_gate.py
 An assertion tagged `SPEC <tag>` states the behaviour its test is for.
@@ -227,6 +228,30 @@ class PushGate(Repo):
         self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", first))
         self.assertEqual(self.jobs(), [(tip, self.tree(tip), ["a.txt", "b.txt"]), (tip, self.tree(tip), ["b.txt"])],
                          "SPEC pushed-range: the gate wasn't told the pushed range's files, for the pushed commit")
+
+    def test_landing_on_engine_v2_takes_the_windows_part_too(self):
+        """A push to refactor/engine-v2 lands a merge: besides the push tier it needs the merge
+        check's Windows part for the pushed commit, since nothing else builds and tests it on Windows
+        before it lands (the commit tier builds nothing). With no Windows verdict the push is refused;
+        the merge check's own pass, stored for the commit's inputs, serves without a new job."""
+        tip = self.commit("a.txt", "a changed\n")
+        self.fleet("done", self.tree(tip), ["a.txt"])  # the push tier passes; no Windows result anywhere
+        landing = ("refs/heads/refactor/engine-v2", tip, "refs/heads/refactor/engine-v2", self.base)
+        done = self.push(landing)
+        jobs = sorted(self.fake.glob("job-*.toml"))
+        self.assertNotEqual(done.returncode, 0, f"SPEC landing-windows: engine-v2 took a commit no Windows check "
+                                                f"passed\n{done.stderr}")
+        self.assertEqual([('os = "windows"' in j.read_text(), f'rev = "{tip}"' in j.read_text()) for j in jobs],
+                         [(False, True), (True, True)],
+                         "SPEC landing-windows: not the push tier, then the Windows part, both for the pushed commit")
+        self.fleet("done", self.tree(tip), [], tier="windows")
+        merge_check = subprocess.run([BASH, "scripts/check.sh", "windows", tip], cwd=self.repo, capture_output=True,
+                                     text=True, env=self.env, timeout=120)
+        self.assertEqual(merge_check.returncode, 0, merge_check.stderr)
+        self.fleet("pending")
+        again = self.push(landing)
+        self.assertEqual((again.returncode, len(list(self.fake.glob("job-*.toml")))), (0, 3),
+                         f"SPEC landing-windows-reuse: the merge check's pass didn't serve the push\n{again.stderr}")
 
 
 class FleetGate(Repo):

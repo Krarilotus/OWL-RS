@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # The push tier for each pushed commit, on the fleet (scripts/check.sh push): the commit's own
 # tree, with the files from where the remote has its branch (new there: where it left
-# refactor/engine-v2) to the commit. A ref the push only deletes has no tree to gate. Milestones
-# run scripts/check.sh all. Enabling the hooks: CONTRIBUTING.md.
+# refactor/engine-v2) to the commit. A ref the push only deletes has no tree to gate. A push to
+# refactor/engine-v2 lands its commit, so it also takes the merge check's Windows part
+# (scripts/check.sh windows): a tree lands only when its push tier passed for that exact tree, and
+# its Windows inputs (scripts/lib/gate-key.sh windows_inputs) passed the Windows check. The merge
+# check's own pass for those inputs serves at once. Milestones run scripts/check.sh all. Enabling
+# the hooks: CONTRIBUTING.md.
 #
 # Git's lines on stdin: <local ref> <local sha> <remote ref> <remote sha>; $1 is the remote, $2 its
 # URL, which a measurement ref's check asks for its branches (NRESE_PUSH_REMOTE).
@@ -25,8 +29,14 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   fi
   # The build-host variables are the gate's own (check.sh, gate-job.sh, remote.sh): from the pusher's
   # environment they would pick the in-job branch, which runs a sent list here, not the fleet gate.
-  env -u NRESE_ON_BUILD_HOST -u NRESE_FILES_FROM NRESE_PUSH_COMMIT="$local_sha" NRESE_PUSH_BASE="$base" \
-    NRESE_PUSH_REF="$remote_ref" NRESE_PUSH_REMOTE="$url" bash scripts/check.sh push < /dev/null || code=1
+  if ! env -u NRESE_ON_BUILD_HOST -u NRESE_FILES_FROM NRESE_PUSH_COMMIT="$local_sha" NRESE_PUSH_BASE="$base" \
+    NRESE_PUSH_REF="$remote_ref" NRESE_PUSH_REMOTE="$url" bash scripts/check.sh push < /dev/null; then
+    code=1
+    continue
+  fi
+  if [ "$remote_ref" = refs/heads/refactor/engine-v2 ]; then
+    env -u NRESE_ON_BUILD_HOST -u NRESE_FILES_FROM bash scripts/check.sh windows "$local_sha" < /dev/null || code=1
+  fi
 done
 [ $gated -gt 0 ] || echo "pre-push: deletions only, nothing to gate" >&2
 exit $code
