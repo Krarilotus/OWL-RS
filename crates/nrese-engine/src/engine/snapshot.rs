@@ -290,6 +290,35 @@ pub struct SnapshotIdentity {
     pub canonical: bool,
 }
 
+/// How many quads a count found ([`Snapshot::count_in`]): all of them, or, where equality
+/// expansion stands for more than a `u64` holds, at least this many. Planning and existence
+/// take [`Self::at_least`]; an answer that must be exact takes [`Self::exact`] and says so
+/// where there is none (PR #70 fix check 2 F3: a capped count was published as an exact
+/// SPARQL `COUNT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Count {
+    Exact(u64),
+    AtLeast(u64),
+}
+
+impl Count {
+    /// The count, where it is exact.
+    pub fn exact(self) -> Option<u64> {
+        match self {
+            Count::Exact(n) => Some(n),
+            Count::AtLeast(_) => None,
+        }
+    }
+
+    /// A lower bound: the count where it is exact.
+    pub fn at_least(self) -> u64 {
+        match self {
+            Count::Exact(n) | Count::AtLeast(n) => n,
+        }
+    }
+}
+
 /// The inferred statements a restricted snapshot keeps ([`Snapshot::with_inferred_subset`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InferredSubset {
@@ -784,21 +813,23 @@ impl Snapshot {
     /// The number of quads matching `pattern` in `model`, expanded, counted up to `limit`:
     /// the stored matches over representatives weighted by how many quads each stands for,
     /// without making the copies. With `limit` 1, whether a read finds one (PR #70 r1 S1).
+    /// [`Count::AtLeast`] where it stopped at `limit`, or where the copies pass what a `u64`
+    /// holds (its maximum then; PR #70 fix check 2 F3).
     fn expanded_count(
         &self,
         classes: &EqualityClasses,
         model: ReadModel,
         pattern: &QuadPattern,
         limit: u64,
-    ) -> u64 {
+    ) -> Count {
         let data = self.data(model);
         let normalised = classes.normalised(pattern);
         let visibility = CopyVisibility::new(data, model);
-        let mut count = 0;
+        let mut count: u64 = 0;
         for stack in Stack::ALL {
             for quad in data.stack(stack).scan(&normalised) {
                 if count >= limit {
-                    return count;
+                    return Count::AtLeast(count);
                 }
                 if !quad.graph.is_default_graph() {
                     count += u64::from(
@@ -811,8 +842,7 @@ impl Snapshot {
                     continue;
                 }
                 let touching = classes.touches(&quad);
-                // A multiplicity past `u64` reads as its maximum, and so does the sum.
-                count = count.saturating_add(match visibility.shows_all(touching) {
+                let copies = match visibility.shows_all(touching) {
                     true => classes.multiplicity(&quad, pattern),
                     false => {
                         let (mut copies, wanted) = (0, limit - count);
@@ -823,9 +853,13 @@ impl Snapshot {
                                 false => std::ops::ControlFlow::Continue(()),
                             }
                         });
-                        copies
+                        Some(copies)
                     }
-                });
+                };
+                match copies.and_then(|copies| count.checked_add(copies)) {
+                    Some(sum) => count = sum,
+                    None => return Count::AtLeast(u64::MAX),
+                }
             }
         }
         if count < limit
@@ -842,7 +876,10 @@ impl Snapshot {
                 .take(usize::try_from(limit - count).unwrap_or(usize::MAX))
                 .count() as u64;
         }
-        count
+        match count >= limit {
+            true => Count::AtLeast(count),
+            false => Count::Exact(count),
+        }
     }
 
     /// An estimate of [`count_in`](Self::count_in) for planning, O(r log n): with
@@ -852,18 +889,20 @@ impl Snapshot {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
         let Some(classes) = self.expanding(model, pattern) else {
-            return self.count_in(model, pattern);
+            return self.count_in(model, pattern).at_least();
         };
         let stored = Snapshot {
             version: Arc::clone(self.data(model)),
             ..self.stored()
         };
         let normalised = classes.normalised(pattern);
-        let mut estimate = stored.count_in(ReadModel::Materialised, &normalised);
+        let mut estimate = stored
+            .count_in(ReadModel::Materialised, &normalised)
+            .at_least();
         // Named graphs are read with the pattern's own constants (a canonical snapshot's,
         // over representatives, with the normalised ones).
         if normalised != *pattern && pattern.graph == GraphSelector::Any && !self.canonical {
-            estimate += stored.count_in(ReadModel::Asserted, pattern);
+            estimate += stored.count_in(ReadModel::Asserted, pattern).at_least();
         }
         estimate
     }
@@ -1040,16 +1079,16 @@ impl Snapshot {
         )
     }
 
-    /// Exact number of quads matching `pattern`, asserted and inferred.
-    pub fn count(&self, pattern: &QuadPattern) -> u64 {
+    /// Number of quads matching `pattern`, asserted and inferred ([`Self::count_in`]).
+    pub fn count(&self, pattern: &QuadPattern) -> Count {
         self.count_in(ReadModel::Materialised, pattern)
     }
 
-    /// Exact number of quads matching `pattern` in `model`, without producing them: O(r log n)
+    /// Number of quads matching `pattern` in `model`, without producing them: O(r log n)
     /// per stack when the matching runs hold no tombstones in range (see
-    /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up. Under
-    /// equality, a count of `u64::MAX` or more reads as `u64::MAX`.
-    pub fn count_in(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
+    /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up. Exact,
+    /// except under equality where the copies pass what a `u64` holds: [`Count::AtLeast`].
+    pub fn count_in(&self, model: ReadModel, pattern: &QuadPattern) -> Count {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
@@ -1067,9 +1106,9 @@ impl Snapshot {
                 graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
                 ..*pattern
             };
-            return self.held_count(model, &every) - self.held_count(model, &default);
+            return Count::Exact(self.held_count(model, &every) - self.held_count(model, &default));
         }
-        self.held_count(model, pattern)
+        Count::Exact(self.held_count(model, pattern))
     }
 
     /// The quads `model`'s stacks hold that match `pattern`: range counts, no expansion.
@@ -1088,10 +1127,10 @@ impl Snapshot {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
-            return self.expanded_count(&classes, model, pattern, 1) > 0;
+            return self.expanded_count(&classes, model, pattern, 1).at_least() > 0;
         }
         if pattern.graph == GraphSelector::AnyNamed {
-            return self.count_in(model, pattern) > 0;
+            return self.count_in(model, pattern).at_least() > 0;
         }
         let plan = AccessPlan::for_pattern(pattern);
         Stack::ALL

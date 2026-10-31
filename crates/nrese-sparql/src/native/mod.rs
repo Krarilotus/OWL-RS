@@ -159,6 +159,17 @@ fn unsupported<T>(what: impl Into<String>) -> NativeResult<T> {
     Err(NativeError::Unsupported(what.into()))
 }
 
+/// `count` where it is exact, as an answer needs it; else the engine's range limit as the
+/// query's error, never a capped number (PR #70 fix check 2 F3).
+fn exact_count(count: nrese_engine::Count) -> NativeResult<u64> {
+    count.exact().ok_or_else(|| {
+        QueryEvaluationError::CountBeyondRange {
+            at_least: count.at_least(),
+        }
+        .into()
+    })
+}
+
 type NativeResult<T> = Result<T, NativeError>;
 
 /// Runs `query` on `snapshot` (borrowed from the view, or owned: a transaction's pending
@@ -3666,7 +3677,7 @@ impl<'a> Context<'a> {
                     .scan_columns_in(self.model, &pattern, permutation, &components)
             {
                 let table = if vars.is_empty() {
-                    let rows = self.snapshot.count_in(self.model, &pattern) as usize;
+                    let rows = exact_count(self.snapshot.count_in(self.model, &pattern))? as usize;
                     IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows))
                 } else {
                     IdTable::from_columns(columns)
@@ -4694,7 +4705,7 @@ impl<'a> Context<'a> {
                 // The index counts quads; in the merged default graph a statement in
                 // several graphs is several quads, so there the scan counts.
                 Some(scan) if !scan.repeats_variable() && !scan.merged() => {
-                    self.snapshot.count_in(self.model, &scan.quad_pattern())
+                    exact_count(self.snapshot.count_in(self.model, &scan.quad_pattern()))?
                 }
                 Some(scan) => self.scan(&scan, None)?.table.len() as u64,
                 None => 0,
