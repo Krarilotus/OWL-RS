@@ -430,10 +430,23 @@ pub(crate) mod tests {
                 tx.commit().unwrap();
             }
         }
-        // The log again, each record with its commit time: revision `r` at `r` ms.
+        // The log again, each record with its commit time: revision `r` at `r` ms. First,
+        // that the transactions wrote theirs: a stamp on every commit, and not zero (PR #79
+        // review, R79-02: the rewrite below replaces them; their order is the wall clock's,
+        // which may step back, so it isn't asserted).
+        let mut stamped = 0;
         for (_, path) in super::list_segments(&super::wal_dir(dir.path())).unwrap() {
             let contents = super::read_segment(&path).unwrap();
             assert!(!contents.torn && !contents.integers_in_dictionary);
+            for record in &contents.records {
+                let stamp = record.committed_micros;
+                assert!(
+                    stamp.is_some_and(|at| at > 0),
+                    "revision {}: {stamp:?}",
+                    record.revision
+                );
+                stamped += 1;
+            }
             let mut bytes = super::SEGMENT_MAGIC.to_vec();
             for record in contents.records {
                 let committed_micros = Some(record.revision * 1000);
@@ -445,6 +458,7 @@ pub(crate) mod tests {
             }
             std::fs::write(&path, bytes).unwrap();
         }
+        assert_eq!(stamped, 9, "every commit in the log");
         let engine = Engine::open(dir.path(), config(Some(5_000))).unwrap();
         let snapshot = engine.snapshot();
         assert_eq!(snapshot.revision(), 5);

@@ -987,12 +987,13 @@ impl Dictionary {
             let work = self.vectors.write().work_for(query);
             match work {
                 super::vectors::Work::None => {}
-                super::vectors::Work::Now => super::vectors::build(&self.vectors, query),
-                super::vectors::Work::Background => {
+                super::vectors::Work::Now => super::vectors::build(&self.vectors, query, None),
+                super::vectors::Work::Background(reservation) => {
                     let builder = self.vector_builder.read().clone();
                     super::vectors::build_in_background(
                         std::sync::Arc::clone(&self.vectors),
                         query.clone(),
+                        reservation,
                         builder.as_ref(),
                     );
                 }
@@ -1015,7 +1016,8 @@ impl Dictionary {
             ..query.clone()
         };
         if self.vectors.read().may_need_work(&query) {
-            super::vectors::build(&self.vectors, &query);
+            // A warm-up holds no reservation, and ends none a background build holds.
+            super::vectors::build(&self.vectors, &query, None);
         }
     }
 
