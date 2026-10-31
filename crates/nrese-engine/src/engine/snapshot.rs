@@ -1279,6 +1279,25 @@ impl Snapshot {
         )
     }
 
+    /// The groups of [`Self::group_counts_in`] that more than `min` quads match, in id
+    /// order: exact, and kept for this version once walked, so that a planner asking for
+    /// them per query walks the index once (a counted forest's message budgets,
+    /// `nrese-sparql`'s `wcoj`). `None` where `group_counts_in` can't walk them.
+    pub fn heavy_groups_in(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        min: u64,
+    ) -> Option<Arc<[(TermId, u64)]>> {
+        let read = *self.read_pattern(model, pattern);
+        self.statistics
+            .heavy_groups(self.data(model), model, read, permutation, min, || {
+                let groups = self.group_counts_in(model, pattern, permutation)?;
+                Some(groups.into_iter().filter(|&(_, n)| n > min).collect())
+            })
+    }
+
     /// The values of `components` (subject 0, predicate 1, object 2, graph 3) of the quads
     /// matching `pattern` in `model`, as columns in `permutation`'s order: what
     /// [`scan_sorted_in`](Self::scan_sorted_in) yields, decoded a block and a column at a

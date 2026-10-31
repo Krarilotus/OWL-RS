@@ -39,7 +39,12 @@ pub(super) struct Query<'a> {
     /// The value lists of patterns with a single variable, read once: the same under any
     /// bindings (LUBM q2 intersected the 2007 departments for each of 1000 universities).
     lists: Vec<OnceLock<Option<Vec<u64>>>>,
+    /// Per pattern and position ([`Query::heavy`]), found once.
+    heavy: Vec<OnceLock<Option<Weighted>>>,
 }
+
+/// Values with a count each, in value order.
+type Weighted = Vec<(u64, u64)>;
 
 /// Why a join stopped early.
 pub(super) enum Stop {
@@ -56,6 +61,18 @@ const CHUNKS_PER_THREAD: usize = 4;
 
 /// Solutions a thread produces between two checks of the shared row count.
 const ROW_STEP: usize = 4096;
+
+/// A child's message to its parent in a counted forest ([`Query::weights`]) is built from
+/// the child's values while it stays within this many times the shortest list of the
+/// parent's values (at least [`MESSAGE_MIN`] entries); past that, the parent's values in
+/// that list are counted one by one against the child's weights instead. On hub-skewed
+/// data the message gathers every neighbour of every hub only to be cut down to a dozen
+/// values (kernel-intersect's skewed triangles: 107 ms against main's 85 ms enumerating
+/// them, 18 Oct 2026).
+const MESSAGE_FACTOR: usize = 64;
+
+/// The least message built before [`MESSAGE_FACTOR`] applies.
+const MESSAGE_MIN: usize = 64;
 
 /// Candidates of the first variable a sampled estimate joins ([`Query::estimate`]).
 const SAMPLES: usize = 128;
@@ -90,6 +107,10 @@ pub(super) struct Stats {
     /// For a count ([`Query::count_solutions`]): the variables bound before the rest was counted as
     /// a forest, a prefix of the order.
     pub counted_after: Option<usize>,
+    /// Whether its messages were budgeted ([`Forest::budgeted`]).
+    pub budgeted: Option<bool>,
+    /// The entries of the forest's messages gathered from children's values.
+    pub messages: AtomicUsize,
 }
 
 /// Where a join's solutions go.
@@ -116,6 +137,10 @@ struct Forest {
     children: Vec<Vec<(usize, usize)>>,
     /// A root per tree: its center.
     roots: Vec<usize>,
+    /// Whether its messages are counted against a budget ([`Query::weights`]): not where
+    /// every child's pattern is known to have no heavy value, so no message can pass its
+    /// budget at once.
+    budgeted: bool,
 }
 
 impl Forest {
@@ -174,6 +199,7 @@ impl<'a> Query<'a> {
         max_rows: usize,
     ) -> Self {
         let lists = patterns.iter().map(|_| OnceLock::new()).collect();
+        let heavy = (0..patterns.len() * 3).map(|_| OnceLock::new()).collect();
         Self {
             snapshot,
             model,
@@ -181,6 +207,7 @@ impl<'a> Query<'a> {
             variables,
             max_rows,
             lists,
+            heavy,
         }
     }
 
@@ -195,6 +222,52 @@ impl<'a> Query<'a> {
             object: value(pattern[2]),
             graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
         }
+    }
+
+    /// The values at `position` of pattern `index` that match it more than [`MESSAGE_MIN`]
+    /// times with only its constants bound, with their matches, in value order: the
+    /// snapshot's, kept for its version (a walk of the index's groups per query made
+    /// uniform triangles 0.3 % more instructions than without them; fleet pm-p2-count-2,
+    /// 31 Oct 2026). `None` where the index can't walk them. A forest's
+    /// patterns have no variable outside the forest, so these are the counts under any
+    /// bindings of the order's prefix.
+    fn heavy(&self, index: usize, position: usize) -> Option<&[(u64, u64)]> {
+        self.heavy[index * 3 + position]
+            .get_or_init(|| {
+                let quad = self.quad_pattern(&self.patterns[index], &vec![None; self.variables]);
+                let bound = |c: usize| match c {
+                    0 => quad.subject.is_some(),
+                    1 => quad.predicate.is_some(),
+                    2 => quad.object.is_some(),
+                    _ => matches!(quad.graph, GraphSelector::Exact(_)),
+                };
+                // An order with every bound component first (the graph too: a bound graph
+                // after the prefix is no range of it) and `position` next.
+                let bound_count = (0..4).filter(|&c| bound(c)).count();
+                let permutation = Permutation::ALL.into_iter().find(|permutation| {
+                    let order = permutation.order();
+                    order[..bound_count].iter().all(|&c| bound(c))
+                        && order.get(bound_count) == Some(&position)
+                })?;
+                let groups = self.snapshot.heavy_groups_in(
+                    self.model,
+                    &quad,
+                    permutation,
+                    MESSAGE_MIN as u64,
+                )?;
+                Some(groups.iter().map(|&(value, n)| (value.raw(), n)).collect())
+            })
+            .as_deref()
+    }
+
+    /// [`Query::heavy`] as found before the join: inside it a list is only read. Found
+    /// there, its group walk (on the pool) waited for workers that had taken up other
+    /// parts of the count and asked for the list being found, its `OnceLock` entered again
+    /// on their own thread: kernel-intersect's count never ended (pm-qprof-13, 19 Oct 2026).
+    fn found_heavy(&self, index: usize, position: usize) -> Option<&[(u64, u64)]> {
+        let found = self.heavy[index * 3 + position].get();
+        debug_assert!(found.is_some(), "heavy values found before the join");
+        found?.as_deref()
     }
 
     fn count(&self, pattern: &[Pos; 3], bindings: &[Option<u64>]) -> u64 {
@@ -320,6 +393,19 @@ impl<'a> Query<'a> {
         depth: usize,
         work: &mut Work<'a>,
     ) -> Option<Cow<'_, [u64]>> {
+        self.sorted_values_by(index, var, depth, Use::Values, work)
+    }
+
+    /// [`Self::sorted_values`] read through the cursor kept for `what`: a pattern read in
+    /// two orders at one depth keeps a cursor per order, each reading forward.
+    fn sorted_values_by(
+        &self,
+        index: usize,
+        var: usize,
+        depth: usize,
+        what: Use,
+        work: &mut Work<'a>,
+    ) -> Option<Cow<'_, [u64]>> {
         let pattern = &self.patterns[index];
         let only_var = pattern
             .iter()
@@ -334,7 +420,7 @@ impl<'a> Query<'a> {
         let quad = self.quad_pattern(pattern, &work.bindings);
         let mut values = Vec::new();
         if work
-            .cursor(depth, index, Use::Values, self)
+            .cursor(depth, index, what, self)
             .values(&quad, position, &mut values)
         {
             return Some(Cow::Owned(values));
@@ -619,6 +705,7 @@ impl<'a> Query<'a> {
             unary,
             children,
             roots,
+            budgeted: true,
         };
         // Each variable read needs values from a pattern of its own or from a child that
         // reads them.
@@ -635,10 +722,23 @@ impl<'a> Query<'a> {
     /// the product over its trees of each root's weights. `None` if a list the counting
     /// reads isn't an index range.
     fn count_forest(&self, forest: &Forest, work: &mut Work<'a>) -> Option<u64> {
+        if forest.budgeted {
+            self.forest_total::<true>(forest, work)
+        } else {
+            self.forest_total::<false>(forest, work)
+        }
+    }
+
+    /// [`Self::count_forest`], its messages budgeted where `BUDGETED`.
+    fn forest_total<const BUDGETED: bool>(
+        &self,
+        forest: &Forest,
+        work: &mut Work<'a>,
+    ) -> Option<u64> {
         let mut total = 1u64;
         for &root in &forest.roots {
             let sum = self
-                .weights(forest, root, work)?
+                .weights::<BUDGETED>(forest, root, work)?
                 .iter()
                 .fold(0u64, |sum, &(_, w)| sum.saturating_add(w));
             if sum == 0 {
@@ -653,7 +753,16 @@ impl<'a> Query<'a> {
     /// bound to it, sorted by value: its own patterns' values joined with what each child
     /// sends (per value of `var`, the sum of the child's weights over the values the
     /// joining pattern pairs with it), each lazy child's matches counted per value.
-    fn weights(&self, forest: &Forest, var: usize, work: &mut Work<'a>) -> Option<Vec<(u64, u64)>> {
+    /// Without `BUDGETED` (a forest none of whose children has a heavy value) the budget
+    /// is compiled out: kept in the code, unused, it made uniform triangles 2.7 % slower
+    /// (fleet pm-abba-k4-confirm, 20 Oct 2026). A message is then at most [`MESSAGE_MIN`]
+    /// times the child's values, as before the budget.
+    fn weights<const BUDGETED: bool>(
+        &self,
+        forest: &Forest,
+        var: usize,
+        work: &mut Work<'a>,
+    ) -> Option<Vec<(u64, u64)>> {
         // The cursors' depth past the order's: a count's work has one more.
         let slot = self.variables;
         let mut lists: Vec<Vec<(u64, u64)>> = Vec::new();
@@ -667,21 +776,73 @@ impl<'a> Query<'a> {
                 lazy.push((child, pattern));
                 continue;
             }
+            let sent = self.weights::<BUDGETED>(forest, child, work)?;
+            let shortest = lists.iter().min_by_key(|list| list.len());
+            let budget = shortest
+                .filter(|_| BUDGETED)
+                .map(|list| (list.len() * MESSAGE_FACTOR).max(MESSAGE_MIN));
             let mut message = Vec::new();
-            for (value, weight) in self.weights(forest, child, work)? {
+            let mut over = false;
+            // A child value's matches checked before they are read where they may exceed the
+            // budget at once: the pattern's heavy values, found once per query (a count per
+            // value made uniform triangles 29 % more instructions, 19 Oct 2026); a light one
+            // is read and added, at most [`MESSAGE_MIN`] past the budget.
+            let position = (0..3).find(|&c| self.patterns[pattern][c] == Pos::Var(child));
+            let heavy = budget
+                .and(position)
+                .and_then(|position| self.found_heavy(pattern, position));
+            let mut next_heavy = 0;
+            for &(value, weight) in &sent {
                 work.bindings[child] = Some(value);
+                // Without the heavy values (an index that can't walk them) no value is
+                // counted ahead: the check after the read below bounds the message.
+                if let (Some(budget), Some(heavy)) = (budget, heavy) {
+                    next_heavy += heavy[next_heavy..].partition_point(|&(v, _)| v < value);
+                    let count = match heavy.get(next_heavy) {
+                        Some(&(v, n)) if v == value => n as usize,
+                        _ => 0,
+                    };
+                    if message.len() + count > budget {
+                        work.bindings[child] = None;
+                        over = true;
+                        break;
+                    }
+                }
                 let values = self.sorted_values(pattern, var, slot, work);
                 work.bindings[child] = None;
-                message.extend(values?.iter().map(|&v| (v, weight)));
-            }
-            message.sort_unstable_by_key(|&(v, _)| v);
-            message.dedup_by(|later, kept| {
-                let same = later.0 == kept.0;
-                if same {
-                    kept.1 = kept.1.saturating_add(later.1);
+                let values = values?;
+                work.messages += values.len();
+                message.extend(values.iter().map(|&v| (v, weight)));
+                if budget.is_some_and(|budget| message.len() > budget) {
+                    over = true;
+                    break;
                 }
-                same
-            });
+            }
+            if over {
+                // The parent's values in its shortest list, each counted against the
+                // child's weights: what the join with that list keeps of the message.
+                message.clear();
+                for &(value, _) in shortest.expect("a budget comes from a list") {
+                    work.bindings[var] = Some(value);
+                    // The other order of the pattern: the cursor otherwise kept for checks,
+                    // which a count's last depth makes none of.
+                    let values = self.sorted_values_by(pattern, child, slot, Use::Seek, work);
+                    work.bindings[var] = None;
+                    match weight_of(&values?, &sent) {
+                        0 => {}
+                        weight => message.push((value, weight)),
+                    }
+                }
+            } else {
+                message.sort_unstable_by_key(|&(v, _)| v);
+                message.dedup_by(|later, kept| {
+                    let same = later.0 == kept.0;
+                    if same {
+                        kept.1 = kept.1.saturating_add(later.1);
+                    }
+                    same
+                });
+            }
             lists.push(message);
         }
         let mut weights = join_weighted(lists);
@@ -783,6 +944,21 @@ impl<'a> Query<'a> {
         let order = self.order();
         let forest = (1..=order.len()).find_map(|depth| self.forest(&order, depth));
         stats.counted_after = forest.as_ref().map(|f| f.depth);
+        // The heavy values the messages check against, found before the join's threads
+        // start ([`Query::found_heavy`]).
+        let mut forest = forest;
+        if let Some(forest) = &mut forest {
+            let mut heavy = false;
+            for &(child, pattern) in forest.children.iter().flatten() {
+                if let Some(position) =
+                    (0..3).find(|&c| self.patterns[pattern][c] == Pos::Var(child))
+                {
+                    heavy |= self.heavy(pattern, position).is_none_or(|h| !h.is_empty());
+                }
+            }
+            forest.budgeted = heavy;
+        }
+        stats.budgeted = forest.as_ref().map(|f| f.budgeted);
         let sinks = self.drive(&order, order.len() + 1, token, stats, || Sink::Count {
             forest: forest.as_ref(),
             total: 0,
@@ -839,6 +1015,22 @@ impl<'a> Query<'a> {
     }
 }
 
+/// The sum of the weights of the entries of `weighted` (sorted by value, distinct) whose
+/// value is in `values` (sorted, distinct), each found by a search forward from the last.
+fn weight_of(values: &[u64], weighted: &[(u64, u64)]) -> u64 {
+    let mut rest = weighted;
+    let mut sum = 0u64;
+    for &value in values {
+        rest = &rest[rest.partition_point(|&(v, _)| v < value)..];
+        match rest.first() {
+            Some(&(v, w)) if v == value => sum = sum.saturating_add(w),
+            Some(_) => {}
+            None => break,
+        }
+    }
+    sum
+}
+
 /// The values in all of `lists` (each sorted by value, distinct), with the product of
 /// their weights.
 fn join_weighted(mut lists: Vec<Vec<(u64, u64)>>) -> Vec<(u64, u64)> {
@@ -870,6 +1062,8 @@ struct Work<'a> {
     /// orders and ranges, each ascending in its own sequence.
     cursors: Vec<[Option<ProbeCursor<'a>>; 3]>,
     patterns: usize,
+    /// Message entries gathered ([`Stats::messages`]).
+    messages: usize,
 }
 
 /// What a cursor of a [`Work`] is for.
@@ -888,6 +1082,7 @@ impl<'a> Work<'a> {
                 .map(|_| [None, None, None])
                 .collect(),
             patterns: query.patterns.len(),
+            messages: 0,
         }
     }
 
@@ -904,6 +1099,7 @@ impl<'a> Work<'a> {
 
     /// Adds the cursors' seeks to `stats`.
     fn finish(&self, stats: &Stats) {
+        stats.messages.fetch_add(self.messages, Ordering::Relaxed);
         for cursor in self.cursors.iter().flatten().flatten() {
             let seeks = cursor.stats();
             stats
@@ -952,6 +1148,66 @@ fn intersect(small: &[u64], large: &[u64]) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::intersect;
+
+    /// Triangles are counted as many as enumerating them finds. Over hubs, messages are
+    /// bounded by the parents' own lists: each of 600 nodes links to 4 of 8 hubs and each
+    /// hub to 40 nodes, and a message from a node's predecessors gathered every predecessor
+    /// of every hub among them (97,280 entries; 1,280 now, 18 Oct 2026). Without a heavy
+    /// value (each node to 4 others) no budget is compiled in: uniform triangles ran 2.7 %
+    /// slower with it (pm-abba-k4-confirm, 20 Oct 2026).
+    #[test]
+    fn forest_messages_over_hubs_stay_within_the_parents_lists() {
+        use super::{Pos, Query, Stats};
+        use nrese_engine::ReadModel;
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        let hubs: Vec<(u32, u32)> = (8..608)
+            .flat_map(|n| (0..4).map(move |k| (n, (n * 3 + k) % 8)))
+            .chain(
+                (0..8).flat_map(|hub| (0..40).map(move |k| (hub, 8 + (hub * 71 + k * 13) % 600))),
+            )
+            .collect();
+        let uniform: Vec<(u32, u32)> = (0..608)
+            .flat_map(|n| (1..5).map(move |k| (n, (n * 37 + k * 101) % 608)))
+            .collect();
+        for (edges, budgeted) in [(hubs, true), (uniform, false)] {
+            let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+            let node = |n: u32| NamedNode::new_unchecked(format!("http://e/n{n}"));
+            let edge = NamedNode::new_unchecked("http://e/s");
+            let mut tx = engine.transaction();
+            for (a, b) in edges {
+                let quad = Quad::new(node(a), edge.clone(), node(b), GraphName::DefaultGraph);
+                tx.insert(quad.as_ref());
+            }
+            tx.commit().unwrap();
+            let snapshot = engine.snapshot();
+            let s = snapshot.lookup(edge.as_ref().into()).unwrap().raw();
+            let (a, b, c) = (Pos::Var(0), Pos::Var(1), Pos::Var(2));
+            let patterns = vec![
+                [a, Pos::Const(s), b],
+                [b, Pos::Const(s), c],
+                [c, Pos::Const(s), a],
+            ];
+            let query = Query::new(&snapshot, ReadModel::Asserted, patterns, 3, usize::MAX);
+            let mut stats = Stats::default();
+            let counted = query.count_solutions(&|| false, &mut stats).ok().unwrap();
+            let enumerated = query
+                .run(&|| false, &mut Stats::default())
+                .ok()
+                .unwrap()
+                .len()
+                / 3;
+            // The hubs' graph is bipartite (its point is the messages); the uniform one has
+            // triangles to count.
+            assert!(
+                budgeted || enumerated > 0,
+                "the uniform graph has triangles"
+            );
+            assert_eq!(counted as usize, enumerated, "budgeted {budgeted}");
+            assert_eq!(stats.budgeted, Some(budgeted));
+            let messages = stats.messages.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(messages < 10_000, "{messages} message entries");
+        }
+    }
 
     #[test]
     fn intersect_matches_a_set_intersection() {
