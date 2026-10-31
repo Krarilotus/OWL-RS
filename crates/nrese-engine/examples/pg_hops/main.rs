@@ -600,9 +600,9 @@ struct Crossing {
 /// - `anchor-hash`: the anchor rule, anchors placed by a hash;
 /// - `term-hash`: every term at a hash of itself (no anchor rule).
 ///
-/// A statement's keys are placed by the leading node component of each permutation of the
-/// asserted layout: the subject for SPOG, GSPO and GPSO (3 keys), the object for POSG, OSPG,
-/// GPOS and GOSP (4). A forward hop from `s` reads `s`'s out-edge, the triple term, `r rdf:reifies
+/// A statement's keys are placed by the leading node component of each permutation the store
+/// holds ([`hops::anchor_keys`] over [`Snapshot::asserted_key_orders`]: a default-graph store's
+/// SPOG and PSOG at the subject, POSG and OSPG at the object). A forward hop from `s` reads `s`'s out-edge, the triple term, `r rdf:reifies
 /// t` and `r`'s properties; it crosses where any of them is placed away from `s`. A backward hop
 /// from `o` reads `o`'s in-edge and the same three; it crosses where any is away from `o`, and an
 /// in-edge mirror would then hold `r`'s properties at `o`.
@@ -651,6 +651,8 @@ fn m6(store: &Path, ranges: &[u64]) -> String {
     // subject's and object's hash), and each occurrence's properties.
     let mut subjects = Vec::with_capacity(stats.quads as usize);
     let mut objects = Vec::with_capacity(stats.quads as usize);
+    let orders = snapshot.asserted_key_orders();
+    let (by_subject, by_object) = hops::anchor_keys(&orders);
     let mut termed: Vec<Vec<u64>> = ranges.iter().map(|&p| vec![0; p as usize]).collect();
     let mut properties = vec![0u32; occurrences.len()];
     for q in snapshot.quads_for_pattern_in(hops::MODEL, &pattern(None, None, None)) {
@@ -658,8 +660,8 @@ fn m6(store: &Path, ranges: &[u64]) -> String {
         subjects.push(anchor(s));
         objects.push(anchor(o));
         for (loads, &p) in termed.iter_mut().zip(ranges) {
-            loads[hash(s, p) as usize] += 3;
-            loads[hash(o, p) as usize] += 4;
+            loads[hash(s, p) as usize] += by_subject;
+            loads[hash(o, p) as usize] += by_object;
         }
         if q.predicate != reifies
             && let Some(i) = reifier(s)
@@ -669,7 +671,8 @@ fn m6(store: &Path, ranges: &[u64]) -> String {
     }
     subjects.par_sort_unstable();
     objects.par_sort_unstable();
-    // Per distinct anchor, its keys: 3 per statement it leads by subject, 4 by object.
+    // Per distinct anchor, its keys: `by_subject` per statement it leads by subject,
+    // `by_object` by object.
     let mut weights: Vec<(u64, u64)> = Vec::new();
     let (mut i, mut j) = (0, 0);
     while i < subjects.len() || j < objects.len() {
@@ -681,11 +684,11 @@ fn m6(store: &Path, ranges: &[u64]) -> String {
         };
         let mut w = 0;
         while subjects.get(i) == Some(&next) {
-            w += 3;
+            w += by_subject;
             i += 1;
         }
         while objects.get(j) == Some(&next) {
-            w += 4;
+            w += by_object;
             j += 1;
         }
         weights.push((next, w));
@@ -783,6 +786,9 @@ fn m6(store: &Path, ranges: &[u64]) -> String {
             properties.iter().map(|&n| u64::from(n)).sum(),
         )
         .num("anchors", weights.len() as u64)
+        .num("permutations", orders.len() as u64)
+        .num("keys_at_subject", by_subject)
+        .num("keys_at_object", by_object)
         .num("placed_keys", total)
         .raw("placements", &format!("[{}]", rows.join(",")));
     j.done()

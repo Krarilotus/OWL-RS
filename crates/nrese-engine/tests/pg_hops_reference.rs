@@ -328,3 +328,38 @@ fn four_runs_with_deletions_answer_as_the_reference_walk() {
     );
     answers_match(&snapshot, &ids, &r, 4);
 }
+
+/// M6's placement weighs a statement by the permutations the store holds: a default-graph
+/// store keeps SPOG, POSG, OSPG and PSOG (two placed at the subject, two at the object), one
+/// with a named graph seven (SPOG, GSPO, GPSO at the subject; POSG, OSPG, GPOS, GOSP at the
+/// object). The keys the tool places are the store's keys.
+#[test]
+fn placement_weighs_the_permutations_the_store_holds() {
+    let engine = engine();
+    insert(&engine, &graph());
+    let snapshot = engine.snapshot();
+    let quads = engine.stats().quads;
+    let orders = snapshot.asserted_key_orders();
+    assert_eq!(orders.len(), 4, "N-Triples keep the default-graph layout");
+    let (subject, object) = hops::anchor_keys(&orders);
+    assert_eq!((subject, object), (2, 2));
+    assert_eq!(
+        quads * (subject + object),
+        quads * 4,
+        "one key per statement and permutation"
+    );
+
+    let named = format!("{} <{NS}knows> {} <{NS}graph> .\n", person(1), person(9));
+    let mut tx = engine.transaction();
+    for quad in RdfParser::from_format(RdfFormat::NQuads).for_slice(named.as_bytes()) {
+        tx.insert(quad.expect("valid N-Quads").as_ref());
+    }
+    tx.commit().expect("commit");
+    let orders = engine.snapshot().asserted_key_orders();
+    assert_eq!(
+        orders.len(),
+        7,
+        "a named graph turns the stack into the quad layout"
+    );
+    assert_eq!(hops::anchor_keys(&orders), (3, 4));
+}

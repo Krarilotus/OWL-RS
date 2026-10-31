@@ -28,11 +28,16 @@ if [ ! -f "$out/env.txt" ]; then  # not after pg-m5.sh in this job: its own buil
   sha256sum "$bin" >> "$out/env.txt"
 fi
 (cd "$d" && sha256sum --check SHA256SUMS) > "$out/m6-inputs-sf$sf.txt"
+timed() { # peak memory and times of a command, where GNU time is installed
+  local record=$1; shift
+  if [ -x /usr/bin/time ]; then /usr/bin/time -v -o "$record" "$@"; else "$@"; fi
+}
 for v in $variants; do
   store=$PWD/store-sf$sf-$v
   if [ ! -d "$store" ]; then
-    "$bin" load "$d/snb-$v.nt" "$store" --load-memory-gb "${LOAD_GB:-8}" > "$out/m6-load-sf$sf-$v.json"
+    timed "$out/m6-load-sf$sf-$v.time" "$bin" load "$d/snb-$v.nt" "$store" --load-memory-gb "${LOAD_GB:-8}" \
+      > "$out/m6-load-sf$sf-$v.json"
   fi
-  "$bin" m6 "$store" > "$out/m6-sf$sf-$v.json"
+  timed "$out/m6-sf$sf-$v.time" "$bin" m6 "$store" > "$out/m6-sf$sf-$v.json"
   rm -rf "$store"
 done
