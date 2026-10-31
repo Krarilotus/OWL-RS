@@ -278,6 +278,19 @@ pub(super) struct Logins {
     sessions: Mutex<HashMap<String, (String, Instant)>>,
     /// Every Argon2 run's turn.
     argon2: Argon2Gate,
+    /// What a password is checked with, in its turn: [`verify_password`].
+    verify: Verifier,
+}
+
+/// Checks a password against a PHC string; [`verify_password`] outside tests, which
+/// install a recording one to see which hash each refusal was checked against.
+#[derive(Clone, Copy)]
+struct Verifier(fn(&str, &str) -> bool);
+
+impl Default for Verifier {
+    fn default() -> Self {
+        Self(verify_password)
+    }
 }
 
 /// A session token's prefix, which tells it from other bearer tokens.
@@ -292,7 +305,17 @@ impl Logins {
             limits,
             secret,
             argon2: Argon2Gate::new(limits.hashes),
+            verify: Verifier(verify_password),
             ..Self::default()
+        }
+    }
+
+    /// [`Self::new`], checking passwords with `verify` instead of [`verify_password`].
+    #[cfg(test)]
+    fn verifying_with(limits: LoginLimits, verify: fn(&str, &str) -> bool) -> Self {
+        Self {
+            verify: Verifier(verify),
+            ..Self::new(limits)
         }
     }
 
@@ -325,7 +348,7 @@ impl Logins {
         }
         let Some(hash) = state.users.get(user).and_then(|u| u.password_hash.clone()) else {
             // As long as a wrong password takes.
-            self.hashing(|| verify_password(password, dummy_hash()))?;
+            self.hashing(|| (self.verify.0)(password, dummy_hash()))?;
             self.failed(&pair);
             return Err(refused());
         };
@@ -337,7 +360,7 @@ impl Logins {
             .get(&key)
             .is_some_and(|(name, verified)| name == user && *verified == hash);
         if !known {
-            if !self.hashing(|| verify_password(password, &hash))? {
+            if !self.hashing(|| (self.verify.0)(password, &hash))? {
                 self.failed(&pair);
                 return Err(refused());
             }
@@ -501,6 +524,68 @@ mod tests {
         logins.login(&state, "alice", PASSWORD, None).unwrap();
         let again = while_held(&logins, || logins.login(&state, "alice", PASSWORD, None));
         assert!(again.is_ok(), "{again:?}");
+    }
+
+    thread_local! {
+        /// The checks [`recording`] made on this thread: password and hash.
+        static CHECKED: std::cell::RefCell<Vec<(String, String)>> = Default::default();
+    }
+
+    /// [`verify_password`], recording each check. A check runs on the caller's thread
+    /// (in its gate turn), so tests running beside each other don't see each other's.
+    fn recording(password: &str, hash: &str) -> bool {
+        CHECKED.with(|checked| {
+            checked
+                .borrow_mut()
+                .push((password.to_owned(), hash.to_owned()))
+        });
+        verify_password(password, hash)
+    }
+
+    /// A name without a login is refused after the work a wrong password takes, and in its
+    /// words (the milestone review's R4): no such credential is remembered, so each waits
+    /// for an Argon2 turn and is checked in it, once, against the fixed hash, as a wrong
+    /// password is against the user's; the fixed hash costs what a user's does; and the
+    /// refusals read the same. A name without a login is one without a record (`nobody`)
+    /// or one whose record has no password (`bob`).
+    #[test]
+    fn unknown_names_are_refused_like_wrong_passwords() {
+        let logins = Logins::verifying_with(
+            LoginLimits {
+                hashes: 1,
+                hash_wait: Duration::ZERO,
+                ..LoginLimits::default()
+            },
+            recording,
+        );
+        let mut state = state();
+        state.users.insert("bob".to_owned(), User::default());
+        let user_hash = state.users["alice"].password_hash.clone().unwrap();
+        let checked = || CHECKED.with(|checked| checked.take());
+        for user in ["nobody", "bob", "alice"] {
+            let outcome = while_held(&logins, || logins.login(&state, user, "guess", None));
+            assert!(
+                matches!(outcome, Err(AccessError::Busy(_))),
+                "{user}: {outcome:?}"
+            );
+            let without_a_turn = checked();
+            assert!(without_a_turn.is_empty(), "{user}: {without_a_turn:?}");
+        }
+        let refusal = |user: &str| match logins.login(&state, user, "guess", None) {
+            Err(AccessError::Forbidden(message)) => message,
+            other => panic!("{user}: {other:?}"),
+        };
+        let guess = |hash: &str| vec![("guess".to_owned(), hash.to_owned())];
+        let wrong_password = refusal("alice");
+        assert_eq!(checked(), guess(&user_hash), "alice");
+        for user in ["nobody", "bob"] {
+            assert_eq!(refusal(user), wrong_password);
+            assert_eq!(checked(), guess(dummy_hash()), "{user}");
+        }
+        // A PHC string's algorithm, version and parameters: all but its salt and hash.
+        let cost = |phc: &str| phc.rsplitn(3, '$').nth(2).map(str::to_owned);
+        assert_eq!(cost(dummy_hash()), cost(&user_hash));
+        assert!(cost(&user_hash).is_some_and(|c| c.starts_with("$argon2id$")));
     }
 
     /// RFC 4231, test case 1.
