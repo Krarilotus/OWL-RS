@@ -556,10 +556,23 @@ def ensure_data(spec: str) -> dict:
                 raise RuntimeError(f"missing input: {spec} was not prepared (fast.py prepare)")
             return {}
         # Into the shared volume whole, one job at a time per host (FAST_LOCK): another job may
-        # be reading or making the same file.
+        # be reading or making the same file. It is its parts' as they are now: their SHA-256 lie
+        # beside it (TARGET.parts, a sidecar, prepared and shared with it), and one made from other
+        # bytes, here or by another gate through the shared index, is made again (Sol, PR #64 r1
+        # F1: a part restored to its freeze left the concatenation of its altered bytes). The old
+        # sums go before the new file and the new sums last, so a making killed at any step leaves
+        # a file without sums, made again (Sol, gate-input-provenance r1: killed between the file
+        # and its sums, the old sums stood beside the new file, and matched once the part was
+        # restored). A failed making leaves nothing beside it (a TARGET.* there is a sidecar).
         part = f"{target}.{ns.name('part', ROOT)}"
         with ns.lock(FAST_LOCK):
-            files(f"test -s {target} || {{ cat {parts} > {part} && mv -f {part} {target}; }}")
+            done = files(f"set -e; trap 'rm -f {part} {part}.parts' EXIT; for p in {parts}; do test -f \"$p\"; done\n"
+                         f"sums=$(sha256sum {parts} | cut -d' ' -f1)\n"
+                         f"[ -s {target} ] && [ \"$sums\" = \"$(cat {target}.parts 2>/dev/null)\" ] && exit 0\n"
+                         f"cat {parts} > {part}; printf '%s\\n' \"$sums\" > {part}.parts\n"
+                         f"rm -f {target}.parts; mv -f {part} {target}; mv -f {part}.parts {target}.parts")
+        if done.returncode != 0:
+            raise RuntimeError(f"missing input: {spec} wasn't made from its parts: {done.stderr.strip()[-200:]}")
         return {}
     path = data_file(spec)
     seed_from_inputs(path)
