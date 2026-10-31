@@ -94,16 +94,9 @@ impl StoreService {
 
     /// Whether the materialised data matches `pattern`, blank nodes read as variables.
     fn ask(&self, pattern: &[Triple]) -> StoreResult<bool> {
-        let term = |t: &Term| match t {
-            Term::BlankNode(b) => format!("?b{}", hex(b.as_str())),
-            other => other.to_string(),
-        };
         let patterns: Vec<String> = pattern
             .iter()
-            .map(|t| {
-                let subject: Term = t.subject.clone().into();
-                format!("{} {} {} .", term(&subject), t.predicate, term(&t.object))
-            })
+            .map(|t| format!("{} .", triple_pattern(t)))
             .collect();
         let text = format!("ASK {{ {} }}", patterns.join(" "));
         let query = SparqlParser::new()
@@ -143,6 +136,28 @@ impl StoreService {
                 })
             })?;
         Ok(!done.violations.is_empty())
+    }
+}
+
+/// `triple` as a SPARQL triple pattern: see [`term_pattern`].
+fn triple_pattern(triple: &Triple) -> String {
+    let subject: Term = triple.subject.clone().into();
+    format!(
+        "{} {} {}",
+        term_pattern(&subject),
+        triple.predicate,
+        term_pattern(&triple.object)
+    )
+}
+
+/// `term` in a SPARQL pattern. A blank node is a variable named by its label at any depth:
+/// inside a triple term it is the same node as outside it (RDF 1.2 Semantics; W3C test
+/// `constrained-bnodes-in-triple-term-fail`).
+fn term_pattern(term: &Term) -> String {
+    match term {
+        Term::BlankNode(b) => format!("?b{}", hex(b.as_str())),
+        Term::Triple(t) => format!("<<( {} )>>", triple_pattern(t)),
+        other => other.to_string(),
     }
 }
 
