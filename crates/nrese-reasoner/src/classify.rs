@@ -95,6 +95,82 @@ enum Part {
     Field(Option<&'static str>),
 }
 
+/// What a statement is to [`build`], by its predicate, or for `rdf:type` by its object
+/// ([`Names::disposition`]).
+#[derive(Debug, Clone, Copy)]
+enum Disposition {
+    /// `rdfs:subClassOf`, `owl:equivalentClass` (both ways), `owl:disjointWith`.
+    Class(ClassAxiom),
+    /// `rdf:type owl:AllDisjointClasses`.
+    AllDisjointClasses,
+    /// A property axiom the rules read where the properties are roles.
+    Property(PropertyAxiom),
+    /// A class or property axiom no rule reads, and its kind.
+    Unread(&'static str),
+    /// A predicate of the mapping's class expressions and data ranges, its place in their
+    /// table: read through the axiom that uses its node; on a named subject it defines that
+    /// class (or relates two properties).
+    Expression(usize, Part),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ClassAxiom {
+    Sub,
+    Equivalent,
+    Disjoint,
+}
+
+/// A value by term for terms fixed when the table is made: the reader's own vocabulary's
+/// [`Disposition`]s ([`Names`]) and the named datatypes ([`Graph`]). Open-addressed on the
+/// term's id and at most half full, so that a lookup, made for every statement or class read,
+/// is a multiply, a shift and mostly one comparison.
+struct TermTable<V> {
+    /// A power of two of slots.
+    slots: Box<[Option<(u64, V)>]>,
+    shift: u32,
+}
+
+impl<V: Copy> FromIterator<(u64, V)> for TermTable<V> {
+    /// The last of a term's entries wins.
+    fn from_iter<I: IntoIterator<Item = (u64, V)>>(entries: I) -> Self {
+        let entries: Vec<(u64, V)> = entries.into_iter().collect();
+        let bits = (entries.len() * 2)
+            .next_power_of_two()
+            .trailing_zeros()
+            .max(1);
+        let mut table = Self {
+            slots: vec![None; 1 << bits].into_boxed_slice(),
+            shift: 64 - bits,
+        };
+        for (term, value) in entries {
+            let mut slot = table.slot(term);
+            while table.slots[slot].is_some_and(|(held, _)| held != term) {
+                slot = (slot + 1) & (table.slots.len() - 1);
+            }
+            table.slots[slot] = Some((term, value));
+        }
+        table
+    }
+}
+
+impl<V: Copy> TermTable<V> {
+    /// Where `term` is looked for first (Fibonacci hashing).
+    fn slot(&self, term: u64) -> usize {
+        (term.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> self.shift) as usize
+    }
+
+    fn get(&self, term: u64) -> Option<V> {
+        let mut slot = self.slot(term);
+        loop {
+            match self.slots[slot] {
+                Some((held, value)) if held == term => return Some(value),
+                Some(_) => slot = (slot + 1) & (self.slots.len() - 1),
+                None => return None,
+            }
+        }
+    }
+}
+
 struct Names {
     sub_class_of: u64,
     equivalent_class: u64,
@@ -118,12 +194,11 @@ struct Names {
     transitive: u64,
     domain: u64,
     range: u64,
-    /// Every predicate of the mapping's class expressions and data ranges (OWL 2 Mapping to
-    /// RDF Graphs, Tables 1 to 3): the constructors a node has one of, their fields, and
-    /// what EL makes of each. The one list the expression reader and [`Self::unread`] read.
-    expression: Vec<(u64, Part)>,
-    /// Class and property axioms no rule reads, by predicate or `rdf:type` object.
-    unread: Vec<(u64, &'static str)>,
+    /// Each statement's [`Disposition`] by its predicate, and by its object where its
+    /// predicate is `rdf:type`: the one decision of what a statement is, made from one table
+    /// of each kind in [`Self::new`].
+    by_predicate: TermTable<Disposition>,
+    by_type: TermTable<Disposition>,
     /// `owl:topObjectProperty` and the other three, whose meaning no rule has.
     top_and_bottom: [u64; 4],
     /// The datatypes of OWL 2's datatype map; and the declarations of others, and of data
@@ -137,7 +212,7 @@ impl Names {
     fn new(v: &mut impl Vocabulary) -> Self {
         let owl = |v: &mut dyn FnMut(&str) -> u64, local: &str| v(&format!("{OWL}{local}"));
         let mut iri = |text: &str| v.iri(text);
-        Self {
+        let mut names = Self {
             sub_class_of: iri(&format!("{RDFS}subClassOf")),
             equivalent_class: owl(&mut iri, "equivalentClass"),
             disjoint_with: owl(&mut iri, "disjointWith"),
@@ -160,47 +235,8 @@ impl Names {
             transitive: owl(&mut iri, "TransitiveProperty"),
             domain: iri(&format!("{RDFS}domain")),
             range: iri(&format!("{RDFS}range")),
-            expression: [
-                ("intersectionOf", Part::Read),
-                ("someValuesFrom", Part::Read),
-                ("unionOf", Part::Unread("union")),
-                ("complementOf", Part::Unread("complement")),
-                ("oneOf", Part::Unread("nominal")),
-                ("hasValue", Part::Unread("nominal")),
-                ("allValuesFrom", Part::Unread("universal restriction")),
-                ("hasSelf", Part::Unread("self restriction")),
-                ("cardinality", Part::Unread("cardinality")),
-                ("minCardinality", Part::Unread("cardinality")),
-                ("maxCardinality", Part::Unread("cardinality")),
-                ("qualifiedCardinality", Part::Unread("cardinality")),
-                ("minQualifiedCardinality", Part::Unread("cardinality")),
-                ("maxQualifiedCardinality", Part::Unread("cardinality")),
-                ("inverseOf", Part::Unread("inverse property")),
-                ("datatypeComplementOf", Part::Unread("data range")),
-                ("onDatatype", Part::Unread("data range")),
-                ("onProperty", Part::Field(None)),
-                ("onClass", Part::Field(None)),
-                ("onDataRange", Part::Field(None)),
-                ("withRestrictions", Part::Field(None)),
-                ("onProperties", Part::Field(Some("n-ary data restriction"))),
-            ]
-            .into_iter()
-            .map(|(local, part)| (owl(&mut iri, local), part))
-            .collect(),
-            unread: [
-                ("FunctionalProperty", "functional property"),
-                ("InverseFunctionalProperty", "inverse-functional property"),
-                ("ReflexiveProperty", "reflexive property"),
-                ("IrreflexiveProperty", "irreflexive property"),
-                ("SymmetricProperty", "symmetric property"),
-                ("AsymmetricProperty", "asymmetric property"),
-                ("propertyDisjointWith", "disjoint properties"),
-                ("AllDisjointProperties", "disjoint properties"),
-                ("disjointUnionOf", "disjoint union"),
-            ]
-            .into_iter()
-            .map(|(local, kind)| (owl(&mut iri, local), kind))
-            .collect(),
+            by_predicate: std::iter::empty().collect(),
+            by_type: std::iter::empty().collect(),
             top_and_bottom: [
                 "topObjectProperty",
                 "bottomObjectProperty",
@@ -211,7 +247,104 @@ impl Names {
             datatype_map: Datatype::ALL.iter().map(|d| iri(&d.iri())).collect(),
             datatype: iri(&format!("{RDFS}Datatype")),
             datatype_property: owl(&mut iri, "DatatypeProperty"),
-        }
+        };
+        // Every predicate of the mapping's class expressions and data ranges (OWL 2 Mapping to
+        // RDF Graphs, Tables 1 to 3): the constructors a node has one of, their fields, and
+        // what EL makes of each.
+        let expression: Vec<(u64, Part)> = [
+            ("intersectionOf", Part::Read),
+            ("someValuesFrom", Part::Read),
+            ("unionOf", Part::Unread("union")),
+            ("complementOf", Part::Unread("complement")),
+            ("oneOf", Part::Unread("nominal")),
+            ("hasValue", Part::Unread("nominal")),
+            ("allValuesFrom", Part::Unread("universal restriction")),
+            ("hasSelf", Part::Unread("self restriction")),
+            ("cardinality", Part::Unread("cardinality")),
+            ("minCardinality", Part::Unread("cardinality")),
+            ("maxCardinality", Part::Unread("cardinality")),
+            ("qualifiedCardinality", Part::Unread("cardinality")),
+            ("minQualifiedCardinality", Part::Unread("cardinality")),
+            ("maxQualifiedCardinality", Part::Unread("cardinality")),
+            ("inverseOf", Part::Unread("inverse property")),
+            ("datatypeComplementOf", Part::Unread("data range")),
+            ("onDatatype", Part::Unread("data range")),
+            ("onProperty", Part::Field(None)),
+            ("onClass", Part::Field(None)),
+            ("onDataRange", Part::Field(None)),
+            ("withRestrictions", Part::Field(None)),
+            ("onProperties", Part::Field(Some("n-ary data restriction"))),
+        ]
+        .into_iter()
+        .map(|(local, part)| (owl(&mut iri, local), part))
+        .collect();
+        // Class and property axioms no rule reads, by predicate or `rdf:type` object.
+        let unread: Vec<(u64, &'static str)> = [
+            ("FunctionalProperty", "functional property"),
+            ("InverseFunctionalProperty", "inverse-functional property"),
+            ("ReflexiveProperty", "reflexive property"),
+            ("IrreflexiveProperty", "irreflexive property"),
+            ("SymmetricProperty", "symmetric property"),
+            ("AsymmetricProperty", "asymmetric property"),
+            ("propertyDisjointWith", "disjoint properties"),
+            ("AllDisjointProperties", "disjoint properties"),
+            ("disjointUnionOf", "disjoint union"),
+        ]
+        .into_iter()
+        .map(|(local, kind)| (owl(&mut iri, local), kind))
+        .collect();
+        let unread = || {
+            unread
+                .iter()
+                .map(|&(term, kind)| (term, Disposition::Unread(kind)))
+        };
+        names.by_predicate = [
+            (names.sub_class_of, Disposition::Class(ClassAxiom::Sub)),
+            (
+                names.equivalent_class,
+                Disposition::Class(ClassAxiom::Equivalent),
+            ),
+            (
+                names.disjoint_with,
+                Disposition::Class(ClassAxiom::Disjoint),
+            ),
+            (
+                names.sub_property_of,
+                Disposition::Property(PropertyAxiom::Sub { equivalent: false }),
+            ),
+            (
+                names.equivalent_property,
+                Disposition::Property(PropertyAxiom::Sub { equivalent: true }),
+            ),
+            (
+                names.property_chain,
+                Disposition::Property(PropertyAxiom::Chain),
+            ),
+            (names.domain, Disposition::Property(PropertyAxiom::Domain)),
+            (names.range, Disposition::Property(PropertyAxiom::Range)),
+        ]
+        .into_iter()
+        .chain(unread())
+        .chain(
+            expression
+                .iter()
+                .enumerate()
+                .map(|(place, &(predicate, part))| {
+                    (predicate, Disposition::Expression(place, part))
+                }),
+        )
+        .collect();
+        names.by_type = [
+            (names.all_disjoint_classes, Disposition::AllDisjointClasses),
+            (
+                names.transitive,
+                Disposition::Property(PropertyAxiom::Transitive),
+            ),
+        ]
+        .into_iter()
+        .chain(unread())
+        .collect();
+        names
     }
 
     /// Whether the rules can read `p` as a role, `Err` why not: it is an expression (an
@@ -226,58 +359,41 @@ impl Names {
         }
     }
 
-    /// The property axiom of the rules `s p o` states; `Err` why it is left out, a property
-    /// it relates being no role; `None` when it states none. The one place that decides it:
-    /// [`build`] reads what this returns and reports what it refuses.
-    fn property_axiom(
-        &self,
-        [s, p, o]: Triple,
-        named: &dyn Fn(u64) -> bool,
-    ) -> Option<Result<PropertyAxiom, &'static str>> {
-        let axiom = if p == self.sub_property_of {
-            PropertyAxiom::Sub { equivalent: false }
-        } else if p == self.equivalent_property {
-            PropertyAxiom::Sub { equivalent: true }
-        } else if p == self.rdf_type && o == self.transitive {
-            PropertyAxiom::Transitive
-        } else if p == self.property_chain {
-            PropertyAxiom::Chain
-        } else if p == self.domain {
-            PropertyAxiom::Domain
-        } else if p == self.range {
-            PropertyAxiom::Range
-        } else {
-            return None;
-        };
-        // The subject is a property; a sub- or equivalent property's object is one too.
-        let roles = self.role(s, named).and_then(|()| match axiom {
-            PropertyAxiom::Sub { .. } => self.role(o, named),
-            _ => Ok(()),
-        });
-        Some(roles.map(|()| axiom))
+    /// What `s p o` is to [`build`], one lookup; `None` for what states no class or property
+    /// axiom: a declaration, an annotation, a list's cell, an assertion about individuals.
+    fn disposition(&self, p: u64, o: u64) -> Option<Disposition> {
+        match p == self.rdf_type {
+            true => self.by_type.get(o),
+            false => self.by_predicate.get(p),
+        }
     }
 
-    /// Why `s p o`, which no rule of [`build`] read and which is no property axiom of the
-    /// rules ([`Self::property_axiom`]), is a class or property axiom left out; `None` when
-    /// it states none: a declaration, an annotation, a part of an expression or list, or an
-    /// assertion about individuals.
-    fn unread(&self, [s, p, o]: Triple, named: &dyn Fn(u64) -> bool) -> Option<&'static str> {
-        let term = if p == self.rdf_type { o } else { p };
-        if let Some(&(_, kind)) = self.unread.iter().find(|&&(t, _)| t == term) {
-            return Some(kind);
+    /// The predicate `p` of the mapping's class expressions and data ranges, if it is one:
+    /// its place in their table and what EL makes of it.
+    fn expression(&self, p: u64) -> Option<(usize, Part)> {
+        match self.by_predicate.get(p) {
+            Some(Disposition::Expression(place, part)) => Some((place, part)),
+            _ => None,
         }
-        // An expression's triples hang off its blank node and are read through the axiom
-        // that uses it; on a named subject they define that class (or, `owl:inverseOf`,
-        // relate two properties).
-        let kind = match self.expression.iter().find(|&&(t, _)| t == p)?.1 {
-            Part::Unread(kind) | Part::Field(Some(kind)) => kind,
-            Part::Read | Part::Field(None) => "named class expression",
-        };
-        named(s).then_some(kind)
+    }
+
+    /// The property axiom `axiom` of `s p o` where the properties it relates are roles: the
+    /// subject, and a sub- or equivalent property's object; `Err` why one isn't.
+    fn roles(
+        &self,
+        axiom: PropertyAxiom,
+        [s, _, o]: Triple,
+        named: &dyn Fn(u64) -> bool,
+    ) -> Result<PropertyAxiom, &'static str> {
+        self.role(s, named).and_then(|()| match axiom {
+            PropertyAxiom::Sub { .. } => self.role(o, named),
+            _ => Ok(()),
+        })?;
+        Ok(axiom)
     }
 }
 
-/// A property axiom the rules read ([`Names::property_axiom`]), between roles.
+/// A property axiom the rules read, between roles ([`Names::roles`]).
 #[derive(Debug, Clone, Copy)]
 enum PropertyAxiom {
     /// `s ⊑ o`, and `o ⊑ s` where they are equivalent.
@@ -434,59 +550,143 @@ impl ListError {
 /// Two different objects where the mapping has one subject and predicate say one thing.
 struct Repeated;
 
+/// A subject of at most this many pairs keeps them as read, the same triple twice included:
+/// scanning so few (two cache lines) is cheaper than sorting them, and most subjects are as
+/// small (a restriction, a list's cell).
+const SCANNED: usize = 8;
+
 /// The triples of an ontology, indexed by subject and predicate.
 struct Graph<'a> {
-    /// Each subject's `(predicate, object)` pairs, sorted: a lookup is a binary search, not a
-    /// scan of every triple of the subject (a node many axioms name has as many).
+    /// Each subject's `(predicate, object)` pairs; past [`SCANNED`] sorted and distinct, so
+    /// that a lookup is a binary search, not a scan of every triple of the subject (a node
+    /// many axioms name has as many).
     by_subject: HashMap<u64, Vec<(u64, u64)>>,
     names: &'a Names,
-    /// What is about data values, which no rule reads: the datatypes (OWL 2's datatype
-    /// map and those declared `rdfs:Datatype`) and the declared data properties.
-    datatypes: HashSet<u64>,
+    /// The declared data properties, whose restrictions no rule reads.
     data_properties: HashSet<u64>,
+    /// The blank nodes no class expression of EL can be read from, whatever uses them, and
+    /// why: those declared `rdfs:Datatype`, a data range, and those whose predicates of the
+    /// mapping's class expressions say something EL lacks, decided once per node.
+    refused: HashMap<u64, &'static str>,
+    /// The named datatypes (OWL 2's datatype map and those declared `rdfs:Datatype`): a
+    /// named class read is one of these or itself.
+    datatypes: TermTable<()>,
 }
 
 impl<'a> Graph<'a> {
-    fn new(triples: &[Triple], names: &'a Names) -> Self {
+    fn new(triples: &[Triple], names: &'a Names, named: &dyn Fn(u64) -> bool) -> Self {
         let mut graph = Graph {
             by_subject: HashMap::new(),
             names,
-            datatypes: names.datatype_map.iter().copied().collect(),
             data_properties: HashSet::new(),
+            refused: HashMap::new(),
+            datatypes: std::iter::empty().collect(),
         };
+        let mut declared = Vec::new();
         for &[s, p, o] in triples {
             graph.by_subject.entry(s).or_default().push((p, o));
             if p == names.rdf_type && o == names.datatype {
-                graph.datatypes.insert(s);
+                declared.push(s);
             } else if p == names.rdf_type && o == names.datatype_property {
                 graph.data_properties.insert(s);
             }
         }
-        // The same triple twice is one: each predicate's range holds distinct objects.
-        for pairs in graph.by_subject.values_mut() {
-            pairs.sort_unstable();
-            pairs.dedup();
+        for (&subject, pairs) in graph.by_subject.iter_mut() {
+            // The same triple twice is one: past `SCANNED` each predicate's range holds
+            // distinct objects; below, a scan skips an earlier copy.
+            let sorted = pairs.len() > SCANNED;
+            if sorted {
+                pairs.sort_unstable();
+                pairs.dedup();
+            }
+            // One node, one expression: a field given twice, or two constructors, read or
+            // not, say two things; a field EL reads no restriction of, or a constructor EL
+            // doesn't read, says one it lacks. Decided here, a lookup a pair, so that a node
+            // many axioms name is decided once, and before any of its values is read. A named
+            // node is read as itself, so only blank ones are decided.
+            if named(subject) {
+                continue;
+            }
+            let (mut constructors, mut repeated, mut previous) = (0, false, None);
+            let (mut unreadable, mut unread) = (None, None);
+            for (i, &pair) in pairs.iter().enumerate() {
+                let (predicate, _) = pair;
+                let Some((place, part)) = names.expression(predicate) else {
+                    continue;
+                };
+                if sorted {
+                    // Sorted and distinct: the predicate again is a second value.
+                    repeated |= previous == Some(predicate);
+                    previous = Some(predicate);
+                } else {
+                    // As read: the same pair earlier is the same triple, the predicate
+                    // earlier with another object a second value.
+                    let earlier = &pairs[..i];
+                    if earlier.contains(&pair) {
+                        continue;
+                    }
+                    repeated |= earlier.iter().any(|&(p, _)| p == predicate);
+                }
+                match part {
+                    Part::Read => constructors += 1,
+                    Part::Unread(kind) => {
+                        constructors += 1;
+                        unread = Some(kind);
+                    }
+                    // The table's first such field names the omission.
+                    Part::Field(Some(kind))
+                        if unreadable.is_none_or(|(first, _)| place < first) =>
+                    {
+                        unreadable = Some((place, kind));
+                    }
+                    Part::Field(_) => {}
+                }
+            }
+            let refused = if repeated || constructors > 1 {
+                Some("malformed class expression")
+            } else {
+                unreadable.map(|(_, kind)| kind).or(unread)
+            };
+            if let Some(kind) = refused {
+                graph.refused.insert(subject, kind);
+            }
+        }
+        // A datatype read as a class is a data range, whatever else its node says. The
+        // datatype map's are IRIs, and `named` is asked of the input's terms only.
+        let (named_declared, blank_declared): (Vec<u64>, Vec<u64>) =
+            declared.into_iter().partition(|&datatype| named(datatype));
+        graph.datatypes = names
+            .datatype_map
+            .iter()
+            .copied()
+            .chain(named_declared)
+            .map(|datatype| (datatype, ()))
+            .collect();
+        for datatype in blank_declared {
+            graph.refused.insert(datatype, "data range");
         }
         graph
     }
 }
 
 impl Graph<'_> {
-    /// The subject's pairs from `predicate` on, by binary search: the predicate's objects
-    /// first, distinct.
-    fn pairs_from(&self, subject: u64, predicate: u64) -> &[(u64, u64)] {
-        let pairs = self.by_subject.get(&subject).map_or(&[][..], Vec::as_slice);
-        &pairs[pairs.partition_point(|&(p, _)| p < predicate)..]
-    }
-
-    fn has(&self, subject: u64, predicate: u64) -> bool {
-        matches!(self.pairs_from(subject, predicate), [(p, _), ..] if *p == predicate)
-    }
-
     /// The object of `subject predicate` where the mapping has at most one; two different
-    /// ones are [`Repeated`].
+    /// ones are [`Repeated`]. Up to [`SCANNED`] pairs a scan, past it a binary search: the
+    /// predicate's objects first, distinct.
     fn one(&self, subject: u64, predicate: u64) -> Result<Option<u64>, Repeated> {
-        match self.pairs_from(subject, predicate) {
+        let pairs = self.by_subject.get(&subject).map_or(&[][..], Vec::as_slice);
+        if pairs.len() <= SCANNED {
+            let mut objects = pairs
+                .iter()
+                .filter(|&&(p, _)| p == predicate)
+                .map(|&(_, o)| o);
+            return match objects.next() {
+                None => Ok(None),
+                Some(first) if objects.all(|o| o == first) => Ok(Some(first)),
+                Some(_) => Err(Repeated),
+            };
+        }
+        match &pairs[pairs.partition_point(|&(p, _)| p < predicate)..] {
             [(p, _), (q, _), ..] if *p == predicate && *q == predicate => Err(Repeated),
             [(p, o), ..] if *p == predicate => Ok(Some(*o)),
             _ => Ok(None),
@@ -520,29 +720,15 @@ impl Graph<'_> {
         if depth > 64 {
             return Err("too deeply nested");
         }
-        if self.datatypes.contains(&node) {
-            return Err("data range");
-        }
         if named(node) {
-            return Ok(Expr::Named(node));
+            return match self.datatypes.get(node) {
+                Some(()) => Err("data range"),
+                None => Ok(Expr::Named(node)),
+            };
         }
-        // One node, one expression: a field given twice, or two constructors, read or not,
-        // say two things; a field EL reads no restriction of says one it lacks. Decided over
-        // the mapping's whole vocabulary before a constructor is read, so none is read while
-        // the node says something else as well.
-        let (mut constructors, mut unreadable) = (0, None);
-        for &(predicate, part) in &self.names.expression {
-            match (self.one(node, predicate), part) {
-                (Err(Repeated), _) => return Err("malformed class expression"),
-                (Ok(None), _) => {}
-                (Ok(Some(_)), Part::Field(kind)) => unreadable = unreadable.or(kind),
-                (Ok(Some(_)), Part::Read | Part::Unread(_)) => constructors += 1,
-            }
-        }
-        if constructors > 1 {
-            return Err("malformed class expression");
-        }
-        if let Some(kind) = unreadable {
+        // A blank datatype, or a blank node decided over the mapping's whole vocabulary when
+        // the graph was built: none of its values is read while it says something else as well.
+        if let Some(&kind) = self.refused.get(&node) {
             return Err(kind);
         }
         let one = |predicate| self.one(node, predicate).ok().flatten();
@@ -569,13 +755,6 @@ impl Graph<'_> {
                 role,
                 Box::new(self.expr(filler, named, depth + 1)?),
             ));
-        }
-        for &(predicate, part) in &self.names.expression {
-            if let Part::Unread(kind) = part
-                && self.has(node, predicate)
-            {
-                return Err(kind);
-            }
         }
         Err("unknown class expression")
     }
@@ -638,7 +817,7 @@ fn build(
     named: &dyn Fn(u64) -> bool,
 ) -> Built {
     let names = Names::new(vocabulary);
-    let graph = Graph::new(triples, &names);
+    let graph = Graph::new(triples, &names, named);
     let mut tbox = Tbox::default();
     let thing = tbox.concept(Some(names.thing));
     let nothing = tbox.concept(Some(names.nothing));
@@ -659,45 +838,51 @@ fn build(
         }
     }
     for &[s, p, o] in triples {
-        if p == names.sub_class_of || p == names.equivalent_class || p == names.disjoint_with {
-            let (Some(a), Some(b)) = (expr(s, p, &mut skipped), expr(o, p, &mut skipped)) else {
-                continue;
-            };
-            let (a, b) = (tbox.name(&a), tbox.name(&b));
-            if p == names.disjoint_with {
-                tbox.and_sub(a, b, nothing);
-            } else {
-                tbox.sub(a, b);
-                if p == names.equivalent_class {
-                    tbox.sub(b, a);
-                }
-            }
-        } else if p == names.rdf_type && o == names.all_disjoint_classes {
-            let members = match graph
-                .one(s, names.members)
-                .ok()
-                .flatten()
-                .ok_or(ListError::Malformed)
-                .and_then(|l| graph.list(l))
-            {
-                Ok(members) => members,
-                Err(error) => {
-                    skipped.push((p, error.reason()));
+        let Some(disposition) = names.disposition(p, o) else {
+            continue;
+        };
+        match disposition {
+            Disposition::Class(axiom) => {
+                let (Some(a), Some(b)) = (expr(s, p, &mut skipped), expr(o, p, &mut skipped))
+                else {
                     continue;
-                }
-            };
-            let concepts: Vec<Concept> = members
-                .iter()
-                .filter_map(|&m| expr(m, p, &mut skipped))
-                .map(|e| tbox.name(&e))
-                .collect();
-            for (i, &a) in concepts.iter().enumerate() {
-                for &b in &concepts[i + 1..] {
-                    tbox.and_sub(a, b, nothing);
+                };
+                let (a, b) = (tbox.name(&a), tbox.name(&b));
+                match axiom {
+                    ClassAxiom::Sub => tbox.sub(a, b),
+                    ClassAxiom::Equivalent => {
+                        tbox.sub(a, b);
+                        tbox.sub(b, a);
+                    }
+                    ClassAxiom::Disjoint => tbox.and_sub(a, b, nothing),
                 }
             }
-        } else if let Some(axiom) = names.property_axiom([s, p, o], named) {
-            match axiom {
+            Disposition::AllDisjointClasses => {
+                let members = match graph
+                    .one(s, names.members)
+                    .ok()
+                    .flatten()
+                    .ok_or(ListError::Malformed)
+                    .and_then(|l| graph.list(l))
+                {
+                    Ok(members) => members,
+                    Err(error) => {
+                        skipped.push((p, error.reason()));
+                        continue;
+                    }
+                };
+                let concepts: Vec<Concept> = members
+                    .iter()
+                    .filter_map(|&m| expr(m, p, &mut skipped))
+                    .map(|e| tbox.name(&e))
+                    .collect();
+                for (i, &a) in concepts.iter().enumerate() {
+                    for &b in &concepts[i + 1..] {
+                        tbox.and_sub(a, b, nothing);
+                    }
+                }
+            }
+            Disposition::Property(axiom) => match names.roles(axiom, [s, p, o], named) {
                 Err(kind) => skipped.push((p, kind)),
                 Ok(PropertyAxiom::Sub { equivalent }) => {
                     let (r, t) = (tbox.role(Some(s)), tbox.role(Some(o)));
@@ -758,9 +943,19 @@ fn build(
                     let (r, c) = (tbox.role(Some(s)), tbox.name(&c));
                     tbox.ranges.push((r, c));
                 }
-            }
-        } else if let Some(kind) = names.unread([s, p, o], named) {
-            skipped.push((p, kind));
+            },
+            Disposition::Unread(kind) => skipped.push((p, kind)),
+            // An expression's triples hang off its blank node and are read through the axiom
+            // that uses it; on a named subject they define that class (or, `owl:inverseOf`,
+            // relate two properties).
+            Disposition::Expression(_, part) if named(s) => skipped.push((
+                p,
+                match part {
+                    Part::Unread(kind) | Part::Field(Some(kind)) => kind,
+                    Part::Read | Part::Field(None) => "named class expression",
+                },
+            )),
+            Disposition::Expression(..) => {}
         }
     }
     (tbox, thing, nothing, skipped)
@@ -1487,7 +1682,7 @@ mod tests {
     fn axioms_without_a_rule_are_reported_as_omitted() {
         /// `(predicate, reason)` omitted, or `(sub, super)` derived.
         type Pairs = &'static [(&'static str, &'static str)];
-        let cases: [(&str, &str, Pairs, Pairs); 27] = [
+        let cases: [(&str, &str, Pairs, Pairs); 28] = [
             (
                 "reflexive",
                 "ex:r rdf:type owl:ReflexiveProperty
@@ -1615,6 +1810,15 @@ mod tests {
                 "ex:D rdf:type rdfs:Datatype
                  ex:q rdfs:range ex:D",
                 &[("rdfs:range", "data range")],
+                &[],
+            ),
+            (
+                // A datatype read as a class is a data range, whatever its node also says.
+                "declared-blank-datatype",
+                "_:d rdf:type rdfs:Datatype
+                 _:d owl:unionOf _:l
+                 ex:A rdfs:subClassOf _:d",
+                &[("rdfs:subClassOf", "data range")],
                 &[],
             ),
             (
@@ -1837,6 +2041,63 @@ mod tests {
                 &[],
             );
         }
+        // Each property characteristic and axiom no rule reads is reported with its kind,
+        // stated by `rdf:type` or by its own predicate.
+        for (class, kind) in [
+            ("FunctionalProperty", "functional property"),
+            ("InverseFunctionalProperty", "inverse-functional property"),
+            ("ReflexiveProperty", "reflexive property"),
+            ("IrreflexiveProperty", "irreflexive property"),
+            ("SymmetricProperty", "symmetric property"),
+            ("AsymmetricProperty", "asymmetric property"),
+            ("AllDisjointProperties", "disjoint properties"),
+        ] {
+            let input = format!("ex:r rdf:type owl:{class}");
+            check(&input, &input, vec![("rdf:type", kind)].leak(), &[]);
+        }
+        for (field, kind) in [
+            ("propertyDisjointWith", "disjoint properties"),
+            ("disjointUnionOf", "disjoint union"),
+        ] {
+            let predicate = format!("owl:{field}");
+            let input = format!("ex:r {predicate} ex:q");
+            check(&input, &input, vec![(&*predicate.leak(), kind)].leak(), &[]);
+        }
+        // Each predicate of the mapping's class expressions and data ranges on a named
+        // subject defines that class (or relates two properties): reported, with the kind of
+        // what EL lacks where it lacks the constructor.
+        for (field, kind) in [
+            ("intersectionOf", "named class expression"),
+            ("someValuesFrom", "named class expression"),
+            ("unionOf", "union"),
+            ("complementOf", "complement"),
+            ("oneOf", "nominal"),
+            ("hasValue", "nominal"),
+            ("allValuesFrom", "universal restriction"),
+            ("hasSelf", "self restriction"),
+            ("cardinality", "cardinality"),
+            ("minCardinality", "cardinality"),
+            ("maxCardinality", "cardinality"),
+            ("qualifiedCardinality", "cardinality"),
+            ("minQualifiedCardinality", "cardinality"),
+            ("maxQualifiedCardinality", "cardinality"),
+            ("inverseOf", "inverse property"),
+            ("datatypeComplementOf", "data range"),
+            ("onDatatype", "data range"),
+            ("onProperty", "named class expression"),
+            ("onClass", "named class expression"),
+            ("onDataRange", "named class expression"),
+            ("withRestrictions", "named class expression"),
+            ("onProperties", "n-ary data restriction"),
+        ] {
+            let predicate = format!("owl:{field}");
+            check(
+                &format!("named {predicate}"),
+                &format!("ex:N {predicate} ex:X"),
+                vec![(&*predicate.clone().leak(), kind)].leak(),
+                &[],
+            );
+        }
         // A restriction many axioms share as their subject (PR #53 sol-loop S1): read for
         // each, nothing to report, no subsumption between named classes. Its cost is the
         // counting probe's question, not this test's.
@@ -1864,6 +2125,17 @@ mod tests {
             ),
             &[],
             &[],
+        );
+        // The same on a node of a few pairs, which is scanned as read, not sorted.
+        check(
+            "onProperty-twice",
+            "ex:A rdfs:subClassOf _:e
+             _:e owl:onProperty ex:r
+             _:e owl:onProperty ex:r
+             _:e owl:someValuesFrom ex:B
+             _:e rdfs:subClassOf ex:D",
+            &[],
+            &[("A", "D")],
         );
         let malformed: Pairs = vec![("rdfs:subClassOf", "malformed class expression"); 200].leak();
         check(
@@ -2019,7 +2291,9 @@ mod tests {
         let mut v = LocalVocabulary::default();
         let triples = load(&mut v, &disjoint(10_001));
         let names = Names::new(&mut v);
-        let graph = Graph::new(&triples, &names);
+        let snapshot = v.clone();
+        let named = move |id: u64| snapshot.text(id).starts_with('<');
+        let graph = Graph::new(&triples, &names, &named);
         assert_eq!(graph.list(v.term("_:l0")).unwrap().len(), 10_001);
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
