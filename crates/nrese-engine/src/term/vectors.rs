@@ -10,8 +10,8 @@
 //! and scans the newer ones exactly (a base and a delta, as FreshDiskANN keeps them).
 //!
 //! - **Building:** a space under [`SYNC_BUILD`] vectors gets its graph at once (under a
-//!   second); a larger one on a thread of its own, the search scanning exactly until it
-//!   is there. Once the vectors no graph covers pass a tenth of those it does, a copy of
+//!   second); a larger one on a thread of its own (or the engine's [`VectorBuilder`]),
+//!   the search scanning exactly until it is there. Once the vectors no graph covers pass a tenth of those it does, a copy of
 //!   the graph is extended with them, again on a thread of its own, and replaces it.
 //! - **Keeping:** the vectors and graphs are written with the other derived indexes after
 //!   a checkpoint ([`super::derived`]) and read at the first search after a start.
@@ -492,19 +492,104 @@ pub(crate) fn build(index: &RwLock<VectorIndex>, query: &VectorQuery) {
         .install(vectors.dimension(), query.metric, graph);
 }
 
-/// [`build`] on a thread of its own.
-pub(crate) fn build_in_background(index: Arc<RwLock<VectorIndex>>, query: VectorQuery) {
-    let spawned = std::thread::Builder::new()
-        .name("nrese-vector-graph".to_owned())
-        .spawn(move || {
-            let built =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&index, &query)));
-            if built.is_err() {
-                tracing::error!("building a vector graph failed; searches stay exact");
-                index.write().release(query.vector.len(), query.metric);
-            }
-        });
-    if let Err(error) = spawned {
+/// Runs the graph builds searches start in the background: each [`VectorBuild`] it is
+/// handed, now or later, or refuses it with an error. Without one, each build gets a
+/// thread of its own ([`crate::Engine::run_vector_builds_with`]).
+pub type VectorBuilder = Arc<dyn Fn(VectorBuild) -> std::io::Result<()> + Send + Sync>;
+
+/// A graph build a search started, its space marked as building meanwhile:
+/// [`Self::run`] builds the graph and installs it. Dropped without having run (refused,
+/// or its build panicked), it ends without one, and a later search starts another.
+pub struct VectorBuild {
+    index: Arc<RwLock<VectorIndex>>,
+    query: VectorQuery,
+    ran: bool,
+}
+
+impl VectorBuild {
+    /// Builds the graph from what the index holds now and installs it, on this thread.
+    pub fn run(mut self) {
+        build(&self.index, &self.query);
+        self.ran = true;
+    }
+}
+
+impl Drop for VectorBuild {
+    fn drop(&mut self) {
+        if !self.ran {
+            let mut index = self.index.write();
+            index.release(self.query.vector.len(), self.query.metric);
+        }
+    }
+}
+
+/// [`build`] through `builder`, or on a thread of its own.
+pub(crate) fn build_in_background(
+    index: Arc<RwLock<VectorIndex>>,
+    query: VectorQuery,
+    builder: Option<&VectorBuilder>,
+) {
+    let job = VectorBuild {
+        index,
+        query,
+        ran: false,
+    };
+    let started = match builder {
+        Some(builder) => builder(job),
+        None => std::thread::Builder::new()
+            .name("nrese-vector-graph".to_owned())
+            .spawn(move || {
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()));
+                if built.is_err() {
+                    tracing::error!("building a vector graph failed; searches stay exact");
+                }
+            })
+            .map(drop),
+    };
+    if let Err(error) = started {
         tracing::warn!(%error, "vector graph not built");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A space of [`SYNC_BUILD`] one-dimensional vectors (its graph built in the
+    /// background), and a search that uses its graph.
+    fn large_space() -> (Arc<RwLock<VectorIndex>>, VectorQuery) {
+        let literals: Vec<String> = (0..SYNC_BUILD)
+            .map(|i| nrese_vector::lexical(&[i as f32]))
+            .collect();
+        let entries: Vec<(u64, &str)> = literals
+            .iter()
+            .enumerate()
+            .map(|(id, literal)| (id as u64, literal.as_str()))
+            .collect();
+        let mut index = VectorIndex::default();
+        index.extend(&entries, entries.len() as u64);
+        (Arc::new(RwLock::new(index)), VectorQuery::new(vec![1.0], 1))
+    }
+
+    /// A background build that couldn't start, or ended without a graph, leaves the space
+    /// to the next search to start another (B-401: a refused spawn kept it marked as
+    /// building, and no later search built its graph).
+    #[test]
+    fn a_build_that_ends_without_a_graph_is_started_again() {
+        let (index, query) = large_space();
+        let refuse: VectorBuilder = Arc::new(|_| Err(std::io::Error::other("no thread")));
+        let abandon: VectorBuilder = Arc::new(|build| {
+            drop(build);
+            Ok(())
+        });
+        for (builder, ended) in [(refuse, "refused"), (abandon, "abandoned")] {
+            let work = index.write().work_for(&query);
+            assert!(matches!(work, Work::Background), "{ended}: a build starts");
+            build_in_background(Arc::clone(&index), query.clone(), Some(&builder));
+            assert!(
+                index.read().may_need_work(&query),
+                "{ended}: the next search starts another"
+            );
+        }
     }
 }

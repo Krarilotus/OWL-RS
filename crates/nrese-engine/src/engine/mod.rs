@@ -683,6 +683,14 @@ impl Engine {
         *self.inner.shared.views.write() = budget;
     }
 
+    /// What runs the vector graph builds searches start from now on in the background
+    /// (spaces of [`SYNC_BUILD`](crate::term::vectors::SYNC_BUILD) vectors or more): the
+    /// owner's executor, which may also hold or refuse them. Unset, each build gets a
+    /// thread of its own.
+    pub fn run_vector_builds_with(&self, builder: crate::term::vectors::VectorBuilder) {
+        self.inner.shared.dictionary.set_vector_builder(builder);
+    }
+
     /// `owl:sameAs` if reads expand equality classes ([`Self::set_equality`]).
     pub fn equality(&self) -> Option<TermId> {
         *self.inner.shared.equality.read()

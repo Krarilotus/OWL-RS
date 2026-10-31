@@ -1,7 +1,8 @@
 //! `store.index_encoding` (`nrese_engine::IndexEncoding`): checkpoints are written as format
 //! 11 with either encoding and reopen with the same statements; checkpoints of formats 9
-//! (no palettes) and 10 (palettes), written by the engine before format 11, still open. A
-//! process of its own: the encoding is set for the process.
+//! (no palettes) and 10 (palettes), written by the engine before format 11, still open. The
+//! encoding is set for the process, which these tests share with the other integration
+//! tests (`main.rs`): theirs build blocks with whichever encoding is set meanwhile.
 
 use std::fs;
 use std::path::Path;
