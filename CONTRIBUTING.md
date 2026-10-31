@@ -24,7 +24,7 @@ owns its tests, and benchmarks never run in a gate.
 
 | Tier | When | What |
 |---|---|---|
-| `commit` | the pre-commit hook | rustfmt; clippy (warnings are errors) on every target of changed crates; compile their dependents' libraries; run the changed crates' fast tests |
+| `commit` | the pre-commit hook | seconds, on this machine, with no build: rustfmt; for the changed files, the lock check and the Docker-name check (`scripts/check-names.sh`). A branch may hold unchecked commits: only a tree that passed the push tier and the merge check lands |
 | `push` | the pre-push hook | changes since the upstream branch: rustfmt and clippy on changed crates; all their tests (slow suites too), dependents' fast tests, additional random seeds for changed crates, and the lock check |
 | `all` | milestones, merges to `main`, CI | everything: both Cargo workspaces, doc tests, the lock check, `cargo-deny` (licences, advisories, bans, sources; `deny.toml`), benchmark-suite contract tests, the console's typecheck and tests |
 
@@ -41,7 +41,7 @@ owns its tests, and benchmarks never run in a gate.
 ## Building and measuring
 
 Rust builds run on the build host ([benches/hosts.toml](benches/hosts.toml)): with
-`git config nrese.buildHost <ssh alias>`, the commit hook and `scripts/lib/remote.sh check|run`
+`git config nrese.buildHost <ssh alias>`, `scripts/check.sh all` and `scripts/lib/remote.sh check|run`
 send the working tree there and run the command in a worktree of its own (`NRESE_BUILD_HOST=local`
 builds on this machine instead). The push tier runs on the fleet only: `.githooks/pre-push` gates
 each pushed commit, by its own tree and the files from where the remote has its branch, as a fleet
