@@ -11,7 +11,7 @@ use nrese_server::policy::{PolicyConfig, RequestTimeouts};
 use nrese_store::{StoreConfig, StoreService};
 use tower::util::ServiceExt;
 
-use crate::support::held_service::{HANG, HeldEndpoint};
+use crate::support::held_service::{HeldEndpoint, past_deadline};
 use crate::support::{
     body_text, test_app_with_store, test_app_with_store_config, test_state_with_store_config,
 };
@@ -93,14 +93,10 @@ async fn a_query_past_its_deadline_times_out() -> Result<(), Box<dyn std::error:
     let mut answer =
         tokio::spawn(app.oneshot(get(&format!("/dataset/query?query={}", encode(&query)))?));
     let call = endpoint.call(&mut answer).await?;
-    tokio::time::advance(deadline + Duration::from_millis(1)).await;
-    // Real time again for the bounds below.
-    tokio::time::resume();
-    let response = tokio::time::timeout(HANG, answer)
-        .await
-        .map_err(|_| format!("no answer in {HANG:?}"))???;
+    let response = past_deadline(started, deadline, answer, &call).await??;
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
-    assert!(started.elapsed() >= deadline, "{:?}", started.elapsed());
+    // Real time again for the close's bound.
+    tokio::time::resume();
     call.closed().await
 }
 
@@ -364,7 +360,8 @@ async fn a_repository_answers_within_its_own_query_timeout()
         "SELECT * WHERE {{ SERVICE <{}> {{ ?s ?p ?o }} }}",
         endpoint.url()
     );
-    // The clock paused, as in the deadline test: the second passes once the call has connected.
+    // The clock paused, as in the deadline test: the repository's second, not the server's
+    // hour, is the deadline that answers.
     tokio::time::pause();
     let started = tokio::time::Instant::now();
     let mut answer = tokio::spawn(app.clone().oneshot(get(&format!(
@@ -372,17 +369,9 @@ async fn a_repository_answers_within_its_own_query_timeout()
         encode(&query)
     ))?));
     let call = endpoint.call(&mut answer).await?;
-    tokio::time::advance(Duration::from_millis(1_001)).await;
-    tokio::time::resume();
-    let response = tokio::time::timeout(HANG, answer)
-        .await
-        .map_err(|_| format!("no answer in {HANG:?}: not the repository's deadline"))???;
+    let response = past_deadline(started, Duration::from_secs(1), answer, &call).await??;
     assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
-    assert!(
-        started.elapsed() >= Duration::from_secs(1),
-        "{:?}",
-        started.elapsed()
-    );
+    tokio::time::resume();
     call.closed().await?;
     // The default repository keeps the server's budget.
     let response = app
