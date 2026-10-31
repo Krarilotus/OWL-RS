@@ -2,10 +2,11 @@
 # The push tier for each pushed commit, on the fleet (scripts/check.sh push): the commit's own
 # tree, with the files from where the remote has its branch (new there: where it left
 # refactor/engine-v2) to the commit. A ref the push only deletes has no tree to gate. A push to
-# refactor/engine-v2 lands a merge, so it also takes the merge check's Windows part for the commit
-# (scripts/check.sh windows): nothing else builds and tests it on Windows before it lands, and the
-# merge check's own pass, stored for the commit's inputs, serves at once. Milestones run
-# scripts/check.sh all. Enabling the hooks: CONTRIBUTING.md.
+# refactor/engine-v2 lands its commit, so it also takes the merge check's Windows part
+# (scripts/check.sh windows): a tree lands only when its push tier passed for that exact tree, and
+# its Windows inputs (scripts/lib/gate-key.sh windows_inputs) passed the Windows check. The merge
+# check's own pass for those inputs serves at once. Milestones run scripts/check.sh all. Enabling
+# the hooks: CONTRIBUTING.md.
 #
 # Git's lines on stdin: <local ref> <local sha> <remote ref> <remote sha>; $1 is the remote, $2 its
 # URL, which a measurement ref's check asks for its branches (NRESE_PUSH_REMOTE).

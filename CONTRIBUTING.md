@@ -24,7 +24,7 @@ owns its tests, and benchmarks never run in a gate.
 
 | Tier | When | What |
 |---|---|---|
-| `commit` | the pre-commit hook | seconds, on this machine, with no build: rustfmt; for the changed files, the lock check and the Docker-name check (`scripts/check-names.sh`). A branch may hold unchecked commits: only a tree that passed the push tier and the merge check lands |
+| `commit` | the pre-commit hook | seconds, on this machine, with no build: rustfmt; for the changed files, the lock check and the Docker-name check (`scripts/check-names.sh`). A branch may hold unchecked commits: a tree lands only when its push tier passed for that exact tree, and its Windows inputs (`scripts/lib/gate-key.sh` `windows_inputs`) passed the Windows check |
 | `push` | the pre-push hook | changes since the upstream branch: rustfmt and clippy on changed crates; all their tests (slow suites too), dependents' fast tests, additional random seeds for changed crates, and the lock check |
 | `all` | milestones, merges to `main`, CI | everything: both Cargo workspaces, doc tests, the lock check, `cargo-deny` (licences, advisories, bans, sources; `deny.toml`), benchmark-suite contract tests, the console's typecheck and tests |
 
@@ -53,8 +53,9 @@ that only deletes refs needs no gate. The merge check's Windows part runs the sa
 fleet host: the whole workspace built, all its tests, its doc tests and the suite contracts. A
 commit whose
 inputs (every file but the docs no other file names, `scripts/lib/gate-key.sh`) passed before
-carries that pass. A push to `refactor/engine-v2` needs both: the hook runs the Windows part for
-the pushed commit too, so run it first (the merge check does): its pass then serves at once.
+carries that pass. A push to `refactor/engine-v2` needs both: the hook also runs the Windows part
+for the pushed commit, which a pass for the same inputs (the merge check's, run first) answers at
+once.
 Build through `scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most `NRESE_BUILD_SLOTS`
 builds at once per machine). Validate in batches: quick checks while
 working, the push tier once per batch. Measure counts first; time only to answer a stated
