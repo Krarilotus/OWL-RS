@@ -18,14 +18,15 @@ import sys
 import tempfile
 import unittest
 
+import isolation
+
 ROOT = Path(__file__).resolve().parents[3]
 BASH = shutil.which("bash")
-# Run from a git hook or inside a gate job, the caller's variables (git's own, the gate's, the
-# fleet's, the thread counts, the Windows job's RUSTUP_AUTO_INSTALL) would make the gates these tests
-# run behave as their caller does.
-LEAKS = ("GIT_", "NRESE_", "FLEET_", "NEXTEST_", "CARGO_BUILD_", "CARGO_TARGET_DIR", "CARGO_ENCODED_RUSTFLAGS",
+# Run from a git hook or inside a gate job, the caller's variables (git's own: isolation.inherit()
+# drops them; the gate's, the fleet's, the thread counts, the Windows job's RUSTUP_AUTO_INSTALL)
+# would make the gates these tests run behave as their caller does.
+LEAKS = ("NRESE_", "FLEET_", "NEXTEST_", "CARGO_BUILD_", "CARGO_TARGET_DIR", "CARGO_ENCODED_RUSTFLAGS",
          "RUSTFLAGS", "RUST_TEST_THREADS", "RUSTUP_AUTO_INSTALL")
-CLEAN = {k: v for k, v in os.environ.items() if not k.startswith(LEAKS)}
 ZERO = "0" * 40
 # The scripts a push runs, copied into each scratch repository (those that exist).
 COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", "scripts/lib/disk.sh",
@@ -66,10 +67,13 @@ class Repo(unittest.TestCase):
         gitconfig = self.root / "gitconfig"
         gitconfig.write_text("[user]\n\tname = t\n\temail = t@t\n[core]\n\tautocrlf = false\n"
                              "[init]\n\tdefaultBranch = main\n")
-        self.env = {**CLEAN, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": gitconfig.as_posix(),
-                    "PATH": (self.fake / "bin").as_posix() + os.pathsep + CLEAN.get("PATH", ""),
-                    "FAKE": self.fake.as_posix(), "NRESE_FLEET_BIN": (self.fake / "fleet").as_posix(),
-                    "FLEET_OWNER": "t3:test", "NRESE_GATE_START_S": "0", "NRESE_GATE_POLL_S": "0"}
+        # Its own git configuration in place of the suite's (identity, autocrlf, the default
+        # branch); the hook it runs is the copied .githooks/pre-push, called by path.
+        self.env = isolation.inherit(
+            *LEAKS, git={"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": gitconfig.as_posix()},
+            PATH=(self.fake / "bin").as_posix() + os.pathsep + os.environ.get("PATH", ""),
+            FAKE=self.fake.as_posix(), NRESE_FLEET_BIN=(self.fake / "fleet").as_posix(),
+            FLEET_OWNER="t3:test", NRESE_GATE_START_S="0", NRESE_GATE_POLL_S="0")
         self.origin = self.root / "origin.git"
         self.git(self.root, "init", "-q", "--bare", str(self.origin))
         self.repo = self.root / "repo"
