@@ -259,8 +259,8 @@ fn dedup_sorted(items: &mut ChargedVec<EncodedQuad>) {
 /// Made on `budget`, everything reserved before it is allocated: the statements, the
 /// run's arrays, its scans' working memory, the version and its list of runs, and the
 /// view's own allocation. The [`View`] holds what it keeps reserved, released after it is
-/// freed; a refusal leaves nothing made. O(a log n + k log k) for a aliases and k such statements, or one scan of
-/// the named graphs where that is less.
+/// freed; a refusal leaves nothing made. O(a log n + k (log k + r log n)) for a aliases, k
+/// such statements and r runs, or one scan of the named graphs where that is less.
 fn canonical_version(
     version: &Arc<Version>,
     same_as: TermId,
@@ -288,6 +288,10 @@ fn canonical_version(
     }
     inserts.sort_unstable();
     dedup_sorted(&mut inserts);
+    // An exact delta (`index/run.rs`): a representatives' statement the asserted stack
+    // holds already, asserted beside an alias's that stands for it, is not inserted again,
+    // or its key would count twice. No insert is a statement tombstoned: those name an alias.
+    inserts.retain(|quad| !asserted.contains(quad));
     // What the view keeps besides its run's arrays: its run, the list of runs, the
     // version and its equality cell, and the view itself, each with its allocation's
     // header.
