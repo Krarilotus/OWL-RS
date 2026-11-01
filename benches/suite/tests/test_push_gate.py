@@ -728,8 +728,8 @@ class WindowsCheck(Repo):
     def test_it_is_the_commits_own_job_on_a_host_that_can_run_the_suite(self):
         """Without a verdict there is no pass, and the exit says so (75, not a failure's 1): the job
         is cancelled and nothing runs here. The job is COMMIT's own (its checkout, its launcher, its
-        tree); it states what it needs (a host that can run the suite, 4 cores, its memory held to
-        the ask) and picks no host."""
+        tree); it states what it needs (a Windows host with rustup, in the fleet's name `rust`, 4
+        cores, its memory held to the ask) and picks no host, nor a host named for the project."""
         older = self.commit("a.txt", "a changed\n")
         self.commit("b.txt", "b changed\n")
         self.fleet("pending")
@@ -741,7 +741,7 @@ class WindowsCheck(Repo):
         steps = json.loads(re.search(r"^steps = (.*)$", text, re.M).group(1))
         self.assertEqual(steps, [["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
                                   "scripts/lib/windows-job.ps1", self.tree(older)]], "SPEC windows-job")
-        for line in ('os = "windows"', 'kind = "owlrs.any"', 'has = ["owlrs-windows-suite"]', "cores = 4",
+        for line in ('os = "windows"', 'kind = "owlrs.any"', 'has = ["rust"]', "cores = 4",
                      'CARGO_BUILD_JOBS = "4"', f'rev = "{older}"', "ram_gb = 9", 'NRESE_MEMORY_CAP_GB = "9"'):
             self.assertIn(line, text, "SPEC windows-job")
         self.assertNotIn("hosts =", text, "SPEC windows-job: the tool picked a host")
@@ -913,24 +913,41 @@ class WindowsJob(Repo):
     def test_it_runs_the_trees_own_windows_tier_and_says_what_it_was(self):
         stubs = self.root / "stubs"
         stubs.mkdir()
+        # rustup's proxies where STUB_MISSING names what the host lacks of the tree's toolchain
+        # (`toolchain`: all of it; `clippy`: the component) until rustup installs it (STUB_INSTALLED, a
+        # file): the proxy installs it (STUB_NO_TOOLCHAIN, a file, says so) unless RUSTUP_AUTO_INSTALL=0.
+        # rustup itself records each call in STUB_RUSTUP_LOG; its `toolchain install` installs, or
+        # fails where STUB_RUSTUP_FAIL is set.
+        lacks = ('  [ "$RUSTUP_AUTO_INSTALL" != 0 ] || exit 1\n'
+                 '  : > "$STUB_NO_TOOLCHAIN"\n'
+                 'fi\n')
         # One workspace package, and no cargo-nextest: cargo test, crate by crate.
-        (stubs / "cargo").write_text('#!/bin/sh\n[ "$1" = metadata ] || exit 1\necho \'{"packages": [{"name": "x"}]}\'\n',
-                                     newline="\n")
-        # rustup's proxy where STUB_NO_TOOLCHAIN is set: the tree's toolchain isn't installed, and the
-        # proxy installs it (STUB_NO_TOOLCHAIN, a file, says so) unless RUSTUP_AUTO_INSTALL=0.
+        (stubs / "cargo").write_text(
+            '#!/bin/sh\nif [ "$1" = metadata ]; then echo \'{"packages": [{"name": "x"}]}\'; exit 0; fi\n'
+            '[ "$1" = clippy ] || exit 1\n'
+            'if [ -n "$STUB_MISSING" ] && [ ! -e "$STUB_INSTALLED" ]; then\n' + lacks
+            + 'echo "clippy 0.1.98"\n', newline="\n")
         (stubs / "rustc").write_text(
-            '#!/bin/sh\nif [ -n "$STUB_NO_TOOLCHAIN" ]; then\n  [ "$RUSTUP_AUTO_INSTALL" != 0 ] || exit 1\n'
-            f'  : > "$STUB_NO_TOOLCHAIN"\nfi\nexec "{(self.fake / "bin" / "rustc").as_posix()}" "$@"\n', newline="\n")
-        for name in ("cargo", "rustc"):
+            '#!/bin/sh\nif [ "$STUB_MISSING" = toolchain ] && [ ! -e "$STUB_INSTALLED" ]; then\n' + lacks
+            + f'exec "{(self.fake / "bin" / "rustc").as_posix()}" "$@"\n', newline="\n")
+        (stubs / "rustup").write_text(
+            '#!/bin/sh\necho "$*" >> "$STUB_RUSTUP_LOG"\n[ -z "$STUB_RUSTUP_FAIL" ] || exit 1\n'
+            '[ "$1 $2" != "toolchain install" ] || : > "$STUB_INSTALLED"\n', newline="\n")
+        for name in ("cargo", "rustc", "rustup"):
             (stubs / name).chmod(0o755)
         # The tree's cargo-guarded.sh: needs a usable stdin, as Python's subprocess and coreutils do,
         # says where it builds, and fails as STUB_FAIL says (<its first argument>:<exit>).
         guarded = ('#!/bin/sh\ncase "$1" in --print-rustflags) echo "-C target-cpu=native"; exit 0 ;; esac\n'
                    f'"{Path(sys.executable).as_posix()}" -c "import os; os.fstat(0)" || exit 9\n'
                    'printf %s "$CARGO_TARGET_DIR" > "$FLEET_OUT/target-dir"\n'
+                   # clippy as cargo runs it: not without the component.
+                   '[ "$1" != clippy ] || [ -z "$STUB_MISSING" ] || [ -e "$STUB_INSTALLED" ] || exit 101\n'
                    '[ "${STUB_FAIL%%:*}" != "$1" ] || exit "${STUB_FAIL#*:}"\n')
+        # The tree's pinned toolchain, and the cache's lock where there is no flock (Git Bash).
         for rel, body in {"scripts/cargo-guarded.sh": guarded, "scripts/fetch-w3c-tests.sh": "exit 0\n",
-                          "benches/suite/tests/isolation.py": "import sys\nsys.exit(0)\n"}.items():
+                          "benches/suite/tests/isolation.py": "import sys\nsys.exit(0)\n",
+                          "rust-toolchain.toml": '[toolchain]\nchannel = "1.98.1"\n',
+                          "benches/suite/suitekit/lock.py": (ROOT / "benches/suite/suitekit/lock.py").read_text()}.items():
             (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.repo / rel).write_text(body, newline="\n")
         (self.repo / "scripts/cargo-guarded.sh").chmod(0o755)
@@ -963,36 +980,53 @@ class WindowsJob(Repo):
                                     f'echo "$*" >> "{seen.as_posix()}"\n'
                                     f'exec "{Path(sys.executable).as_posix()}" "$@"\n', newline="\n")
         (own / "python").chmod(0o755)
-        cases = [  # tree sent, STUB_FAIL, stdin closed, toolchain missing, Python gone -> exit, a record, stdin
-            (tree, "", False, False, False, 0, True, "valid"),
-            ("0" * 40, "", False, False, False, 3, False, None),         # another tree checked out: no verdict
-            (tree, "build:101", False, False, False, 1, True, "valid"),  # a step fails: the tree fails
+        # The toolchain: there; missing, or there without clippy (another job installed the release with
+        # a minimal profile), and rustup installs it; or missing and rustup can't install it.
+        there, missing, no_clippy, uninstallable = None, ("toolchain", ""), ("clippy", ""), ("toolchain", "1")
+        cases = [  # tree sent, STUB_FAIL, stdin closed, toolchain, Python gone -> exit, a record, stdin
+            (tree, "", False, there, False, 0, True, "valid"),
+            ("0" * 40, "", False, there, False, 3, False, None),         # another tree checked out: no verdict
+            (tree, "build:101", False, there, False, 1, True, "valid"),  # a step fails: the tree fails
             # A lint of code only Windows compiles (cfg(windows)) fails the tree there (PR #68's review,
             # R68-F2: the Windows tier built and tested it, and linted nothing).
-            (tree, "clippy:101", False, False, False, 1, True, "valid"),
-            (tree, "build:75", False, False, False, 75, True, "valid"),  # the PC guard stopped a build: no verdict
-            (tree, "", True, False, False, 0, True, "invalid"),          # no usable stdin (fleet I14): said, steps get /dev/null
-            (tree, "", False, True, False, 3, False, None),              # no toolchain for the tree: no verdict, none installed
+            (tree, "clippy:101", False, there, False, 1, True, "valid"),
+            (tree, "build:75", False, there, False, 75, True, "valid"),  # the PC guard stopped a build: no verdict
+            (tree, "", True, there, False, 0, True, "invalid"),          # no usable stdin (fleet I14): said, steps get /dev/null
+            # A host the fleet places it on by `rust` (rustup) without the tree's pinned release: the job
+            # installs that release through rustup, and runs.
+            (tree, "", False, missing, False, 0, True, "valid"),
+            # The release there without clippy: installed too, never a failed tree (sol-loop r1 S1).
+            (tree, "", False, no_clippy, False, 0, True, "valid"),
+            (tree, "", False, uninstallable, False, 3, False, None),     # and if it can't be had: no verdict
             # The declared Python isn't here and can't be had (R76-F2: the host's own ran the suite): no verdict.
-            (tree, "", False, False, True, 3, False, None),
+            (tree, "", False, there, True, 3, False, None),
         ]
-        for case, (sent, fail, closed, missing, gone, code, recorded, stdin) in enumerate(cases):
+        for case, (sent, fail, closed, toolchain, gone, code, recorded, stdin) in enumerate(cases):
             out = self.root / f"out-{case}"
             out.mkdir()
             if gone:
                 shutil.rmtree(base.parent)
-            installed = self.root / f"installed-{case}"
+            proxied, rustup = self.root / f"proxied-{case}", self.root / f"rustup-{case}"
+            lacking, rustup_fails = toolchain or ("", "")
             run = ("exec 0<&-; " if closed else "") + 'exec bash "$@"'
             done = subprocess.run(
                 [BASH, "-c", run, "-", "scripts/lib/windows-job.sh", sent], cwd=self.repo,
                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120,
                 env={**self.env, "PATH": stubs.as_posix() + os.pathsep + self.env["PATH"], "FLEET_OUT": str(out),
                      "FLEET_JOB": f"win-{case}", "FLEET_STEP": "1", "FLEET_HOST": "kraris-gptler", "STUB_FAIL": fail,
-                     "STUB_NO_TOOLCHAIN": installed.as_posix() if missing else "",
+                     "STUB_MISSING": lacking, "STUB_INSTALLED": (self.root / f"installed-{case}").as_posix(),
+                     "STUB_NO_TOOLCHAIN": proxied.as_posix(),
+                     "STUB_RUSTUP_LOG": rustup.as_posix(), "STUB_RUSTUP_FAIL": rustup_fails,
                      "NRESE_GATE_CACHE": cache.as_posix(),
                      "CARGO_TARGET_DIR": (self.root / "shared-target").as_posix()})  # a host's shared one
             self.assertEqual(done.returncode, code, f"SPEC windows-run: case {case}\n{done.stdout}{done.stderr}")
-            self.assertFalse(installed.exists(), "SPEC windows-toolchain: a toolchain was installed")
+            self.assertFalse(proxied.exists(), "SPEC windows-toolchain: rustup's proxy installed a toolchain")
+            # rustup only to install the tree's pinned release, and only where it is missing: never
+            # `default`, `update`, `self update` or `uninstall` (the host's rustup home is shared).
+            calls = rustup.read_text().splitlines() if rustup.exists() else []
+            self.assertEqual(calls, [] if toolchain is there else
+                             ["toolchain install 1.98.1 --no-self-update --profile minimal --component rustfmt,clippy"],
+                             f"SPEC windows-toolchain: case {case}")
             if not recorded:
                 self.assertFalse((out / "gate.json").exists() or (out / "check.log").exists(), f"case {case}")
                 continue
