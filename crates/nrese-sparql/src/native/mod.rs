@@ -5540,7 +5540,7 @@ impl<'b> Probe<'_, 'b> {
             }
             if out.len() + found > room {
                 reserve_rows(&mut out, &mut held, found, usize::MAX).map_err(ProbeStop::Memory)?;
-                room = out.memory_bytes() / (8 * self.width).max(1);
+                room = out.memory_bytes() / out.row_bytes();
             }
             for m in 0..found {
                 for (c, slot) in row.iter_mut().enumerate().take(width) {
@@ -5710,9 +5710,10 @@ fn reserve_rows<B: std::ops::Deref<Target = Budget>>(
     rows: usize,
     most: usize,
 ) -> Result<(), BudgetExceeded> {
-    let row_bytes = 8 * table.width();
+    // A table without columns counts its rows too ([`IdTable::row_bytes`]).
+    let row_bytes = table.row_bytes();
     let needed = table.len().saturating_add(rows);
-    if row_bytes == 0 || needed.saturating_mul(row_bytes) <= table.memory_bytes() {
+    if needed.saturating_mul(row_bytes) <= table.memory_bytes() {
         return Ok(());
     }
     let doubled = (table.memory_bytes() / row_bytes * 2).min(most).max(needed);
