@@ -1733,11 +1733,18 @@ impl Context<'_> {
         drop((s, o, line));
         self.consumed(solutions);
         self.check()?;
-        let table = match joined {
-            // No column: only the count of rows, which holds no memory.
-            0 => IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
-            _ => charged_table(columns.into_iter()),
-        };
+        if joined == 0 {
+            // No column: only the count of rows, charged as rows without columns are
+            // ([`IdTable::memory_bytes`]); whoever consumes it releases that.
+            drop(columns);
+            drop(working);
+            return self.produced(Solutions {
+                vars,
+                table: IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
+                ordered: false,
+            });
+        }
+        let table = charged_table(columns.into_iter());
         drop(working);
         Ok(Solutions {
             vars,
