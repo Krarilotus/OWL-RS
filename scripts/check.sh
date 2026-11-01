@@ -30,7 +30,8 @@
 #                                  the suite contracts, by its own tier here, which its own
 #                                  scripts/lib/windows-job.sh runs on a Windows host. A commit
 #                                  whose inputs (scripts/lib/gate-key.sh windows_inputs)
-#                                  passed before carries that pass: "carried from <commit>".
+#                                  passed before, under the Python runtime it declares
+#                                  (gate_runtime), carries that pass: "carried from <commit>".
 #                                  NRESE_PUSH_REF as for push: the merge check's Windows part
 #                                  for refactor/engine-v2 is a merge gate, a package's isn't.
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
@@ -323,6 +324,12 @@ if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HO
   keyed=$tree on=""
   if [ "$mode" = windows ]; then
     keyed=inputs-$(windows_inputs "$push_commit") || { echo "no inputs of $push_commit to key its pass" >&2; exit 2; }
+    # And the Python runtime the commit declares for the suite: a pass under another, or one from
+    # before the tier declared one, is never carried (scripts/lib/gate-key.sh gate_runtime).
+    runtime=$(gate_runtime "$push_commit") \
+      || { echo "$(git rev-parse --short "$push_commit") declares no Python runtime for the suite" \
+             "(scripts/lib/gate-tools.txt python-windows): it can't be checked" >&2; exit 2; }
+    identity="$identity $(gate_python "$runtime")"
     on="$push_commit "
   fi
   key=$(gate_key "$mode" "$keyed" "$list_hash" "$identity")

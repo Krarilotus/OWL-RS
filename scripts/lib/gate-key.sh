@@ -19,6 +19,10 @@
 #   suite's benches/suite/requirements.txt), which the fleet job installs;
 # - fleet: a pass is only ever a fleet job's, verified (scripts/lib/fleet-gate.sh): no other line
 #   in the file (a hand-written one, an older gate's) has this form.
+# - for `windows`, `python=<id>` after tools: the Python runtime the checked commit declares for
+#   the suite (gate_runtime), which its job's suite ran with, verified (scripts/lib/fleet-gate.sh):
+#   a pass under another runtime, or one recorded before the tier declared one (its key has no
+#   python=), is never carried (PR #76 r1, R76-F2).
 #
 # A pass is a line `<key> | <the job, its host and CPU>` in <git-common-dir>/nrese-gate-passed,
 # written by scripts/check.sh only.
@@ -75,6 +79,24 @@ windows_inputs() {
     ($2 ~ /^docs\// || $2 ~ /^[^\/]*\.md$/) && !($2 in kept) { next }
     { print }' | git hash-object --stdin
 }
+
+# gate_runtime COMMIT: the Python runtime COMMIT declares for the Windows tier's suite, as the
+# suite's environment reports it (scripts/lib/suite-python.sh suite_python_runtime): `python
+# <sys.version>` of scripts/lib/gate-tools.txt's python-windows, then the pins of
+# benches/suite/requirements.txt, name==version (the names normalised, sorted). Fails where COMMIT
+# declares either none.
+gate_runtime() {
+  local build pins
+  build=$(git show "$1:scripts/lib/gate-tools.txt" 2> /dev/null | tr -d '\r' | sed -n 's/^python-windows [^ ]* [^ ]* //p')
+  pins=$(git show "$1:benches/suite/requirements.txt" 2> /dev/null | tr -d '\r' \
+    | awk '/^[A-Za-z0-9]/ { n = $1; sub(/==.*/, "", n); v = substr($1, length(n) + 1); n = tolower(n)
+                            gsub(/[-_.]+/, "-", n); print n v }' | LC_ALL=C sort)
+  [ -n "$build" ] && [ -n "$pins" ] || return 1
+  printf 'python %s\n%s\n' "$build" "$pins"
+}
+
+# gate_python RUNTIME: the key's name of RUNTIME (gate_runtime), `python=<id>`.
+gate_python() { printf 'python=%s\n' "$(printf '%s\n' "$1" | git hash-object --stdin | cut -c1-12)"; }
 
 gate_passed_file() { printf '%s/nrese-gate-passed\n' "$(git rev-parse --git-common-dir)"; }
 

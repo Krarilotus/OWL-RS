@@ -13,7 +13,8 @@
 # commit's own scripts/lib/windows-job.ps1 and through it its scripts/check.sh windows.
 # NRESE_GATE_HOSTS: only these hosts. It follows the job and reads its result: valid only when it
 # is for TREE, LIST_HASH, this tier and IDENTITY (the toolchain and the flags,
-# scripts/lib/gate-key.sh) and left no tracked file changed.
+# scripts/lib/gate-key.sh) and left no tracked file changed; for windows also only when the suite
+# ran with the Python runtime COMMIT declares (gate_runtime), as the record states it.
 #
 # The merge check's jobs are the fleet's merge gates (`priority_class = "merge-gate"`, a class its
 # config ranks): either tier's job when COMMIT is for refactor/engine-v2, i.e. NRESE_PUSH_REF, the
@@ -56,6 +57,12 @@ no_verdict() {
 
 fleet_ready || no_verdict "no fleet to ask"
 [ "$(git rev-parse "$commit^{tree}" 2> /dev/null)" = "$tree" ] || no_verdict "commit $commit isn't tree $tree"
+# shellcheck source=gate-key.sh
+. scripts/lib/gate-key.sh
+runtime=""
+if [ "$mode" = windows ]; then
+  runtime=$(gate_runtime "$commit") || no_verdict "commit $commit declares no Python runtime for the suite"
+fi
 
 # What a tier asks for (cores also bound its compilers; the step's slice caps its memory on
 # Linux, scripts/cargo-guarded.sh's job object on Windows).
@@ -142,10 +149,11 @@ gate() {
   # A verdict only from a whole, consistent record of this job's last attempt where the fleet says
   # it ran (Sol, review-remote-gates-r1-20261020): a pass needs the job done, check.sh's exit 0 and
   # its summary with every step at 0; a failure needs the job failed, exit 1 and a step that
-  # failed. Anything else, or a record of another job, host or attempt, is no verdict.
-  verdict=$(python - "$out" "$mode" "$tree" "$list_hash" "$identity" "${NRESE_W3C_OPTIONAL:+1}"       "$fleet_state" "$fleet_id" "$fleet_host" "$(dirname "$out")/attempt" << 'EOF'
+  # failed. Anything else, or a record of another job, host or attempt, or (windows) of a run under
+  # another Python runtime than the declared one, is no verdict.
+  verdict=$(python - "$out" "$mode" "$tree" "$list_hash" "$identity" "${NRESE_W3C_OPTIONAL:+1}"       "$fleet_state" "$fleet_id" "$fleet_host" "$(dirname "$out")/attempt" "$runtime" << 'EOF'
 import json, sys
-path, mode, tree, list_hash, identity, w3c, state, job, host, attempt_file = sys.argv[1:11]
+path, mode, tree, list_hash, identity, w3c, state, job, host, attempt_file, runtime = sys.argv[1:12]
 r = json.load(open(path, encoding="utf-8"))
 try:
     attempt = open(attempt_file, encoding="utf-8").read().strip()
@@ -153,7 +161,7 @@ except OSError:
     attempt = None
 want = {"tier": mode, "tree": tree, "list_hash": list_hash, "identity": identity,
         "w3c_optional": bool(w3c), "tracked_changes": "", "job": job, "fleet_host": host,
-        "attempt": attempt, "summary": True}
+        "attempt": attempt, "summary": True, "runtime": runtime or None}
 wrong = [f"{k} {r.get(k)!r}, not {v!r}" for k, v in want.items() if r.get(k) != v]
 steps = r.get("steps") or []
 failing = [s["name"] for s in steps if s.get("code") != 0]

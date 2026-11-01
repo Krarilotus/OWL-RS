@@ -10,7 +10,11 @@
 # never one rustup would install: no verdict without it), a target directory of its own in the
 # checkout, never a shared one, and its temporary files in the checkout's tmp/windows-job: both go
 # with the checkout. The suite contracts' Python packages come from an environment of their own in
-# the host's cache, as the Linux gate's do (scripts/lib/suite-python.sh), never the host's Python.
+# the host's cache, as the Linux gate's do (scripts/lib/suite-python.sh), never the host's Python:
+# made from the Python the tree declares (scripts/lib/gate-tools.txt python-windows, python.org's
+# build, installed under the cache), it must run with the runtime the tree declares
+# (scripts/lib/gate-key.sh gate_runtime), or there is no verdict; the record states the runtime it
+# ran with, which scripts/lib/fleet-gate.sh checks against the declared one.
 #
 # The fleet starts a Windows step without a usable stdin (fleet backlog I14): Python's subprocess
 # and coreutils fail on it. The job says so after check.sh's summary, records it (`stdin` in
@@ -45,19 +49,30 @@ run() {
   . scripts/lib/gate-key.sh
   # rustup's proxies would install a missing toolchain, with no deadline, on the host's own rustup.
   export RUSTUP_AUTO_INSTALL=0
-  local identity
+  local identity runtime
   identity=$(gate_identity) || infra "no toolchain here for the tree's rust-toolchain.toml"
+  # The Python runtime the tree declares for the suite, in the identity as in the pass's key
+  # (scripts/check.sh windows).
+  runtime=$(gate_runtime HEAD) \
+    || infra "the tree declares no Python runtime for the suite (scripts/lib/gate-tools.txt python-windows)"
+  identity="$identity $(gate_python "$runtime")"
   echo "=== windows part of tree $tree on $(hostname) ($identity)"
 
-  # The suite's own Python environment, from the host's `python` (Windows' `python3` may be the
-  # Store's stub): first on PATH, so check.sh's suite contracts and the record run with it.
-  local cache=${NRESE_GATE_CACHE:-$HOME/fleet/cache/owlrs-gate} pybin
+  # The suite's own Python environment, from the Python the tree declares, the job's own under the
+  # host's cache, and running with the declared runtime: first on PATH, so check.sh's suite
+  # contracts and the record run with it. The host's `python` (Windows' `python3` may be the
+  # Store's stub) only runs the cache's lock where there is no flock.
+  local cache=${NRESE_GATE_CACHE:-$HOME/fleet/cache/owlrs-gate} version sha build base pybin
   # Git Bash's form (/c/…): a `C:/…` entry in PATH would split at its colon.
   cache=$(cygpath -u "$cache" 2> /dev/null || printf '%s' "$cache")
   # shellcheck source=suite-python.sh
   . scripts/lib/suite-python.sh
-  pybin=$(suite_python "$cache" benches/suite/requirements.txt python) || infra "no Python for the suite"
-  echo "$EPOCHSECONDS" > "${pybin%/*}/.last-used"
+  read -r version sha build < <(sed -n 's/^python-windows //p' scripts/lib/gate-tools.txt | tr -d '\r')
+  base=$(NRESE_PYTHON=python suite_python_windows "$cache" "$version" "$sha" "$build") \
+    || infra "no Python $version for the suite (python.org's, scripts/lib/gate-tools.txt python-windows)"
+  pybin=$(suite_python "$cache" benches/suite/requirements.txt "$base" "$runtime") \
+    || infra "no Python environment for the suite with the declared runtime"
+  echo "$EPOCHSECONDS" | tee "${pybin%/*}/.last-used" > "${base%/tools/python.exe}/.last-used"
   export PATH="$pybin:$PATH"
 
   local temp
@@ -75,7 +90,9 @@ run() {
   code=${PIPESTATUS[0]}
   [ $stdin = valid ] || echo "stdin: the fleet gave this step none it could use (fleet backlog I14); it ran with /dev/null"
 
-  GATE_TIER=windows GATE_TREE=$tree GATE_LIST=$(git hash-object --stdin < /dev/null) GATE_IDENTITY=$identity \
+  # The runtime as the run left it: a run that changed its environment ran with no declared one.
+  GATE_RUNTIME=$(suite_python_runtime "$pybin/python") \
+    GATE_TIER=windows GATE_TREE=$tree GATE_LIST=$(git hash-object --stdin < /dev/null) GATE_IDENTITY=$identity \
     GATE_CODE=$code GATE_CPU=$(gate_cpu) GATE_HOST=$(hostname) \
     GATE_NEXTEST=$(cargo nextest --version 2> /dev/null | head -1) \
     GATE_CHANGED=$(git status --porcelain --untracked-files=no) GATE_SECONDS=$((SECONDS - began)) \
