@@ -9,6 +9,7 @@ Run: python -m unittest discover -s benches/suite/tests -p test_push_gate.py
 An assertion tagged `SPEC <tag>` states the behaviour its test is for.
 """
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
 
 import isolation
 
@@ -114,9 +116,21 @@ class Repo(unittest.TestCase):
         return subprocess.CompletedProcess(done.args, done.returncode, done.stdout.decode(errors="replace"),
                                            done.stderr.decode(errors="replace"))
 
-    def fleet(self, state, tree=None, files=(), tier="push"):
+    def declared(self, commit="HEAD"):
+        """The Python runtime COMMIT declares for the Windows tier's suite (gate_runtime) and the
+        key's name of it (gate_python), or None where it declares none."""
+        done = subprocess.run([BASH, "-c", '. scripts/lib/gate-key.sh && r=$(gate_runtime "$1") && printf "%s\\n" "$r"'
+                               ' && gate_python "$r"', "-", commit], cwd=self.repo, capture_output=True, text=True,
+                              env=self.env)
+        if done.returncode:
+            return None
+        *runtime, name = done.stdout.rstrip("\n").split("\n")
+        return "\n".join(runtime), name
+
+    def fleet(self, state, tree=None, files=(), tier="push", runtime="declared"):
         """The fleet's answer: the job's state and, with TREE, a whole, consistent passing result
-        of its gate (TIER) for TREE and FILES."""
+        of its gate (TIER) for TREE and FILES; a Windows one, as its job records it, under the
+        Python runtime HEAD declares, if it declares one, or under RUNTIME (None: it states none)."""
         (self.fake / "status").write_text(json.dumps({"state": state, "host": "office-pc"}))
         out = self.fake / "results" / "out"
         for name in ("gate.json", "attempt", "gate.log"):
@@ -129,11 +143,16 @@ class Repo(unittest.TestCase):
                                    env=self.env, check=True).stdout.decode().strip()
         identity = subprocess.run([BASH, "-c", ". scripts/lib/gate-key.sh && gate_identity"], cwd=self.repo,
                                   capture_output=True, text=True, env=self.env).stdout.strip()
-        (out / "gate.json").write_text(json.dumps({
+        record = {
             "tier": tier, "part": "rest", "tree": tree, "list_hash": list_hash, "identity": identity,
             "w3c_optional": False, "tracked_changes": "", "code": 0, "host": "office-pc", "cpu": "znver3",
             "job": "gate-1", "fleet_host": "office-pc", "attempt": "gate-1:0:1:1", "summary": True,
-            "steps": [{"name": "fmt", "code": 0, "seconds": 1}]}))
+            "steps": [{"name": "fmt", "code": 0, "seconds": 1}]}
+        declared = self.declared() if tier == "windows" else None
+        if declared:
+            record["identity"] = f"{identity} {declared[1]}"
+            record["runtime"] = declared[0] if runtime == "declared" else runtime
+        (out / "gate.json").write_text(json.dumps(record))
         (out / "attempt").write_text("gate-1:0:1:1\n")
         (out / "gate.log").write_text("=== summary\n  0  fmt (1 s)\n")
 
@@ -310,15 +329,17 @@ esac
                 shutil.rmtree(path) if path.is_dir() else path.unlink()
 
     def job(self, n, host, state, **result):
-        """Job gate-N: its end on HOST, and its record: a whole, passing one, changed by RESULT."""
+        """Job gate-N: its end on HOST, and its record: a whole, passing one (a Windows one under the
+        Python runtime the tip declares, as its job records it), changed by RESULT."""
         (self.fake / f"status-gate-{n}").write_text(json.dumps({"state": state, "host": host}))
         out = self.fake / f"results-gate-{n}" / "out"
         out.mkdir(parents=True)
+        declared = self.declared(self.tip) if result.get("tier") == "windows" else None
         (out / "gate.json").write_text(json.dumps({
             "tier": "push", "tree": self.tree(self.tip), "list_hash": "L", "identity": "ID", "w3c_optional": False,
             "tracked_changes": "", "code": 0, "host": host, "cpu": "znver3", "job": f"gate-{n}", "fleet_host": host,
             "attempt": f"gate-{n}:1", "summary": True, "steps": [{"name": "test", "code": 0, "seconds": 1}],
-            **result}))
+            "runtime": declared[0] if declared else None, **result}))
         (out / "attempt").write_text(f"gate-{n}:1\n")
         (out / "gate.log").write_text("=== summary\n  0  test (1 s)\n")
 
@@ -807,6 +828,82 @@ class WindowsCheck(Repo):
         self.assertEqual((done.returncode, self.submitted(), "has no Windows tier" in done.stderr), (2, [], True),
                          f"SPEC windows-tier\n{done.stderr}")
 
+    # PR #76 r1, R76-F2: the Windows verdict didn't depend on the Python the suite ran with. Its pass
+    # was keyed by the repository's inputs and toolchain alone, and once recorded, `check.sh windows`
+    # exited 0 on it before any job, whichever Python (3.13 on one host, 3.14 on another), packages or
+    # cached environment the suite had run with.
+
+    def runtime(self, commit):
+        """The Python runtime COMMIT declares and the key's name of it."""
+        declared = self.declared(commit)
+        self.assertIsNotNone(declared, "SPEC windows-runtime: the tree declares the Python runtime its Windows tier's"
+                                       " suite runs with (scripts/lib/gate-key.sh gate_runtime)")
+        return declared
+
+    def test_a_pass_from_before_the_declared_runtime_is_never_carried(self):
+        """A pass recorded before the tier declared its runtime (its key names none) ran with
+        whichever Python its host had: the commit is checked again."""
+        tip = self.commit("a.txt", "a changed\n")
+        old = subprocess.run([BASH, "-c", '. scripts/lib/gate-key.sh && gate_key windows "inputs-$(windows_inputs "$1")"'
+                              ' "$(git hash-object --stdin < /dev/null)" "$(gate_identity)"', "-", tip],
+                             cwd=self.repo, capture_output=True, text=True, env=self.env, check=True).stdout.strip()
+        common = Path(self.git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        (common / "nrese-gate-passed").write_text(f"{old} | {tip} fleet:gate-0@office-pc cpu=znver3\n", newline="\n")
+        self.fleet("pending")
+        done = self.check(tip)
+        self.assertEqual((done.returncode, len(self.submitted())), (75, 1),
+                         f"SPEC windows-runtime: a pass from before the declared runtime was carried\n{done.stdout}")
+
+    def test_a_result_under_another_runtime_is_no_verdict_and_no_pass(self):
+        """A result whose suite ran with another Python than the commit declares, other packages, or
+        no runtime stated (an older job's): no verdict, and nothing recorded, so the next check
+        submits again."""
+        tip = self.commit("a.txt", "a changed\n")
+        declared, _ = self.runtime(tip)
+        python, pins = declared.split("\n", 1)
+        for case, runtime in (("another Python", f"python 3.14.0 (main) [MSC v.1944 64 bit (AMD64)]\n{pins}"),
+                              ("other packages", f"{python}\nnumpy==2.4.6"), ("none stated", None)):
+            with self.subTest(case):
+                before = len(self.submitted())
+                self.fleet("done", self.tree(tip), [], tier="windows", runtime=runtime)
+                done = self.check(tip)
+                self.assertEqual((done.returncode, len(self.submitted())), (75, before + 1),
+                                 f"SPEC windows-runtime: {case} counted\n{done.stdout}{done.stderr}")
+                self.assertIn("runtime", done.stdout + done.stderr, case)
+
+    def test_a_commit_that_changes_its_declared_runtime_runs_again(self):
+        """A valid pass, then a commit that changes only the declared runtime (the Python's build,
+        a pin): it is checked again, never carried."""
+        passed = self.commit("a.txt", "a changed\n")
+        before = self.runtime(passed)
+        self.fleet("done", self.tree(passed), [], tier="windows")
+        self.assertEqual(self.check(passed).returncode, 0, "the valid pass")
+        self.fleet("pending")
+        build = "3.13.9 (tags/v3.13.9:0000000, Oct  1 2026, 00:00:00) [MSC v.1944 64 bit (AMD64)]"
+        for path, change in (("scripts/lib/gate-tools.txt", lambda t: re.sub(r"^(python-windows \S+ \S+ ).*$",
+                                                                              lambda m: m.group(1) + build, t, flags=re.M)),
+                             ("benches/suite/requirements.txt", lambda t: t.replace("scipy==1.17.1", "scipy==1.17.2"))):
+            with self.subTest(path):
+                self.git(self.repo, "checkout", "-q", "--detach", passed)
+                text = (self.repo / path).read_text()
+                (self.repo / path).write_text(change(text), newline="")
+                self.git(self.repo, "commit", "-qam", f"change {path}")
+                changed = self.git(self.repo, "rev-parse", "HEAD")
+                self.assertNotEqual(self.runtime(changed), before, path)
+                count = len(self.submitted())
+                done = self.check(changed)
+                self.assertEqual((done.returncode, len(self.submitted())), (75, count + 1),
+                                 f"SPEC windows-runtime: {path}'s change carried the pass\n{done.stdout}")
+
+    def test_a_commit_that_declares_no_runtime_is_refused_before_any_job(self):
+        tools = self.repo / "scripts/lib/gate-tools.txt"
+        tools.write_text(re.sub(r"^python-windows .*\n", "", tools.read_text(), flags=re.M), newline="")
+        self.git(self.repo, "commit", "-q", "--allow-empty", "-am", "no runtime declared")
+        self.fleet("pending")
+        done = self.check(self.git(self.repo, "rev-parse", "HEAD"))
+        self.assertEqual((done.returncode, self.submitted(), "declares no Python runtime" in done.stderr),
+                         (2, [], True), f"SPEC windows-runtime\n{done.stderr}")
+
 
 class WindowsJob(Repo):
     """scripts/lib/windows-job.sh, the Windows part's step on its host, in the job's checkout of the
@@ -841,29 +938,49 @@ class WindowsJob(Repo):
         self.git(self.repo, "commit", "-q", "-m", "the commit under test")
         tree = self.tree("HEAD")
         empty = self.git(self.repo, "hash-object", "/dev/null")
-        # The suite's own Python environment in the host's cache, made already (the tree's
-        # requirements'): its python says what it runs.
+        declared = self.declared()
+        self.assertIsNotNone(declared, "SPEC windows-runtime: the tree declares the Python runtime its suite runs with")
+        runtime, name = declared
+        # The Python the tree declares (python-windows), installed in the host's cache already: it
+        # reports the declared build. No other can be had here (curl fails).
         cache, seen = self.root / "cache", self.root / "suite-python"
+        version, sha, build = re.search(r"^python-windows (\S+) (\S+) (.*)$",
+                                        (self.repo / "scripts/lib/gate-tools.txt").read_text(), re.M).groups()
+        base = cache / f"python-{version}-{sha[:12]}" / "tools"
+        base.mkdir(parents=True)
+        (base / "python.exe").write_text(f"#!/bin/sh\nprintf '%s\\n' '{build}'\n", newline="\n")
+        (base / "python.exe").chmod(0o755)
+        (stubs / "curl").write_text("#!/bin/sh\nexit 22\n", newline="\n")
+        (stubs / "curl").chmod(0o755)
+        # The suite's own Python environment in the host's cache, made already (the tree's
+        # requirements' and declared runtime's): it runs with the declared runtime, and its python
+        # says what it runs.
         requirements = self.git(self.repo, "hash-object", "benches/suite/requirements.txt")
-        own = cache / f"py-{requirements[:12]}" / "bin"
+        own = cache / f"py-{requirements[:12]}-{name.removeprefix('python=')}" / "bin"
         own.mkdir(parents=True)
-        (own / "python").write_text(f'#!/bin/sh\necho "$*" >> "{seen.as_posix()}"\n'
+        (own / "runtime").write_text(f"{runtime}\n", newline="\n")
+        (own / "python").write_text(f'#!/bin/sh\n[ "$1" != - ] || exec cat "{(own / "runtime").as_posix()}"\n'
+                                    f'echo "$*" >> "{seen.as_posix()}"\n'
                                     f'exec "{Path(sys.executable).as_posix()}" "$@"\n', newline="\n")
         (own / "python").chmod(0o755)
-        cases = [  # tree sent, STUB_FAIL, stdin closed, toolchain missing -> exit, a record, stdin
-            (tree, "", False, False, 0, True, "valid"),
-            ("0" * 40, "", False, False, 3, False, None),         # another tree checked out: no verdict
-            (tree, "build:101", False, False, 1, True, "valid"),  # a step fails: the tree fails
+        cases = [  # tree sent, STUB_FAIL, stdin closed, toolchain missing, Python gone -> exit, a record, stdin
+            (tree, "", False, False, False, 0, True, "valid"),
+            ("0" * 40, "", False, False, False, 3, False, None),         # another tree checked out: no verdict
+            (tree, "build:101", False, False, False, 1, True, "valid"),  # a step fails: the tree fails
             # A lint of code only Windows compiles (cfg(windows)) fails the tree there (PR #68's review,
             # R68-F2: the Windows tier built and tested it, and linted nothing).
-            (tree, "clippy:101", False, False, 1, True, "valid"),
-            (tree, "build:75", False, False, 75, True, "valid"),  # the PC guard stopped a build: no verdict
-            (tree, "", True, False, 0, True, "invalid"),          # no usable stdin (fleet I14): said, steps get /dev/null
-            (tree, "", False, True, 3, False, None),              # no toolchain for the tree: no verdict, none installed
+            (tree, "clippy:101", False, False, False, 1, True, "valid"),
+            (tree, "build:75", False, False, False, 75, True, "valid"),  # the PC guard stopped a build: no verdict
+            (tree, "", True, False, False, 0, True, "invalid"),          # no usable stdin (fleet I14): said, steps get /dev/null
+            (tree, "", False, True, False, 3, False, None),              # no toolchain for the tree: no verdict, none installed
+            # The declared Python isn't here and can't be had (R76-F2: the host's own ran the suite): no verdict.
+            (tree, "", False, False, True, 3, False, None),
         ]
-        for case, (sent, fail, closed, missing, code, recorded, stdin) in enumerate(cases):
+        for case, (sent, fail, closed, missing, gone, code, recorded, stdin) in enumerate(cases):
             out = self.root / f"out-{case}"
             out.mkdir()
+            if gone:
+                shutil.rmtree(base.parent)
             installed = self.root / f"installed-{case}"
             run = ("exec 0<&-; " if closed else "") + 'exec bash "$@"'
             done = subprocess.run(
@@ -877,7 +994,7 @@ class WindowsJob(Repo):
             self.assertEqual(done.returncode, code, f"SPEC windows-run: case {case}\n{done.stdout}{done.stderr}")
             self.assertFalse(installed.exists(), "SPEC windows-toolchain: a toolchain was installed")
             if not recorded:
-                self.assertFalse((out / "gate.json").exists(), f"case {case}")
+                self.assertFalse((out / "gate.json").exists() or (out / "check.log").exists(), f"case {case}")
                 continue
             built = Path((out / "target-dir").read_text())
             self.assertTrue(built.name == "target" and os.path.samefile(built.parent, self.repo),
@@ -897,7 +1014,9 @@ class WindowsJob(Repo):
                              f"SPEC windows-run: case {case}")
             self.assertEqual(result["attempt"], (out / "attempt").read_text().strip())
             self.assertRegex(result["identity"],
-                             r"^rustc-1\.98\.1-abcdef123456 flags=-C_target-cpu=native tools=[0-9a-f]{12}$")
+                             rf"^rustc-1\.98\.1-abcdef123456 flags=-C_target-cpu=native tools=[0-9a-f]{{12}} {name}$",
+                             "SPEC windows-runtime: the identity names the declared runtime, as the pass's key does")
+            self.assertEqual(result["runtime"], runtime, "SPEC windows-runtime: the record states what the suite ran with")
             ran = seen.read_text() if seen.exists() else ""
             self.assertIn("benches/suite/tests/isolation.py", ran,
                           f"SPEC windows-python: the suite contracts ran with the host's Python: case {case}")
@@ -920,7 +1039,8 @@ class SuitePython(unittest.TestCase):
         requirements = self.root / "requirements.txt"
         requirements.write_text("scipy==1.17.1\n", newline="\n")
         # The host's Python: `-m venv DIR` makes DIR/bin/python (itself; with LAYOUT=windows
-        # DIR/Scripts/python.exe, and Scripts/python as Git Bash finds python.exe), its `-m pip install`
+        # DIR/Scripts/python.exe, and Scripts/python as Git Bash finds python.exe), whose runtime
+        # (a script on stdin, suite_python_runtime) is REPORTS, where set; its `-m pip install`
         # fails where FAIL is set, and anything else (suitekit/lock.py, where there is no flock) is the
         # real Python's. WAITING, where set, is made as the job comes to the cache's lock: here, or in
         # flock's stand-in where there is a flock.
@@ -929,12 +1049,14 @@ class SuitePython(unittest.TestCase):
                              '  "-m venv") echo "$1 $2" >> "$SEEN"\n'
                              '    if [ "$LAYOUT" = windows ]; then\n'
                              '      mkdir -p "$3/Scripts" && cp "$0" "$3/Scripts/python.exe" && cp "$0" "$3/Scripts/python"\n'
-                             '    else mkdir -p "$3/bin" && cp "$0" "$3/bin/python"; fi ;;\n'
+                             '    else mkdir -p "$3/bin" && cp "$0" "$3/bin/python"\n'
+                             '      [ -z "$REPORTS" ] || printf "%s\\n" "$REPORTS" > "$3/bin/python.reports"; fi ;;\n'
                              '  "-m pip") echo "$1 $2" >> "$SEEN"; [ -z "$FAIL" ] ;;\n'
+                             '  "- ") cat "$0.reports" ;;\n'
                              '  *) [ -z "$WAITING" ] || : > "$WAITING"; exec "$PYTHON" "$@" ;;\nesac\n',
                              newline="\n")
         self.host.chmod(0o755)
-        self.path = CLEAN.get("PATH", "")
+        self.path = os.environ.get("PATH", "")
         flock = shutil.which("flock")
         if flock:
             stand_in = self.root / "stand-ins" / "flock"
@@ -950,10 +1072,12 @@ class SuitePython(unittest.TestCase):
         self.env = self.cache / f"py-{digest[:12]}"
 
     def environment(self, **extra: str) -> dict:
-        return {**CLEAN, "PATH": self.path, "SEEN": self.seen.as_posix(), "PYTHON": sys.executable, **extra}
+        # The suite's git policy (isolation.inherit), none of a calling gate's or job's settings.
+        return isolation.inherit(*LEAKS, **{"PATH": self.path, "SEEN": self.seen.as_posix(),
+                                            "PYTHON": sys.executable, **extra})
 
-    def made(self, **extra: str) -> subprocess.CompletedProcess:
-        return subprocess.run(self.command, cwd=ROOT, capture_output=True, text=True, timeout=60,
+    def made(self, *runtime: str, **extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run([*self.command, *runtime], cwd=ROOT, capture_output=True, text=True, timeout=60,
                               env=self.environment(**extra))
 
     def left(self) -> list:
@@ -1015,6 +1139,76 @@ class SuitePython(unittest.TestCase):
         self.assertTrue((scripts / "python3.exe").exists(), "SPEC suite-python: python3 is the suite's on Windows")
         self.assertEqual((scripts / "python3.exe").read_bytes(), (scripts / "python.exe").read_bytes(),
                          "SPEC suite-python: python3.exe is the environment's own launcher")
+
+    def test_with_a_declared_runtime_only_an_environment_running_with_it_is_the_suites(self):
+        """PR #76 r1, R76-F2: an environment was taken by its requirements and a Python's being in
+        it, whatever Python and packages it ran with. With a declared runtime (gate_runtime) one that
+        runs with another is made again, and one made that doesn't run with it either is refused."""
+        declared = "python 3.13.3 (stand-in)\nscipy==1.17.1"
+        # bytes: a text-mode pipe on Windows would add CR, which the environment's key has none of
+        digest = subprocess.run(["git", "hash-object", "--stdin"], input=f"{declared}\n".encode(), capture_output=True,
+                                check=True).stdout.decode().strip()
+        env = self.cache / f"{self.env.name}-{digest[:12]}"
+        (env / "bin").mkdir(parents=True)
+        shutil.copy(self.host, env / "bin" / "python")
+        (env / "bin" / "python.reports").write_text("python 3.14.0 (another)\nscipy==1.17.1\n", newline="\n")
+        done = self.made(declared, REPORTS=declared)
+        self.assertEqual((done.returncode, Path(done.stdout.strip())), (0, env / "bin"),
+                         f"SPEC suite-python: the declared runtime's environment\n{done.stderr}")
+        self.assertEqual(((env / "bin" / "python.reports").read_text(), self.seen.read_text()),
+                         (f"{declared}\n", "-m venv\n-m pip\n"),
+                         "SPEC suite-python: one running with another runtime is made again")
+        # A Python whose environments run with another runtime than the one declared: refused.
+        done = self.made("python 3.13.3 (stand-in)\nscipy==1.17.2", REPORTS=declared)
+        self.assertNotEqual(done.returncode, 0, f"SPEC suite-python: an environment not of the declared runtime\n"
+                                                f"{done.stdout}")
+        self.assertIn("doesn't run with the declared Python", done.stderr)
+        self.assertEqual(self.left(), [env.name], "SPEC suite-python: and nothing of it is left")
+
+    def test_the_declared_windows_python_is_python_orgs_package_by_its_sha256(self):
+        """suite_python_windows: python.org's NuGet package of the declared version, taken only with
+        the declared sha256, unpacked once under the lock; one that doesn't report the declared build
+        is fetched again."""
+        build = "3.13.3 (stand-in build) [MSC v.1943 64 bit (AMD64)]"
+        package = self.root / "python.nupkg"
+        with zipfile.ZipFile(package, "w") as z:
+            z.writestr("tools/python.exe", f"#!/bin/sh\nprintf '%s\\n' '{build}'\n")
+            z.writestr("python.nuspec", "<package/>\n")
+        sha = hashlib.sha256(package.read_bytes()).hexdigest()
+        # curl copies the package (and says which it was asked for), unzip unpacks it with Python's zipfile.
+        fetch = self.root / "fetch"
+        fetch.mkdir()
+        for name, body in {"curl": 'while [ $# -gt 1 ]; do [ "$1" != -o ] || out=$2; shift; done\n'
+                                   'echo "$1" >> "$SEEN"\ncp "$PACKAGE" "$out"\n',
+                           "unzip": '"$PYTHON" -m zipfile -e "$2" "$4" && chmod +x "$4/tools/python.exe"\n'}.items():
+            (fetch / name).write_text(f"#!/bin/sh\n{body}", newline="\n")
+            (fetch / name).chmod(0o755)
+        python = self.cache / f"python-3.13.3-{sha[:12]}" / "tools" / "python.exe"
+
+        def windows(declared_sha):
+            return subprocess.run(
+                [BASH, "-c", '. scripts/lib/suite-python.sh && suite_python_windows "$@"', "-", self.cache.as_posix(),
+                 "3.13.3", declared_sha, build], cwd=ROOT, capture_output=True, text=True, timeout=60,
+                env=self.environment(PATH=f"{fetch.as_posix()}{os.pathsep}{self.path}", PACKAGE=package.as_posix(),
+                                     NRESE_PYTHON=self.host.as_posix()))
+
+        done = windows("0" * 64)
+        self.assertNotEqual(done.returncode, 0, "SPEC suite-python: a package not of the declared sha256 was taken")
+        self.assertEqual(sorted(p.name for p in self.cache.glob("python-*")), [],
+                         f"SPEC suite-python: nothing of it is left\n{done.stderr}")
+        url = "https://api.nuget.org/v3-flatcontainer/python/3.13.3/python.3.13.3.nupkg\n"
+        for attempt in ("fetched", "there"):
+            done = windows(sha)
+            self.assertEqual((done.returncode, Path(done.stdout.strip())), (0, python),
+                             f"SPEC suite-python: python.org's package, {attempt}\n{done.stderr}")
+            self.assertEqual(self.seen.read_text(), url * 2, f"SPEC suite-python: fetched once ({attempt})")
+        python.write_text("#!/bin/sh\necho 3.12.0\n", newline="\n")  # no longer the declared build
+        done = windows(sha)
+        self.assertEqual((done.returncode, self.seen.read_text().count(url)), (0, 3),
+                         f"SPEC suite-python: one not reporting the declared build is fetched again\n{done.stderr}")
+        # `exec "$1"`, not a lone `"$1"`: Git Bash started by Windows' Python takes that one's quotes apart.
+        self.assertEqual(subprocess.run([BASH, "-c", 'exec "$1"', "-", python.as_posix()], capture_output=True,
+                                        text=True).stdout.strip(), build)
 
 
 if __name__ == "__main__":
