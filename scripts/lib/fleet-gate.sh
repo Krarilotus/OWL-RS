@@ -8,9 +8,9 @@
 # COMMIT (its tree TREE) with the changed files of LIST. The job yields to timed work: never
 # started beside it, stopped when a timed job of higher priority wants its host. It runs on a
 # Linux host with the test role.
-# MODE windows (LIST empty): a job of kind owlrs.any on a Windows host that can run the OWL-RS
-# Windows suite (`has = ["owlrs-windows-suite"]`, declared in the fleet's config), which runs the
-# commit's own scripts/lib/windows-job.ps1 and through it its scripts/check.sh windows.
+# MODE windows (LIST empty): a job of kind owlrs.any on any Windows host with what the tier uses
+# there (below, `has`, in the fleet config's names), which runs the commit's own
+# scripts/lib/windows-job.ps1 and through it its scripts/check.sh windows.
 # NRESE_GATE_HOSTS: only these hosts. It follows the job and reads its result: valid only when it
 # is for TREE, LIST_HASH, this tier and IDENTITY (the toolchain and the flags,
 # scripts/lib/gate-key.sh) and left no tracked file changed; for windows also only when the suite
@@ -76,9 +76,15 @@ case $mode in
     # 9 GB job admitted at 16 GB that peaks at 7.5 GB still leaves 8.5 GB, clear of the 4 GB
     # eviction floor (the fleet's owner, 27 Oct 2026). 16 GB kept checks waiting while 11-15 GB
     # was free.
-    # est: the 4-core run's 899 s with clippy's 38 s, x 1.5.
-    cores=${NRESE_GATE_CORES:-4} ram=${NRESE_GATE_RAM_GB:-9} est=${NRESE_GATE_EST_MIN:-24}
+    # est: the slowest whole 4-core run, 1,547 s, x 1.5 (others took 1,011-1,073 s).
+    cores=${NRESE_GATE_CORES:-4} ram=${NRESE_GATE_RAM_GB:-9} est=${NRESE_GATE_EST_MIN:-39}
     os=windows kind=owlrs.any confirm=kraris-gptler start_s=${NRESE_GATE_START_S:-1800}
+    # What the tier uses there, in the fleet config's names: `rust`, rustup with its MSVC toolchain
+    # and linker (scripts/lib/windows-job.sh installs the tree's pinned release). The rest comes with
+    # every Windows host of the fleet, unnamed: Git Bash, a stdlib `python` on PATH (the cache's
+    # lock), long paths, PowerShell 5.1 with Add-Type, outbound HTTPS (the fleet's owner, 2 Nov 2026).
+    # The suite's Python and packages the job brings itself (scripts/lib/suite-python.sh).
+    has='["rust"]'
     reason="the merge check's Windows part (scripts/check.sh windows); no merge without it" ;;
   *) cores=${NRESE_GATE_CORES:-2} ram=${NRESE_GATE_RAM_GB:-4} est=${NRESE_GATE_EST_MIN:-10} ;;
 esac
@@ -125,8 +131,7 @@ gate() {
     echo "os = $(q "$os")"
     echo "cores = $cores"
     echo "ram_gb = $ram"
-    # A host that can run the suite there (its Python packages, Git Bash), which its config declares.
-    [ "$mode" != windows ] || echo 'has = ["owlrs-windows-suite"]'
+    [ "$mode" != windows ] || echo "has = $has"
     if [ -n "$1" ]; then
       printf 'hosts = ['
       local h sep=""
