@@ -1169,14 +1169,6 @@ impl Solutions {
     fn column(&self, variable: &Variable) -> Option<usize> {
         self.vars.iter().position(|v| v == variable)
     }
-
-    fn unit() -> Self {
-        Self {
-            vars: Vec::new(),
-            table: IdTable::from_rows(0, [&[][..]]),
-            ordered: false,
-        }
-    }
 }
 
 struct Context<'a> {
@@ -1510,6 +1502,16 @@ impl<'a> Context<'a> {
             .cancellation
             .as_ref()
             .map_or(Ok(()), CancellationToken::check)?)
+    }
+
+    /// One solution without bindings (an empty group's), charged as every table is: its row
+    /// counts ([`IdTable::memory_bytes`]), and whoever consumes it releases that.
+    fn unit(&self) -> NativeResult<Solutions> {
+        self.produced(Solutions {
+            vars: Vec::new(),
+            table: IdTable::from_rows(0, [&[][..]]),
+            ordered: false,
+        })
     }
 
     /// Charges a produced table against the query's memory budget.
@@ -1940,7 +1942,7 @@ impl<'a> Context<'a> {
                         None => rows,
                     });
                 }
-                Ok(united.unwrap_or_else(Solutions::unit))
+                united.map_or_else(|| self.unit(), Ok)
             }
             GraphPattern::Extend { inner, bindings } => {
                 let mut solutions = self.eval(inner)?;
@@ -2433,7 +2435,7 @@ impl<'a> Context<'a> {
         // GeoSPARQL relations between features (`spatial`): those with a constant side
         // start the joins, the others follow them.
         if let Some((first, later, rest)) = self.spatial_split(triples) {
-            let mut result = Solutions::unit();
+            let mut result = self.unit()?;
             for triple in &first {
                 result = self.spatial_join(result, triple)?;
             }
@@ -2452,7 +2454,7 @@ impl<'a> Context<'a> {
         }
         // Full-text searches start the joins (`search`).
         if let Some((searches, rest)) = search::split(triples) {
-            let mut result = Solutions::unit();
+            let mut result = self.unit()?;
             for search in &searches {
                 let start = Instant::now();
                 let found = self.search(search)?;
@@ -2489,7 +2491,7 @@ impl<'a> Context<'a> {
             }
         }
         if scans.is_empty() {
-            return Ok(Solutions::unit());
+            return self.unit();
         }
         // A string test on a large pattern's object: the terms that pass, from the
         // dictionary first (`strings`), as a hint.
