@@ -39,6 +39,62 @@ fn an_unconsumed_result_keeps_its_shared_capacity_until_drop() {
     assert_eq!(shared.used(), 0);
 }
 
+/// Spec: a live result keeps the charge of what it holds (as the test above), so no table
+/// the evaluation consumes may release a charge it never took. Rows without columns count
+/// one id each, one solution without bindings too (an empty group under OPTIONAL, made per
+/// row of a substituted EXISTS; sol-loop r1 S1). With 2,000 subjects the live result of
+/// 2,000 one-column rows keeps at least their 16,000 bytes charged.
+#[test]
+fn rows_without_columns_never_release_another_holders_charge() {
+    use nrese_rdf::{GraphName, NamedNode, Quad};
+    use nrese_sparql::QueryResults;
+
+    let subjects = 2_000;
+    let engine = Engine::new(EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..subjects {
+        tx.insert(
+            Quad::new(
+                NamedNode::new_unchecked(format!("urn:s{i}")),
+                NamedNode::new_unchecked("urn:p"),
+                NamedNode::new_unchecked("urn:o"),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new()
+        .parse_query(
+            "SELECT ?s WHERE { ?s <urn:p> ?o FILTER EXISTS { OPTIONAL { FILTER(?s = ?s) } } }",
+        )
+        .unwrap();
+    let shared = SharedBudget::new(1 << 30);
+    let options = QueryOptions {
+        as_written: true,
+        resources: Resources {
+            memory: nrese_exec::Envelope::new(None, Some(shared.clone())),
+            ..Default::default()
+        },
+        ..QueryOptions::default()
+    };
+    let result = evaluate_query(&snapshot, &query, &options).unwrap();
+    let held = shared.used();
+    let QueryResults::Solutions(rows) = result else {
+        panic!("solutions")
+    };
+    assert_eq!(rows.count(), subjects);
+    assert!(
+        held >= subjects * 8,
+        "the live result of {subjects} rows keeps {held} bytes charged"
+    );
+}
+
 #[test]
 fn graph_results_keep_shared_capacity_through_conversion_and_early_drop() {
     use nrese_rdf::{GraphName, NamedNode, Quad};
