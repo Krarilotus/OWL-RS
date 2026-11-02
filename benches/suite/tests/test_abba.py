@@ -361,7 +361,7 @@ systems = []
         """Sol-loop of review r1's fix (S1): a family's own cases were read from the launching
         checkout while the harness's fast suite times them from its own copy of the family file
         (NRESE_FAMILY in the harness's tree). With a declared harness, the family file must be at it
-        byte for byte; a file absent there, or changed since, is refused before anything runs."""
+        as the suite reads it; a file absent there, or changed since, is refused before anything runs."""
         own_case = ('\n[[case]]\nname = "t-own"\narea = "query"\nwhat = "a case of its own"\nsemantics = "none"\n'
                     'data = "social people={n}"\nmetric = "sum_p50_ms"\ncap_gb = 1\nsystems = []\n'
                     'check = {{ "loaded" = ">= 1" }}\n')
@@ -388,6 +388,13 @@ systems = []
                         abba.load_family(path, repo, catalog, harness=at)
                     self.assertIn(why, "\n".join(refused.exception.args[0]))
             self.assertEqual(len(abba.load_family(path, repo, catalog, harness=changed)["cases"]), 2)
+            # Line endings aren't a change (sol-loop r2, T1): a file stored with CRLF, read in a
+            # checkout that normalises line endings, is the harness's file as it is.
+            path.write_bytes((FAMILY + own_case.format(n=2000)).replace("\n", "\r\n").encode("utf-8"))
+            git("-c", "core.autocrlf=false", "add", "-A")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "stored with CRLF")
+            git("config", "core.autocrlf", "true")
+            self.assertEqual(len(abba.load_family(path, repo, catalog, harness=git("rev-parse", "HEAD"))["cases"]), 2)
 
     def test_run_builds_the_family_from_the_registry(self):
         """`run --cases/--areas`: registry cases only, each once, the timeable ones of an area; an
