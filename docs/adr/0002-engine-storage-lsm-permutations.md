@@ -58,7 +58,7 @@ State of the art considered:
 
 ## Observable differences from v1 (Oxigraph), confirmed by differential tests
 
-Both differences are intentional; they are pinned by tests in `crates/nrese-sparql/tests/differential_tests.rs` and must be listed in the release notes when engine v2 replaces v1 (P2).
+Both differences are intentional; they are pinned by tests in `crates/nrese-sparql/tests/it/differential_tests.rs` and must be listed in the release notes when engine v2 replaces v1 (P2).
 
 1. **Literal lexical forms are preserved.** Oxigraph canonicalises typed literals on storage (`"030"^^xsd:integer` is stored as `"30"`, `"1"^^xsd:boolean` as `"true"`, `"25.0"^^xsd:decimal` as `"25"`). RDF 1.1 treats these as distinct terms, and NRESE keeps them. Consequences:
    - Graph patterns match by term: `?s ex:age 30` doesn't match `"030"`.
