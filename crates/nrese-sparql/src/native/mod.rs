@@ -2201,12 +2201,16 @@ impl<'a> Context<'a> {
                     columns[column].fill(graph.raw());
                     solutions.table = IdTable::from_columns(columns);
                 }
+                // The graph's column, charged before it is made.
                 None => {
                     let rows = solutions.table.len();
-                    let mut columns = std::mem::take(&mut solutions.table).into_columns();
-                    columns.push(vec![graph.raw(); rows]);
-                    solutions.vars.push(variable.clone());
-                    solutions.table = IdTable::from_columns(columns);
+                    solutions = self.reshaped(solutions, rows.saturating_mul(8), |mut s| {
+                        let mut columns = std::mem::take(&mut s.table).into_columns();
+                        columns.push(vec![graph.raw(); rows]);
+                        s.vars.push(variable.clone());
+                        s.table = IdTable::from_columns(columns);
+                        s
+                    })?;
                 }
             }
             all = Some(match all {
@@ -4355,12 +4359,14 @@ impl<'a> Context<'a> {
     /// charged before it is made, however many the query names. The result keeps the
     /// charge, of exactly its bytes.
     fn project(&self, solutions: Solutions, variables: &[Variable]) -> NativeResult<Solutions> {
-        let moved = solutions
-            .vars
+        // The input's columns that move: the first named by each variable, each once.
+        let mut moved: Vec<usize> = variables
             .iter()
-            .filter(|v| variables.contains(v))
-            .count();
-        let made = variables.len() - moved;
+            .filter_map(|variable| solutions.vars.iter().position(|v| v == variable))
+            .collect();
+        moved.sort_unstable();
+        moved.dedup();
+        let made = variables.len() - moved.len();
         let growth = solutions.table.len().saturating_mul(8).saturating_mul(made);
         self.reshaped(solutions, growth, |solutions| {
             let mut table = solutions.table;
