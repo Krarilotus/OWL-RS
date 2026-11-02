@@ -209,11 +209,12 @@ mod tests {
             assert!(program.stores_representatives());
             tx.remove(bridge.as_ref());
             let polls = AtomicU64::new(0);
-            let (violations, report, _) = apply_delta(&program, None, &mut tx, &|| {
+            let poll = || {
                 polls.fetch_add(1, Ordering::Relaxed);
                 false
-            })
-            .unwrap();
+            };
+            let operation = nrese_reasoner::eval::OperationStop::new(&poll);
+            let (violations, report, _) = apply_delta(&program, None, &mut tx, &operation).unwrap();
             assert!(violations.is_empty());
             let pending = tx.pending_snapshot();
             let stored: HashSet<EncodedTriple> = pending
