@@ -327,4 +327,19 @@ mod tests {
             }
         }
     }
+
+    /// A `k` past the vectors (a caller widening its search towards the whole space)
+    /// returns every accepted vector, nearest first, from the scan and from the merge:
+    /// the heaps hold the hits there are, not room for `k`.
+    #[test]
+    fn a_k_past_the_vectors_returns_them_all() {
+        let vectors = random_vectors(CHUNK + 7, 3, 7);
+        let query = vectors.get(0);
+        let truth = exact(&vectors, query, vectors.len(), Metric::L2, &|_| true);
+        assert_eq!(truth.len(), CHUNK + 7);
+        for k in [usize::MAX / 2, usize::MAX] {
+            assert_eq!(exact(&vectors, query, k, Metric::L2, &|_| true), truth, "{k}");
+            assert_eq!(merge(truth.iter().rev().copied(), k), truth, "{k}");
+        }
+    }
 }

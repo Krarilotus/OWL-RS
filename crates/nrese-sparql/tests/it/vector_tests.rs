@@ -271,6 +271,23 @@ fn malformed_searches_are_explained() {
             "whole number",
         ),
         ("?v nrv:near ?q", "has no value"),
+        // Past their bounds, refused rather than clamped to another question.
+        (
+            &format!("?v nrv:near {} ; nrv:k 0", near(0.0)),
+            "nrv:k is from 1 to 10000, not 0",
+        ),
+        (
+            &format!("?v nrv:near {} ; nrv:k 10001", near(0.0)),
+            "nrv:k is from 1 to 10000, not 10001",
+        ),
+        (
+            &format!("?v nrv:near {} ; nrv:searchBudget 0", near(0.0)),
+            "nrv:searchBudget is from 1 to 1000000, not 0",
+        ),
+        (
+            &format!("?v nrv:near {} ; nrv:searchBudget 1000001", near(0.0)),
+            "nrv:searchBudget is from 1 to 1000000, not 1000001",
+        ),
     ] {
         let message = error(
             &engine,
@@ -278,6 +295,29 @@ fn malformed_searches_are_explained() {
         );
         assert!(message.contains(expected), "{block}: {message}");
     }
+}
+
+/// `nrv:k` and `nrv:searchBudget` at their largest are taken as given: every one of the
+/// 36 vectors the default graph uses, the widest beam answering as a narrow one.
+#[test]
+fn the_largest_k_and_budget_are_taken_as_given() {
+    let engine = engine();
+    let plain = QueryOptions::default();
+    let query = |options: &str| {
+        rows(
+            &engine,
+            &format!(
+                "SELECT ?v WHERE {{ SERVICE nrv:search {{ ?v nrv:near {} ; {options} }} }}",
+                near(0.0)
+            ),
+            &plain,
+        )
+    };
+    assert_eq!(query("nrv:k 10000").len(), 36);
+    assert_eq!(
+        query("nrv:k 3 ; nrv:searchBudget 1000000"),
+        query("nrv:k 3 ; nrv:searchBudget 1")
+    );
 }
 
 /// A large joined pattern: the search goes first and each hit is probed against the

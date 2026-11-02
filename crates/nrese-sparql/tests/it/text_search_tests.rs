@@ -341,3 +341,84 @@ fn graphdb_lucene_predicates() {
         table(&[&["bridge", "1"]])
     );
 }
+
+/// `text:query`'s limit counts the literals of its property: a literal of another
+/// property that ranks higher ("bridge" three times in three words, BM25) takes none of
+/// the limit, so `(rdfs:label "bridge" 1)` finds the one label that matches.
+#[test]
+fn jena_limit_counts_the_property_literals_only() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let rdfs = |local: &str| {
+        NamedNode::new_unchecked(format!("http://www.w3.org/2000/01/rdf-schema#{local}"))
+    };
+    for (subject, property, text) in [
+        ("note", "comment", "bridge bridge bridge"),
+        ("span", "label", "the old bridge over the river"),
+    ] {
+        tx.insert(
+            Quad::new(
+                ex(subject),
+                rdfs(property),
+                Literal::new_simple_literal(text),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    let plain = QueryOptions::default();
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT ?s WHERE { ?s text:query (rdfs:label \"bridge\" 1) }",
+            &plain
+        ),
+        table(&[&["span"]])
+    );
+    // Without a property, the comment ranks first and the limit keeps it.
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT ?s WHERE { ?s text:query (\"bridge\" 1) }",
+            &plain
+        ),
+        table(&[&["note"]])
+    );
+}
+
+/// How long the cyclic lists below may take before the test calls them hung: a bound
+/// that contains a walk unable to finish, not a measurement.
+const CYCLE_HANG: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A cyclic RDF list (`_:a rdf:rest _:a`) as `text:query`'s subject or object is not an
+/// argument list, as a list without `rdf:nil` isn't: the pattern is read as written and
+/// finds nothing here, instead of walking the cycle forever.
+#[test]
+fn cyclic_text_query_lists_answer() {
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let engine = engine();
+        for query in [
+            "SELECT ?s WHERE { ?s text:query _:a . _:a rdf:first \"bridge\" ; rdf:rest _:a }",
+            "SELECT ?s WHERE { ?s text:query _:a . \
+             _:a rdf:first rdfs:label ; rdf:rest _:b . _:b rdf:first \"bridge\" ; rdf:rest _:a }",
+            "SELECT ?s WHERE { _:l text:query \"bridge\" . _:l rdf:first ?s ; rdf:rest _:l }",
+        ] {
+            let query =
+                format!("PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> {query}");
+            if send
+                .send(rows(&engine, &query, &QueryOptions::default()))
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    for case in 0..3 {
+        let answer = receive
+            .recv_timeout(CYCLE_HANG)
+            .unwrap_or_else(|e| panic!("cyclic list {case}: no answer ({e})"));
+        assert!(answer.is_empty(), "cyclic list {case}: {answer:?}");
+    }
+}
