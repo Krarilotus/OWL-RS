@@ -37,7 +37,8 @@ Read [docs/README.md](docs/README.md) (which document answers what),
 - `literature/` is read-only. Results of licensed systems are never committed.
 - Before writing a research prompt or a design from scratch, ask what prior research already
   found: `literature/wiki/00 Index.md`, the research rounds in
-  `literature/wiki/research/Research reports.md`.
+  `literature/wiki/research/Research reports.md`. It is untracked and lives in the main
+  checkout only: in a linked worktree, look under the first path `git worktree list` prints.
 - Write files with the editor tools; the shell mangles backslashes.
 - Commit-message rules: [CONTRIBUTING.md](CONTRIBUTING.md).
 
