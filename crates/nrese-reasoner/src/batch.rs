@@ -1505,8 +1505,9 @@ impl Store {
             .zip(self.predicates)
             .map(|(relation, p)| (p, [relation.base.so, relation.recent.so]))
             .collect();
-        // At most this many, so the list never grows by doubling.
-        out.reserve(
+        // At most this many, so the list never grows by doubling: exactly, so a caller can
+        // charge the growth before it hands `out` over ([`list`]).
+        out.reserve_exact(
             from_input.len()
                 + runs
                     .iter()
@@ -2898,14 +2899,24 @@ fn list(
                 )
                 .try_reduce(|| ChargedVec::new(&room), appended)
                 .map_err(refused)?;
+            // Expanded, they are freed before the list grows by the others.
+            drop(facts);
             // What `into_listed` adds at most: the runs' facts. It adds none of the input's
-            // (its `input` below takes none), so their room isn't asked for.
+            // (its `input` below takes none), so their room isn't asked for. It grows the
+            // list to exactly that once it has freed the store's other parts: the buffer it
+            // grows into is charged here, beside the list's, not allocated here.
             let others: usize = store
                 .relations
                 .iter()
                 .map(|relation| relation.base.so.len() + relation.recent.so.len())
                 .sum();
-            expanded.reserve_exact(others).map_err(refused)?;
+            let grown = expanded
+                .len()
+                .checked_add(others)
+                .and_then(|facts| facts.checked_mul(size_of::<Triple>()));
+            if !grown.is_some_and(|bytes| room.charge(bytes).is_ok()) {
+                return Err(operation.refuse(MemoryStopCause::OverLimit));
+            }
             let (expanded, _held) = expanded.into_parts();
             store.into_listed(
                 &|_| false,
