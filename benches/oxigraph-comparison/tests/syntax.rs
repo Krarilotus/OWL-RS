@@ -9,9 +9,9 @@
 //!   nrese's are numbered);
 //! - `-1` in an expression: nrese reads the signed literal the grammar's tokens make,
 //!   spargebra a negation of `1` computed at run time. Folded only where both are one term, a
-//!   minus over a canonical integer; every other sign over a number (`+1`, `-0`, `-01`,
-//!   `-.5`, `-1.5e3`) is unresolved, since spargebra reads the token and the expression
-//!   (`+(1)`) alike though they are two terms;
+//!   minus over a canonical integer within 64 bits; every other sign over a number (`+1`, `-0`,
+//!   `-01`, `-.5`, `-1.5e3`, `-9223372036854775808`) is unresolved, since spargebra reads the
+//!   token and the expression (`+(1)`) alike though they are two terms;
 //! - the shape of a nest of `&&` or `||` (both associative): nrese balances it, spargebra
 //!   folds it left.
 //!
@@ -793,14 +793,15 @@ fn signed_number(expression: &E) -> Option<(char, Literal)> {
 }
 
 /// Whether an integer literal is spelled canonically and isn't zero (digits, no leading zero,
-/// not `0`; XSD 1.1 part 2): a minus before it is then the spelling its negation has. The
-/// datatype is unbounded: nrese's evaluator holding 64 bits is no matter of the syntax
-/// (`-9223372036854775808` is `-(9223372036854775808)`).
+/// not `0`; XSD 1.1 part 2) and fits nrese's evaluator's 64 bits: a minus before it is then the
+/// spelling its negation has. Past them the operand is no number there, so `-(9223372036854775808)`
+/// is an error and the token `-9223372036854775808` a number (Sol, PR #73 sol-loop r4, R4-S1).
 fn canonical_integer(number: &Literal) -> bool {
     let value = number.value();
     number.datatype() == xsd::INTEGER
         && value.bytes().all(|b| b.is_ascii_digit())
         && value.bytes().next().is_some_and(|b| b != b'0')
+        && value.parse::<i64>().is_ok()
 }
 
 /// Whether a literal is spelled as the grammar's unsigned number of its datatype (SPARQL 1.1
@@ -1404,7 +1405,8 @@ fn a_sign_never_folds_into_another_term() {
 /// so `+(1)` and the token `+1` compared the same, though `sameTerm(+(1), 1)` is true and
 /// `sameTerm(+1, 1)` false: unary plus keeps its operand's term, the token is a term of its
 /// own. spargebra reads the two alike, so such a sign is unresolved, never the same; a minus
-/// over a canonical integer alone is one term both ways.
+/// over a canonical integer alone is one term both ways, and only one nrese's evaluator holds
+/// (sol-loop r4, R4-S1: `-(9223372036854775808)` is an error there, the token a number).
 #[test]
 fn a_sign_over_a_number_is_the_same_only_as_one_term() {
     let query = |text: &str| canonical(SparqlParser::new().parse_query(text).unwrap());
@@ -1434,6 +1436,28 @@ fn a_sign_over_a_number_is_the_same_only_as_one_term() {
         compare(&query(&select("-(2)")), &query(&select("-2"))),
         "same algebra",
         "SPEC -(2) evaluates to \"-2\", the token's term"
+    );
+    let bound = |e: &str| {
+        query(&format!(
+            "SELECT (BOUND(?x) AS ?ok) WHERE {{ BIND({e} AS ?x) }}"
+        ))
+    };
+    assert_eq!(
+        compare(
+            &bound("-(9223372036854775808)"),
+            &bound("-9223372036854775808")
+        ),
+        "unresolved",
+        "SPEC an integer past 64 bits is no number to nrese's evaluator, so -(9223372036854775808) \
+         leaves ?x unbound, while the token -9223372036854775808 binds it: never the same"
+    );
+    assert_eq!(
+        compare(
+            &bound("-(9223372036854775807)"),
+            &bound("-9223372036854775807")
+        ),
+        "same algebra",
+        "SPEC -(9223372036854775807) evaluates to the token -9223372036854775807's term"
     );
     let both = |text: &str| {
         let theirs = spargebra::SparqlParser::new().parse_query(text).unwrap();
