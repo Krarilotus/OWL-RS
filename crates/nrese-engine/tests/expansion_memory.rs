@@ -51,7 +51,9 @@ fn snapshot(size: usize) -> Snapshot {
     tx.commit().unwrap();
     engine.set_equality(Some(same_as));
     let snapshot = engine.snapshot();
-    snapshot.count_in(ReadModel::Materialised, &QuadPattern::all());
+    snapshot
+        .count_in(ReadModel::Materialised, &QuadPattern::all())
+        .at_least();
     snapshot
 }
 

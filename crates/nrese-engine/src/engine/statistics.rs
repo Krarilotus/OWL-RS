@@ -185,7 +185,7 @@ impl Statistics {
         model: ReadModel,
     ) -> Option<Arc<CharacteristicSets>> {
         let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
-        let size = snapshot.count_in(model, &pattern);
+        let size = snapshot.count_in(model, &pattern).at_least();
         if let Kept::Sets(sets) = self.kept_sets(snapshot, model, size) {
             return sets;
         }
@@ -258,7 +258,7 @@ impl Statistics {
             .spawn(move || {
                 let builder = statistics.claim_anyway(model);
                 let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
-                let size = snapshot.count_in(model, &pattern);
+                let size = snapshot.count_in(model, &pattern).at_least();
                 statistics.build_sets(&builder, &snapshot, model, size, false);
             });
         if started.is_err()
@@ -274,7 +274,7 @@ impl Statistics {
     /// for them or competes with their build.
     pub(crate) fn prepare_sets(self: &Arc<Self>, snapshot: &Snapshot, model: ReadModel) {
         let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
-        let size = snapshot.count_in(model, &pattern);
+        let size = snapshot.count_in(model, &pattern).at_least();
         let builder = self.claim_anyway(model);
         self.build_sets(&builder, snapshot, model, size, true);
     }
@@ -487,7 +487,7 @@ impl Statistics {
         permutation: Permutation,
     ) -> Option<u64> {
         let key = (model, *pattern, permutation);
-        let count = snapshot.count_in(model, pattern);
+        let count = snapshot.count_in(model, pattern).at_least();
         if let Some(&(distinct, at)) = self.distinct.lock().get(&key)
             && count.abs_diff(at) <= at / 4
         {
@@ -607,7 +607,9 @@ mod tests {
         drop(held);
         // One rebuild replaces them.
         let started = std::time::Instant::now();
-        let size = snapshot.count_in(model, &QuadPattern::in_graph(TermId::DEFAULT_GRAPH));
+        let size = snapshot
+            .count_in(model, &QuadPattern::in_graph(TermId::DEFAULT_GRAPH))
+            .at_least();
         while statistics
             .sets
             .lock()
