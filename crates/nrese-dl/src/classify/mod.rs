@@ -158,7 +158,7 @@ impl Default for Options {
 }
 
 /// A classification with whether it is complete.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Taxonomy {
     pub classification: Classification,
     /// Why it isn't complete (empty: it is): budgets that ran out, parts of the ontology
