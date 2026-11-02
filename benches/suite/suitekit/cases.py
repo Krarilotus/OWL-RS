@@ -31,21 +31,24 @@ def family_cases(path: str | Path) -> list[dict]:
 # The vocabulary (benches/cases/README.md explains each).
 AREAS = {"access", "cache", "concurrency", "dl", "kernel", "layout", "load", "maintenance", "memory", "operator",
          "parse", "plan", "query", "reasoning", "rules", "service", "shacl", "geo", "text", "vector", "federation",
-         "rdf12"}
+         "rdf12", "property-graphs"}
 SEMANTICS = {"none", "rdfs", "rdfs-full", "rdfs-plus", "owl-horst", "owl2-ql", "owl2-rl", "owl2-el", "owl2-dl",
              "custom", "el", "dl", "canonical"}
 # What a comparator computes: the same data without reasoning (plain), NRESE's closure, NRESE's
 # rewritten queries, or its own reasoner or service under that name.
 COMPARATOR_SEMANTICS = {"plain", "closure", "rewritten", "rdfs", "rdfs-plus", "owl-horst", "owl2-rl", "owl2-ql",
                         "custom", "el", "dl", "shacl", "text", "geosparql", "federation", "vector"}
-TOOLS = {"perf_lab", "tableau", "classify-el", "classify-horn"}
+TOOLS = {"perf_lab", "tableau", "classify-el", "classify-horn", "pg_hops"}
+# Tools a kit of its own runs, as fleet jobs (its scripts read the case's data and write its
+# results): fast.py and the release gate's plan never run their cases.
+KIT_TOOLS = {"pg_hops": "benches/property-graphs"}
 OUTCOMES = {"ok", "memory-limit", "gave-up", "timeout", "unsupported", "wrong"}
 LEVELS = {"focused", "full"}
 NEEDS = {"docker", "java", "apptainer"}
 SCENARIOS = {"native", "matched", "frontier"}
 REWRITES = {"expressible", "per-query", "not-expressible"}
 PAGE_CACHE = {"warm", "cold"}
-DATA = re.compile(r"^(none|volume:\S+|ore:\S+|concat:\S+|[a-z][a-z0-9-]*( \S+=\S+)*)$")
+DATA = re.compile(r"^(none|volume:\S+|input:\S+|ore:\S+|concat:\S+|[a-z][a-z0-9-]*( \S+=\S+)*)$")
 KEYS = {
     # identity and what it measures
     "name", "area", "what", "group", "workload", "tier", "levels", "est_min", "needs", "scenario",
@@ -96,7 +99,8 @@ def problems(cases: list[dict], systems: dict, workloads: dict | None = None,
             if key in c and not set(c[key]) <= allowed:
                 out.append(f"{where}: {key} {sorted(set(c[key]) - allowed)} not in {', '.join(sorted(allowed))}")
         if not DATA.match(c["data"]):
-            out.append(f"{where}: data {c['data']!r} is none, volume:FILE, ore:ID, concat:A+B or a generator spec")
+            out.append(f"{where}: data {c['data']!r} is none, volume:FILE, input:NAME/PATH, ore:ID, concat:A+B or "
+                       "a generator spec")
         if datasets is not None and "full" in c.get("levels", []) and c["data"].startswith("volume:"):
             if c["data"][len("volume:"):] not in datasets:
                 out.append(f"{where}: a full-level case reads a frozen dataset: {c['data']} isn't in "

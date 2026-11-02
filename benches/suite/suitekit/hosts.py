@@ -38,8 +38,9 @@ def current(registry: dict | None = None, name: str | None = None) -> tuple[str,
 
 def input_path(kind: str, registry: dict | None = None, name: str | None = None,
                environ: dict | None = None) -> Path | None:
-    """Where input `kind` is on this host: its variable when set, else the assets' copy on a
-    host that holds them, else None."""
+    """Where input `kind` is on this host: its variable when set, else the copy on a host that
+    holds it, else None. An input of a `set` (assets.sets) is held by the hosts listing that set
+    in `sets`; any other input by the hosts with assets = true, under assets.root."""
     registry = load() if registry is None else registry
     environ = os.environ if environ is None else environ
     entry = registry.get("inputs", {}).get(kind)
@@ -48,7 +49,13 @@ def input_path(kind: str, registry: dict | None = None, name: str | None = None,
     if entry.get("env") and environ.get(entry["env"]):
         return Path(environ[entry["env"]])
     found = current(registry, name)
-    if found and found[1].get("assets"):
+    if found is None:
+        return None
+    if entry.get("set"):
+        if entry["set"] not in found[1].get("sets", []):
+            return None
+        return Path(registry["assets"]["sets"][entry["set"]]) / entry["path"]
+    if found[1].get("assets"):
         return Path(registry["assets"]["root"]) / entry["path"]
     return None
 

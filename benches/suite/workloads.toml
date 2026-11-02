@@ -437,6 +437,22 @@ kit = "benches/breadth/memory-budget"
 check = "the same closure size and answers as uncapped"
 note = "Systems with a memory budget of their own degrade (NRESE's budgets, QLever's sort memory, JVM heaps); the others are killed at the cap: failed, never a time"
 
+# --- property graphs ----------------------------------------------------------------------
+
+[ldbc-snb-interactive-v2]
+title = "LDBC SNB Interactive v2: a social network's property graph, mapped to RDF 1.2 (reifiers carry the edge properties)"
+kind = "performance"
+tasks = ["property-graphs"]
+needs = ["load", "query", "rdf12"]
+scales = "SF1 (55 M statements, variant A), SF3, SF10 (only where a host's memory fits it)"
+source = "datasets.ldbcouncil.org/bi-pre-audit/bi-sf{1,3}-composite-merged-fk.tar.zst (the datagen's output; the Interactive v2 implementations load these initial snapshots)"
+licence = "Apache-2.0; unaudited results are \"not an LDBC benchmark result\" (LDBC fair-use policy)"
+tiers = ["sf1", "sf3"]
+check = "the load's statements per predicate against the CSV's counts (snb_check.py); the hop answers equal by every access path"
+state = "partial"
+kit = "benches/property-graphs"
+note = "Today the storage measurements (M0 counts, M1 hop micro-costs over the engine's snapshot), not the benchmark's query mix: IS1-IS7 and IC1-IC12 in SPARQL 1.2 are M2, after them"
+
 # --- the fast suite -----------------------------------------------------------------------
 
 [fast]
