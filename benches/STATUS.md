@@ -13,7 +13,7 @@ Generated 2026-11-02 by `python benches/suite/suite.py status --write` from [sui
 
 ## Schedule
 
-The order the families are measured in ([suite/schedule.toml](suite/schedule.toml), the owner's of 12 Oct 2026): the measurement queue starts jobs in it. A family without a workload entry yet is a benchmark of [CATALOG.md](CATALOG.md), named by its section.
+The order the families are measured in ([suite/schedule.toml](suite/schedule.toml), the owner's of 12 Oct 2026). A family without a workload entry yet is a benchmark of [CATALOG.md](CATALOG.md), named by its section.
 
 ### This week, in this order
 
@@ -388,7 +388,7 @@ planned, performance; tasks space; kit `benches/breadth/geographica2` (suite dri
 
 ### fedshop: FedShop200: federated BSBM-like shops, 20 to 200 members, 120 queries
 
-planned, performance; tasks federation; kit `benches/breadth/fedshop` (outside the driver); checked by: answers against the reference source assignment's.
+planned, performance; tasks federation; kit `none yet` (outside the driver); checked by: answers against the reference source assignment's.
 
 | Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | rdf4j | graphdb | anzograph |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -417,7 +417,7 @@ planned, performance; tasks search; kit `benches/breadth/vectors` (outside the d
 
 ### larger-than-memory: LUBM 1000 under memory caps: load, OWL 2 RL closure and the 14 queries at 16, 12, 8, 6, 4 and 2 GB
 
-planned, performance; tasks RT1, RT5; kit `benches/breadth/memory-budget` (outside the driver); checked by: the same closure size and answers as uncapped.
+planned, performance; tasks RT1, RT5; kit `none yet` (outside the driver); checked by: the same closure size and answers as uncapped.
 
 | Tier | nrese | nrese-fsst | nrese-oxigraph | qlever | oxigraph | virtuoso | jena | millenniumdb | rdf4j | graphdb | anzograph |
 |---|---|---|---|---|---|---|---|---|---|---|---|

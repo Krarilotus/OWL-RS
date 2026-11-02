@@ -134,7 +134,7 @@ def render(root: Path, systems: dict, workloads: dict) -> str:
                 last_run[pair["workload"]] = max(last_run.get(pair["workload"], ""), str(record.get("started", ""))[:10])
     out += ["## Schedule", "",
             "The order the families are measured in ([suite/schedule.toml](suite/schedule.toml), the owner's of "
-            "12 Oct 2026): the measurement queue starts jobs in it. A family without a workload entry yet is a "
+            "12 Oct 2026). A family without a workload entry yet is a "
             "benchmark of [CATALOG.md](CATALOG.md), named by its section.", ""]
     for key, heading in (("now", "This week, in this order"), ("backlog", "Backlog"),
                          ("last", "Last: not expected to give data for polishing or optimisation")):

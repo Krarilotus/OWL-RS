@@ -60,7 +60,7 @@ them, and the run's manifest records them.
 benches/sparql/prepare.sh dblp watdiv-10m bsbm-100m gcare     # data into ~/owlrs/sparql-data (SPARQL_DATA)
 benches/sparql/images.sh millenniumdb                         # images no vendor publishes
 benches/sparql/watdiv/queries.sh watdiv-10m 5                 # then split.py into SPARQL_DATA/queries/watdiv-10m, pinned in queries.sha256
-python3 benches/suite/queue.py submit benches/sparql/jobs/JOB.toml   # the timed runs (jobs/*-phuoc.toml: reproductions first)
+# the timed runs: fleet jobs (benches/README.md, "On the fleet"); jobs/*.toml are the old queue's, not submitted any more
 ```
 
 ## Findings kept for the backlog

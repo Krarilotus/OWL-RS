@@ -91,6 +91,7 @@ captured runs again, without running.
 | The answer recorder in the suite: an adjudicated reference per query, a verdict per group (`suite.py answers`) | done |
 | A native runtime for the fast suite: host processes in capped scopes, on a measure host without Docker (`NRESE_FAST_RUNTIME=native`, [fast/README.md](fast/README.md#how-it-measures)) | done |
 | One case registry: [cases/](cases/README.md), a file per group, one schema validated by `suite.py --check` (`levels`, `needs`, `expect`, `scenario`, `workload`) | done |
+| One command on the fleet, by capability: a change timed (`abba.py run`, the family from the registry, nothing committed for it) and the release gate (`release_gate.py jobs --plan`, `--submit`), each one set, its data made by the job | done (2 Nov 2026) |
 | the fast runner moves into `suitekit` as the native plan kind; `fast.py` becomes `suite.py run --level focused` | next |
 | One `compare` over result rows: `suitekit/compare.py` reads fast reports, perf-lab reports and suite results, in the order missing, answers, time, memory by kind, disk; `fast.py compare` and `suite.py compare` are it. Suite pairs still use `summary.py`'s estimator: the bootstrap for them is the next step | started |
 | `perf-lab.sh` and `perf-lab-compare.py` retired: the `lab-*` fast cases (rows pinned; the same rows and times within the old runs' spread on Phuoc-Yu, 12 Oct 2026) and the one `compare` | done |
@@ -192,33 +193,26 @@ Single measurements and diagnoses outside the kits, run with
 | Studies kept for open targets | `nrese-engine`'s ignored tests `compression_study` and `vocabulary_study` (store-size options, P2 in [performance.md](../docs/design/performance.md) §6) |
 | Office PC | `scripts/office/`: dataset preparation (`dbpedia.sh`, `wikidata.sh`) and the perf lab there (`perflab.sh`) |
 
-## The measurement queue
+## On the fleet
 
-Timed runs don't start by hand: they are jobs in a measure host's queue
-([suite/queue.py](suite/queue.py)), run one at a time, so that no two timings share a
-machine and every system of a comparison runs on the same host under the same limits. A
-host's `queue` in [hosts.toml](hosts.toml) says when a timed job may start: the office PC
-at night or while its owner leaves `~/owlrs/FREE`, never while its owners are present
-(`~/owlrs/RETREAT`; a job they stop runs again); Phuoc-Yu whenever no compiler runs;
-Khaleesi (64 GiB, Windows) at night, for runs that need RAM and whole comparisons whose
-every contender runs there, its results fetched the day they end (`queue.py fetch`);
-GamerGrill (WSL) any time, but never a timing: downloads, data preparation, answer checks
-(`window = "any"`). The main PC builds and prepares, never times.
+Every run on another machine is a fleet job (`fleet` on the main PC; the fleet-jobs skill):
+the fleet owns the hosts, their windows and their rules (`fleet rules`, `fleet why ID`), and a
+job says what it needs, never which host. No two timings share a host: a timed job
+(`owlrs.timed`) holds its host alone from its first timed step to its end.
 
 ```text
-python benches/suite/queue.py submit JOB.toml        the job's checkout pushed to its host, the job queued
-python benches/suite/queue.py status                 every host's pending, running, done and failed jobs
-python benches/suite/queue.py cancel ID --host HOST  a pending job back out
-python benches/suite/queue.py fetch ID --host HOST --to DIR   its results here (removed there on a same-day host)
-python benches/suite/queue.py work                   on the host: its runner (one per host, detached)
+python benches/suite/abba.py run --a BASE --b CHANGE --cases A,B [--plan]   time a change: one set
+python benches/fast/release_gate.py jobs CAND --base B --main M --plan        the release gate: plan, then --submit
+python benches/fast/release_gate.py data --cases A,B                        what this host holds of their data
+fleet wait set:ID      fleet status set:ID      fleet results set:ID
 ```
 
-A job names its group, host, checkout and commands (a build first where it needs one), the
-environment (binaries, a matched scenario's limits), what the host must have, its window
-(`quiet` for timings, `any` for counts), priority and expected minutes. Its results land in
-`~/owlrs/results/<id>` on the host; its record is written from them (`suite.py ledger`).
-Answers come before time: compete captures every answer, a timed `suite.py run` must ask for
-them (`--answers full`), or the job is refused.
+A job makes the data it lacks (benches/hosts.toml `[caches]`: where it keeps it, how much,
+how long) and asks the disk for it; the verified bench assets are the one input a host must
+already hold (`has = ["owlrs-bench-assets"]`). Answers come before time: compete captures
+every answer, a timed `suite.py run` must ask for them (`--answers full`).
+`suite/queue.py` and the kits' `jobs/*.toml` are the queue that came before the fleet; they
+aren't used any more.
 
 ## A run, step by step
 
