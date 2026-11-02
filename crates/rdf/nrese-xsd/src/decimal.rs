@@ -607,6 +607,39 @@ mod tests {
         assert_eq!(Decimal::MAX.checked_round(), None);
     }
 
+    /// XPath F&O 3.1 `fn:ceiling`, `fn:floor` and `fn:round` (halves towards positive
+    /// infinity): a result that fits is returned, whatever an intermediate step would need.
+    /// MAX is 170141183460469231731.687303715884105727, MIN is -…731.687303715884105728.
+    #[test]
+    fn rounding_at_the_ends_of_the_range() {
+        let top = "170141183460469231731";
+        let (high, low) = (d(top), d(&format!("-{top}")));
+        type Op = fn(Decimal) -> Option<Decimal>;
+        let (round, ceil, floor): (Op, Op, Op) = (
+            Decimal::checked_round,
+            Decimal::checked_ceil,
+            Decimal::checked_floor,
+        );
+        let cases = [
+            ("round", round, d(&format!("{top}.25")), Some(high)),
+            ("ceil", ceil, Decimal::MIN, Some(low)),
+            // Guards (right on the base too): the other ends, and results out of range.
+            ("round", round, d(&format!("{top}.5")), None),
+            ("round", round, d(&format!("-{top}.5")), Some(low)),
+            ("round", round, Decimal::MIN, None),
+            ("ceil", ceil, Decimal::MAX, None),
+            ("floor", floor, Decimal::MIN, None),
+            ("floor", floor, Decimal::MAX, Some(high)),
+        ];
+        // Every case is checked, so a failure lists each wrong one.
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|&&(_, op, x, expected)| op(x) != expected)
+            .map(|&(name, op, x, expected)| format!("{name}({x}) = {:?}, not {expected:?}", op(x)))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[test]
     fn conversions_round_correctly() {
         assert_eq!(f64::from(Double::from(d("0.1"))), 0.1);
