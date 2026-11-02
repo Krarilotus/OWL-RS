@@ -2904,18 +2904,19 @@ fn list(
             // What `into_listed` adds at most: the runs' facts. It adds none of the input's
             // (its `input` below takes none), so their room isn't asked for. It grows the
             // list to exactly that once it has freed the store's other parts: the buffer it
-            // grows into is charged here, beside the list's, not allocated here.
+            // grows into is charged here, beside the list's, not allocated here; where the
+            // list's capacity already holds them, it doesn't grow and nothing is charged.
             let others: usize = store
                 .relations
                 .iter()
                 .map(|relation| relation.base.so.len() + relation.recent.so.len())
                 .sum();
-            let grown = expanded
-                .len()
-                .checked_add(others)
-                .and_then(|facts| facts.checked_mul(size_of::<Triple>()));
-            if !grown.is_some_and(|bytes| room.charge(bytes).is_ok()) {
-                return Err(operation.refuse(MemoryStopCause::OverLimit));
+            let grown = expanded.len().checked_add(others);
+            if grown.is_none_or(|facts| facts > expanded.capacity()) {
+                let bytes = grown.and_then(|facts| facts.checked_mul(size_of::<Triple>()));
+                if !bytes.is_some_and(|bytes| room.charge(bytes).is_ok()) {
+                    return Err(operation.refuse(MemoryStopCause::OverLimit));
+                }
             }
             let (expanded, _held) = expanded.into_parts();
             store.into_listed(
