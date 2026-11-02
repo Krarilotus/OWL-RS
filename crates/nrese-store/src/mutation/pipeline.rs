@@ -234,12 +234,14 @@ impl MutationPipeline {
             // So does the process's memory limit: the commit is refused, not the machine.
             let memory = self.store.memory_stop();
             let stop = || ticket.is_cancelled() || memory.exceeded();
-            let (violations, materialisation, changed) =
-                crate::reasoning::apply_delta(program, cached, &mut tx, &stop).map_err(|_| {
-                    memory
-                        .error()
-                        .map_or(MutationError::Cancelled, &store_error)
-                })?;
+            let (violations, materialisation, changed) = crate::reasoning::apply_delta(
+                program, cached, &mut tx, &stop,
+            )
+            .map_err(|interrupted| {
+                memory
+                    .error(interrupted)
+                    .map_or(MutationError::Cancelled, &store_error)
+            })?;
             tracing::debug!(?materialisation, "commit-path materialisation");
             crate::reasoning::log_diagnostics(
                 &materialisation.diagnostics,

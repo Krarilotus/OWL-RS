@@ -189,6 +189,11 @@ pub struct Engine {
     interval: Interval,
     /// The capacity envelope's observations (`None`: off).
     observer: Option<Observer>,
+    /// Reads the process's memory for `budget.max_memory` (the OS's; a test's that fails).
+    read_memory: fn() -> nrese_exec::memory::Reading,
+    /// The budget ran out because the process's memory couldn't be read for
+    /// `budget.max_memory` ([`Self::budget_stop`]).
+    memory_unread: AtomicBool,
 }
 
 /// What a saturation may use (the dynamic fallback's budgets, design §4, in their first
@@ -235,6 +240,8 @@ impl Engine {
             budget,
             interval: Interval::new(),
             observer,
+            read_memory: nrese_exec::memory::process_bytes,
+            memory_unread: AtomicBool::new(false),
         };
         if engine.observing() {
             engine.own(engine.program.bytes(), 0);
@@ -251,6 +258,22 @@ impl Engine {
     pub(super) fn with_cancel(mut self, cancel: Option<crate::Cancel>) -> Self {
         self.cancel = cancel;
         self
+    }
+
+    /// The engine reading the process's memory with `read` instead of the OS's.
+    #[cfg(test)]
+    fn with_memory_reader(mut self, read: fn() -> nrese_exec::memory::Reading) -> Self {
+        self.read_memory = read;
+        self
+    }
+
+    /// Why a saturation whose budget ran out stops: the process's memory unreadable for
+    /// `max_memory`, or the budget itself.
+    pub(super) fn budget_stop(&self) -> super::Unsupported {
+        match self.memory_unread.load(Relaxed) {
+            true => super::Unsupported::MemoryUnreadable,
+            false => super::Unsupported::Budget,
+        }
     }
 
     pub fn budget(&self) -> &Budget {
@@ -346,8 +369,11 @@ impl Engine {
         }
         if self.interval.due(now) {
             if let Some(limit) = self.budget.max_memory
-                && nrese_exec::memory::process_bytes().is_some_and(|held| held > limit)
+                && let Some(cause) = nrese_exec::memory::stop_cause((self.read_memory)(), limit)
             {
+                if cause == nrese_exec::memory::MemoryStopCause::Unread {
+                    self.memory_unread.store(true, Relaxed);
+                }
                 self.exhaust();
             }
             self.sample();

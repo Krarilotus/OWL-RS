@@ -11,7 +11,7 @@ use nrese_reasoner::vocabulary::LocalVocabulary;
 
 #[test]
 fn reasoning_stops_at_the_process_memory_limit() {
-    if nrese_exec::memory::process_bytes().is_none() {
+    if !nrese_exec::memory::READS_MEMORY {
         return;
     }
     let mut vocabulary = LocalVocabulary::default();
@@ -30,7 +30,10 @@ fn reasoning_stops_at_the_process_memory_limit() {
     nrese_exec::memory::set_process_limit(1);
     assert!(over_memory_limit());
     let stopped = batch::materialise_owned_until(input.clone(), &rules, None, &schema, NEVER);
-    assert!(matches!(stopped, Err(Interrupted)), "materialisation");
+    assert!(
+        matches!(stopped, Err(Interrupted { .. })),
+        "materialisation"
+    );
     let base = MemoryBase::new(&input, &[]);
     let compiled = delta::Rules {
         rules: &rules,
@@ -38,7 +41,7 @@ fn reasoning_stops_at_the_process_memory_limit() {
         schema: &schema,
     };
     let update = delta::update_until(&base, &[[x, ty, b]], &[], compiled, None, NEVER);
-    assert!(matches!(update, Err(Interrupted)), "commit");
+    assert!(matches!(update, Err(Interrupted { .. })), "commit");
     // Without a limit, the same runs.
     nrese_exec::memory::set_process_limit(0);
     let closure =
