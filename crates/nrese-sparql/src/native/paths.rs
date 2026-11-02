@@ -37,7 +37,8 @@ use nrese_exec::graph::{
 use nrese_sparql_syntax::algebra::PropertyPathExpression;
 
 /// A path with its IRIs resolved to ids; `None` marks an IRI the store doesn't know (no
-/// edges).
+/// edges). Equal paths have equal bags ([`PathEvaluator::either`]).
+#[derive(PartialEq, Eq)]
 pub(crate) enum Path {
     Link(Option<u64>),
     Reverse(Box<Path>),
@@ -57,7 +58,12 @@ impl Path {
         let boxed = |p: &PropertyPathExpression| Box::new(Self::resolve(p, snapshot));
         match path {
             PropertyPathExpression::NamedNode(n) => Self::Link(id(n)),
-            PropertyPathExpression::Reverse(p) => Self::Reverse(boxed(p)),
+            // `^^p` is `p`, pair for pair: one path, so that arms differing only by it are
+            // the same arm ([`PathEvaluator::either`]).
+            PropertyPathExpression::Reverse(p) => match &**p {
+                PropertyPathExpression::Reverse(p) => Self::resolve(p, snapshot),
+                _ => Self::Reverse(boxed(p)),
+            },
             PropertyPathExpression::Sequence(steps) => {
                 Self::Sequence(steps.iter().map(|p| Self::resolve(p, snapshot)).collect())
             }
@@ -485,19 +491,33 @@ impl PathEvaluator<'_> {
 
     /// The bags of `paths` together (a UNION): copies stay copies, and counted ones are
     /// added up with them.
+    /// An arm the alternative names again is the same bag again: it is followed once and
+    /// its values counted as often, never copied, so `p|p|…` costs and holds what `p` does
+    /// however often the path's text repeats it.
     fn either<T: Copy + Eq + std::hash::Hash>(
         &self,
         paths: &[Path],
         bag: impl Fn(&Path) -> Bag<T>,
     ) -> Bag<T> {
-        let bags: Vec<Bag<T>> = paths.iter().map(bag).collect();
-        if bags.iter().all(|bag| matches!(bag, Bag::Copies(_))) {
-            return Bag::Copies(bags.into_iter().flat_map(Bag::values).collect());
+        let mut arms: Vec<(&Path, usize)> = Vec::with_capacity(paths.len());
+        for path in paths {
+            match arms.iter_mut().find(|(arm, _)| *arm == path) {
+                Some((_, times)) => *times += 1,
+                None => arms.push((path, 1)),
+            }
+        }
+        let bags: Vec<(Bag<T>, usize)> =
+            arms.iter().map(|&(arm, times)| (bag(arm), times)).collect();
+        if bags
+            .iter()
+            .all(|(bag, times)| *times == 1 && matches!(bag, Bag::Copies(_)))
+        {
+            return Bag::Copies(bags.into_iter().flat_map(|(bag, _)| bag.values()).collect());
         }
         let mut all = Tally::new();
-        for bag in &bags {
+        for (bag, times) in &bags {
             for (value, copies) in bag.counted() {
-                all.add(value, copies);
+                all.add(value, copies.saturating_mul(*times));
             }
         }
         all.finish()

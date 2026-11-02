@@ -41,7 +41,7 @@
 //! results (`GROUP_CONCAT`, `SAMPLE`, the first of equal `MIN`/`MAX`) come out as they do
 //! from the full join.
 
-use nrese_exec::{IdTable, UNDEF, group::group_rows};
+use nrese_exec::{IdTable, Reservation, UNDEF};
 use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern,
@@ -49,9 +49,10 @@ use nrese_sparql_syntax::algebra::{
 use nrese_sparql_syntax::term::TriplePattern;
 
 use super::{
-    Agg, Context, NativeResult, Solutions, as_path, bound_variables, expression_variables,
-    pushdown, triple_variables,
+    Context, NativeResult, Solutions, as_path, bound_variables, expression_variables, pushdown,
+    triple_variables,
 };
+use crate::QueryEvaluationError;
 
 /// The variables each aggregate reads, if none of the aggregates counts duplicate rows.
 pub(super) fn insensitive_arguments(
@@ -475,15 +476,7 @@ impl Context<'_> {
         }
 
         // The groups, from the core.
-        let key_columns: Vec<Vec<u64>> = variables
-            .iter()
-            .map(|v| match core.column(v) {
-                Some(column) => core.table.column(column).to_vec(),
-                None => vec![UNDEF; core.table.len()],
-            })
-            .collect();
-        let key_table = IdTable::from_columns(key_columns);
-        let groups = group_rows(&key_table, &(0..variables.len()).collect::<Vec<_>>());
+        let (groups, positions) = super::aggregate::groups_of(&core, variables);
         let group_count = groups.len();
         let members_of = |group_of: &mut dyn Iterator<Item = usize>| {
             let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
@@ -493,26 +486,20 @@ impl Context<'_> {
             members
         };
         // Aggregates in the caller's order; each column is filled by the part that
-        // computes it.
+        // computes it, charged before (to `held`), however many the query names.
+        let mut held = Reservation::new(&*self.budget);
+        // Declared after `held`: dropped before it.
         let mut values: Vec<Option<Vec<u64>>> = vec![None; aggregates.len()];
         let compute = |solutions: &Solutions,
                        members: &[Vec<usize>],
                        selected: &[usize],
+                       held: &mut Reservation<&nrese_exec::Budget>,
                        values: &mut Vec<Option<Vec<u64>>>|
          -> NativeResult<()> {
-            let chosen: Vec<(Variable, AggregateExpression)> =
-                selected.iter().map(|&a| aggregates[a].clone()).collect();
-            let computed = self.aggregate_groups(solutions, members, &chosen)?;
-            for (position, &a) in selected.iter().enumerate() {
-                values[a] = Some(
-                    computed
-                        .iter()
-                        .map(|group| match &group[position] {
-                            Agg::Id(id) => *id,
-                            Agg::Term(term) => self.id(term),
-                        })
-                        .collect(),
-                );
+            for &a in selected {
+                held.charge(group_count.saturating_mul(8))
+                    .map_err(QueryEvaluationError::MemoryLimit)?;
+                values[a] = Some(self.aggregate_column(solutions, members, &aggregates[a])?);
             }
             Ok(())
         };
@@ -521,7 +508,7 @@ impl Context<'_> {
             .collect();
         let members = members_of(&mut groups.group_of.iter().map(|&g| g as usize));
         let start = std::time::Instant::now();
-        compute(&core, &members, &core_aggregates, &mut values)?;
+        compute(&core, &members, &core_aggregates, &mut held, &mut values)?;
         if self.trace.is_some() {
             let detail = format!("{} aggregate(s) of the core", core_aggregates.len());
             // At most a group per row of the core (`estimate`'s rule for GROUP BY).
@@ -533,17 +520,21 @@ impl Context<'_> {
         let mut keep = vec![true; group_count];
         if let Some(having) = having {
             let mut vars = variables.to_vec();
-            let mut columns = groups.keys.clone().into_columns();
-            for &a in &core_aggregates {
-                vars.push(aggregates[a].0.clone());
-                columns.push(values[a].clone().unwrap_or_default());
-            }
-            if !columns.is_empty() {
-                let known = Solutions {
-                    vars,
-                    table: IdTable::from_columns(columns),
-                    ordered: false,
-                };
+            vars.extend(core_aggregates.iter().map(|&a| aggregates[a].0.clone()));
+            if !vars.is_empty() {
+                // What HAVING reads, a column per key and core aggregate, charged first.
+                let bytes = group_count.saturating_mul(8).saturating_mul(vars.len());
+                let known = self.made(bytes, || {
+                    let mut columns = super::aggregate::key_columns(&groups, &positions, None);
+                    for &a in &core_aggregates {
+                        columns.push(values[a].clone().unwrap_or_default());
+                    }
+                    Ok(Solutions {
+                        vars,
+                        table: IdTable::from_columns(columns),
+                        ordered: false,
+                    })
+                })?;
                 let mut conjuncts = Vec::new();
                 pushdown::conjuncts_of(having, &mut conjuncts);
                 for conjunct in conjuncts {
@@ -555,6 +546,7 @@ impl Context<'_> {
                             .for_each(|(keep, pass)| *keep &= pass);
                     }
                 }
+                self.consumed(known);
             }
         }
 
@@ -665,7 +657,7 @@ impl Context<'_> {
                 self.note("optional", detail, estimate, joined.table.len(), start);
             }
             let start = std::time::Instant::now();
-            compute(&joined, &members, &selected, &mut values)?;
+            compute(&joined, &members, &selected, &mut held, &mut values)?;
             if self.trace.is_some() {
                 let detail = format!("{} aggregate(s) of the detached OPTIONAL", selected.len());
                 let estimate = Some(kept_groups as u64);
@@ -677,25 +669,28 @@ impl Context<'_> {
         // Detached OPTIONALs without aggregates contribute nothing. The kept groups, with
         // the aggregates in the caller's order.
         let kept: Vec<usize> = (0..group_count).filter(|&g| keep[g]).collect();
-        let mut columns: Vec<Vec<u64>> = groups
-            .keys
-            .columns()
-            .iter()
-            .map(|column| kept.iter().map(|&g| column[g]).collect())
-            .collect();
         let mut vars = variables.to_vec();
-        for (a, (target, _)) in aggregates.iter().enumerate() {
-            let column = values[a].take().unwrap_or_else(|| vec![UNDEF; group_count]);
-            columns.push(kept.iter().map(|&g| column[g]).collect());
-            vars.push(target.clone());
-        }
+        vars.extend(aggregates.iter().map(|(target, _)| target.clone()));
+        // The kept groups' table, a column per key and aggregate, charged before it is made.
+        let bytes = kept.len().saturating_mul(8).saturating_mul(vars.len());
+        let grouped = self.made(bytes, || {
+            let mut columns = super::aggregate::key_columns(&groups, &positions, Some(&kept));
+            for column in &values {
+                columns.push(match column {
+                    Some(column) => kept.iter().map(|&g| column[g]).collect(),
+                    None => vec![UNDEF; kept.len()],
+                });
+            }
+            Ok(Solutions {
+                vars,
+                table: IdTable::from_columns(columns),
+                ordered: false,
+            })
+        });
+        drop(values);
+        drop(held);
         self.consumed(core);
-        self.produced(Solutions {
-            vars,
-            table: IdTable::from_columns(columns),
-            ordered: false,
-        })
-        .map(Some)
+        grouped.map(Some)
     }
 }
 

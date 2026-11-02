@@ -5,7 +5,8 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use nrese_engine::TermId;
-use nrese_exec::UNDEF;
+use nrese_exec::group::{Groups, group_rows};
+use nrese_exec::{BudgetExceeded, IdTable, Reservation, UNDEF};
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{Literal, Term, Variable};
 use nrese_sparql_syntax::algebra::{AggregateExpression, AggregateFunction, Expression};
@@ -14,7 +15,10 @@ use nrese_xsd::{Decimal, Double, Float, Integer};
 use super::expr::Evaluator;
 use super::numeric::Numeric;
 use super::value::Value;
-use super::{ScanPattern, Solutions, calendar, expression_variables, pushdown, value};
+use super::{
+    Context, NativeResult, ScanPattern, Solutions, calendar, expression_variables, pushdown, value,
+};
+use crate::QueryEvaluationError;
 
 /// An aggregate's value: a stored or computed id, or a new term the query interns.
 pub(super) enum Agg {
@@ -411,12 +415,226 @@ impl Running {
 /// inline integers (`COUNT`: any terms): the results [`Aggregator::aggregate_ids`] gives,
 /// without a list of rows per group. `None` for other aggregates. DBpedia q12 summed 1 M
 /// goals into 35 k teams.
+/// Once it applies, and before it allocates, it calls `reserve` with what it holds at most
+/// ([`pass_bytes`]); a refusal ends it.
 pub(super) fn aggregate_in_one_pass(
     solutions: &Solutions,
     group_of: &[u32],
     groups: usize,
     aggregates: &[(Variable, AggregateExpression)],
-) -> Option<Vec<Vec<Agg>>> {
+    reserve: &mut dyn FnMut(usize) -> Result<(), BudgetExceeded>,
+) -> Result<Option<Vec<Vec<Agg>>>, BudgetExceeded> {
+    let Some(plan) = one_pass_plan(solutions, aggregates) else {
+        return Ok(None);
+    };
+    reserve(pass_bytes(groups, plan.len()))?;
+    let mut running = vec![Running::default(); groups * plan.len()];
+    let mut rows = vec![0u64; groups];
+    for (row, &group) in group_of.iter().enumerate() {
+        let group = group as usize;
+        rows[group] += 1;
+        for (a, (column, _)) in plan.iter().enumerate() {
+            if let Some(column) = column {
+                running[group * plan.len() + a].add(solutions.table.get(row, *column));
+            }
+        }
+    }
+    Ok(Some(
+        (0..groups)
+            .map(|group| {
+                plan.iter()
+                    .enumerate()
+                    .map(|(a, (column, name))| {
+                        let r = running[group * plan.len() + a];
+                        if column.is_none() {
+                            return integer_agg(rows[group] as i64);
+                        }
+                        match name {
+                            AggregateFunction::Count => integer_agg(r.count as i64),
+                            _ if r.unbound => Agg::Id(UNDEF),
+                            AggregateFunction::Min => Agg::Id(r.min.map_or(UNDEF, |m| m.1)),
+                            AggregateFunction::Max => Agg::Id(r.max.map_or(UNDEF, |m| m.1)),
+                            _ if r.overflow => Agg::Id(UNDEF),
+                            AggregateFunction::Sum => integer_agg(r.sum),
+                            _ if r.count == 0 => Agg::Term(integer(0)),
+                            _ => match Decimal::from(r.sum)
+                                .checked_div(Decimal::from(r.count as i64))
+                            {
+                                Some(avg) => Agg::Term(
+                                    Literal::new_typed_literal(avg.to_string(), xsd::DECIMAL)
+                                        .into(),
+                                ),
+                                None => Agg::Id(UNDEF),
+                            },
+                        }
+                    })
+                    .collect()
+            })
+            .collect(),
+    ))
+}
+
+/// What a pass over every aggregate at once holds per group and aggregate, at most: its
+/// running state twice (a parallel pass's parts, then them in one list), the value, and a
+/// number's term (its lexical form, at most a decimal's 29 digits with sign and point, and
+/// its datatype's IRI).
+pub(super) const PASS_BYTES: usize = 2 * STATE_BYTES + std::mem::size_of::<Agg>() + 96;
+
+/// The most a pass's running state per group and aggregate holds ([`Running`], and
+/// [`Context::numeric_pass`]'s).
+pub(super) const STATE_BYTES: usize = 96;
+
+const _: () = assert!(std::mem::size_of::<Running>() <= STATE_BYTES);
+
+/// [`PASS_BYTES`] for `groups` groups of `aggregates`, and each group's list of them.
+pub(super) fn pass_bytes(groups: usize, aggregates: usize) -> usize {
+    let per_group = aggregates
+        .saturating_mul(PASS_BYTES)
+        .saturating_add(std::mem::size_of::<Vec<Agg>>());
+    groups.saturating_mul(per_group)
+}
+
+/// The groups of `solutions` by `variables` (GROUP BY), and per variable its column among
+/// the groups' keys (`None`: unbound in every row). The rows are grouped on the columns the
+/// variables name, read where they are, each once: a variable named twice groups as once,
+/// and one no row binds is unbound in all of them, which splits no group (§11.2). Without
+/// variables, all rows are one group, even none of them (§11.4: an aggregate of no rows
+/// has a row); with variables none of them binds, all rows are one group, and no rows none.
+pub(super) fn groups_of(
+    solutions: &Solutions,
+    variables: &[Variable],
+) -> (Groups, Vec<Option<usize>>) {
+    let mut keys: Vec<usize> = Vec::new();
+    let positions = variables
+        .iter()
+        .map(|variable| {
+            let column = solutions.column(variable)?;
+            Some(match keys.iter().position(|&key| key == column) {
+                Some(position) => position,
+                None => {
+                    keys.push(column);
+                    keys.len() - 1
+                }
+            })
+        })
+        .collect();
+    let rows = solutions.table.len();
+    let groups = match keys.is_empty() && !variables.is_empty() {
+        true => Groups {
+            keys: IdTable::from_rows(0, std::iter::repeat_n(&[][..], usize::from(rows > 0))),
+            group_of: vec![0; rows],
+        },
+        false => group_rows(&solutions.table, &keys),
+    };
+    (groups, positions)
+}
+
+/// The groups' key columns by variable, of the groups `kept` (all of them if `None`): a
+/// copy of the key's column, or unbound for a variable without one ([`groups_of`]). As
+/// many as the variables; the caller charges them.
+pub(super) fn key_columns(
+    groups: &Groups,
+    positions: &[Option<usize>],
+    kept: Option<&[usize]>,
+) -> Vec<Vec<u64>> {
+    let rows = kept.map_or(groups.len(), <[usize]>::len);
+    positions
+        .iter()
+        .map(|position| match (position, kept) {
+            (None, _) => vec![UNDEF; rows],
+            (Some(p), None) => groups.keys.column(*p).to_vec(),
+            (Some(p), Some(kept)) => {
+                let column = groups.keys.column(*p);
+                kept.iter().map(|&g| column[g]).collect()
+            }
+        })
+        .collect()
+}
+
+impl Context<'_> {
+    /// Each aggregate's column over `groups` groups (`group_of`: each row's), its values
+    /// interned ([`Context::id`]); the caller charges the columns. From one pass over every
+    /// aggregate where each allows it, what that holds charged first ([`pass_bytes`]);
+    /// otherwise an aggregate at a time ([`Self::aggregate_column`]).
+    pub(super) fn aggregate_columns(
+        &self,
+        solutions: &Solutions,
+        group_of: &[u32],
+        groups: usize,
+        aggregates: &[(Variable, AggregateExpression)],
+    ) -> NativeResult<Vec<Vec<u64>>> {
+        if aggregates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut columns = Vec::with_capacity(aggregates.len());
+        {
+            let mut pass = Reservation::new(&*self.budget);
+            let mut reserve = |bytes: usize| pass.charge(bytes);
+            let memory = QueryEvaluationError::MemoryLimit;
+            // Declared after `pass`: dropped before it.
+            let values =
+                match aggregate_in_one_pass(solutions, group_of, groups, aggregates, &mut reserve)
+                    .map_err(memory)?
+                {
+                    Some(values) => Some(values),
+                    None => self
+                        .numeric_pass(solutions, group_of, groups, aggregates, &mut reserve)
+                        .map_err(memory)?,
+                };
+            if let Some(values) = values {
+                for a in 0..aggregates.len() {
+                    columns.push(self.interned(values.iter().map(|group| &group[a]), groups)?);
+                }
+                return Ok(columns);
+            }
+        }
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); groups];
+        for (row, &group) in group_of.iter().enumerate() {
+            members[group as usize].push(row);
+        }
+        for aggregate in aggregates {
+            columns.push(self.aggregate_column(solutions, &members, aggregate)?);
+        }
+        Ok(columns)
+    }
+
+    /// `aggregate`'s column over the groups `members` lists, its values interned
+    /// ([`Context::id`]). An aggregate at a time: its values and what it remembers of them
+    /// ([`Aggregator`]) are held alone, freed before the next, however many aggregates the
+    /// query names.
+    pub(super) fn aggregate_column(
+        &self,
+        solutions: &Solutions,
+        members: &[Vec<usize>],
+        aggregate: &(Variable, AggregateExpression),
+    ) -> NativeResult<Vec<u64>> {
+        let values = self.aggregate_groups(solutions, members, std::slice::from_ref(aggregate))?;
+        self.interned(values.iter().map(|group| &group[0]), members.len())
+    }
+
+    /// The ids of `len` values.
+    fn interned<'v>(
+        &self,
+        values: impl Iterator<Item = &'v Agg>,
+        len: usize,
+    ) -> NativeResult<Vec<u64>> {
+        let mut ids = Vec::with_capacity(len);
+        for value in values {
+            ids.push(match value {
+                Agg::Id(id) => *id,
+                Agg::Term(term) => self.id(term)?,
+            });
+        }
+        Ok(ids)
+    }
+}
+
+/// Per aggregate, the column [`aggregate_in_one_pass`] reads (`None`: the rows) and its
+/// function; `None` if one isn't for that pass.
+fn one_pass_plan(
+    solutions: &Solutions,
+    aggregates: &[(Variable, AggregateExpression)],
+) -> Option<Vec<(Option<usize>, AggregateFunction)>> {
     // Per aggregate: the column it reads (`None`: the rows) and its function.
     let mut plan: Vec<(Option<usize>, AggregateFunction)> = Vec::new();
     for (_, aggregate) in aggregates {
@@ -452,50 +670,7 @@ pub(super) fn aggregate_in_one_pass(
             _ => return None,
         }
     }
-    let mut running = vec![Running::default(); groups * plan.len()];
-    let mut rows = vec![0u64; groups];
-    for (row, &group) in group_of.iter().enumerate() {
-        let group = group as usize;
-        rows[group] += 1;
-        for (a, (column, _)) in plan.iter().enumerate() {
-            if let Some(column) = column {
-                running[group * plan.len() + a].add(solutions.table.get(row, *column));
-            }
-        }
-    }
-    Some(
-        (0..groups)
-            .map(|group| {
-                plan.iter()
-                    .enumerate()
-                    .map(|(a, (column, name))| {
-                        let r = running[group * plan.len() + a];
-                        if column.is_none() {
-                            return integer_agg(rows[group] as i64);
-                        }
-                        match name {
-                            AggregateFunction::Count => integer_agg(r.count as i64),
-                            _ if r.unbound => Agg::Id(UNDEF),
-                            AggregateFunction::Min => Agg::Id(r.min.map_or(UNDEF, |m| m.1)),
-                            AggregateFunction::Max => Agg::Id(r.max.map_or(UNDEF, |m| m.1)),
-                            _ if r.overflow => Agg::Id(UNDEF),
-                            AggregateFunction::Sum => integer_agg(r.sum),
-                            _ if r.count == 0 => Agg::Term(integer(0)),
-                            _ => match Decimal::from(r.sum)
-                                .checked_div(Decimal::from(r.count as i64))
-                            {
-                                Some(avg) => Agg::Term(
-                                    Literal::new_typed_literal(avg.to_string(), xsd::DECIMAL)
-                                        .into(),
-                                ),
-                                None => Agg::Id(UNDEF),
-                            },
-                        }
-                    })
-                    .collect()
-            })
-            .collect(),
-    )
+    Some(plan)
 }
 
 /// GROUP_CONCAT (SPARQL 1.1 §18.5.1.7): string literals only (anything else makes the
