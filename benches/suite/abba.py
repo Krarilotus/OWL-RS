@@ -313,6 +313,9 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
     steps = prepare + blocks + after
     by_name = {c["name"]: c for c in family["catalog"]}
     has = rg.data_needs([by_name[c["name"]] for c in family["cases"] if c["name"] in by_name])
+    fetched = rg.bench_inputs([by_name[c["name"]] for c in family["cases"] if c["name"] in by_name])
+    if fetched:  # the commit data_state() takes WatDiv's pinned query sets from
+        env["BENCH_INPUTS_REV"] = fetched[0]["source"]["rev"]
     requires = {"roles": rg.TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": max(12, cap)} | ({"has": has} if has else {})
     job = {"id": prefix, "group": "abba", "kind": "owlrs.timed", "class": "exclusive",
            "priority": priority, "priority_reason": reason or f"A-B-B-A: {b[:8]} against {a[:8]}, "
@@ -321,7 +324,7 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
            # The first step asks the job's whole memory too: placed on a host too small for the blocks,
            # its hold would end there and the blocks run elsewhere, without its builds (Sol r2 S1).
            "step_deadline_min": rg.BUILD_MIN * len(revisions) + 120,
-           "requires": requires, "inputs": source + rg.side_inputs(checkout, source[0]["source"]["rev"], revisions)}
+           "requires": requires, "inputs": source + rg.side_inputs(checkout, source[0]["source"]["rev"], revisions) + fetched}
     if host:
         requires["hosts"] = [host]
         job["pin_reason"] = "the family names its timing host (its floor, or a run to reproduce there)"

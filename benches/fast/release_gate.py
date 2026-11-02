@@ -1657,7 +1657,8 @@ def data_disk_gb(cases: list[dict], datasets: Path = ROOT / "benches" / "dataset
     return math.ceil(2 * sum(d.get("bytes", 0) for d in made) / 1e9)
 
 
-def data_state(cases: list[dict], make: bool = False, root: Path = ROOT) -> tuple[list[str], bool]:
+def data_state(cases: list[dict], make: bool = False, root: Path = ROOT,
+               inputs_repo: Path | None = None) -> tuple[list[str], bool]:
     """What this host holds of the cases' frozen inputs (the probe; release-gate.sh prepare runs it
     with `make`): each file in the bench assets (hosts.toml inputs.general) or the SPARQL data cache,
     by its frozen size; with `make`, a missing file benches/sparql/prepare.sh makes is made into the
@@ -1691,13 +1692,55 @@ def data_state(cases: list[dict], make: bool = False, root: Path = ROOT) -> tupl
     for qset in sorted({c["queries"][1:] for c in cases if str(c.get("queries", "")).startswith("@watdiv")}):
         want = sum(1 for p in pins if p.split("  ", 1)[-1].startswith(f"{qset}/"))
         have = len(list((cache / "queries" / qset).glob("*.rq"))) if (cache / "queries" / qset).is_dir() else 0
+        rev = os.environ.get("BENCH_INPUTS_REV", "")
+        if have != want and make and rev:
+            # The private input repository's commit, a git input of the job: the fleet pushes it into the
+            # host's repository, which the job's checkout reads (only the first git input is checked
+            # out), so the set comes out by `git archive`; prepare checks the pins after.
+            import io
+            import shutil
+            import tarfile
+            target = cache / "queries" / qset
+            done = subprocess.run(["git", "-C", str(inputs_repo or root), "archive", "--format=tar", rev, f"queries/{qset}"],
+                                  capture_output=True, timeout=300)
+            if done.returncode == 0:
+                shutil.rmtree(target, ignore_errors=True)
+                with tarfile.open(fileobj=io.BytesIO(done.stdout)) as archive:
+                    archive.extractall(cache, filter="data")
+                have = len(list(target.glob("*.rq")))
+                lines.append(f"copied query set {qset} from the bench inputs ({rev[:12]}): {have} files")
+            else:
+                lines.append(f"FAILED copying query set {qset} from the bench inputs ({rev[:12]}): "
+                             f"{done.stderr.decode(errors='replace').strip()[-200:]}")
         if have == want and want:
             lines.append(f"held query set {qset}: {have} files (prepare checks their pins)")
         else:
             ok = False
             lines.append(f"MISSING query set {qset}: {have} of {want} pinned files; generated with a clock seed, it "
-                         f"can't be made again: copy {cache}/queries/{qset} from a host holding it")
+                         f"can't be made again: it comes from the bench inputs repository (benches/hosts.toml "
+                         f"[sources]), a git input of the job ({'BENCH_INPUTS_REV ' + rev[:12] if rev else 'none given'})")
     return lines, ok
+
+
+BENCH_INPUTS_INPUT = "BENCH_INPUTS"
+
+
+def bench_inputs(cases: list[dict]) -> list[dict]:
+    """The private input repository as a git input (benches/hosts.toml [sources] bench-inputs, its
+    variable overriding), where the cases read a pinned query set that can't be made again (WatDiv's):
+    the job fetches it, nothing a host must hold (the orchestrator's decision (b), 2 Nov 2026). None
+    where no case needs it, or the repository isn't there: the data probe then says what's missing."""
+    import subprocess
+    if not any(str(c.get("queries", "")).startswith("@watdiv") for c in cases):
+        return []
+    source = hosts_registry.load().get("sources", {}).get("bench-inputs", {})
+    repo = os.environ.get(source.get("env") or "BENCH_INPUTS_GIT") or source.get("git")
+    if not repo or not Path(repo).is_dir():
+        return []
+    rev = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=60)
+    if rev.returncode != 0:
+        return []
+    return [{"name": BENCH_INPUTS_INPUT, "source": {"git": Path(repo).as_posix(), "rev": rev.stdout.strip()}}]
 
 
 def case_seconds(measure: dict | None, case: str) -> float | None:
@@ -1751,6 +1794,9 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
         steps = builds + timed_steps + report
         mine = [by_name[c] for c in planned if c in by_name]
         has, disk = data_needs(mine), data_disk_gb(mine)
+        fetched = bench_inputs(mine)
+        if fetched:
+            part_env = {**part_env, "BENCH_INPUTS_REV": fetched[0]["source"]["rev"]}
         requires = ({"roles": TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": ram_gb} | ({"has": has} if has else {})
                     | ({"disk_gb": disk} if disk else {}))
         est = plan_minutes(len(revisions), sides, block_cases, measure)
@@ -1761,7 +1807,7 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
                 # Builds ask the part's whole memory: a host too small for its blocks would end the hold
                 # after them (Sol r2 S1).
                 "step_deadline_min": BUILD_MIN * len(revisions) + 120,
-                "requires": requires, "inputs": inputs}
+                "requires": requires, "inputs": inputs + fetched}
 
     timed_steps = [[*gate_, "plan-blocks", harness]] if measure else []
     block_cases = []

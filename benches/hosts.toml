@@ -50,6 +50,11 @@ fast = { name = "nrese-fast-data", env = "NRESE_FAST_VOLUME", what = "the fast s
 sparql-data = { path = "~/owlrs/sparql-data", env = "SPARQL_DATA", max_gb = 400, what = "the SPARQL workloads' datasets as benches/sparql/prepare.sh makes them (12 frozen files, 196 GB in benches/datasets.toml), their sources (src/) and the pinned query sets (queries/; WatDiv's can't be made again, only copied)", lifetime = "kept while benches/datasets.toml freezes the file; a file whose freeze changed, and src/ after its file is made, may go; scripts/bench-cleanup.sh never removes a frozen file" }
 gate-bin = { path = "~/owlrs/gate-v2-bin", env = "GATE_BIN", max_gb = "not measured yet", what = "the gate's and A-B-B-A's builds by identity (release-gate.sh build), shared by every gate on the host", lifetime = "a build no gate used for GATE_BIN_AGE_DAYS goes (release-gate.sh clean)" }
 
+[sources]
+# Inputs a job fetches as a git input (the fleet stages them; nothing a host must hold): their
+# repository on the main PC, which the variable overrides. Private, never public.
+bench-inputs = { git = "C:/Users/Johannes/Documents/owlrs-bench-inputs", env = "BENCH_INPUTS_GIT", input = "BENCH_INPUTS", what = "the pinned query sets that can't be made again or committed here (WatDiv's: a clock-seeded generator, no licence stated), byte for byte as benches/sparql/queries.sha256 pins them, under queries/" }
+
 [host.office-pc]
 ssh = "Office-PC"
 hostname = "sus-ai"

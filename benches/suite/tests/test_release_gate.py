@@ -345,6 +345,31 @@ class Rounds(unittest.TestCase):
         self.assertIn("MISSING bsbm-100m.nt: made by `bash benches/sparql/prepare.sh bsbm-100m`", text)
         self.assertIn("MISSING query set watdiv-10m", text)
         self.assertIn("can't be made again", text)
+        # The orchestrator's decision (b), 2 Nov 2026: a set comes from the private input repository,
+        # a git input of the job: the fleet pushes its commit (BENCH_INPUTS_REV) into the repository the
+        # job's checkout reads (only a job's first git input is checked out), and with --make the set
+        # is taken out of it by `git archive`.
+        pinned = sum(1 for line in (ROOT / "benches/sparql/queries.sha256").read_text(encoding="utf-8").splitlines()
+                     if line.split("  ", 1)[-1].startswith("watdiv-10m/"))
+        with tempfile.TemporaryDirectory() as cache, tempfile.TemporaryDirectory() as repo:
+            git = lambda *a: __import__("subprocess").run(["git", "-C", repo, *a], capture_output=True, text=True,  # noqa: E731
+                                                          check=True).stdout.strip()
+            git("init", "-q")
+            (Path(repo) / "queries" / "watdiv-10m").mkdir(parents=True)
+            for k in range(pinned):
+                (Path(repo) / "queries" / "watdiv-10m" / f"q{k}.rq").write_text("SELECT * {}\n", encoding="utf-8")
+            git("add", "-A")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "inputs")
+            rev = git("rev-parse", "HEAD")
+            with patch.dict(os.environ, {"SPARQL_DATA": cache, "BENCH_INPUTS_REV": rev}), \
+                    patch.object(gate_module.hosts_registry, "input_path", return_value=None):
+                probed, _ = gate_module.data_state([{"data": "none", "queries": "@watdiv-10m"}])
+                made, ok = gate_module.data_state([{"data": "none", "queries": "@watdiv-10m"}], make=True,
+                                                  inputs_repo=Path(repo))
+            self.assertTrue(probed[0].startswith("MISSING query set watdiv-10m"))  # the probe never copies
+            self.assertTrue(ok, made)
+            self.assertEqual(made[0], f"copied query set watdiv-10m from the bench inputs ({rev[:12]}): {pinned} files")
+            self.assertEqual(len(list((Path(cache) / "queries" / "watdiv-10m").glob("*.rq"))), pinned)
         # A concatenation's parts are inputs too (Sol r2 T2: "no frozen inputs" where both were absent).
         with tempfile.TemporaryDirectory() as cache, patch.dict(os.environ, {"SPARQL_DATA": cache}), \
                 patch.object(gate_module.hosts_registry, "input_path", return_value=None):
@@ -683,6 +708,23 @@ class Parts(unittest.TestCase):
         self.assertNotEqual(big["env"]["GATE_NAME"], found["rg-test-timed"]["env"]["GATE_NAME"])
         self.assertFalse([i for i in big["inputs"] if "artifact" in i["source"]])
         self.assertEqual(big["env"]["GATE_MIN_GB"], "24")
+        # The private input repository is a git input of a part whose cases read a WatDiv query set,
+        # and of no other (the orchestrator's decision (b), 2 Nov 2026).
+        with tempfile.TemporaryDirectory() as repo:
+            run = lambda *a: __import__("subprocess").run(["git", "-C", repo, *a], capture_output=True,  # noqa: E731
+                                                          text=True, check=True)
+            run("init", "-q")
+            run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "inputs")
+            head = run("rev-parse", "HEAD").stdout.strip()
+            with patch.dict(os.environ, {"BENCH_INPUTS_GIT": repo}):
+                watdiv = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "watdiv-10m", checks=False)
+                other = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "lab-olympics", checks=False)
+        self.assertIn({"name": "BENCH_INPUTS", "source": {"git": Path(repo).as_posix(), "rev": head}},
+                      watdiv["rg-test-timed"]["inputs"])
+        self.assertNotIn("BENCH_INPUTS", [i["name"] for i in other["rg-test-timed"]["inputs"]])
+        # Only the first git input is checked out: the job is told the commit to take the sets from.
+        self.assertEqual(watdiv["rg-test-timed"]["env"]["BENCH_INPUTS_REV"], head)
+        self.assertNotIn("BENCH_INPUTS_REV", other["rg-test-timed"]["env"])
         # A selection with no case above the timed part's memory has no big part.
         small = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "lab-olympics")
         self.assertEqual(sorted(small), ["rg-test-checks", "rg-test-timed"])
