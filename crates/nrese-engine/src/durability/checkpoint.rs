@@ -283,17 +283,18 @@ fn write_text_order<W: Write>(
     out: &mut Checksummed<'_, W>,
     dictionary: &Dictionary,
     len: u64,
-    _admission: &Budget,
+    admission: &Budget,
 ) -> EngineResult<()> {
     let started = std::time::Instant::now();
-    let order = dictionary.text_order(len);
+    let order = dictionary.text_order(len, admission)?;
     let ordered = started.elapsed();
     out.pad();
     put_u64(&mut out.buffer, order.len() as u64);
-    for index in order {
+    for &index in order.iter() {
         put_u32(&mut out.buffer, index);
         out.drain()?;
     }
+    drop(order);
     tracing::debug!(
         entries = len,
         text_order_ms = ordered.as_millis() as u64,
