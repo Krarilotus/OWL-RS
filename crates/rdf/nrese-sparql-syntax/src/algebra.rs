@@ -736,6 +736,12 @@ impl OrderExpression {
             Self::Asc(e) | Self::Desc(e) => e,
         }
     }
+
+    pub fn expression_mut(&mut self) -> &mut Expression {
+        match self {
+            Self::Asc(e) | Self::Desc(e) => e,
+        }
+    }
 }
 
 impl fmt::Display for OrderExpression {
