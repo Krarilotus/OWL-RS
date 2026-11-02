@@ -1,0 +1,10 @@
+# Paths the docs mention (in backticks) on purpose although they don't exist
+# (scripts/check-doc-paths.py). Mentions only: a clickable link to a missing file always fails.
+# One per line: DOC TARGET  # why. Remove a line when its reason ends.
+
+docs/STATUS.md ops/fuseki/  # named as removed (A1)
+docs/plan/2026-10-05-v2-merge-checklist.md src/tests/v1_scenarios.rs  # open: an in-progress row names a reasoner file that isn't there; the checklist's owner settles the row
+docs/dev/getting-started.md apps/nrese-console/dist  # the console build's output
+benches/competitors/README.md benches/competitors/results/  # git-ignored results directory
+benches/STATUS.md benches/breadth/fedshop  # open: generated from benches/suite/workloads.toml; the bench registry's owner fixes it there
+benches/STATUS.md benches/breadth/memory-budget  # open: as above
