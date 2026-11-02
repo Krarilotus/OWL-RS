@@ -7,12 +7,11 @@ file that moved or never landed sends its reader looking for nothing, or buildin
     python3 scripts/check-doc-paths.py            every tracked *.md
     python3 scripts/check-doc-paths.py FILE...    these files (the changed ones)
 
-Links: inline links (`[text](dest)`, `[text](<dest with spaces> "title")`) and reference
-definitions (`[label]: dest`, which reference-style links use), in blockquotes too. Link-shaped
-text in code spans and fenced code is checked as well (fail closed): show an example link with a
-path that exists, or a URL. A link resolves from its document's directory only, as a renderer resolves it. Link syntax the
-checker can't read (an unterminated `<`, a `](` with no closing `)`, a definition with no
-destination) fails as unsupported rather than passing unread.
+Links: what a CommonMark parser (markdown-it-py, CommonMark mode) makes a link or an image, from
+its tokens: inline links, autolinks, images, and every reference definition it records (in lists,
+blockquotes, with escaped labels), plus the `href` and `src` of raw HTML. What it doesn't make a
+link (text in code, a broken bracket) isn't one. A link resolves from its document's directory
+only, as a renderer resolves it.
 
 Mentions: a backticked path resolves from the document's directory, from the repository root, or,
 for a path such as `tests/it/x.rs` or `src/lib.rs` written inside a crate's or the console's prose,
@@ -30,7 +29,8 @@ into scripts/doc-paths.allow, one per line: `DOC TARGET  # why`. The allow list 
 only: a clickable link to a missing file always fails.
 
 Exit status: 0 when every path exists, 1 when one doesn't or a doc can't be read (each printed as
-DOC:LINE: KIND TARGET), 2 on a usage error. Stdlib only; no build.
+DOC:LINE: KIND TARGET), 2 on a usage error or without markdown-it-py. Needs markdown-it-py and its
+mdurl (pinned in benches/suite/requirements.txt, the gate's suite environment); no build.
 """
 import glob
 import os
@@ -38,18 +38,20 @@ import re
 import subprocess
 import sys
 
+try:
+    from markdown_it import MarkdownIt
+except ImportError:
+    MarkdownIt = None
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 ALLOW = os.path.join(ROOT, "scripts", "doc-paths.allow")
 TOP = ("scripts/", "docs/", "crates/", "benches/", "apps/", "tests/", "fixtures/", "ops/",
        ".githooks/", ".github/", "fuzz/", ".claude/")
 SKIPPED_DIRS = ("literature/", "fixtures/")
 TICK = re.compile(r"`([^`\n]+)`(\])?")
-QUOTE = re.compile(r"^ {0,3}> ?")
-DEFINITION = re.compile(r"^ {0,3}\[([^\]^][^\]]*)\]:(.*)$")
-TITLE = re.compile(r"\s*(?:\"[^\"]*\"|'[^']*'|\([^)]*\))?\s*$")
+HTML_LINK = re.compile(r"""\b(?:href|src)\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
 PLACEHOLDER = re.compile(r"[<>{}*…$|]|\b(NAME|HOST|ID|REV|DIR)\b")
-URL = re.compile(r"^[a-z][a-z0-9+.-]*:")
-UNSUPPORTED = None  # a destination the checker couldn't read
+URL = re.compile(r"^[a-z][a-z0-9+.-]*:", re.I)
 
 
 def package_dirs():
@@ -99,87 +101,48 @@ def exists(doc_dir, path, crate_relative):
     return any(os.path.exists(os.path.join(base, path)) for base in bases)
 
 
-def destination(text):
-    """The destination at the start of TEXT (after `](` or `]:`) and the rest, or UNSUPPORTED."""
-    text = text.lstrip(" \t")
-    if text.startswith("<"):
-        end = text.find(">")
-        if end < 0 or "<" in text[1:end]:
-            return UNSUPPORTED, ""
-        return text[1:end], text[end + 1:]
-    depth, i = 0, 0
-    while i < len(text) and not text[i].isspace():
-        if text[i] == "\\":
-            i += 1
-        elif text[i] == "(":
-            depth += 1
-        elif text[i] == ")":
-            if depth == 0:
-                break
-            depth -= 1
-        i += 1
-    return text[:i], text[i:]
+def parser():
+    md = MarkdownIt("commonmark")
+    # The destination as written (escapes and entities resolved), not percent-encoded for a URL:
+    # it is looked up as a file.
+    md.normalizeLink = lambda url: url
+    return md
 
 
-def closes(rest):
-    """Whether REST, what follows a destination, is an optional title and then the link's `)`."""
-    rest = rest.lstrip(" \t")
-    if rest[:1] in ('"', "'", "("):
-        end = {'"': '"', "'": "'", "(": ")"}[rest[0]]
-        i = 1
-        while i < len(rest) and rest[i] != end:
-            i += 2 if rest[i] == "\\" else 1
-        if i >= len(rest):
-            return False
-        rest = rest[i + 1:].lstrip(" \t")
-    return rest.startswith(")")
-
-
-def inline_links(line):
-    """Each inline link's destination on LINE, UNSUPPORTED where unreadable."""
-    for m in re.finditer(r"\]\(", line):
-        dest, rest = destination(line[m.end():])
-        if dest is UNSUPPORTED or not closes(rest):
-            yield UNSUPPORTED
-            continue
-        yield dest
-
-
-def links(lines):
-    """(line number, destination) of every link-shaped text: inline links and reference
-    definitions, inside blockquotes too. Code isn't told apart (fail closed): guessing where a fence
-    or code span ends is how a real link went unread."""
-    for no, line in enumerate(lines, 1):
-        while QUOTE.match(line):
-            line = QUOTE.sub("", line, count=1)
-        definition = DEFINITION.match(line)
-        if definition:
-            dest, rest = destination(definition.group(2))
-            if dest is UNSUPPORTED or not dest or not TITLE.fullmatch(rest):
-                yield no, UNSUPPORTED
-            else:
-                yield no, dest
-            continue
-        for dest in inline_links(line):
-            yield no, dest
+def links(text):
+    """(line number, destination) of every link the parser finds in TEXT."""
+    env = {}
+    tokens = parser().parse(text, env)
+    for token in tokens:
+        line = token.map[0] + 1 if token.map else 0
+        if token.type in ("html_block", "html_inline"):
+            for m in HTML_LINK.finditer(token.content):
+                yield line, m.group(1) if m.group(1) is not None else m.group(2)
+        for child in token.children or ():
+            if child.type == "link_open":
+                yield line, child.attrGet("href")
+            elif child.type == "image":
+                yield line, child.attrGet("src")
+            elif child.type == "html_inline":
+                for m in HTML_LINK.finditer(child.content):
+                    yield line, m.group(1) if m.group(1) is not None else m.group(2)
+    for reference in env.get("references", {}).values():
+        yield reference["map"][0] + 1, reference["href"]
 
 
 def missing(path):
     """(line, kind, target) of each reference in the doc at PATH whose target doesn't exist:
-    kind `link` (clickable), `mention` (backticked) or `unsupported` (link syntax not read)."""
+    kind `link` (clickable: a link, image or reference definition) or `mention` (backticked)."""
     doc_dir = os.path.dirname(os.path.abspath(os.path.join(ROOT, path)))
     with open(os.path.join(ROOT, path), encoding="utf-8") as fh:
-        lines = fh.read().splitlines()
-    for no, dest in links(lines):
-        if dest is UNSUPPORTED:
-            yield no, "unsupported", "link syntax this check can't read"
-            continue
-        if URL.match(dest) or dest.startswith("#"):
+        text = fh.read()
+    for no, dest in sorted(set(links(text))):
+        if not dest or URL.match(dest) or dest.startswith("#"):
             continue
         target = clean(dest)
         if target and not PLACEHOLDER.search(target) and not os.path.exists(os.path.join(doc_dir, target)):
             yield no, "link", dest
-    for no, line in enumerate(lines, 1):
+    for no, line in enumerate(text.splitlines(), 1):
         for m in TICK.finditer(line):
             if m.group(2):  # link text: the link itself is checked above
                 continue
@@ -196,6 +159,9 @@ def missing(path):
 def main(argv):
     if any(a.startswith("-") for a in argv):
         print(__doc__.strip().split("\n\n")[1], file=sys.stderr)
+        return 2
+    if MarkdownIt is None:
+        print("check-doc-paths: needs markdown-it-py (pinned in benches/suite/requirements.txt)", file=sys.stderr)
         return 2
     explicit = bool(argv)
     docs = [os.path.abspath(a) for a in argv] if explicit else [os.path.join(ROOT, p) for p in tracked_docs()]
@@ -217,9 +183,8 @@ def main(argv):
             bad += 1
             print(f"{key}:{no}: {kind} {target}")
     if bad:
-        print(f"check-doc-paths: {bad} problem(s): a path the docs name doesn't exist, a link can't be read, "
-              "or a doc can't be read; fix the doc, or list an intended mention in scripts/doc-paths.allow",
-              file=sys.stderr)
+        print(f"check-doc-paths: {bad} problem(s): a path the docs name doesn't exist, or a doc can't be "
+              "read; fix the doc, or list an intended mention in scripts/doc-paths.allow", file=sys.stderr)
     return 1 if bad else 0
 
 
