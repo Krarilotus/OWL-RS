@@ -544,6 +544,12 @@ pub(crate) fn exists(dir: &Path, revision: u64) -> bool {
     checkpoint_path(dir, revision, EXTENSION).exists()
 }
 
+/// Whether the checkpoint of `revision` is in place under its name; an error where that
+/// can't be told.
+pub(crate) fn placed(dir: &Path, revision: u64) -> std::io::Result<bool> {
+    checkpoint_path(dir, revision, EXTENSION).try_exists()
+}
+
 /// Writes a checkpoint of `snapshot` and returns its path; its scratch is charged within
 /// `admission` ([`write_parts`]).
 pub(crate) fn write(

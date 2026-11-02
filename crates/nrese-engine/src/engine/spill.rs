@@ -257,10 +257,13 @@ impl Iterator for Merge {
     }
 }
 
-/// The spilling thread of a bulk load, started with its first chunk.
+/// The spilling thread of a bulk load, started with its first chunk. Dropped, it is joined
+/// and its spill removed: an aborted load's thread never outlives it (B-303).
 pub(super) struct Spiller {
-    chunks: SyncSender<Vec<Vec<EncodedQuad>>>,
-    thread: JoinHandle<std::io::Result<Spill>>,
+    /// Taken when the thread is told to stop.
+    chunks: Option<SyncSender<Vec<Vec<EncodedQuad>>>>,
+    /// Taken when it is joined.
+    thread: Option<JoinHandle<std::io::Result<Spill>>>,
 }
 
 impl Spiller {
@@ -280,21 +283,42 @@ impl Spiller {
                 }
                 Ok(spill)
             })?;
-        Ok(Self { chunks, thread })
+        Ok(Self {
+            chunks: Some(chunks),
+            thread: Some(thread),
+        })
     }
 
     /// Hands a full chunk over, waiting while the last one is written. `false` if the
     /// thread stopped on an error ([`finish`](Self::finish) returns it).
     pub(super) fn send(&self, batches: Vec<Vec<EncodedQuad>>) -> bool {
-        self.chunks.send(batches).is_ok()
+        self.chunks
+            .as_ref()
+            .is_some_and(|chunks| chunks.send(batches).is_ok())
     }
 
     /// Waits for the last chunk to be written; the chunks, or the first error.
-    pub(super) fn finish(self) -> std::io::Result<Spill> {
-        drop(self.chunks);
-        self.thread
-            .join()
-            .unwrap_or_else(|_| Err(std::io::Error::other("the spilling thread panicked")))
+    pub(super) fn finish(mut self) -> std::io::Result<Spill> {
+        self.join()
+            .unwrap_or_else(|| Err(std::io::Error::other("the spilling thread was joined")))
+    }
+
+    /// Stops the thread after the chunk it is writing and waits for it, once.
+    fn join(&mut self) -> Option<std::io::Result<Spill>> {
+        drop(self.chunks.take());
+        let thread = self.thread.take()?;
+        Some(
+            thread
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("the spilling thread panicked"))),
+        )
+    }
+}
+
+impl Drop for Spiller {
+    fn drop(&mut self) {
+        // The spill, if the thread returned one, removes its directory as it drops.
+        drop(self.join());
     }
 }
 
