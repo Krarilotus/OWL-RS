@@ -17,6 +17,10 @@
 //! - **Rejection.** A negative test passes only when both readers reject the document's
 //!   content (a syntax error). A fixture that can't be read, a setup error, an I/O error or
 //!   the two readers disagreeing fails the test, whatever its kind.
+//! - **Expected failures** (`expected-failures.txt`). A listed test may fail only on its
+//!   verdict, once every check before it succeeded; anything that leaves it without a
+//!   verdict (above, a failed round trip, a rejected action or expected result of an
+//!   evaluation, a panic) fails it like any other.
 //! - **Nesting.** One test nests formulas 1,080 deep; the parser's default limit (128, a
 //!   guard for servers) is raised to 2,048 here, and the suite runs on a thread with a
 //!   stack to match.
@@ -213,15 +217,38 @@ fn canonical(quads: &[N3Quad]) -> Dataset {
 /// A document's statements, or the syntax error both readers reject its content with.
 type Verdict = Result<Vec<N3Quad>, RdfSyntaxError>;
 
+/// Why a case fails.
+#[derive(Debug, PartialEq, Eq)]
+enum Failure {
+    /// Every check before the case's verdict succeeded, and the verdict is not the test's:
+    /// a positive document rejected, a negative one read, an evaluation's statements not
+    /// the expected ones. Only this can be an expected failure.
+    Wrong(String),
+    /// The case can't be decided: a fixture that can't be read, a setup error, readers that
+    /// disagree, a failed round trip, an evaluation's action rejected or its expected result
+    /// not read, a panic. Never an expected failure.
+    NoVerdict(String),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Wrong(why) => f.write_str(why),
+            Failure::NoVerdict(why) => write!(f, "no verdict: {why}"),
+        }
+    }
+}
+
 /// The verdict on a document, read from a slice and through a trickling reader. `Err` when
 /// there is none: the fixture can't be read, the parser can't be set up, or the readers
 /// disagree.
-fn parse(root: &Path, iri: &str) -> Result<Verdict, String> {
+fn parse(root: &Path, iri: &str) -> Result<Verdict, Failure> {
     let path = file(root, iri);
-    let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let bytes = std::fs::read(&path)
+        .map_err(|e| Failure::NoVerdict(format!("reading {}: {e}", path.display())))?;
     let parser = N3Parser::new()
         .with_base_iri(iri)
-        .map_err(|e| format!("the base IRI {iri}: {e}"))?
+        .map_err(|e| Failure::NoVerdict(format!("the base IRI {iri}: {e}")))?
         .with_max_nesting(2048);
     let from_slice = parser.clone().for_slice(&bytes).collect();
     agree(from_slice, parser.for_reader(Trickle(&bytes)).collect())
@@ -232,18 +259,17 @@ fn parse(root: &Path, iri: &str) -> Result<Verdict, String> {
 fn agree(
     from_slice: Result<Vec<N3Quad>, RdfParseError>,
     from_reader: Result<Vec<N3Quad>, RdfParseError>,
-) -> Result<Verdict, String> {
-    match (from_slice, from_reader) {
-        (Ok(a), Ok(b)) if canonical(&a) == canonical(&b) => Ok(Ok(a)),
-        (Ok(_), Ok(_)) => {
-            Err("a slice and a trickling reader give different statements".to_owned())
-        }
-        (Err(RdfParseError::Syntax(e)), Err(RdfParseError::Syntax(_))) => Ok(Err(e)),
-        (Err(RdfParseError::Io(e)), _) => Err(format!("the slice fails to read: {e}")),
-        (_, Err(RdfParseError::Io(e))) => Err(format!("the trickling reader fails to read: {e}")),
-        (Ok(_), Err(e)) => Err(format!("only the trickling reader fails: {e}")),
-        (Err(e), Ok(_)) => Err(format!("only the slice fails: {e}")),
-    }
+) -> Result<Verdict, Failure> {
+    let why = match (from_slice, from_reader) {
+        (Ok(a), Ok(b)) if canonical(&a) == canonical(&b) => return Ok(Ok(a)),
+        (Err(RdfParseError::Syntax(e)), Err(RdfParseError::Syntax(_))) => return Ok(Err(e)),
+        (Ok(_), Ok(_)) => "a slice and a trickling reader give different statements".to_owned(),
+        (Err(RdfParseError::Io(e)), _) => format!("the slice fails to read: {e}"),
+        (_, Err(RdfParseError::Io(e))) => format!("the trickling reader fails to read: {e}"),
+        (Ok(_), Err(e)) => format!("only the trickling reader fails: {e}"),
+        (Err(e), Ok(_)) => format!("only the slice fails: {e}"),
+    };
+    Err(Failure::NoVerdict(why))
 }
 
 fn round_trip(quads: &[N3Quad]) -> Result<(), String> {
@@ -267,42 +293,48 @@ fn round_trip(quads: &[N3Quad]) -> Result<(), String> {
 }
 
 /// A case's outcome: `Err` says why it fails.
-type Outcome = Result<(), String>;
+type Outcome = Result<(), Failure>;
 
 fn run(root: &Path, test: &Test) -> Outcome {
     let action = parse(root, &test.action)?;
-    let statements = |verdict: Verdict| verdict.map_err(|e| e.to_string());
     match test.kind {
-        Kind::Positive => round_trip(&statements(action)?),
+        Kind::Positive => {
+            let statements = action.map_err(|e| Failure::Wrong(format!("rejected: {e}")))?;
+            round_trip(&statements).map_err(Failure::NoVerdict)
+        }
         Kind::Negative => match action {
-            Ok(_) => Err("parsed, but must not".to_owned()),
+            Ok(_) => Err(Failure::Wrong("parsed, but must not".to_owned())),
             Err(_) => Ok(()),
         },
         Kind::Eval => {
-            let actual = statements(action)?;
-            round_trip(&actual)?;
-            let result = test
-                .result
-                .as_deref()
-                .ok_or("an evaluation test without result")?;
+            let actual =
+                action.map_err(|e| Failure::NoVerdict(format!("the action is rejected: {e}")))?;
+            round_trip(&actual).map_err(Failure::NoVerdict)?;
+            let result = test.result.as_deref().ok_or_else(|| {
+                Failure::NoVerdict("an evaluation test without result".to_owned())
+            })?;
+            let unread =
+                |e: &dyn std::fmt::Display| Failure::NoVerdict(format!("expected result: {e}"));
             // N3 is a superset of N-Triples (some expected results have literal subjects).
             let expected: Vec<N3Quad> = if !result.ends_with(".nq") {
                 parse(root, result)
-                    .and_then(statements)
-                    .map_err(|e| format!("expected result: {e}"))?
+                    .map_err(|e| unread(&e))?
+                    .map_err(|e| unread(&e))?
             } else {
-                let bytes = std::fs::read(file(root, result)).map_err(|e| e.to_string())?;
+                let bytes = std::fs::read(file(root, result)).map_err(|e| unread(&e))?;
                 RdfParser::from_format(RdfFormat::NQuads)
                     .for_slice(&bytes)
                     .map(|q| q.map(N3Quad::from))
                     .collect::<Result<_, _>>()
-                    .map_err(|e| format!("expected result: {e}"))?
+                    .map_err(|e| unread(&e))?
             };
             let (a, b) = (canonical(&actual), canonical(&expected));
             if a == b {
                 Ok(())
             } else {
-                Err(format!("different statements:\n{a}\nexpected:\n{b}"))
+                Err(Failure::Wrong(format!(
+                    "different statements:\n{a}\nexpected:\n{b}"
+                )))
             }
         }
     }
@@ -326,18 +358,19 @@ fn expected_failures() -> BTreeMap<String, String> {
 
 /// `case`'s outcome, a panic counted as a failure.
 fn caught(case: impl FnOnce() -> Outcome + std::panic::UnwindSafe) -> Outcome {
-    std::panic::catch_unwind(case).unwrap_or_else(|_| Err("panicked".to_owned()))
+    std::panic::catch_unwind(case)
+        .unwrap_or_else(|_| Err(Failure::NoVerdict("panicked".to_owned())))
 }
 
 /// What the suite counts a case as.
 #[derive(Debug, PartialEq, Eq)]
 enum Tally {
     Passed,
-    /// Fails, and is an expected failure.
+    /// Listed as an expected failure, and fails on its verdict.
     Known,
     /// Passes, but is listed as an expected failure.
     Listed,
-    /// Fails, and is not an expected failure.
+    /// Fails, and is not an expected failure: unlisted, or with no verdict.
     Failed(String),
 }
 
@@ -345,8 +378,8 @@ fn tally(test: &Test, outcome: Outcome, expected: &BTreeMap<String, String>) -> 
     match (outcome, expected.contains_key(&test.iri)) {
         (Ok(()), false) => Tally::Passed,
         (Ok(()), true) => Tally::Listed,
-        (Err(_), true) => Tally::Known,
-        (Err(why), false) => Tally::Failed(format!("{} ({:?}): {why}", test.iri, test.kind)),
+        (Err(Failure::Wrong(_)), true) => Tally::Known,
+        (Err(why), _) => Tally::Failed(format!("{} ({:?}): {why}", test.iri, test.kind)),
     }
 }
 
