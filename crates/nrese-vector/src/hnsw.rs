@@ -13,7 +13,7 @@
 //! - **Growth**: [`Hnsw::extend`] links the vectors appended since; nothing is removed
 //!   (the engine's vectors are append-only, a query checks that a hit is still used).
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -451,24 +451,36 @@ impl Visited<'_> {
 }
 
 thread_local! {
-    static VISITED: RefCell<(Vec<u32>, u32)> = const { RefCell::new((Vec::new(), 0)) };
+    /// The thread's visited marks and their last stamp, kept between its searches.
+    static VISITED: Cell<(Vec<u32>, u32)> = const { Cell::new((Vec::new(), 0)) };
 }
 
+/// Runs `f` with visited marks for `nodes` nodes, none visited yet. The marks are taken
+/// out of the thread's for the run and put back after, so a search started inside `f` on
+/// this thread (by `accept`, or a Rayon part taken on while it waits) gets marks of its
+/// own: the thread's then hold none, and it allocates.
 fn with_visited<R>(nodes: usize, f: impl FnOnce(&mut Visited<'_>) -> R) -> R {
-    VISITED.with(|cell| {
-        let mut cell = cell.borrow_mut();
-        let (marks, stamp) = &mut *cell;
-        if marks.len() < nodes {
-            marks.resize(nodes, 0);
-        }
-        *stamp = stamp.wrapping_add(1);
-        if *stamp == 0 {
-            marks.iter_mut().for_each(|mark| *mark = 0);
-            *stamp = 1;
-        }
-        let stamp = *stamp;
-        f(&mut Visited { marks, stamp })
-    })
+    let (mut marks, mut stamp) = VISITED.take();
+    if marks.len() < nodes {
+        marks.resize(nodes, 0);
+    }
+    stamp = stamp.wrapping_add(1);
+    if stamp == 0 {
+        marks.iter_mut().for_each(|mark| *mark = 0);
+        stamp = 1;
+    }
+    let result = f(&mut Visited {
+        marks: &mut marks,
+        stamp,
+    });
+    // The larger of these marks and any a nested search put back is kept.
+    let kept = VISITED.take();
+    VISITED.set(if kept.0.len() > marks.len() {
+        kept
+    } else {
+        (marks, stamp)
+    });
+    result
 }
 
 #[cfg(test)]
