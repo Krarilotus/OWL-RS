@@ -72,6 +72,8 @@ OUT=${FLEET_OUT:-$GATE/results}
 SPARQL_DATA=${SPARQL_DATA:-$HOME/owlrs/sparql-data}
 SHARED=${NRESE_FAST_SHARED:-$HOME/owlrs/fast-data-shared}
 MAX_GB=${GATE_MAX_GB:-24}
+# The host a timed part runs on: a pinned job's (GATE_HOST), else the one the fleet placed it on.
+GATE_HOST=${GATE_HOST:-${FLEET_HOST:-}}
 # A directory the caller names relative to the launching checkout stays there: the gate runs its
 # code from a checkout of its own (below; Sol, PR #60 fix 3's sol-loop S2).
 anchored() { case $1 in /* | [A-Za-z]:[/\\]*) printf '%s' "$1" ;; *) printf '%s/%s' "$PWD" "$1" ;; esac; }
@@ -363,7 +365,7 @@ from suitekit import hosts; print(hosts.input_path("general") or "")')
   # The family's baselines: GATE_BASELINES (default base,main; an A-B-B-A of two sides: base).
   (cd "$tree" && py benches/fast/release_gate.py plan --max-gb "$MAX_GB" --min-gb "${GATE_MIN_GB:-0}" \
      --baselines "${GATE_BASELINES:-base,main}" \
-     ${GATE_BIG_GB:+--big-gb "$GATE_BIG_GB" --big-host "${GATE_BIG_HOST:-khaleesi-wsl}"} ${GATE_CASES:+--cases "$GATE_CASES"}) \
+     ${GATE_BIG_GB:+--big-gb "$GATE_BIG_GB" --big-host "${GATE_BIG_HOST:-the big part}"} ${GATE_CASES:+--cases "$GATE_CASES"}) \
     > "$GATE/plan.json.partial" && mv "$GATE/plan.json.partial" "$GATE/plan.json" \
     || { log "prepare: no plan (release_gate.py plan failed)"; exit 2; }
   cp "$GATE/plan.json" "$OUT/plan.json"

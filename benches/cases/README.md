@@ -103,6 +103,8 @@ Paths in a perf-lab result: `reason.inferred`, `reason.rounds`, `reason.p50_ms`,
 
 | What | How |
 |---|---|
+| a change timed against its base, on the fleet | `python benches/suite/abba.py run --a BASE --b CHANGE --cases A,B` or `--areas X` (`--plan`: the estimate and where it can run; [../abba/README.md](../abba/README.md)) |
+| the release gate, on the fleet | `python benches/fast/release_gate.py jobs CAND --base BASE --main MAIN --plan`, then `--submit` |
 | NRESE's measurement of cases | `python benches/fast/fast.py run --cases A,B` (Docker, or `NRESE_FAST_RUNTIME=native`) |
 | the comparators of cases | `python benches/fast/fast.py compete --cases A,B [--systems S]` |
 | a comparison of two runs | `python benches/fast/fast.py compare BASE NEW` |

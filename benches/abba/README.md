@@ -11,26 +11,44 @@ re-implements timing or statistics:
 
 ## Use
 
-1. Write a family, `benches/abba/NAME.toml`. Its format is in `abba.py`'s docstring:
-   - sides a (the base) and b (the change), as commit ids;
-   - one exclusive timing host;
-   - blocks: at least 3, in whole squares;
-   - its cases, each from benches/cases/ or of its own, each with a content check.
-2. Check it: `python benches/suite/abba.py check benches/abba/NAME.toml`. An invalid family exits 2
-   and says why.
-3. Write the jobs: `python benches/suite/abba.py jobs benches/abba/NAME.toml --out DIR`. `--host
-   H` moves every block to another exclusive host. The command writes a build job and a timed job
-   (after it). Submit both: `fleet submit DIR/*.toml`.
-4. Read the verdict: `fleet results abba-NAME-<b8>` holds abba-verdict.md, abba-verdict.json and
-   abba-exit.
-   - 0: no loss shown.
-   - 1: a loss shown. Run a confirmation round: `abba.py jobs FAMILY --round 2`, then `abba.py
-     report FAMILY R1 R2`. A round-2 job's own report alone says 3: it isn't rounds 1..2.
-   - 2: the family is invalid.
-   - 3: no verdict: evidence missing, incomplete or failed, a content check without a passing
-     result, rounds that aren't distinct runs, or an A-A' arm that itself differs. That is a failed
-     experiment, never a pass.
-   - 4: a confirmed loss (Holm over the family, the rounds combined).
+One command, nothing to commit (Git Bash, from a checkout of engine-v2):
+
+```bash
+python benches/suite/abba.py run --a <base> --b <change> --cases rl-sameas,rl-chain
+python benches/suite/abba.py run --a <base> --b <change> --areas reasoning --plan   # the plan only
+fleet wait set:abba-<name>-<b8>        # as a background task; then:
+fleet results set:abba-<name>-<b8>     # its member's results hold abba-verdict.md, .json and abba-exit
+```
+
+- The family is built from [benches/cases/](../cases/README.md) at the harness's revision (default b):
+  `--cases` by name, `--areas` every case of the area that has a content check and no declared
+  outcome. A case that isn't there goes into the registry first, reviewed; a timing never defines one.
+- The plan comes first: cases, hypotheses, blocks (from the cases' calibrated spread, at least one
+  square; `--blocks` overrides), the estimate in host-hours with its exclusive share, and `fleet
+  check`'s answer: which timing hosts can take it, and what runs or waits there now. `--plan` stops
+  there; otherwise it submits one set.
+- The job asks by capability, never a host: a Linux timing host that builds (roles measure and
+  build), the cases' memory and data (`has`). It builds A, B and the harness there first (untimed:
+  shareable), then holds the host alone for its blocks; its check records the host the fleet chose,
+  whose floor the report reads. `--host H` pins it, with its reason.
+- The family travels in the job (`ABBA_FAMILY`); `family.toml` beside the set file (default
+  `benches/suite/results/abba/NAME-B8/`, git-ignored) is the same family, for a combined report:
+  `abba.py report PATH/family.toml R1 R2`.
+- A confirmation round: the same command with `--round 2`.
+- A reviewed recurring family stays possible: `benches/abba/NAME.toml` (format in `abba.py`'s
+  docstring; cases of its own allowed there, in the registry's schema), then `abba.py jobs
+  benches/abba/NAME.toml --out DIR` and `fleet submit DIR/<set>.set.toml`. A family of registry cases
+  runs from any file; one with cases of its own must be committed, since the harness reads them there.
+
+The verdict's exit codes:
+- 0: no loss shown.
+- 1: a loss shown. Run a confirmation round (`--round 2`), then `abba.py report FAMILY R1 R2`. A
+  round-2 job's own report alone says 3: it isn't rounds 1..2.
+- 2: the family is invalid.
+- 3: no verdict: evidence missing, incomplete or failed, a content check without a passing result,
+  rounds that aren't distinct runs, or an A-A' arm that itself differs. That is a failed experiment,
+  never a pass.
+- 4: a confirmed loss (Holm over the family, the rounds combined).
 
 ## Rules
 
@@ -48,9 +66,9 @@ re-implements timing or statistics:
   - run an A' control only where no stable floor is recorded;
   - no fixed heavy layout.
 
-  Today a family's blocks are one fixed count for every case (`blocks`, at least 3). The
-  adaptive sizing (per-case looks, a target of 3 % by default) comes with harness/abba-adaptive.
-  Until then, choose `blocks` by the noisiest case you declare.
+  Today a family's blocks are one fixed count for every case (`blocks`, at least 3); `run` takes
+  it from the noisiest case's calibration (benches/fast/measure.toml). The adaptive sizing (per-case
+  looks, a target of 3 % by default) comes with harness/abba-adaptive.
 
 Don't time a change with a script of your own. Three such scripts (20 Oct 2026) failed open on
 missing runs, had no interleaved A-A' arm, or counted results instead of checking them.
