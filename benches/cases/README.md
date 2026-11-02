@@ -13,10 +13,12 @@ unique across all of them; its group is its file's name.
 | File | Group | What |
 |---|---|---|
 | `core.toml` | core | NRESE's own focused cases: every reasoning profile, maintenance, DL, memory caps, query shapes and operators, services, kernels, layout, plans (the fast suite) |
-| `sparql.toml` | sparql | the SPARQL stores on their home turf: QLever, Virtuoso, MillenniumDB, Oxigraph, Jena; Sparqloscope, BSBM, WatDiv, SP2Bench, WDBench, G-CARE |
-| `reasoning.toml` | reasoning | the rule reasoners on theirs: RDFox, GraphDB, Nemo, VLog, Soufflé; Claros, SSPE, SPB, Datalog programs, OWL2Bench RL and QL |
-| `dl.toml` | dl | the DL reasoners and OBDA on theirs: Konclude, HermiT, Openllet, ELK, PAGOdA, Ontop; ORE 2015, OWL2Bench EL and DL, NPD |
-| `breadth.toml` | breadth | SHACL, GeoSPARQL, text, RDF 1.2, federation, vectors, larger than memory |
+| `sparql.toml` | sparql | the SPARQL stores on their home turf: QLever, Virtuoso, Oxigraph, Jena; Sparqloscope, BSBM, WatDiv |
+
+A group's file exists once it has a case: the rule reasoners', the DL reasoners' and the
+breadth's home-turf benchmarks (Claros, SPB, Datalog programs; ORE 2015, OWL2Bench; SHACL,
+GeoSPARQL, vectors) run in their kits today, outside this registry. Which contender has no
+home-turf case yet: STANDINGS.md, "Home turf, per contender".
 
 A benchmark family (BSBM, WatDiv, LUBM, ...) is an entry in
 [suite/workloads.toml](../suite/workloads.toml): its source, licence, tiers and state, for
