@@ -159,6 +159,105 @@ fn a_closure_over_a_sequence_holds_its_ends_once() {
     }
 }
 
+/// Spec: as above, for the other places where the query's text multiplies what a query
+/// makes per row (notes/2026-11-02-column-budget.md CB-6, S1-S6). Over 4,096 rows, 256 of
+/// each make 32 MiB or more where each is a column or a term per row: a column per EXISTS
+/// (S1), per GROUP BY variable (S2), per LATERAL variable put in (S4), a sort key per
+/// ORDER BY expression (S3), the 256 strings a CONCAT of 256 parts interns per row (S5):
+/// more than 1 MiB, so the query fails with `MemoryLimit`. What only repeats what is there
+/// makes nothing: ORDER BY unbound variables sorts by nothing (§15.1: unbound sorts first,
+/// so all rows tie), and a closure over 256 times the same link reaches what one does
+/// (§18.4: `p+` is a set), each answered. Either way, the query's thread holds at most the
+/// limit and its bookkeeping. On the default path and as written alike.
+#[test]
+fn what_the_query_text_multiplies_draws_from_the_query_budget() {
+    let p = ex("p");
+    let engine = engine((0..ROWS).map(|i| {
+        let (subject, object) = (ex(&format!("s{i}")), ex(&format!("o{i}")));
+        Quad::new(subject, p.clone(), object, GraphName::DefaultGraph)
+    }));
+    let rows = format!("?s <{EX}p> ?o");
+    let list = |item: &dyn Fn(usize) -> String, separator: &str| {
+        (0..256).map(item).collect::<Vec<_>>().join(separator)
+    };
+    let exists = list(&|_| format!("EXISTS {{ {rows} }}"), " || ");
+    let unbound = list(&|i| format!("?u{i}"), " ");
+    let left = list(&|i| format!("?a{i}"), " ");
+    let ones = list(&|_| "1".to_owned(), " ");
+    let mentioned = list(&|i| format!("?a{i} != 0"), " && ");
+    let keys = list(&|i| format!("CONCAT(STR(?s), \"{i}\")"), " ");
+    let parts = list(&|_| "STR(?s)".to_owned(), ", ");
+    let links = list(&|_| format!("<{EX}p>"), "|");
+    let cases: [(&str, String, Option<usize>); 8] = [
+        (
+            "S1 FILTER of 256 EXISTS",
+            format!("SELECT ?s WHERE {{ {rows} FILTER({exists}) }}"),
+            None,
+        ),
+        (
+            "S1 BIND of 256 EXISTS",
+            format!("SELECT ?s WHERE {{ {rows} BIND(({exists}) AS ?b) }}"),
+            None,
+        ),
+        (
+            "S2 GROUP BY 256 unbound variables",
+            format!("SELECT ?s WHERE {{ {rows} }} GROUP BY ?s {unbound}"),
+            None,
+        ),
+        (
+            "S3 ORDER BY 256 expressions",
+            format!("SELECT ?s WHERE {{ {rows} }} ORDER BY {keys}"),
+            None,
+        ),
+        (
+            "S3 ORDER BY 256 unbound variables",
+            format!("SELECT ?s WHERE {{ {rows} }} ORDER BY {unbound}"),
+            Some(ROWS),
+        ),
+        (
+            "S4 LATERAL putting in 256 variables",
+            format!(
+                "SELECT ?s WHERE {{ VALUES ({left}) {{ ({ones}) }} \
+                 LATERAL {{ {rows} FILTER({mentioned}) }} }}"
+            ),
+            None,
+        ),
+        (
+            "S5 CONCAT of 256 parts",
+            format!("SELECT ?x WHERE {{ {rows} BIND(CONCAT({parts}) AS ?x) }}"),
+            None,
+        ),
+        (
+            "S6 closure of 256 times one link",
+            format!("SELECT ?x ?y WHERE {{ ?x ({links})+ ?y }}"),
+            Some(ROWS),
+        ),
+    ];
+    // Every case runs, and each one that fails is listed.
+    let mut failed = Vec::new();
+    for (case, query, answered) in &cases {
+        for as_written in [false, true] {
+            let (outcome, peak) = run(&engine, query, as_written);
+            let case = format!("{case}, as_written={as_written}");
+            let outcome = match outcome {
+                Err(QueryEvaluationError::MemoryLimit(_)) => None,
+                other => Some(other.map_err(|e| e.to_string())),
+            };
+            if outcome != (*answered).map(Ok) {
+                failed.push(format!(
+                    "{case}: {outcome:?}, not {answered:?} (None: the memory error)"
+                ));
+            }
+            if peak > LIMIT + BOOKKEEPING {
+                failed.push(format!(
+                    "{case}: held {peak} bytes under a {LIMIT}-byte limit"
+                ));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// Spec: a table the query holds stays charged while it lives (`Resources::memory`): the
 /// live result of a SELECT keeps at least a word a row and column charged. A projection
 /// that drops a column must release only that column's charge: the graph's column that
