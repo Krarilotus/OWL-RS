@@ -128,6 +128,8 @@ fn equality_region<B: Base + ?Sized>(
                 });
             }
         }
+        // Estimates saturate (a count over expanded equality past `u64` reads as its
+        // maximum), and so does every sum and product of them here.
         let mut class_facts = 0u64;
         for &m in &members {
             for pattern in [
@@ -135,11 +137,15 @@ fn equality_region<B: Base + ?Sized>(
                 [None, Some(m), None],
                 [None, None, Some(m)],
             ] {
-                class_facts += base.estimate(pattern) as u64;
+                class_facts = class_facts.saturating_add(base.estimate(pattern) as u64);
             }
         }
-        facts += class_facts;
-        dred += 2 * class_facts * members.len() as u64;
+        facts = facts.saturating_add(class_facts);
+        dred = dred.saturating_add(
+            class_facts
+                .saturating_mul(2)
+                .saturating_mul(members.len() as u64),
+        );
         terms.extend(members);
     }
     (!terms.is_empty()).then_some((terms, facts, dred))
@@ -168,9 +174,9 @@ pub(super) fn plan_for_equalities<B: Base + ?Sized>(
     let Some((terms, facts, dred)) = equality_region(base, same_as, equalities) else {
         return Decision::Keep;
     };
-    let recompute = RECOMPUTE_PER_FACT * facts;
-    counts.dred_estimate += dred;
-    counts.recompute_estimate += recompute;
+    let recompute = RECOMPUTE_PER_FACT.saturating_mul(facts);
+    counts.dred_estimate = counts.dred_estimate.saturating_add(dred);
+    counts.recompute_estimate = counts.recompute_estimate.saturating_add(recompute);
     match policy.force {
         Some(Plan::Dred) => Decision::Keep,
         Some(Plan::Recompute) => Decision::Recompute(terms),
