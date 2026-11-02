@@ -1307,7 +1307,8 @@ impl Dictionary {
         let mut decoded = ChargedVec::new(budget);
         let mut merged = ChargedVec::with_capacity(budget, capacity)?;
         merged.fill(capacity, |room| -> Result<(), BudgetExceeded> {
-            while let Some(&b) = base.peek() {
+            // Compared while both have entries; then the rest of either follows unread.
+            while let (Some(&b), Some(_)) = (base.peek(), rest.peek()) {
                 let b_text = super::order::text_of(inner.key_within(b, &mut decoded)?);
                 let b_text = b_text.unwrap_or_default();
                 // The others before it; equal texts: the base's (lower) index first.
@@ -1321,6 +1322,7 @@ impl Dictionary {
                 room.push(b as u32);
                 base.next();
             }
+            base.for_each(|b| room.push(b as u32));
             rest.for_each(|r| room.push(r as u32));
             Ok(())
         })??;
