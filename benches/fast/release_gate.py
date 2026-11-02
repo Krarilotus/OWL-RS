@@ -1603,8 +1603,8 @@ def checkout_rev(checkout: str, candidate: str, harness: str) -> str:
 
 
 # What a timed part asks, never a host (rule.hosts-belong-to-the-fleet; the brief of 2 Nov 2026): a
-# timing host that also builds, since each part builds its sides where it times them (untimed steps of
-# its own job, the host kept between them) and so needs no binaries staged from elsewhere.
+# timing host that also builds, since each part builds its sides where it times them (its first step,
+# the host held from there) and so needs no binaries staged from elsewhere.
 TIMING_ROLES = ["measure", "build"]
 BUILD_MIN = 25  # a revision's build, at most; one of the same identity on that host is reused
 ASSETS = "owlrs-bench-assets"
@@ -1713,7 +1713,7 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     """The gate's fleet jobs, one set: its timed part (the cases up to `max_gb`) and its big part
     (those up to `big_gb`), each one owlrs.timed job on a timing host the fleet picks by capability
     (TIMING_ROLES, Linux: ELF binaries, never native Windows; the memory; the data its cases read):
-    each builds every side and prepares the data there first (untimed steps), then times round 1's
+    each builds every side and prepares the data there first, then times round 1's
     blocks alone and reports; and the W3C suites and the guards on any test host. With `measure` the
     k-th block runs the cases needing k blocks; blocks rotate through `layouts` builds. Each job's
     `est_min` is its planned minutes (plan_minutes())."""
@@ -1730,9 +1730,10 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     revs = {"base": base, "main": main, "cand": candidate}
     revisions = list(dict.fromkeys([base, main, candidate, harness]))
     inputs = source + side_inputs(checkout, source[0]["source"]["rev"], revisions)
-    # Every build and the data's preparation in one first step, the job's one untimed (shareable)
-    # step: the fleet keeps an exclusive job's host only before an exclusive step (planner
-    # held_between_steps), so each later step is one and runs where these binaries are (Sol r1 S1).
+    # Every build and the data's preparation in one first step, exclusive like every step: the fleet
+    # keeps an exclusive job's host only before an exclusive step and while the host takes exclusive
+    # work, so the part starts only where it can time and every step runs where these binaries are
+    # (Sol r1 S1; 2 Nov 2026: an untimed first step built on a host outside its timing window).
     builds = [["bash", "-c", 'set -e; harness=$1; shift; for rev in "$@"; do bash scripts/release-gate.sh build "$rev"; '
                'done; bash scripts/release-gate.sh prepare "$harness"', "prepare", harness, *revisions]]
     # the sides timed (a main that is the base isn't timed again)
@@ -1748,7 +1749,6 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     def part(job_id: str, part_env: dict, planned: list[str], timed_steps: list[list[str]], ram_gb: float,
              block_cases: list[list[str]]) -> dict:
         steps = builds + timed_steps + report
-        untimed = [0]
         mine = [by_name[c] for c in planned if c in by_name]
         has, disk = data_needs(mine), data_disk_gb(mine)
         requires = ({"roles": TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": ram_gb} | ({"has": has} if has else {})
@@ -1757,7 +1757,7 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
         return {"id": job_id, "group": "release", "kind": "owlrs.timed", "class": "exclusive",
                 "priority_class": "merge-gate", "env": part_env, "stall_after_min": 90,
                 "est_min": round(est["total_min"]), "_plan": est,
-                "steps": steps, "untimed_steps": untimed,
+                "steps": steps,
                 # Builds ask the part's whole memory: a host too small for its blocks would end the hold
                 # after them (Sol r2 S1).
                 "step_deadline_min": BUILD_MIN * len(revisions) + 120,
@@ -1840,13 +1840,14 @@ def set_plan(found: dict[str, dict], prefix: str, candidate: str, harness: str, 
                      + f", {asks.get('os', 'any OS')}, {asks['cores']} cores, {asks['ram_gb']} GB"
                      + (f", has {'+'.join(asks['has'])}" if asks.get("has") else ""))
         total += job["est_min"]
-        exclusive += (job.get("_plan") or {}).get("timed_min", 0)
+        exclusive += job["est_min"] if timed else 0  # a timed part holds its host from its first step
     guessed = sorted({c for job in found.values() for c in (job.get("_plan") or {}).get("guessed", [])})
     if guessed:
         lines.append(f"  not calibrated (benches/fast/measure.toml at the harness), a minute a pass assumed: {len(guessed)} "
                      f"cases: {', '.join(guessed)}")
-    lines.append(f"  estimate: {total / 60:.1f} host-hours in all, about {exclusive / 60:.1f} of them a timing host "
-                 "held alone; queue time and confirmation rounds come on top")
+    lines.append(f"  estimate: {total / 60:.1f} host-hours in all, {exclusive / 60:.1f} of them timing hosts held "
+                 "alone (builds included: a build of the same identity is reused); queue time and confirmation "
+                 "rounds come on top")
     return "\n".join(lines)
 
 

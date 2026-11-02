@@ -28,9 +28,10 @@ fleet results set:abba-<name>-<b8>     # its member's results hold abba-verdict.
   check`'s answer: which timing hosts can take it, and what runs or waits there now. `--plan` stops
   there; otherwise it submits one set.
 - The job asks by capability, never a host: a Linux timing host that builds (roles measure and
-  build), the cases' memory and data (`has`). It builds A, B and the harness there first (untimed:
-  shareable), then holds the host alone for its blocks; its check records the host the fleet chose,
-  whose floor the report reads. `--host H` pins it, with its reason.
+  build), the cases' memory and data (`has`). It starts only where it can time, builds A, B and the
+  harness there first and holds that host alone to its end (the fleet keeps a timed job's host only
+  between exclusive steps, while the host takes timed work); its check records the host the fleet
+  chose, whose floor the report reads. `--host H` pins it, with its reason.
 - The family travels in the job (`ABBA_FAMILY`); `family.toml` beside the set file (default
   `benches/suite/results/abba/NAME-B8/`, git-ignored) is the same family, for a combined report:
   `abba.py report PATH/family.toml R1 R2`.
