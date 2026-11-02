@@ -8,9 +8,9 @@ file that moved or never landed sends its reader looking for nothing, or buildin
     python3 scripts/check-doc-paths.py FILE...    these files (the changed ones)
 
 Links: inline links (`[text](dest)`, `[text](<dest with spaces> "title")`) and reference
-definitions (`[label]: dest`, which reference-style links use), in blockquotes too, outside code
-spans and fenced code (a fence ends at a closer of its own character and at least its length).
-A link resolves from its document's directory only, as a renderer resolves it. Link syntax the
+definitions (`[label]: dest`, which reference-style links use), in blockquotes too. Link-shaped
+text in code spans and fenced code is checked as well (fail closed): show an example link with a
+path that exists, or a URL. A link resolves from its document's directory only, as a renderer resolves it. Link syntax the
 checker can't read (an unterminated `<`, a `](` with no closing `)`, a definition with no
 destination) fails as unsupported rather than passing unread.
 
@@ -44,8 +44,6 @@ TOP = ("scripts/", "docs/", "crates/", "benches/", "apps/", "tests/", "fixtures/
        ".githooks/", ".github/", "fuzz/", ".claude/")
 SKIPPED_DIRS = ("literature/", "fixtures/")
 TICK = re.compile(r"`([^`\n]+)`(\])?")
-CODE_SPAN = re.compile(r"(`+)(?:(?!\1).)+?\1")
-FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 QUOTE = re.compile(r"^ {0,3}> ?")
 DEFINITION = re.compile(r"^ {0,3}\[([^\]^][^\]]*)\]:(.*)$")
 TITLE = re.compile(r"\s*(?:\"[^\"]*\"|'[^']*'|\([^)]*\))?\s*$")
@@ -138,12 +136,8 @@ def closes(rest):
 
 
 def inline_links(line):
-    """Each inline link's destination on LINE, UNSUPPORTED where unreadable. A `](` inside a code
-    span isn't a link; backticks in a destination are part of it."""
-    spans = [m.span() for m in CODE_SPAN.finditer(line)]
+    """Each inline link's destination on LINE, UNSUPPORTED where unreadable."""
     for m in re.finditer(r"\]\(", line):
-        if any(start <= m.start() < end for start, end in spans):
-            continue
         dest, rest = destination(line[m.end():])
         if dest is UNSUPPORTED or not closes(rest):
             yield UNSUPPORTED
@@ -152,22 +146,12 @@ def inline_links(line):
 
 
 def links(lines):
-    """(line number, destination) of every link: inline links and reference definitions, inside
-    blockquotes too; none inside fenced code (a fence ends at a closer of its own character, at
-    least its length, with nothing after it)."""
-    fence = None
+    """(line number, destination) of every link-shaped text: inline links and reference
+    definitions, inside blockquotes too. Code isn't told apart (fail closed): guessing where a fence
+    or code span ends is how a real link went unread."""
     for no, line in enumerate(lines, 1):
         while QUOTE.match(line):
             line = QUOTE.sub("", line, count=1)
-        opened = FENCE.match(line)
-        if fence:
-            if opened and opened.group(1)[0] == fence[0] and len(opened.group(1)) >= len(fence) \
-                    and not opened.group(2).strip():
-                fence = None
-            continue
-        if opened and not (opened.group(1)[0] == "`" and "`" in opened.group(2)):
-            fence = opened.group(1)
-            continue
         definition = DEFINITION.match(line)
         if definition:
             dest, rest = destination(definition.group(2))
