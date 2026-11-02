@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use argon2::Argon2;
@@ -216,21 +216,23 @@ impl Default for Argon2Gate {
     }
 }
 
-/// The hash a user name without a login is checked against: the work of a check, which
-/// no password passes in practice (made from random bytes).
-fn dummy_hash() -> &'static str {
-    static DUMMY: OnceLock<String> = OnceLock::new();
-    DUMMY.get_or_init(|| {
-        let mut bytes = [0u8; 32];
-        // Without randomness, zeros: it only has to cost what a check costs.
-        let _ = getrandom::fill(&mut bytes);
-        let text: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        hash_password(&text).unwrap_or_default()
-    })
+/// The hash a user name without a login is checked against: a PHC string with
+/// [`hash_password`]'s algorithm and parameters, so checking it is the work of a check,
+/// and a random salt and output, which no known password was hashed to. Fixed, so no
+/// login makes it first (that extra hash told a missing name from a wrong password,
+/// PR #80 review R80-1).
+const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$8JmJzvxTKI3MtmVdVMLZEQ$raTfQ5S6+jmfK261pBbtAolYcPmAsCVPGL/guuFDyx8";
+
+#[cfg(test)]
+thread_local! {
+    /// Argon2 runs on this thread so far, (hashes, checks): the work a test sees a login do.
+    static ARGON2_RUNS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// The PHC string of `password` (Argon2id, a random salt).
 pub fn hash_password(password: &str) -> Result<String, AccessError> {
+    #[cfg(test)]
+    ARGON2_RUNS.with(|runs| runs.set((runs.get().0 + 1, runs.get().1)));
     Argon2::default()
         .hash_password(password.as_bytes())
         .map(|hash| hash.to_string())
@@ -239,6 +241,8 @@ pub fn hash_password(password: &str) -> Result<String, AccessError> {
 
 /// Whether `password` is the one `hash` (a PHC string) was made from.
 pub fn verify_password(password: &str, hash: &str) -> bool {
+    #[cfg(test)]
+    ARGON2_RUNS.with(|runs| runs.set((runs.get().0, runs.get().1 + 1)));
     PasswordHash::new(hash).is_ok_and(|parsed| {
         Argon2::default()
             .verify_password(password.as_bytes(), &parsed)
@@ -348,7 +352,7 @@ impl Logins {
         }
         let Some(hash) = state.users.get(user).and_then(|u| u.password_hash.clone()) else {
             // As long as a wrong password takes.
-            self.hashing(|| (self.verify.0)(password, dummy_hash()))?;
+            self.hashing(|| (self.verify.0)(password, DUMMY_HASH))?;
             self.failed(&pair);
             return Err(refused());
         };
@@ -526,6 +530,130 @@ mod tests {
         assert!(again.is_ok(), "{again:?}");
     }
 
+    /// The variable that marks the child [`in_a_process_of_its_own`] starts: its test's name.
+    const OWN_PROCESS: &str = "NRESE_LOGIN_TEST_OWN_PROCESS";
+
+    /// How long that child may run: far past its few Argon2 runs, unoptimised and on a busy
+    /// machine.
+    const OWN_PROCESS_DEADLINE: Duration = Duration::from_secs(600);
+
+    /// Whether the calling test runs in a process of its own, where no other test ran before
+    /// it: only in the child this starts. Elsewhere it runs the test again, alone, in a child
+    /// of this test binary, fails if it failed there (printing what it printed) and returns
+    /// false: the caller returns. A child still running at [`OWN_PROCESS_DEADLINE`] is
+    /// stopped, and the test fails. For a test of what a process does first: in the test
+    /// binary's own process, another test may have done it already (PR #86 review R86-N1).
+    /// [`nrese_exec::measure::alone`] does the same for measurements, in binaries that measure.
+    fn in_a_process_of_its_own() -> bool {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        // Both pipes are read as the child writes, or a child that fills one would wait for it.
+        fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                pipe.read_to_end(&mut bytes)
+                    .expect("the child's output reads");
+                String::from_utf8_lossy(&bytes).into_owned()
+            })
+        }
+        let current = std::thread::current();
+        let test = current.name().expect("a test thread, named after its test");
+        let alone = [test, "--exact", "--test-threads=1", "--nocapture"];
+        // The child this starts: the marker names this test, and the process was started with
+        // exactly the arguments that run it alone. A marker inherited by a run of other
+        // arguments, a whole suite, is no such child (PR #86 fix check R86-FC1).
+        if std::env::var(OWN_PROCESS).is_ok_and(|marked| marked == test)
+            && std::env::args_os().skip(1).eq(alone)
+        {
+            return true;
+        }
+        let started = Instant::now();
+        let mut child = Command::new(std::env::current_exe().expect("the test binary"))
+            .args(alone)
+            .env(OWN_PROCESS, test)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the test binary runs");
+        let stdout = drain(child.stdout.take().expect("piped"));
+        let stderr = drain(child.stderr.take().expect("piped"));
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("the child's state") {
+                break Some(status);
+            }
+            if started.elapsed() >= OWN_PROCESS_DEADLINE {
+                child.kill().expect("the child stops");
+                child.wait().expect("the stopped child is waited for");
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let stdout = stdout.join().expect("the child's output");
+        let stderr = stderr.join().expect("the child's output");
+        eprint!("{stdout}{stderr}");
+        let Some(status) = status else {
+            panic!(
+                "{test}, in a process of its own ({}), passed its deadline of {} s: stopped",
+                child.id(),
+                OWN_PROCESS_DEADLINE.as_secs()
+            );
+        };
+        // Exactly this test ran there, and passed: a name that matched none would pass too.
+        assert!(
+            status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{test}, in a process of its own ({}), failed: {status}",
+            child.id()
+        );
+        false
+    }
+
+    /// A fresh service's first refusal of a name without a login does the work of a wrong
+    /// password, and no more: no hash, and one check against a hash of the same algorithm,
+    /// parameters and lengths (R80-1: that first refusal made the dummy hash, a hash more).
+    /// Work, not time. In a process of its own: work done once per process, as that dummy
+    /// hash was, may have been done by another test in this one first (R86-N1).
+    #[test]
+    fn a_missing_name_s_first_refusal_does_a_wrong_password_s_work() {
+        if !in_a_process_of_its_own() {
+            return;
+        }
+        let state = state();
+        let fresh = logins(1, Duration::from_secs(600));
+        let runs = |login: &dyn Fn() -> Result<Principal, AccessError>| {
+            let before = ARGON2_RUNS.with(std::cell::Cell::get);
+            let refused = login();
+            assert!(
+                matches!(refused, Err(AccessError::Forbidden(_))),
+                "{refused:?}"
+            );
+            let after = ARGON2_RUNS.with(std::cell::Cell::get);
+            (after.0 - before.0, after.1 - before.1)
+        };
+        let missing = runs(&|| fresh.login(&state, "mallory", PASSWORD, None));
+        let wrong = runs(&|| fresh.login(&state, "alice", "wrong", None));
+        assert_eq!(missing, (0, 1), "(hashes, checks) of the missing name");
+        assert_eq!(
+            missing, wrong,
+            "(hashes, checks): missing name, wrong password"
+        );
+        let shape = |phc: &str| -> Vec<String> {
+            phc.split('$')
+                .enumerate()
+                .map(|(at, part)| match at {
+                    0..4 => part.to_owned(),
+                    _ => part.len().to_string(),
+                })
+                .collect()
+        };
+        let alice = state.users["alice"].password_hash.clone().unwrap();
+        assert_eq!(shape(DUMMY_HASH), shape(&alice));
+        assert!(
+            PasswordHash::new(DUMMY_HASH).is_ok(),
+            "the check runs Argon2"
+        );
+    }
+
     thread_local! {
         /// The checks [`recording`] made on this thread: password and hash.
         static CHECKED: std::cell::RefCell<Vec<(String, String)>> = Default::default();
@@ -580,11 +708,11 @@ mod tests {
         assert_eq!(checked(), guess(&user_hash), "alice");
         for user in ["nobody", "bob"] {
             assert_eq!(refusal(user), wrong_password);
-            assert_eq!(checked(), guess(dummy_hash()), "{user}");
+            assert_eq!(checked(), guess(DUMMY_HASH), "{user}");
         }
         // A PHC string's algorithm, version and parameters: all but its salt and hash.
         let cost = |phc: &str| phc.rsplitn(3, '$').nth(2).map(str::to_owned);
-        assert_eq!(cost(dummy_hash()), cost(&user_hash));
+        assert_eq!(cost(DUMMY_HASH), cost(&user_hash));
         assert!(cost(&user_hash).is_some_and(|c| c.starts_with("$argon2id$")));
     }
 
