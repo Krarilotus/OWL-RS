@@ -1,4 +1,5 @@
-# Paths the docs name on purpose although they don't exist (scripts/check-doc-paths.py).
+# Paths the docs mention (in backticks) on purpose although they don't exist
+# (scripts/check-doc-paths.py). Mentions only: a clickable link to a missing file always fails.
 # One per line: DOC TARGET  # why. Remove a line when its reason ends.
 
 docs/STATUS.md ops/fuseki/  # named as removed (A1)
