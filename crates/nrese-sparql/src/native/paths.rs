@@ -191,6 +191,63 @@ impl<T: Copy + Eq + std::hash::Hash> Tally<T> {
     }
 }
 
+/// A sequence step's ends: pushed as they come, a copy each, unless the step can multiply
+/// the ways through a node by the path's text ([`multiplies_ways`]) or what it starts from
+/// is counted already; then each end once with how many ways ([`Tally`]). A step that
+/// meets counted ways after all starts counting there. Counting hashes every end: a plain
+/// sequence (`author/city`) needs none of it (the executor memory stack's timing: x1.56).
+enum Ends<T> {
+    Copies(Vec<T>),
+    Counted(Tally<T>),
+}
+
+impl<T: Copy + Eq + std::hash::Hash> Ends<T> {
+    fn new(counted: bool) -> Self {
+        match counted {
+            true => Self::Counted(Tally::new()),
+            false => Self::Copies(Vec::new()),
+        }
+    }
+
+    fn add(&mut self, value: T, copies: usize) {
+        match self {
+            Self::Copies(values) if copies == 1 => values.push(value),
+            Self::Copies(values) => {
+                let mut tally = Tally::new();
+                for &value in values.iter() {
+                    tally.add(value, 1);
+                }
+                tally.add(value, copies);
+                *self = Self::Counted(tally);
+            }
+            Self::Counted(tally) => tally.add(value, copies),
+        }
+    }
+
+    fn finish(self) -> Bag<T> {
+        match self {
+            Self::Copies(values) => Bag::Copies(values),
+            Self::Counted(tally) => tally.finish(),
+        }
+    }
+}
+
+/// Whether following `path` can give an end more copies than the data's ways to it: an
+/// alternative of two or more arms (its arms may reach the same end, or be the same arm),
+/// anywhere but inside a closure or `?`, whose ends are a set.
+fn multiplies_ways(path: &Path) -> bool {
+    match path {
+        Path::Alternative(paths) => paths.len() > 1 || paths.iter().any(multiplies_ways),
+        Path::Sequence(steps) => steps.iter().any(multiplies_ways),
+        Path::Reverse(path) => multiplies_ways(path),
+        Path::Link(_)
+        | Path::Negated(_)
+        | Path::ZeroOrMore(_)
+        | Path::OneOrMore(_)
+        | Path::ZeroOrOne(_) => false,
+    }
+}
+
 /// The graph a path is followed in.
 #[derive(Clone, Copy)]
 pub(crate) enum PathGraph<'a> {
@@ -471,7 +528,7 @@ impl PathEvaluator<'_> {
             if nodes.is_empty() {
                 break;
             }
-            let mut next = Tally::new();
+            let mut next = Ends::new(matches!(nodes, Bag::Counted(_)) || multiplies_ways(step));
             for (m, ways) in nodes.counted() {
                 if self.stopped() {
                     break;
@@ -727,7 +784,8 @@ impl PathEvaluator<'_> {
                 // Each pair once with how many ways through, step by step (`through`).
                 let mut pairs = self.open(first);
                 for step in rest {
-                    let mut next = Tally::new();
+                    let counted = matches!(pairs, Bag::Counted(_)) || multiplies_ways(step);
+                    let mut next = Ends::new(counted);
                     for ((s, m), ways) in pairs.counted() {
                         if self.stopped() {
                             break;
@@ -941,5 +999,51 @@ mod tests {
             pairs(evaluator.open(&plus)),
             pairs(Bag::Copies(vec![(a, a), (a, c), (b, b)]))
         );
+    }
+
+    /// Guard (the executor memory stack's timing, notes/2026-11-02-exec-memory-stack.md
+    /// EMS-11: counting every sequence's ends cost path alternatives x1.56): a sequence counts
+    /// the ways through a node only where a step can multiply them by the path's text (an
+    /// alternative) or its input is counted. A plain sequence keeps its ends as copies, from
+    /// a node and for every pair, and so does an alternative of plain sequences; a sequence
+    /// with an alternative step counts.
+    #[test]
+    fn only_a_step_that_can_multiply_ways_counts_them() {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let [a, b, c, p, q] = ["a", "b", "c", "p", "q"]
+            .map(|name| NamedNode::new_unchecked(format!("http://e/{name}")));
+        let mut tx = engine.transaction();
+        for (s, pr, o) in [(&a, &p, &b), (&a, &q, &b), (&b, &p, &a), (&b, &p, &c)] {
+            let quad = Quad::new(s.clone(), pr.clone(), o.clone(), GraphName::DefaultGraph);
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let link = |n: &NamedNode| PropertyPathExpression::NamedNode(n.clone());
+        let plain = PropertyPathExpression::Sequence(vec![link(&p), link(&p)]);
+        let either = PropertyPathExpression::Alternative(vec![
+            plain.clone(),
+            PropertyPathExpression::Sequence(vec![link(&q), link(&p)]),
+        ]);
+        let stepped = PropertyPathExpression::Sequence(vec![
+            link(&p),
+            PropertyPathExpression::Alternative(vec![link(&p), link(&q)]),
+        ]);
+        let [plain, either, stepped] =
+            [plain, either, stepped].map(|path| Path::resolve(&path, &snapshot));
+        let evaluator = PathEvaluator {
+            snapshot: &snapshot,
+            model: ReadModel::default(),
+            graph: PathGraph::Default,
+            fixed: None,
+            cancellation: None,
+            closures: Default::default(),
+        };
+        let a = snapshot.lookup(a.as_ref().into()).unwrap().raw();
+        assert!(matches!(evaluator.from(&plain, a), Bag::Copies(_)));
+        assert!(matches!(evaluator.open(&plain), Bag::Copies(_)));
+        assert!(matches!(evaluator.open(&either), Bag::Copies(_)));
+        assert!(matches!(evaluator.from(&stepped, a), Bag::Counted(_)));
+        assert!(matches!(evaluator.open(&stepped), Bag::Counted(_)));
     }
 }
