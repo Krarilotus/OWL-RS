@@ -19,6 +19,7 @@ Each subcommand exits 0 only when its part passes; `verdict` only when every par
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -144,6 +145,25 @@ def schedule_errors(passes: list[dict], sides: list[str], min_blocks: int,
             if counts and max(counts.values()) - min(counts.get(k, 0) for k in want) > 1:
                 errors.append(f"{case}: layouts unevenly covered {dict(sorted(counts.items()))}")
     return errors
+
+
+def fleet_host_errors(passes: list[dict], host: str) -> list[str]:
+    """Why the passes can't be judged as `host`'s, the fleet host the round names (an A-B-B-A's
+    manifest, a timed part's report context), whose floor its verdict reads: a pass from another
+    fleet host, or one that doesn't say (manifest.machine() `fleet_host`). Review r1 R1-F1: the
+    fleet may move a timed job between steps when a host's timing window closes, and passes timed
+    elsewhere were judged by the first host's floor, "no loss shown". No host named: nothing to
+    hold them to (a run outside a fleet job)."""
+    if not host:
+        return []
+    found = [(p["report"].get("machine") or {}).get("fleet_host") for p in passes]
+    out = []
+    if unsaid := sum(1 for h in found if not h):
+        out.append(f"{unsaid} passes don't say which fleet host ran them (machine.fleet_host): not judged as {host}'s")
+    if elsewhere := sorted({h for h in found if h and h != host}):
+        out.append(f"passes ran on {', '.join(elsewhere)}, not on {host}, the host the round names and whose floor "
+                   "it reads: a job moved between hosts has no verdict")
+    return out
 
 
 def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, planned: list[str]) -> list[str]:
@@ -795,6 +815,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     planned = sorted({c for p in passes for c in p["report"].get("planned_cases", [])})
     summary["planned"] = planned
     summary["errors"] += provenance_errors(passes, sides, harness, planned)
+    summary["errors"] += fleet_host_errors(passes, str(context.get("host") or ""))
     host_errors, summary["host_notes"] = host_states(passes)
     summary["errors"] += host_errors
     summary["host"] = sorted({(p["report"].get("machine") or {}).get("host") for p in passes}, key=str)
@@ -1657,69 +1678,126 @@ def data_disk_gb(cases: list[dict], datasets: Path = ROOT / "benches" / "dataset
     return math.ceil(2 * sum(d.get("bytes", 0) for d in made) / 1e9)
 
 
-def data_state(cases: list[dict], make: bool = False, root: Path = ROOT,
+def query_set_problems(directory: Path, pinned: dict[str, str]) -> list[str]:
+    """Why the query set in `directory` isn't its pins (empty: it is): every pinned file, by exact
+    name, with its SHA-256, and no other .rq file (review r1 R1-F2: a count of files passed a set of
+    wrong contents, or of other names)."""
+    if not directory.is_dir():
+        return [f"no {directory}"]
+    have = {p.name: p for p in directory.glob("*.rq")}
+    out = []
+    if missing := sorted(set(pinned) - set(have)):
+        out.append(f"{len(missing)} pinned files missing (e.g. {missing[0]})")
+    if extra := sorted(set(have) - set(pinned)):
+        out.append(f"{len(extra)} files not pinned (e.g. {extra[0]})")
+    wrong = sorted(n for n in set(pinned) & set(have)
+                   if hashlib.sha256(have[n].read_bytes()).hexdigest() != pinned[n])
+    if wrong:
+        out.append(f"{len(wrong)} files differ from their SHA-256 pins (e.g. {wrong[0]})")
+    return out
+
+
+def data_state(cases: list[dict], make: bool = False, root: Path | None = None,
                inputs_repo: Path | None = None) -> tuple[list[str], bool]:
-    """What this host holds of the cases' frozen inputs (the probe; release-gate.sh prepare runs it
-    with `make`): each file in the bench assets (hosts.toml inputs.general) or the SPARQL data cache,
-    by its frozen size; with `make`, a missing file benches/sparql/prepare.sh makes is made into the
-    cache first (its SHA-256 is prepare's check). Each generated query set (@NAME) against its pins:
-    WatDiv's generator seeds from the clock, so a missing set can't be made again, only copied from
-    a host holding the pinned files. Lines, and whether everything is there."""
+    """What this host holds of the cases' frozen inputs, and whether all of it is as pinned: the
+    one validator of query sets, which release-gate.sh prepare runs with `make` and stops on.
+    - Datasets: each file in the bench assets (hosts.toml inputs.general) or the SPARQL data cache;
+      with `make`, one benches/sparql/prepare.sh makes is made into the cache first, its failure
+      failing the data. Their one gate is prepare's freeze check (their SHA-256), which links and
+      converts them: here the probe reports a size other than the frozen one, and with `make` leaves
+      the verdict to that check (one validator each, not two; review r1).
+    - Query sets (@watdiv...): exact pinned names and SHA-256 (benches/sparql/queries.sha256), in the
+      cache and as delivered. WatDiv's generator seeds from the clock, so a set that isn't its pins
+      comes from the private bench-inputs repository's commit, a git input of the job
+      (BENCH_INPUTS_REV): extracted aside, checked, and only then put in place; a delivery that
+      isn't the pins fails and leaves the cache as it was.
+    Lines, and whether everything is there and as pinned."""
     import subprocess
-    frozen = {d["file"]: d for d in tomllib.loads((root / "benches/datasets.toml").read_text(encoding="utf-8"))["dataset"]}
+    root = root or ROOT
     general, cache = hosts_registry.input_path("general"), sparql_data()
     files = sorted({f for c in cases for f in volume_files(c)})  # a concatenation's parts too (Sol r2 T2)
+    entries = frozen(set(files), root / "benches" / "datasets.toml")
     lines, ok = [], True
     for name in files:
-        entry = frozen.get(name, {})
+        entry = entries.get(name, {})
         found = next((d / name for d in (general, cache) if d and (d / name).is_file()), None)
         if found is None and make and SPARQL_PREPARE in entry.get("made_by", ""):
             dataset = entry["made_by"].split(SPARQL_PREPARE, 1)[1].split()
             done = subprocess.run(["bash", str(root / SPARQL_PREPARE), *dataset, "--out", str(cache)], cwd=root)
             lines.append(f"made {name} ({' '.join(dataset)}): exit {done.returncode}")
+            if done.returncode != 0:
+                ok = False
             found = cache / name if (cache / name).is_file() else None
         if found is None:
             ok = False
             how = (f"made by `{entry['made_by']}`" if entry.get("made_by") else "no recorded maker")
             lines.append(f"MISSING {name}: {how}")
         elif entry.get("bytes") and found.stat().st_size != entry["bytes"]:
-            ok = False
-            lines.append(f"DIFFERS {name}: {found} is {found.stat().st_size} bytes, frozen {entry['bytes']}")
+            # The probe's diagnosis; in prepare (`make`), the freeze check that follows refuses it by
+            # its SHA-256, the datasets' one gate, so this step doesn't second-guess it.
+            ok = ok and make
+            lines.append(f"DIFFERS {name}: {found} is {found.stat().st_size} bytes, frozen {entry['bytes']}"
+                         + (" (prepare's freeze check decides)" if make else ""))
         else:
-            lines.append(f"held {name}: {found}")
-    pins = (root / "benches/sparql/queries.sha256").read_text(encoding="utf-8").splitlines() \
-        if (root / "benches/sparql/queries.sha256").is_file() else []
+            lines.append(f"present {name}: {found}, its frozen size (prepare checks its SHA-256)")
+    pin_file = root / "benches/sparql/queries.sha256"
+    pins = [line.split("  ", 1) for line in (pin_file.read_text(encoding="utf-8").splitlines()
+                                             if pin_file.is_file() else []) if "  " in line]
+    rev = os.environ.get("BENCH_INPUTS_REV", "")
     for qset in sorted({c["queries"][1:] for c in cases if str(c.get("queries", "")).startswith("@watdiv")}):
-        want = sum(1 for p in pins if p.split("  ", 1)[-1].startswith(f"{qset}/"))
-        have = len(list((cache / "queries" / qset).glob("*.rq"))) if (cache / "queries" / qset).is_dir() else 0
-        rev = os.environ.get("BENCH_INPUTS_REV", "")
-        if have != want and make and rev:
-            # The private input repository's commit, a git input of the job: the fleet pushes it into the
-            # host's repository, which the job's checkout reads (only the first git input is checked
-            # out), so the set comes out by `git archive`; prepare checks the pins after.
-            import io
-            import shutil
-            import tarfile
-            target = cache / "queries" / qset
-            done = subprocess.run(["git", "-C", str(inputs_repo or root), "archive", "--format=tar", rev, f"queries/{qset}"],
-                                  capture_output=True, timeout=300)
-            if done.returncode == 0:
-                shutil.rmtree(target, ignore_errors=True)
-                with tarfile.open(fileobj=io.BytesIO(done.stdout)) as archive:
-                    archive.extractall(cache, filter="data")
-                have = len(list(target.glob("*.rq")))
-                lines.append(f"copied query set {qset} from the bench inputs ({rev[:12]}): {have} files")
-            else:
-                lines.append(f"FAILED copying query set {qset} from the bench inputs ({rev[:12]}): "
-                             f"{done.stderr.decode(errors='replace').strip()[-200:]}")
-        if have == want and want:
-            lines.append(f"held query set {qset}: {have} files (prepare checks their pins)")
-        else:
+        pinned = {name.split("/", 1)[1]: sha for sha, name in pins if name.startswith(f"{qset}/")}
+        target = cache / "queries" / qset
+        if not pinned:
             ok = False
-            lines.append(f"MISSING query set {qset}: {have} of {want} pinned files; generated with a clock seed, it "
-                         f"can't be made again: it comes from the bench inputs repository (benches/hosts.toml "
-                         f"[sources]), a git input of the job ({'BENCH_INPUTS_REV ' + rev[:12] if rev else 'none given'})")
+            lines.append(f"MISSING pins for query set {qset} in {pin_file}")
+            continue
+        problems = query_set_problems(target, pinned)
+        if problems and make and rev:
+            problems = extract_query_set(qset, rev, inputs_repo or root, cache, pinned, lines)
+        if problems:
+            ok = False
+            lines.append(f"MISSING query set {qset}: {'; '.join(problems)}. Generated with a clock seed, it can't be "
+                         f"made again: it comes from the bench inputs repository (benches/hosts.toml [sources]), a "
+                         f"git input of the job ({'BENCH_INPUTS_REV ' + rev[:12] if rev else 'none given'})")
+        else:
+            lines.append(f"held query set {qset}: {len(pinned)} files, each as pinned")
     return lines, ok
+
+
+def extract_query_set(qset: str, rev: str, repo: Path, cache: Path, pinned: dict[str, str],
+                      lines: list[str]) -> list[str]:
+    """The query set `qset` out of the bench-inputs commit `rev` (in `repo`, where the fleet pushed
+    it) by `git archive`, into a directory aside, checked against its pins, and only then in place
+    of the cache's. Its problems (empty: in place); a delivery that isn't the pins leaves the cache
+    as it was."""
+    import io
+    import shutil
+    import subprocess
+    import tarfile
+    import tempfile
+    done = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", rev, f"queries/{qset}"],
+                          capture_output=True, timeout=300)
+    if done.returncode != 0:
+        why = done.stderr.decode(errors="replace").strip()[-200:]
+        lines.append(f"FAILED taking query set {qset} from the bench inputs ({rev[:12]}): {why}")
+        return [f"not in the bench inputs at {rev[:12]}"]
+    (cache / "queries").mkdir(parents=True, exist_ok=True)
+    aside = Path(tempfile.mkdtemp(prefix=f".{qset}-", dir=cache / "queries"))
+    try:
+        with tarfile.open(fileobj=io.BytesIO(done.stdout)) as archive:
+            archive.extractall(aside, filter="data")
+        delivered = aside / "queries" / qset
+        if problems := query_set_problems(delivered, pinned):
+            lines.append(f"FAILED: the bench inputs at {rev[:12]} deliver a query set {qset} that isn't its pins: "
+                         + "; ".join(problems))
+            return [f"the bench inputs at {rev[:12]} aren't its pins"]
+        target = cache / "queries" / qset
+        shutil.rmtree(target, ignore_errors=True)
+        delivered.rename(target)
+        lines.append(f"copied query set {qset} from the bench inputs ({rev[:12]}): {len(pinned)} files, each as pinned")
+        return []
+    finally:
+        shutil.rmtree(aside, ignore_errors=True)
 
 
 BENCH_INPUTS_INPUT = "BENCH_INPUTS"
@@ -1764,7 +1842,14 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     selection = cases.split(",") if cases else None
     run, _, elsewhere = plan(catalog, max_gb, selection, 0, big_gb)
     by_name = {c["name"]: c for c in catalog}
-    env = {"GATE_NAME": f"gate-v2-{candidate[:8]}", "GATE_MAX_GB": str(max_gb), "NRESE_QUIET_SLOT": "0",
+    # Each part's mutable gate state (release-gate.sh GATE: its plan, data view, passes) is the
+    # request's and the part's own: placed by capability, two requests at one candidate, or a part and
+    # the checks, may meet on one host (review r1 R1-F3). The shared binaries and data caches stay
+    # shared (GATE_BIN, SPARQL_DATA).
+    request = json.dumps([candidate, harness, base, main, cases, blocks_per_round, max_gb, big_gb, layouts, batch,
+                          prefix])
+    gate_name = f"gate-v2-{candidate[:8]}-{hashlib.sha256(request.encode()).hexdigest()[:8]}"
+    env = {"GATE_NAME": gate_name, "GATE_MAX_GB": str(max_gb), "NRESE_QUIET_SLOT": "0",
            "GATE_MIN_BLOCKS": str(blocks_per_round), **({"GATE_CASES": cases} if cases else {}),
            **({"GATE_BIG_GB": str(big_gb)} if big_gb else {}),
            **({"GATE_BATCH": "1"} if batch else {}), **({"GATE_LAYOUTS": str(layouts)} if layouts > 1 else {})}
@@ -1815,12 +1900,13 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
         timed_steps.append(block_step(gate_, k, harness, block_layout(k, layouts),
                                       f"plan-block-{k}.json" if measure else None, revs))
         block_cases.append([c for c in run if not measure or k == 1 or need.get(c, blocks_per_round) >= k])
-    out = {f"{prefix}-timed": part(f"{prefix}-timed", {**env, "GATE_PREFIX": prefix, "GATE_RAM_GB": str(max_gb)},
+    out = {f"{prefix}-timed": part(f"{prefix}-timed", {**env, "GATE_NAME": f"{gate_name}-timed", "GATE_PREFIX": prefix,
+                                                           "GATE_RAM_GB": str(max_gb)},
                                    run, timed_steps, max_gb, block_cases)}
     if big_gb and elsewhere:
         # Its own gate directory (GATE_NAME): placed by capability it may share a host with the timed
         # part, whose plan and passes would be overwritten (Sol r1 S3); a confirmation keeps it.
-        big_env = {**env, "GATE_MIN_GB": str(max_gb), "GATE_MAX_GB": str(big_gb), "GATE_NAME": f"{env['GATE_NAME']}-big",
+        big_env = {**env, "GATE_MIN_GB": str(max_gb), "GATE_MAX_GB": str(big_gb), "GATE_NAME": f"{gate_name}-big",
                    "GATE_PREFIX": f"{prefix}-big", "GATE_RAM_GB": str(big_gb + 4)}
         big_env.pop("GATE_BIG_GB")
         big = sorted(elsewhere)
@@ -1831,7 +1917,7 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     if checks:
         out[f"{prefix}-checks"] = {
             "id": f"{prefix}-checks", "group": "release", "kind": "owlrs.any", "priority_class": "merge-gate",
-            "est_min": 100, "env": {**env, "CARGO_BUILD_JOBS": "16"},
+            "est_min": 100, "env": {**env, "GATE_NAME": f"{gate_name}-checks", "CARGO_BUILD_JOBS": "16"},
             "steps": [[*gate_, "w3c"], [*gate_, "guards"], [*gate_, "clean"]],
             "requires": {"roles": ["test"], "os": "linux", "cores": 16, "ram_gb": 12},
             "inputs": [{"name": "checkout", "source": {"git": checkout, "rev": candidate}}]}

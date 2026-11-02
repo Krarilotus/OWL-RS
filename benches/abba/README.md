@@ -31,7 +31,11 @@ fleet results set:abba-<name>-<b8>     # its member's results hold abba-verdict.
   build), the cases' memory and data (`has`). It starts only where it can time, builds A, B and the
   harness there first and holds that host alone to its end (the fleet keeps a timed job's host only
   between exclusive steps, while the host takes timed work); its check records the host the fleet
-  chose, whose floor the report reads. `--host H` pins it, with its reason.
+  chose, whose floor the report reads, and every pass records the fleet host it ran on: a round
+  whose passes ran elsewhere (the fleet moved the job when a window closed) has no verdict.
+  `--host H` pins it, with its reason.
+- The family's cases are the declared harness's registry, in the plan, the job's check and the
+  report alike: a case the harness doesn't have is refused before anything is timed.
 - The family travels in the job (`ABBA_FAMILY`); `family.toml` beside the set file (default
   `benches/suite/results/abba/NAME-B8/`, git-ignored) is the same family, for a combined report:
   `abba.py report PATH/family.toml R1 R2`.

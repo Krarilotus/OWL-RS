@@ -77,15 +77,18 @@ class Abba(unittest.TestCase):
     def load(self):
         return abba.load_family(self.path, self.repo)
 
-    def round_(self, records_of, name="r1", drop=lambda p: False, manifest=True, host="phuoc-yu", k=1):
-        """Round k's results as its job leaves them: the manifest of its check, its passes (after
-        round k - 1's)."""
+    def round_(self, records_of, name="r1", drop=lambda p: False, manifest=True, host="phuoc-yu", k=1,
+               ran_on=None):
+        """Round k's results as its job leaves them: the manifest of its check, naming `host`, its
+        passes (after round k - 1's), run on `ran_on` (default: that host; None in it: unsaid)."""
         out = Path(self.tmp.name) / name
         (out / "passes").mkdir(parents=True)
         for p in fixture.passes(records_of, blocks=6, sides=abba.SIDES):
             later = (k - 1) * 10 ** 9
             for item in [p["report"], *p["report"]["records"]]:
                 item.update(started_ns=item["started_ns"] + later, finished_ns=item["finished_ns"] + later)
+            machine = {**p["report"]["machine"], "fleet_host": host if ran_on is None else ran_on(p)}
+            p["report"]["machine"] = {k_: v for k_, v in machine.items() if v is not None}
             if not drop(p):
                 (out / "passes" / p["path"]).write_text(json.dumps(p["report"]), encoding="utf-8")
         if manifest:
@@ -115,6 +118,26 @@ class Abba(unittest.TestCase):
         self.assertIn("the A-A' arm itself differs", text)
         # The order of a block: A A' B B A' A (or mirrored), every case.
         self.assertEqual([s for s, _ in fixture.fast.palindrome(list(abba.SIDES), 1)], ["a", "a2", "b", "b", "a2", "a"])
+
+    def test_passes_from_another_fleet_host_than_the_manifest_s_have_no_verdict(self):
+        """Review r1 R1-F1 (HOST_IDENTITY): passes all timed on phuoc-yu, a manifest naming
+        office-pc, got "no loss shown" against office-pc's floor. The fleet may move a timed job
+        between steps when a host's window closes; such a round has no verdict, and so has one whose
+        passes don't say which fleet host ran them."""
+        read = []
+        with patch.object(abba.rg, "read_floor", side_effect=lambda path: read.append(path.stem)):
+            code, text = self.verdict(self.round_(records(), name="moved", host="office-pc",
+                                                  ran_on=lambda p: "phuoc-yu"))
+        self.assertEqual(code, abba.NO_VERDICT, text)
+        self.assertIn("passes ran on phuoc-yu, not on office-pc", text)
+        self.assertNotIn("office-pc", read)  # no floor is read for a round that has no verdict
+        code, text = self.verdict(self.round_(records(), name="part-moved",
+                                              ran_on=lambda p: "office-pc" if p["report"]["block"] == 6 else "phuoc-yu"))
+        self.assertEqual(code, abba.NO_VERDICT, text)
+        code, text = self.verdict(self.round_(records(), name="unsaid", ran_on=lambda p: None))
+        self.assertEqual(code, abba.NO_VERDICT, text)
+        self.assertIn("don't say which fleet host ran them", text)
+        self.assertEqual(self.verdict(self.round_(records(), name="stayed"))[0], abba.NO_LOSS)
 
     def test_a_failed_content_check_or_too_few_samples_on_any_side_voids_the_round(self):
         code, text = self.verdict(self.round_(records(broken=lambda side, n: side == "a2" and n == 2)))
@@ -241,6 +264,14 @@ systems = []
             self.assertIn(word, first[2])
         self.assertEqual(first[4:], [abba.ENV_FAMILY, A, B])  # the family, then every revision built
         self.assertEqual([s[2] for s in job["steps"][1:7]], ["block"] * 6)
+        # Its gate state is its family's own: another A at the same B and name is another directory
+        # (review r1 R1-F3); a family's rounds share it.
+        self.path.write_text(FAMILY.replace(A, "c" * 40), encoding="utf-8")
+        other = next(iter(abba.jobs(self.load(), B, self.repo.as_posix()).values()))
+        self.assertNotEqual(other["env"]["GATE_NAME"], job["env"]["GATE_NAME"])
+        self.path.write_text(FAMILY, encoding="utf-8")
+        round2 = next(iter(abba.jobs(self.load(), B, self.repo.as_posix(), round_=2).values()))
+        self.assertEqual(round2["env"]["GATE_NAME"], job["env"]["GATE_NAME"])
         # The first step asks no less memory than the blocks (Sol r2 S1): a case past 12 GB, the
         # builds' own figure before, so that a lower first-step ask would show (Sol r3 U1).
         big = dict(self.family, cases=[{**self.family["cases"][0], "cap_gb": 24}])
@@ -282,6 +313,49 @@ systems = []
         with patch.dict(abba.os.environ, {"ABBA_FAMILY": own}), self.assertRaises(abba.Invalid) as refused:
             abba.load_family(abba.ENV_FAMILY, self.repo)
         self.assertIn("lives in the repository", "\n".join(refused.exception.args[0]))
+
+    def test_a_job_resolves_its_family_at_the_declared_harness(self):
+        """Review r1 R1-F4: a job's check, run in B's checkout, took a case from B's registry that
+        the declared harness doesn't have (dl-number-fragment, absent at 313e5a64), and wrote a
+        manifest claiming that harness. Check, jobs and report resolve the family's cases at the
+        declared harness; a case absent there is refused before anything is timed."""
+        old = "313e5a640639bdc81a25dcbdc1b39f68fef352ef"  # engine-v2 before the registry's additions
+        known = abba.subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", f"{old}^{{commit}}"]).returncode == 0
+        if not known:
+            self.skipTest(f"{old[:8]} isn't in this checkout's history")
+        self.assertNotIn("dl-number-fragment", {c["name"] for c in abba.cases_registry.load_at(ROOT, old)})
+        head = abba.git(ROOT, "rev-parse", "HEAD")
+        family = abba.family_text("t", {"a": A, "b": B}, ["dl-number-fragment"], 3)
+
+        def check(harness):
+            with tempfile.TemporaryDirectory() as out:
+                inherited = {k: v for k, v in abba.os.environ.items() if k not in ("GATE_HOST", "NRESE_FAMILY")}
+                env = {**inherited, "FLEET_OUT": out, "FLEET_HOST": "office-pc", "ABBA_FAMILY": family}
+                if harness:
+                    env["ABBA_HARNESS"] = harness
+                else:
+                    env.pop("ABBA_HARNESS", None)
+                done = abba.subprocess.run([sys.executable, "-B", str(ROOT / "benches/suite/abba.py"), "check",
+                                            abba.ENV_FAMILY], env=env, capture_output=True, text=True, cwd=ROOT)
+                written = (Path(out) / "abba-manifest.json").is_file()
+            return done, written
+
+        refused, written = check(old)
+        self.assertEqual(refused.returncode, abba.INVALID, refused.stdout + refused.stderr)
+        self.assertIn("dl-number-fragment", refused.stderr)
+        self.assertFalse(written)  # no manifest claiming a harness it doesn't hold the cases of
+        taken, written = check(head)
+        self.assertEqual(taken.returncode, 0, taken.stderr)
+        self.assertTrue(written)
+        unnamed, _ = check(None)  # a job's check without its harness is refused, never this tree's
+        self.assertEqual(unnamed.returncode, abba.INVALID, unnamed.stderr)
+        self.assertIn("ABBA_HARNESS", unnamed.stderr)
+        # The same family loaded at each revision: refused at the older one, resolved at the head.
+        with patch.dict(abba.os.environ, {"ABBA_FAMILY": family}):
+            with self.assertRaises(abba.Invalid):
+                abba.load_family(abba.ENV_FAMILY, ROOT, harness=old)
+            self.assertEqual([c["name"] for c in abba.load_family(abba.ENV_FAMILY, ROOT, harness=head)["cases"]],
+                             ["dl-number-fragment"])
 
     def test_run_builds_the_family_from_the_registry(self):
         """`run --cases/--areas`: registry cases only, each once, the timeable ones of an area; an
@@ -325,7 +399,9 @@ systems = []
         """Placed by capability, the round's host is known only where it runs: the check writes
         FLEET_HOST into the manifest (GATE_HOST, a pin, wins), and the report reads that host's floor."""
         with tempfile.TemporaryDirectory() as out:
-            env = {"FLEET_OUT": out, "FLEET_HOST": "office-pc", "ABBA_HARNESS": B, "ABBA_FAMILY": FAMILY}
+            # The harness is a commit of this checkout: the job's check reads its registry (R1-F4).
+            env = {"FLEET_OUT": out, "FLEET_HOST": "office-pc", "ABBA_HARNESS": abba.git(ROOT, "rev-parse", "HEAD"),
+                   "ABBA_FAMILY": FAMILY}
             inherited = {k: v for k, v in abba.os.environ.items() if k not in ("GATE_HOST", "NRESE_FAMILY")}
             done = abba.subprocess.run([sys.executable, "-B", str(ROOT / "benches/suite/abba.py"), "check", abba.ENV_FAMILY],
                                        env={**inherited, **env}, capture_output=True, text=True, cwd=ROOT)

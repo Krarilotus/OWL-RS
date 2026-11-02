@@ -126,7 +126,7 @@ def full_ids(sides: dict[str, str], repo: Path) -> tuple[dict[str, str], list[st
     return out, problems
 
 
-def load_family(path: str | Path, repo: Path, catalog: list[dict] | None = None) -> dict:
+def load_family(path: str | Path, repo: Path, catalog: list[dict] | None = None, harness: str | None = None) -> dict:
     """The family, resolved and validated: a file (read_family(); one with cases of its own must
     be a file of the checkout `repo`, main's is ROOT), its sides as full ids of that checkout
     (full_ids()), its cases (its own, or the catalogue's: the one beside this module, benches/cases
@@ -158,10 +158,16 @@ def load_family(path: str | Path, repo: Path, catalog: list[dict] | None = None)
     entries = data.get("case", [])
     if not entries:
         problems.append("no [[case]]")
+    if catalog is None:
+        # The registry the job runs, the declared harness's, wherever this runs from (review r1
+        # R1-F4: a check in B's checkout read B's registry for an older harness); this tree's without one.
+        catalog = cases_registry.load_at(repo, harness) if harness else cases_registry.load()
     if own:
-        catalog = cases_registry.load(family=Path(repo).resolve() / rel)
-    elif catalog is None:
-        catalog = cases_registry.load()
+        catalog = [*catalog, *({**c, "group": "family"} for c in cases_registry.family_cases(Path(repo).resolve() / rel))]
+        names = [c["name"] for c in catalog]
+        if clash := sorted({n for n in names if names.count(n) > 1}):
+            problems_own = [f"the family's own case {n} is also a registry case" for n in clash]
+            raise Invalid(problems_own)
     by_name = {c["name"]: c for c in catalog}
     cases, hypotheses = [], []
     for i, entry in enumerate(entries):
@@ -287,7 +293,9 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
     gate_ = ["bash", "scripts/release-gate.sh"]
     abba = ["python3", "-B", "benches/suite/abba.py"]
     cap = max(c["cap_gb"] for c in family["cases"])
-    env = {"GATE_NAME": f"abba-{family['name']}-{b[:8]}",
+    # Its gate state is its family's own (the family's SHA-256: sides, cases, blocks), its rounds'
+    # deliberately shared; another request never meets it on a host (review r1 R1-F3).
+    env = {"GATE_NAME": f"abba-{family['name']}-{b[:8]}-{family['sha256'][:8]}",
            "GATE_CASES": ",".join(c["name"] for c in family["cases"]), "GATE_BASELINES": "a",
            "GATE_MAX_GB": str(cap), "NRESE_QUIET_SLOT": "0",
            "GATE_MIN_BLOCKS": str(family["blocks"]), "GATE_ROUND": str(round_ - 1),
@@ -621,6 +629,30 @@ def run(args) -> int:
     return 0
 
 
+def declared_harness(args) -> str | None:
+    """The harness whose registry a command resolves the family's cases at (review r1 R1-F4): in a
+    job's check, ABBA_HARNESS (a job without it is refused); `jobs`, --harness, else the family's b;
+    `report`, the one its rounds' manifests name (they must name one). None: this tree's (a local
+    check)."""
+    if args.command == "check":
+        harness = os.environ.get("ABBA_HARNESS")
+        if os.environ.get("FLEET_OUT") and not harness:
+            raise Invalid(["a job's check needs ABBA_HARNESS, the harness whose registry it times"])
+        return harness or None
+    if args.command == "jobs":
+        rel, raw, _ = read_family(args.family, ROOT)
+        b = tomllib.loads(raw.decode("utf-8")).get("sides", {}).get("b", "")
+        return git(Path(args.checkout), "rev-parse", args.harness or b)
+    named = set()
+    for results in args.results:
+        path = Path(results) / "abba-manifest.json"
+        if path.is_file():
+            named.add(json.loads(path.read_text(encoding="utf-8")).get("harness") or "")
+    if len(named) > 1:
+        raise Invalid([f"the rounds' manifests name different harnesses: {', '.join(sorted(named))}"])
+    return next(iter(named), None) or None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
@@ -660,9 +692,11 @@ def main() -> int:
     if args.command == "run":
         return run(args)
     try:
-        family = load_family(args.family, ROOT)
-    except (Invalid, OSError, tomllib.TOMLDecodeError) as error:
-        problems = error.args[0] if isinstance(error, Invalid) else [str(error)]
+        family = load_family(args.family, ROOT, harness=declared_harness(args))
+    except (Invalid, OSError, tomllib.TOMLDecodeError, subprocess.CalledProcessError) as error:
+        problems = (error.args[0] if isinstance(error, Invalid) else
+                    [f"git {' '.join(error.cmd[3:])}: {(error.stderr or '').strip() or 'failed'}"]
+                    if isinstance(error, subprocess.CalledProcessError) else [str(error)])
         print("\n".join(f"invalid family {args.family}: {p}" for p in problems), file=sys.stderr)
         return INVALID
     if args.command == "check":
