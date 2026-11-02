@@ -355,13 +355,16 @@ fn split_timezone(s: &str) -> Option<(&str, u64)> {
     let Some(split) = s.len().checked_sub(6) else {
         return Some((s, 0));
     };
-    let (rest, zone) = s.split_at(split);
-    // Only a `±hh:mm` suffix is a timezone; a date's own `-MM-DD` is not.
-    let sign = match (zone.as_bytes()[0], zone.as_bytes()[3]) {
+    // Only a `±hh:mm` suffix is a timezone; a date's own `-MM-DD` is not. The sign is
+    // read as a byte first: an ASCII sign byte is always a char boundary, so the split
+    // below cannot land inside a multi-byte character of an ill-typed lexical form.
+    let bytes = s.as_bytes();
+    let sign = match (bytes[split], bytes[split + 3]) {
         (b'+', b':') => 1,
         (b'-', b':') => -1,
         _ => return Some((s, 0)),
     };
+    let (rest, zone) = s.split_at(split);
     let (hours, minutes) = (digits(zone, 1..3)?, digits(zone, 4..6)?);
     let offset = i64::from(hours * 60 + minutes);
     if minutes >= 60 || offset == 0 || offset > 14 * 60 || offset % 15 != 0 {
