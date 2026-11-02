@@ -11,11 +11,14 @@ use rayon::prelude::*;
 /// Row count from which sorting runs in parallel.
 const PARALLEL_SORT_ROWS: usize = 1 << 16;
 
-/// What a row of a table without columns counts for memory budgets: one id, the column an
-/// operator after it may make for it (an unbound variable's UNDEF, a BIND), as a join's row
-/// limit counts it. The table itself holds only its row count, so without this a query
-/// could make rows past its budget that hold nothing, and the next operator a column of
-/// them, before anything is charged.
+/// What a row of a table without columns counts for memory budgets, after its first: one
+/// id, the column an operator after it may make for it (an unbound variable's UNDEF, a
+/// BIND), as a join's row limit counts it. The table itself holds only its row count, so
+/// without this a query could make rows past its budget that hold nothing, and the next
+/// operator a column of them, before anything is charged. The first row, the one solution
+/// of an empty pattern, counts nothing: a column of it is one id a table, which a table's
+/// charge leaves out as it leaves out its list of columns. So making and consuming one
+/// solution without bindings, once per row of a substituted EXISTS, charges nothing.
 const ROW_WITHOUT_COLUMNS_BYTES: usize = size_of::<u64>();
 
 #[derive(Debug, Clone, Default)]
@@ -157,7 +160,7 @@ impl IdTable {
     }
 
     /// What a row of this table counts for memory budgets ([`Self::memory_bytes`]): an id
-    /// a column, and one for a table without columns.
+    /// a column, and one for a table without columns (after its first row).
     pub fn row_bytes(&self) -> usize {
         match self.width() {
             0 => ROW_WITHOUT_COLUMNS_BYTES,
@@ -236,14 +239,12 @@ impl IdTable {
     }
 
     /// Bytes held by the column buffers (by capacity), for memory budgets. A table without
-    /// columns counts one id a row ([`ROW_WITHOUT_COLUMNS_BYTES`]) of the rows it has room
-    /// for: what was reserved, and the most it held, which doesn't drop as rows go.
+    /// columns counts one id a row after the first ([`ROW_WITHOUT_COLUMNS_BYTES`]) of the
+    /// rows it has room for: what was reserved, and the most it held, which doesn't drop as
+    /// rows go.
     pub fn memory_bytes(&self) -> usize {
         if self.columns.is_empty() {
-            return self
-                .len
-                .max(self.rows_held)
-                .saturating_mul(ROW_WITHOUT_COLUMNS_BYTES);
+            return self.bytes_for_rows(self.len.max(self.rows_held));
         }
         self.columns.iter().map(|c| c.capacity() * 8).sum()
     }
