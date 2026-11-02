@@ -166,16 +166,16 @@ def load_family(path: str | Path, repo: Path, catalog: list[dict] | None = None,
         # The harness's fast suite times the family's own cases from its own copy of this file
         # (NRESE_FAMILY, read in the harness's tree): the file must be there as it is here, or the
         # plan and the manifest describe cases other than those timed (sol-loop of review r1, S1).
-        # Compared as the suite reads it, parsed: line endings, stored or checked out, aren't a change
-        # (sol-loop r2, T1: a blob-hash comparison refused a CRLF file read where git normalises them).
-        at = subprocess.run(["git", "-C", str(repo), "show", f"{harness}:{rel}"], capture_output=True)
+        # The same blob, as stored or as this checkout's line-ending filters store it (sol-loop r2, T1:
+        # filtered alone refused a file stored with CRLF). Not compared parsed: values equal in Python
+        # reach the suite as different text (sol-loop r3, U1: 268435456.0 is no buffer limit).
+        git = ["git", "-C", str(repo)]
+        at = subprocess.run([*git, "rev-parse", "--verify", "--quiet", f"{harness}:{rel}"], capture_output=True, text=True)
         if at.returncode != 0:
             raise Invalid([f"{rel} isn't at the harness {harness[:12]}, whose fast suite would time its own cases"])
-        try:
-            same = tomllib.loads(at.stdout.decode("utf-8")) == data
-        except (UnicodeDecodeError, tomllib.TOMLDecodeError):
-            same = False
-        if not same:
+        here = {subprocess.run([*git, "hash-object", *how, "--stdin"], input=raw, capture_output=True).stdout.decode().strip()
+                for how in (["--no-filters"], ["--path", rel])}
+        if at.stdout.strip() not in here:
             raise Invalid([f"{rel} differs at the harness {harness[:12]}: its own cases would be timed as the "
                            "harness has them, not as declared here"])
     if own:
