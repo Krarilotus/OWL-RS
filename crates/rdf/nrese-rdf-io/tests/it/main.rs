@@ -6,3 +6,4 @@ mod jsonld_tests;
 mod rdfxml_tests;
 mod reader_contract_tests;
 mod turtle_tests;
+mod writer_contract_tests;
