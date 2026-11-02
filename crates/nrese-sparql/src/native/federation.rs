@@ -80,23 +80,18 @@ impl Context<'_> {
                 ordered: false,
             };
             let found = self.call_silently(endpoint.as_str(), inner, Some(&subset), silent)?;
-            // The endpoint's rows carry the endpoint, so they join to the rows that named it.
+            // The endpoint's rows carry the endpoint, so they join to the rows that named it:
+            // its column, charged before it is made.
             let found = if found.vars.contains(variable) {
                 found
             } else {
-                let mut vars = found.vars.clone();
-                vars.push(variable.clone());
-                let mut table = IdTable::new(vars.len());
-                let mut line = vec![id; vars.len()];
-                for row in 0..found.table.len() {
-                    line[..found.vars.len()].copy_from_slice(&found.table.row(row));
-                    table.push_row(&line);
-                }
-                Solutions {
-                    vars,
-                    table,
-                    ordered: false,
-                }
+                let rows = found.table.len();
+                self.reshaped(found, rows.saturating_mul(8), |mut found| {
+                    found.table.push_column(vec![id; rows]);
+                    found.vars.push(variable.clone());
+                    found.ordered = false;
+                    found
+                })?
             };
             all = Some(match all {
                 Some(all) => self.union(all, found)?,
