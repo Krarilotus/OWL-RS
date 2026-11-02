@@ -9,7 +9,8 @@ file that moved or never landed sends its reader looking for nothing, or buildin
 
 Links: what a CommonMark parser (markdown-it-py, CommonMark mode) makes a link or an image, from
 its tokens: inline links, autolinks, images, and every reference definition it records (in lists,
-blockquotes, with escaped labels), plus the `href` and `src` of raw HTML. What it doesn't make a
+blockquotes, with escaped labels, repeats too), plus the `href` and `src` of raw HTML as HTML reads
+them (the stdlib's HTMLParser: unquoted, entities decoded, not in comments). What it doesn't make a
 link (text in code, a broken bracket) isn't one. A link resolves from its document's directory
 only, as a renderer resolves it.
 
@@ -37,6 +38,7 @@ import os
 import re
 import subprocess
 import sys
+from html.parser import HTMLParser
 
 try:
     from markdown_it import MarkdownIt
@@ -49,7 +51,6 @@ TOP = ("scripts/", "docs/", "crates/", "benches/", "apps/", "tests/", "fixtures/
        ".githooks/", ".github/", "fuzz/", ".claude/")
 SKIPPED_DIRS = ("literature/", "fixtures/")
 TICK = re.compile(r"`([^`\n]+)`(\])?")
-HTML_LINK = re.compile(r"""\b(?:href|src)\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.I)
 PLACEHOLDER = re.compile(r"[<>{}*…$|]|\b(NAME|HOST|ID|REV|DIR)\b")
 URL = re.compile(r"^[a-z][a-z0-9+.-]*:", re.I)
 
@@ -109,24 +110,44 @@ def parser():
     return md
 
 
+class HtmlLinks(HTMLParser):
+    """The href and src attributes of HTML's tags, as HTML reads them (entities decoded)."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.found = []
+
+    def handle_starttag(self, tag, attrs):
+        self.found += [value for name, value in attrs if name in ("href", "src") and value]
+
+    handle_startendtag = handle_starttag
+
+
+def html_links(html):
+    reader = HtmlLinks()
+    reader.feed(html)
+    reader.close()
+    return reader.found
+
+
 def links(text):
     """(line number, destination) of every link the parser finds in TEXT."""
     env = {}
     tokens = parser().parse(text, env)
     for token in tokens:
         line = token.map[0] + 1 if token.map else 0
-        if token.type in ("html_block", "html_inline"):
-            for m in HTML_LINK.finditer(token.content):
-                yield line, m.group(1) if m.group(1) is not None else m.group(2)
+        if token.type == "html_block":
+            yield from ((line, dest) for dest in html_links(token.content))
+        # An inline tag can be split over tokens (`<a` ... `>`): read the block's inline HTML as one.
+        inline_html = "".join(child.content for child in token.children or () if child.type == "html_inline")
+        yield from ((line, dest) for dest in html_links(inline_html))
         for child in token.children or ():
             if child.type == "link_open":
                 yield line, child.attrGet("href")
             elif child.type == "image":
                 yield line, child.attrGet("src")
-            elif child.type == "html_inline":
-                for m in HTML_LINK.finditer(child.content):
-                    yield line, m.group(1) if m.group(1) is not None else m.group(2)
-    for reference in env.get("references", {}).values():
+    # Every definition, the ones CommonMark ignores as repeats (duplicate_refs) too.
+    for reference in list(env.get("references", {}).values()) + env.get("duplicate_refs", []):
         yield reference["map"][0] + 1, reference["href"]
 
 
