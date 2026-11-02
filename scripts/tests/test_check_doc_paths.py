@@ -1,10 +1,13 @@
 """scripts/check-doc-paths.py: a doc that links or names a path that doesn't exist fails the check.
 
-    python3 -I scripts/tests/test_check_doc_paths.py
+    python3 -B scripts/tests/test_check_doc_paths.py
 
-Spec: the checker's docstring. The documents below are review PR #92 r1's fixtures and witnesses
-(Harness notes review-pr92-r1: fixtures/*.md, P09, P18), each beside a control whose target exists.
-Stdlib only; every document is written to a temporary directory, nothing in the checkout changes.
+Spec: the checker's docstring; what is a link is what CommonMark makes one (markdown-it-py in
+CommonMark mode, the oracle of PR #92's fix check). The documents below are review PR #92 r1's and
+its fix check's fixtures and witnesses (Harness notes review-pr92-r1: fixtures/*.md, P09, P18;
+fixcheck-r1-evidence P05, P06), each beside a control whose target exists. Needs markdown-it-py
+(benches/suite/requirements.txt); every document is written to a temporary directory, nothing in
+the checkout changes.
 """
 import contextlib
 import importlib.util
@@ -66,25 +69,23 @@ class CheckDocPaths(unittest.TestCase):
         self.assertEqual(self.check("[exists][guide]\n\n[guide]: guide.md\n"), 0)
         self.assertEqual(self.check("[exists][g]\n\n  [g]: <sub dir/guide.md> \"Title\"\n"), 0)
 
-    # Fix-round sol-loop F1: a fence's end can't hide the links after it (GFM 4.5). Code isn't
-    # told apart at all (fail closed, after r2's F5/F6), so link-shaped text inside it is checked too.
+    # Fix-round sol-loop F1: a fence's end can't hide the links after it (CommonMark 4.5). Text in
+    # a fence is code, not a link (CommonMark renders `<pre><code>`), so it isn't checked.
     def test_a_link_after_a_closed_fence_is_checked(self):
         fenced = "````\n```\n````\n"
         self.assertEqual(self.check(fenced + "[x](missing.md)\n"), 1)
         self.assertEqual(self.check(fenced + "[x](guide.md)\n"), 0)
-        self.assertEqual(self.check("```\n[x](missing.md)\n```\n"), 1)
-        self.assertEqual(self.check("```\n[x](guide.md)\n```\n"), 0)
+        self.assertEqual(self.check("```\n[x](missing.md)\n```\n"), 0)
 
     # F2: a reference definition inside a blockquote is a definition (GFM 4.7).
     def test_a_reference_definition_in_a_blockquote_is_checked(self):
         self.assertEqual(self.check("> [x][guide]\n>\n> [guide]: definitely-missing-pr92.md\n"), 1)
         self.assertEqual(self.check("> [x][guide]\n>\n> [guide]: guide.md\n"), 0)
 
-    # F3: backticks inside a destination belong to it; link-shaped text in a code span is checked.
+    # F3: backticks inside a destination belong to it; a code span is code, not a link.
     def test_a_destination_with_backticks_is_checked(self):
         self.assertEqual(self.check("[x](`missing.md`)\n"), 1)
-        self.assertEqual(self.check("`[x](missing.md)` is code\n"), 1)
-        self.assertEqual(self.check("`[x](guide.md)` is code\n"), 0)
+        self.assertEqual(self.check("`[x](missing.md)` is code\n"), 0)
 
     # Fix-round sol-loop r2 F5: a fence inside a blockquote ends with the quote (GFM example 98).
     def test_a_link_after_a_quoted_fence_is_checked(self):
@@ -120,9 +121,9 @@ class CheckDocPaths(unittest.TestCase):
         self.assertEqual(self.check('[x](guide.md "a) title")\n'), 0)
         self.assertEqual(self.check('[x](missing.md "a) title")\n'), 1)
 
-    # B1: link syntax the checker can't read fails instead of passing unread.
-    def test_an_unreadable_link_destination_fails(self):
-        self.assertEqual(self.check("[odd](<unterminated\n"), 1)
+    # B1: what CommonMark doesn't make a link is text; nothing sends a reader anywhere.
+    def test_broken_link_syntax_is_text_not_a_link(self):
+        self.assertEqual(self.check("[odd](<unterminated\n"), 0)
 
     # B3: the allow list exempts mentions, never a clickable link.
     def test_an_allowed_target_exempts_a_mention_but_not_a_link(self):
