@@ -66,23 +66,25 @@ class CheckDocPaths(unittest.TestCase):
         self.assertEqual(self.check("[exists][guide]\n\n[guide]: guide.md\n"), 0)
         self.assertEqual(self.check("[exists][g]\n\n  [g]: <sub dir/guide.md> \"Title\"\n"), 0)
 
-    # Fix-round sol-loop F1: a fence ends only at a closer of its own character and at least its
-    # length, with nothing after it (GFM 4.5); a shorter line inside doesn't end it.
+    # Fix-round sol-loop F1: a fence's end can't hide the links after it (GFM 4.5). Code isn't
+    # told apart at all (fail closed, after r2's F5/F6), so link-shaped text inside it is checked too.
     def test_a_link_after_a_closed_fence_is_checked(self):
         fenced = "````\n```\n````\n"
         self.assertEqual(self.check(fenced + "[x](missing.md)\n"), 1)
         self.assertEqual(self.check(fenced + "[x](guide.md)\n"), 0)
-        self.assertEqual(self.check("```\n[x](missing.md)\n```\n"), 0)  # inside a fence: not a link
+        self.assertEqual(self.check("```\n[x](missing.md)\n```\n"), 1)
+        self.assertEqual(self.check("```\n[x](guide.md)\n```\n"), 0)
 
     # F2: a reference definition inside a blockquote is a definition (GFM 4.7).
     def test_a_reference_definition_in_a_blockquote_is_checked(self):
         self.assertEqual(self.check("> [x][guide]\n>\n> [guide]: definitely-missing-pr92.md\n"), 1)
         self.assertEqual(self.check("> [x][guide]\n>\n> [guide]: guide.md\n"), 0)
 
-    # F3: backticks inside a destination belong to it; a code span elsewhere isn't a link.
+    # F3: backticks inside a destination belong to it; link-shaped text in a code span is checked.
     def test_a_destination_with_backticks_is_checked(self):
         self.assertEqual(self.check("[x](`missing.md`)\n"), 1)
-        self.assertEqual(self.check("`[x](missing.md)` is code\n"), 0)
+        self.assertEqual(self.check("`[x](missing.md)` is code\n"), 1)
+        self.assertEqual(self.check("`[x](guide.md)` is code\n"), 0)
 
     # Fix-round sol-loop r2 F5: a fence inside a blockquote ends with the quote (GFM example 98).
     def test_a_link_after_a_quoted_fence_is_checked(self):
