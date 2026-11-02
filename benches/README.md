@@ -208,8 +208,9 @@ fleet wait set:ID      fleet status set:ID      fleet results set:ID
 ```
 
 A job makes the data it lacks (benches/hosts.toml `[caches]`: where it keeps it, how much,
-how long) and asks the disk for it; the verified bench assets are the one input a host must
-already hold (`has = ["owlrs-bench-assets"]`). Answers come before time: compete captures
+how long) and asks the disk for it; what can't be made again (WatDiv's pinned query sets) it
+fetches as a git input from the private bench-inputs repository (hosts.toml `[sources]`); the
+verified bench assets are the one input a host must already hold (`has = ["owlrs-bench-assets"]`). Answers come before time: compete captures
 every answer, a timed `suite.py run` must ask for them (`--answers full`).
 `suite/queue.py` and the kits' `jobs/*.toml` are the queue that came before the fleet; they
 aren't used any more.
