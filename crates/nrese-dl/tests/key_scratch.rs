@@ -120,8 +120,8 @@ fn a_key_holds_memory_linear_in_its_members_and_is_charged_what_it_holds() {
 
 /// The whole check (I35): the key's members, each merged into the last, had the whole class
 /// copied at every merge, so the check held memory and asserted facts quadratic in them
-/// (5.1 GB at 8,000 members). Of two named individuals the one holding fewer of the facts a merge
-/// copies goes into the other.
+/// (5.1 GB at 8,000 members). Of two named individuals without successors, the one copying fewer
+/// facts goes into the other.
 #[test]
 fn the_check_of_a_key_s_members_holds_memory_near_linear_in_them() {
     let _turn = PROFILE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -185,43 +185,204 @@ fn a_merge_of_named_individuals_copies_the_side_with_fewer_facts() {
     );
 }
 
-/// PR #72's fix, Sol r2 S2: `a : ≥n R.C` makes n successors and their inequalities, and
-/// `∃R.C ⊑ {b}` then merges `a` with `b`, which holds 64 labels. Moving `a` prunes its successors
-/// and `b` builds them again from the copied `≥n R.C`; moving `b` copies its 64 labels. The merge
-/// adds about those labels to what the check holds without it.
+/// The model kept, so that the tableau runs, not the counting shortcut.
+fn facts_asserted(o: &Ontology, what: &str) -> u64 {
+    let config = Config {
+        portfolio: false,
+        keep_model: true,
+        ..Config::default()
+    };
+    let outcome = consistency(o, &config);
+    assert_eq!(outcome.answer, Answer::Consistent, "{what}");
+    outcome.telemetry.facts
+}
+
+fn class(o: &mut Ontology, id: u64) -> ExprId {
+    ExprId(o.classes.intern(ClassExpr::Class(id)))
+}
+
+/// PR #72's fix check, R1-F1 at the bound: K labels on `b` and N on `c`, then
+/// `SameIndividual(a b)` (or no `a`) and `b` with `c`, either order. Where the choice couldn't
+/// read both sides to their end, the fix fell back on class sizes and copied c's N labels where
+/// the calculus's order (`b` into `c` for `(b c)`) copies b's K. A merge copies the increment of
+/// N only where the calculus's order does: `(c b)`, with b too long to read to its end
+/// (`WALK` = 1,024 in merge.rs).
 #[test]
-fn a_merge_keeps_the_side_whose_successors_it_would_build_again() {
+fn a_merge_copies_no_more_than_the_calculus_order_at_the_read_s_bound() {
+    let _turn = PROFILE.lock().unwrap_or_else(PoisonError::into_inner);
+    const WALK: u64 = 1024;
+    let asserted = |k: u64, n: u64, with_a: bool, c_first: bool| {
+        let mut o = Ontology::default();
+        let (a, b, c) = (100, 101, 102);
+        for i in 0..k {
+            let label = class(&mut o, 10_000 + i);
+            add(&mut o, Axiom::ClassAssertion(label, b));
+        }
+        for i in 0..n {
+            let label = class(&mut o, 1_000_000 + i);
+            add(&mut o, Axiom::ClassAssertion(label, c));
+        }
+        if with_a {
+            add(&mut o, Axiom::SameIndividual(vec![a, b]));
+        }
+        let pair = if c_first { vec![c, b] } else { vec![b, c] };
+        add(&mut o, Axiom::SameIndividual(pair));
+        facts_asserted(&o, &format!("{k} labels on b, {n} on c"))
+    };
+    let mut over = Vec::new();
+    for k in [WALK - 1, WALK, WALK + 1] {
+        for with_a in [true, false] {
+            for c_first in [false, true] {
+                let added = asserted(k, 8192, with_a, c_first) - asserted(k, 4096, with_a, c_first);
+                // 4,096 more labels on c assert 4,096 facts; copied to b as well, 8,192.
+                let may = if c_first && k >= WALK { 8192 } else { 4096 };
+                if added > may + 64 {
+                    over.push(format!("K = {k}, a: {with_a}, c first: {c_first}: {added}"));
+                }
+            }
+        }
+    }
+    assert!(
+        over.is_empty(),
+        "SPEC merge-bound: facts for 4,096 more labels on c: {}",
+        over.join("; ")
+    );
+}
+
+/// PR #72's fix check, FC-R1-F2: one R edge from `a` to `x`, and `x` owns `≥256 S.C` (256
+/// successors, 32,640 inequalities); Horn axioms then make `b ≈ a`, and `b` holds 64 labels.
+/// Moving `a` prunes x's subtree and `b` builds it again from the copied existential; the
+/// calculus's order moves `b` and copies its labels. The merge adds about those labels to what
+/// the check holds without it.
+#[test]
+fn a_merge_keeps_the_subtree_under_one_edge() {
+    let _turn = PROFILE.lock().unwrap_or_else(PoisonError::into_inner);
+    let asserted = |merged: bool| {
+        let mut o = Ontology::default();
+        let (a, b) = (100, 101);
+        let (r, s, t) = (ObjProp::Named(2), ObjProp::Named(3), ObjProp::Named(4));
+        let (c, d, e) = (class(&mut o, 5), class(&mut o, 6), class(&mut o, 7));
+        let min = ExprId(o.classes.intern(ClassExpr::Min(256, s, c)));
+        let outer = ExprId(o.classes.intern(ClassExpr::Some(r, min)));
+        add(&mut o, Axiom::ClassAssertion(outer, a));
+        add(&mut o, Axiom::ObjectPropertyAssertion(4, b, a));
+        let some_s = ExprId(o.classes.intern(ClassExpr::Some(s, c)));
+        add(&mut o, Axiom::SubClassOf(some_s, d));
+        let some_r = ExprId(o.classes.intern(ClassExpr::Some(r, d)));
+        add(&mut o, Axiom::SubClassOf(some_r, e));
+        if merged {
+            let some_t = ExprId(o.classes.intern(ClassExpr::Some(t, e)));
+            let only_a = ExprId(o.classes.intern(ClassExpr::OneOf(vec![a])));
+            add(&mut o, Axiom::SubClassOf(some_t, only_a));
+        }
+        for k in 0..64 {
+            let label = class(&mut o, 1000 + k);
+            add(&mut o, Axiom::ClassAssertion(label, b));
+        }
+        facts_asserted(&o, &format!("merged: {merged}"))
+    };
+    let (apart, merged) = (asserted(false), asserted(true));
+    // x's 256 successors and their inequalities, built again, are about 33,000 facts.
+    assert!(
+        merged.saturating_sub(apart) <= 1000,
+        "SPEC merge-subtree: {apart} facts without the merge, {merged} with it"
+    );
+}
+
+/// A side's successors aren't what moving it costs: they may never be built again. `a` holds
+/// `≥256 R.C` and its 256 successors, `∃R.C ⊑ {b}` merges it with `b`, and `b` has R to 256
+/// different named individuals in C, which meet the copied `≥256 R.C`. Moving `a` copies its
+/// 17 labels and builds nothing; weighing a's edges to its successors moved `b`, copying its 256
+/// edges. The merge adds about a's labels to what the check holds without it.
+#[test]
+fn a_merge_does_not_weigh_successors_that_need_no_building_again() {
     let _turn = PROFILE.lock().unwrap_or_else(PoisonError::into_inner);
     let asserted = |merged: bool| {
         let mut o = Ontology::default();
         let (a, b) = (100, 101);
         let r = ObjProp::Named(2);
-        let c = ExprId(o.classes.intern(ClassExpr::Class(3)));
+        let c = class(&mut o, 3);
         let min = ExprId(o.classes.intern(ClassExpr::Min(256, r, c)));
         add(&mut o, Axiom::ClassAssertion(min, a));
+        for k in 0..16 {
+            let label = class(&mut o, 2000 + k);
+            add(&mut o, Axiom::ClassAssertion(label, a));
+        }
+        let named: Vec<u64> = (1000..1256).collect();
+        for &z in &named {
+            add(&mut o, Axiom::ObjectPropertyAssertion(2, b, z));
+            add(&mut o, Axiom::ClassAssertion(c, z));
+        }
+        add(&mut o, Axiom::DifferentIndividuals(named));
         if merged {
             let some = ExprId(o.classes.intern(ClassExpr::Some(r, c)));
             let only_b = ExprId(o.classes.intern(ClassExpr::OneOf(vec![b])));
             add(&mut o, Axiom::SubClassOf(some, only_b));
         }
-        for k in 0..64 {
-            let class = ExprId(o.classes.intern(ClassExpr::Class(1000 + k)));
-            add(&mut o, Axiom::ClassAssertion(class, b));
-        }
-        let config = Config {
-            portfolio: false,
-            keep_model: true,
-            ..Config::default()
-        };
-        let outcome = consistency(&o, &config);
-        assert_eq!(outcome.answer, Answer::Consistent, "merged: {merged}");
-        outcome.telemetry.facts
+        facts_asserted(&o, &format!("merged: {merged}"))
     };
     let (apart, merged) = (asserted(false), asserted(true));
-    // a's 256 successors and their inequalities, built again, are about 33,000 facts.
     assert!(
-        merged.saturating_sub(apart) <= 1000,
-        "SPEC merge-storage: {apart} facts without the merge, {merged} with it"
+        merged.saturating_sub(apart) <= 64,
+        "SPEC merge-weigh: {apart} facts without the merge, {merged} with it"
+    );
+}
+
+/// PR #72 r2 sol-loop S1: a fact both sides hold keeps one side's dependencies. `t` holds an
+/// asserted `C`, `s` holds `C` by choosing it from `C ⊔ B`; `u`'s 256 successors then make
+/// `s ≈ t` (by nothing chosen), and `K(s) ⊓ L(t)` gives the merged node `¬C`. Moving `s` into
+/// `t` keeps the asserted `C`: the clash depends on nothing, inconsistent at once. Moving `t`
+/// into `s` kept the chosen one: the clash went back to the choice, cut u's successors and
+/// built them again. The check builds them once.
+#[test]
+fn a_merge_keeps_the_dependencies_of_a_fact_both_sides_hold() {
+    let _turn = PROFILE.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut o = Ontology::default();
+    let (s, t, u) = (100, 101, 102);
+    let (q, r) = (ObjProp::Named(3), ObjProp::Named(4));
+    let c = class(&mut o, 5);
+    let b = class(&mut o, 6);
+    let (k, l, d, e) = (
+        class(&mut o, 7),
+        class(&mut o, 8),
+        class(&mut o, 9),
+        class(&mut o, 10),
+    );
+    add(&mut o, Axiom::ClassAssertion(c, t));
+    add(&mut o, Axiom::ClassAssertion(l, t));
+    let either = ExprId(o.classes.intern(ClassExpr::Or(vec![c, b])));
+    add(&mut o, Axiom::ClassAssertion(either, s));
+    add(&mut o, Axiom::ClassAssertion(k, s));
+    for i in 0..16 {
+        let label = class(&mut o, 2000 + i);
+        add(&mut o, Axiom::ClassAssertion(label, s));
+    }
+    let min = ExprId(o.classes.intern(ClassExpr::Min(256, r, d)));
+    add(&mut o, Axiom::ClassAssertion(min, u));
+    add(&mut o, Axiom::ObjectPropertyAssertion(3, s, u));
+    let some_r = ExprId(o.classes.intern(ClassExpr::Some(r, d)));
+    add(&mut o, Axiom::SubClassOf(some_r, e));
+    let some_q = ExprId(o.classes.intern(ClassExpr::Some(q, e)));
+    let only_t = ExprId(o.classes.intern(ClassExpr::OneOf(vec![t])));
+    add(&mut o, Axiom::SubClassOf(some_q, only_t));
+    let both = ExprId(o.classes.intern(ClassExpr::And(vec![k, l])));
+    let not_c = ExprId(o.classes.intern(ClassExpr::Not(c)));
+    add(&mut o, Axiom::SubClassOf(both, not_c));
+    let config = Config {
+        portfolio: false,
+        keep_model: true,
+        counting: false,
+        disjunctions_first: true,
+        disjunct_learning: false,
+        ..Config::default()
+    };
+    let outcome = consistency(&o, &config);
+    assert_eq!(outcome.answer, Answer::Inconsistent, "C and ¬C on s ≈ t");
+    let built = outcome.telemetry.nodes_created;
+    // Three named nodes and u's 256 successors, once; again after a backtrack, 515.
+    assert!(
+        built < 400,
+        "SPEC merge-deps: {built} nodes created for u's 256 successors"
     );
 }
 

@@ -190,6 +190,114 @@ pub struct Mark {
     pub trail: u32,
 }
 
+/// One entry of a node's fact lists, as [`Graph::entries`] reads it.
+#[derive(Debug, Clone, Copy)]
+pub struct Entry {
+    /// Retracted: still in the list, no longer a fact.
+    pub dead: bool,
+    /// The node at the other end of an edge or inequality; [`NONE`] for a number, concept or
+    /// negative.
+    pub other: u32,
+    /// The in-entry of a self-loop: the second entry of a fact the lists hold twice.
+    pub repeat: bool,
+    /// An at-least number (`≥ n R.F`), what the ≥-rule makes successors from: a node holding
+    /// none that is live has no live successor.
+    pub at_least: bool,
+}
+
+/// The reading of [`Graph::entries`].
+pub struct Entries<'g> {
+    g: &'g Graph,
+    node: u32,
+    numbers: u32,
+    unary: u32,
+    negatives: u32,
+    out: u32,
+    into: u32,
+    unequal: u32,
+}
+
+impl Entries<'_> {
+    /// Whether every entry has been read.
+    pub fn done(&self) -> bool {
+        [
+            self.numbers,
+            self.unary,
+            self.negatives,
+            self.out,
+            self.into,
+            self.unequal,
+        ]
+        .iter()
+        .all(|&at| at == NONE)
+    }
+
+    /// Whether numbers are left to read (they come first).
+    pub fn numbers_left(&self) -> bool {
+        self.numbers != NONE
+    }
+}
+
+impl Iterator for Entries<'_> {
+    type Item = Entry;
+
+    fn next(&mut self) -> Option<Entry> {
+        let g = self.g;
+        let dead = &g.dead;
+        let fact = |dead: bool| Entry {
+            dead,
+            other: NONE,
+            repeat: false,
+            at_least: false,
+        };
+        Some(if self.numbers != NONE {
+            let i = self.numbers as usize;
+            let f = &g.numbers[i];
+            self.numbers = f.next;
+            Entry {
+                at_least: !f.at_most,
+                ..fact(dead.numbers[i])
+            }
+        } else if self.unary != NONE {
+            let i = self.unary as usize;
+            self.unary = g.unary[i].next;
+            fact(dead.unary[i])
+        } else if self.negatives != NONE {
+            let i = self.negatives as usize;
+            self.negatives = g.negatives[i].next;
+            fact(dead.negatives[i])
+        } else if self.out != NONE {
+            let i = self.out as usize;
+            let e = &g.edges[i];
+            self.out = e.next_out;
+            Entry {
+                other: e.to,
+                ..fact(dead.edges[i])
+            }
+        } else if self.into != NONE {
+            let i = self.into as usize;
+            let e = &g.edges[i];
+            self.into = e.next_in;
+            Entry {
+                other: e.from,
+                repeat: e.from == self.node,
+                ..fact(dead.edges[i])
+            }
+        } else if self.unequal != NONE {
+            let i = self.unequal as usize;
+            let f = &g.inequalities[i];
+            let first = f.a == self.node;
+            self.unequal = if first { f.next_a } else { f.next_b };
+            Entry {
+                other: if first { f.b } else { f.a },
+                ..fact(dead.inequalities[i])
+            }
+        } else {
+            return None;
+        })
+    }
+}
+
 fn key(a: u32, b: u32) -> u64 {
     (u64::from(a) << 32) | u64::from(b)
 }
@@ -219,10 +327,6 @@ pub struct Graph {
     /// By node: what its merge into its representative depended on (read only while the
     /// node is merged).
     pub merge_deps: Vec<DepSetId>,
-    /// By node: the nodes its class holds, itself and those merged into it (read while it
-    /// represents one): of two named nodes whose facts a bounded read can't weigh, the smaller
-    /// class goes into the larger (`merge.rs`).
-    pub class_sizes: Vec<u32>,
     /// By node: what its creation depended on (a successor's: its at-least fact's).
     pub born: Vec<DepSetId>,
     /// Retracted facts, by table index (dynamic backtracking).
@@ -284,7 +388,6 @@ impl Graph {
             blocking_hash: 0,
         });
         self.merge_deps.push(DepSetId::EMPTY);
-        self.class_sizes.push(1);
         self.born.push(DepSetId::EMPTY);
         id
     }
@@ -331,7 +434,6 @@ impl Graph {
         self.trail.push(Undo::Representative { node, old, old_dep });
         self.nodes[node as usize].representative = to;
         self.merge_deps[node as usize] = dep;
-        self.class_sizes[to as usize] += self.class_sizes[node as usize];
     }
 
     // Membership -------------------------------------------------------------------------
@@ -516,9 +618,6 @@ impl Graph {
                     self.nodes[node as usize].flags = old | kept
                 }
                 Some(Undo::Representative { node, old, old_dep }) => {
-                    // The trail undoes in reverse: what joined the class since is gone again.
-                    let to = self.nodes[node as usize].representative;
-                    self.class_sizes[to as usize] -= self.class_sizes[node as usize];
                     self.nodes[node as usize].representative = old;
                     self.merge_deps[node as usize] = old_dep;
                 }
@@ -614,7 +713,6 @@ impl Graph {
         self.equalities.truncate(mark.equalities as usize);
         self.nodes.truncate(alive);
         self.merge_deps.truncate(alive);
-        self.class_sizes.truncate(alive);
         self.born.truncate(alive);
         let d = &mut self.dead;
         d.unary.truncate(mark.unary as usize);
@@ -753,45 +851,21 @@ impl Graph {
         })
     }
 
-    /// Every entry of `node`'s fact lists, as [`labels`](Self::labels), the negatives, numbers,
-    /// edges out and in and inequalities walk them: a retracted one as `None`, else the node at
-    /// its other end (`NONE` for a concept, negative or number). What a walk of them costs, for a
-    /// caller that bounds it (`merge.rs`).
-    pub fn fact_entries(&self, node: u32) -> impl Iterator<Item = Option<u32>> + '_ {
+    /// Every entry of `node`'s fact lists, one read each, retracted ones included: the
+    /// numbers first, then the concepts, negatives, edges out and in and inequalities. For a
+    /// caller that bounds the reading (`merge.rs`).
+    pub fn entries(&self, node: u32) -> Entries<'_> {
         let n = &self.nodes[node as usize];
-        let (mut unary, mut negative, mut number) = (n.label, n.negatives, n.numbers);
-        let (mut out, mut into, mut unequal) = (n.first_out, n.first_in, n.inequalities);
-        std::iter::from_fn(move || {
-            let d = &self.dead;
-            Some(if unary != NONE {
-                let i = unary as usize;
-                unary = self.unary[i].next;
-                (!d.unary[i]).then_some(NONE)
-            } else if negative != NONE {
-                let i = negative as usize;
-                negative = self.negatives[i].next;
-                (!d.negatives[i]).then_some(NONE)
-            } else if number != NONE {
-                let i = number as usize;
-                number = self.numbers[i].next;
-                (!d.numbers[i]).then_some(NONE)
-            } else if out != NONE {
-                let (i, e) = (out as usize, &self.edges[out as usize]);
-                out = e.next_out;
-                (!d.edges[i]).then_some(e.to)
-            } else if into != NONE {
-                let (i, e) = (into as usize, &self.edges[into as usize]);
-                into = e.next_in;
-                (!d.edges[i]).then_some(e.from)
-            } else if unequal != NONE {
-                let (i, f) = (unequal as usize, &self.inequalities[unequal as usize]);
-                let other = if f.a == node { f.b } else { f.a };
-                unequal = if f.a == node { f.next_a } else { f.next_b };
-                (!d.inequalities[i]).then_some(other)
-            } else {
-                return None;
-            })
-        })
+        Entries {
+            g: self,
+            node,
+            numbers: n.numbers,
+            unary: n.label,
+            negatives: n.negatives,
+            out: n.first_out,
+            into: n.first_in,
+            unequal: n.inequalities,
+        }
     }
 
     pub fn out_edges(&self, node: u32) -> impl Iterator<Item = (u32, &Edge)> {
@@ -892,7 +966,6 @@ impl Graph {
             + self.equalities.capacity() * size_of::<Equality>()
             + self.trail.capacity() * size_of::<Undo>()
             + self.merge_deps.capacity() * size_of::<DepSetId>()
-            + self.class_sizes.capacity() * size_of::<u32>()
             + (self.unary_ix.capacity() + self.negative_ix.capacity()) * 12
             + self.edge_ix.capacity() * 16
             + (self.number_ix.capacity() + self.inequality_ix.capacity()) * 12
