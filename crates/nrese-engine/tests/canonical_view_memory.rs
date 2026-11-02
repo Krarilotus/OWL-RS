@@ -52,7 +52,8 @@ fn engine(size: usize, views: &Arc<Budget>) -> Engine {
     engine.set_equality(Some(same_as));
     engine
         .snapshot()
-        .count_in(ReadModel::Materialised, &QuadPattern::all());
+        .count_in(ReadModel::Materialised, &QuadPattern::all())
+        .at_least();
     // Readers that bring no budget share one, made once.
     Engine::new(quiet())
         .unwrap()
