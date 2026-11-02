@@ -1207,7 +1207,7 @@ fn representatives_expand_to_the_replicated_closure() {
                 let expanded: HashSet<Triple> = closure
                     .facts
                     .iter()
-                    .flat_map(|&f| closure.classes.expand(f).expect("a test's copies fit"))
+                    .flat_map(|&f| closure.classes.expand(f))
                     .collect();
                 if expanded != expected {
                     let text = |t: &Triple| {
@@ -1290,7 +1290,7 @@ fn a_head_constant_that_is_no_representative_ends_the_closure() {
     let expanded: HashSet<Triple> = closure
         .facts
         .iter()
-        .flat_map(|&f| closure.classes.expand(f).expect("a test's copies fit"))
+        .flat_map(|&f| closure.classes.expand(f))
         .collect();
     assert_eq!(expanded, expected);
     let deprecated = [
@@ -1347,7 +1347,7 @@ fn head_constants_deriving_their_own_class_end_the_closure() {
     let expanded: HashSet<Triple> = closure
         .facts
         .iter()
-        .flat_map(|&f| closure.classes.expand(f).expect("a test's copies fit"))
+        .flat_map(|&f| closure.classes.expand(f))
         .collect();
     assert_eq!(expanded, expected);
     let joined = load(&mut vocabulary, "ex:x owl:r ex:y")[0];
@@ -1431,7 +1431,7 @@ fn chains_over_equal_properties_close_under_representatives() {
     let expanded: HashSet<Triple> = closure
         .facts
         .iter()
-        .flat_map(|&f| closure.classes.expand(f).expect("a test's copies fit"))
+        .flat_map(|&f| closure.classes.expand(f))
         .collect();
     let reflexive = load(&mut vocabulary, "ex:i0 ex:p0 ex:i0")[0];
     assert!(
@@ -1508,7 +1508,7 @@ fn guards_over_a_class_hold_where_its_members_satisfy_them() {
         let expanded: HashSet<Triple> = closure
             .facts
             .iter()
-            .flat_map(|&f| closure.classes.expand(f).expect("a test's copies fit"))
+            .flat_map(|&f| closure.classes.expand(f))
             .collect();
         assert_eq!(expanded, expected, "{rule}");
         let fired = |v: &[Violation]| -> std::collections::BTreeSet<String> {
@@ -1666,7 +1666,7 @@ fn guarded_maintenance_equals_rematerialisation_over_representatives() {
         let mut inferred: Vec<Triple> = closure
             .facts
             .iter()
-            .flat_map(|&f| closure.classes.expand(f).expect("a test's copies fit"))
+            .flat_map(|&f| closure.classes.expand(f))
             .filter(|t| asserted.binary_search(t).is_err())
             .collect();
         inferred.sort_unstable();
