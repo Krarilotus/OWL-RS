@@ -357,6 +357,38 @@ systems = []
             self.assertEqual([c["name"] for c in abba.load_family(abba.ENV_FAMILY, ROOT, harness=head)["cases"]],
                              ["dl-number-fragment"])
 
+    def test_a_family_s_own_cases_are_the_declared_harness_s(self):
+        """Sol-loop of review r1's fix (S1): a family's own cases were read from the launching
+        checkout while the harness's fast suite times them from its own copy of the family file
+        (NRESE_FAMILY in the harness's tree). With a declared harness, the family file must be at it
+        byte for byte; a file absent there, or changed since, is refused before anything runs."""
+        own_case = ('\n[[case]]\nname = "t-own"\narea = "query"\nwhat = "a case of its own"\nsemantics = "none"\n'
+                    'data = "social people={n}"\nmetric = "sum_p50_ms"\ncap_gb = 1\nsystems = []\n'
+                    'check = {{ "loaded" = ">= 1" }}\n')
+        with tempfile.TemporaryDirectory() as root:
+            repo = Path(root)
+            git = lambda *a: abba.subprocess.run(["git", "-C", root, *a], capture_output=True, text=True,  # noqa: E731
+                                                 check=True).stdout.strip()
+            git("init", "-q")
+            commit = lambda m: (git("add", "-A"), git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",  # noqa: E731
+                                                      "--allow-empty", "-m", m), git("rev-parse", "HEAD"))[2]
+            before = commit("no family yet")
+            path = repo / "benches" / "abba" / "own.toml"
+            path.parent.mkdir(parents=True)
+            path.write_bytes((FAMILY + own_case.format(n=1000)).encode("utf-8"))
+            harness = commit("the family")
+            catalog = abba.cases_registry.load()
+            self.assertEqual([c["name"] for c in abba.load_family(path, repo, catalog, harness=harness)["cases"]],
+                             ["lab-olympics", "t-own"])
+            path.write_bytes((FAMILY + own_case.format(n=2000)).encode("utf-8"))  # B changes the case's data
+            changed = commit("its case changed")
+            for at, why in ((harness, "differs"), (before, "isn't at")):
+                with self.subTest(why):
+                    with self.assertRaises(abba.Invalid) as refused:
+                        abba.load_family(path, repo, catalog, harness=at)
+                    self.assertIn(why, "\n".join(refused.exception.args[0]))
+            self.assertEqual(len(abba.load_family(path, repo, catalog, harness=changed)["cases"]), 2)
+
     def test_run_builds_the_family_from_the_registry(self):
         """`run --cases/--areas`: registry cases only, each once, the timeable ones of an area; an
         unknown name or area, a case that can't be timed, and an empty selection are refused with

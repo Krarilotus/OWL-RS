@@ -162,6 +162,20 @@ def load_family(path: str | Path, repo: Path, catalog: list[dict] | None = None,
         # The registry the job runs, the declared harness's, wherever this runs from (review r1
         # R1-F4: a check in B's checkout read B's registry for an older harness); this tree's without one.
         catalog = cases_registry.load_at(repo, harness) if harness else cases_registry.load()
+    if own and harness:
+        # The harness's fast suite times the family's own cases from its own copy of this file
+        # (NRESE_FAMILY, read in the harness's tree): the file must be there as it is here, or the
+        # plan and the manifest describe cases other than those timed (sol-loop of review r1, S1).
+        # Compared as git blobs, its filters applied (a Windows checkout's line endings aren't a change).
+        at = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet", f"{harness}:{rel}"],
+                            capture_output=True, text=True)
+        if at.returncode != 0:
+            raise Invalid([f"{rel} isn't at the harness {harness[:12]}, whose fast suite would time its own cases"])
+        here = subprocess.run(["git", "-C", str(repo), "hash-object", "--path", rel, "--stdin"], input=raw,
+                              capture_output=True)
+        if here.returncode != 0 or here.stdout.decode().strip() != at.stdout.strip():
+            raise Invalid([f"{rel} differs at the harness {harness[:12]}: its own cases would be timed as the "
+                           "harness has them, not as declared here"])
     if own:
         catalog = [*catalog, *({**c, "group": "family"} for c in cases_registry.family_cases(Path(repo).resolve() / rel))]
         names = [c["name"] for c in catalog]
