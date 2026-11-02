@@ -13,7 +13,7 @@ has been measured so far. Start here.
 | What did a given run cover, on which commit and host? | [runs/](runs/README.md): one record per run |
 | Which workloads and systems exist, and which pair can run? | [suite/workloads.toml](suite/workloads.toml), [suite/systems.toml](suite/systems.toml); `suite.py` prints the matrix |
 | Which host does what, and where are the verified inputs? | [hosts.toml](hosts.toml) |
-| Did a change make NRESE slower? | level 2 below: `fast/fast.py run`, then `fast/fast.py compare BASE NEW` |
+| Did a change make NRESE slower? | `python benches/suite/abba.py run --a BASE --b CHANGE --cases ...` (or `--areas ...`): an A-B-B-A on the fleet, one command ([abba/README.md](abba/README.md)) |
 
 ## Four levels
 

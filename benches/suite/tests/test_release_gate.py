@@ -286,6 +286,41 @@ class Rounds(unittest.TestCase):
         self.assertIsNone(gate_module.confirm_job([clean], "C:/repo"))
         self.assertTrue(gate_module.verdict([clean], self.W3C, self.GUARDS)[0])
 
+    def test_two_parts_on_one_host_are_not_rounds_of_each_other(self):
+        """Placed by capability, the timed and the big part may land on one host: grouped by host,
+        the big part's round 0 read as a confirmation of the timed part's (and its losses as
+        confirmed). A part is its prefix; a confirmation keeps its part's."""
+        timed, big = self.round_(1.0), run_gate(passes(slower(1.0)), context={**CONTEXT, "prefix": "rg-cccccccc-big"})
+        confirm = run_gate(passes(slower(1.0)), context={**CONTEXT, "round": 1})
+        parts = gate_module.rounds_of([timed, big, confirm])
+        self.assertEqual(sorted(len(rounds) for rounds in parts), [1, 2])
+        self.assertEqual([r["context"]["prefix"] for r in max(parts, key=len)], ["rg-cccccccc", "rg-cccccccc"])
+
+    def test_a_confirmation_runs_where_its_first_round_ran_and_says_why(self):
+        """Its pin is the gate's one genuine locality (its builds, its floor, its rounds combined);
+        a report naming no host gives no confirmation job, never one on a host named in code."""
+        first = self.round_(1.08)
+        with patch.object(gate_module, "checkout_rev", lambda checkout, cand, harness: harness):
+            job = gate_module.confirm_job([first], "C:/repo")
+            self.assertEqual((job["requires"]["hosts"], job["requires"]["roles"]), (["phuoc-yu"], ["measure", "build"]))
+            self.assertIn("first round", job["pin_reason"])
+            hostless = run_gate(passes(slower(1.08)), context={**CONTEXT, "host": ""})
+            with self.assertRaises(SystemExit):
+                gate_module.confirm_job([hostless], "C:/repo")
+
+    def test_a_part_asks_for_the_data_its_cases_read(self):
+        """The fleet places by `has`: the verified bench assets for frozen datasets, ORE ontologies
+        and reference taxonomies; the SPARQL workloads' data for what benches/sparql/prepare.sh makes
+        and the WatDiv query sets; nothing for generated data."""
+        need = gate_module.data_needs
+        self.assertEqual(need([{"data": "social people=1000"}]), [])
+        self.assertEqual(need([{"data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}]), ["owlrs-bench-assets"])
+        self.assertEqual(need([{"data": "ore:ore_ont_9724"}]), ["owlrs-bench-assets"])
+        self.assertEqual(need([{"data": "el classes=10", "reference": "/fast/ref/x.tax"}]), ["owlrs-bench-assets"])
+        self.assertEqual(need([{"data": "volume:bsbm-100m.nt"}]), ["owlrs-sparql-data"])
+        self.assertEqual(need([{"data": "none", "queries": "@watdiv-10m"}]), ["owlrs-sparql-data"])
+        self.assertEqual(need([{"data": "concat:volume:lubm-1.nt+social people=10"}]), ["owlrs-bench-assets"])
+
 
 class Verdicts(unittest.TestCase):
     def test_the_candidate_failing_a_case_blocks_and_a_baseline_failing_is_reported(self):
@@ -529,7 +564,7 @@ class Parts(unittest.TestCase):
         self.assertIn("its cap is 28 GB", not_run["bsbm-bi-100m"])
         run, not_run, elsewhere = gate_module.plan(catalog, 24, big_gb=28)
         self.assertEqual((run, sorted(not_run)), (["small"], ["huge"]))
-        self.assertIn("timed on khaleesi-wsl", elsewhere["bsbm-bi-100m"])
+        self.assertIn("timed in the big part", elsewhere["bsbm-bi-100m"])  # a part, never a host's name
         run, not_run, elsewhere = gate_module.plan(catalog, 28, min_gb=24)  # the big host's share
         self.assertEqual(run, ["bsbm-bi-100m"])
 
@@ -565,11 +600,30 @@ class Parts(unittest.TestCase):
             counts["OWL 2 RL"]["skipped"] = 89
             self.assertIn("OWL 2 RL: 89 skipped, at most 3 known", gate_module.w3c_check(counts, expected))
 
-    def test_the_jobs_run_the_whole_gate_in_blocks_on_its_hosts(self):
+    def test_the_jobs_run_the_whole_gate_in_blocks_asking_by_capability_one_set(self):
+        """The brief of 2 Nov 2026: the gate asks by capability, never a host, and goes as one set.
+        Each timed part builds every side where it times them (untimed steps of its own job: no
+        binaries staged between hosts, which WSL hosts refuse) and holds its host alone only for its
+        blocks."""
         found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None)
         timed, checks = found["rg-test-timed"], found["rg-test-checks"]
-        self.assertEqual((timed["kind"], timed["class"], timed["after"]), ("owlrs.timed", "exclusive", ["rg-test-build"]))
-        self.assertEqual(checks["requires"]["hosts"], ["office-pc"])
+        self.assertEqual((timed["kind"], timed["class"]), ("owlrs.timed", "exclusive"))
+        for job in found.values():
+            self.assertNotIn("hosts", job["requires"], job["id"])
+            self.assertNotIn("after", job, job["id"])
+        self.assertEqual((timed["requires"]["roles"], timed["requires"]["os"]), (["measure", "build"], "linux"))
+        self.assertEqual(checks["requires"]["roles"], ["test"])
+        untimed = set(timed["untimed_steps"])
+        self.assertEqual({s[2] for i, s in enumerate(timed["steps"]) if i not in untimed}, {"block"})
+        self.assertEqual({s[2] for i, s in enumerate(timed["steps"]) if i in untimed},
+                         {"build", "prepare", "report", "clean"})
+        self.assertLess(max(i for i, s in enumerate(timed["steps"]) if s[2] in ("build", "prepare")),
+                        min(i for i, s in enumerate(timed["steps"]) if s[2] == "block"))
+        import tomllib
+        whole = tomllib.loads(gate_module.toml_set({"id": "rg-test", "fail": "continue"}, list(found.values())))
+        self.assertEqual((whole["set"]["id"], [j["id"] for j in whole["job"]]), ("rg-test", list(found)))
+        self.assertEqual(whole["job"][0]["steps"], timed["steps"])
+        self.assertNotIn("_plan", whole["job"][0])  # the planner's own figures stay out of the job
         blocks_ = [s for s in timed["steps"] if s[2] == "block"]
         self.assertEqual([s[3] for s in blocks_], ["1", "2", "3"])  # 2 asked: one whole square of three sides
         self.assertEqual(blocks_[0][2:], ["block", "1", "c" * 40, "1", "-", f"base={gate_module.BASE}",
@@ -582,14 +636,17 @@ class Parts(unittest.TestCase):
         self.assertEqual(tomllib.loads(gate_module.toml_job(timed))["steps"], timed["steps"])
 
     def test_the_big_cases_run_on_a_linux_host_never_native_windows(self):
-        """Round 8: the big job went to khaleesi, native Windows, with the build's ELF binaries."""
+        """Round 8: the big job went to khaleesi, native Windows, with the build's ELF binaries. It
+        asks for Linux and the memory of its cases, and builds its own binaries there."""
         found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None)
         big = found["rg-test-big"]
-        self.assertEqual(big["requires"]["hosts"], ["khaleesi-wsl"])
-        self.assertEqual([s[2] for s in big["steps"][:2]], ["unpack", "prepare"])
-        self.assertIn({"name": "binaries", "source": {"artifact": "rg-test-build/binaries"}}, big["inputs"])
-        with self.assertRaises(SystemExit):
-            gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None, big_host="khaleesi")
+        self.assertEqual((big["requires"]["os"], big["requires"]["ram_gb"]), ("linux", 32))
+        self.assertEqual({s[2] for s in big["steps"][:4]}, {"build", "prepare"})
+        self.assertFalse([i for i in big["inputs"] if "artifact" in i["source"]])
+        self.assertEqual(big["env"]["GATE_MIN_GB"], "24")
+        # A selection with no case above the timed part's memory has no big part.
+        small = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "lab-olympics")
+        self.assertEqual(sorted(small), ["rg-test-checks", "rg-test-timed"])
         # And the step itself: on another system than Linux, unpack refuses.
         import shutil
         import subprocess
@@ -774,8 +831,8 @@ point {head} "$b"
 
             def checkout_of(candidate):
                 found = gate_module.jobs(candidate, harness, tmp, "rg-test", 2, None, base=root, main=root,
-                                         checks=False, big_host=None)
-                return found["rg-test-build"]["inputs"][0]["source"]["rev"]
+                                         checks=False, big_gb=None)
+                return found["rg-test-timed"]["inputs"][0]["source"]["rev"]
             self.assertEqual((checkout_of(rebased), checkout_of(root)), (rebased, harness))
             with self.assertRaises(SystemExit) as refused:
                 checkout_of(diverged)
@@ -1063,7 +1120,10 @@ class Measurement(unittest.TestCase):
         self.assertEqual(gate_module.blocks(["a", "b", "c"], measure, square=3),
                          [["a", "b", "c"]] * 3 + [["b"]] * 3)
         timed = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None, measure=measure)["rg-test-timed"]
-        self.assertEqual(timed["steps"][0][2:], ["plan-blocks", "c" * 40])
+        planned = [i for i, s in enumerate(timed["steps"]) if s[2:] == ["plan-blocks", "c" * 40]]
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(timed["steps"][planned[0] + 1][2], "block")
+        self.assertIn(planned[0], timed["untimed_steps"])
         self.assertEqual([s[6] for s in timed["steps"] if s[2] == "block"], [f"plan-block-{k}.json" for k in range(1, 7)])
         self.assertEqual((timed["env"]["GATE_SQUARE"], timed["env"]["GATE_MIN_BLOCKS"]), ("3", "3"))
         two = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None, measure=measure,

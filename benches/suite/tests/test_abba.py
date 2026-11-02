@@ -206,7 +206,7 @@ systems = []
         found = abba.jobs(self.family, B, self.repo.as_posix(), "office-pc")  # its sides resolve there too
         timed = found["abba-t-bbbbbbbb"]
         self.assertEqual((timed["requires"]["hosts"], timed["class"], timed["steps"][0][-2:]),
-                         (["office-pc"], "exclusive", ["check", self.family["path"]]))
+                         (["office-pc"], "exclusive", ["check", abba.ENV_FAMILY]))  # registry cases: carried
         blocks = [s for s in timed["steps"] if "block" in s]
         self.assertEqual(len(blocks), 6)
         self.assertEqual(blocks[0][-3:], [f"a={A}", f"a2={A}", f"b={B}"])
@@ -215,6 +215,103 @@ systems = []
         with patch.object(abba.rg, "read_floor", side_effect=lambda path: read.append(path.stem)):
             self.verdict(self.round_(records(), host="office-pc"))
         self.assertEqual((timed["env"]["GATE_HOST"], read), ("office-pc", ["office-pc"]))
+        self.assertIn("pin_reason", timed)
+
+    def test_one_job_asks_by_capability_builds_untimed_and_times_alone(self):
+        """The brief of 2 Nov 2026: no host names. A build job and a timed job pinned to one host
+        were the only way to time where the binaries were built; one job does both, its builds
+        shareable (untimed steps), its host kept between steps, alone for its blocks."""
+        found = abba.jobs(self.family, B, self.repo.as_posix())
+        self.assertEqual(list(found), ["abba-t-bbbbbbbb"])
+        job = found["abba-t-bbbbbbbb"]
+        self.assertNotIn("hosts", job["requires"])
+        self.assertNotIn("GATE_HOST", job["env"])
+        self.assertEqual((job["kind"], job["requires"]["roles"], job["requires"]["os"]),
+                         ("owlrs.timed", ["measure", "build"], "linux"))
+        untimed = set(job["untimed_steps"])
+        timed_kinds = {s[2] for i, s in enumerate(job["steps"]) if i not in untimed}
+        self.assertEqual(timed_kinds, {"block"})
+        first_block = min(i for i, s in enumerate(job["steps"]) if "block" in s)
+        self.assertEqual({s[2] if s[1].endswith(".sh") else s[3] for s in job["steps"][:first_block]},
+                         {"check", "build", "prepare"})
+        self.assertGreater(job["est_min"], 0)
+        import tomllib
+        whole = tomllib.loads(abba.set_file("abba-t-bbbbbbbb", list(found.values())))
+        self.assertEqual((whole["set"]["id"], whole["set"]["fail"], len(whole["job"])), ("abba-t-bbbbbbbb", "stop-rest", 1))
+        self.assertEqual(whole["job"][0]["untimed_steps"], job["untimed_steps"])
+
+    def test_a_family_of_registry_cases_runs_from_anywhere_without_a_commit(self):
+        """PR #91's timing (2 Nov 2026): a family had to be committed on a throwaway ref to be read in
+        the job's checkout. A family of registry cases travels in the job (ABBA_FAMILY): read from a
+        file outside the repository or from the environment, it is the same family (its SHA-256 and
+        hypotheses), and its job names env:ABBA_FAMILY, not a path."""
+        text = self.path.read_bytes().decode("utf-8")  # the family file's own bytes, its identity
+        with tempfile.TemporaryDirectory() as outside:
+            path = Path(outside) / "f.toml"
+            path.write_bytes(text.encode("utf-8"))
+            there = abba.load_family(path, self.repo)
+            with patch.dict(abba.os.environ, {"ABBA_FAMILY": text}):
+                carried = abba.load_family(abba.ENV_FAMILY, self.repo)
+        for family in (there, carried):
+            self.assertEqual((family["sha256"], family["hypotheses"]), (self.family["sha256"], self.family["hypotheses"]))
+        job = next(iter(abba.jobs(there, B, self.repo.as_posix()).values()))
+        self.assertEqual(job["env"]["ABBA_FAMILY"], text)
+        self.assertNotIn("NRESE_FAMILY", job["env"])
+        self.assertEqual(job["steps"][0][-2:], ["check", abba.ENV_FAMILY])
+        # Its rounds are judged against the family whichever way it was read.
+        self.family = carried
+        self.assertEqual(self.verdict(self.round_(records(), name="carried"))[0], abba.NO_LOSS)
+        # An empty variable is no family; a family with cases of its own stays in the repository.
+        with patch.dict(abba.os.environ, {"ABBA_FAMILY": ""}), self.assertRaises(abba.Invalid):
+            abba.load_family(abba.ENV_FAMILY, self.repo)
+        own = FAMILY + '[[case]]\nname = "t-own"\narea = "query"\nwhat = "x"\nsemantics = "none"\n' \
+                       'data = "social people=1000"\nmetric = "sum_p50_ms"\ncap_gb = 1\nsystems = []\ncheck = { "loaded" = ">= 1" }\n'
+        with patch.dict(abba.os.environ, {"ABBA_FAMILY": own}), self.assertRaises(abba.Invalid) as refused:
+            abba.load_family(abba.ENV_FAMILY, self.repo)
+        self.assertIn("lives in the repository", "\n".join(refused.exception.args[0]))
+
+    def test_run_builds_the_family_from_the_registry(self):
+        """`run --cases/--areas`: registry cases only, each once, the timeable ones of an area; an
+        unknown name or area, a case that can't be timed, and an empty selection are refused with
+        the reason. The family it writes is a family file: loaded, its hypotheses are those of the
+        same family written by hand."""
+        catalog = abba.cases_registry.load()
+        self.assertEqual(abba.select(catalog, ["lab-olympics", "lab-olympics"], []), ["lab-olympics"])
+        reasoning = abba.select(catalog, [], ["reasoning"])
+        self.assertIn("rl-sameas", reasoning)
+        self.assertTrue(all(c["check"] and c.get("outcome", "ok") == "ok" for c in catalog if c["name"] in reasoning))
+        self.assertNotIn("rl-single-thread", reasoning)  # no content check: not timed
+        for cases, areas, why in ((["no-such-case"], [], "no case 'no-such-case'"),
+                                  ([], ["no-such-area"], "no area 'no-such-area'"),
+                                  (["rl-single-thread"], [], "rl-single-thread: no content check"),
+                                  (["dl-transitive-400"], [], "a declared outcome (gave-up)"),
+                                  ([], [], "no case: name --cases or --areas")):
+            with self.subTest(why), self.assertRaises(abba.Invalid) as refused:
+                abba.select(catalog, cases, areas)
+            self.assertIn(why, "\n".join(refused.exception.args[0]))
+        text = abba.family_text("t", {"a": A, "b": B}, ["lab-olympics"], 6)
+        self.assertNotIn("\r", text)
+        self.path.write_bytes(text.encode("utf-8"))
+        built = self.load()
+        self.path.write_text(FAMILY.replace('dimensions = ["time/q01-point-lookup", "time/q06-text-filter"]\n'
+                                            "min_samples = 3\n", ""), encoding="utf-8")
+        self.assertEqual(built["hypotheses"], self.load()["hypotheses"])
+        # Effort follows spread: blocks from the calibration, in whole squares, at least one.
+        self.assertEqual(abba.suggested_blocks(["x"], {}), 3)
+        self.assertEqual(abba.suggested_blocks(["x"], {"x": {"passes": 8}}), 6)
+        self.assertEqual(abba.suggested_blocks(["x"], {"x": {"blocks": 7}}), 9)
+
+    def test_a_job_s_check_records_the_host_the_fleet_chose(self):
+        """Placed by capability, the round's host is known only where it runs: the check writes
+        FLEET_HOST into the manifest (GATE_HOST, a pin, wins), and the report reads that host's floor."""
+        with tempfile.TemporaryDirectory() as out:
+            env = {"FLEET_OUT": out, "FLEET_HOST": "office-pc", "ABBA_HARNESS": B, "ABBA_FAMILY": FAMILY}
+            inherited = {k: v for k, v in abba.os.environ.items() if k not in ("GATE_HOST", "NRESE_FAMILY")}
+            done = abba.subprocess.run([sys.executable, "-B", str(ROOT / "benches/suite/abba.py"), "check", abba.ENV_FAMILY],
+                                       env={**inherited, **env}, capture_output=True, text=True, cwd=ROOT)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            manifest = json.loads((Path(out) / "abba-manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual((manifest["host"], manifest["path"]), ("office-pc", abba.ENV_FAMILY))
 
 
 if __name__ == "__main__":
