@@ -25,14 +25,15 @@ Read [docs/README.md](docs/README.md) (which document answers what),
 - Work in your own branch and worktree. The maintainer merges and pushes. Never skip the hooks.
 - Delete only what you created unless the user authorizes a wider cleanup; stop
   processes by PID.
-- Hosts and roles: [benches/hosts.toml](benches/hosts.toml); verified shared inputs are
-  read-only. Rust is compiled, tested and formatted on the build host: `scripts/lib/remote.sh`
-  sends the working tree to it (`git config nrese.buildHost`). The machine you run on is the
-  owner's workstation: it may build (`NRESE_BUILD_HOST=local`), but benchmarks, reasoners,
-  containers and large data run on the measuring and preparing hosts. Its guard stops our
-  heavy processes when memory or disk run low. Every run on a host goes through the
-  measurement queue (`benches/suite/queue.py`), never started by hand: the queue packs
-  shareable jobs side by side and gives timed ones the host alone.
+- Builds, tests, benchmarks, reasoners, containers and large data run as fleet jobs, never
+  started by hand on a host: `fleet rules` says what may run where, `fleet why <job>` explains
+  a placement. The push tier and the Windows check already run that way
+  ([CONTRIBUTING.md](CONTRIBUTING.md#building-and-measuring)); a change is timed only through
+  [benches/abba/README.md](benches/abba/README.md). Verified shared inputs are read-only.
+- The machine you run on is the owner's workstation: its commit tier needs no build, and its
+  guard stops our heavy processes when memory or disk run low.
+- Before building a tool, look in [docs/README.md](docs/README.md#where-is) for the one that
+  exists.
 - `literature/` is read-only. Results of licensed systems are never committed.
 - Write files with the editor tools; the shell mangles backslashes.
 - Commit-message rules: [CONTRIBUTING.md](CONTRIBUTING.md).

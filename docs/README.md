@@ -18,6 +18,25 @@ list wins and the lower one is corrected in the same change.
 | How is it measured? | [benches/README.md](../benches/README.md) (the four levels, hosts), the rules in [benches/PROTOCOL.md](../benches/PROTOCOL.md) |
 | What should research find out next? | [plan/2026-10-05-research-tasks.md](plan/2026-10-05-research-tasks.md) |
 
+## Where is
+
+The tools that exist, so none is built twice. Each one's own header or README is its manual.
+
+| What | Where |
+|---|---|
+| Build, test, format, land: the gate's tiers | `scripts/check.sh commit\|push\|windows\|all`, [CONTRIBUTING.md](../CONTRIBUTING.md#checks); the hooks in `.githooks/` |
+| Builds and tests on other machines | fleet jobs: the push hook and `scripts/check.sh windows` submit them ([CONTRIBUTING.md](../CONTRIBUTING.md#building-and-measuring)); `scripts/lib/fleet-job.sh`, `scripts/lib/gate-job.sh` |
+| The release gate | `scripts/release-gate.sh` (its header), the checklist §4 in [plan/2026-10-05-v2-merge-checklist.md](plan/2026-10-05-v2-merge-checklist.md), the approved trade-offs in `benches/release-tradeoffs.toml` |
+| Benchmarks: cases, workloads, systems, results | [benches/README.md](../benches/README.md); the cases in `benches/cases/`, the catalogue [benches/CATALOG.md](../benches/CATALOG.md), the generated [STATUS](../benches/STATUS.md) and [STANDINGS](../benches/STANDINGS.md), the runner `benches/suite/suite.py` |
+| Timing a change against its base | `benches/suite/abba.py`, [benches/abba/README.md](../benches/abba/README.md); the rules in [benches/PROTOCOL.md](../benches/PROTOCOL.md) |
+| Bisecting a slowdown | `scripts/bisect-perf.py` |
+| Proving HTTP behaviour on a real server | [scripts/verify/README.md](../scripts/verify/README.md) |
+| W3C and other conformance suites | `scripts/fetch-w3c-tests.sh`; each suite's runner and expected failures in its crate's `tests/` |
+| Fuzzing, seed sweeps, Miri | [fuzz/README.md](../fuzz/README.md), `scripts/fuzz-campaign.sh`; `scripts/seed-sweep.py` with `benches/seed-sweeps.toml`; `scripts/miri.sh` |
+| Checked files and lints | `scripts/check-locks.sh` (Cargo lock files current), `scripts/check-names.sh` (Docker names), `scripts/check-doc-paths.py` (paths the docs name exist) |
+| Client compatibility | [tests/compat/README.md](../tests/compat/README.md) |
+| Plan and state | [ROADMAP.md](ROADMAP.md), [STATUS.md](STATUS.md), the merge checklist above |
+
 ## Design
 
 | Document | What |
