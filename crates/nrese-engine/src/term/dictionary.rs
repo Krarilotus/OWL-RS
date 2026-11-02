@@ -2043,6 +2043,10 @@ fn validate_key(key: &[u8]) -> EngineResult<()> {
 }
 
 #[cfg(test)]
+#[path = "dictionary_lock_tests.rs"]
+mod lock_order_tests;
+
+#[cfg(test)]
 mod tests {
     use nrese_rdf::vocab::xsd;
     use nrese_rdf::{BlankNodeRef, LiteralRef, NamedNodeRef};
