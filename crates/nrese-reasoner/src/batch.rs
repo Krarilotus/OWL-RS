@@ -37,6 +37,7 @@ use super::ir::{Guard, Head, Rule, SharedClasses, Term};
 use super::ir::{Triple, Violation};
 use super::lists::{ListVocabulary, instantiate};
 use super::representatives::{EqualityClasses, Guarded, over_classes};
+use nrese_exec::ChargedVec;
 use nrese_exec::heap;
 use nrese_exec::search::Finger;
 
@@ -1876,56 +1877,39 @@ impl Equality {
         seeds.par_sort_unstable();
         seeds.dedup();
         self.member_scans += 3 * seeds.len() as u64;
-        let room = super::eval::memory_room();
-        let room = nrese_exec::Budget::new(usize::try_from(room).unwrap_or(usize::MAX));
-        let charge = |bytes: usize| room.charge(bytes).is_ok();
-        let release = |bytes: usize| room.release(bytes);
-        let fact_bytes = size_of::<Triple>();
-        let lists: Vec<Vec<Triple>> = seeds
+        let room = room_budget();
+        // Each thread's copies, charged as they grow, then appended into one list.
+        let out = seeds
             .par_iter()
-            .map(|&[s, p, o]| {
-                let (ms, mp, mo) = (
-                    self.members(store, s),
-                    self.members(store, p),
-                    self.members(store, o),
-                );
-                let mut facts = Vec::new();
-                for &s in &ms {
-                    for &p in &mp {
-                        for &o in &mo {
-                            let fact = [s, p, o];
-                            if !store.contains(fact) {
-                                // A full list moves to a buffer twice its size, at least 4.
-                                if facts.len() == facts.capacity() {
-                                    let old = facts.capacity() * fact_bytes;
-                                    if !charge((2 * facts.capacity()).max(4) * fact_bytes) {
-                                        return Err(Interrupted);
-                                    }
-                                    facts.push(fact);
-                                    release(old);
-                                } else {
-                                    facts.push(fact);
+            .try_fold(
+                || ChargedVec::new(&room),
+                |mut copies, &[s, p, o]| {
+                    let (ms, mp, mo) = (
+                        self.members(store, s),
+                        self.members(store, p),
+                        self.members(store, o),
+                    );
+                    for &s in &ms {
+                        for &p in &mp {
+                            for &o in &mo {
+                                let fact = [s, p, o];
+                                if !store.contains(fact) {
+                                    push_copy(&mut copies, fact)?;
                                 }
                             }
                         }
                     }
-                }
-                Ok(facts)
-            })
-            .collect::<Result<_, _>>()?;
-        // The round's list beside the seeds' lists; then, those freed, its set: under three
-        // slots a fact (a power of two, filled to 7/8), each a fact and a control byte.
-        let total: usize = lists.iter().map(Vec::len).sum();
-        let held: usize = lists.iter().map(|list| list.capacity() * fact_bytes).sum();
-        if !charge(total * fact_bytes) {
+                    Ok(copies)
+                },
+            )
+            .try_reduce(|| ChargedVec::new(&room), appended)?;
+        // The round's set of them, charged before it is made: under three slots a fact (a
+        // power of two, filled to 7/8), each a fact and a control byte.
+        let set_bytes = out.len().checked_mul(3 * (size_of::<Triple>() + 1));
+        if !set_bytes.is_some_and(|bytes| room.charge(bytes).is_ok()) {
             return Err(Interrupted);
         }
-        let out = lists.concat();
-        drop(lists);
-        release(held);
-        if !charge(total * 3 * (fact_bytes + 1)) {
-            return Err(Interrupted);
-        }
+        let (out, _held) = out.into_parts();
         self.produced = out.iter().copied().collect();
         Ok(out)
     }
@@ -2743,6 +2727,38 @@ fn run(
     Ok(result)
 }
 
+/// What the process may still take now ([`super::eval::memory_room`]), as the budget the
+/// copies of `owl:sameAs` classes are charged to before they are made.
+fn room_budget() -> nrese_exec::Budget {
+    nrese_exec::Budget::new(usize::try_from(super::eval::memory_room()).unwrap_or(usize::MAX))
+}
+
+/// `copy` pushed, the list doubling when full, charged before it grows: never by one item
+/// at a time, which would move the whole list at every push near the limit.
+fn push_copy(
+    copies: &mut ChargedVec<Triple, &nrese_exec::Budget>,
+    copy: Triple,
+) -> Result<(), Interrupted> {
+    if copies.len() == copies.capacity() {
+        let doubled = copies.capacity().max(4);
+        copies.reserve_exact(doubled).map_err(|_| Interrupted)?;
+    }
+    copies.push(copy).map_err(|_| Interrupted)
+}
+
+/// `more` appended to `kept`, charged before `kept` grows: the reduction of each thread's
+/// copies.
+fn appended<'a>(
+    mut kept: ChargedVec<Triple, &'a nrese_exec::Budget>,
+    more: ChargedVec<Triple, &'a nrese_exec::Budget>,
+) -> Result<ChargedVec<Triple, &'a nrese_exec::Budget>, Interrupted> {
+    if kept.is_empty() {
+        return Ok(more);
+    }
+    kept.extend_from_slice(&more).map_err(|_| Interrupted)?;
+    Ok(kept)
+}
+
 /// What a materialisation with equality by representatives lists ([`Listing`]).
 /// [`Interrupted`] where the expanded closure doesn't fit what the process may still take
 /// ([`super::eval::memory_room`]).
@@ -2760,45 +2776,46 @@ fn list(store: Store, reps: &Representatives) -> Result<Vec<Triple>, Interrupted
         ),
         Listing::Expanded => {
             // The facts that mention a class, expanded while the input is there to leave
-            // its facts out; the others as they are. The copies are counted and admitted
-            // before any is made, twice over: the parallel collection holds its parts and
-            // the list at once.
+            // its facts out; the others as they are. Each thread's copies are charged as
+            // they grow, then appended into one list, which gets the room for the others
+            // before it is handed on.
             let facts = store.facts_where(&|fact| current(fact) && shared.mentioned(fact));
-            let size = |id: u64| {
-                reps.classes
-                    .class_of(id)
-                    .map_or(1, |class| class.len() as u64)
-            };
-            let copies = facts.iter().try_fold(0u64, |sum, fact| {
-                let copies = fact
-                    .iter()
-                    .try_fold(1u64, |n, &id| n.checked_mul(size(id)))?;
-                sum.checked_add(copies)
-            });
-            let bytes =
-                copies.and_then(|copies| copies.checked_mul(2 * size_of::<Triple>() as u64));
-            if !bytes.is_some_and(|bytes| bytes <= super::eval::memory_room()) {
-                return Err(Interrupted);
-            }
-            // A fact's copies the allocator refuses end the listing too.
-            let refused = std::sync::atomic::AtomicBool::new(false);
-            let expanded: Vec<Triple> = facts
-                .into_par_iter()
-                .flat_map_iter(|fact| {
-                    reps.classes.expand(fact).unwrap_or_else(|| {
-                        refused.store(true, std::sync::atomic::Ordering::Relaxed);
-                        Vec::new()
-                    })
-                })
-                .filter(|&[s, p, o]| {
-                    !store
-                        .relation(p)
-                        .is_some_and(|relation| relation.input.contains(s, o))
-                })
-                .collect();
-            if refused.into_inner() {
-                return Err(Interrupted);
-            }
+            let room = room_budget();
+            let mut expanded = facts
+                .par_iter()
+                .try_fold(
+                    || ChargedVec::new(&room),
+                    |mut copies, fact| {
+                        let [ms, mp, mo] = fact.each_ref().map(|id| {
+                            reps.classes
+                                .class_of(*id)
+                                .unwrap_or(std::slice::from_ref(id))
+                        });
+                        for &s in ms {
+                            for &p in mp {
+                                for &o in mo {
+                                    let input = store
+                                        .relation(p)
+                                        .is_some_and(|relation| relation.input.contains(s, o));
+                                    if !input {
+                                        push_copy(&mut copies, [s, p, o])?;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(copies)
+                    },
+                )
+                .try_reduce(|| ChargedVec::new(&room), appended)?;
+            // What `into_listed` adds at most: the runs' facts. It adds none of the input's
+            // (its `input` below takes none), so their room isn't asked for.
+            let others: usize = store
+                .relations
+                .iter()
+                .map(|relation| relation.base.so.len() + relation.recent.so.len())
+                .sum();
+            expanded.reserve_exact(others).map_err(|_| Interrupted)?;
+            let (expanded, _held) = expanded.into_parts();
             store.into_listed(
                 &|_| false,
                 &|fact| current(fact) && !shared.mentioned(fact),

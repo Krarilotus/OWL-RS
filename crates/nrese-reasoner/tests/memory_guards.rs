@@ -272,12 +272,12 @@ fn equality_keeps_the_working_set_as_the_only_copy() {
 const BYTES_PER_FACT: usize = 26;
 
 /// The equality copies a materialisation adds (by replication) or lists (by
-/// representatives, expanded) are admitted against the process's memory limit before they
-/// are made: past it, the materialisation stops while the heap holds a fraction of what
-/// they would take. One class of 300 identities and one fact over it in all three places
-/// are 27 M copies, about 650 MB, under a limit 64 MiB above what the process holds.
+/// representatives, expanded) are charged to what the process's memory limit leaves before
+/// they are made: where they don't fit, the materialisation stops without passing it. One
+/// class of 300 identities and one fact over it in all three places are 27 M copies, about
+/// 650 MB, under a limit 32 MiB above what the process holds: the heap stays under 64 MiB.
 #[test]
-fn equality_copies_past_the_memory_limit_stop_before_they_are_made() {
+fn equality_copies_past_the_memory_limit_stop_within_it() {
     use nrese_reasoner::ir::{OWL, Vocabulary};
 
     /// The process's memory limit cleared when the test ends, however it ends.
@@ -304,7 +304,7 @@ fn equality_copies_past_the_memory_limit_stop_before_they_are_made() {
     }
     let held = nrese_exec::memory::process_bytes().expect("the process's memory reads here");
     let _unlimited = Unlimited;
-    nrese_exec::memory::set_process_limit(held + (64 << 20));
+    nrese_exec::memory::set_process_limit(held + (32 << 20));
     for replicate in [false, true] {
         let input = grouped(facts.clone());
         let before = heap::live();
