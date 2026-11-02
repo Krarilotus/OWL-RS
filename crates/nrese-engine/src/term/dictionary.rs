@@ -29,8 +29,9 @@
 //! take their index, then `inner`). The dictionary's locks come after every lock of the
 //! engine, and no dictionary lock is held while code the dictionary doesn't own runs, except
 //! [`Dictionary::with_views`]' and [`Dictionary::for_each_key`]'s callbacks, which take no
-//! lock but `inner`'s recursive read. A vector search's `accept` runs with none
-//! ([`super::vectors::SearchInput`]).
+//! lock but `inner`'s recursive read, and [`Dictionary::intern_all`]'s iterator, run under
+//! `inner`'s write lock, which must not use the dictionary at all. A vector search's `accept`
+//! runs with none ([`super::vectors::SearchInput`]).
 
 use hashbrown::HashTable;
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec};
@@ -864,7 +865,8 @@ impl Dictionary {
         self.intern_locked(&mut self.inner.write(), &mut Vec::with_capacity(64), term)
     }
 
-    /// Interns a batch of terms under one lock acquisition.
+    /// Interns a batch of terms under one lock acquisition. `terms` is consumed under the
+    /// write lock: it must not use the dictionary (a lookup there waits forever).
     pub fn intern_all<'a>(&self, terms: impl IntoIterator<Item = TermRef<'a>>) -> Vec<TermId> {
         let mut key = Vec::with_capacity(64);
         let mut inner = self.inner.write();
