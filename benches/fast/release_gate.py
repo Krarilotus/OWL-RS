@@ -1667,8 +1667,7 @@ def data_state(cases: list[dict], make: bool = False, root: Path = ROOT) -> tupl
     import subprocess
     frozen = {d["file"]: d for d in tomllib.loads((root / "benches/datasets.toml").read_text(encoding="utf-8"))["dataset"]}
     general, cache = hosts_registry.input_path("general"), sparql_data()
-    files = sorted({s[len("volume:"):] for c in cases for s in [c.get("data", ""), *c.get("extra", [])]
-                    if s.startswith("volume:")})
+    files = sorted({f for c in cases for f in volume_files(c)})  # a concatenation's parts too (Sol r2 T2)
     lines, ok = [], True
     for name in files:
         entry = frozen.get(name, {})
@@ -1759,7 +1758,9 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
                 "priority_class": "merge-gate", "env": part_env, "stall_after_min": 90,
                 "est_min": round(est["total_min"]), "_plan": est,
                 "steps": steps, "untimed_steps": untimed,
-                "step_needs": [{"cores": 16, "ram_gb": 12}], "step_deadline_min": BUILD_MIN * len(revisions) + 120,
+                # Builds ask the part's whole memory: a host too small for its blocks would end the hold
+                # after them (Sol r2 S1).
+                "step_deadline_min": BUILD_MIN * len(revisions) + 120,
                 "requires": requires, "inputs": inputs}
 
     timed_steps = [[*gate_, "plan-blocks", harness]] if measure else []
