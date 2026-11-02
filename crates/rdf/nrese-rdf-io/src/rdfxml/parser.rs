@@ -615,18 +615,15 @@ impl<R: BufRead> RdfXmlParser<R> {
                 self.text(&text, true)
             }
             Event::GeneralRef(reference) => {
-                let resolved = match reference.resolve_char_ref() {
-                    Ok(Some(c)) => c.to_string(),
-                    Ok(None) => {
-                        let name = reference.xml10_content();
-                        let mut value = String::new();
-                        self.entity(&name, Inclusion::Content, &mut value, &mut Vec::new())?;
-                        value
+                // A character reference as in attribute values: a legal XML character only.
+                let name = reference.xml10_content();
+                let mut resolved = String::new();
+                match name.strip_prefix('#') {
+                    Some(code) => resolved.push(self.character(code)?),
+                    None => {
+                        self.entity(&name, Inclusion::Content, &mut resolved, &mut Vec::new())?
                     }
-                    Err(e) => {
-                        return Err(self.error(format!("an invalid character reference: {e}")));
-                    }
-                };
+                }
                 self.text(&resolved, true)
             }
             Event::DocType(doctype) => {

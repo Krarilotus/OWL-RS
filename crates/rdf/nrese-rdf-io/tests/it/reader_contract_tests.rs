@@ -126,10 +126,15 @@ impl Read for Broken {
 }
 
 #[test]
-fn a_read_error_ends_a_line_based_document() {
+fn a_read_error_ends_the_document() {
     use io::ErrorKind::{Interrupted, Other};
     const AB: &[u8] = b"<urn:a> <urn:p> <urn:b> .\n";
-    for format in [RdfFormat::NTriples, RdfFormat::NQuads] {
+    for format in [
+        RdfFormat::NTriples,
+        RdfFormat::NQuads,
+        RdfFormat::Turtle,
+        RdfFormat::TriG,
+    ] {
         for recovering in [false, true] {
             let parser = || {
                 let parser = RdfParser::from_format(format);
@@ -337,6 +342,16 @@ fn an_entity_in_text_is_its_replacement_text() {
   <rdf:Description rdf:about="&e;s"><e:p>&a;</e:p></rdf:Description>
 </rdf:RDF>"#;
     assert_eq!(rdf_xml(document), [Ok(literal("xz\ny"))]);
+    // A character reference in text names a legal XML character, as in an attribute.
+    for reference in ["&#xFFFE;", "&#0;", "&#X41;"] {
+        let document = format!(
+            r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:e="http://e/">
+  <rdf:Description rdf:about="http://e/s"><e:p>{reference}</e:p></rdf:Description>
+</rdf:RDF>"#
+        );
+        let items = rdf_xml(&document);
+        assert_eq!(shape(&items), [false], "{reference}: {items:?}");
+    }
 }
 
 #[test]
