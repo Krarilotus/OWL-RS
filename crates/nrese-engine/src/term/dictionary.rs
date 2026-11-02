@@ -651,10 +651,11 @@ impl Dictionary {
             tracing::warn!("vector index unreadable; built anew");
             return;
         };
-        let mut slot = self.vectors.write();
-        if slot.covered() < covered {
-            *self.derived.saved_graphs.lock() = index.graph_coverage();
-            *slot = index;
+        // Not in place of an index a search started a build in meanwhile (a search that
+        // didn't wait for this load; PR #79 fix check r1).
+        let graphs = index.graph_coverage();
+        if self.vectors.write().adopt(index) {
+            *self.derived.saved_graphs.lock() = graphs;
             self.derived.saved.lock()[VECTORS] = covered;
             self.derived
                 .loads
@@ -2330,8 +2331,9 @@ mod tests {
                 a
             });
             if installed {
-                // The graph covers N of M: the next build extends it.
-                let b = next("A's graph is behind: build B starts");
+                // A's reservation ended with its install: the file's index (no graph)
+                // takes the live one's place, and the load's search starts build B.
+                let b = next("the loaded index has no graph: build B starts");
                 drop(a);
                 search(&reopened);
                 none("A's end leaves B's reservation: no build C");
