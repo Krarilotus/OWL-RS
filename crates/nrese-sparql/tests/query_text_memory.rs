@@ -69,7 +69,8 @@ fn run(
     heap::begin_step();
     let outcome = match evaluate_query(&snapshot, &query, &options) {
         Ok(QueryResults::Solutions(mut rows)) => rows.try_fold(0, |n, row| row.map(|_| n + 1)),
-        Ok(_) => panic!("solutions"),
+        Ok(QueryResults::Graph(mut triples)) => triples.try_fold(0, |n, t| t.map(|_| n + 1)),
+        Ok(_) => panic!("solutions or a graph"),
         Err(error) => Err(error),
     };
     heap::end_step("query-text");
@@ -167,15 +168,25 @@ fn a_closure_over_a_sequence_holds_its_ends_once() {
 /// more than 1 MiB, so the query fails with `MemoryLimit`. What only repeats what is there
 /// makes nothing: ORDER BY unbound variables sorts by nothing (§15.1: unbound sorts first,
 /// so all rows tie), and a closure over 256 times the same link reaches what one does
-/// (§18.4: `p+` is a set), each answered. Either way, the query's thread holds at most the
-/// limit and its bookkeeping. On the default path and as written alike.
+/// (§18.4: `p+` is a set), each answered. A CONSTRUCT of 256 template triples makes 1 M
+/// triples, or 16 MiB from one row with a 64 KiB literal, and SAMPLE of that CONCAT a 6 KiB
+/// string per group (4,096 groups): refused.
+/// Either way, the query's thread holds at most the limit and its bookkeeping. On the
+/// default path and as written alike.
 #[test]
 fn what_the_query_text_multiplies_draws_from_the_query_budget() {
     let p = ex("p");
-    let engine = engine((0..ROWS).map(|i| {
-        let (subject, object) = (ex(&format!("s{i}")), ex(&format!("o{i}")));
-        Quad::new(subject, p.clone(), object, GraphName::DefaultGraph)
-    }));
+    // And one statement whose object is a 64 KiB literal.
+    let large = nrese_rdf::Literal::new_simple_literal("x".repeat(1 << 16));
+    let large = Quad::new(ex("large"), ex("q"), large, GraphName::DefaultGraph);
+    let engine = engine(
+        (0..ROWS)
+            .map(|i| {
+                let (subject, object) = (ex(&format!("s{i}")), ex(&format!("o{i}")));
+                Quad::new(subject, p.clone(), object, GraphName::DefaultGraph)
+            })
+            .chain([large]),
+    );
     let rows = format!("?s <{EX}p> ?o");
     let list = |item: &dyn Fn(usize) -> String, separator: &str| {
         (0..256).map(item).collect::<Vec<_>>().join(separator)
@@ -188,7 +199,8 @@ fn what_the_query_text_multiplies_draws_from_the_query_budget() {
     let keys = list(&|i| format!("CONCAT(STR(?s), \"{i}\")"), " ");
     let parts = list(&|_| "STR(?s)".to_owned(), ", ");
     let links = list(&|_| format!("<{EX}p>"), "|");
-    let cases: [(&str, String, Option<usize>); 8] = [
+    let template = list(&|i| format!("?s <{EX}t{i}> ?o ."), " ");
+    let cases: [(&str, String, Option<usize>); 11] = [
         (
             "S1 FILTER of 256 EXISTS",
             format!("SELECT ?s WHERE {{ {rows} FILTER({exists}) }}"),
@@ -231,6 +243,21 @@ fn what_the_query_text_multiplies_draws_from_the_query_budget() {
             "S6 closure of 256 times one link",
             format!("SELECT ?x ?y WHERE {{ ?x ({links})+ ?y }}"),
             Some(ROWS),
+        ),
+        (
+            "CONSTRUCT of 256 template triples",
+            format!("CONSTRUCT {{ {template} }} WHERE {{ {rows} }}"),
+            None,
+        ),
+        (
+            "CONSTRUCT of 256 template triples of one 64 KiB literal",
+            format!("CONSTRUCT {{ {template} }} WHERE {{ ?s <{EX}q> ?o }}"),
+            None,
+        ),
+        (
+            "SAMPLE of a CONCAT of 256 parts per group",
+            format!("SELECT ?s (SAMPLE(CONCAT({parts})) AS ?v) WHERE {{ {rows} }} GROUP BY ?s"),
+            None,
         ),
     ];
     // Every case runs, and each one that fails is listed.
