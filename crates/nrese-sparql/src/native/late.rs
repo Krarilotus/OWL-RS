@@ -121,6 +121,9 @@ impl super::Context<'_> {
             numbers: RefCell::default(),
             cancellation: self.cancellation.clone(),
             budget: std::sync::Arc::clone(&self.budget),
+            kept: RefCell::new(nrese_exec::Reservation::new(std::sync::Arc::clone(
+                &self.budget,
+            ))),
             memory: self.memory.clone(),
             trace: None,
             depth: Cell::new(0),

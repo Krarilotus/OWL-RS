@@ -1,12 +1,13 @@
 //! SPARQL aggregate values and per-group helpers. Group planning, scheduling and
 //! result interning remain in the executor; these helpers preserve row order and errors.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use nrese_engine::TermId;
 use nrese_exec::group::{Groups, group_rows};
-use nrese_exec::{BudgetExceeded, IdTable, Reservation, UNDEF};
+use nrese_exec::{Budget, BudgetExceeded, IdTable, Reservation, UNDEF};
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{Literal, Term, Variable};
 use nrese_sparql_syntax::algebra::{AggregateExpression, AggregateFunction, Expression};
@@ -36,6 +37,84 @@ pub(super) struct Aggregator<'a> {
     pub(super) memo: RefCell<HashMap<(usize, u64), Option<Term>>>,
     /// The same for SUM and AVG: the value as a number ([`Aggregator::numeric_total`]).
     pub(super) numbers: RefCell<HashMap<(usize, u64), Number>>,
+    /// Where the terms it keeps are charged; `None` where it only evaluates.
+    pub(super) kept: Option<&'a Kept>,
+}
+
+/// The terms an aggregation keeps, charged to the query as they are made, whatever size
+/// the query's expressions give them: what [`Aggregator::memo`] remembers (released with
+/// it), a group's values while its aggregate is computed, and the results until the caller
+/// interns them ([`Kept::results`]). A refusal is kept: the caller ends the aggregation at
+/// the group it happened in.
+pub(super) struct Kept {
+    memo: RefCell<Reservation>,
+    values: RefCell<Reservation>,
+    results: RefCell<Reservation>,
+    refused: Cell<Option<BudgetExceeded>>,
+}
+
+/// Which of [`Kept`]'s charges a term goes to.
+#[derive(Clone, Copy)]
+enum Held {
+    Memo,
+    Values,
+    Results,
+}
+
+/// What a kept term holds: its slot and its strings.
+fn kept_bytes(term: &Term) -> usize {
+    std::mem::size_of::<Term>().saturating_add(crate::cache::term_heap(term))
+}
+
+impl Kept {
+    pub(super) fn new(budget: &Arc<Budget>) -> Self {
+        Self {
+            memo: RefCell::new(Reservation::new(Arc::clone(budget))),
+            values: RefCell::new(Reservation::new(Arc::clone(budget))),
+            results: RefCell::new(Reservation::new(Arc::clone(budget))),
+            refused: Cell::new(None),
+        }
+    }
+
+    /// Charges `bytes` to `held`; false once anything was refused.
+    fn hold(&self, held: &RefCell<Reservation>, bytes: usize) -> bool {
+        if self.refused.get().is_some() {
+            return false;
+        }
+        match held.borrow_mut().charge(bytes) {
+            Ok(()) => true,
+            Err(refused) => {
+                self.refused.set(Some(refused));
+                false
+            }
+        }
+    }
+
+    fn of(&self, kind: Held) -> &RefCell<Reservation> {
+        match kind {
+            Held::Memo => &self.memo,
+            Held::Values => &self.values,
+            Held::Results => &self.results,
+        }
+    }
+
+    /// A group's values are gone: so is their charge.
+    fn values_done(&self) {
+        let mut values = self.values.borrow_mut();
+        let bytes = values.bytes();
+        values.release(bytes);
+    }
+
+    /// What the budget refused, if it did.
+    pub(super) fn refused(&self) -> Option<BudgetExceeded> {
+        self.refused.get()
+    }
+
+    /// The results' charge, handed to the caller (the bytes, which it releases once the
+    /// results are interned and dropped); what was remembered is released with `self`.
+    pub(super) fn results(self) -> usize {
+        self.results.into_inner().transfer()
+    }
 }
 
 /// An expression's value for SUM and AVG.
@@ -189,8 +268,18 @@ impl Aggregator<'_> {
         }
     }
 
+    /// Charges `term` as `kind` of [`Self::kept`]; false once the budget refused anything.
+    fn hold(&self, kind: Held, term: &Option<Term>) -> bool {
+        match (self.kept, term) {
+            (Some(kept), Some(term)) => kept.hold(kept.of(kind), kept_bytes(term)),
+            (Some(kept), None) => kept.refused().is_none(),
+            (None, _) => true,
+        }
+    }
+
     /// The expression's value for each of `rows`. With `distinct`, only for the first row
     /// of each combination of the expression's variables: the repeats can't add a value.
+    /// Each value is charged as it is made ([`Kept`]); a refusal ends the list.
     fn evaluated(
         &self,
         solutions: &Solutions,
@@ -206,37 +295,92 @@ impl Aggregator<'_> {
         columns.dedup();
         let table = &solutions.table;
         let eval = |row: usize| self.evaluator.eval(expr, &self.binding(solutions, row));
+        let mut values = Vec::with_capacity(rows.len());
+        let slots = rows
+            .len()
+            .saturating_mul(std::mem::size_of::<Option<Term>>());
+        if let Some(kept) = self.kept
+            && !kept.hold(kept.of(Held::Values), slots)
+        {
+            return values;
+        }
+        let mut push = |value: Option<Term>| {
+            let fits = self.hold(Held::Values, &value);
+            if fits {
+                values.push(value);
+            }
+            fits
+        };
         // A value drawn per row (RAND, BNODE, ...) is drawn for every row.
         if pushdown::per_solution(expr) {
-            return rows.iter().map(|&row| eval(row)).collect();
-        }
-        if let [column] = columns[..] {
+            for &row in rows {
+                if !push(eval(row)) {
+                    break;
+                }
+            }
+        } else if let [column] = columns[..] {
             // One variable: its ids stand for the rows, and the values are remembered
             // across groups.
             let key = expr as *const Expression as usize;
             let mut seen = HashSet::new();
             let mut memo = self.memo.borrow_mut();
-            return rows
-                .iter()
-                .filter(|&&row| !distinct || seen.insert(table.get(row, column)))
-                .map(|&row| {
-                    memo.entry((key, table.get(row, column)))
-                        .or_insert_with(|| eval(row))
-                        .clone()
-                })
-                .collect();
+            for &row in rows {
+                let id = table.get(row, column);
+                if distinct && !seen.insert(id) {
+                    continue;
+                }
+                let value = match memo.get(&(key, id)) {
+                    Some(value) => value.clone(),
+                    None => {
+                        let value = eval(row);
+                        if self.hold(Held::Memo, &value) {
+                            memo.insert((key, id), value.clone());
+                        }
+                        value
+                    }
+                };
+                if !push(value) {
+                    break;
+                }
+            }
+        } else if !distinct || columns.is_empty() {
+            for &row in rows {
+                if !push(eval(row)) {
+                    break;
+                }
+            }
+        } else {
+            let mut seen: HashSet<Vec<u64>> = HashSet::new();
+            for &row in rows {
+                if seen.insert(columns.iter().map(|&c| table.get(row, c)).collect())
+                    && !push(eval(row))
+                {
+                    break;
+                }
+            }
         }
-        if !distinct || columns.is_empty() {
-            return rows.iter().map(|&row| eval(row)).collect();
-        }
-        let mut seen: HashSet<Vec<u64>> = HashSet::new();
-        rows.iter()
-            .filter(|&&row| seen.insert(columns.iter().map(|&c| table.get(row, c)).collect()))
-            .map(|&row| eval(row))
-            .collect()
+        values
     }
 
+    /// `aggregate` over `rows`. Its values are released once it is computed, and the
+    /// result, kept until the caller interns it, is charged ([`Kept`]).
     pub(super) fn aggregate(
+        &self,
+        solutions: &Solutions,
+        rows: &[usize],
+        aggregate: &AggregateExpression,
+    ) -> Agg {
+        let result = self.value_of(solutions, rows, aggregate);
+        if let Some(kept) = self.kept {
+            kept.values_done();
+            if let Agg::Term(term) = &result {
+                kept.hold(kept.of(Held::Results), kept_bytes(term));
+            }
+        }
+        result
+    }
+
+    fn value_of(
         &self,
         solutions: &Solutions,
         rows: &[usize],
@@ -608,8 +752,13 @@ impl Context<'_> {
         members: &[Vec<usize>],
         aggregate: &(Variable, AggregateExpression),
     ) -> NativeResult<Vec<u64>> {
-        let values = self.aggregate_groups(solutions, members, std::slice::from_ref(aggregate))?;
-        self.interned(values.iter().map(|group| &group[0]), members.len())
+        let (values, charged) =
+            self.aggregate_groups(solutions, members, std::slice::from_ref(aggregate))?;
+        let ids = self.interned(values.iter().map(|group| &group[0]), members.len());
+        // Interned (or refused), the results are let go, then their charge.
+        drop(values);
+        self.budget.release(charged);
+        ids
     }
 
     /// The ids of `len` values.
