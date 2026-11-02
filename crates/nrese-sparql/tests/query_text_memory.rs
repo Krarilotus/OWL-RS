@@ -171,7 +171,8 @@ fn a_closure_over_a_sequence_holds_its_ends_once() {
 /// (§18.4: `p+` is a set), each answered. A CONSTRUCT of 256 template triples makes 1 M
 /// triples, or 16 MiB from one row with a 64 KiB literal, and SAMPLE of that CONCAT a 6 KiB
 /// string per group (4,096 groups), and a GROUP_CONCAT whose 4 KiB separator comes
-/// between each two of 4,096 values (16 MiB): refused.
+/// between each two of 4,096 values (16 MiB): refused; over IRIs it has no string
+/// (§18.5.1.7: unbound), so nothing to make, however long its separator: answered.
 /// Either way, the query's thread holds at most the limit and its bookkeeping. On the
 /// default path and as written alike.
 #[test]
@@ -202,7 +203,7 @@ fn what_the_query_text_multiplies_draws_from_the_query_budget() {
     let links = list(&|_| format!("<{EX}p>"), "|");
     let template = list(&|i| format!("?s <{EX}t{i}> ?o ."), " ");
     let separator = "x".repeat(1 << 12);
-    let cases: [(&str, String, Option<usize>); 12] = [
+    let cases: [(&str, String, Option<usize>); 13] = [
         (
             "S1 FILTER of 256 EXISTS",
             format!("SELECT ?s WHERE {{ {rows} FILTER({exists}) }}"),
@@ -268,6 +269,15 @@ fn what_the_query_text_multiplies_draws_from_the_query_budget() {
                  WHERE {{ {rows} }}"
             ),
             None,
+        ),
+        (
+            "GROUP_CONCAT of 64 IRIs with a 32 KiB separator (unbound)",
+            format!(
+                "SELECT (COALESCE(GROUP_CONCAT(?s; SEPARATOR=\"{}\"), \"none\") AS ?v) \
+                 WHERE {{ {{ SELECT ?s WHERE {{ {rows} }} LIMIT 64 }} }}",
+                "x".repeat(1 << 15)
+            ),
+            Some(1),
         ),
     ];
     // Every case runs, and each one that fails is listed.
