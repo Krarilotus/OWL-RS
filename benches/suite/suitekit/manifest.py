@@ -141,6 +141,11 @@ def machine(runtime: str, root: Path | None = None) -> dict:
         "memory_gib": round((memory_bytes() or 0) / 2**30, 1),
         "python": platform.python_version(),
     }
+    # The fleet's name of the host a fleet job's step runs on (FLEET_HOST, set by the fleet): what a
+    # round's manifest and a report's context name, so that passes from another host are told apart
+    # (review r1 R1-F1: `host` is the machine's own name, which the fleet's may not be).
+    if os.environ.get("FLEET_HOST"):
+        out["fleet_host"] = os.environ["FLEET_HOST"]
     # What changes timings on the host, as the run found it (hosts.toml `config` records the
     # intended configuration; compare checks both).
     for key, path in (("governor", "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
