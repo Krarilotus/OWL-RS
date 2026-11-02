@@ -4703,7 +4703,7 @@ impl<'a> Context<'a> {
             };
             let mut table = IdTable::new(1);
             table.push_row(&[self.id(&integer(count))]);
-            return Ok(Solutions {
+            return self.produced(Solutions {
                 vars: vec![target.clone()],
                 table,
                 ordered: false,
@@ -4719,7 +4719,7 @@ impl<'a> Context<'a> {
         {
             let mut table = IdTable::new(1);
             table.push_row(&[self.id(&integer(count))]);
-            return Ok(Solutions {
+            return self.produced(Solutions {
                 vars: vec![target.clone()],
                 table,
                 ordered: false,
@@ -4748,7 +4748,7 @@ impl<'a> Context<'a> {
             }
             let mut table = IdTable::new(1);
             table.push_row(&[self.id(&integer(count))]);
-            return Ok(Solutions {
+            return self.produced(Solutions {
                 vars: vec![target.clone()],
                 table,
                 ordered: false,
