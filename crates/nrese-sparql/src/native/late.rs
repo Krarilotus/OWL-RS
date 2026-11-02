@@ -333,7 +333,8 @@ mod tests {
             let before = ctx.budget.used();
             let (expanded, excess) = measure_within(&envelope, || {
                 let mut charged = Reservation::new(&*ctx.budget);
-                charged.charge(rows * width * 8).unwrap();
+                // One id a column of each row, one id a row without columns.
+                charged.charge(rows * width.max(1) * 8).unwrap();
                 let mut table = IdTable::with_capacity(width, rows);
                 for _ in 0..rows {
                     table.push_row(row);
