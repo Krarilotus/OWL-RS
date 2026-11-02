@@ -6,7 +6,13 @@ use nrese_engine::{
 };
 use nrese_rdf::{Graph, GraphNameRef, NamedNode, NamedNodeRef, QuadRef, TermRef};
 use nrese_rdf_io::{RdfFormat, RdfParser};
-use nrese_shacl::{Component, PropertyPath, Selection, Shapes, compile, validate};
+use nrese_shacl::{Component, PropertyPath, Selection, Shapes, ValidationReport, compile};
+use nrese_sparql::{CancellationToken, QueryEvaluationError, ReadView, Resources};
+
+/// Validation on resources that never stop it.
+fn validate<V: ReadView + Sync>(view: &V, shapes: &Shapes, data: Selection) -> ValidationReport {
+    nrese_shacl::validate(view, shapes, data, &Resources::default()).expect("nothing stops it")
+}
 
 const PREFIXES: &str = "@prefix ex: <http://example.com/> .
 @prefix sh: <http://www.w3.org/ns/shacl#> .
@@ -425,4 +431,80 @@ fn current_shape_and_shapes_graph_are_bound_in_subqueries() {
         assert!(report.failures.is_empty(), "{query}: {:?}", report.failures);
         assert_eq!(report.results.len(), 1, "{query}");
     }
+}
+
+/// RSH-07: a validation runs on its caller's resources, its SHACL-SPARQL queries included,
+/// nested shapes' too. When they stop it (the cancellation fired, or the envelope refused
+/// a charge), the outcome is that stop: not a report of what was found before it, and not a
+/// "failure" of the constraint whose query was stopped (a commit gate would pass a warning).
+#[test]
+fn a_stopped_validation_returns_the_stop_not_a_report() {
+    let cancelled = {
+        let token = CancellationToken::new();
+        token.cancel();
+        Resources {
+            cancellation: Some(token),
+            ..Resources::default()
+        }
+    };
+    // Forty subjects of ex:p: the query's three-way product is 64,000 rows, past 64 KiB.
+    let small = Resources {
+        memory: nrese_exec::Envelope::new(Some(64 * 1024), None),
+        ..Resources::default()
+    };
+    let data: String = (0..40).map(|i| format!("ex:s{i} ex:p ex:o . ")).collect();
+    let data = format!("{data} ex:a a ex:Person .");
+    let wide = "SELECT $this ?value ?b ?c WHERE { ?value <http://example.com/p> ?x .
+        ?b <http://example.com/p> ?y . ?c <http://example.com/p> ?z }";
+    let named = "ex:S a sh:NodeShape ; sh:targetClass ex:Person ;
+        sh:property [ sh:path ex:name ; sh:minCount 1 ] .";
+    let rows = [
+        ("a Core shape, cancelled", named.to_owned(), &cancelled),
+        (
+            "sh:sparql past the envelope",
+            format!(
+                "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select '''{wide}''' ] ."
+            ),
+            &small,
+        ),
+        (
+            "sh:sparql of a nested shape past the envelope",
+            format!(
+                "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:node ex:N .
+                 ex:N a sh:NodeShape ; sh:sparql [ sh:select '''{wide}''' ] ."
+            ),
+            &small,
+        ),
+    ];
+    for (row, shapes, resources) in rows {
+        let engine = engine(&data, &shapes);
+        let snapshot = engine.snapshot();
+        let outcome = nrese_shacl::validate(&snapshot, &compiled(&snapshot), DEFAULT, resources);
+        let stopped = match &outcome {
+            Err(QueryEvaluationError::Cancelled) => resources.cancellation.is_some(),
+            Err(QueryEvaluationError::MemoryLimit(_)) => resources.cancellation.is_none(),
+            _ => false,
+        };
+        assert!(stopped, "{row}: {outcome:?}");
+    }
+
+    // What a change introduces, the same: ex:b is a person without a name.
+    let engine = engine(&data, named);
+    let before = engine.snapshot();
+    let shapes = compiled(&before);
+    let mut tx = engine.transaction();
+    tx.insert(QuadRef::new(
+        NamedNodeRef::new_unchecked("http://example.com/b"),
+        NamedNodeRef::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+        NamedNodeRef::new_unchecked("http://example.com/Person"),
+        GraphNameRef::DefaultGraph,
+    ));
+    let changed: Vec<_> = tx.inserted().collect();
+    let after = tx.pending_snapshot();
+    let outcome =
+        nrese_shacl::validate_changes(&before, &after, &shapes, DEFAULT, &changed, &cancelled);
+    assert!(
+        matches!(outcome, Err(QueryEvaluationError::Cancelled)),
+        "validate_changes: {outcome:?}"
+    );
 }
