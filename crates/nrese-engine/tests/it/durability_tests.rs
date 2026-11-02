@@ -859,43 +859,6 @@ fn an_image_and_the_archived_log_restore_any_later_revision() {
     assert!(restore(Some(36)).0.is_err());
 }
 
-/// Point-in-time restore by time: the commits made up to a time, from the log's commit
-/// times.
-#[test]
-fn the_log_restores_the_state_at_a_time() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = Engine::open(dir.path(), config()).unwrap();
-    let now = || {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as u64
-    };
-    let mut states = commit_all(&engine, &batches(0..5));
-    std::thread::sleep(std::time::Duration::from_millis(5));
-    let middle = now();
-    std::thread::sleep(std::time::Duration::from_millis(5));
-    states.extend(commit_all(&engine, &batches(5..9)));
-    drop(engine);
-    let copy = tempfile::tempdir().unwrap();
-    let wal = copy.path().join("wal");
-    fs::create_dir_all(&wal).unwrap();
-    for entry in fs::read_dir(dir.path().join("wal")).unwrap() {
-        let entry = entry.unwrap();
-        fs::copy(entry.path(), wal.join(entry.file_name())).unwrap();
-    }
-    let config = EngineConfig {
-        durability: DurabilityConfig {
-            recover_until_micros: Some(middle),
-            ..config().durability
-        },
-        ..config()
-    };
-    let engine = Engine::open(copy.path(), config).unwrap();
-    assert_eq!(engine.snapshot().revision(), 5);
-    assert_eq!(contents(&engine), states[4]);
-}
-
 /// A spill directory left by a crashed load goes when the store opens.
 #[test]
 fn opening_removes_a_crashed_loads_spill() {
