@@ -1576,8 +1576,9 @@ impl<'a> Context<'a> {
             .map_or(Ok(()), CancellationToken::check)?)
     }
 
-    /// One solution without bindings (an empty group's), charged as every table is: its row
-    /// counts ([`IdTable::memory_bytes`]), and whoever consumes it releases that.
+    /// One solution without bindings (an empty group's), made as every table is
+    /// ([`Self::produced`]): it counts nothing ([`IdTable::memory_bytes`]), so neither making
+    /// it nor consuming it touches the budget.
     fn unit(&self) -> NativeResult<Solutions> {
         self.produced(Solutions {
             vars: Vec::new(),
@@ -1586,12 +1587,16 @@ impl<'a> Context<'a> {
         })
     }
 
-    /// Charges a produced table against the query's memory budget.
+    /// Charges a produced table against the query's memory budget. A table that counts
+    /// nothing is charged nothing: no call up the budget's levels for it.
     fn produced(&self, solutions: Solutions) -> NativeResult<Solutions> {
         self.check()?;
-        self.budget
-            .charge(solutions.table.memory_bytes())
-            .map_err(QueryEvaluationError::MemoryLimit)?;
+        let bytes = solutions.table.memory_bytes();
+        if bytes > 0 {
+            self.budget
+                .charge(bytes)
+                .map_err(QueryEvaluationError::MemoryLimit)?;
+        }
         Ok(solutions)
     }
 
@@ -1640,11 +1645,13 @@ impl<'a> Context<'a> {
     }
 
     /// Frees a table charged to the query's budget, then releases its charge: the budget
-    /// never shows less than the tables hold.
+    /// never shows less than the tables hold. A table that counts nothing releases nothing.
     fn consumed(&self, solutions: Solutions) {
         let bytes = solutions.table.memory_bytes();
         drop(solutions);
-        self.budget.release(bytes);
+        if bytes > 0 {
+            self.budget.release(bytes);
+        }
     }
 
     /// A table that `reshape` makes of charged ones, which it takes (filtering in place,
@@ -5818,8 +5825,7 @@ impl<'b> Probe<'_, 'b> {
                 }
             }
             if out.len() + found > room {
-                reserve_rows(&mut out, &mut held, found, usize::MAX).map_err(ProbeStop::Memory)?;
-                room = out.memory_bytes() / out.row_bytes();
+                room = grown_room(&mut out, &mut held, found).map_err(ProbeStop::Memory)?;
             }
             for m in 0..found {
                 for (c, slot) in row.iter_mut().enumerate().take(width) {
@@ -6010,16 +6016,17 @@ fn reserve_rows<B: std::ops::Deref<Target = Budget>>(
     rows: usize,
     most: usize,
 ) -> Result<(), BudgetExceeded> {
-    // A table without columns counts its rows too ([`IdTable::row_bytes`]).
-    let row_bytes = table.row_bytes();
+    // What room for so many rows counts is the table's to say: without columns, its rows
+    // after the first ([`IdTable::bytes_for_rows`]).
     let needed = table.len().saturating_add(rows);
-    if needed.saturating_mul(row_bytes) <= table.memory_bytes() {
+    let room = table.len() + table.spare_rows();
+    if needed <= room {
         return Ok(());
     }
-    let doubled = (table.memory_bytes() / row_bytes * 2).min(most).max(needed);
+    let doubled = room.saturating_mul(2).min(most).max(needed);
     let mut grow = |capacity: usize| -> Result<(), BudgetExceeded> {
         let old = held.bytes();
-        held.charge(capacity.saturating_mul(row_bytes))?;
+        held.charge(table.bytes_for_rows(capacity))?;
         table.reserve_exact(capacity - table.len());
         held.release(old);
         // An allocator may hand out more than asked: held too.
@@ -6030,6 +6037,20 @@ fn reserve_rows<B: std::ops::Deref<Target = Budget>>(
         Ok(())
     };
     grow(doubled).or_else(|_| grow(needed))
+}
+
+/// [`reserve_rows`] for `rows` more rows, then the rows `table` has room for: the index
+/// join probe's rare growth, kept out of its loop over rows (PR #84's timing: with it inlined
+/// there, the probe took more cycles at the same instruction count).
+#[cold]
+#[inline(never)]
+fn grown_room<B: std::ops::Deref<Target = Budget>>(
+    table: &mut IdTable,
+    held: &mut Reservation<B>,
+    rows: usize,
+) -> Result<usize, BudgetExceeded> {
+    reserve_rows(table, held, rows, usize::MAX)?;
+    Ok(table.len() + table.spare_rows())
 }
 
 fn has_undef(table: &IdTable, columns: &[usize]) -> bool {
