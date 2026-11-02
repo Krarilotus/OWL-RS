@@ -60,8 +60,9 @@ or per-row virtual dispatch is introduced.
 Keep metadata counts, group walks, sideways probes, eager aggregation, LIMIT pushdown,
 component closures and cyclic worst-case-optimal joins. The
 [`plan tests`](../../crates/nrese-sparql/src/plan/tests.rs) guard scope/order and moved
-VALUES buffers; the [path-join tests](../../crates/nrese-sparql/src/native/path_joins/tests.rs)
-guard eligibility and zero inspection lowering. Native/reference differential tests and
+VALUES buffers; the [path-join differential test](../../crates/nrese-sparql/tests/it/native_differential_tests.rs)
+checks the answers of paths joined to triple patterns, while their eligibility and zero
+inspection lowering have no guard test of their own yet. Native/reference differential tests and
 [route guards](../../crates/nrese-sparql/tests/it/plan_guard_tests.rs) cover execution.
 These work guards establish removed conversions/copying, not lower latency; integration
 and performance validation precede declaring a migrated slice complete.

@@ -59,9 +59,8 @@ once.
 Build through `scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most `NRESE_BUILD_SLOTS`
 builds at once per machine). Validate in batches: quick checks while
 working, the push tier once per batch. Measure counts first; time only to answer a stated
-question, inside `scripts/quiet-slot.sh`, on `release` (`--profile lab` to iterate). A slot
-holds one short measurement, since builds wait for it; long comparison runs go to a machine of
-their own. Every number names the commit its binary was built from and whether the tree was
+question, through `benches/suite/abba.py` ([benches/abba/README.md](benches/abba/README.md):
+A-B-B-A families on one of the fleet's timing hosts, never on this machine). Every number names the commit its binary was built from and whether the tree was
 clean; a binary kept for comparison is rebuilt after its source changes or is reverted.
 
 Keep a separate Cargo target directory for each worktree; share downloaded registry
