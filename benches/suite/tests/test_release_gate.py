@@ -392,6 +392,57 @@ class MainAdapter(unittest.TestCase):
                 fast.ensure_data("social people=10")
             container.assert_not_called()
 
+    @unittest.skipIf(os.name == "nt", "the gate prepares on a Linux host (shared data: hardlinks to read-only blobs)")
+    def test_a_concatenation_is_its_parts_as_they_are(self):
+        """Sol, PR #64 r1 F1: a concatenation made while a part wasn't its freeze outlived the part's
+        repair, and the shared index handed it to the next gate; prepare recorded bytes of no frozen
+        input as prepared. Witness: dl-abox-lubm1's `concat:volume:univ-bench.nt+volume:lubm-1.nt`.
+        Sol, gate-input-provenance r1: a making stopped between the file and its sums left the old
+        sums beside the new file, and they matched once the part was restored."""
+        case = {"name": "c", "data": "concat:volume:a.nt+volume:b.nt"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "data").mkdir()
+            a, b = root / "data" / "a.nt", root / "data" / "b.nt"
+            a.write_text("<urn:a> <urn:p> <urn:o> .\n", encoding="utf-8")
+            # A making stopped as it moves the sums in: `mv` that fails there. The file and the sums
+            # are left as a kill at that point leaves them (the making's trap takes only its partials).
+            stopper = root / "bin" / "mv"
+            stopper.parent.mkdir()
+            stopper.write_text(f'#!/bin/sh\ncase "$*" in *.parts*) exit 1 ;; esac\nexec "{shutil.which("mv")}" "$@"\n',
+                               encoding="utf-8")
+            stopper.chmod(0o755)
+
+            def prepared(gate: str, stopped: bool = False) -> str:
+                """The case prepared in GATE's data, sharing the host's blobs: its concatenation."""
+                data = root / gate
+                path = f"{stopper.parent}{os.pathsep}{os.environ['PATH']}" if stopped else os.environ["PATH"]
+                with patch.object(fast, "FAST_DATA", data), patch.object(fast, "RUNTIME", "native"), \
+                        patch.object(fast, "SHARED", root / "shared"), patch.object(fast, "FAST_LOCK", root / "lock"), \
+                        patch.object(fast, "native_dirs", lambda: {"/fast": data, "/data": root / "data"}), \
+                        patch.object(fast, "load_cases", list), patch.object(fast, "select", lambda *_: [case]), \
+                        patch.object(fast, "binaries", dict), patch.object(fast.manifest, "git", lambda _: {}), \
+                        patch.dict(fast.OPTIONS, {"prepared": False}), patch.dict(os.environ, {"PATH": path}):
+                    self.assertEqual(fast.prepare(None), 1 if stopped else 0)
+                concat = data / "concat-a-b.nt"
+                if not stopped:
+                    recorded = json.loads((data / fast.PREPARED).read_text(encoding="utf-8"))["files"]
+                    self.assertEqual(recorded[concat.as_posix()]["sha256"], fast.file_digest(concat))
+                return concat.read_text(encoding="utf-8")
+
+            frozen, altered = "<urn:b> <urn:p> <urn:o> .\n", "<urn:b> <urn:p> <urn:o> . # not its freeze\n"
+            whole = a.read_text(encoding="utf-8") + frozen
+            b.write_text(altered, encoding="utf-8")
+            prepared("gate-1")
+            b.write_text(frozen, encoding="utf-8")  # its freeze again
+            self.assertEqual(prepared("gate-2"), whole, "SPEC concat-parts: not the shared one of other bytes")
+            self.assertEqual(prepared("gate-1"), whole, "SPEC concat-parts: nor this gate's own")
+            b.write_text(altered, encoding="utf-8")
+            prepared("gate-1", stopped=True)
+            b.write_text(frozen, encoding="utf-8")
+            self.assertEqual(prepared("gate-1"), whole,
+                             "SPEC concat-parts: nor one whose making stopped between the file and its sums")
+
     def test_a_query_set_kept_with_the_data_is_in_the_case_manifest_by_its_name(self):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "watdiv-10m").mkdir()
@@ -671,13 +722,20 @@ point {head} "$b"
                                   cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
             linked = sorted(p.name for p in view.iterdir())
             prepared = (Path(tmp) / "prepared").exists()
-            for tree in Path(t, "gate", "run").glob(f"space-*/src-{head[:8]}"):  # the harness's checkout
-                subprocess.run(["git", "worktree", "remove", "--force", tree.as_posix()], cwd=ROOT, capture_output=True)
-        subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
+            # The harness's checkout this run made, removed by its path alone: never a `prune`, which
+            # takes any registration whose directory this process space can't see, another space's
+            # live checkout among them (release-gate.sh's drop_checkout; Sol, PR #64 r1 F2).
+            left = []
+            for tree in Path(t, "gate", "run").glob(f"space-*/src-{head[:8]}"):
+                removed = subprocess.run(["git", "worktree", "remove", "--force", tree.as_posix()], cwd=ROOT,
+                                         capture_output=True, text=True)
+                if removed.returncode:
+                    left.append(f"{tree}: {removed.stderr.strip()}")
         self.assertNotEqual(done.returncode, 0, f"SPEC frozen inputs: prepare went on\n{done.stdout}{done.stderr}")
         self.assertIn("NOT the freeze support-stress/copies-17.nq.commits.ru", done.stdout + done.stderr)
         self.assertEqual((linked, prepared), ([], False),
                          "SPEC frozen inputs: no input that isn't its freeze in the view, and no data prepared")
+        self.assertEqual(left, [], "the harness checkout this test made stayed registered")
 
     def test_a_main_that_is_the_base_is_timed_once_and_declared_once(self):
         """Orchestrator, 20 Oct 2026: the jobs require a main, so a confirmation passes the base
