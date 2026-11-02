@@ -218,10 +218,10 @@ systems = []
         self.assertEqual((timed["env"]["GATE_HOST"], read), ("office-pc", ["office-pc"]))
         self.assertIn("pin_reason", timed)
 
-    def test_one_job_asks_by_capability_builds_untimed_and_times_alone(self):
+    def test_one_job_asks_by_capability_and_builds_where_it_times(self):
         """The brief of 2 Nov 2026: no host names. A build job and a timed job pinned to one host
-        were the only way to time where the binaries were built; one job does both, its builds
-        shareable (untimed steps), its host kept between steps, alone for its blocks."""
+        were the only way to time where the binaries were built; one job does both, its host held
+        alone from its first step to its last."""
         found = abba.jobs(self.family, B, self.repo.as_posix())
         self.assertEqual(list(found), ["abba-t-bbbbbbbb"])
         job = found["abba-t-bbbbbbbb"]
@@ -230,9 +230,12 @@ systems = []
         self.assertEqual((job["kind"], job["requires"]["roles"], job["requires"]["os"]),
                          ("owlrs.timed", ["measure", "build"], "linux"))
         # The fleet keeps an exclusive job's host only before an exclusive step (planner
-        # held_between_steps; Sol r1 S1): the check, every build and the preparation are the first
-        # step, the only untimed one, and every later step is exclusive, so it runs where they ran.
-        self.assertEqual(job["untimed_steps"], [0])
+        # held_between_steps; Sol r1 S1) and while the host takes exclusive work: every step is
+        # exclusive, none untimed, so the job starts only where it can time (2 Nov 2026: an untimed
+        # first step built on office-pc outside its timing window, and the blocks were offered
+        # another host). The check, every build and the preparation are its first step.
+        self.assertNotIn("untimed_steps", job)
+        self.assertEqual(job["class"], "exclusive")
         first = job["steps"][0]
         for word in ("abba.py check", "release-gate.sh build", "release-gate.sh prepare"):
             self.assertIn(word, first[2])
@@ -248,7 +251,7 @@ systems = []
         import tomllib
         whole = tomllib.loads(abba.set_file("abba-t-bbbbbbbb", list(found.values())))
         self.assertEqual((whole["set"]["id"], whole["set"]["fail"], len(whole["job"])), ("abba-t-bbbbbbbb", "stop-rest", 1))
-        self.assertEqual(whole["job"][0]["untimed_steps"], job["untimed_steps"])
+        self.assertNotIn("untimed_steps", whole["job"][0])
 
     def test_a_family_of_registry_cases_runs_from_anywhere_without_a_commit(self):
         """PR #91's timing (2 Nov 2026): a family had to be committed on a throwaway ref to be read in

@@ -275,11 +275,13 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
     """The family's fleet job, one: on the timing host the fleet picks by capability (TIMING_ROLES,
     Linux, the cases' needs and caps; `host` pins it, with its reason), its check (the manifest the
     report holds the results to, naming that host), the builds of A, B and the harness and the
-    data's preparation, all in its first step, the one untimed (shareable) step; then alone its
-    blocks, its report (the verdict in abba-verdict.json; the step fails only for an invalid
-    family) and clean-up. Builds and blocks share the host, so nothing is staged between jobs: the
-    fleet keeps an exclusive job's host only before an exclusive step (planner held_between_steps;
-    Sol r1 S1, 2 Nov 2026), so every step after the first is one."""
+    data's preparation, all in its first step; then its blocks, its report (the verdict in
+    abba-verdict.json; the step fails only for an invalid family) and clean-up. Every step is
+    exclusive: the fleet keeps an exclusive job's host only before an exclusive step (planner
+    held_between_steps; Sol r1 S1) and only while the host's policy takes exclusive work, so an
+    untimed first step could build where timing is closed and the blocks then go elsewhere,
+    without its builds (2 Nov 2026: built on office-pc by day, outside its timing window). The job
+    starts only where it can time, and builds and blocks share that host."""
     a, b = family["sides"]["a"], family["sides"]["b"]
     prefix = f"abba-{family['name']}-{b[:8]}" + (f"-r{round_}" if round_ > 1 else "")
     gate_ = ["bash", "scripts/release-gate.sh"]
@@ -309,14 +311,13 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
               '--out "$FLEET_OUT/abba-verdict.md"; code=$?; echo "$code" > "$FLEET_OUT/abba-exit"; [ "$code" != 2 ]',
               "abba", named], [*gate_, "clean"]]
     steps = prepare + blocks + after
-    untimed = [0]
     by_name = {c["name"]: c for c in family["catalog"]}
     has = rg.data_needs([by_name[c["name"]] for c in family["cases"] if c["name"] in by_name])
     requires = {"roles": rg.TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": max(12, cap)} | ({"has": has} if has else {})
     job = {"id": prefix, "group": "abba", "kind": "owlrs.timed", "class": "exclusive",
            "priority": priority, "priority_reason": reason or f"A-B-B-A: {b[:8]} against {a[:8]}, "
            f"{len(family['cases'])} cases", "notify": False,
-           "env": env, "est_min": 0, "stall_after_min": 60, "steps": steps, "untimed_steps": untimed,
+           "env": env, "est_min": 0, "stall_after_min": 60, "steps": steps,
            # The first step asks the job's whole memory too: placed on a host too small for the blocks,
            # its hold would end there and the blocks run elsewhere, without its builds (Sol r2 S1).
            "step_deadline_min": rg.BUILD_MIN * len(revisions) + 120,
@@ -553,9 +554,9 @@ def plan_text(family: dict, job: dict, harness: str, measure: dict, set_id: str)
                     else "uncalibrated") + ")" for c in family["cases"]),
              f"  hypotheses: {len(family['hypotheses'])} (Holm over the family); blocks: {family['blocks']} "
              f"(whole squares of A, A' and B), {est['block_min']} min each",
-             f"  estimate: builds and data up to {est['build_min']} min (shareable; a build of the same identity "
-             f"is reused), then {est['timed_min']} min alone on one timing host; {est['total_min']} min, "
-             f"{est['total_min'] / 60:.2f} host-hours, {est['timed_min'] / 60:.2f} of them exclusive"]
+             f"  estimate: one timing host held alone {est['total_min']} min ({est['total_min'] / 60:.2f} "
+             f"host-hours): builds and data up to {est['build_min']} min (a build of the same identity is "
+             f"reused), then {est['timed_min']} min of blocks"]
     if est["guessed"]:
         lines.append(f"  not calibrated (benches/fast/measure.toml): {', '.join(est['guessed'])}: a minute a pass assumed")
     asks = job["requires"]

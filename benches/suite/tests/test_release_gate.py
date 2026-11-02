@@ -633,9 +633,8 @@ class Parts(unittest.TestCase):
 
     def test_the_jobs_run_the_whole_gate_in_blocks_asking_by_capability_one_set(self):
         """The brief of 2 Nov 2026: the gate asks by capability, never a host, and goes as one set.
-        Each timed part builds every side where it times them (untimed steps of its own job: no
-        binaries staged between hosts, which WSL hosts refuse) and holds its host alone only for its
-        blocks."""
+        Each timed part builds every side where it times them (its own first step: no binaries
+        staged between hosts, which WSL hosts refuse), holding that host alone from there."""
         found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None)
         timed, checks = found["rg-test-timed"], found["rg-test-checks"]
         self.assertEqual((timed["kind"], timed["class"]), ("owlrs.timed", "exclusive"))
@@ -644,9 +643,9 @@ class Parts(unittest.TestCase):
             self.assertNotIn("after", job, job["id"])
         self.assertEqual((timed["requires"]["roles"], timed["requires"]["os"]), (["measure", "build"], "linux"))
         self.assertEqual(checks["requires"]["roles"], ["test"])
-        # One untimed first step builds every side and prepares the data; every later step is
-        # exclusive, which is what keeps the host (planner held_between_steps; Sol r1 S1).
-        self.assertEqual(timed["untimed_steps"], [0])
+        # The first step builds every side and prepares the data; no step is untimed, so a part starts
+        # only where it can time and keeps that host (planner held_between_steps; Sol r1 S1).
+        self.assertNotIn("untimed_steps", timed)
         self.assertIn("release-gate.sh build", timed["steps"][0][2])
         self.assertIn("release-gate.sh prepare", timed["steps"][0][2])
         self.assertEqual(timed["steps"][0][4], "c" * 40)  # the harness, then the revisions
@@ -679,7 +678,7 @@ class Parts(unittest.TestCase):
         big = found["rg-test-big"]
         self.assertEqual((big["requires"]["os"], big["requires"]["ram_gb"]), ("linux", 32))
         self.assertIn("release-gate.sh build", big["steps"][0][2])
-        self.assertEqual(big["untimed_steps"], [0])
+        self.assertNotIn("untimed_steps", big)
         # Its own gate directory: on the timed part's host it would overwrite that part's plan (Sol r1 S3).
         self.assertNotEqual(big["env"]["GATE_NAME"], found["rg-test-timed"]["env"]["GATE_NAME"])
         self.assertFalse([i for i in big["inputs"] if "artifact" in i["source"]])
