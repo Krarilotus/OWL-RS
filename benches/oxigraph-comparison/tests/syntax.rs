@@ -8,13 +8,17 @@
 //! - generated names of variables and blank nodes (spargebra's are random 128-bit numbers,
 //!   nrese's are numbered);
 //! - `-1` in an expression: nrese reads the signed literal the grammar's tokens make,
-//!   spargebra a negation of `1` computed at run time;
+//!   spargebra a negation of `1` computed at run time. Folded only where both are one term, a
+//!   minus over a canonical integer; every other sign over a number (`+1`, `-0`, `-01`,
+//!   `-.5`, `-1.5e3`) is unresolved, since spargebra reads the token and the expression
+//!   (`+(1)`) alike though they are two terms;
 //! - the shape of a nest of `&&` or `||` (both associative): nrese balances it, spargebra
 //!   folds it left.
 //!
 //! Every other difference is listed. Those explained (spargebra's right-associative
 //! `-` and `/`, and what each accepts or rejects) are checked to be exactly the expected
-//! ones.
+//! ones. A query whose algebras are equal but hold an unresolved sign is listed and counted
+//! apart, never as the same (orchestrator, IB1350-71f7: an EARL report's cannot-tell).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -31,13 +35,17 @@ use nrese_sparql_syntax::term::{
     GroundTriple, GroundTriplePattern, NamedNodePattern, Quad, QuadPattern, TermPattern,
     TriplePattern,
 };
-use nrese_sparql_syntax::visit::NodeMut;
+use nrese_sparql_syntax::visit::{Node, NodeMut};
 use nrese_sparql_syntax::{GraphUpdateOperation as U, Query, SparqlParser, Update};
 use oxigraph_comparison::w3c;
 use spargebra::algebra as sa;
 use spargebra::term as st;
 
-/// Renames spargebra's random names (and keeps the query's own).
+/// Renames spargebra's random names (and keeps the query's own): each its own alias, `__x:0`,
+/// `__x:1`, … in order of first appearance. An alias holds a `:`, which no variable name or
+/// blank-node label does (the grammar's VARNAME and BLANK_NODE_LABEL, SPARQL 1.1 rules 166 and
+/// 142), so it never meets a name of the query's (Sol, PR #73 r1, S1: the alias `__x0` merged
+/// an aggregate's variable with the query's own `?__x0`).
 #[derive(Default)]
 struct Names {
     map: HashMap<String, String>,
@@ -52,7 +60,7 @@ impl Names {
         let n = self.map.len();
         self.map
             .entry(name.to_owned())
-            .or_insert_with(|| format!("__x{n}"))
+            .or_insert_with(|| format!("__x:{n}"))
             .clone()
     }
 
@@ -588,7 +596,7 @@ impl Names {
 
 /// The names a parser made up, renamed `__0`, `__1`, … in order of first appearance:
 /// nrese's (`__agg0`, `__b1`, …; a query using such a name of its own gets a longer prefix,
-/// parser/mod.rs) and spargebra's random ones as [`Names`] renames them (`__x0`, …). A
+/// parser/mod.rs) and spargebra's random ones as [`Names`] renames them (`__x:0`, …). A
 /// query's own name starting with `__` is renamed with them, alike on both sides. Variables
 /// and blank nodes alone: an IRI or a literal is no name (Sol, syntax-five r1: the literal
 /// `"__agg0"` was renamed with the aggregate's variable, and `"__a"` compared equal to `"__b"`).
@@ -729,21 +737,102 @@ impl Generated {
     }
 }
 
-/// `-1` and `+1` of a number literal as the signed literal, once the operand is folded
-/// itself: nrese reads the literal the grammar's tokens make, spargebra a negation of `1`
-/// computed at run time. Over a literal alone (Sol, syntax-five r1: a base IRI spelling
-/// `UnaryMinus(Literal(…integer))` panicked, `Unary_` and `Unary` compared equal).
+/// The function an unresolved sign becomes ([`fold_sign`]), its sign after it: an IRI no query
+/// holds, as no IRI the grammar reads has a space.
+const UNRESOLVED: &str = "unresolved sign ";
+
+/// A sign over a number literal, written either way: as a sign over it (`UnaryMinus(Literal
+/// ("2"))`, spargebra's reading of the token `-2` and both parsers' of `-(2)`) or as the signed
+/// literal the grammar's tokens make (`Literal("-2")`, nrese's). A minus over a canonical
+/// integer becomes the signed literal: `-(2)` evaluates to the term the token `-2` is. Any
+/// other becomes the marker `<unresolved sign ±>(unsigned literal)`, alike both ways: they are
+/// two terms, which spargebra's reading can't tell apart (Sol, PR #73 r1, sol-loop r3:
+/// `sameTerm(+(1), 1)` is true, `sameTerm(+1, 1)` false). An operand no unsigned token spells
+/// keeps its sign (W1: `-(-1)` became `"--1"`, no number). Over a literal alone (Sol,
+/// syntax-five r1: a base IRI spelling `UnaryMinus(Literal(…integer))` panicked, `Unary_` and
+/// `Unary` compared equal).
 fn fold_sign(expression: &mut E) {
-    let (sign, operand) = match expression {
-        E::UnaryMinus(operand) => ('-', operand),
-        E::UnaryPlus(operand) => ('+', operand),
-        _ => return,
+    let Some((sign, number)) = signed_number(expression) else {
+        return;
     };
-    if let E::Literal(number) = &**operand
-        && [xsd::INTEGER, xsd::DECIMAL, xsd::DOUBLE].contains(&number.datatype())
-    {
-        let signed = format!("{sign}{}", number.value());
-        *expression = E::Literal(Literal::new_typed_literal(signed, number.datatype()));
+    *expression = if sign == '-' && canonical_integer(&number) {
+        let signed = format!("-{}", number.value());
+        E::Literal(Literal::new_typed_literal(signed, number.datatype()))
+    } else {
+        let marker = NamedNode::new_unchecked(format!("{UNRESOLVED}{sign}"));
+        E::FunctionCall(F::Custom(marker), vec![E::Literal(number)])
+    };
+}
+
+/// The sign and the unsigned literal of a sign over a number literal, written either way
+/// ([`fold_sign`]), if the literal is spelled as an unsigned token ([`unsigned_number`]).
+fn signed_number(expression: &E) -> Option<(char, Literal)> {
+    let (sign, number) = match expression {
+        E::UnaryMinus(operand) | E::UnaryPlus(operand) => {
+            let E::Literal(number) = &**operand else {
+                return None;
+            };
+            let sign = if matches!(expression, E::UnaryMinus(_)) {
+                '-'
+            } else {
+                '+'
+            };
+            (sign, number.clone())
+        }
+        E::Literal(literal) => {
+            let unsigned = literal.value().strip_prefix(['+', '-'])?;
+            let sign = literal.value().chars().next()?;
+            (
+                sign,
+                Literal::new_typed_literal(unsigned, literal.datatype()),
+            )
+        }
+        _ => return None,
+    };
+    unsigned_number(&number).then_some((sign, number))
+}
+
+/// Whether an integer literal is spelled canonically and isn't zero (digits, no leading zero,
+/// not `0`; XSD 1.1 part 2): a minus before it is then the spelling its negation has. The
+/// datatype is unbounded: nrese's evaluator holding 64 bits is no matter of the syntax
+/// (`-9223372036854775808` is `-(9223372036854775808)`).
+fn canonical_integer(number: &Literal) -> bool {
+    let value = number.value();
+    number.datatype() == xsd::INTEGER
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && value.bytes().next().is_some_and(|b| b != b'0')
+}
+
+/// Whether a literal is spelled as the grammar's unsigned number of its datatype (SPARQL 1.1
+/// rules 146-148), the operand spargebra keeps of a signed token: `INTEGER` `[0-9]+`,
+/// `DECIMAL` `[0-9]* '.' [0-9]+`, `DOUBLE` `([0-9]+ '.' [0-9]* | '.' [0-9]+ | [0-9]+)
+/// EXPONENT`. A sign before each is in its datatype's lexical space (XSD 1.1 part 2). No other
+/// spelling (signed already, `NaN`, `INF`, no number) and no other datatype: `-` of an
+/// `xsd:int` is an `xsd:integer` (SPARQL 1.1 section 17.3), and no token is an `xsd:float`.
+fn unsigned_number(number: &Literal) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let any_digits = |s: &str| s.is_empty() || digits(s);
+    let (value, datatype) = (number.value(), number.datatype());
+    if datatype == xsd::INTEGER {
+        digits(value)
+    } else if datatype == xsd::DECIMAL {
+        value
+            .split_once('.')
+            .is_some_and(|(whole, fraction)| any_digits(whole) && digits(fraction))
+    } else if datatype == xsd::DOUBLE {
+        value
+            .split_once(['e', 'E'])
+            .is_some_and(|(mantissa, exponent)| {
+                let mantissa = match mantissa.split_once('.') {
+                    Some((whole, fraction)) => {
+                        mantissa != "." && any_digits(whole) && any_digits(fraction)
+                    }
+                    None => digits(mantissa),
+                };
+                mantissa && digits(exponent.strip_prefix(['+', '-']).unwrap_or(exponent))
+            })
+    } else {
+        false
     }
 }
 
@@ -790,9 +879,38 @@ fn nest(expression: E, and: bool, operands: &mut Vec<E>) {
     }
 }
 
+/// A query or update as the test compares it: its algebra rendered, and whether a sign in it is
+/// unresolved ([`fold_sign`]).
+#[derive(Debug, PartialEq)]
+struct Canonical {
+    algebra: String,
+    unresolved: bool,
+}
+
+/// Whether a pattern holds an unresolved sign's marker ([`fold_sign`]), found on the algebra.
+fn holds_unresolved(pattern: &P) -> bool {
+    pattern.find(&mut |node| {
+        matches!(node, Node::Expression(E::FunctionCall(F::Custom(iri), _))
+            if iri.as_str().starts_with(UNRESOLVED))
+    })
+}
+
+/// How two canonical forms compare, the outcome the test counts: "different algebra" when they
+/// differ; equal, "unresolved" when a sign in them is, which is never the same (orchestrator,
+/// IB1350-71f7), else "same algebra".
+fn compare(ours: &Canonical, theirs: &Canonical) -> &'static str {
+    if ours.algebra != theirs.algebra {
+        "different algebra"
+    } else if ours.unresolved || theirs.unresolved {
+        "unresolved"
+    } else {
+        "same algebra"
+    }
+}
+
 /// A query as the test compares it: `&&` and `||` associated and signs folded alike, the
 /// generated names renamed, then rendered.
-fn canonical(mut query: Query) -> String {
+fn canonical(mut query: Query) -> Canonical {
     let mut names = Generated::default();
     match &mut query {
         Query::Construct {
@@ -809,11 +927,18 @@ fn canonical(mut query: Query) -> String {
             names.node(NodeMut::Pattern(pattern));
         }
     }
-    format!("{query:?}")
+    let (Query::Construct { pattern, .. }
+    | Query::Select { pattern, .. }
+    | Query::Describe { pattern, .. }
+    | Query::Ask { pattern, .. }) = &query;
+    Canonical {
+        unresolved: holds_unresolved(pattern),
+        algebra: format!("{query:?}"),
+    }
 }
 
 /// An update as the test compares it, as [`canonical`] a query.
-fn canonical_update(mut update: Update) -> String {
+fn canonical_update(mut update: Update) -> Canonical {
     let mut names = Generated::default();
     for operation in &mut update.operations {
         match operation {
@@ -851,7 +976,12 @@ fn canonical_update(mut update: Update) -> String {
             | U::Drop { .. } => {}
         }
     }
-    format!("{update:?}")
+    Canonical {
+        unresolved: update.operations.iter().any(|operation| {
+            matches!(operation, U::DeleteInsert { pattern, .. } if holds_unresolved(pattern))
+        }),
+        algebra: format!("{update:?}"),
+    }
 }
 
 /// The repository's own queries and updates (`.rq`, `.ru` under `crates`, `benches` and
@@ -949,7 +1079,7 @@ fn every_query_parses_to_the_same_algebra() {
         let theirs = spargebra::SparqlParser::new()
             .with_base_iri(base.as_str())
             .unwrap();
-        let (ours, theirs): (Result<String, String>, Result<String, String>) = if update {
+        let (ours, theirs): (Result<Canonical, String>, Result<Canonical, String>) = if update {
             (
                 ours.parse_update(&text)
                     .map(canonical_update)
@@ -972,12 +1102,11 @@ fn every_query_parses_to_the_same_algebra() {
         };
         let key = match (ours, theirs) {
             (Ok(a), Ok(b)) => {
-                if a == b {
-                    "same algebra"
-                } else {
-                    algebras.insert(name.clone(), (a, b));
-                    "different algebra"
+                let key = compare(&a, &b);
+                if key == "different algebra" {
+                    algebras.insert(name.clone(), (a.algebra, b.algebra));
                 }
+                key
             }
             (Err(_), Err(_)) => "both reject",
             (Ok(_), Err(_)) => "only nrese accepts",
@@ -995,11 +1124,17 @@ fn every_query_parses_to_the_same_algebra() {
     }
     // A difference is explained only by an entry naming its file and this outcome; and with
     // the suites read, every entry is seen with its outcome (none stands for a file that
-    // now agrees, or differs otherwise).
+    // now agrees, or differs otherwise). An unresolved sign is no difference to explain: its
+    // files are listed above and counted apart.
     let explained = |file: &str, key: &str| explains(EXPLAINED, file, key);
     let unexplained: Vec<String> = outcome
         .iter()
-        .filter(|(k, _)| !matches!(**k, "same algebra" | "both reject" | "not UTF-8"))
+        .filter(|(k, _)| {
+            !matches!(
+                **k,
+                "same algebra" | "unresolved" | "both reject" | "not UTF-8"
+            )
+        })
         .flat_map(|(key, files)| files.iter().map(move |file| (key, file)))
         .filter(|(key, file)| !explained(file, key))
         .map(|(key, file)| match algebras.get(file.as_str()) {
@@ -1216,6 +1351,123 @@ fn generated_names_are_variables_and_blank_nodes_alone() {
         ours("SELECT * { ?a ?b ?c FILTER(?a = \"__b\") }"),
         "SPEC two literals differ, whatever they spell"
     );
+}
+
+/// Sol, PR #73 r1 (W1): a sign was written before any number literal's text, so `-(-1)`, the
+/// number 1, became `"--1"^^xsd:integer`, which is no number and another query's own literal.
+/// A sign over a literal no unsigned token spells keeps its unary structure.
+#[test]
+fn a_sign_never_folds_into_another_term() {
+    let query = |text: &str| canonical(SparqlParser::new().parse_query(text).unwrap());
+    assert_eq!(
+        compare(
+            &query("SELECT (isNumeric(-(-1)) AS ?ok) {}"),
+            &query(
+                "SELECT (isNumeric(\"--1\"^^<http://www.w3.org/2001/XMLSchema#integer>) AS ?ok) {}"
+            ),
+        ),
+        "different algebra",
+        "SPEC -(-1) is a number, \"--1\" none (SPARQL 1.1 sections 17.3, 17.4.2.4)"
+    );
+    let select = |e: &str| {
+        query(&format!(
+            "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ({e} AS ?a) {{}}"
+        ))
+    };
+    let distinct = [
+        (
+            "-\"abc\"^^xsd:integer",
+            "\"-abc\"^^xsd:integer",
+            "the sign of no number is an error, the literal ill-typed",
+        ),
+        (
+            "-\"NaN\"^^xsd:double",
+            "\"-NaN\"^^xsd:double",
+            "NaN negated is NaN, \"-NaN\" no double",
+        ),
+        (
+            "-\"1\"^^xsd:int",
+            "\"-1\"^^xsd:int",
+            "the negation of an xsd:int is an xsd:integer",
+        ),
+    ];
+    for (sign, literal, why) in distinct {
+        assert_eq!(
+            compare(&select(sign), &select(literal)),
+            "different algebra",
+            "SPEC {why}: {sign} | {literal}"
+        );
+    }
+}
+
+/// Sol, PR #73 r1, sol-loop r3: a sign was folded into a number wherever the spelling allowed,
+/// so `+(1)` and the token `+1` compared the same, though `sameTerm(+(1), 1)` is true and
+/// `sameTerm(+1, 1)` false: unary plus keeps its operand's term, the token is a term of its
+/// own. spargebra reads the two alike, so such a sign is unresolved, never the same; a minus
+/// over a canonical integer alone is one term both ways.
+#[test]
+fn a_sign_over_a_number_is_the_same_only_as_one_term() {
+    let query = |text: &str| canonical(SparqlParser::new().parse_query(text).unwrap());
+    assert_eq!(
+        compare(
+            &query("SELECT (sameTerm(+(1), 1) AS ?ok) {}"),
+            &query("SELECT (sameTerm(+1, 1) AS ?ok) {}"),
+        ),
+        "unresolved",
+        "SPEC sameTerm(+(1), 1) is true, sameTerm(+1, 1) false: never the same"
+    );
+    let select = |e: &str| format!("SELECT ({e} AS ?a) {{}}");
+    let two_terms = [
+        ("-(0)", "-0"),
+        ("-(.5)", "-.5"),
+        ("-(1.5e3)", "-1.5e3"),
+        ("-(01)", "-01"),
+    ];
+    for (expression, token) in two_terms {
+        assert_eq!(
+            compare(&query(&select(expression)), &query(&select(token))),
+            "unresolved",
+            "SPEC the expression's term isn't the token's: {expression} | {token}"
+        );
+    }
+    assert_eq!(
+        compare(&query(&select("-(2)")), &query(&select("-2"))),
+        "same algebra",
+        "SPEC -(2) evaluates to \"-2\", the token's term"
+    );
+    let both = |text: &str| {
+        let theirs = spargebra::SparqlParser::new().parse_query(text).unwrap();
+        compare(&query(text), &canonical(Names::default().query(&theirs)))
+    };
+    assert_eq!(
+        both("SELECT (+1 AS ?a) (-.5 AS ?b) (+1.5e3 AS ?c) (-1.E-2 AS ?d) {}"),
+        "unresolved",
+        "SPEC spargebra reads each signed token as a sign over it: unresolved"
+    );
+    assert_eq!(
+        both(&select("-2")),
+        "same algebra",
+        "SPEC -2 is one term on both sides"
+    );
+}
+
+/// Sol, PR #73 r1 (S1): spargebra's random names were given the aliases `__x0`, `__x1`, …,
+/// names a query may have itself, so an aggregate's variable merged with the query's own
+/// `?__x0`, and an anonymous blank node with its `_:__x0`. An alias is no name of the query's.
+#[test]
+fn an_alias_is_no_name_of_the_query_s() {
+    let texts = [
+        "SELECT ?__x0 (COUNT(*) AS ?n) WHERE { ?__x0 <urn:p> ?o } GROUP BY ?__x0",
+        "SELECT * { _:__x0 <urn:p> [] }",
+    ];
+    for text in texts {
+        let theirs = spargebra::SparqlParser::new().parse_query(text).unwrap();
+        assert_eq!(
+            canonical(SparqlParser::new().parse_query(text).unwrap()),
+            canonical(Names::default().query(&theirs)),
+            "SPEC the query's name and a generated one stay two names on both sides: {text}"
+        );
+    }
 }
 
 /// Whether an entry of `list` explains `file`'s difference `key`: one naming the file and
