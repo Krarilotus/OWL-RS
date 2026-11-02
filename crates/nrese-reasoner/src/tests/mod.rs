@@ -10,6 +10,8 @@ use super::naive::{Triple, Violation, materialise};
 use super::rulesets::Ruleset;
 use super::vocabulary::LocalVocabulary;
 
+mod stops;
+
 const EX: &str = "http://example.com/";
 
 /// Parses `s p o` lines of prefixed names (`ex:`, `rdf:`, `rdfs:`, `owl:`); `_:x` are
