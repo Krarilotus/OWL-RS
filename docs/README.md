@@ -36,6 +36,7 @@ The tools that exist, so none is built twice. Each one's own header or README is
 | Checked files and lints | `scripts/check-locks.sh` (Cargo lock files current), `scripts/check-names.sh` (Docker names), `scripts/check-doc-paths.py` (paths the docs name exist) |
 | Client compatibility | [tests/compat/README.md](../tests/compat/README.md) |
 | Plan and state | [ROADMAP.md](ROADMAP.md), [STATUS.md](STATUS.md), the merge checklist above |
+| Prior research, before writing a research prompt or a design from scratch | the local, untracked `literature/` corpus: `literature/wiki/00 Index.md`, one row per research round in `literature/wiki/research/Research reports.md` |
 
 ## Design
 
