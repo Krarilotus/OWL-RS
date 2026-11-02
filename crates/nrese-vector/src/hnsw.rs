@@ -581,6 +581,33 @@ mod tests {
                 .is_empty()
         );
     }
+
+    /// A search's `accept` may search the graph again on its own thread (an embedder's
+    /// filter that searches, or a Rayon part a waiting thread takes on): both answer as a
+    /// search alone does. Each search had borrowed its thread's visited marks for its whole
+    /// run, and the nested one panicked on the second borrow.
+    #[test]
+    fn a_search_s_accept_may_search_again_on_its_thread() {
+        let vectors = random_vectors(500, 8, 7);
+        let mut graph = Hnsw::new(Metric::L2, HnswParameters::default());
+        graph.extend(&vectors);
+        let query = vectors.get(42).to_vec();
+        let ids = |hits: Vec<Hit>| hits.into_iter().map(|hit| hit.id).collect::<Vec<_>>();
+        let alone = ids(graph.search(&vectors, &query, 10, 64, &|_| true));
+        let nested = std::sync::Mutex::new(None);
+        let outer = ids(graph.search(&vectors, &query, 10, 64, &|_| {
+            let mut nested = nested.lock().expect("unpoisoned");
+            if nested.is_none() {
+                *nested = Some(ids(graph.search(&vectors, &query, 10, 64, &|_| true)));
+            }
+            true
+        }));
+        assert_eq!(
+            nested.into_inner().expect("unpoisoned"),
+            Some(alone.clone())
+        );
+        assert_eq!(outer, alone);
+    }
 }
 
 #[cfg(test)]
