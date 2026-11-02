@@ -317,7 +317,9 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
            "priority": priority, "priority_reason": reason or f"A-B-B-A: {b[:8]} against {a[:8]}, "
            f"{len(family['cases'])} cases", "notify": False,
            "env": env, "est_min": 0, "stall_after_min": 60, "steps": steps, "untimed_steps": untimed,
-           "step_needs": [{"cores": 16, "ram_gb": 12}], "step_deadline_min": rg.BUILD_MIN * len(revisions) + 120,
+           # The first step asks the job's whole memory too: placed on a host too small for the blocks,
+           # its hold would end there and the blocks run elsewhere, without its builds (Sol r2 S1).
+           "step_deadline_min": rg.BUILD_MIN * len(revisions) + 120,
            "requires": requires, "inputs": source + rg.side_inputs(checkout, source[0]["source"]["rev"], revisions)}
     if host:
         requires["hosts"] = [host]

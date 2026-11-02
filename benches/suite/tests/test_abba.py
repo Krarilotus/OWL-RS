@@ -238,6 +238,9 @@ systems = []
             self.assertIn(word, first[2])
         self.assertEqual(first[4:], [abba.ENV_FAMILY, A, B])  # the family, then every revision built
         self.assertEqual([s[2] for s in job["steps"][1:7]], ["block"] * 6)
+        # The first step asks no less memory than the blocks (Sol r2 S1).
+        self.assertTrue(all(n.get("ram_gb", job["requires"]["ram_gb"]) >= job["requires"]["ram_gb"]
+                            for n in job.get("step_needs", [])))
         self.assertGreater(job["est_min"], 0)
         import tomllib
         whole = tomllib.loads(abba.set_file("abba-t-bbbbbbbb", list(found.values())))

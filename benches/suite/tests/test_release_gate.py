@@ -345,6 +345,12 @@ class Rounds(unittest.TestCase):
         self.assertIn("MISSING bsbm-100m.nt: made by `bash benches/sparql/prepare.sh bsbm-100m`", text)
         self.assertIn("MISSING query set watdiv-10m", text)
         self.assertIn("can't be made again", text)
+        # A concatenation's parts are inputs too (Sol r2 T2: "no frozen inputs" where both were absent).
+        with tempfile.TemporaryDirectory() as cache, patch.dict(os.environ, {"SPARQL_DATA": cache}), \
+                patch.object(gate_module.hosts_registry, "input_path", return_value=None):
+            lines, ok = gate_module.data_state([{"data": "concat:volume:univ-bench.nt+volume:lubm-1.nt"}])
+        self.assertFalse(ok)
+        self.assertEqual(sorted(line.split(":")[0] for line in lines), ["MISSING lubm-1.nt", "MISSING univ-bench.nt"])
 
 
 class Verdicts(unittest.TestCase):
@@ -645,6 +651,11 @@ class Parts(unittest.TestCase):
         self.assertIn("release-gate.sh prepare", timed["steps"][0][2])
         self.assertEqual(timed["steps"][0][4], "c" * 40)  # the harness, then the revisions
         self.assertEqual([s[2] for s in timed["steps"][1:]], ["block"] * 3 + ["report", "clean"])
+        # No step asks less memory than the blocks: placed by a smaller ask, the builds could land on
+        # a host the blocks don't fit, whose hold then ends without them (Sol r2 S1).
+        for job in (timed, found["rg-test-big"]):
+            asks = [n.get("ram_gb", job["requires"]["ram_gb"]) for n in job.get("step_needs", [])]
+            self.assertTrue(all(a >= job["requires"]["ram_gb"] for a in asks), job["id"])
         import tomllib
         whole = tomllib.loads(gate_module.toml_set({"id": "rg-test", "fail": "continue"}, list(found.values())))
         self.assertEqual((whole["set"]["id"], [j["id"] for j in whole["job"]]), ("rg-test", list(found)))
