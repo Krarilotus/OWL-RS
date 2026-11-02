@@ -205,8 +205,9 @@ systems = []
         self.path.write_text(FAMILY, encoding="utf-8")
         found = abba.jobs(self.family, B, self.repo.as_posix(), "office-pc")  # its sides resolve there too
         timed = found["abba-t-bbbbbbbb"]
-        self.assertEqual((timed["requires"]["hosts"], timed["class"], timed["steps"][0][-2:]),
-                         (["office-pc"], "exclusive", ["check", abba.ENV_FAMILY]))  # registry cases: carried
+        first = timed["steps"][0]
+        self.assertEqual((timed["requires"]["hosts"], timed["class"], ["check" if "check" in first[2] else "?", first[4]]),
+                         (["office-pc"], "exclusive", ["check", abba.ENV_FAMILY]))
         blocks = [s for s in timed["steps"] if "block" in s]
         self.assertEqual(len(blocks), 6)
         self.assertEqual(blocks[0][-3:], [f"a={A}", f"a2={A}", f"b={B}"])
@@ -228,12 +229,15 @@ systems = []
         self.assertNotIn("GATE_HOST", job["env"])
         self.assertEqual((job["kind"], job["requires"]["roles"], job["requires"]["os"]),
                          ("owlrs.timed", ["measure", "build"], "linux"))
-        untimed = set(job["untimed_steps"])
-        timed_kinds = {s[2] for i, s in enumerate(job["steps"]) if i not in untimed}
-        self.assertEqual(timed_kinds, {"block"})
-        first_block = min(i for i, s in enumerate(job["steps"]) if "block" in s)
-        self.assertEqual({s[2] if s[1].endswith(".sh") else s[3] for s in job["steps"][:first_block]},
-                         {"check", "build", "prepare"})
+        # The fleet keeps an exclusive job's host only before an exclusive step (planner
+        # held_between_steps; Sol r1 S1): the check, every build and the preparation are the first
+        # step, the only untimed one, and every later step is exclusive, so it runs where they ran.
+        self.assertEqual(job["untimed_steps"], [0])
+        first = job["steps"][0]
+        for word in ("abba.py check", "release-gate.sh build", "release-gate.sh prepare"):
+            self.assertIn(word, first[2])
+        self.assertEqual(first[4:], [abba.ENV_FAMILY, A, B])  # the family, then every revision built
+        self.assertEqual([s[2] for s in job["steps"][1:7]], ["block"] * 6)
         self.assertGreater(job["est_min"], 0)
         import tomllib
         whole = tomllib.loads(abba.set_file("abba-t-bbbbbbbb", list(found.values())))
@@ -257,7 +261,7 @@ systems = []
         job = next(iter(abba.jobs(there, B, self.repo.as_posix()).values()))
         self.assertEqual(job["env"]["ABBA_FAMILY"], text)
         self.assertNotIn("NRESE_FAMILY", job["env"])
-        self.assertEqual(job["steps"][0][-2:], ["check", abba.ENV_FAMILY])
+        self.assertEqual(job["steps"][0][4], abba.ENV_FAMILY)
         # Its rounds are judged against the family whichever way it was read.
         self.family = carried
         self.assertEqual(self.verdict(self.round_(records(), name="carried"))[0], abba.NO_LOSS)
@@ -296,6 +300,13 @@ systems = []
         self.path.write_text(FAMILY.replace('dimensions = ["time/q01-point-lookup", "time/q06-text-filter"]\n'
                                             "min_samples = 3\n", ""), encoding="utf-8")
         self.assertEqual(built["hypotheses"], self.load()["hypotheses"])
+        # The run's id is its request's: the same request is the same set, another one another (Sol r1 S2).
+        same = abba.run_name(None, {"a": A, "b": B}, B, ["lab-olympics"], 3, 1)
+        self.assertEqual(same, abba.run_name(None, {"a": A, "b": B}, B, ["lab-olympics"], 3, 1))
+        for other in (abba.run_name(None, {"a": B, "b": B}, B, ["lab-olympics"], 3, 1),
+                      abba.run_name(None, {"a": A, "b": B}, B, ["lab-olympics"], 6, 1),
+                      abba.run_name("named", {"a": A, "b": B}, B, ["lab-olympics"], 3, 1)):
+            self.assertNotEqual(other, same)
         # Effort follows spread: blocks from the calibration, in whole squares, at least one.
         self.assertEqual(abba.suggested_blocks(["x"], {}), 3)
         self.assertEqual(abba.suggested_blocks(["x"], {"x": {"passes": 8}}), 6)

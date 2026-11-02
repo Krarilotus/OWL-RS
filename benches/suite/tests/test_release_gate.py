@@ -309,17 +309,42 @@ class Rounds(unittest.TestCase):
                 gate_module.confirm_job([hostless], "C:/repo")
 
     def test_a_part_asks_for_the_data_its_cases_read(self):
-        """The fleet places by `has`: the verified bench assets for frozen datasets, ORE ontologies
-        and reference taxonomies; the SPARQL workloads' data for what benches/sparql/prepare.sh makes
-        and the WatDiv query sets; nothing for generated data."""
+        """The fleet places by `has` only what the job can't make: the verified bench assets (frozen
+        datasets, ORE ontologies, reference taxonomies). What benches/sparql/prepare.sh makes is the
+        job's own (Johannes, 2 Nov 2026: "Data is the job's responsibility, not the fleet's"): no
+        capability, but the disk to make it in, its source and its file."""
         need = gate_module.data_needs
         self.assertEqual(need([{"data": "social people=1000"}]), [])
         self.assertEqual(need([{"data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}]), ["owlrs-bench-assets"])
         self.assertEqual(need([{"data": "ore:ore_ont_9724"}]), ["owlrs-bench-assets"])
         self.assertEqual(need([{"data": "el classes=10", "reference": "/fast/ref/x.tax"}]), ["owlrs-bench-assets"])
-        self.assertEqual(need([{"data": "volume:bsbm-100m.nt"}]), ["owlrs-sparql-data"])
-        self.assertEqual(need([{"data": "none", "queries": "@watdiv-10m"}]), ["owlrs-sparql-data"])
+        self.assertEqual(need([{"data": "volume:bsbm-100m.nt"}]), [])
+        self.assertEqual(need([{"data": "volume:watdiv-10m.nt", "queries": "@watdiv-10m"}]), [])
         self.assertEqual(need([{"data": "concat:volume:lubm-1.nt+social people=10"}]), ["owlrs-bench-assets"])
+        frozen = next(d for d in __import__("tomllib").loads((ROOT / "benches/datasets.toml").read_text(encoding="utf-8"))["dataset"]
+                      if d["file"] == "bsbm-100m.nt")
+        self.assertEqual(gate_module.data_disk_gb([{"data": "volume:bsbm-100m.nt"}]), -(-2 * frozen["bytes"] // 10 ** 9))
+        self.assertEqual(gate_module.data_disk_gb([{"data": "volume:lubm-10.nt"}]), 0)
+
+    def test_the_data_probe_says_what_a_host_holds_and_what_it_cannot_make(self):
+        """The probe (release_gate.py data; release-gate.sh prepare with --make): a file in the cache
+        at its frozen size is held, at another size it differs, absent it is missing with its maker;
+        a missing WatDiv query set can't be made again (a clock-seeded generator), only copied."""
+        frozen = {d["file"]: d for d in __import__("tomllib").loads(
+            (ROOT / "benches/datasets.toml").read_text(encoding="utf-8"))["dataset"]}
+        with tempfile.TemporaryDirectory() as cache:
+            (Path(cache) / "watdiv-10m.nt").write_bytes(b"x" * 10)
+            with patch.dict(os.environ, {"SPARQL_DATA": cache}), \
+                    patch.object(gate_module.hosts_registry, "input_path", return_value=None):
+                lines, ok = gate_module.data_state([{"data": "volume:watdiv-10m.nt", "queries": "@watdiv-10m"},
+                                                    {"data": "volume:bsbm-100m.nt"}])
+        self.assertFalse(ok)
+        text = "\n".join(lines)
+        self.assertIn(f"DIFFERS watdiv-10m.nt: {Path(cache) / 'watdiv-10m.nt'} is 10 bytes, frozen "
+                      f"{frozen['watdiv-10m.nt']['bytes']}", text)
+        self.assertIn("MISSING bsbm-100m.nt: made by `bash benches/sparql/prepare.sh bsbm-100m`", text)
+        self.assertIn("MISSING query set watdiv-10m", text)
+        self.assertIn("can't be made again", text)
 
 
 class Verdicts(unittest.TestCase):
@@ -613,12 +638,13 @@ class Parts(unittest.TestCase):
             self.assertNotIn("after", job, job["id"])
         self.assertEqual((timed["requires"]["roles"], timed["requires"]["os"]), (["measure", "build"], "linux"))
         self.assertEqual(checks["requires"]["roles"], ["test"])
-        untimed = set(timed["untimed_steps"])
-        self.assertEqual({s[2] for i, s in enumerate(timed["steps"]) if i not in untimed}, {"block"})
-        self.assertEqual({s[2] for i, s in enumerate(timed["steps"]) if i in untimed},
-                         {"build", "prepare", "report", "clean"})
-        self.assertLess(max(i for i, s in enumerate(timed["steps"]) if s[2] in ("build", "prepare")),
-                        min(i for i, s in enumerate(timed["steps"]) if s[2] == "block"))
+        # One untimed first step builds every side and prepares the data; every later step is
+        # exclusive, which is what keeps the host (planner held_between_steps; Sol r1 S1).
+        self.assertEqual(timed["untimed_steps"], [0])
+        self.assertIn("release-gate.sh build", timed["steps"][0][2])
+        self.assertIn("release-gate.sh prepare", timed["steps"][0][2])
+        self.assertEqual(timed["steps"][0][4], "c" * 40)  # the harness, then the revisions
+        self.assertEqual([s[2] for s in timed["steps"][1:]], ["block"] * 3 + ["report", "clean"])
         import tomllib
         whole = tomllib.loads(gate_module.toml_set({"id": "rg-test", "fail": "continue"}, list(found.values())))
         self.assertEqual((whole["set"]["id"], [j["id"] for j in whole["job"]]), ("rg-test", list(found)))
@@ -641,7 +667,10 @@ class Parts(unittest.TestCase):
         found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None)
         big = found["rg-test-big"]
         self.assertEqual((big["requires"]["os"], big["requires"]["ram_gb"]), ("linux", 32))
-        self.assertEqual({s[2] for s in big["steps"][:4]}, {"build", "prepare"})
+        self.assertIn("release-gate.sh build", big["steps"][0][2])
+        self.assertEqual(big["untimed_steps"], [0])
+        # Its own gate directory: on the timed part's host it would overwrite that part's plan (Sol r1 S3).
+        self.assertNotEqual(big["env"]["GATE_NAME"], found["rg-test-timed"]["env"]["GATE_NAME"])
         self.assertFalse([i for i in big["inputs"] if "artifact" in i["source"]])
         self.assertEqual(big["env"]["GATE_MIN_GB"], "24")
         # A selection with no case above the timed part's memory has no big part.
@@ -834,6 +863,12 @@ point {head} "$b"
                                          checks=False, big_gb=None)
                 return found["rg-test-timed"]["inputs"][0]["source"]["rev"]
             self.assertEqual((checkout_of(rebased), checkout_of(root)), (rebased, harness))
+            # A side the checkout's history doesn't hold is a git input of its own (Sol r1 S4);
+            # one it holds isn't.
+            found = gate_module.jobs(rebased, harness, tmp, "rg-test", 2, None, base=diverged, main=root,
+                                     checks=False, big_gb=None)
+            names = [i["name"] for i in found["rg-test-timed"]["inputs"]]
+            self.assertEqual(names, ["checkout", f"side-{diverged[:8]}"])
             with self.assertRaises(SystemExit) as refused:
                 checkout_of(diverged)
             self.assertIn("contains the other", str(refused.exception))
@@ -1121,9 +1156,8 @@ class Measurement(unittest.TestCase):
                          [["a", "b", "c"]] * 3 + [["b"]] * 3)
         timed = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None, measure=measure)["rg-test-timed"]
         planned = [i for i, s in enumerate(timed["steps"]) if s[2:] == ["plan-blocks", "c" * 40]]
-        self.assertEqual(len(planned), 1)
-        self.assertEqual(timed["steps"][planned[0] + 1][2], "block")
-        self.assertIn(planned[0], timed["untimed_steps"])
+        self.assertEqual(planned, [1])  # after the builds, before the first block
+        self.assertEqual(timed["steps"][2][2], "block")
         self.assertEqual([s[6] for s in timed["steps"] if s[2] == "block"], [f"plan-block-{k}.json" for k in range(1, 7)])
         self.assertEqual((timed["env"]["GATE_SQUARE"], timed["env"]["GATE_MIN_BLOCKS"]), ("3", "3"))
         two = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None, measure=measure,

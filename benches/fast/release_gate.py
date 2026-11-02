@@ -1539,6 +1539,20 @@ def toml_value(v) -> str:
     return json.dumps(v)
 
 
+def side_inputs(checkout: str, rev: str, revs: list[str]) -> list[dict]:
+    """The git inputs a job building `revs` from a checkout of `rev` needs: the sides' measurement
+    commits (measurement_inputs()), and each side that `rev`'s history doesn't hold, so that its
+    build finds it (Sol r1 S4, 2 Nov 2026: a base off the change's history was built unstaged)."""
+    import subprocess
+    inputs = measurement_inputs(checkout, revs)
+    for side in dict.fromkeys(revs):
+        held = subprocess.run(["git", "-C", checkout, "merge-base", "--is-ancestor", side, rev],
+                              capture_output=True, text=True, timeout=60)
+        if held.returncode == 1:  # not an ancestor; another code (no such commit) is the build's to report
+            inputs.append({"name": f"side-{side[:8]}", "source": {"git": checkout, "rev": side}})
+    return inputs
+
+
 def toml_job(job: dict) -> str:
     job = spec(job)
     lines = [f"{k} = {toml_value(v)}" for k, v in job.items() if k not in ("requires", "inputs", "outputs")]
@@ -1562,14 +1576,6 @@ def toml_set(head: dict, members: list[dict]) -> str:
                 lines += [f"[[job.{table}]]"] + [f"{k} = {toml_value(v)}" for k, v in item.items()]
     return "\n".join(lines) + "\n"
 
-
-def linux_host(name: str, registry: dict | None = None) -> None:
-    """The gate's binaries are Linux ELF (built on office-pc): a timed host must be a Linux one in
-    benches/hosts.toml (khaleesi-wsl, not khaleesi). Anything else is refused, never routed."""
-    host = (registry or hosts_registry.load()).get("host", {}).get(name)
-    if not host or host.get("os") != "linux":
-        raise SystemExit(f"{name}: not a Linux host in benches/hosts.toml "
-                         f"(os {host.get('os') if host else 'unknown'}): the gate's ELF binaries can't run there")
 
 
 def checkout_rev(checkout: str, candidate: str, harness: str) -> str:
@@ -1601,37 +1607,98 @@ def checkout_rev(checkout: str, candidate: str, harness: str) -> str:
 # its own job, the host kept between them) and so needs no binaries staged from elsewhere.
 TIMING_ROLES = ["measure", "build"]
 BUILD_MIN = 25  # a revision's build, at most; one of the same identity on that host is reused
-ASSETS, SPARQL_DATA_HAS = "owlrs-bench-assets", "owlrs-sparql-data"
+ASSETS = "owlrs-bench-assets"
 SPARQL_PREPARE = "benches/sparql/prepare.sh"
 
 
-def data_needs(cases: list[dict], datasets: Path = ROOT / "benches" / "datasets.toml") -> list[str]:
-    """What a host must hold for the cases' frozen inputs (fleet `has`; the prepare step reads them,
-    release-gate.sh prepare): the verified bench assets (hosts.toml `inputs`: the datasets, ORE
-    ontologies and the reference taxonomies), or the SPARQL workloads' data (SPARQL_DATA: what
-    benches/sparql/prepare.sh makes, and the WatDiv query sets kept with it)."""
-    made_by: dict[str, str] = {}
+def volume_files(case: dict) -> list[str]:
+    """The frozen files a case reads (`volume:` specs, a concatenation's parts included)."""
+    specs = [case.get("data", ""), *case.get("extra", [])]
+    specs += [p for s in specs if s.startswith("concat:") for p in s[len("concat:"):].split("+")]
+    return [s[len("volume:"):] for s in specs if s.startswith("volume:")]
 
-    def maker(file: str) -> str:  # read once, and only when a case reads a frozen file
-        if not made_by:
-            made_by.update({d["file"]: d.get("made_by", "")
-                            for d in tomllib.loads(datasets.read_text(encoding="utf-8"))["dataset"]})
-        return made_by.get(file, "")
+
+def frozen(files: set[str], datasets: Path) -> dict[str, dict]:
+    """benches/datasets.toml's entries, read only when there are frozen files to look up: a
+    checkout without the file (a test's own repository) plans its generated-data cases (Sol
+    loop proofs 1 and 3, 2 Nov 2026: read for every plan, it failed where no case reads one)."""
+    if not files:
+        return {}
+    return {d["file"]: d for d in tomllib.loads(datasets.read_text(encoding="utf-8"))["dataset"]}
+
+
+def data_needs(cases: list[dict], datasets: Path = ROOT / "benches" / "datasets.toml") -> list[str]:
+    """What a host must hold for the cases' frozen inputs (fleet `has`): the verified bench assets
+    (hosts.toml `inputs`: the datasets, ORE ontologies and the reference taxonomies). The SPARQL
+    workloads' data is the job's own to make (Johannes, 2 Nov 2026: "Data is the job's
+    responsibility, not the fleet's"): release-gate.sh prepare makes what benches/sparql/prepare.sh
+    can into the host's cache (data_state()), the job asking its disk (data_disk_gb())."""
+    entries = frozen({f for c in cases for f in volume_files(c)}, datasets)
     out = set()
     for c in cases:
-        specs = [c.get("data", ""), *c.get("extra", [])]
-        specs += [f"volume:{p[len('volume:'):]}" for s in specs if s.startswith("concat:")
-                  for p in s[len("concat:"):].split("+") if p.startswith("volume:")]
-        for spec in specs:
-            if spec.startswith("volume:"):
-                out.add(SPARQL_DATA_HAS if SPARQL_PREPARE in maker(spec[len("volume:"):]) else ASSETS)
-            elif spec.startswith("ore:"):
-                out.add(ASSETS)
-        if c.get("reference"):
+        if any(SPARQL_PREPARE not in entries.get(f, {}).get("made_by", "") for f in volume_files(c)):
             out.add(ASSETS)
-        if str(c.get("queries", "")).startswith("@watdiv"):
-            out.add(SPARQL_DATA_HAS)
+        if any(s.startswith("ore:") for s in [c.get("data", ""), *c.get("extra", [])]) or c.get("reference"):
+            out.add(ASSETS)
     return sorted(out)
+
+
+def sparql_data() -> Path:
+    """The SPARQL workloads' data cache on this host (benches/hosts.toml [caches.sparql-data])."""
+    return Path(os.environ.get("SPARQL_DATA") or Path.home() / "owlrs" / "sparql-data")
+
+
+def data_disk_gb(cases: list[dict], datasets: Path = ROOT / "benches" / "datasets.toml") -> float:
+    """The disk a job may fill making its cases' SPARQL data where the host lacks it: each
+    frozen file benches/sparql/prepare.sh makes, twice (its source and the file), in GB."""
+    files = {f for c in cases for f in volume_files(c)}
+    entries = frozen(files, datasets)
+    made = [entries[f] for f in files if SPARQL_PREPARE in entries.get(f, {}).get("made_by", "")]
+    return math.ceil(2 * sum(d.get("bytes", 0) for d in made) / 1e9)
+
+
+def data_state(cases: list[dict], make: bool = False, root: Path = ROOT) -> tuple[list[str], bool]:
+    """What this host holds of the cases' frozen inputs (the probe; release-gate.sh prepare runs it
+    with `make`): each file in the bench assets (hosts.toml inputs.general) or the SPARQL data cache,
+    by its frozen size; with `make`, a missing file benches/sparql/prepare.sh makes is made into the
+    cache first (its SHA-256 is prepare's check). Each generated query set (@NAME) against its pins:
+    WatDiv's generator seeds from the clock, so a missing set can't be made again, only copied from
+    a host holding the pinned files. Lines, and whether everything is there."""
+    import subprocess
+    frozen = {d["file"]: d for d in tomllib.loads((root / "benches/datasets.toml").read_text(encoding="utf-8"))["dataset"]}
+    general, cache = hosts_registry.input_path("general"), sparql_data()
+    files = sorted({s[len("volume:"):] for c in cases for s in [c.get("data", ""), *c.get("extra", [])]
+                    if s.startswith("volume:")})
+    lines, ok = [], True
+    for name in files:
+        entry = frozen.get(name, {})
+        found = next((d / name for d in (general, cache) if d and (d / name).is_file()), None)
+        if found is None and make and SPARQL_PREPARE in entry.get("made_by", ""):
+            dataset = entry["made_by"].split(SPARQL_PREPARE, 1)[1].split()
+            done = subprocess.run(["bash", str(root / SPARQL_PREPARE), *dataset, "--out", str(cache)], cwd=root)
+            lines.append(f"made {name} ({' '.join(dataset)}): exit {done.returncode}")
+            found = cache / name if (cache / name).is_file() else None
+        if found is None:
+            ok = False
+            how = (f"made by `{entry['made_by']}`" if entry.get("made_by") else "no recorded maker")
+            lines.append(f"MISSING {name}: {how}")
+        elif entry.get("bytes") and found.stat().st_size != entry["bytes"]:
+            ok = False
+            lines.append(f"DIFFERS {name}: {found} is {found.stat().st_size} bytes, frozen {entry['bytes']}")
+        else:
+            lines.append(f"held {name}: {found}")
+    pins = (root / "benches/sparql/queries.sha256").read_text(encoding="utf-8").splitlines() \
+        if (root / "benches/sparql/queries.sha256").is_file() else []
+    for qset in sorted({c["queries"][1:] for c in cases if str(c.get("queries", "")).startswith("@watdiv")}):
+        want = sum(1 for p in pins if p.split("  ", 1)[-1].startswith(f"{qset}/"))
+        have = len(list((cache / "queries" / qset).glob("*.rq"))) if (cache / "queries" / qset).is_dir() else 0
+        if have == want and want:
+            lines.append(f"held query set {qset}: {have} files (prepare checks their pins)")
+        else:
+            ok = False
+            lines.append(f"MISSING query set {qset}: {have} of {want} pinned files; generated with a clock seed, it "
+                         f"can't be made again: copy {cache}/queries/{qset} from a host holding it")
+    return lines, ok
 
 
 def case_seconds(measure: dict | None, case: str) -> float | None:
@@ -1663,8 +1730,12 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     gate_ = ["bash", "scripts/release-gate.sh"]
     revs = {"base": base, "main": main, "cand": candidate}
     revisions = list(dict.fromkeys([base, main, candidate, harness]))
-    inputs = source + measurement_inputs(checkout, revisions)
-    builds = [[*gate_, "build", rev] for rev in revisions] + [[*gate_, "prepare", harness]]
+    inputs = source + side_inputs(checkout, source[0]["source"]["rev"], revisions)
+    # Every build and the data's preparation in one first step, the job's one untimed (shareable)
+    # step: the fleet keeps an exclusive job's host only before an exclusive step (planner
+    # held_between_steps), so each later step is one and runs where these binaries are (Sol r1 S1).
+    builds = [["bash", "-c", 'set -e; harness=$1; shift; for rev in "$@"; do bash scripts/release-gate.sh build "$rev"; '
+               'done; bash scripts/release-gate.sh prepare "$harness"', "prepare", harness, *revisions]]
     # the sides timed (a main that is the base isn't timed again)
     sides = 2 + (main != base)
     # Whole Latin squares (whole_squares()): every timed side opens a case's blocks alike.
@@ -1678,16 +1749,18 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     def part(job_id: str, part_env: dict, planned: list[str], timed_steps: list[list[str]], ram_gb: float,
              block_cases: list[list[str]]) -> dict:
         steps = builds + timed_steps + report
-        first = len(builds)
-        untimed = [i for i, s in enumerate(steps) if i < first or s in report or s[2] == "plan-blocks"]
-        has = data_needs([by_name[c] for c in planned if c in by_name])
-        requires = {"roles": TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": ram_gb} | ({"has": has} if has else {})
+        untimed = [0]
+        mine = [by_name[c] for c in planned if c in by_name]
+        has, disk = data_needs(mine), data_disk_gb(mine)
+        requires = ({"roles": TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": ram_gb} | ({"has": has} if has else {})
+                    | ({"disk_gb": disk} if disk else {}))
         est = plan_minutes(len(revisions), sides, block_cases, measure)
         return {"id": job_id, "group": "release", "kind": "owlrs.timed", "class": "exclusive",
                 "priority_class": "merge-gate", "env": part_env, "stall_after_min": 90,
                 "est_min": round(est["total_min"]), "_plan": est,
                 "steps": steps, "untimed_steps": untimed,
-                "step_needs": [{"cores": 16, "ram_gb": 12}] * len(builds), "requires": requires, "inputs": inputs}
+                "step_needs": [{"cores": 16, "ram_gb": 12}], "step_deadline_min": BUILD_MIN * len(revisions) + 120,
+                "requires": requires, "inputs": inputs}
 
     timed_steps = [[*gate_, "plan-blocks", harness]] if measure else []
     block_cases = []
@@ -1698,7 +1771,9 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     out = {f"{prefix}-timed": part(f"{prefix}-timed", {**env, "GATE_PREFIX": prefix, "GATE_RAM_GB": str(max_gb)},
                                    run, timed_steps, max_gb, block_cases)}
     if big_gb and elsewhere:
-        big_env = {**env, "GATE_MIN_GB": str(max_gb), "GATE_MAX_GB": str(big_gb),
+        # Its own gate directory (GATE_NAME): placed by capability it may share a host with the timed
+        # part, whose plan and passes would be overwritten (Sol r1 S3); a confirmation keeps it.
+        big_env = {**env, "GATE_MIN_GB": str(max_gb), "GATE_MAX_GB": str(big_gb), "GATE_NAME": f"{env['GATE_NAME']}-big",
                    "GATE_PREFIX": f"{prefix}-big", "GATE_RAM_GB": str(big_gb + 4)}
         big_env.pop("GATE_BIG_GB")
         big = sorted(elsewhere)
@@ -1961,6 +2036,9 @@ def main() -> int:
     s.add_argument("--submit", action="store_true", help="submit the set (fleet submit) once fleet's check takes it")
     s.add_argument("--layouts", type=int, default=1, help="builds a side in different layouts (GATE_LAYOUTS)")
     s.add_argument("--out", type=Path, default=Path("."))
+    s = sub.add_parser("data", help="what this host holds of the cases' frozen inputs (exit 1: something missing)")
+    s.add_argument("--cases", help="comma-separated; default every registry case")
+    s.add_argument("--make", action="store_true", help="make what benches/sparql/prepare.sh can into SPARQL_DATA first")
     s = sub.add_parser("calibrate", help="benches/fast/measure.toml from passes of the gate's host (an A/A run)")
     s.add_argument("--passes", type=Path, nargs="+", required=True, help="pass reports, or directories of them")
     s.add_argument("--budget-min", type=float, default=150, help="the timed part's minutes, at most")
@@ -2000,6 +2078,11 @@ def main() -> int:
         side = measurement_ref(str(ROOT), args.ref, args.commit, args.remote)
         print(f"{args.ref}: the measurement commit of {side[:12]}, admitted (benches/fast/measurement-sides.toml)")
         return 0
+    if args.command == "data":
+        wanted = set(args.cases.split(",")) if args.cases else None
+        lines, ok = data_state([c for c in cases_registry.load() if wanted is None or c["name"] in wanted], args.make)
+        print("\n".join(lines) or "no frozen inputs")
+        return 0 if ok else 1
     if args.command == "plan":
         catalog = cases_registry.load()
         run, not_run, elsewhere = plan(catalog, args.max_gb, args.cases.split(",") if args.cases else None,

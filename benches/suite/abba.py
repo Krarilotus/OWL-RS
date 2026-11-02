@@ -230,6 +230,14 @@ def family_text(name: str, sides: dict[str, str], cases: list[str], blocks: int,
     return "\n".join(lines) + "\n"
 
 
+def run_name(name: str | None, sides: dict[str, str], harness: str, cases: list[str], blocks: int,
+             min_samples: int) -> str:
+    """A run's family name, and so its set's id: the request's own (Sol r1 S2: another A, case list,
+    block count or sample floor gave the same id, and the fleet refused the new set as the old one)."""
+    request = f"{sides['a']} {sides['b']} {harness} {','.join(cases)} {blocks} {min_samples}"
+    return f"{name or 'run'}-{hashlib.sha256(request.encode()).hexdigest()[:8]}"
+
+
 def suggested_blocks(cases: list[str], measure: dict) -> int:
     """A first round's blocks from the cases' calibration (measure.toml: a round's `blocks`, or in
     the older form a side's `passes`, two to a block), at least one square: effort follows spread
@@ -267,11 +275,11 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
     """The family's fleet job, one: on the timing host the fleet picks by capability (TIMING_ROLES,
     Linux, the cases' needs and caps; `host` pins it, with its reason), its check (the manifest the
     report holds the results to, naming that host), the builds of A, B and the harness and the
-    data's preparation (untimed steps: shareable, the host kept between them), then alone its
-    blocks, and its report (the verdict in abba-verdict.json; the step fails only for an invalid
-    family) and clean-up. Builds and blocks share the host, so nothing is staged between jobs."""
-    if host:
-        rg.linux_host(host)
+    data's preparation, all in its first step, the one untimed (shareable) step; then alone its
+    blocks, its report (the verdict in abba-verdict.json; the step fails only for an invalid
+    family) and clean-up. Builds and blocks share the host, so nothing is staged between jobs: the
+    fleet keeps an exclusive job's host only before an exclusive step (planner held_between_steps;
+    Sol r1 S1, 2 Nov 2026), so every step after the first is one."""
     a, b = family["sides"]["a"], family["sides"]["b"]
     prefix = f"abba-{family['name']}-{b[:8]}" + (f"-r{round_}" if round_ > 1 else "")
     gate_ = ["bash", "scripts/release-gate.sh"]
@@ -292,14 +300,16 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
         env["GATE_HOST"] = host
     source = [{"name": "checkout", "source": {"git": checkout, "rev": rg.checkout_rev(checkout, b, harness)}}]
     revisions = list(dict.fromkeys([a, b, harness]))
-    prepare = [[*abba, "check", named]] + [[*gate_, "build", r] for r in revisions] + [[*gate_, "prepare", harness]]
+    prepare = [["bash", "-c", 'set -e; family=$1; shift; python3 -B benches/suite/abba.py check "$family"; '
+                'for rev in "$@"; do bash scripts/release-gate.sh build "$rev"; done; '
+                'bash scripts/release-gate.sh prepare "$ABBA_HARNESS"', "prepare", named, *revisions]]
     blocks = [[*gate_, "block", str(k), harness, "1", "-", f"a={a}", f"a2={a}", f"b={b}"]
               for k in range(1, family["blocks"] + 1)]
     after = [["bash", "-c", 'python3 -B benches/suite/abba.py report "$1" "$FLEET_OUT" --json "$FLEET_OUT/abba-verdict.json" '
               '--out "$FLEET_OUT/abba-verdict.md"; code=$?; echo "$code" > "$FLEET_OUT/abba-exit"; [ "$code" != 2 ]',
               "abba", named], [*gate_, "clean"]]
     steps = prepare + blocks + after
-    untimed = list(range(len(prepare))) + list(range(len(prepare) + len(blocks), len(steps)))
+    untimed = [0]
     by_name = {c["name"]: c for c in family["catalog"]}
     has = rg.data_needs([by_name[c["name"]] for c in family["cases"] if c["name"] in by_name])
     requires = {"roles": rg.TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": max(12, cap)} | ({"has": has} if has else {})
@@ -307,9 +317,8 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
            "priority": priority, "priority_reason": reason or f"A-B-B-A: {b[:8]} against {a[:8]}, "
            f"{len(family['cases'])} cases", "notify": False,
            "env": env, "est_min": 0, "stall_after_min": 60, "steps": steps, "untimed_steps": untimed,
-           "step_needs": [{"cores": 1, "ram_gb": 1}] + [{"cores": 16, "ram_gb": 12}] * (len(prepare) - 1),
-           "requires": requires,
-           "inputs": source + rg.measurement_inputs(checkout, revisions)}
+           "step_needs": [{"cores": 16, "ram_gb": 12}], "step_deadline_min": rg.BUILD_MIN * len(revisions) + 120,
+           "requires": requires, "inputs": source + rg.side_inputs(checkout, source[0]["source"]["rev"], revisions)}
     if host:
         requires["hosts"] = [host]
         job["pin_reason"] = "the family names its timing host (its floor, or a run to reproduce there)"
@@ -572,7 +581,7 @@ def run(args) -> int:
         return INVALID
     measure = measure_at(checkout.as_posix(), harness)
     blocks = args.blocks or suggested_blocks(chosen, measure)
-    name = args.name or "run-" + hashlib.sha256(",".join(chosen).encode()).hexdigest()[:8]
+    name = run_name(args.name, sides, harness, chosen, blocks, args.min_samples)
     text = family_text(name, sides, chosen, blocks, args.min_samples)
     out = args.out or ROOT / "benches" / "suite" / "results" / "abba" / f"{name}-{sides['b'][:8]}"
     out.mkdir(parents=True, exist_ok=True)
