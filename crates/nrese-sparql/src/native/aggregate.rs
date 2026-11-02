@@ -45,11 +45,15 @@ pub(super) struct Aggregator<'a> {
 /// the query's expressions give them: what [`Aggregator::memo`] remembers (released with
 /// it), a group's values while its aggregate is computed, and the results until the caller
 /// interns them ([`Kept::results`]). A refusal is kept: the caller ends the aggregation at
-/// the group it happened in.
+/// the group it happened in. Each is charged from room charged ahead
+/// ([`super::charge_ahead`]), so a term costs no budget call of its own.
 pub(super) struct Kept {
+    budget: Arc<Budget>,
     memo: RefCell<Reservation>,
     values: RefCell<Reservation>,
     results: RefCell<Reservation>,
+    /// What each of `memo`, `values` and `results` holds beyond what was charged to it.
+    spare: [Cell<usize>; 3],
     /// What [`Aggregator::value_of`] charged to `results` before it made the result.
     prepaid: Cell<usize>,
     refused: Cell<Option<BudgetExceeded>>,
@@ -71,20 +75,31 @@ fn kept_bytes(term: &Term) -> usize {
 impl Kept {
     pub(super) fn new(budget: &Arc<Budget>) -> Self {
         Self {
+            budget: Arc::clone(budget),
             memo: RefCell::new(Reservation::new(Arc::clone(budget))),
             values: RefCell::new(Reservation::new(Arc::clone(budget))),
             results: RefCell::new(Reservation::new(Arc::clone(budget))),
+            spare: [Cell::new(0), Cell::new(0), Cell::new(0)],
             prepaid: Cell::new(0),
             refused: Cell::new(None),
         }
     }
 
-    /// Charges `bytes` to `held`; false once anything was refused.
-    fn hold(&self, held: &RefCell<Reservation>, bytes: usize) -> bool {
+    /// Charges `bytes` as `kind`; false once anything was refused.
+    fn hold(&self, kind: Held, bytes: usize) -> bool {
         if self.refused.get().is_some() {
             return false;
         }
-        match held.borrow_mut().charge(bytes) {
+        let spare = &self.spare[kind as usize];
+        let mut left = spare.get();
+        let charged = super::charge_ahead(
+            &self.budget,
+            &mut self.of(kind).borrow_mut(),
+            &mut left,
+            bytes,
+        );
+        spare.set(left);
+        match charged {
             Ok(()) => true,
             Err(refused) => {
                 self.refused.set(Some(refused));
@@ -106,6 +121,7 @@ impl Kept {
         let mut values = self.values.borrow_mut();
         let bytes = values.bytes();
         values.release(bytes);
+        self.spare[Held::Values as usize].set(0);
     }
 
     /// What the budget refused, if it did.
@@ -116,7 +132,9 @@ impl Kept {
     /// The results' charge, handed to the caller (the bytes, which it releases once the
     /// results are interned and dropped); what was remembered is released with `self`.
     pub(super) fn results(self) -> usize {
-        self.results.into_inner().transfer()
+        let mut results = self.results.into_inner();
+        results.release(self.spare[Held::Results as usize].get());
+        results.transfer()
     }
 }
 
@@ -274,7 +292,7 @@ impl Aggregator<'_> {
     /// Charges `term` as `kind` of [`Self::kept`]; false once the budget refused anything.
     fn hold(&self, kind: Held, term: &Option<Term>) -> bool {
         match (self.kept, term) {
-            (Some(kept), Some(term)) => kept.hold(kept.of(kind), kept_bytes(term)),
+            (Some(kept), Some(term)) => kept.hold(kind, kept_bytes(term)),
             (Some(kept), None) => kept.refused().is_none(),
             (None, _) => true,
         }
@@ -303,7 +321,7 @@ impl Aggregator<'_> {
             .len()
             .saturating_mul(std::mem::size_of::<Option<Term>>());
         if let Some(kept) = self.kept
-            && !kept.hold(kept.of(Held::Values), slots)
+            && !kept.hold(Held::Values, slots)
         {
             return values;
         }
@@ -332,14 +350,16 @@ impl Aggregator<'_> {
                 if distinct && !seen.insert(id) {
                     continue;
                 }
-                let value = match memo.get(&(key, id)) {
-                    Some(value) => value.clone(),
-                    None => {
+                // One lookup, one copy (the remembered value's), as before it was charged.
+                let value = match memo.entry((key, id)) {
+                    std::collections::hash_map::Entry::Occupied(known) => known.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(slot) => {
                         let value = eval(row);
                         if self.hold(Held::Memo, &value) {
-                            memo.insert((key, id), value.clone());
+                            slot.insert(value).clone()
+                        } else {
+                            value
                         }
-                        value
                     }
                 };
                 if !push(value) {
@@ -380,10 +400,7 @@ impl Aggregator<'_> {
             let prepaid = kept.prepaid.take();
             match &result {
                 Agg::Term(term) => {
-                    kept.hold(
-                        kept.of(Held::Results),
-                        kept_bytes(term).saturating_sub(prepaid),
-                    );
+                    kept.hold(Held::Results, kept_bytes(term).saturating_sub(prepaid));
                 }
                 Agg::Id(_) => kept.of(Held::Results).borrow_mut().release(prepaid),
             }
@@ -479,7 +496,7 @@ impl Aggregator<'_> {
                         match (self.kept, group_concat_bytes(&values, separator)) {
                             (_, None) => None,
                             (Some(kept), Some(bytes)) => {
-                                if !kept.hold(kept.of(Held::Results), bytes) {
+                                if !kept.hold(Held::Results, bytes) {
                                     return Agg::Id(UNDEF);
                                 }
                                 kept.prepaid.set(bytes);

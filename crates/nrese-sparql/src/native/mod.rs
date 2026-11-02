@@ -253,13 +253,18 @@ fn run(
                 &template,
                 || ctx.check(),
             );
+            // Charged from room charged ahead; what the triples hold stays charged with
+            // them, the room left is released.
+            let mut held = Reservation::new(&*ctx.budget);
+            let mut spare = 0;
             for triple in made {
                 let triple = triple?;
-                ctx.budget
-                    .charge(triple_bytes(&triple))
+                charge_ahead(&ctx.budget, &mut held, &mut spare, triple_bytes(&triple))
                     .map_err(QueryEvaluationError::MemoryLimit)?;
                 triples.push(triple);
             }
+            held.release(spare);
+            held.transfer();
             Outcome::Graph(triples)
         }
         Form::Select => Outcome::Solutions(solutions, ctx.computed.take()),
@@ -724,8 +729,10 @@ fn construct<'a>(
     let fresh_count = labels.len();
     let table = solutions.table;
     let mut emitted: HashSet<nrese_rdf::Triple> = HashSet::new();
-    // The copies `emitted` keeps, each charged before it is kept.
+    // The copies `emitted` keeps, each charged before it is kept, from room charged ahead
+    // (`spare`, released with `held`).
     let mut held = Reservation::new(budget);
+    let mut spare = 0;
     // A triple at a time, however many the template has: the next is the template's
     // `index`-th triple of row `row`, with the row's fresh blank nodes.
     let (mut row, mut index) = (0, 0);
@@ -798,17 +805,19 @@ fn construct<'a>(
                 // the set doubles).
                 let copy = triple_heap(&triple)
                     .saturating_add(2 * std::mem::size_of::<nrese_rdf::Triple>());
-                if let Err(refused) = held.charge(copy) {
+                if let Err(refused) = charge_ahead(budget, &mut held, &mut spare, copy) {
                     row = table.len();
                     return Some(Err(QueryEvaluationError::MemoryLimit(refused).into()));
                 }
                 if !emitted.insert(triple.clone()) {
-                    held.release(copy);
+                    // Not kept: its room is spare again.
+                    spare += copy;
                     continue;
                 }
                 if emitted.len() > 1024 * 1024 {
                     emitted = HashSet::new();
                     held.release(held.bytes());
+                    spare = 0;
                 }
             }
             return Some(Ok(triple));
@@ -4782,13 +4791,16 @@ impl<'a> Context<'a> {
             held.charge(rows.len().saturating_mul(slot))
                 .map_err(memory)?;
             let mut terms = Vec::with_capacity(rows.len());
+            let mut spare = 0;
             for &row in rows {
                 let term = self.evaluator.eval(e, &self.binding(solutions, row));
                 if let Some(term) = &term {
-                    held.charge(crate::cache::term_heap(term)).map_err(memory)?;
+                    let bytes = crate::cache::term_heap(term);
+                    charge_ahead(&self.budget, held, &mut spare, bytes).map_err(memory)?;
                 }
                 terms.push(term);
             }
+            held.release(spare);
             sort_keys.push(SortKey::Terms(terms));
         }
         Ok(sort_keys)
@@ -6051,6 +6063,34 @@ fn grown_room<B: std::ops::Deref<Target = Budget>>(
 ) -> Result<usize, BudgetExceeded> {
     reserve_rows(table, held, rows, usize::MAX)?;
     Ok(table.len() + table.spare_rows())
+}
+
+/// How much [`charge_ahead`] reserves beyond a charge it can't take from what it reserved
+/// before: one budget call for many small charges (a value, a term, a triple) instead of
+/// one each, up through every level of the budget (PR #84's and the executor memory stack's
+/// timing: a call per value or row cost up to x1.6).
+const CHARGE_AHEAD_BYTES: usize = 16 << 10;
+
+/// Charges `bytes` to `held` before they are made, from `spare`: what `held` holds beyond
+/// what was charged through it so far. Where that is too little, the rest is reserved with
+/// up to [`CHARGE_AHEAD_BYTES`] more, as much of that as `budget` has left beyond the rest,
+/// so a charge that fits is never refused for the room ahead. The caller releases `spare`
+/// from `held` once it charges no more.
+fn charge_ahead<B: std::ops::Deref<Target = Budget>>(
+    budget: &Budget,
+    held: &mut Reservation<B>,
+    spare: &mut usize,
+    bytes: usize,
+) -> Result<(), BudgetExceeded> {
+    if let Some(left) = spare.checked_sub(bytes) {
+        *spare = left;
+        return Ok(());
+    }
+    let rest = bytes - *spare;
+    let ahead = CHARGE_AHEAD_BYTES.min(budget.remaining().saturating_sub(rest));
+    held.charge(rest.saturating_add(ahead))?;
+    *spare = ahead;
+    Ok(())
 }
 
 fn has_undef(table: &IdTable, columns: &[usize]) -> bool {
