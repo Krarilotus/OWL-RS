@@ -26,7 +26,7 @@ Notes:
 
 - Environment variables always override values loaded from `config.toml`.
 - If no config file path is provided by CLI or `NRESE_CONFIG_PATH`, the server runs from env/defaults only.
-- The reasoner is configured by `reasoner.mode` and `reasoner.rules` alone; the server resolves them into one runtime profile before diagnostics, capabilities and the console see it.
+- The reasoner's profile comes from `reasoner.mode` and `reasoner.rules` alone (there is no `preset` or feature-override input); the server resolves them into one runtime profile before diagnostics, capabilities and the console see it. The other `reasoner.*` settings below tune it.
 
 ## Validation
 
