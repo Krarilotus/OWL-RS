@@ -11,10 +11,12 @@ import importlib.util
 import io
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
+sys.dont_write_bytecode = True  # importing the checker leaves no __pycache__ in the checkout
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "check-doc-paths.py")
 spec = importlib.util.spec_from_file_location("check_doc_paths", SCRIPT)
 checker = importlib.util.module_from_spec(spec)
