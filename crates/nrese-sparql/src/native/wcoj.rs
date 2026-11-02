@@ -1459,6 +1459,61 @@ mod tests {
         }
     }
 
+    /// A message of light values only is counted per parent once what it has read passes
+    /// its budget and the values left are counted to hold more than counting per parent
+    /// reads: A -> B_j -> C_j -> A (4 triangles), S more C_s -> A, and 8 X -> C_s per C_s.
+    /// Under a = A the gather reads every C_s's 8 predecessors, 8 S + 4 entries, as hubs
+    /// bound first did in kernel-intersect's skewed triangles; per parent, B_j's 4 matches.
+    /// The count is exact (3 per triangle), and the entries stay within the budget (64 per
+    /// B_j) and what one count and per parent read, at any S.
+    #[test]
+    fn a_message_of_light_values_is_counted_per_parent_once_past_its_budget() {
+        use super::{Pos, Query, Stats};
+        use nrese_engine::ReadModel;
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        let node = |name: String| NamedNode::new_unchecked(format!("http://e/{name}"));
+        let edge = NamedNode::new_unchecked("http://e/p");
+        for s in [1_024usize, 4_096] {
+            let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+            let mut tx = engine.transaction();
+            let mut add = |a: String, b: String| {
+                let quad = Quad::new(node(a), edge.clone(), node(b), GraphName::DefaultGraph);
+                tx.insert(quad.as_ref());
+            };
+            for j in 0..4 {
+                add("a".into(), format!("b{j}"));
+                add(format!("b{j}"), format!("c{j}"));
+            }
+            for i in 0..s {
+                add(format!("c{i}"), "a".into());
+                for t in 0..8 {
+                    add(format!("x{i}-{t}"), format!("c{i}"));
+                }
+            }
+            tx.commit().unwrap();
+            let snapshot = engine.snapshot();
+            let p = snapshot.lookup(edge.as_ref().into()).unwrap().raw();
+            let (a, b, c) = (Pos::Var(0), Pos::Var(1), Pos::Var(2));
+            let patterns = vec![
+                [a, Pos::Const(p), b],
+                [b, Pos::Const(p), c],
+                [c, Pos::Const(p), a],
+            ];
+            let query = Query::new(&snapshot, ReadModel::Asserted, patterns, 3, usize::MAX);
+            let mut stats = Stats::default();
+            let counted = query
+                .count_solutions(&|| false, &mut stats)
+                .ok()
+                .unwrap()
+                .exact()
+                .unwrap();
+            assert_eq!(counted, 12, "S = {s}");
+            assert_eq!(stats.budgeted, Some(true), "A's S predecessors are heavy");
+            let messages = stats.messages.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(messages < 1_000, "{messages} message entries at S = {s}");
+        }
+    }
+
     /// A parent counted per value probes the child's values for matches the read shows,
     /// not for a planning count's: an inferred read with equality classes estimates from
     /// the stored statements, asserted ones too. A_i -> B, C -> A_i, 65 X_j -> C and
