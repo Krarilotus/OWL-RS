@@ -81,9 +81,10 @@ fn run(
 
 /// Spec: a query's intermediate results draw from its memory envelope (`Resources::memory`,
 /// the v1.5 bar's "no crash"), wherever their size comes from. Over 4,096 rows, 256
-/// unbound variables projected, or a UNION with a side binding 256 others, make 32 MiB of
-/// columns: more than 1 MiB, so the query fails with `MemoryLimit`, its thread holding at
-/// most the limit and its bookkeeping. 4 variables make 128 KiB, which fits: answered.
+/// unbound variables projected, or a UNION with a side binding 256 others, make 8 MiB of
+/// columns (256 × 4,096 × 8 bytes): more than 1 MiB, so the query fails with
+/// `MemoryLimit`, its thread holding at most the limit and its bookkeeping. 4 variables
+/// make 128 KiB, which fits: answered.
 /// On the default path and as written alike.
 #[test]
 fn columns_made_per_variable_draw_from_the_query_budget() {
@@ -162,8 +163,9 @@ fn a_closure_over_a_sequence_holds_its_ends_once() {
 
 /// Spec: as above, for the other places where the query's text multiplies what a query
 /// makes per row (notes/2026-11-02-column-budget.md CB-6, S1-S6). Over 4,096 rows, 256 of
-/// each make 32 MiB or more where each is a column or a term per row: a column per EXISTS
-/// (S1), per GROUP BY variable (S2), per LATERAL variable put in (S4), a sort key per
+/// each make 8 MiB or more (256 × 4,096 × 8 bytes) where each is a column or a term per
+/// row: a column per EXISTS (S1), per GROUP BY variable (S2), per LATERAL variable put in
+/// (S4), a sort key per
 /// ORDER BY expression (S3), the 256 strings a CONCAT of 256 parts interns per row (S5):
 /// more than 1 MiB, so the query fails with `MemoryLimit`. What only repeats what is there
 /// makes nothing: ORDER BY unbound variables sorts by nothing (§15.1: unbound sorts first,
