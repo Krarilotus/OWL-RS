@@ -9,23 +9,64 @@
 //! coarse limit for everything else (materialisation, reasoning, loads), measured rather
 //! than accounted.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
+/// Whether this target has the readers ([`process_bytes`], [`available_bytes`] and the
+/// others): Linux and Windows. Elsewhere every reading is [`Unread::Unsupported`], and a
+/// memory limit can't be enforced, so its configuration refuses one.
+pub const READS_MEMORY: bool = cfg!(any(windows, target_os = "linux"));
+
+/// Why a reading of memory wasn't taken. A limit that needs it can't be enforced: it
+/// stops the work ([`MemoryStopCause::Unread`]) or refuses its configuration, never
+/// reading as "not over".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unread {
+    /// No reader on this target ([`READS_MEMORY`] is false): known at compile time.
+    Unsupported,
+    /// The target has a reader, and it failed now (`/proc` unreadable or unparsable, the
+    /// system call refused).
+    Failed,
+}
+
+impl std::fmt::Display for Unread {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unsupported => "unread: this platform has no reader",
+            Self::Failed => "unread: the reading failed",
+        })
+    }
+}
+
+impl std::error::Error for Unread {}
+
+/// A reading in bytes, or why there is none.
+pub type Reading = Result<u64, Unread>;
+
+/// A platform reader's answer as a [`Reading`]: none is a failure where the target reads
+/// memory, and unsupported where it doesn't.
+fn reading(bytes: Option<u64>) -> Reading {
+    match bytes {
+        Some(bytes) => Ok(bytes),
+        None if READS_MEMORY => Err(Unread::Failed),
+        None => Err(Unread::Unsupported),
+    }
+}
+
 /// The private memory the process holds now (anonymous on Linux, committed private on
-/// Windows; mapped files excluded, since the kernel reclaims them); `None` where the
-/// platform doesn't say.
-pub fn process_bytes() -> Option<u64> {
-    imp::process_bytes()
+/// Windows; mapped files excluded, since the kernel reclaims them).
+pub fn process_bytes() -> Reading {
+    reading(imp::process_bytes())
 }
 
 /// The most [`process_bytes`] has been since the process started, where the platform
 /// keeps it (Windows: the peak committed private bytes; Linux: the peak resident set,
 /// mapped files included). A [`start_peak_window`] doesn't lower it.
-pub fn peak_process_bytes() -> Option<u64> {
-    let window = imp::peak_process_bytes()?;
+pub fn peak_process_bytes() -> Reading {
+    let window = reading(imp::peak_process_bytes())?;
     let before = PEAK_BEFORE_WINDOW.fetch_max(window, Ordering::Relaxed);
-    Some(before.max(window))
+    Ok(before.max(window))
 }
 
 /// Starts a window for [`window_peak_bytes`], the peak of one phase of a long run. On Linux
@@ -34,7 +75,7 @@ pub fn peak_process_bytes() -> Option<u64> {
 /// `time -v` report as the maximum resident set; elsewhere no window starts and `false`
 /// is returned. Starting a window by writing `clear_refs` directly loses the peak before it.
 pub fn start_peak_window() -> bool {
-    peak_process_bytes();
+    let _ = peak_process_bytes();
     let started = imp::reset_peak();
     WINDOW_UNAVAILABLE.store(!started, Ordering::Relaxed);
     started
@@ -68,9 +109,12 @@ pub fn peak_kind() -> &'static str {
 }
 
 /// The peak of the process's working set (Windows: `PeakWorkingSetSize`, the most physical
-/// memory it held at once, mapped and shared pages included); `None` elsewhere.
-pub fn peak_working_set_bytes() -> Option<u64> {
-    imp::peak_working_set_bytes()
+/// memory it held at once, mapped and shared pages included); unsupported elsewhere.
+pub fn peak_working_set_bytes() -> Reading {
+    match imp::peak_working_set_bytes() {
+        None if !cfg!(windows) => Err(Unread::Unsupported),
+        bytes => reading(bytes),
+    }
 }
 
 /// The highest mark the kernel had when a peak window started.
@@ -78,22 +122,20 @@ static PEAK_BEFORE_WINDOW: AtomicU64 = AtomicU64::new(0);
 
 /// The page faults the process has taken since it started (soft and hard: a mapped file's
 /// pages count as they are first touched), where the platform keeps them.
-pub fn page_faults() -> Option<u64> {
-    imp::page_faults()
+pub fn page_faults() -> Reading {
+    reading(imp::page_faults())
 }
 
-/// The memory resident in the process's working set now, mapped file pages included;
-/// `None` where the platform doesn't say.
-pub fn resident_bytes() -> Option<u64> {
-    imp::resident_bytes()
+/// The memory resident in the process's working set now, mapped file pages included.
+pub fn resident_bytes() -> Reading {
+    reading(imp::resident_bytes())
 }
 
 /// The memory this process may use: the smallest of the machine's physical memory and the
 /// limits it runs under (on Linux its cgroup's and every ancestor's, so a container, a
-/// Kubernetes pod or a systemd scope counts; on Windows its job object's); `None` where the
-/// platform doesn't say.
-pub fn available_bytes() -> Option<u64> {
-    imp::available_bytes()
+/// Kubernetes pod or a systemd scope counts; on Windows its job object's).
+pub fn available_bytes() -> Reading {
+    reading(imp::available_bytes())
 }
 
 /// The memory the process could still take now, as the system reports it: on Linux the
@@ -101,31 +143,123 @@ pub fn available_bytes() -> Option<u64> {
 /// (each limit less the group's use, inactive file pages not counted); on Windows the
 /// least of the machine's available physical memory and what its job object leaves (its
 /// job-wide limit less the job's committed memory, its per-process limit less the process's
-/// own); `None` where the platform doesn't say. Unlike [`available_bytes`], the total, it
-/// changes from one reading to the next, and counts as used what the allocator holds
-/// freed, until it returns it. A cap for admitting an operation as it starts, never a
-/// reservation: what it reports is taken by whoever allocates first.
-pub fn remaining_bytes() -> Option<u64> {
-    imp::remaining_bytes()
+/// own). Unlike [`available_bytes`], the total, it changes from one reading to the next,
+/// and counts as used what the allocator holds freed, until it returns it. A cap for
+/// admitting an operation as it starts, never a reservation: what it reports is taken by
+/// whoever allocates first.
+pub fn remaining_bytes() -> Reading {
+    reading(imp::remaining_bytes())
+}
+
+/// Why a memory limit stopped the work ([`MemoryWatch::cause`], [`process_limit_stop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryStopCause {
+    /// The process held more than the limit.
+    OverLimit,
+    /// The process's memory couldn't be read ([`Unread`]): the limit can't be enforced,
+    /// so the work stops as it would past it.
+    Unread,
+}
+
+impl MemoryStopCause {
+    /// As kept in an atomic beside a watch's flag: 0 is "not stopped".
+    const fn code(cause: Option<Self>) -> u8 {
+        match cause {
+            None => 0,
+            Some(Self::OverLimit) => 1,
+            Some(Self::Unread) => 2,
+        }
+    }
+
+    const fn of(code: u8) -> Option<Self> {
+        match code {
+            0 => None,
+            1 => Some(Self::OverLimit),
+            _ => Some(Self::Unread),
+        }
+    }
+}
+
+/// Whether a reading stops work under `limit`, and why: past the limit, or no reading at
+/// all (a limit that can't be read is not "not over").
+pub fn stop_cause(reading: Reading, limit: u64) -> Option<MemoryStopCause> {
+    match reading {
+        Ok(held) => (held > limit).then_some(MemoryStopCause::OverLimit),
+        Err(_) => Some(MemoryStopCause::Unread),
+    }
+}
+
+/// A process-wide limit and its latest reading ([`PROCESS`]), read with `read`.
+struct ProcessLimit {
+    /// 0: none.
+    limit: AtomicU64,
+    /// Microseconds since `epoch` of the last reading.
+    last: AtomicU64,
+    /// That reading's [`MemoryStopCause`], as its code.
+    stopped: AtomicU8,
+    epoch: OnceLock<Instant>,
+    read: fn() -> Reading,
+}
+
+impl ProcessLimit {
+    const fn new(read: fn() -> Reading) -> Self {
+        Self {
+            limit: AtomicU64::new(0),
+            last: AtomicU64::new(0),
+            stopped: AtomicU8::new(0),
+            epoch: OnceLock::new(),
+            read,
+        }
+    }
+
+    fn set(&self, limit: u64) {
+        self.limit.store(limit, Ordering::Relaxed);
+        self.last.store(0, Ordering::Relaxed);
+        self.stopped.store(0, Ordering::Relaxed);
+    }
+
+    fn limit(&self) -> Option<u64> {
+        Some(self.limit.load(Ordering::Relaxed)).filter(|&limit| limit > 0)
+    }
+
+    /// Whether the latest reading stops work, and why, from that one reading.
+    fn stop(&self) -> Option<MemoryStopCause> {
+        let limit = self.limit()?;
+        let epoch = self.epoch.get_or_init(Instant::now);
+        let now = u64::try_from(epoch.elapsed().as_micros())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let latest = || MemoryStopCause::of(self.stopped.load(Ordering::Relaxed));
+        let last = self.last.load(Ordering::Relaxed);
+        if last != 0 && now.saturating_sub(last) < MemoryWatch::INTERVAL_MICROS {
+            return latest();
+        }
+        // One reader per interval; the others go on with the last answer.
+        if self
+            .last
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return latest();
+        }
+        let cause = stop_cause((self.read)(), limit);
+        self.stopped
+            .store(MemoryStopCause::code(cause), Ordering::Relaxed);
+        cause
+    }
 }
 
 /// The process's memory limit, for long operations whose caller passes no watch of its
 /// own: set by whoever owns the process's configuration (server startup, or an explicit
 /// embedding host), never by opening a store. Polled through [`process_limit_exceeded`]
 /// by the operations that can grow without bound (the reasoner's materialisations and
-/// commits). 0: none.
-static PROCESS_LIMIT: AtomicU64 = AtomicU64::new(0);
-/// Microseconds since [`PROCESS_EPOCH`] of the last reading for the process limit.
-static PROCESS_LAST: AtomicU64 = AtomicU64::new(0);
-/// Whether that reading was over the limit.
-static PROCESS_OVER: AtomicBool = AtomicBool::new(false);
-static PROCESS_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+/// commits).
+static PROCESS: ProcessLimit = ProcessLimit::new(process_bytes);
 
 /// Sets the process's memory limit in bytes (0: none). See [`process_limit_exceeded`].
+/// Its owner refuses a limit where [`READS_MEMORY`] is false, at its configuration.
 pub fn set_process_limit(limit: u64) {
-    PROCESS_LIMIT.store(limit, Ordering::Relaxed);
-    PROCESS_LAST.store(0, Ordering::Relaxed);
-    PROCESS_OVER.store(false, Ordering::Relaxed);
+    PROCESS.set(limit);
 }
 
 /// Whether the process's anonymous memory may be backed by transparent huge pages
@@ -141,60 +275,58 @@ pub fn set_transparent_huge_pages(allowed: bool) -> bool {
 
 /// The process's memory limit, if one is set ([`set_process_limit`]).
 pub fn process_limit() -> Option<u64> {
-    Some(PROCESS_LIMIT.load(Ordering::Relaxed)).filter(|&limit| limit > 0)
+    PROCESS.limit()
 }
 
-/// Whether the process holds more than its memory limit ([`set_process_limit`]), as of a
-/// reading at most [`MemoryWatch::INTERVAL_MICROS`] old: an atomic load and a clock read
-/// in a hot loop. Unlike a [`MemoryWatch`] it doesn't stay over: an operation the limit
-/// stopped frees its memory, and the next one may run.
+/// Whether the process holds more than its memory limit ([`set_process_limit`]), or its
+/// memory can't be read, and which, as of a reading at most
+/// [`MemoryWatch::INTERVAL_MICROS`] old: an atomic load and a clock read in a hot loop;
+/// `None` without a limit or under it. Unlike a [`MemoryWatch`] it doesn't stay stopped:
+/// an operation the limit stopped frees its memory, and the next one may run. An operation
+/// that must not go on after one stop latches it itself, with the cause this returned
+/// (another operation's poll may read the limit again meanwhile).
+pub fn process_limit_stop() -> Option<MemoryStopCause> {
+    PROCESS.stop()
+}
+
+/// [`process_limit_stop`] as a flag.
 pub fn process_limit_exceeded() -> bool {
-    let Some(limit) = process_limit() else {
-        return false;
-    };
-    let epoch = PROCESS_EPOCH.get_or_init(Instant::now);
-    let now = u64::try_from(epoch.elapsed().as_micros())
-        .unwrap_or(u64::MAX)
-        .max(1);
-    let last = PROCESS_LAST.load(Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < MemoryWatch::INTERVAL_MICROS {
-        return PROCESS_OVER.load(Ordering::Relaxed);
-    }
-    // One reader per interval; the others go on with the last answer.
-    if PROCESS_LAST
-        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
-        return PROCESS_OVER.load(Ordering::Relaxed);
-    }
-    let over = process_bytes().is_some_and(|held| held > limit);
-    PROCESS_OVER.store(over, Ordering::Relaxed);
-    over
+    process_limit_stop().is_some()
 }
 
 /// Whether the process has gone past a memory limit, for the stop callbacks of long
 /// operations. The memory is read at most every [`MemoryWatch::INTERVAL_MICROS`], so a
-/// check in a hot loop costs an atomic load and a clock read; once over, it stays over.
+/// check in a hot loop costs an atomic load and a clock read; once stopped, it stays
+/// stopped, and [`Self::cause`] says why.
 #[derive(Debug)]
 pub struct MemoryWatch {
     limit: u64,
     started: Instant,
     /// Microseconds after `started` of the last reading.
     last: AtomicU64,
-    over: AtomicBool,
+    /// Why it stopped, as a [`MemoryStopCause`]'s code (0: it didn't); set once.
+    stopped: AtomicU8,
+    read: fn() -> Reading,
 }
 
 impl MemoryWatch {
     /// How often the memory is read, at most.
     pub const INTERVAL_MICROS: u64 = 10_000;
 
-    /// A watch for `limit` bytes of the process's memory.
+    /// A watch for `limit` bytes of the process's memory ([`process_bytes`]).
     pub fn new(limit: u64) -> Self {
+        Self::with_reader(limit, process_bytes)
+    }
+
+    /// A watch for `limit` bytes as `read` reports them: [`Self::new`]'s reader, or
+    /// another (a test's that fails).
+    pub fn with_reader(limit: u64, read: fn() -> Reading) -> Self {
         Self {
             limit,
             started: Instant::now(),
             last: AtomicU64::new(0),
-            over: AtomicBool::new(false),
+            stopped: AtomicU8::new(0),
+            read,
         }
     }
 
@@ -202,9 +334,15 @@ impl MemoryWatch {
         self.limit
     }
 
-    /// Whether the process holds more than the limit (as of the latest reading).
+    /// Why it stopped, once [`Self::exceeded`] said so; `None` before.
+    pub fn cause(&self) -> Option<MemoryStopCause> {
+        MemoryStopCause::of(self.stopped.load(Ordering::Relaxed))
+    }
+
+    /// Whether the process holds more than the limit, or its memory couldn't be read (as
+    /// of the latest reading).
     pub fn exceeded(&self) -> bool {
-        if self.over.load(Ordering::Relaxed) {
+        if self.stopped.load(Ordering::Relaxed) != 0 {
             return true;
         }
         let now = u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -220,11 +358,17 @@ impl MemoryWatch {
         {
             return false;
         }
-        let over = process_bytes().is_some_and(|held| held > self.limit);
-        if over {
-            self.over.store(true, Ordering::Relaxed);
-        }
-        over
+        let Some(cause) = stop_cause((self.read)(), self.limit) else {
+            return false;
+        };
+        // The first cause stays: a later reading doesn't rename a stop already taken.
+        let _ = self.stopped.compare_exchange(
+            0,
+            MemoryStopCause::code(Some(cause)),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        true
     }
 }
 
@@ -366,7 +510,7 @@ mod imp {
     /// process's own committed memory. `Some(None)` outside a job or without a limit; `None`
     /// where a limit is set whose use can't be read.
     pub(super) fn job_left() -> Option<Option<u64>> {
-        super::job_left_from(in_job(), job_limits, job_committed, super::process_bytes)
+        super::job_left_from(in_job(), job_limits, job_committed, process_bytes)
     }
 
     /// Whether the process runs in a job object; `None` where that can't be asked. Told
@@ -785,6 +929,7 @@ mod tests {
         set_process_limit(1);
         assert_eq!(process_limit(), Some(1));
         assert!(process_limit_exceeded(), "one byte is exceeded");
+        assert_eq!(process_limit_stop(), Some(MemoryStopCause::OverLimit));
         set_process_limit(u64::MAX);
         assert!(!process_limit_exceeded(), "no process holds that much");
         set_process_limit(0);
@@ -1026,7 +1171,7 @@ mod tests {
         };
         assert!(assigned, "{}", std::io::Error::last_os_error());
         assert_eq!(imp::job_limit(), Some(limit));
-        assert_eq!(available_bytes(), Some(limit));
+        assert_eq!(available_bytes(), Ok(limit));
         // What it leaves is the limit less what the job commits now (this process alone is in
         // it): down by what is committed, and up again when that is freed, at each reading
         // (Sol, measure-pool r1: a reading at a notification is not one now).
@@ -1048,7 +1193,7 @@ mod tests {
                 before - during >= COMMITTED - SLACK && after - during >= COMMITTED - SLACK,
                 "{when}: {before}, {during}, {after}"
             );
-            assert!(remaining_bytes().is_some_and(|remaining| remaining <= after + SLACK));
+            assert!(remaining_bytes().is_ok_and(|remaining| remaining <= after + SLACK));
         };
         follows("before a violation");
         // The whole limit asked at once: the job refuses it (a violation of its limit).
@@ -1101,6 +1246,63 @@ mod tests {
         let watch = MemoryWatch::new(1);
         assert!(watch.exceeded());
         assert!(watch.exceeded());
+        assert_eq!(watch.cause(), Some(MemoryStopCause::OverLimit));
+    }
+
+    fn failed() -> Reading {
+        Err(Unread::Failed)
+    }
+
+    fn unsupported() -> Reading {
+        Err(Unread::Unsupported)
+    }
+
+    /// DC-07: a reading at the limit isn't over it, one byte past is; a missing reading of
+    /// either kind stops as well, named as unread, never as "not over".
+    #[test]
+    fn a_missing_reading_stops_and_says_so() {
+        use MemoryStopCause::{OverLimit, Unread as NotRead};
+        let rows = [
+            (Ok(100), 100, None),
+            (Ok(101), 100, Some(OverLimit)),
+            (Err(Unread::Failed), u64::MAX, Some(NotRead)),
+            (Err(Unread::Unsupported), u64::MAX, Some(NotRead)),
+        ];
+        for (reading, limit, cause) in rows {
+            assert_eq!(
+                stop_cause(reading, limit),
+                cause,
+                "{reading:?} under {limit}"
+            );
+        }
+    }
+
+    /// DC-07: a watch whose reader fails stops the work, under any limit, stays stopped,
+    /// and names the cause as unread.
+    #[test]
+    fn a_watch_that_cant_read_stops_as_unread() {
+        for read in [failed as fn() -> Reading, unsupported] {
+            let watch = MemoryWatch::with_reader(u64::MAX, read);
+            assert_eq!(watch.cause(), None, "nothing read yet");
+            assert!(watch.exceeded(), "an unread limit stops the work");
+            assert!(watch.exceeded(), "and stays stopped");
+            assert_eq!(watch.cause(), Some(MemoryStopCause::Unread));
+        }
+    }
+
+    /// DC-07: the process limit stops the work when its reader fails, names the cause as
+    /// unread, and without a limit (0) nothing is read and nothing stops.
+    #[test]
+    fn the_process_limit_stops_when_it_cant_read() {
+        let limit = ProcessLimit::new(failed);
+        limit.set(u64::MAX);
+        assert_eq!(
+            limit.stop(),
+            Some(MemoryStopCause::Unread),
+            "an unread process limit stops the work"
+        );
+        limit.set(0);
+        assert_eq!(limit.stop(), None, "no limit: nothing to enforce");
     }
 
     /// A phase's window starts at what the process holds, and the lifetime peak keeps what

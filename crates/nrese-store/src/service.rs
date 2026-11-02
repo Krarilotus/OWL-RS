@@ -27,6 +27,8 @@ use crate::update::{SparqlUpdateRequest, UpdateExecutionReport};
 #[derive(Clone)]
 pub struct StoreService {
     config: StoreConfig,
+    /// [`StoreConfig::process_memory_bytes`] as resolved at open (0: no limit).
+    process_memory: u64,
     engine: Engine,
     preloaded_ontology: Option<PathBuf>,
     /// Whether the reasoning state file may exist (see [`Self::reasoning_state`]); saves a
@@ -75,14 +77,29 @@ impl MemoryStop {
             .is_some_and(nrese_exec::memory::MemoryWatch::exceeded)
     }
 
-    /// The error of a stop this caused, if it caused one.
-    pub(crate) fn error(&self) -> Option<crate::StoreError> {
-        self.0
+    /// The error of the operation `interrupted` ended, if memory ended it: this watch's
+    /// stop (past its limit, or the memory unread), else the process limit's, by the cause
+    /// the operation itself kept. `None`: its caller stopped it.
+    pub(crate) fn error(
+        &self,
+        interrupted: nrese_reasoner::delta::Interrupted,
+    ) -> Option<crate::StoreError> {
+        use nrese_exec::memory::MemoryStopCause;
+        let process = || nrese_exec::memory::process_limit().unwrap_or(0);
+        let watch = self
+            .0
             .as_ref()
-            .filter(|watch| watch.exceeded())
-            .map(|watch| crate::StoreError::ProcessMemoryLimit {
-                limit: watch.limit(),
-            })
+            .and_then(|watch| Some((watch.limit(), watch.cause()?)))
+            .or_else(|| Some((process(), interrupted.memory?)));
+        match watch {
+            Some((limit, MemoryStopCause::Unread)) => {
+                Some(crate::StoreError::MemoryUnreadable { limit })
+            }
+            Some((limit, MemoryStopCause::OverLimit)) => {
+                Some(crate::StoreError::ProcessMemoryLimit { limit })
+            }
+            None => None,
+        }
     }
 }
 
@@ -96,9 +113,11 @@ impl fmt::Debug for StoreService {
 }
 
 impl StoreService {
-    pub fn new(config: StoreConfig) -> StoreResult<Self> {
+    pub fn new(mut config: StoreConfig) -> StoreResult<Self> {
+        let process_memory = config.process_memory_bytes.resolve()?;
+        config.process_memory_bytes = crate::ProcessMemory::Bytes(process_memory);
         let runtime = std::sync::Arc::new(crate::Runtime::new(
-            config.process_memory_bytes,
+            process_memory,
             config.total_query_memory_bytes,
         ));
         Self::with_runtime(config, runtime)
@@ -109,10 +128,12 @@ impl StoreService {
     /// The runtime's budgets apply, not `config.total_query_memory_bytes` or, for what is
     /// charged, `config.process_memory_bytes` (which stays this store's watch).
     pub fn with_runtime(
-        config: StoreConfig,
+        mut config: StoreConfig,
         runtime: std::sync::Arc<crate::Runtime>,
     ) -> StoreResult<Self> {
         config.validate()?;
+        let process_memory = config.process_memory_bytes.resolve()?;
+        config.process_memory_bytes = crate::ProcessMemory::Bytes(process_memory);
         nrese_engine::set_index_encoding(config.index_encoding);
         nrese_engine::set_vocabulary_encoding(config.vocabulary);
         // Only switched off: on leaves what the process was started with (an operator's
@@ -175,6 +196,7 @@ impl StoreService {
             nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
         ));
         let service = Self {
+            process_memory,
             settings,
             namespaces: std::sync::Arc::new(namespaces),
             quarantine: std::sync::Arc::new(quarantine),
@@ -389,6 +411,12 @@ impl StoreService {
 
     pub fn config(&self) -> &StoreConfig {
         &self.config
+    }
+
+    /// The process memory limit this store watches ([`StoreConfig::process_memory_bytes`]
+    /// as resolved when it opened); 0: none.
+    pub fn process_memory_bytes(&self) -> u64 {
+        self.process_memory
     }
 
     pub fn preloaded_ontology_path(&self) -> Option<&Path> {
@@ -1717,7 +1745,7 @@ impl StoreService {
     /// An operation's stop under this store's process-memory policy; zero disables it.
     /// Opening a store never changes the process owner's global safety fallback.
     pub(crate) fn memory_stop(&self) -> MemoryStop {
-        let limit = self.config.process_memory_bytes;
+        let limit = self.process_memory;
         MemoryStop((limit > 0).then(|| nrese_exec::memory::MemoryWatch::new(limit)))
     }
 
@@ -1728,8 +1756,14 @@ impl StoreService {
         let stop = || memory.exceeded();
         let tx = self.engine.transaction();
         let program = crate::reasoning::Program::compile(&program.into(), &|term| tx.intern(term));
-        nrese_reasoner::engine::equality_report_until(&program, tx.base(), &stop)
-            .unwrap_or_else(|_| "equality: stopped by the process memory limit".to_owned())
+        nrese_reasoner::engine::equality_report_until(&program, tx.base(), &stop).unwrap_or_else(
+            |interrupted| match memory.error(interrupted) {
+                Some(unread @ crate::StoreError::MemoryUnreadable { .. }) => {
+                    format!("equality: {unread}")
+                }
+                _ => "equality: stopped by the process memory limit".to_owned(),
+            },
+        )
     }
 
     /// Replaces the inferred stack with `program`'s closure over the asserted data, as one
@@ -1765,14 +1799,14 @@ impl StoreService {
                 .storing_representatives(self.config.equality_compact);
         let memory = self.memory_stop();
         let stop = || stop() || memory.exceeded();
-        let stopped = || {
+        let stopped = |interrupted| {
             memory
-                .error()
+                .error(interrupted)
                 .unwrap_or(crate::StoreError::MaterialisationCancelled)
         };
         let closure =
             crate::reasoning::materialise_until(&program, rematerialisation.base(), &stop)
-                .map_err(|_| stopped())?;
+                .map_err(stopped)?;
         let inferred = closure.inferred.len() as u64;
         let base = rematerialisation.base();
         let reported = crate::reasoning::MaterialisationReport::default()
@@ -1787,7 +1821,7 @@ impl StoreService {
         // The last word under the writer slot: a caller whose claim ended meanwhile (a
         // retired pipeline, a cancelled request) changes nothing.
         if stop() {
-            return Err(stopped());
+            return Err(stopped(nrese_reasoner::delta::Interrupted::default()));
         }
         // Where asked, what the reasoner freed goes back before the inferred stack, the
         // heap's peak, is built (as between the reasoner's rounds).
@@ -1922,4 +1956,46 @@ fn for_its_reader<T>(
         redact(&mut whole);
     }
     Ok(whole)
+}
+
+#[cfg(test)]
+mod memory_stop_tests {
+    use super::MemoryStop;
+    use crate::StoreError;
+    use nrese_exec::memory::{MemoryStopCause, MemoryWatch, Reading, Unread};
+    use nrese_reasoner::delta::Interrupted;
+
+    fn failed() -> Reading {
+        Err(Unread::Failed)
+    }
+
+    /// DC-07: an operation whose store watch can't read the process's memory stops, and its
+    /// error says the memory was unreadable, with the limit it couldn't enforce.
+    #[test]
+    fn a_store_watch_that_cant_read_stops_as_memory_unreadable() {
+        let stop = MemoryStop(Some(MemoryWatch::with_reader(u64::MAX, failed)));
+        assert!(stop.exceeded());
+        assert!(matches!(
+            stop.error(Interrupted::default()),
+            Some(StoreError::MemoryUnreadable { limit: u64::MAX })
+        ));
+    }
+
+    /// DC-07 S2 (Sol, round 1): an operation the process limit stopped is named by the cause
+    /// it kept when it stopped, not by a later reading: unread, or past the limit; one its
+    /// caller stopped is no memory error.
+    #[test]
+    fn a_process_limit_stop_is_named_by_the_operations_cause() {
+        let unwatched = MemoryStop(None);
+        let error = |memory| unwatched.error(Interrupted { memory });
+        assert!(matches!(
+            error(Some(MemoryStopCause::Unread)),
+            Some(StoreError::MemoryUnreadable { .. })
+        ));
+        assert!(matches!(
+            error(Some(MemoryStopCause::OverLimit)),
+            Some(StoreError::ProcessMemoryLimit { .. })
+        ));
+        assert!(error(None).is_none());
+    }
 }

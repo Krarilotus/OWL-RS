@@ -31,7 +31,8 @@ use rayon::prelude::*;
 use super::delta::Interrupted;
 pub use super::eval::Schema;
 use super::eval::{
-    AllFacts, GroundProgram, Job, NEVER, Probes, Seg, Source, guards_hold, run_jobs_by_morsel,
+    AllFacts, GroundProgram, Job, NEVER, OperationStop, Probes, Seg, Source, guards_hold,
+    run_jobs_by_morsel,
 };
 use super::ir::{Guard, Head, Rule, SharedClasses, Term};
 use super::ir::{Triple, Violation};
@@ -2217,9 +2218,21 @@ pub fn materialise_owned_until(
     schema: &Schema,
     stop: super::eval::Stop<'_>,
 ) -> Result<Materialisation, Interrupted> {
+    materialise_owned_with(input, rules, lists, schema, &OperationStop::new(stop))
+}
+
+/// [`materialise_owned_until`] under one operation's `stop`, whose memory limit its caller
+/// chose ([`OperationStop::with_poll`]).
+pub fn materialise_owned_with(
+    input: Vec<Triple>,
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+    stop: &OperationStop<'_>,
+) -> Result<Materialisation, Interrupted> {
     let clock = std::time::Instant::now();
     let store = Store::new(input);
-    run(store, clock.elapsed(), rules, lists, schema, None, stop)
+    run_latched(store, clock.elapsed(), rules, lists, schema, None, stop)
 }
 
 /// [`materialise`] over input already grouped the way the working set stores it: per
@@ -2329,8 +2342,40 @@ fn sees_classes(rule: &Rule) -> bool {
 }
 
 /// Semi-naive evaluation to the fixpoint, from a store holding the input as its delta;
-/// with equality by representatives if `representatives` is given.
+/// with equality by representatives if `representatives` is given. The process's memory
+/// limit stops it too, whatever the caller polls.
 fn run(
+    store: Store,
+    load: std::time::Duration,
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+    representatives: Option<Representatives>,
+    stop: super::eval::Stop<'_>,
+) -> Result<Materialisation, Interrupted> {
+    let stop = super::eval::OperationStop::new(stop);
+    run_latched(store, load, rules, lists, schema, representatives, &stop)
+}
+
+/// [`run`] under one operation's `stop`: once it fires the run ends, with its cause, and
+/// no morsel it made skip is taken for done.
+fn run_latched(
+    store: Store,
+    load: std::time::Duration,
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+    representatives: Option<Representatives>,
+    stop: &super::eval::OperationStop<'_>,
+) -> Result<Materialisation, Interrupted> {
+    run_body(store, load, rules, lists, schema, representatives, &|| {
+        stop.fired()
+    })
+    .map_err(|_| stop.interrupted())
+}
+
+/// [`run`]'s work, under the operation's latched `stop`.
+fn run_body(
     mut store: Store,
     load: std::time::Duration,
     rules: &[Rule],
@@ -2339,9 +2384,13 @@ fn run(
     mut representatives: Option<Representatives>,
     stop: super::eval::Stop<'_>,
 ) -> Result<Materialisation, Interrupted> {
-    // The process's memory limit stops it too, whatever the caller polls.
-    let stop: super::eval::Stop<'_> = &|| stop() || super::eval::over_memory_limit();
-    let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
+    let check_stop = || {
+        if stop() {
+            Err(Interrupted::default())
+        } else {
+            Ok(())
+        }
+    };
     let mut phases = Phases {
         load,
         passes: 1,
@@ -2552,7 +2601,7 @@ fn run(
             segments(
                 transitive
                     .run(&store, representatives.as_ref(), stop)
-                    .ok_or(Interrupted)?,
+                    .ok_or_else(Interrupted::default)?,
             ),
         ));
         result.counters.closure_pairs.push(transitive.read);

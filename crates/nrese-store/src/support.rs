@@ -141,6 +141,8 @@ pub enum Unavailable {
     Memory(BudgetExceeded),
     /// The process held more than its memory limit.
     ProcessMemory,
+    /// The process's memory couldn't be read for its limit, which then can't be enforced.
+    MemoryUnreadable,
     /// The reading query was cancelled, or its time ran out, while the view was computed.
     Cancelled,
 }
@@ -156,6 +158,9 @@ impl From<Unavailable> for crate::StoreError {
         match unavailable {
             Unavailable::Memory(exceeded) => exceeded.into(),
             Unavailable::ProcessMemory => crate::StoreError::ProcessMemoryLimit {
+                limit: nrese_exec::memory::process_limit().unwrap_or(0),
+            },
+            Unavailable::MemoryUnreadable => crate::StoreError::MemoryUnreadable {
                 limit: nrese_exec::memory::process_limit().unwrap_or(0),
             },
             Unavailable::Cancelled => nrese_sparql::QueryEvaluationError::Cancelled.into(),
@@ -234,6 +239,7 @@ impl Following {
     fn failure(&self, stopped: Stopped) -> Unavailable {
         match stopped {
             Stopped::ProcessMemory => Unavailable::ProcessMemory,
+            Stopped::MemoryUnreadable => Unavailable::MemoryUnreadable,
             // The watch refused: the budget, or else the cancellation.
             Stopped::Memory { .. } => self
                 .refused

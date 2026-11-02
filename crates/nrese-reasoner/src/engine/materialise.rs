@@ -166,8 +166,9 @@ pub fn equality_report_until(
     snapshot: &Snapshot,
     stop: crate::eval::Stop<'_>,
 ) -> Result<String, crate::delta::Interrupted> {
-    if stop() || crate::eval::over_memory_limit() {
-        return Err(crate::delta::Interrupted);
+    let before = crate::eval::OperationStop::new(stop);
+    if before.fired() {
+        return Err(before.interrupted());
     }
     let input: Vec<Triple> = asserted_by_predicate(snapshot)
         .into_iter()

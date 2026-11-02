@@ -9,6 +9,8 @@ use super::source::ConfigSource;
 
 pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfig> {
     let defaults = StoreConfig::default();
+    // The memory the shares (`50%`) are of, read once.
+    let machine = super::units::machine_memory_bytes();
     let equality = parse_equality(source.get(names::REASONING_EQUALITY).as_deref())?;
     Ok(StoreConfig {
         mode: parse_store_mode(source.get(names::STORE_MODE).as_deref())?,
@@ -17,7 +19,10 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             .map(PathBuf::from)
             .unwrap_or(defaults.data_dir),
         ontology_path: source.get(names::ONTOLOGY_PATH).map(PathBuf::from),
-        query_cache_bytes: parse_cache_bytes(source.get(names::QUERY_CACHE_BYTES).as_deref())?,
+        query_cache_bytes: parse_cache_bytes(
+            source.get(names::QUERY_CACHE_BYTES).as_deref(),
+            machine,
+        )?,
         pinned_queries: source
             .get(names::PINNED_QUERIES)
             .map(|list| {
@@ -37,6 +42,7 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         )?,
         total_query_memory_bytes: parse_total_query_memory(
             source.get(names::MAX_TOTAL_QUERY_MEMORY_BYTES).as_deref(),
+            machine,
         )?,
         huge_pages: match choice(source, names::HUGE_PAGES, &["off", "on"])? {
             Some(on) => on == 1,
@@ -46,9 +52,10 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             Some(on) => on == 1,
             None => defaults.reasoning_release,
         },
-        process_memory_bytes: parse_process_memory(
+        process_memory_bytes: nrese_store::ProcessMemory::Bytes(parse_process_memory(
             source.get(names::PROCESS_MEMORY_BYTES).as_deref(),
-        )?,
+            machine,
+        )?),
         federation: parse_federation(source)?,
         hide_unnamed_classes: parse_unnamed_classes(
             source.get(names::REASONING_UNNAMED_CLASSES).as_deref(),
@@ -112,6 +119,7 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
         },
         bulk_load_memory_bytes: parse_bulk_load_memory(
             source.get(names::BULK_LOAD_MEMORY).as_deref(),
+            machine,
         )?,
         invalid_statements: match choice(
             source,
@@ -203,15 +211,15 @@ fn parse_dl(source: &dyn ConfigSource) -> Result<nrese_store::DlConfig> {
 /// The result cache's budget: a size, or a share of the memory the server may use (`5%`).
 /// By default 2% of it, at least 64 MiB and at most 8 GiB: on a 64 GB machine 1.3 GB, so
 /// results of hundreds of megabytes are kept, as QLever's default cache keeps them.
-fn parse_cache_bytes(input: Option<&str>) -> Result<usize> {
+/// A cache, not a limit: where the memory its share is of wasn't read, the floor.
+fn parse_cache_bytes(input: Option<&str>, machine: nrese_store::memory::Reading) -> Result<usize> {
     const MAX_DEFAULT: u64 = 8 << 30;
     let floor = nrese_store::DEFAULT_QUERY_CACHE_BYTES as u64;
     let bytes = match input {
-        Some(text) => super::units::parse_memory(text)
+        Some(text) => super::units::parse_memory(text, machine)
             .with_context(|| format!("failed to parse {}", names::QUERY_CACHE_BYTES))?
             .unwrap_or(floor),
-        None => super::units::machine_memory_bytes()
-            .map_or(floor, |memory| (memory / 50).clamp(floor, MAX_DEFAULT)),
+        None => machine.map_or(floor, |memory| (memory / 50).clamp(floor, MAX_DEFAULT)),
     };
     Ok(bytes as usize)
 }
@@ -331,31 +339,31 @@ pub const DEFAULT_TOTAL_QUERY_MEMORY: &str = "50%";
 /// long operations stop, by default.
 pub const DEFAULT_PROCESS_MEMORY: &str = "75%";
 
-fn parse_process_memory(input: Option<&str>) -> Result<u64> {
+fn parse_process_memory(input: Option<&str>, machine: nrese_store::memory::Reading) -> Result<u64> {
     let text = input.unwrap_or(DEFAULT_PROCESS_MEMORY);
-    let bytes = super::units::parse_memory(text)
-        .with_context(|| format!("failed to parse {}", names::PROCESS_MEMORY_BYTES))?;
-    Ok(bytes.unwrap_or(0))
+    super::units::parse_memory_limit(text, machine, names::PROCESS_MEMORY_BYTES)
 }
 
-/// Bytes or a share of the machine's memory; `0` is unlimited, and so is a share where
-/// the machine's memory isn't known.
 /// What a bulk load's quads may take before they are spilled to disk: a size or a share of
 /// the memory the server may use, `0` for no limit.
 pub const DEFAULT_BULK_LOAD_MEMORY: &str = "25%";
 
-fn parse_bulk_load_memory(input: Option<&str>) -> Result<u64> {
+fn parse_bulk_load_memory(
+    input: Option<&str>,
+    machine: nrese_store::memory::Reading,
+) -> Result<u64> {
     let text = input.unwrap_or(DEFAULT_BULK_LOAD_MEMORY);
-    let bytes = super::units::parse_memory(text)
-        .with_context(|| format!("failed to parse {}", names::BULK_LOAD_MEMORY))?;
-    Ok(bytes.unwrap_or(0))
+    super::units::parse_memory_limit(text, machine, names::BULK_LOAD_MEMORY)
 }
 
-fn parse_total_query_memory(input: Option<&str>) -> Result<usize> {
+fn parse_total_query_memory(
+    input: Option<&str>,
+    machine: nrese_store::memory::Reading,
+) -> Result<usize> {
     let text = input.unwrap_or(DEFAULT_TOTAL_QUERY_MEMORY);
-    let bytes = super::units::parse_memory(text)
-        .with_context(|| format!("failed to parse {}", names::MAX_TOTAL_QUERY_MEMORY_BYTES))?;
-    Ok(bytes.unwrap_or(0) as usize)
+    let bytes =
+        super::units::parse_memory_limit(text, machine, names::MAX_TOTAL_QUERY_MEMORY_BYTES)?;
+    Ok(bytes as usize)
 }
 
 /// What a query without a dataset reads as its default graph: `default` (only the
