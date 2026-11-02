@@ -103,9 +103,11 @@ impl RdfSerializer {
                 RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::NTriples | RdfFormat::NQuads
             )
         {
-            buffer.extend_from_slice(b"VERSION \"");
-            buffer.extend_from_slice(version.as_bytes());
-            buffer.extend_from_slice(b"\"\n");
+            // One string, escaped as N-Triples writes one: the label can't end the
+            // directive or start a statement.
+            buffer.extend_from_slice(b"VERSION ");
+            ntriples::quoted(&mut buffer, version);
+            buffer.push(b'\n');
         }
         QuadSerializer {
             format: self.format,
@@ -115,6 +117,7 @@ impl RdfSerializer {
             rdf_xml,
             json_ld,
             binary: (self.format == RdfFormat::BinaryRdf).then(BinaryWriter::new),
+            failed: false,
         }
     }
 }
@@ -123,6 +126,12 @@ impl RdfSerializer {
 const BUFFER: usize = 64 * 1024;
 
 /// Writes statements in one format. Call [`QuadSerializer::finish`] at the end.
+///
+/// A statement the format can't hold, or a failed write, ends the document: a format writer
+/// may have written part of the statement (or state it depends on) by then, and the writer
+/// part of the buffer, so every later call fails too and [`QuadSerializer::finish`] never
+/// reports a complete document. Only N-Triples' refusal of a named graph, made before
+/// anything is written, leaves the serializer usable.
 pub struct QuadSerializer<W: Write> {
     format: RdfFormat,
     writer: W,
@@ -131,6 +140,13 @@ pub struct QuadSerializer<W: Write> {
     rdf_xml: Option<RdfXmlWriter>,
     json_ld: Option<JsonLd>,
     binary: Option<BinaryWriter>,
+    /// A statement or a write failed: the document can't be completed.
+    failed: bool,
+}
+
+/// What every call after a failure returns.
+fn failed_before() -> io::Error {
+    io::Error::other("an earlier statement or write failed: the document can't be completed")
 }
 
 enum JsonLd {
@@ -141,18 +157,27 @@ enum JsonLd {
 impl<W: Write> QuadSerializer<W> {
     /// Writes a quad. A quad in a named graph is an error for a format without graphs.
     pub fn serialize_quad<'a>(&mut self, quad: impl Into<QuadRef<'a>>) -> io::Result<()> {
+        if self.failed {
+            return Err(failed_before());
+        }
         let quad = quad.into();
+        if self.format == RdfFormat::NTriples && !quad.graph_name.is_default_graph() {
+            // Refused before anything is written: the serializer stays usable.
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("N-Triples has no named graphs: {quad}"),
+            ));
+        }
+        let written = self.encode(quad).and_then(|()| self.flush_full());
+        self.failed = written.is_err();
+        written
+    }
+
+    /// The quad into the buffer, in the format.
+    fn encode(&mut self, quad: QuadRef<'_>) -> io::Result<()> {
         match self.format {
             RdfFormat::NQuads => ntriples::write_quad(&mut self.buffer, quad)?,
-            RdfFormat::NTriples => {
-                if !quad.graph_name.is_default_graph() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("N-Triples has no named graphs: {quad}"),
-                    ));
-                }
-                ntriples::write_triple(&mut self.buffer, quad.into())?;
-            }
+            RdfFormat::NTriples => ntriples::write_triple(&mut self.buffer, quad.into())?,
             RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::N3 => {
                 if let Some(turtle) = &mut self.turtle {
                     turtle.write(&mut self.buffer, quad)?;
@@ -174,7 +199,7 @@ impl<W: Write> QuadSerializer<W> {
                 None => {}
             },
         }
-        self.flush_full()
+        Ok(())
     }
 
     /// Writes a triple (in the default graph).
@@ -182,8 +207,11 @@ impl<W: Write> QuadSerializer<W> {
         self.serialize_quad(triple.into().in_graph(GraphNameRef::DefaultGraph))
     }
 
-    /// Ends the document, and returns the writer.
+    /// Ends the document, and returns the writer; an error after an earlier failure.
     pub fn finish(mut self) -> io::Result<W> {
+        if self.failed {
+            return Err(failed_before());
+        }
         if let Some(turtle) = &mut self.turtle {
             turtle.finish(&mut self.buffer);
         }
