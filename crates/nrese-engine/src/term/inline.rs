@@ -717,6 +717,33 @@ mod tests {
         );
     }
 
+    /// RDF 1.1 Concepts §3.3: a literal whose lexical form is not in its datatype's
+    /// lexical space is ill-typed but still a legal term, so it stays in the dictionary
+    /// with its lexical form. In each row a multi-byte character covers the byte where a
+    /// `±hh:mm` timezone would start (`"éabcde"` is 7 bytes, `len - 6 == 1` is inside `é`).
+    #[test]
+    fn non_ascii_lexicals_stay_in_the_dictionary() {
+        let lexicals = [
+            "éabcde",
+            "2026-09-2é+5:00",
+            "x€bcdef",
+            "2026-09-25T14:03:0é+1:00",
+        ];
+        // Every row is checked, so a failure lists each wrong one (inlined or a panic).
+        let wrong: Vec<String> = [xsd::DATE, xsd::DATE_TIME]
+            .into_iter()
+            .flat_map(|datatype| lexicals.map(|lexical| (lexical, datatype)))
+            .filter_map(|(lexical, datatype)| {
+                match std::panic::catch_unwind(|| inline(lexical, datatype)) {
+                    Ok(None) => None,
+                    Ok(Some(_)) => Some(format!("{lexical} ^^ {datatype} inlined")),
+                    Err(_) => Some(format!("{lexical} ^^ {datatype} panicked")),
+                }
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// The invariant that matters: whatever gets inlined decodes to exactly its input.
     /// Random near-miss strings over each datatype's alphabet.
     #[test]
