@@ -42,9 +42,11 @@ pub(crate) enum Tail {
 }
 
 /// Classifies the segment `bytes` from offset `at`, its first invalid frame. `next` is the
-/// revision a record there would have: the last valid record's plus one, else the segment's
-/// first. Linear in the bytes after `at`; only candidates whose length fits the file and
-/// whose revision could follow are checksummed.
+/// first revision recovery doesn't hold yet (the recovered revision plus one): every record
+/// that could be lost has it or a later one. Not the segment's name, a lower bound only: a
+/// bulk load advances the revision by a checkpoint alone, without a new segment when the
+/// active one is empty. Linear in the bytes after `at`; only candidates whose length fits
+/// the file and whose revision could follow are checksummed.
 pub(crate) fn classify(bytes: &[u8], at: usize, next: u64) -> Tail {
     let rest = &bytes[at..];
     let incomplete = match rest.get(..4) {
@@ -96,8 +98,9 @@ fn intact_after(bytes: &[u8], at: usize, next: u64) -> Option<(u64, u64)> {
 }
 
 /// Copies the segment's bytes from `at` on to `<root>/wal-cut/<segment name>.<at>`, synced,
-/// before they are cut; returns the copy's path. Opening again before the cut writes the
-/// same copy.
+/// before they are cut; returns the copy's path. No copy is ever replaced: one of the same
+/// bytes (opening again before the cut) is reused, and a different one at that offset (a
+/// later cut there) keeps its name while this copy takes the next free `.<n>` after it.
 pub(crate) fn keep(root: &Path, segment: &Path, bytes: &[u8], at: u64) -> EngineResult<PathBuf> {
     let dir = root.join(CUT_DIR);
     fs::create_dir_all(&dir)?;
@@ -106,10 +109,22 @@ pub(crate) fn keep(root: &Path, segment: &Path, bytes: &[u8], at: u64) -> Engine
         .file_name()
         .expect("segment file name")
         .to_string_lossy();
-    let path = dir.join(format!("{name}.{at}"));
-    let temporary = dir.join(format!("{name}.{at}.tmp"));
+    let cut = &bytes[at as usize..];
+    let first = format!("{name}.{at}");
+    let mut path = dir.join(&first);
+    for n in 1.. {
+        match fs::read(&path) {
+            Ok(kept) if kept == cut => return Ok(path),
+            Ok(_) => path = dir.join(format!("{first}.{n}")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let mut temporary = path.clone().into_os_string();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
     let mut file = File::create(&temporary)?;
-    file.write_all(&bytes[at as usize..])?;
+    file.write_all(cut)?;
     file.sync_all()?;
     drop(file);
     fs::rename(&temporary, &path)?;

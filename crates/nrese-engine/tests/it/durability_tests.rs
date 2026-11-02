@@ -351,6 +351,89 @@ fn keeping_the_prefix_opens_up_to_the_damage_and_keeps_the_rest() {
     assert_eq!(contents(&engine), again[0]);
 }
 
+/// A later cut at the same offset never replaces an earlier copy (sol-loop r1 S2): after a
+/// prefix kept at record 2, the next commit is written where record 2 was, and a crash
+/// tears it. Cutting that torn tail keeps it under another name; the copy of the damaged
+/// records 2 to 4, possibly the only one of acknowledged commits, stays as it was.
+#[test]
+fn a_later_cut_at_the_same_offset_keeps_the_earlier_copy() {
+    let (dir, _, mut bytes) = four_records();
+    let second = frame_starts(&bytes)[1];
+    bytes[second + 20] ^= 0x10;
+    let segment = segments(dir.path())[0].clone();
+    fs::write(&segment, &bytes).unwrap();
+    let keep = EngineConfig {
+        durability: DurabilityConfig {
+            wal_damage: WalDamage::KeepPrefix,
+            ..config().durability
+        },
+        ..config()
+    };
+    let engine = Engine::open(dir.path(), keep).unwrap();
+    commit_all(&engine, &batches(1..2));
+    drop(engine);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&segment)
+        .unwrap()
+        .set_len(second as u64 + 20)
+        .unwrap();
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(engine.stats().revision, 1);
+    assert_eq!(
+        fs::read(cut_copy(dir.path(), &segment, second)).unwrap(),
+        bytes[second..],
+        "the earlier copy as it was"
+    );
+    assert_eq!(fs::read_dir(dir.path().join("wal-cut")).unwrap().count(), 2);
+}
+
+/// A segment's name is a lower bound of its records only: bulk loads advance the revision
+/// by checkpoints alone, and an empty active segment keeps its name (sol-loop r1 S1). Here
+/// 30 replacements leave the store at revision 30 with its first segment, named 1, empty;
+/// two small commits (31 and 32, one quad of known terms each) follow in it, far more
+/// revisions past the name than frames fit. A garbage length over record 31 still finds
+/// record 32 intact after it: the open refuses, the log as it was.
+#[test]
+fn damage_is_found_in_a_segment_named_far_below_its_records() {
+    let node = |n: &str| NamedNode::new_unchecked(format!("http://example.com/{n}"));
+    let triple = |o: u64| {
+        Quad::new(
+            node("s"),
+            node("p"),
+            node(&format!("o{o}")),
+            GraphName::DefaultGraph,
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        for n in 0..30 {
+            let load = engine.bulk_load(BulkMode::Replace);
+            load.add(&[triple(n)]);
+            load.finish().unwrap();
+        }
+        assert_eq!(engine.stats().revision, 30);
+        for o in [0, 1] {
+            let mut tx = engine.transaction();
+            tx.insert(triple(o).as_ref());
+            tx.commit().unwrap();
+        }
+    }
+    let segment = segments(dir.path())[0].clone();
+    let mut bytes = fs::read(&segment).unwrap();
+    let starts = frame_starts(&bytes);
+    assert_eq!(starts.len(), 2, "both commits in the first segment");
+    bytes[starts[0]..starts[0] + 4].fill(0xff);
+    fs::write(&segment, &bytes).unwrap();
+    match Engine::open(dir.path(), config()) {
+        Err(EngineError::Corruption(_)) => {}
+        Ok(engine) => panic!("opened at revision {}", engine.stats().revision),
+        Err(other) => panic!("{other}"),
+    }
+    assert_eq!(fs::read(&segment).unwrap(), bytes, "the log as it was");
+}
+
 #[test]
 fn corruption_before_the_tail_is_an_error_not_data_loss() {
     let dir = tempfile::tempdir().unwrap();
