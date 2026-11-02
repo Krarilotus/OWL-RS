@@ -11,7 +11,7 @@ use rayon::prelude::*;
 
 use super::{Program, encode, pattern, storable, triple};
 use crate::delta::{self, Base, MemoryBase};
-use crate::eval::GroundProgram;
+use crate::eval::{GroundProgram, OperationStop};
 use crate::ir::{Triple, Violation};
 use crate::lists::ListDiagnostic;
 
@@ -143,6 +143,18 @@ pub fn maintain(
     tx: &mut Transaction<'_>,
     stop: crate::eval::Stop<'_>,
 ) -> Result<Maintenance, delta::Interrupted> {
+    maintain_with(program, ground, tx, &OperationStop::new(stop))
+}
+
+/// [`maintain`] as one operation under `operation`, whose memory limit and room its caller
+/// chose ([`OperationStop::within`]): the equality copies are admitted by its room, and
+/// once it fires, every part of the maintenance stops.
+pub fn maintain_with(
+    program: &Program,
+    ground: Option<&GroundProgram>,
+    tx: &mut Transaction<'_>,
+    operation: &OperationStop<'_>,
+) -> Result<Maintenance, delta::Interrupted> {
     // Axioms the state lacks (a store that never rematerialised): added with this commit.
     let mut missing_axioms: Vec<Triple> = Vec::new();
     // Unnamed classes left out: as the commit leaves them; one it makes consumable
@@ -162,10 +174,10 @@ pub fn maintain(
     // Revived memberships must participate in the delta executor's introduced-only
     // consistency checks. Keep the batch result for installation below: no second run.
     let mut rebuilt = if revived {
-        Some(super::materialise_until(
+        Some(super::materialise_with(
             program,
             &tx.pending_snapshot(),
-            stop,
+            operation,
         )?)
     } else {
         None
@@ -219,7 +231,7 @@ pub fn maintain(
         if inserted.is_empty() && deleted.is_empty() {
             delta::Update::default()
         } else {
-            delta::update_with(&base, &inserted, &deleted, rules, ground, stop, policy)?
+            delta::update_within(&base, &inserted, &deleted, rules, ground, operation, policy)?
         }
     };
     let mut update = update;
@@ -261,11 +273,11 @@ pub fn maintain(
     if rebuild {
         let mut closure = match rebuilt.take() {
             Some(closure) => closure,
-            None => super::materialise_until(program, &tx.pending_snapshot(), stop)?,
+            None => super::materialise_with(program, &tx.pending_snapshot(), operation)?,
         };
         // An interruption drops the transaction, these changes with it.
-        if stop() {
-            return Err(delta::Interrupted::default());
+        if operation.fired() {
+            return Err(operation.interrupted());
         }
         // Only the difference is applied: O(stored + rebuilt closure) to sort and walk,
         // and a transaction update per fact that changed. A stored snapshot shares the old
@@ -314,8 +326,8 @@ pub fn maintain(
                 .collect();
         }
         update.program = Some(after);
-        if stop() {
-            return Err(delta::Interrupted::default());
+        if operation.fired() {
+            return Err(operation.interrupted());
         }
     }
     Ok(Maintenance {

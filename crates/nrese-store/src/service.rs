@@ -77,20 +77,41 @@ impl MemoryStop {
             .is_some_and(nrese_exec::memory::MemoryWatch::exceeded)
     }
 
+    /// What the operation may still take under this watch now
+    /// ([`nrese_exec::memory::MemoryWatch::room`]): its room for the reasoner
+    /// ([`nrese_reasoner::eval::OperationStop::within`]), which admits by the least of it
+    /// and the process's. Without a watch, no bound of its own.
+    pub(crate) fn room(&self) -> nrese_exec::memory::Reading {
+        self.0
+            .as_ref()
+            .map_or(Ok(u64::MAX), nrese_exec::memory::MemoryWatch::room)
+    }
+
     /// The error of the operation `interrupted` ended, if memory ended it: this watch's
-    /// stop (past its limit, or the memory unread), else the process limit's, by the cause
-    /// the operation itself kept. `None`: its caller stopped it.
+    /// stop (past its limit, or the memory unread), else by the cause the operation itself
+    /// kept: the process limit's stop, or an allocation its room couldn't admit (by the
+    /// least of this watch's and the process's limits, [`Self::room`]), named with the
+    /// least of those limits set. `None`: its caller stopped it.
     pub(crate) fn error(
         &self,
         interrupted: nrese_reasoner::delta::Interrupted,
     ) -> Option<crate::StoreError> {
         use nrese_exec::memory::MemoryStopCause;
-        let process = || nrese_exec::memory::process_limit().unwrap_or(0);
+        let limit = || {
+            [
+                self.0.as_ref().map(nrese_exec::memory::MemoryWatch::limit),
+                nrese_exec::memory::process_limit(),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(0)
+        };
         let watch = self
             .0
             .as_ref()
             .and_then(|watch| Some((watch.limit(), watch.cause()?)))
-            .or_else(|| Some((process(), interrupted.memory?)));
+            .or_else(|| Some((limit(), interrupted.memory?)));
         match watch {
             Some((limit, MemoryStopCause::Unread)) => {
                 Some(crate::StoreError::MemoryUnreadable { limit })
@@ -1753,17 +1774,17 @@ impl StoreService {
     /// `program` on the asserted data, or an explicit diagnostic if stopped.
     pub fn equality_report(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> String {
         let memory = self.memory_stop();
-        let stop = || memory.exceeded();
+        let (stop, room) = (|| memory.exceeded(), || memory.room());
+        let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
         let tx = self.engine.transaction();
         let program = crate::reasoning::Program::compile(&program.into(), &|term| tx.intern(term));
-        nrese_reasoner::engine::equality_report_until(&program, tx.base(), &stop).unwrap_or_else(
-            |interrupted| match memory.error(interrupted) {
+        nrese_reasoner::engine::equality_report_with(&program, tx.base(), &operation)
+            .unwrap_or_else(|interrupted| match memory.error(interrupted) {
                 Some(unread @ crate::StoreError::MemoryUnreadable { .. }) => {
                     format!("equality: {unread}")
                 }
                 _ => "equality: stopped by the process memory limit".to_owned(),
-            },
-        )
+            })
     }
 
     /// Replaces the inferred stack with `program`'s closure over the asserted data, as one
@@ -1799,13 +1820,15 @@ impl StoreService {
                 .storing_representatives(self.config.equality_compact);
         let memory = self.memory_stop();
         let stop = || stop() || memory.exceeded();
+        let room = || memory.room();
         let stopped = |interrupted| {
             memory
                 .error(interrupted)
                 .unwrap_or(crate::StoreError::MaterialisationCancelled)
         };
+        let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
         let closure =
-            crate::reasoning::materialise_until(&program, rematerialisation.base(), &stop)
+            crate::reasoning::materialise_with(&program, rematerialisation.base(), &operation)
                 .map_err(stopped)?;
         let inferred = closure.inferred.len() as u64;
         let base = rematerialisation.base();
