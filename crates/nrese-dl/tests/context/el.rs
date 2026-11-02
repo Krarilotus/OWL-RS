@@ -138,7 +138,11 @@ fn equals_the_el_classifier_on_fuzzed_el_ontologies() {
         };
         // An inconsistent ontology: every class unsatisfiable (the EL classifier also
         // lists every class as equivalent to owl:Thing then).
-        let el_top = if ours.consistent { &el.top } else { &ours.top };
+        let el_top = if ours.consistency == nrese_dl::verdict::Verdict::Consistent {
+            &el.top
+        } else {
+            &ours.top
+        };
         assert_eq!(
             (show(&ours.subsumptions), &ours.unsatisfiable, &ours.top),
             (show(&el.subsumptions), &el.unsatisfiable, el_top),

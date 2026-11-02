@@ -9,33 +9,9 @@ use nrese_dl::tableau;
 use nrese_exec::workers::Workers;
 use nrese_owl::Ontology;
 
-/// What a consistency check found.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Verdict {
-    Consistent,
-    Inconsistent,
-    /// Not decided: a budget ran out, the engines lack something the ontology needs, or
-    /// the check is off. Answers can't be certain then.
-    Unknown(String),
-}
-
-impl Verdict {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Consistent => "consistent",
-            Self::Inconsistent => "inconsistent",
-            Self::Unknown(_) => "unknown",
-        }
-    }
-
-    /// Why it isn't decided, if it isn't.
-    pub fn reason(&self) -> Option<&str> {
-        match self {
-            Self::Unknown(why) => Some(why),
-            _ => None,
-        }
-    }
-}
+/// What a consistency check found: the DL engines' one verdict, which classification
+/// states too.
+pub use nrese_dl::verdict::Verdict;
 
 /// A check's verdict, which engine gave it and what it cost.
 #[derive(Debug, Clone, PartialEq, Eq)]

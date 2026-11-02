@@ -357,7 +357,7 @@ fn class_queries_answer_as_the_realisation_on_random_ontologies() {
         if !reference.incomplete.is_empty() || !reference.taxonomy.complete() {
             continue;
         }
-        if !reference.taxonomy.classification.consistent {
+        if reference.taxonomy.classification.consistency != nrese_dl::verdict::Verdict::Consistent {
             continue;
         }
         let vocabulary =

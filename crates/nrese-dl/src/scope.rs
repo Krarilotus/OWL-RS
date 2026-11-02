@@ -150,10 +150,10 @@ pub fn answer(o: &Ontology, names: &Names, timeout: Option<Duration>) -> Answers
     }
     let consistent = plain.answer == Answer::Consistent;
     let seen = [
-        taxonomy.classification.consistent,
-        realisation.taxonomy.classification.consistent,
+        taxonomy.classification.consistency.decided(),
+        realisation.taxonomy.classification.consistency.decided(),
     ];
-    if seen.iter().any(|&c| c != consistent) {
+    if seen.iter().any(|&c| c != Some(consistent)) {
         return Answers::undecided(
             'x',
             &format!("consistency {consistent}, classification and realisation {seen:?}"),

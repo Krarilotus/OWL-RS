@@ -13,7 +13,8 @@
 //! - [`scope`]: the answers and certificates of the small-scope check (§11);
 //! - [`memory`]: what the engines and compiling hold, drawn from a request's envelope;
 //! - [`limits`]: the budgets, each a caller's setting, none built in;
-//! - [`beyond`]: inputs outside OWL 2 DL, decided where that is sound (§16).
+//! - [`beyond`]: inputs outside OWL 2 DL, decided where that is sound (§16);
+//! - [`verdict`]: consistent, inconsistent or not decided, as every engine reports it.
 //!
 //! Each module is its own package with its own gates (owl2-dl-performance.md §6).
 
@@ -32,3 +33,4 @@ pub mod memory;
 pub mod numbers;
 pub mod scope;
 pub mod tableau;
+pub mod verdict;

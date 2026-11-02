@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 
 use nrese_dl::classify::{self, Classification, Options};
 use nrese_dl::tableau::{self, Answer, Config};
+use nrese_dl::verdict::Verdict;
 use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
 use nrese_owl::{Axiom, ClassExpr, EntityKind, ExprId, Ontology, Term};
 
@@ -77,12 +78,14 @@ fn consistent(o: &Ontology) -> Option<bool> {
 
 /// The classification by one consistency test per class and pair.
 fn brute_classification(o: &Ontology, classes: &[Term]) -> Option<Classification> {
-    let mut c = Classification {
-        classes: classes.to_vec(),
-        consistent: consistent(o)?,
-        ..Classification::default()
-    };
-    if !c.consistent {
+    let mut c = Classification::new(
+        classes.to_vec(),
+        match consistent(o)? {
+            true => Verdict::Consistent,
+            false => Verdict::Inconsistent,
+        },
+    );
+    if c.consistency == Verdict::Inconsistent {
         c.unsatisfiable = classes.to_vec();
         return Some(c);
     }
@@ -402,9 +405,10 @@ fn taxonomies_equal_brute_force() {
             continue;
         }
         tally.compared += 1;
-        tally.inconsistent += u64::from(!expected.consistent);
+        let consistent = expected.consistency == Verdict::Consistent;
+        tally.inconsistent += u64::from(!consistent);
         tally.with_subsumptions += u64::from(!expected.subsumptions.is_empty());
-        tally.with_unsat += u64::from(expected.consistent && !expected.unsatisfiable.is_empty());
+        tally.with_unsat += u64::from(consistent && !expected.unsatisfiable.is_empty());
         // Metamorphic: renamed and shuffled.
         let renamed = fuzz::rename(&o, &|t| t + 1000);
         let back = |c: &Classification| {
@@ -414,7 +418,7 @@ fn taxonomies_equal_brute_force() {
                 subsumptions: c.subsumptions.iter().map(|(a, b)| (f(a), f(b))).collect(),
                 unsatisfiable: c.unsatisfiable.iter().map(f).collect(),
                 top: c.top.iter().map(f).collect(),
-                consistent: c.consistent,
+                consistency: c.consistency.clone(),
             };
             c.subsumptions.sort_unstable();
             c
@@ -479,7 +483,11 @@ fn types_equal_brute_force() {
                 // Every individual has every type; the canonical form is empty.
                 let r = classify::realise(&o, &options());
                 if r.incomplete.is_empty() {
-                    assert!(!r.taxonomy.classification.consistent, "case {case}");
+                    assert_eq!(
+                        r.taxonomy.classification.consistency,
+                        Verdict::Inconsistent,
+                        "case {case}"
+                    );
                     assert!(r.types.iter().all(|t| *t == classes), "case {case}");
                     assert_eq!(r.canonical(&|t| format!("t{t}")), "");
                 }
@@ -796,7 +804,7 @@ fn a_key_of_no_property_left_merges_without_assertions() {
     o.sources = vec![Vec::new(); 2];
     let taxonomy = nrese_dl::classify::classify(&o, &nrese_dl::classify::Options::default());
     assert!(taxonomy.complete());
-    assert!(!taxonomy.classification.consistent);
+    assert_eq!(taxonomy.classification.consistency, Verdict::Inconsistent);
 }
 
 /// Guard (small-scope case 1267640, 12 October 2026): a key applies to every named

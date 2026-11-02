@@ -2137,7 +2137,7 @@ data = "horn classes=3000"
 args = ["--classify", "--runs", "1"]
 queries = ""
 metric = "classification.max_ms"
-check = { "classification.consistent" = "true", "classification.subsumptions" = 1161634 }
+check = { "classification.consistency" = "consistent", "classification.subsumptions" = 1161634 }
 route = { "classification.engine" = "== context-core" }
 cap_gb = 6
 systems = ["hermit:dl", "konclude:dl"]
@@ -2152,7 +2152,7 @@ data = "dl-number n=24 individuals=100"
 args = ["--classify", "--runs", "1"]
 queries = ""
 metric = "classification.max_ms"
-check = { "classification.consistent" = "true", "classification.subsumptions" = 2 }
+check = { "classification.consistency" = "consistent", "classification.subsumptions" = 2 }
 route = { "classification.engine" = "== tableau" }
 cap_gb = 6
 systems = ["hermit:dl", "konclude:dl"]

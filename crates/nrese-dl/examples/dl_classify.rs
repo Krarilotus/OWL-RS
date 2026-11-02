@@ -256,12 +256,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let c = &taxonomy.classification;
     eprintln!(
-        "{} triples; {} classes, {} subsumptions, {} unsatisfiable, consistent {}",
+        "{} triples; {} classes, {} subsumptions, {} unsatisfiable, {}",
         triples.len(),
         c.classes.len(),
         c.subsumptions.len(),
         c.unsatisfiable.len(),
-        c.consistent
+        c.consistency.as_str()
     );
     let mut profile = runs.last().map(|(_, p)| p.clone()).unwrap_or_default();
     profile.total = median(runs.iter().map(|(owl, p)| *owl + p.total).collect());
