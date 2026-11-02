@@ -401,6 +401,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             // Where the statement starts (its first token), for an error's statement.
             let start = self.statement_start();
             if let Err(error) = self.statement() {
+                self.abort_statement();
                 let start = self.input.resolve(start);
                 let syntax = matches!(error, RdfParseError::Syntax(_));
                 self.done =
@@ -458,6 +459,14 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             context,
             graph,
         })
+    }
+
+    /// A statement failed: what it queued is not output (its triples are emitted before
+    /// its end is checked), whether parsing then stops or recovers.
+    fn abort_statement(&mut self) {
+        self.triples.clear();
+        self.triple_terms.clear();
+        self.handed_out = 0;
     }
 
     /// After a syntax error: skips to the end of the statement, a `.` outside brackets (or
