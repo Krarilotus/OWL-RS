@@ -3,7 +3,9 @@ port on 127.0.0.1, the scenario's settings (`--set`, over the defaults below) an
 caller's environment (no NRESE_* variable reaches it, and it starts in its own directory, so no
 stray .env file does either). Its log goes to the evidence. `cleanup` stops it and removes the
 directory, and runs however the scenario ended; on Linux the server also dies with the runner
-(PR_SET_PDEATHSIG), and under fleet the step's scope ends both.
+(PR_SET_PDEATHSIG), and under fleet the step's scope ends both. A stop ends the server with all it
+started (suitekit/processes.py: its own process group on POSIX), so a command that runs the
+server as its child (a Windows venv's python.exe) frees the port too.
 
 Every attempt to start it is recorded (`attempts`), failed ones too. An attempt that fails is
 stopped and reaped before anything else happens; only one whose own log says it couldn't bind
@@ -22,6 +24,8 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+
+from suitekit.processes import stop as stop_tree
 
 from . import client
 
@@ -64,6 +68,7 @@ class Server:
         self.scratch = scratch
         self.root: Path | None = None
         self.process: subprocess.Popen | None = None
+        self.stopped: subprocess.Popen | None = None  # the process whose tree was stopped
         self.port = 0
         self.attempts: list[dict] = []
 
@@ -102,7 +107,7 @@ class Server:
                 try:
                     self.process = subprocess.Popen(
                         self.argv(), cwd=self.root, env=self.env, stdin=subprocess.DEVNULL, stdout=log,
-                        stderr=subprocess.STDOUT,
+                        stderr=subprocess.STDOUT, start_new_session=os.name != "nt",
                         preexec_fn=_die_with_parent if sys.platform.startswith("linux") else None)
                 except OSError as e:
                     record["outcome"] = f"can't start {self.command[0]}: {e}"
@@ -150,16 +155,16 @@ class Server:
         return self.process.poll() if self.process else None
 
     def stop(self) -> int | None:
-        """Stops it: SIGTERM (on Windows TerminateProcess), SIGKILL after ten seconds. Its exit code."""
+        """Stops it with all it started: SIGTERM to its process group, SIGKILL after ten seconds
+        to what is left of it (on Windows taskkill /T /F). Its exit code. Also when the process
+        itself has gone (a launcher that left its child), and once per process, since its pid
+        may be another's after that."""
         if not self.process:
             return None
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(10)
+        if self.stopped is not self.process:
+            stop_tree(self.process, grace_s=10)
+            self.stopped = self.process
+        self.process.wait(10)
         return self.process.returncode
 
     def cleanup(self, keep: bool = False) -> dict:
