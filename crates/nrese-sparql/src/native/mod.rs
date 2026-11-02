@@ -1282,6 +1282,12 @@ impl Charged for Vec<Solutions> {
     }
 }
 
+impl<A: Charged, B: Charged> Charged for (A, B) {
+    fn charged(&self) -> usize {
+        self.0.charged() + self.1.charged()
+    }
+}
+
 /// What [`IdTable::concat`] of `parts`' tables allocates beyond them.
 fn concat_growth(parts: &[Solutions]) -> usize {
     IdTable::concat_growth(parts.iter().map(|p| &p.table))
@@ -1692,7 +1698,7 @@ impl<'a> Context<'a> {
         match pattern {
             GraphPattern::Project { inner, variables } => {
                 let solutions = self.eval_limited(inner, limit)?;
-                Ok(self.project(solutions, variables))
+                self.project(solutions, variables)
             }
             GraphPattern::LeftJoin {
                 left,
@@ -1999,7 +2005,7 @@ impl<'a> Context<'a> {
             }
             GraphPattern::Project { inner, variables } => {
                 let solutions = self.eval(inner)?;
-                Ok(self.project(solutions, variables))
+                self.project(solutions, variables)
             }
             GraphPattern::Distinct { inner } => {
                 // SELECT DISTINCT … ORDER BY projected variables: deduplicate first, then sort
@@ -2028,7 +2034,7 @@ impl<'a> Context<'a> {
                         }
                         _ => self.eval(sorted)?,
                     };
-                    let mut solutions = self.project(solutions, variables);
+                    let mut solutions = self.project(solutions, variables)?;
                     solutions.table.dedup_preserving_order();
                     return self.order_by(solutions, expression, None);
                 }
@@ -2042,7 +2048,7 @@ impl<'a> Context<'a> {
                     && !self.as_written
                 {
                     let solutions = self.eval_set(projected, variables)?;
-                    let mut solutions = self.project(solutions, variables);
+                    let mut solutions = self.project(solutions, variables)?;
                     solutions.table.dedup_preserving_order();
                     return Ok(solutions);
                 }
@@ -2088,7 +2094,7 @@ impl<'a> Context<'a> {
                     let solutions = self.eval(sorted)?;
                     let solutions =
                         self.order_by(solutions, expression, length.map(|l| start + l))?;
-                    let mut solutions = self.project(solutions, variables);
+                    let mut solutions = self.project(solutions, variables)?;
                     solutions.table.slice(*start, *length);
                     return Ok(solutions);
                 }
@@ -2302,19 +2308,62 @@ impl<'a> Context<'a> {
         };
         let estimate = || self.path_estimate(path, Some(from));
         self.note_closures(&evaluator, path.path, estimate, pairs.len(), start);
-        let (vars, table) = if s == o {
-            let same = pairs.into_iter().filter(|(a, b)| a == b).map(|(a, _)| a);
-            (vec![s], IdTable::from_columns(vec![same.collect()]))
-        } else {
-            let (starts, ends): (Vec<u64>, Vec<u64>) = pairs.into_iter().unzip();
+        let reached = self.path_pairs(pairs, s, o)?;
+        self.filtered_path(path, Some((reached, from)), start)
+    }
+
+    /// The table of a path's `(s, o)` pairs (one column if `s` and `o` are one variable,
+    /// of the pairs that start where they end): a row per copy, every column charged
+    /// before it is made (a sequence of alternatives counts a pair once per way through).
+    fn path_pairs(
+        &self,
+        pairs: paths::Bag<(u64, u64)>,
+        s: Variable,
+        o: Variable,
+    ) -> NativeResult<Solutions> {
+        if s == o {
+            let same = || pairs.counted().filter(|((a, b), _)| a == b);
+            let rows = same().fold(0usize, |n, (_, copies)| n.saturating_add(copies));
+            return self.path_table(rows.saturating_mul(8), || {
+                let mut column = Vec::with_capacity(rows);
+                for ((a, _), copies) in same() {
+                    column.extend(std::iter::repeat_n(a, copies));
+                }
+                (vec![s], IdTable::from_columns(vec![column]))
+            });
+        }
+        let rows = pairs.len();
+        self.path_table(rows.saturating_mul(16), || {
+            let (mut starts, mut ends) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
+            for ((a, b), copies) in pairs.counted() {
+                starts.extend(std::iter::repeat_n(a, copies));
+                ends.extend(std::iter::repeat_n(b, copies));
+            }
             (vec![s, o], IdTable::from_columns(vec![starts, ends]))
-        };
-        let reached = self.produced(Solutions {
+        })
+    }
+
+    /// A path's table: `bytes` charged before `make` makes it, then the charge of exactly
+    /// the table's bytes, which it keeps.
+    fn path_table(
+        &self,
+        bytes: usize,
+        make: impl FnOnce() -> (Vec<Variable>, IdTable),
+    ) -> NativeResult<Solutions> {
+        let mut held = Reservation::new(Arc::clone(&self.budget));
+        held.charge(bytes)
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        // Declared after `held`: dropped before it.
+        let (vars, table) = make();
+        self.check()?;
+        held.resize(table.memory_bytes())
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        held.transfer();
+        Ok(Solutions {
             vars,
             table,
             ordered: false,
-        })?;
-        self.filtered_path(path, Some((reached, from)), start)
+        })
     }
 
     /// The path's solutions (`reached`, from that many bound values, or all of them),
@@ -2377,31 +2426,26 @@ impl<'a> Context<'a> {
         let end = |term: &TermPattern| self.path_end(term);
         let mut evaluator = self.path_evaluator()?;
         evaluator.fixed = end(subject).err().or_else(|| end(object).err());
-        let column = |values: Vec<u64>| IdTable::from_columns(vec![values]);
-        let (vars, table) = match (end(subject), end(object)) {
+        // A row per copy of the path's bag, charged before it is made.
+        let column = |variable: Variable, ends: paths::Bag<u64>| {
+            self.path_table(ends.len().saturating_mul(8), || {
+                (
+                    vec![variable],
+                    IdTable::from_columns(vec![ends.into_copies()]),
+                )
+            })
+        };
+        let solutions = match (end(subject), end(object)) {
             (Err(start), Err(finish)) => {
                 let rows = evaluator.multiplicity(&resolved, start, finish);
-                (
-                    Vec::new(),
-                    IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
-                )
+                self.path_table(rows.saturating_mul(8), || {
+                    let rows = IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows));
+                    (Vec::new(), rows)
+                })?
             }
-            (Err(start), Ok(o)) => (vec![o], column(evaluator.from(&resolved, start))),
-            (Ok(s), Err(finish)) => (vec![s], column(evaluator.to(&resolved, finish))),
-            (Ok(s), Ok(o)) if s == o => {
-                let same: Vec<u64> = evaluator
-                    .open(&resolved)
-                    .into_iter()
-                    .filter(|(a, b)| a == b)
-                    .map(|(a, _)| a)
-                    .collect();
-                (vec![s], column(same))
-            }
-            (Ok(s), Ok(o)) => {
-                let (starts, ends): (Vec<u64>, Vec<u64>) =
-                    evaluator.open(&resolved).into_iter().unzip();
-                (vec![s, o], IdTable::from_columns(vec![starts, ends]))
-            }
+            (Err(start), Ok(o)) => column(o, evaluator.from(&resolved, start))?,
+            (Ok(s), Err(finish)) => column(s, evaluator.to(&resolved, finish))?,
+            (Ok(s), Ok(o)) => self.path_pairs(evaluator.open(&resolved), s, o)?,
         };
         let estimate = || {
             let pattern = PathPattern {
@@ -2412,12 +2456,9 @@ impl<'a> Context<'a> {
             };
             Some(self.path_size(&pattern).round() as u64)
         };
-        self.note_closures(&evaluator, path, estimate, table.len(), start);
-        self.produced(Solutions {
-            vars,
-            table,
-            ordered: false,
-        })
+        let rows = solutions.table.len();
+        self.note_closures(&evaluator, path, estimate, rows, start);
+        Ok(solutions)
     }
 
     // --- basic graph patterns ------------------------------------------------------------
@@ -2832,13 +2873,13 @@ impl<'a> Context<'a> {
         let tables = parts
             .into_iter()
             .map(|part| {
-                if part.vars == vars {
+                Ok(if part.vars == vars {
                     part.table
                 } else {
-                    self.project(part, &vars).table
-                }
+                    self.project(part, &vars)?.table
+                })
             })
-            .collect();
+            .collect::<NativeResult<_>>()?;
         Ok(Solutions {
             table: IdTable::concat(vars.len(), tables),
             vars,
@@ -4031,6 +4072,10 @@ impl<'a> Context<'a> {
         })
     }
 
+    /// The rows of both sides over the variables of either: a variable a side lacks is
+    /// UNDEF in its rows. Every column of the result is made, for the rows of both sides,
+    /// while they are held: charged before it is made, however many variables a side
+    /// lacks.
     fn union(&self, left: Solutions, right: Solutions) -> NativeResult<Solutions> {
         let mut vars = left.vars.clone();
         for v in &right.vars {
@@ -4038,28 +4083,30 @@ impl<'a> Context<'a> {
                 vars.push(v.clone());
             }
         }
-        let widen = |s: &Solutions| {
+        let rows = left.table.len() + right.table.len();
+        let growth = rows.saturating_mul(8).saturating_mul(vars.len());
+        self.reshaped((left, right), growth, |(left, right)| {
             // No variables on either side: rows without columns, as many as there are.
-            if vars.is_empty() {
-                return IdTable::from_rows(0, std::iter::repeat_n(&[][..], s.table.len()));
+            let table = if vars.is_empty() {
+                IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows))
+            } else {
+                let column = |v: &Variable| {
+                    let mut column = Vec::with_capacity(rows);
+                    for side in [&left, &right] {
+                        match side.column(v) {
+                            Some(c) => column.extend_from_slice(side.table.column(c)),
+                            None => column.resize(column.len() + side.table.len(), UNDEF),
+                        }
+                    }
+                    column
+                };
+                IdTable::from_columns(vars.iter().map(column).collect())
+            };
+            Solutions {
+                vars,
+                table,
+                ordered: false,
             }
-            let columns: Vec<Vec<u64>> = vars
-                .iter()
-                .map(|v| match s.column(v) {
-                    Some(c) => s.table.column(c).to_vec(),
-                    None => vec![UNDEF; s.table.len()],
-                })
-                .collect();
-            IdTable::from_columns(columns)
-        };
-        let mut table = widen(&left);
-        table.append(&widen(&right));
-        self.consumed(left);
-        self.consumed(right);
-        self.produced(Solutions {
-            vars,
-            table,
-            ordered: false,
         })
     }
 
@@ -4107,7 +4154,7 @@ impl<'a> Context<'a> {
                 ordered: false,
             };
             return Ok(Some(match projection {
-                Some(variables) => self.project(solutions, variables),
+                Some(variables) => self.project(solutions, variables)?,
                 None => solutions,
             }));
         };
@@ -4207,28 +4254,16 @@ impl<'a> Context<'a> {
             table: out,
             ordered: false,
         };
-        let Some(variables) = projection else {
-            out_held.transfer();
-            return Ok(Some(solutions));
-        };
-        // The projection's new columns are charged as the rows were, before they are made:
-        // a bound variable's column moves, every other projected one is made (an unbound
-        // variable's, a column projected again). The result keeps its charge.
-        let moved = solutions
-            .vars
-            .iter()
-            .filter(|v| variables.contains(v))
-            .count();
-        let made = variables.len() - moved;
+        // The result keeps the charge of exactly its bytes; a projection charges the columns
+        // it makes before making them (`project`).
         out_held
-            .charge(solutions.table.len().saturating_mul(8 * made))
-            .map_err(memory)?;
-        let projected = self.project(solutions, variables);
-        out_held
-            .resize(projected.table.memory_bytes())
+            .resize(solutions.table.memory_bytes())
             .map_err(memory)?;
         out_held.transfer();
-        Ok(Some(projected))
+        Ok(Some(match projection {
+            Some(variables) => self.project(solutions, variables)?,
+            None => solutions,
+        }))
     }
 
     /// Which rows pass `expression`: the compiled id-level predicate where it decides
@@ -4315,25 +4350,37 @@ impl<'a> Context<'a> {
 
     // --- modifiers -----------------------------------------------------------------------
 
-    /// The columns of `variables`: bound ones move, an unbound one is UNDEF.
-    fn project(&self, solutions: Solutions, variables: &[Variable]) -> Solutions {
-        let mut table = solutions.table;
-        let mut undef = None;
-        let mut columns = Vec::with_capacity(variables.len());
-        for variable in variables {
-            columns.push(match solutions.vars.iter().position(|v| v == variable) {
-                Some(column) => column,
-                None => *undef.get_or_insert_with(|| {
-                    table.push_column(vec![UNDEF; table.len()]);
-                    table.width() - 1
-                }),
-            });
-        }
-        Solutions {
-            vars: variables.to_vec(),
-            table: table.project(&columns),
-            ordered: solutions.ordered,
-        }
+    /// The columns of `variables` of a charged table: a bound variable's column moves,
+    /// every other one is made (an unbound variable's UNDEF, a column projected again),
+    /// charged before it is made, however many the query names. The result keeps the
+    /// charge, of exactly its bytes.
+    fn project(&self, solutions: Solutions, variables: &[Variable]) -> NativeResult<Solutions> {
+        let moved = solutions
+            .vars
+            .iter()
+            .filter(|v| variables.contains(v))
+            .count();
+        let made = variables.len() - moved;
+        let growth = solutions.table.len().saturating_mul(8).saturating_mul(made);
+        self.reshaped(solutions, growth, |solutions| {
+            let mut table = solutions.table;
+            let mut undef = None;
+            let mut columns = Vec::with_capacity(variables.len());
+            for variable in variables {
+                columns.push(match solutions.vars.iter().position(|v| v == variable) {
+                    Some(column) => column,
+                    None => *undef.get_or_insert_with(|| {
+                        table.push_column(vec![UNDEF; table.len()]);
+                        table.width() - 1
+                    }),
+                });
+            }
+            Solutions {
+                vars: variables.to_vec(),
+                table: table.project(&columns),
+                ordered: solutions.ordered,
+            }
+        })
     }
 
     /// Sorts by the ORDER BY keys. With `limit`, only the first `limit` rows are guaranteed to

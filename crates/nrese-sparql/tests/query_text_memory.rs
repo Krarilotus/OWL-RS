@@ -62,6 +62,9 @@ fn run(
         ..QueryOptions::default()
     };
     let query = SparqlParser::new().parse_query(query).unwrap();
+    // The profile is the process's: one measured run at a time.
+    static MEASURING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _alone = MEASURING.lock().unwrap_or_else(|p| p.into_inner());
     heap::start("query-text");
     heap::begin_step();
     let outcome = match evaluate_query(&snapshot, &query, &options) {
