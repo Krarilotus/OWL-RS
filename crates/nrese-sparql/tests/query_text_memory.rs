@@ -7,6 +7,8 @@
 //! with how often they are reached. Measured with a counting allocator, so this file is a
 //! test binary of its own.
 
+use std::collections::BTreeMap;
+
 use nrese_engine::{Engine, EngineConfig};
 use nrese_exec::{Envelope, SharedBudget, heap};
 use nrese_rdf::{GraphName, NamedNode, Quad};
@@ -77,6 +79,72 @@ fn run(
     let peak = heap::steps().last().unwrap().peak;
     let _ = heap::finish();
     (outcome, peak)
+}
+
+/// A solution: each bound variable's value in N-Triples.
+type Row = BTreeMap<String, String>;
+
+fn row(bindings: &[(&str, String)]) -> Row {
+    bindings
+        .iter()
+        .map(|(variable, value)| ((*variable).to_owned(), value.clone()))
+        .collect()
+}
+
+/// `"n"^^xsd:integer` in N-Triples.
+fn integer(n: usize) -> String {
+    format!("\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>")
+}
+
+/// The solutions of `query` with at most `memory` bytes (none: no limit), sorted: a
+/// SELECT's answer is a bag, and where ORDER BY leaves ties their order is not specified.
+/// Unmeasured, apart from [`run`]'s measurement.
+fn answers(
+    engine: &Engine,
+    query: &str,
+    as_written: bool,
+    memory: Option<usize>,
+) -> Result<Vec<Row>, String> {
+    let snapshot = engine.snapshot();
+    let options = QueryOptions {
+        as_written,
+        resources: Resources {
+            memory: Envelope::new(memory, None),
+            ..Resources::default()
+        },
+        ..QueryOptions::default()
+    };
+    let query = SparqlParser::new().parse_query(query).unwrap();
+    let QueryResults::Solutions(rows) =
+        evaluate_query(&snapshot, &query, &options).map_err(|e| e.to_string())?
+    else {
+        panic!("solutions");
+    };
+    let mut rows = rows
+        .map(|solution| {
+            let solution = solution.map_err(|e| e.to_string())?;
+            Ok(solution
+                .iter()
+                .map(|(variable, value)| (variable.as_str().to_owned(), value.to_string()))
+                .collect())
+        })
+        .collect::<Result<Vec<Row>, String>>()?;
+    rows.sort();
+    Ok(rows)
+}
+
+/// Where `got` and `expected` (both sorted) differ, in a line: their lengths and the first
+/// solution that differs.
+fn difference(got: &[Row], expected: &[Row]) -> Option<String> {
+    if got == expected {
+        return None;
+    }
+    let first = got.iter().zip(expected).find(|(g, e)| g != e);
+    Some(format!(
+        "{} solutions, not {}; first difference: {first:?}",
+        got.len(),
+        expected.len()
+    ))
 }
 
 /// Spec: a query's intermediate results draw from its memory envelope (`Resources::memory`,
@@ -175,8 +243,11 @@ fn a_closure_over_a_sequence_holds_its_ends_once() {
 /// string per group (4,096 groups), and a GROUP_CONCAT whose 4 KiB separator comes
 /// between each two of 4,096 values (16 MiB): refused; over IRIs it has no string
 /// (§18.5.1.7: unbound), so nothing to make, however long its separator: answered.
-/// Either way, the query's thread holds at most the limit and its bookkeeping. On the
-/// default path and as written alike.
+/// Either way, the query's thread holds at most the limit and its bookkeeping. An answered
+/// query's solutions, under the same limit: ORDER BY of unbound variables each subject
+/// once; the closure each `(ex:s<i>, ex:o<i>)` (the 4,096 links, none longer); the
+/// GROUP_CONCAT `"none"` (COALESCE of its unbound value). On the default path and as
+/// written alike.
 #[test]
 fn what_the_query_text_multiplies_draws_from_the_query_budget() {
     let p = ex("p");
@@ -205,7 +276,14 @@ fn what_the_query_text_multiplies_draws_from_the_query_budget() {
     let links = list(&|_| format!("<{EX}p>"), "|");
     let template = list(&|i| format!("?s <{EX}t{i}> ?o ."), " ");
     let separator = "x".repeat(1 << 12);
-    let cases: [(&str, String, Option<usize>); 13] = [
+    let subjects: Vec<Row> = (0..ROWS)
+        .map(|i| row(&[("s", format!("<{EX}s{i}>"))]))
+        .collect();
+    let reached: Vec<Row> = (0..ROWS)
+        .map(|i| row(&[("x", format!("<{EX}s{i}>")), ("y", format!("<{EX}o{i}>"))]))
+        .collect();
+    // The solutions of each answered case (None: the memory error).
+    let cases: [(&str, String, Option<Vec<Row>>); 13] = [
         (
             "S1 FILTER of 256 EXISTS",
             format!("SELECT ?s WHERE {{ {rows} FILTER({exists}) }}"),
@@ -229,7 +307,7 @@ fn what_the_query_text_multiplies_draws_from_the_query_budget() {
         (
             "S3 ORDER BY 256 unbound variables",
             format!("SELECT ?s WHERE {{ {rows} }} ORDER BY {unbound}"),
-            Some(ROWS),
+            Some(subjects),
         ),
         (
             "S4 LATERAL putting in 256 variables",
@@ -247,7 +325,7 @@ fn what_the_query_text_multiplies_draws_from_the_query_budget() {
         (
             "S6 closure of 256 times one link",
             format!("SELECT ?x ?y WHERE {{ ?x ({links})+ ?y }}"),
-            Some(ROWS),
+            Some(reached),
         ),
         (
             "CONSTRUCT of 256 template triples",
@@ -279,12 +357,13 @@ fn what_the_query_text_multiplies_draws_from_the_query_budget() {
                  WHERE {{ {{ SELECT ?s WHERE {{ {rows} }} LIMIT 64 }} }}",
                 "x".repeat(1 << 15)
             ),
-            Some(1),
+            Some(vec![row(&[("v", "\"none\"".to_owned())])]),
         ),
     ];
     // Every case runs, and each one that fails is listed.
     let mut failed = Vec::new();
-    for (case, query, answered) in &cases {
+    for (case, query, expected) in &cases {
+        let answered = expected.as_ref().map(Vec::len);
         for as_written in [false, true] {
             let (outcome, peak) = run(&engine, query, as_written);
             let case = format!("{case}, as_written={as_written}");
@@ -292,10 +371,19 @@ fn what_the_query_text_multiplies_draws_from_the_query_budget() {
                 Err(QueryEvaluationError::MemoryLimit(_)) => None,
                 other => Some(other.map_err(|e| e.to_string())),
             };
-            if outcome != (*answered).map(Ok) {
+            if outcome != answered.map(Ok) {
                 failed.push(format!(
                     "{case}: {outcome:?}, not {answered:?} (None: the memory error)"
                 ));
+            } else if let Some(expected) = expected {
+                let mut expected = expected.clone();
+                expected.sort();
+                match answers(&engine, query, as_written, Some(LIMIT)) {
+                    Ok(got) => {
+                        failed.extend(difference(&got, &expected).map(|d| format!("{case}: {d}")))
+                    }
+                    Err(error) => failed.push(format!("{case}: {error}, unmeasured")),
+                }
             }
             if peak > LIMIT + BOOKKEEPING {
                 failed.push(format!(
@@ -303,6 +391,54 @@ fn what_the_query_text_multiplies_draws_from_the_query_budget() {
                 ));
             }
         }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Spec: SPARQL 1.1 §11.2: grouping on `?s ?s` partitions as grouping on `?s`, so a key the
+/// query names 256 times is one key, and what the grouping holds per row grows with the
+/// distinct keys, not with the text (PR #89 review r1, R89-1). Two projected subqueries
+/// sharing no variable, `{ SELECT ?s … } { SELECT ?a … }`, over the 4,096 statements
+/// `ex:s<i> ex:p ex:o<i>`, grouped by 256 times `?s`, count their 16 M-row product: with
+/// no limit each subject once, with a count of 4,096 (default path; written as is, the
+/// product is made whole, 256 MiB). Under 1 MiB the product does not fit: refused with
+/// `MemoryLimit`, the query's thread holding at most the limit and its bookkeeping (a key
+/// of 256 ids per row would be 8 MiB). On the default path and as written alike.
+#[test]
+fn a_crossed_group_by_a_key_named_again_draws_from_the_query_budget() {
+    let p = ex("p");
+    let engine = engine((0..ROWS).map(|i| {
+        let (subject, object) = (ex(&format!("s{i}")), ex(&format!("o{i}")));
+        Quad::new(subject, p.clone(), object, GraphName::DefaultGraph)
+    }));
+    let keys = vec!["?s"; 256].join(" ");
+    let query = format!(
+        "SELECT ?s (COUNT(*) AS ?count) WHERE {{ \
+         {{ SELECT ?s WHERE {{ ?s <{EX}p> ?o }} }} \
+         {{ SELECT ?a WHERE {{ ?a <{EX}p> ?b }} }} }} GROUP BY {keys}"
+    );
+    let mut failed = Vec::new();
+    for as_written in [false, true] {
+        let (outcome, peak) = run(&engine, &query, as_written);
+        if !matches!(outcome, Err(QueryEvaluationError::MemoryLimit(_))) {
+            failed.push(format!(
+                "as_written={as_written}: {:?}, not the memory error",
+                outcome.map_err(|e| e.to_string())
+            ));
+        }
+        if peak > LIMIT + BOOKKEEPING {
+            failed.push(format!(
+                "as_written={as_written}: held {peak} bytes under a {LIMIT}-byte limit"
+            ));
+        }
+    }
+    let mut expected: Vec<Row> = (0..ROWS)
+        .map(|i| row(&[("s", format!("<{EX}s{i}>")), ("count", integer(ROWS))]))
+        .collect();
+    expected.sort();
+    match answers(&engine, &query, false, None) {
+        Ok(got) => failed.extend(difference(&got, &expected).map(|d| format!("no limit: {d}"))),
+        Err(error) => failed.push(format!("no limit: {error}")),
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
