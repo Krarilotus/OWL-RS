@@ -8,7 +8,8 @@ file that moved or never landed sends its reader looking for nothing, or buildin
     python3 scripts/check-doc-paths.py FILE...    these files (the changed ones)
 
 Links: inline links (`[text](dest)`, `[text](<dest with spaces> "title")`) and reference
-definitions (`[label]: dest`, which reference-style links use), outside code spans and fenced code.
+definitions (`[label]: dest`, which reference-style links use), in blockquotes too, outside code
+spans and fenced code (a fence ends at a closer of its own character and at least its length).
 A link resolves from its document's directory only, as a renderer resolves it. Link syntax the
 checker can't read (an unterminated `<`, a `](` with no closing `)`, a definition with no
 destination) fails as unsupported rather than passing unread.
@@ -44,7 +45,8 @@ TOP = ("scripts/", "docs/", "crates/", "benches/", "apps/", "tests/", "fixtures/
 SKIPPED_DIRS = ("literature/", "fixtures/")
 TICK = re.compile(r"`([^`\n]+)`(\])?")
 CODE_SPAN = re.compile(r"(`+)(?:(?!\1).)+?\1")
-FENCE = re.compile(r"^ {0,3}(```|~~~)")
+FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+QUOTE = re.compile(r"^ {0,3}> ?")
 DEFINITION = re.compile(r"^ {0,3}\[([^\]^][^\]]*)\]:(.*)$")
 TITLE = re.compile(r"\s*(?:\"[^\"]*\"|'[^']*'|\([^)]*\))?\s*$")
 PLACEHOLDER = re.compile(r"[<>{}*…$|]|\b(NAME|HOST|ID|REV|DIR)\b")
@@ -121,30 +123,49 @@ def destination(text):
     return text[:i], text[i:]
 
 
+def closes(rest):
+    """Whether REST, what follows a destination, is an optional title and then the link's `)`."""
+    rest = rest.lstrip(" \t")
+    if rest[:1] in ('"', "'", "("):
+        end = {'"': '"', "'": "'", "(": ")"}[rest[0]]
+        i = 1
+        while i < len(rest) and rest[i] != end:
+            i += 2 if rest[i] == "\\" else 1
+        if i >= len(rest):
+            return False
+        rest = rest[i + 1:].lstrip(" \t")
+    return rest.startswith(")")
+
+
 def inline_links(line):
-    """Each inline link's destination on LINE (code spans removed), UNSUPPORTED where unreadable."""
+    """Each inline link's destination on LINE, UNSUPPORTED where unreadable. A `](` inside a code
+    span isn't a link; backticks in a destination are part of it."""
+    spans = [m.span() for m in CODE_SPAN.finditer(line)]
     for m in re.finditer(r"\]\(", line):
-        dest, rest = destination(line[m.end():])
-        if dest is UNSUPPORTED:
-            yield UNSUPPORTED
+        if any(start <= m.start() < end for start, end in spans):
             continue
-        close = rest.find(")")
-        if close < 0 or not TITLE.fullmatch(rest[:close]):
+        dest, rest = destination(line[m.end():])
+        if dest is UNSUPPORTED or not closes(rest):
             yield UNSUPPORTED
             continue
         yield dest
 
 
 def links(lines):
-    """(line number, destination) of every link: inline links and reference definitions."""
+    """(line number, destination) of every link: inline links and reference definitions, inside
+    blockquotes too; none inside fenced code (a fence ends at a closer of its own character, at
+    least its length, with nothing after it)."""
     fence = None
     for no, line in enumerate(lines, 1):
+        while QUOTE.match(line):
+            line = QUOTE.sub("", line, count=1)
         opened = FENCE.match(line)
         if fence:
-            if opened and opened.group(1) == fence:
+            if opened and opened.group(1)[0] == fence[0] and len(opened.group(1)) >= len(fence) \
+                    and not opened.group(2).strip():
                 fence = None
             continue
-        if opened:
+        if opened and not (opened.group(1)[0] == "`" and "`" in opened.group(2)):
             fence = opened.group(1)
             continue
         definition = DEFINITION.match(line)
@@ -155,7 +176,7 @@ def links(lines):
             else:
                 yield no, dest
             continue
-        for dest in inline_links(CODE_SPAN.sub(lambda m: " " * len(m.group(0)), line)):
+        for dest in inline_links(line):
             yield no, dest
 
 
