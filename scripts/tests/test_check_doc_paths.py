@@ -96,6 +96,24 @@ class CheckDocPaths(unittest.TestCase):
         self.assertEqual(self.check('[a](guide.md "a ` title") [b](missing.md) tail `\n'), 1)
         self.assertEqual(self.check('[a](guide.md "a ` title") [b](guide.md) tail `\n'), 0)
 
+    # Fix check r1 B1 (P05, P06): a reference definition wherever CommonMark finds one, in a list
+    # item, an ordered one, a list item's blockquote, and with an escaped `]` in its label.
+    def test_a_reference_definition_in_a_container_or_with_an_escape_is_checked(self):
+        for label, missing, existing in [
+            ("list item", "[x][g]\n\n- [g]: definitely-missing-pr92.md\n", "[x][g]\n\n- [g]: guide.md\n"),
+            ("ordered list", "[x][g]\n\n1. [g]: definitely-missing-pr92.md\n", "[x][g]\n\n1. [g]: guide.md\n"),
+            ("list, quote", "[x][g]\n\n- > [g]: definitely-missing-pr92.md\n", "[x][g]\n\n- > [g]: guide.md\n"),
+            ("escaped ]", "[x][a\\]]\n\n[a\\]]: definitely-missing-pr92.md\n", "[x][a\\]]\n\n[a\\]]: guide.md\n"),
+        ]:
+            with self.subTest(label):
+                self.assertEqual(self.check(missing), 1)
+                self.assertEqual(self.check(existing), 0)
+
+    # Fix check r1 (P05, a limitation it named): a raw HTML link is a link too.
+    def test_a_raw_html_link_is_checked(self):
+        self.assertEqual(self.check('<a href="definitely-missing-pr92.md">x</a>\n'), 1)
+        self.assertEqual(self.check('<a href="guide.md">x</a>\n'), 0)
+
     # F4: a title may hold a parenthesis.
     def test_a_title_with_a_parenthesis_is_read(self):
         self.assertEqual(self.check("[x](guide.md (title))\n"), 0)
