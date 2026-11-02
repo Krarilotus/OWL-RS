@@ -288,7 +288,8 @@ mod tests {
     /// without columns, each cut to a limit or not. Beyond its charge it holds no more than
     /// a table's list of columns, which a table's charge leaves out
     /// (`IdTable::memory_bytes`). Each input is charged before it is made, inside the
-    /// measurement.
+    /// measurement, and consuming what it answers releases its own charge, never another
+    /// holder's.
     #[test]
     fn an_expansion_holds_no_more_than_it_charges() {
         if !alone() {
@@ -318,6 +319,10 @@ mod tests {
         let mut options = QueryOptions::default();
         options.resources.memory = envelope.clone();
         let ctx = Context::new(&snapshot, &options, None, None);
+        // Another holder's charge, held across every expansion: more than any input's, so
+        // releasing an input's bytes it never charged shows.
+        let mut other = Reservation::new(&*ctx.budget);
+        other.charge(1 << 20).unwrap();
         // What expanding `rows` rows, each `row`, holds beyond its charge, and the rows it
         // answers.
         let expand = |row: &[u64], rows: usize, limit: Option<usize>| -> (usize, usize) {
@@ -325,6 +330,7 @@ mod tests {
             let vars: Vec<Variable> = (0..width)
                 .map(|i| Variable::new_unchecked(format!("v{i}")))
                 .collect();
+            let before = ctx.budget.used();
             let (expanded, excess) = measure_within(&envelope, || {
                 let mut charged = Reservation::new(&*ctx.budget);
                 charged.charge(rows * width * 8).unwrap();
@@ -344,6 +350,11 @@ mod tests {
             });
             let answered = expanded.table.len();
             ctx.consumed(expanded);
+            assert_eq!(
+                ctx.budget.used(),
+                before,
+                "{width} columns, {rows} rows: consuming the answer moved another holder's charge"
+            );
             (excess, answered)
         };
         for (path, row, per_row) in [
