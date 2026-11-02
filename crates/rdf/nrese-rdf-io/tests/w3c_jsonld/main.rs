@@ -8,16 +8,15 @@
 //! - **toRdf**: the quads must equal the expected N-Quads up to blank node names; a
 //!   negative test must fail with the expected error code. Every document is also read
 //!   through a reader, which must agree.
-//! - **expand**: the expanded document must equal the expected one as JSON-LD compares
-//!   them (arrays are sets, but for `@list`).
+//! - **expand**: the expanded document must equal the expected one by the suite's "JSON-LD
+//!   object comparison" (its README): arrays are sets, but for `@list` and inside a JSON
+//!   literal's (`@type: @json`) value, which is ordinary JSON.
 //! - **fromRdf**: the document the expanded writer makes of the N-Quads must equal the
 //!   expected one, compared the same way.
 //! - **Round trips.** The quads of every toRdf test are written with both JSON-LD writers
 //!   (streaming, compacted with prefixes; and expanded) and read back: the same quads.
 //! - Tests for JSON-LD 1.0 processors only, and tests of generalized RDF (blank node
 //!   predicates, which RDF can't hold), are not run.
-//! - `expected-failures.txt` lists tests that fail on purpose, each with its reason; a new
-//!   failure, or a pass of a listed test, fails the run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -295,8 +294,9 @@ fn from_rdf(root: &Path, test: &Test) -> Result<(), String> {
     }
 }
 
-/// JSON-LD equality of expanded documents: arrays are compared as multisets except the
-/// value of `@list`; numbers by value.
+/// JSON-LD object comparison of expanded documents (the suite's README): members without
+/// regard to their order; arrays as multisets, but the value of `@list` in order; the value
+/// of a JSON literal as ordinary JSON ([`same_json`]); other values by strict equality.
 fn same(a: &Value<'_>, b: &Value<'_>, ordered: bool) -> bool {
     match (a, b) {
         (Value::Array(x), Value::Array(y)) => {
@@ -316,9 +316,31 @@ fn same(a: &Value<'_>, b: &Value<'_>, ordered: bool) -> bool {
             })
         }
         (Value::Object(x), Value::Object(y)) => {
+            let json_literal = x.get("@type").and_then(Value::as_str) == Some("@json");
+            x.len() == y.len()
+                && x.iter().all(|(k, v)| {
+                    y.get(k).is_some_and(|w| match k {
+                        "@value" if json_literal => same_json(v, w),
+                        _ => same(v, w, k == "@list"),
+                    })
+                })
+        }
+        _ => same_json(a, b),
+    }
+}
+
+/// Ordinary JSON equality: arrays in order, object members without regard to their order.
+/// Numbers are strictly equal when their IEEE 754 doubles are: the README's "strict
+/// equality" as its reference processors parse JSON (`1`, `1.0` and `1e0` alike).
+fn same_json(a: &Value<'_>, b: &Value<'_>) -> bool {
+    match (a, b) {
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same_json(p, q))
+        }
+        (Value::Object(x), Value::Object(y)) => {
             x.len() == y.len()
                 && x.iter()
-                    .all(|(k, v)| y.get(k).is_some_and(|w| same(v, w, k == "@list")))
+                    .all(|(k, v)| y.get(k).is_some_and(|w| same_json(v, w)))
         }
         (Value::Number(_), Value::Number(_)) => a.as_f64() == b.as_f64(),
         _ => a == b,
@@ -349,22 +371,6 @@ fn expand(root: &Path, test: &Test) -> Result<(), String> {
     }
 }
 
-fn expected_failures() -> BTreeMap<String, String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/w3c_jsonld/expected-failures.txt");
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
-        .map(|l| {
-            let (id, reason) = l.split_once(' ').unwrap_or((l, ""));
-            (
-                id.to_owned(),
-                reason.trim_start_matches(['#', ' ']).to_owned(),
-            )
-        })
-        .collect()
-}
-
 #[test]
 fn w3c_json_ld_suites() {
     let Some(root) = suite_root() else {
@@ -375,9 +381,8 @@ fn w3c_json_ld_suites() {
         eprintln!("skipped: W3C json-ld-api tests not found (run scripts/fetch-w3c-tests.sh)");
         return;
     };
-    let expected = expected_failures();
-    let mut unexpected = Vec::new();
-    println!("W3C JSON-LD 1.1 suites: passed / failed (expected failures) / not run");
+    let mut failures = Vec::new();
+    println!("W3C JSON-LD 1.1 suites: passed / failed / not run");
     type Runner = fn(&Path, &Test) -> Result<(), String>;
     let suites: [(&str, Runner); 3] = [
         ("toRdf-manifest.jsonld", to_rdf),
@@ -387,7 +392,7 @@ fn w3c_json_ld_suites() {
     for (manifest, runner) in suites {
         let tests = read_manifest(&root, manifest);
         assert!(!tests.is_empty(), "no tests in {manifest}");
-        let (mut passed, mut failed, mut known, mut not_run) = (0, 0, 0, 0);
+        let (mut passed, mut failed, mut not_run) = (0, 0, 0);
         for test in &tests {
             if skipped(test) {
                 not_run += 1;
@@ -403,25 +408,58 @@ fn w3c_json_ld_suites() {
             );
             let outcome = std::panic::catch_unwind(|| runner(&root, test))
                 .unwrap_or_else(|_| Err("panicked".to_owned()));
-            match (outcome, expected.contains_key(&test.id)) {
-                (Ok(()), false) => passed += 1,
-                (Ok(()), true) => unexpected.push(format!("passes, but is listed: {}", test.id)),
-                (Err(_), true) => {
+            match outcome {
+                Ok(()) => passed += 1,
+                Err(why) => {
                     failed += 1;
-                    known += 1;
-                }
-                (Err(why), false) => {
-                    failed += 1;
-                    unexpected.push(format!("{}: {why}", test.id));
+                    failures.push(format!("{}: {why}", test.id));
                 }
             }
         }
-        println!("  {manifest}: {passed} / {failed} ({known}) / {not_run}");
+        println!("  {manifest}: {passed} / {failed} / {not_run}");
     }
     assert!(
-        unexpected.is_empty(),
-        "{} unexpected:\n{}",
-        unexpected.len(),
-        unexpected.join("\n")
+        failures.is_empty(),
+        "{} failed:\n{}",
+        failures.len(),
+        failures.join("\n")
     );
+}
+
+/// The suite's JSON-LD object comparison: a property's values are a set; `@list` and a JSON
+/// literal's value, at any depth, are in order; members in any order; numbers as doubles.
+#[test]
+fn comparison_keeps_the_order_of_lists_and_json_literals() {
+    for (a, b, equal) in [
+        (
+            r#"[{"http://e/p": [{"@value": 1}, {"@value": 2}]}]"#,
+            r#"[{"http://e/p": [{"@value": 2}, {"@value": 1}]}]"#,
+            true,
+        ),
+        (
+            r#"[{"http://e/p": [{"@list": [{"@value": 1}, {"@value": 2}]}]}]"#,
+            r#"[{"http://e/p": [{"@list": [{"@value": 2}, {"@value": 1}]}]}]"#,
+            false,
+        ),
+        (
+            r#"{"@type": "@json", "@value": [1, 2]}"#,
+            r#"{"@type": "@json", "@value": [2, 1]}"#,
+            false,
+        ),
+        (
+            r#"{"@value": {"k": [1, [2, 3]]}, "@type": "@json"}"#,
+            r#"{"@type": "@json", "@value": {"k": [1, [3, 2]]}}"#,
+            false,
+        ),
+        (
+            r#"{"@type": "@json", "@value": {"a": 1, "b": 1.0}}"#,
+            r#"{"@value": {"b": 1e0, "a": 1}, "@type": "@json"}"#,
+            true,
+        ),
+        (r#"{"@value": 1}"#, r#"{"@value": 2}"#, false),
+    ] {
+        let (x, y) = (Value::parse(a).unwrap(), Value::parse(b).unwrap());
+        assert_eq!(same(&x, &y, false), equal, "{a} against {b}");
+        assert_eq!(same(&y, &x, false), equal, "{b} against {a}");
+    }
 }
