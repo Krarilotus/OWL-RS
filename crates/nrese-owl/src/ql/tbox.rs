@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::hazards::Hazard;
+use super::witness::Work;
 use super::{Atom, Cq};
 use crate::mapping::Ontology;
 use crate::model::{Axiom, Characteristic, ClassExpr, ExprId, ObjProp, Term};
@@ -86,8 +87,12 @@ pub struct Tbox {
     /// individuals, their classes, and classes with alternatives.
     rewritable: HashSet<Term>,
     /// [`Self::class_alternatives`] per class, as queries ask for them.
-    alternatives: std::sync::RwLock<HashMap<Term, Option<Vec<Basic>>>>,
+    alternatives: std::sync::RwLock<HashMap<Term, Alternatives>>,
 }
+
+/// A class's alternatives ([`Tbox::class_alternatives`]), with the steps of work computing
+/// them took.
+type Alternatives = (Option<Vec<Basic>>, usize);
 
 /// What makes an anonymous element's type: the role that reached it, its filler, and
 /// whether it is a data value.
@@ -276,86 +281,109 @@ impl Tbox {
         out
     }
 
-    /// The basic concepts below `target` (itself included).
-    pub(crate) fn below(&self, target: u32) -> Vec<u32> {
-        reach(&self.down, [target])
-    }
-
     /// The alternatives an atom `class(t)` gets over the closure: the classes and
     /// existentials below it whose instances the materialisation doesn't already make
     /// instances of another alternative. `None` if there is nothing to add.
-    pub(crate) fn class_alternatives(&self, class: Term) -> Option<Vec<Basic>> {
+    ///
+    /// The walks it takes are paid from `work`, the same steps whether the class's
+    /// alternatives were memoised or not (so a query's outcome doesn't depend on the ones
+    /// before it); `Err(())` once there are none left, and then nothing is memoised.
+    pub(crate) fn class_alternatives(
+        &self,
+        class: Term,
+        work: &Work,
+    ) -> Result<Option<Vec<Basic>>, ()> {
         let known = self.alternatives.read().unwrap_or_else(|p| p.into_inner());
-        if let Some(alternatives) = known.get(&class) {
-            return alternatives.clone();
+        if let Some((alternatives, steps)) = known.get(&class) {
+            return if work.take(*steps) {
+                Ok(alternatives.clone())
+            } else {
+                Err(())
+            };
         }
         drop(known);
-        let alternatives = self.compute_class_alternatives(class);
+        let before = work.left();
+        let alternatives = self.compute_class_alternatives(class, work)?;
         self.alternatives
             .write()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(class, alternatives.clone());
-        alternatives
+            .insert(class, (alternatives.clone(), before - work.left()));
+        Ok(alternatives)
     }
 
-    fn compute_class_alternatives(&self, class: Term) -> Option<Vec<Basic>> {
+    fn compute_class_alternatives(
+        &self,
+        class: Term,
+        work: &Work,
+    ) -> Result<Option<Vec<Basic>>, ()> {
         if !self.gaps && self.generators.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let id = self.id(Basic::Class(class))?;
-        let below = self.below(id);
+        let Some(id) = self.id(Basic::Class(class)) else {
+            return Ok(None);
+        };
+        let below = reach_paid(&self.down, [id], work)?;
         // What the materialisation already puts in the class needs no alternative.
-        let covered: HashSet<u32> = reach(&self.base_down, [id]).into_iter().collect();
+        let covered: HashSet<u32> = reach_paid(&self.base_down, [id], work)?
+            .into_iter()
+            .collect();
         if below.len() == covered.len() {
-            return None;
+            return Ok(None);
         }
         let candidates = below
             .into_iter()
             .filter(|b| *b == id || !covered.contains(b))
             .collect();
-        let alternatives = self.minimal(candidates);
-        (alternatives != [Basic::Class(class)]).then_some(alternatives)
+        let alternatives = self.minimal(candidates, work)?;
+        Ok((alternatives != [Basic::Class(class)]).then_some(alternatives))
     }
 
     /// Whether every instance of `class` generates one of the generating axioms `axioms`:
-    /// the class is below one of their left sides.
-    pub(crate) fn generates(&self, class: Term, axioms: &[usize]) -> bool {
+    /// the class is below one of their left sides. The walk is paid from `work`.
+    pub(crate) fn generates(&self, class: Term, axioms: &[usize], work: &Work) -> Result<bool, ()> {
         let Some(id) = self.id(Basic::Class(class)) else {
-            return false;
+            return Ok(false);
         };
-        let above = reach(&self.up, [id]);
-        axioms
+        let above: HashSet<u32> = reach_paid(&self.up, [id], work)?.into_iter().collect();
+        if !work.take(axioms.len()) {
+            return Err(());
+        }
+        Ok(axioms
             .iter()
-            .any(|&g| above.contains(&self.generators[g].left))
+            .any(|&g| above.contains(&self.generators[g].left)))
     }
 
     /// The alternatives for a root that generates any of the generating axioms `axioms`:
     /// the basic concepts below their left sides, minimised as in
-    /// [`Self::class_alternatives`].
+    /// [`Self::class_alternatives`]. The walks are paid from `work`.
     pub(crate) fn generator_alternatives(
         &self,
-        axioms: impl IntoIterator<Item = usize>,
-    ) -> Vec<Basic> {
-        let lefts: Vec<u32> = axioms
-            .into_iter()
-            .map(|g| self.generators[g].left)
-            .collect();
-        self.minimal(reach(&self.down, lefts))
+        axioms: &[usize],
+        work: &Work,
+    ) -> Result<Vec<Basic>, ()> {
+        if !work.take(axioms.len()) {
+            return Err(());
+        }
+        let lefts: Vec<u32> = axioms.iter().map(|&g| self.generators[g].left).collect();
+        let below = reach_paid(&self.down, lefts, work)?;
+        self.minimal(below, work)
     }
 
     /// The members of `set` a named individual can be stated to be (classes and
     /// existentials), leaving out those whose instances the materialisation makes
-    /// instances of another member (one of each set of equivalent ones kept).
-    fn minimal(&self, set: Vec<u32>) -> Vec<Basic> {
+    /// instances of another member (one of each set of equivalent ones kept). Each
+    /// member's walk is paid from `work`, and so is reading what they reach.
+    fn minimal(&self, set: Vec<u32>, work: &Work) -> Result<Vec<Basic>, ()> {
         let set: Vec<u32> = set
             .into_iter()
             .filter(|&id| matches!(self.basic(id), Basic::Class(_) | Basic::Exists(_)))
             .collect();
         let members: HashSet<u32> = set.iter().copied().collect();
-        let above: HashMap<u32, HashSet<u32>> = set
-            .iter()
-            .map(|&id| (id, reach(&self.base_up, [id]).into_iter().collect()))
-            .collect();
+        let mut above: HashMap<u32, HashSet<u32>> = HashMap::new();
+        for &id in &set {
+            let reached = reach_paid(&self.base_up, [id], work)?;
+            above.insert(id, reached.into_iter().collect());
+        }
         let mut kept: Vec<Basic> = set
             .iter()
             .filter(|&&id| {
@@ -368,8 +396,33 @@ impl Tbox {
             .map(|&id| self.basic(id))
             .collect();
         kept.sort();
-        kept
+        Ok(kept)
     }
+}
+
+/// [`reach`], a step of `work` for each element it reaches and each edge it reads from
+/// one; `Err(())` once there are none left.
+fn reach_paid(
+    edges: &[Vec<u32>],
+    start: impl IntoIterator<Item = u32>,
+    work: &Work,
+) -> Result<Vec<u32>, ()> {
+    let mut seen = HashSet::new();
+    let mut queue: VecDeque<u32> = start.into_iter().filter(|&s| seen.insert(s)).collect();
+    let mut out = Vec::new();
+    while let Some(id) = queue.pop_front() {
+        let next = &edges[id as usize];
+        if !work.take(1 + next.len()) {
+            return Err(());
+        }
+        out.push(id);
+        for &next in next {
+            if seen.insert(next) {
+                queue.push_back(next);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Everything reachable from `start` along `edges`, `start` included.

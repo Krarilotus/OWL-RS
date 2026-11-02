@@ -176,6 +176,11 @@ fn rewrite_within(
     if tbox.is_empty() {
         return Outcome::Unchanged;
     }
+    // Every pass below is paid from `work` before it reads the query (review A-1206): with
+    // none left, nothing is read.
+    if work.exhausted() {
+        return Outcome::Exceeded("work");
+    }
     let mut witnesses = match tree_witnesses(tbox, cq, limits.witnesses, limits.candidates, work) {
         Ok(witnesses) => witnesses,
         Err(bound) => return Outcome::Exceeded(bound),
@@ -192,7 +197,10 @@ fn rewrite_within(
         let mut gone: HashSet<usize> = HashSet::new();
         let mut kept: HashSet<usize> = HashSet::new();
         for witness in &witnesses {
-            let Some(because) = implied(tbox, &reduced, witness) else {
+            let Ok(because) = implied(tbox, &reduced, witness, work) else {
+                return Outcome::Exceeded("work");
+            };
+            let Some(because) = because else {
                 continue;
             };
             if witness
@@ -207,6 +215,9 @@ fn rewrite_within(
         }
         if gone.is_empty() {
             break;
+        }
+        if !work.take(reduced.atoms.len()) {
+            return Outcome::Exceeded("work");
         }
         let atoms = reduced
             .atoms
@@ -229,41 +240,67 @@ fn rewrite_within(
     // Each witness's fold once, for every branch it is in; the witnesses the data has
     // wherever they fold go.
     let mut folds: Vec<Vec<Basic>> = Vec::new();
-    witnesses.retain(|w| {
-        let fold = tbox.generator_alternatives(w.generators.iter().copied());
+    let mut kept = Vec::new();
+    for w in witnesses {
+        // Paid before the data is asked: a fold the work cuts short asks nothing.
+        let Ok(fold) = tbox.generator_alternatives(&w.generators, work) else {
+            return Outcome::Exceeded("work");
+        };
+        if !work.take(w.roots.len() + w.atoms.len()) {
+            return Outcome::Exceeded("work");
+        }
         let root = w
             .roots
             .iter()
             .copied()
             .find(|t| matches!(t, QTerm::Const(_)))
             .unwrap_or(QTerm::Var(cq.vars));
+        let roots: HashSet<QTerm> = w.roots.iter().copied().collect();
         let probe = Probe {
             atoms: w
                 .atoms
                 .iter()
-                .map(|&i| cq.atoms[i].map(&|t| if w.roots.contains(&t) { root } else { t }))
+                .map(|&i| cq.atoms[i].map(&|t| if roots.contains(&t) { root } else { t }))
                 .collect(),
             root,
             alternatives: &fold,
         };
         if !fold.is_empty() && realised(&probe) {
-            return false;
+            continue;
         }
         folds.push(fold);
-        true
-    });
-    let existential = (0..cq.vars)
-        .filter(|&v| cq.existential[v as usize] && cq.atoms.iter().any(|a| a.has_var(v)))
+        kept.push(w);
+    }
+    let witnesses = kept;
+    // The existential variables an atom has, in one pass.
+    if !work.take(cq.atoms.len() + cq.vars as usize) {
+        return Outcome::Exceeded("work");
+    }
+    let mut used = vec![false; cq.vars as usize];
+    for atom in &cq.atoms {
+        for v in atom.vars() {
+            used[v as usize] = true;
+        }
+    }
+    let existential = (0..cq.vars as usize)
+        .filter(|&v| cq.existential[v] && used[v])
         .count();
     if existential > limits.existential_vars {
         return Outcome::Exceeded("existential variables");
     }
+    // Each class atom's alternatives (memoised, paid alike: `Tbox::class_alternatives`).
+    if !work.take(cq.atoms.len()) {
+        return Outcome::Exceeded("work");
+    }
     let mut alternatives: HashMap<Term, Option<Vec<Basic>>> = HashMap::new();
     for atom in &cq.atoms {
-        if let Atom::Class(_, class) = atom {
-            alternatives
-                .entry(*class)
-                .or_insert_with(|| tbox.class_alternatives(*class));
+        if let Atom::Class(_, class) = atom
+            && !alternatives.contains_key(class)
+        {
+            let Ok(found) = tbox.class_alternatives(*class, work) else {
+                return Outcome::Exceeded("work");
+            };
+            alternatives.insert(*class, found);
         }
     }
     if witnesses.is_empty() && alternatives.values().all(Option::is_none) {
@@ -286,6 +323,7 @@ fn rewrite_within(
         cq,
         alternatives: &alternatives,
         next: cq.vars,
+        work,
     };
     let mut branches = Vec::new();
     let mut size = 0;
@@ -294,7 +332,10 @@ fn rewrite_within(
             .iter()
             .map(|&i| (&witnesses[i], folds[i].as_slice()))
             .collect();
-        if let Some(branch) = builder.branch(&chosen) {
+        let Ok(branch) = builder.branch(&chosen) else {
+            return Outcome::Exceeded("work");
+        };
+        if let Some(branch) = branch {
             size += branch.size();
             if size > limits.size {
                 return Outcome::Exceeded("size");
@@ -313,16 +354,24 @@ fn rewrite_within(
 
 /// The atom of `cq` that implies `witness`, if one does: the witness has one root, and the
 /// atom states the root to be of a class below the left side of an axiom that generates
-/// it.
-fn implied(tbox: &Tbox, cq: &Cq, witness: &TreeWitness) -> Option<usize> {
+/// it. A step per atom read and the walks, from `work`; `Err(())` once it runs out.
+fn implied(tbox: &Tbox, cq: &Cq, witness: &TreeWitness, work: &Work) -> Result<Option<usize>, ()> {
     let [root] = witness.roots[..] else {
-        return None;
+        return Ok(None);
     };
-    cq.atoms.iter().enumerate().position(|(i, atom)| {
-        matches!(atom, Atom::Class(t, class) if *t == root
-            && !witness.atoms.contains(&i)
-            && tbox.generates(*class, &witness.generators))
-    })
+    if !work.take(cq.atoms.len()) {
+        return Err(());
+    }
+    for (i, atom) in cq.atoms.iter().enumerate() {
+        if let Atom::Class(t, class) = atom
+            && *t == root
+            && witness.atoms.binary_search(&i).is_err()
+            && tbox.generates(*class, &witness.generators, work)?
+        {
+            return Ok(Some(i));
+        }
+    }
+    Ok(None)
 }
 
 /// Every set of witnesses whose atoms are disjoint (the empty set first); `None` past
@@ -342,7 +391,9 @@ fn independent_sets(
         limit: usize,
     ) -> bool {
         out.push(current.clone());
-        if out.len() > limit || !work.spend() {
+        // A step for the set, and one for each atom of the witnesses it reads to grow it.
+        let read: usize = witnesses[from..].iter().map(|w| w.atoms.len()).sum();
+        if out.len() > limit || !work.take(1 + read) {
             return false;
         }
         for i in from..witnesses.len() {
@@ -379,6 +430,8 @@ struct Build<'a> {
     cq: &'a Cq,
     alternatives: &'a HashMap<Term, Option<Vec<Basic>>>,
     next: u32,
+    /// A branch takes a step per atom and alternative it writes, and per root it merges.
+    work: &'a Work,
 }
 
 impl Build<'_> {
@@ -389,16 +442,22 @@ impl Build<'_> {
 
     /// The branch of the witnesses `chosen`, each with its fold (the basic concepts its root
     /// may be stated to be); `None` if it can't match (roots on two constants, or a witness
-    /// no named individual generates).
-    fn branch(&mut self, chosen: &[(&TreeWitness, &[Basic])]) -> Option<Branch> {
+    /// no named individual generates); `Err(())` once the work runs out.
+    fn branch(&mut self, chosen: &[(&TreeWitness, &[Basic])]) -> Result<Option<Branch>, ()> {
         let cq = self.cq;
         // The roots of each witness are one individual.
         let mut classes: Vec<Vec<QTerm>> = Vec::new();
         for (witness, _) in chosen.iter().filter(|(w, _)| !w.roots.is_empty()) {
+            let merged: usize = classes.iter().map(Vec::len).sum();
+            if !self.work.take(witness.roots.len() + merged) {
+                return Err(());
+            }
             let mut class: Vec<QTerm> = witness.roots.clone();
+            let mut members: HashSet<QTerm> = class.iter().copied().collect();
             classes.retain(|other| {
-                if other.iter().any(|t| class.contains(t)) {
+                if other.iter().any(|t| members.contains(t)) {
                     class.extend(other.iter().copied());
+                    members.extend(other.iter().copied());
                     false
                 } else {
                     true
@@ -416,7 +475,7 @@ impl Build<'_> {
                 .filter(|t| matches!(t, QTerm::Const(_)))
                 .collect();
             if constants.len() > 1 {
-                return None;
+                return Ok(None);
             }
             let representative = constants.first().copied().or_else(|| {
                 class
@@ -437,22 +496,28 @@ impl Build<'_> {
             .flat_map(|(w, _)| w.atoms.iter().copied())
             .collect();
         let mut parts: Vec<Part> = Vec::new();
+        let mut written: HashSet<Part> = HashSet::new();
+        let table = self.alternatives;
         for (i, atom) in cq.atoms.iter().enumerate() {
+            let alternatives = match atom {
+                Atom::Class(_, class) => table[class].as_ref(),
+                _ => None,
+            };
+            if !self.work.take(1 + alternatives.map_or(0, Vec::len)) {
+                return Err(());
+            }
             if covered.contains(&i) {
                 continue;
             }
             let atom = atom.map(&map);
-            let part = match &atom {
-                Atom::Class(t, class) => match &self.alternatives[class] {
-                    Some(alternatives) => {
-                        let fresh = self.fresh();
-                        Part::Any(alternatives.iter().map(|&b| stated(b, *t, fresh)).collect())
-                    }
-                    None => Part::Atom(atom),
-                },
+            let part = match (&atom, alternatives) {
+                (Atom::Class(t, _), Some(alternatives)) => {
+                    let fresh = self.fresh();
+                    Part::Any(alternatives.iter().map(|&b| stated(b, *t, fresh)).collect())
+                }
                 _ => Part::Atom(atom),
             };
-            if !parts.contains(&part) {
+            if written.insert(part.clone()) {
                 parts.push(part);
             }
         }
@@ -462,7 +527,10 @@ impl Build<'_> {
                 None => QTerm::Var(self.fresh()),
             };
             if fold.is_empty() {
-                return None;
+                return Ok(None);
+            }
+            if !self.work.take(fold.len()) {
+                return Err(());
             }
             let fresh = self.fresh();
             parts.push(Part::Any(
@@ -477,7 +545,7 @@ impl Build<'_> {
             })
             .collect();
         merged.sort();
-        Some(Branch { parts, merged })
+        Ok(Some(Branch { parts, merged }))
     }
 }
 
