@@ -34,9 +34,9 @@ pub mod term;
 pub use durability::checkpoint::image_revision;
 pub use durability::{DurabilityConfig, SyncPolicy};
 pub use engine::{
-    BulkLoad, BulkMode, CommitSummary, Content, Engine, EngineConfig, EngineStats, EqualityClasses,
-    HeavyGroups, ImageInfo, InferredMask, InferredSubset, LogBatch, ProbeCursor, ReadModel,
-    Rematerialisation, Seek, Snapshot, SnapshotIdentity, Transaction,
+    BulkLoad, BulkMode, CommitSummary, Content, Count, Engine, EngineConfig, EngineStats,
+    EqualityClasses, HeavyGroups, ImageInfo, InferredMask, InferredSubset, LogBatch, ProbeCursor,
+    ReadModel, Rematerialisation, Seek, Snapshot, SnapshotIdentity, Transaction,
 };
 pub use error::{EngineError, EngineResult};
 pub use index::cursor::SeekStats;

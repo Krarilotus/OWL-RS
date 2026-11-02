@@ -22,9 +22,11 @@ import tempfile
 import time
 import unittest
 
+import isolation
+
 ROOT = Path(__file__).resolve().parents[3]
 BASH = shutil.which("bash")
-GB = 1024 * 1024  # kB
+GB =1024 * 1024  # kB
 
 
 def owned(command, **popen):
@@ -112,7 +114,7 @@ class Admission(unittest.TestCase):
         (self.root / "meminfo").write_text(f"MemTotal: {64 * GB} kB\nMemFree: {gb * GB} kB\n")
 
     def env(self, run, **env):
-        base = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "NRESE_", "CARGO_", "FLEET_"))}
+        base = isolation.inherit("NRESE_", "CARGO_", "FLEET_")
         merged = {**base, "HOME": str(self.root), "PATH": f"{self.stubs}{os.pathsep}{os.environ['PATH']}",
                 "OUT": str(self.out), "RUN": run, "GUARD": str(self.guard),
                 "NRESE_BUILD_SLOT_DIR": str(self.root / "slots"), "NRESE_GUARD_BUSY": str(self.guard / "BUSY"),
@@ -126,8 +128,11 @@ class Admission(unittest.TestCase):
         return {k: v for k, v in merged.items() if v is not None}
 
     def start(self, run, stderr=subprocess.DEVNULL, **env):
+        # What a build says, whatever the host's language: PowerShell's own errors come in the
+        # console's code page, which the locale's encoding may not decode (a German Windows's), and a
+        # failed decode left `communicate` with no stderr at all.
         build, end = owned([BASH, "scripts/cargo-guarded.sh", "build"], cwd=self.repo, env=self.env(run, **env),
-                           stdout=subprocess.DEVNULL, stderr=stderr, text=True)
+                           stdout=subprocess.DEVNULL, stderr=stderr, text=True, encoding="utf-8", errors="replace")
         self.addCleanup(end)
         return build
 
