@@ -9,6 +9,9 @@
 //! other entities and prefixes declared outside the fragment give `None`: the caller
 //! doesn't know the value.
 
+/// The namespace the `xml` prefix is bound to (Namespaces in XML 1.0 §3).
+const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+
 /// The canonical form of the fragment `text`, if it is well-formed and decided here.
 pub fn canonical(text: &str) -> Option<String> {
     let mut p = Parser {
@@ -144,7 +147,8 @@ impl Parser<'_> {
                     let c = self.reference()?;
                     self.escape_text(c);
                 }
-                Some(b'>') if self.starts("]]>") => return None,
+                // Raw `]]>` outside a CDATA section is not character data (XML 1.0 §2.4).
+                Some(b']') if self.starts("]]>") => return None,
                 Some(_) => {
                     let c = self.char()?;
                     self.escape_text(c);
@@ -199,7 +203,10 @@ impl Parser<'_> {
             if attribute == "xmlns" || attribute.starts_with("xmlns:") {
                 let prefix = attribute.strip_prefix("xmlns").unwrap_or("");
                 let prefix = prefix.strip_prefix(':').unwrap_or(prefix).to_owned();
-                if declarations.iter().any(|(p, _)| *p == prefix) {
+                // `xml` is bound to its namespace, and nothing else is (Namespaces §3).
+                if declarations.iter().any(|(p, _)| *p == prefix)
+                    || (prefix == "xml") != (value == XML_NAMESPACE)
+                {
                     return None;
                 }
                 declarations.push((prefix, value));
@@ -254,6 +261,13 @@ impl Parser<'_> {
             keyed.push((ns, local, a, v));
         }
         keyed.sort();
+        // Attributes Unique (Namespaces §6.3): by expanded name, so neighbours once sorted.
+        if keyed
+            .windows(2)
+            .any(|w| (&w[0].0, &w[0].1) == (&w[1].0, &w[1].1))
+        {
+            return None;
+        }
         self.out.push('<');
         self.out.push_str(&name);
         for (prefix, iri) in &rendered {
@@ -297,7 +311,11 @@ impl Parser<'_> {
             .map(|(_, iri)| iri.clone())
     }
 
+    /// The namespace IRI `prefix` is bound to; `xml`'s binding needs no declaration.
     fn lookup(&self, prefix: &str) -> Option<String> {
+        if prefix == "xml" {
+            return Some(XML_NAMESPACE.to_owned());
+        }
         self.scopes
             .iter()
             .rev()
