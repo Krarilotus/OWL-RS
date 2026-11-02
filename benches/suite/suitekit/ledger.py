@@ -69,6 +69,21 @@ def dump(record: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+# The reset of 25 Oct 2026: refactor/engine-v2 started again from 59e5e24c and takes the earlier lines'
+# work package by package (Harness notes, Sol-line integration). A record started before it measured an
+# engine the current line doesn't continue as it was: its results stay, as history, marked wherever they
+# are shown, never read as the current engine's; the v1.6 baseline measures the current one whole.
+RESET_DATE, RESET_BASE = "2026-10-25", "59e5e24c"
+PRE_RESET = "†"
+PRE_RESET_NOTE = (f"{PRE_RESET} before the reset of 25 Oct 2026 (engine-v2 re-based on {RESET_BASE}): history, "
+                  "not the current engine's result")
+
+
+def pre_reset(record: dict) -> bool:
+    """Whether the record was started before the reset (RESET_DATE); one without a start date is."""
+    return str(record.get("started", ""))[:10] < RESET_DATE
+
+
 def load_records(runs_dir: Path) -> list[dict]:
     records = []
     for path in sorted(runs_dir.glob("*.toml")):
