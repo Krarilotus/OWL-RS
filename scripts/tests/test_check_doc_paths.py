@@ -84,6 +84,16 @@ class CheckDocPaths(unittest.TestCase):
         self.assertEqual(self.check("[x](`missing.md`)\n"), 1)
         self.assertEqual(self.check("`[x](missing.md)` is code\n"), 0)
 
+    # Fix-round sol-loop r2 F5: a fence inside a blockquote ends with the quote (GFM example 98).
+    def test_a_link_after_a_quoted_fence_is_checked(self):
+        self.assertEqual(self.check("> ```\n> sample\n\n[x](missing.md)\n"), 1)
+        self.assertEqual(self.check("> ```\n> sample\n\n[x](guide.md)\n"), 0)
+
+    # F6: a backtick in a title doesn't open a code span that hides the next link (GFM 6.6).
+    def test_a_backtick_in_a_title_hides_no_link(self):
+        self.assertEqual(self.check('[a](guide.md "a ` title") [b](missing.md) tail `\n'), 1)
+        self.assertEqual(self.check('[a](guide.md "a ` title") [b](guide.md) tail `\n'), 0)
+
     # F4: a title may hold a parenthesis.
     def test_a_title_with_a_parenthesis_is_read(self):
         self.assertEqual(self.check("[x](guide.md (title))\n"), 0)
