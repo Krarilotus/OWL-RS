@@ -19,6 +19,13 @@ pub enum EngineError {
     UnsupportedTerm,
     #[error("the write-ahead log failed earlier; reopen the engine to recover")]
     WalPoisoned,
+    /// A bulk load or rematerialisation whose checkpoint may be on disk without its revision
+    /// being served (its placement's outcome unknown, or it couldn't be mapped): the engine
+    /// takes no more writes, and reopening it recovers whatever is on disk.
+    #[error(
+        "revision {revision} may be committed but isn't served; the engine takes no more writes: reopen it to recover what is on disk"
+    )]
+    CommitUnsettled { revision: u64 },
     #[error("transaction too large for one WAL record ({bytes} bytes); use the bulk loader")]
     TransactionTooLarge { bytes: u64 },
     #[error("data directory {0} is locked by another process")]

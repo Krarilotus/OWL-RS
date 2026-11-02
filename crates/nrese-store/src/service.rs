@@ -154,6 +154,7 @@ impl StoreService {
                         bulk_load_memory: (config.bulk_load_memory_bytes > 0)
                             .then_some(config.bulk_load_memory_bytes),
                         wal_archive: config.wal_archive,
+                        wal_damage: config.wal_damage,
                         ..defaults.durability
                     },
                     ..defaults

@@ -171,6 +171,13 @@ pub const SETTINGS: &[Setting] = &[
         "Keep the WAL segments checkpoints cover, for point-in-time restores (default false).",
     ),
     setting(
+        "store.wal_damage",
+        names::WAL_DAMAGE,
+        Choice(&["refuse", "keep-prefix"]),
+        "Damage in the newest WAL segment that a crash mid-append doesn't leave: refuse to \
+         open, or open with the log up to it, the rest copied to wal-cut/ (default refuse).",
+    ),
+    setting(
         "store.index_encoding",
         names::INDEX_ENCODING,
         Choice(&["fast", "compact"]),

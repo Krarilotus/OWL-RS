@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use nrese_engine::{
     BulkMode, DurabilityConfig, Engine, EngineConfig, EngineError, QuadPattern, SyncPolicy,
-    TermKind,
+    TermKind, WalDamage,
 };
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
@@ -321,6 +321,36 @@ fn cut_copy(dir: &Path, segment: &Path, offset: usize) -> PathBuf {
     dir.join("wal-cut").join(format!("{name}.{offset}"))
 }
 
+/// With the prefix kept (`WalDamage::KeepPrefix`, opted into), damage in record 2 of 4
+/// opens the store at revision 1. Records 2 to 4 are kept byte for byte in the copy, and
+/// the store takes commits again, across a restart.
+#[test]
+fn keeping_the_prefix_opens_up_to_the_damage_and_keeps_the_rest() {
+    let (dir, states, mut bytes) = four_records();
+    let second = frame_starts(&bytes)[1];
+    bytes[second + 20] ^= 0x10;
+    let segment = segments(dir.path())[0].clone();
+    fs::write(&segment, &bytes).unwrap();
+    let keep = EngineConfig {
+        durability: DurabilityConfig {
+            wal_damage: WalDamage::KeepPrefix,
+            ..config().durability
+        },
+        ..config()
+    };
+    let engine = Engine::open(dir.path(), keep.clone()).unwrap();
+    assert_eq!(engine.stats().revision, 1);
+    assert_eq!(contents(&engine), states[0]);
+    assert_eq!(
+        fs::read(cut_copy(dir.path(), &segment, second)).unwrap(),
+        bytes[second..]
+    );
+    let again = commit_all(&engine, &batches(1..2));
+    drop(engine);
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(contents(&engine), again[0]);
+}
+
 #[test]
 fn corruption_before_the_tail_is_an_error_not_data_loss() {
     let dir = tempfile::tempdir().unwrap();
@@ -488,6 +518,7 @@ fn background_checkpoints_bound_the_wal() {
             wal_archive: false,
             recover_until: None,
             recover_until_micros: None,
+            wal_damage: WalDamage::Refuse,
         },
         ..EngineConfig::default()
     };
