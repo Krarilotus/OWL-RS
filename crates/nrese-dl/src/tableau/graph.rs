@@ -220,7 +220,8 @@ pub struct Graph {
     /// node is merged).
     pub merge_deps: Vec<DepSetId>,
     /// By node: the nodes its class holds, itself and those merged into it (read while it
-    /// represents one), so that of two named nodes the smaller class goes into the larger.
+    /// represents one): of two named nodes whose facts a bounded read can't weigh, the smaller
+    /// class goes into the larger (`merge.rs`).
     pub class_sizes: Vec<u32>,
     /// By node: what its creation depended on (a successor's: its at-least fact's).
     pub born: Vec<DepSetId>,
@@ -748,6 +749,47 @@ impl Graph {
                 let i = at as usize;
                 at = self.unary[i].next;
                 (!self.dead.unary[i]).then(|| &self.unary[i])
+            })
+        })
+    }
+
+    /// Every entry of `node`'s fact lists, as [`labels`](Self::labels), the negatives, numbers,
+    /// edges out and in and inequalities walk them: a retracted one as `None`, else the node at
+    /// its other end (`NONE` for a concept, negative or number). What a walk of them costs, for a
+    /// caller that bounds it (`merge.rs`).
+    pub fn fact_entries(&self, node: u32) -> impl Iterator<Item = Option<u32>> + '_ {
+        let n = &self.nodes[node as usize];
+        let (mut unary, mut negative, mut number) = (n.label, n.negatives, n.numbers);
+        let (mut out, mut into, mut unequal) = (n.first_out, n.first_in, n.inequalities);
+        std::iter::from_fn(move || {
+            let d = &self.dead;
+            Some(if unary != NONE {
+                let i = unary as usize;
+                unary = self.unary[i].next;
+                (!d.unary[i]).then_some(NONE)
+            } else if negative != NONE {
+                let i = negative as usize;
+                negative = self.negatives[i].next;
+                (!d.negatives[i]).then_some(NONE)
+            } else if number != NONE {
+                let i = number as usize;
+                number = self.numbers[i].next;
+                (!d.numbers[i]).then_some(NONE)
+            } else if out != NONE {
+                let (i, e) = (out as usize, &self.edges[out as usize]);
+                out = e.next_out;
+                (!d.edges[i]).then_some(e.to)
+            } else if into != NONE {
+                let (i, e) = (into as usize, &self.edges[into as usize]);
+                into = e.next_in;
+                (!d.edges[i]).then_some(e.from)
+            } else if unequal != NONE {
+                let (i, f) = (unequal as usize, &self.inequalities[unequal as usize]);
+                let other = if f.a == node { f.b } else { f.a };
+                unequal = if f.a == node { f.next_a } else { f.next_b };
+                (!d.inequalities[i]).then_some(other)
+            } else {
+                return None;
             })
         })
     }
