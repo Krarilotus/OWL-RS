@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use argon2::Argon2;
@@ -216,21 +216,23 @@ impl Default for Argon2Gate {
     }
 }
 
-/// The hash a user name without a login is checked against: the work of a check, which
-/// no password passes in practice (made from random bytes).
-fn dummy_hash() -> &'static str {
-    static DUMMY: OnceLock<String> = OnceLock::new();
-    DUMMY.get_or_init(|| {
-        let mut bytes = [0u8; 32];
-        // Without randomness, zeros: it only has to cost what a check costs.
-        let _ = getrandom::fill(&mut bytes);
-        let text: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        hash_password(&text).unwrap_or_default()
-    })
+/// The hash a user name without a login is checked against: a PHC string with
+/// [`hash_password`]'s algorithm and parameters, so checking it is the work of a check,
+/// and a random salt and output, which no known password was hashed to. Fixed, so no
+/// login makes it first (that extra hash told a missing name from a wrong password,
+/// PR #80 review R80-1).
+const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$8JmJzvxTKI3MtmVdVMLZEQ$raTfQ5S6+jmfK261pBbtAolYcPmAsCVPGL/guuFDyx8";
+
+#[cfg(test)]
+thread_local! {
+    /// Argon2 runs on this thread so far, (hashes, checks): the work a test sees a login do.
+    static ARGON2_RUNS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// The PHC string of `password` (Argon2id, a random salt).
 pub fn hash_password(password: &str) -> Result<String, AccessError> {
+    #[cfg(test)]
+    ARGON2_RUNS.with(|runs| runs.set((runs.get().0 + 1, runs.get().1)));
     Argon2::default()
         .hash_password(password.as_bytes())
         .map(|hash| hash.to_string())
@@ -239,6 +241,8 @@ pub fn hash_password(password: &str) -> Result<String, AccessError> {
 
 /// Whether `password` is the one `hash` (a PHC string) was made from.
 pub fn verify_password(password: &str, hash: &str) -> bool {
+    #[cfg(test)]
+    ARGON2_RUNS.with(|runs| runs.set((runs.get().0, runs.get().1 + 1)));
     PasswordHash::new(hash).is_ok_and(|parsed| {
         Argon2::default()
             .verify_password(password.as_bytes(), &parsed)
@@ -325,7 +329,7 @@ impl Logins {
         }
         let Some(hash) = state.users.get(user).and_then(|u| u.password_hash.clone()) else {
             // As long as a wrong password takes.
-            self.hashing(|| verify_password(password, dummy_hash()))?;
+            self.hashing(|| verify_password(password, DUMMY_HASH))?;
             self.failed(&pair);
             return Err(refused());
         };
@@ -501,6 +505,48 @@ mod tests {
         logins.login(&state, "alice", PASSWORD, None).unwrap();
         let again = while_held(&logins, || logins.login(&state, "alice", PASSWORD, None));
         assert!(again.is_ok(), "{again:?}");
+    }
+
+    /// A fresh service's first refusal of a name without a login does the work of a wrong
+    /// password, and no more: no hash, and one check against a hash of the same algorithm,
+    /// parameters and lengths (R80-1: that first refusal made the dummy hash, a hash more).
+    /// Work, not time.
+    #[test]
+    fn a_missing_name_s_first_refusal_does_a_wrong_password_s_work() {
+        let state = state();
+        let fresh = logins(1, Duration::from_secs(600));
+        let runs = |login: &dyn Fn() -> Result<Principal, AccessError>| {
+            let before = ARGON2_RUNS.with(std::cell::Cell::get);
+            let refused = login();
+            assert!(
+                matches!(refused, Err(AccessError::Forbidden(_))),
+                "{refused:?}"
+            );
+            let after = ARGON2_RUNS.with(std::cell::Cell::get);
+            (after.0 - before.0, after.1 - before.1)
+        };
+        let missing = runs(&|| fresh.login(&state, "mallory", PASSWORD, None));
+        let wrong = runs(&|| fresh.login(&state, "alice", "wrong", None));
+        assert_eq!(missing, (0, 1), "(hashes, checks) of the missing name");
+        assert_eq!(
+            missing, wrong,
+            "(hashes, checks): missing name, wrong password"
+        );
+        let shape = |phc: &str| -> Vec<String> {
+            phc.split('$')
+                .enumerate()
+                .map(|(at, part)| match at {
+                    0..4 => part.to_owned(),
+                    _ => part.len().to_string(),
+                })
+                .collect()
+        };
+        let alice = state.users["alice"].password_hash.clone().unwrap();
+        assert_eq!(shape(DUMMY_HASH), shape(&alice));
+        assert!(
+            PasswordHash::new(DUMMY_HASH).is_ok(),
+            "the check runs Argon2"
+        );
     }
 
     /// RFC 4231, test case 1.
