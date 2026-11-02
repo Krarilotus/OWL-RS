@@ -271,6 +271,8 @@ impl Wal {
         if self.active_bytes <= SEGMENT_MAGIC.len() as u64 {
             return Ok(());
         }
+        #[cfg(test)]
+        super::fault::check(&super::fault::FAIL_ROTATE, "rotation")?;
         self.active.sync_all()?;
         self.active = create_segment(&self.dir, next_revision, self.magic)?;
         self.active_first_revision = next_revision;
@@ -324,6 +326,8 @@ fn create_segment(dir: &Path, first_revision: u64, magic: &[u8; 8]) -> EngineRes
         .open(&path)?;
     file.write_all(magic)?;
     file.sync_all()?;
+    #[cfg(test)]
+    super::fault::check(&super::fault::FAIL_SEGMENT_PLACED, "segment directory sync")?;
     super::sync_dir(dir)?;
     Ok(OpenOptions::new().append(true).open(&path)?)
 }
