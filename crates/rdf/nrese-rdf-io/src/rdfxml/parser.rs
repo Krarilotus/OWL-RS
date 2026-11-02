@@ -331,14 +331,110 @@ impl<R: BufRead> RdfXmlParser<R> {
         Ok(iri)
     }
 
-    /// An attribute's value: entities expanded and whitespace normalised; one allocation
-    /// when there is neither to do.
-    fn attribute_value(&self, raw: &str) -> String {
-        if raw.contains(['&', '\t', '\n', '\r']) {
-            normalize_attribute(&self.expand(raw))
-        } else {
-            raw.to_owned()
+    /// An attribute's value, normalised as XML 1.0 §3.3.3 says: a character reference adds
+    /// its character, an entity reference its replacement text (normalised in turn), and a
+    /// whitespace character a space. One allocation when there is neither to do.
+    fn attribute_value(&self, raw: &str) -> Step<String> {
+        if !raw.contains(['&', '\t', '\n', '\r']) {
+            return Ok(raw.to_owned());
         }
+        let mut out = String::with_capacity(raw.len());
+        self.include(
+            raw,
+            Inclusion::Attribute { raw: true },
+            &mut out,
+            &mut Vec::new(),
+        )?;
+        Ok(out)
+    }
+
+    /// `text` into `out` with its references replaced (XML 1.0 §4.4): in an attribute
+    /// value with whitespace normalised (a line break of the document's own text, CR LF
+    /// included, is one; a character of a replacement text is one each, §2.11), in content
+    /// as it is. A character a reference produces is never read as markup again. `open`:
+    /// the entities being included, which none may include again.
+    fn include<'e>(
+        &'e self,
+        text: &str,
+        inclusion: Inclusion,
+        out: &mut String,
+        open: &mut Vec<&'e str>,
+    ) -> Step<()> {
+        let mut rest = text;
+        loop {
+            let at = match inclusion {
+                Inclusion::Attribute { .. } => rest.find(['&', '\t', '\n', '\r']),
+                Inclusion::Content => rest.find('&'),
+            };
+            let Some(at) = at else {
+                out.push_str(rest);
+                return Ok(());
+            };
+            out.push_str(&rest[..at]);
+            if rest.as_bytes()[at] != b'&' {
+                out.push(' ');
+                let line_break = matches!(inclusion, Inclusion::Attribute { raw: true })
+                    && rest[at..].starts_with("\r\n");
+                rest = &rest[at + if line_break { 2 } else { 1 }..];
+                continue;
+            }
+            let Some(end) = rest[at..].find(';') else {
+                return Err(self.error("a reference without its ';'"));
+            };
+            let name = &rest[at + 1..at + end];
+            rest = &rest[at + end + 1..];
+            match name.strip_prefix('#') {
+                Some(code) => out.push(self.character(code)?),
+                None => self.entity(name, inclusion, out, open)?,
+            }
+        }
+    }
+
+    /// The replacement of the entity reference `&name;` into `out` (see
+    /// [`RdfXmlParser::include`]).
+    fn entity<'e>(
+        &'e self,
+        name: &str,
+        inclusion: Inclusion,
+        out: &mut String,
+        open: &mut Vec<&'e str>,
+    ) -> Step<()> {
+        if let Some(value) = predefined(name) {
+            out.push_str(value);
+            return Ok(());
+        }
+        let Some((name, replacement)) = self.entities.get_key_value(name) else {
+            return Err(self.error(format!("an undeclared entity &{name};")));
+        };
+        if open.contains(&name.as_str()) {
+            return Err(self.error(format!("the entity &{name}; includes itself")));
+        }
+        if open.len() >= MAX_ENTITY_NESTING {
+            return Err(self.error(format!("entities nested deeper than {MAX_ENTITY_NESTING}")));
+        }
+        open.push(name);
+        let inclusion = match inclusion {
+            Inclusion::Attribute { .. } => Inclusion::Attribute { raw: false },
+            Inclusion::Content => Inclusion::Content,
+        };
+        self.include(replacement, inclusion, out, open)?;
+        open.pop();
+        Ok(())
+    }
+
+    /// The character of a reference `&#…;` (`code` after the `#`): a legal XML character.
+    fn character(&self, code: &str) -> Step<char> {
+        let (digits, radix) = match code.strip_prefix('x') {
+            Some(hex) => (hex, 16),
+            None => (code, 10),
+        };
+        let valid = !digits.is_empty() && digits.chars().all(|c| c.is_digit(radix));
+        u32::from_str_radix(digits, radix)
+            .ok()
+            .filter(|_| valid)
+            .and_then(char::from_u32)
+            .filter(|&c| is_xml_char(c))
+            .ok_or_else(|| self.error(format!("an invalid character reference &#{code};")))
     }
 
     /// An IRI reference resolved against the base in scope.
@@ -523,15 +619,9 @@ impl<R: BufRead> RdfXmlParser<R> {
                     Ok(Some(c)) => c.to_string(),
                     Ok(None) => {
                         let name = reference.xml10_content();
-                        match predefined(&name)
-                            .map(str::to_owned)
-                            .or_else(|| self.entities.get(name.as_ref()).cloned())
-                        {
-                            Some(value) => value,
-                            None => {
-                                return Err(self.error(format!("an undeclared entity &{name};")));
-                            }
-                        }
+                        let mut value = String::new();
+                        self.entity(&name, Inclusion::Content, &mut value, &mut Vec::new())?;
+                        value
                     }
                     Err(e) => {
                         return Err(self.error(format!("an invalid character reference: {e}")));
@@ -541,8 +631,7 @@ impl<R: BufRead> RdfXmlParser<R> {
             }
             Event::DocType(doctype) => {
                 let text = doctype.xml10_content().into_owned();
-                self.declare_entities(&text);
-                Ok(())
+                self.declare_entities(&text)
             }
             Event::Eof => {
                 self.broken = true;
@@ -569,8 +658,10 @@ impl<R: BufRead> RdfXmlParser<R> {
         }
     }
 
-    /// `<!ENTITY name "value">` declarations of the internal subset.
-    fn declare_entities(&mut self, doctype: &str) {
+    /// `<!ENTITY name "value">` declarations of the internal subset, each kept as its
+    /// replacement text (XML 1.0 §4.5): character references replaced, entity references
+    /// left for where the entity is included (so they may name entities declared later).
+    fn declare_entities(&mut self, doctype: &str) -> Step<()> {
         let mut rest = doctype;
         while let Some(at) = rest.find("<!ENTITY") {
             rest = &rest[at + 8..];
@@ -587,61 +678,70 @@ impl<R: BufRead> RdfXmlParser<R> {
                 break;
             };
             let raw = &after[1..1 + close];
-            // Earlier entities and character references in the value.
-            let value = self.expand(raw);
+            let value = self.replacement_text(raw)?;
             self.entities.entry(name.to_owned()).or_insert(value);
             rest = &after[1 + close..];
         }
+        Ok(())
     }
 
-    /// Expands `&name;` (declared or predefined) and `&#…;` in `text`.
-    fn expand(&self, text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        let mut rest = text;
+    /// An entity's replacement text from its literal value: character references replaced,
+    /// entity references kept as they are written.
+    fn replacement_text(&self, literal: &str) -> Step<String> {
+        let mut out = String::with_capacity(literal.len());
+        let mut rest = literal;
         while let Some(at) = rest.find('&') {
             out.push_str(&rest[..at]);
             let Some(end) = rest[at..].find(';') else {
-                out.push_str(&rest[at..]);
-                return out;
+                return Err(self.error("a reference without its ';' in an entity's value"));
             };
             let name = &rest[at + 1..at + end];
-            if let Some(code) = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
-                out.extend(u32::from_str_radix(code, 16).ok().and_then(char::from_u32));
-            } else if let Some(code) = name.strip_prefix('#') {
-                out.extend(code.parse().ok().and_then(char::from_u32));
-            } else if let Some(value) = predefined(name)
-                .map(str::to_owned)
-                .or_else(|| self.entities.get(name).cloned())
-            {
-                out.push_str(&value);
-            } else {
-                out.push_str(&rest[at..at + end + 1]);
+            match name.strip_prefix('#') {
+                Some(code) => out.push(self.character(code)?),
+                None if name.is_empty() => {
+                    return Err(self.error("a reference without a name in an entity's value"));
+                }
+                None => out.push_str(&rest[at..at + end + 1]),
             }
             rest = &rest[at + end + 1..];
         }
         out.push_str(rest);
-        out
+        Ok(out)
     }
 
-    /// The namespace declarations of a start tag, entities expanded.
+    /// The namespace declarations of a start tag, their values normalised as attribute
+    /// values. The tag's entry is pushed even when one fails: every open element has one
+    /// (see [`RdfXmlParser::resync`]).
     fn open_namespaces(&mut self, start: &BytesStart<'_>) -> Step<()> {
         let mut declared = Vec::new();
+        let mut failed = None;
         for attribute in start.attributes().with_checks(true) {
-            let attribute =
-                attribute.map_err(|e| self.error(format!("a malformed attribute: {e}")))?;
-            let key: &str = attribute.key.as_ref();
-            let prefix = match key.strip_prefix("xmlns") {
-                Some("") => "",
-                Some(rest) => match rest.strip_prefix(':') {
-                    Some(prefix) => prefix,
-                    None => continue,
-                },
-                None => continue,
-            };
-            declared.push((prefix.to_owned(), Arc::from(self.expand(&attribute.value))));
+            let value = attribute
+                .map_err(|e| self.error(format!("a malformed attribute: {e}")))
+                .and_then(|attribute| {
+                    let key: &str = attribute.key.as_ref();
+                    let prefix = match key.strip_prefix("xmlns") {
+                        Some("") => "",
+                        Some(rest) => match rest.strip_prefix(':') {
+                            Some(prefix) => prefix,
+                            None => return Ok(None),
+                        },
+                        None => return Ok(None),
+                    };
+                    let value = self.attribute_value(&attribute.value)?;
+                    Ok(Some((prefix.to_owned(), Arc::from(value))))
+                });
+            match value {
+                Ok(Some(declaration)) => declared.push(declaration),
+                Ok(None) => {}
+                Err(error) => {
+                    failed = Some(error);
+                    break;
+                }
+            }
         }
         self.namespaces.push(declared);
-        Ok(())
+        failed.map_or(Ok(()), Err)
     }
 
     /// The IRI bound to `prefix` ("" for the default namespace), if any.
@@ -690,7 +790,7 @@ impl<R: BufRead> RdfXmlParser<R> {
             attributes.push(Attribute {
                 namespace,
                 local,
-                value: self.attribute_value(&attribute.value),
+                value: self.attribute_value(&attribute.value)?,
             });
         }
         Ok(Element {
@@ -1176,7 +1276,7 @@ impl<R: BufRead> RdfXmlParser<R> {
             if key_text == "xmlns" || key_text.starts_with("xmlns:") {
                 continue;
             }
-            let value = self.attribute_value(&attribute.value);
+            let value = self.attribute_value(&attribute.value)?;
             let (namespace, local) = match key.prefix() {
                 Some(p) => {
                     let ns = namespace_of(p.as_ref()).unwrap_or_default();
@@ -1391,9 +1491,20 @@ fn predefined(name: &str) -> Option<&'static str> {
     })
 }
 
-/// Attribute-value normalisation (XML 1.0 §3.3.3): whitespace characters become spaces.
-fn normalize_attribute(value: &str) -> String {
-    value.replace(['\t', '\n', '\r'], " ")
+/// Where a replacement text goes (see [`RdfXmlParser::include`]): an attribute value, from
+/// the document's own text (`raw`) or from an entity's replacement text, or content.
+#[derive(Clone, Copy)]
+enum Inclusion {
+    Attribute { raw: bool },
+    Content,
+}
+
+/// How deep entities may include each other: deeper is an error, not a risk to the stack.
+const MAX_ENTITY_NESTING: usize = 64;
+
+/// A character an XML 1.0 document may hold (`Char`, §2.2).
+fn is_xml_char(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..)
 }
 
 /// An XML `NCName` (as `rdf:ID` and `rdf:nodeID` must be).
