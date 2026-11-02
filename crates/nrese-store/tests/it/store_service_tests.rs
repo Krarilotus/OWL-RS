@@ -392,7 +392,7 @@ fn a_cancelled_graph_read_stops() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn a_materialisation_stops_at_the_process_memory_limit() -> Result<(), Box<dyn std::error::Error>> {
     let config = StoreConfig {
-        process_memory_bytes: 1,
+        process_memory_bytes: nrese_store::ProcessMemory::Bytes(1),
         ..StoreConfig::in_memory()
     };
     let store = StoreService::new(config)?;
@@ -412,7 +412,11 @@ fn a_materialisation_stops_at_the_process_memory_limit() -> Result<(), Box<dyn s
     );
     assert!(!error.is_request_error());
     assert!(store.reasoning_state().is_none(), "nothing was applied");
-    // By default the limit is three quarters of what the process may use.
-    assert!(StoreConfig::in_memory().process_memory_bytes > 0);
+    // By default the limit is three quarters of what the process may use, read at open.
+    assert_eq!(
+        StoreConfig::in_memory().process_memory_bytes,
+        nrese_store::ProcessMemory::Default
+    );
+    assert!(StoreService::new(StoreConfig::in_memory())?.process_memory_bytes() > 0);
     Ok(())
 }

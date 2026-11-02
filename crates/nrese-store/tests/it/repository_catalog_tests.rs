@@ -251,7 +251,7 @@ fn a_repository_switches_the_ql_rewriting() {
 #[test]
 fn a_failed_reconfiguration_keeps_the_old_reasoning() {
     let store = StoreService::new(StoreConfig {
-        process_memory_bytes: 1,
+        process_memory_bytes: nrese_store::ProcessMemory::Bytes(1),
         ..StoreConfig::in_memory()
     })
     .expect("store");

@@ -159,6 +159,17 @@ fn unsupported<T>(what: impl Into<String>) -> NativeResult<T> {
     Err(NativeError::Unsupported(what.into()))
 }
 
+/// `count` where it is exact, as an answer needs it; else the engine's range limit as the
+/// query's error, never a capped number (PR #70 fix check 2 F3).
+fn exact_count(count: nrese_engine::Count) -> NativeResult<u64> {
+    count.exact().ok_or_else(|| {
+        QueryEvaluationError::CountBeyondRange {
+            at_least: count.at_least(),
+        }
+        .into()
+    })
+}
+
 type NativeResult<T> = Result<T, NativeError>;
 
 /// Runs `query` on `snapshot` (borrowed from the view, or owned: a transaction's pending
@@ -3441,7 +3452,8 @@ impl<'a> Context<'a> {
 
     /// `COUNT(*)` of a BGP that is cyclic ([`Self::cyclic_patterns`]), by its
     /// worst-case-optimal join counting instead of producing its solutions
-    /// ([`wcoj::Query::count_solutions`]); `None` if it isn't one.
+    /// ([`wcoj::Query::count_solutions`]); `None` if it isn't one. Past what a `u64` holds,
+    /// [`QueryEvaluationError::CountBeyondRange`].
     fn cyclic_count(&self, triples: &[TriplePattern]) -> NativeResult<Option<u64>> {
         if triples
             .iter()
@@ -3471,7 +3483,7 @@ impl<'a> Context<'a> {
             .map(|rows| rows.round() as u64);
         let mut stats = wcoj::Stats::default();
         let count = if counts.contains(&0) {
-            0
+            nrese_engine::Count::Exact(0)
         } else {
             let patterns: Vec<[wcoj::Pos; 3]> = patterns
                 .into_iter()
@@ -3488,11 +3500,12 @@ impl<'a> Context<'a> {
             }
         };
         if self.trace.is_some() {
-            self.wcoj_step(&vars, &stats, estimate, count);
+            self.wcoj_step(&vars, &stats, estimate, count.at_least());
             let detail = triples.iter().map(ToString::to_string).collect::<Vec<_>>();
-            self.note("wcoj", detail.join(" . "), estimate, count as usize, start);
+            let rows = count.at_least() as usize;
+            self.note("wcoj", detail.join(" . "), estimate, rows, start);
         }
-        Ok(Some(count))
+        exact_count(count).map(Some)
     }
 
     /// EXPLAIN's step for a worst-case-optimal join: its variable order with each one's
@@ -3666,7 +3679,7 @@ impl<'a> Context<'a> {
                     .scan_columns_in(self.model, &pattern, permutation, &components)
             {
                 let table = if vars.is_empty() {
-                    let rows = self.snapshot.count_in(self.model, &pattern) as usize;
+                    let rows = exact_count(self.snapshot.count_in(self.model, &pattern))? as usize;
                     IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows))
                 } else {
                     IdTable::from_columns(columns)
@@ -4694,7 +4707,7 @@ impl<'a> Context<'a> {
                 // The index counts quads; in the merged default graph a statement in
                 // several graphs is several quads, so there the scan counts.
                 Some(scan) if !scan.repeats_variable() && !scan.merged() => {
-                    self.snapshot.count_in(self.model, &scan.quad_pattern())
+                    exact_count(self.snapshot.count_in(self.model, &scan.quad_pattern()))?
                 }
                 Some(scan) => self.scan(&scan, None)?.table.len() as u64,
                 None => 0,

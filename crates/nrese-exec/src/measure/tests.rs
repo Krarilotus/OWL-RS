@@ -19,12 +19,17 @@ enum Counted {
 fn charged_on_threads() -> usize {
     static GO: AtomicUsize = AtomicUsize::new(0);
     static DONE: AtomicUsize = AtomicUsize::new(0);
+    static READY: AtomicUsize = AtomicUsize::new(0);
     static STOP: AtomicBool = AtomicBool::new(false);
     static BUDGET: std::sync::OnceLock<Budget> = std::sync::OnceLock::new();
     let budget = BUDGET.get_or_init(Budget::unlimited);
     let threads: Vec<_> = (0..8)
         .map(|_| {
             std::thread::spawn(move || {
+                // Started: the runtime's own set-up of a new thread (on Unix its entry in
+                // the stack-overflow handler's thread table, a 544-byte node when it splits)
+                // is done before this, and before the first measurement waits for it.
+                READY.fetch_add(1, SeqCst);
                 let mut round = 0;
                 while !STOP.load(SeqCst) {
                     if GO.load(SeqCst) == round {
@@ -43,6 +48,10 @@ fn charged_on_threads() -> usize {
             })
         })
         .collect();
+    // Spawned isn't started: a thread may still be setting itself up when spawn returns.
+    while READY.load(SeqCst) < 8 {
+        spin_loop();
+    }
     let mut worst = 0;
     for round in 1..=50 {
         let ((), excess) = measure_within(budget, || {
