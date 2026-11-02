@@ -243,7 +243,7 @@ impl Durable {
         }
         // Set once the log has been cut at `recover_until`: later segments go.
         let mut cut = false;
-        for (position, (first_revision, path)) in segments.iter().enumerate() {
+        for (position, (_, path)) in segments.iter().enumerate() {
             if cut {
                 fs::remove_file(path)?;
                 continue;
@@ -301,10 +301,8 @@ impl Durable {
                 }
                 let bytes = fs::read(path)?;
                 let at = contents.valid_len;
-                let next = contents
-                    .records
-                    .last()
-                    .map_or(*first_revision, |record| record.revision.saturating_add(1));
+                // Every record that could be lost is past what is recovered.
+                let next = version.revision.saturating_add(1);
                 let cut_bytes = (bytes.len() as u64).saturating_sub(at);
                 match (tail::classify(&bytes, at as usize, next), config.wal_damage) {
                     (tail::Tail::Torn, _) => {
