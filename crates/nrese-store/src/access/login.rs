@@ -530,12 +530,88 @@ mod tests {
         assert!(again.is_ok(), "{again:?}");
     }
 
+    /// The variable that marks the child [`in_a_process_of_its_own`] starts: its test's name.
+    const OWN_PROCESS: &str = "NRESE_LOGIN_TEST_OWN_PROCESS";
+
+    /// How long that child may run: far past its few Argon2 runs, unoptimised and on a busy
+    /// machine.
+    const OWN_PROCESS_DEADLINE: Duration = Duration::from_secs(600);
+
+    /// Whether the calling test runs in a process of its own, where no other test ran before
+    /// it: only in the child this starts. Elsewhere it runs the test again, alone, in a child
+    /// of this test binary, fails if it failed there (printing what it printed) and returns
+    /// false: the caller returns. A child still running at [`OWN_PROCESS_DEADLINE`] is
+    /// stopped, and the test fails. For a test of what a process does first: in the test
+    /// binary's own process, another test may have done it already (PR #86 review R86-N1).
+    /// [`nrese_exec::measure::alone`] does the same for measurements, in binaries that measure.
+    fn in_a_process_of_its_own() -> bool {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        // Both pipes are read as the child writes, or a child that fills one would wait for it.
+        fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                pipe.read_to_end(&mut bytes)
+                    .expect("the child's output reads");
+                String::from_utf8_lossy(&bytes).into_owned()
+            })
+        }
+        let current = std::thread::current();
+        let test = current.name().expect("a test thread, named after its test");
+        if std::env::var(OWN_PROCESS).is_ok_and(|marked| marked == test) {
+            return true;
+        }
+        let started = Instant::now();
+        let mut child = Command::new(std::env::current_exe().expect("the test binary"))
+            .args([test, "--exact", "--test-threads=1", "--nocapture"])
+            .env(OWN_PROCESS, test)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the test binary runs");
+        let stdout = drain(child.stdout.take().expect("piped"));
+        let stderr = drain(child.stderr.take().expect("piped"));
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("the child's state") {
+                break Some(status);
+            }
+            if started.elapsed() >= OWN_PROCESS_DEADLINE {
+                child.kill().expect("the child stops");
+                child.wait().expect("the stopped child is waited for");
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let stdout = stdout.join().expect("the child's output");
+        let stderr = stderr.join().expect("the child's output");
+        eprint!("{stdout}{stderr}");
+        let Some(status) = status else {
+            panic!(
+                "{test}, in a process of its own ({}), passed its deadline of {} s: stopped",
+                child.id(),
+                OWN_PROCESS_DEADLINE.as_secs()
+            );
+        };
+        // Exactly this test ran there, and passed: a name that matched none would pass too.
+        assert!(
+            status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{test}, in a process of its own ({}), failed: {status}",
+            child.id()
+        );
+        false
+    }
+
     /// A fresh service's first refusal of a name without a login does the work of a wrong
     /// password, and no more: no hash, and one check against a hash of the same algorithm,
     /// parameters and lengths (R80-1: that first refusal made the dummy hash, a hash more).
-    /// Work, not time.
+    /// Work, not time. In a process of its own: work done once per process, as that dummy
+    /// hash was, may have been done by another test in this one first (R86-N1).
     #[test]
     fn a_missing_name_s_first_refusal_does_a_wrong_password_s_work() {
+        if !in_a_process_of_its_own() {
+            return;
+        }
         let state = state();
         let fresh = logins(1, Duration::from_secs(600));
         let runs = |login: &dyn Fn() -> Result<Principal, AccessError>| {
