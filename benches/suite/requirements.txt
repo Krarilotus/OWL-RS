@@ -1,10 +1,16 @@
-# The Python packages the suite contracts import (scripts/check.sh runs them), at the versions
-# the main PC has. A gate on a fleet host installs them into its own environment
-# (scripts/lib/suite-python.sh), never into the host's Python, and only these files: each pin
-# lists the sha256 of every file PyPI holds for it (pip's hash-checking mode; the form
+# The Python packages the suite contracts and scripts/check-doc-paths.py import (scripts/check.sh
+# runs them), at the versions the main PC has. A gate on a fleet host installs them into its own
+# environment (scripts/lib/suite-python.sh), never into the host's Python, and only these files:
+# each pin lists the sha256 of every file PyPI holds for it (pip's hash-checking mode; the form
 # `pip-compile --generate-hashes` writes, from https://pypi.org/pypi/<name>/<version>/json).
 # These pins are part of the Python runtime the Windows tier declares (scripts/lib/gate-key.sh
-# gate_runtime).
+# gate_runtime). markdown-it-py and its mdurl: MIT.
+markdown-it-py==4.2.0 \
+    --hash=sha256:04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49 \
+    --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
+mdurl==0.1.2 \
+    --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8 \
+    --hash=sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba
 numpy==2.4.6 \
     --hash=sha256:001fbb8e08d942dd57599e781f2472269ee7f2755fae407b4f67b2f0b17da3f1 \
     --hash=sha256:0280e0356c0829a18d9de1cb7eee50ec22ca639878d7240307ca0943d73cd2c4 \
