@@ -524,6 +524,22 @@ impl<'e> Transaction<'e> {
                     .map_or(0, |since| since.as_micros() as u64),
             ),
         };
+        engine.publish_record(&record, dictionary_len, changes_equality)?;
+        Ok(summary)
+    }
+}
+
+impl Inner {
+    /// Publishes `record` as the next revision, its terms already in the dictionary
+    /// (`dictionary_len` of them): logged first in durable mode, then post-commit
+    /// maintenance. The caller holds the writer slot: a commit, or a replicated record.
+    pub(super) fn publish_record(
+        &self,
+        record: &CommitRecord,
+        dictionary_len: u64,
+        changes_equality: bool,
+    ) -> EngineResult<()> {
+        let shared = &self.shared;
         // The first quad in a named graph turns a default-graph asserted stack into a quad
         // stack. No compaction or checkpoint may replace its runs meanwhile: the writer slot
         // excludes other commits, the compaction slot both of those.
@@ -556,7 +572,7 @@ impl<'e> Transaction<'e> {
         let wal_bytes = match &shared.durable {
             Some(durable) => {
                 let mut wal = durable.wal.lock();
-                wal.append(&record)?;
+                wal.append(record)?;
                 shared.versions.publish(publish);
                 wal.bytes_since_checkpoint()
             }
@@ -567,7 +583,7 @@ impl<'e> Transaction<'e> {
         };
         // After the commit's own compaction slot (a conversion's): compacting takes it.
         drop(_compaction);
-        engine.after_commit(wal_bytes);
-        Ok(summary)
+        self.after_commit(wal_bytes);
+        Ok(())
     }
 }
