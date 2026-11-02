@@ -309,7 +309,10 @@ impl Base for UpperBase<'_> {
     }
 
     fn estimate(&self, bound: [Option<u64>; 3]) -> usize {
-        let view = self.view.count_in(ReadModel::Materialised, &pattern(bound));
+        let view = self
+            .view
+            .count_in(ReadModel::Materialised, &pattern(bound))
+            .at_least();
         // An expanded count past `u64` reads as its maximum (`Snapshot::count_in`): the sum
         // saturates too, never wrapping to a smaller estimate.
         usize::try_from(view)
