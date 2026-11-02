@@ -1,7 +1,8 @@
 //! Guard of a key's scratch (`tableau::keys`; PR #48's review, F1, and its fix check): the
 //! pairs a key tries are enumerated, not stored, so evaluating it holds memory linear in its
-//! members, not in their pairs, and what it holds is what it is charged. Measured with a
-//! counting allocator, so this file is a test binary of its own; its tests take turns
+//! members, not in their pairs, and what it holds is what it is charged. Beside it, the guards
+//! of what a merge of named individuals copies and reads (`tableau::merge`; I35, PR #72). Measured
+//! with a counting allocator, so this file is a test binary of its own; its tests take turns
 //! (`PROFILE`), since a heap profile is the process's.
 
 use std::sync::{Mutex, PoisonError};
@@ -119,7 +120,8 @@ fn a_key_holds_memory_linear_in_its_members_and_is_charged_what_it_holds() {
 
 /// The whole check (I35): the key's members, each merged into the last, had the whole class
 /// copied at every merge, so the check held memory and asserted facts quadratic in them
-/// (5.1 GB at 8,000 members). Of two named individuals the smaller class goes into the larger.
+/// (5.1 GB at 8,000 members). Of two named individuals the one holding fewer of the facts a merge
+/// copies goes into the other.
 #[test]
 fn the_check_of_a_key_s_members_holds_memory_near_linear_in_them() {
     let _turn = PROFILE.lock().unwrap_or_else(PoisonError::into_inner);
@@ -148,5 +150,116 @@ fn the_check_of_a_key_s_members_holds_memory_near_linear_in_them() {
     assert!(
         large < small * 3,
         "SPEC I35: {small} bytes held at most for 400 members, {large} for 800"
+    );
+}
+
+/// PR #72 r1 F1: of two named individuals, the smaller class isn't the side with fewer facts to
+/// copy. `c` holding N labels joined `a ≈ b`'s class of two and had all N copied. What a merge
+/// copies is counted in the facts asserted.
+#[test]
+fn a_merge_of_named_individuals_copies_the_side_with_fewer_facts() {
+    let _turn = PROFILE.lock().unwrap_or_else(PoisonError::into_inner);
+    let asserted = |labels: u64| {
+        let mut o = Ontology::default();
+        let (a, b, c) = (100, 101, 102);
+        for k in 0..labels {
+            let class = ExprId(o.classes.intern(ClassExpr::Class(1000 + k)));
+            add(&mut o, Axiom::ClassAssertion(class, c));
+        }
+        add(&mut o, Axiom::SameIndividual(vec![a, b]));
+        add(&mut o, Axiom::SameIndividual(vec![b, c]));
+        let config = Config {
+            portfolio: false,
+            keep_model: true,
+            ..Config::default()
+        };
+        let outcome = consistency(&o, &config);
+        assert_eq!(outcome.answer, Answer::Consistent, "{labels} labels on c");
+        outcome.telemetry.facts
+    };
+    let (few, many) = (asserted(200), asserted(400));
+    // 200 more labels on c assert 200 more facts; copied to another node as well, 400.
+    assert!(
+        many - few <= 250,
+        "SPEC merge-copies: {few} facts asserted for 200 labels on c, {many} for 400"
+    );
+}
+
+/// PR #72's fix, Sol r2 S2: `a : ≥n R.C` makes n successors and their inequalities, and
+/// `∃R.C ⊑ {b}` then merges `a` with `b`, which holds 64 labels. Moving `a` prunes its successors
+/// and `b` builds them again from the copied `≥n R.C`; moving `b` copies its 64 labels. The merge
+/// adds about those labels to what the check holds without it.
+#[test]
+fn a_merge_keeps_the_side_whose_successors_it_would_build_again() {
+    let _turn = PROFILE.lock().unwrap_or_else(PoisonError::into_inner);
+    let asserted = |merged: bool| {
+        let mut o = Ontology::default();
+        let (a, b) = (100, 101);
+        let r = ObjProp::Named(2);
+        let c = ExprId(o.classes.intern(ClassExpr::Class(3)));
+        let min = ExprId(o.classes.intern(ClassExpr::Min(256, r, c)));
+        add(&mut o, Axiom::ClassAssertion(min, a));
+        if merged {
+            let some = ExprId(o.classes.intern(ClassExpr::Some(r, c)));
+            let only_b = ExprId(o.classes.intern(ClassExpr::OneOf(vec![b])));
+            add(&mut o, Axiom::SubClassOf(some, only_b));
+        }
+        for k in 0..64 {
+            let class = ExprId(o.classes.intern(ClassExpr::Class(1000 + k)));
+            add(&mut o, Axiom::ClassAssertion(class, b));
+        }
+        let config = Config {
+            portfolio: false,
+            keep_model: true,
+            ..Config::default()
+        };
+        let outcome = consistency(&o, &config);
+        assert_eq!(outcome.answer, Answer::Consistent, "merged: {merged}");
+        outcome.telemetry.facts
+    };
+    let (apart, merged) = (asserted(false), asserted(true));
+    // a's 256 successors and their inequalities, built again, are about 33,000 facts.
+    assert!(
+        merged.saturating_sub(apart) <= 1000,
+        "SPEC merge-storage: {apart} facts without the merge, {merged} with it"
+    );
+}
+
+/// PR #72's fix, Sol r2 S1: choosing a merge's direction read each side up to its next copied
+/// fact, so the entries before it that aren't copied were read at every merge: Θ(N·M) for M
+/// merges into a node holding N such entries. `t` holds `R(t, t)` and then `R(t, bᵢ)` for N
+/// named individuals, each merged into it, which leaves N edges to merged nodes ahead of its
+/// one live edge; then M individuals without facts join it, half named first, half second. What
+/// those M merges read doesn't grow with N.
+#[test]
+fn choosing_a_merge_s_direction_reads_no_more_for_a_longer_list() {
+    let _turn = PROFILE.lock().unwrap_or_else(PoisonError::into_inner);
+    let read = |n: u64, m: u64| {
+        let mut o = Ontology::default();
+        let t = 10;
+        add(&mut o, Axiom::ObjectPropertyAssertion(2, t, t));
+        for b in 1000..1000 + n {
+            add(&mut o, Axiom::ObjectPropertyAssertion(2, t, b));
+            add(&mut o, Axiom::SameIndividual(vec![b, t]));
+        }
+        for s in 100_000..100_000 + m {
+            let pair = if s % 2 == 0 { vec![s, t] } else { vec![t, s] };
+            add(&mut o, Axiom::SameIndividual(pair));
+        }
+        let config = Config {
+            portfolio: false,
+            keep_model: true,
+            ..Config::default()
+        };
+        let outcome = consistency(&o, &config);
+        assert_eq!(outcome.answer, Answer::Consistent, "{n} edges, {m} joining");
+        outcome.telemetry.merge_walk
+    };
+    let joining = |n: u64| read(n, 64) - read(n, 0);
+    let (short, long) = (joining(2048), joining(8192));
+    // Read up to each copied fact, the joining merges read about N each: four times as much.
+    assert!(
+        long <= short + short / 2,
+        "SPEC merge-read: 64 merges read {short} entries beside 2048 edges, {long} beside 8192"
     );
 }

@@ -30,6 +30,9 @@ pub struct Telemetry {
     pub levels_skipped: u64,
     pub clashes: u64,
     pub merges: u64,
+    /// The fact-list entries the merges' choice of direction walked, retracted ones included
+    /// (`merge.rs`: at most `WALK` of each side per merge).
+    pub merge_walk: u64,
     /// Applications of the NI rule.
     pub ni_applications: u64,
     /// Nodes whose blocking status was computed, and those found directly blocked.
@@ -75,6 +78,7 @@ impl Telemetry {
             levels_skipped,
             clashes,
             merges,
+            merge_walk,
             ni_applications,
             blocking_tests,
             blocking_hits,

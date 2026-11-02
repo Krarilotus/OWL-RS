@@ -189,6 +189,11 @@ const NOT_BUDGETS: &[(&str, &str, &str)] = &[
         "variables per clause in a join's bindings",
     ),
     ("tableau/graph.rs", "pub const", "a node's flag bits"),
+    (
+        "tableau/merge.rs",
+        "const WALK",
+        "the entries a merge's choice of direction reads, which picks a side, never an answer",
+    ),
     ("tableau/search.rs", "WINDOW", "the restart window"),
     (
         "dl/source.rs",

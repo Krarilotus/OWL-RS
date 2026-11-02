@@ -1,8 +1,9 @@
 //! The ≈-rule (JAIR 2009, Table 5): merging one node into another. The direction is the
 //! calculus's: into a named individual, into a root from a node that isn't named, into an
 //! ancestor; otherwise the other way round. Of two named individuals, which the calculus
-//! leaves open, the smaller class goes into the larger. The merged node's descendants are pruned,
-//! its facts are copied to the target with the equality's dependencies added, and it
+//! leaves open, the one holding fewer facts goes into the other, as far as a bounded read of
+//! both tells; past it, the smaller class into the larger. The merged node's descendants
+//! are pruned, its facts are copied to the target with the equality's dependencies added, and it
 //! points at the target from then on. Everything changed in place goes on the trail, so
 //! a backtrack undoes the merge (no path compression).
 //!
@@ -13,6 +14,35 @@ use super::depset::DepSetId;
 use super::engine::{Engine, Lit, Step, Stop, proof};
 use super::graph::{Annot, NONE, flag};
 use crate::limits::Limit;
+
+/// The entries of each side's fact lists, retracted ones included, that the choice between two
+/// named individuals reads at most (`lighter`); a side with more is weighed by its class size.
+/// It bounds the choice's work per merge at about what copying a small side costs anyway; on
+/// I35's key witness the choice reads 16 entries a merge, at 1,000 members as at 8,000.
+const WALK: u32 = 1024;
+
+/// What reading a side's next weighed fact found.
+enum Read {
+    Fact,
+    End,
+    Spent,
+}
+
+/// Reads `entries` to its next weighed fact, counting each entry read in `walked`, at most
+/// `WALK`.
+fn next_fact(entries: &mut impl Iterator<Item = bool>, walked: &mut u32) -> Read {
+    loop {
+        if *walked == WALK {
+            return Read::Spent;
+        }
+        *walked += 1;
+        match entries.next() {
+            None => return Read::End,
+            Some(true) => return Read::Fact,
+            Some(false) => {}
+        }
+    }
+}
 
 impl Engine<'_> {
     /// Merges what `a` and `b` stand for now, by the equality's `dep` and the merges that
@@ -47,23 +77,88 @@ impl Engine<'_> {
         Ok(())
     }
 
-    /// `(from, into)` by the calculus's order. It leaves two named individuals either way:
-    /// the smaller class goes into the larger, so a fact moves O(log n) times however many
-    /// merges its class takes (I35: a key's members, each merged into the last, copied the
-    /// whole class at every merge, memory quadratic in them).
-    fn direction(&self, s: u32, t: u32) -> (u32, u32) {
-        let node = |n: u32| &self.g.nodes[n as usize];
-        let named = |n: u32| node(n).named != NONE;
-        let root = |n: u32| node(n).flags & flag::ROOT != 0;
+    /// `(from, into)` by the calculus's order. It leaves two named individuals either way
+    /// (`lighter`).
+    fn direction(&mut self, s: u32, t: u32) -> (u32, u32) {
+        let named = |n: u32| self.g.nodes[n as usize].named != NONE;
         if named(s) && named(t) {
-            let size = |n: u32| self.g.class_sizes[n as usize];
-            return if size(s) <= size(t) { (s, t) } else { (t, s) };
+            return self.lighter(s, t);
         }
+        let root = |n: u32| self.g.nodes[n as usize].flags & flag::ROOT != 0;
         if named(t) || (root(t) && !named(s)) || self.g.descends(s, t) {
             (s, t)
         } else {
             (t, s)
         }
+    }
+
+    /// Of two named individuals, `(from, into)` with `from` the one holding fewer facts, by
+    /// `weighed` (I35: a key's members, each merged into the last, copied the whole class at
+    /// every merge, memory quadratic in them; PR #72 r1 F1: the smaller class isn't the side
+    /// with fewer facts). Both sides' fact lists are read in step, one weighed fact of each in
+    /// turn, the source's first: the side that runs out first moves (on a tie the source, as the
+    /// calculus orders a pair), and neither is read past the other's count. So a merge copies
+    /// no more than the other way round would, and a fact that is new where it goes joins at
+    /// least as many as it left (a copy already there adds nothing).
+    ///
+    /// Each side is read for at most `WALK` entries, retracted ones included, so the choice
+    /// costs O(`WALK`) however long the lists. When a side hasn't run out by then and the other
+    /// doesn't run out holding no more, the smaller class goes into the larger (union by size):
+    /// classes partition the nodes, so that at least doubles the class of every fact it moves,
+    /// a fact moves that way at most log₂ n times for a class of n members, and such moves copy
+    /// O(F log n) facts in all for F facts.
+    fn lighter(&mut self, s: u32, t: u32) -> (u32, u32) {
+        let (decided, walked) = {
+            let mut sides = [self.weighed(s), self.weighed(t)];
+            let (mut count, mut walked) = ([0u32; 2], [0u32; 2]);
+            let decided = 'read: loop {
+                for side in 0..2 {
+                    match next_fact(&mut sides[side], &mut walked[side]) {
+                        Read::Fact => count[side] += 1,
+                        Read::End => break 'read Some(side),
+                        Read::Spent => {
+                            // The other side moves only if it runs out holding no more.
+                            let other = 1 - side;
+                            let moves = loop {
+                                if count[other] > count[side] {
+                                    break None;
+                                }
+                                match next_fact(&mut sides[other], &mut walked[other]) {
+                                    Read::Fact => count[other] += 1,
+                                    Read::End => break Some(other),
+                                    Read::Spent => break None,
+                                }
+                            };
+                            break 'read moves;
+                        }
+                    }
+                }
+            };
+            (decided, walked[0] + walked[1])
+        };
+        self.stats.merge_walk += u64::from(walked);
+        let pair = [s, t];
+        match decided {
+            Some(side) => (pair[side], pair[1 - side]),
+            None if self.g.class_sizes[s as usize] <= self.g.class_sizes[t as usize] => (s, t),
+            None => (t, s),
+        }
+    }
+
+    /// Each entry of `node`'s fact lists, in `copy_facts`'s order: whether it weighs. A
+    /// retracted entry doesn't, nor an edge or inequality whose other end is dead. An edge to
+    /// `node`'s own successor does, though `prune(node)` removes it before the copy: it stands
+    /// for the subtree the target builds again from the labels it is copied. Left out, S2's
+    /// witness (`a : ≥1024 R.C`, `∃R.C ⊑ {b}`, 64 labels on b) moved a, and b built a's 1,024
+    /// successors and their inequalities again: 1,051,717 facts, where moving b held 525,956
+    /// (PR #72's fix, Sol r2).
+    fn weighed(&self, node: u32) -> impl Iterator<Item = bool> + '_ {
+        let g = &self.g;
+        g.fact_entries(node).map(move |entry| match entry {
+            None => false,
+            Some(NONE) => true,
+            Some(other) => g.live(other),
+        })
     }
 
     /// Marks every descendant of `node` pruned.
