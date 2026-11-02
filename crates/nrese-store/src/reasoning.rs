@@ -14,7 +14,7 @@ pub use nrese_reasoner::RuleProgram;
 pub use nrese_reasoner::engine::{
     Closure, InferenceStep, JUSTIFICATIONS_AT_MOST, JustificationAnswer, JustificationMode,
     JustifiedStatement, Program, decoded, explain_fact, explain_violation, justify_fact,
-    materialise, materialise_until,
+    materialise, materialise_until, materialise_with,
 };
 
 /// The most diagnostics a report lists; `diagnostics_total` counts them all.
@@ -111,16 +111,16 @@ impl MaterialisationReport {
     }
 }
 
-/// [`nrese_reasoner::engine::maintain`] on a commit, with its report: the violations the
+/// [`nrese_reasoner::engine::maintain_with`] on a commit, with its report: the violations the
 /// change introduced, what it did, and the ground program to reuse.
 pub(crate) fn apply_delta(
     program: &Program,
     ground: Option<&GroundProgram>,
     tx: &mut Transaction<'_>,
-    stop: nrese_reasoner::eval::Stop<'_>,
+    operation: &nrese_reasoner::eval::OperationStop<'_>,
 ) -> Result<(Vec<Violation>, MaterialisationReport, Option<GroundProgram>), delta::Interrupted> {
     let started = Instant::now();
-    let done = nrese_reasoner::engine::maintain(program, ground, tx, stop)?;
+    let done = nrese_reasoner::engine::maintain_with(program, ground, tx, operation)?;
     let report = MaterialisationReport {
         ruleset: program.program.name(),
         revision: tx.base().revision() + 1,
