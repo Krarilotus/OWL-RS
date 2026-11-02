@@ -165,6 +165,17 @@ impl IdTable {
         }
     }
 
+    /// What this table counts for memory budgets with room for exactly `rows` rows
+    /// ([`Self::memory_bytes`]): what to charge before it grows to that room.
+    pub fn bytes_for_rows(&self, rows: usize) -> usize {
+        match self.width() {
+            0 => rows
+                .saturating_sub(1)
+                .saturating_mul(ROW_WITHOUT_COLUMNS_BYTES),
+            width => rows.saturating_mul(width * size_of::<u64>()),
+        }
+    }
+
     /// Appends all rows of `other`, which must have the same width. Sortedness is lost.
     pub fn append(&mut self, other: &IdTable) {
         assert_eq!(self.width(), other.width(), "append: widths differ");
@@ -585,12 +596,14 @@ mod tests {
         }
     }
 
-    /// Spec (SW1, `notes/2026-11-01-late-budget-r2.md`): rows without columns count against
-    /// the budget where they are made, one id each (the column an operator after them may
-    /// make: an unbound variable's UNDEF), so `memory_bytes` reports `rows * 8` for a table
-    /// with no columns, as for one column. What a table reports doesn't drop while it lives,
-    /// as a column's capacity doesn't when rows go: the charge taken for it is the charge
-    /// released.
+    /// Spec (SW1, `notes/2026-11-01-late-budget-r2.md`; first row, PR #84's timing,
+    /// notes/2026-11-02-zero-width-budget.md ZW-10): rows without columns count against the
+    /// budget where they are made, one id each after the first (the column an operator after
+    /// them may make: an unbound variable's UNDEF), so `memory_bytes` reports
+    /// `(rows - 1) * 8` for a table with no columns; one solution without bindings counts
+    /// nothing. What a table reports doesn't drop while it lives, as a column's capacity
+    /// doesn't when rows go: the charge taken for it is the charge released. Room for `n`
+    /// rows counts what `bytes_for_rows(n)` says, with columns or without.
     #[test]
     fn rows_without_columns_count_one_id_each() {
         let rows = |n: usize| IdTable::from_rows(0, std::iter::repeat_n(&[][..], n));
@@ -598,31 +611,40 @@ mod tests {
             IdTable::from_columns((0..width).map(|_| vec![7; n]).collect())
         };
         assert_eq!(rows(0).memory_bytes(), 0);
-        assert_eq!(rows(1_000).memory_bytes(), 8_000);
-        assert_eq!(rows(1_000).memory_bytes(), wide(1_000, 1).memory_bytes());
+        assert_eq!(rows(1).memory_bytes(), 0);
+        assert_eq!(rows(2).memory_bytes(), 8);
+        assert_eq!(rows(1_000).memory_bytes(), 7_992);
         let mut grown = rows(10);
         grown.append(&rows(990));
-        assert_eq!(grown.memory_bytes(), 8_000);
+        assert_eq!(grown.memory_bytes(), 7_992);
         assert_eq!(
             IdTable::concat(0, vec![rows(400), rows(600)]).memory_bytes(),
-            8_000
+            7_992
         );
-        assert_eq!(wide(1_000, 2).project(&[]).memory_bytes(), 8_000);
+        assert_eq!(wide(1_000, 2).project(&[]).memory_bytes(), 7_992);
         // Room reserved counts as a column's capacity does, and is what fits before more
         // is counted.
         let mut room = IdTable::with_capacity(0, 100);
-        assert_eq!((room.memory_bytes(), room.spare_rows()), (800, 100));
+        assert_eq!((room.memory_bytes(), room.spare_rows()), (792, 100));
         room.reserve_exact(400);
-        assert_eq!((room.memory_bytes(), room.spare_rows()), (3_200, 400));
+        assert_eq!((room.memory_bytes(), room.spare_rows()), (3_192, 400));
         room.append(&rows(450));
-        assert_eq!((room.memory_bytes(), room.spare_rows()), (3_600, 0));
+        assert_eq!((room.memory_bytes(), room.spare_rows()), (3_592, 0));
+        for width in [0, 1, 3] {
+            let room = IdTable::with_capacity(width, 100);
+            assert_eq!(
+                room.bytes_for_rows(100),
+                room.memory_bytes(),
+                "{width} columns"
+            );
+        }
         let mut cut = rows(1_000);
         cut.retain_mask(&[true, false].repeat(500));
         assert_eq!(cut.len(), 500);
-        assert_eq!(cut.memory_bytes(), 8_000);
+        assert_eq!(cut.memory_bytes(), 7_992);
         cut.slice(100, Some(10));
         assert_eq!(cut.len(), 10);
-        assert_eq!(cut.memory_bytes(), 8_000);
+        assert_eq!(cut.memory_bytes(), 7_992);
     }
 
     #[test]

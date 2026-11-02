@@ -283,3 +283,119 @@ fn merged_graph_reads_hold_no_more_than_they_charge() {
         );
     }
 }
+
+/// Guard (PR #84's timing, notes/2026-11-02-zero-width-budget.md ZW-10): one solution without
+/// bindings counts nothing, so making and consuming it, as an empty group does once per row
+/// of a substituted EXISTS, never draws on the query's budget: its peak stays where it was.
+/// Two such rows count one id, charged where they are made and released where they are
+/// consumed.
+#[test]
+fn a_solution_without_bindings_draws_nothing_from_the_budget() {
+    let engine = store([]);
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let ctx = Context::new(&snapshot, &options, None, None);
+    // What the evaluation holds from its start (its reads' state); nothing charged and
+    // released before, so a charge now would raise the peak.
+    let held = ctx.budget.used();
+    assert_eq!(ctx.budget.peak(), held, "a fresh evaluation");
+    for _ in 0..3 {
+        let unit = ctx.unit().ok().expect("one solution");
+        ctx.consumed(unit);
+    }
+    assert_eq!((ctx.budget.used(), ctx.budget.peak()), (held, held));
+    let two = ctx
+        .produced(Solutions {
+            vars: Vec::new(),
+            table: IdTable::from_rows(0, [&[][..], &[][..]]),
+            ordered: false,
+        })
+        .ok()
+        .expect("room");
+    assert_eq!(ctx.budget.used(), held + 8);
+    ctx.consumed(two);
+    assert_eq!(ctx.budget.used(), held);
+}
+
+/// Spec (notes/2026-11-02-exec-memory-stack.md EMS-2): what a table is charged is what its
+/// consumer releases. One solution without bindings counts nothing, so an operator that gives
+/// such a row a column, in place or in a table it makes of it, charges that column, or
+/// consuming its answer releases another holder's charge: a projection's UNDEF column, a
+/// union's widening, GRAPH ?g's column, a BIND's column, LATERAL's put-in column, and
+/// SERVICE ?e's endpoint column (that one on any width: sol-loop r1 S1). Each pattern is
+/// evaluated with another holder's charge on the query's budget; after its answer is
+/// consumed the budget holds at least that much again. Every term the cases name is
+/// stored, so no computed term's kept charge covers a release (sol-loop r2 S2).
+#[test]
+fn a_column_given_to_a_row_without_columns_is_charged() {
+    use crate::{CancellationToken, ServiceClient, ServiceResults, Services};
+    use nrese_sparql_syntax::Query;
+
+    /// An endpoint whose every answer is five rows of one variable, a stored term.
+    struct Five;
+    impl ServiceClient for Five {
+        fn select(
+            &self,
+            _endpoint: &str,
+            _query: &str,
+            _cancellation: Option<&CancellationToken>,
+        ) -> Result<ServiceResults, Box<dyn std::error::Error + Send + Sync>> {
+            let x = Term::from(node("a"));
+            Ok(ServiceResults {
+                variables: vec![Variable::new_unchecked("x")],
+                rows: vec![vec![Some(x)]; 5],
+            })
+        }
+    }
+
+    let engine =
+        store((0..3).map(|g| ("a".to_owned(), "r", "b".to_owned(), ["g0", "g1", "g2"][g])));
+    let snapshot = engine.snapshot();
+    let options = QueryOptions {
+        services: Some(Services(Arc::new(Five))),
+        ..QueryOptions::default()
+    };
+    let cases = [
+        ("a projection's UNDEF column", "SELECT ?u WHERE { }"),
+        (
+            "a union's widening",
+            "SELECT * WHERE { { } UNION { VALUES ?u { <urn:a> } } }",
+        ),
+        ("GRAPH ?g's column", "SELECT * WHERE { GRAPH ?g { } }"),
+        ("a BIND's column", "SELECT * WHERE { BIND(<urn:a> AS ?u) }"),
+        (
+            "LATERAL's put-in column",
+            "SELECT * WHERE { VALUES ?s { <urn:a> <urn:b> } LATERAL { FILTER(?s = ?s) } }",
+        ),
+        (
+            "SERVICE ?e's endpoint column",
+            "SELECT * WHERE { VALUES ?e { <urn:b> } SERVICE ?e { ?a ?b ?x } }",
+        ),
+    ];
+    // Every case's verdict, not only the first failing one's.
+    let mut failures = Vec::new();
+    for (case, text) in cases {
+        let Query::Select { pattern, .. } = SparqlParser::new().parse_query(text).unwrap() else {
+            panic!("{case}: a SELECT")
+        };
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let mut other = Reservation::new(&*ctx.budget);
+        other.charge(1 << 20).unwrap();
+        let before = ctx.budget.used();
+        match ctx.eval(&pattern) {
+            Ok(answer) if answer.table.is_empty() => {
+                failures.push(format!("{case}: no rows, nothing tested"));
+            }
+            Ok(answer) => ctx.consumed(answer),
+            Err(_) => failures.push(format!("{case}: refused")),
+        }
+        let after = ctx.budget.used();
+        if after < before {
+            failures.push(format!(
+                "{case}: consuming the answer released {} bytes of another holder's charge",
+                before - after
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
