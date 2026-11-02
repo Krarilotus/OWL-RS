@@ -36,7 +36,8 @@
 //! The subject is `?s`, or a list of `?s`, the score, the matched literal, its graph and
 //! its property (any prefix of them; the graph stays unbound, the property too where the
 //! object names it). The object is the query string, or a list of an
-//! optional property, the query string, an optional limit on the matched literals, and
+//! optional property, the query string, an optional limit on the matched literals (objects
+//! of the property, if one is given), and
 //! `"lang:xx"` for the literals' language (other `name:value` options are ignored). The
 //! query string is read as Lucene's syntax as far as the index goes: words, phrases in
 //! double quotes, `word*` prefixes and fuzzy `word~` (two edits) or `word~1`; `AND` between
@@ -52,7 +53,7 @@
 //! index, over every string literal.
 
 use nrese_engine::{GraphSelector, QuadPattern, TermId, TextQuery};
-use nrese_rdf::{Literal, Term, Variable, vocab::rdf};
+use nrese_rdf::{Literal, NamedNode, Term, Variable, vocab::rdf};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use nrese_exec::IdTable;
@@ -75,6 +76,8 @@ pub(super) struct Search {
     max_rank: Option<usize>,
     /// Only literals in this language (`text:query`'s `"lang:xx"`).
     language: Option<String>,
+    /// Only literals that are objects of this property (`text:query`'s property).
+    property: Option<NamedNode>,
 }
 
 impl Search {
@@ -93,6 +96,7 @@ impl Search {
             min_rank: None,
             max_rank: None,
             language: None,
+            property: None,
         }
     }
 }
@@ -224,6 +228,11 @@ fn list(head: &TermPattern, triples: &[TriplePattern]) -> Option<(Vec<TermPatter
             })
         };
         let (first, rest) = (link(rdf::FIRST.as_str())?, link(rdf::REST.as_str())?);
+        // A node met again closes a cycle (`_:a rdf:rest _:a`): not a list, as one
+        // without `rdf:nil` isn't.
+        if used.contains(&rest) {
+            return None;
+        }
         items.push(triples[first].object.clone());
         used.extend([first, rest]);
         node = triples[rest].object.clone();
@@ -319,6 +328,7 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
         let mut search = Search::new(literal.clone(), text);
         search.query.all_words = all_words;
         search.relevance = outputs.get(1).and_then(variable);
+        search.property = property.clone();
         // GraphDB: the score is a statement on the subject.
         if luc(triple).is_some()
             && let Some(score) = triples.iter().position(|t| {
@@ -366,6 +376,12 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
 impl Context<'_> {
     /// Whether `id` is the object of a statement in the active graph.
     pub(super) fn used_as_object(&self, id: TermId) -> bool {
+        self.used_as_object_of(id, None)
+    }
+
+    /// Whether `id` is the object of a statement in the active graph, with `property`
+    /// as its predicate if given.
+    fn used_as_object_of(&self, id: TermId, property: Option<TermId>) -> bool {
         let graph = match &*self.graph.borrow() {
             GraphScope::Default => GraphSelector::Exact(TermId::DEFAULT_GRAPH),
             GraphScope::Named(g) => GraphSelector::Exact(*g),
@@ -375,7 +391,7 @@ impl Context<'_> {
         };
         let pattern = QuadPattern {
             subject: None,
-            predicate: None,
+            predicate: property,
             object: Some(id),
             graph,
         };
@@ -390,12 +406,23 @@ impl Context<'_> {
     /// The literals `search` matches, with their relevance and rank.
     pub(super) fn search(&self, search: &Search) -> NativeResult<Solutions> {
         self.check()?;
+        // The property restricts the literals before the rank limits count them, so the
+        // join with `?s <property> ?literal` drops none they counted. A property the
+        // store doesn't know: no literal.
+        let property = search
+            .property
+            .as_ref()
+            .map(|p| self.snapshot.lookup(p.as_ref().into()));
         let mut vars = vec![search.matched.clone()];
         vars.extend(search.relevance.iter().cloned());
         vars.extend(search.rank.iter().cloned());
         let mut table = IdTable::new(vars.len());
         let mut rank = 0usize;
-        for found in self.snapshot.text_search(&search.query) {
+        let found = match property {
+            Some(None) => Vec::new(),
+            _ => self.snapshot.text_search(&search.query),
+        };
+        for found in found {
             if search
                 .min_relevance
                 .is_some_and(|min| found.relevance < min)
@@ -412,7 +439,7 @@ impl Context<'_> {
                     continue;
                 }
             }
-            if !self.used_as_object(id) {
+            if !self.used_as_object_of(id, property.flatten()) {
                 continue;
             }
             rank += 1;

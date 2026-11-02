@@ -16,12 +16,12 @@
 //! | Predicate | Object |
 //! |---|---|
 //! | `nrv:near` | the query vector: a vector literal, or a variable the rest of the query binds to one (a search per value) |
-//! | `nrv:k` | how many nearest vectors (default 10) |
+//! | `nrv:k` | how many nearest vectors (default 10; 1 to 10,000, else an argument error) |
 //! | `nrv:score` | a variable: the cosine similarity or dot product, or the Euclidean distance |
 //! | `nrv:rank` | a variable: the rank, from 1 |
 //! | `nrv:metric` | `"cosine"` (the default), `"dot"` or `"l2"` |
 //! | `nrv:exact` | `true`: compare every vector (else large spaces are searched through an HNSW graph) |
-//! | `nrv:searchBudget` | the graph search's beam (default 64): wider finds more of the true nearest |
+//! | `nrv:searchBudget` | the graph search's beam (default 64; 1 to 1,000,000): wider finds more of the true nearest |
 //!
 //! The subject is the matched vector literal. Only literals the query's dataset uses as
 //! objects are found (so a user sees no vector from a graph it may not read). When the
@@ -51,6 +51,9 @@ const DEFAULT_K: usize = 10;
 /// The most `nrv:k` takes.
 const MAX_K: usize = 10_000;
 
+/// The widest beam `nrv:searchBudget` takes.
+const MAX_BUDGET: usize = 100 * MAX_K;
+
 /// The search goes first when the pattern joined to it is estimated at more than this
 /// many rows per vector wanted.
 const PROBE_ABOVE: usize = 50;
@@ -76,6 +79,17 @@ enum Near {
 
 fn argument(message: impl Into<String>) -> QueryEvaluationError {
     QueryEvaluationError::Argument(format!("SERVICE nrv:search: {}", message.into()))
+}
+
+/// `value` if it lies in 1..=`max`, else an argument error naming `option`.
+fn within(value: usize, max: usize, option: &str) -> Result<usize, QueryEvaluationError> {
+    if (1..=max).contains(&value) {
+        Ok(value)
+    } else {
+        Err(argument(format!(
+            "{option} is from 1 to {max}, not {value}"
+        )))
+    }
 }
 
 /// The search `inner` (the block of `SERVICE nrv:search`) states.
@@ -136,8 +150,9 @@ fn parse(inner: &GraphPattern) -> Result<Search, QueryEvaluationError> {
                     _ => return Err(argument("nrv:near takes a vector literal or a variable")),
                 });
             }
-            "k" => search.k = number()?.clamp(1, MAX_K),
-            "searchBudget" => search.ef = Some(number()?.clamp(1, 100 * MAX_K)),
+            // Taken as given or refused, never clamped: a clamp answers another question.
+            "k" => search.k = within(number()?, MAX_K, "nrv:k")?,
+            "searchBudget" => search.ef = Some(within(number()?, MAX_BUDGET, "nrv:searchBudget")?),
             "score" => {
                 search.score = Some(variable.ok_or_else(|| argument("nrv:score takes a variable"))?)
             }

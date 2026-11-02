@@ -231,10 +231,13 @@ struct TopK {
 }
 
 impl TopK {
+    /// Room for `k` hits up to a chunk's worth, grown past that only by hits offered: a
+    /// part never holds more than its chunk, and a large `k` (a caller widening its
+    /// search towards the whole space) allocates for the hits there are.
     fn new(k: usize) -> Self {
         Self {
             k,
-            heap: std::collections::BinaryHeap::with_capacity(k + 1),
+            heap: std::collections::BinaryHeap::with_capacity(k.min(CHUNK) + 1),
         }
     }
 
@@ -338,7 +341,11 @@ mod tests {
         let truth = exact(&vectors, query, vectors.len(), Metric::L2, &|_| true);
         assert_eq!(truth.len(), CHUNK + 7);
         for k in [usize::MAX / 2, usize::MAX] {
-            assert_eq!(exact(&vectors, query, k, Metric::L2, &|_| true), truth, "{k}");
+            assert_eq!(
+                exact(&vectors, query, k, Metric::L2, &|_| true),
+                truth,
+                "{k}"
+            );
             assert_eq!(merge(truth.iter().rev().copied(), k), truth, "{k}");
         }
     }
