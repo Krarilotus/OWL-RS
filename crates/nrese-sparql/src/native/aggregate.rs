@@ -50,6 +50,8 @@ pub(super) struct Kept {
     memo: RefCell<Reservation>,
     values: RefCell<Reservation>,
     results: RefCell<Reservation>,
+    /// What [`Aggregator::value_of`] charged to `results` before it made the result.
+    prepaid: Cell<usize>,
     refused: Cell<Option<BudgetExceeded>>,
 }
 
@@ -72,6 +74,7 @@ impl Kept {
             memo: RefCell::new(Reservation::new(Arc::clone(budget))),
             values: RefCell::new(Reservation::new(Arc::clone(budget))),
             results: RefCell::new(Reservation::new(Arc::clone(budget))),
+            prepaid: Cell::new(0),
             refused: Cell::new(None),
         }
     }
@@ -373,8 +376,16 @@ impl Aggregator<'_> {
         let result = self.value_of(solutions, rows, aggregate);
         if let Some(kept) = self.kept {
             kept.values_done();
-            if let Agg::Term(term) = &result {
-                kept.hold(kept.of(Held::Results), kept_bytes(term));
+            // What `value_of` charged before it made the result is part of it.
+            let prepaid = kept.prepaid.take();
+            match &result {
+                Agg::Term(term) => {
+                    kept.hold(
+                        kept.of(Held::Results),
+                        kept_bytes(term).saturating_sub(prepaid),
+                    );
+                }
+                Agg::Id(_) => kept.of(Held::Results).borrow_mut().release(prepaid),
             }
         }
         result
@@ -460,7 +471,22 @@ impl Aggregator<'_> {
                     AggregateFunction::Sum => sum(&values),
                     AggregateFunction::Avg => average(&values),
                     AggregateFunction::GroupConcat { separator } => {
-                        group_concat(&values, separator.as_deref().unwrap_or(" "))
+                        // The string, its separator once between each two values however
+                        // long the query's separator is, charged before it is made: as the
+                        // result's, which `aggregate` charges the rest of.
+                        // A value that isn't a string makes it unbound: nothing to charge.
+                        let separator = separator.as_deref().unwrap_or(" ");
+                        match (self.kept, group_concat_bytes(&values, separator)) {
+                            (_, None) => None,
+                            (Some(kept), Some(bytes)) => {
+                                if !kept.hold(kept.of(Held::Results), bytes) {
+                                    return Agg::Id(UNDEF);
+                                }
+                                kept.prepaid.set(bytes);
+                                group_concat(&values, separator)
+                            }
+                            (None, Some(_)) => group_concat(&values, separator),
+                        }
                     }
                     _ => None,
                 };
@@ -826,7 +852,7 @@ fn one_pass_plan(
 /// result unbound), joined in row order with the separator, as CONCAT of the values: a
 /// simple literal whatever language the values share.
 pub fn group_concat(values: &[Term], separator: &str) -> Option<Term> {
-    let mut concat = String::new();
+    let mut concat = String::with_capacity(group_concat_bytes(values, separator)?);
     for (i, value) in values.iter().enumerate() {
         let Term::Literal(literal) = value else {
             return None;
@@ -840,6 +866,26 @@ pub fn group_concat(values: &[Term], separator: &str) -> Option<Term> {
         concat.push_str(literal.value());
     }
     Some(Literal::new_simple_literal(concat).into())
+}
+
+/// The bytes of [`group_concat`]'s string: the values' and a separator between each two;
+/// `None` where it has none (a value that isn't a string literal makes it unbound).
+fn group_concat_bytes(values: &[Term], separator: &str) -> Option<usize> {
+    let mut text = 0usize;
+    for value in values {
+        let Term::Literal(literal) = value else {
+            return None;
+        };
+        if literal.language().is_none() && literal.datatype() != xsd::STRING {
+            return None;
+        }
+        text = text.saturating_add(literal.value().len());
+    }
+    let separators = values
+        .len()
+        .saturating_sub(1)
+        .saturating_mul(separator.len());
+    Some(text.saturating_add(separators))
 }
 
 pub fn sum(values: &[Term]) -> Option<Term> {
