@@ -674,6 +674,27 @@ pub(super) fn groups_of(
     solutions: &Solutions,
     variables: &[Variable],
 ) -> (Groups, Vec<Option<usize>>) {
+    let (keys, positions) = bound_keys(solutions, variables);
+    let rows = solutions.table.len();
+    let groups = match keys.is_empty() && !variables.is_empty() {
+        true => Groups {
+            keys: IdTable::from_rows(0, std::iter::repeat_n(&[][..], usize::from(rows > 0))),
+            group_of: vec![0; rows],
+        },
+        false => group_rows(&solutions.table, &keys),
+    };
+    (groups, positions)
+}
+
+/// The columns of `solutions` that `variables` (GROUP BY) name, each once, in the order
+/// first named, and per variable its position among them (`None`: no column, unbound in
+/// every row). Rows ordered by these columns are ordered by the variables' values: a
+/// variable named again compares equal wherever its first naming does, and one without a
+/// column ties everywhere. At most as many as the table's columns, whatever the text.
+pub(super) fn bound_keys(
+    solutions: &Solutions,
+    variables: &[Variable],
+) -> (Vec<usize>, Vec<Option<usize>>) {
     let mut keys: Vec<usize> = Vec::new();
     let positions = variables
         .iter()
@@ -688,15 +709,7 @@ pub(super) fn groups_of(
             })
         })
         .collect();
-    let rows = solutions.table.len();
-    let groups = match keys.is_empty() && !variables.is_empty() {
-        true => Groups {
-            keys: IdTable::from_rows(0, std::iter::repeat_n(&[][..], usize::from(rows > 0))),
-            group_of: vec![0; rows],
-        },
-        false => group_rows(&solutions.table, &keys),
-    };
-    (groups, positions)
+    (keys, positions)
 }
 
 /// The groups' key columns by variable, of the groups `kept` (all of them if `None`): a

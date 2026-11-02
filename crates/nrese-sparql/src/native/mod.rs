@@ -5143,19 +5143,32 @@ impl<'a> Context<'a> {
         // Rows of the keyed side per chunk, so that a chunk's product has about
         // CROSS_CHUNK_ROWS rows.
         let per_chunk = (self.cross_chunk_rows / other.table.len().max(1)).max(1);
-        // A key in scope but never bound has no column: unbound in every row, it splits no
-        // group.
-        let key_columns: Vec<usize> = variables.iter().filter_map(|v| keyed.column(v)).collect();
+        // The keys' columns, each once: a key named again orders and splits nothing more,
+        // and one in scope but never bound has no column (unbound in every row, it splits
+        // no group).
+        let (key_columns, _) = aggregate::bound_keys(&keyed, variables);
+        let memory = QueryEvaluationError::MemoryLimit;
+        // The keyed rows' order and the sort's buffer: a word a row each, charged before
+        // they are made. Declared before `order`: dropped after it.
+        let mut scratch = Reservation::new(&*self.budget);
+        scratch
+            .charge(keyed.table.len().saturating_mul(16))
+            .map_err(memory)?;
         let mut order: Vec<usize> = (0..keyed.table.len()).collect();
         if keyed.table.len() > per_chunk {
-            let key_of = |row: usize| -> Vec<u64> {
+            // Stable: rows of a key keep their order, as the groups' members do.
+            order.sort_by(|&a, &b| {
                 key_columns
                     .iter()
-                    .map(|&c| keyed.table.get(row, c))
-                    .collect()
-            };
-            order.sort_by_cached_key(|&row| key_of(row));
+                    .map(|&c| keyed.table.get(a, c).cmp(&keyed.table.get(b, c)))
+                    .find(|ordering| ordering.is_ne())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
+        // The buffer is gone; the order is left, charged until the chunks are made.
+        scratch
+            .resize(order.capacity().saturating_mul(8))
+            .map_err(memory)?;
         let same_key = |a: usize, b: usize| {
             key_columns
                 .iter()
@@ -5197,6 +5210,8 @@ impl<'a> Context<'a> {
             parts.push(self.group_solutions(crossed, variables, aggregates)?);
             start = end;
         }
+        drop(order);
+        drop(scratch);
         self.consumed(keyed);
         self.consumed(other);
         let Some(first) = parts.first() else {
