@@ -130,6 +130,61 @@ fn nesting_is_bounded_and_deep_input_is_an_error() {
     .unwrap();
 }
 
+/// SPARQL 1.2 grammar: `AnnotationPath ::= ( Reifier | AnnotationBlockPath )*` and
+/// `AnnotationBlockPath ::= '{|' PropertyListPathNotEmpty '|}'`, so an object inside a
+/// block may carry a block of its own. Nested blocks count toward the nesting limit like
+/// groups and brackets ([`SparqlParser::with_max_nesting`], ADR-0012), so deep input is an
+/// error instead of unbounded recursion. Blocks side by side are siblings and add no depth.
+#[test]
+fn nested_annotation_blocks_count_toward_the_nesting_limit() {
+    let parser = SparqlParser::new().with_max_nesting(8);
+    let nested = |n: usize| {
+        format!(
+            "SELECT * {{ ?s <urn:p> ?o {}{} }}",
+            "{| <urn:q> ?x ".repeat(n),
+            "|} ".repeat(n)
+        )
+    };
+    let update = format!(
+        "INSERT {{ <urn:s> <urn:p> <urn:o> {}{} }} WHERE {{}}",
+        "{| <urn:q> <urn:x> ".repeat(20),
+        "|} ".repeat(20)
+    );
+    let siblings = format!(
+        "SELECT * {{ ?s <urn:p> ?o {} }}",
+        "{| <urn:q> ?x |} ".repeat(1000)
+    );
+    let deep = |result: Result<(), String>| result.is_err_and(|e| e.contains("nested deeper"));
+    let query = |text: &str| {
+        parser
+            .parse_query(text)
+            .map(|_| ())
+            .map_err(|e| e.message().to_string())
+    };
+    let cases = [
+        ("20 nested blocks in a query", deep(query(&nested(20)))),
+        (
+            "20 nested blocks in an update template",
+            deep(
+                parser
+                    .parse_update(&update)
+                    .map(|_| ())
+                    .map_err(|e| e.message().to_string()),
+            ),
+        ),
+        // Guards (they parse on the base too): within the limit, and siblings add no depth.
+        ("4 nested blocks parse", query(&nested(4)).is_ok()),
+        ("1,000 sibling blocks parse", query(&siblings).is_ok()),
+    ];
+    // Every case is checked, so a failure lists each wrong one.
+    let wrong: Vec<&str> = cases
+        .iter()
+        .filter(|(_, holds)| !holds)
+        .map(|(what, _)| *what)
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 #[test]
 fn aggregates_only_where_the_grammar_allows_them() {
     for text in [
