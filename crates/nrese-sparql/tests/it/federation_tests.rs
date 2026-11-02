@@ -5,7 +5,7 @@
 use std::sync::{Arc, Mutex};
 
 use nrese_engine::{Engine, EngineConfig};
-use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
+use nrese_rdf::{BlankNode, GraphName, Literal, NamedNode, Quad, Term, Triple, Variable};
 use nrese_sparql::{
     CancellationToken, QueryOptions, QueryResults, ServiceClient, ServiceResults, Services,
     evaluate_query, explain_query,
@@ -230,4 +230,186 @@ fn silent_services_fail_into_one_empty_solution() {
         assert_eq!(answers.len(), 2, "{answers:?}");
         assert!(answers.iter().all(|row| row.ends_with(" -")), "{answers:?}");
     }
+}
+
+/// An endpoint whose answer is made from the query text it gets.
+struct Canned(Box<dyn Fn(&str) -> ServiceResults + Send + Sync>);
+
+impl ServiceClient for Canned {
+    fn select(
+        &self,
+        endpoint: &str,
+        query: &str,
+        _cancellation: Option<&CancellationToken>,
+    ) -> Result<ServiceResults, Box<dyn std::error::Error + Send + Sync>> {
+        assert_eq!(endpoint, REMOTE);
+        Ok((self.0)(query))
+    }
+}
+
+fn canned(answer: impl Fn(&str) -> ServiceResults + Send + Sync + 'static) -> QueryOptions {
+    QueryOptions {
+        services: Some(Services(Arc::new(Canned(Box::new(answer))))),
+        ..QueryOptions::default()
+    }
+}
+
+fn count(n: u64) -> Vec<String> {
+    vec![
+        Literal::new_typed_literal(
+            n.to_string(),
+            NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer"),
+        )
+        .to_string(),
+    ]
+}
+
+/// A blank node label in an endpoint's answer names a node of that answer only (SPARQL 1.1
+/// Query Results JSON §3.2.2 and XML §2.3.1: labels are scoped to the results document): the
+/// same label twice in one answer is one node; in two answers, or in an answer and the store,
+/// two nodes that don't join. Triple terms holding one are scoped the same way.
+#[test]
+fn remote_blank_nodes_are_local_to_their_answer() {
+    let blank = || BlankNode::new_unchecked("b0");
+    // Every answer: two rows, each with `_:b0` for ?x and `<< _:b0 :p :o >>` for ?t,
+    // as far as the query mentions them.
+    let options = canned(move |query| {
+        let mut variables = Vec::new();
+        let mut row = Vec::new();
+        if query.contains("?x") {
+            variables.push(Variable::new_unchecked("x"));
+            row.push(Some(Term::from(blank())));
+        }
+        if query.contains("?t") {
+            variables.push(Variable::new_unchecked("t"));
+            row.push(Some(Term::Triple(Box::new(Triple::new(
+                blank(),
+                ex("p"),
+                ex("o"),
+            )))));
+        }
+        ServiceResults {
+            variables,
+            rows: vec![row.clone(), row],
+        }
+    });
+    // The store has a blank node labelled b0 too.
+    let local = engine(&[Quad::new(
+        blank(),
+        ex("p"),
+        ex("o"),
+        GraphName::DefaultGraph,
+    )]);
+    for (body, expected) in [
+        // One answer: its two rows name one node.
+        (
+            format!(
+                "SELECT (COUNT(DISTINCT ?x) AS ?n) WHERE {{ SERVICE <{REMOTE}> {{ ?x <{EX}p> <{EX}o> }} }}"
+            ),
+            1,
+        ),
+        // Two answers: their nodes differ.
+        (
+            format!(
+                "SELECT (COUNT(*) AS ?n) WHERE {{ SERVICE <{REMOTE}> {{ ?x <{EX}p> <{EX}o> }} SERVICE <{REMOTE}> {{ ?x <{EX}q> <{EX}o> }} }}"
+            ),
+            0,
+        ),
+        // An answer and the store: their nodes differ.
+        (
+            format!(
+                "SELECT (COUNT(*) AS ?n) WHERE {{ ?x <{EX}p> <{EX}o> SERVICE <{REMOTE}> {{ ?x <{EX}q> <{EX}o> }} }}"
+            ),
+            0,
+        ),
+        // Inside triple terms of two answers: they differ.
+        (
+            format!(
+                "SELECT (COUNT(*) AS ?n) WHERE {{ SERVICE <{REMOTE}> {{ ?t <{EX}p> <{EX}o> }} SERVICE <{REMOTE}> {{ ?t <{EX}q> <{EX}o> }} }}"
+            ),
+            0,
+        ),
+    ] {
+        assert_eq!(
+            rows(&local, &body, &options).unwrap(),
+            count(expected),
+            "{body}"
+        );
+    }
+}
+
+/// `SERVICE SILENT ?e`: a row whose ?e is no IRI (a literal, or unbound) can't be sent
+/// anywhere, so it is joined to one empty solution, as a failed call's rows are: kept once,
+/// and joined to no other endpoint's answer. Joined and OPTIONAL alike.
+#[test]
+fn silent_service_variables_keep_rows_without_an_endpoint() {
+    let typed = |s: &str| {
+        Quad::new(
+            ex(s),
+            NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            ex("T"),
+            GraphName::DefaultGraph,
+        )
+    };
+    let local = engine(&[
+        typed("s1"),
+        typed("s2"),
+        typed("s3"),
+        Quad::new(
+            ex("s1"),
+            ex("ep"),
+            NamedNode::new_unchecked(REMOTE),
+            GraphName::DefaultGraph,
+        ),
+        Quad::new(
+            ex("s2"),
+            ex("ep"),
+            Literal::new_simple_literal("elsewhere"),
+            GraphName::DefaultGraph,
+        ),
+    ]);
+    // The endpoint knows one city's name.
+    let options = canned(|_| ServiceResults {
+        variables: vec![Variable::new_unchecked("x"), Variable::new_unchecked("c")],
+        rows: vec![vec![
+            Some(ex("city").into()),
+            Some(Literal::new_simple_literal("one").into()),
+        ]],
+    });
+    let expected = vec![
+        format!("<{EX}s1> \"one\""),
+        format!("<{EX}s2> -"),
+        format!("<{EX}s3> -"),
+    ];
+    for service in [
+        "SERVICE SILENT ?e { ?x <http://example.com/name> ?c }",
+        "OPTIONAL { SERVICE SILENT ?e { ?x <http://example.com/name> ?c } }",
+    ] {
+        let query = format!(
+            "SELECT ?s ?c WHERE {{ ?s a <{EX}T> OPTIONAL {{ ?s <{EX}ep> ?e }} {service} }}"
+        );
+        assert_eq!(rows(&local, &query, &options).unwrap(), expected, "{query}");
+    }
+}
+
+/// The endpoint evaluates the block under the query's BASE: `IRI("rel")` there resolves
+/// against it, as it would locally (SPARQL 1.1 §17.4.2.8).
+#[test]
+fn service_blocks_resolve_against_the_query_base() {
+    let endpoint = Arc::new(Endpoint {
+        engine: engine(&[]),
+        queries: Mutex::default(),
+        fail: false,
+    });
+    let options = QueryOptions {
+        services: Some(Services(endpoint)),
+        ..QueryOptions::default()
+    };
+    let query = format!(
+        "BASE <http://base.example/> SELECT ?x WHERE {{ SERVICE <{REMOTE}> {{ BIND(IRI(\"rel\") AS ?x) }} }}"
+    );
+    assert_eq!(
+        rows(&engine(&[]), &query, &options).unwrap(),
+        vec!["<http://base.example/rel>".to_owned()]
+    );
 }
