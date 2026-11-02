@@ -62,12 +62,12 @@ const CHUNKS_PER_THREAD: usize = 4;
 const ROW_STEP: usize = 4096;
 
 /// A child's message to its parent in a counted forest ([`Query::weights`]) is built from
-/// the child's values while it stays within this many times the shortest list of the
-/// parent's values (at least [`MESSAGE_MIN`] entries); past that, the parent's values in
-/// that list are counted one by one against the child's weights instead. On hub-skewed
-/// data the message gathers every neighbour of every hub only to be cut down to a dozen
-/// values (kernel-intersect's skewed triangles: 107 ms against main's 85 ms enumerating
-/// them, 18 Oct 2026).
+/// the child's values; where one value has more matches than this many times the shortest
+/// list of the parent's values (at least [`MESSAGE_MIN`]), the parent's values in that list
+/// are counted one by one against the child's weights instead, if that reads fewer entries
+/// than the value's matches. On hub-skewed data the message gathers every neighbour of
+/// every hub only to be cut down to a dozen values (kernel-intersect's skewed triangles:
+/// 107 ms against main's 85 ms enumerating them, 18 Oct 2026).
 const MESSAGE_FACTOR: usize = 64;
 
 /// The least message built before [`MESSAGE_FACTOR`] applies.
@@ -227,9 +227,9 @@ impl<'a> Query<'a> {
     /// times with only its constants bound, with their matches, in value order: the
     /// snapshot's, kept for its version (a walk of the index's groups per query made
     /// uniform triangles 0.3 % more instructions than without them; fleet pm-p2-count-2,
-    /// 31 Oct 2026). `None` where the index can't walk them. A forest's
-    /// patterns have no variable outside the forest, so these are the counts under any
-    /// bindings of the order's prefix.
+    /// 31 Oct 2026). `None` where the index can't walk them. Where the pattern has a
+    /// variable outside the forest, these counts have it free: under the order's prefix
+    /// they bound the matches from above only ([`Query::weights`] counts them there).
     fn heavy(&self, index: usize, position: usize) -> Option<&[(TermId, u64)]> {
         self.heavy[index * 3 + position]
             .get_or_init(|| {
@@ -780,12 +780,19 @@ impl<'a> Query<'a> {
             let mut over = false;
             // A child value's matches checked before they are read where they may exceed the
             // budget at once: the pattern's heavy values, found once per query (a count per
-            // value made uniform triangles 29 % more instructions, 19 Oct 2026); a light one
-            // is read and added, at most [`MESSAGE_MIN`] past the budget.
+            // value made uniform triangles 29 % more instructions, 19 Oct 2026). Counting
+            // per parent is taken only where it reads fewer entries than the value's matches
+            // the gather has yet to read: what is read is spent, and the light values to come
+            // may have none (notes/2026-11-02-pm-p2-direction-invariant.md).
             let position = (0..3).find(|&c| self.patterns[pattern][c] == Pos::Var(child));
             let heavy = budget
                 .and(position)
                 .and_then(|position| self.found_heavy(pattern, position));
+            // Whether a heavy count is the gather's read: not where the pattern has a variable
+            // the order's prefix binds (the count has it free).
+            let exact = self.patterns[pattern]
+                .iter()
+                .all(|&p| !matches!(p, Pos::Var(v) if v != child && v != var));
             let mut next_heavy = 0;
             // Per parent value of the shortest list, its matches (`None` once the gather is
             // found cheaper and goes on without the budget).
@@ -794,25 +801,31 @@ impl<'a> Query<'a> {
             for &(value, weight) in &sent {
                 work.bindings[child] = Some(value);
                 // Without the heavy values (an index that can't walk them) no value is
-                // counted ahead: the check after the read below bounds the message.
+                // counted ahead, and the message is gathered.
                 if let (Some(limit), Some(heavy)) = (budget, heavy) {
                     next_heavy += heavy[next_heavy..].partition_point(|&(v, _)| v.raw() < value);
                     let count = match heavy.get(next_heavy) {
                         Some(&(v, n)) if v.raw() == value => n as usize,
                         _ => 0,
                     };
-                    if message.len() + count > limit {
-                        work.bindings[child] = None;
-                        let parents = shortest.expect("a budget comes from a list");
-                        let gathered = message.len() + count;
-                        per_parent =
-                            self.per_parent(pattern, var, parents, sent.len(), gathered, work);
-                        if per_parent.is_some() {
-                            over = true;
-                            break;
-                        }
+                    if count > limit {
+                        // One decision per gather: after it the gather goes on unbudgeted.
                         budget = None;
-                        work.bindings[child] = Some(value);
+                        let left = match exact {
+                            true => Some(count),
+                            false => self.read_count(pattern, slot, work),
+                        };
+                        if let Some(left) = left.filter(|&left| left > limit) {
+                            work.bindings[child] = None;
+                            let parents = shortest.expect("a budget comes from a list");
+                            per_parent =
+                                self.per_parent(pattern, var, parents, sent.len(), left, work);
+                            if per_parent.is_some() {
+                                over = true;
+                                break;
+                            }
+                            work.bindings[child] = Some(value);
+                        }
                     }
                 }
                 let values = self.sorted_values(pattern, var, slot, work);
@@ -820,16 +833,6 @@ impl<'a> Query<'a> {
                 let values = values?;
                 work.messages += values.len();
                 message.extend(values.iter().map(|&v| (v, weight)));
-                if budget.is_some_and(|limit| message.len() > limit) {
-                    let parents = shortest.expect("a budget comes from a list");
-                    let gathered = message.len();
-                    per_parent = self.per_parent(pattern, var, parents, sent.len(), gathered, work);
-                    if per_parent.is_some() {
-                        over = true;
-                        break;
-                    }
-                    budget = None;
-                }
             }
             if let Some(matches) = per_parent.filter(|_| over) {
                 // The parent's values in its shortest list, each counted against the
@@ -1069,18 +1072,18 @@ impl<'a> Query<'a> {
 impl<'a> Query<'a> {
     /// Per value of `parents`, its matches in pattern `index` with `var` bound to it (the
     /// child free; zero only where there is none), where counting the message per parent
-    /// reads fewer entries than `gathered`, the entries its gather has read or found it
-    /// must: each parent reads its matches or probes the `sent` child values, whichever is
+    /// reads fewer entries than `left`, a lower bound on the entries its gather has yet to
+    /// read: each parent reads its matches or probes the `sent` child values, whichever is
     /// fewer, and probes them where the matches are no bound ([`Self::counts_bound_reads`]).
     /// `None` where it doesn't (the gather goes on), the counts stopped once they reach
-    /// `gathered`.
+    /// `left`. With the entries read before, the message then takes fewer than the gather.
     fn per_parent(
         &self,
         index: usize,
         var: usize,
         parents: &[(u64, u64)],
         sent: usize,
-        gathered: usize,
+        left: usize,
         work: &mut Work<'a>,
     ) -> Option<Vec<u64>> {
         let slot = self.variables;
@@ -1098,12 +1101,22 @@ impl<'a> Query<'a> {
                 (_, false) => sent,
             };
             reads = reads.saturating_add(read);
-            if reads >= gathered {
+            if reads >= left {
                 return None;
             }
             matches.push(n);
         }
         Some(matches)
+    }
+
+    /// The matches of pattern `index` under `work`'s bindings, where they are what reading
+    /// them gives ([`Self::counts_bound_reads`]); `None` where the count is no bound.
+    fn read_count(&self, index: usize, slot: usize, work: &mut Work<'a>) -> Option<usize> {
+        if !self.counts_bound_reads() {
+            return None;
+        }
+        let quad = self.quad_pattern(&self.patterns[index], &work.bindings);
+        Some(work.cursor(slot, index, Use::Count, self).count(&quad) as usize)
     }
 
     /// Whether a cursor's match count bounds what reading the matches gives: not where
