@@ -836,15 +836,16 @@ impl<'a> Query<'a> {
                 // child's weights: what the join with that list keeps of the message. A
                 // parent with fewer matches than the child has values reads its matches;
                 // one with more probes the child's values instead, so no parent reads more
-                // than either.
+                // than either; where its matches are no bound, it probes.
                 message.clear();
                 let parents = shortest.expect("a budget comes from a list");
+                let bound = self.counts_bound_reads();
                 for (&(value, _), matches) in parents.iter().zip(matches) {
                     if matches == 0 {
                         continue;
                     }
                     work.bindings[var] = Some(value);
-                    let weight = if matches <= sent.len() as u64 {
+                    let weight = if bound && matches <= sent.len() as u64 {
                         // The other order of the pattern: the cursor otherwise kept for
                         // checks, which a count's last depth makes none of.
                         let values = self.sorted_values_by(pattern, child, slot, Use::Seek, work);
@@ -1067,11 +1068,12 @@ impl<'a> Query<'a> {
 
 impl<'a> Query<'a> {
     /// Per value of `parents`, its matches in pattern `index` with `var` bound to it (the
-    /// child free; for planning, so an estimate where equality classes expand, zero only
-    /// where there is none), where counting the message per parent that way reads fewer entries than
-    /// `gathered`, the entries its gather has read or found it must: each parent reads its
-    /// matches or probes the `sent` child values, whichever is fewer. `None` where it
-    /// doesn't (the gather goes on), the counts stopped once they reach `gathered`.
+    /// child free; zero only where there is none), where counting the message per parent
+    /// reads fewer entries than `gathered`, the entries its gather has read or found it
+    /// must: each parent reads its matches or probes the `sent` child values, whichever is
+    /// fewer, and probes them where the matches are no bound ([`Self::counts_bound_reads`]).
+    /// `None` where it doesn't (the gather goes on), the counts stopped once they reach
+    /// `gathered`.
     fn per_parent(
         &self,
         index: usize,
@@ -1082,6 +1084,7 @@ impl<'a> Query<'a> {
         work: &mut Work<'a>,
     ) -> Option<Vec<u64>> {
         let slot = self.variables;
+        let bound = self.counts_bound_reads();
         let mut matches = Vec::with_capacity(parents.len());
         let mut reads = 0usize;
         for &(value, _) in parents {
@@ -1089,13 +1092,29 @@ impl<'a> Query<'a> {
             let quad = self.quad_pattern(&self.patterns[index], &work.bindings);
             let n = work.cursor(slot, index, Use::Count, self).count(&quad);
             work.bindings[var] = None;
-            reads = reads.saturating_add((n as usize).min(sent));
+            let read = match (n, bound) {
+                (0, _) => 0,
+                (n, true) => (n as usize).min(sent),
+                (_, false) => sent,
+            };
+            reads = reads.saturating_add(read);
             if reads >= gathered {
                 return None;
             }
             matches.push(n);
         }
         Some(matches)
+    }
+
+    /// Whether a cursor's match count bounds what reading the matches gives: not where
+    /// equality classes may expand the read ([`ProbeCursor::count`] is then an estimate of
+    /// the stored statements, which a class of M aliases reads M times).
+    fn counts_bound_reads(&self) -> bool {
+        self.model == ReadModel::Asserted
+            || self
+                .snapshot
+                .equality_classes()
+                .is_none_or(|classes| classes.is_empty())
     }
 }
 
@@ -1424,6 +1443,81 @@ mod tests {
         );
         assert!(stats.counted_after.is_some(), "counted by a forest");
         assert_eq!(counted, 0, "B -> C is asserted, not inferred");
+    }
+
+    /// Where equality classes expand a read, a match count is an estimate of the stored
+    /// statements, no bound of what the read gives: per parent the child's values are then
+    /// probed, never the parent's matches read. K triangles A_i -> B -> C1 -> A_i, C2 -> A_i,
+    /// 65 more predecessors of C1, and B -> D0 with D0 standing for M aliases: B's
+    /// matches estimate as 2 (C1, D0) against two child values, while the read gives
+    /// M + 2. Reading them per A_i made K (M + 2) entries (sol-loop r1 S1 on PR #81's
+    /// R1-F1 repair); the count is exact (3K) and the entries grow with K + M.
+    #[test]
+    fn a_parent_counted_per_value_reads_no_expanded_matches() {
+        use super::{Pos, Query, Stats};
+        use nrese_engine::{EncodedTriple, ReadModel};
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        const K: usize = 64;
+        let node = |name: &str| NamedNode::new_unchecked(format!("http://e/{name}"));
+        let mut entries = Vec::new();
+        for m in [1_024, 4_096] {
+            let engine = nrese_engine::Engine::new(nrese_engine::EngineConfig {
+                background_maintenance: false,
+                ..Default::default()
+            })
+            .unwrap();
+            let mut tx = engine.transaction();
+            let same_as = tx.intern(node("sameAs").as_ref().into());
+            // D0 first: the least id of its class, its representative.
+            let d0 = tx.intern(node("d0").as_ref().into());
+            for t in 0..m {
+                let alias = tx.intern(node(&format!("d0-{t}")).as_ref().into());
+                tx.insert_inferred(EncodedTriple {
+                    subject: alias,
+                    predicate: same_as,
+                    object: d0,
+                });
+            }
+            let mut add = |a: &str, b: &str| {
+                tx.insert(Quad::new(node(a), node("p"), node(b), GraphName::DefaultGraph).as_ref());
+            };
+            for i in 0..K {
+                add(&format!("a{i}"), "b");
+                add("c1", &format!("a{i}"));
+                add("c2", &format!("a{i}"));
+            }
+            add("b", "c1");
+            add("b", "d0");
+            for j in 0..65 {
+                add(&format!("x{j}"), "c1");
+            }
+            tx.commit().unwrap();
+            engine.set_equality(Some(same_as));
+            let snapshot = engine.snapshot();
+            let p = snapshot.lookup(node("p").as_ref().into()).unwrap().raw();
+            let (a, b, c) = (Pos::Var(0), Pos::Var(1), Pos::Var(2));
+            let patterns = vec![
+                [a, Pos::Const(p), b],
+                [b, Pos::Const(p), c],
+                [c, Pos::Const(p), a],
+            ];
+            let query = Query::new(&snapshot, ReadModel::Materialised, patterns, 3, usize::MAX);
+            let mut stats = Stats::default();
+            let counted = query
+                .count_solutions(&|| false, &mut stats)
+                .ok()
+                .unwrap()
+                .exact()
+                .unwrap();
+            assert!(stats.counted_after.is_some(), "counted by a forest");
+            assert_eq!(counted as usize, 3 * K, "M = {m}");
+            entries.push(stats.messages.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        // 3,072 more aliases: a few reads of them, not one per A_i.
+        assert!(
+            entries[1].saturating_sub(entries[0]) <= 4 * 3_072,
+            "message entries {entries:?} at M = 1,024 and 4,096"
+        );
     }
 
     #[test]
