@@ -1378,6 +1378,74 @@ mod tests {
         assert!(entries[1] < 16 * 4_096, "message entries {entries:?}");
     }
 
+    /// A message counted per parent value reads no more than gathering it where the joining
+    /// pattern has a variable the order's prefix binds: the heavy count, every variable
+    /// free, then only bounds the matches from above. A p B_j (P), C_i p A (T), A B_0 C_0,
+    /// A B_j D_i (P T) and 2 P T statements Z_k q C_0: `?a p ?b . ?a ?b ?c . ?c p ?a` has
+    /// one solution, (A, B_0, C_0), and under a = A the gather reads one entry, C_0's
+    /// 2 P T + 1 matches being one there. Taking the heavy count for the gather's cost
+    /// counted per B_j instead: P T entries (PR #81 fix check r1). Numbered and read as
+    /// the COUNT caller does (`cyclic_count`: variables in subject, predicate, object order).
+    #[test]
+    fn a_message_counted_per_parent_reads_no_more_than_the_gather_under_a_bound_prefix() {
+        use super::{Pos, Query, Stats};
+        use nrese_engine::ReadModel;
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        let node = |name: String| NamedNode::new_unchecked(format!("http://e/{name}"));
+        for (p, t) in [(16usize, 128usize), (32, 256)] {
+            let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+            let mut tx = engine.transaction();
+            let mut add = |s: String, predicate: String, o: String| {
+                let quad = Quad::new(node(s), node(predicate), node(o), GraphName::DefaultGraph);
+                tx.insert(quad.as_ref());
+            };
+            // C_0 first: the first child value.
+            for i in 0..t {
+                add(format!("c{i}"), "p".into(), "a".into());
+            }
+            for j in 0..p {
+                add("a".into(), "p".into(), format!("b{j}"));
+            }
+            add("a".into(), "b0".into(), "c0".into());
+            for j in 0..p {
+                for i in 0..t {
+                    add("a".into(), format!("b{j}"), format!("d{i}"));
+                }
+            }
+            for k in 0..2 * p * t {
+                add(format!("z{k}"), "q".into(), "c0".into());
+            }
+            tx.commit().unwrap();
+            let snapshot = engine.snapshot();
+            let edge = snapshot
+                .lookup(node("p".into()).as_ref().into())
+                .unwrap()
+                .raw();
+            let (a, b, c) = (Pos::Var(0), Pos::Var(1), Pos::Var(2));
+            let patterns = vec![
+                [a, Pos::Const(edge), b],
+                [a, b, c],
+                [c, Pos::Const(edge), a],
+            ];
+            let query = Query::new(&snapshot, ReadModel::Asserted, patterns, 3, usize::MAX);
+            let mut stats = Stats::default();
+            let counted = query
+                .count_solutions(&|| false, &mut stats)
+                .ok()
+                .unwrap()
+                .exact()
+                .unwrap();
+            assert_eq!(counted, 1, "P = {p}, T = {t}");
+            assert_eq!(stats.order, [0, 1, 2]);
+            assert_eq!(stats.counted_after, Some(1), "counted by a forest under a");
+            let messages = stats.messages.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                messages <= 1,
+                "{messages} message entries at P = {p}, T = {t}"
+            );
+        }
+    }
+
     /// A parent counted per value probes the child's values for matches the read shows,
     /// not for a planning count's: an inferred read with equality classes estimates from
     /// the stored statements, asserted ones too. A_i -> B, C -> A_i, 65 X_j -> C and
