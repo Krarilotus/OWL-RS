@@ -22,6 +22,8 @@
 mod bulk;
 pub mod characteristic;
 mod equality;
+#[cfg(test)]
+mod lock_tests;
 mod replication;
 mod snapshot;
 pub(crate) mod spill;
