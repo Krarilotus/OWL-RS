@@ -538,6 +538,14 @@ impl VectorBuild {
     }
 }
 
+#[cfg(test)]
+impl VectorBuild {
+    /// Its run up to its end: the graph built and installed, the job kept.
+    pub(crate) fn install_kept(&self) {
+        build(&self.index, &self.query, Some(self.reservation));
+    }
+}
+
 impl Drop for VectorBuild {
     fn drop(&mut self) {
         // Nothing if its install ended the reservation already.
