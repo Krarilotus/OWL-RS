@@ -1197,6 +1197,83 @@ mod tests {
         );
     }
 
+    /// XPath F&O 3.1 `op:add-dayTimeDuration-to-time` and
+    /// `op:subtract-dayTimeDuration-from-time`: the duration is taken modulo 86,400
+    /// seconds, so any duration in range has a time result. 10¹⁹ s ≡ 64,000 s (17:46:40);
+    /// `Decimal::MIN` seconds ≡ 09:51:08.312696284115894272 (its negation, 14:08:51.6873…,
+    /// is not a `Decimal`).
+    #[test]
+    fn time_arithmetic_takes_any_duration_modulo_a_day() {
+        let time = |t: &str| t.parse::<Time>().unwrap();
+        let huge = "PT10000000000000000000S"
+            .parse::<DayTimeDuration>()
+            .unwrap();
+        let min = DayTimeDuration::new(Decimal::MIN);
+        let midnight = time("00:00:00");
+        let cases = [
+            ("+ 10¹⁹ s", midnight.checked_add_duration(huge), "17:46:40"),
+            ("- 10¹⁹ s", midnight.checked_sub_duration(huge), "06:13:20"),
+            (
+                "+ MIN s",
+                midnight.checked_add_duration(min),
+                "09:51:08.312696284115894272",
+            ),
+            (
+                "- MIN s",
+                midnight.checked_sub_duration(min),
+                "14:08:51.687303715884105728",
+            ),
+        ];
+        // Every case is checked, so a failure lists each wrong one.
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|(_, got, expected)| *got != Some(time(expected)))
+            .map(|(what, got, expected)| format!("00:00:00 {what} = {got:?}, not {expected}"))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// XSD 1.1 Part 2, `endOfDayFrag ::= '24:00:00' ('.' '0'+)?` (in the lexical spaces of
+    /// `xsd:time` §3.3.8 and `xsd:dateTime` §3.3.7): hour
+    /// 24 takes only zero fraction digits, however many; digits past the 18th are still
+    /// digits. Other times keep the precision contract: digits past the 18th are dropped.
+    #[test]
+    fn end_of_day_admits_only_zero_fraction_digits() {
+        let time = |t: &str| t.parse::<Time>().ok();
+        let date_time = |t: &str| t.parse::<DateTime>().ok();
+        let cases = [
+            (
+                "24:00:00.0000000000000000001",
+                time("24:00:00.0000000000000000001").is_none(),
+            ),
+            (
+                "2002-10-10T24:00:00.0000000000000000001",
+                date_time("2002-10-10T24:00:00.0000000000000000001").is_none(),
+            ),
+            // Guards (right on the base too): zeros however many, and ordinary truncation.
+            (
+                "24:00:00.0000000000000000000",
+                time("24:00:00.0000000000000000000") == time("00:00:00"),
+            ),
+            (
+                "2002-10-10T24:00:00.0000000000000000000",
+                date_time("2002-10-10T24:00:00.0000000000000000000")
+                    == date_time("2002-10-11T00:00:00"),
+            ),
+            (
+                "12:00:00.0000000000000000001",
+                time("12:00:00.0000000000000000001") == time("12:00:00"),
+            ),
+        ];
+        // Every case is checked, so a failure lists each wrong one.
+        let wrong: Vec<&str> = cases
+            .iter()
+            .filter(|(_, holds)| !holds)
+            .map(|(text, _)| *text)
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[test]
     fn components_and_timezones() {
         let d = dt("1999-05-31T13:20:00.25-05:00");
