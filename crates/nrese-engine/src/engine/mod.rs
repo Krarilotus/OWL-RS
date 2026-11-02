@@ -48,7 +48,7 @@ pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
 pub use equality::Classes as EqualityClasses;
 pub use replication::LogBatch;
 pub use snapshot::{
-    Count, InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity,
+    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity,
 };
 pub use transaction::{CommitSummary, Transaction};
 

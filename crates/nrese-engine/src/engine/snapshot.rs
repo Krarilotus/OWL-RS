@@ -10,6 +10,10 @@ use super::{ReadModel, Stack, Version};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::{Dictionary, TermId};
 
+/// A pattern's heavy groups as the engine keeps them ([`Snapshot::heavy_groups_in`]): values
+/// with their match counts, in id order, charged for as long as any holder keeps them.
+pub type HeavyGroups = Arc<nrese_exec::ChargedVec<(TermId, u64)>>;
+
 mod cursor;
 pub use cursor::{ProbeCursor, Seek};
 
@@ -1295,29 +1299,7 @@ impl Snapshot {
         permutation: Permutation,
     ) -> Option<Vec<(TermId, u64)>> {
         let pattern = self.read_pattern(model, pattern);
-        let pattern = &*pattern;
-        if self.expanding(model, pattern).is_some() {
-            return None;
-        }
-        let plan = AccessPlan::in_permutation(pattern, permutation)?;
-        if plan.exclude_default_graph {
-            return None;
-        }
-        let bound = plan
-            .low
-            .iter()
-            .zip(&plan.high)
-            .take_while(|(l, h)| l == h)
-            .count();
-        if bound >= 4 {
-            return None;
-        }
-        let supported = Stack::ALL.into_iter().all(|stack| {
-            !model.includes(stack) || self.data(model).stack(stack).layout().supports(permutation)
-        });
-        if !supported {
-            return None;
-        }
+        let (plan, bound) = self.group_plan(model, &pattern, permutation)?;
         let mut counts = Vec::new();
         let mut sources = 0;
         for stack in Stack::ALL {
@@ -1347,6 +1329,118 @@ impl Snapshot {
                 .map(|(value, count)| (TermId::from_raw(value), count as u64))
                 .collect(),
         )
+    }
+
+    /// The plan the group walks of `pattern` (as read) take in `permutation`, and its bound
+    /// prefix's length: `None` where a walk can't answer it (equality classes expanded, a
+    /// bound graph after the prefix, a range excluding the default graph, an included
+    /// stack without the permutation).
+    fn group_plan(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+    ) -> Option<(AccessPlan, usize)> {
+        if self.expanding(model, pattern).is_some() {
+            return None;
+        }
+        let plan = AccessPlan::in_permutation(pattern, permutation)?;
+        if plan.exclude_default_graph {
+            return None;
+        }
+        let bound = plan
+            .low
+            .iter()
+            .zip(&plan.high)
+            .take_while(|(l, h)| l == h)
+            .count();
+        if bound >= 4 {
+            return None;
+        }
+        let supported = Stack::ALL.into_iter().all(|stack| {
+            !model.includes(stack) || self.data(model).stack(stack).layout().supports(permutation)
+        });
+        supported.then_some((plan, bound))
+    }
+
+    /// The groups of [`Self::group_counts_in`] that more than `min` quads match, in id
+    /// order: exact, and kept for this version once walked, so that a planner asking for
+    /// them per query walks the index once (a counted forest's message budgets,
+    /// `nrese-sparql`'s `wcoj`). Charged to the engine's statistics budget
+    /// ([`crate::Engine::charge_statistics_to`]) for as long as any holder keeps them.
+    /// `None` where `group_counts_in` can't walk them, or the budget can't take them.
+    pub fn heavy_groups_in(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        min: u64,
+    ) -> Option<HeavyGroups> {
+        let read = *self.read_pattern(model, pattern);
+        // Which reads the walk answers is decided before the list kept: a stored read of
+        // this version keeps one under the same key.
+        let (plan, bound) = self.group_plan(model, &read, permutation)?;
+        self.statistics
+            .heavy_groups(self.data(model), model, read, permutation, min, |budget| {
+                self.heavy_groups_walked(model, &plan, bound, min, budget)
+            })
+    }
+
+    /// The groups past `min` of `plan` grouped at `bound`, charged to `budget` as they are
+    /// found: the candidates of each run past `min / r` for `r` runs in all (a value past
+    /// `min` in all of them is one), each counted again in all of them unless one run
+    /// holds the range. No light group is held.
+    fn heavy_groups_walked(
+        &self,
+        model: ReadModel,
+        plan: &AccessPlan,
+        bound: usize,
+        min: u64,
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<nrese_exec::ChargedVec<(TermId, u64)>, nrese_exec::BudgetExceeded> {
+        let stacks = || {
+            Stack::ALL
+                .into_iter()
+                .filter(move |&stack| model.includes(stack))
+        };
+        let runs: usize = stacks()
+            .map(|stack| self.data(model).stack(stack).runs().len())
+            .sum();
+        let above = (min / runs.max(1) as u64) as i64;
+        let mut candidates = nrese_exec::ChargedVec::new(Arc::clone(budget));
+        for stack in stacks() {
+            self.data(model)
+                .stack(stack)
+                .group_candidates(plan, bound, above, &mut candidates)?;
+        }
+        let mut heavy = nrese_exec::ChargedVec::new(Arc::clone(budget));
+        if runs <= 1 {
+            // One run: its counts are the values' own.
+            for &(value, count) in candidates.iter() {
+                if count > min as i64 {
+                    heavy.push((TermId::from_raw(value), count as u64))?;
+                }
+            }
+            return Ok(heavy);
+        }
+        candidates.sort_unstable_by_key(|&(value, _)| value);
+        let mut last = None;
+        for &(value, _) in candidates.iter() {
+            // Each value once, though several runs may hold it past `above`.
+            if last.replace(value) == Some(value) {
+                continue;
+            }
+            let mut exact = *plan;
+            exact.low[bound] = value;
+            exact.high[bound] = value;
+            let count: u64 = stacks()
+                .map(|stack| self.data(model).stack(stack).count_plan(&exact))
+                .sum();
+            if count > min {
+                heavy.push((TermId::from_raw(value), count))?;
+            }
+        }
+        Ok(heavy)
     }
 
     /// The values of `components` (subject 0, predicate 1, object 2, graph 3) of the quads
