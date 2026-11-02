@@ -35,6 +35,9 @@ Read [docs/README.md](docs/README.md) (which document answers what),
 - Before building a tool, look in [docs/README.md](docs/README.md#where-is) for the one that
   exists.
 - `literature/` is read-only. Results of licensed systems are never committed.
+- Before writing a research prompt or a design from scratch, ask what prior research already
+  found: `literature/wiki/00 Index.md`, the research rounds in
+  `literature/wiki/research/Research reports.md`.
 - Write files with the editor tools; the shell mangles backslashes.
 - Commit-message rules: [CONTRIBUTING.md](CONTRIBUTING.md).
 
