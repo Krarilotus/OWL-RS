@@ -7,3 +7,10 @@ cargo-nextest 0.9.146
 # Miri's toolchain (scripts/miri.sh)
 miri nightly-2026-10-01
 cargo-deny 0.20.2
+# The suite's Python in the Windows tier (scripts/lib/windows-job.sh installs it, under the host's
+# cache, never the host's own): python.org's build of this version, its NuGet package
+# (https://www.nuget.org/packages/python) by the package's sha256, and the sys.version that
+# build reports, which the suite's environment must report (scripts/lib/gate-key.sh gate_runtime).
+#
+#   python-windows version sha256 sys.version
+python-windows 3.13.3 ebddee5683bc3b461d7adaf29f669c7b51d7104a9e203bef4973cc3eefa45ac3 3.13.3 (tags/v3.13.3:6280bb5, Apr  8 2025, 14:47:33) [MSC v.1943 64 bit (AMD64)]

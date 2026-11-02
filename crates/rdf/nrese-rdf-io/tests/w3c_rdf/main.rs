@@ -11,7 +11,10 @@
 //! - **Manifests** are Turtle, read with this crate's own parser.
 //! - **Streaming.** Every document is also read through a reader that gives one byte per
 //!   call, so that every token is cut by the buffer somewhere: the outcome must be the
-//!   same (the same statements up to blank node names, or an error).
+//!   same (the same statements up to blank node names, or a syntax error).
+//! - **Rejection.** A negative test passes only when both readers reject the document's
+//!   content (a syntax error). A fixture that can't be read, a setup error, an I/O error or
+//!   the two readers disagreeing fails the test, whatever its kind.
 //! - **Round trips.** Every document that parses is written back, in its own format, as
 //!   N-Quads and as JSON-LD (Turtle, TriG, RDF/XML and JSON-LD with a few prefixes, to
 //!   exercise abbreviation), and read again: the statements must be the same. JSON-LD 1.1
@@ -19,14 +22,12 @@
 //!   `rdfDirection` option is set), so documents with either skip that one.
 //! - **Parallel parsing.** Every Turtle and TriG document that parses is also cut into 2,
 //!   3 and 8 chunks by the exact splitter and parsed chunk by chunk: the same statements.
-//! - `expected-failures.txt` lists tests that fail on purpose, each with its reason; a new
-//!   failure, or a pass of a listed test, fails the run.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use nrese_rdf::{Dataset, Quad, Term};
-use nrese_rdf_io::{RdfFormat, RdfParser, RdfSerializer};
+use nrese_rdf_io::{RdfFormat, RdfParseError, RdfParser, RdfSerializer, RdfSyntaxError};
 
 const BASE: &str = "https://w3c.github.io/rdf-tests/";
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
@@ -187,31 +188,39 @@ fn canonical(quads: BTreeSet<Quad>) -> Dataset {
     dataset
 }
 
-/// The statements of a document, or the parse error; read from a slice and through a
-/// trickling reader, which must agree.
-fn parse(root: &Path, format: RdfFormat, iri: &str) -> Result<BTreeSet<Quad>, String> {
-    let bytes = std::fs::read(file(root, iri)).map_err(|e| e.to_string())?;
+/// A document's statements, or the syntax error both readers reject its content with.
+type Verdict = Result<BTreeSet<Quad>, RdfSyntaxError>;
+
+/// The verdict on a document, read from a slice and through a trickling reader. `Err` when
+/// there is none: the fixture can't be read, the parser can't be set up, or the readers
+/// disagree.
+fn parse(root: &Path, format: RdfFormat, iri: &str) -> Result<Verdict, String> {
+    let path = file(root, iri);
+    let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let parser = RdfParser::from_format(format)
         .with_base_iri(iri)
-        .map_err(|e| e.to_string())?;
-    let from_slice: Result<BTreeSet<Quad>, String> = parser
-        .clone()
-        .for_slice(&bytes)
-        .collect::<Result<_, _>>()
-        .map_err(|e| e.to_string());
-    let from_reader: Result<BTreeSet<Quad>, String> = parser
-        .for_reader(Trickle(&bytes))
-        .collect::<Result<_, _>>()
-        .map_err(|e| e.to_string());
-    match (&from_slice, from_reader) {
-        (Ok(a), Ok(b)) if canonical(a.clone()) != canonical(b.clone()) => {
-            return Err("a slice and a trickling reader give different statements".to_owned());
+        .map_err(|e| format!("the base IRI {iri}: {e}"))?;
+    let from_slice = parser.clone().for_slice(&bytes).collect();
+    agree(from_slice, parser.for_reader(Trickle(&bytes)).collect())
+}
+
+/// One verdict of the slice's and the reader's: the same statements up to blank node
+/// names, or a syntax error from both. An I/O error is never a verdict.
+fn agree(
+    from_slice: Result<BTreeSet<Quad>, RdfParseError>,
+    from_reader: Result<BTreeSet<Quad>, RdfParseError>,
+) -> Result<Verdict, String> {
+    match (from_slice, from_reader) {
+        (Ok(a), Ok(b)) if canonical(a.clone()) == canonical(b.clone()) => Ok(Ok(a)),
+        (Ok(_), Ok(_)) => {
+            Err("a slice and a trickling reader give different statements".to_owned())
         }
-        (Ok(_), Err(e)) => return Err(format!("only the trickling reader fails: {e}")),
-        (Err(e), Ok(_)) => return Err(format!("only the slice fails: {e}")),
-        _ => {}
+        (Err(RdfParseError::Syntax(e)), Err(RdfParseError::Syntax(_))) => Ok(Err(e)),
+        (Err(RdfParseError::Io(e)), _) => Err(format!("the slice fails to read: {e}")),
+        (_, Err(RdfParseError::Io(e))) => Err(format!("the trickling reader fails to read: {e}")),
+        (Ok(_), Err(e)) => Err(format!("only the trickling reader fails: {e}")),
+        (Err(e), Ok(_)) => Err(format!("only the slice fails: {e}")),
     }
-    from_slice
 }
 
 /// The statements written in `format` and read back must be the same.
@@ -299,14 +308,15 @@ fn parallel(
 
 /// Whether a test passes, and why not.
 fn run(root: &Path, test: &Test) -> Result<(), String> {
-    let action = parse(root, test.format, &test.action);
+    let action = parse(root, test.format, &test.action)?;
     if let Ok(quads) = &action {
         parallel(root, test.format, &test.action, quads)?;
     }
+    let statements = |verdict: Verdict| verdict.map_err(|e| e.to_string());
     match test.kind {
-        Kind::PositiveSyntax => round_trip(test.format, &action?),
+        Kind::PositiveSyntax => round_trip(test.format, &statements(action)?),
         Kind::C14n => {
-            let quads = action?;
+            let quads = statements(action)?;
             let mut writer = RdfSerializer::from_format(test.format).for_writer(Vec::new());
             for quad in &quads {
                 writer.serialize_quad(quad).map_err(|e| e.to_string())?;
@@ -329,7 +339,7 @@ fn run(root: &Path, test: &Test) -> Result<(), String> {
             Err(_) => Ok(()),
         },
         Kind::Eval => {
-            let actual = action?;
+            let actual = statements(action)?;
             round_trip(test.format, &actual)?;
             let result = test
                 .result
@@ -340,8 +350,9 @@ fn run(root: &Path, test: &Test) -> Result<(), String> {
             } else {
                 RdfFormat::NTriples
             };
-            let expected =
-                parse(root, format, result).map_err(|e| format!("expected result: {e}"))?;
+            let expected = parse(root, format, result)
+                .and_then(statements)
+                .map_err(|e| format!("expected result: {e}"))?;
             let (a, b) = (canonical(actual), canonical(expected));
             if a == b {
                 Ok(())
@@ -350,22 +361,6 @@ fn run(root: &Path, test: &Test) -> Result<(), String> {
             }
         }
     }
-}
-
-fn expected_failures() -> BTreeMap<String, String> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/w3c_rdf/expected-failures.txt");
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
-        .map(|l| {
-            let (iri, reason) = l.split_once(' ').unwrap_or((l, ""));
-            (
-                iri.to_owned(),
-                reason.trim_start_matches(['#', ' ']).to_owned(),
-            )
-        })
-        .collect()
 }
 
 #[test]
@@ -378,30 +373,93 @@ fn w3c_rdf_syntax_suites() {
         eprintln!("skipped: W3C rdf-tests not found (run scripts/fetch-w3c-tests.sh)");
         return;
     };
-    let expected = expected_failures();
-    let mut unexpected = Vec::new();
-    println!("W3C RDF syntax suites: passed / failed (expected failures)");
+    let mut failures = Vec::new();
+    println!("W3C RDF syntax suites: passed / failed");
     for suite in SUITES {
         let tests = read_manifest(&root, suite);
         assert!(!tests.is_empty(), "no tests in {suite}");
-        let (mut passed, mut failed, mut known) = (0, 0, 0);
+        let (mut passed, mut failed) = (0, 0);
         for test in &tests {
             let outcome = std::panic::catch_unwind(|| run(&root, test))
                 .unwrap_or_else(|_| Err("panicked".to_owned()));
-            match (outcome, expected.contains_key(&test.iri)) {
-                (Ok(()), false) => passed += 1,
-                (Ok(()), true) => unexpected.push(format!("passes, but is listed: {}", test.iri)),
-                (Err(_), true) => {
+            match outcome {
+                Ok(()) => passed += 1,
+                Err(why) => {
                     failed += 1;
-                    known += 1;
-                }
-                (Err(why), false) => {
-                    failed += 1;
-                    unexpected.push(format!("{} ({:?}): {why}", test.iri, test.kind));
+                    failures.push(format!("{} ({:?}): {why}", test.iri, test.kind));
                 }
             }
         }
-        println!("  {suite}: {passed} / {failed} ({known})");
+        println!("  {suite}: {passed} / {failed}");
     }
-    assert!(unexpected.is_empty(), "{}", unexpected.join("\n"));
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A negative test passes on a syntax error from both readers, and on nothing else: a
+/// fixture that is missing, or whose IRI can't be the base, fails a test of any kind.
+#[test]
+fn negative_tests_pass_only_on_a_content_rejection() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("w3c-rdf-harness-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    // No object: not N-Triples, not Turtle.
+    for name in ["bad.nt", "bad.ttl", "a b.nt"] {
+        std::fs::write(root.join(name), "<http://e/s> <http://e/p> .\n").unwrap();
+    }
+    let test = |kind, format, name: &str| Test {
+        iri: name.to_owned(),
+        kind,
+        format,
+        action: format!("{BASE}{name}"),
+        result: None,
+    };
+    for (format, name) in [
+        (RdfFormat::NTriples, "bad.nt"),
+        (RdfFormat::Turtle, "bad.ttl"),
+    ] {
+        for kind in [Kind::NegativeSyntax, Kind::NegativeEval] {
+            assert_eq!(
+                run(&root, &test(kind, format, name)),
+                Ok(()),
+                "{name} {kind:?}"
+            );
+        }
+    }
+    for name in ["absent.nt", "a b.nt"] {
+        for kind in [Kind::NegativeSyntax, Kind::PositiveSyntax] {
+            let outcome = run(&root, &test(kind, RdfFormat::NTriples, name));
+            assert!(outcome.is_err(), "{name} {kind:?}: {outcome:?}");
+        }
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// The slice and the reader give one verdict, or none: one rejecting what the other reads,
+/// different statements, or an I/O error on either side is a harness failure.
+#[test]
+fn readers_that_disagree_give_no_verdict() {
+    let read = |text: &str| -> Result<BTreeSet<Quad>, RdfParseError> {
+        RdfParser::from_format(RdfFormat::NTriples)
+            .for_slice(text.as_bytes())
+            .collect()
+    };
+    let quads = || read("<http://e/s> <http://e/p> <http://e/o> .\n");
+    let other = || read("<http://e/s> <http://e/p> <http://e/x> .\n");
+    let rejected = || read("<http://e/s> <http://e/p> .\n");
+    let unreadable = || -> Result<BTreeSet<Quad>, RdfParseError> {
+        Err(std::io::Error::other("unreadable").into())
+    };
+    for (case, from_slice, from_reader) in [
+        ("only the reader rejects", quads(), rejected()),
+        ("only the slice rejects", rejected(), quads()),
+        ("different statements", quads(), other()),
+        ("the slice can't read", unreadable(), rejected()),
+        ("the reader can't read", rejected(), unreadable()),
+    ] {
+        let verdict = agree(from_slice, from_reader);
+        assert!(verdict.is_err(), "{case}: {verdict:?}");
+    }
+    assert!(matches!(agree(rejected(), rejected()), Ok(Err(_))));
+    let expected = quads().unwrap();
+    assert_eq!(agree(quads(), quads()), Ok(Ok(expected)));
 }
