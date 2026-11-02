@@ -558,12 +558,18 @@ mod tests {
         }
         let current = std::thread::current();
         let test = current.name().expect("a test thread, named after its test");
-        if std::env::var(OWN_PROCESS).is_ok_and(|marked| marked == test) {
+        let alone = [test, "--exact", "--test-threads=1", "--nocapture"];
+        // The child this starts: the marker names this test, and the process was started with
+        // exactly the arguments that run it alone. A marker inherited by a run of other
+        // arguments, a whole suite, is no such child (PR #86 fix check R86-FC1).
+        if std::env::var(OWN_PROCESS).is_ok_and(|marked| marked == test)
+            && std::env::args_os().skip(1).eq(alone)
+        {
             return true;
         }
         let started = Instant::now();
         let mut child = Command::new(std::env::current_exe().expect("the test binary"))
-            .args([test, "--exact", "--test-threads=1", "--nocapture"])
+            .args(alone)
             .env(OWN_PROCESS, test)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
