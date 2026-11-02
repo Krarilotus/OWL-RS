@@ -8,7 +8,7 @@
 //! test binary of its own.
 
 use nrese_engine::{Engine, EngineConfig};
-use nrese_exec::{Envelope, heap};
+use nrese_exec::{Envelope, SharedBudget, heap};
 use nrese_rdf::{GraphName, NamedNode, Quad};
 use nrese_sparql::{QueryEvaluationError, QueryOptions, QueryResults, Resources, evaluate_query};
 use nrese_sparql_syntax::SparqlParser;
@@ -156,5 +156,60 @@ fn a_closure_over_a_sequence_holds_its_ends_once() {
             "as_written={as_written}: the query's thread held {peak} bytes under a \
              {LIMIT}-byte limit"
         );
+    }
+}
+
+/// Spec: a table the query holds stays charged while it lives (`Resources::memory`): the
+/// live result of a SELECT keeps at least a word a row and column charged. A projection
+/// that drops a column must release only that column's charge: the graph's column that
+/// `GRAPH ?g` adds per graph (one named graph here), and one of two columns a `GROUP BY`
+/// of the same variable twice makes (SPARQL 1.1 §11.2: grouping on `?x ?x` groups on
+/// `?x`; one row). On the default path and as written alike.
+#[test]
+fn projections_release_only_the_columns_they_drop() {
+    let graph = GraphName::NamedNode(ex("g"));
+    let engine = engine([Quad::new(ex("a"), ex("p"), ex("a"), graph)]);
+    let values = (0..1_000).map(|i| i.to_string()).collect::<Vec<_>>();
+    let cases = [
+        (
+            "the graph's column dropped",
+            format!(
+                "SELECT ?x WHERE {{ GRAPH ?g {{ VALUES ?x {{ {} }} }} }}",
+                values.join(" ")
+            ),
+            1_000,
+        ),
+        (
+            "a variable grouped on twice",
+            "SELECT ?x WHERE { VALUES ?x { 1 } } GROUP BY ?x ?x".to_owned(),
+            1,
+        ),
+    ];
+    for (case, query, expected) in &cases {
+        for as_written in [false, true] {
+            let shared = SharedBudget::new(1 << 30);
+            let options = QueryOptions {
+                as_written,
+                resources: Resources {
+                    memory: Envelope::new(None, Some(shared.clone())),
+                    ..Resources::default()
+                },
+                ..QueryOptions::default()
+            };
+            let parsed = SparqlParser::new().parse_query(query).unwrap();
+            let snapshot = engine.snapshot();
+            let result = evaluate_query(&snapshot, &parsed, &options);
+            let held = shared.used();
+            let Ok(QueryResults::Solutions(rows)) = result else {
+                panic!("{case}, as_written={as_written}: no solutions");
+            };
+            let rows = rows.count();
+            assert_eq!(rows, *expected, "{case}, as_written={as_written}");
+            assert!(
+                held >= rows * 8,
+                "{case}, as_written={as_written}: the live result of {rows} rows keeps \
+                 {held} bytes charged"
+            );
+        }
     }
 }
