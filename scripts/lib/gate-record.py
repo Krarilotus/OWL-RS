@@ -3,8 +3,9 @@ for scripts/lib/fleet-gate.sh: OUT/gate.json, from check.sh's log (OUT/check.log
 says in its environment. It holds the tier, the tree, the file list's hash, the toolchain and flags,
 the CPU `native` resolved to, the host (its name and the fleet's), the job and attempt, each step's
 exit code and seconds from check.sh's summary, check.sh's exit code, whether the run left tracked
-files changed, its seconds, the memory the job's slice held at most (GATE_PEAK, bytes; Linux) and
-the stdin the fleet gave (GATE_STDIN; Windows).
+files changed, its seconds, the memory the job's slice held at most (GATE_PEAK, bytes; Linux), the
+stdin the fleet gave (GATE_STDIN; Windows) and the Python runtime the suite ran with (GATE_RUNTIME,
+scripts/lib/suite-python.sh suite_python_runtime; Windows).
 
     python3 scripts/lib/gate-record.py OUT
 """
@@ -32,4 +33,5 @@ json.dump({
     "seconds": int(e["GATE_SECONDS"]),
     "memory_peak_gb": round(int(e["GATE_PEAK"]) / 2**30, 2) if e.get("GATE_PEAK") else None,
     "stdin": e.get("GATE_STDIN") or None,
+    "runtime": e.get("GATE_RUNTIME") or None,
 }, open(os.path.join(out, "gate.json"), "w", encoding="utf-8"), indent=1)

@@ -47,7 +47,9 @@ use crate::term::{Dictionary, DictionaryStats, TermId};
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
 pub use equality::Classes as EqualityClasses;
 pub use replication::LogBatch;
-pub use snapshot::{InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity};
+pub use snapshot::{
+    Count, InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity,
+};
 pub use transaction::{CommitSummary, Transaction};
 
 #[derive(Debug, Clone)]
@@ -681,6 +683,14 @@ impl Engine {
     /// on use it.
     pub fn set_canonical_view_budget(&self, budget: Arc<nrese_exec::Budget>) {
         *self.inner.shared.views.write() = budget;
+    }
+
+    /// What runs the vector graph builds searches start from now on in the background
+    /// (spaces of [`SYNC_BUILD`](crate::term::vectors::SYNC_BUILD) vectors or more): the
+    /// owner's executor, which may also hold or refuse them. Unset, each build gets a
+    /// thread of its own.
+    pub fn run_vector_builds_with(&self, builder: crate::term::vectors::VectorBuilder) {
+        self.inner.shared.dictionary.set_vector_builder(builder);
     }
 
     /// `owl:sameAs` if reads expand equality classes ([`Self::set_equality`]).
