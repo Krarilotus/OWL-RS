@@ -725,7 +725,8 @@ fn stopped_updates_are_interrupted() {
 /// DC-07 S2 (Sol, round 1): the process limit's stop holds for the rest of the
 /// materialisation. One reading over the limit, or unread, then readings under it, at any
 /// poll: the run ends with that cause, or (past the last poll) has the join's fact; never a
-/// result without the fact a skipped morsel would have made.
+/// result without the fact a skipped morsel would have made. Every poll is checked for the
+/// fact before any stop's cause, so a missing fact is what fails first.
 #[test]
 fn a_memory_stop_holds_for_the_rest_of_the_materialisation() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -758,6 +759,7 @@ fn a_memory_stop_holds_for_the_rest_of_the_materialisation() {
     assert!(whole.derived.contains(&fact));
     let n = polls.load(Ordering::Relaxed);
     assert!(n > 2, "{n} polls");
+    let mut causes = Vec::new();
     for cause in [MemoryStopCause::OverLimit, MemoryStopCause::Unread] {
         for k in 0..=n {
             let seen = AtomicUsize::new(0);
@@ -768,9 +770,12 @@ fn a_memory_stop_holds_for_the_rest_of_the_materialisation() {
                     closure.derived.contains(&fact),
                     "{cause:?} at poll {k} of {n}: finished without the join's fact"
                 ),
-                Err(stopped) => assert_eq!(stopped.memory, Some(cause), "poll {k} of {n}"),
+                Err(stopped) => causes.push((cause, k, stopped.memory)),
             }
         }
+    }
+    for (cause, k, named) in causes {
+        assert_eq!(named, Some(cause), "poll {k} of {n}");
     }
 }
 
