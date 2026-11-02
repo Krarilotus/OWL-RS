@@ -266,7 +266,10 @@ fn round_trip(quads: &[N3Quad]) -> Result<(), String> {
     Ok(())
 }
 
-fn run(root: &Path, test: &Test) -> Result<(), String> {
+/// A case's outcome: `Err` says why it fails.
+type Outcome = Result<(), String>;
+
+fn run(root: &Path, test: &Test) -> Outcome {
     let action = parse(root, &test.action)?;
     let statements = |verdict: Verdict| verdict.map_err(|e| e.to_string());
     match test.kind {
@@ -321,6 +324,32 @@ fn expected_failures() -> BTreeMap<String, String> {
         .collect()
 }
 
+/// `case`'s outcome, a panic counted as a failure.
+fn caught(case: impl FnOnce() -> Outcome + std::panic::UnwindSafe) -> Outcome {
+    std::panic::catch_unwind(case).unwrap_or_else(|_| Err("panicked".to_owned()))
+}
+
+/// What the suite counts a case as.
+#[derive(Debug, PartialEq, Eq)]
+enum Tally {
+    Passed,
+    /// Fails, and is an expected failure.
+    Known,
+    /// Passes, but is listed as an expected failure.
+    Listed,
+    /// Fails, and is not an expected failure.
+    Failed(String),
+}
+
+fn tally(test: &Test, outcome: Outcome, expected: &BTreeMap<String, String>) -> Tally {
+    match (outcome, expected.contains_key(&test.iri)) {
+        (Ok(()), false) => Tally::Passed,
+        (Ok(()), true) => Tally::Listed,
+        (Err(_), true) => Tally::Known,
+        (Err(why), false) => Tally::Failed(format!("{} ({:?}): {why}", test.iri, test.kind)),
+    }
+}
+
 #[test]
 fn w3c_n3_parser_suites() {
     std::thread::Builder::new()
@@ -355,18 +384,16 @@ fn suites() {
             if std::env::var_os("NRESE_N3_TRACE").is_some() {
                 eprintln!("{}", test.action);
             }
-            let outcome = std::panic::catch_unwind(|| run(&root, test))
-                .unwrap_or_else(|_| Err("panicked".to_owned()));
-            match (outcome, expected.contains_key(&test.iri)) {
-                (Ok(()), false) => passed += 1,
-                (Ok(()), true) => unexpected.push(format!("passes, but is listed: {}", test.iri)),
-                (Err(_), true) => {
+            match tally(test, caught(|| run(&root, test)), &expected) {
+                Tally::Passed => passed += 1,
+                Tally::Known => {
                     failed += 1;
                     known += 1;
                 }
-                (Err(why), false) => {
+                Tally::Listed => unexpected.push(format!("passes, but is listed: {}", test.iri)),
+                Tally::Failed(why) => {
                     failed += 1;
-                    unexpected.push(format!("{} ({:?}): {why}", test.iri, test.kind));
+                    unexpected.push(why);
                 }
             }
         }
@@ -411,6 +438,81 @@ fn negative_tests_pass_only_on_a_content_rejection() {
         }
     }
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// A listed case's expected failure stands only for the reason it is listed for: an
+/// evaluation whose statements differ from the expected ones once both documents were read
+/// and agreed on. A missing action or expected result, a rejected action, readers that
+/// disagree or a panic fail the listed case, as they fail any other.
+#[test]
+fn a_listed_case_fails_on_anything_but_its_verdict() {
+    let expected = expected_failures();
+    let iri = "<https://w3c.github.io/N3/tests/N3Tests/manifest-parser.ttl#cwm_syntax_numbers.n3>";
+    assert!(expected.contains_key(iri), "{iri} is listed");
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("w3c-n3-listed-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    // A literal keeps its lexical form: "00002" is not "2".
+    for (name, text) in [
+        ("action.n3", "<http://e/s> <http://e/p> 00002 .\n"),
+        ("same.n3", "<http://e/s> <http://e/p> 00002 .\n"),
+        ("canonical.n3", "<http://e/s> <http://e/p> 2 .\n"),
+        ("rejected.n3", "<http://e/s> <http://e/p> .\n"),
+    ] {
+        std::fs::write(root.join(name), text).unwrap();
+    }
+    let eval = |action: &str, result: &str| Test {
+        iri: iri.to_owned(),
+        kind: Kind::Eval,
+        action: format!("{BASE}{action}"),
+        result: Some(format!("{BASE}{result}")),
+    };
+    let checked = |test: &Test| caught(|| run(&root, test));
+    let listed = eval("action.n3", "canonical.n3");
+    // Outcomes no fixture gives: the readers disagree, a reader panics.
+    let read = |text: &str| -> Result<Vec<N3Quad>, RdfParseError> {
+        N3Parser::new().for_slice(text.as_bytes()).collect()
+    };
+    let disagree = agree(
+        read("<http://e/s> <http://e/p> <http://e/o> .\n"),
+        read("<http://e/s> <http://e/p> .\n"),
+    )
+    .map(drop);
+    let mut wrong = Vec::new();
+    for (what, outcome, known) in [
+        ("its verdict", checked(&listed), true),
+        (
+            "no action",
+            checked(&eval("absent.n3", "canonical.n3")),
+            false,
+        ),
+        (
+            "no expected result",
+            checked(&eval("action.n3", "absent.n3")),
+            false,
+        ),
+        (
+            "a rejected action",
+            checked(&eval("rejected.n3", "canonical.n3")),
+            false,
+        ),
+        ("the readers disagree", disagree, false),
+        ("a panic", caught(|| panic!("a reader panics")), false),
+    ] {
+        let got = tally(&listed, outcome, &expected);
+        let right = if known {
+            got == Tally::Known
+        } else {
+            matches!(got, Tally::Failed(_))
+        };
+        if !right {
+            wrong.push(format!("{what}: {got:?}"));
+        }
+    }
+    let passes = tally(&listed, checked(&eval("action.n3", "same.n3")), &expected);
+    std::fs::remove_dir_all(&root).unwrap();
+    assert_eq!(passes, Tally::Listed);
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// The slice and the reader give one verdict, or none: one rejecting what the other reads,
