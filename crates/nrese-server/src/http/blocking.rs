@@ -6,15 +6,28 @@ use nrese_store::CancellationToken;
 
 use crate::error::ApiError;
 
+/// Cancels its token when dropped.
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// Runs `work` on a blocking thread and waits for it until `deadline`: its value, or a
-/// timeout answered with `timeout_message`. `cancellation` is the token `work` runs with.
+/// timeout answered with `timeout_message`. `cancellation` is the token `work` runs with;
+/// it is cancelled when this future ends, however it ends: at the deadline, when the work
+/// is done (harmless), or dropped because the client is gone. So work nobody waits for
+/// stops at its next check instead of running on unobserved (`JoinHandle::abort` can't stop
+/// a blocking task).
 pub(crate) async fn within<T: Send + 'static>(
     deadline: Duration,
     cancellation: CancellationToken,
     timeout_message: &'static str,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, ApiError> {
-    let _ = cancellation;
+    let _cancel = CancelOnDrop(cancellation);
     tokio::time::timeout(deadline, tokio::task::spawn_blocking(work))
         .await
         .map_err(|_| ApiError::timeout(timeout_message))?

@@ -51,7 +51,7 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     changed: &[EncodedQuad],
     resources: &Resources,
 ) -> Result<ValidationReport, QueryEvaluationError> {
-    let _ = resources;
+    resources.check()?;
     let changed: Vec<EncodedQuad> = changed
         .iter()
         .copied()
@@ -61,13 +61,17 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     let graph_after = GraphView::new(after, data);
     let sub_class_of = graph_after.iri(RDFS_SUB_CLASS_OF);
     let classes_moved = sub_class_of.is_some_and(|p| changed.iter().any(|q| q.predicate == p));
-    let validator_before = Validator::new(before, shapes, data);
-    let validator_after = Validator::new(after, shapes, data);
+    let validator_before = Validator::new(before, shapes, data, resources);
+    let validator_after = Validator::new(after, shapes, data, resources);
     let mut introduced: BTreeSet<RawResult> = BTreeSet::new();
     let mut failures = Vec::new();
     if !changed.is_empty() {
         let rdf_type = graph_after.iri(RDF_TYPE);
         for shape in shapes.targeted() {
+            // After a stop in either state the difference means nothing: it is the outcome.
+            if validator_after.stopped() || validator_before.stopped() {
+                break;
+            }
             let affected = if classes_moved {
                 None
             } else {
@@ -104,8 +108,10 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
             let before: BTreeSet<RawResult> = before_results.into_iter().collect();
             introduced.extend(after_results.into_iter().filter(|r| !before.contains(r)));
         }
-        failures.extend(validator_after.into_failures());
     }
+    // A stop in either state is the outcome; only the state after reports its failures.
+    failures.extend(validator_after.into_failures()?);
+    validator_before.into_failures()?;
     let raw: Vec<RawResult> = introduced.into_iter().collect();
     Ok(decode(after, shapes, &raw, failures))
 }
