@@ -47,7 +47,9 @@ use crate::term::{Dictionary, DictionaryStats, TermId};
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
 pub use equality::Classes as EqualityClasses;
 pub use replication::LogBatch;
-pub use snapshot::{InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity};
+pub use snapshot::{
+    HeavyGroups, InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity,
+};
 pub use transaction::{CommitSummary, Transaction};
 
 #[derive(Debug, Clone)]

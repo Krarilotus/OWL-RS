@@ -17,7 +17,9 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nrese_engine::quad::Permutation;
-use nrese_engine::{GraphSelector, ProbeCursor, QuadPattern, ReadModel, Seek, Snapshot, TermId};
+use nrese_engine::{
+    GraphSelector, HeavyGroups, ProbeCursor, QuadPattern, ReadModel, Seek, Snapshot, TermId,
+};
 use nrese_exec::search::partition_point_from;
 use rayon::prelude::*;
 
@@ -39,12 +41,9 @@ pub(super) struct Query<'a> {
     /// The value lists of patterns with a single variable, read once: the same under any
     /// bindings (LUBM q2 intersected the 2007 departments for each of 1000 universities).
     lists: Vec<OnceLock<Option<Vec<u64>>>>,
-    /// Per pattern and position ([`Query::heavy`]), found once.
-    heavy: Vec<OnceLock<Option<Weighted>>>,
+    /// Per pattern and position ([`Query::heavy`]), found once: the snapshot's list, borrowed.
+    heavy: Vec<OnceLock<Option<HeavyGroups>>>,
 }
-
-/// Values with a count each, in value order.
-type Weighted = Vec<(u64, u64)>;
 
 /// Why a join stopped early.
 pub(super) enum Stop {
@@ -231,7 +230,7 @@ impl<'a> Query<'a> {
     /// 31 Oct 2026). `None` where the index can't walk them. A forest's
     /// patterns have no variable outside the forest, so these are the counts under any
     /// bindings of the order's prefix.
-    fn heavy(&self, index: usize, position: usize) -> Option<&[(u64, u64)]> {
+    fn heavy(&self, index: usize, position: usize) -> Option<&[(TermId, u64)]> {
         self.heavy[index * 3 + position]
             .get_or_init(|| {
                 let quad = self.quad_pattern(&self.patterns[index], &vec![None; self.variables]);
@@ -249,25 +248,21 @@ impl<'a> Query<'a> {
                     order[..bound_count].iter().all(|&c| bound(c))
                         && order.get(bound_count) == Some(&position)
                 })?;
-                let groups = self.snapshot.heavy_groups_in(
-                    self.model,
-                    &quad,
-                    permutation,
-                    MESSAGE_MIN as u64,
-                )?;
-                Some(groups.iter().map(|&(value, n)| (value.raw(), n)).collect())
+                self.snapshot
+                    .heavy_groups_in(self.model, &quad, permutation, MESSAGE_MIN as u64)
             })
             .as_deref()
+            .map(|groups| &groups[..])
     }
 
     /// [`Query::heavy`] as found before the join: inside it a list is only read. Found
     /// there, its group walk (on the pool) waited for workers that had taken up other
     /// parts of the count and asked for the list being found, its `OnceLock` entered again
     /// on their own thread: kernel-intersect's count never ended (pm-qprof-13, 19 Oct 2026).
-    fn found_heavy(&self, index: usize, position: usize) -> Option<&[(u64, u64)]> {
+    fn found_heavy(&self, index: usize, position: usize) -> Option<&[(TermId, u64)]> {
         let found = self.heavy[index * 3 + position].get();
         debug_assert!(found.is_some(), "heavy values found before the join");
-        found?.as_deref()
+        found?.as_deref().map(|groups| &groups[..])
     }
 
     fn count(&self, pattern: &[Pos; 3], bindings: &[Option<u64>]) -> u64 {
@@ -792,20 +787,32 @@ impl<'a> Query<'a> {
                 .and(position)
                 .and_then(|position| self.found_heavy(pattern, position));
             let mut next_heavy = 0;
+            // Per parent value of the shortest list, its matches (`None` once the gather is
+            // found cheaper and goes on without the budget).
+            let mut budget = budget;
+            let mut per_parent = None;
             for &(value, weight) in &sent {
                 work.bindings[child] = Some(value);
                 // Without the heavy values (an index that can't walk them) no value is
                 // counted ahead: the check after the read below bounds the message.
-                if let (Some(budget), Some(heavy)) = (budget, heavy) {
-                    next_heavy += heavy[next_heavy..].partition_point(|&(v, _)| v < value);
+                if let (Some(limit), Some(heavy)) = (budget, heavy) {
+                    next_heavy += heavy[next_heavy..].partition_point(|&(v, _)| v.raw() < value);
                     let count = match heavy.get(next_heavy) {
-                        Some(&(v, n)) if v == value => n as usize,
+                        Some(&(v, n)) if v.raw() == value => n as usize,
                         _ => 0,
                     };
-                    if message.len() + count > budget {
+                    if message.len() + count > limit {
                         work.bindings[child] = None;
-                        over = true;
-                        break;
+                        let parents = shortest.expect("a budget comes from a list");
+                        let gathered = message.len() + count;
+                        per_parent =
+                            self.per_parent(pattern, var, parents, sent.len(), gathered, work);
+                        if per_parent.is_some() {
+                            over = true;
+                            break;
+                        }
+                        budget = None;
+                        work.bindings[child] = Some(value);
                     }
                 }
                 let values = self.sorted_values(pattern, var, slot, work);
@@ -813,24 +820,61 @@ impl<'a> Query<'a> {
                 let values = values?;
                 work.messages += values.len();
                 message.extend(values.iter().map(|&v| (v, weight)));
-                if budget.is_some_and(|budget| message.len() > budget) {
-                    over = true;
-                    break;
+                if budget.is_some_and(|limit| message.len() > limit) {
+                    let parents = shortest.expect("a budget comes from a list");
+                    let gathered = message.len();
+                    per_parent = self.per_parent(pattern, var, parents, sent.len(), gathered, work);
+                    if per_parent.is_some() {
+                        over = true;
+                        break;
+                    }
+                    budget = None;
                 }
             }
-            if over {
+            if let Some(matches) = per_parent.filter(|_| over) {
                 // The parent's values in its shortest list, each counted against the
-                // child's weights: what the join with that list keeps of the message.
+                // child's weights: what the join with that list keeps of the message. A
+                // parent with fewer matches than the child has values reads its matches;
+                // one with more probes the child's values instead, so no parent reads more
+                // than either.
                 message.clear();
-                for &(value, _) in shortest.expect("a budget comes from a list") {
+                let parents = shortest.expect("a budget comes from a list");
+                for (&(value, _), matches) in parents.iter().zip(matches) {
+                    if matches == 0 {
+                        continue;
+                    }
                     work.bindings[var] = Some(value);
-                    // The other order of the pattern: the cursor otherwise kept for checks,
-                    // which a count's last depth makes none of.
-                    let values = self.sorted_values_by(pattern, child, slot, Use::Seek, work);
+                    let weight = if matches <= sent.len() as u64 {
+                        // The other order of the pattern: the cursor otherwise kept for
+                        // checks, which a count's last depth makes none of.
+                        let values = self.sorted_values_by(pattern, child, slot, Use::Seek, work);
+                        let values = match values {
+                            Some(values) => values,
+                            None => {
+                                work.bindings[var] = None;
+                                return None;
+                            }
+                        };
+                        work.messages += values.len();
+                        weight_of(&values, &sent)
+                    } else {
+                        work.messages += sent.len();
+                        let mut weight = 0u64;
+                        for &(c, w) in &sent {
+                            work.bindings[child] = Some(c);
+                            let quad = self.quad_pattern(&self.patterns[pattern], &work.bindings);
+                            // Whether the read shows a match: a count is for planning, and
+                            // under equality classes an estimate of stored statements.
+                            if work.cursor(slot, pattern, Use::Count, self).exists(&quad) {
+                                weight = weight.saturating_add(w);
+                            }
+                        }
+                        work.bindings[child] = None;
+                        weight
+                    };
                     work.bindings[var] = None;
-                    match weight_of(&values?, &sent) {
-                        0 => {}
-                        weight => message.push((value, weight)),
+                    if weight > 0 {
+                        message.push((value, weight));
                     }
                 }
             } else {
@@ -1012,6 +1056,40 @@ impl<'a> Query<'a> {
                 done.map(|()| sink)
             })
             .collect()
+    }
+}
+
+impl<'a> Query<'a> {
+    /// Per value of `parents`, its matches in pattern `index` with `var` bound to it (the
+    /// child free; for planning, so an estimate where equality classes expand, zero only
+    /// where there is none), where counting the message per parent that way reads fewer entries than
+    /// `gathered`, the entries its gather has read or found it must: each parent reads its
+    /// matches or probes the `sent` child values, whichever is fewer. `None` where it
+    /// doesn't (the gather goes on), the counts stopped once they reach `gathered`.
+    fn per_parent(
+        &self,
+        index: usize,
+        var: usize,
+        parents: &[(u64, u64)],
+        sent: usize,
+        gathered: usize,
+        work: &mut Work<'a>,
+    ) -> Option<Vec<u64>> {
+        let slot = self.variables;
+        let mut matches = Vec::with_capacity(parents.len());
+        let mut reads = 0usize;
+        for &(value, _) in parents {
+            work.bindings[var] = Some(value);
+            let quad = self.quad_pattern(&self.patterns[index], &work.bindings);
+            let n = work.cursor(slot, index, Use::Count, self).count(&quad);
+            work.bindings[var] = None;
+            reads = reads.saturating_add((n as usize).min(sent));
+            if reads >= gathered {
+                return None;
+            }
+            matches.push(n);
+        }
+        Some(matches)
     }
 }
 
@@ -1207,6 +1285,124 @@ mod tests {
             let messages = stats.messages.load(std::sync::atomic::Ordering::Relaxed);
             assert!(messages < 10_000, "{messages} message entries");
         }
+    }
+
+    /// A message counted per parent value instead reads no more than gathering it would:
+    /// K triangles A_i -> B -> C -> A_i, 64 more predecessors of C (so C is heavy) and M
+    /// more successors of B. Per prefix A_i the gather reads C's 65 predecessors; reading
+    /// B's M + 1 successors for every A_i instead turned 66,560 entries into 67,109,888 at
+    /// K = 1,024, M = 65,536 (PR #81 review r1, F1). The count is exact (3K, three
+    /// rotations each), and the entries read in either direction grow with K + M, not K M.
+    #[test]
+    fn a_message_counted_per_parent_reads_no_more_than_gathering_it() {
+        use super::{Pos, Query, Stats};
+        use nrese_engine::ReadModel;
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        const K: usize = 64;
+        let node = |name: String| NamedNode::new_unchecked(format!("http://e/{name}"));
+        let edge = NamedNode::new_unchecked("http://e/p");
+        let mut entries = Vec::new();
+        for m in [1_024, 4_096] {
+            let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+            let mut tx = engine.transaction();
+            let mut add = |a: String, b: String| {
+                let quad = Quad::new(node(a), edge.clone(), node(b), GraphName::DefaultGraph);
+                tx.insert(quad.as_ref());
+            };
+            for i in 0..K {
+                add(format!("a{i}"), "b".into());
+                add("c".into(), format!("a{i}"));
+            }
+            add("b".into(), "c".into());
+            for j in 0..64 {
+                add(format!("x{j}"), "c".into());
+            }
+            for t in 0..m {
+                add("b".into(), format!("d{t}"));
+            }
+            tx.commit().unwrap();
+            let snapshot = engine.snapshot();
+            let p = snapshot.lookup(edge.as_ref().into()).unwrap().raw();
+            let (a, b, c) = (Pos::Var(0), Pos::Var(1), Pos::Var(2));
+            let patterns = vec![
+                [a, Pos::Const(p), b],
+                [b, Pos::Const(p), c],
+                [c, Pos::Const(p), a],
+            ];
+            let query = Query::new(&snapshot, ReadModel::Asserted, patterns, 3, usize::MAX);
+            let mut stats = Stats::default();
+            let counted = query.count_solutions(&|| false, &mut stats).ok().unwrap();
+            assert_eq!(counted as usize, 3 * K, "M = {m}");
+            entries.push(stats.messages.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        // Four times the successors of B: at most four times the entries, not K times.
+        assert!(
+            entries[1] <= 4 * entries[0] + 66 * K,
+            "message entries {entries:?} at M = 1,024 and 4,096"
+        );
+        assert!(entries[1] < 16 * 4_096, "message entries {entries:?}");
+    }
+
+    /// A parent counted per value probes the child's values for matches the read shows,
+    /// not for a planning count's: an inferred read with equality classes estimates from
+    /// the stored statements, asserted ones too. A_i -> B, C -> A_i, 65 X_j -> C and
+    /// B -> D_t inferred, B -> C asserted only: the inferred read has no triangle, while
+    /// the estimate of B -> C is 1 (the probe of C from B, as in the hub test above).
+    #[test]
+    fn a_parent_probed_per_value_counts_only_what_the_read_shows() {
+        use super::{Pos, Query, Stats};
+        use nrese_engine::{EncodedTriple, ReadModel};
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        let node = |name: &str| NamedNode::new_unchecked(format!("http://e/{name}"));
+        let engine = nrese_engine::Engine::new(nrese_engine::EngineConfig {
+            background_maintenance: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let p = tx.intern(node("p").as_ref().into());
+        let same_as = tx.intern(node("sameAs").as_ref().into());
+        let mut infer = |a: &str, b: &str, predicate| {
+            let subject = tx.intern(node(a).as_ref().into());
+            let object = tx.intern(node(b).as_ref().into());
+            tx.insert_inferred(EncodedTriple {
+                subject,
+                predicate,
+                object,
+            });
+        };
+        for i in 0..8 {
+            infer(&format!("a{i}"), "b", p);
+            infer("c", &format!("a{i}"), p);
+        }
+        for j in 0..65 {
+            infer(&format!("x{j}"), "c", p);
+        }
+        for t in 0..2 {
+            infer("b", &format!("d{t}"), p);
+        }
+        infer("alias", "rep", same_as);
+        tx.insert(Quad::new(node("b"), node("p"), node("c"), GraphName::DefaultGraph).as_ref());
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let snapshot = engine.snapshot();
+        let p = p.raw();
+        let (a, b, c) = (Pos::Var(0), Pos::Var(1), Pos::Var(2));
+        let patterns = vec![
+            [a, Pos::Const(p), b],
+            [b, Pos::Const(p), c],
+            [c, Pos::Const(p), a],
+        ];
+        let query = Query::new(&snapshot, ReadModel::Inferred, patterns, 3, usize::MAX);
+        let mut stats = Stats::default();
+        let counted = query.count_solutions(&|| false, &mut stats).ok().unwrap();
+        assert_eq!(
+            stats.budgeted,
+            Some(true),
+            "no heavy groups: the budget stays"
+        );
+        assert!(stats.counted_after.is_some(), "counted by a forest");
+        assert_eq!(counted, 0, "B -> C is asserted, not inferred");
     }
 
     #[test]
