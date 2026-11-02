@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use nrese_engine::TermId;
 use nrese_exec::group::{Groups, group_rows};
-use nrese_exec::{Budget, BudgetExceeded, IdTable, Reservation, UNDEF};
+use nrese_exec::{Budget, BudgetExceeded, Grant, IdTable, Reservation, UNDEF};
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{Literal, Term, Variable};
 use nrese_sparql_syntax::algebra::{AggregateExpression, AggregateFunction, Expression};
@@ -45,15 +45,13 @@ pub(super) struct Aggregator<'a> {
 /// the query's expressions give them: what [`Aggregator::memo`] remembers (released with
 /// it), a group's values while its aggregate is computed, and the results until the caller
 /// interns them ([`Kept::results`]). A refusal is kept: the caller ends the aggregation at
-/// the group it happened in. Each is charged from room charged ahead
-/// ([`super::charge_ahead`]), so a term costs no budget call of its own.
+/// the group it happened in. All three through one [`Grant`] (a term costs one atomic, no
+/// call up the levels), each kind's share counted here: one grant per aggregation part, so
+/// the room it holds ahead is one grant's.
 pub(super) struct Kept {
-    budget: Arc<Budget>,
-    memo: RefCell<Reservation>,
-    values: RefCell<Reservation>,
-    results: RefCell<Reservation>,
-    /// What each of `memo`, `values` and `results` holds beyond what was charged to it.
-    spare: [Cell<usize>; 3],
+    grant: RefCell<Grant>,
+    /// What each [`Held`] kind holds of the grant's charge.
+    held: [Cell<usize>; 3],
     /// What [`Aggregator::value_of`] charged to `results` before it made the result.
     prepaid: Cell<usize>,
     refused: Cell<Option<BudgetExceeded>>,
@@ -75,11 +73,8 @@ fn kept_bytes(term: &Term) -> usize {
 impl Kept {
     pub(super) fn new(budget: &Arc<Budget>) -> Self {
         Self {
-            budget: Arc::clone(budget),
-            memo: RefCell::new(Reservation::new(Arc::clone(budget))),
-            values: RefCell::new(Reservation::new(Arc::clone(budget))),
-            results: RefCell::new(Reservation::new(Arc::clone(budget))),
-            spare: [Cell::new(0), Cell::new(0), Cell::new(0)],
+            grant: RefCell::new(Grant::new(Arc::clone(budget))),
+            held: [Cell::new(0), Cell::new(0), Cell::new(0)],
             prepaid: Cell::new(0),
             refused: Cell::new(None),
         }
@@ -90,17 +85,12 @@ impl Kept {
         if self.refused.get().is_some() {
             return false;
         }
-        let spare = &self.spare[kind as usize];
-        let mut left = spare.get();
-        let charged = super::charge_ahead(
-            &self.budget,
-            &mut self.of(kind).borrow_mut(),
-            &mut left,
-            bytes,
-        );
-        spare.set(left);
-        match charged {
-            Ok(()) => true,
+        match self.grant.borrow_mut().take(bytes) {
+            Ok(()) => {
+                let held = &self.held[kind as usize];
+                held.set(held.get() + bytes);
+                true
+            }
             Err(refused) => {
                 self.refused.set(Some(refused));
                 false
@@ -108,20 +98,17 @@ impl Kept {
         }
     }
 
-    fn of(&self, kind: Held) -> &RefCell<Reservation> {
-        match kind {
-            Held::Memo => &self.memo,
-            Held::Values => &self.values,
-            Held::Results => &self.results,
-        }
+    /// Releases up to `bytes` of what `kind` holds.
+    fn release(&self, kind: Held, bytes: usize) {
+        let held = &self.held[kind as usize];
+        let bytes = bytes.min(held.get());
+        held.set(held.get() - bytes);
+        self.grant.borrow_mut().give_back(bytes);
     }
 
     /// A group's values are gone: so is their charge.
     fn values_done(&self) {
-        let mut values = self.values.borrow_mut();
-        let bytes = values.bytes();
-        values.release(bytes);
-        self.spare[Held::Values as usize].set(0);
+        self.release(Held::Values, self.held[Held::Values as usize].get());
     }
 
     /// What the budget refused, if it did.
@@ -132,9 +119,10 @@ impl Kept {
     /// The results' charge, handed to the caller (the bytes, which it releases once the
     /// results are interned and dropped); what was remembered is released with `self`.
     pub(super) fn results(self) -> usize {
-        let mut results = self.results.into_inner();
-        results.release(self.spare[Held::Results as usize].get());
-        results.transfer()
+        let others = self.held[Held::Memo as usize].get() + self.held[Held::Values as usize].get();
+        let mut grant = self.grant.into_inner();
+        grant.give_back(others);
+        grant.transfer()
     }
 }
 
@@ -402,7 +390,7 @@ impl Aggregator<'_> {
                 Agg::Term(term) => {
                     kept.hold(Held::Results, kept_bytes(term).saturating_sub(prepaid));
                 }
-                Agg::Id(_) => kept.of(Held::Results).borrow_mut().release(prepaid),
+                Agg::Id(_) => kept.release(Held::Results, prepaid),
             }
         }
         result
