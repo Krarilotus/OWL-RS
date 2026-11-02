@@ -2872,7 +2872,7 @@ fn list(
             let facts = store.facts_where(&|fact| current(fact) && shared.mentioned(fact));
             let room = room_budget(operation)?;
             let refused = |_: BudgetExceeded| operation.refuse(MemoryStopCause::OverLimit);
-            let mut expanded = facts
+            let expanded = facts
                 .par_iter()
                 .try_fold(
                     || ChargedVec::new(&room),
