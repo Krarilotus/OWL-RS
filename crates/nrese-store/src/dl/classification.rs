@@ -34,7 +34,7 @@ pub(super) fn options(store: &StoreService) -> classify::Options {
     let config = &store.config().dl;
     let workers = nrese_exec::workers::Workers::current().limited(config.threads);
     let mut options = config.classification_options(workers, Some(store.envelope(None)));
-    options.max_memory = Some(store.config().process_memory_bytes);
+    options.max_memory = Some(store.process_memory_bytes());
     options
 }
 
@@ -118,7 +118,7 @@ mod tests {
 
     fn store(timeout: Duration) -> StoreService {
         let store = StoreService::new(StoreConfig {
-            process_memory_bytes: 0,
+            process_memory_bytes: crate::ProcessMemory::Bytes(0),
             dl: DlConfig {
                 timeout: Some(timeout),
                 threads: 1,

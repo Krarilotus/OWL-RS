@@ -89,6 +89,20 @@ pub enum Stopped {
     Memory { bytes: usize },
     /// The process held more than its memory limit ([`super::eval::over_memory_limit`]).
     ProcessMemory,
+    /// The process's memory couldn't be read for its limit
+    /// ([`nrese_exec::memory::process_limit_stop`]): the limit can't be enforced, so it
+    /// stopped.
+    MemoryUnreadable,
+}
+
+impl Stopped {
+    /// The stop the process limit's `cause` makes.
+    fn of_process(cause: nrese_exec::memory::MemoryStopCause) -> Self {
+        match cause {
+            nrese_exec::memory::MemoryStopCause::Unread => Self::MemoryUnreadable,
+            nrese_exec::memory::MemoryStopCause::OverLimit => Self::ProcessMemory,
+        }
+    }
 }
 
 /// What an evaluation reports its working set's bytes to at round boundaries: `false`
@@ -104,8 +118,8 @@ pub const UNWATCHED: Watch<'static> = &unwatched;
 
 /// `Err` if the process is past its memory limit or `watch` refuses `bytes`.
 fn check(watch: Watch<'_>, bytes: usize) -> Result<(), Stopped> {
-    if super::eval::over_memory_limit() {
-        return Err(Stopped::ProcessMemory);
+    if let Some(cause) = nrese_exec::memory::process_limit_stop() {
+        return Err(Stopped::of_process(cause));
     }
     match watch(bytes) {
         true => Ok(()),
@@ -1199,5 +1213,21 @@ mod tests {
     #[test]
     fn updates_equal_recomputation() {
         super::super::tests::support_set_updates_against_recomputation();
+    }
+
+    /// DC-07: a stop by the process limit whose memory couldn't be read is reported as
+    /// that, not as the limit; a stop past the limit stays the limit's.
+    #[test]
+    fn an_unread_process_limit_stops_as_memory_unreadable() {
+        use super::Stopped;
+        use nrese_exec::memory::MemoryStopCause;
+        assert_eq!(
+            Stopped::of_process(MemoryStopCause::Unread),
+            Stopped::MemoryUnreadable
+        );
+        assert_eq!(
+            Stopped::of_process(MemoryStopCause::OverLimit),
+            Stopped::ProcessMemory
+        );
     }
 }

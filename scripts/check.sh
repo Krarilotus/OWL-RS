@@ -26,11 +26,12 @@
 #        scripts/check.sh windows [COMMIT]
 #                                  the merge check's Windows part, on the fleet only
 #                                  (scripts/lib/fleet-gate.sh windows): COMMIT (default HEAD)
-#                                  built whole, all its tests and doc tests, the suite
-#                                  contracts, by its own tier here, which its own
+#                                  built whole, clippy on it all, all its tests and doc tests,
+#                                  the suite contracts, by its own tier here, which its own
 #                                  scripts/lib/windows-job.sh runs on a Windows host. A commit
 #                                  whose inputs (scripts/lib/gate-key.sh windows_inputs)
-#                                  passed before carries that pass: "carried from <commit>".
+#                                  passed before, under the Python runtime it declares
+#                                  (gate_runtime), carries that pass: "carried from <commit>".
 #                                  NRESE_PUSH_REF as for push: the merge check's Windows part
 #                                  for refactor/engine-v2 is a merge gate, a package's isn't.
 #        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
@@ -323,6 +324,12 @@ if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HO
   keyed=$tree on=""
   if [ "$mode" = windows ]; then
     keyed=inputs-$(windows_inputs "$push_commit") || { echo "no inputs of $push_commit to key its pass" >&2; exit 2; }
+    # And the Python runtime the commit declares for the suite: a pass under another, or one from
+    # before the tier declared one, is never carried (scripts/lib/gate-key.sh gate_runtime).
+    runtime=$(gate_runtime "$push_commit") \
+      || { echo "$(git rev-parse --short "$push_commit") declares no Python runtime for the suite" \
+             "(scripts/lib/gate-tools.txt python-windows): it can't be checked" >&2; exit 2; }
+    identity="$identity $(gate_python "$runtime")"
     on="$push_commit "
   fi
   key=$(gate_key "$mode" "$keyed" "$list_hash" "$identity")
@@ -436,6 +443,9 @@ case "$mode" in
     [ ${#everything[@]} -gt 0 ] || { echo "no workspace packages found" >&2; exit 2; }
     w3c_data
     step build "$guarded" build --locked --workspace --all-targets
+    # Lints of the code only Windows compiles (cfg(windows)), which no Linux tier sees: the push
+    # tier lints the changed crates on Linux alone (PR #68's review, R68-F2).
+    step clippy "$guarded" clippy --locked --workspace --all-targets
     step test run_tests "${everything[@]}"
     step "doc tests" "$guarded" test --locked --workspace --doc --no-fail-fast
     step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests

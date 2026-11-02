@@ -397,4 +397,75 @@ pub(crate) mod tests {
         engine.checkpoint().unwrap();
         assert!(segments() < kept, "the next checkpoint released it");
     }
+
+    /// Point-in-time restore by time (`recover_until_micros`): the commits made up to the
+    /// time, by the commit times in the log. Commit `r` here was made at `r` ms; at commit
+    /// 5's own time, commit 5 is kept and commit 6 cut.
+    #[test]
+    fn the_log_restores_the_state_at_a_time() {
+        use crate::{DurabilityConfig, Engine, EngineConfig, QuadPattern};
+        let dir = tempfile::tempdir().unwrap();
+        let config = |until| EngineConfig {
+            background_maintenance: false,
+            durability: DurabilityConfig {
+                recover_until_micros: until,
+                ..DurabilityConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        let node = |n: &str| nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{n}"));
+        let quad = |r: u64| {
+            nrese_rdf::Quad::new(
+                node(&format!("s{r}")),
+                node("p"),
+                node("o"),
+                nrese_rdf::GraphName::DefaultGraph,
+            )
+        };
+        {
+            let engine = Engine::open(dir.path(), config(None)).unwrap();
+            for r in 1..=9 {
+                let mut tx = engine.transaction();
+                tx.insert(quad(r).as_ref());
+                tx.commit().unwrap();
+            }
+        }
+        // The log again, each record with its commit time: revision `r` at `r` ms. First,
+        // that the transactions wrote theirs: a stamp on every commit, and not zero (PR #79
+        // review, R79-02: the rewrite below replaces them; their order is the wall clock's,
+        // which may step back, so it isn't asserted).
+        let mut stamped = 0;
+        for (_, path) in super::list_segments(&super::wal_dir(dir.path())).unwrap() {
+            let contents = super::read_segment(&path).unwrap();
+            assert!(!contents.torn && !contents.integers_in_dictionary);
+            for record in &contents.records {
+                let stamp = record.committed_micros;
+                assert!(
+                    stamp.is_some_and(|at| at > 0),
+                    "revision {}: {stamp:?}",
+                    record.revision
+                );
+                stamped += 1;
+            }
+            let mut bytes = super::SEGMENT_MAGIC.to_vec();
+            for record in contents.records {
+                let committed_micros = Some(record.revision * 1000);
+                let record = super::CommitRecord {
+                    committed_micros,
+                    ..record
+                };
+                super::encode_record(&record, &mut bytes).unwrap();
+            }
+            std::fs::write(&path, bytes).unwrap();
+        }
+        assert_eq!(stamped, 9, "every commit in the log");
+        let engine = Engine::open(dir.path(), config(Some(5_000))).unwrap();
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.revision(), 5);
+        let held: std::collections::HashSet<nrese_rdf::Quad> = snapshot
+            .quads_for_pattern(&QuadPattern::all())
+            .map(|q| snapshot.decode_quad(q).unwrap())
+            .collect();
+        assert_eq!(held, (1..=5).map(quad).collect());
+    }
 }

@@ -254,23 +254,43 @@ fn refine<'a>(
 }
 
 /// The run of `run`'s entries that `same` joins which holds more than half of them, if
-/// any: its start and length.
+/// any: its start and length. Such a run holds the middle entry, so only the middle entry's
+/// run is measured, outward from it: not a pass over every run.
 fn largest_run(run: &[Entry], same: impl Fn(&Entry, &Entry) -> bool) -> Option<(usize, usize)> {
-    let mut start = 0;
-    for end in 1..=run.len() {
-        if end == run.len() || !same(&run[end - 1], &run[end]) {
-            if 2 * (end - start) > run.len() {
-                return Some((start, end - start));
-            }
-            start = end;
-        }
+    let middle = run.len() / 2;
+    let mut start = middle;
+    while start > 0 && same(&run[start - 1], &run[start]) {
+        start -= 1;
     }
-    None
+    let mut end = middle + 1;
+    while end < run.len() && same(&run[end - 1], &run[end]) {
+        end += 1;
+    }
+    (2 * (end - start) > run.len()).then_some((start, end - start))
 }
 
-/// Reads the word at `depth` of every entry of `run` (each key once); whether they are
-/// one word and every text goes on.
+/// Reads the word at `depth` of every entry of `run` (each key once).
 fn words_at<'a>(
+    run: &mut [Entry],
+    depth: usize,
+    key: &(dyn Fn(u64) -> Key<'a> + Sync),
+    read: &Words,
+) {
+    let at = |entry: &mut Entry| {
+        let k = key(u64::from(entry.index));
+        *entry = Entry::at(&k[entry.skip()..], depth, entry.index, entry.skip() as u32);
+    };
+    if run.len() > PARALLEL {
+        run.par_iter_mut().for_each(at);
+    } else {
+        run.iter_mut().for_each(at);
+    }
+    count!(read, run.len());
+}
+
+/// [`words_at`], and whether the words are one and every text goes on, known in the same
+/// pass: each entry's word is compared with the first's as it is read.
+fn one_word_at<'a>(
     run: &mut [Entry],
     depth: usize,
     key: &(dyn Fn(u64) -> Key<'a> + Sync),
@@ -280,18 +300,23 @@ fn words_at<'a>(
         let k = key(u64::from(entry.index));
         *entry = Entry::at(&k[entry.skip()..], depth, entry.index, entry.skip() as u32);
     };
-    let first = |run: &[Entry]| (run[0].word, run[0].more());
-    if run.len() > PARALLEL {
-        run.par_iter_mut().for_each(at);
-        count!(read, run.len());
-        let (word, more) = first(run);
-        more && run.par_iter().all(|e| e.word == word && e.more())
-    } else {
-        run.iter_mut().for_each(at);
-        count!(read, run.len());
-        let (word, more) = first(run);
-        more && run.iter().all(|e| e.word == word && e.more())
-    }
+    at(&mut run[0]);
+    let (word, more) = (run[0].word, run[0].more());
+    // Every word is read: the comparisons never stop the pass early.
+    let same = |entry: &mut Entry| {
+        at(entry);
+        entry.word == word && entry.more()
+    };
+    let one = match run.len() > PARALLEL {
+        true => run[1..]
+            .par_iter_mut()
+            .map(same)
+            .reduce(|| true, |a, b| a && b),
+        // Counted, not `all`: that would stop at the first other word, leaving the rest unread.
+        false => run[1..].iter_mut().map(same).filter(|&one| !one).count() == 0,
+    };
+    count!(read, run.len());
+    more && one
 }
 
 /// Skips the prefix every text of `run` shares, past its first `(depth + 1) · 8` bytes
@@ -311,7 +336,7 @@ fn common<'a>(
 ) -> usize {
     for _ in 0..2 {
         depth += 1;
-        if !words_at(run, depth, key, read) {
+        if !one_word_at(run, depth, key, read) {
             return depth;
         }
     }
@@ -536,6 +561,36 @@ mod tests {
             read <= 4 * distinguishing as u64,
             "{read} words read, {distinguishing} distinguishing"
         );
+    }
+
+    /// The run holding more than half of a run's entries is found wherever it lies (the
+    /// refinement's nesting bound rests on it), and none where no run does.
+    #[test]
+    fn the_run_over_half_is_found_from_the_middle() {
+        let runs = |sizes: &[usize]| -> Vec<Entry> {
+            let words = sizes
+                .iter()
+                .enumerate()
+                .flat_map(|(w, &n)| std::iter::repeat_n(w as u64, n));
+            words
+                .map(|word| Entry {
+                    word,
+                    index: 0,
+                    skip: MORE,
+                })
+                .collect()
+        };
+        let same = |a: &Entry, b: &Entry| a.word == b.word && a.more() && b.more();
+        for (sizes, expected) in [
+            (&[6, 1, 2][..], Some((0, 6))),
+            (&[1, 6, 2], Some((1, 6))),
+            (&[2, 1, 6], Some((3, 6))),
+            (&[3, 3, 3], None),
+            (&[4, 4], None),
+            (&[1, 1, 1, 1, 1], None),
+        ] {
+            assert_eq!(largest_run(&runs(sizes), same), expected, "{sizes:?}");
+        }
     }
 
     #[test]

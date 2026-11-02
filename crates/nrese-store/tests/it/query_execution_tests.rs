@@ -3,7 +3,9 @@
 
 use crate::support::Writes;
 use std::io::{self, Write};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use nrese_store::{
     CancellationToken, PreparedQuery, QueryEvaluationError, SparqlQueryRequest, StoreConfig,
@@ -38,34 +40,49 @@ fn is_cancelled(result: &Result<(), StoreError>) -> bool {
     )
 }
 
+/// A query cancelled as the store hands it to the executor, past the store's own checks,
+/// stops and reports itself cancelled; the store is unchanged and takes the next write.
+/// Without cancellation this query runs for hours.
 #[test]
-fn cancelling_stops_a_running_query_promptly() {
-    let service = service_with_triples(2_000);
-    let prepared = PreparedQuery::parse(&SparqlQueryRequest::all(RUNAWAY)).expect("parse");
+fn cancelling_stops_a_query_in_the_executor() {
+    // Not a latency claim: the longest the test waits before it fails instead of hanging.
+    const DEADLINE: Duration = Duration::from_secs(60);
+    let service = Arc::new(service_with_triples(2_000));
+    let revision = service.current_revision();
     let token = CancellationToken::new();
-    let (result, stopped_after) = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| service.run_query(&prepared, &token, io::sink()));
-        std::thread::sleep(Duration::from_millis(200));
-        let cancelled_at = Instant::now();
-        token.cancel();
-        let result = worker.join().expect("worker");
-        (result, cancelled_at.elapsed())
+    let entered = Arc::new(AtomicBool::new(false));
+    let mut prepared = PreparedQuery::parse(&SparqlQueryRequest::all(RUNAWAY)).expect("parse");
+    prepared.on_evaluation({
+        let (token, entered) = (token.clone(), Arc::clone(&entered));
+        move || {
+            entered.store(true, Ordering::Release);
+            token.cancel();
+        }
     });
-    assert!(is_cancelled(&result), "{result:?}");
-    eprintln!("stopped {stopped_after:?} after cancelling");
-    // Without cancellation this query runs for hours. The evaluator checks the token on
-    // every quad it reads, and we check it on every output row. Between two quad reads,
-    // spareval's in-memory join and aggregation loops can't be interrupted. Here that is
-    // under 1 s in release and about 3 s in debug. The native executor (Pf3) checks per
-    // morsel. The bound below leaves debug headroom.
+    let (done, finished) = mpsc::channel();
+    // Not scoped: a query that doesn't stop must fail the test, not hang it.
+    std::thread::spawn({
+        let (service, token) = (Arc::clone(&service), token.clone());
+        move || done.send(service.run_query(&prepared, &token, io::sink()))
+    });
+    let result = finished.recv_timeout(DEADLINE);
+    token.cancel();
+    let result = result.expect("the query stopped");
     assert!(
-        stopped_after < Duration::from_secs(10),
-        "took {stopped_after:?}"
+        entered.load(Ordering::Acquire),
+        "the query reached the executor"
     );
+    assert!(is_cancelled(&result), "{result:?}");
+    assert_eq!(service.current_revision(), revision);
+    service
+        .execute_update_str("INSERT DATA { <http://example.com/after> <http://example.com/p> 1 }")
+        .expect("the writer is free");
+    assert_ne!(service.current_revision(), revision);
 }
 
-/// Cancels the token once `limit` bytes have been written: output arriving before the query
-/// finished proves results stream, and cancelling mid-output stops the rest.
+/// Cancels the token once `limit` bytes have been written: cancelling mid-output stops the
+/// rest of the delivery. Whether the evaluation streams (output before it finishes) is the
+/// executor's to show; this writer can't tell.
 struct CancelAfter<'a> {
     written: usize,
     limit: usize,
@@ -87,7 +104,7 @@ impl Write for CancelAfter<'_> {
 }
 
 #[test]
-fn results_stream_and_can_be_cancelled_mid_output() {
+fn cancelling_mid_output_stops_the_delivery() {
     let service = service_with_triples(2_000);
     let query = "SELECT * WHERE { ?a ?b ?c . ?d ?e ?f }"; // 4 M rows
     let prepared = PreparedQuery::parse(&SparqlQueryRequest::all(query)).expect("parse");
