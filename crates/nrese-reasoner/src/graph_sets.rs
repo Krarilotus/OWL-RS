@@ -39,7 +39,7 @@ use rayon::prelude::*;
 
 use super::batch::Store;
 use super::eval::{
-    GroundProgram, Grounding, Job, Seg, Source, derivations, instantiate_head, transitivity,
+    GroundProgram, Grounding, Job, Poller, Seg, Source, derivations, instantiate_head, transitivity,
 };
 use super::ir::{Head, Rule, Triple};
 
@@ -466,7 +466,8 @@ pub fn support_sets(
             let (job, heads, schema) = &jobs[*j];
             let mut out = Vec::new();
             let mut body = Vec::with_capacity(job.rule.body.len());
-            job.run(&source, range.clone(), &mut |bindings| {
+            let mut poll = Poller::never();
+            job.run(&source, range.clone(), &mut poll, &mut |bindings| {
                 body.clear();
                 body.extend(
                     job.rule
@@ -604,7 +605,9 @@ pub fn derived_otherwise<S: Source + ?Sized>(
     let derives = |rule: &Rule| {
         let mut found = false;
         let mut body = Vec::with_capacity(rule.body.len());
-        derivations(source, rule, fact, Seg::All, &mut |bindings| {
+        // Unpolled, as before: the support sets' stop is the item-18 agent's (N10 r1 F1).
+        let mut poll = Poller::never();
+        derivations(source, rule, fact, Seg::All, &mut poll, &mut |bindings| {
             body.clear();
             body.extend(
                 rule.body
@@ -954,18 +957,26 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
                         continue;
                     }
                     let mut body = Vec::with_capacity(rule.body.len());
-                    derivations(change.source, rule, fact, Seg::All, &mut |bindings| {
-                        body.clear();
-                        body.extend(
-                            rule.body
-                                .iter()
-                                .map(|atom| instantiate_head(atom, bindings)),
-                        );
-                        if premises_in_closure(&body) {
-                            take(premise_sets_from(&body, schema, &lookup, cap));
-                        }
-                        false
-                    });
+                    let mut poll = Poller::never();
+                    derivations(
+                        change.source,
+                        rule,
+                        fact,
+                        Seg::All,
+                        &mut poll,
+                        &mut |bindings| {
+                            body.clear();
+                            body.extend(
+                                rule.body
+                                    .iter()
+                                    .map(|atom| instantiate_head(atom, bindings)),
+                            );
+                            if premises_in_closure(&body) {
+                                take(premise_sets_from(&body, schema, &lookup, cap));
+                            }
+                            false
+                        },
+                    );
                 }
                 (fact, from)
             })
@@ -1078,7 +1089,8 @@ where
         .flat_map_iter(|(j, range)| {
             let (k, job) = &jobs[*j];
             let mut out = Vec::new();
-            job.run(source, range.clone(), &mut |bindings| {
+            let mut poll = Poller::never();
+            job.run(source, range.clone(), &mut poll, &mut |bindings| {
                 emit(*k, bindings, &mut out)
             });
             out

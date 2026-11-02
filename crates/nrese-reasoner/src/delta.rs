@@ -604,7 +604,7 @@ fn update_body<B: Base + ?Sized>(
                 candidates = candidates
                     .into_par_iter()
                     .filter(|&f| {
-                        stop() || !old_program.derivable_by(&left, f, &non_recursive, false)
+                        stop() || !old_program.derivable_by(&left, f, &non_recursive, false, stop)
                     })
                     .collect();
                 check_stop()?;
@@ -711,7 +711,9 @@ fn update_body<B: Base + ?Sized>(
             let by_rules: Vec<Triple> = open
                 .par_iter()
                 .copied()
-                .filter(|&f| !stop() && program.derivable_by(&remaining, f, &not_equality, true))
+                .filter(|&f| {
+                    !stop() && program.derivable_by(&remaining, f, &not_equality, true, stop)
+                })
                 .collect();
             let by_rules: HashSet<Triple> = by_rules.into_iter().collect();
             check_stop()?;
@@ -779,7 +781,7 @@ fn update_body<B: Base + ?Sized>(
         .filter(|&fact| {
             !stop()
                 && !base.is_asserted(fact)
-                && settled.derivable_with(&remaining, fact, !recloses.contains(&fact[1]))
+                && settled.derivable_with(&remaining, fact, !recloses.contains(&fact[1]), stop)
         })
         .collect();
     rederived.extend(others);
@@ -938,6 +940,7 @@ fn update_body<B: Base + ?Sized>(
         settled_consistency..program.consistency.len(),
         &variants,
         &mut found,
+        stop,
     );
     check_stop()?;
     result.violations = sorted(found);
