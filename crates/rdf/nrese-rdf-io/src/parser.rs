@@ -214,10 +214,20 @@ impl RdfParser {
     }
 
     fn wrap<'a, R: Read>(self, inner: Inner<'a, R>) -> QuadParser<'a, R> {
+        // The formats that go on after a syntax error (see `recovering`).
+        let recovers = match self.format {
+            RdfFormat::NTriples | RdfFormat::NQuads => true,
+            RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml | RdfFormat::JsonLd => {
+                self.recover
+            }
+            _ => false,
+        };
         QuadParser {
             inner,
             default_graph: self.default_graph,
             without_named_graphs: self.without_named_graphs,
+            recovers,
+            done: false,
         }
     }
 
@@ -422,118 +432,142 @@ pub struct QuadParser<'a, R: Read> {
     inner: Inner<'a, R>,
     default_graph: GraphName,
     without_named_graphs: bool,
+    /// Whether the format goes on after a syntax error.
+    recovers: bool,
+    /// After an error that stops the document: nothing more.
+    done: bool,
 }
 
 impl<R: Read> QuadParser<'_, R> {
-    /// The next quad, borrowed until the next call; `None` at the end.
+    /// The next quad, borrowed until the next call; `None` at the end. A read error always
+    /// ends the document, and so does a syntax error unless the format goes on after one
+    /// ([`RdfParser::recovering`]), whichever layer found it.
     pub fn next_ref(&mut self) -> Option<Result<QuadRef<'_>, RdfParseError>> {
         let Self {
             inner,
             default_graph,
             without_named_graphs,
+            recovers,
+            done,
         } = self;
-        let (quad, at) = match inner {
-            Inner::Unsupported(format) => {
-                let format = format.take()?;
-                return Some(Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("reading {format} is not implemented yet"),
-                )
-                .into()));
-            }
-            Inner::RdfXmlSlice(parser) => match parser.advance() {
-                Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
-                Ok(false) => return None,
-                Err(error) => return Some(Err(error)),
-            },
-            Inner::RdfXmlReader(parser) => match parser.advance() {
-                Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
-                Ok(false) => return None,
-                Err(error) => return Some(Err(error)),
-            },
-            Inner::BinarySlice(parser) => match parser.advance() {
-                Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
-                Ok(false) => return None,
-                Err(error) => return Some(Err(error)),
-            },
-            Inner::BinaryReader(parser) => match parser.advance() {
-                Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
-                Ok(false) => return None,
-                Err(error) => return Some(Err(error)),
-            },
-            Inner::JsonLd(parser) => match parser.next_ref()? {
-                Ok(quad) => (quad, TextPosition::default()),
-                Err(error) => return Some(Err(error)),
-            },
-            Inner::JsonLdReader(pending, parser) => {
-                if let Some((mut reader, settings)) = pending.take() {
-                    let mut bytes = Vec::new();
-                    if let Err(error) = reader.read_to_end(&mut bytes) {
-                        return Some(Err(error.into()));
-                    }
-                    *parser = Some(Box::new(JsonLdParser::new(Cow::Owned(bytes), settings)));
-                }
-                match parser.as_mut()?.next_ref()? {
-                    Ok(quad) => (quad, TextPosition::default()),
-                    Err(error) => return Some(Err(error)),
-                }
-            }
-            Inner::N3(parser, current) => match parser.next_n3()? {
-                Ok(quad) => match quad.into_quad() {
-                    Ok(quad) => (current.insert(quad).as_ref(), TextPosition::default()),
-                    Err(quad) => {
-                        return Some(Err(RdfSyntaxError::new(
-                            format!("not RDF (read it with nrese_rdf_io::n3): {quad}"),
-                            TextPosition::default()..TextPosition::default(),
-                        )
-                        .into()));
-                    }
-                },
-                Err(error) => return Some(Err(error)),
-            },
-            Inner::Turtle(parser) => match parser.next_ref()? {
-                Ok(quad) => (quad, TextPosition::default()),
-                Err(error) => return Some(Err(error)),
-            },
-            Inner::Lines { lines, parser } => {
-                // The next line with a statement. A `VERSION` directive (RDF 1.2) has none:
-                // it is checked here and skipped (no statement starts with `VERSION`).
-                let (range, line, offset) = loop {
-                    let range = match lines.next() {
-                        Ok(Some(range)) => range,
-                        Ok(None) => return None,
-                        Err(error) => return Some(Err(error.into())),
-                    };
-                    let text = lines.slice(range.clone());
-                    if !has_statement(text) {
-                        continue;
-                    }
-                    let (line, offset) = lines.position();
-                    if text.trim_ascii_start().starts_with(b"VERSION") {
-                        match parser.parse(text, line, offset) {
-                            Ok(None) => continue,
-                            Ok(Some(_)) => unreachable!("a directive has no statement"),
-                            Err(error) => return Some(Err(lines.in_document(error.into()))),
-                        }
-                    }
-                    break (range, line, offset);
-                };
-                match parser.parse(lines.slice(range), line, offset) {
-                    Ok(Some(quad)) => (
-                        quad,
-                        TextPosition {
-                            line,
-                            column: 0,
-                            offset,
-                        },
-                    ),
-                    Ok(None) => unreachable!("parsed to a statement above"),
-                    Err(error) => return Some(Err(lines.in_document(error.into()))),
-                }
-            }
-        };
-        Some(place(quad, default_graph, *without_named_graphs, at))
+        if *done {
+            return None;
+        }
+        let step = next_quad(inner, default_graph, *without_named_graphs);
+        if let Some(Err(error)) = &step {
+            *done = matches!(error, RdfParseError::Io(_)) || !*recovers;
+        }
+        step
     }
+}
+
+/// The next quad of `inner`, in the graph the settings say.
+fn next_quad<'p, R: Read>(
+    inner: &'p mut Inner<'_, R>,
+    default_graph: &'p GraphName,
+    without_named_graphs: bool,
+) -> Option<Result<QuadRef<'p>, RdfParseError>> {
+    let (quad, at) = match inner {
+        Inner::Unsupported(format) => {
+            let format = format.take()?;
+            return Some(Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("reading {format} is not implemented yet"),
+            )
+            .into()));
+        }
+        Inner::RdfXmlSlice(parser) => match parser.advance() {
+            Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
+            Ok(false) => return None,
+            Err(error) => return Some(Err(error)),
+        },
+        Inner::RdfXmlReader(parser) => match parser.advance() {
+            Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
+            Ok(false) => return None,
+            Err(error) => return Some(Err(error)),
+        },
+        Inner::BinarySlice(parser) => match parser.advance() {
+            Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
+            Ok(false) => return None,
+            Err(error) => return Some(Err(error)),
+        },
+        Inner::BinaryReader(parser) => match parser.advance() {
+            Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
+            Ok(false) => return None,
+            Err(error) => return Some(Err(error)),
+        },
+        Inner::JsonLd(parser) => match parser.next_ref()? {
+            Ok(quad) => (quad, TextPosition::default()),
+            Err(error) => return Some(Err(error)),
+        },
+        Inner::JsonLdReader(pending, parser) => {
+            if let Some((mut reader, settings)) = pending.take() {
+                let mut bytes = Vec::new();
+                if let Err(error) = reader.read_to_end(&mut bytes) {
+                    return Some(Err(error.into()));
+                }
+                *parser = Some(Box::new(JsonLdParser::new(Cow::Owned(bytes), settings)));
+            }
+            match parser.as_mut()?.next_ref()? {
+                Ok(quad) => (quad, TextPosition::default()),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        Inner::N3(parser, current) => match parser.next_n3()? {
+            Ok(quad) => match quad.into_quad() {
+                Ok(quad) => (current.insert(quad).as_ref(), TextPosition::default()),
+                Err(quad) => {
+                    return Some(Err(RdfSyntaxError::new(
+                        format!("not RDF (read it with nrese_rdf_io::n3): {quad}"),
+                        TextPosition::default()..TextPosition::default(),
+                    )
+                    .into()));
+                }
+            },
+            Err(error) => return Some(Err(error)),
+        },
+        Inner::Turtle(parser) => match parser.next_ref()? {
+            Ok(quad) => (quad, TextPosition::default()),
+            Err(error) => return Some(Err(error)),
+        },
+        Inner::Lines { lines, parser } => {
+            // The next line with a statement. A `VERSION` directive (RDF 1.2) has none:
+            // it is checked here and skipped (no statement starts with `VERSION`).
+            let (range, line, offset) = loop {
+                let range = match lines.next() {
+                    Ok(Some(range)) => range,
+                    Ok(None) => return None,
+                    Err(error) => return Some(Err(error.into())),
+                };
+                let text = lines.slice(range.clone());
+                if !has_statement(text) {
+                    continue;
+                }
+                let (line, offset) = lines.position();
+                if text.trim_ascii_start().starts_with(b"VERSION") {
+                    match parser.parse(text, line, offset) {
+                        Ok(None) => continue,
+                        Ok(Some(_)) => unreachable!("a directive has no statement"),
+                        Err(error) => return Some(Err(lines.in_document(error.into()))),
+                    }
+                }
+                break (range, line, offset);
+            };
+            match parser.parse(lines.slice(range), line, offset) {
+                Ok(Some(quad)) => (
+                    quad,
+                    TextPosition {
+                        line,
+                        column: 0,
+                        offset,
+                    },
+                ),
+                Ok(None) => unreachable!("parsed to a statement above"),
+                Err(error) => return Some(Err(lines.in_document(error.into()))),
+            }
+        }
+    };
+    Some(place(quad, default_graph, without_named_graphs, at))
 }
 
 /// The quad in the graph the settings say.
