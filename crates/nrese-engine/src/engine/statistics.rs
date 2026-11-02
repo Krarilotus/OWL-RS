@@ -37,11 +37,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use nrese_exec::budget::Budget;
+use nrese_exec::budget::{Budget, BudgetExceeded, ChargedVec};
 use nrese_exec::cell::{self, Build, BuildCell, Builder, Claim, Kind, Scan};
 use parking_lot::Mutex;
 
 use super::characteristic::{CharacteristicSets, Gathered, PairCounts, Partial, SetCount};
+use super::snapshot::HeavyGroups;
 use super::{ReadModel, Snapshot, Version};
 use crate::quad::{GraphSelector, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
@@ -92,7 +93,7 @@ pub(crate) struct Statistics {
     /// number, not its content).
     nodes: Mutex<Vec<NodeCount>>,
     /// Heavy groups of patterns at versions, exact, held as the node counts are.
-    heavy: Mutex<Vec<HeavyGroups>>,
+    heavy: Mutex<Vec<HeavyEntry>>,
     /// Walks for heavy groups begun: what the tests count.
     heavy_walks: AtomicU64,
     /// Per read model, the default graph's characteristic sets.
@@ -152,17 +153,19 @@ type NodeCount = (Weak<Version>, ReadModel, GraphSelector, u64);
 const NODE_ENTRIES: usize = 64;
 
 /// A version (held weakly), what was read of it (the pattern as read, in a permutation, the
-/// groups past a match count), and those groups.
-type HeavyGroups = (
+/// groups past a match count), and those groups as kept, charged (`None`: the budget
+/// couldn't take them, so the version's readers get none without walking again).
+type HeavyEntry = (
     Weak<Version>,
     ReadModel,
     QuadPattern,
     Permutation,
     u64,
-    Arc<[(TermId, u64)]>,
+    Option<cell::Kept<ChargedVec<(TermId, u64)>>>,
 );
 
-/// Heavy-group lists kept; the cache is cleared when it fills up.
+/// Heavy-group lists kept; the cache is cleared when it fills up. Entries, not bytes: each
+/// list's bytes are charged to the statistics' budget.
 const HEAVY_ENTRIES: usize = 256;
 
 impl Statistics {
@@ -193,8 +196,10 @@ impl Statistics {
     }
 
     /// The groups of `pattern` (as read) in `permutation` at `version` in `model` that more
-    /// than `min` quads match: kept, or walked by `walk` (`None`: it can't be, and nothing
-    /// is kept).
+    /// than `min` quads match: kept, or walked by `walk` into vectors charged to the budget
+    /// it is given (the one [`Self::set_budget`] set, else an unlimited one), and kept so.
+    /// `None` where the budget can't take them: then nothing of them stays charged, and
+    /// the version's readers get none without a walk each.
     pub(crate) fn heavy_groups(
         &self,
         version: &Arc<Version>,
@@ -202,8 +207,8 @@ impl Statistics {
         pattern: QuadPattern,
         permutation: Permutation,
         min: u64,
-        walk: impl FnOnce() -> Option<Vec<(TermId, u64)>>,
-    ) -> Option<Arc<[(TermId, u64)]>> {
+        walk: impl FnOnce(&Arc<Budget>) -> Result<ChargedVec<(TermId, u64)>, BudgetExceeded>,
+    ) -> Option<HeavyGroups> {
         let found = self
             .heavy
             .lock()
@@ -214,13 +219,18 @@ impl Statistics {
                     && *perm == permutation
                     && *n == min
                     && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(version)))
-                .then(|| Arc::clone(groups))
+                .then(|| groups.as_ref().map(|kept| Arc::clone(kept.value())))
             });
-        if found.is_some() {
+        if let Some(found) = found {
             return found;
         }
         self.heavy_walks.fetch_add(1, Ordering::Relaxed);
-        let groups: Arc<[(TermId, u64)]> = walk()?.into();
+        let budget = self.budget.lock().clone();
+        let budget = budget.unwrap_or_else(|| Arc::new(Budget::unlimited()));
+        let kept = walk(&budget)
+            .and_then(|groups| cell::Kept::new(groups, Arc::clone(&budget)))
+            .ok();
+        let groups = kept.as_ref().map(|kept| Arc::clone(kept.value()));
         let mut heavy = self.heavy.lock();
         heavy.retain(|(weak, ..)| weak.strong_count() > 0);
         if heavy.len() >= HEAVY_ENTRIES {
@@ -232,9 +242,9 @@ impl Statistics {
             pattern,
             permutation,
             min,
-            Arc::clone(&groups),
+            kept,
         ));
-        Some(groups)
+        groups
     }
 
     /// Walks for heavy groups begun ([`Self::heavy_groups`]).
@@ -599,6 +609,77 @@ mod tests {
         tx.commit().unwrap();
     }
 
+    /// Heavy groups are kept within the statistics' budget, as the characteristic sets are:
+    /// H complete graphs of 66 nodes give 66 H objects with 65 predecessors each, past a
+    /// minimum of 64. Kept, they are charged, for as long as any holder keeps them (an
+    /// entry gone with its version, a planner's list still charged until it lets go);
+    /// where the budget can't take them, nothing is kept, nothing stays charged and the
+    /// planner gets none, never a part (PR #81 review r1, F2).
+    #[test]
+    fn heavy_groups_are_kept_within_the_statistics_budget() {
+        const H: u32 = 4;
+        let list_bytes = 66 * H as usize * std::mem::size_of::<(TermId, u64)>();
+        let pair = |a: u32, b: u32| {
+            let node = |n: u32| NamedNode::new_unchecked(format!("http://example.com/n{n}"));
+            let p = NamedNode::new_unchecked("http://example.com/p");
+            Quad::new(node(a), p, node(b), GraphName::DefaultGraph)
+        };
+        for limit in [0, list_bytes / 2, 1 << 20] {
+            let engine = Engine::new(EngineConfig::default()).unwrap();
+            let budget = Arc::new(Budget::new(limit));
+            engine.charge_statistics_to(Arc::clone(&budget));
+            let mut tx = engine.transaction();
+            for g in 0..H {
+                for (a, b) in (0..66).flat_map(|a| (0..66).map(move |b| (a, b))) {
+                    if a != b {
+                        tx.insert(pair(g * 66 + a, g * 66 + b).as_ref());
+                    }
+                }
+            }
+            tx.commit().unwrap();
+            let snapshot = engine.snapshot();
+            let p = snapshot
+                .lookup(
+                    NamedNode::new_unchecked("http://example.com/p")
+                        .as_ref()
+                        .into(),
+                )
+                .expect("interned");
+            let objects = QuadPattern {
+                predicate: Some(p),
+                ..QuadPattern::all()
+            };
+            let heavy = |snapshot: &Snapshot| {
+                snapshot.heavy_groups_in(ReadModel::default(), &objects, Permutation::Posg, 64)
+            };
+            let kept = heavy(&snapshot);
+            if limit < list_bytes {
+                assert!(kept.is_none(), "limit {limit}: no part of a list");
+                assert_eq!(budget.used(), 0, "limit {limit}: nothing stays charged");
+                continue;
+            }
+            let kept = kept.expect("within the budget");
+            assert_eq!(kept.len(), 66 * H as usize);
+            assert!(kept.iter().all(|&(_, n)| n == 65));
+            let charged = budget.used();
+            assert!(charged >= list_bytes, "{charged} bytes charged");
+            // A commit's version, with the old snapshot gone: its entry goes, the
+            // planner's list stays charged until it is dropped.
+            drop(snapshot);
+            let mut tx = engine.transaction();
+            tx.insert(pair(10_000, 10_001).as_ref());
+            tx.commit().unwrap();
+            assert!(heavy(&engine.snapshot()).is_some());
+            let before = budget.used();
+            drop(kept);
+            assert!(
+                before - budget.used() >= list_bytes,
+                "{before} charged before the list was dropped, {} after",
+                budget.used()
+            );
+        }
+    }
+
     /// A read that expands equality classes has no heavy groups (its groups aren't the
     /// index's), also where a read of the same version as stored walked and kept them: a
     /// kept list answered both, and an empty one turned an expanding count's budget off
@@ -636,9 +717,8 @@ mod tests {
             )
         };
         assert!(heavy(&snapshot.stored()).is_some_and(|groups| !groups.is_empty()));
-        assert_eq!(
-            heavy(&snapshot),
-            None,
+        assert!(
+            heavy(&snapshot).is_none(),
             "an expanding read walks no index groups"
         );
     }
