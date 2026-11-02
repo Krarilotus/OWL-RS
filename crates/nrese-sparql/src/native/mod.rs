@@ -1809,7 +1809,7 @@ impl<'a> Context<'a> {
                 name,
                 inner,
                 silent,
-            } => self.service(name, inner, *silent, None),
+            } => self.service(name, inner, *silent),
             // A SERVICE joined to a pattern gets the values the pattern binds.
             GraphPattern::Join { inputs }
                 if inputs
@@ -1840,8 +1840,7 @@ impl<'a> Context<'a> {
                     return self.vector_join(&local, inner);
                 }
                 let bound = self.eval(&local)?;
-                let found = self.service(name, inner, *silent, Some(&bound))?;
-                self.join(bound, found)
+                self.service_attached(name, inner, *silent, bound, federation::Attach::Join)
             }
             GraphPattern::LeftJoin {
                 left,
@@ -1857,8 +1856,8 @@ impl<'a> Context<'a> {
                     unreachable!("matched above")
                 };
                 let left = self.eval(left)?;
-                let found = self.service(name, inner, *silent, Some(&left))?;
-                self.left_join(left, found, expression.as_ref())
+                let attach = federation::Attach::Optional(expression.as_ref());
+                self.service_attached(name, inner, *silent, left, attach)
             }
             GraphPattern::Path {
                 subject,

@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use nrese_engine::{Engine, EngineConfig};
 use nrese_rdf::{BlankNode, GraphName, Literal, NamedNode, Quad, Term, Triple, Variable};
 use nrese_sparql::{
-    CancellationToken, QueryOptions, QueryResults, ServiceClient, ServiceResults, Services,
-    evaluate_query, explain_query,
+    QueryEvaluationError, QueryOptions, QueryResults, ServiceCall, ServiceClient, ServiceResults,
+    Services, evaluate_query, explain_query,
 };
 use nrese_sparql_syntax::SparqlParser;
 
@@ -31,19 +31,21 @@ impl ServiceClient for Endpoint {
         &self,
         endpoint: &str,
         query: &str,
-        _cancellation: Option<&CancellationToken>,
-    ) -> Result<ServiceResults, Box<dyn std::error::Error + Send + Sync>> {
+        _call: ServiceCall<'_>,
+    ) -> Result<ServiceResults, QueryEvaluationError> {
         assert_eq!(endpoint, REMOTE);
         self.queries.lock().unwrap().push(query.to_owned());
         if self.fail {
-            return Err("the endpoint is down".into());
+            return Err(QueryEvaluationError::Service("the endpoint is down".into()));
         }
-        let parsed = SparqlParser::new().parse_query(query)?;
+        let parsed = SparqlParser::new()
+            .parse_query(query)
+            .map_err(|error| QueryEvaluationError::Service(error.into()))?;
         let snapshot = self.engine.snapshot();
         let QueryResults::Solutions(solutions) =
             evaluate_query(&snapshot, &parsed, &QueryOptions::default())?
         else {
-            return Err("not a SELECT".into());
+            return Err(QueryEvaluationError::Service("not a SELECT".into()));
         };
         let variables = solutions.variables().to_vec();
         let mut rows = Vec::new();
@@ -240,8 +242,8 @@ impl ServiceClient for Canned {
         &self,
         endpoint: &str,
         query: &str,
-        _cancellation: Option<&CancellationToken>,
-    ) -> Result<ServiceResults, Box<dyn std::error::Error + Send + Sync>> {
+        _call: ServiceCall<'_>,
+    ) -> Result<ServiceResults, QueryEvaluationError> {
         assert_eq!(endpoint, REMOTE);
         Ok((self.0)(query))
     }

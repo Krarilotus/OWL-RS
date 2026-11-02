@@ -62,7 +62,7 @@ pub use results::{
     CancellationToken, QueryDatasetSpecification, QueryEvaluationError, QueryResults,
     QuerySolution, QuerySolutionIter, QueryTripleIter,
 };
-pub use service::{ServiceClient, ServiceResults, Services};
+pub use service::{ServiceCall, ServiceClient, ServiceResults, Services};
 pub use update::{ReadSource, UpdateError, UpdateOptions, apply_update, graph_label};
 pub use view::ReadView;
 
