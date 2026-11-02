@@ -147,8 +147,11 @@ impl Engine {
     /// revision are skipped. Returns the revision reached. A record that doesn't follow
     /// (a gap) or whose dictionary doesn't continue this one's is refused
     /// ([`EngineError::Corruption`]): the replica starts again from an image.
+    ///
+    /// On a Rayon pool thread while the writer slot is held: [`EngineError::SlotBusy`]
+    /// (the contract of [`Engine::transaction`]).
     pub fn apply_log(&self, frames: &[u8]) -> EngineResult<u64> {
-        let _slot = self.inner.writer.lock();
+        let _slot = super::admit(&self.inner.writer, "writer")?;
         let shared = &self.inner.shared;
         let mut pos = 0;
         let mut revision = shared.versions.load().revision;
