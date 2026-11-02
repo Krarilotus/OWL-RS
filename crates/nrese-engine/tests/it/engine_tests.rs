@@ -370,7 +370,7 @@ fn exists_agrees_with_count() {
             let model = ReadModel::Materialised;
             assert_eq!(
                 snapshot.exists_in(model, &pattern),
-                snapshot.count_in(model, &pattern) > 0,
+                snapshot.count_in(model, &pattern).at_least() > 0,
                 "{pattern:?}"
             );
         }

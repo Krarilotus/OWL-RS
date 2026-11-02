@@ -74,8 +74,13 @@ impl Base for EngineBase<'_> {
     fn estimate(&self, bound: [Option<u64>; 3]) -> usize {
         let committed = self
             .snapshot
-            .count_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any));
-        usize::try_from(committed).unwrap_or(usize::MAX) + self.inserts.estimate(bound)
+            .count_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any))
+            .at_least();
+        // An expanded count past `u64` reads as its maximum (`Snapshot::count_in`): the sum
+        // saturates too, never wrapping to a smaller estimate.
+        usize::try_from(committed)
+            .unwrap_or(usize::MAX)
+            .saturating_add(self.inserts.estimate(bound))
     }
 
     fn contains(&self, fact: Triple) -> bool {
