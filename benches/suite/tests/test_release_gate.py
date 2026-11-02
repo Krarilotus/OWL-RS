@@ -44,6 +44,81 @@ MACHINE = {"host": "phuoc-yu", "cpu": "Ryzen", "governor": "performance"}
 CONTEXT = {"host": "phuoc-yu", "round": 0, "prefix": "rg-cccccccc", "max_gb": 24.0, "ram_gb": 24.0}
 
 
+def remove_checkout(tree, repo=ROOT) -> subprocess.CompletedProcess:
+    """A checkout a test made, removed by its path alone (never a `prune`). With core.longpaths: a
+    job's temp root on a Windows host can put the repository's deepest files past 260 characters,
+    where git without it can't delete them (khaleesi's Windows tier, 2 Nov 2026: "Filename too long";
+    other platforms ignore the setting)."""
+    return subprocess.run(["git", "-c", "core.longpaths=true", "worktree", "remove", "--force", Path(tree).as_posix()],
+                          cwd=repo, capture_output=True, text=True)
+
+
+def remove_checkouts_under(root, repo=ROOT) -> list[str]:
+    """Every checkout registered under `root`, a test's own temporary directory, removed by its path
+    (remove_checkout()); those that stayed, with git's reason. Never a `git worktree prune`: in the
+    repository the suite runs in it drops any registration whose directory this process can't see,
+    other agents' live checkouts among them (rule.delete-only-what-you-created; 2 Nov 2026)."""
+    listed = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=repo, capture_output=True, text=True)
+    base = Path(root).resolve()
+    left = []
+    for line in listed.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        tree = Path(line[len("worktree "):]).resolve()
+        if tree == base or base in tree.parents:
+            removed = remove_checkout(tree, repo)
+            if removed.returncode:
+                left.append(f"{tree}: {removed.stderr.strip()}")
+    return left
+
+
+class Checkouts(unittest.TestCase):
+    def test_a_test_s_checkout_past_the_windows_path_limit_is_removed(self):
+        """khaleesi's Windows tier, 2 Nov 2026: a test's harness checkout under the job's deep temp
+        root stayed registered ("Filename too long"), failing the test that made it."""
+        if os.name != "nt":
+            self.skipTest("the 260-character limit is Windows'")
+        with tempfile.TemporaryDirectory() as tmp:
+            git = lambda *a, cwd=tmp: subprocess.run(["git", "-c", "core.longpaths=true", *a], cwd=cwd,  # noqa: E731
+                                                       capture_output=True, text=True, check=True)
+            repo = Path(tmp, "r")
+            repo.mkdir()
+            git("init", "-q", cwd=repo)
+            deep = Path(*(["d" * 40] * 6), "f.txt")  # 250 characters inside the checkout
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base", cwd=repo)
+            tree = Path(tmp, "w" * 30)
+            git("worktree", "add", "-q", tree.as_posix(), cwd=repo)
+            (tree / deep).parent.mkdir(parents=True)
+            (tree / deep).write_text("x", encoding="utf-8")
+            git("add", "-A", cwd=tree)
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "deep", cwd=tree)
+            self.assertGreater(len(str((tree / deep).resolve())), 260)
+            removed = remove_checkout(tree, repo)
+            self.assertEqual(removed.returncode, 0, removed.stderr)
+            self.assertFalse(tree.exists())
+
+    def test_a_test_removes_only_its_own_checkouts_never_prunes(self):
+        """Orchestrator, 2 Nov 2026 (rule.delete-only-what-you-created): three tests ran `git worktree
+        prune` in the repository the suite runs in, which drops every registration whose directory
+        this process can't see, another agent's live checkout among them. A test removes the
+        checkouts under its own temporary directory, by path, and nothing else."""
+        with tempfile.TemporaryDirectory() as tmp:
+            git = lambda *a, cwd=tmp: subprocess.run(["git", *a], cwd=cwd, capture_output=True, text=True,  # noqa: E731
+                                                       check=True).stdout
+            repo = Path(tmp, "r")
+            repo.mkdir()
+            git("init", "-q", cwd=repo)
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base", cwd=repo)
+            own, other = Path(tmp, "own"), Path(tmp, "elsewhere")
+            git("worktree", "add", "-q", "--detach", (own / "gate" / "src-1").as_posix(), cwd=repo)
+            git("worktree", "add", "-q", "--detach", (other / "src-2").as_posix(), cwd=repo)
+            shutil.rmtree(other)  # another space's checkout: registered, its directory not visible here
+            self.assertEqual(remove_checkouts_under(own, repo), [])
+            listed = git("worktree", "list", "--porcelain", cwd=repo)
+            self.assertNotIn("src-1", listed)
+            self.assertIn("src-2", listed, "another's registration was dropped")
+
+
 def observation(samples, peak=500, cgroup=900, estimator="samples", rows=None, phases=None, anon=None):
     out = {"identity": {"sweep": 0, "repeat": 0, "cache": "warm"}, "exit": 0, "samples": samples,
            "estimator": estimator, "peak_mib": peak, "phase_peaks": phases or {}, "cgroup_peak_mib": cgroup,
@@ -607,10 +682,11 @@ class Parts(unittest.TestCase):
             done = subprocess.run([bash, "-c", f'PATH="$(cygpath -u "{shim}" 2>/dev/null || echo "{shim}"):$PATH" '
                                    f'exec bash scripts/release-gate.sh unpack'], cwd=ROOT, env=env,
                                   capture_output=True, text=True, encoding="utf-8")
-        # The gate's own checkout (of this checkout's commit) was under the scratch directory.
-        subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
+            # The gate's own checkout (of this checkout's commit), if it made one, is under tmp.
+            left = remove_checkouts_under(tmp)
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertIn("is not Linux", done.stdout)
+        self.assertEqual(left, [], "a checkout this test made stayed registered")
 
     def test_a_block_of_two_sides_is_complete_with_its_four_reports(self):
         """20 Oct 2026: release-gate.sh block counted six reports a block whatever the sides, so an
@@ -660,10 +736,9 @@ echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
                                  f'exec bash scripts/release-gate.sh block 3 {head} 1 - a={head} a2={head} b={head}'],
                                 cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
             reports = len(list(Path(tmp).glob("out/passes/pass-*.json"))) - 4  # block 2's: base and cand
-            for tree in Path(t, "gate", "run").glob(f"space-*/src-{head[:8]}"):  # the harness's checkout
-                subprocess.run(["git", "worktree", "remove", "--force", tree.as_posix()], cwd=ROOT, capture_output=True)
-        subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
+            left = remove_checkouts_under(tmp)  # the harness's checkout, by its path alone
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(left, [], "a checkout this test made stayed registered")
         self.assertIn("block 2: done", done.stdout)
         self.assertIn("main is the same build as another side", done.stdout)  # timed once, as base
         self.assertEqual((aa.returncode, reports), (0, 6), aa.stdout + aa.stderr)  # a, a2, b: twice each
@@ -725,12 +800,7 @@ point {head} "$b"
             # The harness's checkout this run made, removed by its path alone: never a `prune`, which
             # takes any registration whose directory this process space can't see, another space's
             # live checkout among them (release-gate.sh's drop_checkout; Sol, PR #64 r1 F2).
-            left = []
-            for tree in Path(t, "gate", "run").glob(f"space-*/src-{head[:8]}"):
-                removed = subprocess.run(["git", "worktree", "remove", "--force", tree.as_posix()], cwd=ROOT,
-                                         capture_output=True, text=True)
-                if removed.returncode:
-                    left.append(f"{tree}: {removed.stderr.strip()}")
+            left = remove_checkouts_under(tmp)
         self.assertNotEqual(done.returncode, 0, f"SPEC frozen inputs: prepare went on\n{done.stdout}{done.stderr}")
         self.assertIn("NOT the freeze support-stress/copies-17.nq.commits.ru", done.stdout + done.stderr)
         self.assertEqual((linked, prepared), ([], False),
@@ -1994,8 +2064,8 @@ make bin-after 'profile release --locked' '3 days ago'
                              {"IDENTITY", "BUILD.txt", "SHA256SUMS"}, "SPEC: the record stays")
             self.assertEqual(clean(), {"bin-unused": "released", "bin-live": "kept-live"})
             self.assertTrue(Path(tmp, "out", "patch-keyed-builds.tsv").is_file())
-        # The gate's own checkout (of this checkout's commit) was under the scratch directory.
-        subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
+            # The gate's own checkout (of this checkout's commit), if it made one, is under tmp.
+            self.assertEqual(remove_checkouts_under(tmp), [], "a checkout this test made stayed registered")
 
     def test_a_patch_keyed_build_is_never_a_verified_build(self):
         """Sol r1 S2: a gate's pointer or an archive from before T0 could hand a block a build of
