@@ -2720,7 +2720,9 @@ fn run_body(
         0..program.consistency.len(),
         &[],
         &mut found,
+        stop,
     );
+    check_stop()?;
     result.violations = sorted(found);
     result.counters.lookups_without_order = store
         .relations
@@ -2846,13 +2848,16 @@ pub(crate) fn sorted(found: HashSet<Violation>) -> Vec<Violation> {
 }
 
 /// Evaluates consistency instances into `found`: those in `full` over all facts, and the
-/// `(instance, atom)` semi-naive variants in `variants` through the delta.
+/// `(instance, atom)` semi-naive variants in `variants` through the delta. It polls `stop`
+/// as rule evaluation does ([`super::eval::walk`]); stopped, `found` is incomplete and the
+/// caller must ask its (latched) stop again and discard it.
 pub(crate) fn check<S: Source + ?Sized>(
     source: &S,
     program: &GroundProgram,
     full: impl IntoIterator<Item = usize>,
     variants: &[(usize, usize)],
     found: &mut HashSet<Violation>,
+    stop: super::eval::Stop<'_>,
 ) {
     let record = |c: usize, bindings: &[Option<u64>], found: &mut HashSet<Violation>| {
         let (rule, grounded) = &program.consistency[c];
@@ -2885,10 +2890,16 @@ pub(crate) fn check<S: Source + ?Sized>(
         let ground_rule = &program.consistency[c].1.rule;
         jobs.extend(Job::variant(source, ground_rule, i).map(|job| (c, job)));
     }
+    let Some(mut poll) = super::eval::Poller::new(stop) else {
+        return;
+    };
     for (c, job) in jobs {
-        job.run(source, 0..job.drivers(), &mut |bindings| {
+        job.run(source, 0..job.drivers(), &mut poll, &mut |bindings| {
             record(c, bindings, found)
         });
+        if poll.stopped() {
+            return;
+        }
     }
 }
 
