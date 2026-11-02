@@ -1003,17 +1003,18 @@ mod tests {
 
     /// Guard (the executor memory stack's timing, notes/2026-11-02-exec-memory-stack.md
     /// EMS-11: counting every sequence's ends cost path alternatives x1.56): a sequence counts
-    /// the ways through a node only where a step can multiply them by the path's text (an
-    /// alternative) or its input is counted. A plain sequence keeps its ends as copies, from
-    /// a node and for every pair, and so does an alternative of plain sequences; a sequence
-    /// with an alternative step counts.
+    /// the ways through a node only where they can add up: a step with an alternative, a
+    /// counted input, or a step that gives more ends than it was given. A sequence whose steps
+    /// give each entry one end keeps copies, from a node and for every pair, and so does an
+    /// alternative of such sequences; a sequence with an alternative step counts.
     #[test]
     fn only_a_step_that_can_multiply_ways_counts_them() {
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let [a, b, c, p, q] = ["a", "b", "c", "p", "q"]
             .map(|name| NamedNode::new_unchecked(format!("http://e/{name}")));
         let mut tx = engine.transaction();
-        for (s, pr, o) in [(&a, &p, &b), (&a, &q, &b), (&b, &p, &a), (&b, &p, &c)] {
+        // A chain: every node one `p` on, and `a q b`, `b q a` beside it.
+        for (s, pr, o) in [(&a, &p, &b), (&a, &q, &b), (&b, &p, &c), (&b, &q, &a)] {
             let quad = Quad::new(s.clone(), pr.clone(), o.clone(), GraphName::DefaultGraph);
             tx.insert(quad.as_ref());
         }
@@ -1043,7 +1044,62 @@ mod tests {
         assert!(matches!(evaluator.from(&plain, a), Bag::Copies(_)));
         assert!(matches!(evaluator.open(&plain), Bag::Copies(_)));
         assert!(matches!(evaluator.open(&either), Bag::Copies(_)));
+        // From `b` the alternative step gives two ends for one: counted.
         assert!(matches!(evaluator.from(&stepped, a), Bag::Counted(_)));
-        assert!(matches!(evaluator.open(&stepped), Bag::Counted(_)));
+    }
+
+    /// Spec (PR #85 N2; sol-loop r3 S1 of the executor memory stack): a sequence's bag holds
+    /// each end once with how many ways lead there, whatever multiplies the ways: the path's
+    /// text or the data. Over a two-node cycle (`a p b`, `b p a`), 20 `p?` steps from `a` reach
+    /// `a` and `b` 2^19 ways each: two entries, never 2^20 copies; the closure of such a
+    /// sequence answers its two nodes (SPARQL 1.1 §18.4: a sequence is a join, `+` a set).
+    #[test]
+    fn ways_the_data_multiplies_are_counted_not_copied() {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let [a, b, p] =
+            ["a", "b", "p"].map(|name| NamedNode::new_unchecked(format!("http://e/{name}")));
+        let mut tx = engine.transaction();
+        for (s, o) in [(&a, &b), (&b, &a)] {
+            let quad = Quad::new(s.clone(), p.clone(), o.clone(), GraphName::DefaultGraph);
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let maybe = PropertyPathExpression::ZeroOrOne(Box::new(PropertyPathExpression::NamedNode(
+            p.clone(),
+        )));
+        let steps = PropertyPathExpression::Sequence(vec![maybe; 20]);
+        let plus = Path::resolve(
+            &PropertyPathExpression::OneOrMore(Box::new(steps.clone())),
+            &snapshot,
+        );
+        let steps = Path::resolve(&steps, &snapshot);
+        let evaluator = PathEvaluator {
+            snapshot: &snapshot,
+            model: ReadModel::default(),
+            graph: PathGraph::Default,
+            fixed: None,
+            cancellation: None,
+            closures: Default::default(),
+        };
+        let [a, b] = [&a, &b].map(|n| snapshot.lookup(n.as_ref().into()).unwrap().raw());
+        let bag = evaluator.from(&steps, a);
+        assert_eq!(bag.len(), 1 << 20, "the ways: the sequence's solutions");
+        let entries = match &bag {
+            Bag::Copies(values) => values.len(),
+            Bag::Counted(counted) => counted.len(),
+        };
+        assert_eq!(entries, 2, "each end once, not a copy per way");
+        // Every pair: (a, a), (a, b), (b, a), (b, b), 2^19 ways each.
+        let pairs = evaluator.open(&steps);
+        assert_eq!(pairs.len(), 1 << 21, "the ways of every pair");
+        let entries = match &pairs {
+            Bag::Copies(values) => values.len(),
+            Bag::Counted(counted) => counted.len(),
+        };
+        assert_eq!(entries, 4, "each pair once, not a copy per way");
+        let mut reached = evaluator.from(&plus, a).into_copies();
+        reached.sort_unstable();
+        assert_eq!(reached, vec![a.min(b), a.max(b)]);
     }
 }
