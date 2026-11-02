@@ -51,8 +51,10 @@ fn a_checkpoint_asked_on_a_pool_thread_while_one_runs_is_refused() {
     assert!(error.contains("busy"), "says the slot is busy: {error}");
 }
 
-/// The fallible writer forms on a pool thread: a held writer slot is `SlotBusy`, a free one
-/// is taken (refusing it there would be a false refusal).
+/// The writer forms on a pool thread: a held writer slot is `SlotBusy` (the infallible forms'
+/// panic is in `tests/storage_waiters.rs`, the deliberately misused fixture), a free one is
+/// taken by every form, infallible ones included (refusing or panicking there would be a
+/// false refusal).
 #[test]
 fn the_fallible_writer_forms_on_a_pool_thread_are_refused_only_while_it_is_held() {
     use crate::EngineError::SlotBusy;
@@ -77,10 +79,20 @@ fn the_fallible_writer_forms_on_a_pool_thread_are_refused_only_while_it_is_held(
 
     let asking = engine.clone();
     let free = ask_from_the_pool("a free writer slot", move || {
-        let taken = asking.try_transaction().map(drop);
-        taken.is_ok()
+        let fallible = asking.try_transaction().map(drop).is_ok();
+        let infallible = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(asking.transaction());
+            drop(asking.bulk_load(super::BulkMode::Append));
+            drop(asking.rematerialisation());
+        }))
+        .is_ok();
+        (fallible, infallible)
     });
-    assert!(free, "a free slot is taken on a pool thread");
+    assert_eq!(
+        free,
+        (true, true),
+        "a free slot is taken on a pool thread, by the fallible and the infallible forms"
+    );
 }
 
 /// A compaction on a pool thread defers to a running merge instead of waiting for it (that
