@@ -191,11 +191,14 @@ impl<T: Copy + Eq + std::hash::Hash> Tally<T> {
     }
 }
 
-/// A sequence step's ends: pushed as they come, a copy each, unless the step can multiply
-/// the ways through a node by the path's text ([`multiplies_ways`]) or what it starts from
-/// is counted already; then each end once with how many ways ([`Tally`]). A step that
-/// meets counted ways after all starts counting there. Counting hashes every end: a plain
-/// sequence (`author/city`) needs none of it (the executor memory stack's timing: x1.56).
+/// A sequence step's ends: pushed as they come, a copy each, unless what it starts from is
+/// counted already; then each end once with how many ways ([`Tally`]). A step whose copies
+/// outnumber the entries it was given is counted when it ends ([`Self::finish`]): ways that
+/// grow, by the path's text (an alternative) or by the data (a node's several ends), are
+/// the only ones that compound over the next steps (`(p?/…/p?)+` over a cycle: 2^n copies),
+/// and a step that doesn't grow never gives more copies than it got. Counting hashes every
+/// end: a sequence whose steps give one end an entry (`author/city`) needs none of it (the
+/// executor memory stack's timing: counting every step cost path alternatives x1.56).
 enum Ends<T> {
     Copies(Vec<T>),
     Counted(Tally<T>),
@@ -224,27 +227,30 @@ impl<T: Copy + Eq + std::hash::Hash> Ends<T> {
         }
     }
 
-    fn finish(self) -> Bag<T> {
+    /// The step's bag, given the number of entries it started from: copies that outnumber
+    /// them are counted.
+    fn finish(self, entries: usize) -> Bag<T> {
         match self {
+            Self::Copies(values) if values.len() > entries => {
+                let mut tally = Tally::new();
+                for value in values {
+                    tally.add(value, 1);
+                }
+                tally.finish()
+            }
             Self::Copies(values) => Bag::Copies(values),
             Self::Counted(tally) => tally.finish(),
         }
     }
 }
 
-/// Whether following `path` can give an end more copies than the data's ways to it: an
-/// alternative of two or more arms (its arms may reach the same end, or be the same arm),
-/// anywhere but inside a closure or `?`, whose ends are a set.
-fn multiplies_ways(path: &Path) -> bool {
-    match path {
-        Path::Alternative(paths) => paths.len() > 1 || paths.iter().any(multiplies_ways),
-        Path::Sequence(steps) => steps.iter().any(multiplies_ways),
-        Path::Reverse(path) => multiplies_ways(path),
-        Path::Link(_)
-        | Path::Negated(_)
-        | Path::ZeroOrMore(_)
-        | Path::OneOrMore(_)
-        | Path::ZeroOrOne(_) => false,
+impl<T> Bag<T> {
+    /// How many entries the bag holds: its copies, or its counted values.
+    fn entries(&self) -> usize {
+        match self {
+            Self::Copies(values) => values.len(),
+            Self::Counted(counted) => counted.len(),
+        }
     }
 }
 
@@ -528,7 +534,8 @@ impl PathEvaluator<'_> {
             if nodes.is_empty() {
                 break;
             }
-            let mut next = Ends::new(matches!(nodes, Bag::Counted(_)) || multiplies_ways(step));
+            let entries = nodes.entries();
+            let mut next = Ends::new(matches!(nodes, Bag::Counted(_)));
             for (m, ways) in nodes.counted() {
                 if self.stopped() {
                     break;
@@ -541,7 +548,7 @@ impl PathEvaluator<'_> {
                     next.add(end, ways.saturating_mul(more));
                 }
             }
-            nodes = next.finish();
+            nodes = next.finish(entries);
         }
         nodes
     }
@@ -784,8 +791,8 @@ impl PathEvaluator<'_> {
                 // Each pair once with how many ways through, step by step (`through`).
                 let mut pairs = self.open(first);
                 for step in rest {
-                    let counted = matches!(pairs, Bag::Counted(_)) || multiplies_ways(step);
-                    let mut next = Ends::new(counted);
+                    let entries = pairs.entries();
+                    let mut next = Ends::new(matches!(pairs, Bag::Counted(_)));
                     for ((s, m), ways) in pairs.counted() {
                         if self.stopped() {
                             break;
@@ -794,7 +801,7 @@ impl PathEvaluator<'_> {
                             next.add((s, o), ways.saturating_mul(more));
                         }
                     }
-                    pairs = next.finish();
+                    pairs = next.finish(entries);
                 }
                 return pairs;
             }
