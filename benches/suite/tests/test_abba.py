@@ -406,6 +406,17 @@ systems = []
             with self.assertRaises(abba.Invalid) as refused:
                 abba.load_family(path, repo, catalog, harness=as_float)
             self.assertIn("differs", "\n".join(refused.exception.args[0]))
+            # Line endings alone, both committed, no conversion (fix check r1, V1): the harness's
+            # suite times the same cases, so the family is valid, in either direction.
+            lf = (FAMILY + own_case.format(n=3000)).encode("utf-8")
+            crlf = lf.replace(b"\n", b"\r\n")
+            for stored, here, which in ((lf, crlf, "LF at the harness, CRLF here"), (crlf, lf, "CRLF at the harness, LF here")):
+                with self.subTest(which):
+                    path.write_bytes(stored)
+                    at = commit("the harness's line endings")
+                    path.write_bytes(here)
+                    commit("B's line endings")
+                    self.assertEqual(len(abba.load_family(path, repo, catalog, harness=at)["cases"]), 2)
 
     def test_run_builds_the_family_from_the_registry(self):
         """`run --cases/--areas`: registry cases only, each once, the timeable ones of an area; an
