@@ -81,7 +81,8 @@ use nrese_exec::join::{
     outer_join_with_undef,
 };
 use nrese_exec::{
-    Budget, BudgetExceeded, ChargedVec, IdTable, Reservation, UNDEF, computed_id, computed_index,
+    Budget, BudgetExceeded, ChargedVec, Grant, IdTable, Reservation, UNDEF, computed_id,
+    computed_index,
 };
 use nrese_rdf::{Term, Variable};
 use nrese_sparql_syntax::Query;
@@ -253,18 +254,17 @@ fn run(
                 &template,
                 || ctx.check(),
             );
-            // Charged from room charged ahead; what the triples hold stays charged with
-            // them, the room left is released.
-            let mut held = Reservation::new(&*ctx.budget);
-            let mut spare = 0;
+            // One at a time through a grant (an atomic each, no call up the levels); the
+            // triples keep their charge with the outcome.
+            let mut grant = Grant::new(&*ctx.budget);
             for triple in made {
                 let triple = triple?;
-                charge_ahead(&ctx.budget, &mut held, &mut spare, triple_bytes(&triple))
+                grant
+                    .take(triple_bytes(&triple))
                     .map_err(QueryEvaluationError::MemoryLimit)?;
                 triples.push(triple);
             }
-            held.release(spare);
-            held.transfer();
+            grant.transfer();
             Outcome::Graph(triples)
         }
         Form::Select => Outcome::Solutions(solutions, ctx.computed.take()),
@@ -729,10 +729,9 @@ fn construct<'a>(
     let fresh_count = labels.len();
     let table = solutions.table;
     let mut emitted: HashSet<nrese_rdf::Triple> = HashSet::new();
-    // The copies `emitted` keeps, each charged before it is kept, from room charged ahead
-    // (`spare`, released with `held`).
-    let mut held = Reservation::new(budget);
-    let mut spare = 0;
+    // The copies `emitted` keeps, each charged before it is kept, one at a time through a
+    // grant.
+    let mut held = Grant::new(budget);
     // A triple at a time, however many the template has: the next is the template's
     // `index`-th triple of row `row`, with the row's fresh blank nodes.
     let (mut row, mut index) = (0, 0);
@@ -805,19 +804,17 @@ fn construct<'a>(
                 // the set doubles).
                 let copy = triple_heap(&triple)
                     .saturating_add(2 * std::mem::size_of::<nrese_rdf::Triple>());
-                if let Err(refused) = charge_ahead(budget, &mut held, &mut spare, copy) {
+                if let Err(refused) = held.take(copy) {
                     row = table.len();
                     return Some(Err(QueryEvaluationError::MemoryLimit(refused).into()));
                 }
                 if !emitted.insert(triple.clone()) {
-                    // Not kept: its room is spare again.
-                    spare += copy;
+                    held.give_back(copy);
                     continue;
                 }
                 if emitted.len() > 1024 * 1024 {
                     emitted = HashSet::new();
-                    held.release(held.bytes());
-                    spare = 0;
+                    held.trim();
                 }
             }
             return Some(Ok(triple));
@@ -4760,13 +4757,13 @@ impl<'a> Context<'a> {
     /// many keys the query names. A key that is a variable sorts by rank
     /// ([`Self::order_ranks`]: inline integers by id, so no term is decoded); others are
     /// evaluated per row.
-    fn sort_keys(
-        &self,
+    fn sort_keys<'b>(
+        &'b self,
         solutions: &Solutions,
         keys: &[OrderExpression],
         rows: &[usize],
         limit: Option<usize>,
-        held: &mut Reservation<&Budget>,
+        held: &mut Reservation<&'b Budget>,
     ) -> NativeResult<Vec<SortKey>> {
         let memory = QueryEvaluationError::MemoryLimit;
         let mut sort_keys = Vec::with_capacity(keys.len());
@@ -4791,16 +4788,19 @@ impl<'a> Context<'a> {
             held.charge(rows.len().saturating_mul(slot))
                 .map_err(memory)?;
             let mut terms = Vec::with_capacity(rows.len());
-            let mut spare = 0;
+            // A term at a time through a grant (an atomic each, no call up the levels), its
+            // charge then held with the keys'.
+            let mut strings = Grant::new(&*self.budget);
             for &row in rows {
                 let term = self.evaluator.eval(e, &self.binding(solutions, row));
                 if let Some(term) = &term {
-                    let bytes = crate::cache::term_heap(term);
-                    charge_ahead(&self.budget, held, &mut spare, bytes).map_err(memory)?;
+                    strings
+                        .take(crate::cache::term_heap(term))
+                        .map_err(memory)?;
                 }
                 terms.push(term);
             }
-            held.release(spare);
+            held.absorb(strings.into_reservation());
             sort_keys.push(SortKey::Terms(terms));
         }
         Ok(sort_keys)
@@ -6063,34 +6063,6 @@ fn grown_room<B: std::ops::Deref<Target = Budget>>(
 ) -> Result<usize, BudgetExceeded> {
     reserve_rows(table, held, rows, usize::MAX)?;
     Ok(table.len() + table.spare_rows())
-}
-
-/// How much [`charge_ahead`] reserves beyond a charge it can't take from what it reserved
-/// before: one budget call for many small charges (a value, a term, a triple) instead of
-/// one each, up through every level of the budget (PR #84's and the executor memory stack's
-/// timing: a call per value or row cost up to x1.6).
-const CHARGE_AHEAD_BYTES: usize = 16 << 10;
-
-/// Charges `bytes` to `held` before they are made, from `spare`: what `held` holds beyond
-/// what was charged through it so far. Where that is too little, the rest is reserved with
-/// up to [`CHARGE_AHEAD_BYTES`] more, as much of that as `budget` has left beyond the rest,
-/// so a charge that fits is never refused for the room ahead. The caller releases `spare`
-/// from `held` once it charges no more.
-fn charge_ahead<B: std::ops::Deref<Target = Budget>>(
-    budget: &Budget,
-    held: &mut Reservation<B>,
-    spare: &mut usize,
-    bytes: usize,
-) -> Result<(), BudgetExceeded> {
-    if let Some(left) = spare.checked_sub(bytes) {
-        *spare = left;
-        return Ok(());
-    }
-    let rest = bytes - *spare;
-    let ahead = CHARGE_AHEAD_BYTES.min(budget.remaining().saturating_sub(rest));
-    held.charge(rest.saturating_add(ahead))?;
-    *spare = ahead;
-    Ok(())
 }
 
 fn has_undef(table: &IdTable, columns: &[usize]) -> bool {

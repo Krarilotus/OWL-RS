@@ -399,37 +399,3 @@ fn a_column_given_to_a_row_without_columns_is_charged() {
     }
     assert!(failures.is_empty(), "{}", failures.join("; "));
 }
-
-/// Guard (the executor memory stack's timing, notes/2026-11-02-exec-memory-stack.md EMS-11:
-/// a budget call per value, term or triple cost GROUP_CONCAT x1.63): charges through
-/// `charge_ahead` call the budget once for as many as its room ahead holds, each still
-/// charged before it is made, and the room left is released by the caller. Near the limit
-/// only what is left is taken ahead: a charge that fits is never refused for it.
-#[test]
-fn charges_ahead_call_the_budget_once_for_many() {
-    let budget = nrese_exec::Budget::new(1 << 20);
-    let mut held = Reservation::new(&budget);
-    let mut spare = 0;
-    // A thousand values of 10 bytes after the first: one budget call for all of them.
-    charge_ahead(&budget, &mut held, &mut spare, 10).unwrap();
-    let first = budget.used();
-    for _ in 0..1_000 {
-        charge_ahead(&budget, &mut held, &mut spare, 10).unwrap();
-    }
-    assert_eq!(
-        budget.used(),
-        first,
-        "no budget call while the room ahead lasts"
-    );
-    held.release(spare);
-    assert_eq!(budget.used(), 10 * 1_001);
-
-    let small = nrese_exec::Budget::new(100);
-    let mut held = Reservation::new(&small);
-    let mut spare = 0;
-    charge_ahead(&small, &mut held, &mut spare, 60).unwrap();
-    assert_eq!((small.used(), spare), (100, 40));
-    charge_ahead(&small, &mut held, &mut spare, 40).unwrap();
-    assert!(charge_ahead(&small, &mut held, &mut spare, 1).is_err());
-    assert_eq!(small.used(), 100);
-}
