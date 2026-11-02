@@ -17,6 +17,9 @@ use crate::lists::ListDiagnostic;
 pub struct Closure {
     /// The storable inferred statements (in the default graph).
     pub inferred: Vec<EncodedTriple>,
+    /// The derived facts no store can hold (a literal subject, a non-IRI predicate). A
+    /// first load whose closure has any takes the delta executor ([`super::maintain`]).
+    pub unstorable: Vec<Triple>,
     pub violations: Vec<Violation>,
     /// List axioms that weren't instantiated.
     pub diagnostics: Vec<ListDiagnostic>,
@@ -73,16 +76,17 @@ pub fn materialise_until(
     // At its exact size: collected by doubling, the list held up to twice the facts, and
     // at a doubling three times, beside them (LUBM 1000: 6.6 GB at this step's peak).
     let mut inferred = Vec::with_capacity(result.derived.len() + axioms.len());
-    inferred.extend(
-        result
-            .derived
-            .into_iter()
-            .chain(axioms)
-            .filter(|&t| storable(t))
-            .map(encode),
-    );
+    let mut unstorable = Vec::new();
+    for t in result.derived.into_iter().chain(axioms) {
+        if storable(t) {
+            inferred.push(encode(t));
+        } else {
+            unstorable.push(t);
+        }
+    }
     Ok(Closure {
         inferred,
+        unstorable,
         violations,
         diagnostics: result.diagnostics,
         rounds: result.rounds,
