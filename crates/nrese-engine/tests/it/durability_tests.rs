@@ -182,6 +182,145 @@ fn torn_tail_at_every_byte_recovers_the_previous_revision() {
     }
 }
 
+/// Where each frame of a WAL segment starts, after its 8-byte magic.
+fn frame_starts(bytes: &[u8]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut at = 8;
+    while at + 8 <= bytes.len() {
+        starts.push(at);
+        at += 8 + u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    }
+    starts
+}
+
+/// Four acknowledged commits, one record each, in the store's only segment.
+fn four_records() -> (tempfile::TempDir, Vec<HashSet<Quad>>, Vec<u8>) {
+    let dir = tempfile::tempdir().unwrap();
+    let states = {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        commit_all(&engine, &batches(0..4))
+    };
+    let bytes = fs::read(&segments(dir.path())[0]).unwrap();
+    assert_eq!(frame_starts(&bytes).len(), 4);
+    (dir, states, bytes)
+}
+
+/// Damage in the newest segment that a crash mid-append doesn't leave (owner, 26 Oct:
+/// refused by default) fails the open, and leaves the log as it was: a flipped byte in a
+/// record with records after it (B-302: they were cut with it), a garbage header (its
+/// length runs past the end), zeros over a frame boundary with an intact record after
+/// them, and a flipped byte in the last record, which is complete. Each row is judged on
+/// its own.
+#[test]
+fn damage_in_the_last_segment_is_refused_and_left_in_place() {
+    let (source, _, original) = four_records();
+    let starts = frame_starts(&original);
+    let (second, third, last) = (starts[1], starts[2], starts[3]);
+    type Damage = Box<dyn Fn(&mut Vec<u8>)>;
+    let damages: [(&str, Damage); 4] = [
+        (
+            "a flipped byte in record 2 of 4",
+            Box::new(move |bytes: &mut Vec<u8>| bytes[second + 20] ^= 0x10),
+        ),
+        (
+            "a garbage header over record 2",
+            Box::new(move |bytes: &mut Vec<u8>| bytes[second..second + 8].fill(0xff)),
+        ),
+        (
+            "zeros from record 2 into record 3",
+            Box::new(move |bytes: &mut Vec<u8>| bytes[second + 10..third + 12].fill(0)),
+        ),
+        (
+            "a flipped byte in the last record",
+            Box::new(move |bytes: &mut Vec<u8>| bytes[last + 20] ^= 0x10),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, damage) in damages {
+        let dir = tempfile::tempdir().unwrap();
+        copy_dir(source.path(), dir.path());
+        let segment = &segments(dir.path())[0];
+        let mut bytes = original.clone();
+        damage(&mut bytes);
+        fs::write(segment, &bytes).unwrap();
+        let mut wrong = None;
+        for attempt in 1..=2 {
+            match Engine::open(dir.path(), config()) {
+                Err(EngineError::Corruption(_)) => {}
+                Ok(engine) => {
+                    wrong = Some(format!(
+                        "opened at revision {} (attempt {attempt})",
+                        engine.stats().revision
+                    ))
+                }
+                Err(other) => wrong = Some(format!("{other} (attempt {attempt})")),
+            }
+            if wrong.is_none() && fs::read(segment).unwrap() != bytes {
+                wrong = Some(format!("the log changed (attempt {attempt})"));
+            }
+            if wrong.is_some() {
+                break;
+            }
+        }
+        eprintln!(
+            "row {case}: {}",
+            if wrong.is_some() { "FAILED" } else { "ok" }
+        );
+        failures.extend(wrong.map(|w| format!("{case}: {w}")));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Guard (right on the base too): a size extension that never got its data (zeros to the
+/// end of the file) is a torn tail, so every record recovers.
+#[test]
+fn a_zero_filled_tail_is_torn() {
+    let (dir, states, mut bytes) = four_records();
+    bytes.extend_from_slice(&[0; 300]);
+    fs::write(&segments(dir.path())[0], &bytes).unwrap();
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(contents(&engine), states[3]);
+}
+
+/// What opening cuts from a torn tail is kept, byte for byte, in `wal-cut/`: a zero-filled
+/// extension and a last record cut short alike.
+#[test]
+fn a_cut_torn_tail_is_kept() {
+    let (source, _, original) = four_records();
+    let last = frame_starts(&original)[3];
+    let mut zeros = original.clone();
+    zeros.extend_from_slice(&[0; 300]);
+    let tails = [
+        ("zeros to the end", zeros, original.len()),
+        (
+            "the last record cut short",
+            original[..last + 20].to_vec(),
+            last,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, bytes, at) in tails {
+        let dir = tempfile::tempdir().unwrap();
+        copy_dir(source.path(), dir.path());
+        let segment = segments(dir.path())[0].clone();
+        fs::write(&segment, &bytes).unwrap();
+        drop(Engine::open(dir.path(), config()).unwrap());
+        let kept = fs::read(cut_copy(dir.path(), &segment, at)).ok();
+        let ok = kept.as_deref() == Some(&bytes[at..]);
+        eprintln!("row {case}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            failures.push(format!("{case}: kept {:?} bytes", kept.map(|k| k.len())));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Where opening keeps the bytes it cut from `segment` at `offset`.
+fn cut_copy(dir: &Path, segment: &Path, offset: usize) -> PathBuf {
+    let name = segment.file_name().unwrap().to_string_lossy();
+    dir.join("wal-cut").join(format!("{name}.{offset}"))
+}
+
 #[test]
 fn corruption_before_the_tail_is_an_error_not_data_loss() {
     let dir = tempfile::tempdir().unwrap();

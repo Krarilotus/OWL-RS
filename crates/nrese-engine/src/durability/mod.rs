@@ -18,6 +18,10 @@
 
 pub(crate) mod checkpoint;
 pub(crate) mod codec;
+#[cfg(test)]
+pub(crate) mod fault;
+#[cfg(test)]
+mod tests;
 pub(crate) mod wal;
 
 use std::fs::{self, File};
