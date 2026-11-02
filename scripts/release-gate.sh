@@ -370,7 +370,13 @@ from suitekit import hosts; print(hosts.input_path("general") or "")')
     || { log "prepare: no plan (release_gate.py plan failed)"; exit 2; }
   cp "$GATE/plan.json" "$OUT/plan.json"
   cases=$(planned)
-  log "plan: $(py -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["run"]), "cases;", len(d["not_run"]), "not run;", len(d["elsewhere"]), "on the big host")' "$GATE/plan.json")"
+  log "plan: $(py -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["run"]), "cases;", len(d["not_run"]), "not run;", len(d["elsewhere"]), "in the big part")' "$GATE/plan.json")"
+  # The cases' SPARQL data is this job's to make (Johannes, 2 Nov 2026), into the host's cache
+  # (SPARQL_DATA, benches/hosts.toml [caches]): what benches/sparql/prepare.sh makes and the host
+  # lacks is made now; what can't be made is said here, and the check below fails on it.
+  (cd "$tree" && SPARQL_DATA=$SPARQL_DATA py benches/fast/release_gate.py data --cases "$cases" --make) 2>&1 \
+    | tee "$OUT/data.txt" | tee -a "$OUT/gate.log" > /dev/null
+  log "data: $(grep -c '^held' "$OUT/data.txt") held, $(grep -cE '^(MISSING|DIFFERS)' "$OUT/data.txt") missing or differing"
   # The data view: each dataset a planned case reads, from the host's general inputs or the
   # SPARQL data, recorded with its hash. One that isn't its freeze (datasets.toml), or has none,
   # is refused and leaves the view, and preparation stops.
