@@ -344,6 +344,7 @@ impl<'a> Cursor<'a> {
         self.expect(b':')?;
         let whole = self.two_digits()?;
         let mut second = Decimal::from(whole);
+        let mut nonzero_fraction = false;
         if self.text.first() == Some(&b'.') {
             let digits = self.text[1..]
                 .iter()
@@ -353,6 +354,8 @@ impl<'a> Cursor<'a> {
                 return self.fail("a '.' without digits after it");
             }
             let fraction = &self.text[1..=digits];
+            // The value keeps 18 digits, but `24:00:00` takes only zeros, however many.
+            nonzero_fraction = hour == 24 && fraction.iter().any(|&b| b != b'0');
             let mut raw = 0_i128;
             let mut unit = SCALE;
             for &b in fraction.iter().take(18) {
@@ -365,7 +368,7 @@ impl<'a> Cursor<'a> {
         if minute > 59 || whole > 59 {
             return self.fail("minutes or seconds out of range");
         }
-        if hour > 24 || (hour == 24 && (minute != 0 || second != Decimal::ZERO)) {
+        if hour > 24 || (hour == 24 && (minute != 0 || whole != 0 || nonzero_fraction)) {
             return self.fail("an hour out of range");
         }
         Ok((hour, minute, second))
@@ -752,18 +755,31 @@ impl Time {
     }
 
     /// `op:add-dayTimeDuration-to-time`: modulo 24 hours.
+    /// The duration is first reduced to under a day (XPath F&O 3.1 §9.7.15), so every
+    /// duration in range gives a time.
     pub fn checked_add_duration(self, duration: impl Into<DayTimeDuration>) -> Option<Self> {
-        let moved = self.props().plus(0, duration.into().as_seconds())?;
+        self.plus_within_day(Self::within_day(duration.into())?)
+    }
+
+    /// `op:subtract-dayTimeDuration-from-time`: modulo 24 hours. The duration is reduced
+    /// before it is negated, which always fits (`Decimal::MIN` itself has no negation).
+    pub fn checked_sub_duration(self, duration: impl Into<DayTimeDuration>) -> Option<Self> {
+        self.plus_within_day(Self::within_day(duration.into())?.checked_neg()?)
+    }
+
+    /// The duration's seconds modulo a day, with the duration's sign.
+    fn within_day(duration: DayTimeDuration) -> Option<Decimal> {
+        duration.as_seconds().checked_rem(Decimal::from(DAY as i64))
+    }
+
+    fn plus_within_day(self, seconds: Decimal) -> Option<Self> {
+        let moved = self.props().plus(0, seconds)?;
         Some(Self::wrap(Props {
             year: 1972,
             month: 12,
             day: 31,
             ..moved
         }))
-    }
-
-    pub fn checked_sub_duration(self, duration: impl Into<DayTimeDuration>) -> Option<Self> {
-        self.checked_add_duration(duration.into().checked_neg()?)
     }
 
     /// `op:subtract-times`.

@@ -93,17 +93,32 @@ impl Decimal {
 
     /// `fn:round`: to the nearest integer, halves towards positive infinity.
     pub fn checked_round(self) -> Option<Self> {
-        Self(self.0.checked_add(SCALE / 2)?).checked_floor()
+        let (floor, fraction) = self.floor_and_fraction();
+        Self::whole(floor + i128::from(fraction >= SCALE / 2))
     }
 
     /// `fn:ceiling`.
     pub fn checked_ceil(self) -> Option<Self> {
-        Self(self.0.checked_neg()?).checked_floor()?.checked_neg()
+        let (floor, fraction) = self.floor_and_fraction();
+        Self::whole(floor + i128::from(fraction != 0))
     }
 
     /// `fn:floor`.
     pub fn checked_floor(self) -> Option<Self> {
-        self.0.div_euclid(SCALE).checked_mul(SCALE).map(Self)
+        Self::whole(self.0.div_euclid(SCALE))
+    }
+
+    /// The integer at or below the value and the fraction above it (in `0..SCALE`), from
+    /// one division. Only the rounded result is range-checked, by [`Self::whole`]: the
+    /// remainder's wrapping arithmetic is exact because the true remainder lies in range.
+    fn floor_and_fraction(self) -> (i128, i128) {
+        let floor = self.0.div_euclid(SCALE);
+        (floor, self.0.wrapping_sub(floor.wrapping_mul(SCALE)))
+    }
+
+    /// The integer `n` as a decimal, if it is in range.
+    fn whole(n: i128) -> Option<Self> {
+        n.checked_mul(SCALE).map(Self)
     }
 
     pub const fn is_negative(self) -> bool {
