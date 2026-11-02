@@ -7,9 +7,11 @@ file that moved or never landed sends its reader looking for nothing, or buildin
     python3 scripts/check-doc-paths.py            every tracked *.md
     python3 scripts/check-doc-paths.py FILE...    these files (the changed ones)
 
-A path resolves from the document's directory, from the repository root, or, for a path such as
-`tests/it/x.rs` or `src/lib.rs` written inside a crate's or the console's prose, from any crate's
-or app's directory. A
+A link resolves from its document's directory only, as a renderer resolves it (`<…>` destinations
+unwrapped). A backticked path resolves from the document's directory, from the repository root,
+or, for a path such as `tests/it/x.rs` or `src/lib.rs` written inside a crate's or the console's
+prose, from any crate's or app's directory. A named FILE that doesn't exist, or isn't Markdown, is
+skipped, so a changed-files list may carry deleted docs. A
 `:LINE` suffix and a `#anchor` are ignored; anchors aren't checked. Paths with placeholders or
 patterns (`<`, `{`, `*`, `…`, `$`, `NAME`, `HOST`) are skipped, as are links to URLs.
 
@@ -79,10 +81,13 @@ def missing(rel):
         for no, line in enumerate(fh, 1):
             for m in LINK.finditer(line):
                 target = m.group(1)
+                if target.startswith("<") and target.endswith(">"):
+                    target = target[1:-1]
                 if re.match(r"^[a-z][a-z0-9+.-]*:", target) or target.startswith("#"):
                     continue
                 path = clean(target)
-                if path and not PLACEHOLDER.search(path) and not exists(doc_dir, path, False):
+                # A link resolves from its document only, as a renderer resolves it.
+                if path and not PLACEHOLDER.search(path) and not os.path.exists(os.path.join(doc_dir, path)):
                     yield no, target
             for m in TICK.finditer(line):
                 if m.group(2):  # link text: the link itself is checked above
