@@ -16,7 +16,7 @@ import datetime
 from pathlib import Path
 
 from .adapters import adapter
-from .ledger import load_records
+from .ledger import PRE_RESET, PRE_RESET_NOTE, load_records, pre_reset
 from .workloads import DEFINITIONS, plans
 
 MARK = {"ok": "ok", "partial": "part", "wrong": "WRONG", "failed": "FAIL", "timeout": "T/O",
@@ -67,7 +67,7 @@ def runnable(root: Path, key: str, system: dict, name: str, workload: dict) -> s
 
 def newest(records: list[dict]) -> dict[tuple, tuple[str, dict, str]]:
     """(workload, tier, system) -> (date, pair, record id) of the newest record that isn't a skip,
-    or the newest skip if there is nothing else."""
+    or the newest skip if there is nothing else. The pair carries `pre_reset` (ledger.pre_reset())."""
     best: dict[tuple, tuple[str, dict, str]] = {}
     for record in records:
         # The full start time: two records of one day are ordered by it, not by file name.
@@ -77,7 +77,7 @@ def newest(records: list[dict]) -> dict[tuple, tuple[str, dict, str]]:
             current = best.get(key)
             rank = (pair["outcome"] != "skipped", date)
             if current is None or rank > (current[1]["outcome"] != "skipped", current[0]):
-                best[key] = (date, pair, record["id"])
+                best[key] = (date, {**pair, "pre_reset": pre_reset(record)}, record["id"])
     return best
 
 
@@ -118,6 +118,10 @@ def render(root: Path, systems: dict, workloads: dict) -> str:
             f"ok on their newest run: {pairs_ok}",
             f"- **NRESE:** {nrese_ok} of its {nrese_tiers} standard tiers ok on their newest run",
             f"- **Run records:** {len(records)}, newest {max((str(r.get('started', ''))[:10] for r in records), default='-')}",
+            f"- **Before the reset:** {sum(map(pre_reset, records))} of the {len(records)} records, and "
+            f"{sum(1 for e in evidence.values() if e[1]['pre_reset'] and e[1]['outcome'] != 'skipped')} of the "
+            f"{sum(1 for e in evidence.values() if e[1]['outcome'] != 'skipped')} newest outcomes: history, not the "
+            "current engine's (marked †; the v1.6 baseline measures the current engine)",
             ""]
 
     # --- the schedule: what is measured first, the backlog, what comes last
@@ -163,9 +167,10 @@ def render(root: Path, systems: dict, workloads: dict) -> str:
             good = sum(1 for e in got if e and e[1]["outcome"] in ("ok", "restricted"))
             bad = any(e and e[1]["outcome"] in ("failed", "timeout", "wrong", "partial", "disputed") for e in got)
             ran = any(e and e[1]["outcome"] != "skipped" for e in got)
-            cells.append(f"{good}/{len(tiers)}{' !' if bad else ''}" if ran else "·")
+            old = ran and all(e[1]["pre_reset"] for e in got if e and e[1]["outcome"] != "skipped")
+            cells.append(f"{good}/{len(tiers)}{' !' if bad else ''}{PRE_RESET if old else ''}" if ran else "·")
         out.append(f"| {name} | {w['state']} | " + " | ".join(cells) + " |")
-    out += ["", LEGEND, ""]
+    out += ["", LEGEND + f" · {PRE_RESET_NOTE} (every outcome of the cell)", ""]
 
     # --- per workload
     out += ["## Workloads, tier by tier", ""]
@@ -186,7 +191,7 @@ def render(root: Path, systems: dict, workloads: dict) -> str:
             row = []
             for key in able:
                 e = evidence.get((name, tier, key))
-                row.append(f"{MARK[e[1]['outcome']]} {e[0][5:10]}" if e else "·")
+                row.append(f"{MARK[e[1]['outcome']]} {e[0][5:10]}{PRE_RESET if e[1]['pre_reset'] else ''}" if e else "·")
             label = tier if tier in tiers else f"{tier} (extra)"
             out.append(f"| {label} | " + " | ".join(row) + " |")
         out.append("")
@@ -216,7 +221,8 @@ def render(root: Path, systems: dict, workloads: dict) -> str:
     out += ["", "### Problems on the newest run", ""]
     for (name, tier, key), (date, pair, rid) in sorted(evidence.items()):
         if pair["outcome"] in ("failed", "timeout", "wrong", "partial", "disputed"):
-            out.append(f"- {name} {tier} on {key}: {pair['outcome']} ({rid}){': ' + pair['note'] if pair.get('note') else ''}")
+            out.append(f"- {name} {tier} on {key}: {pair['outcome']} ({rid}{', ' + PRE_RESET + ' pre-reset' if pair['pre_reset'] else ''})"
+                       f"{': ' + pair['note'] if pair.get('note') else ''}")
     out += ["", "### Workloads not ready", ""]
     for name, w in workloads.items():
         if w["state"] != "ready":
@@ -228,16 +234,25 @@ def render(root: Path, systems: dict, workloads: dict) -> str:
         out += ["", "### Capabilities NRESE lacks", ""] + [f"- {c}: {step}" for c, step in lacking.items()]
     out.append("")
 
+    # --- the home turfs (standings.home_turf(): the owner's bar, per contender)
+    from . import cases as registry
+    from .standings import home_turf
+    out += ["## Home turf, per contender", "",
+            "Each contender's home-turf cases, whether they can run here and its newest verdict on them "
+            "([STANDINGS.md](STANDINGS.md) has every comparison).", ""]
+    out += home_turf(records, systems, registry.load(root / "benches" / "cases")) + [""]
+
     # --- runs
     out += ["## Runs", "", "Newest first; the records are in [runs/](runs/).", "",
-            "| Run | Started | Kit | Host | Commit | Pairs | Purpose |", "|---|---|---|---|---|---|---|"]
+            "| Run | Started | Line | Kit | Host | Commit | Pairs | Purpose |", "|---|---|---|---|---|---|---|---|"]
     for r in sorted(records, key=lambda r: str(r.get("started", "")), reverse=True):
         commit = str(r.get("commit") or (r.get("candidate") or {}).get("commit", "?"))
         commit = commit[:10] if len(commit) >= 40 else commit
         host = r.get("host", "")
         host = ", ".join(host) if isinstance(host, list) else host
         pairs = [p for p in r.get("pairs", []) if p["outcome"] != "skipped"]
-        out.append(f"| [{r['id']}](runs/{r['id']}.toml) | {str(r.get('started', ''))[:16]} | {r.get('kit', 'suite')} | "
+        out.append(f"| [{r['id']}](runs/{r['id']}.toml) | {str(r.get('started', ''))[:16]} | "
+                   f"{PRE_RESET + ' pre-reset' if pre_reset(r) else 'current'} | {r.get('kit', 'suite')} | "
                    f"{host} | {commit} | {len(pairs)} | {r.get('purpose', '')} |")
     out.append("")
     return "\n".join(out)
