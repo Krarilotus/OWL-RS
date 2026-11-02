@@ -2253,4 +2253,98 @@ mod tests {
         assert!(target.restore_key(5, &keys[0]).is_err());
         assert_eq!(target.len(), 2);
     }
+
+    /// Loading the vector index from its file takes no background build's reservation
+    /// (PR #79 fix check r1, R79-01; notes/2026-11-02-pr79-vector-reservation-design.md).
+    /// The file covers M entries: a build was refused, then the vectors were saved. The
+    /// dictionary reopens with the first N. Two first searches race: the one that looks for
+    /// the file waits before its fingerprint (the derived dir is locked), the other covers
+    /// N and starts build A. Then the M-prefix's other vectors are interned again (aborted
+    /// interns), and the load goes on. Whether A is still queued or has installed its graph
+    /// (and lives on), no second build runs beside the first, and A's end ends no later
+    /// build's reservation.
+    #[test]
+    fn a_load_takes_no_build_s_reservation() {
+        use super::super::VectorQuery;
+        use super::super::vectors::{SYNC_BUILD, VectorBuild};
+        let n = SYNC_BUILD;
+        // A tenth more: the smallest extension of a graph covering N that is built.
+        let m = n + n / 10 + 1;
+        let lexicals: Vec<String> = (0..m).map(|i| nrese_vector::lexical(&[i as f32])).collect();
+        let intern = |dictionary: &Dictionary, range: std::ops::Range<usize>| {
+            for lexical in &lexicals[range] {
+                let datatype = NamedNodeRef::new_unchecked(nrese_vector::DATATYPE);
+                dictionary.intern(LiteralRef::new_typed_literal(lexical, datatype).into());
+            }
+        };
+        let query = VectorQuery::new(vec![1.0], 1);
+        let search = |dictionary: &Dictionary| {
+            dictionary.vector_search(&query, dictionary.len(), &|_| true);
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let source = Dictionary::default();
+        intern(&source, 0..m);
+        source.set_derived_dir(dir.path().to_owned());
+        source.set_vector_builder(std::sync::Arc::new(|_: VectorBuild| {
+            Err(std::io::Error::other("refused"))
+        }));
+        search(&source);
+        source.save_derived();
+        assert_eq!(
+            source.derived.saved.lock()[VECTORS],
+            m as u64,
+            "the file covers M"
+        );
+        let keys = source.export_keys(0, n as u64);
+        let keys: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        for installed in [false, true] {
+            let row = if installed { "A installed" } else { "A queued" };
+            let reopened = Dictionary::default();
+            reopened.restore_keys(&keys).unwrap();
+            reopened.set_derived_dir(dir.path().to_owned());
+            let (sent, jobs) = std::sync::mpsc::channel::<VectorBuild>();
+            reopened.set_vector_builder(std::sync::Arc::new(move |build: VectorBuild| {
+                sent.send(build)
+                    .map_err(|_| std::io::Error::other("no executor"))
+            }));
+            let next = |what: &str| {
+                jobs.recv_timeout(std::time::Duration::from_secs(300))
+                    .unwrap_or_else(|_| panic!("{row}: {what}"))
+            };
+            let none = |what: &str| assert!(jobs.try_recv().is_err(), "{row}: {what}");
+            let a = std::thread::scope(|scope| {
+                let dir_lock = reopened.derived.dir.write();
+                let searches = [
+                    scope.spawn(|| search(&reopened)),
+                    scope.spawn(|| search(&reopened)),
+                ];
+                let a = next("the search that didn't load starts build A");
+                if installed {
+                    a.install_kept();
+                }
+                intern(&reopened, n..m);
+                drop(dir_lock);
+                for search in searches {
+                    search.join().unwrap();
+                }
+                a
+            });
+            if installed {
+                // The graph covers N of M: the next build extends it.
+                let b = next("A's graph is behind: build B starts");
+                drop(a);
+                search(&reopened);
+                none("A's end leaves B's reservation: no build C");
+                drop(b);
+            } else {
+                none("the load starts no build B beside A");
+                drop(a);
+                search(&reopened);
+                let b = next("A's end: build B starts");
+                search(&reopened);
+                none("no build C beside B");
+                drop(b);
+            }
+        }
+    }
 }
