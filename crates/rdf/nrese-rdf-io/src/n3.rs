@@ -214,9 +214,12 @@ impl N3Serializer {
         Self::default()
     }
 
-    /// A prefix (`name` empty or a prefix name).
+    /// A prefix (`name` empty or a prefix name); a name given again is bound to its last
+    /// IRI, in declarations and abbreviations alike.
     pub fn with_prefix(mut self, name: impl Into<String>, iri: impl Into<String>) -> Self {
-        self.prefixes.push((name.into(), iri.into()));
+        let name = name.into();
+        self.prefixes.retain(|(n, _)| *n != name);
+        self.prefixes.push((name, iri.into()));
         self
     }
 
