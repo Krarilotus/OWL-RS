@@ -687,4 +687,77 @@ mod tests {
         assert!(!evaluator.connects(&plus, first, last));
         assert_eq!(evaluator.count_open(&plus), None);
     }
+
+    /// Spec: SPARQL 1.1 §18.4 (ArbitraryLengthPath aside, paths are bags): an alternative
+    /// is a UNION and a sequence a join, so an end comes once per way through; `p+` is a
+    /// set. Over `a p b`, `a q b`, `b p a`, `b p c`, the path `(p|q)/p` goes from `a` to
+    /// `b` two ways and on to `a` and `c`: each twice; from `b` once to `b`.
+    #[test]
+    fn sequences_of_alternatives_keep_one_end_per_way_through() {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let [a, b, c, p, q] = ["a", "b", "c", "p", "q"]
+            .map(|name| NamedNode::new_unchecked(format!("http://e/{name}")));
+        let mut tx = engine.transaction();
+        for (s, pr, o) in [(&a, &p, &b), (&a, &q, &b), (&b, &p, &a), (&b, &p, &c)] {
+            let quad = Quad::new(s.clone(), pr.clone(), o.clone(), GraphName::DefaultGraph);
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let link = |n: &NamedNode| PropertyPathExpression::NamedNode(n.clone());
+        let sequence = PropertyPathExpression::Sequence(vec![
+            PropertyPathExpression::Alternative(vec![link(&p), link(&q)]),
+            link(&p),
+        ]);
+        let plus = Path::resolve(
+            &PropertyPathExpression::OneOrMore(Box::new(sequence.clone())),
+            &snapshot,
+        );
+        let sequence = Path::resolve(&sequence, &snapshot);
+        let evaluator = PathEvaluator {
+            snapshot: &snapshot,
+            model: ReadModel::default(),
+            graph: PathGraph::Default,
+            fixed: None,
+            cancellation: None,
+            closures: Default::default(),
+        };
+        let [a, b, c] = [&a, &b, &c].map(|n| snapshot.lookup(n.as_ref().into()).unwrap().raw());
+        let sorted = |mut values: Vec<u64>| {
+            values.sort_unstable();
+            values
+        };
+        let pairs = |mut values: Vec<(u64, u64)>| {
+            values.sort_unstable();
+            values
+        };
+        assert_eq!(
+            sorted(evaluator.from(&sequence, a)),
+            sorted(vec![a, a, c, c])
+        );
+        assert_eq!(sorted(evaluator.to(&sequence, c)), vec![a, a]);
+        assert_eq!(sorted(evaluator.to(&sequence, b)), vec![b]);
+        assert_eq!(evaluator.multiplicity(&sequence, a, c), 2);
+        assert_eq!(evaluator.multiplicity(&sequence, b, b), 1);
+        assert_eq!(evaluator.multiplicity(&sequence, b, c), 0);
+        assert!(evaluator.connects(&sequence, a, a));
+        assert!(!evaluator.connects(&sequence, c, a));
+        assert_eq!(
+            pairs(evaluator.open(&sequence)),
+            pairs(vec![(a, a), (a, a), (a, c), (a, c), (b, b)])
+        );
+        assert_eq!(pairs(evaluator.reached_from(&sequence, &[b])), vec![(b, b)]);
+        assert_eq!(
+            pairs(evaluator.reaching(&sequence, &[c])),
+            vec![(a, c), (a, c)]
+        );
+        assert_eq!(sorted(evaluator.from(&plus, a)), sorted(vec![a, c]));
+        assert_eq!(evaluator.from(&plus, b), vec![b]);
+        assert_eq!(evaluator.multiplicity(&plus, a, c), 1);
+        assert_eq!(evaluator.multiplicity(&plus, b, c), 0);
+        assert_eq!(
+            pairs(evaluator.open(&plus)),
+            pairs(vec![(a, a), (a, c), (b, b)])
+        );
+    }
 }
