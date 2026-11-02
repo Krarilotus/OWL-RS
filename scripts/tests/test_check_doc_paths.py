@@ -115,6 +115,20 @@ class CheckDocPaths(unittest.TestCase):
         self.assertEqual(self.check('<a href="definitely-missing-pr92.md">x</a>\n'), 1)
         self.assertEqual(self.check('<a href="guide.md">x</a>\n'), 0)
 
+    # Parser round sol-loop G2: an HTML attribute as HTML reads it: unquoted too, entities decoded;
+    # an attribute that only ends in "href" or a comment isn't a link.
+    def test_an_html_attribute_is_read_as_html_reads_it(self):
+        self.assertEqual(self.check("<a href=definitely-missing-pr92.md>x</a>\n"), 1)
+        self.assertEqual(self.check("<a href=guide.md>x</a>\n"), 0)
+        self.assertEqual(self.check('<a href="sub&#32;dir/guide.md">x</a>\n'), 0)
+        self.assertEqual(self.check('<span data-href="definitely-missing-pr92.md">x</span>\n'), 0)
+        self.assertEqual(self.check('<!-- <a href="definitely-missing-pr92.md">x</a> -->\n'), 0)
+
+    # Parser round sol-loop G1: a repeated definition is a definition in the doc too.
+    def test_a_duplicate_reference_definition_is_checked(self):
+        self.assertEqual(self.check("[x][g]\n\n[g]: guide.md\n[g]: definitely-missing-pr92.md\n"), 1)
+        self.assertEqual(self.check("[x][g]\n\n[g]: guide.md\n[g]: guide.md\n"), 0)
+
     # F4: a title may hold a parenthesis.
     def test_a_title_with_a_parenthesis_is_read(self):
         self.assertEqual(self.check("[x](guide.md (title))\n"), 0)
