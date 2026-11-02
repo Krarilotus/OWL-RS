@@ -49,6 +49,22 @@ fn positive_statements_come_from_the_closure() {
 }
 
 #[test]
+fn a_blank_node_inside_and_outside_a_triple_term_is_one_node() {
+    // W3C rdf-tests, rdf/rdf12/rdf-semantics: constrained-bnodes-in-triple-term-fail and
+    // constrained-bnodes-in-triple-term-subject. "Quoted bnode identifiers share the same
+    // scope as non-quoted ones": one value must satisfy every occurrence.
+    let store = store(r#":a1 :p1 <<( :a :b :c )>> . :a :label "A" . :c :label "C" ."#);
+    assert_eq!(
+        entails(&store, r#":a1 :p1 <<( _:x :b :c )>> . _:x :label "C" ."#),
+        Entailment::NotEntailed
+    );
+    assert_eq!(
+        entails(&store, r#":a1 :p1 <<( _:x :b :c )>> . _:x :label "A" ."#),
+        Entailment::Entailed
+    );
+}
+
+#[test]
 fn difference_is_decided_by_refutation() {
     // Two values of a functional property, known to differ: their subjects differ.
     let store = store(

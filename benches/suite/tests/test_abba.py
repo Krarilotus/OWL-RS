@@ -58,15 +58,17 @@ def records(b=1.0, a2=1.0, broken=None, checked=True):
 class Abba(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # The commits a family's sides name: a repository of the tests' own (isolation.repo).
+        # The commits a family's sides name and the family itself: a repository of the tests' own
+        # (isolation.repo).
         own = tempfile.TemporaryDirectory()
         cls.addClassCleanup(own.cleanup)
         cls.repo = Path(own.name)
         cls.commits = isolation.repo(cls.repo, 2)
 
     def setUp(self):
-        (ROOT / "tmp").mkdir(exist_ok=True)
-        self.tmp = tempfile.TemporaryDirectory(dir=ROOT / "tmp")  # a family lives in the repository
+        # A family lives in the checkout it names its sides in: the tests' own, with its rounds'
+        # results beside it (PR #57 r1 R2: in ROOT/tmp, a read-only checkout failed every test).
+        self.tmp = tempfile.TemporaryDirectory(dir=self.repo)
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "t.toml"
         self.path.write_text(FAMILY, encoding="utf-8")
@@ -192,7 +194,7 @@ systems = []
     def test_the_jobs_time_every_block_on_one_host_with_the_a_a_arm(self):
         self.path.write_text(FAMILY.replace("blocks = 6", "blocks = 8"), encoding="utf-8")
         eight = self.load()  # Sol r1: whole squares of A, A' and B
-        self.assertEqual(sum("block" in s for s in abba.jobs(eight, B, ROOT.as_posix(), "office-pc")["abba-t-bbbbbbbb"]["steps"]), 9)
+        self.assertEqual(sum("block" in s for s in abba.jobs(eight, B, self.repo.as_posix(), "office-pc")["abba-t-bbbbbbbb"]["steps"]), 9)
         # One whole square is the least a family may ask (a long, flat case needs no more), fewer
         # is refused: N11 found 6 hard-coded.
         self.path.write_text(FAMILY.replace("blocks = 6", "blocks = 3"), encoding="utf-8")
@@ -201,7 +203,7 @@ systems = []
         with self.assertRaises(abba.Invalid):
             self.load()
         self.path.write_text(FAMILY, encoding="utf-8")
-        found = abba.jobs(self.family, B, ROOT.as_posix(), "office-pc")
+        found = abba.jobs(self.family, B, self.repo.as_posix(), "office-pc")  # its sides resolve there too
         timed = found["abba-t-bbbbbbbb"]
         self.assertEqual((timed["requires"]["hosts"], timed["class"], timed["steps"][0][-2:]),
                          (["office-pc"], "exclusive", ["check", self.family["path"]]))

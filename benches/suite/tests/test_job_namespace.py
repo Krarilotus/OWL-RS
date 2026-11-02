@@ -284,13 +284,31 @@ sweep_builds
         self.assertEqual(done.stdout.split(), ["first", "bin-bbbbbbbb-identity"], done.stdout + done.stderr)
 
 
-def bash(script: str, *args: str, env: dict | None = None, timeout: int = 300) -> subprocess.CompletedProcess:
-    return subprocess.run([BASH, "-c", script, "-", *args], cwd=ROOT, env={**os.environ, **(env or {})},
+def bash(script: str, *args: str, env: dict | None = None, timeout: int = 300,
+         cwd: Path = ROOT) -> subprocess.CompletedProcess:
+    """`script` in `cwd`: the tree under test, whose scripts it sources, unless it runs git there
+    (then a checkout of the test's own)."""
+    return subprocess.run([BASH, "-c", script, "-", *args], cwd=cwd, env={**os.environ, **(env or {})},
                           capture_output=True, text=True, encoding="utf-8", timeout=timeout)
+
+
+# gate-publish.sh, what it sources, and what a revision's build identity reads from its commit.
+# suitekit/lock.py: ns.sh's host lock where there is no flock (Git Bash).
+GATE_PUBLISH = ("scripts/lib/gate-publish.sh", "scripts/lib/ns.sh", "scripts/cargo-guarded.sh", "scripts/lib/disk.sh",
+                "scripts/lib/target-cpu.sh", "rust-toolchain.toml", "benches/suite/suitekit/lock.py")
 
 
 @unittest.skipUnless(BASH, "needs bash")
 class GateBuilds(unittest.TestCase):
+    """The revisions these name (HEAD) are a commit of their own checkout's: PR #57 r1 R2, they
+    resolved HEAD in the checkout the run started in."""
+
+    def setUp(self):
+        own = tempfile.TemporaryDirectory()
+        self.addCleanup(own.cleanup)
+        self.checkout = isolation.checkout(Path(own.name), *GATE_PUBLISH)
+        isolation.repo(self.checkout, 1)
+
     def test_a_build_used_between_the_sweeps_look_and_its_delete_stays(self):
         """Sol, 20 Oct 2026: the sweep found a build old, a gate then stamped it, and the sweep
         deleted it anyway. Use and removal share the lock; the sweep checks again under it."""
@@ -315,7 +333,7 @@ sweep_builds
 bin_of HEAD; [ -e "$dir" ] || echo gone
 '''
         with tempfile.TemporaryDirectory() as tmp:
-            done = bash(script, Path(tmp).as_posix())
+            done = bash(script, Path(tmp).as_posix(), cwd=self.checkout)
         self.assertEqual(done.stdout.split()[:2], ["kept", "bin-aaaaaaaa-identity"], done.stdout + done.stderr)
         self.assertTrue(done.stdout.split()[2].endswith("/none"), done.stdout)
         self.assertEqual(done.stdout.split()[3], "gone")
@@ -331,7 +349,7 @@ GATE_BIN=/unused
 for cpu in portable x86-64-v3; do NRESE_TARGET_CPU=$cpu identity_dir HEAD; done
 NRESE_TARGET_CPU=x86-64-v3 build_identity HEAD | grep '^rustflags'
 '''
-        done = bash(script, env={"RUSTFLAGS": ""})
+        done = bash(script, env={"RUSTFLAGS": ""}, cwd=self.checkout)
         portable, v3, flags = done.stdout.splitlines()
         self.assertNotEqual(portable, v3, done.stderr)
         self.assertEqual(flags, "rustflags -C target-cpu=x86-64-v3")

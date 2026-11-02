@@ -980,11 +980,13 @@ impl<'a> Query<'a> {
     /// The 4-cycle `a→b→c→d→a` binds `a` and counts `Σ_c #{b: a→b→c} · #{d: c→d→a}`:
     /// two lists of 2-paths per `a`, where enumerating it checked every 2-path's
     /// `c→d` against `d→a`. A forest is found at the latest when one variable is left.
+    /// The sums and products saturate, so the total reads `u64::MAX` exactly where there
+    /// are that many solutions or more: [`Count::AtLeast`](nrese_engine::Count::AtLeast).
     pub(super) fn count_solutions(
         &self,
         token: &(dyn Fn() -> bool + Sync),
         stats: &mut Stats,
-    ) -> Result<u64, Stop> {
+    ) -> Result<nrese_engine::Count, Stop> {
         let order = self.order();
         let forest = (1..=order.len()).find_map(|depth| self.forest(&order, depth));
         stats.counted_after = forest.as_ref().map(|f| f.depth);
@@ -1007,10 +1009,14 @@ impl<'a> Query<'a> {
             forest: forest.as_ref(),
             total: 0,
         })?;
-        Ok(sinks.iter().fold(0u64, |sum, sink| match sink {
+        let total = sinks.iter().fold(0u64, |sum, sink| match sink {
             Sink::Count { total, .. } => sum.saturating_add(*total),
             Sink::Rows(_) => sum,
-        }))
+        });
+        Ok(match total {
+            u64::MAX => nrese_engine::Count::AtLeast(total),
+            exact => nrese_engine::Count::Exact(exact),
+        })
     }
 
     /// The join over `order`: the first variable's candidates split across threads, each
@@ -1267,7 +1273,12 @@ mod tests {
             ];
             let query = Query::new(&snapshot, ReadModel::Asserted, patterns, 3, usize::MAX);
             let mut stats = Stats::default();
-            let counted = query.count_solutions(&|| false, &mut stats).ok().unwrap();
+            let counted = query
+                .count_solutions(&|| false, &mut stats)
+                .ok()
+                .unwrap()
+                .exact()
+                .unwrap();
             let enumerated = query
                 .run(&|| false, &mut Stats::default())
                 .ok()
@@ -1331,7 +1342,12 @@ mod tests {
             ];
             let query = Query::new(&snapshot, ReadModel::Asserted, patterns, 3, usize::MAX);
             let mut stats = Stats::default();
-            let counted = query.count_solutions(&|| false, &mut stats).ok().unwrap();
+            let counted = query
+                .count_solutions(&|| false, &mut stats)
+                .ok()
+                .unwrap()
+                .exact()
+                .unwrap();
             assert_eq!(counted as usize, 3 * K, "M = {m}");
             entries.push(stats.messages.load(std::sync::atomic::Ordering::Relaxed));
         }
@@ -1395,7 +1411,12 @@ mod tests {
         ];
         let query = Query::new(&snapshot, ReadModel::Inferred, patterns, 3, usize::MAX);
         let mut stats = Stats::default();
-        let counted = query.count_solutions(&|| false, &mut stats).ok().unwrap();
+        let counted = query
+            .count_solutions(&|| false, &mut stats)
+            .ok()
+            .unwrap()
+            .exact()
+            .unwrap();
         assert_eq!(
             stats.budgeted,
             Some(true),
