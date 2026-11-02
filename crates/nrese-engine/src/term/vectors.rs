@@ -86,8 +86,6 @@ pub(crate) struct VectorIndex {
     /// Dictionary entries up to here are in the spaces.
     covered: u64,
     spaces: BTreeMap<usize, Space>,
-    /// The last reservation a background build was given ([`Work::Background`]).
-    reservations: u64,
 }
 
 #[derive(Debug, Default)]
@@ -105,7 +103,19 @@ struct Slot {
     /// The background build building or extending it, by its reservation: only that
     /// build's end (installed, or dropped unrun) ends it, so a warm-up's install or another
     /// build's end can't release a build still holding it (PR #79 review, R79-01).
-    reserved: Option<u64>,
+    reserved: Option<Claim>,
+}
+
+/// A background build's reservation of its slot: an allocation of its own, held by the
+/// slot and the build and compared by address, so it equals no other build's, in this
+/// index or in one loaded in its place, and no count can wrap (PR #79 fix check r1).
+#[derive(Debug, Clone)]
+pub(crate) struct Claim(Arc<()>);
+
+impl Claim {
+    fn is(&self, other: &Claim) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// What a search needs done to the graph first.
@@ -114,7 +124,7 @@ pub(crate) enum Work {
     /// Build or extend it now.
     Now,
     /// Build or extend it on a thread of its own, under this reservation.
-    Background(u64),
+    Background(Claim),
 }
 
 impl VectorIndex {
@@ -143,7 +153,6 @@ impl VectorIndex {
     /// What the graph `query` uses needs before the search: nothing, building or
     /// extending now (a small space), or on a thread (a large one; reserved for that build).
     pub(crate) fn work_for(&mut self, query: &VectorQuery) -> Work {
-        let reservation = self.reservations + 1;
         let Some(space) = self.spaces.get_mut(&query.vector.len()) else {
             return Work::None;
         };
@@ -164,9 +173,25 @@ impl VectorIndex {
         if covered > 0 && behind * 10 < covered {
             return Work::None;
         }
-        slot.reserved = Some(reservation);
-        self.reservations = reservation;
-        Work::Background(reservation)
+        let claim = Claim(Arc::new(()));
+        slot.reserved = Some(claim.clone());
+        Work::Background(claim)
+    }
+
+    /// Takes `loaded` (read from its file) in place of this index, if it covers more and no
+    /// build holds a reservation in this one: replacing a reservation would let a second
+    /// build start beside its holder (PR #79 fix check r1). Whether it took it.
+    pub(crate) fn adopt(&mut self, loaded: VectorIndex) -> bool {
+        let reserved = self
+            .spaces
+            .values()
+            .flat_map(|space| space.graphs.iter())
+            .any(|slot| slot.reserved.is_some());
+        if reserved || self.covered >= loaded.covered {
+            return false;
+        }
+        *self = loaded;
+        true
     }
 
     /// The vectors and graph to build on (a cheap copy of the vectors, shared chunks).
@@ -188,14 +213,14 @@ impl VectorIndex {
         dimension: usize,
         metric: Metric,
         graph: Hnsw,
-        reservation: Option<u64>,
+        reservation: Option<&Claim>,
     ) {
         let Some(space) = self.spaces.get_mut(&dimension) else {
             return;
         };
         let slot = slot(space, metric);
-        if reservation.is_some() && slot.reserved == reservation {
-            slot.reserved = None;
+        if let Some(mine) = reservation {
+            slot.retire(mine);
         }
         if slot.graph.as_ref().is_none_or(|g| g.len() < graph.len()) {
             slot.graph = Some(Arc::new(graph));
@@ -221,12 +246,9 @@ impl VectorIndex {
 
     /// The build holding `reservation` for `metric` in the space of `dimension` ended
     /// without a graph: its reservation ends, and no other's.
-    fn release(&mut self, dimension: usize, metric: Metric, reservation: u64) {
+    fn release(&mut self, dimension: usize, metric: Metric, reservation: &Claim) {
         if let Some(space) = self.spaces.get_mut(&dimension) {
-            let slot = slot(space, metric);
-            if slot.reserved == Some(reservation) {
-                slot.reserved = None;
-            }
+            slot(space, metric).retire(reservation);
         }
     }
 
@@ -430,11 +452,7 @@ impl VectorIndex {
             }
             spaces.insert(dimension, Space { vectors, graphs });
         }
-        input.is_done().then_some(Self {
-            covered,
-            spaces,
-            reservations: 0,
-        })
+        input.is_done().then_some(Self { covered, spaces })
     }
 }
 
@@ -455,6 +473,19 @@ fn metric_of(code: u32) -> Option<Metric> {
         1 => Some(Metric::Dot),
         2 => Some(Metric::L2),
         _ => None,
+    }
+}
+
+impl Slot {
+    /// Ends `reservation` if it is the one this slot holds, and no other.
+    fn retire(&mut self, reservation: &Claim) {
+        if self
+            .reserved
+            .as_ref()
+            .is_some_and(|held| held.is(reservation))
+        {
+            self.reserved = None;
+        }
     }
 }
 
@@ -492,7 +523,7 @@ fn uses_graph(space: &Space, query: &VectorQuery) -> bool {
 /// Builds or extends the graph `query` uses, from what `index` holds now, and installs
 /// it, ending `reservation` if it still holds the space (a background build's; a warm-up
 /// or a small space's build has none).
-pub(crate) fn build(index: &RwLock<VectorIndex>, query: &VectorQuery, reservation: Option<u64>) {
+pub(crate) fn build(index: &RwLock<VectorIndex>, query: &VectorQuery, reservation: Option<&Claim>) {
     let Some((vectors, base)) = index.read().build_inputs(query) else {
         return;
     };
@@ -528,13 +559,13 @@ pub type VectorBuilder = Arc<dyn Fn(VectorBuild) -> std::io::Result<()> + Send +
 pub struct VectorBuild {
     index: Arc<RwLock<VectorIndex>>,
     query: VectorQuery,
-    reservation: u64,
+    reservation: Claim,
 }
 
 impl VectorBuild {
     /// Builds the graph from what the index holds now and installs it, on this thread.
     pub fn run(self) {
-        build(&self.index, &self.query, Some(self.reservation));
+        build(&self.index, &self.query, Some(&self.reservation));
     }
 }
 
@@ -542,7 +573,7 @@ impl VectorBuild {
 impl VectorBuild {
     /// Its run up to its end: the graph built and installed, the job kept.
     pub(crate) fn install_kept(&self) {
-        build(&self.index, &self.query, Some(self.reservation));
+        build(&self.index, &self.query, Some(&self.reservation));
     }
 }
 
@@ -550,7 +581,11 @@ impl Drop for VectorBuild {
     fn drop(&mut self) {
         // Nothing if its install ended the reservation already.
         let mut index = self.index.write();
-        index.release(self.query.vector.len(), self.query.metric, self.reservation);
+        index.release(
+            self.query.vector.len(),
+            self.query.metric,
+            &self.reservation,
+        );
     }
 }
 
@@ -559,7 +594,7 @@ impl Drop for VectorBuild {
 pub(crate) fn build_in_background(
     index: Arc<RwLock<VectorIndex>>,
     query: VectorQuery,
-    reservation: u64,
+    reservation: Claim,
     builder: Option<&VectorBuilder>,
 ) {
     let job = VectorBuild {
@@ -666,7 +701,7 @@ mod tests {
         assert_eq!(held.lock().len(), 1, "no build C beside B");
         // B's run up to its end: its install.
         let b = held.lock().remove(0);
-        build(&b.index, &b.query, Some(b.reservation));
+        b.install_kept();
         grow();
         search();
         assert_eq!(held.lock().len(), 1, "B installed: build C starts");
