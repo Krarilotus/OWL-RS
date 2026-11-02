@@ -244,9 +244,15 @@ fn run(
             // A triple per solution and template triple, however many the template has:
             // each charged as it is made, before it is kept.
             let mut triples = Vec::new();
-            let made = construct(snapshot, ctx.computed.take(), solutions, &template, || {
-                ctx.check()
-            });
+            let computed = ctx.computed.take();
+            let made = construct(
+                snapshot,
+                &ctx.budget,
+                computed,
+                solutions,
+                &template,
+                || ctx.check(),
+            );
             for triple in made {
                 let triple = triple?;
                 ctx.budget
@@ -258,6 +264,9 @@ fn run(
         }
         Form::Select => Outcome::Solutions(solutions, ctx.computed.take()),
     };
+    // The computed terms go with the outcome: their charge goes with what it holds.
+    let kept = Reservation::new(Arc::clone(&ctx.budget));
+    ctx.kept.replace(kept).transfer();
     Ok((
         outcome,
         Reservation::adopt(Arc::clone(&ctx.budget), ctx.budget.used()),
@@ -307,9 +316,15 @@ pub(crate) fn explain(
         Form::Select | Form::Ask => solutions.table.len(),
         Form::Describe => ctx.describe(&solutions)?.len(),
         Form::Construct(template) => {
-            construct(snapshot, ctx.computed.take(), solutions, &template, || {
-                ctx.check()
-            })
+            let computed = ctx.computed.take();
+            construct(
+                snapshot,
+                &ctx.budget,
+                computed,
+                solutions,
+                &template,
+                || ctx.check(),
+            )
             .try_fold(0usize, |count, triple| triple.map(|_| count + 1))?
         }
     };
@@ -684,6 +699,7 @@ enum TemplateTerm {
 /// nodes are emitted once (the memory of emitted triples is bounded).
 fn construct<'a>(
     snapshot: &'a Snapshot,
+    budget: &'a Budget,
     computed: Vec<Term>,
     solutions: Solutions,
     template: &[TriplePattern],
@@ -708,25 +724,35 @@ fn construct<'a>(
     let fresh_count = labels.len();
     let table = solutions.table;
     let mut emitted: HashSet<nrese_rdf::Triple> = HashSet::new();
-    let mut buffer: Vec<nrese_rdf::Triple> = Vec::new();
-    let mut row = 0;
+    // The copies `emitted` keeps, each charged before it is kept.
+    let mut held = Reservation::new(budget);
+    // A triple at a time, however many the template has: the next is the template's
+    // `index`-th triple of row `row`, with the row's fresh blank nodes.
+    let (mut row, mut index) = (0, 0);
+    let mut fresh: Vec<nrese_rdf::BlankNode> = Vec::new();
     std::iter::from_fn(move || {
         loop {
-            if let Some(triple) = buffer.pop() {
-                return Some(Ok(triple));
-            }
             if row >= table.len() {
                 return None;
             }
             // One check per row, and one per 256 entries of a wide template; an error
             // ends the iteration.
-            if let Err(error) = check() {
+            if index % 256 == 0
+                && let Err(error) = check()
+            {
                 row = table.len();
                 return Some(Err(error));
             }
-            let fresh: Vec<nrese_rdf::BlankNode> = (0..fresh_count)
-                .map(|_| nrese_rdf::BlankNode::default())
-                .collect();
+            if index == 0 {
+                fresh = (0..fresh_count)
+                    .map(|_| nrese_rdf::BlankNode::default())
+                    .collect();
+            }
+            let Some([s, p, o]) = resolved.get(index) else {
+                (row, index) = (row + 1, 0);
+                continue;
+            };
+            index += 1;
             fn template_value(
                 term: &TemplateTerm,
                 column: &dyn Fn(usize) -> Option<Term>,
@@ -755,55 +781,57 @@ fn construct<'a>(
             let current = row;
             let column = |c: usize| decode(snapshot, &computed, table.get(current, c));
             let value = |term: &TemplateTerm| template_value(term, &column, &fresh);
-            for (index, [s, p, o]) in resolved.iter().enumerate() {
-                if index % 256 == 255
-                    && let Err(error) = check()
-                {
-                    buffer.clear();
+            let subject = match value(s) {
+                Some(Term::NamedNode(n)) => nrese_rdf::NamedOrBlankNode::from(n),
+                Some(Term::BlankNode(b)) => nrese_rdf::NamedOrBlankNode::from(b),
+                _ => continue,
+            };
+            let Some(Term::NamedNode(predicate)) = value(p) else {
+                continue;
+            };
+            let Some(object) = value(o) else {
+                continue;
+            };
+            let triple = nrese_rdf::Triple::new(subject, predicate, object);
+            if !triple.subject.is_blank_node() && !triple.object.is_blank_node() {
+                // The copy kept to emit it once, charged first (its slot counted twice:
+                // the set doubles).
+                let copy = triple_heap(&triple)
+                    .saturating_add(2 * std::mem::size_of::<nrese_rdf::Triple>());
+                if let Err(refused) = held.charge(copy) {
                     row = table.len();
-                    return Some(Err(error));
+                    return Some(Err(QueryEvaluationError::MemoryLimit(refused).into()));
                 }
-                let subject = match value(s) {
-                    Some(Term::NamedNode(n)) => nrese_rdf::NamedOrBlankNode::from(n),
-                    Some(Term::BlankNode(b)) => nrese_rdf::NamedOrBlankNode::from(b),
-                    _ => continue,
-                };
-                let Some(Term::NamedNode(predicate)) = value(p) else {
+                if !emitted.insert(triple.clone()) {
+                    held.release(copy);
                     continue;
-                };
-                let Some(object) = value(o) else {
-                    continue;
-                };
-                let triple = nrese_rdf::Triple::new(subject, predicate, object);
-                let new = triple.subject.is_blank_node()
-                    || triple.object.is_blank_node()
-                    || emitted.insert(triple.clone());
-                if new {
-                    buffer.push(triple);
-                    if emitted.len() > 1024 * 1024 {
-                        emitted.clear();
-                    }
+                }
+                if emitted.len() > 1024 * 1024 {
+                    emitted = HashSet::new();
+                    held.release(held.bytes());
                 }
             }
-            buffer.reverse();
-            row += 1;
+            return Some(Ok(triple));
         }
     })
 }
 
-/// What a constructed triple holds once kept ([`run`]): its slot, with the list's room for
-/// it counted at its most (a list doubles), and its terms' strings; as much again for the
-/// copy [`construct`] keeps to emit repeated triples once.
-fn triple_bytes(triple: &nrese_rdf::Triple) -> usize {
+/// The bytes of a triple's terms' strings.
+fn triple_heap(triple: &nrese_rdf::Triple) -> usize {
     let subject = match &triple.subject {
         nrese_rdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
         nrese_rdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
     };
-    let heap = subject
+    subject
         .saturating_add(triple.predicate.as_str().len())
-        .saturating_add(crate::cache::term_heap(&triple.object));
-    let slot = std::mem::size_of::<nrese_rdf::Triple>();
-    (3 * slot).saturating_add(heap.saturating_mul(2))
+        .saturating_add(crate::cache::term_heap(&triple.object))
+}
+
+/// What a constructed triple holds once kept ([`run`]): its strings, and its slot with the
+/// list's room for it counted at its most (a list doubles). The copy [`construct`] keeps to
+/// emit repeated triples once is charged there.
+fn triple_bytes(triple: &nrese_rdf::Triple) -> usize {
+    triple_heap(triple).saturating_add(2 * std::mem::size_of::<nrese_rdf::Triple>())
 }
 
 fn decode(snapshot: &Snapshot, computed: &[Term], id: u64) -> Option<Term> {
@@ -1226,6 +1254,10 @@ struct Context<'a> {
     numbers: RefCell<HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>>,
     cancellation: Option<CancellationToken>,
     budget: Arc<Budget>,
+    /// What the context keeps to the query's end, charged to `budget`: its computed terms
+    /// ([`Self::id`]) and remembered numbers ([`Self::numeric_pass`]). A retry that releases
+    /// what a failed attempt held ([`Self::group`]) leaves it.
+    kept: RefCell<Reservation>,
     /// The request's envelope: what a part of the evaluation keeps beyond it (the spatial
     /// index) draws from it ([`spatial`]).
     memory: nrese_exec::Envelope,
@@ -1443,6 +1475,7 @@ impl<'a> Context<'a> {
             decodes: AtomicU64::new(0),
             numbers: RefCell::default(),
             cancellation: options.resources.cancellation.clone(),
+            kept: RefCell::new(Reservation::new(Arc::clone(&budget))),
             budget,
             memory: options.resources.memory.clone(),
             trace: None,
@@ -1701,7 +1734,8 @@ impl<'a> Context<'a> {
         if let Some(&id) = ids.get(term) {
             return Ok(id);
         }
-        self.budget
+        self.kept
+            .borrow_mut()
             .charge(computed_bytes(term))
             .map_err(QueryEvaluationError::MemoryLimit)?;
         let mut computed = self.computed.borrow_mut();
@@ -4469,31 +4503,51 @@ impl<'a> Context<'a> {
     /// each distinct id is decoded once, the distinct terms are sorted, and every row gets its
     /// term's rank: equal-ordering terms (1 and 1.0) share a rank.
     /// Every aggregate of every group (`members` lists each group's rows), in parallel
-    /// chunks of groups for large inputs.
+    /// chunks of groups for large inputs. The terms the aggregation keeps are charged as
+    /// they are made ([`aggregate::Kept`]); with the results comes their charge (bytes the
+    /// caller releases once it let them go).
     fn aggregate_groups(
         &self,
         solutions: &Solutions,
         members: &[Vec<usize>],
         aggregates: &[(Variable, AggregateExpression)],
-    ) -> NativeResult<Vec<Vec<Agg>>> {
-        let per_group = |aggregator: &Aggregator<'_>, rows: &[usize]| -> Vec<Agg> {
-            aggregates
-                .iter()
-                .map(|(_, aggregate)| aggregator.aggregate(solutions, rows, aggregate))
-                .collect()
+    ) -> NativeResult<(Vec<Vec<Agg>>, usize)> {
+        let shared: &Arc<Budget> = &self.budget;
+        let budget: &Budget = shared;
+        // The aggregates of `groups`, with their results' charge; the refusal that ended
+        // them, if one did.
+        let aggregate = |aggregator: &Aggregator<'_>,
+                         kept: &aggregate::Kept,
+                         groups: &[Vec<usize>]|
+         -> Result<Vec<Vec<Agg>>, BudgetExceeded> {
+            let mut out = Vec::with_capacity(groups.len());
+            for rows in groups {
+                out.push(
+                    aggregates
+                        .iter()
+                        .map(|(_, aggregate)| aggregator.aggregate(solutions, rows, aggregate))
+                        .collect(),
+                );
+                if let Some(refused) = kept.refused() {
+                    return Err(refused);
+                }
+            }
+            Ok(out)
         };
         if solutions.table.len() < 2 * PARALLEL_EXPRESSION_ROWS || members.len() < 2 {
             let term = |id: u64| self.term(id);
+            let kept = aggregate::Kept::new(&self.budget);
             let aggregator = Aggregator {
                 evaluator: &self.evaluator,
                 term: &term,
                 memo: RefCell::default(),
                 numbers: RefCell::default(),
+                kept: Some(&kept),
             };
-            return Ok(members
-                .iter()
-                .map(|rows| per_group(&aggregator, rows))
-                .collect());
+            let out = aggregate(&aggregator, &kept, members)
+                .map_err(QueryEvaluationError::MemoryLimit)?;
+            drop(aggregator);
+            return Ok((out, kept.results()));
         }
         // Chunks of groups holding about PARALLEL_EXPRESSION_ROWS rows each.
         let mut bounds = vec![0];
@@ -4513,36 +4567,58 @@ impl<'a> Context<'a> {
         let token = self.cancellation.as_ref();
         let (snapshot, evaluator): (&Snapshot, _) = (&self.snapshot, &self.evaluator);
         let decodes = &self.decodes;
-        let parts: Vec<Option<Vec<Vec<Agg>>>> = bounds
+        // A part's aggregates and their charge; `Err(None)` once cancelled.
+        type Part = Result<(Vec<Vec<Agg>>, usize), Option<BudgetExceeded>>;
+        let parts: Vec<Part> = bounds
             .par_windows(2)
             .map(|window| {
                 if token.is_some_and(CancellationToken::is_cancelled) {
-                    return None;
+                    return Err(None);
                 }
                 let decoder = Decoder::new(snapshot, computed, decodes);
                 let term = |id: u64| decoder.term(id);
+                let kept = aggregate::Kept::new(shared);
                 let aggregator = Aggregator {
                     evaluator,
                     term: &term,
                     memo: RefCell::default(),
                     numbers: RefCell::default(),
+                    kept: Some(&kept),
                 };
-                Some(
-                    members[window[0]..window[1]]
-                        .iter()
-                        .map(|rows| per_group(&aggregator, rows))
-                        .collect(),
-                )
+                let part = aggregate(&aggregator, &kept, &members[window[0]..window[1]]);
+                drop(aggregator);
+                let charged = kept.results();
+                match part {
+                    Ok(part) => Ok((part, charged)),
+                    Err(refused) => {
+                        budget.release(charged);
+                        Err(Some(refused))
+                    }
+                }
             })
             .collect();
-        let mut out = Vec::with_capacity(members.len());
+        let (mut out, mut charged) = (Vec::with_capacity(members.len()), 0usize);
+        let mut stop = None;
         for part in parts {
-            let Some(part) = part else {
-                return Err(QueryEvaluationError::Cancelled.into());
-            };
-            out.extend(part);
+            match part {
+                Ok((part, bytes)) => {
+                    out.extend(part);
+                    charged = charged.saturating_add(bytes);
+                }
+                Err(why) => stop = Some(stop.flatten().or(why)),
+            }
         }
-        Ok(out)
+        if let Some(why) = stop {
+            // Let go of what the other parts made, then of their charge.
+            drop(out);
+            budget.release(charged);
+            return Err(match why {
+                Some(refused) => QueryEvaluationError::MemoryLimit(refused),
+                None => QueryEvaluationError::Cancelled,
+            }
+            .into());
+        }
+        Ok((out, charged))
     }
 
     /// Ranks of `column`'s values in SPARQL's order. With `top = (k, descending)` only the
@@ -4769,6 +4845,7 @@ impl<'a> Context<'a> {
             && k < n
             && keys.len() > 1
         {
+            let before = held.bytes();
             held.charge(n.saturating_mul(8)).map_err(memory)?;
             let first = self.sort_keys(&solutions, &keys[..1], &rows, Some(k), &mut held)?;
             let cmp = |a: &usize, b: &usize| by_keys(&keys[..1], &first, *a, *b);
@@ -4776,6 +4853,10 @@ impl<'a> Context<'a> {
             positions.select_nth_unstable_by(k - 1, cmp);
             let pivot = positions[k - 1];
             rows.retain(|row| cmp(row, &pivot).is_le());
+            drop(positions);
+            drop(first);
+            // The first key and the positions are gone: so is their charge.
+            held.resize(before).map_err(memory)?;
         }
         let key_values = self.sort_keys(&solutions, keys, &rows, limit, &mut held)?;
         let compare = |a: &usize, b: &usize| {
@@ -4793,6 +4874,9 @@ impl<'a> Context<'a> {
         let order: Vec<usize> = order.into_iter().map(|position| rows[position]).collect();
         drop(key_values);
         drop(rows);
+        // Only the order is left of the scratch, and charged.
+        held.resize(order.capacity().saturating_mul(8))
+            .map_err(memory)?;
         // The rows in that order: a table made of the charged one.
         let width = solutions.table.width();
         let growth = order.len().saturating_mul(8).saturating_mul(width.max(1));
@@ -4836,10 +4920,18 @@ impl<'a> Context<'a> {
             return self.group_streamed(plan, variables, aggregates);
         }
         let before = self.budget.used();
+        let kept = self.kept.borrow().bytes();
         match self.group_direct(inner, variables, aggregates, having) {
             Err(error) if streamable.is_some() && stream::is_memory_limit(&error) => {
-                self.budget
-                    .release(self.budget.used().saturating_sub(before));
+                // What the attempt held, not what the context keeps of it (its computed
+                // terms and numbers stay, and stay charged).
+                let grown = self.kept.borrow().bytes().saturating_sub(kept);
+                self.budget.release(
+                    self.budget
+                        .used()
+                        .saturating_sub(before)
+                        .saturating_sub(grown),
+                );
                 let plan = streamable.as_ref().expect("checked");
                 self.group_streamed(plan, variables, aggregates)
             }
@@ -5226,7 +5318,8 @@ impl<'a> Context<'a> {
             let missing: Vec<(u64, usize)> = missing.into_iter().collect();
             // Each number found is kept: charged before (`number_bytes`), however many
             // expressions the query sums.
-            self.budget
+            self.kept
+                .borrow_mut()
                 .charge(missing.len().saturating_mul(number_bytes()))?;
             let number = |aggregator: &Aggregator<'_>, row: usize| {
                 let binding = aggregator.binding(solutions, row);
@@ -5245,6 +5338,7 @@ impl<'a> Context<'a> {
                     term: &term,
                     memo: RefCell::default(),
                     numbers: RefCell::default(),
+                    kept: None,
                 };
                 missing
                     .iter()
@@ -5265,6 +5359,7 @@ impl<'a> Context<'a> {
                             term: &term,
                             memo: RefCell::default(),
                             numbers: RefCell::default(),
+                            kept: None,
                         };
                         part.iter()
                             .map(|&(id, row)| (id, number(&aggregator, row)))
@@ -5367,7 +5462,9 @@ impl<'a> Context<'a> {
             }
             keep
         });
-        self.budget.release(let_go.saturating_mul(number_bytes()));
+        self.kept
+            .borrow_mut()
+            .release(let_go.saturating_mul(number_bytes()));
         Ok(Some(
             (0..groups)
                 .map(|group| {
