@@ -25,7 +25,14 @@ impl Read for Trickle<'_> {
     }
 }
 
-fn terms() -> Vec<Term> {
+/// The terms written in `format`. XML 1.0 can't hold U+0001 (XML 1.0 §2.2), so XML's
+/// control-character literal keeps only DEL.
+fn terms(format: QueryResultsFormat) -> Vec<Term> {
+    let controls = if format == QueryResultsFormat::Xml {
+        "control \u{7f}"
+    } else {
+        "control \u{1} \u{7f}"
+    };
     let iri = NamedNode::new_unchecked("http://example.com/a?b=c&d='e'");
     vec![
         iri.clone().into(),
@@ -34,7 +41,7 @@ fn terms() -> Vec<Term> {
         Literal::new_simple_literal(" \t edges and \"quotes\" & <tags> ' \\ é 😀\n ").into(),
         Literal::new_simple_literal("").into(),
         Literal::new_simple_literal("   ").into(),
-        Literal::new_simple_literal("control \u{1} \u{7f}").into(),
+        Literal::new_simple_literal(controls).into(),
         Literal::new_language_tagged_literal_unchecked("chat", "fr").into(),
         Literal::new_directional_language_tagged_literal_unchecked("قطة", "ar", BaseDirection::Rtl)
             .into(),
@@ -58,13 +65,13 @@ fn terms() -> Vec<Term> {
 }
 
 /// Solutions over three variables: every term in every column, and unbound ones.
-fn solutions() -> (Vec<Variable>, Vec<Vec<Option<Term>>>) {
+fn solutions(format: QueryResultsFormat) -> (Vec<Variable>, Vec<Vec<Option<Term>>>) {
     let variables = vec![
         Variable::new_unchecked("a"),
         Variable::new_unchecked("b"),
         Variable::new_unchecked("c"),
     ];
-    let terms = terms();
+    let terms = terms(format);
     let mut rows = Vec::new();
     for (i, term) in terms.iter().enumerate() {
         rows.push(vec![
@@ -116,12 +123,12 @@ fn read_trickling(format: QueryResultsFormat, bytes: &[u8]) -> (Vec<Variable>, V
 
 #[test]
 fn every_readable_format_round_trips() {
-    let (variables, rows) = solutions();
     for format in [
         QueryResultsFormat::Json,
         QueryResultsFormat::Xml,
         QueryResultsFormat::Tsv,
     ] {
+        let (variables, rows) = solutions(format);
         let bytes = write(format, &variables, &rows);
         for (read_variables, read_rows) in
             [read_slice(format, &bytes), read_trickling(format, &bytes)]
