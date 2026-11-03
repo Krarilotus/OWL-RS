@@ -8,8 +8,13 @@
 //!   `boolean`, in the results namespace), Namespaces in XML 1.0 §5–6 (names are
 //!   namespace + local name), RDF 1.2's `its:dir` in the ITS namespace, and XML 1.0 §2.2
 //!   (the characters a document can hold) and §2.11 (a raw CR reads as LF).
+//!
+//! Each table checks every row and reports all the rows that fail. A row marked `guard`
+//! held before the change too: it keeps what already worked.
 
-use nrese_rdf::{BaseDirection, Literal, Term, TermRef, Variable};
+use std::fmt::Debug;
+
+use nrese_rdf::{BaseDirection, Literal, NamedNode, Term, TermRef, Variable};
 use nrese_sparql_results::{
     QueryResultsFormat, QueryResultsParser, QueryResultsSerializer, ReaderQueryResultsParserOutput,
     SliceQueryResultsParserOutput, XmlUnrepresentable,
@@ -18,8 +23,41 @@ use nrese_sparql_results::{
 const NS: &str = "http://www.w3.org/2005/sparql-results#";
 const ITS: &str = "http://www.w3.org/2005/11/its";
 
+/// A table's failing rows, reported together at its end.
+#[derive(Default)]
+struct Table(Vec<String>);
+
+impl Table {
+    /// Row `label` (a guard if `guard`): its outcome.
+    fn row(&mut self, guard: bool, label: impl Debug, outcome: Result<(), String>) {
+        if let Err(why) = outcome {
+            let kind = if guard { "guard " } else { "" };
+            self.0.push(format!("{kind}{label:?}: {why}"));
+        }
+    }
+
+    fn done(self) {
+        assert!(
+            self.0.is_empty(),
+            "{} row(s) failed:\n{}",
+            self.0.len(),
+            self.0.join("\n")
+        );
+    }
+}
+
+fn same<T: PartialEq + Debug>(got: T, want: T) -> Result<(), String> {
+    if got == want {
+        Ok(())
+    } else {
+        Err(format!("got {got:?}, want {want:?}"))
+    }
+}
+
+type Rows = Vec<Vec<Option<Term>>>;
+
 /// The rows of a solutions document read from a slice, or the first error.
-fn slice_rows(format: QueryResultsFormat, bytes: &[u8]) -> Result<Vec<Vec<Option<Term>>>, String> {
+fn slice_rows(format: QueryResultsFormat, bytes: &[u8]) -> Result<Rows, String> {
     match QueryResultsParser::from_format(format).for_slice(bytes) {
         Err(error) => Err(error.to_string()),
         Ok(SliceQueryResultsParserOutput::Boolean(_)) => Err("a boolean".to_owned()),
@@ -30,7 +68,7 @@ fn slice_rows(format: QueryResultsFormat, bytes: &[u8]) -> Result<Vec<Vec<Option
 }
 
 /// The same through a reader, which takes the reader path of every format.
-fn reader_rows(format: QueryResultsFormat, bytes: &[u8]) -> Result<Vec<Vec<Option<Term>>>, String> {
+fn reader_rows(format: QueryResultsFormat, bytes: &[u8]) -> Result<Rows, String> {
     match QueryResultsParser::from_format(format).for_reader(bytes) {
         Err(error) => Err(error.to_string()),
         Ok(ReaderQueryResultsParserOutput::Boolean(_)) => Err("a boolean".to_owned()),
@@ -40,19 +78,30 @@ fn reader_rows(format: QueryResultsFormat, bytes: &[u8]) -> Result<Vec<Vec<Optio
     }
 }
 
-/// Both paths read the same rows; returns them.
-fn rows(format: QueryResultsFormat, document: &str) -> Result<Vec<Vec<Option<Term>>>, String> {
-    let slice = slice_rows(format, document.as_bytes());
-    let reader = reader_rows(format, document.as_bytes());
-    assert_eq!(
-        slice.is_ok(),
-        reader.is_ok(),
-        "{document:?}: slice {slice:?}, reader {reader:?}"
-    );
-    if let (Ok(slice), Ok(reader)) = (&slice, &reader) {
-        assert_eq!(slice, reader, "{document:?}");
+/// What both paths read: their rows when they agree (`Ok(Err(_))` when both refuse), or why
+/// they don't.
+fn rows(format: QueryResultsFormat, document: &str) -> Result<Result<Rows, ()>, String> {
+    match (
+        slice_rows(format, document.as_bytes()),
+        reader_rows(format, document.as_bytes()),
+    ) {
+        (Ok(slice), Ok(reader)) if slice == reader => Ok(Ok(slice)),
+        (Err(_), Err(_)) => Ok(Err(())),
+        (slice, reader) => Err(format!("slice {slice:?}, reader {reader:?}")),
     }
-    slice
+}
+
+/// Both paths read `expected`.
+fn reads(format: QueryResultsFormat, document: &str, expected: Rows) -> Result<(), String> {
+    same(rows(format, document)?, Ok(expected))
+}
+
+/// Both paths refuse the document.
+fn refused(format: QueryResultsFormat, document: &str) -> Result<(), String> {
+    match rows(format, document)? {
+        Err(()) => Ok(()),
+        Ok(rows) => Err(format!("read {rows:?}")),
+    }
 }
 
 fn one() -> Term {
@@ -62,22 +111,23 @@ fn one() -> Term {
 #[test]
 fn every_tsv_line_after_the_head_is_a_solution_and_an_empty_field_is_unbound() {
     let tsv = QueryResultsFormat::Tsv;
-    // (document, solutions): each line ends with LF; a last line without one still counts.
-    let cases: [(&str, Vec<Vec<Option<Term>>>); 8] = [
-        ("?x\n", vec![]),
-        ("?x\n\n", vec![vec![None]]),
-        ("?x\n\n\n", vec![vec![None], vec![None]]),
-        ("?x\n\n1\n", vec![vec![None], vec![Some(one())]]),
-        ("?x\n1\n\n", vec![vec![Some(one())], vec![None]]),
-        ("?x\n1", vec![vec![Some(one())]]),
-        ("?x\r\n\r\n", vec![vec![None]]),
-        ("?x\t?y\n\t\n", vec![vec![None, None]]),
-    ];
-    for (document, expected) in cases {
-        assert_eq!(rows(tsv, document), Ok(expected), "{document:?}");
+    let mut table = Table::default();
+    // (guard, document, solutions): each line ends with LF; a last line without one counts.
+    for (guard, document, expected) in [
+        (true, "?x\n", vec![]),
+        (false, "?x\n\n", vec![vec![None]]),
+        (false, "?x\n\n\n", vec![vec![None], vec![None]]),
+        (false, "?x\n\n1\n", vec![vec![None], vec![Some(one())]]),
+        (false, "?x\n1\n\n", vec![vec![Some(one())], vec![None]]),
+        (true, "?x\n1", vec![vec![Some(one())]]),
+        (false, "?x\r\n\r\n", vec![vec![None]]),
+        (true, "?x\t?y\n\t\n", vec![vec![None, None]]),
+    ] {
+        table.row(guard, document, reads(tsv, document, expected));
     }
     // An empty line is one field: not a solution of two variables.
-    assert!(rows(tsv, "?x\t?y\n\n").is_err());
+    table.row(false, "?x\t?y\n\n", refused(tsv, "?x\t?y\n\n"));
+    table.done();
 }
 
 #[test]
@@ -87,12 +137,10 @@ fn a_tsv_solution_with_its_one_variable_unbound_reads_back() {
         .unwrap();
     serializer.serialize_row(&[None]).unwrap();
     let bytes = serializer.finish().unwrap();
+    let document = std::str::from_utf8(&bytes).unwrap();
     assert_eq!(
-        rows(
-            QueryResultsFormat::Tsv,
-            std::str::from_utf8(&bytes).unwrap()
-        ),
-        Ok(vec![vec![None]])
+        reads(QueryResultsFormat::Tsv, document, vec![vec![None]]),
+        Ok(())
     );
 }
 
@@ -111,6 +159,7 @@ fn literal(attributes: &str) -> String {
 #[test]
 fn xml_elements_count_only_in_the_results_namespace() {
     let format = QueryResultsFormat::Xml;
+    let mut table = Table::default();
     for document in [
         r#"<sparql xmlns="urn:wrong"><head/><results/></sparql>"#.to_owned(),
         r#"<sparql><head/><results/></sparql>"#.to_owned(),
@@ -118,22 +167,22 @@ fn xml_elements_count_only_in_the_results_namespace() {
         format!(r#"<sparql xmlns="{NS}"><r:head xmlns:r="urn:wrong"/><results/></sparql>"#),
         format!(r#"<u:sparql xmlns:r="{NS}"><r:head/><r:results/></u:sparql>"#),
     ] {
-        assert!(rows(format, &document).is_err(), "{document}");
+        let outcome = refused(format, &document);
+        table.row(false, document, outcome);
     }
     // A prefix bound to the results namespace names its elements.
     let prefixed = format!(
         r#"<r:sparql xmlns:r="{NS}"><r:head><r:variable name="x"/></r:head><r:results><r:result><r:binding name="x"><r:uri>urn:a</r:uri></r:binding></r:result></r:results></r:sparql>"#
     );
-    assert_eq!(
-        rows(format, &prefixed),
-        Ok(vec![vec![Some(
-            nrese_rdf::NamedNode::new_unchecked("urn:a").into()
-        )]])
-    );
+    let urn_a: Term = NamedNode::new_unchecked("urn:a").into();
+    let outcome = reads(format, &prefixed, vec![vec![Some(urn_a)]]);
+    table.row(true, prefixed, outcome);
     // An element of another namespace that happens to be called `result` is no solution.
     let foreign =
         xml(r#"<results><f:result xmlns:f="urn:f"><f:binding name="x"/></f:result></results>"#);
-    assert_eq!(rows(format, &foreign), Ok(vec![]));
+    let outcome = reads(format, &foreign, vec![]);
+    table.row(false, foreign, outcome);
+    table.done();
 }
 
 #[test]
@@ -143,22 +192,24 @@ fn only_its_dir_in_the_its_namespace_gives_a_literal_its_direction() {
     let rtl: Term =
         Literal::new_directional_language_tagged_literal_unchecked("x", "ar", BaseDirection::Rtl)
             .into();
-    for (attributes, expected) in [
-        (r#"xmlns:q="urn:q" q:dir="rtl""#.to_owned(), &plain),
-        (r#"dir="rtl""#.to_owned(), &plain),
-        (format!(r#"xmlns:its="{ITS}" its:dir="rtl""#), &rtl),
-        (format!(r#"xmlns:d="{ITS}" d:dir="rtl""#), &rtl),
+    let mut table = Table::default();
+    for (guard, attributes, expected) in [
+        (false, r#"xmlns:q="urn:q" q:dir="rtl""#.to_owned(), &plain),
+        (true, r#"dir="rtl""#.to_owned(), &plain),
+        (true, format!(r#"xmlns:its="{ITS}" its:dir="rtl""#), &rtl),
+        (true, format!(r#"xmlns:d="{ITS}" d:dir="rtl""#), &rtl),
         (
+            false,
             format!(r#"xmlns:its="{ITS}" xmlns:q="urn:q" q:dir="ltr" its:dir="rtl""#),
             &rtl,
         ),
     ] {
-        let document = literal(&attributes);
-        assert_eq!(
-            rows(format, &document),
-            Ok(vec![vec![Some(expected.clone())]]),
-            "{document}"
+        let outcome = reads(
+            format,
+            &literal(&attributes),
+            vec![vec![Some(expected.clone())]],
         );
+        table.row(guard, attributes, outcome);
     }
     // Two attributes with the same expanded name, and an undeclared prefix, aren't XML
     // with namespaces.
@@ -166,15 +217,16 @@ fn only_its_dir_in_the_its_namespace_gives_a_literal_its_direction() {
         format!(r#"xmlns:a="{ITS}" xmlns:b="{ITS}" a:dir="rtl" b:dir="ltr""#),
         r#"q:dir="rtl""#.to_owned(),
     ] {
-        let document = literal(&attributes);
-        assert!(rows(format, &document).is_err(), "{document}");
+        let outcome = refused(format, &literal(&attributes));
+        table.row(false, attributes, outcome);
     }
+    table.done();
 }
 
 #[test]
 fn an_xml_document_has_one_head_then_one_results_or_boolean() {
-    let format = QueryResultsFormat::Xml;
     let solution = r#"<result><binding name="x"><uri>urn:a</uri></binding></result>"#;
+    let mut table = Table::default();
     for document in [
         // No head.
         format!(r#"<sparql xmlns="{NS}"><results/></sparql>"#),
@@ -183,17 +235,35 @@ fn an_xml_document_has_one_head_then_one_results_or_boolean() {
         xml("<results/><boolean>true</boolean>"),
         xml("<results/><link href=\"urn:l\"/>"),
         xml("<boolean>true</boolean><results/>"),
+        xml("<boolean>true</boolean><boolean>false</boolean>"),
         // A second head.
         xml("<head/><results/>"),
     ] {
-        assert!(rows(format, &document).is_err(), "{document}");
+        let outcome = document_refused(&document);
+        table.row(false, document, outcome);
     }
-    let document = xml("<boolean>true</boolean><boolean>false</boolean>");
-    assert!(
-        QueryResultsParser::from_format(format)
-            .for_slice(document.as_bytes())
-            .is_err()
-    );
+    table.done();
+}
+
+/// Both paths refuse an XML document, boolean or solutions: at its start or at a row.
+fn document_refused(document: &str) -> Result<(), String> {
+    let parser = QueryResultsParser::from_format(QueryResultsFormat::Xml);
+    let slice = match parser.for_slice(document.as_bytes()) {
+        Err(_) => true,
+        Ok(SliceQueryResultsParserOutput::Boolean(_)) => false,
+        Ok(SliceQueryResultsParserOutput::Solutions(mut rows)) => rows.any(|row| row.is_err()),
+    };
+    let reader = match parser.for_reader(document.as_bytes()) {
+        Err(_) => true,
+        Ok(ReaderQueryResultsParserOutput::Boolean(_)) => false,
+        Ok(ReaderQueryResultsParserOutput::Solutions(mut rows)) => rows.any(|row| row.is_err()),
+    };
+    match (slice, reader) {
+        (true, true) => Ok(()),
+        _ => Err(format!(
+            "read: slice refused {slice}, reader refused {reader}"
+        )),
+    }
 }
 
 /// An XML document of one solution binding `x` to `term`, as the serializer writes it.
@@ -206,27 +276,58 @@ fn written_xml(term: TermRef<'_>) -> std::io::Result<Vec<u8>> {
 
 #[test]
 fn a_carriage_return_in_xml_text_is_written_as_a_reference() {
-    for value in ["a\rb", "a\r\nb", "\r", "a\r"] {
+    let mut table = Table::default();
+    // A CR at a value's ends was a reference already; inside it, it wasn't.
+    for (guard, value) in [
+        (false, "a\rb"),
+        (false, "a\r\nb"),
+        (true, "\r"),
+        (true, "a\r"),
+    ] {
         let term: Term = Literal::new_simple_literal(value).into();
-        let bytes = written_xml(term.as_ref()).unwrap();
-        let text = std::str::from_utf8(&bytes).unwrap();
-        assert!(!text.contains('\r'), "{text:?}");
-        assert_eq!(
-            rows(QueryResultsFormat::Xml, text),
-            Ok(vec![vec![Some(term)]]),
-            "{text:?}"
-        );
+        let outcome = written_xml(term.as_ref())
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| String::from_utf8(bytes).map_err(|e| e.to_string()))
+            .and_then(|text| {
+                if text.contains('\r') {
+                    return Err(format!("a raw CR in {text:?}"));
+                }
+                reads(QueryResultsFormat::Xml, &text, vec![vec![Some(term)]])
+            });
+        table.row(guard, value, outcome);
     }
+    table.done();
+}
+
+/// Writes the row `good`, then the row `bad`: the refusal of `bad`, and the document
+/// `finish` writes after it.
+fn refusal(good: &Term, bad: &Term) -> Result<(std::io::Error, Vec<u8>), String> {
+    let mut serializer = QueryResultsSerializer::from_format(QueryResultsFormat::Xml)
+        .serialize_solutions_to_writer(Vec::new(), vec![Variable::new_unchecked("x")])
+        .map_err(|e| e.to_string())?;
+    serializer
+        .serialize_row(&[Some(good.as_ref())])
+        .map_err(|e| e.to_string())?;
+    let Err(error) = serializer.serialize_row(&[Some(bad.as_ref())]) else {
+        return Err("written".to_owned());
+    };
+    let bytes = serializer.finish().map_err(|e| e.to_string())?;
+    Ok((error, bytes))
 }
 
 #[test]
 fn a_character_xml_cannot_hold_is_refused_and_the_rows_before_it_stand() {
+    let mut table = Table::default();
     // Representable: TAB, LF, DEL, the last characters before the gaps.
     for value in ["\t\n\u{7f}", "\u{d7ff}\u{e000}\u{fffd}\u{10ffff}"] {
         let term: Term = Literal::new_simple_literal(value).into();
-        assert!(written_xml(term.as_ref()).is_ok(), "{value:?}");
+        let outcome = written_xml(term.as_ref())
+            .map(drop)
+            .map_err(|e| e.to_string());
+        table.row(true, value, outcome);
     }
-    for (value, refused) in [
+    let good: Term = Literal::new_simple_literal("good").into();
+    for (value, character) in [
         ("a\u{0}b", '\u{0}'),
         ("a\u{1}b", '\u{1}'),
         ("\u{b}", '\u{b}'),
@@ -234,28 +335,23 @@ fn a_character_xml_cannot_hold_is_refused_and_the_rows_before_it_stand() {
         ("a\u{fffe}", '\u{fffe}'),
         ("\u{ffff}", '\u{ffff}'),
     ] {
-        let good: Term = Literal::new_simple_literal("good").into();
         let bad: Term = Literal::new_simple_literal(value).into();
-        let mut serializer = QueryResultsSerializer::from_format(QueryResultsFormat::Xml)
-            .serialize_solutions_to_writer(Vec::new(), vec![Variable::new_unchecked("x")])
-            .unwrap();
-        serializer.serialize_row(&[Some(good.as_ref())]).unwrap();
-        let error = serializer.serialize_row(&[Some(bad.as_ref())]).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{value:?}");
-        let typed = error
-            .get_ref()
-            .and_then(|e| e.downcast_ref::<XmlUnrepresentable>())
-            .unwrap_or_else(|| panic!("{value:?}: {error}"));
-        assert_eq!(typed.character(), refused);
-        // The refused row left nothing behind: the document holds the row before it.
-        let bytes = serializer.finish().unwrap();
-        assert_eq!(
-            rows(
+        let outcome = refusal(&good, &bad).and_then(|(error, bytes)| {
+            same(error.kind(), std::io::ErrorKind::InvalidData)?;
+            let typed = error
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<XmlUnrepresentable>())
+                .ok_or_else(|| format!("not XmlUnrepresentable: {error}"))?;
+            same(typed.character(), character)?;
+            // The refused row left nothing behind: the document holds the row before it.
+            let text = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+            reads(
                 QueryResultsFormat::Xml,
-                std::str::from_utf8(&bytes).unwrap()
-            ),
-            Ok(vec![vec![Some(good)]]),
-            "{value:?}"
-        );
+                &text,
+                vec![vec![Some(good.clone())]],
+            )
+        });
+        table.row(false, value, outcome);
     }
+    table.done();
 }
