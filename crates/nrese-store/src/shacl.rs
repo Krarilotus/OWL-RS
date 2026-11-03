@@ -12,7 +12,7 @@ use nrese_shacl::{
     PropertyPath, Selection, ShapeError, Shapes, ValidationReport, compile, validate,
     validate_changes,
 };
-use nrese_sparql::ReadView;
+use nrese_sparql::{CancellationToken, ReadView, Resources};
 
 use crate::error::{StoreError, StoreResult};
 use crate::query::GraphResultFormat;
@@ -138,12 +138,13 @@ fn shapes_error(errors: Vec<ShapeError>) -> StoreError {
 }
 
 /// Validates `view` against the shapes in the graph `shapes` (none, if the graph holds
-/// nothing), leaving `also_excluded` out of the data as well.
+/// nothing), leaving `also_excluded` out of the data as well, on `resources`.
 fn validate_view<V: ReadView + Sync>(
     view: &V,
     shapes: Option<TermId>,
     also_excluded: Option<TermId>,
     request: &ShaclValidationRequest,
+    resources: &Resources,
 ) -> StoreResult<(ValidationReport, usize, bool)> {
     let Some(shapes_graph) = shapes else {
         return Ok((ValidationReport::default(), 0, false));
@@ -168,7 +169,8 @@ fn validate_view<V: ReadView + Sync>(
     };
     data.model = request.read_model;
     let applicable = nrese_shacl::applicable(view, &shapes, data);
-    Ok((validate(view, &shapes, data), shapes.len(), applicable))
+    let report = validate(view, &shapes, data, resources)?;
+    Ok((report, shapes.len(), applicable))
 }
 
 /// Fails if the commit in `tx` changes the graph `shapes_graph` and leaves shapes in it that
@@ -198,10 +200,12 @@ pub(crate) fn check_shapes(tx: &Transaction<'_>, shapes_graph: &str) -> StoreRes
 /// What the commit in `tx` introduces against the shapes in the graph `shapes_graph` (the
 /// commit gate, C2): the results present after it and not before, over every data graph.
 /// If the commit changes the shapes, both states are validated in full; otherwise only the
-/// focus nodes the changes can affect ([`validate_changes`]). `None` without shapes.
+/// focus nodes the changes can affect ([`validate_changes`]). `None` without shapes. The
+/// validations run on the write's `resources`; a stop is the error, never a report.
 pub(crate) fn introduced(
     tx: &Transaction<'_>,
     shapes_graph: &str,
+    resources: &Resources,
 ) -> StoreResult<Option<ValidationReport>> {
     let iri = graph_iri(shapes_graph)?;
     let Some(shapes_id) = tx.lookup(iri.as_ref().into()) else {
@@ -217,10 +221,10 @@ pub(crate) fn introduced(
         .any(|quad| quad.graph == shapes_id);
     if shapes_changed {
         let shapes_after = compile(&after, shapes_selection).map_err(shapes_error)?;
-        let mut report = validate(&after, &shapes_after, data);
+        let mut report = validate(&after, &shapes_after, data, resources)?;
         // Shapes that didn't compile before had no results.
         if let Ok(shapes_before) = compile(before, shapes_selection) {
-            let earlier = validate(before, &shapes_before, data).results;
+            let earlier = validate(before, &shapes_before, data, resources)?.results;
             report.results.retain(|result| !earlier.contains(result));
         }
         return Ok(Some(report));
@@ -239,19 +243,30 @@ pub(crate) fn introduced(
         )
         .collect();
     Ok(Some(validate_changes(
-        before, &after, &shapes, data, &changed,
-    )))
+        before, &after, &shapes, data, &changed, resources,
+    )?))
 }
 
 impl StoreService {
     /// Validates the repository's data against SHACL shapes; for a scope that reads every
     /// graph. Ill-formed shapes are a request error ([`StoreError::ShaclShapes`]).
+    ///
+    /// It runs as a query does: stopped by `cancellation` (the transport cancels it at its
+    /// deadline and when the client is gone) and within the server's query memory, its
+    /// SHACL-SPARQL queries included; a stop is [`StoreError::SparqlEvaluation`] with
+    /// [`nrese_sparql::QueryEvaluationError::Cancelled`] or `MemoryLimit`.
     pub fn validate_shacl(
         &self,
         scope: &crate::ReadScope,
         request: &ShaclValidationRequest,
+        cancellation: &CancellationToken,
     ) -> StoreResult<ShaclValidation> {
         scope.require_all("validation")?;
+        let resources = Resources {
+            cancellation: Some(cancellation.clone()),
+            memory: self.envelope(None),
+            ..Resources::default()
+        };
         let stored = graph_iri(&self.config().shapes_graph)?;
         match &request.shapes {
             ShapesSource::Stored | ShapesSource::Graph(_) => {
@@ -265,6 +280,7 @@ impl StoreService {
                     snapshot.lookup(shapes_graph.as_ref().into()),
                     snapshot.lookup(stored.as_ref().into()),
                     request,
+                    &resources,
                 )?;
                 Ok(ShaclValidation {
                     report,
@@ -299,6 +315,7 @@ impl StoreService {
                     tx.lookup(scratch.into()),
                     tx.lookup(stored.as_ref().into()),
                     request,
+                    &resources,
                 )?;
                 Ok(ShaclValidation {
                     report,

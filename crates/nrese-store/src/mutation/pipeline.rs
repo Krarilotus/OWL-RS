@@ -324,7 +324,7 @@ impl MutationPipeline {
             }
             crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph)
                 .map_err(store_error)?;
-            self.shacl_gate(&tx)?;
+            self.shacl_gate(&tx, &context.resources(), store_error)?;
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }
@@ -372,7 +372,7 @@ impl MutationPipeline {
         // Without reasoning, commits don't maintain the inferred stack.
         self.store.invalidate_reasoning().map_err(store_error)?;
         crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph).map_err(store_error)?;
-        self.shacl_gate(&tx)?;
+        self.shacl_gate(&tx, &context.resources(), store_error)?;
         if !ticket.begin_commit() {
             return Err(MutationError::Cancelled);
         }
@@ -384,14 +384,26 @@ impl MutationPipeline {
     }
 
     /// The SHACL commit gate (C2): validates what the transaction's changes can affect,
-    /// after reasoning, and rejects the commit if the policy says so.
-    fn shacl_gate(&self, tx: &nrese_engine::Transaction<'_>) -> Result<(), MutationError> {
+    /// after reasoning, and rejects the commit if the policy says so. It runs on the write's
+    /// `resources` (its cancellation and envelope). A validation they stop fails the write
+    /// as `stopped` maps it, under every policy: it is no verdict on the data, so neither a
+    /// rejection nor a warning to commit past.
+    fn shacl_gate(
+        &self,
+        tx: &nrese_engine::Transaction<'_>,
+        resources: &nrese_sparql::Resources,
+        stopped: impl FnOnce(StoreError) -> MutationError,
+    ) -> Result<(), MutationError> {
         let gate = self.store.config().shacl_gate;
         if gate == ShaclGate::Off {
             return Ok(());
         }
-        let report = crate::shacl::introduced(tx, &self.store.config().shapes_graph)
-            .map_err(|error| MutationError::Gate(error.to_string()))?;
+        let report =
+            match crate::shacl::introduced(tx, &self.store.config().shapes_graph, resources) {
+                Ok(report) => report,
+                Err(error @ StoreError::SparqlEvaluation(_)) => return Err(stopped(error)),
+                Err(error) => return Err(MutationError::Gate(error.to_string())),
+            };
         let Some(report) = report else {
             return Ok(());
         };
