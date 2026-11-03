@@ -391,7 +391,7 @@ source = "github.com/GDD-Nantes/FedShop at 37f2e15; data, queries, reference sou
 licence = "data CC-BY-4.0; code GPL-3.0 (run, never shipped)"
 tiers = ["20", "100", "200"]
 state = "planned"
-kit = "benches/breadth/fedshop"
+kit = "none yet"
 check = "answers against the reference source assignment's"
 note = "NRESE runs only the SERVICE-annotated reference source assignments: it has no source selection over a federation (a finding). FedX, CostFed, Semagrow, HeFQUIN, FedUP published"
 
@@ -433,7 +433,7 @@ source = "the lubm workload's data (benches/datasets.toml, lubm-1000.nt)"
 licence = "GPL-2.0 (generator); data is generated"
 tiers = ["16g", "12g", "8g", "6g", "4g", "2g"]
 state = "planned"
-kit = "benches/breadth/memory-budget"
+kit = "none yet"
 check = "the same closure size and answers as uncapped"
 note = "Systems with a memory budget of their own degrade (NRESE's budgets, QLever's sort memory, JVM heaps); the others are killed at the cap: failed, never a time"
 

@@ -29,7 +29,9 @@ Read [docs/README.md](docs/README.md) (which document answers what),
   started by hand on a host: `fleet rules` says what may run where, `fleet why <job>` explains
   a placement. The push tier and the Windows check already run that way
   ([CONTRIBUTING.md](CONTRIBUTING.md#building-and-measuring)); a change is timed only through
-  [benches/abba/README.md](benches/abba/README.md). Verified shared inputs are read-only.
+  [benches/abba/README.md](benches/abba/README.md): `python benches/suite/abba.py run --a BASE
+  --b CHANGE --cases ...`, and the release gate is `python benches/fast/release_gate.py jobs CAND
+  --plan`, then `--submit`, each one fleet set. Verified shared inputs are read-only.
 - The machine you run on is the owner's workstation: its commit tier needs no build, and its
   guard stops our heavy processes when memory or disk run low.
 - Before building a tool, look in [docs/README.md](docs/README.md#where-is) for the one that
