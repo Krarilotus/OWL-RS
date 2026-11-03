@@ -568,7 +568,8 @@ impl Shared {
 }
 
 /// Background maintenance thread. Wakeups are coalesced; the thread exits when the engine
-/// is dropped (the sender closes), after finishing the task in progress.
+/// is dropped (the sender closes), after finishing the task in progress, and the drop waits
+/// for it (on a Rayon pool thread, running that pool's jobs meanwhile).
 struct Worker {
     wake: Option<mpsc::SyncSender<()>>,
     thread: Option<JoinHandle<()>>,
@@ -602,11 +603,23 @@ impl Worker {
 }
 
 impl Drop for Worker {
+    /// Ends maintenance and waits for it (IB0024). On a Rayon pool thread the wait runs that
+    /// pool's jobs meanwhile: maintenance's merges and checkpoints fork onto the global pool,
+    /// and this thread may be the one their parts wait for.
     fn drop(&mut self) {
         self.wake.take();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        if rayon::current_thread_index().is_some() {
+            while !thread.is_finished() {
+                if !matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
+                    // Nothing of this pool's to run: maintenance is busy elsewhere.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
         }
+        let _ = thread.join();
     }
 }
 
