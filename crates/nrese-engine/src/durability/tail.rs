@@ -101,6 +101,7 @@ fn intact_after(bytes: &[u8], at: usize, next: u64) -> Option<(u64, u64)> {
 /// before they are cut; returns the copy's path. No copy is ever replaced: one of the same
 /// bytes (opening again before the cut) is reused, and a different one at that offset (a
 /// later cut there) keeps its name while this copy takes the next free `.<n>` after it.
+/// Either way the copy's name is synced before this returns, so before the cut.
 pub(crate) fn keep(root: &Path, segment: &Path, bytes: &[u8], at: u64) -> EngineResult<PathBuf> {
     let dir = root.join(CUT_DIR);
     fs::create_dir_all(&dir)?;
@@ -114,7 +115,8 @@ pub(crate) fn keep(root: &Path, segment: &Path, bytes: &[u8], at: u64) -> Engine
     let mut path = dir.join(&first);
     for n in 1.. {
         match fs::read(&path) {
-            Ok(kept) if kept == cut => return Ok(path),
+            // A copy an earlier open placed, whose name may not have been synced then.
+            Ok(kept) if kept == cut => return sync_cut_dir(&dir).map(|()| path),
             Ok(_) => path = dir.join(format!("{first}.{n}")),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
             Err(error) => return Err(error.into()),
@@ -128,8 +130,15 @@ pub(crate) fn keep(root: &Path, segment: &Path, bytes: &[u8], at: u64) -> Engine
     file.sync_all()?;
     drop(file);
     fs::rename(&temporary, &path)?;
-    super::sync_dir(&dir)?;
+    sync_cut_dir(&dir)?;
     Ok(path)
+}
+
+/// Makes the copies' names in `dir` durable.
+fn sync_cut_dir(dir: &Path) -> EngineResult<()> {
+    #[cfg(test)]
+    super::fault::check(&super::fault::FAIL_CUT_DIR_SYNC, "wal-cut directory sync")?;
+    super::sync_dir(dir)
 }
 
 #[cfg(test)]

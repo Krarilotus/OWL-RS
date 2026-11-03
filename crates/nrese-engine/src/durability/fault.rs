@@ -13,6 +13,8 @@ thread_local! {
     pub(crate) static FAIL_SEGMENT_PLACED: Cell<bool> = const { Cell::new(false) };
     /// Mapping a checkpoint just written fails.
     pub(crate) static FAIL_MAP: Cell<bool> = const { Cell::new(false) };
+    /// Syncing `wal-cut/` after a copy is placed (or found) fails.
+    pub(crate) static FAIL_CUT_DIR_SYNC: Cell<bool> = const { Cell::new(false) };
 }
 
 /// An error if `point` is set on this thread.
