@@ -399,3 +399,20 @@ fn a_column_given_to_a_row_without_columns_is_charged() {
     }
     assert!(failures.is_empty(), "{}", failures.join("; "));
 }
+
+/// Spec (sol-loop r3 S2; the budget types' owner, 3 Nov): under a 4 KiB envelope no grant
+/// holds spare, so CONSTRUCT's two grants (the copies it keeps to emit a triple once, and
+/// the triples) charge exactly and answer its one triple, never refused for spare.
+#[test]
+fn construct_under_a_small_envelope_is_never_refused_for_spare() {
+    let engine = store([]);
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new()
+        .parse_query("CONSTRUCT { <urn:s> <urn:p> <urn:o> } WHERE { }")
+        .unwrap();
+    let mut options = QueryOptions::default();
+    options.resources.memory = Envelope::new(Some(4 << 10), None);
+    let answer = crate::evaluate_query(&snapshot, &query, &options);
+    assert!(answer.is_ok(), "refused: {:?}", answer.err());
+    assert!(!options.resources.memory.refused());
+}

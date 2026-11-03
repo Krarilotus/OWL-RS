@@ -254,9 +254,10 @@ fn run(
                 &template,
                 || ctx.check(),
             );
-            // One at a time through a grant (an atomic each, no call up the levels); the
-            // triples keep their charge with the outcome.
-            let mut grant = Grant::new(&*ctx.budget);
+            // One at a time through a grant (no budget call within its spare); the triples
+            // keep their charge with the outcome. One thread, beside `construct`'s own grant:
+            // half the spare each.
+            let mut grant = Grant::with_workers(&*ctx.budget, 2);
             for triple in made {
                 let triple = triple?;
                 grant
@@ -730,8 +731,8 @@ fn construct<'a>(
     let table = solutions.table;
     let mut emitted: HashSet<nrese_rdf::Triple> = HashSet::new();
     // The copies `emitted` keeps, each charged before it is kept, one at a time through a
-    // grant.
-    let mut held = Grant::new(budget);
+    // grant: one thread, beside the caller's grant for the triples (half the spare each).
+    let mut held = Grant::with_workers(budget, 2);
     // A triple at a time, however many the template has: the next is the template's
     // `index`-th triple of row `row`, with the row's fresh blank nodes.
     let (mut row, mut index) = (0, 0);
@@ -4788,9 +4789,9 @@ impl<'a> Context<'a> {
             held.charge(rows.len().saturating_mul(slot))
                 .map_err(memory)?;
             let mut terms = Vec::with_capacity(rows.len());
-            // A term at a time through a grant (an atomic each, no call up the levels), its
-            // charge then held with the keys'.
-            let mut strings = Grant::new(&*self.budget);
+            // A term at a time through a grant (no budget call within its spare), its charge
+            // then held with the keys'. One thread.
+            let mut strings = Grant::with_workers(&*self.budget, 1);
             for &row in rows {
                 let term = self.evaluator.eval(e, &self.binding(solutions, row));
                 if let Some(term) = &term {
