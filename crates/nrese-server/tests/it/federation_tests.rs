@@ -98,42 +98,49 @@ async fn a_server_asks_another() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// An endpoint that answers every request with `response` and keeps the connection open
-/// (until the test process ends), whatever the response's own length says.
+/// An endpoint that answers every request with `response`, on every connection and for
+/// every request a kept-alive connection brings, and keeps each connection open until its
+/// client closes it, whatever the response's own length says.
 fn canned(response: Vec<u8>) -> std::io::Result<String> {
     use std::io::{Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let url = format!("http://{}/sparql", listener.local_addr()?);
+    let response = std::sync::Arc::new(response);
     std::thread::spawn(move || {
-        let mut open = Vec::new();
         for mut stream in listener.incoming().flatten() {
-            // The request's head, then as much of its body as its length says.
-            let mut request = Vec::new();
-            let mut buffer = [0u8; 4096];
-            let head = loop {
-                match stream.read(&mut buffer) {
-                    Ok(0) | Err(_) => break None,
-                    Ok(n) => request.extend_from_slice(&buffer[..n]),
+            let response = std::sync::Arc::clone(&response);
+            std::thread::spawn(move || {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    // A request's head, then as much of its body as its length says.
+                    let head = loop {
+                        if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break at + 4;
+                        }
+                        match stream.read(&mut buffer) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buffer[..n]),
+                        }
+                    };
+                    let text = String::from_utf8_lossy(&request[..head]).to_ascii_lowercase();
+                    let length: usize = text
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    while request.len() < head + length {
+                        match stream.read(&mut buffer) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buffer[..n]),
+                        }
+                    }
+                    request.drain(..head + length);
+                    if stream.write_all(&response).is_err() {
+                        return;
+                    }
                 }
-                if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break Some(at + 4);
-                }
-            };
-            let Some(head) = head else { continue };
-            let text = String::from_utf8_lossy(&request[..head]).to_ascii_lowercase();
-            let length: usize = text
-                .lines()
-                .find_map(|line| line.strip_prefix("content-length:"))
-                .and_then(|value| value.trim().parse().ok())
-                .unwrap_or(0);
-            while request.len() < head + length {
-                match stream.read(&mut buffer) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => request.extend_from_slice(&buffer[..n]),
-                }
-            }
-            let _ = stream.write_all(&response);
-            open.push(stream);
+            });
         }
     });
     Ok(url)
@@ -186,30 +193,41 @@ async fn an_endpoint_error_is_read_no_further_than_its_message()
 }
 
 /// An endpoint's answer is memory of the query that asked for it: one larger than the
-/// query's budget is refused (413), SILENT or not, instead of being read whole.
+/// query's budget is refused (413), SILENT or not, instead of being read whole. Large in
+/// its body, or only once its rows are laid out over its variables.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_answer_beyond_the_query_budget_is_refused() -> Result<(), Box<dyn std::error::Error>> {
-    // One row: a literal of 2 MB, for a query budget of 1 MB.
+    // For a query budget of 1 MB: one row, a literal of 2 MB; and a body of 109 KB, its
+    // bindings (10,000, empty) before its head (10,000 variables), so 100 million values.
     let value = "a".repeat(2_000_000);
-    let json = format!(
+    let large = format!(
         r#"{{"head":{{"vars":["o"]}},"results":{{"bindings":[{{"o":{{"type":"literal","value":"{value}"}}}}]}}}}"#
     );
-    let mut response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: application/sparql-results+json\r\ncontent-length: {}\r\n\r\n",
-        json.len()
-    )
-    .into_bytes();
-    response.extend_from_slice(json.as_bytes());
-    let endpoint = canned(response)?;
-    let app = federated_app(&endpoint, 1_000_000)?;
-    for service in ["SERVICE", "SERVICE SILENT"] {
-        let text = format!("SELECT ?o WHERE {{ {service} <{endpoint}> {{ ?s ?p ?o }} }}");
-        let response = app.clone().oneshot(query(&text)?).await?;
-        assert_eq!(
-            response.status(),
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "{service}"
-        );
+    let vars: Vec<String> = (0..10_000).map(|i| format!("\"v{i}\"")).collect();
+    let wide = format!(
+        r#"{{"results":{{"bindings":[{}]}},"head":{{"vars":[{}]}}}}"#,
+        vec!["{}"; 10_000].join(","),
+        vars.join(",")
+    );
+    for json in [large, wide] {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/sparql-results+json\r\ncontent-length: {}\r\n\r\n",
+            json.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(json.as_bytes());
+        let endpoint = canned(response)?;
+        let app = federated_app(&endpoint, 1_000_000)?;
+        for service in ["SERVICE", "SERVICE SILENT"] {
+            let text = format!("SELECT ?o WHERE {{ {service} <{endpoint}> {{ ?s ?p ?o }} }}");
+            let response = app.clone().oneshot(query(&text)?).await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{service}, {} bytes",
+                json.len()
+            );
+        }
     }
     Ok(())
 }
