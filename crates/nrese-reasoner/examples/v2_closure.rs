@@ -95,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         (
             result.derived,
-            result.violations.len(),
+            result.violations.at_least(),
             result.diagnostics,
             result.rounds,
         )

@@ -129,16 +129,17 @@ impl StoreService {
             .hiding_unnamed_classes(config.hide_unnamed_classes)
             .by_representatives(config.equality_by_representatives)
             .storing_representatives(config.equality_compact);
-        let done = nrese_reasoner::engine::maintain(&compiled, None, &mut tx, &stop).map_err(
-            |interrupted| {
-                memory
-                    .error(interrupted)
-                    .unwrap_or(StoreError::ProcessMemoryLimit {
-                        limit: nrese_exec::memory::process_limit().unwrap_or(0),
-                    })
-            },
-        )?;
-        Ok(!done.violations.is_empty())
+        let report = self.operation_memory();
+        let done =
+            nrese_reasoner::engine::maintain_within(&compiled, None, &mut tx, &stop, &report)
+                .map_err(|interrupted| {
+                    memory
+                        .error(interrupted)
+                        .unwrap_or(StoreError::ProcessMemoryLimit {
+                            limit: nrese_exec::memory::process_limit().unwrap_or(0),
+                        })
+                })?;
+        Ok(!done.violations.consistent())
     }
 }
 

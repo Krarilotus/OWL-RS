@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use super::batch::{self, Schema};
-use super::ir::Vocabulary;
+use super::ir::{Violations, Vocabulary};
 use super::lists::ListVocabulary;
 use super::naive::{Triple, Violation, materialise};
 use super::rulesets::Ruleset;
@@ -265,7 +265,8 @@ fn both_with(
     }
     let mut violations = naive.violations;
     violations.sort_by(|a, b| (&a.rule, &a.bindings).cmp(&(&b.rule, &b.bindings)));
-    assert_eq!(violations, batch.violations, "violations differ");
+    assert_eq!(violations, batch.violations.to_vec(), "violations differ");
+    assert!(batch.violations.complete(), "an unlimited list is complete");
     (naive.derived, violations)
 }
 
@@ -779,6 +780,71 @@ fn a_memory_stop_holds_for_the_rest_of_the_materialisation() {
     }
 }
 
+/// P2-C4: the consistency check polls its operation's stop, between morsels and within a
+/// driver's firings (a rule over independent atoms fires n³ times on n facts each), and a
+/// stop it sees ends the run: whichever poll it fires at, the run either stops or lists
+/// every violation, complete; never a shorter list taken for the whole.
+#[test]
+fn the_consistency_check_polls_the_stop_and_never_reports_a_stopped_list() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::ir::parse_rules;
+    let mut vocabulary = LocalVocabulary::default();
+    let check = parse_rules(
+        "check: (?a rdfs:p ?x), (?b rdfs:q ?y), (?c rdfs:r ?z) -> false",
+        &mut vocabulary,
+    )
+    .unwrap();
+    let schema = Schema::owl(&mut vocabulary);
+    // n facts on each of p, q and r: n³ firings, all from one morsel of n drivers.
+    let mut input_of = |n: usize| {
+        let mut text = String::new();
+        for p in ["p", "q", "r"] {
+            for i in 0..n {
+                text.push_str(&format!("ex:{p}s{i} rdfs:{p} ex:{p}o{i}\n"));
+            }
+        }
+        load(&mut vocabulary, &text)
+    };
+    let (small, large) = (input_of(20), input_of(40));
+    let polls_of = |input: &[Triple]| {
+        let polls = AtomicUsize::new(0);
+        let counting = || {
+            polls.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        let closure =
+            batch::materialise_owned_until(input.to_vec(), &check, None, &schema, &counting)
+                .expect("never stopped");
+        (closure, polls.load(Ordering::Relaxed))
+    };
+    let (whole, polls) = polls_of(&small);
+    assert_eq!(whole.violations.at_least(), 20 * 20 * 20);
+    assert!(whole.violations.complete());
+    // Within the walk, a poll per 4,096 firings: 8,000 firings poll once there, 64,000
+    // fifteen times; everything else the run polls is the same for both inputs (one
+    // morsel, no rule that derives).
+    let (_, polls_large) = polls_of(&large);
+    assert!(
+        polls_large >= polls + (64_000 / 4_096 - 8_000 / 4_096),
+        "{polls} polls at 8,000 firings, {polls_large} at 64,000"
+    );
+    let input = small;
+    for k in 0..=polls {
+        let seen = AtomicUsize::new(0);
+        let from_k = || seen.fetch_add(1, Ordering::Relaxed) >= k;
+        if let Ok(closure) =
+            batch::materialise_owned_until(input.clone(), &check, None, &schema, &from_k)
+        {
+            assert!(
+                closure.violations.complete() && closure.violations == whole.violations,
+                "stopped at poll {k} of {polls}: a list of {} taken for the whole",
+                closure.violations.at_least()
+            );
+        }
+    }
+}
+
 /// DC-07 S2: an operation's stop keeps the memory's cause of the moment it fired, whatever
 /// the limit reads since; one its caller fired has none.
 #[test]
@@ -1133,8 +1199,14 @@ fn hidden_unnamed_classes_leave_the_rest_of_the_closure() {
                     );
                 }
                 assert_eq!(
-                    lean.violations.iter().map(|v| &v.rule).collect::<Vec<_>>(),
-                    full.violations.iter().map(|v| &v.rule).collect::<Vec<_>>(),
+                    lean.violations
+                        .iter()
+                        .map(|(rule, _)| rule)
+                        .collect::<Vec<_>>(),
+                    full.violations
+                        .iter()
+                        .map(|(rule, _)| rule)
+                        .collect::<Vec<_>>(),
                     "{} case {case}",
                     ruleset.name()
                 );
@@ -1228,8 +1300,8 @@ fn representatives_expand_to_the_replicated_closure() {
                         )
                     );
                 }
-                let rules_fired = |v: &[Violation]| -> std::collections::BTreeSet<String> {
-                    v.iter().map(|v| v.rule.clone()).collect()
+                let rules_fired = |v: &Violations| -> std::collections::BTreeSet<String> {
+                    v.iter().map(|(rule, _)| rule.to_owned()).collect()
                 };
                 assert_eq!(
                     rules_fired(&closure.violations),
@@ -1511,8 +1583,8 @@ fn guards_over_a_class_hold_where_its_members_satisfy_them() {
             .flat_map(|&f| closure.classes.expand(f))
             .collect();
         assert_eq!(expanded, expected, "{rule}");
-        let fired = |v: &[Violation]| -> std::collections::BTreeSet<String> {
-            v.iter().map(|v| v.rule.clone()).collect()
+        let fired = |v: &Violations| -> std::collections::BTreeSet<String> {
+            v.iter().map(|(rule, _)| rule.to_owned()).collect()
         };
         assert_eq!(
             fired(&closure.violations),
@@ -2042,15 +2114,19 @@ fn list_rules_follow_list_edits_under_the_delta_executor() {
             maintained.sort_unstable();
             maintained.dedup();
             assert_eq!(maintained, expected.derived, "n = {n}, {step}");
-            let reported: HashSet<&Violation> = result.violations.iter().collect();
-            let holds: HashSet<&Violation> = expected.violations.iter().collect();
+            let reported: HashSet<(&str, &[u64])> = result.violations.iter().collect();
+            let holds: HashSet<(&str, &[u64])> = expected.violations.iter().collect();
             assert!(reported.is_subset(&holds), "n = {n}, {step}: {reported:?}");
             if let Some(program) = result.program {
                 cache = program;
             }
             asserted = after;
             inferred = expected.derived;
-            let rules = result.violations.iter().map(|v| v.rule.clone()).collect();
+            let rules = result
+                .violations
+                .iter()
+                .map(|(rule, _)| rule.to_owned())
+                .collect();
             (rules, cache.consistency.len())
         };
         // c leaves the list; then `p0 sameAs c` is consistent.
@@ -2697,25 +2773,21 @@ fn delta_equals_rematerialisation_under_random_changes() {
                 removed += result.remove.len();
                 // Reported violations: all of them are violations of the new state,
                 // and every violation the old state didn't have is reported.
-                let new_state: HashSet<&Violation> = expected.violations.iter().collect();
-                let old_state: HashSet<&Violation> = before.violations.iter().collect();
-                let reported: HashSet<&Violation> = result.violations.iter().collect();
+                let new_state: HashSet<(&str, &[u64])> = expected.violations.iter().collect();
+                let old_state: HashSet<(&str, &[u64])> = before.violations.iter().collect();
+                let reported: HashSet<(&str, &[u64])> = result.violations.iter().collect();
                 assert!(
                     reported.is_subset(&new_state),
                     "{}\n{reported:?}",
                     context()
                 );
                 for violation in new_state.difference(&old_state) {
-                    let terms: Vec<&str> = violation
-                        .bindings
-                        .iter()
-                        .map(|&id| vocabulary.text(id))
-                        .collect();
+                    let (rule, bindings) = *violation;
+                    let terms: Vec<&str> = bindings.iter().map(|&id| vocabulary.text(id)).collect();
                     assert!(
                         reported.contains(violation),
-                        "{}\nunreported {} {terms:?}",
+                        "{}\nunreported {rule} {terms:?}",
                         context(),
-                        violation.rule
                     );
                 }
                 inferred = maintained;

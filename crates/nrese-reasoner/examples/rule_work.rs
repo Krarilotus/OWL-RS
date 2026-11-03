@@ -220,7 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             p.merge.as_secs_f64(),
             p.consistency.as_secs_f64(),
             result.derived.len(),
-            result.violations.len(),
+            result.violations.at_least(),
             fingerprint(&vocabulary, &result.derived)
         );
         if first.is_none() {
@@ -235,7 +235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         derived.sort_unstable();
         let mut violations = closure.violations;
         violations.sort_by(|a, b| (&a.rule, &a.bindings).cmp(&(&b.rule, &b.bindings)));
-        let same = derived == batch.derived && violations == batch.violations;
+        let same = derived == batch.derived && violations == batch.violations.to_vec();
         println!(
             "naive {:.2} s | derived {} | violations {} | {}",
             started.elapsed().as_secs_f64(),

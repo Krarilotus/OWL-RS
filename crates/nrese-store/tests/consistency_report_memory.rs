@@ -29,8 +29,12 @@ const RULES: &str = r#"
 const POOL: usize = 4 << 20;
 
 fn pipeline() -> MutationPipeline {
+    pipeline_within(POOL)
+}
+
+fn pipeline_within(pool: usize) -> MutationPipeline {
     let mut config = StoreConfig::in_memory();
-    config.total_query_memory_bytes = POOL;
+    config.total_query_memory_bytes = pool;
     let store = StoreService::new(config).expect("store");
     let rules = Arc::new(UserRules::n3("check.n3", RULES).expect("the rules compile"));
     let reasoner = ReasonerConfig::for_mode(ReasoningMode::Custom)
@@ -56,9 +60,8 @@ fn facts(n: usize) -> MutationCommand {
 fn commit(n: usize) -> (usize, String) {
     let pipeline = pipeline();
     let command = facts(n);
-    let (result, peak) = measure::measure(|| {
-        pipeline.apply(command, &Requester::all(), &MutationTicket::new())
-    });
+    let (result, peak) =
+        measure::measure(|| pipeline.apply(command, &Requester::all(), &MutationTicket::new()));
     let Err(MutationError::Rejected(reject)) = result else {
         panic!("{n} facts each: expected a rejection, got {result:?}");
     };
@@ -83,4 +86,17 @@ fn a_commit_records_its_violations_within_the_request_budget() {
          ({small} to {large}); the budget is {POOL}"
     );
     assert!(detail.contains("at least"), "{detail}");
+}
+
+/// A pool without room for the list's first entry: nothing is listed, and the commit is
+/// rejected all the same, as at least one violation and without an explanation.
+#[test]
+fn a_commit_is_rejected_when_not_one_violation_can_be_listed() {
+    let pipeline = pipeline_within(64);
+    let result = pipeline.apply(facts(1), &Requester::all(), &MutationTicket::new());
+    let Err(MutationError::Rejected(reject)) = result else {
+        panic!("expected a rejection, got {result:?}");
+    };
+    assert!(reject.detail.contains("at least 1"), "{}", reject.detail);
+    assert!(reject.explanation.is_none());
 }

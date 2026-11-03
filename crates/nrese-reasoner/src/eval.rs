@@ -19,7 +19,7 @@ use super::ir::{Atom, Guard, Head, OWL, RDF, RDFS, Rule, Term, Vocabulary};
 use super::lists::Facts;
 
 /// Driver matches per parallel work unit.
-const MORSEL: usize = 4096;
+pub(crate) const MORSEL: usize = 4096;
 
 /// Which facts an atom reads in a semi-naive variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -765,6 +765,43 @@ impl<'r> Job<'r> {
             Drivers::Collected(drivers) => drivers[range].iter().for_each(|&fact| visit(fact)),
             Drivers::InPlace(_) => source.scan_range(self.pattern, self.seg, range, &mut visit),
         }
+    }
+
+    /// [`Job::run`] that stops once `emit` returns true ([`walk_until`]): the rest of the
+    /// scans under way, the drivers' included, is passed over. Returns whether `emit`
+    /// stopped it. For the consistency check, whose report can refuse; materialisation
+    /// runs [`Job::run`], which never stops.
+    pub fn run_until<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        range: std::ops::Range<usize>,
+        emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
+    ) -> bool {
+        let mut bindings = vec![None; self.rule.variables()];
+        let driver = &self.rule.body[self.order[0].0];
+        let mut stopped = false;
+        let mut visit = |fact: Triple| {
+            if stopped {
+                return;
+            }
+            if let Some(newly) = bind(driver, fact, &mut bindings) {
+                stopped = walk_until(
+                    source,
+                    &self.rule.body,
+                    &self.rule.guards,
+                    &self.order,
+                    1,
+                    &mut bindings,
+                    emit,
+                );
+                unbind(driver, newly, &mut bindings);
+            }
+        };
+        match &self.drivers {
+            Drivers::Collected(drivers) => drivers[range].iter().for_each(|&fact| visit(fact)),
+            Drivers::InPlace(_) => source.scan_range(self.pattern, self.seg, range, &mut visit),
+        }
+        stopped
     }
 }
 

@@ -40,14 +40,19 @@ use std::borrow::Cow;
 use hashbrown::HashSet;
 use rayon::prelude::*;
 
-use super::batch::{Equality, Store, check, is_replacement_rule, sorted};
+use std::sync::Arc;
+
+use nrese_exec::Budget;
+
+use super::batch::{Equality, Store, check, is_replacement_rule};
 use super::eval::{
     AllFacts, GroundProgram, Job, NEVER, RuleKey, Schema, Seg, Source, Stop, instantiate_head,
     rule_key, run_jobs, run_jobs_acyclic, transitive_predicate,
 };
+use super::ir::Triple;
 use super::ir::{Head, Rule};
-use super::ir::{Triple, Violation};
 use super::lists::{ListVocabulary, instantiate};
+use super::violations::{Violations, unlimited};
 
 /// The materialised state: asserted facts after the change, and inferred facts before it.
 pub trait Base: Sync {
@@ -127,8 +132,9 @@ pub struct Update {
     pub insert: Vec<Triple>,
     /// Facts to remove from the inferred stack.
     pub remove: Vec<Triple>,
-    /// Consistency violations that involve a fact the change added.
-    pub violations: Vec<Violation>,
+    /// Consistency violations that involve a fact the change added, charged to the
+    /// update's budget.
+    pub violations: Violations,
     /// List axioms the change left uninstantiable (malformed, cyclic, oversized) that
     /// weren't before.
     pub diagnostics: Vec<super::lists::ListDiagnostic>,
@@ -265,6 +271,31 @@ pub fn update_with<B: Base + ?Sized>(
     stop: Stop<'_>,
     policy: policy::Policy,
 ) -> Result<Update, Interrupted> {
+    update_within(
+        base,
+        inserted,
+        deleted,
+        rules,
+        cache,
+        stop,
+        policy,
+        &unlimited(),
+    )
+}
+
+/// [`update_with`], its consistency violations charged to `memory` (the operation's own
+/// part: a refusal ends their list, never the update, and keeps the change inconsistent).
+#[allow(clippy::too_many_arguments)]
+pub fn update_within<B: Base + ?Sized>(
+    base: &B,
+    inserted: &[Triple],
+    deleted: &[Triple],
+    rules: Rules<'_>,
+    cache: Option<&GroundProgram>,
+    stop: Stop<'_>,
+    policy: policy::Policy,
+    memory: &Arc<Budget>,
+) -> Result<Update, Interrupted> {
     // The process's memory limit stops it too, whatever the caller polls; once stopped it
     // stays stopped, so no morsel skipped is taken for done.
     let stop = super::eval::OperationStop::new(stop);
@@ -276,11 +307,13 @@ pub fn update_with<B: Base + ?Sized>(
         cache,
         &|| stop.fired(),
         policy,
+        memory,
     )
     .map_err(|_| stop.interrupted())
 }
 
 /// [`update_with`]'s work, under the operation's latched `stop`.
+#[allow(clippy::too_many_arguments)]
 fn update_body<B: Base + ?Sized>(
     base: &B,
     inserted: &[Triple],
@@ -289,6 +322,7 @@ fn update_body<B: Base + ?Sized>(
     cache: Option<&GroundProgram>,
     stop: Stop<'_>,
     policy: policy::Policy,
+    memory: &Arc<Budget>,
 ) -> Result<Update, Interrupted> {
     let check_stop = || {
         if stop() {
@@ -931,16 +965,17 @@ fn update_body<B: Base + ?Sized>(
         .into_iter()
         .filter(|&(c, _)| c < settled_consistency)
         .collect();
-    let mut found = HashSet::new();
+    let mut found = Violations::new(Arc::clone(memory));
     check(
         &state,
         &program,
         settled_consistency..program.consistency.len(),
         &variants,
         &mut found,
-    );
+        stop,
+    )?;
     check_stop()?;
-    result.violations = sorted(found);
+    result.violations = found;
     lap(4, &mut result);
     result.diagnostics = program
         .list_diagnostics
