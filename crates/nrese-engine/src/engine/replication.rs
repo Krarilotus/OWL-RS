@@ -15,11 +15,10 @@
 //!
 //! Inferred statements come with the records: a replica doesn't reason.
 
-use super::{Engine, Version};
+use super::Engine;
 use crate::durability::codec::{CommitRecord, Frame, decode_frame, encode_record};
 use crate::durability::wal;
 use crate::error::{EngineError, EngineResult};
-use crate::index::Layout;
 
 /// How often [`open_segments`] lists the segments again when one moved (archived) or went
 /// (released) between listing and opening.
@@ -148,8 +147,11 @@ impl Engine {
     /// revision are skipped. Returns the revision reached. A record that doesn't follow
     /// (a gap) or whose dictionary doesn't continue this one's is refused
     /// ([`EngineError::Corruption`]): the replica starts again from an image.
+    ///
+    /// On a Rayon pool thread while the writer slot is held: [`EngineError::SlotBusy`]
+    /// (the contract of [`Engine::transaction`]).
     pub fn apply_log(&self, frames: &[u8]) -> EngineResult<u64> {
-        let _slot = self.inner.writer.lock();
+        let _slot = super::admit(&self.inner.writer, "writer")?;
         let shared = &self.inner.shared;
         let mut pos = 0;
         let mut revision = shared.versions.load().revision;
@@ -197,16 +199,6 @@ impl Engine {
                 .restore_key(record.dictionary_start + offset as u64, key)?;
         }
         let dictionary_len = shared.dictionary.len();
-        let latest = shared.versions.load();
-        let converting = latest.asserted.layout() == Layout::DefaultGraph && record.names_a_graph();
-        let _compaction = converting.then(|| shared.versions.compaction_slot.lock());
-        let converted = converting.then(|| shared.versions.load().asserted.with_quads_layout());
-        let asserted_layout = converted
-            .as_ref()
-            .map_or(latest.asserted.layout(), |index| index.layout());
-        drop(latest);
-        let [asserted_run, inferred_run] = record.runs(asserted_layout);
-        let revision = record.revision;
         // Equality classes are found again where `sameAs` statements changed.
         let same_as = *shared.equality.read();
         let changes_equality = same_as.is_some_and(|same_as| {
@@ -221,36 +213,8 @@ impl Engine {
                     .chain(&record.inferred_deletes)
                     .any(|t| t.predicate == same_as)
         });
-        let publish = move |current: &Version| {
-            let asserted = converted.as_ref().unwrap_or(&current.asserted);
-            Version {
-                content: super::Content::fresh(),
-                asserted: asserted.with_run(asserted_run),
-                inferred: current.inferred.with_run(inferred_run),
-                revision,
-                dictionary_len,
-                equality: match changes_equality {
-                    true => Default::default(),
-                    false => std::sync::Arc::clone(&current.equality),
-                },
-                canonical: Default::default(),
-            }
-        };
-        let wal_bytes = match &shared.durable {
-            Some(durable) => {
-                let mut wal = durable.wal.lock();
-                wal.append(record)?;
-                shared.versions.publish(publish);
-                wal.bytes_since_checkpoint()
-            }
-            None => {
-                shared.versions.publish(publish);
-                0
-            }
-        };
-        drop(_compaction);
-        self.inner.after_commit(wal_bytes);
-        Ok(())
+        self.inner
+            .publish_record(record, dictionary_len, changes_equality)
     }
 }
 
