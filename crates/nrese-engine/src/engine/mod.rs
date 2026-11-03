@@ -569,28 +569,44 @@ impl Shared {
 
 /// Background maintenance thread. Wakeups are coalesced; the thread exits when the engine
 /// is dropped (the sender closes), after finishing the task in progress, and the drop waits
-/// for it (on a Rayon pool thread, running that pool's jobs meanwhile).
+/// for it. Dropped on a Rayon pool thread, it starts no further task, and the drop runs that
+/// pool's jobs while a task is still in progress (see `Drop`).
 struct Worker {
     wake: Option<mpsc::SyncSender<()>>,
     thread: Option<JoinHandle<()>>,
+    /// Set by a drop on a Rayon pool thread: maintenance takes on no new task.
+    stopping: Arc<AtomicBool>,
+    shared: Arc<Shared>,
 }
 
 impl Worker {
     fn spawn(shared: Arc<Shared>) -> std::io::Result<Self> {
         let (wake, wakeups) = mpsc::sync_channel::<()>(1);
-        let thread = std::thread::Builder::new()
-            .name("nrese-maintenance".to_owned())
-            .spawn(move || {
-                while wakeups.recv().is_ok() {
-                    // Set before the requests are taken, so that one is always visible.
-                    shared.maintaining.store(true, Ordering::SeqCst);
-                    shared.maintain();
-                    shared.maintaining.store(false, Ordering::SeqCst);
-                }
-            })?;
+        let stopping = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (shared, stopping) = (Arc::clone(&shared), Arc::clone(&stopping));
+            std::thread::Builder::new()
+                .name("nrese-maintenance".to_owned())
+                .spawn(move || {
+                    while wakeups.recv().is_ok() {
+                        // Set before the requests are taken, so that one is always visible;
+                        // and before `stopping` is read: a drop that reads `maintaining`
+                        // after setting `stopping` sees this task, or this task sees it.
+                        shared.maintaining.store(true, Ordering::SeqCst);
+                        if stopping.load(Ordering::SeqCst) {
+                            shared.maintaining.store(false, Ordering::SeqCst);
+                            break;
+                        }
+                        shared.maintain();
+                        shared.maintaining.store(false, Ordering::SeqCst);
+                    }
+                })?
+        };
         Ok(Self {
             wake: Some(wake),
             thread: Some(thread),
+            stopping,
+            shared,
         })
     }
 
@@ -603,15 +619,23 @@ impl Worker {
 }
 
 impl Drop for Worker {
-    /// Ends maintenance and waits for it (IB0024). On a Rayon pool thread the wait runs that
-    /// pool's jobs meanwhile: maintenance's merges and checkpoints fork onto the global pool,
-    /// and this thread may be the one their parts wait for.
+    /// Ends maintenance and waits for it (IB0024): when the drop returns, maintenance has
+    /// ended and released the store. On a Rayon pool thread, maintenance starts no further
+    /// task (a requested compaction or checkpoint left undone: the next open recovers from
+    /// the checkpoint and the log). Only while a task is still in progress does the wait run
+    /// this pool's jobs, as any parallel operation's wait does: that task's merge or
+    /// checkpoint forks onto the global pool, and this thread may be the one its parts need.
+    /// An idle engine's drop runs none.
     fn drop(&mut self) {
+        let on_pool = rayon::current_thread_index().is_some();
+        if on_pool {
+            self.stopping.store(true, Ordering::SeqCst);
+        }
         self.wake.take();
         let Some(thread) = self.thread.take() else {
             return;
         };
-        if rayon::current_thread_index().is_some() {
+        if on_pool && self.shared.maintaining.load(Ordering::SeqCst) {
             while !thread.is_finished() {
                 if !matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
                     // Nothing of this pool's to run: maintenance is busy elsewhere.
