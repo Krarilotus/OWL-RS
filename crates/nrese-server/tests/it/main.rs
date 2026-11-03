@@ -7,6 +7,7 @@ mod access_api_tests;
 mod access_control_tests;
 mod admin_backup_api_tests;
 mod classification_api_tests;
+mod cli_output_tests;
 mod client_compat_tests;
 mod connection_tests;
 mod console_ai_api_tests;
