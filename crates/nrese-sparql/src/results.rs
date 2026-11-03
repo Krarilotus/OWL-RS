@@ -43,6 +43,11 @@ pub enum QueryEvaluationError {
         "the count is more than this engine can count exactly (at least {at_least}): a limit of this engine, not an error in the query"
     )]
     CountBeyondRange { at_least: u64 },
+    /// A table the query needs has more rows or groups than this engine's row numbers or
+    /// group ids name (joins and grouping keep them as `u32`). A limit of the engine, not
+    /// an error in the query.
+    #[error("{0}: a limit of this engine, not an error in the query")]
+    TooLarge(#[from] nrese_exec::RepresentationLimit),
     #[error("{0}")]
     Unexpected(String),
 }
