@@ -252,32 +252,40 @@ mod tests {
         );
     }
 
-    /// The decoded rows are the query's memory, whatever the body's size: rows holding more
-    /// than the budget are refused, and the refusal holds nothing of it.
+    /// The decoded rows are the query's memory, whatever the body's size and wherever its
+    /// head is: rows holding more than the budget are refused, and the refusal holds
+    /// nothing of it. Many narrow rows, and few wide ones.
     #[test]
     fn decoded_rows_are_charged_to_the_query() {
-        let rows = 1_000;
-        let bindings: Vec<String> = (0..rows)
-            .map(|i| format!(r#"{{"o":{{"type":"uri","value":"http://e/{i}"}}}}"#))
-            .collect();
-        let json = format!(
-            r#"{{"head":{{"vars":["o"]}},"results":{{"bindings":[{}]}}}}"#,
-            bindings.join(",")
-        );
-        // Room for the rows' value slots, not for the rows themselves.
-        let budget = std::sync::Arc::new(Budget::new(rows * size_of::<Option<Term>>()));
-        let mut answer = Reservation::new(std::sync::Arc::clone(&budget));
-        let refused = parse(
-            "application/sparql-results+json",
-            json.as_bytes(),
-            rows,
-            &mut answer,
-        );
-        assert!(
-            matches!(refused, Err(QueryEvaluationError::MemoryLimit(_))),
-            "{refused:?}"
-        );
-        drop(answer);
-        assert_eq!(budget.used(), 0);
+        for (width, rows) in [(1, 1_000), (1_000, 4)] {
+            let vars: Vec<String> = (0..width).map(|i| format!("\"v{i}\"")).collect();
+            let head = format!(r#""head":{{"vars":[{}]}}"#, vars.join(","));
+            let bindings: Vec<String> = (0..rows)
+                .map(|i| format!(r#"{{"v0":{{"type":"uri","value":"http://e/{i}"}}}}"#))
+                .collect();
+            let results = format!(r#""results":{{"bindings":[{}]}}"#, bindings.join(","));
+            // Room for the rows' value slots, not for the rows themselves.
+            let room = width * rows * size_of::<Option<Term>>();
+            for json in [
+                format!("{{{head},{results}}}"),
+                format!("{{{results},{head}}}"),
+            ] {
+                let budget = std::sync::Arc::new(Budget::new(room));
+                let mut answer = Reservation::new(std::sync::Arc::clone(&budget));
+                let refused = parse(
+                    "application/sparql-results+json",
+                    json.as_bytes(),
+                    rows,
+                    &mut answer,
+                );
+                assert!(
+                    matches!(refused, Err(QueryEvaluationError::MemoryLimit(_))),
+                    "{width} × {rows}, {}: {refused:?}",
+                    &json[..10]
+                );
+                drop(answer);
+                assert_eq!(budget.used(), 0);
+            }
+        }
     }
 }
