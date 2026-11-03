@@ -22,7 +22,7 @@
 //! stays where it was interned ([`Dictionary::adopt_pending`]).
 
 use hashbrown::HashTable;
-use nrese_exec::{Budget, BudgetExceeded, ChargedVec};
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use nrese_rdf::{
     BaseDirection, BlankNode, GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, Quad,
     QuadRef, Term, TermRef,
@@ -1258,8 +1258,15 @@ impl Dictionary {
 
     /// The text order of the entries `0..len` as checkpoint indices: the mapped base's
     /// order merged with that of the others, from the in-memory order where it covers them,
-    /// else sorted here (and not kept: the checkpoint's base takes them over).
-    pub(crate) fn text_order(&self, len: u64) -> Vec<u32> {
+    /// else sorted here (and not kept: the checkpoint's base takes them over). What it
+    /// allocates for them is charged to `budget` first ([`super::order::sorted_within`]),
+    /// the order with its capacity; refused, it fails with [`EngineError::MemoryLimit`],
+    /// having freed what it made before releasing its charge.
+    pub(crate) fn text_order<'b>(
+        &self,
+        len: u64,
+        budget: &'b Budget,
+    ) -> EngineResult<ChargedVec<u32, &'b Budget>> {
         let inner = self.inner.read();
         let key = |index: u64| inner.key(index);
         let text = |index: u64| super::order::text_in(key(index));
@@ -1269,14 +1276,23 @@ impl Dictionary {
                 None => (&[], 0),
             };
         let order = self.order.read();
+        // The others: the kept order where it covers them, else sorted. Declared before
+        // the sorted order, its reservation is released after it is freed.
+        let _sorted_held: Reservation<&Budget>;
         let sorted: Vec<u32>;
-        let rest: Box<dyn Iterator<Item = u64>> =
-            if order.first == first && order.covered >= len.max(first) {
-                Box::new(order.order.iter().copied().filter(|&i| i < len))
-            } else {
-                sorted = super::order::sorted(first.min(len)..len, &key);
-                Box::new(sorted.iter().map(|&i| u64::from(i)))
-            };
+        let kept: &[u64];
+        if order.first == first && order.covered >= len.max(first) {
+            (kept, sorted, _sorted_held) = (&order.order, Vec::new(), Reservation::new(budget));
+        } else {
+            kept = &[];
+            (sorted, _sorted_held) =
+                super::order::sorted_within(first.min(len)..len, &key, budget)?;
+        }
+        let rest = kept
+            .iter()
+            .copied()
+            .filter(|&i| i < len)
+            .chain(sorted.iter().map(|&i| u64::from(i)));
         // Merged straight from both orders: no copies of them.
         let capacity = base.len() + len.saturating_sub(first) as usize;
         let mut base = base
@@ -1285,18 +1301,33 @@ impl Dictionary {
             .filter(|&i| i < len)
             .peekable();
         let mut rest = rest.peekable();
-        let mut merged = Vec::with_capacity(capacity);
-        loop {
-            let next = match (base.peek(), rest.peek()) {
-                (Some(&b), Some(&r)) if (text(b), b) <= (text(r), r) => base.next(),
-                (Some(_), Some(_)) => rest.next(),
-                (Some(_), None) => base.next(),
-                (None, Some(_)) => rest.next(),
-                (None, None) => break,
-            };
-            merged.push(next.expect("peeked") as u32);
-        }
-        merged
+        // The base's next entry, decoded once where its keys are compressed, into room
+        // charged first. The others' keys are in place: they follow the base (`first` is
+        // its length), and a base without an order is never compressed (format < 7).
+        let mut decoded = ChargedVec::new(budget);
+        let mut merged = ChargedVec::with_capacity(budget, capacity)?;
+        merged.fill(capacity, |room| -> Result<(), BudgetExceeded> {
+            // Compared while both have entries; then the rest of either follows unread.
+            while let (Some(&b), Some(_)) = (base.peek(), rest.peek()) {
+                let b_text = super::order::text_of(inner.key_within(b, &mut decoded)?);
+                let b_text = b_text.unwrap_or_default();
+                // The others before it; equal texts: the base's (lower) index first.
+                while let Some(&r) = rest.peek() {
+                    if (b_text, b) <= (&*text(r), r) {
+                        break;
+                    }
+                    room.push(r as u32);
+                    rest.next();
+                }
+                room.push(b as u32);
+                base.next();
+            }
+            base.for_each(|b| room.push(b as u32));
+            rest.for_each(|r| room.push(r as u32));
+            Ok(())
+        })??;
+        drop(decoded);
+        Ok(merged)
     }
 
     /// Decodes an id back into a term. Returns `None` for ids that do not belong to this
