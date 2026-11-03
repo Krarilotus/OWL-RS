@@ -153,6 +153,40 @@ fn a_rotation_that_fails_before_its_segment_is_placed_leaves_the_log_usable() {
     assert_eq!(contents(&engine), [quad(1), quad(2)].into_iter().collect());
 }
 
+/// The bytes a torn tail's cut removes are kept under a durable name before the cut (sol-loop
+/// r2 S3): an open whose `wal-cut/` can't be synced after the copy is placed fails, the log
+/// uncut; so does the next open while that sync still fails, though it finds the copy
+/// already there (it must sync it before cutting). Once the sync works, the open cuts.
+#[test]
+fn a_cut_waits_for_its_copy_to_be_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        commit(&engine, 1).unwrap();
+        commit(&engine, 2).unwrap();
+    }
+    let (_, segment) = super::wal::list_segments(&super::wal::wal_dir(dir.path()))
+        .unwrap()
+        .pop()
+        .unwrap();
+    let full = std::fs::read(&segment).unwrap();
+    // Record 2 cut short: a torn tail.
+    let torn = &full[..full.len() - 10];
+    std::fs::write(&segment, torn).unwrap();
+    fault::FAIL_CUT_DIR_SYNC.set(true);
+    let first = Engine::open(dir.path(), config()).err();
+    let again = Engine::open(dir.path(), config()).err();
+    fault::FAIL_CUT_DIR_SYNC.set(false);
+    assert!(first.is_some(), "opened with the copy's name not synced");
+    assert!(
+        again.is_some(),
+        "opened again with the found copy's name not synced"
+    );
+    assert_eq!(std::fs::read(&segment).unwrap(), torn, "the log uncut");
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(contents(&engine), [quad(1)].into_iter().collect());
+}
+
 /// A rotation that fails once its new segment is in place under its name (its directory
 /// not synced) takes no more commits before a reopen: records appended to the old segment
 /// would sit behind a later-named one, which replication and segment release read as
