@@ -109,6 +109,19 @@ pub(crate) fn canonical(quads: BTreeSet<Quad>) -> BTreeSet<Quad> {
     quads.into_iter().map(|q| renamed(q, &names)).collect()
 }
 
+/// [`canonical_until`] was stopped before it finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stopped;
+
+/// The quads with their blank nodes renamed canonically, or [`Stopped`] once `stop` returns
+/// true. Not implemented yet (the tests' commit): it never stops.
+pub fn canonical_until(
+    quads: BTreeSet<Quad>,
+    _stop: &dyn Fn() -> bool,
+) -> Result<BTreeSet<Quad>, Stopped> {
+    Ok(canonical(quads))
+}
+
 /// Whether `term` is a blank node or a triple term holding one.
 fn holds_blank_node(term: &Term) -> bool {
     match term {
@@ -812,6 +825,38 @@ mod tests {
         let (n, _) = LEAVES.with(std::cell::Cell::get);
         LEAVES.with(|cell| cell.set((0, usize::MAX)));
         (result, n)
+    }
+
+    /// A cycle of `n` blank nodes on one predicate: every node looks alike, so refinement
+    /// can't tell them apart and the search individualises.
+    fn cycle(n: usize) -> BTreeSet<Quad> {
+        (0..n)
+            .map(|i| quad(&format!("n{i}"), "p", &format!("n{}", (i + 1) % n)))
+            .collect()
+    }
+
+    /// `canonical_until`'s contract: a stop that has already said so ends it before any
+    /// result, and a stop that says so part way ends it at its next poll, not later.
+    #[test]
+    fn a_stop_ends_the_canonicalisation_at_its_next_poll() {
+        assert_eq!(canonical_until(cycle(6), &|| true), Err(Stopped));
+        let polls = std::cell::Cell::new(0);
+        let third = || {
+            polls.set(polls.get() + 1);
+            polls.get() >= 3
+        };
+        assert_eq!(canonical_until(cycle(6), &third), Err(Stopped));
+        assert_eq!(polls.get(), 3, "no poll after the one that stopped it");
+    }
+
+    /// Never stopped, it names blank nodes as `canonical` does: isomorphic inputs, one form.
+    #[test]
+    fn never_stopped_it_is_the_canonical_form() {
+        let a = canonical_until(cycle(6), &|| false).expect("never stopped");
+        let b = canonical_until(renamed(&cycle(6), |n| format!("y{n}")), &|| false)
+            .expect("never stopped");
+        assert_eq!(a, b);
+        assert_eq!(a, canonical(cycle(6)));
     }
 
     #[test]
