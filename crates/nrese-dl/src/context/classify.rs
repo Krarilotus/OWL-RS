@@ -111,6 +111,10 @@ pub struct Saturated {
     top: ContextId,
     /// The individuals' contexts and the clauses on their edges found no clash.
     assertions_consistent: bool,
+    /// What the ontology's reading and normalisation left out (an ontology-taking
+    /// saturation knows; [`saturate_normalised`] alone doesn't): no model of the rest
+    /// says anything of the whole then.
+    left_out: Vec<String>,
     profile: Profile,
 }
 
@@ -167,6 +171,7 @@ pub fn saturate_with_workers(
     let classes = signature(ontology);
     let mut saturated = saturate_normalised(&normalised, &classes, options, cancel, workers)?;
     saturated.profile.normalise = normalise;
+    saturated.left_out = crate::tableau::left_out(ontology, &normalised);
     Ok(saturated)
 }
 
@@ -261,6 +266,7 @@ pub fn saturate_normalised(
         query,
         top,
         assertions_consistent,
+        left_out: Vec::new(),
         profile,
     })
 }
@@ -303,6 +309,8 @@ impl Saturated {
         let names = &self.engine.program.names;
         let consistency = if !self.consistent() {
             Verdict::Inconsistent
+        } else if !self.left_out.is_empty() {
+            Verdict::Unknown(format!("unsupported: {}", self.left_out.join("; ")))
         } else if self.complete() {
             Verdict::Consistent
         } else {
