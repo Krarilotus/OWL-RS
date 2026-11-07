@@ -97,7 +97,7 @@ PREFIX luc: <http://www.ontotext.com/owlim/lucene#>
 SELECT ?x ?score WHERE { ?x luc:myIndex "tower bridge" ; luc:score ?score }
 ```
 
-`text:query`'s subject is `?s` or a list of `?s`, the score, the matched literal (then its graph and property, unbound); its object is the query string or a list of an optional property, the query string, an optional limit on the matched literals and `"lang:xx"`. Without a property, a literal matches as the object of any property. `luc:` takes any index name (there is one index, over every string literal) and finds the resources with a matching literal. Query strings are read as Lucene's syntax as far as this index goes: words, phrases, `word*`, fuzzy `word~` and `word~1`, `AND` (every word needed, else any), `NOT` and `-` (the word is excluded; a phrase after them is dropped); `OR`, `+`, field names and boosts (`^`) are dropped. Scores are the relevance above, not Lucene's.
+`text:query`'s subject is `?s` or a list of `?s`, the score, the matched literal (then its graph and property, unbound); its object is the query string or a list of an optional property, the query string, an optional limit on the matched literals (counted among the objects of the property, if one is given) and `"lang:xx"`. Without a property, a literal matches as the object of any property. `luc:` takes any index name (there is one index, over every string literal) and finds the resources with a matching literal. Query strings are read as Lucene's syntax as far as this index goes: words, phrases, `word*`, fuzzy `word~` and `word~1`, `AND` (every word needed, else any), `NOT` and `-` (the word is excluded; a phrase after them is dropped); `OR`, `+`, field names and boosts (`^`) are dropped. Scores are the relevance above, not Lucene's.
 
 **Vector similarity search** through a virtual `SERVICE`: the vectors are literals of the datatype `nrv:vector` (`"[0.12, -0.5, 0.33]"^^nrv:vector`, numbers as in a JSON array; what embedding services return), and the search finds the nearest ones:
 
@@ -114,12 +114,12 @@ SELECT ?doc ?score WHERE {
 | Predicate | Object |
 |---|---|
 | `nrv:near` | the query vector: a vector literal, or a variable the rest of the query binds to one (`?other ex:embedding ?q`: a search per value) |
-| `nrv:k` | how many nearest vectors per query vector (default 10, at most 10,000) |
+| `nrv:k` | how many nearest vectors per query vector (default 10; 1 to 10,000, else a client error) |
 | `nrv:score` | a variable: the cosine similarity or dot product (`xsd:double`), or the Euclidean distance with `nrv:metric "l2"` |
 | `nrv:rank` | a variable: the rank, from 1 |
 | `nrv:metric` | `"cosine"` (the default), `"dot"` or `"l2"` |
 | `nrv:exact true` | compare every vector |
-| `nrv:searchBudget` | the graph search's beam (default 64): wider finds more of the true nearest, slower |
+| `nrv:searchBudget` | the graph search's beam (default 64; 1 to 1,000,000, else a client error): wider finds more of the true nearest, slower |
 
 The subject is the matched vector literal; only literals the query's dataset uses as objects are found, so a user finds no vector of a graph it may not read. The search returns the `k` nearest vectors that satisfy the patterns joined to it (`?doc ex:embedding ?v` with other conditions on `?doc`). Where those patterns are estimated to bind few rows, they go first and the search is among their values: an exact scan when they are few (under 2% of the vectors of that dimension), the graph with that filter otherwise. Where they bind many, the search goes first, its beam widened by the share of the vectors they are estimated to bind (as for a filter the graph applies itself), and each hit, nearest first, is checked against them through the indexes until `k` pass (100,000 vectors of 384 dimensions: 0.24 ms a query through the graph, recall@10 0.94; 1.3 ms exact). Vectors of each dimension are indexed in memory at the first search and extended with new literals at later ones; up to 20,000 of a dimension are compared exactly, beyond that through an HNSW graph per metric. The graph is built at the first search that needs it, at once up to 50,000 vectors and on a thread of its own beyond (searches scan exactly until it is there); vectors added later are scanned exactly until they pass a tenth of the graph, which is then extended on a thread. A durable store keeps the vectors and graphs in `derived/` (written after each checkpoint), so a restart doesn't rebuild them. Wrong options are client errors that name the option.
 

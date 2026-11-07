@@ -1842,20 +1842,28 @@ impl Snapshot {
 
     /// The vector literals this snapshot's dictionary holds that are nearest to
     /// `query.vector`, among those `accept` takes, nearest first, with how the search went
-    /// (whether statements still use them is the caller's to check, in `accept`).
-    pub fn vector_search(
+    /// (whether statements still use them is the caller's to check, in `accept`). What the
+    /// search holds, the hits included, is charged to `budget` before it is allocated: a
+    /// search the budget has no room for is refused, with nothing left charged.
+    pub fn vector_search<'b>(
         &self,
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
-    ) -> (Vec<(TermId, f32)>, crate::VectorSearchReport) {
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<VectorHits<'b>, nrese_exec::BudgetExceeded> {
         let (hits, report) =
             self.dictionary
-                .vector_search(query, self.version.dictionary_len, accept);
-        let hits = hits
-            .into_iter()
-            .map(|hit| (TermId::from_raw(hit.id), hit.distance))
-            .collect();
-        (hits, report)
+                .vector_search(query, self.version.dictionary_len, accept, budget)?;
+        let len = hits.len();
+        let (hits, held) = hits.into_parts();
+        let found = nrese_exec::ChargedVec::collect(
+            budget,
+            len,
+            hits.into_iter()
+                .map(|hit| (TermId::from_raw(hit.id), hit.distance)),
+        );
+        drop(held);
+        Ok((found?, report))
     }
 
     /// Builds the graph searches like `query` use, covering every vector of its
@@ -1964,6 +1972,13 @@ where
         }
     }
 }
+
+/// A vector search's hits, nearest first, charged to the budget it was given, and how the
+/// search went ([`Snapshot::vector_search`]).
+pub type VectorHits<'b> = (
+    nrese_exec::ChargedVec<(TermId, f32), &'b nrese_exec::Budget>,
+    crate::VectorSearchReport,
+);
 
 #[cfg(test)]
 mod canonical_lifetime_tests {
