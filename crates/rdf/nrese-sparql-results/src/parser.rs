@@ -48,8 +48,10 @@ impl QueryResultsParser {
     ) -> Result<SliceQueryResultsParserOutput<'_>, QueryResultsSyntaxError> {
         let inner = match self.format {
             QueryResultsFormat::Json => {
+                // The head first, wherever it is: bindings before it stream too.
+                let head = json::slice_head(bytes).map_err(syntax_only)?;
                 let events = SliceJsonParser::from_bytes(bytes)?;
-                match JsonSolutions::start(events).map_err(syntax_only)? {
+                match JsonSolutions::start(events, head).map_err(syntax_only)? {
                     (json::Start::Boolean(value), _) => {
                         return Ok(SliceQueryResultsParserOutput::Boolean(value));
                     }
@@ -94,7 +96,7 @@ impl QueryResultsParser {
     ) -> Result<ReaderQueryResultsParserOutput<R>, QueryResultsParseError> {
         let inner = match self.format {
             QueryResultsFormat::Json => {
-                match JsonSolutions::start(ReaderJsonParser::new(reader))? {
+                match JsonSolutions::start(ReaderJsonParser::new(reader), None)? {
                     (json::Start::Boolean(value), _) => {
                         return Ok(ReaderQueryResultsParserOutput::Boolean(value));
                     }
@@ -183,16 +185,8 @@ impl SliceSolutionsParser<'_> {
                 let Some(text) = tsv::next_slice_line(bytes, at) else {
                     return Ok(None);
                 };
-                let text = text?;
                 *line += 1;
-                // A last line with nothing on it is the file's final line break.
-                if text.trim_end_matches('\r').is_empty()
-                    && *at >= bytes.len()
-                    && !variables.is_empty()
-                {
-                    return Ok(None);
-                }
-                tsv::parse_row(text, variables.len(), *line - 1).map(Some)
+                tsv::parse_row(text?, variables.len(), *line - 1).map(Some)
             }
         }
     }
@@ -273,20 +267,7 @@ impl<R: Read> ReaderSolutionsParser<R> {
                     return Ok(None);
                 }
                 *line += 1;
-                let text = buffer.trim_end_matches(['\r', '\n']);
-                if text.is_empty() && !variables.is_empty() {
-                    // Only a final line break may be empty: check that nothing follows.
-                    let mut rest = String::new();
-                    if tsv::next_reader_line(reader, &mut rest)? {
-                        return Err(QueryResultsSyntaxError::msg(format!(
-                            "an empty line {} in TSV results",
-                            *line
-                        ))
-                        .into());
-                    }
-                    return Ok(None);
-                }
-                Ok(Some(tsv::parse_row(text, variables.len(), *line - 1)?))
+                Ok(Some(tsv::parse_row(buffer, variables.len(), *line - 1)?))
             }
         }
     }

@@ -270,6 +270,8 @@ impl Rule {
 /// A fact: subject, predicate and object ids.
 pub type Triple = [u64; 3];
 
+pub use super::violations::Violations;
+
 /// A consistency rule that fired: its name and the bindings of its variables.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Violation {

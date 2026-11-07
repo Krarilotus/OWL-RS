@@ -219,7 +219,9 @@ fn actual(root: &Path, test: &Test, file: &[Triple]) -> Result<Graph, Refusal> {
         &snapshot,
         &shapes,
         Selection::of(GraphSelector::Exact(TermId::DEFAULT_GRAPH)),
-    );
+        &nrese_sparql::Resources::default(),
+    )
+    .map_err(|error| Refusal::Processor(format!("validation stopped: {error}")))?;
     if !report.failures.is_empty() {
         return Err(Refusal::Processor(format!(
             "validation failed: {}",

@@ -191,7 +191,7 @@ pub fn run_draft_check(
     memory_limit: Option<usize>,
 ) -> DraftOutcome {
     let checked = match operation {
-        DraftOperation::Shacl => check_shacl(inputs, limits),
+        DraftOperation::Shacl => check_shacl(inputs, limits, cancellation),
         DraftOperation::Query => check_query(inputs, limits, cancellation, memory_limit),
         DraftOperation::Reasoning => check_reasoning(inputs, limits, cancellation),
     };
@@ -248,7 +248,11 @@ fn store_with(graphs: &[Option<&str>], limits: &DraftLimits) -> Result<StoreServ
     Ok(store)
 }
 
-fn check_shacl(inputs: &DraftInputs, limits: &DraftLimits) -> Checked {
+fn check_shacl(
+    inputs: &DraftInputs,
+    limits: &DraftLimits,
+    cancellation: &CancellationToken,
+) -> Checked {
     let shapes = inputs
         .shapes
         .as_deref()
@@ -281,7 +285,7 @@ fn check_shacl(inputs: &DraftInputs, limits: &DraftLimits) -> Checked {
     };
     let ShaclValidation {
         report, applicable, ..
-    } = match store.validate_shacl(&ReadScope::All, &request) {
+    } = match store.validate_shacl(&ReadScope::All, &request, cancellation) {
         Ok(validation) => validation,
         Err(StoreError::ShaclShapes(problems)) => {
             return Err(failed(format!(
@@ -289,7 +293,12 @@ fn check_shacl(inputs: &DraftInputs, limits: &DraftLimits) -> Checked {
                 problems.join("; ")
             )));
         }
-        Err(error) => return Err(failed(format!("SHACL validation failed: {error}"))),
+        Err(error) => {
+            return Err(cancelled_or(
+                cancellation,
+                format!("SHACL validation failed: {error}"),
+            ));
+        }
     };
     if !report.failures.is_empty() {
         return Err(failed(format!(

@@ -40,8 +40,83 @@ from suitekit import gatestats  # noqa: E402
 HARNESS = "h" * 40
 REVS = {"cand": "c" * 40, "base": "b" * 40, "main": "m" * 40}
 SIDES = ("base", "main", "cand")
-MACHINE = {"host": "phuoc-yu", "cpu": "Ryzen", "governor": "performance"}
+MACHINE = {"host": "phuoc-yu", "cpu": "Ryzen", "governor": "performance", "fleet_host": "phuoc-yu"}
 CONTEXT = {"host": "phuoc-yu", "round": 0, "prefix": "rg-cccccccc", "max_gb": 24.0, "ram_gb": 24.0}
+
+
+def remove_checkout(tree, repo=ROOT) -> subprocess.CompletedProcess:
+    """A checkout a test made, removed by its path alone (never a `prune`). With core.longpaths: a
+    job's temp root on a Windows host can put the repository's deepest files past 260 characters,
+    where git without it can't delete them (khaleesi's Windows tier, 2 Nov 2026: "Filename too long";
+    other platforms ignore the setting)."""
+    return subprocess.run(["git", "-c", "core.longpaths=true", "worktree", "remove", "--force", Path(tree).as_posix()],
+                          cwd=repo, capture_output=True, text=True)
+
+
+def remove_checkouts_under(root, repo=ROOT) -> list[str]:
+    """Every checkout registered under `root`, a test's own temporary directory, removed by its path
+    (remove_checkout()); those that stayed, with git's reason. Never a `git worktree prune`: in the
+    repository the suite runs in it drops any registration whose directory this process can't see,
+    other agents' live checkouts among them (rule.delete-only-what-you-created; 2 Nov 2026)."""
+    listed = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=repo, capture_output=True, text=True)
+    base = Path(root).resolve()
+    left = []
+    for line in listed.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        tree = Path(line[len("worktree "):]).resolve()
+        if tree == base or base in tree.parents:
+            removed = remove_checkout(tree, repo)
+            if removed.returncode:
+                left.append(f"{tree}: {removed.stderr.strip()}")
+    return left
+
+
+class Checkouts(unittest.TestCase):
+    def test_a_test_s_checkout_past_the_windows_path_limit_is_removed(self):
+        """khaleesi's Windows tier, 2 Nov 2026: a test's harness checkout under the job's deep temp
+        root stayed registered ("Filename too long"), failing the test that made it."""
+        if os.name != "nt":
+            self.skipTest("the 260-character limit is Windows'")
+        with tempfile.TemporaryDirectory() as tmp:
+            git = lambda *a, cwd=tmp: subprocess.run(["git", "-c", "core.longpaths=true", *a], cwd=cwd,  # noqa: E731
+                                                       capture_output=True, text=True, check=True)
+            repo = Path(tmp, "r")
+            repo.mkdir()
+            git("init", "-q", cwd=repo)
+            deep = Path(*(["d" * 40] * 6), "f.txt")  # 250 characters inside the checkout
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base", cwd=repo)
+            tree = Path(tmp, "w" * 30)
+            git("worktree", "add", "-q", tree.as_posix(), cwd=repo)
+            (tree / deep).parent.mkdir(parents=True)
+            (tree / deep).write_text("x", encoding="utf-8")
+            git("add", "-A", cwd=tree)
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "deep", cwd=tree)
+            self.assertGreater(len(str((tree / deep).resolve())), 260)
+            removed = remove_checkout(tree, repo)
+            self.assertEqual(removed.returncode, 0, removed.stderr)
+            self.assertFalse(tree.exists())
+
+    def test_a_test_removes_only_its_own_checkouts_never_prunes(self):
+        """Orchestrator, 2 Nov 2026 (rule.delete-only-what-you-created): three tests ran `git worktree
+        prune` in the repository the suite runs in, which drops every registration whose directory
+        this process can't see, another agent's live checkout among them. A test removes the
+        checkouts under its own temporary directory, by path, and nothing else."""
+        with tempfile.TemporaryDirectory() as tmp:
+            git = lambda *a, cwd=tmp: subprocess.run(["git", *a], cwd=cwd, capture_output=True, text=True,  # noqa: E731
+                                                       check=True).stdout
+            repo = Path(tmp, "r")
+            repo.mkdir()
+            git("init", "-q", cwd=repo)
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base", cwd=repo)
+            own, other = Path(tmp, "own"), Path(tmp, "elsewhere")
+            git("worktree", "add", "-q", "--detach", (own / "gate" / "src-1").as_posix(), cwd=repo)
+            git("worktree", "add", "-q", "--detach", (other / "src-2").as_posix(), cwd=repo)
+            shutil.rmtree(other)  # another space's checkout: registered, its directory not visible here
+            self.assertEqual(remove_checkouts_under(own, repo), [])
+            listed = git("worktree", "list", "--porcelain", cwd=repo)
+            self.assertNotIn("src-1", listed)
+            self.assertIn("src-2", listed, "another's registration was dropped")
 
 
 def observation(samples, peak=500, cgroup=900, estimator="samples", rows=None, phases=None, anon=None):
@@ -286,6 +361,167 @@ class Rounds(unittest.TestCase):
         self.assertIsNone(gate_module.confirm_job([clean], "C:/repo"))
         self.assertTrue(gate_module.verdict([clean], self.W3C, self.GUARDS)[0])
 
+    def test_two_parts_on_one_host_are_not_rounds_of_each_other(self):
+        """Placed by capability, the timed and the big part may land on one host: grouped by host,
+        the big part's round 0 read as a confirmation of the timed part's (and its losses as
+        confirmed). A part is its prefix; a confirmation keeps its part's."""
+        timed, big = self.round_(1.0), run_gate(passes(slower(1.0)), context={**CONTEXT, "prefix": "rg-cccccccc-big"})
+        confirm = run_gate(passes(slower(1.0)), context={**CONTEXT, "round": 1})
+        parts = gate_module.rounds_of([timed, big, confirm])
+        self.assertEqual(sorted(len(rounds) for rounds in parts), [1, 2])
+        self.assertEqual([r["context"]["prefix"] for r in max(parts, key=len)], ["rg-cccccccc", "rg-cccccccc"])
+
+    def test_a_confirmation_runs_where_its_first_round_ran_and_says_why(self):
+        """Its pin is the gate's one genuine locality (its builds, its floor, its rounds combined);
+        a report naming no host gives no confirmation job, never one on a host named in code."""
+        first = self.round_(1.08)
+        with patch.object(gate_module, "checkout_rev", lambda checkout, cand, harness: harness):
+            job = gate_module.confirm_job([first], "C:/repo")
+            self.assertEqual((job["requires"]["hosts"], job["requires"]["roles"]), (["phuoc-yu"], ["measure", "build"]))
+            self.assertIn("first round", job["pin_reason"])
+            hostless = run_gate(passes(slower(1.08)), context={**CONTEXT, "host": ""})
+            with self.assertRaises(SystemExit):
+                gate_module.confirm_job([hostless], "C:/repo")
+
+    def test_a_part_s_passes_must_come_from_the_host_its_report_names(self):
+        """Review r1 R1-F1: a timed part judged its passes by its report's host (its floor) without
+        checking that they ran there; the fleet may move a timed job between steps."""
+        def ran_on(host):
+            out = passes(slower(1.0))
+            for p in out:
+                p["report"]["machine"] = {**MACHINE, "fleet_host": host} if host else \
+                    {k: v for k, v in MACHINE.items() if k != "fleet_host"}
+            return out
+        self.assertEqual(run_gate(ran_on("phuoc-yu"))["errors"], [])
+        moved = run_gate(ran_on("office-pc"))["errors"]
+        self.assertTrue(any("passes ran on office-pc, not on phuoc-yu" in e for e in moved), moved)
+        unsaid = run_gate(ran_on(None))["errors"]
+        self.assertTrue(any("don't say which fleet host ran them" in e for e in unsaid), unsaid)
+        # A report naming no host (a run outside a fleet job) holds them to none.
+        self.assertEqual(run_gate(ran_on(None), context={**CONTEXT, "host": ""})["errors"], [])
+
+    def test_a_part_asks_for_the_data_its_cases_read(self):
+        """The fleet places by `has` only what the job can't make: the verified bench assets (frozen
+        datasets, ORE ontologies, reference taxonomies). What benches/sparql/prepare.sh makes is the
+        job's own (Johannes, 2 Nov 2026: "Data is the job's responsibility, not the fleet's"): no
+        capability, but the disk to make it in, its source and its file."""
+        need = gate_module.data_needs
+        self.assertEqual(need([{"data": "social people=1000"}]), [])
+        self.assertEqual(need([{"data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}]), ["owlrs-bench-assets"])
+        self.assertEqual(need([{"data": "ore:ore_ont_9724"}]), ["owlrs-bench-assets"])
+        self.assertEqual(need([{"data": "el classes=10", "reference": "/fast/ref/x.tax"}]), ["owlrs-bench-assets"])
+        self.assertEqual(need([{"data": "volume:bsbm-100m.nt"}]), [])
+        self.assertEqual(need([{"data": "volume:watdiv-10m.nt", "queries": "@watdiv-10m"}]), [])
+        self.assertEqual(need([{"data": "concat:volume:lubm-1.nt+social people=10"}]), ["owlrs-bench-assets"])
+        frozen = next(d for d in __import__("tomllib").loads((ROOT / "benches/datasets.toml").read_text(encoding="utf-8"))["dataset"]
+                      if d["file"] == "bsbm-100m.nt")
+        self.assertEqual(gate_module.data_disk_gb([{"data": "volume:bsbm-100m.nt"}]), -(-2 * frozen["bytes"] // 10 ** 9))
+        self.assertEqual(gate_module.data_disk_gb([{"data": "volume:lubm-10.nt"}]), 0)
+
+    def test_the_data_probe_says_what_a_host_holds_and_what_it_cannot_make(self):
+        """The probe (release_gate.py data; release-gate.sh prepare with --make): a file in the cache
+        at its frozen size is held, at another size it differs, absent it is missing with its maker;
+        a missing WatDiv query set can't be made again (a clock-seeded generator), only copied."""
+        frozen = {d["file"]: d for d in __import__("tomllib").loads(
+            (ROOT / "benches/datasets.toml").read_text(encoding="utf-8"))["dataset"]}
+        with tempfile.TemporaryDirectory() as cache:
+            (Path(cache) / "watdiv-10m.nt").write_bytes(b"x" * 10)
+            with patch.dict(os.environ, {"SPARQL_DATA": cache}), \
+                    patch.object(gate_module.hosts_registry, "input_path", return_value=None):
+                lines, ok = gate_module.data_state([{"data": "volume:watdiv-10m.nt", "queries": "@watdiv-10m"},
+                                                    {"data": "volume:bsbm-100m.nt"}])
+        self.assertFalse(ok)
+        text = "\n".join(lines)
+        self.assertIn(f"DIFFERS watdiv-10m.nt: {Path(cache) / 'watdiv-10m.nt'} is 10 bytes, frozen "
+                      f"{frozen['watdiv-10m.nt']['bytes']}", text)
+        self.assertIn("MISSING bsbm-100m.nt: made by `bash benches/sparql/prepare.sh bsbm-100m`", text)
+        self.assertIn("MISSING query set watdiv-10m", text)
+        self.assertIn("can't be made again", text)
+        # A concatenation's parts are inputs too (Sol r2 T2: "no frozen inputs" where both were absent).
+        with tempfile.TemporaryDirectory() as cache, patch.dict(os.environ, {"SPARQL_DATA": cache}), \
+                patch.object(gate_module.hosts_registry, "input_path", return_value=None):
+            lines, ok = gate_module.data_state([{"data": "concat:volume:univ-bench.nt+volume:lubm-1.nt"}])
+        self.assertFalse(ok)
+        self.assertEqual(sorted(line.split(":")[0] for line in lines), ["MISSING lubm-1.nt", "MISSING univ-bench.nt"])
+
+    def test_a_query_set_is_held_only_as_pinned_by_name_and_digest(self):
+        """Review r1 R1-F2 (DATA_PINS): `data --make` said "held" for 56 files of the right count and
+        wrong contents. A set is held only with exactly its pinned names, each with its SHA-256
+        (benches/sparql/queries.sha256): wrong contents, other names, and a bench-inputs revision
+        that delivers another set all fail, and the cache keeps what it had; the right revision's
+        set is taken (the orchestrator's decision (b), 2 Nov 2026: a git input of the job, read by
+        `git archive`). The CLI exits nonzero on a failure, and release-gate.sh prepare stops on it."""
+        right = {"C1-1.rq": b"SELECT * { ?s ?p ?o }\n", "L1-1.rq": b"SELECT ?s { ?s ?p 1 }\n",
+                 "S1-1.rq": b"ASK { ?s ?p ?o }\n"}
+        wrong = {name: body + b"# not the pinned one\n" for name, body in right.items()}
+        renamed = {f"X{name}": body for name, body in right.items()}
+        sha = lambda body: __import__("hashlib").sha256(body).hexdigest()  # noqa: E731
+        case = [{"data": "none", "queries": "@watdiv-10m"}]
+
+        def write(directory, files):
+            directory.mkdir(parents=True, exist_ok=True)
+            for name, body in files.items():
+                (directory / name).write_bytes(body)
+
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as repo:
+            root, repo = Path(root), Path(repo)
+            (root / "benches/sparql").mkdir(parents=True)
+            (root / "benches/sparql/queries.sha256").write_text(
+                "".join(f"{sha(body)}  watdiv-10m/{name}\n" for name, body in right.items()), encoding="utf-8")
+            git = lambda *a: __import__("subprocess").run(["git", "-C", str(repo), *a], capture_output=True,  # noqa: E731
+                                                          text=True, check=True).stdout.strip()
+            git("init", "-q")
+            revs = {}
+            for label, files in (("wrong", wrong), ("right", right)):
+                for old in (repo / "queries" / "watdiv-10m").glob("*.rq"):
+                    old.unlink()
+                write(repo / "queries" / "watdiv-10m", files)
+                git("add", "-A")
+                git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", label)
+                revs[label] = git("rev-parse", "HEAD")
+
+            def state(cached, make=False, rev=""):
+                with tempfile.TemporaryDirectory() as cache:
+                    if cached is not None:
+                        write(Path(cache) / "queries" / "watdiv-10m", cached)
+                    with patch.dict(os.environ, {"SPARQL_DATA": cache, "BENCH_INPUTS_REV": rev}), \
+                            patch.object(gate_module.hosts_registry, "input_path", return_value=None):
+                        lines, ok = gate_module.data_state(case, make=make, root=root, inputs_repo=repo)
+                    held = {p.name: p.read_bytes() for p in (Path(cache) / "queries" / "watdiv-10m").glob("*.rq")}
+                return lines, ok, held
+
+            lines, ok, _ = state(right)
+            self.assertTrue(ok, lines)
+            for what, cached, why in (("same count, wrong contents", wrong, "differ from their SHA-256 pins"),
+                                      ("same count, other names", renamed, "pinned files missing"),
+                                      ("absent", None, "no ")):
+                with self.subTest(what):
+                    lines, ok, held = state(cached)
+                    self.assertFalse(ok, lines)
+                    self.assertIn(why, "\n".join(lines))
+            # The revision with the wrong set: refused, the cache as it was; the right one: taken.
+            lines, ok, held = state(wrong, make=True, rev=revs["wrong"])
+            self.assertFalse(ok, lines)
+            self.assertIn("aren't its pins", "\n".join(lines))
+            self.assertEqual(held, wrong)
+            lines, ok, held = state(wrong, make=True, rev=revs["right"])
+            self.assertTrue(ok, lines)
+            self.assertEqual(held, right)
+            # The probe never takes a set; an unknown revision is a failure, not a pass.
+            self.assertEqual(state(None, rev=revs["right"])[2], {})
+            self.assertFalse(state(None, make=True, rev="0" * 40)[1])
+            # The CLI's exit says it (release-gate.sh prepare stops on a nonzero one).
+            with tempfile.TemporaryDirectory() as cache:
+                write(Path(cache) / "queries" / "watdiv-10m", wrong)
+                with patch.dict(os.environ, {"SPARQL_DATA": cache, "BENCH_INPUTS_REV": "0" * 40}), \
+                        patch.object(gate_module.hosts_registry, "input_path", return_value=None), \
+                        patch.object(gate_module, "ROOT", root), \
+                        patch.object(gate_module.cases_registry, "load", return_value=[{"name": "q", **case[0]}]), \
+                        patch.object(sys, "argv", ["release_gate.py", "data", "--cases", "q", "--make"]), \
+                        patch.object(sys.stdout, "reconfigure", lambda **kw: None, create=True), \
+                        patch("builtins.print"):
+                    self.assertEqual(gate_module.main(), 1)
+
 
 class Verdicts(unittest.TestCase):
     def test_the_candidate_failing_a_case_blocks_and_a_baseline_failing_is_reported(self):
@@ -529,7 +765,7 @@ class Parts(unittest.TestCase):
         self.assertIn("its cap is 28 GB", not_run["bsbm-bi-100m"])
         run, not_run, elsewhere = gate_module.plan(catalog, 24, big_gb=28)
         self.assertEqual((run, sorted(not_run)), (["small"], ["huge"]))
-        self.assertIn("timed on khaleesi-wsl", elsewhere["bsbm-bi-100m"])
+        self.assertIn("timed in the big part", elsewhere["bsbm-bi-100m"])  # a part, never a host's name
         run, not_run, elsewhere = gate_module.plan(catalog, 28, min_gb=24)  # the big host's share
         self.assertEqual(run, ["bsbm-bi-100m"])
 
@@ -565,11 +801,35 @@ class Parts(unittest.TestCase):
             counts["OWL 2 RL"]["skipped"] = 89
             self.assertIn("OWL 2 RL: 89 skipped, at most 3 known", gate_module.w3c_check(counts, expected))
 
-    def test_the_jobs_run_the_whole_gate_in_blocks_on_its_hosts(self):
+    def test_the_jobs_run_the_whole_gate_in_blocks_asking_by_capability_one_set(self):
+        """The brief of 2 Nov 2026: the gate asks by capability, never a host, and goes as one set.
+        Each timed part builds every side where it times them (its own first step: no binaries
+        staged between hosts, which WSL hosts refuse), holding that host alone from there."""
         found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None)
         timed, checks = found["rg-test-timed"], found["rg-test-checks"]
-        self.assertEqual((timed["kind"], timed["class"], timed["after"]), ("owlrs.timed", "exclusive", ["rg-test-build"]))
-        self.assertEqual(checks["requires"]["hosts"], ["office-pc"])
+        self.assertEqual((timed["kind"], timed["class"]), ("owlrs.timed", "exclusive"))
+        for job in found.values():
+            self.assertNotIn("hosts", job["requires"], job["id"])
+            self.assertNotIn("after", job, job["id"])
+        self.assertEqual((timed["requires"]["roles"], timed["requires"]["os"]), (["measure", "build"], "linux"))
+        self.assertEqual(checks["requires"]["roles"], ["test"])
+        # The first step builds every side and prepares the data; no step is untimed, so a part starts
+        # only where it can time and keeps that host (planner held_between_steps; Sol r1 S1).
+        self.assertNotIn("untimed_steps", timed)
+        self.assertIn("release-gate.sh build", timed["steps"][0][2])
+        self.assertIn("release-gate.sh prepare", timed["steps"][0][2])
+        self.assertEqual(timed["steps"][0][4], "c" * 40)  # the harness, then the revisions
+        self.assertEqual([s[2] for s in timed["steps"][1:]], ["block"] * 3 + ["report", "clean"])
+        # No step asks less memory than the blocks: placed by a smaller ask, the builds could land on
+        # a host the blocks don't fit, whose hold then ends without them (Sol r2 S1).
+        for job in (timed, found["rg-test-big"]):
+            asks = [n.get("ram_gb", job["requires"]["ram_gb"]) for n in job.get("step_needs", [])]
+            self.assertTrue(all(a >= job["requires"]["ram_gb"] for a in asks), job["id"])
+        import tomllib
+        whole = tomllib.loads(gate_module.toml_set({"id": "rg-test", "fail": "continue"}, list(found.values())))
+        self.assertEqual((whole["set"]["id"], [j["id"] for j in whole["job"]]), ("rg-test", list(found)))
+        self.assertEqual(whole["job"][0]["steps"], timed["steps"])
+        self.assertNotIn("_plan", whole["job"][0])  # the planner's own figures stay out of the job
         blocks_ = [s for s in timed["steps"] if s[2] == "block"]
         self.assertEqual([s[3] for s in blocks_], ["1", "2", "3"])  # 2 asked: one whole square of three sides
         self.assertEqual(blocks_[0][2:], ["block", "1", "c" * 40, "1", "-", f"base={gate_module.BASE}",
@@ -582,14 +842,47 @@ class Parts(unittest.TestCase):
         self.assertEqual(tomllib.loads(gate_module.toml_job(timed))["steps"], timed["steps"])
 
     def test_the_big_cases_run_on_a_linux_host_never_native_windows(self):
-        """Round 8: the big job went to khaleesi, native Windows, with the build's ELF binaries."""
+        """Round 8: the big job went to khaleesi, native Windows, with the build's ELF binaries. It
+        asks for Linux and the memory of its cases, and builds its own binaries there."""
         found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None)
         big = found["rg-test-big"]
-        self.assertEqual(big["requires"]["hosts"], ["khaleesi-wsl"])
-        self.assertEqual([s[2] for s in big["steps"][:2]], ["unpack", "prepare"])
-        self.assertIn({"name": "binaries", "source": {"artifact": "rg-test-build/binaries"}}, big["inputs"])
-        with self.assertRaises(SystemExit):
-            gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None, big_host="khaleesi")
+        self.assertEqual((big["requires"]["os"], big["requires"]["ram_gb"]), ("linux", 32))
+        self.assertIn("release-gate.sh build", big["steps"][0][2])
+        self.assertNotIn("untimed_steps", big)
+        # Its own gate directory: on the timed part's host it would overwrite that part's plan (Sol r1 S3).
+        self.assertNotEqual(big["env"]["GATE_NAME"], found["rg-test-timed"]["env"]["GATE_NAME"])
+        self.assertFalse([i for i in big["inputs"] if "artifact" in i["source"]])
+        self.assertEqual(big["env"]["GATE_MIN_GB"], "24")
+        # The private input repository is a git input of a part whose cases read a WatDiv query set,
+        # and of no other (the orchestrator's decision (b), 2 Nov 2026).
+        with tempfile.TemporaryDirectory() as repo:
+            run = lambda *a: __import__("subprocess").run(["git", "-C", repo, *a], capture_output=True,  # noqa: E731
+                                                          text=True, check=True)
+            run("init", "-q")
+            run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "inputs")
+            head = run("rev-parse", "HEAD").stdout.strip()
+            with patch.dict(os.environ, {"BENCH_INPUTS_GIT": repo}):
+                watdiv = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "watdiv-10m", checks=False)
+                other = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "lab-olympics", checks=False)
+        self.assertIn({"name": "BENCH_INPUTS", "source": {"git": Path(repo).as_posix(), "rev": head}},
+                      watdiv["rg-test-timed"]["inputs"])
+        self.assertNotIn("BENCH_INPUTS", [i["name"] for i in other["rg-test-timed"]["inputs"]])
+        # Only the first git input is checked out: the job is told the commit to take the sets from.
+        self.assertEqual(watdiv["rg-test-timed"]["env"]["BENCH_INPUTS_REV"], head)
+        self.assertNotIn("BENCH_INPUTS_REV", other["rg-test-timed"]["env"])
+        # Review r1 R1-F3 (GATE_DIRECTORIES): two requests at one candidate, and the timed part and
+        # the checks, all named gate-v2-CAND8, one mutable gate directory on a shared host. Each
+        # request's each part has its own; the same request gives the same names (its resume).
+        with patch.dict(os.environ, {"BENCH_INPUTS_GIT": str(ROOT / "no-such-inputs")}):
+            first = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "review-first", 3, "lab-olympics")
+            second = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "review-second", 3, "kernel-intersect")
+            again = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "review-first", 3, "lab-olympics")
+        names = [job["env"]["GATE_NAME"] for job in [*first.values(), *second.values()]]
+        self.assertEqual(len(names), len(set(names)), names)
+        self.assertEqual([j["env"]["GATE_NAME"] for j in first.values()], [j["env"]["GATE_NAME"] for j in again.values()])
+        # A selection with no case above the timed part's memory has no big part.
+        small = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "lab-olympics")
+        self.assertEqual(sorted(small), ["rg-test-checks", "rg-test-timed"])
         # And the step itself: on another system than Linux, unpack refuses.
         import shutil
         import subprocess
@@ -607,10 +900,11 @@ class Parts(unittest.TestCase):
             done = subprocess.run([bash, "-c", f'PATH="$(cygpath -u "{shim}" 2>/dev/null || echo "{shim}"):$PATH" '
                                    f'exec bash scripts/release-gate.sh unpack'], cwd=ROOT, env=env,
                                   capture_output=True, text=True, encoding="utf-8")
-        # The gate's own checkout (of this checkout's commit) was under the scratch directory.
-        subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
+            # The gate's own checkout (of this checkout's commit), if it made one, is under tmp.
+            left = remove_checkouts_under(tmp)
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertIn("is not Linux", done.stdout)
+        self.assertEqual(left, [], "a checkout this test made stayed registered")
 
     def test_a_block_of_two_sides_is_complete_with_its_four_reports(self):
         """20 Oct 2026: release-gate.sh block counted six reports a block whatever the sides, so an
@@ -660,10 +954,9 @@ echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
                                  f'exec bash scripts/release-gate.sh block 3 {head} 1 - a={head} a2={head} b={head}'],
                                 cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8")
             reports = len(list(Path(tmp).glob("out/passes/pass-*.json"))) - 4  # block 2's: base and cand
-            for tree in Path(t, "gate", "run").glob(f"space-*/src-{head[:8]}"):  # the harness's checkout
-                subprocess.run(["git", "worktree", "remove", "--force", tree.as_posix()], cwd=ROOT, capture_output=True)
-        subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
+            left = remove_checkouts_under(tmp)  # the harness's checkout, by its path alone
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(left, [], "a checkout this test made stayed registered")
         self.assertIn("block 2: done", done.stdout)
         self.assertIn("main is the same build as another side", done.stdout)  # timed once, as base
         self.assertEqual((aa.returncode, reports), (0, 6), aa.stdout + aa.stderr)  # a, a2, b: twice each
@@ -725,12 +1018,7 @@ point {head} "$b"
             # The harness's checkout this run made, removed by its path alone: never a `prune`, which
             # takes any registration whose directory this process space can't see, another space's
             # live checkout among them (release-gate.sh's drop_checkout; Sol, PR #64 r1 F2).
-            left = []
-            for tree in Path(t, "gate", "run").glob(f"space-*/src-{head[:8]}"):
-                removed = subprocess.run(["git", "worktree", "remove", "--force", tree.as_posix()], cwd=ROOT,
-                                         capture_output=True, text=True)
-                if removed.returncode:
-                    left.append(f"{tree}: {removed.stderr.strip()}")
+            left = remove_checkouts_under(tmp)
         self.assertNotEqual(done.returncode, 0, f"SPEC frozen inputs: prepare went on\n{done.stdout}{done.stderr}")
         self.assertIn("NOT the freeze support-stress/copies-17.nq.commits.ru", done.stdout + done.stderr)
         self.assertEqual((linked, prepared), ([], False),
@@ -774,9 +1062,19 @@ point {head} "$b"
 
             def checkout_of(candidate):
                 found = gate_module.jobs(candidate, harness, tmp, "rg-test", 2, None, base=root, main=root,
-                                         checks=False, big_host=None)
-                return found["rg-test-build"]["inputs"][0]["source"]["rev"]
+                                         checks=False, big_gb=None)
+                return found["rg-test-timed"]["inputs"][0]["source"]["rev"]
             self.assertEqual((checkout_of(rebased), checkout_of(root)), (rebased, harness))
+            # A side the checkout's history doesn't hold is a git input of its own (Sol r1 S4);
+            # one it holds isn't. The bench-inputs repository is the job's input where it exists and
+            # a case reads a WatDiv set (the full catalogue does), absent otherwise (review r1 N1:
+            # the test found this PC's repository and failed elsewhere's contract).
+            for inputs_repo, extra in ((str(Path(tmp) / "no-such-inputs"), []), (tmp, ["BENCH_INPUTS"])):
+                with patch.dict(os.environ, {"BENCH_INPUTS_GIT": inputs_repo}):
+                    found = gate_module.jobs(rebased, harness, tmp, "rg-test", 2, None, base=diverged, main=root,
+                                             checks=False, big_gb=None)
+                names = [i["name"] for i in found["rg-test-timed"]["inputs"]]
+                self.assertEqual(names, ["checkout", f"side-{diverged[:8]}", *extra])
             with self.assertRaises(SystemExit) as refused:
                 checkout_of(diverged)
             self.assertIn("contains the other", str(refused.exception))
@@ -1063,7 +1361,9 @@ class Measurement(unittest.TestCase):
         self.assertEqual(gate_module.blocks(["a", "b", "c"], measure, square=3),
                          [["a", "b", "c"]] * 3 + [["b"]] * 3)
         timed = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None, measure=measure)["rg-test-timed"]
-        self.assertEqual(timed["steps"][0][2:], ["plan-blocks", "c" * 40])
+        planned = [i for i, s in enumerate(timed["steps"]) if s[2:] == ["plan-blocks", "c" * 40]]
+        self.assertEqual(planned, [1])  # after the builds, before the first block
+        self.assertEqual(timed["steps"][2][2], "block")
         self.assertEqual([s[6] for s in timed["steps"] if s[2] == "block"], [f"plan-block-{k}.json" for k in range(1, 7)])
         self.assertEqual((timed["env"]["GATE_SQUARE"], timed["env"]["GATE_MIN_BLOCKS"]), ("3", "3"))
         two = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None, measure=measure,
@@ -1590,6 +1890,58 @@ find "$b" -maxdepth 2 -exec touch -d "$4" {} +'''
                 self.assertEqual(Path(repository).resolve(), Path(self.repo).resolve(),
                                  f"SPEC the jobs' repository is the launching checkout: {file.name}")
 
+    def test_the_report_reads_its_own_jobs_plan_not_the_gate_directory_s(self):
+        """Review r1 R1-F3: `release-gate.sh report` read $GATE/plan.json and inputs.txt, which another
+        request's preparation on the same host could have replaced; the report then judged its passes
+        against another family. It reads the copies its own job's prepare left in its results ($OUT);
+        a confirmation, which prepares nothing (GATE_PLAN), reads its part's."""
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("needs bash")
+        loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
+        tmp = self.gate_beside(loop)
+        head = self.git("rev-parse", "HEAD")
+        args_file = tmp / "report-args.txt"
+        (tmp / "shim").mkdir()
+        (tmp / "shim" / "python3").write_text(f"""#!/usr/bin/env bash
+case " $* " in *" benches/fast/release_gate.py report "*)
+  printf '%s\\n' "$@" > "{args_file.as_posix()}"; echo '{{}}' > "$FLEET_OUT/release-gate.json"; exit 0 ;; esac
+exec "{Path(sys.executable).as_posix()}" "$@"
+""", encoding="utf-8", newline="\n")
+        (tmp / "shim" / "python3").chmod(0o755)
+
+        def report(name: str, extra: dict) -> list[str]:
+            env = self.gate_env(tmp, name)
+            gate, out = Path(env["NRESE_GATE_DIR"]), Path(env["FLEET_OUT"])
+            gate.mkdir(parents=True, exist_ok=True)
+            out.mkdir(parents=True, exist_ok=True)
+            # The gate directory: another request's plan; the job's results: its own.
+            for where, label in ((gate, "another"), (out, "its-own")):
+                (where / "plan.json").write_text(json.dumps(
+                    {"run": [label], "not_run": {f"{label}-not": "why"}, "elsewhere": {}, "family": []}), encoding="utf-8")
+                (where / "inputs.txt").write_text(f"{label} inputs\n", encoding="utf-8")
+            (gate / "plan-confirm1.json").write_text(json.dumps(
+                {"run": ["confirm"], "not_run": {"confirm-not": "why"}, "elsewhere": {}}), encoding="utf-8")
+            args_file.unlink(missing_ok=True)
+            done = subprocess.run([bash, "scripts/release-gate.sh", "report", head, f"cand={head}", f"base={head}"],
+                                  cwd=self.repo, env={**env, **extra}, capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            return args_file.read_text(encoding="utf-8").splitlines()
+
+        def value(args: list[str], flag: str) -> str:
+            return args[args.index(flag) + 1]
+
+        own = report("own", {})
+        out = Path(self.gate_env(tmp, "own")["FLEET_OUT"])
+        self.assertEqual(Path(value(own, "--family")), out / "plan.json")
+        self.assertEqual(Path(value(own, "--inputs")), out / "inputs.txt")
+        self.assertIn("its-own-not=why", own)
+        self.assertNotIn("another-not=why", own)
+        confirm = report("confirm", {"GATE_PLAN": "plan-confirm1.json"})
+        gate = Path(self.gate_env(tmp, "confirm")["NRESE_GATE_DIR"])
+        self.assertEqual(Path(value(confirm, "--family")), gate / "plan.json")
+        self.assertIn("confirm-not=why", confirm)
+
     def test_callers_at_once_share_no_code_checkout(self):
         """Sol, PR #60 fix check 3 (R3): the code checkout, shared under the launching commit's name,
         had no owner: of two `jobs` started at once on one gate directory, one met the other's
@@ -1994,8 +2346,8 @@ make bin-after 'profile release --locked' '3 days ago'
                              {"IDENTITY", "BUILD.txt", "SHA256SUMS"}, "SPEC: the record stays")
             self.assertEqual(clean(), {"bin-unused": "released", "bin-live": "kept-live"})
             self.assertTrue(Path(tmp, "out", "patch-keyed-builds.tsv").is_file())
-        # The gate's own checkout (of this checkout's commit) was under the scratch directory.
-        subprocess.run(["git", "worktree", "prune"], cwd=ROOT, capture_output=True)
+            # The gate's own checkout (of this checkout's commit), if it made one, is under tmp.
+            self.assertEqual(remove_checkouts_under(tmp), [], "a checkout this test made stayed registered")
 
     def test_a_patch_keyed_build_is_never_a_verified_build(self):
         """Sol r1 S2: a gate's pointer or an archive from before T0 could hand a block a build of
