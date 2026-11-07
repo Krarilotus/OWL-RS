@@ -45,8 +45,9 @@ const PRODUCT: &str = "(?s rdfs:p ?o), (?x rdfs:q ?y), (?u rdfs:q ?v)";
 /// Once an update's stop fires, the evaluation under way ends within `POLL_UNITS` scanned
 /// facts plus the scans open on its stack (one per body atom below the driver), and the
 /// update is `Interrupted`. Each row's work is a product the base would scan in full:
-/// a round's join, the consistency check through the new fact, and DRed's search for a
-/// rederivation that fails (N10 review r1, F2).
+/// a round's join, the consistency check through the new fact (one that reports every
+/// binding, and one whose guard rejects them all), and DRed's search for a rederivation
+/// that fails (N10 review r1, F2).
 #[test]
 fn an_evaluation_stops_within_its_poll_interval() {
     struct Row {
@@ -86,8 +87,22 @@ fn an_evaluation_stops_within_its_poll_interval() {
         Row {
             what: "the consistency check",
             rules: format!("clash: {PRODUCT} -> false"),
-            asserted: product,
+            asserted: product.clone(),
             inserted: "ex:a rdfs:p ex:b",
+            deleted: "",
+            open: 2 * n,
+            whole: n * n,
+        },
+        // A check whose bindings all fail its guard (checked once all are bound): it binds
+        // the product and reports nothing, so a poll counted per firing never comes.
+        Row {
+            what: "a consistency check that never fires",
+            rules: format!("clash: {PRODUCT}, ?o != rdfs:b -> false"),
+            asserted: product
+                .iter()
+                .map(|line| line.replace("ex:a rdfs:p ex:b", "ex:a rdfs:p rdfs:b"))
+                .collect(),
+            inserted: "ex:a rdfs:p rdfs:b",
             deleted: "",
             open: 2 * n,
             whole: n * n,
