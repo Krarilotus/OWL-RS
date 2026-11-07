@@ -54,7 +54,7 @@ fn a_stopped_derivation_check_allocates_nothing() {
         },
     );
     assert_eq!(
-        ground.producers(fact).len(),
+        ground.unpolled().producers(fact).len(),
         n,
         "a producer per subproperty"
     );

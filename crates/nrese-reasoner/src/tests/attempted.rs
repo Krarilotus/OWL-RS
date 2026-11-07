@@ -107,7 +107,7 @@ fn empty_support_searches_count_towards_the_stop() {
     let mut vocabulary = LocalVocabulary::default();
     let (closure, ground, fact) = empty_producers(&mut vocabulary, n, "", "");
     assert_eq!(
-        ground.producers(fact).len(),
+        ground.unpolled().producers(fact).len(),
         n,
         "a producer per subproperty"
     );
@@ -288,7 +288,10 @@ fn each_premise_alternative_counts_towards_the_stop() {
     let ground = crate::delta::program(&MemoryBase::new(&facts, &inferred), compiled);
     let fact = load(&mut vocabulary, "ex:C rdfs:comment ex:C")[0];
     assert_eq!(
-        ground.premise_alternatives(Grounding::Bodiless(fact)).len(),
+        ground
+            .unpolled()
+            .premise_alternatives(Grounding::Bodiless(fact))
+            .len(),
         n,
         "an alternative per subclass axiom"
     );
