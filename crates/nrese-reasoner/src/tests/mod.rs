@@ -2357,6 +2357,7 @@ fn check_supports(
                     .iter()
                     .flat_map(|&f| {
                         ground
+                            .unpolled()
                             .named_derivations(&store, f, 20)
                             .into_iter()
                             .map(move |d| (f, d))

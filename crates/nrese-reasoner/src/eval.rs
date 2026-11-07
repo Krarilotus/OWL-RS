@@ -10,6 +10,7 @@
 //!   run in parallel morsels; the other atoms are index lookups ordered by [`plan`].
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 
 use hashbrown::HashSet;
 use rayon::prelude::*;
@@ -1397,6 +1398,89 @@ impl Dispatch {
     }
 }
 
+/// A ground program's enumerations without a poller ([`GroundProgram::unpolled`]): for work
+/// that runs to its end, explanations and tests. During an operation that has a stop they
+/// are read through [`GroundProgram::for_each_alternative`] and
+/// [`GroundProgram::for_each_producer`], which count each one.
+pub struct Unpolled<'a>(&'a GroundProgram);
+
+impl<'a> Unpolled<'a> {
+    /// Every set of schema facts `grounding` was grounded on (the first, then the others).
+    pub fn premise_alternatives(&self, grounding: Grounding) -> Vec<&'a [Triple]> {
+        self.0.alternatives(grounding).collect()
+    }
+
+    /// The rules (indexes into `rules`) whose head can give `fact`, each once.
+    pub fn producers(&self, fact: Triple) -> Vec<usize> {
+        self.0.producer_list(fact)
+    }
+
+    /// [`GroundProgram::named_derivations`] run to its end (`limit` bounds the bodies).
+    pub fn named_derivations<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        fact: Triple,
+        limit: usize,
+    ) -> Vec<(String, Vec<Triple>)> {
+        self.0
+            .named_derivations(source, fact, limit, &mut Poller::never())
+    }
+
+    /// [`Self::named_derivations`] with every set of schema facts each ground rule (and
+    /// transitivity) was grounded on, not only the first: the derivations a justification
+    /// enumeration needs (a bodiless instance's are [`Self::premise_alternatives`]). At most
+    /// `limit`.
+    pub fn every_named_derivation<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        fact: Triple,
+        limit: usize,
+    ) -> Vec<(String, Vec<Triple>)> {
+        let program = self.0;
+        let transitive = program
+            .transitive
+            .contains(&fact[1])
+            .then(|| transitivity(fact[1]));
+        let rules = self
+            .producers(fact)
+            .into_iter()
+            .map(|r| (&program.rules[r], Grounding::Rule(r)))
+            .chain(
+                transitive
+                    .as_ref()
+                    .map(|rule| (rule, Grounding::Transitive(fact[1]))),
+            );
+        let mut bodies = Vec::new();
+        let mut poll = Poller::never();
+        for (rule, grounding) in rules {
+            let alternatives = self.premise_alternatives(grounding);
+            derivations(source, rule, fact, Seg::All, &mut poll, &mut |bindings| {
+                let body: Vec<Triple> = rule
+                    .body
+                    .iter()
+                    .map(|atom| instantiate_head(atom, bindings))
+                    .collect();
+                for premises in &alternatives {
+                    let mut full = body.clone();
+                    full.extend_from_slice(premises);
+                    bodies.push((rule.name.clone(), full));
+                }
+                bodies.len() >= limit
+            });
+            if bodies.len() >= limit {
+                break;
+            }
+        }
+        bodies
+    }
+
+    /// Whether `fact` has a one-step derivation from the facts of `source` (`Seg::All`):
+    /// a bodiless instance, a rule whose head matches it, or transitivity.
+    pub fn derivable<S: Source + ?Sized>(&self, source: &S, fact: Triple) -> bool {
+        self.0.derivable_with(source, fact, true, NEVER)
+    }
+}
+
 /// A ground program: the rule instances with a body (indexed by [`Dispatch`]), the
 /// transitive predicates (closed by a module instead of joins), the facts of bodiless
 /// instances, and the ground consistency rules.
@@ -1531,17 +1615,61 @@ impl GroundProgram {
         }
     }
 
-    /// Every set of schema facts `grounding` was grounded on (the first, then the others).
-    pub fn premise_alternatives(&self, grounding: Grounding) -> Vec<&[Triple]> {
-        self.premise_alternatives_iter(grounding).collect()
-    }
-
-    /// [`Self::premise_alternatives`], enumerated as they are read: a caller that counts
-    /// each as attempted work copies none before its first ([`Poller::attempt`]).
-    pub fn premise_alternatives_iter(
+    /// Visits every set of schema facts `grounding` was grounded on (the first, then the
+    /// others), each a unit of attempted work on `poll`, counted before `body` reads it; `body`
+    /// gets the poller back for its own work. `Some` with what `body` broke with; `None` once
+    /// every alternative was visited, or `poll` stopped ([`Poller::stopped`] says which).
+    ///
+    /// The one way to enumerate them during an operation that has a stop: a read that no
+    /// poller counts can't be written (REAS review r1, sol-loop r6/r7). Explanations, which
+    /// run to their end, read them through [`Self::unpolled`].
+    pub fn for_each_alternative<'p, B>(
         &self,
         grounding: Grounding,
-    ) -> impl Iterator<Item = &[Triple]> + '_ {
+        poll: &mut Poller<'p>,
+        mut body: impl FnMut(&[Triple], &mut Poller<'p>) -> ControlFlow<B>,
+    ) -> Option<B> {
+        for premises in self.alternatives(grounding) {
+            if poll.attempt(1) {
+                return None;
+            }
+            if let ControlFlow::Break(out) = body(premises, poll) {
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    /// Visits each rule (by index) whose head can give `fact`, once each, as
+    /// [`Self::for_each_alternative`] visits alternatives: the enumeration itself is a unit,
+    /// so a stopped poller lists none, and so is each producer.
+    pub fn for_each_producer<'p, B>(
+        &self,
+        fact: Triple,
+        poll: &mut Poller<'p>,
+        mut body: impl FnMut(usize, &mut Poller<'p>) -> ControlFlow<B>,
+    ) -> Option<B> {
+        if poll.attempt(1) {
+            return None;
+        }
+        for r in self.producer_list(fact) {
+            if poll.attempt(1) {
+                return None;
+            }
+            if let ControlFlow::Break(out) = body(r, poll) {
+                return Some(out);
+            }
+        }
+        None
+    }
+
+    /// Reads that no stop bounds, for work that runs to its end (explanations) and tests.
+    pub fn unpolled(&self) -> Unpolled<'_> {
+        Unpolled(self)
+    }
+
+    /// The alternatives, enumerated as they are read.
+    fn alternatives(&self, grounding: Grounding) -> impl Iterator<Item = &[Triple]> + '_ {
         let first: &[Triple] = match grounding {
             Grounding::Rule(r) => &self.premises[r],
             Grounding::Bodiless(fact) => self.bodiless_premises(fact),
@@ -1732,67 +1860,42 @@ impl GroundProgram {
     }
 
     /// The bodies of one-step derivations of `fact` over `source`: a bodiless instance's
-    /// schema facts first ([`Self::bodiless_bodies`]), then up to `limit` by rules whose
-    /// head matches it and transitivity (instantiated premises, plus the schema facts the
-    /// instance was grounded on).
+    /// schema facts first, then up to `limit` by rules whose head matches it and
+    /// transitivity (instantiated premises, plus the schema facts the instance was grounded
+    /// on). Each alternative, producer and search is attempted work on `poll` (DRed's
+    /// proofs run under the update's stop); stopped, the bodies found are incomplete.
     pub fn derivation_bodies<S: Source + ?Sized>(
         &self,
         source: &S,
         fact: Triple,
         limit: usize,
+        poll: &mut Poller<'_>,
     ) -> Vec<Vec<Triple>> {
-        self.bodiless_bodies(fact)
-            .into_iter()
-            .map(<[Triple]>::to_vec)
-            .chain(
-                self.named_derivations(source, fact, limit)
-                    .into_iter()
-                    .map(|(_, body)| body),
-            )
-            .collect()
-    }
-
-    /// The schema facts a bodiless instance of `fact` was grounded on, in each of its
-    /// alternatives (none if `fact` is no bodiless fact): each is a one-step derivation of
-    /// it, as a rule instance's body is.
-    fn bodiless_bodies(&self, fact: Triple) -> Vec<&[Triple]> {
+        let mut bodies: Vec<Vec<Triple>> = Vec::new();
         if self.bodiless.contains(&fact) {
-            self.premise_alternatives(Grounding::Bodiless(fact))
-        } else {
-            Vec::new()
+            self.for_each_alternative(Grounding::Bodiless(fact), poll, |premises, _| {
+                bodies.push(premises.to_vec());
+                ControlFlow::<()>::Continue(())
+            });
         }
+        let named = self.named_derivations(source, fact, limit, poll);
+        bodies.extend(named.into_iter().map(|(_, body)| body));
+        bodies
     }
 
-    /// [`Self::derivation_bodies`], each with the name of the rule it instantiates
-    /// (`prp-trp` for transitivity): what explanations show.
+    /// [`Self::derivation_bodies`] by rules, each with the name of the rule it instantiates
+    /// (`prp-trp` for transitivity): what explanations show. Counted on `poll` as
+    /// [`Self::derivation_bodies`] is; explanations read it through [`Self::unpolled`].
     pub fn named_derivations<S: Source + ?Sized>(
         &self,
         source: &S,
         fact: Triple,
         limit: usize,
+        poll: &mut Poller<'_>,
     ) -> Vec<(String, Vec<Triple>)> {
-        let mut producers = Vec::new();
-        self.heads.matching_fact(fact, &mut producers);
-        producers.sort_unstable();
-        producers.dedup_by_key(|(r, _)| *r);
-        let transitive = self
-            .transitive
-            .contains(&fact[1])
-            .then(|| transitivity(fact[1]));
-        let none: &[Triple] = &[];
-        let transitive_premises = self
-            .transitive_premises
-            .get(&fact[1])
-            .map_or(none, Vec::as_slice);
-        let rules = producers
-            .into_iter()
-            .map(|(r, _)| (&self.rules[r], self.premises[r].as_slice()))
-            .chain(transitive.as_ref().map(|rule| (rule, transitive_premises)));
         let mut bodies = Vec::new();
-        // Explanations run to their end (`limit` bounds the bodies found).
-        let mut poll = Poller::never();
-        for (rule, premises) in rules {
-            derivations(source, rule, fact, Seg::All, &mut poll, &mut |bindings| {
+        let mut search = |rule: &Rule, premises: &[Triple], poll: &mut Poller<'_>| {
+            derivations(source, rule, fact, Seg::All, poll, &mut |bindings| {
                 let mut body: Vec<Triple> = rule
                     .body
                     .iter()
@@ -1802,71 +1905,28 @@ impl GroundProgram {
                 bodies.push((rule.name.clone(), body));
                 bodies.len() >= limit
             });
-            if bodies.len() >= limit {
-                break;
+            bodies.len() >= limit
+        };
+        let full = self.for_each_producer(fact, poll, |r, poll| {
+            match search(&self.rules[r], &self.premises[r], poll) {
+                true => ControlFlow::Break(()),
+                false => ControlFlow::Continue(()),
             }
-        }
-        bodies
-    }
-
-    /// [`Self::named_derivations`] with every set of schema facts each ground rule (and
-    /// transitivity) was grounded on, not only the first: the derivations a justification
-    /// enumeration needs (a bodiless instance's are [`Self::premise_alternatives`]). At most
-    /// `limit`.
-    pub fn every_named_derivation<S: Source + ?Sized>(
-        &self,
-        source: &S,
-        fact: Triple,
-        limit: usize,
-    ) -> Vec<(String, Vec<Triple>)> {
-        let mut producers = Vec::new();
-        self.heads.matching_fact(fact, &mut producers);
-        producers.sort_unstable();
-        producers.dedup_by_key(|(r, _)| *r);
-        let transitive = self
-            .transitive
-            .contains(&fact[1])
-            .then(|| transitivity(fact[1]));
-        let rules = producers
-            .into_iter()
-            .map(|(r, _)| (&self.rules[r], Grounding::Rule(r)))
-            .chain(
-                transitive
-                    .as_ref()
-                    .map(|rule| (rule, Grounding::Transitive(fact[1]))),
+        });
+        if full.is_none() && self.transitive.contains(&fact[1]) && !poll.attempt(1) {
+            search(
+                &transitivity(fact[1]),
+                self.transitive_premises(fact[1]),
+                poll,
             );
-        let mut bodies = Vec::new();
-        let mut poll = Poller::never();
-        for (rule, grounding) in rules {
-            let alternatives = self.premise_alternatives(grounding);
-            derivations(source, rule, fact, Seg::All, &mut poll, &mut |bindings| {
-                let body: Vec<Triple> = rule
-                    .body
-                    .iter()
-                    .map(|atom| instantiate_head(atom, bindings))
-                    .collect();
-                for premises in &alternatives {
-                    let mut full = body.clone();
-                    full.extend_from_slice(premises);
-                    bodies.push((rule.name.clone(), full));
-                }
-                bodies.len() >= limit
-            });
-            if bodies.len() >= limit {
-                break;
-            }
         }
         bodies
     }
 
-    /// Whether `fact` has a one-step derivation from the facts of `source` (`Seg::All`):
-    /// a bodiless instance, a rule whose head matches it, or transitivity.
-    pub fn derivable<S: Source + ?Sized>(&self, source: &S, fact: Triple) -> bool {
-        self.derivable_with(source, fact, true, NEVER)
-    }
-
-    /// [`Self::derivable`], optionally without transitivity (whose closure the caller
-    /// recomputes), searching under `stop` ([`Self::derivable_through`]).
+    /// Whether `fact` has a one-step derivation from the facts of `source` (`Seg::All`): a
+    /// bodiless instance, a rule whose head matches it, or (optionally: the caller may
+    /// recompute its closure) transitivity; searching under `stop`
+    /// ([`Self::derivable_through`]).
     pub fn derivable_with<S: Source + ?Sized>(
         &self,
         source: &S,
@@ -1899,42 +1959,34 @@ impl GroundProgram {
         let Some(mut poll) = Poller::new(stop) else {
             return false;
         };
-        if bodiless_too && self.bodiless.contains(&fact) {
-            for body in self.premise_alternatives_iter(Grounding::Bodiless(fact)) {
-                if poll.attempt(1) {
-                    return false;
-                }
-                if body.iter().all(|&g| source.contains(g)) {
-                    return true;
-                }
-            }
+        if bodiless_too
+            && self.bodiless.contains(&fact)
+            && self
+                .for_each_alternative(Grounding::Bodiless(fact), &mut poll, |body, _| {
+                    match body.iter().all(|&g| source.contains(g)) {
+                        true => ControlFlow::Break(()),
+                        false => ControlFlow::Continue(()),
+                    }
+                })
+                .is_some()
+        {
+            return true;
         }
-        let mut producers = Vec::new();
-        self.heads.matching_fact(fact, &mut producers);
-        producers.sort_unstable();
-        producers.dedup_by_key(|(r, _)| *r);
         let mut found = false;
-        for (r, _) in producers {
-            if poll.attempt(1) {
-                return false;
-            }
-            if !rule(r) {
-                continue;
-            }
-            derivations(
-                source,
-                &self.rules[r],
-                fact,
-                Seg::All,
-                &mut poll,
-                &mut |_| {
+        let by_rule = self.for_each_producer(fact, &mut poll, |r, poll| {
+            if rule(r) {
+                derivations(source, &self.rules[r], fact, Seg::All, poll, &mut |_| {
                     found = true;
                     true
-                },
-            );
-            if found {
-                return true;
+                });
             }
+            match found {
+                true => ControlFlow::Break(()),
+                false => ControlFlow::Continue(()),
+            }
+        });
+        if by_rule.is_some() {
+            return true;
         }
         if transitivity_too && self.transitive.contains(&fact[1]) {
             derivations(
@@ -1966,7 +2018,7 @@ impl GroundProgram {
     }
 
     /// The rules (indexes into `rules`) whose head can give `fact`, each once.
-    pub fn producers(&self, fact: Triple) -> Vec<usize> {
+    fn producer_list(&self, fact: Triple) -> Vec<usize> {
         let mut found = Vec::new();
         self.heads.matching_fact(fact, &mut found);
         let mut rules: Vec<usize> = found.into_iter().map(|(r, _)| r).collect();

@@ -33,6 +33,7 @@
 //! (notes/2026-10-20-executor-admission-design.md, W1 site "reasoner fixpoint").
 
 use std::borrow::Cow;
+use std::ops::ControlFlow;
 
 use hashbrown::{HashMap, HashSet};
 use rayon::prelude::*;
@@ -405,13 +406,14 @@ fn support_sets_run(
     let mut bodiless_by_premise: HashMap<Triple, Vec<Triple>> = HashMap::new();
     for &fact in &program.bodiless {
         let grounding = Grounding::Bodiless(fact);
-        for premises in program.premise_alternatives_iter(grounding) {
-            if poll.attempt(1) {
-                return Err(run.stopped());
-            }
+        program.for_each_alternative(grounding, &mut poll, |premises, _| {
             for &premise in premises {
                 bodiless_by_premise.entry(premise).or_default().push(fact);
             }
+            ControlFlow::<()>::Continue(())
+        });
+        if poll.stopped() {
+            return Err(run.stopped());
         }
         let from = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll);
         merge(&mut sets, fact, from, cap, graphs_of, &mut annotations);
@@ -440,13 +442,14 @@ fn support_sets_run(
     // its sets changed.
     let mut rules_by_premise: HashMap<Triple, Vec<usize>> = HashMap::new();
     for (k, &(_, grounding)) in rules.iter().enumerate() {
-        for premises in program.premise_alternatives_iter(grounding) {
-            if poll.attempt(1) {
-                return Err(run.stopped());
-            }
+        program.for_each_alternative(grounding, &mut poll, |premises, _| {
             for &premise in premises {
                 rules_by_premise.entry(premise).or_default().push(k);
             }
+            ControlFlow::<()>::Continue(())
+        });
+        if poll.stopped() {
+            return Err(run.stopped());
         }
     }
     // What the round doesn't change: the closure's store and the premise maps.
@@ -687,15 +690,12 @@ pub fn derived_otherwise<S: Source + ?Sized>(
     // Each premise alternative is attempted work (sol-loop r7, R7-1); stopped, the grounding
     // reads as not holding, decided by nothing.
     let grounded = |grounding: Grounding, poll: &mut Poller<'_>| {
-        for premises in program.premise_alternatives_iter(grounding) {
-            if poll.attempt(1) {
-                return false;
-            }
-            if holds(premises) {
-                return true;
-            }
-        }
-        false
+        program
+            .for_each_alternative(grounding, poll, |premises, _| match holds(premises) {
+                true => ControlFlow::Break(()),
+                false => ControlFlow::Continue(()),
+            })
+            .is_some()
     };
     if program.bodiless.contains(&fact) && grounded(Grounding::Bodiless(fact), poll) {
         return true;
@@ -717,13 +717,14 @@ pub fn derived_otherwise<S: Source + ?Sized>(
     };
     // Each producer is attempted work before its schema check, an empty search or not
     // (review r1, F1).
-    for r in program.producers(fact) {
-        if poll.attempt(1) {
-            return false;
+    let by_rule = program.for_each_producer(fact, poll, |r, poll| {
+        match grounded(Grounding::Rule(r), poll) && derives(&program.rules[r], poll) {
+            true => ControlFlow::Break(()),
+            false => ControlFlow::Continue(()),
         }
-        if grounded(Grounding::Rule(r), poll) && derives(&program.rules[r], poll) {
-            return true;
-        }
+    });
+    if by_rule.is_some() {
+        return true;
     }
     let p = fact[1];
     program.transitive.contains(&p)
@@ -1096,24 +1097,14 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                             poll,
                         ));
                     }
-                    let mut groundings: Vec<Grounding> = program
-                        .producers(fact)
-                        .into_iter()
-                        .map(Grounding::Rule)
-                        .collect();
-                    if program.transitive.contains(&fact[1]) {
-                        groundings.push(Grounding::Transitive(fact[1]));
-                    }
-                    for grounding in groundings {
-                        if poll.attempt(1) {
-                            break;
-                        }
+                    // Each grounding's derivations of the fact, against its schema part.
+                    let mut search = |grounding: Grounding, poll: &mut Poller<'_>| {
                         let Some(&k) = by_grounding.get(&grounding) else {
-                            continue;
+                            return;
                         };
                         let (rule, schema) = (rules[k].0, &schemas[k]);
                         if schema.is_empty() {
-                            continue;
+                            return;
                         }
                         let mut body = Vec::with_capacity(rule.body.len());
                         derivations(change.source, rule, fact, Seg::All, poll, &mut |bindings| {
@@ -1128,6 +1119,15 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                             }
                             false
                         });
+                    };
+                    // Each producer is attempted work (for_each_producer), and so is the
+                    // transitivity case.
+                    program.for_each_producer(fact, poll, |r, poll| {
+                        search(Grounding::Rule(r), poll);
+                        ControlFlow::<()>::Continue(())
+                    });
+                    if program.transitive.contains(&fact[1]) && !poll.attempt(1) {
+                        search(Grounding::Transitive(fact[1]), poll);
                     }
                     (fact, from)
                 },
@@ -1278,14 +1278,12 @@ fn grounding_sets<L: Lookup + ?Sized>(
     poll: &mut Poller<'_>,
 ) -> Annotation {
     let (mut all, mut truncated) = (Vec::new(), false);
-    for premises in program.premise_alternatives_iter(grounding) {
-        if poll.attempt(1) {
-            break;
-        }
+    program.for_each_alternative(grounding, poll, |premises, _| {
         let found = premise_sets_from(premises, empty, sets, cap);
         truncated |= found.truncated;
         all.extend(found.sets);
-    }
+        ControlFlow::<()>::Continue(())
+    });
     // A derivation's sets: whatever they lack is beyond the head's own graphs.
     let mut out = minimal(all, cap, &|_| false);
     out.truncated |= truncated;
