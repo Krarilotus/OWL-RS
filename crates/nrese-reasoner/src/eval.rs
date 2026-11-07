@@ -754,8 +754,10 @@ impl<'r> Job<'r> {
     }
 
     /// Runs the variant for `drivers[range]`, calling `emit` with each complete binding,
-    /// counting each driver and each fact the walk scans on `poll` ([`walk`]): once its stop
-    /// has fired, the rest is passed over and `poll` says so ([`Poller::stopped`]).
+    /// counting the range's driver positions before it is read (a source may filter some
+    /// out before they reach the walk: [`Source::scan_range`]) and each fact the walk scans
+    /// on `poll` ([`walk`]): once its stop has fired, the rest is passed over and `poll`
+    /// says so ([`Poller::stopped`]).
     pub fn run<S: Source + ?Sized>(
         &self,
         source: &S,
@@ -763,10 +765,13 @@ impl<'r> Job<'r> {
         poll: &mut Poller<'_>,
         emit: &mut dyn FnMut(&[Option<u64>]),
     ) {
+        if poll.attempt(range.len()) {
+            return;
+        }
         let mut bindings = vec![None; self.rule.variables()];
         let driver = &self.rule.body[self.order[0].0];
         let mut visit = |fact: Triple| {
-            if poll.tick() {
+            if poll.stopped() {
                 return;
             }
             if let Some(newly) = bind(driver, fact, &mut bindings) {
@@ -801,11 +806,15 @@ impl<'r> Job<'r> {
         poll: &mut Poller<'_>,
         emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
     ) -> bool {
+        // The range's driver positions, before it is read ([`Job::run`]).
+        if poll.attempt(range.len()) {
+            return false;
+        }
         let mut bindings = vec![None; self.rule.variables()];
         let driver = &self.rule.body[self.order[0].0];
         let mut stopped = false;
         let mut visit = |fact: Triple| {
-            if stopped || poll.tick() {
+            if stopped || poll.stopped() {
                 return;
             }
             if let Some(newly) = bind(driver, fact, &mut bindings) {
@@ -864,11 +873,20 @@ impl<'a> Poller<'a> {
         self.stopped
     }
 
-    /// Counts one unit; true once the stop has fired. The common path tests `stopped` and
-    /// the ticker's countdown: no call and no atomic.
+    /// Counts one fact scanned ([`Self::attempt`]).
     #[inline]
     fn tick(&mut self) -> bool {
-        if !self.stopped && self.ticker.tick(1).is_err() {
+        self.attempt(1)
+    }
+
+    /// Counts `units` of attempted work, whether it delivers anything or not (a search, a
+    /// producer, a range of driver positions); true once the stop has fired. The poller
+    /// bounds attempted work, not delivered rows. The common path tests `stopped` and the
+    /// ticker's countdown: no call and no atomic.
+    #[inline]
+    pub(crate) fn attempt(&mut self, units: usize) -> bool {
+        let units = u32::try_from(units).unwrap_or(u32::MAX);
+        if !self.stopped && self.ticker.tick(units).is_err() {
             self.stopped = true;
         }
         self.stopped
@@ -1156,9 +1174,10 @@ pub fn derivations<S: Source + ?Sized>(
     let Head::Facts(heads) = &rule.head else {
         return;
     };
-    // A poller shared by several searches (one per parallel task) that has stopped: this
-    // one opens no scan at all, not even the first (sol-loop r4, R4-1).
-    if poll.stopped() {
+    // The search is a unit of attempted work, whether it finds anything or not; on a poller
+    // that has stopped (one shared by several searches) it opens no scan at all, not even
+    // the first (sol-loop r4, R4-1; review r1, F1).
+    if poll.attempt(1) {
         return;
     }
     let mut bindings = vec![None; rule.variables()];
@@ -1841,10 +1860,12 @@ impl GroundProgram {
     /// The one answer to whether `fact` has a one-step derivation from `source`, by the
     /// kinds the caller names: an instance of a rule `rule` admits (by index); with
     /// `bodiless_too`, a bodiless instance whose schema facts `source` holds; with
-    /// `transitivity_too`, transitivity. The search polls `stop` ([`walk_until`]): one that
-    /// finds nothing can try a product of a body's matches (N10 review r1, F2). Stopped, it
-    /// answers false, decided by nothing: the caller asks its (latched) stop again and
-    /// discards what it decided with it.
+    /// `transitivity_too`, transitivity. It asks `stop` before any work, then polls it per
+    /// unit attempted ([`Poller::attempt`]): each bodiless alternative, each producer, each
+    /// search, each fact a search scans ([`walk_until`]; one that finds nothing can try a
+    /// product of a body's matches, N10 review r1, F2). Stopped, it answers false, decided
+    /// by nothing: the caller asks its (latched) stop again and discards what it decided
+    /// with it.
     fn derivable_through<S: Source + ?Sized>(
         &self,
         source: &S,
@@ -1854,23 +1875,29 @@ impl GroundProgram {
         transitivity_too: bool,
         stop: Stop<'_>,
     ) -> bool {
-        if bodiless_too
-            && self
-                .bodiless_bodies(fact)
-                .iter()
-                .any(|body| body.iter().all(|&g| source.contains(g)))
-        {
-            return true;
+        // Before the bodiless and producer prelude (review r1, F2).
+        let Some(mut poll) = Poller::new(stop) else {
+            return false;
+        };
+        if bodiless_too {
+            for body in self.bodiless_bodies(fact) {
+                if poll.attempt(1) {
+                    return false;
+                }
+                if body.iter().all(|&g| source.contains(g)) {
+                    return true;
+                }
+            }
         }
         let mut producers = Vec::new();
         self.heads.matching_fact(fact, &mut producers);
         producers.sort_unstable();
         producers.dedup_by_key(|(r, _)| *r);
-        let Some(mut poll) = Poller::new(stop) else {
-            return false;
-        };
         let mut found = false;
         for (r, _) in producers {
+            if poll.attempt(1) {
+                return false;
+            }
             if !rule(r) {
                 continue;
             }
@@ -1887,9 +1914,6 @@ impl GroundProgram {
             );
             if found {
                 return true;
-            }
-            if poll.stopped() {
-                return false;
             }
         }
         if transitivity_too && self.transitive.contains(&fact[1]) {
