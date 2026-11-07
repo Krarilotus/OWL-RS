@@ -58,6 +58,74 @@ type Row<'a> = (
     Option<u64>,
 );
 
+/// A deeper mount of the same hierarchy doesn't hide an ancestor another mount shows (review
+/// r1 R1-C1): the full v2 tree at /sys/fs/cgroup, and the process's own group bind-mounted at
+/// /cg-local. The kernel enforces the 1 GiB parent `limited` over the 4 GiB `worker`
+/// (cgroup-v2.rst: a limit applies to the whole subtree), whichever line mountinfo lists
+/// first; the parent's limit refused through the full mount is unknown, not the bind mount's
+/// 4 GiB. Each group uses 512 MiB, so 512 MiB of the parent's limit is left.
+#[test]
+fn a_deeper_mount_doesnt_hide_a_visible_ancestor() {
+    const FULL_FIRST: &str = "30 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n\
+                              40 23 0:26 /limited/worker /cg-local rw - cgroup2 cgroup2 rw\n";
+    const BIND_FIRST: &str = "40 23 0:26 /limited/worker /cg-local rw - cgroup2 cgroup2 rw\n\
+                              30 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
+    let (one, four, half) = (G.to_string(), (4 * G).to_string(), (G / 2).to_string());
+    let tree = |mounts: &'static str| -> Vec<(&str, &str)> {
+        vec![
+            ("/proc/self/mountinfo", mounts),
+            ("/proc/self/cgroup", "0::/limited/worker"),
+            ("/sys/fs/cgroup/limited/cgroup.controllers", "memory"),
+            ("/sys/fs/cgroup/limited/memory.max", one.as_str()),
+            ("/sys/fs/cgroup/limited/memory.current", half.as_str()),
+            ("/sys/fs/cgroup/limited/worker/cgroup.controllers", "memory"),
+            ("/sys/fs/cgroup/limited/worker/memory.max", four.as_str()),
+            (
+                "/sys/fs/cgroup/limited/worker/memory.current",
+                half.as_str(),
+            ),
+            ("/cg-local/cgroup.controllers", "memory"),
+            ("/cg-local/memory.max", four.as_str()),
+            ("/cg-local/memory.current", half.as_str()),
+        ]
+    };
+    let rows: Vec<Row<'_>> = vec![
+        (
+            "full mount listed first",
+            tree(FULL_FIRST),
+            "",
+            Some(G),
+            Some(G / 2),
+        ),
+        (
+            "bind mount listed first",
+            tree(BIND_FIRST),
+            "",
+            Some(G),
+            Some(G / 2),
+        ),
+        (
+            "parent's limit refused",
+            tree(FULL_FIRST),
+            "/sys/fs/cgroup/limited/memory.max",
+            None,
+            None,
+        ),
+    ];
+    for (name, files, denied, available, remaining) in rows {
+        assert_eq!(
+            linux_available(system(&files, denied)),
+            available,
+            "{name}: available"
+        );
+        assert_eq!(
+            linux_remaining(system(&files, denied)),
+            remaining,
+            "{name}: remaining"
+        );
+    }
+}
+
 /// Each row: a process's view of its memory groups, and what the memory it may use and could
 /// still take read as (`None`: unknown). Groups with a limit use 1 GiB of it.
 #[test]
