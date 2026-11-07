@@ -25,10 +25,34 @@ use nrese_rdf::{
     QuadRef, TermRef, TripleRef,
 };
 
-use super::lexer::{Kind, Lexed, Token, lex};
+use super::lexer::{Kind, Lexed, Malformed, Opening, Token, known_missing, lex, malformed};
 use crate::blank::BlankNodes;
 use crate::error::{RdfParseError, RdfSyntaxError, SkippedStatement, TextPosition};
 use crate::text::{NOT_IN_IRI, decode_iri, decode_string};
+
+/// The tokens that open something a statement must close: `[`, `(`, `<<(`, `<<`, `{|`. A
+/// pattern, the one list for parsing (`take`) and for skipping a failed statement's rest
+/// (`resync`); [`pair`] pairs each with its closer.
+macro_rules! opener {
+    () => {
+        Kind::OpenBracket
+            | Kind::OpenParen
+            | Kind::TripleTermOpen
+            | Kind::ReifiedOpen
+            | Kind::AnnotationOpen
+    };
+}
+
+/// Their closers: `]`, `)`, `)>>`, `>>`, `|}`.
+macro_rules! closer {
+    () => {
+        Kind::CloseBracket
+            | Kind::CloseParen
+            | Kind::TripleTermClose
+            | Kind::ReifiedClose
+            | Kind::AnnotationClose
+    };
+}
 
 mod n3;
 
@@ -80,6 +104,9 @@ struct Input<'a, R> {
     base: u64,
     line: u64,
     line_start: u64,
+    /// A read error met while recovery read ahead: the next `refill` returns it, or the
+    /// parser does once it has stopped, so it is never lost (see `skip_malformed`).
+    held: Option<io::Error>,
 }
 
 impl<R: Read> Input<'_, R> {
@@ -98,6 +125,9 @@ impl<R: Read> Input<'_, R> {
     }
 
     fn refill(&mut self) -> io::Result<()> {
+        if let Some(error) = self.held.take() {
+            return Err(error);
+        }
         let Source::Reader {
             reader,
             buffer,
@@ -283,10 +313,11 @@ pub(crate) struct TurtleParser<'a, R> {
     /// else in a Turtle or TriG statement is an error).
     open: i64,
     ended: bool,
-    /// Whether the statement met bytes the lexer can't read. From there on its tokens are
-    /// no longer the document's (an unterminated string's text lexes as tokens), so what
-    /// it had open counts for nothing when its rest is skipped.
-    unreadable: bool,
+    /// Per quote (`"`, `'`) and width (short, long), whether no later string has a closing
+    /// quote: a search for one reached the input's end without it ([`known_missing`] says
+    /// why that answers for later ones). Recovery then neither lexes nor searches such a
+    /// string again (see `resync`).
+    no_closing: [[bool; 2]; 2],
     /// The current statement.
     arena: String,
     triples: Vec<Triple>,
@@ -367,6 +398,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             base: 0,
             line: 0,
             line_start: 0,
+            held: None,
         };
         Self {
             input,
@@ -379,7 +411,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             after_string: false,
             open: 0,
             ended: false,
-            unreadable: false,
+            no_closing: [[false; 2]; 2],
             arena: String::new(),
             triples: Vec::new(),
             handed_out: 0,
@@ -404,7 +436,8 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 return Some(Ok(self.quad(triple)));
             }
             if self.done {
-                return None;
+                // A read error recovery met before it stopped comes after its syntax error.
+                return self.input.held.take().map(|error| Err(error.into()));
             }
             self.arena.clear();
             self.triples.clear();
@@ -412,7 +445,6 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             self.handed_out = 0;
             self.open = 0;
             self.ended = false;
-            self.unreadable = false;
             // Where the statement starts (its first token), for an error's statement.
             let start = match self.statement_start() {
                 Ok(start) => start,
@@ -499,31 +531,52 @@ impl<'a, R: Read> TurtleParser<'a, R> {
 
     /// After a syntax error: skips to the end of the statement, a `.` outside brackets (or
     /// the `}` closing the TriG block it is in), so that parsing goes on with the next one.
-    /// The brackets the statement had open when it failed are open here too (`carried`,
-    /// from `open`), so a `.` inside them ends nothing; brackets opened while skipping count
-    /// as well (`own`), and a closer closes those first. Bytes the lexer can't read, in the
-    /// statement (`unreadable`) or met here, end the carried ones: the tokens after them
-    /// are no longer the statement's, so what it had open says nothing (the brackets the
-    /// skip opened itself stay counted). A stray closer opens nothing. Bytes the lexer can't
-    /// read are skipped one by one. `false` at the end of the input, or on a read error.
+    /// What stays open while skipping, readable tokens or not:
+    /// - the brackets the statement had open when it failed (`carried`, from `open`), so a
+    ///   `.` inside them ends nothing;
+    /// - the brackets opened while skipping (`opened`, by pair, with a count per pair). A
+    ///   closer closes the last of its pair opened here (and what was opened inside it); a
+    ///   closer of no pair opened here closes the innermost carried bracket; with nothing
+    ///   open it opens nothing. Each bracket is opened and closed once: linear work.
+    ///
+    /// A token the lexer can't read is skipped whole where its end is known, and nothing
+    /// open is forgotten (see `skip_malformed`). Where a quote has no closing quote after it
+    /// (a missing closer), only the quote is skipped and the text after it is read as tokens,
+    /// what was open still open: nothing inside the failed statement is ever emitted, and its
+    /// span, to where parsing resumes, is the error's skipped statement. A string already
+    /// known to have no closing quote (`no_closing`) is skipped so before it is lexed, which
+    /// would search to the end again. `false` at the end of the input, or on a read error.
     fn resync(&mut self) -> bool {
         self.lookahead = None;
         self.arena.clear();
         self.triples.clear();
         self.triple_terms.clear();
-        let mut carried = if self.unreadable { 0 } else { self.open.max(0) };
-        let (mut own, mut braces) = (0i64, 0i64);
+        let mut carried = self.open.max(0);
+        let mut opened: Vec<usize> = Vec::new();
+        let mut counts = [0usize; 5];
+        let mut braces = 0i64;
         loop {
+            if self.no_closing != [[false; 2]; 2] {
+                let no_closing = self.no_closing;
+                let missing =
+                    |opening: Opening| no_closing[quote(opening)][usize::from(opening.long)];
+                let data = &self.input.data()[self.input.position..];
+                if let Some(n) = known_missing(data, self.input.eof(), missing) {
+                    self.input.consume(n);
+                    continue;
+                }
+            }
             match self.fill() {
                 Ok(()) => {}
-                Err(RdfParseError::Io(_)) => return false,
+                Err(RdfParseError::Io(error)) => {
+                    // Recovery stops; the parser returns the read error after the syntax
+                    // error (`next_ref`).
+                    self.input.held = Some(error);
+                    return false;
+                }
                 Err(_) => {
-                    // Unreadable bytes: drop one and lex again.
-                    carried = 0;
                     self.lookahead = None;
-                    if self.input.position < self.input.data().len() {
-                        self.input.consume(1);
-                    } else if self.input.eof() || self.input.refill().is_err() {
+                    if !self.skip_malformed() {
                         return false;
                     }
                     continue;
@@ -543,13 +596,77 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                     self.graph = None;
                     return true;
                 }
-                Kind::Dot if own == 0 && carried == 0 && braces == 0 => return true,
-                kind => match depth(kind) {
-                    1 => own += 1,
-                    -1 if own > 0 => own -= 1,
-                    -1 => carried = (carried - 1).max(0),
-                    _ => {}
-                },
+                Kind::Dot if carried == 0 && opened.is_empty() && braces == 0 => return true,
+                opener!() => {
+                    let pair = pair(token.kind);
+                    counts[pair] += 1;
+                    opened.push(pair);
+                }
+                closer!() => {
+                    let pair = pair(token.kind);
+                    if counts[pair] > 0 {
+                        while let Some(inner) = opened.pop() {
+                            counts[inner] -= 1;
+                            if inner == pair {
+                                break;
+                            }
+                        }
+                    } else if carried > 0 {
+                        opened.clear();
+                        counts = [0; 5];
+                        carried -= 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Skips the token the lexer couldn't read, where `fill` stopped: a string up to its
+    /// closing quote, by the lexer's own string rules with line breaks allowed
+    /// ([`malformed`]); a string with no closing quote after it, its quote only (noted in
+    /// `no_closing`: a failed short search answers for later strings of that quote, a
+    /// failed long one for later long ones); anything else, one byte. Before searching
+    /// again for more input, it reads at least as much again as it has, so a long string
+    /// costs linear work even from a reader that gives a byte at a time. A read error while
+    /// reading ahead is held (`Input::held`) and the search goes on with what was read: the
+    /// error comes when the input is next needed, after what it already holds. `false` at
+    /// the end of the input, or when the string's end can't be read (the error then held).
+    fn skip_malformed(&mut self) -> bool {
+        loop {
+            let no_closing = self.no_closing;
+            let search = |opening: Opening| !no_closing[quote(opening)][usize::from(opening.long)];
+            let data = &self.input.data()[self.input.position..];
+            match malformed(data, self.input.eof(), search) {
+                Malformed::Skip(0) => return false,
+                Malformed::Skip(n) => {
+                    self.input.consume(n);
+                    return true;
+                }
+                Malformed::Missing(n, opening) => {
+                    let quote = quote(opening);
+                    self.no_closing[quote][1] = true;
+                    if !opening.long {
+                        self.no_closing[quote][0] = true;
+                    }
+                    self.input.consume(n);
+                    return true;
+                }
+                Malformed::NeedMore => {
+                    if self.input.held.is_some() {
+                        // The end can't be read: recovery stops, the error comes next.
+                        return false;
+                    }
+                    let wanted = 2 * data.len() + 1;
+                    while self.input.data().len() - self.input.position < wanted
+                        && !self.input.eof()
+                    {
+                        if let Err(error) = self.input.refill() {
+                            self.input.held = Some(error);
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -646,10 +763,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                     return Ok(());
                 }
                 Lexed::NeedMore => self.input.refill()?,
-                Lexed::Error(at, message) => {
-                    self.unreadable = true;
-                    return Err(self.error(position + at, message));
-                }
+                Lexed::Error(at, message) => return Err(self.error(position + at, message)),
             }
         }
     }
@@ -668,7 +782,11 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         self.after_string = matches!(token.kind, Kind::String { .. });
         // What of the statement is open, and whether this token is its end: a `.` with
         // nothing open (see `ended`).
-        self.open += depth(token.kind);
+        match token.kind {
+            opener!() => self.open += 1,
+            closer!() => self.open -= 1,
+            _ => {}
+        }
         self.ended = token.kind == Kind::Dot && self.open == 0;
         Ok(token)
     }
@@ -1424,23 +1542,21 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     }
 }
 
-/// How a token changes what of a statement is open: `[`, `(`, `<<(`, `<<` and `{|` open
-/// one, their closers close one. The one list, for parsing (`take`) and for skipping a
-/// failed statement's rest (`resync`).
-fn depth(kind: Kind) -> i64 {
+/// Which pair an [`opener!`] or [`closer!`] token is of: `[ ]`, `( )`, `<<( )>>`, `<< >>`,
+/// `{| |}`.
+fn pair(kind: Kind) -> usize {
     match kind {
-        Kind::OpenBracket
-        | Kind::OpenParen
-        | Kind::TripleTermOpen
-        | Kind::ReifiedOpen
-        | Kind::AnnotationOpen => 1,
-        Kind::CloseBracket
-        | Kind::CloseParen
-        | Kind::TripleTermClose
-        | Kind::ReifiedClose
-        | Kind::AnnotationClose => -1,
-        _ => 0,
+        Kind::OpenBracket | Kind::CloseBracket => 0,
+        Kind::OpenParen | Kind::CloseParen => 1,
+        Kind::TripleTermOpen | Kind::TripleTermClose => 2,
+        Kind::ReifiedOpen | Kind::ReifiedClose => 3,
+        _ => 4,
     }
+}
+
+/// The index of a string opening's quote in `no_closing`: `"` then `'`.
+fn quote(opening: Opening) -> usize {
+    usize::from(opening.quote == b'\'')
 }
 
 /// A key random per document, for generated blank nodes.
