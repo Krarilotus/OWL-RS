@@ -105,15 +105,34 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
             let before_results = validator_before.validate_all(&work(focus(
                 validator_before.focus_nodes(&shapes.shapes[shape]),
             )));
+            // Charged per result found, so counted before the set drops repeated ones.
+            let before_bytes: usize = before_results.iter().map(RawResult::retained_bytes).sum();
             let before: BTreeSet<RawResult> = before_results.into_iter().collect();
-            introduced.extend(after_results.into_iter().filter(|r| !before.contains(r)));
+            // Results kept are charged to their state's validator; those dropped here are
+            // returned to it once freed.
+            let mut dropped = 0;
+            for result in after_results {
+                if before.contains(&result) || introduced.contains(&result) {
+                    dropped += result.retained_bytes();
+                } else {
+                    introduced.insert(result);
+                }
+            }
+            validator_after.release(dropped);
+            drop(before);
+            validator_before.release(before_bytes);
         }
     }
     // A stop in either state is the outcome; only the state after reports its failures.
-    failures.extend(validator_after.into_failures()?);
-    validator_before.into_failures()?;
+    let (after_failures, held_after) = validator_after.into_failures()?;
+    failures.extend(after_failures);
+    let (_, held_before) = validator_before.into_failures()?;
     let raw: Vec<RawResult> = introduced.into_iter().collect();
-    Ok(decode(after, shapes, &raw, failures))
+    let report = decode(after, shapes, &raw, failures, resources);
+    // The raw results are freed, then their charges returned.
+    drop(raw);
+    drop((held_after, held_before));
+    report
 }
 
 fn in_selection(data: Selection, graph: TermId) -> bool {
