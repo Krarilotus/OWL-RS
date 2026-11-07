@@ -532,7 +532,7 @@ fn asserted_existentials_are_answered_or_reported() {
 /// A left side every individual is in classifies the anonymous ones too: with `P ⊑ ∃S` and
 /// `p : P`, `L ⊑ A` entails `ASK { :p :S ?y . ?y a :A }` for `L` = `⊤ ⊓ ≥ 0 R.⊤`, `B ⊔ ¬B`
 /// or `¬⊥`, each equivalent to `⊤` (OWL 2 Direct Semantics). Each is outside OWL 2 QL (OWL
-/// 2 Profiles §3.2: a QL subclass expression is a class other than `owl:Thing` or `∃R.⊤`),
+/// 2 Profiles §3.2.3: a QL subclass expression is a class, `owl:Thing` included, or `∃R.⊤`),
 /// so the answer is `true` or the status `sound-only`. Also without `P ⊑ ∃S`, where the
 /// open left side's own conclusion is the existential: `¬⊥ ⊑ ∃S.A`.
 ///

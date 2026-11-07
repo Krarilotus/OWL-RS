@@ -243,11 +243,71 @@ extra = ["volume:univ-bench.nt"]
 args = ["--reason", "owl2-ql", "--reason-runs", "35", "--runs", "10"]
 queries = "lubm"
 metric = "reason.p50_ms"
-check = {}
+check = { "q.q01.rows" = 4, "q.q02.rows" = 28, "q.q03.rows" = 6, "q.q04.rows" = 34, "q.q05.rows" = 719, "q.q06.rows" = 75547, "q.q07.rows" = 59, "q.q08.rows" = 5916, "q.q09.rows" = 1233, "q.q10.rows" = 0, "q.q11.rows" = 0, "q.q12.rows" = 0, "q.q13.rows" = 33, "q.q14.rows" = 75547 }
+pinned = "independent of NRESE (P2-C1, 7 Nov 2026; trail Harness notes/trail/p2c1-lubm10-oracle-20261107.md): LUBM(10,0)'s complete counts (Guo, Pan, Heflin 2005, Table 3; Shi, Maly, Zeil 2014, Table XII for q11-q13) where OWL 2 QL reaches them (q01-q05, q13, q14); below them where univ-bench's answers need axioms outside OWL 2 QL (Profiles §3.2): Student and Chair defined by an intersection on the left (q06-q10, q12; q06-q09 as the RDFS-level counts of Guo's Table 3), subOrganizationOf transitive (q11). Statuses not pinned: `complete` is regime-relative (docs/design/ql-rewriting.md §7)"
 route = {}
 cap_gb = 4
 systems = ["graphdb:owl2-ql", "stardog:owl2-ql", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 rewrite = "expressible"
+
+# --- the QL schema reader's work per blank class expression (P2-C1 review r1) ------------
+
+[[case]]
+name = "ql-memberships-reuse"
+area = "reasoning"
+what = "100 restrictions with 100 individuals asserted to be in each, queried with the OWL 2 QL rewriting on one snapshot: the compiled schema reused"
+semantics = "owl2-ql"
+data = "ql-memberships expressions=100 members=100"
+args = ["--reason", "owl2-ql", "--runs", "20"]
+queries = "ql-memberships"
+metric = "sum_p50_ms"
+check = { "q.knows.value" = "expect.knows", "q.people.value" = "expect.people" }
+route = {}
+cap_gb = 4
+systems = []
+
+[[case]]
+name = "ql-memberships-data-commits"
+area = "reasoning"
+what = "the same with 400 commits of an ordinary edge (added, then removed) and a reader running the queries meanwhile: each new snapshot's first query reads the schema again"
+semantics = "owl2-ql"
+data = "ql-memberships expressions=100 members=100 commits=200"
+args = ["--reason", "owl2-ql", "--commits", "{data}.commits.ru", "--readers", "1"]
+queries = "ql-memberships"
+metric = "commits.read_p50_ms"
+check = { "closure_after_commits.equal" = "true", "commits.commits" = "expect.commits", "q.knows.value" = "expect.knows", "q.people.value" = "expect.people" }
+route = {}
+cap_gb = 4
+systems = []
+
+[[case]]
+name = "ql-memberships-type-commits-wide"
+area = "reasoning"
+what = "1,000 restrictions with 10 members each, and 400 commits of memberships (each adds one to every restriction on S0, then removes it) with a reader: the schema read and compiled again per membership revision"
+semantics = "owl2-ql"
+data = "ql-memberships expressions=1000 members=10 commits=200 types=1"
+args = ["--reason", "owl2-ql", "--commits", "{data}.commits.ru", "--readers", "1"]
+queries = "ql-memberships"
+metric = "commits.read_p50_ms"
+check = { "closure_after_commits.equal" = "true", "commits.commits" = "expect.commits", "q.knows.value" = "expect.knows", "q.people.value" = "expect.people" }
+route = {}
+cap_gb = 4
+systems = []
+
+[[case]]
+name = "ql-memberships-type-commits-deep"
+area = "reasoning"
+what = "10 restrictions with 1,000 members each, and the same membership commits with a reader: few expressions, many memberships per expression"
+semantics = "owl2-ql"
+data = "ql-memberships expressions=10 members=1000 commits=200 types=1"
+args = ["--reason", "owl2-ql", "--commits", "{data}.commits.ru", "--readers", "1"]
+queries = "ql-memberships"
+metric = "commits.read_p50_ms"
+check = { "closure_after_commits.equal" = "true", "commits.commits" = "expect.commits", "q.knows.value" = "expect.knows", "q.people.value" = "expect.people" }
+route = {}
+cap_gb = 4
+systems = []
+
 [[case]]
 name = "custom-tc"
 area = "reasoning"

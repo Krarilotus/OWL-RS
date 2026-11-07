@@ -354,8 +354,12 @@ impl Tbox {
 
     /// The members of `set` a named individual can be stated to be (classes and
     /// existentials), leaving out those whose instances the materialisation makes
-    /// instances of another member (one of each set of equivalent ones kept).
+    /// instances of another member (one of each set of equivalent ones kept). With
+    /// `owl:Thing` in `set`, every individual is a member: `[Basic::Thing]` alone.
     fn minimal(&self, set: Vec<u32>) -> Vec<Basic> {
+        if set.iter().any(|&id| self.basic(id) == Basic::Thing) {
+            return vec![Basic::Thing];
+        }
         let set: Vec<u32> = set
             .into_iter()
             .filter(|&id| matches!(self.basic(id), Basic::Class(_) | Basic::Exists(_)))
@@ -721,13 +725,15 @@ impl Builder {
                 tbox.reaching.entry(sigma).or_default().push(ty);
             }
         }
+        // `⊤ ⊑ B` is a gap too: the closure states no individual to be a Thing, so it
+        // applies none of them (P2-C1 review r1 F1).
         tbox.gaps = tbox
             .up
             .iter()
             .zip(&tbox.base_up)
             .enumerate()
             .any(|(id, (up, base))| {
-                !matches!(tbox.basics[id], Basic::Fresh(_) | Basic::Thing)
+                !matches!(tbox.basics[id], Basic::Fresh(_))
                     && up.iter().any(|sup| {
                         !base.contains(sup) && !matches!(tbox.basics[*sup as usize], Basic::Thing)
                     })

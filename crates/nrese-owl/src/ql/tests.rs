@@ -133,6 +133,7 @@ fn branches(rewriting: &Rewriting, table: &Table, vars: &[String]) -> Vec<String
                 .iter()
                 .map(|p| match p {
                     Part::Atom(a) => atom(a),
+                    Part::Top(t) => format!("⊤({})", term(t)),
                     Part::Any(alternatives) => {
                         let mut alternatives: Vec<String> = alternatives.iter().map(atom).collect();
                         alternatives.sort();
