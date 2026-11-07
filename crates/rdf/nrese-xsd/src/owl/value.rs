@@ -143,7 +143,15 @@ impl Value {
             }
             Datatype::AnyUri => Value::AnyUri(string(lexical)?),
             Datatype::DateTime | Datatype::DateTimeStamp => {
-                let d = DateTime::from_str(lexical).map_err(|e| ill(&e.to_string()))?;
+                // A valid form past what is represented is unsupported, never ill-typed; a
+                // dateTimeStamp without its timezone is ill-typed whatever its year.
+                let d = DateTime::from_str(lexical).map_err(|e| match e.unrepresented() {
+                    Some(false) if datatype == Datatype::DateTimeStamp => {
+                        ill("a dateTimeStamp needs a timezone")
+                    }
+                    Some(_) => LiteralError::Unsupported(format!("{lexical:?}: {e}")),
+                    None => ill(&e.to_string()),
+                })?;
                 if fraction_digits(lexical) > 18 {
                     return Err(LiteralError::Unsupported(format!(
                         "{lexical:?}: more than 18 fractional digits of a second"
