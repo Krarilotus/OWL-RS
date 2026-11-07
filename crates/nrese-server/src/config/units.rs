@@ -12,17 +12,38 @@
 use anyhow::{Context, Result, anyhow, bail};
 use nrese_store::memory::Reading;
 
-/// The number and the unit of `text`: `"1.5 GiB"` is `(1.5, "gib")`.
-fn split(text: &str) -> Result<(f64, String)> {
+/// The number and the unit of `text`: `"1.5 GiB"` is `("1.5", "gib")`.
+fn split(text: &str) -> Result<(String, String)> {
     let text = text.trim();
     let digits = text
         .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '_'))
         .unwrap_or(text.len());
-    let number: f64 = text[..digits]
-        .replace('_', "")
-        .parse()
-        .map_err(|_| anyhow!("'{text}' doesn't start with a number"))?;
+    let number = text[..digits].replace('_', "");
+    if number.parse::<f64>().is_err() {
+        bail!("'{text}' doesn't start with a number");
+    }
     Ok((number, text[digits..].trim().to_ascii_lowercase()))
+}
+
+/// `number` (of `text`) times `factor`, exact for a whole number. An error past u64, and
+/// for a positive value below one (`smallest`): it would read as 0, which a budget takes
+/// as none. Whether the value is positive is read from its digits, not from the float: a
+/// decimal too small for f64 parses as 0.0.
+fn scale(text: &str, number: &str, factor: u64, smallest: &str) -> Result<u64> {
+    let too_large = || anyhow!("'{text}' is too large");
+    if !number.contains('.') {
+        let whole: u64 = number.parse().map_err(|_| too_large())?;
+        return whole.checked_mul(factor).ok_or_else(too_large);
+    }
+    let positive = number.bytes().any(|b| matches!(b, b'1'..=b'9'));
+    let value = number.parse::<f64>()? * factor as f64;
+    if value >= u64::MAX as f64 {
+        return Err(too_large());
+    }
+    if positive && value < 1.0 {
+        bail!("'{text}' is more than 0 but less than {smallest}");
+    }
+    Ok(value.round() as u64)
 }
 
 /// Bytes: `1048576`, `1MiB`, `1.5 GiB`, `2G`, `500MB`.
@@ -42,7 +63,7 @@ pub(super) fn parse_size(text: &str) -> Result<u64> {
             bail!("unknown size unit '{other}' in '{text}' (KiB, MiB, GiB, TiB, KB, MB, GB, TB)")
         }
     };
-    Ok((number * factor as f64).round() as u64)
+    scale(text, &number, factor, "one byte")
 }
 
 /// Milliseconds: `30000`, `30s`, `500ms`, `2min`, `1h`.
@@ -55,7 +76,7 @@ pub(super) fn parse_duration_ms(text: &str) -> Result<u64> {
         "h" => 3_600_000,
         other => bail!("unknown time unit '{other}' in '{text}' (ms, s, min, h)"),
     };
-    Ok((number * factor as f64).round() as u64)
+    scale(text, &number, factor, "one millisecond")
 }
 
 /// Bytes, or a share of `machine`, the machine's memory as read ([`machine_memory_bytes`]):
@@ -154,6 +175,83 @@ mod tests {
             assert_eq!(parse_duration_ms(text).unwrap(), ms, "{text}");
         }
         assert!(parse_duration_ms("30 fortnights").is_err());
+    }
+
+    /// A positive value below one byte or one millisecond would read as 0, which budgets
+    /// take as none, and a value past u64 as its largest: both are errors. Every row is
+    /// checked; the failures are reported together.
+    #[test]
+    fn values_below_one_unit_or_past_the_range_are_errors() {
+        let mut wrong = Vec::new();
+        for text in [
+            "0.4",
+            "0.4 B",
+            "0.0001 KiB",
+            "18446744073709551616",
+            "17179869184 GiB",
+            "99999999999999999999999",
+        ] {
+            if let Ok(bytes) = parse_size(text) {
+                wrong.push(format!("size {text:?} read as {bytes}"));
+            }
+        }
+        for text in ["0.1ms", "0.4", "0.0001 s", "5124095576030432 h"] {
+            if let Ok(ms) = parse_duration_ms(text) {
+                wrong.push(format!("duration {text:?} read as {ms} ms"));
+            }
+        }
+        // Guards: zero, one unit, a fraction of a larger unit, the largest size.
+        for (text, bytes) in [
+            ("0", 0u64),
+            ("0.0", 0),
+            ("1", 1),
+            ("0.5 KiB", 512),
+            ("18446744073709551615", u64::MAX),
+        ] {
+            if parse_size(text).ok() != Some(bytes) {
+                wrong.push(format!(
+                    "size {text:?}: {:?}, not {bytes}",
+                    parse_size(text)
+                ));
+            }
+        }
+        for (text, ms) in [("0", 0u64), ("1ms", 1), ("0.5 s", 500), ("0.001 s", 1)] {
+            if parse_duration_ms(text).ok() != Some(ms) {
+                wrong.push(format!(
+                    "duration {text:?}: {:?}, not {ms}",
+                    parse_duration_ms(text)
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A positive decimal too small for f64 (it parses as 0.0) is still positive: an error,
+    /// not 0, which a budget reads as none (review p2-b7-a r1 R1). Every row is checked.
+    #[test]
+    fn positive_values_too_small_for_a_float_are_errors() {
+        let tiny = format!("0.{}1", "0".repeat(400));
+        let mut wrong = Vec::new();
+        for text in [tiny.clone(), format!("{tiny} B"), format!("{tiny}KiB")] {
+            if let Ok(bytes) = parse_size(&text) {
+                wrong.push(format!("size {}…: read as {bytes}", &text[..8]));
+            }
+        }
+        for text in [format!("{tiny}ms"), format!("{tiny} h")] {
+            if let Ok(ms) = parse_duration_ms(&text) {
+                wrong.push(format!("duration {}…: read as {ms} ms", &text[..8]));
+            }
+        }
+        // Guards: lexical zeros, however long, are 0.
+        let zeros = format!("0.{}", "0".repeat(400));
+        for text in [zeros.clone(), format!("{zeros}ms"), "000".to_owned()] {
+            if parse_size(text.trim_end_matches("ms")).ok() != Some(0)
+                || parse_duration_ms(&text).ok() != Some(0)
+            {
+                wrong.push(format!("zero {}…: not 0", &text[..6]));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
