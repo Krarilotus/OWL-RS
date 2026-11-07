@@ -19,6 +19,17 @@ pub(crate) struct Analysis {
     /// Variables an expression computes from (`BIND`, `SELECT (… AS ?v)`): a value
     /// derived from one may be no term of its own.
     computed: HashSet<String>,
+    /// An `owl:sameAs` read whose two ends can be one term: a triple pattern with a
+    /// variable or blank node at an end or one constant at both, or any path step.
+    reflexive_same_as: bool,
+}
+
+/// Whether the `owl:sameAs` pattern `t` can match a reflexive pair: only two distinct
+/// constants can't.
+fn can_be_reflexive(t: &TriplePattern) -> bool {
+    let constant =
+        |term: &TermPattern| matches!(term, TermPattern::NamedNode(_) | TermPattern::Literal(_));
+    !(constant(&t.subject) && constant(&t.object) && t.subject != t.object)
 }
 
 /// A triple pattern or path step: what it reads and what stands at its ends.
@@ -199,6 +210,11 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
             Node::Pattern(p) => {
                 let op = match p {
                     GraphPattern::Bgp { patterns } => {
+                        analysis.reflexive_same_as |= patterns.iter().any(|t| {
+                            matches!(&t.predicate, NamedNodePattern::NamedNode(p)
+                                if p.as_str() == OWL_SAME_AS)
+                                && can_be_reflexive(t)
+                        });
                         analysis.reads.extend(patterns.iter().map(pattern_reads));
                         analysis.atoms.extend(patterns.iter().map(atom_of));
                         None
@@ -206,6 +222,10 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
                     GraphPattern::Path { path, .. } => {
                         let from = analysis.reads.len();
                         path_reads(path, &mut analysis.reads);
+                        // A step's ends are nodes the query doesn't fix: any can be one.
+                        analysis.reflexive_same_as |= analysis.reads[from..]
+                            .iter()
+                            .any(|(p, _)| p.as_deref() == Some(OWL_SAME_AS));
                         // A path's steps meet at nodes the query doesn't see.
                         let steps = analysis.reads[from..]
                             .iter()
@@ -270,9 +290,20 @@ pub(super) fn unbounded(analysis: &Analysis) -> Option<String> {
         })
 }
 
+/// Why the bounds can't decide `analysis`'s `owl:sameAs` reads: eq-ref (OWL 2 Profiles
+/// table 4: every term is `owl:sameAs` itself) is in neither bound: the RL rules leave it
+/// out by design, and so does U1. Holds on every route, so it is asked before [`closed`].
+pub(super) fn reflexive_same_as(analysis: &Analysis) -> Option<&'static str> {
+    analysis.reflexive_same_as.then_some(
+        "the query reads owl:sameAs where both ends can be one term: reflexive owl:sameAs \
+         isn't materialised in either bound",
+    )
+}
+
 /// Whether every predicate and class `analysis` reads has no fact in U1 beyond L.
 pub(super) fn closed(analysis: &Analysis, view: &View, snapshot: &Snapshot) -> bool {
-    // The RL route: the RL closure is complete for an OWL 2 RL ontology.
+    // The RL route: the RL closure is complete for an OWL 2 RL ontology, but for the
+    // reflexive owl:sameAs it leaves out ([`reflexive_same_as`], asked first).
     if view.rules {
         return true;
     }

@@ -20,7 +20,7 @@
 //!    `dl.timeout` per query.
 //!
 //! What can't be decided is said: an unresolved candidate, a non-monotone operator over
-//! an open gap, U1 not available, consistency not proven, a reader who sees part of the
+//! an open gap, a reflexive `owl:sameAs` read (eq-ref is in neither bound), U1 not available, consistency not proven, a reader who sees part of the
 //! data. Bag semantics: L's rows keep their multiplicities; a proved row is added once.
 
 use nrese_dl::limits::{Deadline, Limit};
@@ -230,6 +230,9 @@ fn plan_status_built(store: &StoreService, prepared: &PreparedQuery) -> Status {
             "the query reads {what}: entailed schema statements aren't bounded"
         ));
     }
+    if let Some(why) = reflexive_same_as(&analysis) {
+        return Status::sound_only(why);
+    }
     if closed(&analysis, &view, &snapshot) {
         let mut status = Status::complete();
         status.path("closed-predicates");
@@ -350,6 +353,10 @@ fn decide_answers(
             "the query reads {what}: entailed schema statements aren't bounded (the RL \
              closure's are sound; /classification has the subsumptions under OWL 2 DL)"
         ));
+        return Ok(status.stream(lower_view(&view)));
+    }
+    if let Some(why) = reflexive_same_as(&analysis) {
+        status.add(why.to_owned());
         return Ok(status.stream(lower_view(&view)));
     }
     if closed(&analysis, &view, &snapshot) {

@@ -11,12 +11,15 @@
 //!   values: a functional data property with two values.
 //!
 //! Not done: dt-type1/2 and dt-eq (typing and equating literals by value), which would
-//! fold lexical forms into each other; ill-typed literals (no data value) aren't judged.
+//! fold lexical forms into each other; ill-typed literals (no data value) aren't judged,
+//! but for the string types, whose lexical form is read as a string: a violation found
+//! on it holds anyway (an ill-typed literal is in no value space).
 //! A datatype outside OWL 2's list is not judged either.
 
 use crate::ir::{Triple, Violation};
 use nrese_engine::{TermId, TermKind};
 use nrese_rdf::{Literal, Term};
+use nrese_xsd::owl::text;
 use nrese_xsd::{DateTime, Decimal, Double, Float, Integer};
 use std::str::FromStr;
 
@@ -143,10 +146,17 @@ fn in_value_space(value: &Data, datatype: &str) -> Option<bool> {
         };
     }
     let local = datatype.strip_prefix(XSD)?;
+    // The string types' value spaces (XML Schema 1.1 Part 2 §3.4.1–3.4.7), as their owner
+    // `nrese_xsd::owl::text` holds them.
+    let string_in = |test: fn(&str) -> bool| matches!(value, Data::String(s) if test(s));
     Some(match local {
-        "string" | "normalizedString" | "token" | "language" | "Name" | "NCName" | "NMTOKEN" => {
-            matches!(value, Data::String(_))
-        }
+        "string" => matches!(value, Data::String(_)),
+        "normalizedString" => string_in(text::is_normalized),
+        "token" => string_in(text::is_token),
+        "language" => string_in(text::is_language),
+        "Name" => string_in(text::is_name),
+        "NCName" => string_in(text::is_ncname),
+        "NMTOKEN" => string_in(text::is_nmtoken),
         "boolean" => matches!(value, Data::Boolean(_)),
         "decimal" => matches!(value, Data::Decimal(_)),
         "double" => matches!(value, Data::Double(_)),
