@@ -567,12 +567,20 @@ pub(crate) fn placed(dir: &Path, revision: u64) -> std::io::Result<bool> {
 /// store's commit clock, no earlier than any commit in it.
 pub(crate) type Times = (Option<u64>, u64);
 
-/// The format 12 trailer word of `times`.
-fn trailer((committed, clock): Times) -> u64 {
-    match committed {
-        Some(committed) => committed & !UNKNOWN_TIME,
-        None => (clock & !UNKNOWN_TIME) | UNKNOWN_TIME,
+/// The format 12 trailer word of `times`; a time past [`super::MAX_COMMIT_TIME`] (which
+/// recovery and replication refuse, so none reaches here) fails the write rather than being
+/// kept short.
+fn trailer((committed, clock): Times) -> EngineResult<u64> {
+    let time = committed.unwrap_or(clock);
+    if time > super::MAX_COMMIT_TIME {
+        return Err(EngineError::Corruption(format!(
+            "a commit time past what a checkpoint keeps ({time})"
+        )));
     }
+    Ok(match committed {
+        Some(committed) => committed,
+        None => clock | UNKNOWN_TIME,
+    })
 }
 
 /// The times of a format 12 trailer word (0: neither known).
@@ -703,7 +711,7 @@ pub(crate) fn write_parts<'a>(
         super::fault::CLOCK.set(Some(at));
     }
     // The last commit's time (format 12), 0 where it isn't known.
-    put_u64(&mut out.buffer, trailer(stamp()));
+    put_u64(&mut out.buffer, trailer(stamp())?);
     out.flush_buffer()?;
     let syncing = std::time::Instant::now();
     let magic = MAGIC;

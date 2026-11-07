@@ -616,7 +616,12 @@ impl Inner {
             None => {
                 let committed = match local {
                     true => Some(shared.stamp()),
-                    false => record.committed_micros,
+                    false => {
+                        shared
+                            .clock
+                            .fetch_max(record.committed_micros.unwrap_or(0), Ordering::Relaxed);
+                        record.committed_micros
+                    }
                 };
                 shared
                     .versions
