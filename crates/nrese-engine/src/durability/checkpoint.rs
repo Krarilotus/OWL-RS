@@ -2,9 +2,11 @@
 //!
 //! Format 12 (little-endian): `magic | revision u64 | flags u64 | dictionary | stack* |
 //! committed u64 | crc32 u32`. The CRC covers everything before it. `committed` is when the
-//! revision's last commit was made, microseconds since 1970, 0 where that isn't known; a
-//! time restore needs it (`DurabilityConfig::recover_until_micros`). Format 11 is format 12
-//! without it. Flag bit 1 ([`COMPRESSED_KEYS`], format 11 on):
+//! revision's last commit was made, microseconds since 1970, a time restore needs
+//! (`DurabilityConfig::recover_until_micros`); with its top bit ([`UNKNOWN_TIME`]) set, the
+//! revision also holds commits of unknown time, and the rest is only the store's commit
+//! clock, which new commits never go before; 0 knows neither. Format 11 is format 12 without
+//! it. Flag bit 1 ([`COMPRESSED_KEYS`], format 11 on):
 //! the dictionary's keys are FSST-compressed ([`crate::term::vocabulary`]); its two symbol
 //! tables follow the dictionary's header. Flag bit 0 ([`INTEGERS_IN_DICTIONARY`]):
 //! integer-derived literals are dictionary entries, not inline (a store created before
@@ -86,6 +88,9 @@ const MAGIC_V8: &[u8; 8] = b"NRESECK8";
 /// without the flags, without the text order, unaligned packed permutations, quad lists.
 const MAGIC_V7: &[u8; 8] = b"NRESECK7";
 const MAGIC_V6: &[u8; 8] = b"NRESECK6";
+/// The commit time's top bit (format 12): the revision holds commits of unknown time, and the
+/// rest is only the store's commit clock. Times since 1970 in microseconds never reach it.
+const UNKNOWN_TIME: u64 = 1 << 63;
 /// Flags bit: integer-derived literals are dictionary entries.
 const INTEGERS_IN_DICTIONARY: u64 = 1;
 /// Flags bit: the dictionary's keys are compressed (format 11).
@@ -558,24 +563,47 @@ pub(crate) fn placed(dir: &Path, revision: u64) -> std::io::Result<bool> {
     checkpoint_path(dir, revision, EXTENSION).try_exists()
 }
 
-/// Writes a checkpoint of `snapshot`, of a committed revision (its version's time), and returns
-/// its path; its scratch is charged within `admission` ([`write_parts`]).
+/// A checkpoint's times: its version's (`None`: it holds commits of unknown time) and the
+/// store's commit clock, no earlier than any commit in it.
+pub(crate) type Times = (Option<u64>, u64);
+
+/// The format 12 trailer word of `times`.
+fn trailer((committed, clock): Times) -> u64 {
+    match committed {
+        Some(committed) => committed & !UNKNOWN_TIME,
+        None => (clock & !UNKNOWN_TIME) | UNKNOWN_TIME,
+    }
+}
+
+/// The times of a format 12 trailer word (0: neither known).
+fn times_of(trailer: u64) -> Times {
+    match (trailer, trailer & UNKNOWN_TIME) {
+        (0, _) => (None, 0),
+        (_, 0) => (Some(trailer), trailer),
+        _ => (None, trailer & !UNKNOWN_TIME),
+    }
+}
+
+/// Writes a checkpoint of `snapshot`, of a committed revision (its version's time; `clock`,
+/// the store's commit clock, read with or after the snapshot), and returns its path; its
+/// scratch is charged within `admission` ([`write_parts`]).
 pub(crate) fn write(
     dir: &Path,
     snapshot: &Snapshot,
+    clock: u64,
     admission: Option<&Arc<SharedBudget>>,
 ) -> EngineResult<PathBuf> {
     let committed_micros = snapshot.version().committed_micros;
-    write_stamped(dir, snapshot, admission, &mut || committed_micros)
+    write_stamped(dir, snapshot, admission, &mut || (committed_micros, clock))
 }
 
-/// [`write`] of a revision this checkpoint commits: its time is `stamp`'s, asked for once
+/// [`write`] of a revision this checkpoint commits: its times are `stamp`'s, asked for once
 /// everything else is written ([`write_parts`]).
 pub(crate) fn write_stamped(
     dir: &Path,
     snapshot: &Snapshot,
     admission: Option<&Arc<SharedBudget>>,
-    stamp: &mut dyn FnMut() -> Option<u64>,
+    stamp: &mut dyn FnMut() -> Times,
 ) -> EngineResult<PathBuf> {
     let version = snapshot.version();
     write_parts(
@@ -590,8 +618,8 @@ pub(crate) fn write_stamped(
     )
 }
 
-/// Writes a checkpoint of `revision` from its parts and returns its path. Its last commit's
-/// time (`None`: not known) is `stamp`'s, asked for once the parts are written, just before the
+/// Writes a checkpoint of `revision` from its parts and returns its path. Its times
+/// ([`Times`]) are `stamp`'s, asked for once the parts are written, just before the
 /// file is synced and renamed into place: for a bulk load the checkpoint commits, and the time
 /// is then that of its commit, not of the build before it (as a transaction's is taken just
 /// before its record is synced). It holds the dictionary's
@@ -610,7 +638,7 @@ pub(crate) fn write_parts<'a>(
     dir: &Path,
     admission: Option<&Arc<SharedBudget>>,
     revision: u64,
-    stamp: &mut dyn FnMut() -> Option<u64>,
+    stamp: &mut dyn FnMut() -> Times,
     dictionary: &Dictionary,
     dictionary_len: u64,
     layouts: [Layout; 2],
@@ -675,7 +703,7 @@ pub(crate) fn write_parts<'a>(
         super::fault::CLOCK.set(Some(at));
     }
     // The last commit's time (format 12), 0 where it isn't known.
-    put_u64(&mut out.buffer, stamp().unwrap_or(0));
+    put_u64(&mut out.buffer, trailer(stamp()));
     out.flush_buffer()?;
     let syncing = std::time::Instant::now();
     let magic = MAGIC;
@@ -727,6 +755,8 @@ pub(crate) struct Loaded {
     pub revision: u64,
     /// When its last commit was made (format 12); `None` where that isn't known.
     pub committed_micros: Option<u64>,
+    /// The store's commit clock as it was then (format 12; 0 before).
+    pub clock_micros: u64,
     pub stacks: Stacks,
     /// The store keeps integer-derived literals in its dictionary.
     pub integers_in_dictionary: bool,
@@ -800,15 +830,15 @@ pub(crate) fn load_latest(
         return Err(corrupt("checksum mismatch"));
     }
     lap("crc");
-    // Format 12: the commit time ends the body; the rest is read as format 11.
-    let mut committed_micros = None;
+    // Format 12: the commit times end the body; the rest is read as format 11.
+    let (mut committed_micros, mut clock_micros) = (None, 0);
     if timed {
         let (rest, time) = body
             .split_at_checked(body.len().saturating_sub(8))
             .filter(|(rest, _)| rest.len() >= MAGIC.len())
             .ok_or_else(|| corrupt("truncated"))?;
-        let time = u64::from_le_bytes(time.try_into().expect("8 bytes"));
-        committed_micros = (time != 0).then_some(time);
+        (committed_micros, clock_micros) =
+            times_of(u64::from_le_bytes(time.try_into().expect("8 bytes")));
         reader = Reader::new(rest);
         reader.bytes(MAGIC.len());
     }
@@ -860,6 +890,7 @@ pub(crate) fn load_latest(
         return Ok(Some(Loaded {
             revision,
             committed_micros,
+            clock_micros,
             stacks: Stacks::Packed(stacks),
             integers_in_dictionary,
         }));
@@ -883,6 +914,7 @@ pub(crate) fn load_latest(
     Ok(Some(Loaded {
         revision,
         committed_micros: None,
+        clock_micros: 0,
         stacks: Stacks::Quads { quads, inferred },
         integers_in_dictionary,
     }))

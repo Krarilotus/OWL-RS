@@ -161,6 +161,8 @@ pub(crate) struct Durable {
 pub(crate) struct Recovered {
     pub durable: Durable,
     pub version: Version,
+    /// The store's commit clock: the latest of the checkpoint's and every logged commit time.
+    pub clock: u64,
 }
 
 impl Durable {
@@ -189,6 +191,8 @@ impl Durable {
         // The store's encoding of integer-derived literals: its checkpoint's, else its
         // first WAL segment's, else (a new store) inline.
         let mut integers_in_dictionary = loaded.as_ref().map(|l| l.integers_in_dictionary);
+        // The store's commit clock: the checkpoint's, then every logged time, covered or not.
+        let mut store_clock = loaded.as_ref().map_or(0, |l| l.clock_micros);
         let mut version = match loaded {
             Some(loaded) => {
                 let (asserted, inferred) = match loaded.stacks {
@@ -296,6 +300,7 @@ impl Durable {
             }
             dictionary.set_integers_in_dictionary(integers_in_dictionary.unwrap_or(false));
             for (index, record) in contents.records.iter().enumerate() {
+                store_clock = store_clock.max(record.committed_micros.unwrap_or(0));
                 if record.revision <= version.revision {
                     continue; // covered by the checkpoint
                 }
@@ -402,6 +407,7 @@ impl Durable {
                 config,
                 _lock: lock,
             },
+            clock: store_clock.max(version.committed_micros.unwrap_or(0)),
             version,
         })
     }
