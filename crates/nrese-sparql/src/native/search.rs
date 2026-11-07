@@ -436,7 +436,7 @@ impl Context<'_> {
             _ => None,
         };
         if let Some(variable) = graph_variable {
-            return self.search_per_graph(search, variable);
+            return self.search_per_graph(search, variable, property);
         }
         let mut vars = vec![search.matched.clone()];
         vars.extend(search.relevance.iter().cloned());
@@ -491,7 +491,16 @@ impl Context<'_> {
     /// the pass early (another graph may not have reached it yet); `bds:minRelevance` can
     /// (relevance descends). One pass over the matches, and per match its statements in the
     /// named graphs: no search per graph.
-    fn search_per_graph(&self, search: &Search, graph: Variable) -> NativeResult<Solutions> {
+    ///
+    /// `property` is the search's property as [`Self::search`] looked it up (`Some(None)`: one
+    /// the store doesn't know, so no literal): in each graph only literals that are objects
+    /// of it there are ranked.
+    fn search_per_graph(
+        &self,
+        search: &Search,
+        graph: Variable,
+        property: Option<Option<TermId>>,
+    ) -> NativeResult<Solutions> {
         let memory = crate::QueryEvaluationError::MemoryLimit;
         let mut vars = vec![search.matched.clone()];
         vars.extend(search.relevance.iter().cloned());
@@ -510,7 +519,11 @@ impl Context<'_> {
         let mut ranks_held = nrese_exec::Reservation::new(&*self.budget);
         let mut ranks: HashMap<TermId, usize> = HashMap::new();
         let mut graphs = nrese_exec::ChargedVec::new(std::sync::Arc::clone(&self.budget));
-        for found in self.snapshot.text_search(&search.query) {
+        let found = match property {
+            Some(None) => Vec::new(),
+            _ => self.snapshot.text_search(&search.query),
+        };
+        for found in found {
             self.check()?;
             if search
                 .min_relevance
@@ -522,7 +535,7 @@ impl Context<'_> {
             if !self.in_language(search, id) {
                 continue;
             }
-            self.named_graphs_using(id, &mut graphs)?;
+            self.named_graphs_using(id, property.flatten(), &mut graphs)?;
             for &in_graph in graphs.iter() {
                 let rank = match ranked {
                     true => {
@@ -584,16 +597,18 @@ impl Context<'_> {
     }
 
     /// The named graphs of the dataset (those it lists, where it lists them) whose
-    /// statements have `id` as their object, sorted and each once, into `out`.
+    /// statements have `id` as their object, with `property` as their predicate if given,
+    /// sorted and each once, into `out`.
     fn named_graphs_using(
         &self,
         id: TermId,
+        property: Option<TermId>,
         out: &mut nrese_exec::ChargedVec<TermId>,
     ) -> NativeResult<()> {
         out.clear();
         let pattern = QuadPattern {
             subject: None,
-            predicate: None,
+            predicate: property,
             object: Some(id),
             graph: GraphSelector::AnyNamed,
         };
