@@ -65,9 +65,17 @@ fn path_bytes(path: &Path) -> usize {
     }
 }
 
-/// What a validation keeps, with the charge for it ([`Validator::into_failures`]): free the
-/// results, then drop the charge.
-pub(crate) type Kept = (Vec<RawResult>, Vec<String>, Reservation);
+/// A validation's failures with their charge, which goes where they go: the report takes
+/// both, nothing is charged twice. The fields drop in this order: the strings are freed,
+/// then their charge returned.
+pub(crate) struct Failures {
+    pub(crate) list: Vec<String>,
+    pub(crate) held: Reservation,
+}
+
+/// What a validation keeps ([`Validator::into_failures`]): its results, its failures with
+/// their charge, and the results' charge (free the results, then drop it).
+pub(crate) type Kept = (Vec<RawResult>, Failures, Reservation);
 
 /// Validates the data in `data` against every targeted shape: the results, and the
 /// failures (SPARQL-based constraints that couldn't be evaluated), with their charge to
@@ -91,9 +99,32 @@ pub(crate) fn validate_raw<V: ReadView + Sync>(
                 .map(move |focus| (shape, focus))
         })
         .collect();
-    let results = validator.validate_all(&work);
+    let mut results = validator.validate_all(&work);
+    if validator.has_stopped() {
+        // Freed before their charge goes with the validator.
+        results = Vec::new();
+    }
     let (failures, held) = validator.into_failures()?;
     Ok((results, failures, held))
+}
+
+/// Charges `bytes` to `held`, or records the refusal as the validation's stop.
+fn charge_to(
+    held: &std::sync::Mutex<Reservation>,
+    stop: &OnceLock<QueryEvaluationError>,
+    bytes: usize,
+) -> bool {
+    let charged = held
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .charge(bytes);
+    match charged {
+        Ok(()) => true,
+        Err(refused) => {
+            let _ = stop.set(QueryEvaluationError::MemoryLimit(refused));
+            false
+        }
+    }
 }
 
 /// Whether validating `data` against `shapes` checks anything: an active targeted shape
@@ -141,9 +172,12 @@ pub(crate) struct Validator<'a, V: ReadView> {
     /// outcome, whatever the work returned.
     stop: OnceLock<QueryEvaluationError>,
     failures: std::sync::Mutex<Vec<String>>,
-    /// The charge, to the request's envelope, for the results and failures kept: made
-    /// before each is kept, held until they are dropped ([`Validator::keep`]).
-    held: std::sync::Mutex<Reservation>,
+    /// The charge, to the request's envelope, for the failures kept: made before each is
+    /// kept; it goes with them ([`Failures`]). Declared after them: freed, then returned.
+    held_failures: std::sync::Mutex<Reservation>,
+    /// The charge for the results kept: made before each is kept, held until they are
+    /// dropped ([`Validator::keep`]).
+    held_results: std::sync::Mutex<Reservation>,
     rdf_type: Option<TermId>,
     /// Each class the shapes name, with its subclasses (itself included).
     classes: HashMap<TermId, BTreeSet<TermId>>,
@@ -174,7 +208,12 @@ impl<'a, V: ReadView> Validator<'a, V> {
             resources,
             stop: OnceLock::new(),
             failures: std::sync::Mutex::default(),
-            held: std::sync::Mutex::new(Reservation::new(Arc::new(resources.memory.part()))),
+            held_failures: std::sync::Mutex::new(Reservation::new(Arc::new(
+                resources.memory.part(),
+            ))),
+            held_results: std::sync::Mutex::new(Reservation::new(Arc::new(
+                resources.memory.part(),
+            ))),
             classes: HashMap::new(),
         };
         let sub_class_of = graph.iri(RDFS_SUB_CLASS_OF);
@@ -200,42 +239,43 @@ impl<'a, V: ReadView> Validator<'a, V> {
         validator
     }
 
-    /// The failures recorded while validating, with the charge for them and the results
-    /// kept, or the stop that ended it: then no result it produced may be used.
-    pub(crate) fn into_failures(self) -> Result<(Vec<String>, Reservation), QueryEvaluationError> {
+    /// The failures recorded while validating, with their charge, and the charge for the
+    /// results kept; or the stop that ended it: then no result it produced may be used (drop
+    /// them first: [`Validator::has_stopped`]).
+    pub(crate) fn into_failures(self) -> Result<(Failures, Reservation), QueryEvaluationError> {
         if let Some(stop) = self.stop.into_inner() {
             return Err(stop);
         }
-        let failures = self
+        let list = self
             .failures
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let held = self
-            .held
+            .held_failures
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        Ok((failures, held))
+        let results = self
+            .held_results
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok((Failures { list, held }, results))
     }
 
-    /// Charges `bytes` to the request's envelope, or records its refusal as the stop.
+    /// Whether a stop was met: the results made are then dropped before the validator (and
+    /// with it their charge) goes.
+    pub(crate) fn has_stopped(&self) -> bool {
+        self.stop.get().is_some()
+    }
+
+    /// Charges `bytes` for a result to the request's envelope, or records its refusal as
+    /// the stop.
     fn charge(&self, bytes: usize) -> bool {
-        let charged = self
-            .held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .charge(bytes);
-        match charged {
-            Ok(()) => true,
-            Err(refused) => {
-                let _ = self.stop.set(QueryEvaluationError::MemoryLimit(refused));
-                false
-            }
-        }
+        charge_to(&self.held_results, &self.stop, bytes)
     }
 
-    /// Returns `bytes` charged for what has been dropped.
+    /// Returns `bytes` charged for results that have been dropped.
     pub(crate) fn release(&self, bytes: usize) {
-        self.held
+        self.held_results
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .release(bytes);
@@ -651,8 +691,13 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 .decode(focus)
                 .map_or_else(String::new, |term| term.to_string());
             let failure = format!("a SPARQL constraint at focus node {at}: {problem}");
-            // Kept like a result: charged first (twice its slot, for the vector's growth).
-            if self.charge(2 * std::mem::size_of::<String>() + failure.len()) {
+            // Charged first (twice its slot, for the vector's growth), to the failures' own
+            // charge, which the report takes over with them.
+            if charge_to(
+                &self.held_failures,
+                &self.stop,
+                2 * std::mem::size_of::<String>() + failure.len(),
+            ) {
                 self.failures
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
