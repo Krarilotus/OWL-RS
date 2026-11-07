@@ -293,11 +293,22 @@ pub(super) fn unbounded(analysis: &Analysis) -> Option<String> {
 /// Why the bounds can't decide `analysis`'s `owl:sameAs` reads: eq-ref (OWL 2 Profiles
 /// table 4: every term is `owl:sameAs` itself) is in neither bound: the RL rules leave it
 /// out by design, and so does U1. Holds on every route, so it is asked before [`closed`].
-pub(super) fn reflexive_same_as(analysis: &Analysis) -> Option<&'static str> {
-    analysis.reflexive_same_as.then_some(
-        "the query reads owl:sameAs where both ends can be one term: reflexive owl:sameAs \
-         isn't materialised in either bound",
-    )
+/// The answers over L then miss certain ones; under an operator that isn't monotone
+/// (`not_monotone`: NOT EXISTS, MINUS, OPTIONAL, …) a missing pair can also keep a row the
+/// certain answers lack, so they aren't sound either: `(why, sound)`.
+pub(super) fn reflexive_same_as(analysis: &Analysis) -> Option<(String, bool)> {
+    if !analysis.reflexive_same_as {
+        return None;
+    }
+    const WHY: &str = "the query reads owl:sameAs where both ends can be one term: reflexive \
+                       owl:sameAs isn't materialised in either bound";
+    Some(match analysis.not_monotone {
+        None => (WHY.to_owned(), true),
+        Some(op) => (
+            format!("{WHY}, and under {op}, which isn't monotone, a row it would remove is kept"),
+            false,
+        ),
+    })
 }
 
 /// Whether every predicate and class `analysis` reads has no fact in U1 beyond L.

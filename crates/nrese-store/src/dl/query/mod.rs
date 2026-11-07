@@ -179,6 +179,16 @@ impl Status {
         self.completeness.incomplete("dl", reason);
     }
 
+    /// `add`, or where the answers may hold rows the certain answers lack (`sound`
+    /// false), neither sound nor complete.
+    fn add_open(&mut self, (reason, sound): (String, bool)) {
+        if sound {
+            self.add(reason);
+        } else {
+            self.completeness.unsound("dl", reason);
+        }
+    }
+
     /// Names an unresolved candidate (the first [`super::UNRESOLVED_SHOWN`]).
     fn unresolved(&mut self, candidate: String) {
         if self.detail.unresolved.len() < super::UNRESOLVED_SHOWN {
@@ -230,8 +240,10 @@ fn plan_status_built(store: &StoreService, prepared: &PreparedQuery) -> Status {
             "the query reads {what}: entailed schema statements aren't bounded"
         ));
     }
-    if let Some(why) = reflexive_same_as(&analysis) {
-        return Status::sound_only(why);
+    if let Some(open) = reflexive_same_as(&analysis) {
+        let mut status = Status::complete();
+        status.add_open(open);
+        return status;
     }
     if closed(&analysis, &view, &snapshot) {
         let mut status = Status::complete();
@@ -355,8 +367,8 @@ fn decide_answers(
         ));
         return Ok(status.stream(lower_view(&view)));
     }
-    if let Some(why) = reflexive_same_as(&analysis) {
-        status.add(why.to_owned());
+    if let Some(open) = reflexive_same_as(&analysis) {
+        status.add_open(open);
         return Ok(status.stream(lower_view(&view)));
     }
     if closed(&analysis, &view, &snapshot) {
