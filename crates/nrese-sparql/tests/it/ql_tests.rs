@@ -464,6 +464,124 @@ fn existentials_feeding_a_transitive_role_are_flagged() {
     );
 }
 
+/// A query's answer through the rewriting and its status: `(answer, status, reasons)`.
+fn answered(e: &Engine, query: &str) -> (String, String, String) {
+    let plan = plan_query(&e.snapshot(), &parse(query), &on()).unwrap();
+    let ql = plan.ql.expect("the rewriting applies");
+    let reasons: Vec<String> = ql
+        .completeness
+        .reasons
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+    (
+        rows(e, query, &on()).join(" "),
+        ql.completeness.as_str().to_owned(),
+        reasons.join(" | "),
+    )
+}
+
+/// The restriction `≥ n R.⊤` in Turtle.
+fn at_least(n: u32, property: &str) -> String {
+    format!(
+        "[ a owl:Restriction ; owl:onProperty {property} ; owl:minCardinality \
+         \"{n}\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ]"
+    )
+}
+
+/// An individual asserted to be in an existential has a successor there (OWL 2 Direct
+/// Semantics): `p : ∃S.A` entails `ASK { :p :S ?y . ?y a :A }`, `ASK { :p :S+ ?y . ?y
+/// a :A }` and `ASK { ?y a :A }`. A class assertion of a class expression is outside OWL 2 QL (OWL 2 Profiles
+/// §3.2: a QL `ClassAssertion` names a class), so the rewriting needn't find the answer,
+/// but then the status must say `sound-only` (design §7). The same for `p : ∃S.(≥ 2 R.⊤)`
+/// with `≥ 2 R.⊤ ⊑ A`, a schema the rewriting has nothing to read in (#42's S3), and with a
+/// schema it does read.
+#[test]
+fn asserted_existentials_are_answered_or_reported() {
+    let some = |filler: &str| {
+        format!(":p a [ a owl:Restriction ; owl:onProperty :S ; owl:someValuesFrom {filler} ] .")
+    };
+    let two = at_least(2, ":R");
+    let elsewhere = ":Q rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :T ;
+        owl:someValuesFrom :B ] .";
+    let cases = [
+        ("plain", some(":A")),
+        (
+            "minimum",
+            format!("{} {two} rdfs:subClassOf :A .", some(&two)),
+        ),
+        ("with a schema", format!("{} {elsewhere}", some(":A"))),
+    ];
+    let mut wrong = Vec::new();
+    for (name, turtle) in &cases {
+        let e = engine(turtle);
+        for query in [
+            "ASK { :p :S ?y . ?y a :A }",
+            "ASK { :p :S+ ?y . ?y a :A }",
+            "ASK { ?y a :A }",
+        ] {
+            let (answer, status, reasons) = answered(&e, query);
+            if answer != "true" && status != "sound-only" {
+                wrong.push(format!("{name}, {query}: {answer}, {status} ({reasons})"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A left side every individual is in classifies the anonymous ones too: with `P ⊑ ∃S` and
+/// `p : P`, `L ⊑ A` entails `ASK { :p :S ?y . ?y a :A }` for `L` = `⊤ ⊓ ≥ 0 R.⊤`, `B ⊔ ¬B`
+/// or `¬⊥`, each equivalent to `⊤` (OWL 2 Direct Semantics). Each is outside OWL 2 QL (OWL
+/// 2 Profiles §3.2: a QL subclass expression is a class other than `owl:Thing` or `∃R.⊤`),
+/// so the answer is `true` or the status `sound-only`. Also without `P ⊑ ∃S`, where the
+/// open left side's own conclusion is the existential: `¬⊥ ⊑ ∃S.A`.
+///
+/// Guards (they pass on the base too): `⊤ ⊑ A` the rewriting reads: `true`, complete.
+/// `∃R.C ⊑ A` doesn't hold of `S`'s successor (a model gives it no `R` edge): `false`,
+/// complete.
+#[test]
+fn left_sides_any_individual_is_in_are_answered_or_reported() {
+    let base = ":P rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :S ;
+            owl:someValuesFrom owl:Thing ] .
+        :p a :P .";
+    let some_r = "[ a owl:Restriction ; owl:onProperty :R ; owl:someValuesFrom :C ]";
+    let not_nothing = "[ owl:complementOf owl:Nothing ]";
+    let open = [
+        format!("[ owl:intersectionOf ( owl:Thing {} ) ]", at_least(0, ":R")),
+        "[ owl:unionOf ( :B [ owl:complementOf :B ] ) ]".to_owned(),
+        not_nothing.to_owned(),
+    ];
+    let query = "ASK { :p :S ?y . ?y a :A }";
+    let mut cases: Vec<(String, String)> = open
+        .iter()
+        .map(|left| (left.clone(), format!("{base} {left} rdfs:subClassOf :A .")))
+        .collect();
+    cases.push((
+        format!("{not_nothing} ⊑ ∃S.A"),
+        format!(
+            ":p a :P . {not_nothing} rdfs:subClassOf [ a owl:Restriction ;
+                owl:onProperty :S ; owl:someValuesFrom :A ] ."
+        ),
+    ));
+    let mut wrong = Vec::new();
+    for (name, turtle) in &cases {
+        let e = engine(turtle);
+        let (answer, status, reasons) = answered(&e, query);
+        if answer != "true" && status != "sound-only" {
+            wrong.push(format!("{name}: {answer}, {status} ({reasons})"));
+        }
+    }
+    // Guards.
+    for (left, expected) in [("owl:Thing", "true"), (some_r, "false")] {
+        let e = engine(&format!("{base} {left} rdfs:subClassOf :A ."));
+        let (answer, status, reasons) = answered(&e, query);
+        if (answer.as_str(), status.as_str()) != (expected, "complete") {
+            wrong.push(format!("{left}: {answer}, {status} ({reasons})"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// `EXISTS`, `NOT EXISTS`, `MINUS`'s right side and `GRAPH` naming the default graph read
 /// the entailments as the query's other patterns do (design §2): a pattern there is a set,
 /// its variables bound outside answer variables. Named graphs hold their asserted

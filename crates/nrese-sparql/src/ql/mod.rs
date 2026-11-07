@@ -74,6 +74,16 @@ const DECLARATIONS: &[(&str, &str)] = &[
     (OWL, "InverseFunctionalProperty"),
 ];
 
+/// The properties that make their blank subject a class expression (`nrese-owl`'s
+/// mapping): a restriction's and the set operators'.
+const EXPRESSIONS: &[&str] = &[
+    "onProperty",
+    "intersectionOf",
+    "unionOf",
+    "complementOf",
+    "oneOf",
+];
+
 /// The list-valued properties whose lists are read.
 const LISTS: &[&str] = &[
     "intersectionOf",
@@ -282,6 +292,25 @@ fn schema_statements(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
             if let Some(class) = iri(snapshot, namespace, local) {
                 scan(pattern(rdf_type, Some(class)), &mut out);
             }
+        }
+        // Individuals asserted to be in a class expression (`:p a [ owl:onProperty … ]`),
+        // which have anonymous individuals of their own (design §7): the `rdf:type`
+        // statements of each blank node the schema read makes an expression.
+        let operators: Vec<u64> = EXPRESSIONS
+            .iter()
+            .filter_map(|local| iri(snapshot, OWL, local))
+            .map(TermId::raw)
+            .collect();
+        let mut expressions: Vec<u64> = out
+            .iter()
+            .filter(|s| operators.contains(&s.triple[1]))
+            .map(|s| s.triple[0])
+            .filter(|&node| TermId::from_raw(node).kind() == nrese_engine::TermKind::BlankNode)
+            .collect();
+        expressions.sort_unstable();
+        expressions.dedup();
+        for node in expressions {
+            scan(pattern(rdf_type, Some(TermId::from_raw(node))), &mut out);
         }
     }
     // The lists: from each head, `rdf:first` and `rdf:rest` along the cells.

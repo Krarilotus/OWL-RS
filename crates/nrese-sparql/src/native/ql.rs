@@ -709,14 +709,14 @@ impl Rewriter<'_> {
     }
 
     /// Notes that patterns under `node` (`place` says where) run without the rewriting,
-    /// if they read a term it would change, or a variable predicate or class.
+    /// if they read a term it would change or whose answers through anonymous individuals
+    /// may be missing (a concern, as a read atom's), or a variable predicate or class.
     fn unread(&mut self, node: Node<'_>, place: &str) {
         let tbox = self.tbox;
         let snapshot = self.snapshot;
         let rewritten = |n: &NamedNode| {
-            snapshot
-                .lookup(n.as_ref().into())
-                .is_some_and(|id| tbox.rewrites_term(id.raw()))
+            let id = snapshot.lookup(n.as_ref().into()).map(TermId::raw);
+            id.is_some_and(|t| tbox.rewrites_term(t) || tbox.concern(t).is_some())
         };
         let mut hit: Option<String> = None;
         let mut look = |n: Node<'_>| {
@@ -766,7 +766,8 @@ impl Rewriter<'_> {
             self.report.completeness.incomplete(
                 "ql",
                 format!(
-                    "a pattern inside {place} runs without the rewriting, which changes {what}"
+                    "a pattern inside {place} runs without the rewriting; answers on {what} \
+                     may be missing"
                 ),
             );
         }
