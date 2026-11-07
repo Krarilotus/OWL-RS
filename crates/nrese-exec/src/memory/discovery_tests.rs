@@ -71,6 +71,10 @@ fn a_covered_mount_isnt_a_view() {
     const COVERED: &str = "30 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n\
                            40 23 0:26 /limited/worker /cg-local rw - cgroup2 cgroup2 rw\n\
                            50 23 0:40 / /sys/fs rw - tmpfs tmpfs rw\n";
+    // An older bind mount moved (MS_MOVE) over a newer full tree: mountinfo lists mounts by
+    // when they were made, so the covering mount comes first (sol-loop r4 S2).
+    const MOVED: &str = "40 30 0:26 /limited/worker /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n\
+                         30 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
     let (four, used) = ((4 * G).to_string(), G.to_string());
     let (four, used) = (four.as_str(), used.as_str());
     let rows: Vec<Row<'_>> = vec![
@@ -78,6 +82,19 @@ fn a_covered_mount_isnt_a_view() {
             "group bind-mounted over the full tree",
             vec![
                 ("/proc/self/mountinfo", STACKED),
+                ("/proc/self/cgroup", "0::/limited/worker"),
+                ("/sys/fs/cgroup/cgroup.controllers", "memory"),
+                ("/sys/fs/cgroup/memory.max", four),
+                ("/sys/fs/cgroup/memory.current", used),
+            ],
+            "",
+            Some(4 * G),
+            Some(3 * G),
+        ),
+        (
+            "group moved over a newer full tree",
+            vec![
+                ("/proc/self/mountinfo", MOVED),
                 ("/proc/self/cgroup", "0::/limited/worker"),
                 ("/sys/fs/cgroup/cgroup.controllers", "memory"),
                 ("/sys/fs/cgroup/memory.max", four),
