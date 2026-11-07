@@ -12,16 +12,24 @@
 //!   lock, appends the WAL record (durable mode) and swaps `current` under a short write lock.
 //!   The WAL mutex is held across append and publish, so a checkpoint that snapshots under the
 //!   WAL mutex sees exactly the logged revisions.
-//! - Compaction is serialised by its own slot and installs under the same short write lock.
-//!   Commits only append runs, and only holders of the compaction slot replace them (the
-//!   compactor, and a checkpoint that maps runs it covers), so a window planned from any
-//!   version keeps its position and contents until the compactor installs the merge.
-//!   Small windows are merged inside the commit; larger ones, and checkpoints, go to the
-//!   background worker.
+//! - Compaction merges one window at a time (the merge claim, [`Versions::claim`]) without
+//!   any slot, and publishes under the compaction slot where the window's runs are still
+//!   there. Commits only append runs; holders of the compaction slot replace them (a
+//!   merge's publication, a conversion to the quad layout, a mapped checkpoint, a load's
+//!   install), and keep it only for serial work. Small windows are merged inside the
+//!   commit; larger ones, and checkpoints, go to the background worker.
+//! - Slots and Rayon (SYN-22): the holders of the writer and checkpoint slots run parallel
+//!   work on their caller's pool, so a Rayon pool thread never waits for either slot: it
+//!   takes one only if free, and is refused otherwise ([`EngineError::SlotBusy`]; the
+//!   infallible writer forms panic, naming their `try_` form). No holder of the compaction
+//!   slot runs parallel work, so anyone may wait for it. Order: writer, checkpoint,
+//!   compaction, WAL, the current version; all before any dictionary lock.
 
 mod bulk;
 pub mod characteristic;
 mod equality;
+#[cfg(test)]
+mod lock_tests;
 mod replication;
 mod snapshot;
 pub(crate) mod spill;
@@ -33,11 +41,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 
 use crate::durability::codec::CommitRecord;
 use crate::durability::{DurabilityConfig, Durable, checkpoint};
-use crate::error::EngineResult;
+use crate::error::{EngineError, EngineResult};
 use crate::index::compaction::merge_runs;
 use crate::index::run::Run;
 use crate::index::{CompactionPolicy, IndexVersion, Layout};
@@ -47,8 +55,34 @@ use crate::term::{Dictionary, DictionaryStats, TermId};
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
 pub use equality::Classes as EqualityClasses;
 pub use replication::LogBatch;
-pub use snapshot::{InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity};
+pub use snapshot::{
+    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity,
+};
 pub use transaction::{CommitSummary, Transaction};
+
+/// `slot` (the writer or checkpoint slot, `name`d), taken if free; otherwise waited for off
+/// the Rayon pool, and refused on a pool thread ([`EngineError::SlotBusy`]). Its holder runs
+/// parallel work on its caller's pool with the slot held: a pool thread waiting for the slot
+/// may be what that work needs, or may have that work under it on its own stack.
+fn admit<'s>(slot: &'s Mutex<()>, name: &'static str) -> EngineResult<MutexGuard<'s, ()>> {
+    if let Some(held) = slot.try_lock() {
+        return Ok(held);
+    }
+    match rayon::current_thread_index() {
+        Some(_) => Err(EngineError::SlotBusy(name)),
+        None => Ok(slot.lock()),
+    }
+}
+
+/// The infallible writer forms' answer to a Rayon pool thread that finds the writer slot
+/// held, where waiting could hang the process.
+#[cold]
+fn on_the_pool(instead: &str) -> ! {
+    panic!(
+        "a Rayon pool thread asked for the engine's writer slot while it is held; waiting \
+         could hang (the holder's parallel work may need this thread): use Engine::{instead}"
+    )
+}
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -275,7 +309,11 @@ enum CompactionOutcome {
 
 struct Versions {
     current: RwLock<Arc<Version>>,
+    /// Held to replace runs, and only for serial work: anyone may wait for it.
     compaction_slot: Mutex<()>,
+    /// A merge runs ([`Self::claim`]); `merged` is notified when it ends.
+    merging: Mutex<bool>,
+    merged: Condvar,
     policy: CompactionPolicy,
     /// Merges published.
     compactions: AtomicU64,
@@ -286,8 +324,10 @@ impl Versions {
         self.current.read().clone()
     }
 
-    /// Replaces the current version with a prebuilt one. The caller must hold the writer slot
-    /// and the compaction slot, so that nothing was published since `version` was built.
+    /// Replaces the current version with a prebuilt one. The caller must hold the writer slot,
+    /// so that no statement changed since `version` was built from the latest content (a merge
+    /// or a mapped checkpoint published meanwhile changed runs only, and is replaced), and the
+    /// compaction slot, so that none is published while it is replaced.
     fn install(&self, version: Arc<Version>) {
         *self.current.write() = version;
     }
@@ -302,14 +342,14 @@ impl Versions {
 
     /// Merges windows until the policy is satisfied. With `inline_only`, stops before the
     /// first window above the inline limit and never waits for a running compaction.
+    ///
+    /// The merge runs without the compaction slot, on the caller's pool, and is published
+    /// under it where the window's runs are all still there (a conversion to the quad layout,
+    /// a mapped checkpoint or a load's install may have replaced them meanwhile: planned
+    /// afresh). One merge at a time ([`Self::claim`]).
     fn compact(&self, inline_only: bool) -> CompactionOutcome {
-        let _slot = if inline_only {
-            match self.compaction_slot.try_lock() {
-                Some(slot) => slot,
-                None => return CompactionOutcome::Deferred,
-            }
-        } else {
-            self.compaction_slot.lock()
+        let Some(_merging) = self.claim(inline_only) else {
+            return CompactionOutcome::Deferred;
         };
         loop {
             let version = self.load();
@@ -328,6 +368,7 @@ impl Versions {
             };
             let runs = version.stack(stack).runs();
             let merged = merge_runs(&runs[plan.window.clone()]);
+            let _slot = self.compaction_slot.lock();
             self.publish(|current| {
                 let index = current.stack(stack);
                 // A commit that turned the stack into the quad layout replaced its runs
@@ -348,6 +389,51 @@ impl Versions {
                 }
             });
         }
+    }
+
+    /// The right to merge, until the claim is dropped. Where a merge runs, an inline
+    /// compaction defers to it, and so does any on a Rayon pool thread: that thread may hold
+    /// a part of the running merge under its wait. Others wait for it to end.
+    fn claim(&self, inline_only: bool) -> Option<Merging<'_>> {
+        let mut merging = self.merging.lock();
+        if *merging {
+            if inline_only || rayon::current_thread_index().is_some() {
+                return None;
+            }
+            while *merging {
+                self.merged.wait(&mut merging);
+            }
+        }
+        *merging = true;
+        Some(Merging(self))
+    }
+
+    /// The asserted stack of the latest version converted to the quad layout (a record's
+    /// first quad in a named graph), with the compaction slot, so that nothing replaces the
+    /// stack's runs until the caller publishes. Converted without the slot, on the caller's
+    /// pool, and kept only where the stack's runs are still the ones converted (a merge or a
+    /// mapped checkpoint may have replaced them meanwhile: converted afresh).
+    fn converted_asserted(&self) -> (MutexGuard<'_, ()>, IndexVersion) {
+        loop {
+            let base = self.load();
+            let converted = base.asserted.with_quads_layout();
+            let slot = self.compaction_slot.lock();
+            let now = self.load();
+            let (was, is) = (base.asserted.runs(), now.asserted.runs());
+            if was.len() == is.len() && was.iter().zip(is).all(|(a, b)| Arc::ptr_eq(a, b)) {
+                return (slot, converted);
+            }
+        }
+    }
+}
+
+/// A merge running ([`Versions::claim`]); dropping it, on any path, ends the claim.
+struct Merging<'v>(&'v Versions);
+
+impl Drop for Merging<'_> {
+    fn drop(&mut self) {
+        *self.0.merging.lock() = false;
+        self.0.merged.notify_all();
     }
 }
 
@@ -388,12 +474,13 @@ impl Shared {
     /// Writes a checkpoint of the latest revision and releases the WAL it covers. Writers
     /// continue during the (long) file write. Returns the checkpointed revision. With
     /// `map_checkpoints`, the data is then served from the file ([`Self::serve_mapped`]).
+    /// On a Rayon pool thread while another checkpoint runs: [`EngineError::SlotBusy`].
     fn checkpoint(&self) -> EngineResult<u64> {
         let Some(durable) = &self.durable else {
             return Ok(self.versions.load().revision);
         };
         let (snapshot, path) = {
-            let _slot = durable.checkpoint_slot.lock();
+            let _slot = admit(&durable.checkpoint_slot, "checkpoint")?;
             let snapshot = {
                 let mut wal = durable.wal.lock();
                 let snapshot = self.snapshot();
@@ -616,6 +703,8 @@ impl Engine {
             versions: Versions {
                 current: RwLock::new(Arc::new(version)),
                 compaction_slot: Mutex::new(()),
+                merging: Mutex::new(false),
+                merged: Condvar::new(),
                 policy: config.compaction,
                 compactions: AtomicU64::new(0),
             },
@@ -683,6 +772,14 @@ impl Engine {
         *self.inner.shared.views.write() = budget;
     }
 
+    /// What runs the vector graph builds searches start from now on in the background
+    /// (spaces of [`SYNC_BUILD`](crate::term::vectors::SYNC_BUILD) vectors or more): the
+    /// owner's executor, which may also hold or refuse them. Unset, each build gets a
+    /// thread of its own.
+    pub fn run_vector_builds_with(&self, builder: crate::term::vectors::VectorBuilder) {
+        self.inner.shared.dictionary.set_vector_builder(builder);
+    }
+
     /// `owl:sameAs` if reads expand equality classes ([`Self::set_equality`]).
     pub fn equality(&self) -> Option<TermId> {
         *self.inner.shared.equality.read()
@@ -690,9 +787,21 @@ impl Engine {
 
     /// Starts a transaction, waiting for the writer slot. Dropping it without
     /// [`commit`](Transaction::commit) aborts it.
+    ///
+    /// Contract (here, for [`Self::bulk_load`] and for [`Self::rematerialisation`]): a Rayon
+    /// pool thread never waits for the writer slot, whose holder runs parallel work on its
+    /// caller's pool. On a pool thread that finds it held, this panics, naming
+    /// [`Self::try_transaction`], which returns [`EngineError::SlotBusy`] instead.
     pub fn transaction(&self) -> Transaction<'_> {
-        let slot = self.inner.writer.lock();
-        Transaction::new(&self.inner, Some(slot))
+        self.try_transaction()
+            .unwrap_or_else(|_| on_the_pool("try_transaction"))
+    }
+
+    /// [`Self::transaction`], or [`EngineError::SlotBusy`] on a Rayon pool thread while the
+    /// writer slot is held.
+    pub fn try_transaction(&self) -> EngineResult<Transaction<'_>> {
+        let slot = admit(&self.inner.writer, "writer")?;
+        Ok(Transaction::new(&self.inner, Some(slot)))
     }
 
     /// A transaction over the latest snapshot that never commits and doesn't take the
@@ -703,17 +812,32 @@ impl Engine {
         Transaction::new(&self.inner, None)
     }
 
-    /// Starts a bulk load, waiting for the writer slot. See [`BulkLoad`].
+    /// Starts a bulk load, waiting for the writer slot. See [`BulkLoad`]; on a Rayon pool
+    /// thread, the contract of [`Self::transaction`].
     pub fn bulk_load(&self, mode: BulkMode) -> BulkLoad<'_> {
-        let slot = self.inner.writer.lock();
-        BulkLoad::new(&self.inner, slot, mode)
+        self.try_bulk_load(mode)
+            .unwrap_or_else(|_| on_the_pool("try_bulk_load"))
+    }
+
+    /// [`Self::bulk_load`], or [`EngineError::SlotBusy`] on a Rayon pool thread while the
+    /// writer slot is held.
+    pub fn try_bulk_load(&self, mode: BulkMode) -> EngineResult<BulkLoad<'_>> {
+        let slot = admit(&self.inner.writer, "writer")?;
+        Ok(BulkLoad::new(&self.inner, slot, mode))
     }
 
     /// Starts replacing the inferred stack, waiting for the writer slot. See
-    /// [`Rematerialisation`].
+    /// [`Rematerialisation`]; on a Rayon pool thread, the contract of [`Self::transaction`].
     pub fn rematerialisation(&self) -> Rematerialisation<'_> {
-        let slot = self.inner.writer.lock();
-        Rematerialisation::new(&self.inner, slot)
+        self.try_rematerialisation()
+            .unwrap_or_else(|_| on_the_pool("try_rematerialisation"))
+    }
+
+    /// [`Self::rematerialisation`], or [`EngineError::SlotBusy`] on a Rayon pool thread while
+    /// the writer slot is held.
+    pub fn try_rematerialisation(&self) -> EngineResult<Rematerialisation<'_>> {
+        let slot = admit(&self.inner.writer, "writer")?;
+        Ok(Rematerialisation::new(&self.inner, slot))
     }
 
     /// Waits until background maintenance has nothing requested or running: a compaction
@@ -732,14 +856,17 @@ impl Engine {
         }
     }
 
-    /// Compacts until the policy is satisfied, waiting for any background merge.
+    /// Compacts until the policy is satisfied, waiting for any background merge. On a Rayon
+    /// pool thread it doesn't wait: where a merge runs, it leaves the work to that merge,
+    /// which goes on until the policy is satisfied.
     pub fn compact(&self) {
         self.inner.shared.versions.compact(false);
     }
 
     /// Writes a checkpoint of the latest revision and deletes the WAL segments it covers.
     /// Writers are not blocked while the checkpoint is written. No-op for in-memory engines.
-    /// Returns the checkpointed revision.
+    /// Returns the checkpointed revision; [`EngineError::SlotBusy`] on a Rayon pool thread
+    /// while another checkpoint is written.
     pub fn checkpoint(&self) -> EngineResult<u64> {
         self.inner.shared.checkpoint()
     }

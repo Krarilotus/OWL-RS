@@ -37,6 +37,9 @@ pub enum Unsupported {
     TooLarge,
     /// The saturation's budget ran out ([`super::engine::Budget`]).
     Budget,
+    /// The process's memory couldn't be read for the saturation's limit
+    /// ([`super::engine::Budget::max_memory`]), which then can't be enforced: it stopped.
+    MemoryUnreadable,
 }
 
 impl fmt::Display for Unsupported {
@@ -52,6 +55,10 @@ impl fmt::Display for Unsupported {
             Unsupported::Normalisation { axiom, why } => write!(out, "{why} (axiom {axiom})"),
             Unsupported::TooLarge => write!(out, "too many concepts or roles"),
             Unsupported::Budget => write!(out, "the saturation's budget ran out"),
+            Unsupported::MemoryUnreadable => write!(
+                out,
+                "the process's memory couldn't be read for the saturation's limit"
+            ),
         }
     }
 }

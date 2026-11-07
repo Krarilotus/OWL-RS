@@ -51,7 +51,8 @@ fn contents(engine: &Engine) -> (HashSet<Quad>, HashSet<String>) {
 }
 
 /// Commits a batch: inserts (the first named graph at commit 5), a delete, and an
-/// inferred statement over the inserted terms.
+/// inferred statement over the first insert's terms that nothing asserts: commit `n`
+/// leaves `n + 1` inferred statements.
 fn commit(engine: &Engine, n: u64) {
     let mut tx = engine.transaction();
     let first = quad(n, n >= 5 && n % 2 == 1);
@@ -60,10 +61,13 @@ fn commit(engine: &Engine, n: u64) {
     if n % 4 == 3 {
         tx.remove(quad(n - 2, false).as_ref());
     }
-    let snapshot_ids = tx.inserted().next().map(EncodedTriple::from);
-    if let Some(triple) = snapshot_ids {
-        tx.insert_inferred(triple);
-    }
+    let predicate = NamedNode::new_unchecked("http://example.com/inferred");
+    let inferred = EncodedTriple {
+        subject: tx.intern(first.subject.as_ref().into()),
+        predicate: tx.intern(predicate.as_ref().into()),
+        object: tx.intern(first.object.as_ref()),
+    };
+    assert!(tx.insert_inferred(inferred), "commit {n}: inferred");
     tx.commit().expect("commit");
 }
 
@@ -95,11 +99,15 @@ fn a_replica_holds_what_the_primary_holds() {
         commit(&primary, n);
         if n % 6 == 0 {
             catch_up(&primary, &replica).unwrap();
-            assert_eq!(contents(&replica), contents(&primary), "at {n}");
+            let held = contents(&primary);
+            assert_eq!(held.1.len(), n as usize + 1, "inferred at {n}");
+            assert_eq!(contents(&replica), held, "at {n}");
         }
     }
     assert_eq!(catch_up(&primary, &replica).unwrap(), 20);
-    assert_eq!(contents(&replica), contents(&primary));
+    let held = contents(&primary);
+    assert_eq!(held.1.len(), 20, "inferred");
+    assert_eq!(contents(&replica), held);
     assert_eq!(
         replica.stats().dictionary.terms,
         primary.stats().dictionary.terms

@@ -20,10 +20,15 @@ once for the whole run, for the tests and every process they start:
   user's. Both go when the run ends;
 - stops git's search for a repository at the temporary directory and at this repository
   (GIT_CEILING_DIRECTORIES): git started in a test's temporary directory, or below the
-  repository's top, finds none above it, so a test reaches this repository only by naming it.
+  repository's top, finds none above it.
 
-The tests run in a scratch directory of the module's own (SCRATCH), not in the checkout the run
-started in. A test that needs commits makes them in a repository of its own (repo()).
+The ceilings are a guard on git's discovery, not a sandbox: a test that names this repository
+(`git -C ROOT`, `cwd=ROOT`) still reaches it, and git started at its top finds it. What keeps a
+test out is that it names its own: it runs in a scratch directory of the module's own (SCRATCH),
+not in the checkout the run started in; it makes the commits it needs in a repository of its
+own (repo()), and copies the scripts it runs into a checkout of its own (checkout()). A process
+a test starts takes its environment from inherit() or environment(), the suite's one git policy
+(GIT) included.
 
     pytest:    tests/conftest.py imports it
     unittest:  python benches/suite/tests/isolation.py discover -s benches/suite/tests
@@ -70,11 +75,25 @@ LAUNCH = ("PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "
           "TMPDIR", "LANG", "LC_ALL")
 
 
+def inherit(*drop: str, git: dict[str, str] | None = None, **values: str) -> dict[str, str]:
+    """A process environment from the run's own (os.environ, isolated on import): without any GIT_*
+    a test has set in it since, without the variables whose names start with `drop` (NRESE_,
+    FLEET_, CARGO_: a caller's gate, job or build settings), with the suite's git policy (GIT), and
+    `values` last. A scenario with git configuration of its own (its global file, hooks it runs)
+    passes `git`, which replaces the policy whole: GIT_CONFIG_COUNT outranks every configuration
+    file, so the suite's core.hooksPath and identity would win over its own; `git={}` is a
+    caller's environment with no git settings at all. HOME and the rest stay the caller's."""
+    base = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", *drop))}
+    return {**base, **(GIT if git is None else git), **values}
+
+
 def environment(**values: str) -> dict[str, str]:
     """A process environment of the test's own: what the OS needs to launch a program (LAUNCH),
-    the suite's git isolation, and `values`; nothing else of the caller's (an inherited
-    NRESE_DOCKER took a cleanup test past its fake Docker)."""
-    return {**{k: v for k, v in os.environ.items() if k in LAUNCH or k.startswith("GIT_")}, **values}
+    the suite's git policy (GIT), and `values`; nothing else of the caller's (an inherited
+    NRESE_DOCKER took a cleanup test past its fake Docker). LAUNCH keeps the caller's HOME and
+    USERPROFILE: a program reading its home's files reads the caller's, unless `values` names
+    another."""
+    return {**{k: v for k, v in os.environ.items() if k in LAUNCH}, **GIT, **values}
 
 
 def checkout(dest: Path, *paths: str) -> Path:
@@ -88,7 +107,8 @@ def checkout(dest: Path, *paths: str) -> Path:
 
 
 def repo(path: Path, commits: int) -> list[str]:
-    """A repository of the test's own at `path` with `commits` empty commits in a line: their full
+    """A repository of the test's own at `path` with `commits` commits in a line, the first holding
+    the files already at `path` (a checkout() of this one's scripts), the others empty: their full
     ids, oldest first. A test that needs commits makes them here, never reads this repository's
     history (a fleet checkout may be shallow or pruned)."""
     def git(*args: str) -> str:
@@ -96,6 +116,7 @@ def repo(path: Path, commits: int) -> list[str]:
                               timeout=60).stdout.strip()
     path.mkdir(parents=True, exist_ok=True)
     git("init", "-q")
+    git("add", "-A")
     for n in range(commits):
         git("commit", "-q", "--allow-empty", "-m", f"commit {n + 1}")
     return git("rev-list", "--reverse", "HEAD").split()
@@ -104,6 +125,7 @@ def repo(path: Path, commits: int) -> list[str]:
 if __name__ == "__main__":
     sys.modules["isolation"] = sys.modules["__main__"]  # one isolation, however a test imports it
 OWN = isolate()
+GIT = {k: v for k, v in os.environ.items() if k.startswith("GIT_")}  # the policy isolate() set, all of it
 SCRATCH = OWN / "cwd"
 
 

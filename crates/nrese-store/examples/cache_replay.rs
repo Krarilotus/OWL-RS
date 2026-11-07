@@ -135,8 +135,8 @@ impl Rng {
     }
 }
 
-fn mib(bytes: Option<u64>) -> String {
-    bytes.map_or("?".to_owned(), |b| {
+fn mib(bytes: nrese_exec::memory::Reading) -> String {
+    bytes.map_or("unread".to_owned(), |b| {
         format!("{:.1}", b as f64 / f64::from(1 << 20))
     })
 }
@@ -239,7 +239,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_s - first_round_s,
         mib(after_open),
         mib(after_replay),
-        mib(Some(stats.bytes as u64)),
+        mib(Ok(stats.bytes as u64)),
         stats.entries,
         stats.hits,
         stats.misses,

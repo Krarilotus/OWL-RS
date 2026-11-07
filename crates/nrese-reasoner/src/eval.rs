@@ -19,7 +19,7 @@ use super::ir::{Atom, Guard, Head, OWL, RDF, RDFS, Rule, Term, Vocabulary};
 use super::lists::Facts;
 
 /// Driver matches per parallel work unit.
-const MORSEL: usize = 4096;
+pub(crate) const MORSEL: usize = 4096;
 
 /// Which facts an atom reads in a semi-naive variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -766,6 +766,43 @@ impl<'r> Job<'r> {
             Drivers::InPlace(_) => source.scan_range(self.pattern, self.seg, range, &mut visit),
         }
     }
+
+    /// [`Job::run`] that stops once `emit` returns true ([`walk_until`]): the rest of the
+    /// scans under way, the drivers' included, is passed over. Returns whether `emit`
+    /// stopped it. For the consistency check, whose report can refuse; materialisation
+    /// runs [`Job::run`], which never stops.
+    pub fn run_until<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        range: std::ops::Range<usize>,
+        emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
+    ) -> bool {
+        let mut bindings = vec![None; self.rule.variables()];
+        let driver = &self.rule.body[self.order[0].0];
+        let mut stopped = false;
+        let mut visit = |fact: Triple| {
+            if stopped {
+                return;
+            }
+            if let Some(newly) = bind(driver, fact, &mut bindings) {
+                stopped = walk_until(
+                    source,
+                    &self.rule.body,
+                    &self.rule.guards,
+                    &self.order,
+                    1,
+                    &mut bindings,
+                    emit,
+                );
+                unbind(driver, newly, &mut bindings);
+            }
+        };
+        match &self.drivers {
+            Drivers::Collected(drivers) => drivers[range].iter().for_each(|&fact| visit(fact)),
+            Drivers::InPlace(_) => source.scan_range(self.pattern, self.seg, range, &mut visit),
+        }
+        stopped
+    }
 }
 
 /// Runs `jobs` in parallel morsels; returns the facts their heads derive that `keep`
@@ -782,12 +819,82 @@ fn never() -> bool {
 pub const NEVER: Stop<'static> = &never;
 
 /// Whether the process holds more than its memory limit
-/// ([`nrese_exec::memory::set_process_limit`]): materialisations and commits stop then,
-/// whatever `stop` their caller passes ([`super::delta::Interrupted`]). A collected
-/// closure can outgrow any time budget (a DL bound's evaluation reached 49 GB under a
-/// deadline, 6 October 2026); the caller tells the two apart by asking this again.
+/// ([`nrese_exec::memory::set_process_limit`]), or its memory can't be read:
+/// materialisations and commits stop then, whatever `stop` their caller passes
+/// ([`OperationStop`]). A collected closure can outgrow any time budget (a DL bound's
+/// evaluation reached 49 GB under a deadline, 6 October 2026).
 pub fn over_memory_limit() -> bool {
     nrese_exec::memory::process_limit_exceeded()
+}
+
+/// What polls the process's memory limit for an operation, and why it stops it
+/// ([`nrese_exec::memory::process_limit_stop`]).
+pub type MemoryPoll<'a> = &'a (dyn Fn() -> Option<nrese_exec::memory::MemoryStopCause> + Sync);
+
+/// One operation's stop (a materialisation, a commit's maintenance): its caller's `stop`,
+/// or the process's memory limit. Once it fires it stays fired for this operation, so a
+/// morsel it made skip is never taken for done by a later poll that finds the memory under
+/// the limit again, and it keeps the memory's cause of that moment ([`Self::interrupted`]),
+/// whatever another operation's poll reads since. The next operation makes its own and may
+/// run.
+pub struct OperationStop<'a> {
+    caller: Stop<'a>,
+    memory: MemoryPoll<'a>,
+    /// 0: not fired; else what fired it ([`OperationStop::fired`]).
+    fired: std::sync::atomic::AtomicU8,
+}
+
+impl<'a> OperationStop<'a> {
+    /// Under the process's memory limit.
+    pub fn new(caller: Stop<'a>) -> Self {
+        Self::with_poll(caller, &nrese_exec::memory::process_limit_stop)
+    }
+
+    /// Under the limit `memory` polls (the process's, or a test's).
+    pub fn with_poll(caller: Stop<'a>, memory: MemoryPoll<'a>) -> Self {
+        Self {
+            caller,
+            memory,
+            fired: std::sync::atomic::AtomicU8::new(0),
+        }
+    }
+
+    /// Whether the operation is to stop: an atomic load once it has.
+    pub fn fired(&self) -> bool {
+        use nrese_exec::memory::MemoryStopCause;
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.fired.load(Relaxed) != 0 {
+            return true;
+        }
+        let code = if (self.caller)() {
+            Self::CALLER
+        } else {
+            match (self.memory)() {
+                None => return false,
+                Some(MemoryStopCause::OverLimit) => Self::OVER_LIMIT,
+                Some(MemoryStopCause::Unread) => Self::UNREAD,
+            }
+        };
+        // The first to fire it names it.
+        let _ = self.fired.compare_exchange(0, code, Relaxed, Relaxed);
+        true
+    }
+
+    /// The interruption it ends the operation with: the memory's cause, if the memory
+    /// limit fired it.
+    pub fn interrupted(&self) -> super::delta::Interrupted {
+        use nrese_exec::memory::MemoryStopCause;
+        let memory = match self.fired.load(std::sync::atomic::Ordering::Relaxed) {
+            Self::OVER_LIMIT => Some(MemoryStopCause::OverLimit),
+            Self::UNREAD => Some(MemoryStopCause::Unread),
+            _ => None,
+        };
+        super::delta::Interrupted { memory }
+    }
+
+    const CALLER: u8 = 1;
+    const OVER_LIMIT: u8 = 2;
+    const UNREAD: u8 = 3;
 }
 
 /// Every fact `jobs` derive that `keep` accepts. If `stop` fires, the remaining morsels

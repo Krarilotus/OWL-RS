@@ -283,3 +283,57 @@ fn a_refused_expanded_read_fails_the_query() {
         "{answered} answered, {refused} refused"
     );
 }
+
+/// Equality classes expanded after a join (the default) fail as the query's memory error
+/// when the answer is too large, with a budget or without one; they never abort the
+/// process. One class of 1,000 identities that holds the predicate: `sameAs sameAs sameAs`
+/// joined with itself is one row over representatives and 1000^5 rows expanded.
+#[test]
+fn a_late_expansion_past_memory_fails_the_query() {
+    use nrese_engine::EncodedTriple;
+    use nrese_rdf::NamedNode;
+    use nrese_sparql::{QueryEvaluationError, QueryResults};
+
+    let engine = Engine::new(EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let mut tx = engine.transaction();
+    let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+    // Interned first, owl:sameAs has the smallest id: its class's representative.
+    let same_as = tx.intern(same_as.as_ref().into());
+    let same_as_rep = |subject| EncodedTriple {
+        subject,
+        predicate: same_as,
+        object: same_as,
+    };
+    tx.insert_inferred(same_as_rep(same_as));
+    for i in 1..1_000 {
+        let identity = NamedNode::new_unchecked(format!("urn:i{i}"));
+        let identity = tx.intern(identity.as_ref().into());
+        tx.insert_inferred(same_as_rep(identity));
+    }
+    tx.commit().unwrap();
+    engine.set_equality(Some(same_as));
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new()
+        .parse_query("SELECT * WHERE { ?s ?p ?o . ?o ?q ?x }")
+        .unwrap();
+    for limit in [Some(1 << 30), None] {
+        let options = QueryOptions {
+            resources: Resources {
+                memory: nrese_exec::Envelope::new(limit, None),
+                ..Default::default()
+            },
+            ..QueryOptions::default()
+        };
+        let rows = match evaluate_query(&snapshot, &query, &options) {
+            Ok(QueryResults::Solutions(rows)) => rows.count(),
+            Ok(_) => panic!("solutions"),
+            Err(QueryEvaluationError::MemoryLimit(_)) => continue,
+            Err(other) => panic!("{limit:?} bytes: {other}"),
+        };
+        panic!("{limit:?} bytes: {rows} rows, past what memory holds");
+    }
+}

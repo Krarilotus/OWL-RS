@@ -37,11 +37,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use nrese_exec::budget::Budget;
+use nrese_exec::budget::{Budget, BudgetExceeded, ChargedVec};
 use nrese_exec::cell::{self, Build, BuildCell, Builder, Claim, Kind, Scan};
 use parking_lot::Mutex;
 
 use super::characteristic::{CharacteristicSets, Gathered, PairCounts, Partial, SetCount};
+use super::snapshot::HeavyGroups;
 use super::{ReadModel, Snapshot, Version};
 use crate::quad::{GraphSelector, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
@@ -91,6 +92,10 @@ pub(crate) struct Statistics {
     /// is the same version (a transaction's pending snapshot shares its base's revision
     /// number, not its content).
     nodes: Mutex<Vec<NodeCount>>,
+    /// Heavy groups of patterns at versions, exact, held as the node counts are.
+    heavy: Mutex<Vec<HeavyEntry>>,
+    /// Walks for heavy groups begun: what the tests count.
+    heavy_walks: AtomicU64,
     /// Per read model, the default graph's characteristic sets.
     sets: Mutex<HashMap<ReadModel, Sets>>,
     /// Per read model, the build of its sets under way: one at a time, and planners that
@@ -147,6 +152,22 @@ type NodeCount = (Weak<Version>, ReadModel, GraphSelector, u64);
 /// Node counts kept; the cache is cleared when it fills up.
 const NODE_ENTRIES: usize = 64;
 
+/// A version (held weakly), what was read of it (the pattern as read, in a permutation, the
+/// groups past a match count), and those groups as kept, charged (`None`: the budget
+/// couldn't take them, so the version's readers get none without walking again).
+type HeavyEntry = (
+    Weak<Version>,
+    ReadModel,
+    QuadPattern,
+    Permutation,
+    u64,
+    Option<cell::Kept<ChargedVec<(TermId, u64)>>>,
+);
+
+/// Heavy-group lists kept; the cache is cleared when it fills up. Entries, not bytes: each
+/// list's bytes are charged to the statistics' budget.
+const HEAVY_ENTRIES: usize = 256;
+
 impl Statistics {
     /// The number of distinct subjects and objects of `graphs` in `model` at `version`:
     /// cached, or computed by `count` (`None`: it can't be, and nothing is kept).
@@ -174,6 +195,64 @@ impl Statistics {
         Some(n)
     }
 
+    /// The groups of `pattern` (as read) in `permutation` at `version` in `model` that more
+    /// than `min` quads match: kept, or walked by `walk` into vectors charged to the budget
+    /// it is given (the one [`Self::set_budget`] set, else an unlimited one), and kept so.
+    /// `None` where the budget can't take them: then nothing of them stays charged, and
+    /// the version's readers get none without a walk each.
+    pub(crate) fn heavy_groups(
+        &self,
+        version: &Arc<Version>,
+        model: ReadModel,
+        pattern: QuadPattern,
+        permutation: Permutation,
+        min: u64,
+        walk: impl FnOnce(&Arc<Budget>) -> Result<ChargedVec<(TermId, u64)>, BudgetExceeded>,
+    ) -> Option<HeavyGroups> {
+        let found = self
+            .heavy
+            .lock()
+            .iter()
+            .find_map(|(weak, m, p, perm, n, groups)| {
+                (*m == model
+                    && *p == pattern
+                    && *perm == permutation
+                    && *n == min
+                    && std::ptr::eq(weak.as_ptr(), Arc::as_ptr(version)))
+                .then(|| groups.as_ref().map(|kept| Arc::clone(kept.value())))
+            });
+        if let Some(found) = found {
+            return found;
+        }
+        self.heavy_walks.fetch_add(1, Ordering::Relaxed);
+        let budget = self.budget.lock().clone();
+        let budget = budget.unwrap_or_else(|| Arc::new(Budget::unlimited()));
+        let kept = walk(&budget)
+            .and_then(|groups| cell::Kept::new(groups, Arc::clone(&budget)))
+            .ok();
+        let groups = kept.as_ref().map(|kept| Arc::clone(kept.value()));
+        let mut heavy = self.heavy.lock();
+        heavy.retain(|(weak, ..)| weak.strong_count() > 0);
+        if heavy.len() >= HEAVY_ENTRIES {
+            heavy.clear();
+        }
+        heavy.push((
+            Arc::downgrade(version),
+            model,
+            pattern,
+            permutation,
+            min,
+            kept,
+        ));
+        groups
+    }
+
+    /// Walks for heavy groups begun ([`Self::heavy_groups`]).
+    #[cfg(test)]
+    pub(crate) fn heavy_walks(&self) -> u64 {
+        self.heavy_walks.load(Ordering::Relaxed)
+    }
+
     /// The characteristic sets of the default graph in `model` (see the module docs): kept
     /// (drifted ones while one rebuild replaces them), read from their file (written
     /// after a build, read at the first use after a start), or built now, the first
@@ -185,7 +264,7 @@ impl Statistics {
         model: ReadModel,
     ) -> Option<Arc<CharacteristicSets>> {
         let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
-        let size = snapshot.count_in(model, &pattern);
+        let size = snapshot.count_in(model, &pattern).at_least();
         if let Kept::Sets(sets) = self.kept_sets(snapshot, model, size) {
             return sets;
         }
@@ -258,7 +337,7 @@ impl Statistics {
             .spawn(move || {
                 let builder = statistics.claim_anyway(model);
                 let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
-                let size = snapshot.count_in(model, &pattern);
+                let size = snapshot.count_in(model, &pattern).at_least();
                 statistics.build_sets(&builder, &snapshot, model, size, false);
             });
         if started.is_err()
@@ -274,7 +353,7 @@ impl Statistics {
     /// for them or competes with their build.
     pub(crate) fn prepare_sets(self: &Arc<Self>, snapshot: &Snapshot, model: ReadModel) {
         let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
-        let size = snapshot.count_in(model, &pattern);
+        let size = snapshot.count_in(model, &pattern).at_least();
         let builder = self.claim_anyway(model);
         self.build_sets(&builder, snapshot, model, size, true);
     }
@@ -487,7 +566,7 @@ impl Statistics {
         permutation: Permutation,
     ) -> Option<u64> {
         let key = (model, *pattern, permutation);
-        let count = snapshot.count_in(model, pattern);
+        let count = snapshot.count_in(model, pattern).at_least();
         if let Some(&(distinct, at)) = self.distinct.lock().get(&key)
             && count.abs_diff(at) <= at / 4
         {
@@ -528,6 +607,151 @@ mod tests {
             }
         }
         tx.commit().unwrap();
+    }
+
+    /// Heavy groups are kept within the statistics' budget, as the characteristic sets are:
+    /// H complete graphs of 66 nodes give 66 H objects with 65 predecessors each, past a
+    /// minimum of 64. Kept, they are charged, for as long as any holder keeps them (an
+    /// entry gone with its version, a planner's list still charged until it lets go);
+    /// where the budget can't take them, nothing is kept, nothing stays charged and the
+    /// planner gets none, never a part (PR #81 review r1, F2).
+    #[test]
+    fn heavy_groups_are_kept_within_the_statistics_budget() {
+        const H: u32 = 4;
+        let list_bytes = 66 * H as usize * std::mem::size_of::<(TermId, u64)>();
+        let pair = |a: u32, b: u32| {
+            let node = |n: u32| NamedNode::new_unchecked(format!("http://example.com/n{n}"));
+            let p = NamedNode::new_unchecked("http://example.com/p");
+            Quad::new(node(a), p, node(b), GraphName::DefaultGraph)
+        };
+        for limit in [0, list_bytes / 2, 1 << 20] {
+            let engine = Engine::new(EngineConfig::default()).unwrap();
+            let budget = Arc::new(Budget::new(limit));
+            engine.charge_statistics_to(Arc::clone(&budget));
+            let mut tx = engine.transaction();
+            for g in 0..H {
+                for (a, b) in (0..66).flat_map(|a| (0..66).map(move |b| (a, b))) {
+                    if a != b {
+                        tx.insert(pair(g * 66 + a, g * 66 + b).as_ref());
+                    }
+                }
+            }
+            tx.commit().unwrap();
+            let snapshot = engine.snapshot();
+            let p = snapshot
+                .lookup(
+                    NamedNode::new_unchecked("http://example.com/p")
+                        .as_ref()
+                        .into(),
+                )
+                .expect("interned");
+            let objects = QuadPattern {
+                predicate: Some(p),
+                ..QuadPattern::all()
+            };
+            let heavy = |snapshot: &Snapshot| {
+                snapshot.heavy_groups_in(ReadModel::default(), &objects, Permutation::Posg, 64)
+            };
+            let kept = heavy(&snapshot);
+            if limit < list_bytes {
+                assert!(kept.is_none(), "limit {limit}: no part of a list");
+                assert_eq!(budget.used(), 0, "limit {limit}: nothing stays charged");
+                continue;
+            }
+            let kept = kept.expect("within the budget");
+            assert_eq!(kept.len(), 66 * H as usize);
+            assert!(kept.iter().all(|&(_, n)| n == 65));
+            let charged = budget.used();
+            assert!(charged >= list_bytes, "{charged} bytes charged");
+            // A commit's version, with the old snapshot gone: its entry goes, the
+            // planner's list stays charged until it is dropped.
+            drop(snapshot);
+            let mut tx = engine.transaction();
+            tx.insert(pair(10_000, 10_001).as_ref());
+            tx.commit().unwrap();
+            assert!(heavy(&engine.snapshot()).is_some());
+            let before = budget.used();
+            drop(kept);
+            assert!(
+                before - budget.used() >= list_bytes,
+                "{before} charged before the list was dropped, {} after",
+                budget.used()
+            );
+        }
+    }
+
+    /// A read that expands equality classes has no heavy groups (its groups aren't the
+    /// index's), also where a read of the same version as stored walked and kept them: a
+    /// kept list answered both, and an empty one turned an expanding count's budget off
+    /// (Sol, P2 sol-loop r1 S1).
+    #[test]
+    fn an_expanding_read_has_no_heavy_groups_kept_for_a_stored_one() {
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let node = |name: &str| NamedNode::new_unchecked(format!("http://example.com/{name}"));
+        let mut tx = engine.transaction();
+        let rep = tx.intern(node("rep").as_ref().into());
+        let same_as = tx.intern(node("sameAs").as_ref().into());
+        let alias = tx.intern(node("alias").as_ref().into());
+        tx.insert_inferred(crate::EncodedTriple {
+            subject: alias,
+            predicate: same_as,
+            object: rep,
+        });
+        for i in 0..3 {
+            let object = node(&format!("o{i}"));
+            tx.insert(Quad::new(node("rep"), node("p"), object, GraphName::DefaultGraph).as_ref());
+        }
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let snapshot = engine.snapshot();
+        let heavy = |snapshot: &Snapshot| {
+            snapshot.heavy_groups_in(
+                ReadModel::Materialised,
+                &QuadPattern::all(),
+                Permutation::Spog,
+                1,
+            )
+        };
+        assert!(heavy(&snapshot.stored()).is_some_and(|groups| !groups.is_empty()));
+        assert!(
+            heavy(&snapshot).is_none(),
+            "an expanding read walks no index groups"
+        );
+    }
+
+    /// A pattern's heavy groups are walked once per version: asked again, of the same
+    /// snapshot or another of the same version, they are the ones kept; a commit's version
+    /// walks again and finds what it holds. Walked per query, they made counting uniform
+    /// triangles 0.3 % more instructions than without them (fleet pm-p2-count-2, 31 Oct
+    /// 2026).
+    #[test]
+    fn heavy_groups_are_walked_once_per_version() {
+        let model = ReadModel::default();
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        // Subjects with three quads: every third, those past a minimum of two.
+        add(&engine, 0..300);
+        let statistics = Arc::clone(&engine.inner.shared.statistics);
+        let heavy = |snapshot: &Snapshot| {
+            snapshot
+                .heavy_groups_in(model, &QuadPattern::all(), Permutation::Spog, 2)
+                .expect("the default graph's subjects can be walked")
+        };
+        let snapshot = engine.snapshot();
+        let first = heavy(&snapshot);
+        assert_eq!(first.len(), 100);
+        assert!(first.iter().all(|&(_, n)| n == 3));
+        assert!(Arc::ptr_eq(&first, &heavy(&snapshot)));
+        assert!(Arc::ptr_eq(&first, &heavy(&engine.snapshot())));
+        assert_eq!(statistics.heavy_walks(), 1);
+        add(&engine, 300..330);
+        assert_eq!(heavy(&engine.snapshot()).len(), 110);
+        assert_eq!(statistics.heavy_walks(), 2);
+        assert_eq!(heavy(&snapshot).len(), 100, "the old version keeps its own");
+        assert_eq!(statistics.heavy_walks(), 2);
     }
 
     /// Holds the next build once its first scan is published: `planners` start, and the
@@ -607,7 +831,9 @@ mod tests {
         drop(held);
         // One rebuild replaces them.
         let started = std::time::Instant::now();
-        let size = snapshot.count_in(model, &QuadPattern::in_graph(TermId::DEFAULT_GRAPH));
+        let size = snapshot
+            .count_in(model, &QuadPattern::in_graph(TermId::DEFAULT_GRAPH))
+            .at_least();
         while statistics
             .sets
             .lock()

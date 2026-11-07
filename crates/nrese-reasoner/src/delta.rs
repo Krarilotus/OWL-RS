@@ -40,14 +40,19 @@ use std::borrow::Cow;
 use hashbrown::HashSet;
 use rayon::prelude::*;
 
-use super::batch::{Equality, Store, check, is_replacement_rule, sorted};
+use std::sync::Arc;
+
+use nrese_exec::Budget;
+
+use super::batch::{Equality, Store, check, is_replacement_rule};
 use super::eval::{
     AllFacts, GroundProgram, Job, NEVER, RuleKey, Schema, Seg, Source, Stop, instantiate_head,
     rule_key, run_jobs, run_jobs_acyclic, transitive_predicate,
 };
+use super::ir::Triple;
 use super::ir::{Head, Rule};
-use super::ir::{Triple, Violation};
 use super::lists::{ListVocabulary, instantiate};
+use super::violations::{Violations, unlimited};
 
 /// The materialised state: asserted facts after the change, and inferred facts before it.
 pub trait Base: Sync {
@@ -127,8 +132,9 @@ pub struct Update {
     pub insert: Vec<Triple>,
     /// Facts to remove from the inferred stack.
     pub remove: Vec<Triple>,
-    /// Consistency violations that involve a fact the change added.
-    pub violations: Vec<Violation>,
+    /// Consistency violations that involve a fact the change added, charged to the
+    /// update's budget.
+    pub violations: Violations,
     /// List axioms the change left uninstantiable (malformed, cyclic, oversized) that
     /// weren't before.
     pub diagnostics: Vec<super::lists::ListDiagnostic>,
@@ -187,7 +193,8 @@ impl<B: Base + ?Sized> Source for Overlay<'_, B> {
         let seg = seg.plain();
         let extra = self.extra.estimate(pattern, seg);
         match seg {
-            Seg::Old | Seg::All => extra + self.base.estimate(pattern),
+            // The base's estimate saturates (`Snapshot::count_in`), so the sum does too.
+            Seg::Old | Seg::All => extra.saturating_add(self.base.estimate(pattern)),
             _ => extra,
         }
     }
@@ -220,13 +227,18 @@ pub fn update<B: Base + ?Sized>(
 ) -> Update {
     match update_until(base, inserted, deleted, rules, cache, NEVER) {
         Ok(update) => update,
-        Err(Interrupted) => unreachable!("NEVER doesn't stop"),
+        Err(_) => unreachable!("NEVER doesn't stop"),
     }
 }
 
-/// [`update`] stopped by `stop` (the caller gave up, a deadline passed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Interrupted;
+/// [`update`] stopped by `stop` (the caller gave up, a deadline passed), or by the
+/// process's memory limit ([`super::eval::OperationStop`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Interrupted {
+    /// Why the process's memory limit stopped it, if that is what stopped it: past the
+    /// limit, or the memory unreadable.
+    pub memory: Option<nrese_exec::memory::MemoryStopCause>,
+}
 
 /// [`update`], polling `stop` between rounds and per job morsel. When it fires, the work
 /// so far is discarded: nothing has been applied, so the state stays as it was.
@@ -259,9 +271,66 @@ pub fn update_with<B: Base + ?Sized>(
     stop: Stop<'_>,
     policy: policy::Policy,
 ) -> Result<Update, Interrupted> {
-    // The process's memory limit stops it too, whatever the caller polls.
-    let stop: Stop<'_> = &|| stop() || super::eval::over_memory_limit();
-    let check_stop = || if stop() { Err(Interrupted) } else { Ok(()) };
+    update_within(
+        base,
+        inserted,
+        deleted,
+        rules,
+        cache,
+        stop,
+        policy,
+        &unlimited(),
+    )
+}
+
+/// [`update_with`], its consistency violations charged to `memory` (the operation's own
+/// part: a refusal ends their list, never the update, and keeps the change inconsistent).
+#[allow(clippy::too_many_arguments)]
+pub fn update_within<B: Base + ?Sized>(
+    base: &B,
+    inserted: &[Triple],
+    deleted: &[Triple],
+    rules: Rules<'_>,
+    cache: Option<&GroundProgram>,
+    stop: Stop<'_>,
+    policy: policy::Policy,
+    memory: &Arc<Budget>,
+) -> Result<Update, Interrupted> {
+    // The process's memory limit stops it too, whatever the caller polls; once stopped it
+    // stays stopped, so no morsel skipped is taken for done.
+    let stop = super::eval::OperationStop::new(stop);
+    update_body(
+        base,
+        inserted,
+        deleted,
+        rules,
+        cache,
+        &|| stop.fired(),
+        policy,
+        memory,
+    )
+    .map_err(|_| stop.interrupted())
+}
+
+/// [`update_with`]'s work, under the operation's latched `stop`.
+#[allow(clippy::too_many_arguments)]
+fn update_body<B: Base + ?Sized>(
+    base: &B,
+    inserted: &[Triple],
+    deleted: &[Triple],
+    rules: Rules<'_>,
+    cache: Option<&GroundProgram>,
+    stop: Stop<'_>,
+    policy: policy::Policy,
+    memory: &Arc<Budget>,
+) -> Result<Update, Interrupted> {
+    let check_stop = || {
+        if stop() {
+            Err(Interrupted::default())
+        } else {
+            Ok(())
+        }
+    };
     let mut result = Update::default();
     if policy.rebuilds_at_once() {
         result.policy.plan = policy::Plan::Rebuild;
@@ -485,7 +554,7 @@ pub fn update_with<B: Base + ?Sized>(
                         });
                     }
                     nrese_exec::graph::transitive_closure_until(&edges, stop)
-                        .ok_or(Interrupted)?
+                        .ok_or_else(Interrupted::default)?
                         .into_iter()
                         .collect()
                 } else {
@@ -825,7 +894,7 @@ pub fn update_with<B: Base + ?Sized>(
                 });
                 produced.extend(
                     nrese_exec::graph::transitive_closure_until(&all, stop)
-                        .ok_or(Interrupted)?
+                        .ok_or_else(Interrupted::default)?
                         .into_iter()
                         .map(|(s, o)| [s, p, o])
                         .filter(|&f| !state.contains(f)),
@@ -896,16 +965,17 @@ pub fn update_with<B: Base + ?Sized>(
         .into_iter()
         .filter(|&(c, _)| c < settled_consistency)
         .collect();
-    let mut found = HashSet::new();
+    let mut found = Violations::new(Arc::clone(memory));
     check(
         &state,
         &program,
         settled_consistency..program.consistency.len(),
         &variants,
         &mut found,
-    );
+        stop,
+    )?;
     check_stop()?;
-    result.violations = sorted(found);
+    result.violations = found;
     lap(4, &mut result);
     result.diagnostics = program
         .list_diagnostics
@@ -926,14 +996,39 @@ pub fn update_with<B: Base + ?Sized>(
 /// before). [`update_with`]'s own last phase without its insert rounds, for a caller that
 /// derived the new facts in bulk (a first load, [`crate::engine::maintain`]): the same
 /// report, through the new facts only, with the ground program extended by the instances of
-/// new schema and list facts as phase 3 extends it.
+/// new schema and list facts as phase 3 extends it; charged to `memory` as the delta's own
+/// is ([`update_within`]), and stopped by `stop` or the process's memory limit as it is.
 pub fn introduced_violations<B: Base + ?Sized>(
     base: &B,
     inserted: &[Triple],
     derived: &[Triple],
     rules: Rules<'_>,
     cache: Option<&GroundProgram>,
-) -> Vec<Violation> {
+    stop: Stop<'_>,
+    memory: &Arc<Budget>,
+) -> Result<Violations, Interrupted> {
+    let stop = super::eval::OperationStop::new(stop);
+    introduced_violations_body(
+        base,
+        inserted,
+        derived,
+        rules,
+        cache,
+        &|| stop.fired(),
+        memory,
+    )
+    .map_err(|_| stop.interrupted())
+}
+
+fn introduced_violations_body<B: Base + ?Sized>(
+    base: &B,
+    inserted: &[Triple],
+    derived: &[Triple],
+    rules: Rules<'_>,
+    cache: Option<&GroundProgram>,
+    stop: Stop<'_>,
+    memory: &Arc<Budget>,
+) -> Result<Violations, Interrupted> {
     let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
     let empty = Store::default();
     let computed: Option<GroundProgram> = cache.is_none().then(|| {
@@ -978,15 +1073,16 @@ pub fn introduced_violations<B: Base + ?Sized>(
         .into_iter()
         .filter(|&(c, _)| c < settled_consistency)
         .collect();
-    let mut found = HashSet::new();
+    let mut found = Violations::new(Arc::clone(memory));
     check(
         &state,
         &program,
         settled_consistency..program.consistency.len(),
         &variants,
         &mut found,
-    );
-    sorted(found)
+        stop,
+    )?;
+    Ok(found)
 }
 
 /// The facts of `base` that mention one of `terms`, in any position: each through its

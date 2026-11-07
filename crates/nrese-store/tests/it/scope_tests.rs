@@ -648,7 +648,7 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
     // Two stores each that differ only in how many statements the secret graph holds.
     let store = |hidden: usize, public: &str| {
         let mut config = in_memory_store_config();
-        config.process_memory_bytes = 0;
+        config.process_memory_bytes = nrese_store::ProcessMemory::Bytes(0);
         config.total_query_memory_bytes = 64 << 10;
         let pipeline = MutationPipeline::new(
             Arc::new(StoreService::new(config).unwrap()),

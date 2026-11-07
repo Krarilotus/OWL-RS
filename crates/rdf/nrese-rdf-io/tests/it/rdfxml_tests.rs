@@ -6,17 +6,28 @@ use std::path::Path;
 use nrese_rdf::{Dataset, Quad};
 use nrese_rdf_io::{RdfFormat, RdfParser, RdfSerializer};
 
+/// `NRESE_W3C_REQUIRED` set and not empty (check.sh and CI set it). P07's
+/// `nrese-corpus::required()` replaces this.
+fn required() -> bool {
+    std::env::var_os("NRESE_W3C_REQUIRED").is_some_and(|v| !v.is_empty())
+}
+
 /// The OWL 2 test cases (one large RDF/XML file with entities, fetched by
 /// `scripts/fetch-w3c-tests.sh`): read without error, written back and read again alike.
+/// A missing file skips the test unless `required()`; any other read error fails it.
 #[test]
 fn the_owl_2_test_cases_read_and_round_trip() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.cache/owl-test/all.rdf");
-    let Ok(bytes) = std::fs::read(&path) else {
-        eprintln!(
-            "skipped: {} not found (run scripts/fetch-w3c-tests.sh)",
-            path.display()
-        );
-        return;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required() => {
+            eprintln!(
+                "skipped: {} not found (run scripts/fetch-w3c-tests.sh)",
+                path.display()
+            );
+            return;
+        }
+        Err(e) => panic!("{}: {e} (run scripts/fetch-w3c-tests.sh)", path.display()),
     };
     let quads: BTreeSet<Quad> = RdfParser::from_format(RdfFormat::RdfXml)
         .with_base_iri("http://www.w3.org/2009/11/owl-test/all.rdf")

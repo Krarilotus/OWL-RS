@@ -15,6 +15,8 @@ mod cli;
 mod env_names;
 mod env_values;
 mod file_config;
+#[cfg(test)]
+mod percent_budget_tests;
 mod policy_env;
 mod reasoner_env;
 mod replication_env;
@@ -47,9 +49,18 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// Installs the process's memory limit, once at startup, before opening stores.
-    pub fn install_process_memory_policy(&self) {
-        nrese_exec::memory::set_process_limit(self.store.process_memory_bytes);
+    /// Installs the process's memory limit, once at startup, before opening stores. Refuses
+    /// one it can't enforce ([`nrese_store::ProcessMemory::resolve`]): the server doesn't
+    /// start with a limit it would ignore.
+    pub fn install_process_memory_policy(&self) -> Result<()> {
+        let limit = self.store.process_memory_bytes.resolve().map_err(|error| {
+            anyhow::anyhow!(
+                "budgets.process_memory ({}) can't be installed: {error}",
+                names::PROCESS_MEMORY_BYTES
+            )
+        })?;
+        nrese_exec::memory::set_process_limit(limit);
+        Ok(())
     }
 
     /// The effective settings, one `key = value` per line, for `check-config`. Credentials
@@ -79,6 +90,7 @@ impl ServerConfig {
             ("store.verify_on_open", store.verify_on_open.to_string()),
             ("store.map_checkpoints", store.map_checkpoints.to_string()),
             ("store.wal_archive", store.wal_archive.to_string()),
+            ("store.wal_damage", store.wal_damage.as_str().to_owned()),
             (
                 "store.index_encoding",
                 store.index_encoding.as_str().to_owned(),
@@ -236,9 +248,11 @@ impl ServerConfig {
             .context("failed to parse bind address")?;
         let deployment_posture =
             parse_deployment_posture(source.get(names::DEPLOYMENT_POSTURE).as_deref())?;
-        let store = parse_store_config(source)?;
+        // Resolve all memory shares against one reading of the process's capacity.
+        let machine = units::machine_memory_bytes();
+        let store = parse_store_config(source, machine)?;
         let reasoner = parse_reasoner_config(source)?;
-        let policy = parse_policy_config(source)?;
+        let policy = parse_policy_config(source, machine)?;
         let ai = parse_ai_config(source)?;
         let replication = replication_env::parse_replication_config(source)?;
         if replication.mode != crate::replication::ReplicationMode::Off

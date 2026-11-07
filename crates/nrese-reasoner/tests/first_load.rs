@@ -93,12 +93,12 @@ fn a_first_load_reports_what_every_plan_reports() {
                     let mut violations = done
                         .violations
                         .iter()
-                        .map(|v| format!("{}:{:?}", v.rule, v.bindings))
+                        .map(|(rule, bindings)| format!("{rule}:{bindings:?}"))
                         .collect::<Vec<_>>();
                     violations.sort();
                     let diagnostics = format!("{:?}", done.diagnostics);
                     outcomes.push((violations, diagnostics));
-                    if done.violations.is_empty() {
+                    if done.violations.consistent() {
                         tx.commit().unwrap();
                         let snapshot = engine.snapshot();
                         let stored: std::collections::HashSet<_> = snapshot
@@ -152,7 +152,7 @@ fn a_first_load_tolerates_a_violation_the_axioms_had_before() {
         let remat = engine.rematerialisation();
         let closure = materialise(&program, remat.base());
         assert!(
-            !closure.violations.is_empty(),
+            !closure.violations.consistent(),
             "preexisting axiom violation"
         );
         remat.finish(closure.inferred).unwrap();
@@ -168,7 +168,7 @@ fn a_first_load_tolerates_a_violation_the_axioms_had_before() {
         outcomes.push(
             done.violations
                 .iter()
-                .map(|v| format!("{}:{:?}", v.rule, v.bindings))
+                .map(|(rule, bindings)| format!("{rule}:{bindings:?}"))
                 .collect::<Vec<_>>(),
         );
     }
@@ -209,7 +209,12 @@ fn a_first_load_tolerates_a_datatype_violation_the_axioms_had_before() {
                 drop(tx);
                 let remat = engine.rematerialisation();
                 let closure = materialise(&program, remat.base());
-                assert!(closure.violations.iter().any(|v| v.rule == "dt-not-type"));
+                assert!(
+                    closure
+                        .violations
+                        .iter()
+                        .any(|(rule, _)| rule == "dt-not-type")
+                );
                 remat.finish(closure.inferred).unwrap();
                 assert_eq!(engine.snapshot().len_in(ReadModel::Asserted), 0);
                 let ground = program.ground_program(&engine.snapshot());
@@ -224,7 +229,7 @@ fn a_first_load_tolerates_a_datatype_violation_the_axioms_had_before() {
                 let mut violations = done
                     .violations
                     .iter()
-                    .map(|v| format!("{}:{:?}", v.rule, v.bindings))
+                    .map(|(rule, bindings)| format!("{rule}:{bindings:?}"))
                     .collect::<Vec<_>>();
                 violations.sort();
                 outcomes.push(violations);
@@ -270,7 +275,12 @@ fn a_first_load_whose_axioms_conclude_an_unstorable_fact_takes_the_delta() {
                 drop(tx);
                 let remat = engine.rematerialisation();
                 let closure = materialise(&program, remat.base());
-                assert!(closure.violations.iter().any(|v| v.rule == "dt-not-type"));
+                assert!(
+                    closure
+                        .violations
+                        .iter()
+                        .any(|(rule, _)| rule == "dt-not-type")
+                );
                 remat.finish(closure.inferred).unwrap();
                 assert_eq!(engine.snapshot().len_in(ReadModel::Asserted), 0);
                 let ground = program.ground_program(&engine.snapshot());
@@ -292,7 +302,7 @@ fn a_first_load_whose_axioms_conclude_an_unstorable_fact_takes_the_delta() {
                 let mut violations = done
                     .violations
                     .iter()
-                    .map(|v| format!("{}:{:?}", v.rule, v.bindings))
+                    .map(|(rule, bindings)| format!("{rule}:{bindings:?}"))
                     .collect::<Vec<_>>();
                 violations.sort();
                 outcomes.push(violations);

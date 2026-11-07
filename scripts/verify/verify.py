@@ -51,6 +51,9 @@ from pathlib import Path
 if sys.version_info < (3, 11):
     sys.exit("verify.py needs Python 3.11 or later (tomllib)")
 
+# The suite's kit, for the server's tree stop (suitekit/processes.py); last, so that its other
+# modules (queue.py) shadow no standard module.
+sys.path.append(str(Path(__file__).resolve().parents[2] / "benches" / "suite"))
 from verifykit import checks, client, jobs, scenario as scenarios, selftest  # noqa: E402
 from verifykit.server import LaunchError, Server, sha256_of  # noqa: E402
 

@@ -576,7 +576,7 @@ fn measure(store: &StoreService, text: &str, args: &Args, batch: usize) -> Measu
         let executions = if i >= args.warmup { batch } else { 1 };
         match run_once(store, &prepared, args.timeout, executions) {
             Ok((rows, elapsed)) => {
-                if let (Some(before), Some(after)) = (faults, nrese_exec::memory::page_faults()) {
+                if let (Ok(before), Ok(after)) = (faults, nrese_exec::memory::page_faults()) {
                     match measured.first_faults {
                         None => measured.first_faults = Some(after - before),
                         Some(_) => measured.faults.push(after - before),
@@ -777,15 +777,16 @@ fn heap_profile(phases: Vec<nrese_exec::heap::Phase>) {
 }
 
 /// The process's peak since it started and its memory now, in MiB, where the OS reports
-/// them: on Linux the resident set, on Windows the committed private bytes.
-fn memory_mib() -> Option<(u64, u64)> {
+/// them: on Linux the resident set, on Windows the committed private bytes. Reported as
+/// "unread" where either isn't read, never as 0.
+fn memory_mib() -> Result<(u64, u64), nrese_exec::memory::Unread> {
     use nrese_exec::memory;
     let now = if cfg!(windows) {
         memory::process_bytes()
     } else {
         memory::resident_bytes()
     };
-    Some((memory::peak_process_bytes()? / 1048576, now? / 1048576))
+    Ok((memory::peak_process_bytes()? / 1048576, now? / 1048576))
 }
 
 /// `query -> p50 ms` from an earlier `--json` report.
@@ -954,7 +955,7 @@ impl Report {
             "\n  \"peak_kind\": {:?},",
             nrese_exec::memory::peak_kind()
         ));
-        if let Some(peak) = nrese_exec::memory::peak_working_set_bytes() {
+        if let Ok(peak) = nrese_exec::memory::peak_working_set_bytes() {
             sections.push_str(&format!("\n  \"peak_working_set_bytes\": {peak},"));
         }
         if COUNT_ALLOCATIONS.load(Ordering::Relaxed) {
@@ -967,7 +968,7 @@ impl Report {
             "{{\n  \"label\": {label:?},\n  \"open_s\": {:.6},\n  \"load_s\": {:.6},\n  \"peak_mib\": {},\n  \"cgroup_peak_mib\": {},\n  \"sum_p50_ms\": {:.3},{}{}\n  \"queries\": [\n{}\n  ]\n}}\n",
             self.open_s,
             self.load_s,
-            memory.map_or(0, |(peak, _)| peak),
+            memory.map_or("\"unread\"".to_owned(), |(peak, _)| peak.to_string()),
             cgroup_peak_mib().map_or("null".to_owned(), |m| m.to_string()),
             self.sum_p50,
             sections,
@@ -1103,7 +1104,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     let started = Instant::now();
     let store = Arc::new(StoreService::new(config)?);
     report.open_s = started.elapsed().as_secs_f64();
-    if let Some((_, resident)) = memory_mib() {
+    if let Ok((_, resident)) = memory_mib() {
         report
             .sections
             .push(("open_resident_mib", resident.to_string()));
@@ -1152,8 +1153,11 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         )
     });
     if let Some(program) = &program {
-        if let Some((peak, rss)) = memory_mib() {
-            eprintln!("before reasoning: memory peak {peak} MiB, resident {rss} MiB");
+        match memory_mib() {
+            Ok((peak, rss)) => {
+                eprintln!("before reasoning: memory peak {peak} MiB, resident {rss} MiB")
+            }
+            Err(unread) => eprintln!("before reasoning: memory {unread}"),
         }
         let phase = Phase::start();
         nrese_exec::heap::start("store: compile");
@@ -1162,11 +1166,15 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         // The process's memory while it reasons, read every 20 ms: the peak counter of
         // the OS also holds the load's.
         let sampling = AtomicBool::new(true);
-        let sampled = std::thread::scope(|scope| -> Result<u64, Box<dyn std::error::Error>> {
+        let sampled = std::thread::scope(|scope| -> Result<_, Box<dyn std::error::Error>> {
+            // One unread sample leaves the peak unread: a missed sample may have been it.
             let sampler = scope.spawn(|| {
-                let mut peak = 0;
+                let mut peak: nrese_exec::memory::Reading = Ok(0);
                 while sampling.load(Ordering::Relaxed) {
-                    peak = peak.max(nrese_exec::memory::process_bytes().unwrap_or(0));
+                    peak = match (peak, nrese_exec::memory::process_bytes()) {
+                        (Ok(peak), Ok(now)) => Ok(peak.max(now)),
+                        (Err(unread), _) | (_, Err(unread)) => Err(unread),
+                    };
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 peak
@@ -1184,10 +1192,13 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             let peak = sampler.join().expect("the sampler ends");
             outcome.map(|()| peak)
         })?;
-        eprintln!(
-            "reasoning: process memory peak {} MiB (sampled)",
-            sampled / 1048576
-        );
+        match sampled {
+            Ok(peak) => eprintln!(
+                "reasoning: process memory peak {} MiB (sampled)",
+                peak / 1048576
+            ),
+            Err(unread) => eprintln!("reasoning: process memory peak {unread} (sampled)"),
+        }
         heap_profile(nrese_exec::heap::finish());
         let done = last.expect("at least one run");
         let (p50, _, max) = modes::percentiles(&mut times);
@@ -1247,6 +1258,7 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             let validation = store.validate_shacl(
                 &nrese_store::ReadScope::All,
                 &ShaclValidationRequest::default(),
+                &nrese_store::CancellationToken::new(),
             )?;
             times.push(started.elapsed());
             results = validation.report.results.len();
@@ -1380,16 +1392,17 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
     }
     let memory_after_load = memory_mib();
     if args.faults
-        && let Some(resident) = nrese_exec::memory::resident_bytes()
+        && let Ok(resident) = nrese_exec::memory::resident_bytes()
     {
         eprintln!("working set after open: {} MiB", resident / 1048576);
     }
     eprintln!(
         "open {:.2} s{}",
         report.open_s,
-        memory_after_load.map_or(String::new(), |(peak, rss)| format!(
-            ", memory: peak {peak} MiB, resident {rss} MiB"
-        ))
+        memory_after_load.map_or_else(
+            |unread| format!(", memory {unread}"),
+            |(peak, rss)| format!(", memory: peak {peak} MiB, resident {rss} MiB")
+        )
     );
     // Where the resident memory goes: the indexes, the dictionary's text and its index.
     let stats = store.engine_stats();
@@ -1588,8 +1601,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             .push(("phases", format!("{{{}}}", members.join(", "))));
     }
     report.qerror = (args.qerror && !estimates.is_empty()).then(|| qerror_summary(&estimates));
-    if let Some((peak, rss)) = memory_mib() {
-        println!("memory: peak {peak} MiB, resident {rss} MiB");
+    match memory_mib() {
+        Ok((peak, rss)) => println!("memory: peak {peak} MiB, resident {rss} MiB"),
+        Err(unread) => println!("memory {unread}"),
     }
     Ok(())
 }

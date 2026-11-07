@@ -35,7 +35,7 @@ use std::borrow::Cow;
 
 use keys::PackedKeys;
 use merge::SignedMerge;
-use nrese_exec::{BudgetExceeded, Reservation};
+use nrese_exec::{BudgetExceeded, ChargedVec, Reservation};
 use run::{PermutationRun, Run};
 
 use crate::quad::{AccessPlan, EncodedQuad, Permutation, QuadPattern};
@@ -323,6 +323,48 @@ impl IndexVersion {
             let start = keys.bound_in(0, keys.len(), &adapted.low, false);
             start < keys.len() && keys.get(start) <= adapted.high
         })
+    }
+
+    /// [`Self::group_counts`] keeping only the groups a run counts more than `above` times,
+    /// pushed as they are walked (one run after another, on this thread): the candidates for
+    /// a value counted more than `above` times the runs in all of them together (a sum of
+    /// `r` counts past `r * above` has one past `above`). No light group is held, and what
+    /// is kept is charged to `out`'s budget as it grows: a refusal ends the walk.
+    pub(crate) fn group_candidates(
+        &self,
+        plan: &AccessPlan,
+        position: usize,
+        above: i64,
+        out: &mut ChargedVec<(u64, i64)>,
+    ) -> Result<(), BudgetExceeded> {
+        let Some(adapted) = self.layout.adapt(plan) else {
+            return Ok(());
+        };
+        // As in `group_counts`: the default graph's group of a graph-first plan adapted.
+        let position = if adapted.permutation == plan.permutation {
+            position
+        } else if position == 0 {
+            let count = self.count_plan(plan) as i64;
+            return match count > above {
+                true => out.push((TermId::DEFAULT_GRAPH.raw(), count)),
+                false => Ok(()),
+            };
+        } else {
+            position - 1
+        };
+        for run in self.runs.iter() {
+            let perm = run.permutation(adapted.permutation);
+            let (start, end) = perm.range(&adapted.low, &adapted.high);
+            let mut kept = Ok(());
+            perm.keys.groups(start, end, position, |value, i, j| {
+                let count = (j - i) as i64 - 2 * perm.tombstones_in(i, j) as i64;
+                if count > above && kept.is_ok() {
+                    kept = out.push((value, count));
+                }
+            });
+            kept?;
+        }
+        Ok(())
     }
 
     /// For each distinct value at key `position` of `plan`'s permutation (the first component

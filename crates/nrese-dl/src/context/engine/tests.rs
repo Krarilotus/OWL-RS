@@ -25,6 +25,40 @@ fn payload_engine() -> Engine {
     Engine::new(program, Strategy::Cautious, false, budget)
 }
 
+fn failed() -> nrese_exec::memory::Reading {
+    Err(nrese_exec::memory::Unread::Failed)
+}
+
+/// DC-07: a saturation under a process memory limit whose reading fails stops, and says
+/// the memory was unreadable, not that its budget ran out; without a limit nothing is read.
+#[test]
+fn an_unread_memory_limit_stops_the_saturation_as_unreadable() {
+    let engine = |max_memory| {
+        let normalised =
+            nrese_owl::normalise_with(&nrese_owl::Ontology::default(), Default::default());
+        let program = super::super::compile::compile(&normalised, &[1], false)
+            .unwrap()
+            .program;
+        let budget = Budget {
+            max_memory,
+            ..Budget::default()
+        };
+        Engine::new(program, Strategy::Cautious, false, budget).with_memory_reader(failed)
+    };
+    let limited = engine(Some(u64::MAX));
+    assert!(
+        limited.out_of_budget(),
+        "an unread limit stops the saturation"
+    );
+    assert_eq!(
+        limited.budget_stop(),
+        super::super::Unsupported::MemoryUnreadable
+    );
+    let unlimited = engine(None);
+    assert!(!unlimited.out_of_budget());
+    assert_eq!(unlimited.budget_stop(), super::super::Unsupported::Budget);
+}
+
 #[test]
 fn the_envelope_stops_its_engine_alone_and_for_good() {
     let engine = payload_engine();

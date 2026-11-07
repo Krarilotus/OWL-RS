@@ -20,9 +20,21 @@
 //! new ones put in tables of their own ([`super::pending`]); at the end they are numbered
 //! in the order they first occur in the input and become a segment of entries whose text
 //! stays where it was interned ([`Dictionary::adopt_pending`]).
+//!
+//! Lock order: a thread takes the dictionary's locks only in this order, and never two of one
+//! level: one index's (`text`, `iri_text`, `vectors` or `vector_builder`), then `inner`, then
+//! `order`, then the derived files' bookkeeping. With the fair `RwLock`, a read behind a
+//! queued writer waits, so even two readers taking two locks in opposite orders close a
+//! cycle with an interner (B-103: `stats` took `inner`, then the indexes, while extensions
+//! take their index, then `inner`). The dictionary's locks come after every lock of the
+//! engine, and no dictionary lock is held while code the dictionary doesn't own runs, except
+//! [`Dictionary::with_views`]' and [`Dictionary::for_each_key`]'s callbacks, which take no
+//! lock but `inner`'s recursive read, and [`Dictionary::intern_all`]'s iterator, run under
+//! `inner`'s write lock, which must not use the dictionary at all. A vector search's `accept`
+//! runs with none ([`super::vectors::SearchInput`]).
 
 use hashbrown::HashTable;
-use nrese_exec::{Budget, BudgetExceeded, ChargedVec};
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use nrese_rdf::{
     BaseDirection, BlankNode, GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, Quad,
     QuadRef, Term, TermRef,
@@ -516,6 +528,9 @@ pub struct Dictionary {
     /// The vector literals, built at the first vector search and extended at later ones
     /// ([`super::vectors`]).
     vectors: std::sync::Arc<RwLock<super::vectors::VectorIndex>>,
+    /// Runs the vector graph builds searches start in the background; unset, each gets a
+    /// thread of its own.
+    vector_builder: RwLock<Option<super::vectors::VectorBuilder>>,
     /// The text order of the entries the mapped base doesn't order ([`super::order`]).
     order: RwLock<super::order::TextOrder>,
     /// Integer-derived literals (`xsd:int`, ...) are dictionary entries, not inline
@@ -648,10 +663,11 @@ impl Dictionary {
             tracing::warn!("vector index unreadable; built anew");
             return;
         };
-        let mut slot = self.vectors.write();
-        if slot.covered() < covered {
-            *self.derived.saved_graphs.lock() = index.graph_coverage();
-            *slot = index;
+        // Not in place of an index a search started a build in meanwhile (a search that
+        // didn't wait for this load; PR #79 fix check r1).
+        let graphs = index.graph_coverage();
+        if self.vectors.write().adopt(index) {
+            *self.derived.saved_graphs.lock() = graphs;
             self.derived.saved.lock()[VECTORS] = covered;
             self.derived
                 .loads
@@ -761,11 +777,15 @@ impl Dictionary {
     }
 
     pub fn stats(&self) -> DictionaryStats {
+        // Each index's figures under its own lock, let go before `inner` (the lock order).
+        let vector_bytes = self.vectors.read().memory_bytes() as u64;
+        let text_covered = self.text.read().covered();
+        let iri_text_covered = self.iri_text.read().covered();
         let inner = self.inner.read();
         let base = inner.base.as_ref();
         DictionaryStats {
-            vector_bytes: self.vectors.read().memory_bytes() as u64,
-            text_covered: self.text.read().covered() + self.iri_text.read().covered(),
+            vector_bytes,
+            text_covered: text_covered + iri_text_covered,
             derived_loaded: self
                 .derived
                 .loads
@@ -845,7 +865,8 @@ impl Dictionary {
         self.intern_locked(&mut self.inner.write(), &mut Vec::with_capacity(64), term)
     }
 
-    /// Interns a batch of terms under one lock acquisition.
+    /// Interns a batch of terms under one lock acquisition. `terms` is consumed under the
+    /// write lock: it must not use the dictionary (a lookup there waits forever).
     pub fn intern_all<'a>(&self, terms: impl IntoIterator<Item = TermRef<'a>>) -> Vec<TermId> {
         let mut key = Vec::with_capacity(64);
         let mut inner = self.inner.write();
@@ -953,13 +974,15 @@ impl Dictionary {
                 self.text.write().prepare_stems(language);
             }
         }
+        // The index's lock before `inner`'s (the lock order).
+        let text = self.text.read();
         let inner = self.inner.read();
         let text_of = |index: u64| match view_key(&inner.key(index)) {
             TermView::String(value) | TermView::LangString { value, .. } => Some(value.to_owned()),
             _ => None,
         };
         // Matches are entry numbers: as ids, by the entry's kind.
-        let mut matches = self.text.read().search(query, &text_of);
+        let mut matches = text.search(query, &text_of);
         for found in &mut matches {
             let kind = match view_key(&inner.key(found.id)) {
                 TermView::LangString { .. } => TermKind::LangString,
@@ -984,18 +1007,26 @@ impl Dictionary {
             let work = self.vectors.write().work_for(query);
             match work {
                 super::vectors::Work::None => {}
-                super::vectors::Work::Now => super::vectors::build(&self.vectors, query),
-                super::vectors::Work::Background => super::vectors::build_in_background(
-                    std::sync::Arc::clone(&self.vectors),
-                    query.clone(),
-                ),
+                super::vectors::Work::Now => super::vectors::build(&self.vectors, query, None),
+                super::vectors::Work::Background(reservation) => {
+                    let builder = self.vector_builder.read().clone();
+                    super::vectors::build_in_background(
+                        std::sync::Arc::clone(&self.vectors),
+                        query.clone(),
+                        reservation,
+                        builder.as_ref(),
+                    );
+                }
             }
         }
         let accept = |raw: u64| {
             let id = TermId::from_raw(raw);
             id.payload() < known && accept(id)
         };
-        self.vectors.read().search(query, &accept)
+        // What the search reads, taken under the lock; the search and `accept` run without
+        // it (`accept` may intern and search again; the scans are parallel).
+        let input = self.vectors.read().search_input(query);
+        super::vectors::search(input, query, &accept)
     }
 
     /// Builds the graph a search like `query` uses, covering every vector, before
@@ -1008,8 +1039,14 @@ impl Dictionary {
             ..query.clone()
         };
         if self.vectors.read().may_need_work(&query) {
-            super::vectors::build(&self.vectors, &query);
+            // A warm-up holds no reservation, and ends none a background build holds.
+            super::vectors::build(&self.vectors, &query, None);
         }
+    }
+
+    /// Runs the vector graph builds searches start from now on through `builder`.
+    pub(crate) fn set_vector_builder(&self, builder: super::vectors::VectorBuilder) {
+        *self.vector_builder.write() = Some(builder);
     }
 
     /// The vector index, from its file at the first use, then with the vector literals
@@ -1084,12 +1121,14 @@ impl Dictionary {
                 self.iri_text.write().prepare_stems(language);
             }
         }
+        // The index's lock before `inner`'s (the lock order).
+        let text = self.iri_text.read();
         let inner = self.inner.read();
         let text_of = |index: u64| match view_key(&inner.key(index)) {
             TermView::Iri(iri) => super::text::local_name_text(iri),
             _ => None,
         };
-        let mut matches = self.iri_text.read().search(query, &text_of);
+        let mut matches = text.search(query, &text_of);
         for found in &mut matches {
             found.id = TermId::new(TermKind::Iri, found.id).raw();
         }
@@ -1243,8 +1282,15 @@ impl Dictionary {
 
     /// The text order of the entries `0..len` as checkpoint indices: the mapped base's
     /// order merged with that of the others, from the in-memory order where it covers them,
-    /// else sorted here (and not kept: the checkpoint's base takes them over).
-    pub(crate) fn text_order(&self, len: u64) -> Vec<u32> {
+    /// else sorted here (and not kept: the checkpoint's base takes them over). What it
+    /// allocates for them is charged to `budget` first ([`super::order::sorted_within`]),
+    /// the order with its capacity; refused, it fails with [`EngineError::MemoryLimit`],
+    /// having freed what it made before releasing its charge.
+    pub(crate) fn text_order<'b>(
+        &self,
+        len: u64,
+        budget: &'b Budget,
+    ) -> EngineResult<ChargedVec<u32, &'b Budget>> {
         let inner = self.inner.read();
         let key = |index: u64| inner.key(index);
         let text = |index: u64| super::order::text_in(key(index));
@@ -1254,14 +1300,23 @@ impl Dictionary {
                 None => (&[], 0),
             };
         let order = self.order.read();
+        // The others: the kept order where it covers them, else sorted. Declared before
+        // the sorted order, its reservation is released after it is freed.
+        let _sorted_held: Reservation<&Budget>;
         let sorted: Vec<u32>;
-        let rest: Box<dyn Iterator<Item = u64>> =
-            if order.first == first && order.covered >= len.max(first) {
-                Box::new(order.order.iter().copied().filter(|&i| i < len))
-            } else {
-                sorted = super::order::sorted(first.min(len)..len, &key);
-                Box::new(sorted.iter().map(|&i| u64::from(i)))
-            };
+        let kept: &[u64];
+        if order.first == first && order.covered >= len.max(first) {
+            (kept, sorted, _sorted_held) = (&order.order, Vec::new(), Reservation::new(budget));
+        } else {
+            kept = &[];
+            (sorted, _sorted_held) =
+                super::order::sorted_within(first.min(len)..len, &key, budget)?;
+        }
+        let rest = kept
+            .iter()
+            .copied()
+            .filter(|&i| i < len)
+            .chain(sorted.iter().map(|&i| u64::from(i)));
         // Merged straight from both orders: no copies of them.
         let capacity = base.len() + len.saturating_sub(first) as usize;
         let mut base = base
@@ -1270,18 +1325,33 @@ impl Dictionary {
             .filter(|&i| i < len)
             .peekable();
         let mut rest = rest.peekable();
-        let mut merged = Vec::with_capacity(capacity);
-        loop {
-            let next = match (base.peek(), rest.peek()) {
-                (Some(&b), Some(&r)) if (text(b), b) <= (text(r), r) => base.next(),
-                (Some(_), Some(_)) => rest.next(),
-                (Some(_), None) => base.next(),
-                (None, Some(_)) => rest.next(),
-                (None, None) => break,
-            };
-            merged.push(next.expect("peeked") as u32);
-        }
-        merged
+        // The base's next entry, decoded once where its keys are compressed, into room
+        // charged first. The others' keys are in place: they follow the base (`first` is
+        // its length), and a base without an order is never compressed (format < 7).
+        let mut decoded = ChargedVec::new(budget);
+        let mut merged = ChargedVec::with_capacity(budget, capacity)?;
+        merged.fill(capacity, |room| -> Result<(), BudgetExceeded> {
+            // Compared while both have entries; then the rest of either follows unread.
+            while let (Some(&b), Some(_)) = (base.peek(), rest.peek()) {
+                let b_text = super::order::text_of(inner.key_within(b, &mut decoded)?);
+                let b_text = b_text.unwrap_or_default();
+                // The others before it; equal texts: the base's (lower) index first.
+                while let Some(&r) = rest.peek() {
+                    if (b_text, b) <= (&*text(r), r) {
+                        break;
+                    }
+                    room.push(r as u32);
+                    rest.next();
+                }
+                room.push(b as u32);
+                base.next();
+            }
+            base.for_each(|b| room.push(b as u32));
+            rest.for_each(|r| room.push(r as u32));
+            Ok(())
+        })??;
+        drop(decoded);
+        Ok(merged)
     }
 
     /// Decodes an id back into a term. Returns `None` for ids that do not belong to this
@@ -1377,7 +1447,8 @@ impl Dictionary {
 
     /// Calls `f` with a lookup of entry views below `limit`, all under one read lock: for
     /// writing many terms (result serialisation) without a lock per term. `f` may decode
-    /// ([`Self::decode`] reads recursively) but not intern.
+    /// ([`Self::decode`] reads recursively) but not intern, search or take any other lock
+    /// (the lock order in the module docs).
     pub fn with_views<R>(
         &self,
         limit: u64,
@@ -2028,6 +2099,10 @@ fn validate_key(key: &[u8]) -> EngineResult<()> {
 }
 
 #[cfg(test)]
+#[path = "dictionary_lock_tests.rs"]
+mod lock_order_tests;
+
+#[cfg(test)]
 mod tests {
     use nrese_rdf::vocab::xsd;
     use nrese_rdf::{BlankNodeRef, LiteralRef, NamedNodeRef};
@@ -2238,5 +2313,100 @@ mod tests {
         assert!(target.restore_key(0, &keys[1]).is_err());
         assert!(target.restore_key(5, &keys[0]).is_err());
         assert_eq!(target.len(), 2);
+    }
+
+    /// Loading the vector index from its file takes no background build's reservation
+    /// (PR #79 fix check r1, R79-01; notes/2026-11-02-pr79-vector-reservation-design.md).
+    /// The file covers M entries: a build was refused, then the vectors were saved. The
+    /// dictionary reopens with the first N. Two first searches race: the one that looks for
+    /// the file waits before its fingerprint (the derived dir is locked), the other covers
+    /// N and starts build A. Then the M-prefix's other vectors are interned again (aborted
+    /// interns), and the load goes on. Whether A is still queued or has installed its graph
+    /// (and lives on), no second build runs beside the first, and A's end ends no later
+    /// build's reservation.
+    #[test]
+    fn a_load_takes_no_build_s_reservation() {
+        use super::super::VectorQuery;
+        use super::super::vectors::{SYNC_BUILD, VectorBuild};
+        let n = SYNC_BUILD;
+        // A tenth more: the smallest extension of a graph covering N that is built.
+        let m = n + n / 10 + 1;
+        let lexicals: Vec<String> = (0..m).map(|i| nrese_vector::lexical(&[i as f32])).collect();
+        let intern = |dictionary: &Dictionary, range: std::ops::Range<usize>| {
+            for lexical in &lexicals[range] {
+                let datatype = NamedNodeRef::new_unchecked(nrese_vector::DATATYPE);
+                dictionary.intern(LiteralRef::new_typed_literal(lexical, datatype).into());
+            }
+        };
+        let query = VectorQuery::new(vec![1.0], 1);
+        let search = |dictionary: &Dictionary| {
+            dictionary.vector_search(&query, dictionary.len(), &|_| true);
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let source = Dictionary::default();
+        intern(&source, 0..m);
+        source.set_derived_dir(dir.path().to_owned());
+        source.set_vector_builder(std::sync::Arc::new(|_: VectorBuild| {
+            Err(std::io::Error::other("refused"))
+        }));
+        search(&source);
+        source.save_derived();
+        assert_eq!(
+            source.derived.saved.lock()[VECTORS],
+            m as u64,
+            "the file covers M"
+        );
+        let keys = source.export_keys(0, n as u64);
+        let keys: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        for installed in [false, true] {
+            let row = if installed { "A installed" } else { "A queued" };
+            let reopened = Dictionary::default();
+            reopened.restore_keys(&keys).unwrap();
+            reopened.set_derived_dir(dir.path().to_owned());
+            let (sent, jobs) = std::sync::mpsc::channel::<VectorBuild>();
+            reopened.set_vector_builder(std::sync::Arc::new(move |build: VectorBuild| {
+                sent.send(build)
+                    .map_err(|_| std::io::Error::other("no executor"))
+            }));
+            let next = |what: &str| {
+                jobs.recv_timeout(std::time::Duration::from_secs(300))
+                    .unwrap_or_else(|_| panic!("{row}: {what}"))
+            };
+            let none = |what: &str| assert!(jobs.try_recv().is_err(), "{row}: {what}");
+            let a = std::thread::scope(|scope| {
+                let dir_lock = reopened.derived.dir.write();
+                let searches = [
+                    scope.spawn(|| search(&reopened)),
+                    scope.spawn(|| search(&reopened)),
+                ];
+                let a = next("the search that didn't load starts build A");
+                if installed {
+                    a.install_kept();
+                }
+                intern(&reopened, n..m);
+                drop(dir_lock);
+                for search in searches {
+                    search.join().unwrap();
+                }
+                a
+            });
+            if installed {
+                // A's reservation ended with its install: the file's index (no graph)
+                // takes the live one's place, and the load's search starts build B.
+                let b = next("the loaded index has no graph: build B starts");
+                drop(a);
+                search(&reopened);
+                none("A's end leaves B's reservation: no build C");
+                drop(b);
+            } else {
+                none("the load starts no build B beside A");
+                drop(a);
+                search(&reopened);
+                let b = next("A's end: build B starts");
+                search(&reopened);
+                none("no build C beside B");
+                drop(b);
+            }
+        }
     }
 }

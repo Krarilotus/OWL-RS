@@ -134,6 +134,7 @@ impl super::Context<'_> {
             index_joins: self.index_joins,
             merge_set: self.merge_set.clone(),
             named: self.named.clone(),
+            store_default: self.store_default,
             synthetic: Cell::new(self.synthetic.get()),
             services: self.services.clone(),
             service_denied: self.service_denied,
@@ -152,40 +153,77 @@ impl super::Context<'_> {
     /// Every row of `solutions` with each value replaced by each identity of its class,
     /// independently per column (a value outside every class stays), up to `limit` rows.
     /// Column by column: each row's combinations in odometer order (the last column
-    /// fastest), each column written in one pass.
+    /// fastest), each column written in one pass. Every buffer it makes is charged before
+    /// it is made and allocated fallibly, so an expansion past the query's budget, or past
+    /// what memory holds, fails as [`MemoryLimit`](crate::QueryEvaluationError::MemoryLimit).
     fn expand_classes(
         &self,
-        mut solutions: super::Solutions,
+        solutions: super::Solutions,
         classes: &nrese_engine::EqualityClasses,
         limit: Option<usize>,
     ) -> super::NativeResult<super::Solutions> {
         let (width, rows) = (solutions.table.width(), solutions.table.len());
         let limit = limit.unwrap_or(usize::MAX);
         let size = |id: u64| classes.members_of(&id).len();
-        // Each row's number of combinations.
-        let mut factor = vec![1usize; rows];
-        for c in 0..width {
-            for (f, &id) in factor.iter_mut().zip(solutions.table.column(c)) {
+        // The first value in a class of two or more identities, column by column. Without
+        // one (without columns too) every row is one combination: the rows are the answer,
+        // cut to the limit in place.
+        let first = (0..width).find_map(|c| {
+            let column = solutions.table.column(c);
+            column.iter().position(|&id| size(id) > 1).map(|r| (c, r))
+        });
+        let Some((first_column, first_row)) = first else {
+            let mut solutions = solutions;
+            if rows > limit {
+                solutions.table.slice(0, Some(limit));
+            }
+            return Ok(solutions);
+        };
+        // What it makes, charged before it is made, beside the input's charge. A size past
+        // `usize` (a saturated total included) is charged as the most bytes there are, which
+        // no budget holding the input grants.
+        let mut held =
+            nrese_exec::Reservation::adopt(&*self.budget, solutions.table.memory_bytes());
+        let mut charge = |bytes| {
+            held.charge(bytes)
+                .map_err(crate::QueryEvaluationError::MemoryLimit)
+        };
+        // Declared after `held`, as every buffer below: freed before its charge is released.
+        let mut solutions = solutions;
+        // Each row's number of combinations (`usize::MAX`: that many or more); the values
+        // before the first in a class count once.
+        charge(bytes::<usize>(rows))?;
+        let mut factor = self.room::<usize>(rows)?;
+        factor.resize(rows, 1);
+        for c in first_column..width {
+            let from = if c == first_column { first_row } else { 0 };
+            let column = &solutions.table.column(c)[from..];
+            for (f, &id) in factor[from..].iter_mut().zip(column) {
                 *f = f.saturating_mul(size(id));
             }
         }
-        if factor.iter().all(|&f| f == 1) && rows <= limit {
-            return Ok(solutions);
-        }
-        // The rows whose combinations fit the limit (the last one maybe in part).
+        // The rows whose combinations fit the limit (the last one maybe in part), each
+        // written whole: a column holds `total` ids until it is cut to the limit.
         let mut total = 0usize;
         let mut kept = 0;
         while kept < rows && total < limit {
             total = total.saturating_add(factor[kept]);
             kept += 1;
         }
+        // The columns, their list and the kept rows' strides, all charged before the first
+        // is made.
+        charge(total.checked_mul(width).map_or(usize::MAX, bytes::<u64>))?;
+        charge(bytes::<Vec<u64>>(width))?;
+        charge(bytes::<usize>(kept))?;
         self.check()?;
-        let mut columns: Vec<Vec<u64>> = vec![Vec::new(); width];
+        let mut columns = self.room::<Vec<u64>>(width)?;
+        columns.resize_with(width, Vec::new);
         // Products of the later columns' sizes, per row, built from the last column back.
-        let mut stride = vec![1usize; kept];
+        let mut stride = self.room::<usize>(kept)?;
+        stride.resize(kept, 1);
         for c in (0..width).rev() {
             let column = solutions.table.column(c);
-            let mut out = Vec::with_capacity(total);
+            let mut out = self.room::<u64>(total)?;
             for r in 0..kept {
                 let members = classes.members_of(&column[r]);
                 let repeat = stride[r];
@@ -201,17 +239,138 @@ impl super::Context<'_> {
             columns[c] = out;
             self.check()?;
         }
-        let out = if width == 0 {
-            nrese_exec::IdTable::from_rows(0, std::iter::repeat_n(&[][..], total.min(limit)))
-        } else {
-            nrese_exec::IdTable::from_columns(columns)
-        };
+        let out = nrese_exec::IdTable::from_columns(columns);
         let vars = std::mem::take(&mut solutions.vars);
-        self.consumed(solutions);
-        self.produced(super::Solutions {
+        drop((factor, stride, solutions));
+        self.check()?;
+        held.resize(out.memory_bytes())
+            .map_err(crate::QueryEvaluationError::MemoryLimit)?;
+        held.transfer();
+        Ok(super::Solutions {
             vars,
             table: out,
             ordered: false,
         })
+    }
+
+    /// An empty vector with room for `len` items, allocated fallibly: a budget without a
+    /// limit grants any size, and the allocator may still refuse it.
+    fn room<T>(&self, len: usize) -> super::NativeResult<Vec<T>> {
+        let mut items = Vec::new();
+        if items.try_reserve_exact(len).is_err() {
+            let refused = nrese_exec::BudgetExceeded {
+                limit: self.budget.limit(),
+                requested: bytes::<T>(len),
+                used: self.budget.used(),
+                shared: false,
+            };
+            return Err(crate::QueryEvaluationError::MemoryLimit(refused).into());
+        }
+        Ok(items)
+    }
+}
+
+/// The bytes of `len` items of `T` (`usize::MAX` past `usize`).
+fn bytes<T>(len: usize) -> usize {
+    len.saturating_mul(std::mem::size_of::<T>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Context, Solutions};
+    use crate::QueryOptions;
+    use nrese_engine::{EncodedTriple, Engine, EngineConfig};
+    use nrese_exec::measure::{alone, measure_within};
+    use nrese_exec::{Envelope, IdTable, Reservation};
+    use nrese_rdf::{NamedNode, Variable};
+
+    /// What an expansion holds beyond its charge doesn't grow with its rows, on each path:
+    /// rows expanded over a class of two identities, rows with no value in a class, rows
+    /// without columns, each cut to a limit or not. Beyond its charge it holds no more than
+    /// a table's list of columns, which a table's charge leaves out
+    /// (`IdTable::memory_bytes`). Each input is charged before it is made, inside the
+    /// measurement.
+    #[test]
+    fn an_expansion_holds_no_more_than_it_charges() {
+        if !alone() {
+            return;
+        }
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let node = |name: &str| NamedNode::new_unchecked(format!("urn:{name}"));
+        let [same_as, a, b, outside] =
+            ["sameAs", "a", "b", "outside"].map(|name| tx.intern(node(name).as_ref().into()));
+        tx.insert_inferred(EncodedTriple {
+            subject: b,
+            predicate: same_as,
+            object: a,
+        });
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let snapshot = engine.snapshot();
+        let classes = snapshot.equality_classes().expect("a class");
+        let (class, _) = classes.iter().next().expect("a class");
+        let outside = outside.raw();
+        let envelope = Envelope::unlimited();
+        let mut options = QueryOptions::default();
+        options.resources.memory = envelope.clone();
+        let ctx = Context::new(&snapshot, &options, None, None);
+        // What expanding `rows` rows, each `row`, holds beyond its charge, and the rows it
+        // answers.
+        let expand = |row: &[u64], rows: usize, limit: Option<usize>| -> (usize, usize) {
+            let width = row.len();
+            let vars: Vec<Variable> = (0..width)
+                .map(|i| Variable::new_unchecked(format!("v{i}")))
+                .collect();
+            let (expanded, excess) = measure_within(&envelope, || {
+                let mut charged = Reservation::new(&*ctx.budget);
+                charged.charge(rows * width * 8).unwrap();
+                let mut table = IdTable::with_capacity(width, rows);
+                for _ in 0..rows {
+                    table.push_row(row);
+                }
+                charged.transfer();
+                let input = Solutions {
+                    vars,
+                    table,
+                    ordered: false,
+                };
+                ctx.expand_classes(input, &classes, limit)
+                    .ok()
+                    .expect("expanded")
+            });
+            let answered = expanded.table.len();
+            ctx.consumed(expanded);
+            (excess, answered)
+        };
+        for (path, row, per_row) in [
+            ("expanded", &[class, outside][..], 2),
+            ("in no class", &[outside, outside][..], 1),
+            ("without columns", &[][..], 1),
+        ] {
+            for cut in [false, true] {
+                let held = |rows: usize| {
+                    let limit = cut.then_some(rows / 2);
+                    let (excess, answered) = expand(row, rows, limit);
+                    let answers = limit.unwrap_or(rows * per_row);
+                    assert_eq!(answered, answers, "{path}, {rows} rows, limit {limit:?}");
+                    excess
+                };
+                let (few, many) = (held(4_096), held(32_768));
+                assert_eq!(
+                    many, few,
+                    "{path}, cut {cut}: uncharged bytes grow with the rows"
+                );
+                let list = row.len() * std::mem::size_of::<Vec<u64>>();
+                assert!(
+                    few <= list,
+                    "{path}, cut {cut}: {few} bytes uncharged, more than a list of columns"
+                );
+            }
+        }
     }
 }

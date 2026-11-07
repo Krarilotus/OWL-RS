@@ -56,9 +56,9 @@ POLL_S = 60
 # A timed job holds its host's timings for one chunk of about this many minutes, then yields
 # (hosts.toml queue.chunk_min overrides; a chunk past 1.5 times it is stopped).
 CHUNK_MIN = 30
-# On Windows, a job's processes and git open no console window (the runner is a scheduled
-# task in the owner's session).
-QUIET_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# On Windows, a job's processes and git open no console window (QUIET_WINDOW); a chunk is
+# stopped with all it runs (stop).
+from suitekit.processes import QUIET_WINDOW, stop  # noqa: E402
 
 
 # --- jobs ------------------------------------------------------------------------------------
@@ -333,23 +333,6 @@ class Queue:
                            creationflags=QUIET_WINDOW)
         self.move(path, job, state)
         return state
-
-
-def stop(process: subprocess.Popen, grace_s: float = 30):
-    """Stops a chunk and all it runs: SIGTERM to its process group, SIGKILL after `grace_s`
-    (Windows: taskkill /T /F)."""
-    if os.name == "nt":
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True,
-                       creationflags=QUIET_WINDOW)
-        return
-    import signal
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-        process.wait(timeout=grace_s)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
 
 
 QUIET_WATCH = HERE.parents[1] / "scripts" / "lib" / "quiet-watch.py"

@@ -2324,6 +2324,60 @@ fn cyclic_bgps_equal_the_reference() {
     assert_eq!(checked, 1000);
 }
 
+/// COUNT(*) of a cyclic BGP, counted by its join, is exact while 64 bits hold it and fails
+/// as the engine's range limit past them; it never answers a capped number. A triangle over
+/// one statement and `m` patterns of 256 matches each are 256^m solutions: 2^56 for 7, and
+/// 2^64, one past `u64::MAX`, for 8.
+#[test]
+fn a_cyclic_count_past_64_bits_fails_as_a_range_limit() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    tx.insert(Quad::new(ex("a"), ex("link"), ex("a"), GraphName::DefaultGraph).as_ref());
+    for i in 0..256 {
+        let quad = Quad::new(
+            ex(&format!("s{i}")),
+            ex("p"),
+            ex("o"),
+            GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    // A budget, so that a count from the rows would fail at once instead of making them.
+    let options = QueryOptions {
+        resources: nrese_sparql::Resources {
+            memory: nrese_exec::Envelope::new(Some(64 << 20), None),
+            ..Default::default()
+        },
+        ..QueryOptions::default()
+    };
+    let count = |m: usize| -> Result<Option<Term>, nrese_sparql::QueryEvaluationError> {
+        let independent: String = (0..m)
+            .map(|i| format!(" ?x{i} <{EX}p> <{EX}o> ."))
+            .collect();
+        let text = format!(
+            "SELECT (COUNT(*) AS ?n) WHERE {{ ?a <{EX}link> ?b . ?b <{EX}link> ?c . \
+             ?c <{EX}link> ?a .{independent} }}"
+        );
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let QueryResults::Solutions(mut solutions) = evaluate_query(&snapshot, &query, &options)?
+        else {
+            unreachable!("a SELECT")
+        };
+        Ok(solutions
+            .next()
+            .transpose()?
+            .and_then(|s| s.get("n").cloned()))
+    };
+    let exact = Literal::new_typed_literal((1u64 << 56).to_string(), xsd::INTEGER);
+    assert_eq!(count(7).unwrap(), Some(exact.into()));
+    match count(8) {
+        Err(nrese_sparql::QueryEvaluationError::CountBeyondRange { .. }) => {}
+        other => panic!("256^8 solutions: {other:?}"),
+    }
+}
+
 /// A selective pattern joined with a much larger one runs as a parallel index nested-loop
 /// join (enough rows for several chunks); it equals the reference evaluator.
 #[test]

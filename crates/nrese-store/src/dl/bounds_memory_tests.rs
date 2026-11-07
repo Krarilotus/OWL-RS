@@ -5,7 +5,7 @@ use crate::StoreConfig;
 
 fn store(limit: u64) -> StoreService {
     let store = StoreService::new(StoreConfig {
-        process_memory_bytes: limit,
+        process_memory_bytes: crate::ProcessMemory::Bytes(limit),
         ..StoreConfig::in_memory()
     })
     .unwrap();
@@ -23,7 +23,7 @@ fn store(limit: u64) -> StoreService {
 
 #[test]
 fn embedded_low_memory_bounds_are_unavailable_on_every_build_path() {
-    if nrese_exec::memory::process_bytes().is_none() {
+    if !nrese_exec::memory::READS_MEMORY {
         return;
     }
     let store = store(1);
@@ -61,7 +61,7 @@ fn embedded_zero_memory_policy_leaves_bounds_enabled() {
 
 #[test]
 fn embedded_low_memory_stops_maintenance_of_an_existing_upper_bound() {
-    if nrese_exec::memory::process_bytes().is_none() {
+    if !nrese_exec::memory::READS_MEMORY {
         return;
     }
     let store = store(1);

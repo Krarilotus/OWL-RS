@@ -118,3 +118,37 @@ fn a_new_term_waits_without_its_hash() {
         "{per_term:.1} bytes a pending term beyond its text ({pending} for {terms} terms, {text} of text)"
     );
 }
+
+/// A first load appended to an empty store builds its index from the quads it holds, as a
+/// replacing load does: filtered against the empty store, they were copied, a second array
+/// of 32 bytes a quad while the index was built (DBpedia core's peak 2 GB higher; fleet
+/// pm-ib1801-1, 21 Oct 2026).
+#[test]
+fn a_first_appended_load_builds_its_index_from_the_quads_it_holds() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|p| p.into_inner());
+    const QUADS: usize = 16 * 4096;
+    // What the index build holds at its peak, beyond the sorted quads.
+    let build = |mode: BulkMode| {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let load = engine.bulk_load(mode);
+        for b in 0..16 {
+            load.add(&batch(b * 4096, 4096));
+        }
+        heap::start("bulk load: finish");
+        load.finish().unwrap();
+        let phases = heap::finish();
+        assert_eq!(engine.snapshot().len(), QUADS as u64);
+        let phase = |label: &str| {
+            *phases
+                .iter()
+                .find(|phase| phase.label == label)
+                .unwrap_or_else(|| panic!("no phase {label}: {phases:?}"))
+        };
+        phase("load: permutations").peak - phase("load: sorting").live_after
+    };
+    let (replaced, appended) = (build(BulkMode::Replace), build(BulkMode::Append));
+    assert!(
+        appended < replaced + QUADS * 32 / 2,
+        "an appended load's index build held {appended} bytes, a replacing one's {replaced}"
+    );
+}

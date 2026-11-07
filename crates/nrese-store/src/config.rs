@@ -41,13 +41,15 @@ pub struct StoreConfig {
     /// The memory the process may hold before a long operation (a materialisation, the
     /// reasoning of a commit) stops with [`StoreError::ProcessMemoryLimit`](crate::StoreError::ProcessMemoryLimit)
     /// instead of taking the machine; 0 is no limit. By default three quarters of what the
-    /// process may use ([`default_process_memory_bytes`]).
+    /// process may use ([`ProcessMemory::Default`]), read when the store opens; opening
+    /// fails where it can't be read, and where this target can't read memory a limit is
+    /// refused ([`ProcessMemory::resolve`]).
     /// It is also the limit of the process's budget ([`Runtime::memory`](crate::Runtime::memory)),
     /// which what queries and maintenance charge draws on, the queries' budget within it.
     /// This is the store's watch policy, not a write to the global process limit.
     /// The server installs its process-wide fallback separately at startup. Disabling
     /// this watch does not bypass a fallback explicitly installed by the process owner.
-    pub process_memory_bytes: u64,
+    pub process_memory_bytes: ProcessMemory,
     /// Whether the process's memory may be backed by transparent huge pages (Linux;
     /// `nrese_exec::memory::set_transparent_huge_pages`): faster work over large heaps
     /// (materialisation, loads), more memory held while serving many small requests.
@@ -111,6 +113,10 @@ pub struct StoreConfig {
     /// On disk: keep the WAL segments checkpoints cover in `wal-archive/` of the data
     /// directory (point-in-time restore; see `nrese_engine::DurabilityConfig::wal_archive`).
     pub wal_archive: bool,
+    /// On disk: what opening does with damage in the newest WAL segment that a crash
+    /// mid-append doesn't leave (`store.wal_damage`): refuse to open (the default), or open
+    /// with the log up to it, the rest copied aside (see `nrese_engine::WalDamage`).
+    pub wal_damage: nrese_engine::WalDamage,
     /// How index blocks are encoded when built (`store.index_encoding`): `Fast`, or
     /// `Compact` (palettes: a smaller store, scans up to a tenth slower). Set for the
     /// process when the store opens; see `nrese_engine::IndexEncoding`.
@@ -248,10 +254,53 @@ impl Default for StoreConfig {
     }
 }
 
-/// Three quarters of the memory the process may use (the container's limit, else the
-/// machine's: [`nrese_exec::memory::available_bytes`]); 0 (no limit) where unknown.
-pub fn default_process_memory_bytes() -> u64 {
-    nrese_exec::memory::available_bytes().map_or(0, |bytes| bytes / 4 * 3)
+/// [`StoreConfig::process_memory_bytes`]: the default, read when the store opens, or a
+/// number of bytes (0: no limit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessMemory {
+    /// Three quarters of the memory the process may use (the container's limit, else the
+    /// machine's: [`nrese_exec::memory::available_bytes`]).
+    Default,
+    /// This many bytes; 0 is no limit.
+    Bytes(u64),
+}
+
+impl ProcessMemory {
+    /// The limit in bytes (0: none), refused where it can't be enforced: a limit where this
+    /// target doesn't read memory ([`nrese_exec::memory::READS_MEMORY`]), or the default
+    /// where the memory it is a share of can't be read.
+    pub fn resolve(self) -> StoreResult<u64> {
+        self.resolve_with(
+            nrese_exec::memory::READS_MEMORY,
+            nrese_exec::memory::available_bytes,
+        )
+    }
+
+    /// [`Self::resolve`] on a target that reads memory or not, `available` reading the memory
+    /// the process may use: the resolution itself, for a caller that must show what it does
+    /// where memory isn't read.
+    pub fn resolve_with(
+        self,
+        reads_memory: bool,
+        available: impl FnOnce() -> nrese_exec::memory::Reading,
+    ) -> StoreResult<u64> {
+        match self {
+            Self::Bytes(0) => Ok(0),
+            Self::Bytes(_) if !reads_memory => Err(StoreError::Configuration(
+                "process_memory_bytes: this platform doesn't read the process's memory, so \
+                 the limit can't be enforced; set it to 0 to run without one"
+                    .to_owned(),
+            )),
+            Self::Bytes(bytes) => Ok(bytes),
+            Self::Default => available().map(|bytes| bytes / 4 * 3).map_err(|unread| {
+                StoreError::Configuration(format!(
+                    "process_memory_bytes: its default, three quarters of the memory the \
+                     process may use, needs that memory read ({unread}); set it by hand, in \
+                     bytes, or 0 to run without a limit"
+                ))
+            }),
+        }
+    }
 }
 
 impl StoreConfig {
@@ -266,7 +315,7 @@ impl StoreConfig {
             union_default_graph: false,
             geosparql_stated_only: false,
             total_query_memory_bytes: 0,
-            process_memory_bytes: default_process_memory_bytes(),
+            process_memory_bytes: ProcessMemory::Default,
             huge_pages: DEFAULT_HUGE_PAGES,
             reasoning_release: DEFAULT_REASONING_RELEASE,
             federation: FederationConfig::default(),
@@ -283,6 +332,7 @@ impl StoreConfig {
             bulk_load_memory_bytes: 0,
             invalid_statements: crate::quarantine::InvalidStatements::Quarantine,
             wal_archive: false,
+            wal_damage: nrese_engine::WalDamage::Refuse,
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
@@ -301,7 +351,7 @@ impl StoreConfig {
             union_default_graph: false,
             geosparql_stated_only: false,
             total_query_memory_bytes: 0,
-            process_memory_bytes: default_process_memory_bytes(),
+            process_memory_bytes: ProcessMemory::Default,
             huge_pages: DEFAULT_HUGE_PAGES,
             reasoning_release: DEFAULT_REASONING_RELEASE,
             federation: FederationConfig::default(),
@@ -318,6 +368,7 @@ impl StoreConfig {
             bulk_load_memory_bytes: 0,
             invalid_statements: crate::quarantine::InvalidStatements::Quarantine,
             wal_archive: false,
+            wal_damage: nrese_engine::WalDamage::Refuse,
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
@@ -366,5 +417,55 @@ impl StoreConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProcessMemory;
+    use nrese_exec::memory::{Reading, Unread};
+
+    const G: u64 = 1 << 30;
+
+    fn unused() -> Reading {
+        panic!("a limit set by hand reads nothing")
+    }
+
+    /// The message of a refusal: a configuration error that names the setting.
+    fn refusal(resolved: crate::StoreResult<u64>) -> String {
+        match resolved {
+            Err(crate::StoreError::Configuration(message)) => {
+                assert!(message.contains("process_memory_bytes"), "{message}");
+                message
+            }
+            other => panic!("refused, not {other:?}"),
+        }
+    }
+
+    /// DC-07: where memory isn't read, a limit set by hand can't be enforced and is refused,
+    /// naming the setting and the way out; no limit (0) stays allowed.
+    #[test]
+    fn a_limit_is_refused_where_memory_isnt_read() {
+        let message = refusal(ProcessMemory::Bytes(G).resolve_with(false, unused));
+        assert!(message.contains('0'), "says 0 runs without one: {message}");
+        assert_eq!(
+            ProcessMemory::Bytes(0).resolve_with(false, unused).ok(),
+            Some(0)
+        );
+        assert_eq!(
+            ProcessMemory::Bytes(G).resolve_with(true, unused).ok(),
+            Some(G)
+        );
+    }
+
+    /// DC-07: the default is three quarters of what the process may use; where that can't
+    /// be read (the reading failed, or no reader here) opening refuses it, naming the setting
+    /// to set by hand, instead of running without a limit.
+    #[test]
+    fn the_default_limit_needs_its_reading() {
+        let default = ProcessMemory::Default;
+        assert_eq!(default.resolve_with(true, || Ok(4 * G)).ok(), Some(3 * G));
+        refusal(default.resolve_with(true, || Err(Unread::Failed)));
+        refusal(default.resolve_with(false, || Err(Unread::Unsupported)));
     }
 }

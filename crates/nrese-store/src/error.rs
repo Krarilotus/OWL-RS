@@ -72,6 +72,15 @@ pub enum StoreError {
         .limit / (1 << 20)
     )]
     ProcessMemoryLimit { limit: u64 },
+    /// A long operation stopped because the process's memory couldn't be read, so its
+    /// memory limit couldn't be enforced (`nrese_exec::memory::Unread`); nothing of it was
+    /// applied.
+    #[error(
+        "stopped: the process's memory couldn't be read to hold it to its limit ({} MiB); \
+         nothing was applied",
+        .limit / (1 << 20)
+    )]
+    MemoryUnreadable { limit: u64 },
     /// A bulk load was stopped ([`crate::LoadProgress::cancel`]); nothing of it was
     /// committed.
     #[error("the load was cancelled; nothing of it was committed")]
@@ -199,6 +208,7 @@ impl StoreError {
             | Self::MaterialisationCancelled
             | Self::InferencesNotRecorded(_)
             | Self::ProcessMemoryLimit { .. }
+            | Self::MemoryUnreadable { .. }
             | Self::MemoryLimitWithoutAmounts { .. }
             | Self::LoadCancelled
             // Answered by the transport as what it is (the query is fine; its answers

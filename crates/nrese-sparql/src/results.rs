@@ -36,6 +36,13 @@ pub enum QueryEvaluationError {
     /// literal it needs).
     #[error("{0}")]
     Argument(String),
+    /// A count the query asks for is more than this engine can report exactly: at least
+    /// `at_least`, past what its 64-bit counts hold (equality expansion of very large
+    /// `owl:sameAs` classes). A limit of the engine, not an error in the query.
+    #[error(
+        "the count is more than this engine can count exactly (at least {at_least}): a limit of this engine, not an error in the query"
+    )]
+    CountBeyondRange { at_least: u64 },
     #[error("{0}")]
     Unexpected(String),
 }

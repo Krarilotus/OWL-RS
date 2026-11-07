@@ -488,10 +488,14 @@ fn characteristic_sets_are_complete_for_the_first_planners() {
         }
         load.finish().unwrap();
         assert!(
-            engine.snapshot().count_in(
-                ReadModel::default(),
-                &QuadPattern::in_graph(TermId::DEFAULT_GRAPH)
-            ) > 1 << 20
+            engine
+                .snapshot()
+                .count_in(
+                    ReadModel::default(),
+                    &QuadPattern::in_graph(TermId::DEFAULT_GRAPH)
+                )
+                .at_least()
+                > 1 << 20
         );
         let planned = first_planners(&engine);
         let expected = planned[0].expect("the first planners have the sets");

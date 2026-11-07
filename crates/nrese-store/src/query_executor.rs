@@ -113,6 +113,18 @@ pub struct PreparedQuery {
     rdf12: bool,
     /// Under `owl2-dl`: which answers this query asks for (`None`: `dl.answers`).
     dl_answers: Option<crate::DlAnswers>,
+    /// Told when the query is handed to the executor ([`Self::on_evaluation`]).
+    on_evaluation: Option<OnEvaluation>,
+}
+
+/// What [`PreparedQuery::on_evaluation`] calls.
+#[derive(Clone)]
+struct OnEvaluation(std::sync::Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for OnEvaluation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OnEvaluation")
+    }
 }
 
 impl PreparedQuery {
@@ -178,7 +190,18 @@ impl PreparedQuery {
             pin: None,
             rdf12: false,
             dl_answers: request.dl_answers,
+            on_evaluation: None,
         })
+    }
+
+    /// Calls `entered` whenever the store hands this query to the executor, past the
+    /// store's own last cancellation check: a cancellation after that is the executor's to
+    /// observe. For tests that cancel a query in the executor's work (a cancellation
+    /// timed by a sleep can land before it, in the store); unset, it costs one branch per
+    /// run.
+    #[doc(hidden)]
+    pub fn on_evaluation(&mut self, entered: impl Fn() + Send + Sync + 'static) {
+        self.on_evaluation = Some(OnEvaluation(std::sync::Arc::new(entered)));
     }
 
     /// Whether the query itself makes or matches RDF 1.2 terms: triple term patterns
@@ -472,6 +495,9 @@ fn serialize(
     cancellation: &CancellationToken,
     out: impl Write,
 ) -> StoreResult<()> {
+    if let Some(OnEvaluation(entered)) = &prepared.on_evaluation {
+        entered();
+    }
     let mut out = out;
     let version = prepared.rdf12.then_some("1.2");
     let format = match prepared.solutions_format {

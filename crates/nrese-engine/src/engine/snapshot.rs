@@ -10,6 +10,10 @@ use super::{ReadModel, Stack, Version};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
 use crate::term::{Dictionary, TermId};
 
+/// A pattern's heavy groups as the engine keeps them ([`Snapshot::heavy_groups_in`]): values
+/// with their match counts, in id order, charged for as long as any holder keeps them.
+pub type HeavyGroups = Arc<nrese_exec::ChargedVec<(TermId, u64)>>;
+
 mod cursor;
 pub use cursor::{ProbeCursor, Seek};
 
@@ -288,6 +292,35 @@ pub struct SnapshotIdentity {
     pub equality: Option<TermId>,
     /// Whether reads give equality classes canonically.
     pub canonical: bool,
+}
+
+/// How many quads a count found ([`Snapshot::count_in`]): all of them, or, where equality
+/// expansion stands for more than a `u64` holds, at least this many. Planning and existence
+/// take [`Self::at_least`]; an answer that must be exact takes [`Self::exact`] and says so
+/// where there is none (PR #70 fix check 2 F3: a capped count was published as an exact
+/// SPARQL `COUNT`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum Count {
+    Exact(u64),
+    AtLeast(u64),
+}
+
+impl Count {
+    /// The count, where it is exact.
+    pub fn exact(self) -> Option<u64> {
+        match self {
+            Count::Exact(n) => Some(n),
+            Count::AtLeast(_) => None,
+        }
+    }
+
+    /// A lower bound: the count where it is exact.
+    pub fn at_least(self) -> u64 {
+        match self {
+            Count::Exact(n) | Count::AtLeast(n) => n,
+        }
+    }
 }
 
 /// The inferred statements a restricted snapshot keeps ([`Snapshot::with_inferred_subset`]).
@@ -781,20 +814,27 @@ impl Snapshot {
             .expect("every layout keeps the permutation of a pattern's access plan")
     }
 
-    /// The number of quads matching `pattern` in `model`, expanded: the stored matches over
-    /// representatives weighted by how many quads each stands for.
+    /// The number of quads matching `pattern` in `model`, expanded, counted up to `limit`:
+    /// the stored matches over representatives weighted by how many quads each stands for,
+    /// without making the copies. With `limit` 1, whether a read finds one (PR #70 r1 S1).
+    /// [`Count::AtLeast`] where it stopped at `limit`, or where the copies pass what a `u64`
+    /// holds (its maximum then; PR #70 fix check 2 F3).
     fn expanded_count(
         &self,
         classes: &EqualityClasses,
         model: ReadModel,
         pattern: &QuadPattern,
-    ) -> u64 {
+        limit: u64,
+    ) -> Count {
         let data = self.data(model);
         let normalised = classes.normalised(pattern);
         let visibility = CopyVisibility::new(data, model);
-        let mut count = 0;
+        let mut count: u64 = 0;
         for stack in Stack::ALL {
             for quad in data.stack(stack).scan(&normalised) {
+                if count >= limit {
+                    return Count::AtLeast(count);
+                }
                 if !quad.graph.is_default_graph() {
                     count += u64::from(
                         model == ReadModel::Materialised
@@ -806,19 +846,28 @@ impl Snapshot {
                     continue;
                 }
                 let touching = classes.touches(&quad);
-                count += match visibility.shows_all(touching) {
+                let copies = match visibility.shows_all(touching) {
                     true => classes.multiplicity(&quad, pattern),
                     false => {
-                        let mut copies = 0;
+                        let (mut copies, wanted) = (0, limit - count);
                         classes.expand(&quad, pattern, &mut |copy| {
                             copies += u64::from(visibility.shows(&copy, touching));
+                            match copies >= wanted {
+                                true => std::ops::ControlFlow::Break(()),
+                                false => std::ops::ControlFlow::Continue(()),
+                            }
                         });
-                        copies
+                        Some(copies)
                     }
                 };
+                match copies.and_then(|copies| count.checked_add(copies)) {
+                    Some(sum) => count = sum,
+                    None => return Count::AtLeast(u64::MAX),
+                }
             }
         }
-        if model == ReadModel::Materialised
+        if count < limit
+            && model == ReadModel::Materialised
             && pattern.graph == GraphSelector::Any
             && normalised != *pattern
             && !self.canonical
@@ -828,9 +877,13 @@ impl Snapshot {
                 .asserted
                 .scan(pattern)
                 .filter(|quad| !quad.graph.is_default_graph())
+                .take(usize::try_from(limit - count).unwrap_or(usize::MAX))
                 .count() as u64;
         }
-        count
+        match count >= limit {
+            true => Count::AtLeast(count),
+            false => Count::Exact(count),
+        }
     }
 
     /// An estimate of [`count_in`](Self::count_in) for planning, O(r log n): with
@@ -840,18 +893,20 @@ impl Snapshot {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
         let Some(classes) = self.expanding(model, pattern) else {
-            return self.count_in(model, pattern);
+            return self.count_in(model, pattern).at_least();
         };
         let stored = Snapshot {
             version: Arc::clone(self.data(model)),
             ..self.stored()
         };
         let normalised = classes.normalised(pattern);
-        let mut estimate = stored.count_in(ReadModel::Materialised, &normalised);
+        let mut estimate = stored
+            .count_in(ReadModel::Materialised, &normalised)
+            .at_least();
         // Named graphs are read with the pattern's own constants (a canonical snapshot's,
         // over representatives, with the normalised ones).
         if normalised != *pattern && pattern.graph == GraphSelector::Any && !self.canonical {
-            estimate += stored.count_in(ReadModel::Asserted, pattern);
+            estimate += stored.count_in(ReadModel::Asserted, pattern).at_least();
         }
         estimate
     }
@@ -914,12 +969,18 @@ impl Snapshot {
         }
     }
 
-    /// Number of asserted and inferred quads. O(1).
+    /// Number of asserted and inferred quads the stacks hold ([`Self::len_in`]). O(1).
     pub fn len(&self) -> u64 {
         self.len_in(ReadModel::Materialised)
     }
 
-    /// Number of quads visible in `model`. O(1); exact because the stacks are disjoint.
+    /// Number of quads `model`'s stacks hold. O(1); exact because the stacks are disjoint.
+    /// It is the number visible in `model` where reads take the stacks as they are. Under
+    /// equality ([`crate::Engine::set_equality`]) they don't: reads skip the default graph's
+    /// statements that name an alias (the inferred `alias sameAs representative` among
+    /// them) and expand what representatives hold to every identity, so the visible number
+    /// may be lower or higher; over [`Self::with_canonical_equality`], which expands
+    /// nothing, it is at most this one. [`Self::count_in`] counts what reads see.
     pub fn len_in(&self, model: ReadModel) -> u64 {
         Stack::ALL
             .into_iter()
@@ -928,8 +989,13 @@ impl Snapshot {
             .sum()
     }
 
+    /// Whether reads see no quad. O(1) where reads take the stacks as they are; under
+    /// equality, which can hide every quad the stacks hold, whether a read finds a first one
+    /// ([`Self::exists_in`]: a scan up to it, making no copies) (PR #70 r1 F1, S1).
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+            || (self.equality.is_some()
+                && !self.exists_in(ReadModel::Materialised, &QuadPattern::all()))
     }
 
     pub fn contains(&self, quad: &EncodedQuad) -> bool {
@@ -1017,22 +1083,25 @@ impl Snapshot {
         )
     }
 
-    /// Exact number of quads matching `pattern`, asserted and inferred.
-    pub fn count(&self, pattern: &QuadPattern) -> u64 {
+    /// Number of quads matching `pattern`, asserted and inferred ([`Self::count_in`]).
+    pub fn count(&self, pattern: &QuadPattern) -> Count {
         self.count_in(ReadModel::Materialised, pattern)
     }
 
-    /// Exact number of quads matching `pattern` in `model`, without producing them: O(r log n)
+    /// Number of quads matching `pattern` in `model`, without producing them: O(r log n)
     /// per stack when the matching runs hold no tombstones in range (see
-    /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up.
-    pub fn count_in(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
+    /// `IndexVersion::count_plan`). The stacks are disjoint, so their counts add up. Exact,
+    /// except under equality where the copies pass what a `u64` holds: [`Count::AtLeast`].
+    pub fn count_in(&self, model: ReadModel, pattern: &QuadPattern) -> Count {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
-            return self.expanded_count(&classes, model, pattern);
+            return self.expanded_count(&classes, model, pattern, u64::MAX);
         }
         if pattern.graph == GraphSelector::AnyNamed {
-            // Every graph minus the default graph: two range counts instead of a scan.
+            // Every graph minus the default graph: two range counts instead of a scan, both
+            // as held. Named graphs are read as held, never expanded, so neither count is an
+            // expanded one, which can read as `u64::MAX` (PR #70 F2 round, sol-loop r1 S1).
             let every = QuadPattern {
                 graph: GraphSelector::Any,
                 ..*pattern
@@ -1041,8 +1110,13 @@ impl Snapshot {
                 graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
                 ..*pattern
             };
-            return self.count_in(model, &every) - self.count_in(model, &default);
+            return Count::Exact(self.held_count(model, &every) - self.held_count(model, &default));
         }
+        Count::Exact(self.held_count(model, pattern))
+    }
+
+    /// The quads `model`'s stacks hold that match `pattern`: range counts, no expansion.
+    fn held_count(&self, model: ReadModel, pattern: &QuadPattern) -> u64 {
         let plan = AccessPlan::for_pattern(pattern);
         Stack::ALL
             .into_iter()
@@ -1057,10 +1131,10 @@ impl Snapshot {
         let pattern = self.read_pattern(model, pattern);
         let pattern = &*pattern;
         if let Some(classes) = self.expanding(model, pattern) {
-            return self.expanded(classes, model, pattern).next().is_some();
+            return self.expanded_count(&classes, model, pattern, 1).at_least() > 0;
         }
         if pattern.graph == GraphSelector::AnyNamed {
-            return self.count_in(model, pattern) > 0;
+            return self.count_in(model, pattern).at_least() > 0;
         }
         let plan = AccessPlan::for_pattern(pattern);
         Stack::ALL
@@ -1225,29 +1299,7 @@ impl Snapshot {
         permutation: Permutation,
     ) -> Option<Vec<(TermId, u64)>> {
         let pattern = self.read_pattern(model, pattern);
-        let pattern = &*pattern;
-        if self.expanding(model, pattern).is_some() {
-            return None;
-        }
-        let plan = AccessPlan::in_permutation(pattern, permutation)?;
-        if plan.exclude_default_graph {
-            return None;
-        }
-        let bound = plan
-            .low
-            .iter()
-            .zip(&plan.high)
-            .take_while(|(l, h)| l == h)
-            .count();
-        if bound >= 4 {
-            return None;
-        }
-        let supported = Stack::ALL.into_iter().all(|stack| {
-            !model.includes(stack) || self.data(model).stack(stack).layout().supports(permutation)
-        });
-        if !supported {
-            return None;
-        }
+        let (plan, bound) = self.group_plan(model, &pattern, permutation)?;
         let mut counts = Vec::new();
         let mut sources = 0;
         for stack in Stack::ALL {
@@ -1279,12 +1331,125 @@ impl Snapshot {
         )
     }
 
+    /// The plan the group walks of `pattern` (as read) take in `permutation`, and its bound
+    /// prefix's length: `None` where a walk can't answer it (equality classes expanded, a
+    /// bound graph after the prefix, a range excluding the default graph, an included
+    /// stack without the permutation).
+    fn group_plan(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+    ) -> Option<(AccessPlan, usize)> {
+        if self.expanding(model, pattern).is_some() {
+            return None;
+        }
+        let plan = AccessPlan::in_permutation(pattern, permutation)?;
+        if plan.exclude_default_graph {
+            return None;
+        }
+        let bound = plan
+            .low
+            .iter()
+            .zip(&plan.high)
+            .take_while(|(l, h)| l == h)
+            .count();
+        if bound >= 4 {
+            return None;
+        }
+        let supported = Stack::ALL.into_iter().all(|stack| {
+            !model.includes(stack) || self.data(model).stack(stack).layout().supports(permutation)
+        });
+        supported.then_some((plan, bound))
+    }
+
+    /// The groups of [`Self::group_counts_in`] that more than `min` quads match, in id
+    /// order: exact, and kept for this version once walked, so that a planner asking for
+    /// them per query walks the index once (a counted forest's message budgets,
+    /// `nrese-sparql`'s `wcoj`). Charged to the engine's statistics budget
+    /// ([`crate::Engine::charge_statistics_to`]) for as long as any holder keeps them.
+    /// `None` where `group_counts_in` can't walk them, or the budget can't take them.
+    pub fn heavy_groups_in(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        min: u64,
+    ) -> Option<HeavyGroups> {
+        let read = *self.read_pattern(model, pattern);
+        // Which reads the walk answers is decided before the list kept: a stored read of
+        // this version keeps one under the same key.
+        let (plan, bound) = self.group_plan(model, &read, permutation)?;
+        self.statistics
+            .heavy_groups(self.data(model), model, read, permutation, min, |budget| {
+                self.heavy_groups_walked(model, &plan, bound, min, budget)
+            })
+    }
+
+    /// The groups past `min` of `plan` grouped at `bound`, charged to `budget` as they are
+    /// found: the candidates of each run past `min / r` for `r` runs in all (a value past
+    /// `min` in all of them is one), each counted again in all of them unless one run
+    /// holds the range. No light group is held.
+    fn heavy_groups_walked(
+        &self,
+        model: ReadModel,
+        plan: &AccessPlan,
+        bound: usize,
+        min: u64,
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<nrese_exec::ChargedVec<(TermId, u64)>, nrese_exec::BudgetExceeded> {
+        let stacks = || {
+            Stack::ALL
+                .into_iter()
+                .filter(move |&stack| model.includes(stack))
+        };
+        let runs: usize = stacks()
+            .map(|stack| self.data(model).stack(stack).runs().len())
+            .sum();
+        let above = (min / runs.max(1) as u64) as i64;
+        let mut candidates = nrese_exec::ChargedVec::new(Arc::clone(budget));
+        for stack in stacks() {
+            self.data(model)
+                .stack(stack)
+                .group_candidates(plan, bound, above, &mut candidates)?;
+        }
+        let mut heavy = nrese_exec::ChargedVec::new(Arc::clone(budget));
+        if runs <= 1 {
+            // One run: its counts are the values' own.
+            for &(value, count) in candidates.iter() {
+                if count > min as i64 {
+                    heavy.push((TermId::from_raw(value), count as u64))?;
+                }
+            }
+            return Ok(heavy);
+        }
+        candidates.sort_unstable_by_key(|&(value, _)| value);
+        let mut last = None;
+        for &(value, _) in candidates.iter() {
+            // Each value once, though several runs may hold it past `above`.
+            if last.replace(value) == Some(value) {
+                continue;
+            }
+            let mut exact = *plan;
+            exact.low[bound] = value;
+            exact.high[bound] = value;
+            let count: u64 = stacks()
+                .map(|stack| self.data(model).stack(stack).count_plan(&exact))
+                .sum();
+            if count > min {
+                heavy.push((TermId::from_raw(value), count))?;
+            }
+        }
+        Ok(heavy)
+    }
+
     /// The values of `components` (subject 0, predicate 1, object 2, graph 3) of the quads
     /// matching `pattern` in `model`, as columns in `permutation`'s order: what
     /// [`scan_sorted_in`](Self::scan_sorted_in) yields, decoded a block and a column at a
     /// time instead of a quad at a time. `None` where that can't answer: the matches lie
-    /// in both stacks, or in several runs or a run with deletions, which must be merged
-    /// quad by quad; or the plan needs a post-filter.
+    /// in several runs or a run with deletions, which must be merged quad by quad, or in
+    /// both stacks with columns that can't order them ([`Self::columns_of_stacks`]); or
+    /// the plan needs a post-filter.
     pub fn scan_columns_in(
         &self,
         model: ReadModel,
@@ -1313,7 +1478,9 @@ impl Snapshot {
     /// decoded a block and a column at a time, and merged in `permutation`'s order where
     /// both stacks have matches (they hold no quad twice): asserted and inferred
     /// statements of one pattern, as reasoning gives them. `None` where a stack can't be
-    /// decoded so (several runs, deletions).
+    /// decoded so (several runs, deletions), or where both have matches and the columns
+    /// can't order them: rows compare on the columns alone, so every column the plan lets
+    /// vary must be among them up to the last of them in `permutation`'s order.
     fn columns_of_stacks(
         &self,
         model: ReadModel,
@@ -1321,15 +1488,24 @@ impl Snapshot {
         permutation: Permutation,
         components: &[usize],
     ) -> Option<Vec<Vec<u64>>> {
+        let matching = Stack::ALL
+            .map(|stack| model.includes(stack) && self.data(model).stack(stack).any_plan(plan));
+        let order = permutation.order();
+        let projected = |position: usize| components.contains(&order[position]);
+        let last = (0..4).rev().find(|&position| projected(position));
+        let ordered = last.is_none_or(|last| {
+            (0..last)
+                .all(|position| plan.low[position] == plan.high[position] || projected(position))
+        });
+        if matching.iter().all(|&matches| matches) && !ordered {
+            return None;
+        }
         let mut parts: Vec<Vec<Vec<u64>>> = Vec::new();
-        for stack in Stack::ALL {
-            if !model.includes(stack) {
+        for (stack, matches) in Stack::ALL.into_iter().zip(matching) {
+            if !matches {
                 continue;
             }
             let index = self.data(model).stack(stack);
-            if !index.any_plan(plan) {
-                continue;
-            }
             let mut out = vec![Vec::new(); components.len()];
             if !index.scan_columns(plan, components, &mut out) {
                 return None;
