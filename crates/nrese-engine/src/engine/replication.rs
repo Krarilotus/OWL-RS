@@ -185,6 +185,8 @@ impl Engine {
 
     /// One record as a commit (the writer slot held).
     fn apply_record(&self, record: &CommitRecord) -> EngineResult<()> {
+        // Before anything is applied: a time the store couldn't keep is refused.
+        crate::durability::check_commit_time(record)?;
         let shared = &self.inner.shared;
         let dictionary_len = shared.dictionary.len();
         if record.dictionary_start > dictionary_len {

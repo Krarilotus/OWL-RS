@@ -300,6 +300,7 @@ impl Durable {
             }
             dictionary.set_integers_in_dictionary(integers_in_dictionary.unwrap_or(false));
             for (index, record) in contents.records.iter().enumerate() {
+                check_commit_time(record)?;
                 store_clock = store_clock.max(record.committed_micros.unwrap_or(0));
                 if record.revision <= version.revision {
                     continue; // covered by the checkpoint
@@ -447,6 +448,23 @@ fn replay(
     // logged without a time (a version 4 or 5 segment) makes it unknown.
     version.committed_micros = later(version.committed_micros, record.committed_micros);
     Ok(())
+}
+
+/// The latest commit time a store keeps, microseconds since 1970: a checkpoint holds it in 63
+/// bits, the 64th marking a version of unknown time. A wall clock reaches it in the year
+/// 292,277; only a replicated record or a damaged log can say otherwise.
+pub(crate) const MAX_COMMIT_TIME: u64 = (1 << 63) - 1;
+
+/// Refuses a logged record whose commit time is past [`MAX_COMMIT_TIME`] (sol-loop, review
+/// fix S2): its time couldn't be kept, and kept short it would read as earlier than it was.
+pub(crate) fn check_commit_time(record: &CommitRecord) -> EngineResult<()> {
+    match record.committed_micros {
+        Some(time) if time > MAX_COMMIT_TIME => Err(EngineError::Corruption(format!(
+            "log record {} has a commit time past what a store keeps ({time})",
+            record.revision
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// The time of a version that adds a commit made at `commit` to one at `previous`: the later
