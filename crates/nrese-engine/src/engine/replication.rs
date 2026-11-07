@@ -601,12 +601,22 @@ mod tests {
         past_u64[1].keys.clear();
         let mut invalid_suffix = encoded(&all[..1]);
         invalid_suffix.extend_from_slice(b"not a record at all");
+        // DUR-2 fix check r3: a valid record, then one whose commit time no store keeps
+        // (`durability::MAX_COMMIT_TIME`).
+        let mut past_time = decoded(&batch.frames);
+        past_time.truncate(2);
+        past_time[1].committed_micros = Some(1 << 63);
         let later = super::LogExpectation {
             after: 2,
             records: 2,
             last: 4,
         };
-        let rows: [(&str, Vec<u8>, super::LogExpectation); 7] = [
+        let rows: [(&str, Vec<u8>, super::LogExpectation); 8] = [
+            (
+                "a commit time past its range after a valid record",
+                encoded(&past_time),
+                expect(2, 3),
+            ),
             (
                 "a dictionary range ending past u64",
                 encoded(&past_u64),
