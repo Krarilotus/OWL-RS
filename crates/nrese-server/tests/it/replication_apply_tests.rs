@@ -123,7 +123,10 @@ fn replica_of(dir: &Path, primary: Option<String>) -> Result<AppState, Box<dyn s
 }
 
 /// How many records the stop test's batch has: enough that applying them takes far longer
-/// than stopping does.
+/// than stopping does. Measured on 7 Nov (proof job p2b7-69-stop-boundary, khaleesi-wsl,
+/// debug build): the stop landed within the batch in 3 of 3 runs at every size from 25 to
+/// 3000 records, so the boundary there is 25 or fewer; 3000 keeps a wide margin for hosts
+/// that apply records faster.
 const MANY: u64 = 3000;
 
 /// A follower stopped while it applies a batch: once `stop` returns, nothing more is
