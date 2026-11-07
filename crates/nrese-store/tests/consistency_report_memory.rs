@@ -33,10 +33,14 @@ fn pipeline() -> MutationPipeline {
 }
 
 fn pipeline_within(pool: usize) -> MutationPipeline {
+    pipeline_of(pool, RULES)
+}
+
+fn pipeline_of(pool: usize, rules: &str) -> MutationPipeline {
     let mut config = StoreConfig::in_memory();
     config.total_query_memory_bytes = pool;
     let store = StoreService::new(config).expect("store");
-    let rules = Arc::new(UserRules::n3("check.n3", RULES).expect("the rules compile"));
+    let rules = Arc::new(UserRules::n3("check.n3", rules).expect("the rules compile"));
     let reasoner = ReasonerConfig::for_mode(ReasoningMode::Custom)
         .with_rules(Some(rules))
         .expect("a mode for the rules");
@@ -99,4 +103,18 @@ fn a_commit_is_rejected_when_not_one_violation_can_be_listed() {
     };
     assert!(reject.detail.contains("at least 1"), "{}", reject.detail);
     assert!(reject.explanation.is_none());
+}
+
+/// The same pool and a rule whose atoms both have facts that never join (sol-loop r1
+/// S1): nothing fires, so nothing is charged and the consistent commit is accepted; a
+/// budget without room for a list that stays empty is no inconsistency.
+#[test]
+fn a_consistent_commit_is_accepted_whatever_room_the_list_has() {
+    let rules = "@prefix : <http://example.com/> .\n{ ?s :p ?x . ?s :q ?y } => false .\n";
+    let pipeline = pipeline_of(64, rules);
+    let command = MutationCommand::Update(SparqlUpdateRequest::new(format!(
+        "INSERT DATA {{ <{EX}a> <{EX}p> <{EX}x> . <{EX}b> <{EX}q> <{EX}y> . }}"
+    )));
+    let result = pipeline.apply(command, &Requester::all(), &MutationTicket::new());
+    assert!(result.is_ok(), "a consistent commit: {result:?}");
 }
