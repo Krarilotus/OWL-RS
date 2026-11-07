@@ -525,22 +525,51 @@ impl<'e> Transaction<'e> {
                 base.version().committed_micros,
             )),
         };
-        // Unknown stays unknown: this commit's time bounds nothing committed before it.
-        let committed_micros =
-            crate::durability::later(base.version().committed_micros, record.committed_micros);
+        engine.publish_record(&record, dictionary_len, changes_equality)?;
+        Ok(summary)
+    }
+}
+
+impl Inner {
+    /// Publishes `record` as the next revision, its terms already in the dictionary
+    /// (`dictionary_len` of them): logged first in durable mode, then post-commit
+    /// maintenance. The caller holds the writer slot: a commit, or a replicated record.
+    pub(super) fn publish_record(
+        &self,
+        record: &CommitRecord,
+        dictionary_len: u64,
+        changes_equality: bool,
+    ) -> EngineResult<()> {
+        let shared = &self.shared;
         // The first quad in a named graph turns a default-graph asserted stack into a quad
-        // stack. No compaction or checkpoint may replace its runs meanwhile: the writer slot
-        // excludes other commits, the compaction slot both of those.
+        // stack. No merge or mapped checkpoint may replace its runs between the conversion
+        // and the publication: the writer slot excludes other commits, the compaction slot
+        // both of those. It is converted first, in parallel without the slot, and kept where
+        // the stack's runs are still the ones converted. The record's runs are built before
+        // that, in the layout the stack will have (no holder of the compaction slot runs
+        // parallel work; only commits, under the writer slot, change the layout).
         let latest = shared.versions.load();
         let converting = latest.asserted.layout() == Layout::DefaultGraph && record.names_a_graph();
-        let _compaction = converting.then(|| shared.versions.compaction_slot.lock());
-        let converted = converting.then(|| shared.versions.load().asserted.with_quads_layout());
-        let asserted_layout = converted
-            .as_ref()
-            .map_or(latest.asserted.layout(), |index| index.layout());
+        let asserted_layout = match converting {
+            true => Layout::Quads,
+            false => latest.asserted.layout(),
+        };
         drop(latest);
         let [asserted_run, inferred_run] = record.runs(asserted_layout);
+        let (_compaction, converted) = match converting {
+            true => {
+                let (slot, converted) = shared.versions.converted_asserted();
+                (Some(slot), Some(converted))
+            }
+            false => (None, None),
+        };
+        debug_assert!(
+            converted
+                .as_ref()
+                .is_none_or(|index| index.layout() == asserted_layout)
+        );
         let revision = record.revision;
+        let committed = record.committed_micros;
         let publish = move |current: &Version| {
             debug_assert_eq!(current.revision + 1, revision, "single writer");
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
@@ -549,7 +578,9 @@ impl<'e> Transaction<'e> {
                 asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,
-                committed_micros,
+                // The latest of its commits: unknown stays unknown, and a replicated record
+                // (a primary's log may step back) bounds what came before too.
+                committed_micros: crate::durability::later(current.committed_micros, committed),
                 dictionary_len,
                 equality: match changes_equality {
                     true => Default::default(),
@@ -561,7 +592,7 @@ impl<'e> Transaction<'e> {
         let wal_bytes = match &shared.durable {
             Some(durable) => {
                 let mut wal = durable.wal.lock();
-                wal.append(&record)?;
+                wal.append(record)?;
                 shared.versions.publish(publish);
                 wal.bytes_since_checkpoint()
             }
@@ -572,7 +603,7 @@ impl<'e> Transaction<'e> {
         };
         // After the commit's own compaction slot (a conversion's): compacting takes it.
         drop(_compaction);
-        engine.after_commit(wal_bytes);
-        Ok(summary)
+        self.after_commit(wal_bytes);
+        Ok(())
     }
 }
