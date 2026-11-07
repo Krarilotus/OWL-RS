@@ -442,31 +442,40 @@ mod tests {
 
     /// Under every budget from none to what it held at its peak, a scan of several parts
     /// either answers as unlimited or is refused (some parts refused while others finished),
-    /// and holds nothing afterwards either way (review fix check, S2).
+    /// and holds nothing afterwards either way (review fix check, S2). On one worker, so
+    /// that the peak of the unlimited run is the peak of every run; the peak itself is one
+    /// of the limits, so one run answers.
     #[test]
     fn scans_refused_partway_release_everything() {
         let vectors = random_vectors(3 * CHUNK + 5, 4, 13);
         let query = vectors.get(3).to_vec();
-        let unlimited = Budget::unlimited();
-        let truth = exact(&vectors, &query, CHUNK, Metric::L2, &|_| true, &unlimited)
-            .unwrap()
-            .to_vec();
-        let peak = unlimited.peak();
-        let (mut answered, mut refused) = (0, 0);
-        for limit in (0..=peak).step_by((peak / 64).max(1)) {
-            let budget = Budget::new(limit);
-            match exact(&vectors, &query, CHUNK, Metric::L2, &|_| true, &budget) {
-                Ok(found) => {
-                    assert_eq!(*found, truth, "limit {limit}");
-                    answered += 1;
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        one.install(|| {
+            let unlimited = Budget::unlimited();
+            let truth = exact(&vectors, &query, CHUNK, Metric::L2, &|_| true, &unlimited)
+                .unwrap()
+                .to_vec();
+            let peak = unlimited.peak();
+            let (mut answered, mut refused) = (0, 0);
+            let limits = (0..peak).step_by((peak / 64).max(1)).chain([peak]);
+            for limit in limits {
+                let budget = Budget::new(limit);
+                match exact(&vectors, &query, CHUNK, Metric::L2, &|_| true, &budget) {
+                    Ok(found) => {
+                        assert_eq!(*found, truth, "limit {limit}");
+                        answered += 1;
+                    }
+                    Err(_) => refused += 1,
                 }
-                Err(_) => refused += 1,
+                assert_eq!(budget.used(), 0, "limit {limit}: released");
             }
-            assert_eq!(budget.used(), 0, "limit {limit}: released");
-        }
-        assert!(
-            answered > 0 && refused > 0,
-            "{answered} answered, {refused} refused"
-        );
+            assert!(
+                answered > 0 && refused > 0,
+                "{answered} answered, {refused} refused"
+            );
+        });
     }
 }

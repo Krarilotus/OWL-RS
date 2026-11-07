@@ -615,7 +615,9 @@ mod tests {
             .to_vec();
         let peak = unlimited.peak();
         let (mut answered, mut refused) = (0, 0);
-        for limit in (0..=peak).step_by((peak / 64).max(1)) {
+        // The peak itself is one of the limits: the search is on this thread alone, so its
+        // peak is the same every run, and that run answers.
+        for limit in (0..peak).step_by((peak / 64).max(1)).chain([peak]) {
             let budget = Budget::new(limit);
             match graph.search(&vectors, &query, 50, 200, &|_| true, &budget) {
                 Ok(found) => {
