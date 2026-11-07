@@ -81,9 +81,10 @@ fn embedded_low_memory_stops_maintenance_of_an_existing_upper_bound() {
     .unwrap();
     *store.dl().bounds.state.lock().unwrap() = Some(State {
         revision: tx.base().revision(),
-        upper: Ok(upper),
+        upper: Ok(Arc::new(upper)),
         last: "read",
-        taxonomy: std::sync::OnceLock::new(),
+        compiled: store.dl().bounds.compiled(),
+        taxonomy: None,
         rules: false,
     });
     let quad = nrese_rdf::Quad::new(

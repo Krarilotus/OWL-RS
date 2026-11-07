@@ -29,7 +29,6 @@
 //! facts as stored, and a class that may split is never maintained.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use nrese_dl::bounds;
@@ -238,13 +237,79 @@ impl Values {
         [s, p, self.of(o)]
     }
 
-    /// Every term `rep` stands for: the literals with its value, or `rep` alone.
+    /// Keeps what a commit's change noted ([`Noting`]), its commit done.
+    fn absorb(&mut self, noted: Values) {
+        self.rep.extend(noted.rep);
+        for (rep, new) in noted.members {
+            self.members
+                .entry(rep)
+                .or_insert_with(|| vec![rep])
+                .extend(new);
+        }
+        self.by_value.extend(noted.by_value);
+        self.seen.extend(noted.seen);
+    }
+}
+
+/// U1's literals by value as a commit's change reads them: U1's own ([`Values`]), unchanged,
+/// and those the change meets first, `added`, which U1 keeps only when the commit happens
+/// ([`Upper::apply`]). `added.members` holds only the literals the change adds to a value.
+struct Noting<'a> {
+    base: &'a Values,
+    added: Values,
+}
+
+impl Noting<'_> {
+    fn add(&mut self, view: &Snapshot, id: u64) {
+        if !is_literal(id) || self.base.seen.contains(&id) || !self.added.seen.insert(id) {
+            return;
+        }
+        let Some(value) = value_of(view, id) else {
+            return;
+        };
+        let known = self.base.by_value.get(&value);
+        match known.or_else(|| self.added.by_value.get(&value)).copied() {
+            None => {
+                self.added.by_value.insert(value, id);
+            }
+            Some(rep) => {
+                self.added.rep.insert(id, rep);
+                self.added.members.entry(rep).or_default().push(id);
+            }
+        }
+    }
+
+    fn add_objects<'t>(
+        &mut self,
+        view: &Snapshot,
+        facts: impl IntoIterator<Item = &'t Triple>,
+        compared: &HashSet<u64>,
+    ) {
+        for t in facts {
+            if compared.contains(&t[1]) {
+                self.add(view, t[2]);
+            }
+        }
+    }
+
+    fn of(&self, id: u64) -> u64 {
+        let rep = self.added.rep.get(&id).or_else(|| self.base.rep.get(&id));
+        rep.copied().unwrap_or(id)
+    }
+
+    fn map(&self, [s, p, o]: Triple) -> Triple {
+        [s, p, self.of(o)]
+    }
+
+    /// Every term `rep` stands for: the literals with its value (`rep` first), or `rep`
+    /// alone, and those of its value the change met.
     fn members(&self, rep: u64) -> impl Iterator<Item = u64> + '_ {
-        let all = self.members.get(&rep);
-        all.into_iter()
+        let base = self.base.members.get(&rep);
+        base.into_iter()
             .flatten()
             .copied()
-            .chain(all.is_none().then_some(rep))
+            .chain(base.is_none().then_some(rep))
+            .chain(self.added.members.get(&rep).into_iter().flatten().copied())
     }
 }
 
@@ -265,7 +330,7 @@ struct UpperBase<'a> {
     view: &'a Snapshot,
     facts: &'a HashSet<Triple>,
     stack: &'a Stack,
-    values: &'a Values,
+    values: &'a Noting<'a>,
 }
 
 impl UpperBase<'_> {
@@ -373,6 +438,8 @@ pub struct Change {
     insert: Vec<Triple>,
     remove: Vec<Triple>,
     program: Option<GroundProgram>,
+    /// The literals the change read by value first ([`Noting`]).
+    noted: Values,
     pub elapsed: Duration,
     /// The change derives an equality between two terms: U1 then has classes, which it
     /// keeps by representatives, so it is evaluated afresh instead.
@@ -421,9 +488,9 @@ pub struct Upper {
     /// predicates [`bounds::Program::compared_predicates`] names. Other literals are never
     /// compared, so they needn't be read by value (LUBM's names, e-mail addresses and
     /// telephone numbers: 107,410 literals at LUBM(10)). A commit's new literals are noted
-    /// when its change is computed: a representative stays one whether the commit happens
-    /// or not.
-    values: Mutex<Values>,
+    /// as its change is computed and kept with the change ([`Self::apply`]): U1 is read,
+    /// never changed, while the change is computed.
+    values: Values,
     /// The `owl:sameAs` classes, by representative: the stack is over them.
     classes: nrese_reasoner::representatives::EqualityClasses,
     rdf_type: u64,
@@ -583,7 +650,7 @@ impl Upper {
             object_properties,
             data_properties,
             ground: None,
-            values: Mutex::new(values),
+            values,
             classes: m.classes,
             elapsed: started.elapsed(),
         })
@@ -614,7 +681,8 @@ impl Upper {
     /// ([`Self::apply`]), so a commit that doesn't happen leaves U1 as it was: `view` is
     /// the materialised view after the commit, `inserted` the facts new to the view,
     /// `deleted` those gone from it (each checked here against the view and the
-    /// program's facts). Cost: the change's.
+    /// program's facts). U1 is only read, so it is shared while this runs. Cost: the
+    /// change's.
     pub fn change(
         &self,
         view: &Snapshot,
@@ -624,7 +692,10 @@ impl Upper {
     ) -> Result<Change, GaveUp> {
         check_stop(stop)?;
         let started = Instant::now();
-        let mut values = self.values.lock().unwrap_or_else(|p| p.into_inner());
+        let mut values = Noting {
+            base: &self.values,
+            added: Values::default(),
+        };
         values.add_objects(view, inserted, self.program.compared_predicates());
         let mut inserted: Vec<Triple> = inserted
             .iter()
@@ -660,6 +731,7 @@ impl Upper {
             ..Change::default()
         };
         if inserted.is_empty() && deleted.is_empty() {
+            change.noted = values.added;
             return Ok(change);
         }
         let rules = delta::Rules {
@@ -688,11 +760,13 @@ impl Upper {
             .into_iter()
             .filter(|t| !base.is_asserted(*t))
             .collect();
+        change.noted = values.added;
         change.elapsed = started.elapsed();
         Ok(change)
     }
 
-    /// Applies a commit's change ([`Self::change`]) once the commit is done.
+    /// Applies a commit's change ([`Self::change`]) once the commit is done, the literals
+    /// it read by value first among them.
     pub fn apply(&mut self, change: Change) {
         for t in change.moved.into_iter().chain(change.remove) {
             self.stack.remove(t);
@@ -703,6 +777,7 @@ impl Upper {
         if let Some(program) = change.program {
             self.ground = Some(program);
         }
+        self.values.absorb(change.noted);
         self.elapsed = change.elapsed;
     }
 
@@ -754,11 +829,7 @@ impl Upper {
 
     /// How many literals U1 reads by value ([`Values`]).
     pub fn literals_by_value(&self) -> usize {
-        self.values
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .seen
-            .len()
+        self.values.seen.len()
     }
 
     /// Whether `term` is one of U1's own (a Skolem constant, a fresh class, the clash).
