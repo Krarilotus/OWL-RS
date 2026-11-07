@@ -656,14 +656,15 @@ pub fn closure_within(
 /// only through the fact itself (`C ⊑ D`, `D ⊑ C`, `a : C` gives `a : D`, which gives
 /// `a : C` back). [`independently_derived`] decides.
 ///
-/// The search polls `stop` ([`Poller`]): stopped, it answers false, decided by nothing, and
-/// the caller asks its (latched) stop again before it uses the answer.
+/// The search ticks `poll` ([`Poller`], one per parallel task, so that a fact whose search
+/// scans nothing costs no poll): stopped, it answers false, decided by nothing, and the
+/// caller asks its (latched) stop again before it uses the answer.
 pub fn derived_otherwise<S: Source + ?Sized>(
     source: &S,
     program: &GroundProgram,
     axioms: &[Triple],
     fact: Triple,
-    stop: Stop<'_>,
+    poll: &mut Poller<'_>,
 ) -> bool {
     if axioms.binary_search(&fact).is_ok() {
         return true;
@@ -678,13 +679,10 @@ pub fn derived_otherwise<S: Source + ?Sized>(
     if program.bodiless.contains(&fact) && grounded(Grounding::Bodiless(fact)) {
         return true;
     }
-    let derives = |rule: &Rule| {
+    let mut derives = |rule: &Rule| {
         let mut found = false;
         let mut body = Vec::with_capacity(rule.body.len());
-        let Some(mut poll) = Poller::new(stop) else {
-            return false;
-        };
-        derivations(source, rule, fact, Seg::All, &mut poll, &mut |bindings| {
+        derivations(source, rule, fact, Seg::All, poll, &mut |bindings| {
             body.clear();
             body.extend(
                 rule.body
@@ -790,10 +788,19 @@ pub fn rederived<S: Source + Sync + ?Sized>(
     let run = Run::new(limits);
     run.check(size_of_val(candidates))?;
     let fired = || run.fired();
+    // One poller per parallel task, not per candidate: a candidate whose search scans
+    // nothing then costs no poll (a poll reads the process's memory limit).
     let one_step: Vec<Triple> = candidates
         .par_iter()
         .copied()
-        .filter(|&fact| derived_otherwise(source, program, axioms, fact, &fired))
+        .map_init(
+            || Poller::new(&fired),
+            |poll, fact| {
+                let poll = poll.as_mut()?;
+                derived_otherwise(source, program, axioms, fact, poll).then_some(fact)
+            },
+        )
+        .flatten_iter()
         .collect();
     run.check((candidates.len() + 2 * one_step.capacity()) * size_of::<Triple>())?;
     let (mut found, mut undecided) = (Vec::with_capacity(one_step.len()), Vec::new());
@@ -1028,51 +1035,48 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
             previous: change.previous,
         };
         let list: Vec<Triple> = members.iter().copied().collect();
+        // One poller per parallel task, not per derivation search (as `rederived`).
         list.par_iter()
-            .map(|&fact| {
-                let mut from = Annotation::default();
-                let mut take = |found: Annotation| {
-                    from.truncated |= found.truncated;
-                    from.sets.extend(found.sets);
-                };
-                if program.bodiless.contains(&fact) {
-                    take(grounding_sets(
-                        program,
-                        Grounding::Bodiless(fact),
-                        &lookup,
-                        cap,
-                        &empty,
-                    ));
-                }
-                let mut groundings: Vec<Grounding> = program
-                    .producers(fact)
-                    .into_iter()
-                    .map(Grounding::Rule)
-                    .collect();
-                if program.transitive.contains(&fact[1]) {
-                    groundings.push(Grounding::Transitive(fact[1]));
-                }
-                for grounding in groundings {
-                    let Some(&k) = by_grounding.get(&grounding) else {
-                        continue;
+            .map_init(
+                || Poller::new(&fired),
+                |poll, &fact| {
+                    let mut from = Annotation::default();
+                    let mut take = |found: Annotation| {
+                        from.truncated |= found.truncated;
+                        from.sets.extend(found.sets);
                     };
-                    let (rule, schema) = (rules[k].0, &schemas[k]);
-                    if schema.is_empty() {
-                        continue;
+                    if program.bodiless.contains(&fact) {
+                        take(grounding_sets(
+                            program,
+                            Grounding::Bodiless(fact),
+                            &lookup,
+                            cap,
+                            &empty,
+                        ));
                     }
-                    let mut body = Vec::with_capacity(rule.body.len());
-                    // Stopped: what it found is incomplete; the check after the pass ends
-                    // the run before it is read.
-                    let Some(mut poll) = Poller::new(&fired) else {
-                        break;
-                    };
-                    derivations(
-                        change.source,
-                        rule,
-                        fact,
-                        Seg::All,
-                        &mut poll,
-                        &mut |bindings| {
+                    let mut groundings: Vec<Grounding> = program
+                        .producers(fact)
+                        .into_iter()
+                        .map(Grounding::Rule)
+                        .collect();
+                    if program.transitive.contains(&fact[1]) {
+                        groundings.push(Grounding::Transitive(fact[1]));
+                    }
+                    for grounding in groundings {
+                        let Some(&k) = by_grounding.get(&grounding) else {
+                            continue;
+                        };
+                        let (rule, schema) = (rules[k].0, &schemas[k]);
+                        if schema.is_empty() {
+                            continue;
+                        }
+                        let mut body = Vec::with_capacity(rule.body.len());
+                        // Stopped: what it found is incomplete; the check after the pass ends
+                        // the run before it is read.
+                        let Some(poll) = poll.as_mut() else {
+                            break;
+                        };
+                        derivations(change.source, rule, fact, Seg::All, poll, &mut |bindings| {
                             body.clear();
                             body.extend(
                                 rule.body
@@ -1083,11 +1087,11 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                                 take(premise_sets_from(&body, schema, &lookup, cap));
                             }
                             false
-                        },
-                    );
-                }
-                (fact, from)
-            })
+                        });
+                    }
+                    (fact, from)
+                },
+            )
             .collect()
     };
     run.check(
