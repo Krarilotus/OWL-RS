@@ -224,8 +224,11 @@ pub(crate) fn introduced(
         let mut report = validate(&after, &shapes_after, data, resources)?;
         // Shapes that didn't compile before had no results.
         if let Ok(shapes_before) = compile(before, shapes_selection) {
-            let earlier = validate(before, &shapes_before, data, resources)?.results;
-            report.results.retain(|result| !earlier.contains(result));
+            // The whole earlier report, so its charge is held while its results are.
+            let earlier = validate(before, &shapes_before, data, resources)?;
+            report
+                .results
+                .retain(|result| !earlier.results.contains(result));
         }
         return Ok(Some(report));
     }

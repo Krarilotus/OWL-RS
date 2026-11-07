@@ -844,30 +844,16 @@ impl<V: ReadView> Compiler<'_, V> {
                 messages if messages.is_empty() => component.messages.clone(),
                 messages => messages,
             };
-            // Every combination of the parameters' values.
-            let mut combinations: Vec<Vec<(Variable, TermId)>> = vec![Vec::new()];
-            for (variable, found) in &values {
-                combinations = combinations
-                    .into_iter()
-                    .flat_map(|chosen| {
-                        found.iter().map(move |&value| {
-                            let mut chosen = chosen.clone();
-                            chosen.push((variable.clone(), value));
-                            chosen
-                        })
-                    })
-                    .collect();
-            }
-            for parameters in combinations {
-                out.push(Constraint::Sparql(Box::new(SparqlCheck {
-                    source: None,
-                    component: Component::Custom(component.node),
-                    query: query.clone(),
-                    ask,
-                    parameters,
-                    messages: messages.clone(),
-                })));
-            }
+            // One check for every combination of the parameters' values, which validation
+            // runs in turn: the values are kept, not multiplied out.
+            out.push(Constraint::Sparql(Box::new(SparqlCheck {
+                source: None,
+                component: Component::Custom(component.node),
+                query,
+                ask,
+                parameters: values,
+                messages,
+            })));
         }
     }
 }

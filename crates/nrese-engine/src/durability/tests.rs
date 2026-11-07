@@ -526,6 +526,18 @@ fn log_after(dir: &std::path::Path, at: u64) -> Vec<u8> {
     frames
 }
 
+/// Applies `frames`, one record after `replica`'s revision ([`log_after`]), as a replica
+/// does ([`Engine::apply_log`]).
+fn apply_one(replica: &Engine, frames: &[u8]) -> EngineResult<crate::Applied> {
+    let after = replica.stats().revision;
+    let expected = crate::LogExpectation {
+        after,
+        records: 1,
+        last: after + 1,
+    };
+    replica.apply_log(frames, &expected, &nrese_exec::stop::StopSource::none())
+}
+
 /// A replicated commit's time moves the store's clock in memory as on disk (sol-loop, review
 /// fix S1): an in-memory replica applies a primary's commit made at 2000, then replaces its
 /// data under a clock reading 1000. The replacement is stamped no earlier than 2000, so an
@@ -533,7 +545,7 @@ fn log_after(dir: &std::path::Path, at: u64) -> Vec<u8> {
 #[test]
 fn a_replicated_time_moves_the_clock_in_memory_too() {
     let replica = Engine::new(config()).unwrap();
-    replica.apply_log(&primary_log(2000)).unwrap();
+    apply_one(&replica, &primary_log(2000)).unwrap();
     fault::CLOCK.set(Some(1000));
     let load = replica.bulk_load(BulkMode::Replace);
     load.add(&[quad(9)]);
@@ -566,7 +578,7 @@ fn commit_times_past_their_range_are_refused() {
         let mut wrong = Vec::new();
         {
             let replica = Engine::open(dir.path(), config()).unwrap();
-            let result = replica.apply_log(&primary_log(at));
+            let result = apply_one(&replica, &primary_log(at));
             if result.is_ok() != applied {
                 wrong.push(format!("applied: {result:?}"));
             }
@@ -809,7 +821,7 @@ fn a_time_a_legacy_log_lost_is_never_certified() {
     let frames = log_after(copied(dir.path()).path(), 2000);
     {
         let replica = Engine::open(dir.path(), config()).unwrap();
-        replica.apply_log(&frames).unwrap();
+        apply_one(&replica, &frames).unwrap();
     }
     {
         let replica = Engine::open(dir.path(), config()).unwrap();
