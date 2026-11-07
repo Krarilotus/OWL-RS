@@ -224,6 +224,34 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// A positive decimal too small for f64 (it parses as 0.0) is still positive: an error,
+    /// not 0, which a budget reads as none (review p2-b7-a r1 R1). Every row is checked.
+    #[test]
+    fn positive_values_too_small_for_a_float_are_errors() {
+        let tiny = format!("0.{}1", "0".repeat(400));
+        let mut wrong = Vec::new();
+        for text in [tiny.clone(), format!("{tiny} B"), format!("{tiny}KiB")] {
+            if let Ok(bytes) = parse_size(&text) {
+                wrong.push(format!("size {}…: read as {bytes}", &text[..8]));
+            }
+        }
+        for text in [format!("{tiny}ms"), format!("{tiny} h")] {
+            if let Ok(ms) = parse_duration_ms(&text) {
+                wrong.push(format!("duration {}…: read as {ms} ms", &text[..8]));
+            }
+        }
+        // Guards: lexical zeros, however long, are 0.
+        let zeros = format!("0.{}", "0".repeat(400));
+        for text in [zeros.clone(), format!("{zeros}ms"), "000".to_owned()] {
+            if parse_size(text.trim_end_matches("ms")).ok() != Some(0)
+                || parse_duration_ms(&text).ok() != Some(0)
+            {
+                wrong.push(format!("zero {}…: not 0", &text[..6]));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[test]
     fn memory_is_bytes_or_a_share_of_the_machine() {
         const G: u64 = 1 << 30;

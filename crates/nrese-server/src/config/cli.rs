@@ -667,4 +667,35 @@ mod tests {
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
+
+    /// Guards: the profile `restore --until-time` takes is RFC 3339 read by the xsd:dateTime
+    /// calendar (docs/ops/server-setup.md): a leap second (`:60`) and an offset past ±14:00
+    /// are refused, ±14:00 itself taken, and `24:00:00` is the next day's midnight. Every row
+    /// is checked.
+    #[test]
+    fn rfc3339_times_follow_the_xsd_profile_at_its_boundaries() {
+        use super::parse_time;
+        let mut wrong = Vec::new();
+        for text in [
+            "2016-12-31T23:59:60Z",
+            "2026-10-02T14:05:00+14:01",
+            "2026-10-02T14:05:00-14:01",
+            "2026-10-02T14:05:00+15:00",
+            "2026-10-02T24:00:01Z",
+        ] {
+            if let Ok(micros) = parse_time(text) {
+                wrong.push(format!("{text} read as {micros}"));
+            }
+        }
+        for (text, micros) in [
+            ("2026-10-03T04:05:00+14:00", 1_790_949_900_000_000u64),
+            ("2026-10-02T00:05:00-14:00", 1_790_949_900_000_000),
+            ("2026-10-01T24:00:00Z", 1_790_899_200_000_000),
+        ] {
+            if parse_time(text).ok() != Some(micros) {
+                wrong.push(format!("{text}: {:?}, not {micros}", parse_time(text)));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 }
