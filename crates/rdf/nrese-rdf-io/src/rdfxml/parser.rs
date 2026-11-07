@@ -21,7 +21,7 @@
 //!   ancestor in the literal hasn't declared them, attributes sorted, text and attribute
 //!   values escaped as canonicalisation says.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::BufRead;
 use std::sync::Arc;
@@ -177,6 +177,10 @@ pub(crate) struct RdfXmlParser<R: BufRead> {
     done: bool,
     /// The XML reader failed (not well-formed) or the input ended: nothing to resume.
     broken: bool,
+    /// The work of every entity inclusion so far (see [`RdfXmlParser::entity`]), and of the
+    /// current top-level reference's.
+    expanded: Cell<u64>,
+    reference: Cell<u64>,
 }
 
 type Step<T> = Result<T, RdfParseError>;
@@ -229,6 +233,8 @@ impl<R: BufRead> RdfXmlParser<R> {
             current: None,
             done: false,
             broken: false,
+            expanded: Cell::new(0),
+            reference: Cell::new(0),
         }
     }
 
@@ -412,6 +418,7 @@ impl<R: BufRead> RdfXmlParser<R> {
         if open.len() >= MAX_ENTITY_NESTING {
             return Err(self.error(format!("entities nested deeper than {MAX_ENTITY_NESTING}")));
         }
+        self.charge_inclusion(replacement, open.is_empty())?;
         open.push(name);
         let inclusion = match inclusion {
             Inclusion::Attribute { .. } => Inclusion::Attribute { raw: false },
@@ -419,6 +426,44 @@ impl<R: BufRead> RdfXmlParser<R> {
         };
         self.include(replacement, inclusion, out, open)?;
         open.pop();
+        Ok(())
+    }
+
+    /// Counts an entity's inclusion before anything of it is written, and refuses it past
+    /// the bound (entity amplification, as libxml2 and Expat bound it): the work of every
+    /// inclusion of the document, its replacement text plus [`INCLUSION_COST`], stays within
+    /// [`AMPLIFICATION`] times the input read so far plus [`AMPLIFICATION_ALLOWANCE`], and
+    /// one reference at the top (`top`), with all it includes, within
+    /// [`MAX_REFERENCE_EXPANSION`]. The text an inclusion writes is at most its replacement
+    /// text, so these bound what references produce, and how often they are followed.
+    fn charge_inclusion(&self, replacement: &str, top: bool) -> Step<()> {
+        let cost = (replacement.len() as u64).saturating_add(INCLUSION_COST);
+        let expanded = self.expanded.get().saturating_add(cost);
+        let allowed = self
+            .reader
+            .buffer_position()
+            .saturating_mul(AMPLIFICATION)
+            .saturating_add(AMPLIFICATION_ALLOWANCE);
+        if expanded > allowed {
+            return Err(self.error(format!(
+                "entities expand to more than {AMPLIFICATION} times the input read so far \
+                 (plus {} MiB)",
+                AMPLIFICATION_ALLOWANCE >> 20
+            )));
+        }
+        let reference = if top {
+            cost
+        } else {
+            self.reference.get().saturating_add(cost)
+        };
+        if reference > MAX_REFERENCE_EXPANSION {
+            return Err(self.error(format!(
+                "one entity reference expands to more than {} MiB",
+                MAX_REFERENCE_EXPANSION >> 20
+            )));
+        }
+        self.expanded.set(expanded);
+        self.reference.set(reference);
         Ok(())
     }
 
@@ -1498,6 +1543,18 @@ enum Inclusion {
 
 /// How deep entities may include each other: deeper is an error, not a risk to the stack.
 const MAX_ENTITY_NESTING: usize = 64;
+
+/// The entity amplification bound ([`RdfXmlParser::charge_inclusion`]): the work of entity
+/// inclusions may reach this many times the input read so far, plus the allowance
+/// (Expat's activation threshold), and one reference's expansion the maximum (the size of
+/// one value, as libxml2 bounds one text node). Real RDF/XML, entities for namespace IRIs,
+/// stays below 1 time the input.
+const AMPLIFICATION: u64 = 10;
+const AMPLIFICATION_ALLOWANCE: u64 = 8 << 20;
+const MAX_REFERENCE_EXPANSION: u64 = 16 << 20;
+/// Each inclusion's work besides its text (libxml2's `XML_ENT_FIXED_COST`): empty entities
+/// can't be included without bound either.
+const INCLUSION_COST: u64 = 20;
 
 /// A character an XML 1.0 document may hold (`Char`, §2.2).
 fn is_xml_char(c: char) -> bool {
