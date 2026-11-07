@@ -80,51 +80,66 @@ fn reflexive_same_as_reads_are_not_complete_on_the_rules_route() {
 /// owl:sameAs ?x` holds of `:rex` (eq-ref, OWL 2 Profiles table 4), so NOT EXISTS removes
 /// it (SPARQL 1.1 §17.4.1.4) and the certain answers are none. Answered over the lower
 /// bound, `:rex` is returned: never labelled sound, in the plan or any answer mode, and
-/// refused under `exact` (P2-06 review r1, F1).
+/// refused under `exact` (P2-06 review r1, F1). The label holds whatever decides first: a
+/// schema read beside it (review r2), or a negated property set, which reads `owl:sameAs`
+/// unless it excludes it.
 #[test]
 fn a_reflexive_same_as_read_under_negation_is_not_sound() {
     use nrese_store::{CancellationToken, DlAnswers, SparqlQueryRequest, StoreError};
     let dl = pipeline();
     insert(&dl, ":Dog rdfs:subClassOf :Animal . :rex a :Dog .").expect("an RL ontology");
     assert_eq!(dl.store().dl_bounds().last, "rules");
-    // Guard (holds on the base too): a monotone read misses answers only, so it stays sound.
-    let (rows, status) = query(&dl, "SELECT ?x { ?x owl:sameAs :rex }");
-    assert!(rows.is_empty(), "{rows:?}");
-    assert!(status.shared.sound && !status.is_complete(), "{status:?}");
-    let negated = "SELECT ?x { ?x a :Dog FILTER NOT EXISTS { ?x owl:sameAs ?x } }";
     let mut wrong = Vec::new();
-    for mode in [
-        None,
-        Some(DlAnswers::CertainWhereComplete),
-        Some(DlAnswers::Sound),
+    // Guards (hold on the base too): a monotone read misses answers only, so it stays sound.
+    for monotone in [
+        "SELECT ?x { ?x owl:sameAs :rex }",
+        "SELECT ?x { ?x !:owns :rex }",
+        "SELECT ?x { :Dog rdfs:subClassOf :Animal . ?x owl:sameAs :rex }",
     ] {
-        let (rows, status) = super::queries::query_with(&dl, negated, mode).expect("answered");
-        // The lower bound's row, which the certain answers lack: answered, not certified.
-        if rows != ["rex"] {
-            wrong.push(format!("{mode:?}: rows {rows:?}"));
-        }
-        if status.shared.sound || status.is_complete() {
-            wrong.push(format!("{mode:?}: {:?}", status.shared));
+        let (rows, status) = query(&dl, monotone);
+        if !rows.is_empty() || !status.shared.sound || status.is_complete() {
+            wrong.push(format!("guard {monotone}: {rows:?} {:?}", status.shared));
         }
     }
-    let store = dl.store();
-    let prepared = store
-        .prepare_query(&SparqlQueryRequest::all(format!(
-            "{}{negated}",
-            super::PREFIXES
-        )))
-        .expect("prepared");
-    let planned = store
-        .plan_query(&prepared, &CancellationToken::new())
-        .expect("plan")
-        .completeness
-        .expect("a status");
-    if planned.sound || planned.complete {
-        wrong.push(format!("plan: {planned:?}"));
-    }
-    let exact = super::queries::query_with(&dl, negated, Some(DlAnswers::Exact));
-    if !matches!(exact, Err(StoreError::Incomplete(_))) {
-        wrong.push(format!("exact: {exact:?}"));
+    for negated in [
+        "SELECT ?x { ?x a :Dog FILTER NOT EXISTS { ?x owl:sameAs ?x } }",
+        "SELECT ?x { :Dog rdfs:subClassOf :Animal . ?x a :Dog \
+         FILTER NOT EXISTS { ?x owl:sameAs ?x } }",
+        "SELECT ?x { ?x a :Dog FILTER NOT EXISTS { ?x !:owns ?x } }",
+    ] {
+        for mode in [
+            None,
+            Some(DlAnswers::CertainWhereComplete),
+            Some(DlAnswers::Sound),
+        ] {
+            let (rows, status) = super::queries::query_with(&dl, negated, mode).expect("answered");
+            // The lower bound's row, which the certain answers lack: answered, not certified.
+            if rows != ["rex"] {
+                wrong.push(format!("{negated} {mode:?}: rows {rows:?}"));
+            }
+            if status.shared.sound || status.is_complete() {
+                wrong.push(format!("{negated} {mode:?}: {:?}", status.shared));
+            }
+        }
+        let store = dl.store();
+        let prepared = store
+            .prepare_query(&SparqlQueryRequest::all(format!(
+                "{}{negated}",
+                super::PREFIXES
+            )))
+            .expect("prepared");
+        let planned = store
+            .plan_query(&prepared, &CancellationToken::new())
+            .expect("plan")
+            .completeness
+            .expect("a status");
+        if planned.sound || planned.complete {
+            wrong.push(format!("{negated} plan: {planned:?}"));
+        }
+        let exact = super::queries::query_with(&dl, negated, Some(DlAnswers::Exact));
+        if !matches!(exact, Err(StoreError::Incomplete(_))) {
+            wrong.push(format!("{negated} exact: {exact:?}"));
+        }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
