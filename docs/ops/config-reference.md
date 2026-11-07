@@ -293,6 +293,8 @@ Read replicas ([replication.md](replication.md)); both sides need an on-disk sto
 
 Every limit on memory, time and request size is in one table, `[budgets]`. Values are plain numbers (bytes, milliseconds) or numbers with a unit: `"4GiB"`, `"512MiB"`, `"2GB"`, `"30s"`, `"2min"`, and for memory a share of the machine, `"50%"`. `nrese-server check-config` prints the values in effect, and `/version` reports them under `budgets`.
 
+Memory shares range from `0%` to `100%` and use the process's capacity (including container limits), read once when configuration loads. `budgets.query_memory = "50%"` gives each query half of that capacity; `0%` has the same meaning as `0`.
+
 | Key | Environment | Default | What it bounds |
 |---|---|---|---|
 | `budgets.query_memory` | `NRESE_MAX_QUERY_MEMORY_BYTES` | 4 GiB | One query's memory envelope: its intermediate and retained results and, under `owl2-dl`, its DL work (the exact services' compilation scratch and engines). A query whose evaluation needs more is answered `413`; DL candidates past it are left unresolved, the status says so (`422` under `dl.answers = exact`). `0` = unlimited |
@@ -354,6 +356,8 @@ schema reading, normalisation and compilation are not all internally interruptib
 Two rule-reasoning steps also don't poll the deadline:
 - the one-off full materialisation that runs when no current reasoning state is recorded;
 - closing a newly declared transitive property.
+
+A fixed limit comes before every authenticated request: a body of known length up to 64 KiB is read whole before the answer (clients that send the headers and the body apart need that), and that read waits at most 10 s. A body still missing then gets 401 if authentication refused the request's credentials, else 408.
 
 ## SPARQL Parse Error Profile
 

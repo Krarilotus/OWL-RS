@@ -25,5 +25,6 @@ mod turtle;
 
 pub use error::{RdfParseError, RdfSyntaxError, SkippedStatement, TextPosition};
 pub use format::RdfFormat;
+pub use ntriples::parse_term;
 pub use parser::{QuadParser, RdfParser};
 pub use serializer::{QuadSerializer, RdfSerializer};

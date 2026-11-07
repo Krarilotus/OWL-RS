@@ -20,7 +20,7 @@
 //!    `dl.timeout` per query.
 //!
 //! What can't be decided is said: an unresolved candidate, a non-monotone operator over
-//! an open gap, U1 not available, consistency not proven, a reader who sees part of the
+//! an open gap, a reflexive `owl:sameAs` read (eq-ref is in neither bound), U1 not available, consistency not proven, a reader who sees part of the
 //! data. Bag semantics: L's rows keep their multiplicities; a proved row is added once.
 
 use nrese_dl::limits::{Deadline, Limit};
@@ -214,23 +214,46 @@ impl Status {
 /// What can be said before running `prepared`: complete where every predicate it reads
 /// is closed; otherwise the bounds decide when it runs.
 pub(crate) fn plan_status(store: &StoreService, prepared: &PreparedQuery) -> Completeness {
-    plan_status_built(store, prepared).completeness
+    let analysis = analyse(prepared.query());
+    let mut completeness = plan_status_built(store, prepared, &analysis).completeness;
+    certify(&mut completeness, &analysis);
+    completeness
 }
 
-fn plan_status_built(store: &StoreService, prepared: &PreparedQuery) -> Status {
+/// The hazards that hold of `analysis` whatever path decided its status, composed last
+/// onto it by both entry points ([`plan_status`], [`answer`]): each only lowers what the
+/// status asserts, so no earlier return can claim more than they allow.
+fn certify(completeness: &mut Completeness, analysis: &Analysis) {
+    if let Some((why, sound)) = reflexive_same_as(analysis) {
+        if sound {
+            completeness.incomplete("dl", why);
+        } else {
+            completeness.unsound("dl", why);
+        }
+    }
+}
+
+fn plan_status_built(
+    store: &StoreService,
+    prepared: &PreparedQuery,
+    analysis: &Analysis,
+) -> Status {
     if prepared.access().is_some() || prepared.has_dataset() {
         return Status::sound_only(
             "the query reads part of the data: not checked against the bounds",
         );
     }
     let (snapshot, view) = super::bounds::view(store);
-    let analysis = analyse(prepared.query());
-    if let Some(what) = unbounded(&analysis) {
+    if let Some(what) = unbounded(analysis) {
         return Status::sound_only(format!(
             "the query reads {what}: entailed schema statements aren't bounded"
         ));
     }
-    if closed(&analysis, &view, &snapshot) {
+    // Answered over L alone; [`certify`] says what that misses.
+    if reflexive_same_as(analysis).is_some() {
+        return Status::complete();
+    }
+    if closed(analysis, &view, &snapshot) {
         let mut status = Status::complete();
         status.path("closed-predicates");
         return status;
@@ -252,8 +275,14 @@ pub(crate) fn answer(
     mode: DlAnswers,
 ) -> StoreResult<Outcome> {
     cancellation.check()?;
-    let outcome = decide_answers(store, prepared, cancellation, memory, mode)?;
+    let analysis = analyse(prepared.query());
+    let mut outcome = decide_answers(store, prepared, &analysis, cancellation, memory, mode)?;
     cancellation.check()?;
+    match &mut outcome {
+        Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => {
+            certify(status, &analysis)
+        }
+    }
     let status = match &outcome {
         Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => status,
     };
@@ -302,6 +331,7 @@ pub(crate) enum Read {
 fn decide_answers(
     store: &StoreService,
     prepared: &PreparedQuery,
+    analysis: &Analysis,
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
     mode: DlAnswers,
@@ -323,7 +353,6 @@ fn decide_answers(
         .stream(Read::Latest));
     }
     let (snapshot, view) = super::bounds::view(store);
-    let analysis = analyse(prepared.query());
     let mut status = Status::complete();
     let consistency = consistency_at(store, &snapshot, &view, cancellation, deadline, memory);
     cancellation.check()?;
@@ -345,19 +374,23 @@ fn decide_answers(
                 .to_owned(),
         );
     }
-    if let Some(what) = unbounded(&analysis) {
+    if let Some(what) = unbounded(analysis) {
         status.add(format!(
             "the query reads {what}: entailed schema statements aren't bounded (the RL \
              closure's are sound; /classification has the subsumptions under OWL 2 DL)"
         ));
         return Ok(status.stream(lower_view(&view)));
     }
-    if closed(&analysis, &view, &snapshot) {
+    // Answered over L alone; [`certify`] says what that misses.
+    if reflexive_same_as(analysis).is_some() {
+        return Ok(status.stream(lower_view(&view)));
+    }
+    if closed(analysis, &view, &snapshot) {
         // One evaluation, streamed: L's answers are the certain ones.
         status.path("closed-predicates");
         return Ok(status.stream(lower_view(&view)));
     }
-    if closed_for_answers(&analysis, &view, &snapshot) {
+    if closed_for_answers(analysis, &view, &snapshot) {
         // The same, where the gap has only individuals no answer can name.
         status.path("skolem-only-gap");
         #[cfg(debug_assertions)]
@@ -415,7 +448,7 @@ fn decide_answers(
             let decided = exact::decide_until(
                 store,
                 &view.lower,
-                &analysis,
+                analysis,
                 &[],
                 &candidates,
                 cancellation,
@@ -479,7 +512,7 @@ fn decide_answers(
                 let decided = exact::decide_until(
                     store,
                     &view.lower,
-                    &analysis,
+                    analysis,
                     &variables,
                     &rows,
                     cancellation,
