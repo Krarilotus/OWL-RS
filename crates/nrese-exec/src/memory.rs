@@ -457,8 +457,11 @@ mod imp {
     }
 
     pub fn available_bytes() -> Option<u64> {
-        let machine = status()?.ullTotalPhys;
-        Some(job_limit().map_or(machine, |limit| limit.min(machine)))
+        super::windows_available(
+            status().map(|status| status.ullTotalPhys),
+            in_job(),
+            job_limits,
+        )
     }
 
     pub fn remaining_bytes() -> Option<u64> {
@@ -501,6 +504,7 @@ mod imp {
     /// is visible: a process started by `cargo run` or `cargo test` sits in cargo's own job
     /// (which has no limit), so a cap on an enclosing job is seen only by processes started
     /// directly, as a service or a container starts the server.
+    #[cfg(test)]
     pub(super) fn job_limit() -> Option<u64> {
         super::least(job_limits()?)
     }
@@ -610,10 +614,7 @@ mod imp {
     /// could stop a materialisation that fits (LUBM 1000 maps about 5 GB).
     pub fn process_bytes() -> Option<u64> {
         let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-        let mut fields = statm.split_whitespace().skip(1);
-        let resident: u64 = fields.next()?.parse().ok()?;
-        let shared: u64 = fields.next()?.parse().ok()?;
-        Some(resident.saturating_sub(shared) * PAGE)
+        super::statm_bytes(&statm, PAGE).map(|bytes| bytes.anonymous)
     }
 
     pub fn page_faults() -> Option<u64> {
@@ -628,8 +629,7 @@ mod imp {
 
     pub fn resident_bytes() -> Option<u64> {
         let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-        let resident: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-        Some(resident * PAGE)
+        super::statm_bytes(&statm, PAGE).map(|bytes| bytes.resident)
     }
 
     pub fn set_transparent_huge_pages(allowed: bool) -> bool {
@@ -670,21 +670,11 @@ mod imp {
     }
 
     pub fn available_bytes() -> Option<u64> {
-        let read = |path: &str| std::fs::read_to_string(path).ok();
-        let machine = read("/proc/meminfo").and_then(|text| {
-            let line = text.lines().find(|line| line.starts_with("MemTotal:"))?;
-            let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-            Some(kib * 1024)
-        })?;
-        let limit = read("/proc/self/cgroup").and_then(|own| super::cgroup::limit(&own, read));
-        Some(limit.map_or(machine, |limit| limit.min(machine)))
+        super::linux_available(|path| std::fs::read_to_string(path))
     }
 
     pub fn remaining_bytes() -> Option<u64> {
-        let read = |path: &str| std::fs::read_to_string(path).ok();
-        let meminfo = read("/proc/meminfo");
-        let own = read("/proc/self/cgroup");
-        super::linux_remaining(meminfo.as_deref(), own.as_deref(), read)
+        super::linux_remaining(|path| std::fs::read_to_string(path))
     }
 }
 
@@ -778,25 +768,69 @@ fn windows_remaining(machine: Option<u64>, job: Option<Option<u64>>) -> Option<u
     least([machine, job?])
 }
 
-/// The memory a Linux process could still take, from `/proc/meminfo`'s text and its cgroup
-/// membership (`/proc/self/cgroup`'s): the least of the machine's `MemAvailable` and what
-/// its cgroups leave ([`cgroup::left`]); `None` where a cgroup's reading makes no sense, not
-/// the machine's alone. `read` reads a file's text.
-#[cfg(any(target_os = "linux", test))]
-fn linux_remaining(
-    meminfo: Option<&str>,
-    own: Option<&str>,
-    read: impl Fn(&str) -> Option<String>,
+/// The memory a Windows process may use: the least of the machine's physical memory and its
+/// job object's limits.
+#[cfg(any(windows, test))]
+fn windows_available(
+    machine: Option<u64>,
+    in_job: Option<bool>,
+    limits: impl FnOnce() -> Option<[Option<u64>; 2]>,
 ) -> Option<u64> {
-    let machine = meminfo.and_then(|text| {
-        let line = text
-            .lines()
-            .find(|line| line.starts_with("MemAvailable:"))?;
-        let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-        Some(kib * 1024)
-    });
-    let groups = match own {
-        Some(own) => cgroup::left(own, read)?,
+    let _ = in_job;
+    let machine = machine?;
+    let limit = limits().and_then(|limits| least(limits));
+    Some(limit.map_or(machine, |limit| limit.min(machine)))
+}
+
+/// A `/proc/self/statm` reading in bytes: the resident set, and its anonymous part (resident
+/// less shared: file-backed and shared memory).
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Statm {
+    resident: u64,
+    anonymous: u64,
+}
+
+/// `/proc/self/statm`'s text in bytes. Its fields count pages, of `page` bytes: the system's
+/// page size, which on aarch64 Linux may be 4, 16 or 64 KiB.
+#[cfg(any(target_os = "linux", test))]
+fn statm_bytes(text: &str, page: u64) -> Option<Statm> {
+    let mut fields = text.split_whitespace().skip(1);
+    let resident: u64 = fields.next()?.parse().ok()?;
+    let shared: u64 = fields.next()?.parse().ok()?;
+    Some(Statm {
+        resident: resident.checked_mul(page)?,
+        anonymous: resident.saturating_sub(shared).checked_mul(page)?,
+    })
+}
+
+/// A `/proc/meminfo` field (`MemTotal:`, `MemAvailable:`) in bytes.
+#[cfg(any(target_os = "linux", test))]
+fn meminfo_bytes(text: &str, field: &str) -> Option<u64> {
+    let line = text.lines().find(|line| line.starts_with(field))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    kib.checked_mul(1024)
+}
+
+/// The memory a Linux process may use: the least of the machine's `MemTotal` and its cgroups'
+/// limits ([`cgroup::limit`]). `read` reads a file's text.
+#[cfg(any(target_os = "linux", test))]
+fn linux_available(read: impl Fn(&str) -> std::io::Result<String>) -> Option<u64> {
+    let text = |path: &str| read(path).ok();
+    let machine = meminfo_bytes(&text("/proc/meminfo")?, "MemTotal:")?;
+    let limit = text("/proc/self/cgroup").and_then(|own| cgroup::limit(&own, &text));
+    Some(limit.map_or(machine, |limit| limit.min(machine)))
+}
+
+/// The memory a Linux process could still take: the least of the machine's `MemAvailable`
+/// and what its cgroups leave ([`cgroup::left`]); `None` where a cgroup's reading makes no
+/// sense, not the machine's alone. `read` reads a file's text.
+#[cfg(any(target_os = "linux", test))]
+fn linux_remaining(read: impl Fn(&str) -> std::io::Result<String>) -> Option<u64> {
+    let text = |path: &str| read(path).ok();
+    let machine = text("/proc/meminfo").and_then(|text| meminfo_bytes(&text, "MemAvailable:"));
+    let groups = match text("/proc/self/cgroup") {
+        Some(own) => cgroup::left(&own, &text)?,
         None => None,
     };
     least([machine, groups])
@@ -909,6 +943,9 @@ mod cgroup {
         Some(least)
     }
 }
+
+#[cfg(test)]
+mod discovery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1028,40 +1065,50 @@ mod tests {
                 available / 1024
             )
         };
+        let remaining = |meminfo: Option<String>, own: Option<&str>| {
+            linux_remaining(system(&files, meminfo.as_deref(), own))
+        };
         let v2 = Some("0::/app.slice/run.scope");
-        assert_eq!(
-            linux_remaining(Some(&meminfo(20 * G)), v2, read),
-            Some(3 * G)
-        );
+        assert_eq!(remaining(Some(meminfo(20 * G)), v2), Some(3 * G));
         // The machine's, where it is less.
-        assert_eq!(linux_remaining(Some(&meminfo(G)), v2, read), Some(G));
+        assert_eq!(remaining(Some(meminfo(G)), v2), Some(G));
         let v1 = Some("4:cpu:/docker/abc\n3:memory:/docker/abc");
-        assert_eq!(
-            linux_remaining(Some(&meminfo(20 * G)), v1, read),
-            Some(2 * G)
-        );
+        assert_eq!(remaining(Some(meminfo(20 * G)), v1), Some(2 * G));
         // No limit anywhere: the machine's; and no reading at all.
         let free = Some("0::/system.slice/x.service");
-        assert_eq!(
-            linux_remaining(Some(&meminfo(5 * G)), free, read),
-            Some(5 * G)
-        );
-        assert_eq!(linux_remaining(None, None, read), None);
+        assert_eq!(remaining(Some(meminfo(5 * G)), free), Some(5 * G));
+        assert_eq!(remaining(None, None), None);
         // A limit of 0 leaves nothing; one whose use or value can't be read leaves what
         // isn't known, not the machine's.
         let at = |group: &str| format!("0::/{group}");
-        let machine = Some(meminfo(G));
         assert_eq!(
-            linux_remaining(machine.as_deref(), Some(&at("zero.scope")), read),
+            remaining(Some(meminfo(G)), Some(&at("zero.scope"))),
             Some(0)
         );
         assert_eq!(cgroup::limit(&at("zero.scope"), read), Some(0));
         for group in ["blind.scope", "odd.scope"] {
             assert_eq!(
-                linux_remaining(machine.as_deref(), Some(&at(group)), read),
+                remaining(Some(meminfo(G)), Some(&at(group))),
                 None,
                 "{group}"
             );
+        }
+    }
+
+    /// A file system of `files` for the readers, with `/proc/meminfo` and `/proc/self/cgroup`
+    /// as given: a file it doesn't have is not found.
+    fn system<'a>(
+        files: &'a std::collections::HashMap<String, String>,
+        meminfo: Option<&'a str>,
+        own: Option<&'a str>,
+    ) -> impl Fn(&str) -> std::io::Result<String> + 'a {
+        move |path| {
+            let text = match path {
+                "/proc/meminfo" => meminfo.map(str::to_owned),
+                "/proc/self/cgroup" => own.map(str::to_owned),
+                _ => files.get(path).cloned(),
+            };
+            text.ok_or_else(|| std::io::ErrorKind::NotFound.into())
         }
     }
 
