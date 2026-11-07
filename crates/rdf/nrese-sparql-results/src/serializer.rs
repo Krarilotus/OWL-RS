@@ -5,6 +5,7 @@ use std::io::{self, Write};
 
 use nrese_rdf::{TermRef, Variable};
 
+use crate::error::XmlUnrepresentable;
 use crate::format::QueryResultsFormat;
 use crate::{csv, json, tsv, xml};
 
@@ -63,7 +64,7 @@ impl QueryResultsSerializer {
         let mut out = Vec::with_capacity(FLUSH_AT + 4096);
         match self.format {
             QueryResultsFormat::Json => json::write_head(&mut out, &variables, self.version),
-            QueryResultsFormat::Xml => xml::write_head(&mut out, &variables),
+            QueryResultsFormat::Xml => xml::write_head(&mut out, &variables).map_err(refused)?,
             QueryResultsFormat::Csv => csv::write_head(&mut out, &variables),
             QueryResultsFormat::Tsv => tsv::write_head(&mut out, &variables),
         }
@@ -134,7 +135,14 @@ impl<W: Write> WriterSolutionsSerializer<W> {
         let first = std::mem::replace(&mut self.first, false);
         match self.format {
             QueryResultsFormat::Json => json::write_row(&mut self.out, &self.variables, row, first),
-            QueryResultsFormat::Xml => xml::write_row(&mut self.out, &self.variables, row),
+            QueryResultsFormat::Xml => {
+                // A refused row leaves nothing: the rows before it stand.
+                let start = self.out.len();
+                if let Err(error) = xml::write_row(&mut self.out, &self.variables, row) {
+                    self.out.truncate(start);
+                    return Err(refused(error));
+                }
+            }
             QueryResultsFormat::Csv => csv::write_row(&mut self.out, row),
             QueryResultsFormat::Tsv => tsv::write_row(&mut self.out, row),
         }
@@ -157,14 +165,28 @@ impl<W: Write> WriterSolutionsSerializer<W> {
     }
 }
 
+/// The XML writer's refusal of a character, as the serializer's error.
+fn refused(error: XmlUnrepresentable) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
 /// One term as it stands in a solution of `format`: a JSON term object, an XML term
 /// element, a TSV term, a CSV field. For writers that lay out the rows themselves (the
 /// engine writes them from its id tables) and must still write terms exactly as
 /// [`WriterSolutionsSerializer`] does.
+///
+/// An XML term with a character XML 1.0 can't hold ([`XmlUnrepresentable`]) is left out
+/// (nothing is appended), so its `<binding>` has no term and no reader takes the document;
+/// [`WriterSolutionsSerializer`] reports the refusal instead.
 pub fn write_term(format: QueryResultsFormat, term: TermRef<'_>, out: &mut Vec<u8>) {
     match format {
         QueryResultsFormat::Json => json::write_term(out, term),
-        QueryResultsFormat::Xml => xml::write_term(out, term),
+        QueryResultsFormat::Xml => {
+            let start = out.len();
+            if xml::write_term(out, term).is_err() {
+                out.truncate(start);
+            }
+        }
         QueryResultsFormat::Csv => csv::write_term(out, term),
         QueryResultsFormat::Tsv => tsv::write_term(out, term),
     }

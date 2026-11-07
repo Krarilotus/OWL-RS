@@ -97,7 +97,7 @@ pub(crate) enum Frame {
     /// No bytes left.
     End,
     /// An incomplete or checksum-failing frame: a torn write at the tail of the log, or
-    /// corruption anywhere else. The caller decides which, based on the position.
+    /// damage. Recovery decides which ([`super::tail`]).
     Invalid,
 }
 

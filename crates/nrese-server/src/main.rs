@@ -174,8 +174,13 @@ async fn run() -> Result<()> {
                 // The data stays loaded (for diagnosis and repair); the server will start
                 // in quarantine.
                 anyhow::bail!(
-                    "the loaded data is inconsistent under {}: {} violation(s)",
+                    "the loaded data is inconsistent under {}: {}{} violation(s)",
                     program.name(),
+                    if report.violations_at_least {
+                        "at least "
+                    } else {
+                        ""
+                    },
                     report.violations
                 );
             }

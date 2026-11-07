@@ -185,16 +185,8 @@ impl SliceSolutionsParser<'_> {
                 let Some(text) = tsv::next_slice_line(bytes, at) else {
                     return Ok(None);
                 };
-                let text = text?;
                 *line += 1;
-                // A last line with nothing on it is the file's final line break.
-                if text.trim_end_matches('\r').is_empty()
-                    && *at >= bytes.len()
-                    && !variables.is_empty()
-                {
-                    return Ok(None);
-                }
-                tsv::parse_row(text, variables.len(), *line - 1).map(Some)
+                tsv::parse_row(text?, variables.len(), *line - 1).map(Some)
             }
         }
     }
@@ -275,20 +267,7 @@ impl<R: Read> ReaderSolutionsParser<R> {
                     return Ok(None);
                 }
                 *line += 1;
-                let text = buffer.trim_end_matches(['\r', '\n']);
-                if text.is_empty() && !variables.is_empty() {
-                    // Only a final line break may be empty: check that nothing follows.
-                    let mut rest = String::new();
-                    if tsv::next_reader_line(reader, &mut rest)? {
-                        return Err(QueryResultsSyntaxError::msg(format!(
-                            "an empty line {} in TSV results",
-                            *line
-                        ))
-                        .into());
-                    }
-                    return Ok(None);
-                }
-                Ok(Some(tsv::parse_row(text, variables.len(), *line - 1)?))
+                Ok(Some(tsv::parse_row(buffer, variables.len(), *line - 1)?))
             }
         }
     }
