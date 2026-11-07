@@ -504,6 +504,13 @@ mod imp {
     /// is visible: a process started by `cargo run` or `cargo test` sits in cargo's own job
     /// (which has no limit), so a cap on an enclosing job is seen only by processes started
     /// directly, as a service or a container starts the server.
+    ///
+    /// Decided (the orchestrator, 7 Nov 17:10, P2-A4 review r1 R1-C2, IB1709-5712): a limit on
+    /// an enclosing job is a documented limitation, as a cgroup v2 limit above the namespace is
+    /// (IB2001-2a56). No supported call shows it: `QueryInformationJobObject` answers for the
+    /// immediate job, and `GlobalMemoryStatusEx`'s commit fields ignore job limits (fleet
+    /// `p2a4x-jobprobe-79195bb6`: an outer 1 GiB cap enforced, both fields unchanged). Under a
+    /// capped parent job the server's memory limit is set by hand (`process_memory_bytes`).
     #[cfg(test)]
     pub(super) fn job_limit() -> Option<u64> {
         super::least(job_limits()?)
@@ -773,7 +780,8 @@ fn windows_remaining(machine: Option<u64>, job: Option<Option<u64>>) -> Option<u
 /// The memory a Windows process may use, from the machine's physical memory, whether the
 /// process is in a job object, and the job's limits (those set): the least of the machine's
 /// and the job's. `None` where membership can't be asked, or the job's limits can't be read
-/// (outside a job that query fails too: told apart by membership), not the machine's.
+/// (outside a job that query fails too: told apart by membership), not the machine's. The
+/// job is the immediate one; an enclosing job's limit isn't observable (`imp::job_limit`).
 #[cfg(any(windows, test))]
 fn windows_available(
     machine: Option<u64>,
