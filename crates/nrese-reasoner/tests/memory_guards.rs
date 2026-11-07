@@ -338,3 +338,80 @@ fn equality_copies_past_the_memory_limit_stop_within_it() {
         );
     }
 }
+
+/// The equality copies, charged as they grow, are joined once into a list of exactly their
+/// number, so their charge costs no memory the uncharged copies didn't: 2,000 `owl:sameAs`
+/// groups of 10 (560,000 facts), on one thread. The heap's peak per fact on 7 November
+/// 2026: listed by representatives 72.1 bytes uncharged (313e5a64), 93.4 joined pairwise
+/// with the joined list's doubling room kept (459d47c8), 72.5 joined once; by replication
+/// 183.7, 192.8 and 183.7.
+#[test]
+fn equality_copies_are_joined_once_at_their_number() {
+    use nrese_reasoner::ir::{OWL, Vocabulary};
+
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let peak_per_fact = |replicate: bool| {
+        let mut vocabulary = LocalVocabulary::default();
+        let rules = Ruleset::Owl2Rl
+            .rules(&mut vocabulary)
+            .expect("OWL 2 RL parses");
+        let lists = ListVocabulary::new(&mut vocabulary);
+        let schema = Schema::owl(&mut vocabulary);
+        let same_as = vocabulary.iri(&format!("{OWL}sameAs"));
+        let [val, group, knows] = ["val", "group", "knows"]
+            .map(|name| vocabulary.iri(&format!("http://example.com/{name}")));
+        let (groups, size) = (2_000, 10);
+        let mut facts = Vec::new();
+        for g in 0..groups {
+            let ids: Vec<u64> = (0..size)
+                .map(|j| vocabulary.iri(&format!("http://example.com/i{g}_{j}")))
+                .collect();
+            let label = vocabulary.iri(&format!("http://example.com/G{g}"));
+            for (j, &id) in ids.iter().enumerate() {
+                let value = vocabulary.iri(&format!("http://example.com/v{g}_{j}"));
+                facts.extend([[id, val, value], [id, group, label]]);
+                if let Some(&next) = ids.get(j + 1) {
+                    facts.push([id, same_as, next]);
+                }
+            }
+            let next = vocabulary.iri(&format!("http://example.com/i{}_0", (g + 1) % groups));
+            facts.push([ids[0], knows, next]);
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("a pool");
+        let input = grouped(facts);
+        let before = heap::live();
+        heap::start("input");
+        let result = pool.install(|| match replicate {
+            true => batch::materialise_grouped_until(
+                input,
+                &rules,
+                Some(&lists),
+                &schema,
+                nrese_reasoner::eval::NEVER,
+            ),
+            false => batch::materialise_representatives_until(
+                batch::Input::Grouped(input),
+                &rules,
+                Some(&lists),
+                &schema,
+                batch::Listing::Expanded,
+                nrese_reasoner::eval::NEVER,
+            ),
+        });
+        let phases = heap::finish();
+        let derived = result.expect("never stopped").derived.len();
+        assert!(derived > 500_000, "{derived} facts: too few to tell");
+        let peak = phases.iter().map(|phase| phase.peak).max().expect("phases") - before;
+        peak as f64 / derived as f64
+    };
+    for (replicate, at_most) in [(false, 75.0), (true, 187.0)] {
+        let per_fact = peak_per_fact(replicate);
+        assert!(
+            per_fact <= at_most,
+            "replicate {replicate}: {per_fact:.1} bytes per fact at the heap's peak, at most {at_most}"
+        );
+    }
+}
