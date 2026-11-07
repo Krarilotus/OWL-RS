@@ -40,7 +40,7 @@ owns its tests, and benchmarks never run in a gate.
 
 ## Building and measuring
 
-Rust builds run on the build host ([benches/hosts.toml](benches/hosts.toml)): with
+Rust builds run on a build host (the fleet's: `fleet rules` lists them): with
 `git config nrese.buildHost <ssh alias>`, `scripts/check.sh all` and `scripts/lib/remote.sh check|run`
 send the working tree there and run the command in a worktree of its own (`NRESE_BUILD_HOST=local`
 builds on this machine instead). The push tier runs on the fleet only: `.githooks/pre-push` gates

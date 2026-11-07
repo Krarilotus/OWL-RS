@@ -95,6 +95,11 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             None => defaults.checkpoint_after_wal_bytes,
         },
         wal_archive: parse_bool(source, names::WAL_ARCHIVE, defaults.wal_archive)?,
+        wal_damage: match choice(source, names::WAL_DAMAGE, &["refuse", "keep-prefix"])? {
+            None => defaults.wal_damage,
+            Some(0) => nrese_store::WalDamage::Refuse,
+            Some(_) => nrese_store::WalDamage::KeepPrefix,
+        },
         index_encoding: match source.get(names::INDEX_ENCODING) {
             None => defaults.index_encoding,
             Some(name) => {

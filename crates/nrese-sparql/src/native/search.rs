@@ -374,13 +374,17 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
 }
 
 impl Context<'_> {
-    /// Whether `id` is the object of a statement in the active graph.
+    /// Whether `id` is the object of a statement in the active graph ([`Self::used_as_object_of`]
+    /// with any predicate).
     pub(super) fn used_as_object(&self, id: TermId) -> bool {
         self.used_as_object_of(id, None)
     }
 
-    /// Whether `id` is the object of a statement in the active graph, with `property`
-    /// as its predicate if given.
+    /// Whether `id` is the object of a statement in the active graph, with `property` as its
+    /// predicate if given: under `GRAPH ?g`, in one of the dataset's named graphs where it
+    /// lists them (`FROM NAMED`, and of those only the graphs the reader may read:
+    /// `ResolvedDataset::restricted`). The graph and the property hold for the same
+    /// statement.
     fn used_as_object_of(&self, id: TermId, property: Option<TermId>) -> bool {
         let graph = match &*self.graph.borrow() {
             GraphScope::Default => GraphSelector::Exact(TermId::DEFAULT_GRAPH),
@@ -398,9 +402,15 @@ impl Context<'_> {
         let merge_set = matches!(*self.graph.borrow(), GraphScope::Union)
             .then_some(self.merge_set.as_ref())
             .flatten();
+        let named = matches!(*self.graph.borrow(), GraphScope::Variable(_))
+            .then_some(self.named.as_deref())
+            .flatten();
         self.snapshot
             .quads_for_pattern_in(self.model, &pattern)
-            .any(|quad| merge_set.is_none_or(|graphs| graphs.contains(&quad.graph)))
+            .any(|quad| {
+                merge_set.is_none_or(|graphs| graphs.contains(&quad.graph))
+                    && named.is_none_or(|graphs| graphs.contains(&quad.graph))
+            })
     }
 
     /// The literals `search` matches, with their relevance and rank.

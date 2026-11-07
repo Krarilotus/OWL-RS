@@ -418,6 +418,11 @@ fn unescape(text: &str, string: bool) -> Result<String, String> {
 
 // ---------------------------------------------------------------------------------------
 // Line sources: a slice, or a reader
+//
+// A line ends with LF (§2; a CR before it is dropped, as readers are advised to cope with
+// CRLF), and a last line without one is still a line. Every line after the head is one
+// solution (§4.1), an empty one included: with one variable it leaves that variable
+// unbound, as the writer writes such a solution.
 
 /// The next line of `bytes` from `*at` (without its line break), or `None` at the end.
 pub(crate) fn next_slice_line<'a>(

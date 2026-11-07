@@ -1,15 +1,17 @@
 //! Full materialisation of a snapshot's asserted statements ([`super::materialise`]).
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use nrese_engine::quad::Permutation;
 use nrese_engine::{EncodedTriple, QuadPattern, ReadModel, Snapshot, TermId};
+use nrese_exec::Budget;
 use rayon::prelude::*;
 
 use super::{Program, encode, storable};
 use crate::batch::{self, Phases, Schema};
 use crate::delta;
-use crate::ir::{Triple, Violation};
+use crate::ir::{Triple, Violations};
 use crate::lists::ListDiagnostic;
 
 /// A closure computed over engine term ids.
@@ -17,7 +19,8 @@ use crate::lists::ListDiagnostic;
 pub struct Closure {
     /// The storable inferred statements (in the default graph).
     pub inferred: Vec<EncodedTriple>,
-    pub violations: Vec<Violation>,
+    /// Its consistency violations, sorted: the rules', then the datatype checks'.
+    pub violations: Violations,
     /// List axioms that weren't instantiated.
     pub diagnostics: Vec<ListDiagnostic>,
     pub rounds: usize,
@@ -35,40 +38,62 @@ pub fn materialise_until(
     snapshot: &Snapshot,
     stop: crate::eval::Stop<'_>,
 ) -> Result<Closure, delta::Interrupted> {
+    materialise_within(program, snapshot, stop, &crate::violations::unlimited())
+}
+
+/// [`materialise_until`], its consistency violations (the rules' and the datatype checks')
+/// charged to `memory`: the operation's own part, whose refusal ends their list and keeps
+/// the state inconsistent ([`Violations`]).
+pub fn materialise_within(
+    program: &Program,
+    snapshot: &Snapshot,
+    stop: crate::eval::Stop<'_>,
+    memory: &Arc<Budget>,
+) -> Result<Closure, delta::Interrupted> {
     nrese_exec::heap::phase("reasoner: input");
     let (input, axioms) = input_of(program, snapshot);
     let schema = program.schema_for(snapshot);
     let result = match program.same_as.filter(|_| program.by_representatives) {
-        Some(same_as) => match by_representatives(program, input, same_as, &schema, stop)? {
-            // A class holding rdf:nil reads every list through it as empty: computed again
-            // by replication. A compact stack keeps the closure over representatives.
-            result if result.nil_merged && !program.store_representatives => {
-                batch::materialise_grouped_until(
-                    input_of(program, snapshot).0,
-                    &program.rules,
-                    program.lists.as_ref(),
-                    &schema,
-                    stop,
-                )?
+        Some(same_as) => {
+            match by_representatives(program, input, same_as, &schema, stop, memory)? {
+                // A class holding rdf:nil reads every list through it as empty: computed
+                // again by replication. A compact stack keeps the closure over
+                // representatives.
+                result if result.nil_merged && !program.store_representatives => {
+                    batch::materialise_grouped_within(
+                        input_of(program, snapshot).0,
+                        &program.rules,
+                        program.lists.as_ref(),
+                        &schema,
+                        stop,
+                        memory,
+                    )?
+                }
+                result => result,
             }
-            result => result,
-        },
-        None => batch::materialise_grouped_until(
+        }
+        None => batch::materialise_grouped_within(
             input,
             &program.rules,
             program.lists.as_ref(),
             &schema,
             stop,
+            memory,
         )?,
     };
     nrese_exec::heap::phase("reasoner: datatype checks");
     let mut violations = result.violations;
-    violations.extend(super::datatypes::violations(
-        &result.derived,
-        program.rdf_type,
-        program.same_as,
-        &|id| snapshot.decode(TermId::from_raw(id)),
-    ));
+    // A list that already stopped at its budget makes the state inconsistent: the
+    // datatype checks would add nothing to that.
+    if violations.complete() {
+        violations.append(super::datatypes::violations(
+            &result.derived,
+            program.rdf_type,
+            program.same_as,
+            &|id| snapshot.decode(TermId::from_raw(id)),
+            memory,
+        ));
+    }
     nrese_exec::heap::phase("store: encode");
     // At its exact size: collected by doubling, the list held up to twice the facts, and
     // at a doubling three times, beside them (LUBM 1000: 6.6 GB at this step's peak).
@@ -127,18 +152,20 @@ fn by_representatives(
     same_as: u64,
     schema: &Schema,
     stop: crate::eval::Stop<'_>,
+    memory: &Arc<Budget>,
 ) -> Result<batch::Materialisation, delta::Interrupted> {
     let listing = match program.store_representatives {
         true => batch::Listing::Stored,
         false => batch::Listing::Expanded,
     };
-    let mut result = batch::materialise_representatives_until(
+    let mut result = batch::materialise_representatives_within(
         batch::Input::Grouped(input),
         &program.rules,
         program.lists.as_ref(),
         schema,
         listing,
         stop,
+        memory,
     )?;
     if program.store_representatives && !result.classes.is_empty() {
         let classes = &result.classes;
