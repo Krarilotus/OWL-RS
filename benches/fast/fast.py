@@ -1457,6 +1457,13 @@ def case_inputs(case: dict) -> dict[str, str | None]:
             same = (was.get("bytes"), was.get("mtime_ns")) == (stat.st_size, stat.st_mtime_ns)
             _DIGESTS[key] = was["sha256"] if same and was.get("sha256") else file_digest(path)
         out[name] = _DIGESTS[key]
+    # A concatenation loads its parts in its order: the same parts in another order are other bytes
+    # (sol-loop r3 V2). Its fingerprint: its parts in order, each by its hash (a generated part by its spec).
+    specs = [case.get("data", ""), *([case["data_alt"]] if case.get("data_alt") else []), *case.get("extra", [])]
+    for i, spec in enumerate((s for s in specs if s.startswith("concat:")), 1):
+        parts = [(p, out.get(p[len("volume:"):]) if p.startswith("volume:") else p) for p in spec[len("concat:"):].split("+")]
+        out[f"concat {i}"] = (None if any(v is None for _, v in parts)
+                              else hashlib.sha256("\n".join(f"{p}={v}" for p, v in parts).encode()).hexdigest())
     return out
 
 

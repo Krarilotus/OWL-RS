@@ -522,8 +522,8 @@ def input_check(base_report: dict, new_report: dict) -> dict[str, str]:
     base, new = loaded_inputs(base_report), loaded_inputs(new_report)
     out = {}
     for case in sorted(set(base) & set(new)):
-        if base[case] is None and new[case] is None and not reads.get(case, ["?"]):
-            continue  # generated data alone: nothing frozen to record
+        if not reads.get(case, ["?"]):
+            continue  # generated data alone: nothing frozen, whatever a record says (sol-loop r3 V3)
         if why := input_difference(base[case], new[case]):
             out[case] = why
     return out
@@ -553,10 +553,16 @@ def input_difference(base: dict | None, new: dict | None, base_bytes: dict | Non
     return None
 
 
+UNLISTED = "(inputs the run doesn't list with their SHA-256)"
+
+
 def suite_inputs(paths: list[Path]) -> tuple[dict | None, dict]:
     """The /data files suite results read (the manifest.json beside each: `datasets`, their sizes,
     and `dataset_sha256`): file -> SHA-256 (None: not recorded, or two invocations disagree), and
-    file -> size; (None, {}) where a manifest is missing."""
+    file -> size; (None, {}) where a manifest is missing. Only an invocation that states its inputs'
+    hashes (`dataset_sha256`, `{}` included) establishes them: `datasets` alone may miss what a
+    workload loads itself (sol-loop r3 V1: commit-latency's LUBM), so its inputs stay unknown
+    (UNLISTED), its listed sizes still showing another release."""
     hashes: dict = {}
     sizes: dict = {}
     for path in dict.fromkeys(p.resolve() for p in paths):
@@ -565,6 +571,8 @@ def suite_inputs(paths: list[Path]) -> tuple[dict | None, dict]:
         except (OSError, ValueError, KeyError):
             return None, {}
         for i in invocations:
+            if "dataset_sha256" not in i:
+                hashes[UNLISTED] = None
             digests = i.get("dataset_sha256") or {}
             for f, size in (i.get("datasets") or {}).items():
                 sha = digests.get(f)

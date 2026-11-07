@@ -56,7 +56,8 @@ def write(directory: Path, rows: list[dict]) -> Path:
     # without one, compare can't tell which input a run read, and refuses).
     manifest = directory / "manifest.json"
     if not manifest.exists():
-        manifest.write_text(json.dumps({"schema": 1, "invocations": [{"datasets": {}}]}), encoding="utf-8")
+        manifest.write_text(json.dumps({"schema": 1, "invocations": [{"datasets": {}, "dataset_sha256": {}}]}),
+                            encoding="utf-8")
     return path
 
 
@@ -166,6 +167,32 @@ class LoadedInputs(unittest.TestCase):
         code, text = self.compare(self.report(100.0, case="rl-hierarchy"), self.report(50.0, case="rl-hierarchy"))
         self.assertIn("faster", text)
         self.assertEqual(code, 0, text)
+        # Sol-loop r3 V3: an older record without `inputs` against a new one saying {} (none read).
+        code, text = self.compare(self.report(100.0, case="rl-hierarchy"), self.report(50.0, {}, case="rl-hierarchy"))
+        self.assertIn("faster", text)
+        self.assertEqual(code, 0, text)
+
+    def test_a_concatenation_s_order_is_part_of_its_input(self):
+        """Sol-loop r3 V2: the same parts concatenated in another order are other bytes loaded."""
+        a = {"lubm-1.nt": "l" * 64, "univ-bench.nt": "u" * 64, "concat 1": "a" * 64}
+        b = {"lubm-1.nt": "l" * 64, "univ-bench.nt": "u" * 64, "concat 1": "b" * 64}
+        code, text = self.compare(self.report(100.0, a, case="dl-abox-lubm1"), self.report(50.0, b, case="dl-abox-lubm1"))
+        self.assertIn("different input", text)
+        self.assertEqual(code, 2, text)
+
+    def test_suite_results_that_don_t_list_their_inputs_hashes_are_unknown(self):
+        """Sol-loop r3 V1: `datasets: {}` doesn't prove a run read no frozen file (commit-latency
+        loads LUBM outside its declared inputs, maintenance.py). Only a manifest that states its
+        inputs' hashes (`dataset_sha256`, `{}` included) establishes them."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            old, new = self.suite_run(d / "old", 100, {}), self.suite_run(d / "new", 50, {})
+            text = output(compare.main, [str(old), str(new)])
+            self.assertIn("input unknown", text)
+            self.assertNotIn("faster", text)
+            stated_old = self.suite_run(d / "so", 100, {}, {})
+            stated_new = self.suite_run(d / "sn", 50, {}, {})
+            self.assertIn("faster", output(compare.main, [str(stated_old), str(stated_new)]))
 
 
 class Contracts(unittest.TestCase):
