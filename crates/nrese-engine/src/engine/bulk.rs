@@ -31,7 +31,7 @@ use rayon::prelude::*;
 
 use super::spill::{Spill, Spiller};
 use super::{CommitSummary, Inner, ReadModel, Snapshot, Stack, Version};
-use crate::durability::{Durable, checkpoint, commit_time};
+use crate::durability::{Durable, checkpoint, commit_time, later};
 use crate::error::{EngineError, EngineResult};
 use crate::index::keys::PackedKeys;
 use crate::index::run::{PermutationBuilder, Run};
@@ -276,7 +276,10 @@ impl<'e> BulkLoad<'e> {
                     layout,
                     builder: PermutationBuilder::planned(quads, layout.permutations()),
                     revision: summary.revision,
-                    committed_micros: commit_time(current.committed_micros),
+                    stamp: Stamp {
+                        previous: current.committed_micros,
+                        replaces: true,
+                    },
                     dictionary_len: shared.dictionary.len(),
                 };
                 (next, summary)
@@ -294,12 +297,17 @@ impl<'e> BulkLoad<'e> {
                     asserted: IndexVersion::from_quads(Layout::holding(&quads), quads),
                     inferred: IndexVersion::empty(Layout::DefaultGraph),
                     revision: summary.revision,
-                    committed_micros: Some(commit_time(current.committed_micros)),
+                    // Stamped as it commits ([`publish`]).
+                    committed_micros: None,
                     dictionary_len: shared.dictionary.len(),
                     equality: Default::default(),
                     canonical: Default::default(),
                 };
-                (Next::Built(next), summary)
+                let stamp = Stamp {
+                    previous: current.committed_micros,
+                    replaces: true,
+                };
+                (Next::Built(next, stamp), summary)
             }
             BulkMode::Append => {
                 // Into a store asserting nothing every quad is new: moved, not filtered into
@@ -344,12 +352,18 @@ impl<'e> BulkLoad<'e> {
                     asserted: asserted.with_run(run),
                     inferred: current.inferred.with_delta(&[], &explicit),
                     revision: summary.revision,
-                    committed_micros: Some(commit_time(current.committed_micros)),
+                    // Stamped as it commits ([`publish`]).
+                    committed_micros: None,
                     dictionary_len: shared.dictionary.len(),
                     equality: Default::default(),
                     canonical: Default::default(),
                 };
-                (Next::Built(next), summary)
+                // It keeps what was there: of unknown time if that is.
+                let stamp = Stamp {
+                    previous: current.committed_micros,
+                    replaces: false,
+                };
+                (Next::Built(next, stamp), summary)
             }
         };
         if summary.inserted + summary.deleted + summary.inferred_deleted == 0 {
@@ -403,7 +417,10 @@ fn publish_spilled(
         Source::Spilled(spill),
         layout,
         revision,
-        commit_time(current.committed_micros),
+        Stamp {
+            previous: current.committed_micros,
+            replaces: true,
+        },
         dictionary_len,
     )?;
     drop(compaction);
@@ -443,8 +460,8 @@ impl Source {
 
 /// The version a bulk load publishes.
 enum Next {
-    /// Built in memory.
-    Built(Version),
+    /// Built in memory, its time stamped as it commits.
+    Built(Version, Stamp),
     /// Asserted quads and nothing else: their permutations are built one at a time, each
     /// written to the checkpoint and dropped before the next (durable, `map_checkpoints`).
     /// The load's peak then holds one packed permutation instead of all of them.
@@ -453,10 +470,32 @@ enum Next {
         layout: Layout,
         builder: PermutationBuilder,
         revision: u64,
-        /// When it is committed ([`commit_time`]).
-        committed_micros: u64,
+        stamp: Stamp,
         dictionary_len: u64,
     },
+}
+
+/// The time a bulk publication's version takes, stamped as it commits ([`Stamp::take`]): at
+/// its checkpoint's end, just before the file is synced and renamed, not when the version was
+/// built (a long checkpoint write could then commit after a time it was stamped before).
+#[derive(Debug, Clone, Copy)]
+struct Stamp {
+    /// The time of the version it builds on.
+    previous: Option<u64>,
+    /// It holds nothing of that version (a replacement): its time doesn't depend on it.
+    replaces: bool,
+}
+
+impl Stamp {
+    /// The version's time, taken now: the commit's ([`commit_time`]), bounding what it keeps
+    /// of the previous version too; unknown if it keeps any of a version of unknown time.
+    fn take(self) -> Option<u64> {
+        let commit = commit_time(self.previous);
+        match self.replaces {
+            true => Some(commit),
+            false => later(self.previous, Some(commit)),
+        }
+    }
 }
 
 /// Installs `next` as the latest version, the bulk way: in durable mode a checkpoint of it
@@ -465,85 +504,87 @@ enum Next {
 /// touch, as after a restart). The caller holds the writer and compaction slots.
 fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     let shared = &engine.shared;
-    let next = match next {
-        Next::Built(version) => version,
+    let (mut next, stamp) = match next {
+        Next::Built(version, stamp) => (version, stamp),
         Next::Streamed {
             layout,
             builder,
             revision,
-            committed_micros,
+            stamp,
             dictionary_len,
         } => {
             let source = Source::Memory(builder);
-            return publish_streamed(
-                engine,
-                source,
-                layout,
-                revision,
-                committed_micros,
-                dictionary_len,
-            )
-            .map(|_| ());
+            return publish_streamed(engine, source, layout, revision, stamp, dictionary_len)
+                .map(|_| ());
         }
     };
+    let Some(durable) = &shared.durable else {
+        next.committed_micros = stamp.take();
+        shared.versions.install(Arc::new(next));
+        return Ok(());
+    };
     let next = Arc::new(next);
-    match &shared.durable {
-        Some(durable) => {
-            let revision = next.revision;
-            let _checkpoint = durable.checkpoint_slot.lock();
-            let image = Snapshot::new(
-                Arc::clone(&next),
-                Arc::clone(&shared.dictionary),
-                Arc::clone(&shared.statistics),
-                None,
-                Arc::clone(&shared.views.read()),
-            );
-            let path = commit_image(durable, revision, || {
-                checkpoint::write(durable.root(), &image, shared.admission.as_ref())
-            })?;
-            shared
-                .checkpoints
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            drop(image);
-            let mut base = None;
-            let next = match durable
-                .config
-                .map_checkpoints
-                .then(|| checkpoint::map_written(&path))
-            {
-                Some(Ok((dictionary, [asserted, inferred]))) => {
-                    base = Some(dictionary);
-                    Arc::new(Version {
-                        // The same statements, mapped from the checkpoint.
-                        content: next.content,
-                        asserted,
-                        inferred,
-                        equality: Arc::clone(&next.equality),
-                        revision,
-                        committed_micros: next.committed_micros,
-                        dictionary_len: next.dictionary_len,
-                        canonical: Default::default(),
-                    })
-                }
-                Some(Err(error)) => {
-                    tracing::warn!(%error, "checkpoint not mapped; data stays in memory");
-                    next
-                }
-                None => next,
-            };
-            // The checkpoint covers every logged revision: later commits go to the segment
-            // `commit_image` started, and all older segments can go.
-            let mut wal = durable.wal.lock();
-            shared.versions.install(next);
-            release_covered(&mut wal, durable.root(), revision);
-            drop(wal);
-            if let Some(base) = base
-                && let Err(error) = shared.dictionary.rebase(base)
-            {
-                tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
-            }
+    let revision = next.revision;
+    let _checkpoint = durable.checkpoint_slot.lock();
+    let image = Snapshot::new(
+        Arc::clone(&next),
+        Arc::clone(&shared.dictionary),
+        Arc::clone(&shared.statistics),
+        None,
+        Arc::clone(&shared.views.read()),
+    );
+    let mut committed_micros = None;
+    let path = commit_image(durable, revision, || {
+        checkpoint::write_stamped(
+            durable.root(),
+            &image,
+            shared.admission.as_ref(),
+            &mut || {
+                committed_micros = stamp.take();
+                committed_micros
+            },
+        )
+    })?;
+    shared
+        .checkpoints
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    drop(image);
+    let mut base = None;
+    let next = match durable
+        .config
+        .map_checkpoints
+        .then(|| checkpoint::map_written(&path))
+    {
+        Some(Ok((dictionary, [asserted, inferred]))) => {
+            base = Some(dictionary);
+            Arc::new(Version {
+                // The same statements, mapped from the checkpoint.
+                content: next.content,
+                asserted,
+                inferred,
+                equality: Arc::clone(&next.equality),
+                revision,
+                committed_micros,
+                dictionary_len: next.dictionary_len,
+                canonical: Default::default(),
+            })
         }
-        None => shared.versions.install(next),
+        Some(Err(error)) => {
+            tracing::warn!(%error, "checkpoint not mapped; data stays in memory");
+            Arc::new(next.with_time(committed_micros))
+        }
+        None => Arc::new(next.with_time(committed_micros)),
+    };
+    // The checkpoint covers every logged revision: later commits go to the segment
+    // `commit_image` started, and all older segments can go.
+    let mut wal = durable.wal.lock();
+    shared.versions.install(next);
+    release_covered(&mut wal, durable.root(), revision);
+    drop(wal);
+    if let Some(base) = base
+        && let Err(error) = shared.dictionary.rebase(base)
+    {
+        tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
     }
     Ok(())
 }
@@ -556,7 +597,7 @@ fn publish_streamed(
     mut source: Source,
     layout: Layout,
     revision: u64,
-    committed_micros: u64,
+    stamp: Stamp,
     dictionary_len: u64,
 ) -> EngineResult<u64> {
     let shared = &engine.shared;
@@ -573,25 +614,29 @@ fn publish_streamed(
             asserted,
             inferred: IndexVersion::empty(Layout::DefaultGraph),
             revision,
-            committed_micros: Some(committed_micros),
+            committed_micros: None,
             dictionary_len,
             equality: Default::default(),
             canonical: Default::default(),
         };
         let len = next.asserted.len();
-        publish(engine, Next::Built(next))?;
+        publish(engine, Next::Built(next, stamp))?;
         return Ok(len);
     };
     let _checkpoint = durable.checkpoint_slot.lock();
     let empty = PackedKeys::from_sorted(&[]);
     // Every layout has SPOG: its length is the number of quads.
     let mut len = 0;
+    let mut committed_micros = None;
     let path = commit_image(durable, revision, || {
         checkpoint::write_parts(
             durable.root(),
             shared.admission.as_ref(),
             revision,
-            Some(committed_micros),
+            &mut || {
+                committed_micros = stamp.take();
+                committed_micros
+            },
             &shared.dictionary,
             dictionary_len,
             [layout, Layout::DefaultGraph],
@@ -629,7 +674,7 @@ fn publish_streamed(
         asserted,
         inferred,
         revision,
-        committed_micros: Some(committed_micros),
+        committed_micros,
         dictionary_len,
         equality: Default::default(),
         canonical: Default::default(),
@@ -774,12 +819,18 @@ impl<'e> Rematerialisation<'e> {
             asserted: current.asserted.clone(),
             inferred: IndexVersion::from_quads(Layout::DefaultGraph, quads),
             revision: summary.revision,
-            committed_micros: Some(commit_time(current.committed_micros)),
+            // Stamped as it commits ([`publish`]).
+            committed_micros: None,
             dictionary_len: shared.dictionary.len(),
             equality: Default::default(),
             canonical: Default::default(),
         };
-        publish(engine, Next::Built(next))?;
+        // It keeps the asserted stack: of unknown time if that is.
+        let stamp = Stamp {
+            previous: current.committed_micros,
+            replaces: false,
+        };
+        publish(engine, Next::Built(next, stamp))?;
         drop(_compaction);
         tracing::info!(
             revision = summary.revision,

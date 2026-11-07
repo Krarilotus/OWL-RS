@@ -185,10 +185,11 @@ pub(crate) struct Version {
     pub(crate) asserted: IndexVersion,
     pub(crate) inferred: IndexVersion,
     pub(crate) revision: u64,
-    /// When its latest commit was made, microseconds since 1970
-    /// ([`commit_time`](crate::durability::commit_time): never before an earlier commit's);
-    /// `None` where that isn't known (recovered from a format 11 checkpoint or an untimed
-    /// log record, and not committed to since). Checkpoints keep it (format 12).
+    /// A time no commit in it was made after, microseconds since 1970: the latest of its
+    /// commits' ([`commit_time`](crate::durability::commit_time),
+    /// [`later`](crate::durability::later)); 0 for revision 0. `None` where that isn't known:
+    /// recovered from a format 11 checkpoint or an untimed log record, and kept until a bulk
+    /// replacement holds nothing from before. Checkpoints keep it (format 12).
     pub(crate) committed_micros: Option<u64>,
     /// Dictionary entries visible to this version; newer terms are hidden from lookups.
     pub(crate) dictionary_len: u64,
@@ -228,7 +229,8 @@ impl Version {
             asserted: IndexVersion::empty(Layout::DefaultGraph),
             inferred: IndexVersion::empty(Layout::DefaultGraph),
             revision: 0,
-            committed_micros: None,
+            // No commit yet: every one is after it.
+            committed_micros: Some(0),
             dictionary_len: 0,
             equality: Default::default(),
             content: Content::fresh(),
@@ -247,6 +249,21 @@ impl Version {
         match stack {
             Stack::Asserted => &mut self.asserted,
             Stack::Inferred => &mut self.inferred,
+        }
+    }
+
+    /// This version with the time `committed_micros` (a bulk publication, stamped as it
+    /// commits).
+    pub(crate) fn with_time(&self, committed_micros: Option<u64>) -> Self {
+        Self {
+            asserted: self.asserted.clone(),
+            inferred: self.inferred.clone(),
+            revision: self.revision,
+            committed_micros,
+            dictionary_len: self.dictionary_len,
+            equality: Arc::clone(&self.equality),
+            content: self.content,
+            canonical: Default::default(),
         }
     }
 

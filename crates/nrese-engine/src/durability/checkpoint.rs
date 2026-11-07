@@ -555,19 +555,31 @@ pub(crate) fn placed(dir: &Path, revision: u64) -> std::io::Result<bool> {
     checkpoint_path(dir, revision, EXTENSION).try_exists()
 }
 
-/// Writes a checkpoint of `snapshot` and returns its path; its scratch is charged within
-/// `admission` ([`write_parts`]).
+/// Writes a checkpoint of `snapshot`, of a committed revision (its version's time), and returns
+/// its path; its scratch is charged within `admission` ([`write_parts`]).
 pub(crate) fn write(
     dir: &Path,
     snapshot: &Snapshot,
     admission: Option<&Arc<SharedBudget>>,
+) -> EngineResult<PathBuf> {
+    let committed_micros = snapshot.version().committed_micros;
+    write_stamped(dir, snapshot, admission, &mut || committed_micros)
+}
+
+/// [`write`] of a revision this checkpoint commits: its time is `stamp`'s, asked for once
+/// everything else is written ([`write_parts`]).
+pub(crate) fn write_stamped(
+    dir: &Path,
+    snapshot: &Snapshot,
+    admission: Option<&Arc<SharedBudget>>,
+    stamp: &mut dyn FnMut() -> Option<u64>,
 ) -> EngineResult<PathBuf> {
     let version = snapshot.version();
     write_parts(
         dir,
         admission,
         snapshot.revision(),
-        version.committed_micros,
+        stamp,
         snapshot.dictionary(),
         snapshot.dictionary_len(),
         [version.asserted.layout(), version.inferred.layout()],
@@ -575,8 +587,11 @@ pub(crate) fn write(
     )
 }
 
-/// Writes a checkpoint of `revision`, last committed at `committed_micros` (`None`: not
-/// known), from its parts and returns its path: the dictionary's
+/// Writes a checkpoint of `revision` from its parts and returns its path. Its last commit's
+/// time (`None`: not known) is `stamp`'s, asked for once the parts are written, just before the
+/// file is synced and renamed into place: for a bulk load the checkpoint commits, and the time
+/// is then that of its commit, not of the build before it (as a transaction's is taken just
+/// before its record is synced). It holds the dictionary's
 /// entries `0..dictionary_len`, and each stack's permutations as `packed` gives them, in
 /// the order of the stack's layout (`layouts`: asserted, inferred). Each is written before the next is asked for, so a
 /// caller can build one at a time and drop it (bulk loads).
@@ -592,7 +607,7 @@ pub(crate) fn write_parts<'a>(
     dir: &Path,
     admission: Option<&Arc<SharedBudget>>,
     revision: u64,
-    committed_micros: Option<u64>,
+    stamp: &mut dyn FnMut() -> Option<u64>,
     dictionary: &Dictionary,
     dictionary_len: u64,
     layouts: [Layout; 2],
@@ -652,8 +667,12 @@ pub(crate) fn write_parts<'a>(
             write += writing.elapsed();
         }
     }
+    #[cfg(test)]
+    if let Some(at) = super::fault::CLOCK_AT_TRAILER.get() {
+        super::fault::CLOCK.set(Some(at));
+    }
     // The last commit's time (format 12), 0 where it isn't known.
-    put_u64(&mut out.buffer, committed_micros.unwrap_or(0));
+    put_u64(&mut out.buffer, stamp().unwrap_or(0));
     out.flush_buffer()?;
     let syncing = std::time::Instant::now();
     let magic = MAGIC;

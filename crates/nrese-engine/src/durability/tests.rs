@@ -260,6 +260,180 @@ fn commit_times_never_go_back() {
     assert_eq!(times, [Some(1000), Some(1000), Some(1000)]);
 }
 
+/// Opens `dir` restoring the commits made up to `until`: what it holds, or `None` if it
+/// refused.
+fn restored(dir: &std::path::Path, until: u64) -> Option<HashSet<Quad>> {
+    let restore = EngineConfig {
+        durability: DurabilityConfig {
+            recover_until_micros: Some(until),
+            ..config().durability
+        },
+        ..config()
+    };
+    Engine::open(dir, restore)
+        .ok()
+        .map(|engine| contents(&engine))
+}
+
+/// The newest checkpoint in `dir`, rewritten as format 11 (no commit time), as an earlier
+/// binary would have written it: format 12 is format 11 with the time before the checksum.
+fn as_format_11(dir: &std::path::Path) {
+    let path = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "nck"))
+        .max()
+        .unwrap();
+    let file = std::fs::read(&path).unwrap();
+    assert_eq!(&file[..8], b"NRESECKC");
+    let mut old = b"NRESECKB".to_vec();
+    old.extend_from_slice(&file[8..file.len() - 12]);
+    let crc = crc32fast::hash(&old);
+    old.extend_from_slice(&crc.to_le_bytes());
+    std::fs::write(&path, old).unwrap();
+}
+
+/// A version's time bounds every commit in it, whatever history it was recovered from
+/// (sol-loop r1 S1, S2). Rows, each a restore at 1500 that must refuse, judged apart:
+/// - a log an earlier binary wrote under a clock that stepped back (commits logged at 2000,
+///   then 1000), replayed and checkpointed: the checkpoint's commits include one at 2000;
+/// - a format 11 checkpoint (no time) of a commit made at 2000, then a commit at 1000 and a
+///   checkpoint: what it holds from before is still of unknown time.
+///
+/// And a guard: a bulk replacement after that unknown history holds nothing from it, so its
+/// checkpoint's time is known again and a restore after it opens.
+#[test]
+fn a_version_time_bounds_every_commit_in_it() {
+    let mut failures = Vec::new();
+    let mut check = |row: &str, got: Option<HashSet<Quad>>, expected: Option<HashSet<Quad>>| {
+        let ok = got == expected;
+        eprintln!("row {row}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            failures.push(format!("{row}: held {got:?}, expected {expected:?}"));
+        }
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        commit(&engine, 0).unwrap();
+        commit(&engine, 1).unwrap();
+    }
+    for (_, path) in super::wal::list_segments(&super::wal::wal_dir(dir.path())).unwrap() {
+        let file = std::fs::read(&path).unwrap();
+        let contents = super::wal::read_segment(&path).unwrap();
+        let mut bytes = file[..8].to_vec();
+        for (record, at) in contents.records.into_iter().zip([2000, 1000]) {
+            let record = super::codec::CommitRecord {
+                committed_micros: Some(at),
+                ..record
+            };
+            super::codec::encode_record(&record, &mut bytes).unwrap();
+        }
+        std::fs::write(&path, bytes).unwrap();
+    }
+    Engine::open(dir.path(), config())
+        .unwrap()
+        .checkpoint()
+        .unwrap();
+    check(
+        "a stepped-back log replayed and checkpointed",
+        restored(dir.path(), 1500),
+        None,
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        fault::CLOCK.set(Some(2000));
+        commit(&engine, 0).unwrap();
+        engine.checkpoint().unwrap();
+    }
+    as_format_11(dir.path());
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        fault::CLOCK.set(Some(1000));
+        commit(&engine, 1).unwrap();
+        engine.checkpoint().unwrap();
+    }
+    check(
+        "a commit after a format 11 checkpoint",
+        restored(dir.path(), 1500),
+        None,
+    );
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        fault::CLOCK.set(Some(3000));
+        let load = engine.bulk_load(BulkMode::Replace);
+        load.add(&[quad(7)]);
+        load.finish().unwrap();
+    }
+    fault::CLOCK.set(None);
+    check(
+        "a replacement after it (guard)",
+        restored(dir.path(), 3500),
+        Some([quad(7)].into_iter().collect()),
+    );
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A bulk publication is stamped when it commits, at its checkpoint's end, not when its
+/// version was built before the (long) write (sol-loop r1 S3). The clock reads 1000 while the
+/// load is built and 2000 once its checkpoint is written (`fault::CLOCK_AT_TRAILER`); a
+/// restore at 1500 must refuse it. Rows, judged apart: an append (built in memory), a
+/// replacement (streamed into the checkpoint) and a rematerialisation.
+#[test]
+fn a_bulk_publication_is_stamped_when_it_commits() {
+    type Publish = fn(&Engine);
+    let rows: [(&str, Publish); 3] = [
+        ("an append", |engine| {
+            let load = engine.bulk_load(BulkMode::Append);
+            load.add(&[quad(10)]);
+            load.finish().unwrap();
+        }),
+        ("a replacement", |engine| {
+            let load = engine.bulk_load(BulkMode::Replace);
+            load.add(&[quad(10)]);
+            load.finish().unwrap();
+        }),
+        ("a rematerialisation", |engine| {
+            let rematerialisation = engine.rematerialisation();
+            let id = |n: &str| {
+                rematerialisation.intern(nrese_rdf::TermRef::NamedNode(
+                    NamedNode::new_unchecked(format!("http://example.com/{n}")).as_ref(),
+                ))
+            };
+            let inferred = vec![crate::EncodedTriple {
+                subject: id("s0"),
+                predicate: id("q"),
+                object: id("o0"),
+            }];
+            rematerialisation.finish(inferred).unwrap();
+        }),
+    ];
+    let mut failures = Vec::new();
+    for (row, publish) in rows {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = Engine::open(dir.path(), config()).unwrap();
+            fault::CLOCK.set(Some(500));
+            commit(&engine, 0).unwrap();
+            fault::CLOCK.set(Some(1000));
+            fault::CLOCK_AT_TRAILER.set(Some(2000));
+            publish(&engine);
+            fault::CLOCK_AT_TRAILER.set(None);
+            fault::CLOCK.set(None);
+        }
+        let got = restored(dir.path(), 1500);
+        let ok = got.is_none();
+        eprintln!("row {row}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            failures.push(format!("{row}: held {got:?}, expected a refusal"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 /// The bytes a torn tail's cut removes are kept under a durable name before the cut (sol-loop
 /// r2 S3): an open whose `wal-cut/` can't be synced after the copy is placed fails, the log
 /// uncut; so does the next open while that sync still fails, though it finds the copy
