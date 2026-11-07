@@ -217,6 +217,12 @@ pub(crate) struct Version {
     pub(crate) asserted: IndexVersion,
     pub(crate) inferred: IndexVersion,
     pub(crate) revision: u64,
+    /// A time no commit in it was made after, microseconds since 1970: the latest of its
+    /// commits' ([`commit_time`](crate::durability::commit_time),
+    /// [`later`](crate::durability::later)); 0 for revision 0. `None` where that isn't known:
+    /// recovered from a format 11 checkpoint or an untimed log record, and kept until a bulk
+    /// replacement holds nothing from before. Checkpoints keep it (format 12).
+    pub(crate) committed_micros: Option<u64>,
     /// Dictionary entries visible to this version; newer terms are hidden from lookups.
     pub(crate) dictionary_len: u64,
     /// Its `owl:sameAs` classes, once a read needs them ([`equality`]).
@@ -255,6 +261,8 @@ impl Version {
             asserted: IndexVersion::empty(Layout::DefaultGraph),
             inferred: IndexVersion::empty(Layout::DefaultGraph),
             revision: 0,
+            // No commit yet: every one is after it.
+            committed_micros: Some(0),
             dictionary_len: 0,
             equality: Default::default(),
             content: Content::fresh(),
@@ -276,11 +284,27 @@ impl Version {
         }
     }
 
+    /// This version with the time `committed_micros` (a bulk publication, stamped as it
+    /// commits).
+    pub(crate) fn with_time(&self, committed_micros: Option<u64>) -> Self {
+        Self {
+            asserted: self.asserted.clone(),
+            inferred: self.inferred.clone(),
+            revision: self.revision,
+            committed_micros,
+            dictionary_len: self.dictionary_len,
+            equality: Arc::clone(&self.equality),
+            content: self.content,
+            canonical: Default::default(),
+        }
+    }
+
     fn with_stack(&self, stack: Stack, index: IndexVersion) -> Self {
         let mut next = Self {
             asserted: self.asserted.clone(),
             inferred: self.inferred.clone(),
             revision: self.revision,
+            committed_micros: self.committed_micros,
             dictionary_len: self.dictionary_len,
             equality: Arc::clone(&self.equality),
             // Only compaction replaces a stack this way: the same statements.
@@ -467,9 +491,22 @@ struct Shared {
     views: RwLock<Arc<nrese_exec::Budget>>,
     /// The checkpoints' scratch is charged within it ([`EngineConfig::admission`]).
     admission: Option<Arc<nrese_exec::SharedBudget>>,
+    /// The store's commit clock, microseconds since 1970: the latest time a commit of it was
+    /// stamped or logged with, so no commit is stamped before it
+    /// ([`crate::durability::commit_time`]). Apart from a version's time, which is unknown
+    /// while it holds commits of unknown time: the clock stays known through them (review r1,
+    /// R1-F2). Recovered from the checkpoint and the log; changed by writers only.
+    clock: AtomicU64,
 }
 
 impl Shared {
+    /// A stamp for a new commit: never before the store's clock, which takes it.
+    fn stamp(&self) -> u64 {
+        let stamp = crate::durability::commit_time(Some(self.clock.load(Ordering::Relaxed)));
+        self.clock.fetch_max(stamp, Ordering::Relaxed);
+        stamp
+    }
+
     fn snapshot(&self) -> Snapshot {
         Snapshot::new(
             self.versions.load(),
@@ -490,9 +527,11 @@ impl Shared {
         };
         let (snapshot, path) = {
             let _slot = admit(&durable.checkpoint_slot, "checkpoint")?;
-            let snapshot = {
+            let (snapshot, clock) = {
                 let mut wal = durable.wal.lock();
+                // Commits publish under the log's lock: the clock is that of the snapshot.
                 let snapshot = self.snapshot();
+                let clock = self.clock.load(Ordering::Relaxed);
                 if checkpoint::exists(durable.root(), snapshot.revision()) {
                     // Nothing was committed since (and the file may be in use, mapped);
                     // searches since may have extended the derived indexes.
@@ -501,9 +540,10 @@ impl Shared {
                     return Ok(snapshot.revision());
                 }
                 wal.rotate(snapshot.revision() + 1)?;
-                snapshot
+                (snapshot, clock)
             };
-            let path = checkpoint::write(durable.root(), &snapshot, self.admission.as_ref())?;
+            let path =
+                checkpoint::write(durable.root(), &snapshot, clock, self.admission.as_ref())?;
             self.checkpoints.fetch_add(1, Ordering::Relaxed);
             durable.wal.lock().release_through(snapshot.revision())?;
             (snapshot, path)
@@ -550,6 +590,7 @@ impl Shared {
                     asserted: index(Stack::Asserted, &asserted),
                     inferred: index(Stack::Inferred, &inferred),
                     revision: current.revision,
+                    committed_micros: current.committed_micros,
                     dictionary_len: current.dictionary_len,
                     equality: Arc::clone(&current.equality),
                     content: current.content,
@@ -842,7 +883,7 @@ impl std::fmt::Debug for Engine {
 impl Engine {
     /// An in-memory engine.
     pub fn new(config: EngineConfig) -> EngineResult<Self> {
-        Self::build(config, Arc::default(), None, Version::empty())
+        Self::build(config, Arc::default(), None, Version::empty(), 0)
     }
 
     /// Opens (or creates) a durable engine in `dir`, recovering its last committed revision.
@@ -865,17 +906,25 @@ impl Engine {
             inferred = version.inferred.len(),
             "engine recovered"
         );
-        let engine = Self::build(config, dictionary, Some(recovered.durable), version)?;
+        let engine = Self::build(
+            config,
+            dictionary,
+            Some(recovered.durable),
+            version,
+            recovered.clock,
+        )?;
         engine.inner.shared.statistics.set_dir(derived);
         Ok(engine)
     }
 
-    /// `version.dictionary_len` is replaced by the dictionary's actual length.
+    /// `version.dictionary_len` is replaced by the dictionary's actual length; `clock` is
+    /// the store's commit clock ([`Shared::clock`]).
     fn build(
         config: EngineConfig,
         dictionary: Arc<Dictionary>,
         durable: Option<Durable>,
         version: Version,
+        clock: u64,
     ) -> EngineResult<Self> {
         let version = Version {
             dictionary_len: dictionary.len(),
@@ -900,6 +949,7 @@ impl Engine {
             equality: RwLock::new(None),
             views: RwLock::new(Arc::new(nrese_exec::Budget::unlimited())),
             admission: config.admission,
+            clock: AtomicU64::new(clock),
         });
         let worker = config
             .background_maintenance
@@ -1061,7 +1111,11 @@ impl Engine {
     pub fn write_image(&self, dir: &std::path::Path) -> EngineResult<ImageInfo> {
         let shared = &self.inner.shared;
         let snapshot = shared.snapshot();
-        let path = crate::durability::checkpoint::write(dir, &snapshot, shared.admission.as_ref())?;
+        // Read after the snapshot: no commit in it is later (one after it may be, which only
+        // keeps the clock higher, as it must stay).
+        let clock = shared.clock.load(Ordering::Relaxed);
+        let path =
+            crate::durability::checkpoint::write(dir, &snapshot, clock, shared.admission.as_ref())?;
         let version = snapshot.version();
         Ok(ImageInfo {
             path,
