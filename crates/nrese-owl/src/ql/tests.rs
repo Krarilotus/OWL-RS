@@ -586,3 +586,105 @@ fn a_query_has_one_work_budget_for_its_patterns() {
         Outcome::Exceeded("the query's work")
     );
 }
+
+/// `?s :p ?o0 . … ?s :p ?o{n-1}` with every object existential, as constants and variables
+/// of `table`.
+fn flat(table: &mut Table, n: u32) -> Cq {
+    let p = table.id("http://e/p".to_owned());
+    Cq {
+        atoms: (1..=n)
+            .map(|o| Atom::Role(QTerm::Var(0), p, QTerm::Var(o)))
+            .collect(),
+        vars: n + 1,
+        existential: (0..=n).map(|v| v > 0).collect(),
+    }
+}
+
+/// Review A-1206: with no step left a pattern reads nothing, so the bound it reports is
+/// the query's work, not one that reading it would reach: here 5,000 existential objects,
+/// each a candidate interior, past `Limits::candidates`.
+#[test]
+fn a_pattern_with_no_work_left_reads_nothing() {
+    let (tbox, mut table) = tbox("SubClassOf(:A ObjectSomeValuesFrom(:p owl:Thing))", true);
+    let query = flat(&mut table, 5_000);
+    let none = &mut |_: &Probe<'_>| false;
+    let limits = Limits::default();
+    let no_work = Limits { work: 0, ..limits };
+    // Both rows, each reported: the query's budget spent, and a pattern bound of none.
+    let rows = [
+        (
+            "query budget 0",
+            rewrite_with(&tbox, &query, &limits, &Budget::new(0), none),
+            Outcome::Exceeded("the query's work"),
+        ),
+        (
+            "Limits::work 0",
+            rewrite(&tbox, &query, &no_work),
+            Outcome::Exceeded("work"),
+        ),
+    ];
+    let wrong: Vec<String> = rows
+        .iter()
+        .filter(|(_, got, want)| got != want)
+        .map(|(row, got, want)| format!("{row}: {got:?}, not {want:?}"))
+        .collect();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Review A-1206: an atom the rewriting doesn't read keeps its variables out of every tree
+/// witness (`Atom::Other`), so they are no candidate interiors. Fourteen of them in one such
+/// atom make 2¹⁴ − 1 connected sets, past `Limits::candidates`; beside it, `p(?x ?y)` still
+/// gets its witness.
+#[test]
+fn variables_of_an_atom_the_rewriting_doesnt_read_are_no_candidates() {
+    let (tbox, mut table) = tbox("SubClassOf(:A ObjectSomeValuesFrom(:p owl:Thing))", true);
+    let p = table.id("http://e/p".to_owned());
+    let query = Cq {
+        atoms: vec![
+            Atom::Role(QTerm::Var(0), p, QTerm::Var(1)),
+            Atom::Other(0, (2..16).collect()),
+        ],
+        vars: 16,
+        existential: (0..16).map(|v| v > 0).collect(),
+    };
+    let Outcome::Rewritten(r) = rewrite(&tbox, &query, &Limits::default()) else {
+        panic!(
+            "not rewritten: {:?}",
+            rewrite(&tbox, &query, &Limits::default())
+        );
+    };
+    assert_eq!(r.witnesses, 1);
+}
+
+/// Review A-1206: a class atom's alternatives come from a walk of the hierarchy below the
+/// class, and the walk is paid for: each of `k` gap inclusions `C{i+1} ⊑ C{i} ⊓ X` (no list
+/// rules) below `C0` costs the pattern a step at least. A second run, with the walk's result
+/// memoised, takes the same steps.
+#[test]
+fn class_alternatives_are_paid_for_alike_cold_and_warm() {
+    let used = |k: usize| {
+        let axioms: Vec<String> = (0..k)
+            .map(|i| format!("SubClassOf(:C{} ObjectIntersectionOf(:C{i} :X))", i + 1))
+            .collect();
+        let (tbox, mut table) = tbox(&axioms.join("\n"), false);
+        let (query, _) = cq(&mut table, "C0(?x)", &[]);
+        let limits = Limits::default();
+        let none = &mut |_: &Probe<'_>| false;
+        let mut steps = Vec::new();
+        for _ in 0..2 {
+            let budget = Budget::new(limits.query_work);
+            let Outcome::Rewritten(r) = rewrite_with(&tbox, &query, &limits, &budget, none) else {
+                panic!("not rewritten");
+            };
+            assert_eq!(r.size(), k + 1);
+            steps.push(limits.query_work - budget.left());
+        }
+        assert_eq!(steps[0], steps[1], "cold and warm differ (k = {k})");
+        steps[0]
+    };
+    let (short, long) = (used(10), used(40));
+    assert!(
+        long >= short + 30,
+        "{short} steps for 10 classes, {long} for 40"
+    );
+}

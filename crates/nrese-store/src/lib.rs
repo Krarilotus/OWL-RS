@@ -82,7 +82,7 @@ pub use nrese_engine::cpu;
 /// the allocator.
 pub use nrese_engine::memory::set_release as set_memory_release;
 pub use nrese_engine::{
-    Applied, EngineError, IndexEncoding, LogExpectation, ReadModel, VocabularyEncoding,
+    Applied, EngineError, IndexEncoding, LogExpectation, ReadModel, VocabularyEncoding, WalDamage,
 };
 pub use nrese_shacl::{ValidationReport, ValidationResult};
 pub use nrese_sparql::{

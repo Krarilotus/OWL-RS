@@ -3,11 +3,12 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::OnceLock;
 
 use nrese_engine::{TermId, TermKind};
 use nrese_rdf::Term;
-use nrese_sparql::ReadView;
 use nrese_sparql::value::{Value, compare, lang_matches};
+use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 
 use crate::datatype::well_formed;
 use crate::graph::{GraphView, Selection};
@@ -37,13 +38,16 @@ pub(crate) struct RawResult {
 
 /// Validates the data in `data` against every targeted shape: the results, and the
 /// failures (SPARQL-based constraints that couldn't be evaluated). Focus nodes are
-/// validated in parallel; the results keep the sequential order.
+/// validated in parallel; the results keep the sequential order. A stop of `resources` is
+/// the outcome instead ([`Validator::into_failures`]).
 pub(crate) fn validate_raw<V: ReadView + Sync>(
     view: &V,
     shapes: &Shapes,
     data: Selection,
-) -> (Vec<RawResult>, Vec<String>) {
-    let validator = Validator::new(view, shapes, data);
+    resources: &Resources,
+) -> Result<(Vec<RawResult>, Vec<String>), QueryEvaluationError> {
+    resources.check()?;
+    let validator = Validator::new(view, shapes, data, resources);
     let work: Vec<(ShapeRef, TermId)> = shapes
         .targeted()
         .flat_map(|shape| {
@@ -54,14 +58,17 @@ pub(crate) fn validate_raw<V: ReadView + Sync>(
         })
         .collect();
     let results = validator.validate_all(&work);
-    (results, validator.into_failures())
+    let failures = validator.into_failures()?;
+    Ok((results, failures))
 }
 
 /// Whether validating `data` against `shapes` checks anything: an active targeted shape
 /// with at least one focus node and at least one constraint, its own or reached through
 /// nested shapes. A conforming report with nothing applicable is a vacuous pass.
 pub(crate) fn applicable<V: ReadView + Sync>(view: &V, shapes: &Shapes, data: Selection) -> bool {
-    let validator = Validator::new(view, shapes, data);
+    // Only targets are read: no constraint runs, so nothing that resources stop.
+    let resources = Resources::default();
+    let validator = Validator::new(view, shapes, data, &resources);
     shapes.targeted().any(|shape| {
         constrained(shapes, shape, &mut Vec::new())
             && !validator.focus_nodes(&shapes.shapes[shape]).is_empty()
@@ -93,6 +100,12 @@ fn constrained(shapes: &Shapes, shape: ShapeRef, seen: &mut Vec<ShapeRef>) -> bo
 pub(crate) struct Validator<'a, V: ReadView> {
     graph: GraphView<'a, V>,
     shapes: &'a Shapes,
+    /// What the validation runs on, its SHACL-SPARQL queries included.
+    resources: &'a Resources,
+    /// The first stop met: the cancellation fired, or the envelope refused a query's
+    /// charge. From then on work returns without results, and the stop is the validation's
+    /// outcome, whatever the work returned.
+    stop: OnceLock<QueryEvaluationError>,
     failures: std::sync::Mutex<Vec<String>>,
     rdf_type: Option<TermId>,
     /// Each class the shapes name, with its subclasses (itself included).
@@ -110,12 +123,19 @@ fn is_literal(id: TermId) -> bool {
 }
 
 impl<'a, V: ReadView> Validator<'a, V> {
-    pub(crate) fn new(view: &'a V, shapes: &'a Shapes, data: Selection) -> Self {
+    pub(crate) fn new(
+        view: &'a V,
+        shapes: &'a Shapes,
+        data: Selection,
+        resources: &'a Resources,
+    ) -> Self {
         let graph = GraphView::new(view, data);
         let mut validator = Self {
             rdf_type: graph.iri(RDF_TYPE),
             graph,
             shapes,
+            resources,
+            stop: OnceLock::new(),
             failures: std::sync::Mutex::default(),
             classes: HashMap::new(),
         };
@@ -142,11 +162,31 @@ impl<'a, V: ReadView> Validator<'a, V> {
         validator
     }
 
-    /// The failures recorded while validating.
-    pub(crate) fn into_failures(self) -> Vec<String> {
-        self.failures
+    /// The failures recorded while validating, or the stop that ended it: then no result
+    /// it produced may be used.
+    pub(crate) fn into_failures(self) -> Result<Vec<String>, QueryEvaluationError> {
+        if let Some(stop) = self.stop.into_inner() {
+            return Err(stop);
+        }
+        Ok(self
+            .failures
             .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
+    /// Whether the validation has stopped: a stop was met, or the cancellation fires now
+    /// (recorded as the stop).
+    pub(crate) fn stopped(&self) -> bool {
+        if self.stop.get().is_some() {
+            return true;
+        }
+        match self.resources.check() {
+            Ok(()) => false,
+            Err(stop) => {
+                let _ = self.stop.set(stop);
+                true
+            }
+        }
     }
 
     /// The results of validating each `(shape, focus node)` of `work`, in that order: in
@@ -215,6 +255,11 @@ impl<'a, V: ReadView> Validator<'a, V> {
         results: &mut Vec<RawResult>,
         stack: &mut Stack,
     ) {
+        // Every validation of a node against a shape, nested ones included, looks at the
+        // stop first: the work after one is bounded by one call's.
+        if self.stopped() {
+            return;
+        }
         let shape = &self.shapes.shapes[shape_ref];
         // Recursive shapes are undefined in SHACL: a node already being validated against
         // the shape is taken to conform.
@@ -497,7 +542,8 @@ impl<'a, V: ReadView> Validator<'a, V> {
         }
     }
 
-    /// A SHACL-SPARQL check for `focus` ([`sparql`]): its results, or a failure.
+    /// A SHACL-SPARQL check for `focus` ([`sparql`]): its results, or a failure, or the
+    /// validation's stop.
     fn sparql(
         &self,
         shape_ref: ShapeRef,
@@ -535,9 +581,13 @@ impl<'a, V: ReadView> Validator<'a, V> {
             values,
             shape.node,
             self.shapes.graph,
+            self.resources,
         );
         match outcome {
-            Err(error) => failure(&error),
+            Err(sparql::Problem::Stopped(stop)) => {
+                let _ = self.stop.set(stop);
+            }
+            Err(sparql::Problem::Failed(error)) => failure(&error),
             Ok(sparql::Outcome::Failed(failed)) => {
                 for value in failed {
                     results.push(raw(Some(value), shape.path.clone()));

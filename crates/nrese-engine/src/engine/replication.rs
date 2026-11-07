@@ -15,11 +15,10 @@
 //!
 //! Inferred statements come with the records: a replica doesn't reason.
 
-use super::{Engine, Version};
+use super::Engine;
 use crate::durability::codec::{CommitRecord, Frame, decode_frame, encode_record};
 use crate::durability::wal;
 use crate::error::{EngineError, EngineResult};
-use crate::index::Layout;
 
 /// How often [`open_segments`] lists the segments again when one moved (archived) or went
 /// (released) between listing and opening.
@@ -187,13 +186,16 @@ impl Engine {
     /// meanwhile) and the records are published one by one. `stop` is checked before each:
     /// once it stops, no further record is published ([`Applied::stopped`]). A local
     /// failure on a record (the log's write) leaves the records before it published.
+    ///
+    /// On a Rayon pool thread while the writer slot is held: [`EngineError::SlotBusy`]
+    /// (the contract of [`Engine::transaction`]).
     pub fn apply_log(
         &self,
         frames: &[u8],
         expected: &LogExpectation,
         stop: &nrese_exec::stop::StopSource,
     ) -> EngineResult<Applied> {
-        let _slot = self.inner.writer.lock();
+        let _slot = super::admit(&self.inner.writer, "writer")?;
         let shared = &self.inner.shared;
         let records = self.checked_batch(frames, expected)?;
         let keys: Vec<&[u8]> = records
@@ -310,20 +312,10 @@ impl Engine {
         Ok(records)
     }
 
-    /// One record as a commit, its dictionary entries restored and the dictionary
+    /// One record as a commit, its dictionary entries already restored and the dictionary
     /// published at `dictionary_len` entries (the writer slot held).
     fn apply_record(&self, record: &CommitRecord, dictionary_len: u64) -> EngineResult<()> {
         let shared = &self.inner.shared;
-        let latest = shared.versions.load();
-        let converting = latest.asserted.layout() == Layout::DefaultGraph && record.names_a_graph();
-        let _compaction = converting.then(|| shared.versions.compaction_slot.lock());
-        let converted = converting.then(|| shared.versions.load().asserted.with_quads_layout());
-        let asserted_layout = converted
-            .as_ref()
-            .map_or(latest.asserted.layout(), |index| index.layout());
-        drop(latest);
-        let [asserted_run, inferred_run] = record.runs(asserted_layout);
-        let revision = record.revision;
         // Equality classes are found again where `sameAs` statements changed.
         let same_as = *shared.equality.read();
         let changes_equality = same_as.is_some_and(|same_as| {
@@ -338,36 +330,8 @@ impl Engine {
                     .chain(&record.inferred_deletes)
                     .any(|t| t.predicate == same_as)
         });
-        let publish = move |current: &Version| {
-            let asserted = converted.as_ref().unwrap_or(&current.asserted);
-            Version {
-                content: super::Content::fresh(),
-                asserted: asserted.with_run(asserted_run),
-                inferred: current.inferred.with_run(inferred_run),
-                revision,
-                dictionary_len,
-                equality: match changes_equality {
-                    true => Default::default(),
-                    false => std::sync::Arc::clone(&current.equality),
-                },
-                canonical: Default::default(),
-            }
-        };
-        let wal_bytes = match &shared.durable {
-            Some(durable) => {
-                let mut wal = durable.wal.lock();
-                wal.append(record)?;
-                shared.versions.publish(publish);
-                wal.bytes_since_checkpoint()
-            }
-            None => {
-                shared.versions.publish(publish);
-                0
-            }
-        };
-        drop(_compaction);
-        self.inner.after_commit(wal_bytes);
-        Ok(())
+        self.inner
+            .publish_record(record, dictionary_len, changes_equality)
     }
 }
 

@@ -7,10 +7,11 @@ use super::env_names as names;
 use super::env_values::parse_bool;
 use super::source::ConfigSource;
 
-pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfig> {
+pub(super) fn parse_store_config(
+    source: &dyn ConfigSource,
+    machine: nrese_exec::memory::Reading,
+) -> Result<StoreConfig> {
     let defaults = StoreConfig::default();
-    // The memory the shares (`50%`) are of, read once.
-    let machine = super::units::machine_memory_bytes();
     let equality = parse_equality(source.get(names::REASONING_EQUALITY).as_deref())?;
     Ok(StoreConfig {
         mode: parse_store_mode(source.get(names::STORE_MODE).as_deref())?,
@@ -95,6 +96,11 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             None => defaults.checkpoint_after_wal_bytes,
         },
         wal_archive: parse_bool(source, names::WAL_ARCHIVE, defaults.wal_archive)?,
+        wal_damage: match choice(source, names::WAL_DAMAGE, &["refuse", "keep-prefix"])? {
+            None => defaults.wal_damage,
+            Some(0) => nrese_store::WalDamage::Refuse,
+            Some(_) => nrese_store::WalDamage::KeepPrefix,
+        },
         index_encoding: match source.get(names::INDEX_ENCODING) {
             None => defaults.index_encoding,
             Some(name) => {
@@ -428,7 +434,9 @@ mod tests {
             if let Some(value) = value {
                 source.insert(names::REASONING_SUPPORT_SETS, value);
             }
-            parse_store_config(&source).unwrap().support_sets
+            parse_store_config(&source, Ok(16 << 30))
+                .unwrap()
+                .support_sets
         };
         assert_eq!(cap(None), 16);
         assert_eq!(cap(Some("4")), 4);

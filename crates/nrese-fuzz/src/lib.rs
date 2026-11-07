@@ -21,6 +21,7 @@ use nrese_rdf::Quad;
 use nrese_rdf_io::{RdfFormat, RdfParser, RdfSerializer};
 use nrese_sparql_results::{
     QueryResultsFormat, QueryResultsParser, QueryResultsSerializer, SliceQueryResultsParserOutput,
+    XmlUnrepresentable,
 };
 use nrese_sparql_syntax::{DEFAULT_MAX_NESTING, SparqlParser};
 
@@ -235,7 +236,17 @@ fn results(format: QueryResultsFormat, data: &[u8]) {
                 .expect("in memory");
             for row in rows {
                 let row: Vec<_> = row.iter().map(|v| v.as_ref().map(Into::into)).collect();
-                writer.serialize_row(&row).expect("in memory");
+                if let Err(error) = writer.serialize_row(&row) {
+                    // A value read can hold a character XML 1.0 can't (`&#1;`): the writer
+                    // refuses it, as it should; any other error is one.
+                    if error
+                        .get_ref()
+                        .is_some_and(|e| e.is::<XmlUnrepresentable>())
+                    {
+                        return;
+                    }
+                    panic!("{format:?}: writing a row failed: {error}");
+                }
             }
             writer.finish().expect("in memory")
         }
