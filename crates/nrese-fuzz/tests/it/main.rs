@@ -62,6 +62,8 @@ fn seeds(target: Target) -> Vec<&'static [u8]> {
         ],
         Target::ResultsXml => vec![
             b"<?xml version=\"1.0\"?><sparql xmlns=\"http://www.w3.org/2005/sparql-results#\"><head><variable name=\"x\"/></head><results><result><binding name=\"x\"><literal xml:lang=\"en\">a</literal></binding></result></results></sparql>",
+            // A value XML 1.0 can't hold: read, then refused when written back.
+            b"<sparql xmlns=\"http://www.w3.org/2005/sparql-results#\"><head><variable name=\"x\"/></head><results><result><binding name=\"x\"><literal>&#1;</literal></binding></result></results></sparql>",
         ],
         Target::ResultsTsv => vec![
             b"?x\t?y\n<http://a/>\t\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>\n_:b\t\n",

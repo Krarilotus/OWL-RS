@@ -192,6 +192,11 @@ api_key = "replace-me"
 - default: `false`
 - on disk, keep the WAL segments that checkpoints cover in `wal-archive/` of the data directory instead of deleting them. With an image backup they restore the store to any later revision (`nrese-server restore DIR --wal ARCHIVE --wal DATA/wal --until-revision N`). The archive grows until pruned (`nrese-server prune-archive R`, with `R` the oldest image backup's revision plus one). Sync it to another machine for recovery from a lost disk
 
+- file key: `store.wal_damage`
+- env override: `NRESE_WAL_DAMAGE`
+- default: `refuse`
+- on disk, what opening does with damage in the newest write-ahead log segment. What a crash during a commit leaves (one incomplete last record, or zeros to the end of the file, with no intact record after it) is always cut: that commit was never acknowledged. Its bytes are kept in `wal-cut/` of the data directory, and a warning is logged. Any other damage (a complete record failing its checksum, or damage with intact records after it) may hold acknowledged commits. `refuse` doesn't open the store and leaves the log as it is, so an operator can back the directory up and decide. `keep-prefix` opens with the log up to the damage, copies the rest to `wal-cut/` first and logs the cut as an error: commits acknowledged after the damage are then only in that copy. Neither costs anything on healthy commits; the choice is downtime after a damaged crash against losing acknowledged commits without anyone's word. Damage in an older segment always refuses to open
+
 - file key: `store.index_encoding`
 - env override: `NRESE_INDEX_ENCODING`
 - default: `fast`
