@@ -14,5 +14,9 @@ nrese-rdf = { path = "../nrese-rdf", default-features = false }
 quick-xml = { workspace = true }
 thiserror.workspace = true
 
+[dev-dependencies]
+# The heap counts of tests/results_first_memory.rs.
+nrese-exec = { path = "../../nrese-exec" }
+
 [lints]
 workspace = true
