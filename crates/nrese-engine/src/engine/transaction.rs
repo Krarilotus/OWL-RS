@@ -518,11 +518,17 @@ impl<'e> Transaction<'e> {
             deletes: asserted.deletes.into_iter().collect(),
             inferred_inserts: triples(inferred.inserts),
             inferred_deletes: triples(inferred.deletes),
-            committed_micros: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |since| since.as_micros() as u64),
-            ),
+            committed_micros: Some({
+                #[cfg(test)]
+                let clock = crate::durability::fault::CLOCK.get();
+                #[cfg(not(test))]
+                let clock = None;
+                clock.unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |since| since.as_micros() as u64)
+                })
+            }),
         };
         // The first quad in a named graph turns a default-graph asserted stack into a quad
         // stack. No compaction or checkpoint may replace its runs meanwhile: the writer slot

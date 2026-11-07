@@ -153,6 +153,111 @@ fn a_rotation_that_fails_before_its_segment_is_placed_leaves_the_log_usable() {
     assert_eq!(contents(&engine), [quad(1), quad(2)].into_iter().collect());
 }
 
+/// One time-restore row: commits of `quad(0)`, `quad(1)`, … made at the clock times given, a
+/// checkpoint after the first `checkpointed` of them (0: none), then an open restoring the
+/// commits made up to `until`. What the restored store holds, or `None` if the open refused.
+fn time_restore(times: &[u64], checkpointed: usize, until: u64) -> Option<HashSet<Quad>> {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        for (n, &at) in times.iter().enumerate() {
+            fault::CLOCK.set(Some(at));
+            commit(&engine, n as u64).unwrap();
+            if n + 1 == checkpointed {
+                engine.checkpoint().unwrap();
+            }
+        }
+        fault::CLOCK.set(None);
+    }
+    let restore = EngineConfig {
+        durability: DurabilityConfig {
+            recover_until_micros: Some(until),
+            ..config().durability
+        },
+        ..config()
+    };
+    Engine::open(dir.path(), restore)
+        .ok()
+        .map(|engine| contents(&engine))
+}
+
+/// A time restore never serves a commit made after its time (EEV-06): it holds exactly the
+/// commits made up to it, or refuses. Before the fix, a checkpoint made after the time was
+/// used whole: its commits after the time came back. Rows:
+/// - an image after the time, the log empty: must refuse (it can't hold less);
+/// - a clock stepped back before the image (commits at 1000, then 500): the second commit
+///   was made after the first, so the image is after 750 too, though its own clock said
+///   500; commit times never going back makes it refuse;
+/// - guards (right on the base too): an image before the time with the log across it, and
+///   an image whose last commit is at the time exactly, both restore what was made by then.
+/// Each row is judged on its own.
+#[test]
+fn a_time_restore_never_serves_commits_made_after_its_time() {
+    let held = |n: u64| (0..n).map(quad).collect::<HashSet<_>>();
+    // (row, times, checkpointed after, until, what it may hold: None = refuse only)
+    let rows: [(&str, &[u64], usize, u64, Option<HashSet<Quad>>); 4] = [
+        ("an image after the time", &[1000, 2000], 2, 1500, None),
+        (
+            "a clock stepped back before the image",
+            &[1000, 500],
+            2,
+            750,
+            None,
+        ),
+        (
+            "an image before the time, the log across it (guard)",
+            &[1000, 2000, 3000],
+            1,
+            2500,
+            Some(held(2)),
+        ),
+        (
+            "an image at the time exactly (guard)",
+            &[1000, 2000],
+            2,
+            2000,
+            Some(held(2)),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (row, times, checkpointed, until, expected) in rows {
+        let restored = time_restore(times, checkpointed, until);
+        let ok = restored == expected;
+        eprintln!("row {row}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            failures.push(format!("{row}: held {restored:?}, expected {expected:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A store's commit times never go back and are never 0 (a checkpoint's "unknown"), whatever
+/// the clock does: commits under a clock reading 1000, then 500, then 0 (before 1970) are
+/// logged at 1000, 1000 and 1000. Before the fix they were logged at the clock's times.
+#[test]
+fn commit_times_never_go_back() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        for (n, at) in [1000, 500, 0].into_iter().enumerate() {
+            fault::CLOCK.set(Some(at));
+            commit(&engine, n as u64).unwrap();
+        }
+        fault::CLOCK.set(None);
+    }
+    let mut times = Vec::new();
+    for (_, path) in super::wal::list_segments(&super::wal::wal_dir(dir.path())).unwrap() {
+        let contents = super::wal::read_segment(&path).unwrap();
+        times.extend(
+            contents
+                .records
+                .iter()
+                .map(|record| record.committed_micros),
+        );
+    }
+    assert_eq!(times, [Some(1000), Some(1000), Some(1000)]);
+}
+
 /// The bytes a torn tail's cut removes are kept under a durable name before the cut (sol-loop
 /// r2 S3): an open whose `wal-cut/` can't be synced after the copy is placed fails, the log
 /// uncut; so does the next open while that sync still fails, though it finds the copy
