@@ -568,6 +568,14 @@ mod tests {
         keyless.truncate(1);
         keyless[0].keys.clear();
         keyless[0].dictionary_start += 1;
+        // Fix check r2 R2-F1: a range whose end is past u64 (start u64::MAX, one key), then a
+        // keyless record starting at 0.
+        let mut past_u64 = decoded(&batch.frames);
+        past_u64.truncate(2);
+        past_u64[0].dictionary_start = u64::MAX;
+        past_u64[0].keys.truncate(1);
+        past_u64[1].dictionary_start = 0;
+        past_u64[1].keys.clear();
         let mut invalid_suffix = encoded(&all[..1]);
         invalid_suffix.extend_from_slice(b"not a record at all");
         let later = super::LogExpectation {
@@ -575,7 +583,12 @@ mod tests {
             records: 2,
             last: 4,
         };
-        let rows: [(&str, Vec<u8>, super::LogExpectation); 6] = [
+        let rows: [(&str, Vec<u8>, super::LogExpectation); 7] = [
+            (
+                "a dictionary range ending past u64",
+                encoded(&past_u64),
+                expect(2, 3),
+            ),
             (
                 "a keyless record past the dictionary's end",
                 encoded(&keyless),
@@ -614,7 +627,11 @@ mod tests {
             copy_dir(image.path(), &dir);
             let replica = Engine::open(&dir, durable()).unwrap();
             let before = (replica.stats().revision, replica.stats().dictionary.terms);
-            let result = replica.apply_log(&frames, &expected, &stop);
+            // A panic is this row's failure, not the whole table's.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                replica.apply_log(&frames, &expected, &stop)
+            }))
+            .unwrap_or_else(|_| Err(EngineError::Configuration("panicked".to_owned())));
             if !matches!(result, Err(EngineError::Corruption(_))) {
                 wrong.push(format!("{row}: {result:?}"));
             }
@@ -722,5 +739,58 @@ mod tests {
             .unwrap();
         let expected = terms_after_reopen(&clean_dir, clean);
         assert_eq!(held, expected);
+    }
+
+    /// An answer whose revisions run past u64 is refused, not added up (SYN-69 r3 sol-loop
+    /// N1): a replica at revision u64::MAX - 1 (as a restored image can be; here its
+    /// published revision is raised in memory) given records at revisions u64::MAX and 0,
+    /// `last` 0. Refused as corruption with the replica as it was; nothing reaches its log
+    /// (the reopened replica is at its logged revision, its dictionary unchanged).
+    #[test]
+    fn an_answer_whose_revisions_run_past_u64_is_refused() {
+        let (primary, image) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let batch = primary_and_image(primary.path(), image.path());
+        let replica = Engine::open(image.path(), durable()).unwrap();
+        let logged = (replica.stats().revision, replica.stats().dictionary.terms);
+        let high = u64::MAX - 1;
+        replica
+            .inner
+            .shared
+            .versions
+            .publish(|current| super::super::Version {
+                asserted: current.asserted.clone(),
+                inferred: current.inferred.clone(),
+                revision: high,
+                dictionary_len: current.dictionary_len,
+                equality: std::sync::Arc::clone(&current.equality),
+                content: current.content,
+                canonical: Default::default(),
+            });
+        let mut records = decoded(&batch.frames);
+        records.truncate(2);
+        records[0].revision = u64::MAX;
+        records[1].revision = 0;
+        let expected = super::LogExpectation {
+            after: high,
+            records: 2,
+            last: 0,
+        };
+        let stop = nrese_exec::stop::StopSource::none();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            replica.apply_log(&encoded(&records), &expected, &stop)
+        }));
+        assert!(
+            matches!(result, Ok(Err(EngineError::Corruption(_)))),
+            "{:?}",
+            result.as_ref().map_err(|_| "panicked")
+        );
+        assert_eq!(replica.stats().revision, high);
+        assert_eq!(replica.stats().dictionary.terms, logged.1);
+        drop(replica);
+        let reopened = Engine::open(image.path(), durable()).unwrap();
+        assert_eq!(
+            (reopened.stats().revision, reopened.stats().dictionary.terms),
+            logged
+        );
     }
 }
