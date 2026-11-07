@@ -195,6 +195,28 @@ Single measurements and diagnoses outside the kits, run with
 
 ## On the fleet
 
+Selected cells: `uv run --no-project python -B benches/suite/suite.py fleet
+--systems nrese,qlever,oxigraph,virtuoso,jena,rdf4j --workloads sparqloscope,bsbm,watdiv
+--nrese COMMIT --budget-hours 20 --plan`. `--tiers WORKLOAD=TIER,WORKLOAD=TIER`
+narrows tiers; `--gaps` considers indexed gaps (current-definition coverage refresh is deferred).
+Every omitted cell has a reason. Only adapters with historical successful evidence and
+free publication rights are admitted; kit declarations alone do not qualify. Missing query
+assets are omitted. Host data are verified/prepared by the existing release-gate helpers.
+
+The default is plan only: a set file, per-cell/member/total host-hours including reference,
+build and preparation work, followed by `fleet check` (placement and queue impact) and
+`fleet estimate`. Catalogue estimates are explicitly unmeasured for this protocol. Cells
+are pruned to strictly below the budget. `--submit` submits the checked set with a content
+request token; repeating that request reuses the fleet set. No campaign scheduler is added.
+
+Each member keeps its suite bundle, raw `stdout.log`/`stderr.log`, input receipts and
+`identity.json` under `~/owlrs/private/suite-fleet/MEMBER` on its execution host;
+`--result-root` changes that private root. Fleet receives a `cell/` copy in its own
+private result store outside checkouts; `fleet results set:ID` locates it and shows
+delivery status. `results_at` names the host landing, not a local copy destination. A member is one suite invocation; failed
+members retain partial evidence. Coverage refresh and reconciliation of unindexed old
+outputs remain follow-ups. Review the plan before submission.
+
 Every run on another machine is a fleet job (`fleet` on the main PC; the fleet-jobs skill):
 the fleet owns the hosts, their windows and their rules (`fleet rules`, `fleet why ID`), and a
 job says what it needs, never which host. No two timings share a host: a timed job
