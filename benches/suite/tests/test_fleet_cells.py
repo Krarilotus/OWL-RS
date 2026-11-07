@@ -24,6 +24,7 @@ class FleetCells(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.out = Path(self.tmp.name)
         self.calls = []
+        self.sets = {}
         self.addCleanup(patch.stopall)
         patch.object(abba, "git", side_effect=lambda root, *args: "" if args[0] == "status"
                      else "b" * 40 if args[-1].startswith("b" * 40) else A).start()
@@ -32,6 +33,12 @@ class FleetCells(unittest.TestCase):
 
     def fleet(self, *args):
         self.calls.append(args)
+        if args[0] == "status":
+            return (0, json.dumps(self.sets[args[1]])) if args[1] in self.sets else (1, json.dumps({"error": f"no job {args[1]}"}))
+        if args[0] == "submit":
+            doc = tomllib.loads(Path(args[1]).read_text())
+            key = "set:" + doc["set"]["id"]
+            self.sets[key] = {"id": key, "members": [{"id": j["id"]} for j in doc["job"]]}
         if "--json" in args:
             return 0, json.dumps({"jobs": [{"fleet": {"verdict": "now"}, "hosts": []}]})
         return 0, "set:accepted job:member"
@@ -83,7 +90,7 @@ class FleetCells(unittest.TestCase):
         first = self.document()["set"]
         self.assertEqual(self.run_plan("--budget-hours", "50", "--submit")[0], 0)
         self.assertEqual(self.document()["set"], first)
-        self.assertEqual([c[0] for c in self.calls], ["check", "check", "estimate", "submit"] * 2)
+        self.assertEqual(sum(c[0] == "submit" for c in self.calls), 1)
         self.assertIn("request", first)
         self.assertEqual(self.run_plan("--references", "oxigraph,jena", "--budget-hours", "50", "--submit")[0], 0)
         self.assertEqual(len(list(self.out.glob("*.set.toml"))), 1)  # S1: equivalent selection, one request
@@ -172,6 +179,44 @@ class FleetCells(unittest.TestCase):
         self.assertIn("java", self.document()["job"][0]["requires"]["has"])
         self.assertIn("adapter needs ['docker']", text)
         self.assertIn("workload/driver needs ['java']", text)
+
+    def test_fleet_asks_do_not_cap_native_measurement_cpus(self):
+        # Opus B1: native suite.py run has no cap, even with a per-system historical core ask.
+        from suitekit import fleet_cells
+        make = fleet_cells.jobs
+        def measured(groups, args):
+            groups[0]["measured"] = {"cores": 7}
+            return make(groups, args)
+        with patch.object(fleet_cells, "jobs", side_effect=measured):
+            code, text = self.run_plan("--systems", "jena,qlever", "--budget-hours", "80")
+        self.assertEqual(code, 0, text)
+        for job in self.document()["job"]:
+            self.assertNotIn("DOCKER_CPUS", job["env"])
+            self.assertEqual(job["requires"]["cores"], 2)
+
+    def test_identity_excludes_budget_owner_and_checkout(self):
+        # Opus N1: same measured cells/trees/inputs retain identity across administration changes.
+        from suitekit import fleet_cells
+        self.assertEqual(self.run_plan("--budget-hours", "50", "--submit")[0], 0)
+        first, make = self.document()["set"], fleet_cells.jobs
+        def elsewhere(groups, args):
+            args.checkout = self.out / "another-worktree"
+            return make(groups, args)
+        with patch.object(fleet_cells, "jobs", side_effect=elsewhere):
+            code, text = self.run_plan("--budget-hours", "49", "--owner", "another-owner", "--submit")
+        self.assertEqual(code, 0, text)
+        self.assertIn("reuse set:" + first["id"], text)
+        self.assertEqual(sum(c[0] == "submit" for c in self.calls), 1)
+
+    def test_existing_set_is_reused_before_check_or_submit(self):
+        # Opus N1: a repeat returns the existing set/member ids, including after capacity closes.
+        self.assertEqual(self.run_plan("--budget-hours", "50", "--submit")[0], 0)
+        existing = self.sets["set:" + self.document()["set"]["id"]]
+        with patch.object(abba.rg, "fleet_call", side_effect=lambda *a: (0, json.dumps(existing)) if a[0] == "status" else (1, "must not recheck/submit")) as call:
+            code, text = self.run_plan("--budget-hours", "50", "--submit")
+        self.assertEqual(code, 0, text)
+        self.assertEqual([c.args[0] for c in call.call_args_list], ["status"])
+        self.assertTrue(all(j["id"] in text for j in existing["members"]))
 
 
 if __name__ == "__main__":
