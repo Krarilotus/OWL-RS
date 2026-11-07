@@ -70,6 +70,8 @@ pub(crate) struct StoreSettings {
     /// [`StoreConfig::search_scope`](crate::StoreConfig), or the repository's: read once
     /// per query and update, so a change applies to the next one.
     pub search_scope: std::sync::Arc<std::sync::RwLock<nrese_sparql::SearchScope>>,
+    /// [`StoreConfig::reader_corpus_bytes`](crate::StoreConfig), or the repository's.
+    pub reader_corpus_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl StoreSettings {

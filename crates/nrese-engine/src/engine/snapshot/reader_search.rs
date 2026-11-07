@@ -95,16 +95,14 @@ impl Documents {
     }
 }
 
-/// Words of the bits a slice of a corpus walk covers at most ([`Snapshot::mark_values`]):
-/// its group counts (16 bytes a term) are what the slice holds besides the bits.
-const SLICE_WORDS: usize = 1024;
-
-/// Words of the bits each slice of a walk over `words` covers: four slices a thread of the
-/// pool, at most [`SLICE_WORDS`].
-fn slice_words(words: usize) -> usize {
+/// Words of the bits each slice of a walk over `words` covers ([`Snapshot::mark_values`]):
+/// four slices a thread of the pool, at most `most`
+/// ([`crate::CorpusTuning::walk_slice_words`]; a slice holds its group counts, 16 bytes a
+/// term, besides the bits).
+fn slice_words(words: usize, most: usize) -> usize {
     words
         .div_ceil(rayon::current_num_threads() * 4)
-        .clamp(1, SLICE_WORDS)
+        .clamp(1, most.max(1))
 }
 
 /// The request's budget, or an unlimited one where the caller brought none.
@@ -120,6 +118,14 @@ impl Snapshot {
     /// statistics without an engine's cell (a search then keeps nothing).
     fn corpora(&self) -> Option<&CorpusStore> {
         self.statistics.corpora.get_or_init()
+    }
+
+    /// The most words of bits a slice of a corpus walk covers: the engine's setting, or the
+    /// default for statistics without an engine's cell.
+    fn walk_slice_words(&self) -> usize {
+        self.corpora()
+            .map_or(crate::CorpusTuning::DEFAULT, CorpusStore::tuning)
+            .walk_slice_words
     }
 
     /// The string literals that are objects of statements this snapshot shows in
@@ -464,7 +470,9 @@ impl Snapshot {
         let mut bits = nrese_exec::ChargedVec::with_capacity(Arc::clone(budget), words)?;
         bits.resize(words, 0)?;
         let mut scratch = nrese_exec::Reservation::new(Arc::clone(budget));
-        let (running, bytes) = self.walk_scratch(words, budget.remaining());
+        // Read once: the slices charged are the slices walked.
+        let per = slice_words(words, self.walk_slice_words());
+        let (running, bytes) = self.walk_scratch(words, per, budget.remaining());
         scratch.charge(bytes)?;
         // Per graph, each kind's walk; a scan (where the index can't walk them) marks every
         // kind at once. Only the count needs the index: on a pool thread it is covered
@@ -473,7 +481,7 @@ impl Snapshot {
         let mut walk = move || {
             let mut mark = |graph: GraphSelector| {
                 for &kind in documents.kinds() {
-                    if self.mark_values(model, graph, documents, kind, marks, running) {
+                    if self.mark_values(model, graph, documents, kind, marks, per, running) {
                         break;
                     }
                 }
@@ -546,9 +554,8 @@ impl Snapshot {
     /// word of the slice) from each run, and as many again where they are merged or
     /// compared. As many at once as `room` holds, at least one, no more than the pool's
     /// threads nor than there are slices.
-    fn walk_scratch(&self, words: usize, room: usize) -> (usize, usize) {
+    fn walk_scratch(&self, words: usize, per: usize, room: usize) -> (usize, usize) {
         let runs = self.version.runs().count().max(1);
-        let per = slice_words(words);
         let slice = per * 64 * 16 * runs * 2;
         let most = words.div_ceil(per).min(rayon::current_num_threads()).max(1);
         let running = (room / slice).clamp(1, most);
@@ -585,10 +592,12 @@ impl Snapshot {
 
     /// Sets the bit of the dictionary entry of each term of `kind` at `documents`' position
     /// (object or subject) of the statements in `graphs` (one graph, every graph, or every
-    /// named graph) in `model`. The entries in slices of whole words, `running` at once on
-    /// the pool: each a walk over the index's groups in its range of ids, so no list of
-    /// every term is held. Where the index can't walk them (a reader of equality classes),
-    /// one scan of the statements marks the terms of every kind of `documents`: then `true`.
+    /// named graph) in `model`. The entries in slices of `per` whole words, `running` at
+    /// once on the pool: each a walk over the index's groups in its range of ids, so no list
+    /// of every term is held. Where the index can't walk them (a reader of equality
+    /// classes), one scan of the statements marks the terms of every kind of `documents`:
+    /// then `true`.
+    #[allow(clippy::too_many_arguments)]
     fn mark_values(
         &self,
         model: ReadModel,
@@ -596,10 +605,10 @@ impl Snapshot {
         documents: Documents,
         kind: TermKind,
         bits: &mut [u64],
+        per: usize,
         running: usize,
     ) -> bool {
         use rayon::prelude::*;
-        let per = slice_words(bits.len());
         let wave = |at: usize, wave: &mut [u64]| {
             wave.par_chunks_mut(per)
                 .enumerate()

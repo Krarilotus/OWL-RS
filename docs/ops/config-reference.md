@@ -152,6 +152,27 @@ api_key = "replace-me"
   - `reader`: search ranks text and IRIs, and selects vectors, from the reader's snapshot, read model and active dataset only: a graph the reader may not read, an open transaction's terms, a later version or a term no statement uses changes no score, rank or selection. Vectors are compared exactly (recall 1) among the visible ones. Costs: the first search of a scope at a version walks its statements to build its corpus (kept, and after a small commit derived from the kept one by probing what the commit touched); a vector search scans the space's vectors, testing each for visibility. Admission may still depend on the dictionary's span, the index walk's scratch, the touched terms charged before the scope check and the shared corpus cache's retention (approved R2-F2 exception, [http-api.md](http-api.md)): a refusal can reveal hidden volume, a score can't.
 - graph access, EXPLAIN and refusal sanitising are the same in both modes
 
+- file key: `store.reader_corpus_bytes`
+- env override: `NRESE_READER_CORPUS_BYTES`
+- a repository's `reader_corpus_bytes` in its settings overrides it for that repository
+- default: 256 MiB; a size such as `1GiB`
+- what the corpora a `reader` search scope keeps (one per scope and version, with the lineage that derives the next version's from it) may take, within the memory the queries draw on. Past it the least recently used go first; a corpus that still doesn't fit is built for its search alone, on that request's memory. This is the only bound on how many corpora and lineage steps are kept
+- why 256 MiB: a corpus of 1,000,000 documents takes 250,336 bytes, so about a thousand of that size fit (measured, fleet `syn24-lineage-probe-8faeb458`)
+- unused under `global`: nothing is allocated until a `reader` search runs
+
+- file key: `store.reader_walk_slice`
+- env override: `NRESE_READER_WALK_SLICE`
+- default: 1024; at least 1
+- words of bits (64 terms each) one slice of a corpus walk covers at most; a slice also holds a group count of 16 bytes a term, so the default slice holds at most 1 MiB of counts. Smaller slices hold less scratch per thread, larger ones split the walk less
+- why 1,024: a walk of 1,000,000 documents in slices of 256, 1,024 and 4,096 words does 111.7, 110.4 and 111.9 million instructions (fleet `syn24-work-probe-2-06961a4e`) and takes 20.8, 9.1 and 9.4 ms on 12 threads (fleet `syn24-tuning-probe-f4b4dd86`); 1,024 holds no more scratch than 4,096
+
+- file key: `store.reader_documents_per_probe`
+- env override: `NRESE_READER_DOCUMENTS_PER_PROBE`
+- default: 10; at least 1
+- after commits, a `reader` search derives its corpus from a kept ancestor's by probing the terms the commits touched, while there are at most the corpus's documents divided by this; past that it walks the scope's statements again. Larger values walk sooner, smaller ones probe longer
+- why 10: measured in work (single-threaded instructions), so it holds whatever the core count. At 1,000,000 documents a probe does about 1,100 instructions and a walk about 110 million: they cost the same at about 100,000 touched terms, which is 10 documents per probe. A walk has no fixed cost in work (1,000 documents: 157,000–203,000 instructions), so small corpora get no floor (fleet `syn24-work-probe-2-06961a4e`)
+- the trade-off: a walk runs on every core, a derivation on one. On 12 threads the walk's wall time matches 90–190 documents per probe (fleet `syn24-tuning-probe-f4b4dd86`), so just below the crossover a derivation can take up to about 10× the parallel walk's wall time. Under concurrent readers and shared hosts, throughput and the other tenants pay for work, which is why the default counts work. A latency-first deployment with one tenant can raise it toward the wall-time crossover
+
 - file key: `shacl.shapes_graph`
 - env override: `NRESE_SHACL_SHAPES_GRAPH`
 - default: `http://rdf4j.org/schema/rdf4j#SHACLShapeGraph` (the graph RDF4J and GraphDB use)

@@ -146,6 +146,30 @@ pub const SETTINGS: &[Setting] = &[
          snapshot and graphs show alone (reader).",
     ),
     setting(
+        "store.reader_corpus_bytes",
+        names::READER_CORPUS_BYTES,
+        Amount(Bytes),
+        "What the corpora a reader search scope keeps, and their lineage, may take within the \
+         queries' memory; the least recently used go first (default 256MiB: a 1M-document \
+         corpus takes about 250KB). A repository may set its own.",
+    ),
+    setting(
+        "store.reader_walk_slice",
+        names::READER_WALK_SLICE,
+        Integer,
+        "Words of bits (64 terms each) one slice of a reader corpus walk covers at most; each \
+         slice also holds 16 bytes a term (default 1024).",
+    ),
+    setting(
+        "store.reader_documents_per_probe",
+        names::READER_DOCUMENTS_PER_PROBE,
+        Integer,
+        "Documents a reader corpus walk visits for the work of one probe: after commits, a \
+         kept corpus is derived while the terms touched since are at most its documents over \
+         this, else walked again (default 10, measured in work; at least 1). A \
+         latency-first store with one tenant may raise it.",
+    ),
+    setting(
         "store.import_directory",
         names::IMPORT_DIR,
         Text,

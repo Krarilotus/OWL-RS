@@ -99,6 +99,11 @@ pub struct RepositorySettings {
     /// [`crate::StoreConfig::search_scope`]); the server's `store.search_scope` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_scope: Option<String>,
+    /// Bytes a `reader` search scope's corpora may take
+    /// ([`crate::StoreConfig::reader_corpus_bytes`]); the server's
+    /// `store.reader_corpus_bytes` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader_corpus_bytes: Option<u64>,
 }
 
 /// The longest per-repository query timeout: one hour.
@@ -122,6 +127,12 @@ impl RepositorySettings {
         self.search_scope
             .as_deref()
             .and_then(crate::SearchScope::from_name)
+    }
+
+    /// The bytes a `reader` search scope's corpora may take, if the settings give them.
+    pub fn reader_corpus_bytes(&self) -> Option<usize> {
+        self.reader_corpus_bytes
+            .map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX))
     }
 
     /// The reasoning mode, if the settings choose one.
@@ -437,6 +448,9 @@ impl Catalog {
             search_scope: settings
                 .search_scope_mode()
                 .unwrap_or(self.template.search_scope),
+            reader_corpus_bytes: settings
+                .reader_corpus_bytes()
+                .unwrap_or(self.template.reader_corpus_bytes),
             ..self.template.clone()
         };
         let store = StoreService::with_runtime(config, Arc::clone(&self.runtime))
@@ -715,6 +729,16 @@ impl Catalog {
                 .search_scope_mode()
                 .unwrap_or(self.template.search_scope);
             repository.pipeline.read().store().set_search_scope(scope);
+        }
+        if before.reader_corpus_bytes != settings.reader_corpus_bytes {
+            let bytes = settings
+                .reader_corpus_bytes()
+                .unwrap_or(self.template.reader_corpus_bytes);
+            repository
+                .pipeline
+                .read()
+                .store()
+                .set_reader_corpus_bytes(bytes);
         }
         *repository.settings.write() = settings;
         Ok(())
