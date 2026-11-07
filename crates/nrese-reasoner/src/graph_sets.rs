@@ -656,9 +656,10 @@ pub fn closure_within(
 /// only through the fact itself (`C ⊑ D`, `D ⊑ C`, `a : C` gives `a : D`, which gives
 /// `a : C` back). [`independently_derived`] decides.
 ///
-/// The search ticks `poll` ([`Poller`], one per parallel task, so that a fact whose search
-/// scans nothing costs no poll): stopped, it answers false, decided by nothing, and the
-/// caller asks its (latched) stop again before it uses the answer.
+/// It counts on `poll` ([`Poller`], one per parallel task) each unit it attempts, found or
+/// not: the fact, each producer, each search and each fact a search scans. Stopped, it
+/// answers false, decided by nothing, and the caller asks its (latched) stop again before
+/// it uses the answer.
 pub fn derived_otherwise<S: Source + ?Sized>(
     source: &S,
     program: &GroundProgram,
@@ -666,6 +667,9 @@ pub fn derived_otherwise<S: Source + ?Sized>(
     fact: Triple,
     poll: &mut Poller<'_>,
 ) -> bool {
+    if poll.attempt(1) {
+        return false;
+    }
     if axioms.binary_search(&fact).is_ok() {
         return true;
     }
@@ -679,7 +683,7 @@ pub fn derived_otherwise<S: Source + ?Sized>(
     if program.bodiless.contains(&fact) && grounded(Grounding::Bodiless(fact)) {
         return true;
     }
-    let mut derives = |rule: &Rule| {
+    let derives = |rule: &Rule, poll: &mut Poller<'_>| {
         let mut found = false;
         let mut body = Vec::with_capacity(rule.body.len());
         derivations(source, rule, fact, Seg::All, poll, &mut |bindings| {
@@ -694,17 +698,21 @@ pub fn derived_otherwise<S: Source + ?Sized>(
         });
         found
     };
-    if program
-        .producers(fact)
-        .into_iter()
-        .any(|r| grounded(Grounding::Rule(r)) && derives(&program.rules[r]))
-    {
-        return true;
+    // Each producer is attempted work before its schema check, an empty search or not
+    // (review r1, F1).
+    for r in program.producers(fact) {
+        if poll.attempt(1) {
+            return false;
+        }
+        if grounded(Grounding::Rule(r)) && derives(&program.rules[r], poll) {
+            return true;
+        }
     }
     let p = fact[1];
     program.transitive.contains(&p)
+        && !poll.attempt(1)
         && grounded(Grounding::Transitive(p))
-        && derives(&transitivity(p))
+        && derives(&transitivity(p), poll)
 }
 
 /// Whether the asserted `fact` of the closure `source` is in the least closure of the
@@ -1063,6 +1071,15 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                         groundings.push(Grounding::Transitive(fact[1]));
                     }
                     for grounding in groundings {
+                        // Each grounding is attempted work, searched or not (review r1, F1).
+                        // Stopped: what it found is incomplete; the check after the pass ends
+                        // the run before it is read.
+                        let Some(poll) = poll.as_mut() else {
+                            break;
+                        };
+                        if poll.attempt(1) {
+                            break;
+                        }
                         let Some(&k) = by_grounding.get(&grounding) else {
                             continue;
                         };
@@ -1071,11 +1088,6 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                             continue;
                         }
                         let mut body = Vec::with_capacity(rule.body.len());
-                        // Stopped: what it found is incomplete; the check after the pass ends
-                        // the run before it is read.
-                        let Some(poll) = poll.as_mut() else {
-                            break;
-                        };
                         derivations(change.source, rule, fact, Seg::All, poll, &mut |bindings| {
                             body.clear();
                             body.extend(
