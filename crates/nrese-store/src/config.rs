@@ -113,6 +113,10 @@ pub struct StoreConfig {
     /// On disk: keep the WAL segments checkpoints cover in `wal-archive/` of the data
     /// directory (point-in-time restore; see `nrese_engine::DurabilityConfig::wal_archive`).
     pub wal_archive: bool,
+    /// On disk: what opening does with damage in the newest WAL segment that a crash
+    /// mid-append doesn't leave (`store.wal_damage`): refuse to open (the default), or open
+    /// with the log up to it, the rest copied aside (see `nrese_engine::WalDamage`).
+    pub wal_damage: nrese_engine::WalDamage,
     /// How index blocks are encoded when built (`store.index_encoding`): `Fast`, or
     /// `Compact` (palettes: a smaller store, scans up to a tenth slower). Set for the
     /// process when the store opens; see `nrese_engine::IndexEncoding`.
@@ -328,6 +332,7 @@ impl StoreConfig {
             bulk_load_memory_bytes: 0,
             invalid_statements: crate::quarantine::InvalidStatements::Quarantine,
             wal_archive: false,
+            wal_damage: nrese_engine::WalDamage::Refuse,
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
@@ -363,6 +368,7 @@ impl StoreConfig {
             bulk_load_memory_bytes: 0,
             invalid_statements: crate::quarantine::InvalidStatements::Quarantine,
             wal_archive: false,
+            wal_damage: nrese_engine::WalDamage::Refuse,
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
