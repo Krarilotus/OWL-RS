@@ -2251,6 +2251,59 @@ cap_gb = 6
 systems = []
 home_turf = "virtuoso"
 
+# Background checkpoints overlapping reads and commits (IB0024 fix check F1): a checkpoint
+# runs as a job of the global pool, its file writing on one of its threads. A durable store,
+# 5,000 commits under 8 readers, a checkpoint asked for every 128 KiB of log (a count at
+# 10,000 commits and 1 MiB wrote 2: about 1.2 MiB of log here, 8 to 10 asked); the check makes
+# sure checkpoints were written during them. Readers at the host's width and on a pool of
+# one thread (where the checkpoint's thread is the pool's only one), commits at the host's;
+# each case has a store of its own: a sweep would replay the same commits on a store they
+# changed.
+[[case]]
+name = "checkpoint-under-readers"
+area = "concurrency"
+what = "5,000 commits on a durable store under 8 readers, background checkpoints every 128 KiB of log, the host's pool width: read latency (p99) while checkpoints are written"
+semantics = "none"
+data = "churn people=200000 changes=2500"
+setup = ["--store", "{scratch}/store", "--load", "{data}"]
+args = ["--store", "{scratch}/store", "--commits", "{data}.commits.ru", "--readers", "8", "--checkpoint-after-wal-bytes", "131072"]
+queries = "churn"
+metric = "commits.read_p99_ms"
+check = { "commits.commits" = 5000, "commits.checkpoints" = ">= 4" }
+route = {}
+cap_gb = 6
+systems = []
+
+[[case]]
+name = "checkpoint-under-readers-commits"
+area = "concurrency"
+what = "checkpoint-under-readers timed by its commits: write latency (p99) while background checkpoints are written, the host's pool width"
+semantics = "none"
+data = "churn people=200000 changes=2500"
+setup = ["--store", "{scratch}/store", "--load", "{data}"]
+args = ["--store", "{scratch}/store", "--commits", "{data}.commits.ru", "--readers", "8", "--checkpoint-after-wal-bytes", "131072"]
+queries = "churn"
+metric = "commits.p99_ms"
+check = { "commits.commits" = 5000, "commits.checkpoints" = ">= 4" }
+route = {}
+cap_gb = 6
+systems = []
+
+[[case]]
+name = "checkpoint-under-readers-w1"
+area = "concurrency"
+what = "checkpoint-under-readers on a pool of one thread: the checkpoint's thread is the pool's only one"
+semantics = "none"
+data = "churn people=200000 changes=2500"
+setup = ["--store", "{scratch}/store", "--load", "{data}"]
+args = ["--store", "{scratch}/store", "--commits", "{data}.commits.ru", "--readers", "8", "--checkpoint-after-wal-bytes", "131072", "--threads", "1"]
+queries = "churn"
+metric = "commits.read_p99_ms"
+check = { "commits.commits" = 5000, "commits.checkpoints" = ">= 4" }
+route = {}
+cap_gb = 6
+systems = []
+
 [[case]]
 name = "cache-replay"
 area = "cache"

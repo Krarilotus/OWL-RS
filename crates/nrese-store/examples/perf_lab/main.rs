@@ -264,6 +264,8 @@ struct Args {
     readers: usize,
     clients: Vec<usize>,
     cache_bytes: usize,
+    /// A durable store's automatic checkpoint threshold, in WAL bytes (unset: the default).
+    checkpoint_after_wal_bytes: Option<u64>,
     duration: Duration,
     threads: Option<usize>,
     export: Option<PathBuf>,
@@ -311,6 +313,7 @@ fn parse_args() -> Result<Args, String> {
         readers: 0,
         clients: Vec::new(),
         cache_bytes: 0,
+        checkpoint_after_wal_bytes: None,
         duration: Duration::from_secs(10),
         threads: None,
         export: None,
@@ -377,6 +380,13 @@ fn parse_args() -> Result<Args, String> {
                 args.cache_bytes = value()?
                     .parse()
                     .map_err(|e| format!("--cache-bytes: {e}"))?
+            }
+            "--checkpoint-after-wal-bytes" => {
+                args.checkpoint_after_wal_bytes = Some(
+                    value()?
+                        .parse()
+                        .map_err(|e| format!("--checkpoint-after-wal-bytes: {e}"))?,
+                )
             }
             "--clients" => {
                 args.clients = value()?
@@ -1079,6 +1089,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         ))
         .unwrap_or_default(),
         support_sets: args.support_sets.unwrap_or(config.support_sets),
+        checkpoint_after_wal_bytes: args
+            .checkpoint_after_wal_bytes
+            .unwrap_or(config.checkpoint_after_wal_bytes),
         ..config
     };
     COUNT_ALLOCATIONS.store(args.count_allocations, Ordering::Relaxed);
