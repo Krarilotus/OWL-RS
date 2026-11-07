@@ -2272,6 +2272,57 @@ mod tests {
         }
     }
 
+    /// P2-01, the inline lengths and first ids (an optimisation: its oracle). Across every
+    /// kind of piece (frozen heaps, one with a sealed block, adopted bulk segments, the live
+    /// heap), every id's key read through the dictionary and through a view is the key it was
+    /// given, and every key is found at its id.
+    #[test]
+    fn every_id_reads_its_own_key_across_the_pieces() {
+        let dictionary = Dictionary::default();
+        let mut expected: Vec<Vec<u8>> = Vec::new();
+        let intern = |expected: &mut Vec<Vec<u8>>, text: String| {
+            let id = dictionary.intern(LiteralRef::new_simple_literal(&text).into());
+            assert_eq!(id.payload(), expected.len() as u64);
+            expected.push([&b"S"[..], text.as_bytes()].concat());
+        };
+        let adopt = |expected: &mut Vec<Vec<u8>>, round: usize| {
+            let pending = Pending::default();
+            let keys: Vec<Vec<u8>> = (0..3)
+                .map(|k| format!("Iurn:bulk-{round}-{k}").into_bytes())
+                .collect();
+            let mut indexes = vec![NEW; keys.len()];
+            pending.intern((1, 0), &mut indexes, &mut Vec::new(), |k| {
+                (&keys[k][..], key_hash(&keys[k]))
+            });
+            dictionary.adopt_pending(pending, |_| {});
+            expected.extend(keys);
+        };
+        for i in 0..BLOCK + 10 {
+            intern(&mut expected, format!("first {i}"));
+        }
+        adopt(&mut expected, 0);
+        for i in 0..100 {
+            intern(&mut expected, format!("second {i}"));
+        }
+        adopt(&mut expected, 1);
+        for i in 0..50 {
+            intern(&mut expected, format!("live {i}"));
+        }
+        assert_eq!(dictionary.inner.read().segments.len(), 4);
+        let view = dictionary.view();
+        let inner = dictionary.inner.read();
+        for (id, key) in expected.iter().enumerate() {
+            let id = id as u64;
+            assert_eq!(&*inner.key(id), &key[..], "entry {id}");
+            assert_eq!(
+                &*view.pieces().key(id),
+                &key[..],
+                "entry {id} through a view"
+            );
+            assert_eq!(inner.find(key_hash(key), key), Some(id), "entry {id} found");
+        }
+    }
+
     /// P2-01, Sol r1 S1. A scan copies no key of a heap's tail, a frozen heap's included: its
     /// peak stays below half the tail's bytes, where any copy of the tail holds all of them.
     /// Here 64 keys of 256 KiB in a heap frozen by a bulk load, and a needle matching none.
