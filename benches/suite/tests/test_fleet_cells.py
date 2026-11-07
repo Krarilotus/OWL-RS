@@ -24,7 +24,8 @@ class FleetCells(unittest.TestCase):
         self.out = Path(self.tmp.name)
         self.calls = []
         self.addCleanup(patch.stopall)
-        patch.object(abba, "git", side_effect=lambda root, *args: "b" * 40 if "b" * 40 in args else A).start()
+        patch.object(abba, "git", side_effect=lambda root, *args: "" if args[0] == "status"
+                     else "b" * 40 if args[-1].startswith("b" * 40) else A).start()
         patch.object(abba.rg, "side_inputs", return_value=[]).start()
         patch.object(abba.rg, "fleet_call", side_effect=self.fleet).start()
 
@@ -35,7 +36,7 @@ class FleetCells(unittest.TestCase):
     def run_plan(self, *extra):
         output = io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
-            code = suite.main(["suite.py", "fleet", "--nrese", A, "--out", str(self.out),
+            code = suite.main(["suite.py", "fleet", "--owner", "suite-fixture", "--nrese", A, "--out", str(self.out),
                                "--systems", "qlever", "--workloads", "sparqloscope", *extra])
         return code, output.getvalue()
 
@@ -61,6 +62,10 @@ class FleetCells(unittest.TestCase):
         self.assertEqual(code, 0, text)
         self.assertIn("budget", text)
         self.assertFalse(self.calls)
+        code, text = self.run_plan("--budget-hours", "30")
+        self.assertEqual(code, 0, text)
+        self.assertIn("budget", text)  # three 600-minute systems plus build/preparation exceed 30 h
+        self.assertFalse(self.calls)
         for value in ("-1", "nan", "inf"):
             with self.assertRaises(SystemExit) as error:
                 self.run_plan("--budget-hours", value)
@@ -74,9 +79,9 @@ class FleetCells(unittest.TestCase):
         self.assertEqual(self.run_plan("--budget-hours", "50", "--submit")[0], 0)
         self.assertEqual(self.document()["set"], first)
         self.assertEqual([c[0] for c in self.calls], ["check", "estimate", "submit"] * 2)
-        self.assertIn("request_token", first)
+        self.assertIn("request", first)
         self.assertEqual(self.run_plan("--nrese", "b" * 40, "--budget-hours", "50")[0], 0)
-        tokens = {tomllib.loads(p.read_text())["set"]["request_token"] for p in self.out.glob("*.set.toml")}
+        tokens = {tomllib.loads(p.read_text())["set"]["request"] for p in self.out.glob("*.set.toml")}
         self.assertEqual(len(tokens), 2)
 
     def test_job_declares_resources_identity_answers_and_private_landing(self):
@@ -97,6 +102,17 @@ class FleetCells(unittest.TestCase):
         self.assertIn("private", job["results_at"])
         self.assertIn("unmeasured", text)
         self.assertNotIn("submit", [c[0] for c in self.calls])
+        payload = json.loads(job["env"]["SUITE_CELL"])
+        self.assertEqual(payload["nrese"], A)
+        self.assertEqual(payload["harness"], A)
+        self.assertEqual(payload["group"]["references"], ["jena", "oxigraph"])
+
+    def test_check_refusal_cannot_submit(self):
+        # Spec point 3: fleet's refusal is final; --submit must not bypass it.
+        with patch.object(abba.rg, "fleet_call", return_value=(1, "refused")) as call:
+            code, text = self.run_plan("--budget-hours", "50", "--submit")
+        self.assertEqual(code, 1, text)
+        self.assertEqual([c.args[0] for c in call.call_args_list], ["check"])
 
 
 if __name__ == "__main__":
