@@ -170,10 +170,56 @@ pub(crate) struct SparqlCheck {
     /// An ASK validator: run per value node, with `$value`; a value fails when it answers
     /// false. Otherwise a SELECT: each solution is a result.
     pub(crate) ask: bool,
-    /// The component's parameters: the variable each is pre-bound as, and the value.
-    pub(crate) parameters: Vec<(nrese_rdf::Variable, TermId)>,
+    /// The component's parameters: the variable each is pre-bound as, and the shape's values
+    /// for it. The component constrains the shape once per combination of these values
+    /// (SHACL §6.2), each run in turn ([`SparqlCheck::each_combination`]); they aren't
+    /// multiplied out, which would grow as a power of the shapes graph.
+    pub(crate) parameters: Vec<(nrese_rdf::Variable, Vec<TermId>)>,
     /// The `sh:message`s of the constraint or validator (else the component's).
     pub(crate) messages: Vec<TermId>,
+}
+
+impl SparqlCheck {
+    /// Calls `each` with every combination of the parameters' values, one value per
+    /// parameter, the first parameter's changing slowest, until `each` breaks. Without
+    /// parameters (`sh:sparql`) that is one combination, the empty one; a parameter without
+    /// values leaves none.
+    pub(crate) fn each_combination(
+        &self,
+        mut each: impl FnMut(&[(nrese_rdf::Variable, TermId)]) -> std::ops::ControlFlow<()>,
+    ) {
+        if self.parameters.iter().any(|(_, values)| values.is_empty()) {
+            return;
+        }
+        let mut at = vec![0; self.parameters.len()];
+        let mut chosen: Vec<(nrese_rdf::Variable, TermId)> = self
+            .parameters
+            .iter()
+            .map(|(variable, values)| (variable.clone(), values[0]))
+            .collect();
+        loop {
+            if each(&chosen).is_break() {
+                return;
+            }
+            // The next combination: the last parameter that has a next value takes it, and
+            // every parameter after it starts over.
+            let mut parameter = self.parameters.len();
+            loop {
+                if parameter == 0 {
+                    return;
+                }
+                parameter -= 1;
+                let values = &self.parameters[parameter].1;
+                at[parameter] += 1;
+                if at[parameter] < values.len() {
+                    chosen[parameter].1 = values[at[parameter]];
+                    break;
+                }
+                at[parameter] = 0;
+                chosen[parameter].1 = values[0];
+            }
+        }
+    }
 }
 
 /// A constraint component, as `sh:sourceConstraintComponent` names it.

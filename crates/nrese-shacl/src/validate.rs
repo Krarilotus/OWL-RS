@@ -3,6 +3,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::ControlFlow;
 use std::sync::OnceLock;
 
 use nrese_engine::{TermId, TermKind};
@@ -573,46 +574,56 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(format!("a SPARQL constraint at focus node {at}: {problem}"));
         };
-        let outcome = sparql::run(
-            view,
-            data,
-            check,
-            focus,
-            values,
-            shape.node,
-            self.shapes.graph,
-            self.resources,
-        );
-        match outcome {
-            Err(sparql::Problem::Stopped(stop)) => {
-                let _ = self.stop.set(stop);
+        // Each combination of the parameters' values is a constraint of its own (SHACL §6.2),
+        // run in turn: a stop between them ends the walk.
+        check.each_combination(|parameters| {
+            if self.stopped() {
+                return ControlFlow::Break(());
             }
-            Err(sparql::Problem::Failed(error)) => failure(&error),
-            Ok(sparql::Outcome::Failed(failed)) => {
-                for value in failed {
-                    results.push(raw(Some(value), shape.path.clone()));
+            let outcome = sparql::run(
+                view,
+                data,
+                check,
+                parameters,
+                focus,
+                values,
+                shape.node,
+                self.shapes.graph,
+                self.resources,
+            );
+            match outcome {
+                Err(sparql::Problem::Stopped(stop)) => {
+                    let _ = self.stop.set(stop);
+                    return ControlFlow::Break(());
                 }
-            }
-            Ok(sparql::Outcome::Solutions(found)) => {
-                for solution in found {
-                    if solution.failure {
-                        failure("the query reported ?failure");
-                        continue;
+                Err(sparql::Problem::Failed(error)) => failure(&error),
+                Ok(sparql::Outcome::Failed(failed)) => {
+                    for value in failed {
+                        results.push(raw(Some(value), shape.path.clone()));
                     }
-                    let value = match &solution.value {
-                        Some(term) => self.graph.lookup(term),
-                        // A node shape's value is its focus node.
-                        None => shape.path.is_none().then_some(focus),
-                    };
-                    let path = solution
-                        .path
-                        .and_then(|path| self.graph.lookup(&Term::NamedNode(path)))
-                        .map(Path::Predicate)
-                        .or_else(|| shape.path.clone());
-                    results.push(raw(value, path));
+                }
+                Ok(sparql::Outcome::Solutions(found)) => {
+                    for solution in found {
+                        if solution.failure {
+                            failure("the query reported ?failure");
+                            continue;
+                        }
+                        let value = match &solution.value {
+                            Some(term) => self.graph.lookup(term),
+                            // A node shape's value is its focus node.
+                            None => shape.path.is_none().then_some(focus),
+                        };
+                        let path = solution
+                            .path
+                            .and_then(|path| self.graph.lookup(&Term::NamedNode(path)))
+                            .map(Path::Predicate)
+                            .or_else(|| shape.path.clone());
+                        results.push(raw(value, path));
+                    }
                 }
             }
-        }
+            ControlFlow::Continue(())
+        });
     }
 }
 

@@ -205,16 +205,18 @@ impl From<QueryEvaluationError> for Problem {
     }
 }
 
-/// Runs `check` for `focus` (with `values`, its value nodes, for an ASK validator) over
-/// `data`, with the pre-bound variables of SHACL-SPARQL, on the validation's `resources`.
+/// Runs `check` with one combination of its `parameters`' values ([`SparqlCheck::each_combination`])
+/// for `focus` (with `values`, its value nodes, for an ASK validator) over `data`, with the
+/// pre-bound variables of SHACL-SPARQL, on the validation's `resources`.
 #[expect(
     clippy::too_many_arguments,
-    reason = "one check's inputs: the data, the check, its focus and values, its shape's terms and the resources"
+    reason = "one check's inputs: the data, the check and its parameters, its focus and values, its shape's terms and the resources"
 )]
 pub(crate) fn run<V: ReadView>(
     view: &V,
     data: Selection,
     check: &SparqlCheck,
+    parameters: &[(Variable, TermId)],
     focus: TermId,
     values: &[TermId],
     shape: TermId,
@@ -232,7 +234,7 @@ pub(crate) fn run<V: ReadView>(
     if let Some(graph) = shapes_graph {
         bound.insert(variable(SHAPES_GRAPH), decode(graph)?);
     }
-    for (name, value) in &check.parameters {
+    for (name, value) in parameters {
         bound.insert(name.clone(), decode(*value)?);
     }
     // The statements Core reads, shapes graphs left out ([`Selection::query_dataset`]), on
