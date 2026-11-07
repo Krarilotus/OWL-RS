@@ -561,3 +561,54 @@ pub fn replication(
         peaks.join(", ")
     ))
 }
+
+/// The upload path (`--upload FILE`): the file sent as a Graph Store PUT into a named graph
+/// of a fresh in-memory store, `runs` times, each run its own store, through the mutation
+/// pipeline as the server applies it (parse, write, commit). The PUT's times, the last run's
+/// peak memory, and the statements the graph holds after it (the case's check).
+pub fn upload(
+    config: &nrese_store::StoreConfig,
+    file: &Path,
+    format: nrese_store::GraphResultFormat,
+    runs: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use nrese_store::{GraphTarget, GraphWriteRequest, ReadContext, StatementPattern};
+    const GRAPH: &str = "urn:perf-lab:upload";
+    let payload = std::fs::read(file)?;
+    let (mut times, mut statements, mut peak) = (Vec::new(), 0, String::from("null"));
+    for _ in 0..runs.max(1) {
+        let store = Arc::new(StoreService::new(config.clone())?);
+        let pipeline = MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(nrese_reasoner::ReasonerService::new(Default::default())),
+        );
+        let request = GraphWriteRequest {
+            target: GraphTarget::NamedGraph(GRAPH.to_owned()),
+            format,
+            base_iri: None,
+            payload: payload.clone(),
+            replace: true,
+        };
+        let phase = crate::Phase::start();
+        let started = Instant::now();
+        pipeline.apply(
+            MutationCommand::GraphWrite(request),
+            &Requester::all(),
+            &MutationTicket::new(),
+        )?;
+        times.push(started.elapsed());
+        peak = phase.json();
+        let in_graph = StatementPattern {
+            contexts: vec![nrese_rdf::NamedNode::new_unchecked(GRAPH).into()],
+            ..StatementPattern::default()
+        };
+        statements = store.count(&ReadContext::all(), &in_graph)?;
+    }
+    let runs = times.len();
+    let (p50, _, max) = percentiles(&mut times);
+    let min = times.first().map_or(0.0, |t| t.as_secs_f64() * 1e3);
+    Ok(format!(
+        "{{\"p50_ms\": {p50:.3}, \"min_ms\": {min:.3}, \"max_ms\": {max:.3}, \"runs\": {runs}, \"statements\": {statements}, \"bytes\": {}, \"memory\": {peak}}}",
+        payload.len()
+    ))
+}
