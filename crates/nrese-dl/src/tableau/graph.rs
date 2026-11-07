@@ -190,6 +190,114 @@ pub struct Mark {
     pub trail: u32,
 }
 
+/// One entry of a node's fact lists, as [`Graph::entries`] reads it.
+#[derive(Debug, Clone, Copy)]
+pub struct Entry {
+    /// Retracted: still in the list, no longer a fact.
+    pub dead: bool,
+    /// The node at the other end of an edge or inequality; [`NONE`] for a number, concept or
+    /// negative.
+    pub other: u32,
+    /// The in-entry of a self-loop: the second entry of a fact the lists hold twice.
+    pub repeat: bool,
+    /// An at-least number (`≥ n R.F`), what the ≥-rule makes successors from: a node holding
+    /// none that is live has no live successor.
+    pub at_least: bool,
+}
+
+/// The reading of [`Graph::entries`].
+pub struct Entries<'g> {
+    g: &'g Graph,
+    node: u32,
+    numbers: u32,
+    unary: u32,
+    negatives: u32,
+    out: u32,
+    into: u32,
+    unequal: u32,
+}
+
+impl Entries<'_> {
+    /// Whether every entry has been read.
+    pub fn done(&self) -> bool {
+        [
+            self.numbers,
+            self.unary,
+            self.negatives,
+            self.out,
+            self.into,
+            self.unequal,
+        ]
+        .iter()
+        .all(|&at| at == NONE)
+    }
+
+    /// Whether numbers are left to read (they come first).
+    pub fn numbers_left(&self) -> bool {
+        self.numbers != NONE
+    }
+}
+
+impl Iterator for Entries<'_> {
+    type Item = Entry;
+
+    fn next(&mut self) -> Option<Entry> {
+        let g = self.g;
+        let dead = &g.dead;
+        let fact = |dead: bool| Entry {
+            dead,
+            other: NONE,
+            repeat: false,
+            at_least: false,
+        };
+        Some(if self.numbers != NONE {
+            let i = self.numbers as usize;
+            let f = &g.numbers[i];
+            self.numbers = f.next;
+            Entry {
+                at_least: !f.at_most,
+                ..fact(dead.numbers[i])
+            }
+        } else if self.unary != NONE {
+            let i = self.unary as usize;
+            self.unary = g.unary[i].next;
+            fact(dead.unary[i])
+        } else if self.negatives != NONE {
+            let i = self.negatives as usize;
+            self.negatives = g.negatives[i].next;
+            fact(dead.negatives[i])
+        } else if self.out != NONE {
+            let i = self.out as usize;
+            let e = &g.edges[i];
+            self.out = e.next_out;
+            Entry {
+                other: e.to,
+                ..fact(dead.edges[i])
+            }
+        } else if self.into != NONE {
+            let i = self.into as usize;
+            let e = &g.edges[i];
+            self.into = e.next_in;
+            Entry {
+                other: e.from,
+                repeat: e.from == self.node,
+                ..fact(dead.edges[i])
+            }
+        } else if self.unequal != NONE {
+            let i = self.unequal as usize;
+            let f = &g.inequalities[i];
+            let first = f.a == self.node;
+            self.unequal = if first { f.next_a } else { f.next_b };
+            Entry {
+                other: if first { f.b } else { f.a },
+                ..fact(dead.inequalities[i])
+            }
+        } else {
+            return None;
+        })
+    }
+}
+
 fn key(a: u32, b: u32) -> u64 {
     (u64::from(a) << 32) | u64::from(b)
 }
@@ -741,6 +849,23 @@ impl Graph {
                 (!self.dead.unary[i]).then(|| &self.unary[i])
             })
         })
+    }
+
+    /// Every entry of `node`'s fact lists, one read each, retracted ones included: the
+    /// numbers first, then the concepts, negatives, edges out and in and inequalities. For a
+    /// caller that bounds the reading (`merge.rs`).
+    pub fn entries(&self, node: u32) -> Entries<'_> {
+        let n = &self.nodes[node as usize];
+        Entries {
+            g: self,
+            node,
+            numbers: n.numbers,
+            unary: n.label,
+            negatives: n.negatives,
+            out: n.first_out,
+            into: n.first_in,
+            unequal: n.inequalities,
+        }
     }
 
     pub fn out_edges(&self, node: u32) -> impl Iterator<Item = (u32, &Edge)> {
