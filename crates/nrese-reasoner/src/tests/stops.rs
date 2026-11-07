@@ -199,3 +199,88 @@ fn a_stopped_materialisation_is_never_reported_complete() {
         }
     }
 }
+
+/// A support-set update (graph access) whose change's forward cone is one driver joined
+/// with two atoms of 300 facts each: once its caller's stop fires, the round under way
+/// ends within `POLL_UNITS` scanned facts plus the two scans open on its stack, and the
+/// update ends `Cancelled`, with no sets (RSH-18, the support facet).
+#[test]
+fn a_cancelled_support_update_stops_within_its_poll_interval() {
+    use crate::eval::{Seg, Source};
+    use crate::graph_sets::{Annotation, Change, Limits, Stopped, UNWATCHED, update_support_sets};
+
+    /// The closure, counting the facts its scans hand out.
+    struct Closure {
+        facts: batch::Store,
+        scanned: AtomicUsize,
+    }
+    impl Source for Closure {
+        fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple)) {
+            self.facts.scan(pattern, seg, &mut |fact| {
+                self.scanned.fetch_add(1, Ordering::Relaxed);
+                f(fact);
+            });
+        }
+        fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize {
+            self.facts.estimate(pattern, seg)
+        }
+        fn contains(&self, fact: Triple) -> bool {
+            self.facts.contains(fact)
+        }
+    }
+
+    let n = 300;
+    let mut vocabulary = LocalVocabulary::default();
+    let rules = parse_rules(
+        &format!("join: {PRODUCT} -> (?s rdfs:r ?v)"),
+        &mut vocabulary,
+    )
+    .unwrap();
+    let schema = Schema::owl(&mut vocabulary);
+    let compiled = Rules {
+        rules: &rules,
+        lists: None,
+        schema: &schema,
+    };
+    let text: Vec<String> = (0..n)
+        .map(|i| format!("ex:x{i} rdfs:q ex:y{i}"))
+        .chain(["ex:a rdfs:p ex:b".to_owned()])
+        .collect();
+    let mut asserted = load(&mut vocabulary, &text.join("\n"));
+    asserted.sort_unstable();
+    let inferred = batch::materialise(&asserted, &rules, None, &schema).derived;
+    assert_eq!(inferred.len(), n, "the join's facts");
+    let ground = crate::delta::program(&MemoryBase::new(&asserted, &inferred), compiled);
+    let mut closure: Vec<Triple> = asserted.iter().chain(&inferred).copied().collect();
+    closure.sort_unstable();
+    let touched = load(&mut vocabulary, "ex:a rdfs:p ex:b");
+    let source = Closure {
+        facts: batch::Store::new(closure.clone()),
+        scanned: AtomicUsize::new(0),
+    };
+    let previous = |_: Triple| Annotation::default();
+    let change = Change {
+        source: &source,
+        in_closure: &|f| closure.binary_search(&f).is_ok(),
+        touched: &touched,
+        previous: &previous,
+        limit: usize::MAX,
+    };
+    let fires = 1000;
+    let stop = || source.scanned.load(Ordering::Relaxed) >= fires;
+    let limits = Limits {
+        watch: UNWATCHED,
+        stop: &stop,
+    };
+    let result = update_support_sets(&change, &ground, &[], &|_| vec![0], 1, limits);
+    assert_eq!(result.err(), Some(Stopped::Cancelled));
+    let scanned = source.scanned.load(Ordering::Relaxed);
+    let bound = fires + nrese_exec::POLL_UNITS as usize + 2 * n;
+    assert!(bound < n * n, "the bound proves nothing");
+    assert!(
+        scanned <= bound,
+        "{scanned} facts scanned after a stop at {fires} (bound {bound}; the round's join \
+         scans {})",
+        n * n
+    );
+}
