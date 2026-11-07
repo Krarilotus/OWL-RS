@@ -9,6 +9,7 @@ use rayon::prelude::*;
 use super::{Program, encode, storable};
 use crate::batch::{self, Phases, Schema};
 use crate::delta;
+use crate::eval::OperationStop;
 use crate::ir::{Triple, Violation};
 use crate::lists::ListDiagnostic;
 
@@ -35,6 +36,16 @@ pub fn materialise_until(
     snapshot: &Snapshot,
     stop: crate::eval::Stop<'_>,
 ) -> Result<Closure, delta::Interrupted> {
+    materialise_with(program, snapshot, &OperationStop::new(stop))
+}
+
+/// [`materialise_until`] under one operation's `stop`, whose memory limit and room its
+/// caller chose ([`OperationStop::within`]): the equality copies are admitted by its room.
+pub fn materialise_with(
+    program: &Program,
+    snapshot: &Snapshot,
+    stop: &OperationStop<'_>,
+) -> Result<Closure, delta::Interrupted> {
     nrese_exec::heap::phase("reasoner: input");
     let (input, axioms) = input_of(program, snapshot);
     let schema = program.schema_for(snapshot);
@@ -43,7 +54,7 @@ pub fn materialise_until(
             // A class holding rdf:nil reads every list through it as empty: computed again
             // by replication. A compact stack keeps the closure over representatives.
             result if result.nil_merged && !program.store_representatives => {
-                batch::materialise_grouped_until(
+                batch::materialise_grouped_with(
                     input_of(program, snapshot).0,
                     &program.rules,
                     program.lists.as_ref(),
@@ -53,7 +64,7 @@ pub fn materialise_until(
             }
             result => result,
         },
-        None => batch::materialise_grouped_until(
+        None => batch::materialise_grouped_with(
             input,
             &program.rules,
             program.lists.as_ref(),
@@ -126,13 +137,13 @@ fn by_representatives(
     input: Grouped,
     same_as: u64,
     schema: &Schema,
-    stop: crate::eval::Stop<'_>,
+    stop: &OperationStop<'_>,
 ) -> Result<batch::Materialisation, delta::Interrupted> {
     let listing = match program.store_representatives {
         true => batch::Listing::Stored,
         false => batch::Listing::Expanded,
     };
-    let mut result = batch::materialise_representatives_until(
+    let mut result = batch::materialise_representatives_with(
         batch::Input::Grouped(input),
         &program.rules,
         program.lists.as_ref(),
@@ -166,10 +177,20 @@ pub fn equality_report_until(
     snapshot: &Snapshot,
     stop: crate::eval::Stop<'_>,
 ) -> Result<String, crate::delta::Interrupted> {
-    let before = crate::eval::OperationStop::new(stop);
-    if before.fired() {
-        return Err(before.interrupted());
+    equality_report_with(program, snapshot, &OperationStop::new(stop))
+}
+
+/// [`equality_report_until`] under one operation's `stop`, whose memory limit and room its
+/// caller chose ([`OperationStop::within`]): replication's copies are admitted by its room.
+pub fn equality_report_with(
+    program: &Program,
+    snapshot: &Snapshot,
+    operation: &OperationStop<'_>,
+) -> Result<String, crate::delta::Interrupted> {
+    if operation.fired() {
+        return Err(operation.interrupted());
     }
+    let stop: crate::eval::Stop<'_> = &|| operation.fired();
     let input: Vec<Triple> = asserted_by_predicate(snapshot)
         .into_iter()
         .flat_map(|(p, pairs)| pairs.into_iter().map(move |(o, s)| [s, p, o]))
@@ -185,12 +206,12 @@ pub fn equality_report_until(
     let representative_time = started.elapsed();
     let asserted = input.len();
     let started = Instant::now();
-    let replicated = batch::materialise_owned_until(
+    let replicated = batch::materialise_owned_with(
         input,
         &program.rules,
         program.lists.as_ref(),
         &program.schema,
-        stop,
+        operation,
     )?;
     let replicated_time = started.elapsed();
     let classes = closure.classes.classes().count();

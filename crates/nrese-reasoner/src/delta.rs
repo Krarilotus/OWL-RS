@@ -268,28 +268,35 @@ pub fn update_with<B: Base + ?Sized>(
     // The process's memory limit stops it too, whatever the caller polls; once stopped it
     // stays stopped, so no morsel skipped is taken for done.
     let stop = super::eval::OperationStop::new(stop);
-    update_body(
-        base,
-        inserted,
-        deleted,
-        rules,
-        cache,
-        &|| stop.fired(),
-        policy,
-    )
-    .map_err(|_| stop.interrupted())
+    update_within(base, inserted, deleted, rules, cache, &stop, policy)
 }
 
-/// [`update_with`]'s work, under the operation's latched `stop`.
+/// [`update_with`] under one operation's `stop`, whose memory limit and room its caller
+/// chose ([`super::eval::OperationStop::within`]): replication's copies are admitted by
+/// its room.
+pub fn update_within<B: Base + ?Sized>(
+    base: &B,
+    inserted: &[Triple],
+    deleted: &[Triple],
+    rules: Rules<'_>,
+    cache: Option<&GroundProgram>,
+    stop: &super::eval::OperationStop<'_>,
+    policy: policy::Policy,
+) -> Result<Update, Interrupted> {
+    update_body(base, inserted, deleted, rules, cache, stop, policy).map_err(|_| stop.interrupted())
+}
+
+/// [`update_with`]'s work, under the operation's latched stop, `operation`.
 fn update_body<B: Base + ?Sized>(
     base: &B,
     inserted: &[Triple],
     deleted: &[Triple],
     rules: Rules<'_>,
     cache: Option<&GroundProgram>,
-    stop: Stop<'_>,
+    operation: &super::eval::OperationStop<'_>,
     policy: policy::Policy,
 ) -> Result<Update, Interrupted> {
+    let stop: Stop<'_> = &|| operation.fired();
     let check_stop = || {
         if stop() {
             Err(Interrupted::default())
@@ -845,7 +852,7 @@ fn update_body<B: Base + ?Sized>(
         candidates.extend(run_jobs(&state, &jobs, &|fact| !state.contains(fact), stop));
         check_stop()?;
         if let Some(equality) = &mut equality {
-            candidates.extend(equality.run(&state));
+            candidates.extend(equality.run(&state, operation)?);
         }
         drop(jobs);
         // Transitive properties: newly declared ones closed in full (SCC condensation), the
