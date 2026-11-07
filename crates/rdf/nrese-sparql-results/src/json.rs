@@ -2,8 +2,10 @@
 //! `nrese-json`'s pull parser one solution at a time.
 //!
 //! Reading takes the members of the top object in any order. The usual one (`head`, then
-//! `results`) streams; `results` before `head` is legal JSON too, and then the bindings are
-//! collected until the variables are known.
+//! `results`) streams; `results` before `head` is legal JSON too. From memory that streams
+//! as well: the head is read first ([`slice_head`]). From a reader the bindings are
+//! collected as written until the variables are known, and each laid out over them only
+//! when it is handed out, so they never take every row at every variable.
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -153,8 +155,9 @@ pub(crate) enum Start {
 pub(crate) struct JsonSolutions<E: Events> {
     events: E,
     variables: Arc<[Variable]>,
-    /// Rows collected before the head (`results` before `head`), handed out first.
-    buffered: VecDeque<Vec<Option<Term>>>,
+    /// Bindings collected before the head (`results` before `head`, from a reader), as
+    /// written: handed out first, each laid out over the variables then.
+    buffered: VecDeque<Vec<(String, Term)>>,
     /// Inside the bindings array.
     streaming: bool,
     done: bool,
@@ -165,12 +168,16 @@ const MAX_NESTING: usize = 64;
 
 impl<E: Events> JsonSolutions<E> {
     /// Reads up to the first binding (or the whole document, for a boolean or when the
-    /// bindings come before the head).
-    pub(crate) fn start(mut events: E) -> Result<(Start, Self), QueryResultsParseError> {
+    /// bindings come before a head not known yet). `head`: the document's variables, if
+    /// already read ([`slice_head`]).
+    pub(crate) fn start(
+        mut events: E,
+        head: Option<Vec<Variable>>,
+    ) -> Result<(Start, Self), QueryResultsParseError> {
         if !matches!(events.next()?, JsonEvent::StartObject) {
             return Err(syntax("SPARQL JSON results must be an object"));
         }
-        let mut variables: Option<Vec<Variable>> = None;
+        let mut variables: Option<Vec<Variable>> = head;
         let mut boolean = None;
         let mut early: Vec<Vec<(String, Term)>> = Vec::new();
         let mut saw_results = false;
@@ -239,16 +246,12 @@ impl<E: Events> JsonSolutions<E> {
             (None, None) => return Err(syntax("neither 'boolean' nor 'head' and 'results'")),
             (Some(_), None) => return Err(syntax("'results' without 'head'")),
         };
-        let mut buffered = VecDeque::with_capacity(early.len());
-        for binding in early {
-            buffered.push_back(place(&variables, binding)?);
-        }
         Ok((
             start,
             Self {
                 events,
                 variables,
-                buffered,
+                buffered: early.into(),
                 streaming: false,
                 done: true,
             },
@@ -261,8 +264,8 @@ impl<E: Events> JsonSolutions<E> {
 
     /// The next solution's values, or `None` after the last.
     pub(crate) fn next_row(&mut self) -> Result<Option<Vec<Option<Term>>>, QueryResultsParseError> {
-        if let Some(row) = self.buffered.pop_front() {
-            return Ok(Some(row));
+        if let Some(binding) = self.buffered.pop_front() {
+            return place(&self.variables, binding).map(Some);
         }
         if self.done || !self.streaming {
             return Ok(None);
@@ -285,6 +288,26 @@ impl<E: Events> JsonSolutions<E> {
             }
             _ => Err(syntax("a binding must be an object")),
         }
+    }
+}
+
+/// The variables of a document in memory, wherever its `head` is among the top object's
+/// members, so that bindings before it stream too; `None` if it has no head, or isn't an
+/// object (then [`JsonSolutions::start`] says what is wrong). Reads no binding into memory.
+pub(crate) fn slice_head(bytes: &[u8]) -> Result<Option<Vec<Variable>>, QueryResultsParseError> {
+    let mut events = SliceJsonParser::from_bytes(bytes)?;
+    if !matches!(events.next()?, JsonEvent::StartObject) {
+        return Ok(None);
+    }
+    loop {
+        let key = match events.next()? {
+            JsonEvent::ObjectKey(key) => key.into_owned(),
+            _ => return Ok(None),
+        };
+        if key == "head" {
+            return read_head(&mut events).map(Some);
+        }
+        skip_value(&mut events)?;
     }
 }
 

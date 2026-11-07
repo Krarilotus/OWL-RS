@@ -19,6 +19,7 @@ Each subcommand exits 0 only when its part passes; `verdict` only when every par
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -46,7 +47,7 @@ PASS_FILE = re.compile(r"pass-(\d+)-([A-Za-z0-9_.-]+)\.json$")
 # --- plan --------------------------------------------------------------------------------------
 
 def plan(catalog: list[dict], max_gb: float, selection: list[str] | None = None, min_gb: float = 0,
-         big_gb: float | None = None, big_host: str = "khaleesi-wsl") -> tuple[list[str], dict, dict]:
+         big_gb: float | None = None, big_host: str = "the big part") -> tuple[list[str], dict, dict]:
     """The cases a host giving `max_gb` runs at their declared caps (those above `min_gb`: the big
     host's share), the cases a big host giving `big_gb` runs instead (`elsewhere`), and the
     others with why. A cap is never lowered to fit (PROTOCOL.md §3)."""
@@ -60,7 +61,7 @@ def plan(catalog: list[dict], max_gb: float, selection: list[str] | None = None,
         if cap <= max_gb:
             run.append(case["name"])
         elif big_gb is not None and cap <= big_gb:
-            elsewhere[case["name"]] = f"its cap is {cap:g} GB: timed on {big_host} (giving {big_gb:g} GB)"
+            elsewhere[case["name"]] = f"its cap is {cap:g} GB: timed in {big_host} (giving {big_gb:g} GB)"
         else:
             not_run[case["name"]] = f"its cap is {cap:g} GB, the gate's host gives {max_gb:g} GB"
     return run, not_run, elsewhere
@@ -144,6 +145,25 @@ def schedule_errors(passes: list[dict], sides: list[str], min_blocks: int,
             if counts and max(counts.values()) - min(counts.get(k, 0) for k in want) > 1:
                 errors.append(f"{case}: layouts unevenly covered {dict(sorted(counts.items()))}")
     return errors
+
+
+def fleet_host_errors(passes: list[dict], host: str) -> list[str]:
+    """Why the passes can't be judged as `host`'s, the fleet host the round names (an A-B-B-A's
+    manifest, a timed part's report context), whose floor its verdict reads: a pass from another
+    fleet host, or one that doesn't say (manifest.machine() `fleet_host`). Review r1 R1-F1: the
+    fleet may move a timed job between steps when a host's timing window closes, and passes timed
+    elsewhere were judged by the first host's floor, "no loss shown". No host named: nothing to
+    hold them to (a run outside a fleet job)."""
+    if not host:
+        return []
+    found = [(p["report"].get("machine") or {}).get("fleet_host") for p in passes]
+    out = []
+    if unsaid := sum(1 for h in found if not h):
+        out.append(f"{unsaid} passes don't say which fleet host ran them (machine.fleet_host): not judged as {host}'s")
+    if elsewhere := sorted({h for h in found if h and h != host}):
+        out.append(f"passes ran on {', '.join(elsewhere)}, not on {host}, the host the round names and whose floor "
+                   "it reads: a job moved between hosts has no verdict")
+    return out
 
 
 def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, planned: list[str]) -> list[str]:
@@ -795,6 +815,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
     planned = sorted({c for p in passes for c in p["report"].get("planned_cases", [])})
     summary["planned"] = planned
     summary["errors"] += provenance_errors(passes, sides, harness, planned)
+    summary["errors"] += fleet_host_errors(passes, str(context.get("host") or ""))
     host_errors, summary["host_notes"] = host_states(passes)
     summary["errors"] += host_errors
     summary["host"] = sorted({(p["report"].get("machine") or {}).get("host") for p in passes}, key=str)
@@ -1521,32 +1542,61 @@ def measurement_inputs(checkout: str, revs: list[str], sides: dict[str, str] | N
     return inputs
 
 
+def spec(job: dict) -> dict:
+    """The job as the fleet takes it: without the planner's own keys (`_plan`)."""
+    return {k: v for k, v in job.items() if not k.startswith("_")}
+
+
+def toml_value(v) -> str:
+    """A value as TOML writes it inline (strings JSON-escaped, which TOML's basic strings read)."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(toml_value(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{ " + ", ".join(f"{k} = {toml_value(x)}" for k, x in v.items()) + " }"
+    return json.dumps(v)
+
+
+def side_inputs(checkout: str, rev: str, revs: list[str]) -> list[dict]:
+    """The git inputs a job building `revs` from a checkout of `rev` needs: the sides' measurement
+    commits (measurement_inputs()), and each side that `rev`'s history doesn't hold, so that its
+    build finds it (Sol r1 S4, 2 Nov 2026: a base off the change's history was built unstaged)."""
+    import subprocess
+    inputs = measurement_inputs(checkout, revs)
+    for side in dict.fromkeys(revs):
+        held = subprocess.run(["git", "-C", checkout, "merge-base", "--is-ancestor", side, rev],
+                              capture_output=True, text=True, timeout=60)
+        if held.returncode == 1:  # not an ancestor; another code (no such commit) is the build's to report
+            inputs.append({"name": f"side-{side[:8]}", "source": {"git": checkout, "rev": side}})
+    return inputs
+
+
 def toml_job(job: dict) -> str:
-    def value(v):
-        if isinstance(v, bool):
-            return "true" if v else "false"
-        if isinstance(v, (int, float)):
-            return repr(v)
-        if isinstance(v, list):
-            return "[" + ", ".join(value(x) for x in v) + "]"
-        if isinstance(v, dict):
-            return "{ " + ", ".join(f"{k} = {value(x)}" for k, x in v.items()) + " }"
-        return json.dumps(v)
-    lines = [f"{k} = {value(v)}" for k, v in job.items() if k not in ("requires", "inputs", "outputs")]
-    lines += ["", "[requires]"] + [f"{k} = {value(v)}" for k, v in job["requires"].items()]
+    job = spec(job)
+    lines = [f"{k} = {toml_value(v)}" for k, v in job.items() if k not in ("requires", "inputs", "outputs")]
+    lines += ["", "[requires]"] + [f"{k} = {toml_value(v)}" for k, v in job["requires"].items()]
     for table in ("inputs", "outputs"):
         for item in job.get(table, []):
-            lines += ["", f"[[{table}]]"] + [f"{k} = {value(v)}" for k, v in item.items()]
+            lines += ["", f"[[{table}]]"] + [f"{k} = {toml_value(v)}" for k, v in item.items()]
     return "\n".join(lines) + "\n"
 
 
-def linux_host(name: str, registry: dict | None = None) -> None:
-    """The gate's binaries are Linux ELF (built on office-pc): a timed host must be a Linux one in
-    benches/hosts.toml (khaleesi-wsl, not khaleesi). Anything else is refused, never routed."""
-    host = (registry or hosts_registry.load()).get("host", {}).get(name)
-    if not host or host.get("os") != "linux":
-        raise SystemExit(f"{name}: not a Linux host in benches/hosts.toml "
-                         f"(os {host.get('os') if host else 'unknown'}): the gate's ELF binaries can't run there")
+def toml_set(head: dict, members: list[dict]) -> str:
+    """One fleet set (fleet-jobs skill, "A set": one wait, one cancel, one result): `head` its
+    [set] table, each member a [[job]] with its requires, inputs and outputs."""
+    lines = ["[set]"] + [f"{k} = {toml_value(v)}" for k, v in head.items()]
+    for job in map(spec, members):
+        lines += ["", "[[job]]"] + [f"{k} = {toml_value(v)}" for k, v in job.items()
+                                     if k not in ("requires", "inputs", "outputs")]
+        lines += ["[job.requires]"] + [f"{k} = {toml_value(v)}" for k, v in job["requires"].items()]
+        for table in ("inputs", "outputs"):
+            for item in job.get(table, []):
+                lines += [f"[[job.{table}]]"] + [f"{k} = {toml_value(v)}" for k, v in item.items()]
+    return "\n".join(lines) + "\n"
+
 
 
 def checkout_rev(checkout: str, candidate: str, harness: str) -> str:
@@ -1573,83 +1623,364 @@ def checkout_rev(checkout: str, candidate: str, harness: str) -> str:
                      "--harness the candidate)")
 
 
+# What a timed part asks, never a host (rule.hosts-belong-to-the-fleet; the brief of 2 Nov 2026): a
+# timing host that also builds, since each part builds its sides where it times them (its first step,
+# the host held from there) and so needs no binaries staged from elsewhere.
+TIMING_ROLES = ["measure", "build"]
+BUILD_MIN = 25  # a revision's build, at most; one of the same identity on that host is reused
+ASSETS = "owlrs-bench-assets"
+SPARQL_PREPARE = "benches/sparql/prepare.sh"
+
+
+def volume_files(case: dict) -> list[str]:
+    """The frozen files a case reads (`volume:` specs, a concatenation's parts included)."""
+    specs = [case.get("data", ""), *case.get("extra", [])]
+    specs += [p for s in specs if s.startswith("concat:") for p in s[len("concat:"):].split("+")]
+    return [s[len("volume:"):] for s in specs if s.startswith("volume:")]
+
+
+def frozen(files: set[str], datasets: Path) -> dict[str, dict]:
+    """benches/datasets.toml's entries, read only when there are frozen files to look up: a
+    checkout without the file (a test's own repository) plans its generated-data cases (Sol
+    loop proofs 1 and 3, 2 Nov 2026: read for every plan, it failed where no case reads one)."""
+    if not files:
+        return {}
+    return {d["file"]: d for d in tomllib.loads(datasets.read_text(encoding="utf-8"))["dataset"]}
+
+
+def data_needs(cases: list[dict], datasets: Path = ROOT / "benches" / "datasets.toml") -> list[str]:
+    """What a host must hold for the cases' frozen inputs (fleet `has`): the verified bench assets
+    (hosts.toml `inputs`: the datasets, ORE ontologies and the reference taxonomies). The SPARQL
+    workloads' data is the job's own to make (Johannes, 2 Nov 2026: "Data is the job's
+    responsibility, not the fleet's"): release-gate.sh prepare makes what benches/sparql/prepare.sh
+    can into the host's cache (data_state()), the job asking its disk (data_disk_gb())."""
+    entries = frozen({f for c in cases for f in volume_files(c)}, datasets)
+    out = set()
+    for c in cases:
+        if any(SPARQL_PREPARE not in entries.get(f, {}).get("made_by", "") for f in volume_files(c)):
+            out.add(ASSETS)
+        if any(s.startswith("ore:") for s in [c.get("data", ""), *c.get("extra", [])]) or c.get("reference"):
+            out.add(ASSETS)
+    return sorted(out)
+
+
+def sparql_data() -> Path:
+    """The SPARQL workloads' data cache on this host (benches/hosts.toml [caches.sparql-data])."""
+    return Path(os.environ.get("SPARQL_DATA") or Path.home() / "owlrs" / "sparql-data")
+
+
+def data_disk_gb(cases: list[dict], datasets: Path = ROOT / "benches" / "datasets.toml") -> float:
+    """The disk a job may fill making its cases' SPARQL data where the host lacks it: each
+    frozen file benches/sparql/prepare.sh makes, twice (its source and the file), in GB."""
+    files = {f for c in cases for f in volume_files(c)}
+    entries = frozen(files, datasets)
+    made = [entries[f] for f in files if SPARQL_PREPARE in entries.get(f, {}).get("made_by", "")]
+    return math.ceil(2 * sum(d.get("bytes", 0) for d in made) / 1e9)
+
+
+def query_set_problems(directory: Path, pinned: dict[str, str]) -> list[str]:
+    """Why the query set in `directory` isn't its pins (empty: it is): every pinned file, by exact
+    name, with its SHA-256, and no other .rq file (review r1 R1-F2: a count of files passed a set of
+    wrong contents, or of other names)."""
+    if not directory.is_dir():
+        return [f"no {directory}"]
+    have = {p.name: p for p in directory.glob("*.rq")}
+    out = []
+    if missing := sorted(set(pinned) - set(have)):
+        out.append(f"{len(missing)} pinned files missing (e.g. {missing[0]})")
+    if extra := sorted(set(have) - set(pinned)):
+        out.append(f"{len(extra)} files not pinned (e.g. {extra[0]})")
+    wrong = sorted(n for n in set(pinned) & set(have)
+                   if hashlib.sha256(have[n].read_bytes()).hexdigest() != pinned[n])
+    if wrong:
+        out.append(f"{len(wrong)} files differ from their SHA-256 pins (e.g. {wrong[0]})")
+    return out
+
+
+def data_state(cases: list[dict], make: bool = False, root: Path | None = None,
+               inputs_repo: Path | None = None) -> tuple[list[str], bool]:
+    """What this host holds of the cases' frozen inputs, and whether all of it is as pinned: the
+    one validator of query sets, which release-gate.sh prepare runs with `make` and stops on.
+    - Datasets: each file in the bench assets (hosts.toml inputs.general) or the SPARQL data cache;
+      with `make`, one benches/sparql/prepare.sh makes is made into the cache first, its failure
+      failing the data. Their one gate is prepare's freeze check (their SHA-256), which links and
+      converts them: here the probe reports a size other than the frozen one, and with `make` leaves
+      the verdict to that check (one validator each, not two; review r1).
+    - Query sets (@watdiv...): exact pinned names and SHA-256 (benches/sparql/queries.sha256), in the
+      cache and as delivered. WatDiv's generator seeds from the clock, so a set that isn't its pins
+      comes from the private bench-inputs repository's commit, a git input of the job
+      (BENCH_INPUTS_REV): extracted aside, checked, and only then put in place; a delivery that
+      isn't the pins fails and leaves the cache as it was.
+    Lines, and whether everything is there and as pinned."""
+    import subprocess
+    root = root or ROOT
+    general, cache = hosts_registry.input_path("general"), sparql_data()
+    files = sorted({f for c in cases for f in volume_files(c)})  # a concatenation's parts too (Sol r2 T2)
+    entries = frozen(set(files), root / "benches" / "datasets.toml")
+    lines, ok = [], True
+    for name in files:
+        entry = entries.get(name, {})
+        found = next((d / name for d in (general, cache) if d and (d / name).is_file()), None)
+        if found is None and make and SPARQL_PREPARE in entry.get("made_by", ""):
+            dataset = entry["made_by"].split(SPARQL_PREPARE, 1)[1].split()
+            done = subprocess.run(["bash", str(root / SPARQL_PREPARE), *dataset, "--out", str(cache)], cwd=root)
+            lines.append(f"made {name} ({' '.join(dataset)}): exit {done.returncode}")
+            if done.returncode != 0:
+                ok = False
+            found = cache / name if (cache / name).is_file() else None
+        if found is None:
+            ok = False
+            how = (f"made by `{entry['made_by']}`" if entry.get("made_by") else "no recorded maker")
+            lines.append(f"MISSING {name}: {how}")
+        elif entry.get("bytes") and found.stat().st_size != entry["bytes"]:
+            # The probe's diagnosis; in prepare (`make`), the freeze check that follows refuses it by
+            # its SHA-256, the datasets' one gate, so this step doesn't second-guess it.
+            ok = ok and make
+            lines.append(f"DIFFERS {name}: {found} is {found.stat().st_size} bytes, frozen {entry['bytes']}"
+                         + (" (prepare's freeze check decides)" if make else ""))
+        else:
+            lines.append(f"present {name}: {found}, its frozen size (prepare checks its SHA-256)")
+    pin_file = root / "benches/sparql/queries.sha256"
+    pins = [line.split("  ", 1) for line in (pin_file.read_text(encoding="utf-8").splitlines()
+                                             if pin_file.is_file() else []) if "  " in line]
+    rev = os.environ.get("BENCH_INPUTS_REV", "")
+    for qset in sorted({c["queries"][1:] for c in cases if str(c.get("queries", "")).startswith("@watdiv")}):
+        pinned = {name.split("/", 1)[1]: sha for sha, name in pins if name.startswith(f"{qset}/")}
+        target = cache / "queries" / qset
+        if not pinned:
+            ok = False
+            lines.append(f"MISSING pins for query set {qset} in {pin_file}")
+            continue
+        problems = query_set_problems(target, pinned)
+        if problems and make and rev:
+            problems = extract_query_set(qset, rev, inputs_repo or root, cache, pinned, lines)
+        if problems:
+            ok = False
+            lines.append(f"MISSING query set {qset}: {'; '.join(problems)}. Generated with a clock seed, it can't be "
+                         f"made again: it comes from the bench inputs repository (benches/hosts.toml [sources]), a "
+                         f"git input of the job ({'BENCH_INPUTS_REV ' + rev[:12] if rev else 'none given'})")
+        else:
+            lines.append(f"held query set {qset}: {len(pinned)} files, each as pinned")
+    return lines, ok
+
+
+def extract_query_set(qset: str, rev: str, repo: Path, cache: Path, pinned: dict[str, str],
+                      lines: list[str]) -> list[str]:
+    """The query set `qset` out of the bench-inputs commit `rev` (in `repo`, where the fleet pushed
+    it) by `git archive`, into a directory aside, checked against its pins, and only then in place
+    of the cache's. Its problems (empty: in place); a delivery that isn't the pins leaves the cache
+    as it was."""
+    import io
+    import shutil
+    import subprocess
+    import tarfile
+    import tempfile
+    done = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", rev, f"queries/{qset}"],
+                          capture_output=True, timeout=300)
+    if done.returncode != 0:
+        why = done.stderr.decode(errors="replace").strip()[-200:]
+        lines.append(f"FAILED taking query set {qset} from the bench inputs ({rev[:12]}): {why}")
+        return [f"not in the bench inputs at {rev[:12]}"]
+    (cache / "queries").mkdir(parents=True, exist_ok=True)
+    aside = Path(tempfile.mkdtemp(prefix=f".{qset}-", dir=cache / "queries"))
+    try:
+        with tarfile.open(fileobj=io.BytesIO(done.stdout)) as archive:
+            archive.extractall(aside, filter="data")
+        delivered = aside / "queries" / qset
+        if problems := query_set_problems(delivered, pinned):
+            lines.append(f"FAILED: the bench inputs at {rev[:12]} deliver a query set {qset} that isn't its pins: "
+                         + "; ".join(problems))
+            return [f"the bench inputs at {rev[:12]} aren't its pins"]
+        target = cache / "queries" / qset
+        shutil.rmtree(target, ignore_errors=True)
+        delivered.rename(target)
+        lines.append(f"copied query set {qset} from the bench inputs ({rev[:12]}): {len(pinned)} files, each as pinned")
+        return []
+    finally:
+        shutil.rmtree(aside, ignore_errors=True)
+
+
+BENCH_INPUTS_INPUT = "BENCH_INPUTS"
+
+
+def bench_inputs(cases: list[dict]) -> list[dict]:
+    """The private input repository as a git input (benches/hosts.toml [sources] bench-inputs, its
+    variable overriding), where the cases read a pinned query set that can't be made again (WatDiv's):
+    the job fetches it, nothing a host must hold (the orchestrator's decision (b), 2 Nov 2026). None
+    where no case needs it, or the repository isn't there: the data probe then says what's missing."""
+    import subprocess
+    if not any(str(c.get("queries", "")).startswith("@watdiv") for c in cases):
+        return []
+    source = hosts_registry.load().get("sources", {}).get("bench-inputs", {})
+    repo = os.environ.get(source.get("env") or "BENCH_INPUTS_GIT") or source.get("git")
+    if not repo or not Path(repo).is_dir():
+        return []
+    rev = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=60)
+    if rev.returncode != 0:
+        return []
+    return [{"name": BENCH_INPUTS_INPUT, "source": {"git": Path(repo).as_posix(), "rev": rev.stdout.strip()}}]
+
+
+def case_seconds(measure: dict | None, case: str) -> float | None:
+    """A case's seconds a pass by the calibration, None where it has none."""
+    value = (measure or {}).get(case, {}).get("seconds")
+    return float(value) if value else None
+
+
 def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_round: int, cases: str | None,
-         base: str = BASE, main: str = MAIN, timed_host: str = "phuoc-yu", checks_host: str = "office-pc",
-         max_gb: float = 24, checks: bool = True, big_host: str | None = "khaleesi-wsl",
-         big_gb: float = 28, measure: dict | None = None, batch: bool = False,
-         layouts: int = 1) -> dict[str, dict]:
-    """The gate's fleet jobs: binaries and data, then round 1's blocks and its report, alone on
-    the timed host; the cases whose caps exceed it on the big host, a Linux endpoint (khaleesi-wsl:
-    ELF binaries run there, never on native Windows; unpack refuses another), on the build's
-    binaries; the W3C suites and the guards on the checks host. With `measure` the k-th block runs
-    the cases needing k blocks; blocks rotate through `layouts` builds."""
-    linux_host(timed_host)
-    if big_host:
-        linux_host(big_host)
-    env = {"GATE_NAME": f"gate-v2-{candidate[:8]}", "GATE_MAX_GB": str(max_gb), "NRESE_QUIET_SLOT": "0",
+         base: str = BASE, main: str = MAIN, max_gb: float = 24, checks: bool = True,
+         big_gb: float | None = 28, measure: dict | None = None, batch: bool = False,
+         layouts: int = 1, catalog: list[dict] | None = None) -> dict[str, dict]:
+    """The gate's fleet jobs, one set: its timed part (the cases up to `max_gb`) and its big part
+    (those up to `big_gb`), each one owlrs.timed job on a timing host the fleet picks by capability
+    (TIMING_ROLES, Linux: ELF binaries, never native Windows; the memory; the data its cases read):
+    each builds every side and prepares the data there first, then times round 1's
+    blocks alone and reports; and the W3C suites and the guards on any test host. With `measure` the
+    k-th block runs the cases needing k blocks; blocks rotate through `layouts` builds. Each job's
+    `est_min` is its planned minutes (plan_minutes())."""
+    catalog = cases_registry.load() if catalog is None else catalog
+    selection = cases.split(",") if cases else None
+    run, _, elsewhere = plan(catalog, max_gb, selection, 0, big_gb)
+    by_name = {c["name"]: c for c in catalog}
+    # Each part's mutable gate state (release-gate.sh GATE: its plan, data view, passes) is the
+    # request's and the part's own: placed by capability, two requests at one candidate, or a part and
+    # the checks, may meet on one host (review r1 R1-F3). The shared binaries and data caches stay
+    # shared (GATE_BIN, SPARQL_DATA).
+    request = json.dumps([candidate, harness, base, main, cases, blocks_per_round, max_gb, big_gb, layouts, batch,
+                          prefix])
+    gate_name = f"gate-v2-{candidate[:8]}-{hashlib.sha256(request.encode()).hexdigest()[:8]}"
+    env = {"GATE_NAME": gate_name, "GATE_MAX_GB": str(max_gb), "NRESE_QUIET_SLOT": "0",
            "GATE_MIN_BLOCKS": str(blocks_per_round), **({"GATE_CASES": cases} if cases else {}),
-           **({"GATE_BIG_GB": str(big_gb), "GATE_BIG_HOST": big_host} if big_host else {}),
+           **({"GATE_BIG_GB": str(big_gb)} if big_gb else {}),
            **({"GATE_BATCH": "1"} if batch else {}), **({"GATE_LAYOUTS": str(layouts)} if layouts > 1 else {})}
     source = [{"name": "checkout", "source": {"git": checkout, "rev": checkout_rev(checkout, candidate, harness)}}]
     gate_ = ["bash", "scripts/release-gate.sh"]
     revs = {"base": base, "main": main, "cand": candidate}
-    small = bool(cases)
-    out = {f"{prefix}-build": {
-        "id": f"{prefix}-build", "group": "release", "kind": "owlrs.build", "priority_class": "merge-gate",
-        "est_min": 25 * len(dict.fromkeys([base, main, candidate, harness])) + (10 if small else 30), "env": env,
-        "steps": [[*gate_, "build", rev] for rev in dict.fromkeys([base, main, candidate, harness])]
-        + [[*gate_, "prepare", harness]] + ([[*gate_, "pack", base, main, candidate, harness]] if big_host else []),
-        "requires": {"hosts": [timed_host], "cores": 16, "ram_gb": 12},
-        "inputs": source + measurement_inputs(checkout, [base, main, candidate, harness]),
-        **({"outputs": [{"name": "binaries", "path": "binaries"}]} if big_host else {})}}
-    # minutes, the three sides' two runs of every case (a main that is the base isn't timed again)
+    revisions = list(dict.fromkeys([base, main, candidate, harness]))
+    inputs = source + side_inputs(checkout, source[0]["source"]["rev"], revisions)
+    # Every build and the data's preparation in one first step, exclusive like every step: the fleet
+    # keeps an exclusive job's host only before an exclusive step and while the host takes exclusive
+    # work, so the part starts only where it can time and every step runs where these binaries are
+    # (Sol r1 S1; 2 Nov 2026: an untimed first step built on a host outside its timing window).
+    builds = [["bash", "-c", 'set -e; harness=$1; shift; for rev in "$@"; do bash scripts/release-gate.sh build "$rev"; '
+               'done; bash scripts/release-gate.sh prepare "$harness"', "prepare", harness, *revisions]]
+    # the sides timed (a main that is the base isn't timed again)
     sides = 2 + (main != base)
-    per_block = (2 if small else 60) * sides / 3
     # Whole Latin squares (whole_squares()): every timed side opens a case's blocks alike.
     env["GATE_SQUARE"] = str(sides)
     blocks_per_round = whole_squares(blocks_per_round, sides)
     env["GATE_MIN_BLOCKS"] = str(blocks_per_round)
-    count = blocks_per_round
-    steps = [[*gate_, "plan-blocks", harness]] if measure else []
-    if measure:
-        need = {c: whole_squares(int(e.get("blocks", blocks_per_round)), sides) for c, e in measure.items()}
-        count = max([blocks_per_round, *need.values()])
-        full = sum(e.get("seconds", 0) for e in measure.values()) or 1
-    est = 2.0
+    need = {c: whole_squares(int(e.get("blocks", blocks_per_round)), sides) for c, e in (measure or {}).items()}
+    count = max([blocks_per_round, *need.values()]) if measure else blocks_per_round
+    report = [[*gate_, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"], [*gate_, "clean"]]
+
+    def part(job_id: str, part_env: dict, planned: list[str], timed_steps: list[list[str]], ram_gb: float,
+             block_cases: list[list[str]]) -> dict:
+        steps = builds + timed_steps + report
+        mine = [by_name[c] for c in planned if c in by_name]
+        has, disk = data_needs(mine), data_disk_gb(mine)
+        fetched = bench_inputs(mine)
+        if fetched:
+            part_env = {**part_env, "BENCH_INPUTS_REV": fetched[0]["source"]["rev"]}
+        requires = ({"roles": TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": ram_gb} | ({"has": has} if has else {})
+                    | ({"disk_gb": disk} if disk else {}))
+        est = plan_minutes(len(revisions), sides, block_cases, measure)
+        return {"id": job_id, "group": "release", "kind": "owlrs.timed", "class": "exclusive",
+                "priority_class": "merge-gate", "env": part_env, "stall_after_min": 90,
+                "est_min": round(est["total_min"]), "_plan": est,
+                "steps": steps,
+                # Builds ask the part's whole memory: a host too small for its blocks would end the hold
+                # after them (Sol r2 S1).
+                "step_deadline_min": BUILD_MIN * len(revisions) + 120,
+                "requires": requires, "inputs": inputs + fetched}
+
+    timed_steps = [[*gate_, "plan-blocks", harness]] if measure else []
+    block_cases = []
     for k in range(1, count + 1):
-        steps.append(block_step(gate_, k, harness, block_layout(k, layouts),
-                                f"plan-block-{k}.json" if measure else None, revs))
-        share = (sum(e.get("seconds", 0) for c, e in measure.items() if need[c] >= k or k == 1) / full) if measure else 1
-        est += per_block * share + 2
-    out[f"{prefix}-timed"] = {
-        "id": f"{prefix}-timed", "group": "release", "kind": "owlrs.timed", "class": "exclusive",
-        "priority_class": "merge-gate", "after": [f"{prefix}-build"],
-        "env": {**env, "GATE_HOST": timed_host, "GATE_PREFIX": prefix, "GATE_RAM_GB": str(max_gb)},
-        "est_min": round(est), "stall_after_min": 60,
-        "steps": steps + [[*gate_, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"],
-                          [*gate_, "clean"]],
-        "requires": {"hosts": [timed_host], "cores": 16, "ram_gb": max_gb}, "inputs": source}
-    if big_host:
-        big_env = {**env, "GATE_MIN_GB": str(max_gb), "GATE_MAX_GB": str(big_gb), "GATE_HOST": big_host,
+        timed_steps.append(block_step(gate_, k, harness, block_layout(k, layouts),
+                                      f"plan-block-{k}.json" if measure else None, revs))
+        block_cases.append([c for c in run if not measure or k == 1 or need.get(c, blocks_per_round) >= k])
+    out = {f"{prefix}-timed": part(f"{prefix}-timed", {**env, "GATE_NAME": f"{gate_name}-timed", "GATE_PREFIX": prefix,
+                                                           "GATE_RAM_GB": str(max_gb)},
+                                   run, timed_steps, max_gb, block_cases)}
+    if big_gb and elsewhere:
+        # Its own gate directory (GATE_NAME): placed by capability it may share a host with the timed
+        # part, whose plan and passes would be overwritten (Sol r1 S3); a confirmation keeps it.
+        big_env = {**env, "GATE_MIN_GB": str(max_gb), "GATE_MAX_GB": str(big_gb), "GATE_NAME": f"{gate_name}-big",
                    "GATE_PREFIX": f"{prefix}-big", "GATE_RAM_GB": str(big_gb + 4)}
         big_env.pop("GATE_BIG_GB")
-        out[f"{prefix}-big"] = {
-            "id": f"{prefix}-big", "group": "release", "kind": "owlrs.timed", "class": "exclusive",
-            "priority_class": "merge-gate", "after": [f"{prefix}-build"], "env": big_env,
-            "est_min": (6 if small else 45) * blocks_per_round + 30, "stall_after_min": 90,
-            "steps": [[*gate_, "unpack"], [*gate_, "prepare", harness]]
-            + [block_step(gate_, k, harness, block_layout(k, layouts), None, revs) for k in range(1, blocks_per_round + 1)]
-            + [[*gate_, "report", harness, f"cand={candidate}", f"base={base}", f"main={main}"], [*gate_, "clean"]],
-            "requires": {"hosts": [big_host], "cores": 16, "ram_gb": big_gb + 4},
-            "inputs": [*source, {"name": "binaries", "source": {"artifact": f"{prefix}-build/binaries"}}]}
+        big = sorted(elsewhere)
+        out[f"{prefix}-big"] = part(
+            f"{prefix}-big", big_env, big,
+            [block_step(gate_, k, harness, block_layout(k, layouts), None, revs) for k in range(1, blocks_per_round + 1)],
+            big_gb + 4, [big] * blocks_per_round)
     if checks:
         out[f"{prefix}-checks"] = {
             "id": f"{prefix}-checks", "group": "release", "kind": "owlrs.any", "priority_class": "merge-gate",
-            "est_min": 100, "env": {**env, "CARGO_BUILD_JOBS": "16"},
+            "est_min": 100, "env": {**env, "GATE_NAME": f"{gate_name}-checks", "CARGO_BUILD_JOBS": "16"},
             "steps": [[*gate_, "w3c"], [*gate_, "guards"], [*gate_, "clean"]],
-            "requires": {"hosts": [checks_host], "cores": 16, "ram_gb": 12},
+            "requires": {"roles": ["test"], "os": "linux", "cores": 16, "ram_gb": 12},
             "inputs": [{"name": "checkout", "source": {"git": checkout, "rev": candidate}}]}
     return out
+
+
+def plan_minutes(revisions: int, sides: int, block_cases: list[list[str]], measure: dict | None) -> dict:
+    """A timed part's minutes: its builds and data (at most BUILD_MIN a revision, shareable), and
+    its blocks alone on its host, each every timed side twice over the block's cases (their
+    calibrated seconds a pass, else a minute) plus a pass's own overhead. `guessed`: the cases
+    without a calibration."""
+    guessed = sorted({c for cases in block_cases for c in cases if case_seconds(measure, c) is None})
+    timed = sum(2 * sides * (sum(case_seconds(measure, c) or 60.0 for c in cases) + PASS_OVERHEAD_S) / 60
+                for cases in block_cases)
+    built = BUILD_MIN * revisions + 10
+    return {"build_min": built, "timed_min": round(timed, 1), "total_min": built + timed + 3, "guessed": guessed}
+
+
+FLEET_DEADLINE_S = 120  # a fleet call (check, submit): stopped past this, its reading then missing
+
+
+def fleet_call(*args: str) -> tuple[int, str]:
+    """The fleet CLI (`fleet` on PATH, else FLEET_BIN) under a deadline that stops it
+    (rule.remote-calls-have-deadlines): its exit and output; (-1, why) when it gave no answer, which
+    a caller treats as "not checked", never as taken."""
+    import shutil
+    import subprocess
+    binary = os.environ.get("FLEET_BIN") or shutil.which("fleet")
+    if not binary:
+        return -1, "fleet: not on PATH (set FLEET_BIN)"
+    try:
+        done = subprocess.run([binary, *args], capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=FLEET_DEADLINE_S)
+    except subprocess.TimeoutExpired:
+        return -1, f"fleet {args[0]}: no answer in {FLEET_DEADLINE_S} s (stopped)"
+    return done.returncode, (done.stdout + done.stderr).strip()
+
+
+def set_plan(found: dict[str, dict], prefix: str, candidate: str, harness: str, base: str, main: str,
+              measure: dict | None) -> str:
+    """The gate's plan before anything is queued: each part's cases, blocks, minutes and asks, and
+    the whole in host-hours (intent.bench-by-purpose: "estimated time value ... how much it would
+    block")."""
+    lines = [f"set:{prefix}: cand {candidate[:12]} against base {base[:12]} and main {main[:12]}, harness {harness[:12]}"]
+    total = exclusive = 0.0
+    for job in found.values():
+        asks = job["requires"]
+        blocks_ = sum(1 for s in job["steps"] if len(s) > 2 and s[2] == "block")
+        timed = job["kind"] == "owlrs.timed"
+        lines.append(f"  {job['id']}: {job['est_min']} min" + (f", {blocks_} blocks" if timed else "")
+                     + f"; asks {job['kind']}" + (f", roles {'+'.join(asks['roles'])}" if asks.get("roles") else "")
+                     + f", {asks.get('os', 'any OS')}, {asks['cores']} cores, {asks['ram_gb']} GB"
+                     + (f", has {'+'.join(asks['has'])}" if asks.get("has") else ""))
+        total += job["est_min"]
+        exclusive += job["est_min"] if timed else 0  # a timed part holds its host from its first step
+    guessed = sorted({c for job in found.values() for c in (job.get("_plan") or {}).get("guessed", [])})
+    if guessed:
+        lines.append(f"  not calibrated (benches/fast/measure.toml at the harness), a minute a pass assumed: {len(guessed)} "
+                     f"cases: {', '.join(guessed)}")
+    lines.append(f"  estimate: {total / 60:.1f} host-hours in all, {exclusive / 60:.1f} of them timing hosts held "
+                 "alone (builds included: a build of the same identity is reused); queue time and confirmation "
+                 "rounds come on top")
+    return "\n".join(lines)
 
 
 # --- rounds and the verdict (research round 8: prespecified rounds, Holm over the family) ------
@@ -1658,12 +1989,15 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
 
 
 def rounds_of(reports: list[dict]) -> list[list[dict]]:
-    """The reports of each timed part (host), first round first (`context.round`)."""
-    by_host: dict[str, list[dict]] = {}
+    """The reports of each timed part, first round first (`context.round`). A part is its job's
+    prefix (GATE_PREFIX: the timed part's, the big part's; a confirmation keeps its part's), else its
+    host: placed by capability, two parts may run on one host, and they aren't rounds of each other."""
+    by_part: dict[str, list[dict]] = {}
     for r in reports:
-        host = (r.get("context") or {}).get("host") or ",".join(map(str, r.get("host", [])))
-        by_host.setdefault(host, []).append(r)
-    return [sorted(rs, key=lambda r: (r.get("context") or {}).get("round", 0)) for rs in by_host.values()]
+        ctx = r.get("context") or {}
+        part = ctx.get("prefix") or ctx.get("host") or ",".join(map(str, r.get("host", [])))
+        by_part.setdefault(part, []).append(r)
+    return [sorted(rs, key=lambda r: (r.get("context") or {}).get("round", 0)) for rs in by_part.values()]
 
 
 def dimension_in(report: dict, side: str, case: str, dimension: str) -> dict | None:
@@ -1681,6 +2015,9 @@ def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) 
         return None
     first = rounds[0]
     ctx = first.get("context") or {}
+    if not ctx.get("host"):
+        raise SystemExit(f"{ctx.get('prefix') or 'a timed part'}: its report names no host (GATE_HOST, else FLEET_HOST): "
+                         "a confirmation runs where round 1 ran (its binaries, its floor), so none is written")
     cases = sorted({h.split("|")[1] for h in pending})
     low, high = CONFIRM_BLOCKS
     revs = {"cand": first["candidate"]["revision"], **first["baselines"]}
@@ -1707,7 +2044,9 @@ def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) 
             + [block_step(gate_, b, harness, block_layout(b, layouts), None, revs) for b in range(1, n + 1)]
             + [[*gate_, "report", harness, f"cand={revs['cand']}", *(f"{s}={r}" for s, r in first["baselines"].items())],
                [*gate_, "clean"]],
-            "requires": {"hosts": [ctx.get("host") or "phuoc-yu"], "cores": 16, "ram_gb": ctx.get("ram_gb", 24)},
+            "requires": {"hosts": [ctx["host"]], "roles": TIMING_ROLES, "os": "linux", "cores": 16,
+                         "ram_gb": ctx.get("ram_gb", 24)},
+            "pin_reason": "a confirmation round runs on its first round's host: its builds there, its floor, its rounds combined",
             "inputs": [{"name": "checkout", "source": {"git": checkout,
                                                        "rev": checkout_rev(checkout, revs["cand"], harness)}}]}
 
@@ -1776,7 +2115,7 @@ def main() -> int:
     s.add_argument("--max-gb", type=float, required=True)
     s.add_argument("--min-gb", type=float, default=0, help="only cases above this cap (the big host's share)")
     s.add_argument("--big-gb", type=float, help="cases up to this cap run on the big host instead")
-    s.add_argument("--big-host", default="khaleesi-wsl")
+    s.add_argument("--big-host", default="the big part", help="its name in the plan's reasons")
     s.add_argument("--cases")
     s.add_argument("--baselines", default="base,main", help="the family's baselines (declared before any result)")
     s = sub.add_parser("report")
@@ -1824,11 +2163,16 @@ def main() -> int:
     s.add_argument("--main", default=MAIN)
     s.add_argument("--max-gb", type=float, default=24)
     s.add_argument("--no-checks", action="store_true", help="without the W3C and guards job")
-    s.add_argument("--big-host", default="khaleesi-wsl",
-                   help="the Linux host of the cases above --max-gb ('' for none; never native Windows)")
-    s.add_argument("--big-gb", type=float, default=28)
+    s.add_argument("--big-gb", type=float, default=28,
+                   help="the cases above --max-gb up to this run in the big part (a timing host with that memory)")
+    s.add_argument("--no-big", action="store_true", help="without the big part")
+    s.add_argument("--plan", action="store_true", help="the plan and fleet's check of the set only: nothing queued")
+    s.add_argument("--submit", action="store_true", help="submit the set (fleet submit) once fleet's check takes it")
     s.add_argument("--layouts", type=int, default=1, help="builds a side in different layouts (GATE_LAYOUTS)")
     s.add_argument("--out", type=Path, default=Path("."))
+    s = sub.add_parser("data", help="what this host holds of the cases' frozen inputs (exit 1: something missing)")
+    s.add_argument("--cases", help="comma-separated; default every registry case")
+    s.add_argument("--make", action="store_true", help="make what benches/sparql/prepare.sh can into SPARQL_DATA first")
     s = sub.add_parser("calibrate", help="benches/fast/measure.toml from passes of the gate's host (an A/A run)")
     s.add_argument("--passes", type=Path, nargs="+", required=True, help="pass reports, or directories of them")
     s.add_argument("--budget-min", type=float, default=150, help="the timed part's minutes, at most")
@@ -1868,6 +2212,11 @@ def main() -> int:
         side = measurement_ref(str(ROOT), args.ref, args.commit, args.remote)
         print(f"{args.ref}: the measurement commit of {side[:12]}, admitted (benches/fast/measurement-sides.toml)")
         return 0
+    if args.command == "data":
+        wanted = set(args.cases.split(",")) if args.cases else None
+        lines, ok = data_state([c for c in cases_registry.load() if wanted is None or c["name"] in wanted], args.make)
+        print("\n".join(lines) or "no frozen inputs")
+        return 0 if ok else 1
     if args.command == "plan":
         catalog = cases_registry.load()
         run, not_run, elsewhere = plan(catalog, args.max_gb, args.cases.split(",") if args.cases else None,
@@ -1998,15 +2347,34 @@ def main() -> int:
         batch = all(subprocess.run(["git", "-C", args.checkout, "grep", "-q", "-e", '"--batch"', r, "--",
                                     "crates/nrese-store/examples"], capture_output=True).returncode == 0
                     for r in {candidate, rev(args.base), rev(args.main)})
-        found = jobs(candidate, harness, args.checkout, args.id or f"rg-{candidate[:8]}",
+        prefix = args.id or f"rg-{candidate[:8]}"
+        found = jobs(candidate, harness, args.checkout, prefix,
                      args.blocks, args.cases, rev(args.base), rev(args.main), max_gb=args.max_gb,
-                     checks=not args.no_checks, big_host=args.big_host or None, big_gb=args.big_gb,
-                     measure=measure, batch=batch, layouts=args.layouts)
+                     checks=not args.no_checks, big_gb=None if args.no_big else args.big_gb,
+                     measure=measure, batch=batch, layouts=args.layouts,
+                     catalog=cases_registry.load_at(args.checkout, harness))
         args.out.mkdir(parents=True, exist_ok=True)
-        for name, job in found.items():
-            (args.out / f"{name}.toml").write_text(toml_job(job), encoding="utf-8")
-            print(args.out / f"{name}.toml")
-        return 0
+        path = args.out / f"{prefix}.set.toml"
+        path.write_bytes(toml_set({"id": prefix, "fail": "continue"}, list(found.values())).encode("utf-8"))
+        print(set_plan(found, prefix, candidate, harness, rev(args.base), rev(args.main), measure))
+        print(f"  set file: {path}")
+        if not (args.plan or args.submit):
+            print(f"  not checked or submitted: --plan asks fleet where it can run, --submit submits it")
+            return 0
+        code, said = fleet_call("check", str(path))
+        print("  fleet check" + (f" (exit {code})" if code else "") + ":\n    " + "\n    ".join(said.splitlines() or ["-"]))
+        if not args.submit:
+            print(f"not submitted (--plan): fleet submit {path}, or this command with --submit")
+            return 0
+        if code != 0:
+            print("not submitted: fleet check didn't take the set (above)", file=sys.stderr)
+            return 1
+        code, said = fleet_call("submit", str(path))
+        print(said)
+        if code == 0:
+            print(f"wait: fleet wait set:{prefix}; then fetch each part (fleet results ID --to DIR) and "
+                  f"release-gate.sh verdict TIMED_DIR... CHECKS_DIR")
+        return 0 if code == 0 else 1
     parts = [json.loads(path.read_text(encoding="utf-8")) for path in [*args.timed, args.w3c, args.guards]]
     passed, text = verdict(parts[:-2], parts[-2], parts[-1])
     print(text)
