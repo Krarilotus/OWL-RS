@@ -344,6 +344,40 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
             "<urn:g> { <urn:s> <urn:p> [ <urn:q> ( 1 ] . <urn:after> <urn:p> <urn:o> . }",
             vec![None, Some(&after_in_g)],
         ),
+        // A brace as the failing token counts as one met while skipping: a `{` stays open
+        // over the `.` inside it; a `}` ends the TriG block it is in, so what follows is in
+        // the default graph (and in Turtle, with no block, closes nothing).
+        (
+            false,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> { <urn:q> . <urn:u> <urn:v> <urn:w> . } . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::TriG,
+            "<urn:g> { <urn:s> <urn:p> { <urn:q> . <urn:u> <urn:v> <urn:w> . } . <urn:after> <urn:p> <urn:o> . }",
+            vec![None, Some(&after_in_g)],
+        ),
+        (
+            false,
+            RdfFormat::TriG,
+            "<urn:g> { <urn:s> <urn:p> } <http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        // Before, the `[` kept the skip going to the end, `urn:after` with it: over-skipping.
+        (
+            false,
+            RdfFormat::TriG,
+            "<urn:g> { <urn:s> <urn:p> [ <urn:q> <urn:o> } <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        (
+            true,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> } . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
         // A string with a line break in it, closed later: its end is known, so it is
         // skipped whole and the `] .` and statement in it are text, not structure (fix
         // check r2). LF and CR, both quotes, and in a TriG block.
@@ -547,16 +581,18 @@ fn an_opener_refused_by_the_nesting_limit_stays_open() {
     table.done();
 }
 
-/// Each of the ten delimiters, at every token position of statements using every grammar
-/// routine that opens one (objects, lists, triple terms, reified triples, annotations,
-/// reifiers, `[]`, datatypes, directives, TriG graph names), replacing the token there or put
-/// before it, then a valid statement: recovering runs to the end on all three paths without a
-/// panic. In a debug build `resync` checks that the brackets noted open when a statement
+/// Each of the ten delimiters and the two braces, at every token position of statements using
+/// every grammar routine that opens one (objects, lists, triple terms, reified triples,
+/// annotations, reifiers, `[]`, datatypes, directives, TriG graph names), replacing the token
+/// there or put before it, then a valid statement: recovering runs to the end on all three
+/// paths without a panic. In a debug build `resync` checks that the brackets noted open when a statement
 /// fails agree with those it took, so a grammar site that noted none fails here (fix check
 /// r3). A guard: before, there was no such check.
 #[test]
 fn recovery_knows_every_bracket_open_wherever_a_statement_fails() {
-    const DELIMITERS: [&str; 10] = ["[", "]", "(", ")", "<<(", ")>>", "<<", ">>", "{|", "|}"];
+    const DELIMITERS: [&str; 12] = [
+        "[", "]", "(", ")", "<<(", ")>>", "<<", ">>", "{|", "|}", "{", "}",
+    ];
     let seeds = [
         (
             RdfFormat::Turtle,
