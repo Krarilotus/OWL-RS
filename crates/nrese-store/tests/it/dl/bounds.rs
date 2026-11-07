@@ -157,12 +157,18 @@ fn an_upper_bound_with_equality_classes_is_read_expanded() {
     let (rows, status) = super::queries::query(&dl, "SELECT ?x { ?x a :Dept }");
     assert_eq!(rows, ["d1", "d2"], "{:?}", status.reasons());
     assert!(status.is_complete(), "{:?}", status.reasons());
+    // Guard (holds on the base too): the two constants are decided, U1's equality refuted.
+    let (rows, status) = super::queries::query(&dl, "ASK { :d1 owl:sameAs :d2 }");
+    assert_eq!(rows, ["false"], "U1's equality is not an answer");
+    assert!(status.is_complete(), "{:?}", status.reasons());
+    // `?x = :d1` (eq-ref, OWL 2 Profiles table 4) is in neither bound: not complete
+    // (RSH-04).
     let (rows, status) = super::queries::query(&dl, "SELECT ?x { :d1 owl:sameAs ?x }");
     assert!(
         !rows.contains(&"d2".to_owned()),
         "U1's equality is not an answer: {rows:?}"
     );
-    assert!(status.is_complete(), "{:?}", status.reasons());
+    assert!(!status.is_complete(), "{:?}", status.reasons());
 }
 
 #[test]

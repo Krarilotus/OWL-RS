@@ -355,13 +355,16 @@ fn split_timezone(s: &str) -> Option<(&str, u64)> {
     let Some(split) = s.len().checked_sub(6) else {
         return Some((s, 0));
     };
-    let (rest, zone) = s.split_at(split);
-    // Only a `±hh:mm` suffix is a timezone; a date's own `-MM-DD` is not.
-    let sign = match (zone.as_bytes()[0], zone.as_bytes()[3]) {
+    // Only a `±hh:mm` suffix is a timezone; a date's own `-MM-DD` is not. The sign is
+    // read as a byte first: an ASCII sign byte is always a char boundary, so the split
+    // below cannot land inside a multi-byte character of an ill-typed lexical form.
+    let bytes = s.as_bytes();
+    let sign = match (bytes[split], bytes[split + 3]) {
         (b'+', b':') => 1,
         (b'-', b':') => -1,
         _ => return Some((s, 0)),
     };
+    let (rest, zone) = s.split_at(split);
     let (hours, minutes) = (digits(zone, 1..3)?, digits(zone, 4..6)?);
     let offset = i64::from(hours * 60 + minutes);
     if minutes >= 60 || offset == 0 || offset > 14 * 60 || offset % 15 != 0 {
@@ -715,6 +718,33 @@ mod tests {
                 "2026-02-30T00:00:00",
             ],
         );
+    }
+
+    /// RDF 1.1 Concepts §3.3: a literal whose lexical form is not in its datatype's
+    /// lexical space is ill-typed but still a legal term, so it stays in the dictionary
+    /// with its lexical form. In each row a multi-byte character covers the byte where a
+    /// `±hh:mm` timezone would start (`"éabcde"` is 7 bytes, `len - 6 == 1` is inside `é`).
+    #[test]
+    fn non_ascii_lexicals_stay_in_the_dictionary() {
+        let lexicals = [
+            "éabcde",
+            "2026-09-2é+5:00",
+            "x€bcdef",
+            "2026-09-25T14:03:0é+1:00",
+        ];
+        // Every row is checked, so a failure lists each wrong one (inlined or a panic).
+        let wrong: Vec<String> = [xsd::DATE, xsd::DATE_TIME]
+            .into_iter()
+            .flat_map(|datatype| lexicals.map(|lexical| (lexical, datatype)))
+            .filter_map(|(lexical, datatype)| {
+                match std::panic::catch_unwind(|| inline(lexical, datatype)) {
+                    Ok(None) => None,
+                    Ok(Some(_)) => Some(format!("{lexical} ^^ {datatype} inlined")),
+                    Err(_) => Some(format!("{lexical} ^^ {datatype} panicked")),
+                }
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// The invariant that matters: whatever gets inlined decodes to exactly its input.

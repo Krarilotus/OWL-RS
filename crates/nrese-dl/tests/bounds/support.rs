@@ -186,7 +186,11 @@ pub fn lower(table: &mut Table, input: &[Triple]) -> Closure {
     facts.dedup();
     Closure {
         facts,
-        violations: m.violations.into_iter().map(|v| v.rule).collect(),
+        violations: m
+            .violations
+            .iter()
+            .map(|(rule, _)| rule.to_owned())
+            .collect(),
         ..Closure::default()
     }
 }

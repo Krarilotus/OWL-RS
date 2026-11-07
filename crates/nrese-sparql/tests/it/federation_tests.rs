@@ -415,3 +415,21 @@ fn service_blocks_resolve_against_the_query_base() {
         vec!["<http://base.example/rel>".to_owned()]
     );
 }
+
+/// `SERVICE ?e` joined to no solutions: no solution names an endpoint, so nothing is
+/// called and the join has no solutions, SILENT or not (SPARQL 1.1 Federated Query §4: the
+/// endpoint is each solution's value of ?e).
+#[test]
+fn service_variables_joined_to_no_solutions_have_none() {
+    let options = canned(|query| panic!("no endpoint to call, yet called with {query}"));
+    let local = engine(&[]);
+    for service in ["SERVICE", "SERVICE SILENT"] {
+        for body in [
+            format!("?s <{EX}ep> ?e {service} ?e {{ ?x <{EX}name> ?c }}"),
+            format!("?s <{EX}ep> ?e OPTIONAL {{ {service} ?e {{ ?x <{EX}name> ?c }} }}"),
+        ] {
+            let query = format!("SELECT * WHERE {{ {body} }}");
+            assert_eq!(rows(&local, &query, &options), Ok(Vec::new()), "{query}");
+        }
+    }
+}
