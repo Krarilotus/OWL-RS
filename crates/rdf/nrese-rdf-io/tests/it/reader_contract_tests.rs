@@ -618,8 +618,17 @@ fn recovery_knows_every_bracket_open_wherever_a_statement_fails() {
                             .into_boxed_str(),
                     );
                     let parser = || RdfParser::from_format(format).recovering();
+                    let bytes = || Pieces(document.as_bytes().chunks(1).map(Ok).collect());
+                    // Every item to the end: the delimiter can come after the seed's own
+                    // quads (fix check r3's sol-loop, S1). A parser that doesn't end fails
+                    // the row.
+                    const BOUND: usize = 1_000;
                     let outcome = std::panic::catch_unwind(|| {
-                        on_three_paths(parser, document.as_bytes());
+                        [
+                            parser().for_slice(document.as_bytes()).take(BOUND).count(),
+                            parser().for_reader(document.as_bytes()).take(BOUND).count(),
+                            parser().for_reader(bytes()).take(BOUND).count(),
+                        ]
                     })
                     .map_err(|panic| {
                         let message = panic
@@ -627,6 +636,12 @@ fn recovery_knows_every_bracket_open_wherever_a_statement_fails() {
                             .cloned()
                             .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()));
                         format!("panicked: {message:?}")
+                    })
+                    .and_then(|counts| {
+                        match counts.iter().all(|&n| n < BOUND) {
+                            true => Ok(()),
+                            false => Err(format!("no end within {BOUND} items: {counts:?}")),
+                        }
                     });
                     table.row(true, (format, document), outcome);
                 }
