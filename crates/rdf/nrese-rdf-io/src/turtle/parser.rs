@@ -313,6 +313,13 @@ pub(crate) struct TurtleParser<'a, R> {
     /// else in a Turtle or TriG statement is an error).
     open: i64,
     ended: bool,
+    /// When a statement fails: the brackets it left open, by pair ([`pair`]), noted as its
+    /// error unwinds out of the routines that took them, innermost first (`within`); and
+    /// its failing token, when that was itself an opener or closer (`unexpected`). Written
+    /// on an error only, read by `resync`, cleared at the error: a statement that parses
+    /// never touches them.
+    unclosed: Vec<usize>,
+    failed: Option<Kind>,
     /// Per quote (`"`, `'`) and width (short, long), whether no later string has a closing
     /// quote: a search for one reached the input's end without it ([`known_missing`] says
     /// why that answers for later ones). Recovery then neither lexes nor searches such a
@@ -411,6 +418,8 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             after_string: false,
             open: 0,
             ended: false,
+            unclosed: Vec::new(),
+            failed: None,
             no_closing: [[false; 2]; 2],
             arena: String::new(),
             triples: Vec::new(),
@@ -463,6 +472,8 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                     && self.settings.recover
                     && !self.settings.n3
                     && (self.ended || self.resync()));
+                self.unclosed.clear();
+                self.failed = None;
                 let error = match error {
                     RdfParseError::Syntax(error) => {
                         RdfParseError::Syntax(self.skipped(error, start))
@@ -531,13 +542,14 @@ impl<'a, R: Read> TurtleParser<'a, R> {
 
     /// After a syntax error: skips to the end of the statement, a `.` outside brackets (or
     /// the `}` closing the TriG block it is in), so that parsing goes on with the next one.
-    /// What stays open while skipping, readable tokens or not:
-    /// - the brackets the statement had open when it failed (`carried`, from `open`), so a
-    ///   `.` inside them ends nothing;
-    /// - the brackets opened while skipping (`opened`, by pair, with a count per pair). A
-    ///   closer closes the last of its pair opened here (and what was opened inside it); a
-    ///   closer of no pair opened here closes the innermost carried bracket; with nothing
-    ///   open it opens nothing. Each bracket is opened and closed once: linear work.
+    /// What is open while skipping, readable tokens or not, is one stack of brackets with
+    /// their kinds (see [`bracket`]):
+    /// - at its bottom, the brackets the statement had open when it failed (`unclosed`),
+    ///   then its failing token if that was an opener or closer (`failed`), so a `.` inside
+    ///   them ends nothing;
+    /// - above them, the brackets opened while skipping. A closer closes the innermost open
+    ///   bracket of its own pair, with those opened inside it; with none of its pair open it
+    ///   closes nothing.
     ///
     /// A token the lexer can't read is skipped whole where its end is known, and nothing
     /// open is forgotten (see `skip_malformed`). Where a quote has no closing quote after it
@@ -551,11 +563,33 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         self.arena.clear();
         self.triples.clear();
         self.triple_terms.clear();
-        let mut carried = self.open.max(0);
-        let mut opened: Vec<usize> = Vec::new();
+        // Outermost first: `unclosed` was noted innermost first, as the error unwound.
+        let mut open = std::mem::take(&mut self.unclosed);
+        open.reverse();
         let mut counts = [0usize; 5];
+        for &pair in &open {
+            counts[pair] += 1;
+        }
+        let failed = self.failed.take();
+        // Every opener `take` counted is still open in a routine that noted it, or is the
+        // failing token; every closer it counted closed its own routine's opener, or is the
+        // failing token. A routine taking an opener without `within`, or a site rejecting a
+        // token without `unexpected`, breaks this.
+        debug_assert_eq!(
+            self.open,
+            open.len() as i64
+                + match failed {
+                    Some(opener!()) => 1,
+                    Some(closer!()) => -1,
+                    _ => 0,
+                },
+            "the brackets noted open disagree with those taken",
+        );
+        if let Some(kind) = failed {
+            bracket(&mut open, &mut counts, kind);
+        }
         let mut braces = 0i64;
-        loop {
+        let resumed = loop {
             if self.no_closing != [[false; 2]; 2] {
                 let no_closing = self.no_closing;
                 let missing =
@@ -572,54 +606,39 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                     // Recovery stops; the parser returns the read error after the syntax
                     // error (`next_ref`).
                     self.input.held = Some(error);
-                    return false;
+                    break false;
                 }
                 Err(_) => {
                     self.lookahead = None;
                     if !self.skip_malformed() {
-                        return false;
+                        break false;
                     }
                     continue;
                 }
             }
             let Some(token) = self.lookahead.take() else {
-                return false;
+                break false;
             };
             self.input.consume(token.consumed);
             self.after_string = matches!(token.kind, Kind::String { .. });
             match token.kind {
-                Kind::Eof => return false,
+                Kind::Eof => break false,
                 Kind::OpenBrace => braces += 1,
                 Kind::CloseBrace if braces > 0 => braces -= 1,
                 Kind::CloseBrace if self.settings.trig && self.in_block => {
                     self.in_block = false;
                     self.graph = None;
-                    return true;
+                    break true;
                 }
-                Kind::Dot if carried == 0 && opened.is_empty() && braces == 0 => return true,
-                opener!() => {
-                    let pair = pair(token.kind);
-                    counts[pair] += 1;
-                    opened.push(pair);
-                }
-                closer!() => {
-                    let pair = pair(token.kind);
-                    if counts[pair] > 0 {
-                        while let Some(inner) = opened.pop() {
-                            counts[inner] -= 1;
-                            if inner == pair {
-                                break;
-                            }
-                        }
-                    } else if carried > 0 {
-                        opened.clear();
-                        counts = [0; 5];
-                        carried -= 1;
-                    }
-                }
+                Kind::Dot if open.is_empty() && braces == 0 => break true,
+                opener!() | closer!() => bracket(&mut open, &mut counts, token.kind),
                 _ => {}
             }
-        }
+        };
+        // The allocation is kept for the next failed statement.
+        open.clear();
+        self.unclosed = open;
+        resumed
     }
 
     /// Skips the token the lexer couldn't read, where `fill` stopped: a string up to its
@@ -794,9 +813,38 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     fn expect(&mut self, kind: Kind, what: &'static str) -> Step<Token> {
         let token = self.take()?;
         if token.kind != kind {
-            return Err(self.error(token.start, what));
+            return Err(self.unexpected(&token, what));
         }
         Ok(token)
+    }
+
+    /// The error for `token`, taken where the grammar has no place for it. An opener or a
+    /// closer is noted (`failed`): it opens or closes in the document though no routine
+    /// took it as such, and recovery counts it (`resync`).
+    #[cold]
+    fn unexpected(&mut self, token: &Token, what: impl Into<String>) -> RdfParseError {
+        if matches!(token.kind, opener!() | closer!()) {
+            self.failed = Some(token.kind);
+        }
+        self.error(token.start, what)
+    }
+
+    /// `inside`, the part of a statement right after `opener` was taken, up to and with its
+    /// closer. On an error the opener is still open: it is noted (`unclosed`, as the error
+    /// unwinds, so innermost first) for recovery to keep it open (`resync`). On success
+    /// nothing is added to what `?` does.
+    #[inline(always)]
+    fn within<T>(&mut self, opener: Kind, inside: impl FnOnce(&mut Self) -> Step<T>) -> Step<T> {
+        match inside(self) {
+            Ok(value) => Ok(value),
+            Err(error) => Err(self.still_open(opener, error)),
+        }
+    }
+
+    #[cold]
+    fn still_open(&mut self, opener: Kind, error: RdfParseError) -> RdfParseError {
+        self.unclosed.push(pair(opener));
+        error
     }
 
     /// The text of a token taken last.
@@ -939,7 +987,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                     return Err(self.error(token.start, "a prefixed name that isn't an IRI"));
                 }
             }
-            _ => return Err(self.error(token.start, "expected an IRI")),
+            _ => return Err(self.unexpected(token, "expected an IRI")),
         }
         Ok(self.span_from(start))
     }
@@ -1047,7 +1095,11 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 self.predicate_object_list(term, 0)?;
                 self.end_of_triples()
             }
-            Kind::OpenBracket if trig && !self.in_block && self.peek()? == Kind::CloseBracket => {
+            Kind::OpenBracket
+                if trig
+                    && !self.in_block
+                    && self.within(Kind::OpenBracket, Self::peek)? == Kind::CloseBracket =>
+            {
                 // `[]`: a graph's name, or the subject of triples.
                 self.take()?;
                 if self.peek()? == Kind::OpenBrace {
@@ -1099,7 +1151,9 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 ))
             }
             Kind::OpenBracket => {
-                self.expect(Kind::CloseBracket, "expected '[]' as a graph's name")?;
+                self.within(Kind::OpenBracket, |p| {
+                    p.expect(Kind::CloseBracket, "expected '[]' as a graph's name")
+                })?;
                 let Term::Blank(span) = self.fresh() else {
                     unreachable!()
                 };
@@ -1107,7 +1161,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                     self.arena[span.start as usize..span.end as usize].to_owned(),
                 ))
             }
-            _ => Err(self.error(token.start, "expected a graph's name")),
+            _ => Err(self.unexpected(token, "expected a graph's name")),
         }
     }
 
@@ -1115,7 +1169,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     fn prefix(&mut self, dot: bool) -> Step<()> {
         let name = self.take()?;
         let Kind::PrefixedName { colon, .. } = name.kind else {
-            return Err(self.error(name.start, "expected a prefix name ending with ':'"));
+            return Err(self.unexpected(&name, "expected a prefix name ending with ':'"));
         };
         let text = self.text(&name)?;
         if text.len() != colon + 1 {
@@ -1124,7 +1178,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         let prefix = text[..colon].to_owned();
         let iri = self.take()?;
         if !matches!(iri.kind, Kind::IriRef { .. }) {
-            return Err(self.error(iri.start, "expected the prefix's IRI"));
+            return Err(self.unexpected(&iri, "expected the prefix's IRI"));
         }
         self.resolve_iri(&iri)?;
         self.prefixes.insert(prefix, self.resolved.clone());
@@ -1138,7 +1192,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     fn base(&mut self, dot: bool) -> Step<()> {
         let iri = self.take()?;
         if !matches!(iri.kind, Kind::IriRef { .. }) {
-            return Err(self.error(iri.start, "expected the base IRI"));
+            return Err(self.unexpected(&iri, "expected the base IRI"));
         }
         self.resolve_iri(&iri)?;
         self.base = Some(
@@ -1158,7 +1212,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         self.after_string = false;
         let long = label.text.start - label.start == 3;
         if !matches!(label.kind, Kind::String { .. }) || long {
-            return Err(self.error(label.start, "expected the version label as a short string"));
+            return Err(self.unexpected(&label, "expected the version label as a short string"));
         }
         if dot {
             self.expect(Kind::Dot, "expected '.' after @version")?;
@@ -1171,7 +1225,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     fn triples_from(&mut self, first: Token) -> Step<()> {
         match first.kind {
             Kind::ReifiedOpen => {
-                let subject = self.reified_triple(0)?;
+                let subject = self.within(Kind::ReifiedOpen, |p| p.reified_triple(0))?;
                 if self.peek_is_verb()? {
                     self.predicate_object_list(subject, 0)?;
                 }
@@ -1187,23 +1241,25 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             }
             Kind::OpenBracket => {
                 let subject = self.fresh();
-                if self.peek()? == Kind::CloseBracket {
+                if self.within(Kind::OpenBracket, Self::peek)? == Kind::CloseBracket {
                     // `[]` as subject: a predicate-object list must follow.
                     self.take()?;
                     return self.predicate_object_list(subject, 0);
                 }
-                self.predicate_object_list(subject, 1)?;
-                self.expect(Kind::CloseBracket, "expected ']'")?;
+                self.within(Kind::OpenBracket, |p| {
+                    p.predicate_object_list(subject, 1)?;
+                    p.expect(Kind::CloseBracket, "expected ']'")
+                })?;
                 if self.peek_is_verb()? {
                     self.predicate_object_list(subject, 0)?;
                 }
                 Ok(())
             }
             Kind::OpenParen => {
-                let subject = self.collection(1)?;
+                let subject = self.within(Kind::OpenParen, |p| p.collection(1))?;
                 self.predicate_object_list(subject, 0)
             }
-            _ => Err(self.error(first.start, "expected a subject")),
+            _ => Err(self.unexpected(&first, "expected a subject")),
         }
     }
 
@@ -1253,7 +1309,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         match verb.kind {
             Kind::A => Ok(Term::Static(rdf::TYPE)),
             Kind::IriRef { .. } | Kind::PrefixedName { .. } => Ok(Term::Iri(self.iri(&verb)?)),
-            _ => Err(self.error(verb.start, "expected a predicate")),
+            _ => Err(self.unexpected(&verb, "expected a predicate")),
         }
     }
 
@@ -1270,30 +1326,34 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             | Kind::True
             | Kind::False => self.literal(&token)?,
             Kind::OpenBracket => {
-                let depth = self.deeper(depth, token.start)?;
-                let node = self.fresh();
-                self.emit(subject, predicate, node);
-                if self.peek()? != Kind::CloseBracket {
-                    self.predicate_object_list(node, depth)?;
-                }
-                self.expect(Kind::CloseBracket, "expected ']'")?;
-                return Ok(node);
+                return self.within(Kind::OpenBracket, |p| {
+                    let depth = p.deeper(depth, token.start)?;
+                    let node = p.fresh();
+                    p.emit(subject, predicate, node);
+                    if p.peek()? != Kind::CloseBracket {
+                        p.predicate_object_list(node, depth)?;
+                    }
+                    p.expect(Kind::CloseBracket, "expected ']'")?;
+                    Ok(node)
+                });
             }
             Kind::OpenParen => {
-                let depth = self.deeper(depth, token.start)?;
-                let head = self.collection(depth)?;
+                let head = self.within(Kind::OpenParen, |p| {
+                    let depth = p.deeper(depth, token.start)?;
+                    p.collection(depth)
+                })?;
                 self.emit(subject, predicate, head);
                 return Ok(head);
             }
-            Kind::TripleTermOpen => {
-                let depth = self.deeper(depth, token.start)?;
-                self.triple_term(depth)?
-            }
-            Kind::ReifiedOpen => {
-                let depth = self.deeper(depth, token.start)?;
-                self.reified_triple(depth)?
-            }
-            _ => return Err(self.error(token.start, "expected an object")),
+            Kind::TripleTermOpen => self.within(Kind::TripleTermOpen, |p| {
+                let depth = p.deeper(depth, token.start)?;
+                p.triple_term(depth)
+            })?,
+            Kind::ReifiedOpen => self.within(Kind::ReifiedOpen, |p| {
+                let depth = p.deeper(depth, token.start)?;
+                p.reified_triple(depth)
+            })?,
+            _ => return Err(self.unexpected(&token, "expected an object")),
         };
         self.emit(subject, predicate, object);
         Ok(object)
@@ -1317,13 +1377,15 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             Kind::IriRef { .. } | Kind::PrefixedName { .. } => Ok(Term::Iri(self.iri(token)?)),
             Kind::BlankLabel => Ok(Term::Blank(self.blank_label(token)?)),
             Kind::OpenBracket => {
-                self.expect(
-                    Kind::CloseBracket,
-                    "expected ']': only '[]' is allowed here",
-                )?;
+                self.within(Kind::OpenBracket, |p| {
+                    p.expect(
+                        Kind::CloseBracket,
+                        "expected ']': only '[]' is allowed here",
+                    )
+                })?;
                 Ok(self.fresh())
             }
-            _ => Err(self.error(token.start, what)),
+            _ => Err(self.unexpected(token, what)),
         }
     }
 
@@ -1347,10 +1409,10 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         let predicate = self.verb()?;
         let token = self.take()?;
         let object = match token.kind {
-            Kind::TripleTermOpen => {
-                let depth = self.deeper(depth, token.start)?;
-                self.triple_term(depth)?
-            }
+            Kind::TripleTermOpen => self.within(Kind::TripleTermOpen, |p| {
+                let depth = p.deeper(depth, token.start)?;
+                p.triple_term(depth)
+            })?,
             kind if Self::starts_literal(kind) => self.literal(&token)?,
             _ => self.node(
                 &token,
@@ -1369,10 +1431,10 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     fn reified_triple(&mut self, depth: usize) -> Step<Term> {
         let token = self.take()?;
         let subject = match token.kind {
-            Kind::ReifiedOpen => {
-                let depth = self.deeper(depth, token.start)?;
-                self.reified_triple(depth)?
-            }
+            Kind::ReifiedOpen => self.within(Kind::ReifiedOpen, |p| {
+                let depth = p.deeper(depth, token.start)?;
+                p.reified_triple(depth)
+            })?,
             _ => self.node(
                 &token,
                 "expected an IRI, a blank node or a reified triple as subject",
@@ -1381,14 +1443,14 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         let predicate = self.verb()?;
         let token = self.take()?;
         let object = match token.kind {
-            Kind::ReifiedOpen => {
-                let depth = self.deeper(depth, token.start)?;
-                self.reified_triple(depth)?
-            }
-            Kind::TripleTermOpen => {
-                let depth = self.deeper(depth, token.start)?;
-                self.triple_term(depth)?
-            }
+            Kind::ReifiedOpen => self.within(Kind::ReifiedOpen, |p| {
+                let depth = p.deeper(depth, token.start)?;
+                p.reified_triple(depth)
+            })?,
+            Kind::TripleTermOpen => self.within(Kind::TripleTermOpen, |p| {
+                let depth = p.deeper(depth, token.start)?;
+                p.triple_term(depth)
+            })?,
             kind if Self::starts_literal(kind) => self.literal(&token)?,
             _ => self.node(&token, "expected an object of the reified triple")?,
         };
@@ -1443,21 +1505,23 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 }
                 Kind::AnnotationOpen => {
                     let token = self.take()?;
-                    let depth = self.deeper(depth, token.start)?;
-                    let triple = match term {
-                        Some(triple) => triple,
-                        None => *term.insert(self.add_triple_term(subject, predicate, object)),
-                    };
-                    let block_subject = match reifier.take() {
-                        Some(named) => named,
-                        None => {
-                            let fresh = self.fresh();
-                            self.emit(fresh, Term::Static(rdf::REIFIES), triple);
-                            fresh
-                        }
-                    };
-                    self.predicate_object_list(block_subject, depth)?;
-                    self.expect(Kind::AnnotationClose, "expected '|}' after the annotation")?;
+                    self.within(Kind::AnnotationOpen, |p| {
+                        let depth = p.deeper(depth, token.start)?;
+                        let triple = match term {
+                            Some(triple) => triple,
+                            None => *term.insert(p.add_triple_term(subject, predicate, object)),
+                        };
+                        let block_subject = match reifier.take() {
+                            Some(named) => named,
+                            None => {
+                                let fresh = p.fresh();
+                                p.emit(fresh, Term::Static(rdf::REIFIES), triple);
+                                fresh
+                            }
+                        };
+                        p.predicate_object_list(block_subject, depth)?;
+                        p.expect(Kind::AnnotationClose, "expected '|}' after the annotation")
+                    })?;
                 }
                 _ => return Ok(()),
             }
@@ -1551,6 +1615,27 @@ fn pair(kind: Kind) -> usize {
         Kind::TripleTermOpen | Kind::TripleTermClose => 2,
         Kind::ReifiedOpen | Kind::ReifiedClose => 3,
         _ => 4,
+    }
+}
+
+/// An opener or closer met in a failed statement (`resync`), applied to what is open there:
+/// `open` (pairs, outermost first) and `counts` (how many of each pair it holds). An opener
+/// opens. A closer closes the innermost open bracket of its own pair, and the unfinished
+/// ones opened inside it go with it; with none of its pair open, it closes nothing. Each
+/// bracket is opened and closed once, and a closer of a pair not open costs O(1): linear
+/// work.
+fn bracket(open: &mut Vec<usize>, counts: &mut [usize; 5], kind: Kind) {
+    let pair = pair(kind);
+    if matches!(kind, opener!()) {
+        counts[pair] += 1;
+        open.push(pair);
+    } else if counts[pair] > 0 {
+        while let Some(inner) = open.pop() {
+            counts[inner] -= 1;
+            if inner == pair {
+                break;
+            }
+        }
     }
 }
 
