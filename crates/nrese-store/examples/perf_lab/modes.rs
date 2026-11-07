@@ -562,19 +562,62 @@ pub fn replication(
     ))
 }
 
-/// The upload path (`--upload FILE`): the file sent as a Graph Store PUT into a named graph
-/// of a fresh in-memory store, `runs` times, each run its own store, through the mutation
-/// pipeline as the server applies it (parse, write, commit). The PUT's times, the last run's
-/// peak memory, and the statements the graph holds after it (the case's check).
+/// How `--upload` sends its file (`--upload-as`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadRoute {
+    /// A Graph Store PUT into a named graph.
+    GraphStore,
+    /// RDF4J's statements Add into three contexts.
+    Statements,
+    /// An RDF4J transaction's DELETE of the file's statements, put there first.
+    Delete,
+}
+
+/// An RDF4J transaction's DELETE of `data`, from `graph`, as the server makes it when the
+/// body arrives (`http/rdf4j.rs` `removals`).
+fn delete_ops(
+    data: nrese_store::RdfPayload,
+    graph: nrese_rdf::GraphName,
+) -> Result<Vec<nrese_store::StatementOp>, Box<dyn std::error::Error>> {
+    Ok(vec![nrese_store::StatementOp::remove_patterns(
+        data,
+        vec![graph],
+        false,
+    )?])
+}
+
+/// The upload path (`--upload FILE`): the file sent along `route` to a fresh in-memory
+/// store, `runs` times, each run its own store, through the mutation pipeline as the server
+/// applies it (parse, write, commit). The route's times, the last run's peak memory, and
+/// the statements the store holds after it (the case's check).
 pub fn upload(
     config: &nrese_store::StoreConfig,
     file: &Path,
     format: nrese_store::GraphResultFormat,
+    route: UploadRoute,
     runs: usize,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    use nrese_store::{GraphTarget, GraphWriteRequest, ReadContext, StatementPattern};
+    use nrese_store::{
+        GraphTarget, GraphWriteRequest, RdfPayload, ReadContext, StatementOp, StatementPattern,
+        StatementsRequest,
+    };
     const GRAPH: &str = "urn:perf-lab:upload";
+    let graph = || nrese_rdf::NamedNode::new_unchecked(GRAPH);
     let payload = std::fs::read(file)?;
+    let data = || RdfPayload {
+        payload: payload.clone(),
+        format,
+        base_iri: None,
+    };
+    let put = || {
+        MutationCommand::GraphWrite(GraphWriteRequest {
+            target: GraphTarget::NamedGraph(GRAPH.to_owned()),
+            format,
+            base_iri: None,
+            payload: payload.clone(),
+            replace: true,
+        })
+    };
     let (mut times, mut statements, mut peak) = (Vec::new(), 0, String::from("null"));
     for _ in 0..runs.max(1) {
         let store = Arc::new(StoreService::new(config.clone())?);
@@ -582,27 +625,46 @@ pub fn upload(
             Arc::clone(&store),
             Arc::new(nrese_reasoner::ReasonerService::new(Default::default())),
         );
-        let request = GraphWriteRequest {
-            target: GraphTarget::NamedGraph(GRAPH.to_owned()),
-            format,
-            base_iri: None,
-            payload: payload.clone(),
-            replace: true,
-        };
+        let apply = |command| pipeline.apply(command, &Requester::all(), &MutationTicket::new());
+        if route == UploadRoute::Delete {
+            // The statements to delete, put there first (not timed).
+            apply(put())?;
+        }
         let phase = crate::Phase::start();
         let started = Instant::now();
-        pipeline.apply(
-            MutationCommand::GraphWrite(request),
-            &Requester::all(),
-            &MutationTicket::new(),
-        )?;
+        match route {
+            UploadRoute::GraphStore => drop(apply(put())?),
+            // RDF4J's `/statements` with three `context` parameters: each statement into
+            // three graphs.
+            UploadRoute::Statements => {
+                let contexts = (0..3)
+                    .map(|i| nrese_rdf::NamedNode::new_unchecked(format!("{GRAPH}:{i}")).into())
+                    .collect();
+                let add = StatementOp::Add {
+                    data: data(),
+                    contexts,
+                };
+                drop(apply(MutationCommand::Statements(StatementsRequest::new(
+                    vec![add],
+                )))?);
+            }
+            // An RDF4J transaction's DELETE of the statements in the graph: its arrival, a
+            // read inside the transaction (its pending operations applied), its commit.
+            UploadRoute::Delete => {
+                let request = StatementsRequest::new(delete_ops(data(), graph().into())?);
+                store.count(
+                    &ReadContext {
+                        pending: Some(&request),
+                        ..ReadContext::all()
+                    },
+                    &StatementPattern::default(),
+                )?;
+                drop(apply(MutationCommand::Statements(request))?);
+            }
+        }
         times.push(started.elapsed());
         peak = phase.json();
-        let in_graph = StatementPattern {
-            contexts: vec![nrese_rdf::NamedNode::new_unchecked(GRAPH).into()],
-            ..StatementPattern::default()
-        };
-        statements = store.count(&ReadContext::all(), &in_graph)?;
+        statements = store.count(&ReadContext::all(), &StatementPattern::default())?;
     }
     let runs = times.len();
     let (p50, _, max) = percentiles(&mut times);

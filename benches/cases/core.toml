@@ -1362,6 +1362,38 @@ route = {}
 cap_gb = 4
 systems = []
 guards = ["an upload is read as it goes into its write, never held as owned quads (UPLOAD)"]
+
+[[case]]
+name = "upload-statements-contexts"
+area = "load"
+what = "RDF4J's statements Add of 1 M N-Triples statements with three context parameters: each statement into three graphs, 3 M quads"
+semantics = "none"
+data = "entities entities=250000"
+tool_loads = false
+args = ["--upload", "{data}", "--upload-format", "ntriples", "--upload-as", "statements"]
+queries = ""
+metric = "upload.p50_ms"
+check = { "upload.statements" = 3000000 }
+route = {}
+cap_gb = 4
+systems = []
+guards = ["statements into contexts are placed per statement as it is read, with no context-expanded copy (UPLOAD)"]
+
+[[case]]
+name = "upload-transaction-delete"
+area = "load"
+what = "an RDF4J transaction's DELETE of 1 M statements from their graph: the body's arrival, a read inside the transaction, the commit"
+semantics = "none"
+data = "entities entities=250000"
+tool_loads = false
+args = ["--upload", "{data}", "--upload-format", "ntriples", "--upload-as", "delete"]
+queries = ""
+metric = "upload.p50_ms"
+check = { "upload.statements" = 0 }
+route = {}
+cap_gb = 4
+systems = []
+guards = ["a transaction DELETE keeps its body and reads it when applied, never a pattern per statement (UPLOAD)"]
 [[case]]
 name = "open-first-query"
 area = "load"
