@@ -156,6 +156,55 @@ mod tests {
         assert!(parse_duration_ms("30 fortnights").is_err());
     }
 
+    /// A positive value below one byte or one millisecond would read as 0, which budgets
+    /// take as none, and a value past u64 as its largest: both are errors. Every row is
+    /// checked; the failures are reported together.
+    #[test]
+    fn values_below_one_unit_or_past_the_range_are_errors() {
+        let mut wrong = Vec::new();
+        for text in [
+            "0.4",
+            "0.4 B",
+            "0.0001 KiB",
+            "18446744073709551616",
+            "17179869184 GiB",
+            "99999999999999999999999",
+        ] {
+            if let Ok(bytes) = parse_size(text) {
+                wrong.push(format!("size {text:?} read as {bytes}"));
+            }
+        }
+        for text in ["0.1ms", "0.4", "0.0001 s", "5124095576030432 h"] {
+            if let Ok(ms) = parse_duration_ms(text) {
+                wrong.push(format!("duration {text:?} read as {ms} ms"));
+            }
+        }
+        // Guards: zero, one unit, a fraction of a larger unit, the largest size.
+        for (text, bytes) in [
+            ("0", 0u64),
+            ("0.0", 0),
+            ("1", 1),
+            ("0.5 KiB", 512),
+            ("18446744073709551615", u64::MAX),
+        ] {
+            if parse_size(text).ok() != Some(bytes) {
+                wrong.push(format!(
+                    "size {text:?}: {:?}, not {bytes}",
+                    parse_size(text)
+                ));
+            }
+        }
+        for (text, ms) in [("0", 0u64), ("1ms", 1), ("0.5 s", 500), ("0.001 s", 1)] {
+            if parse_duration_ms(text).ok() != Some(ms) {
+                wrong.push(format!(
+                    "duration {text:?}: {:?}, not {ms}",
+                    parse_duration_ms(text)
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[test]
     fn memory_is_bytes_or_a_share_of_the_machine() {
         const G: u64 = 1 << 30;
