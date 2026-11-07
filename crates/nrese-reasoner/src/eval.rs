@@ -791,22 +791,21 @@ impl<'r> Job<'r> {
 
     /// [`Job::run`] that stops once `emit` returns true ([`walk_until`]): the rest of the
     /// scans under way, the drivers' included, is passed over. Returns whether `emit`
-    /// stopped it. For the consistency check, whose report can refuse; materialisation
-    /// runs [`Job::run`], which never stops.
+    /// stopped it. It polls `poll` as [`Job::run`] does: once that has stopped, what was
+    /// emitted is incomplete ([`Poller::stopped`]). For the consistency check, whose report
+    /// can refuse; materialisation runs [`Job::run`], which `emit` never stops.
     pub fn run_until<S: Source + ?Sized>(
         &self,
         source: &S,
         range: std::ops::Range<usize>,
+        poll: &mut Poller<'_>,
         emit: &mut dyn FnMut(&[Option<u64>]) -> bool,
     ) -> bool {
         let mut bindings = vec![None; self.rule.variables()];
         let driver = &self.rule.body[self.order[0].0];
         let mut stopped = false;
-        // Merge of #104 only: the walk's poller never fires here, as before the merge (the
-        // check polls per firing); the next commit polls it.
-        let mut poll = Poller::never();
         let mut visit = |fact: Triple| {
-            if stopped {
+            if stopped || poll.tick() {
                 return;
             }
             if let Some(newly) = bind(driver, fact, &mut bindings) {
@@ -817,7 +816,7 @@ impl<'r> Job<'r> {
                     &self.order,
                     1,
                     &mut bindings,
-                    &mut poll,
+                    poll,
                     emit,
                 );
                 unbind(driver, newly, &mut bindings);
