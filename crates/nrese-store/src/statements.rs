@@ -14,12 +14,12 @@
 //! its requester may not write, whether the statement is there or not.
 
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, TermId, Transaction};
-use nrese_rdf::{GraphName, NamedNode, Quad, Term, TermRef};
+use nrese_rdf::{GraphName, GraphNameRef, NamedNode, Quad, QuadRef, Term, TermRef};
 use nrese_sparql::ReadView;
 
 use crate::error::StoreResult;
 use crate::query::GraphResultFormat;
-use crate::rdf_io::parse_payload;
+use crate::rdf_io::{BlankNodes, each_payload_quad};
 use crate::update::SparqlUpdateRequest;
 use crate::view::decoded_quads;
 
@@ -92,26 +92,125 @@ pub struct RdfPayload {
 }
 
 impl RdfPayload {
-    /// The payload's statements placed per `contexts` (module docs).
-    fn quads(&self, contexts: &[GraphName]) -> StoreResult<Vec<Quad>> {
-        let parsed = parse_payload(self.format, self.base_iri.as_deref(), &self.payload)?;
-        if contexts.is_empty() {
-            return Ok(parsed);
-        }
-        Ok(parsed
-            .iter()
-            .flat_map(|quad| {
-                contexts.iter().map(|graph| {
-                    Quad::new(
-                        quad.subject.clone(),
-                        quad.predicate.clone(),
-                        quad.object.clone(),
-                        graph.clone(),
-                    )
+    /// The payload's statements placed per `contexts` (module docs), each to `each` as it
+    /// is read: once per context if any are given.
+    fn each_quad(
+        &self,
+        contexts: &[GraphName],
+        blank_nodes: BlankNodes,
+        mut each: impl FnMut(QuadRef<'_>) -> StoreResult<()>,
+    ) -> StoreResult<()> {
+        each_payload_quad(
+            self.format.rdf_format(),
+            self.base_iri.as_deref(),
+            &self.payload,
+            blank_nodes,
+            |quad| {
+                if contexts.is_empty() {
+                    return each(quad);
+                }
+                contexts.iter().try_for_each(|graph| {
+                    each(QuadRef::new(
+                        quad.subject,
+                        quad.predicate,
+                        quad.object,
+                        graph.as_ref(),
+                    ))
                 })
-            })
-            .collect())
+            },
+        )
     }
+
+    /// Whether the payload is RDF in its format: read to its end, nothing kept.
+    fn check(&self, blank_nodes: BlankNodes) -> StoreResult<()> {
+        self.each_quad(&[], blank_nodes, |_| Ok(()))
+    }
+}
+
+impl StatementOp {
+    /// An RDF4J transaction's `DELETE` of `data` ([`StatementOp::RemovePatterns`]): the
+    /// payload is read once now, so one that isn't RDF is refused when it is sent (as
+    /// RDF4J's server refuses it), and kept as it came for when it is applied.
+    pub fn remove_patterns(
+        data: RdfPayload,
+        contexts: Vec<GraphName>,
+        preserve_blank_nodes: bool,
+    ) -> StoreResult<Self> {
+        data.check(blank_nodes(preserve_blank_nodes))?;
+        Ok(Self::RemovePatterns {
+            data,
+            contexts,
+            preserve_blank_nodes,
+        })
+    }
+}
+
+/// Fresh blank nodes, or (`preserveNodeId`) the payload's labels, which name the store's.
+fn blank_nodes(preserve: bool) -> BlankNodes {
+    match preserve {
+        true => BlankNodes::AsWritten,
+        false => BlankNodes::Fresh,
+    }
+}
+
+/// `sesame:wildcard`: in a transaction's `DELETE` payload, any value at that position.
+const WILDCARD: &str = "http://www.openrdf.org/schema/sesame#wildcard";
+/// `rdf4j:nil`: in a `DELETE` payload's graph position, the default graph.
+const NIL: &str = "http://rdf4j.org/schema/rdf4j#nil";
+
+/// The pattern of a statement of an RDF4J transaction's `DELETE` payload
+/// ([`StatementOp::RemovePatterns`]).
+fn removal_pattern(quad: QuadRef<'_>, contexts: &[GraphName]) -> StatementPattern {
+    let wildcard =
+        |term: TermRef<'_>| matches!(term, TermRef::NamedNode(node) if node.as_str() == WILDCARD);
+    let subject: TermRef<'_> = quad.subject.into();
+    StatementPattern {
+        subject: (!wildcard(subject)).then(|| subject.into_owned()),
+        predicate: (quad.predicate.as_str() != WILDCARD).then(|| quad.predicate.into_owned()),
+        object: (!wildcard(quad.object)).then(|| quad.object.into_owned()),
+        contexts: match quad.graph_name {
+            GraphNameRef::DefaultGraph => contexts.to_vec(),
+            GraphNameRef::NamedNode(node) if node.as_str() == NIL => vec![GraphName::DefaultGraph],
+            graph => vec![graph.into_owned()],
+        },
+    }
+}
+
+/// Fails unless the write may change `graph` (no copy where every graph is writable).
+fn check_write(requester: &crate::Requester, graph: GraphNameRef<'_>) -> StoreResult<()> {
+    match requester.write.access() {
+        Some(_) => requester.write.check(&graph.into_owned()),
+        None => Ok(()),
+    }
+}
+
+/// Removes what `pattern` matches in the graphs the requester reads; every graph it would
+/// change must be writable.
+fn remove_matching(
+    tx: &mut Transaction<'_>,
+    pattern: &StatementPattern,
+    requester: &crate::Requester,
+) -> StoreResult<()> {
+    let patterns = pattern.patterns(&*tx, &requester.read);
+    if let Some(writable) = requester.write.access() {
+        let mut allowed = std::collections::HashSet::new();
+        for engine_pattern in &patterns {
+            for quad in tx.quads_for_pattern_in(ReadModel::Asserted, engine_pattern) {
+                if allowed.contains(&quad.graph) {
+                    continue;
+                }
+                if !writable.allows_id(&*tx, quad.graph) {
+                    let graph = crate::mutation::command::graph_name(tx, quad.graph);
+                    return requester.write.check(&graph);
+                }
+                allowed.insert(quad.graph);
+            }
+        }
+    }
+    for engine_pattern in patterns {
+        tx.remove_matching(&engine_pattern);
+    }
+    Ok(())
 }
 
 /// One write of a [`StatementsRequest`].
@@ -130,6 +229,18 @@ pub enum StatementOp {
     },
     /// Removes every statement matching the pattern.
     RemoveMatching(StatementPattern),
+    /// An RDF4J transaction's `DELETE` (made with [`StatementOp::remove_patterns`]): each
+    /// statement of the payload a pattern, as RDF4J's server reads it (its client removes
+    /// this way, `clear()` too). `sesame:wildcard` matches any value; a statement without a
+    /// graph removes from every graph (or from `contexts`), one in `rdf4j:nil` from the
+    /// default graph; with `preserve_blank_nodes` (`preserveNodeId`), blank nodes refer to
+    /// the store's. The payload is kept as it came and read again when applied: never as
+    /// a pattern per statement.
+    RemovePatterns {
+        data: RdfPayload,
+        contexts: Vec<GraphName>,
+        preserve_blank_nodes: bool,
+    },
     /// A SPARQL update.
     Update(SparqlUpdateRequest),
 }
@@ -159,41 +270,32 @@ pub(crate) fn apply_statements(
     update: &mut dyn FnMut(&mut Transaction<'_>, &SparqlUpdateRequest) -> StoreResult<()>,
 ) -> StoreResult<()> {
     for op in &request.ops {
+        // Each statement of a payload as it is read; one that fails part-way fails the
+        // request, whose transaction is then discarded with all it changed.
         match op {
             StatementOp::Add { data, contexts } => {
-                for quad in data.quads(contexts)? {
-                    requester.write.check(&quad.graph_name)?;
-                    tx.insert(quad.as_ref());
-                }
+                data.each_quad(contexts, BlankNodes::Fresh, |quad| {
+                    check_write(requester, quad.graph_name)?;
+                    tx.insert(quad);
+                    Ok(())
+                })?;
             }
             StatementOp::RemoveData { data, contexts } => {
-                for quad in data.quads(contexts)? {
-                    requester.write.check(&quad.graph_name)?;
-                    tx.remove(quad.as_ref());
-                }
+                data.each_quad(contexts, BlankNodes::Fresh, |quad| {
+                    check_write(requester, quad.graph_name)?;
+                    tx.remove(quad);
+                    Ok(())
+                })?;
             }
-            StatementOp::RemoveMatching(pattern) => {
-                // The removal matches in the graphs the requester reads.
-                let patterns = pattern.patterns(&*tx, &requester.read);
-                if let Some(writable) = requester.write.access() {
-                    // Every graph the removal would change must be writable.
-                    let mut allowed = std::collections::HashSet::new();
-                    for engine_pattern in &patterns {
-                        for quad in tx.quads_for_pattern_in(ReadModel::Asserted, engine_pattern) {
-                            if allowed.contains(&quad.graph) {
-                                continue;
-                            }
-                            if !writable.allows_id(&*tx, quad.graph) {
-                                let graph = crate::mutation::command::graph_name(tx, quad.graph);
-                                return requester.write.check(&graph);
-                            }
-                            allowed.insert(quad.graph);
-                        }
-                    }
-                }
-                for engine_pattern in patterns {
-                    tx.remove_matching(&engine_pattern);
-                }
+            StatementOp::RemoveMatching(pattern) => remove_matching(tx, pattern, requester)?,
+            StatementOp::RemovePatterns {
+                data,
+                contexts,
+                preserve_blank_nodes,
+            } => {
+                data.each_quad(&[], blank_nodes(*preserve_blank_nodes), |quad| {
+                    remove_matching(tx, &removal_pattern(quad, contexts), requester)
+                })?;
             }
             StatementOp::Update(request) => update(tx, request)?,
         }

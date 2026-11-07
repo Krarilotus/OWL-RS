@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nrese_rdf::{GraphName, NamedNode, Term};
+use nrese_rdf::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNodeRef, TermRef};
 use nrese_rdf_io::{RdfFormat, RdfSyntaxError};
 use serde::{Deserialize, Serialize};
 
@@ -510,16 +510,20 @@ impl Quarantine {
             None => format!("{text}\n"),
         };
         let document = format!("{}{body}", statement.context);
-        let quads = crate::rdf_io::parse_payload_preserving_blank_nodes(
-            format,
+        // Read as it goes: whether a statement names a blank node.
+        let mut has_blank_nodes = false;
+        crate::rdf_io::each_payload_quad(
+            format.rdf_format(),
             statement.base.as_deref(),
             document.as_bytes(),
+            crate::rdf_io::BlankNodes::AsWritten,
+            |quad| {
+                has_blank_nodes |= has_blank_node(quad.subject.into())
+                    || has_blank_node(quad.object)
+                    || matches!(quad.graph_name, GraphNameRef::BlankNode(_));
+                Ok(())
+            },
         )?;
-        let has_blank_nodes = quads.iter().any(|quad| {
-            has_blank_node(&quad.subject.clone().into())
-                || has_blank_node(&quad.object)
-                || matches!(quad.graph_name, GraphName::BlankNode(_))
-        });
         if has_blank_nodes && !request.fresh_blank_nodes {
             return Err(StoreError::Quarantine(format!(
                 "quarantined statement {id} has blank nodes, which a write can't name yet: \
@@ -593,11 +597,12 @@ fn load_files(dir: &Path, extension: &str) -> StoreResult<Vec<PathBuf>> {
     Ok(files.into_iter().map(|(_, _, path)| path).collect())
 }
 
-fn has_blank_node(term: &Term) -> bool {
+fn has_blank_node(term: TermRef<'_>) -> bool {
     match term {
-        Term::BlankNode(_) => true,
-        Term::Triple(triple) => {
-            has_blank_node(&triple.subject.clone().into()) || has_blank_node(&triple.object)
+        TermRef::BlankNode(_) => true,
+        TermRef::Triple(triple) => {
+            has_blank_node(NamedOrBlankNodeRef::from(&triple.subject).into())
+                || has_blank_node((&triple.object).into())
         }
         _ => false,
     }

@@ -16,7 +16,7 @@ use nrese_sparql::{CancellationToken, ReadView, Resources};
 
 use crate::error::{StoreError, StoreResult};
 use crate::query::GraphResultFormat;
-use crate::rdf_io::{BlankNodes, parse_graph, serialize_triples};
+use crate::rdf_io::{BlankNodes, each_graph_quad, serialize_triples};
 use crate::service::StoreService;
 
 /// Where a request's shapes stay while it runs. They are never committed.
@@ -297,19 +297,22 @@ impl StoreService {
                 // The shapes go into a graph of a speculative transaction, never committed:
                 // they share the repository's dictionary, as stored shapes do, and leave no
                 // trace. It takes no writer slot, so commits go on meanwhile.
+                // Each statement into it as it is read; validated once all are read (an
+                // error drops the transaction).
                 let scratch = NamedNodeRef::new_unchecked(REQUEST_SHAPES_GRAPH);
-                let quads = parse_graph(
+                let mut tx = self.engine().speculative();
+                let revision = tx.base().revision();
+                each_graph_quad(
                     *format,
                     base_iri.as_deref(),
                     payload.as_slice(),
                     GraphName::NamedNode(scratch.into_owned()),
                     BlankNodes::Fresh,
+                    |quad| {
+                        tx.insert(quad);
+                        Ok(())
+                    },
                 )?;
-                let mut tx = self.engine().speculative();
-                let revision = tx.base().revision();
-                for quad in &quads {
-                    tx.insert(quad.as_ref());
-                }
                 let (report, shapes, applicable) = validate_view(
                     &tx,
                     tx.lookup(scratch.into()),
