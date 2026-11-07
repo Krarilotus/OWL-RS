@@ -350,6 +350,8 @@ Two rule-reasoning steps also don't poll the deadline:
 - the one-off full materialisation that runs when no current reasoning state is recorded;
 - closing a newly declared transitive property.
 
+A fixed limit comes before every authenticated request: a body of known length up to 64 KiB is read whole before the answer (clients that send the headers and the body apart need that), and that read waits at most 10 s. A body still missing then gets 401 if authentication refused the request's credentials, else 408.
+
 ## SPARQL Parse Error Profile
 
 - `policy.sparql_parse_error_profile` -> `NRESE_SPARQL_PARSE_ERROR_PROFILE`
