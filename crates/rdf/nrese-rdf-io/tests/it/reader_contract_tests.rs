@@ -112,6 +112,94 @@ fn a_failed_statement_gives_none_of_its_triples() {
     table.done();
 }
 
+/// Recovery resumes right after the failing statement's end: a `.` with nothing of the
+/// statement open is its end (Turtle 1.2 §6.5 `triples '.'`; `RdfParser::recovering`: the
+/// rest of the statement is skipped, up to the `.` ending it). Guards held before the
+/// change too.
+#[test]
+fn recovery_resumes_after_the_failing_statements_own_end() {
+    let abc = triple("http://e/a", "http://e/b", iri("http://e/c"));
+    let def = triple("http://e/d", "http://e/e", iri("http://e/f"));
+    let in_g = Quad::new(
+        iri("http://e/a"),
+        iri("http://e/b"),
+        iri("http://e/c"),
+        iri("http://e/g"),
+    );
+    let mut table = Table::default();
+    // (guard, format, document, recovering's items: Err as None)
+    let cases: [(bool, RdfFormat, &str, Vec<Option<&Quad>>); 7] = [
+        // The failing token is the statement's own `.`.
+        (
+            false,
+            RdfFormat::Turtle,
+            "<http://e/s> <http://e/p> 1, . <http://e/a> <http://e/b> <http://e/c> .",
+            vec![None, Some(&abc)],
+        ),
+        (
+            false,
+            RdfFormat::Turtle,
+            "<http://e/s> . <http://e/a> <http://e/b> <http://e/c> .",
+            vec![None, Some(&abc)],
+        ),
+        (
+            false,
+            RdfFormat::TriG,
+            "<http://e/g> { <http://e/s> <http://e/p> 1, . <http://e/a> <http://e/b> <http://e/c> . }",
+            vec![None, Some(&in_g)],
+        ),
+        // A `.` inside brackets doesn't end the statement: skipped to the one that does.
+        (
+            true,
+            RdfFormat::Turtle,
+            "<http://e/s> <http://e/p> [ <http://e/q> . ] . <http://e/a> <http://e/b> <http://e/c> .",
+            vec![None, Some(&abc)],
+        ),
+        (
+            true,
+            RdfFormat::Turtle,
+            "<http://e/s> <http://e/p> ( 1 . ) . <http://e/a> <http://e/b> <http://e/c> .",
+            vec![None, Some(&abc)],
+        ),
+        // Bytes the lexer can't read right after a statement start a bad statement, which
+        // ends at its `.`: the earlier statement's `.` doesn't count for it.
+        (
+            true,
+            RdfFormat::Turtle,
+            "<http://e/a> <http://e/b> <http://e/c> . %% <http://e/d> <http://e/e> <http://e/f> . <http://e/d> <http://e/e> <http://e/f> .",
+            vec![Some(&abc), None, Some(&def)],
+        ),
+        // A statement failing at its first token.
+        (
+            true,
+            RdfFormat::Turtle,
+            "] <http://e/s> . <http://e/a> <http://e/b> <http://e/c> .",
+            vec![None, Some(&abc)],
+        ),
+    ];
+    for (guard, format, document, expected) in cases {
+        let items = drain(
+            RdfParser::from_format(format)
+                .recovering()
+                .for_slice(document.as_bytes()),
+        );
+        let got: Vec<Option<&Quad>> = items.iter().map(|item| item.as_ref().ok()).collect();
+        table.row(guard, ("recovering", document), same(got, expected.clone()));
+        // Strict: one error, then the end.
+        let strict = drain(RdfParser::from_format(format).for_slice(document.as_bytes()));
+        let strict_expected: Vec<bool> = match expected.first() {
+            Some(Some(_)) => vec![true, false],
+            _ => vec![false],
+        };
+        table.row(
+            true,
+            ("strict", document),
+            shaped(&strict, &strict_expected),
+        );
+    }
+    table.done();
+}
+
 // --- A read error always stops ------------------------------------------------------------
 
 /// A reader that gives its pieces in order: bytes, or a failure of a kind.
