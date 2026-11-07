@@ -178,7 +178,8 @@ impl Engine {
     /// it follows a revision this engine has reached (its records up to this engine's
     /// revision are skipped, as an answer applied twice); the frames are complete records,
     /// nothing else; their revisions are exactly `after + 1 ..= last`, `records` of them;
-    /// their dictionary entries follow on from each other. Then the batch's dictionary
+    /// their dictionary entries follow on from each other; their commit times are ones a
+    /// store keeps ([`crate::durability::check_commit_time`]). Then the batch's dictionary
     /// entries are restored at once, all or none, each checked under that lock as
     /// `Dictionary::restore_key` takes one (continuing this dictionary; a speculative
     /// transaction may have interned meanwhile). Anything else is refused
@@ -298,8 +299,10 @@ impl Engine {
             ));
         }
         // Each record's dictionary range ends within u64 (a range from the wire is refused,
-        // not added up): checked before anything below adds to it.
+        // not added up): checked before anything below adds to it. Its commit time is one a
+        // store keeps: refused here, a later record's never leaves an earlier one applied.
         for record in &records {
+            crate::durability::check_commit_time(record)?;
             if record
                 .dictionary_start
                 .checked_add(record.keys.len() as u64)
@@ -327,8 +330,6 @@ impl Engine {
     /// One record as a commit, its dictionary entries already restored and the dictionary
     /// published at `dictionary_len` entries (the writer slot held).
     fn apply_record(&self, record: &CommitRecord, dictionary_len: u64) -> EngineResult<()> {
-        // Before anything is applied: a time the store couldn't keep is refused.
-        crate::durability::check_commit_time(record)?;
         let shared = &self.inner.shared;
         // Equality classes are found again where `sameAs` statements changed.
         let same_as = *shared.equality.read();
