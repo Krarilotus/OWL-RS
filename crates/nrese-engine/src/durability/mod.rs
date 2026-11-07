@@ -263,8 +263,9 @@ impl Durable {
                 None => {
                     return Err(EngineError::Configuration(format!(
                         "the checkpoint at revision {} has no commit time (format 11 or older, or \
-                         commits logged without one): restore by revision, or from an image \
-                         this version wrote",
+                         a store with commits of unknown time): restore by revision; for restore \
+                         by time, export the store as N-Quads and load it into a new data \
+                         directory",
                         version.revision
                     )));
                 }
