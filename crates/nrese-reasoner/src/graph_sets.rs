@@ -1049,6 +1049,17 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                 || Poller::new(&fired),
                 |poll, &fact| {
                     let mut from = Annotation::default();
+                    // The fact is attempted work before either prelude (its bodiless sets,
+                    // its producers), and so is each grounding (review r1, F1; sol-loop r6,
+                    // R6-1). Stopped, or no poller (stopped before the task began): what it
+                    // found is incomplete, and the check after the pass ends the run before
+                    // it is read.
+                    let Some(poll) = poll.as_mut() else {
+                        return (fact, from);
+                    };
+                    if poll.attempt(1) {
+                        return (fact, from);
+                    }
                     let mut take = |found: Annotation| {
                         from.truncated |= found.truncated;
                         from.sets.extend(found.sets);
@@ -1071,12 +1082,6 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                         groundings.push(Grounding::Transitive(fact[1]));
                     }
                     for grounding in groundings {
-                        // Each grounding is attempted work, searched or not (review r1, F1).
-                        // Stopped: what it found is incomplete; the check after the pass ends
-                        // the run before it is read.
-                        let Some(poll) = poll.as_mut() else {
-                            break;
-                        };
                         if poll.attempt(1) {
                             break;
                         }
