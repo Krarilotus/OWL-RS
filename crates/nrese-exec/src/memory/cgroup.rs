@@ -86,12 +86,17 @@ fn group(read: &impl Fn(&str) -> io::Result<String>) -> Result<Option<Group>, Un
     // The mount of this hierarchy whose root holds the group, the widest such root. Every mount
     // of one hierarchy shows the same tree, so the widest shows every ancestor a deeper one does
     // and more: a bind mount of the group itself must not hide the limits above it (review r1
-    // R1-C1). Above the widest, nothing is visible.
+    // R1-C1). Above the widest, nothing is visible. A mount another one covers isn't a view
+    // (sol-loop r3 S1): its files aren't reachable at its mount point.
+    let places: Vec<Option<(u64, u64, String)>> = mounts.lines().map(place).collect();
     let mut best: Option<(usize, String, String)> = None;
-    for line in mounts.lines() {
+    for (index, line) in mounts.lines().enumerate() {
         let Some((root, point)) = mount(line, files) else {
             continue;
         };
+        if covered(index, &places) {
+            continue;
+        }
         let Some(rest) = under(path, &root) else {
             continue;
         };
@@ -126,6 +131,53 @@ fn mount(line: &str, files: &Files) -> Option<(String, String)> {
         kind == "cgroup2"
     };
     ours.then(|| (unescape(root), unescape(point)))
+}
+
+/// A mountinfo line's mount id, parent mount id and mount point (proc(5): the first, second
+/// and fifth fields).
+fn place(line: &str) -> Option<(u64, u64, String)> {
+    let mut fields = line.split(' ');
+    let id = fields.next()?.parse().ok()?;
+    let parent = fields.next()?.parse().ok()?;
+    let point = unescape(fields.nth(2)?);
+    Some((id, parent, point))
+}
+
+/// Whether the mount at `index` of mountinfo is covered: a mount listed after it (mountinfo
+/// lists mounts in the order they were made) sits at its mount point or at a directory above
+/// it, and the mount isn't inside that later one (its parent chain doesn't reach it). A mount
+/// stacked on the same point, or one over a directory above, hides it whole. A line that
+/// can't be read covers nothing: then a cgroup mount counts, and a wrong choice reads files
+/// that aren't there, which is Unknown, never a limit too high.
+fn covered(index: usize, places: &[Option<(u64, u64, String)>]) -> bool {
+    let Some((id, _, point)) = &places[index] else {
+        return false;
+    };
+    let parent_of = |of: u64| {
+        places
+            .iter()
+            .flatten()
+            .find(|(id, ..)| *id == of)
+            .map(|p| p.1)
+    };
+    places[index + 1..]
+        .iter()
+        .flatten()
+        .any(|(later, _, above)| {
+            if under(point, above).is_none() {
+                return false;
+            }
+            // Inside the later mount: some ancestor of this one is it.
+            let mut at = *id;
+            for _ in 0..places.len() {
+                match parent_of(at) {
+                    Some(parent) if parent == *later => return false,
+                    Some(parent) if parent != at => at = parent,
+                    _ => break,
+                }
+            }
+            true
+        })
 }
 
 /// A mountinfo field as the path it names: proc(5) writes space, tab, newline and backslash
