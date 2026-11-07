@@ -97,3 +97,137 @@ async fn a_server_asks_another() -> Result<(), Box<dyn std::error::Error>> {
     server.abort();
     Ok(())
 }
+
+/// An endpoint that answers every request with `response`, on every connection and for
+/// every request a kept-alive connection brings, and keeps each connection open until its
+/// client closes it, whatever the response's own length says.
+fn canned(response: Vec<u8>) -> std::io::Result<String> {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}/sparql", listener.local_addr()?);
+    let response = std::sync::Arc::new(response);
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let response = std::sync::Arc::clone(&response);
+            std::thread::spawn(move || {
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    // A request's head, then as much of its body as its length says.
+                    let head = loop {
+                        if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            break at + 4;
+                        }
+                        match stream.read(&mut buffer) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buffer[..n]),
+                        }
+                    };
+                    let text = String::from_utf8_lossy(&request[..head]).to_ascii_lowercase();
+                    let length: usize = text
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    while request.len() < head + length {
+                        match stream.read(&mut buffer) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buffer[..n]),
+                        }
+                    }
+                    request.drain(..head + length);
+                    if stream.write_all(&response).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    Ok(url)
+}
+
+/// A server whose SERVICE may call `endpoint`, with `memory` bytes per query (0: unlimited).
+fn federated_app(
+    endpoint: &str,
+    memory: usize,
+) -> Result<axum::Router, Box<dyn std::error::Error>> {
+    let local = StoreService::new(StoreConfig::in_memory())?;
+    local.set_service_client(Arc::new(HttpServiceClient::new(
+        FederationConfig {
+            allow: vec![endpoint.to_owned()],
+            timeout_ms: 3_600_000,
+            ..FederationConfig::default()
+        },
+        tokio::runtime::Handle::current(),
+    )?));
+    let policy = PolicyConfig {
+        limits: nrese_server::policy::RequestLimits {
+            max_query_memory_bytes: memory,
+            ..PolicyConfig::default().limits
+        },
+        ..PolicyConfig::default()
+    };
+    test_app_with_store(local, policy, ReasonerConfig::default())
+}
+
+/// An endpoint's error is its status: the call fails with it at once, reading no more of
+/// the body than the message shows, however long the body says it is (here it never ends).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_endpoint_error_is_read_no_further_than_its_message()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut response = b"HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\ncontent-length: 100000000\r\n\r\n".to_vec();
+    response.extend(std::iter::repeat_n(b'x', 600));
+    let endpoint = canned(response)?;
+    let app = federated_app(&endpoint, 0)?;
+    let text = format!("SELECT * WHERE {{ SERVICE <{endpoint}> {{ ?s ?p ?o }} }}");
+    let response = tokio::time::timeout(
+        crate::support::held_service::HANG,
+        app.oneshot(query(&text)?),
+    )
+    .await
+    .map_err(|_| "the SERVICE call waited for the rest of the error's body")??;
+    assert!(!response.status().is_success(), "{}", response.status());
+    let body = body_text(response).await?;
+    assert!(body.contains("500 Internal Server Error"), "{body}");
+    Ok(())
+}
+
+/// An endpoint's answer is memory of the query that asked for it: one larger than the
+/// query's budget is refused (413), SILENT or not, instead of being read whole. Large in
+/// its body, or only once its rows are laid out over its variables.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_beyond_the_query_budget_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    // For a query budget of 1 MB: one row, a literal of 2 MB; and a body of 109 KB, its
+    // bindings (10,000, empty) before its head (10,000 variables), so 100 million values.
+    let value = "a".repeat(2_000_000);
+    let large = format!(
+        r#"{{"head":{{"vars":["o"]}},"results":{{"bindings":[{{"o":{{"type":"literal","value":"{value}"}}}}]}}}}"#
+    );
+    let vars: Vec<String> = (0..10_000).map(|i| format!("\"v{i}\"")).collect();
+    let wide = format!(
+        r#"{{"results":{{"bindings":[{}]}},"head":{{"vars":[{}]}}}}"#,
+        vec!["{}"; 10_000].join(","),
+        vars.join(",")
+    );
+    for json in [large, wide] {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/sparql-results+json\r\ncontent-length: {}\r\n\r\n",
+            json.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(json.as_bytes());
+        let endpoint = canned(response)?;
+        let app = federated_app(&endpoint, 1_000_000)?;
+        for service in ["SERVICE", "SERVICE SILENT"] {
+            let text = format!("SELECT ?o WHERE {{ {service} <{endpoint}> {{ ?s ?p ?o }} }}");
+            let response = app.clone().oneshot(query(&text)?).await?;
+            assert_eq!(
+                response.status(),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{service}, {} bytes",
+                json.len()
+            );
+        }
+    }
+    Ok(())
+}

@@ -29,8 +29,8 @@ use manifest::{GraphFile, Kind, Suite, Test};
 use nrese_engine::{Engine, EngineConfig, QuadPattern};
 use nrese_rdf::{BlankNode, Dataset, GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Variable};
 use nrese_sparql::{
-    CancellationToken, QueryOptions, QueryResults, ServiceClient, ServiceResults, Services,
-    UpdateOptions, apply_update, evaluate_query,
+    QueryEvaluationError, QueryOptions, QueryResults, ServiceCall, ServiceClient, ServiceResults,
+    Services, UpdateOptions, apply_update, evaluate_query,
 };
 use nrese_sparql_results::{QueryResultsFormat, QueryResultsSerializer};
 use nrese_sparql_syntax::{Query, SparqlParser, Update};
@@ -206,13 +206,17 @@ impl ServiceClient for Endpoints {
         &self,
         endpoint: &str,
         query: &str,
-        _cancellation: Option<&CancellationToken>,
-    ) -> Result<ServiceResults, Box<dyn std::error::Error + Send + Sync>> {
+        _call: ServiceCall<'_>,
+    ) -> Result<ServiceResults, QueryEvaluationError> {
+        let failed =
+            |error: Box<dyn std::error::Error + Send + Sync>| QueryEvaluationError::Service(error);
         let engine = self
             .0
             .get(endpoint)
-            .ok_or_else(|| format!("no endpoint {endpoint}"))?;
-        let parsed = SparqlParser::new().parse_query(query)?;
+            .ok_or_else(|| failed(format!("no endpoint {endpoint}").into()))?;
+        let parsed = SparqlParser::new()
+            .parse_query(query)
+            .map_err(|error| failed(error.into()))?;
         let snapshot = engine.snapshot();
         // The endpoints reach each other too (a SERVICE nested in a SERVICE).
         let options = QueryOptions {
@@ -221,7 +225,7 @@ impl ServiceClient for Endpoints {
         };
         let QueryResults::Solutions(solutions) = evaluate_query(&snapshot, &parsed, &options)?
         else {
-            return Err("not a SELECT".into());
+            return Err(failed("not a SELECT".into()));
         };
         let variables = solutions.variables().to_vec();
         let mut rows = Vec::new();
