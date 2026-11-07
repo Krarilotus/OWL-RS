@@ -1180,14 +1180,6 @@ impl Solutions {
     fn column(&self, variable: &Variable) -> Option<usize> {
         self.vars.iter().position(|v| v == variable)
     }
-
-    fn unit() -> Self {
-        Self {
-            vars: Vec::new(),
-            table: IdTable::from_rows(0, [&[][..]]),
-            ordered: false,
-        }
-    }
 }
 
 struct Context<'a> {
@@ -1521,6 +1513,16 @@ impl<'a> Context<'a> {
             .cancellation
             .as_ref()
             .map_or(Ok(()), CancellationToken::check)?)
+    }
+
+    /// One solution without bindings (an empty group's), charged as every table is: its row
+    /// counts ([`IdTable::memory_bytes`]), and whoever consumes it releases that.
+    fn unit(&self) -> NativeResult<Solutions> {
+        self.produced(Solutions {
+            vars: Vec::new(),
+            table: IdTable::from_rows(0, [&[][..]]),
+            ordered: false,
+        })
     }
 
     /// Charges a produced table against the query's memory budget.
@@ -1951,7 +1953,7 @@ impl<'a> Context<'a> {
                         None => rows,
                     });
                 }
-                Ok(united.unwrap_or_else(Solutions::unit))
+                united.map_or_else(|| self.unit(), Ok)
             }
             GraphPattern::Extend { inner, bindings } => {
                 let mut solutions = self.eval(inner)?;
@@ -2444,7 +2446,7 @@ impl<'a> Context<'a> {
         // GeoSPARQL relations between features (`spatial`): those with a constant side
         // start the joins, the others follow them.
         if let Some((first, later, rest)) = self.spatial_split(triples) {
-            let mut result = Solutions::unit();
+            let mut result = self.unit()?;
             for triple in &first {
                 result = self.spatial_join(result, triple)?;
             }
@@ -2463,7 +2465,7 @@ impl<'a> Context<'a> {
         }
         // Full-text searches start the joins (`search`).
         if let Some((searches, rest)) = search::split(triples) {
-            let mut result = Solutions::unit();
+            let mut result = self.unit()?;
             for search in &searches {
                 let start = Instant::now();
                 let found = self.search(search)?;
@@ -2500,7 +2502,7 @@ impl<'a> Context<'a> {
             }
         }
         if scans.is_empty() {
-            return Ok(Solutions::unit());
+            return self.unit();
         }
         // A string test on a large pattern's object: the terms that pass, from the
         // dictionary first (`strings`), as a hint.
@@ -4714,7 +4716,7 @@ impl<'a> Context<'a> {
             };
             let mut table = IdTable::new(1);
             table.push_row(&[self.id(&integer(count))]);
-            return Ok(Solutions {
+            return self.produced(Solutions {
                 vars: vec![target.clone()],
                 table,
                 ordered: false,
@@ -4730,7 +4732,7 @@ impl<'a> Context<'a> {
         {
             let mut table = IdTable::new(1);
             table.push_row(&[self.id(&integer(count))]);
-            return Ok(Solutions {
+            return self.produced(Solutions {
                 vars: vec![target.clone()],
                 table,
                 ordered: false,
@@ -4759,7 +4761,7 @@ impl<'a> Context<'a> {
             }
             let mut table = IdTable::new(1);
             table.push_row(&[self.id(&integer(count))]);
-            return Ok(Solutions {
+            return self.produced(Solutions {
                 vars: vec![target.clone()],
                 table,
                 ordered: false,
@@ -5553,7 +5555,7 @@ impl<'b> Probe<'_, 'b> {
             }
             if out.len() + found > room {
                 reserve_rows(&mut out, &mut held, found, usize::MAX).map_err(ProbeStop::Memory)?;
-                room = out.memory_bytes() / (8 * self.width).max(1);
+                room = out.memory_bytes() / out.row_bytes();
             }
             for m in 0..found {
                 for (c, slot) in row.iter_mut().enumerate().take(width) {
@@ -5723,9 +5725,10 @@ fn reserve_rows<B: std::ops::Deref<Target = Budget>>(
     rows: usize,
     most: usize,
 ) -> Result<(), BudgetExceeded> {
-    let row_bytes = 8 * table.width();
+    // A table without columns counts its rows too ([`IdTable::row_bytes`]).
+    let row_bytes = table.row_bytes();
     let needed = table.len().saturating_add(rows);
-    if row_bytes == 0 || needed.saturating_mul(row_bytes) <= table.memory_bytes() {
+    if needed.saturating_mul(row_bytes) <= table.memory_bytes() {
         return Ok(());
     }
     let doubled = (table.memory_bytes() / row_bytes * 2).min(most).max(needed);

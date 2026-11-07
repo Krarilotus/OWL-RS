@@ -38,7 +38,7 @@ impl Context<'_> {
         // The endpoints are the values the joined solutions have for the variable.
         let unbound = || -> NativeResult<Solutions> {
             if silent {
-                Ok(Solutions::unit())
+                self.unit()
             } else {
                 Err(QueryEvaluationError::Service(
                     format!("SERVICE {variable}: the variable has no value").into(),
@@ -121,7 +121,7 @@ impl Context<'_> {
             Err(NativeError::Evaluation(error))
                 if silent && !matches!(error, QueryEvaluationError::Cancelled) =>
             {
-                Ok(Solutions::unit())
+                self.unit()
             }
             other => other,
         }
@@ -188,7 +188,7 @@ impl Context<'_> {
                 None => solutions,
             });
         }
-        Ok(all.unwrap_or_else(Solutions::unit))
+        all.map_or_else(|| self.unit(), Ok)
     }
 }
 
