@@ -70,6 +70,11 @@ pub struct Rewriting {
     pub branches: Vec<Branch>,
     pub vars: u32,
     pub witnesses: usize,
+    /// Terms (classes, or a folded witness's first predicate) whose atom holds of every
+    /// individual (`⊤ ⊑ …`) on an answer variable nothing else binds: their answers are
+    /// every individual, which a query can't list, so those beyond the closure's may be
+    /// missing.
+    pub unlisted: Vec<Term>,
 }
 
 impl Rewriting {
@@ -94,7 +99,7 @@ impl Branch {
         self.parts
             .iter()
             .map(|p| match p {
-                Part::Atom(_) => 1,
+                Part::Atom(_) | Part::Top(_) => 1,
                 Part::Any(alternatives) => alternatives.len(),
             })
             .sum()
@@ -106,6 +111,9 @@ impl Branch {
 pub enum Part {
     Atom(Atom),
     Any(Vec<Atom>),
+    /// The term is an individual (not a literal): a constant, or a variable another part
+    /// of the branch binds. What an atom that holds of every individual (`⊤ ⊑ …`) leaves.
+    Top(QTerm),
 }
 
 /// What the data may be asked about a tree witness before it is folded: whether every
@@ -277,6 +285,7 @@ fn rewrite_within(
             }],
             vars: cq.vars,
             witnesses: 0,
+            unlisted: Vec::new(),
         });
     }
     let Some(sets) = independent_sets(&witnesses, limits.branches, work) else {
@@ -286,6 +295,7 @@ fn rewrite_within(
         cq,
         alternatives: &alternatives,
         next: cq.vars,
+        unlisted: Vec::new(),
     };
     let mut branches = Vec::new();
     let mut size = 0;
@@ -304,10 +314,14 @@ fn rewrite_within(
             }
         }
     }
+    let mut unlisted = builder.unlisted;
+    unlisted.sort_unstable();
+    unlisted.dedup();
     Outcome::Rewritten(Rewriting {
         branches,
         vars: builder.next,
         witnesses: witnesses.len(),
+        unlisted,
     })
 }
 
@@ -379,6 +393,16 @@ struct Build<'a> {
     cq: &'a Cq,
     alternatives: &'a HashMap<Term, Option<Vec<Basic>>>,
     next: u32,
+    /// [`Rewriting::unlisted`].
+    unlisted: Vec<Term>,
+}
+
+/// An atom that holds of every individual, before the branch says what binds its term:
+/// the term, the atom as written (for a class atom), and the term it is reported under.
+struct Everyone {
+    t: QTerm,
+    written: Option<Atom>,
+    term: Term,
 }
 
 impl Build<'_> {
@@ -437,6 +461,7 @@ impl Build<'_> {
             .flat_map(|(w, _)| w.atoms.iter().copied())
             .collect();
         let mut parts: Vec<Part> = Vec::new();
+        let mut everyone: Vec<Everyone> = Vec::new();
         for (i, atom) in cq.atoms.iter().enumerate() {
             if covered.contains(&i) {
                 continue;
@@ -444,6 +469,14 @@ impl Build<'_> {
             let atom = atom.map(&map);
             let part = match &atom {
                 Atom::Class(t, class) => match &self.alternatives[class] {
+                    Some(alternatives) if alternatives[..] == [Basic::Thing] => {
+                        everyone.push(Everyone {
+                            t: *t,
+                            written: Some(atom.clone()),
+                            term: *class,
+                        });
+                        continue;
+                    }
                     Some(alternatives) => {
                         let fresh = self.fresh();
                         Part::Any(alternatives.iter().map(|&b| stated(b, *t, fresh)).collect())
@@ -464,10 +497,53 @@ impl Build<'_> {
             if fold.is_empty() {
                 return None;
             }
+            if fold[..] == [Basic::Thing] {
+                let term = witness.atoms.first().and_then(|&i| match &cq.atoms[i] {
+                    Atom::Class(_, c) => Some(*c),
+                    Atom::Role(_, p, _) => Some(*p),
+                    Atom::Other(..) => None,
+                });
+                everyone.push(Everyone {
+                    t: root,
+                    written: None,
+                    term: term.unwrap_or_default(),
+                });
+                continue;
+            }
             let fresh = self.fresh();
             parts.push(Part::Any(
                 fold.iter().map(|&b| stated(b, root, fresh)).collect(),
             ));
+        }
+        // An atom that holds of every individual needs only its term to be one: a
+        // constant, or a variable another part binds. An existential variable nothing else
+        // has is some individual, and the domain is never empty. An answer variable nothing
+        // else binds would be every individual: kept as written, and said.
+        let bound = |t: QTerm, parts: &[Part]| {
+            parts.iter().any(|p| match p {
+                Part::Atom(a) => a.terms().contains(&t),
+                Part::Any(alternatives) => alternatives.iter().all(|a| a.terms().contains(&t)),
+                Part::Top(_) => false,
+            })
+        };
+        let mut tops = Vec::new();
+        for e in everyone {
+            match e.t {
+                QTerm::Const(_) => tops.push(Part::Top(e.t)),
+                t if bound(t, &parts) => tops.push(Part::Top(t)),
+                // Variables from `cq.vars` on are the branch's own: existential.
+                QTerm::Var(v) if cq.existential.get(v as usize).is_none_or(|&e| e) => {}
+                QTerm::Var(_) => {
+                    self.unlisted.push(e.term);
+                    // A witness's root: the branch can't bind it, so it goes.
+                    tops.push(Part::Atom(e.written?));
+                }
+            }
+        }
+        for top in tops {
+            if !parts.contains(&top) {
+                parts.push(top);
+            }
         }
         let mut merged: Vec<(u32, QTerm)> = stands_for
             .into_iter()

@@ -134,6 +134,15 @@ alternative (or the atom itself) follows from it by what the ruleset materialise
 (subclasses, domains, ranges, sub- and inverse properties, `∃P.⊤ ⊑ A`; intersections on
 the right only under `owl2-rl`, whose list rules apply them).
 
+`owl:Thing` on the left (`⊤ ⊑ A`, `⊤ ⊑ ∃R`, and `≥ 0 R.C`, read as `⊤`) makes every
+individual an instance, and the closure applies it to none (it states no individual to be
+a Thing). An atom `A(t)` with `⊤` below `A`, or a witness folded to `⊤`, then needs only
+`t` to be an individual: true for a constant that is no literal, `FILTER(!isLITERAL(?t))`
+for a variable another atom binds, and nothing for an existential variable nothing else
+has (the domain is never empty: `⊤ ⊑ A` answers `ASK { ?x a :A }` true). An answer
+variable nothing else binds would range over every individual, which a query can't list:
+the atom runs as written and the answer says `sound-only`.
+
 ## 3. Semantics: sets and bags
 
 Certain answers are sets. Inside `DISTINCT`, `REDUCED` and `ASK` the rewritten pattern is
