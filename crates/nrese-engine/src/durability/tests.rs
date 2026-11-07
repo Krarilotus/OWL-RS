@@ -502,9 +502,16 @@ fn the_store_clock_never_goes_back_over_an_unknown_history() {
 /// replica is sent ([`Engine::apply_log`]).
 fn primary_log(at: u64) -> Vec<u8> {
     let dir = tempfile::tempdir().unwrap();
-    let engine = Engine::open(dir.path(), config()).unwrap();
+    log_after(dir.path(), at)
+}
+
+/// The log of one commit, `quad(1)`, made on the store in `dir`, its record's time replaced
+/// by `at`.
+fn log_after(dir: &std::path::Path, at: u64) -> Vec<u8> {
+    let engine = Engine::open(dir, config()).unwrap();
+    let after = engine.stats().revision;
     commit(&engine, 1).unwrap();
-    let batch = engine.log_since(0, usize::MAX).unwrap();
+    let batch = engine.log_since(after, usize::MAX).unwrap();
     let (mut frames, mut pos) = (Vec::new(), 0);
     while let super::codec::Frame::Record(record, used) =
         super::codec::decode_frame(&batch.frames[pos..])
@@ -610,10 +617,14 @@ fn as_format_11(dir: &std::path::Path) {
 /// - a log an earlier binary wrote under a clock that stepped back (commits logged at 2000,
 ///   then 1000), replayed and checkpointed: the checkpoint's commits include one at 2000;
 /// - a format 11 checkpoint (no time) of a commit made at 2000, then a commit at 1000 and a
-///   checkpoint: what it holds from before is still of unknown time.
+///   checkpoint: what it holds from before is still of unknown time;
+/// - a bulk replacement at 3000 after that, restored at 3500: it holds nothing from before,
+///   but a commit of unknown time may have been made after any time this store would stamp
+///   (review r2, R1-F2: a legacy log loses its times), so no later time is certified. This
+///   row expected the replacement's time known until that review.
 ///
-/// And a guard: a bulk replacement after that unknown history holds nothing from it, so its
-/// checkpoint's time is known again and a restore after it opens.
+/// And a guard: a bulk replacement after a history of known time keeps its time, and a
+/// restore after it opens.
 #[test]
 fn a_version_time_bounds_every_commit_in_it() {
     let mut failures = Vec::new();
@@ -681,11 +692,130 @@ fn a_version_time_bounds_every_commit_in_it() {
         load.finish().unwrap();
     }
     fault::CLOCK.set(None);
+    check("a replacement after it", restored(dir.path(), 3500), None);
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        fault::CLOCK.set(Some(2000));
+        commit(&engine, 0).unwrap();
+        fault::CLOCK.set(Some(3000));
+        let load = engine.bulk_load(BulkMode::Replace);
+        load.add(&[quad(7)]);
+        load.finish().unwrap();
+    }
+    fault::CLOCK.set(None);
     check(
-        "a replacement after it (guard)",
+        "a replacement after a known history (guard)",
         restored(dir.path(), 3500),
         Some([quad(7)].into_iter().collect()),
     );
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A legacy store (integer-derived literals in its dictionary): the format 11 checkpoint an
+/// earlier binary wrote of one commit, flagged so, its log released. New segments are then
+/// version 4, which keep no commit times (`format_4_checkpoints_are_read` in `tests/it`).
+fn legacy() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        commit(&engine, 0).unwrap();
+        engine.checkpoint().unwrap();
+    }
+    as_format_11(dir.path());
+    let path = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "nck"))
+        .max()
+        .unwrap();
+    let mut file = std::fs::read(&path).unwrap();
+    // `magic | revision | flags`: flag bit 0, integers in the dictionary.
+    file[16] |= 1;
+    let body = file.len() - 4;
+    let crc = crc32fast::hash(&file[..body]);
+    file[body..].copy_from_slice(&crc.to_le_bytes());
+    std::fs::write(&path, file).unwrap();
+    std::fs::remove_dir_all(super::wal::wal_dir(dir.path())).unwrap();
+    dir
+}
+
+/// A time a legacy store's log couldn't keep is never certified by a later commit (review r2,
+/// R1-F2): its version 4 segments keep no times, so a reopen replays its commits untimed.
+/// Rows, judged apart, each refused by a restore at 1500 for its time (`Configuration`), the
+/// store opening plainly with the replacement:
+/// - a bulk replacement at 500, a transaction at 2000, a reopen, a replacement at 1000;
+/// - the replica route: a primary's commit made at 2000 applied, a reopen, a replacement at
+///   1000.
+///
+/// Before the fix the reopened clock was the checkpoint's (500, or 0), the last replacement
+/// was stamped 1000 and certified, and the restore at 1500 served it.
+#[test]
+fn a_time_a_legacy_log_lost_is_never_certified() {
+    let replace = |engine: &Engine, clock: u64, n: u64| {
+        fault::CLOCK.set(Some(clock));
+        let load = engine.bulk_load(BulkMode::Replace);
+        load.add(&[quad(n)]);
+        load.finish().unwrap();
+        fault::CLOCK.set(None);
+    };
+    let mut failures = Vec::new();
+    let mut check = |row: &str, dir: &std::path::Path, replacement: u64| {
+        let mut wrong = Vec::new();
+        let segments = super::wal::list_segments(&super::wal::wal_dir(dir)).unwrap();
+        let newest = &segments.last().unwrap().1;
+        if std::fs::read(newest).unwrap()[..8] != *b"NRESEWL4" {
+            wrong.push("its log isn't of version 4".to_string());
+        }
+        let restore = EngineConfig {
+            durability: DurabilityConfig {
+                recover_until_micros: Some(1500),
+                ..config().durability
+            },
+            ..config()
+        };
+        match Engine::open(copied(dir).path(), restore) {
+            Err(EngineError::Configuration(_)) => {}
+            Err(error) => wrong.push(format!("restore at 1500 failed otherwise: {error}")),
+            Ok(engine) => wrong.push(format!("restored at 1500: {:?}", contents(&engine))),
+        }
+        let held = contents(&Engine::open(dir, config()).unwrap());
+        if held != [quad(replacement)].into_iter().collect() {
+            wrong.push(format!("opened holding {held:?}"));
+        }
+        eprintln!(
+            "row {row}: {}",
+            if wrong.is_empty() { "ok" } else { "FAILED" }
+        );
+        failures.extend(wrong.into_iter().map(|w| format!("{row}: {w}")));
+    };
+
+    let dir = legacy();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        replace(&engine, 500, 10);
+        fault::CLOCK.set(Some(2000));
+        commit(&engine, 11).unwrap();
+        fault::CLOCK.set(None);
+    }
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        replace(&engine, 1000, 12);
+    }
+    check("a transaction at 2000", dir.path(), 12);
+
+    let dir = legacy();
+    let frames = log_after(copied(dir.path()).path(), 2000);
+    {
+        let replica = Engine::open(dir.path(), config()).unwrap();
+        replica.apply_log(&frames).unwrap();
+    }
+    {
+        let replica = Engine::open(dir.path(), config()).unwrap();
+        replace(&replica, 1000, 12);
+    }
+    check("a replicated commit at 2000", dir.path(), 12);
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
