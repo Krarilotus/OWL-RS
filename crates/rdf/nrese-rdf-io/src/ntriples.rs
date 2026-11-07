@@ -675,7 +675,7 @@ const SPECIAL: [bool; 256] = special();
 
 /// `text` quoted and escaped as N-Triples writes a string: what needs no escape is
 /// copied in one piece.
-fn quoted(out: &mut Vec<u8>, text: &str) {
+pub(crate) fn quoted(out: &mut Vec<u8>, text: &str) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let bytes = text.as_bytes();
     out.push(b'"');
