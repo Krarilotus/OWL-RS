@@ -138,6 +138,15 @@ const DECLARED: &str = r#"
 ex:A a owl:Class .
 "#;
 
+/// A restriction with no property: the reader leaves the axiom out (a fatal diagnostic),
+/// so the rest's model says nothing of the whole (sol-loop r1 S1).
+const MALFORMED: &str = r#"
+@prefix ex: <http://example.com/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+ex:A a owl:Class ; rdfs:subClassOf [ a owl:Restriction ] .
+"#;
+
 const ROUTES: [&str; 4] = [
     "/dataset/classification",
     "/dataset/realisation",
@@ -177,6 +186,13 @@ async fn every_form_states_the_verdict_or_its_absence() -> Result<(), Box<dyn st
             serde_json::json!(true),
             "consistent",
             "complete",
+        ),
+        (
+            "malformed",
+            MALFORMED,
+            serde_json::Value::Null,
+            "unknown",
+            "sound-only",
         ),
     ];
     let mut wrong = Vec::new();
