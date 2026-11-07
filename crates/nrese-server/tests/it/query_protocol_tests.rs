@@ -345,8 +345,8 @@ async fn a_repository_answers_within_its_own_query_timeout()
         .await?;
     assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
     // A query held in a SERVICE call: the repository's second stops it, not the server's
-    // hour. The server installs its SERVICE client on the default repository only
-    // (main.rs), so the test gives this one the endpoint's.
+    // hour. The default repository has no SERVICE client here, so the test gives this one
+    // the endpoint's.
     let endpoint = HeldEndpoint::bind().await?;
     state
         .repositories()

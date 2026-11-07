@@ -665,9 +665,16 @@ async fn graphs_are_listed_with_their_sizes() {
 }
 
 /// A query in flight is listed with its text; cancelling it stops it, and its client gets
-/// an error instead of results.
+/// the cancellation's answer (408) instead of results. SILENT doesn't change that: a call
+/// cancelled with its query is the query's cancellation, not an endpoint's failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn running_queries_are_listed_and_cancelled() {
+    for service in ["SERVICE", "SERVICE SILENT"] {
+        cancel_held(service).await;
+    }
+}
+
+async fn cancel_held(service: &str) {
     // A query held in a SERVICE call that never answers, under a deadline (an hour) this
     // test never reaches: only the cancellation can stop it.
     let endpoint = HeldEndpoint::bind().await.unwrap();
@@ -682,7 +689,7 @@ async fn running_queries_are_listed_and_cancelled() {
     };
     let app = test_app_with_store(store, policy, ReasonerConfig::default()).unwrap();
     let held = format!(
-        "SELECT * WHERE {{ SERVICE <{}> {{ ?s ?p ?o }} }}",
+        "SELECT * WHERE {{ {service} <{}> {{ ?s ?p ?o }} }}",
         endpoint.url()
     );
     let mut running = {
@@ -728,7 +735,7 @@ async fn running_queries_are_listed_and_cancelled() {
         .await
         .expect("the cancelled query stops")
         .unwrap();
-    assert!(!status.is_success(), "{status}");
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "{service}");
     call.closed().await.unwrap();
     let (_, text) = send(
         &app,

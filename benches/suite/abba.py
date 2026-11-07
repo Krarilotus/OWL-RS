@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
 """A targeted A-B-B-A: one change (B) against its base (A), on the release gate's machinery, with
-an interleaved A-A' arm. Agents declare a family file; this checks it, writes its fleet jobs and
-gives the verdict. Nothing here re-implements timing or statistics: the blocks are
-release-gate.sh's (a palindrome A A' B B A' A per case, every side a fresh copy of its build,
-seeded orientation, the quiet watcher, at most one repeat of a disturbed block), the tests
-release_gate.py's (gate(), Holm, rounds by decide(), the floor).
+an interleaved A-A' arm. A family is built from the case registry by `run`, or declared in a file;
+this checks it, writes its fleet job and gives the verdict. Nothing here re-implements timing or
+statistics: the blocks are release-gate.sh's (a palindrome A A' B B A' A per case, every side a
+fresh copy of its build, seeded orientation, the quiet watcher, at most one repeat of a disturbed
+block), the tests release_gate.py's (gate(), Holm, rounds by decide(), the floor).
 
+    abba.py run --a REV --b REV (--cases A,B | --areas X,Y) [--blocks N] [--round K] [--plan]
+                                             one command: the family from benches/cases, its plan
+                                             (estimate, the hosts that can take it, what waits there),
+                                             then one fleet set (fleet wait set:ID); nothing to commit
     abba.py check FAMILY                     the family, valid or not (exit 2); in a job, its manifest
     abba.py jobs FAMILY [--host H] [--round K] [--harness REV] [--out DIR]
-                                             the fleet jobs: its builds, then its blocks and report
+                                             the fleet set of a family file: one timed job that
+                                             builds on the host it lands on, then times there
     abba.py report FAMILY RESULTS...          the verdict from each round's results (in round order)
 
-A family (benches/abba/NAME.toml):
+FAMILY is a file, or env:ABBA_FAMILY (the family's text in that variable: how a job carries a
+family of registry cases). A family of registry cases runs from any file, committed or not; one
+with cases of its own lives in the repository (benches/abba/), since the harness's fast suite
+reads them there (NRESE_FAMILY).
+
+A family file (benches/abba/NAME.toml, or what `run` writes):
 
     name = "lcp"                  # the jobs' names: abba-lcp-...
-    host = "phuoc-yu"             # one exclusive timing host for every block (--host overrides)
+    host = "phuoc-yu"             # optional: pin every block to this host (--host overrides); without
+                                  # it the fleet picks a timing host by capability
     blocks = 3                    # a round's blocks: at least 3 (one whole square), in whole squares
     [sides]
     a = "REV"                     # the base: a commit id, resolved to its full id (a short one too)
@@ -61,6 +72,9 @@ MIN_BLOCKS = 3  # one whole Latin square of A, A' and B; a family may ask for mo
 NO_LOSS, LOSS_SHOWN, INVALID, NO_VERDICT, CONFIRMED = 0, 1, 2, 3, 4
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 REV = re.compile(r"^[0-9a-f]{7,40}$")
+# A family carried in a job's environment (`run`, and `jobs` of a family of registry cases): its
+# text in ABBA_FAMILY, read by the job's check and report as this name.
+ENV_FAMILY = "env:ABBA_FAMILY"
 
 
 class Invalid(Exception):
@@ -73,7 +87,24 @@ def family_path(path: str | Path, repo: Path) -> str:
     try:
         return resolved.relative_to(Path(repo).resolve()).as_posix()
     except ValueError:
-        raise Invalid([f"{path}: a family lives in the repository (benches/abba/), not outside it"])
+        raise Invalid([f"{path}: a family with cases of its own lives in the repository (benches/abba/), "
+                       "where the harness's fast suite reads them; a family of registry cases runs from anywhere"])
+
+
+def read_family(path: str | Path, repo: Path) -> tuple[str, bytes, bool]:
+    """The family's name as the jobs give it, its bytes, and whether it lies in the checkout `repo`:
+    env:ABBA_FAMILY (its text in that variable), a file of the repository (its relative path), or
+    a file elsewhere (its own path)."""
+    if str(path) == ENV_FAMILY:
+        text = os.environ.get("ABBA_FAMILY")
+        if not text:
+            raise Invalid([f"{ENV_FAMILY}: ABBA_FAMILY is empty or not set"])
+        return ENV_FAMILY, text.encode("utf-8"), False
+    resolved = Path(path).resolve()
+    try:
+        return resolved.relative_to(Path(repo).resolve()).as_posix(), resolved.read_bytes(), True
+    except ValueError:
+        return resolved.as_posix(), resolved.read_bytes(), False
 
 
 def full_ids(sides: dict[str, str], repo: Path) -> tuple[dict[str, str], list[str]]:
@@ -95,14 +126,19 @@ def full_ids(sides: dict[str, str], repo: Path) -> tuple[dict[str, str], list[st
     return out, problems
 
 
-def load_family(path: str | Path, repo: Path) -> dict:
-    """The family, resolved and validated: a file of the checkout `repo` (main's is ROOT), its
-    sides as full ids of that checkout (full_ids()), its cases (its own, or the catalogue's: the
-    one beside this module, benches/cases of the tree under test, whatever `repo` is; each with a
-    content check), its hypotheses (b vs a, per case and declared dimension). Raises Invalid."""
-    rel = family_path(path, repo)
-    raw = (Path(repo).resolve() / rel).read_bytes()
+def load_family(path: str | Path, repo: Path, catalog: list[dict] | None = None, harness: str | None = None) -> dict:
+    """The family, resolved and validated: a file (read_family(); one with cases of its own must
+    be a file of the checkout `repo`, main's is ROOT), its sides as full ids of that checkout
+    (full_ids()), its cases (its own, or the catalogue's: the one beside this module, benches/cases
+    of the tree under test, whatever `repo` is; each with a content check), its hypotheses (b vs a,
+    per case and declared dimension; `catalog`: the registry to take them from, by default this
+    tree's). Raises Invalid."""
+    rel, raw, inside = read_family(path, repo)
     data = tomllib.loads(raw.decode("utf-8"))
+    own = [e for e in data.get("case", []) if "catalog" not in e]
+    if own and not inside:
+        raise Invalid([f"{path}: a family with cases of its own lives in the repository (benches/abba/), where the "
+                       "harness's fast suite reads them; a family of registry cases runs from anywhere"])
     problems = []
     name, host, blocks = data.get("name", ""), data.get("host", ""), data.get("blocks", MIN_BLOCKS)
     sides = data.get("sides", {})
@@ -122,7 +158,30 @@ def load_family(path: str | Path, repo: Path) -> dict:
     entries = data.get("case", [])
     if not entries:
         problems.append("no [[case]]")
-    catalog = cases_registry.load(family=Path(repo).resolve() / rel)
+    if catalog is None:
+        # The registry the job runs, the declared harness's, wherever this runs from (review r1
+        # R1-F4: a check in B's checkout read B's registry for an older harness); this tree's without one.
+        catalog = cases_registry.load_at(repo, harness) if harness else cases_registry.load()
+    if own and harness:
+        # The harness's fast suite times the family's own cases from its own copy of this file
+        # (NRESE_FAMILY, read in the harness's tree): the file must be there as it is here, or the
+        # plan and the manifest describe cases other than those timed (sol-loop of review r1, S1).
+        # The same bytes, CRLF read as LF on both sides: line endings, stored, converted or not, are no
+        # change to what the suite times (sol-loop r2, T1; fix check r1, V1). Every other byte is: not
+        # compared parsed, as values equal in Python reach the suite as different text (sol-loop r3,
+        # U1: 268435456.0 is no buffer limit).
+        at = subprocess.run(["git", "-C", str(repo), "show", f"{harness}:{rel}"], capture_output=True)
+        if at.returncode != 0:
+            raise Invalid([f"{rel} isn't at the harness {harness[:12]}, whose fast suite would time its own cases"])
+        if at.stdout.replace(b"\r\n", b"\n") != raw.replace(b"\r\n", b"\n"):
+            raise Invalid([f"{rel} differs at the harness {harness[:12]}: its own cases would be timed as the "
+                           "harness has them, not as declared here"])
+    if own:
+        catalog = [*catalog, *({**c, "group": "family"} for c in cases_registry.family_cases(Path(repo).resolve() / rel))]
+        names = [c["name"] for c in catalog]
+        if clash := sorted({n for n in names if names.count(n) > 1}):
+            problems_own = [f"the family's own case {n} is also a registry case" for n in clash]
+            raise Invalid(problems_own)
     by_name = {c["name"]: c for c in catalog}
     cases, hypotheses = [], []
     for i, entry in enumerate(entries):
@@ -150,7 +209,69 @@ def load_family(path: str | Path, repo: Path) -> dict:
     if problems:
         raise Invalid(problems)
     return {"path": rel, "sha256": hashlib.sha256(raw).hexdigest(), "name": name, "host": host, "blocks": blocks,
-            "sides": dict(sides), "cases": cases, "hypotheses": hypotheses, "catalog": catalog}
+            "sides": dict(sides), "cases": cases, "hypotheses": hypotheses, "catalog": catalog,
+            "text": raw.decode("utf-8"), "own": bool(own)}
+
+
+# --- a family from the registry (`run`) ---------------------------------------------------------
+
+def select(catalog: list[dict], cases: list[str], areas: list[str]) -> list[str]:
+    """The registry's cases a run names: `cases` by name, then every case of `areas` that can be
+    timed (a content check, no declared outcome), in registry order, each once. Raises Invalid on
+    an unknown name or area, a named case that can't be timed, or an empty selection."""
+    by_name = {c["name"]: c for c in catalog}
+    problems = [f"no case {n!r} in benches/cases/" for n in cases if n not in by_name]
+    known = {c["area"] for c in catalog}
+    problems += [f"no area {a!r} (areas: {', '.join(sorted(known))})" for a in areas if a not in known]
+    timeable = lambda c: bool(c.get("check")) and c.get("outcome", "ok") == "ok"  # noqa: E731
+    for n in cases:
+        if n in by_name and not timeable(by_name[n]):
+            why = "no content check" if not by_name[n].get("check") else f"a declared outcome ({by_name[n]['outcome']})"
+            problems.append(f"{n}: {why}: not timed")
+    for a in areas:
+        if a in known and not any(timeable(c) for c in catalog if c["area"] == a):
+            problems.append(f"area {a}: no case with a content check and no declared outcome")
+    chosen = list(dict.fromkeys([n for n in cases if n in by_name]
+                                + [c["name"] for c in catalog if c["area"] in areas and timeable(c)]))
+    if not chosen and not problems:
+        problems.append("no case: name --cases or --areas")
+    if problems:
+        raise Invalid(problems)
+    return chosen
+
+
+def family_text(name: str, sides: dict[str, str], cases: list[str], blocks: int, min_samples: int = 1) -> str:
+    """A family of registry cases as a family file's text (LF only: its SHA-256 is the family's
+    identity, on every host)."""
+    lines = [f'# A-B-B-A of b against a over registry cases (benches/suite/abba.py run)',
+             f'name = "{name}"', f"blocks = {blocks}", "[sides]", f'a = "{sides["a"]}"', f'b = "{sides["b"]}"']
+    for case in cases:
+        lines += ["[[case]]", f'catalog = "{case}"'] + ([f"min_samples = {min_samples}"] if min_samples > 1 else [])
+    return "\n".join(lines) + "\n"
+
+
+def run_name(name: str | None, sides: dict[str, str], harness: str, cases: list[str], blocks: int,
+             min_samples: int) -> str:
+    """A run's family name, and so its set's id: the request's own (Sol r1 S2: another A, case list,
+    block count or sample floor gave the same id, and the fleet refused the new set as the old one)."""
+    request = f"{sides['a']} {sides['b']} {harness} {','.join(cases)} {blocks} {min_samples}"
+    return f"{name or 'run'}-{hashlib.sha256(request.encode()).hexdigest()[:8]}"
+
+
+def suggested_blocks(cases: list[str], measure: dict) -> int:
+    """A first round's blocks from the cases' calibration (measure.toml: a round's `blocks`, or in
+    the older form a side's `passes`, two to a block), at least one square: effort follows spread
+    (benches/abba/README.md)."""
+    def need(entry: dict) -> int:
+        return int(entry["blocks"]) if "blocks" in entry else (int(entry.get("passes", 0)) + 1) // 2
+    return rg.whole_squares(max([need(measure.get(c, {})) for c in cases] + [MIN_BLOCKS]), len(SIDES))
+
+
+def estimate(family: dict, measure: dict, builds: int) -> dict:
+    """The job's minutes (release_gate.plan_minutes(): the gate's model, the same for both tools):
+    its builds and data, shareable, then its blocks alone, every block all its cases on A, A' and B."""
+    est = rg.plan_minutes(builds, len(SIDES), [[c["name"] for c in family["cases"]]] * family["blocks"], measure)
+    return est | {"block_min": round(est["timed_min"] / family["blocks"], 1), "total_min": round(est["total_min"])}
 
 
 def manifest_of(family: dict, harness: str, round_: int, host: str, job: str = "") -> dict:
@@ -169,42 +290,82 @@ def git(repo: Path, *args: str) -> str:
 
 # --- jobs --------------------------------------------------------------------------------------
 
-def jobs(family: dict, harness: str, checkout: str, host: str, round_: int = 1) -> dict[str, dict]:
-    """The family's fleet jobs: its check and builds (A, B and the harness), then on one host,
-    alone, its check again (the manifest the report holds the results to), its blocks and its
-    report (the verdict in abba-verdict.json; the step itself fails only for an invalid family)."""
-    rg.linux_host(host)
+def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int = 1,
+         priority: int = 790, reason: str = "") -> dict[str, dict]:
+    """The family's fleet job, one: on the timing host the fleet picks by capability (TIMING_ROLES,
+    Linux, the cases' needs and caps; `host` pins it, with its reason), its check (the manifest the
+    report holds the results to, naming that host), the builds of A, B and the harness and the
+    data's preparation, all in its first step; then its blocks, its report (the verdict in
+    abba-verdict.json; the step fails only for an invalid family) and clean-up. Every step is
+    exclusive: the fleet keeps an exclusive job's host only before an exclusive step (planner
+    held_between_steps; Sol r1 S1) and only while the host's policy takes exclusive work, so an
+    untimed first step could build where timing is closed and the blocks then go elsewhere,
+    without its builds (2 Nov 2026: built on office-pc by day, outside its timing window). The job
+    starts only where it can time, and builds and blocks share that host."""
     a, b = family["sides"]["a"], family["sides"]["b"]
     prefix = f"abba-{family['name']}-{b[:8]}" + (f"-r{round_}" if round_ > 1 else "")
     gate_ = ["bash", "scripts/release-gate.sh"]
     abba = ["python3", "-B", "benches/suite/abba.py"]
-    env = {"GATE_NAME": f"abba-{family['name']}-{b[:8]}", "NRESE_FAMILY": family["path"],
+    cap = max(c["cap_gb"] for c in family["cases"])
+    # Its gate state is its family's own (the family's SHA-256: sides, cases, blocks), its rounds'
+    # deliberately shared; another request never meets it on a host (review r1 R1-F3).
+    env = {"GATE_NAME": f"abba-{family['name']}-{b[:8]}-{family['sha256'][:8]}",
            "GATE_CASES": ",".join(c["name"] for c in family["cases"]), "GATE_BASELINES": "a",
-           "GATE_MAX_GB": str(max(c["cap_gb"] for c in family["cases"])), "NRESE_QUIET_SLOT": "0",
-           "GATE_MIN_BLOCKS": str(family["blocks"]), "GATE_HOST": host, "GATE_ROUND": str(round_ - 1),
+           "GATE_MAX_GB": str(cap), "NRESE_QUIET_SLOT": "0",
+           "GATE_MIN_BLOCKS": str(family["blocks"]), "GATE_ROUND": str(round_ - 1),
            "GATE_PREFIX": prefix, "ABBA_HARNESS": harness, "ABBA_ROUND": str(round_)}
+    if family["own"]:
+        env["NRESE_FAMILY"] = family["path"]  # the harness's fast suite reads its own cases there
+        named = family["path"]
+    else:
+        env["ABBA_FAMILY"] = family["text"]  # the family itself: nothing to commit
+        named = ENV_FAMILY
+    if host:
+        env["GATE_HOST"] = host
     source = [{"name": "checkout", "source": {"git": checkout, "rev": rg.checkout_rev(checkout, b, harness)}}]
     revisions = list(dict.fromkeys([a, b, harness]))
-    seconds = 30 * len(family["cases"])  # a case's run, roughly: the estimate only orders the queue
-    return {
-        f"{prefix}-build": {
-            "id": f"{prefix}-build", "group": "abba", "kind": "owlrs.build", "env": env,
-            "est_min": 25 * len(revisions) + 10,
-            "steps": [[*abba, "check", family["path"]]] + [[*gate_, "build", r] for r in revisions]
-            + [[*gate_, "prepare", harness]],
-            "requires": {"hosts": [host], "cores": 16, "ram_gb": 12},
-            "inputs": source + rg.measurement_inputs(checkout, revisions)},
-        prefix: {
-            "id": prefix, "group": "abba", "kind": "owlrs.timed", "class": "exclusive", "after": [f"{prefix}-build"],
-            "env": env, "est_min": round(family["blocks"] * (6 * seconds / 60 + 1) + 5), "stall_after_min": 60,
-            "steps": [[*abba, "check", family["path"]]]
-            + [[*gate_, "block", str(k), harness, "1", "-", f"a={a}", f"a2={a}", f"b={b}"]
-               for k in range(1, family["blocks"] + 1)]
-            + [["bash", "-c", 'python3 -B benches/suite/abba.py report "$1" "$FLEET_OUT" --json "$FLEET_OUT/abba-verdict.json" '
-                '--out "$FLEET_OUT/abba-verdict.md"; code=$?; echo "$code" > "$FLEET_OUT/abba-exit"; [ "$code" != 2 ]',
-                "abba", family["path"]], [*gate_, "clean"]],
-            "requires": {"hosts": [host], "cores": 16, "ram_gb": max(12, max(c["cap_gb"] for c in family["cases"]))},
-            "inputs": source}}
+    prepare = [["bash", "-c", 'set -e; family=$1; shift; python3 -B benches/suite/abba.py check "$family"; '
+                'for rev in "$@"; do bash scripts/release-gate.sh build "$rev"; done; '
+                'bash scripts/release-gate.sh prepare "$ABBA_HARNESS"', "prepare", named, *revisions]]
+    blocks = [[*gate_, "block", str(k), harness, "1", "-", f"a={a}", f"a2={a}", f"b={b}"]
+              for k in range(1, family["blocks"] + 1)]
+    after = [["bash", "-c", 'python3 -B benches/suite/abba.py report "$1" "$FLEET_OUT" --json "$FLEET_OUT/abba-verdict.json" '
+              '--out "$FLEET_OUT/abba-verdict.md"; code=$?; echo "$code" > "$FLEET_OUT/abba-exit"; [ "$code" != 2 ]',
+              "abba", named], [*gate_, "clean"]]
+    steps = prepare + blocks + after
+    by_name = {c["name"]: c for c in family["catalog"]}
+    has = rg.data_needs([by_name[c["name"]] for c in family["cases"] if c["name"] in by_name])
+    fetched = rg.bench_inputs([by_name[c["name"]] for c in family["cases"] if c["name"] in by_name])
+    if fetched:  # the commit data_state() takes WatDiv's pinned query sets from
+        env["BENCH_INPUTS_REV"] = fetched[0]["source"]["rev"]
+    requires = {"roles": rg.TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": max(12, cap)} | ({"has": has} if has else {})
+    job = {"id": prefix, "group": "abba", "kind": "owlrs.timed", "class": "exclusive",
+           "priority": priority, "priority_reason": reason or f"A-B-B-A: {b[:8]} against {a[:8]}, "
+           f"{len(family['cases'])} cases", "notify": False,
+           "env": env, "est_min": 0, "stall_after_min": 60, "steps": steps,
+           # The first step asks the job's whole memory too: placed on a host too small for the blocks,
+           # its hold would end there and the blocks run elsewhere, without its builds (Sol r2 S1).
+           "step_deadline_min": rg.BUILD_MIN * len(revisions) + 120,
+           "requires": requires, "inputs": source + rg.side_inputs(checkout, source[0]["source"]["rev"], revisions) + fetched}
+    if host:
+        requires["hosts"] = [host]
+        job["pin_reason"] = "the family names its timing host (its floor, or a run to reproduce there)"
+    measure = measure_at(checkout, harness)
+    job["est_min"] = estimate(family, measure, len(revisions))["total_min"]
+    return {prefix: job}
+
+
+def measure_at(checkout: str, rev: str) -> dict:
+    """The harness's calibration (benches/fast/measure.toml at `rev`), {} where it has none."""
+    shown = subprocess.run(["git", "-C", checkout, "show", f"{rev}:benches/fast/measure.toml"],
+                           capture_output=True, text=True, encoding="utf-8")
+    return tomllib.loads(shown.stdout).get("case", {}) if shown.returncode == 0 else {}
+
+
+def set_file(set_id: str, members: list[dict]) -> str:
+    """One fleet set of `members`: one wait, one cancel, one result; a member that fails stops
+    the rest."""
+    return rg.toml_set({"id": set_id, "fail": "stop-rest"}, members)
 
 
 # --- the verdict ---------------------------------------------------------------------------------
@@ -405,16 +566,135 @@ def report(family: dict, rounds: list[Path]) -> tuple[int, str, dict]:
     return code, "\n".join(lines), out
 
 
+def plan_text(family: dict, job: dict, harness: str, measure: dict, set_id: str) -> str:
+    """What a run will do and cost, before anything is queued (intent.bench-by-purpose: "I could
+    see estimated time value for those to run to see how much it would block")."""
+    est = estimate(family, measure, len(dict.fromkeys([*family["sides"].values(), harness])))
+    by_name = {c["name"]: c for c in family["catalog"]}
+    lines = [f"{set_id}: b {family['sides']['b'][:12]} against a {family['sides']['a'][:12]}, "
+             f"harness {harness[:12]}, round {job['env']['ABBA_ROUND']}",
+             f"  cases ({len(family['cases'])}): " + ", ".join(
+                 f"{c['name']} ({by_name.get(c['name'], {}).get('area', '?')}, cap {c['cap_gb']} GB, "
+                 + (f"{measure[c['name']]['seconds']} s a pass" if measure.get(c["name"], {}).get("seconds")
+                    else "uncalibrated") + ")" for c in family["cases"]),
+             f"  hypotheses: {len(family['hypotheses'])} (Holm over the family); blocks: {family['blocks']} "
+             f"(whole squares of A, A' and B), {est['block_min']} min each",
+             f"  estimate: one timing host held alone {est['total_min']} min ({est['total_min'] / 60:.2f} "
+             f"host-hours): builds and data up to {est['build_min']} min (a build of the same identity is "
+             f"reused), then {est['timed_min']} min of blocks"]
+    if est["guessed"]:
+        lines.append(f"  not calibrated (benches/fast/measure.toml): {', '.join(est['guessed'])}: a minute a pass assumed")
+    asks = job["requires"]
+    lines.append(f"  asks: {job['kind']}, roles {'+'.join(asks['roles'])}, {asks['os']}, {asks['cores']} cores, "
+                 f"{asks['ram_gb']} GB" + (f", has {'+'.join(asks['has'])}" if asks.get("has") else "")
+                 + (f", pinned to {asks['hosts'][0]} ({job['pin_reason']})" if asks.get("hosts") else "")
+                 + f"; priority {job['priority']}")
+    return "\n".join(lines)
+
+
+def run(args) -> int:
+    """`run`: the family from the registry, its plan, its set; submitted unless --plan."""
+    checkout = Path(args.checkout)
+    sides, problems = full_ids({"a": args.a, "b": args.b}, checkout)
+    harness = git(checkout, "rev-parse", args.harness or sides.get("b", args.b)) if not problems else ""
+    if problems:
+        print("\n".join(problems), file=sys.stderr)
+        return INVALID
+    catalog = cases_registry.load_at(checkout, harness)  # the registry the job will run
+    try:
+        chosen = select(catalog, [c for c in (args.cases or "").split(",") if c],
+                        [a for a in (args.areas or "").split(",") if a])
+    except Invalid as error:
+        print("\n".join(error.args[0]), file=sys.stderr)
+        return INVALID
+    measure = measure_at(checkout.as_posix(), harness)
+    blocks = args.blocks or suggested_blocks(chosen, measure)
+    name = run_name(args.name, sides, harness, chosen, blocks, args.min_samples)
+    text = family_text(name, sides, chosen, blocks, args.min_samples)
+    out = args.out or ROOT / "benches" / "suite" / "results" / "abba" / f"{name}-{sides['b'][:8]}"
+    out.mkdir(parents=True, exist_ok=True)
+    path = out / "family.toml"
+    path.write_bytes(text.encode("utf-8"))
+    try:
+        family = load_family(path, checkout, catalog)
+    except Invalid as error:
+        print("\n".join(f"invalid family: {p}" for p in error.args[0]), file=sys.stderr)
+        return INVALID
+    found = jobs(family, harness, checkout.as_posix(), args.host or "", args.round, args.priority, args.reason or "")
+    set_id = next(iter(found))
+    set_path = out / f"{set_id}.set.toml"
+    set_path.write_bytes(set_file(set_id, list(found.values())).encode("utf-8"))
+    print(plan_text(family, found[set_id], harness, measure, f"set:{set_id}"))
+    print(f"  family: {path} (sha256 {family['sha256'][:12]}); set file: {set_path}")
+    code, said = rg.fleet_call("check", str(set_path))
+    print("  fleet check" + (f" (exit {code})" if code else "") + ":\n    " + "\n    ".join(said.splitlines() or ["-"]))
+    if args.plan:
+        print("plan only: nothing queued")
+        return 0
+    if code != 0:
+        print("not submitted: fleet check didn't take it (above)", file=sys.stderr)
+        return 1
+    code, said = rg.fleet_call("submit", str(set_path))
+    print(said)
+    if code != 0:
+        return 1
+    print(f"wait: fleet wait set:{set_id}   verdict: fleet results set:{set_id}, then its member's "
+          f"abba-verdict.md; a combined report: abba.py report {path} R1 R2")
+    return 0
+
+
+def declared_harness(args) -> str | None:
+    """The harness whose registry a command resolves the family's cases at (review r1 R1-F4): in a
+    job's check, ABBA_HARNESS (a job without it is refused); `jobs`, --harness, else the family's b;
+    `report`, the one its rounds' manifests name (they must name one). None: this tree's (a local
+    check)."""
+    if args.command == "check":
+        harness = os.environ.get("ABBA_HARNESS")
+        if os.environ.get("FLEET_OUT") and not harness:
+            raise Invalid(["a job's check needs ABBA_HARNESS, the harness whose registry it times"])
+        return harness or None
+    if args.command == "jobs":
+        rel, raw, _ = read_family(args.family, ROOT)
+        b = tomllib.loads(raw.decode("utf-8")).get("sides", {}).get("b", "")
+        return git(Path(args.checkout), "rev-parse", args.harness or b)
+    named = set()
+    for results in args.results:
+        path = Path(results) / "abba-manifest.json"
+        if path.is_file():
+            named.add(json.loads(path.read_text(encoding="utf-8")).get("harness") or "")
+    if len(named) > 1:
+        raise Invalid([f"the rounds' manifests name different harnesses: {', '.join(sorted(named))}"])
+    return next(iter(named), None) or None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="command", required=True)
+    s = sub.add_parser("run", help="time b against a over registry cases: plan, then one fleet set")
+    s.add_argument("--a", required=True, help="the base, a commit")
+    s.add_argument("--b", required=True, help="the change, a commit (A = B: an A/A run)")
+    s.add_argument("--cases", help="registry cases, comma-separated")
+    s.add_argument("--areas", help="registry areas: every case of each that can be timed")
+    s.add_argument("--blocks", type=int, help="a round's blocks (default: from the cases' calibrated spread, at least 3)")
+    s.add_argument("--min-samples", type=int, default=1)
+    s.add_argument("--round", type=int, default=1)
+    s.add_argument("--name", help="the family's name (default: from its cases); a new name is a new set")
+    s.add_argument("--host", help="pin to this timing host (default: the fleet picks one by capability)")
+    s.add_argument("--harness", help="the revision whose harness runs it (default b)")
+    s.add_argument("--priority", type=int, default=790)
+    s.add_argument("--reason", help="the priority's reason (default: what is timed)")
+    s.add_argument("--checkout", default=ROOT.as_posix())
+    s.add_argument("--out", type=Path, help="where the family and set files go (default suite/results/abba/...)")
+    s.add_argument("--plan", action="store_true", help="the plan and fleet's check only: nothing queued")
     s = sub.add_parser("check")
     s.add_argument("family")
     s = sub.add_parser("jobs")
     s.add_argument("family")
-    s.add_argument("--host", help="the timing host (overrides the family's)")
+    s.add_argument("--host", help="pin to this timing host (overrides the family's)")
     s.add_argument("--round", type=int, default=1)
     s.add_argument("--harness", help="the revision whose harness runs it (default b)")
+    s.add_argument("--priority", type=int, default=790)
+    s.add_argument("--reason")
     s.add_argument("--checkout", default=ROOT.as_posix())
     s.add_argument("--out", type=Path, default=Path("."))
     s = sub.add_parser("report")
@@ -423,29 +703,38 @@ def main() -> int:
     s.add_argument("--json", type=Path)
     s.add_argument("--out", type=Path)
     args = ap.parse_args()
+    if args.command == "run":
+        return run(args)
     try:
-        family = load_family(args.family, ROOT)
-    except (Invalid, OSError, tomllib.TOMLDecodeError) as error:
-        problems = error.args[0] if isinstance(error, Invalid) else [str(error)]
+        family = load_family(args.family, ROOT, harness=declared_harness(args))
+    except (Invalid, OSError, tomllib.TOMLDecodeError, subprocess.CalledProcessError) as error:
+        problems = (error.args[0] if isinstance(error, Invalid) else
+                    [f"git {' '.join(error.cmd[3:])}: {(error.stderr or '').strip() or 'failed'}"]
+                    if isinstance(error, subprocess.CalledProcessError) else [str(error)])
         print("\n".join(f"invalid family {args.family}: {p}" for p in problems), file=sys.stderr)
         return INVALID
     if args.command == "check":
+        # In a job, the host it runs on: a pinned family's (GATE_HOST), else the one the fleet chose.
+        host = os.environ.get("GATE_HOST") or os.environ.get("FLEET_HOST") or family["host"]
         print(f"{family['name']}: {len(family['hypotheses'])} hypotheses, {len(family['cases'])} cases, "
-              f"{family['blocks']} blocks (whole squares of A, A' and B) on {family['host']}")
+              f"{family['blocks']} blocks (whole squares of A, A' and B) on {host or 'a host the fleet picks'}")
         if os.environ.get("FLEET_OUT"):  # in a job: the manifest its report holds the results to
             harness = os.environ.get("ABBA_HARNESS") or git(ROOT, "rev-parse", "HEAD")
-            manifest = manifest_of(family, harness, int(os.environ.get("ABBA_ROUND", "1")),
-                                   os.environ.get("GATE_HOST") or family["host"], os.environ.get("FLEET_JOB", ""))
+            manifest = manifest_of(family, harness, int(os.environ.get("ABBA_ROUND", "1")), host,
+                                   os.environ.get("FLEET_JOB", ""))
             (Path(os.environ["FLEET_OUT"]) / "abba-manifest.json").write_text(json.dumps(manifest, indent=1),
                                                                               encoding="utf-8")
         return 0
     if args.command == "jobs":
         harness = git(Path(args.checkout), "rev-parse", args.harness or family["sides"]["b"])
-        found = jobs(family, harness, args.checkout, args.host or family["host"], args.round)
+        found = jobs(family, harness, args.checkout, args.host or family["host"], args.round, args.priority,
+                     args.reason or "")
         args.out.mkdir(parents=True, exist_ok=True)
-        for name, job in found.items():
-            (args.out / f"{name}.toml").write_text(rg.toml_job(job), encoding="utf-8")
-            print(args.out / f"{name}.toml")
+        set_id = next(iter(found))
+        path = args.out / f"{set_id}.set.toml"
+        path.write_bytes(set_file(set_id, list(found.values())).encode("utf-8"))
+        print(plan_text(family, found[set_id], harness, measure_at(args.checkout, harness), f"set:{set_id}"))
+        print(f"  submit: fleet submit {path}   wait: fleet wait set:{set_id}")
         return 0
     code, text, out = report(family, args.results)
     print(text)
