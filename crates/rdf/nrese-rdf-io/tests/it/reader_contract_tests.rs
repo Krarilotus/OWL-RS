@@ -250,6 +250,100 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
             "<urn:g> { <urn:s> <urn:p> [ <urn:q> . % . <urn:u> <urn:v> <urn:w> . ] . <urn:after> <urn:p> <urn:o> . }",
             vec![None, Some(&after_in_g)],
         ),
+        // A closer closes an open bracket of its own kind, or nothing: a `)` with only `[`
+        // open leaves them open, whether the `[` was the failed statement's or the skip's
+        // (fix check r3: A1B-R3-F1 and R2-11).
+        (
+            false,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> [ <urn:q> . [ ) . <urn:u> <urn:v> <urn:w> . ] ] . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::TriG,
+            "<urn:g> { <urn:s> <urn:p> [ <urn:q> . [ ) . <urn:u> <urn:v> <urn:w> . ] ] . <urn:after> <urn:p> <urn:o> . }",
+            vec![None, Some(&after_in_g)],
+        ),
+        (
+            false,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> [ <urn:q> . ) . <urn:u> <urn:v> <urn:w> . ] . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::TriG,
+            "<urn:g> { <urn:s> <urn:p> [ <urn:q> . ) . <urn:u> <urn:v> <urn:w> . ] . <urn:after> <urn:p> <urn:o> . }",
+            vec![None, Some(&after_in_g)],
+        ),
+        // The same when the failing token is itself the wrong closer (taken where `]` was
+        // expected), or a stray opener (taken where `.` was expected).
+        (
+            false,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> [ <urn:q> <urn:o> ) . <urn:u> <urn:v> <urn:w> . ] . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::TriG,
+            "<urn:g> { <urn:s> <urn:p> [ <urn:q> <urn:o> ) . <urn:u> <urn:v> <urn:w> . ] . <urn:after> <urn:p> <urn:o> . }",
+            vec![None, Some(&after_in_g)],
+        ),
+        (
+            false,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> <urn:o> [ ) . <urn:u> <urn:v> <urn:w> . ] . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::TriG,
+            "<urn:g> { <urn:s> <urn:p> <urn:o> [ ) . <urn:u> <urn:v> <urn:w> . ] . <urn:after> <urn:p> <urn:o> . }",
+            vec![None, Some(&after_in_g)],
+        ),
+        // An open `<<(` isn't closed by a `]`.
+        (
+            false,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> <<( <urn:a> <urn:b> . ] . <urn:u> <urn:v> <urn:w> . )>> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::TriG,
+            "<urn:g> { <urn:s> <urn:p> <<( <urn:a> <urn:b> . ] . <urn:u> <urn:v> <urn:w> . )>> . <urn:after> <urn:p> <urn:o> . }",
+            vec![None, Some(&after_in_g)],
+        ),
+        // A closer of an outer open bracket closes it and the unfinished ones inside it (the
+        // salvage policy), whether met while skipping or as the failing token. Before, the
+        // `]` closed one bracket of two, so `urn:after` was skipped too: over-skipping, not
+        // a wrong answer.
+        (
+            false,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> [ <urn:q> ( 1 . ] . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::TriG,
+            "<urn:g> { <urn:s> <urn:p> [ <urn:q> ( 1 . ] . <urn:after> <urn:p> <urn:o> . }",
+            vec![None, Some(&after_in_g)],
+        ),
+        (
+            false,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> [ <urn:q> ( 1 ] . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::TriG,
+            "<urn:g> { <urn:s> <urn:p> [ <urn:q> ( 1 ] . <urn:after> <urn:p> <urn:o> . }",
+            vec![None, Some(&after_in_g)],
+        ),
         // A string with a line break in it, closed later: its end is known, so it is
         // skipped whole and the `] .` and statement in it are text, not structure (fix
         // check r2). LF and CR, both quotes, and in a TriG block.
@@ -393,6 +487,151 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
             ("strict", document),
             shaped(&strict, &strict_expected),
         );
+    }
+    table.done();
+}
+
+/// `document` parsed by `parser` from a slice, a reader, and a reader giving one byte at a
+/// time.
+fn on_three_paths(
+    parser: impl Fn() -> RdfParser,
+    document: &'static [u8],
+) -> [(&'static str, Vec<Result<Quad, String>>); 3] {
+    let bytes = || Pieces(document.chunks(1).map(Ok).collect());
+    [
+        ("slice", drain(parser().for_slice(document))),
+        ("reader", drain(parser().for_reader(document))),
+        ("byte reader", drain(parser().for_reader(bytes()))),
+    ]
+}
+
+/// An opener refused by the nesting limit is in the document all the same: it stays open
+/// while the failed statement's rest is skipped, so a `.` before its `]` ends nothing and the
+/// two `)` close nothing (fix check r3; `RdfParser::recovering`). Turtle and a TriG block, on
+/// all three paths.
+#[test]
+fn an_opener_refused_by_the_nesting_limit_stays_open() {
+    let after = triple("urn:after", "urn:p", iri("urn:o"));
+    let after_in_g = Quad::new(iri("urn:after"), iri("urn:p"), iri("urn:o"), iri("urn:g"));
+    let mut table = Table::default();
+    for (format, document, expected) in [
+        (
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> [ <urn:q> [ ) ) . <urn:u> <urn:v> <urn:w> . ] ] . <urn:after> <urn:p> <urn:o> .",
+            &after,
+        ),
+        (
+            RdfFormat::TriG,
+            "<urn:g> { <urn:s> <urn:p> [ <urn:q> [ ) ) . <urn:u> <urn:v> <urn:w> . ] ] . <urn:after> <urn:p> <urn:o> . }",
+            &after_in_g,
+        ),
+    ] {
+        let parser = || {
+            RdfParser::from_format(format)
+                .with_max_nesting(1)
+                .recovering()
+        };
+        for (path, items) in on_three_paths(parser, document.as_bytes()) {
+            let got: Vec<Option<&Quad>> = items.iter().map(|item| item.as_ref().ok()).collect();
+            let inside = got
+                .iter()
+                .flatten()
+                .any(|quad| quad.subject.to_string() == "<urn:u>");
+            let outcome = match inside {
+                true => Err(format!("a quad from inside the failed statement: {got:?}")),
+                false => same(got, vec![None, Some(expected)]),
+            };
+            table.row(false, (path, document), outcome);
+        }
+    }
+    table.done();
+}
+
+/// Each of the ten delimiters, at every token position of statements using every grammar
+/// routine that opens one (objects, lists, triple terms, reified triples, annotations,
+/// reifiers, `[]`, datatypes, directives, TriG graph names), replacing the token there or put
+/// before it, then a valid statement: recovering runs to the end on all three paths without a
+/// panic. In a debug build `resync` checks that the brackets noted open when a statement
+/// fails agree with those it took, so a grammar site that noted none fails here (fix check
+/// r3). A guard: before, there was no such check.
+#[test]
+fn recovery_knows_every_bracket_open_wherever_a_statement_fails() {
+    const DELIMITERS: [&str; 10] = ["[", "]", "(", ")", "<<(", ")>>", "<<", ">>", "{|", "|}"];
+    let seeds = [
+        (
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> [ <urn:q> ( 1 <<( <urn:a> <urn:b> <urn:c> )>> ) ; <urn:r> << <urn:a> <urn:b> <urn:c> ~ <urn:x> >> {| <urn:p> <urn:o> |} ] .",
+        ),
+        (RdfFormat::Turtle, "[ <urn:p> <urn:o> ] <urn:q> <urn:r> ."),
+        (RdfFormat::Turtle, "[ ] <urn:p> <urn:o> ."),
+        (RdfFormat::Turtle, "( 1 2 ) <urn:p> <urn:o> ."),
+        (
+            RdfFormat::Turtle,
+            "<< << <urn:a> <urn:b> <urn:c> >> <urn:p> << <urn:a> <urn:b> <urn:c> >> >> <urn:q> <urn:r> .",
+        ),
+        (
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> << [ ] <urn:b> <<( <urn:a> <urn:b> \"x\" )>> ~ [ ] >> .",
+        ),
+        (
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> <<( [ ] <urn:b> <<( <urn:a> <urn:b> <urn:c> )>> )>> .",
+        ),
+        (
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> <urn:o> ~ [ ] {| <urn:q> [ <urn:r> <urn:o> ] |} .",
+        ),
+        (RdfFormat::Turtle, "<urn:s> <urn:p> \"x\"^^ <urn:dt> ."),
+        (RdfFormat::Turtle, "@prefix ex: <urn:ex#> ."),
+        (RdfFormat::Turtle, "@base <urn:b> ."),
+        (RdfFormat::Turtle, "@version \"1.2\" ."),
+        (RdfFormat::Turtle, "PREFIX ex: <urn:ex#>"),
+        (RdfFormat::TriG, "GRAPH [ ] { <urn:s> <urn:p> <urn:o> . }"),
+        (
+            RdfFormat::TriG,
+            "[ ] { <urn:s> <urn:p> [ <urn:q> <urn:o> ] . }",
+        ),
+        (
+            RdfFormat::TriG,
+            "<urn:g> { [ <urn:p> <urn:o> ] <urn:q> ( 1 ) . }",
+        ),
+        (RdfFormat::TriG, "[ ] <urn:p> <urn:o> ."),
+        (RdfFormat::TriG, "[ <urn:p> <urn:o> ] <urn:q> <urn:r> ."),
+    ];
+    let mut table = Table::default();
+    for (format, seed) in seeds {
+        let tokens: Vec<&str> = seed.split(' ').collect();
+        for at in 0..=tokens.len() {
+            for delimiter in DELIMITERS {
+                for replace in [false, true] {
+                    if replace && at == tokens.len() {
+                        continue;
+                    }
+                    let mut mutated = tokens.clone();
+                    if replace {
+                        mutated[at] = delimiter;
+                    } else {
+                        mutated.insert(at, delimiter);
+                    }
+                    let document: &'static str = Box::leak(
+                        format!("{} <urn:after> <urn:p> <urn:o> .", mutated.join(" "))
+                            .into_boxed_str(),
+                    );
+                    let parser = || RdfParser::from_format(format).recovering();
+                    let outcome = std::panic::catch_unwind(|| {
+                        on_three_paths(parser, document.as_bytes());
+                    })
+                    .map_err(|panic| {
+                        let message = panic
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()));
+                        format!("panicked: {message:?}")
+                    });
+                    table.row(true, (format, document), outcome);
+                }
+            }
+        }
     }
     table.done();
 }
