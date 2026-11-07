@@ -83,7 +83,10 @@ fn group(read: &impl Fn(&str) -> io::Result<String>) -> Result<Option<Group>, Un
     };
     let path = path.trim();
     let mounts = read("/proc/self/mountinfo").map_err(|_| Unknown)?;
-    // The mount of this hierarchy whose root holds the group, the deepest such root.
+    // The mount of this hierarchy whose root holds the group, the widest such root. Every mount
+    // of one hierarchy shows the same tree, so the widest shows every ancestor a deeper one does
+    // and more: a bind mount of the group itself must not hide the limits above it (review r1
+    // R1-C1). Above the widest, nothing is visible.
     let mut best: Option<(usize, String, String)> = None;
     for line in mounts.lines() {
         let Some((root, point)) = mount(line, files) else {
@@ -94,7 +97,7 @@ fn group(read: &impl Fn(&str) -> io::Result<String>) -> Result<Option<Group>, Un
         };
         if best
             .as_ref()
-            .is_none_or(|(deepest, ..)| root.len() > *deepest)
+            .is_none_or(|(widest, ..)| root.len() < *widest)
         {
             best = Some((root.len(), point, rest.to_owned()));
         }
