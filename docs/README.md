@@ -6,6 +6,7 @@ list wins and the lower one is corrected in the same change.
 | Question | Document |
 |---|---|
 | Who owns what; in which layer is a problem fixed? | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| Which shared contract should a caller use; where are known bypasses? | [architecture/contracts.md](architecture/contracts.md) |
 | Why was it decided so? | [adr/](adr/), the standing decisions in [ADR-0010](adr/0010-standing-product-decisions.md) |
 | In which order is it built? | [ROADMAP.md](ROADMAP.md) |
 | What is done, what is open? | [STATUS.md](STATUS.md), with the open-work list; before v2 goes to `main`: the status table of the [merge checklist](plan/2026-10-05-v2-merge-checklist.md) |

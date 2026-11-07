@@ -12,12 +12,19 @@
 //! append the WAL record and sync it, then publish the new version. A commit is therefore
 //! acknowledged only once it is durable, and nothing is visible that isn't in the log.
 //!
-//! Recovery = newest checkpoint + replay of all later WAL records in revision order. A torn
-//! frame at the end of the last segment is truncated (it was never acknowledged); invalid
-//! data anywhere else is reported as corruption instead of being silently skipped.
+//! Recovery = newest checkpoint + replay of all later WAL records in revision order. In the
+//! newest segment, a torn tail (what a crash during an append leaves, [`tail`]) is cut, its
+//! bytes kept in `<dir>/wal-cut/`. Other damage there refuses to open, the log left as it
+//! is, unless [`WalDamage::KeepPrefix`] allows cutting it too. Invalid data in an earlier
+//! segment always refuses to open; nothing is skipped.
 
 pub(crate) mod checkpoint;
 pub(crate) mod codec;
+#[cfg(test)]
+pub(crate) mod fault;
+pub(crate) mod tail;
+#[cfg(test)]
+mod tests;
 pub(crate) mod wal;
 
 use std::fs::{self, File};
@@ -40,6 +47,40 @@ pub enum SyncPolicy {
     /// Hand WAL writes to the OS without waiting. Survives a process crash, but the last
     /// commits can be lost on power failure or an OS crash.
     OsBuffered,
+}
+
+/// What opening does with damage in the newest WAL segment that a crash during an append
+/// doesn't leave ([`tail`]): a complete record failing its check, or invalid bytes with an
+/// intact record after them. A torn tail is cut either way, its bytes kept. Neither choice
+/// costs a healthy commit anything; they trade downtime after a damaged crash against the
+/// silent loss of acknowledged commits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WalDamage {
+    /// Refuse to open, leaving the log as it is, until an operator decides (the default):
+    /// no acknowledged commit is dropped without someone's word.
+    #[default]
+    Refuse,
+    /// Open with the log up to the damage. The rest is copied to `<dir>/wal-cut/` first and
+    /// the cut logged as an error; commits acknowledged after the damage are then in that
+    /// copy only.
+    KeepPrefix,
+}
+
+impl WalDamage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Refuse => "refuse",
+            Self::KeepPrefix => "keep-prefix",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "refuse" => Some(Self::Refuse),
+            "keep-prefix" => Some(Self::KeepPrefix),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +124,9 @@ pub struct DurabilityConfig {
     /// with `recover_until`; commits logged without a time (before WAL version 6) count as
     /// earlier.
     pub recover_until_micros: Option<u64>,
+    /// Damage in the newest WAL segment: refuse to open (the default), or keep the log up
+    /// to it.
+    pub wal_damage: WalDamage,
 }
 
 impl Default for DurabilityConfig {
@@ -97,6 +141,7 @@ impl Default for DurabilityConfig {
             wal_archive: false,
             recover_until: None,
             recover_until_micros: None,
+            wal_damage: WalDamage::Refuse,
         }
     }
 }
@@ -254,8 +299,47 @@ impl Durable {
                         path.display()
                     )));
                 }
-                tracing::warn!(segment = %path.display(), valid_len = contents.valid_len, "truncating torn WAL tail");
-                wal::truncate_segment(path, contents.valid_len)?;
+                let bytes = fs::read(path)?;
+                let at = contents.valid_len;
+                // Every record that could be lost is past what is recovered.
+                let next = version.revision.saturating_add(1);
+                let cut_bytes = (bytes.len() as u64).saturating_sub(at);
+                match (tail::classify(&bytes, at as usize, next), config.wal_damage) {
+                    (tail::Tail::Torn, _) => {
+                        let kept = tail::keep(root, path, &bytes, at)?;
+                        tracing::warn!(segment = %path.display(), offset = at, bytes = cut_bytes, kept = %kept.display(), "cut a torn WAL tail (an append a crash interrupted)");
+                    }
+                    (tail::Tail::Damaged { intact_after }, WalDamage::Refuse) => {
+                        let after = intact_after.map_or(String::new(), |(offset, revision)| {
+                            format!(
+                                "; an intact record of revision {revision} follows at byte {offset}"
+                            )
+                        });
+                        return Err(EngineError::Corruption(format!(
+                            "damaged WAL record in {} at byte {at}, after revision {}{after}. \
+                             The log is left as it is. To open with the log up to revision {} \
+                             (the rest copied to {}/), set the WAL damage policy to keep the \
+                             prefix (server: store.wal_damage = \"keep-prefix\")",
+                            path.display(),
+                            version.revision,
+                            version.revision,
+                            tail::CUT_DIR,
+                        )));
+                    }
+                    (tail::Tail::Damaged { intact_after }, WalDamage::KeepPrefix) => {
+                        let kept = tail::keep(root, path, &bytes, at)?;
+                        tracing::error!(
+                            segment = %path.display(),
+                            offset = at,
+                            bytes = cut_bytes,
+                            kept_through_revision = version.revision,
+                            intact_after = ?intact_after,
+                            kept = %kept.display(),
+                            "cut a damaged WAL tail: commits acknowledged after the damage are only in the copy"
+                        );
+                    }
+                }
+                wal::truncate_segment(path, at)?;
             }
         }
 

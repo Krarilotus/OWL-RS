@@ -169,6 +169,8 @@ impl Spill {
 
 impl Drop for Spill {
     fn drop(&mut self) {
+        #[cfg(test)]
+        tests::on_teardown(&self.dir);
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
@@ -255,10 +257,13 @@ impl Iterator for Merge {
     }
 }
 
-/// The spilling thread of a bulk load, started with its first chunk.
+/// The spilling thread of a bulk load, started with its first chunk. Dropped, it is joined
+/// and its spill removed: an aborted load's thread never outlives it (B-303).
 pub(super) struct Spiller {
-    chunks: SyncSender<Vec<Vec<EncodedQuad>>>,
-    thread: JoinHandle<std::io::Result<Spill>>,
+    /// Taken when the thread is told to stop.
+    chunks: Option<SyncSender<Vec<Vec<EncodedQuad>>>>,
+    /// Taken when it is joined.
+    thread: Option<JoinHandle<std::io::Result<Spill>>>,
 }
 
 impl Spiller {
@@ -278,21 +283,42 @@ impl Spiller {
                 }
                 Ok(spill)
             })?;
-        Ok(Self { chunks, thread })
+        Ok(Self {
+            chunks: Some(chunks),
+            thread: Some(thread),
+        })
     }
 
     /// Hands a full chunk over, waiting while the last one is written. `false` if the
     /// thread stopped on an error ([`finish`](Self::finish) returns it).
     pub(super) fn send(&self, batches: Vec<Vec<EncodedQuad>>) -> bool {
-        self.chunks.send(batches).is_ok()
+        self.chunks
+            .as_ref()
+            .is_some_and(|chunks| chunks.send(batches).is_ok())
     }
 
     /// Waits for the last chunk to be written; the chunks, or the first error.
-    pub(super) fn finish(self) -> std::io::Result<Spill> {
-        drop(self.chunks);
-        self.thread
-            .join()
-            .unwrap_or_else(|_| Err(std::io::Error::other("the spilling thread panicked")))
+    pub(super) fn finish(mut self) -> std::io::Result<Spill> {
+        self.join()
+            .unwrap_or_else(|| Err(std::io::Error::other("the spilling thread was joined")))
+    }
+
+    /// Stops the thread after the chunk it is writing and waits for it, once.
+    fn join(&mut self) -> Option<std::io::Result<Spill>> {
+        drop(self.chunks.take());
+        let thread = self.thread.take()?;
+        Some(
+            thread
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("the spilling thread panicked"))),
+        )
+    }
+}
+
+impl Drop for Spiller {
+    fn drop(&mut self) {
+        // The spill, if the thread returned one, removes its directory as it drops.
+        drop(self.join());
     }
 }
 
@@ -309,6 +335,69 @@ pub(crate) fn remove_leftovers(root: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::TermId;
+
+    /// What a test wants to know when a spill directory is torn down, by directory.
+    type Observer = Box<dyn Fn() + Send>;
+    static TEARDOWN: std::sync::Mutex<Vec<(PathBuf, Observer)>> = std::sync::Mutex::new(Vec::new());
+
+    /// Called as the spill in `dir` is torn down, by whichever thread drops it.
+    pub(super) fn on_teardown(dir: &Path) {
+        for (watched, observe) in TEARDOWN.lock().unwrap().iter() {
+            if watched == dir {
+                observe();
+            }
+        }
+    }
+
+    /// A load dropped unfinished after it spilled removes its spill directory while it
+    /// still holds the writer slot (B-303). Released first, the next load could start,
+    /// recreate the directory and have its chunks removed by the old load's writer.
+    #[test]
+    fn an_aborted_load_tears_its_spill_down_before_the_writer_slot_goes() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::EngineConfig {
+            background_maintenance: false,
+            durability: crate::DurabilityConfig {
+                // Chunks of 4 quads.
+                bulk_load_memory: Some(384),
+                ..crate::DurabilityConfig::default()
+            },
+            ..crate::EngineConfig::default()
+        };
+        let engine = crate::Engine::open(dir.path(), config).unwrap();
+        let inner = Arc::clone(&engine.inner);
+        let (sender, held) = std::sync::mpsc::channel();
+        let spill_dir = dir.path().join(SPILL_DIR);
+        let observer: Observer = Box::new(move || {
+            let _ = sender.send(inner.writer.try_lock().is_none());
+        });
+        TEARDOWN.lock().unwrap().push((spill_dir.clone(), observer));
+        let node = |n: u64| nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{n}"));
+        let quads: Vec<nrese_rdf::Quad> = (0..8)
+            .map(|n| {
+                nrese_rdf::Quad::new(
+                    node(n),
+                    node(100),
+                    node(n + 1),
+                    nrese_rdf::GraphName::DefaultGraph,
+                )
+            })
+            .collect();
+        let load = engine.bulk_load(crate::BulkMode::Replace);
+        load.add(&quads);
+        drop(load);
+        let held = held.recv_timeout(std::time::Duration::from_secs(60));
+        TEARDOWN
+            .lock()
+            .unwrap()
+            .retain(|(watched, _)| *watched != spill_dir);
+        assert_eq!(
+            held,
+            Ok(true),
+            "the writer slot was free while the spill directory was removed"
+        );
+    }
 
     #[test]
     fn raw_spill_preserves_batch_order_and_reports_write_errors() {

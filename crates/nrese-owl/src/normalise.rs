@@ -52,10 +52,11 @@ pub struct Options {
     /// (`complements.rs`). Equisatisfiable; a model of the clauses says nothing of what is
     /// left out. Off by default.
     pub complements: bool,
-    /// Every clause names exactly the axioms it needs (for proofs and justifications). Off,
-    /// the automata of non-simple roles are minimised (`automata.rs`): far fewer clauses
-    /// over large role hierarchies, with sources that may name more than needed. On by
-    /// default.
+    /// Every clause names exactly the axioms it needs (for proofs and justifications), a
+    /// shared name's definition a set per axiom that takes the name. Off, the automata of
+    /// non-simple roles are minimised (`automata.rs`): far fewer clauses over large role
+    /// hierarchies, with sources that may name more than needed, and a shared definition
+    /// names only the axiom that first made it. On by default.
     pub exact_provenance: bool,
 }
 
@@ -245,6 +246,10 @@ struct Normaliser<'a> {
     takers: HashMap<u32, Vec<Taker>>,
     /// The shared names whose definitions can't be read in full, with why.
     failed: HashMap<u32, &'static str>,
+    /// With exact provenance: each clause of a shared name's definition, with the name and
+    /// what else the clause needs besides the definition's axiom (a transition's role
+    /// inclusions). `finish` gives it a source set per axiom that takes the name.
+    defined: Vec<(usize, u32, Vec<usize>)>,
 }
 
 impl<'a> Normaliser<'a> {
@@ -273,6 +278,7 @@ impl<'a> Normaliser<'a> {
             taker: Taker::Axiom(0),
             takers: HashMap::new(),
             failed: HashMap::new(),
+            defined: Vec::new(),
         };
         n.role_inclusions(extra);
         n
@@ -1284,23 +1290,79 @@ impl<'a> Normaliser<'a> {
     }
 
     fn add(&mut self, body: Vec<BodyAtom>, head: Vec<HeadAtom>, source: usize) {
-        self.add_needing(body, head, vec![source]);
+        self.add_needing(body, head, source, Vec::new());
     }
 
-    /// Adds the clause that `needed`'s axioms give together; a clause already there gets
-    /// `needed` as another way to it.
-    fn add_needing(&mut self, body: Vec<BodyAtom>, head: Vec<HeadAtom>, needed: Vec<usize>) {
+    /// Adds the clause that axiom `source` and the axioms `with` give together; a clause
+    /// already there gets them as another way to it. Read for the current taker: of a
+    /// shared name's definition, the clause is noted for the name's other axioms
+    /// ([`Self::shared_sources`]).
+    fn add_needing(
+        &mut self,
+        body: Vec<BodyAtom>,
+        head: Vec<HeadAtom>,
+        source: usize,
+        with: Vec<usize>,
+    ) {
+        let mut needed = with.clone();
+        needed.push(source);
+        needed.sort_unstable();
+        needed.dedup();
         let clause = Clause::new(body, head, needed.clone());
         let key = (clause.body.clone(), clause.head.clone());
-        if let Some(&at) = self.clause_index.get(&key) {
-            let sources = &mut self.out.clauses[at].sources;
-            if !sources.contains(&needed) {
-                sources.push(needed);
+        let at = match self.clause_index.get(&key) {
+            Some(&at) => {
+                let sources = &mut self.out.clauses[at].sources;
+                if !sources.contains(&needed) {
+                    sources.push(needed);
+                }
+                at
             }
-            return;
+            None => {
+                let at = self.out.clauses.len();
+                self.clause_index.insert(key, at);
+                self.out.clauses.push(clause);
+                at
+            }
+        };
+        if self.exact_provenance
+            && let Taker::Name(name) = self.taker
+        {
+            self.defined.push((at, name, with));
         }
-        self.clause_index.insert(key, self.out.clauses.len());
-        self.out.clauses.push(clause);
+    }
+
+    /// Each clause of a shared name's definition, given by every axiom that takes the name
+    /// (directly, or through a definition that takes it), not only by the one that made it:
+    /// a cache hit returns the name, and the clauses stay one (review A-1204: `(A ⊓ B)(a)`,
+    /// `(A ⊓ B)(b)` share `Q ⊑ A ⊓ B`, and `A(b)` needs the second assertion alone). A
+    /// clause gets a source set per such axiom, with what else it needs.
+    fn shared_sources(&mut self) {
+        let mut by_clause: HashMap<usize, Vec<(u32, Vec<usize>)>> = HashMap::new();
+        for (clause, name, with) in std::mem::take(&mut self.defined) {
+            by_clause.entry(clause).or_default().push((name, with));
+        }
+        let mut taking: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (clause, mut uses) in by_clause {
+            uses.sort_unstable();
+            uses.dedup();
+            let sources = &mut self.out.clauses[clause].sources;
+            let mut seen: HashSet<Vec<usize>> = sources.iter().cloned().collect();
+            for (name, with) in uses {
+                let axioms = taking
+                    .entry(name)
+                    .or_insert_with(|| taking_axioms(&self.takers, name));
+                for &axiom in axioms.iter() {
+                    let mut set = with.clone();
+                    set.push(axiom);
+                    set.sort_unstable();
+                    set.dedup();
+                    if seen.insert(set.clone()) {
+                        sources.push(set);
+                    }
+                }
+            }
+        }
     }
 
     // Role inclusions and automata -----------------------------------------------------
@@ -1603,12 +1665,10 @@ impl<'a> Normaliser<'a> {
         let state = |s: u32| Concept::Fresh(names[s as usize]);
         // A transition needs the universal and the role inclusions of its edge together
         // (justifications through a role hierarchy or chain name them: found by the
-        // context core's proof test, 3 October 2026).
+        // context core's proof test, 3 October 2026). They are the automaton's: what takes
+        // its start state gives them too.
+        let outer = std::mem::replace(&mut self.taker, Taker::Name(start));
         for (a, label, b, axioms) in &nfa.edges {
-            let mut needed = vec![source];
-            needed.extend(axioms);
-            needed.sort_unstable();
-            needed.dedup();
             match label {
                 Some(edge) => self.add_needing(
                     vec![
@@ -1616,15 +1676,18 @@ impl<'a> Normaliser<'a> {
                         Self::edge(*edge, Var::X, Var::Y(0)),
                     ],
                     vec![HeadAtom::Concept(state(*b), Var::Y(0))],
-                    needed,
+                    source,
+                    axioms.clone(),
                 ),
                 None => self.add_needing(
                     vec![BodyAtom::Concept(state(*a), Var::X)],
                     vec![HeadAtom::Concept(state(*b), Var::X)],
-                    needed,
+                    source,
+                    axioms.clone(),
                 ),
             }
         }
+        self.taker = outer;
         // The end state: the filler holds (taken as the automaton, by its start state).
         self.define(
             start,
@@ -1683,12 +1746,36 @@ impl<'a> Normaliser<'a> {
         nfa
     }
 
-    fn finish(self) -> Normalised {
+    fn finish(mut self) -> Normalised {
+        self.shared_sources();
         let mut out = self.out;
         out.classes = self.classes;
         out.ranges = self.ranges;
         out
     }
+}
+
+/// The axioms that take the shared name `name`, directly or through the definitions of
+/// the names that take it (sorted).
+fn taking_axioms(takers: &HashMap<u32, Vec<Taker>>, name: u32) -> Vec<usize> {
+    let mut seen = HashSet::from([name]);
+    let mut todo = vec![name];
+    let mut out = Vec::new();
+    while let Some(at) = todo.pop() {
+        for &taker in takers.get(&at).into_iter().flatten() {
+            match taker {
+                Taker::Axiom(index) => out.push(index),
+                Taker::Name(other) => {
+                    if seen.insert(other) {
+                        todo.push(other);
+                    }
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 #[cfg(test)]

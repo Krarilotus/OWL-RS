@@ -683,8 +683,12 @@ impl<'a> Parser<'a> {
                 return Ok(out);
             };
             if self.eat("{|") {
+                // A block's objects may carry blocks of their own: a nesting level, as a
+                // `[ … ]` is. Blocks side by side are this loop's siblings and add none.
+                self.enter()?;
                 let properties = self.property_list(paths, true)?;
                 self.expect("|}")?;
+                self.leave();
                 self.add_properties(reifier.clone(), properties.focus, &mut out.patterns)?;
                 out.patterns.extend(properties.patterns);
             }

@@ -3,6 +3,7 @@
 
 mod build;
 mod limits;
+mod models;
 mod ni;
 mod probes;
 mod resources;
