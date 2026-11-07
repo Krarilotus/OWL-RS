@@ -12,17 +12,36 @@
 use anyhow::{Context, Result, anyhow, bail};
 use nrese_store::memory::Reading;
 
-/// The number and the unit of `text`: `"1.5 GiB"` is `(1.5, "gib")`.
-fn split(text: &str) -> Result<(f64, String)> {
+/// The number and the unit of `text`: `"1.5 GiB"` is `("1.5", "gib")`.
+fn split(text: &str) -> Result<(String, String)> {
     let text = text.trim();
     let digits = text
         .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '_'))
         .unwrap_or(text.len());
-    let number: f64 = text[..digits]
-        .replace('_', "")
-        .parse()
-        .map_err(|_| anyhow!("'{text}' doesn't start with a number"))?;
+    let number = text[..digits].replace('_', "");
+    if number.parse::<f64>().is_err() {
+        bail!("'{text}' doesn't start with a number");
+    }
     Ok((number, text[digits..].trim().to_ascii_lowercase()))
+}
+
+/// `number` (of `text`) times `factor`, exact for a whole number. An error past u64, and
+/// for a positive value below one (`smallest`): it would read as 0, which a budget takes
+/// as none.
+fn scale(text: &str, number: &str, factor: u64, smallest: &str) -> Result<u64> {
+    let too_large = || anyhow!("'{text}' is too large");
+    if !number.contains('.') {
+        let whole: u64 = number.parse().map_err(|_| too_large())?;
+        return whole.checked_mul(factor).ok_or_else(too_large);
+    }
+    let value = number.parse::<f64>()? * factor as f64;
+    if value >= u64::MAX as f64 {
+        return Err(too_large());
+    }
+    if value > 0.0 && value < 1.0 {
+        bail!("'{text}' is more than 0 but less than {smallest}");
+    }
+    Ok(value.round() as u64)
 }
 
 /// Bytes: `1048576`, `1MiB`, `1.5 GiB`, `2G`, `500MB`.
@@ -42,7 +61,7 @@ pub(super) fn parse_size(text: &str) -> Result<u64> {
             bail!("unknown size unit '{other}' in '{text}' (KiB, MiB, GiB, TiB, KB, MB, GB, TB)")
         }
     };
-    Ok((number * factor as f64).round() as u64)
+    scale(text, &number, factor, "one byte")
 }
 
 /// Milliseconds: `30000`, `30s`, `500ms`, `2min`, `1h`.
@@ -55,7 +74,7 @@ pub(super) fn parse_duration_ms(text: &str) -> Result<u64> {
         "h" => 3_600_000,
         other => bail!("unknown time unit '{other}' in '{text}' (ms, s, min, h)"),
     };
-    Ok((number * factor as f64).round() as u64)
+    scale(text, &number, factor, "one millisecond")
 }
 
 /// Bytes, or a share of `machine`, the machine's memory as read ([`machine_memory_bytes`]):
