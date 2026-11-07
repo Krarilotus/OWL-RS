@@ -9,5 +9,6 @@ mod engine_tests;
 mod index_encoding_tests;
 mod inferred_stack_tests;
 mod replication_tests;
+mod text_scope_tests;
 mod vector_tests;
 mod vocabulary_tests;

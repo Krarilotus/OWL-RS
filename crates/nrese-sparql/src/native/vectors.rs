@@ -218,6 +218,8 @@ impl Context<'_> {
         };
         let mut rows = Rows::new(&search);
         let mut used: HashMap<u64, bool> = HashMap::new();
+        let within = self.search_in()?;
+        let refused = std::cell::Cell::new(None);
         for (near_id, vector) in queries {
             self.check()?;
             let accept = |id: TermId| {
@@ -229,7 +231,7 @@ impl Context<'_> {
                 &search,
                 vector,
                 candidates.as_ref().map(HashSet::len),
-                |query| self.snapshot.vector_search(query, &accept),
+                |query| self.vector_fetch(&within, query, &accept, &refused),
                 |id| {
                     Ok((*used
                         .entry(id.raw())
@@ -237,6 +239,9 @@ impl Context<'_> {
                     .then_some(()))
                 },
             )?;
+            if let Some(refused) = refused.take() {
+                return Err(QueryEvaluationError::MemoryLimit(refused).into());
+            }
             rows.push(
                 self,
                 &search,
@@ -279,11 +284,13 @@ impl Context<'_> {
         // beam is widened by the inverse share as for a filter it applies itself. Without
         // it the first `k` hits that pass come from an approximate list whose tail misses
         // them (recall 0.50 against 0.98, one kind in ten of 200,000 vectors).
+        let within = self.search_in()?;
+        let refused = std::cell::Cell::new(None);
         let found = self.nearest(
             &search,
             vector.clone(),
             Some(estimate.ceil() as usize),
-            |query| self.snapshot.vector_search(query, &|_| true),
+            |query| self.vector_fetch(&within, query, &|_| true, &refused),
             |id| {
                 if !self.used_as_object(id) {
                     return Ok(None);
@@ -303,6 +310,9 @@ impl Context<'_> {
                 Ok(Some(Probed::new(self, rows)))
             },
         )?;
+        if let Some(refused) = refused.take() {
+            return Err(QueryEvaluationError::MemoryLimit(refused).into());
+        }
         let mut rows = Rows::new(&search);
         rows.push(
             self,
@@ -341,6 +351,41 @@ impl Context<'_> {
             }
         };
         self.join(local, found)
+    }
+
+    /// One round of a vector search, over what `within` says: the dictionary's index
+    /// (global), or the vectors the reader sees, compared exactly. A reader's corpus the
+    /// query's budget refused goes to `refused` (the caller's error), with no hits.
+    fn vector_fetch(
+        &self,
+        within: &super::search::SearchIn,
+        query: &VectorQuery,
+        accept: &(dyn Fn(TermId) -> bool + Sync),
+        refused: &std::cell::Cell<Option<nrese_exec::BudgetExceeded>>,
+    ) -> (Vec<(TermId, f32)>, VectorSearchReport) {
+        use super::search::SearchIn;
+        let none = VectorSearchReport {
+            space: 0,
+            graph: false,
+            scanned: 0,
+        };
+        match within {
+            SearchIn::Global => self.snapshot.vector_search(query, accept),
+            SearchIn::Reader(None) => (Vec::new(), none),
+            SearchIn::Reader(Some((_, scope))) => match self.snapshot.vector_search_in(
+                self.model,
+                scope,
+                query,
+                accept,
+                Some(&self.budget),
+            ) {
+                Ok(found) => found,
+                Err(error) => {
+                    refused.set(Some(error));
+                    (Vec::new(), none)
+                }
+            },
+        }
     }
 
     /// Merge sorted search rounds with retained, successfully probed candidates.

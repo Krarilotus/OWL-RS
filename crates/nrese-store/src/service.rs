@@ -167,6 +167,10 @@ impl StoreService {
         engine.set_canonical_view_budget(std::sync::Arc::new(
             nrese_exec::Budget::unlimited().within(runtime.query_memory()),
         ));
+        // So do the corpora reader-scoped searches keep, where they are on.
+        if config.search_scope == crate::SearchScope::Reader {
+            engine.set_text_corpus_budget(reader_corpus_budget(&runtime));
+        }
         let before = engine.snapshot().revision();
         let preloaded_ontology = preload_ontology(&engine, &config)?;
         let ql_mode = config.ql_rewriting;
@@ -182,6 +186,7 @@ impl StoreService {
                 std::sync::Arc::new(nrese_sparql::ResultCache::new(config.query_cache_bytes))
             }),
             ql: std::sync::Arc::default(),
+            search_scope: std::sync::Arc::new(std::sync::RwLock::new(config.search_scope)),
         };
         let unavailable = std::sync::Arc::<std::sync::OnceLock<String>>::default();
         let namespaces = crate::namespaces::Namespaces::open(
@@ -279,6 +284,28 @@ impl StoreService {
     /// When queries are rewritten for OWL 2 QL.
     pub fn ql_rewriting(&self) -> crate::QlRewritingMode {
         *self.ql_mode.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// What searches rank and select among ([`crate::StoreConfig::search_scope`]).
+    pub fn search_scope(&self) -> crate::SearchScope {
+        self.settings.search_scope()
+    }
+
+    /// Changes what searches rank and select among (a repository's setting): queries and
+    /// updates that start from now on read it; running ones keep theirs. Their cached
+    /// results stay apart ([`nrese_sparql::ResultCache`] keys a reader's scope).
+    pub fn set_search_scope(&self, scope: crate::SearchScope) {
+        let mut current = self
+            .settings
+            .search_scope
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        // Turned on: the corpora the engine keeps for it draw on the queries' memory.
+        if scope == crate::SearchScope::Reader && *current != scope {
+            self.engine
+                .set_text_corpus_budget(reader_corpus_budget(&self.settings.runtime));
+        }
+        *current = scope;
     }
 
     /// Changes when queries are rewritten for OWL 2 QL (a repository's setting), at once.
@@ -472,6 +499,7 @@ impl StoreService {
             cancellation,
             union_default_graph: self.config.union_default_graph,
             geosparql_stated_only: self.config.geosparql_stated_only,
+            search_scope: self.search_scope(),
             services: self.services(),
             namespaces: self.namespaces.all(),
             supports: std::sync::Arc::clone(&self.supports),
@@ -1466,12 +1494,18 @@ impl StoreService {
         infer: bool,
     ) -> StoreResult<Vec<crate::autocomplete::Suggestion>> {
         scope.require_all("autocompletion")?;
+        // A reader's corpora draw from the request's envelope, as a query's do.
+        let search_scope = self.search_scope();
+        let budget = (search_scope == crate::SearchScope::Reader)
+            .then(|| std::sync::Arc::new(self.envelope(None).part()));
         Ok(crate::autocomplete::autocomplete(
             &self.engine.snapshot(),
             read_model(infer),
             typed,
             limit,
-        ))
+            search_scope,
+            budget.as_ref(),
+        )?)
     }
 
     /// The named graphs `scope` reads (RDF4J's `/contexts`).
@@ -1908,6 +1942,13 @@ impl StoreService {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
+}
+
+/// What the corpora of reader-scoped searches an engine keeps may take: 256 MiB, within
+/// the memory the queries draw on ([`crate::SearchScope::Reader`]).
+fn reader_corpus_budget(runtime: &crate::Runtime) -> std::sync::Arc<nrese_exec::Budget> {
+    const READER_CORPUS_BYTES: usize = 256 << 20;
+    std::sync::Arc::new(nrese_exec::Budget::new(READER_CORPUS_BYTES).within(runtime.query_memory()))
 }
 
 /// The read model of RDF4J's `infer` parameter.

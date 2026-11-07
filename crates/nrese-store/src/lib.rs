@@ -85,6 +85,7 @@ pub use nrese_engine::{EngineError, IndexEncoding, ReadModel, VocabularyEncoding
 pub use nrese_shacl::{ValidationReport, ValidationResult};
 pub use nrese_sparql::{
     CancellationToken, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryEvaluationError,
+    SearchScope,
 };
 pub use quarantine::{
     EntryState, InvalidStatements, Outcome, Quarantine, QuarantineFilter, QuarantineItem,

@@ -34,6 +34,15 @@ pub struct StoreConfig {
     /// GeoSPARQL relations in triple patterns read only the statements that assert them,
     /// without the query-rewrite extension computing them from geometries.
     pub geosparql_stated_only: bool,
+    /// What full-text relevance, IRI search and vector selection are computed over
+    /// (`store.search_scope`, a repository's `search_scope`):
+    /// [`global`](nrese_sparql::SearchScope::Global), the default, ranks over the
+    /// dictionary's whole indexes and selects vectors through the shared graph (returned
+    /// data respects graph access, scores and approximate selection may depend on data
+    /// outside the reader's graphs); [`reader`](nrese_sparql::SearchScope::Reader) ranks
+    /// and selects among what the reader's snapshot, read model and active graphs show
+    /// alone, at the cost of a corpus per scope and an exact scan of the visible vectors.
+    pub search_scope: nrese_sparql::SearchScope,
     /// Bytes of intermediate results all running queries may hold together; 0 is
     /// unlimited. A query that asks for more than is left fails with
     /// [`StoreError::is_server_memory_limit`](crate::StoreError::is_server_memory_limit).
@@ -314,6 +323,7 @@ impl StoreConfig {
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
             union_default_graph: false,
             geosparql_stated_only: false,
+            search_scope: nrese_sparql::SearchScope::Global,
             total_query_memory_bytes: 0,
             process_memory_bytes: ProcessMemory::Default,
             huge_pages: DEFAULT_HUGE_PAGES,
@@ -350,6 +360,7 @@ impl StoreConfig {
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
             union_default_graph: false,
             geosparql_stated_only: false,
+            search_scope: nrese_sparql::SearchScope::Global,
             total_query_memory_bytes: 0,
             process_memory_bytes: ProcessMemory::Default,
             huge_pages: DEFAULT_HUGE_PAGES,

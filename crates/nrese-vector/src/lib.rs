@@ -215,6 +215,47 @@ pub fn exact_from(
     merge(parts.into_iter().flatten(), k)
 }
 
+/// The `k` vectors nearest to `query` among those `eligible` takes and then `accept`
+/// takes (by id), nearest first, and how many `eligible` took: every vector compared, on
+/// every core. `eligible` decides what the search is over (a reader's visible vectors),
+/// `accept` narrows its hits: `eligible` is asked first, and `accept` only of what it took.
+pub fn exact_eligible(
+    vectors: &Vectors,
+    query: &[f32],
+    k: usize,
+    metric: Metric,
+    eligible: &(dyn Fn(u64) -> bool + Sync),
+    accept: &(dyn Fn(u64) -> bool + Sync),
+) -> (Vec<Hit>, usize) {
+    if vectors.is_empty() || query.len() != vectors.dimension {
+        return (Vec::new(), 0);
+    }
+    let query = Query::new(query);
+    let parts: Vec<(Vec<Hit>, usize)> = (0..vectors.chunks.len())
+        .into_par_iter()
+        .map(|c| {
+            let mut best = TopK::new(k);
+            let mut taken = 0;
+            for position in c * CHUNK..((c + 1) * CHUNK).min(vectors.len()) {
+                let position = position as u32;
+                let id = vectors.id(position);
+                if eligible(id) {
+                    taken += 1;
+                    if accept(id) {
+                        best.offer(id, vectors.distance(metric, &query, position));
+                    }
+                }
+            }
+            (best.into_sorted(), taken)
+        })
+        .collect();
+    let taken = parts.iter().map(|(_, taken)| taken).sum();
+    (
+        merge(parts.into_iter().flat_map(|(hits, _)| hits), k),
+        taken,
+    )
+}
+
 /// The `k` nearest of `hits`, nearest first.
 pub fn merge(hits: impl IntoIterator<Item = Hit>, k: usize) -> Vec<Hit> {
     let mut best = TopK::new(k);

@@ -138,6 +138,14 @@ pub const SETTINGS: &[Setting] = &[
          ones only.",
     ),
     setting(
+        "store.search_scope",
+        names::SEARCH_SCOPE,
+        Choice(&["global", "reader"]),
+        "What full-text relevance, IRI search and vector selection are computed over: the \
+         dictionary's whole indexes (default global, the fastest), or what the reader's \
+         snapshot and graphs show alone (reader).",
+    ),
+    setting(
         "store.import_directory",
         names::IMPORT_DIR,
         Text,

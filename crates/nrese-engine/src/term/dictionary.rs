@@ -2101,6 +2101,8 @@ fn validate_key(key: &[u8]) -> EngineResult<()> {
     }
 }
 
+mod reader_search;
+
 #[cfg(test)]
 #[path = "dictionary_lock_tests.rs"]
 mod lock_order_tests;

@@ -542,6 +542,45 @@ pub(crate) fn search(
     )
 }
 
+/// The `query.k` vectors of `input` nearest to `query.vector` among those `eligible`
+/// takes, then `accept` takes (by id): every eligible vector compared, the graph unused,
+/// so that no vector `eligible` refuses changes which are selected (a reader's search,
+/// `SearchScope::Reader`). The report's space and scan are the eligible vectors. No lock
+/// of the index is held, as in [`search`]: the same snapshot, scoped.
+pub(crate) fn search_eligible(
+    input: Option<SearchInput>,
+    query: &VectorQuery,
+    eligible: &(dyn Fn(u64) -> bool + Sync),
+    accept: &(dyn Fn(u64) -> bool + Sync),
+) -> (Vec<Hit>, VectorSearchReport) {
+    let Some(SearchInput { vectors, .. }) = input else {
+        return (
+            Vec::new(),
+            VectorSearchReport {
+                space: 0,
+                graph: false,
+                scanned: 0,
+            },
+        );
+    };
+    let (hits, taken) = nrese_vector::exact_eligible(
+        &vectors,
+        &query.vector,
+        query.k,
+        query.metric,
+        eligible,
+        accept,
+    );
+    (
+        hits,
+        VectorSearchReport {
+            space: taken,
+            graph: false,
+            scanned: taken,
+        },
+    )
+}
+
 /// Builds or extends the graph `query` uses, from what `index` holds now, and installs
 /// it, ending `reservation` if it still holds the space (a background build's; a warm-up
 /// or a small space's build has none).
