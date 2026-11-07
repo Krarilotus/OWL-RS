@@ -176,13 +176,6 @@ pub(super) enum Segment {
 }
 
 impl Segment {
-    pub(super) fn start(&self) -> u64 {
-        match self {
-            Self::Heap(heap) => heap.start,
-            Self::Adopted(adopted) => adopted.start,
-        }
-    }
-
     pub(super) fn key(&self, id: u64) -> &[u8] {
         match self {
             Self::Heap(heap) => heap.key(id),
@@ -202,8 +195,14 @@ impl Segment {
 pub(super) struct Inner {
     /// Entries `0..base.len` from a mapped checkpoint.
     pub(super) base: Option<Arc<Base>>,
+    /// The base's length (0 without one), inline: every key's lookup by id reads it first,
+    /// and reads no `Arc` to get it.
+    base_len: u64,
     /// Entries after the base, before the heap, by id.
     pub(super) segments: Vec<Arc<Segment>>,
+    /// Each segment's first id, inline: a key's lookup by id searches these, reading no
+    /// segment's `Arc` until it has found the one holding the key.
+    starts: Vec<u64>,
     /// The entries interned one by one since, at the end.
     pub(super) heap: Heap,
     /// Advanced by every rebase (the one change of the base): a text order built for one
@@ -215,14 +214,16 @@ impl Inner {
     pub(super) fn with_base(base: Base, generation: u64) -> Self {
         Self {
             heap: Heap::at(base.len),
+            base_len: base.len,
             base: Some(Arc::new(base)),
             segments: Vec::new(),
+            starts: Vec::new(),
             generation,
         }
     }
 
     pub(super) fn base_len(&self) -> u64 {
-        self.base.as_ref().map_or(0, |base| base.len)
+        self.base_len
     }
 
     pub(super) fn len(&self) -> u64 {
@@ -246,7 +247,7 @@ impl Inner {
         if index >= self.heap.start {
             return self.heap.key(index);
         }
-        let at = self.segments.partition_point(|s| s.start() <= index) - 1;
+        let at = self.starts.partition_point(|&start| start <= index) - 1;
         self.segments[at].key(index)
     }
 
@@ -257,9 +258,10 @@ impl Inner {
         index: u64,
         decoded: &'k mut ChargedVec<u8, B>,
     ) -> Result<&'k [u8], BudgetExceeded> {
-        let Some(base) = self.base.as_ref().filter(|base| index < base.len) else {
+        if index >= self.base_len {
             return Ok(self.added_key(index));
-        };
+        }
+        let base = self.base.as_ref().expect("an index below the base");
         match &base.codec {
             None => Ok(base.key(index)),
             Some(codec) => {
@@ -274,7 +276,7 @@ impl Inner {
     /// compressed the buffer it is decompressed into ([`Base::decode_bound`]).
     pub(super) fn decode_bound(&self, index: u64) -> usize {
         match &self.base {
-            Some(base) if index < base.len => base.decode_bound(index),
+            Some(base) if index < self.base_len => base.decode_bound(index),
             _ => self.key(index).len(),
         }
     }
@@ -302,8 +304,10 @@ impl Inner {
         let after = adopted.start + adopted.len();
         let heap = std::mem::replace(&mut self.heap, Heap::at(after));
         if heap.len() > 0 {
+            self.starts.push(heap.start);
             self.segments.push(Arc::new(Segment::Heap(heap)));
         }
+        self.starts.push(adopted.start);
         let segment = Arc::new(Segment::Adopted(adopted));
         self.segments.push(Arc::clone(&segment));
         segment
@@ -323,10 +327,10 @@ impl Inner {
         total
     }
 
-    /// The bytes [`Self::view`] allocates: its lists of `Arc`s (cloned with their lengths as
-    /// capacities), no key bytes.
+    /// The bytes [`Self::view`] allocates: its lists of `Arc`s and the segments' first ids
+    /// (cloned with their lengths as capacities), no key bytes.
     pub(super) fn view_bytes(&self) -> usize {
-        self.segments.len() * size_of::<Arc<Segment>>()
+        self.segments.len() * (size_of::<Arc<Segment>>() + size_of::<u64>())
             + self.heap.blocks.len() * size_of::<Arc<Block>>()
             + self.heap.tail.len() * size_of::<Arc<[u8]>>()
     }
@@ -335,7 +339,9 @@ impl Inner {
     pub(super) fn view(&self) -> View {
         View(Self {
             base: self.base.clone(),
+            base_len: self.base_len,
             segments: self.segments.clone(),
+            starts: self.starts.clone(),
             heap: self.heap.keys(),
             generation: self.generation,
         })
