@@ -52,6 +52,11 @@ def write(directory: Path, rows: list[dict]) -> Path:
         writer = csv.DictWriter(f, fieldnames=FIELDS)
         writer.writeheader()
         writer.writerows(rows)
+    # A suite run's manifest, as every run writes one: these fixtures read no /data file (7 Nov 2026:
+    # without one, compare can't tell which input a run read, and refuses).
+    manifest = directory / "manifest.json"
+    if not manifest.exists():
+        manifest.write_text(json.dumps({"schema": 1, "invocations": [{"datasets": {}}]}), encoding="utf-8")
     return path
 
 
@@ -60,6 +65,107 @@ def output(main, argv) -> str:
     with contextlib.redirect_stdout(out):
         main(argv)
     return out.getvalue()
+
+
+class LoadedInputs(unittest.TestCase):
+    """Review r1 of pkg/stage-data, R1-W1 (7 Nov 2026): lubm-10 and lubm-100 became a new release
+    (their sorted distinct lines), and `compare` called a new LUBM result faster than an old one
+    without saying the two had loaded other bytes. A case's code-change verdict needs the same
+    frozen input files, byte for byte, on both sides; a form pin never stands in for them."""
+    OLD, NEW = "66f44fa8" + "0" * 56, "85b6ccc3" + "0" * 56
+
+    def report(self, ms, inputs=None, case="rdfs-full-lubm10"):
+        record = {"case": case, "status": "ok", "samples": {"reason.p50_ms": [ms, ms]}, "metric": ms}
+        if inputs is not None:
+            record["inputs"] = inputs
+        return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
+                "started": "2026-11-07T16:00:00", "records": [dict(record), dict(record)]}
+
+    def compare(self, base, new):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = compare.compare_reports(base, new)
+        return code, out.getvalue()
+
+    def test_an_old_release_against_the_new_one_gives_no_code_change_verdict(self):
+        old = {"lubm-10.nt": self.OLD, "univ-bench.nt": "u" * 64}
+        new = {"lubm-10.nt": self.NEW, "univ-bench.nt": "u" * 64}
+        code, text = self.compare(self.report(100.0, old), self.report(50.0, new))
+        self.assertIn("different input", text)
+        self.assertIn("lubm-10.nt", text)
+        self.assertNotIn("faster", text)
+        self.assertEqual(code, 2, text)  # nothing left that compares
+
+    def test_a_case_whose_loaded_bytes_aren_t_known_gets_no_verdict(self):
+        code, text = self.compare(self.report(100.0), self.report(50.0, {"lubm-10.nt": self.NEW, "univ-bench.nt": "u" * 64}))
+        self.assertIn("input unknown", text)
+        self.assertNotIn("faster", text)
+        self.assertEqual(code, 2, text)
+        # A file whose bytes a run couldn't read (the Docker runtime's volume) is unknown on both
+        # sides alike: never "the same".
+        unread = {"lubm-10.nt": None, "univ-bench.nt": None}
+        code, text = self.compare(self.report(100.0, unread), self.report(50.0, unread))
+        self.assertIn("input unknown", text)
+        self.assertNotIn("faster", text)
+
+    def test_the_same_bytes_compare_as_before(self):
+        same = {"lubm-10.nt": self.NEW, "univ-bench.nt": "u" * 64}
+        code, text = self.compare(self.report(100.0, same), self.report(50.0, same))
+        self.assertIn("faster", text)
+        self.assertNotIn("different input", text)
+        self.assertEqual(code, 0, text)
+
+    def suite_run(self, directory, ms, datasets=None, digests=None):
+        path = write(directory, [load(), query("q1", ms), query("q1", ms, run=2), query("q1", ms, run=3)])
+        invocation = {"machine": {"host": "fixture", "governor": "performance"}, "started": "2026-11-07T16:00:00",
+                      "datasets": datasets or {}}
+        if digests is not None:
+            invocation["dataset_sha256"] = digests
+        (directory / "manifest.json").write_text(json.dumps({"schema": 1, "invocations": [invocation]}),
+                                                 encoding="utf-8")
+        return path
+
+    def test_suite_results_of_another_release_give_no_verdict(self):
+        """The orchestrator, 7 Nov 2026 (16:55): suite results are compared by their own path
+        (compare.main -> compare_pairs), which printed faster or slower across another release of a
+        dataset. The same rule holds there: the /data files both runs read, the same bytes, or no
+        verdict; without recorded hashes, another size is another input and the same size unknown."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            old = self.suite_run(d / "old", 100, {"/data/lubm-10.nt": 231509261})
+            new = self.suite_run(d / "new", 50, {"/data/lubm-10.nt": 224996086})
+            text = output(compare.main, [str(old), str(new)])
+            self.assertIn("different input", text)
+            self.assertNotIn("faster", text)
+            self.assertEqual(compare.main([str(old), str(new)]), 2)
+            same_size = self.suite_run(d / "same-size", 50, {"/data/lubm-10.nt": 231509261})
+            self.assertIn("input unknown", output(compare.main, [str(old), str(same_size)]))
+            # Recorded hashes decide: the same bytes compare as before.
+            a = self.suite_run(d / "a", 100, {"/data/lubm-10.nt": 1}, {"/data/lubm-10.nt": "s" * 64})
+            b = self.suite_run(d / "b", 50, {"/data/lubm-10.nt": 1}, {"/data/lubm-10.nt": "s" * 64})
+            text = output(compare.main, [str(a), str(b)])
+            self.assertNotIn("different input", text)
+            self.assertNotIn("input unknown", text)
+            self.assertIn("faster", text)
+
+    def test_a_perf_lab_case_compares_on_the_same_bytes_and_is_refused_on_others(self):
+        """The orchestrator, 7 Nov 2026 (17:12): leads compare perf-lab runs (the `lab-*` cases, the
+        perf lab through fast.py) for counts; their records say what they loaded like every case."""
+        same = {"olympics.nt": "o" * 64}
+        code, text = self.compare(self.report(100.0, same, case="lab-olympics"),
+                                  self.report(50.0, same, case="lab-olympics"))
+        self.assertIn("faster", text)
+        self.assertEqual(code, 0, text)
+        code, text = self.compare(self.report(100.0, same, case="lab-olympics"),
+                                  self.report(50.0, {"olympics.nt": "p" * 64}, case="lab-olympics"))
+        self.assertIn("different input", text)
+        self.assertNotIn("faster", text)
+        self.assertEqual(code, 2, text)
+
+    def test_a_case_of_generated_data_alone_needs_no_recorded_inputs(self):
+        code, text = self.compare(self.report(100.0, case="rl-hierarchy"), self.report(50.0, case="rl-hierarchy"))
+        self.assertIn("faster", text)
+        self.assertEqual(code, 0, text)
 
 
 class Contracts(unittest.TestCase):

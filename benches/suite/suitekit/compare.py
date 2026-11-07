@@ -24,6 +24,10 @@ order, so that nothing lost hides behind a time:
 Runs of different hosts, or of one host under different configurations (benches/hosts.toml
 `config`, or a different CPU governor read by the runs), are not compared: compare exits 2
 unless --allow-host-change, and then flags every verdict as no evidence of a code change.
+Of two fast-suite reports, a case whose two sides didn't load the same frozen input files, byte
+for byte (each record's `inputs`), or don't say which, gets no verdict: it is listed as a
+different or unknown input, no evidence of a code change, and compare exits 2 when no case is
+left (7 Nov 2026: lubm-10/100's new release; a form pin never stands in for the bytes).
 
 BASE and NEW are fast-suite reports (`.json`: the full report, or a compact record that
 names it), perf-lab reports (`.json` with `queries`), or suite results (directories or
@@ -488,14 +492,112 @@ def host_check(base: list[dict | None], new: list[dict | None], allow: bool) -> 
     return None
 
 
+def frozen_files(case: dict) -> list[str]:
+    """The frozen dataset files a registry case reads (`volume:` specs, a concatenation's parts too)."""
+    specs = [case.get("data", ""), *([case["data_alt"]] if case.get("data_alt") else []), *case.get("extra", [])]
+    specs += [p for s in specs if s.startswith("concat:") for p in s[len("concat:"):].split("+")]
+    return sorted({s[len("volume:"):] for s in specs if s.startswith("volume:")})
+
+
+def loaded_inputs(report: dict) -> dict[str, dict | None]:
+    """Per case, the byte SHA-256 of each frozen file its records say they loaded (fast.py run's
+    record `inputs`): one mapping, or None where a record doesn't say or two records disagree."""
+    out: dict[str, dict | None] = {}
+    for r in report.get("records", []):
+        seen = r.get("inputs")
+        if r["case"] not in out:
+            out[r["case"]] = seen
+        elif out[r["case"]] != seen:
+            out[r["case"]] = None
+    return out
+
+
+def input_check(base_report: dict, new_report: dict) -> dict[str, str]:
+    """The cases whose two sides didn't load the same frozen input bytes, or don't say which, with
+    why: no verdict of theirs is evidence of a code change (review r1 of pkg/stage-data, R1-W1, 7 Nov
+    2026: lubm-10/100's new release made an old result "slower" than a new one). A case reading no
+    frozen file (generated data, the generator part of the code compared) needs none recorded."""
+    from . import cases as registry
+    reads = {c["name"]: frozen_files(c) for c in registry.load()}
+    base, new = loaded_inputs(base_report), loaded_inputs(new_report)
+    out = {}
+    for case in sorted(set(base) & set(new)):
+        if base[case] is None and new[case] is None and not reads.get(case, ["?"]):
+            continue  # generated data alone: nothing frozen to record
+        if why := input_difference(base[case], new[case]):
+            out[case] = why
+    return out
+
+
+def input_difference(base: dict | None, new: dict | None, base_bytes: dict | None = None,
+                     new_bytes: dict | None = None) -> str | None:
+    """The one input rule of both comparison paths (fast-suite reports, suite results): why the two
+    sides' frozen input files (file -> its byte SHA-256, None: not known; the whole mapping None: not
+    recorded) aren't the same bytes, or None when they are. Without hashes, another size (`*_bytes`)
+    is another input; the same size is unknown, never "the same"."""
+    if base is None or new is None:
+        side = "either side" if base is None and new is None else ("the base" if base is None else "the new run")
+        return f"input unknown: {side} doesn't record the bytes it loaded"
+    files = sorted(set(base) | set(new))
+    sizes = lambda f: ((base_bytes or {}).get(f), (new_bytes or {}).get(f))  # noqa: E731
+    differ = [f for f in files if (base.get(f) and new.get(f) and base[f] != new[f])
+              or (None not in sizes(f) and sizes(f)[0] != sizes(f)[1])]
+    if differ:
+        return "different input: " + "; ".join(
+            f"{f} {('sha256 ' + str(base.get(f))[:12]) if base.get(f) else str(sizes(f)[0]) + ' bytes'} in the base, "
+            f"{('sha256 ' + str(new.get(f))[:12]) if new.get(f) else str(sizes(f)[1]) + ' bytes'} in the new run"
+            for f in differ)
+    unknown = [f for f in files if not base.get(f) or not new.get(f)]
+    if unknown:
+        return f"input unknown: no recorded SHA-256 of {', '.join(unknown)} on both sides"
+    return None
+
+
+def suite_inputs(paths: list[Path]) -> tuple[dict | None, dict]:
+    """The /data files suite results read (the manifest.json beside each: `datasets`, their sizes,
+    and `dataset_sha256`): file -> SHA-256 (None: not recorded, or two invocations disagree), and
+    file -> size; (None, {}) where a manifest is missing."""
+    hashes: dict = {}
+    sizes: dict = {}
+    for path in dict.fromkeys(p.resolve() for p in paths):
+        try:
+            invocations = json.loads((path.parent / "manifest.json").read_text(encoding="utf-8"))["invocations"]
+        except (OSError, ValueError, KeyError):
+            return None, {}
+        for i in invocations:
+            digests = i.get("dataset_sha256") or {}
+            for f, size in (i.get("datasets") or {}).items():
+                sha = digests.get(f)
+                if f in hashes and (hashes[f] != sha or sizes.get(f) != size):
+                    hashes[f] = None
+                    sizes[f] = sizes.get(f) if sizes.get(f) == size else None
+                else:
+                    hashes.setdefault(f, sha)
+                    sizes.setdefault(f, size)
+    return hashes, sizes
+
+
 def compare_reports(base_report: dict, new_report: dict, min_ms: float = 2.0, allow_host_change: bool = False) -> int:
-    """Two fast-suite (or perf-lab) reports; the exit status."""
+    """Two fast-suite (or perf-lab) reports; the exit status: 2 also where no case loaded the same
+    input on both sides."""
     if not math.isfinite(min_ms) or min_ms < 0:
         raise ValueError("--min-ms must be finite and nonnegative")
     refused = host_check([identity(base_report.get("machine"), base_report.get("started"))],
                          [identity(new_report.get("machine"), new_report.get("started"))], allow_host_change)
     if refused:
         return refused
+    other_input = input_check(base_report, new_report)
+    if other_input:
+        print("## Inputs\n")
+        for case, why in other_input.items():
+            print(f"- {case}: {why}; not compared: no evidence of a code change")
+        print()
+        keep = lambda report: {**report, "records": [r for r in report.get("records", [])  # noqa: E731
+                                                     if r["case"] not in other_input]}
+        base_report, new_report = keep(base_report), keep(new_report)
+        if not base_report["records"] or not new_report["records"]:
+            print("REFUSED: no case loaded the same input on both sides")
+            return 2
     for name, report in (("base", base_report), ("new", new_report)):
         if report.get("reps", 2) < 2:
             print(f"warning: the {name} run has one repetition: its spread is unknown, so a verdict "
@@ -733,6 +835,14 @@ def main(argv: list[str]) -> int:
     refused = host_check(manifest_identities(base_files), manifest_identities(new_files), args.allow_host_change)
     if refused:
         return refused
+    # The input rule of compare_reports() (input_difference()), over the /data files the runs read:
+    # another release of a dataset is no evidence of a code change (the orchestrator, 7 Nov 2026).
+    (base_sha, base_bytes), (new_sha, new_bytes) = suite_inputs(base_files), suite_inputs(new_files)
+    if base_sha != {} or new_sha != {}:
+        if why := input_difference(base_sha, new_sha, base_bytes, new_bytes):
+            print(f"## Inputs\n\n- {why}\n\nREFUSED: the runs didn't read the same input: no time or memory "
+                  "verdict would be evidence of a code change")
+            return 2
     base = collect(base_files, systems, args.include_restricted)
     new = collect(new_files, systems, args.include_restricted)
     print(f"# {args.new} against {args.base}\n")

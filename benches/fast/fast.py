@@ -1425,6 +1425,41 @@ def file_digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+_DIGESTS: dict = {}
+
+
+def case_inputs(case: dict) -> dict[str, str | None]:
+    """The byte SHA-256 of each frozen file the case reads (`volume:`, a concatenation's parts too),
+    as this run found it, None where it isn't there: from FAST_DATA/PREPARED.json where it holds the
+    file unchanged, else hashed once a run. A record carries them so that a comparison can tell runs
+    of the same input from runs of another release (compare.input_check(); review r1 of
+    pkg/stage-data, R1-W1, 7 Nov 2026)."""
+    from suitekit.compare import frozen_files
+    if "prepared" not in _DIGESTS:
+        try:
+            _DIGESTS["prepared"] = json.loads((FAST_DATA / PREPARED).read_text(encoding="utf-8")).get("files", {})
+        except (OSError, ValueError):
+            _DIGESTS["prepared"] = {}
+    out = {}
+    for name in frozen_files(case):
+        try:
+            # The Docker runtime reads them from a volume this process can't hash: unknown, said so.
+            path = Path(native(data_file(f"volume:{name}"))) if RUNTIME == "native" else None
+            stat = path.stat() if path else None
+        except (OSError, RuntimeError):
+            stat = None
+        if stat is None:
+            out[name] = None
+            continue
+        key = (path.as_posix(), stat.st_size, stat.st_mtime_ns)
+        if key not in _DIGESTS:
+            was = _DIGESTS["prepared"].get(path.as_posix(), {})
+            same = (was.get("bytes"), was.get("mtime_ns")) == (stat.st_size, stat.st_mtime_ns)
+            _DIGESTS[key] = was["sha256"] if same and was.get("sha256") else file_digest(path)
+        out[name] = _DIGESTS[key]
+    return out
+
+
 # One copy of a host's prepared data for every gate (NRESE_FAST_SHARED; release-gate.sh sets it):
 # each file under FAST_DATA lives once, read-only, as SHARED/blobs/<sha256>, hardlinked into each
 # gate's FAST_DATA, and SHARED/index/<generator>.json says which files a data file and its
@@ -1679,6 +1714,7 @@ def run(args) -> int:
             record["verdict"] = verdict(case, record)
             # The case's own time, without the wait for the quiet slot.
             record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
+            record["inputs"] = case_inputs(case)  # the frozen bytes it loaded (compare.input_check)
             report["records"].append(record)
             mark = "" if record["status"] == record.get("expected_outcome", "ok") else "  <<<"
             metric = record.get("metric")
@@ -1894,6 +1930,7 @@ def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict],
                           "expected_outcome": case.get("outcome", "ok")}
             record["verdict"] = verdict(case, record)
             record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
+            record["inputs"] = case_inputs(case)  # the frozen bytes it loaded (compare.input_check)
             record.update(started_ns=start_ns, finished_ns=time.time_ns(), block=args.block, layout=args.layout,
                           side=name, run=run)
             reports[(name, run)]["records"].append(record)
