@@ -40,6 +40,7 @@ pub mod service;
 #[cfg(test)]
 mod tests;
 pub mod unnamed;
+mod violations;
 pub mod vocabulary;
 
 pub use capability::{CapabilityMaturity, ReasonerCapability, ReasonerFeature, ReasonerRunStatus};

@@ -19,6 +19,13 @@ pub enum EngineError {
     UnsupportedTerm,
     #[error("the write-ahead log failed earlier; reopen the engine to recover")]
     WalPoisoned,
+    /// A bulk load or rematerialisation whose checkpoint may be on disk without its revision
+    /// being served (its placement's outcome unknown, or it couldn't be mapped): the engine
+    /// takes no more writes, and reopening it recovers whatever is on disk.
+    #[error(
+        "revision {revision} may be committed but isn't served; the engine takes no more writes: reopen it to recover what is on disk"
+    )]
+    CommitUnsettled { revision: u64 },
     #[error("transaction too large for one WAL record ({bytes} bytes); use the bulk loader")]
     TransactionTooLarge { bytes: u64 },
     #[error("data directory {0} is locked by another process")]
@@ -28,6 +35,11 @@ pub enum EngineError {
     /// A speculative transaction ([`crate::Engine::speculative`]) was asked to commit.
     #[error("a speculative transaction can't commit")]
     Speculative,
+    /// The engine's writer or checkpoint slot (named) is held, and the caller is a Rayon pool
+    /// thread, which never waits for it: the holder's parallel work may need that thread.
+    /// Retry later, or ask from a thread of no pool.
+    #[error("the engine's {0} slot is busy, and a Rayon pool thread doesn't wait for it")]
+    SlotBusy(&'static str),
     /// The write-ahead log no longer holds the records a replica asked for
     /// ([`crate::Engine::log_since`]): it starts again from an image of revision `oldest`
     /// or later.

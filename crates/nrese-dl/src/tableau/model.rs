@@ -79,7 +79,7 @@ impl Engine<'_> {
                 }
             }
         }
-        for e in &self.g.edges {
+        for e in self.g.live_edges() {
             if let (Some(a), Some(b)) = (at(e.from), at(e.to)) {
                 m.roles.push((self.p.roles[e.role as usize], a, b));
             }
@@ -91,7 +91,7 @@ impl Engine<'_> {
         }
         // Data values: an element's own edges to concrete nodes (a blocked node's are its
         // blocker's).
-        for e in &self.g.edges {
+        for e in self.g.live_edges() {
             if element[e.from as usize] != NONE
                 && let Some(v) = witness.get(&e.to)
             {
@@ -164,7 +164,7 @@ impl Engine<'_> {
         // blocker's parent: a blocked node has its own with its parent, labelled alike
         // (pairwise blocking).
         let parent = |x: u32| self.g.nodes[x as usize].parent;
-        for e in &self.g.edges {
+        for e in self.g.live_edges() {
             let (from, to) = (e.from as usize, e.to as usize);
             if element[from] == NONE || element[to] == NONE {
                 continue;
@@ -196,7 +196,7 @@ impl Engine<'_> {
             }
         }
         // Data values: a directly blocked node has its blocker's.
-        for e in &self.g.edges {
+        for e in self.g.live_edges() {
             let Some(v) = witness.get(&e.to) else {
                 continue;
             };

@@ -3,6 +3,7 @@ mod admin_dataset;
 mod ai;
 mod api_v1;
 pub(crate) mod authentication;
+mod blocking;
 mod cache_api;
 mod classification;
 mod console;
