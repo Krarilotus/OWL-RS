@@ -2993,9 +2993,6 @@ pub(crate) fn check<S: Source + ?Sized>(
         // budget without room for its group can't make consistent data look inconsistent.
         let mut id = None;
         for start in (0..job.drivers()).step_by(MORSEL) {
-            if stop() {
-                return Err(Interrupted::default());
-            }
             let range = start..(start + MORSEL).min(job.drivers());
             let stopped = job.run_until(source, range, &mut poll, &mut |bindings| {
                 // A refused report stops the walk: the state is inconsistent whatever

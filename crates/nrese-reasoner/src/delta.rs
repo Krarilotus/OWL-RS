@@ -637,9 +637,7 @@ fn update_body<B: Base + ?Sized>(
                 // Independent per candidate: in parallel.
                 candidates = candidates
                     .into_par_iter()
-                    .filter(|&f| {
-                        stop() || !old_program.derivable_by(&left, f, &non_recursive, false, stop)
-                    })
+                    .filter(|&f| !old_program.derivable_by(&left, f, &non_recursive, false, stop))
                     .collect();
                 check_stop()?;
             }
@@ -745,9 +743,7 @@ fn update_body<B: Base + ?Sized>(
             let by_rules: Vec<Triple> = open
                 .par_iter()
                 .copied()
-                .filter(|&f| {
-                    !stop() && program.derivable_by(&remaining, f, &not_equality, true, stop)
-                })
+                .filter(|&f| program.derivable_by(&remaining, f, &not_equality, true, stop))
                 .collect();
             let by_rules: HashSet<Triple> = by_rules.into_iter().collect();
             check_stop()?;
@@ -813,8 +809,7 @@ fn update_body<B: Base + ?Sized>(
         .par_iter()
         .copied()
         .filter(|&fact| {
-            !stop()
-                && !base.is_asserted(fact)
+            !base.is_asserted(fact)
                 && settled.derivable_with(&remaining, fact, !recloses.contains(&fact[1]), stop)
         })
         .collect();
