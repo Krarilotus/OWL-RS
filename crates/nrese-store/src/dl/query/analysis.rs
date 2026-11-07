@@ -20,7 +20,8 @@ pub(crate) struct Analysis {
     /// derived from one may be no term of its own.
     computed: HashSet<String>,
     /// An `owl:sameAs` read whose two ends can be one term: a triple pattern with a
-    /// variable or blank node at an end or one constant at both, or any path step.
+    /// variable or blank node at an end or one constant at both, or any path step. A
+    /// variable predicate and a negated property set count as possible `owl:sameAs` reads.
     reflexive_same_as: bool,
 }
 
@@ -210,10 +211,13 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
             Node::Pattern(p) => {
                 let op = match p {
                     GraphPattern::Bgp { patterns } => {
+                        // A variable predicate can be owl:sameAs.
                         analysis.reflexive_same_as |= patterns.iter().any(|t| {
-                            matches!(&t.predicate, NamedNodePattern::NamedNode(p)
-                                if p.as_str() == OWL_SAME_AS)
-                                && can_be_reflexive(t)
+                            let same_as = match &t.predicate {
+                                NamedNodePattern::NamedNode(p) => p.as_str() == OWL_SAME_AS,
+                                NamedNodePattern::Variable(_) => true,
+                            };
+                            same_as && can_be_reflexive(t)
                         });
                         analysis.reads.extend(patterns.iter().map(pattern_reads));
                         analysis.atoms.extend(patterns.iter().map(atom_of));
@@ -223,9 +227,10 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
                         let from = analysis.reads.len();
                         path_reads(path, &mut analysis.reads);
                         // A step's ends are nodes the query doesn't fix: any can be one.
+                        // A negated property set (no predicate) can read owl:sameAs.
                         analysis.reflexive_same_as |= analysis.reads[from..]
                             .iter()
-                            .any(|(p, _)| p.as_deref() == Some(OWL_SAME_AS));
+                            .any(|(p, _)| p.as_deref().is_none_or(|p| p == OWL_SAME_AS));
                         // A path's steps meet at nodes the query doesn't see.
                         let steps = analysis.reads[from..]
                             .iter()
