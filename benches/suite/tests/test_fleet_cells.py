@@ -32,6 +32,8 @@ class FleetCells(unittest.TestCase):
 
     def fleet(self, *args):
         self.calls.append(args)
+        if "--json" in args:
+            return 0, json.dumps({"jobs": [{"fleet": {"verdict": "now"}, "hosts": []}]})
         return 0, "set:accepted job:member"
 
     def run_plan(self, *extra):
@@ -81,7 +83,7 @@ class FleetCells(unittest.TestCase):
         first = self.document()["set"]
         self.assertEqual(self.run_plan("--budget-hours", "50", "--submit")[0], 0)
         self.assertEqual(self.document()["set"], first)
-        self.assertEqual([c[0] for c in self.calls], ["check", "estimate", "submit"] * 2)
+        self.assertEqual([c[0] for c in self.calls], ["check", "check", "estimate", "submit"] * 2)
         self.assertIn("request", first)
         self.assertEqual(self.run_plan("--nrese", "b" * 40, "--budget-hours", "50")[0], 0)
         tokens = {tomllib.loads(p.read_text())["set"]["request"] for p in self.out.glob("*.set.toml")}
@@ -125,6 +127,33 @@ class FleetCells(unittest.TestCase):
                 code = suite.main(["suite.py", "fleet", "--_member"])
         self.assertEqual(code, 2, output.getvalue())
         self.assertIn("restricted", output.getvalue())
+
+    def test_cells_have_separate_jobs_and_adapter_capabilities(self):
+        # Master 21:24: one job per cell; resource basis and workload needs remain explicit.
+        code, text = self.run_plan("--systems", "qlever,jena", "--budget-hours", "80")
+        self.assertEqual(code, 0, text)
+        jobs = self.document()["job"]
+        self.assertEqual(len(jobs), 2)
+        for job in jobs:
+            payload = json.loads(job["env"]["SUITE_CELL"])
+            self.assertEqual(len(payload["group"]["systems"]), 1)
+            system = payload["group"]["systems"][0]
+            self.assertEqual("java" in job["requires"]["has"], system == "jena")
+        self.assertIn("resource basis", text)
+
+    def test_permanently_unplaceable_cell_is_omitted_from_the_set(self):
+        # Master 21:24: one impossible member cannot sink the placeable cells' set.
+        def checked(*args):
+            if "--json" in args and "qlever" in args[1]:
+                return 1, json.dumps({"jobs": [{"fleet": {"verdict": "never"},
+                                              "hosts": [{"host": "h", "reason": "needs more RAM"}]}]})
+            return self.fleet(*args)
+        with patch.object(abba.rg, "fleet_call", side_effect=checked):
+            code, text = self.run_plan("--systems", "qlever,jena", "--budget-hours", "80")
+        self.assertEqual(code, 0, text)
+        self.assertEqual(len(self.document()["job"]), 1)
+        self.assertIn("omit qlever", text)
+        self.assertIn("needs more RAM", text)
 
 
 if __name__ == "__main__":
