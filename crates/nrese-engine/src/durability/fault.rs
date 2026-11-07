@@ -15,6 +15,8 @@ thread_local! {
     pub(crate) static FAIL_MAP: Cell<bool> = const { Cell::new(false) };
     /// Syncing `wal-cut/` after a copy is placed (or found) fails.
     pub(crate) static FAIL_CUT_DIR_SYNC: Cell<bool> = const { Cell::new(false) };
+    /// The wall clock, microseconds since 1970, as commits on this thread read it.
+    pub(crate) static CLOCK: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 /// An error if `point` is set on this thread.
