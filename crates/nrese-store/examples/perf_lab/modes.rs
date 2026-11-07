@@ -366,20 +366,26 @@ pub fn classification(
         .collect();
     let (p50, _, max) = percentiles(&mut times);
     eprintln!(
-        "classification ({}): {} subsumptions, {} unsatisfiable, consistent {}, {} reasons it may be incomplete; p50 {p50:.1} ms",
+        "classification ({}): {} subsumptions, {} unsatisfiable, {}, {} reasons it may be incomplete; p50 {p50:.1} ms",
         report.engine,
         report.subsumptions.len(),
         report.unsatisfiable.len(),
-        report.consistent,
+        report.consistency.as_str(),
         report.incomplete.len()
     );
+    // `consistent` (`null` where undecided) stays for harnesses that check it.
+    let consistent = match report.consistency.decided() {
+        Some(decided) => decided.to_string(),
+        None => "null".to_owned(),
+    };
     Ok(format!(
-        "{{\"engine\": {:?}, \"subsumptions\": {}, \"unsatisfiable\": {}, \"consistent\": {}, \"incomplete\": {}, \
-         \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}, \"samples_ms\": [{}]}}",
+        "{{\"engine\": {:?}, \"subsumptions\": {}, \"unsatisfiable\": {}, \"consistency\": {:?}, \
+         \"consistent\": {consistent}, \"incomplete\": {}, \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}, \
+         \"samples_ms\": [{}]}}",
         report.engine,
         report.subsumptions.len(),
         report.unsatisfiable.len(),
-        report.consistent,
+        report.consistency.as_str(),
         report.incomplete.len(),
         samples.join(", ")
     ))

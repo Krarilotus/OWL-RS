@@ -151,10 +151,12 @@ On the combined URL a form is a query or an update by its field, and a body by i
 
 `GET /dataset/classification`: the OWL 2 DL class hierarchy of the asserted statements (all graphs), computed on request by the DL engines ([design](../design/owl2-dl.md) §7): the context core where its Horn stage takes the ontology (EL and Horn ontologies), else the hypertableau driver (known and possible subsumers, tests in parallel on `dl.threads` workers, within `dl.timeout`). The result is kept per revision, so a second request on an unchanged store is free.
 
-- `application/json` (the default): `subsumptions` (pairs `[sub, super]` of class IRIs, every one, equivalent classes both ways, without `owl:Thing`), `unsatisfiable` (classes that can have no instance), `equivalent_to_thing`, `consistent` (false: the ontology has no model, and every class is unsatisfiable), `engine` (`context-core` or `tableau`), `complete` and `incomplete` (why subsumptions may be missing: a budget ran out, or a construct the engines lack; what is listed is entailed either way), `micros`
-- `application/n-triples`: the same as `rdfs:subClassOf` statements, `owl:Nothing` as the superclass of unsatisfiable classes
+- `application/json` (the default): `subsumptions` (pairs `[sub, super]` of class IRIs, every one, equivalent classes both ways, without `owl:Thing`), `unsatisfiable` (classes that can have no instance), `equivalent_to_thing`, `consistent` (`true`; `false`: the ontology has no model, and nothing is listed; `null`: not decided) with `consistency` (`consistent`, `inconsistent` or `unknown`), `engine` (`context-core` or `tableau`), `complete` (nothing left out and the consistency decided) and `incomplete` (why subsumptions may be missing: a budget ran out, or a construct the engines lack; what is listed is entailed either way), `micros`
+- `application/n-triples`: the same as `rdfs:subClassOf` statements, `owl:Nothing` as the superclass of unsatisfiable classes; an inconsistent ontology as the one statement `owl:Thing rdfs:subClassOf owl:Nothing`
 
-`GET /dataset/realisation`: each named individual's types under OWL 2 DL, by the same engines (a type is tested by whether its negation makes the ontology inconsistent, candidates cut by the models found). JSON: `types` (individual IRI → every named class it is an instance of), `consistent`, `engine`, `complete`, `incomplete`, `micros`; N-Triples: `rdf:type` statements.
+Both forms carry `NRESE-Completeness` (regime `owl2-dl`, as query answers do): `complete`, or `sound-only` with the reasons (`dl: …`), an undecided consistency among them.
+
+`GET /dataset/realisation`: each named individual's types under OWL 2 DL, by the same engines (a type is tested by whether its negation makes the ontology inconsistent, candidates cut by the models found). JSON: `types` (individual IRI → every named class it is an instance of; none for an inconsistent ontology), `consistent` and `consistency` (as above), `engine`, `complete`, `incomplete`, `micros`; N-Triples: `rdf:type` statements, or an inconsistency's one statement as above; the same `NRESE-Completeness` header.
 
 The hierarchy isn't stored; the reasoning modes materialise instance-level inferences (see [config-reference.md](config-reference.md)).
 
@@ -240,7 +242,7 @@ Isolated checks of pinned inputs, for the Datamodel Workflow and any other clien
 Every answer is 200 with a terminal status (`completed`, `failed`, `timeout`, `unsupported`) and echoes the request's identity. A request that isn't a draft-check request is 400; a larger one than the upload limit, 413.
 
 Limits today:
-- One profile, `owl2-rl`: consistency by the OWL 2 RL rules, unsatisfiable classes by the OWL 2 EL classifier. Axioms either skipped are reported as unsupported, and the answer is then not complete.
+- One profile, `owl2-rl`, under the semantics `nrese:draft-check/2`: `logical_consistent` is `false` where the OWL 2 RL rules or the OWL 2 DL engines find no model, `true` where neither does and both decided, and `null` where it isn't decided; unsatisfiable classes by the OWL 2 DL classification, none listed for an inconsistent input. Axioms either skipped, and an undecided verdict, are reported as unsupported, and the answer is then not complete. (`/1`'s `logical_consistent` was the RL rules' alone; it is no longer served.)
 - SHACL Core only; SHACL-SPARQL, SHACL-AF and `sh:entailment` are reported as unsupported.
 - A time limit above the server's query timeout is refused, not shortened.
 

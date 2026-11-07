@@ -22,12 +22,13 @@ use nrese_owl::{Ontology, Term};
 use super::driver::{insert_sorted, intersect_opt, reason, union_into};
 use super::{Classification, Deadline, Options, Profile, Taxonomy, classify};
 use crate::tableau::{self, Answer, At, Labels, Prepared, Probe, ProbeOutcome, Want};
+use crate::verdict::Verdict;
 
 const THING: &str = "http://www.w3.org/2002/07/owl#Thing";
 const NOTHING: &str = "http://www.w3.org/2002/07/owl#Nothing";
 
 /// The individuals' types.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Realisation {
     /// The taxonomy the types are over.
     pub taxonomy: Taxonomy,
@@ -55,20 +56,20 @@ pub fn realise(ontology: &Ontology, options: &Options) -> Realisation {
         individuals: individuals.clone(),
         incomplete: taxonomy.incomplete.clone(),
         profile: taxonomy.profile.clone(),
-        ..Realisation::default()
+        types: Vec::new(),
+        taxonomy,
     };
-    if !taxonomy.classification.consistent {
+    if r.taxonomy.classification.consistency == Verdict::Inconsistent {
         // Every individual is an instance of every class: nothing to list.
-        r.types = vec![taxonomy.classification.classes.clone(); individuals.len()];
-        r.taxonomy = taxonomy;
+        r.types = vec![r.taxonomy.classification.classes.clone(); individuals.len()];
         return r;
     }
     let t = Instant::now();
     let prepared = tableau::prepared(ontology);
     let (normalised, _) = super::clauses(&prepared, options);
-    let classes = &taxonomy.classification.classes;
+    let classes = &r.taxonomy.classification.classes;
     let program = Prepared::new(&prepared, &normalised, classes, &individuals);
-    let mut work = Work::new(&taxonomy.classification, &individuals, options, deadline);
+    let mut work = Work::new(&r.taxonomy.classification, &individuals, options, deadline);
     work.run(&program);
     r.types = work
         .types
@@ -83,7 +84,6 @@ pub fn realise(ontology: &Ontology, options: &Options) -> Realisation {
     r.profile.compile += program.compile_time();
     r.profile.realisation = t.elapsed();
     r.profile.total = started.elapsed();
-    r.taxonomy = taxonomy;
     r
 }
 
@@ -332,7 +332,7 @@ impl Realisation {
     /// type; `name` gives an IRI.
     pub fn canonical(&self, name: &dyn Fn(Term) -> String) -> String {
         let c = &self.taxonomy.classification;
-        if !c.consistent {
+        if c.consistency == Verdict::Inconsistent {
             // The runner answers `inconsistent` instead of a realisation.
             return String::new();
         }
