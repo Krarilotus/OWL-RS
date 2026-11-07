@@ -1660,12 +1660,20 @@ DATASET_MAKERS = {
     "perf_lab generate support-stress": [],
 }
 SUPPORT_STRESS = "perf_lab generate support-stress"
+# Makers whose output a copy can meet only by its form: riot labels the blank nodes afresh on every
+# make. Their files count as makeable only with a form pin (`rdfc_sha256`); one without keeps the
+# assets (sol-loop r1 S1: owl2bench-ql-1.nt).
+FORM_ONLY = {"bash benches/reasoning/prepare-owl2bench.sh"}
 
 
 def maker_of(entry: dict) -> tuple[str, list[str]] | None:
-    """The job-run maker of a frozen file (its DATASET_MAKERS start and what it needs), or None."""
+    """The job-run maker of a frozen file (its DATASET_MAKERS start and what it needs), or None: none
+    here, or one whose copies can't meet the file's pins."""
     made = entry.get("made_by", "")
-    return next(((start, needs) for start, needs in DATASET_MAKERS.items() if made.startswith(start + " ")), None)
+    found = next(((start, needs) for start, needs in DATASET_MAKERS.items() if made.startswith(start + " ")), None)
+    if found and found[0] in FORM_ONLY and not entry.get("rdfc_sha256"):
+        return None
+    return found
 
 
 def data_needs(cases: list[dict], datasets: Path = ROOT / "benches" / "datasets.toml") -> list[str]:

@@ -57,6 +57,17 @@ def save(root: Path, catalog: dict):
     (root / "benches/datasets.toml").write_text("\n".join(lines), encoding="utf-8", newline="\n")
 
 
+def refreeze(entry: dict, size: int, sha256: str, today: str) -> dict:
+    """`entry` frozen anew at `size` bytes and `sha256`: new bytes are a new release (dated today),
+    and its form pin (`rdfc_sha256`), the old graph's, goes with them (sol-loop r1 S3: kept, it
+    accepted the old graph). Same bytes: unchanged but for its size."""
+    if entry.get("sha256") != sha256:
+        entry["frozen"] = today
+        entry.pop("rdfc_sha256", None)
+    entry["bytes"], entry["sha256"] = size, sha256
+    return entry
+
+
 class Store:
     """The dataset files: in the Docker volume, or in a directory."""
 
@@ -159,9 +170,10 @@ def main(argv: list[str], workloads: dict, root: Path) -> int:
             entry.setdefault("role", "source" if f.startswith("real/") else "core")
             if f in sources:
                 entry["source"] = sources[f]
-            if entry.get("sha256") != hashes.get(f):
-                entry["frozen"] = today
-            entry["bytes"], entry["sha256"] = size, hashes.get(f, "")
+            if entry.get("rdfc_sha256") and entry.get("sha256") != hashes.get(f):
+                print(f"{f}: its bytes changed: its form pin (rdfc_sha256) was the old graph's and is dropped; "
+                      "compute it anew (crates/rdf/nrese-rdf-io/examples/rdfc.rs) before a job may make it")
+            refreeze(entry, size, hashes.get(f, ""), today)
         catalog["dataset"] = list(by_file.values())
         save(root, catalog)
         print(f"{len(present)} files frozen into benches/datasets.toml")
