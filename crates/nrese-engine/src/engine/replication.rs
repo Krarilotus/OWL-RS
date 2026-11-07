@@ -225,6 +225,7 @@ impl Engine {
                 applied.stopped = true;
                 break;
             }
+            // Within u64: `checked_batch` refused any range that isn't.
             published = published.max(record.dictionary_start + record.keys.len() as u64);
             self.apply_record(record, published)?;
             applied.revision = record.revision;
@@ -273,7 +274,13 @@ impl Engine {
             ));
         }
         for (offset, record) in records.iter().enumerate() {
-            let at = expected.after + 1 + offset as u64;
+            // Revisions from the wire are compared, not added up past u64.
+            let Some(at) = expected.after.checked_add(1 + offset as u64) else {
+                return refuse(format!(
+                    "has record {} past the last revision there is",
+                    record.revision
+                ));
+            };
             if record.revision != at {
                 return refuse(format!(
                     "has record {} where revision {at} goes",
@@ -289,6 +296,20 @@ impl Engine {
                 "ends at revision {last}, its answer says {}",
                 expected.last
             ));
+        }
+        // Each record's dictionary range ends within u64 (a range from the wire is refused,
+        // not added up): checked before anything below adds to it.
+        for record in &records {
+            if record
+                .dictionary_start
+                .checked_add(record.keys.len() as u64)
+                .is_none()
+            {
+                return refuse(format!(
+                    "has record {} whose dictionary entries end past u64",
+                    record.revision
+                ));
+            }
         }
         // A primary's records continue each other's dictionary entries.
         for pair in records.windows(2) {
