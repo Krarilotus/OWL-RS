@@ -12,7 +12,7 @@ use nrese_rdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
 use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 
 use crate::model::{Component, Path, SH, Severity, Shapes};
-use crate::validate::RawResult;
+use crate::validate::{Failures, RawResult};
 
 /// What validating a data graph against a shapes graph found.
 #[derive(Debug, Clone, Default)]
@@ -21,9 +21,17 @@ pub struct ValidationReport {
     /// Validation failures (SHACL §3.6.2): a SPARQL-based constraint that couldn't be
     /// evaluated or reported `?failure`. A report with failures is no verdict.
     pub failures: Vec<String>,
-    /// The report's charge to the envelope of the request that made it, held while the
-    /// report (or a clone of it) lives.
-    _held: Option<Arc<Reservation>>,
+    /// The report's charges to the envelope of the request that made it, held while the
+    /// report (or a clone of it) lives. Declared last: the report is freed, then they go.
+    _held: Option<Arc<Held>>,
+}
+
+/// What a report holds against its request's envelope: its decoded results and the
+/// failures it took over from the validation, with the charge they had there.
+#[derive(Debug)]
+struct Held {
+    _decoded: Reservation,
+    _failures: Reservation,
 }
 
 /// Reports are equal when what they report is: their charge isn't part of it.
@@ -189,7 +197,7 @@ pub(crate) fn decode<V: ReadView>(
     view: &V,
     shapes: &Shapes,
     raw: &[RawResult],
-    failures: Vec<String>,
+    failures: Failures,
     resources: &Resources,
 ) -> Result<ValidationReport, QueryEvaluationError> {
     let budget = Arc::new(resources.memory.part());
@@ -277,16 +285,22 @@ pub(crate) fn decode<V: ReadView>(
                 .collect(),
         });
     }
-    // The terms are freed, and their charge returned; the failures are the report's now.
+    // The terms are freed, and their charge returned.
     drop(terms);
-    for failure in &failures {
-        held.charge(2 * std::mem::size_of::<String>() + failure.len())?;
-    }
     resources.check()?;
+    // The failures, already charged where they were kept, are the report's now, with that
+    // charge: nothing is charged for them again.
+    let Failures {
+        list,
+        held: failures_held,
+    } = failures;
     Ok(ValidationReport {
         results,
-        failures,
-        _held: Some(Arc::new(held)),
+        failures: list,
+        _held: Some(Arc::new(Held {
+            _decoded: held,
+            _failures: failures_held,
+        })),
     })
 }
 

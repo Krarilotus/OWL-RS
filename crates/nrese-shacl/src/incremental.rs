@@ -64,7 +64,6 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     let validator_before = Validator::new(before, shapes, data, resources);
     let validator_after = Validator::new(after, shapes, data, resources);
     let mut introduced: BTreeSet<RawResult> = BTreeSet::new();
-    let mut failures = Vec::new();
     if !changed.is_empty() {
         let rdf_type = graph_after.iri(RDF_TYPE);
         for shape in shapes.targeted() {
@@ -123,10 +122,16 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
             validator_before.release(before_bytes);
         }
     }
-    // A stop in either state is the outcome; only the state after reports its failures.
-    let (after_failures, held_after) = validator_after.into_failures()?;
-    failures.extend(after_failures);
-    let (_, held_before) = validator_before.into_failures()?;
+    // A stop in either state is the outcome: what was introduced is freed before the
+    // validators (and their charges) go.
+    if validator_after.has_stopped() || validator_before.has_stopped() {
+        introduced.clear();
+    }
+    // Only the state after reports its failures, which the report takes over with their
+    // charge; the state before's are dropped now, with theirs.
+    let (failures, held_after) = validator_after.into_failures()?;
+    let (earlier_failures, held_before) = validator_before.into_failures()?;
+    drop(earlier_failures);
     let raw: Vec<RawResult> = introduced.into_iter().collect();
     let report = decode(after, shapes, &raw, failures, resources);
     // The raw results are freed, then their charges returned.
