@@ -206,10 +206,14 @@ pub fn exact_from<'b>(
     let query = Query::new(query);
     let chunks = start / CHUNK..vectors.chunks.len();
     type Part<'b> = Result<ChargedVec<Hit, &'b Budget>, BudgetExceeded>;
-    // The parts' list itself, charged before rayon collects into it (one entry a part).
+    // The parts' list itself: charged, allocated for exactly one entry a part, then filled
+    // by rayon in place (`collect_into_vec` reserves nothing more for room already there;
+    // a plain `collect` would round the allocation up to at least four entries).
     let mut list = Reservation::new(budget);
     list.charge(charged::bytes::<Part<'b>>(budget, chunks.len())?)?;
-    let parts: Vec<Part<'b>> = chunks
+    let mut parts: Vec<Part<'b>> = Vec::with_capacity(chunks.len());
+    list.resize(charged::bytes::<Part<'b>>(budget, parts.capacity())?)?;
+    chunks
         .into_par_iter()
         .map(|c| {
             let mut best = TopK::new(k, budget)?;
@@ -223,7 +227,7 @@ pub fn exact_from<'b>(
             }
             best.into_sorted()
         })
-        .collect();
+        .collect_into_vec(&mut parts);
     let mut best = TopK::new(k, budget)?;
     let mut refused = None;
     for part in parts {
@@ -434,5 +438,35 @@ mod tests {
             drop(found);
             assert_eq!(room.used(), 0);
         }
+    }
+
+    /// Under every budget from none to what it held at its peak, a scan of several parts
+    /// either answers as unlimited or is refused (some parts refused while others finished),
+    /// and holds nothing afterwards either way (review fix check, S2).
+    #[test]
+    fn scans_refused_partway_release_everything() {
+        let vectors = random_vectors(3 * CHUNK + 5, 4, 13);
+        let query = vectors.get(3).to_vec();
+        let unlimited = Budget::unlimited();
+        let truth = exact(&vectors, &query, CHUNK, Metric::L2, &|_| true, &unlimited)
+            .unwrap()
+            .to_vec();
+        let peak = unlimited.peak();
+        let (mut answered, mut refused) = (0, 0);
+        for limit in (0..=peak).step_by((peak / 64).max(1)) {
+            let budget = Budget::new(limit);
+            match exact(&vectors, &query, CHUNK, Metric::L2, &|_| true, &budget) {
+                Ok(found) => {
+                    assert_eq!(*found, truth, "limit {limit}");
+                    answered += 1;
+                }
+                Err(_) => refused += 1,
+            }
+            assert_eq!(budget.used(), 0, "limit {limit}: released");
+        }
+        assert!(
+            answered > 0 && refused > 0,
+            "{answered} answered, {refused} refused"
+        );
     }
 }

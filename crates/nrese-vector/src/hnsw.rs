@@ -599,6 +599,39 @@ mod tests {
         }
     }
 
+    /// Under every budget from none to what it held at its peak, a graph search either
+    /// answers as unlimited or is refused, and holds nothing afterwards either way (review
+    /// fix check, S2).
+    #[test]
+    fn graph_searches_refused_partway_release_everything() {
+        let vectors = random_vectors(2_000, 8, 5);
+        let mut graph = Hnsw::new(Metric::L2, HnswParameters::default());
+        graph.extend(&vectors);
+        let query = vectors.get(7).to_vec();
+        let unlimited = Budget::unlimited();
+        let truth = graph
+            .search(&vectors, &query, 50, 200, &|_| true, &unlimited)
+            .unwrap()
+            .to_vec();
+        let peak = unlimited.peak();
+        let (mut answered, mut refused) = (0, 0);
+        for limit in (0..=peak).step_by((peak / 64).max(1)) {
+            let budget = Budget::new(limit);
+            match graph.search(&vectors, &query, 50, 200, &|_| true, &budget) {
+                Ok(found) => {
+                    assert_eq!(*found, truth, "limit {limit}");
+                    answered += 1;
+                }
+                Err(_) => refused += 1,
+            }
+            assert_eq!(budget.used(), 0, "limit {limit}: released");
+        }
+        assert!(
+            answered > 0 && refused > 0,
+            "{answered} answered, {refused} refused"
+        );
+    }
+
     #[test]
     fn small_and_empty_graphs_answer() {
         let mut graph = Hnsw::new(Metric::Cosine, HnswParameters::default());
