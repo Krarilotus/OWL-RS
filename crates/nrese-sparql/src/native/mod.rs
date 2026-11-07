@@ -1239,6 +1239,10 @@ struct Context<'a> {
     merge_set: Option<crate::dataset::GraphSet>,
     /// The graphs `GRAPH` may name, if the dataset lists them (`FROM NAMED`).
     named: Option<Vec<TermId>>,
+    /// Whether `GRAPH` with another store's name for the default graph reads the store's
+    /// default graph ([`crate::dataset::ResolvedDataset::store_default`]): not for a reader
+    /// who may not read it.
+    store_default: bool,
     /// Numbers the columns the executor adds for itself ([`exists`]).
     synthetic: Cell<usize>,
     /// [`QueryOptions::services`].
@@ -1355,6 +1359,7 @@ impl<'a> Context<'a> {
             Some(access) => resolved.restricted(snapshot, access),
             None => resolved,
         };
+        let store_default = resolved.store_default;
         let (scope, merge_set) = match resolved.default {
             DefaultGraph::Store => (GraphScope::Default, None),
             DefaultGraph::Graph(graph) => (GraphScope::Named(graph), None),
@@ -1401,6 +1406,7 @@ impl<'a> Context<'a> {
         let mut ctx = Self {
             merge_set,
             named,
+            store_default,
             as_written: options.as_written,
             spatial_rewrite: !options.geosparql_stated_only,
             cross_chunk_rows: options.cross_chunk_rows.unwrap_or(CROSS_CHUNK_ROWS).max(1),
@@ -2139,13 +2145,18 @@ impl<'a> Context<'a> {
 
     fn graph(&self, name: &NamedNodePattern, inner: &GraphPattern) -> NativeResult<Solutions> {
         let variable = match name {
-            // Jena's name for the default graph (`compat`): the store's default graph.
-            NamedNodePattern::NamedNode(n) if crate::compat::names_default_graph(n.as_str()) => {
+            // Jena's name for the default graph (`compat`): the store's default graph, where
+            // it is in reach; for a reader who may not read it, absent as an unreadable named
+            // graph is (below).
+            NamedNodePattern::NamedNode(n)
+                if crate::compat::names_default_graph(n.as_str()) && self.store_default =>
+            {
                 return self.in_graph(GraphScope::Default, inner);
             }
             NamedNodePattern::NamedNode(n) => {
-                let id = self
-                    .lookup_const(n.as_ref().into())
+                let id = (!crate::compat::names_default_graph(n.as_str()))
+                    .then(|| self.lookup_const(n.as_ref().into()))
+                    .flatten()
                     .filter(|&id| self.is_named_graph(id));
                 return match id {
                     Some(id) => self.in_graph(GraphScope::Named(id), inner),
