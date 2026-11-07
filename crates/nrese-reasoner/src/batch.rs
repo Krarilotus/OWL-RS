@@ -31,13 +31,15 @@ use rayon::prelude::*;
 use super::delta::Interrupted;
 pub use super::eval::Schema;
 use super::eval::{
-    AllFacts, GroundProgram, Job, NEVER, OperationStop, Probes, Seg, Source, guards_hold,
+    AllFacts, GroundProgram, Job, MORSEL, NEVER, OperationStop, Probes, Seg, Source, guards_hold,
     run_jobs_by_morsel,
 };
+use super::ir::Triple;
 use super::ir::{Guard, Head, Rule, SharedClasses, Term};
-use super::ir::{Triple, Violation};
 use super::lists::{ListVocabulary, instantiate};
 use super::representatives::{EqualityClasses, Guarded, over_classes};
+use super::violations::{Violations, unlimited};
+use nrese_exec::Budget;
 use nrese_exec::heap;
 use nrese_exec::search::Finger;
 
@@ -284,8 +286,8 @@ fn merge_marked(open: &[Pair], marked: &[Pair]) -> (Vec<Pair>, Vec<u64>) {
 pub struct Materialisation {
     /// Facts derived beyond the input, sorted, without duplicates.
     pub derived: Vec<Triple>,
-    /// Consistency violations on the closure, sorted.
-    pub violations: Vec<Violation>,
+    /// Consistency violations on the closure, sorted, charged to the run's budget.
+    pub violations: Violations,
     pub diagnostics: Vec<super::lists::ListDiagnostic>,
     pub rounds: usize,
     /// Rules after grounding, at the end.
@@ -2207,7 +2209,17 @@ pub fn materialise_owned(
 ) -> Materialisation {
     let clock = std::time::Instant::now();
     let store = Store::new(input);
-    run(store, clock.elapsed(), rules, lists, schema, None, NEVER).expect("never stopped")
+    run(
+        store,
+        clock.elapsed(),
+        rules,
+        lists,
+        schema,
+        None,
+        NEVER,
+        &unlimited(),
+    )
+    .expect("never stopped")
 }
 
 /// [`materialise_owned`], polling `stop` as [`materialise_grouped_until`] does.
@@ -2232,7 +2244,16 @@ pub fn materialise_owned_with(
 ) -> Result<Materialisation, Interrupted> {
     let clock = std::time::Instant::now();
     let store = Store::new(input);
-    run_latched(store, clock.elapsed(), rules, lists, schema, None, stop)
+    run_latched(
+        store,
+        clock.elapsed(),
+        rules,
+        lists,
+        schema,
+        None,
+        stop,
+        &unlimited(),
+    )
 }
 
 /// [`materialise`] over input already grouped the way the working set stores it: per
@@ -2257,9 +2278,31 @@ pub fn materialise_grouped_until(
     schema: &Schema,
     stop: super::eval::Stop<'_>,
 ) -> Result<Materialisation, Interrupted> {
+    materialise_grouped_within(input, rules, lists, schema, stop, &unlimited())
+}
+
+/// [`materialise_grouped_until`], its consistency violations charged to `memory` (the
+/// operation's own part: a refusal ends their list, never the materialisation).
+pub fn materialise_grouped_within(
+    input: Vec<(u64, Vec<(u64, u64)>)>,
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+    stop: super::eval::Stop<'_>,
+    memory: &Arc<Budget>,
+) -> Result<Materialisation, Interrupted> {
     let clock = std::time::Instant::now();
     let store = Store::from_groups(input);
-    run(store, clock.elapsed(), rules, lists, schema, None, stop)
+    run(
+        store,
+        clock.elapsed(),
+        rules,
+        lists,
+        schema,
+        None,
+        stop,
+        memory,
+    )
 }
 
 /// The closure of `input` under `rules` with equality by representatives
@@ -2278,6 +2321,20 @@ pub fn materialise_representatives_until(
     listing: Listing,
     stop: super::eval::Stop<'_>,
 ) -> Result<Materialisation, Interrupted> {
+    materialise_representatives_within(input, rules, lists, schema, listing, stop, &unlimited())
+}
+
+/// [`materialise_representatives_until`], its consistency violations charged to `memory`
+/// (as [`materialise_grouped_within`]).
+pub fn materialise_representatives_within(
+    input: Input,
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+    listing: Listing,
+    stop: super::eval::Stop<'_>,
+    memory: &Arc<Budget>,
+) -> Result<Materialisation, Interrupted> {
     let clock = std::time::Instant::now();
     let store = match input {
         Input::Facts(facts) => Store::new(facts),
@@ -2294,7 +2351,16 @@ pub fn materialise_representatives_until(
     if representatives.is_none() && listing == Listing::Representatives {
         // Every fact: the input's too.
         let input_facts = store.facts_where(&|_| true);
-        let mut result = run(store, clock.elapsed(), rules, lists, schema, None, stop)?;
+        let mut result = run(
+            store,
+            clock.elapsed(),
+            rules,
+            lists,
+            schema,
+            None,
+            stop,
+            memory,
+        )?;
         result.derived.extend(input_facts);
         result.derived.par_sort_unstable();
         result.derived.dedup();
@@ -2308,6 +2374,7 @@ pub fn materialise_representatives_until(
         schema,
         representatives,
         stop,
+        memory,
     )
 }
 
@@ -2343,7 +2410,9 @@ fn sees_classes(rule: &Rule) -> bool {
 
 /// Semi-naive evaluation to the fixpoint, from a store holding the input as its delta;
 /// with equality by representatives if `representatives` is given. The process's memory
-/// limit stops it too, whatever the caller polls.
+/// limit stops it too, whatever the caller polls. Its consistency violations are charged
+/// to `memory`.
+#[allow(clippy::too_many_arguments)]
 fn run(
     store: Store,
     load: std::time::Duration,
@@ -2352,13 +2421,24 @@ fn run(
     schema: &Schema,
     representatives: Option<Representatives>,
     stop: super::eval::Stop<'_>,
+    memory: &Arc<Budget>,
 ) -> Result<Materialisation, Interrupted> {
     let stop = super::eval::OperationStop::new(stop);
-    run_latched(store, load, rules, lists, schema, representatives, &stop)
+    run_latched(
+        store,
+        load,
+        rules,
+        lists,
+        schema,
+        representatives,
+        &stop,
+        memory,
+    )
 }
 
 /// [`run`] under one operation's `stop`: once it fires the run ends, with its cause, and
 /// no morsel it made skip is taken for done.
+#[allow(clippy::too_many_arguments)]
 fn run_latched(
     store: Store,
     load: std::time::Duration,
@@ -2367,14 +2447,24 @@ fn run_latched(
     schema: &Schema,
     representatives: Option<Representatives>,
     stop: &super::eval::OperationStop<'_>,
+    memory: &Arc<Budget>,
 ) -> Result<Materialisation, Interrupted> {
-    run_body(store, load, rules, lists, schema, representatives, &|| {
-        stop.fired()
-    })
+    let fired = || stop.fired();
+    run_body(
+        store,
+        load,
+        rules,
+        lists,
+        schema,
+        representatives,
+        &fired,
+        memory,
+    )
     .map_err(|_| stop.interrupted())
 }
 
 /// [`run`]'s work, under the operation's latched `stop`.
+#[allow(clippy::too_many_arguments)]
 fn run_body(
     mut store: Store,
     load: std::time::Duration,
@@ -2383,6 +2473,7 @@ fn run_body(
     schema: &Schema,
     mut representatives: Option<Representatives>,
     stop: super::eval::Stop<'_>,
+    memory: &Arc<Budget>,
 ) -> Result<Materialisation, Interrupted> {
     let check_stop = || {
         if stop() {
@@ -2710,7 +2801,7 @@ fn run_body(
         .as_ref()
         .is_some_and(|e| store.estimate([None, Some(e.same_as), None], Seg::All) > 0);
     store.objects(&|p| equal || reads.by_object(p) || schema.read_in_grounding(p));
-    let mut found = HashSet::new();
+    let mut found = Violations::new(Arc::clone(memory));
     check(
         &Current {
             store: &store,
@@ -2720,8 +2811,9 @@ fn run_body(
         0..program.consistency.len(),
         &[],
         &mut found,
-    );
-    result.violations = sorted(found);
+        stop,
+    )?;
+    result.violations = found;
     result.counters.lookups_without_order = store
         .relations
         .iter()
@@ -2838,44 +2930,45 @@ impl Reads {
     }
 }
 
-/// Violations sorted by rule and bindings.
-pub(crate) fn sorted(found: HashSet<Violation>) -> Vec<Violation> {
-    let mut violations: Vec<Violation> = found.into_iter().collect();
-    violations.sort_by(|a, b| (&a.rule, &a.bindings).cmp(&(&b.rule, &b.bindings)));
-    violations
-}
-
 /// Evaluates consistency instances into `found`: those in `full` over all facts, and the
-/// `(instance, atom)` semi-naive variants in `variants` through the delta.
+/// `(instance, atom)` semi-naive variants in `variants` through the delta; then finishes
+/// it (sorted, without duplicates). Polls `stop` between morsels of driver matches, and a
+/// fired `stop` ends it with [`Interrupted`]: a stopped check is never a report. Once the
+/// report refuses (its budget has no room), no further morsel runs: the state is
+/// inconsistent whatever the rest would add.
 pub(crate) fn check<S: Source + ?Sized>(
     source: &S,
     program: &GroundProgram,
     full: impl IntoIterator<Item = usize>,
     variants: &[(usize, usize)],
-    found: &mut HashSet<Violation>,
-) {
-    let record = |c: usize, bindings: &[Option<u64>], found: &mut HashSet<Violation>| {
+    found: &mut Violations,
+    stop: super::eval::Stop<'_>,
+) -> Result<(), Interrupted> {
+    // The record's words: the job's bindings are sized for the grounded instance, which
+    // lacks the schema variables when one of them has the highest index.
+    fn words<'a>(
+        program: &'a GroundProgram,
+        c: usize,
+        bindings: &'a [Option<u64>],
+    ) -> impl Iterator<Item = u64> + 'a {
         let (rule, grounded) = &program.consistency[c];
-        // The job's bindings are sized for the grounded instance, which lacks the schema
-        // variables when one of them has the highest index.
-        let bindings = (0..rule.variables())
-            .map(|v| {
-                grounded.substitution[v]
-                    .or_else(|| bindings.get(v).copied().flatten())
-                    .unwrap_or(0)
-            })
-            .collect();
-        found.insert(Violation {
-            rule: rule.name.clone(),
-            bindings,
-        });
+        (0..rule.variables()).map(move |v| {
+            grounded.substitution[v]
+                .or_else(|| bindings.get(v).copied().flatten())
+                .unwrap_or(0)
+        })
+    }
+    let group_of = |c: usize, found: &mut Violations| {
+        let rule = &program.consistency[c].0;
+        found.group(&rule.name, rule.variables())
     };
     let mut jobs: Vec<(usize, Job<'_>)> = Vec::new();
     for c in full {
         let ground_rule = &program.consistency[c].1.rule;
         if ground_rule.body.is_empty() {
             if guards_hold(&ground_rule.guards, &program.consistency[c].1.substitution) {
-                record(c, &vec![None; program.consistency[c].0.variables()], found);
+                let Some(id) = group_of(c, found) else { break };
+                found.record(id, words(program, c, &[]));
             }
         } else {
             jobs.extend(Job::full(source, ground_rule).map(|job| (c, job)));
@@ -2885,11 +2978,58 @@ pub(crate) fn check<S: Source + ?Sized>(
         let ground_rule = &program.consistency[c].1.rule;
         jobs.extend(Job::variant(source, ground_rule, i).map(|job| (c, job)));
     }
-    for (c, job) in jobs {
-        job.run(source, 0..job.drivers(), &mut |bindings| {
-            record(c, bindings, found)
-        });
+    // Firings between two polls of `stop` inside a morsel: one driver can have very many
+    // (a rule over independent atoms), so the morsel alone is too coarse.
+    const POLL: u32 = 4096;
+    let mut interrupted = false;
+    let mut since_poll = 0u32;
+    'jobs: for (c, job) in jobs {
+        // A list that refused (an empty-body rule above, or an earlier job) ends the
+        // check: the state is inconsistent whatever the rest would add.
+        if !found.complete() {
+            break;
+        }
+        // Made at the job's first firing: a job that never fires charges nothing, so a
+        // budget without room for its group can't make consistent data look inconsistent.
+        let mut id = None;
+        for start in (0..job.drivers()).step_by(MORSEL) {
+            if stop() {
+                return Err(Interrupted::default());
+            }
+            let range = start..(start + MORSEL).min(job.drivers());
+            let stopped = job.run_until(source, range, &mut |bindings| {
+                since_poll += 1;
+                if since_poll == POLL {
+                    since_poll = 0;
+                    if stop() {
+                        interrupted = true;
+                        return true;
+                    }
+                }
+                // A refused report stops the walk: the state is inconsistent whatever
+                // the rest would add.
+                let group = match id {
+                    Some(group) => group,
+                    None => match group_of(c, found) {
+                        Some(group) => *id.insert(group),
+                        None => return true,
+                    },
+                };
+                !found.record(group, words(program, c, bindings))
+            });
+            if interrupted {
+                return Err(Interrupted::default());
+            }
+            if stopped {
+                break 'jobs;
+            }
+        }
     }
+    if stop() {
+        return Err(Interrupted::default());
+    }
+    found.finish();
+    Ok(())
 }
 
 #[cfg(test)]
