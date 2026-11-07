@@ -128,7 +128,7 @@ class FleetCells(unittest.TestCase):
         patch("suitekit.fleet_cells.manifest.machine", return_value={}).start()
         for chosen, reason in ((["graphdb"], "restricted"), ([], "exactly one"), (["qlever", "oxigraph"], "exactly one")):
             with self.subTest(systems=chosen):
-                payload = {"group": {"systems": chosen, "references": []}, "result_root": str(self.out), "member": "bad", "nrese": A, "harness": A}
+                payload = {"group": {"systems": chosen, "references": []}, "result_root": str(self.out), "member": "bad", "nrese": A, "harness": A, "deadline_min": 1}
                 with patch.dict(os.environ, {"SUITE_CELL": json.dumps(payload), "FLEET_OUT": str(self.out / "export"), "NRESE_GATE_DIR": str(self.out / "gate")}):
                     output = io.StringIO()
                     with contextlib.redirect_stderr(output):
