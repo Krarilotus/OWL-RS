@@ -268,7 +268,11 @@ pub fn maintain_within(
         };
         if inserted.is_empty() && deleted.is_empty() {
             delta::Update::default()
-        } else if let Some(closure) = rebuilt.as_ref().filter(|_| first_load) {
+        } else if let Some(closure) = rebuilt.as_mut().filter(|_| first_load) {
+            // The batch's own report isn't the one given (it holds an axiom's old violations
+            // too): let go of its charge before the introduced-only report takes the same
+            // budget, which then holds what the delta executor's single report would.
+            drop(std::mem::take(&mut closure.violations));
             // The new inferred facts, as the delta executor reports them (its `insert`): the
             // state tells which storable ones it held before, and none it can't hold (above).
             let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
