@@ -547,6 +547,12 @@ pub(crate) fn exists(dir: &Path, revision: u64) -> bool {
     checkpoint_path(dir, revision, EXTENSION).exists()
 }
 
+/// Whether the checkpoint of `revision` is in place under its name; an error where that
+/// can't be told.
+pub(crate) fn placed(dir: &Path, revision: u64) -> std::io::Result<bool> {
+    checkpoint_path(dir, revision, EXTENSION).try_exists()
+}
+
 /// Writes a checkpoint of `snapshot` and returns its path; its scratch is charged within
 /// `admission` ([`write_parts`]).
 pub(crate) fn write(
@@ -654,6 +660,8 @@ pub(crate) fn write_parts<'a>(
     drop(file);
     let path = checkpoint_path(dir, revision, EXTENSION);
     fs::rename(&tmp, &path)?;
+    #[cfg(test)]
+    super::fault::check(&super::fault::FAIL_DIR_SYNC, "directory sync")?;
     super::sync_dir(dir)?;
     tracing::debug!(
         revision,
@@ -868,6 +876,8 @@ fn read_stacks<'a>(
 pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])> {
     let corrupt =
         |what: &str| EngineError::Corruption(format!("checkpoint {}: {what}", path.display()));
+    #[cfg(test)]
+    super::fault::check(&super::fault::FAIL_MAP, "mapping")?;
     let map = crate::mapped::map(path)?;
     let bytes: &[u8] = &map;
     let body = &bytes[..bytes.len().saturating_sub(4)];

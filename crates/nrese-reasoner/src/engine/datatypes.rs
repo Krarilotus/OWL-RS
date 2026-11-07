@@ -14,11 +14,13 @@
 //! fold lexical forms into each other; ill-typed literals (no data value) aren't judged.
 //! A datatype outside OWL 2's list is not judged either.
 
-use crate::ir::{Triple, Violation};
+use crate::ir::{Triple, Violations};
 use nrese_engine::{TermId, TermKind};
+use nrese_exec::Budget;
 use nrese_rdf::{Literal, Term};
 use nrese_xsd::{DateTime, Decimal, Double, Float, Integer};
 use std::str::FromStr;
+use std::sync::Arc;
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
@@ -175,19 +177,26 @@ fn in_value_space(value: &Data, datatype: &str) -> Option<bool> {
     })
 }
 
-/// The datatype violations among `facts` (derived facts, generalised ones included).
+/// The datatype violations among `facts` (derived facts, generalised ones included),
+/// finished, charged to `memory` as [`Violations`] are: a budget without room ends the
+/// list there, still inconsistent.
 pub(crate) fn violations(
     facts: &[Triple],
     rdf_type: u64,
     same_as: Option<u64>,
     decode: &dyn Fn(u64) -> Option<Term>,
-) -> Vec<Violation> {
+    memory: &Arc<Budget>,
+) -> Violations {
     let literal = |id: u64| match decode(id) {
         Some(Term::Literal(l)) => Some(l),
         _ => None,
     };
-    let mut out = Vec::new();
+    let mut out = Violations::new(Arc::clone(memory));
+    let (mut not_type, mut diff) = (None, None);
     for &[s, p, o] in facts {
+        if !out.complete() {
+            break;
+        }
         if !is_literal(s) {
             continue;
         }
@@ -197,11 +206,9 @@ pub(crate) fn violations(
             };
             if let Some(value) = data(&lt)
                 && in_value_space(&value, dt.as_str()) == Some(false)
+                && let Some(group) = *not_type.get_or_insert_with(|| out.group("dt-not-type", 2))
             {
-                out.push(Violation {
-                    rule: "dt-not-type".to_owned(),
-                    bindings: vec![s, o],
-                });
+                out.record(group, [s, o]);
             }
         } else if Some(p) == same_as && is_literal(o) && s < o {
             let (Some(a), Some(b)) = (literal(s), literal(o)) else {
@@ -209,16 +216,13 @@ pub(crate) fn violations(
             };
             if let (Some(x), Some(y)) = (data(&a), data(&b))
                 && x != y
+                && let Some(group) = *diff.get_or_insert_with(|| out.group("dt-diff", 2))
             {
-                out.push(Violation {
-                    rule: "dt-diff".to_owned(),
-                    bindings: vec![s, o],
-                });
+                out.record(group, [s, o]);
             }
         }
     }
-    out.sort_by(|a, b| (&a.rule, &a.bindings).cmp(&(&b.rule, &b.bindings)));
-    out.dedup();
+    out.finish();
     out
 }
 
@@ -260,7 +264,11 @@ mod tests {
                 });
             tx.commit().unwrap();
             let closure = super::super::materialise(&program, &engine.snapshot());
-            let mut rules: Vec<String> = closure.violations.into_iter().map(|v| v.rule).collect();
+            let mut rules: Vec<String> = closure
+                .violations
+                .iter()
+                .map(|(rule, _)| rule.to_owned())
+                .collect();
             rules.sort();
             rules.dedup();
             rules
