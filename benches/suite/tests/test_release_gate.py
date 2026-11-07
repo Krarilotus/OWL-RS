@@ -429,6 +429,9 @@ class Rounds(unittest.TestCase):
         self.assertEqual(need([{"data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}]), ["docker"])
         self.assertEqual(need([{"data": "concat:volume:lubm-1.nt+social people=10"}]), ["docker"])
         self.assertEqual(need([{"data": "volume:owl2bench-rl-1.nt"}]), ["docker"])
+        # Sol-loop r1 S1: riot labels an OWL2Bench file's blank nodes afresh, so a made copy can meet
+        # only a form pin; one without it (owl2bench-ql-1.nt) still needs the assets.
+        self.assertEqual(need([{"data": "volume:owl2bench-ql-1.nt"}]), ["owlrs-bench-assets"])
         self.assertEqual(need([{"data": "volume:support-stress/copies-8.nq"}]), [])
         self.assertEqual(need([{"data": "volume:era-shacl/ERA.ttl"}]), ["owlrs-bench-assets"])  # no maker here
         self.assertEqual(need([{"data": "volume:lubm-10.nt"}, {"data": "ore:ore_ont_9724"}]),
@@ -500,6 +503,13 @@ class Rounds(unittest.TestCase):
             (Path(root) / "benches").mkdir()
             datasets.save(Path(root), {"budget_gb": 300, "dataset": [entry]})
             self.assertEqual(datasets.load(Path(root))["dataset"], [entry])
+        # Sol-loop r1 S3: a freeze that changes the bytes drops the form pin, which was the old graph's
+        # (it accepted the old graph after a re-freeze); the same bytes keep it.
+        same = datasets.refreeze(dict(entry), 47781, "2" * 64, "2026-11-08")
+        self.assertEqual((same["rdfc_sha256"], same.get("frozen")), ("7" * 64, None))
+        changed = datasets.refreeze(dict(entry), 47781, "3" * 64, "2026-11-08")
+        self.assertNotIn("rdfc_sha256", changed)
+        self.assertEqual((changed["sha256"], changed["frozen"]), ("3" * 64, "2026-11-08"))
 
     def test_the_data_step_makes_a_missing_file_aside_and_keeps_only_what_its_pin_accepts(self):
         """Orchestrator, 7 Nov 2026: a maker writes into a directory aside (NRESE_DATASET_DIR, never

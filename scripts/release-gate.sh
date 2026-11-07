@@ -384,7 +384,12 @@ from suitekit import hosts; print(hosts.input_path("general") or "")')
   # (a harness without it leaves such a file unchecked, so refused).
   export NRESE_PERF_LAB=$bin/release/examples/perf_lab
   unset NRESE_RDFC
-  if [ -e "$tree/crates/rdf/nrese-rdf-io/examples/rdfc.rs" ]; then
+  # Built only where a planned case reads a file pinned by form (sol-loop r1 S4).
+  form=$(cd "$tree" && py -c 'import sys, tomllib; sys.path[:0] = ["benches/suite", "benches/fast"]
+import release_gate as rg; from suitekit import cases as r
+want = set(sys.argv[1].split(",")); pins = {d["file"]: d for d in tomllib.load(open("benches/datasets.toml", "rb"))["dataset"]}
+print(any(pins.get(f, {}).get("rdfc_sha256") for c in r.load() if c["name"] in want for f in rg.volume_files(c)))' "$cases")
+  if [ "$form" = True ] && [ -e "$tree/crates/rdf/nrese-rdf-io/examples/rdfc.rs" ]; then
     rdfc_target=$SPACE/build/target-rdfc
     if (cd "$tree" && CARGO_TARGET_DIR=$rdfc_target bash scripts/cargo-guarded.sh build --release --locked --quiet \
           -p nrese-rdf-io --example rdfc); then
