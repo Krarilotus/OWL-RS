@@ -19,6 +19,7 @@ use std::borrow::Cow;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use rayon::prelude::*;
 
 /// A key as the dictionary hands it out: in place, or decoded ([`super::vocabulary`]).
@@ -62,9 +63,9 @@ pub(crate) fn text_of(key: &[u8]) -> Option<&[u8]> {
 /// finished by comparing the rest of its texts. The refinement loops along a run's texts
 /// rather than nesting a level per word (which overflowed the stack at texts of tens of
 /// kilobytes); runs split off are sorted in parallel, nested at most log2 of the entries
-/// deep ([`refine`]). Transient memory: 16 bytes per entry (640 MB at DBpedia's 40 M terms),
-/// freed when the order is built, and nothing per run; uncharged (a W1 site: the
-/// checkpoint's and the lazy order's build).
+/// deep ([`refine`]). Transient memory: 16 bytes per index of `range` (640 MB at DBpedia's
+/// 40 M terms), freed when the order is built, and nothing per run. Uncharged here (a W1
+/// site: the lazy order's build); [`sorted_within`] charges it.
 pub(crate) fn sorted<'a, T>(
     range: std::ops::Range<u64>,
     key: &(dyn Fn(u64) -> Key<'a> + Sync),
@@ -72,7 +73,29 @@ pub(crate) fn sorted<'a, T>(
 where
     T: Copy + Ord + Send + Into<u64> + TryFrom<u64>,
 {
-    sorted_reading(range, key, &Words::default())
+    let unlimited = Budget::unlimited();
+    let (order, _held) = sorted_reading(range, key, &unlimited, &Words::default())
+        .expect("an unlimited budget refuses nothing");
+    order
+}
+
+/// [`sorted`], its memory charged to `budget` before it is allocated: the entries (16
+/// bytes per index of `range`) until they are freed, and the order, whose reservation
+/// comes with it, for a holder that frees the order before it drops the reservation.
+/// Refused, it fails having freed what it made, then released its charge. A charge never
+/// waits (a refusal is the error), so this may run where nothing may wait.
+///
+/// A range past `u32::MAX` (wider than a checkpoint's indices) is sorted as [`sorted`]
+/// sorts it, uncharged.
+pub(crate) fn sorted_within<'a, 'b, T>(
+    range: std::ops::Range<u64>,
+    key: &(dyn Fn(u64) -> Key<'a> + Sync),
+    budget: &'b Budget,
+) -> Result<(Vec<T>, Reservation<&'b Budget>), BudgetExceeded>
+where
+    T: Copy + Ord + Send + Into<u64> + TryFrom<u64>,
+{
+    sorted_reading(range, key, budget, &Words::default())
 }
 
 /// The words of keys the refinement reads, counted under test only: the guard of
@@ -92,12 +115,13 @@ macro_rules! count {
     };
 }
 
-/// [`sorted`], the words of keys it reads added to `read`.
-fn sorted_reading<'a, T>(
+/// [`sorted_within`], the words of keys it reads added to `read`.
+fn sorted_reading<'a, 'b, T>(
     range: std::ops::Range<u64>,
     key: &(dyn Fn(u64) -> Key<'a> + Sync),
+    budget: &'b Budget,
     read: &Words,
-) -> Vec<T>
+) -> Result<(Vec<T>, Reservation<&'b Budget>), BudgetExceeded>
 where
     T: Copy + Ord + Send + Into<u64> + TryFrom<u64>,
 {
@@ -114,27 +138,41 @@ where
             .collect();
         let text = |index: T| text_in(key(index.into()));
         entries.par_sort_unstable_by(|&a, &b| text(a).cmp(&text(b)).then(a.cmp(&b)));
-        return entries;
+        return Ok((entries, Reservation::new(budget)));
     }
-    let mut entries: Vec<Entry> = range
+    // An entry per index, charged first and filled in place (an indexed collect, exact:
+    // no chunks appended), those without a text dropped in place. Declared before the
+    // entries, the reservation is released after they are freed, however this ends.
+    let held: Reservation<&Budget>;
+    let mut entries: Vec<Entry>;
+    let indices = range.start as usize..range.end as usize;
+    (entries, held) = ChargedVec::with_capacity(budget, indices.len())?.into_parts();
+    indices
         .into_par_iter()
-        .filter_map(|index| {
-            let key = key(index);
-            let text = text_of(&key)?;
+        .map(|index| {
+            let key = key(index as u64);
+            let Some(text) = text_of(&key) else {
+                return Entry::NONE;
+            };
             let skip = (text.as_ptr() as usize - key.as_ptr() as usize) as u32;
-            Some(Entry::at(text, 0, index as u32, skip))
+            Entry::at(text, 0, index as u32, skip)
         })
-        .collect();
+        .collect_into_vec(&mut entries);
+    entries.retain(|entry| entry.index != Entry::NONE.index);
     count!(read, entries.len());
     refine(&mut entries, 0, key, read);
-    entries
-        .into_iter()
-        .map(|entry| {
+    let order = ChargedVec::collect(
+        budget,
+        entries.len(),
+        entries.iter().map(|entry| {
             T::try_from(u64::from(entry.index))
                 .ok()
                 .expect("an index of the order's width")
-        })
-        .collect()
+        }),
+    )?;
+    drop(entries);
+    drop(held);
+    Ok(order.into_parts())
 }
 
 /// An entry of [`sorted`] at some depth of its text.
@@ -150,6 +188,14 @@ struct Entry {
 const MORE: u32 = 1 << 31;
 
 impl Entry {
+    /// The place of an index without a text while the entries are made: no entry has its
+    /// index, since [`sorted_reading`] gives this path indices below `u32::MAX` only.
+    const NONE: Entry = Entry {
+        word: 0,
+        index: u32::MAX,
+        skip: 0,
+    };
+
     fn at(text: &[u8], depth: usize, index: u32, skip: u32) -> Self {
         let from = (depth * 8).min(text.len());
         let part = &text[from..text.len().min(from + 8)];
@@ -254,23 +300,43 @@ fn refine<'a>(
 }
 
 /// The run of `run`'s entries that `same` joins which holds more than half of them, if
-/// any: its start and length.
+/// any: its start and length. Such a run holds the middle entry, so only the middle entry's
+/// run is measured, outward from it: not a pass over every run.
 fn largest_run(run: &[Entry], same: impl Fn(&Entry, &Entry) -> bool) -> Option<(usize, usize)> {
-    let mut start = 0;
-    for end in 1..=run.len() {
-        if end == run.len() || !same(&run[end - 1], &run[end]) {
-            if 2 * (end - start) > run.len() {
-                return Some((start, end - start));
-            }
-            start = end;
-        }
+    let middle = run.len() / 2;
+    let mut start = middle;
+    while start > 0 && same(&run[start - 1], &run[start]) {
+        start -= 1;
     }
-    None
+    let mut end = middle + 1;
+    while end < run.len() && same(&run[end - 1], &run[end]) {
+        end += 1;
+    }
+    (2 * (end - start) > run.len()).then_some((start, end - start))
 }
 
-/// Reads the word at `depth` of every entry of `run` (each key once); whether they are
-/// one word and every text goes on.
+/// Reads the word at `depth` of every entry of `run` (each key once).
 fn words_at<'a>(
+    run: &mut [Entry],
+    depth: usize,
+    key: &(dyn Fn(u64) -> Key<'a> + Sync),
+    read: &Words,
+) {
+    let at = |entry: &mut Entry| {
+        let k = key(u64::from(entry.index));
+        *entry = Entry::at(&k[entry.skip()..], depth, entry.index, entry.skip() as u32);
+    };
+    if run.len() > PARALLEL {
+        run.par_iter_mut().for_each(at);
+    } else {
+        run.iter_mut().for_each(at);
+    }
+    count!(read, run.len());
+}
+
+/// [`words_at`], and whether the words are one and every text goes on, known in the same
+/// pass: each entry's word is compared with the first's as it is read.
+fn one_word_at<'a>(
     run: &mut [Entry],
     depth: usize,
     key: &(dyn Fn(u64) -> Key<'a> + Sync),
@@ -280,18 +346,23 @@ fn words_at<'a>(
         let k = key(u64::from(entry.index));
         *entry = Entry::at(&k[entry.skip()..], depth, entry.index, entry.skip() as u32);
     };
-    let first = |run: &[Entry]| (run[0].word, run[0].more());
-    if run.len() > PARALLEL {
-        run.par_iter_mut().for_each(at);
-        count!(read, run.len());
-        let (word, more) = first(run);
-        more && run.par_iter().all(|e| e.word == word && e.more())
-    } else {
-        run.iter_mut().for_each(at);
-        count!(read, run.len());
-        let (word, more) = first(run);
-        more && run.iter().all(|e| e.word == word && e.more())
-    }
+    at(&mut run[0]);
+    let (word, more) = (run[0].word, run[0].more());
+    // Every word is read: the comparisons never stop the pass early.
+    let same = |entry: &mut Entry| {
+        at(entry);
+        entry.word == word && entry.more()
+    };
+    let one = match run.len() > PARALLEL {
+        true => run[1..]
+            .par_iter_mut()
+            .map(same)
+            .reduce(|| true, |a, b| a && b),
+        // Counted, not `all`: that would stop at the first other word, leaving the rest unread.
+        false => run[1..].iter_mut().map(same).filter(|&one| !one).count() == 0,
+    };
+    count!(read, run.len());
+    more && one
 }
 
 /// Skips the prefix every text of `run` shares, past its first `(depth + 1) · 8` bytes
@@ -311,7 +382,7 @@ fn common<'a>(
 ) -> usize {
     for _ in 0..2 {
         depth += 1;
-        if !words_at(run, depth, key, read) {
+        if !one_word_at(run, depth, key, read) {
             return depth;
         }
     }
@@ -510,7 +581,9 @@ mod tests {
         }
         let key = |i: u64| Cow::Borrowed(keys[i as usize].as_slice());
         let read = AtomicU64::new(0);
-        let got: Vec<u64> = sorted_reading(0..keys.len() as u64, &key, &read);
+        let unlimited = Budget::unlimited();
+        let (got, _held): (Vec<u64>, _) =
+            sorted_reading(0..keys.len() as u64, &key, &unlimited, &read).unwrap();
         let read = read.into_inner();
         let text = |i: u64| text_of(&keys[i as usize]).unwrap();
         let mut expected: Vec<u64> = (0..keys.len() as u64).collect();
@@ -536,6 +609,87 @@ mod tests {
             read <= 4 * distinguishing as u64,
             "{read} words read, {distinguishing} distinguishing"
         );
+    }
+
+    /// The run holding more than half of a run's entries is found wherever it lies (the
+    /// refinement's nesting bound rests on it), and none where no run does.
+    #[test]
+    fn the_run_over_half_is_found_from_the_middle() {
+        let runs = |sizes: &[usize]| -> Vec<Entry> {
+            let words = sizes
+                .iter()
+                .enumerate()
+                .flat_map(|(w, &n)| std::iter::repeat_n(w as u64, n));
+            words
+                .map(|word| Entry {
+                    word,
+                    index: 0,
+                    skip: MORE,
+                })
+                .collect()
+        };
+        let same = |a: &Entry, b: &Entry| a.word == b.word && a.more() && b.more();
+        for (sizes, expected) in [
+            (&[6, 1, 2][..], Some((0, 6))),
+            (&[1, 6, 2], Some((1, 6))),
+            (&[2, 1, 6], Some((3, 6))),
+            (&[3, 3, 3], None),
+            (&[4, 4], None),
+            (&[1, 1, 1, 1, 1], None),
+        ] {
+            assert_eq!(largest_run(&runs(sizes), same), expected, "{sizes:?}");
+        }
+    }
+
+    /// The charged sort is the text order (the comparison sort's), entries without a text
+    /// left out, and holds the order's capacity, 8 bytes an entry of `u64`, until dropped:
+    /// texts among blank nodes, blank nodes alone, an empty range, and a range starting
+    /// past 0. Refused, it holds nothing.
+    #[test]
+    fn the_charged_order_is_the_text_order_and_holds_its_capacity() {
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for i in 0..40_000u64 {
+            keys.push(match i % 5 {
+                0 => format!("B{i}").into_bytes(),
+                1 => format!("Ihttp://e/{}", i % 977).into_bytes(),
+                _ => format!("Lde\0{}", (i * 7919) % 40_009).into_bytes(),
+            });
+        }
+        let blanks: Vec<Vec<u8>> = (0..100).map(|i| format!("B{i}").into_bytes()).collect();
+        for (keys, range) in [
+            (&keys, 0..keys.len() as u64),
+            (&keys, 12_345..keys.len() as u64),
+            (&blanks, 0..blanks.len() as u64),
+            (&keys, 7..7),
+        ] {
+            let key = |i: u64| Cow::Borrowed(keys[i as usize].as_slice());
+            let mut expected: Vec<u64> = range
+                .clone()
+                .filter(|&i| text_of(&keys[i as usize]).is_some())
+                .collect();
+            expected.sort_by(|&a, &b| {
+                text_of(&keys[a as usize])
+                    .cmp(&text_of(&keys[b as usize]))
+                    .then(a.cmp(&b))
+            });
+            let budget = Budget::unlimited();
+            let (got, held): (Vec<u64>, _) = sorted_within(range.clone(), &key, &budget).unwrap();
+            assert_eq!(got, expected, "{range:?}");
+            assert_eq!(got, sorted::<u64>(range.clone(), &key), "{range:?}");
+            assert_eq!(
+                (held.bytes(), budget.used()),
+                (8 * got.capacity(), 8 * expected.len()),
+                "{range:?}"
+            );
+            drop(got);
+            drop(held);
+            assert_eq!(budget.used(), 0);
+        }
+        let key = |i: u64| Cow::Borrowed(keys[i as usize].as_slice());
+        let budget = Budget::new(16 * keys.len() - 1);
+        let refused = sorted_within::<u64>(0..keys.len() as u64, &key, &budget);
+        assert!(refused.is_err());
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]

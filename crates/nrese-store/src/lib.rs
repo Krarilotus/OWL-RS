@@ -52,7 +52,7 @@ pub use backup::{
 pub use bulk_load::{BulkLoadReport, BulkLoadRequest, LoadProgress};
 pub use classification::{ClassificationReport, RealisationReport};
 pub use config::{
-    DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, GateSeverity,
+    DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, GateSeverity, ProcessMemory,
     QlRewritingMode, ShaclGate, StoreConfig, StoreMode,
 };
 pub use delta::MutationDeltaPreview;
@@ -81,7 +81,7 @@ pub use nrese_engine::cpu;
 /// How the process returns freed memory to the system, registered by the binary that picks
 /// the allocator.
 pub use nrese_engine::memory::set_release as set_memory_release;
-pub use nrese_engine::{EngineError, IndexEncoding, ReadModel, VocabularyEncoding};
+pub use nrese_engine::{EngineError, IndexEncoding, ReadModel, VocabularyEncoding, WalDamage};
 pub use nrese_shacl::{ValidationReport, ValidationResult};
 pub use nrese_sparql::{
     CancellationToken, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryEvaluationError,

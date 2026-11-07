@@ -13,7 +13,7 @@
 //! - **Growth**: [`Hnsw::extend`] links the vectors appended since; nothing is removed
 //!   (the engine's vectors are append-only, a query checks that a hit is still used).
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -451,24 +451,36 @@ impl Visited<'_> {
 }
 
 thread_local! {
-    static VISITED: RefCell<(Vec<u32>, u32)> = const { RefCell::new((Vec::new(), 0)) };
+    /// The thread's visited marks and their last stamp, kept between its searches.
+    static VISITED: Cell<(Vec<u32>, u32)> = const { Cell::new((Vec::new(), 0)) };
 }
 
+/// Runs `f` with visited marks for `nodes` nodes, none visited yet. The marks are taken
+/// out of the thread's for the run and put back after, so a search started inside `f` on
+/// this thread (by `accept`, or a Rayon part taken on while it waits) gets marks of its
+/// own: the thread's then hold none, and it allocates.
 fn with_visited<R>(nodes: usize, f: impl FnOnce(&mut Visited<'_>) -> R) -> R {
-    VISITED.with(|cell| {
-        let mut cell = cell.borrow_mut();
-        let (marks, stamp) = &mut *cell;
-        if marks.len() < nodes {
-            marks.resize(nodes, 0);
-        }
-        *stamp = stamp.wrapping_add(1);
-        if *stamp == 0 {
-            marks.iter_mut().for_each(|mark| *mark = 0);
-            *stamp = 1;
-        }
-        let stamp = *stamp;
-        f(&mut Visited { marks, stamp })
-    })
+    let (mut marks, mut stamp) = VISITED.take();
+    if marks.len() < nodes {
+        marks.resize(nodes, 0);
+    }
+    stamp = stamp.wrapping_add(1);
+    if stamp == 0 {
+        marks.iter_mut().for_each(|mark| *mark = 0);
+        stamp = 1;
+    }
+    let result = f(&mut Visited {
+        marks: &mut marks,
+        stamp,
+    });
+    // The larger of these marks and any a nested search put back is kept.
+    let kept = VISITED.take();
+    VISITED.set(if kept.0.len() > marks.len() {
+        kept
+    } else {
+        (marks, stamp)
+    });
+    result
 }
 
 #[cfg(test)]
@@ -580,6 +592,33 @@ mod tests {
                 .search(&vectors, &[1.0, 0.0], 5, 10, &|_| true)
                 .is_empty()
         );
+    }
+
+    /// A search's `accept` may search the graph again on its own thread (an embedder's
+    /// filter that searches, or a Rayon part a waiting thread takes on): both answer as a
+    /// search alone does. Each search had borrowed its thread's visited marks for its whole
+    /// run, and the nested one panicked on the second borrow.
+    #[test]
+    fn a_search_s_accept_may_search_again_on_its_thread() {
+        let vectors = random_vectors(500, 8, 7);
+        let mut graph = Hnsw::new(Metric::L2, HnswParameters::default());
+        graph.extend(&vectors);
+        let query = vectors.get(42).to_vec();
+        let ids = |hits: Vec<Hit>| hits.into_iter().map(|hit| hit.id).collect::<Vec<_>>();
+        let alone = ids(graph.search(&vectors, &query, 10, 64, &|_| true));
+        let nested = std::sync::Mutex::new(None);
+        let outer = ids(graph.search(&vectors, &query, 10, 64, &|_| {
+            let mut nested = nested.lock().expect("unpoisoned");
+            if nested.is_none() {
+                *nested = Some(ids(graph.search(&vectors, &query, 10, 64, &|_| true)));
+            }
+            true
+        }));
+        assert_eq!(
+            nested.into_inner().expect("unpoisoned"),
+            Some(alone.clone())
+        );
+        assert_eq!(outer, alone);
     }
 }
 

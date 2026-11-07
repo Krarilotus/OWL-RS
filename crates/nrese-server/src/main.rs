@@ -52,9 +52,9 @@ fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let _ = dotenvy::dotenv();
-    init_tracing();
-
     let cli = CliConfig::from_args(std::env::args_os())?;
+    init_tracing(&cli.command);
+
     if let CliCommand::Convert(convert) = &cli.command {
         let statements = nrese_store::convert_file(&convert.input, &convert.output)
             .with_context(|| format!("converting {}", convert.input.display()))?;
@@ -83,7 +83,7 @@ async fn run() -> Result<()> {
         return print_query(&store, print.clone());
     }
     let mut config = ServerConfig::load_with(cli.config_path.as_deref(), &cli.overrides)?;
-    config.install_process_memory_policy();
+    config.install_process_memory_policy()?;
     // The default repository's reasoning as changed through the engine API overrides the
     // configuration's (it is kept in the data directory).
     if let Some(settings) = nrese_server::repositories::stored_default_settings(&config.store)
@@ -174,8 +174,13 @@ async fn run() -> Result<()> {
                 // The data stays loaded (for diagnosis and repair); the server will start
                 // in quarantine.
                 anyhow::bail!(
-                    "the loaded data is inconsistent under {}: {} violation(s)",
+                    "the loaded data is inconsistent under {}: {}{} violation(s)",
                     program.name(),
+                    if report.violations_at_least {
+                        "at least "
+                    } else {
+                        ""
+                    },
                     report.violations
                 );
             }
@@ -223,8 +228,12 @@ async fn run() -> Result<()> {
         .await
         .with_context(|| format!("failed to bind {}", config.bind_address))?;
 
+    // The address bound, not the one configured: port 0 names the port the system chose.
+    let bound_address = listener
+        .local_addr()
+        .with_context(|| format!("reading the address bound for {}", config.bind_address))?;
     tracing::info!(
-        bind_address = %config.bind_address,
+        bind_address = %bound_address,
         deployment_posture = config.deployment_posture.as_str(),
         data_dir = %store.config().data_dir.display(),
         reasoning_mode = ?reasoner.config().mode(),
@@ -396,11 +405,19 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
+/// Log lines go to standard error, except the server's: a command's standard output is its
+/// result (`query`'s answers, `print-query`'s query, the configuration schema), which a log
+/// line before it would corrupt. The server's stay on standard output, where its operators
+/// read them.
+fn init_tracing(command: &CliCommand) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
+    let logs = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .compact()
-        .init();
+        .compact();
+    if *command == CliCommand::Serve {
+        logs.init();
+    } else {
+        logs.with_writer(std::io::stderr).init();
+    }
 }

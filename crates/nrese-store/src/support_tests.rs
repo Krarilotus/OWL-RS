@@ -326,3 +326,24 @@ fn a_pending_read_is_the_gathered_one() {
          asserted in reach {view_added}, deletions {deleted}"
     );
 }
+
+/// DC-07: an evaluation the process limit stopped because the process's memory couldn't be
+/// read fails its read as "memory unreadable", not as the limit; one stopped past the
+/// limit stays the limit's.
+#[test]
+fn a_view_stopped_unread_fails_as_memory_unreadable() {
+    let following = Following::new(&Work {
+        budget: Arc::new(Budget::unlimited()),
+        cancellation: None,
+    });
+    let unread = following.failure(Stopped::MemoryUnreadable);
+    assert_eq!(unread, Unavailable::MemoryUnreadable);
+    assert!(matches!(
+        crate::StoreError::from(unread),
+        crate::StoreError::MemoryUnreadable { .. }
+    ));
+    assert!(matches!(
+        crate::StoreError::from(following.failure(Stopped::ProcessMemory)),
+        crate::StoreError::ProcessMemoryLimit { .. }
+    ));
+}

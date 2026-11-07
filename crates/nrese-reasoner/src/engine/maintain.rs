@@ -1,18 +1,20 @@
 //! Maintenance of a transaction's inferred stack on a commit ([`super::maintain`]).
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use nrese_engine::{
     EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, Snapshot, TermId,
     Transaction,
 };
+use nrese_exec::Budget;
 
 use rayon::prelude::*;
 
 use super::{Program, encode, pattern, storable, triple};
 use crate::delta::{self, Base, MemoryBase};
 use crate::eval::GroundProgram;
-use crate::ir::{Triple, Violation};
+use crate::ir::{Triple, Violations};
 use crate::lists::ListDiagnostic;
 
 /// A transaction's state as the delta executor reads it: the committed indexes (asserted
@@ -74,8 +76,13 @@ impl Base for EngineBase<'_> {
     fn estimate(&self, bound: [Option<u64>; 3]) -> usize {
         let committed = self
             .snapshot
-            .count_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any));
-        usize::try_from(committed).unwrap_or(usize::MAX) + self.inserts.estimate(bound)
+            .count_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any))
+            .at_least();
+        // An expanded count past `u64` reads as its maximum (`Snapshot::count_in`): the sum
+        // saturates too, never wrapping to a smaller estimate.
+        usize::try_from(committed)
+            .unwrap_or(usize::MAX)
+            .saturating_add(self.inserts.estimate(bound))
     }
 
     fn contains(&self, fact: Triple) -> bool {
@@ -113,8 +120,8 @@ impl Base for EngineBase<'_> {
 /// What [`maintain`] did to a transaction's inferred stack.
 #[derive(Debug, Default)]
 pub struct Maintenance {
-    /// The consistency violations the change introduced.
-    pub violations: Vec<Violation>,
+    /// The consistency violations the change introduced, charged to its budget.
+    pub violations: Violations,
     pub inserted: u64,
     pub removed: u64,
     pub rounds: usize,
@@ -138,6 +145,19 @@ pub fn maintain(
     tx: &mut Transaction<'_>,
     stop: crate::eval::Stop<'_>,
 ) -> Result<Maintenance, delta::Interrupted> {
+    maintain_within(program, ground, tx, stop, &crate::violations::unlimited())
+}
+
+/// [`maintain`], the consistency violations (the rules' and the datatype checks', and a
+/// rebuild's) charged to `memory`: the operation's own part, whose refusal ends their list
+/// and keeps the change inconsistent ([`Violations`]).
+pub fn maintain_within(
+    program: &Program,
+    ground: Option<&GroundProgram>,
+    tx: &mut Transaction<'_>,
+    stop: crate::eval::Stop<'_>,
+    memory: &Arc<Budget>,
+) -> Result<Maintenance, delta::Interrupted> {
     // Axioms the state lacks (a store that never rematerialised): added with this commit.
     let mut missing_axioms: Vec<Triple> = Vec::new();
     // Unnamed classes left out: as the commit leaves them; one it makes consumable
@@ -157,10 +177,11 @@ pub fn maintain(
     // Revived memberships must participate in the delta executor's introduced-only
     // consistency checks. Keep the batch result for installation below: no second run.
     let mut rebuilt = if revived {
-        Some(super::materialise_until(
+        Some(super::materialise_within(
             program,
             &tx.pending_snapshot(),
             stop,
+            memory,
         )?)
     } else {
         None
@@ -188,13 +209,14 @@ pub fn maintain(
         && tx.base().len_in(ReadModel::Asserted) == 0
         && tx.deleted().next().is_none()
         && tx.inserted().next().is_some()
-        && program.axioms_conclude_only_storable(tx.base(), stop)?;
+        && program.axioms_conclude_only_storable(tx.base(), stop, memory)?;
     let mut unstorable: Vec<Triple> = Vec::new();
     if first_load {
-        rebuilt = Some(super::materialise::materialise_with_unstorable_until(
+        rebuilt = Some(super::materialise::materialise_with_unstorable_within(
             program,
             &tx.pending_snapshot(),
             stop,
+            memory,
             &mut unstorable,
         )?);
     }
@@ -260,7 +282,9 @@ pub fn maintain(
                 .chain(unstorable.drain(..))
                 .collect();
             delta::Update {
-                violations: delta::introduced_violations(&base, &inserted, &derived, rules, ground),
+                violations: delta::introduced_violations(
+                    &base, &inserted, &derived, rules, ground, stop, memory,
+                )?,
                 insert: derived,
                 policy: delta::policy::Counts {
                     plan: delta::policy::Plan::Rebuild,
@@ -269,16 +293,24 @@ pub fn maintain(
                 ..Default::default()
             }
         } else {
-            delta::update_with(&base, &inserted, &deleted, rules, ground, stop, policy)?
+            delta::update_within(
+                &base, &inserted, &deleted, rules, ground, stop, policy, memory,
+            )?
         }
     };
     let mut update = update;
-    update.violations.extend(super::datatypes::violations(
-        &update.insert,
-        program.rdf_type,
-        program.same_as,
-        &|id| tx.decode(TermId::from_raw(id)),
-    ));
+    // A list that already stopped at its budget makes the change inconsistent: the
+    // datatype checks would add nothing to that.
+    if update.violations.complete() {
+        let datatypes = super::datatypes::violations(
+            &update.insert,
+            program.rdf_type,
+            program.same_as,
+            &|id| tx.decode(TermId::from_raw(id)),
+            memory,
+        );
+        update.violations.append(datatypes);
+    }
     let (mut inserted, mut removed) = (0, 0);
     // Over representatives, a change that may split a class is rebuilt (B3a: the
     // translation can't follow it; the representative view for the delta executor is B3b).
@@ -311,11 +343,11 @@ pub fn maintain(
     if rebuild {
         let mut closure = match rebuilt.take() {
             Some(closure) => closure,
-            None => super::materialise_until(program, &tx.pending_snapshot(), stop)?,
+            None => super::materialise_within(program, &tx.pending_snapshot(), stop, memory)?,
         };
         // An interruption drops the transaction, these changes with it.
         if stop() {
-            return Err(delta::Interrupted);
+            return Err(delta::Interrupted::default());
         }
         // Only the difference is applied: O(stored + rebuilt closure) to sort and walk,
         // and a transaction update per fact that changed. A stored snapshot shares the old
@@ -365,7 +397,7 @@ pub fn maintain(
         }
         update.program = Some(after);
         if stop() {
-            return Err(delta::Interrupted);
+            return Err(delta::Interrupted::default());
         }
     }
     Ok(Maintenance {
@@ -655,7 +687,7 @@ mod tests {
                         }
                         let done =
                             maintain(&program, Some(&ground), &mut tx, crate::eval::NEVER).unwrap();
-                        assert!(done.violations.is_empty(), "no inconsistency is possible");
+                        assert!(done.violations.consistent(), "no inconsistency is possible");
                         let took = done.work.plan;
                         taken.insert(took);
                         tx.commit().unwrap();
@@ -805,7 +837,10 @@ mod tests {
             }
             let closure = super::super::materialise(&program, &tx.pending_snapshot());
             assert!(
-                closure.violations.iter().any(|v| v.rule == "cls-nothing2"),
+                closure
+                    .violations
+                    .iter()
+                    .any(|(rule, _)| rule == "cls-nothing2"),
                 "by representatives {representatives}: {:?}",
                 closure.violations
             );
@@ -853,7 +888,7 @@ mod tests {
             let done = maintain(&program, None, &mut tx, crate::eval::NEVER).unwrap();
             assert_eq!(done.work.plan, Plan::Rebuild, "consistent {consistent}");
             assert_eq!(
-                done.violations.is_empty(),
+                done.violations.consistent(),
                 consistent,
                 "{:?}",
                 done.violations

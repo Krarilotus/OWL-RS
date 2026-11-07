@@ -72,6 +72,8 @@ OUT=${FLEET_OUT:-$GATE/results}
 SPARQL_DATA=${SPARQL_DATA:-$HOME/owlrs/sparql-data}
 SHARED=${NRESE_FAST_SHARED:-$HOME/owlrs/fast-data-shared}
 MAX_GB=${GATE_MAX_GB:-24}
+# The host a timed part runs on: a pinned job's (GATE_HOST), else the one the fleet placed it on.
+GATE_HOST=${GATE_HOST:-${FLEET_HOST:-}}
 # A directory the caller names relative to the launching checkout stays there: the gate runs its
 # code from a checkout of its own (below; Sol, PR #60 fix 3's sol-loop S2).
 anchored() { case $1 in /* | [A-Za-z]:[/\\]*) printf '%s' "$1" ;; *) printf '%s/%s' "$PWD" "$1" ;; esac; }
@@ -363,15 +365,29 @@ from suitekit import hosts; print(hosts.input_path("general") or "")')
   # The family's baselines: GATE_BASELINES (default base,main; an A-B-B-A of two sides: base).
   (cd "$tree" && py benches/fast/release_gate.py plan --max-gb "$MAX_GB" --min-gb "${GATE_MIN_GB:-0}" \
      --baselines "${GATE_BASELINES:-base,main}" \
-     ${GATE_BIG_GB:+--big-gb "$GATE_BIG_GB" --big-host "${GATE_BIG_HOST:-khaleesi-wsl}"} ${GATE_CASES:+--cases "$GATE_CASES"}) \
+     ${GATE_BIG_GB:+--big-gb "$GATE_BIG_GB" --big-host "${GATE_BIG_HOST:-the big part}"} ${GATE_CASES:+--cases "$GATE_CASES"}) \
     > "$GATE/plan.json.partial" && mv "$GATE/plan.json.partial" "$GATE/plan.json" \
     || { log "prepare: no plan (release_gate.py plan failed)"; exit 2; }
   cp "$GATE/plan.json" "$OUT/plan.json"
   cases=$(planned)
-  log "plan: $(py -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["run"]), "cases;", len(d["not_run"]), "not run;", len(d["elsewhere"]), "on the big host")' "$GATE/plan.json")"
+  log "plan: $(py -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["run"]), "cases;", len(d["not_run"]), "not run;", len(d["elsewhere"]), "in the big part")' "$GATE/plan.json")"
+  # The cases' SPARQL data is this job's to make (Johannes, 2 Nov 2026), into the host's cache
+  # (SPARQL_DATA, benches/hosts.toml [caches]): what benches/sparql/prepare.sh makes and the host
+  # lacks is made now, and the query sets are checked by name and SHA-256 (release_gate.py
+  # data_state(), their one validator; review r1 R1-F2); anything not as pinned stops preparation.
+  # It reads the host's own inputs ($general, as resolved above), never the gate's data view that
+  # fast_env points BENCH_GENERAL_DATA at for fast.py: the view holds only what an earlier
+  # preparation linked (trail pkg-bench-registry, hypothesis 4).
+  (cd "$tree" && if [ -n "$general" ]; then export BENCH_GENERAL_DATA=$general; else unset BENCH_GENERAL_DATA; fi
+   SPARQL_DATA=$SPARQL_DATA py benches/fast/release_gate.py data --cases "$cases" --make) > "$OUT/data.txt" 2>&1
+  data_code=$?
+  tee -a "$OUT/gate.log" < "$OUT/data.txt" > /dev/null
+  log "data: $(grep -cE '^(held|present)' "$OUT/data.txt") as pinned, $(grep -cE '^(MISSING|DIFFERS|FAILED)' "$OUT/data.txt") not"
+  [ "$data_code" = 0 ] || { log "prepare: the cases' data isn't as pinned ($OUT/data.txt): stopped"; exit 2; }
   # The data view: each dataset a planned case reads, from the host's general inputs or the
-  # SPARQL data; checked against its freeze (datasets.toml) and recorded either way.
-  (cd "$tree" && py - "$cases" "$general" "$SPARQL_DATA" "$GATE/data" > "$OUT/inputs.txt") <<'EOF' || exit 2
+  # SPARQL data, recorded with its hash. One that isn't its freeze (datasets.toml), or has none,
+  # is refused and leaves the view, and preparation stops.
+  (cd "$tree" && py - "$cases" "$general" "$SPARQL_DATA" "$GATE/data" > "$OUT/inputs.txt") <<'EOF' || { tee -a "$OUT/gate.log" < "$OUT/inputs.txt"; exit 2; }
 import hashlib, os, subprocess, sys, tomllib
 from pathlib import Path
 sys.path.insert(0, "benches/suite")
@@ -391,7 +407,13 @@ for name in files:
         print(f"MISSING {name}: neither in {general} nor in {sparql}"); failed = True; continue
     target, sha = view / name, digest(source)
     entry = frozen.get(name, {})
-    status = "frozen" if sha == entry.get("sha256") else f"NOT the freeze ({entry.get('sha256', 'none')[:12]})"
+    if sha != entry.get("sha256"):
+        if target.is_symlink() or target.exists():
+            target.unlink()  # an earlier preparation's
+        print(f"NOT the freeze {name}: {source} sha256 {sha}, frozen {entry.get('sha256', 'none')[:12]}")
+        failed = True
+        continue
+    status = "frozen"
     target.parent.mkdir(parents=True, exist_ok=True)
     if entry.get("n_triples") or name.startswith("bsbm-"):
         # Not N-Triples as frozen (BSBM's Turtle doubles): converted once per source, which
@@ -416,17 +438,14 @@ for name in files:
 sys.exit(1 if failed else 0)
 EOF
   cp "$OUT/inputs.txt" "$GATE/inputs.txt" && tee -a "$OUT/gate.log" < "$OUT/inputs.txt"
-  # Generated query sets kept with the data (never committed): checked file by file
-  # against benches/sparql/queries.sha256, then the gate reads them from there.
+  # Generated query sets kept with the data (never committed), checked against
+  # benches/sparql/queries.sha256 by the data step above: the gate reads them from there.
   for set in $(cd "$tree" && py -c 'import sys; sys.path.insert(0, "benches/suite")
 from suitekit import cases as r
 wanted = sys.argv[1].split(",")
 print(" ".join(sorted({c["queries"][1:] for c in r.load() if c["name"] in wanted and c.get("queries", "").startswith("@watdiv")})))' "$cases"); do
-    (cd "$SPARQL_DATA/queries" && grep -E "  $set/" "$tree/benches/sparql/queries.sha256" | sha256sum -c --quiet -) \
-      && [ "$(ls "$SPARQL_DATA/queries/$set" | wc -l)" = "$(grep -cE "  $set/" "$tree/benches/sparql/queries.sha256")" ] \
-      || { log "the query set $set differs from its pins"; exit 2; }
     ln -sfn "$SPARQL_DATA/queries/$set" "$GATE/query-sets/$set"
-    log "query set $set: $(ls "$SPARQL_DATA/queries/$set" | wc -l) files match their pins"
+    log "query set $set: $(ls "$SPARQL_DATA/queries/$set" | wc -l) files, as pinned (data step)"
   done
   # The cases' generated data, by the harness's generator, for every side alike.
   (cd "$tree" && NRESE_FAST_BIN=$bin NRESE_FAST_REVISION=$harness py benches/fast/fast.py prepare --cases "$cases") \
@@ -671,14 +690,21 @@ report)
     args+=(--side "$name=$rev")
   done
   required=$(printf '%s\n' "$@" | sed 1d | cut -d= -f1 | paste -sd, -)
+  # The plan and inputs this job's own prepare step recorded in its results ($OUT), not whatever
+  # the gate directory holds by now (review r1 R1-F3); a confirmation prepares nothing and reads
+  # its part's (GATE_PLAN, the part's plan.json and inputs.txt).
+  own_plan=$PLAN own_family=$GATE/plan.json own_inputs=$GATE/inputs.txt
+  if [ -z "${GATE_PLAN:-}" ] && [ -f "$OUT/plan.json" ] && [ -f "$OUT/inputs.txt" ]; then
+    own_plan=$OUT/plan.json own_family=$OUT/plan.json own_inputs=$OUT/inputs.txt
+  fi
   for key in not_run elsewhere; do
     listed=$(py -c 'import json,sys; [print(f"{k}={v}") for k, v in json.load(open(sys.argv[1]))[sys.argv[2]].items()]' \
-      "$PLAN" "$key")
+      "$own_plan" "$key")
     while IFS= read -r line; do [ -z "$line" ] || args+=("--${key/_/-}" "$line"); done <<< "$listed"
   done
   (cd "$tree" && py benches/fast/release_gate.py report --passes "$OUT/passes" --candidate "$candidate" "${args[@]}" \
-     --require "$required" --harness-revision "$harness" --min-blocks "${GATE_MIN_BLOCKS:-2}" --family "$GATE/plan.json" \
-     --inputs "$GATE/inputs.txt" \
+     --require "$required" --harness-revision "$harness" --min-blocks "${GATE_MIN_BLOCKS:-2}" --family "$own_family" \
+     --inputs "$own_inputs" \
      --context "host=${GATE_HOST:-}" --context "round=${GATE_ROUND:-0}" --context "prefix=${GATE_PREFIX:-}" \
      --context "gate_name=${GATE_NAME:-}" --context "max_gb=$MAX_GB" --context "ram_gb=${GATE_RAM_GB:-$MAX_GB}" \
      --context "layouts=$LAYOUTS" \

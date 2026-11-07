@@ -208,7 +208,7 @@ permits.
   - steals.
 
 **Regression baselines:**
-- **Committed:** NRESE's per-ontology times, as JSON under `benches/baselines/dl/`. A package that slows a tier's sum by more than 5% (beyond noise) explains why, or doesn't merge.
+- **Planned, not committed yet:** NRESE's per-ontology times as JSON baselines. Timing verdicts follow [benches/abba/README.md](../../benches/abba/README.md), not a percentage tolerance.
 - **Publishing:** HermiT (LGPL-3.0), Konclude 0.7 (LGPL-3.0), ELK (Apache-2.0) and Openllet (AGPL-3.0) results may be published; the commercial systems' may not (`benches/competitors/README.md`).
 
 **Profiling before optimising** (the project's rule): sampling profiles (Windows ETW on the

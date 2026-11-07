@@ -234,19 +234,23 @@ impl MutationPipeline {
             // So does the process's memory limit: the commit is refused, not the machine.
             let memory = self.store.memory_stop();
             let stop = || ticket.is_cancelled() || memory.exceeded();
+            // The violations' list draws on the request's envelope: past it, the list stops
+            // and the commit is still rejected (the change is inconsistent either way).
+            let report_memory = Arc::new(envelope.part());
             let (violations, materialisation, changed) =
-                crate::reasoning::apply_delta(program, cached, &mut tx, &stop).map_err(|_| {
-                    memory
-                        .error()
-                        .map_or(MutationError::Cancelled, &store_error)
-                })?;
+                crate::reasoning::apply_delta(program, cached, &mut tx, &stop, &report_memory)
+                    .map_err(|interrupted| {
+                        memory
+                            .error(interrupted)
+                            .map_or(MutationError::Cancelled, &store_error)
+                    })?;
             tracing::debug!(?materialisation, "commit-path materialisation");
             crate::reasoning::log_diagnostics(
                 &materialisation.diagnostics,
                 materialisation.diagnostics_total,
                 "the commit leaves an ontology axiom unusable",
             );
-            if let Some(violation) = violations.first() {
+            if !violations.consistent() {
                 // The committer sees the premises asserted in graphs it may read; the
                 // others are withheld, and counted (graph access: nothing from a graph a
                 // reader can't read reaches it).
@@ -258,19 +262,36 @@ impl MutationPipeline {
                     _ => true,
                 };
                 let restricted = matches!(requester.read, crate::ReadScope::Graphs(_));
-                let explanation = crate::reasoning::explain_violation(
-                    program,
-                    violation,
-                    &tx,
-                    restricted.then_some(&readable as &dyn Fn(nrese_reasoner::ir::Triple) -> bool),
-                );
-                let attribution =
-                    attribute_reject_delta(&explanation, &MutationDeltaPreview::of(&tx));
-                let mut detail = format!(
-                    "mutation violates {} consistency check(s); first: {}",
-                    violations.len(),
-                    explanation.summary
-                );
+                // A list that stopped at its budget before its first entry has none to
+                // explain; the change is rejected all the same.
+                let explanation = violations.first().map(|violation| {
+                    crate::reasoning::explain_violation(
+                        program,
+                        &violation,
+                        &tx,
+                        restricted
+                            .then_some(&readable as &dyn Fn(nrese_reasoner::ir::Triple) -> bool),
+                    )
+                });
+                let attribution = explanation.as_ref().and_then(|explanation| {
+                    attribute_reject_delta(explanation, &MutationDeltaPreview::of(&tx))
+                });
+                let count = match violations.complete() {
+                    true => violations.at_least().to_string(),
+                    false => format!("at least {}", violations.at_least()),
+                };
+                let mut detail = match &explanation {
+                    Some(explanation) => format!(
+                        "mutation violates {count} consistency check(s); first: {}",
+                        explanation.summary
+                    ),
+                    None => format!("mutation violates {count} consistency check(s)"),
+                };
+                if !violations.complete() {
+                    detail.push_str(
+                        " (the list of violations stopped at the request's memory budget)",
+                    );
+                }
                 if let Some((s, p, o)) = attribution
                     .as_ref()
                     .and_then(super::attribution::RejectAttribution::likely_commit_trigger)
@@ -279,12 +300,12 @@ impl MutationPipeline {
                 }
                 self.record_run(ReasoningRunRecord::from_report(
                     &materialisation,
-                    Some(explanation.clone()),
+                    explanation.clone(),
                     attribution.clone(),
                 ));
                 return Err(MutationError::Rejected(Box::new(MutationReject {
                     detail,
-                    explanation: Some(explanation),
+                    explanation,
                     attribution,
                 })));
             }
@@ -322,7 +343,7 @@ impl MutationPipeline {
             }
             crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph)
                 .map_err(store_error)?;
-            self.shacl_gate(&tx)?;
+            self.shacl_gate(&tx, &context.resources(), store_error)?;
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }
@@ -370,7 +391,7 @@ impl MutationPipeline {
         // Without reasoning, commits don't maintain the inferred stack.
         self.store.invalidate_reasoning().map_err(store_error)?;
         crate::shacl::check_shapes(&tx, &self.store.config().shapes_graph).map_err(store_error)?;
-        self.shacl_gate(&tx)?;
+        self.shacl_gate(&tx, &context.resources(), store_error)?;
         if !ticket.begin_commit() {
             return Err(MutationError::Cancelled);
         }
@@ -382,14 +403,26 @@ impl MutationPipeline {
     }
 
     /// The SHACL commit gate (C2): validates what the transaction's changes can affect,
-    /// after reasoning, and rejects the commit if the policy says so.
-    fn shacl_gate(&self, tx: &nrese_engine::Transaction<'_>) -> Result<(), MutationError> {
+    /// after reasoning, and rejects the commit if the policy says so. It runs on the write's
+    /// `resources` (its cancellation and envelope). A validation they stop fails the write
+    /// as `stopped` maps it, under every policy: it is no verdict on the data, so neither a
+    /// rejection nor a warning to commit past.
+    fn shacl_gate(
+        &self,
+        tx: &nrese_engine::Transaction<'_>,
+        resources: &nrese_sparql::Resources,
+        stopped: impl FnOnce(StoreError) -> MutationError,
+    ) -> Result<(), MutationError> {
         let gate = self.store.config().shacl_gate;
         if gate == ShaclGate::Off {
             return Ok(());
         }
-        let report = crate::shacl::introduced(tx, &self.store.config().shapes_graph)
-            .map_err(|error| MutationError::Gate(error.to_string()))?;
+        let report =
+            match crate::shacl::introduced(tx, &self.store.config().shapes_graph, resources) {
+                Ok(report) => report,
+                Err(error @ StoreError::SparqlEvaluation(_)) => return Err(stopped(error)),
+                Err(error) => return Err(MutationError::Gate(error.to_string())),
+            };
         let Some(report) = report else {
             return Ok(());
         };

@@ -8,12 +8,20 @@
 # COMMIT (its tree TREE) with the changed files of LIST. The job yields to timed work: never
 # started beside it, stopped when a timed job of higher priority wants its host. It runs on a
 # Linux host with the test role.
-# MODE windows (LIST empty): a job of kind owlrs.any on a Windows host that can run the OWL-RS
-# Windows suite (`has = ["owlrs-windows-suite"]`, declared in the fleet's config), which runs the
-# commit's own scripts/lib/windows-job.ps1 and through it its scripts/check.sh windows.
+# MODE windows (LIST empty): a job of kind owlrs.any on any Windows host with what the tier uses
+# there (below, `has`, in the fleet config's names), which runs the commit's own
+# scripts/lib/windows-job.ps1 and through it its scripts/check.sh windows.
 # NRESE_GATE_HOSTS: only these hosts. It follows the job and reads its result: valid only when it
 # is for TREE, LIST_HASH, this tier and IDENTITY (the toolchain and the flags,
-# scripts/lib/gate-key.sh) and left no tracked file changed.
+# scripts/lib/gate-key.sh) and left no tracked file changed; for windows also only when the suite
+# ran with the Python runtime COMMIT declares (gate_runtime), as the record states it.
+#
+# The merge check's jobs are the fleet's merge gates (`priority_class = "merge-gate"`, a class its
+# config ranks): either tier's job when COMMIT is for refactor/engine-v2, i.e. NRESE_PUSH_REF, the
+# ref it goes to, is refs/heads/refactor/engine-v2: the pre-push hook's, or by hand the caller's
+# word (a merge check run before its push states it for both tiers). A package's push or Windows
+# check isn't one, a merge among its commits or not (Sol, merge-gate-class r1; PR #69 r1 R1), nor a
+# check by hand that names no ref.
 #
 # A failure on a host whose failures don't count alone (NRESE_GATE_UNCONFIRMED_HOSTS, default
 # khaleesi and khaleesi-wsl: the owner, 20 Oct 2026, its RAM never formally verified) is reported
@@ -27,8 +35,10 @@
 # NRESE_GATE_START_S (default 180 s; again after a host stopped it), it ran past NRESE_GATE_MAX_S
 # (default 10800 s), or its result is missing or for something else. The job is cancelled then,
 # and nothing runs here instead: no verdict, no push. For windows the start window is 1800 s and
-# the ask 6 cores: the fleet counts the main PC's own load, and kraris-gptler didn't free 8 cores
-# within 30 min on 26 Oct 2026.
+# the ask 4 cores, measured: a 4-core run took 899 s and started within 11 min, where a 6-core
+# one hadn't started in 25 (PR #66's, 31 Oct 2026: the host's console cap gives the fleet 8 of its
+# 16 threads, its owner's own load 2-6 of those); 6 cores took 696 s. The build and the tests are
+# what more cores speed up, not the suite contracts (466 s of the 899).
 set -u
 mode=$1 list=$2 tree=$3 list_hash=$4 identity=$5 where=$6 commit=$7
 cd "$(git rev-parse --show-toplevel)" || exit 75
@@ -47,6 +57,12 @@ no_verdict() {
 
 fleet_ready || no_verdict "no fleet to ask"
 [ "$(git rev-parse "$commit^{tree}" 2> /dev/null)" = "$tree" ] || no_verdict "commit $commit isn't tree $tree"
+# shellcheck source=gate-key.sh
+. scripts/lib/gate-key.sh
+runtime=""
+if [ "$mode" = windows ]; then
+  runtime=$(gate_runtime "$commit") || no_verdict "commit $commit declares no Python runtime for the suite"
+fi
 
 # What a tier asks for (cores also bound its compilers; the step's slice caps its memory on
 # Linux, scripts/cargo-guarded.sh's job object on Windows).
@@ -60,12 +76,24 @@ case $mode in
     # 9 GB job admitted at 16 GB that peaks at 7.5 GB still leaves 8.5 GB, clear of the 4 GB
     # eviction floor (the fleet's owner, 27 Oct 2026). 16 GB kept checks waiting while 11-15 GB
     # was free.
-    cores=${NRESE_GATE_CORES:-6} ram=${NRESE_GATE_RAM_GB:-9} est=${NRESE_GATE_EST_MIN:-30}
+    # est: the slowest whole 4-core run, 1,547 s, x 1.5 (others took 1,011-1,073 s).
+    cores=${NRESE_GATE_CORES:-4} ram=${NRESE_GATE_RAM_GB:-9} est=${NRESE_GATE_EST_MIN:-39}
     os=windows kind=owlrs.any confirm=kraris-gptler start_s=${NRESE_GATE_START_S:-1800}
+    # What the tier uses there, in the fleet config's names: `rust`, rustup with its MSVC toolchain
+    # and linker (scripts/lib/windows-job.sh installs the tree's pinned release). The rest comes with
+    # every Windows host of the fleet, unnamed: Git Bash, a stdlib `python` on PATH (the cache's
+    # lock), long paths, PowerShell 5.1 with Add-Type, outbound HTTPS (the fleet's owner, 2 Nov 2026).
+    # The suite's Python and packages the job brings itself (scripts/lib/suite-python.sh).
+    has='["rust"]'
     reason="the merge check's Windows part (scripts/check.sh windows); no merge without it" ;;
   *) cores=${NRESE_GATE_CORES:-2} ram=${NRESE_GATE_RAM_GB:-4} est=${NRESE_GATE_EST_MIN:-10} ;;
 esac
 priority=${NRESE_GATE_PRIORITY:-600}
+# The merge check's jobs (above): either tier's, for a commit that goes to engine-v2.
+class=""
+if [ "${NRESE_PUSH_REF:-}" = refs/heads/refactor/engine-v2 ]; then
+  class=merge-gate
+fi
 job=$(mktemp)
 trap 'rm -f "$job"' EXIT
 
@@ -78,6 +106,7 @@ gate() {
     # 600 by default; a gate someone waits for may say so (NRESE_GATE_PRIORITY with its reason).
     echo "priority = $priority"
     echo "priority_reason = $(q "${NRESE_GATE_REASON:-$reason}")"
+    [ -z "$class" ] || echo "priority_class = $(q "$class")"
     echo "est_min = $est"
     if [ "$mode" = windows ]; then
       printf 'steps = [["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", %s, %s]]\n' \
@@ -102,8 +131,7 @@ gate() {
     echo "os = $(q "$os")"
     echo "cores = $cores"
     echo "ram_gb = $ram"
-    # A host that can run the suite there (its Python packages, Git Bash), which its config declares.
-    [ "$mode" != windows ] || echo 'has = ["owlrs-windows-suite"]'
+    [ "$mode" != windows ] || echo "has = $has"
     if [ -n "$1" ]; then
       printf 'hosts = ['
       local h sep=""
@@ -126,10 +154,11 @@ gate() {
   # A verdict only from a whole, consistent record of this job's last attempt where the fleet says
   # it ran (Sol, review-remote-gates-r1-20261020): a pass needs the job done, check.sh's exit 0 and
   # its summary with every step at 0; a failure needs the job failed, exit 1 and a step that
-  # failed. Anything else, or a record of another job, host or attempt, is no verdict.
-  verdict=$(python - "$out" "$mode" "$tree" "$list_hash" "$identity" "${NRESE_W3C_OPTIONAL:+1}"       "$fleet_state" "$fleet_id" "$fleet_host" "$(dirname "$out")/attempt" << 'EOF'
+  # failed. Anything else, or a record of another job, host or attempt, or (windows) of a run under
+  # another Python runtime than the declared one, is no verdict.
+  verdict=$(python - "$out" "$mode" "$tree" "$list_hash" "$identity" "${NRESE_W3C_OPTIONAL:+1}"       "$fleet_state" "$fleet_id" "$fleet_host" "$(dirname "$out")/attempt" "$runtime" << 'EOF'
 import json, sys
-path, mode, tree, list_hash, identity, w3c, state, job, host, attempt_file = sys.argv[1:11]
+path, mode, tree, list_hash, identity, w3c, state, job, host, attempt_file, runtime = sys.argv[1:12]
 r = json.load(open(path, encoding="utf-8"))
 try:
     attempt = open(attempt_file, encoding="utf-8").read().strip()
@@ -137,7 +166,7 @@ except OSError:
     attempt = None
 want = {"tier": mode, "tree": tree, "list_hash": list_hash, "identity": identity,
         "w3c_optional": bool(w3c), "tracked_changes": "", "job": job, "fleet_host": host,
-        "attempt": attempt, "summary": True}
+        "attempt": attempt, "summary": True, "runtime": runtime or None}
 wrong = [f"{k} {r.get(k)!r}, not {v!r}" for k, v in want.items() if r.get(k) != v]
 steps = r.get("steps") or []
 failing = [s["name"] for s in steps if s.get("code") != 0]

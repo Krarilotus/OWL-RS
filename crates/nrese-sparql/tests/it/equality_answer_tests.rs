@@ -11,8 +11,8 @@ use std::sync::Arc;
 use nrese_engine::{EncodedTriple, Engine, EngineConfig, Snapshot};
 use nrese_rdf::{GraphName, NamedNode, Quad, Term};
 use nrese_sparql::{
-    CancellationToken, QueryEvaluationError, QueryOptions, QueryResults, ServiceClient,
-    ServiceResults, Services, evaluate_query,
+    QueryEvaluationError, QueryOptions, QueryResults, ServiceCall, ServiceClient, ServiceResults,
+    Services, evaluate_query,
 };
 use nrese_sparql_syntax::SparqlParser;
 
@@ -138,14 +138,16 @@ impl ServiceClient for Endpoint {
         &self,
         _endpoint: &str,
         query: &str,
-        _cancellation: Option<&CancellationToken>,
-    ) -> Result<ServiceResults, Box<dyn std::error::Error + Send + Sync>> {
-        let parsed = SparqlParser::new().parse_query(query)?;
+        _call: ServiceCall<'_>,
+    ) -> Result<ServiceResults, QueryEvaluationError> {
+        let parsed = SparqlParser::new()
+            .parse_query(query)
+            .map_err(|error| QueryEvaluationError::Service(error.into()))?;
         let snapshot = self.0.snapshot();
         let QueryResults::Solutions(solutions) =
             evaluate_query(&snapshot, &parsed, &QueryOptions::default())?
         else {
-            return Err("not a SELECT".into());
+            return Err(QueryEvaluationError::Service("not a SELECT".into()));
         };
         let variables = solutions.variables().to_vec();
         let mut rows = Vec::new();
@@ -409,5 +411,64 @@ fn canonical_reads_take_a_constant_by_its_class_in_every_graph() {
             subjects.iter().any(|&(_, g)| g == alias),
             "{model:?}: {subjects:?}"
         );
+    }
+}
+
+/// A COUNT whose answer is past what 64 bits hold fails as the engine's range limit; it
+/// never answers a wrong number. `owl:sameAs owl:sameAs owl:sameAs` over a class of n
+/// identities is n³ statements, past 2^64 from n = 2,642,246 on.
+#[test]
+#[ignore = "about 2.7 M statements: run with --ignored, in release (the package's release proof)"]
+fn a_count_past_64_bits_fails_as_a_range_limit() {
+    const IDENTITIES: u64 = 2_700_000;
+    let engine = Engine::new(EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let mut tx = engine.transaction();
+    let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+    // Interned first, owl:sameAs has the smallest id: its class's representative.
+    let same_as = tx.intern(same_as.as_ref().into());
+    let same_as_rep = |subject| EncodedTriple {
+        subject,
+        predicate: same_as,
+        object: same_as,
+    };
+    tx.insert_inferred(same_as_rep(same_as));
+    for i in 1..IDENTITIES {
+        let identity = tx.intern(ex(&format!("i{i}")).as_ref().into());
+        tx.insert_inferred(same_as_rep(identity));
+    }
+    tx.commit().unwrap();
+    engine.set_equality(Some(same_as));
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new()
+        .parse_query("SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }")
+        .unwrap();
+    let early = QueryOptions {
+        equality_early_expansion: true,
+        as_written: true,
+        ..QueryOptions::default()
+    };
+    for options in [QueryOptions::default(), early] {
+        let count = || -> Result<Option<Term>, QueryEvaluationError> {
+            let QueryResults::Solutions(mut solutions) =
+                evaluate_query(&snapshot, &query, &options)?
+            else {
+                unreachable!("a SELECT")
+            };
+            Ok(solutions
+                .next()
+                .transpose()?
+                .and_then(|s| s.get("n").cloned()))
+        };
+        match count() {
+            Err(QueryEvaluationError::CountBeyondRange { .. }) => {}
+            other => panic!(
+                "early expansion {}: {other:?}",
+                options.equality_early_expansion
+            ),
+        }
     }
 }

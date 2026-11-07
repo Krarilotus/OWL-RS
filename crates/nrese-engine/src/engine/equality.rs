@@ -259,8 +259,8 @@ fn dedup_sorted(items: &mut ChargedVec<EncodedQuad>) {
 /// Made on `budget`, everything reserved before it is allocated: the statements, the
 /// run's arrays, its scans' working memory, the version and its list of runs, and the
 /// view's own allocation. The [`View`] holds what it keeps reserved, released after it is
-/// freed; a refusal leaves nothing made. O(a log n + k log k) for a aliases and k such statements, or one scan of
-/// the named graphs where that is less.
+/// freed; a refusal leaves nothing made. O(a log n + k (log k + r log n)) for a aliases, k
+/// such statements and r runs, or one scan of the named graphs where that is less.
 fn canonical_version(
     version: &Arc<Version>,
     same_as: TermId,
@@ -288,6 +288,10 @@ fn canonical_version(
     }
     inserts.sort_unstable();
     dedup_sorted(&mut inserts);
+    // An exact delta (`index/run.rs`): a representatives' statement the asserted stack
+    // holds already, asserted beside an alias's that stands for it, is not inserted again,
+    // or its key would count twice. No insert is a statement tombstoned: those name an alias.
+    inserts.retain(|quad| !asserted.contains(quad));
     // What the view keeps besides its run's arrays: its run, the list of runs, the
     // version and its equality cell, and the view itself, each with its allocation's
     // header.
@@ -488,15 +492,16 @@ impl Classes {
     }
 
     /// How many quads a canonical stored quad stands for, given the pattern's constants
-    /// (a constant stands for itself).
-    pub(crate) fn multiplicity(&self, quad: &EncodedQuad, pattern: &QuadPattern) -> u64 {
+    /// (a constant stands for itself); `None` for more than a `u64` holds, never a wrapped
+    /// or capped number (PR #70 fix checks 1 F2 and 2 F3: a class of 2^22 identities).
+    pub(crate) fn multiplicity(&self, quad: &EncodedQuad, pattern: &QuadPattern) -> Option<u64> {
         let size = |bound: Option<TermId>, id: TermId| match bound {
             Some(_) => 1,
             None => self.expansion(id.raw()).map_or(1, |m| m.len() as u64),
         };
         size(pattern.subject, quad.subject)
-            * size(pattern.predicate, quad.predicate)
-            * size(pattern.object, quad.object)
+            .checked_mul(size(pattern.predicate, quad.predicate))?
+            .checked_mul(size(pattern.object, quad.object))
     }
 
     /// How many copies [`Self::expand`] gives `quad` for `pattern`: the product of its
@@ -511,12 +516,13 @@ impl Classes {
             .saturating_mul(count(pattern.object, quad.object))
     }
 
-    /// The quads a canonical stored quad stands for, the pattern's constants in place.
+    /// The quads a canonical stored quad stands for, the pattern's constants in place, until
+    /// `out` breaks (an existence question has its answer at the first one it counts).
     pub(crate) fn expand(
         &self,
         quad: &EncodedQuad,
         pattern: &QuadPattern,
-        out: &mut impl FnMut(EncodedQuad),
+        out: &mut impl FnMut(EncodedQuad) -> std::ops::ControlFlow<()>,
     ) {
         let values = |bound: Option<TermId>, id: TermId| -> Values<'_> {
             match bound {
@@ -536,7 +542,9 @@ impl Classes {
         for &s in s.as_slice() {
             for &p in p.as_slice() {
                 for &o in o.as_slice() {
-                    out(EncodedQuad::from_components([s, p, o, graph]));
+                    if out(EncodedQuad::from_components([s, p, o, graph])).is_break() {
+                        return;
+                    }
                 }
             }
         }
@@ -744,6 +752,7 @@ impl<'a, I: Iterator<Item = EncodedQuad>> Expand<'a, I> {
             if all || visibility.shows(&quad, touching) {
                 pending.push(Reverse(permutation.to_key(&quad)));
             }
+            std::ops::ControlFlow::Continue(())
         });
         true
     }
@@ -868,6 +877,24 @@ mod tests {
         .collect();
         assert_eq!(expanded.len(), 3 + 1);
         assert!(expanded.iter().all(|q| q.subject.raw() == 30));
-        assert_eq!(classes.multiplicity(&quad(10, 5, 20), &pattern), 3);
+        assert_eq!(classes.multiplicity(&quad(10, 5, 20), &pattern), Some(3));
+    }
+
+    /// One class of 2^22 identities in all three places stands for 2^66 quads, more than a
+    /// `u64` holds: the multiplicity says so, neither wrapped (it wrapped to 0, so a snapshot
+    /// holding such a class read as empty: PR #70 fix check 1 F2) nor capped (a capped count
+    /// was published as an exact `COUNT`: fix check 2 F3).
+    #[test]
+    fn multiplicity_past_u64_is_none() {
+        let r = 1;
+        let mut classes = Classes::default();
+        classes.members.insert(r, (r..r + (1 << 22)).collect());
+        let all = QuadPattern::all();
+        assert_eq!(classes.multiplicity(&quad(r, r, r), &all), None);
+        let bound = QuadPattern {
+            subject: Some(TermId::from_raw(r)),
+            ..all
+        };
+        assert_eq!(classes.multiplicity(&quad(r, r, r), &bound), Some(1 << 44));
     }
 }

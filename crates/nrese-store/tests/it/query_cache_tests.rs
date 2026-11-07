@@ -198,9 +198,8 @@ fn pinned_results_stay_and_are_pinned_again_after_a_commit() {
 
 #[test]
 fn configured_queries_are_pinned_at_startup() {
-    let dir = std::env::temp_dir().join(format!("nrese-pins-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("everything.rq");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("everything.rq");
     std::fs::write(&path, "SELECT * WHERE { ?s ?p ?o }").unwrap();
     let store = StoreService::new(StoreConfig {
         pinned_queries: vec![path],
@@ -210,10 +209,9 @@ fn configured_queries_are_pinned_at_startup() {
     let pins = store.pinned_queries();
     assert_eq!(pins.len(), 1);
     assert_eq!(pins[0].name, "everything");
-    std::fs::remove_dir_all(&dir).unwrap();
     // A file that isn't there is a startup error.
     let missing = StoreService::new(StoreConfig {
-        pinned_queries: vec![dir.join("missing.rq")],
+        pinned_queries: vec![dir.path().join("missing.rq")],
         ..StoreConfig::in_memory()
     });
     assert!(missing.is_err());

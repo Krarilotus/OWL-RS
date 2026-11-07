@@ -9,7 +9,8 @@
 //! | Duration | `ms`, `s`, `min` (or `m`), `h` |
 //! | Share of the machine's memory | `%` |
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use nrese_store::memory::Reading;
 
 /// The number and the unit of `text`: `"1.5 GiB"` is `(1.5, "gib")`.
 fn split(text: &str) -> Result<(f64, String)> {
@@ -57,12 +58,12 @@ pub(super) fn parse_duration_ms(text: &str) -> Result<u64> {
     Ok((number * factor as f64).round() as u64)
 }
 
-/// Bytes, or a share of the machine's memory (`50%`). `Ok(None)` if a share is asked for
-/// and the machine's memory isn't known: the caller then sets no limit.
-pub(super) fn parse_memory(text: &str) -> Result<Option<u64>> {
+/// Bytes, or a share of `machine`, the machine's memory as read ([`machine_memory_bytes`]):
+/// `50%`. The inner `Err` if a share is asked for and the machine's memory wasn't read.
+pub(super) fn parse_memory(text: &str, machine: Reading) -> Result<Reading> {
     let trimmed = text.trim();
     let Some(percent) = trimmed.strip_suffix('%') else {
-        return parse_size(trimmed).map(Some);
+        return parse_size(trimmed).map(Ok);
     };
     let share: f64 = percent
         .trim()
@@ -71,12 +72,25 @@ pub(super) fn parse_memory(text: &str) -> Result<Option<u64>> {
     if !(0.0..=100.0).contains(&share) {
         bail!("'{text}' is not between 0% and 100%");
     }
-    Ok(machine_memory_bytes().map(|total| (total as f64 * share / 100.0) as u64))
+    Ok(machine.map(|total| (total as f64 * share / 100.0) as u64))
+}
+
+/// A memory limit (`name`'s): bytes, or a share of `machine` ([`parse_memory`]). A share
+/// of memory that wasn't read is refused: the limit couldn't be known, and none is no
+/// limit at all.
+pub(super) fn parse_memory_limit(text: &str, machine: Reading, name: &str) -> Result<u64> {
+    let bytes = parse_memory(text, machine).with_context(|| format!("failed to parse {name}"))?;
+    bytes.map_err(|unread| {
+        anyhow!(
+            "{name} is '{text}', a share of the memory the process may use, which wasn't \
+             read ({unread}); set it in bytes, or 0 for no limit"
+        )
+    })
 }
 
 /// The memory this process may use: the container's limit if there is one, else the
 /// machine's (`nrese_store::memory::available_bytes`, on Linux and Windows).
-pub fn machine_memory_bytes() -> Option<u64> {
+pub fn machine_memory_bytes() -> Reading {
     nrese_store::memory::available_bytes()
 }
 
@@ -144,12 +158,37 @@ mod tests {
 
     #[test]
     fn memory_is_bytes_or_a_share_of_the_machine() {
-        assert_eq!(parse_memory("8GiB").unwrap(), Some(8 << 30));
-        assert!(parse_memory("150%").is_err());
-        assert!(parse_memory("half").is_err());
-        // Known on Linux, unknown elsewhere: either way not an error.
-        let half = parse_memory("50%").unwrap();
-        assert_eq!(half, machine_memory_bytes().map(|total| total / 2));
+        const G: u64 = 1 << 30;
+        assert_eq!(parse_memory("8GiB", Ok(16 * G)).unwrap(), Ok(8 * G));
+        assert!(parse_memory("150%", Ok(16 * G)).is_err());
+        assert!(parse_memory("half", Ok(16 * G)).is_err());
+        assert_eq!(parse_memory("50%", Ok(16 * G)).unwrap(), Ok(8 * G));
+        let unread = Err(nrese_store::memory::Unread::Failed);
+        assert_eq!(parse_memory("50%", unread).unwrap(), unread);
+        assert_eq!(parse_memory("8GiB", unread).unwrap(), Ok(8 * G));
+    }
+
+    /// DC-07: a memory limit given as a share of memory that couldn't be read is refused,
+    /// naming the setting and the way out (bytes, or 0 for none); bytes need no reading.
+    #[test]
+    fn a_share_of_unread_memory_is_no_limit_and_is_refused() {
+        const NAME: &str = "NRESE_PROCESS_MEMORY_BYTES";
+        for unread in [
+            nrese_store::memory::Unread::Failed,
+            nrese_store::memory::Unread::Unsupported,
+        ] {
+            let error = parse_memory_limit("75%", Err(unread), NAME).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(NAME) && message.contains(" 0"),
+                "{message}"
+            );
+            assert_eq!(
+                parse_memory_limit("2GiB", Err(unread), NAME).unwrap(),
+                2 << 30
+            );
+            assert_eq!(parse_memory_limit("0", Err(unread), NAME).unwrap(), 0);
+        }
     }
 
     #[test]

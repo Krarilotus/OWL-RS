@@ -2,15 +2,22 @@
 hooks a calling git names (isolation.py). 20 Oct 2026: under the commit hook, tests that ran git
 emptied two commits and moved a branch of the repository being committed to; a caller's
 configuration (GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG_COUNT) set core.hooksPath and ran
-an outside hook in a test's own repository (Sol)."""
+an outside hook in a test's own repository (Sol).
+
+A test's own setup runs git under the suite's policy too; only the process under test starts from
+a caller's environment (isolation.inherit(git={})). PR #57 r1 R1: the setup here built its git
+environment by dropping every GIT_* variable, the suite's own configuration with them, so a
+caller's global commit.gpgSign failed it before its assertions."""
 from __future__ import annotations
 
-import os
+import ast
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+import isolation
 
 ISOLATION = Path(__file__).with_name("isolation.py")
 INNER_TEST = '''
@@ -41,15 +48,13 @@ class Inner(unittest.TestCase):
 
 class Isolation(unittest.TestCase):
     def test_a_test_running_git_under_a_hook_touches_neither_the_outer_repository_nor_its_hooks(self):
-        clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             outer, inner, hooks = tmp / "outer", tmp / "inner", tmp / "outside-hooks"
             for d in (outer, inner, hooks):
                 d.mkdir()
-            git = lambda *a: subprocess.run(["git", "-C", str(outer), "-c", "user.name=t", "-c", "user.email=t@t",  # noqa: E731
-                                             "-c", "core.hooksPath=", *a], capture_output=True, text=True, env=clean,
-                                            check=True).stdout
+            git = lambda *a: subprocess.run(["git", "-C", str(outer), *a], capture_output=True, text=True,  # noqa: E731
+                                            env=isolation.inherit(), check=True).stdout
             git("init", "-q")
             git("commit", "-q", "--allow-empty", "-m", "outer")
             state = lambda: (git("for-each-ref"), git("rev-parse", "HEAD"), git("symbolic-ref", "HEAD"),  # noqa: E731
@@ -65,10 +70,11 @@ class Isolation(unittest.TestCase):
             (inner / "test_inner.py").write_text(INNER_TEST, encoding="utf-8")
             # What a commit hook's environment can name: the outer repository, its index and tree,
             # a namespace, and configuration of every level.
-            hook = {**clean, "GIT_DIR": str(outer / ".git"), "GIT_INDEX_FILE": str(outer / ".git" / "index"),
-                    "GIT_WORK_TREE": str(outer), "GIT_NAMESPACE": "caller", "GIT_CONFIG_GLOBAL": str(config),
-                    "GIT_CONFIG_SYSTEM": str(config), "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.hooksPath",
-                    "GIT_CONFIG_VALUE_0": hooks.as_posix()}
+            hook = isolation.inherit(git={"GIT_DIR": str(outer / ".git"), "GIT_INDEX_FILE": str(outer / ".git" / "index"),
+                                          "GIT_WORK_TREE": str(outer), "GIT_NAMESPACE": "caller",
+                                          "GIT_CONFIG_GLOBAL": str(config), "GIT_CONFIG_SYSTEM": str(config),
+                                          "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.hooksPath",
+                                          "GIT_CONFIG_VALUE_0": hooks.as_posix()})
             done = subprocess.run([sys.executable, str(ISOLATION), "discover", "-s", str(inner)], env=hook,
                                   capture_output=True, text=True, timeout=120)
             self.assertFalse(marker.exists(), "an outside hook ran in a test's repository")
@@ -79,19 +85,31 @@ class Isolation(unittest.TestCase):
         """27 Oct 2026: a test read the history of the checkout it ran in and failed on hosts
         that had pruned it. Run from a checkout whose temporary directory lies inside it (a job
         directory's), a test's own directory and the one it runs in find no repository."""
-        clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
         with tempfile.TemporaryDirectory() as tmp:
             outer, inner = Path(tmp) / "outer", Path(tmp) / "inner"
             for d in (outer / "tmp", inner):
                 d.mkdir(parents=True)
             for args in (["init", "-q"], ["commit", "-q", "--allow-empty", "-m", "outer"]):
-                subprocess.run(["git", "-C", str(outer), "-c", "user.name=t", "-c", "user.email=t@t",
-                                "-c", "core.hooksPath=", *args], env=clean, check=True, capture_output=True, timeout=60)
+                subprocess.run(["git", "-C", str(outer), *args], env=isolation.inherit(), check=True,
+                               capture_output=True, timeout=60)
             (inner / "test_inner.py").write_text(INNER_FINDS_NO_REPOSITORY, encoding="utf-8")
             done = subprocess.run([sys.executable, str(ISOLATION), "discover", "-s", str(inner)], cwd=outer,
-                                  env={**clean, "TMPDIR": str(outer / "tmp"), "TEMP": str(outer / "tmp"),
-                                       "TMP": str(outer / "tmp")}, capture_output=True, text=True, timeout=120)
+                                  env=isolation.inherit(git={}, TMPDIR=str(outer / "tmp"), TEMP=str(outer / "tmp"),
+                                                        TMP=str(outer / "tmp")),
+                                  capture_output=True, text=True, timeout=120)
             self.assertEqual(done.returncode, 0, done.stderr[-800:])
+
+    def test_only_isolation_builds_a_git_environment(self):
+        """PR #57 r1 R3: five tests stripped or rebuilt git's environment themselves, and one of
+        them dropped the suite's configuration with the caller's (R1). A test module names no
+        GIT_ prefix to strip and asks git for no list of its variables: it takes
+        isolation.inherit() or environment() and sets its scenario's values on top."""
+        found = []
+        for path in sorted(ISOLATION.parent.glob("*.py")):
+            if path not in (ISOLATION, Path(__file__)):  # the policy, and this check's own two names
+                found += [f"{path.name}:{node.lineno} {node.value}" for node in ast.walk(ast.parse(path.read_text("utf-8")))
+                          if isinstance(node, ast.Constant) and node.value in ("GIT_", "--local-env-vars")]
+        self.assertEqual(found, [], "SPEC one git policy: only isolation.py strips or lists git's variables")
 
 
 if __name__ == "__main__":
