@@ -7,7 +7,7 @@ use crate::{QueryEvaluationError, QueryOptions, QueryResults, evaluate_query};
 use nrese_engine::vector::{CHUNK, DATATYPE, lexical};
 use nrese_engine::{Engine, EngineConfig};
 use nrese_exec::measure::{alone, measure_within};
-use nrese_exec::{Envelope, SharedBudget};
+use nrese_exec::{Budget, Envelope, SharedBudget};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
 use nrese_sparql_syntax::SparqlParser;
 
@@ -133,4 +133,29 @@ fn a_vector_search_past_its_envelope_is_refused_and_releases_everything() {
     let roomy = Envelope::new(Some(peak.max(1) * 2 + (1 << 20)), Some(shared.clone()));
     assert_eq!(witness(&engine, roomy).unwrap(), 0);
     assert_eq!(shared.used(), 0);
+}
+
+/// The exact scan holds nothing it didn't charge, at one, two and three parts (where a
+/// collected list of parts would round its allocation up) and at sixteen: each part's
+/// heap and hits, the list of parts and the merge are charged before they are allocated
+/// and released after they are freed (review fix check, S1).
+#[test]
+fn an_exact_scan_holds_no_more_than_it_charges() {
+    use nrese_engine::vector::{Metric, Vectors, exact};
+    if !alone() {
+        return;
+    }
+    for parts in [1, 2, 3, 16] {
+        let mut vectors = Vectors::new(1);
+        for i in 0..parts * CHUNK {
+            vectors.push(i as u64, &[i as f32]);
+        }
+        let budget = Budget::unlimited();
+        let (found, excess) = measure_within(&budget, || {
+            exact(&vectors, &[0.0], 10, Metric::L2, &|_| true, &budget).map(|hits| hits.len())
+        });
+        assert_eq!(found.unwrap(), 10, "{parts} parts");
+        assert_eq!(excess, 0, "{parts} parts: bytes held beyond the charge");
+        assert_eq!(budget.used(), 0, "{parts} parts: released");
+    }
 }
