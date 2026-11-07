@@ -19,15 +19,17 @@
 //! So is a shape whose affected nodes pass [`MAX_AFFECTED`].
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use nrese_engine::{EncodedQuad, GraphSelector, TermId};
+use nrese_exec::Reservation;
 use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 
 use crate::graph::{GraphView, Selection};
 use crate::model::{Constraint, Path, ShapeRef, Shapes, Target};
 use crate::path;
 use crate::report::{ValidationReport, decode};
-use crate::validate::{RawResult, Validator};
+use crate::validate::{self, Failures, RawResult, Validator};
 
 /// Affected focus nodes per shape beyond which the shape is validated whole: following
 /// that many nodes back costs about what a full validation does.
@@ -61,7 +63,8 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     let graph_after = GraphView::new(after, data);
     let sub_class_of = graph_after.iri(RDFS_SUB_CLASS_OF);
     let classes_moved = sub_class_of.is_some_and(|p| changed.iter().any(|q| q.predicate == p));
-    let validator_before = Validator::new(before, shapes, data, resources);
+    // The state before's failures are thrown away: none is made or charged.
+    let validator_before = Validator::discarding_failures(before, shapes, data, resources);
     let validator_after = Validator::new(after, shapes, data, resources);
     let mut introduced: BTreeSet<RawResult> = BTreeSet::new();
     if !changed.is_empty() {
@@ -142,9 +145,14 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
 
 /// The results a change of the shapes introduces in `data`: full validation against
 /// `shapes_after` in `after`, less what full validation against `shapes_before` found in
-/// `before` (`None`: the shapes didn't compile before, so nothing was found). Both views must
-/// share one dictionary, and each set of shapes be compiled from it. Runs on `resources` as
-/// [`crate::validate`] does.
+/// `before` (`None`: the shapes didn't compile before, so nothing was found), with the
+/// failures of the state after. Both views must share one dictionary, and each set of
+/// shapes be compiled from it. Runs on `resources` as [`crate::validate`] does.
+///
+/// The state before is validated only to tell its results apart: not at all when the state
+/// after has none, and without its failures, which are neither made nor charged. So a
+/// commit that removes what failed (an unsupported `sh:entailment`, a broken constraint)
+/// can't be refused by what it removes.
 pub fn validate_shapes_change<A: ReadView + Sync, B: ReadView + Sync>(
     before: &A,
     shapes_before: Option<&Shapes>,
@@ -154,13 +162,26 @@ pub fn validate_shapes_change<A: ReadView + Sync, B: ReadView + Sync>(
     resources: &Resources,
 ) -> Result<ValidationReport, QueryEvaluationError> {
     let mut report = crate::validate(after, shapes_after, data, resources)?;
-    if let Some(shapes_before) = shapes_before {
-        // The whole earlier report, so its charge is held while its results are.
-        let earlier = crate::validate(before, shapes_before, data, resources)?;
-        report
-            .results
-            .retain(|result| !earlier.results.contains(result));
+    let Some(shapes_before) = shapes_before else {
+        return Ok(report);
+    };
+    if report.results.is_empty() {
+        return Ok(report);
     }
+    let (earlier, held) = validate::validate_raw_results(before, shapes_before, data, resources)?;
+    let none = Failures {
+        list: Vec::new(),
+        held: Reservation::new(Arc::new(resources.memory.part())),
+    };
+    let decoded = decode(before, shapes_before, &earlier, none, resources);
+    // The earlier raw results are freed, then their charge returned.
+    drop(earlier);
+    drop(held);
+    // The whole earlier report, so its charge is held while its results are.
+    let earlier = decoded?;
+    report
+        .results
+        .retain(|result| !earlier.results.contains(result));
     Ok(report)
 }
 
