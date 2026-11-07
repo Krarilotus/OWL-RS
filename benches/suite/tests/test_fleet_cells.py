@@ -139,6 +139,8 @@ class FleetCells(unittest.TestCase):
             self.assertEqual(len(payload["group"]["systems"]), 1)
             system = payload["group"]["systems"][0]
             self.assertEqual("java" in job["requires"]["has"], system == "jena")
+            self.assertEqual(job["requires"]["ram_gb"], 28)  # sparql.toml's declared cap, no flat overhead
+            self.assertEqual(job["requires"]["cores"], 2)  # cargo-guarded.sh's documented floor
         self.assertIn("resource basis", text)
 
     def test_permanently_unplaceable_cell_is_omitted_from_the_set(self):
@@ -154,6 +156,14 @@ class FleetCells(unittest.TestCase):
         self.assertEqual(len(self.document()["job"]), 1)
         self.assertIn("omit qlever", text)
         self.assertIn("needs more RAM", text)
+
+    def test_bsbm_java_is_a_workload_dependency_for_qlever_too(self):
+        # Master's clarification: keep BIBM's actual Java need, separately from adapter needs.
+        code, text = self.run_plan("--workloads", "bsbm", "--tiers", "bsbm=bsbm-bi-100m", "--budget-hours", "20")
+        self.assertEqual(code, 0, text)
+        self.assertIn("java", self.document()["job"][0]["requires"]["has"])
+        self.assertIn("adapter needs ['docker']", text)
+        self.assertIn("workload/driver needs ['java']", text)
 
 
 if __name__ == "__main__":
