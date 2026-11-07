@@ -2081,4 +2081,51 @@ mod tests {
         });
         assert_eq!(all, 10_000);
     }
+
+    /// A poller shared by several searches (one per parallel task: the support sets'
+    /// one-step searches) stops one; every later search on it scans nothing, not even the
+    /// first scan it would open (sol-loop r4, R4-1).
+    #[test]
+    fn a_search_on_a_stopped_poller_scans_nothing() {
+        // (?x 12 ?y), (?y 12 ?z) -> (?x 13 ?z), asked for (1 13 2): 5,000 facts (1 12 y) and
+        // 6,000 (w 12 2), no y a w, so no path. The search starts from the smaller side, the
+        // 5,000 (1 12 y), scans them and finds nothing.
+        let facts: Vec<Triple> = (1_000..6_000)
+            .map(|y| [1, 12, y])
+            .chain((10_000..16_000).map(|w| [w, 12, 2]))
+            .collect();
+        let source = Counting {
+            facts,
+            scans: AtomicUsize::new(0),
+            matches: AtomicUsize::new(0),
+        };
+        let (x, y, z) = (Term::Var(0), Term::Var(1), Term::Var(2));
+        let rule = Rule {
+            name: "chain".to_owned(),
+            body: vec![Atom([x, Term::Const(12), y]), Atom([y, Term::Const(12), z])],
+            guards: vec![],
+            head: Head::Facts(vec![Atom([x, Term::Const(13), z])]),
+        };
+        // Not at the poller's start; at its first poll in the walk.
+        let asks = AtomicUsize::new(0);
+        let stop = || asks.fetch_add(1, Ordering::Relaxed) >= 1;
+        let mut poll = Poller::new(&stop).expect("not stopped yet");
+        derivations(&source, &rule, [1, 13, 2], Seg::All, &mut poll, &mut |_| {
+            false
+        });
+        assert!(poll.stopped(), "the first search outlived POLL_UNITS facts");
+        source.scans.store(0, Ordering::Relaxed);
+        source.matches.store(0, Ordering::Relaxed);
+        derivations(&source, &rule, [1, 13, 2], Seg::All, &mut poll, &mut |_| {
+            false
+        });
+        assert_eq!(
+            (
+                source.scans.load(Ordering::Relaxed),
+                source.matches.load(Ordering::Relaxed)
+            ),
+            (0, 0),
+            "scans opened and facts scanned by a search on a stopped poller"
+        );
+    }
 }
