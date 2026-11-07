@@ -2210,29 +2210,8 @@ impl<'a> Context<'a> {
         let mut all: Option<Solutions> = None;
         for graph in graphs {
             self.check()?;
-            let mut solutions = self.in_graph(GraphScope::Named(graph), inner)?;
-            match solutions.column(variable) {
-                // The pattern binds the variable itself: it must be this graph.
-                Some(column) => {
-                    let mask: Vec<bool> = solutions
-                        .table
-                        .column(column)
-                        .iter()
-                        .map(|&id| id == graph.raw() || id == UNDEF)
-                        .collect();
-                    solutions.table.retain_mask(&mask);
-                    let mut columns = std::mem::take(&mut solutions.table).into_columns();
-                    columns[column].fill(graph.raw());
-                    solutions.table = IdTable::from_columns(columns);
-                }
-                None => {
-                    let rows = solutions.table.len();
-                    let mut columns = std::mem::take(&mut solutions.table).into_columns();
-                    columns.push(vec![graph.raw(); rows]);
-                    solutions.vars.push(variable.clone());
-                    solutions.table = IdTable::from_columns(columns);
-                }
-            }
+            let solutions = self.in_graph(GraphScope::Named(graph), inner)?;
+            let solutions = bind_graph(solutions, variable, RowGraphs::One(graph.raw()));
             all = Some(match all {
                 Some(all) => self.union(all, solutions)?,
                 None => solutions,
@@ -5618,6 +5597,59 @@ impl<'b> Probe<'_, 'b> {
         }
         Ok(())
     }
+}
+
+/// The graphs [`bind_graph`] binds: one for every row, or each row's own.
+enum RowGraphs {
+    One(u64),
+    Each(Vec<u64>),
+}
+
+impl RowGraphs {
+    fn of(&self, row: usize) -> u64 {
+        match self {
+            Self::One(graph) => *graph,
+            Self::Each(graphs) => graphs[row],
+        }
+    }
+}
+
+/// `solutions`, a pattern's rows in named graphs, joined with `variable` bound to each row's
+/// graph, as SPARQL 1.1 §18.6 evaluates `GRAPH ?g { P }`: where the pattern binds `variable`
+/// itself, only the rows whose value is their graph (or unbound) stay, the graph written
+/// into its column in place (the column keeps its capacity, so what was charged for it is
+/// what [`Context::consumed`] releases); else the graphs become `variable`'s column. One
+/// rule for every evaluation of a graph variable: graph by graph ([`Context::graph`]) and a
+/// search's rows across graphs ([`search`]).
+fn bind_graph(mut solutions: Solutions, variable: &Variable, graphs: RowGraphs) -> Solutions {
+    let rows = solutions.table.len();
+    if let RowGraphs::Each(each) = &graphs {
+        debug_assert_eq!(each.len(), rows);
+    }
+    let mut columns = std::mem::take(&mut solutions.table).into_columns();
+    match solutions.column(variable) {
+        Some(column) => {
+            let mask: Vec<bool> = columns[column]
+                .iter()
+                .enumerate()
+                .map(|(row, &id)| id == graphs.of(row) || id == UNDEF)
+                .collect();
+            for (row, value) in columns[column].iter_mut().enumerate() {
+                *value = graphs.of(row);
+            }
+            solutions.table = IdTable::from_columns(columns);
+            solutions.table.retain_mask(&mask);
+        }
+        None => {
+            columns.push(match graphs {
+                RowGraphs::One(graph) => vec![graph; rows],
+                RowGraphs::Each(graphs) => graphs,
+            });
+            solutions.vars.push(variable.clone());
+            solutions.table = IdTable::from_columns(columns);
+        }
+    }
+    solutions
 }
 
 /// Columns of the variables `left` and `right` share, pairwise.
