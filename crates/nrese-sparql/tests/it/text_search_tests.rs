@@ -4,7 +4,7 @@
 
 use nrese_engine::{Engine, EngineConfig};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
-use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, explain_query};
+use nrese_sparql::{GraphAccess, QueryOptions, QueryResults, evaluate_query, explain_query};
 use nrese_sparql_syntax::SparqlParser;
 
 const EX: &str = "http://example.com/";
@@ -339,5 +339,62 @@ fn graphdb_lucene_predicates() {
     assert_eq!(
         query("SELECT ?x ?s WHERE { ?x luc:labels \"tower AND bridge\" ; luc:score ?s }"),
         table(&[&["bridge", "1"]])
+    );
+}
+
+/// A search under `GRAPH ?g` matches only literals of the named graphs the query's dataset
+/// has (SPARQL 1.1 §13.3, §18.6): those `FROM NAMED` lists, and of those only the graphs its
+/// reader may read (`QueryOptions::access`: the others are absent). One row each, every row
+/// reported: the reader of every graph (a guard), a reader who may not read `g`, one who
+/// may, and `FROM NAMED` naming another graph or `g`.
+#[test]
+fn a_graph_search_matches_only_the_datasets_named_graphs() {
+    let engine = engine();
+    let reader = |graphs: &[&str]| QueryOptions {
+        access: Some(std::sync::Arc::new(GraphAccess {
+            default_graph: true,
+            graphs: graphs.iter().map(|g| format!("{EX}{g}")).collect(),
+            ..GraphAccess::default()
+        })),
+        ..QueryOptions::default()
+    };
+    let search = |from: &str| {
+        format!("SELECT ?o {from} WHERE {{ GRAPH ?g {{ ?o bds:search \"bridge\" }} }}")
+    };
+    let hidden = table(&[&["A bridge in another graph"]]);
+    let rows_of = [
+        (
+            "every graph",
+            search(""),
+            QueryOptions::default(),
+            hidden.clone(),
+        ),
+        ("g unreadable", search(""), reader(&[]), table(&[])),
+        ("g readable", search(""), reader(&["g"]), hidden.clone()),
+        (
+            "FROM NAMED another graph",
+            search("FROM NAMED <http://example.com/other>"),
+            QueryOptions::default(),
+            table(&[]),
+        ),
+        (
+            "FROM NAMED g",
+            search("FROM NAMED <http://example.com/g>"),
+            QueryOptions::default(),
+            hidden,
+        ),
+    ];
+    let mut failed = Vec::new();
+    for (name, query, options, want) in rows_of {
+        let got = sorted(rows(&engine, &query, &options));
+        if got != want {
+            failed.push(format!("{name}: got {got:?}, want {want:?}"));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} rows failed:\n{}",
+        failed.len(),
+        failed.join("\n")
     );
 }
