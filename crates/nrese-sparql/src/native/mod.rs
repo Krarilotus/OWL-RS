@@ -61,6 +61,8 @@ mod triple_joins;
 mod triple_terms;
 pub(crate) mod typed_results;
 pub(crate) mod value;
+#[cfg(test)]
+mod vector_budget_tests;
 mod vectors;
 mod wcoj;
 
