@@ -54,7 +54,7 @@ use crate::term::{Dictionary, DictionaryStats, TermId};
 
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
 pub use equality::Classes as EqualityClasses;
-pub use replication::LogBatch;
+pub use replication::{Applied, LogBatch, LogExpectation};
 pub use snapshot::{
     Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity,
 };
@@ -432,6 +432,15 @@ impl Versions {
         Some(Merging(self))
     }
 
+    /// Waits until no merge runs. Off the Rayon pool only (the background worker's thread):
+    /// a pool thread may hold a part of the running merge under its wait.
+    fn wait_for_merge(&self) {
+        let mut merging = self.merging.lock();
+        while *merging {
+            self.merged.wait(&mut merging);
+        }
+    }
+
     /// The asserted stack of the latest version converted to the quad layout (a record's
     /// first quad in a named graph), with the compaction slot, so that nothing replaces the
     /// stack's runs until the caller publishes. Converted without the slot, on the caller's
@@ -595,43 +604,194 @@ impl Shared {
         }
     }
 
-    /// Runs whatever maintenance was requested. Called by the background worker.
-    fn maintain(&self) {
-        if self.wants_compaction.swap(false, Ordering::AcqRel) {
-            self.versions.compact(false);
-        }
-        if self.wants_checkpoint.swap(false, Ordering::AcqRel)
-            && let Err(error) = self.checkpoint()
+    /// Runs whatever maintenance was requested: a task of the background worker. Returns what
+    /// is to be done again because it couldn't be done now (on a pool thread nothing waits
+    /// for a running merge or checkpoint); the requests stay set for it.
+    fn maintain(&self) -> Again {
+        let mut again = Again::default();
+        if self.wants_compaction.swap(false, Ordering::AcqRel)
+            && self.versions.compact(false) == CompactionOutcome::Deferred
         {
-            tracing::error!(%error, "background checkpoint failed");
+            self.wants_compaction.store(true, Ordering::Release);
+            again.merge = true;
+        }
+        if self.wants_checkpoint.swap(false, Ordering::AcqRel) {
+            match self.checkpoint() {
+                Ok(_) => {}
+                // Another checkpoint is being written; it may be of an older revision than
+                // the one this request is for: again once it is written.
+                Err(crate::EngineError::SlotBusy(_)) => {
+                    self.wants_checkpoint.store(true, Ordering::Release);
+                    again.checkpoint = true;
+                }
+                Err(error) => tracing::error!(%error, "background checkpoint failed"),
+            }
+        }
+        again
+    }
+
+    /// Waits until no checkpoint is being written. Off the Rayon pool only (the background
+    /// worker's thread).
+    fn wait_for_checkpoint(&self) {
+        if let Some(durable) = &self.durable {
+            drop(durable.checkpoint_slot.lock());
         }
     }
 }
 
-/// Background maintenance thread. Wakeups are coalesced; the thread exits when the engine
-/// is dropped (the sender closes), after finishing the task in progress.
+/// Maintenance a task couldn't do yet ([`Shared::maintain`]).
+#[derive(Debug, Default, Clone, Copy)]
+struct Again {
+    /// A compaction deferred to a merge running.
+    merge: bool,
+    /// A checkpoint refused while another was being written.
+    checkpoint: bool,
+}
+
+/// Where the background worker's current task is (`Worker`).
+enum Task {
+    /// No task.
+    None,
+    /// Spawned on the pool, not started yet.
+    Queued,
+    Running,
+    /// Done: what is to be done again, or the panic the task ended in.
+    Ended(std::thread::Result<Again>),
+    /// Never started: a drop on a pool thread took it back, to leave it undone.
+    Abandoned,
+    /// Never started: a drop off the pool took it back, for the worker's thread to run.
+    Reclaimed,
+}
+
+/// Which thread is dropping the engine, once one is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shutdown {
+    /// A Rayon pool thread: no further task is run, and none queued is started.
+    OnPool,
+    /// A thread of no pool: what was requested is still done, on the worker's own thread.
+    OffPool,
+}
+
+/// What the background worker and its drop share.
+struct Lifecycle {
+    /// The current task, and the drop under way, if any.
+    state: Mutex<(Task, Option<Shutdown>)>,
+    changed: Condvar,
+}
+
+/// Background maintenance. Wakeups are coalesced. While the engine lives, each task (a
+/// compaction, a checkpoint) runs as one job of the global Rayon pool, the pool its parallel
+/// parts use, and the worker's own thread waits for it. The worker exits when the engine is
+/// dropped (the sender closes), after the task in progress, and the drop waits for it
+/// without running any pool job and without needing a free one (see `Drop`).
 struct Worker {
     wake: Option<mpsc::SyncSender<()>>,
     thread: Option<JoinHandle<()>>,
+    life: Arc<Lifecycle>,
 }
 
 impl Worker {
     fn spawn(shared: Arc<Shared>) -> std::io::Result<Self> {
         let (wake, wakeups) = mpsc::sync_channel::<()>(1);
-        let thread = std::thread::Builder::new()
-            .name("nrese-maintenance".to_owned())
-            .spawn(move || {
-                while wakeups.recv().is_ok() {
-                    // Set before the requests are taken, so that one is always visible.
-                    shared.maintaining.store(true, Ordering::SeqCst);
-                    shared.maintain();
-                    shared.maintaining.store(false, Ordering::SeqCst);
-                }
-            })?;
+        let life = Arc::new(Lifecycle {
+            state: Mutex::new((Task::None, None)),
+            changed: Condvar::new(),
+        });
+        let thread = {
+            let life = Arc::clone(&life);
+            std::thread::Builder::new()
+                .name("nrese-maintenance".to_owned())
+                .spawn(move || {
+                    while wakeups.recv().is_ok() {
+                        loop {
+                            let again = Self::task(&shared, &life);
+                            // Again once what held it up has ended (this thread may wait).
+                            if again.merge {
+                                shared.versions.wait_for_merge();
+                            }
+                            if again.checkpoint {
+                                shared.wait_for_checkpoint();
+                            }
+                            if !(again.merge || again.checkpoint) {
+                                break;
+                            }
+                        }
+                    }
+                })?
+        };
         Ok(Self {
             wake: Some(wake),
             thread: Some(thread),
+            life,
         })
+    }
+
+    /// Runs one task and waits for it: on the pool while the engine lives, on this thread
+    /// once a drop off the pool is under way, and not at all once one on a pool thread is.
+    fn task(shared: &Arc<Shared>, life: &Arc<Lifecycle>) -> Again {
+        let here = {
+            let mut state = life.state.lock();
+            match state.1 {
+                Some(Shutdown::OnPool) => return Again::default(),
+                Some(Shutdown::OffPool) => true,
+                None => {
+                    state.0 = Task::Queued;
+                    false
+                }
+            }
+        };
+        // Before the requests are taken, so that one is always visible ([`Engine::settle`]).
+        shared.maintaining.store(true, Ordering::SeqCst);
+        if here {
+            let again = shared.maintain();
+            shared.maintaining.store(false, Ordering::SeqCst);
+            return again;
+        }
+        {
+            // Weak: a job taken back by a drop stays queued until the pool runs it, and must
+            // not keep the store (its directory lock, its files) beyond the drop.
+            let (shared, life) = (Arc::downgrade(shared), Arc::clone(life));
+            rayon::spawn(move || {
+                {
+                    let mut state = life.state.lock();
+                    if !matches!(state.0, Task::Queued) {
+                        return;
+                    }
+                    state.0 = Task::Running;
+                }
+                // Caught here: a panic in a Rayon job would abort the process. It is resumed
+                // on the worker's thread, which ends with it.
+                let ended = match shared.upgrade() {
+                    Some(shared) => {
+                        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            shared.maintain()
+                        }));
+                        // Let go of the store before the drop waiting for this task can return.
+                        drop(shared);
+                        ended
+                    }
+                    None => Ok(Again::default()),
+                };
+                life.state.lock().0 = Task::Ended(ended);
+                life.changed.notify_all();
+            });
+        }
+        let task = {
+            let mut state = life.state.lock();
+            while matches!(state.0, Task::Queued | Task::Running) {
+                life.changed.wait(&mut state);
+            }
+            std::mem::replace(&mut state.0, Task::None)
+        };
+        let again = match task {
+            Task::Ended(Ok(again)) => again,
+            Task::Ended(Err(panic)) => std::panic::resume_unwind(panic),
+            // The pool may have no thread free to start it (base ran it on this thread).
+            Task::Reclaimed => shared.maintain(),
+            _ => Again::default(),
+        };
+        shared.maintaining.store(false, Ordering::SeqCst);
+        again
     }
 
     fn wake(&self) {
@@ -643,7 +803,31 @@ impl Worker {
 }
 
 impl Drop for Worker {
+    /// Ends maintenance and waits for it (IB0024): when the drop returns, maintenance has
+    /// ended and released the store. The wait runs no pool job, and needs no pool thread to
+    /// be free: a task that has started runs on a pool thread other than this one and ends
+    /// without it, and one queued but not started is taken back.
+    /// - On a Rayon pool thread (which may be the only one that could start it), it and any
+    ///   further task are left undone. That loses nothing: the next open recovers from the
+    ///   checkpoint and the log.
+    /// - Off the pool, it and what is still requested run on the worker's own thread, as the
+    ///   worker did before it ran tasks on the pool.
     fn drop(&mut self) {
+        let shutdown = match rayon::current_thread_index() {
+            Some(_) => Shutdown::OnPool,
+            None => Shutdown::OffPool,
+        };
+        {
+            let mut state = self.life.state.lock();
+            state.1 = Some(shutdown);
+            if matches!(state.0, Task::Queued) {
+                state.0 = match shutdown {
+                    Shutdown::OnPool => Task::Abandoned,
+                    Shutdown::OffPool => Task::Reclaimed,
+                };
+                self.life.changed.notify_all();
+            }
+        }
         self.wake.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

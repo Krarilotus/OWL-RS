@@ -69,59 +69,33 @@ pub struct RestoreCommand {
 }
 
 /// An RFC 3339 time (`2026-10-02T14:05:00Z`, `…T16:05:00.5+02:00`) as microseconds since
-/// 1970.
+/// 1970. Its calendar is `xsd:dateTime`'s, which RFC 3339's times are: a real date and
+/// clock time with an offset from UTC (`T`, `t` or a space between them; `Z` or `z`).
+/// Digits past the microsecond are cut off; a leap second (`:60`) and an offset past
+/// ±14:00 are refused, as `xsd:dateTime` refuses them.
 pub fn parse_time(text: &str) -> Result<u64> {
-    let bad = || anyhow::anyhow!("'{text}' is not an RFC 3339 time (2026-10-02T14:05:00Z)");
-    let number = |part: &str| part.parse::<i64>().map_err(|_| bad());
-    let (date, rest) = text.split_once(['T', 't', ' ']).ok_or_else(bad)?;
-    let mut date = date.splitn(3, '-');
-    let (year, month, day) = (
-        number(date.next().ok_or_else(bad)?)?,
-        number(date.next().ok_or_else(bad)?)?,
-        number(date.next().ok_or_else(bad)?)?,
-    );
-    // The zone: Z, or an offset from UTC.
-    let (time, offset_minutes) = if let Some(time) = rest.strip_suffix(['Z', 'z']) {
-        (time, 0)
-    } else {
-        let at = rest.rfind(['+', '-']).ok_or_else(bad)?;
-        let (time, zone) = rest.split_at(at);
-        let sign = if zone.starts_with('-') { -1 } else { 1 };
-        let (hours, minutes) = zone[1..].split_once(':').ok_or_else(bad)?;
-        (time, sign * (number(hours)? * 60 + number(minutes)?))
+    use std::str::FromStr as _;
+    let bad = |why: &dyn std::fmt::Display| {
+        anyhow::anyhow!("'{text}' is not an RFC 3339 time (2026-10-02T14:05:00Z): {why}")
     };
-    let mut clock = time.splitn(3, ':');
-    let (hour, minute, second) = (
-        number(clock.next().ok_or_else(bad)?)?,
-        number(clock.next().ok_or_else(bad)?)?,
-        clock.next().ok_or_else(bad)?,
-    );
-    let (whole, fraction) = second.split_once('.').unwrap_or((second, ""));
-    let second = number(whole)?;
-    let micros: i64 = match fraction {
-        "" => 0,
-        digits if digits.len() <= 9 && digits.bytes().all(|b| b.is_ascii_digit()) => {
-            format!("{digits:0<6}")[..6].parse().map_err(|_| bad())?
-        }
-        _ => return Err(bad()),
-    };
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return Err(bad());
+    let (date, time) = text
+        .split_once(['T', 't', ' '])
+        .ok_or_else(|| bad(&"no time"))?;
+    let time = time
+        .strip_suffix('z')
+        .map_or_else(|| time.to_owned(), |time| format!("{time}Z"));
+    let offset = time.len().checked_sub(6).map(|at| time.as_bytes()[at]);
+    if !time.ends_with('Z') && !matches!(offset, Some(b'+' | b'-')) {
+        return Err(bad(&"no offset from UTC"));
     }
-    // Days since 1970 of the civil date (Howard Hinnant's algorithm).
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let year_of_era = y - era * 400;
-    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * 146_097 + day_of_era - 719_468;
-    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second - offset_minutes * 60;
-    u64::try_from(seconds * 1_000_000 + micros).map_err(|_| bad())
+    let at = nrese_xsd::DateTime::from_str(&format!("{date}T{time}")).map_err(|e| bad(&e))?;
+    let epoch = nrese_xsd::DateTime::from_str("1970-01-01T00:00:00Z").map_err(|e| bad(&e))?;
+    let micros = at
+        .checked_sub(epoch)
+        .and_then(|since| since.as_seconds().checked_mul(1_000_000))
+        .and_then(|micros| nrese_xsd::Integer::try_from(micros).ok())
+        .ok_or_else(|| bad(&"out of range"))?;
+    u64::try_from(i64::from(micros)).map_err(|_| bad(&"before 1970"))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -653,5 +627,75 @@ mod tests {
         assert!(parse_time("2026-13-02T14:05:00Z").is_err());
         assert!(parse_time("yesterday").is_err());
         assert!(parse_time("2026-10-02T14:05:00").is_err());
+    }
+
+    /// Only real calendar dates, clock times and offsets (RFC 3339 §5.6 and §5.7): an
+    /// impossible one is refused, not moved to another instant. Every row is checked; the
+    /// failures are reported together.
+    #[test]
+    fn rfc3339_times_outside_the_calendar_are_refused() {
+        use super::parse_time;
+        let mut wrong = Vec::new();
+        for text in [
+            "2026-02-31T00:00:00Z",
+            "2025-02-29T00:00:00Z",
+            "2026-04-31T12:00:00Z",
+            "2026-10-02T14:05:00+02:99",
+            "2026-10-02T14:05:00+99:00",
+            "2026-10-02T-1:05:00Z",
+            "2026-10-02T14:-5:00Z",
+            "2026-10-02T14:05:-1Z",
+            "2026-1-02T14:05:00Z",
+            "2026-10-02T14:05:00+2:00",
+        ] {
+            if let Ok(micros) = parse_time(text) {
+                wrong.push(format!("{text} read as {micros}"));
+            }
+        }
+        // Guards: the separators and zone letters RFC 3339 allows, a leap day, an offset
+        // that is the same instant.
+        for (text, micros) in [
+            ("2024-02-29T00:00:00Z", 1_709_164_800_000_000u64),
+            ("2026-10-02t14:05:00z", 1_790_949_900_000_000),
+            ("2026-10-02 14:05:00Z", 1_790_949_900_000_000),
+            ("2026-10-02T23:35:00+09:30", 1_790_949_900_000_000),
+            ("2026-10-02T14:05:00.1234567Z", 1_790_949_900_123_456),
+        ] {
+            if parse_time(text).ok() != Some(micros) {
+                wrong.push(format!("{text}: {:?}, not {micros}", parse_time(text)));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Guards: the profile `restore --until-time` takes is RFC 3339 read by the xsd:dateTime
+    /// calendar (docs/ops/server-setup.md): a leap second (`:60`) and an offset past ±14:00
+    /// are refused, ±14:00 itself taken, and `24:00:00` is the next day's midnight. Every row
+    /// is checked.
+    #[test]
+    fn rfc3339_times_follow_the_xsd_profile_at_its_boundaries() {
+        use super::parse_time;
+        let mut wrong = Vec::new();
+        for text in [
+            "2016-12-31T23:59:60Z",
+            "2026-10-02T14:05:00+14:01",
+            "2026-10-02T14:05:00-14:01",
+            "2026-10-02T14:05:00+15:00",
+            "2026-10-02T24:00:01Z",
+        ] {
+            if let Ok(micros) = parse_time(text) {
+                wrong.push(format!("{text} read as {micros}"));
+            }
+        }
+        for (text, micros) in [
+            ("2026-10-03T04:05:00+14:00", 1_790_949_900_000_000u64),
+            ("2026-10-02T00:05:00-14:00", 1_790_949_900_000_000),
+            ("2026-10-01T24:00:00Z", 1_790_899_200_000_000),
+        ] {
+            if parse_time(text).ok() != Some(micros) {
+                wrong.push(format!("{text}: {:?}, not {micros}", parse_time(text)));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

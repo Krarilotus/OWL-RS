@@ -94,6 +94,9 @@ pub fn commits(
         .collect();
     let rematerialised_before = store.last_materialisation().map(|m| m.revision);
     let stop = Arc::new(AtomicBool::new(false));
+    // Checkpoints written meanwhile: on a durable store, the automatic ones the commits'
+    // log growth asks for (checkpoint-under-readers checks that they overlap).
+    let checkpoints_before = store.engine_stats().checkpoints;
     let handles = spawn_readers(&store, queries, readers, &stop);
     let (mut times, mut inserted, mut deleted, mut rounds) = (Vec::new(), 0u64, 0u64, 0usize);
     // The maintenance's work over the commits, in counts (equality cases compare these).
@@ -137,8 +140,11 @@ pub fn commits(
         }
     }
     let whole = started.elapsed();
+    // Written by the time the commits ended, before the readers stop: overlapping both.
+    let checkpoints = store.engine_stats().checkpoints - checkpoints_before;
     stop.store(true, Ordering::Relaxed);
     let mut reads = join_readers(handles)?;
+    let read_qps = reads.len() as f64 / whole.as_secs_f64();
     let incremental = store.last_materialisation().map(|m| m.revision) == rematerialised_before;
     let (p50, p99, max) = percentiles(&mut times);
     let samples: Vec<String> = times
@@ -173,7 +179,8 @@ pub fn commits(
         "{{\"commits\": {}, \"whole_s\": {:.3}, \"p50_ms\": {p50:.4}, \"p99_ms\": {p99:.4}, \"max_ms\": {max:.3}, \
          \"inferred_inserted\": {inserted}, \"inferred_deleted\": {deleted}, \"max_rounds\": {rounds}, \
          \"incremental\": {incremental}, \"readers\": {readers}, \"reads\": {}, \"read_p50_ms\": {r50:.3}, \
-         \"read_p99_ms\": {r99:.3}, \"samples_ms\": [{}], \"work\": {{{}}}{}}}",
+         \"read_p99_ms\": {r99:.3}, \"read_qps\": {read_qps:.1}, \"checkpoints\": {checkpoints}, \
+         \"samples_ms\": [{}], \"work\": {{{}}}{}}}",
         times.len(),
         whole.as_secs_f64(),
         reads.len(),
@@ -515,7 +522,13 @@ pub fn replication(
             let batch = primary.log_since(at, BATCH_BYTES)?;
             feed += started.elapsed();
             let started = Instant::now();
-            at = follower.apply_log(&batch.frames)?;
+            at = follower
+                .apply_log(
+                    &batch.frames,
+                    &batch.expectation(at),
+                    &nrese_exec::stop::StopSource::none(),
+                )?
+                .revision;
             apply += started.elapsed();
             run_records += batch.records;
             run_bytes += batch.frames.len();

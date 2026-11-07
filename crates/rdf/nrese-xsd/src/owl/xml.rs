@@ -9,6 +9,9 @@
 //! other entities and prefixes declared outside the fragment give `None`: the caller
 //! doesn't know the value.
 
+/// The namespace the `xml` prefix is bound to (Namespaces in XML 1.0 §3).
+const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
+
 /// The canonical form of the fragment `text`, if it is well-formed and decided here.
 pub fn canonical(text: &str) -> Option<String> {
     let mut p = Parser {
@@ -144,7 +147,8 @@ impl Parser<'_> {
                     let c = self.reference()?;
                     self.escape_text(c);
                 }
-                Some(b'>') if self.starts("]]>") => return None,
+                // Raw `]]>` outside a CDATA section is not character data (XML 1.0 §2.4).
+                Some(b']') if self.starts("]]>") => return None,
                 Some(_) => {
                     let c = self.char()?;
                     self.escape_text(c);
@@ -199,7 +203,10 @@ impl Parser<'_> {
             if attribute == "xmlns" || attribute.starts_with("xmlns:") {
                 let prefix = attribute.strip_prefix("xmlns").unwrap_or("");
                 let prefix = prefix.strip_prefix(':').unwrap_or(prefix).to_owned();
-                if declarations.iter().any(|(p, _)| *p == prefix) {
+                // `xml` is bound to its namespace, and nothing else is (Namespaces §3).
+                if declarations.iter().any(|(p, _)| *p == prefix)
+                    || (prefix == "xml") != (value == XML_NAMESPACE)
+                {
                     return None;
                 }
                 declarations.push((prefix, value));
@@ -254,6 +261,13 @@ impl Parser<'_> {
             keyed.push((ns, local, a, v));
         }
         keyed.sort();
+        // Attributes Unique (Namespaces §6.3): by expanded name, so neighbours once sorted.
+        if keyed
+            .windows(2)
+            .any(|w| (&w[0].0, &w[0].1) == (&w[1].0, &w[1].1))
+        {
+            return None;
+        }
         self.out.push('<');
         self.out.push_str(&name);
         for (prefix, iri) in &rendered {
@@ -297,7 +311,11 @@ impl Parser<'_> {
             .map(|(_, iri)| iri.clone())
     }
 
+    /// The namespace IRI `prefix` is bound to; `xml`'s binding needs no declaration.
     fn lookup(&self, prefix: &str) -> Option<String> {
+        if prefix == "xml" {
+            return Some(XML_NAMESPACE.to_owned());
+        }
         self.scopes
             .iter()
             .rev()
@@ -394,5 +412,57 @@ mod tests {
             Some("<a></a>".to_owned())
         );
         assert_eq!(canonical("plain"), Some("plain".to_owned()));
+    }
+
+    /// XML 1.0 §2.4 (`CharData` excludes `]]>`): raw `]]>` in content is not well-formed,
+    /// unlike its escaped form. Namespaces in XML 1.0 §6.3 (Attributes Unique): no two
+    /// attributes with the same expanded name, whatever their prefixes. §3: `xml` is bound
+    /// to its namespace and no other prefix (nor the default) may be. Malformed: no value.
+    #[test]
+    fn namespace_malformed_fragments_have_no_value() {
+        let xml = "http://www.w3.org/XML/1998/namespace";
+        let malformed = [
+            "a]]>b".to_owned(),
+            "<a>]]></a>".to_owned(),
+            "<a xmlns:p=\"urn:x\" xmlns:q=\"urn:x\" p:x=\"1\" q:x=\"2\"/>".to_owned(),
+            "<a xmlns:xml=\"urn:x\"/>".to_owned(),
+            format!("<a xmlns:p=\"{xml}\" p:z=\"1\"/>"),
+            format!("<a xmlns=\"{xml}\"/>"),
+        ];
+        // Every case is checked, so a failure lists each one given a value.
+        let valued: Vec<(&String, String)> = malformed
+            .iter()
+            .filter_map(|text| Some((text, canonical(text)?)))
+            .collect();
+        assert!(valued.is_empty(), "{valued:#?}");
+        // Guards (right on the base too): the escaped form, and two prefixes on two IRIs.
+        assert_eq!(canonical("a]]&gt;b"), Some("a]]&gt;b".to_owned()));
+        assert_eq!(
+            canonical("<a xmlns:p=\"urn:x\" xmlns:q=\"urn:y\" q:x=\"2\" p:x=\"1\"/>").unwrap(),
+            "<a xmlns:p=\"urn:x\" xmlns:q=\"urn:y\" p:x=\"1\" q:x=\"2\"></a>"
+        );
+    }
+
+    /// Namespaces in XML 1.0 §3: `xml` is bound to its namespace whether declared or not,
+    /// so declaring it changes nothing. Canonical XML 1.0 §2.2 orders attributes by
+    /// namespace IRI, then local name; exclusive canonicalisation renders no `xml`
+    /// declaration. `http://a/` sorts before `http://www.w3.org/XML/1998/namespace`.
+    #[test]
+    fn the_xml_prefix_is_bound_whether_declared_or_not() {
+        let xml = "http://www.w3.org/XML/1998/namespace";
+        let expected = "<a xmlns:p=\"http://a/\" p:b=\"2\" xml:z=\"1\"></a>";
+        let texts = [
+            "<a xmlns:p=\"http://a/\" xml:z=\"1\" p:b=\"2\"/>".to_owned(),
+            "<a xmlns:p=\"http://a/\" p:b=\"2\" xml:z=\"1\"/>".to_owned(),
+            // A guard (right on the base too): with the declaration, xml:z was resolved.
+            format!("<a xmlns:p=\"http://a/\" xmlns:xml=\"{xml}\" xml:z=\"1\" p:b=\"2\"/>"),
+        ];
+        // Every case is checked, so a failure lists each wrong one.
+        let wrong: Vec<(&String, Option<String>)> = texts
+            .iter()
+            .map(|text| (text, canonical(text)))
+            .filter(|(_, form)| form.as_deref() != Some(expected))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
