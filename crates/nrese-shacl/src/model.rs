@@ -19,6 +19,9 @@ pub struct Shapes {
     pub(crate) index: HashMap<TermId, ShapeRef>,
     /// The shapes graph's name, if it is a named graph: `$shapesGraph` in SHACL-SPARQL.
     pub(crate) graph: Option<TermId>,
+    /// The `sh:entailment` values of the shapes graph (SHACL §1.5): regimes the data must be
+    /// validated under. None is supported, so each is a failure of every validation.
+    pub(crate) entailments: Vec<TermId>,
 }
 
 impl Shapes {
@@ -29,6 +32,12 @@ impl Shapes {
 
     pub fn is_empty(&self) -> bool {
         self.shapes.is_empty()
+    }
+
+    /// Whether validating against these shapes can report nothing at all: no shape, and no
+    /// `sh:entailment`, which is a failure of every validation even without shapes.
+    pub fn is_vacuous(&self) -> bool {
+        self.shapes.is_empty() && self.entailments.is_empty()
     }
 
     /// The shapes validation starts from: active ones with a target.

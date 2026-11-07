@@ -81,6 +81,11 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
     for root in roots {
         compiler.shape(root);
     }
+    // Any triple with `sh:entailment` in the shapes graph, whatever its subject (SHACL §1.5).
+    let entailments = compiler
+        .sh("entailment")
+        .map(|predicate| compiler.graph.objects_of(predicate))
+        .unwrap_or_default();
     if compiler.errors.is_empty() {
         Ok(Shapes {
             shapes: compiler.shapes,
@@ -89,6 +94,7 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
                 GraphSelector::Exact(graph) if !graph.is_default_graph() => Some(graph),
                 _ => None,
             },
+            entailments,
         })
     } else {
         Err(compiler.errors)

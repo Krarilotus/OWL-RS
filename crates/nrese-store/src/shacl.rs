@@ -234,7 +234,8 @@ pub(crate) fn introduced(
         return Ok(Some(report));
     }
     let shapes = compile(before, shapes_selection).map_err(shapes_error)?;
-    if shapes.is_empty() {
+    // A shapes graph with only `sh:entailment` still makes every validation fail.
+    if shapes.is_vacuous() {
         return Ok(None);
     }
     let changed: Vec<EncodedQuad> = tx
