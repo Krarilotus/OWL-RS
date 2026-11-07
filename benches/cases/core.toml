@@ -2340,6 +2340,26 @@ systems = []
 guards = ["DL in the store (owl2-dl): a commit's consistency proved by the upper bound U1"]
 
 [[case]]
+name = "dlmode-commits-readers"
+area = "maintenance"
+what = "4,000 owl2-dl commits over a schema outside OWL 2 RL (a union on the right), 8 readers alongside, each read taking the bounds' view of the latest revision: U1's change and install against its reads; the last commit, inconsistent only under OWL 2 DL, is rejected"
+semantics = "owl2-dl"
+# `violate=2`'s union keeps the ontology outside OWL 2 RL, so U1 is compiled and each commit
+# maintains it (the RL schema alone routes every commit to the RL rules, with no U1).
+data = "churn people=20000 changes=2000 violate=2"
+args = ["--reason", "owl2-dl", "--commits", "{data}.commits.ru", "--readers", "8"]
+queries = "churn"
+# The whole run: commits and reads that wait for each other show in it (a commit's tail, a
+# read's stall), where one commit's p50 doesn't.
+metric = "commits.whole_s"
+check = { "commits.commits" = 4000, "commits.error" = "has inconsistent under OWL 2 DL" }
+# Only the DL gate rejects the last commit: the ontology took the U1 route, not the RL one.
+route = { "commits.error" = "has touched-islands" }
+cap_gb = 4
+systems = []
+guards = ["U1's locks are leaves: no read waits for a commit's change of U1, no install for a read's build (SYN-22, P2-C6b)"]
+
+[[case]]
 name = "dlmode-commits-small"
 area = "maintenance"
 what = "400 commits under owl2-dl on a tenth of dlmode-commits' data: a commit's fixed cost of the DL check (PR #30's and #37's timing)"
