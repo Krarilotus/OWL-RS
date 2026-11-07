@@ -1458,12 +1458,13 @@ def case_inputs(case: dict) -> dict[str, str | None]:
             _DIGESTS[key] = was["sha256"] if same and was.get("sha256") else file_digest(path)
         out[name] = _DIGESTS[key]
     # A concatenation loads its parts in its order: the same parts in another order are other bytes
-    # (sol-loop r3 V2). Its fingerprint: its parts in order, each by its hash (a generated part by its spec).
+    # (sol-loop r3 V2). Its fingerprint: its parts in order, each by its hash (a generated part by its
+    # spec), keyed by the concatenation itself, not by where the case lists it (sol-loop r4 W1).
     specs = [case.get("data", ""), *([case["data_alt"]] if case.get("data_alt") else []), *case.get("extra", [])]
-    for i, spec in enumerate((s for s in specs if s.startswith("concat:")), 1):
+    for spec in (s for s in specs if s.startswith("concat:")):
         parts = [(p, out.get(p[len("volume:"):]) if p.startswith("volume:") else p) for p in spec[len("concat:"):].split("+")]
-        out[f"concat {i}"] = (None if any(v is None for _, v in parts)
-                              else hashlib.sha256("\n".join(f"{p}={v}" for p, v in parts).encode()).hexdigest())
+        out[spec] = (None if any(v is None for _, v in parts)
+                     else hashlib.sha256("\n".join(f"{p}={v}" for p, v in parts).encode()).hexdigest())
     return out
 
 
