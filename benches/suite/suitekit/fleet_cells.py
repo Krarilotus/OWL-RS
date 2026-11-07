@@ -98,18 +98,18 @@ def select(root, systems, workloads, args):
                             why = f"reference {ref}: {reason or 'different regime'}"
                             break
                 if not why:
-                    group = selected.get((name, tier), {"case": case, "systems": [], "regime": regime})
-                    before = set(group["systems"]) | set(refs) if group["systems"] else set()
-                    after = set(group["systems"]) | {key} | set(refs)
+                    group = {"case": case, "systems": [key], "regime": regime, "references": refs}
                     overhead = args.build_min * len({args.nrese, args.harness}) + args.prepare_min
-                    added = (len(after) - len(before)) * case["est_min"] + (0 if before else overhead)
-                    if total + added >= args.budget_hours * 60:
+                    added = len({key, *refs}) * case["est_min"] + overhead
+                    if added >= args.budget_hours * 60:
                         why = f"budget: {added / 60:.2f} additional host-hours exceeds remaining strict budget"
                     else:
-                        group["systems"].append(key)
-                        group["minutes"] = len(after) * case["est_min"] + overhead
-                        group["references"] = refs
-                        selected[name, tier] = group
+                        group["minutes"] = added
+                        owned = workloads[name].get("resources", {})
+                        group["resources"] = owned.get(tier, owned)
+                        group["measured"] = next((p.get("resources", {}) for r in reversed(records) for p in r.get("pairs", [])
+                            if (p.get("workload"), str(p.get("tier")), p.get("system")) == (name, tier, key) and p.get("outcome") == "ok"), {})
+                        selected[name, tier, key] = group
                         total += added
                 if why:
                     omitted.append(f"omit {label}: {why}")
@@ -125,10 +125,21 @@ def jobs(groups, args):
     set_id, members = "suite-cells-" + token[:16], []
     for group in groups:
         case = group["case"]
-        member = f"{set_id}-{case['name']}"
-        cap = case["cap_gb"]
-        needs = {"cores": args.cores, "ram_gb": cap + args.driver_gb,
-                 "disk_gb": args.build_disk_gb + abba.rg.data_disk_gb([case])}
+        key = group["systems"][0]
+        member = f"{set_id}-{case['name']}-{key}"
+        declared = {"ram_gb": case["cap_gb"], **group["resources"]}
+        fallback = {"cores": args.cores, "disk_gb": args.build_disk_gb + abba.rg.data_disk_gb([case])}
+        needs, basis = {}, {}
+        for field in ("cores", "ram_gb", "disk_gb"):
+            for source, values in (("tier/registry", declared), ("measured cell record", group["measured"]), ("unmeasured configured build allowance / frozen-data helper", fallback)):
+                if field in values:
+                    needs[field], basis[field] = values[field], source
+                    break
+        cap = needs["ram_gb"]
+        adapter_needs = ["docker"] if "docker" in adapters.adapter(key).runtimes else []
+        adapter_needs += ["java"] if key in ("jena", "rdf4j") else []
+        workload_needs = sorted(set(case.get("needs", [])) - {"docker"})
+        print(f"{key} / {case['workload']} / {case['tier']}: resource basis {basis}; ask {needs}; adapter needs {adapter_needs}; workload/driver needs {workload_needs}")
         payload = {"group": group, "nrese": args.nrese, "harness": args.harness, "member": member,
                    "result_root": args.result_root, "deadline_min": group["minutes"] * args.deadline_factor}
         members.append({"id": member, "group": "suite-cells", "kind": "owlrs.timed", "class": "exclusive",
@@ -138,8 +149,8 @@ def jobs(groups, args):
                         "steps": [["bash", "-c", 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"; '
                                    'exec uv run --no-project python -B benches/suite/suite.py fleet --_member']],
                         "step_needs": [needs], "requires": {**needs, "os": "linux", "roles": abba.rg.TIMING_ROLES,
-                        "has": sorted(set(case.get("needs", [])) | set(abba.rg.data_needs([case])) | {"docker"})},
-                        "env": {"SUITE_CELL": json.dumps(payload), "DOCKER_CPUS": str(args.cores), "GATE_MAX_GB": str(cap),
+                        "has": sorted(set(adapter_needs + workload_needs + abba.rg.data_needs([case])))},
+                        "env": {"SUITE_CELL": json.dumps(payload), "DOCKER_CPUS": str(needs["cores"]), "CARGO_BUILD_JOBS": str(needs["cores"]), "GATE_MAX_GB": str(cap),
                                 "DOCKER_MEMORY": f"{cap}g",
                                 "NRESE_GATE_DIR": f"~/owlrs/{member}", "GATE_NAME": member, "GATE_CASES": case["name"]},
                         "inputs": [{"name": "checkout", "source": {"git": str(args.checkout), "rev": args.harness}}]
@@ -151,7 +162,7 @@ def member(root, systems):
     """Fleet step glue only: existing build/data helpers, then the unchanged suite run."""
     payload = json.loads(os.environ["SUITE_CELL"])
     group = payload["group"]
-    chosen = sorted(set(group["systems"]) | set(group["references"]))
+    chosen = group["systems"]
     for key in chosen:
         if why := publication_problem(key, systems.get(key, {})):
             print(f"{key}: {why}", file=sys.stderr)
@@ -228,8 +239,7 @@ def main(argv, systems, workloads, root):
     p.add_argument("--nrese", default="refactor/engine-v2")
     p.add_argument("--references", default="jena,oxigraph")
     p.add_argument("--budget-hours", type=float, default=20)
-    p.add_argument("--cores", type=int, default=16, help="existing timed-job CPU ask; unmeasured for cells")
-    p.add_argument("--driver-gb", type=float, default=2, help="unmeasured driver overhead beyond the catalogue cap")
+    p.add_argument("--cores", type=int, default=2, help="unmeasured fallback: cargo-guarded.sh's two-job floor")
     p.add_argument("--build-disk-gb", type=float, default=20, help="unmeasured build disk beyond data_disk_gb")
     p.add_argument("--build-min", type=float, default=abba.rg.BUILD_MIN, help="existing build estimate per revision")
     p.add_argument("--prepare-min", type=float, default=10, help="existing plan_minutes data allowance, unmeasured")
@@ -243,7 +253,7 @@ def main(argv, systems, workloads, root):
     args = p.parse_args(argv)
     if args._member:
         return member(root, systems)
-    for key in ("budget_hours", "cores", "driver_gb", "build_disk_gb", "build_min", "prepare_min", "deadline_factor"):
+    for key in ("budget_hours", "cores", "build_disk_gb", "build_min", "prepare_min", "deadline_factor"):
         if not math.isfinite(getattr(args, key)) or getattr(args, key) < 0 or (key != "budget_hours" and getattr(args, key) == 0):
             p.error(f"{key} must be finite and {'nonnegative' if key == 'budget_hours' else 'positive'}")
     if not args.systems and not args.gaps:
@@ -259,11 +269,36 @@ def main(argv, systems, workloads, root):
             raise ValueError("pinning requires a clean harness checkout; commit the suite changes first")
         groups, omitted, minutes = select(root, systems, workloads, args)
         print("\n".join(omitted))
-        print(f"total {minutes / 60:.2f} host-hours, unmeasured including builds, preparation and references; budget <{args.budget_hours:g} h")
+        print(f"candidates {minutes / 60:.2f} host-hours, unmeasured including build/preparation and reference allowance; budget <{args.budget_hours:g} h")
         if not groups:
             return 0
         set_id, token, members = jobs(groups, args)
         args.out.mkdir(parents=True, exist_ok=True)
+        retained = []
+        for job in members:
+            probe = args.out / f"{job['id']}.toml"
+            probe.write_text(abba.rg.toml_job({**job, "id": job["id"] + "-placement"}), encoding="utf-8")
+            code, said = abba.rg.fleet_call("check", str(probe), "--json")
+            print(f"fleet check {job['id']} (exit {code}):\n{said}")
+            reading = json.loads(said) if said.startswith("{") else {}
+            checked = reading.get("jobs", [])
+            if not checked: return 1
+            if checked and checked[0].get("fleet", {}).get("verdict") == "never":
+                reasons = "; ".join(h["reason"] for h in checked[0].get("hosts", []))
+                print(f"omit {json.loads(job['env']['SUITE_CELL'])['group']['systems'][0]}: no host can ever take cell: {reasons}")
+            elif code:
+                return 1
+            elif sum(j["est_min"] for j in retained) + job["est_min"] >= args.budget_hours * 60:
+                print(f"omit {job['id']}: budget")
+            else:
+                retained.append(job)
+        members = retained
+        print(f"total admitted {sum(j['est_min'] for j in members) / 60:.2f} host-hours (unmeasured)")
+        if not members:
+            print("total admitted 0 host-hours; no placeable cells; nothing submitted")
+            return 0
+        token = hashlib.sha256(json.dumps(members, sort_keys=True).encode()).hexdigest()
+        set_id = "suite-cells-" + token[:16]
         path = args.out / f"{set_id}.set.toml"
         path.write_text(abba.rg.toml_set({"id": set_id, "request": token, "fail": "stop-rest"}, members), encoding="utf-8")
         print(f"set:{set_id}: {path}; NRESE {args.nrese}, harness {args.harness}")
