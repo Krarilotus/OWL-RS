@@ -123,8 +123,9 @@ pub struct DurabilityConfig {
     /// Recover the commits made up to this time only (microseconds since 1970), cut as
     /// with `recover_until`; commits logged without a time (before WAL version 6) count as
     /// earlier. Opening fails if the checkpoint's last commit was made after it, or its
-    /// time isn't known (format 11 and older, or commits logged without a time before it):
-    /// restore from an older image, or by revision.
+    /// time isn't known (format 11 and older, or any commit of unknown time in the store
+    /// before it, a bulk replacement since included): restore from an older image, or by
+    /// revision.
     pub recover_until_micros: Option<u64>,
     /// Damage in the newest WAL segment: refuse to open (the default), or keep the log up
     /// to it.

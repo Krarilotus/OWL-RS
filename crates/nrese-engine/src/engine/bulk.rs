@@ -279,7 +279,6 @@ impl<'e> BulkLoad<'e> {
                     revision: summary.revision,
                     stamp: Stamp {
                         previous: current.committed_micros,
-                        replaces: true,
                     },
                     dictionary_len: shared.dictionary.len(),
                 };
@@ -306,7 +305,6 @@ impl<'e> BulkLoad<'e> {
                 };
                 let stamp = Stamp {
                     previous: current.committed_micros,
-                    replaces: true,
                 };
                 (Next::Built(next, stamp), summary)
             }
@@ -362,7 +360,6 @@ impl<'e> BulkLoad<'e> {
                 // It keeps what was there: of unknown time if that is.
                 let stamp = Stamp {
                     previous: current.committed_micros,
-                    replaces: false,
                 };
                 (Next::Built(next, stamp), summary)
             }
@@ -418,7 +415,6 @@ fn publish_spilled(
         revision,
         Stamp {
             previous: current.committed_micros,
-            replaces: true,
         },
         dictionary_len,
     )?;
@@ -478,25 +474,21 @@ enum Next {
 /// built (a long checkpoint write could then commit after a time it was stamped before).
 #[derive(Debug, Clone, Copy)]
 struct Stamp {
-    /// The time of the version it builds on.
+    /// The time of the version it follows, which a replacement takes too, though it keeps
+    /// nothing of it: while that time is unknown, a commit may have been made after any time
+    /// the store's clock gives (a legacy store's version 4 log keeps no times, so a reopen
+    /// loses them: review r2, R1-F2), and no later time is certified.
     previous: Option<u64>,
-    /// It holds nothing of that version (a replacement): its time doesn't depend on it.
-    replaces: bool,
 }
 
 impl Stamp {
     /// The version's times, taken now: the commit is stamped by the store's clock
-    /// ([`super::Shared::stamp`]: never before an earlier commit, even of a version of unknown
-    /// time), and the version's time bounds what it keeps of the previous version too, unknown
-    /// if it keeps any of a version of unknown time. Returns that and the clock
-    /// ([`checkpoint::Times`]).
+    /// ([`super::Shared::stamp`]: never before an earlier commit whose time it knows), and the
+    /// version's time is the later of that and the previous version's, unknown if that is
+    /// ([`later`]). Returns that and the clock ([`checkpoint::Times`]).
     fn take(self, shared: &super::Shared) -> checkpoint::Times {
         let commit = shared.stamp();
-        let committed = match self.replaces {
-            true => Some(commit),
-            false => later(self.previous, Some(commit)),
-        };
-        (committed, commit)
+        (later(self.previous, Some(commit)), commit)
     }
 }
 
@@ -845,7 +837,6 @@ impl<'e> Rematerialisation<'e> {
         // It keeps the asserted stack: of unknown time if that is.
         let stamp = Stamp {
             previous: current.committed_micros,
-            replaces: false,
         };
         publish(engine, Next::Built(next, stamp))?;
         tracing::info!(
