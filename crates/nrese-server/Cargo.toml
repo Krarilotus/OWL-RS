@@ -25,6 +25,8 @@ libmimalloc-sys = { workspace = true }
 # bytes in /metrics).
 nrese-exec = { path = "../nrese-exec" }
 nrese-rdf = { path = "../rdf/nrese-rdf" }
+# The RDF4J protocol's terms, read by the N-Triples reader (src/http/rdf4j.rs).
+nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
 nrese-reasoner = { path = "../nrese-reasoner" }
 nrese-sparql = { path = "../nrese-sparql" }
 nrese-store = { path = "../nrese-store", features = ["openapi"] }
