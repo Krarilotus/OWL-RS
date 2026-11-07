@@ -1400,6 +1400,19 @@ impl Dispatch {
 /// A ground program: the rule instances with a body (indexed by [`Dispatch`]), the
 /// transitive predicates (closed by a module instead of joins), the facts of bodiless
 /// instances, and the ground consistency rules.
+///
+/// It offers no enumeration of premise alternatives or producers that no poller counts:
+/// during an operation that has a stop, each one read is attempted work (REAS review r1,
+/// sol-loop r6/r7). Work that runs to its end reads them through `unpolled()`.
+///
+/// ```compile_fail
+/// fn uncounted(program: &nrese_reasoner::eval::GroundProgram, fact: [u64; 3]) -> usize {
+///     program.producers(fact).len()
+///         + program
+///             .premise_alternatives(nrese_reasoner::eval::Grounding::Bodiless(fact))
+///             .len()
+/// }
+/// ```
 #[derive(Default, Clone)]
 pub struct GroundProgram {
     pub rules: Vec<Rule>,
