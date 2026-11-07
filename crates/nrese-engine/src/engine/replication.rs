@@ -79,6 +79,34 @@ pub struct LogBatch {
     pub latest: u64,
 }
 
+impl LogBatch {
+    /// What this batch, the records after `after`, says it carries.
+    pub fn expectation(&self, after: u64) -> LogExpectation {
+        LogExpectation {
+            after,
+            records: self.records as u64,
+            last: self.last,
+        }
+    }
+}
+
+/// What a log answer says it carries ([`Engine::apply_log`]): the records after revision
+/// `after`, `records` of them, the last at revision `last` (`after` without records).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogExpectation {
+    pub after: u64,
+    pub records: u64,
+    pub last: u64,
+}
+
+/// What [`Engine::apply_log`] did: the revision it reached, and whether it stopped before
+/// the answer's last record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Applied {
+    pub revision: u64,
+    pub stopped: bool,
+}
+
 impl Engine {
     /// The committed records after revision `after`, from the write-ahead log and its
     /// archive, as encoded frames: at least one record if there is any, then more while
@@ -143,60 +171,149 @@ impl Engine {
         Ok(batch)
     }
 
-    /// Applies records of a primary's log ([`Engine::log_since`]) in order, each as one
-    /// commit with the primary's revision and term ids; records at or below this engine's
-    /// revision are skipped. Returns the revision reached. A record that doesn't follow
-    /// (a gap) or whose dictionary doesn't continue this one's is refused
-    /// ([`EngineError::Corruption`]): the replica starts again from an image.
-    pub fn apply_log(&self, frames: &[u8]) -> EngineResult<u64> {
+    /// Applies a primary's log answer ([`Engine::log_since`]) that says it carries
+    /// `expected`: its records in order, each as one commit with the primary's revision and
+    /// term ids.
+    ///
+    /// The whole answer is checked first, under the writer slot, with nothing published:
+    /// it follows a revision this engine has reached (its records up to this engine's
+    /// revision are skipped, as an answer applied twice); the frames are complete records, nothing else;
+    /// their revisions are exactly `after + 1 ..= last`, `records` of them; their
+    /// dictionary entries follow on from each other and continue this dictionary
+    /// (`Dictionary::check_keys`). Anything else is refused
+    /// ([`EngineError::Corruption`]) with the engine as it was: the replica starts again
+    /// from an image. Then the batch's dictionary entries are restored at once (checked
+    /// again under that lock, all or none: a speculative transaction may have interned
+    /// meanwhile) and the records are published one by one. `stop` is checked before each:
+    /// once it stops, no further record is published ([`Applied::stopped`]). A local
+    /// failure on a record (the log's write) leaves the records before it published.
+    pub fn apply_log(
+        &self,
+        frames: &[u8],
+        expected: &LogExpectation,
+        stop: &nrese_exec::stop::StopSource,
+    ) -> EngineResult<Applied> {
         let _slot = self.inner.writer.lock();
         let shared = &self.inner.shared;
+        let records = self.checked_batch(frames, expected)?;
+        let keys: Vec<&[u8]> = records
+            .iter()
+            .flat_map(|record| record.keys.iter().map(Vec::as_slice))
+            .collect();
+        let mut applied = Applied {
+            revision: shared.versions.load().revision,
+            stopped: false,
+        };
+        let Some(first) = records.first() else {
+            return Ok(applied);
+        };
+        // What the published version covers: entries past it (a stopped batch's tail, a
+        // speculative transaction's terms) are in memory but not published, and stay so
+        // until a record that holds them is.
+        let mut published = shared.versions.load().dictionary_len;
+        shared
+            .dictionary
+            .restore_keys_checked(first.dictionary_start, &keys)?;
+        // Records this engine already has (an answer applied again) are skipped.
+        let reached = applied.revision;
+        for record in records.iter().filter(|record| record.revision > reached) {
+            #[cfg(test)]
+            tests::before_record(record.revision);
+            if stop.check().is_err() {
+                applied.stopped = true;
+                break;
+            }
+            published = published.max(record.dictionary_start + record.keys.len() as u64);
+            self.apply_record(record, published)?;
+            applied.revision = record.revision;
+        }
+        Ok(applied)
+    }
+
+    /// The records of `frames` once they are what `expected` says, in order; nothing
+    /// changed (the writer slot held).
+    fn checked_batch(
+        &self,
+        frames: &[u8],
+        expected: &LogExpectation,
+    ) -> EngineResult<Vec<CommitRecord>> {
+        let shared = &self.inner.shared;
+        let refuse =
+            |why: String| Err(EngineError::Corruption(format!("a replicated batch {why}")));
+        let revision = shared.versions.load().revision;
+        // An answer from before this engine's revision may come again (its records up to
+        // here are skipped); one after it would leave a gap.
+        if expected.after > revision {
+            return refuse(format!(
+                "follows revision {}, this engine is at {revision}",
+                expected.after
+            ));
+        }
+        let mut records = Vec::new();
         let mut pos = 0;
-        let mut revision = shared.versions.load().revision;
-        while pos < frames.len() {
-            let record = match decode_frame(&frames[pos..]) {
+        loop {
+            match decode_frame(&frames[pos..]) {
                 Frame::Record(record, used) => {
                     pos += used;
-                    record
+                    records.push(record);
                 }
                 Frame::End => break,
                 Frame::Invalid => {
-                    return Err(EngineError::Corruption(format!(
-                        "an invalid log record at byte {pos} of a replicated batch"
-                    )));
+                    return refuse(format!("holds an invalid log record at byte {pos}"));
                 }
-            };
-            if record.revision <= revision {
-                continue;
             }
-            if record.revision != revision + 1 {
-                return Err(EngineError::Corruption(format!(
-                    "replicated record {} doesn't follow revision {revision}",
+        }
+        if records.len() as u64 != expected.records {
+            return refuse(format!(
+                "holds {} records, its answer says {}",
+                records.len(),
+                expected.records
+            ));
+        }
+        for (offset, record) in records.iter().enumerate() {
+            let at = expected.after + 1 + offset as u64;
+            if record.revision != at {
+                return refuse(format!(
+                    "has record {} where revision {at} goes",
                     record.revision
-                )));
+                ));
             }
-            self.apply_record(&record)?;
-            revision = record.revision;
         }
-        Ok(revision)
-    }
-
-    /// One record as a commit (the writer slot held).
-    fn apply_record(&self, record: &CommitRecord) -> EngineResult<()> {
-        let shared = &self.inner.shared;
-        let dictionary_len = shared.dictionary.len();
-        if record.dictionary_start > dictionary_len {
-            return Err(EngineError::Corruption(format!(
-                "replicated record {} starts the dictionary at {}, the replica has {dictionary_len}",
-                record.revision, record.dictionary_start
-            )));
+        let last = records
+            .last()
+            .map_or(expected.after, |record| record.revision);
+        if last != expected.last {
+            return refuse(format!(
+                "ends at revision {last}, its answer says {}",
+                expected.last
+            ));
         }
-        for (offset, key) in record.keys.iter().enumerate() {
+        // A primary's records continue each other's dictionary entries.
+        for pair in records.windows(2) {
+            let ends = pair[0].dictionary_start + pair[0].keys.len() as u64;
+            if pair[1].dictionary_start != ends {
+                return refuse(format!(
+                    "record {} starts the dictionary at {}, the record before ends at {ends}",
+                    pair[1].revision, pair[1].dictionary_start
+                ));
+            }
+        }
+        if let Some(first) = records.first() {
+            let keys: Vec<&[u8]> = records
+                .iter()
+                .flat_map(|record| record.keys.iter().map(Vec::as_slice))
+                .collect();
             shared
                 .dictionary
-                .restore_key(record.dictionary_start + offset as u64, key)?;
+                .check_keys(first.dictionary_start, &keys)?;
         }
-        let dictionary_len = shared.dictionary.len();
+        Ok(records)
+    }
+
+    /// One record as a commit, its dictionary entries restored and the dictionary
+    /// published at `dictionary_len` entries (the writer slot held).
+    fn apply_record(&self, record: &CommitRecord, dictionary_len: u64) -> EngineResult<()> {
+        let shared = &self.inner.shared;
         let latest = shared.versions.load();
         let converting = latest.asserted.layout() == Layout::DefaultGraph && record.names_a_graph();
         let _compaction = converting.then(|| shared.versions.compaction_slot.lock());
@@ -263,6 +380,22 @@ mod tests {
     thread_local! {
         /// What a test does between the feed's listing of the segments and its opening them.
         static BETWEEN: RefCell<Option<Box<dyn FnMut()>>> = RefCell::new(None);
+    }
+
+    thread_local! {
+        /// What a test does before a replicated record is published (its revision).
+        static BEFORE_RECORD: RefCell<Option<BeforeRecord>> = RefCell::new(None);
+    }
+
+    /// What a test does before a record is published, given its revision.
+    type BeforeRecord = Box<dyn FnMut(u64)>;
+
+    pub(super) fn before_record(revision: u64) {
+        BEFORE_RECORD.with(|before| {
+            if let Some(act) = before.borrow_mut().as_mut() {
+                act(revision);
+            }
+        });
     }
 
     pub(super) fn between_listing_and_opening() {
@@ -356,5 +489,283 @@ mod tests {
         let batch = engine.log_since(0, 1 << 20).unwrap();
         BETWEEN.with(|between| *between.borrow_mut() = None);
         assert_eq!((batch.records, batch.last), (3, 3));
+    }
+
+    fn durable() -> EngineConfig {
+        EngineConfig {
+            background_maintenance: false,
+            durability: DurabilityConfig {
+                sync: SyncPolicy::EveryCommit,
+                ..DurabilityConfig::default()
+            },
+            ..EngineConfig::default()
+        }
+    }
+
+    /// Commit `n`: one statement with a subject of its own (a new dictionary entry).
+    fn commit(engine: &Engine, n: u64) {
+        let mut tx = engine.transaction();
+        let quad = nrese_rdf::Quad::new(
+            nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/s{n}")),
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/p"),
+            nrese_rdf::NamedNode::new_unchecked("http://example.com/o"),
+            nrese_rdf::GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+        tx.commit().unwrap();
+    }
+
+    /// A primary at revision 4 and an image of it at revision 1 in `image`; the primary's
+    /// log after revision 1.
+    fn primary_and_image(primary: &std::path::Path, image: &std::path::Path) -> super::LogBatch {
+        let engine = Engine::open(primary, durable()).unwrap();
+        commit(&engine, 0);
+        engine.write_image(image).unwrap();
+        for n in 1..4 {
+            commit(&engine, n);
+        }
+        let batch = engine.log_since(1, 1 << 20).unwrap();
+        assert_eq!((batch.records, batch.last), (3, 4));
+        batch
+    }
+
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let target = to.join(entry.file_name());
+            match entry.file_type().unwrap().is_dir() {
+                true => copy_dir(&entry.path(), &target),
+                false => drop(std::fs::copy(entry.path(), &target).unwrap()),
+            }
+        }
+    }
+
+    fn decoded(frames: &[u8]) -> Vec<super::CommitRecord> {
+        let mut records = Vec::new();
+        let mut pos = 0;
+        while let super::Frame::Record(record, used) = super::decode_frame(&frames[pos..]) {
+            pos += used;
+            records.push(record);
+        }
+        records
+    }
+
+    fn encoded(records: &[super::CommitRecord]) -> Vec<u8> {
+        let mut frames = Vec::new();
+        for record in records {
+            super::encode_record(record, &mut frames).unwrap();
+        }
+        frames
+    }
+
+    /// A stop raised before record 3 of an answer of 2 to 4: record 2 is published, 3 and 4
+    /// aren't, now or after a reopen (review p2-b7-syn69 r1, R1-F2: stop at whole records).
+    #[test]
+    fn a_stop_before_a_record_publishes_no_further_record() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (primary, image) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let batch = primary_and_image(primary.path(), image.path());
+        let replica = Engine::open(image.path(), durable()).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let stop = nrese_exec::stop::StopSource::new(Some(Arc::clone(&flag)), None);
+        let raise = Arc::clone(&flag);
+        BEFORE_RECORD.with(|before| {
+            *before.borrow_mut() = Some(Box::new(move |revision| {
+                if revision == 3 {
+                    raise.store(true, Ordering::Release);
+                }
+            }));
+        });
+        let applied = replica.apply_log(&batch.frames, &batch.expectation(1), &stop);
+        BEFORE_RECORD.with(|before| *before.borrow_mut() = None);
+        let expected = super::Applied {
+            revision: 2,
+            stopped: true,
+        };
+        assert_eq!(applied.unwrap(), expected);
+        assert_eq!(replica.stats().revision, 2);
+        drop(replica);
+        let reopened = Engine::open(image.path(), durable()).unwrap();
+        assert_eq!(reopened.stats().revision, 2);
+    }
+
+    /// An answer that isn't what it says is refused before anything is published: the
+    /// replica keeps its revision and dictionary, also after a reopen (review p2-b7-syn69 r1,
+    /// R1-F1). Guard (passes before the check too): an answer that is what it says applies.
+    /// Every row is checked.
+    #[test]
+    fn an_answer_that_is_not_what_it_says_changes_nothing() {
+        let (primary, image) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let batch = primary_and_image(primary.path(), image.path());
+        let all = decoded(&batch.frames);
+        assert_eq!(all.len(), 3);
+        let expect = |records, last| super::LogExpectation {
+            after: 1,
+            records,
+            last,
+        };
+        let mut discontinuous = decoded(&batch.frames);
+        discontinuous[1].dictionary_start += 1;
+        // Review r2 S1: a record with no keys of its own, its range past the dictionary.
+        let mut keyless = decoded(&batch.frames);
+        keyless.truncate(1);
+        keyless[0].keys.clear();
+        keyless[0].dictionary_start += 1;
+        let mut invalid_suffix = encoded(&all[..1]);
+        invalid_suffix.extend_from_slice(b"not a record at all");
+        let later = super::LogExpectation {
+            after: 2,
+            records: 2,
+            last: 4,
+        };
+        let rows: [(&str, Vec<u8>, super::LogExpectation); 6] = [
+            (
+                "a keyless record past the dictionary's end",
+                encoded(&keyless),
+                expect(1, 2),
+            ),
+            (
+                "more records than it says",
+                batch.frames.clone(),
+                expect(2, 3),
+            ),
+            (
+                "fewer records than it says",
+                encoded(&all[..2]),
+                expect(3, 4),
+            ),
+            (
+                "an invalid record after a valid one",
+                invalid_suffix,
+                expect(2, 3),
+            ),
+            (
+                "a record not continuing the dictionary",
+                encoded(&discontinuous),
+                expect(3, 4),
+            ),
+            (
+                "records after a revision not reached",
+                encoded(&all[1..]),
+                later,
+            ),
+        ];
+        let stop = nrese_exec::stop::StopSource::none();
+        let mut wrong = Vec::new();
+        for (index, (row, frames, expected)) in rows.into_iter().enumerate() {
+            let dir = primary.path().join(format!("replica-{index}"));
+            copy_dir(image.path(), &dir);
+            let replica = Engine::open(&dir, durable()).unwrap();
+            let before = (replica.stats().revision, replica.stats().dictionary.terms);
+            let result = replica.apply_log(&frames, &expected, &stop);
+            if !matches!(result, Err(EngineError::Corruption(_))) {
+                wrong.push(format!("{row}: {result:?}"));
+            }
+            let after = (replica.stats().revision, replica.stats().dictionary.terms);
+            if after != before {
+                wrong.push(format!(
+                    "{row}: (revision, terms) {before:?} became {after:?}"
+                ));
+            }
+            drop(replica);
+            let reopened = Engine::open(&dir, durable()).unwrap();
+            let again = (reopened.stats().revision, reopened.stats().dictionary.terms);
+            if again != before {
+                wrong.push(format!("{row}: after a reopen {again:?}, not {before:?}"));
+            }
+        }
+        let dir = primary.path().join("replica-guard");
+        copy_dir(image.path(), &dir);
+        let replica = Engine::open(&dir, durable()).unwrap();
+        let applied = replica.apply_log(&batch.frames, &batch.expectation(1), &stop);
+        if !matches!(
+            applied,
+            Ok(super::Applied {
+                revision: 4,
+                stopped: false
+            })
+        ) {
+            wrong.push(format!("an answer that is what it says: {applied:?}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A stopped batch's unpublished tail stays unpublished (review r2 S3): records 2 to 4
+    /// stopped before 3, then record 3 alone applied, checkpointed and reopened, hold the
+    /// dictionary of a replica that applied 2 and 3 without a stop: none of record 4's
+    /// entries.
+    #[test]
+    fn a_stopped_batch_s_tail_is_not_published_by_a_later_record() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (primary, image) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let batch = primary_and_image(primary.path(), image.path());
+        let all = decoded(&batch.frames);
+        let terms_after_reopen = |dir: &std::path::Path, engine: Engine| {
+            engine.checkpoint().unwrap();
+            drop(engine);
+            let reopened = Engine::open(dir, durable()).unwrap();
+            (reopened.stats().revision, reopened.stats().dictionary.terms)
+        };
+        // Stopped before record 3, then record 3 alone.
+        let stopped_dir = primary.path().join("stopped");
+        copy_dir(image.path(), &stopped_dir);
+        let stopped = Engine::open(&stopped_dir, durable()).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let stop = nrese_exec::stop::StopSource::new(Some(Arc::clone(&flag)), None);
+        let raise = Arc::clone(&flag);
+        BEFORE_RECORD.with(|before| {
+            *before.borrow_mut() = Some(Box::new(move |revision| {
+                if revision == 3 {
+                    raise.store(true, Ordering::Release);
+                }
+            }));
+        });
+        let first = stopped.apply_log(&batch.frames, &batch.expectation(1), &stop);
+        BEFORE_RECORD.with(|before| *before.borrow_mut() = None);
+        assert!(
+            matches!(
+                first,
+                Ok(super::Applied {
+                    revision: 2,
+                    stopped: true
+                })
+            ),
+            "{first:?}"
+        );
+        let none = nrese_exec::stop::StopSource::none();
+        let three = super::LogExpectation {
+            after: 2,
+            records: 1,
+            last: 3,
+        };
+        let second = stopped.apply_log(&encoded(&all[1..2]), &three, &none);
+        assert!(
+            matches!(
+                second,
+                Ok(super::Applied {
+                    revision: 3,
+                    stopped: false
+                })
+            ),
+            "{second:?}"
+        );
+        let held = terms_after_reopen(&stopped_dir, stopped);
+        // 2 and 3 without a stop.
+        let clean_dir = primary.path().join("clean");
+        copy_dir(image.path(), &clean_dir);
+        let clean = Engine::open(&clean_dir, durable()).unwrap();
+        let two_three = super::LogExpectation {
+            after: 1,
+            records: 2,
+            last: 3,
+        };
+        clean
+            .apply_log(&encoded(&all[..2]), &two_three, &none)
+            .unwrap();
+        let expected = terms_after_reopen(&clean_dir, clean);
+        assert_eq!(held, expected);
     }
 }
