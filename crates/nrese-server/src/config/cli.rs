@@ -654,4 +654,43 @@ mod tests {
         assert!(parse_time("yesterday").is_err());
         assert!(parse_time("2026-10-02T14:05:00").is_err());
     }
+
+    /// Only real calendar dates, clock times and offsets (RFC 3339 §5.6 and §5.7): an
+    /// impossible one is refused, not moved to another instant. Every row is checked; the
+    /// failures are reported together.
+    #[test]
+    fn rfc3339_times_outside_the_calendar_are_refused() {
+        use super::parse_time;
+        let mut wrong = Vec::new();
+        for text in [
+            "2026-02-31T00:00:00Z",
+            "2025-02-29T00:00:00Z",
+            "2026-04-31T12:00:00Z",
+            "2026-10-02T14:05:00+02:99",
+            "2026-10-02T14:05:00+99:00",
+            "2026-10-02T-1:05:00Z",
+            "2026-10-02T14:-5:00Z",
+            "2026-10-02T14:05:-1Z",
+            "2026-1-02T14:05:00Z",
+            "2026-10-02T14:05:00+2:00",
+        ] {
+            if let Ok(micros) = parse_time(text) {
+                wrong.push(format!("{text} read as {micros}"));
+            }
+        }
+        // Guards: the separators and zone letters RFC 3339 allows, a leap day, an offset
+        // that is the same instant.
+        for (text, micros) in [
+            ("2024-02-29T00:00:00Z", 1_709_164_800_000_000u64),
+            ("2026-10-02t14:05:00z", 1_790_949_900_000_000),
+            ("2026-10-02 14:05:00Z", 1_790_949_900_000_000),
+            ("2026-10-02T23:35:00+09:30", 1_790_949_900_000_000),
+            ("2026-10-02T14:05:00.1234567Z", 1_790_949_900_123_456),
+        ] {
+            if parse_time(text).ok() != Some(micros) {
+                wrong.push(format!("{text}: {:?}, not {micros}", parse_time(text)));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 }
