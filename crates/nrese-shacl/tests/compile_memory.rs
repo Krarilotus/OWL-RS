@@ -150,6 +150,75 @@ fn a_refused_select_validation_holds_less_than_its_solutions() {
     assert!(bytes < 8 << 20, "held {bytes} bytes");
 }
 
+/// SYN-56 review r1 F1: comparing a change of the shapes copies nothing that a shape's
+/// results share. 2048 subjects of ex:p each lack ex:required, against a property shape with
+/// 1024 messages: copied into each earlier result's comparison key, the messages' ids alone
+/// would take 2048 × 1024 × 8 bytes = 16 MiB (decoded into each result, far more). An
+/// annotation added to the shape changes no result, and the comparison holds at most a
+/// quarter of those copies.
+#[test]
+fn a_shapes_change_holds_less_than_its_results_messages() {
+    if !measure::alone() {
+        return;
+    }
+    let data: String = (0..2048)
+        .map(|i| format!("ex:s{i} ex:p ex:o .\n"))
+        .collect();
+    let messages: Vec<String> = (0..1024).map(|i| format!("\"m{i}\"")).collect();
+    let shapes = format!(
+        "ex:S a sh:PropertyShape ; sh:targetSubjectsOf ex:p ; sh:path ex:required ;
+           sh:minCount 1 ; sh:message {} .",
+        messages.join(" , ")
+    );
+    let prefixes = "@prefix ex: <http://example.com/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .";
+    let engine = Engine::new(EngineConfig::default()).expect("engine");
+    let insert = |tx: &mut nrese_engine::Transaction<'_>, turtle: &str, graph: GraphNameRef<'_>| {
+        for quad in RdfParser::from_format(RdfFormat::Turtle)
+            .for_slice(format!("{prefixes}{turtle}").as_bytes())
+        {
+            let quad = quad.expect("turtle");
+            tx.insert(QuadRef::new(
+                &quad.subject,
+                &quad.predicate,
+                &quad.object,
+                graph,
+            ));
+        }
+    };
+    let shapes_graph = GraphNameRef::from(NamedNodeRef::new_unchecked(SHAPES));
+    let mut tx = engine.transaction();
+    insert(&mut tx, &data, GraphNameRef::DefaultGraph);
+    insert(&mut tx, &shapes, shapes_graph);
+    tx.commit().expect("commit");
+    let before = engine.snapshot();
+    let graph = before
+        .lookup(NamedNodeRef::new_unchecked(SHAPES).into())
+        .expect("the shapes graph");
+    let selection = Selection::asserted(GraphSelector::Exact(graph));
+    let shapes_before = compile(&before, selection).expect("shapes");
+    let mut tx = engine.transaction();
+    insert(&mut tx, "ex:S rdfs:comment \"annotated\" .", shapes_graph);
+    let after = tx.pending_snapshot();
+    let shapes_after = compile(&after, selection).expect("shapes");
+    let data = Selection::of(GraphSelector::Exact(nrese_engine::TermId::DEFAULT_GRAPH));
+    let resources = nrese_sparql::Resources::default();
+    let (outcome, bytes) = measure::measure(|| {
+        nrese_shacl::validate_shapes_change(
+            &before,
+            Some(&shapes_before),
+            &after,
+            &shapes_after,
+            data,
+            &resources,
+        )
+        .map(|report| report.results.len())
+    });
+    eprintln!("a shapes change of 2048 results held at most {bytes} bytes: {outcome:?}");
+    assert!(matches!(outcome, Ok(0)), "{outcome:?}");
+    assert!(bytes < 4 << 20, "held {bytes} bytes");
+}
+
 /// Doubling the values of each parameter at most doubles what compiling the shapes holds at
 /// once (it adds as many statements); built once per combination, it would hold eight times
 /// as much.
