@@ -28,6 +28,8 @@ nrese-rdf = { path = "../rdf/nrese-rdf" }
 nrese-reasoner = { path = "../nrese-reasoner" }
 nrese-sparql = { path = "../nrese-sparql" }
 nrese-store = { path = "../nrese-store", features = ["openapi"] }
+# The calendar of `restore --until-time` (src/config/cli.rs).
+nrese-xsd = { path = "../rdf/nrese-xsd" }
 parking_lot = { workspace = true }
 # rustls only (no OpenSSL: the binary needs no system TLS library), trusting the bundled
 # roots and the machine's CA store (an identity provider with an internal certificate).
