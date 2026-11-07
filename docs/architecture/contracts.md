@@ -167,18 +167,15 @@ Known bypasses:
 
 ## Reasoner verdicts
 
-**Owners:** store `Verdict/Checked` (`crates/nrese-store/src/dl/consistency.rs:14`, :42), query `Completeness/Regime`
-(`crates/nrese-sparql/src/completeness.rs:12`, :50), tableau `Answer` (`crates/nrese-dl/src/tableau/mod.rs:229`) and beyond `Verdict`
-(`crates/nrese-dl/src/beyond/mod.rs:65`). Consistent requires established consistency; unknown includes unsupported or exhausted runs. Completeness
-means all certain answers under the regime; soundness means each returned answer is certain. `ReasonerRunStatus::Completed`
-(`crates/nrese-reasoner/src/capability.rs:33`) is lifecycle telemetry. Preserve reasons and revision/regime identity; map tableau Unsupported/GaveUp to
-Unknown (:158 in consistency.rs), lower guarantees for unknown consistency, and refuse exact answers without completeness. See [reasoning
-semantics](../spec/reasoning-semantics.md).
-
-Known bypasses:
-
-- `crates/nrese-store/src/draft_check.rs:441`: Draft reasoning derives `consistent` solely from RL violation count, then emits logical_consistent at :445 while separately carrying unsupported reasons.
-- `crates/nrese-dl/src/classify/driver.rs:230`: Classification finish initializes consistent=true, while undecided classes are recorded separately at :249–262.
+**Owners:** nrese-dl `Verdict` (`crates/nrese-dl/src/verdict.rs:8`), re-exported as store `dl::Verdict`; store `Checked`
+(`crates/nrese-store/src/dl/consistency.rs:18`); query `Completeness/Regime` (`crates/nrese-sparql/src/completeness.rs:12`, :50), tableau `Answer`
+(`crates/nrese-dl/src/tableau/mod.rs:229`) and beyond `Verdict` (`crates/nrese-dl/src/beyond/mod.rs:65`, converted by `consistency()`). The verdict has
+no default: classification states `Consistent`, `Inconsistent` or `Unknown(why)`, and its reports (`crates/nrese-store/src/classification.rs`) list
+nothing for an inconsistent ontology and always carry a reason for an undecided one (`reasons`, :72). Consistent requires established consistency;
+unknown includes unsupported or exhausted runs and parts left out of the reading. Completeness means all certain answers under the regime; soundness
+means each returned answer is certain. `ReasonerRunStatus::Completed` (`crates/nrese-reasoner/src/capability.rs:33`) is lifecycle telemetry. Preserve
+reasons and revision/regime identity; map tableau Unsupported/GaveUp to Unknown (:138 in consistency.rs), lower guarantees for unknown consistency,
+and refuse exact answers without completeness. See [reasoning semantics](../spec/reasoning-semantics.md).
 
 ## Dataset and bench inputs
 

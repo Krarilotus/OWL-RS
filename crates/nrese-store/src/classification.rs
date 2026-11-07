@@ -67,6 +67,17 @@ fn iri(snapshot: &Snapshot, id: u64) -> Option<String> {
     }
 }
 
+/// A report's reasons: the engines', and an undecided verdict's own where they list none,
+/// so an answer without a verdict never reads as complete in any form.
+fn reasons(consistency: &Verdict, mut incomplete: Vec<String>) -> Vec<String> {
+    if let Some(why) = consistency.reason()
+        && incomplete.is_empty()
+    {
+        incomplete.push(format!("consistency not decided: {why}"));
+    }
+    incomplete
+}
+
 fn sorted_iris(snapshot: &Snapshot, ids: &[u64]) -> Vec<String> {
     let mut out: Vec<String> = ids.iter().filter_map(|&c| iri(snapshot, c)).collect();
     out.sort();
@@ -100,7 +111,7 @@ impl StoreService {
             equivalent_to_thing: list(&c.top),
             consistency: c.consistency.clone(),
             engine: taxonomy.profile.path,
-            incomplete: taxonomy.incomplete.clone(),
+            incomplete: reasons(&c.consistency, taxonomy.incomplete.clone()),
             micros: started.elapsed().as_micros() as u64,
         })
     }
@@ -125,10 +136,32 @@ impl StoreService {
         incomplete.extend(r.incomplete.iter().cloned());
         Ok(RealisationReport {
             types,
+            incomplete: reasons(&consistency, incomplete),
             consistency,
             engine: r.taxonomy.profile.path,
-            incomplete,
             micros: started.elapsed().as_micros() as u64,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A report's reasons are never empty while its verdict is undecided: the verdict's
+    /// own reason stands in where the engines listed none (N4 design, G4-1: every form
+    /// carries the verdict or its absence).
+    #[test]
+    fn an_undecided_verdict_always_carries_a_reason() {
+        let budget = Verdict::Unknown("gave up: the node budget".to_owned());
+        assert_eq!(
+            reasons(&budget, Vec::new()),
+            ["consistency not decided: gave up: the node budget"]
+        );
+        let listed = vec!["consistency not decided (unsupported): x".to_owned()];
+        assert_eq!(reasons(&budget, listed.clone()), listed);
+        for decided in [Verdict::Consistent, Verdict::Inconsistent] {
+            assert!(reasons(&decided, Vec::new()).is_empty());
+        }
     }
 }

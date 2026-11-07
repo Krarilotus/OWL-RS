@@ -23,17 +23,12 @@ const NOTHING: &str = "http://www.w3.org/2002/07/owl#Nothing";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
 /// The answer's status under OWL 2 DL: what it lists is entailed either way, so it is
-/// sound; complete only with nothing left out and the consistency decided.
-fn completeness(consistency: &Verdict, incomplete: &[String]) -> Completeness {
+/// sound; complete only without reasons, of which the store's report lists an undecided
+/// consistency's (`nrese_store::ClassificationReport::incomplete`).
+fn completeness(incomplete: &[String]) -> Completeness {
     let mut status = Completeness::under(Regime::Owl2Dl);
     for why in incomplete {
         status.incomplete("dl", why.clone());
-    }
-    // The engines list an undecided verdict among the reasons; never complete without one.
-    if let Some(why) = consistency.reason()
-        && incomplete.is_empty()
-    {
-        status.incomplete("dl", format!("consistency not decided: {why}"));
     }
     status
 }
@@ -143,7 +138,7 @@ pub async fn classify(
         "unsatisfiable": report.unsatisfiable,
         "equivalent_to_thing": report.equivalent_to_thing,
     });
-    let status = completeness(&report.consistency, &report.incomplete);
+    let status = completeness(&report.incomplete);
     respond(wants_triples(headers), text, json, &status)
 }
 
@@ -177,6 +172,6 @@ pub async fn realise(
         "micros": report.micros,
         "types": types,
     });
-    let status = completeness(&report.consistency, &report.incomplete);
+    let status = completeness(&report.incomplete);
     respond(wants_triples(headers), text, json, &status)
 }
