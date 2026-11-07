@@ -2109,6 +2109,170 @@ mod tests {
 
     use super::*;
 
+    /// Rounds of each lock-span guard: on the parent tree the shape shows as a race (the
+    /// holder's thread must take a fed job while it waits), so a guard tries several times.
+    const ROUNDS: usize = 4;
+
+    /// Whether the dictionary's lock is free now (taken and let go, never waited for).
+    fn free(dictionary: &std::sync::Arc<Dictionary>) -> impl Fn() -> bool + Send + Sync + 'static {
+        let dictionary = std::sync::Arc::clone(dictionary);
+        move || dictionary.inner.try_write().is_some() && dictionary.order.try_write().is_some()
+    }
+
+    /// A dictionary of `n` simple literals, each holding a `w`: enough entries for several
+    /// scan slices and a parallel text order.
+    fn literals(n: usize) -> std::sync::Arc<Dictionary> {
+        let dictionary = Dictionary::default();
+        for i in 0..n {
+            let text = format!("w{:07}", (i * 7_919) % n);
+            dictionary.intern(LiteralRef::new_simple_literal(&text).into());
+        }
+        std::sync::Arc::new(dictionary)
+    }
+
+    fn containing<'a>(
+        needle: &'a str,
+        placement: super::super::Placement,
+    ) -> super::super::StringTest<'a> {
+        super::super::StringTest {
+            needle,
+            placement,
+            iris: false,
+            strings: true,
+            lang_strings: false,
+            typed: false,
+            language: None,
+            ascii_case_insensitive: false,
+        }
+    }
+
+    /// Span 1 (P2-01). A bulk load's numbering and renumbering under the adoption guard never
+    /// have the holder's thread run a pool job while the guard is held: a job that wanted the
+    /// dictionary (to intern, or to read behind a queued writer) would wait there with the
+    /// numbering under it, and the numbering would wait for it. On engine-v2 688181dd they
+    /// ran as Rayon work on the caller's pool, which the holder's thread helps with.
+    #[test]
+    fn a_loads_numbering_takes_on_no_job_under_the_adoption_guard() {
+        let dictionary = std::sync::Arc::new(Dictionary::default());
+        let mut every_time = true;
+        for round in 0..ROUNDS {
+            let pending = Pending::default();
+            let mut provisional: Vec<u64> = Vec::new();
+            for b in 0..200u32 {
+                let keys: Vec<Vec<u8>> = (0..500)
+                    .map(|k| format!("Iurn:t-{round}-{b}-{k}").into_bytes())
+                    .collect();
+                let mut indexes = vec![NEW; keys.len()];
+                pending.intern((1, b), &mut indexes, &mut Vec::new(), |k| {
+                    (&keys[k][..], key_hash(&keys[k]))
+                });
+                provisional.extend_from_slice(&indexes);
+            }
+            let id = |payload: u64| TermId::new(TermKind::Iri, payload);
+            let mut quads: Vec<EncodedQuad> = provisional
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|q| EncodedQuad::new(id(q[0]), id(q[1]), id(q[2]), id(q[3])))
+                .collect();
+            every_time &= nrese_exec::workers::contended(
+                || dictionary.adopt_pending(pending, |adopted| adopted.renumber(&mut quads)),
+                free(&dictionary),
+            );
+            // Renumbered to the ids the dictionary holds now.
+            let start = (round * 200 * 500) as u64;
+            assert_eq!(quads[0].subject, id(start));
+            assert_eq!(quads.last().unwrap().graph, id(start + 200 * 500 - 1));
+        }
+        assert!(
+            every_time,
+            "a job ran on the numbering's thread under the adoption guard"
+        );
+        assert_eq!(dictionary.len(), (ROUNDS * 200 * 500) as u64);
+    }
+
+    /// Span 2 (P2-01). A substring scan of the arenas takes on no pool job under the
+    /// dictionary's read guard (the hazard of span 1, behind a queued writer).
+    #[test]
+    fn a_substring_scan_takes_on_no_job_under_the_read_guard() {
+        let n = 300_000;
+        let dictionary = literals(n);
+        let test = containing("w", super::super::Placement::Anywhere);
+        let mut every_time = true;
+        for _ in 0..ROUNDS {
+            let found = std::sync::Arc::new(std::sync::Mutex::new(0));
+            let scan = {
+                let (dictionary, found) = (std::sync::Arc::clone(&dictionary), found.clone());
+                move || {
+                    *found.lock().unwrap() = dictionary.matching_strings(&test, n as u64).len();
+                }
+            };
+            every_time &= nrese_exec::workers::contended(scan, free(&dictionary));
+            assert_eq!(*found.lock().unwrap(), n);
+        }
+        assert!(
+            every_time,
+            "a job ran on the scan's thread under the read guard"
+        );
+    }
+
+    /// Span 3 (P2-01). A checkpoint's text order, sorted for entries no kept order covers,
+    /// takes on no pool job under the dictionary's guards.
+    #[test]
+    fn a_checkpoints_text_order_takes_on_no_job_under_the_guards() {
+        let n = 300_000;
+        let dictionary = literals(n);
+        let mut every_time = true;
+        for _ in 0..ROUNDS {
+            let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let build = {
+                let (dictionary, order) = (std::sync::Arc::clone(&dictionary), order.clone());
+                move || {
+                    let budget = Budget::unlimited();
+                    *order.lock().unwrap() =
+                        dictionary.text_order(n as u64, &budget).unwrap().to_vec();
+                }
+            };
+            every_time &= nrese_exec::workers::contended(build, free(&dictionary));
+            let order = order.lock().unwrap();
+            assert_eq!(order.len(), n);
+            let text = |i: u32| dictionary.inner.read().key(u64::from(i)).into_owned();
+            assert!(order.windows(2).all(|w| text(w[0]) < text(w[1])));
+        }
+        assert!(
+            every_time,
+            "a job ran on the text order's thread under the guards"
+        );
+    }
+
+    /// Span 4 (P2-01). A prefix search that first takes the entries interned since into the
+    /// kept text order takes on no pool job under the guards (`order` written, `inner` read).
+    #[test]
+    fn a_prefix_search_extending_the_order_takes_on_no_job_under_the_guards() {
+        let n = 300_000;
+        let mut every_time = true;
+        for _ in 0..ROUNDS {
+            // Afresh each round: the order is extended once, by the first search.
+            let dictionary = literals(n);
+            let found = std::sync::Arc::new(std::sync::Mutex::new(0));
+            let search = {
+                let (dictionary, found) = (std::sync::Arc::clone(&dictionary), found.clone());
+                move || {
+                    let test = containing("w0000", super::super::Placement::Start);
+                    *found.lock().unwrap() = dictionary.matching_strings(&test, n as u64).len();
+                }
+            };
+            every_time &= nrese_exec::workers::contended(search, free(&dictionary));
+            // `w0000` and three digits: the values 0..1000 (`literals` holds each of 0..n once).
+            assert_eq!(*found.lock().unwrap(), 1_000);
+            assert_eq!(dictionary.order.read().covered, n as u64);
+        }
+        assert!(
+            every_time,
+            "a job ran on the prefix search's thread under the guards"
+        );
+    }
+
     /// Views of decoded keys stay valid while the arena keeps more (its list grows and
     /// moves): the case Miri's Stacked Borrows checks (the audit of 2 October).
     #[test]
