@@ -10,6 +10,7 @@ use super::naive::{Triple, Violation, materialise};
 use super::rulesets::Ruleset;
 use super::vocabulary::LocalVocabulary;
 
+mod attempted;
 mod stops;
 
 const EX: &str = "http://example.com/";
