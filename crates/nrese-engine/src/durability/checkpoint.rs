@@ -988,6 +988,50 @@ mod tests {
         dictionary
     }
 
+    /// P2-01 A4. A view of the dictionary's keys taken before a rebase reads every key it
+    /// held after it. The rebase moves the heap's suffix into a new heap: the view is then the
+    /// only owner of the old heap's blocks, which go when it drops.
+    #[test]
+    fn a_view_taken_before_a_rebase_reads_its_keys_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = Dictionary::default();
+        let n = 10_000u64;
+        for i in 0..n {
+            dictionary.intern(LiteralRef::new_simple_literal(&format!("word {i}")).into());
+        }
+        let keys = dictionary.export_keys(0, n);
+        let held = dictionary.held_view();
+        // A checkpoint of the first 6,000 entries, compressed, with its text order.
+        let len = 6_000;
+        let codec = Codec::train(&dictionary.export_keys(0, len));
+        let budget = Budget::unlimited();
+        let mut out = Checksummed {
+            inner: Vec::new(),
+            crc: crc32fast::Hasher::new(),
+            buffer: Vec::new(),
+            written: 0,
+            _held: Reservation::new(&budget),
+        };
+        super::write_dictionary(&mut out, &dictionary, len, Some(&codec), &budget).unwrap();
+        super::write_text_order(&mut out, &dictionary, len, &budget).unwrap();
+        out.flush_buffer().unwrap();
+        let path = dir.path().join("dictionary");
+        std::fs::write(&path, out.inner).unwrap();
+        let map = crate::mapped::map(&path).unwrap();
+        let base =
+            super::read_dictionary(&mut super::Reader::new(&map), &map, true, true, true).unwrap();
+        assert!(dictionary.rebase(base).unwrap());
+        assert!(
+            held.sole_owner_of_its_heap(),
+            "the rebase let go of the old heap's blocks"
+        );
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(&held.key(i as u64), key, "entry {i} through the view");
+        }
+        assert_eq!(dictionary.export_keys(0, n), keys);
+        drop(held);
+    }
+
     /// Samples FSST trains on at its largest: the most keys a sample has, each empty (FSST
     /// copies the list of them), of either table; long keys of both (FSST samples them, one
     /// table trained while the other lives); every byte value, in no order (the most symbol
@@ -1196,8 +1240,11 @@ mod tests {
         }
         let heap = heap_dictionary(20_000, 100);
         let (n, m) = (20_100, 20_000);
+        // The view of the keys the order is sorted from, charged first: its heap's sealed
+        // blocks' `Arc`s (8 bytes each, a block a 4,096 keys) and its tail keys' (16 each).
+        let view = 8 * (n / 4_096) + 16 * (n % 4_096);
         let mut outcomes = Vec::new();
-        for room in [16 * n - 1, 16 * n + 4 * m - 1] {
+        for room in [view + 16 * n - 1, view + 16 * n + 4 * m - 1] {
             let root = SharedBudget::new(room);
             let budget = Budget::unlimited().within(Some(Arc::clone(&root)));
             let mut out = sink(&budget);
@@ -1222,7 +1269,8 @@ mod tests {
             ascii_case_insensitive: false,
         };
         assert_eq!(kept.matching_strings(&prefix, u64::MAX).len(), 1_000);
-        let root = SharedBudget::new(4 * kept.len() as usize - 1);
+        // The view first: the 1,000 entries interned since the base, in the heap's tail.
+        let root = SharedBudget::new(16 * 1_000 + 4 * kept.len() as usize - 1);
         let budget = Budget::unlimited().within(Some(Arc::clone(&root)));
         let mut out = sink(&budget);
         let len = kept.len();
