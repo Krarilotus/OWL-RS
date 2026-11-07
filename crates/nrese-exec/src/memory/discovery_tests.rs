@@ -58,6 +58,63 @@ type Row<'a> = (
     Option<u64>,
 );
 
+/// A mount another one covers isn't a view (sol-loop r3 S1; proc_pid_mountinfo(5) lists covered
+/// mounts too): a launcher bind-mounts the process's group `worker` (4 GiB, 1 GiB used) over the
+/// full v2 tree at /sys/fs/cgroup, or covers /sys/fs with a tmpfs and leaves the group bind-mounted
+/// at /cg-local. Only the group is visible then, at the covering mount, and its limit is read
+/// there; the full tree's files aren't reachable. The parent above it is the approved v2
+/// limitation (IB2001-2a56).
+#[test]
+fn a_covered_mount_isnt_a_view() {
+    const STACKED: &str = "30 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n\
+                           40 30 0:26 /limited/worker /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
+    const COVERED: &str = "30 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n\
+                           40 23 0:26 /limited/worker /cg-local rw - cgroup2 cgroup2 rw\n\
+                           50 23 0:40 / /sys/fs rw - tmpfs tmpfs rw\n";
+    let (four, used) = ((4 * G).to_string(), G.to_string());
+    let (four, used) = (four.as_str(), used.as_str());
+    let rows: Vec<Row<'_>> = vec![
+        (
+            "group bind-mounted over the full tree",
+            vec![
+                ("/proc/self/mountinfo", STACKED),
+                ("/proc/self/cgroup", "0::/limited/worker"),
+                ("/sys/fs/cgroup/cgroup.controllers", "memory"),
+                ("/sys/fs/cgroup/memory.max", four),
+                ("/sys/fs/cgroup/memory.current", used),
+            ],
+            "",
+            Some(4 * G),
+            Some(3 * G),
+        ),
+        (
+            "full tree covered by a tmpfs above it",
+            vec![
+                ("/proc/self/mountinfo", COVERED),
+                ("/proc/self/cgroup", "0::/limited/worker"),
+                ("/cg-local/cgroup.controllers", "memory"),
+                ("/cg-local/memory.max", four),
+                ("/cg-local/memory.current", used),
+            ],
+            "",
+            Some(4 * G),
+            Some(3 * G),
+        ),
+    ];
+    for (name, files, denied, available, remaining) in rows {
+        assert_eq!(
+            linux_available(system(&files, denied)),
+            available,
+            "{name}: available"
+        );
+        assert_eq!(
+            linux_remaining(system(&files, denied)),
+            remaining,
+            "{name}: remaining"
+        );
+    }
+}
+
 /// A deeper mount of the same hierarchy doesn't hide an ancestor another mount shows (review
 /// r1 R1-C1): the full v2 tree at /sys/fs/cgroup, and the process's own group bind-mounted at
 /// /cg-local. The kernel enforces the 1 GiB parent `limited` over the 4 GiB `worker`
