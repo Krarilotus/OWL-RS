@@ -247,9 +247,11 @@ impl ServerConfig {
             .context("failed to parse bind address")?;
         let deployment_posture =
             parse_deployment_posture(source.get(names::DEPLOYMENT_POSTURE).as_deref())?;
-        let store = parse_store_config(source)?;
+        // Resolve all memory shares against one reading of the process's capacity.
+        let machine = units::machine_memory_bytes();
+        let store = parse_store_config(source, machine)?;
         let reasoner = parse_reasoner_config(source)?;
-        let policy = parse_policy_config(source)?;
+        let policy = parse_policy_config(source, machine)?;
         let ai = parse_ai_config(source)?;
         let replication = replication_env::parse_replication_config(source)?;
         if replication.mode != crate::replication::ReplicationMode::Off
