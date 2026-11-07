@@ -30,7 +30,7 @@ mod validate;
 
 pub use compile::{ShapeError, compile};
 pub use graph::Selection;
-pub use incremental::validate_changes;
+pub use incremental::{validate_changes, validate_shapes_change};
 pub use model::{Component, SH, Severity, ShapeRef, Shapes};
 pub use report::{PropertyPath, ValidationReport, ValidationResult};
 

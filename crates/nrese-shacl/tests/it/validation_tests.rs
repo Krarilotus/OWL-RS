@@ -906,3 +906,174 @@ fn a_stopped_validation_returns_the_stop_not_a_report() {
         "validate_changes: {outcome:?}"
     );
 }
+
+/// SHACL §1.5: a shapes graph with `sh:entailment E`, where the processor doesn't support E,
+/// makes the processor signal a failure: the report is no verdict (SYN-56, B-1401). The data
+/// conforms to the shape, so only the failure can make the report not conform.
+#[test]
+fn an_unsupported_entailment_is_a_failure() {
+    let engine = engine(
+        "ex:a ex:name \"A\" .",
+        "ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+           sh:property [ sh:path ex:name ; sh:minCount 1 ] .
+         ex:S sh:entailment <http://www.w3.org/ns/entailment/RDFS> .",
+    );
+    let snapshot = engine.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert!(report.results.is_empty(), "{:?}", report.results);
+    assert!(
+        report
+            .failures
+            .iter()
+            .any(|failure| failure.contains("http://www.w3.org/ns/entailment/RDFS")),
+        "{:?}",
+        report.failures
+    );
+    assert!(!report.conforms());
+}
+
+/// Whether anything applies (the vacuous-pass flag) follows what can fail (SYN-56, B-1406): a
+/// node that fails a shape had something applicable. `sh:not` of a shape without constraints
+/// always fails (the empty shape conforms); `sh:or ()` and `sh:xone ( [] [] )` always fail;
+/// `sh:or ( [] )` and `sh:xone ( [] )` never do. Focus ex:a has no statements; ex:N needs
+/// class ex:C, so ex:a fails it. Each row also checks validation agrees with its expectation.
+#[test]
+fn applicability_follows_what_can_fail() {
+    for (row, constraint, expected) in [
+        ("sh:not []", "sh:not [ ]", true),
+        ("sh:or ()", "sh:or ( )", true),
+        ("sh:xone ( [] [] )", "sh:xone ( [ ] [ ] )", true),
+        ("guard: sh:or ( [] )", "sh:or ( [ ] )", false),
+        ("guard: sh:xone ( [] )", "sh:xone ( [ ] )", false),
+        ("guard: sh:or ( N N )", "sh:or ( ex:N ex:N )", true),
+    ] {
+        let engine = engine(
+            "ex:b ex:p ex:c .",
+            &format!(
+                "ex:S a sh:NodeShape ; sh:targetNode ex:a ; {constraint} . ex:N sh:class ex:C ."
+            ),
+        );
+        let snapshot = engine.snapshot();
+        let shapes = compiled(&snapshot);
+        let failed = !validate(&snapshot, &shapes, DEFAULT).conforms();
+        assert_eq!(failed, expected, "{row}: validation");
+        assert_eq!(
+            nrese_shacl::applicable(&snapshot, &shapes, DEFAULT),
+            expected,
+            "{row}: applicable"
+        );
+    }
+}
+
+/// SYN-56 review r1 F4: whether a shape can fail doesn't depend on which shape is looked at
+/// first. ex:B targets ex:a and needs it to conform to ex:A; ex:A needs ex:B back and has
+/// `sh:in ()`, which every node fails. So ex:a fails ex:A and ex:B: validation fails, and
+/// something applied. ex:A targets an absent class, so it is a root without focus nodes.
+/// Roots are visited in term id order: the two declaration orders intern ex:A or ex:B first.
+#[test]
+fn applicability_of_recursive_shapes_does_not_depend_on_their_order() {
+    let a = "ex:A a sh:NodeShape ; sh:targetClass ex:Absent ; sh:node ex:B ; sh:in ( ) .";
+    let b = "ex:B a sh:NodeShape ; sh:targetNode ex:a ; sh:node ex:A .";
+    for (row, shapes) in [
+        ("ex:A first", format!("{a}\n{b}")),
+        ("ex:B first", format!("{b}\n{a}")),
+    ] {
+        let engine = engine("ex:b ex:p ex:c .", &shapes);
+        let snapshot = engine.snapshot();
+        let shapes = compiled(&snapshot);
+        assert!(
+            !validate(&snapshot, &shapes, DEFAULT).conforms(),
+            "{row}: validation"
+        );
+        assert!(
+            nrese_shacl::applicable(&snapshot, &shapes, DEFAULT),
+            "{row}: applicable"
+        );
+    }
+}
+
+/// 1000 distinct `sh:entailment` values, each a failure charged at 192 bytes: 192,000 bytes of
+/// diagnostics, past a 64 KiB envelope.
+fn many_entailments() -> String {
+    (0..1000)
+        .map(|i| format!("ex:S sh:entailment <http://example.com/entailment/regime-{i:04}> .\n"))
+        .collect()
+}
+
+/// A shapes change in one transaction on `store`: the state before, its shapes, the state
+/// after `removed` left the shapes graph, and that state's shapes.
+fn shapes_removed(store: &Engine, removed: &str) -> (Snapshot, Shapes, Snapshot, Shapes) {
+    let before = store.snapshot();
+    let shapes_before = compiled(&before);
+    let selection = shapes_selection(&before);
+    let mut tx = store.transaction();
+    for quad in RdfParser::from_format(RdfFormat::Turtle)
+        .for_slice(format!("{PREFIXES}{removed}").as_bytes())
+    {
+        let quad = quad.expect("turtle");
+        tx.remove(QuadRef::new(
+            &quad.subject,
+            &quad.predicate,
+            &quad.object,
+            GraphNameRef::from(NamedNodeRef::new_unchecked(SHAPES_GRAPH)),
+        ));
+    }
+    let after = tx.pending_snapshot();
+    let shapes_after = compile(&after, selection).expect("shapes");
+    (before, shapes_before, after, shapes_after)
+}
+
+fn small_envelope() -> Resources {
+    Resources {
+        memory: nrese_exec::Envelope::new(Some(64 * 1024), None),
+        ..Resources::default()
+    }
+}
+
+/// SYN-56 review r1 F3: the state before a shapes change is validated only to tell which of
+/// the state after's results are new; its failures are no part of the outcome. Removing a
+/// shapes graph that asks for 1000 entailment regimes (diagnostics past a 64 KiB envelope)
+/// leaves nothing to validate: the change is accepted with an empty report.
+#[test]
+fn removing_shapes_with_many_entailments_is_not_refused_for_their_diagnostics() {
+    let shapes = many_entailments();
+    let store = engine("ex:a ex:p ex:b .", &shapes);
+    let (before, shapes_before, after, shapes_after) = shapes_removed(&store, &shapes);
+    let outcome = nrese_shacl::validate_shapes_change(
+        &before,
+        Some(&shapes_before),
+        &after,
+        &shapes_after,
+        DEFAULT,
+        &small_envelope(),
+    )
+    .map(|report| (report.results.len(), report.failures.len()));
+    assert!(matches!(outcome, Ok((0, 0))), "{outcome:?}");
+}
+
+/// SYN-56 review r1 F3: as above, but the state after keeps a shape whose result (ex:a has no
+/// ex:name) the state before had too, so the state before is validated; its 1000 entailment
+/// failures are still no part of the outcome, nor charged: nothing is introduced.
+#[test]
+fn a_shapes_change_compares_results_without_the_state_before_s_diagnostics() {
+    let entailments = many_entailments();
+    let store = engine(
+        "ex:a ex:p ex:b .",
+        &format!(
+            "ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+               sh:property [ sh:path ex:name ; sh:minCount 1 ] .
+             {entailments}"
+        ),
+    );
+    let (before, shapes_before, after, shapes_after) = shapes_removed(&store, &entailments);
+    let outcome = nrese_shacl::validate_shapes_change(
+        &before,
+        Some(&shapes_before),
+        &after,
+        &shapes_after,
+        DEFAULT,
+        &small_envelope(),
+    )
+    .map(|report| (report.results.len(), report.failures.len()));
+    assert!(matches!(outcome, Ok((0, 0))), "{outcome:?}");
+}

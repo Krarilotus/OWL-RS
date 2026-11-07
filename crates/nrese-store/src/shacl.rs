@@ -10,7 +10,7 @@ use nrese_engine::{EncodedQuad, GraphSelector, ReadModel, TermId, Transaction};
 use nrese_rdf::{GraphName, NamedNode, NamedNodeRef, Term};
 use nrese_shacl::{
     PropertyPath, Selection, ShapeError, Shapes, ValidationReport, compile, validate,
-    validate_changes,
+    validate_changes, validate_shapes_change,
 };
 use nrese_sparql::{CancellationToken, ReadView, Resources};
 
@@ -221,19 +221,21 @@ pub(crate) fn introduced(
         .any(|quad| quad.graph == shapes_id);
     if shapes_changed {
         let shapes_after = compile(&after, shapes_selection).map_err(shapes_error)?;
-        let mut report = validate(&after, &shapes_after, data, resources)?;
         // Shapes that didn't compile before had no results.
-        if let Ok(shapes_before) = compile(before, shapes_selection) {
-            // The whole earlier report, so its charge is held while its results are.
-            let earlier = validate(before, &shapes_before, data, resources)?;
-            report
-                .results
-                .retain(|result| !earlier.results.contains(result));
-        }
+        let shapes_before = compile(before, shapes_selection).ok();
+        let report = validate_shapes_change(
+            before,
+            shapes_before.as_ref(),
+            &after,
+            &shapes_after,
+            data,
+            resources,
+        )?;
         return Ok(Some(report));
     }
     let shapes = compile(before, shapes_selection).map_err(shapes_error)?;
-    if shapes.is_empty() {
+    // A shapes graph with only `sh:entailment` still makes every validation fail.
+    if shapes.is_vacuous() {
         return Ok(None);
     }
     let changed: Vec<EncodedQuad> = tx
