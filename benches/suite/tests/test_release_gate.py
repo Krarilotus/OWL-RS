@@ -524,6 +524,9 @@ class Rounds(unittest.TestCase):
                     patch.object(fast.hosts, "input_path", return_value=data), \
                     patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
                 self.assertNotEqual(fast.case_inputs(ab), fast.case_inputs(ba))
+                # Sol-loop r4 W1: the same concatenations listed in another order are the same input.
+                both = {"name": "t", "data": "volume:lubm-10.nt", "extra": [ab["data"], ba["data"]]}
+                self.assertEqual(fast.case_inputs(both), fast.case_inputs({**both, "extra": both["extra"][::-1]}))
 
     def test_the_catalogue_keeps_a_form_pin_and_a_note_when_it_is_written_again(self):
         """7 Nov 2026: `suite.py data` rewrites benches/datasets.toml from a fixed list of keys, so a
