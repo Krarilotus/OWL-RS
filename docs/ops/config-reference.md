@@ -143,6 +143,15 @@ api_key = "replace-me"
   - `stated`: the asserted statements only (the topology vocabulary without the rewrite), for data whose relations are curated, or where computing them from geometries is unwanted
 - the filter functions (`geof:sfWithin(?a, ?b)`) compute from geometries in both modes
 
+- file key: `store.search_scope`
+- env override: `NRESE_SEARCH_SCOPE`
+- a repository's `search_scope` in its settings overrides it for that repository
+- values: `global` (the default), `reader`
+- what full-text relevance (`bds:search`, `text:query`, `luc:`), IRI autocompletion and vector selection (`nrv:search`) are computed over:
+  - `global`: search uses the dictionary-wide text and IRI statistics and the existing vector-search strategy (the shared HNSW graph for large spaces). Returned data respects graph access, but relevance scores and approximate selection may depend on data outside the reader's graphs. The fastest.
+  - `reader`: search ranks text and IRIs, and selects vectors, from the reader's snapshot, read model and active dataset only: a graph the reader may not read, an open transaction's terms, a later version or a term no statement uses changes no score, rank or selection. Vectors are compared exactly (recall 1) among the visible ones. Costs: the first search of a scope at a version walks its statements to build its corpus (kept, and after a small commit derived from the kept one by probing what the commit touched); a vector search scans the space's vectors, testing each for visibility. Admission may still depend on the dictionary's span, the index walk's scratch, the touched terms charged before the scope check and the shared corpus cache's retention (approved R2-F2 exception, [http-api.md](http-api.md)): a refusal can reveal hidden volume, a score can't.
+- graph access, EXPLAIN and refusal sanitising are the same in both modes
+
 - file key: `shacl.shapes_graph`
 - env override: `NRESE_SHACL_SHAPES_GRAPH`
 - default: `http://rdf4j.org/schema/rdf4j#SHACLShapeGraph` (the graph RDF4J and GraphDB use)

@@ -41,6 +41,10 @@ pub(super) fn parse_store_config(
         geosparql_stated_only: parse_geosparql_relations(
             source.get(names::GEOSPARQL_RELATIONS).as_deref(),
         )?,
+        search_scope: match choice(source, names::SEARCH_SCOPE, &["global", "reader"])? {
+            Some(1) => nrese_store::SearchScope::Reader,
+            _ => nrese_store::SearchScope::Global,
+        },
         total_query_memory_bytes: parse_total_query_memory(
             source.get(names::MAX_TOTAL_QUERY_MEMORY_BYTES).as_deref(),
             machine,

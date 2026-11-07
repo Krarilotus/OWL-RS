@@ -30,6 +30,10 @@ use std::collections::{BTreeMap, HashMap};
 use rayon::prelude::*;
 use rust_stemmers::{Algorithm, Stemmer};
 
+mod scope;
+pub(crate) use scope::Bits;
+pub use scope::Corpus;
+
 /// What to search for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextQuery {

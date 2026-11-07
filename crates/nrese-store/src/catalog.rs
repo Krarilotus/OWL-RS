@@ -95,6 +95,10 @@ pub struct RepositorySettings {
     /// docs/design/ql-rewriting.md §4); the server's `reasoner.ql_rewriting` when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ql_rewriting: Option<String>,
+    /// What searches rank and select among (`global`, `reader`;
+    /// [`crate::StoreConfig::search_scope`]); the server's `store.search_scope` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_scope: Option<String>,
 }
 
 /// The longest per-repository query timeout: one hour.
@@ -111,6 +115,13 @@ impl RepositorySettings {
         self.ql_rewriting
             .as_deref()
             .and_then(crate::QlRewritingMode::from_name)
+    }
+
+    /// The search scope, if the settings choose one.
+    pub fn search_scope_mode(&self) -> Option<crate::SearchScope> {
+        self.search_scope
+            .as_deref()
+            .and_then(crate::SearchScope::from_name)
     }
 
     /// The reasoning mode, if the settings choose one.
@@ -423,6 +434,9 @@ impl Catalog {
             ql_rewriting: settings
                 .ql_rewriting_mode()
                 .unwrap_or(self.template.ql_rewriting),
+            search_scope: settings
+                .search_scope_mode()
+                .unwrap_or(self.template.search_scope),
             ..self.template.clone()
         };
         let store = StoreService::with_runtime(config, Arc::clone(&self.runtime))
@@ -696,6 +710,12 @@ impl Catalog {
                 .unwrap_or(self.template.ql_rewriting);
             repository.pipeline.read().store().set_ql_rewriting(mode);
         }
+        if before.search_scope != settings.search_scope {
+            let scope = settings
+                .search_scope_mode()
+                .unwrap_or(self.template.search_scope);
+            repository.pipeline.read().store().set_search_scope(scope);
+        }
         *repository.settings.write() = settings;
         Ok(())
     }
@@ -719,6 +739,13 @@ pub fn check(settings: &RepositorySettings) -> Result<(), CatalogError> {
     {
         return Err(CatalogError::Invalid(format!(
             "ql_rewriting must be 'auto', 'on' or 'off', not '{name}'"
+        )));
+    }
+    if let Some(name) = &settings.search_scope
+        && settings.search_scope_mode().is_none()
+    {
+        return Err(CatalogError::Invalid(format!(
+            "search_scope must be 'global' or 'reader', not '{name}'"
         )));
     }
     if let Some(ms) = settings.query_timeout_ms

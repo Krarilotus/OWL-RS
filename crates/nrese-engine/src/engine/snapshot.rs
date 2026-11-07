@@ -17,6 +17,10 @@ pub type HeavyGroups = Arc<nrese_exec::ChargedVec<(TermId, u64)>>;
 mod cursor;
 pub use cursor::{ProbeCursor, Seek};
 
+mod reader_search;
+pub(crate) use reader_search::Documents;
+pub use reader_search::TextScope;
+
 /// A consistent view of one committed revision. Cheap to clone; holding it keeps that
 /// revision's runs alive but never blocks writers or compaction.
 ///
@@ -687,7 +691,7 @@ impl Snapshot {
             reads: self.reads.clone(),
             version,
             dictionary: Arc::clone(&self.dictionary),
-            statistics: Arc::default(),
+            statistics: Arc::new(self.statistics.for_view()),
             equality: self.equality,
             canonical: self.canonical,
             held,

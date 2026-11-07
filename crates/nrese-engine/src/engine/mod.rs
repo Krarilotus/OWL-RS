@@ -27,6 +27,7 @@
 
 mod bulk;
 pub mod characteristic;
+mod corpora;
 mod equality;
 #[cfg(test)]
 mod lock_tests;
@@ -53,10 +54,12 @@ use crate::quad::{EncodedQuad, EncodedTriple};
 use crate::term::{Dictionary, DictionaryStats, TermId};
 
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
+pub use corpora::TextCorpusStats;
 pub use equality::Classes as EqualityClasses;
 pub use replication::LogBatch;
 pub use snapshot::{
-    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity,
+    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot,
+    SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
 
@@ -699,7 +702,7 @@ impl Engine {
         };
         let shared = Arc::new(Shared {
             dictionary,
-            statistics: Arc::default(),
+            statistics: Arc::new(statistics::Statistics::for_engine()),
             versions: Versions {
                 current: RwLock::new(Arc::new(version)),
                 compaction_slot: Mutex::new(()),
@@ -770,6 +773,17 @@ impl Engine {
     /// on use it.
     pub fn set_canonical_view_budget(&self, budget: Arc<nrese_exec::Budget>) {
         *self.inner.shared.views.write() = budget;
+    }
+
+    /// What the corpora of reader-scoped searches the engine keeps are charged to from now
+    /// on ([`Snapshot::text_search_in`]; at first 256 MiB of their own): a store that uses
+    /// reader-scoped search gives them its share. The kept corpora and their lineage are let
+    /// go (searches holding one keep it, charged to the old budget, until they let go).
+    /// Makes the engine's store of corpora if no reader-scoped search did yet.
+    pub fn set_text_corpus_budget(&self, budget: Arc<nrese_exec::Budget>) {
+        if let Some(store) = self.inner.shared.statistics.corpora.get_or_init() {
+            store.set_budget(budget);
+        }
     }
 
     /// What runs the vector graph builds searches start from now on in the background
