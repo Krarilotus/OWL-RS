@@ -9,6 +9,12 @@
 //! mean no limit; 0 is a limit of nothing. A limit that may apply but can't be read is
 //! [`Unknown`], never no limit (A-902; the owner: an OS reading that couldn't be determined is
 //! never "no limit"). `read` reads a file's text.
+//!
+//! Groups above a cgroup namespace's root aren't visible, and their limits still apply. On v1
+//! the own group's `hierarchical_memory_limit` (`memory.stat`) includes them; v2 has no such
+//! file, so there a limit is known only as far up as the namespace shows, as the JDK, .NET
+//! and Go runtimes read it, and a process under a limit above its namespace sets its memory
+//! limit by hand (the orchestrator's decision, 3 Nov, P2-A4 IB2001-2a56).
 
 use std::io::{self, ErrorKind};
 
@@ -165,7 +171,13 @@ fn limited(
     else {
         return Ok(());
     };
-    if !files.v1 {
+    if files.v1 {
+        // The kernel's own least limit over the whole hierarchy, groups above a namespace
+        // included, which the walk below can't see (since Linux 2.6.29).
+        if let Some(limit) = hierarchical(read, &dir)?.filter(|&limit| limit < NONE_ABOVE) {
+            each(files, &dir, limit)?;
+        }
+    } else {
         // Every v2 group has it: without it the group isn't where its path leads.
         read(&format!("{dir}/cgroup.controllers")).map_err(|_| Unknown)?;
     }
@@ -190,6 +202,27 @@ fn limited(
         }
         dir.truncate(dir.rfind('/').ok_or(Unknown)?);
     }
+}
+
+/// A v1 group's `hierarchical_memory_limit` (`memory.stat`): the least limit of the group and
+/// every ancestor. `None` where the kernel doesn't show it; `Unknown` where the statistics
+/// can't be read or the value makes no sense.
+fn hierarchical(
+    read: &impl Fn(&str) -> io::Result<String>,
+    dir: &str,
+) -> Result<Option<u64>, Unknown> {
+    let stat = match read(&format!("{dir}/memory.stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(Unknown),
+    };
+    let Some(value) = stat.lines().find_map(|line| {
+        let (name, value) = line.split_once(' ')?;
+        (name == "hierarchical_memory_limit").then_some(value)
+    }) else {
+        return Ok(None);
+    };
+    value.trim().parse().map(Some).map_err(|_| Unknown)
 }
 
 /// The smallest limit of the process's groups; `None`: no group has one.

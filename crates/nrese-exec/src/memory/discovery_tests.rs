@@ -195,6 +195,37 @@ fn a_limit_that_may_apply_but_wasnt_read_is_unknown_never_none() {
             Some(4 * G),
             Some(3 * G),
         ),
+        // The same container under a parent group capped at 2 GiB, which its namespace hides
+        // (`--cgroup-parent`; Sol, P2-A4 r1 S1): v1's statistics show the hierarchy's least
+        // limit, and what is left of it is at most that less the group's own use.
+        (
+            "v1 limit above the namespace",
+            vec![
+                ("/proc/self/mountinfo", unnamespaced),
+                ("/proc/self/cgroup", "3:memory:/docker/abc"),
+                ("/sys/fs/cgroup/memory/memory.limit_in_bytes", four),
+                ("/sys/fs/cgroup/memory/memory.usage_in_bytes", used),
+                (
+                    "/sys/fs/cgroup/memory/memory.stat",
+                    "cache 0\nhierarchical_memory_limit 2147483648\ntotal_inactive_file 0\n",
+                ),
+            ],
+            "",
+            Some(2 * G),
+            Some(G),
+        ),
+        (
+            "v1 statistics refused",
+            vec![
+                ("/proc/self/mountinfo", unnamespaced),
+                ("/proc/self/cgroup", "3:memory:/docker/abc"),
+                ("/sys/fs/cgroup/memory/memory.limit_in_bytes", four),
+                ("/sys/fs/cgroup/memory/memory.usage_in_bytes", used),
+            ],
+            "/sys/fs/cgroup/memory/memory.stat",
+            None,
+            None,
+        ),
         // A mount whose root is another group (`/docker/ab` isn't above `/docker/abc`): the
         // process's group isn't visible, whatever the mount point holds.
         (
