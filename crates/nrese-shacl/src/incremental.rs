@@ -21,7 +21,7 @@
 use std::collections::BTreeSet;
 
 use nrese_engine::{EncodedQuad, GraphSelector, TermId};
-use nrese_sparql::ReadView;
+use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 
 use crate::graph::{GraphView, Selection};
 use crate::model::{Constraint, Path, ShapeRef, Shapes, Target};
@@ -40,13 +40,18 @@ const RDFS_SUB_CLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf
 /// introduce in `data`: validation of the focus nodes the change can affect, in `after`,
 /// minus the same validation in `before`. Both views must share one dictionary (a
 /// transaction and its base snapshot do), and `shapes` must be compiled from it.
+///
+/// Both validations run on `resources` and stop as [`crate::validate`] does: a stop in
+/// either state is the outcome, never a difference of partial results.
 pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     before: &A,
     after: &B,
     shapes: &Shapes,
     data: Selection,
     changed: &[EncodedQuad],
-) -> ValidationReport {
+    resources: &Resources,
+) -> Result<ValidationReport, QueryEvaluationError> {
+    resources.check()?;
     let changed: Vec<EncodedQuad> = changed
         .iter()
         .copied()
@@ -56,13 +61,17 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     let graph_after = GraphView::new(after, data);
     let sub_class_of = graph_after.iri(RDFS_SUB_CLASS_OF);
     let classes_moved = sub_class_of.is_some_and(|p| changed.iter().any(|q| q.predicate == p));
-    let validator_before = Validator::new(before, shapes, data);
-    let validator_after = Validator::new(after, shapes, data);
+    let validator_before = Validator::new(before, shapes, data, resources);
+    let validator_after = Validator::new(after, shapes, data, resources);
     let mut introduced: BTreeSet<RawResult> = BTreeSet::new();
     let mut failures = Vec::new();
     if !changed.is_empty() {
         let rdf_type = graph_after.iri(RDF_TYPE);
         for shape in shapes.targeted() {
+            // After a stop in either state the difference means nothing: it is the outcome.
+            if validator_after.stopped() || validator_before.stopped() {
+                break;
+            }
             let affected = if classes_moved {
                 None
             } else {
@@ -99,10 +108,12 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
             let before: BTreeSet<RawResult> = before_results.into_iter().collect();
             introduced.extend(after_results.into_iter().filter(|r| !before.contains(r)));
         }
-        failures.extend(validator_after.into_failures());
     }
+    // A stop in either state is the outcome; only the state after reports its failures.
+    failures.extend(validator_after.into_failures()?);
+    validator_before.into_failures()?;
     let raw: Vec<RawResult> = introduced.into_iter().collect();
-    decode(after, shapes, &raw, failures)
+    Ok(decode(after, shapes, &raw, failures))
 }
 
 fn in_selection(data: Selection, graph: TermId) -> bool {

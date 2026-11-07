@@ -9,6 +9,7 @@ use nrese_rdf::vocab::xsd;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_shacl::{Selection, ValidationReport, compile, validate, validate_changes};
+use nrese_sparql::Resources;
 
 const EX: &str = "http://example.com/";
 const SHAPES_GRAPH: &str = "http://example.com/shapes";
@@ -148,9 +149,11 @@ fn incremental_validation_equals_the_difference_of_full_validations() {
         }
         let changed: Vec<_> = tx.inserted().chain(tx.deleted()).collect();
         let after = tx.pending_snapshot();
-        let incremental = validate_changes(&before, &after, &shapes, data, &changed);
-        let full_before = keys(&validate(&before, &shapes, data));
-        let full_after = keys(&validate(&after, &shapes, data));
+        let resources = Resources::default();
+        let incremental = validate_changes(&before, &after, &shapes, data, &changed, &resources)
+            .expect("nothing stops it");
+        let full_before = keys(&validate(&before, &shapes, data, &resources).expect("validated"));
+        let full_after = keys(&validate(&after, &shapes, data, &resources).expect("validated"));
         let expected: BTreeSet<String> = full_after.difference(&full_before).cloned().collect();
         assert_eq!(
             keys(&incremental),

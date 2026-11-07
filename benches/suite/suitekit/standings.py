@@ -14,7 +14,8 @@ import tomllib
 from collections import defaultdict
 from pathlib import Path
 
-from .ledger import load_records
+from . import cases as registry
+from .ledger import PRE_RESET, PRE_RESET_NOTE, load_records, pre_reset
 
 VERDICTS = ("win", "tie", "loss", "no-verdict")
 
@@ -42,6 +43,65 @@ def cell_time(entry: dict) -> str:
     return f"{time['ratio']:.3g} [{low:.3g}, {high:.3g}]"
 
 
+# The most memory a timed case gets: the release gate's big part (release_gate.py jobs --big-gb).
+GATE_MAX_GB = 28
+
+
+def home_turf(records: list[dict], systems: dict, catalog: list[dict]) -> list[str]:
+    """Per contender (systems.toml, NRESE and its variants apart): its home-turf cases (the
+    registry's `home_turf`), whether they can run here (refused, licensed, nothing to start it, a
+    case's memory above the gate's, a declared outcome, no content check), and its newest verdict
+    on them (marked † before the reset). A contender without one is a gap, listed (the owner's bar:
+    "Beat each competitor on its home turf")."""
+    table = newest(records)
+    contenders = [k for k, s in systems.items() if k != "nrese" and not k.startswith("nrese") and "variant-of" not in s]
+    lines = ["| Contender | Home-turf cases | Runnable here | Newest verdict on its home turf |", "|---|---|---|---|"]
+    gaps = []
+    for system in contenders:
+        s = systems[system]
+        cases = [c for c in catalog if c.get("home_turf") == system]
+        if s.get("refused"):
+            runnable = f"no: refused ({s['refused']})"
+        elif not s.get("runs"):
+            runnable = "no: nothing here starts it"
+        elif not cases:
+            runnable = ("licensed: runs, its results stay local" if s.get("publish") == "permission"
+                        else f"yes ({', '.join(s['runs'])})")
+        else:
+            notes = []
+            for c in cases:
+                if c["cap_gb"] > GATE_MAX_GB:
+                    notes.append(f"{c['name']} needs {c['cap_gb']:g} GB, above the gate's {GATE_MAX_GB}")
+                if c.get("outcome", "ok") != "ok":
+                    notes.append(f"{c['name']}: declared {c['outcome']}")
+                if not c.get("check"):
+                    notes.append(f"{c['name']}: no content check (not timed)")
+            runnable = ("licensed: runs, its results stay local" if s.get("publish") == "permission" else "yes") \
+                + ("; " + "; ".join(notes) if notes else "")
+        if not cases:
+            gaps.append(system)
+            lines.append(f"| {system} | **gap: none defined** | {runnable} | - |")
+            continue
+        verdicts = []
+        for c in cases:
+            found = [(e, r) for (sys_, case, *_), entries in table.items() if sys_ == system and case == c["name"]
+                     for e, r in entries]
+            if s.get("publish") == "permission":
+                verdicts.append(f"{c['name']}: {'ran (local)' if found else 'not measured'}")
+            elif found:
+                e, r = max(found, key=lambda er: str(er[1].get("started", "")))
+                verdicts.append(f"{c['name']}: {e['verdict']} {str(r.get('started', ''))[:10]}"
+                                + (PRE_RESET if pre_reset(r) else ""))
+            else:
+                verdicts.append(f"{c['name']}: not measured")
+        lines.append(f"| {system} | {', '.join(c['name'] for c in cases)} | {runnable} | {'; '.join(verdicts)} |")
+    named = sorted({c["home_turf"] for c in catalog if c.get("home_turf")} - set(systems))
+    lines += ["", f"Gaps, no home-turf case defined ({len(gaps)} of {len(contenders)}): {', '.join(gaps) or 'none'}."]
+    if named:
+        lines.append(f"Home turfs of systems not in suite/systems.toml (no runner here): {', '.join(named)}.")
+    return lines
+
+
 def render(records: list[dict], systems: dict, root: Path) -> str:
     table = newest(records)
     restricted = {k for k, s in systems.items() if s.get("publish") == "permission"}
@@ -65,6 +125,9 @@ def render(records: list[dict], systems: dict, root: Path) -> str:
         "materialisation (`reason`), timed only where its derived relations' counts passed their checks. Load and memory "
         "(serve peak, with its kind) as the same ratio. A case marked ★ is the contender's home turf "
         "([cases/](cases/README.md) `home_turf`).",
+        "",
+        f"{PRE_RESET_NOTE}: a row or newest date marked so. {sum(map(pre_reset, records))} of the {len(records)} run "
+        "records are.",
         "",
         "## Summary",
         "",
@@ -110,7 +173,8 @@ def render(records: list[dict], systems: dict, root: Path) -> str:
         turf = [er for er in rows if er[0].get("home_turf") == system]
         wrong = sum(1 for e, _ in rows if e["answers"] != "ok")
         latest = max(str(r.get("started", ""))[:10] for _, r in rows)
-        lines.append(f"| {system} | {counts(turf) if turf else '-'} | {counts(rows)} | {wrong} | {latest} |")
+        old = all(pre_reset(r) for _, r in rows)
+        lines.append(f"| {system} | {counts(turf) if turf else '-'} | {counts(rows)} | {wrong} | {latest}{PRE_RESET if old else ''} |")
         sections += ["", f"## {system}", "",
                      "| Case | Semantics | Answers | Timed | Time NRESE/them [95 %] | Verdict | Load | Memory | Run |",
                      "|---|---|---|---|---|---|---|---|---|"]
@@ -123,8 +187,14 @@ def render(records: list[dict], systems: dict, root: Path) -> str:
             memory = f"{memory['ratio']:.3g} ({memory['kind']})" if memory else "-"
             sections.append(f"| {e['case']}{star} | {e.get('semantics', '-')} | {e['answers']} | {e.get('timed', '-')} | "
                             f"{cell_time(e)} | **{e['verdict']}** | {e.get('load', '-')} | {memory} | "
-                            f"[{r['id']}](runs/{r['id']}.toml) ({r.get('host', '?')}, {str(r.get('commit', '?'))[:7]}) |")
-    return "\n".join(lines + sections) + "\n"
+                            f"[{r['id']}](runs/{r['id']}.toml) ({r.get('host', '?')}, {str(r.get('commit', '?'))[:7]})"
+                            f"{' ' + PRE_RESET if pre_reset(r) else ''} |")
+    catalog = registry.load(root / "benches" / "cases") if (root / "benches" / "cases").is_dir() else []
+    turf = ["", "## Home turf, per contender", "",
+            "The owner's bar: beat each competitor on its home turf. Per contender of "
+            "[suite/systems.toml](suite/systems.toml): its home-turf cases ([cases/](cases/README.md) `home_turf`), "
+            "whether they can run here, and its newest verdict on them.", ""] + home_turf(records, systems, catalog)
+    return "\n".join(lines + turf + sections) + "\n"
 
 
 def main(argv: list[str], systems: dict, root: Path) -> int:
