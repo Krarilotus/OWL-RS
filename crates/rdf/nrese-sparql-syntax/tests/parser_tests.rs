@@ -56,6 +56,33 @@ signed_object_row!(path_token_positive_double, "+3e2", "double");
 signed_object_row!(path_token_leading_dot_decimal, "+.5", "decimal");
 signed_object_row!(path_token_leading_dot_double, "+.5e2", "double");
 
+#[test]
+fn path_token_construct_round_trip() {
+    // Reduced from crash-15491783f49d4d5c91b5e3e24519bd3c3d99c3fa (P4-F14).
+    let query = parse("CONSTRUCT WHERE { <http://e/a> <http://e/p> +3e0 }");
+    assert_eq!(round_trip(&query), query);
+}
+
+#[test]
+fn path_token_variable_object_guard() {
+    for name in ["o", "1", "\u{e9}"] {
+        let query = parse(&format!("SELECT * {{ ?s <http://e/p>?{name} }}"));
+        let GraphPattern::Project { inner, .. } = query.pattern() else {
+            panic!("no projection")
+        };
+        assert_eq!(
+            inner.as_ref(),
+            &GraphPattern::Bgp {
+                patterns: vec![TriplePattern::new(
+                    Variable::new_unchecked("s"),
+                    NamedNode::new_unchecked("http://e/p"),
+                    TermPattern::from(Variable::new_unchecked(name)),
+                )],
+            }
+        );
+    }
+}
+
 macro_rules! path_modifier_guard {
     ($name:ident, $modifier:literal, $variant:ident, $object:literal) => {
         #[test]
