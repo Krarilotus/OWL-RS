@@ -92,34 +92,52 @@ struct Component<'a> {
     incident: Vec<Vec<usize>>,
     blank_nodes: Vec<&'a BlankNode>,
     present: HashSet<Key>,
+    /// The caller's stop ([`canonical_until`]), and whether it has said so: from then on
+    /// refinement and the search return at once, and their result is not used.
+    stop: &'a dyn Fn() -> bool,
+    stopped: std::cell::Cell<bool>,
 }
 
 /// The quads with their blank nodes renamed canonically.
 pub(crate) fn canonical(quads: BTreeSet<Quad>) -> BTreeSet<Quad> {
-    let encoded;
-    let names = if quads.iter().any(|q| holds_blank_node(&q.object)) {
-        encoded = encode(&quads);
-        names(&encoded)
-    } else {
-        names(&quads)
-    };
-    if names.is_empty() {
-        return quads;
+    match canonical_until(quads, &|| false) {
+        Ok(quads) => quads,
+        Err(Stopped) => unreachable!("a search that is never stopped finishes"),
     }
-    quads.into_iter().map(|q| renamed(q, &names)).collect()
 }
 
 /// [`canonical_until`] was stopped before it finished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stopped;
 
-/// The quads with their blank nodes renamed canonically, or [`Stopped`] once `stop` returns
-/// true. Not implemented yet (the tests' commit): it never stops.
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("canonicalisation stopped")
+    }
+}
+
+impl std::error::Error for Stopped {}
+
+/// The quads with their blank nodes renamed canonically, as [`crate::Dataset::canonicalize`]
+/// names them, or [`Stopped`] once `stop` returns true. `stop` is polled once per round of
+/// colour refinement and once per node of the search, so a stop is seen within one of
+/// either: the search is exponential on some inputs, and a caller with a deadline or a
+/// cancellation bounds it here.
 pub fn canonical_until(
     quads: BTreeSet<Quad>,
-    _stop: &dyn Fn() -> bool,
+    stop: &dyn Fn() -> bool,
 ) -> Result<BTreeSet<Quad>, Stopped> {
-    Ok(canonical(quads))
+    let encoded;
+    let names = if quads.iter().any(|q| holds_blank_node(&q.object)) {
+        encoded = encode(&quads);
+        names(&encoded, stop)?
+    } else {
+        names(&quads, stop)?
+    };
+    if names.is_empty() {
+        return Ok(quads);
+    }
+    Ok(quads.into_iter().map(|q| renamed(q, &names)).collect())
 }
 
 /// Whether `term` is a blank node or a triple term holding one.
@@ -225,8 +243,11 @@ fn renamed(quad: Quad, names: &HashMap<BlankNode, BlankNode>) -> Quad {
     }
 }
 
-/// The canonical name of every blank node of `quads`.
-fn names(quads: &BTreeSet<Quad>) -> HashMap<BlankNode, BlankNode> {
+/// The canonical name of every blank node of `quads`, or [`Stopped`] once `stop` says so.
+fn names(
+    quads: &BTreeSet<Quad>,
+    stop: &dyn Fn() -> bool,
+) -> Result<HashMap<BlankNode, BlankNode>, Stopped> {
     // Exact ids for every other term, with content hashes for colouring.
     let mut fixed: HashMap<Term, u32> = HashMap::new();
     let mut fixed_hash: Vec<u64> = Vec::new();
@@ -286,7 +307,7 @@ fn names(quads: &BTreeSet<Quad>) -> HashMap<BlankNode, BlankNode> {
         with_blanks.push((quad, ids));
     }
     if blank_nodes.is_empty() {
-        return HashMap::new();
+        return Ok(HashMap::new());
     }
     // The quads of each component, with slots numbered within it.
     let mut groups: HashMap<usize, Group<'_>> = HashMap::new();
@@ -326,7 +347,8 @@ fn names(quads: &BTreeSet<Quad>) -> HashMap<BlankNode, BlankNode> {
                  predicates,
                  blank_nodes,
                  ..
-             }| {
+             }|
+             -> Result<Form<'_>, Stopped> {
                 let mut incident = vec![Vec::new(); blank_nodes.len()];
                 for (q, quad_slots) in slots.iter().enumerate() {
                     for slot in quad_slots {
@@ -349,12 +371,17 @@ fn names(quads: &BTreeSet<Quad>) -> HashMap<BlankNode, BlankNode> {
                     fixed_hash: &fixed_hash,
                     incident,
                     blank_nodes,
+                    stop,
+                    stopped: std::cell::Cell::new(false),
                 };
                 let colours = component.search(vec![0; component.blank_nodes.len()]);
-                (component.relabel(&colours, "p"), component.named(&colours))
+                if component.stopped.get() {
+                    return Err(Stopped);
+                }
+                Ok((component.relabel(&colours, "p"), component.named(&colours)))
             },
         )
-        .collect();
+        .collect::<Result<_, _>>()?;
     forms.sort_by(|a, b| a.0.cmp(&b.0));
     // The final names: the component's place in that order, and the node's colour.
     let mut name_of: HashMap<BlankNode, BlankNode> = HashMap::new();
@@ -366,10 +393,18 @@ fn names(quads: &BTreeSet<Quad>) -> HashMap<BlankNode, BlankNode> {
             );
         }
     }
-    name_of
+    Ok(name_of)
 }
 
 impl<'a> Component<'a> {
+    /// Whether the caller's stop has said so (it is asked until it does, then no more).
+    fn should_stop(&self) -> bool {
+        if !self.stopped.get() && (self.stop)() {
+            self.stopped.set(true);
+        }
+        self.stopped.get()
+    }
+
     /// Rehashes each blank node with its neighbourhood until the partition is stable.
     /// A node alone in its colour keeps it (it is told apart already, and its colour then
     /// carries nothing from one part of the component to another), and so does a node
@@ -381,6 +416,10 @@ impl<'a> Component<'a> {
         let mut next: Vec<u64> = vec![0; colours.len()];
         let mut sizes: HashMap<u64, u32> = HashMap::new();
         loop {
+            // Stopped: the colours as they are, which the search won't use.
+            if self.should_stop() {
+                return colours;
+            }
             sizes.clear();
             for &c in &colours {
                 *sizes.entry(c).or_default() += 1;
@@ -594,6 +633,9 @@ impl<'s, 'a> Search<'s, 'a> {
         let component = self.component;
         let mut colours = component.refine(colours, self.scope.as_deref());
         loop {
+            if component.should_stop() {
+                return None;
+            }
             let Some(members) = Component::tied_class(&colours, self.scope.as_deref()) else {
                 return self.leaf(colours, path);
             };
@@ -628,6 +670,9 @@ impl<'s, 'a> Search<'s, 'a> {
                 path.push(m);
                 let back = self.node(individualised(&colours, m), path);
                 path.truncate(level);
+                if component.stopped.get() {
+                    return None;
+                }
                 explored.push(m);
                 // Automorphisms that keep this node's colouring join its choices' orbits.
                 for gamma in &self.automorphisms {
