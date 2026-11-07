@@ -153,6 +153,11 @@ impl<'a> Run<'a> {
         }
     }
 
+    /// Whether it has stopped: what its stages' pollers ask ([`Poller`]).
+    fn fired(&self) -> bool {
+        self.stop.fired()
+    }
+
     /// Why it stopped, once it has.
     fn stopped(&self) -> Stopped {
         match self.stop.interrupted().memory {
@@ -522,11 +527,14 @@ fn support_sets_run(
             })
             .collect();
         let sets_now = &sets;
+        let fired = || run.fired();
         found.par_extend(tasks.par_iter().flat_map_iter(|(j, range)| {
             let (job, heads, schema) = &jobs[*j];
             let mut out = Vec::new();
             let mut body = Vec::with_capacity(job.rule.body.len());
-            let mut poll = Poller::never();
+            let Some(mut poll) = Poller::new(&fired) else {
+                return out;
+            };
             job.run(&source, range.clone(), &mut poll, &mut |bindings| {
                 body.clear();
                 body.extend(
@@ -545,6 +553,10 @@ fn support_sets_run(
                     );
                 }
             });
+            // Stopped part-way: nothing of it is kept; the round's check ends the run.
+            if poll.stopped() {
+                out.clear();
+            }
             out
         }));
         // The round's peak: its derivations and its delta beside the sets.
@@ -643,11 +655,15 @@ pub fn closure_within(
 /// Necessary for following from the other facts, not sufficient: the premises may hold
 /// only through the fact itself (`C ⊑ D`, `D ⊑ C`, `a : C` gives `a : D`, which gives
 /// `a : C` back). [`independently_derived`] decides.
+///
+/// The search polls `stop` ([`Poller`]): stopped, it answers false, decided by nothing, and
+/// the caller asks its (latched) stop again before it uses the answer.
 pub fn derived_otherwise<S: Source + ?Sized>(
     source: &S,
     program: &GroundProgram,
     axioms: &[Triple],
     fact: Triple,
+    stop: Stop<'_>,
 ) -> bool {
     if axioms.binary_search(&fact).is_ok() {
         return true;
@@ -665,8 +681,9 @@ pub fn derived_otherwise<S: Source + ?Sized>(
     let derives = |rule: &Rule| {
         let mut found = false;
         let mut body = Vec::with_capacity(rule.body.len());
-        // Unpolled, as before: the support sets' stop is the item-18 agent's (N10 r1 F1).
-        let mut poll = Poller::never();
+        let Some(mut poll) = Poller::new(stop) else {
+            return false;
+        };
         derivations(source, rule, fact, Seg::All, &mut poll, &mut |bindings| {
             body.clear();
             body.extend(
@@ -772,10 +789,11 @@ pub fn rederived<S: Source + Sync + ?Sized>(
 ) -> Result<(Vec<Triple>, Vec<Triple>), Stopped> {
     let run = Run::new(limits);
     run.check(size_of_val(candidates))?;
+    let fired = || run.fired();
     let one_step: Vec<Triple> = candidates
         .par_iter()
         .copied()
-        .filter(|&fact| derived_otherwise(source, program, axioms, fact))
+        .filter(|&fact| derived_otherwise(source, program, axioms, fact, &fired))
         .collect();
     run.check((candidates.len() + 2 * one_step.capacity()) * size_of::<Triple>())?;
     let (mut found, mut undecided) = (Vec::with_capacity(one_step.len()), Vec::new());
@@ -864,7 +882,7 @@ fn forward_cone<S: Source + Sync + ?Sized>(
             all: source,
             changed: &delta,
         };
-        let heads = instances(&changed, rules, &|k, bindings, out| {
+        let heads = instances(&changed, rules, run, &|k, bindings, out| {
             let rule = rules[k].0;
             if let Head::Facts(heads) = &rule.head {
                 out.extend(heads.iter().map(|head| instantiate_head(head, bindings)));
@@ -1002,6 +1020,7 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
         .collect();
     let premises_in_closure = |body: &[Triple]| body.iter().all(|&p| (change.in_closure)(p));
     // Every derivation of every affected fact, against the sets as they start.
+    let fired = || run.fired();
     let found: Vec<(Triple, Annotation)> = {
         let lookup = Recomputing {
             now: &now,
@@ -1042,7 +1061,11 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                         continue;
                     }
                     let mut body = Vec::with_capacity(rule.body.len());
-                    let mut poll = Poller::never();
+                    // Stopped: what it found is incomplete; the check after the pass ends
+                    // the run before it is read.
+                    let Some(mut poll) = Poller::new(&fired) else {
+                        break;
+                    };
                     derivations(
                         change.source,
                         rule,
@@ -1092,7 +1115,7 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                 affected: &affected,
                 previous: change.previous,
             };
-            instances(&source, &rules, &|k, bindings, out| {
+            instances(&source, &rules, run, &|k, bindings, out| {
                 let rule = rules[k].0;
                 let Head::Facts(heads) = &rule.head else {
                     return;
@@ -1136,8 +1159,9 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
 }
 
 /// What `emit` makes of every instance of `rules` (by index) with a premise among
-/// `source`'s delta facts, the instances in parallel morsels.
-fn instances<S, T, E>(source: &S, rules: &[(&Rule, Grounding)], emit: &E) -> Vec<T>
+/// `source`'s delta facts, the instances in parallel morsels, each polling `run`'s stop.
+/// Stopped, the result is incomplete: the caller checks `run` before it reads it.
+fn instances<S, T, E>(source: &S, rules: &[(&Rule, Grounding)], run: &Run<'_>, emit: &E) -> Vec<T>
 where
     S: Source + Sync + ?Sized,
     T: Send,
@@ -1167,15 +1191,21 @@ where
                 .map(move |start| (j, start..(start + MORSEL).min(job.drivers())))
         })
         .collect();
+    let fired = || run.fired();
     tasks
         .par_iter()
         .flat_map_iter(|(j, range)| {
             let (k, job) = &jobs[*j];
             let mut out = Vec::new();
-            let mut poll = Poller::never();
+            let Some(mut poll) = Poller::new(&fired) else {
+                return out;
+            };
             job.run(source, range.clone(), &mut poll, &mut |bindings| {
                 emit(*k, bindings, &mut out)
             });
+            if poll.stopped() {
+                out.clear();
+            }
             out
         })
         .collect()
