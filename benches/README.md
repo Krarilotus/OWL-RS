@@ -206,8 +206,9 @@ assets are omitted. Host data are verified/prepared by the existing release-gate
 The default is plan only: a set file, per-cell/member/total host-hours including reference,
 build and preparation work, followed by `fleet check` (placement and queue impact) and
 `fleet estimate`. Catalogue estimates are explicitly unmeasured for this protocol. Cells
-are pruned to strictly below the budget. `--submit` submits the checked set with a content
-request token; repeating that request reuses the fleet set. No campaign scheduler is added.
+are pruned to strictly below the budget. Tokens cover measured cells, pinned identities, inputs and scenario.
+Owner, budget and checkout path are excluded. Existing sets are looked up and reused; `--submit` queues only new checked sets.
+Fleet core asks are placement/build allowances; exclusive measurement CPU caps remain unset.
 
 Each member is one system/workload/tier cell, checked separately before set admission;
 permanent placement refusals are omissions. The plan separates adapter needs from workload
