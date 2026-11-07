@@ -504,7 +504,7 @@ async fn round(
                 "the primary's log no longer holds revision {}: start this replica again from \
                  an empty data directory (the primary keeps its log for replicas with \
                  storage.wal_archive = true)",
-                after + 1
+                after.saturating_add(1)
             );
         }
         if !status.is_success() {
