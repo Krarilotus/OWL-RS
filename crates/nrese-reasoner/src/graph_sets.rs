@@ -395,17 +395,25 @@ fn support_sets_run(
     let mut sets: HashMap<Triple, Annotation> = HashMap::with_capacity(facts.len());
     sets.extend(initial);
     let empty = Annotation::empty_set();
+    // The sequential stages' poller (the premise maps, the bodiless and schema sets): each
+    // premise alternative they read is attempted work (sol-loop r7, R7-1). The parallel
+    // morsels make their own.
+    let fired = || run.fired();
+    let mut poll = Poller::new(&fired).ok_or_else(|| run.stopped())?;
     // Facts without a body (ground from schema facts alone, `C subClassOf C` from
     // `C a owl:Class`): evaluated again whenever one of their premises changes.
     let mut bodiless_by_premise: HashMap<Triple, Vec<Triple>> = HashMap::new();
     for &fact in &program.bodiless {
         let grounding = Grounding::Bodiless(fact);
-        for premises in program.premise_alternatives(grounding) {
+        for premises in program.premise_alternatives_iter(grounding) {
+            if poll.attempt(1) {
+                return Err(run.stopped());
+            }
             for &premise in premises {
                 bodiless_by_premise.entry(premise).or_default().push(fact);
             }
         }
-        let from = grounding_sets(program, grounding, &sets, cap, &empty);
+        let from = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll);
         merge(&mut sets, fact, from, cap, graphs_of, &mut annotations);
     }
     // The rules with their schema premises; transitivity as a rule here (the module's
@@ -432,7 +440,10 @@ fn support_sets_run(
     // its sets changed.
     let mut rules_by_premise: HashMap<Triple, Vec<usize>> = HashMap::new();
     for (k, &(_, grounding)) in rules.iter().enumerate() {
-        for premises in program.premise_alternatives(grounding) {
+        for premises in program.premise_alternatives_iter(grounding) {
+            if poll.attempt(1) {
+                return Err(run.stopped());
+            }
             for &premise in premises {
                 rules_by_premise.entry(premise).or_default().push(k);
             }
@@ -480,7 +491,7 @@ fn support_sets_run(
         for fact in delta_facts(&delta) {
             for &bodiless in bodiless_by_premise.get(&fact).into_iter().flatten() {
                 let grounding = Grounding::Bodiless(bodiless);
-                let from = grounding_sets(program, grounding, &sets, cap, &empty);
+                let from = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll);
                 found.extend(
                     from.sets
                         .into_iter()
@@ -492,7 +503,7 @@ fn support_sets_run(
         for (k, &(rule, grounding)) in rules.iter().enumerate() {
             // The schema facts' part, once per rule and round: the minimal sets over the
             // alternative groundings.
-            let schema = grounding_sets(program, grounding, &sets, cap, &empty);
+            let schema = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll);
             let Head::Facts(heads) = &rule.head else {
                 continue;
             };
@@ -527,7 +538,6 @@ fn support_sets_run(
             })
             .collect();
         let sets_now = &sets;
-        let fired = || run.fired();
         found.par_extend(tasks.par_iter().flat_map_iter(|(j, range)| {
             let (job, heads, schema) = &jobs[*j];
             let mut out = Vec::new();
@@ -674,13 +684,20 @@ pub fn derived_otherwise<S: Source + ?Sized>(
         return true;
     }
     let holds = |premises: &[Triple]| premises.iter().all(|&p| p != fact && source.contains(p));
-    let grounded = |grounding: Grounding| {
-        program
-            .premise_alternatives(grounding)
-            .into_iter()
-            .any(holds)
+    // Each premise alternative is attempted work (sol-loop r7, R7-1); stopped, the grounding
+    // reads as not holding, decided by nothing.
+    let grounded = |grounding: Grounding, poll: &mut Poller<'_>| {
+        for premises in program.premise_alternatives_iter(grounding) {
+            if poll.attempt(1) {
+                return false;
+            }
+            if holds(premises) {
+                return true;
+            }
+        }
+        false
     };
-    if program.bodiless.contains(&fact) && grounded(Grounding::Bodiless(fact)) {
+    if program.bodiless.contains(&fact) && grounded(Grounding::Bodiless(fact), poll) {
         return true;
     }
     let derives = |rule: &Rule, poll: &mut Poller<'_>| {
@@ -704,14 +721,14 @@ pub fn derived_otherwise<S: Source + ?Sized>(
         if poll.attempt(1) {
             return false;
         }
-        if grounded(Grounding::Rule(r)) && derives(&program.rules[r], poll) {
+        if grounded(Grounding::Rule(r), poll) && derives(&program.rules[r], poll) {
             return true;
         }
     }
     let p = fact[1];
     program.transitive.contains(&p)
         && !poll.attempt(1)
-        && grounded(Grounding::Transitive(p))
+        && grounded(Grounding::Transitive(p), poll)
         && derives(&transitivity(p), poll)
 }
 
@@ -1016,18 +1033,24 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
         fixed + table_bytes::<Triple, Annotation>(now.capacity()) + annotations
     };
     run.check(held(&now, annotations))?;
-    // The schema facts' part per rule: they aren't affected, so it is fixed.
+    let fired = || run.fired();
+    // The schema facts' part per rule: they aren't affected, so it is fixed. A sequential
+    // stage with its own poller (sol-loop r7, R7-1), checked before its sets are used.
     let schemas: Vec<Annotation> = {
         let lookup = Recomputing {
             now: &now,
             affected: &affected,
             previous: change.previous,
         };
+        let mut poll = Poller::new(&fired).ok_or_else(|| run.stopped())?;
         rules
             .iter()
-            .map(|&(_, grounding)| grounding_sets(program, grounding, &lookup, cap, &empty))
+            .map(|&(_, grounding)| {
+                grounding_sets(program, grounding, &lookup, cap, &empty, &mut poll)
+            })
             .collect()
     };
+    run.check(held(&now, annotations))?;
     let by_grounding: HashMap<Grounding, usize> = rules
         .iter()
         .enumerate()
@@ -1035,7 +1058,6 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
         .collect();
     let premises_in_closure = |body: &[Triple]| body.iter().all(|&p| (change.in_closure)(p));
     // Every derivation of every affected fact, against the sets as they start.
-    let fired = || run.fired();
     let found: Vec<(Triple, Annotation)> = {
         let lookup = Recomputing {
             now: &now,
@@ -1071,6 +1093,7 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                             &lookup,
                             cap,
                             &empty,
+                            poll,
                         ));
                     }
                     let mut groundings: Vec<Grounding> = program
@@ -1242,15 +1265,23 @@ fn delta_facts(store: &Store) -> Vec<Triple> {
 /// The sets of the schema facts `grounding` was grounded on: over its alternatives, the
 /// minimal unions of one set per premise, marked if an alternative's were or the cap
 /// cut them; none if no alternative has sets yet.
+///
+/// Each alternative is a unit of attempted work on `poll`, counted before its premises are
+/// read (sol-loop r7, R7-1): stopped, the sets are incomplete, and the stage's check ends
+/// the run before they are used.
 fn grounding_sets<L: Lookup + ?Sized>(
     program: &GroundProgram,
     grounding: Grounding,
     sets: &L,
     cap: usize,
     empty: &Annotation,
+    poll: &mut Poller<'_>,
 ) -> Annotation {
     let (mut all, mut truncated) = (Vec::new(), false);
-    for premises in program.premise_alternatives(grounding) {
+    for premises in program.premise_alternatives_iter(grounding) {
+        if poll.attempt(1) {
+            break;
+        }
         let found = premise_sets_from(premises, empty, sets, cap);
         truncated |= found.truncated;
         all.extend(found.sets);

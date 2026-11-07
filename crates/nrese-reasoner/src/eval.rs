@@ -1520,20 +1520,27 @@ impl GroundProgram {
 
     /// Every set of schema facts `grounding` was grounded on (the first, then the others).
     pub fn premise_alternatives(&self, grounding: Grounding) -> Vec<&[Triple]> {
+        self.premise_alternatives_iter(grounding).collect()
+    }
+
+    /// [`Self::premise_alternatives`], enumerated as they are read: a caller that counts
+    /// each as attempted work copies none before its first ([`Poller::attempt`]).
+    pub fn premise_alternatives_iter(
+        &self,
+        grounding: Grounding,
+    ) -> impl Iterator<Item = &[Triple]> + '_ {
         let first: &[Triple] = match grounding {
             Grounding::Rule(r) => &self.premises[r],
             Grounding::Bodiless(fact) => self.bodiless_premises(fact),
             Grounding::Transitive(p) => self.transitive_premises(p),
         };
-        std::iter::once(first)
-            .chain(
-                self.other_premises
-                    .get(&grounding)
-                    .into_iter()
-                    .flatten()
-                    .map(Vec::as_slice),
-            )
-            .collect()
+        std::iter::once(first).chain(
+            self.other_premises
+                .get(&grounding)
+                .into_iter()
+                .flatten()
+                .map(Vec::as_slice),
+        )
     }
 
     /// The schema facts that made `p` transitive (empty if it isn't).
@@ -1879,8 +1886,8 @@ impl GroundProgram {
         let Some(mut poll) = Poller::new(stop) else {
             return false;
         };
-        if bodiless_too {
-            for body in self.bodiless_bodies(fact) {
+        if bodiless_too && self.bodiless.contains(&fact) {
+            for body in self.premise_alternatives_iter(Grounding::Bodiless(fact)) {
                 if poll.attempt(1) {
                     return false;
                 }
