@@ -287,7 +287,7 @@ pub async fn session_update(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let access = guard::update_access(&state, &authenticated).await?;
-    let request = super::rdf4j::update(&raw, &headers, &body)?;
+    let request = super::rdf4j::update(&state.policy(), &raw, &headers, &body)?;
     add(
         &state,
         &session,
@@ -674,7 +674,10 @@ struct ReasoningRun {
     revision: u64,
     asserted: u64,
     inferred: u64,
+    /// The consistency violations found: 0 exactly when the data is consistent.
     violations: usize,
+    /// Their list stopped at its memory budget: `violations` is a lower bound.
+    violations_at_least: bool,
     elapsed_ms: u128,
 }
 
@@ -686,6 +689,7 @@ impl From<&nrese_store::MaterialisationReport> for ReasoningRun {
             asserted: report.asserted,
             inferred: report.inferred,
             violations: report.violations,
+            violations_at_least: report.violations_at_least,
             elapsed_ms: report.elapsed.as_millis(),
         }
     }

@@ -262,6 +262,26 @@ fn uses_any<'a>(
     None
 }
 
+/// Whether an IRI is of the reserved vocabulary (`rdf:`, `rdfs:`, `xsd:`, `owl:`) and not
+/// one of the names OWL 2 DL gives it (`owl:Thing`, `owl:Nothing`, the top and bottom
+/// properties): an entity the reader leaves out ([`leave_out_reserved`]). Callers that
+/// choose input for the reader ask it here, not by a copy of the list.
+pub fn reserved_name(iri: &str) -> bool {
+    use crate::vocab::{OWL, RDF, RDFS, XSD};
+    const ALLOWED: [&str; 6] = [
+        "Thing",
+        "Nothing",
+        "topObjectProperty",
+        "bottomObjectProperty",
+        "topDataProperty",
+        "bottomDataProperty",
+    ];
+    if let Some(local) = iri.strip_prefix(OWL) {
+        return !ALLOWED.contains(&local);
+    }
+    [RDF, RDFS, XSD].iter().any(|ns| iri.starts_with(ns))
+}
+
 /// Leaves out the axioms that use an IRI of the reserved vocabulary (`rdf:`, `rdfs:`,
 /// `xsd:`, `owl:`; *OWL 2 Structural Specification* §2.4) as a class, a property or an
 /// individual, but for those §2.4 gives OWL 2 DL (`owl:Thing`, `owl:Nothing`, the top and
@@ -272,24 +292,11 @@ fn uses_any<'a>(
 /// follows from the rest still follows. Terms whose IRI the source doesn't give
 /// ([`Terms::iri_text`]) aren't checked.
 pub(crate) fn leave_out_reserved(ontology: &mut Ontology, terms: &dyn Terms) {
-    use crate::vocab::{OWL, RDF, RDFS, XSD};
-    let b = ontology.builtin;
-    let allowed = [
-        b.top_object,
-        b.bottom_object,
-        b.top_data,
-        b.bottom_data,
-        terms.iri(&format!("{OWL}Thing")),
-        terms.iri(&format!("{OWL}Nothing")),
-    ];
     let mut cache: HashMap<Term, bool> = HashMap::new();
     let mut reserved = |t: Term| -> bool {
-        *cache.entry(t).or_insert_with(|| {
-            !allowed.contains(&Some(t))
-                && terms
-                    .iri_text(t)
-                    .is_some_and(|iri| [RDF, RDFS, XSD, OWL].iter().any(|ns| iri.starts_with(ns)))
-        })
+        *cache
+            .entry(t)
+            .or_insert_with(|| terms.iri_text(t).is_some_and(|iri| reserved_name(&iri)))
     };
     let mut kept = Vec::with_capacity(ontology.axioms.len());
     let mut sources = Vec::with_capacity(ontology.axioms.len());

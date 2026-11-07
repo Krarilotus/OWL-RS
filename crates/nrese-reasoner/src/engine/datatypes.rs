@@ -11,14 +11,19 @@
 //!   values: a functional data property with two values.
 //!
 //! Not done: dt-type1/2 and dt-eq (typing and equating literals by value), which would
-//! fold lexical forms into each other; ill-typed literals (no data value) aren't judged.
+//! fold lexical forms into each other; ill-typed literals (no data value) aren't judged,
+//! but for the string types, whose lexical form is read as a string: a violation found
+//! on it holds anyway (an ill-typed literal is in no value space).
 //! A datatype outside OWL 2's list is not judged either.
 
-use crate::ir::{Triple, Violation};
+use crate::ir::{Triple, Violations};
 use nrese_engine::{TermId, TermKind};
+use nrese_exec::Budget;
 use nrese_rdf::{Literal, Term};
+use nrese_xsd::owl::text;
 use nrese_xsd::{DateTime, Decimal, Double, Float, Integer};
 use std::str::FromStr;
+use std::sync::Arc;
 
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
@@ -143,10 +148,17 @@ fn in_value_space(value: &Data, datatype: &str) -> Option<bool> {
         };
     }
     let local = datatype.strip_prefix(XSD)?;
+    // The string types' value spaces (XML Schema 1.1 Part 2 §3.4.1–3.4.7), as their owner
+    // `nrese_xsd::owl::text` holds them.
+    let string_in = |test: fn(&str) -> bool| matches!(value, Data::String(s) if test(s));
     Some(match local {
-        "string" | "normalizedString" | "token" | "language" | "Name" | "NCName" | "NMTOKEN" => {
-            matches!(value, Data::String(_))
-        }
+        "string" => matches!(value, Data::String(_)),
+        "normalizedString" => string_in(text::is_normalized),
+        "token" => string_in(text::is_token),
+        "language" => string_in(text::is_language),
+        "Name" => string_in(text::is_name),
+        "NCName" => string_in(text::is_ncname),
+        "NMTOKEN" => string_in(text::is_nmtoken),
         "boolean" => matches!(value, Data::Boolean(_)),
         "decimal" => matches!(value, Data::Decimal(_)),
         "double" => matches!(value, Data::Double(_)),
@@ -175,19 +187,26 @@ fn in_value_space(value: &Data, datatype: &str) -> Option<bool> {
     })
 }
 
-/// The datatype violations among `facts` (derived facts, generalised ones included).
+/// The datatype violations among `facts` (derived facts, generalised ones included),
+/// finished, charged to `memory` as [`Violations`] are: a budget without room ends the
+/// list there, still inconsistent.
 pub(crate) fn violations(
     facts: &[Triple],
     rdf_type: u64,
     same_as: Option<u64>,
     decode: &dyn Fn(u64) -> Option<Term>,
-) -> Vec<Violation> {
+    memory: &Arc<Budget>,
+) -> Violations {
     let literal = |id: u64| match decode(id) {
         Some(Term::Literal(l)) => Some(l),
         _ => None,
     };
-    let mut out = Vec::new();
+    let mut out = Violations::new(Arc::clone(memory));
+    let (mut not_type, mut diff) = (None, None);
     for &[s, p, o] in facts {
+        if !out.complete() {
+            break;
+        }
         if !is_literal(s) {
             continue;
         }
@@ -197,11 +216,9 @@ pub(crate) fn violations(
             };
             if let Some(value) = data(&lt)
                 && in_value_space(&value, dt.as_str()) == Some(false)
+                && let Some(group) = *not_type.get_or_insert_with(|| out.group("dt-not-type", 2))
             {
-                out.push(Violation {
-                    rule: "dt-not-type".to_owned(),
-                    bindings: vec![s, o],
-                });
+                out.record(group, [s, o]);
             }
         } else if Some(p) == same_as && is_literal(o) && s < o {
             let (Some(a), Some(b)) = (literal(s), literal(o)) else {
@@ -209,16 +226,13 @@ pub(crate) fn violations(
             };
             if let (Some(x), Some(y)) = (data(&a), data(&b))
                 && x != y
+                && let Some(group) = *diff.get_or_insert_with(|| out.group("dt-diff", 2))
             {
-                out.push(Violation {
-                    rule: "dt-diff".to_owned(),
-                    bindings: vec![s, o],
-                });
+                out.record(group, [s, o]);
             }
         }
     }
-    out.sort_by(|a, b| (&a.rule, &a.bindings).cmp(&(&b.rule, &b.bindings)));
-    out.dedup();
+    out.finish();
     out
 }
 
@@ -249,6 +263,7 @@ mod tests {
                      rdfs:range xsd:nonNegativeInteger .
                  ex:weight rdfs:range xsd:double .
                  ex:name rdfs:range xsd:string .
+                 ex:code rdfs:range xsd:token .
                  {data}"
             );
             for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
@@ -260,7 +275,11 @@ mod tests {
                 });
             tx.commit().unwrap();
             let closure = super::super::materialise(&program, &engine.snapshot());
-            let mut rules: Vec<String> = closure.violations.into_iter().map(|v| v.rule).collect();
+            let mut rules: Vec<String> = closure
+                .violations
+                .iter()
+                .map(|(rule, _)| rule.to_owned())
+                .collect();
             rules.sort();
             rules.dedup();
             rules
@@ -293,6 +312,14 @@ mod tests {
             ["dt-not-type"],
             "a language string is no xsd:string"
         );
+        // A string with two inner spaces is no xsd:token (XML Schema 1.1 Part 2 §3.4.2).
+        assert_eq!(
+            rules("ex:a ex:code \"a  b\" ."),
+            ["dt-not-type"],
+            "no token"
+        );
+        // Guard (holds on the base too).
+        assert_eq!(rules("ex:a ex:code \"a b\" ."), none, "a token");
     }
 
     #[test]
@@ -330,6 +357,39 @@ mod tests {
             Some(false)
         );
         assert_eq!(space(typed("true", "boolean"), "boolean"), Some(true));
+        // The string types' value spaces (XML Schema 1.1 Part 2 §3.4.1–3.4.7, each equal to
+        // its lexical space): a string outside one isn't in it (RSH-12). Every row is checked
+        // and the wrong ones reported together.
+        let outside = [
+            ("a\tb", "normalizedString"),
+            ("a  b", "token"),
+            (" a", "token"),
+            ("a b", "NMTOKEN"),
+            ("1a", "Name"),
+            ("a:b", "NCName"),
+            ("abcdefghi", "language"),
+        ];
+        // Guards (in the value space, so they hold on the base too).
+        let inside = [
+            ("a b", "normalizedString"),
+            ("a b", "token"),
+            ("1a", "NMTOKEN"),
+            ("a:b", "Name"),
+            ("_a", "NCName"),
+            ("en-US", "language"),
+        ];
+        let rows = outside
+            .map(|(v, l)| (v, l, false))
+            .into_iter()
+            .chain(inside.map(|(v, l)| (v, l, true)));
+        let wrong: Vec<String> = rows
+            .filter_map(|(value, local, expected)| {
+                let got = space(Literal::new_simple_literal(value), local);
+                (got != Some(expected))
+                    .then(|| format!("{value:?} in xsd:{local}: {got:?}, not {expected}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
         assert_eq!(space(typed("5", "integer"), "gYear"), None);
         assert!(
             data(&typed("abc", "integer")).is_none(),

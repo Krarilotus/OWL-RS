@@ -229,7 +229,10 @@ impl QlRewriting {
         let thing = snapshot
             .lookup(nrese_rdf::vocab::owl::THING.into())
             .map(TermId::raw);
-        let mut statements = schema_statements(snapshot);
+        let keep = |graph: u64| {
+            access.is_none_or(|access| access.allows_id(snapshot, TermId::from_raw(graph)))
+        };
+        let mut statements = schema_statements(snapshot, &keep);
         if let Some(access) = access {
             statements.retain(|s| access.allows_id(snapshot, TermId::from_raw(s.graph)));
         }
@@ -263,8 +266,9 @@ fn iri(snapshot: &Snapshot, namespace: &str, local: &str) -> Option<TermId> {
 }
 
 /// The asserted statements of the schema, in every graph, sorted: the schema properties',
-/// the declarations', and the cells of the lists they name.
-fn schema_statements(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
+/// the declarations', the cells of the lists they name, and per class expression one
+/// statement of an individual in it, from a graph `keep` admits.
+fn schema_statements(snapshot: &Snapshot, keep: &dyn Fn(u64) -> bool) -> Vec<nrese_owl::Statement> {
     let mut out = Vec::new();
     let scan = |pattern: QuadPattern, out: &mut Vec<nrese_owl::Statement>| {
         out.extend(
@@ -294,8 +298,12 @@ fn schema_statements(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
             }
         }
         // Individuals asserted to be in a class expression (`:p a [ owl:onProperty … ]`),
-        // which have anonymous individuals of their own (design §7): the `rdf:type`
-        // statements of each blank node the schema read makes an expression.
+        // which have anonymous individuals of their own (design §7). What the hazards read
+        // of them is the expression, not who is in it: one `rdf:type` statement per blank
+        // node the schema read makes an expression, in a graph `keep` lets the reader see.
+        // The schema stays the expressions' size, and a membership that doesn't change
+        // which expressions have one keeps the compiled TBox (P2-C1 timing, 7 Nov: every
+        // membership read made 10,000 of them a 10 ms read after each commit).
         let operators: Vec<u64> = EXPRESSIONS
             .iter()
             .filter_map(|local| iri(snapshot, OWL, local))
@@ -310,7 +318,23 @@ fn schema_statements(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
         expressions.sort_unstable();
         expressions.dedup();
         for node in expressions {
-            scan(pattern(rdf_type, Some(TermId::from_raw(node))), &mut out);
+            let member = snapshot
+                .quads_for_pattern_in(
+                    ReadModel::Asserted,
+                    &pattern(rdf_type, Some(TermId::from_raw(node))),
+                )
+                // One the reader keeps: it leaves out a reserved name as the individual
+                // (`rdf:type a _:e`), and another member must stand in (Sol r4 S1).
+                .find(|q| {
+                    keep(q.graph.raw())
+                        && !matches!(snapshot.decode(q.subject),
+                            Some(Term::NamedNode(n))
+                                if nrese_owl::diagnostics::reserved_name(n.as_str()))
+                });
+            out.extend(member.map(|q| nrese_owl::Statement {
+                triple: [q.subject.raw(), q.predicate.raw(), q.object.raw()],
+                graph: q.graph.raw(),
+            }));
         }
     }
     // The lists: from each head, `rdf:first` and `rdf:rest` along the cells.
