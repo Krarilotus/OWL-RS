@@ -48,6 +48,16 @@ fn system(
     }
 }
 
+/// A row: its name, the files the process sees, one it may not read (or ""), and what the
+/// memory it may use and could still take read as (`None`: unknown).
+type Row<'a> = (
+    &'a str,
+    Vec<(&'a str, &'a str)>,
+    &'static str,
+    Option<u64>,
+    Option<u64>,
+);
+
 /// Each row: a process's view of its memory groups, and what the memory it may use and could
 /// still take read as (`None`: unknown). Groups with a limit use 1 GiB of it.
 #[test]
@@ -73,13 +83,7 @@ fn a_limit_that_may_apply_but_wasnt_read_is_unknown_never_none() {
     let unnamespaced =
         "35 25 0:31 /docker/abc /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n";
     let neighbour = "35 25 0:31 /docker/ab /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n";
-    let rows: Vec<(
-        &str,
-        Vec<(&str, &str)>,
-        &'static str,
-        Option<u64>,
-        Option<u64>,
-    )> = vec![
+    let rows: Vec<Row<'_>> = vec![
         // The reference: a v2 group with a limit of 4 GiB, 1 GiB of it used.
         ("v2 group", v2_app.to_vec(), "", Some(4 * G), Some(3 * G)),
         // Membership that can't be read: whatever limit there is wasn't read.
@@ -294,10 +298,17 @@ fn statm_counts_pages_of_the_given_size() {
 
 /// The process's memory as statm reads it agrees with `/proc/self/status`, which counts in
 /// kB whatever the page size: off by a factor of the page size's ratio to 4 KiB where the
-/// page size is assumed. The readings are moments apart, so within a factor of two.
+/// page size is assumed. The readings are moments apart, so within a factor of two, and in a
+/// process of its own ([`alone`]), where no other test allocates between them (Sol, P2-A4 r1
+/// S2).
+///
+/// [`alone`]: crate::measure::alone
 #[cfg(target_os = "linux")]
 #[test]
 fn statm_agrees_with_status_in_kilobytes() {
+    if !crate::measure::alone() {
+        return;
+    }
     let status = std::fs::read_to_string("/proc/self/status").expect("/proc/self/status");
     let kib = |field: &str| -> u64 {
         let line = status.lines().find(|line| line.starts_with(field));

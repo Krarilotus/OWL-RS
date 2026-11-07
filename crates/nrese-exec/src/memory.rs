@@ -604,9 +604,11 @@ mod imp {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    /// The size of a page, which /proc/self/statm counts in. 4 KiB on the platforms the
-    /// store runs on; reading it would need libc.
-    const PAGE: u64 = 4096;
+    /// The size of a page, which /proc/self/statm counts in: the system's (4, 16 or 64 KiB
+    /// on aarch64), read once ([`crate::region::page_size`]).
+    fn page() -> u64 {
+        crate::region::page_size() as u64
+    }
 
     /// The anonymous resident memory: resident minus shared (file-backed and shared
     /// memory), as Windows's committed private bytes count. The store's mapped checkpoint
@@ -614,7 +616,7 @@ mod imp {
     /// could stop a materialisation that fits (LUBM 1000 maps about 5 GB).
     pub fn process_bytes() -> Option<u64> {
         let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-        super::statm_bytes(&statm, PAGE).map(|bytes| bytes.anonymous)
+        super::statm_bytes(&statm, page()).map(|bytes| bytes.anonymous)
     }
 
     pub fn page_faults() -> Option<u64> {
@@ -629,7 +631,7 @@ mod imp {
 
     pub fn resident_bytes() -> Option<u64> {
         let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-        super::statm_bytes(&statm, PAGE).map(|bytes| bytes.resident)
+        super::statm_bytes(&statm, page()).map(|bytes| bytes.resident)
     }
 
     pub fn set_transparent_huge_pages(allowed: bool) -> bool {
@@ -762,24 +764,24 @@ fn job_left_from(
 }
 
 /// The memory a Windows process could still take: the least of the machine's available
-/// memory and what its job leaves; `None` where the job's reading isn't known.
+/// memory and what its job leaves; `None` where either reading isn't known.
 #[cfg(any(windows, test))]
 fn windows_remaining(machine: Option<u64>, job: Option<Option<u64>>) -> Option<u64> {
-    least([machine, job?])
+    least([Some(machine?), job?])
 }
 
-/// The memory a Windows process may use: the least of the machine's physical memory and its
-/// job object's limits.
+/// The memory a Windows process may use, from the machine's physical memory, whether the
+/// process is in a job object, and the job's limits (those set): the least of the machine's
+/// and the job's. `None` where membership can't be asked, or the job's limits can't be read
+/// (outside a job that query fails too: told apart by membership), not the machine's.
 #[cfg(any(windows, test))]
 fn windows_available(
     machine: Option<u64>,
     in_job: Option<bool>,
     limits: impl FnOnce() -> Option<[Option<u64>; 2]>,
 ) -> Option<u64> {
-    let _ = in_job;
-    let machine = machine?;
-    let limit = limits().and_then(|limits| least(limits));
-    Some(limit.map_or(machine, |limit| limit.min(machine)))
+    let job = if in_job? { least(limits()?) } else { None };
+    least([Some(machine?), job])
 }
 
 /// A `/proc/self/statm` reading in bytes: the resident set, and its anonymous part (resident
@@ -813,136 +815,25 @@ fn meminfo_bytes(text: &str, field: &str) -> Option<u64> {
 }
 
 /// The memory a Linux process may use: the least of the machine's `MemTotal` and its cgroups'
-/// limits ([`cgroup::limit`]). `read` reads a file's text.
+/// limits ([`cgroup::limit`]); `None` where either isn't known, not the machine's alone.
+/// `read` reads a file's text.
 #[cfg(any(target_os = "linux", test))]
 fn linux_available(read: impl Fn(&str) -> std::io::Result<String>) -> Option<u64> {
-    let text = |path: &str| read(path).ok();
-    let machine = meminfo_bytes(&text("/proc/meminfo")?, "MemTotal:")?;
-    let limit = text("/proc/self/cgroup").and_then(|own| cgroup::limit(&own, &text));
-    Some(limit.map_or(machine, |limit| limit.min(machine)))
+    let machine = meminfo_bytes(&read("/proc/meminfo").ok()?, "MemTotal:")?;
+    least([Some(machine), cgroup::limit(&read).ok()?])
 }
 
 /// The memory a Linux process could still take: the least of the machine's `MemAvailable`
-/// and what its cgroups leave ([`cgroup::left`]); `None` where a cgroup's reading makes no
-/// sense, not the machine's alone. `read` reads a file's text.
+/// and what its cgroups leave ([`cgroup::left`]); `None` where either isn't known, not the
+/// other alone. `read` reads a file's text.
 #[cfg(any(target_os = "linux", test))]
 fn linux_remaining(read: impl Fn(&str) -> std::io::Result<String>) -> Option<u64> {
-    let text = |path: &str| read(path).ok();
-    let machine = text("/proc/meminfo").and_then(|text| meminfo_bytes(&text, "MemAvailable:"));
-    let groups = match text("/proc/self/cgroup") {
-        Some(own) => cgroup::left(&own, &text)?,
-        None => None,
-    };
-    least([machine, groups])
+    let machine = meminfo_bytes(&read("/proc/meminfo").ok()?, "MemAvailable:")?;
+    least([Some(machine), cgroup::left(&read).ok()?])
 }
 
-/// The memory limit a Linux process runs under, from its cgroup membership: cgroup v2 (a
-/// `0::/path` line) reads `memory.max` in the process's group and every ancestor's, v1 (a
-/// line naming the `memory` controller) `memory.limit_in_bytes`; the smallest counts. "max",
-/// v1's page-aligned maximum and a group without the file mean no limit; 0 is a limit of
-/// nothing. `read` reads a file's text.
 #[cfg(any(target_os = "linux", test))]
-mod cgroup {
-    /// Above this a limit means "none".
-    const NONE_ABOVE: u64 = 1 << 62;
-
-    /// Where a cgroup version keeps a group's memory limit, its use, and its statistics, and
-    /// the statistic that counts its inactive file pages.
-    struct Files {
-        root: &'static str,
-        limit: &'static str,
-        usage: &'static str,
-        inactive: &'static str,
-    }
-
-    const V2: Files = Files {
-        root: "/sys/fs/cgroup",
-        limit: "memory.max",
-        usage: "memory.current",
-        inactive: "inactive_file",
-    };
-
-    const V1: Files = Files {
-        root: "/sys/fs/cgroup/memory",
-        limit: "memory.limit_in_bytes",
-        usage: "memory.usage_in_bytes",
-        inactive: "total_inactive_file",
-    };
-
-    /// `each` of the process's memory group and its ancestors that has a limit, innermost
-    /// first: its directory and its limit; `each` returns `None` where it can't read what it
-    /// needs. `None`: a limit, or what `each` read, that makes no sense.
-    fn limited(
-        own: &str,
-        read: &impl Fn(&str) -> Option<String>,
-        mut each: impl FnMut(&Files, &str, u64) -> Option<()>,
-    ) -> Option<()> {
-        let Some((files, path)) = own.lines().find_map(|line| {
-            let mut fields = line.splitn(3, ':');
-            let (_, controllers, path) = (fields.next()?, fields.next()?, fields.next()?);
-            if controllers.is_empty() {
-                Some((&V2, path))
-            } else if controllers.split(',').any(|c| c == "memory") {
-                Some((&V1, path))
-            } else {
-                None
-            }
-        }) else {
-            return Some(());
-        };
-        let mut dir = format!("{}{}", files.root, path.trim().trim_end_matches('/'));
-        loop {
-            if let Some(text) = read(&format!("{dir}/{}", files.limit)) {
-                let text = text.trim();
-                if text != "max" {
-                    let limit: u64 = text.parse().ok()?;
-                    if limit < NONE_ABOVE {
-                        each(files, &dir, limit)?;
-                    }
-                }
-            }
-            if dir.len() == files.root.len() {
-                return Some(());
-            }
-            dir.truncate(dir.rfind('/')?);
-        }
-    }
-
-    pub fn limit(own: &str, read: impl Fn(&str) -> Option<String>) -> Option<u64> {
-        let mut smallest = None;
-        limited(own, &read, |_, _, limit| {
-            smallest = super::least([smallest, Some(limit)]);
-            Some(())
-        })?;
-        smallest
-    }
-
-    /// What the process's groups leave of their limits: the least of each limit less the
-    /// group's use, its inactive file pages not counted. Those are page cache the kernel
-    /// reclaims before it refuses memory, the store's mapped files among them (counted,
-    /// a store mapping its checkpoint would leave nothing); its active ones count. `Some(None)`:
-    /// no group has a limit; `None`: a group has one but its use can't be read, or a limit
-    /// makes no sense, so what is left isn't known.
-    pub fn left(own: &str, read: impl Fn(&str) -> Option<String>) -> Option<Option<u64>> {
-        let mut least = None;
-        limited(own, &read, |files, dir, limit| {
-            let number = |text: &str| text.trim().parse::<u64>().ok();
-            let usage = number(&read(&format!("{dir}/{}", files.usage))?)?;
-            let inactive = read(&format!("{dir}/memory.stat"))
-                .and_then(|stat| {
-                    stat.lines().find_map(|line| {
-                        let (name, value) = line.split_once(' ')?;
-                        (name == files.inactive).then(|| number(value)).flatten()
-                    })
-                })
-                .unwrap_or(0);
-            let used = usage.saturating_sub(inactive);
-            least = super::least([least, Some(limit.saturating_sub(used))]);
-            Some(())
-        })?;
-        Some(least)
-    }
-}
+mod cgroup;
 
 #[cfg(test)]
 mod discovery_tests;
@@ -978,8 +869,8 @@ mod tests {
 
     #[test]
     fn a_cgroup_limit_is_the_smallest_on_the_path_up() {
-        use std::collections::HashMap;
-        let files: HashMap<&str, &str> = HashMap::from([
+        const NONE: &str = "9223372036854771712";
+        let files = fixture(&[
             ("/sys/fs/cgroup/user.slice/memory.max", "max"),
             (
                 "/sys/fs/cgroup/user.slice/user-1000.slice/memory.max",
@@ -990,24 +881,35 @@ mod tests {
                 "17179869184",
             ),
             (
+                "/sys/fs/cgroup/user.slice/user-1000.slice/run.scope/cgroup.controllers",
+                "memory",
+            ),
+            (
+                "/sys/fs/cgroup/system.slice/x.service/cgroup.controllers",
+                "memory",
+            ),
+            ("/sys/fs/cgroup/memory/memory.limit_in_bytes", NONE),
+            ("/sys/fs/cgroup/memory/docker/memory.limit_in_bytes", NONE),
+            (
                 "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
                 "4294967296",
             ),
-            (
-                "/sys/fs/cgroup/memory/free/memory.limit_in_bytes",
-                "9223372036854771712",
-            ),
+            ("/sys/fs/cgroup/memory/free/memory.limit_in_bytes", NONE),
         ]);
-        let read = |path: &str| files.get(path).map(|text| (*text).to_owned());
+        let limit = |own: &str| cgroup::limit(&system(&files, None, Some(own)));
         // v2: the scope's 16 GiB, under its slice's 32 GiB.
-        let own = "0::/user.slice/user-1000.slice/run.scope";
-        assert_eq!(cgroup::limit(own, read), Some(16 << 30));
+        assert_eq!(
+            limit("0::/user.slice/user-1000.slice/run.scope"),
+            Ok(Some(16 << 30))
+        );
         // v1: the memory controller's line, not the others'.
-        let own = "4:cpu,cpuacct:/docker/abc\n3:memory:/docker/abc";
-        assert_eq!(cgroup::limit(own, read), Some(4 << 30));
+        assert_eq!(
+            limit("4:cpu,cpuacct:/docker/abc\n3:memory:/docker/abc"),
+            Ok(Some(4 << 30))
+        );
         // No limit anywhere, or v1's "none" value.
-        assert_eq!(cgroup::limit("0::/system.slice/x.service", read), None);
-        assert_eq!(cgroup::limit("3:memory:/free", read), None);
+        assert_eq!(limit("0::/system.slice/x.service"), Ok(None));
+        assert_eq!(limit("3:memory:/free"), Ok(None));
     }
 
     /// Linux's remaining memory is the least of the machine's available memory and what
@@ -1018,8 +920,17 @@ mod tests {
         const G: u64 = 1 << 30;
         let gib = |n: u64| (n * G).to_string();
         let files: HashMap<String, String> = [
+            ("/proc/self/mountinfo", MOUNTS.to_owned()),
             // v2: the slice leaves 8 - (7 - 2) = 3 GiB, the scope 16 - (6 - 1) = 11.
             ("/sys/fs/cgroup/memory.max", "max".to_owned()),
+            (
+                "/sys/fs/cgroup/app.slice/run.scope/cgroup.controllers",
+                "memory".to_owned(),
+            ),
+            (
+                "/sys/fs/cgroup/system.slice/x.service/cgroup.controllers",
+                "memory".to_owned(),
+            ),
             ("/sys/fs/cgroup/app.slice/memory.max", gib(8)),
             ("/sys/fs/cgroup/app.slice/memory.current", gib(7)),
             (
@@ -1032,7 +943,15 @@ mod tests {
                 "/sys/fs/cgroup/app.slice/run.scope/memory.stat",
                 format!("inactive_file {}", gib(1)),
             ),
-            // v1: 4 GiB less 3 used, 1 of them inactive cache: 2 GiB.
+            // v1: 4 GiB less 3 used, 1 of them inactive cache: 2 GiB; no limit above it.
+            (
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                "9223372036854771712".to_owned(),
+            ),
+            (
+                "/sys/fs/cgroup/memory/docker/memory.limit_in_bytes",
+                "9223372036854771712".to_owned(),
+            ),
             (
                 "/sys/fs/cgroup/memory/docker/abc/memory.limit_in_bytes",
                 gib(4),
@@ -1057,8 +976,11 @@ mod tests {
         ]
         .into_iter()
         .map(|(path, text)| (path.to_owned(), text))
+        .chain(["zero", "blind", "odd"].map(|scope| {
+            let path = format!("/sys/fs/cgroup/{scope}.scope/cgroup.controllers");
+            (path, "memory".to_owned())
+        }))
         .collect();
-        let read = |path: &str| files.get(path).cloned();
         let meminfo = |available: u64| {
             format!(
                 "MemTotal: 33554432 kB\nMemAvailable: {} kB\n",
@@ -1085,7 +1007,10 @@ mod tests {
             remaining(Some(meminfo(G)), Some(&at("zero.scope"))),
             Some(0)
         );
-        assert_eq!(cgroup::limit(&at("zero.scope"), read), Some(0));
+        assert_eq!(
+            cgroup::limit(&system(&files, None, Some(&at("zero.scope")))),
+            Ok(Some(0))
+        );
         for group in ["blind.scope", "odd.scope"] {
             assert_eq!(
                 remaining(Some(meminfo(G)), Some(&at(group))),
@@ -1093,6 +1018,19 @@ mod tests {
                 "{group}"
             );
         }
+    }
+
+    /// cgroup v2 and v1's memory hierarchy where systemd mounts them.
+    const MOUNTS: &str = "30 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n\
+                          35 25 0:31 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n";
+
+    /// `files` and [`MOUNTS`] as `/proc/self/mountinfo`, for [`system`].
+    fn fixture(files: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        [("/proc/self/mountinfo", MOUNTS)]
+            .iter()
+            .chain(files)
+            .map(|(path, text)| ((*path).to_owned(), (*text).to_owned()))
+            .collect()
     }
 
     /// A file system of `files` for the readers, with `/proc/meminfo` and `/proc/self/cgroup`

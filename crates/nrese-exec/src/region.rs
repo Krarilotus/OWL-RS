@@ -486,6 +486,14 @@ fn charge(
     held.charge(bytes)
 }
 
+/// The system's page size, read once: what regions map and give back in, and what Linux's
+/// `/proc/self/statm` counts in ([`crate::memory`]). Miri, and targets other than Linux and
+/// Windows, have none: 4 KiB there.
+#[cfg(target_os = "linux")]
+pub(crate) fn page_size() -> usize {
+    sys::page()
+}
+
 /// The system calls, the only unsafe code of regions besides the views of their items.
 /// A failure to make or give back memory that was reserved and charged panics: it is the
 /// system's, as an allocation failure is.
