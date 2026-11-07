@@ -130,6 +130,57 @@ fn a_first_load_reports_what_every_plan_reports() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// A first load's report fits wherever the delta executor's own fits: the batch's report
+/// is let go before the introduced-only one takes the same budget (sol-loop r1 S1: both were
+/// held, and the report refused where the delta's was complete, losing its bindings). The
+/// limit is measured, not picked: the delta executor's peak on the same load.
+#[test]
+fn a_first_loads_report_fits_the_budget_the_deltas_fits() {
+    use nrese_exec::Budget;
+    use nrese_reasoner::engine::maintain_within;
+    let load: String = (0..200)
+        .map(|i| format!("ex:i{i} a owl:Nothing . "))
+        .collect();
+    let run = |plan: Option<Plan>, budget: &std::sync::Arc<Budget>| {
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let program =
+            Program::compile(&Ruleset::Owl2Rl.into(), &|t| tx.intern(t)).maintaining_by(plan);
+        let text = format!("{PREFIX}{load}");
+        for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
+            tx.insert(quad.unwrap().as_ref());
+        }
+        let done = maintain_within(&program, None, &mut tx, &|| false, budget).unwrap();
+        let listed: Vec<String> = done
+            .violations
+            .iter()
+            .map(|(rule, bindings)| format!("{rule}:{bindings:?}"))
+            .collect();
+        (done.work.plan, done.violations.complete(), listed)
+    };
+    let measured = std::sync::Arc::new(Budget::new(usize::MAX));
+    let (plan, complete, delta) = run(Some(Plan::Dred), &measured);
+    assert_ne!(plan, Plan::Rebuild, "the control takes the delta executor");
+    assert!(
+        complete && delta.len() >= 200,
+        "the delta's report: {}",
+        delta.len()
+    );
+    let limit = measured.peak();
+    assert!(limit > 0, "the delta's report is charged");
+    let (plan, complete, first_load) = run(None, &std::sync::Arc::new(Budget::new(limit)));
+    assert_eq!(plan, Plan::Rebuild, "the first load is materialised once");
+    assert!(
+        complete,
+        "the first load's report refused at the delta's own peak ({limit} bytes)"
+    );
+    assert_eq!(first_load, delta, "the same violations, bindings included");
+}
+
 /// A user rule's fact makes the empty state inconsistent; an unrelated insert introduces
 /// nothing and is reported as the delta reports it.
 #[test]
