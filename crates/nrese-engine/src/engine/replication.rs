@@ -178,7 +178,8 @@ impl Engine {
     /// it follows a revision this engine has reached (its records up to this engine's
     /// revision are skipped, as an answer applied twice); the frames are complete records,
     /// nothing else; their revisions are exactly `after + 1 ..= last`, `records` of them;
-    /// their dictionary entries follow on from each other. Then the batch's dictionary
+    /// their dictionary entries follow on from each other; their commit times are ones a
+    /// store keeps ([`crate::durability::check_commit_time`]). Then the batch's dictionary
     /// entries are restored at once, all or none, each checked under that lock as
     /// `Dictionary::restore_key` takes one (continuing this dictionary; a speculative
     /// transaction may have interned meanwhile). Anything else is refused
@@ -298,8 +299,10 @@ impl Engine {
             ));
         }
         // Each record's dictionary range ends within u64 (a range from the wire is refused,
-        // not added up): checked before anything below adds to it.
+        // not added up): checked before anything below adds to it. Its commit time is one a
+        // store keeps: refused here, a later record's never leaves an earlier one applied.
         for record in &records {
+            crate::durability::check_commit_time(record)?;
             if record
                 .dictionary_start
                 .checked_add(record.keys.len() as u64)
@@ -343,7 +346,7 @@ impl Engine {
                     .any(|t| t.predicate == same_as)
         });
         self.inner
-            .publish_record(record, dictionary_len, changes_equality)
+            .publish_record(record, false, dictionary_len, changes_equality)
     }
 }
 
@@ -599,12 +602,22 @@ mod tests {
         past_u64[1].keys.clear();
         let mut invalid_suffix = encoded(&all[..1]);
         invalid_suffix.extend_from_slice(b"not a record at all");
+        // DUR-2 fix check r3: a valid record, then one whose commit time no store keeps
+        // (`durability::MAX_COMMIT_TIME`).
+        let mut past_time = decoded(&batch.frames);
+        past_time.truncate(2);
+        past_time[1].committed_micros = Some(1 << 63);
         let later = super::LogExpectation {
             after: 2,
             records: 2,
             last: 4,
         };
-        let rows: [(&str, Vec<u8>, super::LogExpectation); 7] = [
+        let rows: [(&str, Vec<u8>, super::LogExpectation); 8] = [
+            (
+                "a commit time past its range after a valid record",
+                encoded(&past_time),
+                expect(2, 3),
+            ),
             (
                 "a dictionary range ending past u64",
                 encoded(&past_u64),
@@ -782,6 +795,7 @@ mod tests {
                 asserted: current.asserted.clone(),
                 inferred: current.inferred.clone(),
                 revision: high,
+                committed_micros: current.committed_micros,
                 dictionary_len: current.dictionary_len,
                 equality: std::sync::Arc::clone(&current.equality),
                 content: current.content,
