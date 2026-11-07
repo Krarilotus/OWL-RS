@@ -31,7 +31,7 @@ use rayon::prelude::*;
 
 use super::spill::{Spill, Spiller};
 use super::{CommitSummary, Inner, ReadModel, Snapshot, Stack, Version};
-use crate::durability::{Durable, checkpoint, commit_time, later};
+use crate::durability::{Durable, checkpoint, later};
 use crate::error::{EngineError, EngineResult};
 use crate::index::keys::PackedKeys;
 use crate::index::run::{PermutationBuilder, Run};
@@ -485,14 +485,18 @@ struct Stamp {
 }
 
 impl Stamp {
-    /// The version's time, taken now: the commit's ([`commit_time`]), bounding what it keeps
-    /// of the previous version too; unknown if it keeps any of a version of unknown time.
-    fn take(self) -> Option<u64> {
-        let commit = commit_time(self.previous);
-        match self.replaces {
+    /// The version's times, taken now: the commit is stamped by the store's clock
+    /// ([`super::Shared::stamp`]: never before an earlier commit, even of a version of unknown
+    /// time), and the version's time bounds what it keeps of the previous version too, unknown
+    /// if it keeps any of a version of unknown time. Returns that and the clock
+    /// ([`checkpoint::Times`]).
+    fn take(self, shared: &super::Shared) -> checkpoint::Times {
+        let commit = shared.stamp();
+        let committed = match self.replaces {
             true => Some(commit),
             false => later(self.previous, Some(commit)),
-        }
+        };
+        (committed, commit)
     }
 }
 
@@ -520,7 +524,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
         }
     };
     let Some(durable) = &shared.durable else {
-        next.committed_micros = stamp.take();
+        next.committed_micros = stamp.take(shared).0;
         let _compaction = shared.versions.compaction_slot.lock();
         shared.versions.install(Arc::new(next));
         return Ok(());
@@ -542,8 +546,9 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
             &image,
             shared.admission.as_ref(),
             &mut || {
-                committed_micros = stamp.take();
-                committed_micros
+                let times = stamp.take(shared);
+                committed_micros = times.0;
+                times
             },
         )
     })?;
@@ -638,8 +643,9 @@ fn publish_streamed(
             shared.admission.as_ref(),
             revision,
             &mut || {
-                committed_micros = stamp.take();
-                committed_micros
+                let times = stamp.take(shared);
+                committed_micros = times.0;
+                times
             },
             &shared.dictionary,
             dictionary_len,

@@ -21,7 +21,9 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::SyncPolicy;
-use super::codec::{CommitRecord, Frame, decode_frame, encode_record};
+#[cfg(test)]
+use super::codec::encode_record;
+use super::codec::{CommitRecord, Frame, decode_frame, encode_record_at};
 use crate::error::{EngineError, EngineResult};
 
 /// Version 2 added the inferred stack to commit records (roadmap E6); version 3 inlines
@@ -240,9 +242,18 @@ impl Wal {
         self.bytes_since_checkpoint
     }
 
-    /// Appends one record and makes it durable according to the sync policy. The caller
-    /// publishes the commit only after this returns `Ok`.
-    pub(crate) fn append(&mut self, record: &CommitRecord) -> EngineResult<()> {
+    /// Appends one record and makes it durable according to the sync policy, and returns its
+    /// commit time. The caller publishes the commit only after this returns `Ok`.
+    ///
+    /// A local commit is stamped here, by `stamp`, once the record's preparation and any
+    /// rotation are done and just before it is written and synced: the time is that of the
+    /// commit, not of its build (review r1, R1-F1). Without `stamp` (a replicated record)
+    /// the record's own time is kept.
+    pub(crate) fn append(
+        &mut self,
+        record: &CommitRecord,
+        stamp: Option<&mut dyn FnMut() -> u64>,
+    ) -> EngineResult<Option<u64>> {
         if self.poisoned {
             return Err(EngineError::WalPoisoned);
         }
@@ -253,20 +264,14 @@ impl Wal {
         if let Some(at) = super::fault::CLOCK_AT_APPEND.get() {
             super::fault::CLOCK.set(Some(at));
         }
+        let committed = match stamp {
+            Some(stamp) => Some(stamp()),
+            None => record.committed_micros,
+        };
         self.buffer.clear();
         // Version 4 segments (stores that keep integers in their dictionary) have no times.
-        let timed;
-        let record = match self.magic == SEGMENT_MAGIC {
-            true => record,
-            false => {
-                timed = CommitRecord {
-                    committed_micros: None,
-                    ..record.clone()
-                };
-                &timed
-            }
-        };
-        encode_record(record, &mut self.buffer)?; // nothing written yet on error
+        let logged = committed.filter(|_| self.magic == SEGMENT_MAGIC);
+        encode_record_at(record, logged, &mut self.buffer)?; // nothing written yet on error
         let result = self
             .active
             .write_all(&self.buffer)
@@ -280,7 +285,7 @@ impl Wal {
         }
         self.active_bytes += self.buffer.len() as u64;
         self.bytes_since_checkpoint += self.buffer.len() as u64;
-        Ok(())
+        Ok(committed)
     }
 
     /// Starts a new segment for the records from `next_revision` on (a lower bound: a bulk

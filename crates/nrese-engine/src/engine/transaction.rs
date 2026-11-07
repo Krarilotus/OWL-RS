@@ -1,5 +1,7 @@
 //! Write transactions: exact deltas over a base snapshot, published atomically on commit.
 
+use std::sync::atomic::Ordering;
+
 use hashbrown::HashSet;
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
 use parking_lot::MutexGuard;
@@ -520,12 +522,10 @@ impl<'e> Transaction<'e> {
             deletes: asserted.deletes.into_iter().collect(),
             inferred_inserts: triples(inferred.inserts),
             inferred_deletes: triples(inferred.deletes),
-            // Never before the last commit's (the writer slot is held: `base` is the latest).
-            committed_micros: Some(crate::durability::commit_time(
-                base.version().committed_micros,
-            )),
+            // Stamped as it goes to the log ([`Inner::publish_record`]).
+            committed_micros: None,
         };
-        engine.publish_record(&record, dictionary_len, changes_equality)?;
+        engine.publish_record(&record, true, dictionary_len, changes_equality)?;
         Ok(summary)
     }
 }
@@ -534,9 +534,15 @@ impl Inner {
     /// Publishes `record` as the next revision, its terms already in the dictionary
     /// (`dictionary_len` of them): logged first in durable mode, then post-commit
     /// maintenance. The caller holds the writer slot: a commit, or a replicated record.
+    ///
+    /// A `local` commit is stamped by the store's clock ([`Shared::stamp`]) when its record
+    /// goes to the log, its runs built and its layout converted, and the record and the
+    /// version take that one time (review r1, R1-F1). A replicated record keeps the
+    /// primary's time, which the clock takes too.
     pub(super) fn publish_record(
         &self,
         record: &CommitRecord,
+        local: bool,
         dictionary_len: u64,
         changes_equality: bool,
     ) -> EngineResult<()> {
@@ -569,8 +575,7 @@ impl Inner {
                 .is_none_or(|index| index.layout() == asserted_layout)
         );
         let revision = record.revision;
-        let committed = record.committed_micros;
-        let publish = move |current: &Version| {
+        let publish = move |current: &Version, committed: Option<u64>| {
             debug_assert_eq!(current.revision + 1, revision, "single writer");
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
             Version {
@@ -592,12 +597,30 @@ impl Inner {
         let wal_bytes = match &shared.durable {
             Some(durable) => {
                 let mut wal = durable.wal.lock();
-                wal.append(record)?;
-                shared.versions.publish(publish);
+                let mut stamp = || shared.stamp();
+                let stamp: Option<&mut dyn FnMut() -> u64> = match local {
+                    true => Some(&mut stamp),
+                    false => None,
+                };
+                let committed = wal.append(record, stamp)?;
+                if !local {
+                    shared
+                        .clock
+                        .fetch_max(committed.unwrap_or(0), Ordering::Relaxed);
+                }
+                shared
+                    .versions
+                    .publish(|current| publish(current, committed));
                 wal.bytes_since_checkpoint()
             }
             None => {
-                shared.versions.publish(publish);
+                let committed = match local {
+                    true => Some(shared.stamp()),
+                    false => record.committed_micros,
+                };
+                shared
+                    .versions
+                    .publish(|current| publish(current, committed));
                 0
             }
         };
