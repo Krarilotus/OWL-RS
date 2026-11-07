@@ -11,8 +11,10 @@ use nrese_store::GraphResultFormat;
 static ALLOCATOR: measure::Measured<std::alloc::System> = measure::Measured(std::alloc::System);
 
 /// What reading may hold uncharged at once: the parser's buffers for one statement, which
-/// are its own, not the quads kept.
-const SCRATCH: usize = 64 << 10;
+/// are its own, not the quads kept. Measured (upload-r1-probe-3a374ba1, three runs, the
+/// same each time): 6,103 bytes past the charge, of 7,537,304 charged; the refusal's peak
+/// 1,046,076 bytes against the 1 MiB envelope. 16 KiB is 2.7 times the excess measured.
+const SCRATCH: usize = 16 << 10;
 
 /// `lines` statements of 1,000-character IRIs, every fourth with a triple term as object
 /// and a literal in it; about 3 KB kept per statement.
@@ -46,6 +48,11 @@ fn kept_quads_are_charged_before_they_are_allocated() {
         nrese_store::parse_payload(GraphResultFormat::NTriples, None, &document, &envelope)
     });
     let quads = quads.expect("within the envelope");
+    // The measurements, for the limits' calibration (run with --nocapture).
+    eprintln!(
+        "measured: charged {} bytes, excess {excess} bytes",
+        envelope.used()
+    );
     assert_eq!(quads.len(), 2_000);
     assert!(
         envelope.used() >= 6 << 20,
@@ -70,6 +77,7 @@ fn quads_past_the_envelope_are_refused_before_they_are_copied() {
     let (outcome, peak) = measure::measure(|| {
         nrese_store::parse_payload(GraphResultFormat::NTriples, None, &document, &envelope)
     });
+    eprintln!("measured: refused at peak {peak} bytes");
     let error = outcome.expect_err("past the envelope");
     assert!(
         error.to_string().contains("memory"),

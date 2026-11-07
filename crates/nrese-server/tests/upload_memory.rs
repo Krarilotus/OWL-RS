@@ -19,8 +19,10 @@ static ALLOCATOR: measure::Measured<std::alloc::System> = measure::Measured(std:
 
 /// Statements in the document: held as owned patterns, about 150 MB.
 const STATEMENTS: usize = 50_000;
-/// What the request may take at its peak: the body, its few terms, the session.
-const PEAK: usize = 32 << 20;
+/// What the request may take at its peak: the body, its few terms, the session. Measured
+/// (upload-r1-probe-3a374ba1, three runs, the same each time): 577,420 bytes; before UPLOAD
+/// 163 MiB. 4 MiB is 7 times the measured and 40 times below before.
+const PEAK: usize = 4 << 20;
 
 #[test]
 fn a_transaction_delete_keeps_its_document_not_a_pattern_per_statement() {
@@ -68,6 +70,8 @@ fn a_transaction_delete_keeps_its_document_not_a_pattern_per_statement() {
         .unwrap();
     let (response, peak) = measure::measure(|| runtime.block_on(app.clone().oneshot(request)));
     assert_eq!(response.unwrap().status(), StatusCode::OK);
+    // The measurement, for the limit's calibration (run with --nocapture).
+    eprintln!("measured: a transaction DELETE: peak {peak} bytes");
     assert!(
         peak < PEAK,
         "a transaction DELETE: {} MiB at its peak, more than {} MiB",
