@@ -122,11 +122,18 @@ fn a_global_engine_keeps_no_corpora() {
 
 /// Guard: one walk per scope, then the kept corpus; an open transaction builds nothing;
 /// after a commit the corpus is derived from the last one (a probe per term the commit
-/// touched), not walked again.
+/// touched), not walked again. 1,300 labels that match no query make the corpora large
+/// enough to be worth deriving over the 60-label commit (120 terms) under the default 10
+/// documents a probe (master 7 Nov 18:16).
 #[test]
 fn corpora_are_walked_once_then_derived_across_commits() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     base(&engine);
+    let mut tx = engine.transaction();
+    for i in 0..1300 {
+        tx.insert(label(&format!("pad{i}"), &format!("pad {i}"), None).as_ref());
+    }
+    tx.commit().unwrap();
     let snapshot = engine.snapshot();
     let default = TextScope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
     let all = every(&snapshot, "alpha beta");
@@ -438,6 +445,12 @@ fn random_commits(seed: u64, failed: &mut Vec<String>) {
         ..EngineConfig::default()
     })
     .unwrap();
+    // Corpora of a few dozen documents: derived wherever the touched terms are at most
+    // their documents, so that derivation is checked against the walk's oracle.
+    engine.set_corpus_tuning(nrese_engine::CorpusTuning {
+        documents_per_probe: 1,
+        ..nrese_engine::CorpusTuning::DEFAULT
+    });
     let graphs = [None, Some("g1"), Some("g2"), Some("g3")];
     let words = ["alpha", "beta", "gamma", "delta", "epsilon"];
     let mut random = Random(seed);
@@ -806,6 +819,11 @@ fn a_replica_scores_as_its_primary() {
     base(&primary);
     primary.write_image(replica_dir.path()).unwrap();
     let replica = Engine::open(replica_dir.path(), config()).unwrap();
+    // A corpus of 11 documents, derived over the log's 4 touched terms.
+    replica.set_corpus_tuning(nrese_engine::CorpusTuning {
+        documents_per_probe: 1,
+        ..nrese_engine::CorpusTuning::DEFAULT
+    });
     let q = "alpha beta";
     assert_eq!(
         texts(&replica.snapshot(), &every(&replica.snapshot(), q)),

@@ -45,6 +45,29 @@ pub(super) fn parse_store_config(
             Some(1) => nrese_store::SearchScope::Reader,
             _ => nrese_store::SearchScope::Global,
         },
+        reader_corpus_bytes: super::env_values::parse_bytes(
+            source,
+            names::READER_CORPUS_BYTES,
+            defaults.reader_corpus_bytes,
+        )?,
+        reader_corpus_tuning: nrese_store::CorpusTuning {
+            walk_slice_words: match super::env_values::parse_usize(
+                source,
+                names::READER_WALK_SLICE,
+                defaults.reader_corpus_tuning.walk_slice_words,
+            )? {
+                0 => bail!("{} must be at least 1", names::READER_WALK_SLICE),
+                words => words,
+            },
+            documents_per_probe: match super::env_values::parse_u64(
+                source,
+                names::READER_DOCUMENTS_PER_PROBE,
+                defaults.reader_corpus_tuning.documents_per_probe,
+            )? {
+                0 => bail!("{} must be at least 1", names::READER_DOCUMENTS_PER_PROBE),
+                documents => documents,
+            },
+        },
         total_query_memory_bytes: parse_total_query_memory(
             source.get(names::MAX_TOTAL_QUERY_MEMORY_BYTES).as_deref(),
             machine,
@@ -445,6 +468,49 @@ mod tests {
         assert_eq!(cap(None), 16);
         assert_eq!(cap(Some("4")), 4);
         assert_eq!(cap(Some(usize::MAX.to_string().as_str())), usize::MAX);
+    }
+
+    /// Spec: docs/ops/config-reference.md, `store.reader_corpus_bytes` (default 256 MiB, a
+    /// size), `store.reader_walk_slice` (default 1024, at least 1) and
+    /// `store.reader_documents_per_probe` (default 10, at least 1): each reaches the store; a
+    /// zero where at least 1 is asked is refused, naming its setting. New settings: their
+    /// test was written with them.
+    #[test]
+    fn the_reader_corpus_settings_reach_the_store() {
+        let parse = |pairs: &[(&str, &str)]| {
+            let mut source = KeyValueSource::default();
+            for &(name, value) in pairs {
+                source.insert(name, value);
+            }
+            parse_store_config(&source, Ok(16 << 30))
+        };
+        let defaults = parse(&[]).unwrap();
+        assert_eq!(defaults.reader_corpus_bytes, 256 << 20);
+        assert_eq!(
+            defaults.reader_corpus_tuning,
+            nrese_store::CorpusTuning {
+                walk_slice_words: 1024,
+                documents_per_probe: 10
+            }
+        );
+        let set = parse(&[
+            (names::READER_CORPUS_BYTES, "1GiB"),
+            (names::READER_WALK_SLICE, "256"),
+            (names::READER_DOCUMENTS_PER_PROBE, "4"),
+        ])
+        .unwrap();
+        assert_eq!(set.reader_corpus_bytes, 1 << 30);
+        assert_eq!(
+            set.reader_corpus_tuning,
+            nrese_store::CorpusTuning {
+                walk_slice_words: 256,
+                documents_per_probe: 4
+            }
+        );
+        for name in [names::READER_WALK_SLICE, names::READER_DOCUMENTS_PER_PROBE] {
+            let refused = parse(&[(name, "0")]).map(|_| ()).unwrap_err();
+            assert!(refused.to_string().contains(name), "{name}: {refused}");
+        }
     }
 
     #[test]

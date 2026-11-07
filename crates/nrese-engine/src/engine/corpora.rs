@@ -21,19 +21,21 @@
 //! first reader search) has no lineage: walked.
 //!
 //! The lineage (content → its parent, the terms and predicates touched) is kept only
-//! while a corpus is kept, back to the oldest kept one, for at most [`STEPS`] steps and
-//! [`STEP_TERMS`] terms. Beyond, or where more terms were touched than a probe each is
-//! worth ([`worth_deriving`]), the corpus is walked again.
+//! while a corpus is kept, back to the oldest kept one, as far as the budget holds it.
+//! Where more terms were touched since a kept ancestor than a probe each is worth
+//! ([`worth_deriving`], [`CorpusTuning::documents_per_probe`]), or the lineage doesn't
+//! reach one, the corpus is walked again.
 //!
 //! Memory is the memory-accounting owner's ([`nrese_exec::ChargedVec`],
 //! [`nrese_exec::Reservation`]), charged before it is allocated. What the store keeps is
 //! charged to its budget ([`crate::Engine::set_text_corpus_budget`]; at first
-//! [`DEFAULT_BUDGET`]): a kept corpus's members (built on it, so nothing moves between
-//! budgets), each entry's key and each lineage step; a kept corpus an evicted entry's
-//! search still holds stays charged until it lets go. What doesn't fit after the least
-//! recently used are let go isn't kept: the corpus is then built on the searching
+//! [`DEFAULT_READER_CORPUS_BYTES`]): a kept corpus's members (built on it, so nothing moves
+//! between budgets), each entry's key and each lineage step; a kept corpus an evicted
+//! entry's search still holds stays charged until it lets go. What doesn't fit after the
+//! least recently used are let go isn't kept: the corpus is then built on the searching
 //! request's budget and serves that search alone, as everything a search builds besides
-//! (the bits, the walk's counts, the probes' list). At most [`ENTRIES`] are kept.
+//! (the bits, the walk's counts, the probes' list). The budget is the only bound on how
+//! many corpora and steps are kept.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,15 +74,53 @@ impl Corpora {
     }
 }
 
-/// Corpora kept at most.
-pub(crate) const ENTRIES: usize = 64;
+/// What the corpora of reader-scoped searches an engine keeps, and their lineage, may take
+/// unless set otherwise (the store's `store.reader_corpus_bytes`;
+/// [`crate::Engine::set_text_corpus_budget`]): 256 MiB. A 1 M-document corpus takes
+/// 250,336 bytes (fleet `syn24-lineage-probe-8faeb458`), so about a thousand such corpora fit;
+/// the least recently used go first.
+pub const DEFAULT_READER_CORPUS_BYTES: usize = 256 << 20;
 
-/// What the store keeps is charged to at first: 256 MiB.
-pub(crate) const DEFAULT_BUDGET: usize = 256 << 20;
+/// How reader-scoped searches build their corpora: settings, each with its default and the
+/// measured reason for it ([`crate::Engine::set_corpus_tuning`]; the store's
+/// `store.reader_walk_slice`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CorpusTuning {
+    /// Words of bits (64 terms each) one slice of a corpus walk covers at most; each slice
+    /// also holds a group count of 16 bytes a term.
+    pub walk_slice_words: usize,
+    /// Documents a walk visits for the work of one probe of a touched term: a corpus is
+    /// derived from a kept ancestor's while the terms touched since are at most its
+    /// documents over this, else walked again. At least 1.
+    pub documents_per_probe: u64,
+}
 
-/// Lineage steps kept, and the terms they may hold together.
-const STEPS: usize = 4096;
-const STEP_TERMS: usize = 1 << 18;
+impl CorpusTuning {
+    /// The defaults, each measured.
+    ///
+    /// - `walk_slice_words` 1024: a walk of 1 M documents in slices of 256, 1,024 and
+    ///   4,096 words does 111.7 M, 110.4 M and 111.9 M instructions (fleet
+    ///   `syn24-work-probe-2-06961a4e`) and takes 20.8, 9.1 and 9.4 ms on 12 threads
+    ///   (`syn24-tuning-probe-f4b4dd86`); 1,024 holds no more scratch than 4,096.
+    /// - `documents_per_probe` 10, from work, not wall time, so it holds whatever the core
+    ///   count. At 1 M documents a probe does about 1,100 instructions and a walk about
+    ///   110 M: they cost alike at about 100,000 terms, 10 documents a probe
+    ///   (`syn24-work-probe-2-06961a4e`). A walk has no fixed cost in work (1,000
+    ///   documents: 157–203 k instructions), so there is no floor. On 12 threads a walk's
+    ///   wall time matches 90–190 documents a probe (`syn24-tuning-probe-f4b4dd86`): just
+    ///   below the crossover, a serial derivation may take up to about 10× the parallel
+    ///   walk's time. A latency-first store with one tenant can raise it.
+    pub const DEFAULT: Self = Self {
+        walk_slice_words: 1024,
+        documents_per_probe: 10,
+    };
+}
+
+impl Default for CorpusTuning {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 /// What a corpus is of, without the version: the documents, the model, the graphs, and
 /// the reader's equality (`owl:sameAs` when it expands classes) and whether it reads them
@@ -206,13 +246,13 @@ struct State {
     retired: Vec<(Weak<Corpus>, Reservation)>,
     steps: HashMap<Content, Step>,
     order: VecDeque<Content>,
-    step_terms: usize,
 }
 
 /// The kept corpora and the lineage, shared by the snapshots of an engine and the views
 /// made from them.
 pub(crate) struct CorpusStore {
     budget: Mutex<Arc<Budget>>,
+    tuning: Mutex<CorpusTuning>,
     state: Mutex<State>,
     steps: AtomicU64,
     walked: AtomicU64,
@@ -245,10 +285,15 @@ fn terms(
     object.into_iter().chain(subject)
 }
 
-/// Whether probing `touched` terms beats walking a corpus of `documents`: a probe costs
-/// about what a walk spends on sixteen documents.
-pub(crate) fn worth_deriving(touched: usize, documents: u64) -> bool {
-    touched as u64 <= (documents / 16).max(1024)
+/// The most touched terms worth probing to derive a corpus of `documents` rather than
+/// walking it: a probe does the work a walk does on `documents_per_probe` documents.
+pub(crate) fn derive_bound(documents: u64, documents_per_probe: u64) -> u64 {
+    documents / documents_per_probe.max(1)
+}
+
+/// Whether probing `touched` terms beats walking a corpus of `documents`.
+pub(crate) fn worth_deriving(touched: usize, documents: u64, documents_per_probe: u64) -> bool {
+    touched as u64 <= derive_bound(documents, documents_per_probe)
 }
 
 /// `items` sorted, without repeats (the vector keeps its capacity and charge).
@@ -266,12 +311,12 @@ fn sort_dedup(items: &mut ChargedVec<u64>) {
 
 /// The steps from `from` up its lineage, nearest first, while `steps` holds them.
 fn up(steps: &HashMap<Content, Step>, from: Content) -> impl Iterator<Item = &Step> + Clone {
-    std::iter::successors(steps.get(&from), |step| steps.get(&step.parent)).take(STEPS)
+    std::iter::successors(steps.get(&from), |step| steps.get(&step.parent))
 }
 
 impl Default for CorpusStore {
     fn default() -> Self {
-        Self::on(Arc::new(Budget::new(DEFAULT_BUDGET)))
+        Self::on(Arc::new(Budget::new(DEFAULT_READER_CORPUS_BYTES)))
     }
 }
 
@@ -279,12 +324,12 @@ impl CorpusStore {
     fn on(budget: Arc<Budget>) -> Self {
         Self {
             budget: Mutex::new(budget),
+            tuning: Mutex::new(CorpusTuning::DEFAULT),
             state: Mutex::new(State {
                 kept: Vec::new(),
                 retired: Vec::new(),
                 steps: HashMap::new(),
                 order: VecDeque::new(),
-                step_terms: 0,
             }),
             steps: AtomicU64::new(0),
             walked: AtomicU64::new(0),
@@ -306,6 +351,16 @@ impl CorpusStore {
     /// The budget what the store keeps is charged to.
     pub(crate) fn budget(&self) -> Arc<Budget> {
         Arc::clone(&self.budget.lock())
+    }
+
+    /// How corpora are built from now on; kept corpora stay (they are exact either way).
+    pub(crate) fn set_tuning(&self, tuning: CorpusTuning) {
+        *self.tuning.lock() = tuning;
+    }
+
+    /// How corpora are built.
+    pub(crate) fn tuning(&self) -> CorpusTuning {
+        *self.tuning.lock()
     }
 
     /// Records that `child` was made from `parent`, adding or removing these statements
@@ -354,7 +409,6 @@ impl CorpusStore {
     ) {
         let (touched, touched_charge) = touched.into_parts();
         let (predicates, predicates_charge) = predicates.into_parts();
-        state.step_terms += touched.len();
         let replaced = state.steps.insert(
             child,
             Step {
@@ -365,9 +419,8 @@ impl CorpusStore {
             },
         );
         // A content is made once; a second step for it would leave its first in the order.
-        match replaced {
-            Some(old) => state.step_terms -= old.touched.len(),
-            None => state.order.push_back(child),
+        if replaced.is_none() {
+            state.order.push_back(child);
         }
         self.steps.fetch_add(1, Ordering::Relaxed);
         Self::prune(state);
@@ -416,7 +469,6 @@ impl CorpusStore {
     fn forget_lineage(state: &mut State) {
         state.steps.clear();
         state.order.clear();
-        state.step_terms = 0;
     }
 
     /// Lets the oldest step go; `false` if there is none.
@@ -424,9 +476,7 @@ impl CorpusStore {
         let Some(oldest) = state.order.pop_front() else {
             return false;
         };
-        if let Some(step) = state.steps.remove(&oldest) {
-            state.step_terms -= step.touched.len();
-        }
+        state.steps.remove(&oldest);
         true
     }
 
@@ -447,14 +497,13 @@ impl CorpusStore {
             .retain(|(corpus, _)| corpus.strong_count() > 0);
     }
 
-    /// Drops the oldest steps beyond the bounds, and those no path to a kept corpus takes:
-    /// contents are numbered as made, so a path from a version down to a kept corpus only
-    /// passes steps made after that corpus's version.
+    /// Drops the oldest steps no path to a kept corpus takes: contents are numbered as
+    /// made, so a path from a version down to a kept corpus only passes steps made after
+    /// that corpus's version. (The budget bounds the rest: [`Self::record_terms`].)
     fn prune(state: &mut State) {
         let oldest_kept = state.kept.iter().map(|k| k.content.raw()).min();
         while let Some(&oldest) = state.order.front() {
-            let useless = oldest_kept.is_none_or(|kept| oldest.raw() <= kept);
-            if !useless && state.order.len() <= STEPS && state.step_terms <= STEP_TERMS {
+            if oldest_kept.is_some_and(|kept| oldest.raw() > kept) {
                 break;
             }
             Self::drop_oldest_step(state);
@@ -488,6 +537,7 @@ impl CorpusStore {
         request: &Arc<Budget>,
     ) -> Result<Found, BudgetExceeded> {
         let content = version.content;
+        let per_probe = self.tuning().documents_per_probe;
         let mut state = self.state.lock();
         let at = state
             .kept
@@ -507,7 +557,16 @@ impl CorpusStore {
             }
             None => false,
         };
-        // The nearest ancestor with a kept, built corpus of this kind, and the steps there.
+        // The nearest ancestor with a kept, built corpus of this kind, and the steps there:
+        // looked for no further back than the most terms any kept corpus of this kind is
+        // worth deriving over.
+        let reach = state
+            .kept
+            .iter()
+            .filter(|k| kind.matches(&k.kind))
+            .filter_map(|k| k.corpus.as_ref())
+            .map(|(corpus, _)| derive_bound(corpus.documents(), per_probe))
+            .max();
         let same_as = kind.equality.map(TermId::raw);
         let mut ancestor = None;
         let (mut terms, mut count) = (0, 0);
@@ -527,12 +586,12 @@ impl CorpusStore {
                 ancestor = Some(Arc::clone(corpus));
                 break;
             }
-            if terms > STEP_TERMS {
+            if reach.is_none_or(|reach| terms as u64 > reach) {
                 break;
             }
         }
         let from = match ancestor {
-            Some(base) if worth_deriving(terms, base.documents()) => {
+            Some(base) if worth_deriving(terms, base.documents(), per_probe) => {
                 let all = up(&state.steps, content)
                     .take(count)
                     .flat_map(|step| step.touched.iter().copied());
@@ -553,9 +612,6 @@ impl CorpusStore {
         {
             let kept = state.kept.remove(at);
             Self::retire(&mut state, kept);
-        }
-        while state.kept.len() >= ENTRIES {
-            Self::evict_one(&mut state, None);
         }
         let mut key = Reservation::new(self.budget());
         while key.charge(key_bytes(kind)).is_err() {

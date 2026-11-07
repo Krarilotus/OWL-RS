@@ -52,6 +52,11 @@ fn a_lineage_longer_than_any_step_count_still_derives() {
 #[test]
 fn a_large_later_commit_leaves_the_lineage_of_earlier_versions() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
+    // A corpus of 11 documents, derived over the small commit's 2 touched terms.
+    engine.set_corpus_tuning(nrese_engine::CorpusTuning {
+        documents_per_probe: 1,
+        ..nrese_engine::CorpusTuning::DEFAULT
+    });
     base(&engine);
     every(&engine.snapshot(), "alpha");
     let mut tx = engine.transaction();

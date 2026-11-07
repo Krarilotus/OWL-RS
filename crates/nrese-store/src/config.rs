@@ -43,6 +43,15 @@ pub struct StoreConfig {
     /// and selects among what the reader's snapshot, read model and active graphs show
     /// alone, at the cost of a corpus per scope and an exact scan of the visible vectors.
     pub search_scope: nrese_sparql::SearchScope,
+    /// Bytes the corpora a `reader` search scope keeps, and their lineage, may take within
+    /// the memory the queries draw on (`store.reader_corpus_bytes`, a repository's
+    /// `reader_corpus_bytes`; default [`nrese_engine::DEFAULT_READER_CORPUS_BYTES`], whose doc
+    /// gives the measured reason). The least recently used go first; a corpus that doesn't
+    /// fit serves its own search alone.
+    pub reader_corpus_bytes: usize,
+    /// How a `reader` search scope builds its corpora (`store.reader_walk_slice`; default
+    /// [`nrese_engine::CorpusTuning::DEFAULT`]).
+    pub reader_corpus_tuning: nrese_engine::CorpusTuning,
     /// Bytes of intermediate results all running queries may hold together; 0 is
     /// unlimited. A query that asks for more than is left fails with
     /// [`StoreError::is_server_memory_limit`](crate::StoreError::is_server_memory_limit).
@@ -324,6 +333,8 @@ impl StoreConfig {
             union_default_graph: false,
             geosparql_stated_only: false,
             search_scope: nrese_sparql::SearchScope::Global,
+            reader_corpus_bytes: nrese_engine::DEFAULT_READER_CORPUS_BYTES,
+            reader_corpus_tuning: nrese_engine::CorpusTuning::DEFAULT,
             total_query_memory_bytes: 0,
             process_memory_bytes: ProcessMemory::Default,
             huge_pages: DEFAULT_HUGE_PAGES,
@@ -361,6 +372,8 @@ impl StoreConfig {
             union_default_graph: false,
             geosparql_stated_only: false,
             search_scope: nrese_sparql::SearchScope::Global,
+            reader_corpus_bytes: nrese_engine::DEFAULT_READER_CORPUS_BYTES,
+            reader_corpus_tuning: nrese_engine::CorpusTuning::DEFAULT,
             total_query_memory_bytes: 0,
             process_memory_bytes: ProcessMemory::Default,
             huge_pages: DEFAULT_HUGE_PAGES,

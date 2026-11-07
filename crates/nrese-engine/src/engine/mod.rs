@@ -54,7 +54,7 @@ use crate::quad::{EncodedQuad, EncodedTriple};
 use crate::term::{Dictionary, DictionaryStats, TermId};
 
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
-pub use corpora::TextCorpusStats;
+pub use corpora::{CorpusTuning, DEFAULT_READER_CORPUS_BYTES, TextCorpusStats};
 pub use equality::Classes as EqualityClasses;
 pub use replication::LogBatch;
 pub use snapshot::{
@@ -775,8 +775,18 @@ impl Engine {
         *self.inner.shared.views.write() = budget;
     }
 
+    /// How reader-scoped searches build their corpora from now on ([`CorpusTuning`]; at
+    /// first its defaults). Makes the engine's store of corpora if no reader-scoped search
+    /// did yet.
+    pub fn set_corpus_tuning(&self, tuning: CorpusTuning) {
+        if let Some(store) = self.inner.shared.statistics.corpora.get_or_init() {
+            store.set_tuning(tuning);
+        }
+    }
+
     /// What the corpora of reader-scoped searches the engine keeps are charged to from now
-    /// on ([`Snapshot::text_search_in`]; at first 256 MiB of their own): a store that uses
+    /// on ([`Snapshot::text_search_in`]; at first [`DEFAULT_READER_CORPUS_BYTES`] of their
+    /// own): a store that uses
     /// reader-scoped search gives them its share. The kept corpora and their lineage are let
     /// go (searches holding one keep it, charged to the old budget, until they let go).
     /// Makes the engine's store of corpora if no reader-scoped search did yet.

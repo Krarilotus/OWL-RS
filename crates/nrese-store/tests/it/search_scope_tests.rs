@@ -133,6 +133,73 @@ fn a_repository_inherits_or_chooses_its_search_scope() {
     );
 }
 
+/// The corpora's budget (`store.reader_corpus_bytes`, a repository's `reader_corpus_bytes`;
+/// docs/ops/config-reference.md): absent, 256 MiB; a repository inherits the server's and
+/// may set its own, changed at once; under `global` nothing is made. Observable: the
+/// budget the engine's corpora are charged to, after a reader search. A new setting: its
+/// test was written with it.
+#[test]
+fn a_repository_inherits_or_sets_its_corpus_budget() {
+    let mut failed = Vec::new();
+    let rows = [
+        (None, None, 256 << 20),
+        (Some(1 << 20), None, 1 << 20),
+        (None, Some(2u64 << 20), 2 << 20),
+        (Some(1 << 20), Some(3u64 << 20), 3 << 20),
+    ];
+    let with = |bytes: Option<u64>| RepositorySettings {
+        search_scope: Some("reader".to_owned()),
+        reader_corpus_bytes: bytes,
+        ..RepositorySettings::default()
+    };
+    for (server, repository, want) in rows {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let defaults = StoreConfig::on_disk(dir.path());
+        let store = StoreService::new(StoreConfig {
+            reader_corpus_bytes: server.unwrap_or(defaults.reader_corpus_bytes),
+            ..defaults
+        })
+        .expect("store");
+        let catalog = Catalog::open(store, ReasonerService::new(ReasonerConfig::default()))
+            .expect("catalogue");
+        catalog.create("r", with(repository)).expect("created");
+        let store = store_of(&catalog, "r");
+        fill(&store);
+        top(&store);
+        let stats = store.text_corpus_stats();
+        if stats.budget != want {
+            failed.push(format!(
+                "server {server:?}, repository {repository:?}: {stats:?}"
+            ));
+        }
+    }
+    // Changed at once.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = StoreService::new(StoreConfig::on_disk(dir.path())).expect("store");
+    let catalog =
+        Catalog::open(store, ReasonerService::new(ReasonerConfig::default())).expect("catalogue");
+    catalog.create("r", with(None)).expect("created");
+    let store = store_of(&catalog, "r");
+    fill(&store);
+    catalog.change("r", with(Some(5 << 20))).expect("changed");
+    top(&store);
+    if store.text_corpus_stats().budget != 5 << 20 {
+        failed.push(format!("changed: {:?}", store.text_corpus_stats()));
+    }
+    // Global: no corpora, whatever the budget.
+    let global = StoreService::new(StoreConfig {
+        reader_corpus_bytes: 1 << 20,
+        ..StoreConfig::in_memory()
+    })
+    .expect("store");
+    fill(&global);
+    top(&global);
+    if global.text_corpus_stats().started {
+        failed.push(format!("global: {:?}", global.text_corpus_stats()));
+    }
+    assert!(failed.is_empty(), "{failed:?}");
+}
+
 /// An update's `WHERE` clause searches as the store's queries do: its best match under each
 /// scope, written down and read back.
 #[test]
