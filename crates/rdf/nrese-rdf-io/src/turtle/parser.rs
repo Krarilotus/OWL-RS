@@ -283,6 +283,10 @@ pub(crate) struct TurtleParser<'a, R> {
     /// else in a Turtle or TriG statement is an error).
     open: i64,
     ended: bool,
+    /// Whether the statement met bytes the lexer can't read. From there on its tokens are
+    /// no longer the document's (an unterminated string's text lexes as tokens), so what
+    /// it had open counts for nothing when its rest is skipped.
+    unreadable: bool,
     /// The current statement.
     arena: String,
     triples: Vec<Triple>,
@@ -375,6 +379,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             after_string: false,
             open: 0,
             ended: false,
+            unreadable: false,
             arena: String::new(),
             triples: Vec::new(),
             handed_out: 0,
@@ -407,6 +412,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             self.handed_out = 0;
             self.open = 0;
             self.ended = false;
+            self.unreadable = false;
             // Where the statement starts (its first token), for an error's statement.
             let start = match self.statement_start() {
                 Ok(start) => start,
@@ -493,20 +499,27 @@ impl<'a, R: Read> TurtleParser<'a, R> {
 
     /// After a syntax error: skips to the end of the statement, a `.` outside brackets (or
     /// the `}` closing the TriG block it is in), so that parsing goes on with the next one.
-    /// Bytes the lexer can't read are skipped one by one. `false` at the end of the input,
-    /// or on a read error.
+    /// The brackets the statement had open when it failed are open here too (`carried`,
+    /// from `open`), so a `.` inside them ends nothing; brackets opened while skipping count
+    /// as well (`own`), and a closer closes those first. Bytes the lexer can't read, in the
+    /// statement (`unreadable`) or met here, end the carried ones: the tokens after them
+    /// are no longer the statement's, so what it had open says nothing (the brackets the
+    /// skip opened itself stay counted). A stray closer opens nothing. Bytes the lexer can't
+    /// read are skipped one by one. `false` at the end of the input, or on a read error.
     fn resync(&mut self) -> bool {
         self.lookahead = None;
         self.arena.clear();
         self.triples.clear();
         self.triple_terms.clear();
-        let (mut nesting, mut braces) = (0i64, 0i64);
+        let mut carried = if self.unreadable { 0 } else { self.open.max(0) };
+        let (mut own, mut braces) = (0i64, 0i64);
         loop {
             match self.fill() {
                 Ok(()) => {}
                 Err(RdfParseError::Io(_)) => return false,
                 Err(_) => {
                     // Unreadable bytes: drop one and lex again.
+                    carried = 0;
                     self.lookahead = None;
                     if self.input.position < self.input.data().len() {
                         self.input.consume(1);
@@ -523,8 +536,6 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             self.after_string = matches!(token.kind, Kind::String { .. });
             match token.kind {
                 Kind::Eof => return false,
-                Kind::OpenBracket | Kind::OpenParen => nesting += 1,
-                Kind::CloseBracket | Kind::CloseParen => nesting -= 1,
                 Kind::OpenBrace => braces += 1,
                 Kind::CloseBrace if braces > 0 => braces -= 1,
                 Kind::CloseBrace if self.settings.trig && self.in_block => {
@@ -532,8 +543,13 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                     self.graph = None;
                     return true;
                 }
-                Kind::Dot if nesting <= 0 && braces == 0 => return true,
-                _ => {}
+                Kind::Dot if own == 0 && carried == 0 && braces == 0 => return true,
+                kind => match depth(kind) {
+                    1 => own += 1,
+                    -1 if own > 0 => own -= 1,
+                    -1 => carried = (carried - 1).max(0),
+                    _ => {}
+                },
             }
         }
     }
@@ -630,7 +646,10 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                     return Ok(());
                 }
                 Lexed::NeedMore => self.input.refill()?,
-                Lexed::Error(at, message) => return Err(self.error(position + at, message)),
+                Lexed::Error(at, message) => {
+                    self.unreadable = true;
+                    return Err(self.error(position + at, message));
+                }
             }
         }
     }
@@ -649,19 +668,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         self.after_string = matches!(token.kind, Kind::String { .. });
         // What of the statement is open, and whether this token is its end: a `.` with
         // nothing open (see `ended`).
-        match token.kind {
-            Kind::OpenBracket
-            | Kind::OpenParen
-            | Kind::TripleTermOpen
-            | Kind::ReifiedOpen
-            | Kind::AnnotationOpen => self.open += 1,
-            Kind::CloseBracket
-            | Kind::CloseParen
-            | Kind::TripleTermClose
-            | Kind::ReifiedClose
-            | Kind::AnnotationClose => self.open -= 1,
-            _ => {}
-        }
+        self.open += depth(token.kind);
         self.ended = token.kind == Kind::Dot && self.open == 0;
         Ok(token)
     }
@@ -1414,6 +1421,25 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             }
             _ => Term::Static(rdf::NIL),
         })
+    }
+}
+
+/// How a token changes what of a statement is open: `[`, `(`, `<<(`, `<<` and `{|` open
+/// one, their closers close one. The one list, for parsing (`take`) and for skipping a
+/// failed statement's rest (`resync`).
+fn depth(kind: Kind) -> i64 {
+    match kind {
+        Kind::OpenBracket
+        | Kind::OpenParen
+        | Kind::TripleTermOpen
+        | Kind::ReifiedOpen
+        | Kind::AnnotationOpen => 1,
+        Kind::CloseBracket
+        | Kind::CloseParen
+        | Kind::TripleTermClose
+        | Kind::ReifiedClose
+        | Kind::AnnotationClose => -1,
+        _ => 0,
     }
 }
 
