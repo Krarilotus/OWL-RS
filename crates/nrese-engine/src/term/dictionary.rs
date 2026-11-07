@@ -1008,6 +1008,16 @@ impl Dictionary {
     /// The string literals matching `query`, best first; the text index first takes in the
     /// terms interned since the last search.
     pub fn text_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
+        self.text_search_in(query, None)
+    }
+
+    /// [`Self::text_search`], ranked among `corpus`'s documents alone where one is given
+    /// (`SearchScope::Reader`), else among every indexed one.
+    pub(crate) fn text_search_in(
+        &self,
+        query: &super::TextQuery,
+        corpus: Option<&super::text::Corpus>,
+    ) -> Vec<super::TextMatch> {
         self.prepare_text(false, query.stem.as_deref());
         // The index's lock before `inner`'s (the lock order).
         let text = self.text.read();
@@ -1017,7 +1027,10 @@ impl Dictionary {
             _ => None,
         };
         // Matches are entry numbers: as ids, by the entry's kind.
-        let mut matches = text.search(query, &text_of);
+        let mut matches = match corpus {
+            None => text.search(query, &text_of),
+            Some(corpus) => text.search_over(query, &text_of, corpus),
+        };
         for found in &mut matches {
             let kind = match view_key(&inner.key(found.id)) {
                 TermView::LangString { .. } => TermKind::LangString,
@@ -1123,6 +1136,16 @@ impl Dictionary {
     /// The IRIs whose local name's words match `query`, best first; the index first takes
     /// in the IRIs interned since the last search.
     pub fn iri_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
+        self.iri_search_in(query, None)
+    }
+
+    /// [`Self::iri_search`], ranked among `corpus`'s documents alone where one is given
+    /// (`SearchScope::Reader`), else among every indexed one.
+    pub(crate) fn iri_search_in(
+        &self,
+        query: &super::TextQuery,
+        corpus: Option<&super::text::Corpus>,
+    ) -> Vec<super::TextMatch> {
         self.prepare_text(true, query.stem.as_deref());
         // The index's lock before `inner`'s (the lock order).
         let text = self.iri_text.read();
@@ -1131,7 +1154,10 @@ impl Dictionary {
             TermView::Iri(iri) => super::text::local_name_text(iri),
             _ => None,
         };
-        let mut matches = text.search(query, &text_of);
+        let mut matches = match corpus {
+            None => text.search(query, &text_of),
+            Some(corpus) => text.search_over(query, &text_of, corpus),
+        };
         for found in &mut matches {
             found.id = TermId::new(TermKind::Iri, found.id).raw();
         }

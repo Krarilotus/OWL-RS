@@ -193,26 +193,10 @@ pub fn exact_from(
     metric: Metric,
     accept: &(dyn Fn(u64) -> bool + Sync),
 ) -> Vec<Hit> {
-    if k == 0 || start >= vectors.len() || query.len() != vectors.dimension {
+    if k == 0 {
         return Vec::new();
     }
-    let query = Query::new(query);
-    let parts: Vec<Vec<Hit>> = (start / CHUNK..vectors.chunks.len())
-        .into_par_iter()
-        .map(|c| {
-            let mut best = TopK::new(k);
-            let first = (c * CHUNK).max(start);
-            for position in first..((c + 1) * CHUNK).min(vectors.len()) {
-                let position = position as u32;
-                let id = vectors.id(position);
-                if accept(id) {
-                    best.offer(id, vectors.distance(metric, &query, position));
-                }
-            }
-            best.into_sorted()
-        })
-        .collect();
-    merge(parts.into_iter().flatten(), k)
+    scan::<false>(vectors, start, query, k, metric, |_| true, accept).0
 }
 
 /// The `k` vectors nearest to `query` among those `eligible` takes and then `accept`
@@ -227,20 +211,39 @@ pub fn exact_eligible(
     eligible: &(dyn Fn(u64) -> bool + Sync),
     accept: &(dyn Fn(u64) -> bool + Sync),
 ) -> (Vec<Hit>, usize) {
-    if vectors.is_empty() || query.len() != vectors.dimension {
+    scan::<true>(vectors, 0, query, k, metric, eligible, accept)
+}
+
+/// The one exact search: the `k` vectors from position `start` on nearest to `query`
+/// among those `eligible` takes and then `accept` takes, nearest first, and (with `COUNT`)
+/// how many `eligible` took. [`exact_from`] is this with every vector eligible and
+/// nothing counted, monomorphised: the global search does no work for the scope.
+fn scan<const COUNT: bool>(
+    vectors: &Vectors,
+    start: usize,
+    query: &[f32],
+    k: usize,
+    metric: Metric,
+    eligible: impl Fn(u64) -> bool + Sync,
+    accept: &(dyn Fn(u64) -> bool + Sync),
+) -> (Vec<Hit>, usize) {
+    if start >= vectors.len() || query.len() != vectors.dimension {
         return (Vec::new(), 0);
     }
     let query = Query::new(query);
-    let parts: Vec<(Vec<Hit>, usize)> = (0..vectors.chunks.len())
+    let parts: Vec<(Vec<Hit>, usize)> = (start / CHUNK..vectors.chunks.len())
         .into_par_iter()
         .map(|c| {
             let mut best = TopK::new(k);
             let mut taken = 0;
-            for position in c * CHUNK..((c + 1) * CHUNK).min(vectors.len()) {
+            let first = (c * CHUNK).max(start);
+            for position in first..((c + 1) * CHUNK).min(vectors.len()) {
                 let position = position as u32;
                 let id = vectors.id(position);
                 if eligible(id) {
-                    taken += 1;
+                    if COUNT {
+                        taken += 1;
+                    }
                     if accept(id) {
                         best.offer(id, vectors.distance(metric, &query, position));
                     }
