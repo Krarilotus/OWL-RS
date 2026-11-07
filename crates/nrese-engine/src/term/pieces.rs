@@ -1,6 +1,16 @@
-//! The dictionary's storage: the entries interned one by one ([`Heap`]), the segments
-//! between the mapped base and the heap ([`Segment`]), and the three together ([`Inner`]),
-//! which [`super::dictionary::Dictionary`] keeps behind its lock.
+//! The dictionary's storage, in pieces that never change once made: the mapped base, the
+//! segments between it and the heap ([`Segment`]), and the heap of entries interned one by one
+//! ([`Heap`]): sealed blocks of [`BLOCK`] keys and a tail of fewer, each key its own `Arc`.
+//! [`Inner`] holds them behind the dictionary's lock; a [`View`] holds the same `Arc`s with no
+//! lock, for work over the keys that runs in parallel (a scan, a text order, an index build).
+//!
+//! A view taken under a brief read guard clones the pieces' `Arc`s and the tail keys' (at most
+//! [`BLOCK`] of them): it copies no key bytes, however long the keys. Ids are append-only and a
+//! piece never changes, so a view answers for every id below its length the key the dictionary
+//! had when it was taken, for as long as it lives, across interns, adoptions and rebases. A piece
+//! is freed when its last `Arc` drops: a view pins exactly the pieces it holds.
+
+use std::sync::Arc;
 
 use hashbrown::HashTable;
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec};
@@ -9,19 +19,55 @@ use super::dictionary::Base;
 use super::order::Key;
 use super::pending::Adopted;
 
-/// Entries kept on the heap, one after another, from id `start` on.
+/// Keys in a heap's sealed block: every block holds exactly this many.
+pub(super) const BLOCK: usize = 1 << BLOCK_SHIFT;
+const BLOCK_SHIFT: u32 = 12;
+
+/// A heap's keys, sealed: never changed once made, shared by the heap and the views.
+pub(super) struct Block {
+    /// The keys, one after another.
+    pub(super) bytes: Box<[u8]>,
+    /// Their end offsets in `bytes`.
+    pub(super) ends: Box<[u64]>,
+}
+
+impl Block {
+    /// The keys `keys`, one after another.
+    pub(super) fn of<'k>(keys: impl Iterator<Item = &'k [u8]> + Clone) -> Self {
+        let mut bytes = Vec::with_capacity(keys.clone().map(<[u8]>::len).sum());
+        let mut ends = Vec::with_capacity(keys.size_hint().0);
+        for key in keys {
+            bytes.extend_from_slice(key);
+            ends.push(bytes.len() as u64);
+        }
+        Self {
+            bytes: bytes.into_boxed_slice(),
+            ends: ends.into_boxed_slice(),
+        }
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub(super) fn key(&self, local: usize) -> &[u8] {
+        heap_key(&self.bytes, &self.ends, local)
+    }
+}
+
+/// Entries kept on the heap, from id `start` on: sealed blocks of [`BLOCK`] keys, then the
+/// tail, fewer than [`BLOCK`], each key its own `Arc` (a view shares them).
 #[derive(Default)]
 pub(super) struct Heap {
     pub(super) start: u64,
-    /// The keys, one after another.
-    pub(super) bytes: Vec<u8>,
-    /// Their end offsets in `bytes`.
-    pub(super) ends: Vec<u64>,
-    /// Their [`key_hash`]es: the table grows by moving numbers, without reading and
-    /// hashing every key again under the write lock (a bulk load stalled on it).
-    pub(super) hashes: Vec<u64>,
-    /// Their ids, by [`key_hash`].
-    pub(super) table: HashTable<u64>,
+    pub(super) blocks: Vec<Arc<Block>>,
+    pub(super) tail: Vec<Arc<[u8]>>,
+    /// Their `key_hash`es: the table grows by moving numbers, without reading and
+    /// hashing every key again under the write lock (a bulk load stalled on it). Empty in a
+    /// view's heap, which never looks keys up.
+    hashes: Vec<u64>,
+    /// Their ids, by `key_hash`; empty in a view's heap.
+    table: HashTable<u64>,
 }
 
 impl Heap {
@@ -33,22 +79,27 @@ impl Heap {
     }
 
     pub(super) fn len(&self) -> u64 {
-        self.ends.len() as u64
+        (self.blocks.len() * BLOCK + self.tail.len()) as u64
     }
 
     pub(super) fn key(&self, id: u64) -> &[u8] {
-        heap_key(&self.bytes, &self.ends, (id - self.start) as usize)
+        let local = (id - self.start) as usize;
+        match self.blocks.get(local >> BLOCK_SHIFT) {
+            Some(block) => block.key(local & (BLOCK - 1)),
+            None => &self.tail[local - self.blocks.len() * BLOCK],
+        }
     }
 
     pub(super) fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
         self.table.find(hash, |&id| self.key(id) == key).copied()
     }
 
-    /// Appends `key` (not an entry yet), whose hash is `hash`, and returns its id.
+    /// Appends `key` (not an entry yet), whose hash is `hash`, and returns its id. The tail is
+    /// sealed into a block when it holds [`BLOCK`] keys: its keys are copied once, under the
+    /// write lock that appends.
     pub(super) fn push(&mut self, key: &[u8], hash: u64) -> u64 {
         let id = self.start + self.len();
-        self.bytes.extend_from_slice(key);
-        self.ends.push(self.bytes.len() as u64);
+        self.tail.push(Arc::from(key));
         self.hashes.push(hash);
         let Heap {
             table,
@@ -57,7 +108,62 @@ impl Heap {
             ..
         } = self;
         table.insert_unique(hash, id, |&i| hashes[(i - *start) as usize]);
+        if self.tail.len() == BLOCK {
+            let block = Block::of(self.tail.iter().map(|key| &**key));
+            self.blocks.push(Arc::new(block));
+            self.tail.clear();
+        }
         id
+    }
+
+    /// The heap of `keys` (none an entry yet, their hashes `hashes`), from id `start`; `None`
+    /// if two of them are equal (the duplicate's index). Full blocks are sealed at once.
+    pub(super) fn of_keys(start: u64, keys: &[&[u8]], hashes: Vec<u64>) -> Result<Self, u64> {
+        let full = keys.len() / BLOCK * BLOCK;
+        let mut heap = Heap::at(start);
+        heap.blocks = keys[..full]
+            .chunks(BLOCK)
+            .map(|chunk| Arc::new(Block::of(chunk.iter().copied())))
+            .collect();
+        heap.tail = keys[full..].iter().map(|&key| Arc::from(key)).collect();
+        let mut table = HashTable::with_capacity(keys.len());
+        for (index, &hash) in hashes.iter().enumerate() {
+            let id = start + index as u64;
+            if table
+                .find(hash, |&other| heap.key(other) == heap.key(id))
+                .is_some()
+            {
+                return Err(id);
+            }
+            table.insert_unique(hash, id, |&i| hashes[(i - start) as usize]);
+        }
+        heap.table = table;
+        heap.hashes = hashes;
+        Ok(heap)
+    }
+
+    /// Its keys as a view reads them: the blocks' and tail keys' `Arc`s, no table.
+    fn keys(&self) -> Self {
+        Self {
+            start: self.start,
+            blocks: self.blocks.clone(),
+            tail: self.tail.clone(),
+            hashes: Vec::new(),
+            table: HashTable::new(),
+        }
+    }
+
+    /// Bytes of keys, and of what finds them: end offsets, hashes, the table, the tail's
+    /// `Arc`s (header and pointer).
+    fn bytes(&self) -> (u64, u64) {
+        let keys = self.blocks.iter().map(|b| b.bytes.len()).sum::<usize>()
+            + self.tail.iter().map(|key| key.len()).sum::<usize>();
+        let index = self.blocks.len() * BLOCK * 8
+            + self.hashes.capacity() * 8
+            + self.table.capacity() * 9
+            + self.tail.capacity() * 16
+            + self.tail.len() * 16;
+        (keys as u64, index as u64)
     }
 }
 
@@ -95,19 +201,23 @@ impl Segment {
 #[derive(Default)]
 pub(super) struct Inner {
     /// Entries `0..base.len` from a mapped checkpoint.
-    pub(super) base: Option<Base>,
+    pub(super) base: Option<Arc<Base>>,
     /// Entries after the base, before the heap, by id.
-    pub(super) segments: Vec<Segment>,
+    pub(super) segments: Vec<Arc<Segment>>,
     /// The entries interned one by one since, at the end.
     pub(super) heap: Heap,
+    /// Advanced by every rebase (the one change of the base): a text order built for one
+    /// generation is never installed in another ([`super::order::TextOrder`]).
+    pub(super) generation: u64,
 }
 
 impl Inner {
-    pub(super) fn with_base(base: Base) -> Self {
+    pub(super) fn with_base(base: Base, generation: u64) -> Self {
         Self {
             heap: Heap::at(base.len),
-            base: Some(base),
+            base: Some(Arc::new(base)),
             segments: Vec::new(),
+            generation,
         }
     }
 
@@ -186,35 +296,64 @@ impl Inner {
     }
 
     /// Takes a bulk load's numbered terms, ids `adopted.start..` (the next ones): the heap
-    /// so far is frozen before them, a new one begins after.
-    pub(super) fn adopt(&mut self, adopted: Adopted) {
+    /// so far is frozen before them, a new one begins after. Returns their segment.
+    pub(super) fn adopt(&mut self, adopted: Adopted) -> Arc<Segment> {
         assert_eq!(adopted.start, self.len(), "adopted terms take the next ids");
         let after = adopted.start + adopted.len();
         let heap = std::mem::replace(&mut self.heap, Heap::at(after));
         if heap.len() > 0 {
-            self.segments.push(Segment::Heap(heap));
+            self.segments.push(Arc::new(Segment::Heap(heap)));
         }
-        self.segments.push(Segment::Adopted(adopted));
+        let segment = Arc::new(Segment::Adopted(adopted));
+        self.segments.push(Arc::clone(&segment));
+        segment
     }
 
     /// The heaps' and segments' key bytes and index bytes.
     pub(super) fn heap_bytes(&self) -> (u64, u64) {
-        let heap = |h: &Heap| {
-            (
-                h.bytes.len() as u64,
-                (h.ends.capacity() * 16 + h.table.capacity() * 9) as u64,
-            )
-        };
-        let mut total = heap(&self.heap);
+        let mut total = self.heap.bytes();
         for segment in &self.segments {
-            let (keys, index) = match segment {
-                Segment::Heap(h) => heap(h),
+            let (keys, index) = match &**segment {
+                Segment::Heap(h) => h.bytes(),
                 Segment::Adopted(a) => a.bytes(),
             };
             total.0 += keys;
             total.1 += index;
         }
         total
+    }
+
+    /// The bytes [`Self::view`] allocates: its lists of `Arc`s (cloned with their lengths as
+    /// capacities), no key bytes.
+    pub(super) fn view_bytes(&self) -> usize {
+        self.segments.len() * size_of::<Arc<Segment>>()
+            + self.heap.blocks.len() * size_of::<Arc<Block>>()
+            + self.heap.tail.len() * size_of::<Arc<[u8]>>()
+    }
+
+    /// The view of its keys now ([`View`]).
+    pub(super) fn view(&self) -> View {
+        View(Self {
+            base: self.base.clone(),
+            segments: self.segments.clone(),
+            heap: self.heap.keys(),
+            generation: self.generation,
+        })
+    }
+}
+
+/// The dictionary's keys `0..len` at one moment, held with no lock (the module docs). It reads
+/// keys; it finds none (its heap has no table).
+pub(super) struct View(Inner);
+
+impl View {
+    /// The pieces, for scans over them.
+    pub(super) fn pieces(&self) -> &Inner {
+        &self.0
+    }
+
+    pub(super) fn generation(&self) -> u64 {
+        self.0.generation
     }
 }
 
