@@ -498,6 +498,95 @@ fn the_store_clock_never_goes_back_over_an_unknown_history() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// A primary's log of one commit, `quad(1)`, its record's time replaced by `at`: what a
+/// replica is sent ([`Engine::apply_log`]).
+fn primary_log(at: u64) -> Vec<u8> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    commit(&engine, 1).unwrap();
+    let batch = engine.log_since(0, usize::MAX).unwrap();
+    let (mut frames, mut pos) = (Vec::new(), 0);
+    while let super::codec::Frame::Record(record, used) =
+        super::codec::decode_frame(&batch.frames[pos..])
+    {
+        pos += used;
+        let record = super::codec::CommitRecord {
+            committed_micros: Some(at),
+            ..record
+        };
+        super::codec::encode_record(&record, &mut frames).unwrap();
+    }
+    frames
+}
+
+/// A replicated commit's time moves the store's clock in memory as on disk (sol-loop, review
+/// fix S1): an in-memory replica applies a primary's commit made at 2000, then replaces its
+/// data under a clock reading 1000. The replacement is stamped no earlier than 2000, so an
+/// image of it is refused by a restore at 1500. Before the fix it was stamped 1000.
+#[test]
+fn a_replicated_time_moves_the_clock_in_memory_too() {
+    let replica = Engine::new(config()).unwrap();
+    replica.apply_log(&primary_log(2000)).unwrap();
+    fault::CLOCK.set(Some(1000));
+    let load = replica.bulk_load(BulkMode::Replace);
+    load.add(&[quad(9)]);
+    load.finish().unwrap();
+    fault::CLOCK.set(None);
+    let image = tempfile::tempdir().unwrap();
+    replica.write_image(image.path()).unwrap();
+    let held = restored(image.path(), 1500);
+    assert!(
+        held.is_none(),
+        "the replacement's image restored at 1500: {held:?}"
+    );
+}
+
+/// A commit time is below 2^63 (sol-loop, review fix S2): a checkpoint keeps it in 63 bits.
+/// A replicated record at 2^63 or `u64::MAX` is refused, nothing applied; one at 2^63 - 1 is
+/// applied, and its checkpoint keeps the time exactly (refused by a restore at 2^63 - 2,
+/// used at 2^63 - 1; a guard). Before the fix the top bit was dropped when checkpointed,
+/// making a commit look 2^63 earlier.
+#[test]
+fn commit_times_past_their_range_are_refused() {
+    let top = 1u64 << 63;
+    let mut failures = Vec::new();
+    for (row, at, applied) in [
+        ("u64::MAX", u64::MAX, false),
+        ("2^63", top, false),
+        ("2^63 - 1 (guard)", top - 1, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wrong = Vec::new();
+        {
+            let replica = Engine::open(dir.path(), config()).unwrap();
+            let result = replica.apply_log(&primary_log(at));
+            if result.is_ok() != applied {
+                wrong.push(format!("applied: {result:?}"));
+            }
+            if replica.stats().revision != u64::from(applied) {
+                wrong.push(format!("at revision {}", replica.stats().revision));
+            }
+            if applied {
+                replica.checkpoint().unwrap();
+            }
+        }
+        if applied {
+            if restored(copied(dir.path()).path(), top - 2).is_some() {
+                wrong.push("its checkpoint used at 2^63 - 2".into());
+            }
+            if restored(copied(dir.path()).path(), top - 1).is_none() {
+                wrong.push("its checkpoint refused at 2^63 - 1".into());
+            }
+        }
+        eprintln!(
+            "row {row}: {}",
+            if wrong.is_empty() { "ok" } else { "FAILED" }
+        );
+        failures.extend(wrong.into_iter().map(|w| format!("{row}: {w}")));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 /// The newest checkpoint in `dir`, rewritten as format 11 (no commit time), as an earlier
 /// binary would have written it: format 12 is format 11 with the time before the checksum.
 fn as_format_11(dir: &std::path::Path) {
