@@ -22,8 +22,12 @@ static ALLOCATOR: measure::Measured<std::alloc::System> = measure::Measured(std:
 /// Statements in the document: held as owned copies, about 150 MB.
 const STATEMENTS: usize = 50_000;
 /// What applying it may take at its peak: its dictionary entries, one statement, the
-/// transaction's few distinct quads, and the store's fixed working sets.
-const PEAK: usize = 32 << 20;
+/// transaction's few distinct quads, and the store's fixed working sets. Measured
+/// (upload-r1-probe-3a374ba1, three runs each, the same each time): 14,966 bytes for the
+/// Graph Store PUT, 14,926 into three contexts, 14,341 as request shapes, 3,590 as a
+/// restore; before UPLOAD 155 to 632 MiB. 1 MiB is 70 times the most measured and
+/// 155 times below the least of before.
+const PEAK: usize = 1 << 20;
 
 /// `STATEMENTS` times the same statement, its terms in a 1,000-character namespace.
 fn long_prefix_turtle() -> Vec<u8> {
@@ -57,6 +61,8 @@ fn apply(pipeline: &MutationPipeline, command: MutationCommand) -> usize {
 }
 
 fn below(what: &str, peak: usize) {
+    // The measurement, for the limit's calibration (run with --nocapture).
+    eprintln!("measured: {what}: peak {peak} bytes");
     assert!(
         peak < PEAK,
         "{what}: {} MiB at its peak, more than {} MiB",
