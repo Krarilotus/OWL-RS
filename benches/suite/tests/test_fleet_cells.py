@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import tomllib
@@ -113,6 +114,15 @@ class FleetCells(unittest.TestCase):
             code, text = self.run_plan("--budget-hours", "50", "--submit")
         self.assertEqual(code, 1, text)
         self.assertEqual([c.args[0] for c in call.call_args_list], ["check"])
+
+    def test_member_boundary_also_refuses_restricted_outputs(self):
+        # Spec point 7: direct fleet-step calls cannot create restricted export bundles.
+        with patch.dict(os.environ, {"SUITE_CELL": json.dumps({"group": {"systems": ["graphdb"], "references": []}})}):
+            output = io.StringIO()
+            with contextlib.redirect_stderr(output):
+                code = suite.main(["suite.py", "fleet", "--_member"])
+        self.assertEqual(code, 2, output.getvalue())
+        self.assertIn("restricted", output.getvalue())
 
 
 if __name__ == "__main__":
