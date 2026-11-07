@@ -1178,6 +1178,16 @@ fn a_commit_breaking_a_datatype_rule_is_rejected_with_the_rule_named() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("dt-not-type"), "{error}");
+    // An ill-typed value has no data value, so it is in no range (RDF 1.2 Concepts §3.4, OWL 2
+    // Profiles table 8): rejected under owl2-rl.
+    let error = pipeline
+        .apply(
+            insert(&format!("<{ex}b> <{ex}age> \"abc\"^^<{xsd}integer>")),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .expect_err("an ill-typed value under a range is an inconsistency");
+    assert!(error.to_string().contains("dt-not-type"), "{error}");
     pipeline
         .apply(
             insert(&format!("<{ex}b> <{ex}age> \"5\"^^<{xsd}integer>")),

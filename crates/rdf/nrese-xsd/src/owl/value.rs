@@ -286,7 +286,8 @@ mod tests {
 
     #[test]
     fn ill_typed_and_unsupported_literals() {
-        for (lexical, d) in [
+        // Every row is checked and the wrong ones reported together.
+        let ill_typed: Vec<String> = [
             ("128", Datatype::Byte),
             ("-1", Datatype::NonNegativeInteger),
             ("1.5", Datatype::Integer),
@@ -295,19 +296,28 @@ mod tests {
             (" a", Datatype::Token),
             ("1a", Datatype::Name),
             ("2000-01-01T00:00:00", Datatype::DateTimeStamp),
+            ("2000-13-01T00:00:00Z", Datatype::DateTime),
+            // A year past what is represented doesn't excuse the rest of the form (XML
+            // Schema 1.1 Part 2 §3.3.7.2, §3.4.28.1): every other part is still checked.
+            ("100000000001-13-01T00:00:00Z", Datatype::DateTime),
+            ("100000000001-01-01T00:00:00", Datatype::DateTimeStamp),
+            ("100000000000-12-31T24:00:00", Datatype::DateTimeStamp),
+            // Leap years by the year itself: 100000000001 and 100000000100 aren't.
+            ("100000000001-02-29T00:00:00Z", Datatype::DateTime),
+            ("100000000100-02-29T00:00:00Z", Datatype::DateTime),
             ("yes", Datatype::Boolean),
             ("F", Datatype::HexBinary),
             ("TQ=", Datatype::Base64Binary),
             ("TR==", Datatype::Base64Binary),
-        ] {
-            assert!(
-                matches!(
-                    Value::parse(lexical, d, None),
-                    Err(LiteralError::IllTyped(_))
-                ),
-                "{lexical} {d:?}"
-            );
-        }
+        ]
+        .into_iter()
+        .filter_map(|(lexical, d)| {
+            let got = Value::parse(lexical, d, None);
+            (!matches!(got, Err(LiteralError::IllTyped(_))))
+                .then(|| format!("{lexical} as {d:?}: {got:?}"))
+        })
+        .collect();
+        assert!(ill_typed.is_empty(), "{ill_typed:#?}");
         assert!(matches!(
             Value::parse("1".repeat(50).as_str(), Datatype::Integer, None),
             Err(LiteralError::Unsupported(_))
@@ -320,5 +330,26 @@ mod tests {
             ),
             Err(LiteralError::Unsupported(_))
         ));
+        // A year has no bound (XML Schema 1.1 Part 2 §3.3.7.2): one past what is represented
+        // is valid, so unsupported, never ill-typed. Every row is checked.
+        let wrong: Vec<String> = [
+            ("100000000001-01-01T00:00:00Z", Datatype::DateTime),
+            ("100000000001-01-01T00:00:00Z", Datatype::DateTimeStamp),
+            ("-100000000001-01-01T00:00:00", Datatype::DateTime),
+            ("99999999999999999999-01-01T00:00:00Z", Datatype::DateTime),
+            ("100000000000-12-31T24:00:00Z", Datatype::DateTime),
+            ("100000000000-12-31T24:00:00", Datatype::DateTime),
+            // 100000000400 is a leap year (divisible by 400), and so is its negation.
+            ("100000000400-02-29T00:00:00Z", Datatype::DateTime),
+            ("-100000000400-02-29T00:00:00Z", Datatype::DateTime),
+        ]
+        .into_iter()
+        .filter_map(|(lexical, d)| {
+            let got = Value::parse(lexical, d, None);
+            (!matches!(got, Err(LiteralError::Unsupported(_))))
+                .then(|| format!("{lexical} as {d:?}: {got:?}"))
+        })
+        .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
