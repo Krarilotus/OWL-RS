@@ -20,6 +20,18 @@
 //! new ones put in tables of their own ([`super::pending`]); at the end they are numbered
 //! in the order they first occur in the input and become a segment of entries whose text
 //! stays where it was interned ([`Dictionary::adopt_pending`]).
+//!
+//! Lock order: a thread takes the dictionary's locks only in this order, and never two of one
+//! level: one index's (`text`, `iri_text`, `vectors` or `vector_builder`), then `inner`, then
+//! `order`, then the derived files' bookkeeping. With the fair `RwLock`, a read behind a
+//! queued writer waits, so even two readers taking two locks in opposite orders close a
+//! cycle with an interner (B-103: `stats` took `inner`, then the indexes, while extensions
+//! take their index, then `inner`). The dictionary's locks come after every lock of the
+//! engine, and no dictionary lock is held while code the dictionary doesn't own runs, except
+//! [`Dictionary::with_views`]' and [`Dictionary::for_each_key`]'s callbacks, which take no
+//! lock but `inner`'s recursive read, and [`Dictionary::intern_all`]'s iterator, run under
+//! `inner`'s write lock, which must not use the dictionary at all. A vector search's `accept`
+//! runs with none ([`super::vectors::SearchInput`]).
 
 use hashbrown::HashTable;
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
@@ -765,11 +777,15 @@ impl Dictionary {
     }
 
     pub fn stats(&self) -> DictionaryStats {
+        // Each index's figures under its own lock, let go before `inner` (the lock order).
+        let vector_bytes = self.vectors.read().memory_bytes() as u64;
+        let text_covered = self.text.read().covered();
+        let iri_text_covered = self.iri_text.read().covered();
         let inner = self.inner.read();
         let base = inner.base.as_ref();
         DictionaryStats {
-            vector_bytes: self.vectors.read().memory_bytes() as u64,
-            text_covered: self.text.read().covered() + self.iri_text.read().covered(),
+            vector_bytes,
+            text_covered: text_covered + iri_text_covered,
             derived_loaded: self
                 .derived
                 .loads
@@ -849,7 +865,8 @@ impl Dictionary {
         self.intern_locked(&mut self.inner.write(), &mut Vec::with_capacity(64), term)
     }
 
-    /// Interns a batch of terms under one lock acquisition.
+    /// Interns a batch of terms under one lock acquisition. `terms` is consumed under the
+    /// write lock: it must not use the dictionary (a lookup there waits forever).
     pub fn intern_all<'a>(&self, terms: impl IntoIterator<Item = TermRef<'a>>) -> Vec<TermId> {
         let mut key = Vec::with_capacity(64);
         let mut inner = self.inner.write();
@@ -957,13 +974,15 @@ impl Dictionary {
                 self.text.write().prepare_stems(language);
             }
         }
+        // The index's lock before `inner`'s (the lock order).
+        let text = self.text.read();
         let inner = self.inner.read();
         let text_of = |index: u64| match view_key(&inner.key(index)) {
             TermView::String(value) | TermView::LangString { value, .. } => Some(value.to_owned()),
             _ => None,
         };
         // Matches are entry numbers: as ids, by the entry's kind.
-        let mut matches = self.text.read().search(query, &text_of);
+        let mut matches = text.search(query, &text_of);
         for found in &mut matches {
             let kind = match view_key(&inner.key(found.id)) {
                 TermView::LangString { .. } => TermKind::LangString,
@@ -1004,7 +1023,10 @@ impl Dictionary {
             let id = TermId::from_raw(raw);
             id.payload() < known && accept(id)
         };
-        self.vectors.read().search(query, &accept)
+        // What the search reads, taken under the lock; the search and `accept` run without
+        // it (`accept` may intern and search again; the scans are parallel).
+        let input = self.vectors.read().search_input(query);
+        super::vectors::search(input, query, &accept)
     }
 
     /// Builds the graph a search like `query` uses, covering every vector, before
@@ -1099,12 +1121,14 @@ impl Dictionary {
                 self.iri_text.write().prepare_stems(language);
             }
         }
+        // The index's lock before `inner`'s (the lock order).
+        let text = self.iri_text.read();
         let inner = self.inner.read();
         let text_of = |index: u64| match view_key(&inner.key(index)) {
             TermView::Iri(iri) => super::text::local_name_text(iri),
             _ => None,
         };
-        let mut matches = self.iri_text.read().search(query, &text_of);
+        let mut matches = text.search(query, &text_of);
         for found in &mut matches {
             found.id = TermId::new(TermKind::Iri, found.id).raw();
         }
@@ -1423,7 +1447,8 @@ impl Dictionary {
 
     /// Calls `f` with a lookup of entry views below `limit`, all under one read lock: for
     /// writing many terms (result serialisation) without a lock per term. `f` may decode
-    /// ([`Self::decode`] reads recursively) but not intern.
+    /// ([`Self::decode`] reads recursively) but not intern, search or take any other lock
+    /// (the lock order in the module docs).
     pub fn with_views<R>(
         &self,
         limit: u64,
@@ -2072,6 +2097,10 @@ fn validate_key(key: &[u8]) -> EngineResult<()> {
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "dictionary_lock_tests.rs"]
+mod lock_order_tests;
 
 #[cfg(test)]
 mod tests {
