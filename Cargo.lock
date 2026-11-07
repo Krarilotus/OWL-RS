@@ -1267,6 +1267,7 @@ dependencies = [
  "nrese-sparql",
  "nrese-sparql-results",
  "nrese-store",
+ "nrese-xsd",
  "parking_lot",
  "reqwest",
  "serde",

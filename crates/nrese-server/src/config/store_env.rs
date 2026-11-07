@@ -465,6 +465,65 @@ mod tests {
         assert!(parse_dl(&source).is_err());
     }
 
+    /// Only `0` and `unlimited` mean no budget: a positive budget below one millisecond or
+    /// one byte is refused, naming its setting, not read as none; so is one past the range.
+    /// Every row is checked; the failures are reported together.
+    #[test]
+    fn a_dl_budget_below_one_unit_or_past_the_range_is_refused() {
+        let mut wrong = Vec::new();
+        for (name, value) in [
+            (names::DL_TIMEOUT_MS, "0.1ms"),
+            (names::DL_TIMEOUT_MS, "0.4"),
+            (names::DL_LOWER_BOUND_TIMEOUT_MS, "0.1ms"),
+            (names::DL_MEMORY, "0.4"),
+            (names::DL_MEMORY, "0.4B"),
+            (names::DL_MEMORY, "17179869184GiB"),
+            (names::DL_TIMEOUT_MS, "5124095576030432h"),
+        ] {
+            let mut source = KeyValueSource::default();
+            source.insert(name, value);
+            match parse_dl(&source) {
+                Ok(dl) => wrong.push(format!(
+                    "{name}={value}: timeout {:?}, lower-bound timeout {:?}, memory {:?}",
+                    dl.timeout, dl.lower_bound_timeout, dl.memory_bytes
+                )),
+                Err(error) if !format!("{error:#}").contains(name) => {
+                    wrong.push(format!("{name}={value}: {error:#} doesn't name it"));
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Through the DL configuration: a positive budget too small for a float (`0.000…1`) is
+    /// refused naming its setting, never loaded as no budget (review p2-b7-a r1 R1). Every
+    /// row is checked.
+    #[test]
+    fn a_dl_budget_too_small_for_a_float_is_refused() {
+        let tiny = format!("0.{}1", "0".repeat(400));
+        let mut wrong = Vec::new();
+        for (name, value) in [
+            (names::DL_TIMEOUT_MS, format!("{tiny}ms")),
+            (names::DL_LOWER_BOUND_TIMEOUT_MS, format!("{tiny}ms")),
+            (names::DL_MEMORY, format!("{tiny}B")),
+        ] {
+            let mut source = KeyValueSource::default();
+            source.insert(name, &value);
+            match parse_dl(&source) {
+                Ok(dl) => wrong.push(format!(
+                    "{name}: loaded, timeout {:?}, lower-bound timeout {:?}, memory {:?}",
+                    dl.timeout, dl.lower_bound_timeout, dl.memory_bytes
+                )),
+                Err(error) if !format!("{error:#}").contains(name) => {
+                    wrong.push(format!("{name}: {error:#} doesn't name it"));
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[test]
     fn every_dl_budget_takes_a_value_zero_or_unlimited() {
         use std::time::Duration;
