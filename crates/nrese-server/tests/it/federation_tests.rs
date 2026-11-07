@@ -6,12 +6,13 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use nrese_reasoner::ReasonerConfig;
+use nrese_server::build_app;
 use nrese_server::federation::HttpServiceClient;
 use nrese_server::policy::PolicyConfig;
 use nrese_store::{FederationConfig, StoreConfig, StoreService};
 use tower::util::ServiceExt;
 
-use crate::support::{body_text, test_app_with_store};
+use crate::support::{body_text, test_app_with_store, test_state_with_store_config};
 
 const EX: &str = "http://example.com/";
 
@@ -229,5 +230,62 @@ async fn an_answer_beyond_the_query_budget_is_refused() -> Result<(), Box<dyn st
             );
         }
     }
+    Ok(())
+}
+
+/// A repository created at run time calls the endpoints the server's SERVICE client may
+/// call, as the default repository does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_created_repository_calls_the_servers_endpoints() -> Result<(), Box<dyn std::error::Error>>
+{
+    let json = r#"{"head":{"vars":["o"]},"results":{"bindings":[{"o":{"type":"literal","value":"there"}}]}}"#;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/sparql-results+json\r\ncontent-length: {}\r\n\r\n{json}",
+        json.len()
+    );
+    let endpoint = canned(response.into_bytes())?;
+    let dir = tempfile::tempdir()?;
+    let state = test_state_with_store_config(
+        StoreConfig::on_disk(dir.path()),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )?;
+    // The server installs its client on the default repository's store (main.rs).
+    state
+        .store()
+        .set_service_client(Arc::new(HttpServiceClient::new(
+            FederationConfig {
+                allow: vec![endpoint.clone()],
+                ..FederationConfig::default()
+            },
+            tokio::runtime::Handle::current(),
+        )?));
+    let app = build_app(state);
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::PUT)
+                .uri("/api/v1/repositories/other")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let text = format!("SELECT ?o WHERE {{ SERVICE <{endpoint}> {{ ?s ?p ?o }} }}");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/repositories/other/query")
+                .method(Method::POST)
+                .header("content-type", "application/sparql-query")
+                .header("accept", "text/tab-separated-values")
+                .body(Body::from(text))?,
+        )
+        .await?;
+    let status = response.status();
+    let body = body_text(response).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"there\""), "{body}");
     Ok(())
 }
