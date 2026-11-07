@@ -1156,6 +1156,11 @@ pub fn derivations<S: Source + ?Sized>(
     let Head::Facts(heads) = &rule.head else {
         return;
     };
+    // A poller shared by several searches (one per parallel task) that has stopped: this
+    // one opens no scan at all, not even the first (sol-loop r4, R4-1).
+    if poll.stopped() {
+        return;
+    }
     let mut bindings = vec![None; rule.variables()];
     for head in heads {
         let Some(newly) = bind(head, fact, &mut bindings) else {
