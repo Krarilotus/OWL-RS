@@ -130,6 +130,10 @@ impl Context<'_> {
             }
             NamedNodePattern::Variable(v) => v,
         };
+        // Joined to no solutions: none names an endpoint, and the join has none.
+        if bound.is_some_and(|b| b.table.is_empty()) {
+            return Ok((Solutions::unit(), None));
+        }
         // The endpoints are the values the joined solutions have for the variable.
         let unbound = || -> NativeResult<Solutions> {
             if silent {
