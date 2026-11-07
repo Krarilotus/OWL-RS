@@ -122,7 +122,9 @@ pub struct DurabilityConfig {
     pub recover_until: Option<u64>,
     /// Recover the commits made up to this time only (microseconds since 1970), cut as
     /// with `recover_until`; commits logged without a time (before WAL version 6) count as
-    /// earlier.
+    /// earlier. Opening fails if the checkpoint's last commit was made after it, or its
+    /// time isn't known (format 11 and older, or commits logged without a time before it):
+    /// restore from an older image, or by revision.
     pub recover_until_micros: Option<u64>,
     /// Damage in the newest WAL segment: refuse to open (the default), or keep the log up
     /// to it.
@@ -217,6 +219,7 @@ impl Durable {
                     asserted,
                     inferred,
                     revision: loaded.revision,
+                    committed_micros: loaded.committed_micros,
                     dictionary_len: 0,
                     equality: Default::default(),
                     canonical: Default::default(),
@@ -240,6 +243,32 @@ impl Durable {
                 "the checkpoint is at revision {}, after the requested revision {until}",
                 version.revision
             )));
+        }
+        // A time restore starts from the checkpoint only if every commit in it was made by
+        // then: its last commit's time (commit times never go back, `commit_time`) is known
+        // and not later (EEV-06).
+        if let Some(until) = config.recover_until_micros
+            && version.revision > 0
+        {
+            match version.committed_micros {
+                None => {
+                    return Err(EngineError::Configuration(format!(
+                        "the checkpoint at revision {} has no commit time (format 11 or older, or \
+                         commits logged without one): restore by revision, or from an image \
+                         this version wrote",
+                        version.revision
+                    )));
+                }
+                Some(committed) if committed > until => {
+                    return Err(EngineError::Configuration(format!(
+                        "the checkpoint at revision {} was committed at {committed}, after the \
+                         requested time {until} (microseconds since 1970): restore from an \
+                         image taken before it",
+                        version.revision
+                    )));
+                }
+                Some(_) => {}
+            }
         }
         // Set once the log has been cut at `recover_until`: later segments go.
         let mut cut = false;
@@ -404,7 +433,29 @@ fn replay(
         *version.stack_mut(stack) = index;
     }
     version.revision = record.revision;
+    // A record logged without a time (a version 4 or 5 segment): the version's is unknown.
+    version.committed_micros = record.committed_micros;
     Ok(())
+}
+
+/// The commit time of a revision after one committed at `previous`: the wall clock, in
+/// microseconds since 1970, but never before `previous` and never 0 (a checkpoint's
+/// "unknown"). So a store's commit times never go back, whatever its clock does, and a
+/// version's time is that of its latest commit: one made by a time has every commit before
+/// it made by then too (a time restore's cut, EEV-06).
+pub(crate) fn commit_time(previous: Option<u64>) -> u64 {
+    now_micros().max(previous.unwrap_or(0)).max(1)
+}
+
+/// The wall clock, microseconds since 1970 (0 before it).
+fn now_micros() -> u64 {
+    #[cfg(test)]
+    if let Some(at) = fault::CLOCK.get() {
+        return at;
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_micros() as u64)
 }
 
 /// Makes a rename or file creation in `dir` durable. Directories can't be opened as files on

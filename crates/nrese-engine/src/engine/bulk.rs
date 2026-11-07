@@ -31,7 +31,7 @@ use rayon::prelude::*;
 
 use super::spill::{Spill, Spiller};
 use super::{CommitSummary, Inner, ReadModel, Snapshot, Stack, Version};
-use crate::durability::{Durable, checkpoint};
+use crate::durability::{Durable, checkpoint, commit_time};
 use crate::error::{EngineError, EngineResult};
 use crate::index::keys::PackedKeys;
 use crate::index::run::{PermutationBuilder, Run};
@@ -276,6 +276,7 @@ impl<'e> BulkLoad<'e> {
                     layout,
                     builder: PermutationBuilder::planned(quads, layout.permutations()),
                     revision: summary.revision,
+                    committed_micros: commit_time(current.committed_micros),
                     dictionary_len: shared.dictionary.len(),
                 };
                 (next, summary)
@@ -293,6 +294,7 @@ impl<'e> BulkLoad<'e> {
                     asserted: IndexVersion::from_quads(Layout::holding(&quads), quads),
                     inferred: IndexVersion::empty(Layout::DefaultGraph),
                     revision: summary.revision,
+                    committed_micros: Some(commit_time(current.committed_micros)),
                     dictionary_len: shared.dictionary.len(),
                     equality: Default::default(),
                     canonical: Default::default(),
@@ -342,6 +344,7 @@ impl<'e> BulkLoad<'e> {
                     asserted: asserted.with_run(run),
                     inferred: current.inferred.with_delta(&[], &explicit),
                     revision: summary.revision,
+                    committed_micros: Some(commit_time(current.committed_micros)),
                     dictionary_len: shared.dictionary.len(),
                     equality: Default::default(),
                     canonical: Default::default(),
@@ -400,6 +403,7 @@ fn publish_spilled(
         Source::Spilled(spill),
         layout,
         revision,
+        commit_time(current.committed_micros),
         dictionary_len,
     )?;
     drop(compaction);
@@ -449,6 +453,8 @@ enum Next {
         layout: Layout,
         builder: PermutationBuilder,
         revision: u64,
+        /// When it is committed ([`commit_time`]).
+        committed_micros: u64,
         dictionary_len: u64,
     },
 }
@@ -465,10 +471,19 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
             layout,
             builder,
             revision,
+            committed_micros,
             dictionary_len,
         } => {
             let source = Source::Memory(builder);
-            return publish_streamed(engine, source, layout, revision, dictionary_len).map(|_| ());
+            return publish_streamed(
+                engine,
+                source,
+                layout,
+                revision,
+                committed_micros,
+                dictionary_len,
+            )
+            .map(|_| ());
         }
     };
     let next = Arc::new(next);
@@ -505,6 +520,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                         inferred,
                         equality: Arc::clone(&next.equality),
                         revision,
+                        committed_micros: next.committed_micros,
                         dictionary_len: next.dictionary_len,
                         canonical: Default::default(),
                     })
@@ -540,6 +556,7 @@ fn publish_streamed(
     mut source: Source,
     layout: Layout,
     revision: u64,
+    committed_micros: u64,
     dictionary_len: u64,
 ) -> EngineResult<u64> {
     let shared = &engine.shared;
@@ -556,6 +573,7 @@ fn publish_streamed(
             asserted,
             inferred: IndexVersion::empty(Layout::DefaultGraph),
             revision,
+            committed_micros: Some(committed_micros),
             dictionary_len,
             equality: Default::default(),
             canonical: Default::default(),
@@ -573,6 +591,7 @@ fn publish_streamed(
             durable.root(),
             shared.admission.as_ref(),
             revision,
+            Some(committed_micros),
             &shared.dictionary,
             dictionary_len,
             [layout, Layout::DefaultGraph],
@@ -610,6 +629,7 @@ fn publish_streamed(
         asserted,
         inferred,
         revision,
+        committed_micros: Some(committed_micros),
         dictionary_len,
         equality: Default::default(),
         canonical: Default::default(),
@@ -754,6 +774,7 @@ impl<'e> Rematerialisation<'e> {
             asserted: current.asserted.clone(),
             inferred: IndexVersion::from_quads(Layout::DefaultGraph, quads),
             revision: summary.revision,
+            committed_micros: Some(commit_time(current.committed_micros)),
             dictionary_len: shared.dictionary.len(),
             equality: Default::default(),
             canonical: Default::default(),

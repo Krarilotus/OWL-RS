@@ -185,6 +185,11 @@ pub(crate) struct Version {
     pub(crate) asserted: IndexVersion,
     pub(crate) inferred: IndexVersion,
     pub(crate) revision: u64,
+    /// When its latest commit was made, microseconds since 1970
+    /// ([`commit_time`](crate::durability::commit_time): never before an earlier commit's);
+    /// `None` where that isn't known (recovered from a format 11 checkpoint or an untimed
+    /// log record, and not committed to since). Checkpoints keep it (format 12).
+    pub(crate) committed_micros: Option<u64>,
     /// Dictionary entries visible to this version; newer terms are hidden from lookups.
     pub(crate) dictionary_len: u64,
     /// Its `owl:sameAs` classes, once a read needs them ([`equality`]).
@@ -223,6 +228,7 @@ impl Version {
             asserted: IndexVersion::empty(Layout::DefaultGraph),
             inferred: IndexVersion::empty(Layout::DefaultGraph),
             revision: 0,
+            committed_micros: None,
             dictionary_len: 0,
             equality: Default::default(),
             content: Content::fresh(),
@@ -249,6 +255,7 @@ impl Version {
             asserted: self.asserted.clone(),
             inferred: self.inferred.clone(),
             revision: self.revision,
+            committed_micros: self.committed_micros,
             dictionary_len: self.dictionary_len,
             equality: Arc::clone(&self.equality),
             // Only compaction replaces a stack this way: the same statements.
@@ -456,6 +463,7 @@ impl Shared {
                     asserted: index(Stack::Asserted, &asserted),
                     inferred: index(Stack::Inferred, &inferred),
                     revision: current.revision,
+                    committed_micros: current.committed_micros,
                     dictionary_len: current.dictionary_len,
                     equality: Arc::clone(&current.equality),
                     content: current.content,

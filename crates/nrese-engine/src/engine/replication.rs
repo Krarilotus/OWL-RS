@@ -228,6 +228,8 @@ impl Engine {
                 asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,
+                // The primary's time, as its log (and this one's) has it.
+                committed_micros: record.committed_micros,
                 dictionary_len,
                 equality: match changes_equality {
                     true => Default::default(),

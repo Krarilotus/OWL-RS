@@ -190,12 +190,14 @@ fn time_restore(times: &[u64], checkpointed: usize, until: u64) -> Option<HashSe
 ///   500; commit times never going back makes it refuse;
 /// - guards (right on the base too): an image before the time with the log across it, and
 ///   an image whose last commit is at the time exactly, both restore what was made by then.
+///
 /// Each row is judged on its own.
 #[test]
 fn a_time_restore_never_serves_commits_made_after_its_time() {
     let held = |n: u64| (0..n).map(quad).collect::<HashSet<_>>();
     // (row, times, checkpointed after, until, what it may hold: None = refuse only)
-    let rows: [(&str, &[u64], usize, u64, Option<HashSet<Quad>>); 4] = [
+    type Row<'a> = (&'a str, &'a [u64], usize, u64, Option<HashSet<Quad>>);
+    let rows: [Row; 4] = [
         ("an image after the time", &[1000, 2000], 2, 1500, None),
         (
             "a clock stepped back before the image",
