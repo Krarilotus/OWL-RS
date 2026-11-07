@@ -294,8 +294,10 @@ fn decoded_slice(
 /// A slice of the dictionary for a string scan: entries `.1` of one arena.
 enum Part<'i> {
     Base(&'i Base, (usize, usize)),
-    /// A heap's block (its tail copied into one), its first id `.1`.
+    /// A heap's sealed block, its first id `.1`.
     Keys(&'i Block, u64, (usize, usize)),
+    /// A heap's tail keys `.2`, each its own `Arc`, the first's id `.1`: searched in place.
+    Tail(&'i [std::sync::Arc<[u8]>], u64, (usize, usize)),
     /// Shard `.1` of a bulk load's terms.
     Shard(&'i Adopted, usize, (usize, usize)),
 }
@@ -1013,11 +1015,6 @@ impl Dictionary {
             })
             .chain([&inner.heap])
             .collect();
-        // Each heap's tail (fewer than BLOCK keys, each its own `Arc`) copied into one block.
-        let tails: Vec<Block> = heaps
-            .iter()
-            .map(|heap| Block::of(heap.tail.iter().map(|key| &**key)))
-            .collect();
         let mut arenas = 0;
         let mut parts: Vec<Part<'_>> = Vec::new();
         if let Some(base) = &inner.base {
@@ -1025,14 +1022,17 @@ impl Dictionary {
             let entries = below(0, base.len as usize);
             parts.extend(super::strings::slices(entries).map(|s| Part::Base(base, s)));
         }
-        for (heap, tail) in heaps.iter().zip(&tails) {
+        for heap in &heaps {
             arenas += 1;
-            let blocks = heap.blocks.iter().map(|block| &**block).chain([tail]);
-            for (b, block) in blocks.enumerate() {
+            for (b, block) in heap.blocks.iter().enumerate() {
                 let start = heap.start + (b * BLOCK) as u64;
                 let entries = below(start, block.len());
                 parts.extend(super::strings::slices(entries).map(|s| Part::Keys(block, start, s)));
             }
+            // The tail's keys where they are: nothing copied, none at or past the limit.
+            let start = heap.start + (heap.blocks.len() * BLOCK) as u64;
+            let entries = below(start, heap.tail.len());
+            parts.extend(super::strings::slices(entries).map(|s| Part::Tail(&heap.tail, start, s)));
         }
         // A bulk load's terms: each shard's arena, its entries numbered to their ids
         // (an entry that existed already shows under its own id too: deduplicated).
@@ -1059,6 +1059,14 @@ impl Dictionary {
             Part::Keys(block, start, slice) => {
                 matcher.slice(&block.bytes, &block.ends[..], slice, start, out)
             }
+            // Each key an arena of one entry: the search never runs into the next key.
+            Part::Tail(keys, start, (first, last)) => (first..last)
+                .map(|i| {
+                    let key = &keys[i];
+                    let ends = [key.len() as u64];
+                    matcher.slice(key, &ends[..], (0, 1), start + i as u64, out)
+                })
+                .sum(),
             Part::Shard(adopted, s, slice) => {
                 let shard = &adopted.shards[s];
                 let from = out.len();
