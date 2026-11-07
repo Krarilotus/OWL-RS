@@ -12,7 +12,7 @@ use nrese_rdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
 use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 
 use crate::model::{Component, Path, SH, Severity, Shapes};
-use crate::validate::{Failures, RawResult};
+use crate::validate::{Failures, RawResult, ResultPath, ResultTerm};
 
 /// What validating a data graph against a shapes graph found.
 #[derive(Debug, Clone, Default)]
@@ -123,7 +123,7 @@ fn decode_path<V: ReadView>(view: &V, path: &Path) -> Option<PropertyPath> {
 }
 
 /// The bytes a decoded term holds besides its own slot: its text.
-fn term_bytes(term: &Term) -> usize {
+pub(crate) fn term_bytes(term: &Term) -> usize {
     match term {
         Term::NamedNode(node) => node.as_str().len(),
         Term::BlankNode(node) => node.as_str().len(),
@@ -221,9 +221,13 @@ pub(crate) fn decode<V: ReadView>(
             _ => None,
         };
         let messages = result.messages.as_deref().unwrap_or(&shape.messages);
+        let stored_value = match &result.value {
+            Some(ResultTerm::Stored(id)) => Some(*id),
+            _ => None,
+        };
         for id in [
             Some(result.focus),
-            result.value,
+            stored_value,
             Some(shape.node),
             result.source,
             custom,
@@ -235,14 +239,30 @@ pub(crate) fn decode<V: ReadView>(
         {
             terms.load(id)?;
         }
-        let path = result
-            .path
-            .as_ref()
-            .and_then(|path| decode_path(view, path));
+        let path = match &result.path {
+            None => None,
+            Some(ResultPath::Path(path)) => decode_path(view, path),
+            Some(ResultPath::Computed(predicate)) => {
+                Some(PropertyPath::Predicate((**predicate).clone()))
+            }
+        };
+        // A computed value is the query's term as it made it ([`ResultTerm`]).
+        let value = |terms: &Terms<'_, V>| -> Option<Term> {
+            match &result.value {
+                None => None,
+                Some(ResultTerm::Stored(id)) => Some(terms.get(*id).clone()),
+                Some(ResultTerm::Computed(computed)) => Some(computed.term.clone()),
+            }
+        };
+        let value_bytes = match &result.value {
+            None => 0,
+            Some(ResultTerm::Stored(id)) => term_bytes(terms.get(*id)),
+            Some(ResultTerm::Computed(computed)) => term_bytes(&computed.term),
+        };
         // What this result holds once built, charged before any of it is copied.
         let mut bytes = 2 * std::mem::size_of::<ValidationResult>()
             + term_bytes(terms.get(result.focus))
-            + result.value.map_or(0, |id| term_bytes(terms.get(id)))
+            + value_bytes
             + term_bytes(terms.get(shape.node))
             + result.source.map_or(0, |id| term_bytes(terms.get(id)))
             + 2 * sh_bytes
@@ -267,7 +287,7 @@ pub(crate) fn decode<V: ReadView>(
         results.push(ValidationResult {
             focus_node: terms.get(result.focus).clone(),
             path,
-            value: result.value.map(|id| terms.get(id).clone()),
+            value: value(&terms),
             source_shape: terms.get(shape.node).clone(),
             component: match custom.map(|id| terms.get(id)) {
                 None => NamedNode::new_unchecked(result.component.iri()),

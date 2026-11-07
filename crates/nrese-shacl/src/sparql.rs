@@ -167,11 +167,11 @@ pub(crate) fn path_expression(
     })
 }
 
-/// A solution of a SELECT check, as a result: the value and path it names, if any, and
-/// whether it reports a failure.
-pub(crate) struct Found {
-    pub(crate) value: Option<Term>,
-    pub(crate) path: Option<NamedNode>,
+/// A solution of a SELECT check, as a result: the value and path it names, if any (borrowed
+/// from the solution), and whether it reports a failure.
+pub(crate) struct Found<'s> {
+    pub(crate) value: Option<&'s Term>,
+    pub(crate) path: Option<&'s NamedNode>,
     pub(crate) failure: bool,
 }
 
@@ -281,18 +281,19 @@ pub(crate) fn run<'a, V: ReadView>(
 }
 
 /// A SELECT check's solution, as a result ([`Outcome::Solutions`] yields them as they are
-/// read: each is decoded, used and dropped before the next).
-pub(crate) fn found(solution: &QuerySolution) -> Found {
+/// read: each is decoded, used and dropped before the next). Nothing is copied: a row that
+/// reports `?failure` costs no copy of its terms.
+pub(crate) fn found(solution: &QuerySolution) -> Found<'_> {
     let failure = matches!(
         solution.get("failure"),
         Some(Term::Literal(l)) if l.value() == "true"
     );
     let path = match solution.get("path") {
-        Some(Term::NamedNode(path)) => Some(path.clone()),
+        Some(Term::NamedNode(path)) => Some(path),
         _ => None,
     };
     Found {
-        value: solution.get(VALUE).cloned(),
+        value: solution.get(VALUE),
         path,
         failure,
     }
