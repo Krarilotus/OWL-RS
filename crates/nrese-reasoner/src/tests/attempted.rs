@@ -258,6 +258,73 @@ fn filtered_driver_positions_count_towards_the_stop() {
     );
 }
 
+/// F1 (sol-loop r7, R7-1): one changed bodiless fact with more than `POLL_UNITS` premise
+/// alternatives (one per schema fact that grounds it). Each alternative is attempted work:
+/// cancelled at the first read of its earlier sets, the update reads at most `POLL_UNITS`
+/// more and ends `Cancelled`.
+#[test]
+fn each_premise_alternative_counts_towards_the_stop() {
+    use crate::eval::Grounding;
+    use crate::graph_sets::{Annotation, Change, Limits, Stopped, UNWATCHED, update_support_sets};
+    let n = 3 * POLL_UNITS;
+    let mut vocabulary = LocalVocabulary::default();
+    let rules = parse_rules(
+        "sco: (?c rdfs:subClassOf ?d) -> (?c rdfs:comment ?c)",
+        &mut vocabulary,
+    )
+    .unwrap();
+    let schema = Schema::owl(&mut vocabulary);
+    let text: Vec<String> = (0..n)
+        .map(|i| format!("ex:C rdfs:subClassOf ex:D{i}"))
+        .collect();
+    let mut facts = load(&mut vocabulary, &text.join("\n"));
+    facts.sort_unstable();
+    let compiled = Rules {
+        rules: &rules,
+        lists: None,
+        schema: &schema,
+    };
+    let inferred = batch::materialise(&facts, &rules, None, &schema).derived;
+    let ground = crate::delta::program(&MemoryBase::new(&facts, &inferred), compiled);
+    let fact = load(&mut vocabulary, "ex:C rdfs:comment ex:C")[0];
+    assert_eq!(
+        ground.premise_alternatives(Grounding::Bodiless(fact)).len(),
+        n,
+        "an alternative per subclass axiom"
+    );
+    let mut closure = facts;
+    closure.extend(&inferred);
+    closure.sort_unstable();
+    let source = batch::Store::new(closure.clone());
+    let asked = AtomicUsize::new(0);
+    let previous = |_: Triple| {
+        asked.fetch_add(1, Ordering::Relaxed);
+        Annotation::default()
+    };
+    let touched = [fact];
+    let change = Change {
+        source: &source,
+        in_closure: &|f| closure.binary_search(&f).is_ok(),
+        touched: &touched,
+        previous: &previous,
+        limit: usize::MAX,
+    };
+    let stop = || asked.load(Ordering::Relaxed) >= 1;
+    let limits = Limits {
+        watch: UNWATCHED,
+        stop: &stop,
+    };
+    let result = update_support_sets(&change, &ground, &[], &|_| vec![0], 1, limits);
+    assert_eq!(result.err(), Some(Stopped::Cancelled));
+    let read = asked.load(Ordering::Relaxed);
+    let bound = 1 + POLL_UNITS;
+    assert!(bound < n, "the bound proves nothing");
+    assert!(
+        read <= bound,
+        "{read} premise sets read, the first of them cancelling (bound {bound}; {n} alternatives)"
+    );
+}
+
 /// F1 (sol-loop r6, R6-1): a support-set update's first pass over more than `POLL_UNITS`
 /// changed facts. Each fact's prelude (its bodiless sets, which read the sets the facts
 /// had before, and its producers) is attempted work: cancelled during the first fact's,
