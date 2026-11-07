@@ -27,18 +27,20 @@ fn split(text: &str) -> Result<(String, String)> {
 
 /// `number` (of `text`) times `factor`, exact for a whole number. An error past u64, and
 /// for a positive value below one (`smallest`): it would read as 0, which a budget takes
-/// as none.
+/// as none. Whether the value is positive is read from its digits, not from the float: a
+/// decimal too small for f64 parses as 0.0.
 fn scale(text: &str, number: &str, factor: u64, smallest: &str) -> Result<u64> {
     let too_large = || anyhow!("'{text}' is too large");
     if !number.contains('.') {
         let whole: u64 = number.parse().map_err(|_| too_large())?;
         return whole.checked_mul(factor).ok_or_else(too_large);
     }
+    let positive = number.bytes().any(|b| matches!(b, b'1'..=b'9'));
     let value = number.parse::<f64>()? * factor as f64;
     if value >= u64::MAX as f64 {
         return Err(too_large());
     }
-    if value > 0.0 && value < 1.0 {
+    if positive && value < 1.0 {
         bail!("'{text}' is more than 0 but less than {smallest}");
     }
     Ok(value.round() as u64)
