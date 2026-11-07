@@ -76,6 +76,24 @@ def load(directory: Path = CASES, family: str | Path | None = None) -> list[dict
     return out
 
 
+def load_at(repo: str | Path, rev: str) -> list[dict]:
+    """Every case as the commit `rev` of the checkout `repo` holds them (benches/cases/*.toml there,
+    read by git): the registry a job at that revision runs, whatever this tree holds."""
+    import subprocess
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True,  # noqa: E731
+                                    encoding="utf-8", check=True).stdout
+    out = []
+    for name in sorted(git("ls-tree", "--name-only", rev, "benches/cases/").split()):
+        if name.endswith(".toml"):
+            for case in tomllib.loads(git("show", f"{rev}:{name}")).get("case", []):
+                out.append({**case, "group": Path(name).stem})
+    names = [c["name"] for c in out]
+    duplicate = sorted({n for n in names if names.count(n) > 1})
+    if duplicate:
+        raise ValueError(f"case names must be unique across benches/cases/ at {rev}: {', '.join(duplicate)}")
+    return out
+
+
 def problems(cases: list[dict], systems: dict, workloads: dict | None = None,
              datasets: set[str] | None = None) -> list[str]:
     """One line per problem: unknown keys or values, a comparator that isn't a system, a

@@ -21,6 +21,7 @@
 //! so nothing is ever visible that a crash could lose. Its cost is O(dataset), which is why
 //! small changes should use transactions.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -30,7 +31,7 @@ use rayon::prelude::*;
 
 use super::spill::{Spill, Spiller};
 use super::{CommitSummary, Inner, ReadModel, Snapshot, Stack, Version};
-use crate::durability::checkpoint;
+use crate::durability::{Durable, checkpoint};
 use crate::error::{EngineError, EngineResult};
 use crate::index::keys::PackedKeys;
 use crate::index::run::{PermutationBuilder, Run};
@@ -58,7 +59,6 @@ pub enum BulkMode {
 /// it interned stay unreferenced in the dictionary, as with an aborted transaction.
 pub struct BulkLoad<'e> {
     engine: &'e Inner,
-    _slot: MutexGuard<'e, ()>,
     mode: BulkMode,
     batches: Mutex<Batches>,
     /// Quads per spilled chunk, if the load spills past its memory budget.
@@ -73,6 +73,10 @@ pub struct BulkLoad<'e> {
     added: std::sync::atomic::AtomicU32,
     /// What interning a batch works in, kept for the next ones: one per thread adding.
     scratch: Mutex<Vec<BatchScratch>>,
+    /// The writer slot. Last, because fields drop in order: a load dropped unfinished joins
+    /// its spilling thread and removes the spill directory (`spiller`) before the next load
+    /// can start and create its own there (B-303).
+    _slot: MutexGuard<'e, ()>,
 }
 
 /// Interned quads not yet spilled.
@@ -96,7 +100,6 @@ impl<'e> BulkLoad<'e> {
             .map(|budget| (budget as usize / 3 / size_of::<EncodedQuad>()).max(1));
         Self {
             engine,
-            _slot: slot,
             mode,
             batches: Mutex::default(),
             chunk,
@@ -105,6 +108,7 @@ impl<'e> BulkLoad<'e> {
             pending: Pending::default(),
             added: std::sync::atomic::AtomicU32::new(0),
             scratch: Mutex::default(),
+            _slot: slot,
         }
     }
 
@@ -204,13 +208,18 @@ impl<'e> BulkLoad<'e> {
         } = self;
         drop(scratch);
         let shared = &engine.shared;
-        // No commit can run (writer slot) and no compaction can replace runs while the new
-        // version is built from the current one and installed.
-        let _compaction = shared.versions.compaction_slot.lock();
+        // No commit can run (writer slot): `base` stays the latest content, though a merge or
+        // a mapped checkpoint may replace its runs with the same statements. The new version
+        // is built from it without the compaction slot, which `publish` takes to install it:
+        // nothing that waits for that slot waits for the load's parallel work.
         let base = shared.snapshot();
         let started = Instant::now();
         let spilled = match (spill_failed.into_inner(), spiller.into_inner()) {
-            (Some(error), _) => return Err(EngineError::Io(error)),
+            (Some(error), spiller) => {
+                // Joined, its directory gone, while the writer slot is held.
+                drop(spiller);
+                return Err(EngineError::Io(error));
+            }
             (None, Some(spiller)) => Some(spiller.finish()?),
             (None, None) => None,
         };
@@ -244,7 +253,7 @@ impl<'e> BulkLoad<'e> {
         });
         renumbered?;
         if let Some(spill) = spilled {
-            return publish_spilled(engine, spill, current, started, _compaction);
+            return publish_spilled(engine, spill, current, started);
         }
         // By radix over the bits the ids use ([`nrese_exec::sort`]).
         nrese_exec::heap::phase("load: sorting");
@@ -350,7 +359,6 @@ impl<'e> BulkLoad<'e> {
 
         let built = started.elapsed();
         publish(engine, next)?;
-        drop(_compaction);
         tracing::info!(
             revision = summary.revision,
             inserted = summary.inserted,
@@ -382,7 +390,6 @@ fn publish_spilled(
     spill: Spill,
     current: &Version,
     started: Instant,
-    compaction: MutexGuard<'_, ()>,
 ) -> EngineResult<CommitSummary> {
     let revision = current.revision + 1;
     let dictionary_len = engine.shared.dictionary.len();
@@ -394,7 +401,6 @@ fn publish_spilled(
         revision,
         dictionary_len,
     )?;
-    drop(compaction);
     let summary = CommitSummary {
         revision,
         inserted,
@@ -448,7 +454,10 @@ enum Next {
 /// Installs `next` as the latest version, the bulk way: in durable mode a checkpoint of it
 /// is written first, so no WAL record is needed, and with `map_checkpoints` the version
 /// installed is the checkpoint's, mapped (same content: memory then holds what queries
-/// touch, as after a restart). The caller holds the writer and compaction slots.
+/// touch, as after a restart). The caller holds the writer slot. The checkpoint is written
+/// under the checkpoint slot, on the caller's pool, and the version installed under the
+/// compaction slot, held for nothing else: a merge or mapped checkpoint published since
+/// `next` was built is replaced (the same statements: the writer slot kept them).
 fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     let shared = &engine.shared;
     let next = match next {
@@ -467,7 +476,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     match &shared.durable {
         Some(durable) => {
             let revision = next.revision;
-            let _checkpoint = durable.checkpoint_slot.lock();
+            let _checkpoint = super::admit(&durable.checkpoint_slot, "checkpoint")?;
             let image = Snapshot::new(
                 Arc::clone(&next),
                 Arc::clone(&shared.dictionary),
@@ -475,7 +484,9 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                 None,
                 Arc::clone(&shared.views.read()),
             );
-            let path = checkpoint::write(durable.root(), &image, shared.admission.as_ref())?;
+            let path = commit_image(durable, revision, || {
+                checkpoint::write(durable.root(), &image, shared.admission.as_ref())
+            })?;
             shared
                 .checkpoints
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -505,20 +516,24 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                 }
                 None => next,
             };
-            // The checkpoint covers every logged revision: later commits start a new
-            // segment, and all older segments can go.
+            // The checkpoint covers every logged revision: later commits go to the segment
+            // `commit_image` started, and all older segments can go.
+            let compaction = shared.versions.compaction_slot.lock();
             let mut wal = durable.wal.lock();
-            wal.rotate(revision + 1)?;
             shared.versions.install(next);
             release_covered(&mut wal, durable.root(), revision);
             drop(wal);
+            drop(compaction);
             if let Some(base) = base
                 && let Err(error) = shared.dictionary.rebase(base)
             {
                 tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
             }
         }
-        None => shared.versions.install(next),
+        None => {
+            let _compaction = shared.versions.compaction_slot.lock();
+            shared.versions.install(next);
+        }
     }
     Ok(())
 }
@@ -555,30 +570,32 @@ fn publish_streamed(
         publish(engine, Next::Built(next))?;
         return Ok(len);
     };
-    let _checkpoint = durable.checkpoint_slot.lock();
+    let _checkpoint = super::admit(&durable.checkpoint_slot, "checkpoint")?;
     let empty = PackedKeys::from_sorted(&[]);
     // Every layout has SPOG: its length is the number of quads.
     let mut len = 0;
-    let path = checkpoint::write_parts(
-        durable.root(),
-        shared.admission.as_ref(),
-        revision,
-        &shared.dictionary,
-        dictionary_len,
-        [layout, Layout::DefaultGraph],
-        &mut |stack, permutation| {
-            Ok(match stack {
-                Stack::Asserted => {
-                    let packed = source.packed(permutation)?;
-                    if permutation == Permutation::Spog {
-                        len = packed.len() as u64;
+    let path = commit_image(durable, revision, || {
+        checkpoint::write_parts(
+            durable.root(),
+            shared.admission.as_ref(),
+            revision,
+            &shared.dictionary,
+            dictionary_len,
+            [layout, Layout::DefaultGraph],
+            &mut |stack, permutation| {
+                Ok(match stack {
+                    Stack::Asserted => {
+                        let packed = source.packed(permutation)?;
+                        if permutation == Permutation::Spog {
+                            len = packed.len() as u64;
+                        }
+                        std::borrow::Cow::Owned(packed)
                     }
-                    std::borrow::Cow::Owned(packed)
-                }
-                Stack::Inferred => std::borrow::Cow::Borrowed(&empty),
-            })
-        },
-    );
+                    Stack::Inferred => std::borrow::Cow::Borrowed(&empty),
+                })
+            },
+        )
+    });
     drop(source);
     let path = path?;
     shared
@@ -587,10 +604,11 @@ fn publish_streamed(
     let (base, [asserted, inferred]) = match checkpoint::map_written(&path) {
         Ok(mapped) => mapped,
         Err(error) => {
-            // Nothing else holds the data: the load fails, and the checkpoint goes so that
-            // a restart doesn't recover what was never published.
-            let _ = std::fs::remove_file(&path);
-            return Err(error);
+            // Committed (the checkpoint is in place), but nothing else holds the data to
+            // serve it: no write may follow before a reopen recovers it.
+            durable.wal.lock().poison();
+            tracing::error!(%error, revision, "a committed bulk load's checkpoint couldn't be mapped; reopen the engine to serve it");
+            return Err(EngineError::CommitUnsettled { revision });
         }
     };
     let next = Arc::new(Version {
@@ -602,15 +620,45 @@ fn publish_streamed(
         equality: Default::default(),
         canonical: Default::default(),
     });
+    let compaction = shared.versions.compaction_slot.lock();
     let mut wal = durable.wal.lock();
-    wal.rotate(revision + 1)?;
     shared.versions.install(next);
     release_covered(&mut wal, durable.root(), revision);
     drop(wal);
+    drop(compaction);
     if let Err(error) = shared.dictionary.rebase(base) {
         tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
     }
     Ok(len)
+}
+
+/// Writes, with `write`, the checkpoint of `revision`, a new revision of a bulk load or
+/// rematerialisation, and returns its path: the commit point (EEV-01, B-301). The caller
+/// holds the writer, compaction and checkpoint slots.
+///
+/// Before it the log moves to a new segment, the one step that can leave it unfit for the
+/// commits after; past it nothing may report the revision uncommitted, since a restart
+/// recovers it. A write that failed with the checkpoint possibly in place (its rename's
+/// outcome unknown, its directory unsynced) poisons the log: no commit of any kind can then
+/// take the revision again before a reopen settles which one is on disk.
+fn commit_image(
+    durable: &Durable,
+    revision: u64,
+    write: impl FnOnce() -> EngineResult<PathBuf>,
+) -> EngineResult<PathBuf> {
+    durable.wal.lock().rotate(revision)?;
+    let error = match write() {
+        Ok(path) => return Ok(path),
+        Err(error) => error,
+    };
+    match checkpoint::placed(durable.root(), revision) {
+        Ok(false) => Err(error),
+        placed => {
+            durable.wal.lock().poison();
+            tracing::error!(%error, revision, ?placed, "a bulk publication's outcome is unknown until the engine is reopened");
+            Err(EngineError::CommitUnsettled { revision })
+        }
+    }
 }
 
 /// Removes what a published checkpoint at `revision` covers: the log segments before it and
@@ -672,7 +720,9 @@ impl<'e> Rematerialisation<'e> {
             base,
         } = self;
         let shared = &engine.shared;
-        let _compaction = shared.versions.compaction_slot.lock();
+        // The new stack is built from `base` alone (the writer slot keeps it the latest
+        // content) without the compaction slot, which `publish` takes to install it: nothing
+        // that waits for that slot waits for this parallel work.
         let started = Instant::now();
         let mut quads: Vec<EncodedQuad> = inferred
             .into_par_iter()
@@ -693,11 +743,8 @@ impl<'e> Rematerialisation<'e> {
             .par_iter()
             .filter(|q| quads.binary_search(q).is_err())
             .count();
-        // Compaction may have replaced runs since `base` was taken, with the same content.
-        let current = shared.snapshot();
-        let current = current.version();
         let summary = CommitSummary {
-            revision: current.revision + 1,
+            revision: base.revision() + 1,
             inserted: 0,
             deleted: 0,
             inferred_inserted: inserted as u64,
@@ -705,21 +752,26 @@ impl<'e> Rematerialisation<'e> {
         };
         if inserted + deleted == 0 {
             return Ok(CommitSummary {
-                revision: current.revision,
+                revision: base.revision(),
                 ..summary
             });
         }
+        let inferred = IndexVersion::from_quads(Layout::DefaultGraph, quads);
+        // A merge may have replaced the asserted runs since `base` was taken, with the same
+        // statements: the latest ones are kept.
+        let current = shared.snapshot();
+        let current = current.version();
+        debug_assert_eq!(current.revision, base.revision(), "single writer");
         let next = Version {
             content: super::Content::fresh(),
             asserted: current.asserted.clone(),
-            inferred: IndexVersion::from_quads(Layout::DefaultGraph, quads),
+            inferred,
             revision: summary.revision,
             dictionary_len: shared.dictionary.len(),
             equality: Default::default(),
             canonical: Default::default(),
         };
         publish(engine, Next::Built(next))?;
-        drop(_compaction);
         tracing::info!(
             revision = summary.revision,
             inferred_inserted = summary.inferred_inserted,

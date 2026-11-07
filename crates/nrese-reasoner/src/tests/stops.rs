@@ -173,7 +173,11 @@ fn a_stopped_materialisation_is_never_reported_complete() {
     )
     .expect("runs");
     assert_eq!(whole.derived.len(), n, "the join's facts");
-    assert_eq!(whole.violations.len(), n * n, "the clash's bindings");
+    assert_eq!(
+        whole.violations.to_vec().len(),
+        n * n,
+        "the clash's bindings"
+    );
     let polls = asks.load(Ordering::Relaxed);
     let inside = 2 * n * n / nrese_exec::POLL_UNITS as usize;
     assert!(
