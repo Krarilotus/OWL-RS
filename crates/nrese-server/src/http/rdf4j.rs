@@ -34,7 +34,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use nrese_rdf::{BlankNode, GraphName, Literal, NamedNode, Term};
+use nrese_rdf::{GraphName, Literal, Term};
 
 use crate::access::AccessView;
 use nrese_store::{
@@ -70,77 +70,12 @@ fn param<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-/// A term written as in N-Triples.
+/// A term written as in N-Triples, the whole parameter (spaces and line ends around it
+/// aside), read by the N-Triples reader ([`nrese_rdf_io::parse_term`]).
 pub(crate) fn term(text: &str) -> Result<Term, ApiError> {
-    let bad = || ApiError::bad_request(format!("'{text}' is not an N-Triples term"));
-    let text = text.trim();
-    if let Some(iri) = text.strip_prefix('<').and_then(|t| t.strip_suffix('>')) {
-        return NamedNode::new(unescape(iri).ok_or_else(bad)?)
-            .map(Term::from)
-            .map_err(|_| bad());
-    }
-    if let Some(label) = text.strip_prefix("_:") {
-        return BlankNode::new(label).map(Term::from).map_err(|_| bad());
-    }
-    let rest = text.strip_prefix('"').ok_or_else(bad)?;
-    // The closing quote: the last one not escaped.
-    let mut end = None;
-    let mut escaped = false;
-    for (i, c) in rest.char_indices() {
-        match c {
-            '\\' if !escaped => escaped = true,
-            '"' if !escaped => end = Some(i),
-            _ => escaped = false,
-        }
-        if c != '\\' {
-            escaped = false;
-        }
-    }
-    let end = end.ok_or_else(bad)?;
-    let value = unescape(&rest[..end]).ok_or_else(bad)?;
-    let suffix = &rest[end + 1..];
-    if suffix.is_empty() {
-        return Ok(Literal::new_simple_literal(value).into());
-    }
-    if let Some(language) = suffix.strip_prefix('@') {
-        return Literal::new_language_tagged_literal(value, language)
-            .map(Term::from)
-            .map_err(|_| bad());
-    }
-    let datatype = suffix
-        .strip_prefix("^^<")
-        .and_then(|d| d.strip_suffix('>'))
-        .ok_or_else(bad)?;
-    let datatype = NamedNode::new(unescape(datatype).ok_or_else(bad)?).map_err(|_| bad())?;
-    Ok(Literal::new_typed_literal(value, datatype).into())
-}
-
-/// N-Triples string escapes undone; `None` for a malformed one (a `\u` escape takes exactly
-/// four hex digits, `\U` eight, as everywhere else).
-fn unescape(text: &str) -> Option<String> {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find('\\') {
-        out.push_str(&rest[..at]);
-        let escape = &rest[at..];
-        let (c, width) = match escape.as_bytes().get(1)? {
-            b't' => ('\t', 2),
-            b'b' => ('\u{8}', 2),
-            b'n' => ('\n', 2),
-            b'r' => ('\r', 2),
-            b'f' => ('\u{c}', 2),
-            b'"' => ('"', 2),
-            b'\'' => ('\'', 2),
-            b'\\' => ('\\', 2),
-            b'u' => (nrese_rdf::escape::unicode_escape(escape.as_bytes(), 0)?, 6),
-            b'U' => (nrese_rdf::escape::unicode_escape(escape.as_bytes(), 0)?, 10),
-            _ => return None,
-        };
-        out.push(c);
-        rest = &escape[width..];
-    }
-    out.push_str(rest);
-    Some(out)
+    nrese_rdf_io::parse_term(text.trim()).map_err(|error| {
+        ApiError::bad_request(format!("'{text}' is not an N-Triples term: {error}"))
+    })
 }
 
 /// The graphs of the `context` parameters (`null`: the default graph).
@@ -1031,6 +966,8 @@ pub async fn transaction_rollback(
 
 #[cfg(test)]
 mod tests {
+    use nrese_rdf::NamedNode;
+
     use super::*;
 
     #[test]
