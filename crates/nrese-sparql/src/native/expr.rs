@@ -142,6 +142,11 @@ thread_local! {
 }
 
 impl Evaluator {
+    /// The query's `BASE`.
+    pub(super) fn base(&self) -> Option<&Iri<String>> {
+        self.base.as_ref()
+    }
+
     /// An evaluator for one query; `base` resolves relative IRIs of `IRI()`.
     pub fn with_base(base: Option<Iri<String>>) -> Self {
         Self {
