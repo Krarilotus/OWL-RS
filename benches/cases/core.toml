@@ -1958,6 +1958,36 @@ cap_gb = 4
 systems = []
 
 [[case]]
+name = "parse-turtle-flat"
+area = "parse"
+what = "the Turtle parser alone, one thread, from memory: 1 M flat IRI triples (250,000 subjects, four each, no brackets), the parser's per-token cost"
+semantics = "none"
+data = "turtle entities=250000 nested=0"
+tool_loads = false
+args = ["--parse-turtle", "{data}", "--runs", "5"]
+queries = ""
+metric = "parse_turtle.p50_ms"
+check = { "parse_turtle.quads" = "expect.statements" }
+route = {}
+cap_gb = 2
+systems = []
+
+[[case]]
+name = "parse-turtle-nested"
+area = "parse"
+what = "the Turtle parser alone, one thread, from memory: 1.3 M triples from 100,000 statements each using every bracket ([ ], ( ), <<( )>>, << >>, {| |}), the parser's cost per nested span"
+semantics = "none"
+data = "turtle entities=100000 nested=1"
+tool_loads = false
+args = ["--parse-turtle", "{data}", "--runs", "5"]
+queries = ""
+metric = "parse_turtle.p50_ms"
+check = { "parse_turtle.quads" = "expect.statements" }
+route = {}
+cap_gb = 2
+systems = []
+
+[[case]]
 name = "plan-estimates"
 area = "plan"
 what = "the planner's estimates on nine query shapes: q-errors per operator (counts), beside the queries' times"
