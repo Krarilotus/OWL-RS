@@ -743,6 +743,16 @@ impl Graph {
         })
     }
 
+    /// Every edge of the table that wasn't retracted: what the graph says now, for a
+    /// caller that reads the whole table (a retracted edge's endpoints may both survive).
+    pub fn live_edges(&self) -> impl Iterator<Item = &Edge> {
+        debug_assert_eq!(self.edges.len(), self.dead.edges.len());
+        self.edges
+            .iter()
+            .zip(&self.dead.edges)
+            .filter_map(|(e, &dead)| (!dead).then_some(e))
+    }
+
     pub fn out_edges(&self, node: u32) -> impl Iterator<Item = (u32, &Edge)> {
         let mut at = self.nodes[node as usize].first_out;
         std::iter::from_fn(move || {

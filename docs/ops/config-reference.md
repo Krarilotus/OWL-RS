@@ -26,7 +26,7 @@ Notes:
 
 - Environment variables always override values loaded from `config.toml`.
 - If no config file path is provided by CLI or `NRESE_CONFIG_PATH`, the server runs from env/defaults only.
-- External reasoner input may still be expressed as `mode`, `preset`, and optional feature overrides, but the server resolves those inputs into one runtime profile/tier contract before diagnostics, capabilities, and frontend surfaces see them.
+- The reasoner's profile comes from `reasoner.mode` and `reasoner.rules` alone (there is no `preset` or feature-override input); the server resolves them into one runtime profile before diagnostics, capabilities and the console see it. The other `reasoner.*` settings below tune it.
 
 ## Validation
 
@@ -152,8 +152,8 @@ api_key = "replace-me"
 - env override: `NRESE_QUERY_CACHE_BYTES`
 - default: 2% of the memory the server may use (the container's limit, else the machine's), at least 64 MiB and at most 8 GiB; a size, or a share such as `5%`; `0` disables the cache
 - the result cache: the results of query parts (every operator the executor runs: a join, a group, a subquery, the whole query; and each prefix of a basic graph pattern's joins) are kept as id columns and shared by every query on an unchanged store, so a repeated query and a query sharing a part with an earlier one are answered from memory. Parts that differ only in their variables' names are one part. A part is valid only for the snapshot it was computed on (its revision and the statements it shows: a transaction's pending state never meets a committed part) and for everything else its result depends on: the dataset (`FROM`, the protocol's graphs), the read model (asserted, inferred, both), the user's access, the equality reading and the base IRI. So a commit makes every older part unreachable, and they are dropped when a query runs on the new revision. Parts calling `NOW()`, `RAND()`, `UUID()`, `STRUUID()` or `BNODE()`, or reading a `SERVICE`, are never kept
-- what is kept: a part that took longer to compute than its copy takes (at least 20 µs, and 1 µs per 2 kB twice over), no larger than a quarter of the budget; ranked by its cost times its hits over its bytes (GreedyDual-Size-Frequency), the lowest evicted first; a part worth less than what it would evict is not kept. The budget counts the columns, the computed values, the keys and the bookkeeping (about 770 bytes per entry), and the cache never holds more heap than it (a test checks it against the allocator)
-- queries asking for the same part at the same time compute it once: the others wait for it (and compute it themselves if that query fails)
+- what is kept: a part that took longer to compute than its copy takes (at least 20 µs, and 1 µs per 10 kB twice over, `COPY_BYTES_PER_MICRO` in `nrese-sparql/src/cache.rs`), no larger than a quarter of the budget; ranked by its cost times its hits over its bytes (GreedyDual-Size-Frequency), the lowest evicted first; a part worth less than what it would evict is not kept. The budget counts the columns, the computed values, the keys and the bookkeeping (about 770 bytes per entry), and the cache never holds more heap than it (a test checks it against the allocator)
+- queries asking for the same part at the same time compute it once: the others wait for it (and compute it themselves if that query fails); a query running on a Rayon worker never waits, it computes the part beside the other ([the bounded rule](../design/research-designs.md#8-query-progress-under-shared-cache-waits-decided-the-bounded-rule))
 - a query's whole answer is kept too, as the bytes of each output format it was written in (beside its id columns, in the same budget and ranking), where writing it cost more than twice copying it: a repeated query is a copy of what was written before. An answer's key also holds what the store's answer depends on: under `owl2-dl` the mode and the `dl-answers` asked for (answers over the lower bound L are cached for L, never for the snapshot), the completeness status the answer is sent with, and the OWL 2 QL rewriting where it applies; the status header is computed for every request, so a cached answer carries the one a fresh answer would
 - EXPLAIN marks each operator answered from the cache (`"cache": "hit"`) or taken from another query computing it (`"cache": "shared"`); `GET /api/v1/repositories/{id}/cache` shows the counts, `DELETE` on it drops every result not pinned
 
@@ -191,6 +191,11 @@ api_key = "replace-me"
 - env override: `NRESE_WAL_ARCHIVE`
 - default: `false`
 - on disk, keep the WAL segments that checkpoints cover in `wal-archive/` of the data directory instead of deleting them. With an image backup they restore the store to any later revision (`nrese-server restore DIR --wal ARCHIVE --wal DATA/wal --until-revision N`). The archive grows until pruned (`nrese-server prune-archive R`, with `R` the oldest image backup's revision plus one). Sync it to another machine for recovery from a lost disk
+
+- file key: `store.wal_damage`
+- env override: `NRESE_WAL_DAMAGE`
+- default: `refuse`
+- on disk, what opening does with damage in the newest write-ahead log segment. What a crash during a commit leaves (one incomplete last record, or zeros to the end of the file, with no intact record after it) is always cut: that commit was never acknowledged. Its bytes are kept in `wal-cut/` of the data directory, and a warning is logged. Any other damage (a complete record failing its checksum, or damage with intact records after it) may hold acknowledged commits. `refuse` doesn't open the store and leaves the log as it is, so an operator can back the directory up and decide. `keep-prefix` opens with the log up to the damage, copies the rest to `wal-cut/` first and logs the cut as an error: commits acknowledged after the damage are then only in that copy. Neither costs anything on healthy commits; the choice is downtime after a damaged crash against losing acknowledged commits without anyone's word. Damage in an older segment always refuses to open
 
 - file key: `store.index_encoding`
 - env override: `NRESE_INDEX_ENCODING`

@@ -34,6 +34,33 @@ cap_gb = 8
 systems = ["jena:rdfs", "rdf4j:rdfs", "graphdb:rdfs", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 rewrite = "expressible"
 [[case]]
+name = "rl-hierarchy-small"
+area = "reasoning"
+what = "a 15-class tree and a 1,000-class spine over 1,000 typed instances: the rule joins' fixed costs where the data is small (PR #34's guard timing)"
+semantics = "owl2-rl"
+data = "hierarchy fan=2 depth=4 spine=1000 instances=1000 every=10"
+args = ["--reason", "owl2-rl", "--reason-runs", "30"]
+repeat = 4
+queries = "hierarchy"
+metric = "reason.p50_ms"
+check = { "q.root.value" = "expect.instances_of_root", "q.spine-middle.value" = "expect.instances_of_spine_middle", "q.h1.value" = "expect.instances_of_h1" }
+route = { "reason.rounds" = "<= 3" }
+cap_gb = 8
+systems = []
+[[case]]
+name = "ql-hierarchy-small"
+area = "reasoning"
+what = "the same small hierarchy answered by OWL 2 QL rewriting: the rewriting's cost per query over a 1,000-class spine (PR #48's timing)"
+semantics = "owl2-ql"
+data = "hierarchy fan=2 depth=4 spine=1000 instances=1000 every=10"
+args = ["--reason", "owl2-ql", "--runs", "20"]
+queries = "hierarchy"
+metric = "sum_p50_ms"
+check = { "q.root.value" = "expect.instances_of_root", "q.spine-middle.value" = "expect.instances_of_spine_middle", "q.h1.value" = "expect.instances_of_h1" }
+route = {}
+cap_gb = 8
+systems = []
+[[case]]
 name = "rl-clique"
 area = "reasoning"
 what = "a symmetric and transitive property closing 40 random trees of 300 to cliques (3.6 M pairs)"
@@ -80,6 +107,21 @@ cap_gb = 6
 systems = ["qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 guards = ["equality by representatives: facts over each class's smallest id, expanded at read time"]
 rewrite = "not-expressible"
+[[case]]
+name = "rl-sameas-replicate"
+area = "reasoning"
+what = "the same sameAs groups with equality by replication (Equality::run): every fact copied to each member (PR #91's timing)"
+semantics = "owl2-rl"
+data = "sameas groups=20000 size=10"
+args = ["--reason", "owl2-rl", "--reason-runs", "16"]
+env = { NRESE_REASONING_EQUALITY = "replicate" }
+queries = "sameas"
+metric = "reason.p50_ms"
+# The closure is the same under either equality (crates/nrese-store/src/config.rs).
+check = { "q.values.value" = "expect.values", "q.same-as.value" = "expect.same_as_pairs", "q.knows.value" = "expect.knows", "q.group-values.rows" = 10 }
+route = {}
+cap_gb = 6
+systems = []
 [[case]]
 name = "rl-chain"
 area = "reasoning"
@@ -1019,6 +1061,122 @@ cap_gb = 4
 systems = ["hermit:dl", "openllet:dl", "konclude:dl"]
 guards = ["P3: minimal automata, transitions the inclusions imply"]
 
+# Keys over transitive (non-simple) properties: every member of A reaches z through each key
+# property, so the key equates them, against DifferentIndividuals(a0 a1) (PR #48's timing).
+[[case]]
+name = "dl-keys-100"
+area = "dl"
+what = "HasKey over one transitive property, 100 named members: inconsistent by the key and one difference"
+semantics = "dl"
+data = "dl-keys members=100 properties=1"
+tool = "tableau"
+repeat = 8
+metric = "whole_ms"
+check = { "answer" = "expect.answer" }
+route = {}
+timeout_s = 120
+cap_gb = 4
+systems = []
+[[case]]
+name = "dl-keys-400"
+area = "dl"
+what = "the same key, 400 members"
+semantics = "dl"
+data = "dl-keys members=400 properties=1"
+tool = "tableau"
+repeat = 8
+metric = "whole_ms"
+check = { "answer" = "expect.answer" }
+route = {}
+timeout_s = 120
+cap_gb = 4
+systems = []
+[[case]]
+name = "dl-keys-1200"
+area = "dl"
+what = "the same key, 1,200 members"
+semantics = "dl"
+data = "dl-keys members=1200 properties=1"
+tool = "tableau"
+repeat = 12
+metric = "whole_ms"
+check = { "answer" = "expect.answer" }
+route = {}
+timeout_s = 120
+cap_gb = 8
+systems = []
+[[case]]
+name = "dl-keys-2400"
+area = "dl"
+what = "the same key, 2,400 members"
+semantics = "dl"
+data = "dl-keys members=2400 properties=1"
+tool = "tableau"
+repeat = 12
+metric = "whole_ms"
+check = { "answer" = "expect.answer" }
+route = {}
+timeout_s = 120
+cap_gb = 8
+systems = []
+[[case]]
+name = "dl-keys-8x3"
+area = "dl"
+what = "a key over three transitive properties, 8 members"
+semantics = "dl"
+data = "dl-keys members=8 properties=3"
+tool = "tableau"
+repeat = 8
+metric = "whole_ms"
+check = { "answer" = "expect.answer" }
+route = {}
+timeout_s = 120
+cap_gb = 4
+systems = []
+[[case]]
+name = "dl-keys-128x3"
+area = "dl"
+what = "a key over three transitive properties, 128 members"
+semantics = "dl"
+data = "dl-keys members=128 properties=3"
+tool = "tableau"
+repeat = 32
+metric = "whole_ms"
+check = { "answer" = "expect.answer" }
+route = {}
+timeout_s = 120
+cap_gb = 8
+systems = []
+[[case]]
+name = "dl-number-fragment"
+area = "dl"
+what = "the number shortcut's supported fragment: D = {d} with exactly two p-predecessors, each with exactly three q-predecessors (PR #38's timing)"
+semantics = "dl"
+data = "dl-number-fragment"
+tool = "tableau"
+repeat = 30
+metric = "whole_ms"
+check = { "answer" = "expect.answer" }
+route = {}
+cap_gb = 4
+systems = []
+[[case]]
+name = "el-shallow-existentials"
+area = "dl"
+what = "OWL 2 EL reading of 50,000 existential restrictions (A_i disjoint from ∃partOf.B_i under a 60-role hierarchy): saturation is small, so normalisation shows (#78's timing)"
+semantics = "el"
+data = "dl-roles roles=60 axioms=50000"
+tool = "classify-el"
+repeat = 3
+metric = "whole_ms"
+# Disjointness axioms imply no subsumption between named classes; 150,002 concepts is three
+# per axiom (A_i, B_i, the filler) and two more, as every round of #78's timing read it.
+check = { "concepts" = "150002", "subsumptions" = "0" }
+pinned = "subsumptions: the axioms (disjointness only); concepts: #78's timing rounds (Harness scratch/lane-m-g2/eip, 28-31 Oct 2026)"
+route = {}
+cap_gb = 6
+systems = []
+
 [[case]]
 name = "el-classify"
 area = "dl"
@@ -1375,6 +1533,20 @@ systems = ["qlever:plain", "oxigraph:plain", "jena:plain", "virtuoso:plain"]
 guards = ["string filters on the dictionary"]
 args = ["--runs", "400"]
 [[case]]
+name = "lazy-text-order"
+area = "operator"
+what = "the first STRSTARTS over 180 k people's names in a fresh process: the text order sorted then, every entry's key borrowed (O2's timing)"
+semantics = "none"
+data = "social people=180000"
+queries = "op-strings"
+args = ["--warmup", "0", "--runs", "1"]
+repeat = 10
+metric = "sum_p50_ms"
+check = { "q.contains.value" = "expect.names_containing_w42", "q.strstarts.value" = "expect.names_starting_user_7" }
+route = {}
+cap_gb = 6
+systems = []
+[[case]]
 name = "op-dates"
 area = "operator"
 what = "YEAR ranges, integer and dateTime comparisons as index ranges on inline literals"
@@ -1509,6 +1681,46 @@ area = "service"
 what = "exact k-NN (k = 10, cosine) over 200 k 64-dimensional embeddings, filtered to one kind in ten"
 semantics = "none"
 data = "vectors items=200000 dim=64 kinds=10"
+queries = "@vectors-exact"
+args = ["--runs", "300"]
+metric = "sum_p50_ms"
+check = { "recall" = ">= 1.0" }
+route = {}
+cap_gb = 6
+systems = []
+# The exact scan at its chunk boundary (4,096 vectors a chunk): one under, at and one over (W2's timing).
+[[case]]
+name = "vector-exact-4095"
+area = "service"
+what = "exact k-NN over 4,095 embeddings, one kind in ten: a corpus one short of a whole chunk"
+semantics = "none"
+data = "vectors items=4095 dim=64 kinds=10"
+queries = "@vectors-exact"
+args = ["--runs", "300"]
+metric = "sum_p50_ms"
+check = { "recall" = ">= 1.0" }
+route = {}
+cap_gb = 6
+systems = []
+[[case]]
+name = "vector-exact-4096"
+area = "service"
+what = "exact k-NN over 4,096 embeddings: exactly one chunk"
+semantics = "none"
+data = "vectors items=4096 dim=64 kinds=10"
+queries = "@vectors-exact"
+args = ["--runs", "300"]
+metric = "sum_p50_ms"
+check = { "recall" = ">= 1.0" }
+route = {}
+cap_gb = 6
+systems = []
+[[case]]
+name = "vector-exact-4097"
+area = "service"
+what = "exact k-NN over 4,097 embeddings: one vector into a second chunk"
+semantics = "none"
+data = "vectors items=4097 dim=64 kinds=10"
 queries = "@vectors-exact"
 args = ["--runs", "300"]
 metric = "sum_p50_ms"
@@ -2056,6 +2268,20 @@ counters = ["cache.hits"]
 systems = ["qlever:plain"]
 home_turf = "qlever"
 guards = ["the caching work package: QLever caches every plan subtree, NRESE whole results"]
+[[case]]
+name = "cache-replay-cached"
+area = "cache"
+what = "the same query log with the result cache on (256 MiB) alone, checked: a recurring query is answered from the cache (N11's timing)"
+semantics = "none"
+data = "social people=300000"
+queries = "@cache-log"
+args = ["--warmup", "0", "--runs", "1", "--cache-bytes", "268435456"]
+metric = "sum_p50_ms"
+check = { "cache.hits" = ">= 1" }
+route = {}
+cap_gb = 6
+counters = ["cache.hits"]
+systems = []
 
 # --- OWL 2 QL rewriting and the owl2-dl mode (refactor/engine-v2: QL, G3) ----------------------
 
@@ -2112,6 +2338,20 @@ cap_gb = 4
 # No comparator: the others maintain OWL 2 RL, not a DL consistency check per commit.
 systems = []
 guards = ["DL in the store (owl2-dl): a commit's consistency proved by the upper bound U1"]
+
+[[case]]
+name = "dlmode-commits-small"
+area = "maintenance"
+what = "400 commits under owl2-dl on a tenth of dlmode-commits' data: a commit's fixed cost of the DL check (PR #30's and #37's timing)"
+semantics = "owl2-dl"
+data = "churn people=2000 changes=200"
+args = ["--reason", "owl2-dl", "--commits", "{data}.commits.ru"]
+queries = "churn"
+metric = "commits.p50_ms"
+check = { "commits.commits" = 400, "closure_after_commits.equal" = "true" }
+route = { "commits.incremental" = "== true" }
+cap_gb = 4
+systems = []
 
 [[case]]
 name = "dlmode-reject"
