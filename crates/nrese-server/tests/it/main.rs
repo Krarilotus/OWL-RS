@@ -22,6 +22,7 @@ mod openapi_tests;
 mod packaging_tests;
 mod policy_api_tests;
 mod query_protocol_tests;
+mod rdf4j_admission_tests;
 mod rdf4j_protocol_tests;
 mod replication_tests;
 mod shacl_api_tests;
