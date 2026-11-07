@@ -33,6 +33,54 @@ use crate::StoreService;
 #[path = "bounds_memory_tests.rs"]
 mod memory_tests;
 
+#[cfg(test)]
+#[path = "bounds_lock_tests.rs"]
+mod lock_tests;
+
+/// Where the lock tests hold U1's work mid-way: a hook run once, on the thread doing that
+/// work, for the store whose bounds it names.
+#[cfg(test)]
+pub(crate) mod seam {
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Point {
+        /// A commit's change of U1, U1 taken and the change not begun.
+        Change,
+        /// U1 built afresh for a read, not begun.
+        Build,
+        /// The TBox's taxonomy for a read, not begun.
+        Taxonomy,
+        /// A revision's read view, not begun.
+        View,
+    }
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOK: Mutex<Option<(usize, Point, Hook)>> = Mutex::new(None);
+
+    fn key(bounds: &super::Bounds) -> usize {
+        std::ptr::from_ref(bounds) as usize
+    }
+
+    pub(crate) fn set(bounds: &super::Bounds, point: Point, hook: impl FnOnce() + Send + 'static) {
+        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((key(bounds), point, Box::new(hook)));
+    }
+
+    pub(crate) fn at(bounds: &super::Bounds, point: Point) {
+        let hook = {
+            let mut slot = HOOK.lock().unwrap_or_else(|p| p.into_inner());
+            match &*slot {
+                Some((k, p, _)) if *k == key(bounds) && *p == point => slot.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, _, hook)) = hook {
+            hook();
+        }
+    }
+}
+
 /// U1 at a revision.
 struct State {
     revision: u64,
@@ -191,6 +239,8 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
                     .map(quad_triple)
                     .chain(tx.inferred_deleted().map(triple))
                     .collect();
+                #[cfg(test)]
+                seam::at(&store.dl().bounds, seam::Point::Change);
                 match upper.change(&pending, &inserted, &deleted, &stop) {
                     Ok(change) if !change.merges() => {
                         return Preparation {
@@ -379,6 +429,8 @@ pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
                 let memory = store.memory_stop();
                 let stop = move || deadline.passed() || memory.exceeded();
                 let resolve = |t: nrese_rdf::TermRef<'_>| source::resolve(replica, &tx, t);
+                #[cfg(test)]
+                seam::at(bounds, seam::Point::Build);
                 Upper::build(&ontology, &normalised, &snapshot, &resolve, &stop)
             }
         };
@@ -396,11 +448,15 @@ pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
     let s = state.as_ref().expect("built above");
     let taxonomy = match &s.upper {
         Ok(_) if !s.rules => Some(Arc::clone(s.taxonomy.get_or_init(|| {
+            #[cfg(test)]
+            seam::at(bounds, seam::Point::Taxonomy);
             let ontology = super::query::ontology_at(store, &snapshot);
             Arc::new(super::lower::tbox_taxonomy(store, &ontology))
         }))),
         _ => None,
     };
+    #[cfg(test)]
+    seam::at(bounds, seam::Point::View);
     let view = Arc::new(build_view(&snapshot, s, taxonomy.as_deref()));
     *bounds.view.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&view));
     (snapshot, view)
