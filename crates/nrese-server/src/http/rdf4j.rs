@@ -52,6 +52,7 @@ use crate::http::requests::{
     accept_header_value, query_from_post, query_from_url, update_from_post,
 };
 use crate::http::sparql;
+use crate::policy::PolicyConfig;
 use crate::repositories::DEFAULT_REPOSITORY;
 use crate::state::AppState;
 
@@ -242,12 +243,16 @@ fn is_update(headers: &HeaderMap) -> bool {
         || media_type_matches(content_type, "application/sparql-update")
 }
 
+/// The SPARQL update of a request, within the policy's update limit (its decoded text, as
+/// `/dataset/update` counts it): every RDF4J path that takes one comes here.
 pub(crate) fn update(
+    policy: &PolicyConfig,
     raw: &RawQuery,
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<SparqlUpdateRequest, ApiError> {
     let operation = update_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), body)?;
+    policy.enforce_update_bytes(operation.update.len())?;
     Ok(SparqlUpdateRequest {
         update: operation.update,
         using_graphs: operation.using_graphs,
@@ -505,7 +510,7 @@ pub async fn query_post(
             .is_ok_and(|pairs| pairs.iter().any(|(key, _)| key == "update"));
     if form_update || media_type_matches(content_type, "application/sparql-update") {
         let access = guard::update_access(&state, &authenticated).await?;
-        let request = update(&raw, &headers, &body)?;
+        let request = update(&state.policy(), &raw, &headers, &body)?;
         apply(&state, vec![StatementOp::Update(request)], &access).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
@@ -582,7 +587,7 @@ pub async fn statements_post(
     let state = state.for_repository(&id)?;
     let access = guard::view(&state, &identity);
     let op = if is_update(&headers) {
-        StatementOp::Update(update(&raw, &headers, &body)?)
+        StatementOp::Update(update(&state.policy(), &raw, &headers, &body)?)
     } else {
         state.policy().enforce_rdf_upload_bytes(body.len())?;
         StatementOp::Add {
@@ -955,17 +960,25 @@ pub async fn transaction_action(
     if !sessions.ping(&txid, owner) {
         return Err(ApiError::not_found(format!("no transaction '{txid}'")));
     }
+    // A payload past the upload limit is refused before it is read.
+    if matches!(action.as_str(), "ADD" | "DELETE" | "UPDATE") {
+        state.policy().enforce_rdf_upload_bytes(body.len())?;
+    }
     let ops = match action.as_str() {
         "ADD" => Some(vec![StatementOp::Add {
             data: payload(&headers, &body)?,
             contexts: contexts(&pairs)?,
         }]),
         "DELETE" => Some(removals(&pairs, &headers, &body)?),
-        "UPDATE" => Some(vec![StatementOp::Update(update(&raw, &headers, &body)?)]),
+        "UPDATE" => Some(vec![StatementOp::Update(update(
+            &state.policy(),
+            &raw,
+            &headers,
+            &body,
+        )?)]),
         _ => None,
     };
     if let Some(ops) = ops {
-        state.policy().enforce_rdf_upload_bytes(body.len())?;
         return match sessions.add(&txid, owner, ops) {
             true => Ok(StatusCode::OK.into_response()),
             false => Err(ApiError::not_found(format!("no transaction '{txid}'"))),
