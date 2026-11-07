@@ -516,6 +516,14 @@ class Rounds(unittest.TestCase):
                 self.assertEqual(fast.case_inputs(case)["lubm-10.nt"], "p" * 64)  # the prepared manifest's
             with patch.object(fast, "RUNTIME", "docker"), patch.dict(fast._DIGESTS, clear=True):
                 self.assertEqual(fast.case_inputs(case), {"lubm-10.nt": None, "univ-bench.nt": None})
+            # Sol-loop r3 V2: a concatenation's order is part of what was loaded.
+            (data / "univ-bench.nt").write_bytes(b"<u> <v> <w> .\n")
+            ab = {"name": "t", "data": "concat:volume:lubm-10.nt+volume:univ-bench.nt"}
+            ba = {"name": "t", "data": "concat:volume:univ-bench.nt+volume:lubm-10.nt"}
+            with patch.object(fast, "RUNTIME", "native"), patch.object(fast, "FAST_DATA", fast_data), \
+                    patch.object(fast.hosts, "input_path", return_value=data), \
+                    patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
+                self.assertNotEqual(fast.case_inputs(ab), fast.case_inputs(ba))
 
     def test_the_catalogue_keeps_a_form_pin_and_a_note_when_it_is_written_again(self):
         """7 Nov 2026: `suite.py data` rewrites benches/datasets.toml from a fixed list of keys, so a
