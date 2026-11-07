@@ -128,10 +128,9 @@ impl Tbox {
     /// Why answers to `cq` through anonymous individuals may be missing
     /// (docs/design/ql-rewriting.md §7): each atom's term reached by a hazard, with the
     /// hazard; a hazard that reaches every term once, under the first atom. Empty: none.
+    /// Also where the rewriting has nothing to rewrite ([`Self::is_empty`]): individuals
+    /// asserted to be in an existential have anonymous successors of their own.
     pub fn concerns(&self, cq: &Cq) -> Vec<(Term, Hazard)> {
-        if self.is_empty() {
-            return Vec::new();
-        }
         let mut out: Vec<(Term, Hazard)> = Vec::new();
         for atom in &cq.atoms {
             let term = match atom {
@@ -139,17 +138,27 @@ impl Tbox {
                 Atom::Role(_, p, _) => *p,
                 Atom::Other(..) => continue,
             };
-            let hazard = self
-                .hazards
-                .global
-                .or_else(|| self.hazards.affected.get(&term).copied());
-            if let Some(h) = hazard
+            if let Some(h) = self.concern(term)
                 && !out.iter().any(|&(t, _)| t == term)
             {
                 out.push((term, h));
             }
         }
         out
+    }
+
+    /// The hazard by which answers on `term` (a class or property) through anonymous
+    /// individuals may be missing, if any.
+    pub fn concern(&self, term: Term) -> Option<Hazard> {
+        self.hazards
+            .global
+            .or_else(|| self.hazards.affected.get(&term).copied())
+    }
+
+    /// Whether some answer through anonymous individuals may be missing: a term has a
+    /// [`Self::concern`].
+    pub fn has_concerns(&self) -> bool {
+        self.hazards.global.is_some() || !self.hazards.affected.is_empty()
     }
 
     /// Whether the rewriting may change an atom on `term` (a class or property): for the
