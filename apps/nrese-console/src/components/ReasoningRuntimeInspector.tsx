@@ -64,7 +64,9 @@ export function ReasoningRuntimeInspector({ strings, reasoning }: Props) {
           <div className="fact-card">
             <div className="fact-label">{strings.reasoningRunViolationsLabel}</div>
             <div className="fact-value mono">
-              {lastRun ? lastRun.consistency_violations : unavailable}
+              {lastRun
+                ? `${lastRun.consistency_violations_at_least ? "≥ " : ""}${lastRun.consistency_violations}`
+                : unavailable}
             </div>
           </div>
           <div className="fact-card">

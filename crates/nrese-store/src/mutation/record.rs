@@ -15,6 +15,8 @@ pub struct ReasoningRunRecord {
     pub inferred_inserted: u64,
     pub inferred_deleted: u64,
     pub consistency_violations: u64,
+    /// Their list stopped at its memory budget: `consistency_violations` is a lower bound.
+    pub consistency_violations_at_least: bool,
     pub rounds: usize,
     pub elapsed_micros: u64,
     pub primary_reject: Option<RejectExplanation>,
@@ -45,6 +47,7 @@ impl ReasoningRunRecord {
             inferred_inserted: report.inferred_inserted,
             inferred_deleted: report.inferred_deleted,
             consistency_violations: report.violations as u64,
+            consistency_violations_at_least: report.violations_at_least,
             rounds: report.rounds,
             elapsed_micros: u64::try_from(report.elapsed.as_micros()).unwrap_or(u64::MAX),
             primary_reject,

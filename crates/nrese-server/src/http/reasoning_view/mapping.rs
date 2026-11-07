@@ -25,6 +25,7 @@ pub fn last_run_view(run: &ReasoningRunRecord) -> LastReasoningRunView {
         inferred_inserted: run.inferred_inserted,
         inferred_deleted: run.inferred_deleted,
         consistency_violations: run.consistency_violations,
+        consistency_violations_at_least: run.consistency_violations_at_least,
         rounds: run.rounds,
         elapsed_micros: run.elapsed_micros,
         primary_reject: run
@@ -44,6 +45,7 @@ pub fn materialisation_view(report: &MaterialisationReport) -> MaterialisationVi
         asserted: report.asserted,
         inferred: report.inferred,
         consistency_violations: report.violations,
+        consistency_violations_at_least: report.violations_at_least,
         rounds: report.rounds,
         elapsed_millis: u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX),
         ontology_diagnostics: report.diagnostics.iter().map(diagnostic_view).collect(),
