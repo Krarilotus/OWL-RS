@@ -492,6 +492,31 @@ class Rounds(unittest.TestCase):
             self.assertEqual(chosen, general / "lubm-10.nt")
             self.assertIn("bytes", problem)
 
+    def test_a_record_says_which_frozen_bytes_its_case_loaded(self):
+        """Review r1 of pkg/stage-data, R1-W1: a comparison can hold a verdict to the same input only
+        if each record says which bytes its case loaded. The prepared manifest's hash where it holds
+        the file unchanged, else the file's own; None where the file isn't there, or the run can't
+        read it (the Docker runtime's volume)."""
+        import hashlib
+        with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as fast_data:
+            data, fast_data = Path(data), Path(fast_data)
+            (data / "lubm-10.nt").write_bytes(b"<a> <b> <c> .\n")
+            case = {"name": "t", "data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}
+            stat = (data / "lubm-10.nt").stat()
+            with patch.object(fast, "RUNTIME", "native"), patch.object(fast, "FAST_DATA", fast_data), \
+                    patch.object(fast.hosts, "input_path", return_value=data), \
+                    patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
+                self.assertEqual(fast.case_inputs(case), {"lubm-10.nt": hashlib.sha256(b"<a> <b> <c> .\n").hexdigest(),
+                                                          "univ-bench.nt": None})
+            (fast_data / fast.PREPARED).write_text(json.dumps({"files": {(data / "lubm-10.nt").as_posix(): {
+                "bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha256": "p" * 64}}}), encoding="utf-8")
+            with patch.object(fast, "RUNTIME", "native"), patch.object(fast, "FAST_DATA", fast_data), \
+                    patch.object(fast.hosts, "input_path", return_value=data), \
+                    patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
+                self.assertEqual(fast.case_inputs(case)["lubm-10.nt"], "p" * 64)  # the prepared manifest's
+            with patch.object(fast, "RUNTIME", "docker"), patch.dict(fast._DIGESTS, clear=True):
+                self.assertEqual(fast.case_inputs(case), {"lubm-10.nt": None, "univ-bench.nt": None})
+
     def test_the_catalogue_keeps_a_form_pin_and_a_note_when_it_is_written_again(self):
         """7 Nov 2026: `suite.py data` rewrites benches/datasets.toml from a fixed list of keys, so a
         freeze would have dropped univ-bench.nt's `rdfc_sha256` (its only pin a made copy can meet)
