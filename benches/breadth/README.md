@@ -44,9 +44,7 @@ the backlog.
    system on one host under one memory cap, then `suite.py report` and `compare` and a run
    record in [runs/](../runs/).
 
-`python benches/suite/queue.py submit benches/breadth/jobs/<job>.toml` queues a job; the
-host runs it when the owner's order and its window allow. A step stopped because the host's
-owners came back runs again.
+> **Superseded (2 Nov 2026):** these job files were written for `suite/queue.py`, the queue before the fleet; they name hosts and aren't submitted any more. A run of this kit is a fleet job ([../README.md](../README.md#on-the-fleet)); porting them is a follow-up.
 
 Licensed systems (GraphDB, Stardog) run on our machines only; their rows carry
 `publish = permission` and their numbers are never committed ([competitors/README.md](../competitors/README.md)).

@@ -110,19 +110,22 @@ pub async fn validate(
     }
 
     let store = state.store();
-    let validation = tokio::time::timeout(
+    let cancellation = nrese_store::CancellationToken::new();
+    let token = cancellation.clone();
+    let validation = super::blocking::within(
         state.policy().timeouts.query,
-        tokio::task::spawn_blocking(move || store.validate_shacl(&scope, &request)),
+        cancellation,
+        "validation exceeded policy timeout",
+        move || store.validate_shacl(&scope, &request, &token),
     )
-    .await
-    .map_err(|_| ApiError::timeout("validation exceeded policy timeout"))?
-    .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| {
-        if error.is_request_error() {
-            ApiError::bad_request(error.to_string())
-        } else {
-            ApiError::internal(error.to_string())
+    .await?
+    .map_err(|error| match error {
+        // Stopped as a query is: by its deadline, or by the memory queries may hold.
+        nrese_store::StoreError::SparqlEvaluation(_) if !error.is_request_error() => {
+            super::sparql::map_query_error(&state.policy(), error)
         }
+        error if error.is_request_error() => ApiError::bad_request(error.to_string()),
+        error => ApiError::internal(error.to_string()),
     })?;
 
     let (media_type, body) = match format {

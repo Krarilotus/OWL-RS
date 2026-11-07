@@ -427,6 +427,11 @@ impl Catalog {
         };
         let store = StoreService::with_runtime(config, Arc::clone(&self.runtime))
             .map_err(|error| error.to_string())?;
+        // Its SERVICE calls go where the default repository's may: the server's client.
+        let services = self.default.pipeline.read().store().services();
+        if let Some(services) = services {
+            store.set_service_client(services.0);
+        }
         match reasoner.config().materialised_program() {
             Some(program) if !store.reasoning_is_current(&program) => {
                 store
