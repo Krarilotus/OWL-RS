@@ -132,3 +132,84 @@ fn a_compaction_on_a_pool_thread_defers_to_a_running_merge() {
     );
     assert!(engine.stats().runs < runs);
 }
+
+/// IB0024 review C1: dropping the last Engine on a pool thread while a maintenance task is
+/// in progress runs no job of that pool. Here the pool's one queued job wants a mutex the
+/// dropping job holds: run beneath the drop, it would wait for good. The test holds the
+/// compaction slot, so the maintenance merge that has started can't finish until the drop has
+/// begun; then it lets it finish. The drop returns, the dropping job lets go of the mutex, and
+/// only then does the queued job run.
+#[test]
+fn the_last_engine_dropped_on_a_pool_thread_runs_no_job_while_maintenance_is_in_progress() {
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::sync::{Arc, Mutex};
+
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let shared = Arc::clone(&engine.inner.shared);
+    let slot = shared.versions.compaction_slot.lock();
+    // Two runs of 20,000: their 40,000-entry window is above the inline limit, so the commit
+    // hands it to maintenance, whose merge then waits for the held slot to publish.
+    for (from, to) in [(0u64, 20_000u64), (20_000, 40_000)] {
+        let mut tx = engine.transaction();
+        for i in from..to {
+            let quad = nrese_rdf::Quad::new(
+                nrese_rdf::NamedNode::new_unchecked(format!("urn:s{i}")),
+                nrese_rdf::NamedNode::new_unchecked("urn:p"),
+                nrese_rdf::NamedNode::new_unchecked(format!("urn:o{i}")),
+                nrese_rdf::GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+    }
+    let started = std::time::Instant::now();
+    while !shared.maintaining.load(SeqCst) {
+        assert!(started.elapsed() < DEADLINE, "maintenance never started");
+        std::thread::yield_now();
+    }
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("a pool of one");
+    let (dropping, entered) = mpsc::channel();
+    let (dropped, returned) = mpsc::channel();
+    let lock = Arc::new(Mutex::new(()));
+    let ran_under_the_drop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (lock, ran) = (Arc::clone(&lock), Arc::clone(&ran_under_the_drop));
+        pool.spawn(move || {
+            let held = lock.lock().unwrap();
+            let in_drop = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            {
+                let (wants, in_drop, ran) = (Arc::clone(&lock), Arc::clone(&in_drop), ran);
+                rayon::spawn(move || {
+                    ran.store(in_drop.load(SeqCst), SeqCst);
+                    drop(wants.lock());
+                });
+            }
+            let _ = dropping.send(());
+            drop(engine);
+            in_drop.store(false, SeqCst);
+            drop(held);
+            let _ = dropped.send(());
+        });
+    }
+    entered
+        .recv_timeout(DEADLINE)
+        .expect("the dropping job starts");
+    // A margin for the drop to reach its wait (the maintenance merge can't end before the
+    // slot is let go); the outcome is checked by the answer below, not by time.
+    std::thread::sleep(Duration::from_millis(200));
+    drop(slot);
+    returned.recv_timeout(DEADLINE).unwrap_or_else(|_| {
+        panic!(
+            "the last engine's drop on a pool thread still waits after {DEADLINE:?}: it ran a \
+             job of its pool that waits for the caller's mutex (a wait cycle)"
+        )
+    });
+    assert!(
+        !ran_under_the_drop.load(SeqCst),
+        "the pool's queued job ran beneath the drop"
+    );
+}
