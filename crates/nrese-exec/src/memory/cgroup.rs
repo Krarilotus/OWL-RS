@@ -87,7 +87,7 @@ fn group(read: &impl Fn(&str) -> io::Result<String>) -> Result<Option<Group>, Un
     // of one hierarchy shows the same tree, so the widest shows every ancestor a deeper one does
     // and more: a bind mount of the group itself must not hide the limits above it (review r1
     // R1-C1). Above the widest, nothing is visible. A mount another one covers isn't a view
-    // (sol-loop r3 S1): its files aren't reachable at its mount point.
+    // (sol-loop r3 S1, r4 S2): its files aren't reachable at its mount point.
     let places: Vec<Option<(u64, u64, String)>> = mounts.lines().map(place).collect();
     let mut best: Option<(usize, String, String)> = None;
     for (index, line) in mounts.lines().enumerate() {
@@ -143,41 +143,45 @@ fn place(line: &str) -> Option<(u64, u64, String)> {
     Some((id, parent, point))
 }
 
-/// Whether the mount at `index` of mountinfo is covered: a mount listed after it (mountinfo
-/// lists mounts in the order they were made) sits at its mount point or at a directory above
-/// it, and the mount isn't inside that later one (its parent chain doesn't reach it). A mount
-/// stacked on the same point, or one over a directory above, hides it whole. A line that
-/// can't be read covers nothing: then a cgroup mount counts, and a wrong choice reads files
-/// that aren't there, which is Unknown, never a limit too high.
+/// Whether the mount at `index` of mountinfo is covered, from the mount tree alone (each
+/// mount's parent and point), never from the order of the lines, which a moved mount
+/// (`MS_MOVE`) doesn't change (sol-loop r4 S2). A mount is covered when
+/// - another is mounted on it at its own point (stacked on it), or
+/// - another on the same parent sits at a directory above its point (mounted over the path to
+///   it: a mount made at that path afterwards would have had the upper one as its parent), or
+/// - its parent is covered and it isn't the mount stacked on that parent.
+///
+/// A line that can't be read covers nothing: then a cgroup mount counts, and a wrong choice
+/// reads files that aren't there, which is Unknown, never a limit too high.
 fn covered(index: usize, places: &[Option<(u64, u64, String)>]) -> bool {
-    let Some((id, _, point)) = &places[index] else {
+    let mounts: Vec<&(u64, u64, String)> = places.iter().flatten().collect();
+    let Some(this) = &places[index] else {
         return false;
     };
-    let parent_of = |of: u64| {
-        places
+    let mut at = this;
+    // Up the parent chain, at most once per mount.
+    for _ in 0..=mounts.len() {
+        let (id, parent, point) = at;
+        let stacked = mounts.iter().any(|(_, on, over)| on == id && over == point);
+        let overmounted = mounts.iter().any(|(other, on, over)| {
+            other != id && on == parent && under(point, over).is_some_and(|rest| !rest.is_empty())
+        });
+        if stacked || overmounted {
+            return true;
+        }
+        // Inside its parent: covered with it, unless it is what's stacked on the parent.
+        let Some(&up) = mounts
             .iter()
-            .flatten()
-            .find(|(id, ..)| *id == of)
-            .map(|p| p.1)
-    };
-    places[index + 1..]
-        .iter()
-        .flatten()
-        .any(|(later, _, above)| {
-            if under(point, above).is_none() {
-                return false;
-            }
-            // Inside the later mount: some ancestor of this one is it.
-            let mut at = *id;
-            for _ in 0..places.len() {
-                match parent_of(at) {
-                    Some(parent) if parent == *later => return false,
-                    Some(parent) if parent != at => at = parent,
-                    _ => break,
-                }
-            }
-            true
-        })
+            .find(|(other, ..)| other == parent && other != id)
+        else {
+            return false;
+        };
+        if up.2 == *point {
+            return false;
+        }
+        at = up;
+    }
+    false
 }
 
 /// A mountinfo field as the path it names: proc(5) writes space, tab, newline and backslash
