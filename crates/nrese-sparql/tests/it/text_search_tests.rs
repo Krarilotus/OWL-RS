@@ -396,31 +396,34 @@ const CYCLE_HANG: std::time::Duration = std::time::Duration::from_secs(2);
 /// finds nothing here, instead of walking the cycle forever.
 #[test]
 fn cyclic_text_query_lists_answer() {
-    let (send, receive) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let engine = engine();
-        for query in [
-            "SELECT ?s WHERE { ?s text:query _:a . _:a rdf:first \"bridge\" ; rdf:rest _:a }",
-            "SELECT ?s WHERE { ?s text:query _:a . \
-             _:a rdf:first rdfs:label ; rdf:rest _:b . _:b rdf:first \"bridge\" ; rdf:rest _:a }",
-            "SELECT ?s WHERE { _:l text:query \"bridge\" . _:l rdf:first ?s ; rdf:rest _:l }",
-        ] {
+    let queries = [
+        "SELECT ?s WHERE { ?s text:query _:a . _:a rdf:first \"bridge\" ; rdf:rest _:a }",
+        "SELECT ?s WHERE { ?s text:query _:a .          _:a rdf:first rdfs:label ; rdf:rest _:b . _:b rdf:first \"bridge\" ; rdf:rest _:a }",
+        "SELECT ?s WHERE { _:l text:query \"bridge\" . _:l rdf:first ?s ; rdf:rest _:l }",
+    ];
+    // Each list on a thread of its own, so that one that hangs doesn't hide the others.
+    let answers: Vec<_> = queries
+        .iter()
+        .map(|query| {
+            let (send, receive) = std::sync::mpsc::channel();
             let query =
                 format!("PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> {query}");
-            if send
-                .send(rows(&engine, &query, &QueryOptions::default()))
-                .is_err()
-            {
-                return;
-            }
-        }
-    });
-    for case in 0..3 {
-        let answer = receive
-            .recv_timeout(CYCLE_HANG)
-            .unwrap_or_else(|e| panic!("cyclic list {case}: no answer ({e})"));
-        assert!(answer.is_empty(), "cyclic list {case}: {answer:?}");
-    }
+            std::thread::spawn(move || {
+                let _ = send.send(rows(&engine(), &query, &QueryOptions::default()));
+            });
+            receive
+        })
+        .collect();
+    let failures: Vec<String> = answers
+        .into_iter()
+        .enumerate()
+        .filter_map(|(case, receive)| match receive.recv_timeout(CYCLE_HANG) {
+            Ok(answer) if answer.is_empty() => None,
+            Ok(answer) => Some(format!("cyclic list {case}: {answer:?}")),
+            Err(e) => Some(format!("cyclic list {case}: no answer ({e})")),
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 /// A search under `GRAPH ?g` matches only literals of the named graphs the query's dataset
