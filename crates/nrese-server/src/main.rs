@@ -52,9 +52,9 @@ fn main() -> Result<()> {
 
 async fn run() -> Result<()> {
     let _ = dotenvy::dotenv();
-    init_tracing();
-
     let cli = CliConfig::from_args(std::env::args_os())?;
+    init_tracing(&cli.command);
+
     if let CliCommand::Convert(convert) = &cli.command {
         let statements = nrese_store::convert_file(&convert.input, &convert.output)
             .with_context(|| format!("converting {}", convert.input.display()))?;
@@ -174,8 +174,13 @@ async fn run() -> Result<()> {
                 // The data stays loaded (for diagnosis and repair); the server will start
                 // in quarantine.
                 anyhow::bail!(
-                    "the loaded data is inconsistent under {}: {} violation(s)",
+                    "the loaded data is inconsistent under {}: {}{} violation(s)",
                     program.name(),
+                    if report.violations_at_least {
+                        "at least "
+                    } else {
+                        ""
+                    },
                     report.violations
                 );
             }
@@ -400,11 +405,19 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
     Ok(())
 }
 
-fn init_tracing() {
+/// Log lines go to standard error, except the server's: a command's standard output is its
+/// result (`query`'s answers, `print-query`'s query, the configuration schema), which a log
+/// line before it would corrupt. The server's stay on standard output, where its operators
+/// read them.
+fn init_tracing(command: &CliCommand) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
+    let logs = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .compact()
-        .init();
+        .compact();
+    if *command == CliCommand::Serve {
+        logs.init();
+    } else {
+        logs.with_writer(std::io::stderr).init();
+    }
 }

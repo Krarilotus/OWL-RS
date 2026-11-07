@@ -40,7 +40,7 @@ owns its tests, and benchmarks never run in a gate.
 
 ## Building and measuring
 
-Rust builds run on the build host ([benches/hosts.toml](benches/hosts.toml)): with
+Rust builds run on a build host (the fleet's: `fleet rules` lists them): with
 `git config nrese.buildHost <ssh alias>`, `scripts/check.sh all` and `scripts/lib/remote.sh check|run`
 send the working tree there and run the command in a worktree of its own (`NRESE_BUILD_HOST=local`
 builds on this machine instead). The push tier runs on the fleet only: `.githooks/pre-push` gates
@@ -59,9 +59,8 @@ once.
 Build through `scripts/cargo-guarded.sh` (a disk budget, a memory cap, at most `NRESE_BUILD_SLOTS`
 builds at once per machine). Validate in batches: quick checks while
 working, the push tier once per batch. Measure counts first; time only to answer a stated
-question, inside `scripts/quiet-slot.sh`, on `release` (`--profile lab` to iterate). A slot
-holds one short measurement, since builds wait for it; long comparison runs go to a machine of
-their own. Every number names the commit its binary was built from and whether the tree was
+question, through `benches/suite/abba.py` ([benches/abba/README.md](benches/abba/README.md):
+A-B-B-A families on one of the fleet's timing hosts, never on this machine). Every number names the commit its binary was built from and whether the tree was
 clean; a binary kept for comparison is rebuilt after its source changes or is reverted.
 
 Keep a separate Cargo target directory for each worktree; share downloaded registry

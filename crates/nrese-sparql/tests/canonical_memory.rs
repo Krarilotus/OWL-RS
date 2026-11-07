@@ -11,8 +11,8 @@ use nrese_engine::{EncodedTriple, Engine, EngineConfig};
 use nrese_exec::{Envelope, heap};
 use nrese_rdf::{GraphName, NamedNode, Quad, Variable};
 use nrese_sparql::{
-    CancellationToken, QueryOptions, QueryResults, Resources, ServiceClient, ServiceResults,
-    Services, evaluate_query,
+    QueryEvaluationError, QueryOptions, QueryResults, Resources, ServiceCall, ServiceClient,
+    ServiceResults, Services, evaluate_query,
 };
 use nrese_sparql_syntax::SparqlParser;
 
@@ -33,8 +33,8 @@ impl ServiceClient for Endpoint {
         &self,
         _endpoint: &str,
         query: &str,
-        _cancellation: Option<&CancellationToken>,
-    ) -> Result<ServiceResults, Box<dyn std::error::Error + Send + Sync>> {
+        _call: ServiceCall<'_>,
+    ) -> Result<ServiceResults, QueryEvaluationError> {
         *self.0.lock().unwrap() += query.matches(" ) (").count() + query.matches("VALUES").count();
         Ok(ServiceResults {
             variables: vec![Variable::new_unchecked("x"), Variable::new_unchecked("y")],

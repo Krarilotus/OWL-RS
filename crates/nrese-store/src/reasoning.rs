@@ -2,19 +2,20 @@
 //! the reasoner's engine verbs (`nrese_reasoner::engine`) the store calls. The store
 //! decides when to reason; how is the reasoner's.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nrese_engine::{ReadModel, TermId, Transaction};
 use nrese_reasoner::delta;
 use nrese_reasoner::eval::GroundProgram;
-use nrese_reasoner::ir::Violation;
+use nrese_reasoner::ir::Violations;
 use nrese_reasoner::lists::ListDiagnostic;
 
 pub use nrese_reasoner::RuleProgram;
 pub use nrese_reasoner::engine::{
     Closure, InferenceStep, JUSTIFICATIONS_AT_MOST, JustificationAnswer, JustificationMode,
     JustifiedStatement, Program, decoded, explain_fact, explain_violation, justify_fact,
-    materialise, materialise_until, materialise_with,
+    materialise, materialise_until, materialise_with, materialise_within,
 };
 
 /// The most diagnostics a report lists; `diagnostics_total` counts them all.
@@ -83,7 +84,12 @@ pub struct MaterialisationReport {
     pub inferred: u64,
     pub inferred_inserted: u64,
     pub inferred_deleted: u64,
+    /// The consistency violations found: 0 exactly when the state is consistent; a lower
+    /// bound where [`Self::violations_at_least`].
     pub violations: usize,
+    /// Their list stopped at its memory budget, so [`Self::violations`] is a lower bound
+    /// (at least 1: the state is inconsistent).
+    pub violations_at_least: bool,
     /// Ontology parts the reasoner couldn't use: after a rematerialisation all of them,
     /// after a commit those the commit introduced. At most [`MAX_REPORTED_DIAGNOSTICS`].
     pub diagnostics: Vec<OntologyDiagnostic>,
@@ -112,15 +118,17 @@ impl MaterialisationReport {
 }
 
 /// [`nrese_reasoner::engine::maintain_with`] on a commit, with its report: the violations the
-/// change introduced, what it did, and the ground program to reuse.
+/// change introduced (charged to `memory`, the request's part), what it did, and the
+/// ground program to reuse.
 pub(crate) fn apply_delta(
     program: &Program,
     ground: Option<&GroundProgram>,
     tx: &mut Transaction<'_>,
     operation: &nrese_reasoner::eval::OperationStop<'_>,
-) -> Result<(Vec<Violation>, MaterialisationReport, Option<GroundProgram>), delta::Interrupted> {
+    memory: &Arc<nrese_exec::Budget>,
+) -> Result<(Violations, MaterialisationReport, Option<GroundProgram>), delta::Interrupted> {
     let started = Instant::now();
-    let done = nrese_reasoner::engine::maintain_with(program, ground, tx, operation)?;
+    let done = nrese_reasoner::engine::maintain_with(program, ground, tx, operation, memory)?;
     let report = MaterialisationReport {
         ruleset: program.program.name(),
         revision: tx.base().revision() + 1,
@@ -128,7 +136,8 @@ pub(crate) fn apply_delta(
         inferred: tx.len_in(ReadModel::Inferred),
         inferred_inserted: done.inserted,
         inferred_deleted: done.removed,
-        violations: done.violations.len(),
+        violations: done.violations.at_least(),
+        violations_at_least: !done.violations.complete(),
         rounds: done.rounds,
         elapsed: started.elapsed(),
         work: done.work,
@@ -214,8 +223,10 @@ mod tests {
                 false
             };
             let operation = nrese_reasoner::eval::OperationStop::new(&poll);
-            let (violations, report, _) = apply_delta(&program, None, &mut tx, &operation).unwrap();
-            assert!(violations.is_empty());
+            let memory = Arc::new(nrese_exec::Budget::unlimited());
+            let (violations, report, _) =
+                apply_delta(&program, None, &mut tx, &operation, &memory).unwrap();
+            assert!(violations.consistent());
             let pending = tx.pending_snapshot();
             let stored: HashSet<EncodedTriple> = pending
                 .stored()

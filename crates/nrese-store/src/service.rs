@@ -175,6 +175,7 @@ impl StoreService {
                         bulk_load_memory: (config.bulk_load_memory_bytes > 0)
                             .then_some(config.bulk_load_memory_bytes),
                         wal_archive: config.wal_archive,
+                        wal_damage: config.wal_damage,
                         ..defaults.durability
                     },
                     ..defaults
@@ -1770,6 +1771,14 @@ impl StoreService {
         MemoryStop((limit > 0).then(|| nrese_exec::memory::MemoryWatch::new(limit)))
     }
 
+    /// A part of the process's budget ([`crate::Runtime::memory`]) of its own, for what
+    /// a store operation outside any request charges (a rematerialisation's consistency
+    /// violations): a refusal marks this part only. Without a process budget it is
+    /// unlimited by setting, bounded only by [`Self::memory_stop`].
+    pub(crate) fn operation_memory(&self) -> std::sync::Arc<nrese_exec::Budget> {
+        std::sync::Arc::new(nrese_exec::Budget::unlimited().within(self.runtime().memory()))
+    }
+
     /// The closure's size with equality replicated and over representatives, for
     /// `program` on the asserted data, or an explicit diagnostic if stopped.
     pub fn equality_report(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> String {
@@ -1827,9 +1836,16 @@ impl StoreService {
                 .unwrap_or(crate::StoreError::MaterialisationCancelled)
         };
         let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
-        let closure =
-            crate::reasoning::materialise_with(&program, rematerialisation.base(), &operation)
-                .map_err(stopped)?;
+        let closure = crate::reasoning::materialise_with(
+            &program,
+            rematerialisation.base(),
+            &operation,
+            &self.operation_memory(),
+        )
+        .map_err(stopped)?;
+        // 0 exactly when consistent; a lower bound where the list stopped at its budget.
+        let violations = closure.violations.at_least();
+        let violations_at_least = !closure.violations.complete();
         let inferred = closure.inferred.len() as u64;
         let base = rematerialisation.base();
         let reported = crate::reasoning::MaterialisationReport::default()
@@ -1858,13 +1874,14 @@ impl StoreService {
             rules,
             self.config.hide_unnamed_classes,
             self.config.equality_compact,
-            closure.violations.len(),
+            violations,
         ))
         .map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
-        if !closure.violations.is_empty() {
+        if violations > 0 {
             tracing::error!(
                 ruleset = %rules.name(),
-                violations = closure.violations.len(),
+                violations,
+                violations_at_least,
                 "the data is inconsistent: the store is in quarantine until it is repaired"
             );
         }
@@ -1875,7 +1892,8 @@ impl StoreService {
             inferred,
             inferred_inserted = summary.inferred_inserted,
             inferred_deleted = summary.inferred_deleted,
-            violations = closure.violations.len(),
+            violations,
+            violations_at_least,
             rounds = closure.rounds,
             ms = started.elapsed().as_millis() as u64,
             "inferred stack rematerialised"
@@ -1887,7 +1905,8 @@ impl StoreService {
             inferred,
             inferred_inserted: summary.inferred_inserted,
             inferred_deleted: summary.inferred_deleted,
-            violations: closure.violations.len(),
+            violations,
+            violations_at_least,
             rounds: closure.rounds,
             elapsed: started.elapsed(),
             phases: closure.phases,

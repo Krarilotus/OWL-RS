@@ -399,8 +399,15 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             self.triple_terms.clear();
             self.handed_out = 0;
             // Where the statement starts (its first token), for an error's statement.
-            let start = self.statement_start();
+            let start = match self.statement_start() {
+                Ok(start) => start,
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+            };
             if let Err(error) = self.statement() {
+                self.abort_statement();
                 let start = self.input.resolve(start);
                 let syntax = matches!(error, RdfParseError::Syntax(_));
                 self.done =
@@ -419,21 +426,24 @@ impl<'a, R: Read> TurtleParser<'a, R> {
 
     /// Where the next statement starts: its first token, or the position where lexing it
     /// fails. Kept as copies of the input's counters; `Input::resolve` makes it a text
-    /// position, for an error only. (The statement reads its first token anyway.)
-    fn statement_start(&mut self) -> Start {
+    /// position, for an error only. (The statement reads its first token anyway, and meets
+    /// a lexing error again; a read error is returned here, since reading again could go
+    /// on past it.)
+    fn statement_start(&mut self) -> Step<Start> {
         let at = match self.fill() {
             Ok(()) => self
                 .lookahead
                 .as_ref()
                 .map_or(self.input.position, |token| token.start),
+            Err(error @ RdfParseError::Io(_)) => return Err(error),
             Err(_) => self.input.position,
         };
-        Start {
+        Ok(Start {
             offset: self.input.base + at as u64,
             from: self.input.base + self.input.position as u64,
             line: self.input.line,
             line_start: self.input.line_start,
-        }
+        })
     }
 
     /// `error` with the statement it is in, from `start` to where parsing resumes, and the
@@ -458,6 +468,14 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             context,
             graph,
         })
+    }
+
+    /// A statement failed: what it queued is not output (its triples are emitted before
+    /// its end is checked), whether parsing then stops or recovers.
+    fn abort_statement(&mut self) {
+        self.triples.clear();
+        self.triple_terms.clear();
+        self.handed_out = 0;
     }
 
     /// After a syntax error: skips to the end of the statement, a `.` outside brackets (or
