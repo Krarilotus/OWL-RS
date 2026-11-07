@@ -30,9 +30,12 @@ pub(crate) struct TreeWitness {
     pub generators: Vec<usize>,
 }
 
-/// Steps a rewriting may take (design §5): each candidate interior, each place a witness
-/// search tries, each set of witnesses. Counted, not timed: the same query over the same
-/// TBox takes the same steps, so the bound is deterministic.
+/// Steps a rewriting may take (design §5): each candidate interior and each of its
+/// members, each place a witness search tries, each set of witnesses, each atom a pass over
+/// the query reads, and each element and edge a walk of the TBox's hierarchy reaches.
+/// Taken before the work they pay for (review A-1206: with none left, nothing of the query
+/// is read). Counted, not timed: the same query over the same TBox takes the same steps,
+/// so the bound is deterministic.
 pub(crate) struct Work(std::cell::Cell<usize>);
 
 impl Work {
@@ -42,11 +45,19 @@ impl Work {
 
     /// Takes a step; `false` once there are none left.
     pub(crate) fn spend(&self) -> bool {
-        match self.0.get() {
-            0 => false,
-            left => {
-                self.0.set(left - 1);
+        self.take(1)
+    }
+
+    /// Takes `steps` steps; `false`, and none left, where there are fewer.
+    pub(crate) fn take(&self, steps: usize) -> bool {
+        match self.0.get().checked_sub(steps) {
+            Some(left) => {
+                self.0.set(left);
                 true
+            }
+            None => {
+                self.0.set(0);
+                false
             }
         }
     }
@@ -69,30 +80,60 @@ pub(crate) fn tree_witnesses(
     candidates: usize,
     work: &Work,
 ) -> Result<Vec<TreeWitness>, &'static str> {
-    let existential: Vec<u32> = (0..cq.vars)
-        .filter(|&v| cq.existential[v as usize] && cq.atoms.iter().any(|a| a.has_var(v)))
-        .collect();
+    // One pass over the atoms, a step each (and each variable of an `Other` atom): the
+    // existential variables of the atoms the rewriting reads, with their atoms. An `Other`
+    // atom's variables are never in an interior (a witness can't have the atom), so they are
+    // no candidates.
+    if !work.take(cq.atoms.len()) {
+        return Err("work");
+    }
+    let mut excluded: HashSet<u32> = HashSet::new();
+    let mut by_var: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (i, atom) in cq.atoms.iter().enumerate() {
+        match atom {
+            Atom::Other(_, vars) => {
+                if !work.take(vars.len()) {
+                    return Err("work");
+                }
+                excluded.extend(vars.iter().copied());
+            }
+            _ => {
+                for v in atom.vars() {
+                    if cq.existential[v as usize] {
+                        let atoms = by_var.entry(v).or_default();
+                        if atoms.last() != Some(&i) {
+                            atoms.push(i);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    by_var.retain(|v, _| !excluded.contains(v));
+    let mut existential: Vec<u32> = by_var.keys().copied().collect();
+    existential.sort_unstable();
     if existential.is_empty() || tbox.generators.is_empty() {
         return Ok(Vec::new());
     }
     // Existential variables are neighbours when an atom has both.
     let mut neighbours: HashMap<u32, BTreeSet<u32>> = HashMap::new();
     for atom in &cq.atoms {
-        let vars: Vec<u32> = atom
-            .vars()
-            .into_iter()
-            .filter(|&v| cq.existential[v as usize])
-            .collect();
-        for &a in &vars {
-            for &b in &vars {
-                if a != b {
-                    neighbours.entry(a).or_default().insert(b);
-                }
-            }
+        if let Atom::Role(QTerm::Var(a), _, QTerm::Var(b)) = *atom
+            && a != b
+            && by_var.contains_key(&a)
+            && by_var.contains_key(&b)
+        {
+            neighbours.entry(a).or_default().insert(b);
+            neighbours.entry(b).or_default().insert(a);
         }
     }
-    let subsets = connected_subsets(&existential, &neighbours, candidates).ok_or("candidates")?;
-    let search = Search { tbox, cq, work };
+    let subsets = connected_subsets(&existential, &neighbours, candidates, work)?;
+    let search = Search {
+        tbox,
+        cq,
+        work,
+        by_var: &by_var,
+    };
     let mut witnesses = Vec::new();
     for interior in subsets {
         if !work.spend() {
@@ -113,13 +154,15 @@ pub(crate) fn tree_witnesses(
     Ok(witnesses)
 }
 
-/// Every connected set of `vars` (ESU: each once, from its least member); `None` past
-/// `limit`.
+/// Every connected set of `vars` (ESU: each once, from its least member); `Err` past
+/// `limit` ("candidates") or once `work` runs out ("work"): each set takes a step per
+/// member, and growing it a step per neighbour and extension entry it reads.
 fn connected_subsets(
     vars: &[u32],
     neighbours: &HashMap<u32, BTreeSet<u32>>,
     limit: usize,
-) -> Option<Vec<Vec<u32>>> {
+    work: &Work,
+) -> Result<Vec<Vec<u32>>, &'static str> {
     let none = BTreeSet::new();
     let of = |v: u32| neighbours.get(&v).unwrap_or(&none);
     let mut out = Vec::new();
@@ -130,39 +173,46 @@ fn connected_subsets(
         of: &dyn Fn(u32) -> &'n BTreeSet<u32>,
         out: &mut Vec<Vec<u32>>,
         limit: usize,
-    ) -> bool {
+        work: &Work,
+    ) -> Result<(), &'static str> {
+        if !work.take(subset.len()) {
+            return Err("work");
+        }
         out.push(subset.clone());
         if out.len() > limit {
-            return false;
+            return Err("candidates");
         }
+        let members: HashSet<u32> = subset.iter().copied().collect();
         let mut extension = extension;
         while let Some(w) = extension.pop() {
+            let read =
+                subset.iter().map(|&s| of(s).len()).sum::<usize>() + of(w).len() + extension.len();
+            if !work.take(read) {
+                return Err("work");
+            }
             let near: HashSet<u32> = subset.iter().flat_map(|&s| of(s).iter().copied()).collect();
             let mut next = extension.clone();
+            let mut listed: HashSet<u32> = next.iter().copied().collect();
             for &u in of(w) {
-                if u > start && !subset.contains(&u) && !near.contains(&u) && !next.contains(&u) {
+                if u > start && !members.contains(&u) && !near.contains(&u) && listed.insert(u) {
                     next.push(u);
                 }
             }
             subset.push(w);
-            let ok = extend(subset, next, start, of, out, limit);
+            let grown = extend(subset, next, start, of, out, limit, work);
             subset.pop();
-            if !ok {
-                return false;
-            }
+            grown?;
         }
-        true
+        Ok(())
     }
     for &v in vars {
         let extension: Vec<u32> = of(v).iter().copied().filter(|&u| u > v).collect();
-        if !extend(&mut vec![v], extension, v, &of, &mut out, limit) {
-            return None;
-        }
+        extend(&mut vec![v], extension, v, &of, &mut out, limit, work)?;
     }
     for subset in &mut out {
         subset.sort_unstable();
     }
-    Some(out)
+    Ok(out)
 }
 
 /// An anonymous element: the types along the path from the individual.
@@ -172,27 +222,38 @@ struct Search<'a> {
     tbox: &'a Tbox,
     cq: &'a Cq,
     work: &'a Work,
+    /// The atoms of each candidate variable.
+    by_var: &'a HashMap<u32, Vec<usize>>,
 }
 
 impl Search<'_> {
-    /// The tree witness with interior `interior`, if some tree takes it.
+    /// The tree witness with interior `interior`, if some tree takes it (`None` too where
+    /// the work ran out: the caller reads that).
     fn witness(&self, interior: Vec<u32>) -> Option<TreeWitness> {
         let inside = |t: &QTerm| matches!(t, QTerm::Var(v) if interior.contains(v));
-        let atoms: Vec<usize> = (0..self.cq.atoms.len())
-            .filter(|&i| self.cq.atoms[i].terms().iter().any(inside))
+        let mut atoms: Vec<usize> = interior
+            .iter()
+            .flat_map(|v| self.by_var.get(v).into_iter().flatten().copied())
             .collect();
+        if !self.work.take(atoms.len() * interior.len()) {
+            return None;
+        }
+        atoms.sort_unstable();
+        atoms.dedup();
         let mut roots: Vec<QTerm> = Vec::new();
+        let mut root_set: HashSet<QTerm> = HashSet::new();
         for &i in &atoms {
             let atom = &self.cq.atoms[i];
             if matches!(atom, Atom::Other(..)) {
                 return None;
             }
             for term in atom.terms() {
-                if !inside(&term) && !roots.contains(&term) {
+                if !inside(&term) && root_set.insert(term) {
                     roots.push(term);
                 }
             }
         }
+        let root_of = |t: &QTerm| root_set.contains(t);
         let constants = roots
             .iter()
             .filter(|t| matches!(t, QTerm::Const(_)))
@@ -200,13 +261,26 @@ impl Search<'_> {
         if constants > 1 {
             return None;
         }
+        // The atoms between interior variables: what places the next one.
+        let links: Vec<usize> = atoms
+            .iter()
+            .copied()
+            .filter(|&i| {
+                matches!(self.cq.atoms[i], Atom::Role(QTerm::Var(a), _, QTerm::Var(b))
+                    if interior.contains(&a) && interior.contains(&b))
+            })
+            .collect();
         let tbox = self.tbox;
+        // Each scan of types stops once the work runs out (`maps` then fails at once, which
+        // isn't a mismatch).
         let types: Vec<usize> = if roots.is_empty() {
             (0..tbox.types.len())
+                .take_while(|_| !self.work.exhausted())
                 .filter(|&ty| {
                     interior
                         .iter()
-                        .any(|&top| self.maps(&interior, &atoms, &roots, top, ty))
+                        .take_while(|_| !self.work.exhausted())
+                        .any(|&top| self.maps(&interior, &links, &root_set, top, ty))
                 })
                 .collect()
         } else {
@@ -215,14 +289,10 @@ impl Search<'_> {
             let (first, role) = atoms
                 .iter()
                 .find_map(|&i| match self.cq.atoms[i] {
-                    Atom::Role(s, p, QTerm::Var(o))
-                        if roots.contains(&s) && interior.contains(&o) =>
-                    {
+                    Atom::Role(s, p, QTerm::Var(o)) if root_of(&s) && interior.contains(&o) => {
                         Some((o, ObjProp::Named(p)))
                     }
-                    Atom::Role(QTerm::Var(s), p, o)
-                        if roots.contains(&o) && interior.contains(&s) =>
-                    {
+                    Atom::Role(QTerm::Var(s), p, o) if root_of(&o) && interior.contains(&s) => {
                         Some((s, ObjProp::Inverse(p)))
                     }
                     _ => None,
@@ -233,16 +303,21 @@ impl Search<'_> {
                 .into_iter()
                 .flatten()
                 .copied()
-                .filter(|&ty| self.maps(&interior, &atoms, &roots, first, ty))
+                .take_while(|_| !self.work.exhausted())
+                .filter(|&ty| self.maps(&interior, &links, &root_set, first, ty))
                 .collect()
         };
-        if types.is_empty() {
+        if types.is_empty() || self.work.exhausted() {
             return None;
         }
-        // Without roots, the trees that reach one of these types take it too.
+        // Without roots, the trees that reach one of these types take it too (a step per
+        // type read, each round).
         let types: HashSet<usize> = if roots.is_empty() {
             let mut reached: HashSet<usize> = types.iter().copied().collect();
             loop {
+                if !self.work.take(tbox.types.len()) {
+                    return None;
+                }
                 let more: Vec<usize> = (0..tbox.types.len())
                     .filter(|ty| !reached.contains(ty))
                     .filter(|&ty| tbox.types[ty].children.iter().any(|c| reached.contains(c)))
@@ -255,6 +330,9 @@ impl Search<'_> {
         } else {
             types.into_iter().collect()
         };
+        if !self.work.take(tbox.generators.len()) {
+            return None;
+        }
         let generators = (0..tbox.generators.len())
             .filter(|&g| types.contains(&tbox.generators[g].ty))
             .collect();
@@ -267,12 +345,13 @@ impl Search<'_> {
     }
 
     /// Whether the atoms map into a tree with `start` on an element of type `ty` (a child
-    /// of the individual the roots map to; without roots, the top of the image).
+    /// of the individual the roots map to; without roots, the top of the image). `links`:
+    /// the atoms between interior variables.
     fn maps(
         &self,
         interior: &[u32],
-        atoms: &[usize],
-        roots: &[QTerm],
+        links: &[usize],
+        roots: &HashSet<QTerm>,
         start: u32,
         ty: usize,
     ) -> bool {
@@ -281,17 +360,17 @@ impl Search<'_> {
         }
         let mut assigned: HashMap<u32, Path> = HashMap::new();
         assigned.insert(start, vec![ty]);
-        if !self.consistent(start, &assigned, atoms, roots) {
+        if !self.consistent(start, &assigned, roots) {
             return false;
         }
-        self.extend(interior, atoms, roots, &mut assigned)
+        self.extend(interior, links, roots, &mut assigned)
     }
 
     fn extend(
         &self,
         interior: &[u32],
-        atoms: &[usize],
-        roots: &[QTerm],
+        links: &[usize],
+        roots: &HashSet<QTerm>,
         assigned: &mut HashMap<u32, Path>,
     ) -> bool {
         if assigned.len() == interior.len() {
@@ -300,7 +379,7 @@ impl Search<'_> {
         // The next variable: one an atom links to an assigned one (the interior is
         // connected).
         let tbox = self.tbox;
-        for &i in atoms {
+        for &i in links {
             let Atom::Role(s, p, o) = &self.cq.atoms[i] else {
                 continue;
             };
@@ -329,6 +408,10 @@ impl Search<'_> {
             };
             let here = assigned[&from].clone();
             let last = *here.last().expect("paths start at a type");
+            // A step per child type read, before reading them.
+            if !self.work.take(tbox.types[last].children.len()) {
+                return false;
+            }
             let mut candidates: Vec<Path> = Vec::new();
             // The parent: the edge from it to `here` is `here`'s role; p(here, parent)
             // holds when that role is included in `back`.
@@ -350,8 +433,8 @@ impl Search<'_> {
                     return false;
                 }
                 assigned.insert(to, path);
-                if self.consistent(to, assigned, atoms, roots)
-                    && self.extend(interior, atoms, roots, assigned)
+                if self.consistent(to, assigned, roots)
+                    && self.extend(interior, links, roots, assigned)
                 {
                     return true;
                 }
@@ -363,14 +446,12 @@ impl Search<'_> {
         false
     }
 
-    /// Whether the atoms with `var` whose terms are all placed hold.
-    fn consistent(
-        &self,
-        var: u32,
-        assigned: &HashMap<u32, Path>,
-        atoms: &[usize],
-        roots: &[QTerm],
-    ) -> bool {
+    /// Whether the atoms with `var` whose terms are all placed hold (a step per atom read).
+    fn consistent(&self, var: u32, assigned: &HashMap<u32, Path>, roots: &HashSet<QTerm>) -> bool {
+        let atoms = self.by_var.get(&var).map_or(&[][..], Vec::as_slice);
+        if !self.work.take(atoms.len()) {
+            return false;
+        }
         let tbox = self.tbox;
         // Where a term is: an anonymous element, or the individual (`None`).
         let place = |t: &QTerm| -> Option<Option<&Path>> {
@@ -384,9 +465,6 @@ impl Search<'_> {
         };
         for &i in atoms {
             let atom = &self.cq.atoms[i];
-            if !atom.has_var(var) {
-                continue;
-            }
             let ok = match atom {
                 Atom::Class(t, class) => match place(t) {
                     Some(Some(path)) => tbox.type_has_class(*path.last().unwrap(), *class),
