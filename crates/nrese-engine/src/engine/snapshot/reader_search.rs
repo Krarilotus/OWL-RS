@@ -141,7 +141,7 @@ impl Snapshot {
         let request = request_budget(budget);
         let corpus = self.text_corpus(Documents::Literals, model, scope, &request)?;
         let known = self.version.dictionary_len;
-        let mut matches = self.dictionary.text_search_in(query, &corpus);
+        let mut matches = self.dictionary.text_search_in(query, Some(&corpus));
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
         Ok(matches)
     }
@@ -163,7 +163,7 @@ impl Snapshot {
         let request = request_budget(budget);
         let corpus = self.text_corpus(Documents::Subjects, model, scope, &request)?;
         let known = self.version.dictionary_len;
-        let mut found = self.dictionary.iri_search_in(query, &corpus);
+        let mut found = self.dictionary.iri_search_in(query, Some(&corpus));
         found.retain(|m| TermId::from_raw(m.id).payload() < known);
         if let Some((classes, true)) = self.corpus_classes(Documents::Subjects, model) {
             // Best first: the first of each class is its best identity's.

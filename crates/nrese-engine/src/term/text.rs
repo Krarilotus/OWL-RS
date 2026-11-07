@@ -223,6 +223,37 @@ impl Postings {
     }
 }
 
+/// What a search ranks among ([`TextIndex::search_over`]): its documents' number and words,
+/// and a word's postings restricted to its documents. Every indexed document ([`Whole`]),
+/// or a reader's corpus ([`Corpus`]); the search body is one, monomorphised per scope, so
+/// the whole index's search does the work it did before scopes existed.
+pub(crate) trait Scope {
+    fn documents(&self) -> u64;
+    fn total_words(&self) -> u64;
+    /// `list`, a word's postings in the index, restricted to this scope's documents.
+    fn postings<'l>(&self, list: Cow<'l, [(u64, u16)]>) -> Cow<'l, [(u64, u16)]>;
+}
+
+/// Every document of an index: its own statistics, its postings as they are.
+pub(crate) struct Whole<'a>(pub(crate) &'a TextIndex);
+
+impl Scope for Whole<'_> {
+    #[inline]
+    fn documents(&self) -> u64 {
+        self.0.documents
+    }
+
+    #[inline]
+    fn total_words(&self) -> u64 {
+        self.0.total_words
+    }
+
+    #[inline(always)]
+    fn postings<'l>(&self, list: Cow<'l, [(u64, u16)]>) -> Cow<'l, [(u64, u16)]> {
+        list
+    }
+}
+
 /// The index. Documents are numbered by the caller (the dictionary's entry numbers), in
 /// ascending order as they are added.
 #[derive(Debug)]
@@ -541,17 +572,30 @@ impl TextIndex {
     }
 
     /// The literals matching `query`, best first (ties by id); `text_of` gives a literal's
-    /// text, to check phrases.
+    /// text, to check phrases. Ranked among every indexed document ([`Whole`]).
     pub(crate) fn search(
         &self,
         query: &TextQuery,
         text_of: &dyn Fn(u64) -> Option<String>,
     ) -> Vec<TextMatch> {
-        let documents = self.documents as f64;
+        self.search_over(query, text_of, &Whole(self))
+    }
+
+    /// The documents of `scope` matching `query`, best first (ties by id), scored by BM25
+    /// with `scope`'s statistics alone: its document count and mean length, each word's
+    /// frequency among its documents, the best match among them ([`Scope`]: every indexed
+    /// document, or a reader's corpus). `text_of` gives a document's text, to check phrases.
+    pub(crate) fn search_over<S: Scope>(
+        &self,
+        query: &TextQuery,
+        text_of: &dyn Fn(u64) -> Option<String>,
+        scope: &S,
+    ) -> Vec<TextMatch> {
+        let documents = scope.documents() as f64;
         if documents == 0.0 {
             return Vec::new();
         }
-        let average = self.total_words as f64 / documents;
+        let average = scope.total_words() as f64 / documents;
         let (k1, b) = (1.2, 0.75);
         // Stemming, where the language has a stemmer and its stems are prepared.
         let stemming = query
@@ -618,7 +662,7 @@ impl TextIndex {
         for phrase in &phrases {
             let lists: Vec<Cow<'_, [(u64, u16)]>> = phrase
                 .iter()
-                .map(|word| self.postings_of(word, Match::Exact, stems))
+                .map(|word| scope.postings(self.postings_of(word, Match::Exact, stems)))
                 .collect();
             if lists.iter().any(|list| list.is_empty()) {
                 continue;
@@ -651,7 +695,7 @@ impl TextIndex {
             }
         }
         for (word, matching) in &terms {
-            let found = self.postings_of(word, *matching, stems);
+            let found = scope.postings(self.postings_of(word, *matching, stems));
             let frequency = found.len() as f64;
             let idf = (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln();
             for &(id, count) in found.iter() {
