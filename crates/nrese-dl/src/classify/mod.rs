@@ -251,7 +251,10 @@ pub fn classify(ontology: &Ontology, options: &Options) -> Taxonomy {
     let (normalised, inlined) = clauses(&ontology, options);
     let normalise = t.elapsed();
     trace("context core");
-    if options.context_core {
+    // With parts left out (an axiom the normaliser or the reader dropped), the context
+    // core's taxonomy says nothing of the whole: the driver reports it, after a Horn
+    // inconsistency, which stands.
+    if options.context_core && tableau::left_out(&ontology, &normalised).is_empty() {
         let core = options.core(deadline.budget(options, None));
         let t = Instant::now();
         if let Ok(saturated) = crate::context::saturate_normalised(
