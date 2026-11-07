@@ -1482,7 +1482,10 @@ def loaded_digest(key: str) -> str | None:
     if cache not in _DIGESTS:
         was = _DIGESTS["prepared"].get(path.as_posix(), {})
         same = (was.get("bytes"), was.get("mtime_ns")) == (stat.st_size, stat.st_mtime_ns)
-        _DIGESTS[cache] = was["sha256"] if same and was.get("sha256") else file_digest(path)
+        try:
+            _DIGESTS[cache] = was["sha256"] if same and was.get("sha256") else file_digest(path)
+        except OSError:
+            return None  # there but unreadable: unknown, and the run goes on (sol-loop r5 X2)
     return _DIGESTS[cache]
 
 

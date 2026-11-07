@@ -210,6 +210,23 @@ class LoadedInputs(unittest.TestCase):
             same = self.suite_run(d / "same", 50, {}, {"/data/lubm-10.nt": "o" * 64})
             self.assertIn("faster", output(compare.main, [str(old), str(same)]))
 
+    def test_invocations_agreeing_on_a_hash_hold_whatever_size_each_lists(self):
+        """Sol-loop r5 X1: two invocations hashing a file alike, one listing its size and one not, were
+        taken as disagreeing, and a same-bytes comparison was refused."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            runs = []
+            for name, ms in (("old", 100), ("new", 50)):
+                path = self.suite_run(d / name, ms)
+                invocation = {"machine": {"host": "fixture", "governor": "performance"}, "started": "2026-11-07T16:00:00",
+                              "dataset_sha256": {"/data/lubm-10.nt": "s" * 64}}
+                (d / name / "manifest.json").write_text(json.dumps({"schema": 1, "invocations": [
+                    {**invocation, "datasets": {}}, {**invocation, "datasets": {"/data/lubm-10.nt": 224996086}}]}),
+                    encoding="utf-8")
+                runs.append(path)
+            self.assertEqual(compare.main([str(runs[0]), str(runs[1])]), 0)
+            self.assertIn("faster", output(compare.main, [str(runs[0]), str(runs[1])]))
+
     def test_a_case_s_declared_input_missing_from_a_record_is_unknown(self):
         """The orchestrator, 7 Nov 2026 (18:12): a declared input a record doesn't hash, or a hash for
         an input the case doesn't declare, is unknown, never none."""

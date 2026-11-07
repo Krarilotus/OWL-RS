@@ -579,12 +579,17 @@ def suite_inputs(paths: list[Path]) -> tuple[dict | None, dict]:
             # outside its declared plan, commit-latency's LUBM, was dropped with the size map's keys).
             for f in sorted(set(listed) | set(digests)):
                 sha, size = digests.get(f), listed.get(f)
-                if f in hashes and (hashes[f] != sha or sizes.get(f) != size):
+                if f not in hashes:
+                    hashes[f], sizes[f] = sha, size
+                    continue
+                # Disagreement: hashes that differ (or one missing), or two known sizes that differ; a
+                # size one invocation lists and another doesn't is no disagreement (sol-loop r5 X1).
+                if hashes[f] != sha or (size is not None and sizes.get(f) not in (None, size)):
                     hashes[f] = None
-                    sizes[f] = sizes.get(f) if sizes.get(f) == size else None
-                else:
-                    hashes.setdefault(f, sha)
-                    sizes.setdefault(f, size)
+                if sizes.get(f) is None:
+                    sizes[f] = size
+                elif size is not None and sizes[f] != size:
+                    sizes[f] = None
     return hashes, sizes
 
 

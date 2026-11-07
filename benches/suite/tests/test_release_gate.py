@@ -535,6 +535,10 @@ class Rounds(unittest.TestCase):
                     patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
                 self.assertEqual(fast.case_inputs({"name": "o", "data": "ore:ore_ont_9724"}),
                                  {"ore:ore_ont_9724": hashlib.sha256(b"<o> <p> <q> .\n").hexdigest()})
+                # Sol-loop r5 X2: a file there but unreadable is unknown, and the run goes on.
+                with patch.object(fast, "file_digest", side_effect=PermissionError("denied")), \
+                        patch.dict(fast._DIGESTS, clear=True):
+                    self.assertEqual(fast.case_inputs({"name": "o", "data": "ore:ore_ont_9724"}), {"ore:ore_ont_9724": None})
                 # A kind of input nothing here resolves is an external file of unknown bytes: never none.
                 self.assertEqual(fast.case_inputs({"name": "n", "data": "url:https://example.org/x.nt"}),
                                  {"url:https://example.org/x.nt": None})
