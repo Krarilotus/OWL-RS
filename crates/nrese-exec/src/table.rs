@@ -11,14 +11,35 @@ use rayon::prelude::*;
 /// Row count from which sorting runs in parallel.
 const PARALLEL_SORT_ROWS: usize = 1 << 16;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// What a row of a table without columns counts for memory budgets: one id, the column an
+/// operator after it may make for it (an unbound variable's UNDEF, a BIND), as a join's row
+/// limit counts it. The table itself holds only its row count, so without this a query
+/// could make rows past its budget that hold nothing, and the next operator a column of
+/// them, before anything is charged.
+const ROW_WITHOUT_COLUMNS_BYTES: usize = size_of::<u64>();
+
+#[derive(Debug, Clone, Default)]
 pub struct IdTable {
     columns: Vec<Vec<u64>>,
     len: usize,
+    /// Without columns, the rows the table counts room for, as a column counts its
+    /// capacity ([`Self::memory_bytes`]): what was reserved, and the most it held; it
+    /// doesn't drop as rows go.
+    rows_held: usize,
     /// The table is sorted lexicographically on these columns (in this order). Empty if
     /// nothing is known.
     sorted_by: Vec<usize>,
 }
+
+/// Tables are equal by their rows and sort order; what they count for budgets doesn't
+/// matter.
+impl PartialEq for IdTable {
+    fn eq(&self, other: &Self) -> bool {
+        self.columns == other.columns && self.len == other.len && self.sorted_by == other.sorted_by
+    }
+}
+
+impl Eq for IdTable {}
 
 impl IdTable {
     /// An empty table with `width` columns.
@@ -30,6 +51,7 @@ impl IdTable {
         Self {
             columns: (0..width).map(|_| Vec::with_capacity(rows)).collect(),
             len: 0,
+            rows_held: rows,
             sorted_by: Vec::new(),
         }
     }
@@ -47,6 +69,7 @@ impl IdTable {
         Self {
             columns,
             len,
+            rows_held: 0,
             sorted_by: Vec::new(),
         }
     }
@@ -115,19 +138,30 @@ impl IdTable {
         self.columns.push(column);
     }
 
-    /// The rows that fit before the table reallocates.
+    /// The rows that fit before the table reallocates; without columns, before it counts
+    /// more ([`Self::memory_bytes`]).
     pub fn spare_rows(&self) -> usize {
         self.columns
             .iter()
             .map(|c| c.capacity() - c.len())
             .min()
-            .unwrap_or(usize::MAX)
+            .unwrap_or(self.rows_held.saturating_sub(self.len))
     }
 
-    /// Room for `rows` more rows, allocated exactly.
+    /// Room for `rows` more rows, allocated exactly; without columns, counted.
     pub fn reserve_exact(&mut self, rows: usize) {
         for column in &mut self.columns {
             column.reserve_exact(rows);
+        }
+        self.rows_held = self.rows_held.max(self.len.saturating_add(rows));
+    }
+
+    /// What a row of this table counts for memory budgets ([`Self::memory_bytes`]): an id
+    /// a column, and one for a table without columns.
+    pub fn row_bytes(&self) -> usize {
+        match self.width() {
+            0 => ROW_WITHOUT_COLUMNS_BYTES,
+            width => width * size_of::<u64>(),
         }
     }
 
@@ -190,9 +224,22 @@ impl IdTable {
         short.saturating_mul(rows).saturating_mul(8)
     }
 
-    /// Bytes held by the column buffers (by capacity), for memory budgets.
+    /// Bytes held by the column buffers (by capacity), for memory budgets. A table without
+    /// columns counts one id a row ([`ROW_WITHOUT_COLUMNS_BYTES`]) of the rows it has room
+    /// for: what was reserved, and the most it held, which doesn't drop as rows go.
     pub fn memory_bytes(&self) -> usize {
+        if self.columns.is_empty() {
+            return self
+                .len
+                .max(self.rows_held)
+                .saturating_mul(ROW_WITHOUT_COLUMNS_BYTES);
+        }
         self.columns.iter().map(|c| c.capacity() * 8).sum()
+    }
+
+    /// Before rows are removed: a table without columns keeps counting them.
+    fn hold_rows(&mut self) {
+        self.rows_held = self.rows_held.max(self.len);
     }
 
     /// The columns the table is known to be sorted on, most significant first.
@@ -312,6 +359,7 @@ impl IdTable {
 
     pub fn retain_mask(&mut self, mask: &[bool]) {
         assert_eq!(mask.len(), self.len, "mask length");
+        self.hold_rows();
         let filter = |column: &mut Vec<u64>| {
             let mut keep = mask.iter();
             column.retain(|_| *keep.next().unwrap());
@@ -411,6 +459,7 @@ impl IdTable {
         IdTable {
             columns: projected,
             len: self.len,
+            rows_held: 0,
             sorted_by,
         }
     }
@@ -419,6 +468,7 @@ impl IdTable {
     pub fn slice(&mut self, offset: usize, limit: Option<usize>) {
         let start = offset.min(self.len);
         let end = limit.map_or(self.len, |l| start.saturating_add(l).min(self.len));
+        self.hold_rows();
         for column in &mut self.columns {
             column.truncate(end);
             column.drain(..start);
@@ -533,6 +583,46 @@ mod tests {
             }
             assert!(projected.check_sorted(projected.sorted_by()));
         }
+    }
+
+    /// Spec (SW1, `notes/2026-11-01-late-budget-r2.md`): rows without columns count against
+    /// the budget where they are made, one id each (the column an operator after them may
+    /// make: an unbound variable's UNDEF), so `memory_bytes` reports `rows * 8` for a table
+    /// with no columns, as for one column. What a table reports doesn't drop while it lives,
+    /// as a column's capacity doesn't when rows go: the charge taken for it is the charge
+    /// released.
+    #[test]
+    fn rows_without_columns_count_one_id_each() {
+        let rows = |n: usize| IdTable::from_rows(0, std::iter::repeat_n(&[][..], n));
+        let wide = |n: usize, width: usize| {
+            IdTable::from_columns((0..width).map(|_| vec![7; n]).collect())
+        };
+        assert_eq!(rows(0).memory_bytes(), 0);
+        assert_eq!(rows(1_000).memory_bytes(), 8_000);
+        assert_eq!(rows(1_000).memory_bytes(), wide(1_000, 1).memory_bytes());
+        let mut grown = rows(10);
+        grown.append(&rows(990));
+        assert_eq!(grown.memory_bytes(), 8_000);
+        assert_eq!(
+            IdTable::concat(0, vec![rows(400), rows(600)]).memory_bytes(),
+            8_000
+        );
+        assert_eq!(wide(1_000, 2).project(&[]).memory_bytes(), 8_000);
+        // Room reserved counts as a column's capacity does, and is what fits before more
+        // is counted.
+        let mut room = IdTable::with_capacity(0, 100);
+        assert_eq!((room.memory_bytes(), room.spare_rows()), (800, 100));
+        room.reserve_exact(400);
+        assert_eq!((room.memory_bytes(), room.spare_rows()), (3_200, 400));
+        room.append(&rows(450));
+        assert_eq!((room.memory_bytes(), room.spare_rows()), (3_600, 0));
+        let mut cut = rows(1_000);
+        cut.retain_mask(&[true, false].repeat(500));
+        assert_eq!(cut.len(), 500);
+        assert_eq!(cut.memory_bytes(), 8_000);
+        cut.slice(100, Some(10));
+        assert_eq!(cut.len(), 10);
+        assert_eq!(cut.memory_bytes(), 8_000);
     }
 
     #[test]

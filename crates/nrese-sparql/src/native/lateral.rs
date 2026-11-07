@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use nrese_exec::{IdTable, UNDEF};
+use nrese_exec::UNDEF;
 use nrese_rdf::{Term, Variable};
 use nrese_sparql_syntax::algebra::GraphPattern;
 
@@ -68,28 +68,36 @@ impl Context<'_> {
             }
             let substituted = super::substitute::Values { terms: &terms }.pattern(right);
             let graph = key.last().copied().filter(|&id| id != UNDEF);
-            let mut found = match graph {
+            let found = match graph {
                 Some(id) => self.in_graph(
                     GraphScope::Named(nrese_engine::TermId::from_raw(id)),
                     &substituted,
                 )?,
                 None => self.eval(&substituted)?,
             };
-            // The values put in, as columns: what joins the results to their rows.
+            // The values put in, as columns: what joins the results to their rows. A column
+            // per value the results lack, however many the query puts in, charged before
+            // they are made.
             let rows = found.table.len();
             let mut added: Vec<(Variable, u64)> = put_in;
             if let (Some(id), GraphScope::Variable(g)) = (graph, &*self.graph.borrow()) {
                 added.push((g.clone(), id));
             }
+            let mut lacking: Vec<(Variable, u64)> = Vec::with_capacity(added.len());
             for (variable, id) in added {
-                if found.column(&variable).is_some() {
-                    continue;
+                if found.column(&variable).is_none() && lacking.iter().all(|(v, _)| *v != variable)
+                {
+                    lacking.push((variable, id));
                 }
-                let mut columns = std::mem::take(&mut found.table).into_columns();
-                columns.push(vec![id; rows]);
-                found.table = IdTable::from_columns(columns);
-                found.vars.push(variable);
             }
+            let growth = rows.saturating_mul(8).saturating_mul(lacking.len());
+            let found = self.reshaped(found, growth, |mut found| {
+                for (variable, id) in lacking {
+                    found.table.push_column(vec![id; rows]);
+                    found.vars.push(variable);
+                }
+                found
+            })?;
             results = Some(match results {
                 None => found,
                 Some(results) => self.union(results, found)?,

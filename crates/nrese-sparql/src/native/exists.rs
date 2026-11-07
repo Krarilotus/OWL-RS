@@ -355,8 +355,10 @@ impl Context<'_> {
         Variable::new_unchecked(format!("{what} {n}"))
     }
 
-    /// `solutions` with a boolean column for each `EXISTS` in `expression`, and the
-    /// expression reading those columns instead; the columns are the last `count`.
+    /// `solutions` (charged) with a boolean column for each `EXISTS` in `expression`, and
+    /// the expression reading those columns instead; the columns are the last `count`,
+    /// each charged before it is made, however many the expression holds
+    /// ([`Self::drop_added`] releases them).
     pub(super) fn with_exists(
         &self,
         mut solutions: Solutions,
@@ -364,14 +366,17 @@ impl Context<'_> {
     ) -> NativeResult<(Solutions, Expression, usize)> {
         let mut patterns = Vec::new();
         let plain = split(expression, &mut patterns, &mut |_| self.synthetic("exists"));
-        let yes = self.id(&Term::from(Literal::from(true)));
-        let no = self.id(&Term::from(Literal::from(false)));
+        let yes = self.id(&Term::from(Literal::from(true)))?;
+        let no = self.id(&Term::from(Literal::from(false)))?;
         for (variable, pattern) in &patterns {
             let mask = self.exists_mask(&solutions, pattern)?;
-            let mut columns = std::mem::take(&mut solutions.table).into_columns();
-            columns.push(mask.iter().map(|&m| if m { yes } else { no }).collect());
-            solutions.table = IdTable::from_columns(columns);
-            solutions.vars.push(variable.clone());
+            let growth = mask.len().saturating_mul(8);
+            solutions = self.reshaped(solutions, growth, |mut solutions| {
+                let column = mask.iter().map(|&m| if m { yes } else { no }).collect();
+                solutions.table.push_column(column);
+                solutions.vars.push(variable.clone());
+                solutions
+            })?;
         }
         Ok((solutions, plain, patterns.len()))
     }
@@ -631,11 +636,13 @@ impl Context<'_> {
         let ordered = left.ordered;
         let rows = left.table.len();
         let row_variable = self.synthetic("left row");
-        let mut numbered = left;
-        let mut columns = std::mem::take(&mut numbered.table).into_columns();
-        columns.push((0..rows as u64).collect());
-        numbered.table = IdTable::from_columns(columns);
-        numbered.vars.push(row_variable.clone());
+        // The row numbers' column, charged before it is made: `numbered` is consumed as
+        // the charged table it is.
+        let numbered = self.reshaped(left, rows.saturating_mul(8), |mut numbered| {
+            numbered.table.push_column((0..rows as u64).collect());
+            numbered.vars.push(row_variable.clone());
+            numbered
+        })?;
         let (lk, rk) = shared_columns(&numbered, &right);
         let vars = super::joined_vars(&numbered, &right, &rk);
         let max_rows = self.row_limit(vars.len());

@@ -242,7 +242,7 @@ impl Context<'_> {
                 &search,
                 found.into_iter().map(|(id, d, ())| (id, d)),
                 near_id,
-            );
+            )?;
         }
         self.produced(rows.into_solutions())
     }
@@ -309,7 +309,7 @@ impl Context<'_> {
             &search,
             found.iter().map(|(id, d, _)| (*id, *d)),
             None,
-        );
+        )?;
         // Union consumes its inputs, also when it fails; the winners not yet handed to it
         // are released as they drop.
         let mut probed = None;
@@ -465,21 +465,22 @@ impl Rows {
         search: &Search,
         found: impl IntoIterator<Item = (TermId, f32)>,
         near_id: Option<u64>,
-    ) {
+    ) -> NativeResult<()> {
         for (rank, (id, distance)) in found.into_iter().enumerate() {
             let mut row = vec![id.raw()];
             if search.score.is_some() {
                 let score = f64::from(search.metric.score(distance));
-                row.push(context.id(&Term::from(Literal::from(score))));
+                row.push(context.id(&Term::from(Literal::from(score)))?);
             }
             if search.rank.is_some() {
-                row.push(context.id(&Term::from(Literal::from(rank as i64 + 1))));
+                row.push(context.id(&Term::from(Literal::from(rank as i64 + 1)))?);
             }
             if self.near_column {
                 row.push(near_id.unwrap_or(UNDEF));
             }
             self.table.push_row(&row);
         }
+        Ok(())
     }
 
     fn into_solutions(self) -> Solutions {
@@ -836,9 +837,11 @@ mod tests {
         // its own.
         let unrelated = 128 + super::super::own_bytes(&snapshot);
         const UNRELATED: usize = 128;
+        // The six winners hold 64 rows of two ids each (6 KiB); a union of i of them makes
+        // its i * 1 KiB table while they are held: the third fits, the fourth doesn't.
         let options = QueryOptions {
             resources: crate::Resources {
-                memory: nrese_exec::Envelope::new(Some(unrelated + 8192 - 1), None),
+                memory: nrese_exec::Envelope::new(Some(unrelated + 6144 + 4096 - 1), None),
                 ..Default::default()
             },
             ..Default::default()
@@ -853,7 +856,7 @@ mod tests {
             Err(QueryEvaluationError::MemoryLimit(error)) => error,
             _ => panic!("fourth winner's union must exceed the remaining budget"),
         };
-        assert_eq!((error.used, error.requested), (unrelated + 2048, 6144));
+        assert_eq!((error.used, error.requested), (unrelated + 6144, 4096));
         assert_eq!(
             ctx.budget.used(),
             unrelated,

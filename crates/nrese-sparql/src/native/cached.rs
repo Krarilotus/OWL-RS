@@ -277,7 +277,10 @@ impl Context<'_> {
         let table = match part.computed.is_empty() {
             true => part.table.clone(),
             false => {
-                let ids: Vec<u64> = part.computed.iter().map(|term| self.id(term)).collect();
+                let mut ids = Vec::with_capacity(part.computed.len());
+                for term in &part.computed {
+                    ids.push(self.id(term)?);
+                }
                 IdTable::from_columns(
                     part.table
                         .columns()
