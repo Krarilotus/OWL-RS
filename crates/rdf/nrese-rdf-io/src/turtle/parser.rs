@@ -31,8 +31,9 @@ use crate::error::{RdfParseError, RdfSyntaxError, SkippedStatement, TextPosition
 use crate::text::{NOT_IN_IRI, decode_iri, decode_string};
 
 /// The tokens that open something a statement must close: `[`, `(`, `<<(`, `<<`, `{|`. A
-/// pattern, the one list for parsing (`take`) and for skipping a failed statement's rest
-/// (`resync`); [`pair`] pairs each with its closer.
+/// pattern, the one list for a failing token (`unexpected`), for skipping a failed
+/// statement's rest (`resync`) and for debug builds' count in `take`; [`pair`] pairs each
+/// with its closer.
 macro_rules! opener {
     () => {
         Kind::OpenBracket
@@ -308,16 +309,18 @@ pub(crate) struct TurtleParser<'a, R> {
     generated: u64,
     lookahead: Option<Token>,
     after_string: bool,
-    /// The current statement's `[`, `(`, `<<(`, `<<` and `{|` not closed yet, and whether
-    /// the token taken last was a `.` with none open: the statement's end (a `.` anywhere
-    /// else in a Turtle or TriG statement is an error).
+    /// Debug builds only, for `resync`'s check: the current statement's `[`, `(`, `<<(`, `<<`
+    /// and `{|` not closed yet, and whether the token taken last was a `.` with none open.
+    /// Release builds keep no count per token: what recovery needs is noted on errors only.
+    #[cfg(debug_assertions)]
     open: i64,
+    #[cfg(debug_assertions)]
     ended: bool,
     /// When a statement fails: the brackets it left open, by pair ([`pair`]), noted as its
     /// error unwinds out of the routines that took them, innermost first (`within`); and
-    /// its failing token, when that was itself an opener or closer (`unexpected`). Written
-    /// on an error only, read by `resync`, cleared at the error: a statement that parses
-    /// never touches them.
+    /// its failing token, when that was itself an opener, a closer or a `.` (`unexpected`).
+    /// Written on an error only, read by `resync`, cleared at the error: a statement that
+    /// parses never touches them.
     unclosed: Vec<usize>,
     failed: Option<Kind>,
     /// Per quote (`"`, `'`) and width (short, long), whether no later string has a closing
@@ -416,7 +419,9 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             generated: 0,
             lookahead: None,
             after_string: false,
+            #[cfg(debug_assertions)]
             open: 0,
+            #[cfg(debug_assertions)]
             ended: false,
             unclosed: Vec::new(),
             failed: None,
@@ -452,8 +457,11 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             self.triples.clear();
             self.triple_terms.clear();
             self.handed_out = 0;
-            self.open = 0;
-            self.ended = false;
+            #[cfg(debug_assertions)]
+            {
+                self.open = 0;
+                self.ended = false;
+            }
             // Where the statement starts (its first token), for an error's statement.
             let start = match self.statement_start() {
                 Ok(start) => start,
@@ -467,11 +475,9 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 let start = self.input.resolve(start);
                 let syntax = matches!(error, RdfParseError::Syntax(_));
                 // A statement whose failing token was its own `.` has ended there already:
-                // recovery goes on right after it, skipping nothing more.
-                self.done = !(syntax
-                    && self.settings.recover
-                    && !self.settings.n3
-                    && (self.ended || self.resync()));
+                // recovery goes on right after it, skipping nothing more (`resync`).
+                self.done =
+                    !(syntax && self.settings.recover && !self.settings.n3 && self.resync());
                 self.unclosed.clear();
                 self.failed = None;
                 let error = match error {
@@ -545,8 +551,9 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     /// What is open while skipping, readable tokens or not, is one stack of brackets with
     /// their kinds (see [`bracket`]):
     /// - at its bottom, the brackets the statement had open when it failed (`unclosed`),
-    ///   so a `.` inside them ends nothing; then its failing token if that was an opener or
-    ///   closer, braces included (`failed`), counted as the first token skipped;
+    ///   so a `.` inside them ends nothing; then its failing token if that was an opener, a
+    ///   closer (braces included) or a `.` (`failed`), counted as the first token skipped: a
+    ///   failing `.` with nothing open has ended the statement, and nothing more is skipped;
     /// - above them, the brackets opened while skipping. A closer closes the innermost open
     ///   bracket of its own pair, with those opened inside it; with none of its pair open it
     ///   closes nothing.
@@ -558,6 +565,9 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     /// span, to where parsing resumes, is the error's skipped statement. A string already
     /// known to have no closing quote (`no_closing`) is skipped so before it is lexed, which
     /// would search to the end again. `false` at the end of the input, or on a read error.
+    /// Cold, and never inlined: recovery stays out of the parsing path.
+    #[cold]
+    #[inline(never)]
     fn resync(&mut self) -> bool {
         self.lookahead = None;
         self.arena.clear();
@@ -571,20 +581,29 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             counts[pair] += 1;
         }
         let failed = self.failed.take();
-        // Every opener `take` counted is still open in a routine that noted it, or is the
-        // failing token; every closer it counted closed its own routine's opener, or is the
-        // failing token. A routine taking an opener without `within`, or a site rejecting a
-        // token without `unexpected`, breaks this.
-        debug_assert_eq!(
-            self.open,
-            open.len() as i64
-                + match failed {
-                    Some(opener!()) => 1,
-                    Some(closer!()) => -1,
-                    _ => 0,
-                },
-            "the brackets noted open disagree with those taken",
-        );
+        // Debug builds: every opener `take` counted is still open in a routine that noted it,
+        // or is the failing token; every closer it counted closed its own routine's opener, or
+        // is the failing token; and the statement ended at its failing token exactly when that
+        // is a `.` taken with nothing open. A routine taking an opener without `within`, or a
+        // site rejecting a token without `unexpected`, breaks this.
+        #[cfg(debug_assertions)]
+        {
+            assert_eq!(
+                self.open,
+                open.len() as i64
+                    + match failed {
+                        Some(opener!()) => 1,
+                        Some(closer!()) => -1,
+                        _ => 0,
+                    },
+                "the brackets noted open disagree with those taken",
+            );
+            assert_eq!(
+                self.ended,
+                failed == Some(Kind::Dot) && open.is_empty(),
+                "the statement's end noted disagrees with the one taken",
+            );
+        }
         let mut braces = 0i64;
         // The failing token counts as the first one skipped: a `}` closing the TriG block
         // ends the statement right there.
@@ -834,14 +853,17 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         let token = self.lookahead.take().expect("filled");
         self.input.consume(token.consumed);
         self.after_string = matches!(token.kind, Kind::String { .. });
-        // What of the statement is open, and whether this token is its end: a `.` with
-        // nothing open (see `ended`).
-        match token.kind {
-            opener!() => self.open += 1,
-            closer!() => self.open -= 1,
-            _ => {}
+        // Debug builds: what of the statement is open, and whether this token is its end (a
+        // `.` with nothing open), for `resync`'s check of what errors note.
+        #[cfg(debug_assertions)]
+        {
+            match token.kind {
+                opener!() => self.open += 1,
+                closer!() => self.open -= 1,
+                _ => {}
+            }
+            self.ended = token.kind == Kind::Dot && self.open == 0;
         }
-        self.ended = token.kind == Kind::Dot && self.open == 0;
         Ok(token)
     }
 
@@ -854,13 +876,13 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     }
 
     /// The error for `token`, taken where the grammar has no place for it. An opener or a
-    /// closer, braces included, is noted (`failed`): it opens or closes in the document
-    /// though no routine took it as such, and recovery counts it (`resync`).
+    /// closer, braces included, or a `.` is noted (`failed`): it opens, closes or ends in the
+    /// document though no routine took it as such, and recovery counts it (`resync`).
     #[cold]
     fn unexpected(&mut self, token: &Token, what: impl Into<String>) -> RdfParseError {
         if matches!(
             token.kind,
-            opener!() | closer!() | Kind::OpenBrace | Kind::CloseBrace
+            opener!() | closer!() | Kind::OpenBrace | Kind::CloseBrace | Kind::Dot
         ) {
             self.failed = Some(token.kind);
         }
