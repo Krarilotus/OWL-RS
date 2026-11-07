@@ -42,7 +42,9 @@ class FleetCells(unittest.TestCase):
         return code, output.getvalue()
 
     def document(self):
-        return tomllib.loads(next(self.out.glob("*.set.toml")).read_text())
+        paths = list(self.out.glob("*.set.toml"))
+        self.assertTrue(paths, "fleet must emit the requested reviewable set")
+        return tomllib.loads(paths[0].read_text())
 
     def test_every_tier_and_publication_boundary_has_an_omission(self):
         # Spec points 1/6: available tier selected; unavailable/refused/restricted cells omitted.
