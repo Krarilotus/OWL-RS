@@ -218,11 +218,18 @@ pub fn exact_from<'b>(
         .map(|c| {
             let mut best = TopK::new(k, budget)?;
             let first = (c * CHUNK).max(start);
+            // The distance a vector must beat, kept beside the loop: most vectors of a
+            // part don't, and are passed by one comparison.
+            let mut bound = best.bound();
             for position in first..((c + 1) * CHUNK).min(vectors.len()) {
                 let position = position as u32;
                 let id = vectors.id(position);
                 if accept(id) {
-                    best.offer(id, vectors.distance(metric, &query, position))?;
+                    let distance = vectors.distance(metric, &query, position);
+                    if bound.is_none_or(|worst| distance < worst) {
+                        best.offer(id, distance)?;
+                        bound = best.bound();
+                    }
                 }
             }
             best.into_sorted()
@@ -284,6 +291,16 @@ impl<'b> TopK<'b> {
         })
     }
 
+    /// The distance an offer must be below to be kept: none while fewer than `k` are.
+    #[inline]
+    fn bound(&self) -> Option<f32> {
+        match self.heap.len() < self.k {
+            true => None,
+            false => self.heap.peek().map(|worst| worst.0),
+        }
+    }
+
+    #[inline]
     fn offer(&mut self, id: u64, distance: f32) -> Result<(), BudgetExceeded> {
         if self.heap.len() < self.k {
             self.heap.push(Ordered(distance, id))?;
@@ -477,5 +494,49 @@ mod tests {
                 "{answered} answered, {refused} refused"
             );
         });
+    }
+
+    /// The hits come nearest first and, at equal distances, smallest id first, from the
+    /// scan and from the merge, however the parts and the scan's bound met them. Specified
+    /// by `exact`'s order: nearest first, then by id. `k` takes whole groups of equal
+    /// distances here: which of a group a `k` cutting through it keeps is the order the scan
+    /// meets them, as before the bound (the first met stays, an equal one doesn't enter).
+    #[test]
+    fn equal_distances_come_in_id_order() {
+        // Three distances, each held by many vectors spread over three parts.
+        let mut vectors = Vectors::new(2);
+        for i in 0..3 * CHUNK as u64 + 11 {
+            let value = (i % 3) as f32;
+            vectors.push(1_000_000 - i * 7, &[value, 0.0]);
+        }
+        let groups: Vec<usize> = (0..3)
+            .map(|g| (0..vectors.len()).filter(|i| i % 3 == g).count())
+            .collect();
+        let unlimited = Budget::unlimited();
+        let ks = [
+            groups[0],
+            groups[0] + groups[1],
+            vectors.len(),
+            vectors.len() + 5,
+        ];
+        for k in ks {
+            let found = exact(&vectors, &[0.0, 0.0], k, Metric::L2, &|_| true, &unlimited)
+                .unwrap()
+                .to_vec();
+            let query = Query::new(&[0.0, 0.0]);
+            let mut all: Vec<Hit> = (0..vectors.len() as u32)
+                .map(|p| Hit {
+                    id: vectors.id(p),
+                    distance: vectors.distance(Metric::L2, &query, p),
+                })
+                .collect();
+            all.sort_by(|a, b| a.distance.total_cmp(&b.distance).then(a.id.cmp(&b.id)));
+            all.truncate(k);
+            assert_eq!(found, all, "k {k}");
+            let merged = merge(all.iter().rev().copied(), k, &unlimited)
+                .unwrap()
+                .to_vec();
+            assert_eq!(merged, all, "k {k}: merge");
+        }
     }
 }

@@ -1853,13 +1853,16 @@ impl Snapshot {
         let (hits, report) =
             self.dictionary
                 .vector_search(query, self.version.dictionary_len, accept, budget)?;
-        let mut found = nrese_exec::ChargedVec::with_capacity(budget, hits.len())?;
+        let len = hits.len();
         let (hits, held) = hits.into_parts();
-        for hit in hits {
-            found.push((TermId::from_raw(hit.id), hit.distance))?;
-        }
+        let found = nrese_exec::ChargedVec::collect(
+            budget,
+            len,
+            hits.into_iter()
+                .map(|hit| (TermId::from_raw(hit.id), hit.distance)),
+        );
         drop(held);
-        Ok((found, report))
+        Ok((found?, report))
     }
 
     /// Builds the graph searches like `query` use, covering every vector of its
