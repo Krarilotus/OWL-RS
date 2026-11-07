@@ -113,4 +113,44 @@ mod tests {
         }
         assert!(limits(round, Some("soon")).is_err());
     }
+
+    /// A positive limit below one millisecond is refused, naming the setting, never read
+    /// as none (review p2-b7-syn69 r1, R1-F3: the units owner's rule, reached through
+    /// replication's settings). `1ms` stays finite. Every row is checked.
+    #[test]
+    fn a_replication_limit_below_a_millisecond_is_refused() {
+        let mut wrong = Vec::new();
+        for name in [
+            names::REPLICATION_ROUND_TIMEOUT_MS,
+            names::REPLICATION_IMAGE_TIMEOUT_MS,
+        ] {
+            for value in ["0.1ms", "0.0001s"] {
+                let mut source = KeyValueSource::default();
+                source.insert(name, value);
+                match parse_replication_config(&source) {
+                    Ok(config) => wrong.push(format!(
+                        "{name}={value}: round {:?}, image {:?}",
+                        config.round_timeout, config.image_timeout
+                    )),
+                    Err(error) if !format!("{error:#}").contains(name) => {
+                        wrong.push(format!("{name}={value}: {error:#} doesn't name it"));
+                    }
+                    Err(_) => {}
+                }
+            }
+            let mut source = KeyValueSource::default();
+            source.insert(name, "1ms");
+            let config = parse_replication_config(&source);
+            let read = config.as_ref().map(|c| (c.round_timeout, c.image_timeout));
+            let one = Some(Duration::from_millis(1));
+            let expected = match name {
+                names::REPLICATION_ROUND_TIMEOUT_MS => read.ok().map(|(r, _)| r),
+                _ => read.ok().map(|(_, i)| i),
+            };
+            if expected != Some(one) {
+                wrong.push(format!("{name}=1ms: {read:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 }
