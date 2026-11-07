@@ -243,3 +243,35 @@ fn a_search_under_graph_variable_is_evaluated_per_named_graph() {
         failed.join("\n")
     );
 }
+
+/// `text:query`'s property holds under `GRAPH ?g` as it does outside one: in each graph the
+/// limit counts that graph's literals of the property, so a literal of another property
+/// that ranks higher there takes none of it. "bridge bridge bridge" is a comment in g1 and
+/// a label in g2. `(rdfs:label "bridge" 1)` finds g1's one label ("the old bridge over the
+/// river") and g2's label. Before, g1's comment took g1's limit and its row was dropped by
+/// the property's join.
+#[test]
+fn a_property_limits_a_search_under_graph_variable_in_each_graph() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let rdfs = |local: &str| {
+        NamedNode::new_unchecked(format!("http://www.w3.org/2000/01/rdf-schema#{local}"))
+    };
+    for (subject, property, text, graph) in [
+        ("note", "comment", "bridge bridge bridge", "g1"),
+        ("span", "label", "the old bridge over the river", "g1"),
+        ("arch", "label", "bridge bridge bridge", "g2"),
+    ] {
+        let text = Term::from(Literal::new_simple_literal(text));
+        tx.insert(Quad::new(ex(subject), rdfs(property), text, ex(graph)).as_ref());
+    }
+    tx.commit().unwrap();
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT ?g ?s WHERE { GRAPH ?g { ?s text:query (rdfs:label \"bridge\" 1) } }",
+            &QueryOptions::default()
+        ),
+        table(&[&["g1", "span"], &["g2", "arch"]])
+    );
+}
