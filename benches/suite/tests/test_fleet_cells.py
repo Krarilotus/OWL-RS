@@ -24,7 +24,7 @@ class FleetCells(unittest.TestCase):
         self.out = Path(self.tmp.name)
         self.calls = []
         self.addCleanup(patch.stopall)
-        patch.object(abba, "git", return_value=A).start()
+        patch.object(abba, "git", side_effect=lambda root, *args: "b" * 40 if "b" * 40 in args else A).start()
         patch.object(abba.rg, "side_inputs", return_value=[]).start()
         patch.object(abba.rg, "fleet_call", side_effect=self.fleet).start()
 
