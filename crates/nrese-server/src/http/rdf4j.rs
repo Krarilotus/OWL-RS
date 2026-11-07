@@ -1064,6 +1064,34 @@ mod tests {
         assert!(term("<http://e/\\U0001F98>").is_err());
     }
 
+    /// A term that isn't one N-Triples term (an unescaped quote inside a literal, a raw line
+    /// break, a second term) is refused, never read as a different value: a DELETE pattern
+    /// with it would remove other statements. Every row is checked; the failures are
+    /// reported together.
+    #[test]
+    fn malformed_terms_are_refused_not_read_as_others() {
+        let mut wrong = Vec::new();
+        for text in [
+            "\"a\"\"",
+            "\"a\"b\"",
+            "\"a\" \"b\"",
+            "\"a\nb\"",
+            "\"a\rb\"@en",
+        ] {
+            if let Ok(read) = term(text) {
+                wrong.push(format!("{text:?} read as {read:?}"));
+            }
+        }
+        // Guards: an escaped quote, surrounding spaces.
+        for (text, value) in [("\"a\\\"b\"", "a\"b"), ("  \"a\"  ", "a")] {
+            let expected = Term::from(Literal::new_simple_literal(value));
+            if term(text).ok().as_ref() != Some(&expected) {
+                wrong.push(format!("{text:?}: {:?}", term(text)));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[test]
     fn contexts_with_null() {
         let pairs = vec![
