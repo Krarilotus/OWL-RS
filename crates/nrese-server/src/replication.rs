@@ -470,6 +470,25 @@ pub async fn pull_once(
     primary: &str,
     state: &AppState,
 ) -> anyhow::Result<usize> {
+    round(client, primary, state, &Applying::default()).await
+}
+
+/// A follower's application of the records it receives: what stops it (checked between
+/// records) and what is held while it runs on its own thread.
+#[derive(Clone, Default)]
+struct Applying {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Held by the thread applying a batch until it ends: waiting for it waits for that.
+    running: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+/// [`pull_once`], its application owned by `applying`.
+async fn round(
+    client: &reqwest::Client,
+    primary: &str,
+    state: &AppState,
+    applying: &Applying,
+) -> anyhow::Result<usize> {
     let replication = state.replication();
     let config = &replication.config;
     let after = state.store().current_revision();
@@ -510,26 +529,34 @@ pub async fn pull_once(
             )
         })??,
     };
-    if (progress.records > 0) == frames.is_empty() {
+    // The store checks the whole answer against what it says before it applies any of it.
+    let expected = nrese_store::LogExpectation {
+        after,
+        records: progress.records,
+        last: progress.last,
+    };
+    let store = state.store();
+    let stop = nrese_exec::stop::StopSource::new(Some(applying.stop.clone()), None);
+    let running = applying.running.clone().lock_owned().await;
+    let applied = tokio::task::spawn_blocking(move || {
+        let applied = store.apply_replication_log(&frames, &expected, &stop);
+        // The store goes before `running` does: who waits for `running` (a stop) finds
+        // the store let go of.
+        drop(store);
+        drop(running);
+        applied
+    })
+    .await??;
+    let published = applied.revision.saturating_sub(after) as usize;
+    if applied.stopped {
         anyhow::bail!(
-            "the primary's answer says {} records and carries {} bytes",
-            progress.records,
-            frames.len()
+            "stopped at revision {} of {}",
+            applied.revision,
+            progress.last
         );
     }
-    if progress.records > 0 {
-        let store = state.store();
-        let reached =
-            tokio::task::spawn_blocking(move || store.apply_replication_log(&frames)).await??;
-        if reached != progress.last {
-            anyhow::bail!(
-                "the primary's records reached revision {reached}, not {} as it said",
-                progress.last
-            );
-        }
-    }
-    replication.contact(progress.latest, progress.records as usize, None);
-    Ok(progress.records as usize)
+    replication.contact(progress.latest, published, None);
+    Ok(published)
 }
 
 /// What a log answer says it carries: its record count, the revision of its last record
@@ -542,7 +569,9 @@ struct Progress {
 
 impl Progress {
     /// The progress `headers` report for the records after `after`; an error if one is
-    /// missing, not a number, or contradicts the others.
+    /// missing or not a number, or if the primary's latest revision contradicts them.
+    /// Whether the records are what the answer says is the store's to check, before it
+    /// applies any ([`nrese_store::StoreService::apply_replication_log`]).
     fn read(headers: &HeaderMap, after: u64) -> anyhow::Result<Self> {
         let header = |name: &str| {
             headers
@@ -556,15 +585,7 @@ impl Progress {
             last: header(LAST)?,
             latest: header(LATEST)?,
         };
-        // Every revision is one record: the records after `after` are those up to `last`.
-        let follows = match progress.records {
-            0 => progress.last == after,
-            records => {
-                progress.last.checked_sub(after) == Some(records)
-                    && progress.last <= progress.latest
-            }
-        };
-        if !follows || progress.latest < after {
+        if progress.last > progress.latest || progress.latest < after {
             anyhow::bail!(
                 "the primary's answer after revision {after} says {} records, the last at \
                  revision {}, its latest {}",
@@ -582,11 +603,13 @@ impl Progress {
 /// growing pause on errors (reported in the status).
 pub fn follow(state: AppState) -> anyhow::Result<Follower> {
     let (client, primary) = client(&state.replication().config)?;
-    Ok(Follower(tokio::spawn(async move {
+    let applying = Applying::default();
+    let owned = applying.clone();
+    let task = tokio::spawn(async move {
         let poll = state.replication().config.poll;
         let mut pause = poll;
         loop {
-            match pull_once(&client, &primary, &state).await {
+            match round(&client, &primary, &state, &owned).await {
                 Ok(0) => {
                     pause = poll;
                     tokio::time::sleep(poll).await;
@@ -600,25 +623,39 @@ pub fn follow(state: AppState) -> anyhow::Result<Follower> {
                 }
             }
         }
-    })))
+    });
+    Ok(Follower { task, applying })
 }
 
-/// The task [`follow`] runs, and with it the server state it holds: ended when this is
-/// stopped or dropped, at its next await (a batch being applied is applied to its end on
-/// its own thread; the engine applies each record whole).
-pub struct Follower(tokio::task::JoinHandle<()>);
+/// The task [`follow`] runs and the application it starts, with the server state and the
+/// store they hold. Stopped (or dropped), the task ends at its next await and a batch being
+/// applied ends at its next record: no record after it is published.
+pub struct Follower {
+    task: tokio::task::JoinHandle<()>,
+    applying: Applying,
+}
 
 impl Follower {
-    /// Ends the task and waits until it has let go of everything it held.
+    /// Stops the task and the application, and waits until both have ended and let go of
+    /// what they held (the store, and with it its directory's lock).
     pub async fn stop(mut self) {
-        self.0.abort();
-        let _ = (&mut self.0).await;
+        self.applying
+            .stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.task.abort();
+        let _ = (&mut self.task).await;
+        // The thread applying a batch holds this until it has ended.
+        let _ = self.applying.running.lock().await;
     }
 }
 
 impl Drop for Follower {
+    /// Stops both without waiting: the application ends at its next record.
     fn drop(&mut self) {
-        self.0.abort();
+        self.applying
+            .stop
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.task.abort();
     }
 }
 

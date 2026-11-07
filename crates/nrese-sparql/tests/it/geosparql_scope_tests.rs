@@ -406,10 +406,15 @@ fn spatial_answers_stay_in_the_readers_scope() {
     primary.write_image(replica_dir.path()).unwrap();
     let replica = Engine::open(replica_dir.path(), durable).unwrap();
     commit(&primary, LATER.iter().map(|st| (st, graph_name(st.3))));
-    let batch = primary
-        .log_since(replica.snapshot().revision(), 1 << 20)
+    let after = replica.snapshot().revision();
+    let batch = primary.log_since(after, 1 << 20).unwrap();
+    replica
+        .apply_log(
+            &batch.frames,
+            &batch.expectation(after),
+            &nrese_exec::stop::StopSource::none(),
+        )
         .unwrap();
-    replica.apply_log(&batch.frames).unwrap();
     assert_eq!(replica.snapshot().revision(), primary.snapshot().revision());
 
     let mut failed = Vec::new();
