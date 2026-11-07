@@ -54,7 +54,7 @@ use crate::term::{Dictionary, DictionaryStats, TermId};
 
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
 pub use equality::Classes as EqualityClasses;
-pub use replication::LogBatch;
+pub use replication::{Applied, LogBatch, LogExpectation};
 pub use snapshot::{
     Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity,
 };

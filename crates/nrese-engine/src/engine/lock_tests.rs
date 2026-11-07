@@ -68,7 +68,17 @@ fn the_fallible_writer_forms_on_a_pool_thread_are_refused_only_while_it_is_held(
             asking.try_transaction().map(drop),
             asking.try_bulk_load(super::BulkMode::Append).map(drop),
             asking.try_rematerialisation().map(drop),
-            asking.apply_log(&[]).map(drop),
+            asking
+                .apply_log(
+                    &[],
+                    &crate::LogExpectation {
+                        after: 0,
+                        records: 0,
+                        last: 0,
+                    },
+                    &nrese_exec::stop::StopSource::none(),
+                )
+                .map(drop),
         ]
     });
     drop(held);

@@ -522,7 +522,13 @@ pub fn replication(
             let batch = primary.log_since(at, BATCH_BYTES)?;
             feed += started.elapsed();
             let started = Instant::now();
-            at = follower.apply_log(&batch.frames)?;
+            at = follower
+                .apply_log(
+                    &batch.frames,
+                    &batch.expectation(at),
+                    &nrese_exec::stop::StopSource::none(),
+                )?
+                .revision;
             apply += started.elapsed();
             run_records += batch.records;
             run_bytes += batch.frames.len();
