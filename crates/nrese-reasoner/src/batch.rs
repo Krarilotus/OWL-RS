@@ -2958,7 +2958,7 @@ pub(crate) fn check<S: Source + ?Sized>(
                 .unwrap_or(0)
         })
     }
-    let group = |c: usize, found: &mut Violations| {
+    let group_of = |c: usize, found: &mut Violations| {
         let rule = &program.consistency[c].0;
         found.group(&rule.name, rule.variables())
     };
@@ -2967,7 +2967,7 @@ pub(crate) fn check<S: Source + ?Sized>(
         let ground_rule = &program.consistency[c].1.rule;
         if ground_rule.body.is_empty() {
             if guards_hold(&ground_rule.guards, &program.consistency[c].1.substitution) {
-                let Some(id) = group(c, found) else { break };
+                let Some(id) = group_of(c, found) else { break };
                 found.record(id, words(program, c, &[]));
             }
         } else {
@@ -2984,7 +2984,9 @@ pub(crate) fn check<S: Source + ?Sized>(
     let mut interrupted = false;
     let mut since_poll = 0u32;
     'jobs: for (c, job) in jobs {
-        let Some(id) = group(c, found) else { break };
+        // Made at the job's first firing: a job that never fires charges nothing, so a
+        // budget without room for its group can't make consistent data look inconsistent.
+        let mut id = None;
         for start in (0..job.drivers()).step_by(MORSEL) {
             if stop() {
                 return Err(Interrupted::default());
@@ -3001,7 +3003,14 @@ pub(crate) fn check<S: Source + ?Sized>(
                 }
                 // A refused report stops the walk: the state is inconsistent whatever
                 // the rest would add.
-                !found.record(id, words(program, c, bindings))
+                let group = match id {
+                    Some(group) => group,
+                    None => match group_of(c, found) {
+                        Some(group) => *id.insert(group),
+                        None => return true,
+                    },
+                };
+                !found.record(group, words(program, c, bindings))
             });
             if interrupted {
                 return Err(Interrupted::default());
