@@ -452,6 +452,265 @@ fn a_component_constrains_once_per_combination_of_its_parameter_values() {
     assert_eq!(report.results.len(), 3, "{:?}", report.results);
 }
 
+/// Shapes with a constraint component of `parameters` parameters, `values` values each on
+/// shape ex:S (targeting ex:a), an ASK that every combination fails, and a message of
+/// `message` bytes on ex:S: `values`^`parameters` results, each with that message.
+fn failing_component(parameters: usize, values: usize, message: usize) -> String {
+    let declared: Vec<String> = (0..parameters)
+        .map(|p| format!("[ sh:path ex:p{p} ]"))
+        .collect();
+    let given: Vec<String> = (0..parameters)
+        .map(|p| {
+            let values: Vec<String> = (0..values).map(|v| v.to_string()).collect();
+            format!("ex:p{p} {}", values.join(" , "))
+        })
+        .collect();
+    format!(
+        "ex:C a sh:ConstraintComponent ; sh:parameter {} ;
+           sh:validator [ a sh:SPARQLAskValidator ; sh:ask '''ASK {{ FILTER(false) }}''' ] .
+         ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:message \"{}\" ; {} .",
+        declared.join(" , "),
+        "x".repeat(message),
+        given.join(" ; ")
+    )
+}
+
+/// SHCL-AMP r1 R1, guard: with room for them, every combination's result is reported:
+/// 8^4 = 4096, each with the shape's 4 KiB message.
+#[test]
+fn a_component_s_results_are_all_reported_when_affordable() {
+    let store = engine("ex:a ex:q ex:b .", &failing_component(4, 8, 4096));
+    let snapshot = store.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(report.results.len(), 4096);
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|result| result.messages.len() == 1 && result.messages[0].value().len() == 4096)
+    );
+}
+
+/// SHCL-AMP r1 R1: the decoded report is charged before it is built. 16^2 = 256 results are
+/// a few hundred bytes each as ids, but each decodes the shape's 16 KiB message: 4 MiB of
+/// message text. A 1 MiB envelope holds the results (every combination runs: 256 queries)
+/// and refuses their report.
+#[test]
+fn a_report_past_the_envelope_is_refused() {
+    let store = engine("ex:a ex:q ex:b .", &failing_component(2, 16, 16 << 10));
+    let snapshot = store.snapshot();
+    // A view that never cancels: it counts the queries.
+    let view = CancelAfter {
+        inner: &snapshot,
+        token: CancellationToken::new(),
+        evaluations: std::sync::atomic::AtomicUsize::new(0),
+        at: usize::MAX,
+        in_report: false,
+    };
+    let resources = Resources {
+        memory: nrese_exec::Envelope::new(Some(1 << 20), None),
+        ..Resources::default()
+    };
+    let outcome = nrese_shacl::validate(&view, &compiled(&snapshot), DEFAULT, &resources);
+    assert_eq!(
+        view.evaluations.load(std::sync::atomic::Ordering::SeqCst),
+        256,
+        "the walk ran every combination before the refusal"
+    );
+    assert!(
+        matches!(outcome, Err(QueryEvaluationError::MemoryLimit(_))),
+        "{:?}",
+        outcome.map(|report| report.results.len())
+    );
+}
+
+/// SHCL-AMP r1 R1: a validation's results and their decoded messages are charged to its
+/// envelope. 8^4 results, each decoding a 4 KiB message, are 16 MiB of message text alone;
+/// a 1 MiB envelope refuses them: the outcome is that refusal, with no report.
+#[test]
+fn a_component_s_results_past_the_envelope_are_refused() {
+    let store = engine("ex:a ex:q ex:b .", &failing_component(4, 8, 4096));
+    let snapshot = store.snapshot();
+    let resources = Resources {
+        memory: nrese_exec::Envelope::new(Some(1 << 20), None),
+        ..Resources::default()
+    };
+    let outcome = nrese_shacl::validate(&snapshot, &compiled(&snapshot), DEFAULT, &resources);
+    assert!(
+        matches!(outcome, Err(QueryEvaluationError::MemoryLimit(_))),
+        "{:?}",
+        outcome.map(|report| report.results.len())
+    );
+}
+
+/// SHCL-AMP R1 sol r1 S3, guard (fails on 707e24dd): what a change's validation finds in the
+/// state before is charged per result found and returned per result found, though the set
+/// it is compared in keeps one of each. Sixteen shapes each fail all 16^2 combinations of a
+/// component with the same result (a result names no combination); an unrelated change
+/// introduces nothing, and a 1 MiB envelope affords it, one shape at a time.
+#[test]
+fn repeated_results_of_a_change_s_validation_are_returned() {
+    let values: Vec<String> = (0..16).map(|v| v.to_string()).collect();
+    let values = values.join(" , ");
+    let shapes: Vec<String> = (0..16)
+        .map(|s| {
+            format!(
+                "ex:S{s} a sh:NodeShape ; sh:targetNode ex:a ; ex:p0 {values} ; ex:p1 {values} ."
+            )
+        })
+        .collect();
+    let store = engine(
+        "ex:a ex:q ex:b .",
+        &format!(
+            "ex:C a sh:ConstraintComponent ; sh:parameter [ sh:path ex:p0 ] , [ sh:path ex:p1 ] ;
+               sh:validator [ a sh:SPARQLAskValidator ; sh:ask '''ASK {{ FILTER(false) }}''' ] .
+             {}",
+            shapes.join("\n")
+        ),
+    );
+    let before = store.snapshot();
+    let compiled_before = compiled(&before);
+    let mut tx = store.transaction();
+    tx.insert(QuadRef::new(
+        NamedNodeRef::new_unchecked("http://example.com/z"),
+        NamedNodeRef::new_unchecked("http://example.com/q"),
+        NamedNodeRef::new_unchecked("http://example.com/w"),
+        GraphNameRef::DefaultGraph,
+    ));
+    let changed: Vec<_> = tx.inserted().collect();
+    let after = tx.pending_snapshot();
+    let resources = Resources {
+        memory: nrese_exec::Envelope::new(Some(1 << 20), None),
+        ..Resources::default()
+    };
+    let introduced = nrese_shacl::validate_changes(
+        &before,
+        &after,
+        &compiled_before,
+        DEFAULT,
+        &changed,
+        &resources,
+    );
+    assert!(
+        matches!(&introduced, Ok(report) if report.results.is_empty()),
+        "{:?}",
+        introduced.map(|report| report.results.len())
+    );
+}
+
+/// A view of `inner` that cancels `token` at its `at`-th query evaluation, or, with
+/// `in_report`, at the first term it decodes after that evaluation (by then the walk has
+/// run every query, so the decode is the report's).
+struct CancelAfter<'v> {
+    inner: &'v Snapshot,
+    token: CancellationToken,
+    evaluations: std::sync::atomic::AtomicUsize,
+    at: usize,
+    in_report: bool,
+}
+
+impl<'v> ReadView for CancelAfter<'v> {
+    fn quads_for_pattern_in<'a>(
+        &'a self,
+        model: ReadModel,
+        pattern: &nrese_engine::QuadPattern,
+    ) -> impl Iterator<Item = nrese_engine::EncodedQuad> + use<'a, 'v> {
+        self.inner.quads_for_pattern_in(model, pattern)
+    }
+
+    fn named_graphs<'a>(&'a self) -> impl Iterator<Item = TermId> + use<'a, 'v> {
+        ReadView::named_graphs(self.inner)
+    }
+
+    fn contains_named_graph(&self, graph: TermId) -> bool {
+        ReadView::contains_named_graph(self.inner, graph)
+    }
+
+    fn lookup(&self, term: TermRef<'_>) -> Option<TermId> {
+        ReadView::lookup(self.inner, term)
+    }
+
+    fn decode(&self, id: TermId) -> Option<nrese_rdf::Term> {
+        if self.in_report && self.evaluations.load(std::sync::atomic::Ordering::SeqCst) >= self.at {
+            self.token.cancel();
+        }
+        ReadView::decode(self.inner, id)
+    }
+
+    fn decode_quad(&self, quad: nrese_engine::EncodedQuad) -> Option<nrese_rdf::Quad> {
+        ReadView::decode_quad(self.inner, quad)
+    }
+
+    fn snapshot(&self) -> Option<&Snapshot> {
+        Some(self.inner)
+    }
+
+    fn evaluation_snapshot(&self) -> std::borrow::Cow<'_, Snapshot> {
+        let n = self
+            .evaluations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if !self.in_report && n == self.at {
+            self.token.cancel();
+        }
+        std::borrow::Cow::Borrowed(self.inner)
+    }
+}
+
+/// Validates `snapshot` against its shapes through a [`CancelAfter`] view: the outcome and
+/// the number of queries evaluated.
+fn cancelled_after(
+    snapshot: &Snapshot,
+    at: usize,
+    in_report: bool,
+) -> (Result<usize, QueryEvaluationError>, usize) {
+    let token = CancellationToken::new();
+    let view = CancelAfter {
+        inner: snapshot,
+        token: token.clone(),
+        evaluations: std::sync::atomic::AtomicUsize::new(0),
+        at,
+        in_report,
+    };
+    let resources = Resources {
+        cancellation: Some(token),
+        ..Resources::default()
+    };
+    let outcome = nrese_shacl::validate(&view, &compiled(snapshot), DEFAULT, &resources)
+        .map(|report| report.results.len());
+    let evaluations = view.evaluations.load(std::sync::atomic::Ordering::SeqCst);
+    (outcome, evaluations)
+}
+
+/// SHCL-AMP r1 R1, guard: a cancellation after some combinations ran stops the walk: of 4^2
+/// = 16 combinations, the cancellation at the 5th query leaves the 7th unrun.
+#[test]
+fn a_cancellation_between_combinations_stops_the_walk() {
+    let store = engine("ex:a ex:q ex:b .", &failing_component(2, 4, 16));
+    let snapshot = store.snapshot();
+    let (outcome, evaluations) = cancelled_after(&snapshot, 5, false);
+    assert!(
+        matches!(outcome, Err(QueryEvaluationError::Cancelled)),
+        "{outcome:?}"
+    );
+    assert!(evaluations <= 6, "{evaluations} queries ran");
+}
+
+/// SHCL-AMP r1 R1: a cancellation while the report is decoded, after all 4^2 = 16
+/// combinations ran, is the outcome: no report.
+#[test]
+fn a_cancellation_while_the_report_is_decoded_stops_it() {
+    let store = engine("ex:a ex:q ex:b .", &failing_component(2, 4, 16));
+    let snapshot = store.snapshot();
+    let (outcome, evaluations) = cancelled_after(&snapshot, 16, true);
+    assert_eq!(evaluations, 16, "every combination ran first");
+    assert!(
+        matches!(outcome, Err(QueryEvaluationError::Cancelled)),
+        "{outcome:?}"
+    );
+}
+
 /// RSH-07: a validation runs on its caller's resources, its SHACL-SPARQL queries included,
 /// nested shapes' too. When they stop it (the cancellation fired, or the envelope refused
 /// a charge), the outcome is that stop: not a report of what was found before it, and not a
