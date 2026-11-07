@@ -77,8 +77,8 @@ use crate::results::{
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::join::{
-    anti_join_in_place, compatible_mask, join, join_keeping_left_order, join_with_undef, left_join,
-    outer_join_with_undef,
+    JoinStop, anti_join_in_place, compatible_mask, join, join_keeping_left_order, join_with_undef,
+    left_join, outer_join_with_undef,
 };
 use nrese_exec::{
     Budget, BudgetExceeded, ChargedVec, IdTable, Reservation, UNDEF, computed_id, computed_index,
@@ -1582,6 +1582,15 @@ impl<'a> Context<'a> {
         .into()
     }
 
+    /// The error of a stopped join of `width` output columns: its row limit
+    /// ([`Self::too_large`]), or an input with more rows than the join's row numbers name.
+    fn join_stopped(&self, stop: JoinStop, width: usize) -> NativeError {
+        match stop {
+            JoinStop::Rows(rows) => self.too_large(rows.max_rows.saturating_add(1), width),
+            JoinStop::TooLarge(limit) => QueryEvaluationError::TooLarge(limit).into(),
+        }
+    }
+
     /// Frees a table charged to the query's budget, then releases its charge: the budget
     /// never shows less than the tables hold.
     fn consumed(&self, solutions: Solutions) {
@@ -1974,10 +1983,12 @@ impl<'a> Context<'a> {
                 let mut table = left.table;
                 if has_undef(&table, &lk) || has_undef(&right.table, &rk) {
                     // A row goes if a compatible row shares a variable both bind.
-                    let removed = compatible_mask(&table, &right.table, &lk, &rk, true);
+                    let removed = compatible_mask(&table, &right.table, &lk, &rk, true)
+                        .map_err(QueryEvaluationError::from)?;
                     table.retain_mask(&removed.iter().map(|r| !r).collect::<Vec<_>>());
                 } else {
-                    anti_join_in_place(&mut table, &right.table, &lk, &rk);
+                    anti_join_in_place(&mut table, &right.table, &lk, &rk)
+                        .map_err(QueryEvaluationError::from)?;
                 }
                 self.consumed(right);
                 self.produced(Solutions {
@@ -3995,7 +4006,7 @@ impl<'a> Context<'a> {
         } else {
             join(&left.table, &right.table, &lk, &rk, max_rows)
         }
-        .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
+        .map_err(|e| self.join_stopped(e, vars.len()))?;
         self.budget.release(hash_table);
         let ordered = left.ordered;
         self.consumed(left);
@@ -4040,7 +4051,7 @@ impl<'a> Context<'a> {
         } else {
             left_join(&left.table, &right.table, &lk, &rk, accept, max_rows)
         }
-        .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
+        .map_err(|e| self.join_stopped(e, vars.len()))?;
         self.budget.release(hash_table);
         let ordered = left.ordered;
         self.consumed(left);
@@ -5240,7 +5251,7 @@ impl<'a> Context<'a> {
             }
         };
         let keys: Vec<usize> = (0..variables.len()).collect();
-        let groups = group_rows(&key_table, &keys);
+        let groups = group_rows(&key_table, &keys).map_err(QueryEvaluationError::from)?;
         // Without GROUP BY, an empty input still yields one (empty) group.
         let group_count = groups.len();
         let one_pass = aggregate_in_one_pass(&solutions, &groups.group_of, group_count, aggregates)
