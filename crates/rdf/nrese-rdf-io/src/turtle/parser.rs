@@ -278,6 +278,11 @@ pub(crate) struct TurtleParser<'a, R> {
     generated: u64,
     lookahead: Option<Token>,
     after_string: bool,
+    /// The current statement's `[`, `(`, `<<(`, `<<` and `{|` not closed yet, and whether
+    /// the token taken last was a `.` with none open: the statement's end (a `.` anywhere
+    /// else in a Turtle or TriG statement is an error).
+    open: i64,
+    ended: bool,
     /// The current statement.
     arena: String,
     triples: Vec<Triple>,
@@ -368,6 +373,8 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             generated: 0,
             lookahead: None,
             after_string: false,
+            open: 0,
+            ended: false,
             arena: String::new(),
             triples: Vec::new(),
             handed_out: 0,
@@ -398,6 +405,8 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             self.triples.clear();
             self.triple_terms.clear();
             self.handed_out = 0;
+            self.open = 0;
+            self.ended = false;
             // Where the statement starts (its first token), for an error's statement.
             let start = match self.statement_start() {
                 Ok(start) => start,
@@ -410,8 +419,12 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 self.abort_statement();
                 let start = self.input.resolve(start);
                 let syntax = matches!(error, RdfParseError::Syntax(_));
-                self.done =
-                    !(syntax && self.settings.recover && !self.settings.n3 && self.resync());
+                // A statement whose failing token was its own `.` has ended there already:
+                // recovery goes on right after it, skipping nothing more.
+                self.done = !(syntax
+                    && self.settings.recover
+                    && !self.settings.n3
+                    && (self.ended || self.resync()));
                 let error = match error {
                     RdfParseError::Syntax(error) => {
                         RdfParseError::Syntax(self.skipped(error, start))
@@ -634,6 +647,22 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         let token = self.lookahead.take().expect("filled");
         self.input.consume(token.consumed);
         self.after_string = matches!(token.kind, Kind::String { .. });
+        // What of the statement is open, and whether this token is its end: a `.` with
+        // nothing open (see `ended`).
+        match token.kind {
+            Kind::OpenBracket
+            | Kind::OpenParen
+            | Kind::TripleTermOpen
+            | Kind::ReifiedOpen
+            | Kind::AnnotationOpen => self.open += 1,
+            Kind::CloseBracket
+            | Kind::CloseParen
+            | Kind::TripleTermClose
+            | Kind::ReifiedClose
+            | Kind::AnnotationClose => self.open -= 1,
+            _ => {}
+        }
+        self.ended = token.kind == Kind::Dot && self.open == 0;
         Ok(token)
     }
 
