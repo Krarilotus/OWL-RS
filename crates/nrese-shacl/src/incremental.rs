@@ -140,6 +140,30 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     report
 }
 
+/// The results a change of the shapes introduces in `data`: full validation against
+/// `shapes_after` in `after`, less what full validation against `shapes_before` found in
+/// `before` (`None`: the shapes didn't compile before, so nothing was found). Both views must
+/// share one dictionary, and each set of shapes be compiled from it. Runs on `resources` as
+/// [`crate::validate`] does.
+pub fn validate_shapes_change<A: ReadView + Sync, B: ReadView + Sync>(
+    before: &A,
+    shapes_before: Option<&Shapes>,
+    after: &B,
+    shapes_after: &Shapes,
+    data: Selection,
+    resources: &Resources,
+) -> Result<ValidationReport, QueryEvaluationError> {
+    let mut report = crate::validate(after, shapes_after, data, resources)?;
+    if let Some(shapes_before) = shapes_before {
+        // The whole earlier report, so its charge is held while its results are.
+        let earlier = crate::validate(before, shapes_before, data, resources)?;
+        report
+            .results
+            .retain(|result| !earlier.results.contains(result));
+    }
+    Ok(report)
+}
+
 fn in_selection(data: Selection, graph: TermId) -> bool {
     let selected = match data.graphs {
         GraphSelector::Exact(selected) => graph == selected,
