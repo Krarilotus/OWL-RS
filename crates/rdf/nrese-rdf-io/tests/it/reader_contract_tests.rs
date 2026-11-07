@@ -114,8 +114,10 @@ fn a_failed_statement_gives_none_of_its_triples() {
 
 /// Recovery resumes right after the failing statement's end: a `.` with nothing of the
 /// statement open is its end (Turtle 1.2 §6.5 `triples '.'`; `RdfParser::recovering`: the
-/// rest of the statement is skipped, up to the `.` ending it). Guards held before the
-/// change too.
+/// rest of the statement is skipped, up to the `.` ending it). What of the statement is
+/// open when it fails stays open while its rest is skipped, `[`, `(`, `<<(`, `<<` and `{|`
+/// alike (review p2-a1b r1, A1B-R1-F1). Read from a slice, a reader, and a reader giving
+/// one byte at a time. Guards held before the change too.
 #[test]
 fn recovery_resumes_after_the_failing_statements_own_end() {
     let abc = triple("http://e/a", "http://e/b", iri("http://e/c"));
@@ -126,9 +128,107 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
         iri("http://e/c"),
         iri("http://e/g"),
     );
+    let after = triple("urn:after", "urn:p", iri("urn:o"));
+    let after_in_g = Quad::new(iri("urn:after"), iri("urn:p"), iri("urn:o"), iri("urn:g"));
     let mut table = Table::default();
     // (guard, format, document, recovering's items: Err as None)
-    let cases: [(bool, RdfFormat, &str, Vec<Option<&Quad>>); 7] = [
+    let cases: Vec<(bool, RdfFormat, &'static str, Vec<Option<&Quad>>)> = vec![
+        // The statement fails inside its open `[` or `(`: the statement-shaped `urn:u`
+        // sequence inside it is skipped with it, up to the `]` or `)` and the `.` after.
+        (
+            false,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> [ <urn:q> . <urn:a> <urn:b> <urn:c> . <urn:u> <urn:v> <urn:w> . ] . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> ( 1 . <urn:a> <urn:b> <urn:c> . <urn:u> <urn:v> <urn:w> . ) . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::TriG,
+            "<urn:g> { <urn:s> <urn:p> [ <urn:q> . <urn:a> <urn:b> <urn:c> . <urn:u> <urn:v> <urn:w> . ] . <urn:after> <urn:p> <urn:o> . }",
+            vec![None, Some(&after_in_g)],
+        ),
+        (
+            false,
+            RdfFormat::TriG,
+            "<urn:g> { <urn:s> <urn:p> ( 1 . <urn:a> <urn:b> <urn:c> . <urn:u> <urn:v> <urn:w> . ) . <urn:after> <urn:p> <urn:o> . }",
+            vec![None, Some(&after_in_g)],
+        ),
+        // The same inside an open triple term or annotation.
+        (
+            false,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> <<( <urn:a> . <urn:u> <urn:v> <urn:w> . )>> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> <urn:o> {| <urn:q> . <urn:u> <urn:v> <urn:w> . |} . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        // RDF 1.2's delimiters opened in the skipped rest count as brackets too.
+        (
+            false,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> <urn:o> <urn:x> <<( <urn:a> <urn:b> . <urn:u> <urn:v> <urn:w> . )>> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> <urn:o> <urn:x> << <urn:a> <urn:b> . <urn:u> <urn:v> <urn:w> . >> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> <urn:o> <urn:x> {| <urn:a> <urn:b> . <urn:u> <urn:v> <urn:w> . |} . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        // The `}` closing the TriG block ends the statement, open brackets or not.
+        (
+            true,
+            RdfFormat::TriG,
+            "<urn:g> { <urn:s> <urn:p> [ <urn:q> . } <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        // Bytes the lexer can't read inside an open `[` (a string not closed on its line):
+        // the tokens after them aren't the document's, so the brackets open before count
+        // for nothing, and the skip ends at the next `.` outside brackets lexed after them.
+        (
+            true,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> [ <urn:q> \"open ; <urn:r> ( 1 2 ] .\n<urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        // The same when the bytes come while the rest is skipped (sol-loop A1B-R2-F1).
+        (
+            true,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> [ <urn:q> . \"open ; <urn:r> ( 1 2 ] .\n<urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        // Brackets the skip opened itself stay open past unreadable bytes (sol-loop
+        // A1B-R3-F1).
+        (
+            true,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> <urn:o> <urn:x> [ % . <urn:u> <urn:v> <urn:w> . ] . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        // A stray closer opens nothing: the next `.` outside brackets ends the statement.
+        (
+            true,
+            RdfFormat::Turtle,
+            "<urn:s> <urn:p> 1, ] . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
         // The failing token is the statement's own `.`.
         (
             false,
@@ -178,13 +278,25 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
         ),
     ];
     for (guard, format, document, expected) in cases {
-        let items = drain(
-            RdfParser::from_format(format)
-                .recovering()
-                .for_slice(document.as_bytes()),
-        );
-        let got: Vec<Option<&Quad>> = items.iter().map(|item| item.as_ref().ok()).collect();
-        table.row(guard, ("recovering", document), same(got, expected.clone()));
+        let parser = || RdfParser::from_format(format).recovering();
+        let bytes = || Pieces(document.as_bytes().chunks(1).map(Ok).collect());
+        for (path, items) in [
+            ("slice", drain(parser().for_slice(document.as_bytes()))),
+            ("reader", drain(parser().for_reader(document.as_bytes()))),
+            ("byte reader", drain(parser().for_reader(bytes()))),
+        ] {
+            let got: Vec<Option<&Quad>> = items.iter().map(|item| item.as_ref().ok()).collect();
+            // No quad from inside the failed statement, and all of the output as expected.
+            let inside = got
+                .iter()
+                .flatten()
+                .any(|quad| quad.subject.to_string() == "<urn:u>");
+            let outcome = match inside {
+                true => Err(format!("a quad from inside the failed statement: {got:?}")),
+                false => same(got, expected.clone()),
+            };
+            table.row(guard, ("recovering", path, document), outcome);
+        }
         // Strict: one error, then the end.
         let strict = drain(RdfParser::from_format(format).for_slice(document.as_bytes()));
         let strict_expected: Vec<bool> = match expected.first() {
