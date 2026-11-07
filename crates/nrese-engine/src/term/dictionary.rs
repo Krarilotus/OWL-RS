@@ -996,12 +996,19 @@ impl Dictionary {
     /// The vector literals nearest to `query.vector` among the first `known` entries that
     /// `accept` takes (by id), nearest first; the index first takes in the vector literals
     /// interned since the last search, and builds or extends the graph the search uses.
-    pub fn vector_search(
+    pub fn vector_search<'b>(
         &self,
         query: &super::VectorQuery,
         known: u64,
         accept: &(dyn Fn(TermId) -> bool + Sync),
-    ) -> (Vec<nrese_vector::Hit>, super::VectorSearchReport) {
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<
+        (
+            nrese_exec::ChargedVec<nrese_vector::Hit, &'b nrese_exec::Budget>,
+            super::VectorSearchReport,
+        ),
+        nrese_exec::BudgetExceeded,
+    > {
         self.cover_vectors();
         if self.vectors.read().may_need_work(query) {
             let work = self.vectors.write().work_for(query);
@@ -1026,7 +1033,7 @@ impl Dictionary {
         // What the search reads, taken under the lock; the search and `accept` run without
         // it (`accept` may intern and search again; the scans are parallel).
         let input = self.vectors.read().search_input(query);
-        super::vectors::search(input, query, &accept)
+        super::vectors::search(input, query, &accept, budget)
     }
 
     /// Builds the graph a search like `query` uses, covering every vector, before
@@ -2103,6 +2110,13 @@ fn validate_key(key: &[u8]) -> EngineResult<()> {
 mod lock_order_tests;
 
 #[cfg(test)]
+/// A budget that refuses nothing, for vector searches whose memory a test doesn't check.
+pub(crate) fn unlimited() -> &'static nrese_exec::Budget {
+    static UNLIMITED: std::sync::OnceLock<nrese_exec::Budget> = std::sync::OnceLock::new();
+    UNLIMITED.get_or_init(nrese_exec::Budget::unlimited)
+}
+
+#[cfg(test)]
 mod tests {
     use nrese_rdf::vocab::xsd;
     use nrese_rdf::{BlankNodeRef, LiteralRef, NamedNodeRef};
@@ -2340,7 +2354,9 @@ mod tests {
         };
         let query = VectorQuery::new(vec![1.0], 1);
         let search = |dictionary: &Dictionary| {
-            dictionary.vector_search(&query, dictionary.len(), &|_| true);
+            dictionary
+                .vector_search(&query, dictionary.len(), &|_| true, unlimited())
+                .unwrap();
         };
         let dir = tempfile::tempdir().unwrap();
         let source = Dictionary::default();
