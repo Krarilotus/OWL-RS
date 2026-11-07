@@ -422,8 +422,10 @@ pub async fn repository_put(
             let quads = state
                 .repositories()
                 .parse_configuration(format, &body)
-                .map_err(|error| {
-                    ApiError::bad_request(format!("repository configuration: {error}"))
+                .map_err(|error| match error.is_memory_limit() {
+                    // Memory refused as a query's is (the server's budget in use: 503).
+                    true => sparql::map_query_error(&state.policy(), error),
+                    false => ApiError::bad_request(format!("repository configuration: {error}")),
                 })?;
             crate::repository_config::from_config(&id, &quads).map_err(ApiError::bad_request)?
         }

@@ -19,7 +19,7 @@ use nrese_sparql::ReadView;
 
 use crate::error::StoreResult;
 use crate::query::GraphResultFormat;
-use crate::rdf_io::{BlankNodes, each_payload_quad};
+use crate::rdf_io::{BlankNodes, Consumer, each_payload_quad};
 use crate::update::SparqlUpdateRequest;
 use crate::view::decoded_quads;
 
@@ -93,11 +93,12 @@ pub struct RdfPayload {
 
 impl RdfPayload {
     /// The payload's statements placed per `contexts` (module docs), each to `each` as it
-    /// is read: once per context if any are given.
+    /// is read (as `consumer` needs them: [`Consumer`]): once per context if any are given.
     fn each_quad(
         &self,
         contexts: &[GraphName],
         blank_nodes: BlankNodes,
+        consumer: Consumer,
         mut each: impl FnMut(QuadRef<'_>) -> StoreResult<()>,
     ) -> StoreResult<()> {
         each_payload_quad(
@@ -105,6 +106,7 @@ impl RdfPayload {
             self.base_iri.as_deref(),
             &self.payload,
             blank_nodes,
+            consumer,
             |quad| {
                 if contexts.is_empty() {
                     return each(quad);
@@ -123,7 +125,7 @@ impl RdfPayload {
 
     /// Whether the payload is RDF in its format: read to its end, nothing kept.
     fn check(&self, blank_nodes: BlankNodes) -> StoreResult<()> {
-        self.each_quad(&[], blank_nodes, |_| Ok(()))
+        self.each_quad(&[], blank_nodes, Consumer::Local, |_| Ok(()))
     }
 }
 
@@ -271,17 +273,20 @@ pub(crate) fn apply_statements(
 ) -> StoreResult<()> {
     for op in &request.ops {
         // Each statement of a payload as it is read; one that fails part-way fails the
-        // request, whose transaction is then discarded with all it changed.
+        // request, whose transaction is then discarded with all it changed. Inserts intern
+        // into the shared dictionary, which a discarded transaction doesn't undo: their
+        // payload is read whole and found valid first ([`Consumer::Interning`]). Removals
+        // only look terms up.
         match op {
             StatementOp::Add { data, contexts } => {
-                data.each_quad(contexts, BlankNodes::Fresh, |quad| {
+                data.each_quad(contexts, BlankNodes::Fresh, Consumer::Interning, |quad| {
                     check_write(requester, quad.graph_name)?;
                     tx.insert(quad);
                     Ok(())
                 })?;
             }
             StatementOp::RemoveData { data, contexts } => {
-                data.each_quad(contexts, BlankNodes::Fresh, |quad| {
+                data.each_quad(contexts, BlankNodes::Fresh, Consumer::Local, |quad| {
                     check_write(requester, quad.graph_name)?;
                     tx.remove(quad);
                     Ok(())
@@ -293,7 +298,8 @@ pub(crate) fn apply_statements(
                 contexts,
                 preserve_blank_nodes,
             } => {
-                data.each_quad(&[], blank_nodes(*preserve_blank_nodes), |quad| {
+                let blank_nodes = blank_nodes(*preserve_blank_nodes);
+                data.each_quad(&[], blank_nodes, Consumer::Local, |quad| {
                     remove_matching(tx, &removal_pattern(quad, contexts), requester)
                 })?;
             }

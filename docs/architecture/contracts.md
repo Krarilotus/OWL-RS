@@ -51,11 +51,6 @@ sampled `MemoryWatch` are not exact pre-allocation admission. See [resource life
 
 Known bypasses:
 
-- `crates/nrese-store/src/rdf_io.rs:59`: `parse_graph` collects an owned `Vec<Quad>` with no envelope.
-- `crates/nrese-store/src/rdf_io.rs:76`: `parse_payload` does the same for uploads.
-- `crates/nrese-store/src/rdf_io.rs:89`: Preserved-blank-node parser duplicates the uncharged collection.
-- `crates/nrese-store/src/rdf_io.rs:101`: Dataset restore parser collects the same way.
-- `crates/nrese-store/src/statements.rs:101`: Context fan-out clones every parsed quad into every context then collects, beside the original parse.
 - `crates/nrese-store/src/statements.rs:212`: Pattern matching materializes decoded quads in a plain growing vector.
 - `crates/nrese-store/src/dl/source.rs:109`: Transaction ontology reader collects all asserted `Statement`s before `nrese_owl::read`, without an envelope parameter.
 - `crates/nrese-store/src/dl/source.rs:126`: Snapshot ontology reader repeats the full uncharged collection.
@@ -76,6 +71,8 @@ Known bypasses:
 - `crates/nrese-exec/src/graph.rs:148`: Transitive closure produces a plain Vec of potentially quadratic pairs without reservation; :155 constructs the output.
 
 DL documents sampled accounting in `crates/nrese-dl/src/memory.rs:1`; it is not exact pre-allocation admission.
+
+A dropped transaction does not undo dictionary interning (`crates/nrese-engine/src/engine/transaction.rs:503–515`, open row, owner engine/transaction); ingest callers that intern validate the whole document first (`crates/nrese-store/src/rdf_io.rs` `Consumer::Interning`).
 
 ## Lock order
 

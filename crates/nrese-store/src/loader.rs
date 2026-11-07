@@ -9,7 +9,7 @@ use tracing::info;
 use crate::config::StoreConfig;
 use crate::error::{StoreError, StoreResult};
 use crate::query::GraphResultFormat;
-use crate::rdf_io::{BlankNodes, each_graph_quad, file_base_iri};
+use crate::rdf_io::{BlankNodes, each_graph_quad_once, file_base_iri};
 
 /// Loads the configured ontology file into the default graph, if one is configured. A
 /// configured but missing file is an error. Idempotent: the file's own blank-node labels
@@ -26,10 +26,12 @@ pub(crate) fn preload_ontology(
             path: ontology_path,
         });
     }
-    // Each statement into the transaction as it is read; committed only once the file is
-    // read to its end (an error drops the transaction, and nothing of the file is kept).
+    // Each statement into the transaction as it is read, in one pass; committed only once
+    // the file is read to its end. An error fails the store's opening, which drops this
+    // engine with its dictionary: the terms a failed file interned go with it, so no first
+    // validating pass is needed (unlike uploads, `Consumer::Interning`).
     let mut tx = engine.transaction();
-    each_graph_quad(
+    each_graph_quad_once(
         infer_ontology_format(&ontology_path)?,
         Some(&file_base_iri(&ontology_path)?),
         BufReader::new(File::open(&ontology_path)?),
