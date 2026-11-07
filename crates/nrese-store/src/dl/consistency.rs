@@ -169,7 +169,11 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
 }
 
 fn normalisation() -> nrese_owl::Options {
-    nrese_owl::Options::default()
+    // This check consumes only the verdict, never clause proofs or justifications.
+    nrese_owl::Options {
+        exact_provenance: false,
+        ..nrese_owl::Options::default()
+    }
 }
 
 fn check_using(ontology: &Ontology, budget: &Budget, normalise: nrese_owl::Options) -> Checked {
