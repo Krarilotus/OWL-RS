@@ -20,6 +20,9 @@ thread_local! {
     /// What `CLOCK` reads once a checkpoint's parts are written, before its commit time:
     /// the time a long checkpoint write took.
     pub(crate) static CLOCK_AT_TRAILER: Cell<Option<u64>> = const { Cell::new(None) };
+    /// What `CLOCK` reads once a transaction's record is about to be written to the log,
+    /// its preparation (runs, a layout conversion, a rotation) done: the time that took.
+    pub(crate) static CLOCK_AT_APPEND: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 /// An error if `point` is set on this thread.

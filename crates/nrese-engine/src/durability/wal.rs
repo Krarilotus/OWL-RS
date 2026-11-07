@@ -249,6 +249,10 @@ impl Wal {
         if self.active_bytes >= self.segment_bytes {
             self.rotate(record.revision)?;
         }
+        #[cfg(test)]
+        if let Some(at) = super::fault::CLOCK_AT_APPEND.get() {
+            super::fault::CLOCK.set(Some(at));
+        }
         self.buffer.clear();
         // Version 4 segments (stores that keep integers in their dictionary) have no times.
         let timed;
