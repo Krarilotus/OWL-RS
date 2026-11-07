@@ -2264,6 +2264,43 @@ mod tests {
         }
     }
 
+    /// P2-01, Sol r1 S1. A scan copies no key of a heap's tail, a frozen heap's included: its
+    /// peak stays below half the tail's bytes, where any copy of the tail holds all of them.
+    /// Here 64 keys of 256 KiB in a heap frozen by a bulk load, and a needle matching none.
+    #[test]
+    fn a_scan_copies_no_tail_keys() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        let dictionary = Dictionary::default();
+        let long = 256 << 10;
+        let padding = "x".repeat(long);
+        for i in 0..64 {
+            let text = format!("{i:04}{padding}");
+            dictionary.intern(LiteralRef::new_simple_literal(&text).into());
+        }
+        let pending = Pending::default();
+        let key = b"Iurn:freezes-the-heap".to_vec();
+        let mut indexes = vec![NEW];
+        pending.intern((1, 0), &mut indexes, &mut Vec::new(), |_| {
+            (&key[..], key_hash(&key))
+        });
+        dictionary.adopt_pending(pending, |_| {});
+        assert!(matches!(
+            &*dictionary.inner.read().segments[0],
+            Segment::Heap(heap) if heap.tail.len() == 64
+        ));
+        let test = containing("no such text", super::super::Placement::Anywhere);
+        let (found, peak) =
+            nrese_exec::measure::measure(|| dictionary.matching_strings(&test, u64::MAX));
+        assert!(found.is_empty());
+        assert!(
+            peak < 64 * long / 2,
+            "the scan held {peak} bytes over tails of {} bytes",
+            64 * long
+        );
+    }
+
     /// Views of decoded keys stay valid while the arena keeps more (its list grows and
     /// moves): the case Miri's Stacked Borrows checks (the audit of 2 October).
     #[test]
