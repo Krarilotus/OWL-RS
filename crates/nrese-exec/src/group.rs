@@ -7,7 +7,9 @@
 //! (SUM, MIN, AVG) need term values, which this crate doesn't resolve.
 
 use hashbrown::HashMap;
+use hashbrown::hash_map::Entry;
 
+use crate::narrow::{RepresentationLimit, group_id};
 use crate::table::IdTable;
 
 type Hasher = foldhash::fast::FixedState;
@@ -41,13 +43,14 @@ impl Groups {
 }
 
 /// Groups `table` by `keys`. With no keys, all rows form one group, and an empty input gives
-/// one empty group (SPARQL: an aggregate without GROUP BY yields one row).
-pub fn group_rows(table: &IdTable, keys: &[usize]) -> Groups {
+/// one empty group (SPARQL: an aggregate without GROUP BY yields one row). A group id past
+/// what a `u32` holds is refused where it would be issued, never wrapped onto another group.
+pub fn group_rows(table: &IdTable, keys: &[usize]) -> Result<Groups, RepresentationLimit> {
     if keys.is_empty() {
-        return Groups {
+        return Ok(Groups {
             keys: IdTable::from_rows(0, [&[][..]]),
             group_of: vec![0; table.len()],
-        };
+        });
     }
     let mut group_keys = IdTable::new(keys.len());
     let mut group_of = Vec::with_capacity(table.len());
@@ -57,54 +60,61 @@ pub fn group_rows(table: &IdTable, keys: &[usize]) -> Groups {
             *slot = table.get(row, k);
         }
     };
+    // Each id is checked once, where it is issued: the id of a new group is the number of
+    // groups before it.
     if table.is_sorted_on(keys) {
+        let mut group = 0;
         for row in 0..table.len() {
             let new_group = row == 0
                 || keys
                     .iter()
                     .any(|&k| table.get(row, k) != table.get(row - 1, k));
             if new_group {
+                group = group_id(group_keys.len())?;
                 fill(&mut key, row);
                 group_keys.push_row(&key);
             }
-            group_of.push(group_keys.len() as u32 - 1);
+            group_of.push(group);
         }
         let sorted: Vec<usize> = (0..keys.len()).collect();
-        return Groups {
+        return Ok(Groups {
             keys: group_keys.assume_sorted_by(sorted),
             group_of,
-        };
+        });
     }
     if let [k] = keys {
         let mut index: HashMap<u64, u32, Hasher> = HashMap::with_hasher(Hasher::default());
         for &value in table.column(*k) {
-            let next = index.len() as u32;
-            let group = *index.entry(value).or_insert_with(|| {
-                group_keys.push_row(&[value]);
-                next
-            });
+            let group = match index.entry(value) {
+                Entry::Occupied(group) => *group.get(),
+                Entry::Vacant(slot) => {
+                    let group = group_id(group_keys.len())?;
+                    group_keys.push_row(&[value]);
+                    *slot.insert(group)
+                }
+            };
             group_of.push(group);
         }
     } else {
         let mut index: HashMap<Vec<u64>, u32, Hasher> = HashMap::with_hasher(Hasher::default());
         for row in 0..table.len() {
             fill(&mut key, row);
-            let next = index.len() as u32;
             let group = match index.get(&key) {
                 Some(&group) => group,
                 None => {
-                    index.insert(key.clone(), next);
+                    let group = group_id(group_keys.len())?;
+                    index.insert(key.clone(), group);
                     group_keys.push_row(&key);
-                    next
+                    group
                 }
             };
             group_of.push(group);
         }
     }
-    Groups {
+    Ok(Groups {
         keys: group_keys,
         group_of,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -121,20 +131,20 @@ mod tests {
     fn sorted_and_hashed_grouping_agree() {
         let rows: Vec<[u64; 3]> = (0..500u64).map(|i| [i % 7, i % 3, i]).collect();
         let mut table = IdTable::from_rows(3, rows.iter().map(|r| &r[..]));
-        let hashed = group_rows(&table, &[0, 1]);
+        let hashed = group_rows(&table, &[0, 1]).unwrap();
         table.sort_by(&[0, 1]);
-        let sorted = group_rows(&table, &[0, 1]);
+        let sorted = group_rows(&table, &[0, 1]).unwrap();
         assert_eq!(counted(&hashed), counted(&sorted));
         assert_eq!(sorted.len(), 21);
         assert!(sorted.keys.is_sorted_on(&[0, 1]));
-        let single = group_rows(&table, &[1]);
+        let single = group_rows(&table, &[1]).unwrap();
         assert_eq!(counted(&single).iter().map(|(_, n)| n).sum::<u64>(), 500);
     }
 
     #[test]
     fn no_keys_is_one_group_even_when_empty() {
         let empty = IdTable::new(2);
-        let groups = group_rows(&empty, &[]);
+        let groups = group_rows(&empty, &[]).unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups.counts(), vec![0]);
     }
