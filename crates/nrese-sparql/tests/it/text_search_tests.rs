@@ -342,6 +342,90 @@ fn graphdb_lucene_predicates() {
     );
 }
 
+/// `text:query`'s limit counts the literals of its property: a literal of another
+/// property that ranks higher ("bridge" three times in three words, BM25) takes none of
+/// the limit, so `(rdfs:label "bridge" 1)` finds the one label that matches.
+#[test]
+fn jena_limit_counts_the_property_literals_only() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let rdfs = |local: &str| {
+        NamedNode::new_unchecked(format!("http://www.w3.org/2000/01/rdf-schema#{local}"))
+    };
+    for (subject, property, text) in [
+        ("note", "comment", "bridge bridge bridge"),
+        ("span", "label", "the old bridge over the river"),
+    ] {
+        tx.insert(
+            Quad::new(
+                ex(subject),
+                rdfs(property),
+                Literal::new_simple_literal(text),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    let plain = QueryOptions::default();
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT ?s WHERE { ?s text:query (rdfs:label \"bridge\" 1) }",
+            &plain
+        ),
+        table(&[&["span"]])
+    );
+    // Without a property, the comment ranks first and the limit keeps it.
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT ?s WHERE { ?s text:query (\"bridge\" 1) }",
+            &plain
+        ),
+        table(&[&["note"]])
+    );
+}
+
+/// How long the cyclic lists below may take before the test calls them hung: a bound
+/// that contains a walk unable to finish, not a measurement.
+const CYCLE_HANG: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A cyclic RDF list (`_:a rdf:rest _:a`) as `text:query`'s subject or object is not an
+/// argument list, as a list without `rdf:nil` isn't: the pattern is read as written and
+/// finds nothing here, instead of walking the cycle forever.
+#[test]
+fn cyclic_text_query_lists_answer() {
+    let queries = [
+        "SELECT ?s WHERE { ?s text:query _:a . _:a rdf:first \"bridge\" ; rdf:rest _:a }",
+        "SELECT ?s WHERE { ?s text:query _:a .          _:a rdf:first rdfs:label ; rdf:rest _:b . _:b rdf:first \"bridge\" ; rdf:rest _:a }",
+        "SELECT ?s WHERE { _:l text:query \"bridge\" . _:l rdf:first ?s ; rdf:rest _:l }",
+    ];
+    // Each list on a thread of its own, so that one that hangs doesn't hide the others.
+    let answers: Vec<_> = queries
+        .iter()
+        .map(|query| {
+            let (send, receive) = std::sync::mpsc::channel();
+            let query =
+                format!("PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> {query}");
+            std::thread::spawn(move || {
+                let _ = send.send(rows(&engine(), &query, &QueryOptions::default()));
+            });
+            receive
+        })
+        .collect();
+    let failures: Vec<String> = answers
+        .into_iter()
+        .enumerate()
+        .filter_map(|(case, receive)| match receive.recv_timeout(CYCLE_HANG) {
+            Ok(answer) if answer.is_empty() => None,
+            Ok(answer) => Some(format!("cyclic list {case}: {answer:?}")),
+            Err(e) => Some(format!("cyclic list {case}: no answer ({e})")),
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 /// A search under `GRAPH ?g` matches only literals of the named graphs the query's dataset
 /// has (SPARQL 1.1 §13.3, §18.6): those `FROM NAMED` lists, and of those only the graphs its
 /// reader may read (`QueryOptions::access`: the others are absent). One row each, every row
