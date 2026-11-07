@@ -1,24 +1,39 @@
 //! The validation report (design §6): results with their terms decoded, and the report as
 //! an RDF graph.
 
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use nrese_engine::TermId;
+use nrese_exec::Reservation;
 use nrese_rdf::vocab::{rdf, xsd};
 use nrese_rdf::{BlankNode, Literal, NamedNode, NamedOrBlankNode, Term, Triple};
-use nrese_sparql::ReadView;
+use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 
 use crate::model::{Component, Path, SH, Severity, Shapes};
 use crate::validate::RawResult;
 
 /// What validating a data graph against a shapes graph found.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ValidationReport {
     pub results: Vec<ValidationResult>,
     /// Validation failures (SHACL §3.6.2): a SPARQL-based constraint that couldn't be
     /// evaluated or reported `?failure`. A report with failures is no verdict.
     pub failures: Vec<String>,
+    /// The report's charge to the envelope of the request that made it, held while the
+    /// report (or a clone of it) lives.
+    _held: Option<Arc<Reservation>>,
 }
+
+/// Reports are equal when what they report is: their charge isn't part of it.
+impl PartialEq for ValidationReport {
+    fn eq(&self, other: &Self) -> bool {
+        self.results == other.results && self.failures == other.failures
+    }
+}
+
+impl Eq for ValidationReport {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationResult {
@@ -99,58 +114,180 @@ fn decode_path<V: ReadView>(view: &V, path: &Path) -> Option<PropertyPath> {
     })
 }
 
+/// The bytes a decoded term holds besides its own slot: its text.
+fn term_bytes(term: &Term) -> usize {
+    match term {
+        Term::NamedNode(node) => node.as_str().len(),
+        Term::BlankNode(node) => node.as_str().len(),
+        Term::Literal(literal) => {
+            literal.value().len()
+                + literal.datatype().as_str().len()
+                + literal.language().map_or(0, str::len)
+        }
+        Term::Triple(triple) => {
+            std::mem::size_of::<Triple>()
+                + match &triple.subject {
+                    NamedOrBlankNode::NamedNode(node) => node.as_str().len(),
+                    NamedOrBlankNode::BlankNode(node) => node.as_str().len(),
+                }
+                + triple.predicate.as_str().len()
+                + term_bytes(&triple.object)
+        }
+    }
+}
+
+/// The bytes a decoded path holds besides its own slot.
+fn property_path_bytes(path: &PropertyPath) -> usize {
+    match path {
+        PropertyPath::Predicate(predicate) => predicate.as_str().len(),
+        PropertyPath::Inverse(inner)
+        | PropertyPath::ZeroOrMore(inner)
+        | PropertyPath::OneOrMore(inner)
+        | PropertyPath::ZeroOrOne(inner) => {
+            std::mem::size_of::<PropertyPath>() + property_path_bytes(inner)
+        }
+        PropertyPath::Sequence(parts) | PropertyPath::Alternative(parts) => {
+            parts.capacity() * std::mem::size_of::<PropertyPath>()
+                + parts.iter().map(property_path_bytes).sum::<usize>()
+        }
+    }
+}
+
+/// The terms a report names, each decoded once from the view and charged as it is kept:
+/// one term is held just before its charge, which is the data's own size, not the
+/// report's. Dropped, the terms are freed, then their charge returned.
+struct Terms<'v, V> {
+    view: &'v V,
+    decoded: HashMap<TermId, Term>,
+    held: Reservation,
+}
+
+impl<V: ReadView> Terms<'_, V> {
+    /// Makes sure `id` is decoded.
+    fn load(&mut self, id: TermId) -> Result<(), QueryEvaluationError> {
+        if !self.decoded.contains_key(&id) {
+            let term = self.view.decode(id).expect("ids read from the view decode");
+            self.held
+                .charge(2 * std::mem::size_of::<(TermId, Term)>() + term_bytes(&term))?;
+            self.decoded.insert(id, term);
+        }
+        Ok(())
+    }
+
+    fn get(&self, id: TermId) -> &Term {
+        &self.decoded[&id]
+    }
+}
+
 /// Decodes `raw` into a report. Ids come from `view`'s dictionary, so every one decodes.
+///
+/// The report is charged to `resources`' envelope, each result before it is built (its
+/// messages, which every result of a shape copies, included), and holds that charge while
+/// it lives; `resources`' cancellation is checked before each result and before the report
+/// is returned. A refusal or a cancellation is the outcome, with no report.
 pub(crate) fn decode<V: ReadView>(
     view: &V,
     shapes: &Shapes,
     raw: &[RawResult],
     failures: Vec<String>,
-) -> ValidationReport {
-    let term = |id: TermId| view.decode(id).expect("ids read from the view decode");
-    let results = raw
-        .iter()
-        .map(|result| {
-            let shape = &shapes.shapes[result.shape];
-            let severity = match shape.severity {
-                Severity::Violation => sh("Violation"),
+    resources: &Resources,
+) -> Result<ValidationReport, QueryEvaluationError> {
+    let budget = Arc::new(resources.memory.part());
+    let mut held = Reservation::new(Arc::clone(&budget));
+    let mut terms = Terms {
+        view,
+        decoded: HashMap::new(),
+        held: Reservation::new(budget),
+    };
+    let sh_bytes = SH.len() + "ConstraintComponent".len();
+    let mut results = Vec::new();
+    for result in raw {
+        resources.check()?;
+        let shape = &shapes.shapes[result.shape];
+        let custom = match result.component {
+            Component::Custom(component) => Some(component),
+            _ => None,
+        };
+        let severity_id = match shape.severity {
+            Severity::Other(severity) => Some(severity),
+            _ => None,
+        };
+        let messages = result.messages.as_deref().unwrap_or(&shape.messages);
+        for id in [
+            Some(result.focus),
+            result.value,
+            Some(shape.node),
+            result.source,
+            custom,
+            severity_id,
+        ]
+        .into_iter()
+        .flatten()
+        .chain(messages.iter().copied())
+        {
+            terms.load(id)?;
+        }
+        let path = result
+            .path
+            .as_ref()
+            .and_then(|path| decode_path(view, path));
+        // What this result holds once built, charged before any of it is copied.
+        let mut bytes = 2 * std::mem::size_of::<ValidationResult>()
+            + term_bytes(terms.get(result.focus))
+            + result.value.map_or(0, |id| term_bytes(terms.get(id)))
+            + term_bytes(terms.get(shape.node))
+            + result.source.map_or(0, |id| term_bytes(terms.get(id)))
+            + 2 * sh_bytes
+            + path.as_ref().map_or(0, property_path_bytes)
+            + messages.len() * std::mem::size_of::<Literal>();
+        for &message in messages {
+            bytes += term_bytes(terms.get(message));
+        }
+        for id in [custom, severity_id].into_iter().flatten() {
+            bytes += term_bytes(terms.get(id));
+        }
+        held.charge(bytes)?;
+        let severity = match severity_id.map(|id| terms.get(id)) {
+            None => match shape.severity {
                 Severity::Warning => sh("Warning"),
                 Severity::Info => sh("Info"),
-                Severity::Other(severity) => match term(severity) {
-                    Term::NamedNode(severity) => severity,
-                    _ => sh("Violation"),
-                },
-            };
-            ValidationResult {
-                focus_node: term(result.focus),
-                path: result
-                    .path
-                    .as_ref()
-                    .and_then(|path| decode_path(view, path)),
-                value: result.value.map(term),
-                source_shape: term(shape.node),
-                component: match result.component {
-                    Component::Custom(component) => match term(component) {
-                        Term::NamedNode(component) => component,
-                        _ => sh("ConstraintComponent"),
-                    },
-                    component => NamedNode::new_unchecked(component.iri()),
-                },
-                source_constraint: result.source.map(term),
-                severity,
-                messages: result
-                    .messages
-                    .as_deref()
-                    .unwrap_or(&shape.messages)
-                    .iter()
-                    .filter_map(|&message| match term(message) {
-                        Term::Literal(message) => Some(message),
-                        _ => None,
-                    })
-                    .collect(),
-            }
-        })
-        .collect();
-    ValidationReport { results, failures }
+                _ => sh("Violation"),
+            },
+            Some(Term::NamedNode(severity)) => severity.clone(),
+            Some(_) => sh("Violation"),
+        };
+        results.push(ValidationResult {
+            focus_node: terms.get(result.focus).clone(),
+            path,
+            value: result.value.map(|id| terms.get(id).clone()),
+            source_shape: terms.get(shape.node).clone(),
+            component: match custom.map(|id| terms.get(id)) {
+                None => NamedNode::new_unchecked(result.component.iri()),
+                Some(Term::NamedNode(component)) => component.clone(),
+                Some(_) => sh("ConstraintComponent"),
+            },
+            source_constraint: result.source.map(|id| terms.get(id).clone()),
+            severity,
+            messages: messages
+                .iter()
+                .filter_map(|&message| match terms.get(message) {
+                    Term::Literal(message) => Some(message.clone()),
+                    _ => None,
+                })
+                .collect(),
+        });
+    }
+    // The terms are freed, and their charge returned; the failures are the report's now.
+    drop(terms);
+    for failure in &failures {
+        held.charge(2 * std::mem::size_of::<String>() + failure.len())?;
+    }
+    resources.check()?;
+    Ok(ValidationReport {
+        results,
+        failures,
+        _held: Some(Arc::new(held)),
+    })
 }
 
 impl ValidationReport {

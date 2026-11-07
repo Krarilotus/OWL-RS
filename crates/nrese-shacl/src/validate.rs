@@ -4,9 +4,10 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use nrese_engine::{TermId, TermKind};
+use nrese_exec::Reservation;
 use nrese_rdf::Term;
 use nrese_sparql::value::{Value, compare, lang_matches};
 use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
@@ -37,16 +38,48 @@ pub(crate) struct RawResult {
     pub(crate) messages: Option<Vec<TermId>>,
 }
 
+impl RawResult {
+    /// What keeping this result can hold, at most: its slot in the vector of its focus node
+    /// and in the collected one (each up to twice its items while it grows), and its heap.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        4 * std::mem::size_of::<Self>()
+            + self.path.as_ref().map_or(0, path_bytes)
+            + self.messages.as_ref().map_or(0, |messages| {
+                messages.capacity() * std::mem::size_of::<TermId>()
+            })
+    }
+}
+
+/// The heap a path holds.
+fn path_bytes(path: &Path) -> usize {
+    match path {
+        Path::Predicate(_) => 0,
+        Path::Inverse(inner)
+        | Path::ZeroOrMore(inner)
+        | Path::OneOrMore(inner)
+        | Path::ZeroOrOne(inner) => std::mem::size_of::<Path>() + path_bytes(inner),
+        Path::Sequence(parts) | Path::Alternative(parts) => {
+            parts.capacity() * std::mem::size_of::<Path>()
+                + parts.iter().map(path_bytes).sum::<usize>()
+        }
+    }
+}
+
+/// What a validation keeps, with the charge for it ([`Validator::into_failures`]): free the
+/// results, then drop the charge.
+pub(crate) type Kept = (Vec<RawResult>, Vec<String>, Reservation);
+
 /// Validates the data in `data` against every targeted shape: the results, and the
-/// failures (SPARQL-based constraints that couldn't be evaluated). Focus nodes are
-/// validated in parallel; the results keep the sequential order. A stop of `resources` is
-/// the outcome instead ([`Validator::into_failures`]).
+/// failures (SPARQL-based constraints that couldn't be evaluated), with their charge to
+/// `resources`' envelope. Focus nodes are validated in parallel; the results keep the
+/// sequential order. A stop of `resources` is the outcome instead
+/// ([`Validator::into_failures`]).
 pub(crate) fn validate_raw<V: ReadView + Sync>(
     view: &V,
     shapes: &Shapes,
     data: Selection,
     resources: &Resources,
-) -> Result<(Vec<RawResult>, Vec<String>), QueryEvaluationError> {
+) -> Result<Kept, QueryEvaluationError> {
     resources.check()?;
     let validator = Validator::new(view, shapes, data, resources);
     let work: Vec<(ShapeRef, TermId)> = shapes
@@ -59,8 +92,8 @@ pub(crate) fn validate_raw<V: ReadView + Sync>(
         })
         .collect();
     let results = validator.validate_all(&work);
-    let failures = validator.into_failures()?;
-    Ok((results, failures))
+    let (failures, held) = validator.into_failures()?;
+    Ok((results, failures, held))
 }
 
 /// Whether validating `data` against `shapes` checks anything: an active targeted shape
@@ -108,6 +141,9 @@ pub(crate) struct Validator<'a, V: ReadView> {
     /// outcome, whatever the work returned.
     stop: OnceLock<QueryEvaluationError>,
     failures: std::sync::Mutex<Vec<String>>,
+    /// The charge, to the request's envelope, for the results and failures kept: made
+    /// before each is kept, held until they are dropped ([`Validator::keep`]).
+    held: std::sync::Mutex<Reservation>,
     rdf_type: Option<TermId>,
     /// Each class the shapes name, with its subclasses (itself included).
     classes: HashMap<TermId, BTreeSet<TermId>>,
@@ -138,6 +174,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
             resources,
             stop: OnceLock::new(),
             failures: std::sync::Mutex::default(),
+            held: std::sync::Mutex::new(Reservation::new(Arc::new(resources.memory.part()))),
             classes: HashMap::new(),
         };
         let sub_class_of = graph.iri(RDFS_SUB_CLASS_OF);
@@ -163,16 +200,52 @@ impl<'a, V: ReadView> Validator<'a, V> {
         validator
     }
 
-    /// The failures recorded while validating, or the stop that ended it: then no result
-    /// it produced may be used.
-    pub(crate) fn into_failures(self) -> Result<Vec<String>, QueryEvaluationError> {
+    /// The failures recorded while validating, with the charge for them and the results
+    /// kept, or the stop that ended it: then no result it produced may be used.
+    pub(crate) fn into_failures(self) -> Result<(Vec<String>, Reservation), QueryEvaluationError> {
         if let Some(stop) = self.stop.into_inner() {
             return Err(stop);
         }
-        Ok(self
+        let failures = self
             .failures
             .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = self
+            .held
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok((failures, held))
+    }
+
+    /// Charges `bytes` to the request's envelope, or records its refusal as the stop.
+    fn charge(&self, bytes: usize) -> bool {
+        let charged = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .charge(bytes);
+        match charged {
+            Ok(()) => true,
+            Err(refused) => {
+                let _ = self.stop.set(QueryEvaluationError::MemoryLimit(refused));
+                false
+            }
+        }
+    }
+
+    /// Returns `bytes` charged for what has been dropped.
+    pub(crate) fn release(&self, bytes: usize) {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .release(bytes);
+    }
+
+    /// Keeps `result` in `results`, charged first; a refusal is the validation's stop.
+    fn keep(&self, results: &mut Vec<RawResult>, result: RawResult) {
+        if self.charge(result.retained_bytes()) {
+            results.push(result);
+        }
     }
 
     /// Whether the validation has stopped: a stop was met, or the cancellation fires now
@@ -246,7 +319,12 @@ impl<'a, V: ReadView> Validator<'a, V> {
     fn conforms(&self, shape: ShapeRef, node: TermId, stack: &mut Stack) -> bool {
         let mut results = Vec::new();
         self.validate_node(shape, node, &mut results, stack);
-        results.is_empty()
+        let conforms = results.is_empty();
+        // Only their existence counts: they are dropped, then their charge returned.
+        let charged: usize = results.iter().map(RawResult::retained_bytes).sum();
+        drop(results);
+        self.release(charged);
+        conforms
     }
 
     pub(crate) fn validate_node(
@@ -344,7 +422,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
         let mut each = |component: Component, ok: &mut dyn FnMut(TermId) -> bool| {
             for &value in values {
                 if !ok(value) {
-                    results.push(result(component, Some(value)));
+                    self.keep(results, result(component, Some(value)));
                 }
             }
         };
@@ -369,12 +447,12 @@ impl<'a, V: ReadView> Validator<'a, V> {
             }),
             Constraint::MinCount(min) => {
                 if (values.len() as u64) < *min {
-                    results.push(result(Component::MinCount, None));
+                    self.keep(results, result(Component::MinCount, None));
                 }
             }
             Constraint::MaxCount(max) => {
                 if values.len() as u64 > *max {
-                    results.push(result(Component::MaxCount, None));
+                    self.keep(results, result(Component::MaxCount, None));
                 }
             }
             Constraint::Range(bound, limit) => {
@@ -419,7 +497,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                     }
                 }
                 for _ in tags.values().filter(|&&count| count > 1) {
-                    results.push(result(Component::UniqueLang, None));
+                    self.keep(results, result(Component::UniqueLang, None));
                 }
             }
             Constraint::Equals(property) => {
@@ -427,7 +505,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 each(Component::Equals, &mut |v| other.binary_search(&v).is_ok());
                 for &value in &other {
                     if !values.contains(&value) {
-                        results.push(result(Component::Equals, Some(value)));
+                        self.keep(results, result(Component::Equals, Some(value)));
                     }
                 }
             }
@@ -460,7 +538,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                         let ok = matches!(order, Some(Ordering::Less))
                             || (!strict && matches!(order, Some(Ordering::Equal)));
                         if !ok {
-                            results.push(result(component, Some(value)));
+                            self.keep(results, result(component, Some(value)));
                         }
                     }
                 }
@@ -510,32 +588,35 @@ impl<'a, V: ReadView> Validator<'a, V> {
                     })
                     .count() as u64;
                 if min.is_some_and(|min| count < min) {
-                    results.push(result(Component::QualifiedMinCount, None));
+                    self.keep(results, result(Component::QualifiedMinCount, None));
                 }
                 if max.is_some_and(|max| count > max) {
-                    results.push(result(Component::QualifiedMaxCount, None));
+                    self.keep(results, result(Component::QualifiedMaxCount, None));
                 }
             }
             Constraint::Closed(allowed) => {
                 for &value in values {
                     for (predicate, object) in self.graph.edges(value) {
                         if !allowed.contains(&predicate) {
-                            results.push(RawResult {
-                                focus,
-                                path: Some(Path::Predicate(predicate)),
-                                value: Some(object),
-                                shape: shape_ref,
-                                component: Component::Closed,
-                                source: None,
-                                messages: None,
-                            });
+                            self.keep(
+                                results,
+                                RawResult {
+                                    focus,
+                                    path: Some(Path::Predicate(predicate)),
+                                    value: Some(object),
+                                    shape: shape_ref,
+                                    component: Component::Closed,
+                                    source: None,
+                                    messages: None,
+                                },
+                            );
                         }
                     }
                 }
             }
             Constraint::HasValue(expected) => {
                 if !values.contains(expected) {
-                    results.push(result(Component::HasValue, None));
+                    self.keep(results, result(Component::HasValue, None));
                 }
             }
             Constraint::In(allowed) => each(Component::In, &mut |v| allowed.contains(&v)),
@@ -569,10 +650,14 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 .graph
                 .decode(focus)
                 .map_or_else(String::new, |term| term.to_string());
-            self.failures
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(format!("a SPARQL constraint at focus node {at}: {problem}"));
+            let failure = format!("a SPARQL constraint at focus node {at}: {problem}");
+            // Kept like a result: charged first (twice its slot, for the vector's growth).
+            if self.charge(2 * std::mem::size_of::<String>() + failure.len()) {
+                self.failures
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(failure);
+            }
         };
         // Each combination of the parameters' values is a constraint of its own (SHACL §6.2),
         // run in turn: a stop between them ends the walk.
@@ -599,11 +684,33 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 Err(sparql::Problem::Failed(error)) => failure(&error),
                 Ok(sparql::Outcome::Failed(failed)) => {
                     for value in failed {
-                        results.push(raw(Some(value), shape.path.clone()));
+                        self.keep(results, raw(Some(value), shape.path.clone()));
                     }
                 }
-                Ok(sparql::Outcome::Solutions(found)) => {
-                    for solution in found {
+                Ok(sparql::Outcome::Solutions(solutions)) => {
+                    // Each solution is decoded, made a result (by id) and dropped before the
+                    // next: only the kept results, charged, stay. An evaluation error part way
+                    // makes the combination a failure with no results, as when it was read whole.
+                    let start = results.len();
+                    for solution in solutions {
+                        if self.stopped() {
+                            return ControlFlow::Break(());
+                        }
+                        let solution = match solution.map_err(sparql::Problem::from) {
+                            Ok(solution) => sparql::found(&solution),
+                            Err(sparql::Problem::Stopped(stop)) => {
+                                let _ = self.stop.set(stop);
+                                return ControlFlow::Break(());
+                            }
+                            Err(sparql::Problem::Failed(error)) => {
+                                let dropped: usize =
+                                    results[start..].iter().map(RawResult::retained_bytes).sum();
+                                results.truncate(start);
+                                self.release(dropped);
+                                failure(&error);
+                                break;
+                            }
+                        };
                         if solution.failure {
                             failure("the query reported ?failure");
                             continue;
@@ -618,7 +725,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                             .and_then(|path| self.graph.lookup(&Term::NamedNode(path)))
                             .map(Path::Predicate)
                             .or_else(|| shape.path.clone());
-                        results.push(raw(value, path));
+                        self.keep(results, raw(value, path));
                     }
                 }
             }

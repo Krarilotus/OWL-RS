@@ -9,6 +9,8 @@ license.workspace = true
 
 [dependencies]
 nrese-engine = { path = "../nrese-engine" }
+# Retained results and the decoded report are charged to the request's envelope.
+nrese-exec = { path = "../nrese-exec" }
 nrese-sparql = { path = "../nrese-sparql" }
 nrese-sparql-syntax = { path = "../rdf/nrese-sparql-syntax" }
 nrese-rdf = { path = "../rdf/nrese-rdf" }

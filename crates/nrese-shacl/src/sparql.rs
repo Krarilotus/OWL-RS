@@ -28,7 +28,10 @@ use std::sync::Arc;
 
 use nrese_engine::TermId;
 use nrese_rdf::{NamedNode, Term, Variable};
-use nrese_sparql::{QueryEvaluationError, QueryOptions, QueryResults, ReadView, Resources};
+use nrese_sparql::{
+    QueryEvaluationError, QueryOptions, QueryResults, QuerySolution, QuerySolutionIter, ReadView,
+    Resources,
+};
 use nrese_sparql_syntax::algebra::{Expression, GraphPattern, PropertyPathExpression};
 
 use crate::graph::Selection;
@@ -173,10 +176,11 @@ pub(crate) struct Found {
 }
 
 /// What a check found for one focus node: per value node (ASK) or per solution (SELECT).
-pub(crate) enum Outcome {
+pub(crate) enum Outcome<'a> {
     /// The value nodes an ASK validator answered false for.
     Failed(Vec<TermId>),
-    Solutions(Vec<Found>),
+    /// A SELECT's solutions, decoded as they are read ([`found`]): none is kept here.
+    Solutions(QuerySolutionIter<'a>),
 }
 
 /// Why a check has no outcome.
@@ -212,8 +216,8 @@ impl From<QueryEvaluationError> for Problem {
     clippy::too_many_arguments,
     reason = "one check's inputs: the data, the check and its parameters, its focus and values, its shape's terms and the resources"
 )]
-pub(crate) fn run<V: ReadView>(
-    view: &V,
+pub(crate) fn run<'a, V: ReadView>(
+    view: &'a V,
     data: Selection,
     check: &SparqlCheck,
     parameters: &[(Variable, TermId)],
@@ -222,7 +226,7 @@ pub(crate) fn run<V: ReadView>(
     shape: TermId,
     shapes_graph: Option<TermId>,
     resources: &Resources,
-) -> Result<Outcome, Problem> {
+) -> Result<Outcome<'a>, Problem> {
     let decode = |id: TermId| {
         view.decode(id)
             .ok_or_else(|| format!("term #{} isn't known", id.raw()))
@@ -273,22 +277,23 @@ pub(crate) fn run<V: ReadView>(
             "a SELECT constraint isn't a SELECT query".into(),
         ));
     };
-    let mut found = Vec::new();
-    for solution in solutions {
-        let solution = solution.map_err(Problem::from)?;
-        let failure = matches!(
-            solution.get("failure"),
-            Some(Term::Literal(l)) if l.value() == "true"
-        );
-        let path = match solution.get("path") {
-            Some(Term::NamedNode(path)) => Some(path.clone()),
-            _ => None,
-        };
-        found.push(Found {
-            value: solution.get(VALUE).cloned(),
-            path,
-            failure,
-        });
+    Ok(Outcome::Solutions(solutions))
+}
+
+/// A SELECT check's solution, as a result ([`Outcome::Solutions`] yields them as they are
+/// read: each is decoded, used and dropped before the next).
+pub(crate) fn found(solution: &QuerySolution) -> Found {
+    let failure = matches!(
+        solution.get("failure"),
+        Some(Term::Literal(l)) if l.value() == "true"
+    );
+    let path = match solution.get("path") {
+        Some(Term::NamedNode(path)) => Some(path.clone()),
+        _ => None,
+    };
+    Found {
+        value: solution.get(VALUE).cloned(),
+        path,
+        failure,
     }
-    Ok(Outcome::Solutions(found))
 }
