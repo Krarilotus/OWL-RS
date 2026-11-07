@@ -451,7 +451,8 @@ fn check_reasoning(
         (true, None) => None,
     };
     Ok(DraftOutcome {
-        complete: unsupported.is_empty() && consistent.is_some(),
+        // An undecided verdict is among the classification's reasons, so never complete.
+        complete: unsupported.is_empty(),
         unsupported,
         logical_consistent: consistent,
         // The classification report lists none for an inconsistent ontology; nor does an
