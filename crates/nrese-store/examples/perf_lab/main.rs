@@ -64,6 +64,8 @@
 //!   `--duration-s`. `--threads N` sizes the thread pool (1: single-threaded). `--export`
 //!   writes the store's statements, inferred ones included, as N-Triples (the closure the
 //!   stores without reasoning load). `--canonicalize` canonicalises blank nodes.
+//!   `--parse-turtle FILE` parses a Turtle file `--runs` times on one thread, nothing stored
+//!   (the Turtle parser alone).
 //!   `--prepare-vector-graph 64:cosine` synchronously prepares that vector space before
 //!   query timing, recording its preparation phase and checking full graph coverage.
 //!   `--replication COMMITS:QUADS` times read replicas' log shipping: COMMITS commits of
@@ -273,6 +275,7 @@ struct Args {
     count_allocations: bool,
     parse_only: bool,
     kernel: Option<String>,
+    parse_turtle: Option<PathBuf>,
     replication: Option<String>,
     replication_probe: bool,
     classify: bool,
@@ -321,6 +324,7 @@ fn parse_args() -> Result<Args, String> {
         count_allocations: false,
         parse_only: false,
         kernel: None,
+        parse_turtle: None,
         replication: None,
         replication_probe: false,
         classify: false,
@@ -408,6 +412,7 @@ fn parse_args() -> Result<Args, String> {
             "--count-allocations" => args.count_allocations = true,
             "--parse-only" => args.parse_only = true,
             "--kernel" => args.kernel = Some(value()?),
+            "--parse-turtle" => args.parse_turtle = Some(value()?.into()),
             "--replication" => args.replication = Some(value()?),
             "--replication-probe" => match value()?.as_str() {
                 "swap-one" => args.replication_probe = true,
@@ -1099,6 +1104,12 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         report
             .sections
             .push(("kernel", modes::kernel(kernel, args.runs)?));
+        return Ok(());
+    }
+    if let Some(file) = &args.parse_turtle {
+        report
+            .sections
+            .push(("parse_turtle", modes::parse_turtle(file, args.runs)?));
         return Ok(());
     }
     if let Some(spec) = &args.replication {

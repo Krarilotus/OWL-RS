@@ -2,8 +2,8 @@
 //!
 //! Every kind is deterministic for its parameters and seed, written as N-Triples (RDF 1.2
 //! where it holds triple terms; the multi-graph kinds `geo4` and `social4` as N-Quads over four
-//! named graphs, `ex:graph0` to `ex:graph3`), and computes here, independently of the store, the
-//! answers the suite checks before a time counts. They go to standard output as one JSON
+//! named graphs, `ex:graph0` to `ex:graph3`; `turtle` as Turtle), and computes here,
+//! independently of the store, the answers the suite checks before a time counts. They go to standard output as one JSON
 //! object (`expect`), with the statement count and the parameters used. Kinds that need
 //! commits also write `OUT.commits.ru`: one SPARQL update per line, one commit each;
 //! `support-stress` also writes its reader (`OUT.reader`) and that reader's own updates
@@ -150,6 +150,7 @@ pub fn main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "text" => text(&params, &mut rng, &mut nt)?,
         "vectors" => vectors(&params, &mut rng, &mut nt)?,
         "rdf12" => rdf12(&params, &mut rng, &mut nt)?,
+        "turtle" => turtle(&params, &mut nt)?,
         "graph" => graph(&params, &mut rng, &mut nt)?,
         "twins" => twins(&params, &mut rng, &mut nt, out)?,
         "dl-transitive" => dl_transitive(&params, &mut nt)?,
@@ -830,6 +831,44 @@ fn vectors(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
             ),
         );
     }
+    Ok(e)
+}
+
+/// Turtle (not N-Triples), for the Turtle parser alone (`perf_lab --parse-turtle`): `entities`
+/// subjects. `nested=0`: four flat IRI triples each. `nested=1`: one statement each using
+/// every Turtle and RDF 1.2 bracket: a blank-node property list holding a two-item list, a
+/// triple term, a reified triple and an annotation, 13 triples:
+///
+/// ```turtle
+/// <s> <p> [ <q> <o> ; <r> ( <a> <b> ) ] ;
+///     <t> <<( <a> <b> <o> )>> ;
+///     <u> << <a> <b> <o> >> ;
+///     <v> <o> {| <w> <x> |} .
+/// ```
+///
+/// (`[ … ]` 3 triples, the list 4, `<t>` 1, the reified triple 2, `<v>` 1, its annotation 2.)
+fn turtle(p: &Params, nt: &mut Nt) -> std::io::Result<Expect> {
+    let (n, nested) = (p.get("entities", 250_000), p.get("nested", 0) != 0);
+    let (a, b, x) = (ex("a"), ex("b"), ex("x"));
+    let [pp, q, r, t, u, v, w] = ["p", "q", "r", "t", "u", "v", "w"].map(ex);
+    for i in 0..n {
+        let (s, o) = (ex(format!("s{i}")), ex(format!("o{i}")));
+        if nested {
+            writeln!(
+                nt.out,
+                "{s} {pp} [ {q} {o} ; {r} ( {a} {b} ) ] ;\n    {t} <<( {a} {b} {o} )>> ;\n    \
+                 {u} << {a} {b} {o} >> ;\n    {v} {o} {{| {w} {x} |}} ."
+            )?;
+            nt.count += 13;
+        } else {
+            for p in [&pp, &q, &r, &t] {
+                writeln!(nt.out, "{s} {p} {o} .")?;
+            }
+            nt.count += 4;
+        }
+    }
+    let mut e = Expect::new();
+    e.insert("entities".into(), json!(n));
     Ok(e)
 }
 

@@ -1,6 +1,6 @@
 //! The perf lab's measurements beyond a query set, for the fast suite (`benches/fast`):
 //! commits through the mutation pipeline with readers alongside, clients running the query
-//! set concurrently, and blank-node canonicalisation.
+//! set concurrently, blank-node canonicalisation, and Turtle parsing alone.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -310,6 +310,36 @@ pub fn kernel(name: &str, runs: usize) -> Result<String, Box<dyn std::error::Err
          \"sorted\": {sorted}, \"samples_ms\": [{}]}}",
         megabytes / (p50 / 1e3),
         samples.join(", ")
+    ))
+}
+
+/// A Turtle file parsed `runs` times on this thread from memory, nothing stored: the
+/// Turtle parser's own cost (`perf_lab generate turtle` writes the data). The quads are
+/// borrowed and counted; any error fails the run.
+pub fn parse_turtle(file: &Path, runs: usize) -> Result<String, Box<dyn std::error::Error>> {
+    use nrese_rdf_io::{RdfFormat, RdfParser};
+    let bytes = std::fs::read(file)?;
+    let mut times = Vec::new();
+    let mut quads = 0u64;
+    for _ in 0..runs {
+        let at = Instant::now();
+        let mut parser = RdfParser::from_format(RdfFormat::Turtle).for_slice(&bytes);
+        let mut count = 0u64;
+        while let Some(quad) = parser.next_ref() {
+            quad?;
+            count += 1;
+        }
+        times.push(at.elapsed());
+        quads = count;
+    }
+    let (p50, _, max) = percentiles(&mut times);
+    eprintln!(
+        "parsed {quads} quads from {} bytes × {runs}: p50 {p50:.1} ms, max {max:.1} ms",
+        bytes.len()
+    );
+    Ok(format!(
+        "{{\"quads\": {quads}, \"bytes\": {}, \"runs\": {runs}, \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}}}",
+        bytes.len()
     ))
 }
 
