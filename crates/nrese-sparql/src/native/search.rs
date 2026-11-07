@@ -463,11 +463,22 @@ impl Context<'_> {
     /// (relevance descends). One pass over the matches, and per match its statements in the
     /// named graphs: no search per graph.
     fn search_per_graph(&self, search: &Search, graph: Variable) -> NativeResult<Solutions> {
+        let memory = crate::QueryEvaluationError::MemoryLimit;
         let mut vars = vec![search.matched.clone()];
         vars.extend(search.relevance.iter().cloned());
         vars.extend(search.rank.iter().cloned());
-        vars.push(graph);
+        // The rows, and each row's graph, charged to the query's budget before they grow:
+        // the rows a literal in many graphs fans out to are refused before they outgrow it.
+        // Each charge declared before what it covers: on an error the buffer is freed first,
+        // then its charge released (brief v3 §3).
+        let mut held = nrese_exec::Reservation::new(&*self.budget);
         let mut table = IdTable::new(vars.len());
+        let mut graph_of_row = nrese_exec::ChargedVec::new(std::sync::Arc::clone(&self.budget));
+        // Each graph's rank so far, kept only where a rank decides anything; its table is
+        // charged before it grows (`spatial::map_room`), even where no row passes.
+        let ranked =
+            search.rank.is_some() || search.min_rank.is_some() || search.max_rank.is_some();
+        let mut ranks_held = nrese_exec::Reservation::new(&*self.budget);
         let mut ranks: HashMap<TermId, usize> = HashMap::new();
         let mut graphs = nrese_exec::ChargedVec::new(std::sync::Arc::clone(&self.budget));
         for found in self.snapshot.text_search(&search.query) {
@@ -484,9 +495,18 @@ impl Context<'_> {
             }
             self.named_graphs_using(id, &mut graphs)?;
             for &in_graph in graphs.iter() {
-                let rank = ranks.entry(in_graph).or_default();
-                *rank += 1;
-                let rank = *rank;
+                let rank = match ranked {
+                    true => {
+                        if !ranks.contains_key(&in_graph) {
+                            super::spatial::map_room(&mut ranks_held, &mut ranks)
+                                .map_err(memory)?;
+                        }
+                        let rank = ranks.entry(in_graph).or_default();
+                        *rank += 1;
+                        *rank
+                    }
+                    false => 0,
+                };
                 if search.max_rank.is_some_and(|max| rank > max)
                     || search.min_rank.is_some_and(|min| rank < min)
                 {
@@ -499,15 +519,28 @@ impl Context<'_> {
                 if search.rank.is_some() {
                     row.push(self.id(&Term::from(Literal::from(rank as i64))));
                 }
-                row.push(in_graph.raw());
+                super::reserve_rows(&mut table, &mut held, 1, usize::MAX).map_err(memory)?;
                 table.push_row(&row);
+                graph_of_row.push(in_graph.raw()).map_err(memory)?;
             }
         }
-        self.produced(Solutions {
+        self.check()?;
+        // Both stay charged to the query as its result, as `produced` charges one; the
+        // graph binding then follows the one rule (`bind_graph`).
+        let charged = held.transfer() + graph_of_row.charged();
+        let (graph_of_row, charge) = graph_of_row.into_parts();
+        charge.transfer();
+        let solutions = Solutions {
             vars,
             table,
             ordered: false,
-        })
+        };
+        let solutions = super::bind_graph(solutions, &graph, super::RowGraphs::Each(graph_of_row));
+        // Where the search bound the graph variable itself, its column was replaced: what
+        // the result no longer holds is released.
+        self.budget
+            .release(charged.saturating_sub(solutions.table.memory_bytes()));
+        Ok(solutions)
     }
 
     /// Whether the literal `id` is in `search`'s language, where it names one.

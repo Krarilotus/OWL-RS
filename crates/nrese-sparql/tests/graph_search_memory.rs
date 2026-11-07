@@ -57,12 +57,18 @@ struct Run {
 }
 
 fn run(engine: &Engine, query: &str, limit: Option<usize>) -> Run {
+    run_with(engine, query, limit, false)
+}
+
+/// [`run`], with the operators where the query puts them where `as_written`.
+fn run_with(engine: &Engine, query: &str, limit: Option<usize>, as_written: bool) -> Run {
     let shared = SharedBudget::new(usize::MAX);
     let options = QueryOptions {
         resources: Resources {
             memory: Envelope::new(limit, Some(Arc::clone(&shared))),
             ..Resources::default()
         },
+        as_written,
         ..QueryOptions::default()
     };
     let text = format!("{PREFIXES}{query}");
@@ -171,6 +177,40 @@ fn fan_out_is_refused_before_the_rows_outgrow_the_envelope() {
             small.held_after,
             row_bytes / 4
         ));
+    }
+    assert!(
+        failed.is_empty(),
+        "{} rows failed:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+}
+
+/// Graph by graph, the pattern binding the graph variable itself: its column is written in
+/// place, so what each graph's rows were charged is what is released, and an empty answer
+/// over many graphs isn't refused for charges nothing holds (sol-loop round 3 S1:
+/// replacing the column left each graph's charge behind). `VALUES ?g { UNDEF }` binds it,
+/// `FILTER(BOUND(?g))` drops the row; as written, so nothing is rewritten. Rows: 20,000
+/// graphs within 64 KiB, no rows and nothing held after; and 50 graphs (guard).
+#[test]
+fn graph_by_graph_binding_holds_no_charge_for_what_it_drops() {
+    let _serial = HEAP.lock().unwrap_or_else(|p| p.into_inner());
+    let query = "SELECT ?g WHERE { GRAPH ?g { VALUES ?g { UNDEF } FILTER(BOUND(?g)) } }";
+    let limit = 64 << 10;
+    let mut failed = Vec::new();
+    for graphs in [50, 20_000] {
+        let engine = engine(graphs, graphs, true);
+        let run = run_with(&engine, query, Some(limit), true);
+        eprintln!(
+            "{graphs} graphs, limit {limit}: {:?}, peak {} bytes, held after {}",
+            run.outcome, run.peak, run.held_after
+        );
+        if run.outcome != Ok(0) || run.held_after != 0 {
+            failed.push(format!(
+                "{graphs} graphs: got {:?}, held after {}; want no rows, nothing held",
+                run.outcome, run.held_after
+            ));
+        }
     }
     assert!(
         failed.is_empty(),
