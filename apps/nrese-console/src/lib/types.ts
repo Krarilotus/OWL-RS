@@ -61,6 +61,8 @@ export type LastReasoningRun = {
   inferred_inserted: number;
   inferred_deleted: number;
   consistency_violations: number;
+  /// The list stopped at its memory budget: the count is a lower bound.
+  consistency_violations_at_least?: boolean;
   rounds: number;
   elapsed_micros: number;
 };
