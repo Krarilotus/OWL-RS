@@ -180,6 +180,48 @@ class LoadedInputs(unittest.TestCase):
         self.assertIn("different input", text)
         self.assertEqual(code, 2, text)
 
+    def test_an_ore_case_s_converted_ontology_is_its_input(self):
+        """Fix check r2, R2-W2: an `ore:` case loads a converted external ontology, not generated data;
+        it was taken as input-free, and the registry's shortcut even dropped two different recorded
+        hashes. Recorded identities come first; without them the input is unknown."""
+        a, b = {"ore:ore_ont_9724": "a" * 64}, {"ore:ore_ont_9724": "b" * 64}
+        code, text = self.compare(self.report(100.0, a, case="ctx-ore-9724"), self.report(50.0, b, case="ctx-ore-9724"))
+        self.assertEqual(code, 2, text)
+        self.assertNotIn("faster", text)
+        self.assertIn("different input", text)
+        code, text = self.compare(self.report(100.0, case="ctx-ore-9724"), self.report(50.0, case="ctx-ore-9724"))
+        self.assertEqual(code, 2, text)  # an older report: unknown, never "none"
+        self.assertIn("input unknown", text)
+        code, text = self.compare(self.report(100.0, a, case="ctx-ore-9724"), self.report(50.0, a, case="ctx-ore-9724"))
+        self.assertEqual(code, 0, text)
+        self.assertIn("faster", text)
+
+    def test_suite_results_hashing_a_file_they_don_t_list_by_size_hold_to_it(self):
+        """Fix check r2, R2-W1: a hash in `dataset_sha256` for a file outside `datasets` was dropped,
+        and two runs of other bytes compared (commit-latency loads LUBM its plan doesn't declare)."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            old = self.suite_run(d / "old", 100, {}, {"/data/lubm-10.nt": "o" * 64})
+            new = self.suite_run(d / "new", 50, {}, {"/data/lubm-10.nt": "n" * 64})
+            self.assertEqual(compare.main([str(old), str(new)]), 2)
+            text = output(compare.main, [str(old), str(new)])
+            self.assertNotIn("faster", text)
+            self.assertIn("different input", text)
+            same = self.suite_run(d / "same", 50, {}, {"/data/lubm-10.nt": "o" * 64})
+            self.assertIn("faster", output(compare.main, [str(old), str(same)]))
+
+    def test_a_case_s_declared_input_missing_from_a_record_is_unknown(self):
+        """The orchestrator, 7 Nov 2026 (18:12): a declared input a record doesn't hash, or a hash for
+        an input the case doesn't declare, is unknown, never none."""
+        code, text = self.compare(self.report(100.0, {"lubm-10.nt": "x" * 64}),
+                                  self.report(50.0, {"lubm-10.nt": "x" * 64}))  # univ-bench.nt unhashed
+        self.assertEqual(code, 2, text)
+        self.assertIn("input unknown", text)
+        extra = {"lubm-10.nt": "x" * 64, "univ-bench.nt": "u" * 64, "lubm-100.nt": "y" * 64}
+        code, text = self.compare(self.report(100.0, extra), self.report(50.0, extra))
+        self.assertEqual(code, 2, text)
+        self.assertIn("input unknown", text)
+
     def test_suite_results_that_don_t_list_their_inputs_hashes_are_unknown(self):
         """Sol-loop r3 V1: `datasets: {}` doesn't prove a run read no frozen file (commit-latency
         loads LUBM outside its declared inputs, maintenance.py). Only a manifest that states its

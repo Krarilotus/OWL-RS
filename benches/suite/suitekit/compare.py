@@ -492,13 +492,6 @@ def host_check(base: list[dict | None], new: list[dict | None], allow: bool) -> 
     return None
 
 
-def frozen_files(case: dict) -> list[str]:
-    """The frozen dataset files a registry case reads (`volume:` specs, a concatenation's parts too)."""
-    specs = [case.get("data", ""), *([case["data_alt"]] if case.get("data_alt") else []), *case.get("extra", [])]
-    specs += [p for s in specs if s.startswith("concat:") for p in s[len("concat:"):].split("+")]
-    return sorted({s[len("volume:"):] for s in specs if s.startswith("volume:")})
-
-
 def loaded_inputs(report: dict) -> dict[str, dict | None]:
     """Per case, the byte SHA-256 of each frozen file its records say they loaded (fast.py run's
     record `inputs`): one mapping, or None where a record doesn't say or two records disagree."""
@@ -513,32 +506,37 @@ def loaded_inputs(report: dict) -> dict[str, dict | None]:
 
 
 def input_check(base_report: dict, new_report: dict) -> dict[str, str]:
-    """The cases whose two sides didn't load the same frozen input bytes, or don't say which, with
+    """The cases whose two sides didn't load the same external input bytes, or don't say which, with
     why: no verdict of theirs is evidence of a code change (review r1 of pkg/stage-data, R1-W1, 7 Nov
-    2026: lubm-10/100's new release made an old result "slower" than a new one). A case reading no
-    frozen file (generated data, the generator part of the code compared) needs none recorded."""
+    2026: lubm-10/100's new release made an old result "slower" than a new one). What a case loads is
+    suitekit.inputs.declared()'s one answer. Recorded identities come first; a case of generated data
+    alone (it declares nothing, and neither side records a file) needs none recorded."""
     from . import cases as registry
-    reads = {c["name"]: frozen_files(c) for c in registry.load()}
+    from . import inputs
+    declares = {c["name"]: inputs.declared(c) for c in registry.load()}
     base, new = loaded_inputs(base_report), loaded_inputs(new_report)
     out = {}
     for case in sorted(set(base) & set(new)):
-        if not reads.get(case, ["?"]):
-            continue  # generated data alone: nothing frozen, whatever a record says (sol-loop r3 V3)
-        if why := input_difference(base[case], new[case]):
+        b, n, want = base[case], new[case], declares.get(case)
+        if want == set() and not b and not n:
+            continue  # generated data alone, on both sides (sol-loop r3 V3)
+        if why := input_difference(b, n, declared=want):
             out[case] = why
     return out
 
 
 def input_difference(base: dict | None, new: dict | None, base_bytes: dict | None = None,
-                     new_bytes: dict | None = None) -> str | None:
+                     new_bytes: dict | None = None, declared: set[str] | None = None) -> str | None:
     """The one input rule of both comparison paths (fast-suite reports, suite results): why the two
-    sides' frozen input files (file -> its byte SHA-256, None: not known; the whole mapping None: not
+    sides' external input files (file -> its byte SHA-256, None: not known; the whole mapping None: not
     recorded) aren't the same bytes, or None when they are. Without hashes, another size (`*_bytes`)
-    is another input; the same size is unknown, never "the same"."""
+    is another input; the same size is unknown, never "the same". With `declared` (what the case
+    loads, suitekit.inputs.declared()), a declared file a side doesn't hash, or a hashed file the case
+    doesn't declare, is unknown, never none."""
     if base is None or new is None:
         side = "either side" if base is None and new is None else ("the base" if base is None else "the new run")
         return f"input unknown: {side} doesn't record the bytes it loaded"
-    files = sorted(set(base) | set(new))
+    files = sorted(set(base) | set(new) | set(declared or ()))
     sizes = lambda f: ((base_bytes or {}).get(f), (new_bytes or {}).get(f))  # noqa: E731
     differ = [f for f in files if (base.get(f) and new.get(f) and base[f] != new[f])
               or (None not in sizes(f) and sizes(f)[0] != sizes(f)[1])]
@@ -550,6 +548,8 @@ def input_difference(base: dict | None, new: dict | None, base_bytes: dict | Non
     unknown = [f for f in files if not base.get(f) or not new.get(f)]
     if unknown:
         return f"input unknown: no recorded SHA-256 of {', '.join(unknown)} on both sides"
+    if declared is not None and (undeclared := sorted(f for f in files if f not in declared)):
+        return f"input unknown: {', '.join(undeclared)} hashed, but not an input this case declares"
     return None
 
 
@@ -574,8 +574,11 @@ def suite_inputs(paths: list[Path]) -> tuple[dict | None, dict]:
             if "dataset_sha256" not in i:
                 hashes[UNLISTED] = None
             digests = i.get("dataset_sha256") or {}
-            for f, size in (i.get("datasets") or {}).items():
-                sha = digests.get(f)
+            listed = i.get("datasets") or {}
+            # Every file the run hashed or listed (fix check r2, R2-W1: a hash for a file the run loads
+            # outside its declared plan, commit-latency's LUBM, was dropped with the size map's keys).
+            for f in sorted(set(listed) | set(digests)):
+                sha, size = digests.get(f), listed.get(f)
                 if f in hashes and (hashes[f] != sha or sizes.get(f) != size):
                     hashes[f] = None
                     sizes[f] = sizes.get(f) if sizes.get(f) == size else None

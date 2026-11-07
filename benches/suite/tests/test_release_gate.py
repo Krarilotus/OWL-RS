@@ -527,6 +527,33 @@ class Rounds(unittest.TestCase):
                 # Sol-loop r4 W1: the same concatenations listed in another order are the same input.
                 both = {"name": "t", "data": "volume:lubm-10.nt", "extra": [ab["data"], ba["data"]]}
                 self.assertEqual(fast.case_inputs(both), fast.case_inputs({**both, "extra": both["extra"][::-1]}))
+            # Fix check r2, R2-W2: an ORE case's converted ontology is a loaded external file, hashed.
+            (fast_data / "ore").mkdir()
+            (fast_data / "ore" / "ore_ont_9724.nt").write_bytes(b"<o> <p> <q> .\n")
+            with patch.object(fast, "RUNTIME", "native"), patch.object(fast, "FAST_DATA", fast_data), \
+                    patch.object(fast.hosts, "input_path", return_value=data), \
+                    patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
+                self.assertEqual(fast.case_inputs({"name": "o", "data": "ore:ore_ont_9724"}),
+                                 {"ore:ore_ont_9724": hashlib.sha256(b"<o> <p> <q> .\n").hexdigest()})
+                # A kind of input nothing here resolves is an external file of unknown bytes: never none.
+                self.assertEqual(fast.case_inputs({"name": "n", "data": "url:https://example.org/x.nt"}),
+                                 {"url:https://example.org/x.nt": None})
+
+    def test_which_external_files_a_case_loads_has_one_answer(self):
+        """The orchestrator, 7 Nov 2026 (18:12): the recorder and the comparison decide what an input
+        is by one function (suitekit.inputs.declared()); a kind it doesn't know is external, of
+        unknown bytes; only a bare generator spec is generated."""
+        from suitekit import inputs
+        self.assertEqual(inputs.declared({"data": "social people=1000"}), set())
+        self.assertEqual(inputs.declared({"data": "none"}), set())
+        self.assertEqual(inputs.declared({"data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}),
+                         {"lubm-10.nt", "univ-bench.nt"})
+        self.assertEqual(inputs.declared({"data": "ore:ore_ont_9724"}), {"ore:ore_ont_9724"})
+        self.assertEqual(inputs.declared({"data": "el classes=10", "reference": "/fast/ref/x.tax"}),
+                         {"reference:/fast/ref/x.tax"})
+        self.assertEqual(inputs.declared({"data": "concat:volume:univ-bench.nt+social people=10"}),
+                         {"univ-bench.nt", "concat:volume:univ-bench.nt+social people=10"})
+        self.assertEqual(inputs.declared({"data": "url:https://example.org/x.nt"}), {"url:https://example.org/x.nt"})
 
     def test_the_catalogue_keeps_a_form_pin_and_a_note_when_it_is_written_again(self):
         """7 Nov 2026: `suite.py data` rewrites benches/datasets.toml from a fixed list of keys, so a
