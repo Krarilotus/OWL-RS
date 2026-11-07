@@ -195,14 +195,11 @@ impl Hnsw {
         let mut found =
             self.search_level(vectors, &query, &[nearest], ef.max(k), 0, &accepted, budget)?;
         found.truncate(k);
-        let mut hits = ChargedVec::with_capacity(budget, found.len())?;
-        for &(distance, position) in found.iter() {
-            hits.push(Hit {
-                id: vectors.id(position),
-                distance,
-            })?;
-        }
-        Ok(hits)
+        let hits = found.iter().map(|&(distance, position)| Hit {
+            id: vectors.id(position),
+            distance,
+        });
+        ChargedVec::collect(budget, found.len(), hits)
     }
 
     /// Bytes of the links.
@@ -402,7 +399,11 @@ impl Hnsw {
     ) -> Result<ChargedVec<(f32, u32), &'b Budget>, BudgetExceeded> {
         with_visited(self.links.len(), |visited| {
             let mut candidates: Heap<'b, Reverse<Ordered<u32>>> = Heap::with_capacity(budget, 0)?;
-            let mut results: Heap<'b, Ordered<u32>> = Heap::with_capacity(budget, 0)?;
+            // The results never hold more than the beam (or the nodes there are) and one being
+            // pushed: room for that, charged at once, and the loop's pushes neither grow nor
+            // fail.
+            let room = ef.max(entries.len()).min(self.links.len()) + 1;
+            let mut results: Heap<'b, Ordered<u32>> = Heap::with_capacity(budget, room)?;
             let mut links = Vec::new();
             for &(distance, node) in entries {
                 if visited.insert(node) {
@@ -421,6 +422,9 @@ impl Hnsw {
                     break;
                 }
                 self.snapshot_links(node, level, &mut links);
+                // Room for every link at once, charged before the loop: its pushes neither
+                // grow nor fail.
+                candidates.reserve(links.len())?;
                 for &neighbour in &links {
                     if !visited.insert(neighbour) {
                         continue;
@@ -430,9 +434,9 @@ impl Hnsw {
                     if full && results.peek().is_some_and(|worst| distance >= worst.0) {
                         continue;
                     }
-                    candidates.push(Reverse(Ordered(distance, neighbour)))?;
+                    candidates.push_reserved(Reverse(Ordered(distance, neighbour)));
                     if accept(neighbour) {
-                        results.push(Ordered(distance, neighbour))?;
+                        results.push_reserved(Ordered(distance, neighbour));
                         if results.len() > ef {
                             results.pop();
                         }
