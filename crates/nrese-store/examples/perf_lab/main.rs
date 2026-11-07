@@ -273,6 +273,8 @@ struct Args {
     kernel: Option<String>,
     replication: Option<String>,
     replication_probe: bool,
+    upload: Option<PathBuf>,
+    upload_format: Option<nrese_store::GraphResultFormat>,
     classify: bool,
     prepare_vector_graph: Option<(usize, nrese_engine::vector::Metric)>,
     read_graphs: Vec<String>,
@@ -320,6 +322,8 @@ fn parse_args() -> Result<Args, String> {
         kernel: None,
         replication: None,
         replication_probe: false,
+        upload: None,
+        upload_format: None,
         classify: false,
         prepare_vector_graph: None,
         read_graphs: Vec::new(),
@@ -403,6 +407,14 @@ fn parse_args() -> Result<Args, String> {
                 "swap-one" => args.replication_probe = true,
                 other => return Err(format!("--replication-probe swap-one, not {other}")),
             },
+            "--upload" => args.upload = Some(value()?.into()),
+            "--upload-format" => {
+                args.upload_format = Some(match value()?.as_str() {
+                    "ntriples" => nrese_store::GraphResultFormat::NTriples,
+                    "turtle" => nrese_store::GraphResultFormat::Turtle,
+                    other => return Err(format!("--upload-format ntriples|turtle, not {other}")),
+                })
+            }
             "--classify" => args.classify = true,
             "--read-graphs" => args.read_graphs = value()?.split(',').map(str::to_owned).collect(),
             "--support-sets" => {
@@ -1086,6 +1098,15 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         report
             .sections
             .push(("kernel", modes::kernel(kernel, args.runs)?));
+        return Ok(());
+    }
+    if let Some(file) = &args.upload {
+        let format = args
+            .upload_format
+            .unwrap_or(nrese_store::GraphResultFormat::NTriples);
+        report
+            .sections
+            .push(("upload", modes::upload(&config, file, format, args.runs)?));
         return Ok(());
     }
     if let Some(spec) = &args.replication {

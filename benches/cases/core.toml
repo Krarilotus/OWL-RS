@@ -1330,6 +1330,38 @@ systems = ["jena:plain", "qlever:plain", "oxigraph:plain", "virtuoso:plain"]
 home_turf = "jena"
 guards = ["P1-F7 permutations derived by a stable partition"]
 repeat = 4
+
+[[case]]
+name = "upload-graph-nt"
+area = "load"
+what = "a Graph Store PUT of 1 M N-Triples statements (the harness's entity shape) into a fresh store, through the mutation pipeline as the server applies it"
+semantics = "none"
+data = "entities entities=250000"
+tool_loads = false
+args = ["--upload", "{data}", "--upload-format", "ntriples"]
+queries = ""
+metric = "upload.p50_ms"
+check = { "upload.statements" = 1000000 }
+route = {}
+cap_gb = 4
+systems = []
+guards = ["an upload is read as it goes into its write, never held as owned quads (UPLOAD)"]
+
+[[case]]
+name = "upload-graph-ttl"
+area = "load"
+what = "the same 1 M statements as Turtle with compact prefixed names, sent as a Graph Store PUT: an upload whose terms are written once and expanded per statement"
+semantics = "none"
+data = "entities-turtle entities=250000"
+tool_loads = false
+args = ["--upload", "{data}", "--upload-format", "turtle"]
+queries = ""
+metric = "upload.p50_ms"
+check = { "upload.statements" = 1000000 }
+route = {}
+cap_gb = 4
+systems = []
+guards = ["an upload is read as it goes into its write, never held as owned quads (UPLOAD)"]
 [[case]]
 name = "open-first-query"
 area = "load"

@@ -542,6 +542,8 @@ the tableau). Pairs that hang are recorded in their case (`hangs`) and not run a
 | `mem-reason-2g` | memory | owl2-rl | none: NRESE's own column |  | LUBM 10 materialised (OWL 2 RL) and queried in a 2 GiB container |
 | `mem-reason-lubm100-2g` | memory | owl2-rl | none: NRESE's own column |  | LUBM 100 materialised in a 2 GiB container: the frontier until reasoning spills |
 | `load-entities` | load | none | jena: plain, qlever: plain, oxigraph: plain, virtuoso: plain | Jena | bulk load of 20 M statements (the harness's entity shape) into memory |
+| `upload-graph-nt` | load | none | none: NRESE's own column |  | a Graph Store PUT of 1 M N-Triples statements (the harness's entity shape) into a fresh store, through the mutation pipeline as the server applies it |
+| `upload-graph-ttl` | load | none | none: NRESE's own column |  | the same 1 M statements as Turtle with compact prefixed names, sent as a Graph Store PUT: an upload whose terms are written once and expanded per statement |
 | `open-first-query` | load | none | oxigraph: plain | Oxigraph | a 1 M-statement store on disk: open it in a fresh process and answer four point lookups (open plus first executions) |
 | `q-star` | query | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain |  | 5-way stars: a selective one and a count over all people |
 | `q-chain` | query | none | qlever: plain, oxigraph: plain, jena: plain, virtuoso: plain |  | 4-hop chains from one person, and a chain through posts and likes |
