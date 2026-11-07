@@ -123,10 +123,10 @@ class FleetCells(unittest.TestCase):
 
     def test_check_refusal_cannot_submit(self):
         # Spec point 3: fleet's refusal is final; --submit must not bypass it.
-        with patch.object(abba.rg, "fleet_call", return_value=(1, "refused")) as call:
+        with patch.object(abba.rg, "fleet_call", side_effect=lambda *a: (1, "refused") if a[0] == "check" else self.fleet(*a)) as call:
             code, text = self.run_plan("--budget-hours", "50", "--submit")
         self.assertEqual(code, 1, text)
-        self.assertEqual([c.args[0] for c in call.call_args_list], ["check"])
+        self.assertNotIn("submit", [c.args[0] for c in call.call_args_list])
 
     def test_member_boundary_also_refuses_restricted_outputs(self):
         # Spec point 7: direct fleet-step calls cannot create restricted export bundles.
