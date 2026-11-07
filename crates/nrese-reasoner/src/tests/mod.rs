@@ -845,6 +845,67 @@ fn the_consistency_check_polls_the_stop_and_never_reports_a_stopped_list() {
     }
 }
 
+/// P2-C4 sol-loop r2 S3: once the list has refused, no further consistency job runs. An
+/// empty-body rule (its schema atom grounded) that violates under a budget of 0 refuses
+/// before the jobs; a three-atom rule queued before it, whose guard never holds, would
+/// still walk its drivers, two morsels (one stop poll each) of 5,000 drivers, without
+/// ever firing. Its polls are the measure: with the check after the refusal there are
+/// none, so the run polls as often as one without that rule.
+#[test]
+fn no_consistency_job_runs_after_the_list_refused() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::ir::parse_rules;
+    let mut vocabulary = LocalVocabulary::default();
+    // The rules' parser knows rdf:, rdfs:, owl: and xsd: only: the constants are owl: names.
+    let mut text =
+        String::from("owl:A rdfs:subClassOf owl:B\nex:q0 rdfs:q ex:y\nex:r0 rdfs:r ex:z\n");
+    for i in 0..5_000 {
+        text.push_str(&format!("ex:p{i} rdfs:p owl:same\n"));
+    }
+    let input = load(&mut vocabulary, &text);
+    let walk = "walk: (?a rdfs:p ?x), (?b rdfs:q ?y), (?c rdfs:r ?z), ?x != owl:same -> false\n";
+    let empty = "empty: (owl:A rdfs:subClassOf owl:B) -> false\n";
+    let with_walk = parse_rules(&format!("{walk}{empty}"), &mut vocabulary).unwrap();
+    let without = parse_rules(empty, &mut vocabulary).unwrap();
+    let schema = Schema::owl(&mut vocabulary);
+    let mut sorted = input.clone();
+    sorted.sort_unstable_by_key(|&[s, p, o]| (p, o, s));
+    sorted.dedup();
+    let mut groups: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
+    for [s, p, o] in sorted {
+        match groups.last_mut() {
+            Some((last, pairs)) if *last == p => pairs.push((o, s)),
+            _ => groups.push((p, vec![(o, s)])),
+        }
+    }
+    let polls_of = |rules: &[super::ir::Rule]| {
+        let polls = AtomicUsize::new(0);
+        let counting = || {
+            polls.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        let memory = Arc::new(nrese_exec::Budget::new(0));
+        let closure = batch::materialise_grouped_within(
+            groups.clone(),
+            rules,
+            None,
+            &schema,
+            &counting,
+            &memory,
+        )
+        .expect("never stopped");
+        assert!(!closure.violations.complete() && !closure.violations.consistent());
+        polls.load(Ordering::Relaxed)
+    };
+    assert_eq!(
+        polls_of(&with_walk),
+        polls_of(&without),
+        "the refused list's check went on to walk a job"
+    );
+}
+
 /// DC-07 S2: an operation's stop keeps the memory's cause of the moment it fired, whatever
 /// the limit reads since; one its caller fired has none.
 #[test]
