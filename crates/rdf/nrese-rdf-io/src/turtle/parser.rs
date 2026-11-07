@@ -545,8 +545,8 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     /// What is open while skipping, readable tokens or not, is one stack of brackets with
     /// their kinds (see [`bracket`]):
     /// - at its bottom, the brackets the statement had open when it failed (`unclosed`),
-    ///   then its failing token if that was an opener or closer (`failed`), so a `.` inside
-    ///   them ends nothing;
+    ///   so a `.` inside them ends nothing; then its failing token if that was an opener or
+    ///   closer, braces included (`failed`), counted as the first token skipped;
     /// - above them, the brackets opened while skipping. A closer closes the innermost open
     ///   bracket of its own pair, with those opened inside it; with none of its pair open it
     ///   closes nothing.
@@ -585,11 +585,31 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 },
             "the brackets noted open disagree with those taken",
         );
-        if let Some(kind) = failed {
-            bracket(&mut open, &mut counts, kind);
-        }
         let mut braces = 0i64;
-        let resumed = loop {
+        // The failing token counts as the first one skipped: a `}` closing the TriG block
+        // ends the statement right there.
+        let ended =
+            failed.is_some_and(|kind| self.skip_token(kind, &mut open, &mut counts, &mut braces));
+        let resumed = if ended {
+            true
+        } else {
+            self.skip_rest(&mut open, &mut counts, &mut braces)
+        };
+        // The allocation is kept for the next failed statement.
+        open.clear();
+        self.unclosed = open;
+        resumed
+    }
+
+    /// The rest of a failed statement, skipped token by token (`skip_token`) up to its end:
+    /// `true` there, `false` at the end of the input or on a read error (see `resync`).
+    fn skip_rest(
+        &mut self,
+        open: &mut Vec<usize>,
+        counts: &mut [usize; 5],
+        braces: &mut i64,
+    ) -> bool {
+        loop {
             if self.no_closing != [[false; 2]; 2] {
                 let no_closing = self.no_closing;
                 let missing =
@@ -621,24 +641,39 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             };
             self.input.consume(token.consumed);
             self.after_string = matches!(token.kind, Kind::String { .. });
-            match token.kind {
-                Kind::Eof => break false,
-                Kind::OpenBrace => braces += 1,
-                Kind::CloseBrace if braces > 0 => braces -= 1,
-                Kind::CloseBrace if self.settings.trig && self.in_block => {
-                    self.in_block = false;
-                    self.graph = None;
-                    break true;
-                }
-                Kind::Dot if open.is_empty() && braces == 0 => break true,
-                opener!() | closer!() => bracket(&mut open, &mut counts, token.kind),
-                _ => {}
+            if token.kind == Kind::Eof {
+                break false;
             }
-        };
-        // The allocation is kept for the next failed statement.
-        open.clear();
-        self.unclosed = open;
-        resumed
+            if self.skip_token(token.kind, open, counts, braces) {
+                break true;
+            }
+        }
+    }
+
+    /// One token of a failed statement, its failing token or one of its rest, applied to
+    /// what is open there: brackets (`open` and `counts`, see [`bracket`]) and the `{` opened
+    /// in it (`braces`). `true` when it ends the statement: the `}` closing the TriG block it
+    /// is in (open brackets or not), or a `.` with nothing open.
+    fn skip_token(
+        &mut self,
+        kind: Kind,
+        open: &mut Vec<usize>,
+        counts: &mut [usize; 5],
+        braces: &mut i64,
+    ) -> bool {
+        match kind {
+            Kind::OpenBrace => *braces += 1,
+            Kind::CloseBrace if *braces > 0 => *braces -= 1,
+            Kind::CloseBrace if self.settings.trig && self.in_block => {
+                self.in_block = false;
+                self.graph = None;
+                return true;
+            }
+            Kind::Dot => return open.is_empty() && *braces == 0,
+            opener!() | closer!() => bracket(open, counts, kind),
+            _ => {}
+        }
+        false
     }
 
     /// Skips the token the lexer couldn't read, where `fill` stopped: a string up to its
@@ -819,11 +854,14 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     }
 
     /// The error for `token`, taken where the grammar has no place for it. An opener or a
-    /// closer is noted (`failed`): it opens or closes in the document though no routine
-    /// took it as such, and recovery counts it (`resync`).
+    /// closer, braces included, is noted (`failed`): it opens or closes in the document
+    /// though no routine took it as such, and recovery counts it (`resync`).
     #[cold]
     fn unexpected(&mut self, token: &Token, what: impl Into<String>) -> RdfParseError {
-        if matches!(token.kind, opener!() | closer!()) {
+        if matches!(
+            token.kind,
+            opener!() | closer!() | Kind::OpenBrace | Kind::CloseBrace
+        ) {
             self.failed = Some(token.kind);
         }
         self.error(token.start, what)
