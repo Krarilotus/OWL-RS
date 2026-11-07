@@ -176,14 +176,14 @@ impl Engine {
     ///
     /// The whole answer is checked first, under the writer slot, with nothing published:
     /// it follows a revision this engine has reached (its records up to this engine's
-    /// revision are skipped, as an answer applied twice); the frames are complete records, nothing else;
-    /// their revisions are exactly `after + 1 ..= last`, `records` of them; their
-    /// dictionary entries follow on from each other and continue this dictionary
-    /// (`Dictionary::check_keys`). Anything else is refused
+    /// revision are skipped, as an answer applied twice); the frames are complete records,
+    /// nothing else; their revisions are exactly `after + 1 ..= last`, `records` of them;
+    /// their dictionary entries follow on from each other. Then the batch's dictionary
+    /// entries are restored at once, all or none, each checked under that lock as
+    /// `Dictionary::restore_key` takes one (continuing this dictionary; a speculative
+    /// transaction may have interned meanwhile). Anything else is refused
     /// ([`EngineError::Corruption`]) with the engine as it was: the replica starts again
-    /// from an image. Then the batch's dictionary entries are restored at once (checked
-    /// again under that lock, all or none: a speculative transaction may have interned
-    /// meanwhile) and the records are published one by one. `stop` is checked before each:
+    /// from an image. Then the records are published one by one. `stop` is checked before each:
     /// once it stops, no further record is published ([`Applied::stopped`]). A local
     /// failure on a record (the log's write) leaves the records before it published.
     ///
@@ -299,15 +299,6 @@ impl Engine {
                     pair[1].revision, pair[1].dictionary_start
                 ));
             }
-        }
-        if let Some(first) = records.first() {
-            let keys: Vec<&[u8]> = records
-                .iter()
-                .flat_map(|record| record.keys.iter().map(Vec::as_slice))
-                .collect();
-            shared
-                .dictionary
-                .check_keys(first.dictionary_start, &keys)?;
         }
         Ok(records)
     }

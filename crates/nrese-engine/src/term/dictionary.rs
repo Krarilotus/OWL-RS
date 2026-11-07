@@ -1720,23 +1720,16 @@ impl Dictionary {
         Ok(())
     }
 
-    /// Whether [`Self::restore_keys_checked`] would take `keys` at `start..`: each as
-    /// [`Self::restore_key`] takes one. Reads only (one read lock, a plain loop).
-    pub(crate) fn check_keys(&self, start: u64, keys: &[&[u8]]) -> EngineResult<()> {
-        let inner = self.inner.read();
-        check_restore(&inner, start, keys)
-    }
-
-    /// Restores `keys` at `start..` under one write lock, all or none: checked there as
-    /// [`Self::check_keys`] checks them (another interner may have added entries since),
-    /// then the ones past the dictionary's end appended in order.
+    /// Restores `keys` at `start..` under one write lock, all or none: each checked as
+    /// [`Self::restore_key`] takes one (under this lock: another interner may have added
+    /// entries before it), then the ones past the dictionary's end appended in order.
     pub(crate) fn restore_keys_checked(&self, start: u64, keys: &[&[u8]]) -> EngineResult<()> {
         let mut inner = self.inner.write();
-        check_restore(&inner, start, keys)?;
+        let hashes = check_restore(&inner, start, keys)?;
         let len = inner.len();
-        for (offset, key) in keys.iter().enumerate() {
+        for (offset, (key, hash)) in keys.iter().zip(hashes).enumerate() {
             if start + offset as u64 >= len {
-                inner.push(key, key_hash(key));
+                inner.push(key, hash);
             }
         }
         Ok(())
@@ -1779,7 +1772,8 @@ fn restored(inner: &Inner, len: u64, index: u64, key: &[u8], hash: u64) -> Engin
 
 /// [`restored`] for `keys` at `start..` (consecutive indexes): the ones past `inner`'s end
 /// count as appended in order, so a key appended twice in the batch is a duplicate too.
-fn check_restore(inner: &Inner, start: u64, keys: &[&[u8]]) -> EngineResult<()> {
+/// Returns each key's hash ([`key_hash`]), computed once.
+fn check_restore(inner: &Inner, start: u64, keys: &[&[u8]]) -> EngineResult<Vec<u64>> {
     let mut len = inner.len();
     // The range's start, whether or not it holds keys: past the end is a gap.
     if start > len {
@@ -1787,21 +1781,26 @@ fn check_restore(inner: &Inner, start: u64, keys: &[&[u8]]) -> EngineResult<()> 
             "dictionary gap: expected entry {start}, dictionary has {len}"
         )));
     }
-    let mut appended: std::collections::HashMap<&[u8], u64> = std::collections::HashMap::new();
+    let mut hashes = Vec::with_capacity(keys.len());
+    // The batch's appended keys, by offset into `keys`, under their hashes.
+    let mut appended: HashTable<usize> = HashTable::new();
     for (offset, key) in keys.iter().enumerate() {
         validate_key(key)?;
         let index = start + offset as u64;
-        if let Some(already) = appended.get(key) {
+        let hash = key_hash(key);
+        if let Some(&already) = appended.find(hash, |&other| keys[other] == *key) {
             return Err(EngineError::Corruption(format!(
-                "duplicate dictionary key logged at {index} (already {already})"
+                "duplicate dictionary key logged at {index} (already {})",
+                start + already as u64
             )));
         }
-        if let Restore::Append = restored(inner, len, index, key, key_hash(key))? {
-            appended.insert(key, index);
+        if let Restore::Append = restored(inner, len, index, key, hash)? {
+            appended.insert_unique(hash, offset, |&other| key_hash(keys[other]));
             len += 1;
         }
+        hashes.push(hash);
     }
-    Ok(())
+    Ok(hashes)
 }
 
 /// The graph name as a term; `None` for the default graph.
@@ -2385,8 +2384,8 @@ mod tests {
     /// A batch of logged keys (a replicated answer's) is checked as `restore_key` would take
     /// each in turn, and restored all or none: a valid overlap and append, a divergent
     /// overlap, a gap, a key that already has another entry, a key twice in the batch.
-    /// `check_keys` changes nothing; `restore_keys_checked` refuses as it does and then
-    /// leaves the dictionary as it was. Every row is checked.
+    /// `restore_keys_checked` refuses as `restore_key` does and then leaves the dictionary as
+    /// it was. Every row is checked.
     #[test]
     fn a_batch_of_logged_keys_is_checked_as_restore_key_takes_them() {
         let source = Dictionary::default();
@@ -2420,12 +2419,6 @@ mod tests {
                 .all(|(i, key)| one_by_one.restore_key(start + i as u64, key).is_ok());
             if verdict != takes {
                 wrong.push(format!("{row}: restore_key took it: {verdict}"));
-            }
-            let checked = target();
-            if checked.check_keys(start, &batch).is_ok() != takes || checked.len() != 2 {
-                wrong.push(format!(
-                    "{row}: check_keys disagrees or changed the dictionary"
-                ));
             }
             let restored = target();
             let result = restored.restore_keys_checked(start, &batch);
