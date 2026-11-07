@@ -1263,6 +1263,7 @@ dependencies = [
  "mimalloc",
  "nrese-exec",
  "nrese-rdf",
+ "nrese-rdf-io",
  "nrese-reasoner",
  "nrese-sparql",
  "nrese-sparql-results",
