@@ -275,6 +275,229 @@ fn restored(dir: &std::path::Path, until: u64) -> Option<HashSet<Quad>> {
         .map(|engine| contents(&engine))
 }
 
+/// The commit times of the log's records in `dir`, in order.
+fn logged_times(dir: &std::path::Path) -> Vec<Option<u64>> {
+    let mut times = Vec::new();
+    for (_, path) in super::wal::list_segments(&super::wal::wal_dir(dir)).unwrap() {
+        let contents = super::wal::read_segment(&path).unwrap();
+        times.extend(
+            contents
+                .records
+                .iter()
+                .map(|record| record.committed_micros),
+        );
+    }
+    times
+}
+
+/// A copy of the store in `dir` (a restore changes what it opens).
+fn copied(dir: &std::path::Path) -> tempfile::TempDir {
+    fn copy(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap() {
+            let path = entry.unwrap().path();
+            let target = to.join(path.file_name().unwrap());
+            if path.is_dir() {
+                copy(&path, &target);
+            } else if path.file_name().is_some_and(|name| name != "LOCK") {
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
+    }
+    let copy_dir = tempfile::tempdir().unwrap();
+    copy(dir, copy_dir.path());
+    copy_dir
+}
+
+/// A transaction is stamped when its record goes to the log, its preparation done (review
+/// r1, R1-F1): the clock reads 1000 when it commits and 2000 once its runs are built, its
+/// layout converted or the log rotated (`fault::CLOCK_AT_APPEND`). Its record and its version
+/// take 2000: a restore at 1500 leaves it out, and a checkpoint after it is refused at 1999,
+/// used at 2000. Before the fix both took 1000, so a restore at 1500 kept a commit made at
+/// 2000. Rows, judged apart: an insert; a store's first named graph (its layout converted);
+/// a commit that starts a segment.
+#[test]
+fn a_transaction_is_stamped_at_its_log_append() {
+    let named = |n: u64| {
+        let node = |name: String| NamedNode::new_unchecked(format!("http://example.com/{name}"));
+        Quad::new(
+            node(format!("s{n}")),
+            node("p".into()),
+            node(format!("o{n}")),
+            node("g".into()),
+        )
+    };
+    let rows: [(&str, Quad, EngineConfig); 3] = [
+        ("an insert", quad(1), config()),
+        ("a first named graph", named(1), config()),
+        ("a rotation", quad(1), small_segments()),
+    ];
+    let mut failures = Vec::new();
+    for (row, inserted, open) in rows {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = Engine::open(dir.path(), open.clone()).unwrap();
+            fault::CLOCK.set(Some(500));
+            commit(&engine, 0).unwrap();
+            engine.checkpoint().unwrap();
+            fault::CLOCK.set(Some(1000));
+            fault::CLOCK_AT_APPEND.set(Some(2000));
+            let mut tx = engine.transaction();
+            tx.insert(inserted.as_ref());
+            tx.commit().unwrap();
+            fault::CLOCK_AT_APPEND.set(None);
+            fault::CLOCK.set(None);
+        }
+        let mut wrong = Vec::new();
+        let logged = logged_times(dir.path());
+        if logged.last() != Some(&Some(2000)) {
+            wrong.push(format!("logged at {logged:?}"));
+        }
+        let held = restored(copied(dir.path()).path(), 1500);
+        if held != Some([quad(0)].into_iter().collect()) {
+            wrong.push(format!("restored at 1500: {held:?}"));
+        }
+        // The version's time, as the checkpoint after it keeps it.
+        Engine::open(dir.path(), open)
+            .unwrap()
+            .checkpoint()
+            .unwrap();
+        if restored(copied(dir.path()).path(), 1999).is_some() {
+            wrong.push("its checkpoint used at 1999".into());
+        }
+        if restored(copied(dir.path()).path(), 2000).is_none() {
+            wrong.push("its checkpoint refused at 2000".into());
+        }
+        eprintln!(
+            "row {row}: {}",
+            if wrong.is_empty() { "ok" } else { "FAILED" }
+        );
+        failures.extend(wrong.into_iter().map(|w| format!("{row}: {w}")));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Commits of unknown time leave the store's clock where it was (review r1, R1-F2): a version
+/// holding them has no known time, but the commits after them still never go back. Each row
+/// starts from such a history and steps the clock back from 2000 to 1000:
+/// - two commits after a format 11 checkpoint are logged at 2000 and 2000;
+/// - a replacement after a commit at 2000 is stamped no earlier, so a restore at 1500 refuses
+///   its checkpoint;
+/// - the clock survives a checkpoint of unknown time and a reopen: the commit after is logged
+///   at 2000;
+/// - an untimed record replayed, a commit at 2000, then a replacement: refused at 1500.
+///
+/// Before the fix the clock was the version's time, unknown there, so it started again.
+#[test]
+fn the_store_clock_never_goes_back_over_an_unknown_history() {
+    // A store whose only content is of unknown time: a format 11 checkpoint of a commit.
+    let unknown = || {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine = Engine::open(dir.path(), config()).unwrap();
+            fault::CLOCK.set(Some(3000));
+            commit(&engine, 0).unwrap();
+            engine.checkpoint().unwrap();
+            fault::CLOCK.set(None);
+        }
+        as_format_11(dir.path());
+        dir
+    };
+    let at = |engine: &Engine, clock: u64, n: u64| {
+        fault::CLOCK.set(Some(clock));
+        commit(engine, n).unwrap();
+        fault::CLOCK.set(None);
+    };
+    let replace = |engine: &Engine, clock: u64| {
+        fault::CLOCK.set(Some(clock));
+        let load = engine.bulk_load(BulkMode::Replace);
+        load.add(&[quad(9)]);
+        load.finish().unwrap();
+        fault::CLOCK.set(None);
+    };
+    let mut failures = Vec::new();
+    let mut check = |row: &str, ok: bool, got: String| {
+        eprintln!("row {row}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            failures.push(format!("{row}: {got}"));
+        }
+    };
+
+    let dir = unknown();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        at(&engine, 2000, 1);
+        at(&engine, 1000, 2);
+    }
+    let logged = logged_times(dir.path());
+    check(
+        "two commits after a format 11 checkpoint",
+        logged == [Some(2000), Some(2000)],
+        format!("logged at {logged:?}"),
+    );
+
+    let dir = unknown();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        at(&engine, 2000, 1);
+        replace(&engine, 1000);
+    }
+    let held = restored(dir.path(), 1500);
+    check(
+        "a replacement after them",
+        held.is_none(),
+        format!("restored at 1500: {held:?}"),
+    );
+
+    let dir = unknown();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        at(&engine, 2000, 1);
+        engine.checkpoint().unwrap();
+    }
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        at(&engine, 1000, 2);
+    }
+    let logged = logged_times(dir.path());
+    check(
+        "across a checkpoint and a reopen",
+        logged.last() == Some(&Some(2000)),
+        format!("logged at {logged:?}"),
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        at(&engine, 3000, 0);
+    }
+    for (_, path) in super::wal::list_segments(&super::wal::wal_dir(dir.path())).unwrap() {
+        let file = std::fs::read(&path).unwrap();
+        let contents = super::wal::read_segment(&path).unwrap();
+        let mut bytes = file[..8].to_vec();
+        for record in contents.records {
+            let record = super::codec::CommitRecord {
+                committed_micros: None,
+                ..record
+            };
+            super::codec::encode_record(&record, &mut bytes).unwrap();
+        }
+        std::fs::write(&path, bytes).unwrap();
+    }
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        at(&engine, 2000, 1);
+        replace(&engine, 1000);
+    }
+    let held = restored(dir.path(), 1500);
+    check(
+        "an untimed record replayed",
+        held.is_none(),
+        format!("restored at 1500: {held:?}"),
+    );
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 /// The newest checkpoint in `dir`, rewritten as format 11 (no commit time), as an earlier
 /// binary would have written it: format 12 is format 11 with the time before the checksum.
 fn as_format_11(dir: &std::path::Path) {
