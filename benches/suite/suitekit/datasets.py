@@ -31,7 +31,9 @@ HEADER = """# The frozen benchmark datasets (benches/PROTOCOL.md §6; `suite.py 
 # command that made it and the release of its source. The reserved space holds them for
 # good (budget_gb); scripts/bench-cleanup.sh never removes a catalogued file. Regenerating a
 # file must give the same hash, or it is a new release: freeze it again and say so in the
-# run records that use it.
+# run records that use it. A file whose maker labels its blank nodes afresh each time (riot)
+# is pinned by form too: `rdfc_sha256`, the SHA-256 of its RDFC-1.0 canonical N-Quads
+# (crates/rdf/nrese-rdf-io/examples/rdfc.rs), which a made copy must meet where its bytes can't.
 """
 
 
@@ -47,8 +49,8 @@ def save(root: Path, catalog: dict):
     lines = [HEADER, f"budget_gb = {catalog['budget_gb']}", ""]
     for d in sorted(catalog["dataset"], key=lambda d: d["file"]):
         lines.append("[[dataset]]")
-        for key in ("file", "workload", "tier", "role", "made_by", "source", "bytes", "sha256", "frozen",
-                    "n_triples"):
+        for key in ("file", "workload", "tier", "role", "made_by", "source", "bytes", "sha256", "rdfc_sha256",
+                    "frozen", "n_triples", "note"):
             if d.get(key) not in (None, ""):
                 lines.append(f"{key} = {toml_value(d[key])}")
         lines.append("")
