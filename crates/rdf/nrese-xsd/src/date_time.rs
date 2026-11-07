@@ -307,6 +307,17 @@ impl<'a> Cursor<'a> {
 
     /// `-?([1-9][0-9]{3,}|0[0-9]{3})`
     fn year(&mut self) -> Result<i64, ParseError> {
+        match self.year_or_stand_in()? {
+            (year, false) => Ok(year),
+            (_, true) => self.fail("a year out of range"),
+        }
+    }
+
+    /// [`Self::year`], but a valid year past `MAX_YEAR` reads as a stand-in with its sign and
+    /// its leap years (its remainder mod 400, which its last four digits give), with `true`:
+    /// the rest of the lexical form can still be checked before it is refused as beyond
+    /// what is represented.
+    fn year_or_stand_in(&mut self) -> Result<(i64, bool), ParseError> {
         let negative = self.text.first() == Some(&b'-');
         if negative {
             self.text = &self.text[1..];
@@ -318,13 +329,22 @@ impl<'a> Cursor<'a> {
         if digits > 4 && self.text[0] == b'0' {
             return self.fail("a year of more than four digits with a leading zero");
         }
-        let year: i64 = std::str::from_utf8(&self.text[..digits])
+        let text = &self.text[..digits];
+        let represented = std::str::from_utf8(text)
             .ok()
-            .and_then(|t| t.parse().ok())
-            .filter(|y| *y <= MAX_YEAR)
-            .map_or_else(|| self.fail("a year out of range"), Ok)?;
+            .and_then(|t| t.parse::<i64>().ok())
+            .filter(|y| *y <= MAX_YEAR);
+        let (year, past) = match represented {
+            Some(year) => (year, false),
+            None => {
+                let last4 = text[digits - 4..]
+                    .iter()
+                    .fold(0, |n, d| n * 10 + i64::from(d - b'0'));
+                (2000 + last4 % 400, true)
+            }
+        };
         self.text = &self.text[digits..];
-        Ok(if negative { -year } else { year })
+        Ok((if negative { -year } else { year }, past))
     }
 
     fn month(&mut self) -> Result<u8, ParseError> {
@@ -573,7 +593,7 @@ impl DateTime {
     }
 
     fn read(c: &mut Cursor<'_>) -> Result<Self, ParseError> {
-        let year = c.year()?;
+        let (year, past) = c.year_or_stand_in()?;
         c.expect(b'-')?;
         let month = c.month()?;
         c.expect(b'-')?;
@@ -584,6 +604,12 @@ impl DateTime {
         c.expect(b'T')?;
         let (hour, minute, second) = c.time()?;
         let timezone = c.timezone_and_end()?;
+        // A valid lexical form, every part checked: refused only as beyond what is
+        // represented, saying whether it has a timezone (a dateTimeStamp needs one).
+        let unrepresented = || ParseError::unrepresented_year(c.datatype, timezone.is_some());
+        if past {
+            return Err(unrepresented());
+        }
         let props = Props {
             year,
             month,
@@ -598,7 +624,7 @@ impl DateTime {
             return props
                 .plus(0, Decimal::from(86_400))
                 .map(Self::wrap)
-                .ok_or(ParseError::new("dateTime", "a year out of range"));
+                .ok_or_else(unrepresented);
         }
         Ok(Self::wrap(props))
     }
