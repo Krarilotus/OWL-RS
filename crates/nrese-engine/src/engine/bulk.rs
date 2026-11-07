@@ -204,9 +204,10 @@ impl<'e> BulkLoad<'e> {
         } = self;
         drop(scratch);
         let shared = &engine.shared;
-        // No commit can run (writer slot) and no compaction can replace runs while the new
-        // version is built from the current one and installed.
-        let _compaction = shared.versions.compaction_slot.lock();
+        // No commit can run (writer slot): `base` stays the latest content, though a merge or
+        // a mapped checkpoint may replace its runs with the same statements. The new version
+        // is built from it without the compaction slot, which `publish` takes to install it:
+        // nothing that waits for that slot waits for the load's parallel work.
         let base = shared.snapshot();
         let started = Instant::now();
         let spilled = match (spill_failed.into_inner(), spiller.into_inner()) {
@@ -244,7 +245,7 @@ impl<'e> BulkLoad<'e> {
         });
         renumbered?;
         if let Some(spill) = spilled {
-            return publish_spilled(engine, spill, current, started, _compaction);
+            return publish_spilled(engine, spill, current, started);
         }
         // By radix over the bits the ids use ([`nrese_exec::sort`]).
         nrese_exec::heap::phase("load: sorting");
@@ -350,7 +351,6 @@ impl<'e> BulkLoad<'e> {
 
         let built = started.elapsed();
         publish(engine, next)?;
-        drop(_compaction);
         tracing::info!(
             revision = summary.revision,
             inserted = summary.inserted,
@@ -382,7 +382,6 @@ fn publish_spilled(
     spill: Spill,
     current: &Version,
     started: Instant,
-    compaction: MutexGuard<'_, ()>,
 ) -> EngineResult<CommitSummary> {
     let revision = current.revision + 1;
     let dictionary_len = engine.shared.dictionary.len();
@@ -394,7 +393,6 @@ fn publish_spilled(
         revision,
         dictionary_len,
     )?;
-    drop(compaction);
     let summary = CommitSummary {
         revision,
         inserted,
@@ -448,7 +446,10 @@ enum Next {
 /// Installs `next` as the latest version, the bulk way: in durable mode a checkpoint of it
 /// is written first, so no WAL record is needed, and with `map_checkpoints` the version
 /// installed is the checkpoint's, mapped (same content: memory then holds what queries
-/// touch, as after a restart). The caller holds the writer and compaction slots.
+/// touch, as after a restart). The caller holds the writer slot. The checkpoint is written
+/// under the checkpoint slot, on the caller's pool, and the version installed under the
+/// compaction slot, held for nothing else: a merge or mapped checkpoint published since
+/// `next` was built is replaced (the same statements: the writer slot kept them).
 fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     let shared = &engine.shared;
     let next = match next {
@@ -467,7 +468,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     match &shared.durable {
         Some(durable) => {
             let revision = next.revision;
-            let _checkpoint = durable.checkpoint_slot.lock();
+            let _checkpoint = super::admit(&durable.checkpoint_slot, "checkpoint")?;
             let image = Snapshot::new(
                 Arc::clone(&next),
                 Arc::clone(&shared.dictionary),
@@ -507,18 +508,23 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
             };
             // The checkpoint covers every logged revision: later commits start a new
             // segment, and all older segments can go.
+            let compaction = shared.versions.compaction_slot.lock();
             let mut wal = durable.wal.lock();
             wal.rotate(revision + 1)?;
             shared.versions.install(next);
             release_covered(&mut wal, durable.root(), revision);
             drop(wal);
+            drop(compaction);
             if let Some(base) = base
                 && let Err(error) = shared.dictionary.rebase(base)
             {
                 tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
             }
         }
-        None => shared.versions.install(next),
+        None => {
+            let _compaction = shared.versions.compaction_slot.lock();
+            shared.versions.install(next);
+        }
     }
     Ok(())
 }
@@ -555,7 +561,7 @@ fn publish_streamed(
         publish(engine, Next::Built(next))?;
         return Ok(len);
     };
-    let _checkpoint = durable.checkpoint_slot.lock();
+    let _checkpoint = super::admit(&durable.checkpoint_slot, "checkpoint")?;
     let empty = PackedKeys::from_sorted(&[]);
     // Every layout has SPOG: its length is the number of quads.
     let mut len = 0;
@@ -602,11 +608,13 @@ fn publish_streamed(
         equality: Default::default(),
         canonical: Default::default(),
     });
+    let compaction = shared.versions.compaction_slot.lock();
     let mut wal = durable.wal.lock();
     wal.rotate(revision + 1)?;
     shared.versions.install(next);
     release_covered(&mut wal, durable.root(), revision);
     drop(wal);
+    drop(compaction);
     if let Err(error) = shared.dictionary.rebase(base) {
         tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
     }
@@ -672,7 +680,9 @@ impl<'e> Rematerialisation<'e> {
             base,
         } = self;
         let shared = &engine.shared;
-        let _compaction = shared.versions.compaction_slot.lock();
+        // The new stack is built from `base` alone (the writer slot keeps it the latest
+        // content) without the compaction slot, which `publish` takes to install it: nothing
+        // that waits for that slot waits for this parallel work.
         let started = Instant::now();
         let mut quads: Vec<EncodedQuad> = inferred
             .into_par_iter()
@@ -693,11 +703,8 @@ impl<'e> Rematerialisation<'e> {
             .par_iter()
             .filter(|q| quads.binary_search(q).is_err())
             .count();
-        // Compaction may have replaced runs since `base` was taken, with the same content.
-        let current = shared.snapshot();
-        let current = current.version();
         let summary = CommitSummary {
-            revision: current.revision + 1,
+            revision: base.revision() + 1,
             inserted: 0,
             deleted: 0,
             inferred_inserted: inserted as u64,
@@ -705,21 +712,26 @@ impl<'e> Rematerialisation<'e> {
         };
         if inserted + deleted == 0 {
             return Ok(CommitSummary {
-                revision: current.revision,
+                revision: base.revision(),
                 ..summary
             });
         }
+        let inferred = IndexVersion::from_quads(Layout::DefaultGraph, quads);
+        // A merge may have replaced the asserted runs since `base` was taken, with the same
+        // statements: the latest ones are kept.
+        let current = shared.snapshot();
+        let current = current.version();
+        debug_assert_eq!(current.revision, base.revision(), "single writer");
         let next = Version {
             content: super::Content::fresh(),
             asserted: current.asserted.clone(),
-            inferred: IndexVersion::from_quads(Layout::DefaultGraph, quads),
+            inferred,
             revision: summary.revision,
             dictionary_len: shared.dictionary.len(),
             equality: Default::default(),
             canonical: Default::default(),
         };
         publish(engine, Next::Built(next))?;
-        drop(_compaction);
         tracing::info!(
             revision = summary.revision,
             inferred_inserted = summary.inferred_inserted,

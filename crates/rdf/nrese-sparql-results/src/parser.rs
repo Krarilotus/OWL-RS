@@ -48,8 +48,10 @@ impl QueryResultsParser {
     ) -> Result<SliceQueryResultsParserOutput<'_>, QueryResultsSyntaxError> {
         let inner = match self.format {
             QueryResultsFormat::Json => {
+                // The head first, wherever it is: bindings before it stream too.
+                let head = json::slice_head(bytes).map_err(syntax_only)?;
                 let events = SliceJsonParser::from_bytes(bytes)?;
-                match JsonSolutions::start(events).map_err(syntax_only)? {
+                match JsonSolutions::start(events, head).map_err(syntax_only)? {
                     (json::Start::Boolean(value), _) => {
                         return Ok(SliceQueryResultsParserOutput::Boolean(value));
                     }
@@ -94,7 +96,7 @@ impl QueryResultsParser {
     ) -> Result<ReaderQueryResultsParserOutput<R>, QueryResultsParseError> {
         let inner = match self.format {
             QueryResultsFormat::Json => {
-                match JsonSolutions::start(ReaderJsonParser::new(reader))? {
+                match JsonSolutions::start(ReaderJsonParser::new(reader), None)? {
                     (json::Start::Boolean(value), _) => {
                         return Ok(ReaderQueryResultsParserOutput::Boolean(value));
                     }
