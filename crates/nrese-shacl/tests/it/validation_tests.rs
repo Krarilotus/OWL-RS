@@ -433,6 +433,25 @@ fn current_shape_and_shapes_graph_are_bound_in_subqueries() {
     }
 }
 
+/// SHACL §6.2: a SPARQL-based constraint component constrains a shape once per combination of
+/// the shape's values for its parameters. Two values of ex:p1 and three of ex:p2 are six
+/// constraints; the ASK fails where p1 < p2: (1 2), (1 3) and (2 3), so the focus node has
+/// three results. Pairing values by position, or stopping at the shorter list, finds fewer.
+#[test]
+fn a_component_constrains_once_per_combination_of_its_parameter_values() {
+    let engine = engine(
+        "ex:a ex:q ex:b .",
+        "ex:C a sh:ConstraintComponent ;
+           sh:parameter [ sh:path ex:p1 ] , [ sh:path ex:p2 ] ;
+           sh:validator [ a sh:SPARQLAskValidator ; sh:ask '''ASK { FILTER ($p1 >= $p2) }''' ] .
+         ex:S a sh:NodeShape ; sh:targetNode ex:a ; ex:p1 1 , 2 ; ex:p2 1 , 2 , 3 .",
+    );
+    let snapshot = engine.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(report.results.len(), 3, "{:?}", report.results);
+}
+
 /// RSH-07: a validation runs on its caller's resources, its SHACL-SPARQL queries included,
 /// nested shapes' too. When they stop it (the cancellation fired, or the envelope refused
 /// a charge), the outcome is that stop: not a report of what was found before it, and not a
