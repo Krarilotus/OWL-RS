@@ -264,6 +264,12 @@ mod tests {
                  ex:weight rdfs:range xsd:double .
                  ex:name rdfs:range xsd:string .
                  ex:code rdfs:range xsd:token .
+                 ex:big rdfs:range xsd:long .
+                 ex:hex rdfs:range xsd:hexBinary .
+                 ex:born a owl:DatatypeProperty, owl:FunctionalProperty .
+                 ex:when rdfs:range xsd:dateTime .
+                 ex:any rdfs:range rdfs:Literal .
+                 @prefix rdf: <{RDF}> .
                  {data}"
             );
             for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
@@ -320,6 +326,119 @@ mod tests {
         );
         // Guard (holds on the base too).
         assert_eq!(rules("ex:a ex:code \"a b\" ."), none, "a token");
+        // Every literal of OWL 2's datatype map is judged by its data value (OWL 2 Structural
+        // Specification §4, OWL 2 Profiles table 8). An ill-typed literal has no value, so it is
+        // in no value space (RDF 1.2 Concepts §3.4: "a semantic inconsistency"). Every row is
+        // checked and the wrong ones reported together.
+        let dt_not_type: &[&str] = &["dt-not-type"];
+        let dt_diff: &[&str] = &["dt-diff"];
+        let red: &[(&str, &[&str], &str)] = &[
+            (
+                "ex:a ex:age \"abc\"^^xsd:integer .",
+                dt_not_type,
+                "an ill-typed integer",
+            ),
+            (
+                "ex:a ex:name \"yes\"^^xsd:boolean .",
+                dt_not_type,
+                "an ill-typed boolean",
+            ),
+            (
+                "ex:a ex:hex \"F\"^^xsd:hexBinary .",
+                dt_not_type,
+                "an ill-typed hexBinary",
+            ),
+            // §4.2: integers have no bound; 2^63 is past xsd:long's.
+            (
+                "ex:a ex:big 9223372036854775808 .",
+                dt_not_type,
+                "2^63 is no long",
+            ),
+            (
+                "ex:a ex:age 18446744073709551616, 18446744073709551617 .",
+                dt_diff,
+                "two ages past 2^64",
+            ),
+            // §4.5: the value spaces of hexBinary and base64Binary are disjoint.
+            (
+                "ex:a ex:hex \"AQ==\"^^xsd:base64Binary .",
+                dt_not_type,
+                "base64 is no hex",
+            ),
+            // rdf:PlainLiteral "abc@en" is the tagged string "abc"@en, no xsd:string.
+            (
+                "ex:a ex:name \"abc@en\"^^rdf:PlainLiteral .",
+                dt_not_type,
+                "a tagged plain literal",
+            ),
+            // §4.7: one instant at two offsets is equal but not identical: two values.
+            (
+                "ex:a ex:born \"1956-06-25T04:00:00-05:00\"^^xsd:dateTime, \
+                 \"1956-06-25T10:00:00+01:00\"^^xsd:dateTime .",
+                dt_diff,
+                "one instant at two offsets",
+            ),
+            // A year past what is represented doesn't excuse the rest of the form (XML
+            // Schema 1.1 Part 2 §3.3.7.2, §3.4.28.1): still ill-typed (XSDVAL sol-loop S2).
+            (
+                "ex:a ex:when \"100000000001-13-01T00:00:00Z\"^^xsd:dateTime .",
+                dt_not_type,
+                "a year past what is represented, month 13",
+            ),
+            (
+                "ex:a ex:any \"100000000001-01-01T00:00:00\"^^xsd:dateTimeStamp .",
+                dt_not_type,
+                "a year past what is represented, a dateTimeStamp without a timezone",
+            ),
+        ];
+        // Guards (accepted on the base too): values in their range, one value under two
+        // lexical forms, and a datatype outside the map, which is not judged.
+        let guards: &[(&str, &[&str], &str)] = &[
+            ("ex:a ex:hex \"0F\"^^xsd:hexBinary .", &[], "a hexBinary"),
+            (
+                "ex:a ex:age 18446744073709551616 .",
+                &[],
+                "2^64 is a nonNegativeInteger",
+            ),
+            ("ex:a ex:big -9223372036854775808 .", &[], "-2^63 is a long"),
+            (
+                "ex:a ex:name \"abc@\"^^rdf:PlainLiteral .",
+                &[],
+                "an untagged plain literal",
+            ),
+            (
+                "ex:a ex:born \"2000-01-01T00:00:00Z\"^^xsd:dateTime, \
+                 \"2000-01-01T00:00:00.000Z\"^^xsd:dateTime .",
+                &[],
+                "one date-time under two lexical forms",
+            ),
+            (
+                "ex:a ex:age \"2001\"^^xsd:gYear .",
+                &[],
+                "gYear is outside the map",
+            ),
+            // A year has no bound (XML Schema 1.1 Part 2 §3.3.7.2): one past what is
+            // represented is valid, not judged, never an inconsistency (XSDVAL sol-loop S1).
+            (
+                "ex:a ex:when \"100000000001-01-01T00:00:00Z\"^^xsd:dateTime .",
+                &[],
+                "a year past what is represented, under xsd:dateTime",
+            ),
+            (
+                "ex:a ex:any \"100000000001-01-01T00:00:00Z\"^^xsd:dateTime .",
+                &[],
+                "a year past what is represented, under rdfs:Literal",
+            ),
+        ];
+        let wrong: Vec<String> = red
+            .iter()
+            .chain(guards)
+            .filter_map(|&(data, expected, why)| {
+                let got = rules(data);
+                (got != expected).then(|| format!("{why}: {got:?}, not {expected:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]
