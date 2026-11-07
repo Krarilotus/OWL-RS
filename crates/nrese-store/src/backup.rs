@@ -13,7 +13,7 @@ use nrese_rdf_io::{RdfFormat, RdfParseError};
 use sha2::{Digest, Sha256};
 
 use crate::error::{StoreError, StoreResult};
-use crate::rdf_io::{parse_dataset, write_quads};
+use crate::rdf_io::{BlankNodes, each_payload_quad, write_quads};
 
 /// The closing comment of an export, before its checksum's 64 hex digits.
 pub const DIGEST_PREFIX: &str = "# nrese-sha256 ";
@@ -145,19 +145,27 @@ pub fn export_dataset(
     })
 }
 
-/// Replaces the whole dataset with the artifact's quads. The artifact is parsed completely
-/// before the transaction is touched, so an invalid artifact changes nothing.
+/// Replaces the whole dataset with the artifact's quads, each as it is read. An invalid
+/// artifact changes nothing: a damaged one fails its checksum first, and one that fails
+/// part-way fails the restore, whose transaction is then discarded (the mutation pipeline
+/// commits only a write that ends).
 pub(crate) fn apply_restore(
     tx: &mut Transaction<'_>,
     request: &DatasetRestoreRequest,
 ) -> StoreResult<DatasetRestoreReport> {
     let checksum_verified = verify_checksum(&request.payload)?;
-    let quads = parse_dataset(request.format.rdf_format(), &request.payload)?;
     let replaced_existing = !tx.is_empty();
     tx.remove_matching(&QuadPattern::all());
-    for quad in &quads {
-        tx.insert(quad.as_ref());
-    }
+    each_payload_quad(
+        request.format.rdf_format(),
+        None,
+        &request.payload,
+        BlankNodes::Fresh,
+        |quad| {
+            tx.insert(quad);
+            Ok(())
+        },
+    )?;
     Ok(DatasetRestoreReport {
         format: request.format,
         checksum_sha256: sha256_hex(&request.payload),
