@@ -343,3 +343,51 @@ async fn a_slow_image_that_keeps_coming_is_not_cut_off() {
         }
     }
 }
+
+/// A stopped follower lets go of its round: the connection of the request it was waiting
+/// on closes (written with the fix: `Follower` is its API).
+#[tokio::test]
+async fn a_stopped_follower_lets_go_of_its_round() {
+    let primary = HeldPrimary::bind().await;
+    let state = replica_with(ReplicationConfig {
+        primary: Some(primary.url.clone()),
+        ..ReplicationConfig::default()
+    });
+    let follower = replication::follow(state).expect("follower");
+    let mut stream = tokio::time::timeout(HANG, primary.listener.accept())
+        .await
+        .expect("the follower's request")
+        .expect("accepted")
+        .0;
+    read_request(&mut stream).await.expect("its request");
+    tokio::time::timeout(HANG, follower.stop())
+        .await
+        .expect("stopped");
+    let mut rest = Vec::new();
+    let closed = tokio::time::timeout(HANG, stream.read_to_end(&mut rest)).await;
+    assert!(matches!(closed, Ok(Ok(_))), "{closed:?}");
+}
+
+/// A log round whose primary sends a piece every 20 s (never pausing 30 s) still ends once
+/// `replication.round_timeout` has passed (written with the fix: the setting is new).
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_log_round_that_trickles_ends_at_its_round_timeout() {
+    let _clock = hold_clock();
+    let primary = HeldPrimary::bind().await;
+    let mut running = pull(
+        &primary,
+        replica_with(ReplicationConfig {
+            round_timeout: Some(Duration::from_secs(60)),
+            ..ReplicationConfig::default()
+        }),
+    );
+    let mut stream = primary.request(&mut running).await.expect("request");
+    send(&mut stream, LOG_HEAD.as_bytes()).await;
+    for _ in 0..2 {
+        send(&mut stream, b"x").await;
+        assert!(still_running_after(Duration::from_secs(20), &running).await);
+    }
+    send(&mut stream, b"x").await;
+    let ended = after(Duration::from_secs(25), &mut running).await;
+    assert!(failed_with(&ended, "round_timeout"), "{ended:?}");
+}

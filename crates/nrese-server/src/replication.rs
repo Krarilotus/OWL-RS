@@ -70,6 +70,13 @@ pub struct ReplicationConfig {
     pub poll: Duration,
     /// About how many bytes of log a replica asks for at once.
     pub batch_bytes: usize,
+    /// The longest one log round may take, its answer whole (a primary sending a byte at a
+    /// time doesn't extend it); `None`: no total limit, the limits between pieces stay.
+    pub round_timeout: Option<Duration>,
+    /// The longest a replica waits for its primary to prepare an image (the primary writes
+    /// and checks it before its answer begins); `None`: no limit. The image then comes as
+    /// long as its pieces come.
+    pub image_timeout: Option<Duration>,
 }
 
 impl Default for ReplicationConfig {
@@ -80,6 +87,8 @@ impl Default for ReplicationConfig {
             token: None,
             poll: Duration::from_millis(500),
             batch_bytes: 8 << 20,
+            round_timeout: Some(Duration::from_secs(300)),
+            image_timeout: Some(Duration::from_secs(3600)),
         }
     }
 }
@@ -335,6 +344,48 @@ fn client(config: &ReplicationConfig) -> anyhow::Result<(reqwest::Client, String
     Ok((client, primary))
 }
 
+// Every exchange with the primary ends: its answer begins within a limit, and its body
+// pauses at most `IDLE` between pieces. A log round as a whole takes at most
+// `replication.round_timeout`; an image comes as long as its pieces come, however large,
+// after the primary has prepared it (`replication.image_timeout`).
+
+/// The longest a replica waits for a log answer to begin (its headers).
+const HEADERS: Duration = Duration::from_secs(30);
+/// The longest an answer's body may pause between two pieces.
+const IDLE: Duration = Duration::from_secs(30);
+
+/// `request` sent; an error if its answer hasn't begun within `wait` (`None`: no limit).
+async fn begin(
+    request: reqwest::RequestBuilder,
+    wait: Option<Duration>,
+) -> anyhow::Result<reqwest::Response> {
+    let Some(wait) = wait else {
+        return Ok(request.send().await?);
+    };
+    match tokio::time::timeout(wait, request.send()).await {
+        Ok(response) => Ok(response?),
+        Err(_) => anyhow::bail!("the primary didn't answer within {} s", wait.as_secs()),
+    }
+}
+
+/// The next piece of `response`'s body (`None` at its end); an error if none comes within
+/// [`IDLE`].
+async fn piece(response: &mut reqwest::Response) -> anyhow::Result<Option<axum::body::Bytes>> {
+    match tokio::time::timeout(IDLE, response.chunk()).await {
+        Ok(piece) => Ok(piece?),
+        Err(_) => anyhow::bail!("the primary stopped sending for {} s", IDLE.as_secs()),
+    }
+}
+
+/// An error answer's text, as far as it comes within [`IDLE`].
+async fn error_text(response: reqwest::Response) -> String {
+    tokio::time::timeout(IDLE, response.text())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+}
+
 fn authorised(
     request: reqwest::RequestBuilder,
     config: &ReplicationConfig,
@@ -365,18 +416,21 @@ pub async fn bootstrap(config: &ReplicationConfig, data_dir: &Path) -> anyhow::R
         return Ok(None);
     }
     let (client, primary) = client(config)?;
-    let response = authorised(
-        client.get(format!("{primary}/api/v1/replication/image")),
-        config,
+    // The primary writes and checks the image before its answer begins.
+    let response = begin(
+        authorised(
+            client.get(format!("{primary}/api/v1/replication/image")),
+            config,
+        ),
+        config.image_timeout,
     )
-    .send()
     .await
     .with_context(|| format!("asking {primary} for an image"))?;
     if !response.status().is_success() {
         anyhow::bail!(
             "{primary} answered {} to the image request: {}",
             response.status(),
-            response.text().await.unwrap_or_default()
+            error_text(response).await
         );
     }
     let manifest: nrese_store::ImageManifest = serde_json::from_str(
@@ -398,7 +452,7 @@ pub async fn bootstrap(config: &ReplicationConfig, data_dir: &Path) -> anyhow::R
         use std::io::Write;
         let mut file = std::fs::File::create(&staged)?;
         let mut response = response;
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = piece(&mut response).await? {
             file.write_all(&chunk)?;
         }
         file.sync_all()?;
@@ -423,48 +477,112 @@ pub async fn pull_once(
         "{primary}/api/v1/replication/log?after={after}&max_bytes={}",
         config.batch_bytes
     );
-    let response = authorised(client.get(url), config).send().await?;
-    let status = response.status();
-    if status == reqwest::StatusCode::GONE {
-        anyhow::bail!(
-            "the primary's log no longer holds revision {}: start this replica again from \
-             an empty data directory (the primary keeps its log for replicas with \
-             storage.wal_archive = true)",
-            after + 1
-        );
-    }
-    if !status.is_success() {
-        anyhow::bail!(
-            "the primary answered {status}: {}",
-            response.text().await.unwrap_or_default()
-        );
-    }
-    let header = |name: &str| {
-        response
-            .headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok())
+    let round = async {
+        let mut response = begin(authorised(client.get(url), config), Some(HEADERS)).await?;
+        let status = response.status();
+        if status == reqwest::StatusCode::GONE {
+            anyhow::bail!(
+                "the primary's log no longer holds revision {}: start this replica again from \
+                 an empty data directory (the primary keeps its log for replicas with \
+                 storage.wal_archive = true)",
+                after + 1
+            );
+        }
+        if !status.is_success() {
+            anyhow::bail!(
+                "the primary answered {status}: {}",
+                error_text(response).await
+            );
+        }
+        let progress = Progress::read(response.headers(), after)?;
+        let mut frames = Vec::new();
+        while let Some(chunk) = piece(&mut response).await? {
+            frames.extend_from_slice(&chunk);
+        }
+        Ok::<_, anyhow::Error>((progress, frames))
     };
-    let (records, latest) = (
-        header(RECORDS).unwrap_or(0),
-        header(LATEST).unwrap_or(after),
-    );
-    let frames = response.bytes().await?;
-    if records > 0 {
-        let store = state.store();
-        tokio::task::spawn_blocking(move || store.apply_replication_log(&frames)).await??;
+    let (progress, frames) = match config.round_timeout {
+        None => round.await?,
+        Some(limit) => tokio::time::timeout(limit, round).await.map_err(|_| {
+            anyhow::anyhow!(
+                "the log round took longer than replication.round_timeout ({} s)",
+                limit.as_secs()
+            )
+        })??,
+    };
+    if (progress.records > 0) == frames.is_empty() {
+        anyhow::bail!(
+            "the primary's answer says {} records and carries {} bytes",
+            progress.records,
+            frames.len()
+        );
     }
-    replication.contact(latest, records as usize, None);
-    Ok(records as usize)
+    if progress.records > 0 {
+        let store = state.store();
+        let reached =
+            tokio::task::spawn_blocking(move || store.apply_replication_log(&frames)).await??;
+        if reached != progress.last {
+            anyhow::bail!(
+                "the primary's records reached revision {reached}, not {} as it said",
+                progress.last
+            );
+        }
+    }
+    replication.contact(progress.latest, progress.records as usize, None);
+    Ok(progress.records as usize)
 }
 
-/// Follows the primary's log until the server stops: asks again at once while records
-/// come, after `replication.poll` once caught up, and after a growing pause on errors
-/// (reported in the status).
-pub fn follow(state: AppState) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+/// What a log answer says it carries: its record count, the revision of its last record
+/// (the asked-for one without records) and the primary's latest revision.
+struct Progress {
+    records: u64,
+    last: u64,
+    latest: u64,
+}
+
+impl Progress {
+    /// The progress `headers` report for the records after `after`; an error if one is
+    /// missing, not a number, or contradicts the others.
+    fn read(headers: &HeaderMap, after: u64) -> anyhow::Result<Self> {
+        let header = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .ok_or_else(|| anyhow::anyhow!("the primary's answer has no number in {name}"))
+        };
+        let progress = Self {
+            records: header(RECORDS)?,
+            last: header(LAST)?,
+            latest: header(LATEST)?,
+        };
+        // Every revision is one record: the records after `after` are those up to `last`.
+        let follows = match progress.records {
+            0 => progress.last == after,
+            records => {
+                progress.last.checked_sub(after) == Some(records)
+                    && progress.last <= progress.latest
+            }
+        };
+        if !follows || progress.latest < after {
+            anyhow::bail!(
+                "the primary's answer after revision {after} says {} records, the last at \
+                 revision {}, its latest {}",
+                progress.records,
+                progress.last,
+                progress.latest
+            );
+        }
+        Ok(progress)
+    }
+}
+
+/// Follows the primary's log until the returned [`Follower`] is stopped or dropped: asks
+/// again at once while records come, after `replication.poll` once caught up, and after a
+/// growing pause on errors (reported in the status).
+pub fn follow(state: AppState) -> anyhow::Result<Follower> {
     let (client, primary) = client(&state.replication().config)?;
-    Ok(tokio::spawn(async move {
+    Ok(Follower(tokio::spawn(async move {
         let poll = state.replication().config.poll;
         let mut pause = poll;
         loop {
@@ -482,19 +600,26 @@ pub fn follow(state: AppState) -> anyhow::Result<tokio::task::JoinHandle<()>> {
                 }
             }
         }
-    }))
+    })))
 }
 
-/// The headers a log answer carries, for tests.
-pub fn log_headers(headers: &HeaderMap) -> (u64, u64, u64) {
-    let get = |name: &str| {
-        headers
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-    };
-    (get(RECORDS), get(LAST), get(LATEST))
+/// The task [`follow`] runs, and with it the server state it holds: ended when this is
+/// stopped or dropped, at its next await (a batch being applied is applied to its end on
+/// its own thread; the engine applies each record whole).
+pub struct Follower(tokio::task::JoinHandle<()>);
+
+impl Follower {
+    /// Ends the task and waits until it has let go of everything it held.
+    pub async fn stop(mut self) {
+        self.0.abort();
+        let _ = (&mut self.0).await;
+    }
+}
+
+impl Drop for Follower {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[cfg(test)]
