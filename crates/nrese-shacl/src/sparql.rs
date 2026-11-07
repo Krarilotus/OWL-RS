@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use nrese_engine::TermId;
 use nrese_rdf::{NamedNode, Term, Variable};
-use nrese_sparql::{QueryOptions, QueryResults, ReadView};
+use nrese_sparql::{QueryEvaluationError, QueryOptions, QueryResults, ReadView, Resources};
 use nrese_sparql_syntax::algebra::{Expression, GraphPattern, PropertyPathExpression};
 
 use crate::graph::Selection;
@@ -179,8 +179,38 @@ pub(crate) enum Outcome {
     Solutions(Vec<Found>),
 }
 
+/// Why a check has no outcome.
+pub(crate) enum Problem {
+    /// The validation's resources stopped the query: the cancellation fired, or the envelope
+    /// refused a charge. No verdict on the data: the whole validation stops with it.
+    Stopped(QueryEvaluationError),
+    /// The check couldn't be evaluated: a failure of this constraint.
+    Failed(String),
+}
+
+impl From<String> for Problem {
+    fn from(problem: String) -> Self {
+        Self::Failed(problem)
+    }
+}
+
+impl From<QueryEvaluationError> for Problem {
+    fn from(error: QueryEvaluationError) -> Self {
+        match error {
+            QueryEvaluationError::Cancelled | QueryEvaluationError::MemoryLimit(_) => {
+                Self::Stopped(error)
+            }
+            other => Self::Failed(other.to_string()),
+        }
+    }
+}
+
 /// Runs `check` for `focus` (with `values`, its value nodes, for an ASK validator) over
-/// `data`, with the pre-bound variables of SHACL-SPARQL.
+/// `data`, with the pre-bound variables of SHACL-SPARQL, on the validation's `resources`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one check's inputs: the data, the check, its focus and values, its shape's terms and the resources"
+)]
 pub(crate) fn run<V: ReadView>(
     view: &V,
     data: Selection,
@@ -189,7 +219,8 @@ pub(crate) fn run<V: ReadView>(
     values: &[TermId],
     shape: TermId,
     shapes_graph: Option<TermId>,
-) -> Result<Outcome, String> {
+    resources: &Resources,
+) -> Result<Outcome, Problem> {
     let decode = |id: TermId| {
         view.decode(id)
             .ok_or_else(|| format!("term #{} isn't known", id.raw()))
@@ -204,15 +235,19 @@ pub(crate) fn run<V: ReadView>(
     for (name, value) in &check.parameters {
         bound.insert(name.clone(), decode(*value)?);
     }
-    // The statements Core reads, shapes graphs left out ([`Selection::query_dataset`]).
-    let mut options = QueryOptions::default();
+    // The statements Core reads, shapes graphs left out ([`Selection::query_dataset`]), on
+    // the validation's cancellation and envelope.
+    let mut options = QueryOptions {
+        resources: resources.clone(),
+        ..QueryOptions::default()
+    };
     data.query_dataset(view, &mut options)?;
     let evaluate = |bound: HashMap<Variable, Term>| {
         let options = QueryOptions {
             pre_bound: Some(Arc::new(bound)),
             ..options.clone()
         };
-        nrese_sparql::evaluate_query(view, &check.query, &options).map_err(|e| e.to_string())
+        nrese_sparql::evaluate_query(view, &check.query, &options).map_err(Problem::from)
     };
     if check.ask {
         let mut failed = Vec::new();
@@ -222,17 +257,23 @@ pub(crate) fn run<V: ReadView>(
             match evaluate(bound)? {
                 QueryResults::Boolean(true) => {}
                 QueryResults::Boolean(false) => failed.push(value),
-                _ => return Err("an ASK validator isn't an ASK query".into()),
+                _ => {
+                    return Err(Problem::Failed(
+                        "an ASK validator isn't an ASK query".into(),
+                    ));
+                }
             }
         }
         return Ok(Outcome::Failed(failed));
     }
     let QueryResults::Solutions(solutions) = evaluate(bound)? else {
-        return Err("a SELECT constraint isn't a SELECT query".into());
+        return Err(Problem::Failed(
+            "a SELECT constraint isn't a SELECT query".into(),
+        ));
     };
     let mut found = Vec::new();
     for solution in solutions {
-        let solution = solution.map_err(|e| e.to_string())?;
+        let solution = solution.map_err(Problem::from)?;
         let failure = matches!(
             solution.get("failure"),
             Some(Term::Literal(l)) if l.value() == "true"

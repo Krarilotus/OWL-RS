@@ -11,8 +11,8 @@ use std::sync::Arc;
 use nrese_engine::{EncodedTriple, Engine, EngineConfig, Snapshot};
 use nrese_rdf::{GraphName, NamedNode, Quad, Term};
 use nrese_sparql::{
-    CancellationToken, QueryEvaluationError, QueryOptions, QueryResults, ServiceClient,
-    ServiceResults, Services, evaluate_query,
+    QueryEvaluationError, QueryOptions, QueryResults, ServiceCall, ServiceClient, ServiceResults,
+    Services, evaluate_query,
 };
 use nrese_sparql_syntax::SparqlParser;
 
@@ -138,14 +138,16 @@ impl ServiceClient for Endpoint {
         &self,
         _endpoint: &str,
         query: &str,
-        _cancellation: Option<&CancellationToken>,
-    ) -> Result<ServiceResults, Box<dyn std::error::Error + Send + Sync>> {
-        let parsed = SparqlParser::new().parse_query(query)?;
+        _call: ServiceCall<'_>,
+    ) -> Result<ServiceResults, QueryEvaluationError> {
+        let parsed = SparqlParser::new()
+            .parse_query(query)
+            .map_err(|error| QueryEvaluationError::Service(error.into()))?;
         let snapshot = self.0.snapshot();
         let QueryResults::Solutions(solutions) =
             evaluate_query(&snapshot, &parsed, &QueryOptions::default())?
         else {
-            return Err("not a SELECT".into());
+            return Err(QueryEvaluationError::Service("not a SELECT".into()));
         };
         let variables = solutions.variables().to_vec();
         let mut rows = Vec::new();

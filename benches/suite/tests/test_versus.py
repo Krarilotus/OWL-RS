@@ -77,6 +77,41 @@ class Standings(unittest.TestCase):
         self.assertIn("| graphdb | restricted | restricted | - | ran in 1 runs; results stay local |", text)
         self.assertIn("| jena | - | - | - | not measured yet |", text)
 
+    def test_a_result_from_before_the_reset_is_marked_never_shown_as_current(self):
+        """The brief of 2 Nov 2026: STATUS and STANDINGS showed 12 Oct's results with nothing saying
+        they measured an engine engine-v2 no longer continues (the reset of 25 Oct 2026)."""
+        entry = {"case": "c", "semantics": "plain", "system": "qlever", "answers": "ok", "timed": "2/2",
+                 "verdict": "win", "time": {"ratio": 0.25, "ci": [0.2, 0.3]}}
+        systems = {"nrese": {}, "qlever": {"publish": "free"}}
+        for started, marked in (("2026-10-24T23:59", True), ("2026-10-25T00:00", False), ("", True)):
+            with self.subTest(started=started):
+                record = {"id": "r", "started": started, "host": "h", "commit": "a", "versus": [entry]}
+                self.assertEqual(standings.pre_reset(record), marked)
+                text = standings.render([record], systems, Path("."))
+                summary, comparisons = text.split("## Home turf")[0], text.split("## qlever")[1]
+                rows = [line for line in summary.splitlines() if line.startswith("| qlever |")] + \
+                       [line for line in comparisons.splitlines() if line.startswith("| c |")]
+                self.assertEqual([line.rstrip(" |").endswith("†") for line in rows], [marked, marked], rows)
+
+    def test_every_contender_shows_its_home_turf_or_is_a_listed_gap(self):
+        """The owner's bar, "Beat each competitor on its home turf": per contender its home-turf cases,
+        whether they can run here, its newest verdict (marked before the reset); none is a gap, named."""
+        entry = {"case": "c", "semantics": "plain", "system": "qlever", "answers": "ok", "timed": "2/2",
+                 "verdict": "win", "time": {"ratio": 0.25, "ci": [0.2, 0.3]}}
+        systems = {"nrese": {}, "qlever": {"publish": "free", "runs": ["docker"]},
+                   "graphdb": {"publish": "permission", "runs": ["docker"]},
+                   "rdfox": {"publish": "permission", "refused": "no licence"}, "jena": {"publish": "free", "runs": ["docker"]}}
+        catalog = [{"name": "c", "home_turf": "qlever", "cap_gb": 6, "check": {"x": 1}},
+                   {"name": "huge", "home_turf": "jena", "cap_gb": 64, "check": {"x": 1}}]
+        rows = standings.home_turf([{"id": "r", "started": "2026-10-10", "versus": [entry]}], systems, catalog)
+        by = {line.split(" | ")[0].lstrip("| "): line for line in rows if line.startswith("| ") and "---" not in line}
+        self.assertIn("c: win 2026-10-10†", by["qlever"])
+        self.assertIn("huge needs 64 GB", by["jena"])
+        self.assertIn("gap: none defined", by["graphdb"])
+        self.assertIn("licensed", by["graphdb"])
+        self.assertIn("refused", by["rdfox"])
+        self.assertIn("Gaps, no home-turf case defined (2 of 4): graphdb, rdfox.", rows)
+
 
 class Refused(unittest.TestCase):
     def test_a_refused_system_shows_its_published_numbers_apart_never_as_measured(self):
