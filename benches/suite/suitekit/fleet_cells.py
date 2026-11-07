@@ -119,7 +119,7 @@ def select(root, systems, workloads, args):
 
 
 def jobs(groups, args):
-    request = {k: v for k, v in vars(args).items() if k not in ("out", "submit", "plan", "systems", "workloads", "tiers", "gaps")}
+    request = {k: v for k, v in vars(args).items() if k not in ("out", "submit", "plan", "systems", "workloads", "tiers", "gaps", "references")}
     request["groups"] = groups
     token = hashlib.sha256(json.dumps(request, sort_keys=True, default=str).encode()).hexdigest()
     set_id, members = "suite-cells-" + token[:16], []
@@ -163,6 +163,9 @@ def member(root, systems):
     payload = json.loads(os.environ["SUITE_CELL"])
     group = payload["group"]
     chosen = group["systems"]
+    if not isinstance(chosen, list) or len(chosen) != 1 or not isinstance(chosen[0], str) or chosen[0] not in systems:
+        print("member requires exactly one known system", file=sys.stderr)
+        return 2
     for key in chosen:
         if why := publication_problem(key, systems.get(key, {})):
             print(f"{key}: {why}", file=sys.stderr)
@@ -293,9 +296,8 @@ def main(argv, systems, workloads, root):
             else:
                 retained.append(job)
         members = retained
-        print(f"total admitted {sum(j['est_min'] for j in members) / 60:.2f} host-hours (unmeasured)")
+        print(f"total admitted {sum(j['est_min'] for j in members) / 60:.2f} host-hours (unmeasured)" + ("; no placeable cells; nothing submitted" if not members else ""))
         if not members:
-            print("total admitted 0 host-hours; no placeable cells; nothing submitted")
             return 0
         token = hashlib.sha256(json.dumps(members, sort_keys=True).encode()).hexdigest()
         set_id = "suite-cells-" + token[:16]
