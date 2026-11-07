@@ -75,7 +75,8 @@ Initial loads and full restores bypass the per-commit path (`Engine::bulk_load`;
   - Other damage in the newest segment is a startup error that leaves the log as it is (`store.wal_damage = "refuse"`, the default), or, opted into, the log is kept up to the damage with the rest copied to `wal-cut/` (`"keep-prefix"`).
   - Invalid data in an older segment is a startup error, never silently skipped.
 - **Directory lock.** The data directory is locked against a second process.
-- **Format versions.** WAL segments and checkpoints carry a format version in their magic bytes (`durability/wal.rs`, `durability/checkpoint.rs`, which lists what each version added). Older formats this build still reads (WAL 4 to 6, checkpoints 4 to 11) are read; any other is rejected at startup with `UnsupportedFormat` instead of being reported as corrupt.
+- **Format versions.** WAL segments and checkpoints carry a format version in their magic bytes (`durability/wal.rs`, `durability/checkpoint.rs`, which lists what each version added). Older formats this build still reads (WAL 4 to 6, checkpoints 4 to 12) are read; any other is rejected at startup with `UnsupportedFormat` instead of being reported as corrupt. Checkpoints are written as format 12 (since 7 Nov 2026: the last commit's time, for restores by time), which earlier binaries don't read.
+- **Commit times.** Every commit is stamped with the wall clock, but never earlier than the commit before it, so a store's commit times never go back. A restore by time keeps the commits made up to the time and refuses to start from a checkpoint whose last commit was made after it, or whose time isn't known (format 11 and older).
 
 ## Limits
 

@@ -1,7 +1,10 @@
 //! Checkpoints: a full image of one revision (dictionary plus both index stacks).
 //!
-//! Format 11 (little-endian): `magic | revision u64 | flags u64 | dictionary | stack* | crc32
-//! u32`. The CRC covers everything before it. Flag bit 1 ([`COMPRESSED_KEYS`], format 11):
+//! Format 12 (little-endian): `magic | revision u64 | flags u64 | dictionary | stack* |
+//! committed u64 | crc32 u32`. The CRC covers everything before it. `committed` is when the
+//! revision's last commit was made, microseconds since 1970, 0 where that isn't known; a
+//! time restore needs it (`DurabilityConfig::recover_until_micros`). Format 11 is format 12
+//! without it. Flag bit 1 ([`COMPRESSED_KEYS`], format 11 on):
 //! the dictionary's keys are FSST-compressed ([`crate::term::vocabulary`]); its two symbol
 //! tables follow the dictionary's header. Flag bit 0 ([`INTEGERS_IN_DICTIONARY`]):
 //! integer-derived literals are dictionary entries, not inline (a store created before
@@ -70,8 +73,10 @@ use crate::term::vocabulary::{Codec, Trained, VocabularyEncoding, vocabulary_enc
 /// the dictionary's text order; version 8 the flags (integer-derived literals inline);
 /// version 9 lets the asserted stack have the default-graph layout; version 10 lets blocks
 /// of the packed permutations store a position as a palette; version 11 stores the
-/// dictionary's offsets in blocks.
-const MAGIC: &[u8; 8] = b"NRESECKB";
+/// dictionary's offsets in blocks; version 12 the last commit's time (EEV-06).
+const MAGIC: &[u8; 8] = b"NRESECKC";
+/// Format 11: format 12 without the commit time.
+const MAGIC_V11: &[u8; 8] = b"NRESECKB";
 /// Format 10: 8-byte dictionary end offsets.
 const MAGIC_V10: &[u8; 8] = b"NRESECKA";
 /// Formats 9 and 8 read as 10: their blocks have no palettes (the byte was zero padding).
@@ -562,6 +567,7 @@ pub(crate) fn write(
         dir,
         admission,
         snapshot.revision(),
+        version.committed_micros,
         snapshot.dictionary(),
         snapshot.dictionary_len(),
         [version.asserted.layout(), version.inferred.layout()],
@@ -569,7 +575,8 @@ pub(crate) fn write(
     )
 }
 
-/// Writes a checkpoint of `revision` from its parts and returns its path: the dictionary's
+/// Writes a checkpoint of `revision`, last committed at `committed_micros` (`None`: not
+/// known), from its parts and returns its path: the dictionary's
 /// entries `0..dictionary_len`, and each stack's permutations as `packed` gives them, in
 /// the order of the stack's layout (`layouts`: asserted, inferred). Each is written before the next is asked for, so a
 /// caller can build one at a time and drop it (bulk loads).
@@ -577,10 +584,15 @@ pub(crate) fn write(
 /// The scratch of the dictionary's section is charged to a budget within `admission`, the
 /// process's root (`EngineConfig::admission`; `None`: no limit), before it is allocated:
 /// refused, it fails with [`EngineError::MemoryLimit`] and publishes nothing.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one per header field and part, each given apart by its two callers"
+)]
 pub(crate) fn write_parts<'a>(
     dir: &Path,
     admission: Option<&Arc<SharedBudget>>,
     revision: u64,
+    committed_micros: Option<u64>,
     dictionary: &Dictionary,
     dictionary_len: u64,
     layouts: [Layout; 2],
@@ -640,6 +652,8 @@ pub(crate) fn write_parts<'a>(
             write += writing.elapsed();
         }
     }
+    // The last commit's time (format 12), 0 where it isn't known.
+    put_u64(&mut out.buffer, committed_micros.unwrap_or(0));
     out.flush_buffer()?;
     let syncing = std::time::Instant::now();
     let magic = MAGIC;
@@ -689,6 +703,8 @@ pub(crate) fn stack_index(
 /// A loaded checkpoint: its revision and both stacks; the dictionary is restored in place.
 pub(crate) struct Loaded {
     pub revision: u64,
+    /// When its last commit was made (format 12); `None` where that isn't known.
+    pub committed_micros: Option<u64>,
     pub stacks: Stacks,
     /// The store keeps integer-derived literals in its dictionary.
     pub integers_in_dictionary: bool,
@@ -735,9 +751,11 @@ pub(crate) fn load_latest(
         .ok_or_else(|| corrupt("truncated"))?;
     let mut reader = Reader::new(body);
     let mut blocks = false;
+    let mut timed = false;
     let (packed, aligned, with_order, with_flags) = match reader.bytes(MAGIC.len()) {
-        Some(magic) if magic == MAGIC => {
+        Some(magic) if magic == MAGIC || magic == MAGIC_V11 => {
             blocks = true;
+            timed = magic == MAGIC;
             (true, true, true, true)
         }
         Some(magic) if magic == MAGIC_V10 || magic == MAGIC_V9 || magic == MAGIC_V8 => {
@@ -760,6 +778,18 @@ pub(crate) fn load_latest(
         return Err(corrupt("checksum mismatch"));
     }
     lap("crc");
+    // Format 12: the commit time ends the body; the rest is read as format 11.
+    let mut committed_micros = None;
+    if timed {
+        let (rest, time) = body
+            .split_at_checked(body.len().saturating_sub(8))
+            .filter(|(rest, _)| rest.len() >= MAGIC.len())
+            .ok_or_else(|| corrupt("truncated"))?;
+        let time = u64::from_le_bytes(time.try_into().expect("8 bytes"));
+        committed_micros = (time != 0).then_some(time);
+        reader = Reader::new(rest);
+        reader.bytes(MAGIC.len());
+    }
     let revision = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
     let (integers_in_dictionary, compressed) = match with_flags {
         true => {
@@ -807,6 +837,7 @@ pub(crate) fn load_latest(
         lap("packed permutations");
         return Ok(Some(Loaded {
             revision,
+            committed_micros,
             stacks: Stacks::Packed(stacks),
             integers_in_dictionary,
         }));
@@ -829,6 +860,7 @@ pub(crate) fn load_latest(
         .ok_or_else(|| corrupt("truncated inferred"))?;
     Ok(Some(Loaded {
         revision,
+        committed_micros: None,
         stacks: Stacks::Quads { quads, inferred },
         integers_in_dictionary,
     }))
@@ -877,11 +909,15 @@ pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])
     super::fault::check(&super::fault::FAIL_MAP, "mapping")?;
     let map = crate::mapped::map(path)?;
     let bytes: &[u8] = &map;
-    let body = &bytes[..bytes.len().saturating_sub(4)];
+    let mut body = &bytes[..bytes.len().saturating_sub(4)];
+    // Format 12 ends its body in the commit time, which the version carries already.
+    if body.starts_with(MAGIC) {
+        body = &body[..body.len().saturating_sub(8)];
+    }
     let mut reader = Reader::new(body);
     // Format 8 is format 9 with the quad layout only; 9 is 10 without palettes.
     let blocks = match reader.bytes(MAGIC.len()) {
-        Some(magic) if magic == MAGIC => true,
+        Some(magic) if magic == MAGIC || magic == MAGIC_V11 => true,
         Some(magic) if magic == MAGIC_V10 || magic == MAGIC_V9 || magic == MAGIC_V8 => false,
         _ => return Err(corrupt("bad magic")),
     };
@@ -1152,5 +1188,82 @@ mod tests {
             assert_eq!((snapshot.revision(), snapshot.len()), (1, 1));
             assert_eq!(engine.checkpoint().unwrap(), 1);
         }
+    }
+
+    /// A format 11 checkpoint (no commit time) still opens as it did, plainly and for a
+    /// restore by revision; a restore by time from it is refused, since nothing says when its
+    /// commits were made (EEV-06). Format 12 is format 11 with the time before the checksum,
+    /// so removing it gives the format 11 file of the same store.
+    #[test]
+    fn a_format_11_checkpoint_opens_but_not_for_a_time_restore() {
+        use crate::{DurabilityConfig, Engine, EngineConfig, EngineError, QuadPattern};
+        let dir = tempfile::tempdir().unwrap();
+        let config = |until: Option<u64>, revision: Option<u64>| EngineConfig {
+            background_maintenance: false,
+            durability: DurabilityConfig {
+                recover_until_micros: until,
+                recover_until: revision,
+                ..DurabilityConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        let node = |n: &str| NamedNode::new_unchecked(format!("http://example.com/{n}"));
+        let quad = Quad::new(node("s"), node("p"), node("o"), GraphName::DefaultGraph);
+        {
+            let engine = Engine::open(dir.path(), config(None, None)).unwrap();
+            super::super::fault::CLOCK.set(Some(1000));
+            let mut tx = engine.transaction();
+            tx.insert(quad.as_ref());
+            tx.commit().unwrap();
+            super::super::fault::CLOCK.set(None);
+            assert_eq!(engine.checkpoint().unwrap(), 1);
+        }
+        let path = super::checkpoint_path(dir.path(), 1, super::EXTENSION);
+        let file = std::fs::read(&path).unwrap();
+        assert_eq!(&file[..8], super::MAGIC);
+        let time = file.len() - 12;
+        assert_eq!(
+            u64::from_le_bytes(file[time..time + 8].try_into().unwrap()),
+            1000
+        );
+        let mut old = super::MAGIC_V11.to_vec();
+        old.extend_from_slice(&file[8..time]);
+        let crc = crc32fast::hash(&old);
+        old.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &old).unwrap();
+
+        let refused = Engine::open(dir.path(), config(Some(u64::MAX), None)).err();
+        assert!(
+            matches!(refused, Some(EngineError::Configuration(_))),
+            "{refused:?}"
+        );
+        for (case, open) in [
+            ("plain", config(None, None)),
+            ("by revision", config(None, Some(1))),
+        ] {
+            let engine = Engine::open(dir.path(), open).unwrap();
+            let snapshot = engine.snapshot();
+            assert_eq!(snapshot.revision(), 1, "{case}");
+            let held: Vec<Quad> = snapshot
+                .quads_for_pattern(&QuadPattern::all())
+                .map(|q| snapshot.decode_quad(q).unwrap())
+                .collect();
+            assert_eq!(held, std::slice::from_ref(&quad), "{case}");
+        }
+        // With verification too (its checksum and structure), as format 11 was read.
+        let verified = EngineConfig {
+            durability: DurabilityConfig {
+                verify_on_open: true,
+                ..config(None, None).durability
+            },
+            ..config(None, None)
+        };
+        assert_eq!(
+            Engine::open(dir.path(), verified)
+                .unwrap()
+                .snapshot()
+                .revision(),
+            1
+        );
     }
 }

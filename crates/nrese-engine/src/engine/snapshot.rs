@@ -676,6 +676,7 @@ impl Snapshot {
             asserted: self.version.asserted.clone(),
             inferred,
             revision: self.version.revision,
+            committed_micros: self.version.committed_micros,
             dictionary_len: self.version.dictionary_len,
             equality: Default::default(),
             canonical: Default::default(),
