@@ -85,6 +85,8 @@ class FleetCells(unittest.TestCase):
         self.assertEqual(self.document()["set"], first)
         self.assertEqual([c[0] for c in self.calls], ["check", "check", "estimate", "submit"] * 2)
         self.assertIn("request", first)
+        self.assertEqual(self.run_plan("--references", "oxigraph,jena", "--budget-hours", "50", "--submit")[0], 0)
+        self.assertEqual(len(list(self.out.glob("*.set.toml"))), 1)  # S1: equivalent selection, one request
         self.assertEqual(self.run_plan("--nrese", "b" * 40, "--budget-hours", "50")[0], 0)
         tokens = {tomllib.loads(p.read_text())["set"]["request"] for p in self.out.glob("*.set.toml")}
         self.assertEqual(len(tokens), 2)
@@ -121,12 +123,18 @@ class FleetCells(unittest.TestCase):
 
     def test_member_boundary_also_refuses_restricted_outputs(self):
         # Spec point 7: direct fleet-step calls cannot create restricted export bundles.
-        with patch.dict(os.environ, {"SUITE_CELL": json.dumps({"group": {"systems": ["graphdb"], "references": []}})}):
-            output = io.StringIO()
-            with contextlib.redirect_stderr(output):
-                code = suite.main(["suite.py", "fleet", "--_member"])
-        self.assertEqual(code, 2, output.getvalue())
-        self.assertIn("restricted", output.getvalue())
+        patch("suitekit.fleet_cells.subprocess.run", side_effect=OSError("no external work in boundary fixture")).start()
+        patch("suitekit.fleet_cells.manifest.git", return_value={}).start()
+        patch("suitekit.fleet_cells.manifest.machine", return_value={}).start()
+        for chosen, reason in ((["graphdb"], "restricted"), ([], "exactly one"), (["qlever", "oxigraph"], "exactly one")):
+            with self.subTest(systems=chosen):
+                payload = {"group": {"systems": chosen, "references": []}, "result_root": str(self.out), "member": "bad", "nrese": A, "harness": A}
+                with patch.dict(os.environ, {"SUITE_CELL": json.dumps(payload), "FLEET_OUT": str(self.out / "export"), "NRESE_GATE_DIR": str(self.out / "gate")}):
+                    output = io.StringIO()
+                    with contextlib.redirect_stderr(output):
+                        code = suite.main(["suite.py", "fleet", "--_member"])
+                self.assertEqual(code, 2, output.getvalue())
+                self.assertIn(reason, output.getvalue())
 
     def test_cells_have_separate_jobs_and_adapter_capabilities(self):
         # Master 21:24: one job per cell; resource basis and workload needs remain explicit.
