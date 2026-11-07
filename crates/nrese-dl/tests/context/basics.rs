@@ -141,6 +141,41 @@ fn conjunctive_fillers_and_bottom_propagation() {
     assert!(unsat(&mut table, &c, "Z"));
 }
 
+/// An axiom the reader left out (a fatal diagnostic): a model of the rest says nothing of
+/// the whole, so the verdict is undecided; a clash in the rest still stands (sol-loop S2).
+#[test]
+fn a_left_out_axiom_leaves_consistency_undecided() {
+    use nrese_dl::verdict::Verdict;
+    let malformed = |b: &mut Build| nrese_owl::Diagnostic::Malformed {
+        node: b.t("r"),
+        what: "a restriction without a property",
+    };
+    let mut table = Table::default();
+    let mut b = Build::new(&mut table);
+    let (a, bb) = (b.c("A"), b.c("B"));
+    b.sub(a, bb);
+    let fatal = malformed(&mut b);
+    let mut o = b.done();
+    o.diagnostics.push(fatal);
+    let c = classify(&o, 1).expect("Horn");
+    assert!(
+        matches!(c.consistency, Verdict::Unknown(_)),
+        "{:?}",
+        c.consistency
+    );
+
+    let mut b = Build::new(&mut table);
+    let (a, bot) = (b.c("A"), b.e(ClassExpr::Nothing));
+    let thing = b.e(ClassExpr::Thing);
+    b.sub(thing, a);
+    b.sub(a, bot);
+    let fatal = malformed(&mut b);
+    let mut o = b.done();
+    o.diagnostics.push(fatal);
+    let c = classify(&o, 1).expect("Horn");
+    assert_eq!(c.consistency, Verdict::Inconsistent);
+}
+
 /// Classes equivalent to `owl:Thing`, and an inconsistent TBox and ABox.
 #[test]
 fn top_and_inconsistency() {
