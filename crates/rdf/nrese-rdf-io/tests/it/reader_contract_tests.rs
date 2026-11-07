@@ -581,17 +581,18 @@ fn an_opener_refused_by_the_nesting_limit_stays_open() {
     table.done();
 }
 
-/// Each of the ten delimiters and the two braces, at every token position of statements using
-/// every grammar routine that opens one (objects, lists, triple terms, reified triples,
+/// Each of the ten delimiters, the two braces and `.`, at every token position of statements
+/// using every grammar routine that opens one (objects, lists, triple terms, reified triples,
 /// annotations, reifiers, `[]`, datatypes, directives, TriG graph names), replacing the token
 /// there or put before it, then a valid statement: recovering runs to the end on all three
-/// paths without a panic. In a debug build `resync` checks that the brackets noted open when a statement
-/// fails agree with those it took, so a grammar site that noted none fails here (fix check
-/// r3). A guard: before, there was no such check.
+/// paths without a panic. In a debug build `resync` checks that the brackets noted open when
+/// a statement fails agree with those it took, and that it ended at its failing token exactly
+/// when that is a `.` taken with nothing open, so a grammar site that noted nothing fails
+/// here (fix check r3; P, r5). A guard: before, there was no such check.
 #[test]
 fn recovery_knows_every_bracket_open_wherever_a_statement_fails() {
-    const DELIMITERS: [&str; 12] = [
-        "[", "]", "(", ")", "<<(", ")>>", "<<", ">>", "{|", "|}", "{", "}",
+    const DELIMITERS: [&str; 13] = [
+        "[", "]", "(", ")", "<<(", ")>>", "<<", ">>", "{|", "|}", "{", "}", ".",
     ];
     let seeds = [
         (
