@@ -217,10 +217,14 @@ async fn run() -> Result<()> {
         config.deployment_posture,
     )?;
     let state = state.with_replication(config.replication.clone());
-    if replica {
-        nrese_server::replication::follow(state.clone())?;
+    // Held for as long as the server serves; stopped when it ends.
+    let follower = if replica {
+        let follower = nrese_server::replication::follow(state.clone())?;
         tracing::info!(primary = ?config.replication.primary, "following the primary's log");
-    }
+        Some(follower)
+    } else {
+        None
+    };
     state.mark_ready();
     let app = build_app(state);
 
@@ -252,12 +256,15 @@ async fn run() -> Result<()> {
         }
     });
     // Peer addresses for the mtls mode's trusted proxies.
-    axum::serve(
+    let served = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .await
-    .context("nrese-server terminated unexpectedly")
+    .await;
+    if let Some(follower) = follower {
+        follower.stop().await;
+    }
+    served.context("nrese-server terminated unexpectedly")
 }
 
 /// Reasoner v2: brings the inferred stack in line with the configured rules, unless the

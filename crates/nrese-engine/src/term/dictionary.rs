@@ -1711,30 +1711,96 @@ impl Dictionary {
     /// Re-adds a raw key during recovery. The key must land exactly at `expected_index`.
     pub(crate) fn restore_key(&self, expected_index: u64, key: &[u8]) -> EngineResult<()> {
         validate_key(key)?;
+        let hash = key_hash(key);
         let mut inner = self.inner.write();
         let len = inner.len();
-        if expected_index < len {
-            return if inner.key(expected_index) == key {
-                Ok(())
-            } else {
-                Err(EngineError::Corruption(format!(
-                    "dictionary entry {expected_index} differs from the logged key"
-                )))
-            };
-        }
-        if expected_index != len {
-            return Err(EngineError::Corruption(format!(
-                "dictionary gap: expected entry {expected_index}, dictionary has {len}"
-            )));
-        }
-        let index = self.intern_key_locked(&mut inner, key);
-        if index != expected_index {
-            return Err(EngineError::Corruption(format!(
-                "duplicate dictionary key logged at {expected_index} (already {index})"
-            )));
+        if let Restore::Append = restored(&inner, len, expected_index, key, hash)? {
+            inner.push(key, hash);
         }
         Ok(())
     }
+
+    /// Restores `keys` at `start..` under one write lock, all or none: each checked as
+    /// [`Self::restore_key`] takes one (under this lock: another interner may have added
+    /// entries before it), then the ones past the dictionary's end appended in order.
+    pub(crate) fn restore_keys_checked(&self, start: u64, keys: &[&[u8]]) -> EngineResult<()> {
+        let mut inner = self.inner.write();
+        let hashes = check_restore(&inner, start, keys)?;
+        let len = inner.len();
+        for (offset, (key, hash)) in keys.iter().zip(hashes).enumerate() {
+            if start + offset as u64 >= len {
+                inner.push(key, hash);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What restoring a logged key does to a dictionary of `len` entries.
+enum Restore {
+    /// Entry `index` is already this key.
+    Present,
+    /// The key goes at the end, `index == len`.
+    Append,
+}
+
+/// The one rule of restoring a logged key at `index` into `inner`, as if it had `len`
+/// entries (the keys of a batch being checked count as appended): an index below `len`
+/// must hold the same key, `len` takes a key that is nowhere else, and anything past it is
+/// a gap.
+fn restored(inner: &Inner, len: u64, index: u64, key: &[u8], hash: u64) -> EngineResult<Restore> {
+    if index < len {
+        return match index < inner.len() && inner.key(index) == key {
+            true => Ok(Restore::Present),
+            false => Err(EngineError::Corruption(format!(
+                "dictionary entry {index} differs from the logged key"
+            ))),
+        };
+    }
+    if index != len {
+        return Err(EngineError::Corruption(format!(
+            "dictionary gap: expected entry {index}, dictionary has {len}"
+        )));
+    }
+    if let Some(already) = inner.find(hash, key) {
+        return Err(EngineError::Corruption(format!(
+            "duplicate dictionary key logged at {index} (already {already})"
+        )));
+    }
+    Ok(Restore::Append)
+}
+
+/// [`restored`] for `keys` at `start..` (consecutive indexes): the ones past `inner`'s end
+/// count as appended in order, so a key appended twice in the batch is a duplicate too.
+/// Returns each key's hash ([`key_hash`]), computed once.
+fn check_restore(inner: &Inner, start: u64, keys: &[&[u8]]) -> EngineResult<Vec<u64>> {
+    let mut len = inner.len();
+    // The range's start, whether or not it holds keys: past the end is a gap.
+    if start > len {
+        return Err(EngineError::Corruption(format!(
+            "dictionary gap: expected entry {start}, dictionary has {len}"
+        )));
+    }
+    let mut hashes = Vec::with_capacity(keys.len());
+    // The batch's appended keys, by offset into `keys`, under their hashes.
+    let mut appended: HashTable<usize> = HashTable::new();
+    for (offset, key) in keys.iter().enumerate() {
+        validate_key(key)?;
+        let index = start + offset as u64;
+        let hash = key_hash(key);
+        if let Some(&already) = appended.find(hash, |&other| keys[other] == *key) {
+            return Err(EngineError::Corruption(format!(
+                "duplicate dictionary key logged at {index} (already {})",
+                start + already as u64
+            )));
+        }
+        if let Restore::Append = restored(inner, len, index, key, hash)? {
+            appended.insert_unique(hash, offset, |&other| key_hash(keys[other]));
+            len += 1;
+        }
+        hashes.push(hash);
+    }
+    Ok(hashes)
 }
 
 /// The graph name as a term; `None` for the default graph.
@@ -2313,6 +2379,61 @@ mod tests {
         assert!(target.restore_key(0, &keys[1]).is_err());
         assert!(target.restore_key(5, &keys[0]).is_err());
         assert_eq!(target.len(), 2);
+    }
+
+    /// A batch of logged keys (a replicated answer's) is checked as `restore_key` would take
+    /// each in turn, and restored all or none: a valid overlap and append, a divergent
+    /// overlap, a gap, a key that already has another entry, a key twice in the batch.
+    /// `restore_keys_checked` refuses as `restore_key` does and then leaves the dictionary as
+    /// it was. Every row is checked.
+    #[test]
+    fn a_batch_of_logged_keys_is_checked_as_restore_key_takes_them() {
+        let source = Dictionary::default();
+        for text in ["a", "b", "c"] {
+            source.intern(LiteralRef::new_simple_literal(text).into());
+        }
+        let keys = source.export_keys(0, source.len());
+        let k = |i: usize| keys[i].as_slice();
+        // The target holds the first two entries.
+        let target = || {
+            let target = Dictionary::default();
+            target.restore_key(0, k(0)).unwrap();
+            target.restore_key(1, k(1)).unwrap();
+            target
+        };
+        let rows: [(&str, u64, Vec<&[u8]>, bool); 6] = [
+            ("overlap then append", 1, vec![k(1), k(2)], true),
+            ("append only", 2, vec![k(2)], true),
+            ("divergent overlap", 1, vec![k(0), k(2)], false),
+            ("gap", 3, vec![k(2)], false),
+            ("key with another entry", 2, vec![k(0)], false),
+            ("a key twice in the batch", 2, vec![k(2), k(2)], false),
+        ];
+        let mut wrong = Vec::new();
+        for (row, start, batch, takes) in rows {
+            // restore_key, one at a time, on a copy: its verdict.
+            let one_by_one = target();
+            let verdict = batch
+                .iter()
+                .enumerate()
+                .all(|(i, key)| one_by_one.restore_key(start + i as u64, key).is_ok());
+            if verdict != takes {
+                wrong.push(format!("{row}: restore_key took it: {verdict}"));
+            }
+            let restored = target();
+            let result = restored.restore_keys_checked(start, &batch);
+            let len = match takes {
+                true => start + batch.len() as u64,
+                false => 2,
+            };
+            if result.is_ok() != takes || restored.len() != len.max(2) {
+                wrong.push(format!(
+                    "{row}: restore_keys_checked {result:?}, {} entries",
+                    restored.len()
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// Loading the vector index from its file takes no background build's reservation
