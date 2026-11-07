@@ -20,7 +20,7 @@ use nrese_engine::{
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 
 /// `subject`'s label `text`: a vector literal where it is one (`[1, 2]`).
-fn label(subject: &str, text: &str, graph: Option<&str>) -> Quad {
+pub(crate) fn label(subject: &str, text: &str, graph: Option<&str>) -> Quad {
     let literal = match text.starts_with('[') {
         true => Literal::new_typed_literal(
             text,
@@ -39,7 +39,7 @@ fn label(subject: &str, text: &str, graph: Option<&str>) -> Quad {
     )
 }
 
-fn query(text: &str) -> TextQuery {
+pub(crate) fn query(text: &str) -> TextQuery {
     TextQuery {
         text: text.to_owned(),
         all_words: false,
@@ -48,18 +48,18 @@ fn query(text: &str) -> TextQuery {
     }
 }
 
-const EVERY: TextScope = TextScope::EVERY;
-const MODEL: ReadModel = ReadModel::Materialised;
+pub(crate) const EVERY: TextScope = TextScope::EVERY;
+pub(crate) const MODEL: ReadModel = ReadModel::Materialised;
 
 /// A reader's search of every graph.
-fn every(snapshot: &Snapshot, text: &str) -> Vec<TextMatch> {
+pub(crate) fn every(snapshot: &Snapshot, text: &str) -> Vec<TextMatch> {
     snapshot
         .text_search_in(MODEL, &EVERY, &query(text), None)
         .unwrap()
 }
 
 /// The matches as texts with their relevance (ids differ between engines).
-fn texts(snapshot: &Snapshot, found: &[TextMatch]) -> Vec<(String, f64)> {
+pub(crate) fn texts(snapshot: &Snapshot, found: &[TextMatch]) -> Vec<(String, f64)> {
     found
         .iter()
         .map(|m| match snapshot.decode(TermId::from_raw(m.id)) {
@@ -69,7 +69,7 @@ fn texts(snapshot: &Snapshot, found: &[TextMatch]) -> Vec<(String, f64)> {
         .collect()
 }
 
-fn base(engine: &Engine) {
+pub(crate) fn base(engine: &Engine) {
     let mut tx = engine.transaction();
     tx.insert(label("a", "alpha one two", None).as_ref());
     tx.insert(label("b", "beta", None).as_ref());
@@ -81,7 +81,7 @@ fn base(engine: &Engine) {
 }
 
 /// The corpora built so far: by a walk, and derived from an ancestor's.
-fn built(snapshot: &Snapshot) -> (u64, u64) {
+pub(crate) fn built(snapshot: &Snapshot) -> (u64, u64) {
     let stats = snapshot.text_corpus_stats();
     (stats.walked, stats.derived)
 }
@@ -189,8 +189,9 @@ fn corpora_are_walked_once_then_derived_across_commits() {
     assert_eq!(built(&latest), (3, 3));
 }
 
-/// Guard: the kept corpora stay within the engine's budget and count, least recently used
-/// out; scopes of equal graph sets share one.
+/// The kept corpora stay within the engine's budget, least recently used out, and the
+/// budget is their only bound (no count: master 7 Nov 17:28, IB1727-3bc5); scopes of equal
+/// graph sets share one.
 #[test]
 fn kept_corpora_are_bounded_and_shared_by_equal_graph_sets() {
     let engine_with = |budget: Option<usize>| {
@@ -239,13 +240,14 @@ fn kept_corpora_are_bounded_and_shared_by_equal_graph_sets() {
         );
     }
     assert_eq!(built(&snapshot), (2, 0));
-    // More scopes than are kept: at most the count.
+    // Eighty scopes more, all within the default budget: every one kept (the merge of g1
+    // and g2 and the eighty single graphs, g0's among them, shared).
     for g in 0..80 {
         let scope = TextScope::Graphs(GraphSelector::Exact(graph(&snapshot, g)));
         search(&snapshot, &scope, "word1");
     }
     let stats = snapshot.text_corpus_stats();
-    assert_eq!(stats.kept, 64, "{stats:?}");
+    assert_eq!(stats.kept, 81, "{stats:?}");
     assert!(stats.bytes > 0 && stats.bytes <= stats.budget, "{stats:?}");
     // A budget of a few corpora's bytes: never more held than it.
     let one = stats.bytes / stats.kept;
