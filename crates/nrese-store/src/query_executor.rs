@@ -670,5 +670,6 @@ fn query_options(
         result_cache: store.result_cache.clone(),
         pin: prepared.pin.clone(),
         ql: store.ql(),
+        search_scope: nrese_sparql::SearchScope::Global,
     }
 }
