@@ -2984,6 +2984,11 @@ pub(crate) fn check<S: Source + ?Sized>(
     let mut interrupted = false;
     let mut since_poll = 0u32;
     'jobs: for (c, job) in jobs {
+        // A list that refused (an empty-body rule above, or an earlier job) ends the
+        // check: the state is inconsistent whatever the rest would add.
+        if !found.complete() {
+            break;
+        }
         // Made at the job's first firing: a job that never fires charges nothing, so a
         // budget without room for its group can't make consistent data look inconsistent.
         let mut id = None;
