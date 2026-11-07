@@ -105,6 +105,7 @@ def select(root, systems, workloads, args):
                         why = f"budget: {added / 60:.2f} additional host-hours exceeds remaining strict budget"
                     else:
                         group["minutes"] = added
+                        group["input_hashes"] = {f: d["sha256"] for f, d in frozen.items()}
                         owned = workloads[name].get("resources", {})
                         group["resources"] = owned.get(tier, owned)
                         group["measured"] = next((p.get("resources", {}) for r in reversed(records) for p in r.get("pairs", [])
@@ -119,28 +120,29 @@ def select(root, systems, workloads, args):
 
 
 def jobs(groups, args):
-    request = {k: v for k, v in vars(args).items() if k not in ("out", "submit", "plan", "systems", "workloads", "tiers", "gaps", "references")}
-    request["groups"] = groups
-    token = hashlib.sha256(json.dumps(request, sort_keys=True, default=str).encode()).hexdigest()
-    set_id, members = "suite-cells-" + token[:16], []
+    members = []
     for group in groups:
         case = group["case"]
         key = group["systems"][0]
-        member = f"{set_id}-{case['name']}-{key}"
         declared = {"ram_gb": case["cap_gb"], **group["resources"]}
         fallback = {"cores": args.cores, "disk_gb": args.build_disk_gb + abba.rg.data_disk_gb([case])}
         needs, basis = {}, {}
         for field in ("cores", "ram_gb", "disk_gb"):
             for source, values in (("tier/registry", declared), ("measured cell record", group["measured"]), ("unmeasured configured build allowance / frozen-data helper", fallback)):
+                if field == "cores" and source == "measured cell record": continue
                 if field in values:
                     needs[field], basis[field] = values[field], source
                     break
         cap = needs["ram_gb"]
+        identity = {"cell": [case["workload"], case["tier"], key], "nrese": args.nrese, "harness_tree": args.harness_tree,
+                    "inputs": group["input_hashes"], "scenario": {"name": "native", "memory_gb": cap, "references": group["references"]}}
+        token = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        member = f"suite-cell-{case['name']}-{key}-{token[:16]}"
         adapter_needs = ["docker"] if "docker" in adapters.adapter(key).runtimes else []
         adapter_needs += ["java"] if key in ("jena", "rdf4j") else []
         workload_needs = sorted(set(case.get("needs", [])) - {"docker"})
         print(f"{key} / {case['workload']} / {case['tier']}: resource basis {basis}; ask {needs}; adapter needs {adapter_needs}; workload/driver needs {workload_needs}")
-        payload = {"group": group, "nrese": args.nrese, "harness": args.harness, "member": member,
+        payload = {"identity": identity, "group": group, "nrese": args.nrese, "harness": args.harness, "member": member,
                    "result_root": args.result_root, "deadline_min": group["minutes"] * args.deadline_factor}
         members.append({"id": member, "group": "suite-cells", "kind": "owlrs.timed", "class": "exclusive",
                         "purpose": "timing", "priority": 600, "priority_reason": "catalogue cells below confirmation and merge gates",
@@ -150,12 +152,25 @@ def jobs(groups, args):
                                    'exec uv run --no-project python -B benches/suite/suite.py fleet --_member']],
                         "step_needs": [needs], "requires": {**needs, "os": "linux", "roles": abba.rg.TIMING_ROLES,
                         "has": sorted(set(adapter_needs + workload_needs + abba.rg.data_needs([case])))},
-                        "env": {"SUITE_CELL": json.dumps(payload), "DOCKER_CPUS": str(needs["cores"]), "CARGO_BUILD_JOBS": str(needs["cores"]), "GATE_MAX_GB": str(cap),
+                        "env": {"SUITE_CELL": json.dumps(payload), "CARGO_BUILD_JOBS": str(needs["cores"]), "GATE_MAX_GB": str(cap),
                                 "DOCKER_MEMORY": f"{cap}g",
                                 "NRESE_GATE_DIR": f"~/owlrs/{member}", "GATE_NAME": member, "GATE_CASES": case["name"]},
                         "inputs": [{"name": "checkout", "source": {"git": str(args.checkout), "rev": args.harness}}]
                                   + abba.rg.side_inputs(str(args.checkout), args.harness, [args.nrese])})
-    return set_id, token, members
+    return members
+
+
+def request(members):
+    token = hashlib.sha256(json.dumps(sorted(j["id"] for j in members)).encode()).hexdigest()
+    set_id = "suite-cells-" + token[:16]
+    code, said = abba.rg.fleet_call("status", "set:" + set_id, "--json")
+    found = json.JSONDecoder().raw_decode(said.lstrip())[0] if said.lstrip().startswith("{") else {}
+    if not code and found.get("id") == "set:" + set_id and sorted(m["id"] for m in found.get("members", [])) == sorted(j["id"] for j in members):
+        print(f"reuse set:{set_id}\n{said}")
+        return set_id, token, 0
+    if code and found.get("error") == "no job set:" + set_id: return set_id, token, None
+    print(f"fleet lookup failed (exit {code}): {said}", file=sys.stderr)
+    return set_id, token, 1
 
 
 def member(root, systems):
@@ -174,10 +189,11 @@ def member(root, systems):
     if landing.resolve().is_relative_to(root.resolve()):
         raise ValueError("private result root must be outside the checkout")
     landing.mkdir(parents=True, exist_ok=True)
-    (landing / "identity.json").write_text(json.dumps({"nrese": payload["nrese"], "harness": payload["harness"],
+    (landing / "identity.json").write_text(json.dumps({**payload["identity"], "nrese": payload["nrese"], "harness": payload["harness"],
         "git": manifest.git(root), "machine": manifest.machine("process"), "classification": "private/free"}, indent=2), encoding="utf-8")
     out = Path(os.environ["FLEET_OUT"])
     env = {**os.environ, "PATH": str(Path.home() / ".cargo/bin") + os.pathsep + os.environ["PATH"]}
+    env.pop("DOCKER_CPUS", None)
     gate = Path(env["NRESE_GATE_DIR"]).expanduser()
     env.update(NRESE_GATE_DIR=str(gate), SPARQL_DATA=str(abba.rg.sparql_data()))
     target = out.parent / "suite-client-target"
@@ -266,6 +282,7 @@ def main(argv, systems, workloads, root):
     os.environ["FLEET_OWNER"] = args.owner
     args.checkout = root
     args.harness = abba.git(root, "rev-parse", "HEAD")
+    args.harness_tree = abba.git(root, "rev-parse", args.harness + "^{tree}")
     args.nrese = abba.git(root, "rev-parse", "--verify", f"{args.nrese}^{{commit}}")
     try:
         if abba.git(root, "status", "--porcelain", "--untracked-files=normal"):
@@ -275,7 +292,12 @@ def main(argv, systems, workloads, root):
         print(f"candidates {minutes / 60:.2f} host-hours, unmeasured including build/preparation and reference allowance; budget <{args.budget_hours:g} h")
         if not groups:
             return 0
-        set_id, token, members = jobs(groups, args)
+        members = jobs(groups, args)
+        proposed = []
+        for job in members:
+            if sum(j["est_min"] for j in proposed) + job["est_min"] < args.budget_hours * 60: proposed.append(job)
+        _, _, reused = request(proposed)
+        if reused is not None: return reused
         args.out.mkdir(parents=True, exist_ok=True)
         retained = []
         for job in members:
@@ -299,8 +321,8 @@ def main(argv, systems, workloads, root):
         print(f"total admitted {sum(j['est_min'] for j in members) / 60:.2f} host-hours (unmeasured)" + ("; no placeable cells; nothing submitted" if not members else ""))
         if not members:
             return 0
-        token = hashlib.sha256(json.dumps(members, sort_keys=True).encode()).hexdigest()
-        set_id = "suite-cells-" + token[:16]
+        set_id, token, reused = request(members)
+        if reused is not None: return reused
         path = args.out / f"{set_id}.set.toml"
         path.write_text(abba.rg.toml_set({"id": set_id, "request": token, "fail": "stop-rest"}, members), encoding="utf-8")
         print(f"set:{set_id}: {path}; NRESE {args.nrese}, harness {args.harness}")
