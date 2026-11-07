@@ -30,6 +30,72 @@ fn int(value: &str) -> Expression {
     Literal::new_typed_literal(value, xsd::INTEGER).into()
 }
 
+// SPARQL 1.1 section 19.8: longest token, signed numerics and PathMod.
+macro_rules! signed_object_row {
+    ($name:ident, $value:literal, $datatype:literal) => {
+        #[test]
+        fn $name() {
+            let triple = format!("?s <http://e/p> {}", $value);
+            let query = parse(&format!("SELECT * {{ {triple} }}"));
+            let expected = parse(&format!(
+                "SELECT * {{ ?s <http://e/p> \"{}\"^^<http://www.w3.org/2001/XMLSchema#{}> }}",
+                $value, $datatype
+            ));
+            assert_eq!(query, expected, "signed object must remain a triple");
+            assert_eq!(round_trip(&query), query);
+            let construct = parse(&format!("CONSTRUCT WHERE {{ {triple} }}"));
+            assert_eq!(round_trip(&construct), construct);
+        }
+    };
+}
+
+signed_object_row!(path_token_positive_integer, "+3", "integer");
+signed_object_row!(path_token_negative_integer_guard, "-3", "integer");
+signed_object_row!(path_token_positive_decimal, "+3.5", "decimal");
+signed_object_row!(path_token_positive_double, "+3e2", "double");
+signed_object_row!(path_token_leading_dot_decimal, "+.5", "decimal");
+signed_object_row!(path_token_leading_dot_double, "+.5e2", "double");
+
+macro_rules! path_modifier_guard {
+    ($name:ident, $modifier:literal, $variant:ident, $object:literal) => {
+        #[test]
+        fn $name() {
+            use nrese_sparql_syntax::algebra::PropertyPathExpression;
+            for gap in ["", " ", " # comment\n"] {
+                let query = parse(&format!(
+                    "SELECT * {{ ?s <http://e/p>{gap}{}{gap}{} }}",
+                    $modifier, $object
+                ));
+                let GraphPattern::Project { inner, .. } = query.pattern() else {
+                    panic!("no projection")
+                };
+                let GraphPattern::Path { path, .. } = inner.as_ref() else {
+                    panic!("expected a path: {inner:?}")
+                };
+                assert_eq!(
+                    path,
+                    &PropertyPathExpression::$variant(Box::new(
+                        NamedNode::new_unchecked("http://e/p").into()
+                    ))
+                );
+                assert_eq!(round_trip(&query), query);
+            }
+        }
+    };
+}
+
+path_modifier_guard!(path_token_plus_variable_guard, "+", OneOrMore, "?o");
+path_modifier_guard!(path_token_star_variable_guard, "*", ZeroOrMore, "?o");
+path_modifier_guard!(path_token_question_variable_guard, "?", ZeroOrOne, "?o");
+path_modifier_guard!(path_token_plus_iri_guard, "+", OneOrMore, "<http://e/o>");
+path_modifier_guard!(path_token_star_iri_guard, "*", ZeroOrMore, "<http://e/o>");
+path_modifier_guard!(
+    path_token_question_iri_guard,
+    "?",
+    ZeroOrOne,
+    "<http://e/o>"
+);
+
 fn sub(a: Expression, b: Expression) -> Expression {
     Expression::Subtract(Box::new(a), Box::new(b))
 }
