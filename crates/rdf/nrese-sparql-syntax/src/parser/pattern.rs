@@ -808,20 +808,10 @@ impl<'a> Parser<'a> {
 
     fn path_elt(&mut self) -> ParseResult<PropertyPathExpression> {
         let primary = self.path_primary()?;
-        Ok(match self.peek() {
-            Some(b'*') => {
-                self.pos += 1;
-                PropertyPathExpression::ZeroOrMore(Box::new(primary))
-            }
-            Some(b'+') => {
-                self.pos += 1;
-                PropertyPathExpression::OneOrMore(Box::new(primary))
-            }
-            // `?` is a modifier unless a variable name follows it.
-            Some(b'?') if !self.at_variable() => {
-                self.pos += 1;
-                PropertyPathExpression::ZeroOrOne(Box::new(primary))
-            }
+        Ok(match self.path_mod() {
+            Some(b'*') => PropertyPathExpression::ZeroOrMore(Box::new(primary)),
+            Some(b'+') => PropertyPathExpression::OneOrMore(Box::new(primary)),
+            Some(b'?') => PropertyPathExpression::ZeroOrOne(Box::new(primary)),
             _ => primary,
         })
     }

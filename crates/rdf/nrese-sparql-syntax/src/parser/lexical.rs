@@ -7,6 +7,21 @@ use nrese_rdf::{BaseDirection, BlankNode, Iri, Literal, NamedNode, Variable};
 use super::{ParseResult, Parser};
 
 impl<'a> Parser<'a> {
+    /// `PathMod`, with longest-token precedence over its single-byte terminals.
+    /// A variable owns its `?` and a signed numeric literal owns its `+`.
+    pub(super) fn path_mod(&mut self) -> Option<u8> {
+        let token = self.peek()?;
+        match token {
+            b'?' if self.at_variable() => None,
+            b'+' if self.at_number(true) => None,
+            b'?' | b'*' | b'+' => {
+                self.pos += 1;
+                Some(token)
+            }
+            _ => None,
+        }
+    }
+
     // --- IRIs -----------------------------------------------------------------------
 
     /// Whether an IRI (`<…>`, not `<<`) or a prefixed name comes next.
