@@ -15,6 +15,8 @@ mod cli;
 mod env_names;
 mod env_values;
 mod file_config;
+#[cfg(test)]
+mod percent_budget_tests;
 mod policy_env;
 mod reasoner_env;
 mod replication_env;
