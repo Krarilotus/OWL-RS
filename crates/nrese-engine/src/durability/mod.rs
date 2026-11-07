@@ -219,7 +219,11 @@ impl Durable {
                     asserted,
                     inferred,
                     revision: loaded.revision,
-                    committed_micros: loaded.committed_micros,
+                    // Revision 0 holds no commit: every later one is after it.
+                    committed_micros: match loaded.revision {
+                        0 => Some(0),
+                        _ => loaded.committed_micros,
+                    },
                     dictionary_len: 0,
                     equality: Default::default(),
                     canonical: Default::default(),
@@ -433,9 +437,18 @@ fn replay(
         *version.stack_mut(stack) = index;
     }
     version.revision = record.revision;
-    // A record logged without a time (a version 4 or 5 segment): the version's is unknown.
-    version.committed_micros = record.committed_micros;
+    // The latest of all its commits: a log an earlier binary wrote may step back. A record
+    // logged without a time (a version 4 or 5 segment) makes it unknown.
+    version.committed_micros = later(version.committed_micros, record.committed_micros);
     Ok(())
+}
+
+/// The time of a version that adds a commit made at `commit` to one at `previous`: the later
+/// of the two, so it bounds every commit in it; unknown (`None`) if either is.
+pub(crate) fn later(previous: Option<u64>, commit: Option<u64>) -> Option<u64> {
+    previous
+        .zip(commit)
+        .map(|(previous, commit)| previous.max(commit))
 }
 
 /// The commit time of a revision after one committed at `previous`: the wall clock, in

@@ -17,6 +17,9 @@ thread_local! {
     pub(crate) static FAIL_CUT_DIR_SYNC: Cell<bool> = const { Cell::new(false) };
     /// The wall clock, microseconds since 1970, as commits on this thread read it.
     pub(crate) static CLOCK: Cell<Option<u64>> = const { Cell::new(None) };
+    /// What `CLOCK` reads once a checkpoint's parts are written, before its commit time:
+    /// the time a long checkpoint write took.
+    pub(crate) static CLOCK_AT_TRAILER: Cell<Option<u64>> = const { Cell::new(None) };
 }
 
 /// An error if `point` is set on this thread.

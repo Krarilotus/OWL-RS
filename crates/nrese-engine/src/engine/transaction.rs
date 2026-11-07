@@ -525,7 +525,9 @@ impl<'e> Transaction<'e> {
                 base.version().committed_micros,
             )),
         };
-        let committed_micros = record.committed_micros;
+        // Unknown stays unknown: this commit's time bounds nothing committed before it.
+        let committed_micros =
+            crate::durability::later(base.version().committed_micros, record.committed_micros);
         // The first quad in a named graph turns a default-graph asserted stack into a quad
         // stack. No compaction or checkpoint may replace its runs meanwhile: the writer slot
         // excludes other commits, the compaction slot both of those.
