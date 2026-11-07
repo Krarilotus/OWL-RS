@@ -517,6 +517,7 @@ impl Quarantine {
             statement.base.as_deref(),
             document.as_bytes(),
             crate::rdf_io::BlankNodes::AsWritten,
+            crate::rdf_io::Consumer::Local,
             |quad| {
                 has_blank_nodes |= has_blank_node(quad.subject.into())
                     || has_blank_node(quad.object)

@@ -7,7 +7,7 @@ use crate::error::StoreResult;
 use crate::graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphTarget, GraphWriteReport, GraphWriteRequest,
 };
-use crate::rdf_io::{BlankNodes, each_graph_quad, write_quads};
+use crate::rdf_io::{BlankNodes, Consumer, each_graph_quad, write_quads};
 
 /// Whether the target graph exists in `view` under `model`: the default graph always, a
 /// named graph while it holds a statement. Nothing is decoded (Graph Store Protocol `HEAD`).
@@ -42,8 +42,9 @@ pub(crate) fn write_graph(
 }
 
 /// Adds (or, with `replace`, substitutes) the payload's triples in the target graph, each
-/// as it is read. A payload that fails part-way fails the write, whose transaction is then
-/// discarded with all it changed (the mutation pipeline commits only a write that ends).
+/// as it is read once the whole payload is known valid ([`Consumer::Interning`]): an
+/// invalid payload interns nothing, and fails the write before its first insert, whose
+/// transaction is then discarded (the mutation pipeline commits only a write that ends).
 pub(crate) fn apply_graph_write(
     tx: &mut Transaction<'_>,
     request: &GraphWriteRequest,
@@ -70,6 +71,7 @@ pub(crate) fn apply_graph_write(
         request.payload.as_slice(),
         graph,
         BlankNodes::Fresh,
+        Consumer::Interning,
         |quad| {
             tx.insert(quad);
             any = true;
