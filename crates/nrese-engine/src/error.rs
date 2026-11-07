@@ -28,6 +28,11 @@ pub enum EngineError {
     /// A speculative transaction ([`crate::Engine::speculative`]) was asked to commit.
     #[error("a speculative transaction can't commit")]
     Speculative,
+    /// The engine's writer or checkpoint slot (named) is held, and the caller is a Rayon pool
+    /// thread, which never waits for it: the holder's parallel work may need that thread.
+    /// Retry later, or ask from a thread of no pool.
+    #[error("the engine's {0} slot is busy, and a Rayon pool thread doesn't wait for it")]
+    SlotBusy(&'static str),
     /// The write-ahead log no longer holds the records a replica asked for
     /// ([`crate::Engine::log_since`]): it starts again from an image of revision `oldest`
     /// or later.
