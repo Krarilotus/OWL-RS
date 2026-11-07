@@ -170,6 +170,49 @@ fn unchanged_schema_reuses_the_compiled_tbox_across_views_and_commits() {
     assert!(Arc::ptr_eq(&original, &ql.tbox(&engine.snapshot(), None)));
 }
 
+/// What the schema reads of individuals in a class expression is that the expression has
+/// one: more members of a restriction that has one keep the compiled TBox (P2-C1 timing,
+/// 7 Nov: every membership read made each commit's first query 10 ms at 10,000 members).
+#[test]
+fn more_members_of_a_class_expression_keep_the_compiled_tbox() {
+    let engine = engine(":m0 a _:restriction .");
+    let ql = QlRewriting::new(Closure { lists: true });
+    let original = ql.tbox(&engine.snapshot(), None);
+    let snapshot = engine.snapshot();
+    // The restriction's own blank node, as the store has it.
+    let on = iri(&snapshot, OWL, "onProperty").unwrap();
+    let restriction = snapshot
+        .quads_for_pattern_in(
+            nrese_engine::ReadModel::Asserted,
+            &QuadPattern {
+                subject: None,
+                predicate: Some(on),
+                object: None,
+                graph: GraphSelector::Any,
+            },
+        )
+        .next()
+        .map(|q| snapshot.decode(q.subject).unwrap())
+        .unwrap();
+    let Term::BlankNode(restriction) = restriction else {
+        panic!("{restriction:?}");
+    };
+    let mut tx = engine.transaction();
+    for n in 1..50 {
+        tx.insert(
+            Quad::new(
+                NamedNode::new_unchecked(format!("{EX}m{n}")),
+                NamedNode::new_unchecked(format!("{RDF}type")),
+                restriction.clone(),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    assert!(Arc::ptr_eq(&original, &ql.tbox(&engine.snapshot(), None)));
+}
+
 #[test]
 fn introducing_owl_thing_without_changing_the_schema_matches_fresh_preparation() {
     let engine = engine("");
@@ -204,8 +247,8 @@ fn introducing_owl_thing_without_changing_the_schema_matches_fresh_preparation()
     };
     let pending = tx.pending_snapshot();
     assert_eq!(
-        schema_statements(&engine.snapshot()),
-        schema_statements(&pending)
+        schema_statements(&engine.snapshot(), &|_| true),
+        schema_statements(&pending, &|_| true)
     );
     let expected = answers(&pending, &options());
     assert_eq!(expected, ["<http://example.org/ann>"]);

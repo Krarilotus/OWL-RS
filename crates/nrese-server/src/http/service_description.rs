@@ -1,11 +1,61 @@
+use crate::repositories::DEFAULT_REPOSITORY;
 use crate::runtime_posture::{
     GRAPH_STORE_ENDPOINT, METRICS_ENDPOINT, OPERATOR_UI_PATH, QUERY_ENDPOINT,
     SERVICE_DESCRIPTION_ENDPOINT, SHACL_ENDPOINT, SPARQL_ENDPOINT, TELL_ENDPOINT, UPDATE_ENDPOINT,
 };
 use crate::state::AppState;
 
+/// The endpoints of the repository a description describes: the default repository's
+/// short aliases (`/dataset/…`), another's under `/api/v1/repositories/{id}`.
+struct Endpoints {
+    query: String,
+    update: String,
+    sparql: String,
+    tell: String,
+    graph_store: String,
+    shacl: String,
+    description: String,
+}
+
+impl Endpoints {
+    fn of(repository: &str) -> Self {
+        if repository == DEFAULT_REPOSITORY {
+            return Self {
+                query: QUERY_ENDPOINT.to_owned(),
+                update: UPDATE_ENDPOINT.to_owned(),
+                sparql: SPARQL_ENDPOINT.to_owned(),
+                tell: TELL_ENDPOINT.to_owned(),
+                graph_store: GRAPH_STORE_ENDPOINT.to_owned(),
+                shacl: SHACL_ENDPOINT.to_owned(),
+                description: SERVICE_DESCRIPTION_ENDPOINT.to_owned(),
+            };
+        }
+        let at = |path: &str| format!("/api/v1/repositories/{repository}/{path}");
+        Self {
+            query: at("query"),
+            update: at("update"),
+            sparql: at("sparql"),
+            tell: at("tell"),
+            graph_store: at("data"),
+            shacl: at("shacl"),
+            description: at("service-description"),
+        }
+    }
+}
+
+/// The SPARQL service description of `state`'s repository: its endpoints, and what is on
+/// as the runtime posture says (the facts the JSON capabilities report).
 pub fn build_service_description(state: &AppState) -> String {
     let posture = state.runtime_posture();
+    let Endpoints {
+        query: query_endpoint,
+        update: update_endpoint,
+        sparql: sparql_endpoint,
+        tell: tell_endpoint,
+        graph_store: graph_store_endpoint,
+        shacl: shacl_endpoint,
+        description: description_endpoint,
+    } = Endpoints::of(state.repository_id());
     let reasoning_mode = state.reasoner_mode_name();
     let reasoning_profile = state.reasoner_profile_name();
     let reasoning_read_model = state.reasoner_read_model_name();
@@ -13,14 +63,14 @@ pub fn build_service_description(state: &AppState) -> String {
     let graph_store_write_enabled = bool_literal(posture.graph_write_enabled);
     let sparql_update_enabled = bool_literal(posture.sparql_update_enabled);
     let tell_enabled = bool_literal(posture.tell_enabled);
-    let federated_service_enabled = "false";
+    let federated_service_enabled = bool_literal(posture.federated_service_enabled);
     let update_endpoint = posture
         .sparql_update_enabled
-        .then_some(format!("   nrese:updateEndpoint <{UPDATE_ENDPOINT}> ;\n"))
+        .then_some(format!("   nrese:updateEndpoint <{update_endpoint}> ;\n"))
         .unwrap_or_default();
     let tell_endpoint = posture
         .tell_enabled
-        .then_some(format!("   nrese:tellEndpoint <{TELL_ENDPOINT}> ;\n"))
+        .then_some(format!("   nrese:tellEndpoint <{tell_endpoint}> ;\n"))
         .unwrap_or_default();
     let metrics_endpoint = posture
         .metrics_path()
@@ -38,16 +88,16 @@ pub fn build_service_description(state: &AppState) -> String {
 @prefix nrese: <https://nrese.dev/ns/service#> .\n\
 \n\
 [] a sd:Service ;\n\
-   sd:endpoint <{QUERY_ENDPOINT}> ;\n\
+   sd:endpoint <{query_endpoint}> ;\n\
    sd:supportedLanguage sd:SPARQL11Query ;\n\
    sd:resultFormat format:SPARQL_Results_JSON , format:SPARQL_Results_XML , format:SPARQL_Results_CSV , format:SPARQL_Results_TSV , format:N-Triples , format:Turtle , format:RDF_XML , format:JSON-LD , format:N-Quads , format:TriG ;\n\
    sd:inputFormat format:N-Triples , format:Turtle , format:RDF_XML , format:JSON-LD , format:N-Quads , format:TriG ;\n\
-   nrese:sparqlEndpoint <{SPARQL_ENDPOINT}> ;\n\
-   nrese:serviceDescriptionEndpoint <{SERVICE_DESCRIPTION_ENDPOINT}> ;\n\
+   nrese:sparqlEndpoint <{sparql_endpoint}> ;\n\
+   nrese:serviceDescriptionEndpoint <{description_endpoint}> ;\n\
 {update_endpoint}\
 {tell_endpoint}\
-   nrese:graphStoreEndpoint <{GRAPH_STORE_ENDPOINT}> ;\n\
-   nrese:shaclEndpoint <{SHACL_ENDPOINT}> ;\n\
+   nrese:graphStoreEndpoint <{graph_store_endpoint}> ;\n\
+   nrese:shaclEndpoint <{shacl_endpoint}> ;\n\
 {metrics_endpoint}\
 {operator_endpoint}\
    nrese:reasoningMode \"{reasoning_mode}\" ;\n\

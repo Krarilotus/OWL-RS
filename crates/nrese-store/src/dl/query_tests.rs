@@ -288,6 +288,7 @@ fn cancellation_takes_precedence_over_partial_answers_and_incompleteness() {
         let outcome = decide_answers(
             &store,
             &prepared,
+            &analyse(prepared.query()),
             &token,
             &nrese_exec::Envelope::unlimited(),
             mode,
