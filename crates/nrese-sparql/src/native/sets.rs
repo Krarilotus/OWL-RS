@@ -202,7 +202,10 @@ impl Context<'_> {
                         }
                     });
                 }
-                joined.unwrap_or_else(Solutions::unit)
+                match joined {
+                    Some(joined) => joined,
+                    None => self.unit()?,
+                }
             }
             GraphPattern::LeftJoin {
                 left,

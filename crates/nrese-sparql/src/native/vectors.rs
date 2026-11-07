@@ -836,9 +836,11 @@ mod tests {
         // its own.
         let unrelated = 128 + super::super::own_bytes(&snapshot);
         const UNRELATED: usize = 128;
+        // The six winners hold 64 rows of two ids each (6 KiB); a union of i of them makes
+        // its i * 1 KiB table while they are held: the third fits, the fourth doesn't.
         let options = QueryOptions {
             resources: crate::Resources {
-                memory: nrese_exec::Envelope::new(Some(unrelated + 8192 - 1), None),
+                memory: nrese_exec::Envelope::new(Some(unrelated + 6144 + 4096 - 1), None),
                 ..Default::default()
             },
             ..Default::default()
@@ -853,7 +855,7 @@ mod tests {
             Err(QueryEvaluationError::MemoryLimit(error)) => error,
             _ => panic!("fourth winner's union must exceed the remaining budget"),
         };
-        assert_eq!((error.used, error.requested), (unrelated + 2048, 6144));
+        assert_eq!((error.used, error.requested), (unrelated + 6144, 4096));
         assert_eq!(
             ctx.budget.used(),
             unrelated,
