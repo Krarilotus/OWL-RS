@@ -22,8 +22,11 @@ coverage` compares it with what the evaluated commit expects (Harness notes
 |  | `target_cpu`, inherited `rustflags_env`, `sources` (its program's BUILD_SOURCES -> git id at |
 |  | the build's own commit, which is not the invocation's: its declared dependency envelope, by |
 |  | content, a superset of what any one build reads), `inputs` |
-|  | (BUILD_INPUTS -> "no files" or a digest: what its build scripts read from outside git), and |
-|  | in Docker `rust_image`, the pinned `rust_image_id` it compiled in, and `rustflags`; or unknown |
+|  | (BUILD_INPUTS -> "no files" or a digest: what its build scripts read from outside git, from |
+|  | the clean export it builds in: "no files"), `toolchain` (rustc, cargo, host as the build ran |
+|  | them), `controlled` (true: the export, the declared toolchain, the owner's environment, no |
+|  | cargo config outside it; else unknown, why), and in Docker `rust_image`, the pinned |
+|  | `rust_image_id` it compiled in, and `rustflags`; or unknown |
 | settings | the suite settings in force that change a measurement (manifest `settings` less |
 |  | OPERATIONAL_SETTINGS: where a run keeps its files) |
 | protocol | the attempt's own (manifest `protocol`): runs, query runs, cache modes, order, limits |

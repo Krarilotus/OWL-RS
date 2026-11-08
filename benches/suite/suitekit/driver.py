@@ -25,6 +25,8 @@ import signal
 import socket
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 import tomllib
 import uuid
@@ -226,6 +228,7 @@ class Suite:
         self._writer: Writer | None = None
         self.made_files: list[str] = []  # datasets this run made, as /data paths
         self.made_volumes: list[str] = []
+        self.made_exports: list[Path] = []  # build exports (P1e), removed after each build
         self.made_images: list[str] = []
         self.written: list[Result] = []
         self.hashed: dict[str, str | None] = {}  # /data input -> its SHA-256 (data_hashes)
@@ -255,15 +258,15 @@ class Suite:
         print(text, flush=True)
 
     def host_command(self, command: list[str], log: Path | None = None, timeout: float | None = None,
-                     cwd: Path | None = None, env: dict | None = None) -> int:
+                     cwd: Path | None = None, env: dict | None = None, environ: dict | None = None) -> int:
         """Runs a command on the host, from the repository root unless `cwd` says otherwise
-        (echoed in a dry run)."""
+        (echoed in a dry run): in this process's environment with `env` added, or in `environ` alone."""
         if command[0] == "bash":
             command = [bash(), *command[1:]]
         if self.args.dry_run:
             self.say(f"    [host] {shell(command)}")
             return 0
-        environment = {**os.environ, **env} if env else None
+        environment = environ if environ is not None else ({**os.environ, **env} if env else None)
         if log is None:
             return subprocess.run(command, cwd=cwd or self.root, timeout=timeout, env=environment).returncode
         log.parent.mkdir(parents=True, exist_ok=True)
@@ -378,12 +381,25 @@ class Suite:
         if self.args.skip_build:
             return True
         ctx = self.context_for_images()
-        source = nrese.source(ctx)
+        source = Path(nrese.source(ctx))
         # What it is built from and with (P2 design review F4): its checkout when the build starts, and
         # the build's own configuration, never an environment list taken for its defaults.
-        self.built[nrese.key] = built_from(Path(source), "nrese")
+        self.built[nrese.key] = built_from(source, "nrese")
         self.say(f"building {nrese.key} (release) from {source}")
         log = self.results / "logs" / f"{nrese.key}-build-{self.stamp}.log"
+        # From a clean export of its commit, never the worktree (P1e: r5 F17 and every file git
+        # doesn't hold); removed after the build, its binary in the build's own target.
+        tree = self.export_build(source, nrese.key)
+        if tree is None:
+            return False
+        try:
+            return self.build_nrese_in(nrese, ctx, tree, log)
+        finally:
+            self.remove_export(tree)
+
+    def build_nrese_in(self, nrese, ctx, tree: Path, log: Path) -> bool:
+        if tree != Path(nrese.source(ctx)):
+            self.built[nrese.key]["inputs"] = build_inputs(tree, "nrese")
         if self.args.runtime == "docker":
             # Its own build volume, labelled, removed with the run; the Cargo registry is the
             # host's shared cache, never removed by a run.
@@ -406,7 +422,12 @@ class Suite:
                 self.say(f"the {nrese.key} build: its Rust image {tag} isn't pinned for this run")
                 return False
             self.built[nrese.key].update(rust_image=tag, rust_image_id=image, rustflags=rustflags)
-            rc = self.host_command(["docker", "run", "--rm", "--cpus", cpus, "-v", f"{source.as_posix()}:/src:ro",
+            # The image's toolchain, in its environment (its own and RUSTFLAGS); its config is the
+            # pinned image's, the source mount the export (r5 F16, F17).
+            toolchain = toolchain_in(image, tree) if not self.args.dry_run else receipts.unknown("a dry run")
+            self.built[nrese.key].update(toolchain=toolchain,
+                                         controlled=controlled(tree, None, toolchain, declared_toolchain(tree)))
+            rc = self.host_command(["docker", "run", "--rm", "--cpus", cpus, "-v", f"{tree.as_posix()}:/src:ro",
                                     "-e", f"RUSTFLAGS={rustflags}",
                                     "-v", f"{nrese.target_volume}:/target",
                                     "-v", f"{ns.shared('cargo')}:/usr/local/cargo/registry",
@@ -414,16 +435,67 @@ class Suite:
                                     "cargo", "build", "--release", "--locked", "-j", cpus, "-p", "nrese-server",
                                     "--target-dir", "/target"], log)
         else:
-            # From the source tree: its own toolchain, budget and target directory.
+            # Its own toolchain, budget and target directory, in the controlled environment (r4 F15).
+            environment = {**controlled_environment(os.environ), "CARGO_TARGET_DIR": str(nrese.target_dir(ctx))}
+            self.built[nrese.key].update(self.host_control(tree, environment))
             rc = self.host_command(["bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked",
-                                    "-p", "nrese-server"], log, cwd=source)
+                                    "-p", "nrese-server"], log, cwd=tree, environ=environment)
         if rc != 0:
             self.say(f"the {nrese.key} build failed; see {log}")
         return rc == 0
 
-    def harness(self) -> str:
+    def record_builds(self) -> None:
+        """The build records so far into the manifest (`builds`, what the receipts copy), after each
+        build, a failed one too, whether or not a cell runs (P1e sol-loop r1 S2)."""
+        if self.manifest and self.built:
+            self.manifest.update(builds=dict(self.built))
+
+    def export_build(self, source: Path, program: str) -> Path | None:
+        """A fresh export of `source`'s commit for a build of `program` (P1e), in a directory of this
+        run's own, outside any checkout (cargo reads .cargo/config in every ancestor of the directory
+        it builds in): build_export_base. None, said why, where it can't be made; never the worktree
+        in its place. A dry run builds nothing: the source, for its echo."""
+        if self.args.dry_run:
+            return source
+        commit = checkout_state(source).get("commit")
+        if not commit:
+            self.say(f"the {program} build: {source} has no commit to export")
+            return None
+        try:
+            tree = Path(tempfile.mkdtemp(prefix=f"nrese-build-{program}-", dir=build_export_base(source, self.root)))
+        except OSError as error:
+            self.say(f"the {program} build: no directory for its export: {error}")
+            return None
+        self.made_exports.append(tree)
+        try:
+            export_commit(source, commit, tree)
+        except (OSError, tarfile.TarError, subprocess.SubprocessError) as error:
+            self.say(f"the {program} build: exporting {commit[:12]} failed: {error}")
+            self.remove_export(tree)
+            return None
+        return tree
+
+    def remove_export(self, tree: Path) -> None:
+        """An export this run made goes (a failure to is in the run's cleanup errors, and the export
+        stays in made_exports, a residual)."""
+        if tree in self.made_exports and self.runtime.attempt(shutil.rmtree, tree):
+            self.made_exports.remove(tree)
+
+    def host_control(self, tree: Path, environment: dict) -> dict:
+        """A host build's `toolchain` (rustc and cargo as they run in `tree` with `environment`) and
+        whether it is `controlled` (r5 F16-F18)."""
+        toolchain = toolchain_here(tree, environment) if not self.args.dry_run else receipts.unknown("a dry run")
+        return {"toolchain": toolchain,
+                "controlled": controlled(tree, environment, toolchain, declared_toolchain(tree))}
+
+    def harness_target(self) -> Path:
+        """The harness build's output directory; a relative CARGO_TARGET_DIR is the repository's, where
+        the build and the run both find it (it builds in an export, removed after it: P1e sol-loop r1 S1)."""
         target = Path(self.settings.get("CARGO_TARGET_DIR") or self.root / "target")
-        return self.settings.get("HARNESS") or str(target / "release" / f"nrese-bench-harness{EXE}")
+        return target if target.is_absolute() else self.root / target
+
+    def harness(self) -> str:
+        return self.settings.get("HARNESS") or str(self.harness_target() / "release" / f"nrese-bench-harness{EXE}")
 
     def build_harness(self) -> bool:
         if self.args.skip_build:
@@ -434,8 +506,19 @@ class Suite:
         self.say("building the harness (release)")
         self.built["harness"] = built_from(self.root, "harness")
         log = self.results / "logs" / f"harness-build-{self.stamp}.log"
-        rc = self.host_command(["bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked", "--quiet",
-                                "--manifest-path", "benches/nrese-bench-harness/Cargo.toml"], log)
+        tree = self.export_build(self.root, "harness")
+        if tree is None:
+            return False
+        try:
+            if tree != self.root:
+                self.built["harness"]["inputs"] = build_inputs(tree, "harness")
+            environment = {**controlled_environment(os.environ), "CARGO_TARGET_DIR": str(self.harness_target())}
+            self.built["harness"].update(self.host_control(tree, environment))
+            rc = self.host_command(["bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked", "--quiet",
+                                    "--manifest-path", "benches/nrese-bench-harness/Cargo.toml"], log,
+                                   cwd=tree, environ=environment)
+        finally:
+            self.remove_export(tree)
         return rc == 0
 
     def data_missing(self, inputs: list[str]) -> list[str]:
@@ -918,10 +1001,14 @@ class Suite:
         if self.manifest and self.args.runtime == "docker":
             self.manifest.update(images=image_ids(list(images)), pinned_images=ns.pinned(self.root))
         for key in dict.fromkeys(key for _, key, system, _ in chosen if isinstance(system, Nrese)):
-            if not self.build_nrese(adapter(key)):
+            built = self.build_nrese(adapter(key))
+            self.record_builds()
+            if not built:
                 return 1
         if any(system is not None and plan.kind != "kit" for plan, _, system, _ in chosen):
-            if not self.build_harness():
+            built = self.build_harness()
+            self.record_builds()
+            if not built:
                 self.say("the harness build failed")
                 return 1
         unavailable: dict[int, str] = {}
@@ -1113,6 +1200,8 @@ class Suite:
             self.runtime.attempt(shutil.rmtree, self.runtime.owned_path(str(self.results)))
         if self.scratch.exists() and not self.runtime.workers() and not self.runtime.created_stores:
             self.runtime.attempt(self.scratch.rmdir)
+        for tree in list(self.made_exports):  # scratch, whatever is kept
+            self.remove_export(tree)
         if self.args.dry_run:
             return
         if not self.keep and not self.runtime.workers():
@@ -1169,6 +1258,154 @@ def built_from(source: Path, program: str) -> dict:
     state = {k: v for k, v in checkout_state(source).items() if k in ("commit", "dirty")}
     return {**state, "sources": receipts.object_ids(source, state.get("commit") or "", receipts.BUILD_SOURCES[program]),
             "inputs": build_inputs(source, program), **build_settings(os.environ)}
+
+
+# The environment a host build runs cargo in, and nothing else (P2 design check r4 F15; an allowlist,
+# as hermetic builds clear theirs): where the toolchain and outputs are, the recorded settings, the
+# launcher's own knobs (NRESE_*, FLEET_SLICE, NS_HELD_*), and the platform's base. Any other variable
+# (CARGO_ENCODED_RUSTFLAGS, CARGO_PROFILE_*, cc's CFLAGS or CRATE_CC_NO_DEFAULTS, ...) never reaches
+# cargo, rustc or a build script. Windows names are upper case there (os.environ).
+BUILD_ENVIRONMENT = frozenset({
+    "PATH", "HOME", "USER", "TMPDIR", "TMP", "TEMP",
+    "CARGO_HOME", "RUSTUP_HOME", "RUSTUP_AUTO_INSTALL", "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS", "RUSTFLAGS",
+    "FLEET_SLICE",
+    "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "PATHEXT", "OS", "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE", "PROCESSOR_IDENTIFIER", "LOCALAPPDATA", "APPDATA", "USERPROFILE", "USERNAME",
+    "PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432", "PROGRAMDATA", "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)", "MSYSTEM"})
+BUILD_ENVIRONMENT_PREFIXES = ("NRESE_", "NS_HELD_")
+# Read by our sources at compile time (option_env!): a different binary, so never passed, whatever the
+# prefix (test_receipts checks every such name).
+COMPILE_TIME_NAMES = frozenset({"NRESE_BUILD_REVISION"})
+
+
+def controlled_environment(env: Mapping[str, str]) -> dict[str, str]:
+    """`env` less everything a build doesn't need (BUILD_ENVIRONMENT): pure."""
+    def passed(name: str) -> bool:
+        name = name.upper() if os.name == "nt" else name
+        return name not in COMPILE_TIME_NAMES and (name in BUILD_ENVIRONMENT
+                                                   or name.startswith(BUILD_ENVIRONMENT_PREFIXES))
+    return {k: v for k, v in env.items() if passed(k)}
+
+
+def build_export_base(*checkouts: Path) -> Path:
+    """Where a build's export goes: the system's temporary directory, unless that is inside one of
+    `checkouts` (whose .cargo cargo would then read too), then beside the first of them."""
+    temp = Path(tempfile.gettempdir()).resolve()
+    for checkout in checkouts:
+        if temp.is_relative_to(checkout.resolve()):
+            return checkouts[0].resolve().parent
+    return temp
+
+
+def export_commit(checkout: Path, commit: str, dest: Path, timeout: float = 600) -> None:
+    """`dest` <- the committed tree of `commit` in `checkout` (git archive): files git holds, nothing
+    it ignores. Every file and directory is stamped with the export's time, never the commit's: cargo
+    decides freshness by mtimes, and an older commit's would read as older than the last build's
+    outputs (a stale binary). Raises where git or the archive fails."""
+    now = time.time()
+
+    def stamped(member, path):
+        member = tarfile.data_filter(member, path)
+        return None if member is None else member.replace(mtime=now, deep=False)
+    with subprocess.Popen(["git", "-C", str(checkout), "archive", "--format=tar", commit],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as git:
+        try:
+            with tarfile.open(fileobj=git.stdout, mode="r|") as tar:
+                tar.extractall(dest, filter=stamped)
+            said = git.stderr.read().decode(errors="replace").strip()
+            code = git.wait(timeout=timeout)
+        except BaseException:
+            git.kill()
+            raise
+    if code != 0:
+        raise OSError(f"git archive {commit[:12]} exited {code}: {said.splitlines()[-1] if said else 'no output'}")
+
+
+def declared_toolchain(root: Path) -> str | None:
+    """The toolchain channel `root`'s rust-toolchain.toml declares (the owner's: P2 compares it), or
+    None where it can't be read."""
+    try:
+        return tomllib.loads((root / "rust-toolchain.toml").read_text(encoding="utf-8"))["toolchain"]["channel"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def parse_toolchain(text: str):
+    """`rustc -vV` then `cargo -vV`'s output -> {rustc, cargo, host}, or unknown."""
+    releases = re.findall(r"^release: (\S+)", text, re.M)
+    hosts = re.findall(r"^host: (\S+)", text, re.M)
+    if len(releases) != 2 or not hosts:
+        return receipts.unknown(f"rustc -vV and cargo -vV said: {text.strip()[-200:] or 'nothing'}")
+    return {"rustc": releases[0], "cargo": releases[1], "host": hosts[0]}
+
+
+def toolchain_here(directory: Path, env: Mapping[str, str]):
+    """The toolchain a host build in `directory` with `env` runs (r5 F16): rustc and cargo found on
+    its PATH and run there, as rustup's proxies or a toolchain's own bin would be for the build."""
+    out = []
+    for tool in ("rustc", "cargo"):
+        exe = shutil.which(tool, path=env.get("PATH") or env.get("Path"))
+        if exe is None:
+            return receipts.unknown(f"no {tool} on the build's PATH")
+        try:
+            done = subprocess.run([exe, "-vV"], cwd=directory, env=dict(env), capture_output=True, text=True,
+                                  timeout=120)
+        except (OSError, subprocess.SubprocessError) as error:
+            return receipts.unknown(f"{tool} -vV: {error}")
+        if done.returncode != 0:
+            said = (done.stderr or done.stdout or "").strip().splitlines()
+            return receipts.unknown(f"{tool} -vV exited {done.returncode}: {said[-1] if said else 'no output'}")
+        out.append(done.stdout)
+    return parse_toolchain("".join(out))
+
+
+def toolchain_in(image: str, tree: Path):
+    """The toolchain the pinned image `image` runs, in the export mounted as a Docker build mounts it."""
+    try:
+        done = subprocess.run(["docker", "run", "--rm", "-v", f"{tree.as_posix()}:/src:ro", "-w", "/src", image,
+                               "sh", "-c", "rustc -vV && cargo -vV"], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as error:
+        return receipts.unknown(f"docker run {image}: {error}")
+    if done.returncode != 0:
+        said = (done.stderr or done.stdout or "").strip().splitlines()
+        return receipts.unknown(f"docker run {image} exited {done.returncode}: {said[-1] if said else 'no output'}")
+    return parse_toolchain(done.stdout)
+
+
+def cargo_configs(directory: Path, env: Mapping[str, str]) -> list[str]:
+    """The cargo configuration files a build in `directory` reads that its export doesn't hold: a
+    .cargo/config or .cargo/config.toml in any ancestor of it, and in its Cargo home (CARGO_HOME,
+    relative to `directory`, the build's own working directory, where it isn't absolute: r5 F18;
+    else ~/.cargo). Its own .cargo is its commit's."""
+    home = Path(env["CARGO_HOME"]) if env.get("CARGO_HOME") else Path.home() / ".cargo"
+    if not home.is_absolute():
+        home = directory / home
+    found = []
+    for folder in [parent / ".cargo" for parent in directory.resolve().parents] + [home]:
+        for name in ("config", "config.toml"):
+            path = str((folder / name).resolve())
+            if (folder / name).is_file() and path not in found:
+                found.append(path)
+    return found
+
+
+def controlled(directory: Path, env: Mapping[str, str] | None, toolchain, declared: str | None):
+    """True when a build in `directory` (an export) reads no cargo config outside it (`env`, a host
+    build's; None in a container, whose config is its pinned image's) and runs the declared
+    toolchain; else unknown, every reason why (r4 F15, r5 F16-F18)."""
+    why = []
+    configs = cargo_configs(directory, env) if env is not None else []
+    if configs:
+        why.append(f"cargo also reads {', '.join(configs)}")
+    if declared is None:
+        why.append("rust-toolchain.toml declares no channel that can be read")
+    if not isinstance(toolchain, dict) or "unknown" in toolchain:
+        why.append(f"its toolchain can't be read: {(toolchain or {}).get('unknown', 'nothing')}")
+    elif declared is not None:
+        why += [f"{tool} {toolchain[tool]} selected, rust-toolchain.toml declares {declared}"
+                for tool in ("rustc", "cargo") if toolchain[tool] != declared]
+    return receipts.unknown("; ".join(why)) if why else True
 
 
 def expected_build_inputs(program: str) -> dict:
@@ -1292,6 +1529,7 @@ def main(argv: list[str], systems: dict, workloads: dict, root: Path) -> int:
                                               "residuals": {**suite.runtime.residuals(),
                                                             "scratch": str(suite.scratch) if suite.scratch.exists() else None,
                                                             "files": suite.made_files, "volumes": suite.made_volumes,
+                                                            "exports": [str(t) for t in suite.made_exports],
                                                             "images": suite.made_images}})
 
             if not suite.runtime.attempt(record_cleanup) and code == 0:
