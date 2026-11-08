@@ -480,7 +480,8 @@ impl Context<'_> {
             })
             .collect();
         let key_table = IdTable::from_columns(key_columns);
-        let groups = group_rows(&key_table, &(0..variables.len()).collect::<Vec<_>>());
+        let groups = group_rows(&key_table, &(0..variables.len()).collect::<Vec<_>>())
+            .map_err(crate::QueryEvaluationError::from)?;
         let group_count = groups.len();
         let members_of = |group_of: &mut dyn Iterator<Item = usize>| {
             let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];

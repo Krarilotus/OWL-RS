@@ -204,6 +204,13 @@ impl Pending {
     /// positions (splitters from a sample) merged in parallel, each range's ids starting
     /// after the sizes of those before it. One sequential merge took 2 s of LUBM 1000's
     /// load (33 M terms) while the other threads waited.
+    ///
+    /// It runs under the dictionary's adoption guard, which a Rayon pool's jobs may wait for
+    /// (to intern, or to read behind a writer). So its parallel parts are slices
+    /// ([`nrese_exec::slices`]): run by the caller and by threads of no pool, each a plain
+    /// loop over its shard or range that calls into no Rayon and takes no lock; `existing`
+    /// reads the borrowed guard's dictionary. Every slice ends whatever waits for the
+    /// dictionary, and the caller with them.
     pub(crate) fn number(
         self,
         start: u64,
@@ -215,32 +222,29 @@ impl Pending {
             .into_iter()
             .map(Mutex::into_inner)
             .collect();
+        // Lanes beside the caller: one per 16 K entries, up to the pool's width.
+        let lanes = nrese_exec::slices::lanes_for(shards.iter().map(Shard::len).sum(), 1 << 14);
         // Per shard: its new entries by first position; known ones take their ids.
-        let orders: Vec<Vec<u32>> = shards
-            .par_iter_mut()
-            .map(|shard| {
-                let mut order: Vec<u32> = Vec::with_capacity(shard.len());
-                for local in 0..shard.len() {
-                    match existing(shard.key(local)) {
-                        Some(id) => *shard.slots[local].get_mut() = id,
-                        None => order.push(local as u32),
-                    }
+        let orders: Vec<Vec<u32>> = nrese_exec::slices::map_mut(&mut shards, lanes, |_, shard| {
+            let mut order: Vec<u32> = Vec::with_capacity(shard.len());
+            for local in 0..shard.len() {
+                match existing(shard.key(local)) {
+                    Some(id) => *shard.slots[local].get_mut() = id,
+                    None => order.push(local as u32),
                 }
-                order.sort_unstable_by_key(|&local| shard.slots[local as usize].load(Relaxed));
-                // The arrays shed what growing by doubling left over (a shard at a time,
-                // so the copies are small).
-                shard.bytes.shrink_to_fit();
-                shard.ends.shrink_to_fit();
-                shard.slots.shrink_to_fit();
-                let Shard {
-                    table, bytes, ends, ..
-                } = shard;
-                table.shrink_to_fit(|&local| {
-                    super::hash::key_hash(entry(bytes, ends, local as usize))
-                });
-                order
-            })
-            .collect();
+            }
+            order.sort_unstable_by_key(|&local| shard.slots[local as usize].load(Relaxed));
+            // The arrays shed what growing by doubling left over (a shard at a time,
+            // so the copies are small).
+            shard.bytes.shrink_to_fit();
+            shard.ends.shrink_to_fit();
+            shard.slots.shrink_to_fit();
+            let Shard {
+                table, bytes, ends, ..
+            } = shard;
+            table.shrink_to_fit(|&local| super::hash::key_hash(entry(bytes, ends, local as usize)));
+            order
+        });
         let total: usize = orders.iter().map(Vec::len).sum();
         let first = |s: usize, local: u32| shards[s].slots[local as usize].load(Relaxed);
         // Ranges of first positions, a few per thread, from a sample of each shard.
@@ -261,19 +265,15 @@ impl Pending {
             .map(|r| sample[r * sample.len() / ranges])
             .collect();
         // Per shard, where each range begins in its order.
-        let bounds: Vec<Vec<usize>> = orders
-            .par_iter()
-            .enumerate()
-            .map(|(s, order)| {
-                let mut bounds = Vec::with_capacity(ranges + 1);
-                bounds.push(0);
-                for &splitter in &splitters {
-                    bounds.push(order.partition_point(|&local| first(s, local) < splitter));
-                }
-                bounds.push(order.len());
-                bounds
-            })
-            .collect();
+        let bounds: Vec<Vec<usize>> = nrese_exec::slices::map(&orders, lanes, |s, order| {
+            let mut bounds = Vec::with_capacity(ranges + 1);
+            bounds.push(0);
+            for &splitter in &splitters {
+                bounds.push(order.partition_point(|&local| first(s, local) < splitter));
+            }
+            bounds.push(order.len());
+            bounds
+        });
         let mut places = vec![0u64; total];
         let mut parts: Vec<(usize, &mut [u64])> = Vec::with_capacity(ranges);
         let (mut rest, mut offset) = (&mut places[..], 0);
@@ -284,28 +284,26 @@ impl Pending {
             rest = tail;
             offset += size;
         }
-        parts
-            .into_par_iter()
-            .enumerate()
-            .for_each(|(r, (offset, out))| {
-                let mut heads: BinaryHeap<Reverse<(u64, usize, usize)>> = (0..orders.len())
-                    .filter(|&s| bounds[s][r] < bounds[s][r + 1])
-                    .map(|s| {
-                        let i = bounds[s][r];
-                        Reverse((first(s, orders[s][i]), s, i))
-                    })
-                    .collect();
-                let mut n = 0;
-                while let Some(Reverse((_, s, i))) = heads.pop() {
-                    let local = orders[s][i];
-                    shards[s].slots[local as usize].store(start + (offset + n) as u64, Relaxed);
-                    out[n] = place(&shards[s], s, local);
-                    n += 1;
-                    if i + 1 < bounds[s][r + 1] {
-                        heads.push(Reverse((first(s, orders[s][i + 1]), s, i + 1)));
-                    }
+        nrese_exec::slices::map_mut(&mut parts, lanes, |r, (offset, out)| {
+            let offset = *offset;
+            let mut heads: BinaryHeap<Reverse<(u64, usize, usize)>> = (0..orders.len())
+                .filter(|&s| bounds[s][r] < bounds[s][r + 1])
+                .map(|s| {
+                    let i = bounds[s][r];
+                    Reverse((first(s, orders[s][i]), s, i))
+                })
+                .collect();
+            let mut n = 0;
+            while let Some(Reverse((_, s, i))) = heads.pop() {
+                let local = orders[s][i];
+                shards[s].slots[local as usize].store(start + (offset + n) as u64, Relaxed);
+                out[n] = place(&shards[s], s, local);
+                n += 1;
+                if i + 1 < bounds[s][r + 1] {
+                    heads.push(Reverse((first(s, orders[s][i + 1]), s, i + 1)));
                 }
-            });
+            }
+        });
         Adopted {
             start,
             shards,

@@ -93,17 +93,32 @@ impl Decimal {
 
     /// `fn:round`: to the nearest integer, halves towards positive infinity.
     pub fn checked_round(self) -> Option<Self> {
-        Self(self.0.checked_add(SCALE / 2)?).checked_floor()
+        let (floor, fraction) = self.floor_and_fraction();
+        Self::whole(floor + i128::from(fraction >= SCALE / 2))
     }
 
     /// `fn:ceiling`.
     pub fn checked_ceil(self) -> Option<Self> {
-        Self(self.0.checked_neg()?).checked_floor()?.checked_neg()
+        let (floor, fraction) = self.floor_and_fraction();
+        Self::whole(floor + i128::from(fraction != 0))
     }
 
     /// `fn:floor`.
     pub fn checked_floor(self) -> Option<Self> {
-        self.0.div_euclid(SCALE).checked_mul(SCALE).map(Self)
+        Self::whole(self.0.div_euclid(SCALE))
+    }
+
+    /// The integer at or below the value and the fraction above it (in `0..SCALE`), from
+    /// one division. Only the rounded result is range-checked, by [`Self::whole`]: the
+    /// remainder's wrapping arithmetic is exact because the true remainder lies in range.
+    fn floor_and_fraction(self) -> (i128, i128) {
+        let floor = self.0.div_euclid(SCALE);
+        (floor, self.0.wrapping_sub(floor.wrapping_mul(SCALE)))
+    }
+
+    /// The integer `n` as a decimal, if it is in range.
+    fn whole(n: i128) -> Option<Self> {
+        n.checked_mul(SCALE).map(Self)
     }
 
     pub const fn is_negative(self) -> bool {
@@ -605,6 +620,39 @@ mod tests {
             assert_eq!(d(x).checked_floor(), Some(d(floor)), "floor {x}");
         }
         assert_eq!(Decimal::MAX.checked_round(), None);
+    }
+
+    /// XPath F&O 3.1 `fn:ceiling`, `fn:floor` and `fn:round` (halves towards positive
+    /// infinity): a result that fits is returned, whatever an intermediate step would need.
+    /// MAX is 170141183460469231731.687303715884105727, MIN is -…731.687303715884105728.
+    #[test]
+    fn rounding_at_the_ends_of_the_range() {
+        let top = "170141183460469231731";
+        let (high, low) = (d(top), d(&format!("-{top}")));
+        type Op = fn(Decimal) -> Option<Decimal>;
+        let (round, ceil, floor): (Op, Op, Op) = (
+            Decimal::checked_round,
+            Decimal::checked_ceil,
+            Decimal::checked_floor,
+        );
+        let cases = [
+            ("round", round, d(&format!("{top}.25")), Some(high)),
+            ("ceil", ceil, Decimal::MIN, Some(low)),
+            // Guards (right on the base too): the other ends, and results out of range.
+            ("round", round, d(&format!("{top}.5")), None),
+            ("round", round, d(&format!("-{top}.5")), Some(low)),
+            ("round", round, Decimal::MIN, None),
+            ("ceil", ceil, Decimal::MAX, None),
+            ("floor", floor, Decimal::MIN, None),
+            ("floor", floor, Decimal::MAX, Some(high)),
+        ];
+        // Every case is checked, so a failure lists each wrong one.
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|&&(_, op, x, expected)| op(x) != expected)
+            .map(|&(name, op, x, expected)| format!("{name}({x}) = {:?}, not {expected:?}", op(x)))
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

@@ -76,6 +76,9 @@ pub struct Program {
     /// The maintenance plan every commit takes where it applies (the differential tests
     /// of each plan); `None`: the cheapest ([`delta::policy`]).
     plan: Option<delta::policy::Plan>,
+    /// Whether the axioms' own closure concludes only facts a store can hold, once a first
+    /// load asked ([`Self::axioms_conclude_only_storable`]).
+    axioms_storable: std::sync::OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Program {
@@ -130,6 +133,7 @@ impl Program {
             store_representatives: false,
             axioms,
             plan: None,
+            axioms_storable: std::sync::OnceLock::new(),
         }
     }
 

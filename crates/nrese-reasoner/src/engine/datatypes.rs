@@ -11,13 +11,16 @@
 //!   values: a functional data property with two values.
 //!
 //! Not done: dt-type1/2 and dt-eq (typing and equating literals by value), which would
-//! fold lexical forms into each other; ill-typed literals (no data value) aren't judged.
+//! fold lexical forms into each other; ill-typed literals (no data value) aren't judged,
+//! but for the string types, whose lexical form is read as a string: a violation found
+//! on it holds anyway (an ill-typed literal is in no value space).
 //! A datatype outside OWL 2's list is not judged either.
 
 use crate::ir::{Triple, Violations};
 use nrese_engine::{TermId, TermKind};
 use nrese_exec::Budget;
 use nrese_rdf::{Literal, Term};
+use nrese_xsd::owl::text;
 use nrese_xsd::{DateTime, Decimal, Double, Float, Integer};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -145,10 +148,17 @@ fn in_value_space(value: &Data, datatype: &str) -> Option<bool> {
         };
     }
     let local = datatype.strip_prefix(XSD)?;
+    // The string types' value spaces (XML Schema 1.1 Part 2 §3.4.1–3.4.7), as their owner
+    // `nrese_xsd::owl::text` holds them.
+    let string_in = |test: fn(&str) -> bool| matches!(value, Data::String(s) if test(s));
     Some(match local {
-        "string" | "normalizedString" | "token" | "language" | "Name" | "NCName" | "NMTOKEN" => {
-            matches!(value, Data::String(_))
-        }
+        "string" => matches!(value, Data::String(_)),
+        "normalizedString" => string_in(text::is_normalized),
+        "token" => string_in(text::is_token),
+        "language" => string_in(text::is_language),
+        "Name" => string_in(text::is_name),
+        "NCName" => string_in(text::is_ncname),
+        "NMTOKEN" => string_in(text::is_nmtoken),
         "boolean" => matches!(value, Data::Boolean(_)),
         "decimal" => matches!(value, Data::Decimal(_)),
         "double" => matches!(value, Data::Double(_)),
@@ -253,6 +263,7 @@ mod tests {
                      rdfs:range xsd:nonNegativeInteger .
                  ex:weight rdfs:range xsd:double .
                  ex:name rdfs:range xsd:string .
+                 ex:code rdfs:range xsd:token .
                  {data}"
             );
             for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
@@ -301,6 +312,14 @@ mod tests {
             ["dt-not-type"],
             "a language string is no xsd:string"
         );
+        // A string with two inner spaces is no xsd:token (XML Schema 1.1 Part 2 §3.4.2).
+        assert_eq!(
+            rules("ex:a ex:code \"a  b\" ."),
+            ["dt-not-type"],
+            "no token"
+        );
+        // Guard (holds on the base too).
+        assert_eq!(rules("ex:a ex:code \"a b\" ."), none, "a token");
     }
 
     #[test]
@@ -338,6 +357,39 @@ mod tests {
             Some(false)
         );
         assert_eq!(space(typed("true", "boolean"), "boolean"), Some(true));
+        // The string types' value spaces (XML Schema 1.1 Part 2 §3.4.1–3.4.7, each equal to
+        // its lexical space): a string outside one isn't in it (RSH-12). Every row is checked
+        // and the wrong ones reported together.
+        let outside = [
+            ("a\tb", "normalizedString"),
+            ("a  b", "token"),
+            (" a", "token"),
+            ("a b", "NMTOKEN"),
+            ("1a", "Name"),
+            ("a:b", "NCName"),
+            ("abcdefghi", "language"),
+        ];
+        // Guards (in the value space, so they hold on the base too).
+        let inside = [
+            ("a b", "normalizedString"),
+            ("a b", "token"),
+            ("1a", "NMTOKEN"),
+            ("a:b", "Name"),
+            ("_a", "NCName"),
+            ("en-US", "language"),
+        ];
+        let rows = outside
+            .map(|(v, l)| (v, l, false))
+            .into_iter()
+            .chain(inside.map(|(v, l)| (v, l, true)));
+        let wrong: Vec<String> = rows
+            .filter_map(|(value, local, expected)| {
+                let got = space(Literal::new_simple_literal(value), local);
+                (got != Some(expected))
+                    .then(|| format!("{value:?} in xsd:{local}: {got:?}, not {expected}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
         assert_eq!(space(typed("5", "integer"), "gYear"), None);
         assert!(
             data(&typed("abc", "integer")).is_none(),
