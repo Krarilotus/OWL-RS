@@ -37,12 +37,19 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     if let Some(kind) = super::fault::FAIL_DIR_SYNC_OF.with_borrow(|of| {
         of.as_ref()
-            .filter(|(failing, _)| failing.as_path() == dir)
+            .filter(|(failing, _)| super::fault::same_dir(failing, dir))
             .map(|&(_, kind)| kind)
     }) {
         return Err(std::io::Error::new(
             kind,
             format!("syncing {} failed (a test's)", dir.display()),
+        ));
+    }
+    #[cfg(feature = "fault-points")]
+    if let Some(kind) = crate::fault_points::dir_sync_fails(dir) {
+        return Err(std::io::Error::new(
+            kind,
+            format!("syncing {} failed (a fault point's)", dir.display()),
         ));
     }
     #[cfg(unix)]

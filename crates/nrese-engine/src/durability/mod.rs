@@ -22,6 +22,8 @@ pub(crate) mod checkpoint;
 pub(crate) mod codec;
 #[cfg(test)]
 pub(crate) mod fault;
+#[cfg(test)]
+mod link_tests;
 mod lock;
 pub mod place;
 pub(crate) mod tail;

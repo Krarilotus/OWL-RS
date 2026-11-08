@@ -41,6 +41,16 @@ thread_local! {
 /// What [`ON_DIR_SYNC`] calls.
 pub(crate) type DirSyncHook = Box<dyn FnMut(&std::path::Path)>;
 
+/// Whether `a` and `b` name the same directory: the same spelling, or the same canonical path
+/// (a sync reaching it through a link or a junction, DUR-4, spells it as the link's target).
+pub(crate) fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b
+        || matches!(
+            (a.canonicalize(), b.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
 /// An error if `point` is set on this thread.
 pub(crate) fn check(point: &'static LocalKey<Cell<bool>>, what: &str) -> std::io::Result<()> {
     match point.get() {

@@ -25,6 +25,8 @@ pub mod cpu;
 mod durability;
 pub mod engine;
 pub mod error;
+#[cfg(feature = "fault-points")]
+pub mod fault_points;
 mod index;
 mod mapped;
 pub mod memory;
