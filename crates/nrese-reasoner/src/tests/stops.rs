@@ -226,7 +226,9 @@ fn a_stopped_materialisation_is_never_reported_complete() {
 #[test]
 fn a_cancelled_support_update_stops_within_its_poll_interval() {
     use crate::eval::{Seg, Source};
-    use crate::graph_sets::{Annotation, Change, Limits, Stopped, UNWATCHED, update_support_sets};
+    use crate::graph_sets::{
+        Change, Limits, Previous, Sets, Stopped, UNWATCHED, update_support_sets,
+    };
 
     /// The closure, counting the facts its scans hand out.
     struct Closure {
@@ -277,7 +279,7 @@ fn a_cancelled_support_update_stops_within_its_poll_interval() {
         facts: batch::Store::new(closure.clone()),
         scanned: AtomicUsize::new(0),
     };
-    let previous = |_: Triple| Annotation::default();
+    let previous = |_: Triple| Previous::Sets(Sets::NONE);
     let change = Change {
         source: &source,
         in_closure: &|f| closure.binary_search(&f).is_ok(),
@@ -287,11 +289,13 @@ fn a_cancelled_support_update_stops_within_its_poll_interval() {
     };
     let fires = 1000;
     let stop = || source.scanned.load(Ordering::Relaxed) >= fires;
+    let scratch = std::sync::Arc::new(nrese_exec::Budget::unlimited());
     let limits = Limits {
         watch: UNWATCHED,
         stop: &stop,
+        scratch: &scratch,
     };
-    let result = update_support_sets(&change, &ground, &[], &|_| vec![0], 1, limits);
+    let result = update_support_sets(&change, &ground, &[], &|_: Triple| Some(0), 1, limits);
     assert_eq!(result.err(), Some(Stopped::Cancelled));
     let scanned = source.scanned.load(Ordering::Relaxed);
     let bound = fires + nrese_exec::POLL_UNITS as usize + 2 * n;

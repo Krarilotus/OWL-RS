@@ -146,7 +146,7 @@ def fake_docker(tmp: Path) -> tuple[dict, dict]:
     return python_side, isolation.environment(**state, NRESE_DOCKER=sh.as_posix())
 
 
-CLEANUP = ("scripts/bench-cleanup.sh", "scripts/lib/disk.sh", "scripts/lib/ns.sh")
+CLEANUP = ("scripts/bench-cleanup.sh", "scripts/lib/disk.sh", *isolation.NS_SH)
 
 
 def cleanup_checkout(root: Path) -> Path:
@@ -297,9 +297,8 @@ def bash(script: str, *args: str, env: dict | None = None, timeout: int = 300,
 
 
 # gate-publish.sh, what it sources, and what a revision's build identity reads from its commit.
-# suitekit/lock.py: ns.sh's host lock where there is no flock (Git Bash).
-GATE_PUBLISH = ("scripts/lib/gate-publish.sh", "scripts/lib/ns.sh", "scripts/cargo-guarded.sh", "scripts/lib/disk.sh",
-                "scripts/lib/target-cpu.sh", "rust-toolchain.toml", "benches/suite/suitekit/lock.py")
+GATE_PUBLISH = ("scripts/lib/gate-publish.sh", *isolation.NS_SH, "scripts/cargo-guarded.sh", "scripts/lib/disk.sh",
+                "scripts/lib/target-cpu.sh", "rust-toolchain.toml")
 
 
 @unittest.skipUnless(BASH, "needs bash")
