@@ -924,7 +924,7 @@ class Suite:
             mine = receipts.unknown(f"a {plan.kind} plan's: its child's, not recorded here")
             out[cell] = {
                 **attempts[cell], "complete": True, "commit": commit, "dirty": entry["git"].get("dirty"),
-                "code": receipts.object_ids(self.root, commit, receipts.CODE_PATHS
+                "code": receipts.object_ids(self.root, commit, receipts.code_paths(self.root, commit)
                                             + (receipts.BUILD_PATHS if compiled or child else ())),
                 "images": mine if child else {i: pins.get(i) or receipts.unknown("not in the run's pin map")
                                               for i in sorted({*system.images(ctx), *(i for i, _ in system.builds())})},
