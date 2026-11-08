@@ -898,15 +898,29 @@ impl<T, B: Deref<Target = Budget>> ChargedVec<T, B> {
     }
 
     /// Room for `additional` more items: the capacity doubles where the budget has room
-    /// for it, else grows by what is asked.
+    /// for it, else grows to the most it has room for, and at least by what is asked.
+    ///
+    /// Grown by only what is asked, a vector near its limit reallocated at every push,
+    /// copying all its items each time, until it was refused: pushes there cost copies
+    /// quadratic in the vector's length (the executor memory stack's second lead, 8 Nov).
+    /// Grown to what fits, it is refused at most one growth later.
     pub fn reserve(&mut self, additional: usize) -> Result<(), BudgetExceeded> {
         let needed = self.needed(additional)?;
         if needed <= self.items.capacity() {
             return Ok(());
         }
         let doubled = needed.max(self.items.capacity().saturating_mul(2));
-        let fits = Self::bytes(doubled).is_some_and(|bytes| bytes <= self.held.budget.remaining());
-        self.set_capacity(if fits { doubled } else { needed })
+        self.set_capacity(self.most_that_fits(needed, doubled))
+    }
+
+    /// Of capacities from `needed` to `doubled` items, the most whose bytes the budget has
+    /// room for beside the current capacity's (a reallocation holds both); `needed` if none
+    /// fits, which its charge then refuses.
+    fn most_that_fits(&self, needed: usize, doubled: usize) -> usize {
+        match std::mem::size_of::<T>() {
+            0 => doubled,
+            size => (self.held.budget.remaining() / size).clamp(needed, doubled),
+        }
     }
 
     /// Room for exactly `additional` more items.
