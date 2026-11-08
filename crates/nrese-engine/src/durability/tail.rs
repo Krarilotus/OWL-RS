@@ -104,8 +104,7 @@ fn intact_after(bytes: &[u8], at: usize, next: u64) -> Option<(u64, u64)> {
 /// Either way the copy's name is synced before this returns, so before the cut.
 pub(crate) fn keep(root: &Path, segment: &Path, bytes: &[u8], at: u64) -> EngineResult<PathBuf> {
     let dir = root.join(CUT_DIR);
-    fs::create_dir_all(&dir)?;
-    super::sync_dir(root)?;
+    super::place::create_dir_all(&dir)?;
     let name = segment
         .file_name()
         .expect("segment file name")

@@ -243,7 +243,7 @@ impl Durable {
         );
 
         let wal_dir = wal::wal_dir(root);
-        fs::create_dir_all(&wal_dir)?;
+        place::create_dir_all(&wal_dir)?;
         let segments = wal::list_segments(&wal_dir)?;
         let last = segments.len().checked_sub(1);
         if let Some(until) = config.recover_until

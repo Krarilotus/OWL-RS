@@ -189,9 +189,10 @@ impl Wal {
             true => SEGMENT_MAGIC_V4,
             false => SEGMENT_MAGIC,
         };
-        fs::create_dir_all(dir)?;
+        // Durably named: the archive is made after the open's sync of the store's directory.
+        super::place::create_dir_all(dir)?;
         if let Some(archive) = &archive {
-            fs::create_dir_all(archive)?;
+            super::place::create_dir_all(archive)?;
         }
         // A segment a crash left under its temporary name was never part of the log.
         for entry in fs::read_dir(dir)? {
