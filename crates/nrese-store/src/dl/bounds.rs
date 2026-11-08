@@ -876,7 +876,8 @@ fn assemble(snapshot: &Snapshot, parts: Parts, kept: &Arc<nrese_exec::Budget>) -
     } = parts;
     let revision = view.revision;
     if !lower.is_empty() {
-        match snapshot.with_inferred_added_within(&lower, kept) {
+        // Derived from `snapshot` alone, so the view keeps its publication (dictionary 3.0b).
+        match snapshot.with_inferred_derived_within(&lower, kept) {
             Ok(lower) => view.lower = lower,
             Err(_) => return (refused(snapshot, revision), false),
         }
@@ -892,7 +893,7 @@ fn assemble(snapshot: &Snapshot, parts: Parts, kept: &Arc<nrese_exec::Budget>) -
             return (refused(snapshot, revision), false);
         }
         drop(facts);
-        let Ok(upper_view) = snapshot.with_inferred_added_within(&triples, kept) else {
+        let Ok(upper_view) = snapshot.with_inferred_derived_within(&triples, kept) else {
             return (refused(snapshot, revision), false);
         };
         // Read expanded to every identity of U1's classes (the stack keeps representatives).

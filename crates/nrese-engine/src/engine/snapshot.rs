@@ -721,6 +721,28 @@ impl Snapshot {
         added: &[crate::quad::EncodedTriple],
         budget: &Arc<nrese_exec::Budget>,
     ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        self.inferred_added_within(added, budget, ViewOf::Addition)
+    }
+
+    /// [`Self::with_inferred_added_within`] for statements this snapshot's own DL bounds
+    /// derive from it alone: the view keeps this snapshot's publication (a published
+    /// snapshot's gets a token, an unpublished one's none). F2's contract revision for the
+    /// store's DL bounds (the master, 8 Nov): they are its only caller, and a test fails any
+    /// other (`tests/derived_view_callers.rs`).
+    pub fn with_inferred_derived_within(
+        &self,
+        derived: &[crate::quad::EncodedTriple],
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        self.inferred_added_within(derived, budget, ViewOf::Derived)
+    }
+
+    fn inferred_added_within(
+        &self,
+        added: &[crate::quad::EncodedTriple],
+        budget: &Arc<nrese_exec::Budget>,
+        of: ViewOf,
+    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
         use std::mem::size_of;
         let stack = &self.version.inferred;
         let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
@@ -740,11 +762,7 @@ impl Snapshot {
         let (inferred, run) = built?;
         let held =
             nrese_exec::Reservation::adopt(Arc::clone(budget), held.transfer() + run.transfer());
-        Ok(self.restricted(
-            inferred,
-            Held::new(self.held.with(0), held),
-            ViewOf::Addition,
-        ))
+        Ok(self.restricted(inferred, Held::new(self.held.with(0), held), of))
     }
 
     /// This snapshot with the inferred statements `mask` hides removed, as
@@ -811,7 +829,7 @@ impl Snapshot {
             version,
             vocabulary: self.vocabulary.clone(),
             published: match of {
-                ViewOf::Restriction => self.published,
+                ViewOf::Restriction | ViewOf::Derived => self.published,
                 ViewOf::Addition => false,
             },
             statistics: Arc::new(self.statistics.for_view()),
@@ -2094,13 +2112,16 @@ impl<'s> SharedState<'s> {
 }
 
 /// What a restricted view's inferred stack is to its source's ([`Snapshot::restricted`]):
-/// a restriction keeps the source's publication, an addition never has one.
+/// a restriction or a derivation keeps the source's publication, an addition never has one.
 #[derive(Clone, Copy)]
 enum ViewOf {
     /// Fewer of the source's inferred statements: a subset, `Only` or a mask.
     Restriction,
     /// Statements the source doesn't have, never published.
     Addition,
+    /// Statements the source's own DL bounds derive from it alone
+    /// ([`Snapshot::with_inferred_derived_within`]).
+    Derived,
 }
 
 /// Why a [`Snapshot`]'s search gave no answer: a refusal, never an empty answer.
