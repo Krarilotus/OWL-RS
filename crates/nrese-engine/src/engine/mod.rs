@@ -33,6 +33,8 @@ mod equality;
 mod lock_tests;
 mod private;
 mod replication;
+#[cfg(test)]
+mod shared_state_tests;
 mod snapshot;
 pub(crate) mod spill;
 mod statistics;
@@ -60,8 +62,8 @@ pub use equality::Classes as EqualityClasses;
 pub use private::PrivateTransaction;
 pub use replication::{Applied, LogBatch, LogExpectation};
 pub use snapshot::{
-    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, SearchRefused, Seek, Snapshot,
-    SnapshotIdentity, TextScope,
+    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, SearchRefused, Seek,
+    SharedState, Snapshot, SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
 
@@ -544,8 +546,10 @@ impl Shared {
         stamp
     }
 
+    /// The installed version, published: the one constructor of a snapshot that grants a
+    /// [`snapshot::SharedState`].
     fn snapshot(&self) -> Snapshot {
-        Snapshot::new(
+        Snapshot::published(
             self.versions.load(),
             Arc::clone(&self.dictionary),
             Arc::clone(&self.statistics),
