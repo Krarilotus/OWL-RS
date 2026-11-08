@@ -1106,8 +1106,9 @@ fn a_directory_is_made_only_where_its_name_can_be_made_durable() {
 /// places what recovery reads in is made through the placement owner (sol-loop round 3 on review
 /// r1, S1): a directory made elsewhere, then found by `place::create_dir_all`, is taken for one
 /// provisioned beforehand where its holder can't be synced, and its name is never made durable
-/// (replica bootstrap made its data directory that way). A source scan of those callers, their
-/// test modules left out.
+/// (replica bootstrap made its data directory that way). Files recovery reads are renamed into
+/// place through it too (round 5, S3: the quarantine's, and the reasoning marker). A source scan
+/// of those callers, their test modules left out.
 #[test]
 fn store_directories_are_made_through_the_placement_owner() {
     let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -1121,7 +1122,14 @@ fn store_directories_are_made_through_the_placement_owner() {
         "nrese-store/src/metadata.rs",
         "nrese-server/src/replication.rs",
         "nrese-server/src/http/admin_dataset.rs",
+        // DUR-3 sol-loop round 5, S3, and the sweep after it: the quarantine and the reasoning
+        // marker are read at open too.
+        "nrese-store/src/quarantine.rs",
+        "nrese-store/src/service.rs",
     ];
+    // A rename recovery doesn't read: the catalogue moves a removed repository aside to delete
+    // it (a lost move leaves it to its tombstone, which is synced).
+    let exempt = ["std::fs::rename(&dir, &trash)"];
     let mut found = Vec::new();
     for file in files {
         let text = std::fs::read_to_string(crates.join(file)).unwrap();
@@ -1136,10 +1144,13 @@ fn store_directories_are_made_through_the_placement_owner() {
             if tests_begin {
                 break;
             }
-            let makes = ["create_dir_all(", "create_dir("]
+            let makes = ["create_dir_all(", "create_dir(", "fs::rename("]
                 .into_iter()
-                .any(|call| line.contains(call) && !line.contains(&format!("place::{call}")));
-            if makes {
+                .any(|call| {
+                    line.contains(call)
+                        && !line.contains(&format!("place::{}", call.trim_start_matches("fs::")))
+                });
+            if makes && !exempt.iter().any(|exempt| line.contains(exempt)) {
                 found.push(format!("{file}:{}: {}", n + 1, line.trim()));
             }
         }
