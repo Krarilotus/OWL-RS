@@ -28,9 +28,33 @@ use parking_lot::Mutex;
 
 use super::charged::ChargedArc;
 use super::dictionary::{
-    Dictionary, TRIPLE_KEY_LEN, decode_key, encode_key, encoded_len, lookup_bytes, triple_ids,
+    Dictionary, TRIPLE_KEY_LEN, decode_key, encode_key, encoded_len, key_lookup_bytes, triple_ids,
     triple_key, view_key,
 };
+
+/// The most bytes the dictionary's probe of a key of `encoded` bytes allocates, on a plain or a
+/// compressed base, whichever is more ([`key_lookup_bytes`]).
+fn probe_bytes(encoded: usize) -> usize {
+    key_lookup_bytes(encoded, false).max(key_lookup_bytes(encoded, true))
+}
+
+/// The most bytes a lookup of `term` through an overlay or a view holds at once: a probe and
+/// then an own key, one after the other; for a triple term, its components' lookups one after
+/// another, then its own probe and key.
+fn lookup_scratch(term: TermRef<'_>) -> usize {
+    match term {
+        TermRef::Triple(triple) => [
+            lookup_scratch(triple.subject.as_ref().into()),
+            lookup_scratch(triple.predicate.as_ref().into()),
+            lookup_scratch(triple.object.as_ref()),
+            probe_bytes(TRIPLE_KEY_LEN) + TRIPLE_KEY_LEN,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0),
+        _ => probe_bytes(encoded_len(term)) + encoded_len(term),
+    }
+}
 use super::hash::key_hash;
 use super::suffix::{Frozen, Suffix};
 use super::{TermId, TermKind, TermView};
@@ -63,7 +87,9 @@ impl Overlay {
     }
 
     /// The id of `term`: inline, the dictionary's below `start`, or this overlay's own, added
-    /// if it is new. What it allocates is charged first; refused, no entry is added.
+    /// if it is new. What it allocates is charged first. Refused, `term` is not added; a triple
+    /// term's components interned before the refusal stay, each its own entry, charged (a later
+    /// intern finds them; one id per term holds).
     pub(crate) fn intern(&self, term: TermRef<'_>) -> Result<TermId, BudgetExceeded> {
         if let Some(id) = self.dictionary.inline_id(term) {
             return Ok(id);
@@ -75,9 +101,11 @@ impl Overlay {
                 self.intern(triple.predicate.as_ref().into())?,
                 self.intern(triple.object.as_ref())?,
             ];
-            // The dictionary's probe builds its key, then this one: both charged first.
+            // The dictionary's probe of the key (on a compressed base, its compressed form too),
+            // then this one's key: charged first, at the larger of the two bases' bounds, since
+            // the probe takes its own guard and a rebase may change the base meanwhile.
             let mut scratch = Reservation::new(&*self.budget);
-            scratch.charge(2 * TRIPLE_KEY_LEN)?;
+            scratch.charge(probe_bytes(TRIPLE_KEY_LEN) + TRIPLE_KEY_LEN)?;
             if let Some(id) = self.dictionary.triple_term_bounded(ids, self.start) {
                 return Ok(id);
             }
@@ -108,7 +136,8 @@ impl Overlay {
         Ok(TermId::new(kind, id))
     }
 
-    /// [`Self::intern`] of each of `quad`'s terms (the default graph as itself).
+    /// [`Self::intern`] of each of `quad`'s terms (the default graph as itself). Refused, the
+    /// terms interned before the refusal stay, as [`Self::intern`]'s components do.
     pub(crate) fn intern_quad(
         &self,
         quad: nrese_rdf::QuadRef<'_>,
@@ -240,15 +269,15 @@ impl OverlayView {
         self.overlay.lookup_below(term, self.end())
     }
 
-    /// [`Self::lookup`], what it allocates charged first through `charge`: the dictionary's
-    /// lookup scratch ([`lookup_bytes`]) and the key of an own entry.
+    /// [`Self::lookup`], what it allocates charged first through `charge` ([`lookup_scratch`]):
+    /// at the larger of a plain and a compressed base's bounds, since its probes take their own
+    /// guards and a rebase may change the base between them.
     pub(crate) fn lookup_charged<E>(
         &self,
         term: TermRef<'_>,
         charge: impl FnOnce(usize) -> Result<(), E>,
     ) -> Result<Option<TermId>, E> {
-        let compressed = self.dictionary().keys_compressed();
-        charge(lookup_bytes(term, compressed) + encoded_len(term).max(TRIPLE_KEY_LEN))?;
+        charge(lookup_scratch(term))?;
         Ok(self.lookup(term))
     }
 
@@ -385,9 +414,14 @@ impl OverlayView {
             scan.slices += 1;
             scan.keys_tested += tested;
         }
+        // A key a pass finds is pushed once per pass: sorted, then each once.
         own.sort_unstable();
         own.dedup();
+        // Sorted as the dictionary's are: by id, kind first. An own id is above every shared one
+        // of its kind, not above every shared one: a shared language-tagged string sorts after
+        // an own simple literal.
         found.extend(own);
+        found.sort_unstable();
         (found, scan)
     }
 
