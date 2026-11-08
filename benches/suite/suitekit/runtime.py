@@ -491,10 +491,11 @@ class DockerRuntime(Runtime):
     def run(self, spec, log, timeout_s):
         if spec.name in self.containers or spec.name in self.names("container"):
             raise FileExistsError(spec.name)
+        argv = self.args(spec, detached=True)  # one refused (its memory, its image) is never owned or removed
         server = self.containers[spec.name] = Server(spec, spec.name, log)
         started = time.monotonic()
         try:
-            subprocess.run(self.args(spec, detached=True), check=True, capture_output=True)
+            subprocess.run(argv, check=True, capture_output=True)
             sampler = server.sampler = self.sample(spec.name)
             timed_out = False
             try:
@@ -513,8 +514,9 @@ class DockerRuntime(Runtime):
     def start(self, spec, log):
         if spec.name in self.containers or spec.name in self.names("container"):
             raise FileExistsError(spec.name)
+        argv = self.args(spec, detached=True)
         server = self.containers[spec.name] = Server(spec, spec.name, log)
-        subprocess.run(self.args(spec, detached=True), check=True, capture_output=True)
+        subprocess.run(argv, check=True, capture_output=True)
         server.sampler = self.sample(spec.name)
         return server
 
@@ -552,6 +554,10 @@ class DockerRuntime(Runtime):
         return name
 
     def store_bytes(self, source):
+        # Between a load and a serve, never beside a container of its own: a declared fleet job's
+        # watcher matches one live container to each declaration (fleet Spec 9).
+        if self.containers:
+            raise RuntimeError(f"the store's size is read with no container running: {', '.join(self.containers)} runs")
         out = run_quiet([ns.executable(), *ns.run_args(ROOT, OWNER), "--rm", "-v", f"{source}:/v:ro", "alpine",
                          "du", "-sb", "/v"], 600)
         try:

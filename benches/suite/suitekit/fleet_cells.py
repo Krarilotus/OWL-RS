@@ -13,8 +13,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import abba
-from . import adapters, cases, driver, ledger, manifest, status, workloads as definitions
+from . import adapters, cases, driver, ledger, manifest, schema, status, workloads as definitions
 from .runtime import Mount
+
+
+# A cell step's memory beside its containers: its release and harness builds of f255c0d0 at 2 jobs peaked (slice memory.peak)
+# at 3.77 GiB in suite-fleet-slice-measure-1#3cabc677 and 3.60 GiB clean in suite-fleet-slice-measure-2#e2093634: the larger.
+SLICE_GB = 3.77
 
 
 def names(text):
@@ -134,6 +139,20 @@ def jobs(groups, args):
                     needs[field], basis[field] = values[field], source
                     break
         cap = needs["ram_gb"]
+        # Spec 9 (#132 B2): the fleet holds declared containers outside the step's slice and takes their memory
+        # out of it (job.rs memory_cap), so the ask is the slice's own work (builds, driver, client: --slice-gb)
+        # plus every container declared: the measured one's, and its data makers' (release_gate.data_job()).
+        try:
+            asked, data_fields, data_env = abba.rg.data_job(
+                [case], {"cores": needs["cores"], "ram_gb": args.slice_gb + cap},
+                harness=(str(args.checkout), args.harness), containers_declared=True)
+        except abba.rg.HarnessRefused as refused:
+            print(f"omit {key} / {case['workload']} / {case['tier']}: {refused}")
+            continue
+        containers = [{"name": "suite", "memory_gb": cap}, *data_fields.get("containers", [])]
+        build_jobs = needs["cores"]  # what the slice was measured at; a maker's CPUs raise only the ask
+        needs = {**needs, "ram_gb": asked["ram_gb"],
+                 "cores": max([needs["cores"]] + [c["cpus"] for c in containers if "cpus" in c])}
         identity = {"cell": [case["workload"], case["tier"], key], "nrese": args.nrese, "harness_tree": args.harness_tree,
                     "inputs": group["input_hashes"], "scenario": {"name": "native", "memory_gb": cap, "references": group["references"]}}
         token = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
@@ -144,16 +163,16 @@ def jobs(groups, args):
         print(f"{key} / {case['workload']} / {case['tier']}: resource basis {basis}; ask {needs}; adapter needs {adapter_needs}; workload/driver needs {workload_needs}")
         payload = {"identity": identity, "group": group, "nrese": args.nrese, "harness": args.harness, "member": member,
                    "result_root": args.result_root, "deadline_min": group["minutes"] * args.deadline_factor}
-        members.append({"spec": 9, "containers": [{"name": "suite", "memory_gb": cap}], "id": member, "group": "suite-cells", "kind": "owlrs.timed", "class": "exclusive",
+        members.append({"spec": 9, "containers": containers, "id": member, "group": "suite-cells", "kind": "owlrs.timed", "class": "exclusive",
                         "purpose": "timing", "priority": 600, "priority_reason": "catalogue cells below confirmation and merge gates",
                         "notify": False, "hold_between_steps": True, "est_min": group["minutes"],
                         "step_deadline_min": payload["deadline_min"], "results_at": f"{args.result_root}/{member}",
                         "steps": [["bash", "-c", 'export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"; '
                                    'exec uv run --no-project python -B benches/suite/suite.py fleet --_member']],
                         "step_needs": [needs], "requires": {**needs, "os": "linux", "roles": abba.rg.TIMING_ROLES,
-                        "has": sorted(set(adapter_needs + workload_needs + abba.rg.data_needs([case])))},
-                        "env": {"SUITE_CELL": json.dumps(payload), "CARGO_BUILD_JOBS": str(needs["cores"]), "GATE_MAX_GB": str(cap),
-                                "DOCKER_MEMORY": f"{cap}g",
+                        "has": sorted(set(adapter_needs + workload_needs + asked.get("has", [])))},
+                        "env": {"SUITE_CELL": json.dumps(payload), "CARGO_BUILD_JOBS": str(build_jobs), "GATE_MAX_GB": str(cap),
+                                "NRESE_SUITE_MEMORY_GB": f"{cap:g}", **data_env,
                                 "NRESE_GATE_DIR": f"~/owlrs/{member}", "GATE_NAME": member, "GATE_CASES": case["name"]},
                         "inputs": [{"name": "checkout", "source": {"git": str(args.checkout), "rev": args.harness}}]
                                   + abba.rg.side_inputs(str(args.checkout), args.harness, [args.nrese])})
@@ -236,6 +255,11 @@ def member(root, systems):
             run(command)
             if not all((landing / n).is_file() for n in ("results.csv", "manifest.json", "answers.json")):
                 raise ValueError("suite result bundle incomplete")
+            # A system that fails doesn't stop the suite (driver.cycle): a cell whose every row failed (a refused
+            # container, #132 B2) measured nothing, and says so.
+            rows = schema.read(landing / "results.csv")
+            if not any(r["status"] == "ok" for r in rows) and any(r["status"] == "failed" for r in rows):
+                raise ValueError("no measured row: " + "; ".join(sorted({r["note"] for r in rows if r["status"] == "failed"})))
             code = 0
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             print(str(error), file=stderr)
@@ -260,6 +284,7 @@ def main(argv, systems, workloads, root):
     p.add_argument("--budget-hours", type=float, default=20)
     p.add_argument("--cores", type=int, default=2, help="unmeasured fallback: cargo-guarded.sh's two-job floor")
     p.add_argument("--build-disk-gb", type=float, default=20, help="unmeasured build disk beyond data_disk_gb")
+    p.add_argument("--slice-gb", type=float, default=SLICE_GB, help="the step's own memory beside its containers (SLICE_GB)")
     p.add_argument("--build-min", type=float, default=abba.rg.BUILD_MIN, help="existing build estimate per revision")
     p.add_argument("--prepare-min", type=float, default=10, help="existing plan_minutes data allowance, unmeasured")
     p.add_argument("--deadline-factor", type=float, default=2, help="unmeasured deadline/estimate ratio")
@@ -272,7 +297,7 @@ def main(argv, systems, workloads, root):
     args = p.parse_args(argv)
     if args._member:
         return member(root, systems)
-    for key in ("budget_hours", "cores", "build_disk_gb", "build_min", "prepare_min", "deadline_factor"):
+    for key in ("budget_hours", "cores", "build_disk_gb", "slice_gb", "build_min", "prepare_min", "deadline_factor"):
         if not math.isfinite(getattr(args, key)) or getattr(args, key) < 0 or (key != "budget_hours" and getattr(args, key) == 0):
             p.error(f"{key} must be finite and {'nonnegative' if key == 'budget_hours' else 'positive'}")
     if not args.systems and not args.gaps:

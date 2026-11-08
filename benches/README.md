@@ -209,6 +209,8 @@ build and preparation work, followed by `fleet check` (placement and queue impac
 are pruned to strictly below the budget. Tokens cover measured cells, pinned identities, inputs and scenario.
 Owner, budget and checkout path are excluded. Existing sets are looked up and reused; `--submit` queues only new checked sets.
 Fleet core asks are placement/build allowances; exclusive measurement CPU caps remain unset.
+Each member declares (fleet spec 9) its measured container, without a CPU limit, and its data makers',
+asking `--slice-gb` (builds, driver) beyond them; `suitekit/ns.py` `run_args` starts every container.
 
 Each member is one system/workload/tier cell, checked separately before set admission;
 permanent placement refusals are omissions. The plan separates adapter needs from workload

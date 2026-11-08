@@ -1812,7 +1812,8 @@ def harness_tables(checkout: str | Path, harness: str) -> DataTables:
     return DataTables(catalogue, makers, form_only, sparql, containers, held_makers(at, containers))
 
 
-def data_job(cases: list[dict], requires: dict, *, harness: tuple[str, str] | None) -> tuple[dict, dict, dict]:
+def data_job(cases: list[dict], requires: dict, *, harness: tuple[str, str] | None,
+             containers_declared: bool = False) -> tuple[dict, dict, dict]:
     """The one data ask of a timing job of `cases` (abba.py jobs(), jobs() part()), its `requires`
     (cores, ram_gb) given: (requires, the job's own fields, its env), all of it from the dataset
     metadata of `harness` (checkout, commit), whose data step makes the data (harness_tables(); None:
@@ -1823,8 +1824,11 @@ def data_job(cases: list[dict], requires: dict, *, harness: tuple[str, str] | No
     run one at a time; `ram_gb` grows by its memory, which the fleet takes out of every step's slice,
     so the builds and blocks keep what they asked; and the env its makers' containers take their
     limits from (scripts/lib/ns.sh ns_maker_args). A job that runs no such maker is asked as before,
-    nothing declared. Refused (HarnessRefused): a harness without a readable catalogue with [makers]
-    (harness_tables(): PR #139's harness without dataset makers among them, whose prepare doesn't make
+    nothing declared. With `containers_declared` (spec 9 for containers of its own: a suite cell), every
+    maker that can start a container and has a [makers] container is declared, whatever `has` says:
+    the SPARQL maker asks the host nothing, yet starts one wherever Docker is (#132). Refused
+    (HarnessRefused): a harness without a readable catalogue with [makers] (harness_tables(): PR #139's
+    harness without dataset makers among them, whose prepare doesn't make
     what the plan counts on), a case file its catalogue doesn't name, and makers that start containers
     it has no size for or doesn't hold to the declaration."""
     files = {f for c in cases for f in volume_files(c)}
@@ -1838,11 +1842,13 @@ def data_job(cases: list[dict], requires: dict, *, harness: tuple[str, str] | No
                                  "harness's benches/datasets.toml, or time those cases with a harness that has it")
     has, disk = data_needs(cases, tables), data_disk_gb(cases, tables)
     requires = {**requires, **({"has": has} if has else {}), **({"disk_gb": disk} if disk else {})}
-    if "docker" not in has:
+    if "docker" not in has and not containers_declared:
         return requires, {}, {}
     starts = {found[0] for f in files if (found := maker_of(tables.catalogue.get(f, {}), tables)) and found[1]}
     starts |= {f"bash {tables.sparql}" for f in files
                if tables.sparql in tables.catalogue.get(f, {}).get("made_by", "")}
+    if not starts:
+        return requires, {}, {}
     sizes = {start: tables.containers.get(start) for start in starts}
     named = harness[1][:12] if harness else "here"
     # Every maker of a declared job runs in the one declared container, SPARQL's too (sol-loop r3 S3).
