@@ -203,11 +203,27 @@ fn check_with_budget(
             evidence: Vec::new(),
         };
     }
+    // The check's memory: the request's envelope, its reading of the ontology included.
+    let memory = operation.memory.clone().unwrap_or_default();
     let ontology = match preparation.ontology.take() {
         Some(ontology) => ontology,
         None => {
             source::intern_vocabulary(tx);
-            source::read_pending(tx)
+            match source::read_pending(tx, memory.clone()) {
+                Ok(ontology) => ontology,
+                // Unknown, never consistent: the check didn't run.
+                Err(_) => {
+                    return Gate {
+                        checked: Checked {
+                            verdict: Verdict::Unknown(source::refused("the commit")),
+                            engine: "none",
+                            elapsed: started.elapsed(),
+                        },
+                        reject: None,
+                        evidence: Vec::new(),
+                    };
+                }
+            }
         }
     };
     let budget = operation.remaining(deadline);
@@ -228,11 +244,11 @@ fn check_with_budget(
             revision,
             consistency,
         }) if revision == before => consistency.verdict == Verdict::Inconsistent,
-        _ => {
-            let ontology = source::read_snapshot(tx.base());
+        // Unread, as undecided: not known to have been inconsistent, so rejected.
+        _ => source::read_snapshot(tx.base(), memory).is_ok_and(|ontology| {
             let checked = consistency::check(&ontology, &operation.remaining(deadline));
             checked.verdict == Verdict::Inconsistent
-        }
+        }),
     };
     if was_inconsistent {
         return Gate {
@@ -443,7 +459,7 @@ mod tests {
             nrese_rdf::GraphName::DefaultGraph,
         );
         tx.insert(quad.as_ref());
-        let ontology = source::read_pending(&tx);
+        let ontology = source::read_pending(&tx, nrese_exec::Envelope::unlimited()).unwrap();
         for stop in ["deadline", "cancelled", "running"] {
             let cancel = Cancel::default();
             if stop == "cancelled" {

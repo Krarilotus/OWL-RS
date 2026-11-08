@@ -61,7 +61,9 @@ pub(super) fn decide_until(
         return unresolved(&Limit::Time.reached("the deadline passed"));
     }
     let config = &store.config().dl;
-    let base = ontology_at(store, snapshot);
+    let Ok(base) = ontology_at(store, snapshot) else {
+        return unresolved(nrese_dl::memory::EXHAUSTED);
+    };
     let mut scratch = nrese_dl::memory::Scratch::new(Some(memory));
     if scratch
         .charge(|| nrese_dl::memory::ontology_bytes(&base))

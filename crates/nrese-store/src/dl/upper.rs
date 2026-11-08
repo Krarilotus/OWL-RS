@@ -598,17 +598,40 @@ fn reasoner_rules(program: &bounds::Program, values: &Values) -> Vec<ir::Rule> {
 }
 
 /// The materialised view's facts (every graph, each once).
-fn view_facts(view: &Snapshot, stop: Stop<'_>) -> Result<Vec<Triple>, GaveUp> {
-    let mut facts = Vec::new();
+/// The materialised view's facts (every graph, each once), charged to `budget` as they are
+/// collected (SYN-61: the whole view, U1's build's largest scratch).
+fn view_facts(
+    view: &Snapshot,
+    stop: Stop<'_>,
+    budget: &std::sync::Arc<nrese_exec::Budget>,
+) -> Result<nrese_exec::ChargedVec<Triple>, GaveUp> {
+    let mut facts = nrese_exec::ChargedVec::new(std::sync::Arc::clone(budget));
     for q in view.quads_for_pattern_in(ReadModel::Materialised, &pattern([None, None, None])) {
         if facts.len() % 1024 == 0 {
             check_stop(stop)?;
         }
-        facts.push([q.subject.raw(), q.predicate.raw(), q.object.raw()]);
+        facts
+            .push([q.subject.raw(), q.predicate.raw(), q.object.raw()])
+            .map_err(|_| GaveUp(SCRATCH_REFUSED.to_owned()))?;
     }
-    facts.sort_unstable();
-    facts.dedup();
+    sort_dedup(&mut facts);
     Ok(facts)
+}
+
+/// Why U1 isn't available when its build's scratch doesn't fit.
+const SCRATCH_REFUSED: &str = "its evaluation's input doesn't fit the queries' memory";
+
+/// `facts` sorted, each once; in place, allocating nothing.
+fn sort_dedup(facts: &mut nrese_exec::ChargedVec<Triple>) {
+    facts.sort_unstable();
+    let mut kept = 0;
+    for i in 0..facts.len() {
+        if i == 0 || facts[i] != facts[kept - 1] {
+            facts[kept] = facts[i];
+            kept += 1;
+        }
+    }
+    facts.truncate(kept);
 }
 
 impl Upper {
@@ -643,8 +666,8 @@ impl Upper {
         // The literals U1 compares, by value: of the view, the program's facts, its rules.
         let compared = program.compared_predicates();
         let mut values = Values::default();
-        let mut input = view_facts(view, stop)?;
-        values.add_objects(view, &input, compared);
+        let mut input = view_facts(view, stop, kept)?;
+        values.add_objects(view, input.iter(), compared);
         let program_facts: Vec<Triple> = program.facts.iter().map(|(f, _)| *f).collect();
         values.add_objects(view, &program_facts, compared);
         for rule in &program.rules {
@@ -658,12 +681,17 @@ impl Upper {
         }
         let rules = reasoner_rules(&program, &values);
         let facts: HashSet<Triple> = program_facts.iter().map(|&f| values.map(f)).collect();
-        for t in &mut input {
+        for t in input.iter_mut() {
             *t = values.map(*t);
         }
-        input.extend(facts.iter().copied());
-        input.sort_unstable();
-        input.dedup();
+        for &fact in &facts {
+            input
+                .push(fact)
+                .map_err(|_| GaveUp(SCRATCH_REFUSED.to_owned()))?;
+        }
+        sort_dedup(&mut input);
+        // The input's charge is held until the evaluation that consumes it returns.
+        let (input, input_held) = input.into_parts();
         // Equality by representatives: the closure over one term per class, the input's
         // facts that mention a class rewritten beside it, each other identity placed in
         // its class.
@@ -687,6 +715,8 @@ impl Upper {
             }
             stack.try_insert(t).map_err(refused)?;
         }
+        // The input is consumed and the derived facts (which may have reused it) freed.
+        drop(input_held);
         for (representative, members) in m.classes.classes() {
             for (i, &member) in members.iter().filter(|&&m| m != representative).enumerate() {
                 if i % 1024 == 0 {

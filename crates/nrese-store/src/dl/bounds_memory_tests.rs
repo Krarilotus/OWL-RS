@@ -95,7 +95,13 @@ fn embedded_low_memory_bounds_are_unavailable_on_every_build_path() {
     );
     assert!(upper_facts(&store, true).is_none(), "fresh diagnostic U1");
     let report = report(&store);
-    assert!(report.unavailable.as_deref().unwrap().contains("stopped"));
+    // For memory: the watch stopped the evaluation, or (SYN-61) the queries' memory refused
+    // its reading first.
+    let why = report.unavailable.as_deref().unwrap();
+    assert!(
+        why.contains("stopped") || why.contains("memory envelope"),
+        "{why}"
+    );
     assert!(upper_facts(&store, false).is_none(), "cached read U1");
     // A distinct store ensures prepare cannot just reuse an unavailable read result.
     let store = self::store(1);
@@ -129,7 +135,8 @@ fn embedded_low_memory_stops_maintenance_of_an_existing_upper_bound() {
     let store = store(1);
     let mut tx = store.engine().speculative();
     source::intern_vocabulary(&tx);
-    let ontology = source::read_snapshot(tx.base());
+    let ontology =
+        source::read_snapshot(tx.base(), Arc::new(nrese_exec::Budget::unlimited())).unwrap();
     let normalised = nrese_owl::normalise(&ontology);
     // Seed the existing U1 without a watch or a charge, as if the process had been below its
     // budget at the prior revision. The next preparation must carry its own watch.
