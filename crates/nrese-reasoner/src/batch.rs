@@ -2978,11 +2978,11 @@ pub(crate) fn check<S: Source + ?Sized>(
         let ground_rule = &program.consistency[c].1.rule;
         jobs.extend(Job::variant(source, ground_rule, i).map(|job| (c, job)));
     }
-    // Firings between two polls of `stop` inside a morsel: one driver can have very many
-    // (a rule over independent atoms), so the morsel alone is too coarse.
-    const POLL: u32 = 4096;
-    let mut interrupted = false;
-    let mut since_poll = 0u32;
+    // One driver can have very many bindings (a rule over independent atoms), firing or
+    // not, so the morsel alone is too coarse: the walk polls `stop` per fact it scans.
+    let Some(mut poll) = super::eval::Poller::new(stop) else {
+        return Err(Interrupted::default());
+    };
     'jobs: for (c, job) in jobs {
         // A list that refused (an empty-body rule above, or an earlier job) ends the
         // check: the state is inconsistent whatever the rest would add.
@@ -2993,19 +2993,8 @@ pub(crate) fn check<S: Source + ?Sized>(
         // budget without room for its group can't make consistent data look inconsistent.
         let mut id = None;
         for start in (0..job.drivers()).step_by(MORSEL) {
-            if stop() {
-                return Err(Interrupted::default());
-            }
             let range = start..(start + MORSEL).min(job.drivers());
-            let stopped = job.run_until(source, range, &mut |bindings| {
-                since_poll += 1;
-                if since_poll == POLL {
-                    since_poll = 0;
-                    if stop() {
-                        interrupted = true;
-                        return true;
-                    }
-                }
+            let stopped = job.run_until(source, range, &mut poll, &mut |bindings| {
                 // A refused report stops the walk: the state is inconsistent whatever
                 // the rest would add.
                 let group = match id {
@@ -3017,7 +3006,7 @@ pub(crate) fn check<S: Source + ?Sized>(
                 };
                 !found.record(group, words(program, c, bindings))
             });
-            if interrupted {
+            if poll.stopped() {
                 return Err(Interrupted::default());
             }
             if stopped {

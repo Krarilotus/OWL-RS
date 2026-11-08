@@ -781,42 +781,87 @@ impl Dictionary {
         }
     }
 
-    /// The string literals matching `query`, best first; the text index first takes in the
-    /// terms interned since the last search.
-    pub fn text_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
-        self.load_text(TEXT, &self.text);
-        if self.text.read().covered() < self.len() {
-            let mut text = self.text.write();
+    /// The text index of the string literals (with `iris`, of the IRIs' local names): from
+    /// its file at the first use, then taking in the terms interned since, and with the
+    /// stems of `stem` prepared. Takes and lets go of the index's write lock, so the
+    /// caller holds none of the dictionary's.
+    pub(crate) fn prepare_text(&self, iris: bool, stem: Option<&str>) {
+        use rayon::prelude::*;
+        let (which, slot) = match iris {
+            false => (TEXT, &self.text),
+            true => (IRI_TEXT, &self.iri_text),
+        };
+        self.load_text(which, slot);
+        if slot.read().covered() < self.len() {
+            let mut text = slot.write();
             let inner = self.inner.read();
             let end = inner.len();
             // In batches, each tokenised on every core (TextIndex::extend).
             let mut start = text.covered();
             while start < end {
                 let stop = (start + TEXT_BATCH).min(end);
-                let keys: Vec<(u64, Key<'_>)> = (start..stop)
-                    .map(|index| (index, inner.key(index)))
-                    .collect();
-                let documents: Vec<(u64, &str)> = keys
-                    .iter()
-                    .filter_map(|(index, key)| match view_key(key) {
-                        TermView::String(value) | TermView::LangString { value, .. } => {
-                            Some((*index, value))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                text.extend(&documents);
+                match iris {
+                    false => {
+                        let keys: Vec<(u64, Key<'_>)> = (start..stop)
+                            .map(|index| (index, inner.key(index)))
+                            .collect();
+                        let documents: Vec<(u64, &str)> =
+                            keys.iter()
+                                .filter_map(|(index, key)| match view_key(key) {
+                                    TermView::String(value)
+                                    | TermView::LangString { value, .. } => Some((*index, value)),
+                                    _ => None,
+                                })
+                                .collect();
+                        text.extend(&documents);
+                    }
+                    true => {
+                        // The local names on every core: string work per IRI (25 M in
+                        // DBpedia).
+                        let inner_ref: &Inner = &inner;
+                        let names: Vec<(u64, String)> = (start..stop)
+                            .into_par_iter()
+                            .filter_map(|index| match view_key(&inner_ref.key(index)) {
+                                TermView::Iri(iri) => {
+                                    Some((index, super::text::local_name_text(iri)?))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        let documents: Vec<(u64, &str)> = names
+                            .iter()
+                            .map(|(index, words)| (*index, words.as_str()))
+                            .collect();
+                        text.extend(&documents);
+                    }
+                }
                 start = stop;
             }
             text.cover(end);
         }
-        if let Some(language) = query.stem.as_deref() {
+        if let Some(language) = stem {
             // The read lock goes before the write lock is taken.
-            let ready = self.text.read().stems_ready(language);
+            let ready = slot.read().stems_ready(language);
             if !ready {
-                self.text.write().prepare_stems(language);
+                slot.write().prepare_stems(language);
             }
         }
+    }
+
+    /// The string literals matching `query`, best first; the text index first takes in the
+    /// terms interned since the last search.
+    pub fn text_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
+        self.text_search_in(query, None)
+    }
+
+    /// [`Self::text_search`], ranked among `corpus`'s documents alone where one is given
+    /// (`SearchScope::Reader`), else among every indexed one.
+    pub(crate) fn text_search_in(
+        &self,
+        query: &super::TextQuery,
+        corpus: Option<&super::text::Corpus>,
+    ) -> Vec<super::TextMatch> {
+        self.prepare_text(false, query.stem.as_deref());
         // The index's lock before `inner`'s (the lock order).
         let text = self.text.read();
         let inner = self.inner.read();
@@ -825,7 +870,10 @@ impl Dictionary {
             _ => None,
         };
         // Matches are entry numbers: as ids, by the entry's kind.
-        let mut matches = text.search(query, &text_of);
+        let mut matches = match corpus {
+            None => text.search(query, &text_of),
+            Some(corpus) => text.search_over(query, &text_of, corpus),
+        };
         for found in &mut matches {
             let kind = match view_key(&inner.key(found.id)) {
                 TermView::LangString { .. } => TermKind::LangString,
@@ -938,39 +986,17 @@ impl Dictionary {
     /// The IRIs whose local name's words match `query`, best first; the index first takes
     /// in the IRIs interned since the last search.
     pub fn iri_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
-        use rayon::prelude::*;
-        self.load_text(IRI_TEXT, &self.iri_text);
-        if self.iri_text.read().covered() < self.len() {
-            let mut text = self.iri_text.write();
-            let inner = self.inner.read();
-            let end = inner.len();
-            let mut start = text.covered();
-            while start < end {
-                let stop = (start + TEXT_BATCH).min(end);
-                // The local names on every core: string work per IRI (25 M in DBpedia).
-                let inner_ref: &Inner = &inner;
-                let names: Vec<(u64, String)> = (start..stop)
-                    .into_par_iter()
-                    .filter_map(|index| match view_key(&inner_ref.key(index)) {
-                        TermView::Iri(iri) => Some((index, super::text::local_name_text(iri)?)),
-                        _ => None,
-                    })
-                    .collect();
-                let documents: Vec<(u64, &str)> = names
-                    .iter()
-                    .map(|(index, words)| (*index, words.as_str()))
-                    .collect();
-                text.extend(&documents);
-                start = stop;
-            }
-            text.cover(end);
-        }
-        if let Some(language) = query.stem.as_deref() {
-            let ready = self.iri_text.read().stems_ready(language);
-            if !ready {
-                self.iri_text.write().prepare_stems(language);
-            }
-        }
+        self.iri_search_in(query, None)
+    }
+
+    /// [`Self::iri_search`], ranked among `corpus`'s documents alone where one is given
+    /// (`SearchScope::Reader`), else among every indexed one.
+    pub(crate) fn iri_search_in(
+        &self,
+        query: &super::TextQuery,
+        corpus: Option<&super::text::Corpus>,
+    ) -> Vec<super::TextMatch> {
+        self.prepare_text(true, query.stem.as_deref());
         // The index's lock before `inner`'s (the lock order).
         let text = self.iri_text.read();
         let inner = self.inner.read();
@@ -978,7 +1004,10 @@ impl Dictionary {
             TermView::Iri(iri) => super::text::local_name_text(iri),
             _ => None,
         };
-        let mut matches = text.search(query, &text_of);
+        let mut matches = match corpus {
+            None => text.search(query, &text_of),
+            Some(corpus) => text.search_over(query, &text_of, corpus),
+        };
         for found in &mut matches {
             found.id = TermId::new(TermKind::Iri, found.id).raw();
         }
@@ -2043,6 +2072,8 @@ fn validate_key(key: &[u8]) -> EngineResult<()> {
         ))
     }
 }
+
+mod reader_search;
 
 #[cfg(test)]
 #[path = "dictionary_lock_tests.rs"]

@@ -71,7 +71,9 @@ pub fn explain_with<B: Base + ?Sized>(
         if derivations.len() >= budget {
             break;
         }
-        let mut found = program.named_derivations(&source, next, BRANCHES);
+        let mut found = program
+            .unpolled()
+            .named_derivations(&source, next, BRANCHES);
         if program.bodiless.contains(&next) {
             found.insert(
                 0,
@@ -206,12 +208,17 @@ pub fn proof_graph<B: Base + ?Sized>(
         if base.is_asserted(next) {
             graph.add("asserted", &[], &[next], next);
         }
-        let mut found = program.every_named_derivation(&source, next, DERIVATIONS);
+        let mut found = program
+            .unpolled()
+            .every_named_derivation(&source, next, DERIVATIONS);
         if found.len() >= DERIVATIONS {
             graph.complete = false;
         }
         if program.bodiless.contains(&next) {
-            for premises in program.premise_alternatives(super::eval::Grounding::Bodiless(next)) {
+            let alternatives = program
+                .unpolled()
+                .premise_alternatives(super::eval::Grounding::Bodiless(next));
+            for premises in alternatives {
                 found.push(("axiom".to_owned(), premises.to_vec()));
             }
         }
@@ -247,11 +254,13 @@ pub fn valid_step<B: Base + ?Sized>(
     if inference.rule == "axiom" {
         return program.bodiless.contains(&inference.conclusion)
             && program
+                .unpolled()
                 .premise_alternatives(super::eval::Grounding::Bodiless(inference.conclusion))
                 .iter()
                 .any(|premises| same(premises));
     }
     program
+        .unpolled()
         .every_named_derivation(&Whole(base), inference.conclusion, usize::MAX)
         .iter()
         .any(|(rule, body)| *rule == inference.rule && same(body))
