@@ -1684,6 +1684,25 @@ def maker_of(entry: dict) -> tuple[str, list[str]] | None:
     return found
 
 
+def makers_at(checkout: str | Path, harness: str) -> bool:
+    """Whether the harness at commit `harness` of `checkout` makes datasets (its release_gate.py names
+    DATASET_MAKERS: staged datasets, engine-v2 838cd7eb, PR #129). A job's placement is planned by the
+    submitter's data_needs(), its data made by the harness's prepare: a harness from before them asks
+    no maker, so a file only a maker makes is missing where no earlier job left it (orchestrator,
+    8 Nov 2026: abba-run-055fe886-f3da61f9). Unknown (not a commit there): False, refused."""
+    import subprocess
+    done = subprocess.run(["git", "-C", str(checkout), "grep", "-q", "-e", "DATASET_MAKERS", harness, "--",
+                           "benches/fast/release_gate.py"], capture_output=True, timeout=60)
+    return done.returncode == 0
+
+
+def made_only(cases: list[dict], datasets: Path = ROOT / "benches" / "datasets.toml") -> list[str]:
+    """The cases' frozen files only a DATASET_MAKERS maker provides here (no bench-assets copy is
+    planned for them: data_needs())."""
+    entries = frozen({f for c in cases for f in volume_files(c)}, datasets)
+    return sorted({f for c in cases for f in volume_files(c) if maker_of(entries.get(f, {}))})
+
+
 def data_needs(cases: list[dict], datasets: Path = ROOT / "benches" / "datasets.toml") -> list[str]:
     """What a host must hold or run for the cases' frozen inputs (fleet `has`). The job makes what
     benches/sparql/prepare.sh and the DATASET_MAKERS can (Johannes, 2 Nov 2026: "Data is the job's

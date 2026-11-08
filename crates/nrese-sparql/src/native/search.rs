@@ -60,11 +60,13 @@
 
 use std::collections::HashMap;
 
-use nrese_engine::{GraphSelector, QuadPattern, TermId, TextQuery};
+use nrese_engine::{GraphSelector, QuadPattern, TermId, TextQuery, TextScope};
 use nrese_rdf::{Literal, NamedNode, Term, Variable, vocab::rdf};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 
-use nrese_exec::IdTable;
+use nrese_exec::{IdTable, Reservation};
+
+use crate::dataset::GraphSet;
 
 use super::{Context, GraphScope, NativeResult, Solutions};
 
@@ -381,7 +383,91 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
     Some((searches, rest))
 }
 
+/// What a search ranks or selects among ([`crate::SearchScope`]): the dictionary's whole
+/// index, or the corpus of these graphs as the reader sees them (`None`: no graph is in
+/// scope, nothing matches). A list of graphs is a copy charged to the query's budget, with
+/// its reservation (bound before the scope, so that it goes after the copy).
+pub(super) enum SearchIn {
+    Global,
+    Reader(Option<(Option<Reservation>, TextScope)>),
+}
+
 impl Context<'_> {
+    /// The literals `search`'s query matches, best first, ranked over what the query's
+    /// [`crate::SearchScope`] says: the dictionary's whole index, or the reader's corpus of
+    /// the active graphs (under `GRAPH ?g`, the named graphs it may read, merged). Decided
+    /// once per search, before its scan; both [`Self::search`] and the per-graph search read
+    /// it.
+    fn found(&self, search: &Search) -> NativeResult<Vec<nrese_engine::TextMatch>> {
+        Ok(match self.search_in()? {
+            SearchIn::Global => self.snapshot.text_search(&search.query),
+            SearchIn::Reader(None) => Vec::new(),
+            SearchIn::Reader(Some((_charge, scope))) => self
+                .snapshot
+                .text_search_in(self.model, &scope, &search.query, Some(&self.budget))
+                .map_err(crate::QueryEvaluationError::MemoryLimit)?,
+        })
+    }
+
+    /// What this context's searches rank and select among: decided once per search, before
+    /// its scan, from the query's [`crate::SearchScope`].
+    pub(super) fn search_in(&self) -> NativeResult<SearchIn> {
+        match self.search_scope {
+            crate::SearchScope::Global => Ok(SearchIn::Global),
+            crate::SearchScope::Reader => self.text_scope().map(SearchIn::Reader),
+        }
+    }
+
+    /// The graphs whose terms a reader's search in the active graph ranks among: the active
+    /// graph, the merge the default graph is, or the named graphs `GRAPH ?g` may bind
+    /// (`None`: none). A merge of every graph but some (SHACL's data graph without its
+    /// shapes) is listed: the default graph and every named graph the snapshot holds but
+    /// those, charged as the list grows.
+    #[allow(clippy::type_complexity)]
+    fn text_scope(&self) -> NativeResult<Option<(Option<Reservation>, TextScope)>> {
+        let memory = crate::QueryEvaluationError::MemoryLimit;
+        let charged = |graphs: nrese_exec::ChargedVec<TermId>| {
+            let (graphs, charge) = graphs.into_parts();
+            (Some(charge), TextScope::Merge(graphs))
+        };
+        let copy = |graphs: &[TermId]| -> NativeResult<(Option<Reservation>, TextScope)> {
+            let copy = nrese_exec::ChargedVec::collect(
+                std::sync::Arc::clone(&self.budget),
+                graphs.len(),
+                graphs.iter().copied(),
+            )
+            .map_err(memory)?;
+            Ok(charged(copy))
+        };
+        let all_but = |left_out: &[TermId]| -> NativeResult<(Option<Reservation>, TextScope)> {
+            let mut graphs = nrese_exec::ChargedVec::new(std::sync::Arc::clone(&self.budget));
+            for graph in std::iter::once(TermId::DEFAULT_GRAPH).chain(self.snapshot.named_graphs())
+            {
+                if !left_out.contains(&graph) {
+                    graphs.push(graph).map_err(memory)?;
+                }
+            }
+            Ok(charged(graphs))
+        };
+        let plain = |scope| Ok(Some((None, scope)));
+        match &*self.graph.borrow() {
+            GraphScope::Default => plain(TextScope::Graphs(GraphSelector::Exact(
+                TermId::DEFAULT_GRAPH,
+            ))),
+            GraphScope::Named(g) => plain(TextScope::Graphs(GraphSelector::Exact(*g))),
+            GraphScope::Variable(_) => match &self.named {
+                Some(named) => copy(named).map(Some),
+                None => plain(TextScope::Graphs(GraphSelector::AnyNamed)),
+            },
+            GraphScope::Union => match &self.merge_set {
+                Some(GraphSet::Only(graphs)) => copy(graphs).map(Some),
+                Some(GraphSet::AllBut(left_out)) => all_but(left_out).map(Some),
+                None => plain(TextScope::Graphs(GraphSelector::Any)),
+            },
+            GraphScope::Missing => Ok(None),
+        }
+    }
+
     /// Whether `id` is the object of a statement in the active graph ([`Self::used_as_object_of`]
     /// with any predicate).
     pub(super) fn used_as_object(&self, id: TermId) -> bool {
@@ -445,7 +531,7 @@ impl Context<'_> {
         let mut rank = 0usize;
         let found = match property {
             Some(None) => Vec::new(),
-            _ => self.snapshot.text_search(&search.query),
+            _ => self.found(search)?,
         };
         for found in found {
             if search
@@ -521,7 +607,7 @@ impl Context<'_> {
         let mut graphs = nrese_exec::ChargedVec::new(std::sync::Arc::clone(&self.budget));
         let found = match property {
             Some(None) => Vec::new(),
-            _ => self.snapshot.text_search(&search.query),
+            _ => self.found(search)?,
         };
         for found in found {
             self.check()?;

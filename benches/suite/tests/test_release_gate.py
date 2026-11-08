@@ -13,6 +13,7 @@ host's noise between instances.
 """
 from __future__ import annotations
 
+import argparse
 import contextlib
 import copy
 import importlib.util
@@ -949,6 +950,200 @@ class MainAdapter(unittest.TestCase):
             self.assertEqual(fast.changed_inputs(files), [])
             data.write_text("xy")
             self.assertEqual(fast.changed_inputs(files), [data.as_posix()])
+
+
+class DeclaredMetric(unittest.TestCase):
+    """The orchestrator, 7 Nov 2026 (18:05): C1's A-B-B-A abba-run-2102481f-fbbc9ee1 timed
+    ql-memberships-type-commits-wide, which declares `commits.read_p50_ms`, by the commit latency
+    (`time/_`, ratio 0.98), while B's reader read in ~10 ms against A's 0.004 ms: a loss in no
+    hypothesis. fast.samples() took a section's `samples_ms` (the commits') for any metric of that
+    section. A case's timed series is the metric it declares."""
+    CASE = {"name": "ql-memberships-type-commits-wide", "metric": "commits.read_p50_ms", "tool": "perf_lab"}
+
+    @staticmethod
+    def result(read_p50, commit_ms=0.2077):
+        return {"commits": {"commits": 400, "p50_ms": commit_ms, "p99_ms": 0.9461, "reads": 10010,
+                            "read_p50_ms": read_p50, "read_p99_ms": 0.119, "samples_ms": [commit_ms] * 400}}
+
+    def test_a_case_is_timed_by_the_metric_it_declares(self):
+        self.assertEqual(fast.samples(self.CASE, self.result(0.004)), {"_": [0.004]})
+        # Its section's own latency keeps its samples (the commits' p50 is what they sample).
+        self.assertEqual(fast.samples({**self.CASE, "metric": "commits.p50_ms"}, self.result(0.004))["_"],
+                         [0.2077] * 400)
+        # Another statistic of a sampled section is that statistic, not the samples' median.
+        self.assertEqual(fast.samples({**self.CASE, "metric": "commits.p99_ms"}, self.result(0.004)), {"_": [0.9461]})
+
+    def test_a_metric_in_seconds_is_a_series_in_milliseconds(self):
+        """Review r1 R1-F1: `commits.whole_s` reached the series in seconds, where the comparison's
+        floors are milliseconds. A metric declared in seconds (`*_s`) is milliseconds in the series,
+        per process and over repeated processes alike; a p50 sample series is as it was."""
+        case = {"name": "rule-delta-sweep", "metric": "commits.whole_s", "tool": "perf_lab"}
+        whole = lambda s: {"commits": {"whole_s": s, "p50_ms": 0.2, "samples_ms": [0.2] * 4}}  # noqa: E731
+        self.assertEqual(fast.samples(case, whole(3.0)), {"_": [3000.0]})
+        self.assertEqual(fast.samples(case, {**whole(3.0), "_repeats": [whole(3.0), whole(3.2)]}), {"_": [3000.0, 3200.0]})
+        self.assertEqual(fast.metric_value(case, whole(3.0)), 3000.0)
+        self.assertEqual(fast.samples({**case, "metric": "commits.p50_ms"}, whole(3.0)), {"_": [0.2] * 4})
+
+    def test_a_600_ms_whole_run_loss_is_a_regression_in_compare(self):
+        """Review r1 R1-F1, the real caller: `fast.py compare` (compare_reports) with its 2 ms floor
+        called 3.0 s -> 3.6 s "slower, below absolute floor" and exited 0. Specified independently: a
+        whole run 600 ms slower, 20 % and far above 2 ms, is a regression."""
+        from suitekit import compare
+        case = {"name": "rule-delta-sweep", "metric": "commits.whole_s", "tool": "perf_lab"}
+
+        def report(seconds):
+            records = []
+            for rep in (1, 2):
+                result = {"commits": {"whole_s": seconds, "p50_ms": 0.2, "samples_ms": [0.2] * 4}}
+                records.append({"case": case["name"], "rep": rep, "status": "ok", "checks": [], "routes": [],
+                                "metric": fast.metric_value(case, result), "samples": fast.samples(case, result)})
+            return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
+                    "started": "2026-11-08T02:00:00", "records": records}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = compare.compare_reports(report(3.0), report(3.6))
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertNotIn("below absolute floor", out.getvalue())
+
+    @staticmethod
+    def saved(case, metric, series, units=None):
+        records = []
+        for rep in (1, 2):
+            r = {"case": case, "rep": rep, "status": "ok", "checks": [], "routes": [], "metric": metric,
+                 "samples": {"_": list(series)}}
+            if units is not None:
+                r["series_units"] = units
+            records.append(r)
+        return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
+                "started": "2026-11-08T02:00:00", "records": records}
+
+    def compared(self, base, new):
+        from suitekit import compare
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = compare.compare_reports(base, new)
+        return code, out.getvalue()
+
+    def test_reports_of_two_timing_unit_generations_are_normalised_or_refused(self):
+        """Fix check r2, R2-F1: reports before 8 Nov 2026 saved `commits.whole_s` in seconds and
+        timed it by its section's commit latencies; new ones save milliseconds of the whole run. A
+        record says its generation (`series_units`; none: 1); compare normalises what that generation
+        fixes exactly and refuses what it can't, before any verdict."""
+        # The verdicts first (a red run fails at a verdict, not at a missing name); generation 2 literal.
+        # An old rule-delta-sweep record timed its commit latencies: another quantity, refused.
+        old = self.saved("rule-delta-sweep", 3.0, [0.2, 0.2, 0.2])
+        new = self.saved("rule-delta-sweep", 3000.0, [3000.0], units=2)
+        code, text = self.compared(old, new)
+        self.assertEqual(code, 2, text)
+        self.assertNotIn("faster", text)
+        self.assertIn("timing units", text)
+        # A load_s case was milliseconds in both generations: an old 3.0 s load against a new 3.6 s is
+        # a 600 ms regression.
+        load = next(c["name"] for c in __import__("suitekit.cases", fromlist=["load"]).load() if c.get("metric") == "load_s")
+        code, text = self.compared(self.saved(load, 3000.0, [3000.0]),
+                                   self.saved(load, 3600.0, [3600.0], units=2))
+        self.assertEqual(code, 1, text)
+        self.assertIn("SLOWER", text)
+        # Same generation on both sides compares as it always did.
+        code, text = self.compared(self.saved("rule-delta-sweep", 3.0, [10.0] * 3),
+                                   self.saved("rule-delta-sweep", 3.0, [20.0] * 3))
+        self.assertEqual(code, 1, text)  # 10 ms more, above the 2 ms floor
+        # A generation compare doesn't know is refused.
+        code, text = self.compared(new, self.saved("rule-delta-sweep", 3600.0, [3600.0], units=99))
+        self.assertEqual(code, 2, text)
+        self.assertIn("unknown timing units", text)
+        # Every record fast.py writes says its generation: compare's own.
+        from suitekit import compare
+        self.assertEqual(fast.SERIES_UNITS, compare.SERIES_UNITS)
+        self.assertEqual(compare.SERIES_UNITS, 2)
+
+    def test_an_old_seconds_series_is_milliseconds_after_normalising(self):
+        """A generation-1 record of a seconds field whose series was its own value (no section samples):
+        its metric and series times 1000."""
+        from suitekit import compare
+        record = {"case": "x", "metric": 3.0, "samples": {"_": [3.0, 3.1]}}
+        self.assertEqual(compare.normalised(record, "phase.whole_s"),
+                         {**record, "metric": 3000.0, "samples": {"_": [3000.0, 3100.0]},
+                          "series_units": compare.SERIES_UNITS})
+        self.assertIsNone(compare.normalised({**record, "case": "y"}, "commits.whole_s"))  # section latency
+        self.assertEqual(compare.normalised(dict(record), "load_s")["metric"], 3.0)  # was ms already
+
+    CHECK = "closure_after_commits.equal"  # rule-delta-sweep's registry check (benches/cases/core.toml)
+
+    @classmethod
+    def two_cases(cls, units, sweep_status="ok", sweep_peak=1000):
+        """r3's reports: rule-delta-sweep of one generation (1: seconds and its commit latencies;
+        2: milliseconds of the whole run) beside an unchanged rl-hierarchy."""
+        records = []
+        for rep in (1, 2):
+            ok = sweep_status == "ok"
+            sweep = {"case": "rule-delta-sweep", "rep": rep, "status": sweep_status, "routes": [],
+                     "checks": [{"path": cls.CHECK, "want": "true", "got": ok, "ok": ok}],
+                     "metric": 3.0 if units is None else 3000.0,
+                     "samples": {"_": [0.2, 0.2, 0.2] if units is None else [3000.0]},
+                     "peak_mib": sweep_peak, "memory_kind": "lifetime"}
+            hierarchy = {"case": "rl-hierarchy", "rep": rep, "status": "ok", "checks": [], "routes": [],
+                         "metric": 100.0, "samples": {"_": [100.0]}, "peak_mib": 500, "memory_kind": "lifetime"}
+            for r in (sweep, hierarchy):
+                if units is not None:
+                    r["series_units"] = units
+                records.append(r)
+        return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
+                "started": "2026-11-08T02:00:00", "records": records}
+
+    def test_refused_timing_keeps_the_case_s_status_checks_and_memory(self):
+        """Fix check r3, R3-F1: refusing a case's timing (units of two generations) dropped its whole
+        record, so a case gone from ok to wrong beside an unchanged one exited 0. Specified (r3's
+        required revision; compare.py's order, "nothing lost hides behind a time"): only the refused
+        case's time is not compared; its status, checks and memory are, and their failure is nonzero."""
+        no_ratio = lambda text: self.assertIsNone(re.search(r"^rule-delta-sweep +\d", text, re.M), text)  # noqa: E731
+        with self.subTest("ok -> wrong beside an unchanged case: an acceptance failure, the status named"):
+            code, text = self.compared(self.two_cases(None), self.two_cases(2, sweep_status="wrong"))
+            self.assertEqual(code, 1, text)
+            self.assertRegex(text, r"rule-delta-sweep +status ok -> wrong +CHANGED")
+            no_ratio(text)
+            self.assertRegex(text, r"rl-hierarchy .* same")
+        with self.subTest("the wrong case alone: no timing left, its failure is the verdict (1), not the refusal (2)"):
+            def alone(report):
+                return {**report, "records": [r for r in report["records"] if r["case"] == "rule-delta-sweep"]}
+            code, text = self.compared(alone(self.two_cases(None)), alone(self.two_cases(2, sweep_status="wrong")))
+            self.assertEqual(code, 1, text)
+            self.assertIn("status ok -> wrong", text)
+        with self.subTest("a refused case's peak still counts: 1000 -> 2000 MiB"):
+            code, text = self.compared(self.two_cases(None), self.two_cases(2, sweep_peak=2000))
+            self.assertEqual(code, 1, text)
+            self.assertRegex(text, r"rule-delta-sweep +peak .*1000 -> 2000 MiB +MORE MEMORY")
+        with self.subTest("guard (as at 43b1f309): all ok, the refused case listed, no ratio for it, exit 0"):
+            code, text = self.compared(self.two_cases(None), self.two_cases(2))
+            self.assertEqual(code, 0, text)
+            self.assertRegex(text, r"rule-delta-sweep.*not compared")
+            no_ratio(text)
+
+    def test_refused_timing_keeps_the_wrong_status_in_compact_reports(self):
+        """R3-F1 through `fast.py compare` on compact records alone (their full reports not here):
+        they keep status, checks and `series_units`, so the verdict is the full reports'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for name, report in (("base", self.two_cases(None)), ("new", self.two_cases(2, sweep_status="wrong"))):
+                full = Path(tmp) / f"{name}-full.json"
+                full.write_text(json.dumps(report), encoding="utf-8")
+                paths.append(fast.write_compact(full, Path(tmp) / f"{name}.json"))
+                full.unlink()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = fast.compare(argparse.Namespace(base=str(paths[0]), new=str(paths[1])))
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertRegex(out.getvalue(), r"rule-delta-sweep +status ok -> wrong +CHANGED")
+        self.assertIn("full report isn't here", out.getvalue())
+
+    def test_c1_s_read_slowdown_is_a_loss_in_its_family(self):
+        """The run's own values, per pass: A 0.004 ms in every block, B 10.371, 9.843 and 10.547 ms."""
+        a = [fast.samples(self.CASE, self.result(0.004))["_"] for _ in range(3)]
+        b = [fast.samples(self.CASE, self.result(ms, 0.2056))["_"] for ms in (10.371, 9.843, 10.547)]
+        blocks = [1, 2, 3]
+        r = gate_module.dimension(a, blocks, b, blocks, {}, "ms")
+        self.assertEqual(r["status"], "loss shown", r)
+        self.assertGreater(r["ratio"], 1000)
 
 
 class Memory(unittest.TestCase):
