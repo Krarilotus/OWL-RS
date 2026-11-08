@@ -355,7 +355,13 @@ impl MutationPipeline {
             let supports = self.store.supports();
             let touched = supports.wants_commits().then(|| supports.touched(&tx));
             let before = tx.base().revision();
-            let summary = tx.commit().map_err(|error| MutationError::Store {
+            // With the rewriting on, the QL schema notes what the commit changes of
+            // individuals' memberships of class expressions, before the commit publishes.
+            let summary = match self.store.query_settings().ql() {
+                Some(ql) => ql.commit(tx),
+                None => tx.commit(),
+            }
+            .map_err(|error| MutationError::Store {
                 kind,
                 source: StoreError::Engine(error),
             })?;

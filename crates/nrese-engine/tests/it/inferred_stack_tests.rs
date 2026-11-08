@@ -857,3 +857,41 @@ fn merged_columns_keep_the_scan_order_or_are_refused() {
         Some(in_order)
     );
 }
+
+/// What `Snapshot::asserted_identity` says (P2-C1; DUR's and NUM's conditions): a commit of
+/// inferred statements only keeps it, as does a restricted view; a commit of asserted
+/// statements gives a new one, as does a transaction's pending state, even unchanged, and
+/// `CommitSummary::asserted` is the published snapshot's.
+#[test]
+fn the_asserted_identity_follows_the_asserted_statements_only() {
+    let engine = engine();
+    let first = engine.snapshot().asserted_identity();
+    let mut tx = engine.transaction();
+    tx.insert_inferred(triple(1, 2, 3));
+    let summary = tx.commit().expect("commit");
+    assert_eq!(
+        engine.snapshot().asserted_identity(),
+        first,
+        "inferred only"
+    );
+    assert_eq!(summary.asserted, first);
+    let mut tx = engine.transaction();
+    assert_ne!(
+        tx.pending_snapshot().asserted_identity(),
+        first,
+        "pending, unchanged"
+    );
+    assert!(tx.insert_encoded(EncodedQuad::new(id(4), id(5), id(6), TermId::DEFAULT_GRAPH)));
+    let pending = tx.pending_snapshot().asserted_identity();
+    assert_ne!(pending, first, "pending");
+    let summary = tx.commit().expect("commit");
+    let after = engine.snapshot().asserted_identity();
+    assert_ne!(after, first, "an asserted commit");
+    assert_ne!(after, pending, "the committed state isn't the pending view");
+    assert_eq!(
+        summary.asserted, after,
+        "the summary names what was published"
+    );
+    let nothing = engine.transaction().commit().expect("commit");
+    assert_eq!(nothing.asserted, after, "a commit that changes nothing");
+}
