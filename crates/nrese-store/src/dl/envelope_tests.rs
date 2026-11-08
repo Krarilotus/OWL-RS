@@ -127,17 +127,25 @@ fn a_request_past_its_envelope_through_any_end_ends_within_it() {
         premise > 64 << 10,
         "the ABox makes compiling the larger part"
     );
+    // What the store keeps for every request once the revision's U1, views and ontology are
+    // built: charged within the catalog since SYN-61, the same after every request.
+    let kept = catalog.used();
+    assert_eq!(
+        kept,
+        store.dl().bounds.kept().used(),
+        "only the bounds' keep"
+    );
     let mut ends = Vec::new();
     let mut limit = 256;
     while limit < needed + needed / 4 {
         let memory = store.envelope(Some(limit));
         let end = run(&store, &memory);
         assert!(memory.refused() || end == End::Answered, "at {limit} bytes");
-        // Back to what the store keeps for every request (the bounds' U1 and views, charged
-        // within the catalog since SYN-61): nothing of the request stays.
+        // Back to what the store keeps: nothing of the request stays, in its envelope or in
+        // the bounds'.
         assert_eq!(
             catalog.used(),
-            store.dl().bounds.kept().used(),
+            kept,
             "at {limit} bytes the catalog's budget is back"
         );
         ends.push((limit, end));

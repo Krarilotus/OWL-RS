@@ -4,10 +4,16 @@ use super::*;
 use crate::StoreConfig;
 
 fn store(limit: u64) -> StoreService {
-    let store = StoreService::new(StoreConfig {
-        process_memory_bytes: crate::ProcessMemory::Bytes(limit),
-        ..StoreConfig::in_memory()
-    })
+    // The store watch at `limit`; what is charged (the bounds' reading and keeping among it,
+    // SYN-61) on a runtime of its own with room (`StoreService::with_runtime`: the config's
+    // process memory stays the store's watch), so these tests reach the watch.
+    let store = StoreService::with_runtime(
+        StoreConfig {
+            process_memory_bytes: crate::ProcessMemory::Bytes(limit),
+            ..StoreConfig::in_memory()
+        },
+        Arc::new(crate::Runtime::new(0, 1 << 30)),
+    )
     .unwrap();
     // An existential conclusion takes the U1 route, not the OWL 2 RL shortcut.
     store
@@ -19,6 +25,249 @@ fn store(limit: u64) -> StoreService {
         )
         .unwrap();
     store
+}
+
+/// A store with a queries' pool of its own (what the bounds read and keep draw on), holding
+/// `data` written past the pipeline (no commit builds U1: the first read does).
+fn pooled(data: &str) -> StoreService {
+    let store = StoreService::new(StoreConfig {
+        total_query_memory_bytes: 1 << 30,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
+    store.update_str_ungated(data).unwrap();
+    store
+}
+
+/// Leaves `room` bytes of the store's queries' pool free while the returned charge is held.
+fn squeeze(store: &StoreService, room: usize) -> nrese_exec::Reservation {
+    let pool = store.runtime().query_memory().expect("the queries' pool");
+    let mut hold = nrese_exec::Reservation::new(Arc::new(store.envelope(None).part()));
+    hold.charge(pool.limit() - pool.used() - room).unwrap();
+    hold
+}
+
+/// An existential axiom (U1's route) and `n` members of its class: U1 has about two facts
+/// each.
+fn members(n: usize) -> String {
+    let mut data = String::from(
+        "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+         INSERT DATA { :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ;
+             owl:someValuesFrom :B ] .",
+    );
+    for i in 0..n {
+        data.push_str(&format!(" :a{i} a :A ."));
+    }
+    data.push('}');
+    data
+}
+
+/// A U1 the queries' memory refused is never kept: once memory is free again, the next read of
+/// the same revision builds it (SYN-61).
+#[test]
+fn an_upper_bound_refused_for_memory_is_built_once_memory_is_free() {
+    let store = pooled(&members(2_000));
+    let hold = squeeze(&store, 4096);
+    let refused = report(&store);
+    assert!(
+        refused
+            .unavailable
+            .as_deref()
+            .is_some_and(|why| why.contains("memory")),
+        "{refused:?}"
+    );
+    drop(hold);
+    let after = report(&store);
+    assert_eq!(after.unavailable, None, "{after:?}");
+    assert!(after.upper_facts > 0, "{after:?}");
+}
+
+/// What the bounds keep is charged while kept (SYN-61): the query-ontology cache's ontology
+/// among it, beside U1's stack, so the charge is at least both.
+#[test]
+fn the_cached_ontology_is_charged_with_what_the_bounds_keep() {
+    let mut data = members(1);
+    data.pop();
+    for i in 0..20_000 {
+        data.push_str(&format!(" :a0 :note \"n{i}\" ."));
+    }
+    data.push('}');
+    let store = pooled(&data);
+    let report = report(&store);
+    assert_eq!(report.unavailable, None, "{report:?}");
+    let snapshot = store.engine().snapshot();
+    let ontology = super::super::query::ontology_at(&store, &snapshot).unwrap();
+    let cached = nrese_dl::memory::ontology_bytes(&ontology);
+    let stack = report.upper_facts * 3 * std::mem::size_of::<[u64; 3]>();
+    let kept = store.dl().bounds.kept().used();
+    assert!(
+        kept >= cached + stack,
+        "{kept} bytes kept, the cached ontology {cached}, the stack's keys {stack}"
+    );
+}
+
+/// The query ontology's charge goes with its last holder, not with the cache (SYN-61): a reader
+/// still holding a revision's ontology after the cache moved to the next keeps it charged, so
+/// the budget holds both.
+#[test]
+fn a_cached_ontology_a_reader_holds_stays_charged_after_the_cache_moves_on() {
+    let mut data = members(1);
+    data.pop();
+    for i in 0..5_000 {
+        data.push_str(&format!(" :a0 :note \"n{i}\" ."));
+    }
+    data.push('}');
+    let store = pooled(&data);
+    let first = super::super::query::ontology_at(&store, &store.engine().snapshot()).unwrap();
+    store
+        .update_str_ungated("PREFIX : <urn:test:> INSERT DATA { :a0 :note \"more\" . }")
+        .unwrap();
+    let second = super::super::query::ontology_at(&store, &store.engine().snapshot()).unwrap();
+    let both = nrese_dl::memory::ontology_bytes(&first)
+        + nrese_dl::memory::ontology_bytes(&second);
+    let kept = store.dl().bounds.kept().used();
+    assert!(
+        kept >= both,
+        "{kept} bytes kept while both revisions' ontologies ({both} bytes) are held"
+    );
+}
+
+/// A generation the latest revision has passed is let go, with its charge, before U1 is built
+/// afresh (SYN-61), so the build needs room for itself, not beside it: when the build of the
+/// revision after a write past the pipeline begins, the bounds hold no older generation.
+#[test]
+fn a_superseded_generation_is_let_go_before_a_fresh_build() {
+    let store = Arc::new(pooled(&members(2_000)));
+    let first = report(&store);
+    assert_eq!(first.unavailable, None, "{first:?}");
+    store
+        .update_str_ungated("PREFIX : <urn:test:> INSERT DATA { :extra a :A . }")
+        .unwrap();
+    // The revision of the generation the bounds hold as the build begins.
+    let held = Arc::new(std::sync::Mutex::new(None));
+    let (at, seen) = (Arc::clone(&store), Arc::clone(&held));
+    seam::set(&store.dl().bounds, seam::Point::Build, move || {
+        let generation = lock(&at.dl().bounds.state).as_ref().map(|s| s.revision);
+        *seen.lock().unwrap() = Some(generation);
+    });
+    let after = report(&store);
+    assert_eq!(after.unavailable, None, "{after:?}");
+    assert_eq!(
+        *held.lock().unwrap(),
+        Some(None),
+        "the generation held as the build of revision {} began (None: no build)",
+        after.revision
+    );
+}
+
+/// What is published only moves forward, a generation let go included (U1-P, SYN-61). A read
+/// of a later revision lets the bounds' generation go, and its own U1 is refused for memory,
+/// so nothing replaces it. A build of the older revision that finishes late (with U1
+/// unavailable) then publishes nothing: a commit from that revision would carry it forward
+/// as the later revision's U1.
+#[test]
+fn a_late_build_of_a_revision_a_read_let_go_publishes_nothing() {
+    let store = pooled(&members(200));
+    let first = report(&store);
+    assert_eq!(first.unavailable, None, "{first:?}");
+    store
+        .update_str_ungated("PREFIX : <urn:test:> INSERT DATA { :extra a :A . }")
+        .unwrap();
+    let hold = squeeze(&store, 0);
+    let refused = report(&store);
+    drop(hold);
+    let held = || lock(&store.dl().bounds.state).as_ref().map(|s| s.revision);
+    assert_eq!(
+        held(),
+        None,
+        "the bounds after the refused read: {refused:?}"
+    );
+    // The late build of the first revision, at its publication (a read's, afresh).
+    let state = State {
+        revision: first.revision,
+        upper: Err(not_compiled()),
+        last: "read",
+        compiled: store.dl().bounds.compiled(),
+        taxonomy: None,
+        rules: false,
+    };
+    publish(&mut lock(&store.dl().bounds.state), state);
+    assert_eq!(
+        held(),
+        None,
+        "revision {}'s late build published after revision {} let it go",
+        first.revision,
+        refused.revision
+    );
+}
+
+/// Building a revision's view from a U1 the bounds keep allocates nothing store-scale it
+/// hasn't charged first (SYN-61), the view's copies of U1's facts (24 bytes a fact) among it.
+/// Measured against the bounds' budget (`nrese_exec::measure`, alone): what the build holds
+/// beyond its charges stays well below those copies; left uncharged, they alone would exceed
+/// it. U1 is built and its taxonomy kept before, by a commit and a read; a second commit's
+/// change is U1's delta, so the measured read builds the view only.
+#[test]
+fn a_views_copies_of_the_upper_bound_are_charged_before_they_are_made() {
+    if !nrese_exec::measure::alone() {
+        return;
+    }
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let store = Arc::new(
+        StoreService::new(StoreConfig {
+            total_query_memory_bytes: 1 << 30,
+            ..StoreConfig::in_memory()
+        })
+        .unwrap(),
+    );
+    let pipeline = crate::MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Dl,
+        ))),
+    );
+    let commit = |data: String| {
+        pipeline
+            .apply(
+                crate::MutationCommand::Update(crate::SparqlUpdateRequest::new(data)),
+                &crate::Requester::all(),
+                &crate::MutationTicket::new(),
+            )
+            .unwrap();
+    };
+    // Twenty existentials: twenty facts of U1 a member.
+    let mut data = String::from(
+        "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> INSERT DATA {",
+    );
+    for k in 0..20 {
+        data.push_str(&format!(
+            " :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p{k} ; \
+             owl:someValuesFrom :B ] ."
+        ));
+    }
+    for i in 0..2_000 {
+        data.push_str(&format!(" :a{i} a :A ."));
+    }
+    data.push('}');
+    commit(data);
+    let before = report(&store);
+    assert_eq!(before.unavailable, None, "{before:?}");
+    commit("PREFIX : <urn:test:> INSERT DATA { :extra a :A . }".to_owned());
+    let budget = Arc::clone(store.dl().bounds.kept());
+    let ((), excess) = nrese_exec::measure::measure_within(&budget, || {
+        let _ = view(&store);
+    });
+    let after = report(&store);
+    assert_eq!(after.last, "delta", "{after:?}");
+    let copies = after.upper_facts * std::mem::size_of::<EncodedTriple>();
+    assert!(
+        excess < copies / 2,
+        "{excess} bytes held beyond the charge building the view of {} facts of U1 \
+         ({copies} bytes of copies)",
+        after.upper_facts
+    );
 }
 
 /// What the bounds keep at a revision is charged to their budget while kept (SYN-61): U1's
@@ -95,13 +344,7 @@ fn embedded_low_memory_bounds_are_unavailable_on_every_build_path() {
     );
     assert!(upper_facts(&store, true).is_none(), "fresh diagnostic U1");
     let report = report(&store);
-    // For memory: the watch stopped the evaluation, or (SYN-61) the queries' memory refused
-    // its reading first.
-    let why = report.unavailable.as_deref().unwrap();
-    assert!(
-        why.contains("stopped") || why.contains("memory envelope"),
-        "{why}"
-    );
+    assert!(report.unavailable.as_deref().unwrap().contains("stopped"));
     assert!(upper_facts(&store, false).is_none(), "cached read U1");
     // A distinct store ensures prepare cannot just reuse an unavailable read result.
     let store = self::store(1);
@@ -135,10 +378,9 @@ fn embedded_low_memory_stops_maintenance_of_an_existing_upper_bound() {
     let store = store(1);
     let mut tx = store.engine().speculative();
     source::intern_vocabulary(&tx);
-    let ontology =
-        source::read_snapshot(tx.base(), Arc::new(nrese_exec::Budget::unlimited())).unwrap();
+    let ontology = source::read_snapshot(tx.base(), Arc::clone(store.dl().bounds.kept())).unwrap();
     let normalised = nrese_owl::normalise(&ontology);
-    // Seed the existing U1 without a watch or a charge, as if the process had been below its
+    // Seed the existing U1 without a watch, as if the process had been below its
     // budget at the prior revision. The next preparation must carry its own watch.
     let upper = Upper::build(
         &ontology,
@@ -146,17 +388,20 @@ fn embedded_low_memory_stops_maintenance_of_an_existing_upper_bound() {
         tx.base(),
         &|t| Some(tx.intern(t)),
         nrese_reasoner::eval::NEVER,
-        &Arc::new(nrese_exec::Budget::unlimited()),
+        store.dl().bounds.kept(),
     )
     .unwrap();
-    *store.dl().bounds.state.lock().unwrap() = Some(State {
-        revision: tx.base().revision(),
-        upper: Ok(Arc::new(upper)),
-        last: "read",
-        compiled: store.dl().bounds.compiled(),
-        taxonomy: None,
-        rules: false,
-    });
+    publish(
+        &mut lock(&store.dl().bounds.state),
+        State {
+            revision: tx.base().revision(),
+            upper: Ok(Arc::new(upper)),
+            last: "read",
+            compiled: store.dl().bounds.compiled(),
+            taxonomy: None,
+            rules: false,
+        },
+    );
     let quad = nrese_rdf::Quad::new(
         nrese_rdf::NamedNode::new_unchecked("urn:test:b"),
         nrese_rdf::vocab::rdf::TYPE,
