@@ -1487,9 +1487,17 @@ fn existentials_bounded_restrictions_force_are_answered_or_reported() {
 /// - `C ⊑ ∃R.Self`, `R` with domain `D`, `D ⊓ F ⊑ G`, with `x : C, F`: `x : G`. The chain
 ///   runs through two axioms in the RL profile, which RL's rules apply only to facts the
 ///   closure has.
+/// - Review r1 F1: `C ⊑ {a}` with `c : C`, `a : D`: `c = a`, so `c : D`.
+/// - F2: `C ⊑ ¬¬D` with `c : C`: `c : D`. Neither the TBox nor the closure removes the
+///   double complement.
+/// - F2: `C ⊑ ¬(≥ 2 R)` with `c : C`, `R(c, x)`, `R(c, y)`, `x : D`: `x = y`, so `y : D`.
 ///
-/// Precision guard: `x : Person` and `x : Employed` of the third case, terms of the same
-/// axiom that no uncovered conclusion reaches, stay `complete` under owl2-ql.
+/// Precision guards, each a query whose answers are complete under its regime:
+/// - `x : Person` and `x : Employed` of the third case, terms of the same axiom that no
+///   uncovered conclusion reaches (owl2-ql).
+/// - F3: after `A ⊓ B ⊑ C` and `C ⊑ ∀R.D`, the edges of `R`, which the universal adds none
+///   of (owl2-ql).
+/// - F4: `C ⊑ ∀R.¬{a}` equates nobody, so an unrelated class `Z` stays complete (both).
 #[test]
 fn axioms_outside_the_profile_are_answered_or_reported() {
     let head = format!(
@@ -1530,6 +1538,28 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
             ),
             format!("ASK {{ <{E}x> a <{E}G> }}"),
         ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Class ; owl:oneOf ( :a ) ] .
+                 :c a :C . :a a :D ."
+            ),
+            format!("ASK {{ <{E}c> a <{E}D> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ owl:complementOf [ owl:complementOf :D ] ] .
+                 :c a :C ."
+            ),
+            format!("ASK {{ <{E}c> a <{E}D> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ owl:complementOf [ a owl:Restriction ;
+                     owl:onProperty :R ; owl:minCardinality 2 ] ] .
+                 :c a :C ; :R :x , :y . :x a :D ."
+            ),
+            format!("ASK {{ <{E}y> a <{E}D> }}"),
+        ),
     ];
     let mut wrong = Vec::new();
     for (n, (turtle, query)) in cases.iter().enumerate() {
@@ -1549,19 +1579,52 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
             }
         }
     }
-    // The guard: the premise's terms stay `complete` under owl2-ql.
-    let dir = tempfile::tempdir().unwrap();
-    let store = store(&cases[2].0, dir.path(), Ruleset::Owl2Ql, true);
-    for class in ["Person", "Employed"] {
-        let query = format!("SELECT ?x WHERE {{ ?x a <{E}{class}> }}");
-        let result = store
-            .execute_query(&SparqlQueryRequest::all(query.as_str()))
-            .unwrap();
-        let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
-        if !matches!(status, "complete" | "none") {
-            wrong.push(format!(
-                "guard, owl2-ql, {query}: {status}, expected complete"
-            ));
+    let universal = format!(
+        "{head}[ owl:intersectionOf ( :A :B ) ] rdfs:subClassOf :C .
+         :C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ; owl:allValuesFrom :D ] .
+         :c a :A, :B ; :R :z ."
+    );
+    let not_a = format!(
+        "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+             owl:allValuesFrom [ owl:complementOf [ a owl:Class ; owl:oneOf ( :a ) ] ] ] .
+         :c a :C ; :R :b . :z a :Z ."
+    );
+    let guards = [
+        (
+            &cases[2].0,
+            vec![Ruleset::Owl2Ql],
+            format!("SELECT ?x WHERE {{ ?x a <{E}Person> }}"),
+        ),
+        (
+            &cases[2].0,
+            vec![Ruleset::Owl2Ql],
+            format!("SELECT ?x WHERE {{ ?x a <{E}Employed> }}"),
+        ),
+        (
+            &universal,
+            vec![Ruleset::Owl2Ql],
+            format!("SELECT ?x ?y WHERE {{ ?x <{E}R> ?y }}"),
+        ),
+        (
+            &not_a,
+            vec![Ruleset::Owl2Ql, Ruleset::Owl2Rl],
+            format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}"),
+        ),
+    ];
+    for (turtle, rulesets, query) in guards {
+        for ruleset in rulesets {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(turtle, dir.path(), ruleset, true);
+            let result = store
+                .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                .unwrap();
+            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+            if !matches!(status, "complete" | "none") {
+                wrong.push(format!(
+                    "guard, {}, {query}: {status}, expected complete",
+                    ruleset.name()
+                ));
+            }
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
