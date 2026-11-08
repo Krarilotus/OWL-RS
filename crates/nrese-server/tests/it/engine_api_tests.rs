@@ -1166,9 +1166,9 @@ async fn query_results_are_pinned_listed_and_unpinned() {
 
 /// A change of the default repository's reasoning that fails after publishing its
 /// inferences, and can't restore the old ones either (neither reasoning's state file can be
-/// written: `reasoning.tmp` taken), leaves the default repository unavailable until a
-/// restart: its requests get 503, while the repository list (which says why to operators),
-/// `/readyz` (ready, degraded) and the other repositories go on.
+/// written: its staging name `reasoning.state.tmp` taken), leaves the default repository
+/// unavailable until a restart: its requests get 503, while the repository list (which says why
+/// to operators), `/readyz` (ready, degraded) and the other repositories go on.
 #[tokio::test]
 async fn a_default_repository_left_in_no_known_state_is_unavailable_alone() {
     let dir = tempfile::tempdir().unwrap();
@@ -1190,7 +1190,7 @@ async fn a_default_repository_left_in_no_known_state_is_unavailable_alone() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{text}");
-    std::fs::create_dir(dir.path().join("reasoning.tmp")).unwrap();
+    std::fs::create_dir(dir.path().join("reasoning.state.tmp")).unwrap();
     let (status, text) = send(
         &app,
         Method::PATCH,

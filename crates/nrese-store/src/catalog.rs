@@ -864,7 +864,8 @@ impl Catalog {
             // could bring it back, and the next start would reclaim the new repository. A sync
             // of the directory makes every such unlink durable, else nothing is created.
             // (A new directory holds no tombstone: its first sync is as good.)
-            let synced = std::fs::create_dir_all(root).and_then(|()| crate::metadata::sync(root));
+            let synced = nrese_engine::place::create_dir_all(root)
+                .and_then(|()| crate::metadata::sync(root));
             if let Err(error) = synced {
                 return Err(CatalogError::Store(format!(
                     "{}: {error}; no repository is created until the directory can be synced (a removal's tombstone may not be durably gone)",
@@ -883,7 +884,7 @@ impl Catalog {
                     dir.display()
                 )));
             }
-            std::fs::create_dir_all(&dir)
+            nrese_engine::place::create_dir_all(&dir)
                 .map_err(|error| CatalogError::Store(format!("{}: {error}", dir.display())))?;
             write_settings(&dir.join(SETTINGS_FILE), &settings)?;
         }
