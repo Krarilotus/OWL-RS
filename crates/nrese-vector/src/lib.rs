@@ -7,6 +7,7 @@
 //! dictionary in [`Vectors`] by term id, and the query engine decides which index to ask
 //! and with which filter.
 
+mod charged;
 mod hnsw;
 mod kernels;
 mod literal;
@@ -15,6 +16,8 @@ pub use hnsw::{Hnsw, HnswParameters, HnswParts};
 pub use kernels::{Metric, dot, squared_l2};
 pub use literal::{DATATYPE, NAMESPACE, ParseError, lexical, parse};
 
+use charged::Heap;
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use rayon::prelude::*;
 
 /// Vectors per chunk: appending copies at most the last chunk when a snapshot of the
@@ -172,133 +175,146 @@ pub struct Hit {
 }
 
 /// The `k` vectors of `vectors` nearest to `query` among those `accept` takes (by id),
-/// nearest first: every vector compared, on every core.
-pub fn exact(
+/// nearest first: every vector compared, on every core. What the scan holds (each part's
+/// best, the merged best) is charged to `budget` before it is allocated; a scan the budget
+/// has no room for is refused, with nothing left charged.
+pub fn exact<'b>(
     vectors: &Vectors,
     query: &[f32],
     k: usize,
     metric: Metric,
     accept: &(dyn Fn(u64) -> bool + Sync),
-) -> Vec<Hit> {
-    exact_from(vectors, 0, query, k, metric, accept)
+    budget: &'b Budget,
+) -> Result<ChargedVec<Hit, &'b Budget>, BudgetExceeded> {
+    exact_from(vectors, 0, query, k, metric, accept, budget)
 }
 
 /// [`exact`] over the vectors from position `start` on: the ones a graph doesn't cover
 /// yet.
-pub fn exact_from(
+pub fn exact_from<'b>(
     vectors: &Vectors,
     start: usize,
     query: &[f32],
     k: usize,
     metric: Metric,
     accept: &(dyn Fn(u64) -> bool + Sync),
-) -> Vec<Hit> {
-    if k == 0 {
-        return Vec::new();
-    }
-    scan::<false>(vectors, start, query, k, metric, |_| true, accept).0
-}
-
-/// The `k` vectors nearest to `query` among those `eligible` takes and then `accept`
-/// takes (by id), nearest first, and how many `eligible` took: every vector compared, on
-/// every core. `eligible` decides what the search is over (a reader's visible vectors),
-/// `accept` narrows its hits: `eligible` is asked first, and `accept` only of what it took.
-pub fn exact_eligible(
-    vectors: &Vectors,
-    query: &[f32],
-    k: usize,
-    metric: Metric,
-    eligible: &(dyn Fn(u64) -> bool + Sync),
-    accept: &(dyn Fn(u64) -> bool + Sync),
-) -> (Vec<Hit>, usize) {
-    scan::<true>(vectors, 0, query, k, metric, eligible, accept)
-}
-
-/// The one exact search: the `k` vectors from position `start` on nearest to `query`
-/// among those `eligible` takes and then `accept` takes, nearest first, and (with `COUNT`)
-/// how many `eligible` took. [`exact_from`] is this with every vector eligible and
-/// nothing counted, monomorphised: the global search does no work for the scope.
-fn scan<const COUNT: bool>(
-    vectors: &Vectors,
-    start: usize,
-    query: &[f32],
-    k: usize,
-    metric: Metric,
-    eligible: impl Fn(u64) -> bool + Sync,
-    accept: &(dyn Fn(u64) -> bool + Sync),
-) -> (Vec<Hit>, usize) {
-    if start >= vectors.len() || query.len() != vectors.dimension {
-        return (Vec::new(), 0);
+    budget: &'b Budget,
+) -> Result<ChargedVec<Hit, &'b Budget>, BudgetExceeded> {
+    if k == 0 || start >= vectors.len() || query.len() != vectors.dimension {
+        return Ok(ChargedVec::new(budget));
     }
     let query = Query::new(query);
-    let parts: Vec<(Vec<Hit>, usize)> = (start / CHUNK..vectors.chunks.len())
+    let chunks = start / CHUNK..vectors.chunks.len();
+    type Part<'b> = Result<ChargedVec<Hit, &'b Budget>, BudgetExceeded>;
+    // The parts' list itself: charged, allocated for exactly one entry a part, then filled
+    // by rayon in place (`collect_into_vec` reserves nothing more for room already there;
+    // a plain `collect` would round the allocation up to at least four entries).
+    let mut list = Reservation::new(budget);
+    list.charge(charged::bytes::<Part<'b>>(budget, chunks.len())?)?;
+    let mut parts: Vec<Part<'b>> = Vec::with_capacity(chunks.len());
+    list.resize(charged::bytes::<Part<'b>>(budget, parts.capacity())?)?;
+    chunks
         .into_par_iter()
         .map(|c| {
-            let mut best = TopK::new(k);
-            let mut taken = 0;
+            let mut best = TopK::new(k, budget)?;
             let first = (c * CHUNK).max(start);
+            // The distance a vector must beat, kept beside the loop: most vectors of a
+            // part don't, and are passed by one comparison.
+            let mut bound = best.bound();
             for position in first..((c + 1) * CHUNK).min(vectors.len()) {
                 let position = position as u32;
                 let id = vectors.id(position);
-                if eligible(id) {
-                    if COUNT {
-                        taken += 1;
-                    }
-                    if accept(id) {
-                        best.offer(id, vectors.distance(metric, &query, position));
+                if accept(id) {
+                    let distance = vectors.distance(metric, &query, position);
+                    if bound.is_none_or(|worst| distance < worst) {
+                        best.offer(id, distance)?;
+                        bound = best.bound();
                     }
                 }
             }
-            (best.into_sorted(), taken)
+            best.into_sorted()
         })
-        .collect();
-    let taken = parts.iter().map(|(_, taken)| taken).sum();
-    (
-        merge(parts.into_iter().flat_map(|(hits, _)| hits), k),
-        taken,
-    )
+        .collect_into_vec(&mut parts);
+    let mut best = TopK::new(k, budget)?;
+    let mut refused = None;
+    for part in parts {
+        match part {
+            // Each part's hits are freed as they are offered, then its charge released.
+            Ok(hits) if refused.is_none() => {
+                let (hits, held) = hits.into_parts();
+                for hit in hits {
+                    if let Err(error) = best.offer(hit.id, hit.distance) {
+                        refused = Some(error);
+                        break;
+                    }
+                }
+                drop(held);
+            }
+            Ok(_) => {}
+            Err(error) => refused = refused.or(Some(error)),
+        }
+    }
+    drop(list);
+    match refused {
+        Some(error) => Err(error),
+        None => best.into_sorted(),
+    }
 }
 
-/// The `k` nearest of `hits`, nearest first.
-pub fn merge(hits: impl IntoIterator<Item = Hit>, k: usize) -> Vec<Hit> {
-    let mut best = TopK::new(k);
+/// The `k` nearest of `hits`, nearest first, held as [`exact`] holds its merge.
+pub fn merge(
+    hits: impl IntoIterator<Item = Hit>,
+    k: usize,
+    budget: &Budget,
+) -> Result<ChargedVec<Hit, &Budget>, BudgetExceeded> {
+    let mut best = TopK::new(k, budget)?;
     for hit in hits {
-        best.offer(hit.id, hit.distance);
+        best.offer(hit.id, hit.distance)?;
     }
     best.into_sorted()
 }
 
-/// The `k` best hits offered, kept in a max-heap by distance.
-struct TopK {
+/// The `k` best hits offered, kept in a max-heap by distance, charged to a budget.
+struct TopK<'b> {
     k: usize,
-    heap: std::collections::BinaryHeap<Ordered<u64>>,
+    heap: Heap<'b, Ordered<u64>>,
 }
 
-impl TopK {
-    fn new(k: usize) -> Self {
-        Self {
+impl<'b> TopK<'b> {
+    /// Room for `k` hits up to a chunk's worth, grown past that only by hits offered: a
+    /// part never holds more than its chunk, and a large `k` (a caller widening its
+    /// search towards the whole space) allocates for the hits there are.
+    fn new(k: usize, budget: &'b Budget) -> Result<Self, BudgetExceeded> {
+        Ok(Self {
             k,
-            heap: std::collections::BinaryHeap::with_capacity(k + 1),
+            heap: Heap::with_capacity(budget, k.min(CHUNK) + 1)?,
+        })
+    }
+
+    /// The distance an offer must be below to be kept: none while fewer than `k` are.
+    #[inline]
+    fn bound(&self) -> Option<f32> {
+        match self.heap.len() < self.k {
+            true => None,
+            false => self.heap.peek().map(|worst| worst.0),
         }
     }
 
-    fn offer(&mut self, id: u64, distance: f32) {
+    #[inline]
+    fn offer(&mut self, id: u64, distance: f32) -> Result<(), BudgetExceeded> {
         if self.heap.len() < self.k {
-            self.heap.push(Ordered(distance, id));
+            self.heap.push(Ordered(distance, id))?;
         } else if self.heap.peek().is_some_and(|worst| distance < worst.0) {
             self.heap.pop();
-            self.heap.push(Ordered(distance, id));
+            self.heap.push(Ordered(distance, id))?;
         }
+        Ok(())
     }
 
-    fn into_sorted(self) -> Vec<Hit> {
-        let mut hits: Vec<Hit> = self
-            .heap
-            .into_iter()
-            .map(|Ordered(distance, id)| Hit { id, distance })
-            .collect();
-        hits.sort_by(|a, b| a.distance.total_cmp(&b.distance).then(a.id.cmp(&b.id)));
-        hits
+    /// Nearest first (by distance, then id).
+    fn into_sorted(self) -> Result<ChargedVec<Hit, &'b Budget>, BudgetExceeded> {
+        self.heap
+            .into_sorted(|Ordered(distance, id)| Hit { id, distance })
     }
 }
 
@@ -351,12 +367,13 @@ mod tests {
     /// for every metric.
     #[test]
     fn exact_scans_find_the_nearest() {
+        let unlimited = Budget::unlimited();
         let vectors = random_vectors(40_000, 24, 7);
         let query: Vec<f32> = vectors.get(123).iter().map(|v| v + 0.01).collect();
         for metric in [Metric::Cosine, Metric::Dot, Metric::L2] {
             for odd_only in [false, true] {
                 let accept = |id: u64| !odd_only || id % 2 == 1;
-                let found = exact(&vectors, &query, 10, metric, &accept);
+                let found = exact(&vectors, &query, 10, metric, &accept, &unlimited).unwrap();
                 let q = Query::new(&query);
                 let mut all: Vec<Hit> = (0..vectors.len() as u32)
                     .filter(|&p| accept(vectors.id(p)))
@@ -367,8 +384,159 @@ mod tests {
                     .collect();
                 all.sort_by(|a, b| a.distance.total_cmp(&b.distance).then(a.id.cmp(&b.id)));
                 all.truncate(10);
-                assert_eq!(found, all, "{metric:?}, odd only {odd_only}");
+                assert_eq!(*found, all, "{metric:?}, odd only {odd_only}");
             }
+        }
+    }
+
+    /// A `k` past the vectors (a caller widening its search towards the whole space)
+    /// returns every accepted vector, nearest first, from the scan and from the merge:
+    /// the heaps hold the hits there are, not room for `k`.
+    #[test]
+    fn a_k_past_the_vectors_returns_them_all() {
+        let unlimited = Budget::unlimited();
+        let vectors = random_vectors(CHUNK + 7, 3, 7);
+        let query = vectors.get(0);
+        let truth = exact(
+            &vectors,
+            query,
+            vectors.len(),
+            Metric::L2,
+            &|_| true,
+            &unlimited,
+        )
+        .unwrap()
+        .to_vec();
+        assert_eq!(truth.len(), CHUNK + 7);
+        for k in [usize::MAX / 2, usize::MAX] {
+            assert_eq!(
+                exact(&vectors, query, k, Metric::L2, &|_| true, &unlimited)
+                    .unwrap()
+                    .to_vec(),
+                truth,
+                "{k}"
+            );
+            assert_eq!(
+                merge(truth.iter().rev().copied(), k, &unlimited)
+                    .unwrap()
+                    .to_vec(),
+                truth,
+                "{k}"
+            );
+        }
+    }
+
+    /// A scan and a merge under a budget with no room for their heaps are refused, and
+    /// leave nothing charged; dropped, what they answered releases its charge; with room
+    /// for twice what one held at its peak (the parts' order varies), they answer as
+    /// unlimited.
+    #[test]
+    fn scans_and_merges_charge_what_they_hold_and_release_it() {
+        let vectors = random_vectors(3 * CHUNK + 5, 4, 11);
+        let query = vectors.get(17).to_vec();
+        for k in [1, 10, CHUNK, 4 * CHUNK] {
+            let unlimited = Budget::unlimited();
+            let truth = exact(&vectors, &query, k, Metric::L2, &|_| true, &unlimited)
+                .unwrap()
+                .to_vec();
+            assert_eq!(unlimited.used(), 0, "k {k}: released when dropped");
+            assert!(
+                unlimited.peak() >= truth.len() * size_of::<Hit>(),
+                "k {k}: charged"
+            );
+            let tight = Budget::new(1);
+            assert!(exact(&vectors, &query, k, Metric::L2, &|_| true, &tight).is_err());
+            assert_eq!(tight.used(), 0, "k {k}: a refused scan holds nothing");
+            assert!(merge(truth.iter().copied(), k, &tight).is_err());
+            assert_eq!(tight.used(), 0, "k {k}: a refused merge holds nothing");
+            let room = Budget::new(unlimited.peak() * 2);
+            let found = exact(&vectors, &query, k, Metric::L2, &|_| true, &room).unwrap();
+            assert_eq!(*found, truth, "k {k}");
+            drop(found);
+            assert_eq!(room.used(), 0);
+        }
+    }
+
+    /// Under every budget from none to what it held at its peak, a scan of several parts
+    /// either answers as unlimited or is refused (some parts refused while others finished),
+    /// and holds nothing afterwards either way (review fix check, S2). On one worker, so
+    /// that the peak of the unlimited run is the peak of every run; the peak itself is one
+    /// of the limits, so one run answers.
+    #[test]
+    fn scans_refused_partway_release_everything() {
+        let vectors = random_vectors(3 * CHUNK + 5, 4, 13);
+        let query = vectors.get(3).to_vec();
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        one.install(|| {
+            let unlimited = Budget::unlimited();
+            let truth = exact(&vectors, &query, CHUNK, Metric::L2, &|_| true, &unlimited)
+                .unwrap()
+                .to_vec();
+            let peak = unlimited.peak();
+            let (mut answered, mut refused) = (0, 0);
+            let limits = (0..peak).step_by((peak / 64).max(1)).chain([peak]);
+            for limit in limits {
+                let budget = Budget::new(limit);
+                match exact(&vectors, &query, CHUNK, Metric::L2, &|_| true, &budget) {
+                    Ok(found) => {
+                        assert_eq!(*found, truth, "limit {limit}");
+                        answered += 1;
+                    }
+                    Err(_) => refused += 1,
+                }
+                assert_eq!(budget.used(), 0, "limit {limit}: released");
+            }
+            assert!(
+                answered > 0 && refused > 0,
+                "{answered} answered, {refused} refused"
+            );
+        });
+    }
+
+    /// The hits come nearest first and, at equal distances, smallest id first, from the
+    /// scan and from the merge, however the parts and the scan's bound met them. Specified
+    /// by `exact`'s order: nearest first, then by id. `k` takes whole groups of equal
+    /// distances here: which of a group a `k` cutting through it keeps is the order the scan
+    /// meets them, as before the bound (the first met stays, an equal one doesn't enter).
+    #[test]
+    fn equal_distances_come_in_id_order() {
+        // Three distances, each held by many vectors spread over three parts.
+        let mut vectors = Vectors::new(2);
+        for i in 0..3 * CHUNK as u64 + 11 {
+            let value = (i % 3) as f32;
+            vectors.push(1_000_000 - i * 7, &[value, 0.0]);
+        }
+        let groups: Vec<usize> = (0..3)
+            .map(|g| (0..vectors.len()).filter(|i| i % 3 == g).count())
+            .collect();
+        let unlimited = Budget::unlimited();
+        let ks = [
+            groups[0],
+            groups[0] + groups[1],
+            vectors.len(),
+            vectors.len() + 5,
+        ];
+        for k in ks {
+            let found = exact(&vectors, &[0.0, 0.0], k, Metric::L2, &|_| true, &unlimited)
+                .unwrap()
+                .to_vec();
+            let query = Query::new(&[0.0, 0.0]);
+            let mut all: Vec<Hit> = (0..vectors.len() as u32)
+                .map(|p| Hit {
+                    id: vectors.id(p),
+                    distance: vectors.distance(Metric::L2, &query, p),
+                })
+                .collect();
+            all.sort_by(|a, b| a.distance.total_cmp(&b.distance).then(a.id.cmp(&b.id)));
+            all.truncate(k);
+            assert_eq!(found, all, "k {k}");
+            let merged = merge(all.iter().rev().copied(), k, &unlimited)
+                .unwrap()
+                .to_vec();
+            assert_eq!(merged, all, "k {k}: merge");
         }
     }
 }

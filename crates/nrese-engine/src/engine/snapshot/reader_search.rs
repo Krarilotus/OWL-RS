@@ -187,16 +187,16 @@ impl Snapshot {
     /// `query.vector` first (ties by id), with how the search went. Every one of them is
     /// compared (exact, whatever `query.strategy` asks): no vector outside them (another
     /// version's, an open transaction's, a deleted one, one in a graph outside the scope)
-    /// changes the answer or the report. Building the corpus is charged to `budget` as
-    /// [`Self::text_search_in`]'s is.
-    pub fn vector_search_in(
+    /// changes the answer or the report. Building the corpus, the scan and the hits are
+    /// charged to `budget` before they are allocated, as [`Snapshot::vector_search`]'s are.
+    pub fn vector_search_in<'b>(
         &self,
         model: ReadModel,
         scope: &TextScope,
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
-        budget: Option<&Arc<nrese_exec::Budget>>,
-    ) -> Result<(Vec<(TermId, f32)>, crate::VectorSearchReport), nrese_exec::BudgetExceeded> {
+        budget: &'b Arc<nrese_exec::Budget>,
+    ) -> Result<super::VectorHits<'b>, nrese_exec::BudgetExceeded> {
         // The space first: no vector of the query's dimension, nothing found and nothing
         // reported, before a corpus is admitted (attack list item 7; sol-loop r1 S3).
         let Some(input) = self.dictionary.vector_input(query) else {
@@ -205,10 +205,9 @@ impl Snapshot {
                 graph: false,
                 scanned: 0,
             };
-            return Ok((Vec::new(), none));
+            return Ok((nrese_exec::ChargedVec::new(&**budget), none));
         };
-        let request = request_budget(budget);
-        let corpus = self.text_corpus(Documents::Vectors, model, scope, &request)?;
+        let corpus = self.text_corpus(Documents::Vectors, model, scope, budget)?;
         // The corpus decides what the search is over and reports; `accept` narrows its hits.
         let known = self.version.dictionary_len;
         let eligible = |raw: u64| {
@@ -217,12 +216,18 @@ impl Snapshot {
         };
         let accept = |raw: u64| accept(TermId::from_raw(raw));
         let (hits, report) =
-            crate::term::vectors::search_eligible(Some(input), query, &eligible, &accept);
-        let hits = hits
-            .into_iter()
-            .map(|hit| (TermId::from_raw(hit.id), hit.distance))
-            .collect();
-        Ok((hits, report))
+            crate::term::vectors::search_eligible(Some(input), query, &eligible, &accept, budget)?;
+        // As the global search hands them over: the ids typed, the raw hits freed first.
+        let len = hits.len();
+        let (hits, held) = hits.into_parts();
+        let found = nrese_exec::ChargedVec::collect(
+            &**budget,
+            len,
+            hits.into_iter()
+                .map(|hit| (TermId::from_raw(hit.id), hit.distance)),
+        );
+        drop(held);
+        Ok((found?, report))
     }
 
     /// The corpora this snapshot's engine keeps, and how many were built by a walk or

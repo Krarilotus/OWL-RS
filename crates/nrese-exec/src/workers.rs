@@ -187,6 +187,77 @@ impl Workers {
     }
 }
 
+/// Test support for the guards against a lock held across parallel work: runs `holder` on a
+/// thread of a pool of two while jobs of that pool,
+/// fed from outside, keep coming. Each fed job that runs on the holder's thread before
+/// `holder` returns asks `free` whether the lock is free (taking it and letting go at once,
+/// never waiting). Returns whether every one found it free.
+///
+/// Such a job runs there only while the holder waits in a Rayon wait (the thread takes on
+/// its pool's jobs meanwhile). Where the holder holds the lock then, a job that wanted it
+/// would wait there with the holder under it: both for good. The check finds that shape
+/// without waiting for it. With the lock let go before the parallel work, or the work run on
+/// threads of no pool that the holder joins, no fed job finds it held.
+#[doc(hidden)]
+pub fn contended(
+    holder: impl FnOnce() + Send,
+    free: impl Fn() -> bool + Send + Sync + 'static,
+) -> bool {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    thread_local! {
+        static HOLDING: Cell<bool> = const { Cell::new(false) };
+    }
+    let pool = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .thread_name(|i| format!("contended-{i}"))
+            .build()
+            .expect("a pool of two threads"),
+    );
+    let free = Arc::new(free);
+    let stop = Arc::new(AtomicBool::new(false));
+    let held = Arc::new(AtomicBool::new(false));
+    let outstanding = Arc::new(AtomicUsize::new(0));
+    // From outside the pool: the jobs wait in its queue of injected jobs, which a thread in a
+    // Rayon wait turns to when it finds no part of its own work to take.
+    let feeder = {
+        let (pool, free, stop) = (Arc::clone(&pool), Arc::clone(&free), Arc::clone(&stop));
+        let (held, outstanding) = (Arc::clone(&held), Arc::clone(&outstanding));
+        std::thread::spawn(move || {
+            while !stop.load(SeqCst) {
+                if outstanding.load(SeqCst) >= 2 {
+                    std::thread::yield_now();
+                    continue;
+                }
+                outstanding.fetch_add(1, SeqCst);
+                let (free, held, outstanding) = (
+                    Arc::clone(&free),
+                    Arc::clone(&held),
+                    Arc::clone(&outstanding),
+                );
+                pool.spawn(move || {
+                    if HOLDING.with(Cell::get) && !free() {
+                        held.store(true, SeqCst);
+                    }
+                    outstanding.fetch_sub(1, SeqCst);
+                });
+            }
+        })
+    };
+    pool.install(|| {
+        HOLDING.with(|h| h.set(true));
+        holder();
+        HOLDING.with(|h| h.set(false));
+    });
+    stop.store(true, SeqCst);
+    feeder.join().expect("the feeder");
+    while outstanding.load(SeqCst) > 0 {
+        std::thread::yield_now();
+    }
+    !held.load(SeqCst)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

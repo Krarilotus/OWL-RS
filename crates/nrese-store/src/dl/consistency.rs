@@ -9,33 +9,9 @@ use nrese_dl::tableau;
 use nrese_exec::workers::Workers;
 use nrese_owl::Ontology;
 
-/// What a consistency check found.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Verdict {
-    Consistent,
-    Inconsistent,
-    /// Not decided: a budget ran out, the engines lack something the ontology needs, or
-    /// the check is off. Answers can't be certain then.
-    Unknown(String),
-}
-
-impl Verdict {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Consistent => "consistent",
-            Self::Inconsistent => "inconsistent",
-            Self::Unknown(_) => "unknown",
-        }
-    }
-
-    /// Why it isn't decided, if it isn't.
-    pub fn reason(&self) -> Option<&str> {
-        match self {
-            Self::Unknown(why) => Some(why),
-            _ => None,
-        }
-    }
-}
+/// What a consistency check found: the DL engines' one verdict, which classification
+/// states too.
+pub use nrese_dl::verdict::Verdict;
 
 /// A check's verdict, which engine gave it and what it cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +141,18 @@ fn verdict(answer: tableau::Answer) -> Verdict {
 }
 
 fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
+    check_using(ontology, budget, normalisation())
+}
+
+fn normalisation() -> nrese_owl::Options {
+    // This check consumes only the verdict, never clause proofs or justifications.
+    nrese_owl::Options {
+        exact_provenance: false,
+        ..nrese_owl::Options::default()
+    }
+}
+
+fn check_using(ontology: &Ontology, budget: &Budget, normalise: nrese_owl::Options) -> Checked {
     let started = Instant::now();
     let deadline = Deadline::after(budget.timeout);
     if budget.spent() {
@@ -177,6 +165,7 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
     let options = nrese_dl::context::Options {
         threads: budget.workers.width(),
         proofs: false,
+        normalise,
         budget: nrese_dl::context::Budget {
             deadline: deadline.instant(),
             max_join: budget.max_join,
@@ -226,6 +215,7 @@ fn check_read(ontology: &Ontology, budget: &Budget) -> Checked {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nrese_owl::{Axiom, ClassExpr, ExprId};
 
     fn budget() -> Budget {
         Budget {
@@ -240,6 +230,106 @@ mod tests {
             max_join: None,
             explanation_tests: None,
         }
+    }
+
+    fn shared_name() -> Ontology {
+        let mut ontology = Ontology::default();
+        let a = ExprId(ontology.classes.intern(ClassExpr::Class(1)));
+        let b = ExprId(ontology.classes.intern(ClassExpr::Class(2)));
+        let both = ExprId(ontology.classes.intern(ClassExpr::And(vec![a, b])));
+        for individual in 100..132 {
+            ontology
+                .axioms
+                .push(Axiom::ClassAssertion(both, individual));
+            ontology.sources.push(Vec::new());
+        }
+        ontology
+    }
+
+    // R1: verdict-only normalisation retains one definition source per shared name,
+    // while exact normalisation still supports every axiom that uses that name.
+    #[test]
+    fn consistency_normalisation_saves_shared_name_source_sets() {
+        let ontology = shared_name();
+        let sets = |options| {
+            nrese_owl::normalise_with(&ontology, options)
+                .clauses
+                .iter()
+                .map(|clause| clause.sources.len())
+                .sum::<usize>()
+        };
+        let exact = sets(nrese_owl::Options::default());
+        let consistency = sets(normalisation());
+        eprintln!("shared-name source sets: exact={exact}, consistency={consistency}");
+        assert_eq!(
+            exact, 64,
+            "32 source alternatives on each of two definitions"
+        );
+        assert_eq!(consistency, 2, "one source set on each definition suffices");
+    }
+
+    // R1 guards: exact and verdict-only normalisation decide the same ontology;
+    // deterministic limits stay undecided, including the non-Horn fallback path.
+    #[test]
+    fn consistency_normalisation_preserves_every_verdict() {
+        let consistent = shared_name();
+        let mut inconsistent = consistent.clone();
+        let nothing = ExprId(inconsistent.classes.intern(ClassExpr::Nothing));
+        inconsistent
+            .axioms
+            .push(Axiom::ClassAssertion(nothing, 100));
+        inconsistent.sources.push(Vec::new());
+        let mut nonhorn = Ontology::default();
+        let a = ExprId(nonhorn.classes.intern(ClassExpr::Class(1)));
+        let b = ExprId(nonhorn.classes.intern(ClassExpr::Class(2)));
+        let either = ExprId(nonhorn.classes.intern(ClassExpr::Or(vec![a, b])));
+        nonhorn.axioms.push(Axiom::ClassAssertion(either, 100));
+        nonhorn.sources.push(Vec::new());
+        let mut clash = nonhorn.clone();
+        clash.axioms.push(Axiom::DisjointClasses(vec![a, b]));
+        clash.axioms.push(Axiom::ClassAssertion(a, 100));
+        clash.axioms.push(Axiom::ClassAssertion(b, 100));
+        clash.sources.resize(clash.axioms.len(), Vec::new());
+        let nodes = Budget {
+            max_nodes: Some(0),
+            ..budget()
+        };
+        let expired = Budget {
+            timeout: Some(Duration::ZERO),
+            ..budget()
+        };
+        let cancel = tableau::Cancel::default();
+        cancel.cancel();
+        let cancelled = Budget {
+            cancel: Some(cancel),
+            ..budget()
+        };
+        let rows = [
+            ("empty", Ontology::default(), budget(), "consistent"),
+            ("shared name", consistent.clone(), budget(), "consistent"),
+            ("contradiction", inconsistent, budget(), "inconsistent"),
+            ("tableau", nonhorn.clone(), budget(), "consistent"),
+            ("tableau contradiction", clash, budget(), "inconsistent"),
+            ("zero nodes", nonhorn, nodes, "unknown"),
+            ("zero time", consistent.clone(), expired, "unknown"),
+            ("cancelled", consistent, cancelled, "unknown"),
+        ];
+        let mut wrong = Vec::new();
+        for (name, ontology, budget, expected) in rows {
+            let exact = check_using(&ontology, &budget, nrese_owl::Options::default());
+            let actual = check(&ontology, &budget);
+            eprintln!(
+                "guard {name}: exact={:?}, consistency={:?} ({})",
+                exact.verdict, actual.verdict, actual.engine
+            );
+            if exact.verdict.as_str() != expected || actual.verdict != exact.verdict {
+                wrong.push(format!(
+                    "{name}: expected {expected}, exact={:?}, consistency={:?}",
+                    exact.verdict, actual.verdict
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     #[test]
