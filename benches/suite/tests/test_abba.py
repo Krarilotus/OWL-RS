@@ -332,7 +332,7 @@ systems = []
                     if name == "unsized":
                         with self.assertRaises(abba.Invalid) as refused:
                             abba.jobs(self.load(), harness, repo.as_posix())
-                        self.assertIn("MAKER_CONTAINERS", "\n".join(refused.exception.args[0]))
+                        self.assertIn("container", "\n".join(refused.exception.args[0]))
                         continue
                     job = next(iter(abba.jobs(self.load(), harness, repo.as_posix()).values()))
                     blocks = max(12, *(c["cap_gb"] for c in self.load()["cases"]))
