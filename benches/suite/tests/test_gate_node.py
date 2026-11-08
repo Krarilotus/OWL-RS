@@ -92,13 +92,32 @@ class GateNode(unittest.TestCase):
                          newline="\n")
         return tools
 
-    def gate_node(self, tools: Path):
+    def gate_node(self, tools: Path, script: str = 'gate_node "$@"', path: str = ""):
         return subprocess.run(
-            [BASH, "-c", '. scripts/lib/gate-node.sh && gate_node "$@"', "-", self.cache.as_posix(), tools.as_posix()],
+            [BASH, "-c", f'. scripts/lib/gate-node.sh && {script}', "-", self.cache.as_posix(), tools.as_posix()],
             cwd=ROOT, capture_output=True, text=True, timeout=60,
-            env=isolation.inherit(*LEAKS, PATH=self.path, SEEN=self.seen.as_posix(), DIST=self.dist.as_posix(),
-                                  BASE="https://dist.example", NRESE_NODE_DIST="https://dist.example",
-                                  PYTHON=sys.executable, NRESE_PYTHON=sys.executable))
+            env=isolation.inherit(*LEAKS, PATH=f"{path}{os.pathsep if path else ''}{self.path}", SEEN=self.seen.as_posix(),
+                                  DIST=self.dist.as_posix(), BASE="https://dist.example",
+                                  NRESE_NODE_DIST="https://dist.example", PYTHON=sys.executable,
+                                  NRESE_PYTHON=sys.executable))
+
+    def seed(self, sha: str, provenance: bool, npx_usable: bool = True) -> Path:
+        """An entry from before with the pinned version's node and npm: with its provenance (the record
+        gate_node_unpack writes) or without (made before it, or by another archive), and an npx that runs or
+        one that is a directory."""
+        entry = self.cache / f"node-{VERSION}-{sha[:12]}"
+        bin_dir = entry / "bin" if self.platform == "linux-x64" else entry
+        bin_dir.mkdir(parents=True)
+        for tool, body in {"node": node_script(VERSION), "npm": b"#!/bin/sh\necho 10.9.9\n",
+                           "npx": b"#!/bin/sh\necho 10.9.9\n"}.items():
+            if tool == "npx" and not npx_usable:
+                (bin_dir / tool).mkdir()
+                continue
+            (bin_dir / tool).write_bytes(body)
+            (bin_dir / tool).chmod(0o755)
+        if provenance:
+            (entry / ".provenance").write_text(f"sha256 {sha} {self.name}\n", newline="\n")
+        return bin_dir
 
     def entries(self):
         return sorted(p.name for p in self.cache.iterdir()) if self.cache.exists() else []
@@ -165,6 +184,45 @@ class GateNode(unittest.TestCase):
                 self.assertEqual(self.seen.read_text().count("dist.example"), 1,
                                  f"SPEC gate-node: an entry without its {missing} is fetched again")
                 self.assertTrue((bin_dir / missing).exists(), f"SPEC gate-node: and has its {missing} then")
+
+    def test_an_entry_is_reused_only_as_the_build_it_records(self):
+        # Review r1 F2: reuse checked a version string, never the build: an entry of the pinned version
+        # with another payload and no record of the archive it came from was taken.
+        good = self.publish(VERSION)
+        tools = self.pin(good)
+        self.seed(good, provenance=False)
+        done = self.gate_node(tools)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.fetches(), 1, "SPEC gate-node: an entry without its build's record is made again")
+        entry = self.cache / f"node-{VERSION}-{good[:12]}"
+        self.assertIn(good, (entry / ".provenance").read_text(), "SPEC gate-node: and records the verified sha256")
+        # One with its record is taken as it is: no fetch.
+        done = self.gate_node(tools)
+        self.assertEqual((done.returncode, self.fetches()), (0, 1), done.stderr)
+
+    def fetches(self) -> int:
+        return self.seen.read_text().count("dist.example") if self.seen.exists() else 0
+
+    def test_an_unusable_npx_never_lets_the_hosts_run(self):
+        # Review r1 F1: npx was checked by existence alone; one that is a directory passed, and the console
+        # step's bare `npx` reached the host's (on Windows, with the host's own node).
+        good = self.publish(VERSION)
+        tools = self.pin(good)
+        self.seed(good, provenance=True, npx_usable=False)
+        host = self.root / "host-bin"
+        host.mkdir()
+        marker = self.root / "host-npx-ran"
+        (host / "npx").write_text(f'#!/bin/sh\n: > "{marker.as_posix()}"\necho HOST-NPX\n', newline="\n")
+        (host / "npx").chmod(0o755)
+        # As the gate jobs and the console step run it: the cache in Git Bash's form on Windows
+        # (windows-job.sh's cygpath -u: a `C:` in PATH splits at its colon), the entry first on PATH,
+        # then a bare npx.
+        done = self.gate_node(tools, 'c=$(cygpath -u "$1" 2> /dev/null || printf "%s" "$1"); '
+                                     'bin=$(gate_node "$c" "$2") && PATH="$bin:$PATH" && npx --version',
+                              path=host.as_posix())
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse(marker.exists(), f"SPEC gate-node: the host's npx ran\n{done.stdout}{done.stderr}")
+        self.assertEqual(done.stdout.strip(), "10.9.9", "SPEC gate-node: the pinned build's npx ran")
 
     def test_a_build_reporting_another_version_is_refused(self):
         sha = self.publish("1.0.0")  # the archive's sha256 is pinned, yet its node isn't VERSION
