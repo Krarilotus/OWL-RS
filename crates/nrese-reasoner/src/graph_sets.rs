@@ -1404,15 +1404,17 @@ fn merge_found(
 /// r5 S1). Fields drop in order: the sets before their charge.
 struct Held<'a> {
     annotation: Annotation,
-    _charge: Reservation<&'a Budget>,
+    /// `None` where nothing is charged: a zero-byte reservation's drop still runs the
+    /// budget's atomics, once per derivation on the inline path (sol-loop r11 S1).
+    _charge: Option<Reservation<&'a Budget>>,
 }
 
 impl<'a> Held<'a> {
     /// `annotation`, with nothing more charged for it (sets held inline, or nothing).
-    fn uncharged(annotation: Annotation, run: &Run<'a>) -> Self {
+    fn uncharged(annotation: Annotation, _run: &Run<'a>) -> Self {
         Self {
             annotation,
-            _charge: Reservation::new(&**run.scratch),
+            _charge: None,
         }
     }
 }
@@ -1477,7 +1479,7 @@ impl<'a> Charged<'a> {
         charge.resize(slots(out.sets.capacity()) + words(&out.sets))?;
         Ok(Held {
             annotation: out,
-            _charge: charge,
+            _charge: Some(charge),
         })
     }
 }
@@ -1488,36 +1490,45 @@ impl<'a> Charged<'a> {
 struct ChargedSet<'a> {
     /// Before `charge`: fields drop in order.
     set: GraphSet,
-    charge: Reservation<&'a Budget>,
+    /// `None` until something is charged: an inline set costs no budget call at all.
+    charge: Option<Reservation<&'a Budget>>,
+    budget: &'a Budget,
 }
 
 impl<'a> ChargedSet<'a> {
     /// A copy of `set`, its words charged first.
     fn copy(set: &GraphSet, budget: &'a Budget) -> Result<Self, BudgetExceeded> {
-        let mut charge = Reservation::new(budget);
-        let bytes = set.heap_bytes();
+        let mut copy = Self {
+            set: GraphSet::default(),
+            charge: None,
+            budget,
+        };
+        copy.charge(set.heap_bytes())?;
+        copy.set = set.clone();
+        Ok(copy)
+    }
+
+    /// `bytes` more charged, where there are any.
+    fn charge(&mut self, bytes: usize) -> Result<(), BudgetExceeded> {
         if bytes > 0 {
-            charge.charge(bytes)?;
+            let budget = self.budget;
+            self.charge
+                .get_or_insert_with(|| Reservation::new(budget))
+                .charge(bytes)?;
         }
-        Ok(Self {
-            set: set.clone(),
-            charge,
-        })
+        Ok(())
     }
 
     /// Becomes its union with `other`: the union's words (at most the longer operand's)
     /// charged before it is made, the old set's released after it is freed.
     fn union_with(&mut self, other: &GraphSet) -> Result<(), BudgetExceeded> {
-        let bytes = self.set.heap_bytes().max(other.heap_bytes());
-        if bytes > 0 {
-            self.charge.charge(bytes)?;
-        }
+        self.charge(self.set.heap_bytes().max(other.heap_bytes()))?;
         let next = self.set.union(other);
         let old = std::mem::replace(&mut self.set, next);
         let freed = old.heap_bytes();
         drop(old);
-        if freed > 0 {
-            self.charge.release(freed);
+        if let Some(charge) = &mut self.charge {
+            charge.release(freed);
         }
         Ok(())
     }
@@ -1525,11 +1536,15 @@ impl<'a> ChargedSet<'a> {
     /// The set as a one-set annotation: where it holds words, its list's slot is charged
     /// too before the list is made.
     fn into_held(mut self, truncated: bool) -> Result<Held<'a>, BudgetExceeded> {
-        if self.charge.bytes() > 0 {
+        if self
+            .charge
+            .as_ref()
+            .is_some_and(|charge| charge.bytes() > 0)
+        {
             // Refused here, `self` drops whole: the set before its charge.
-            self.charge.charge(slots(1))?;
+            self.charge(slots(1))?;
         }
-        let Self { set, charge } = self;
+        let Self { set, charge, .. } = self;
         Ok(Held {
             annotation: Annotation {
                 sets: vec![set],
@@ -1572,7 +1587,8 @@ impl<'a> Gathered<'a> {
                 .into_iter()
                 .for_each(|set| room.push(set))
         })?;
-        let mut words_part = Reservation::adopt(self.budget, held._charge.transfer());
+        let mut words_part =
+            Reservation::adopt(self.budget, held._charge.map_or(0, Reservation::transfer));
         words_part.resize(moved_words)?;
         let mine = std::mem::replace(&mut self.words, Reservation::new(self.budget));
         self.words = Reservation::adopt(self.budget, mine.transfer() + words_part.transfer());
@@ -1750,7 +1766,7 @@ fn premise_sets_from<'a, L: Lookup + ?Sized>(
 ) -> Result<Held<'a>, BudgetExceeded> {
     // The usual case, one set everywhere: a single union, nothing to minimise. Its copies
     // charged before they are made (review r2 C1.a); held inline, nothing is charged, so a
-    // derivation costs no shared atomic.
+    // derivation makes no budget call.
     if let [only] = start.sets.as_slice() {
         let mut one = ChargedSet::copy(only, run.scratch)?;
         let mut truncated = start.truncated;
@@ -1784,7 +1800,7 @@ fn premise_sets_from<'a, L: Lookup + ?Sized>(
                 truncated: start.truncated,
                 beyond_own: start.beyond_own,
             },
-            _charge: copy.charge,
+            _charge: Some(copy.charge),
         }
     };
     for premise in body {
@@ -1910,7 +1926,7 @@ mod tests {
         use crate::batch::Store;
         use crate::ir::{Rule, Term, Triple, parse_rules};
         use crate::vocabulary::LocalVocabulary;
-        use nrese_exec::{Budget, Reservation, measure};
+        use nrese_exec::{Budget, measure};
         use std::sync::Arc;
         if !measure::alone() {
             return;
@@ -1951,7 +1967,7 @@ mod tests {
                             .collect(),
                         ..Annotation::default()
                     },
-                    _charge: Reservation::new(&*budget),
+                    _charge: None,
                 })
                 .collect();
             let (live, excess) = measure::measure_within(&budget, || {
