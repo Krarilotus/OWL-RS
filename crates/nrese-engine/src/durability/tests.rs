@@ -958,6 +958,78 @@ fn a_directory_sync_is_real() {
     super::sync_dir(dir.path()).unwrap();
 }
 
+/// The directories an open creates for its store are durably named before it takes commits
+/// (review r1, R1-F2): each new one's entry in the directory holding it is synced, so a power
+/// loss can't take the store's name with every commit acknowledged in it. Here the sync of
+/// that holding directory fails (`fault::FAIL_DIR_SYNC_OF`), and the open must refuse. Before
+/// the fix only the store's own directory was synced, so it opened. Rows, judged apart:
+/// - two missing levels, the sync of the existing directory above them failing;
+/// - one missing level, the same;
+/// - a relative single directory, the sync of `.` failing (made in the working directory,
+///   removed after);
+/// - guards: an existing store directory opens though its parent's sync fails (nothing new is
+///   named there), and two missing levels open with every sync working.
+#[test]
+fn an_open_names_every_directory_it_creates() {
+    let base = tempfile::tempdir().unwrap();
+    let relative = std::path::PathBuf::from(format!("dur3-relative-{}", std::process::id()));
+    // (row, store directory, the directory whose sync fails, whether it must open)
+    type Row<'a> = (
+        &'a str,
+        std::path::PathBuf,
+        Option<std::path::PathBuf>,
+        bool,
+    );
+    let rows: [Row; 5] = [
+        (
+            "two missing levels",
+            base.path().join("a").join("b"),
+            Some(base.path().to_path_buf()),
+            false,
+        ),
+        (
+            "one missing level",
+            base.path().join("c"),
+            Some(base.path().to_path_buf()),
+            false,
+        ),
+        (
+            "a relative single directory",
+            relative.clone(),
+            Some(std::path::PathBuf::from(".")),
+            false,
+        ),
+        (
+            "an existing directory (guard)",
+            base.path().to_path_buf(),
+            base.path().parent().map(std::path::Path::to_path_buf),
+            true,
+        ),
+        (
+            "two missing levels, every sync working (guard)",
+            base.path().join("d").join("e"),
+            None,
+            true,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (row, dir, failing, opens) in rows {
+        fault::FAIL_DIR_SYNC_OF.set(failing);
+        let opened = Engine::open(&dir, config()).map(|engine| commit(&engine, 0).map(drop));
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        let ok = match opens {
+            true => matches!(opened, Ok(Ok(()))),
+            false => opened.is_err(),
+        };
+        eprintln!("row {row}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            failures.push(format!("{row}: {:?}", opened.map(|_| "opened")));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&relative);
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
 /// What an open replayed is durable before it takes new commits (F5): the segments it
 /// replayed records from are synced. Before the fix nothing was, so under `OsBuffered` (or an
 /// `EveryCommit` record written but not synced when the process died) a power loss after the
