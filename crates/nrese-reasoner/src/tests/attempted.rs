@@ -114,9 +114,11 @@ fn empty_support_searches_count_towards_the_stop() {
     let source = Asked::new(closure.clone());
     let asserted = |f: Triple| closure.binary_search(&f).is_ok();
     let stop = || source.cancel.load(Ordering::Relaxed);
+    let scratch = std::sync::Arc::new(nrese_exec::Budget::unlimited());
     let limits = Limits {
         watch: UNWATCHED,
         stop: &stop,
+        scratch: &scratch,
     };
     let result = rederived(
         &source,
@@ -313,9 +315,11 @@ fn each_premise_alternative_counts_towards_the_stop() {
         limit: usize::MAX,
     };
     let stop = || asked.load(Ordering::Relaxed) >= 1;
+    let scratch = std::sync::Arc::new(nrese_exec::Budget::unlimited());
     let limits = Limits {
         watch: UNWATCHED,
         stop: &stop,
+        scratch: &scratch,
     };
     let result = update_support_sets(&change, &ground, &[], &|_| vec![0], 1, limits);
     assert_eq!(result.err(), Some(Stopped::Cancelled));
@@ -377,9 +381,11 @@ fn a_support_update_s_first_pass_counts_each_fact() {
         limit: usize::MAX,
     };
     let stop = || asked.load(Ordering::Relaxed) >= 1;
+    let scratch = std::sync::Arc::new(nrese_exec::Budget::unlimited());
     let limits = Limits {
         watch: UNWATCHED,
         stop: &stop,
+        scratch: &scratch,
     };
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(1)

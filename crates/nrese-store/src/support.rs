@@ -245,6 +245,7 @@ impl Following {
             Stopped::ProcessMemory => Unavailable::ProcessMemory,
             Stopped::MemoryUnreadable => Unavailable::MemoryUnreadable,
             Stopped::Cancelled => Unavailable::Cancelled,
+            Stopped::Refused(exceeded) => Unavailable::Memory(exceeded),
             // The watch refused: the budget, or else the cancellation.
             Stopped::Memory { .. } => self
                 .refused
@@ -466,6 +467,7 @@ impl SupportSets {
             Limits {
                 watch: &|bytes| following.watch(bytes),
                 stop: &|| following.cancelled(),
+                scratch: &working.budget,
             },
         )
         .map_err(|stopped| following.failure(stopped))?;
@@ -662,6 +664,7 @@ impl SupportSets {
         let limits = Limits {
             watch: &|bytes| following.watch(bytes),
             stop: &|| following.cancelled(),
+            scratch: &working.budget,
         };
         let recomputed =
             match update_support_sets(&change, &ground, &self.axioms, &graphs_of, cap, limits) {
@@ -2144,6 +2147,7 @@ impl Supports {
         let limits = Limits {
             watch: &watch,
             stop: &stop,
+            scratch: &working.budget,
         };
         let closure = After {
             snapshot,
@@ -2472,6 +2476,7 @@ impl Supports {
         let limits = Limits {
             watch: &|bytes| following.watch(bytes),
             stop: &|| following.cancelled(),
+            scratch: &working.budget,
         };
         let held = closure_within(&closure.facts, &ground, &axioms, &reads, limits)
             .map_err(|stopped| following.failure(stopped))?;

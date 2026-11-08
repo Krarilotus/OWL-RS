@@ -71,6 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Vec::new()
         }
     };
+    let scratch = std::sync::Arc::new(nrese_exec::Budget::unlimited());
     let started = Instant::now();
     let sets = nrese_reasoner::graph_sets::support_sets(
         &all,
@@ -78,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &[],
         &graph_of,
         cap,
-        nrese_reasoner::graph_sets::Limits::UNLIMITED,
+        nrese_reasoner::graph_sets::Limits::unlimited(&scratch),
     )
     .map_err(|stopped| format!("{stopped:?}"))?;
     let elapsed = started.elapsed();

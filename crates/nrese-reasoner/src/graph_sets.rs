@@ -25,19 +25,29 @@
 //! forward closure of the facts it touched), from what the others keep: each starts
 //! again from its own graphs, its mark included.
 //!
-//! Memory: an evaluation's working set (the closure's store, the sets, a round's
-//! derivations) is not charged before it is allocated; it reports its size to a
-//! [`Watch`] at round boundaries and stops when the watch refuses (the reading query's
-//! envelope), or when the process passes its memory limit. A temporary exemption, shared
-//! with the materialiser's working set, until the reasoner's working set is charged
-//! (notes/2026-10-20-executor-admission-design.md, W1 site "reasoner fixpoint").
+//! Memory: a round's derivations, which grow with the rule instances (a complete
+//! transitive relation of n² facts has n³), are charged to the evaluation's working budget
+//! ([`Limits::scratch`]) before they are allocated, and reduced per fact as they come,
+//! exactly ([`found`]); a refusal stops the evaluation ([`Stopped::Refused`]). The rest of
+//! its working set (the closure's store, the sets, a round's delta) is not charged before
+//! it is allocated: it reports its size to a [`Watch`] at round boundaries and stops when
+//! the watch refuses (the reading query's envelope), or when the process passes its memory
+//! limit. A temporary exemption, shared with the materialiser's working set, until the
+//! reasoner's working set is charged (notes/2026-10-20-executor-admission-design.md, W1
+//! site "reasoner fixpoint").
+
+mod found;
 
 use std::borrow::Cow;
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use hashbrown::{HashMap, HashSet};
+use nrese_exec::{Budget, BudgetExceeded, Reservation};
 use rayon::prelude::*;
 
+use self::found::Found;
 use super::batch::Store;
 use super::eval::{
     GroundProgram, Grounding, Job, NEVER, OperationStop, Poller, Seg, Source, Stop, derivations,
@@ -98,6 +108,9 @@ pub enum Stopped {
     /// Its caller's stop fired ([`Limits::stop`]): the reading query was cancelled, or its
     /// time ran out.
     Cancelled,
+    /// Its working budget ([`Limits::scratch`]) had no room for a round's derivations: they
+    /// weren't allocated.
+    Refused(BudgetExceeded),
 }
 
 impl Stopped {
@@ -123,19 +136,25 @@ pub const UNWATCHED: Watch<'static> = &unwatched;
 
 /// What an evaluation answers to: `watch` sees its working set's bytes at round
 /// boundaries, and `stop` (its caller's cancellation) is asked there too. `stop` must take
-/// no lock: it may be asked inside a scan.
+/// no lock: it may be asked inside a scan. A round's derivations are charged to `scratch`
+/// before they are allocated.
 #[derive(Clone, Copy)]
 pub struct Limits<'a> {
     pub watch: Watch<'a>,
     pub stop: Stop<'a>,
+    pub scratch: &'a Arc<Budget>,
 }
 
-impl Limits<'static> {
-    /// Nothing but the process's memory limit stops the evaluation.
-    pub const UNLIMITED: Limits<'static> = Limits {
-        watch: UNWATCHED,
-        stop: NEVER,
-    };
+impl<'a> Limits<'a> {
+    /// Nothing but the process's memory limit stops the evaluation; its derivations are
+    /// charged to `scratch` (an unlimited budget, for a caller with nothing to follow).
+    pub fn unlimited(scratch: &'a Arc<Budget>) -> Self {
+        Self {
+            watch: UNWATCHED,
+            stop: NEVER,
+            scratch,
+        }
+    }
 }
 
 /// One evaluation call's limits, its stop latched with the process's memory limit
@@ -144,6 +163,11 @@ impl Limits<'static> {
 struct Run<'a> {
     watch: Watch<'a>,
     stop: OperationStop<'a>,
+    scratch: &'a Arc<Budget>,
+    /// Whether a charge to `scratch` was refused: the run stops ([`Self::refuse`]).
+    refused: AtomicBool,
+    /// The first refusal, to report.
+    refusal: Mutex<Option<BudgetExceeded>>,
 }
 
 impl<'a> Run<'a> {
@@ -151,16 +175,61 @@ impl<'a> Run<'a> {
         Self {
             watch: limits.watch,
             stop: OperationStop::new(limits.stop),
+            scratch: limits.scratch,
+            refused: AtomicBool::new(false),
+            refusal: Mutex::new(None),
         }
     }
 
-    /// Whether it has stopped: what its stages' pollers ask ([`Poller`]).
+    /// Whether it has stopped, a refused charge included: what its stages' pollers ask
+    /// ([`Poller`]).
     fn fired(&self) -> bool {
-        self.stop.fired()
+        self.refused.load(Ordering::Relaxed) || self.stop.fired()
+    }
+
+    /// A charge to its working budget was refused: the run stops, its other morsels at
+    /// their next poll, and reports the first refusal ([`Stopped::Refused`]).
+    fn refuse(&self, exceeded: BudgetExceeded) {
+        self.refusal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert(exceeded);
+        self.refused.store(true, Ordering::Relaxed);
+    }
+
+    /// Room for `bytes` of copies on the way to [`minimal`], charged to the run's working
+    /// budget before they are made, released when it drops.
+    fn room(&self, bytes: usize) -> Result<Reservation<Arc<Budget>>, BudgetExceeded> {
+        let mut held = Reservation::new(Arc::clone(self.scratch));
+        held.charge(bytes)?;
+        Ok(held)
+    }
+
+    /// A task's derivations, charged to the run's working budget.
+    fn found(&self) -> Found<'a> {
+        Found::new(self.scratch)
+    }
+
+    /// Every task's derivations in one, its room charged first; `Err` if the run has
+    /// stopped (a part may be cut short) or the room is refused.
+    fn gather(&self, parts: Vec<Found<'a>>) -> Result<Found<'a>, Stopped> {
+        if self.fired() {
+            return Err(self.stopped());
+        }
+        let mut all = self.found();
+        all.reserve(parts.iter().map(Found::len).sum())
+            .map_err(Stopped::Refused)?;
+        for part in parts {
+            all.append(part).map_err(Stopped::Refused)?;
+        }
+        Ok(all.finish())
     }
 
     /// Why it stopped, once it has.
     fn stopped(&self) -> Stopped {
+        if let Some(exceeded) = *self.refusal.lock().unwrap_or_else(|p| p.into_inner()) {
+            return Stopped::Refused(exceeded);
+        }
         match self.stop.interrupted().memory {
             Some(cause) => Stopped::of_process(cause),
             None => Stopped::Cancelled,
@@ -170,7 +239,7 @@ impl<'a> Run<'a> {
     /// `Err` if the run has stopped (its caller, or the process past its memory limit) or
     /// `watch` refuses `bytes`: after every stage, before its output is read.
     fn check(&self, bytes: usize) -> Result<(), Stopped> {
-        if self.stop.fired() {
+        if self.fired() {
             return Err(self.stopped());
         }
         match (self.watch)(bytes) {
@@ -489,17 +558,15 @@ fn support_sets_run(
         // Every instance with a premise among the changed facts, with every premise's
         // current sets (an instance found twice adds the same sets twice, harmlessly):
         // jobs in parallel morsels, each emitting (head, set, whether the instance's sets
-        // are truncated) triples.
-        let mut found: Vec<(Triple, GraphSet, bool)> = Vec::new();
+        // are truncated) triples, charged and reduced per head as they come ([`found`]).
+        let mut bodiless_found = run.found();
         for fact in delta_facts(&delta) {
             for &bodiless in bodiless_by_premise.get(&fact).into_iter().flatten() {
                 let grounding = Grounding::Bodiless(bodiless);
                 let from = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll);
-                found.extend(
-                    from.sets
-                        .into_iter()
-                        .map(|set| (bodiless, set, from.truncated)),
-                );
+                bodiless_found
+                    .add_all(bodiless, &from.sets, from.truncated)
+                    .map_err(Stopped::Refused)?;
             }
         }
         let mut jobs: Vec<(Job<'_>, &[super::ir::Atom], Annotation)> = Vec::new();
@@ -541,51 +608,59 @@ fn support_sets_run(
             })
             .collect();
         let sets_now = &sets;
-        found.par_extend(tasks.par_iter().flat_map_iter(|(j, range)| {
-            let (job, heads, schema) = &jobs[*j];
-            let mut out = Vec::new();
-            let mut body = Vec::with_capacity(job.rule.body.len());
-            let Some(mut poll) = Poller::new(&fired) else {
-                return out;
-            };
-            job.run(&source, range.clone(), &mut poll, &mut |bindings| {
-                body.clear();
-                body.extend(
-                    job.rule
-                        .body
-                        .iter()
-                        .map(|atom| super::eval::instantiate_head(atom, bindings)),
-                );
-                let from = premise_sets_from(&body, schema, sets_now, cap);
-                for head in heads.iter() {
-                    let fact = super::eval::instantiate_head(head, bindings);
-                    out.extend(
-                        from.sets
+        let mut parts: Vec<Found> = tasks
+            .par_iter()
+            .map(|(j, range)| {
+                let (job, heads, schema) = &jobs[*j];
+                let mut out = run.found();
+                let mut body = Vec::with_capacity(job.rule.body.len());
+                let Some(mut poll) = Poller::new(&fired) else {
+                    return out;
+                };
+                let mut refused = false;
+                job.run(&source, range.clone(), &mut poll, &mut |bindings| {
+                    if refused {
+                        return;
+                    }
+                    body.clear();
+                    body.extend(
+                        job.rule
+                            .body
                             .iter()
-                            .map(|set| (fact, set.clone(), from.truncated)),
+                            .map(|atom| super::eval::instantiate_head(atom, bindings)),
                     );
+                    let from = premise_sets_from(&body, schema, sets_now, cap);
+                    for head in heads.iter() {
+                        let fact = super::eval::instantiate_head(head, bindings);
+                        if let Err(exceeded) = out.add_all(fact, &from.sets, from.truncated) {
+                            run.refuse(exceeded);
+                            refused = true;
+                            return;
+                        }
+                    }
+                });
+                // Stopped or refused part-way: nothing of it is kept; the round's check
+                // ends the run.
+                if poll.stopped() || refused {
+                    return run.found();
                 }
-            });
-            // Stopped part-way: nothing of it is kept; the round's check ends the run.
-            if poll.stopped() {
-                out.clear();
-            }
-            out
-        }));
-        // The round's peak: its derivations and its delta beside the sets.
-        let round = found.capacity() * size_of::<(Triple, GraphSet, bool)>()
-            + found
-                .iter()
-                .map(|(_, set, _)| set.heap_bytes())
-                .sum::<usize>()
-            + delta.bytes().total()
+                // Reduced once, with the round's other parts ([`Run::gather`]).
+                out
+            })
+            .collect();
+        parts.push(bodiless_found);
+        // The round's peak beside the sets: its delta and its morsels (its derivations are
+        // charged, [`Limits::scratch`]).
+        let round = delta.bytes().total()
             + jobs.capacity() * size_of::<(Job<'_>, &[super::ir::Atom], Annotation)>()
-            + tasks.capacity() * size_of::<(usize, std::ops::Range<usize>)>();
+            + tasks.capacity() * size_of::<(usize, std::ops::Range<usize>)>()
+            + parts.capacity() * size_of::<Found>();
         run.check(held(&sets, annotations) + round)?;
         drop((jobs, tasks));
-        // Per head: its new sets merged into its old ones.
-        found.par_sort_unstable();
-        found.dedup();
+        // Per head: its new sets merged into its old ones, the derivations sorted by head
+        // and reduced ([`found`]: exactly what `minimal` keeps of them).
+        let gathered = run.gather(parts)?;
+        let found = gathered.entries();
         let mut starts: Vec<usize> = (0..found.len())
             .filter(|&i| i == 0 || found[i - 1].0 != found[i].0)
             .collect();
@@ -611,7 +686,19 @@ fn support_sets_run(
                 {
                     return None;
                 }
-                let mut all = kept.to_vec();
+                // The copies `minimal` takes, charged first (sol-loop r1 S1).
+                let copies = slots(kept.len() + group.len())
+                    + words(kept.iter().chain(group.iter().map(|(_, set, _)| set)));
+                let _room = match run.room(copies) {
+                    Ok(room) => room,
+                    Err(exceeded) => {
+                        run.refuse(exceeded);
+                        return None;
+                    }
+                };
+                // At its final capacity: what is charged is what is allocated.
+                let mut all = Vec::with_capacity(kept.len() + group.len());
+                all.extend_from_slice(kept);
                 all.extend(group.iter().map(|(_, set, _)| set.clone()));
                 let mut next = minimal(all, cap, &own_graph_of(fact, graphs_of));
                 next.truncated |= truncated || marks;
@@ -622,7 +709,11 @@ fn support_sets_run(
                     .then_some((fact, next))
             })
             .collect();
-        drop((found, starts));
+        drop((gathered, starts));
+        // A refused copy cut the heads short: none of it is written back.
+        if run.fired() {
+            return Err(run.stopped());
+        }
         for (fact, next) in updates {
             annotations += next.heap_bytes();
             if let Some(old) = sets.insert(fact, next) {
@@ -907,6 +998,7 @@ fn forward_cone<S: Source + Sync + ?Sized>(
     if affected.iter().any(|fact| schema.contains(fact)) {
         return Ok(None);
     }
+    let none = GraphSet::default();
     let mut frontier: Vec<Triple> = affected.iter().copied().collect();
     while !frontier.is_empty() {
         frontier.sort_unstable();
@@ -915,19 +1007,18 @@ fn forward_cone<S: Source + Sync + ?Sized>(
             all: source,
             changed: &delta,
         };
+        // The heads, without sets: the reduction keeps each once.
         let heads = instances(&changed, rules, run, &|k, bindings, out| {
             let rule = rules[k].0;
             if let Head::Facts(heads) = &rule.head {
-                out.extend(heads.iter().map(|head| instantiate_head(head, bindings)));
+                for head in heads {
+                    out.add(instantiate_head(head, bindings), &none, false)?;
+                }
             }
-        });
-        run.check(
-            fixed
-                + table_bytes::<Triple, ()>(affected.capacity())
-                + delta.bytes().total()
-                + heads.capacity() * size_of::<Triple>(),
-        )?;
-        for head in heads {
+            Ok(())
+        })?;
+        run.check(fixed + table_bytes::<Triple, ()>(affected.capacity()) + delta.bytes().total())?;
+        for &(head, ..) in heads.entries() {
             if affected.insert(head) {
                 if schema.contains(&head) {
                     return Ok(None);
@@ -1059,7 +1150,8 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
         .collect();
     let premises_in_closure = |body: &[Triple]| body.iter().all(|&p| (change.in_closure)(p));
     // Every derivation of every affected fact, against the sets as they start.
-    let found: Vec<(Triple, Annotation)> = {
+    // Each fact's derivations charged and kept once per set as they come ([`found`]).
+    let found: Vec<(Triple, Found)> = {
         let lookup = Recomputing {
             now: &now,
             affected: &affected,
@@ -1071,21 +1163,29 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
             .map_init(
                 || Poller::new(&fired),
                 |poll, &fact| {
-                    let mut from = Annotation::default();
                     // The fact is attempted work before either prelude (its bodiless sets,
                     // its producers), and so is each grounding (review r1, F1; sol-loop r6,
                     // R6-1). Stopped, or no poller (stopped before the task began): what it
-                    // found is incomplete, and the check after the pass ends the run before
-                    // it is read.
+                    // found is incomplete (nothing), and the check after the pass ends the
+                    // run before it is read.
                     let Some(poll) = poll.as_mut() else {
-                        return (fact, from);
+                        return (fact, run.found());
                     };
                     if poll.attempt(1) {
-                        return (fact, from);
+                        return (fact, run.found());
                     }
+                    // Charged and kept once per set as they come ([`found`]); a refusal
+                    // latches the run, which its pollers see.
+                    let mut from = run.found();
+                    let mut refused = false;
                     let mut take = |found: Annotation| {
-                        from.truncated |= found.truncated;
-                        from.sets.extend(found.sets);
+                        if refused {
+                            return;
+                        }
+                        if let Err(exceeded) = from.add_all(fact, &found.sets, found.truncated) {
+                            run.refuse(exceeded);
+                            refused = true;
+                        }
                     };
                     if program.bodiless.contains(&fact) {
                         take(grounding_sets(
@@ -1129,19 +1229,24 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                     if program.transitive.contains(&fact[1]) && !poll.attempt(1) {
                         search(Grounding::Transitive(fact[1]), poll);
                     }
+                    // Its copies are `minimal`'s to sort and drop, as before.
                     (fact, from)
                 },
             )
             .collect()
     };
-    run.check(
-        held(&now, annotations)
-            + found.capacity() * size_of::<(Triple, Annotation)>()
-            + found.iter().map(|(_, a)| a.heap_bytes()).sum::<usize>(),
-    )?;
+    run.check(held(&now, annotations) + found.capacity() * size_of::<(Triple, Found)>())?;
     let mut changed: Vec<Triple> = Vec::new();
     for (fact, from) in found {
-        if merge(&mut now, fact, from, cap, graphs_of, &mut annotations) {
+        if merge_found(
+            run,
+            &mut now,
+            fact,
+            from.entries(),
+            cap,
+            graphs_of,
+            &mut annotations,
+        )? {
             changed.push(fact);
         }
     }
@@ -1162,7 +1267,7 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
             instances(&source, &rules, run, &|k, bindings, out| {
                 let rule = rules[k].0;
                 let Head::Facts(heads) = &rule.head else {
-                    return;
+                    return Ok(());
                 };
                 let body: Vec<Triple> = rule
                     .body
@@ -1170,46 +1275,100 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                     .map(|atom| instantiate_head(atom, bindings))
                     .collect();
                 if !premises_in_closure(&body) {
-                    return;
+                    return Ok(());
                 }
                 let from = premise_sets_from(&body, &schemas[k], &lookup, cap);
                 for head in heads {
                     let fact = instantiate_head(head, bindings);
                     if members.contains(&fact) && !from.is_empty() {
-                        out.push((fact, from.clone()));
+                        out.add_all(fact, &from.sets, from.truncated)?;
                     }
                 }
-            })
+                Ok(())
+            })?
         };
-        run.check(
-            held(&now, annotations)
-                + delta.bytes().total()
-                + found.capacity() * size_of::<(Triple, Annotation)>()
-                + found.iter().map(|(_, a)| a.heap_bytes()).sum::<usize>(),
-        )?;
-        let mut by_fact: HashMap<Triple, Annotation> = HashMap::new();
-        for (fact, from) in found {
-            let entry = by_fact.entry(fact).or_default();
-            entry.truncated |= from.truncated;
-            entry.sets.extend(from.sets);
-        }
-        for (fact, from) in by_fact {
-            if merge(&mut now, fact, from, cap, graphs_of, &mut annotations) {
+        run.check(held(&now, annotations) + delta.bytes().total())?;
+        // Sorted by fact: each fact's derivations merged into its sets.
+        let entries = found.entries();
+        let mut start = 0;
+        while start < entries.len() {
+            let fact = entries[start].0;
+            let end = start + entries[start..].partition_point(|e| e.0 == fact);
+            let from = &entries[start..end];
+            if merge_found(run, &mut now, fact, from, cap, graphs_of, &mut annotations)? {
                 changed.push(fact);
             }
+            start = end;
         }
     }
     Ok(Some(now))
 }
 
-/// What `emit` makes of every instance of `rules` (by index) with a premise among
-/// `source`'s delta facts, the instances in parallel morsels, each polling `run`'s stop.
-/// Stopped, the result is incomplete: the caller checks `run` before it reads it.
-fn instances<S, T, E>(source: &S, rules: &[(&Rule, Grounding)], run: &Run<'_>, emit: &E) -> Vec<T>
+/// The bytes of a list of `n` sets' slots.
+fn slots(n: usize) -> usize {
+    n * size_of::<GraphSet>()
+}
+
+/// The bytes a copy of `sets` holds beyond its slots: the words of sets past 128 graphs.
+fn words<'s>(sets: impl IntoIterator<Item = &'s GraphSet>) -> usize {
+    sets.into_iter().map(GraphSet::heap_bytes).sum()
+}
+
+/// [`merge`] of one fact's reduced derivations `entries` ([`found`]) into its sets in
+/// `now`, the copies on the way charged first (sol-loop r1 S1, r2 S1/S2): the derivations'
+/// list (their slots and words), and beside it `merge`'s, at its final capacity, of the
+/// fact's sets (copied: slots and words) with the derivations (moved: slots only).
+fn merge_found(
+    run: &Run<'_>,
+    now: &mut HashMap<Triple, Annotation>,
+    fact: Triple,
+    entries: &[found::Entry],
+    cap: usize,
+    graphs_of: &(dyn Fn(Triple) -> Vec<u32> + Sync),
+    annotations: &mut usize,
+) -> Result<bool, Stopped> {
+    let (n, kept) = (
+        entries.len(),
+        now.get(&fact).map_or(&[][..], |a| a.sets.as_slice()),
+    );
+    let copies = slots(n)
+        + words(entries.iter().map(|(_, set, _)| set))
+        + slots(kept.len() + n)
+        + words(kept);
+    let _room = run.room(copies).map_err(Stopped::Refused)?;
+    Ok(merge(
+        now,
+        fact,
+        annotation_of(entries),
+        cap,
+        graphs_of,
+        annotations,
+    ))
+}
+
+/// One fact's reduced derivations ([`found`]) as an annotation: their sets, marked if one
+/// was ([`merge`] reads the mark as one beyond the fact's own graphs).
+fn annotation_of(entries: &[found::Entry]) -> Annotation {
+    Annotation {
+        sets: entries.iter().map(|(_, set, _)| set.clone()).collect(),
+        truncated: entries.iter().any(|&(_, _, marked)| marked),
+        beyond_own: false,
+    }
+}
+
+/// What `emit` adds of every instance of `rules` (by index) with a premise among
+/// `source`'s delta facts, the instances in parallel morsels, each polling `run`'s stop and
+/// charged and reduced per fact ([`found`]); then all of them, sorted by fact. `Err` where
+/// `run` stopped (its caller, the process's memory, or a charge `emit` was refused).
+fn instances<'r, S, E>(
+    source: &S,
+    rules: &[(&Rule, Grounding)],
+    run: &Run<'r>,
+    emit: &E,
+) -> Result<Found<'r>, Stopped>
 where
     S: Source + Sync + ?Sized,
-    T: Send,
-    E: Fn(usize, &[Option<u64>], &mut Vec<T>) + Sync,
+    E: Fn(usize, &[Option<u64>], &mut Found<'r>) -> Result<(), BudgetExceeded> + Sync,
 {
     let jobs: Vec<(usize, Job<'_>)> = rules
         .iter()
@@ -1236,23 +1395,33 @@ where
         })
         .collect();
     let fired = || run.fired();
-    tasks
+    let parts: Vec<Found> = tasks
         .par_iter()
-        .flat_map_iter(|(j, range)| {
+        .map(|(j, range)| {
             let (k, job) = &jobs[*j];
-            let mut out = Vec::new();
+            let mut out = run.found();
             let Some(mut poll) = Poller::new(&fired) else {
                 return out;
             };
+            let mut refused = false;
             job.run(source, range.clone(), &mut poll, &mut |bindings| {
-                emit(*k, bindings, &mut out)
+                if refused {
+                    return;
+                }
+                if let Err(exceeded) = emit(*k, bindings, &mut out) {
+                    run.refuse(exceeded);
+                    refused = true;
+                }
             });
-            if poll.stopped() {
-                out.clear();
+            // Stopped or refused part-way: nothing of it is kept; `gather` ends the run.
+            if poll.stopped() || refused {
+                return run.found();
             }
+            // Reduced once, with the other parts ([`Run::gather`]).
             out
         })
-        .collect()
+        .collect();
+    run.gather(parts)
 }
 
 /// Every fact of `store`.
@@ -1361,7 +1530,9 @@ fn merge(
     annotations: &mut usize,
 ) -> bool {
     let current = sets.entry(fact).or_default();
-    let mut all = current.sets.clone();
+    // At its final capacity ([`merge_found`] charges it so).
+    let mut all = Vec::with_capacity(current.sets.len() + from.sets.len());
+    all.extend_from_slice(&current.sets);
     all.extend(from.sets);
     let mut next = minimal(all, cap, &own_graph_of(fact, graphs_of));
     next.truncated |= current.truncated || from.truncated;
