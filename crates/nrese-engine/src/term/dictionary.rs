@@ -606,6 +606,13 @@ impl Dictionary {
         self.inner.read().heap.tail.len()
     }
 
+    /// Test support: whether a writer holds the entries' lock or is queued for it, so that a
+    /// plain (not recursive) read waits behind it: such a read then fails to start.
+    #[cfg(test)]
+    pub(crate) fn writer_waiting(&self) -> bool {
+        self.inner.try_read().is_none()
+    }
+
     /// Number of dictionary entries (inline terms are not counted).
     pub fn len(&self) -> u64 {
         self.inner.read().len()
