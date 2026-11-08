@@ -52,6 +52,30 @@ describe("NreseClient", () => {
     expect(response.suggestions[0]?.label).toBe("X");
   });
 
+  // SYN-72 C-1107: every graph request names exactly its target (Graph Store Protocol §4:
+  // `?default` or one `graph=` parameter carrying the whole IRI).
+  test.each([
+    [{ kind: "named", iri: "https://example.org/g#x&y z" }, "?graph=https%3A%2F%2Fexample.org%2Fg%23x%26y%20z"],
+    [{ kind: "default" }, "?default"],
+  ] as const)("sends graph requests to %j", async (target, query) => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(null, { status: 204 }),
+    );
+    const client = new NreseClient({ fetchImpl: fetchImpl as typeof fetch });
+
+    await client.deleteGraph(target);
+    await client.writeGraph("PUT", "", target);
+    await client.readGraph(target);
+    await client.runTell("", target);
+
+    expect(fetchImpl.mock.calls.map(([input]) => input)).toEqual([
+      `/dataset/data${query}`,
+      `/dataset/data${query}`,
+      `/dataset/data${query}`,
+      `/dataset/tell${query}`,
+    ]);
+  });
+
   test("sends the configured headers with every request", async () => {
     // The review of 3 October 2026 (C3): diagnostics reads and graph DELETE went without.
     const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
