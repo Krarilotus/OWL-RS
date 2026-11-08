@@ -46,15 +46,22 @@ def done(attempt, started, commit, **fields):
             "outcome": {"outcome": "ok"}, "answers": "ok", **fields}
 
 
+def files(directory: Path) -> dict[str, bytes]:
+    """A directory's files' bytes; not its run's lock (Windows' lock is a byte lock: unreadable
+    while held), which holds nothing."""
+    return {p.name: p.read_bytes() for p in directory.iterdir() if p.name != "manifest.lock"}
+
+
 class Crash:
     """What a host crash leaves of a results directory, from the calls its manifest writers made:
     a file's bytes once its fsync returned, under a name already on disk; a new name or a rename
-    once its directory was synced, which Windows can't (`windows`): there it is lost. What is
+    once its directory was synced, unless the directory sync makes nothing durable (`no_dirsync`:
+    the suite's on Windows before review r3, a share that can't flush): then it is lost. What is
     there at the start counts as long on disk. `fail` fails the fsync publishing an attempt."""
 
-    def __init__(self, directory: Path, windows: bool):
-        self.directory, self.windows, self.names, self.pending = directory, windows, {}, {}
-        self.disk = {p.name: p.read_bytes() for p in directory.iterdir()}
+    def __init__(self, directory: Path, no_dirsync: bool):
+        self.directory, self.no_dirsync, self.names, self.pending = directory, no_dirsync, {}, {}
+        self.disk = files(directory)
 
     def patches(self, fail=False):
         real_open, real_fsync, real_replace = open, os.fsync, os.replace
@@ -78,7 +85,7 @@ class Crash:
             self.pending[Path(target).name] = self.pending.pop(Path(source).name, b"")
 
         def synced(directory):
-            if not self.windows:
+            if not self.no_dirsync:
                 self.disk.update(self.pending)
                 self.pending.clear()
         return [patch("suitekit.manifest.open", opened, create=True), patch("suitekit.manifest.os.fsync", fsync),
@@ -149,7 +156,7 @@ class Ledger(unittest.TestCase):
         (self.run / "attempts.jsonl").write_text('\n{"cell": "lubm/1/x", "attem', encoding="utf-8")
         a2 = {"attempt": "a2", "started": "t", "complete": False}
         manifest.append_attempts(self.run, {"lubm/1/x": a2})
-        self.assertEqual(manifest.read_attempts(self.run), [{"cell": "lubm/1/x", **a2}])
+        self.assertEqual(manifest.read_journal(self.run), [{"cell": "lubm/1/x", **a2}])
 
     def test_answers_are_the_attempt_s_own_never_the_directory_s(self):
         """R3: I1 measured A with full answers, ok; I2 measured A again with --answers off. The
@@ -189,22 +196,34 @@ class Driver(unittest.TestCase):
         self.root = Path(temporary.name).resolve()
         (self.root / "data").mkdir()
 
-    def suite(self, runs=2, skip_build=True):
+    def suite(self, runs=2, skip_build=True, results="results"):
         args = driver.arguments(["--runtime", "process", "--data", str(self.root / "data"), "--results",
-                                 str(self.root / "results"), "--systems", "x", "--workloads", "w",
+                                 str(self.root / results), "--systems", "x", "--workloads", "w",
                                  "--runs", str(runs), *(["--skip-build"] if skip_build else [])])
         suite = driver.Suite(args, {"x": {"capabilities": ["load"], "publish": "free"}},
                              {"w": {"needs": ["load"], "state": "ready", "kit": ""}}, self.root)
         suite.say = Mock()
         suite.manifest = driver.Manifest(suite.results, self.root, [], args, "process", {})
+        self.addCleanup(getattr(suite.manifest, "close", lambda: None))  # its run's end
         return suite
+
+    def main(self, results, run=None):
+        """suite.py run into `results`, its Suite.run replaced by `run`: exit code, stderr."""
+        err = io.StringIO()
+        with patch.object(driver.Suite, "run", side_effect=run, return_value=0) as ran, \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            code = driver.main(["--runtime", "process", "--data", str(self.root / "data"), "--results",
+                                str(results), "--systems", "x", "--workloads", "w"],
+                               {"x": {"capabilities": ["load"], "publish": "free"}},
+                               {"w": {"needs": ["load"], "state": "ready", "kit": ""}}, self.root)
+        return code, err.getvalue(), ran.called
 
     def cells(self, suite):
         return json.loads((suite.results / "manifest.json").read_text(encoding="utf-8"))["invocations"][-1].get("cells", {})
 
     def journal(self, suite):
         lines = (suite.results / "attempts.jsonl").read_text(encoding="utf-8").splitlines()
-        return {a["cell"]: a for a in map(json.loads, filter(None, lines))}
+        return {a["cell"]: a for a in map(json.loads, filter(None, lines)) if "cell" in a}  # not invocations'
 
     def system(self, images=()):
         # definition_paths: what the reviewed head's adapters had (r1), so its red reaches the verdicts.
@@ -305,18 +324,19 @@ class Driver(unittest.TestCase):
         attempts A again. Its attempt's flush fails: no work of A starts, the rows stay, A is
         incomplete. Or it is flushed, A's work starts and the host dies: reopened with only what was
         on disk, A is I2's incomplete attempt, never I1's receipt, and B keeps I1's. Or the attempts'
-        file's name never reached the disk: on Windows (no directory flush: a rename or new name there
-        is lost) then no receipt stands; on POSIX I2's directory sync puts it there, B's with it."""
-        for windows, case in [(w, c) for w in (False, True) for c in ("flush fails", "crash", "journal lost")]:
-            with self.subTest(windows=windows, case=case):
+        file's name never reached the disk: I2's directory sync puts it there, B's with it; where that
+        sync makes nothing durable (a rename or new name is lost), no receipt stands."""
+        for no_dirsync, case in [(n, c) for n in (False, True) for c in ("flush fails", "crash", "journal lost")]:
+            with self.subTest(no_dirsync=no_dirsync, case=case):
                 self.setUp()
                 # A checkout, as a run's always is (the ledger reads its dirty count).
                 subprocess.run(["git", "init", "-q", str(self.root)], capture_output=True, check=True)
                 first = self.suite(runs=1)
                 self.run_tiers(first, [Plan("w", "1"), Plan("w", "2")], self.system())
                 rows = (first.results / "results.csv").read_text(encoding="utf-8")
+                first.manifest.finish(0)
                 i1 = json.loads((first.results / "manifest.json").read_text(encoding="utf-8"))["invocations"][0]["cells"]
-                again, started, disk = self.suite(runs=1), [], Crash(first.results, windows)
+                again, started, disk = self.suite(runs=1), [], Crash(first.results, no_dirsync)
                 if case == "journal lost":
                     disk.disk.pop("attempts.jsonl", None)
 
@@ -337,7 +357,58 @@ class Driver(unittest.TestCase):
                 self.assertNotEqual(pairs["1"].get("attempt"), i1["w/1/x"]["attempt"])  # never I1's for I2's
                 self.assertFalse(pairs["1"].get("complete"))
                 self.assertEqual(pairs["2"].get("attempt"),
-                         None if case == "journal lost" and windows else i1["w/2/x"]["attempt"])
+                         None if case == "journal lost" and no_dirsync else i1["w/2/x"]["attempt"])
+
+    def test_one_run_at_a_time_owns_a_results_directory(self):
+        """R2a (review cell-receipts r4): two runs appending to one directory's journal can overwrite
+        each other's attempts (Windows' append is a seek, then a write). While a run holds the
+        directory, a second is refused with its remedy before anything runs, and the directory stays
+        as it was; once the first ends, or fails, the next one runs."""
+        results = self.root / "results"
+        holder = self.suite(runs=1)  # its run in progress
+        before = files(results)
+        code, err, ran = self.main(results)
+        self.assertEqual((code, ran), (2, False))
+        self.assertIn("--results", err)
+        self.assertEqual(files(results), before)
+        holder.manifest.finish(0)
+        self.assertEqual(self.main(results)[0], 0)
+        with self.assertRaises(RuntimeError):
+            self.main(results, run=RuntimeError("its work failed"))
+        self.assertEqual(self.main(results)[0], 0)
+
+    def test_a_batch_directory_whose_journal_lost_records_lets_no_older_receipt_stand(self):
+        """R2b (review cell-receipts r4): a batch of D1 and D2. D1's I1 completed A (tier 1) and B
+        (tier 2); D2's I2 attempted A later and was interrupted. Then D2's journal is missing, or
+        recreated with only a B attempt: what it lost is unknowable, so A is never I1's completed
+        receipt. With D2's journal intact, A is I2's incomplete attempt. D2 itself can't vanish: its
+        name is synced in the batch directory before its first attempt."""
+        subprocess.run(["git", "init", "-q", str(self.root)], capture_output=True, check=True)
+        first = self.suite(runs=1, results="batch/d1")
+        self.run_tiers(first, [Plan("w", "1"), Plan("w", "2")], self.system())
+        i1 = self.cells(first)
+        synced, real = [], manifest.sync_directory
+        with patch("suitekit.manifest.sync_directory", side_effect=lambda d: (synced.append(Path(d)), real(d))[1]):
+            second = self.suite(runs=2, results="batch/d2")
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_tiers(second, [Plan("w", "1")], self.system(), stop=lambda plan, run: run == 2)
+        i2 = self.journal(second)["w/1/x"]["attempt"]
+        b = {"cell": "w/2/x", "attempt": "b3", "started": "2026-11-08T23:00:00.000000", "complete": False}
+        for lost in ("intact", "missing", "recreated with B only"):
+            with self.subTest(journal=lost):
+                if lost == "missing":
+                    (second.results / "attempts.jsonl").unlink()
+                elif lost != "intact":
+                    (second.results / "attempts.jsonl").write_text("\n" + json.dumps(b), encoding="utf-8")
+                with patch("suitekit.versus.versus", return_value=[]), patch("suitekit.cases.load", return_value=[]):
+                    record = ledger.from_results(self.root / "batch", self.root)
+                a = next(p for p in record["pairs"] if p["tier"] == "1").get("receipt", {})
+                self.assertNotEqual(a.get("attempt"), i1["w/1/x"]["attempt"])  # never I1's for I2's
+                self.assertFalse(a.get("complete"))
+                if lost == "intact":
+                    self.assertEqual(a["attempt"], i2)
+        # D2's own name was on disk before any of its attempts (its Manifest): it can't vanish.
+        self.assertIn(self.root / "batch", synced)
 
     def test_a_run_into_a_directory_whose_manifest_can_t_be_read_is_refused_and_leaves_it(self):
         """Review cell-receipts r2 (orchestrator, 8 Nov 05:38): a manifest that couldn't be parsed was
@@ -361,9 +432,9 @@ class Driver(unittest.TestCase):
                 self.assertEqual((results / "manifest.json").read_text(encoding="utf-8"), text)
 
     def test_a_manifest_is_on_disk_before_it_replaces_the_old_one(self):
-        """Guard: the file's bytes are flushed (fsync) before the replace, and on POSIX the directory
-        after it, so a rename that survives a crash names a whole file (receipts; attempts don't
-        rest on it)."""
+        """Guard: the file's bytes are flushed (fsync) before the replace, and the directory after it
+        (POSIX: its fsync, seen here; Windows: FlushFileBuffers, not an os call), so a rename that
+        survives a crash names a whole file (receipts; attempts don't rest on it)."""
         suite, calls = self.suite(runs=1), []
         real_fsync, real_replace = driver.os.fsync, driver.os.replace
         with patch("suitekit.manifest.os.fsync", side_effect=lambda fd: (calls.append("fsync"), real_fsync(fd))[1]), \

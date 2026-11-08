@@ -7,6 +7,7 @@ appends one entry to `invocations`:
 
 | Field | Meaning |
 |---|---|
+| invocation | its id, in attempts.jsonl before it is here (append_attempts); one run at a time holds manifest.lock |
 | started, finished | ISO 8601 times (finished is null while it runs, or if it died) |
 | argv | the `suite.py run` arguments |
 | protocol | runs, query runs, cache modes, order, seed, timeouts: the protocol knobs |
@@ -24,6 +25,7 @@ Nothing in it is secret: licence paths are recorded as set/unset only.
 """
 from __future__ import annotations
 
+import contextlib
 import datetime
 import functools
 import hashlib
@@ -32,7 +34,10 @@ import os
 import platform
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
+
+from .lock import lock
 
 # The variables the suite and its adapters read; licence variables are recorded as set or not.
 SETTINGS = ["JAVA_HEAP", "DOCKER_MEMORY", "DOCKER_CPUS", "SKIP_COUNT", "QUERY_MEMORY_MIB", "JENA_OWL_REASONER", "ONTOLOGY",
@@ -222,10 +227,26 @@ class ManifestError(RuntimeError):
 
 
 def sync_directory(directory: Path):
-    """A new name or rename in `directory` made durable: on POSIX the directory's own fsync.
-    Windows has no such flush (a directory can't be opened to flush it): there a name may be lost
-    in a crash, so nothing that must hold rests on one (attempts: append_attempts)."""
+    """A new name or rename in `directory` made durable: on POSIX the directory's own fsync; on
+    Windows FlushFileBuffers on the directory, opened for writing with FILE_FLAG_BACKUP_SEMANTICS
+    (as nrese-engine's durability/place). Raises if it can't (some network shares can't)."""
     if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.restype, kernel32.FlushFileBuffers.argtypes = wintypes.HANDLE, [wintypes.HANDLE]
+        kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                                         wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        # GENERIC_WRITE, shared read/write/delete, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS
+        handle = kernel32.CreateFileW(str(directory), 0x40000000, 7, None, 3, 0x02000000, None)
+        if handle in (None, wintypes.HANDLE(-1).value):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            if not kernel32.FlushFileBuffers(handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            kernel32.CloseHandle(handle)
         return
     fd = os.open(directory, os.O_RDONLY)
     try:
@@ -243,34 +264,55 @@ def append_attempts(results: Path, attempts: dict[str, dict]):
     (sync_directory). No rename: a file appended to only never comes back older after a crash,
     on Windows too (review cell-receipts r3). Each record starts its own line, so a torn one (a
     crash mid-append; its work never started) never takes the next with it. Raises if any of it
-    fails: the cells' work must not start."""
+    fails: the cells' work must not start. Only the run that owns `results` appends (Manifest's
+    lock): Windows' append is a seek, then a write, so two appenders could overwrite each other."""
+    _append(results, [{"cell": cell, **attempt} for cell, attempt in attempts.items()])
+
+
+def _append(results: Path, records: list[dict]):
     with open(results / ATTEMPTS, "a", encoding="utf-8", newline="\n") as f:
-        f.write("".join("\n" + json.dumps({"cell": cell, **attempt}) for cell, attempt in attempts.items()))
+        f.write("".join("\n" + json.dumps(record) for record in records))
         f.flush()
         os.fsync(f.fileno())
     sync_directory(results)
 
 
-def read_attempts(results: Path) -> list[dict]:
-    """The attempts in <results>/attempts.jsonl, in the order written; a torn record is skipped."""
+def read_journal(results: Path) -> list[dict]:
+    """<results>/attempts.jsonl's records in the order written: each invocation's start
+    (`invocation`) and each cell's attempt (`cell`, `attempt`); a torn record is skipped."""
     path, out = results / ATTEMPTS, []
     for line in path.read_text(encoding="utf-8").splitlines() if path.exists() else []:
         try:
             record = json.loads(line)
         except ValueError:
             continue
-        if isinstance(record, dict) and isinstance(record.get("cell"), str) and record.get("attempt"):
+        if isinstance(record, dict) and (record.get("invocation")
+                                         or isinstance(record.get("cell"), str) and record.get("attempt")):
             out.append(record)
     return out
 
 
 class Manifest:
     """One invocation's entry in <results>/manifest.json, written at the start and updated
-    as the run learns its images and datasets, and at the end."""
+    as the run learns its images and datasets, and at the end. One run at a time owns a results
+    directory, from here to finish() or close() (or its process's end): a second is refused."""
 
     def __init__(self, results: Path, root: Path, argv: list[str], args, runtime: str, settings: dict):
-        self.path = results / "manifest.json"
+        self.path, self._owner = results / "manifest.json", contextlib.ExitStack()
+        try:
+            self._owner.enter_context(lock(results / "manifest.lock", wait=False))
+        except OSError as error:
+            raise ManifestError(f"{results}: another run is writing into it ({error}); let it finish, "
+                                "or give this one its own --results") from error
+        try:
+            self._start(root, argv, args, runtime, settings)
+        except BaseException:
+            self.close()
+            raise
+
+    def _start(self, root: Path, argv: list[str], args, runtime: str, settings: dict):
         self.entry = {
+            "invocation": uuid.uuid4().hex,
             "started": now(),
             "finished": None,
             "argv": argv,
@@ -289,6 +331,12 @@ class Manifest:
             "exit": None,
         }
         data = self._read()
+        # The results directory's own name on disk before any of its attempts: a batch member that
+        # ran can't vanish while an older one's receipt stays (review cell-receipts r4 R2b).
+        sync_directory(self.path.parent.parent)
+        # The invocation in the journal before the manifest names it: a journal lacking an
+        # invocation its manifest names has lost records (ledger; review cell-receipts r4 R2b).
+        _append(self.path.parent, [{"invocation": self.entry["invocation"], "started": self.entry["started"]}])
         data.setdefault("invocations", []).append(self.entry)
         self.index = len(data["invocations"]) - 1
         self._write(data)
@@ -334,4 +382,11 @@ class Manifest:
         self._write(data)
 
     def finish(self, code: int | None):
-        self.update(finished=now(), exit=code)
+        try:
+            self.update(finished=now(), exit=code)
+        finally:
+            self.close()
+
+    def close(self):
+        """The results directory given up, for the next run."""
+        self._owner.close()
