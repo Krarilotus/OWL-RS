@@ -394,7 +394,7 @@ impl Context<'_> {
                     .vector_search_in(self.model, scope, query, accept, &self.budget)
             }
         };
-        found.map_err(|e| QueryEvaluationError::MemoryLimit(e).into())
+        found.map_err(|refused| QueryEvaluationError::from(refused).into())
     }
 
     /// Merge sorted search rounds with retained, successfully probed candidates.
