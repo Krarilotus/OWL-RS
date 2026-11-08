@@ -31,7 +31,6 @@ mod corpora;
 mod equality;
 #[cfg(test)]
 mod lock_tests;
-mod pending;
 mod replication;
 mod snapshot;
 pub(crate) mod spill;

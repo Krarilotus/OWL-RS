@@ -12,11 +12,14 @@
 //!   ([`Pending::stack_contains`]), and those that end up asserted ([`Pending::shadowed_inferred`])
 //!   leave the inferred stack. Both pending-snapshot builders take that set from here.
 //! - **No way to publication.** It is a value; only the write transaction turns its deltas into a
-//!   commit record ([`Pending::into_parts`]).
+//!   commit record ([`Pending::into_parts`]). That is by visibility: this module is the write
+//!   transaction's child, and what is `pub(super)` here, `into_parts` and the deltas' sets among
+//!   it, is the write transaction's alone. What a private transaction needs is widened to
+//!   `pub(in crate::engine)` when it arrives; those parts never are.
 
 use hashbrown::HashSet;
 
-use super::{ReadModel, Snapshot, Stack};
+use crate::engine::{ReadModel, Snapshot, Stack};
 use crate::quad::{EncodedQuad, QuadPattern};
 use crate::term::TermId;
 

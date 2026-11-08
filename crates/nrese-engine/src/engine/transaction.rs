@@ -7,7 +7,9 @@ use hashbrown::HashSet;
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
 use parking_lot::MutexGuard;
 
-use super::pending::{Pending, SnapshotChanges};
+mod pending;
+
+use self::pending::{Pending, SnapshotChanges};
 use super::{Inner, ReadModel, Snapshot, Version};
 use crate::durability::codec::CommitRecord;
 use crate::error::EngineResult;
