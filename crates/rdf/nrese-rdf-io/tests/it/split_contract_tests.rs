@@ -177,6 +177,21 @@ fn a_chunked_recovering_parse_is_the_sequential_one() {
                 "<urn:g> {{ <urn:s> <urn:p> }} <http://e/a> <http://e/b> <http://e/c> .{AFTER}"
             ),
         ),
+        // A VERSION whose short string has a raw line break: recovery skips the string as a
+        // malformed token and the directive ends at its `.`, so no cut after the string
+        // (sol-loop r1 S2).
+        (
+            false,
+            RdfFormat::Turtle,
+            format!("VERSION 12 \"a\nb\"\n<urn:s> <urn:p> <urn:o> .{AFTER}"),
+        ),
+        // A byte order mark before the first directive: the parser reads past it, so the
+        // directive is in force in every chunk (sol-loop r1 S4; before this package too).
+        (
+            false,
+            RdfFormat::Turtle,
+            format!("\u{FEFF}@prefix ex: <http://e/> .\nex:a ex:b ex:c .\nex:d ex:e ex:f .{AFTER}"),
+        ),
         // Valid names with escapes (`\(`, `\)`, `\.`) are names: guards.
         (
             true,
@@ -236,6 +251,14 @@ fn the_skimmer_cuts_where_recovery_resumes() {
             RdfFormat::TriG,
             format!("<urn:g> {{ <urn:s> <urn:p> [ <urn:q> <urn:o> ] }}\n{three}"),
             5,
+        ),
+        // A byte order mark before a TriG block's head: still a block (sol-loop r1 S4).
+        (
+            false,
+            RdfFormat::TriG,
+            "\u{FEFF}<urn:g> { <urn:s> <urn:p> <urn:o> . }\n<urn:h> { <urn:a> <urn:b> <urn:c> . }\n"
+                .to_owned(),
+            3,
         ),
     ];
     for (guard, format, document, want) in rows {
