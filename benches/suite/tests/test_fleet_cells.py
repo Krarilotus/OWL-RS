@@ -105,7 +105,7 @@ class FleetCells(unittest.TestCase):
         job = self.document()["job"][0]
         self.assertEqual(job["kind"], "owlrs.timed")
         self.assertEqual((job["class"], job.get("untimed_steps", [])), ("exclusive", []))
-        self.assertEqual(job["spec"], 9)
+        self.assertEqual(job.get("spec"), 9)
         self.assertEqual(job["containers"], [{"name": "suite", "memory_gb": 28}])
         self.assertEqual(job["priority"], 600)
         self.assertFalse(job["requires"].get("hosts"))
