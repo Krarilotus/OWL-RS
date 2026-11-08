@@ -21,8 +21,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nrese_engine::{GraphSelector, QuadPattern, Snapshot, TermId, Transaction};
-use nrese_rdf::{BlankNode, GraphName as OxGraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, Transaction};
+use nrese_rdf::{
+    BlankNode, GraphName as OxGraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term,
+};
 use nrese_sparql_syntax::algebra::GraphTarget;
 use nrese_sparql_syntax::term::{GraphName, GroundQuad, Quad as DataQuad};
 use nrese_sparql_syntax::{GraphUpdateOperation, Update};
@@ -212,9 +214,16 @@ fn apply_operation(
             }
         }
         GraphUpdateOperation::Create { graph, silent } => {
-            let exists = tx
-                .lookup(graph.as_ref().into())
-                .is_some_and(|id| tx.contains_named_graph(id) && options.sees(tx, id));
+            // Another store's name for the default graph names it: it exists iff it holds a
+            // quad, as a named graph does.
+            let holds = |id| match id == TermId::DEFAULT_GRAPH {
+                true => tx
+                    .quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::in_graph(id))
+                    .next()
+                    .is_some(),
+                false => tx.contains_named_graph(id),
+            };
+            let exists = graph_id(tx, graph).is_some_and(|id| holds(id) && options.sees(tx, id));
             if exists && !silent {
                 return Err(UpdateError::GraphAlreadyExists(graph.clone()));
             }
@@ -247,7 +256,7 @@ fn clear(
     };
     let restricted = options.access.is_some() || options.writable.is_some();
     let graphs: Vec<TermId> = match target {
-        GraphTarget::NamedNode(name) => match tx.lookup(name.as_ref().into()) {
+        GraphTarget::NamedNode(name) => match graph_id(tx, name) {
             Some(id) => vec![id],
             None => return Ok(()),
         },
@@ -300,13 +309,21 @@ fn clear(
     Ok(())
 }
 
+/// The store graph an operation's graph name names ([`crate::compat::graph_named`]).
 fn graph_name(graph: &GraphName) -> OxGraphName {
     match graph {
-        GraphName::NamedNode(name) if crate::compat::names_default_graph(name.as_str()) => {
-            OxGraphName::DefaultGraph
-        }
-        GraphName::NamedNode(name) => name.clone().into(),
+        GraphName::NamedNode(name) => crate::compat::graph_named(name).into_owned(),
         GraphName::DefaultGraph => OxGraphName::DefaultGraph,
+    }
+}
+
+/// The id of the store graph `name` names ([`crate::compat::graph_named`]), if the store
+/// knows that name.
+fn graph_id(tx: &Transaction<'_>, name: &NamedNode) -> Option<TermId> {
+    match crate::compat::graph_named(name) {
+        GraphNameRef::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
+        GraphNameRef::NamedNode(name) => tx.lookup(name.into()),
+        GraphNameRef::BlankNode(node) => tx.lookup(node.into()),
     }
 }
 
