@@ -1676,6 +1676,74 @@ def maker_of(entry: dict) -> tuple[str, list[str]] | None:
     return found
 
 
+# The container each maker that starts containers runs them in, one at a time (memory GB, CPUs): what a
+# job that may run it declares to the fleet and holds the maker's containers to (data_job(); the master,
+# 8 Nov 2026: the fleet refused #129's timing jobs, their makers' containers undeclared). The LUBM and
+# OWL2Bench makers': twice the lowest cap that made every job-run file (maker-containers-measure-1, 8 Nov
+# 2026: lubm-1/10/100 and owl2bench-rl-1 made at 8 CPUs uncapped and under 8, 4 and 2 GB, the LUBM bytes
+# as pinned under each; the largest uncapped peaks UBA's lubm-100 run, 3.8 GB, and its sort, 5.6 GB with
+# its written file's page cache; at 2 GB, UBA at its cap, the whole make 133 s against 108 uncapped).
+# benches/sparql/prepare.sh's: its own CAP (its containers' limits outside a declared job;
+# test_release_gate holds the two alike).
+MAKER_CONTAINERS = {
+    "bash benches/reasoning/prepare-lubm.sh": (4, 8),
+    "bash benches/reasoning/prepare-owl2bench.sh": (4, 8),
+    "bash " + SPARQL_PREPARE: (8, 8),
+}
+
+
+def staged_makers_problems(found: dict[str, dict], checkout: str, harness: str) -> list[str]:
+    """Why the planned jobs `found` would run makers not held to their declaration (empty: none). A
+    job's data step runs the harness's own makers (release-gate.sh prepare, in the harness's
+    worktree), not this checkout's: a harness from before their containers carried the job's label
+    and limits (scripts/lib/ns.sh ns_maker_args) starts containers the fleet stops the step at
+    (sol-loop r1 S1 of pkg/maker-containers, 8 Nov 2026). Read from `harness` in `checkout`, for the
+    makers each job declares (data_job()'s `_makers`); unreadable fails. The planners' one check
+    before a plan is written (abba.py run and jobs, release_gate.py jobs)."""
+    import subprocess
+
+    def at(path: str) -> str:
+        done = subprocess.run(["git", "-C", checkout, "show", f"{harness}:{path}"], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=60)
+        return done.stdout if done.returncode == 0 else ""
+
+    makers = sorted({m for job in found.values() for m in job.get("_makers", [])})
+    if not makers:
+        return []
+    old = ([] if "ns_maker_args()" in at("scripts/lib/ns.sh") else ["scripts/lib/ns.sh"]) \
+        + [m for m in makers if "ns_maker_args" not in at(m)]
+    return [f"the harness {harness[:12]}'s data makers don't hold their containers to the job's declaration "
+            f"({', '.join(old)}: no ns_maker_args), so the fleet would stop its data step: time with a harness "
+            "that has them (abba.py run --harness, release-gate.sh jobs HARNESS)"] if old else []
+
+
+def data_job(cases: list[dict], requires: dict, datasets: Path = ROOT / "benches" / "datasets.toml") \
+        -> tuple[dict, dict, dict]:
+    """The one data ask of a timing job of `cases` (abba.py jobs(), jobs() part()), its `requires`
+    (cores, ram_gb) given: (requires, the job's own fields, its env). What the host must have or run
+    (`has`, data_needs()) and the disk to make it in (data_disk_gb()). Where a maker it may run starts
+    containers (one that asks for Docker), the fleet's declared containers (F61, job spec 9: `spec`,
+    `containers`, Linux): one container, as large as the largest of its makers' (MAKER_CONTAINERS),
+    since they run one at a time; `ram_gb` grows by its memory, which the fleet takes out of every
+    step's slice, so the builds and blocks keep what they asked; and the env its makers' containers
+    take their limits from (scripts/lib/ns.sh ns_maker_args). A job that runs no such maker is asked
+    as before, nothing declared. The declaring job names its makers' scripts (`_makers`, the
+    planner's own: spec() leaves it out of the job), for staged_makers_problems()."""
+    has, disk = data_needs(cases, datasets), data_disk_gb(cases, datasets)
+    requires = {**requires, **({"has": has} if has else {}), **({"disk_gb": disk} if disk else {})}
+    if "docker" not in has:
+        return requires, {}, {}
+    files = {f for c in cases for f in volume_files(c)}
+    entries = frozen(files, datasets)  # the whole catalogue: only the cases' own files count
+    makers = {start: size for start, size in MAKER_CONTAINERS.items()
+              if any(entries.get(f, {}).get("made_by", "").startswith(start + " ") for f in files)}
+    memory, cpus = max(m for m, _ in makers.values()), max(c for _, c in makers.values())
+    requires |= {"os": "linux", "ram_gb": requires["ram_gb"] + memory}
+    return (requires, {"spec": 9, "containers": [{"name": "maker", "memory_gb": memory, "cpus": cpus}],
+                       "_makers": sorted(start.split()[1] for start in makers)},
+            {"NRESE_MAKER_MEMORY_GB": f"{memory:g}", "NRESE_MAKER_CPUS": f"{cpus:g}"})
+
+
 def data_needs(cases: list[dict], datasets: Path = ROOT / "benches" / "datasets.toml") -> list[str]:
     """What a host must hold or run for the cases' frozen inputs (fleet `has`). The job makes what
     benches/sparql/prepare.sh and the DATASET_MAKERS can (Johannes, 2 Nov 2026: "Data is the job's
@@ -2041,14 +2109,15 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
              block_cases: list[list[str]]) -> dict:
         steps = builds + timed_steps + report
         mine = [by_name[c] for c in planned if c in by_name]
-        has, disk = data_needs(mine), data_disk_gb(mine)
+        # Its data's ask, its makers' containers declared: data_job(), as abba.py's jobs.
+        requires, data_fields, data_env = data_job(
+            mine, {"roles": TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": ram_gb})
+        part_env = {**part_env, **data_env}
         fetched = bench_inputs(mine)
         if fetched:
             part_env = {**part_env, "BENCH_INPUTS_REV": fetched[0]["source"]["rev"]}
-        requires = ({"roles": TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": ram_gb} | ({"has": has} if has else {})
-                    | ({"disk_gb": disk} if disk else {}))
         est = plan_minutes(len(revisions), sides, block_cases, measure)
-        return {"id": job_id, "group": "release", "kind": "owlrs.timed", "class": "exclusive",
+        return {"id": job_id, "group": "release", "kind": "owlrs.timed", "class": "exclusive", **data_fields,
                 "priority_class": "merge-gate", "env": part_env, "stall_after_min": 90,
                 "est_min": round(est["total_min"]), "_plan": est,
                 "steps": steps,
@@ -2516,6 +2585,9 @@ def main() -> int:
                      checks=not args.no_checks, big_gb=None if args.no_big else args.big_gb,
                      measure=measure, batch=batch, layouts=args.layouts,
                      catalog=cases_registry.load_at(args.checkout, harness))
+        if staged := staged_makers_problems(found, args.checkout, harness):
+            print("\n".join(staged), file=sys.stderr)
+            return 2
         args.out.mkdir(parents=True, exist_ok=True)
         path = args.out / f"{prefix}.set.toml"
         path.write_bytes(toml_set({"id": prefix, "fail": "continue"}, list(found.values())).encode("utf-8"))
