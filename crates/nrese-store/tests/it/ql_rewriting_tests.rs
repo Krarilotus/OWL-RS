@@ -1420,6 +1420,60 @@ fn existentials_of_axioms_the_tbox_reads_in_part_are_answered_or_reported() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A bounded restriction forces an existential on a successor that exists (I24b fix check
+/// r2, F4; fixtures `review-i24b-r3/f4.ttl` and `f4-exact-zero.ttl`). `C ⊑ ¬(≥ 1 R.¬∃S.D)`
+/// and `C ⊑ (= 0 R.¬∃S.D)` are both `C ⊑ ∀R.∃S.D` (OWL 2 Direct Semantics §2.2.3): with
+/// `c : C` and `R(c, x)`, `x` has an `S`-successor in `D`, so both queries are entailed.
+/// Each must be answered true, or reported as not `complete`, under owl2-rl and owl2-ql.
+#[test]
+fn existentials_bounded_restrictions_force_are_answered_or_reported() {
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n"
+    );
+    let not_x = "[ a owl:Class ; owl:complementOf
+                   [ a owl:Restriction ; owl:onProperty :S ; owl:someValuesFrom :D ] ]";
+    let cases = [
+        format!(
+            "{head}:C rdfs:subClassOf [ a owl:Class ; owl:complementOf
+                 [ a owl:Restriction ; owl:onProperty :R ;
+                   owl:minQualifiedCardinality \"1\"^^xsd:nonNegativeInteger ; owl:onClass {not_x} ] ] .
+             :c a :C ; :R :x ."
+        ),
+        format!(
+            "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                 owl:qualifiedCardinality \"0\"^^xsd:nonNegativeInteger ; owl:onClass {not_x} ] .
+             :c a :C ; :R :x ."
+        ),
+    ];
+    let queries = [
+        format!("ASK {{ <{E}x> <{E}S> ?y . ?y a <{E}D> }}"),
+        format!("ASK {{ ?y a <{E}D> }}"),
+    ];
+    let mut wrong = Vec::new();
+    for (n, turtle) in cases.iter().enumerate() {
+        for ruleset in [Ruleset::Owl2Rl, Ruleset::Owl2Ql] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(turtle, dir.path(), ruleset, true);
+            for query in &queries {
+                let result = store
+                    .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                    .unwrap_or_else(|e| panic!("case {n}, {query}: {e}"));
+                let answer = String::from_utf8(result.payload).unwrap();
+                let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+                if !answer.contains("true") && matches!(status, "complete" | "none") {
+                    wrong.push(format!(
+                        "case {n}, {}, {query}: {answer}, {status}",
+                        ruleset.name()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A rewritten query reads only what its reader may (design §1), and uses the schema as
 /// the RL closure the reader sees was computed: a reader who sees the inferences its graphs
 /// support (`inferred = "supported"`) gets the existentials of readable graphs only, one who
