@@ -616,7 +616,7 @@ def decide(parts: list[list[dict]]) -> dict:
     round 3 could still get rejected, whether or not round 1 flagged it: a loss first seen while
     confirming another is confirmed too, not dropped); everything else passes at the end of its
     budget."""
-    family, rounds_p, where = [], {}, {}
+    family, rounds_p, where, untested = [], {}, {}, {}
     for rounds in parts:
         declared = rounds[0].get("family") or list(rounds[0].get("pvalues", {}))
         family += [h for h in declared if h not in where]
@@ -625,6 +625,11 @@ def decide(parts: list[list[dict]]) -> dict:
         for k, report in enumerate(rounds[:3]):
             for h, p in (report.get("pvalues") or {}).items():
                 rounds_p.setdefault(h, [None, None, None])[k] = p
+            # A declared hypothesis a round didn't test, for the reason the gate gave (compare_case):
+            # not part of a pass however the rest comes out (review abba-not-compared r1 W-OUT1).
+            for h, why in (report.get("not_compared") or {}).items():
+                if h in declared:
+                    untested.setdefault(h, why)
     combined = {h: gatestats.combine_rounds(rounds_p.get(h, [None, None, None])) for h in family}
     rejected = gatestats.holm(combined)
     # Round 3 where it could still decide: Holm rejects it if every hypothesis measured in round 2
@@ -644,7 +649,8 @@ def decide(parts: list[list[dict]]) -> dict:
         elif h in third and h in best:
             pending.append(h)
     return {"family": family, "m": len(family), "combined": combined, "rounds": rounds_p,
-            "losses": sorted(rejected, key=lambda h: combined[h]), "pending": pending}
+            "losses": sorted(rejected, key=lambda h: combined[h]), "pending": pending,
+            "not_compared": {h: untested[h] for h in family if h in untested}}
 
 
 # --- the owner-approved trade-offs (benches/release-tradeoffs.toml) ----------------------------
@@ -2244,6 +2250,8 @@ def verdict(timed: list[dict], w3c: dict, guards: dict) -> tuple[bool, str]:
             blocking_losses.append(text)
     lines += [f"- **confirmed loss**: {t}" for t in blocking_losses]
     lines += [f"- **pending** (a round that could reject it hasn't run): {h}" for h in d["pending"]]
+    lines += [f"- **not compared**: {h.split('|')[1]} against {h.split('|')[0]}: {h.split('|', 2)[2]}: {why}"
+              for h, why in d["not_compared"].items()]
     lines += [f"- {b}" for b in other] + [f"- pass error: {e}" for e in errors]
     covered = {c for t in timed for c in t.get("planned", [])}
     missing = sorted({c for t in timed for c in t.get("elsewhere", {})} - covered)
@@ -2252,8 +2260,8 @@ def verdict(timed: list[dict], w3c: dict, guards: dict) -> tuple[bool, str]:
     lines.append(f"- W3C: {'passed' if w3c['passed'] else 'NOT passed'} ({'; '.join(w3c['errors']) or 'every suite as required'})")
     lines.append(f"- §0 guards: {'passed' if guards['passed'] else 'NOT passed'} "
                  f"({'; '.join(guards['errors'][:5]) or str(guards['guards']) + ' guards ran and passed'})")
-    passed = (not blocking_losses and not d["pending"] and not other and not errors and not diagnostic
-              and not missing and w3c["passed"] and guards["passed"])
+    passed = (not blocking_losses and not d["pending"] and not d["not_compared"] and not other and not errors
+              and not diagnostic and not missing and w3c["passed"] and guards["passed"])
     lines += ["", f"**{'PASSED' if passed else 'NOT PASSED'}**"]
     return passed, "\n".join(lines) + "\n"
 
