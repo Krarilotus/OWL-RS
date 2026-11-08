@@ -302,6 +302,114 @@ fn dot_dot_after_a_link_is_taken_as_windows_takes_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Windows' lexical normalisation, as `place::as_walked` applies it (sol-loop round 2, S3):
+/// only a root absorbs a `..`. A drive-relative path (`C:x`, no root) keeps a `..` that goes
+/// above its start, as a relative path does. A verbatim path is left as it is. Rows of (path,
+/// what Windows walks), from Windows' path normalisation rules. Before the fix a drive-relative
+/// prefix absorbed `..` like a root: `C:alias\..\..\tenant\store` became `C:tenant\store`.
+#[cfg(windows)]
+#[test]
+fn windows_paths_are_walked_as_windows_normalises_them() {
+    let rows = [
+        (r"C:alias\..\..\tenant\store", r"C:..\tenant\store"),
+        (r"C:\a\..\..\b", r"C:\b"),
+        (r"\\server\share\..\x", r"\\server\share\x"),
+        (r"a\..\..\b", r"..\b"),
+        (r"..\a", r"..\a"),
+        (r"a\.\b", r"a\b"),
+        (r"\\?\C:\a\..\b", r"\\?\C:\a\..\b"),
+    ];
+    let wrong: Vec<String> = rows
+        .iter()
+        .filter_map(|(path, walked)| {
+            let got = place::as_walked(Path::new(path));
+            (got != Path::new(walked))
+                .then(|| format!("{path}: walked {}, not {walked}", got.display()))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A drive-relative path whose `..` goes above its start, and a relative link target from a
+/// relative root (sol-loop round 2, S2 and S3), on Windows. Both are relative to this test's
+/// working directory (never changed: a directory made inside it).
+/// - S3: `D:..\<cwd's name>\<made>\a\store` (D the working directory's drive) names the chain
+///   through the working directory's parent, and succeeds; before the fix the prefix absorbed
+///   the `..` and the path named didn't exist.
+/// - S2 (a directory symlink: needs the privilege): `<made>\a\alias` → `..\data`, both
+///   `<made>\data\store` and `<made>\a\data\store` there; naming `<made>\a\alias\store` syncs
+///   `<made>\data` (the actual store's holder), and its failing sync refuses. Before the fix the
+///   joined target was walked again from `<made>\a`, naming `<made>\a\data`'s chain.
+#[cfg(windows)]
+#[test]
+fn relative_windows_paths_name_what_windows_reaches() {
+    let mut wrong = Vec::new();
+    let cwd = std::env::current_dir().unwrap();
+    let made = tempfile::tempdir_in(&cwd).unwrap();
+    let relative = made.path().strip_prefix(&cwd).unwrap().to_path_buf();
+    std::fs::create_dir_all(made.path().join("a\\store")).unwrap();
+
+    // S3: a drive-relative path with a leading `..`.
+    let drive = match cwd.components().next() {
+        Some(std::path::Component::Prefix(prefix)) => prefix.as_os_str().to_owned(),
+        other => panic!("the working directory has no prefix: {other:?}"),
+    };
+    let mut path = PathBuf::from(&drive);
+    path.push("..");
+    path.push(cwd.file_name().unwrap());
+    path.push(&relative);
+    path.push("a\\store");
+    let (named, synced) = syncs_of(|| place::name_existing(&path));
+    if let Err(error) = named {
+        wrong.push(format!("{}: {error}", path.display()));
+    }
+    wrong.extend(judge(
+        "a drive-relative `..`",
+        &synced,
+        &[
+            cwd.parent().unwrap(),
+            &cwd,
+            made.path(),
+            &made.path().join("a"),
+        ],
+        true,
+    ));
+
+    // S2: a relative target from a relative root.
+    std::fs::create_dir_all(made.path().join("data\\store")).unwrap();
+    std::fs::create_dir_all(made.path().join("a\\data\\store")).unwrap();
+    match std::os::windows::fs::symlink_dir("..\\data", made.path().join("a\\alias")) {
+        Ok(()) => {
+            let path = relative.join("a\\alias\\store");
+            let (named, synced) = syncs_of(|| place::name_existing(&path));
+            if let Err(error) = named {
+                wrong.push(format!("{}: {error}", path.display()));
+            }
+            wrong.extend(judge(
+                "a relative target from a relative root",
+                &synced,
+                &[&made.path().join("a"), &made.path().join("data")],
+                true,
+            ));
+            fault::FAIL_DIR_SYNC_OF
+                .set(Some((made.path().join("data"), std::io::ErrorKind::Other)));
+            let named = place::name_existing(&path);
+            fault::FAIL_DIR_SYNC_OF.set(None);
+            if named.is_ok() {
+                wrong
+                    .push("a relative target: named though the actual holder's sync failed".into());
+            }
+        }
+        Err(error) if error.raw_os_error() == Some(1314) => {
+            eprintln!(
+                "a relative target row: not run (no privilege to make a symlink on this host)"
+            );
+        }
+        Err(error) => panic!("symlink: {error}"),
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// Links in links, relative links and `..` after a link (Linux): the resolution follows them as
 /// the kernel does. Rows, judged apart: a chain `l1` → `l2` → `t/inner` of relative links,
 /// `l1/store` synced through `t` and `t/inner`; `..` after a link (`x` → `p/q`, then

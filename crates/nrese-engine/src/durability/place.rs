@@ -268,7 +268,7 @@ fn resolve(path: &Path) -> std::io::Result<Resolution> {
 /// taken lexically first, as Windows normalises a path before the file system sees it, so
 /// `alias\..\x` is `x` whatever `alias` points to (sol-loop round 1, S1); a relative path keeps
 /// its leading `..`, and a root's `..` is the root.
-fn as_walked(path: &Path) -> PathBuf {
+pub(super) fn as_walked(path: &Path) -> PathBuf {
     #[cfg(windows)]
     {
         use std::path::{Component, Prefix};
