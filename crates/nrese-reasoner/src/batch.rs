@@ -3466,6 +3466,54 @@ mod counted_tests {
             );
         });
     }
+
+    /// REAS-2 (orchestrator, 8 Nov 15:54): a closed family's read of a marked delta
+    /// ([`Run::scan_unmarked`]) counts a slice's positions ahead, so its reader asks its stop
+    /// within `POLL_UNITS` plus one run, the longest run counted at once: `POLL_UNITS`
+    /// (`Run::scan_unmarked` hands each slice on in pieces of at most `POLL_UNITS`). One
+    /// delta chunk of the production chunk size, 1 << 20 pairs ([`CHUNK_PAIRS`]), none of
+    /// them marked: counted as one attempt, the whole chunk was one ask. The chunk is built
+    /// as one ([`Pairs::whole`]) rather than through [`set_chunk_pairs`], a process-wide
+    /// setting the other unit tests read at 16 while this one runs.
+    #[test]
+    fn a_marked_delta_scan_asks_its_stop_within_a_run() {
+        let n: usize = 1 << 20;
+        let pairs: Vec<Pair> = (0..n as u64).map(|i| (i, i + 1)).collect();
+        let mut relation = Relation {
+            closed_by: Some(1),
+            ..Relation::default()
+        };
+        relation.delta = Run::new(Pairs::whole(pairs), false);
+        relation.marks = Some(Marks {
+            all: false,
+            so: vec![vec![0; n.div_ceil(64)]],
+            os: None,
+        });
+        let asks = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || {
+            asks.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        let poll = Poller::new(&stop).expect("not stopped");
+        let mut delivered = 0;
+        {
+            let mut deliver = |_: Triple| delivered += 1;
+            let mut visit = Visit::new(&poll, &mut deliver);
+            relation.scan(None, None, Seg::DeltaNotBy(1), &mut |at| {
+                on(&mut visit, 7, at)
+            });
+        }
+        assert_eq!(delivered, n, "every pair of the delta, none marked");
+        let interval = nrese_exec::POLL_UNITS as usize;
+        // The longest run the scan counts at once (`Run::scan_unmarked`).
+        let run = interval;
+        let asks = asks.load(Ordering::Relaxed);
+        assert!(
+            asks >= n / (interval + run),
+            "{asks} asks of the stop for {n} positions: more than {interval} positions plus \
+             one run of {run} visited between two of them"
+        );
+    }
 }
 
 #[cfg(test)]
