@@ -1474,6 +1474,99 @@ fn existentials_bounded_restrictions_force_are_answered_or_reported() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A `complete` status under a regime is claimed only where every axiom an answer's terms
+/// can meet is in that regime's profile, or covered by a hazard (I24c; master's ruling of
+/// 8 Nov 10:31). The profile's rules are complete only for its ontologies (W3C OWL 2
+/// Profiles, theorem PR1). Each `true` below is entailed under the OWL 2 Direct Semantics.
+///
+/// Answered true, or not reported `complete`:
+/// - W-N1 (I24b r4 review): `C ⊑ ∀R.Self(S)` with `c : C`, `R(c, x)`: `S(x, x)`.
+/// - W-N2: `C ⊑ ∀R.{a}` with `c : C`, `R(c, x)`, `a : D`: `x = a`, so `x : D`.
+/// - Under owl2-ql, `Person ⊓ Employed ⊑ Worker ⊑ Taxpayer` with `x : Person, Employed`:
+///   `x : Taxpayer`, on a superclass of the uncovered conclusion.
+/// - `C ⊑ ∃R.Self`, `R` with domain `D`, `D ⊓ F ⊑ G`, with `x : C, F`: `x : G`. The chain
+///   runs through two axioms in the RL profile, which RL's rules apply only to facts the
+///   closure has.
+///
+/// Precision guard: `x : Person` and `x : Employed` of the third case, terms of the same
+/// axiom that no uncovered conclusion reaches, stay `complete` under owl2-ql.
+#[test]
+fn axioms_outside_the_profile_are_answered_or_reported() {
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n"
+    );
+    let cases = [
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ; owl:allValuesFrom
+                     [ a owl:Restriction ; owl:onProperty :S ; owl:hasSelf true ] ] .
+                 :c a :C ; :R :x ."
+            ),
+            format!("ASK {{ <{E}x> <{E}S> <{E}x> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                     owl:allValuesFrom [ a owl:Class ; owl:oneOf ( :a ) ] ] .
+                 :c a :C ; :R :x . :a a :D ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}D> }}"),
+        ),
+        (
+            format!(
+                "{head}[ owl:intersectionOf ( :Person :Employed ) ] rdfs:subClassOf :Worker .
+                 :Worker rdfs:subClassOf :Taxpayer .
+                 :x a :Person, :Employed ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}Taxpayer> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ; owl:hasSelf true ] .
+                 :R rdfs:domain :D .
+                 [ owl:intersectionOf ( :D :F ) ] rdfs:subClassOf :G .
+                 :x a :C, :F ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}G> }}"),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (n, (turtle, query)) in cases.iter().enumerate() {
+        for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(turtle, dir.path(), ruleset, true);
+            let result = store
+                .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                .unwrap_or_else(|e| panic!("case {n}, {query}: {e}"));
+            let answer = String::from_utf8(result.payload).unwrap();
+            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+            if !answer.contains("true") && matches!(status, "complete" | "none") {
+                wrong.push(format!(
+                    "case {n}, {}, {query}: {answer}, {status}",
+                    ruleset.name()
+                ));
+            }
+        }
+    }
+    // The guard: the premise's terms stay `complete` under owl2-ql.
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&cases[2].0, dir.path(), Ruleset::Owl2Ql, true);
+    for class in ["Person", "Employed"] {
+        let query = format!("SELECT ?x WHERE {{ ?x a <{E}{class}> }}");
+        let result = store
+            .execute_query(&SparqlQueryRequest::all(query.as_str()))
+            .unwrap();
+        let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+        if !matches!(status, "complete" | "none") {
+            wrong.push(format!(
+                "guard, owl2-ql, {query}: {status}, expected complete"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A rewritten query reads only what its reader may (design §1), and uses the schema as
 /// the RL closure the reader sees was computed: a reader who sees the inferences its graphs
 /// support (`inferred = "supported"`) gets the existentials of readable graphs only, one who
