@@ -625,8 +625,10 @@ def decide(parts: list[list[dict]]) -> dict:
         for k, report in enumerate(rounds[:3]):
             for h, p in (report.get("pvalues") or {}).items():
                 rounds_p.setdefault(h, [None, None, None])[k] = p
-            # A declared hypothesis a round didn't test, for the reason the gate gave (compare_case):
-            # not part of a pass however the rest comes out (review abba-not-compared r1 W-OUT1).
+        # A declared hypothesis any round given didn't test, for the reason the gate gave
+        # (compare_case), the statistical slots or not: not part of a pass however the rest comes
+        # out (review abba-not-compared r1 W-OUT1; release-not-compared r1 W1: a fourth round's).
+        for report in rounds:
             for h, why in (report.get("not_compared") or {}).items():
                 if h in declared:
                     untested.setdefault(h, why)
@@ -2535,8 +2537,11 @@ def main() -> int:
         code, said = fleet_call("check", str(path))
         print("  fleet check" + (f" (exit {code})" if code else "") + ":\n    " + "\n    ".join(said.splitlines() or ["-"]))
         if not args.submit:
-            print(f"not submitted (--plan): fleet submit {path}, or this command with --submit")
-            return 0
+            # A plan the fleet refuses exits as refused (abba.py run --plan's sibling, review
+            # release-not-compared r1 OUT1).
+            print(f"not submitted (--plan): fleet submit {path}, or this command with --submit"
+                  + ("; fleet check refuses it (above)" if code else ""))
+            return 1 if code else 0
         if code != 0:
             print("not submitted: fleet check didn't take the set (above)", file=sys.stderr)
             return 1

@@ -132,6 +132,24 @@ class Abba(unittest.TestCase):
                     self.assertNotIn("not compared", row)
                     self.assertNotIn("| - | - |", row)
 
+    def test_a_fourth_round_that_compared_nothing_is_never_read_as_no_loss(self):
+        """Review release-not-compared r1 W1: four rounds in order, the first three comparable, the
+        fourth's A answering what the pinned rows don't (B's match), so it compared nothing; the
+        decision took reasons from three slots only and the report said no loss."""
+        pinned = {"q01-point-lookup": 5, "q06-text-filter": 1033}
+        base = records()
+
+        def wrong_a(side, n):
+            out = base(side, n)
+            for o in out[0]["observations"]:
+                o["rows"] = dict(pinned) if side == "b" else {"q01-point-lookup": 4, "q06-text-filter": 1000}
+            return out
+        rounds = [self.round_(records() if k < 4 else wrong_a, name=f"r{k}", k=k) for k in range(1, 5)]
+        code, text = self.verdict(*rounds)
+        self.assertNotEqual(code, abba.NO_LOSS)
+        self.assertEqual(code, abba.NOT_COMPARED)
+        self.assertIn("2 of 2 hypotheses not compared", text)
+
     def test_a_plan_the_fleet_refuses_exits_as_refused(self):
         """STAGE2's lead, 8 Nov 2026: `abba.py run --plan` exited 0 when the fleet check it ran
         refused the set ("(exit 1)" in its text only), so a script read a refused plan as taken. It

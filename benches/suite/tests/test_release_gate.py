@@ -13,8 +13,10 @@ host's noise between instances.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 import re
@@ -377,6 +379,43 @@ class Rounds(unittest.TestCase):
                     self.assertIn(f"**not compared**: lab-olympics against {side}: memory/anon_kernel: "
                                   f"{side} reports none (unsupported by this baseline)", text)
                 self.assertEqual(sorted(gate_module.decide([[s]])["not_compared"]), sorted(memory))
+
+    def test_a_round_beyond_the_statistical_slots_that_compared_nothing_is_never_a_pass(self):
+        """Review release-not-compared r1 W1: decide() took not-compared reasons from the three
+        statistical slots only, so a fourth round that tested nothing was dropped and the verdict
+        PASSED. Three rounds compare the memory hypotheses; the fourth's baseline reports none."""
+        def records_of(base_anon):
+            def of(side, n):
+                return [record(samples={"q01": [10.0, 10.1, 9.9], "q06": [4.8, 4.85, 4.8]},
+                               anon=1_000_000 if side == "cand" else base_anon)]
+            return of
+        family = [f"{s}|lab-olympics|memory/anon_kernel" for s in ("base", "main")]
+        rounds = [run_gate(passes(records_of(1_000_000 if k < 3 else None), blocks=4), family=family,
+                           context={**CONTEXT, "round": k}) for k in range(4)]
+        passed, text = gate_module.verdict(rounds, self.W3C, self.GUARDS)
+        self.assertFalse(passed)
+        self.assertIn("**not compared**: lab-olympics against base: memory/anon_kernel", text)
+        self.assertTrue(gate_module.verdict(rounds[:3], self.W3C, self.GUARDS)[0])  # the three alone pass
+
+    def test_a_refused_plan_of_the_gate_s_jobs_exits_as_refused(self):
+        """Review release-not-compared r1 OUT1: `release_gate.py jobs --plan` returned 0 when the
+        fleet check refused the set, as abba.py run --plan did. It exits 1; a taken plan 0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
+            subprocess.run(["git", "-C", tmp, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                            "--allow-empty", "-m", "x"], check=True, capture_output=True)
+            for code, expected in ((1, 1), (0, 0)):
+                with self.subTest(fleet_check=code), \
+                        patch.object(sys, "argv", ["release_gate.py", "jobs", "HEAD", "--base", "HEAD", "--main", "HEAD",
+                                                   "--checkout", tmp, "--out", str(Path(tmp) / "out"), "--plan"]), \
+                        patch.object(gate_module, "jobs", return_value={"rg-x": {"id": "rg-x"}}), \
+                        patch.object(gate_module, "set_plan", return_value="plan"), \
+                        patch.object(gate_module, "toml_set", return_value=""), \
+                        patch.object(gate_module.cases_registry, "load_at", return_value=[]), \
+                        patch.object(gate_module, "fleet_call", return_value=(code, "said")) as fleet, \
+                        contextlib.redirect_stdout(io.TextIOWrapper(io.BytesIO(), encoding="utf-8")):
+                    self.assertEqual(gate_module.main(), expected)
+                    self.assertEqual([c.args[0] for c in fleet.call_args_list], ["check"])
 
     def test_nothing_flagged_needs_no_confirmation(self):
         clean = self.round_(1.0)
