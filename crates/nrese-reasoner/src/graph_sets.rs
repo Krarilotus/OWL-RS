@@ -1917,6 +1917,131 @@ mod tests {
         assert!(failed.is_empty(), "{failed:#?}");
     }
 
+    /// Fix check r2 C1.b residual, by the allocator: an update's lookup of a premise it doesn't
+    /// recompute reads the premise's sets where its caller keeps them (a store's pool of
+    /// distinct sets, which the premise's entries index), and where nothing is kept (sets
+    /// that are just those it starts with, from its graphs) makes them charged first. The
+    /// unaffected premise `x` comes first, the affected `a` (own graph 2^16) second; rows vary
+    /// how many sets `x` keeps and how far their graphs reach, and refuse with no room. Each
+    /// row is checked on its own: nothing held beyond the charge, nothing charged after, and
+    /// either the specified sets (each of `x`'s with `a`'s graph, unmarked) or a refusal.
+    #[test]
+    fn an_unaffected_premise_is_read_where_it_is_kept() {
+        use super::{
+            Annotation, GraphSet, Limits, Recomputing, Run, initial_sets, premise_sets_from,
+        };
+        use hashbrown::{HashMap, HashSet};
+        use nrese_exec::{Budget, measure};
+        use std::sync::Arc;
+        if !measure::alone() {
+            return;
+        }
+        let (x, a): ([u64; 3], [u64; 3]) = ([1, 2, 3], [3, 2, 4]);
+        let a_graph = 1u32 << 16;
+        let mut now: HashMap<[u64; 3], Annotation> = HashMap::new();
+        now.insert(
+            a,
+            Annotation {
+                sets: vec![GraphSet::of(a_graph)],
+                ..Annotation::default()
+            },
+        );
+        let affected: HashSet<[u64; 3]> = [a].into_iter().collect();
+        let start = Annotation::empty_set();
+        let cap = 64;
+        let spread = |n: u32, step: u32| (0..n).map(|j| 128 + j * step).collect::<Vec<u32>>();
+        let near = ((1u32 << 16) - 4..1 << 16).collect::<Vec<u32>>();
+        // (row, x's sets are only its own graphs', x's graphs, the budget's limit)
+        let rows: [(&str, bool, Vec<u32>, usize); 6] = [
+            ("kept 1, span 2^16", false, vec![(1 << 16) + 1], usize::MAX),
+            ("kept 8, span 2^12", false, spread(8, 512), usize::MAX),
+            ("kept 64, span 2^16", false, spread(64, 1022), usize::MAX),
+            ("own 4, at 2^16", true, near.clone(), usize::MAX),
+            ("kept 64, refused first", false, spread(64, 1022), 0),
+            ("own 4, refused first", true, near, 0),
+        ];
+        let mut failed = Vec::new();
+        for (what, own, graphs, limit) in rows {
+            // As a store keeps them: a kept fact's distinct sets in a pool and its entries
+            // indexing it; an own fact's graphs only (each asserted fact with its graph).
+            let pool: Vec<GraphSet> = graphs.iter().map(|&g| GraphSet::of(g)).collect();
+            let entries: Vec<([u64; 3], u32)> = (0..pool.len() as u32).map(|i| (x, i)).collect();
+            let placed: Vec<([u64; 3], u32)> = graphs.iter().map(|&g| (x, g)).collect();
+            // The store's callback (`nrese-store` support.rs, `SupportSets::updated`).
+            let previous = |fact: [u64; 3]| -> Annotation {
+                if fact != x {
+                    return Annotation::default();
+                }
+                match own {
+                    false => Annotation {
+                        sets: entries
+                            .iter()
+                            .map(|&(_, id)| pool[id as usize].clone())
+                            .collect(),
+                        truncated: false,
+                        beyond_own: false,
+                    },
+                    true => {
+                        let graphs_of: Vec<u32> = placed
+                            .iter()
+                            .filter(|&&(f, _)| f == fact)
+                            .map(|&(_, g)| g)
+                            .collect();
+                        initial_sets(graphs_of, false, cap)
+                    }
+                }
+            };
+            let budget = Arc::new(Budget::new(limit));
+            let (got, excess) = measure::measure_within(&budget, || {
+                let run = Run::new(Limits::unlimited(&budget));
+                let lookup = Recomputing {
+                    now: &now,
+                    affected: &affected,
+                    previous: &previous,
+                };
+                premise_sets_from(&[x, a], &start, &lookup, cap, &run)
+            });
+            let got = got.map(|held| {
+                let mut sets: Vec<Vec<u32>> =
+                    held.sets.iter().map(|set| set.graphs().collect()).collect();
+                sets.sort_unstable();
+                (sets, held.truncated)
+            });
+            let want = match limit {
+                0 => None,
+                _ => {
+                    // Each union's graphs, ascending (as `GraphSet::graphs` gives them).
+                    let mut sets: Vec<Vec<u32>> = graphs
+                        .iter()
+                        .map(|&g| vec![g.min(a_graph), g.max(a_graph)])
+                        .collect();
+                    sets.sort_unstable();
+                    Some((sets, false))
+                }
+            };
+            let answered = match (&got, &want) {
+                (Ok(got), Some(want)) => got == want,
+                (Err(_), None) => true,
+                _ => false,
+            };
+            if !answered || excess != 0 || budget.used() != 0 {
+                failed.push(format!(
+                    "{what}: {}, {excess} bytes beyond the charge, {} still charged",
+                    match (&got, answered) {
+                        (Ok((sets, _)), true) => format!("{} sets as specified", sets.len()),
+                        (Ok(got), false) => format!("{got:?}, not as specified"),
+                        (Err(_), true) => "refused".to_owned(),
+                        (Err(_), false) => "refused, not as specified".to_owned(),
+                    },
+                    budget.used()
+                ));
+            } else {
+                eprintln!("{what}: ok");
+            }
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
     /// Review r2 C1.b, by the allocator: a round's jobs refer to their rule's charged schema
     /// part and hold no copy of it. Over several live jobs, what building them allocates is
     /// the same whatever the schema parts' set count and span.
