@@ -337,11 +337,10 @@ impl Window {
     /// threads waiting inside it are let go; the refusal is the result then. Between perf's
     /// enable and its disable the harness only returns from the enable's wait, checks the
     /// allocation flag and writes the disable: nothing allocates or formats (the `noop` op
-    /// counts what is left).
+    /// counts what is left). No pause before it: a caller with threads of its own has them
+    /// ready first (`ops::parallel`), and the load's pool threads went idle while the op's
+    /// input was prepared.
     pub(crate) fn count<R>(&mut self, op: impl FnOnce() -> R) -> Result<R, String> {
-        // The load's and the checkpoint's pool threads go to sleep first: perf counts every
-        // thread of the process.
-        std::thread::sleep(std::time::Duration::from_millis(200));
         let opened = match &mut self.control {
             Some(control) => control.send(b"enable\n"),
             None => Ok(()),

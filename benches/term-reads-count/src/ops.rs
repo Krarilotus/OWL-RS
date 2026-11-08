@@ -328,9 +328,9 @@ pub(crate) fn run(
 
 /// `read` over `items` into `out` (one result per item), both split into exactly `threads`
 /// parts, some empty if there are fewer items: as many readers as `noop` has at that thread
-/// count, so it calibrates every run. The threads start before the window opens and end after
-/// it closes, so neither is counted. A reader that panics still meets the barriers, and the
-/// run fails with its message.
+/// count, so it calibrates every run. The threads start, and set up, before the window opens
+/// (the controller waits for every one of them first) and end after it closes, so neither is
+/// counted. A reader that panics still meets the barriers, and the run fails with its message.
 fn parallel<T: Sync, O: Send>(
     threads: usize,
     snapshot: &Snapshot,
@@ -353,7 +353,10 @@ fn parallel<T: Sync, O: Send>(
         parts.push((these, theirs));
         (items, out) = (rest, others);
     }
-    let [start, done, end] = [(); 3].map(|()| Barrier::new(parts.len() + 1));
+    // `ready`: every reader has done its setup, before the window opens (not counted);
+    // `start` and `done` bound the op inside the window (counted, as in `noop`); `end` lets
+    // the readers go after it has closed.
+    let [ready, start, done, end] = [(); 4].map(|()| Barrier::new(parts.len() + 1));
     #[cfg(feature = "inject")]
     let mut late = hook("late-reader");
     std::thread::scope(|scope| {
@@ -361,7 +364,7 @@ fn parallel<T: Sync, O: Send>(
             .into_iter()
             .map(|(part, out)| {
                 let snapshot = snapshot.clone();
-                let (start, done, end, read) = (&start, &done, &end, &read);
+                let (ready, start, done, end, read) = (&ready, &start, &done, &end, &read);
                 // The first reader only.
                 #[cfg(feature = "inject")]
                 let late = std::mem::take(&mut late);
@@ -371,8 +374,10 @@ fn parallel<T: Sync, O: Send>(
                         std::thread::sleep(std::time::Duration::from_secs(1));
                     }
                     // The allocator sets up a thread's heap on its first allocation (about
-                    // 7,500 instructions, measured): here, before the window, not in the op.
+                    // 7,500 instructions, measured): here, before `ready`, so before the
+                    // window, however late the thread starts.
                     drop(std::hint::black_box(Box::new(0_u64)));
+                    ready.wait();
                     start.wait();
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         read(&snapshot, part, out)
@@ -389,6 +394,7 @@ fn parallel<T: Sync, O: Send>(
                 })
             })
             .collect();
+        ready.wait();
         let counted = window.count(|| {
             start.wait();
             done.wait();
