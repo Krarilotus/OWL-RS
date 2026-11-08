@@ -245,7 +245,12 @@ impl Durable {
         );
 
         let wal_dir = wal::wal_dir(root);
-        place::create_dir_all(&wal_dir)?;
+        // Named in the root, durably named above: the root's sync after replay names them.
+        place::create_store_dir(&wal_dir)?;
+        let archive = config.wal_archive.then(|| wal::archive_dir(root));
+        if let Some(archive) = &archive {
+            place::create_store_dir(archive)?;
+        }
         let segments = wal::list_segments(&wal_dir)?;
         let last = segments.len().checked_sub(1);
         if let Some(until) = config.recover_until
@@ -435,7 +440,8 @@ impl Durable {
         // What was recovered is durable before a new commit is acknowledged (F5): replayed
         // records may be in the page cache only (written under `OsBuffered`, or not synced yet
         // when the process died), and new commits may go to a segment after them. A
-        // checkpoint renamed just before the crash, and segments removed or cut, likewise.
+        // checkpoint renamed just before the crash, and segments removed or cut, likewise. The
+        // root's sync also names the WAL's directory and the archive, found in it above.
         for path in &replayed {
             place::sync_file(path)?;
         }
@@ -449,7 +455,7 @@ impl Durable {
             config.wal_segment_bytes,
             config.sync,
             integers_in_dictionary,
-            config.wal_archive.then(|| wal::archive_dir(root)),
+            archive,
         )?;
         Ok(Recovered {
             durable: Self {
