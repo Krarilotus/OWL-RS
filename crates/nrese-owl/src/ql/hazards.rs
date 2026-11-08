@@ -460,7 +460,7 @@ pub(crate) fn hazards(
     let mut untyped: Vec<(Term, Hazard)> = Vec::new();
     for &(e, positive) in unread {
         let (mut roles, mut fillers) = (Vec::new(), Vec::new());
-        generated(o, e, positive, &mut roles, &mut fillers);
+        generated(o, e, positive, &mut roles, Some(&mut fillers));
         if let Some(&role) = roles.first() {
             let h = Hazard::Untyped(role);
             untyped.extend(fillers.into_iter().map(|t| (t, h)));
@@ -818,11 +818,12 @@ fn enumerated(o: &Ontology, e: ExprId) -> Option<Term> {
 
 /// The roles of the existentials (`∃`, `≥ n`) in an expression ([`generated`]).
 fn existential_roles(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
-    generated(o, e, true, out, &mut Vec::new());
+    generated(o, e, true, out, None);
 }
 
 /// The existentials concluded by `e` (`positive`) or by its complement: their roles into
-/// `roles`, their fillers' terms into `fillers`. Every `≥ 1`-form of the expression's
+/// `roles`, their fillers' terms into `fillers` where given (a caller without them reads
+/// no filler's terms: #155's count). Every `≥ 1`-form of the expression's
 /// negation normal form is collected, at any depth (fix check r2, F4):
 /// - A restriction makes a successor where it reads as `≥ n` for n ≥ 1: `∃R.F`, `≥ n` and
 ///   `= n` for n ≥ 1, `¬∀R.F` (`∃R.¬F`), `¬≤ n` (`≥ n+1`) and `¬= n` (it may be `≥ n+1`).
@@ -837,29 +838,34 @@ fn existential_roles(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
 ///   combinations make a data value at most.
 ///
 /// Inverses give the named property, its role component. Conservative: it may name a
-/// role no individual is made for, never miss one. Each (expression, polarity) is walked
-/// once, so reading both polarities under nested bounds doesn't double the walk at each
-/// level; a successor's filler terms are still collected per restriction that makes one.
+/// role no individual is made for, never miss one. Under a bound, whose filler is read both
+/// ways, each (expression, polarity) is walked once, so nested bounds don't double the walk
+/// at each level; elsewhere the walk follows the expression as before and allocates
+/// nothing (#155's count: a set per walk cost 3.9 % of a compile over 1,000 asserted
+/// restrictions). A successor's filler terms are still collected per restriction that
+/// makes one.
 fn generated(
     o: &Ontology,
     e: ExprId,
     positive: bool,
     roles: &mut Vec<Term>,
-    fillers: &mut Vec<Term>,
+    fillers: Option<&mut Vec<Term>>,
 ) {
-    nnf(o, e, positive, &mut HashSet::new(), roles, fillers);
+    nnf(o, e, positive, false, &mut HashSet::new(), roles, fillers);
 }
 
+/// [`generated`]'s walk; `bounded` where it is inside a filler read both ways.
 fn nnf(
     o: &Ontology,
     e: ExprId,
     positive: bool,
+    bounded: bool,
     seen: &mut HashSet<(ExprId, bool)>,
     roles: &mut Vec<Term>,
-    fillers: &mut Vec<Term>,
+    mut fillers: Option<&mut Vec<Term>>,
 ) {
     use ClassExpr as C;
-    if !seen.insert((e, positive)) {
+    if bounded && !seen.insert((e, positive)) {
         return;
     }
     // An object restriction: its role and filler, whether it makes a successor, and
@@ -877,11 +883,19 @@ fn nnf(
         ) => return,
         (C::And(parts) | C::Or(parts), _) => {
             for &part in parts {
-                nnf(o, part, positive, seen, roles, fillers);
+                nnf(
+                    o,
+                    part,
+                    positive,
+                    bounded,
+                    seen,
+                    roles,
+                    fillers.as_deref_mut(),
+                );
             }
             return;
         }
-        (C::Not(inner), _) => return nnf(o, *inner, !positive, seen, roles, fillers),
+        (C::Not(inner), _) => return nnf(o, *inner, !positive, bounded, seen, roles, fillers),
         (C::DataSome(p, _), true)
         | (C::DataAll(p, _), false)
         | (C::DataMax(_, p, _), false)
@@ -911,12 +925,15 @@ fn nnf(
     };
     if makes {
         roles.push(p.named());
-        terms(o, *f, fillers);
+        if let Some(fillers) = fillers.as_deref_mut() {
+            terms(o, *f, fillers);
+        }
     }
+    let bounded = bounded || (inside && outside);
     if inside {
-        nnf(o, *f, true, seen, roles, fillers);
+        nnf(o, *f, true, bounded, seen, roles, fillers.as_deref_mut());
     }
     if outside {
-        nnf(o, *f, false, seen, roles, fillers);
+        nnf(o, *f, false, bounded, seen, roles, fillers);
     }
 }
