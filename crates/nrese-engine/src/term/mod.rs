@@ -16,7 +16,9 @@ pub(crate) mod offsets;
 pub(crate) mod order;
 pub(crate) mod pending;
 mod pieces;
+pub(crate) mod slot;
 mod strings;
+pub(crate) mod suffix;
 pub mod text;
 pub mod vectors;
 pub(crate) mod vocabulary;
@@ -24,6 +26,10 @@ pub(crate) mod vocabulary;
 mod vocabulary_study;
 
 pub use dictionary::{Dictionary, DictionaryStats, TermView};
+
+/// Test support: keys in a sealed block of the dictionary's heap.
+#[cfg(test)]
+pub(crate) const BLOCK: usize = pieces::BLOCK;
 pub use strings::{Placement, StringScan, StringTest};
 pub use text::{TextMatch, TextQuery};
 pub use vectors::{VectorQuery, VectorSearchReport, VectorStrategy};
