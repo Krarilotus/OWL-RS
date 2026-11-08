@@ -122,7 +122,7 @@ fn a_request_past_its_envelope_through_any_end_ends_within_it() {
     // The premise's copy alone is larger than the bounds' rows: a limit below it leaves
     // the bounds room and the compilation none.
     let snapshot = store.engine().snapshot();
-    let premise = nrese_dl::memory::ontology_bytes(&ontology_at(&store, &snapshot));
+    let premise = nrese_dl::memory::ontology_bytes(&ontology_at(&store, &snapshot).unwrap());
     assert!(
         premise > 64 << 10,
         "the ABox makes compiling the larger part"

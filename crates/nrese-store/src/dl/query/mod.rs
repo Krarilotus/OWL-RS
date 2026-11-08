@@ -59,7 +59,13 @@ pub(crate) use exact::{Ids, ground_axiom};
 #[derive(Debug, Default)]
 pub(crate) struct OntologyCache(std::sync::Mutex<Option<(u64, Arc<Ontology>)>>);
 
-pub(crate) fn ontology_at(store: &StoreService, snapshot: &Snapshot) -> Arc<Ontology> {
+/// The asserted ontology at `snapshot`'s revision, read once per revision; its reading's
+/// scratch charged to the bounds' budget (the store's, within the queries' memory: SYN-61).
+/// `Err` where that can't take it, with nothing kept.
+pub(crate) fn ontology_at(
+    store: &StoreService,
+    snapshot: &Snapshot,
+) -> Result<Arc<Ontology>, nrese_exec::BudgetExceeded> {
     let mut cache = store
         .dl()
         .query_ontology
@@ -69,11 +75,12 @@ pub(crate) fn ontology_at(store: &StoreService, snapshot: &Snapshot) -> Arc<Onto
     if let Some((revision, ontology)) = &*cache
         && *revision == snapshot.revision()
     {
-        return Arc::clone(ontology);
+        return Ok(Arc::clone(ontology));
     }
-    let ontology = Arc::new(source::read_snapshot(snapshot));
+    let kept = Arc::clone(store.dl().bounds.kept());
+    let ontology = Arc::new(source::read_snapshot(snapshot, kept)?);
     *cache = Some((snapshot.revision(), Arc::clone(&ontology)));
-    ontology
+    Ok(ontology)
 }
 
 /// The data's consistency at `snapshot`'s revision: recorded by its commit, proved by U1,
@@ -115,7 +122,9 @@ fn consistency_at(
         return stopped;
     }
     let cancel = nrese_dl::tableau::Cancel::from_flag(cancellation.flag());
-    let ontology = ontology_at(store, snapshot);
+    let Ok(ontology) = ontology_at(store, snapshot) else {
+        return Verdict::Unknown(source::refused("the revision"));
+    };
     let budget = gate::budget(store, Some(cancel), memory).remaining(deadline);
     if let Some(stopped) = stopped() {
         return stopped;

@@ -262,9 +262,10 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         .as_ref()
         .filter(|s| s.revision == base)
         .map(|s| (s.rules, s.upper.clone()));
-    let asserted: Vec<Triple> = tx.inserted().chain(tx.deleted()).map(quad_triple).collect();
+    // The commit's asserted changes, read from the transaction each time: no copy of them.
+    let asserted = || tx.inserted().chain(tx.deleted()).map(quad_triple);
     if let Some((true, _)) = current
-        && !asserted.iter().any(|t| changes_schema(tx, *t))
+        && !asserted().any(|t| changes_schema(tx, t))
     {
         return Preparation {
             base,
@@ -278,8 +279,7 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         match upper.as_deref() {
             // A U1 with equality classes is evaluated afresh (`Upper`'s module docs).
             Ok(upper)
-                if upper.classes().is_empty()
-                    && asserted.iter().all(|t| upper.is_assertion(*t)) =>
+                if upper.classes().is_empty() && asserted().all(|t| upper.is_assertion(t)) =>
             {
                 let before = tx.base();
                 let inserted: Vec<Triple> = tx
@@ -319,7 +319,7 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
                     }
                 }
             }
-            Err(_) if !asserted.iter().any(|t| changes_schema(tx, *t)) => {
+            Err(_) if !asserted().any(|t| changes_schema(tx, t)) => {
                 return Preparation {
                     base,
                     prepared: Prepared::Unavailable,
@@ -332,7 +332,15 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         }
     }
     source::intern_vocabulary(tx);
-    let ontology = source::read_pending(tx);
+    let Ok(ontology) = source::read_pending(tx, Arc::clone(store.dl().bounds.kept())) else {
+        return Preparation {
+            base,
+            prepared: Prepared::Rebuilt(Box::new(Err(GaveUp(source::refused("the commit"))))),
+            decided_by: "upper-bound",
+            proves_consistency: false,
+            ontology: None,
+        };
+    };
     if routed_to_rules(&ontology) && ontology.diagnostics.iter().all(|d| !d.is_fatal()) {
         // The RL gate that ran before has decided the commit's consistency.
         return Preparation {
@@ -601,7 +609,10 @@ fn afresh(store: &StoreService, snapshot: &Snapshot) -> (Result<Upper, GaveUp>, 
     if !replica {
         source::intern_vocabulary(&tx);
     }
-    let ontology = source::read_snapshot(snapshot);
+    let ontology = match source::read_snapshot(snapshot, Arc::clone(store.dl().bounds.kept())) {
+        Ok(ontology) => ontology,
+        Err(_) => return (Err(GaveUp(source::refused("the revision"))), false),
+    };
     if routed_to_rules(&ontology) && ontology.diagnostics.iter().all(|d| !d.is_fatal()) {
         return (Err(not_compiled()), true);
     }
@@ -630,11 +641,23 @@ fn taxonomy(
         return taxonomy;
     }
     let bounds = &store.dl().bounds;
+    // The taxonomy, and whether to keep it for the compilation: one whose ontology couldn't
+    // be read (SYN-61) is empty and incomplete, sound for this read (L adds nothing), never
+    // kept.
     let build = || {
         #[cfg(test)]
         seam::at(bounds, seam::Point::Taxonomy);
-        let ontology = super::query::ontology_at(store, snapshot);
-        Arc::new(super::lower::tbox_taxonomy(store, &ontology))
+        match super::query::ontology_at(store, snapshot) {
+            Ok(ontology) => (
+                Arc::new(super::lower::tbox_taxonomy(store, &ontology)),
+                true,
+            ),
+            Err(_) => {
+                let mut empty = super::lower::tbox_taxonomy(store, &nrese_owl::Ontology::default());
+                empty.incomplete.push(source::refused("the TBox"));
+                (Arc::new(empty), false)
+            }
+        }
     };
     let kept = || {
         lock(&bounds.state)
@@ -648,7 +671,11 @@ fn taxonomy(
             .claim(compiled, Kind::Opaque, || kept().map(Some))
         {
             Claim::Build(builder) => {
-                let taxonomy = build();
+                let (taxonomy, keep) = build();
+                if !keep {
+                    // Given to nobody waiting: they read again (the builder's drop wakes them).
+                    return taxonomy;
+                }
                 if let Some(s) = lock(&bounds.state).as_mut()
                     && s.compiled == compiled
                 {
@@ -661,7 +688,7 @@ fn taxonomy(
                 Ok(Some(taxonomy)) => return taxonomy,
                 // The build failed: again.
                 Ok(None) => {}
-                Err(nrese_exec::cell::Busy) => return build(),
+                Err(nrese_exec::cell::Busy) => return build().0,
             },
         }
     }
@@ -945,7 +972,8 @@ pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[Str
         if !replica {
             source::intern_vocabulary(&tx);
         }
-        let ontology = source::read_snapshot(&snapshot);
+        let ontology =
+            source::read_snapshot(&snapshot, Arc::clone(store.dl().bounds.kept())).ok()?;
         let normalised = nrese_owl::normalise(&ontology);
         let memory = store.memory_stop();
         let deadline = Deadline::after(store.config().dl.timeout);

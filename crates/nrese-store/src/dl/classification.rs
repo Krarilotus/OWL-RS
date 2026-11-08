@@ -49,7 +49,9 @@ pub(crate) fn taxonomy(store: &StoreService, snapshot: &Snapshot) -> Arc<Taxonom
         Taxonomy::complete,
         || match latest(&cache.realisation, revision) {
             Some(realisation) => realisation.taxonomy.clone(),
-            None => run(store, snapshot, classify::classify),
+            None => run(store, snapshot, classify::classify, |t, why| {
+                t.incomplete.push(why)
+            }),
         },
     )
 }
@@ -61,7 +63,11 @@ pub(crate) fn realisation(store: &StoreService, snapshot: &Snapshot) -> Arc<Real
         &store.dl().classification.realisation,
         snapshot.revision(),
         complete,
-        || run(store, snapshot, classify::realise),
+        || {
+            run(store, snapshot, classify::realise, |r, why| {
+                r.incomplete.push(why)
+            })
+        },
     )
 }
 
@@ -96,18 +102,30 @@ fn latest<T>(slot: &Slot<T>, revision: u64) -> Option<Arc<T>> {
 
 /// `engine` over `snapshot`'s asserted ontology, within one timeout that includes
 /// reading the ontology.
+/// Its reading of the ontology draws on the run's envelope too (SYN-61); where that can't
+/// take it, the engine's result over no axioms, `incomplete` saying why (never kept: a
+/// result kept is complete).
 fn run<T>(
     store: &StoreService,
     snapshot: &Snapshot,
     engine: fn(&nrese_owl::Ontology, &classify::Options) -> T,
+    incomplete: fn(&mut T, String),
 ) -> T {
     let started = Instant::now();
-    let ontology = source::read_snapshot(snapshot);
     let mut options = options(store);
+    let memory = options.tableau.memory.clone().unwrap_or_default();
+    let read = source::read_snapshot(snapshot, memory);
     options.timeout = options
         .timeout
         .map(|limit| limit.saturating_sub(started.elapsed()));
-    engine(&ontology, &options)
+    match read {
+        Ok(ontology) => engine(&ontology, &options),
+        Err(_) => {
+            let mut none = engine(&nrese_owl::Ontology::default(), &options);
+            incomplete(&mut none, source::refused("the revision"));
+            none
+        }
+    }
 }
 
 #[cfg(test)]
