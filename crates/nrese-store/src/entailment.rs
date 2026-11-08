@@ -344,8 +344,16 @@ impl StoreService {
             ));
         }
         let snapshot = self.engine().snapshot();
-        let premise = source::read_snapshot(&snapshot);
-        let budget = gate::budget(self, None, &self.envelope(None));
+        let memory = self.envelope(None);
+        // Undecided where the request's envelope can't take reading the premise (SYN-61).
+        let Ok(premise) = source::read_snapshot(&snapshot, memory.clone()) else {
+            let why = source::refused("the premise");
+            return Ok(DlEntailment {
+                answer: Entailed::Unknown(format!("the premise: {why}")),
+                premise: Verdict::Unknown(why),
+            });
+        };
+        let budget = gate::budget(self, None, &memory);
         let checked = consistency::check(&premise, &budget);
         if checked.verdict != Verdict::Consistent {
             let answer = match &checked.verdict {
