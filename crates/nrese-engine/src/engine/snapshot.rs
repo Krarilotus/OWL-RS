@@ -166,6 +166,10 @@ fn unlimited() -> &'static Arc<nrese_exec::Budget> {
 #[derive(Debug, Default)]
 pub struct InferredMask {
     runs: Vec<Arc<crate::index::run::Run>>,
+    /// Whether it ever showed a statement the stack it was made over didn't hold, so that
+    /// a view through it adds statements never published ([`Snapshot::with_inferred_mask`]).
+    /// Kept by every mask changed from it: an addition stays one.
+    adds: bool,
     /// The charge of its runs and its list, the earlier masks' among its parts. After
     /// `runs`: released once they are freed.
     held: Held,
@@ -276,8 +280,24 @@ impl InferredMask {
             let run = crate::index::run::Run::from_delta_within(layout, show, hide, &mut held)?;
             runs.push(Arc::new(run));
         }
+        // A statement shown that the stack doesn't hold, visible through the mask: the
+        // view adds it (the store's support views show facts asserted out of a reader's
+        // reach). One sign sum per shown statement, over the stack's runs and the mask's,
+        // as the view will read it; nothing allocated.
+        let stack = &snapshot.version.inferred;
+        let visible = |quad: &EncodedQuad| {
+            let sign: i64 = (stack.runs().iter().chain(&runs))
+                .map(|run| run.sign_of(quad))
+                .sum();
+            sign > 0
+        };
+        let adds = self.adds
+            || show
+                .iter()
+                .any(|quad| !stack.contains(quad) && visible(quad));
         Ok(Self {
             runs,
+            adds,
             held: Held::new(self.held.with(0), held),
         })
     }
@@ -638,18 +658,16 @@ impl Snapshot {
         self.restricted(inferred, self.held.clone(), of)
     }
 
-    /// What a view keeping only `kept` of this snapshot's inferred statements is to it: a
-    /// restriction if they are among them, which the caller ensures (the store's support
-    /// views derive them from this snapshot's statements). Checked in debug builds only,
-    /// where a view of any other statement loses the publication its source had. A check
-    /// in release costs about as much as building the view: 24.5 against 21.2 ms for 100 k
-    /// of 1 M statements (sizing probe `dictlc-p30-probe-d6cf4e5a`), on every version a
-    /// support view is rebuilt for.
+    /// What a view keeping only `kept` of its inferred statements is to this snapshot: a
+    /// restriction if they are all among them, an addition otherwise. The store's support
+    /// views merge facts asserted out of a reader's reach into their lists, so this is
+    /// checked in every build. It costs about as much as building the view: 24.5 against
+    /// 21.2 ms for 100 k of 1 M statements (sizing probe `dictlc-p30-probe-d6cf4e5a`), once
+    /// per view built.
     fn kept_among_inferred(&self, kept: &[EncodedQuad]) -> ViewOf {
-        let among = || kept.iter().all(|quad| self.version.inferred.contains(quad));
-        match cfg!(debug_assertions) && !among() {
-            true => ViewOf::Addition,
-            false => ViewOf::Restriction,
+        match kept.iter().all(|quad| self.version.inferred.contains(quad)) {
+            true => ViewOf::Restriction,
+            false => ViewOf::Addition,
         }
     }
 
@@ -752,7 +770,11 @@ impl Snapshot {
         parts.push(mask.held.clone());
         let held = Held::new(parts, held);
         let inferred = stack.with_runs(&mask.runs);
-        Ok(Some(self.restricted(inferred, held, ViewOf::Restriction)))
+        let of = match mask.adds {
+            true => ViewOf::Addition,
+            false => ViewOf::Restriction,
+        };
+        Ok(Some(self.restricted(inferred, held, of)))
     }
 
     /// What [`Self::restricted`] allocates for a view: its version, equality cell and
