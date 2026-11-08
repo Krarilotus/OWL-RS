@@ -1,40 +1,139 @@
-//! `SERVICE` ([`crate::service`]): the block goes to the endpoint as `SELECT *`, with the
-//! values bound so far as `VALUES` when it is joined to them. `SERVICE ?endpoint` calls
-//! each endpoint the solutions it is joined to bind, with their rows.
+//! `SERVICE` ([`crate::service`]): the block goes to the endpoint as `SELECT *` under the
+//! query's `BASE`, with the values bound so far as `VALUES` when it is joined to them.
+//! `SERVICE ?endpoint` calls each endpoint the solutions it is joined to bind, with their
+//! rows. An answer's blank nodes are its own: they join to nothing of another answer or
+//! the store.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use nrese_sparql_syntax::Query;
-use nrese_sparql_syntax::algebra::GraphPattern;
+use nrese_sparql_syntax::algebra::{Expression, GraphPattern};
 use nrese_sparql_syntax::term::{GroundTerm, NamedNodePattern};
 
-use nrese_exec::{IdTable, UNDEF};
-use nrese_rdf::{Term, Variable};
+use nrese_exec::{IdTable, Reservation, UNDEF};
+use nrese_rdf::{BlankNode, NamedOrBlankNode, Term, Triple, Variable};
 
-use crate::results::QueryEvaluationError;
+use crate::results::{CancellationToken, QueryEvaluationError};
 
 use super::{Context, NativeError, NativeResult, Solutions, bound_variables};
-use crate::service::{BIND_CHUNK, BIND_LIMIT};
+use crate::service::{BIND_CHUNK, BIND_LIMIT, ServiceCall};
+
+/// How a `SERVICE` joins what the query has bound before it.
+pub(super) enum Attach<'e> {
+    Join,
+    /// `OPTIONAL`, with its filter.
+    Optional(Option<&'e Expression>),
+}
+
+/// The rows of a `SERVICE SILENT ?e` with no endpoint to call: those whose value in
+/// `column` is one of `values` (no IRI, or unbound).
+struct Uncalled {
+    column: usize,
+    values: HashSet<u64>,
+}
 
 impl Context<'_> {
-    /// `SERVICE name { inner }`, joined to `bound` if given; with `silent`, a failing
-    /// endpoint gives one solution without bindings.
+    /// `SERVICE name { inner }` on its own; with `silent`, a failing endpoint gives one
+    /// solution without bindings.
     pub(super) fn service(
         &self,
         name: &NamedNodePattern,
         inner: &GraphPattern,
         silent: bool,
-        bound: Option<&Solutions>,
     ) -> NativeResult<Solutions> {
+        Ok(self.service_found(name, inner, silent, None)?.0)
+    }
+
+    /// `SERVICE name { inner }` joined to `bound` as `attach` says. Under SILENT, the rows
+    /// whose endpoint variable holds no IRI are joined to one empty solution, as a failed
+    /// call's are: kept once, and joined to no endpoint's answer.
+    pub(super) fn service_attached(
+        &self,
+        name: &NamedNodePattern,
+        inner: &GraphPattern,
+        silent: bool,
+        bound: Solutions,
+        attach: Attach<'_>,
+    ) -> NativeResult<Solutions> {
+        let (found, uncalled) = self.service_found(name, inner, silent, Some(&bound))?;
+        let (bound, kept) = match uncalled {
+            Some(uncalled) => {
+                let (called, kept) = self.split(bound, &uncalled)?;
+                (called, Some(kept))
+            }
+            None => (bound, None),
+        };
+        let joined = match attach {
+            Attach::Join => self.join(bound, found)?,
+            Attach::Optional(expression) => self.left_join(bound, found, expression)?,
+        };
+        match kept {
+            Some(kept) => self.union(joined, kept),
+            None => Ok(joined),
+        }
+    }
+
+    /// `bound` split into the rows `uncalled` doesn't name and those it does, these charged
+    /// (with the mask that splits them) before they are made.
+    fn split(
+        &self,
+        mut bound: Solutions,
+        uncalled: &Uncalled,
+    ) -> NativeResult<(Solutions, Solutions)> {
+        let (len, width) = (bound.table.len(), bound.table.width());
+        let is_kept = |row| {
+            uncalled
+                .values
+                .contains(&bound.table.get(row, uncalled.column))
+        };
+        let rows = (0..len).filter(|&row| is_kept(row)).count();
+        let mut held = Reservation::new(Arc::clone(&self.budget));
+        held.charge(len.saturating_add(rows.saturating_mul(width).saturating_mul(8)))
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        let called: Vec<bool> = (0..len).map(|row| !is_kept(row)).collect();
+        let mut kept = IdTable::with_capacity(width, rows);
+        for row in (0..len).filter(|&row| !called[row]) {
+            kept.push_row(&bound.table.row(row));
+        }
+        bound.table.retain_mask(&called);
+        drop(called);
+        // From here the table's charge, released as it is consumed.
+        held.resize(kept.memory_bytes())
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        held.transfer();
+        let kept = Solutions {
+            vars: bound.vars.clone(),
+            table: kept,
+            ordered: false,
+        };
+        Ok((bound, kept))
+    }
+
+    /// The endpoints' answer to `SERVICE name { inner }`, joined to `bound` if given, and
+    /// the rows of `bound` that SILENT keeps without a call, if any.
+    fn service_found(
+        &self,
+        name: &NamedNodePattern,
+        inner: &GraphPattern,
+        silent: bool,
+        bound: Option<&Solutions>,
+    ) -> NativeResult<(Solutions, Option<Uncalled>)> {
         if super::vectors::is_search(name) {
-            return self.vector_service(inner, bound);
+            return Ok((self.vector_service(inner, bound)?, None));
         }
         let variable = match name {
             NamedNodePattern::NamedNode(endpoint) => {
-                return self.call_silently(endpoint.as_str(), inner, bound, silent);
+                let found = self.call_silently(endpoint.as_str(), inner, bound, silent)?;
+                return Ok((found, None));
             }
             NamedNodePattern::Variable(v) => v,
         };
+        // Joined to no solutions: none names an endpoint, and the join has none.
+        if bound.is_some_and(|b| b.table.is_empty()) {
+            return Ok((self.unit()?, None));
+        }
         // The endpoints are the values the joined solutions have for the variable.
         let unbound = || -> NativeResult<Solutions> {
             if silent {
@@ -47,7 +146,7 @@ impl Context<'_> {
             }
         };
         let Some((bound, column)) = bound.and_then(|b| Some((b, b.column(variable)?))) else {
-            return unbound();
+            return Ok((unbound()?, None));
         };
         let mut rows_of: HashMap<u64, Vec<usize>> = HashMap::new();
         for row in 0..bound.table.len() {
@@ -59,10 +158,14 @@ impl Context<'_> {
         let mut endpoints: Vec<(u64, Vec<usize>)> = rows_of.into_iter().collect();
         endpoints.sort_unstable_by_key(|(id, _)| *id);
         let mut all: Option<Solutions> = None;
+        let mut uncalled = HashSet::new();
         for (id, rows) in endpoints {
             let endpoint = match (id != UNDEF).then(|| self.term(id)).flatten() {
                 Some(Term::NamedNode(n)) => n,
-                _ if silent => continue,
+                _ if silent => {
+                    uncalled.insert(id);
+                    continue;
+                }
                 _ => {
                     return Err(QueryEvaluationError::Service(
                         format!("SERVICE {variable}: an endpoint must be an IRI").into(),
@@ -98,13 +201,33 @@ impl Context<'_> {
                 None => found,
             });
         }
-        match all {
-            Some(all) => Ok(all),
-            None => unbound(),
+        let uncalled = (!uncalled.is_empty()).then_some(Uncalled {
+            column,
+            values: uncalled,
+        });
+        let found = match all {
+            Some(all) => all,
+            None => unbound()?,
+        };
+        Ok((found, uncalled))
+    }
+
+    /// A call's error: one that failed once the query was cancelled was stopped by the
+    /// cancellation, whatever the client says of it.
+    fn stopped(&self, error: QueryEvaluationError) -> QueryEvaluationError {
+        let cancelled = self
+            .cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled);
+        match error {
+            QueryEvaluationError::Service(_) if cancelled => QueryEvaluationError::Cancelled,
+            error => error,
         }
     }
 
-    /// One endpoint's answer; with `silent`, a failure gives one solution without bindings.
+    /// One endpoint's answer; with `silent`, the endpoint's failure gives one solution
+    /// without bindings. The query's own errors, its cancellation and a refusal of memory,
+    /// are never ignored.
     fn call_silently(
         &self,
         endpoint: &str,
@@ -113,11 +236,7 @@ impl Context<'_> {
         silent: bool,
     ) -> NativeResult<Solutions> {
         match self.call_service(endpoint, inner, bound) {
-            Err(NativeError::Evaluation(error))
-                if silent && !matches!(error, QueryEvaluationError::Cancelled) =>
-            {
-                self.unit()
-            }
+            Err(NativeError::Evaluation(QueryEvaluationError::Service(_))) if silent => self.unit(),
             other => other,
         }
     }
@@ -154,22 +273,34 @@ impl Context<'_> {
         let mut all: Option<Solutions> = None;
         for pattern in patterns {
             self.check()?;
+            // Under the query's BASE: an `IRI()` the endpoint evaluates resolves as here.
             let query = Query::Select {
                 dataset: None,
                 pattern,
-                base_iri: None,
+                base_iri: self.evaluator.base().cloned(),
             }
             .to_string();
+            // Declared before the answer: released once the answer is freed.
+            let mut held = Reservation::new(Arc::clone(&self.budget));
+            let call = ServiceCall {
+                cancellation: self.cancellation.as_ref(),
+                budget: &self.budget,
+                answer: &mut held,
+            };
             let results = services
                 .0
-                .select(endpoint, &query, self.cancellation.as_ref())
-                .map_err(QueryEvaluationError::Service)?;
-            // The endpoint's terms as canonical answers name them.
+                .select(endpoint, &query, call)
+                .map_err(|error| self.stopped(error))?;
+            // The endpoint's terms, its blank nodes its own, as canonical answers name them.
+            let scope = Scope::new();
             let table = match &self.canonical {
-                None => import(&results, |term| self.id(term))?,
-                Some(names) => import(&results, |term| match names.id(term) {
-                    Some(id) => Ok(id),
-                    None => self.id(&names.term(term.clone())),
+                None => import(&results, |term| self.id(&scope.of(term)))?,
+                Some(names) => import(&results, |term| {
+                    let term = scope.of(term);
+                    match names.id(&term) {
+                        Some(id) => Ok(id),
+                        None => self.id(&names.term(term.into_owned())),
+                    }
                 })?,
             };
             let solutions = self.produced(Solutions {
@@ -200,6 +331,41 @@ fn import(
         table.push_row(&row);
     }
     Ok(table)
+}
+
+/// The blank nodes of one endpoint answer, named apart from every other answer's and the
+/// store's: a results document's labels are its own (SPARQL 1.1 Query Results JSON §3.2.2,
+/// XML §2.3.1). `_:l` becomes `_:r<s>xl`, `s` random per answer (128 bits), inside triple
+/// terms too; the same label within the answer stays one node.
+struct Scope(u128);
+
+impl Scope {
+    fn new() -> Self {
+        Self(rand::random())
+    }
+
+    fn of<'t>(&self, term: &'t Term) -> Cow<'t, Term> {
+        match term {
+            Term::BlankNode(b) => Cow::Owned(self.blank(b).into()),
+            Term::Triple(t) => Cow::Owned(Term::Triple(Box::new(self.triple(t)))),
+            Term::NamedNode(_) | Term::Literal(_) => Cow::Borrowed(term),
+        }
+    }
+
+    fn blank(&self, b: &BlankNode) -> BlankNode {
+        BlankNode::new_unchecked(format!("r{:x}x{}", self.0, b.as_str()))
+    }
+
+    fn triple(&self, t: &Triple) -> Triple {
+        Triple {
+            subject: match &t.subject {
+                NamedOrBlankNode::BlankNode(b) => self.blank(b).into(),
+                named @ NamedOrBlankNode::NamedNode(_) => named.clone(),
+            },
+            predicate: t.predicate.clone(),
+            object: self.of(&t.object).into_owned(),
+        }
+    }
 }
 
 impl Context<'_> {

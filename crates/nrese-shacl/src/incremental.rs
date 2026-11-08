@@ -19,15 +19,17 @@
 //! So is a shape whose affected nodes pass [`MAX_AFFECTED`].
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use nrese_engine::{EncodedQuad, GraphSelector, TermId};
-use nrese_sparql::ReadView;
+use nrese_exec::Reservation;
+use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 
 use crate::graph::{GraphView, Selection};
 use crate::model::{Constraint, Path, ShapeRef, Shapes, Target};
 use crate::path;
 use crate::report::{ValidationReport, decode};
-use crate::validate::{RawResult, Validator};
+use crate::validate::{self, Failures, RawResult, Validator};
 
 /// Affected focus nodes per shape beyond which the shape is validated whole: following
 /// that many nodes back costs about what a full validation does.
@@ -40,13 +42,18 @@ const RDFS_SUB_CLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf
 /// introduce in `data`: validation of the focus nodes the change can affect, in `after`,
 /// minus the same validation in `before`. Both views must share one dictionary (a
 /// transaction and its base snapshot do), and `shapes` must be compiled from it.
+///
+/// Both validations run on `resources` and stop as [`crate::validate`] does: a stop in
+/// either state is the outcome, never a difference of partial results.
 pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     before: &A,
     after: &B,
     shapes: &Shapes,
     data: Selection,
     changed: &[EncodedQuad],
-) -> ValidationReport {
+    resources: &Resources,
+) -> Result<ValidationReport, QueryEvaluationError> {
+    resources.check()?;
     let changed: Vec<EncodedQuad> = changed
         .iter()
         .copied()
@@ -56,13 +63,17 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     let graph_after = GraphView::new(after, data);
     let sub_class_of = graph_after.iri(RDFS_SUB_CLASS_OF);
     let classes_moved = sub_class_of.is_some_and(|p| changed.iter().any(|q| q.predicate == p));
-    let validator_before = Validator::new(before, shapes, data);
-    let validator_after = Validator::new(after, shapes, data);
+    // The state before's failures are thrown away: none is made or charged.
+    let validator_before = Validator::discarding_failures(before, shapes, data, resources);
+    let validator_after = Validator::new(after, shapes, data, resources);
     let mut introduced: BTreeSet<RawResult> = BTreeSet::new();
-    let mut failures = Vec::new();
     if !changed.is_empty() {
         let rdf_type = graph_after.iri(RDF_TYPE);
         for shape in shapes.targeted() {
+            // After a stop in either state the difference means nothing: it is the outcome.
+            if validator_after.stopped() || validator_before.stopped() {
+                break;
+            }
             let affected = if classes_moved {
                 None
             } else {
@@ -96,13 +107,82 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
             let before_results = validator_before.validate_all(&work(focus(
                 validator_before.focus_nodes(&shapes.shapes[shape]),
             )));
+            // Charged per result found, so counted before the set drops repeated ones.
+            let before_bytes: usize = before_results.iter().map(RawResult::retained_bytes).sum();
             let before: BTreeSet<RawResult> = before_results.into_iter().collect();
-            introduced.extend(after_results.into_iter().filter(|r| !before.contains(r)));
+            // Results kept are charged to their state's validator; those dropped here are
+            // returned to it once freed.
+            let mut dropped = 0;
+            for result in after_results {
+                if before.contains(&result) || introduced.contains(&result) {
+                    dropped += result.retained_bytes();
+                } else {
+                    introduced.insert(result);
+                }
+            }
+            validator_after.release(dropped);
+            drop(before);
+            validator_before.release(before_bytes);
         }
-        failures.extend(validator_after.into_failures());
     }
+    // A stop in either state is the outcome: what was introduced is freed before the
+    // validators (and their charges) go.
+    if validator_after.has_stopped() || validator_before.has_stopped() {
+        introduced.clear();
+    }
+    // Only the state after reports its failures, which the report takes over with their
+    // charge; the state before's are dropped now, with theirs.
+    let (failures, held_after) = validator_after.into_failures()?;
+    let (earlier_failures, held_before) = validator_before.into_failures()?;
+    drop(earlier_failures);
     let raw: Vec<RawResult> = introduced.into_iter().collect();
-    decode(after, shapes, &raw, failures)
+    let report = decode(after, shapes, &raw, failures, resources);
+    // The raw results are freed, then their charges returned.
+    drop(raw);
+    drop((held_after, held_before));
+    report
+}
+
+/// The results a change of the shapes introduces in `data`: full validation against
+/// `shapes_after` in `after`, less what full validation against `shapes_before` found in
+/// `before` (`None`: the shapes didn't compile before, so nothing was found), with the
+/// failures of the state after. Both views must share one dictionary, and each set of
+/// shapes be compiled from it. Runs on `resources` as [`crate::validate`] does.
+///
+/// The state before is validated only to tell its results apart: not at all when the state
+/// after has none, and without its failures, which are neither made nor charged. So a
+/// commit that removes what failed (an unsupported `sh:entailment`, a broken constraint)
+/// can't be refused by what it removes.
+pub fn validate_shapes_change<A: ReadView + Sync, B: ReadView + Sync>(
+    before: &A,
+    shapes_before: Option<&Shapes>,
+    after: &B,
+    shapes_after: &Shapes,
+    data: Selection,
+    resources: &Resources,
+) -> Result<ValidationReport, QueryEvaluationError> {
+    let mut report = crate::validate(after, shapes_after, data, resources)?;
+    let Some(shapes_before) = shapes_before else {
+        return Ok(report);
+    };
+    if report.results.is_empty() {
+        return Ok(report);
+    }
+    let (earlier, held) = validate::validate_raw_results(before, shapes_before, data, resources)?;
+    let none = Failures {
+        list: Vec::new(),
+        held: Reservation::new(Arc::new(resources.memory.part())),
+    };
+    let decoded = decode(before, shapes_before, &earlier, none, resources);
+    // The earlier raw results are freed, then their charge returned.
+    drop(earlier);
+    drop(held);
+    // The whole earlier report, so its charge is held while its results are.
+    let earlier = decoded?;
+    report
+        .results
+        .retain(|result| !earlier.results.contains(result));
+    Ok(report)
 }
 
 fn in_selection(data: Selection, graph: TermId) -> bool {

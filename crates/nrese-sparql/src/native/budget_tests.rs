@@ -328,7 +328,7 @@ fn a_solution_without_bindings_draws_nothing_from_the_budget() {
 /// stored, so no computed term's kept charge covers a release (sol-loop r2 S2).
 #[test]
 fn a_column_given_to_a_row_without_columns_is_charged() {
-    use crate::{CancellationToken, ServiceClient, ServiceResults, Services};
+    use crate::{ServiceCall, ServiceClient, ServiceResults, Services};
     use nrese_sparql_syntax::Query;
 
     /// An endpoint whose every answer is five rows of one variable, a stored term.
@@ -338,8 +338,8 @@ fn a_column_given_to_a_row_without_columns_is_charged() {
             &self,
             _endpoint: &str,
             _query: &str,
-            _cancellation: Option<&CancellationToken>,
-        ) -> Result<ServiceResults, Box<dyn std::error::Error + Send + Sync>> {
+            _call: ServiceCall<'_>,
+        ) -> Result<ServiceResults, QueryEvaluationError> {
             let x = Term::from(node("a"));
             Ok(ServiceResults {
                 variables: vec![Variable::new_unchecked("x")],

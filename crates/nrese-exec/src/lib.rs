@@ -22,6 +22,8 @@
 //! - [`heap`]: heap profiles by phase, for memory guards and profiles
 //! - [`stop`]: stopping long work at bounded checkpoints ([`StopSource`], [`Ticker`])
 //! - [`narrow`]: narrow representations, refused typed at their exact limit
+//! - [`slices`]: parallel work under a lock that pool jobs may wait for, on threads of no
+//!   pool that the caller joins
 //! - [`sort`]: sorting and deduplicating id keys by radix over their significant bits
 //!
 //! Everything here works on ids: it never decodes a term. Operations that need values
@@ -45,6 +47,7 @@ pub mod memory;
 pub mod narrow;
 pub mod region;
 pub mod search;
+pub mod slices;
 pub mod sort;
 pub mod stop;
 pub mod table;

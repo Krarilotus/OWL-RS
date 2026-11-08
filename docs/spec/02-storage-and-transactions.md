@@ -71,10 +71,12 @@ Initial loads and full restores bypass the per-commit path (`Engine::bulk_load`;
 - **Acknowledgement.** A commit is acknowledged only after its WAL record is synced (`SyncPolicy::EveryCommit`, the default).
 - **Checkpoints** run in the background once the WAL grows past a threshold. Writers keep committing while a checkpoint is written, and covered WAL segments are deleted afterwards.
 - **Recovery** loads the newest checkpoint and then replays later WAL records.
-  - A torn record at the end of the log (a crash mid-write) is truncated; it was never acknowledged.
-  - Invalid data anywhere else is a startup error, never silently skipped.
+  - A torn record at the end of the log (a crash mid-write: one incomplete last record, or zeros to the end, with no intact record after it) is cut; it was never acknowledged. Its bytes are kept in `wal-cut/`.
+  - Other damage in the newest segment is a startup error that leaves the log as it is (`store.wal_damage = "refuse"`, the default), or, opted into, the log is kept up to the damage with the rest copied to `wal-cut/` (`"keep-prefix"`).
+  - Invalid data in an older segment is a startup error, never silently skipped.
 - **Directory lock.** The data directory is locked against a second process.
-- **Format versions.** WAL segments and checkpoints carry a format version in their magic bytes (`durability/wal.rs`, `durability/checkpoint.rs`, which lists what each version added). Older formats this build still reads (WAL 4 to 6, checkpoints 4 to 11) are read; any other is rejected at startup with `UnsupportedFormat` instead of being reported as corrupt.
+- **Format versions.** WAL segments and checkpoints carry a format version in their magic bytes (`durability/wal.rs`, `durability/checkpoint.rs`, which lists what each version added). Older formats this build still reads (WAL 4 to 6, checkpoints 4 to 12) are read; any other is rejected at startup with `UnsupportedFormat` instead of being reported as corrupt. Checkpoints are written as format 12 (since 7 Nov 2026: the last commit's time, for restores by time), which earlier binaries don't read.
+- **Commit times.** Every commit is stamped with the wall clock as its record goes to the log (a bulk load: as its checkpoint is completed), but never earlier than any commit of the store whose time it knows, so those times never go back. The store's clock survives commits of unknown time (format 11 checkpoints, untimed log records), checkpoints and reopens. Once a store holds a commit of unknown time, its later versions' times are unknown too, a bulk replacement's included: that commit may have been made after any time the clock gives. Stores that keep integer literals in their dictionary (created before inline integers) log no times, so their times are lost at each reopen. A restore by time keeps the commits made up to the time and refuses to start from a checkpoint whose last commit was made after it, or whose time isn't known.
 
 ## Limits
 

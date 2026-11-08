@@ -41,8 +41,10 @@ pub use explain::{
     InferenceStep, JUSTIFICATIONS_AT_MOST, JustificationAnswer, JustificationMode,
     JustifiedStatement, explain_fact, explain_violation, justify_fact,
 };
-pub use maintain::{EngineBase, Maintenance, maintain};
-pub use materialise::{Closure, equality_report_until, materialise, materialise_until};
+pub use maintain::{EngineBase, Maintenance, maintain, maintain_within};
+pub use materialise::{
+    Closure, equality_report_until, materialise, materialise_until, materialise_within,
+};
 
 /// A rule program compiled against the engine dictionary: its rules, list vocabulary and
 /// schema vocabulary as engine ids. Ids never change once interned, so it is built once.
@@ -73,6 +75,9 @@ pub struct Program {
     /// The maintenance plan every commit takes where it applies (the differential tests
     /// of each plan); `None`: the cheapest ([`delta::policy`]).
     plan: Option<delta::policy::Plan>,
+    /// Whether the axioms' own closure concludes only facts a store can hold, once a first
+    /// load asked ([`Self::axioms_conclude_only_storable`]).
+    axioms_storable: std::sync::OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Program {
@@ -127,6 +132,7 @@ impl Program {
             store_representatives: false,
             axioms,
             plan: None,
+            axioms_storable: std::sync::OnceLock::new(),
         }
     }
 

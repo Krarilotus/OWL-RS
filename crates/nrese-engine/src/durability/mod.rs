@@ -12,12 +12,19 @@
 //! append the WAL record and sync it, then publish the new version. A commit is therefore
 //! acknowledged only once it is durable, and nothing is visible that isn't in the log.
 //!
-//! Recovery = newest checkpoint + replay of all later WAL records in revision order. A torn
-//! frame at the end of the last segment is truncated (it was never acknowledged); invalid
-//! data anywhere else is reported as corruption instead of being silently skipped.
+//! Recovery = newest checkpoint + replay of all later WAL records in revision order. In the
+//! newest segment, a torn tail (what a crash during an append leaves, [`tail`]) is cut, its
+//! bytes kept in `<dir>/wal-cut/`. Other damage there refuses to open, the log left as it
+//! is, unless [`WalDamage::KeepPrefix`] allows cutting it too. Invalid data in an earlier
+//! segment always refuses to open; nothing is skipped.
 
 pub(crate) mod checkpoint;
 pub(crate) mod codec;
+#[cfg(test)]
+pub(crate) mod fault;
+pub(crate) mod tail;
+#[cfg(test)]
+mod tests;
 pub(crate) mod wal;
 
 use std::fs::{self, File};
@@ -40,6 +47,40 @@ pub enum SyncPolicy {
     /// Hand WAL writes to the OS without waiting. Survives a process crash, but the last
     /// commits can be lost on power failure or an OS crash.
     OsBuffered,
+}
+
+/// What opening does with damage in the newest WAL segment that a crash during an append
+/// doesn't leave ([`tail`]): a complete record failing its check, or invalid bytes with an
+/// intact record after them. A torn tail is cut either way, its bytes kept. Neither choice
+/// costs a healthy commit anything; they trade downtime after a damaged crash against the
+/// silent loss of acknowledged commits.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WalDamage {
+    /// Refuse to open, leaving the log as it is, until an operator decides (the default):
+    /// no acknowledged commit is dropped without someone's word.
+    #[default]
+    Refuse,
+    /// Open with the log up to the damage. The rest is copied to `<dir>/wal-cut/` first and
+    /// the cut logged as an error; commits acknowledged after the damage are then in that
+    /// copy only.
+    KeepPrefix,
+}
+
+impl WalDamage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Refuse => "refuse",
+            Self::KeepPrefix => "keep-prefix",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "refuse" => Some(Self::Refuse),
+            "keep-prefix" => Some(Self::KeepPrefix),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,8 +122,14 @@ pub struct DurabilityConfig {
     pub recover_until: Option<u64>,
     /// Recover the commits made up to this time only (microseconds since 1970), cut as
     /// with `recover_until`; commits logged without a time (before WAL version 6) count as
-    /// earlier.
+    /// earlier. Opening fails if the checkpoint's last commit was made after it, or its
+    /// time isn't known (format 11 and older, or any commit of unknown time in the store
+    /// before it, a bulk replacement since included): restore from an older image, or by
+    /// revision.
     pub recover_until_micros: Option<u64>,
+    /// Damage in the newest WAL segment: refuse to open (the default), or keep the log up
+    /// to it.
+    pub wal_damage: WalDamage,
 }
 
 impl Default for DurabilityConfig {
@@ -97,6 +144,7 @@ impl Default for DurabilityConfig {
             wal_archive: false,
             recover_until: None,
             recover_until_micros: None,
+            wal_damage: WalDamage::Refuse,
         }
     }
 }
@@ -114,6 +162,8 @@ pub(crate) struct Durable {
 pub(crate) struct Recovered {
     pub durable: Durable,
     pub version: Version,
+    /// The store's commit clock: the latest of the checkpoint's and every logged commit time.
+    pub clock: u64,
 }
 
 impl Durable {
@@ -142,6 +192,8 @@ impl Durable {
         // The store's encoding of integer-derived literals: its checkpoint's, else its
         // first WAL segment's, else (a new store) inline.
         let mut integers_in_dictionary = loaded.as_ref().map(|l| l.integers_in_dictionary);
+        // The store's commit clock: the checkpoint's, then every logged time, covered or not.
+        let mut store_clock = loaded.as_ref().map_or(0, |l| l.clock_micros);
         let mut version = match loaded {
             Some(loaded) => {
                 let (asserted, inferred) = match loaded.stacks {
@@ -172,6 +224,11 @@ impl Durable {
                     asserted,
                     inferred,
                     revision: loaded.revision,
+                    // Revision 0 holds no commit: every later one is after it.
+                    committed_micros: match loaded.revision {
+                        0 => Some(0),
+                        _ => loaded.committed_micros,
+                    },
                     dictionary_len: 0,
                     equality: Default::default(),
                     canonical: Default::default(),
@@ -196,6 +253,33 @@ impl Durable {
                 version.revision
             )));
         }
+        // A time restore starts from the checkpoint only if every commit in it was made by
+        // then: its last commit's time (commit times never go back, `commit_time`) is known
+        // and not later (EEV-06).
+        if let Some(until) = config.recover_until_micros
+            && version.revision > 0
+        {
+            match version.committed_micros {
+                None => {
+                    return Err(EngineError::Configuration(format!(
+                        "the checkpoint at revision {} has no commit time (format 11 or older, or \
+                         a store with commits of unknown time): restore by revision; for restore \
+                         by time, export the store as N-Quads and load it into a new data \
+                         directory",
+                        version.revision
+                    )));
+                }
+                Some(committed) if committed > until => {
+                    return Err(EngineError::Configuration(format!(
+                        "the checkpoint at revision {} was committed at {committed}, after the \
+                         requested time {until} (microseconds since 1970): restore from an \
+                         image taken before it",
+                        version.revision
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
         // Set once the log has been cut at `recover_until`: later segments go.
         let mut cut = false;
         for (position, (_, path)) in segments.iter().enumerate() {
@@ -218,6 +302,8 @@ impl Durable {
             }
             dictionary.set_integers_in_dictionary(integers_in_dictionary.unwrap_or(false));
             for (index, record) in contents.records.iter().enumerate() {
+                check_commit_time(record)?;
+                store_clock = store_clock.max(record.committed_micros.unwrap_or(0));
                 if record.revision <= version.revision {
                     continue; // covered by the checkpoint
                 }
@@ -254,8 +340,47 @@ impl Durable {
                         path.display()
                     )));
                 }
-                tracing::warn!(segment = %path.display(), valid_len = contents.valid_len, "truncating torn WAL tail");
-                wal::truncate_segment(path, contents.valid_len)?;
+                let bytes = fs::read(path)?;
+                let at = contents.valid_len;
+                // Every record that could be lost is past what is recovered.
+                let next = version.revision.saturating_add(1);
+                let cut_bytes = (bytes.len() as u64).saturating_sub(at);
+                match (tail::classify(&bytes, at as usize, next), config.wal_damage) {
+                    (tail::Tail::Torn, _) => {
+                        let kept = tail::keep(root, path, &bytes, at)?;
+                        tracing::warn!(segment = %path.display(), offset = at, bytes = cut_bytes, kept = %kept.display(), "cut a torn WAL tail (an append a crash interrupted)");
+                    }
+                    (tail::Tail::Damaged { intact_after }, WalDamage::Refuse) => {
+                        let after = intact_after.map_or(String::new(), |(offset, revision)| {
+                            format!(
+                                "; an intact record of revision {revision} follows at byte {offset}"
+                            )
+                        });
+                        return Err(EngineError::Corruption(format!(
+                            "damaged WAL record in {} at byte {at}, after revision {}{after}. \
+                             The log is left as it is. To open with the log up to revision {} \
+                             (the rest copied to {}/), set the WAL damage policy to keep the \
+                             prefix (server: store.wal_damage = \"keep-prefix\")",
+                            path.display(),
+                            version.revision,
+                            version.revision,
+                            tail::CUT_DIR,
+                        )));
+                    }
+                    (tail::Tail::Damaged { intact_after }, WalDamage::KeepPrefix) => {
+                        let kept = tail::keep(root, path, &bytes, at)?;
+                        tracing::error!(
+                            segment = %path.display(),
+                            offset = at,
+                            bytes = cut_bytes,
+                            kept_through_revision = version.revision,
+                            intact_after = ?intact_after,
+                            kept = %kept.display(),
+                            "cut a damaged WAL tail: commits acknowledged after the damage are only in the copy"
+                        );
+                    }
+                }
+                wal::truncate_segment(path, at)?;
             }
         }
 
@@ -285,6 +410,7 @@ impl Durable {
                 config,
                 _lock: lock,
             },
+            clock: store_clock.max(version.committed_micros.unwrap_or(0)),
             version,
         })
     }
@@ -320,7 +446,55 @@ fn replay(
         *version.stack_mut(stack) = index;
     }
     version.revision = record.revision;
+    // The latest of all its commits: a log an earlier binary wrote may step back. A record
+    // logged without a time (a version 4 or 5 segment) makes it unknown.
+    version.committed_micros = later(version.committed_micros, record.committed_micros);
     Ok(())
+}
+
+/// The latest commit time a store keeps, microseconds since 1970: a checkpoint holds it in 63
+/// bits, the 64th marking a version of unknown time. A wall clock reaches it in the year
+/// 292,277; only a replicated record or a damaged log can say otherwise.
+pub(crate) const MAX_COMMIT_TIME: u64 = (1 << 63) - 1;
+
+/// Refuses a logged record whose commit time is past [`MAX_COMMIT_TIME`] (sol-loop, review
+/// fix S2): its time couldn't be kept, and kept short it would read as earlier than it was.
+pub(crate) fn check_commit_time(record: &CommitRecord) -> EngineResult<()> {
+    match record.committed_micros {
+        Some(time) if time > MAX_COMMIT_TIME => Err(EngineError::Corruption(format!(
+            "log record {} has a commit time past what a store keeps ({time})",
+            record.revision
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The time of a version that adds a commit made at `commit` to one at `previous`: the later
+/// of the two, so it bounds every commit in it; unknown (`None`) if either is.
+pub(crate) fn later(previous: Option<u64>, commit: Option<u64>) -> Option<u64> {
+    previous
+        .zip(commit)
+        .map(|(previous, commit)| previous.max(commit))
+}
+
+/// The commit time of a revision after one committed at `previous`: the wall clock, in
+/// microseconds since 1970, but never before `previous` and never 0 (a checkpoint's
+/// "unknown"). So a store's commit times never go back, whatever its clock does, and a
+/// version's time is that of its latest commit: one made by a time has every commit before
+/// it made by then too (a time restore's cut, EEV-06).
+pub(crate) fn commit_time(previous: Option<u64>) -> u64 {
+    now_micros().max(previous.unwrap_or(0)).max(1)
+}
+
+/// The wall clock, microseconds since 1970 (0 before it).
+fn now_micros() -> u64 {
+    #[cfg(test)]
+    if let Some(at) = fault::CLOCK.get() {
+        return at;
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_micros() as u64)
 }
 
 /// Makes a rename or file creation in `dir` durable. Directories can't be opened as files on

@@ -58,6 +58,30 @@ impl fmt::Display for QueryResultsSyntaxError {
     }
 }
 
+/// A character that XML 1.0 can't hold, not even as a character reference (XML 1.0 §2.2):
+/// a C0 control other than TAB, LF and CR, or U+FFFE or U+FFFF. The XML writer refuses
+/// a term with one; [`crate::WriterSolutionsSerializer`] returns it inside an
+/// [`io::ErrorKind::InvalidData`] error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub struct XmlUnrepresentable(pub(crate) char);
+
+impl XmlUnrepresentable {
+    /// The character refused.
+    pub fn character(self) -> char {
+        self.0
+    }
+}
+
+impl fmt::Display for XmlUnrepresentable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "U+{:04X} can't be written in XML 1.0, not even as a character reference",
+            u32::from(self.0)
+        )
+    }
+}
+
 /// Why parsing stopped.
 #[derive(Debug, thiserror::Error)]
 pub enum QueryResultsParseError {

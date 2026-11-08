@@ -20,9 +20,21 @@
 //! new ones put in tables of their own ([`super::pending`]); at the end they are numbered
 //! in the order they first occur in the input and become a segment of entries whose text
 //! stays where it was interned ([`Dictionary::adopt_pending`]).
+//!
+//! Lock order: a thread takes the dictionary's locks only in this order, and never two of one
+//! level: one index's (`text`, `iri_text`, `vectors` or `vector_builder`), then `inner`, then
+//! `order`, then the derived files' bookkeeping. With the fair `RwLock`, a read behind a
+//! queued writer waits, so even two readers taking two locks in opposite orders close a
+//! cycle with an interner (B-103: `stats` took `inner`, then the indexes, while extensions
+//! take their index, then `inner`). The dictionary's locks come after every lock of the
+//! engine, and no dictionary lock is held while code the dictionary doesn't own runs, except
+//! [`Dictionary::with_views`]' and [`Dictionary::for_each_key`]'s callbacks, which take no
+//! lock but `inner`'s recursive read, and [`Dictionary::intern_all`]'s iterator, run under
+//! `inner`'s write lock, which must not use the dictionary at all. A vector search's `accept`
+//! runs with none ([`super::vectors::SearchInput`]).
 
 use hashbrown::HashTable;
-use nrese_exec::{Budget, BudgetExceeded, ChargedVec};
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use nrese_rdf::{
     BaseDirection, BlankNode, GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, Quad,
     QuadRef, Term, TermRef,
@@ -33,6 +45,7 @@ use super::hash::key_hash;
 use super::offsets::{Ends, Offsets};
 use super::order::Key;
 use super::pending::{Adopted, NEW, Pending};
+use super::pieces::{BLOCK, Block, Heap, Inner, Segment, View};
 use super::vocabulary::{Codec, Sample};
 use super::{TermId, TermKind, inline_to_literal, try_inline_literal};
 use crate::error::{EngineError, EngineResult};
@@ -122,7 +135,7 @@ impl Base {
     /// The most bytes entry `index`'s key holds while [`Self::plain`] decompresses it and
     /// its text is copied out of it: the buffer it starts in and the one it moves to (a
     /// code is at most a symbol of 8 bytes), then that one and the text.
-    fn decode_bound(&self, index: u64) -> usize {
+    pub(super) fn decode_bound(&self, index: u64) -> usize {
         let stored = self.key(index).len();
         match &self.codec {
             None => stored,
@@ -134,7 +147,7 @@ impl Base {
     }
 
     /// The index of the plain `key`, whose hash is `hash`, if it is an entry.
-    fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
+    pub(super) fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
         match &self.codec {
             None => self.find_stored(hash, key),
             Some(codec) => {
@@ -213,215 +226,6 @@ pub(crate) fn base_slots(len: u64) -> u64 {
     (len + len / 3 + 1).next_power_of_two()
 }
 
-/// Entries kept on the heap, one after another, from id `start` on.
-#[derive(Default)]
-struct Heap {
-    start: u64,
-    /// The keys, one after another.
-    bytes: Vec<u8>,
-    /// Their end offsets in `bytes`.
-    ends: Vec<u64>,
-    /// Their [`key_hash`]es: the table grows by moving numbers, without reading and
-    /// hashing every key again under the write lock (a bulk load stalled on it).
-    hashes: Vec<u64>,
-    /// Their ids, by [`key_hash`].
-    table: HashTable<u64>,
-}
-
-impl Heap {
-    fn at(start: u64) -> Self {
-        Self {
-            start,
-            ..Self::default()
-        }
-    }
-
-    fn len(&self) -> u64 {
-        self.ends.len() as u64
-    }
-
-    fn key(&self, id: u64) -> &[u8] {
-        heap_key(&self.bytes, &self.ends, (id - self.start) as usize)
-    }
-
-    fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
-        self.table.find(hash, |&id| self.key(id) == key).copied()
-    }
-
-    /// Appends `key` (not an entry yet), whose hash is `hash`, and returns its id.
-    fn push(&mut self, key: &[u8], hash: u64) -> u64 {
-        let id = self.start + self.len();
-        self.bytes.extend_from_slice(key);
-        self.ends.push(self.bytes.len() as u64);
-        self.hashes.push(hash);
-        let Heap {
-            table,
-            hashes,
-            start,
-            ..
-        } = self;
-        table.insert_unique(hash, id, |&i| hashes[(i - *start) as usize]);
-        id
-    }
-}
-
-/// Entries between the base and the live heap: a heap frozen when a bulk load's terms
-/// came after it, or a bulk load's terms in the arenas they were interned into
-/// ([`super::pending`]).
-enum Segment {
-    Heap(Heap),
-    Adopted(Adopted),
-}
-
-impl Segment {
-    fn start(&self) -> u64 {
-        match self {
-            Self::Heap(heap) => heap.start,
-            Self::Adopted(adopted) => adopted.start,
-        }
-    }
-
-    fn key(&self, id: u64) -> &[u8] {
-        match self {
-            Self::Heap(heap) => heap.key(id),
-            Self::Adopted(adopted) => adopted.key(id - adopted.start),
-        }
-    }
-
-    fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
-        match self {
-            Self::Heap(heap) => heap.find(hash, key),
-            Self::Adopted(adopted) => adopted.find(hash, key),
-        }
-    }
-}
-
-#[derive(Default)]
-struct Inner {
-    /// Entries `0..base.len` from a mapped checkpoint.
-    base: Option<Base>,
-    /// Entries after the base, before the heap, by id.
-    segments: Vec<Segment>,
-    /// The entries interned one by one since, at the end.
-    heap: Heap,
-}
-
-impl Inner {
-    fn with_base(base: Base) -> Self {
-        Self {
-            heap: Heap::at(base.len),
-            base: Some(base),
-            segments: Vec::new(),
-        }
-    }
-
-    fn base_len(&self) -> u64 {
-        self.base.as_ref().map_or(0, |base| base.len)
-    }
-
-    fn len(&self) -> u64 {
-        self.heap.start + self.heap.len()
-    }
-
-    /// Entry `index`'s plain key: in place, or decoded from a compressed base.
-    fn key(&self, index: u64) -> Key<'_> {
-        if index < self.base_len() {
-            return self
-                .base
-                .as_ref()
-                .expect("an index below the base")
-                .plain(index);
-        }
-        Key::Borrowed(self.added_key(index))
-    }
-
-    /// Entry `index`'s key, above the base: on the heap or in a segment, in place.
-    fn added_key(&self, index: u64) -> &[u8] {
-        if index >= self.heap.start {
-            return self.heap.key(index);
-        }
-        let at = self.segments.partition_point(|s| s.start() <= index) - 1;
-        self.segments[at].key(index)
-    }
-
-    /// [`Self::key`], a key of a compressed base decoded into `decoded`, its room charged
-    /// first; every other key is read in place.
-    fn key_within<'k, B: std::ops::Deref<Target = Budget>>(
-        &'k self,
-        index: u64,
-        decoded: &'k mut ChargedVec<u8, B>,
-    ) -> Result<&'k [u8], BudgetExceeded> {
-        let Some(base) = self.base.as_ref().filter(|base| index < base.len) else {
-            return Ok(self.added_key(index));
-        };
-        match &base.codec {
-            None => Ok(base.key(index)),
-            Some(codec) => {
-                decoded.clear();
-                codec.decompress_within(base.key(index), decoded)?;
-                Ok(decoded)
-            }
-        }
-    }
-
-    /// The most bytes decoding entry `index` allocates: its text's, and for a key stored
-    /// compressed the buffer it is decompressed into ([`Base::decode_bound`]).
-    fn decode_bound(&self, index: u64) -> usize {
-        match &self.base {
-            Some(base) if index < base.len => base.decode_bound(index),
-            _ => self.key(index).len(),
-        }
-    }
-
-    /// The index of `key`, whose hash is `hash`, if it is an entry.
-    fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
-        if let Some(index) = self.base.as_ref().and_then(|base| base.find(hash, key)) {
-            return Some(index);
-        }
-        self.segments
-            .iter()
-            .find_map(|segment| segment.find(hash, key))
-            .or_else(|| self.heap.find(hash, key))
-    }
-
-    /// Appends `key` (not an entry yet), whose hash is `hash`, and returns its index.
-    fn push(&mut self, key: &[u8], hash: u64) -> u64 {
-        self.heap.push(key, hash)
-    }
-
-    /// Takes a bulk load's numbered terms, ids `adopted.start..` (the next ones): the heap
-    /// so far is frozen before them, a new one begins after.
-    fn adopt(&mut self, adopted: Adopted) {
-        assert_eq!(adopted.start, self.len(), "adopted terms take the next ids");
-        let after = adopted.start + adopted.len();
-        let heap = std::mem::replace(&mut self.heap, Heap::at(after));
-        if heap.len() > 0 {
-            self.segments.push(Segment::Heap(heap));
-        }
-        self.segments.push(Segment::Adopted(adopted));
-    }
-
-    /// The heaps' and segments' key bytes and index bytes.
-    fn heap_bytes(&self) -> (u64, u64) {
-        let heap = |h: &Heap| {
-            (
-                h.bytes.len() as u64,
-                (h.ends.capacity() * 16 + h.table.capacity() * 9) as u64,
-            )
-        };
-        let mut total = heap(&self.heap);
-        for segment in &self.segments {
-            let (keys, index) = match segment {
-                Segment::Heap(h) => heap(h),
-                Segment::Adopted(a) => a.bytes(),
-            };
-            total.0 += keys;
-            total.1 += index;
-        }
-        total
-    }
-}
-
 /// Keys decoded while views of them are lent out ([`Dictionary::with_views`]): each stays
 /// where it is until the arena is dropped, after the views.
 ///
@@ -490,19 +294,47 @@ fn decoded_slice(
 /// A slice of the dictionary for a string scan: entries `.1` of one arena.
 enum Part<'i> {
     Base(&'i Base, (usize, usize)),
-    Heap(&'i Heap, (usize, usize)),
+    /// A heap's sealed block, its first id `.1`.
+    Keys(&'i Block, u64, (usize, usize)),
+    /// A heap's tail keys `.2`, each its own `Arc`, the first's id `.1`: searched in place.
+    Tail(&'i [std::sync::Arc<[u8]>], u64, (usize, usize)),
     /// Shard `.1` of a bulk load's terms.
     Shard(&'i Adopted, usize, (usize, usize)),
 }
 
-/// Heap entry `local` (counted from the end of the base).
-fn heap_key<'a>(bytes: &'a [u8], ends: &[u64], local: usize) -> &'a [u8] {
-    let start = if local == 0 {
-        0
-    } else {
-        ends[local - 1] as usize
-    };
-    &bytes[start..ends[local] as usize]
+#[cfg(test)]
+thread_local! {
+    /// Test hook: runs once, in the next prefix search on this thread, between its view of the
+    /// keys and its order's installation.
+    static BETWEEN_VIEW_AND_INSTALL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn between_view_and_install() {
+    if let Some(hook) = BETWEEN_VIEW_AND_INSTALL.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// Test support: a view of the keys held across other work (a rebase).
+#[cfg(test)]
+pub(crate) struct HeldView(View);
+
+#[cfg(test)]
+impl HeldView {
+    pub(crate) fn key(&self, index: u64) -> Vec<u8> {
+        self.0.pieces().key(index).into_owned()
+    }
+
+    /// Whether the view alone holds its heap's sealed blocks: the dictionary let go of them.
+    pub(crate) fn sole_owner_of_its_heap(&self) -> bool {
+        let blocks = &self.0.pieces().heap.blocks;
+        !blocks.is_empty()
+            && blocks
+                .iter()
+                .all(|block| std::sync::Arc::strong_count(block) == 1)
+    }
 }
 
 #[derive(Default)]
@@ -731,6 +563,29 @@ impl Dictionary {
         }
     }
 
+    /// The keys as they are now, held with no lock ([`View`]): for parallel work over them.
+    fn view(&self) -> View {
+        self.inner.read().view()
+    }
+
+    /// [`Self::view`], what it allocates charged to `budget` first, under the same guard. The
+    /// reservation comes first: bound in that order, it is released after the view is freed.
+    fn view_within<'b>(
+        &self,
+        budget: &'b Budget,
+    ) -> Result<(Reservation<&'b Budget>, View), BudgetExceeded> {
+        let inner = self.inner.read();
+        let mut held = Reservation::new(budget);
+        held.charge(inner.view_bytes())?;
+        Ok((held, inner.view()))
+    }
+
+    /// Test support: [`Self::view`], held ([`HeldView`]).
+    #[cfg(test)]
+    pub(crate) fn held_view(&self) -> HeldView {
+        HeldView(self.view())
+    }
+
     /// Number of dictionary entries (inline terms are not counted).
     pub fn len(&self) -> u64 {
         self.inner.read().len()
@@ -765,11 +620,15 @@ impl Dictionary {
     }
 
     pub fn stats(&self) -> DictionaryStats {
+        // Each index's figures under its own lock, let go before `inner` (the lock order).
+        let vector_bytes = self.vectors.read().memory_bytes() as u64;
+        let text_covered = self.text.read().covered();
+        let iri_text_covered = self.iri_text.read().covered();
         let inner = self.inner.read();
         let base = inner.base.as_ref();
         DictionaryStats {
-            vector_bytes: self.vectors.read().memory_bytes() as u64,
-            text_covered: self.text.read().covered() + self.iri_text.read().covered(),
+            vector_bytes,
+            text_covered: text_covered + iri_text_covered,
             derived_loaded: self
                 .derived
                 .loads
@@ -778,7 +637,7 @@ impl Dictionary {
             arena_bytes: inner.heap_bytes().0 + base.map_or(0, |b| b.arena.len() as u64),
             // A slot is the stored index plus one control byte.
             index_bytes: inner.heap_bytes().1,
-            mapped_bytes: base.map_or(0, Base::bytes),
+            mapped_bytes: base.map_or(0, |base| base.bytes()),
         }
     }
 
@@ -849,7 +708,8 @@ impl Dictionary {
         self.intern_locked(&mut self.inner.write(), &mut Vec::with_capacity(64), term)
     }
 
-    /// Interns a batch of terms under one lock acquisition.
+    /// Interns a batch of terms under one lock acquisition. `terms` is consumed under the
+    /// write lock: it must not use the dictionary (a lookup there waits forever).
     pub fn intern_all<'a>(&self, terms: impl IntoIterator<Item = TermRef<'a>>) -> Vec<TermId> {
         let mut key = Vec::with_capacity(64);
         let mut inner = self.inner.write();
@@ -957,13 +817,15 @@ impl Dictionary {
                 self.text.write().prepare_stems(language);
             }
         }
+        // The index's lock before `inner`'s (the lock order).
+        let text = self.text.read();
         let inner = self.inner.read();
         let text_of = |index: u64| match view_key(&inner.key(index)) {
             TermView::String(value) | TermView::LangString { value, .. } => Some(value.to_owned()),
             _ => None,
         };
         // Matches are entry numbers: as ids, by the entry's kind.
-        let mut matches = self.text.read().search(query, &text_of);
+        let mut matches = text.search(query, &text_of);
         for found in &mut matches {
             let kind = match view_key(&inner.key(found.id)) {
                 TermView::LangString { .. } => TermKind::LangString,
@@ -977,12 +839,19 @@ impl Dictionary {
     /// The vector literals nearest to `query.vector` among the first `known` entries that
     /// `accept` takes (by id), nearest first; the index first takes in the vector literals
     /// interned since the last search, and builds or extends the graph the search uses.
-    pub fn vector_search(
+    pub fn vector_search<'b>(
         &self,
         query: &super::VectorQuery,
         known: u64,
         accept: &(dyn Fn(TermId) -> bool + Sync),
-    ) -> (Vec<nrese_vector::Hit>, super::VectorSearchReport) {
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<
+        (
+            nrese_exec::ChargedVec<nrese_vector::Hit, &'b nrese_exec::Budget>,
+            super::VectorSearchReport,
+        ),
+        nrese_exec::BudgetExceeded,
+    > {
         self.cover_vectors();
         if self.vectors.read().may_need_work(query) {
             let work = self.vectors.write().work_for(query);
@@ -1004,7 +873,10 @@ impl Dictionary {
             let id = TermId::from_raw(raw);
             id.payload() < known && accept(id)
         };
-        self.vectors.read().search(query, &accept)
+        // What the search reads, taken under the lock; the search and `accept` run without
+        // it (`accept` may intern and search again; the scans are parallel).
+        let input = self.vectors.read().search_input(query);
+        super::vectors::search(input, query, &accept, budget)
     }
 
     /// Builds the graph a search like `query` uses, covering every vector, before
@@ -1099,12 +971,14 @@ impl Dictionary {
                 self.iri_text.write().prepare_stems(language);
             }
         }
+        // The index's lock before `inner`'s (the lock order).
+        let text = self.iri_text.read();
         let inner = self.inner.read();
         let text_of = |index: u64| match view_key(&inner.key(index)) {
             TermView::Iri(iri) => super::text::local_name_text(iri),
             _ => None,
         };
-        let mut matches = self.iri_text.read().search(query, &text_of);
+        let mut matches = text.search(query, &text_of);
         for found in &mut matches {
             found.id = TermId::new(TermKind::Iri, found.id).raw();
         }
@@ -1134,8 +1008,20 @@ impl Dictionary {
         {
             return self.prefix_matches(test, limit);
         }
-        let inner = self.inner.read();
+        // The keys as they are now, held with no lock: the parallel loop runs on the caller's
+        // pool, and no job it takes on there can wait for a lock this scan holds.
+        let view = self.view();
+        let inner = view.pieces();
         let below = |start: u64, count: usize| (limit.saturating_sub(start) as usize).min(count);
+        let heaps: Vec<&Heap> = inner
+            .segments
+            .iter()
+            .filter_map(|segment| match &**segment {
+                Segment::Heap(heap) => Some(heap),
+                Segment::Adopted(_) => None,
+            })
+            .chain([&inner.heap])
+            .collect();
         let mut arenas = 0;
         let mut parts: Vec<Part<'_>> = Vec::new();
         if let Some(base) = &inner.base {
@@ -1143,23 +1029,22 @@ impl Dictionary {
             let entries = below(0, base.len as usize);
             parts.extend(super::strings::slices(entries).map(|s| Part::Base(base, s)));
         }
-        let heaps = inner
-            .segments
-            .iter()
-            .filter_map(|segment| match segment {
-                Segment::Heap(heap) => Some(heap),
-                Segment::Adopted(_) => None,
-            })
-            .chain([&inner.heap]);
-        for heap in heaps {
+        for heap in &heaps {
             arenas += 1;
-            let entries = below(heap.start, heap.ends.len());
-            parts.extend(super::strings::slices(entries).map(|s| Part::Heap(heap, s)));
+            for (b, block) in heap.blocks.iter().enumerate() {
+                let start = heap.start + (b * BLOCK) as u64;
+                let entries = below(start, block.len());
+                parts.extend(super::strings::slices(entries).map(|s| Part::Keys(block, start, s)));
+            }
+            // The tail's keys where they are: nothing copied, none at or past the limit.
+            let start = heap.start + (heap.blocks.len() * BLOCK) as u64;
+            let entries = below(start, heap.tail.len());
+            parts.extend(super::strings::slices(entries).map(|s| Part::Tail(&heap.tail, start, s)));
         }
         // A bulk load's terms: each shard's arena, its entries numbered to their ids
         // (an entry that existed already shows under its own id too: deduplicated).
         for segment in &inner.segments {
-            let Segment::Adopted(adopted) = segment else {
+            let Segment::Adopted(adopted) = &**segment else {
                 continue;
             };
             if limit <= adopted.start {
@@ -1178,9 +1063,17 @@ impl Dictionary {
                 decoded_slice(base, &matcher, test, slice, out)
             }
             Part::Base(base, slice) => matcher.slice(&base.arena, &base.offsets, slice, 0, out),
-            Part::Heap(heap, slice) => {
-                matcher.slice(&heap.bytes, &heap.ends[..], slice, heap.start, out)
+            Part::Keys(block, start, slice) => {
+                matcher.slice(&block.bytes, &block.ends[..], slice, start, out)
             }
+            // Each key an arena of one entry: the search never runs into the next key.
+            Part::Tail(keys, start, (first, last)) => (first..last)
+                .map(|i| {
+                    let key = &keys[i];
+                    let ends = [key.len() as u64];
+                    matcher.slice(key, &ends[..], (0, 1), start + i as u64, out)
+                })
+                .sum(),
             Part::Shard(adopted, s, slice) => {
                 let shard = &adopted.shards[s];
                 let from = out.len();
@@ -1220,12 +1113,21 @@ impl Dictionary {
     }
 
     /// The entries below `limit` that pass `test`, a prefix test, from the text order.
+    ///
+    /// The kept order is cloned first, then the keys are viewed: the view holds every entry
+    /// the order does. Where the order doesn't cover the view, it is extended from the view
+    /// with no lock held, the answer read from the extension; the extension is installed only
+    /// if the kept order is still the one it extended, in the generation the view read.
     fn prefix_matches(
         &self,
         test: &super::StringTest<'_>,
         limit: u64,
     ) -> (Vec<TermId>, super::StringScan) {
-        let inner = self.inner.read();
+        let kept = self.order.read().clone();
+        let view = self.view();
+        #[cfg(test)]
+        between_view_and_install();
+        let inner = view.pieces();
         let key = |index: u64| inner.key(index);
         let needle = test.needle.as_bytes();
         let mut candidates: Vec<u64> = Vec::new();
@@ -1237,12 +1139,21 @@ impl Dictionary {
             }
             None => 0,
         };
-        {
-            let mut order = self.order.write();
-            order.extend(first, inner.len(), &key);
-            let (start, end) = super::order::prefix_range(&order.order, &key, needle);
-            candidates.extend_from_slice(&order.order[start..end]);
-        }
+        let order = if kept.covers(first, inner.len()) {
+            kept
+        } else {
+            let mut extended = kept.clone();
+            extended.extend(first, inner.len(), &key);
+            if kept.generation == view.generation() {
+                let mut current = self.order.write();
+                if current.same(&kept) {
+                    *current = extended.clone();
+                }
+            }
+            extended
+        };
+        let (start, end) = super::order::prefix_range(&order.order, &key, needle);
+        candidates.extend_from_slice(&order.order[start..end]);
         candidates.retain(|&index| index < limit);
         let scan = super::StringScan {
             keys_tested: candidates.len() as u64,
@@ -1258,9 +1169,24 @@ impl Dictionary {
 
     /// The text order of the entries `0..len` as checkpoint indices: the mapped base's
     /// order merged with that of the others, from the in-memory order where it covers them,
-    /// else sorted here (and not kept: the checkpoint's base takes them over).
-    pub(crate) fn text_order(&self, len: u64) -> Vec<u32> {
-        let inner = self.inner.read();
+    /// else sorted here (and not kept: the checkpoint's base takes them over). What it
+    /// allocates for them is charged to `budget` first ([`super::order::sorted_within`]),
+    /// the order with its capacity; refused, it fails with [`EngineError::MemoryLimit`],
+    /// having freed what it made before releasing its charge.
+    pub(crate) fn text_order<'b>(
+        &self,
+        len: u64,
+        budget: &'b Budget,
+    ) -> EngineResult<ChargedVec<u32, &'b Budget>> {
+        // The kept order cloned, then the keys viewed (holding every entry the order does):
+        // the sort runs with no lock held ([`prefix_matches`](Self::prefix_matches)).
+        let order = self.order.read().clone();
+        let (_view_held, view) = self.view_within(budget)?;
+        let inner = view.pieces();
+        debug_assert!(
+            len <= inner.len(),
+            "a checkpoint of entries the dictionary holds"
+        );
         let key = |index: u64| inner.key(index);
         let text = |index: u64| super::order::text_in(key(index));
         let (base, first): (&[u32], u64) =
@@ -1268,15 +1194,23 @@ impl Dictionary {
                 Some(order) => (order, inner.base_len()),
                 None => (&[], 0),
             };
-        let order = self.order.read();
+        // The others: the kept order where it covers them, else sorted. Declared before
+        // the sorted order, its reservation is released after it is freed.
+        let _sorted_held: Reservation<&Budget>;
         let sorted: Vec<u32>;
-        let rest: Box<dyn Iterator<Item = u64>> =
-            if order.first == first && order.covered >= len.max(first) {
-                Box::new(order.order.iter().copied().filter(|&i| i < len))
-            } else {
-                sorted = super::order::sorted(first.min(len)..len, &key);
-                Box::new(sorted.iter().map(|&i| u64::from(i)))
-            };
+        let kept: &[u64];
+        if order.covers(first, len.max(first)) {
+            (kept, sorted, _sorted_held) = (&order.order, Vec::new(), Reservation::new(budget));
+        } else {
+            kept = &[];
+            (sorted, _sorted_held) =
+                super::order::sorted_within(first.min(len)..len, &key, budget)?;
+        }
+        let rest = kept
+            .iter()
+            .copied()
+            .filter(|&i| i < len)
+            .chain(sorted.iter().map(|&i| u64::from(i)));
         // Merged straight from both orders: no copies of them.
         let capacity = base.len() + len.saturating_sub(first) as usize;
         let mut base = base
@@ -1285,18 +1219,33 @@ impl Dictionary {
             .filter(|&i| i < len)
             .peekable();
         let mut rest = rest.peekable();
-        let mut merged = Vec::with_capacity(capacity);
-        loop {
-            let next = match (base.peek(), rest.peek()) {
-                (Some(&b), Some(&r)) if (text(b), b) <= (text(r), r) => base.next(),
-                (Some(_), Some(_)) => rest.next(),
-                (Some(_), None) => base.next(),
-                (None, Some(_)) => rest.next(),
-                (None, None) => break,
-            };
-            merged.push(next.expect("peeked") as u32);
-        }
-        merged
+        // The base's next entry, decoded once where its keys are compressed, into room
+        // charged first. The others' keys are in place: they follow the base (`first` is
+        // its length), and a base without an order is never compressed (format < 7).
+        let mut decoded = ChargedVec::new(budget);
+        let mut merged = ChargedVec::with_capacity(budget, capacity)?;
+        merged.fill(capacity, |room| -> Result<(), BudgetExceeded> {
+            // Compared while both have entries; then the rest of either follows unread.
+            while let (Some(&b), Some(_)) = (base.peek(), rest.peek()) {
+                let b_text = super::order::text_of(inner.key_within(b, &mut decoded)?);
+                let b_text = b_text.unwrap_or_default();
+                // The others before it; equal texts: the base's (lower) index first.
+                while let Some(&r) = rest.peek() {
+                    if (b_text, b) <= (&*text(r), r) {
+                        break;
+                    }
+                    room.push(r as u32);
+                    rest.next();
+                }
+                room.push(b as u32);
+                base.next();
+            }
+            base.for_each(|b| room.push(b as u32));
+            rest.for_each(|r| room.push(r as u32));
+            Ok(())
+        })??;
+        drop(decoded);
+        Ok(merged)
     }
 
     /// Decodes an id back into a term. Returns `None` for ids that do not belong to this
@@ -1392,7 +1341,8 @@ impl Dictionary {
 
     /// Calls `f` with a lookup of entry views below `limit`, all under one read lock: for
     /// writing many terms (result serialisation) without a lock per term. `f` may decode
-    /// ([`Self::decode`] reads recursively) but not intern.
+    /// ([`Self::decode`] reads recursively) but not intern, search or take any other lock
+    /// (the lock order in the module docs).
     pub fn with_views<R>(
         &self,
         limit: u64,
@@ -1466,24 +1416,36 @@ impl Dictionary {
     }
 
     /// Numbers a bulk load's `pending` terms after the entries there are (in the order of
-    /// their first occurrence in the input: [`super::pending`]), calls `remap` with them so
-    /// the load's quads take their ids, and adds them as a segment: their text stays where
-    /// it was interned. Readers go on meanwhile; writers wait.
+    /// their first occurrence in the input: [`super::pending`]), adds them as a segment
+    /// (their text stays where it was interned), then calls `remap` with them so the load's
+    /// quads take their ids. Readers go on meanwhile; writers wait for the adoption.
+    ///
+    /// The adoption guard is held across the numbering only, whose parallel parts run on
+    /// threads of no pool and take no lock ([`Pending::number`]): every one ends, whatever
+    /// waits for the dictionary. `remap` runs after the guard is let go, with any parallel
+    /// work it likes: the ids it reads are published, and the terms are entries before any
+    /// quad refers to them (as an aborted transaction's are).
     pub(crate) fn adopt_pending(&self, pending: Pending, remap: impl FnOnce(&Adopted)) {
         if pending.is_empty() {
             remap(&Adopted::empty(self.len()));
             return;
         }
-        let inner = self.inner.upgradable_read();
-        // A load into an empty dictionary finds none of its terms there: no hashing.
-        let empty = inner.len() == 0;
-        let adopted = pending.number(inner.len(), |key| match empty {
-            true => None,
-            false => inner.find(key_hash(key), key),
-        });
-        remap(&adopted);
-        let mut inner = parking_lot::RwLockUpgradableReadGuard::upgrade(inner);
-        inner.adopt(adopted);
+        let segment = {
+            let inner = self.inner.upgradable_read();
+            let held: &Inner = &inner;
+            // A load into an empty dictionary finds none of its terms there: no hashing.
+            let empty = held.len() == 0;
+            let adopted = pending.number(held.len(), |key| match empty {
+                true => None,
+                false => held.find(key_hash(key), key),
+            });
+            let mut inner = parking_lot::RwLockUpgradableReadGuard::upgrade(inner);
+            inner.adopt(adopted)
+        };
+        let Segment::Adopted(adopted) = &*segment else {
+            unreachable!("an adoption's segment");
+        };
+        remap(adopted);
     }
 
     /// Encodes `quad` without interning; `None` if any term is unknown (below `limit`).
@@ -1573,7 +1535,7 @@ impl Dictionary {
                 "checkpoint dictionary restored into a non-empty dictionary".to_owned(),
             ));
         }
-        *inner = Inner::with_base(base);
+        *inner = Inner::with_base(base, inner.generation);
         Ok(())
     }
 
@@ -1591,14 +1553,17 @@ impl Dictionary {
                 "a checkpoint's dictionary doesn't match the dictionary".to_owned(),
             ));
         }
-        let mut next = Inner::with_base(base);
+        // A new generation: a text order built for the old one is never installed. Views taken
+        // before keep the old pieces, and read every key they held.
+        let generation = inner.generation + 1;
+        let mut next = Inner::with_base(base, generation);
         for index in len..inner.len() {
             let key = inner.key(index);
             next.push(&key, key_hash(&key));
         }
         *inner = next;
         // The in-memory text order covered entries the base orders now.
-        *self.order.write() = super::order::TextOrder::default();
+        *self.order.write() = super::order::TextOrder::at(generation);
         Ok(true)
     }
 
@@ -1617,68 +1582,105 @@ impl Dictionary {
                 "checkpoint dictionary restored into a non-empty dictionary".to_owned(),
             ));
         }
-        let Heap {
-            table,
-            bytes,
-            ends,
-            hashes: kept,
-            ..
-        } = &mut inner.heap;
-        bytes.reserve_exact(keys.iter().map(|key| key.len()).sum());
-        ends.reserve_exact(keys.len());
-        for key in keys {
-            bytes.extend_from_slice(key);
-            ends.push(bytes.len() as u64);
-        }
-        let key = |i: u64| {
-            let i = i as usize;
-            let start = if i == 0 { 0 } else { ends[i - 1] as usize };
-            &bytes[start..ends[i] as usize]
-        };
-        *table = HashTable::with_capacity(keys.len());
-        for (index, &hash) in hashes.iter().enumerate() {
-            let index = index as u64;
-            if table
-                .find(hash, |&other| key(other) == key(index))
-                .is_some()
-            {
-                return Err(EngineError::Corruption(format!(
-                    "duplicate dictionary key at {index}"
-                )));
-            }
-            table.insert_unique(hash, index, |&i| hashes[i as usize]);
-        }
-        *kept = hashes;
+        inner.heap = Heap::of_keys(0, keys, hashes).map_err(|index| {
+            EngineError::Corruption(format!("duplicate dictionary key at {index}"))
+        })?;
         Ok(())
     }
 
     /// Re-adds a raw key during recovery. The key must land exactly at `expected_index`.
     pub(crate) fn restore_key(&self, expected_index: u64, key: &[u8]) -> EngineResult<()> {
         validate_key(key)?;
+        let hash = key_hash(key);
         let mut inner = self.inner.write();
         let len = inner.len();
-        if expected_index < len {
-            return if inner.key(expected_index) == key {
-                Ok(())
-            } else {
-                Err(EngineError::Corruption(format!(
-                    "dictionary entry {expected_index} differs from the logged key"
-                )))
-            };
-        }
-        if expected_index != len {
-            return Err(EngineError::Corruption(format!(
-                "dictionary gap: expected entry {expected_index}, dictionary has {len}"
-            )));
-        }
-        let index = self.intern_key_locked(&mut inner, key);
-        if index != expected_index {
-            return Err(EngineError::Corruption(format!(
-                "duplicate dictionary key logged at {expected_index} (already {index})"
-            )));
+        if let Restore::Append = restored(&inner, len, expected_index, key, hash)? {
+            inner.push(key, hash);
         }
         Ok(())
     }
+
+    /// Restores `keys` at `start..` under one write lock, all or none: each checked as
+    /// [`Self::restore_key`] takes one (under this lock: another interner may have added
+    /// entries before it), then the ones past the dictionary's end appended in order.
+    pub(crate) fn restore_keys_checked(&self, start: u64, keys: &[&[u8]]) -> EngineResult<()> {
+        let mut inner = self.inner.write();
+        let hashes = check_restore(&inner, start, keys)?;
+        let len = inner.len();
+        for (offset, (key, hash)) in keys.iter().zip(hashes).enumerate() {
+            if start + offset as u64 >= len {
+                inner.push(key, hash);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What restoring a logged key does to a dictionary of `len` entries.
+enum Restore {
+    /// Entry `index` is already this key.
+    Present,
+    /// The key goes at the end, `index == len`.
+    Append,
+}
+
+/// The one rule of restoring a logged key at `index` into `inner`, as if it had `len`
+/// entries (the keys of a batch being checked count as appended): an index below `len`
+/// must hold the same key, `len` takes a key that is nowhere else, and anything past it is
+/// a gap.
+fn restored(inner: &Inner, len: u64, index: u64, key: &[u8], hash: u64) -> EngineResult<Restore> {
+    if index < len {
+        return match index < inner.len() && inner.key(index) == key {
+            true => Ok(Restore::Present),
+            false => Err(EngineError::Corruption(format!(
+                "dictionary entry {index} differs from the logged key"
+            ))),
+        };
+    }
+    if index != len {
+        return Err(EngineError::Corruption(format!(
+            "dictionary gap: expected entry {index}, dictionary has {len}"
+        )));
+    }
+    if let Some(already) = inner.find(hash, key) {
+        return Err(EngineError::Corruption(format!(
+            "duplicate dictionary key logged at {index} (already {already})"
+        )));
+    }
+    Ok(Restore::Append)
+}
+
+/// [`restored`] for `keys` at `start..` (consecutive indexes): the ones past `inner`'s end
+/// count as appended in order, so a key appended twice in the batch is a duplicate too.
+/// Returns each key's hash ([`key_hash`]), computed once.
+fn check_restore(inner: &Inner, start: u64, keys: &[&[u8]]) -> EngineResult<Vec<u64>> {
+    let mut len = inner.len();
+    // The range's start, whether or not it holds keys: past the end is a gap.
+    if start > len {
+        return Err(EngineError::Corruption(format!(
+            "dictionary gap: expected entry {start}, dictionary has {len}"
+        )));
+    }
+    let mut hashes = Vec::with_capacity(keys.len());
+    // The batch's appended keys, by offset into `keys`, under their hashes.
+    let mut appended: HashTable<usize> = HashTable::new();
+    for (offset, key) in keys.iter().enumerate() {
+        validate_key(key)?;
+        let index = start + offset as u64;
+        let hash = key_hash(key);
+        if let Some(&already) = appended.find(hash, |&other| keys[other] == *key) {
+            return Err(EngineError::Corruption(format!(
+                "duplicate dictionary key logged at {index} (already {})",
+                start + already as u64
+            )));
+        }
+        if let Restore::Append = restored(inner, len, index, key, hash)? {
+            appended.insert_unique(hash, offset, |&other| key_hash(keys[other]));
+            len += 1;
+        }
+        hashes.push(hash);
+    }
+    Ok(hashes)
 }
 
 /// The graph name as a term; `None` for the default graph.
@@ -2043,11 +2045,400 @@ fn validate_key(key: &[u8]) -> EngineResult<()> {
 }
 
 #[cfg(test)]
+#[path = "dictionary_lock_tests.rs"]
+mod lock_order_tests;
+
+#[cfg(test)]
+/// A budget that refuses nothing, for vector searches whose memory a test doesn't check.
+pub(crate) fn unlimited() -> &'static nrese_exec::Budget {
+    static UNLIMITED: std::sync::OnceLock<nrese_exec::Budget> = std::sync::OnceLock::new();
+    UNLIMITED.get_or_init(nrese_exec::Budget::unlimited)
+}
+
+#[cfg(test)]
 mod tests {
     use nrese_rdf::vocab::xsd;
     use nrese_rdf::{BlankNodeRef, LiteralRef, NamedNodeRef};
 
     use super::*;
+
+    /// Rounds of each lock-span guard: on the parent tree the shape shows as a race (the
+    /// holder's thread must take a fed job while it waits), so a guard tries several times.
+    const ROUNDS: usize = 4;
+
+    /// Whether the dictionary's lock is free now (taken and let go, never waited for).
+    fn free(dictionary: &std::sync::Arc<Dictionary>) -> impl Fn() -> bool + Send + Sync + 'static {
+        let dictionary = std::sync::Arc::clone(dictionary);
+        move || dictionary.inner.try_write().is_some() && dictionary.order.try_write().is_some()
+    }
+
+    /// A dictionary of `n` simple literals, each holding a `w`: enough entries for several
+    /// scan slices and a parallel text order.
+    fn literals(n: usize) -> std::sync::Arc<Dictionary> {
+        let dictionary = Dictionary::default();
+        for i in 0..n {
+            let text = format!("w{:07}", (i * 7_919) % n);
+            dictionary.intern(LiteralRef::new_simple_literal(&text).into());
+        }
+        std::sync::Arc::new(dictionary)
+    }
+
+    fn containing<'a>(
+        needle: &'a str,
+        placement: super::super::Placement,
+    ) -> super::super::StringTest<'a> {
+        super::super::StringTest {
+            needle,
+            placement,
+            iris: false,
+            strings: true,
+            lang_strings: false,
+            typed: false,
+            language: None,
+            ascii_case_insensitive: false,
+        }
+    }
+
+    /// Span 1 (P2-01). A bulk load's numbering and renumbering under the adoption guard never
+    /// have the holder's thread run a pool job while the guard is held: a job that wanted the
+    /// dictionary (to intern, or to read behind a queued writer) would wait there with the
+    /// numbering under it, and the numbering would wait for it. On engine-v2 688181dd they
+    /// ran as Rayon work on the caller's pool, which the holder's thread helps with.
+    #[test]
+    fn a_loads_numbering_takes_on_no_job_under_the_adoption_guard() {
+        let dictionary = std::sync::Arc::new(Dictionary::default());
+        let mut every_time = true;
+        for round in 0..ROUNDS {
+            let pending = Pending::default();
+            let mut provisional: Vec<u64> = Vec::new();
+            for b in 0..200u32 {
+                let keys: Vec<Vec<u8>> = (0..500)
+                    .map(|k| format!("Iurn:t-{round}-{b}-{k}").into_bytes())
+                    .collect();
+                let mut indexes = vec![NEW; keys.len()];
+                pending.intern((1, b), &mut indexes, &mut Vec::new(), |k| {
+                    (&keys[k][..], key_hash(&keys[k]))
+                });
+                provisional.extend_from_slice(&indexes);
+            }
+            let id = |payload: u64| TermId::new(TermKind::Iri, payload);
+            let mut quads: Vec<EncodedQuad> = provisional
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|q| EncodedQuad::new(id(q[0]), id(q[1]), id(q[2]), id(q[3])))
+                .collect();
+            every_time &= nrese_exec::workers::contended(
+                || dictionary.adopt_pending(pending, |adopted| adopted.renumber(&mut quads)),
+                free(&dictionary),
+            );
+            // Renumbered to the ids the dictionary holds now.
+            let start = (round * 200 * 500) as u64;
+            assert_eq!(quads[0].subject, id(start));
+            assert_eq!(quads.last().unwrap().graph, id(start + 200 * 500 - 1));
+        }
+        assert!(
+            every_time,
+            "a job ran on the numbering's thread under the adoption guard"
+        );
+        assert_eq!(dictionary.len(), (ROUNDS * 200 * 500) as u64);
+    }
+
+    /// Span 2 (P2-01). A substring scan of the arenas takes on no pool job under the
+    /// dictionary's read guard (the hazard of span 1, behind a queued writer).
+    #[test]
+    fn a_substring_scan_takes_on_no_job_under_the_read_guard() {
+        let n = 300_000;
+        let dictionary = literals(n);
+        let test = containing("w", super::super::Placement::Anywhere);
+        let mut every_time = true;
+        for _ in 0..ROUNDS {
+            let found = std::sync::Arc::new(std::sync::Mutex::new(0));
+            let scan = {
+                let (dictionary, found) = (std::sync::Arc::clone(&dictionary), found.clone());
+                move || {
+                    *found.lock().unwrap() = dictionary.matching_strings(&test, n as u64).len();
+                }
+            };
+            every_time &= nrese_exec::workers::contended(scan, free(&dictionary));
+            assert_eq!(*found.lock().unwrap(), n);
+        }
+        assert!(
+            every_time,
+            "a job ran on the scan's thread under the read guard"
+        );
+    }
+
+    /// Span 3 (P2-01). A checkpoint's text order, sorted for entries no kept order covers,
+    /// takes on no pool job under the dictionary's guards.
+    #[test]
+    fn a_checkpoints_text_order_takes_on_no_job_under_the_guards() {
+        let n = 300_000;
+        let dictionary = literals(n);
+        let mut every_time = true;
+        for _ in 0..ROUNDS {
+            let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let build = {
+                let (dictionary, order) = (std::sync::Arc::clone(&dictionary), order.clone());
+                move || {
+                    let budget = Budget::unlimited();
+                    *order.lock().unwrap() =
+                        dictionary.text_order(n as u64, &budget).unwrap().to_vec();
+                }
+            };
+            every_time &= nrese_exec::workers::contended(build, free(&dictionary));
+            let order = order.lock().unwrap();
+            assert_eq!(order.len(), n);
+            let text = |i: u32| dictionary.inner.read().key(u64::from(i)).into_owned();
+            assert!(order.windows(2).all(|w| text(w[0]) < text(w[1])));
+        }
+        assert!(
+            every_time,
+            "a job ran on the text order's thread under the guards"
+        );
+    }
+
+    /// Span 4 (P2-01). A prefix search that first takes the entries interned since into the
+    /// kept text order takes on no pool job under the guards (`order` written, `inner` read).
+    #[test]
+    fn a_prefix_search_extending_the_order_takes_on_no_job_under_the_guards() {
+        let n = 300_000;
+        let mut every_time = true;
+        for _ in 0..ROUNDS {
+            // Afresh each round: the order is extended once, by the first search.
+            let dictionary = literals(n);
+            let found = std::sync::Arc::new(std::sync::Mutex::new(0));
+            let search = {
+                let (dictionary, found) = (std::sync::Arc::clone(&dictionary), found.clone());
+                move || {
+                    let test = containing("w0000", super::super::Placement::Start);
+                    *found.lock().unwrap() = dictionary.matching_strings(&test, n as u64).len();
+                }
+            };
+            every_time &= nrese_exec::workers::contended(search, free(&dictionary));
+            // `w0000` and three digits: the values 0..1000 (`literals` holds each of 0..n once).
+            assert_eq!(*found.lock().unwrap(), 1_000);
+            assert_eq!(dictionary.order.read().covered, n as u64);
+        }
+        assert!(
+            every_time,
+            "a job ran on the prefix search's thread under the guards"
+        );
+    }
+
+    /// Sets the hook a prefix search runs between its view and its installation.
+    fn set_between_view_and_install(hook: impl FnOnce() + 'static) {
+        BETWEEN_VIEW_AND_INSTALL.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// P2-01 A2. A key interned between a prefix search's view and its order's installation
+    /// keeps one id. The search answers from its view (without the key), the order it installs
+    /// covers the view, and the next search finds the key.
+    #[test]
+    fn a_key_interned_between_a_view_and_its_order_is_found_by_the_next_search() {
+        let n = 20_000u64;
+        let dictionary = literals(n as usize);
+        let late = LiteralRef::new_simple_literal("w0000777 late");
+        let interned = std::sync::Arc::new(std::sync::Mutex::new(None));
+        {
+            let (dictionary, interned) = (dictionary.clone(), interned.clone());
+            set_between_view_and_install(move || {
+                *interned.lock().unwrap() = Some(dictionary.intern(late.into()));
+            });
+        }
+        let prefix = containing("w0000", super::super::Placement::Start);
+        // `w0000` and three digits: the values 0..1000.
+        assert_eq!(dictionary.matching_strings(&prefix, u64::MAX).len(), 1_000);
+        let late_id = interned.lock().unwrap().expect("the hook ran");
+        assert_eq!(dictionary.lookup(late.into()), Some(late_id));
+        assert_eq!(dictionary.order.read().covered, n);
+        let found = dictionary.matching_strings(&prefix, u64::MAX);
+        assert_eq!(found.len(), 1_001);
+        assert!(found.contains(&late_id));
+        assert_eq!(dictionary.order.read().covered, n + 1);
+    }
+
+    /// P2-01 A6. An order extended in one generation is not installed after the dictionary
+    /// moved to another (here advanced by hand between the view and the installation, as a
+    /// rebase does); the search still answers from its own extension.
+    #[test]
+    fn an_order_extended_in_an_older_generation_is_not_installed() {
+        let dictionary = literals(20_000);
+        {
+            let dictionary = dictionary.clone();
+            set_between_view_and_install(move || {
+                let mut inner = dictionary.inner.write();
+                inner.generation += 1;
+                *dictionary.order.write() = super::super::order::TextOrder::at(inner.generation);
+            });
+        }
+        let prefix = containing("w0000", super::super::Placement::Start);
+        assert_eq!(dictionary.matching_strings(&prefix, u64::MAX).len(), 1_000);
+        let order = dictionary.order.read();
+        assert_eq!((order.covered, order.generation), (0, 1));
+    }
+
+    /// P2-01 A7. Of two prefix searches extending the order at once (one runs inside the
+    /// other's window), both answer, and the installed order is the text order of every entry.
+    #[test]
+    fn of_two_extensions_at_once_the_order_stays_the_text_order() {
+        let n = 20_000u64;
+        let dictionary = literals(n as usize);
+        let inner_found = std::sync::Arc::new(std::sync::Mutex::new(0));
+        {
+            let (dictionary, inner_found) = (dictionary.clone(), inner_found.clone());
+            set_between_view_and_install(move || {
+                let prefix = containing("w0001", super::super::Placement::Start);
+                *inner_found.lock().unwrap() = dictionary.matching_strings(&prefix, u64::MAX).len();
+            });
+        }
+        let prefix = containing("w0000", super::super::Placement::Start);
+        assert_eq!(dictionary.matching_strings(&prefix, u64::MAX).len(), 1_000);
+        assert_eq!(*inner_found.lock().unwrap(), 1_000);
+        let order = dictionary.order.read().clone();
+        assert_eq!(order.covered, n);
+        let text = |i: u64| dictionary.inner.read().key(i).into_owned();
+        assert!(
+            order
+                .order
+                .windows(2)
+                .all(|w| (text(w[0]), w[0]) < (text(w[1]), w[1]))
+        );
+    }
+
+    /// P2-01 A5. A view copies no key bytes: a 64 MiB literal in the heap's tail is the very
+    /// allocation the view holds.
+    #[test]
+    fn a_view_shares_the_tails_keys() {
+        let dictionary = Dictionary::default();
+        let long = "x".repeat(64 << 20);
+        let id = dictionary.intern(LiteralRef::new_simple_literal(&long).into());
+        let view = dictionary.view();
+        let inner = dictionary.inner.read();
+        let local = id.payload() as usize;
+        assert!(std::sync::Arc::ptr_eq(
+            &inner.heap.tail[local],
+            &view.pieces().heap.tail[local]
+        ));
+    }
+
+    /// P2-01 A8. The heap seals its tail into a block at every BLOCK-th key: keys keep their
+    /// ids across a seal, every block holds BLOCK keys, and the tail the rest.
+    #[test]
+    fn keys_keep_their_ids_across_a_seal() {
+        let key = |i: usize| format!("k{i}");
+        for n in [BLOCK - 1, BLOCK, BLOCK + 1, 2 * BLOCK + 3] {
+            let dictionary = Dictionary::default();
+            let ids: Vec<TermId> = (0..n)
+                .map(|i| dictionary.intern(LiteralRef::new_simple_literal(&key(i)).into()))
+                .collect();
+            {
+                let inner = dictionary.inner.read();
+                assert_eq!(
+                    (inner.heap.blocks.len(), inner.heap.tail.len()),
+                    (n / BLOCK, n % BLOCK)
+                );
+                assert!(inner.heap.blocks.iter().all(|block| block.len() == BLOCK));
+            }
+            for (i, &id) in ids.iter().enumerate() {
+                let text = key(i);
+                let literal = LiteralRef::new_simple_literal(&text);
+                assert_eq!(dictionary.lookup(literal.into()), Some(id));
+                assert_eq!(
+                    dictionary.decode(id),
+                    Some(Term::from(literal.into_owned()))
+                );
+            }
+        }
+    }
+
+    /// P2-01, the inline lengths and first ids (an optimisation: its oracle). Across every
+    /// kind of piece (frozen heaps, one with a sealed block, adopted bulk segments, the live
+    /// heap), every id's key read through the dictionary and through a view is the key it was
+    /// given, and every key is found at its id.
+    #[test]
+    fn every_id_reads_its_own_key_across_the_pieces() {
+        let dictionary = Dictionary::default();
+        let mut expected: Vec<Vec<u8>> = Vec::new();
+        let intern = |expected: &mut Vec<Vec<u8>>, text: String| {
+            let id = dictionary.intern(LiteralRef::new_simple_literal(&text).into());
+            assert_eq!(id.payload(), expected.len() as u64);
+            expected.push([&b"S"[..], text.as_bytes()].concat());
+        };
+        let adopt = |expected: &mut Vec<Vec<u8>>, round: usize| {
+            let pending = Pending::default();
+            let keys: Vec<Vec<u8>> = (0..3)
+                .map(|k| format!("Iurn:bulk-{round}-{k}").into_bytes())
+                .collect();
+            let mut indexes = vec![NEW; keys.len()];
+            pending.intern((1, 0), &mut indexes, &mut Vec::new(), |k| {
+                (&keys[k][..], key_hash(&keys[k]))
+            });
+            dictionary.adopt_pending(pending, |_| {});
+            expected.extend(keys);
+        };
+        for i in 0..BLOCK + 10 {
+            intern(&mut expected, format!("first {i}"));
+        }
+        adopt(&mut expected, 0);
+        for i in 0..100 {
+            intern(&mut expected, format!("second {i}"));
+        }
+        adopt(&mut expected, 1);
+        for i in 0..50 {
+            intern(&mut expected, format!("live {i}"));
+        }
+        assert_eq!(dictionary.inner.read().segments.len(), 4);
+        let view = dictionary.view();
+        let inner = dictionary.inner.read();
+        for (id, key) in expected.iter().enumerate() {
+            let id = id as u64;
+            assert_eq!(&*inner.key(id), &key[..], "entry {id}");
+            assert_eq!(
+                &*view.pieces().key(id),
+                &key[..],
+                "entry {id} through a view"
+            );
+            assert_eq!(inner.find(key_hash(key), key), Some(id), "entry {id} found");
+        }
+    }
+
+    /// P2-01, Sol r1 S1. A scan copies no key of a heap's tail, a frozen heap's included: its
+    /// peak stays below half the tail's bytes, where any copy of the tail holds all of them.
+    /// Here 64 keys of 256 KiB in a heap frozen by a bulk load, and a needle matching none.
+    #[test]
+    fn a_scan_copies_no_tail_keys() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        let dictionary = Dictionary::default();
+        let long = 256 << 10;
+        let padding = "x".repeat(long);
+        for i in 0..64 {
+            let text = format!("{i:04}{padding}");
+            dictionary.intern(LiteralRef::new_simple_literal(&text).into());
+        }
+        let pending = Pending::default();
+        let key = b"Iurn:freezes-the-heap".to_vec();
+        let mut indexes = vec![NEW];
+        pending.intern((1, 0), &mut indexes, &mut Vec::new(), |_| {
+            (&key[..], key_hash(&key))
+        });
+        dictionary.adopt_pending(pending, |_| {});
+        assert!(matches!(
+            &*dictionary.inner.read().segments[0],
+            Segment::Heap(heap) if heap.tail.len() == 64
+        ));
+        let test = containing("no such text", super::super::Placement::Anywhere);
+        let (found, peak) =
+            nrese_exec::measure::measure(|| dictionary.matching_strings(&test, u64::MAX));
+        assert!(found.is_empty());
+        assert!(
+            peak < 64 * long / 2,
+            "the scan held {peak} bytes over tails of {} bytes",
+            64 * long
+        );
+    }
 
     /// Views of decoded keys stay valid while the arena keeps more (its list grows and
     /// moves): the case Miri's Stacked Borrows checks (the audit of 2 October).
@@ -2255,6 +2646,61 @@ mod tests {
         assert_eq!(target.len(), 2);
     }
 
+    /// A batch of logged keys (a replicated answer's) is checked as `restore_key` would take
+    /// each in turn, and restored all or none: a valid overlap and append, a divergent
+    /// overlap, a gap, a key that already has another entry, a key twice in the batch.
+    /// `restore_keys_checked` refuses as `restore_key` does and then leaves the dictionary as
+    /// it was. Every row is checked.
+    #[test]
+    fn a_batch_of_logged_keys_is_checked_as_restore_key_takes_them() {
+        let source = Dictionary::default();
+        for text in ["a", "b", "c"] {
+            source.intern(LiteralRef::new_simple_literal(text).into());
+        }
+        let keys = source.export_keys(0, source.len());
+        let k = |i: usize| keys[i].as_slice();
+        // The target holds the first two entries.
+        let target = || {
+            let target = Dictionary::default();
+            target.restore_key(0, k(0)).unwrap();
+            target.restore_key(1, k(1)).unwrap();
+            target
+        };
+        let rows: [(&str, u64, Vec<&[u8]>, bool); 6] = [
+            ("overlap then append", 1, vec![k(1), k(2)], true),
+            ("append only", 2, vec![k(2)], true),
+            ("divergent overlap", 1, vec![k(0), k(2)], false),
+            ("gap", 3, vec![k(2)], false),
+            ("key with another entry", 2, vec![k(0)], false),
+            ("a key twice in the batch", 2, vec![k(2), k(2)], false),
+        ];
+        let mut wrong = Vec::new();
+        for (row, start, batch, takes) in rows {
+            // restore_key, one at a time, on a copy: its verdict.
+            let one_by_one = target();
+            let verdict = batch
+                .iter()
+                .enumerate()
+                .all(|(i, key)| one_by_one.restore_key(start + i as u64, key).is_ok());
+            if verdict != takes {
+                wrong.push(format!("{row}: restore_key took it: {verdict}"));
+            }
+            let restored = target();
+            let result = restored.restore_keys_checked(start, &batch);
+            let len = match takes {
+                true => start + batch.len() as u64,
+                false => 2,
+            };
+            if result.is_ok() != takes || restored.len() != len.max(2) {
+                wrong.push(format!(
+                    "{row}: restore_keys_checked {result:?}, {} entries",
+                    restored.len()
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// Loading the vector index from its file takes no background build's reservation
     /// (PR #79 fix check r1, R79-01; notes/2026-11-02-pr79-vector-reservation-design.md).
     /// The file covers M entries: a build was refused, then the vectors were saved. The
@@ -2280,7 +2726,9 @@ mod tests {
         };
         let query = VectorQuery::new(vec![1.0], 1);
         let search = |dictionary: &Dictionary| {
-            dictionary.vector_search(&query, dictionary.len(), &|_| true);
+            dictionary
+                .vector_search(&query, dictionary.len(), &|_| true, unlimited())
+                .unwrap();
         };
         let dir = tempfile::tempdir().unwrap();
         let source = Dictionary::default();

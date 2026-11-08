@@ -61,6 +61,8 @@ mod triple_joins;
 mod triple_terms;
 pub(crate) mod typed_results;
 pub(crate) mod value;
+#[cfg(test)]
+mod vector_budget_tests;
 mod vectors;
 mod wcoj;
 
@@ -77,8 +79,8 @@ use crate::results::{
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::join::{
-    anti_join_in_place, compatible_mask, join, join_keeping_left_order, join_with_undef, left_join,
-    outer_join_with_undef,
+    JoinStop, anti_join_in_place, compatible_mask, join, join_keeping_left_order, join_with_undef,
+    left_join, outer_join_with_undef,
 };
 use nrese_exec::{
     Budget, BudgetExceeded, ChargedVec, Grant, IdTable, Reservation, UNDEF, computed_id,
@@ -1292,6 +1294,10 @@ struct Context<'a> {
     merge_set: Option<crate::dataset::GraphSet>,
     /// The graphs `GRAPH` may name, if the dataset lists them (`FROM NAMED`).
     named: Option<Vec<TermId>>,
+    /// Whether `GRAPH` with another store's name for the default graph reads the store's
+    /// default graph ([`crate::dataset::ResolvedDataset::store_default`]): not for a reader
+    /// who may not read it.
+    store_default: bool,
     /// Numbers the columns the executor adds for itself ([`exists`]).
     synthetic: Cell<usize>,
     /// [`QueryOptions::services`].
@@ -1414,6 +1420,7 @@ impl<'a> Context<'a> {
             Some(access) => resolved.restricted(snapshot, access),
             None => resolved,
         };
+        let store_default = resolved.store_default;
         let (scope, merge_set) = match resolved.default {
             DefaultGraph::Store => (GraphScope::Default, None),
             DefaultGraph::Graph(graph) => (GraphScope::Named(graph), None),
@@ -1460,6 +1467,7 @@ impl<'a> Context<'a> {
         let mut ctx = Self {
             merge_set,
             named,
+            store_default,
             as_written: options.as_written,
             spatial_rewrite: !options.geosparql_stated_only,
             cross_chunk_rows: options.cross_chunk_rows.unwrap_or(CROSS_CHUNK_ROWS).max(1),
@@ -1649,6 +1657,15 @@ impl<'a> Context<'a> {
             shared: self.budget.bounded_by_shared(),
         })
         .into()
+    }
+
+    /// The error of a stopped join of `width` output columns: its row limit
+    /// ([`Self::too_large`]), or an input with more rows than the join's row numbers name.
+    fn join_stopped(&self, stop: JoinStop, width: usize) -> NativeError {
+        match stop {
+            JoinStop::Rows(rows) => self.too_large(rows.max_rows.saturating_add(1), width),
+            JoinStop::TooLarge(limit) => QueryEvaluationError::TooLarge(limit).into(),
+        }
     }
 
     /// Frees a table charged to the query's budget, then releases its charge: the budget
@@ -1923,7 +1940,7 @@ impl<'a> Context<'a> {
                 name,
                 inner,
                 silent,
-            } => self.service(name, inner, *silent, None),
+            } => self.service(name, inner, *silent),
             // A SERVICE joined to a pattern gets the values the pattern binds.
             GraphPattern::Join { inputs }
                 if inputs
@@ -1954,8 +1971,7 @@ impl<'a> Context<'a> {
                     return self.vector_join(&local, inner);
                 }
                 let bound = self.eval(&local)?;
-                let found = self.service(name, inner, *silent, Some(&bound))?;
-                self.join(bound, found)
+                self.service_attached(name, inner, *silent, bound, federation::Attach::Join)
             }
             GraphPattern::LeftJoin {
                 left,
@@ -1971,8 +1987,8 @@ impl<'a> Context<'a> {
                     unreachable!("matched above")
                 };
                 let left = self.eval(left)?;
-                let found = self.service(name, inner, *silent, Some(&left))?;
-                self.left_join(left, found, expression.as_ref())
+                let attach = federation::Attach::Optional(expression.as_ref());
+                self.service_attached(name, inner, *silent, left, attach)
             }
             GraphPattern::Path {
                 subject,
@@ -2083,10 +2099,12 @@ impl<'a> Context<'a> {
                 let mut table = left.table;
                 if has_undef(&table, &lk) || has_undef(&right.table, &rk) {
                     // A row goes if a compatible row shares a variable both bind.
-                    let removed = compatible_mask(&table, &right.table, &lk, &rk, true);
+                    let removed = compatible_mask(&table, &right.table, &lk, &rk, true)
+                        .map_err(QueryEvaluationError::from)?;
                     table.retain_mask(&removed.iter().map(|r| !r).collect::<Vec<_>>());
                 } else {
-                    anti_join_in_place(&mut table, &right.table, &lk, &rk);
+                    anti_join_in_place(&mut table, &right.table, &lk, &rk)
+                        .map_err(QueryEvaluationError::from)?;
                 }
                 self.consumed(right);
                 self.produced(Solutions {
@@ -2255,13 +2273,18 @@ impl<'a> Context<'a> {
 
     fn graph(&self, name: &NamedNodePattern, inner: &GraphPattern) -> NativeResult<Solutions> {
         let variable = match name {
-            // Jena's name for the default graph (`compat`): the store's default graph.
-            NamedNodePattern::NamedNode(n) if crate::compat::names_default_graph(n.as_str()) => {
+            // Jena's name for the default graph (`compat`): the store's default graph, where
+            // it is in reach; for a reader who may not read it, absent as an unreadable named
+            // graph is (below).
+            NamedNodePattern::NamedNode(n)
+                if crate::compat::names_default_graph(n.as_str()) && self.store_default =>
+            {
                 return self.in_graph(GraphScope::Default, inner);
             }
             NamedNodePattern::NamedNode(n) => {
-                let id = self
-                    .lookup_const(n.as_ref().into())
+                let id = (!crate::compat::names_default_graph(n.as_str()))
+                    .then(|| self.lookup_const(n.as_ref().into()))
+                    .flatten()
                     .filter(|&id| self.is_named_graph(id));
                 return match id {
                     Some(id) => self.in_graph(GraphScope::Named(id), inner),
@@ -2304,33 +2327,16 @@ impl<'a> Context<'a> {
         let mut all: Option<Solutions> = None;
         for graph in graphs {
             self.check()?;
-            let mut solutions = self.in_graph(GraphScope::Named(graph), inner)?;
-            match solutions.column(variable) {
-                // The pattern binds the variable itself: it must be this graph.
-                Some(column) => {
-                    let mask: Vec<bool> = solutions
-                        .table
-                        .column(column)
-                        .iter()
-                        .map(|&id| id == graph.raw() || id == UNDEF)
-                        .collect();
-                    solutions.table.retain_mask(&mask);
-                    let mut columns = std::mem::take(&mut solutions.table).into_columns();
-                    columns[column].fill(graph.raw());
-                    solutions.table = IdTable::from_columns(columns);
-                }
-                // The graph's column, charged before it is made.
-                None => {
-                    let rows = solutions.table.len();
-                    solutions = self.reshaped(solutions, rows.saturating_mul(8), |mut s| {
-                        let mut columns = std::mem::take(&mut s.table).into_columns();
-                        columns.push(vec![graph.raw(); rows]);
-                        s.vars.push(variable.clone());
-                        s.table = IdTable::from_columns(columns);
-                        s
-                    })?;
-                }
-            }
+            let solutions = self.in_graph(GraphScope::Named(graph), inner)?;
+            // The graph's column, where the pattern doesn't bind the variable, charged
+            // before it is made; the charge then follows the table's bytes (`reshaped`).
+            let growth = match solutions.column(variable) {
+                Some(_) => 0,
+                None => solutions.table.len().saturating_mul(8),
+            };
+            let solutions = self.reshaped(solutions, growth, |solutions| {
+                bind_graph(solutions, variable, RowGraphs::One(graph.raw()))
+            })?;
             all = Some(match all {
                 Some(all) => self.union(all, solutions)?,
                 None => solutions,
@@ -4140,7 +4146,7 @@ impl<'a> Context<'a> {
         } else {
             join(&left.table, &right.table, &lk, &rk, max_rows)
         }
-        .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
+        .map_err(|e| self.join_stopped(e, vars.len()))?;
         self.budget.release(hash_table);
         let ordered = left.ordered;
         self.consumed(left);
@@ -4185,7 +4191,7 @@ impl<'a> Context<'a> {
         } else {
             left_join(&left.table, &right.table, &lk, &rk, accept, max_rows)
         }
-        .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
+        .map_err(|e| self.join_stopped(e, vars.len()))?;
         self.budget.release(hash_table);
         let ordered = left.ordered;
         self.consumed(left);
@@ -5530,7 +5536,7 @@ impl<'a> Context<'a> {
         variables: &[Variable],
         aggregates: &[(Variable, AggregateExpression)],
     ) -> NativeResult<Solutions> {
-        let (groups, positions) = aggregate::groups_of(&solutions, variables);
+        let (groups, positions) = aggregate::groups_of(&solutions, variables)?;
         let group_count = groups.len();
         let mut vars: Vec<Variable> = variables.to_vec();
         vars.extend(aggregates.iter().map(|(target, _)| target.clone()));
@@ -5882,6 +5888,59 @@ impl<'b> Probe<'_, 'b> {
         }
         Ok(())
     }
+}
+
+/// The graphs [`bind_graph`] binds: one for every row, or each row's own.
+enum RowGraphs {
+    One(u64),
+    Each(Vec<u64>),
+}
+
+impl RowGraphs {
+    fn of(&self, row: usize) -> u64 {
+        match self {
+            Self::One(graph) => *graph,
+            Self::Each(graphs) => graphs[row],
+        }
+    }
+}
+
+/// `solutions`, a pattern's rows in named graphs, joined with `variable` bound to each row's
+/// graph, as SPARQL 1.1 §18.6 evaluates `GRAPH ?g { P }`: where the pattern binds `variable`
+/// itself, only the rows whose value is their graph (or unbound) stay, the graph written
+/// into its column in place (the column keeps its capacity, so what was charged for it is
+/// what [`Context::consumed`] releases); else the graphs become `variable`'s column. One
+/// rule for every evaluation of a graph variable: graph by graph ([`Context::graph`]) and a
+/// search's rows across graphs ([`search`]).
+fn bind_graph(mut solutions: Solutions, variable: &Variable, graphs: RowGraphs) -> Solutions {
+    let rows = solutions.table.len();
+    if let RowGraphs::Each(each) = &graphs {
+        debug_assert_eq!(each.len(), rows);
+    }
+    let mut columns = std::mem::take(&mut solutions.table).into_columns();
+    match solutions.column(variable) {
+        Some(column) => {
+            let mask: Vec<bool> = columns[column]
+                .iter()
+                .enumerate()
+                .map(|(row, &id)| id == graphs.of(row) || id == UNDEF)
+                .collect();
+            for (row, value) in columns[column].iter_mut().enumerate() {
+                *value = graphs.of(row);
+            }
+            solutions.table = IdTable::from_columns(columns);
+            solutions.table.retain_mask(&mask);
+        }
+        None => {
+            columns.push(match graphs {
+                RowGraphs::One(graph) => vec![graph; rows],
+                RowGraphs::Each(graphs) => graphs,
+            });
+            solutions.vars.push(variable.clone());
+            solutions.table = IdTable::from_columns(columns);
+        }
+    }
+    solutions
 }
 
 /// Columns of the variables `left` and `right` share, pairwise.

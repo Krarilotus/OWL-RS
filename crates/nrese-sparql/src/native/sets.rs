@@ -476,7 +476,7 @@ impl Context<'_> {
         }
 
         // The groups, from the core.
-        let (groups, positions) = super::aggregate::groups_of(&core, variables);
+        let (groups, positions) = super::aggregate::groups_of(&core, variables)?;
         let group_count = groups.len();
         let members_of = |group_of: &mut dyn Iterator<Item = usize>| {
             let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];

@@ -19,6 +19,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec};
 use nrese_vector::{Hit, Hnsw, HnswParameters, HnswParts, Metric, Vectors};
 use parking_lot::RwLock;
 
@@ -252,63 +253,20 @@ impl VectorIndex {
         }
     }
 
-    /// The `query.k` vectors nearest to `query.vector` that `accept` takes (by id).
-    pub(crate) fn search(
-        &self,
-        query: &VectorQuery,
-        accept: &(dyn Fn(u64) -> bool + Sync),
-    ) -> (Vec<Hit>, VectorSearchReport) {
-        let Some(space) = self.spaces.get(&query.vector.len()) else {
-            return (
-                Vec::new(),
-                VectorSearchReport {
-                    space: 0,
-                    graph: false,
-                    scanned: 0,
-                },
-            );
-        };
-        let len = space.vectors.len();
+    /// What a search like `query` reads ([`search`]): its space's vectors and the graph, if
+    /// the search uses one; `None` if no space has the query's dimension.
+    pub(crate) fn search_input(&self, query: &VectorQuery) -> Option<SearchInput> {
+        let space = self.spaces.get(&query.vector.len())?;
         let graph = space
             .graphs
             .iter()
             .find(|slot| slot.metric == query.metric)
-            .and_then(|slot| slot.graph.as_ref())
+            .and_then(|slot| slot.graph.clone())
             .filter(|_| uses_graph(space, query));
-        let Some(graph) = graph else {
-            let hits =
-                nrese_vector::exact(&space.vectors, &query.vector, query.k, query.metric, accept);
-            return (
-                hits,
-                VectorSearchReport {
-                    space: len,
-                    graph: false,
-                    scanned: len,
-                },
-            );
-        };
-        // Over-fetch for the filter: the beam keeps accepted vectors only, so a filter
-        // that rejects many needs a wider one.
-        let share = query.accepted.map_or(1.0, |n| n as f64 / len.max(1) as f64);
-        let ef = ((query.ef.max(query.k) as f64) / share.clamp(EXACT_SHARE, 1.0)).ceil() as usize;
-        let from_graph = graph.search(&space.vectors, &query.vector, query.k, ef, accept);
-        let tail = nrese_vector::exact_from(
-            &space.vectors,
-            graph.len(),
-            &query.vector,
-            query.k,
-            query.metric,
-            accept,
-        );
-        let hits = nrese_vector::merge(from_graph.into_iter().chain(tail), query.k);
-        (
-            hits,
-            VectorSearchReport {
-                space: len,
-                graph: true,
-                scanned: len - graph.len(),
-            },
-        )
+        Some(SearchInput {
+            vectors: space.vectors.clone(),
+            graph,
+        })
     }
 
     /// Whether no space has a vector.
@@ -518,6 +476,84 @@ fn uses_graph(space: &Space, query: &VectorQuery) -> bool {
             size >= EXACT_BELOW && !selective
         }
     }
+}
+
+/// What one search reads, taken from the index under its read lock ([`VectorIndex::search_input`])
+/// and searched after the lock is let go: the space's vectors (a copy of its shared chunks;
+/// an extension appending to a chunk copies it, so these stay as taken) and the graph,
+/// which covers a prefix of them. The one snapshot a vector search reads: a search that
+/// scopes or charges its vectors does so on this, not on a second copy.
+#[derive(Debug)]
+pub(crate) struct SearchInput {
+    vectors: Vectors,
+    graph: Option<Arc<Hnsw>>,
+}
+
+/// The `query.k` vectors of `input` nearest to `query.vector` that `accept` takes (by id).
+/// No lock of the index is held: `accept` is the caller's (it may intern and search again),
+/// and the scans run in parallel on the caller's pool.
+pub(crate) fn search<'b>(
+    input: Option<SearchInput>,
+    query: &VectorQuery,
+    accept: &(dyn Fn(u64) -> bool + Sync),
+    budget: &'b Budget,
+) -> Result<(ChargedVec<Hit, &'b Budget>, VectorSearchReport), BudgetExceeded> {
+    let Some(SearchInput { vectors, graph }) = input else {
+        return Ok((
+            ChargedVec::new(budget),
+            VectorSearchReport {
+                space: 0,
+                graph: false,
+                scanned: 0,
+            },
+        ));
+    };
+    let len = vectors.len();
+    let Some(graph) = graph else {
+        let hits = nrese_vector::exact(
+            &vectors,
+            &query.vector,
+            query.k,
+            query.metric,
+            accept,
+            budget,
+        )?;
+        return Ok((
+            hits,
+            VectorSearchReport {
+                space: len,
+                graph: false,
+                scanned: len,
+            },
+        ));
+    };
+    // Over-fetch for the filter: the beam keeps accepted vectors only, so a filter that
+    // rejects many needs a wider one.
+    let share = query.accepted.map_or(1.0, |n| n as f64 / len.max(1) as f64);
+    let ef = ((query.ef.max(query.k) as f64) / share.clamp(EXACT_SHARE, 1.0)).ceil() as usize;
+    let from_graph = graph.search(&vectors, &query.vector, query.k, ef, accept, budget)?;
+    let tail = nrese_vector::exact_from(
+        &vectors,
+        graph.len(),
+        &query.vector,
+        query.k,
+        query.metric,
+        accept,
+        budget,
+    )?;
+    // Each list is freed as the merge takes it, then its charge released.
+    let (from_graph, graph_held) = from_graph.into_parts();
+    let (tail, tail_held) = tail.into_parts();
+    let hits = nrese_vector::merge(from_graph.into_iter().chain(tail), query.k, budget);
+    drop((graph_held, tail_held));
+    Ok((
+        hits?,
+        VectorSearchReport {
+            space: len,
+            graph: true,
+            scanned: len - graph.len(),
+        },
+    ))
 }
 
 /// Builds or extends the graph `query` uses, from what `index` holds now, and installs

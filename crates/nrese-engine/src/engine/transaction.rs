@@ -1,5 +1,7 @@
 //! Write transactions: exact deltas over a base snapshot, published atomically on commit.
 
+use std::sync::atomic::Ordering;
+
 use hashbrown::HashSet;
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
 use parking_lot::MutexGuard;
@@ -175,6 +177,7 @@ impl<'e> Transaction<'e> {
                 .inferred
                 .with_delta(&inferred_inserts, &inferred_deletes),
             revision: base.revision,
+            committed_micros: base.committed_micros,
             dictionary_len: self.engine.shared.dictionary.len(),
             equality: match self.changes_equality() {
                 true => Default::default(),
@@ -215,6 +218,7 @@ impl<'e> Transaction<'e> {
                 .with_delta(&asserted_inserts, &asserted_deletes),
             inferred: seen.inferred.with_delta(&[], &gone),
             revision: seen.revision,
+            committed_micros: seen.committed_micros,
             dictionary_len: self.engine.shared.dictionary.len(),
             equality: match self.changes_equality() {
                 true => Default::default(),
@@ -518,26 +522,60 @@ impl<'e> Transaction<'e> {
             deletes: asserted.deletes.into_iter().collect(),
             inferred_inserts: triples(inferred.inserts),
             inferred_deletes: triples(inferred.deletes),
-            committed_micros: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |since| since.as_micros() as u64),
-            ),
+            // Stamped as it goes to the log ([`Inner::publish_record`]).
+            committed_micros: None,
         };
+        engine.publish_record(&record, true, dictionary_len, changes_equality)?;
+        Ok(summary)
+    }
+}
+
+impl Inner {
+    /// Publishes `record` as the next revision, its terms already in the dictionary
+    /// (`dictionary_len` of them): logged first in durable mode, then post-commit
+    /// maintenance. The caller holds the writer slot: a commit, or a replicated record.
+    ///
+    /// A `local` commit is stamped by the store's clock ([`Shared::stamp`]) when its record
+    /// goes to the log, its runs built and its layout converted, and the record and the
+    /// version take that one time (review r1, R1-F1). A replicated record keeps the
+    /// primary's time, which the clock takes too.
+    pub(super) fn publish_record(
+        &self,
+        record: &CommitRecord,
+        local: bool,
+        dictionary_len: u64,
+        changes_equality: bool,
+    ) -> EngineResult<()> {
+        let shared = &self.shared;
         // The first quad in a named graph turns a default-graph asserted stack into a quad
-        // stack. No compaction or checkpoint may replace its runs meanwhile: the writer slot
-        // excludes other commits, the compaction slot both of those.
+        // stack. No merge or mapped checkpoint may replace its runs between the conversion
+        // and the publication: the writer slot excludes other commits, the compaction slot
+        // both of those. It is converted first, in parallel without the slot, and kept where
+        // the stack's runs are still the ones converted. The record's runs are built before
+        // that, in the layout the stack will have (no holder of the compaction slot runs
+        // parallel work; only commits, under the writer slot, change the layout).
         let latest = shared.versions.load();
         let converting = latest.asserted.layout() == Layout::DefaultGraph && record.names_a_graph();
-        let _compaction = converting.then(|| shared.versions.compaction_slot.lock());
-        let converted = converting.then(|| shared.versions.load().asserted.with_quads_layout());
-        let asserted_layout = converted
-            .as_ref()
-            .map_or(latest.asserted.layout(), |index| index.layout());
+        let asserted_layout = match converting {
+            true => Layout::Quads,
+            false => latest.asserted.layout(),
+        };
         drop(latest);
         let [asserted_run, inferred_run] = record.runs(asserted_layout);
+        let (_compaction, converted) = match converting {
+            true => {
+                let (slot, converted) = shared.versions.converted_asserted();
+                (Some(slot), Some(converted))
+            }
+            false => (None, None),
+        };
+        debug_assert!(
+            converted
+                .as_ref()
+                .is_none_or(|index| index.layout() == asserted_layout)
+        );
         let revision = record.revision;
-        let publish = move |current: &Version| {
+        let publish = move |current: &Version, committed: Option<u64>| {
             debug_assert_eq!(current.revision + 1, revision, "single writer");
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
             Version {
@@ -545,6 +583,9 @@ impl<'e> Transaction<'e> {
                 asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,
+                // The latest of its commits: unknown stays unknown, and a replicated record
+                // (a primary's log may step back) bounds what came before too.
+                committed_micros: crate::durability::later(current.committed_micros, committed),
                 dictionary_len,
                 equality: match changes_equality {
                     true => Default::default(),
@@ -556,18 +597,41 @@ impl<'e> Transaction<'e> {
         let wal_bytes = match &shared.durable {
             Some(durable) => {
                 let mut wal = durable.wal.lock();
-                wal.append(&record)?;
-                shared.versions.publish(publish);
+                let mut stamp = || shared.stamp();
+                let stamp: Option<&mut dyn FnMut() -> u64> = match local {
+                    true => Some(&mut stamp),
+                    false => None,
+                };
+                let committed = wal.append(record, stamp)?;
+                if !local {
+                    shared
+                        .clock
+                        .fetch_max(committed.unwrap_or(0), Ordering::Relaxed);
+                }
+                shared
+                    .versions
+                    .publish(|current| publish(current, committed));
                 wal.bytes_since_checkpoint()
             }
             None => {
-                shared.versions.publish(publish);
+                let committed = match local {
+                    true => Some(shared.stamp()),
+                    false => {
+                        shared
+                            .clock
+                            .fetch_max(record.committed_micros.unwrap_or(0), Ordering::Relaxed);
+                        record.committed_micros
+                    }
+                };
+                shared
+                    .versions
+                    .publish(|current| publish(current, committed));
                 0
             }
         };
         // After the commit's own compaction slot (a conversion's): compacting takes it.
         drop(_compaction);
-        engine.after_commit(wal_bytes);
-        Ok(summary)
+        self.after_commit(wal_bytes);
+        Ok(())
     }
 }

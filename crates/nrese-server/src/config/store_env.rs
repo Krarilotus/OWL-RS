@@ -7,10 +7,11 @@ use super::env_names as names;
 use super::env_values::parse_bool;
 use super::source::ConfigSource;
 
-pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfig> {
+pub(super) fn parse_store_config(
+    source: &dyn ConfigSource,
+    machine: nrese_exec::memory::Reading,
+) -> Result<StoreConfig> {
     let defaults = StoreConfig::default();
-    // The memory the shares (`50%`) are of, read once.
-    let machine = super::units::machine_memory_bytes();
     let equality = parse_equality(source.get(names::REASONING_EQUALITY).as_deref())?;
     Ok(StoreConfig {
         mode: parse_store_mode(source.get(names::STORE_MODE).as_deref())?,
@@ -95,6 +96,11 @@ pub(super) fn parse_store_config(source: &dyn ConfigSource) -> Result<StoreConfi
             None => defaults.checkpoint_after_wal_bytes,
         },
         wal_archive: parse_bool(source, names::WAL_ARCHIVE, defaults.wal_archive)?,
+        wal_damage: match choice(source, names::WAL_DAMAGE, &["refuse", "keep-prefix"])? {
+            None => defaults.wal_damage,
+            Some(0) => nrese_store::WalDamage::Refuse,
+            Some(_) => nrese_store::WalDamage::KeepPrefix,
+        },
         index_encoding: match source.get(names::INDEX_ENCODING) {
             None => defaults.index_encoding,
             Some(name) => {
@@ -428,7 +434,9 @@ mod tests {
             if let Some(value) = value {
                 source.insert(names::REASONING_SUPPORT_SETS, value);
             }
-            parse_store_config(&source).unwrap().support_sets
+            parse_store_config(&source, Ok(16 << 30))
+                .unwrap()
+                .support_sets
         };
         assert_eq!(cap(None), 16);
         assert_eq!(cap(Some("4")), 4);
@@ -455,6 +463,65 @@ mod tests {
         let mut source = KeyValueSource::default();
         source.insert(names::DL_ANSWERS, "complete");
         assert!(parse_dl(&source).is_err());
+    }
+
+    /// Only `0` and `unlimited` mean no budget: a positive budget below one millisecond or
+    /// one byte is refused, naming its setting, not read as none; so is one past the range.
+    /// Every row is checked; the failures are reported together.
+    #[test]
+    fn a_dl_budget_below_one_unit_or_past_the_range_is_refused() {
+        let mut wrong = Vec::new();
+        for (name, value) in [
+            (names::DL_TIMEOUT_MS, "0.1ms"),
+            (names::DL_TIMEOUT_MS, "0.4"),
+            (names::DL_LOWER_BOUND_TIMEOUT_MS, "0.1ms"),
+            (names::DL_MEMORY, "0.4"),
+            (names::DL_MEMORY, "0.4B"),
+            (names::DL_MEMORY, "17179869184GiB"),
+            (names::DL_TIMEOUT_MS, "5124095576030432h"),
+        ] {
+            let mut source = KeyValueSource::default();
+            source.insert(name, value);
+            match parse_dl(&source) {
+                Ok(dl) => wrong.push(format!(
+                    "{name}={value}: timeout {:?}, lower-bound timeout {:?}, memory {:?}",
+                    dl.timeout, dl.lower_bound_timeout, dl.memory_bytes
+                )),
+                Err(error) if !format!("{error:#}").contains(name) => {
+                    wrong.push(format!("{name}={value}: {error:#} doesn't name it"));
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Through the DL configuration: a positive budget too small for a float (`0.000…1`) is
+    /// refused naming its setting, never loaded as no budget (review p2-b7-a r1 R1). Every
+    /// row is checked.
+    #[test]
+    fn a_dl_budget_too_small_for_a_float_is_refused() {
+        let tiny = format!("0.{}1", "0".repeat(400));
+        let mut wrong = Vec::new();
+        for (name, value) in [
+            (names::DL_TIMEOUT_MS, format!("{tiny}ms")),
+            (names::DL_LOWER_BOUND_TIMEOUT_MS, format!("{tiny}ms")),
+            (names::DL_MEMORY, format!("{tiny}B")),
+        ] {
+            let mut source = KeyValueSource::default();
+            source.insert(name, &value);
+            match parse_dl(&source) {
+                Ok(dl) => wrong.push(format!(
+                    "{name}: loaded, timeout {:?}, lower-bound timeout {:?}, memory {:?}",
+                    dl.timeout, dl.lower_bound_timeout, dl.memory_bytes
+                )),
+                Err(error) if !format!("{error:#}").contains(name) => {
+                    wrong.push(format!("{name}: {error:#} doesn't name it"));
+                }
+                Err(_) => {}
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

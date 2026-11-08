@@ -1,7 +1,12 @@
 //! Checkpoints: a full image of one revision (dictionary plus both index stacks).
 //!
-//! Format 11 (little-endian): `magic | revision u64 | flags u64 | dictionary | stack* | crc32
-//! u32`. The CRC covers everything before it. Flag bit 1 ([`COMPRESSED_KEYS`], format 11):
+//! Format 12 (little-endian): `magic | revision u64 | flags u64 | dictionary | stack* |
+//! committed u64 | crc32 u32`. The CRC covers everything before it. `committed` is when the
+//! revision's last commit was made, microseconds since 1970, a time restore needs
+//! (`DurabilityConfig::recover_until_micros`); with its top bit ([`UNKNOWN_TIME`]) set, the
+//! revision also holds commits of unknown time, and the rest is only the store's commit
+//! clock, which new commits never go before; 0 knows neither. Format 11 is format 12 without
+//! it. Flag bit 1 ([`COMPRESSED_KEYS`], format 11 on):
 //! the dictionary's keys are FSST-compressed ([`crate::term::vocabulary`]); its two symbol
 //! tables follow the dictionary's header. Flag bit 0 ([`INTEGERS_IN_DICTIONARY`]):
 //! integer-derived literals are dictionary entries, not inline (a store created before
@@ -70,8 +75,10 @@ use crate::term::vocabulary::{Codec, Trained, VocabularyEncoding, vocabulary_enc
 /// the dictionary's text order; version 8 the flags (integer-derived literals inline);
 /// version 9 lets the asserted stack have the default-graph layout; version 10 lets blocks
 /// of the packed permutations store a position as a palette; version 11 stores the
-/// dictionary's offsets in blocks.
-const MAGIC: &[u8; 8] = b"NRESECKB";
+/// dictionary's offsets in blocks; version 12 the last commit's time (EEV-06).
+const MAGIC: &[u8; 8] = b"NRESECKC";
+/// Format 11: format 12 without the commit time.
+const MAGIC_V11: &[u8; 8] = b"NRESECKB";
 /// Format 10: 8-byte dictionary end offsets.
 const MAGIC_V10: &[u8; 8] = b"NRESECKA";
 /// Formats 9 and 8 read as 10: their blocks have no palettes (the byte was zero padding).
@@ -81,6 +88,9 @@ const MAGIC_V8: &[u8; 8] = b"NRESECK8";
 /// without the flags, without the text order, unaligned packed permutations, quad lists.
 const MAGIC_V7: &[u8; 8] = b"NRESECK7";
 const MAGIC_V6: &[u8; 8] = b"NRESECK6";
+/// The commit time's top bit (format 12): the revision holds commits of unknown time, and the
+/// rest is only the store's commit clock. Times since 1970 in microseconds never reach it.
+const UNKNOWN_TIME: u64 = 1 << 63;
 /// Flags bit: integer-derived literals are dictionary entries.
 const INTEGERS_IN_DICTIONARY: u64 = 1;
 /// Flags bit: the dictionary's keys are compressed (format 11).
@@ -277,21 +287,24 @@ fn write_dictionary<W: Write>(
 }
 
 /// Writes the end of the dictionary section: the entries `0..len` with a text, sorted by it
-/// ([`crate::term::order`]). Its sort is not charged yet (the scans' charging brings one).
+/// ([`crate::term::order`]). Its sort and the order are charged to `admission` before they
+/// are allocated ([`Dictionary::text_order`]), and held until the order is written.
 fn write_text_order<W: Write>(
     out: &mut Checksummed<'_, W>,
     dictionary: &Dictionary,
     len: u64,
+    admission: &Budget,
 ) -> EngineResult<()> {
     let started = std::time::Instant::now();
-    let order = dictionary.text_order(len);
+    let order = dictionary.text_order(len, admission)?;
     let ordered = started.elapsed();
     out.pad();
     put_u64(&mut out.buffer, order.len() as u64);
-    for index in order {
+    for &index in order.iter() {
         put_u32(&mut out.buffer, index);
         out.drain()?;
     }
+    drop(order);
     tracing::debug!(
         entries = len,
         text_order_ms = ordered.as_millis() as u64,
@@ -544,18 +557,68 @@ pub(crate) fn exists(dir: &Path, revision: u64) -> bool {
     checkpoint_path(dir, revision, EXTENSION).exists()
 }
 
-/// Writes a checkpoint of `snapshot` and returns its path; its scratch is charged within
-/// `admission` ([`write_parts`]).
+/// Whether the checkpoint of `revision` is in place under its name; an error where that
+/// can't be told.
+pub(crate) fn placed(dir: &Path, revision: u64) -> std::io::Result<bool> {
+    checkpoint_path(dir, revision, EXTENSION).try_exists()
+}
+
+/// A checkpoint's times: its version's (`None`: it holds commits of unknown time) and the
+/// store's commit clock, no earlier than any commit in it.
+pub(crate) type Times = (Option<u64>, u64);
+
+/// The format 12 trailer word of `times`; a time past [`super::MAX_COMMIT_TIME`] (which
+/// recovery and replication refuse, so none reaches here) fails the write rather than being
+/// kept short.
+fn trailer((committed, clock): Times) -> EngineResult<u64> {
+    let time = committed.unwrap_or(clock);
+    if time > super::MAX_COMMIT_TIME {
+        return Err(EngineError::Corruption(format!(
+            "a commit time past what a checkpoint keeps ({time})"
+        )));
+    }
+    Ok(match committed {
+        Some(committed) => committed,
+        None => clock | UNKNOWN_TIME,
+    })
+}
+
+/// The times of a format 12 trailer word (0: neither known).
+fn times_of(trailer: u64) -> Times {
+    match (trailer, trailer & UNKNOWN_TIME) {
+        (0, _) => (None, 0),
+        (_, 0) => (Some(trailer), trailer),
+        _ => (None, trailer & !UNKNOWN_TIME),
+    }
+}
+
+/// Writes a checkpoint of `snapshot`, of a committed revision (its version's time; `clock`,
+/// the store's commit clock, read with or after the snapshot), and returns its path; its
+/// scratch is charged within `admission` ([`write_parts`]).
 pub(crate) fn write(
     dir: &Path,
     snapshot: &Snapshot,
+    clock: u64,
     admission: Option<&Arc<SharedBudget>>,
+) -> EngineResult<PathBuf> {
+    let committed_micros = snapshot.version().committed_micros;
+    write_stamped(dir, snapshot, admission, &mut || (committed_micros, clock))
+}
+
+/// [`write`] of a revision this checkpoint commits: its times are `stamp`'s, asked for once
+/// everything else is written ([`write_parts`]).
+pub(crate) fn write_stamped(
+    dir: &Path,
+    snapshot: &Snapshot,
+    admission: Option<&Arc<SharedBudget>>,
+    stamp: &mut dyn FnMut() -> Times,
 ) -> EngineResult<PathBuf> {
     let version = snapshot.version();
     write_parts(
         dir,
         admission,
         snapshot.revision(),
+        stamp,
         snapshot.dictionary(),
         snapshot.dictionary_len(),
         [version.asserted.layout(), version.inferred.layout()],
@@ -563,7 +626,11 @@ pub(crate) fn write(
     )
 }
 
-/// Writes a checkpoint of `revision` from its parts and returns its path: the dictionary's
+/// Writes a checkpoint of `revision` from its parts and returns its path. Its times
+/// ([`Times`]) are `stamp`'s, asked for once the parts are written, just before the
+/// file is synced and renamed into place: for a bulk load the checkpoint commits, and the time
+/// is then that of its commit, not of the build before it (as a transaction's is taken just
+/// before its record is synced). It holds the dictionary's
 /// entries `0..dictionary_len`, and each stack's permutations as `packed` gives them, in
 /// the order of the stack's layout (`layouts`: asserted, inferred). Each is written before the next is asked for, so a
 /// caller can build one at a time and drop it (bulk loads).
@@ -571,10 +638,15 @@ pub(crate) fn write(
 /// The scratch of the dictionary's section is charged to a budget within `admission`, the
 /// process's root (`EngineConfig::admission`; `None`: no limit), before it is allocated:
 /// refused, it fails with [`EngineError::MemoryLimit`] and publishes nothing.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one per header field and part, each given apart by its two callers"
+)]
 pub(crate) fn write_parts<'a>(
     dir: &Path,
     admission: Option<&Arc<SharedBudget>>,
     revision: u64,
+    stamp: &mut dyn FnMut() -> Times,
     dictionary: &Dictionary,
     dictionary_len: u64,
     layouts: [Layout; 2],
@@ -617,7 +689,7 @@ pub(crate) fn write_parts<'a>(
     // Where the time goes, for the load log (bulk loads build the permutations here).
     let started = std::time::Instant::now();
     write_dictionary(&mut out, dictionary, dictionary_len, codec, &admission)?;
-    write_text_order(&mut out, dictionary, dictionary_len)?;
+    write_text_order(&mut out, dictionary, dictionary_len, &admission)?;
     let dictionary_ms = started.elapsed().as_millis() as u64;
     let (mut build, mut write) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
     for (stack, layout) in Stack::ALL.into_iter().zip(layouts) {
@@ -634,6 +706,12 @@ pub(crate) fn write_parts<'a>(
             write += writing.elapsed();
         }
     }
+    #[cfg(test)]
+    if let Some(at) = super::fault::CLOCK_AT_TRAILER.get() {
+        super::fault::CLOCK.set(Some(at));
+    }
+    // The last commit's time (format 12), 0 where it isn't known.
+    put_u64(&mut out.buffer, trailer(stamp())?);
     out.flush_buffer()?;
     let syncing = std::time::Instant::now();
     let magic = MAGIC;
@@ -651,6 +729,8 @@ pub(crate) fn write_parts<'a>(
     drop(file);
     let path = checkpoint_path(dir, revision, EXTENSION);
     fs::rename(&tmp, &path)?;
+    #[cfg(test)]
+    super::fault::check(&super::fault::FAIL_DIR_SYNC, "directory sync")?;
     super::sync_dir(dir)?;
     tracing::debug!(
         revision,
@@ -681,6 +761,10 @@ pub(crate) fn stack_index(
 /// A loaded checkpoint: its revision and both stacks; the dictionary is restored in place.
 pub(crate) struct Loaded {
     pub revision: u64,
+    /// When its last commit was made (format 12); `None` where that isn't known.
+    pub committed_micros: Option<u64>,
+    /// The store's commit clock as it was then (format 12; 0 before).
+    pub clock_micros: u64,
     pub stacks: Stacks,
     /// The store keeps integer-derived literals in its dictionary.
     pub integers_in_dictionary: bool,
@@ -727,9 +811,11 @@ pub(crate) fn load_latest(
         .ok_or_else(|| corrupt("truncated"))?;
     let mut reader = Reader::new(body);
     let mut blocks = false;
+    let mut timed = false;
     let (packed, aligned, with_order, with_flags) = match reader.bytes(MAGIC.len()) {
-        Some(magic) if magic == MAGIC => {
+        Some(magic) if magic == MAGIC || magic == MAGIC_V11 => {
             blocks = true;
+            timed = magic == MAGIC;
             (true, true, true, true)
         }
         Some(magic) if magic == MAGIC_V10 || magic == MAGIC_V9 || magic == MAGIC_V8 => {
@@ -752,6 +838,18 @@ pub(crate) fn load_latest(
         return Err(corrupt("checksum mismatch"));
     }
     lap("crc");
+    // Format 12: the commit times end the body; the rest is read as format 11.
+    let (mut committed_micros, mut clock_micros) = (None, 0);
+    if timed {
+        let (rest, time) = body
+            .split_at_checked(body.len().saturating_sub(8))
+            .filter(|(rest, _)| rest.len() >= MAGIC.len())
+            .ok_or_else(|| corrupt("truncated"))?;
+        (committed_micros, clock_micros) =
+            times_of(u64::from_le_bytes(time.try_into().expect("8 bytes")));
+        reader = Reader::new(rest);
+        reader.bytes(MAGIC.len());
+    }
     let revision = reader.u64().ok_or_else(|| corrupt("truncated header"))?;
     let (integers_in_dictionary, compressed) = match with_flags {
         true => {
@@ -799,6 +897,8 @@ pub(crate) fn load_latest(
         lap("packed permutations");
         return Ok(Some(Loaded {
             revision,
+            committed_micros,
+            clock_micros,
             stacks: Stacks::Packed(stacks),
             integers_in_dictionary,
         }));
@@ -821,6 +921,8 @@ pub(crate) fn load_latest(
         .ok_or_else(|| corrupt("truncated inferred"))?;
     Ok(Some(Loaded {
         revision,
+        committed_micros: None,
+        clock_micros: 0,
         stacks: Stacks::Quads { quads, inferred },
         integers_in_dictionary,
     }))
@@ -865,13 +967,19 @@ fn read_stacks<'a>(
 pub(crate) fn map_written(path: &Path) -> EngineResult<(Base, [IndexVersion; 2])> {
     let corrupt =
         |what: &str| EngineError::Corruption(format!("checkpoint {}: {what}", path.display()));
+    #[cfg(test)]
+    super::fault::check(&super::fault::FAIL_MAP, "mapping")?;
     let map = crate::mapped::map(path)?;
     let bytes: &[u8] = &map;
-    let body = &bytes[..bytes.len().saturating_sub(4)];
+    let mut body = &bytes[..bytes.len().saturating_sub(4)];
+    // Format 12 ends its body in the commit time, which the version carries already.
+    if body.starts_with(MAGIC) {
+        body = &body[..body.len().saturating_sub(8)];
+    }
     let mut reader = Reader::new(body);
     // Format 8 is format 9 with the quad layout only; 9 is 10 without palettes.
     let blocks = match reader.bytes(MAGIC.len()) {
-        Some(magic) if magic == MAGIC => true,
+        Some(magic) if magic == MAGIC || magic == MAGIC_V11 => true,
         Some(magic) if magic == MAGIC_V10 || magic == MAGIC_V9 || magic == MAGIC_V8 => false,
         _ => return Err(corrupt("bad magic")),
     };
@@ -917,7 +1025,7 @@ mod tests {
     use std::sync::Arc;
 
     use nrese_exec::{Budget, Reservation, SharedBudget};
-    use nrese_rdf::{GraphName, Literal, LiteralRef, NamedNode, Quad};
+    use nrese_rdf::{BlankNodeRef, GraphName, Literal, LiteralRef, NamedNode, Quad};
 
     use super::Checksummed;
     use crate::term::Dictionary;
@@ -961,7 +1069,7 @@ mod tests {
             _held: Reservation::new(&budget),
         };
         super::write_dictionary(&mut out, &heap, heap.len(), Some(&codec), &budget).unwrap();
-        super::write_text_order(&mut out, &heap, heap.len()).unwrap();
+        super::write_text_order(&mut out, &heap, heap.len(), &budget).unwrap();
         out.flush_buffer().unwrap();
         let path = dir.join("dictionary");
         std::fs::write(&path, out.inner).unwrap();
@@ -973,6 +1081,50 @@ mod tests {
             dictionary.intern(LiteralRef::new_simple_literal(&format!("new {i}")).into());
         }
         dictionary
+    }
+
+    /// P2-01 A4. A view of the dictionary's keys taken before a rebase reads every key it
+    /// held after it. The rebase moves the heap's suffix into a new heap: the view is then the
+    /// only owner of the old heap's blocks, which go when it drops.
+    #[test]
+    fn a_view_taken_before_a_rebase_reads_its_keys_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = Dictionary::default();
+        let n = 10_000u64;
+        for i in 0..n {
+            dictionary.intern(LiteralRef::new_simple_literal(&format!("word {i}")).into());
+        }
+        let keys = dictionary.export_keys(0, n);
+        let held = dictionary.held_view();
+        // A checkpoint of the first 6,000 entries, compressed, with its text order.
+        let len = 6_000;
+        let codec = Codec::train(&dictionary.export_keys(0, len));
+        let budget = Budget::unlimited();
+        let mut out = Checksummed {
+            inner: Vec::new(),
+            crc: crc32fast::Hasher::new(),
+            buffer: Vec::new(),
+            written: 0,
+            _held: Reservation::new(&budget),
+        };
+        super::write_dictionary(&mut out, &dictionary, len, Some(&codec), &budget).unwrap();
+        super::write_text_order(&mut out, &dictionary, len, &budget).unwrap();
+        out.flush_buffer().unwrap();
+        let path = dir.path().join("dictionary");
+        std::fs::write(&path, out.inner).unwrap();
+        let map = crate::mapped::map(&path).unwrap();
+        let base =
+            super::read_dictionary(&mut super::Reader::new(&map), &map, true, true, true).unwrap();
+        assert!(dictionary.rebase(base).unwrap());
+        assert!(
+            held.sole_owner_of_its_heap(),
+            "the rebase let go of the old heap's blocks"
+        );
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(&held.key(i as u64), key, "entry {i} through the view");
+        }
+        assert_eq!(dictionary.export_keys(0, n), keys);
+        drop(held);
     }
 
     /// Samples FSST trains on at its largest: the most keys a sample has, each empty (FSST
@@ -1103,6 +1255,129 @@ mod tests {
         assert_eq!((excess, budget.used(), root.used()), (0, 0, 0));
     }
 
+    /// A dictionary of `texts` simple literals and `blanks` blank nodes (no text: not in
+    /// the order), on the heap alone: its text order is sorted whole.
+    fn heap_dictionary(texts: u64, blanks: u64) -> Dictionary {
+        let dictionary = Dictionary::default();
+        for i in 0..texts {
+            let text = format!("{} {i}", hex(i, 12));
+            dictionary.intern(LiteralRef::new_simple_literal(&text).into());
+        }
+        for i in 0..blanks {
+            dictionary.intern(BlankNodeRef::new_unchecked(&format!("b{i}")).into());
+        }
+        dictionary
+    }
+
+    /// A writer into nothing, its buffer made before a measurement.
+    fn sink(budget: &Budget) -> Checksummed<'_, std::io::Sink> {
+        Checksummed {
+            inner: std::io::sink(),
+            crc: crc32fast::Hasher::new(),
+            buffer: Vec::with_capacity(2 * super::BUFFER),
+            written: 0,
+            _held: Reservation::new(budget),
+        }
+    }
+
+    /// A checkpoint's text order takes nothing it didn't charge to its admission first
+    /// (SYN-49: 16 bytes an entry sorted, and the merged order, charged nowhere: 640 MB at
+    /// 40 M terms). Three shapes: a compressed base with its order and entries since (those
+    /// sorted, then merged with the base's, its keys decoded); the same once a prefix
+    /// search has sorted them (only merged); a heap with no base, blank nodes among it
+    /// (all sorted).
+    #[test]
+    fn a_checkpoints_text_order_holds_what_it_charged() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (sorted, kept) = (dir.path().join("sorted"), dir.path().join("kept"));
+        std::fs::create_dir_all(&sorted).unwrap();
+        std::fs::create_dir_all(&kept).unwrap();
+        let sorted = dictionary(&sorted);
+        let kept = dictionary(&kept);
+        let prefix = crate::term::StringTest {
+            needle: "new",
+            placement: crate::term::Placement::Start,
+            iris: false,
+            strings: true,
+            lang_strings: true,
+            typed: false,
+            language: None,
+            ascii_case_insensitive: false,
+        };
+        assert_eq!(kept.matching_strings(&prefix, u64::MAX).len(), 1_000);
+        let heap = heap_dictionary(20_000, 100);
+        let budget = Budget::unlimited();
+        let mut excess = Vec::new();
+        for dictionary in [&sorted, &kept, &heap] {
+            let mut out = sink(&budget);
+            let len = dictionary.len();
+            let ((), held) = nrese_exec::measure::measure_within(&budget, || {
+                super::write_text_order(&mut out, dictionary, len, &budget).unwrap();
+            });
+            excess.push(held);
+        }
+        assert_eq!(excess, [0; 3], "bytes held beyond the charges");
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// A text order refused part way frees what it made before it releases its charge,
+    /// and holds nothing after: refused its entries (nothing made), refused the order
+    /// once the entries are sorted (the entries made), refused the merged order of a kept
+    /// one. Room in a root of exactly so much: 20,100 entries of 16 bytes, 20,000 of them
+    /// with a text, 4 bytes each in the order and in the merged order.
+    #[test]
+    fn a_refused_text_order_frees_before_it_releases() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        let heap = heap_dictionary(20_000, 100);
+        let (n, m) = (20_100, 20_000);
+        // The view of the keys the order is sorted from, charged first: its heap's sealed
+        // blocks' `Arc`s (8 bytes each, a block a 4,096 keys) and its tail keys' (16 each).
+        let view = 8 * (n / 4_096) + 16 * (n % 4_096);
+        let mut outcomes = Vec::new();
+        for room in [view + 16 * n - 1, view + 16 * n + 4 * m - 1] {
+            let root = SharedBudget::new(room);
+            let budget = Budget::unlimited().within(Some(Arc::clone(&root)));
+            let mut out = sink(&budget);
+            let (refused, excess) = nrese_exec::measure::measure_within(&budget, || {
+                super::write_text_order(&mut out, &heap, n as u64, &budget)
+            });
+            let refused = matches!(refused, Err(crate::EngineError::MemoryLimit(_)));
+            drop(out);
+            outcomes.push((refused, excess, root.used()));
+        }
+        // Kept: the merged order alone, 4 bytes an entry.
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dictionary(dir.path());
+        let prefix = crate::term::StringTest {
+            needle: "new",
+            placement: crate::term::Placement::Start,
+            iris: false,
+            strings: true,
+            lang_strings: true,
+            typed: false,
+            language: None,
+            ascii_case_insensitive: false,
+        };
+        assert_eq!(kept.matching_strings(&prefix, u64::MAX).len(), 1_000);
+        // The view first: the 1,000 entries interned since the base, in the heap's tail.
+        let root = SharedBudget::new(16 * 1_000 + 4 * kept.len() as usize - 1);
+        let budget = Budget::unlimited().within(Some(Arc::clone(&root)));
+        let mut out = sink(&budget);
+        let len = kept.len();
+        let (refused, excess) = nrese_exec::measure::measure_within(&budget, || {
+            super::write_text_order(&mut out, &kept, len, &budget)
+        });
+        let refused = matches!(refused, Err(crate::EngineError::MemoryLimit(_)));
+        drop(out);
+        outcomes.push((refused, excess, root.used()));
+        assert_eq!(outcomes, [(true, 0, 0); 3]);
+    }
+
     /// A checkpoint its admission root has no room for fails with a memory error, once its
     /// file is begun: it publishes nothing and holds nothing. The next start removes the
     /// file and recovers the revision from the log, and a checkpoint with room is written
@@ -1142,5 +1417,82 @@ mod tests {
             assert_eq!((snapshot.revision(), snapshot.len()), (1, 1));
             assert_eq!(engine.checkpoint().unwrap(), 1);
         }
+    }
+
+    /// A format 11 checkpoint (no commit time) still opens as it did, plainly and for a
+    /// restore by revision; a restore by time from it is refused, since nothing says when its
+    /// commits were made (EEV-06). Format 12 is format 11 with the time before the checksum,
+    /// so removing it gives the format 11 file of the same store.
+    #[test]
+    fn a_format_11_checkpoint_opens_but_not_for_a_time_restore() {
+        use crate::{DurabilityConfig, Engine, EngineConfig, EngineError, QuadPattern};
+        let dir = tempfile::tempdir().unwrap();
+        let config = |until: Option<u64>, revision: Option<u64>| EngineConfig {
+            background_maintenance: false,
+            durability: DurabilityConfig {
+                recover_until_micros: until,
+                recover_until: revision,
+                ..DurabilityConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        let node = |n: &str| NamedNode::new_unchecked(format!("http://example.com/{n}"));
+        let quad = Quad::new(node("s"), node("p"), node("o"), GraphName::DefaultGraph);
+        {
+            let engine = Engine::open(dir.path(), config(None, None)).unwrap();
+            super::super::fault::CLOCK.set(Some(1000));
+            let mut tx = engine.transaction();
+            tx.insert(quad.as_ref());
+            tx.commit().unwrap();
+            super::super::fault::CLOCK.set(None);
+            assert_eq!(engine.checkpoint().unwrap(), 1);
+        }
+        let path = super::checkpoint_path(dir.path(), 1, super::EXTENSION);
+        let file = std::fs::read(&path).unwrap();
+        assert_eq!(&file[..8], super::MAGIC);
+        let time = file.len() - 12;
+        assert_eq!(
+            u64::from_le_bytes(file[time..time + 8].try_into().unwrap()),
+            1000
+        );
+        let mut old = super::MAGIC_V11.to_vec();
+        old.extend_from_slice(&file[8..time]);
+        let crc = crc32fast::hash(&old);
+        old.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &old).unwrap();
+
+        let refused = Engine::open(dir.path(), config(Some(u64::MAX), None)).err();
+        assert!(
+            matches!(refused, Some(EngineError::Configuration(_))),
+            "{refused:?}"
+        );
+        for (case, open) in [
+            ("plain", config(None, None)),
+            ("by revision", config(None, Some(1))),
+        ] {
+            let engine = Engine::open(dir.path(), open).unwrap();
+            let snapshot = engine.snapshot();
+            assert_eq!(snapshot.revision(), 1, "{case}");
+            let held: Vec<Quad> = snapshot
+                .quads_for_pattern(&QuadPattern::all())
+                .map(|q| snapshot.decode_quad(q).unwrap())
+                .collect();
+            assert_eq!(held, std::slice::from_ref(&quad), "{case}");
+        }
+        // With verification too (its checksum and structure), as format 11 was read.
+        let verified = EngineConfig {
+            durability: DurabilityConfig {
+                verify_on_open: true,
+                ..config(None, None).durability
+            },
+            ..config(None, None)
+        };
+        assert_eq!(
+            Engine::open(dir.path(), verified)
+                .unwrap()
+                .snapshot()
+                .revision(),
+            1
+        );
     }
 }
