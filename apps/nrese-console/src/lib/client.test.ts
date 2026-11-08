@@ -35,6 +35,34 @@ describe("NreseClient", () => {
     });
   });
 
+  // SYN-72 C-1105: the server states every query answer's completeness, `complete`
+  // included; an answer that arrives without it was not shown complete.
+  test.each([
+    [{}, { status: "not-certified", header: "absent" }],
+    [{ "NRESE-Completeness": "complete" }, { status: "complete", header: "complete" }],
+  ])("reads a query answer with headers %j as %j", async (headers, completeness) => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response("true", { status: 200, headers }),
+    );
+    const client = new NreseClient({ fetchImpl: fetchImpl as typeof fetch });
+
+    const response = await client.runQuery("ASK {}", "application/sparql-results+json");
+
+    expect(response.completeness).toEqual(completeness);
+  });
+
+  test("leaves a failed query's completeness unset", async () => {
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response("no", { status: 400 }),
+    );
+    const client = new NreseClient({ fetchImpl: fetchImpl as typeof fetch });
+
+    const response = await client.runQuery("ASK {", "application/sparql-results+json");
+
+    expect(response).toMatchObject({ ok: false, status: 400 });
+    expect(response.completeness).toBeUndefined();
+  });
+
   test("asks for autocompletion with the typed text encoded", async () => {
     const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
       new Response(JSON.stringify({ suggestions: [{ iri: "http://e/x", label: "X", score: 1 }] }), {
