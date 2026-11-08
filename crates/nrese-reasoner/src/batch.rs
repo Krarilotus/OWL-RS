@@ -1891,14 +1891,15 @@ impl Equality {
         let chunks = seeds
             .par_iter()
             .try_fold(
-                || ChargedVec::new(&room),
-                |mut copies, &[s, p, o]| {
+                || (ChargedVec::new(&room), ChargedVec::new(&room)),
+                |(mut copies, mut scratch), &[s, p, o]| {
                     let (ms, mp, mo) = (
                         self.members(store, s),
                         self.members(store, p),
                         self.members(store, o),
                     );
-                    copies.fill(copies_at_most([&ms, &mp, &mo]), |out| {
+                    let bound = copies_at_most([&ms, &mp, &mo]);
+                    append_copies(&mut copies, &mut scratch, bound, |out| {
                         for &s in &ms {
                             for &p in &mp {
                                 for &o in &mo {
@@ -1910,9 +1911,10 @@ impl Equality {
                             }
                         }
                     })?;
-                    Ok(copies)
+                    Ok((copies, scratch))
                 },
             )
+            .map(|folded| folded.map(|(copies, _scratch)| copies))
             .collect::<Result<Vec<_>, _>>()
             .map_err(refused)?;
         let out = concatenated(&room, chunks).map_err(refused)?;
@@ -2930,6 +2932,21 @@ fn copies_at_most(members: [&[u64]; 3]) -> usize {
     })
 }
 
+/// A thread's copies, charged to the operation's room.
+pub(crate) type Copies<'a> = ChargedVec<Triple, &'a nrese_exec::Budget>;
+
+/// One fact's copies, at most `bound` of them, that `make` writes, appended to the thread's
+/// `copies`; `scratch` is the thread's room for one fact's copies.
+pub(crate) fn append_copies<'a>(
+    copies: &mut Copies<'a>,
+    scratch: &mut Copies<'a>,
+    bound: usize,
+    make: impl FnOnce(&mut nrese_exec::Room<'_, Triple>),
+) -> Result<(), BudgetExceeded> {
+    let _ = scratch;
+    copies.fill(bound, make)
+}
+
 /// Each thread's copies, `chunks`, in one list of exactly their number: its room charged
 /// before it is made, beside theirs, then each chunk moved in and freed in turn, so every
 /// copy moves once and the list never grows (a pairwise reduction would move them at each
@@ -2984,14 +3001,15 @@ fn list(
             let chunks = facts
                 .par_iter()
                 .try_fold(
-                    || ChargedVec::new(&room),
-                    |mut copies, fact| {
+                    || (ChargedVec::new(&room), ChargedVec::new(&room)),
+                    |(mut copies, mut scratch), fact| {
                         let [ms, mp, mo] = fact.each_ref().map(|id| {
                             reps.classes
                                 .class_of(*id)
                                 .unwrap_or(std::slice::from_ref(id))
                         });
-                        copies.fill(copies_at_most([ms, mp, mo]), |out| {
+                        let bound = copies_at_most([ms, mp, mo]);
+                        append_copies(&mut copies, &mut scratch, bound, |out| {
                             for &s in ms {
                                 for &p in mp {
                                     let relation = store.relation(p);
@@ -3005,9 +3023,10 @@ fn list(
                                 }
                             }
                         })?;
-                        Ok(copies)
+                        Ok((copies, scratch))
                     },
                 )
+                .map(|folded| folded.map(|(copies, _scratch)| copies))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(refused)?;
             let expanded = concatenated(&room, chunks).map_err(refused)?;
