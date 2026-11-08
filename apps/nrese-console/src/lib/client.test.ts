@@ -77,8 +77,28 @@ describe("NreseClient", () => {
     ]);
   });
 
+  // SYN-72 R1-F1: the server reads these named graphs as the default graph
+  // (nrese-sparql/src/compat.rs); a named target naming one is refused before any request.
+  test.each(["urn:x-arq:DefaultGraph", "urn:x-rdflib:default"])(
+    "refuses a named target %s, sending nothing",
+    async (iri) => {
+      const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response(null, { status: 204 }),
+      );
+      const client = new NreseClient({ fetchImpl: fetchImpl as typeof fetch });
+      const target = { kind: "named", iri } as const;
+
+      await expect(client.deleteGraph(target)).rejects.toThrow(/default graph/i);
+      await expect(client.writeGraph("PUT", "", target)).rejects.toThrow(/default graph/i);
+      await expect(client.writeGraph("POST", "", target)).rejects.toThrow(/default graph/i);
+      await expect(client.readGraph(target)).rejects.toThrow(/default graph/i);
+      await expect(client.runTell("", target)).rejects.toThrow(/default graph/i);
+      expect(fetchImpl).not.toHaveBeenCalled();
+    },
+  );
+
   // Guard (unchanged behaviour): the console's selector names the default graph in default
-  // mode whatever its hidden IRI field holds, and the typed IRI in named mode.
+  // mode whatever its IRI field holds, and the typed IRI in named mode.
   test("maps the console's graph selector to its target", () => {
     expect(selectedGraphTarget("default", "http://example.com/g")).toEqual({ kind: "default" });
     expect(selectedGraphTarget("named", "http://example.com/g")).toEqual({
