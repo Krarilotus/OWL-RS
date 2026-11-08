@@ -443,6 +443,126 @@ fn a_crossed_group_by_a_key_named_again_draws_from_the_query_budget() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+/// Spec: SPARQL 1.1 §18.4: an alternative is a UNION of its arms' bags, and `p+` and `p?`
+/// are sets. Over n self-loops `ex:n<i> ex:p ex:n<i>`, a hub `ex:h ex:p ex:n<i>` and
+/// `ex:m ex:q ex:m`, the k arms `!(ex:q)`, `!(ex:q|ex:q)`, … (arm i names `ex:q` i times:
+/// k distinct arms, each every `ex:p` statement) give each of the 2n `ex:p` pairs k times;
+/// under `+` each pair once (the self-pairs and the hub's), from the hub each `ex:n<i>`
+/// once, under `?` each pair once and every node with itself (2n + 2), COUNT under `+` 2n,
+/// `^(…)+` each reversed pair once. Outside a closure the bag keeps its copies: 4 arms
+/// answer each pair 4 times; 64 arms make 128n rows, over 1 MiB for n = 1,024 and 4,096:
+/// `MemoryLimit`. Each way, the query's thread holds at most the limit and its bookkeeping
+/// (holding every arm's bag at once would be 64 × 2n × 16 bytes, 8 MiB for n = 4,096; the
+/// package review r1 of the executor memory stack, EMS-R1). On the default path and as
+/// written alike.
+#[test]
+fn overlapping_alternative_arms_draw_from_the_query_budget() {
+    let mut failed = Vec::new();
+    for n in [1usize << 10, 1 << 12] {
+        let (p, hub) = (ex("p"), ex("h"));
+        let node = |i: usize| ex(&format!("n{i}"));
+        let marker = Quad::new(ex("m"), ex("q"), ex("m"), GraphName::DefaultGraph);
+        let engine = engine(
+            (0..n)
+                .flat_map(|i| {
+                    [
+                        Quad::new(node(i), p.clone(), node(i), GraphName::DefaultGraph),
+                        Quad::new(hub.clone(), p.clone(), node(i), GraphName::DefaultGraph),
+                    ]
+                })
+                .chain([marker]),
+        );
+        let iri = |name: &str| format!("<{EX}{name}>");
+        let selves = || (0..n).map(|i| (iri(&format!("n{i}")), iri(&format!("n{i}"))));
+        let spokes = || (0..n).map(|i| (iri("h"), iri(&format!("n{i}"))));
+        let pairs = |pairs: Vec<(String, String)>| -> Vec<Row> {
+            let rows = pairs.into_iter().map(|(x, y)| row(&[("x", x), ("y", y)]));
+            rows.collect()
+        };
+        for k in [4usize, 64] {
+            let arms = (1..=k)
+                .map(|i| format!("!({})", vec![iri("q"); i].join("|")))
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let once: Vec<(String, String)> = selves().chain(spokes()).collect();
+            let copies = once
+                .iter()
+                .flat_map(|pair| std::iter::repeat_n(pair.clone(), k));
+            let mut zero_or_one = once.clone();
+            zero_or_one.extend([(iri("h"), iri("h")), (iri("m"), iri("m"))]);
+            let reversed = once.iter().map(|(x, y)| (y.clone(), x.clone())).collect();
+            let ends = (0..n)
+                .map(|i| row(&[("y", iri(&format!("n{i}")))]))
+                .collect();
+            let count = vec![row(&[("c", integer(2 * n))])];
+            // The solutions of each case (None: the memory error).
+            let cases: [(&str, String, Option<Vec<Row>>); 6] = [
+                (
+                    "under +",
+                    format!("SELECT ?x ?y WHERE {{ ?x ({arms})+ ?y }}"),
+                    Some(pairs(once.clone())),
+                ),
+                (
+                    "from the hub under +",
+                    format!("SELECT ?y WHERE {{ {} ({arms})+ ?y }}", iri("h")),
+                    Some(ends),
+                ),
+                (
+                    "under ?",
+                    format!("SELECT ?x ?y WHERE {{ ?x ({arms})? ?y }}"),
+                    Some(pairs(zero_or_one)),
+                ),
+                (
+                    "reversed under +",
+                    format!("SELECT ?x ?y WHERE {{ ?x (^({arms}))+ ?y }}"),
+                    Some(pairs(reversed)),
+                ),
+                (
+                    "COUNT under +",
+                    format!("SELECT (COUNT(*) AS ?c) WHERE {{ ?x ({arms})+ ?y }}"),
+                    Some(count),
+                ),
+                (
+                    "outside a closure",
+                    format!("SELECT ?x ?y WHERE {{ ?x ({arms}) ?y }}"),
+                    (k == 4).then(|| pairs(copies.collect())),
+                ),
+            ];
+            for (case, query, expected) in &cases {
+                let answered = expected.as_ref().map(Vec::len);
+                for as_written in [false, true] {
+                    let (outcome, peak) = run(&engine, query, as_written);
+                    let case = format!("{case}, {k} arms, n={n}, as_written={as_written}");
+                    let outcome = match outcome {
+                        Err(QueryEvaluationError::MemoryLimit(_)) => None,
+                        other => Some(other.map_err(|e| e.to_string())),
+                    };
+                    if outcome != answered.map(Ok) {
+                        failed.push(format!(
+                            "{case}: {outcome:?}, not {answered:?} (None: the memory error)"
+                        ));
+                    } else if let Some(expected) = expected {
+                        let mut expected = expected.clone();
+                        expected.sort();
+                        match answers(&engine, query, as_written, Some(LIMIT)) {
+                            Ok(got) => failed.extend(
+                                difference(&got, &expected).map(|d| format!("{case}: {d}")),
+                            ),
+                            Err(error) => failed.push(format!("{case}: {error}, unmeasured")),
+                        }
+                    }
+                    if peak > LIMIT + BOOKKEEPING {
+                        failed.push(format!(
+                            "{case}: held {peak} bytes under a {LIMIT}-byte limit"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// Spec: a table the query holds stays charged while it lives (`Resources::memory`): the
 /// live result of a SELECT keeps at least a word a row and column charged. A projection
 /// that drops a column must release only that column's charge: the graph's column that
