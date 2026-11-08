@@ -390,6 +390,67 @@ class Driver(unittest.TestCase):
                 else:
                     self.assertEqual(set(image["source"]), {"unknown"})
 
+    PIN = "sha256:" + "d" * 64
+
+    def pins(self, text):
+        """This test's checkout's digest pins (benches/suite/images.toml)."""
+        (self.root / "benches/suite").mkdir(parents=True, exist_ok=True)
+        (self.root / "benches/suite/images.toml").write_text(text, encoding="utf-8")
+
+    def test_a_pinned_image_is_pulled_by_its_digest(self):
+        """P1c (orchestrator, 8 Nov 11:22): a tag names no content, its digest does; a pulled image
+        with a pin is pulled by that digest and tagged, so the run runs the pinned content (one that
+        is present but isn't the pin is pulled again by it); one without a pin is pulled by its tag."""
+        self.pins(f'[pins]\n"qlever/qlever:latest" = "{self.PIN}"\n')
+        suite = self.suite(runs=1)
+        calls = []
+        present = {"qlever/qlever:latest": '["qlever/qlever@sha256:' + "e" * 64 + '"]'}
+        for image_present in (False, True):
+            with self.subTest(present=image_present), patch.object(suite.args, "runtime", "docker"), \
+                    patch.object(suite, "host_command", side_effect=lambda c, *a, **k: calls.append(c) or 0), \
+                    patch.object(suite.runtime, "image_present", return_value=image_present), \
+                    patch.object(driver, "run_quiet", side_effect=lambda c, *a, **k: Mock(
+                        returncode=0, stdout=present.get(c[-1], "[]") + "\n")):
+                calls.clear()
+                suite.ensure_images({"qlever/qlever:latest": None, "other/thing:1": None})
+                self.assertIn(["docker", "pull", "-q", f"qlever/qlever@{self.PIN}"], calls)
+                self.assertIn(["docker", "tag", f"qlever/qlever@{self.PIN}", "qlever/qlever:latest"], calls)
+                if not image_present:
+                    self.assertIn(["docker", "pull", "-q", "other/thing:1"], calls)
+
+    def test_a_pulled_image_s_source_is_its_pin_when_the_id_that_ran_holds_it(self):
+        """P1c: a pulled image counts only as the content its tag's pin names: the id that ran must
+        hold that digest. Pinned and held: "pulled, pinned <digest>"; held another: unknown, naming
+        both; no pin: unknown."""
+        cases = {"held": ([f"qlever/qlever@{self.PIN}"], True, f"pulled, pinned {self.PIN}"),
+                 "another": (["qlever/qlever@sha256:" + "e" * 64], True, None),
+                 "no pin": ([f"qlever/qlever@{self.PIN}"], False, None)}
+        for name, (digests, pinned, expected) in cases.items():
+            with self.subTest(name), patch.object(self, "root", self.root / name.replace(" ", "-")):
+                (self.root / "data").mkdir(parents=True)
+                self.pins(f'[pins]\n"qlever/qlever:latest" = "{self.PIN}"\n' if pinned else "[pins]\n")
+                suite = self.suite(runs=1)
+
+                def inspect(command, *a, **k):
+                    out = json.dumps(digests) if "RepoDigests" in command[-2] else ""
+                    return Mock(returncode=0, stdout=out + "\n")
+                with patch.object(driver.ns, "pinned", return_value={"qlever/qlever:latest": "sha256:ID"}), \
+                        patch.object(driver, "run_quiet", side_effect=inspect):
+                    self.run_tiers(suite, [Plan("w", "1")], self.system(images=["qlever/qlever:latest"]))
+                source = self.cells(suite)["w/1/x"]["images"]["qlever/qlever:latest"]["source"]
+                if expected:
+                    self.assertEqual(source, expected)
+                else:
+                    self.assertEqual(set(source), {"unknown"})
+                    self.assertIn("pin", source["unknown"])
+
+    def test_a_pin_that_isn_t_a_digest_is_refused(self):
+        for text in ('[pins]\n"a:1" = "latest"\n', '[pins]\n"a:1" = "sha256:abc"\n', "pins = 1\n"):
+            with self.subTest(text):
+                self.pins(text)
+                with self.assertRaises(ValueError):
+                    driver.image_pins(self.root)
+
     def test_what_a_cell_can_t_evidence_is_unknown_never_empty(self):
         """R6: a driver plan's inputs, images, build and settings are its child's; an input outside
         the datasets and an external driver aren't hashed; a binary not built here is unknown."""
