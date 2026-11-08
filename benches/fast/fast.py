@@ -841,6 +841,18 @@ def verdict(case: dict, record: dict) -> dict:
     return out
 
 
+SH = "<http://www.w3.org/ns/shacl#"
+
+
+def shacl_report_counts(text: str) -> dict[str, int]:
+    """A SHACL validation report's (N-Triples) sh:value and sh:resultPath triples: its results'
+    values and paths (SHACL 1.0 §5.3.2). A predicate is a line's second term: a subject is an IRI
+    or a blank node, a triple term only an object (RDF 1.2), so nothing before it has a space."""
+    predicates = [parts[1] for line in text.splitlines()
+                  if len(parts := line.split(None, 2)) == 3 and not line.startswith("#")]
+    return {"values": predicates.count(f"{SH}value>"), "paths": predicates.count(f"{SH}resultPath>")}
+
+
 def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, data: str) -> dict:
     """run_case's measurement, its data ready: the record."""
     name = case["name"]
@@ -874,6 +886,11 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
             record["notes"].append(f"timed by its load: its metric ({case['metric']}) is the suite driver's")
         command = [*base, *loads, *(["--queries", queries] if queries else []),
                    *substitute(case.get("args", []), data, scratch)]
+        # A case with shapes writes its last validation's report (every perf lab of engine-v2 can), so
+        # that what the results hold is counted, not only how many (shacl_report_counts()).
+        report_nt = SCRATCH / f"{case['name']}.shacl.nt"
+        if "--shapes" in case.get("args", []):
+            command += ["--shacl-report", f"/out/{case['name']}.shacl.nt"]
         script = ""
         if "setup" in case:
             setup = ["/target/release/examples/perf_lab", *substitute(case["setup"], data, scratch)]
@@ -906,6 +923,10 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
                 break
             result = json.loads(path.read_text(encoding="utf-8"))
             path.unlink()
+            if report_nt.exists():
+                if isinstance(result.get("shacl"), dict):
+                    result["shacl"].update(shacl_report_counts(report_nt.read_text(encoding="utf-8")))
+                report_nt.unlink()
             result["_sweep"] = " ".join(entry)
             result["_page_cache"] = mode
             if case.get("queries", "").startswith("@vectors") and code == 0:
@@ -1085,7 +1106,7 @@ COUNTERS = ("reason.new_facts", "reason.inferred", "reason.rounds",
             "held.index_mib", "held.dictionary_terms", "held.inferred",
             "clauses", "nodes_created", "branch_points", "backjumps", "clashes", "merges", "facts", "clauses_fired",
             "concepts", "contexts", "subsumers", "links", "conclusions", "duplicates", "dl_clauses", "functions",
-            "shacl.results", "kernel.rows", "held.index_bytes",
+            "shacl.results", "shacl.values", "shacl.paths", "kernel.rows", "held.index_bytes",
             "reason.bindings", "reason.probes", "reason.passes", "cache.hits", "subset_checks", "clauses_generated", "clauses_kept",
             "redundant_forward", "redundant_backward", "contexts_created", "hyper", "pred")
 

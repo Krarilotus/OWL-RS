@@ -131,6 +131,38 @@ class FastComparison(unittest.TestCase):
             self.assertEqual(record["samples"][f"{mode}/q/repeat"], [2, 2])
         self.assertEqual(fast.case_manifest([case])["cache_modes"], {"cache": ["warm", "cold"]})
 
+    def test_a_shacl_case_counts_its_report_s_values_and_paths(self):
+        """SHACL lead, 8 Nov 2026 (shacl-lubm-computed): the specified answer has 40,944 sh:value and
+        20,472 sh:resultPath (SHACL 1.0 §5.3.2), which perf_lab doesn't count; its --shacl-report
+        writes the report as N-Triples. A case with --shapes asks for it, counts them as
+        shacl.values and shacl.paths, so a check can pin them, and leaves no report behind."""
+        sh = "http://www.w3.org/ns/shacl#"
+        report = "".join([f"_:r{i} <{sh}value> \"v{i}\" .\n" for i in range(3)]
+                         + [f"_:r{i} <{sh}resultPath> <http://x/p{i}> .\n" for i in range(2)]
+                         + [f"_:r0 <{sh}focusNode> <<( _:b <{sh}value> <http://x/o> )>> .\n",
+                            f"_:v <{sh}conforms> \"false\"^^<http://www.w3.org/2001/XMLSchema#boolean> .\n"])
+        case = {"name": "shapes", "data": "none", "args": ["--shapes", "/src/shapes.ttl"], "queries": "",
+                "metric": "shacl.p50_ms", "cap_gb": 2,
+                "check": {"shacl.results": 3, "shacl.values": 3, "shacl.paths": 2}}
+        with tempfile.TemporaryDirectory() as directory:
+            scratch, commands = Path(directory), []
+
+            def measured(name, cap, command, env=None, timeout=None):
+                commands.append(command[-1])
+                (scratch / "shapes.json").write_text(json.dumps({"shacl": {"results": 3, "p50_ms": 1.0}}))
+                (scratch / "shapes.shacl.nt").write_text(report, encoding="utf-8")
+                return 0, "", "", 1
+
+            with patch.object(fast, "SCRATCH", scratch), patch.object(fast, "container", measured):
+                record = fast.measure(case, "shapes", 1, {}, {}, "none")
+            left = sorted(p.name for p in scratch.iterdir())
+        self.assertEqual([(c["path"], c["got"], c["ok"]) for c in record["observations"][0]["checks"]],
+                         [("shacl.results", 3, True), ("shacl.values", 3, True), ("shacl.paths", 2, True)])
+        self.assertIn("'--shacl-report' '/out/shapes.shacl.nt'", commands[0])
+        self.assertEqual(left, [])
+        self.assertEqual({k: record["counters"][k] for k in ("shacl.values", "shacl.paths")},
+                         {"shacl.values": 3, "shacl.paths": 2})  # a triple term's sh:value isn't one
+
     def test_single_client_level_survives_measurement_and_compaction(self):
         clients = {"clients": 32, "qps": 100, "p99_ms": 1, "memory": {"peak_mib": 64}}
         case = {"name": "single", "data": "none", "args": ["--clients", "32"],
