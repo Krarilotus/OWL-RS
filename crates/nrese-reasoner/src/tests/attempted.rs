@@ -267,7 +267,9 @@ fn filtered_driver_positions_count_towards_the_stop() {
 #[test]
 fn each_premise_alternative_counts_towards_the_stop() {
     use crate::eval::Grounding;
-    use crate::graph_sets::{Annotation, Change, Limits, Stopped, UNWATCHED, update_support_sets};
+    use crate::graph_sets::{
+        Change, Limits, Previous, Sets, Stopped, UNWATCHED, update_support_sets,
+    };
     let n = 3 * POLL_UNITS;
     let mut vocabulary = LocalVocabulary::default();
     let rules = parse_rules(
@@ -304,7 +306,7 @@ fn each_premise_alternative_counts_towards_the_stop() {
     let asked = AtomicUsize::new(0);
     let previous = |_: Triple| {
         asked.fetch_add(1, Ordering::Relaxed);
-        Annotation::default()
+        Previous::Sets(Sets::NONE)
     };
     let touched = [fact];
     let change = Change {
@@ -321,7 +323,7 @@ fn each_premise_alternative_counts_towards_the_stop() {
         stop: &stop,
         scratch: &scratch,
     };
-    let result = update_support_sets(&change, &ground, &[], &|_| vec![0], 1, limits);
+    let result = update_support_sets(&change, &ground, &[], &|_: Triple| Some(0), 1, limits);
     assert_eq!(result.err(), Some(Stopped::Cancelled));
     let read = asked.load(Ordering::Relaxed);
     let bound = 1 + POLL_UNITS;
@@ -339,7 +341,9 @@ fn each_premise_alternative_counts_towards_the_stop() {
 /// `Cancelled`. One thread, so the bound is one task's.
 #[test]
 fn a_support_update_s_first_pass_counts_each_fact() {
-    use crate::graph_sets::{Annotation, Change, Limits, Stopped, UNWATCHED, update_support_sets};
+    use crate::graph_sets::{
+        Change, Limits, Previous, Sets, Stopped, UNWATCHED, update_support_sets,
+    };
     let n = 3 * POLL_UNITS;
     let mut vocabulary = LocalVocabulary::default();
     let rules = parse_rules(
@@ -371,7 +375,7 @@ fn a_support_update_s_first_pass_counts_each_fact() {
     let asked = AtomicUsize::new(0);
     let previous = |_: Triple| {
         asked.fetch_add(1, Ordering::Relaxed);
-        Annotation::default()
+        Previous::Sets(Sets::NONE)
     };
     let change = Change {
         source: &source,
@@ -391,8 +395,8 @@ fn a_support_update_s_first_pass_counts_each_fact() {
         .num_threads(1)
         .build()
         .unwrap();
-    let result =
-        pool.install(|| update_support_sets(&change, &ground, &[], &|_| vec![0], 1, limits));
+    let result = pool
+        .install(|| update_support_sets(&change, &ground, &[], &|_: Triple| Some(0), 1, limits));
     assert_eq!(result.err(), Some(Stopped::Cancelled));
     let read = asked.load(Ordering::Relaxed);
     let bound = 1 + POLL_UNITS;

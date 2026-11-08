@@ -54,7 +54,7 @@ fn input() -> (Vec<Triple>, crate::eval::GroundProgram) {
 #[test]
 fn a_refused_round_ends_the_evaluation_and_holds_nothing() {
     let (closure, ground) = input();
-    let in_one_graph = |_: Triple| vec![0];
+    let in_one_graph = |_: Triple| Some(0);
     let tight = Arc::new(Budget::new(16 << 10));
     let result = support_sets(
         &closure,
@@ -130,13 +130,17 @@ fn a_premise_product_is_admitted_before_it_is_built() {
     let n = 60u32;
     for (what, a, b) in [("inline", 0, n), ("spilled", 0, 200)] {
         let (closure, ground, asserted) = product_input();
-        let graphs_of = |fact: Triple| -> Vec<u32> {
-            match asserted.iter().position(|&f| f == fact) {
-                Some(0) => (a..a + n).collect(),
-                Some(_) => (b..b + n).collect(),
-                None => Vec::new(),
-            }
-        };
+        // The first asserted fact in graphs a.., the others in b.., sorted.
+        let mut pairs: Vec<(Triple, u32)> = asserted
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &f)| {
+                let first = if i == 0 { a } else { b };
+                (first..first + n).map(move |g| (f, g))
+            })
+            .collect();
+        pairs.sort_unstable();
+        let graphs_of = crate::graph_sets::InGraphs(&pairs);
         // What the product's unions hold: their slots, and each union's words on the heap.
         use crate::graph_sets::GraphSet;
         let words: usize = (a..a + n)
