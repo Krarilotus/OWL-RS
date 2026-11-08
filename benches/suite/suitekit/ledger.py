@@ -27,6 +27,7 @@ import re
 import tomllib
 from pathlib import Path
 
+from .manifest import read_attempts
 from .schema import read
 from .summary import summarise
 
@@ -144,17 +145,24 @@ def from_results(directory: Path, root: Path) -> dict:
         record["started"] = rows[0]["date"]
         record["host"] = rows[0]["host"]
         record["commit"] = "unknown (before run manifests)"
-    # Each cell's newest attempt (receipts.py), finished or not: never an older receipt in an
-    # unfinished one's place, never the directory's commit, outcome or answers (review r1 R2, R3).
+    # Each cell's newest attempt, from its directory's journal (on disk before its work; its order,
+    # not the clock), finished or not; its receipt only the one under that attempt: never an older
+    # receipt in an unfinished one's place, nor one the journal doesn't hold, never the directory's
+    # commit, outcome or answers (reviews cell-receipts r1 R2, R3; r3).
     newest: dict[str, dict] = {}
-    for invocation in invocations:
-        for cell, attempt in (invocation.get("cells") or {}).items():
+    for run in runs:
+        for cell, attempt in {a["cell"]: a for a in read_attempts(run)}.items():
             if cell not in newest or str(attempt.get("started", "")) >= str(newest[cell].get("started", "")):
                 newest[cell] = attempt
+    done = {(cell, r.get("attempt")): r for i in invocations for cell, r in (i.get("cells") or {}).items()
+            if r.get("complete")}
     pairs, summarised = [], summarise(rows)
     for (workload, tier, system), pair in sorted(summarised.items()):
         entry = {"workload": workload, "tier": tier, "system": system} | pair.outcome()
-        if (attempt := newest.get(f"{workload}/{tier}/{system}")) is not None:
+        cell = f"{workload}/{tier}/{system}"
+        if (started := newest.get(cell)) is not None:
+            attempt = done.get((cell, started["attempt"])) or {
+                "attempt": started["attempt"], "started": started.get("started"), "complete": False}
             # A licensed system's outcome and answers are results, whatever the outcome: they stay
             # local (R1); its receipt says only what ran.
             entry["receipt"] = ({k: v for k, v in attempt.items() if k not in ("outcome", "answers")}

@@ -16,7 +16,7 @@ appends one entry to `invocations`:
 | images | image -> its content id, for every image the run used |
 | datasets | /data path -> size in bytes, for every input the run read |
 | sources | the downloads behind the datasets: URL and the server's Last-Modified (a "latest" dump changes) |
-| cells | `workload/tier/system` -> its attempt, before its work; its receipt once it ran it all (receipts.py) |
+| cells | `workload/tier/system` -> its receipt once it ran it all (receipts.py); its attempt, before its work, is in attempts.jsonl beside it (append_attempts) |
 | data_hash_s | the seconds the receipts' data hashes took |
 | exit | the run's exit code |
 
@@ -222,8 +222,9 @@ class ManifestError(RuntimeError):
 
 
 def sync_directory(directory: Path):
-    """A rename in `directory` made durable: on POSIX the directory's own fsync; Windows can't
-    open a directory to flush it, and NTFS journals the rename (MoveFileEx's replace)."""
+    """A new name or rename in `directory` made durable: on POSIX the directory's own fsync.
+    Windows has no such flush (a directory can't be opened to flush it): there a name may be lost
+    in a crash, so nothing that must hold rests on one (attempts: append_attempts)."""
     if os.name == "nt":
         return
     fd = os.open(directory, os.O_RDONLY)
@@ -231,6 +232,36 @@ def sync_directory(directory: Path):
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+ATTEMPTS = "attempts.jsonl"
+
+
+def append_attempts(results: Path, attempts: dict[str, dict]):
+    """Cells' attempts appended to <results>/attempts.jsonl, on disk before this returns: the
+    file's own fsync (on Windows _commit, i.e. FlushFileBuffers) after the append, then its name
+    (sync_directory). No rename: a file appended to only never comes back older after a crash,
+    on Windows too (review cell-receipts r3). Each record starts its own line, so a torn one (a
+    crash mid-append; its work never started) never takes the next with it. Raises if any of it
+    fails: the cells' work must not start."""
+    with open(results / ATTEMPTS, "a", encoding="utf-8", newline="\n") as f:
+        f.write("".join("\n" + json.dumps({"cell": cell, **attempt}) for cell, attempt in attempts.items()))
+        f.flush()
+        os.fsync(f.fileno())
+    sync_directory(results)
+
+
+def read_attempts(results: Path) -> list[dict]:
+    """The attempts in <results>/attempts.jsonl, in the order written; a torn record is skipped."""
+    path, out = results / ATTEMPTS, []
+    for line in path.read_text(encoding="utf-8").splitlines() if path.exists() else []:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and isinstance(record.get("cell"), str) and record.get("attempt"):
+            out.append(record)
+    return out
 
 
 class Manifest:

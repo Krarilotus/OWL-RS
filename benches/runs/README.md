@@ -70,4 +70,5 @@ From 8 November 2026 a pair can also carry `receipt`, its cell's newest attempt
 older finished one never stands in for it); else its own invocation's commit, code, images,
 build, settings, data hashes, outcome and answer verdict (`wrong` stands against counts that look
 right). What it couldn't evidence is `{ unknown = "why" }`. A licensed system's receipt holds
-no outcome or answers, whatever the outcome. A pair without a receipt predates them.
+no outcome or answers, whatever the outcome. A pair without a receipt predates them, or its
+attempts' record (attempts.jsonl) didn't survive: either way it has no evidence.
