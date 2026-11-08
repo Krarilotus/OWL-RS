@@ -616,7 +616,7 @@ fn generated_cases_answer_as_the_dl_oracle() {
             i + 1
         )
     };
-    let mut counts: std::collections::BTreeMap<&str, [usize; 6]> = Default::default();
+    let mut counts = Counts::default();
     let mut failures = Vec::new();
     let mut inconclusive = Vec::new();
     let mut redrawn = 0;
@@ -685,10 +685,25 @@ fn generated_cases_answer_as_the_dl_oracle() {
             }
         }
     }
-    // Undecided, an inconsistent case never compared among them, against every verdict.
+    eprintln!("REDRAWN {redrawn} inconsistent cases");
+    inconclusive.extend(judge(&counts, deadline));
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    assert!(inconclusive.is_empty(), "{}", inconclusive.join("\n"));
+}
+
+/// Verdicts per family, as the generated test counts them: agree, reported, missed,
+/// extra, undecided, inconsistent.
+type Counts<'a> = std::collections::BTreeMap<&'a str, [usize; 6]>;
+
+/// Why a generated run that ended by `deadline` is inconclusive, printing each family's
+/// counts (`FAMILY` lines). Undecided verdicts are at most a fifth, in total and in each
+/// family with ten verdicts or more, an inconsistent case never compared among them, and at
+/// least one verdict is decided.
+fn judge(counts: &Counts, deadline: std::time::Instant) -> Vec<String> {
+    let mut inconclusive = Vec::new();
     let undecided = |c: &[usize; 6]| (c[4] + c[5], c.iter().sum::<usize>());
     let mut total = [0usize; 6];
-    for (family, c) in &counts {
+    for (family, c) in counts {
         eprintln!(
             "FAMILY {family}: agree {}, reported {}, missed {}, extra {}, undecided {}, \
              inconsistent {}",
@@ -702,7 +717,6 @@ fn generated_cases_answer_as_the_dl_oracle() {
             *t += x;
         }
     }
-    eprintln!("REDRAWN {redrawn} inconsistent cases");
     let (u, n) = undecided(&total);
     if 5 * u > n {
         inconclusive.push(format!("total: {u} of {n} undecided"));
@@ -710,6 +724,18 @@ fn generated_cases_answer_as_the_dl_oracle() {
     if u == n {
         inconclusive.push(format!("no decided verdict of {n}"));
     }
-    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
-    assert!(inconclusive.is_empty(), "{}", inconclusive.join("\n"));
+    inconclusive
+}
+
+/// A run whose deadline passed at any point is inconclusive, even where its counts would
+/// pass: the case it was in ended undecided for want of time (review G1 r2, F4: a deadline
+/// in the last case passed the gate). Here one family of ten verdicts, one of them
+/// undecided, under a deadline already past.
+#[test]
+fn a_run_past_its_deadline_is_inconclusive() {
+    let counts: Counts = [("uniform", [9, 0, 0, 0, 1, 0])].into_iter().collect();
+    let now = std::time::Instant::now();
+    assert!(judge(&counts, now + std::time::Duration::from_secs(60)).is_empty());
+    let past = now.checked_sub(std::time::Duration::from_secs(1)).unwrap();
+    assert!(!judge(&counts, past).is_empty(), "passed past its deadline");
 }
