@@ -595,9 +595,17 @@ pub(crate) fn positive_terms(o: &Ontology, e: ExprId, positive: bool, out: &mut 
             out.push(r.named());
             positive_terms(o, *f, true, out);
         }
+        // `≤ 0 R.F` (also `= 0`, `¬≥ 1`) puts every successor outside `F`: facts of `¬F`,
+        // no `R` edge (Sol r1 S1). A larger bound equates ([`concludes_equality`]).
+        (ClassExpr::Max(0, _, f) | ClassExpr::Exact(0, _, f), true)
+        | (ClassExpr::Min(1, _, f), false) => positive_terms(o, *f, false, out),
         (ClassExpr::Max(_, r, f) | ClassExpr::Exact(_, r, f), false) => {
             out.push(r.named());
             positive_terms(o, *f, true, out);
+            // `¬= 1` may be `≤ 0`.
+            if matches!(o.class(e), ClassExpr::Exact(1, ..)) {
+                positive_terms(o, *f, false, out);
+            }
         }
         (ClassExpr::HasValue(r, _) | ClassExpr::HasSelf(r), true) => out.push(r.named()),
         (ClassExpr::DataSome(d, _) | ClassExpr::DataHasValue(d, _), true)
@@ -652,11 +660,18 @@ pub fn concludes_equality(o: &Ontology, axiom: &Axiom) -> bool {
             (ClassExpr::OneOf(_), true) => true,
             (ClassExpr::And(es) | ClassExpr::Or(es), p) => es.iter().any(|&e| equates(o, e, p)),
             (ClassExpr::Not(e), p) => equates(o, *e, !p),
-            // `≤ n`, positive or as `¬≥ n+1`.
+            // `≤ n` for n ≥ 1, positive or as `¬≥ n+1`; `≤ 0 R.F` excludes `F`, so its filler
+            // counts negated (Sol r1 S1, S2: `≤ 0 R.¬{a}` equates, `= 0 R.{a}` doesn't).
+            (ClassExpr::Max(0, _, f) | ClassExpr::Exact(0, _, f), true)
+            | (ClassExpr::Min(1, _, f), false) => equates(o, *f, false),
             (ClassExpr::Max(n, ..), true) => *n >= 1,
             (ClassExpr::Min(n, ..), false) => *n >= 2,
-            (ClassExpr::Exact(n, _, f), true) => *n >= 1 || equates(o, *f, true),
-            (ClassExpr::Exact(n, _, f), false) => *n >= 2 || equates(o, *f, true),
+            // `= n` for n ≥ 1 holds `≤ n`.
+            (ClassExpr::Exact(..), true) => true,
+            // `¬= n` is `≤ n−1` or `≥ n+1`.
+            (ClassExpr::Exact(n, _, f), false) => {
+                *n >= 2 || equates(o, *f, true) || (*n == 1 && equates(o, *f, false))
+            }
             (ClassExpr::Max(_, _, f), false) | (ClassExpr::Min(_, _, f), true) => {
                 equates(o, *f, true)
             }
