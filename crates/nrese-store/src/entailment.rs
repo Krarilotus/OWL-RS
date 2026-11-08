@@ -113,7 +113,8 @@ impl StoreService {
     /// reasoner maintains the closure over a speculative transaction, which is dropped.
     fn refutes(&self, program: &RuleProgram, opposite: &[Triple]) -> StoreResult<bool> {
         let memory = self.memory_stop();
-        let stop = || memory.exceeded();
+        let (stop, room) = (|| memory.exceeded(), || memory.room());
+        let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
         let config = self.config();
         let mut tx = self.engine().speculative();
         for t in opposite {
@@ -131,7 +132,7 @@ impl StoreService {
             .storing_representatives(config.equality_compact);
         let report = self.operation_memory();
         let done =
-            nrese_reasoner::engine::maintain_within(&compiled, None, &mut tx, &stop, &report)
+            nrese_reasoner::engine::maintain_with(&compiled, None, &mut tx, &operation, &report)
                 .map_err(|interrupted| {
                     memory
                         .error(interrupted)

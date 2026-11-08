@@ -334,6 +334,14 @@ impl MemoryWatch {
         self.limit
     }
 
+    /// What the process may still take under the limit now: the limit less what it holds
+    /// (none past it), read now, not at the interval of [`Self::exceeded`]. For admitting
+    /// an allocation whose size is known before it is made, which a poll would only see
+    /// after. A failed reading leaves no room to admit by ([`Unread`]).
+    pub fn room(&self) -> Reading {
+        (self.read)().map(|held| self.limit.saturating_sub(held))
+    }
+
     /// Why it stopped, once [`Self::exceeded`] said so; `None` before.
     pub fn cause(&self) -> Option<MemoryStopCause> {
         MemoryStopCause::of(self.stopped.load(Ordering::Relaxed))
@@ -1320,6 +1328,23 @@ mod tests {
             assert!(watch.exceeded(), "and stays stopped");
             assert_eq!(watch.cause(), Some(MemoryStopCause::Unread));
         }
+    }
+
+    /// D14 (LM-V15-4): a watch's room is its limit less what its reader says the process
+    /// holds, none past the limit, and no reading where the reader fails: an allocation
+    /// of a known size is admitted by it, never against a room it couldn't read.
+    #[test]
+    fn a_watchs_room_is_its_limit_less_what_the_process_holds() {
+        fn holds_100() -> Reading {
+            Ok(100)
+        }
+        assert_eq!(MemoryWatch::with_reader(250, holds_100).room(), Ok(150));
+        assert_eq!(MemoryWatch::with_reader(100, holds_100).room(), Ok(0));
+        assert_eq!(MemoryWatch::with_reader(40, holds_100).room(), Ok(0));
+        assert_eq!(
+            MemoryWatch::with_reader(u64::MAX, failed).room(),
+            Err(Unread::Failed)
+        );
     }
 
     /// DC-07: the process limit stops the work when its reader fails, names the cause as
