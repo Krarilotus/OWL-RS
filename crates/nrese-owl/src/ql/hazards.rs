@@ -551,14 +551,17 @@ pub(crate) fn hazards(
     // An uncovered axiom that equates named individuals: global, unless another hazard
     // already is (that one's reason is the more specific).
     let mut outside_global: Option<Hazard> = None;
-    let equating_properties = crate::profile::equating_properties(o);
+    // Taken only where an axiom is outside: a schema without one pays nothing for it.
+    let mut equating_properties = None;
     for (i, axiom) in o.axioms.iter().enumerate() {
         // Read whole, the rewriting answers it; in the closure's profile, its rules do.
         if !read.partial.contains(&i) || crate::profile::covered(o, axiom, rl) {
             continue;
         }
         let concluded = crate::profile::concluded_terms(o, axiom, rl);
-        let equality = crate::profile::concludes_equality(o, axiom, &equating_properties);
+        let equating =
+            equating_properties.get_or_insert_with(|| crate::profile::equating_properties(o));
+        let equality = crate::profile::concludes_equality(o, axiom, equating);
         // A conclusion that equates may name no term of its own (`∀R.{a}`, `C ⊑ {a}`): its
         // hazard is global, named by any term of the axiom (review r1, F1).
         let name = match concluded.first() {
@@ -633,8 +636,13 @@ pub(crate) fn hazards(
     // from premise to conclusion (design note "Source 3"). A seed doesn't follow its own
     // axiom back to its premise, which holds wherever its conclusion is missed. A term
     // reached through another axiom follows every axiom, its seed's included.
+    // Built only for seeds to walk from: without an uncovered conclusion, nothing.
     let mut forward: HashMap<Term, Vec<(usize, Term)>> = HashMap::new();
-    for (i, axiom) in o.axioms.iter().enumerate() {
+    let axioms = match outside.is_empty() {
+        true => &[][..],
+        false => &o.axioms[..],
+    };
+    for (i, axiom) in axioms.iter().enumerate() {
         for (premise, conclusion) in directed_edges(o, axiom) {
             for &a in &premise {
                 forward
