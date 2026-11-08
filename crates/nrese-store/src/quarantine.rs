@@ -461,14 +461,21 @@ impl Quarantine {
     /// Records `resolution`: appended to the log, then in effect.
     fn record(&self, resolution: Resolution) -> StoreResult<()> {
         if let Some(dir) = &self.dir {
-            fs::create_dir_all(dir)?;
+            // Durably named, the directory and the log the first time it is made (DUR-3): the
+            // quarantine reads them at open.
+            nrese_engine::place::create_dir_all(dir)?;
+            let path = dir.join(RESOLUTIONS);
+            let new = !path.exists();
             let mut log = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(dir.join(RESOLUTIONS))?;
+                .open(&path)?;
             let line = serde_json::to_string(&resolution).expect("a resolution serialises");
             log.write_all(format!("{line}\n").as_bytes())?;
             log.sync_data()?;
+            if new {
+                nrese_engine::place::sync_dir(dir)?;
+            }
         }
         self.state()
             .resolutions
@@ -761,7 +768,9 @@ impl Collector<'_> {
         match &self.partial {
             Some(partial) => {
                 if inner.out.is_none() {
-                    fs::create_dir_all(partial.parent().expect("in the quarantine directory"))?;
+                    nrese_engine::place::create_dir_all(
+                        partial.parent().expect("in the quarantine directory"),
+                    )?;
                     inner.out = Some(BufWriter::new(File::create(partial)?));
                 }
                 let out = inner.out.as_mut().expect("opened");
@@ -785,7 +794,10 @@ impl Collector<'_> {
             let file = out.into_inner().map_err(|error| error.into_error())?;
             file.sync_data()?;
             drop(file);
-            fs::rename(partial, partial.with_extension("jsonl"))?;
+            // Durably named before the load is acknowledged (DUR-3, sol-loop round 5, S3): a
+            // load of only invalid statements publishes nothing else.
+            nrese_engine::place::rename(partial, &partial.with_extension("jsonl"))?;
+            nrese_engine::place::sync_dir(partial.parent().expect("in the quarantine directory"))?;
         }
         let mut state = self.quarantine.state();
         state.held.append(&mut inner.held);
