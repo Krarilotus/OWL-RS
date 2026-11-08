@@ -376,6 +376,61 @@ fn graph_restricted_readers_keep_no_probes() {
     assert_eq!(kept_probes(&ql), (None, Vec::new()));
 }
 
+/// A view that adds inferred statements to a published snapshot, as the DL bounds derive
+/// (master, 8 Nov 23:20), and its base: in either order of reading, each gets what a fresh
+/// rewriting gives it.
+/// - Their TBoxes may be one: what the TBox reads (the core, the memberships, the equality
+///   probe) is asserted only (`read_core`, `member_of`, `has_equality`).
+/// - Their probes ask the materialised data, which differs (here the witness is only in the
+///   view), so they're kept apart by the view's identity (`realised`'s lookup).
+#[test]
+fn an_added_view_and_its_base_keep_their_own_probes() {
+    let engine = engine(":other :knows :acme .");
+    let base = engine.snapshot();
+    let id = |s: &str| {
+        base.lookup(NamedNodeRef::new_unchecked(&format!("{EX}{s}")).into())
+            .unwrap()
+    };
+    let witness = EncodedQuad {
+        subject: id("ann"),
+        predicate: id("worksFor"),
+        object: id("acme"),
+        graph: TermId::DEFAULT_GRAPH,
+    };
+    // The DL bounds' constructor replaces this once it exists (DICT2, 8 Nov).
+    let added = base.with_inferred_added(&[witness]);
+    assert_ne!(added.identity(), base.identity());
+    assert_eq!(added.asserted_identity(), base.asserted_identity());
+    let expected = ["<http://example.org/ann>"];
+    let fresh = |snapshot: &Snapshot| {
+        let report = check(
+            snapshot,
+            &sharing(&Arc::new(QlRewriting::new(Closure { lists: true }))),
+            &expected,
+        );
+        (report.patterns, report.realised, report.completeness)
+    };
+    let (on_base, on_added) = (fresh(&base), fresh(&added));
+    // The case is one only where the two answer their probes differently.
+    assert_ne!(on_base.1, on_added.1);
+    for order in [[&base, &added, &base], [&added, &base, &added]] {
+        let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+        let options = sharing(&ql);
+        for snapshot in order {
+            let report = check(snapshot, &options, &expected);
+            let own = match snapshot.identity() == base.identity() {
+                true => &on_base,
+                false => &on_added,
+            };
+            assert_eq!(
+                &(report.patterns, report.realised, report.completeness),
+                own
+            );
+        }
+        assert!(Arc::ptr_eq(&ql.tbox(&base, None), &ql.tbox(&added, None)));
+    }
+}
+
 #[test]
 fn equal_count_inferred_masks_do_not_share_realised_witnesses() {
     let engine = engine(":other :knows :acme .");
