@@ -325,6 +325,13 @@ class Adapter:
         """(image, build context under benches/) for images this repository builds."""
         return []
 
+    def script_builds(self, ctx: Context) -> list[tuple[str, str, str]]:
+        """(image, build context under benches/, the Dockerfile ARG naming its source commit) for
+        images a script builds from a source chosen apart from their context (benches/sparql/images.sh):
+        their build label names that source commit, and a receipt without it is unknown (review
+        image-source-commit r1 F2)."""
+        return []
+
     def supports(self, ctx: Context, inputs: list[str], regime: str) -> str | None:
         if ctx.runtime.kind not in self.runtimes:
             return f"no {ctx.runtime.kind} path (runs: {', '.join(sorted(self.runtimes))})"
@@ -763,6 +770,10 @@ class MillenniumDB(Adapter):
 
     def images(self, ctx):
         return [ctx.setting("MILLENNIUMDB_IMAGE", "nrese-bench/millenniumdb:ecbf6dd")]
+
+    def script_builds(self, ctx):
+        # benches/sparql/images.sh millenniumdb: its source at MDB_COMMIT (the Dockerfile's default).
+        return [(self.images(ctx)[0], "competitors/millenniumdb", "MDB_COMMIT")]
 
     def load(self, ctx, store, inputs, regime):
         buffer = ctx.setting("MDB_IMPORT_BUFFER", "4GB")

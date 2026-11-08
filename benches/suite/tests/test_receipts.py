@@ -26,6 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from suitekit import driver, ledger, manifest, receipts, schema  # noqa: E402
 from suitekit.workloads import Plan  # noqa: E402
 
+ROOT = Path(__file__).resolve().parents[3]  # this repository
+
 HEADER = ("date,host,runtime,system,version,publish,workload,tier,regime,run,task,item,repeat,status,ms,"
           "peak_mib,rows,bytes,note,cache,order,recall\n")
 
@@ -227,9 +229,10 @@ class Driver(unittest.TestCase):
         lines = (suite.results / "attempts.jsonl").read_text(encoding="utf-8").splitlines()
         return {a["cell"]: a for a in map(json.loads, filter(None, lines)) if "cell" in a}  # not invocations'
 
-    def system(self, images=()):
+    def system(self, images=(), script_builds=()):
         # definition_paths: what the reviewed head's adapters had (r1), so its red reaches the verdicts.
         return Mock(regimes={"none": ""}, images=Mock(return_value=list(images)), builds=Mock(return_value=[]),
+                    script_builds=Mock(return_value=list(script_builds)),
                     supports=Mock(return_value=None), definition_paths=())
 
     def run_tiers(self, suite, tiers, system, stop=lambda plan, run: False):
@@ -300,6 +303,51 @@ class Driver(unittest.TestCase):
                     self.run_tiers(suite, [Plan("w", "1")], self.system(images=["img:t"]))
                 self.assertEqual(self.cells(suite)["w/1/x"]["images"]["img:t"]["source"], expected)
 
+    def test_an_image_that_compiles_a_source_of_its_own_needs_its_source_commit_label(self):
+        """Review image-source-commit r1 F2 (orchestrator 18:26): an image its adapter declares built
+        from a source chosen apart from its context (script_builds: MillenniumDB's, by images.sh)
+        is known only with its source commit; its context's tree alone says unknown, why. An image
+        built from its context alone (builds: Jena's) is known by that tree, as before."""
+        tree = "t" * 40
+        labels = {"sha256:M": (f"benches/competitors/millenniumdb@{tree}", ""),
+                  "sha256:N": (f"benches/competitors/millenniumdb@{tree}", "ecbf6dde" + "0" * 32),
+                  "sha256:J": (f"benches/competitors/jena@{tree}", "")}
+
+        def inspect(command, *a, **k):
+            built, commit = labels[command[-1]]
+            return Mock(returncode=0, stdout=f"{built}|{commit}\n", stderr="")
+        declared = [("img:m", "competitors/millenniumdb", "MDB_COMMIT")]
+        for mdb, expected in (("sha256:M", None),
+                              ("sha256:N", f"built from benches/competitors/millenniumdb@{tree}, source commit "
+                                           + "ecbf6dde" + "0" * 32)):
+            with self.subTest(mdb), patch.object(self, "root", self.root / mdb[-1]):
+                (self.root / "data").mkdir(parents=True)
+                suite = self.suite(runs=1)
+                with patch.object(driver.ns, "pinned", return_value={"img:m": mdb, "img:j": "sha256:J"}), \
+                        patch.object(driver, "run_quiet", side_effect=inspect):
+                    self.run_tiers(suite, [Plan("w", "1")], self.system(images=["img:m", "img:j"],
+                                                                        script_builds=declared))
+                images = self.cells(suite)["w/1/x"]["images"]
+                if expected is None:
+                    self.assertIn("no source commit", images["img:m"]["source"]["unknown"])
+                else:
+                    self.assertEqual(images["img:m"]["source"], expected)
+                self.assertEqual(images["img:j"]["source"], f"built from benches/competitors/jena@{tree}")
+
+    def test_the_millenniumdb_adapter_declares_the_image_images_sh_builds_at_its_dockerfile_s_commit(self):
+        """Review r1 F2: the declaration is the adapter's own; its tag is the one images.sh builds
+        (nrese-bench/millenniumdb:<the declared commit's first seven>), so declaration, Dockerfile
+        and tag can't drift apart unnoticed."""
+        ctx = driver.Context(None, ROOT, ROOT, ROOT, driver.Mount("-", "/data"), [], 0, {}, "images")
+        mdb = driver.adapter("millenniumdb")
+        (tag, context, arg), = mdb.script_builds(ctx)
+        self.assertEqual(tag, mdb.images(ctx)[0])
+        declared = {line.split("=", 1)[1].strip() for line in
+                    (ROOT / "benches" / context / "Dockerfile").read_text(encoding="utf-8").splitlines()
+                    if line.startswith(f"ARG {arg}=")}
+        self.assertEqual(len(declared), 1)
+        self.assertEqual(tag, f"nrese-bench/millenniumdb:{declared.pop()[:7]}")
+
     def test_a_receipt_says_why_an_image_s_source_couldn_t_be_read(self):
         """#161's Windows gate (gate-windows-59532fff57-1794140734): reading an image's label raised
         FileNotFoundError on a host without docker, and the receipt was never written. Without docker,
@@ -363,6 +411,7 @@ class Driver(unittest.TestCase):
             suite = self.suite(runs=1, skip_build=False)
         suite.manifest.update(settings={"JAVA_HEAP": "8g", "NRESE_BENCH_SCRATCH": "/x", "NRESE_BENCH_KEEP": "1"})
         nrese = Mock(spec=driver.Nrese, key="nrese", images=Mock(return_value=[]), builds=Mock(return_value=[]),
+                     script_builds=Mock(return_value=[]),
                      regimes={"none": ""}, supports=Mock(return_value=None),
                      source=Mock(return_value=self.root), rust_image=Mock(return_value="rust:1.98.1-bookworm"),
                      target_volume="v")
@@ -549,7 +598,8 @@ class Driver(unittest.TestCase):
         child = self.cells(suite)["w/1/x"]
         for field in ("images", "build", "settings", "data"):
             self.assertEqual(set(child[field]), {"unknown"}, field)
-        nrese = Mock(spec=driver.Nrese, key="nrese", images=Mock(return_value=[]), builds=Mock(return_value=[]))
+        nrese = Mock(spec=driver.Nrese, key="nrese", images=Mock(return_value=[]), builds=Mock(return_value=[]),
+                     script_builds=Mock(return_value=[]))
         plan = Plan("w", "2", inputs=["/rggs/rg.ttl"], external=["bibm"])
         suite.receipts(plan, [("x", nrese)], suite.attempts(plan, [("x", nrese)]))
         served = self.cells(suite)["w/2/x"]
