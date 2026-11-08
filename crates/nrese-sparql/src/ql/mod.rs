@@ -6,13 +6,13 @@
 //! rewriting of a query's basic graph patterns is `native/ql.rs`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use nrese_engine::{
     AssertedIdentity, GraphSelector, QuadPattern, ReadModel, Snapshot, SnapshotIdentity, TermId,
 };
 use nrese_owl::ql::Tbox;
-use nrese_rdf::{NamedNodeRef, Term};
+use nrese_rdf::{NamedNodeRef, Term, vocab};
 
 use crate::GraphAccess;
 
@@ -569,8 +569,22 @@ fn touched_expressions(tx: &nrese_engine::Transaction<'_>) -> Option<Vec<Members
 }
 
 fn iri(snapshot: &Snapshot, namespace: &str, local: &str) -> Option<TermId> {
-    snapshot.lookup(NamedNodeRef::new_unchecked(&format!("{namespace}{local}")).into())
+    named(snapshot, &format!("{namespace}{local}"))
 }
+
+fn named(snapshot: &Snapshot, iri: &str) -> Option<TermId> {
+    snapshot.lookup(NamedNodeRef::new_unchecked(iri).into())
+}
+
+/// The IRIs of the list properties every schema read looks up, joined once rather than on
+/// each read (#155's count: a `format!` per name and read). The schema properties and
+/// declarations are [`READ`]'s, joined once too; the class-expression markers are the
+/// mapping's ([`expressions_of`]).
+fn owl(table: &[&str]) -> Vec<String> {
+    table.iter().map(|l| format!("{OWL}{l}")).collect()
+}
+
+static LIST_IRIS: LazyLock<Vec<String>> = LazyLock::new(|| owl(LISTS));
 
 /// The asserted statements of the schema, in every graph, sorted: the schema properties',
 /// the declarations', the cells of the lists they name, and per class expression one
@@ -622,22 +636,22 @@ fn read_core(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
         object,
         graph: GraphSelector::Any,
     };
-    let lookup = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
     let (properties, classes) = &*READ;
-    for p in properties.iter().filter_map(|p| lookup(p.as_str())) {
+    for p in properties.iter().filter_map(|p| named(snapshot, p)) {
         scan(pattern(p, None), &mut out);
     }
-    if let Some(rdf_type) = iri(snapshot, RDF, "type") {
-        for class in classes.iter().filter_map(|c| lookup(c.as_str())) {
+    let lookup = |term: NamedNodeRef<'_>| snapshot.lookup(term.into());
+    if let Some(rdf_type) = lookup(vocab::rdf::TYPE) {
+        for class in classes.iter().filter_map(|c| named(snapshot, c)) {
             scan(pattern(rdf_type, Some(class)), &mut out);
         }
     }
     // The lists: from each head, `rdf:first` and `rdf:rest` along the cells.
-    let (first, rest) = (iri(snapshot, RDF, "first"), iri(snapshot, RDF, "rest"));
+    let (first, rest) = (lookup(vocab::rdf::FIRST), lookup(vocab::rdf::REST));
     if let (Some(first), Some(rest)) = (first, rest) {
-        let heads: Vec<u64> = LISTS
+        let heads: Vec<u64> = LIST_IRIS
             .iter()
-            .filter_map(|local| iri(snapshot, OWL, local))
+            .filter_map(|p| named(snapshot, p))
             .flat_map(|p| {
                 out.iter()
                     .filter(move |s| s.triple[1] == p.raw())
@@ -683,11 +697,7 @@ fn expressions_of(snapshot: &Snapshot, core: &[nrese_owl::Statement]) -> Vec<u64
     // The mapping's own markers, those it can't read included (an n-ary or a malformed
     // restriction), so the memberships of every node it would read as a class expression
     // reach it, and it reports what it can't read (I24c-2 review r1, F2; r2, F5).
-    let vocabulary = nrese_owl::Vocabulary::new(&|iri| {
-        snapshot
-            .lookup(NamedNodeRef::new_unchecked(iri).into())
-            .map(TermId::raw)
-    });
+    let vocabulary = nrese_owl::Vocabulary::new(&|iri| named(snapshot, iri).map(TermId::raw));
     let markers = nrese_owl::mapping::ClassExpressionMarkers::of(&vocabulary);
     let operators = markers.properties();
     let types: Vec<u64> = markers.types.into_iter().flatten().collect();
