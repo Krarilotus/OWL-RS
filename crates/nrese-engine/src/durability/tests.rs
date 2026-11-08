@@ -970,7 +970,11 @@ fn a_directory_sync_is_real() {
 /// - the same open tried again, the sync still failing (sol-loop on review r1, S1): the first
 ///   refusal mustn't leave a directory the retry takes for durably named;
 /// - a directory that exists, made by someone else (another attempt, another process) and not
-///   known to be named durably: its holder's sync failing, the open refuses;
+///   known to be named durably: its holder's sync failing, the open refuses (it makes the
+///   store's WAL directory in it, so it syncs every name at once);
+/// - an existing store, its holder's sync failing: the open succeeds, as it changes nothing and
+///   leaves its names to the first durable write, and the first commit is refused
+///   (deferred-sync design note of 8 Nov);
 /// - guards: an existing directory whose holder can't be opened for the sync (no permission)
 ///   opens, as nothing more can be done for its name there; two missing levels open with every
 ///   sync working.
@@ -981,45 +985,61 @@ fn an_open_names_every_directory_it_creates() {
     let base = tempfile::tempdir().unwrap();
     let relative = PathBuf::from(format!("dur3-relative-{}", std::process::id()));
     std::fs::create_dir(base.path().join("made")).unwrap();
-    // (row, store directory, the directory whose sync fails and how, attempts, whether the
-    // last must open)
-    type Row<'a> = (&'a str, PathBuf, Option<(PathBuf, ErrorKind)>, usize, bool);
+    // A store made and closed while every sync works.
+    drop(Engine::open(base.path().join("kept"), config()).unwrap());
+    // What the last attempt must do.
+    #[derive(Clone, Copy, Debug)]
+    enum Must {
+        Open,
+        RefuseTheOpen,
+        RefuseTheFirstCommit,
+    }
+    // (row, store directory, the directory whose sync fails and how, attempts, what the last
+    // must do)
+    type Row<'a> = (&'a str, PathBuf, Option<(PathBuf, ErrorKind)>, usize, Must);
     let failing = |dir: &std::path::Path| Some((dir.to_path_buf(), ErrorKind::Other));
-    let rows: [Row; 7] = [
+    let rows: [Row; 8] = [
         (
             "two missing levels",
             base.path().join("a").join("b"),
             failing(base.path()),
             1,
-            false,
+            Must::RefuseTheOpen,
         ),
         (
             "one missing level",
             base.path().join("c"),
             failing(base.path()),
             1,
-            false,
+            Must::RefuseTheOpen,
         ),
         (
             "a relative single directory",
             relative.clone(),
             failing(std::path::Path::new(".")),
             1,
-            false,
+            Must::RefuseTheOpen,
         ),
         (
             "tried again",
             base.path().join("r").join("s"),
             failing(base.path()),
             2,
-            false,
+            Must::RefuseTheOpen,
         ),
         (
             "a directory someone else made",
             base.path().join("made"),
             failing(base.path()),
             1,
-            false,
+            Must::RefuseTheOpen,
+        ),
+        (
+            "an existing store",
+            base.path().join("kept"),
+            failing(base.path()),
+            1,
+            Must::RefuseTheFirstCommit,
         ),
         (
             "an existing directory, its holder not to be opened (guard)",
@@ -1028,27 +1048,28 @@ fn an_open_names_every_directory_it_creates() {
                 .parent()
                 .map(|parent| (parent.to_path_buf(), ErrorKind::PermissionDenied)),
             1,
-            true,
+            Must::Open,
         ),
         (
             "two missing levels, every sync working (guard)",
             base.path().join("d").join("e"),
             None,
             1,
-            true,
+            Must::Open,
         ),
     ];
     let mut failures = Vec::new();
-    for (row, dir, failing, attempts, opens) in rows {
+    for (row, dir, failing, attempts, must) in rows {
         fault::FAIL_DIR_SYNC_OF.set(failing);
         let mut opened = Err(EngineError::Configuration("not tried".to_owned()));
         for _ in 0..attempts {
             opened = Engine::open(&dir, config()).map(|engine| commit(&engine, 0).map(drop));
         }
         fault::FAIL_DIR_SYNC_OF.set(None);
-        let ok = match opens {
-            true => matches!(opened, Ok(Ok(()))),
-            false => opened.is_err(),
+        let ok = match must {
+            Must::Open => matches!(opened, Ok(Ok(()))),
+            Must::RefuseTheOpen => opened.is_err(),
+            Must::RefuseTheFirstCommit => matches!(opened, Ok(Err(_))),
         };
         eprintln!("row {row}: {}", if ok { "ok" } else { "FAILED" });
         if !ok {
@@ -1283,18 +1304,55 @@ fn an_open_syncs_what_it_replayed() {
     }
 }
 
-/// A reopen syncs each directory once (timing of 8 Nov, the master's decision 1): every
-/// directory holding a level of the store's path (the names R1-F2 makes durable), the WAL's
-/// directory and the store's own (F5's syncs after replay, which also name the store's
-/// subdirectories it found), each exactly once, whatever else of the open names them. Before the
-/// fix the open named the store's path again for the WAL's directory, and the WAL named both
-/// again: every directory above the store three times, the store's twice, and once more with the
-/// WAL archive. Rows, judged apart: a reopen; a reopen with the WAL archive.
-#[test]
-fn a_reopen_syncs_each_directory_once() {
+/// The names a reopen of the store in `root` makes durable (R1-F2 and F5): each directory
+/// holding a level of its path (the root, or a Windows prefix, holds nothing), the WAL's
+/// directory and the store's own, each once.
+fn names_of(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, usize> {
+    let mut names: std::collections::BTreeMap<_, _> = root
+        .ancestors()
+        .skip(1)
+        .filter(|level| !level.as_os_str().is_empty())
+        .map(|level| (level.to_path_buf(), 1))
+        .collect();
+    names.insert(super::wal::wal_dir(root), 1);
+    names.insert(root.to_path_buf(), 1);
+    names
+}
+
+/// What `step` returns, and the directories it synced, each with how often.
+fn dir_syncs_of<T>(
+    step: impl FnOnce() -> T,
+) -> (T, std::collections::BTreeMap<std::path::PathBuf, usize>) {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
+    let synced = Rc::new(std::cell::RefCell::new(BTreeMap::<PathBuf, usize>::new()));
+    let seen = Rc::clone(&synced);
+    fault::ON_DIR_SYNC.set(Some(Box::new(move |dir: &Path| {
+        *seen.borrow_mut().entry(dir.to_path_buf()).or_default() += 1;
+    })));
+    let out = step();
+    fault::ON_DIR_SYNC.set(None);
+    (out, synced.take())
+}
+
+/// A store at `<base>/store` with one commit in its log and no checkpoint, closed.
+fn a_closed_store(config: EngineConfig) -> (tempfile::TempDir, std::path::PathBuf) {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("store");
+    let engine = Engine::open(&root, config).unwrap();
+    commit(&engine, 1).unwrap();
+    (base, root)
+}
+
+/// A reopen syncs its names once, by its first commit (timing of 8 Nov, the master's decisions
+/// of 12:15 and 14:37): the open itself syncs no directory, as the first sync an open does pays
+/// the journal's commit and a device flush (+0.5 ms a reopen on the timing host); the first
+/// commit syncs each of its names (`names_of`) once, before it is acknowledged; the second
+/// syncs none. Before the fix the open synced them all and the commit none. Rows, judged
+/// apart: a reopen; a reopen with the WAL archive.
+#[test]
+fn a_reopen_syncs_its_names_once_by_its_first_commit() {
     let mut wrong = Vec::new();
     for (row, wal_archive) in [("a reopen", false), ("a reopen with the WAL archive", true)] {
         let archived = || EngineConfig {
@@ -1304,38 +1362,128 @@ fn a_reopen_syncs_each_directory_once() {
             },
             ..config()
         };
-        let base = tempfile::tempdir().unwrap();
-        let root = base.path().join("store");
-        {
-            let engine = Engine::open(&root, archived()).unwrap();
-            commit(&engine, 1).unwrap();
+        let (_base, root) = a_closed_store(archived());
+        let (opened, at_open) = dir_syncs_of(|| Engine::open(&root, archived()));
+        let engine = match opened {
+            Ok(engine) => engine,
+            Err(error) => {
+                wrong.push(format!("{row}: the reopen failed: {error}"));
+                continue;
+            }
+        };
+        let (first, at_first) = dir_syncs_of(|| commit(&engine, 2));
+        let (second, at_second) = dir_syncs_of(|| commit(&engine, 3));
+        eprintln!("row {row}: open {at_open:?}; first commit {at_first:?}; second {at_second:?}");
+        if !at_open.is_empty() {
+            wrong.push(format!("{row}: the open synced {at_open:#?}"));
         }
-        // Each holder of a level of the store's path (the root, or a Windows prefix, holds
-        // nothing), then the WAL's directory and the store's.
-        let mut expected: BTreeMap<PathBuf, usize> = root
-            .ancestors()
-            .skip(1)
-            .filter(|level| !level.as_os_str().is_empty())
-            .map(|level| (level.to_path_buf(), 1))
-            .collect();
-        expected.insert(super::wal::wal_dir(&root), 1);
-        expected.insert(root.clone(), 1);
-        let synced = Rc::new(std::cell::RefCell::new(BTreeMap::<PathBuf, usize>::new()));
-        let seen = Rc::clone(&synced);
-        fault::ON_DIR_SYNC.set(Some(Box::new(move |dir: &Path| {
-            *seen.borrow_mut().entry(dir.to_path_buf()).or_default() += 1;
-        })));
-        let opened = Engine::open(&root, archived());
-        fault::ON_DIR_SYNC.set(None);
-        if let Err(error) = &opened {
-            wrong.push(format!("{row}: the reopen failed: {error}"));
-            continue;
+        if let Err(error) = first.and(second) {
+            wrong.push(format!("{row}: a commit failed: {error}"));
         }
-        let synced = synced.take();
-        eprintln!("row {row}: {synced:?}");
-        if synced != expected {
+        if at_first != names_of(&root) {
             wrong.push(format!(
-                "{row}: synced {synced:#?}, expected each once: {expected:#?}"
+                "{row}: the first commit synced {at_first:#?}, expected each name once: {:#?}",
+                names_of(&root)
+            ));
+        }
+        if !at_second.is_empty() {
+            wrong.push(format!("{row}: the second commit synced {at_second:#?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Whatever relies on a reopened store's names first syncs them (the deferred-sync design
+/// note's invariant): a checkpoint, a bulk publication and the log served to a follower each
+/// sync every name (`names_of`) before they return, when no commit came first. Before the fix
+/// the open had synced them, and none of these did again. Rows, judged apart.
+#[test]
+fn a_reopen_syncs_its_names_before_anything_relies_on_them() {
+    type Step = fn(&Engine) -> Result<(), String>;
+    let steps: [(&str, Step); 3] = [
+        ("a checkpoint", |engine| {
+            engine.checkpoint().map(drop).map_err(|e| e.to_string())
+        }),
+        ("a bulk publication", |engine| {
+            let load = engine.bulk_load(BulkMode::Append);
+            load.add(&[quad(10)]);
+            load.finish().map(drop).map_err(|e| e.to_string())
+        }),
+        ("the log served", |engine| {
+            engine
+                .log_since(0, usize::MAX)
+                .map(drop)
+                .map_err(|e| e.to_string())
+        }),
+    ];
+    let mut wrong = Vec::new();
+    for (row, step) in steps {
+        let (_base, root) = a_closed_store(config());
+        let engine = Engine::open(&root, config()).unwrap();
+        let (done, synced) = dir_syncs_of(|| step(&engine));
+        eprintln!("row {row}: {synced:?}");
+        if let Err(error) = done {
+            wrong.push(format!("{row}: failed: {error}"));
+        }
+        let missing: Vec<_> = names_of(&root)
+            .into_keys()
+            .filter(|name| !synced.contains_key(name))
+            .collect();
+        if !missing.is_empty() {
+            wrong.push(format!("{row}: returned with {missing:?} not synced"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A first commit whose names can't be synced is not acknowledged (the design note's attack
+/// 2): the store's directory sync failing, the commit returns an error and publishes nothing,
+/// and the log takes no more commits (the record is written, its outcome unknown, as for a
+/// record whose own sync failed); reopened, the store opens, with or without that commit.
+/// Before the fix the commit didn't sync the names, and succeeded. Second row: a checkpoint
+/// whose names can't be synced fails before it writes anything, and the log stays usable.
+#[test]
+fn a_first_commit_whose_names_cant_be_synced_is_refused() {
+    let mut wrong = Vec::new();
+    {
+        let (_base, root) = a_closed_store(config());
+        let engine = Engine::open(&root, config()).unwrap();
+        fault::FAIL_DIR_SYNC_OF.set(Some((root.clone(), std::io::ErrorKind::Other)));
+        let first = commit(&engine, 2);
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        if first.is_ok() {
+            wrong.push("commit: acknowledged though the store's name wasn't synced".to_owned());
+        }
+        if engine.snapshot().revision() != 1 {
+            wrong.push("commit: the refused commit was published".to_owned());
+        }
+        if !matches!(commit(&engine, 3), Err(EngineError::WalPoisoned)) {
+            wrong.push("commit: the log took a commit after an unknown outcome".to_owned());
+        }
+        drop(engine);
+        match Engine::open(&root, config()) {
+            Ok(engine) if [1, 2].contains(&engine.snapshot().revision()) => {}
+            other => wrong.push(format!(
+                "commit: the reopen: {:?}",
+                other.map(|engine| engine.snapshot().revision())
+            )),
+        }
+    }
+    {
+        let (_base, root) = a_closed_store(config());
+        let engine = Engine::open(&root, config()).unwrap();
+        fault::FAIL_DIR_SYNC_OF.set(Some((root.clone(), std::io::ErrorKind::Other)));
+        let checkpointed = engine.checkpoint();
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        if checkpointed.is_ok() {
+            wrong.push("checkpoint: written though the store's name wasn't synced".to_owned());
+        }
+        if super::checkpoint::exists(&root, 1) {
+            wrong.push("checkpoint: a checkpoint was placed".to_owned());
+        }
+        if let Err(error) = commit(&engine, 2) {
+            wrong.push(format!(
+                "checkpoint: the log refused the next commit: {error}"
             ));
         }
     }
