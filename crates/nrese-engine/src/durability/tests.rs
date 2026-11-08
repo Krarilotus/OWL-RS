@@ -1133,24 +1133,14 @@ fn store_directories_are_made_through_the_placement_owner() {
     let mut found = Vec::new();
     for file in files {
         let text = std::fs::read_to_string(crates.join(file)).unwrap();
-        let lines: Vec<&str> = text.lines().collect();
-        // Inside an inline test module, any name, at the file's top level: skipped up to its
-        // closing brace (an out-of-line `mod tests;` is no module here: sol-loop round 4, S2).
-        let mut in_tests = false;
-        for (n, line) in lines.iter().enumerate() {
-            if in_tests {
-                in_tests = *line != "}";
+        let lines = match product_lines(&text) {
+            Ok(lines) => lines,
+            Err(error) => {
+                found.push(format!("{file}: {error}"));
                 continue;
             }
-            let tests_begin = line.trim() == "#[cfg(test)]"
-                && lines.get(n + 1).is_some_and(|next| {
-                    let next = next.trim_start();
-                    next.contains("mod ") && next.trim_end().ends_with('{')
-                });
-            if tests_begin {
-                in_tests = true;
-                continue;
-            }
+        };
+        for (n, line) in lines {
             let makes = ["create_dir_all(", "create_dir(", "fs::rename("]
                 .into_iter()
                 .any(|call| {
@@ -1174,6 +1164,84 @@ fn store_directories_are_made_through_the_placement_owner() {
         found.is_empty(),
         "made outside durability::place: {found:#?}"
     );
+}
+
+/// The product code of a Rust source file, with each line's index: every line but those of its
+/// inline test modules. A test module is `#[cfg(test)]` at column 0 followed by a `mod … {`
+/// line at column 0 (any name; an out-of-line `mod tests;` is none: sol-loop round 4, S2), and
+/// it ends at a bare `}` at column 0. Any other line at column 0 that starts with `}` inside one,
+/// or a file ending inside one, is refused rather than guessed (fix check r2, N4: a close like
+/// `} // comment` skipped the product code after it).
+fn product_lines(text: &str) -> Result<Vec<(usize, &str)>, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut product = Vec::new();
+    let mut in_tests: Option<usize> = None;
+    for (n, line) in lines.iter().enumerate() {
+        if let Some(start) = in_tests {
+            if *line == "}" {
+                in_tests = None;
+            } else if line.starts_with('}') {
+                return Err(format!(
+                    "the test module at line {} closes as {line:?} at line {}: only a bare `}}` is read",
+                    start + 1,
+                    n + 1
+                ));
+            }
+            continue;
+        }
+        let module = *line == "#[cfg(test)]"
+            && lines.get(n + 1).is_some_and(|next| {
+                !next.starts_with(char::is_whitespace)
+                    && next.contains("mod ")
+                    && next.trim_end().ends_with('{')
+            });
+        if module {
+            in_tests = Some(n);
+            continue;
+        }
+        product.push((n, *line));
+    }
+    match in_tests {
+        Some(start) => Err(format!(
+            "the test module at line {} never closes",
+            start + 1
+        )),
+        None => Ok(product),
+    }
+}
+
+/// [`product_lines`] reads the shapes it is given, and refuses others (fix check r2, N4). Rows:
+/// a test module named anything, closed by a bare `}`, then product code; an out-of-line
+/// `mod tests;` (no module: the code after it is read); a `#[cfg(test)]` seam inside a function
+/// (indented: read); a module closed by `} // comment` (refused); a module never closed
+/// (refused).
+#[test]
+fn the_scan_reads_product_code_only_in_the_shapes_it_knows() {
+    fn read(text: &str) -> Result<Vec<&str>, String> {
+        product_lines(text).map(|lines| lines.into_iter().map(|(_, line)| line).collect())
+    }
+    let mut wrong = Vec::new();
+    let module = "fn a() {}\n#[cfg(test)]\nmod checks {\n    fn t() {}\n}\nfn b() {}\n";
+    if read(module) != Ok(vec!["fn a() {}", "fn b() {}"]) {
+        wrong.push(format!("a test module: {:?}", read(module)));
+    }
+    let out_of_line = "#[cfg(test)]\nmod tests;\nfn b() {}\n";
+    if read(out_of_line) != Ok(vec!["#[cfg(test)]", "mod tests;", "fn b() {}"]) {
+        wrong.push(format!("out of line: {:?}", read(out_of_line)));
+    }
+    let seam = "fn a() {\n    #[cfg(test)]\n    if seam() {\n    }\n}\n";
+    if read(seam).map(|lines| lines.len()) != Ok(5) {
+        wrong.push(format!("a seam: {:?}", read(seam)));
+    }
+    let commented = "#[cfg(test)]\nmod tests {\n} // tests\nfn b() {}\n";
+    if read(commented).is_ok() {
+        wrong.push(format!("a commented close: {:?}", read(commented)));
+    }
+    let unclosed = "#[cfg(test)]\nmod tests {\n    fn t() {}\n";
+    if read(unclosed).is_ok() {
+        wrong.push(format!("never closed: {:?}", read(unclosed)));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// What an open replayed is durable before it takes new commits (F5): the segments it
