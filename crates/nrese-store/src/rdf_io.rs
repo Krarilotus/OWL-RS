@@ -71,21 +71,30 @@ pub(crate) fn parse_graph(
         .collect()
 }
 
-/// `quad` as the store keeps it: in the default graph where its graph is another store's name
-/// for it (`urn:x-arq:DefaultGraph`, `urn:x-rdflib:default`: [`nrese_sparql::compat`]), which
-/// every SPARQL name of it reads; otherwise as it is. Every dataset input passes its quads
-/// through here: request payloads, restores, quarantine replays and bulk loads.
-pub(crate) fn stored(mut quad: Quad) -> Quad {
-    if let GraphName::NamedNode(graph) = &quad.graph_name
-        && nrese_sparql::compat::names_default_graph(graph.as_str())
-    {
-        quad.graph_name = GraphName::DefaultGraph;
+/// The store graph `graph` names: the default graph for another store's name for it
+/// (`urn:x-arq:DefaultGraph`, `urn:x-rdflib:default`: [`nrese_sparql::compat`]), which every
+/// SPARQL name of it reads; otherwise `graph`. The store's one placement of a graph name: a
+/// document's graphs, an explicit context or target, a restore's and a bulk load's graphs all
+/// pass through here, after any protocol override and before any permission check.
+pub(crate) fn stored_graph(graph: GraphName) -> GraphName {
+    match &graph {
+        GraphName::NamedNode(name) if nrese_sparql::compat::names_default_graph(name.as_str()) => {
+            GraphName::DefaultGraph
+        }
+        _ => graph,
     }
+}
+
+/// `quad` in the graph the store keeps it in ([`stored_graph`]).
+pub(crate) fn stored(mut quad: Quad) -> Quad {
+    quad.graph_name = stored_graph(quad.graph_name);
     quad
 }
 
-/// Parses a request payload into quads, in the graphs it names (the default graph for
-/// triples, and for another store's name for it: [`stored`]), with fresh blank nodes.
+/// Parses a request payload into quads, in the graphs it names as written (the default graph
+/// for triples): a protocol can still tell a graph left out from one named, an alias of the
+/// default graph included. Where the quads are placed, they pass through [`stored`]. Fresh
+/// blank nodes.
 pub fn parse_payload(
     format: GraphResultFormat,
     base_iri: Option<&str>,
@@ -93,7 +102,7 @@ pub fn parse_payload(
 ) -> StoreResult<Vec<Quad>> {
     parser(format.rdf_format(), base_iri, BlankNodes::Fresh)?
         .for_slice(payload)
-        .map(|quad| quad.map(stored).map_err(StoreError::from))
+        .map(|quad| quad.map_err(StoreError::from))
         .collect()
 }
 
@@ -106,7 +115,7 @@ pub fn parse_payload_preserving_blank_nodes(
 ) -> StoreResult<Vec<Quad>> {
     parser(format.rdf_format(), base_iri, BlankNodes::AsWritten)?
         .for_slice(payload)
-        .map(|quad| quad.map(stored).map_err(StoreError::from))
+        .map(|quad| quad.map_err(StoreError::from))
         .collect()
 }
 

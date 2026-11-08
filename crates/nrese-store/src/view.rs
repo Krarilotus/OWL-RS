@@ -23,12 +23,13 @@ pub(crate) fn decoded_quads<'a, V: ReadView>(
 }
 
 impl GraphTarget {
-    /// The RDF graph name this target addresses.
+    /// The store graph this target addresses: another store's name for the default graph is the
+    /// default graph (`rdf_io::stored_graph`).
     pub(crate) fn graph_name(&self) -> StoreResult<GraphName> {
         match self {
             Self::DefaultGraph => Ok(GraphName::DefaultGraph),
             Self::NamedGraph(iri) => NamedNode::new(iri.as_str())
-                .map(GraphName::from)
+                .map(|name| crate::rdf_io::stored_graph(name.into()))
                 .map_err(|_| StoreError::InvalidGraphIri(iri.clone())),
         }
     }
