@@ -100,6 +100,35 @@ class Abba(unittest.TestCase):
         code, text, _ = abba.report(self.family, list(rounds))
         return code, text
 
+    def test_hypotheses_nothing_compared_never_read_as_no_loss(self):
+        """SHACL lead, 8 Nov 2026 (orchestrator 04:31): A's answers differ from the pinned ones and B's
+        match, so the gate takes neither side's time there (release_gate.compare_case, not_compared);
+        the report decided over no test at all and said "No loss shown (exit 0)", its rows `- | 1 | -`.
+        It names each hypothesis not compared and why, with B's own numbers, and never exits 0."""
+        pinned = {"q01-point-lookup": 5, "q06-text-filter": 1033}
+        for wrong in ({"q01-point-lookup": 4, "q06-text-filter": 1000}, {"q01-point-lookup": 4}):
+            with self.subTest(wrong=sorted(wrong)):
+                base = records()
+
+                def records_of(side, n):
+                    out = base(side, n)
+                    for o in out[0]["observations"]:
+                        o["rows"] = dict(pinned) if side == "b" else {**pinned, **wrong}
+                    return out
+                code, text = self.verdict(self.round_(records_of, name=f"r-{len(wrong)}"))
+                self.assertNotEqual(code, abba.NO_LOSS)
+                self.assertNotIn("No loss shown", text)
+                self.assertEqual(code, abba.NOT_COMPARED)
+                self.assertIn(f"{len(wrong)} of 2 hypotheses not compared", text)
+                for s in wrong:
+                    row = next(line for line in text.splitlines() if line.startswith(f"| lab-olympics / time/{s} |"))
+                    self.assertIn("not compared: answers differ from a's", row)
+                    self.assertRegex(row, r"B \d+(\.\d+)? ms")
+                for s in set(pinned) - set(wrong):  # the other one tested, as before: its ratio and p
+                    row = next(line for line in text.splitlines() if line.startswith(f"| lab-olympics / time/{s} |"))
+                    self.assertNotIn("not compared", row)
+                    self.assertNotIn("| - | - |", row)
+
     def test_missing_evidence_is_no_verdict_never_a_pass(self):
         self.assertEqual(self.verdict(self.round_(records()))[0], abba.NO_LOSS)
         cases = [("a slot missing", dict(drop=lambda p: p["n"] == 9)),
@@ -240,6 +269,48 @@ systems = []
             self.verdict(self.round_(records(), host="office-pc"))
         self.assertEqual((timed["env"]["GATE_HOST"], read), ("office-pc", ["office-pc"]))
         self.assertIn("pin_reason", timed)
+
+    def test_a_job_asks_for_what_making_its_data_takes(self):
+        """Orchestrator, 7 Nov 2026: a set makes the datasets its cases read where its host lacks
+        them (LUBM's in Docker), so it asks for Docker and the disk to make them in, not the bench
+        assets; asked for nothing, it could land where its data can be neither found nor made."""
+        self.path.write_bytes(abba.family_text("t", {"a": A, "b": B}, ["dlmode-lubm1"], 6).encode("utf-8"))
+        with patch.object(abba.rg, "makers_at", return_value=True):  # its harness makes data
+            job = next(iter(abba.jobs(self.load(), B, self.repo.as_posix()).values()))
+        self.assertEqual(job["requires"].get("has"), ["docker"])
+        self.assertGreaterEqual(job["requires"].get("disk_gb", 0), 1)
+
+    def test_a_harness_that_can_t_make_its_family_s_data_is_refused_before_planning(self):
+        """Orchestrator, 8 Nov 2026: REAS's and C5's sets (abba-run-055fe886-f3da61f9) were planned by a
+        submitter that makes support-stress data, so asked for no assets, but prepared by a harness
+        from before the dataset makers (838cd7eb, PR #129), which didn't make them: "7 not as pinned"
+        on a host without them, after the builds. Refused at the plan, saying why."""
+        old = self.commits[-1]  # a real harness commit whose tree has no dataset makers
+        sides = {"a": self.commits[0], "b": old}
+        self.path.write_bytes(abba.family_text("t", sides, ["support-copies-17"], 6).encode("utf-8"))
+        with self.assertRaises(abba.Invalid) as refused:  # planned unrefused, it asks for no assets
+            abba.jobs(self.load(), old, self.repo.as_posix())
+        text = "\n".join(refused.exception.args[0])
+        self.assertIn("support-stress/copies-17.nq", text)
+        self.assertIn("dataset makers", text)
+        with patch.object(abba.rg, "makers_at", return_value=True):  # the same family, a harness that makes it
+            job = next(iter(abba.jobs(self.load(), old, self.repo.as_posix()).values()))
+        self.assertNotIn("owlrs-bench-assets", job["requires"].get("has", []))
+
+    def test_whether_a_harness_makes_data_is_read_from_its_own_tree(self):
+        """makers_at(): the harness's own release_gate.py, at that commit, names the dataset makers."""
+        with tempfile.TemporaryDirectory() as d:
+            git = lambda *a: abba.subprocess.run(["git", "-C", d, *a], capture_output=True, text=True,  # noqa: E731
+                                                 check=True).stdout.strip()
+            git("init", "-q")
+            Path(d, "benches/fast").mkdir(parents=True)
+            commit = lambda text: (Path(d, "benches/fast/release_gate.py").write_text(text, encoding="utf-8"),  # noqa: E731
+                                   git("add", "-A"), git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                                                         "-m", "x"), git("rev-parse", "HEAD"))[3]
+            before, after = commit("# no makers\n"), commit("DATASET_MAKERS = {}\n")
+            self.assertFalse(abba.rg.makers_at(d, before))
+            self.assertTrue(abba.rg.makers_at(d, after))
+            self.assertFalse(abba.rg.makers_at(d, "0" * 40))  # not there: unknown, refused
 
     def test_one_job_asks_by_capability_and_builds_where_it_times(self):
         """The brief of 2 Nov 2026: no host names. A build job and a timed job pinned to one host

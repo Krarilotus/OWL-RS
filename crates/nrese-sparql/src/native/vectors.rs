@@ -235,6 +235,7 @@ impl Context<'_> {
         // Whether each hit is used in the active graph, kept across the query vectors:
         // charged, as it grows with the hits the searches widen to.
         let mut used: Ids<'_, bool> = Ids::new(&self.budget);
+        let within = self.search_in()?;
         for (near_id, vector) in queries {
             self.check()?;
             let accept = |id: TermId| {
@@ -246,11 +247,7 @@ impl Context<'_> {
                 &search,
                 vector,
                 candidates.as_ref().map(HashSet::len),
-                |query| {
-                    self.snapshot
-                        .vector_search(query, &accept, &self.budget)
-                        .map_err(|e| QueryEvaluationError::MemoryLimit(e).into())
-                },
+                |query| self.vector_fetch(&within, query, &accept),
                 |id| {
                     let used = match used.get(id.raw()) {
                         Some(&used) => used,
@@ -305,15 +302,12 @@ impl Context<'_> {
         // beam is widened by the inverse share as for a filter it applies itself. Without
         // it the first `k` hits that pass come from an approximate list whose tail misses
         // them (recall 0.50 against 0.98, one kind in ten of 200,000 vectors).
+        let within = self.search_in()?;
         let found = self.nearest(
             &search,
             vector.clone(),
             Some(estimate.ceil() as usize),
-            |query| {
-                self.snapshot
-                    .vector_search(query, &|_| true, &self.budget)
-                    .map_err(|e| QueryEvaluationError::MemoryLimit(e).into())
-            },
+            |query| self.vector_fetch(&within, query, &|_| true),
             |id| {
                 if !self.used_as_object(id) {
                     return Ok(None);
@@ -373,6 +367,34 @@ impl Context<'_> {
             }
         };
         self.join(local, found)
+    }
+
+    /// One round of a vector search, over what `within` says: the dictionary's index
+    /// (global), or the vectors the reader sees, compared exactly; charged to the query's
+    /// budget either way, a refusal (the search's or a reader's corpus) its memory error.
+    fn vector_fetch(
+        &self,
+        within: &super::search::SearchIn,
+        query: &VectorQuery,
+        accept: &(dyn Fn(TermId) -> bool + Sync),
+    ) -> NativeResult<Fetched<'_>> {
+        use super::search::SearchIn;
+        let found = match within {
+            SearchIn::Global => self.snapshot.vector_search(query, accept, &self.budget),
+            SearchIn::Reader(None) => Ok((
+                ChargedVec::new(&*self.budget),
+                VectorSearchReport {
+                    space: 0,
+                    graph: false,
+                    scanned: 0,
+                },
+            )),
+            SearchIn::Reader(Some((_, scope))) => {
+                self.snapshot
+                    .vector_search_in(self.model, scope, query, accept, &self.budget)
+            }
+        };
+        found.map_err(|e| QueryEvaluationError::MemoryLimit(e).into())
     }
 
     /// Merge sorted search rounds with retained, successfully probed candidates.

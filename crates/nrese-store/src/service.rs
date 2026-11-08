@@ -167,6 +167,15 @@ impl StoreService {
         engine.set_canonical_view_budget(std::sync::Arc::new(
             nrese_exec::Budget::unlimited().within(runtime.query_memory()),
         ));
+        // So do the corpora reader-scoped searches keep, where they are on.
+        if config.search_scope == crate::SearchScope::Reader {
+            start_reader_corpora(
+                &engine,
+                &runtime,
+                config.reader_corpus_bytes,
+                config.reader_corpus_tuning,
+            );
+        }
         let before = engine.snapshot().revision();
         let preloaded_ontology = preload_ontology(&engine, &config)?;
         let ql_mode = config.ql_rewriting;
@@ -182,6 +191,10 @@ impl StoreService {
                 std::sync::Arc::new(nrese_sparql::ResultCache::new(config.query_cache_bytes))
             }),
             ql: std::sync::Arc::default(),
+            search_scope: std::sync::Arc::new(std::sync::RwLock::new(config.search_scope)),
+            reader_corpus_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                config.reader_corpus_bytes,
+            )),
         };
         let unavailable = std::sync::Arc::<std::sync::OnceLock<String>>::default();
         let namespaces = crate::namespaces::Namespaces::open(
@@ -279,6 +292,65 @@ impl StoreService {
     /// When queries are rewritten for OWL 2 QL.
     pub fn ql_rewriting(&self) -> crate::QlRewritingMode {
         *self.ql_mode.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// What searches rank and select among ([`crate::StoreConfig::search_scope`]).
+    pub fn search_scope(&self) -> crate::SearchScope {
+        self.settings.search_scope()
+    }
+
+    /// Changes what searches rank and select among (a repository's setting): queries and
+    /// updates that start from now on read it; running ones keep theirs. Their cached
+    /// results stay apart ([`nrese_sparql::ResultCache`] keys a reader's scope).
+    pub fn set_search_scope(&self, scope: crate::SearchScope) {
+        let mut current = self
+            .settings
+            .search_scope
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        // Turned on: the corpora the engine keeps for it draw on the queries' memory.
+        if scope == crate::SearchScope::Reader && *current != scope {
+            self.start_reader_corpora();
+        }
+        *current = scope;
+    }
+
+    /// Changes the bytes a `reader` search scope's corpora may take (a repository's
+    /// setting; [`crate::StoreConfig::reader_corpus_bytes`]): searches from now on keep
+    /// theirs within it, and the corpora kept so far are let go. Under `global` it is read
+    /// when `reader` is turned on.
+    pub fn set_reader_corpus_bytes(&self, bytes: usize) {
+        // Under the scope's lock: a scope turned on meanwhile reads the new bytes.
+        let current = self
+            .settings
+            .search_scope
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let before = self
+            .settings
+            .reader_corpus_bytes
+            .swap(bytes, std::sync::atomic::Ordering::Relaxed);
+        if before != bytes && *current == crate::SearchScope::Reader {
+            self.start_reader_corpora();
+        }
+    }
+
+    /// The bytes a `reader` search scope's corpora may take now.
+    pub fn reader_corpus_bytes(&self) -> usize {
+        self.settings
+            .reader_corpus_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Gives the engine's corpora their budget (the setting's bytes within the queries'
+    /// memory) and their tuning: reader-scoped searches from now on use them.
+    fn start_reader_corpora(&self) {
+        start_reader_corpora(
+            &self.engine,
+            &self.settings.runtime,
+            self.reader_corpus_bytes(),
+            self.config.reader_corpus_tuning,
+        );
     }
 
     /// Changes when queries are rewritten for OWL 2 QL (a repository's setting), at once.
@@ -439,6 +511,12 @@ impl StoreService {
         self.engine.stats()
     }
 
+    /// The corpora a `reader` search scope keeps: their bytes against their budget, and how
+    /// many were walked or derived; `started` false while none was made.
+    pub fn text_corpus_stats(&self) -> nrese_engine::TextCorpusStats {
+        self.engine.snapshot().text_corpus_stats()
+    }
+
     /// Every statement in `format` (a backup); for a scope that reads every graph.
     pub fn export_dataset(
         &self,
@@ -472,6 +550,7 @@ impl StoreService {
             cancellation,
             union_default_graph: self.config.union_default_graph,
             geosparql_stated_only: self.config.geosparql_stated_only,
+            search_scope: self.search_scope(),
             services: self.services(),
             namespaces: self.namespaces.all(),
             supports: std::sync::Arc::clone(&self.supports),
@@ -1477,12 +1556,18 @@ impl StoreService {
         infer: bool,
     ) -> StoreResult<Vec<crate::autocomplete::Suggestion>> {
         scope.require_all("autocompletion")?;
+        // A reader's corpora draw from the request's envelope, as a query's do.
+        let search_scope = self.search_scope();
+        let budget = (search_scope == crate::SearchScope::Reader)
+            .then(|| std::sync::Arc::new(self.envelope(None).part()));
         Ok(crate::autocomplete::autocomplete(
             &self.engine.snapshot(),
             read_model(infer),
             typed,
             limit,
-        ))
+            search_scope,
+            budget.as_ref(),
+        )?)
     }
 
     /// The named graphs `scope` reads (RDF4J's `/contexts`).
@@ -1919,6 +2004,20 @@ impl StoreService {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
+}
+
+/// Gives `engine`'s corpora of reader-scoped searches ([`crate::SearchScope::Reader`]) a
+/// budget of `bytes` within the memory the queries draw on, and `tuning`.
+fn start_reader_corpora(
+    engine: &Engine,
+    runtime: &crate::Runtime,
+    bytes: usize,
+    tuning: nrese_engine::CorpusTuning,
+) {
+    engine.set_text_corpus_budget(std::sync::Arc::new(
+        nrese_exec::Budget::new(bytes).within(runtime.query_memory()),
+    ));
+    engine.set_corpus_tuning(tuning);
 }
 
 /// The read model of RDF4J's `infer` parameter.
