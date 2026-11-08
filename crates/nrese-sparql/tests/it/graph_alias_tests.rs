@@ -48,6 +48,8 @@ fn run(reads: &str, update: &str) -> String {
         "writes-a" => options.writable = access(&[a.as_str()], false),
         // A writable list that spells the alias as a graph IRI, without the default graph.
         "writes-alias-iri" => options.writable = access(&["urn:x-arq:DefaultGraph"], false),
+        // A reader of everything who may write the default graph alone.
+        "writes-default" => options.writable = access(&[], true),
         _ => unreachable!("{reads}"),
     }
     let update = update.replace("<ex:", &format!("<{EX}"));
@@ -106,6 +108,21 @@ writes-alias-iri | CLEAR GRAPH <urn:x-arq:DefaultGraph> | forbidden
 guard plain | INSERT DATA { GRAPH <urn:x-arq:DefaultGraph> { <ex:x> <ex:p> 1 } } | DEFAULT:d DEFAULT:x a:a
 guard plain | DELETE WHERE { GRAPH <urn:x-rdflib:default> { ?s ?p ?o } } | a:a
 guard plain | INSERT { GRAPH <ex:dest> { ?s ?p ?o } } USING <urn:x-arq:DefaultGraph> WHERE { ?s ?p ?o } | DEFAULT:d a:a dest:d
+# Review r1, S2-F1 (rows failed on slice 2's 10e51e7e): a transfer between two names of the
+# default graph is a transfer of a graph to itself, which changes nothing.
+plain | COPY DEFAULT TO <urn:x-arq:DefaultGraph> | DEFAULT:d a:a
+plain | COPY <urn:x-arq:DefaultGraph> TO DEFAULT | DEFAULT:d a:a
+plain | COPY <urn:x-arq:DefaultGraph> TO <urn:x-rdflib:default> | DEFAULT:d a:a
+plain | MOVE DEFAULT TO <urn:x-rdflib:default> | DEFAULT:d a:a
+plain | MOVE <urn:x-rdflib:default> TO DEFAULT | DEFAULT:d a:a
+plain | MOVE <urn:x-rdflib:default> TO <urn:x-arq:DefaultGraph> | DEFAULT:d a:a
+guard plain | ADD <urn:x-arq:DefaultGraph> TO DEFAULT | DEFAULT:d a:a
+# Review r1, S2-F2: a template's graph variable bound to such a name writes the default graph,
+# under the default graph's rights.
+plain | INSERT { GRAPH ?g { <ex:x> <ex:p> 1 } } WHERE { VALUES ?g { <urn:x-arq:DefaultGraph> } } | DEFAULT:d DEFAULT:x a:a
+plain | DELETE { GRAPH ?g { ?s ?p ?o } } WHERE { VALUES ?g { <urn:x-rdflib:default> } ?s ?p ?o } | a:a
+writes-default | INSERT { GRAPH ?g { <ex:x> <ex:p> 1 } } WHERE { VALUES ?g { <urn:x-arq:DefaultGraph> } } | DEFAULT:d DEFAULT:x a:a
+writes-alias-iri | INSERT { GRAPH ?g { <ex:x> <ex:p> 1 } } WHERE { VALUES ?g { <urn:x-arq:DefaultGraph> } } | forbidden
 ";
 
 #[test]
