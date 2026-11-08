@@ -1813,7 +1813,34 @@ fn schema_the_reader_or_the_mapping_leaves_out_is_reported() {
     );
     let query = format!("ASK {{ <{E}c> a <{E}D> }}");
     let dir = tempfile::tempdir().unwrap();
-    let result = store(&reserved_first, dir.path(), Ruleset::Owl2Ql, true)
+    let reserved_store = store(&reserved_first, dir.path(), Ruleset::Owl2Ql, true);
+    // Its precondition (review r2, F6): the first asserted `owl:sameAs` in the snapshot's
+    // scan, the one a reader sampling one statement took, is the reserved one.
+    {
+        use nrese_engine::{GraphSelector, QuadPattern, ReadModel};
+        use nrese_rdf::NamedNodeRef;
+        let snapshot = reserved_store.read_snapshot(None).unwrap();
+        let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
+        let same_as = id("http://www.w3.org/2002/07/owl#sameAs").expect("owl:sameAs");
+        let first = snapshot
+            .quads_for_pattern_in(
+                ReadModel::Asserted,
+                &QuadPattern {
+                    subject: None,
+                    predicate: Some(same_as),
+                    object: None,
+                    graph: GraphSelector::Any,
+                },
+            )
+            .next()
+            .expect("an equality");
+        assert_eq!(
+            Some(first.subject),
+            id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            "the reserved equality comes first in scan order"
+        );
+    }
+    let result = reserved_store
         .execute_query(&SparqlQueryRequest::all(query.as_str()))
         .unwrap();
     let answer = String::from_utf8(result.payload).unwrap();

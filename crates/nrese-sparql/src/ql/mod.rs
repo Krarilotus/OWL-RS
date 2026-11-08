@@ -682,16 +682,16 @@ fn read_core(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
 fn expressions_of(snapshot: &Snapshot, core: &[nrese_owl::Statement]) -> Vec<u64> {
     // The mapping's own markers, those it can't read included (an n-ary or a malformed
     // restriction), so the memberships of every node it would read as a class expression
-    // reach it, and it reports what it can't read (I24c-2 review r1, F2).
-    let ids = |iris: &[&str]| -> Vec<u64> {
-        iris.iter()
-            .filter_map(|i| snapshot.lookup(NamedNodeRef::new_unchecked(i).into()))
+    // reach it, and it reports what it can't read (I24c-2 review r1, F2; r2, F5).
+    let vocabulary = nrese_owl::Vocabulary::new(&|iri| {
+        snapshot
+            .lookup(NamedNodeRef::new_unchecked(iri).into())
             .map(TermId::raw)
-            .collect()
-    };
-    let operators = ids(&nrese_owl::mapping::CLASS_EXPRESSION_PROPERTIES);
-    let types = ids(&nrese_owl::mapping::CLASS_EXPRESSION_TYPES);
-    let rdf_type = iri(snapshot, RDF, "type").map(TermId::raw);
+    });
+    let markers = nrese_owl::mapping::ClassExpressionMarkers::of(&vocabulary);
+    let operators = markers.properties();
+    let types: Vec<u64> = markers.types.into_iter().flatten().collect();
+    let rdf_type = vocabulary.rdf_type;
     let mut out: Vec<u64> = core
         .iter()
         .filter(|s| {
