@@ -7,6 +7,7 @@ use nrese_exec::measure::{alone, measure, measure_within};
 use nrese_exec::{Envelope, SharedBudget};
 use nrese_rdf::{GraphName, NamedNode, Quad};
 use nrese_sparql_syntax::SparqlParser;
+use nrese_sparql_syntax::algebra::PropertyPathExpression;
 
 fn node(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("urn:{local}"))
@@ -415,4 +416,226 @@ fn construct_under_a_small_envelope_is_never_refused_for_spare() {
     let answer = crate::evaluate_query(&snapshot, &query, &options);
     assert!(answer.is_ok(), "refused: {:?}", answer.err());
     assert!(!options.resources.memory.refused());
+}
+
+/// A store of default-graph statements `urn:s urn:p urn:o`, without background maintenance.
+fn default_store(statements: impl IntoIterator<Item = (String, String, String)>) -> Engine {
+    let config = EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    };
+    let engine = Engine::new(config).unwrap();
+    let mut tx = engine.transaction();
+    for (s, p, o) in statements {
+        let quad = Quad::new(node(&s), node(&p), node(&o), GraphName::DefaultGraph);
+        tx.insert(quad.as_ref());
+    }
+    tx.commit().unwrap();
+    engine
+}
+
+/// A path's end: `?name` a variable, else the IRI `urn:name`.
+fn end(text: &str) -> TermPattern {
+    match text.strip_prefix('?') {
+        Some(name) => TermPattern::Variable(Variable::new_unchecked(name)),
+        None => TermPattern::NamedNode(node(text)),
+    }
+}
+
+fn link(p: &str) -> PropertyPathExpression {
+    PropertyPathExpression::NamedNode(node(p))
+}
+
+/// A path pattern: its subject, path and object ([`end`]).
+type PathTerms<'a> = (&'a str, &'a PropertyPathExpression, &'a str);
+
+/// A path pattern that owns its path, for a case to return.
+type PathCase = (&'static str, PropertyPathExpression, &'static str);
+
+/// `subject path object` over `engine`'s default graph under a request limit of `limit`
+/// bytes (`None`: unlimited): its rows or the refusal, and the most it held beyond its charge
+/// at any moment ([`measure_within`]: a charge released while its memory lives counts there).
+fn path_held(
+    engine: &Engine,
+    (subject, path, object): PathTerms<'_>,
+    limit: Option<usize>,
+) -> (Result<usize, String>, usize) {
+    let snapshot = engine.snapshot();
+    let mut options = QueryOptions::default();
+    options.resources.memory = Envelope::new(limit, None);
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let (subject, object) = (end(subject), end(object));
+    measure_within(&options.resources.memory, || {
+        ctx.path(&subject, path, &object)
+            .map(|solutions| solutions.table.len())
+            .map_err(|error| format!("{:?}", QueryEvaluationError::from(error)))
+    })
+}
+
+/// Guard (the executor memory stack's package fix check r3, EMS-R3-C1, and its related
+/// sites): a path's buffers hold no more than they are charged at any moment, so a query
+/// sharing the server's budget can never take the room of memory that still lives. Each
+/// case runs at `rows` and at `more` rows, and the most it held beyond its charge may not
+/// grow by a byte a row it adds: what grows with the rows is charged throughout (what doesn't
+/// is the plan's bookkeeping, the same at both sizes). `case` makes the store for a size and
+/// names the path pattern, `limit` the request's limit at that size.
+fn holds_nothing_uncharged_per_row(
+    name: &str,
+    (rows, more): (usize, usize),
+    case: impl Fn(usize) -> (Engine, PathCase),
+    limit: impl Fn(usize) -> Option<usize>,
+    answer: impl Fn(Result<usize, String>, usize) -> Result<(), String>,
+) -> Result<(), String> {
+    let held = |n: usize| {
+        let (engine, (subject, path, object)) = case(n);
+        let (rows, excess) = path_held(&engine, (subject, &path, object), limit(n));
+        answer(rows, n).map_err(|wrong| format!("{name} at {n} rows: {wrong}"))?;
+        Ok::<_, String>(excess)
+    };
+    let (few, many) = (held(rows)?, held(more)?);
+    eprintln!("{name}: {few} bytes beyond its charge at {rows} rows, {many} at {more}");
+    match many.saturating_sub(few) < more - rows {
+        true => Ok(()),
+        false => Err(format!(
+            "{name}: held {few} bytes beyond its charge at {rows} rows, {many} at {more}"
+        )),
+    }
+}
+
+/// The answer must be `n` rows.
+fn rows_of(rows: Result<usize, String>, n: usize) -> Result<(), String> {
+    match rows {
+        Ok(rows) if rows == n => Ok(()),
+        other => Err(format!("answered {other:?}, not {n} rows")),
+    }
+}
+
+/// Spec (EMS-R3-C1 and the sites the package fix check r3 named beside it): every row-sized
+/// buffer of a path is charged while it lives, through the move into its table and through a
+/// refusal. Cases, each at two sizes:
+/// - `<h> (p|missing) ?y` over 2^k + 1 statements (T1): the union's vector has room for 2^(k+1)
+///   ends; moved into its column, its whole capacity stays charged (it was released down to
+///   its length, then charged again, at 6449d5cd).
+/// - `?x (p|missing) ?y` (T2): the pairs' columns are made beside the pairs, whose charge
+///   goes only once they are freed.
+/// - T2 under a limit one byte below the pairs and their two columns together (T3): the
+///   union of n pairs has room for n.next_power_of_two() of 16 bytes, each column n ids;
+///   refused at the columns, and the pairs freed before their charge is released.
+/// - `<h> p/q ?y` (T4, a sequence from a node), `?x p/q ?y` (T5, every pair), `?x p/(q/r) ?y`
+///   (T6, a step that isn't a link), `<h> p/q <b>` (T7, both ends bound: the ways counted): a
+///   step's input is freed before its charge goes.
+#[test]
+fn a_paths_buffers_are_charged_while_they_live() {
+    if !alone() {
+        return;
+    }
+    let either = || PropertyPathExpression::Alternative(vec![link("p"), link("missing")]);
+    let fanned =
+        |n: usize| default_store((0..n).map(|i| ("h".to_owned(), "p".to_owned(), format!("n{i}"))));
+    let unlimited = |_| None;
+    let refused = |rows: Result<usize, String>, _| match rows {
+        Err(refusal) if refusal.contains("MemoryLimit") => Ok(()),
+        other => Err(format!("answered {other:?}, not refused")),
+    };
+    // A sequence `p/q` whose middle nodes are `m<i>`: from `h` (T4), or from `x<i>` (T5).
+    let chain = |n: usize, shared_start: bool| {
+        default_store((0..n).flat_map(|i| {
+            let start = match shared_start {
+                true => "h".to_owned(),
+                false => format!("x{i}"),
+            };
+            [
+                (start, "p".to_owned(), format!("m{i}")),
+                (format!("m{i}"), "q".to_owned(), format!("y{i}")),
+            ]
+        }))
+    };
+    let sequence = |steps: Vec<PropertyPathExpression>| PropertyPathExpression::Sequence(steps);
+    let (wide, narrow) = ((32_769, 65_537), (4_097, 8_193));
+    let failures: Vec<String> = [
+        holds_nothing_uncharged_per_row(
+            "T1 <h> (p|missing) ?y",
+            wide,
+            |n| (fanned(n), ("h", either(), "?y")),
+            unlimited,
+            rows_of,
+        ),
+        holds_nothing_uncharged_per_row(
+            "T2 ?x (p|missing) ?y",
+            wide,
+            |n| (fanned(n), ("?x", either(), "?y")),
+            unlimited,
+            rows_of,
+        ),
+        holds_nothing_uncharged_per_row(
+            "T3 ?x (p|missing) ?y refused at its columns",
+            wide,
+            |n| (fanned(n), ("?x", either(), "?y")),
+            |n: usize| Some(n.next_power_of_two() * 16 + 2 * n * 8 - 1),
+            refused,
+        ),
+        holds_nothing_uncharged_per_row(
+            "T4 <h> p/q ?y",
+            narrow,
+            |n| {
+                (
+                    chain(n, true),
+                    ("h", sequence(vec![link("p"), link("q")]), "?y"),
+                )
+            },
+            unlimited,
+            rows_of,
+        ),
+        holds_nothing_uncharged_per_row(
+            "T5 ?x p/q ?y",
+            narrow,
+            |n| {
+                (
+                    chain(n, false),
+                    ("?x", sequence(vec![link("p"), link("q")]), "?y"),
+                )
+            },
+            unlimited,
+            rows_of,
+        ),
+        holds_nothing_uncharged_per_row(
+            "T6 ?x p/(q/r) ?y",
+            narrow,
+            |n| {
+                let engine = default_store(
+                    std::iter::once(("a".to_owned(), "p".to_owned(), "m".to_owned())).chain(
+                        (0..n).flat_map(|i| {
+                            [
+                                ("m".to_owned(), "q".to_owned(), format!("x{i}")),
+                                (format!("x{i}"), "r".to_owned(), format!("y{i}")),
+                            ]
+                        }),
+                    ),
+                );
+                let inner = sequence(vec![link("q"), link("r")]);
+                (engine, ("?x", sequence(vec![link("p"), inner]), "?y"))
+            },
+            unlimited,
+            rows_of,
+        ),
+        holds_nothing_uncharged_per_row(
+            "T7 <h> p/q <b>",
+            narrow,
+            |n| {
+                let engine = default_store((0..n).flat_map(|i| {
+                    [
+                        ("h".to_owned(), "p".to_owned(), format!("m{i}")),
+                        (format!("m{i}"), "q".to_owned(), "b".to_owned()),
+                    ]
+                }));
+                (engine, ("h", sequence(vec![link("p"), link("q")]), "b"))
+            },
+            unlimited,
+            rows_of,
+        ),
+    ]
+    .into_iter()
+    .filter_map(Result::err)
+    .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
