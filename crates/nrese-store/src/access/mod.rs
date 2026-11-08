@@ -181,9 +181,13 @@ pub struct User {
     pub roles: BTreeSet<String>,
     /// The PHC string of its local login's password, if it has one.
     pub password_hash: Option<String>,
-    /// The change that created it, if it was created with a local login: its personal
-    /// space's prefix carries it ([`AccessState::prefix`]). `None` for a user from before
-    /// ids, or one whose name its credentials give (a token's subject).
+    /// The change that created this record; `None` for one from before ids, a continuing
+    /// identity. A record isn't evidence of a person by its password (package review R1-D1):
+    /// this tells a new record from a continuing one.
+    pub created: Option<u64>,
+    /// The change that first gave this record, created after ids, a local login: its
+    /// personal space's prefix carries it ([`AccessState::prefix`]). `None` for a user from
+    /// before ids, or one its credentials name (a token's subject) without a local login.
     pub id: Option<u64>,
 }
 
@@ -478,9 +482,11 @@ impl AccessState {
         }
     }
 
-    /// Gives each workspace this state has and `before` hadn't, and each user it has and
-    /// `before` hadn't that has a local login, the id `number` (the number of the change
-    /// that made this state from `before`; one change creates one record at most).
+    /// Names what the change numbered `number` (which made this state from `before`; one
+    /// change creates one record at most) creates: each workspace this state has and `before`
+    /// hadn't gets the id `number`; each user it has and `before` hadn't gets `created`; and
+    /// each user created after ids that has a local login and no id yet gets the id `number`,
+    /// at creation or at the later change that gives it one (R1-D1).
     fn identify_new(&mut self, before: &AccessState, number: u64) {
         // A personal space's record (its sharing) takes its user's id.
         for (name, workspace) in &mut self.workspaces {
@@ -489,7 +495,10 @@ impl AccessState {
             }
         }
         for (name, user) in &mut self.users {
-            if !before.users.contains_key(name) && user.password_hash.is_some() {
+            if !before.users.contains_key(name) {
+                user.created = Some(number);
+            }
+            if user.created.is_some() && user.id.is_none() && user.password_hash.is_some() {
                 user.id = Some(number);
             }
         }

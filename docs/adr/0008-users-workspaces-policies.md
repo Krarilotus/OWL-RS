@@ -92,16 +92,19 @@ API and the UI manage, with an audit log.
 Removing a workspace removes its record and keeps its graphs and saved queries (for
 administrators). Its name is free again, but its content is not passed on: the owner's
 decision of 26 October (C-204 (b)) binds content to an internal id.
-- The id is the number of the change that created the workspace, or the local user (a
-  user created with a password). Change numbers never repeat, so neither do ids.
+- The id is the number of the change that created the workspace, or that first gave a user
+  record created after ids a local login (at its creation, or later). Change numbers never
+  repeat, so neither do ids. A user record also keeps the number of the change that created
+  it, so a record created anew, with or without a password, is never mistaken for one from
+  before ids.
 - The prefix carries it: `{base}workspace/{name}~{id}/`, and a local user's personal
   space `{base}space/{user}~{id}/`. Names hold no `~`, so the prefixes of two incarnations
   never overlap. Saved queries carry their space's id (`nra:spaceId`) and are found only in
   that incarnation.
 - Workspaces and users from before ids keep their prefixes `…/workspace/{name}/` and
   `…/space/{user}/`, as do users named by their credentials (a token's subject, who is the
-  same person whenever that name comes back) and user records created without a password.
-  No data is migrated.
-- A server older than this change drops the ids at its next access change, and those
-  spaces fall back to the prefixes without one: going back to such a version, once a
-  workspace or a local user with an id exists, is not supported.
+  same person whenever that name comes back) while their record, if any, has no local
+  login. No data is migrated.
+- Going back to a server version from before ids, once a workspace or a user with an id
+  exists, is not supported: such a version doesn't know the ids, may keep some and lose
+  others, and would give id-bearing content the prefixes without one.
