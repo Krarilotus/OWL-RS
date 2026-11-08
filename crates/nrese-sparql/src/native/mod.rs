@@ -2389,14 +2389,13 @@ impl<'a> Context<'a> {
             // `GRAPH ?g` sends patterns with paths graph by graph (`scans_everywhere`).
             GraphScope::Variable(_) => return unsupported("a path read in all graphs at once"),
         };
-        Ok(paths::PathEvaluator {
-            snapshot: &self.snapshot,
-            model: self.model,
+        Ok(paths::PathEvaluator::new(
+            &self.snapshot,
+            self.model,
             graph,
-            fixed: None,
-            cancellation: self.cancellation.as_ref(),
-            closures: Cell::new(0),
-        })
+            self.cancellation.as_ref(),
+            &self.budget,
+        ))
     }
 
     /// The solutions of `path` that can join `bound`: if `bound` binds one of the path's
@@ -2434,6 +2433,7 @@ impl<'a> Context<'a> {
         } else {
             return self.filtered_path(path, None, start);
         };
+        let pairs = pairs.map_err(QueryEvaluationError::MemoryLimit)?;
         let estimate = || self.path_estimate(path, Some(from));
         self.note_closures(&evaluator, path.path, estimate, pairs.len(), start);
         let reached = self.path_pairs(pairs, s, o)?;
@@ -2564,17 +2564,24 @@ impl<'a> Context<'a> {
                 )
             })
         };
+        let refused = QueryEvaluationError::MemoryLimit;
         let solutions = match ends {
             (Err(start), Err(finish)) => {
-                let rows = evaluator.multiplicity(&resolved, start, finish);
+                let rows = evaluator
+                    .solutions(&resolved, start, finish)
+                    .map_err(refused)?;
                 self.path_table(rows.saturating_mul(8), || {
                     let rows = IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows));
                     (Vec::new(), rows)
                 })?
             }
-            (Err(start), Ok(o)) => column(o, evaluator.from(&resolved, start))?,
-            (Ok(s), Err(finish)) => column(s, evaluator.to(&resolved, finish))?,
-            (Ok(s), Ok(o)) => self.path_pairs(evaluator.open(&resolved), s, o)?,
+            (Err(start), Ok(o)) => column(o, evaluator.ends(&resolved, start).map_err(refused)?)?,
+            (Ok(s), Err(finish)) => {
+                column(s, evaluator.starts(&resolved, finish).map_err(refused)?)?
+            }
+            (Ok(s), Ok(o)) => {
+                self.path_pairs(evaluator.pairs(&resolved).map_err(refused)?, s, o)?
+            }
         };
         let estimate = || {
             let pattern = PathPattern {
@@ -5029,6 +5036,7 @@ impl<'a> Context<'a> {
             && let Some(count) = self
                 .path_evaluator()?
                 .count_open(&paths::Path::resolve(path, &self.snapshot))
+                .map_err(QueryEvaluationError::MemoryLimit)?
         {
             if self.trace.is_some() {
                 let detail = format!("COUNT of {path} from the closure's size per component");
