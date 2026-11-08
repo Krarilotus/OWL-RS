@@ -1306,6 +1306,7 @@ name = "nrese-sparql"
 version = "0.1.0"
 dependencies = [
  "geo",
+ "hashbrown 0.16.1",
  "hex",
  "md-5",
  "nrese-engine",
@@ -1398,6 +1399,7 @@ dependencies = [
 name = "nrese-vector"
 version = "0.1.0"
 dependencies = [
+ "nrese-exec",
  "parking_lot",
  "rayon",
 ]

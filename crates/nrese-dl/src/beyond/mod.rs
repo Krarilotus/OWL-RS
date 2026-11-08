@@ -72,6 +72,17 @@ pub enum Verdict {
     Undecided(String),
 }
 
+impl Verdict {
+    /// The verdict without its evidence: what a classification of the input states.
+    pub fn consistency(&self) -> crate::verdict::Verdict {
+        match self {
+            Self::Consistent { .. } => crate::verdict::Verdict::Consistent,
+            Self::Inconsistent { .. } => crate::verdict::Verdict::Inconsistent,
+            Self::Undecided(why) => crate::verdict::Verdict::Unknown(why.clone()),
+        }
+    }
+}
+
 /// The answer for an input with what it rests on.
 #[derive(Debug, Clone)]
 pub struct Decision {

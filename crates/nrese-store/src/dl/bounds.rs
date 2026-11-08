@@ -16,9 +16,12 @@
 //! embedded reads and diagnostic rebuilds. A stopped U1 is unavailable, never complete;
 //! zero disables the store's watch without changing the process owner's fallback.
 
+use nrese_dl::classify::Taxonomy;
 use nrese_dl::limits::Deadline;
+use nrese_exec::cell::{BuildCell, Claim, Kind};
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use nrese_engine::{EncodedQuad, EncodedTriple, ReadModel, Snapshot, TermId, Transaction};
 use nrese_owl::Ontology;
@@ -33,20 +36,86 @@ use crate::StoreService;
 #[path = "bounds_memory_tests.rs"]
 mod memory_tests;
 
+#[cfg(test)]
+#[path = "bounds_lock_tests.rs"]
+mod lock_tests;
+
+/// Where the lock tests hold U1's work mid-way: a hook run once, on the thread doing that
+/// work, for the store whose bounds it names.
+#[cfg(test)]
+pub(crate) mod seam {
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Point {
+        /// A commit's change of U1, U1 taken and the change not begun.
+        Change,
+        /// U1 built afresh for a read, not begun.
+        Build,
+        /// The TBox's taxonomy for a read, not begun.
+        Taxonomy,
+        /// A revision's read view, not begun.
+        View,
+    }
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOK: Mutex<Option<(usize, Point, Hook)>> = Mutex::new(None);
+
+    fn key(bounds: &super::Bounds) -> usize {
+        std::ptr::from_ref(bounds) as usize
+    }
+
+    pub(crate) fn set(bounds: &super::Bounds, point: Point, hook: impl FnOnce() + Send + 'static) {
+        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((key(bounds), point, Box::new(hook)));
+    }
+
+    pub(crate) fn at(bounds: &super::Bounds, point: Point) {
+        let hook = {
+            let mut slot = HOOK.lock().unwrap_or_else(|p| p.into_inner());
+            match &*slot {
+                Some((k, p, _)) if *k == key(bounds) && *p == point => slot.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, _, hook)) = hook {
+            hook();
+        }
+    }
+}
+
 /// U1 at a revision.
 struct State {
     revision: u64,
-    upper: Result<Upper, GaveUp>,
+    /// Shared only with the commit computing its change ([`prepare`]), which lets go
+    /// before [`install`] changes it in place: a read takes what it needs of U1 under the
+    /// bounds' state, never keeping it.
+    upper: Result<Arc<Upper>, GaveUp>,
     /// How U1 got to this revision: `delta` (the delta executor), `rebuilt` (compiled
     /// and evaluated afresh on commit), `read` (afresh for a query), `kept` (U1 gave up
     /// and nothing it is compiled from changed).
     last: &'static str,
+    /// Which compilation of U1 this is: a new one each time U1 is compiled afresh, kept
+    /// by a commit's change. The taxonomy's key.
+    compiled: u64,
     /// The TBox's taxonomy for L's memberships ([`super::lower`]): computed on the first
     /// read, kept as long as U1's compilation (both change only with the schema).
-    taxonomy: std::sync::OnceLock<Arc<nrese_dl::classify::Taxonomy>>,
+    taxonomy: Option<Arc<Taxonomy>>,
     /// The ontology is in OWL 2 RL: the RL rules decide it (theorem PR1 of OWL 2
     /// Profiles: complete for its assertions and its consistency), and U1 isn't compiled.
     rules: bool,
+}
+
+/// Installs `state` unless the bounds describe its revision or a later one already: what
+/// is published only moves forward, and U1 of a revision, once there, stands.
+fn publish(slot: &mut Option<State>, state: State) {
+    if slot.as_ref().is_none_or(|s| s.revision < state.revision) {
+        *slot = Some(state);
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// The route the ontology's profile gives (`nrese_owl::profile`): an OWL 2 RL ontology
@@ -56,18 +125,38 @@ fn routed_to_rules(ontology: &Ontology) -> bool {
 }
 
 /// U1's place on the RL route: not compiled.
-fn not_compiled() -> Result<Upper, GaveUp> {
-    Err(GaveUp(
-        "not compiled: the ontology is in OWL 2 RL, which the RL rules decide".to_owned(),
-    ))
+fn not_compiled() -> GaveUp {
+    GaveUp("not compiled: the ontology is in OWL 2 RL, which the RL rules decide".to_owned())
 }
 
 /// The store's bounds: U1 for the revision it describes, and the read view of the latest
 /// revision a query asked for.
+///
+/// **No lock here is held across Rayon work, a wait, or a call into the engine** (design
+/// note `2026-11-02-p2-c6b-u1-design.md`, U1-I): under `state` and `view` runs only serial
+/// work over what is in memory. U1's change, its builds, its taxonomy and a view's runs
+/// all run with none held, so whoever waits for one of these locks waits for a holder
+/// that waits for nothing. A build several readers want is built once through a
+/// [`BuildCell`]: a reader off the pool waits for it; one on a Rayon worker builds its
+/// own (the bounded rule, `research-designs.md` §8). Lock order: the engine's writer slot,
+/// the pipeline's ground cache, then `state` (a leaf); a cell's own lock, then `view` or
+/// `state`; every dictionary lock after them.
 #[derive(Default)]
 pub(crate) struct Bounds {
     state: Mutex<Option<State>>,
     view: Mutex<Option<Arc<View>>>,
+    /// Read views being built, by revision (U1 built afresh among them).
+    views: BuildCell<u64, View>,
+    /// Taxonomies being built, by U1's compilation ([`State::compiled`]).
+    taxonomies: BuildCell<u64, Taxonomy>,
+    compilations: AtomicU64,
+}
+
+impl Bounds {
+    /// A new compilation's number.
+    fn compiled(&self) -> u64 {
+        self.compilations.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 impl std::fmt::Debug for Bounds {
@@ -153,15 +242,14 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
     let deadline = Deadline::after(store.config().dl.timeout);
     let memory = store.memory_stop();
     let stop = move || stop() || deadline.passed() || memory.exceeded();
-    let state = store
-        .dl()
-        .bounds
-        .state
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    let current = state.as_ref().filter(|s| s.revision == base);
+    // U1 at the base, taken under the state and changed without it (U1-I): readers never
+    // wait for a commit's (parallel) change.
+    let current: Option<(bool, Result<Arc<Upper>, GaveUp>)> = lock(&store.dl().bounds.state)
+        .as_ref()
+        .filter(|s| s.revision == base)
+        .map(|s| (s.rules, s.upper.clone()));
     let asserted: Vec<Triple> = tx.inserted().chain(tx.deleted()).map(quad_triple).collect();
-    if let Some(State { rules: true, .. }) = current
+    if let Some((true, _)) = current
         && !asserted.iter().any(|t| changes_schema(tx, *t))
     {
         return Preparation {
@@ -172,8 +260,8 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
             ontology: None,
         };
     }
-    if let Some(State { upper, .. }) = current {
-        match upper {
+    if let Some((_, upper)) = current {
+        match upper.as_deref() {
             // A U1 with equality classes is evaluated afresh (`Upper`'s module docs).
             Ok(upper)
                 if upper.classes().is_empty()
@@ -191,6 +279,8 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
                     .map(quad_triple)
                     .chain(tx.inferred_deleted().map(triple))
                     .collect();
+                #[cfg(test)]
+                seam::at(&store.dl().bounds, seam::Point::Change);
                 match upper.change(&pending, &inserted, &deleted, &stop) {
                     Ok(change) if !change.merges() => {
                         return Preparation {
@@ -227,7 +317,6 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
             _ => {}
         }
     }
-    drop(state);
     source::intern_vocabulary(tx);
     let ontology = source::read_pending(tx);
     if routed_to_rules(&ontology) && ontology.diagnostics.iter().all(|d| !d.is_fatal()) {
@@ -302,41 +391,48 @@ fn in_view(view: &Snapshot, [s, p, o]: Triple) -> bool {
 
 /// Installs a commit's preparation for its new `revision`.
 pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: u64) {
-    let mut state = store
-        .dl()
-        .bounds
-        .state
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let bounds = &store.dl().bounds;
+    let mut state = lock(&bounds.state);
     match preparation.prepared {
-        Prepared::Rebuilt(upper) => {
-            *state = Some(State {
+        Prepared::Rebuilt(upper) => publish(
+            &mut state,
+            State {
                 revision,
-                upper: *upper,
+                upper: upper.map(Arc::new),
                 last: "rebuilt",
-                taxonomy: std::sync::OnceLock::new(),
+                compiled: bounds.compiled(),
+                taxonomy: None,
                 rules: false,
-            });
-        }
-        Prepared::Rules => {
-            *state = Some(State {
+            },
+        ),
+        Prepared::Rules => publish(
+            &mut state,
+            State {
                 revision,
-                upper: not_compiled(),
+                upper: Err(not_compiled()),
                 last: "rules",
-                taxonomy: std::sync::OnceLock::new(),
+                compiled: bounds.compiled(),
+                taxonomy: None,
                 rules: true,
-            });
-        }
+            },
+        ),
         Prepared::Delta(change) => match state.as_mut() {
             Some(s) if s.revision == preparation.base => {
                 if let Ok(upper) = &mut s.upper {
+                    // Nobody else holds it: the commit's preparation let go, and reads
+                    // never keep it (`State::upper`).
+                    let Some(upper) = Arc::get_mut(upper) else {
+                        debug_assert!(false, "U1 shared at its commit's install");
+                        *state = None;
+                        return;
+                    };
                     upper.apply(*change);
                 }
                 s.revision = revision;
                 s.last = "delta";
             }
-            // A query rebuilt U1 for the new revision meanwhile: it stands.
-            Some(s) if s.revision == revision => {}
+            // A query built U1 for the new revision (or a later one) meanwhile: it stands.
+            Some(s) if s.revision >= revision => {}
             _ => *state = None,
         },
         Prepared::Unavailable => {
@@ -351,69 +447,259 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
 }
 
 /// The read view of the store's latest revision, and its snapshot: U1 built afresh if it
-/// doesn't describe that revision (O(the closure)), the view once per revision.
+/// doesn't describe that revision (O(the closure)), the view once per revision. A view
+/// already built is returned without waiting for anything. A missing one is built once:
+/// a read off the pool waits for the build under way, one on a Rayon worker builds its
+/// own (U1-B).
 pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
     let bounds = &store.dl().bounds;
-    let mut state = bounds.state.lock().unwrap_or_else(|p| p.into_inner());
-    let snapshot = store.engine().snapshot();
-    let revision = snapshot.revision();
-    if let Some(view) = &*bounds.view.lock().unwrap_or_else(|p| p.into_inner())
-        && view.revision == revision
-    {
-        return (snapshot, Arc::clone(view));
-    }
-    if state.as_ref().is_none_or(|s| s.revision != revision) {
-        let tx = store.engine().speculative();
-        let replica = store.dl().replica();
-        if !replica {
-            source::intern_vocabulary(&tx);
-        }
-        let ontology = source::read_snapshot(&snapshot);
-        let rules =
-            routed_to_rules(&ontology) && ontology.diagnostics.iter().all(|d| !d.is_fatal());
-        let upper = match rules {
-            true => not_compiled(),
-            false => {
-                let normalised = nrese_owl::normalise(&ontology);
-                let deadline = Deadline::after(store.config().dl.timeout);
-                let memory = store.memory_stop();
-                let stop = move || deadline.passed() || memory.exceeded();
-                let resolve = |t: nrese_rdf::TermRef<'_>| source::resolve(replica, &tx, t);
-                Upper::build(&ontology, &normalised, &snapshot, &resolve, &stop)
-            }
+    loop {
+        let snapshot = store.engine().snapshot();
+        let revision = snapshot.revision();
+        let cached = || {
+            lock(&bounds.view)
+                .as_ref()
+                .filter(|view| view.revision == revision)
+                .map(Arc::clone)
         };
-        *state = Some(State {
-            revision,
-            upper,
-            last: match rules {
-                true => "rules",
-                false => "read",
+        if let Some(view) = cached() {
+            return (snapshot, view);
+        }
+        let built = match bounds
+            .views
+            .claim(revision, Kind::Opaque, || cached().map(Some))
+        {
+            Claim::Build(builder) => {
+                let built = read(store, &snapshot);
+                builder.finish(built.clone());
+                built
+            }
+            Claim::Wait(flight) => match flight.wait() {
+                Ok(built) => built,
+                Err(nrese_exec::cell::Busy) => read(store, &snapshot),
             },
-            taxonomy: std::sync::OnceLock::new(),
-            rules,
-        });
+        };
+        // None: the bounds describe a later revision than the snapshot now, or the build
+        // failed. Again, from the latest snapshot.
+        if let Some(view) = built {
+            return (snapshot, view);
+        }
     }
-    let s = state.as_ref().expect("built above");
-    let taxonomy = match &s.upper {
-        Ok(_) if !s.rules => Some(Arc::clone(s.taxonomy.get_or_init(|| {
-            let ontology = super::query::ontology_at(store, &snapshot);
-            Arc::new(super::lower::tbox_taxonomy(store, &ontology))
-        }))),
-        _ => None,
-    };
-    let view = Arc::new(build_view(&snapshot, s, taxonomy.as_deref()));
-    *bounds.view.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&view));
-    (snapshot, view)
 }
 
-fn build_view(
+/// The view of `snapshot`'s revision, published; `None` if the bounds describe a later
+/// revision. U1 is the bounds' where they describe the revision, read under their state;
+/// else built afresh here and published. No lock is held across U1's build, its taxonomy
+/// or the view's runs (U1-I).
+fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
+    let bounds = &store.dl().bounds;
+    let revision = snapshot.revision();
+    // The bounds' U1 at the revision: its compilation, route, `rdf:type`, taxonomy.
+    let found = {
+        let state = lock(&bounds.state);
+        match state.as_ref() {
+            Some(s) if s.revision > revision => return None,
+            Some(s) if s.revision == revision => Some((
+                s.compiled,
+                s.rules,
+                s.upper.as_ref().ok().map(|u| u.program.names.rdf_type),
+                s.taxonomy.clone(),
+            )),
+            _ => None,
+        }
+    };
+    let parts = match found {
+        Some((compiled, rules, rdf_type, kept)) => {
+            let lower = match rdf_type {
+                Some(rdf_type) if !rules => {
+                    let taxonomy = taxonomy(store, snapshot, compiled, kept);
+                    super::lower::memberships(snapshot, &taxonomy, rdf_type)
+                        .into_iter()
+                        .collect()
+                }
+                _ => HashSet::new(),
+            };
+            // Serial: what the view takes of U1, under the state (a commit's install
+            // may change U1 in place once it is let go).
+            let state = lock(&bounds.state);
+            let s = state
+                .as_ref()
+                .filter(|s| s.revision == revision && s.compiled == compiled)?;
+            parts(snapshot, s.revision, s.upper.as_deref(), s.rules, lower)
+        }
+        None => {
+            let (upper, rules) = afresh(store, snapshot);
+            let compiled = bounds.compiled();
+            let taxonomy = match &upper {
+                Ok(_) if !rules => Some(taxonomy(store, snapshot, compiled, None)),
+                _ => None,
+            };
+            let lower = match (&upper, &taxonomy) {
+                (Ok(upper), Some(taxonomy)) => {
+                    super::lower::memberships(snapshot, taxonomy, upper.program.names.rdf_type)
+                        .into_iter()
+                        .collect()
+                }
+                _ => HashSet::new(),
+            };
+            let parts = parts(snapshot, revision, upper.as_ref(), rules, lower);
+            let last = match rules {
+                true => "rules",
+                false => "read",
+            };
+            let state = State {
+                revision,
+                upper: upper.map(Arc::new),
+                last,
+                compiled,
+                taxonomy,
+                rules,
+            };
+            publish(&mut lock(&bounds.state), state);
+            parts
+        }
+    };
+    #[cfg(test)]
+    seam::at(bounds, seam::Point::View);
+    let view = Arc::new(assemble(snapshot, parts));
+    let mut cached = lock(&bounds.view);
+    if cached.as_ref().is_none_or(|v| v.revision < view.revision) {
+        *cached = Some(Arc::clone(&view));
+    }
+    Some(view)
+}
+
+/// U1 compiled and evaluated afresh over `snapshot` (or, `true`, the RL route's place).
+fn afresh(store: &StoreService, snapshot: &Snapshot) -> (Result<Upper, GaveUp>, bool) {
+    let tx = store.engine().speculative();
+    let replica = store.dl().replica();
+    if !replica {
+        source::intern_vocabulary(&tx);
+    }
+    let ontology = source::read_snapshot(snapshot);
+    if routed_to_rules(&ontology) && ontology.diagnostics.iter().all(|d| !d.is_fatal()) {
+        return (Err(not_compiled()), true);
+    }
+    let normalised = nrese_owl::normalise(&ontology);
+    let deadline = Deadline::after(store.config().dl.timeout);
+    let memory = store.memory_stop();
+    let stop = move || deadline.passed() || memory.exceeded();
+    let resolve = |t: nrese_rdf::TermRef<'_>| source::resolve(replica, &tx, t);
+    #[cfg(test)]
+    seam::at(&store.dl().bounds, seam::Point::Build);
+    let upper = Upper::build(&ontology, &normalised, snapshot, &resolve, &stop);
+    (upper, false)
+}
+
+/// The TBox's taxonomy for U1's compilation `compiled` (`kept`: the bounds' own), built
+/// once per compilation: a read off the pool waits for the build under way, one on a
+/// Rayon worker builds its own (U1-B).
+fn taxonomy(
+    store: &StoreService,
     snapshot: &Snapshot,
-    state: &State,
-    taxonomy: Option<&nrese_dl::classify::Taxonomy>,
-) -> View {
-    if state.rules {
-        return View {
-            revision: state.revision,
+    compiled: u64,
+    kept: Option<Arc<Taxonomy>>,
+) -> Arc<Taxonomy> {
+    if let Some(taxonomy) = kept {
+        return taxonomy;
+    }
+    let bounds = &store.dl().bounds;
+    let build = || {
+        #[cfg(test)]
+        seam::at(bounds, seam::Point::Taxonomy);
+        let ontology = super::query::ontology_at(store, snapshot);
+        Arc::new(super::lower::tbox_taxonomy(store, &ontology))
+    };
+    let kept = || {
+        lock(&bounds.state)
+            .as_ref()
+            .filter(|s| s.compiled == compiled)
+            .and_then(|s| s.taxonomy.clone())
+    };
+    loop {
+        match bounds
+            .taxonomies
+            .claim(compiled, Kind::Opaque, || kept().map(Some))
+        {
+            Claim::Build(builder) => {
+                let taxonomy = build();
+                if let Some(s) = lock(&bounds.state).as_mut()
+                    && s.compiled == compiled
+                {
+                    s.taxonomy.get_or_insert_with(|| Arc::clone(&taxonomy));
+                }
+                builder.finish(Some(Arc::clone(&taxonomy)));
+                return taxonomy;
+            }
+            Claim::Wait(flight) => match flight.wait() {
+                Ok(Some(taxonomy)) => return taxonomy,
+                // The build failed: again.
+                Ok(None) => {}
+                Err(nrese_exec::cell::Busy) => return build(),
+            },
+        }
+    }
+}
+
+/// What a view takes of U1 ([`parts`]), before its runs are built ([`assemble`]).
+struct Parts {
+    /// The view, its snapshots still `snapshot` itself.
+    view: View,
+    /// L's memberships from the taxonomy.
+    lower: Vec<EncodedQuad>,
+    upper: Option<UpperParts>,
+}
+
+/// What the upper view takes of U1.
+struct UpperParts {
+    /// L's memberships over representatives (`None`: `Parts::lower` as they are).
+    over_representatives: Option<Vec<EncodedQuad>>,
+    /// U1's facts beyond them.
+    facts: Vec<EncodedQuad>,
+    /// `owl:sameAs`, where U1 has classes.
+    same_as: Option<u64>,
+}
+
+/// The view's runs, from what it took of U1: Rayon work, with no lock held.
+fn assemble(snapshot: &Snapshot, parts: Parts) -> View {
+    let Parts {
+        mut view,
+        lower,
+        upper,
+    } = parts;
+    if !lower.is_empty() {
+        view.lower = snapshot.with_inferred_added(&lower);
+    }
+    if let Some(UpperParts {
+        over_representatives,
+        facts,
+        same_as,
+    }) = upper
+    {
+        let mut quads = over_representatives.unwrap_or(lower);
+        quads.extend(facts);
+        let upper_view = snapshot.with_inferred_added(&quads);
+        // Read expanded to every identity of U1's classes (the stack keeps representatives).
+        view.upper = Some(match same_as {
+            None => upper_view,
+            Some(same_as) => upper_view.with_equality(Some(TermId::from_raw(same_as))),
+        });
+    }
+    view
+}
+
+/// What a view of `revision` takes of U1 and of L's memberships `lower`: serial, O(U1's
+/// facts), nothing waited for (U1-I).
+fn parts(
+    snapshot: &Snapshot,
+    revision: u64,
+    upper: Result<&Upper, &GaveUp>,
+    rules: bool,
+    lower: HashSet<Triple>,
+) -> Parts {
+    if rules {
+        let view = View {
+            revision,
             lower: snapshot.clone(),
             lower_facts: 0,
             upper: None,
@@ -427,12 +713,17 @@ fn build_view(
             proves_consistency: true,
             rules: true,
         };
+        return Parts {
+            view,
+            lower: Vec::new(),
+            upper: None,
+        };
     }
-    let upper = match &state.upper {
+    let upper = match upper {
         Ok(upper) => upper,
         Err(GaveUp(why)) => {
-            return View {
-                revision: state.revision,
+            let view = View {
+                revision,
                 lower: snapshot.clone(),
                 lower_facts: 0,
                 upper: None,
@@ -446,15 +737,15 @@ fn build_view(
                 proves_consistency: false,
                 rules: false,
             };
+            return Parts {
+                view,
+                lower: Vec::new(),
+                upper: None,
+            };
         }
     };
     let rdf_type = upper.program.names.rdf_type;
     let clash = upper.program.names.clash;
-    let lower: HashSet<Triple> = taxonomy
-        .map(|t| super::lower::memberships(snapshot, t, rdf_type))
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
     let encode = |[s, p, o]: Triple| {
         EncodedTriple::new(
             TermId::from_raw(s),
@@ -465,11 +756,8 @@ fn build_view(
     };
     let lower_quads: Vec<EncodedQuad> = lower.iter().map(|&t| encode(t)).collect();
     let mut view = View {
-        revision: state.revision,
-        lower: match lower_quads.is_empty() {
-            true => snapshot.clone(),
-            false => snapshot.with_inferred_added(&lower_quads),
-        },
+        revision,
+        lower: snapshot.clone(),
         lower_facts: lower.len(),
         upper: None,
         unavailable: (!upper.program.incomplete.is_empty()).then(|| {
@@ -498,13 +786,13 @@ fn build_view(
     let named = |t: u64| !upper.is_internal(t) || named_classes.contains(&t);
     // L's memberships beside it, over representatives as the expanded reads want them.
     let classes = upper.classes();
-    let mut quads: Vec<EncodedQuad> = match classes.is_empty() {
-        true => lower_quads,
-        false => lower
+    let over_representatives: Option<Vec<EncodedQuad>> = (!classes.is_empty()).then(|| {
+        lower
             .iter()
             .map(|&[s, p, o]| encode([classes.representative(s), p, classes.representative(o)]))
-            .collect(),
-    };
+            .collect()
+    });
+    let mut quads: Vec<EncodedQuad> = Vec::with_capacity(upper.stack.len());
     for [s, p, o] in upper.stack.iter() {
         // L's memberships from the taxonomy are certain: no gap.
         if lower.contains(&[s, p, o]) {
@@ -533,13 +821,16 @@ fn build_view(
         }
         quads.push(encode([s, p, o]));
     }
-    let upper_view = snapshot.with_inferred_added(&quads);
-    // Read expanded to every identity of U1's classes (the stack keeps representatives).
-    view.upper = Some(match upper.classes().is_empty() {
-        true => upper_view,
-        false => upper_view.with_equality(Some(TermId::from_raw(upper.same_as()))),
-    });
-    view
+    let same_as = (!classes.is_empty()).then(|| upper.same_as());
+    Parts {
+        view,
+        lower: lower_quads,
+        upper: Some(UpperParts {
+            over_representatives,
+            facts: quads,
+            same_as,
+        }),
+    }
 }
 
 /// The bounds at the store's latest revision, for reports and tests.
@@ -567,15 +858,10 @@ pub struct BoundsReport {
 /// The bounds at the latest revision (U1 built afresh if it doesn't describe it).
 pub(crate) fn report(store: &StoreService) -> BoundsReport {
     let (_, view) = self::view(store);
-    let state = store
-        .dl()
-        .bounds
-        .state
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let state = lock(&store.dl().bounds.state);
     let current = state.as_ref().filter(|s| s.revision == view.revision);
     let last = current.map_or("read", |s| s.last);
-    let upper = current.and_then(|s| s.upper.as_ref().ok());
+    let upper = current.and_then(|s| s.upper.as_deref().ok());
     let literals_by_value = upper.map_or(0, Upper::literals_by_value);
     let (equality_classes, largest_class) = upper.map_or((0, 0), |u| {
         let sizes = u.classes().classes().map(|(_, members)| members.len());
@@ -627,12 +913,7 @@ pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[Str
         upper.stack.iter().collect()
     } else {
         let _ = view(store);
-        let state = store
-            .dl()
-            .bounds
-            .state
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let state = lock(&store.dl().bounds.state);
         state.as_ref()?.upper.as_ref().ok()?.stack.iter().collect()
     };
     let mut out: Vec<[String; 3]> = facts.into_iter().map(|t| t.map(decode)).collect();
