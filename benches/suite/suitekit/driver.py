@@ -332,18 +332,20 @@ class Suite:
             self.made_images.append(image)
         return True
 
-    def image_source(self, image: str, image_id: str):
+    def image_source(self, image: str, image_id: str, compiles_source: bool = False):
         """Where the image with this id came from, read off that id (the one the run's containers
         run, its pin), never off a tag that may name another by now (P1b review r1 F1): its build
         label; or, for a tag with a digest pin (images.toml), "pulled, pinned DIGEST" when that id
-        holds the pin (P1c); else unknown, with why. Unreadable is unknown with its reason, never an
-        exception: a receipt is written on a host without docker too (#161's Windows gate,
-        gate-windows-59532fff57-1794140734)."""
-        if (image, image_id) not in self.image_sources:
-            self.image_sources[(image, image_id)] = self._image_source(image, image_id)
-        return self.image_sources[(image, image_id)]
+        holds the pin (P1c); else unknown, with why. An image that `compiles_source` (its adapter's
+        script_builds) is known only with its source commit label too (review image-source-commit
+        r1 F2). Unreadable is unknown with its reason, never an exception: a receipt is written on
+        a host without docker too (#161's Windows gate, gate-windows-59532fff57-1794140734)."""
+        key = (image, image_id, compiles_source)
+        if key not in self.image_sources:
+            self.image_sources[key] = self._image_source(image, image_id, compiles_source)
+        return self.image_sources[key]
 
-    def _image_source(self, image: str, image_id: str):
+    def _image_source(self, image: str, image_id: str, compiles_source: bool):
         try:
             label = run_quiet(["docker", "image", "inspect", "--format",
                                f'{{{{index .Config.Labels "{IMAGE_LABEL}"}}}}|'
@@ -355,8 +357,13 @@ class Suite:
             return receipts.unknown(f"docker image inspect failed (exit {label.returncode}): "
                                     f"{said[-1] if said else 'no output'}")
         found, _, commit = label.stdout.strip().replace("<no value>", "").partition("|")
+        if found and commit:
+            return f"built from {found}, source commit {commit}"
+        if found and compiles_source:
+            return receipts.unknown(f"built from {found}, but no source commit label: its adapter builds it from "
+                                    "a source chosen apart from its context (script_builds)")
         if found:
-            return f"built from {found}" + (f", source commit {commit}" if commit else "")
+            return f"built from {found}"
         pin = image_pins(self.root).get(image)
         if not pin:
             return receipts.unknown("no build label and no digest pin (benches/suite/images.toml)")
@@ -988,13 +995,14 @@ class Suite:
                     if (r.workload, r.tier, r.system) == (plan.workload, plan.tier, key)]
             pair = summarise(rows).get((plan.workload, plan.tier, key))
             compiled = isinstance(system, Nrese) or plan.kind == "cycle"
+            scripted = set() if child else {tag for tag, _, _ in system.script_builds(ctx)}
             mine = receipts.unknown(f"a {plan.kind} plan's: its child's, not recorded here")
             out[cell] = {
                 **attempts[cell], "complete": True, "commit": commit, "dirty": entry["git"].get("dirty"),
                 "code": receipts.object_ids(self.root, commit, receipts.code_paths(self.root, commit)
                                             + (receipts.BUILD_PATHS if compiled or child else ())),
                 "images": mine if child else {
-                    i: {"id": pins[i], "source": self.image_source(i, pins[i])} if pins.get(i) else
+                    i: {"id": pins[i], "source": self.image_source(i, pins[i], i in scripted)} if pins.get(i) else
                        {"id": receipts.unknown("not in the run's pin map"),
                         "source": receipts.unknown("no image pinned: none known to have run")}
                     for i in sorted({*system.images(ctx), *(i for i, _ in system.builds())})},
