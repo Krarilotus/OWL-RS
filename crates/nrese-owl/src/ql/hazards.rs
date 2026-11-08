@@ -291,8 +291,8 @@ fn terms(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
 pub(crate) struct Read<'a> {
     /// The conclusions it doesn't read, each with its polarity: its ledger.
     pub unread: &'a std::collections::BTreeSet<(ExprId, bool)>,
-    /// The axioms it reads only in part or not at all, by index.
-    pub partial: &'a std::collections::BTreeSet<usize>,
+    /// The axioms it reads only in part or not at all, by index, ascending.
+    pub partial: &'a [usize],
     /// Whether the closure is OWL 2 RL's (`Closure::lists`); QL's otherwise.
     pub rl: bool,
 }
@@ -548,9 +548,10 @@ pub(crate) fn hazards(
     let mut outside_global: Option<Hazard> = None;
     // Taken only where an axiom is outside: a schema without one pays nothing for it.
     let mut equating_properties = None;
-    for (i, axiom) in o.axioms.iter().enumerate() {
-        // Read whole, the rewriting answers it; in the closure's profile, its rules do.
-        if !read.partial.contains(&i) || crate::profile::covered(o, axiom, rl) {
+    // Read whole, the rewriting answers an axiom; in the closure's profile, its rules do.
+    for &i in read.partial {
+        let axiom = &o.axioms[i];
+        if crate::profile::covered(o, axiom, rl) {
             continue;
         }
         let concluded = crate::profile::concluded_terms(o, axiom, rl);
