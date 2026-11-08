@@ -723,7 +723,7 @@ fn support_sets_run(
                 }
                 // The copies `minimal` takes, charged first (sol-loop r1 S1).
                 let copied = words(kept.iter().chain(group.iter().map(|(_, set, _)| set)));
-                let chosen = Charged::with_capacity(run, kept.len() + group.len(), copied)
+                let chosen = Charged::with_capacity(run, kept.len() + group.len(), cap, copied)
                     .and_then(|mut all| {
                         kept.iter().for_each(|set| all.push(set.clone()));
                         group.iter().for_each(|(_, set, _)| all.push(set.clone()));
@@ -1424,10 +1424,19 @@ struct Charged<'a> {
 }
 
 impl<'a> Charged<'a> {
-    /// Room for `n` sets and `extra` bytes beside them (their words, `minimal`'s output),
-    /// charged before anything is allocated.
-    fn with_capacity(run: &Run<'a>, n: usize, extra: usize) -> Result<Self, BudgetExceeded> {
-        let charge = run.room(slots(n).saturating_add(extra))?;
+    /// Room for `n` sets, for the output of the [`Self::minimal`] to come at `cap` (0: none
+    /// comes), and `words` bytes beside them (the sets' words), charged before anything is
+    /// allocated: the output's room is the type's to charge, not each caller's to remember.
+    fn with_capacity(
+        run: &Run<'a>,
+        n: usize,
+        cap: usize,
+        words: usize,
+    ) -> Result<Self, BudgetExceeded> {
+        let bytes = slots(n)
+            .saturating_add(slots(n.min(cap)))
+            .saturating_add(words);
+        let charge = run.room(bytes)?;
         Ok(Self {
             sets: Vec::with_capacity(n),
             charge,
@@ -1466,6 +1475,7 @@ struct Gathered<'a> {
     /// Before `words`: fields drop in order.
     sets: ChargedVec<GraphSet, &'a Budget>,
     words: Reservation<&'a Budget>,
+    budget: &'a Budget,
 }
 
 impl<'a> Gathered<'a> {
@@ -1473,17 +1483,28 @@ impl<'a> Gathered<'a> {
         Self {
             sets: ChargedVec::new(budget),
             words: Reservation::new(budget),
+            budget,
         }
     }
 
-    /// `held`'s sets moved in: their words charged here first, their list's room too.
-    fn take(&mut self, held: Held<'a>) -> Result<(), BudgetExceeded> {
-        self.words.charge(words(&held.sets))?;
-        let annotation = held.into_retained();
-        let n = annotation.sets.len();
+    /// `held`'s sets moved in, `held` whole until they are (sol-loop r9 S5): the list's room
+    /// charged first; refused, or unwinding, `held` drops as it was, its sets before their
+    /// charge. Moved, its old list is freed: of its charge, its slots' part is released and
+    /// its sets' words' part handed over, not charged again.
+    fn take(&mut self, mut held: Held<'a>) -> Result<(), BudgetExceeded> {
+        let n = held.sets.len();
+        let moved_words = words(&held.sets);
+        let sets = &mut held.annotation.sets;
         self.sets.fill(n, |room| {
-            annotation.sets.into_iter().for_each(|set| room.push(set))
-        })
+            std::mem::take(sets)
+                .into_iter()
+                .for_each(|set| room.push(set))
+        })?;
+        let mut words_part = Reservation::adopt(self.budget, held._charge.transfer());
+        words_part.resize(moved_words)?;
+        let mine = std::mem::replace(&mut self.words, Reservation::new(self.budget));
+        self.words = Reservation::adopt(self.budget, mine.transfer() + words_part.transfer());
+        Ok(())
     }
 
     /// `minimal` of the sets (its output's slots charged first, then every charge they hold
@@ -1492,7 +1513,7 @@ impl<'a> Gathered<'a> {
     fn choose(self, cap: usize, run: &Run<'a>) -> Result<Held<'a>, BudgetExceeded> {
         // Refused here, the whole drops: the list before the words.
         let out = run.room(slots(self.sets.len().min(cap)))?;
-        let Self { sets, words } = self;
+        let Self { sets, words, .. } = self;
         let (sets, slots_held) = sets.into_parts();
         let bytes = out.transfer() + slots_held.transfer() + words.transfer();
         Charged {
@@ -1695,7 +1716,7 @@ fn premise_sets_from<'a, L: Lookup + ?Sized>(
     }
     // The product as it stands, with its charge, until the next replaces it (sol-loop r5 S1).
     let mut product = {
-        let mut copy = Charged::with_capacity(run, start.sets.len(), words(&start.sets))?;
+        let mut copy = Charged::with_capacity(run, start.sets.len(), 0, words(&start.sets))?;
         start.sets.iter().for_each(|set| copy.push(set.clone()));
         Held {
             annotation: Annotation {
@@ -1713,10 +1734,12 @@ fn premise_sets_from<'a, L: Lookup + ?Sized>(
         // Charged first: the unions (their slots, at most the longer operand's words each)
         // and `minimal`'s output beside them; past what a budget can count, refused.
         let n = product.sets.len().saturating_mul(own.sets.len());
-        let extra = slots(n.min(cap))
-            .saturating_add(own.sets.len().saturating_mul(words(&product.sets)))
+        let unions_words = own
+            .sets
+            .len()
+            .saturating_mul(words(&product.sets))
             .saturating_add(product.sets.len().saturating_mul(words(own.sets.iter())));
-        let mut next = Charged::with_capacity(run, n, extra)?;
+        let mut next = Charged::with_capacity(run, n, cap, unions_words)?;
         for a in &product.sets {
             for b in own.sets.iter() {
                 next.push(a.union(b));
@@ -1828,6 +1851,34 @@ mod tests {
             all.choose(8, &run).is_err()
         });
         assert!(refused, "no room for the output");
+        assert_eq!(excess, 0, "{excess} bytes held beyond the charge");
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// Sol-loop r9 S5, by the allocator: a support algebra result moved into the sets a
+    /// grounding gathers stays charged until its old list is freed, and the choice after
+    /// holds nothing beyond its charge either.
+    #[test]
+    fn a_gathered_result_stays_charged_until_its_list_is_freed() {
+        use super::{Charged, Gathered, GraphSet, Limits, Run, words};
+        use nrese_exec::{Budget, measure};
+        use std::sync::Arc;
+        if !measure::alone() {
+            return;
+        }
+        // Eight singleton sets past 128 graphs: a result of eight, all kept.
+        let sets: Vec<GraphSet> = (0..8).map(|g| GraphSet::of(200 + g)).collect();
+        let budget = Arc::new(Budget::unlimited());
+        let (kept, excess) = measure::measure_within(&budget, || {
+            let run = Run::new(Limits::unlimited(&budget));
+            let mut made = Charged::with_capacity(&run, sets.len(), 8, words(&sets)).unwrap();
+            sets.iter().for_each(|set| made.push(set.clone()));
+            let held = made.minimal(8, &|_| false).unwrap();
+            let mut all = Gathered::new(&budget);
+            all.take(held).unwrap();
+            all.choose(8, &run).unwrap().sets.len()
+        });
+        assert_eq!(kept, 8);
         assert_eq!(excess, 0, "{excess} bytes held beyond the charge");
         assert_eq!(budget.used(), 0);
     }
