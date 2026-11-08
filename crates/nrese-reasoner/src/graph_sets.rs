@@ -2275,6 +2275,116 @@ mod tests {
         assert!(failed.is_empty(), "{failed:#?}");
     }
 
+    /// Merge-time count of #159 (`p2c5-r4-memcount1-2df9ed96`, the master 12:50): a round's
+    /// parts gathered into one hold their entries once, as the base's one buffer did. Where a
+    /// part has room for all of them, gathering allocates nothing; where none has, at most one
+    /// buffer of their total. Each row on its own, by the allocator, with every entry kept
+    /// once and sorted.
+    #[test]
+    fn gathered_parts_hold_their_entries_once() {
+        use super::found::Entry;
+        use super::{Found, GraphSet, Limits, Run};
+        use nrese_exec::{Budget, measure};
+        use std::sync::Arc;
+        if !measure::alone() {
+            return;
+        }
+        let entry = |i: u64| -> Entry { ([i, 2, 3], GraphSet::of((i % 64) as u32), false) };
+        // A row, each part's (entries, room for), and what gathering may allocate at most.
+        type Row = (&'static str, Vec<(u64, usize)>, usize);
+        let slot = size_of::<Entry>();
+        let rows: [Row; 2] = [
+            ("a part has room for all", vec![(600, 1024), (100, 100)], 0),
+            ("none has room", vec![(500, 500), (500, 500)], 1000 * slot),
+        ];
+        let mut failed = Vec::new();
+        for (what, shape, most) in rows {
+            let budget = Arc::new(Budget::unlimited());
+            let mut next = 0u64;
+            let parts: Vec<Found<'_>> = shape
+                .iter()
+                .map(|&(n, room)| {
+                    let mut part = Found::new(&budget);
+                    part.reserve(room).unwrap();
+                    for _ in 0..n {
+                        part.add(entry(next).0, &entry(next).1, false).unwrap();
+                        next += 1;
+                    }
+                    part
+                })
+                .collect();
+            let total: usize = shape.iter().map(|&(n, _)| n as usize).sum();
+            let run = Run::new(Limits::unlimited(&budget));
+            let (gathered, held) = measure::measure(|| run.gather(parts));
+            let gathered = gathered.expect("an unlimited budget");
+            let mut want: Vec<Entry> = (0..total as u64).map(entry).collect();
+            want.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let answered = gathered.entries() == want.as_slice();
+            if !answered || held > most {
+                failed.push(format!(
+                    "{what}: {} entries{}, {held} bytes allocated (at most {most})",
+                    gathered.len(),
+                    if answered { "" } else { ", not as specified" },
+                ));
+            } else {
+                eprintln!("{what}: ok, {held} bytes");
+            }
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    /// Merge-time count of #159 (`p2c5-r4-memcount3-caded3cf`: product's commit-2 update 13 %
+    /// slower than before r4): a lookup of a fact whose sets are its own graphs' reads them
+    /// once where they fit its buffer, and a second time only past it, by the work counter
+    /// (its calls to `Graphs::each`). Each row gives `initial_sets` of the fact's graphs.
+    #[test]
+    fn own_sets_read_their_graphs_once() {
+        use super::{Graphs, InGraphs, Limits, Run, initial_sets, own_sets};
+        use nrese_exec::Budget;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted<'a>(InGraphs<'a>, AtomicUsize);
+        impl Graphs for Counted<'_> {
+            fn each(&self, fact: [u64; 3], graph: &mut dyn FnMut(u32)) {
+                self.1.fetch_add(1, Ordering::Relaxed);
+                self.0.each(fact, graph);
+            }
+            fn holds(&self, fact: [u64; 3], graph: u32) -> bool {
+                self.0.holds(fact, graph)
+            }
+        }
+        let fact = [1, 2, 3];
+        let budget = Arc::new(Budget::unlimited());
+        let run = Run::new(Limits::unlimited(&budget));
+        let mut failed = Vec::new();
+        // (graphs the fact is asserted in, reads at most)
+        for (k, most) in [(1u32, 1usize), (32, 1), (64, 1), (65, 2)] {
+            let placed: Vec<([u64; 3], u32)> = (0..k).map(|g| (fact, 200 + g)).collect();
+            let graphs = Counted(InGraphs(&placed), AtomicUsize::new(0));
+            let cap = 16;
+            let got = own_sets(fact, &graphs, &[], cap, &run)
+                .expect("an unlimited budget")
+                .map(|looked| {
+                    let sets = looked.sets();
+                    (sets.iter().cloned().collect::<Vec<_>>(), sets.truncated)
+                });
+            let want = initial_sets((0..k).map(|g| 200 + g).collect(), false, cap);
+            let reads = graphs.1.load(Ordering::Relaxed);
+            let answered = got.as_ref() == Some(&(want.sets.clone(), want.truncated));
+            if !answered || reads > most {
+                failed.push(format!(
+                    "{k} graphs: {reads} reads (at most {most}){}",
+                    if answered {
+                        ""
+                    } else {
+                        ", sets not as specified"
+                    }
+                ));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
     /// What an own set's charge counts before it is made ([`super::own_sets`]) is what the
     /// set holds: either side of the inline edge (128 graphs) and far past it.
     #[test]
