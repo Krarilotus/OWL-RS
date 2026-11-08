@@ -69,9 +69,10 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     // one term, one form in both ([`ResultTerm`]).
     let frontier = |term: &Term| graph_after.lookup(term);
     // The state before's failures are thrown away: none is made or charged.
-    let validator_before =
-        Validator::discarding_failures(before, shapes, data, resources).with_frontier(&frontier);
-    let validator_after = Validator::new(after, shapes, data, resources);
+    let validator_before = Validator::discarding_failures(before, shapes, data, resources)
+        .with_frontier(&frontier)
+        .comparing();
+    let validator_after = Validator::new(after, shapes, data, resources).comparing();
     let mut introduced: BTreeSet<RawResult> = BTreeSet::new();
     if !changed.is_empty() {
         let rdf_type = graph_after.iri(RDF_TYPE);
@@ -173,7 +174,10 @@ pub fn validate_shapes_change<A: ReadView + Sync, B: ReadView + Sync>(
     data: Selection,
     resources: &Resources,
 ) -> Result<ValidationReport, QueryEvaluationError> {
-    let (raw, failures, held_after) = validate::validate_raw(after, shapes_after, data, resources)?;
+    // Its results are compared only where there were shapes before.
+    let compares = shapes_before.is_some();
+    let (raw, failures, held_after) =
+        validate::validate_raw(after, shapes_after, data, resources, compares)?;
     // Declared after their charge, so dropped before it, whatever the outcome.
     let mut later = raw;
     if let Some(shapes_before) = shapes_before

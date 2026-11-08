@@ -182,15 +182,20 @@ pub(crate) type Kept = (Vec<RawResult>, Failures, Reservation);
 /// failures (SPARQL-based constraints that couldn't be evaluated), with their charge to
 /// `resources`' envelope. Focus nodes are validated in parallel; the results keep the
 /// sequential order. A stop of `resources` is the outcome instead
-/// ([`Validator::into_failures`]).
+/// ([`Validator::into_failures`]). `compares`: the results will be compared with another
+/// state's ([`Validator::comparing`]).
 pub(crate) fn validate_raw<V: ReadView + Sync>(
     view: &V,
     shapes: &Shapes,
     data: Selection,
     resources: &Resources,
+    compares: bool,
 ) -> Result<Kept, QueryEvaluationError> {
     resources.check()?;
-    let validator = Validator::new(view, shapes, data, resources);
+    let mut validator = Validator::new(view, shapes, data, resources);
+    if compares {
+        validator = validator.comparing();
+    }
     let results = validate_every_focus(&validator, shapes);
     let (failures, held) = validator.into_failures()?;
     Ok((results, failures, held))
@@ -208,8 +213,9 @@ pub(crate) fn validate_raw_results<'a, V: ReadView + Sync>(
     frontier: &'a Frontier<'a>,
 ) -> Result<(Vec<RawResult>, Reservation), QueryEvaluationError> {
     resources.check()?;
-    let validator =
-        Validator::discarding_failures(view, shapes, data, resources).with_frontier(frontier);
+    let validator = Validator::discarding_failures(view, shapes, data, resources)
+        .with_frontier(frontier)
+        .comparing();
     let results = validate_every_focus(&validator, shapes);
     let (_, held) = validator.into_failures()?;
     Ok((results, held))
@@ -361,6 +367,9 @@ pub(crate) struct Validator<'a, V: ReadView> {
     /// The view whose dictionary decides whether a term a query bound is stored or computed
     /// ([`ResultTerm`]); `None`: this validator's own.
     frontier: Option<&'a Frontier<'a>>,
+    /// Whether its results are compared with another state's ([`Validator::comparing`]): only
+    /// then do blank nodes a query bound need their comparison form.
+    compares: bool,
     rdf_type: Option<TermId>,
     /// Each class the shapes name, with its subclasses (itself included).
     classes: HashMap<TermId, BTreeSet<TermId>>,
@@ -451,6 +460,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
             ))),
             keep_failures,
             frontier: None,
+            compares: false,
             classes: HashMap::new(),
         };
         let sub_class_of = graph.iri(RDFS_SUB_CLASS_OF);
@@ -507,6 +517,18 @@ impl<'a, V: ReadView> Validator<'a, V> {
         self
     }
 
+    /// The validator, its results to be compared with another state's ([`validate_changes`],
+    /// [`validate_shapes_change`]): blank nodes a query bound get their comparison form
+    /// ([`Validator::result_term`]). Without it (a report alone) they are kept as the query
+    /// made them, which is what the report shows either way.
+    ///
+    /// [`validate_changes`]: crate::validate_changes
+    /// [`validate_shapes_change`]: crate::validate_shapes_change
+    pub(crate) fn comparing(mut self) -> Self {
+        self.compares = true;
+        self
+    }
+
     /// The id of `term` in the frontier's dictionary.
     fn known(&self, term: &Term) -> Option<TermId> {
         match self.frontier {
@@ -521,8 +543,16 @@ impl<'a, V: ReadView> Validator<'a, V> {
     /// isn't asked, since a later state may store a node under a fresh node's name. A triple
     /// term holding a fresh blank node can't be stored (the dictionary knows a triple term only
     /// with its parts): computed, compared by [`Validator::triple_key`]. One holding only this
-    /// state's blank nodes goes through the frontier as any other term.
+    /// state's blank nodes goes through the frontier as any other term. Where nothing compares
+    /// the results ([`Validator::comparing`]), a blank node or a triple term holding one is the
+    /// query's term as it is: no lookup, no comparison form (the report shows the same term).
     fn result_term(&self, term: &Term) -> ResultTerm {
+        if !self.compares && holds_blank_node(term) {
+            return ResultTerm::Computed(Box::new(Computed {
+                term: term.clone(),
+                key: None,
+            }));
+        }
         if let Term::BlankNode(_) = term {
             return match self.graph.lookup(term) {
                 Some(id) => ResultTerm::Stored(id),
