@@ -335,6 +335,12 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
     steps = prepare + blocks + after
     by_name = {c["name"]: c for c in family["catalog"]}
     mine = [by_name[c["name"]] for c in family["cases"] if c["name"] in by_name]
+    # Planned as made by the job, so made by its harness's prepare: one from before the dataset makers
+    # wouldn't (orchestrator, 8 Nov 2026: abba-run-055fe886-f3da61f9, "7 not as pinned" after the builds).
+    if (made := rg.made_only(mine)) and not rg.makers_at(checkout, harness):
+        raise Invalid([f"the harness {harness[:12]} has no dataset makers (engine-v2 838cd7eb, PR #129), so it "
+                       f"can't make {made[0]}" + (f" and {len(made) - 1} more" if len(made) > 1 else "")
+                       + ": merge engine-v2 into it, or give --harness at or after that commit"])
     # What its data takes where the host lacks it: the makers' needs, their disk (7 Nov 2026) and the
     # containers they start, declared (8 Nov 2026): release_gate.data_job().
     requires, data_fields, data_env = rg.data_job(

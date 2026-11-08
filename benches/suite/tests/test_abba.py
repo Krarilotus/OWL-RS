@@ -246,7 +246,8 @@ systems = []
         them (LUBM's in Docker), so it asks for Docker and the disk to make them in, not the bench
         assets; asked for nothing, it could land where its data can be neither found nor made."""
         self.path.write_bytes(abba.family_text("t", {"a": A, "b": B}, ["dlmode-lubm1"], 6).encode("utf-8"))
-        job = next(iter(abba.jobs(self.load(), B, self.repo.as_posix()).values()))
+        with patch.object(abba.rg, "makers_at", return_value=True):  # its harness makes data
+            job = next(iter(abba.jobs(self.load(), B, self.repo.as_posix()).values()))
         self.assertEqual(job["requires"].get("has"), ["docker"])
         self.assertGreaterEqual(job["requires"].get("disk_gb", 0), 1)
 
@@ -257,7 +258,9 @@ systems = []
         (release_gate.data_job()), asks that memory on top of what its blocks ask, and tells its
         makers the limits; a job making nothing in containers declares nothing."""
         self.path.write_bytes(abba.family_text("t", {"a": A, "b": B}, ["shacl-lubm"], 6).encode("utf-8"))
-        job = next(iter(abba.jobs(self.load(), B, self.repo.as_posix()).values()))
+        with patch.object(abba.rg, "makers_at", return_value=True):  # its harness makes data (PR #139)
+            job = next(iter(abba.jobs(self.load(), B, self.repo.as_posix()).values()))
+            set_id = next(iter(abba.jobs(self.load(), B, self.repo.as_posix())))
         self.assertEqual(job["spec"], 9)
         [maker] = job["containers"]
         plain = next(iter(abba.jobs(self.family, B, self.repo.as_posix()).values()))  # FAMILY's cases make nothing
@@ -270,9 +273,40 @@ systems = []
                          (f"{maker['memory_gb']:g}", f"{maker['cpus']:g}"))
         self.assertNotIn("NRESE_MAKER_MEMORY_GB", plain["env"])
         import tomllib
-        set_id = next(iter(abba.jobs(self.load(), B, self.repo.as_posix())))
         read = tomllib.loads(abba.set_file(set_id, [job]))["job"][0]
         self.assertEqual((read["spec"], read["containers"]), (9, [maker]))
+
+    def test_a_harness_that_can_t_make_its_family_s_data_is_refused_before_planning(self):
+        """Orchestrator, 8 Nov 2026: REAS's and C5's sets (abba-run-055fe886-f3da61f9) were planned by a
+        submitter that makes support-stress data, so asked for no assets, but prepared by a harness
+        from before the dataset makers (838cd7eb, PR #129), which didn't make them: "7 not as pinned"
+        on a host without them, after the builds. Refused at the plan, saying why."""
+        old = self.commits[-1]  # a real harness commit whose tree has no dataset makers
+        sides = {"a": self.commits[0], "b": old}
+        self.path.write_bytes(abba.family_text("t", sides, ["support-copies-17"], 6).encode("utf-8"))
+        with self.assertRaises(abba.Invalid) as refused:  # planned unrefused, it asks for no assets
+            abba.jobs(self.load(), old, self.repo.as_posix())
+        text = "\n".join(refused.exception.args[0])
+        self.assertIn("support-stress/copies-17.nq", text)
+        self.assertIn("dataset makers", text)
+        with patch.object(abba.rg, "makers_at", return_value=True):  # the same family, a harness that makes it
+            job = next(iter(abba.jobs(self.load(), old, self.repo.as_posix()).values()))
+        self.assertNotIn("owlrs-bench-assets", job["requires"].get("has", []))
+
+    def test_whether_a_harness_makes_data_is_read_from_its_own_tree(self):
+        """makers_at(): the harness's own release_gate.py, at that commit, names the dataset makers."""
+        with tempfile.TemporaryDirectory() as d:
+            git = lambda *a: abba.subprocess.run(["git", "-C", d, *a], capture_output=True, text=True,  # noqa: E731
+                                                 check=True).stdout.strip()
+            git("init", "-q")
+            Path(d, "benches/fast").mkdir(parents=True)
+            commit = lambda text: (Path(d, "benches/fast/release_gate.py").write_text(text, encoding="utf-8"),  # noqa: E731
+                                   git("add", "-A"), git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
+                                                         "-m", "x"), git("rev-parse", "HEAD"))[3]
+            before, after = commit("# no makers\n"), commit("DATASET_MAKERS = {}\n")
+            self.assertFalse(abba.rg.makers_at(d, before))
+            self.assertTrue(abba.rg.makers_at(d, after))
+            self.assertFalse(abba.rg.makers_at(d, "0" * 40))  # not there: unknown, refused
 
     def test_one_job_asks_by_capability_and_builds_where_it_times(self):
         """The brief of 2 Nov 2026: no host names. A build job and a timed job pinned to one host
