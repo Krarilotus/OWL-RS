@@ -65,8 +65,9 @@
 //!   writes the store's statements, inferred ones included, as N-Triples (the closure the
 //!   stores without reasoning load). `--canonicalize` canonicalises blank nodes.
 //!   `--parse-turtle FILE` parses a Turtle file `--runs` times on one thread, nothing stored
-//!   (the Turtle parser alone); `--split-turtle PARTS:FILE` cuts it into up to PARTS chunks
-//!   as bulk load does, nothing parsed (the skim alone).
+//!   (the Turtle parser alone); `--split-turtle FILE:PARTS` cuts it into up to PARTS chunks
+//!   as bulk load does, nothing parsed (the skim alone). The file comes first: the native
+//!   bench runtime maps a container path only at the start of a word.
 //!   `--prepare-vector-graph 64:cosine` synchronously prepares that vector space before
 //!   query timing, recording its preparation phase and checking full graph coverage.
 //!   `--replication COMMITS:QUADS` times read replicas' log shipping: COMMITS commits of
@@ -418,9 +419,9 @@ fn parse_args() -> Result<Args, String> {
             "--parse-turtle" => args.parse_turtle = Some(value()?.into()),
             "--split-turtle" => {
                 let spec = value()?;
-                let (parts, file) = spec
-                    .split_once(':')
-                    .ok_or("--split-turtle takes PARTS:FILE")?;
+                let (file, parts) = spec
+                    .rsplit_once(':')
+                    .ok_or("--split-turtle takes FILE:PARTS")?;
                 let parts = parts
                     .parse()
                     .map_err(|e| format!("--split-turtle parts: {e}"))?;
