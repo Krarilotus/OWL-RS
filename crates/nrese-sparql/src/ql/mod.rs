@@ -6,13 +6,14 @@
 //! rewriting of a query's basic graph patterns is `native/ql.rs`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 use nrese_engine::{
     AssertedIdentity, GraphSelector, QuadPattern, ReadModel, Snapshot, SnapshotIdentity, TermId,
 };
 use nrese_owl::ql::Tbox;
-use nrese_rdf::{NamedNodeRef, Term, vocab};
+use nrese_rdf::vocab::{owl, rdf, rdfs};
+use nrese_rdf::{NamedNodeRef, Term};
 
 use crate::GraphAccess;
 
@@ -27,79 +28,82 @@ const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
 const OWL: &str = "http://www.w3.org/2002/07/owl#";
 
+// The reader's tables are `nrese_rdf::vocab` constants, built at compile time: a schema read
+// looks them up with no IRI to build and nothing kept on the heap (#155's count).
+
 /// The schema properties read, in every graph.
-const SCHEMA: &[(&str, &str)] = &[
-    (RDFS, "subClassOf"),
-    (OWL, "equivalentClass"),
-    (RDFS, "subPropertyOf"),
-    (OWL, "equivalentProperty"),
-    (OWL, "inverseOf"),
-    (RDFS, "domain"),
-    (RDFS, "range"),
-    (OWL, "onProperty"),
-    (OWL, "someValuesFrom"),
-    (OWL, "allValuesFrom"),
-    (OWL, "hasValue"),
-    (OWL, "minCardinality"),
-    (OWL, "minQualifiedCardinality"),
-    (OWL, "cardinality"),
-    (OWL, "qualifiedCardinality"),
-    (OWL, "onClass"),
-    (OWL, "onDataRange"),
-    (OWL, "intersectionOf"),
-    (OWL, "unionOf"),
-    (OWL, "disjointUnionOf"),
+const SCHEMA: &[NamedNodeRef<'static>] = &[
+    rdfs::SUB_CLASS_OF,
+    owl::EQUIVALENT_CLASS,
+    rdfs::SUB_PROPERTY_OF,
+    owl::EQUIVALENT_PROPERTY,
+    owl::INVERSE_OF,
+    rdfs::DOMAIN,
+    rdfs::RANGE,
+    owl::ON_PROPERTY,
+    owl::SOME_VALUES_FROM,
+    owl::ALL_VALUES_FROM,
+    owl::HAS_VALUE,
+    owl::MIN_CARDINALITY,
+    owl::MIN_QUALIFIED_CARDINALITY,
+    owl::CARDINALITY,
+    owl::QUALIFIED_CARDINALITY,
+    owl::ON_CLASS,
+    owl::ON_DATA_RANGE,
+    owl::INTERSECTION_OF,
+    owl::UNION_OF,
+    owl::DISJOINT_UNION_OF,
     // What the rewriting doesn't follow, for the completeness it reports (design §7).
-    (OWL, "propertyChainAxiom"),
-    (OWL, "hasKey"),
-    (OWL, "oneOf"),
-    (OWL, "complementOf"),
-    (OWL, "hasSelf"),
-    (OWL, "maxCardinality"),
-    (OWL, "maxQualifiedCardinality"),
+    owl::PROPERTY_CHAIN_AXIOM,
+    owl::HAS_KEY,
+    owl::ONE_OF,
+    owl::COMPLEMENT_OF,
+    owl::HAS_SELF,
+    owl::MAX_CARDINALITY,
+    owl::MAX_QUALIFIED_CARDINALITY,
     // Disjointness concludes a part's complement, which may be an existential (I24b
     // fix check r1, F3: `A ⊑ ¬≤0 S.D`).
-    (OWL, "disjointWith"),
-    (OWL, "members"),
+    owl::DISJOINT_WITH,
+    owl::MEMBERS,
 ];
 
 /// The classes whose members' `rdf:type` statements are read: what the mapping needs to
 /// know about the schema's terms.
-const DECLARATIONS: &[(&str, &str)] = &[
-    (OWL, "Restriction"),
-    (OWL, "Class"),
-    (RDFS, "Class"),
-    (RDFS, "Datatype"),
-    (OWL, "ObjectProperty"),
-    (OWL, "DatatypeProperty"),
-    (OWL, "AnnotationProperty"),
-    (OWL, "SymmetricProperty"),
-    (OWL, "ReflexiveProperty"),
-    (OWL, "TransitiveProperty"),
-    (OWL, "FunctionalProperty"),
-    (OWL, "InverseFunctionalProperty"),
-    (OWL, "AllDisjointClasses"),
+const DECLARATIONS: &[NamedNodeRef<'static>] = &[
+    owl::RESTRICTION,
+    owl::CLASS,
+    rdfs::CLASS,
+    rdfs::DATATYPE,
+    owl::OBJECT_PROPERTY,
+    owl::DATATYPE_PROPERTY,
+    owl::ANNOTATION_PROPERTY,
+    owl::SYMMETRIC_PROPERTY,
+    owl::REFLEXIVE_PROPERTY,
+    owl::TRANSITIVE_PROPERTY,
+    owl::FUNCTIONAL_PROPERTY,
+    owl::INVERSE_FUNCTIONAL_PROPERTY,
+    owl::ALL_DISJOINT_CLASSES,
 ];
 
 /// The properties that make their blank subject a class expression (`nrese-owl`'s
 /// mapping): a restriction's and the set operators'.
-const EXPRESSIONS: &[&str] = &[
-    "onProperty",
-    "intersectionOf",
-    "unionOf",
-    "complementOf",
-    "oneOf",
+const EXPRESSIONS: &[NamedNodeRef<'static>] = &[
+    owl::ON_PROPERTY,
+    owl::INTERSECTION_OF,
+    owl::UNION_OF,
+    owl::COMPLEMENT_OF,
+    owl::ONE_OF,
 ];
 
 /// The list-valued properties whose lists are read.
-const LISTS: &[&str] = &[
-    "intersectionOf",
-    "unionOf",
-    "disjointUnionOf",
-    "propertyChainAxiom",
-    "hasKey",
-    "oneOf",
-    "members",
+const LISTS: &[NamedNodeRef<'static>] = &[
+    owl::INTERSECTION_OF,
+    owl::UNION_OF,
+    owl::DISJOINT_UNION_OF,
+    owl::PROPERTY_CHAIN_AXIOM,
+    owl::HAS_KEY,
+    owl::ONE_OF,
+    owl::MEMBERS,
 ];
 
 /// What the QL rewriting did to one query (EXPLAIN, and with every answer).
@@ -517,27 +521,8 @@ fn touched_expressions(tx: &nrese_engine::Transaction<'_>) -> Option<Vec<Members
 }
 
 fn iri(snapshot: &Snapshot, namespace: &str, local: &str) -> Option<TermId> {
-    named(snapshot, &format!("{namespace}{local}"))
+    snapshot.lookup(NamedNodeRef::new_unchecked(&format!("{namespace}{local}")).into())
 }
-
-fn named(snapshot: &Snapshot, iri: &str) -> Option<TermId> {
-    snapshot.lookup(NamedNodeRef::new_unchecked(iri).into())
-}
-
-/// The IRIs of the tables every schema read looks up, joined once rather than on each read
-/// (#155's count: a `format!` per name and read).
-fn joined(table: &[(&str, &str)]) -> Vec<String> {
-    table.iter().map(|(n, l)| format!("{n}{l}")).collect()
-}
-
-fn owl(table: &[&str]) -> Vec<String> {
-    table.iter().map(|l| format!("{OWL}{l}")).collect()
-}
-
-static SCHEMA_IRIS: LazyLock<Vec<String>> = LazyLock::new(|| joined(SCHEMA));
-static DECLARATION_IRIS: LazyLock<Vec<String>> = LazyLock::new(|| joined(DECLARATIONS));
-static EXPRESSION_IRIS: LazyLock<Vec<String>> = LazyLock::new(|| owl(EXPRESSIONS));
-static LIST_IRIS: LazyLock<Vec<String>> = LazyLock::new(|| owl(LISTS));
 
 /// The asserted statements of the schema, in every graph, sorted: the schema properties',
 /// the declarations', the cells of the lists they name, and per class expression one
@@ -589,25 +574,25 @@ fn read_core(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
         object,
         graph: GraphSelector::Any,
     };
-    for p in SCHEMA_IRIS.iter() {
-        if let Some(p) = named(snapshot, p) {
+    let lookup = |term: NamedNodeRef<'_>| snapshot.lookup(term.into());
+    for &p in SCHEMA {
+        if let Some(p) = lookup(p) {
             scan(pattern(p, None), &mut out);
         }
     }
-    let lookup = |term: NamedNodeRef<'_>| snapshot.lookup(term.into());
-    if let Some(rdf_type) = lookup(vocab::rdf::TYPE) {
-        for class in DECLARATION_IRIS.iter() {
-            if let Some(class) = named(snapshot, class) {
+    if let Some(rdf_type) = lookup(rdf::TYPE) {
+        for &class in DECLARATIONS {
+            if let Some(class) = lookup(class) {
                 scan(pattern(rdf_type, Some(class)), &mut out);
             }
         }
     }
     // The lists: from each head, `rdf:first` and `rdf:rest` along the cells.
-    let (first, rest) = (lookup(vocab::rdf::FIRST), lookup(vocab::rdf::REST));
+    let (first, rest) = (lookup(rdf::FIRST), lookup(rdf::REST));
     if let (Some(first), Some(rest)) = (first, rest) {
-        let heads: Vec<u64> = LIST_IRIS
+        let heads: Vec<u64> = LISTS
             .iter()
-            .filter_map(|p| named(snapshot, p))
+            .filter_map(|&p| lookup(p))
             .flat_map(|p| {
                 out.iter()
                     .filter(move |s| s.triple[1] == p.raw())
@@ -650,9 +635,9 @@ fn read_core(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
 /// or a set operator's property, sorted. Read from the core, never from data: an entry
 /// whose core is unchanged keeps its list.
 fn expressions_of(snapshot: &Snapshot, core: &[nrese_owl::Statement]) -> Vec<u64> {
-    let operators: Vec<u64> = EXPRESSION_IRIS
+    let operators: Vec<u64> = EXPRESSIONS
         .iter()
-        .filter_map(|p| named(snapshot, p))
+        .filter_map(|&p| snapshot.lookup(p.into()))
         .map(TermId::raw)
         .collect();
     let mut out: Vec<u64> = core
