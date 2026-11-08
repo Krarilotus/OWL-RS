@@ -320,8 +320,8 @@ fn eligibility_comes_with_the_version_acquired() {
 ///   a statement it doesn't infer (an asserted one, then one it doesn't hold at all), through
 ///   both `InferredSubset::Only` and `with_inferred_only`.
 /// - Expected: the real subset keeps the token; each list naming a statement the snapshot
-///   doesn't infer has none.
-#[cfg(debug_assertions)]
+///   doesn't infer has none. In every build (sol-loop r1 S1: the store's support views merge
+///   such statements into their lists).
 #[test]
 fn a_kept_list_beyond_the_inferred_statements_loses_eligibility() {
     let engine = engine();
@@ -347,4 +347,52 @@ fn a_kept_list_beyond_the_inferred_statements_loses_eligibility() {
         let only = published.with_inferred_only(kept, &budget()).unwrap();
         assert_eq!(token(&only), eligible, "with_inferred_only({kept:?})");
     }
+}
+
+/// Sol-loop r1 S1 (8 Nov), the master's ruling (F2): a mask that shows a statement its stack
+/// doesn't hold adds it, so a view through it is unpublished; one that only hides, or shows
+/// again what it hid, is a restriction. An addition stays one through later changes.
+///
+/// - Input: the published snapshot's masks: hiding one inferred statement; that, then showing
+///   it again; showing a statement the stack doesn't infer (an asserted one, as the store's
+///   support views show facts asserted out of a reader's reach); that one changed again by
+///   hiding another statement.
+/// - Expected: views through the first two keep the token; through the last two, none.
+#[test]
+fn a_mask_that_shows_an_extra_statement_loses_eligibility() {
+    let engine = engine();
+    let published = engine.snapshot();
+    let all = inferred(&published);
+    let extra: Vec<EncodedQuad> = published
+        .quads_for_pattern_in(super::ReadModel::Asserted, &crate::QuadPattern::all())
+        .take(1)
+        .collect();
+    let view = |mask: &InferredMask| {
+        published
+            .with_inferred_mask(mask, &budget())
+            .unwrap()
+            .expect("the stack's layout")
+    };
+    let hiding = InferredMask::hiding(&published, &all[..1], &budget()).unwrap();
+    assert!(token(&view(&hiding)), "hiding only");
+    let shown_again = hiding
+        .changed(&published, &[], &all[..1], &budget())
+        .unwrap();
+    assert!(token(&view(&shown_again)), "showing again what it hid");
+    let adding = InferredMask::default()
+        .changed(&published, &[], &extra, &budget())
+        .unwrap();
+    let through = view(&adding);
+    assert!(
+        through.contains_in(super::ReadModel::Inferred, &extra[0]),
+        "the mask shows the extra statement as inferred"
+    );
+    assert!(
+        !token(&through),
+        "showing a statement the stack doesn't hold"
+    );
+    let still = adding
+        .changed(&published, &all[1..2], &[], &budget())
+        .unwrap();
+    assert!(!token(&view(&still)), "an addition stays one");
 }
