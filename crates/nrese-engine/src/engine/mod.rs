@@ -58,7 +58,7 @@ pub use corpora::{CorpusTuning, DEFAULT_READER_CORPUS_BYTES, TextCorpusStats};
 pub use equality::Classes as EqualityClasses;
 pub use replication::{Applied, LogBatch, LogExpectation};
 pub use snapshot::{
-    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot,
+    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, SearchRefused, Seek, Snapshot,
     SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
