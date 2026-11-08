@@ -385,6 +385,150 @@ fn a_file_is_read_only_where_its_own_path_reaches_the_group() {
     ]);
 }
 
+/// A group's coordinates in the cgroup namespace aren't a path (SYN-45 fix check r2;
+/// cgroup_namespaces(7), path_resolution(7)): a launcher makes the namespace in /limited/scope
+/// and then moves the process to the sibling /limited/worker, so /proc/self/cgroup names
+/// `/../worker`. Its mounts: the namespace's root (scope, 8 GiB) at /a/cg, the worker (4 GiB,
+/// the process) at /a/worker, the real parent /limited (1 GiB) at /cg-safe, and loose's single
+/// memory.max (8 GiB) at /a/memory.max. A path through /a/cg/.. leaves /a/cg for /a, so the
+/// kernel answers /a/cg/../worker with the worker's files and /a/cg/../memory.max with loose's;
+/// the rows keep those answers for a reader of paths. The kernel enforces limited's 1 GiB,
+/// which /cg-safe shows. Each group uses 512 MiB. The safe view is listed after and before the
+/// namespace's root.
+#[test]
+fn a_group_above_the_namespace_is_read_where_a_view_shows_it() {
+    let (one, four, eight, half) = (
+        G.to_string(),
+        (4 * G).to_string(),
+        (8 * G).to_string(),
+        (G / 2).to_string(),
+    );
+    let (one, four, eight, half) = (one.as_str(), four.as_str(), eight.as_str(), half.as_str());
+    const SAFE_AFTER: &str = concat!(
+        root!(),
+        "30 23 0:26 / /a/cg rw - cgroup2 cgroup2 rw\n",
+        "40 23 0:26 /../worker /a/worker rw - cgroup2 cgroup2 rw\n",
+        "50 23 0:26 /.. /cg-safe rw - cgroup2 cgroup2 rw\n",
+        "60 23 0:26 /../loose/memory.max /a/memory.max rw - cgroup2 cgroup2 rw\n"
+    );
+    const SAFE_BEFORE: &str = concat!(
+        root!(),
+        "50 23 0:26 /.. /cg-safe rw - cgroup2 cgroup2 rw\n",
+        "30 23 0:26 / /a/cg rw - cgroup2 cgroup2 rw\n",
+        "40 23 0:26 /../worker /a/worker rw - cgroup2 cgroup2 rw\n",
+        "60 23 0:26 /../loose/memory.max /a/memory.max rw - cgroup2 cgroup2 rw\n"
+    );
+    let files = |mounts: &'static str| -> Vec<(&str, &str)> {
+        vec![
+            ("/proc/self/mountinfo", mounts),
+            ("/proc/self/cgroup", "0::/../worker"),
+            // The namespace's root, scope.
+            ("/a/cg/cgroup.controllers", "memory"),
+            ("/a/cg/cgroup.procs", "77\n"),
+            ("/a/cg/memory.max", eight),
+            ("/a/cg/memory.current", half),
+            // loose's memory.max, bound over a file.
+            ("/a/memory.max", eight),
+            // The real parent, limited, and the worker in it.
+            ("/cg-safe/cgroup.controllers", "memory"),
+            ("/cg-safe/memory.max", one),
+            ("/cg-safe/memory.current", half),
+            ("/cg-safe/worker/cgroup.controllers", "memory"),
+            ("/cg-safe/worker/cgroup.procs", procs()),
+            ("/cg-safe/worker/memory.max", four),
+            ("/cg-safe/worker/memory.current", half),
+            // The worker, the process's group.
+            ("/a/worker/cgroup.controllers", "memory"),
+            ("/a/worker/cgroup.procs", procs()),
+            ("/a/worker/memory.max", four),
+            ("/a/worker/memory.current", half),
+            // What the kernel answers a path through /a/cg/.. with: /a's entries.
+            ("/a/cg/../worker/cgroup.controllers", "memory"),
+            ("/a/cg/../worker/cgroup.procs", procs()),
+            ("/a/cg/../worker/memory.max", four),
+            ("/a/cg/../worker/memory.current", half),
+            ("/a/cg/../memory.max", eight),
+        ]
+    };
+    check(vec![
+        (
+            "own group beside the namespace's root, safe view after it",
+            files(SAFE_AFTER),
+            "",
+            Some(G),
+            Some(G / 2),
+        ),
+        (
+            "own group beside the namespace's root, safe view before it",
+            files(SAFE_BEFORE),
+            "",
+            Some(G),
+            Some(G / 2),
+        ),
+    ]);
+}
+
+/// A group is read wherever the kernel shows it to the process (fix check r2, F1 and F2): in a
+/// chroot whose root isn't a mount, mountinfo has no `/` line (the kernel leaves out mounts
+/// outside the root; fs/proc_namespace.c), and the cgroup mount's parent isn't listed; the
+/// process's group /app (2 GiB) is read there. In a threaded v2 group (cgroup-v2.rst, "Threads")
+/// `cgroup.procs` refuses with EOPNOTSUPP and `cgroup.threads` lists the process's leader,
+/// whose thread id is the process's; the memory controller is a domain one, so the threaded
+/// group has no memory.max and its domain's limit (2 GiB) is the one that applies. Each uses
+/// 512 MiB.
+#[test]
+fn a_group_is_read_wherever_the_kernel_shows_it() {
+    let (two, half) = ((2 * G).to_string(), (G / 2).to_string());
+    let (two, half) = (two.as_str(), half.as_str());
+    const CHROOT: &str = concat!(
+        "31 22 0:5 / /proc rw - proc proc rw\n",
+        "30 22 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n"
+    );
+    let chroot = vec![
+        ("/proc/self/mountinfo", CHROOT),
+        ("/proc/self/cgroup", "0::/app"),
+        ("/sys/fs/cgroup/cgroup.controllers", "memory"),
+        ("/sys/fs/cgroup/app/cgroup.controllers", "memory"),
+        ("/sys/fs/cgroup/app/cgroup.procs", procs()),
+        ("/sys/fs/cgroup/app/memory.max", two),
+        ("/sys/fs/cgroup/app/memory.current", half),
+    ];
+    let threads = format!("{}\n{}\n", std::process::id(), std::process::id() + 1);
+    let threaded = vec![
+        ("/proc/self/mountinfo", V2_MOUNT),
+        ("/proc/self/cgroup", "0::/domain/thread"),
+        ("/sys/fs/cgroup/cgroup.controllers", "memory"),
+        ("/sys/fs/cgroup/domain/cgroup.controllers", "memory"),
+        ("/sys/fs/cgroup/domain/cgroup.procs", procs()),
+        ("/sys/fs/cgroup/domain/memory.max", two),
+        ("/sys/fs/cgroup/domain/memory.current", half),
+        // A threaded group's controllers are threaded ones.
+        ("/sys/fs/cgroup/domain/thread/cgroup.controllers", "pids"),
+        ("/sys/fs/cgroup/domain/thread/cgroup.type", "threaded"),
+        ("/sys/fs/cgroup/domain/thread/cgroup.procs", "EOPNOTSUPP"),
+        (
+            "/sys/fs/cgroup/domain/thread/cgroup.threads",
+            threads.as_str(),
+        ),
+    ];
+    check(vec![
+        (
+            "chroot whose root isn't a mount",
+            chroot,
+            "",
+            Some(2 * G),
+            Some(2 * G - G / 2),
+        ),
+        (
+            "threaded v2 group",
+            threaded,
+            "",
+            Some(2 * G),
+            Some(2 * G - G / 2),
+        ),
+    ]);
+}
+
 /// A mount another one covers isn't a view (sol-loop r3 S1; proc_pid_mountinfo(5) lists covered
 /// mounts too): a launcher bind-mounts the process's group `worker` (4 GiB, 1 GiB used) over the
 /// full v2 tree at /sys/fs/cgroup, or covers /sys/fs with a tmpfs and leaves the group bind-mounted
