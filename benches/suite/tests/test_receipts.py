@@ -418,6 +418,52 @@ class Driver(unittest.TestCase):
                 if not image_present:
                     self.assertIn(["docker", "pull", "-q", "other/thing:1"], calls)
 
+    def test_a_pinned_image_runs_its_pin_or_the_run_stops_before_pinning(self):
+        """P1c review r1 F1, F2: the digest pull's and the retag's exit codes were ignored, so with a
+        mismatching image already holding the tag a failed pull went on, and the run timed the old
+        content. Modelled on a local docker's state (tags, ids, digests): the tag ends on the pinned
+        content, or the run stops (non-zero) before any image is pinned or timed."""
+        pinned_id, old_id = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+        self.pins(f'[pins]\n"qlever/qlever:latest" = "{self.PIN}"\n')
+        for name, pull_ok, tag_ok in (("pinned", True, True), ("the pull fails", False, True), ("the retag fails", True, False)):
+            with self.subTest(name):
+                tags = {"qlever/qlever:latest": old_id}  # present, another build
+                digests = {old_id: {"sha256:" + "e" * 64}}
+
+                def docker(command, *a, **k):
+                    if command[:2] == ["docker", "pull"]:
+                        if not pull_ok:
+                            return 1
+                        tags[command[-1]] = pinned_id
+                        digests[pinned_id] = {self.PIN}
+                    elif command[:2] == ["docker", "tag"]:
+                        if not tag_ok or command[-2] not in tags:  # docker: no such source image
+                            return 1
+                        tags[command[-1]] = tags[command[-2]]
+                    return 0
+
+                def inspect(command, *a, **k):
+                    held = digests.get(tags.get(command[-1], command[-1]), set())
+                    return Mock(returncode=0, stdout=json.dumps(sorted(f"qlever/qlever@{d}" for d in held)) + "\n")
+                suite = self.suite(runs=1, results=f"results-{name.replace(' ', '-')}")
+                pinning = Mock()
+                with patch.object(suite.args, "runtime", "docker"), patch.object(suite, "host_command", side_effect=docker), \
+                        patch.object(suite.runtime, "image_present", side_effect=lambda image: image in tags), \
+                        patch.object(driver, "run_quiet", side_effect=inspect), patch.object(driver.ns, "pin_images", pinning), \
+                        patch.object(driver, "plans", return_value=[Plan("w", "1")]), \
+                        patch.object(driver, "adapter", return_value=self.system(images=["qlever/qlever:latest"])), \
+                        patch.object(suite, "cycle") as cycle, patch.object(suite, "build_harness", return_value=True), \
+                        patch.object(suite, "ensure_data", return_value=None), \
+                        patch.object(suite, "sif_missing", return_value=None):
+                    code = suite.run()
+                if pull_ok and tag_ok:
+                    self.assertEqual(tags["qlever/qlever:latest"], pinned_id)
+                    pinning.assert_called_once()
+                else:
+                    self.assertEqual(code, 1)
+                    pinning.assert_not_called()
+                    cycle.assert_not_called()
+
     def test_a_pulled_image_s_source_is_its_pin_when_the_id_that_ran_holds_it(self):
         """P1c: a pulled image counts only as the content its tag's pin names: the id that ran must
         hold that digest. Pinned and held: "pulled, pinned <digest>"; held another: unknown, naming
