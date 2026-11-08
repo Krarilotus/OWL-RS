@@ -30,6 +30,23 @@ class FleetCells(unittest.TestCase):
                      else "b" * 40 if args[-1].startswith("b" * 40) else A).start()
         patch.object(abba.rg, "side_inputs", return_value=[]).start()
         patch.object(abba.rg, "fleet_call", side_effect=self.fleet).start()
+        # The harness A is this tree: its data step's makers are this catalogue's.
+        patch.object(abba.rg, "harness_tables", side_effect=lambda *_: abba.rg.local_tables()).start()
+
+    def asks(self, job, memory=28):
+        """What a cell's job must ask (fleet Spec 9; #132 B2): its slice's own work (fleet_cells.SLICE_GB, measured)
+        plus every container it declares, which the fleet takes out of that slice (job.rs memory_cap); the CPUs of
+        each declared one within its cores. Its declarations: the measured container's, then its makers'."""
+        from suitekit import fleet_cells
+        case = json.loads(job["env"]["SUITE_CELL"])["group"]["case"]
+        _, data, _ = abba.rg.data_job([case], {"cores": 2, "ram_gb": 0}, harness=None, containers_declared=True)
+        declared = [{"name": "suite", "memory_gb": memory}] + data.get("containers", [])
+        self.assertEqual(job["containers"], declared)
+        self.assertEqual(job["requires"]["ram_gb"], fleet_cells.SLICE_GB + sum(c["memory_gb"] for c in declared))
+        self.assertEqual(job["requires"]["cores"], max([2] + [c["cpus"] for c in declared if "cpus" in c]))
+        self.assertEqual((job["env"]["NRESE_SUITE_MEMORY_GB"], "DOCKER_MEMORY" in job["env"]), (f"{memory:g}", False))
+        self.assertEqual(job["env"].get("NRESE_MAKER_MEMORY_GB"), f"{declared[1]['memory_gb']:g}" if declared[1:] else None)
+        return declared
 
     def fleet(self, *args):
         self.calls.append(args)
@@ -106,11 +123,12 @@ class FleetCells(unittest.TestCase):
         self.assertEqual(job["kind"], "owlrs.timed")
         self.assertEqual((job["class"], job.get("untimed_steps", [])), ("exclusive", []))
         self.assertEqual(job.get("spec"), 9)
-        self.assertEqual(job["containers"], [{"name": "suite", "memory_gb": 28}])
+        self.asks(job)
         self.assertEqual(job["priority"], 600)
         self.assertFalse(job["requires"].get("hosts"))
         self.assertEqual(job["inputs"][0]["source"]["rev"], A)
-        self.assertEqual([n["ram_gb"] for n in job["step_needs"]], [28] * len(job["steps"]))
+        self.assertEqual([(n["ram_gb"], n["cores"]) for n in job["step_needs"]],
+                         [(job["requires"]["ram_gb"], job["requires"]["cores"])] * len(job["steps"]))
         for need in job["step_needs"]:
             for field in ("cores", "ram_gb", "disk_gb"):
                 self.assertGreater(need[field], 0)
@@ -145,6 +163,49 @@ class FleetCells(unittest.TestCase):
                 self.assertEqual(code, 2, output.getvalue())
                 self.assertIn(reason, output.getvalue())
 
+    def test_a_member_whose_every_measured_row_failed_does_not_pass(self):
+        # Master 16:31 (#132 B2): a refused container is caught per system, leaving a bundle of failed rows; the cell
+        # mustn't then exit 0 as if it had measured. One ok row is a measurement (it passes).
+        import csv
+        import subprocess
+        from suitekit import schema
+        bins, gate, landing = self.out / "bin", self.out / "gate", self.out / "private" / "cell"
+        harness = self.out / "suite-client-target" / "release" / "nrese-bench-harness"
+        for directory in (bins, gate, harness.parent):
+            directory.mkdir(parents=True)
+        (bins / "IDENTITY").write_text("build", encoding="utf-8")
+        (gate / "inputs.txt").write_text("inputs", encoding="utf-8")
+        harness.write_bytes(b"client")
+        refused = "DOCKER_MEMORY=28g (28672 MiB) exceeds the fleet step's slice (2867 MiB, 1843 MiB for containers)"
+        for statuses, expected in ((["failed", "failed"], 1), (["failed", "ok"], 0)):
+            def run(command, **_):
+                if "--results" in command:
+                    results = Path(command[command.index("--results") + 1])
+                    with open(results / "results.csv", "w", newline="", encoding="utf-8") as f:
+                        out = csv.DictWriter(f, schema.FIELDS)
+                        out.writeheader()
+                        for status in statuses:
+                            out.writerow({"system": "qlever", "task": "load", "status": status,
+                                          "note": refused if status == "failed" else ""})
+                    for name in ("manifest.json", "answers.json"):
+                        (results / name).write_text("{}", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, str(bins) if "bin_of" in " ".join(command) else "", "")
+            payload = {"group": {"systems": ["qlever"], "references": ["jena", "oxigraph"],
+                                 "case": {"workload": "sparqloscope", "tier": "sparqloscope-dblp"}},
+                       "identity": {}, "result_root": str(self.out / "private"), "member": "cell", "nrese": A,
+                       "harness": A, "deadline_min": 1}
+            with self.subTest(statuses=statuses), \
+                    patch("suitekit.fleet_cells.subprocess.run", side_effect=run), \
+                    patch("suitekit.fleet_cells.manifest.git", return_value={}), \
+                    patch("suitekit.fleet_cells.manifest.machine", return_value={}), \
+                    patch("suitekit.fleet_cells.manifest.binaries", return_value={"verified": True}), \
+                    patch.dict(os.environ, {"SUITE_CELL": json.dumps(payload), "FLEET_OUT": str(self.out / "export"),
+                                            "NRESE_GATE_DIR": str(gate)}):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(suite.main(["suite.py", "fleet", "--_member"]), expected)
+                if expected:
+                    self.assertIn(refused, (landing / "stderr.log").read_text(encoding="utf-8"))
+
     def test_cells_have_separate_jobs_and_adapter_capabilities(self):
         # Master 21:24: one job per cell; resource basis and workload needs remain explicit.
         code, text = self.run_plan("--systems", "qlever,jena", "--budget-hours", "80")
@@ -156,8 +217,10 @@ class FleetCells(unittest.TestCase):
             self.assertEqual(len(payload["group"]["systems"]), 1)
             system = payload["group"]["systems"][0]
             self.assertEqual("java" in job["requires"]["has"], system == "jena")
-            self.assertEqual(job["requires"]["ram_gb"], 28)  # sparql.toml's declared cap, no flat overhead
-            self.assertEqual(job["requires"]["cores"], 2)  # cargo-guarded.sh's documented floor
+            # sparql.toml's declared cap, plus the measured slice and the makers' container; cargo-guarded.sh's
+            # 2-job floor for the builds, raised only to a maker's CPUs.
+            self.asks(job)
+            self.assertEqual(job["env"]["CARGO_BUILD_JOBS"], "2")
         self.assertIn("resource basis", text)
 
     def test_permanently_unplaceable_cell_is_omitted_from_the_set(self):
@@ -187,14 +250,15 @@ class FleetCells(unittest.TestCase):
         from suitekit import fleet_cells
         make = fleet_cells.jobs
         def measured(groups, args):
-            groups[0]["measured"] = {"cores": 7}
+            # Above the makers' 8 CPUs (#132), which now raise the ask on their own: still a witness.
+            groups[0]["measured"] = {"cores": 20}
             return make(groups, args)
         with patch.object(fleet_cells, "jobs", side_effect=measured):
             code, text = self.run_plan("--systems", "jena,qlever", "--budget-hours", "80")
         self.assertEqual(code, 0, text)
         for job in self.document()["job"]:
             self.assertNotIn("DOCKER_CPUS", job["env"])
-            self.assertEqual(job["requires"]["cores"], 2)
+            self.asks(job)
 
     def test_identity_excludes_budget_owner_and_checkout(self):
         # Opus N1: same measured cells/trees/inputs retain identity across administration changes.
