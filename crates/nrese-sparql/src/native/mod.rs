@@ -481,8 +481,10 @@ pub(crate) fn delete_insert(
         let graph = |g: &GraphNamePattern| match g {
             GraphNamePattern::NamedNode(n) => Some(crate::compat::graph_named(n).into_owned()),
             GraphNamePattern::DefaultGraph => Some(nrese_rdf::GraphName::DefaultGraph),
+            // A value bound to the graph slot names a store graph as a constant does
+            // (review r1, S2-F2), whatever bound it: VALUES, BIND, SERVICE or GRAPH ?g.
             GraphNamePattern::Variable(v) => match value(v)? {
-                Term::NamedNode(n) => Some(n.into()),
+                Term::NamedNode(n) => Some(crate::compat::graph_named(&n).into_owned()),
                 Term::BlankNode(b) => Some(b.into()),
                 Term::Literal(_) | Term::Triple(_) => None,
             },
