@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hashbrown::{HashMap, HashSet};
-use nrese_exec::{Budget, BudgetExceeded, Reservation};
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
 use rayon::prelude::*;
 
 use self::found::Found;
@@ -199,8 +199,9 @@ impl<'a> Run<'a> {
 
     /// Room for `bytes` of copies on the way to [`minimal`], charged to the run's working
     /// budget before they are made, released when it drops.
-    fn room(&self, bytes: usize) -> Result<Reservation<Arc<Budget>>, BudgetExceeded> {
-        let mut held = Reservation::new(Arc::clone(self.scratch));
+    fn room(&self, bytes: usize) -> Result<Reservation<&'a Budget>, BudgetExceeded> {
+        // Borrowed: no reference count per call (it is taken per rule instance's product).
+        let mut held = Reservation::new(&**self.scratch);
         held.charge(bytes)?;
         Ok(held)
     }
@@ -257,8 +258,18 @@ fn table_bytes<K, V>(capacity: usize) -> usize {
 /// A set of graphs (indices into the caller's graph list) as a bitset: inline up to 128
 /// graphs, so a union is a word-wise OR and a subset test an AND-NOT, without allocation.
 /// Trailing zero words are trimmed, so equal sets are equal values.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// A copy holds exactly its words ([`Clone`] below, and a union's): what a copy's charge
+/// counts is what it allocates (`SmallVec`'s own clone rounds a spilled copy's capacity up to
+/// a power of two; review r1 C1 fix proof `p2c5-green17-e62a4843`).
+#[derive(Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GraphSet(smallvec::SmallVec<[u64; 2]>);
+
+impl Clone for GraphSet {
+    fn clone(&self) -> Self {
+        Self(smallvec::SmallVec::from_slice(&self.0))
+    }
+}
 
 impl GraphSet {
     /// The set of one graph.
@@ -275,7 +286,8 @@ impl GraphSet {
         } else {
             (other, self)
         };
-        let mut words = long.0.clone();
+        // The longer operand's words, exactly (see the type's doc).
+        let mut words = smallvec::SmallVec::from_slice(&long.0);
         for (w, o) in words.iter_mut().zip(&short.0) {
             *w |= o;
         }
@@ -484,7 +496,8 @@ fn support_sets_run(
         if poll.stopped() {
             return Err(run.stopped());
         }
-        let from = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll);
+        let from = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll, run)
+            .map_err(Stopped::Refused)?;
         merge(&mut sets, fact, from, cap, graphs_of, &mut annotations);
     }
     // The rules with their schema premises; transitivity as a rule here (the module's
@@ -563,7 +576,8 @@ fn support_sets_run(
         for fact in delta_facts(&delta) {
             for &bodiless in bodiless_by_premise.get(&fact).into_iter().flatten() {
                 let grounding = Grounding::Bodiless(bodiless);
-                let from = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll);
+                let from = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll, run)
+                    .map_err(Stopped::Refused)?;
                 bodiless_found
                     .add_all(bodiless, &from.sets, from.truncated)
                     .map_err(Stopped::Refused)?;
@@ -573,7 +587,8 @@ fn support_sets_run(
         for (k, &(rule, grounding)) in rules.iter().enumerate() {
             // The schema facts' part, once per rule and round: the minimal sets over the
             // alternative groundings.
-            let schema = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll);
+            let schema = grounding_sets(program, grounding, &sets, cap, &empty, &mut poll, run)
+                .map_err(Stopped::Refused)?;
             let Head::Facts(heads) = &rule.head else {
                 continue;
             };
@@ -629,7 +644,14 @@ fn support_sets_run(
                             .iter()
                             .map(|atom| super::eval::instantiate_head(atom, bindings)),
                     );
-                    let from = premise_sets_from(&body, schema, sets_now, cap);
+                    let from = match premise_sets_from(&body, schema, sets_now, cap, run) {
+                        Ok(from) => from,
+                        Err(exceeded) => {
+                            run.refuse(exceeded);
+                            refused = true;
+                            return;
+                        }
+                    };
                     for head in heads.iter() {
                         let fact = super::eval::instantiate_head(head, bindings);
                         if let Err(exceeded) = out.add_all(fact, &from.sets, from.truncated) {
@@ -1138,9 +1160,10 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
         rules
             .iter()
             .map(|&(_, grounding)| {
-                grounding_sets(program, grounding, &lookup, cap, &empty, &mut poll)
+                grounding_sets(program, grounding, &lookup, cap, &empty, &mut poll, run)
             })
-            .collect()
+            .collect::<Result<_, _>>()
+            .map_err(Stopped::Refused)?
     };
     run.check(held(&now, annotations))?;
     let by_grounding: HashMap<Grounding, usize> = rules
@@ -1178,11 +1201,13 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                     // latches the run, which its pollers see.
                     let mut from = run.found();
                     let mut refused = false;
-                    let mut take = |found: Annotation| {
+                    let mut take = |found: Result<Annotation, BudgetExceeded>| {
                         if refused {
                             return;
                         }
-                        if let Err(exceeded) = from.add_all(fact, &found.sets, found.truncated) {
+                        let added = found
+                            .and_then(|found| from.add_all(fact, &found.sets, found.truncated));
+                        if let Err(exceeded) = added {
                             run.refuse(exceeded);
                             refused = true;
                         }
@@ -1195,6 +1220,7 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                             cap,
                             &empty,
                             poll,
+                            run,
                         ));
                     }
                     // Each grounding's derivations of the fact, against its schema part.
@@ -1215,7 +1241,7 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                                     .map(|atom| instantiate_head(atom, bindings)),
                             );
                             if premises_in_closure(&body) {
-                                take(premise_sets_from(&body, schema, &lookup, cap));
+                                take(premise_sets_from(&body, schema, &lookup, cap, run));
                             }
                             false
                         });
@@ -1277,7 +1303,7 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                 if !premises_in_closure(&body) {
                     return Ok(());
                 }
-                let from = premise_sets_from(&body, &schemas[k], &lookup, cap);
+                let from = premise_sets_from(&body, &schemas[k], &lookup, cap, run)?;
                 for head in heads {
                     let fact = instantiate_head(head, bindings);
                     if members.contains(&fact) && !from.is_empty() {
@@ -1306,7 +1332,7 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
 
 /// The bytes of a list of `n` sets' slots.
 fn slots(n: usize) -> usize {
-    n * size_of::<GraphSet>()
+    n.saturating_mul(size_of::<GraphSet>())
 }
 
 /// The bytes a copy of `sets` holds beyond its slots: the words of sets past 128 graphs.
@@ -1438,6 +1464,10 @@ fn delta_facts(store: &Store) -> Vec<Triple> {
 /// Each alternative is a unit of attempted work on `poll`, counted before its premises are
 /// read (sol-loop r7, R7-1): stopped, the sets are incomplete, and the stage's check ends
 /// the run before they are used.
+///
+/// Every alternative's sets are held together until `minimal` chooses among them: their
+/// slots and words are charged to `run`'s working budget as they are added, and held
+/// through `minimal` (review r1 C1); `Err` where it has no room.
 fn grounding_sets<L: Lookup + ?Sized>(
     program: &GroundProgram,
     grounding: Grounding,
@@ -1445,29 +1475,55 @@ fn grounding_sets<L: Lookup + ?Sized>(
     cap: usize,
     empty: &Annotation,
     poll: &mut Poller<'_>,
-) -> Annotation {
-    let (mut all, mut truncated) = (Vec::new(), false);
+    run: &Run<'_>,
+) -> Result<Annotation, BudgetExceeded> {
+    let budget: &Budget = run.scratch;
+    let mut all: ChargedVec<GraphSet, &Budget> = ChargedVec::new(budget);
+    let mut held_words = Reservation::new(budget);
+    let (mut truncated, mut refused) = (false, None);
     program.for_each_alternative(grounding, poll, |premises, _| {
-        let found = premise_sets_from(premises, empty, sets, cap);
-        truncated |= found.truncated;
-        all.extend(found.sets);
-        ControlFlow::<()>::Continue(())
+        let added = premise_sets_from(premises, empty, sets, cap, run).and_then(|found| {
+            truncated |= found.truncated;
+            held_words.charge(words(&found.sets))?;
+            let n = found.sets.len();
+            all.fill(n, |room| {
+                found.sets.into_iter().for_each(|set| room.push(set))
+            })
+        });
+        match added {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(exceeded) => {
+                refused = Some(exceeded);
+                ControlFlow::Break(())
+            }
+        }
     });
+    if let Some(exceeded) = refused {
+        return Err(exceeded);
+    }
+    // The sets' slots charged until `minimal` has consumed them; their words beside them.
+    let (all, _slots) = all.into_parts();
     // A derivation's sets: whatever they lack is beyond the head's own graphs.
     let mut out = minimal(all, cap, &|_| false);
     out.truncated |= truncated;
     out.beyond_own |= truncated;
-    out
+    Ok(out)
 }
 
 /// The minimal unions of the sets `start` with one set per premise of `body`, marked if
 /// `start`'s, a premise's or a step's were; none if a premise has none yet.
+///
+/// Each step's product (every union of a kept set with one of the premise's) is charged to
+/// `run`'s working budget before it is built and held until `minimal` has consumed it: its
+/// slots, and at most the longer operand's words per union (review r1 C1); `Err` where it
+/// has no room. Exact: `minimal` sees the whole product, as before.
 fn premise_sets_from<L: Lookup + ?Sized>(
     body: &[Triple],
     start: &Annotation,
     sets: &L,
     cap: usize,
-) -> Annotation {
+    run: &Run<'_>,
+) -> Result<Annotation, BudgetExceeded> {
     // The usual case, one set everywhere: a single union, nothing to minimise.
     if let [only] = start.sets.as_slice() {
         let mut one = only.clone();
@@ -1475,7 +1531,7 @@ fn premise_sets_from<L: Lookup + ?Sized>(
         let mut single = true;
         for premise in body {
             let Some(own) = sets.sets_of(premise) else {
-                return Annotation::default();
+                return Ok(Annotation::default());
             };
             match own.sets.as_slice() {
                 [set] => {
@@ -1489,19 +1545,25 @@ fn premise_sets_from<L: Lookup + ?Sized>(
             }
         }
         if single {
-            return Annotation {
+            return Ok(Annotation {
                 sets: vec![one],
                 truncated,
                 beyond_own: truncated,
-            };
+            });
         }
     }
     let mut product = start.clone();
     for premise in body {
         let Some(own) = sets.sets_of(premise) else {
-            return Annotation::default();
+            return Ok(Annotation::default());
         };
-        let mut next = Vec::with_capacity(product.sets.len() * own.sets.len());
+        // Charged first: past what a budget can count, refused as having no room.
+        let n = product.sets.len().saturating_mul(own.sets.len());
+        let bytes = slots(n)
+            .saturating_add(own.sets.len().saturating_mul(words(&product.sets)))
+            .saturating_add(product.sets.len().saturating_mul(words(own.sets.iter())));
+        let _room = run.room(bytes)?;
+        let mut next = Vec::with_capacity(n);
         for a in &product.sets {
             for b in own.sets.iter() {
                 next.push(a.union(b));
@@ -1513,10 +1575,10 @@ fn premise_sets_from<L: Lookup + ?Sized>(
         product.beyond_own |= truncated;
     }
     // A premise without sets yet: the instance gives nothing now, whatever was cut.
-    match product.is_empty() {
+    Ok(match product.is_empty() {
         true => Annotation::default(),
         false => product,
-    }
+    })
 }
 
 /// Adds `from` (derivations of `fact`) to `fact`'s sets, `annotations` following the heap
