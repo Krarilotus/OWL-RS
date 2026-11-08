@@ -547,6 +547,43 @@ fn existentials_in_right_sides_the_tbox_reads_as_nothing_are_hazards() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// Disjointness concludes a part's complement (fix check r1, F3), read in negation normal
+/// form. An `A` disjoint from `≤ 0 S.D` is in `≥ 1 S.D`; one disjoint from `∀S.¬D` is in
+/// `∃S.D`. Either way it has an `S`-successor in `D` (OWL 2 Direct Semantics), so every
+/// atom of `S(?x ?y), D(?y)` has a concern. The reason may be any hazard that reaches it.
+/// Guards, with no anonymous individual: `≤ 0 S.D` and `∀S.¬D` as a plain conclusion, and
+/// named disjoint classes.
+#[test]
+fn disjointness_concludes_the_complement_of_its_parts() {
+    let none = "ObjectMaxCardinality(0 :S :D)";
+    let all_not = "ObjectAllValuesFrom(:S ObjectComplementOf(:D))";
+    let mut wrong = Vec::new();
+    for axioms in [
+        format!("DisjointUnion(:C :A {none})"),
+        format!("DisjointUnion(:C :A {all_not})"),
+        format!("DisjointClasses(:A {none})"),
+        format!("DisjointClasses({all_not} :A)"),
+    ] {
+        let found = concerns(&axioms, "S(?x ?y), D(?y)");
+        if found.len() != 2 {
+            wrong.push(format!(
+                "{axioms}: {found:?}, expected a concern on S and on D"
+            ));
+        }
+    }
+    for axioms in [
+        format!("SubClassOf(:C {none})"),
+        format!("SubClassOf(:C {all_not})"),
+        "DisjointClasses(:A :B)".to_owned(),
+    ] {
+        let found = concerns(&axioms, "S(?x ?y), D(?y), A(?x)");
+        if !found.is_empty() {
+            wrong.push(format!("{axioms}: {found:?}, expected nothing"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 #[test]
 fn an_equating_hazard_is_not_hidden_by_another_on_the_same_role() {
     // Found by the mixed differential test (case 2378 of seed 11): a transitive property
