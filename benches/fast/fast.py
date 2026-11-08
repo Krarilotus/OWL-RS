@@ -55,6 +55,9 @@ from suitekit.runtime import end_scope, scope_argv  # noqa: E402
 from suitekit.compare import (KEPT_POINTS, UNSTABLE_PEAK, bootstrap_ratio, client_throughput,  # noqa: E402,F401
                               compare_reports, counter_changes, load_report, peak_spread, pooled,
                               process_peak, series_ratios, spread, statistic, thin)
+# Every record says the generation of its timing units (compare.units_check() normalises or refuses
+# a mix; fix check r2 of pkg/declared-metrics).
+from suitekit.compare import SERIES_UNITS  # noqa: E402
 from suitekit.workloads import fast_data_name  # noqa: E402
 from suitekit import ns  # noqa: E402
 
@@ -1283,7 +1286,16 @@ def cold_ms(result: dict) -> float | None:
     return result["open_s"] * 1000.0 + sum(firsts)
 
 
+def ms_scale(metric: str) -> float:
+    """The factor from a metric's declared unit to the milliseconds every timed series and metric value
+    is in: a field in seconds (its last name ends in `_s`: load_s, open_s, commits.whole_s) times 1000,
+    anything else as it is (review r1 of pkg/declared-metrics, R1-F1: `commits.whole_s` reached the
+    series in seconds, under the comparison's 2 ms floor)."""
+    return 1000.0 if metric.rsplit(".", 1)[-1].endswith("_s") else 1.0
+
+
 def metric_value(case: dict, result: dict):
+    """The case's declared metric in this result, in milliseconds (ms_scale())."""
     case = {**case, "metric": timed_metric(case)}
     if case["metric"] == "cold_ms":
         # With the page cache warm and emptied: the sum of the two modes' medians.
@@ -1292,12 +1304,13 @@ def metric_value(case: dict, result: dict):
             if values:
                 total = (total or 0.0) + statistics.median(values)
         return total
+    scale = ms_scale(case["metric"])
     value = lookup(case["metric"], result)
-    if case["metric"] in ("load_s", "open_s") and value is not None:
-        value = value * 1000.0
-    if "_repeats" in result and case["metric"] in ("load_s", "open_s", "clients.p99_ms", "canonicalize.p50_ms"):
+    if value is not None:
+        value = value * scale
+    if "_repeats" in result and (scale != 1.0 or case["metric"] in ("clients.p99_ms", "canonicalize.p50_ms")):
         values = [lookup(case["metric"], r) for r in result["_repeats"]]
-        values = [v * (1000.0 if case["metric"] in ("load_s", "open_s") else 1.0) for v in values if v is not None]
+        values = [v * scale for v in values if v is not None]
         value = statistics.median(values) if values else value
     return value
 
@@ -1309,7 +1322,7 @@ def samples(case: dict, result: dict) -> dict:
     if result.get("client_sweep"):
         return {f"{level['clients']} clients p99": [level["p99_ms"]] for level in result["client_sweep"]}
     if case.get("sweep") and "_repeats" in result:
-        scale = 1000.0 if metric in ("load_s", "open_s") else 1.0
+        scale = ms_scale(metric)
         series: dict[str, list[float]] = {}
         for r in result["_repeats"]:
             value = lookup(metric, r)
@@ -1334,13 +1347,17 @@ def samples(case: dict, result: dict) -> dict:
     section = metric.split(".")[0]
     # Repeated processes (`repeat`) pool their samples, as the queries' above.
     runs = result.get("_repeats", [result])
-    if isinstance(result.get(section), dict) and "samples_ms" in result[section]:
+    # A section's samples are its own latency: they stand for the metric only where the metric is
+    # that latency's median (`SECTION.p50_ms`). Another field of it (a read latency, a p99, a max) is
+    # its own value, per process below (the orchestrator, 7 Nov 2026: C1's `commits.read_p50_ms` was
+    # timed by its commits' samples, and a 2,500-fold read slowdown was in no hypothesis).
+    if metric == f"{section}.p50_ms" and isinstance(result.get(section), dict) and "samples_ms" in result[section]:
         return {"_": [s for r in runs for s in (r.get(section) or {}).get("samples_ms", [])]}
     if "samples_ms" in result:
         return {"_": [s for r in runs for s in r.get("samples_ms", []) if s is not None]}
     if "_repeats" in result:
         values = [lookup(metric, r) for r in result["_repeats"]]
-        scale = 1000.0 if metric in ("load_s", "open_s") else 1.0
+        scale = ms_scale(metric)
         return {"_": [v * scale for v in values if v is not None]}
     value = metric_value(case, result)
     return {"_": [value]} if value is not None else {}
@@ -1741,6 +1758,7 @@ def run(args) -> int:
                           "checks": [], "routes": [], "samples": {}, "metric": None,
                           "expected_outcome": case.get("outcome", "ok")}
             record["verdict"] = verdict(case, record)
+            record["series_units"] = SERIES_UNITS
             # The case's own time, without the wait for the quiet slot.
             record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
             record["inputs"] = case_inputs(case)  # the frozen bytes it loaded (compare.input_check)
@@ -1958,6 +1976,7 @@ def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict],
                           "checks": [], "routes": [], "samples": {}, "metric": None,
                           "expected_outcome": case.get("outcome", "ok")}
             record["verdict"] = verdict(case, record)
+            record["series_units"] = SERIES_UNITS
             record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
             record["inputs"] = case_inputs(case)  # the frozen bytes it loaded (compare.input_check)
             record.update(started_ns=start_ns, finished_ns=time.time_ns(), block=args.block, layout=args.layout,
