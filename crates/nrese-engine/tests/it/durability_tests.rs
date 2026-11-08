@@ -1184,3 +1184,17 @@ fn a_checkpoint_orders_equal_long_texts() {
     assert!(snapshot.text_order_ready());
     assert_eq!(snapshot.matching_strings(&test).len(), 2);
 }
+
+/// A reopen gives a new asserted identity (P2-C1, DUR's condition): it is never persisted,
+/// so a cache keyed by it can't take one process's state for another's.
+#[test]
+fn a_reopen_gives_a_new_asserted_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        commit_all(&engine, &batches(0..2));
+        engine.snapshot().asserted_identity()
+    };
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_ne!(engine.snapshot().asserted_identity(), before);
+}

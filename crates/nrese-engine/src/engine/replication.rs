@@ -347,6 +347,7 @@ impl Engine {
         });
         self.inner
             .publish_record(record, false, dictionary_len, changes_equality)
+            .map(|_| ())
     }
 }
 
@@ -799,6 +800,7 @@ mod tests {
                 dictionary_len: current.dictionary_len,
                 equality: std::sync::Arc::clone(&current.equality),
                 content: current.content,
+                asserted_content: current.asserted_content,
                 canonical: Default::default(),
             });
         let mut records = decoded(&batch.frames);

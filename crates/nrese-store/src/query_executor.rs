@@ -83,7 +83,7 @@ impl StoreSettings {
     }
 
     /// The QL rewriting queries get now.
-    fn ql(&self) -> Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>> {
+    pub(crate) fn ql(&self) -> Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>> {
         self.ql.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 }
