@@ -27,7 +27,7 @@ use nrese_engine::{
 use nrese_rdf::{BlankNode, GraphName as OxGraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use nrese_sparql_syntax::algebra::GraphTarget;
 use nrese_sparql_syntax::term::{GraphName, GroundQuad, Quad as DataQuad};
-use nrese_sparql_syntax::{GraphUpdateOperation, Update};
+use nrese_sparql_syntax::{GraphUpdateOperation, TransferOp, Update};
 use thiserror::Error;
 
 use crate::results::{QueryDatasetSpecification, QueryEvaluationError};
@@ -224,14 +224,31 @@ fn apply_operation(
         GraphUpdateOperation::Clear { graph, .. } | GraphUpdateOperation::Drop { graph, .. } => {
             clear(tx, graph, options)?;
         }
-        GraphUpdateOperation::Add { from, to, .. } => add(tx, from, to, options)?,
+        GraphUpdateOperation::Transfer { op, from, to, .. } => {
+            // SPARQL 1.1 Update §3.2.3–3.2.5: a transfer between two names of one store graph
+            // changes nothing (review r1 of slice 2, S2-F1); the names are resolved first.
+            if graph_name(from) == graph_name(to) {
+                return Ok(());
+            }
+            let target = |graph: &GraphName| match graph {
+                GraphName::NamedNode(name) => GraphTarget::NamedNode(name.clone()),
+                GraphName::DefaultGraph => GraphTarget::DefaultGraph,
+            };
+            if *op != TransferOp::Add {
+                clear(tx, &target(to), options)?;
+            }
+            add(tx, from, to, options)?;
+            if *op == TransferOp::Move {
+                clear(tx, &target(from), options)?;
+            }
+        }
     }
     Ok(())
 }
 
 /// `ADD`, and the copy step of `MOVE` and `COPY`: every asserted statement of `from`, in the
 /// state before the operation, inserted into `to`. Its input is the graph as stored, not what
-/// a `WHERE` clause reads ([`GraphUpdateOperation::Add`]): no union default graph, inferred
+/// a `WHERE` clause reads ([`GraphUpdateOperation::Transfer`]): no union default graph, inferred
 /// statement or protocol dataset. A graph the user may not read is absent, so nothing is
 /// copied from it; inserting into a graph the user may not write fails the request.
 fn add(
