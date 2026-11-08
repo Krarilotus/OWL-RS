@@ -172,6 +172,86 @@ class LoadedInputs(unittest.TestCase):
         self.assertIn("faster", text)
         self.assertEqual(code, 0, text)
 
+    ABSENT = object()  # a record before 7 Nov 2026: no `inputs` key at all
+
+    def reps(self, ms, observations, case="rl-hierarchy"):
+        """A report of one case whose records each say what they loaded: a mapping, or ABSENT."""
+        records = []
+        for rep, seen in enumerate(observations, 1):
+            record = {"case": case, "rep": rep, "status": "ok", "samples": {"reason.p50_ms": [ms, ms]}, "metric": ms}
+            if seen is not self.ABSENT:
+                record["inputs"] = seen
+            records.append(record)
+        return {"reps": len(records), "machine": {"host": "fixture", "governor": "performance"},
+                "started": "2026-11-07T16:00:00", "records": records}
+
+    def test_recorded_external_bytes_that_disagree_are_not_generated_data(self):
+        """Fix check r3, R3-W1 (7 Nov 2026): a case that once loaded a frozen file (`volume:history.nt`)
+        and now generates its data under the same name (today's rl-hierarchy declares no input). A
+        historical run without --prepared recorded other bytes of that file in its two repetitions; its
+        records collapsed to "unknown", the generated-only exemption read that as "no input", and the
+        new run came out faster, exit 0. Specified (the review's required correction): the exemption
+        holds only where no record on either side names an external file; recorded external evidence
+        that disagrees, or that only some records state, is unknown and refused before pooling."""
+        a, b = {"history.nt": "a" * 64}, {"history.nt": "b" * 64}
+        generated = [{}, {}]
+        for label, old, new in (("the base's repetitions disagree", [a, b], generated),
+                                ("one base repetition records a file, one says nothing", [a, self.ABSENT], generated),
+                                ("one base repetition records a file, one records none", [a, {}], generated),
+                                ("the base disagrees, the new run says nothing", [a, b], [self.ABSENT, self.ABSENT]),
+                                ("both sides disagree", [a, b], [b, a]),
+                                ("the new run's repetitions disagree", generated, [a, b])):
+            with self.subTest(label):
+                code, text = self.compare(self.reps(100.0, old), self.reps(50.0, new))
+                self.assertEqual(code, 2, text)
+                self.assertNotIn("faster", text)
+                self.assertIn("input unknown", text)
+        # The public entry point (suite.py compare / fast.py compare BASE.json NEW.json), the review's witness.
+        with tempfile.TemporaryDirectory() as d:
+            old, new = Path(d) / "history-base.json", Path(d) / "history-new.json"
+            old.write_text(json.dumps(self.reps(100.0, [a, b])), encoding="utf-8")
+            new.write_text(json.dumps(self.reps(50.0, generated)), encoding="utf-8")
+            self.assertEqual(compare.main([str(old), str(new)]), 2)
+            text = output(compare.main, [str(old), str(new)])
+            self.assertNotIn("faster", text)
+            self.assertIn("input unknown", text)
+
+    def test_an_inputs_field_that_isn_t_a_mapping_is_not_none(self):
+        """Design note r3w1, invariant 1: a record that has `inputs` but not as a mapping of file to
+        hash says something was recorded, not that nothing was loaded; for a case of generated data
+        today it is unknown, never the generated-only exemption."""
+        for seen in (None, [], "lubm-10.nt", 0):
+            with self.subTest(inputs=seen):
+                code, text = self.compare(self.reps(100.0, [seen, seen]), self.reps(50.0, [{}, {}]))
+                self.assertEqual(code, 2, text)
+                self.assertNotIn("faster", text)
+
+    def test_generated_data_alone_compares_whatever_mix_of_old_and_new_records(self):
+        """Sol-loop r3 V3, kept by R3-W1's correction: records that name no external file, older ones
+        without `inputs` and newer ones saying {} in any mix, on either side, compare."""
+        for old, new in (([self.ABSENT, {}], [{}, {}]), ([{}, {}], [self.ABSENT, {}]),
+                         ([self.ABSENT, self.ABSENT], [{}, self.ABSENT]), ([{}, {}], [{}, {}])):
+            with self.subTest(old=old, new=new):
+                code, text = self.compare(self.reps(100.0, old), self.reps(50.0, new))
+                self.assertEqual(code, 0, text)
+                self.assertIn("faster", text)
+                self.assertNotIn("input unknown", text)
+
+    def test_a_case_s_agreeing_records_compare_and_one_silent_record_doesn_t(self):
+        """A case that loads frozen files: every record stating the same bytes on both sides compares;
+        one record that doesn't say makes its side unknown (R3-W1's correction: no record's
+        observation is dropped on the way to the decision)."""
+        same = {"lubm-10.nt": self.NEW, "univ-bench.nt": "u" * 64}
+        code, text = self.compare(self.reps(100.0, [same, same], "rdfs-full-lubm10"),
+                                  self.reps(50.0, [same, same], "rdfs-full-lubm10"))
+        self.assertEqual(code, 0, text)
+        self.assertIn("faster", text)
+        code, text = self.compare(self.reps(100.0, [same, self.ABSENT], "rdfs-full-lubm10"),
+                                  self.reps(50.0, [same, same], "rdfs-full-lubm10"))
+        self.assertEqual(code, 2, text)
+        self.assertNotIn("faster", text)
+        self.assertIn("input unknown", text)
+
     def test_a_concatenation_s_order_is_part_of_its_input(self):
         """Sol-loop r3 V2: the same parts concatenated in another order are other bytes loaded."""
         a = {"lubm-1.nt": "l" * 64, "univ-bench.nt": "u" * 64, "concat 1": "a" * 64}
