@@ -299,7 +299,8 @@ pub(crate) fn run(
 }
 
 /// `read` over `items` into `out`, both split into one part per thread. The threads start
-/// before the window opens and end after it closes, so neither is counted.
+/// before the window opens and end after it closes, so neither is counted. A reader that
+/// panics still meets the barriers, and the run fails with its message.
 fn parallel<T: Sync, O: Send>(
     threads: usize,
     snapshot: &Snapshot,
@@ -319,9 +320,18 @@ fn parallel<T: Sync, O: Send>(
                 let (start, done, end, read) = (&start, &done, &end, &read);
                 scope.spawn(move || {
                     start.wait();
-                    read(&snapshot, part, out);
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        read(&snapshot, part, out)
+                    }));
                     done.wait();
                     end.wait();
+                    outcome.map_err(|panic| {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+                        format!("a reader panicked: {}", message.unwrap_or("(no message)"))
+                    })
                 })
             })
             .collect();
@@ -330,10 +340,12 @@ fn parallel<T: Sync, O: Send>(
             done.wait();
         });
         end.wait();
-        for reader in readers {
-            reader.join().expect("a reader panicked");
-        }
-        counted
+        let read = readers.into_iter().try_for_each(|reader| {
+            reader
+                .join()
+                .unwrap_or_else(|_| Err("a reader panicked at a barrier".into()))
+        });
+        counted.and(read)
     })
 }
 
