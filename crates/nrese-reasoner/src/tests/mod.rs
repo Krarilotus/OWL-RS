@@ -11,6 +11,7 @@ use super::rulesets::Ruleset;
 use super::vocabulary::LocalVocabulary;
 
 mod attempted;
+mod sources;
 mod stops;
 
 const EX: &str = "http://example.com/";
