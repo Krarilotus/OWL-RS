@@ -914,15 +914,32 @@ pub fn over_memory_limit() -> bool {
 /// ([`nrese_exec::memory::process_limit_stop`]).
 pub type MemoryPoll<'a> = &'a (dyn Fn() -> Option<nrese_exec::memory::MemoryStopCause> + Sync);
 
+/// What an operation's own memory limit leaves it now, read when asked: a store's watch
+/// ([`nrese_exec::memory::MemoryWatch::room`]), whose limit the process's needn't be.
+pub type MemoryRoom<'a> = &'a (dyn Fn() -> nrese_exec::memory::Reading + Sync);
+
+/// What the process's memory limit leaves now, if one is set (the limit less what the
+/// process holds, as [`over_memory_limit`] reads it); without one, no bound.
+fn process_room() -> nrese_exec::memory::Reading {
+    use nrese_exec::memory;
+    match memory::process_limit() {
+        Some(limit) => memory::process_bytes().map(|held| limit.saturating_sub(held)),
+        None => Ok(u64::MAX),
+    }
+}
+
 /// One operation's stop (a materialisation, a commit's maintenance): its caller's `stop`,
 /// or the process's memory limit. Once it fires it stays fired for this operation, so a
 /// morsel it made skip is never taken for done by a later poll that finds the memory under
 /// the limit again, and it keeps the memory's cause of that moment ([`Self::interrupted`]),
 /// whatever another operation's poll reads since. The next operation makes its own and may
-/// run.
+/// run. It also says what memory the operation may still take ([`Self::room`]), and ends
+/// it for its memory where an allocation of a known size doesn't fit ([`Self::refuse`]).
 pub struct OperationStop<'a> {
     caller: Stop<'a>,
     memory: MemoryPoll<'a>,
+    /// The operation's own memory limit's room, beside the process's ([`Self::within`]).
+    room: Option<MemoryRoom<'a>>,
     /// 0: not fired; else what fired it ([`OperationStop::fired`]).
     fired: std::sync::atomic::AtomicU8,
 }
@@ -938,8 +955,50 @@ impl<'a> OperationStop<'a> {
         Self {
             caller,
             memory,
+            room: None,
             fired: std::sync::atomic::AtomicU8::new(0),
         }
+    }
+
+    /// Under the operation's own memory limit too, whose room `room` reads: what it admits
+    /// is the least of that room and [`Self::room`]'s others.
+    pub fn within(self, room: MemoryRoom<'a>) -> Self {
+        Self {
+            room: Some(room),
+            ..self
+        }
+    }
+
+    /// What the operation may still take now: the least of what its own memory limit
+    /// leaves ([`Self::within`]), what the process's leaves, if one is set, and what the
+    /// system leaves the process ([`nrese_exec::memory::remaining_bytes`]). Read when
+    /// asked, once before allocations whose size is known, which a poll would only see
+    /// once they are made. A reading that can't be taken is no room: its cause is
+    /// [`MemoryStopCause::Unread`](nrese_exec::memory::MemoryStopCause).
+    pub fn room(&self) -> Result<u64, nrese_exec::memory::MemoryStopCause> {
+        let own = self.room.map_or(Ok(u64::MAX), |room| room());
+        [own, process_room(), nrese_exec::memory::remaining_bytes()]
+            .into_iter()
+            .try_fold(u64::MAX, |least, room| room.map(|room| least.min(room)))
+            .map_err(|_| nrese_exec::memory::MemoryStopCause::Unread)
+    }
+
+    /// Ends the operation for its memory (`cause`): it fires from now on, and the
+    /// interruption returned, as [`Self::interrupted`] gives it later, says why, unless it
+    /// had fired before (the first to fire it names it).
+    pub fn refuse(&self, cause: nrese_exec::memory::MemoryStopCause) -> super::delta::Interrupted {
+        use nrese_exec::memory::MemoryStopCause;
+        let code = match cause {
+            MemoryStopCause::OverLimit => Self::OVER_LIMIT,
+            MemoryStopCause::Unread => Self::UNREAD,
+        };
+        let _ = self.fired.compare_exchange(
+            0,
+            code,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.interrupted()
     }
 
     /// Whether the operation is to stop: an atomic load once it has.
