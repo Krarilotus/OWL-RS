@@ -23,6 +23,7 @@
 use hashbrown::HashSet;
 
 use super::Base;
+use crate::eval::Poller;
 use crate::ir::Triple;
 
 /// The plan an update took.
@@ -103,6 +104,7 @@ fn equality_region<B: Base + ?Sized>(
     base: &B,
     same_as: u64,
     equalities: impl Iterator<Item = Triple>,
+    poll: &Poller<'_>,
 ) -> Option<(HashSet<u64>, u64, u64)> {
     let mut terms: HashSet<u64> = HashSet::new();
     let (mut facts, mut dred) = (0u64, 0u64);
@@ -119,7 +121,7 @@ fn equality_region<B: Base + ?Sized>(
                 [Some(x), Some(same_as), None],
                 [None, Some(same_as), Some(x)],
             ] {
-                base.scan(pattern, &mut |t| {
+                base.scan(pattern, poll, &mut |t| {
                     for y in [t[0], t[2]] {
                         if members.insert(y) {
                             queue.push(y);
@@ -137,7 +139,7 @@ fn equality_region<B: Base + ?Sized>(
                 [None, Some(m), None],
                 [None, None, Some(m)],
             ] {
-                class_facts = class_facts.saturating_add(base.estimate(pattern) as u64);
+                class_facts = class_facts.saturating_add(base.estimate(pattern, poll) as u64);
             }
         }
         facts = facts.saturating_add(class_facts);
@@ -152,13 +154,15 @@ fn equality_region<B: Base + ?Sized>(
 }
 
 /// The decision for an update whose overdeletion meets `equalities` (deleted or about to
-/// be overdeleted), under `policy`.
+/// be overdeleted), under `policy`, reading on `poll`: stopped, the decision means
+/// nothing, and the caller asks its latched stop before acting on it.
 pub(super) fn plan_for_equalities<B: Base + ?Sized>(
     base: &B,
     same_as: u64,
     equalities: impl Iterator<Item = Triple>,
     policy: Policy,
     counts: &mut Counts,
+    poll: &Poller<'_>,
 ) -> Decision {
     let mut equalities = equalities.peekable();
     if equalities.peek().is_none() {
@@ -171,7 +175,7 @@ pub(super) fn plan_for_equalities<B: Base + ?Sized>(
         // class's walk was 52 of a 500-member split's 115 ms).
         return Decision::Rebuild;
     }
-    let Some((terms, facts, dred)) = equality_region(base, same_as, equalities) else {
+    let Some((terms, facts, dred)) = equality_region(base, same_as, equalities, poll) else {
         return Decision::Keep;
     };
     let recompute = RECOMPUTE_PER_FACT.saturating_mul(facts);

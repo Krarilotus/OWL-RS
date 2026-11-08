@@ -184,17 +184,19 @@ fn components(nodes: usize, edges: &[(usize, usize)]) -> Vec<usize> {
         .collect()
 }
 
-/// The `owl:sameAs` partners of `term` in `source` (other than itself).
+/// The `owl:sameAs` partners of `term` in `source` (other than itself), read on `poll`.
 pub fn same_as_partners<S: Source + ?Sized>(
     source: &S,
     same_as: Option<u64>,
     term: u64,
+    poll: &super::eval::Poller<'_>,
 ) -> Vec<u64> {
     let mut out = Vec::new();
     if let Some(same_as) = same_as {
         source.scan(
             [Some(term), Some(same_as), None],
             super::eval::Seg::All,
+            poll,
             &mut |t| {
                 if t[2] != term {
                     out.push(t[2]);

@@ -4,7 +4,8 @@
 use nrese_engine::{GraphSelector, ReadModel, Snapshot, TermId, Transaction};
 
 use super::{Program, decoded, pattern, triple};
-use crate::delta::Base;
+use crate::delta::VisitsBase;
+use crate::eval::{Probe, Visit};
 use crate::ir::{Triple, Violation};
 
 /// What an OWL 2 RL consistency rule's violation means, for reject reports.
@@ -327,31 +328,35 @@ pub(crate) struct SnapshotBase<'a> {
     pub(crate) axioms: &'a [Triple],
 }
 
-impl Base for SnapshotBase<'_> {
-    fn scan(&self, bound: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
+/// Reads count as [`Base`] says: each quad a scan visits is a delivered position; it
+/// filters nothing.
+impl VisitsBase for SnapshotBase<'_> {
+    fn visit(&self, bound: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
         for quad in self
             .snapshot
             .quads_for_pattern_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any))
         {
-            f(triple(quad));
+            if !visit.fact(triple(quad)) {
+                return;
+            }
         }
     }
 
-    fn estimate(&self, bound: [Option<u64>; 3]) -> usize {
+    fn size(&self, bound: [Option<u64>; 3], _: Probe<'_, '_>) -> usize {
         let count = self
             .snapshot
             .estimate_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any));
         usize::try_from(count).unwrap_or(usize::MAX)
     }
 
-    fn contains(&self, fact: Triple) -> bool {
+    fn holds(&self, fact: Triple, _: Probe<'_, '_>) -> bool {
         self.snapshot.exists_in(
             ReadModel::Materialised,
             &pattern(fact.map(Some), GraphSelector::Any),
         )
     }
 
-    fn is_asserted(&self, fact: Triple) -> bool {
+    fn asserts(&self, fact: Triple, _: Probe<'_, '_>) -> bool {
         self.axioms.binary_search(&fact).is_ok()
             || self.snapshot.exists_in(
                 ReadModel::Asserted,

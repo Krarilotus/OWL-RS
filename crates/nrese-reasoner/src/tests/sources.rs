@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::load;
 use crate::batch::Schema;
-use crate::delta::{Base, Interrupted, MemoryBase, Rules, update_until};
+use crate::delta::{Interrupted, MemoryBase, Rules, VisitsBase, update_until};
+use crate::eval::{Probe, Visit};
 use crate::ir::{Triple, parse_rules};
 use crate::vocabulary::LocalVocabulary;
 
@@ -21,27 +22,28 @@ struct Probed {
     probes: AtomicUsize,
 }
 
-impl Base for Probed {
-    fn scan(&self, pattern: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
+/// Reads are the inner base's.
+impl VisitsBase for Probed {
+    fn visit(&self, pattern: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
         if pattern == self.trigger {
             self.armed.store(true, Ordering::Relaxed);
         }
-        self.base.scan(pattern, f);
+        self.base.visit(pattern, visit);
     }
 
-    fn estimate(&self, pattern: [Option<u64>; 3]) -> usize {
-        self.base.estimate(pattern)
+    fn size(&self, pattern: [Option<u64>; 3], probe: Probe<'_, '_>) -> usize {
+        self.base.size(pattern, probe)
     }
 
-    fn contains(&self, fact: Triple) -> bool {
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
         if self.armed.load(Ordering::Relaxed) {
             self.probes.fetch_add(1, Ordering::Relaxed);
         }
-        self.base.contains(fact)
+        self.base.holds(fact, probe)
     }
 
-    fn is_asserted(&self, fact: Triple) -> bool {
-        self.base.is_asserted(fact)
+    fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
+        self.base.asserts(fact, probe)
     }
 }
 

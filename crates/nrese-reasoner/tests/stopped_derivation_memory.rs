@@ -7,7 +7,7 @@
 use nrese_exec::measure;
 use nrese_reasoner::batch::{self, Schema};
 use nrese_reasoner::delta::{MemoryBase, Rules, program};
-use nrese_reasoner::eval::{OperationStop, Seg, Source};
+use nrese_reasoner::eval::{OperationStop, Probe, Seg, Visit, Visits};
 use nrese_reasoner::ir::{RDFS, Vocabulary, parse_rules};
 use nrese_reasoner::vocabulary::LocalVocabulary;
 
@@ -79,22 +79,33 @@ fn a_stopped_derivation_check_allocates_nothing() {
     );
 }
 
-/// The closure's facts in a list: what the checks would read, had they work to do.
+/// The closure's facts in a list: what the checks would read, had they work to do. Reads
+/// count as `Source` says: the call, then each fact a scan visits.
 struct Facts(Vec<[u64; 3]>);
 
-impl Source for Facts {
-    fn scan(&self, pattern: [Option<u64>; 3], _: Seg, f: &mut dyn FnMut([u64; 3])) {
+impl Visits for Facts {
+    fn visit(&self, pattern: [Option<u64>; 3], _: Seg, visit: &mut Visit<'_, '_>) {
         let matches = |t: &[u64; 3]| (0..3).all(|i| pattern[i].is_none_or(|v| v == t[i]));
-        self.0.iter().filter(|t| matches(t)).for_each(|&t| f(t));
+        for t in &self.0 {
+            let going = match matches(t) {
+                true => visit.fact(*t),
+                false => visit.skip(),
+            };
+            if !going {
+                return;
+            }
+        }
     }
 
-    fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize {
-        let mut n = 0;
-        self.scan(pattern, seg, &mut |_| n += 1);
-        n
+    fn size(&self, pattern: [Option<u64>; 3], _: Seg, probe: Probe<'_, '_>) -> usize {
+        let matches = |t: &[u64; 3]| (0..3).all(|i| pattern[i].is_none_or(|v| v == t[i]));
+        match probe.units(self.0.len()) {
+            true => self.0.iter().filter(|t| matches(t)).count(),
+            false => 0,
+        }
     }
 
-    fn contains(&self, fact: [u64; 3]) -> bool {
-        self.0.contains(&fact)
+    fn holds(&self, fact: [u64; 3], probe: Probe<'_, '_>) -> bool {
+        probe.units(self.0.len()) && self.0.contains(&fact)
     }
 }

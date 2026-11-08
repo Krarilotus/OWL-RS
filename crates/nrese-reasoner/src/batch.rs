@@ -31,8 +31,8 @@ use rayon::prelude::*;
 use super::delta::Interrupted;
 pub use super::eval::Schema;
 use super::eval::{
-    AllFacts, GroundProgram, Job, MORSEL, NEVER, OperationStop, Probes, Seg, Source, guards_hold,
-    run_jobs_by_morsel,
+    AllFacts, GroundProgram, Job, MORSEL, NEVER, OperationStop, Poller, Probe, Probes, Seg, Source,
+    Visit, Visits, guards_hold, run_jobs_by_morsel,
 };
 use super::ir::Triple;
 use super::ir::{Guard, Head, Rule, SharedClasses, Term};
@@ -768,33 +768,41 @@ impl Run {
         self.so.contains((s, o))
     }
 
-    /// Calls `f` with every `(s, o)` matching the bound positions that `keep` accepts.
+    /// Hands every position matching the bound positions to `f`: a pair `keep` accepts as
+    /// [`At::Pair`], every other position it visits (the ones `keep` or the object filter
+    /// passes over) as [`At::Skip`]; ends once `f` returns false (the reader's poller
+    /// stopped: [`Visit`]).
     fn scan(
         &self,
         s: Option<u64>,
         o: Option<u64>,
         keep: &dyn Fn(u64, u64) -> bool,
         missed: &std::sync::atomic::AtomicU64,
-        f: &mut dyn FnMut(u64, u64),
+        f: &mut dyn FnMut(At) -> bool,
     ) {
+        let at = |s, o| match keep(s, o) {
+            true => At::Pair(s, o),
+            false => At::Skip,
+        };
         match (s, o) {
             (Some(s), Some(o)) => {
-                if self.contains(s, o) && keep(s, o) {
-                    f(s, o);
-                }
+                f(match self.contains(s, o) {
+                    true => at(s, o),
+                    false => At::Skip,
+                });
             }
             (Some(s), None) => {
                 for &(_, o) in self.so.range(s).flatten() {
-                    if keep(s, o) {
-                        f(s, o);
+                    if !f(at(s, o)) {
+                        return;
                     }
                 }
             }
             (None, Some(o)) => match &self.os {
                 Some(os) => {
                     for &(_, s) in os.range(o).flatten() {
-                        if keep(s, o) {
-                            f(s, o);
+                        if !f(at(s, o)) {
+                            return;
                         }
                     }
                 }
@@ -805,16 +813,20 @@ impl Run {
                         missed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     for &(s, other) in self.so.iter() {
-                        if other == o && keep(s, o) {
-                            f(s, o);
+                        let at = match other == o {
+                            true => at(s, o),
+                            false => At::Skip,
+                        };
+                        if !f(at) {
+                            return;
                         }
                     }
                 }
             },
             (None, None) => {
                 for &(s, o) in self.so.iter() {
-                    if keep(s, o) {
-                        f(s, o);
+                    if !f(at(s, o)) {
+                        return;
                     }
                 }
             }
@@ -898,14 +910,15 @@ impl Run {
         true
     }
 
-    /// [`Run::scan`] without the pairs `marks` marks.
+    /// [`Run::scan`] without the pairs `marks` marks: each slice's positions handed on
+    /// ahead ([`At::Ahead`], the marked ones included), its pairs, then [`At::Settle`].
     fn scan_unmarked(
         &self,
         s: Option<u64>,
         o: Option<u64>,
         marks: &Marks,
         missed: &std::sync::atomic::AtomicU64,
-        f: &mut dyn FnMut(u64, u64),
+        f: &mut dyn FnMut(At) -> bool,
     ) {
         if marks.all {
             return;
@@ -913,10 +926,22 @@ impl Run {
         let mut slices = Slices::new();
         if self.matching_unmarked(s, o, marks, &mut slices) {
             for slice in &slices {
-                slice.for_each(|(a, b)| match slice.swapped {
-                    true => f(b, a),
-                    false => f(a, b),
+                if !f(At::Ahead(slice.pairs.len())) {
+                    return;
+                }
+                let mut going = true;
+                slice.for_each(|(a, b)| {
+                    // Stopped by a read of `f`'s: the rest of the slice is passed over.
+                    if going {
+                        going = f(match slice.swapped {
+                            true => At::Pair(b, a),
+                            false => At::Pair(a, b),
+                        });
+                    }
                 });
+                if !going || !f(At::Settle) {
+                    return;
+                }
             }
             return;
         }
@@ -927,8 +952,12 @@ impl Run {
         }
         for (chunk, words) in self.so.chunks.iter().zip(&marks.so) {
             for (i, &(s, other)) in chunk.iter().enumerate() {
-                if other == o && !marked(words, i) {
-                    f(s, o);
+                let at = match other == o && !marked(words, i) {
+                    true => At::Pair(s, o),
+                    false => At::Skip,
+                };
+                if !f(at) {
+                    return;
                 }
             }
         }
@@ -1021,6 +1050,31 @@ type Slices<'a> = smallvec::SmallVec<[Slice<'a>; 4]>;
 /// round costs its delta plus the recent run, not the whole relation, and the total
 /// merge work stays O(n log n). The input, kept apart, makes the added pairs the base
 /// and the recent run: what a materialisation derived, without a list of its own.
+/// A position a relation's scan visits, as it hands it on ([`Relation::scan`]): a pair it
+/// delivers, a position it passes over, a run of positions about to be visited (counted
+/// ahead), or the end of such a run (what of it went unvisited, marked pairs, is dropped).
+/// The store maps these onto its reader's [`Visit`].
+#[derive(Clone, Copy)]
+enum At {
+    Pair(u64, u64),
+    Skip,
+    Ahead(usize),
+    Settle,
+}
+
+/// What a relation's positions are, to the store's reader `visit`: `p`'s facts.
+fn on(visit: &mut Visit<'_, '_>, p: u64, at: At) -> bool {
+    match at {
+        At::Pair(s, o) => visit.fact([s, p, o]),
+        At::Skip => visit.skip(),
+        At::Ahead(n) => visit.ahead(n),
+        At::Settle => {
+            visit.settle();
+            !visit.stopped()
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Relation {
     /// The pairs the store started with, once the first round has read them as its
@@ -1111,21 +1165,29 @@ impl Relation {
         }
     }
 
-    /// Whether the delta has a pair with object `o`.
-    pub(crate) fn delta_has_object(&self, o: u64) -> bool {
+    /// Whether the delta has a pair with object `o`, counting what it reads on `poll`
+    /// (false once that has stopped: an answer that means nothing).
+    pub(crate) fn delta_has_object(&self, o: u64, poll: &Poller<'_>) -> bool {
         let mut found = false;
         let all = |_: u64, _: u64| true;
         self.delta
-            .scan(None, Some(o), &all, &self.missed, &mut |_, _| found = true);
-        found
+            .scan(None, Some(o), &all, &self.missed, &mut |at| {
+                found |= matches!(at, At::Pair(..));
+                !poll.tick()
+            });
+        found && !poll.stopped()
     }
 
-    /// Calls `f` with each distinct object of the delta.
-    pub(crate) fn delta_objects(&self, f: &mut dyn FnMut(u64)) {
+    /// Calls `f` with each distinct object of the delta, counting each pair it reads on
+    /// `poll` and ending once that has stopped.
+    pub(crate) fn delta_objects(&self, poll: &Poller<'_>, f: &mut dyn FnMut(u64)) {
         match &self.delta.os {
             Some(os) => {
                 let mut last = None;
                 for &(o, _) in os.iter() {
+                    if poll.tick() {
+                        return;
+                    }
                     if last != Some(o) {
                         f(o);
                         last = Some(o);
@@ -1133,6 +1195,9 @@ impl Relation {
                 }
             }
             None => {
+                if poll.attempt(self.delta.len()) {
+                    return;
+                }
                 let mut objects: Vec<u64> = self.delta.so.iter().map(|&(_, o)| o).collect();
                 objects.sort_unstable();
                 objects.dedup();
@@ -1206,8 +1271,9 @@ impl Relation {
         out
     }
 
-    /// Calls `f` with every `(s, o)` matching the bound positions in `seg`.
-    fn scan(&self, s: Option<u64>, o: Option<u64>, seg: Seg, f: &mut dyn FnMut(u64, u64)) {
+    /// Hands every position matching the bound positions in `seg` to `f`, as its runs visit
+    /// them ([`Run::scan`]); ends once `f` returns false.
+    fn scan(&self, s: Option<u64>, o: Option<u64>, seg: Seg, f: &mut dyn FnMut(At) -> bool) {
         let all = |_: u64, _: u64| true;
         let missed = &self.missed;
         match seg {
@@ -1549,40 +1615,78 @@ impl Store {
             .collect()
     }
 
-    /// Every stored fact mentioning one of `terms`, in any position (some more than once).
-    /// By the subject and object orders where a run has them; a run without its object
-    /// order is read whole for the objects.
-    fn mentioning(&self, terms: &HashSet<u64>) -> Vec<Triple> {
-        self.relations
+    /// Every stored fact mentioning one of `terms`, in any position (some more than once);
+    /// `None` if `stop` (latched) fired. By the subject and object orders where a run has
+    /// them; a run without its object order is read whole for the objects. Each relation is
+    /// a task with its own poller, counting each lookup (a term in a run's order) and each
+    /// position read (sweep M17: relations × terms lookups).
+    fn mentioning(&self, terms: &HashSet<u64>, stop: super::eval::Stop<'_>) -> Option<Vec<Triple>> {
+        let facts = self
+            .relations
             .par_iter()
             .zip(self.predicates.par_iter())
             .flat_map_iter(|(relation, &p)| {
                 let mut out = Vec::new();
+                let Some(poll) = Poller::new(stop) else {
+                    return out;
+                };
+                // The pairs of `slices`, counted before they are read; false once stopped.
+                let read = |out: &mut Vec<Triple>,
+                            slices: &mut dyn Iterator<Item = &[Pair]>,
+                            swapped: bool| {
+                    for slice in slices {
+                        if poll.attempt(slice.len()) {
+                            return false;
+                        }
+                        out.extend(slice.iter().map(|&(a, b)| match swapped {
+                            true => [b, p, a],
+                            false => [a, p, b],
+                        }));
+                    }
+                    !poll.tick()
+                };
                 for run in [&relation.input, &relation.base, &relation.recent] {
                     if terms.contains(&p) {
-                        out.extend(run.so.iter().map(|&(s, o)| [s, p, o]));
+                        if !read(
+                            &mut out,
+                            &mut run.so.chunks.iter().map(Vec::as_slice),
+                            false,
+                        ) {
+                            return Vec::new();
+                        }
                         continue;
                     }
                     for &t in terms {
-                        out.extend(run.so.range(t).flatten().map(|&(s, o)| [s, p, o]));
+                        if !read(&mut out, &mut run.so.range(t), false) {
+                            return Vec::new();
+                        }
                     }
                     match &run.os {
                         Some(os) => {
                             for &t in terms {
-                                out.extend(os.range(t).flatten().map(|&(o, s)| [s, p, o]));
+                                if !read(&mut out, &mut os.range(t), true) {
+                                    return Vec::new();
+                                }
                             }
                         }
-                        None => out.extend(
-                            run.so
-                                .iter()
-                                .filter(|(_, o)| terms.contains(o))
-                                .map(|&(s, o)| [s, p, o]),
-                        ),
+                        None => {
+                            if poll.attempt(run.so.len()) {
+                                return Vec::new();
+                            }
+                            out.extend(
+                                run.so
+                                    .iter()
+                                    .filter(|(_, o)| terms.contains(o))
+                                    .map(|&(s, o)| [s, p, o]),
+                            );
+                        }
                     }
                 }
                 out
             })
-            .collect()
+            .collect();
+        // A task that stopped left facts out; the stop is latched, so asking it again tells.
+        (!stop()).then_some(facts)
     }
 
     /// Makes `news` (per relation: the open part, the closed part) the relations' deltas.
@@ -1676,34 +1780,51 @@ impl Store {
     }
 }
 
-impl Source for Store {
-    fn scan(&self, [s, p, o]: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple)) {
+/// The store's reads ([`Source`]'s counting): each relation a scan opens is a unit
+/// ([`Visit::skip`]), each position its runs visit another ([`Relation::scan`], the ones the
+/// old segment's filter passes over included); a range's positions are counted ahead, the
+/// ones the delta filter passes over skipped within them. Probes over every relation count
+/// each relation.
+impl Visits for Store {
+    fn visit(&self, [s, p, o]: [Option<u64>; 3], seg: Seg, visit: &mut Visit<'_, '_>) {
         match p {
             Some(p) => {
                 if let Some(relation) = self.relation(p) {
-                    relation.scan(s, o, seg, &mut |s, o| f([s, p, o]));
+                    relation.scan(s, o, seg, &mut |at| on(visit, p, at));
                 }
             }
             None => {
                 for (relation, &p) in self.relations.iter().zip(&self.predicates) {
-                    relation.scan(s, o, seg, &mut |s, o| f([s, p, o]));
+                    if !visit.skip() {
+                        return;
+                    }
+                    relation.scan(s, o, seg, &mut |at| on(visit, p, at));
                 }
             }
         }
     }
 
-    fn estimate(&self, [s, p, o]: [Option<u64>; 3], seg: Seg) -> usize {
+    fn size(&self, [s, p, o]: [Option<u64>; 3], seg: Seg, probe: Probe<'_, '_>) -> usize {
         match p {
             Some(p) => self.relation(p).map_or(0, |r| r.estimate(s, o, seg)),
+            None if !probe.units(self.relations.len()) => 0,
             None => self.relations.iter().map(|r| r.estimate(s, o, seg)).sum(),
         }
     }
 
-    fn contains(&self, [s, p, o]: Triple) -> bool {
+    fn holds(&self, [s, p, o]: Triple, _: Probe<'_, '_>) -> bool {
         self.relation(p).is_some_and(|r| r.contains(s, o))
     }
 
-    fn matches_len(&self, [s, p, o]: [Option<u64>; 3], seg: Seg) -> Option<usize> {
+    fn positions(
+        &self,
+        [s, p, o]: [Option<u64>; 3],
+        seg: Seg,
+        probe: Probe<'_, '_>,
+    ) -> Option<usize> {
+        if p.is_none() && !probe.units(self.relations.len()) {
+            return Some(0);
+        }
         self.relations_of(p)
             .map(|(_, relation)| {
                 let slices = relation.matching(s, o, seg)?;
@@ -1712,15 +1833,17 @@ impl Source for Store {
             .sum()
     }
 
-    fn scan_range(
+    fn visit_range(
         &self,
         [s, p, o]: [Option<u64>; 3],
         seg: Seg,
         range: std::ops::Range<usize>,
-        f: &mut dyn FnMut(Triple),
+        visit: &mut Visit<'_, '_>,
     ) {
+        // The range's positions were counted ahead, filtered ones included (REAS sol-loop
+        // r7): each is delivered or skipped within that count.
         let mut at = 0;
-        for (p, relation) in self.relations_of(p) {
+        'relations: for (p, relation) in self.relations_of(p) {
             let slices = relation
                 .matching(s, o, seg)
                 .expect("matches_len gave slices");
@@ -1731,7 +1854,7 @@ impl Source for Store {
                     continue;
                 }
                 if start >= range.end {
-                    return;
+                    break 'relations;
                 }
                 let part = range.start.max(start) - start..range.end.min(end) - start;
                 if slice.old {
@@ -1739,14 +1862,25 @@ impl Source for Store {
                         .old_checks
                         .fetch_add(part.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
+                let mut going = true;
                 slice.for_each_in(part, |(a, b)| {
-                    let (s, o) = if slice.swapped { (b, a) } else { (a, b) };
-                    if !(slice.old && relation.delta.contains(s, o)) {
-                        f([s, p, o]);
+                    // Stopped by a read of the reader's: the rest of the range is passed over.
+                    if !going {
+                        return;
                     }
+                    let (s, o) = if slice.swapped { (b, a) } else { (a, b) };
+                    going = match slice.old && relation.delta.contains(s, o) {
+                        true => visit.skip(),
+                        false => visit.fact([s, p, o]),
+                    };
                 });
+                if !going {
+                    return;
+                }
             }
         }
+        // Marked pairs a slice passes over were counted ahead too.
+        visit.settle();
     }
 }
 
@@ -1795,22 +1929,39 @@ impl Equality {
     }
 
     /// The class of `x`: itself and its `sameAs` partners, sorted.
-    fn members<S: Source + ?Sized>(&self, store: &S, x: u64) -> Vec<u64> {
+    fn members<S: Source + ?Sized>(&self, store: &S, x: u64, poll: &Poller<'_>) -> Vec<u64> {
         let mut members = vec![x];
-        store.scan([Some(x), Some(self.same_as), None], Seg::All, &mut |t| {
-            members.push(t[2]);
-        });
+        store.scan(
+            [Some(x), Some(self.same_as), None],
+            Seg::All,
+            poll,
+            &mut |t| {
+                members.push(t[2]);
+            },
+        );
         members.sort_unstable();
         members.dedup();
         members
     }
 
-    /// The expansions of the delta of `store` (see the type's docs), not yet in it.
-    pub(crate) fn run<S: Source + ?Sized>(&mut self, store: &S) -> Vec<Triple> {
-        let equalities = store.estimate([None, Some(self.same_as), None], Seg::All);
+    /// The expansions of the delta of `store` (see the type's docs), not yet in it; `None`
+    /// if `stop` (latched) fired. Its reads count on one poller for its sequential part and
+    /// one per parallel task for the expansions, each fact's three classes and their
+    /// product of probes (sweep M10). Stopped, its state (`partners`) may be part-read:
+    /// the module belongs to the operation, which ends with the stop.
+    pub(crate) fn run<S: Source + ?Sized>(
+        &mut self,
+        store: &S,
+        stop: super::eval::Stop<'_>,
+    ) -> Option<Vec<Triple>> {
+        let poll = Poller::new(stop)?;
+        let equalities = store.estimate([None, Some(self.same_as), None], Seg::All, &poll);
+        if poll.stopped() {
+            return None;
+        }
         if equalities == 0 {
             self.produced.clear();
-            return Vec::new();
+            return Some(Vec::new());
         }
         let same_as = self.same_as;
         // A fact mentioning no term with a partner expands to itself only (#12 of the
@@ -1819,37 +1970,47 @@ impl Equality {
         // a large one (the batch executor's rounds) they are collected once from all
         // `sameAs` facts and then kept current from each round's.
         if self.partners.is_none()
-            && store.estimate([None, None, None], Seg::Delta) * 8 >= equalities
+            && store.estimate([None, None, None], Seg::Delta, &poll) * 8 >= equalities
         {
             let mut all = TermSet::default();
-            store.scan([None, Some(same_as), None], Seg::All, &mut |[s, _, o]| {
-                if s != o {
-                    all.insert(s);
-                    all.insert(o);
-                }
-            });
+            store.scan(
+                [None, Some(same_as), None],
+                Seg::All,
+                &poll,
+                &mut |[s, _, o]| {
+                    if s != o {
+                        all.insert(s);
+                        all.insert(o);
+                    }
+                },
+            );
             self.partners = Some(all);
         } else if let Some(partners) = &mut self.partners {
-            store.scan([None, Some(same_as), None], Seg::Delta, &mut |[s, _, o]| {
-                if s != o {
-                    partners.insert(s);
-                    partners.insert(o);
-                }
-            });
+            store.scan(
+                [None, Some(same_as), None],
+                Seg::Delta,
+                &poll,
+                &mut |[s, _, o]| {
+                    if s != o {
+                        partners.insert(s);
+                        partners.insert(o);
+                    }
+                },
+            );
         }
         let mut looked_up: HashMap<u64, bool> = HashMap::new();
         let mut has_partner = |term: u64| match &self.partners {
             Some(partners) => partners.contains(term),
             None => *looked_up.entry(term).or_insert_with(|| {
                 // An upper bound: zero means no equality mentions the term.
-                store.estimate([Some(term), Some(same_as), None], Seg::All) > 0
-                    || store.estimate([None, Some(same_as), Some(term)], Seg::All) > 0
+                store.estimate([Some(term), Some(same_as), None], Seg::All, &poll) > 0
+                    || store.estimate([None, Some(same_as), Some(term)], Seg::All, &poll) > 0
             }),
         };
         let mut seeds: Vec<Triple> = Vec::new();
         let mut merged: Vec<u64> = Vec::new();
         let produced = &self.produced;
-        store.scan([None, None, None], Seg::Delta, &mut |t| {
+        store.scan([None, None, None], Seg::Delta, &poll, &mut |t| {
             if t[1] == same_as {
                 if t[0] != t[2] {
                     merged.push(t[0]);
@@ -1867,37 +2028,51 @@ impl Equality {
                     seeds.push(t);
                 }
             };
-            store.scan([Some(a), None, None], Seg::All, &mut push);
-            store.scan([None, None, Some(a)], Seg::All, &mut push);
-            store.scan([None, Some(a), None], Seg::All, &mut push);
+            store.scan([Some(a), None, None], Seg::All, &poll, &mut push);
+            store.scan([None, None, Some(a)], Seg::All, &poll, &mut push);
+            store.scan([None, Some(a), None], Seg::All, &poll, &mut push);
+        }
+        if poll.stopped() {
+            return None;
         }
         seeds.par_sort_unstable();
         seeds.dedup();
         self.member_scans += 3 * seeds.len() as u64;
         let out: Vec<Triple> = seeds
             .par_iter()
-            .flat_map_iter(|&[s, p, o]| {
-                let (ms, mp, mo) = (
-                    self.members(store, s),
-                    self.members(store, p),
-                    self.members(store, o),
-                );
-                let mut facts = Vec::new();
-                for &s in &ms {
-                    for &p in &mp {
-                        for &o in &mo {
-                            let fact = [s, p, o];
-                            if !store.contains(fact) {
-                                facts.push(fact);
+            .map_init(
+                || Poller::new(stop),
+                |poll, &[s, p, o]| {
+                    let Some(poll) = poll.as_ref() else {
+                        return Vec::new();
+                    };
+                    let (ms, mp, mo) = (
+                        self.members(store, s, poll),
+                        self.members(store, p, poll),
+                        self.members(store, o, poll),
+                    );
+                    let mut facts = Vec::new();
+                    for &s in &ms {
+                        for &p in &mp {
+                            for &o in &mo {
+                                let fact = [s, p, o];
+                                if !store.contains(fact, poll) {
+                                    facts.push(fact);
+                                }
                             }
                         }
                     }
-                }
-                facts
-            })
+                    facts
+                },
+            )
+            .flat_map_iter(|facts| facts)
             .collect();
+        // A task that stopped left facts out; the stop is latched, so asking it again tells.
+        if stop() {
+            return None;
+        }
         self.produced = out.iter().copied().collect();
-        out
+        Some(out)
     }
 }
 
@@ -1977,13 +2152,19 @@ impl Representatives {
         lost
     }
 
-    /// The facts the merge that took the places of `lost` makes stale, rewritten.
-    fn rewrites(&self, store: &Store, lost: &HashSet<u64>) -> Vec<Triple> {
-        let mut facts = store.mentioning(lost);
+    /// The facts the merge that took the places of `lost` makes stale, rewritten; `None`
+    /// if `stop` (latched) fired ([`Store::mentioning`]).
+    fn rewrites(
+        &self,
+        store: &Store,
+        lost: &HashSet<u64>,
+        stop: super::eval::Stop<'_>,
+    ) -> Option<Vec<Triple>> {
+        let mut facts = store.mentioning(lost, stop)?;
         facts
             .par_iter_mut()
             .for_each(|fact| *fact = self.classes.rewrite(*fact));
-        facts
+        Some(facts)
     }
 }
 
@@ -2022,44 +2203,47 @@ struct Current<'a> {
     stale: &'a TermSet,
 }
 
-impl Source for Current<'_> {
-    fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple)) {
+/// Reads are the store's ([`Visits for Store`](Store)): its positions are this source's,
+/// the stale ones it filters out included.
+impl Visits for Current<'_> {
+    fn visit(&self, pattern: [Option<u64>; 3], seg: Seg, visit: &mut Visit<'_, '_>) {
         if self.stale.is_empty() {
-            return self.store.scan(pattern, seg, f);
+            return self.store.visit(pattern, seg, visit);
         }
-        self.store.scan(pattern, seg, &mut |fact| {
-            if !self.stale.mentioned(fact) {
-                f(fact);
-            }
+        visit.filtered(&|fact| !self.stale.mentioned(fact), |inner| {
+            self.store.visit(pattern, seg, inner)
         });
     }
 
-    fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize {
-        self.store.estimate(pattern, seg)
+    fn size(&self, pattern: [Option<u64>; 3], seg: Seg, probe: Probe<'_, '_>) -> usize {
+        self.store.size(pattern, seg, probe)
     }
 
-    fn contains(&self, fact: Triple) -> bool {
-        !self.stale.mentioned(fact) && self.store.contains(fact)
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
+        !self.stale.mentioned(fact) && self.store.holds(fact, probe)
     }
 
-    fn matches_len(&self, pattern: [Option<u64>; 3], seg: Seg) -> Option<usize> {
-        self.store.matches_len(pattern, seg)
+    fn positions(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        probe: Probe<'_, '_>,
+    ) -> Option<usize> {
+        self.store.positions(pattern, seg, probe)
     }
 
-    fn scan_range(
+    fn visit_range(
         &self,
         pattern: [Option<u64>; 3],
         seg: Seg,
         range: std::ops::Range<usize>,
-        f: &mut dyn FnMut(Triple),
+        visit: &mut Visit<'_, '_>,
     ) {
         if self.stale.is_empty() {
-            return self.store.scan_range(pattern, seg, range, f);
+            return self.store.visit_range(pattern, seg, range, visit);
         }
-        self.store.scan_range(pattern, seg, range, &mut |fact| {
-            if !self.stale.mentioned(fact) {
-                f(fact);
-            }
+        visit.filtered(&|fact| !self.stale.mentioned(fact), |inner| {
+            self.store.visit_range(pattern, seg, range, inner)
         });
     }
 }
@@ -2510,19 +2694,26 @@ fn run_body(
     // facts rewritten, where the input asserts equalities.
     let mut pending: Vec<Triple> = Vec::new();
     if let Some(reps) = &mut representatives {
+        // The input's equalities, read as the rounds' sequential stages read: on a poller
+        // of the operation's stop, its result checked before use.
+        let poll = Poller::new(stop).ok_or_else(Interrupted::default)?;
         let mut pairs = Vec::new();
-        store.scan([None, Some(reps.same_as), None], Seg::All, &mut |[
-            s,
-            _,
-            o,
-        ]| {
-            if s != o {
-                pairs.push((s, o));
-            }
-        });
+        store.scan(
+            [None, Some(reps.same_as), None],
+            Seg::All,
+            &poll,
+            &mut |[s, _, o]| {
+                if s != o {
+                    pairs.push((s, o));
+                }
+            },
+        );
+        check_stop()?;
         let lost = reps.merge(&pairs);
         if !lost.is_empty() {
-            pending = reps.rewrites(&store, &lost);
+            pending = reps
+                .rewrites(&store, &lost, stop)
+                .ok_or_else(Interrupted::default)?;
             if rules.iter().any(|rule| names_any(rule, &lost)) {
                 rules = rules
                     .iter()
@@ -2534,6 +2725,10 @@ fn run_body(
     let none = TermSet::default();
     loop {
         check_stop()?;
+        // The round's sequential reads (the object orders' estimate, the bodiless facts'
+        // and pending facts' probes, job construction) count on this; each stage checks the
+        // latched stop before its output is used.
+        let stage = Poller::new(stop).ok_or_else(Interrupted::default)?;
         result.rounds += 1;
         // Where asked (budgets.reasoning_release), what the last round freed (its
         // candidates, the runs a fold replaced) goes back before this one allocates: a
@@ -2581,7 +2776,9 @@ fn run_body(
         // dropped where nothing reads them (P1-F11).
         let equal = equality
             .as_ref()
-            .is_some_and(|e| store.estimate([None, Some(e.same_as), None], Seg::All) > 0);
+            .is_some_and(|e| store.estimate([None, Some(e.same_as), None], Seg::All, &stage) > 0);
+        // The orders are the store's state: built only from an answer that means something.
+        check_stop()?;
         let reads = Reads::of(program.rules.iter());
         store.objects(&|p| equal || reads.by_object(p) || schema.read_in_grounding(p));
         phases.grounding += clock.elapsed();
@@ -2606,9 +2803,9 @@ fn run_body(
         if let Some(rewrite) = rewrite {
             facts.iter_mut().for_each(|fact| *fact = rewrite(*fact));
         }
-        facts.retain(|&f| !store.contains(f));
+        facts.retain(|&f| !store.contains(f, &stage));
         let mut candidates: Vec<Candidates> = vec![(None, segments(facts))];
-        pending.retain(|&fact| !store.contains(fact));
+        pending.retain(|&fact| !store.contains(fact, &stage));
         candidates.push((None, segments(std::mem::take(&mut pending))));
         // Each job with the closed family its rule belongs to, if any: a variant of such
         // a rule reads the delta without what the family produced, and what a job of the
@@ -2617,18 +2814,19 @@ fn run_body(
         let mut families: Vec<Option<u64>> = Vec::new();
         // After a merge, the rules whose guards see the classes run in full.
         let again = |rule: &Rule| reevaluate && sees_classes(rule);
-        for (r, i) in program.variants(&store) {
+        for (r, i) in program.variants(&store, &stage) {
             if r < evaluated && !again(&program.rules[r]) {
                 let family = program.closed_family(r);
                 let delta = family.map_or(Seg::Delta, Seg::DeltaNotBy);
-                if let Some(job) = Job::variant_reading(&current, &program.rules[r], i, delta) {
+                let rule = &program.rules[r];
+                if let Some(job) = Job::variant_reading(&current, rule, i, delta, &stage) {
                     jobs.push(job);
                     families.push(family);
                 }
             }
         }
         for (r, rule) in program.rules.iter().enumerate().skip(evaluated) {
-            if let Some(job) = Job::full(&current, rule) {
+            if let Some(job) = Job::full(&current, rule, &stage) {
                 jobs.push(job);
                 families.push(program.closed_family(r));
             }
@@ -2636,7 +2834,7 @@ fn run_body(
         if reevaluate {
             for (r, rule) in program.rules.iter().enumerate().take(evaluated) {
                 if sees_classes(rule)
-                    && let Some(job) = Job::full(&current, rule)
+                    && let Some(job) = Job::full(&current, rule, &stage)
                 {
                     jobs.push(job);
                     families.push(program.closed_family(r));
@@ -2646,7 +2844,11 @@ fn run_body(
         }
         let probes = Probes::for_jobs(jobs.len());
         let starts = std::sync::atomic::AtomicU64::new(0);
-        let keep = |facts: &mut Vec<Triple>| {
+        // One probe per fact, counted before they are read.
+        let keep = |facts: &mut Vec<Triple>, poll: &Poller<'_>| {
+            if poll.attempt(facts.len()) {
+                return;
+            }
             let n = store.retain_new(facts);
             starts.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
         };
@@ -2697,7 +2899,10 @@ fn run_body(
         ));
         result.counters.closure_pairs.push(transitive.read);
         if let Some(equality) = &mut equality {
-            candidates.push((None, segments(equality.run(&store))));
+            let expanded = equality
+                .run(&store, stop)
+                .ok_or_else(Interrupted::default)?;
+            candidates.push((None, segments(expanded)));
         }
         let mut merged = false;
         // New equalities merge classes: the round's candidates and the stored facts that
@@ -2731,11 +2936,14 @@ fn run_body(
                         }
                     }
                 }
-                moved.extend(reps.rewrites(&store, &lost));
+                moved.extend(
+                    reps.rewrites(&store, &lost, stop)
+                        .ok_or_else(Interrupted::default)?,
+                );
                 moved
                     .par_iter_mut()
                     .for_each(|fact| *fact = reps.classes.rewrite(*fact));
-                moved.retain(|&fact| !store.contains(fact));
+                moved.retain(|&fact| !store.contains(fact, &stage));
                 // Rewritten: no longer what a family produced.
                 candidates.push((None, segments(moved)));
                 merged = true;
@@ -2797,9 +3005,11 @@ fn run_body(
                 .map(|(_, grounded)| &grounded.rule),
         ),
     );
+    let stage = Poller::new(stop).ok_or_else(Interrupted::default)?;
     let equal = equality
         .as_ref()
-        .is_some_and(|e| store.estimate([None, Some(e.same_as), None], Seg::All) > 0);
+        .is_some_and(|e| store.estimate([None, Some(e.same_as), None], Seg::All, &stage) > 0);
+    check_stop()?;
     store.objects(&|p| equal || reads.by_object(p) || schema.read_in_grounding(p));
     let mut found = Violations::new(Arc::clone(memory));
     check(
@@ -2839,7 +3049,7 @@ fn run_body(
     let mut derived = match representatives {
         None => store.into_derived(),
         Some(reps) => {
-            let derived = list(store, &reps);
+            let derived = list(store, &reps, stop).ok_or_else(Interrupted::default)?;
             result.classes = reps.classes;
             result.merges = reps.merges;
             derived
@@ -2851,11 +3061,12 @@ fn run_body(
     Ok(result)
 }
 
-/// What a materialisation with equality by representatives lists ([`Listing`]).
-fn list(store: Store, reps: &Representatives) -> Vec<Triple> {
+/// What a materialisation with equality by representatives lists ([`Listing`]); `None` if
+/// `stop` (latched) fired while the expansion ran.
+fn list(store: Store, reps: &Representatives, stop: super::eval::Stop<'_>) -> Option<Vec<Triple>> {
     let (stale, shared) = (&reps.stale, &reps.shared);
     let current = |fact: Triple| !stale.mentioned(fact);
-    match reps.listing {
+    Some(match reps.listing {
         Listing::Representatives => store.into_listed(&current, &current, Vec::new()),
         // Without classes, what was added.
         Listing::Stored | Listing::Expanded if reps.classes.is_empty() => store.into_derived(),
@@ -2866,24 +3077,42 @@ fn list(store: Store, reps: &Representatives) -> Vec<Triple> {
         ),
         Listing::Expanded => {
             // The facts that mention a class, expanded while the input is there to leave
-            // its facts out; the others as they are.
+            // its facts out; the others as they are. Each class expansion is a product of
+            // members, each copy a probe of the input: counted per task (sweep M12).
             let expanded: Vec<Triple> = store
                 .facts_where(&|fact| current(fact) && shared.mentioned(fact))
                 .into_par_iter()
-                .flat_map_iter(|fact| reps.classes.expand(fact))
-                .filter(|&[s, p, o]| {
-                    !store
-                        .relation(p)
-                        .is_some_and(|relation| relation.input.contains(s, o))
-                })
+                .map_init(
+                    || Poller::new(stop),
+                    |poll, fact| {
+                        // The product's copies, counted before it is built.
+                        let members = |t: u64| reps.classes.class_of(t).map_or(1, <[u64]>::len);
+                        let copies = fact.iter().map(|&t| members(t)).product::<usize>();
+                        if poll.as_ref().is_none_or(|poll| poll.attempt(copies)) {
+                            return Vec::new();
+                        }
+                        let mut copies = reps.classes.expand(fact);
+                        copies.retain(|&[s, p, o]| {
+                            !store
+                                .relation(p)
+                                .is_some_and(|relation| relation.input.contains(s, o))
+                        });
+                        copies
+                    },
+                )
+                .flatten_iter()
                 .collect();
+            // A task that stopped left copies out; the stop is latched, so asking it tells.
+            if stop() {
+                return None;
+            }
             store.into_listed(
                 &|_| false,
                 &|fact| current(fact) && !shared.mentioned(fact),
                 expanded,
             )
         }
-    }
+    })
 }
 
 /// What ground rules read of the relations: which relations they can look up by object
@@ -2962,6 +3191,12 @@ pub(crate) fn check<S: Source + ?Sized>(
         let rule = &program.consistency[c].0;
         found.group(&rule.name, rule.variables())
     };
+    // One driver can have very many bindings (a rule over independent atoms), firing or
+    // not, so the morsel alone is too coarse: the walk's reads poll `stop` per fact they
+    // visit, and so do the jobs' constructions (sweep M01).
+    let Some(poll) = Poller::new(stop) else {
+        return Err(Interrupted::default());
+    };
     let mut jobs: Vec<(usize, Job<'_>)> = Vec::new();
     for c in full {
         let ground_rule = &program.consistency[c].1.rule;
@@ -2971,18 +3206,13 @@ pub(crate) fn check<S: Source + ?Sized>(
                 found.record(id, words(program, c, &[]));
             }
         } else {
-            jobs.extend(Job::full(source, ground_rule).map(|job| (c, job)));
+            jobs.extend(Job::full(source, ground_rule, &poll).map(|job| (c, job)));
         }
     }
     for &(c, i) in variants {
         let ground_rule = &program.consistency[c].1.rule;
-        jobs.extend(Job::variant(source, ground_rule, i).map(|job| (c, job)));
+        jobs.extend(Job::variant(source, ground_rule, i, &poll).map(|job| (c, job)));
     }
-    // One driver can have very many bindings (a rule over independent atoms), firing or
-    // not, so the morsel alone is too coarse: the walk polls `stop` per fact it scans.
-    let Some(mut poll) = super::eval::Poller::new(stop) else {
-        return Err(Interrupted::default());
-    };
     'jobs: for (c, job) in jobs {
         // A list that refused (an empty-body rule above, or an earlier job) ends the
         // check: the state is inconsistent whatever the rest would add.
@@ -2994,7 +3224,7 @@ pub(crate) fn check<S: Source + ?Sized>(
         let mut id = None;
         for start in (0..job.drivers()).step_by(MORSEL) {
             let range = start..(start + MORSEL).min(job.drivers());
-            let stopped = job.run_until(source, range, &mut poll, &mut |bindings| {
+            let stopped = job.run_until(source, range, &poll, &mut |bindings| {
                 // A refused report stops the walk: the state is inconsistent whatever
                 // the rest would add.
                 let group = match id {
@@ -3019,6 +3249,43 @@ pub(crate) fn check<S: Source + ?Sized>(
     }
     found.finish();
     Ok(())
+}
+
+#[cfg(test)]
+mod counted_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A poller whose stop has fired since it was made: it stops at its next poll.
+    fn fired_after(fired: &AtomicBool, test: impl FnOnce(&Poller<'_>)) {
+        let stop = || fired.load(Ordering::Relaxed);
+        let poll = Poller::new(&stop).expect("not stopped yet");
+        fired.store(true, Ordering::Relaxed);
+        test(&poll);
+    }
+
+    /// REAS-2 (master, 8 Nov 05:29: a counted test per leaf that filters): the store's scan
+    /// counts the positions its runs pass over, not only the facts it delivers. A lookup by
+    /// object alone in a relation without its object order reads every pair: over three poll
+    /// intervals of pairs, none with the object, a poller whose stop has fired polls within
+    /// the scan and is stopped by it; uncounted, it would never poll.
+    #[test]
+    fn a_store_scan_counts_the_pairs_it_passes_over() {
+        let n = 3 * u64::from(nrese_exec::POLL_UNITS);
+        let mut store = Store::new((0..n).map(|i| [i, 5, 1_000_000 + i]).collect());
+        store.objects(&|_| false);
+        fired_after(&AtomicBool::new(false), |poll| {
+            let mut delivered = 0;
+            store.scan([None, Some(5), Some(7)], Seg::All, poll, &mut |_| {
+                delivered += 1
+            });
+            assert_eq!(delivered, 0, "no pair has the object");
+            assert!(
+                poll.stopped(),
+                "{n} pairs passed over without the poller polling"
+            );
+        });
+    }
 }
 
 #[cfg(test)]
@@ -3187,7 +3454,12 @@ mod chunk_tests {
             ] {
                 let read = |relation: &Relation, seg: Seg| {
                     let mut out = Vec::new();
-                    relation.scan(s, o, seg, &mut |s, o| out.push((s, o)));
+                    relation.scan(s, o, seg, &mut |at| {
+                        if let At::Pair(s, o) = at {
+                            out.push((s, o));
+                        }
+                        true
+                    });
                     sorted(out)
                 };
                 // As morsels read it: the slices, their skipped pairs left out.

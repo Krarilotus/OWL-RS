@@ -12,8 +12,8 @@ use nrese_exec::Budget;
 use rayon::prelude::*;
 
 use super::{Program, encode, pattern, storable, triple};
-use crate::delta::{self, Base, MemoryBase};
-use crate::eval::GroundProgram;
+use crate::delta::{self, Base, MemoryBase, VisitsBase};
+use crate::eval::{GroundProgram, Poller, Probe, Visit};
 use crate::ir::{Triple, Violations};
 use crate::lists::ListDiagnostic;
 
@@ -60,20 +60,26 @@ impl<'a> EngineBase<'a> {
     }
 }
 
-impl Base for EngineBase<'_> {
-    fn scan(&self, bound: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
+/// Reads count as [`Base`] says: each quad a scan visits is a position, the deleted ones it
+/// passes over skipped, and so is each axiom it checks; the inserts' on their store's.
+impl VisitsBase for EngineBase<'_> {
+    fn visit(&self, bound: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
         for quad in self
             .snapshot
             .quads_for_pattern_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any))
         {
-            if !self.deletes.contains(&quad) {
-                f(triple(quad));
+            let going = match self.deletes.contains(&quad) {
+                true => visit.skip(),
+                false => visit.fact(triple(quad)),
+            };
+            if !going {
+                return;
             }
         }
-        self.inserts.scan(bound, f);
+        self.inserts.visit(bound, visit);
     }
 
-    fn estimate(&self, bound: [Option<u64>; 3]) -> usize {
+    fn size(&self, bound: [Option<u64>; 3], probe: Probe<'_, '_>) -> usize {
         let committed = self
             .snapshot
             .count_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any))
@@ -82,37 +88,47 @@ impl Base for EngineBase<'_> {
         // saturates too, never wrapping to a smaller estimate.
         usize::try_from(committed)
             .unwrap_or(usize::MAX)
-            .saturating_add(self.inserts.estimate(bound))
+            .saturating_add(self.inserts.size(bound, probe))
     }
 
-    fn contains(&self, fact: Triple) -> bool {
-        self.inserts.contains(fact) || self.committed(ReadModel::Materialised, fact)
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
+        self.inserts.holds(fact, probe) || self.committed(ReadModel::Materialised, fact)
     }
 
-    fn is_asserted(&self, fact: Triple) -> bool {
-        self.inserts.contains(fact)
+    fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
+        self.inserts.holds(fact, probe)
             || self.axioms.binary_search(&fact).is_ok()
             || self.committed(ReadModel::Asserted, fact)
     }
 
-    fn scan_asserted(&self, bound: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
+    fn visit_asserted(&self, bound: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
         for quad in self
             .snapshot
             .quads_for_pattern_in(ReadModel::Asserted, &pattern(bound, GraphSelector::Any))
         {
-            if !self.deletes.contains(&quad) {
-                f(triple(quad));
+            let going = match self.deletes.contains(&quad) {
+                true => visit.skip(),
+                false => visit.fact(triple(quad)),
+            };
+            if !going {
+                return;
             }
         }
-        self.inserts.scan(bound, f);
+        self.inserts.visit(bound, visit);
         let matches = |fact: &Triple| {
             bound
                 .iter()
                 .zip(fact)
                 .all(|(want, have)| want.is_none_or(|want| want == *have))
         };
-        for axiom in self.axioms.iter().filter(|axiom| matches(axiom)) {
-            f(*axiom);
+        for axiom in self.axioms.iter() {
+            let going = match matches(axiom) {
+                true => visit.fact(*axiom),
+                false => visit.skip(),
+            };
+            if !going {
+                return;
+            }
         }
     }
 }
@@ -222,6 +238,9 @@ pub fn maintain_within(
     }
     let update = {
         let base = EngineBase::new(tx, &program.axioms);
+        // The change's own probes of the base (a deleted fact still asserted elsewhere, a
+        // derived one known before) count on the commit's stop, as the update's do.
+        let prep = Poller::new(stop).ok_or_else(delta::Interrupted::default)?;
         // Facts new to the state: in no graph and not inferred before the transaction.
         let mut inserted: Vec<Triple> = tx
             .inserted()
@@ -233,7 +252,7 @@ pub fn maintain_within(
                 .axioms
                 .iter()
                 .copied()
-                .filter(|&axiom| !base.known_before(axiom) && !base.inserts.contains(axiom))
+                .filter(|&axiom| !base.known_before(axiom) && !base.inserts.contains(axiom, &prep))
                 .collect();
             inserted.extend(missing_axioms.iter().copied());
         }
@@ -252,10 +271,13 @@ pub fn maintain_within(
         let mut deleted: Vec<Triple> = tx
             .deleted()
             .map(triple)
-            .filter(|&t| !base.is_asserted(t))
+            .filter(|&t| !base.is_asserted(t, &prep))
             .collect();
         deleted.sort_unstable();
         deleted.dedup();
+        if prep.stopped() {
+            return Err(delta::Interrupted::default());
+        }
         // A rebuild reads the asserted facts and writes the closure, both about the size
         // of the stored state; the policy offers it to a change that inserts nothing
         // ([`delta::policy::Plan::Rebuild`]).
@@ -281,10 +303,14 @@ pub fn maintain_within(
                 .iter()
                 .map(|t| triple(t.in_default_graph()))
                 .filter(|&f| {
-                    !base.is_asserted(f) && !(base.contains(f) && !inserted_set.contains(&f))
+                    !base.is_asserted(f, &prep)
+                        && !(base.contains(f, &prep) && !inserted_set.contains(&f))
                 })
                 .chain(unstorable.drain(..))
                 .collect();
+            if prep.stopped() {
+                return Err(delta::Interrupted::default());
+            }
             delta::Update {
                 violations: delta::introduced_violations(
                     &base, &inserted, &derived, rules, ground, stop, memory,
@@ -578,6 +604,46 @@ mod tests {
     use nrese_engine::{Engine, EngineConfig};
     use nrese_rdf::{BlankNodeRef, NamedNodeRef};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// REAS-2 (master, 8 Nov 05:29: a counted test per leaf that filters): an engine base's
+    /// scan counts the quads it passes over (deleted by the change), not only those it
+    /// delivers. Over three poll intervals of deleted quads, a poller whose stop has fired
+    /// polls within the scan and is stopped by it; uncounted, it would never poll.
+    #[test]
+    fn an_engine_base_scan_counts_the_deleted_quads_it_passes_over() {
+        let n = 3 * nrese_exec::POLL_UNITS as usize;
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+        let (p, o) = (iri("http://example.com/p"), iri("http://example.com/o"));
+        let facts: Vec<Triple> = (0..n)
+            .map(|i| [iri(&format!("http://example.com/s{i}")), p, o])
+            .collect();
+        for &fact in &facts {
+            tx.insert_encoded(encode(fact).in_default_graph());
+        }
+        tx.commit().unwrap();
+        let mut tx = engine.transaction();
+        for &fact in &facts {
+            tx.remove_encoded(encode(fact).in_default_graph());
+        }
+        let base = EngineBase::new(&tx, &[]);
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        let stop = || fired.load(Ordering::Relaxed);
+        let poll = Poller::new(&stop).expect("not stopped yet");
+        fired.store(true, Ordering::Relaxed);
+        let mut delivered = 0;
+        base.scan([None, Some(p), None], &poll, &mut |_| delivered += 1);
+        assert_eq!(delivered, 0, "every quad the scan meets is deleted");
+        assert!(
+            poll.stopped(),
+            "{n} quads passed over without the poller polling"
+        );
+    }
 
     /// B3a: random commits that merge and split `owl:sameAs` classes (asserted equalities,
     /// functional and inverse-functional properties) leave the inferred stack equal to a
