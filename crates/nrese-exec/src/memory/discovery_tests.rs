@@ -75,6 +75,10 @@ fn a_covered_mount_isnt_a_view() {
     // when they were made, so the covering mount comes first (sol-loop r4 S2).
     const MOVED: &str = "40 30 0:26 /limited/worker /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n\
                          30 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
+    // A namespace's root is its own parent (proc_pid_mountinfo(5)), as an initramfs lists its
+    // rootfs; it covers nothing below it (sol-loop r5 S3).
+    const ROOTED: &str = "1 1 0:2 / / rw - rootfs rootfs rw\n\
+                          20 1 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
     let (four, used) = ((4 * G).to_string(), G.to_string());
     let (four, used) = (four.as_str(), used.as_str());
     let rows: Vec<Row<'_>> = vec![
@@ -86,6 +90,19 @@ fn a_covered_mount_isnt_a_view() {
                 ("/sys/fs/cgroup/cgroup.controllers", "memory"),
                 ("/sys/fs/cgroup/memory.max", four),
                 ("/sys/fs/cgroup/memory.current", used),
+            ],
+            "",
+            Some(4 * G),
+            Some(3 * G),
+        ),
+        (
+            "full tree under a self-parented root",
+            vec![
+                ("/proc/self/mountinfo", ROOTED),
+                ("/proc/self/cgroup", "0::/limited/worker"),
+                ("/sys/fs/cgroup/limited/worker/cgroup.controllers", "memory"),
+                ("/sys/fs/cgroup/limited/worker/memory.max", four),
+                ("/sys/fs/cgroup/limited/worker/memory.current", used),
             ],
             "",
             Some(4 * G),
