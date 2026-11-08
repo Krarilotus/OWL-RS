@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use nrese_rdf::{Literal, NamedNode, Term};
 use parking_lot::RwLock;
 
-use super::Dictionary;
+use super::{Dictionary, unlimited};
 use crate::term::text::TextIndex;
 use crate::term::vectors::VectorIndex;
 use crate::term::{TextQuery, VectorQuery, VectorStrategy};
@@ -169,7 +169,8 @@ fn stats_an_index_extension_and_intern_never_wait_on_each_other() {
             stats_extension_and_intern(vectors, vector_literal(&[1.0, 2.0]), |dictionary| {
                 let query = VectorQuery::new(vec![1.0, 2.0], 5);
                 dictionary
-                    .vector_search(&query, dictionary.len(), &|_| true)
+                    .vector_search(&query, dictionary.len(), &|_| true, unlimited())
+                    .unwrap()
                     .0
                     .len()
             }),
@@ -200,16 +201,24 @@ fn a_vector_search_s_accept_may_intern_and_search_again() {
                 let nested_space = AtomicUsize::new(0);
                 let entered = AtomicBool::new(false);
                 let known = dictionary.len();
-                let (hits, report) = dictionary.vector_search(&query, known, &|_| {
-                    if !entered.swap(true, Ordering::SeqCst) {
-                        dictionary.intern(vector_literal(&[100.0, 100.0]).as_ref());
-                        let (nested, report) =
-                            dictionary.vector_search(&query, dictionary.len(), &|_| true);
-                        assert_eq!(nested.len(), 3, "{strategy:?}: nested hits");
-                        nested_space.store(report.space, Ordering::SeqCst);
-                    }
-                    true
-                });
+                let (hits, report) = dictionary
+                    .vector_search(
+                        &query,
+                        known,
+                        &|_| {
+                            if !entered.swap(true, Ordering::SeqCst) {
+                                dictionary.intern(vector_literal(&[100.0, 100.0]).as_ref());
+                                let (nested, report) = dictionary
+                                    .vector_search(&query, dictionary.len(), &|_| true, unlimited())
+                                    .unwrap();
+                                assert_eq!(nested.len(), 3, "{strategy:?}: nested hits");
+                                nested_space.store(report.space, Ordering::SeqCst);
+                            }
+                            true
+                        },
+                        unlimited(),
+                    )
+                    .unwrap();
                 (hits.len(), report.space, nested_space.into_inner())
             })
         };

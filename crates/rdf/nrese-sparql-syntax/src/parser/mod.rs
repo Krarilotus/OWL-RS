@@ -24,8 +24,8 @@ use nrese_rdf::{BlankNode, Iri, IriParseError, NamedNode, Variable};
 use crate::algebra::{AggregateExpression, GraphPattern, PropertyPathExpression};
 use crate::query::{GraphUpdateOperation, Query, Update};
 
-/// Nesting allowed by default: of groups, brackets, paths, collections and triple terms
-/// as the text is read, and of the algebra it builds ([`GraphPattern::depth`]). The passes
+/// Nesting allowed by default: of groups, brackets, paths, collections, triple terms and
+/// annotation blocks as the text is read, and of the algebra it builds ([`GraphPattern::depth`]). The passes
 /// over the algebra recurse as deep as it nests, and at this depth every one fits on a
 /// thread of 2 MiB with room to spare (ADR-0012). Deeper input is an error, not a stack
 /// overflow.
@@ -111,8 +111,8 @@ impl SparqlParser {
         self
     }
 
-    /// How deep groups, brackets, paths, collections and triple terms, and the algebra
-    /// they build, may nest ([`DEFAULT_MAX_NESTING`]).
+    /// How deep groups, brackets, paths, collections, triple terms and annotation blocks,
+    /// and the algebra they build, may nest ([`DEFAULT_MAX_NESTING`]).
     pub fn with_max_nesting(mut self, depth: usize) -> Self {
         self.max_nesting = depth;
         self

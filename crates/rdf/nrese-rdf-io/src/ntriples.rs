@@ -252,6 +252,32 @@ impl LineParser {
         }
     }
 
+    /// One term written as in N-Triples, the whole of `text` (spaces around it aside): an
+    /// IRI, a blank node, a literal or a triple term, read as this parser reads an object.
+    /// Text after the term, or a line break anywhere in it, is an error.
+    pub(crate) fn term(&mut self, text: &str) -> Result<Term, RdfSyntaxError> {
+        let bytes = text.as_bytes();
+        // Line 0: the first, as positions count.
+        let fail = |(range, message): Failure| syntax(bytes, 0, 0, range, message);
+        // A document's lines hold no line break, so the object reader doesn't look for one.
+        if let Some(at) = memchr2(b'\n', b'\r', bytes) {
+            return Err(fail((at..at + 1, "a line break in a term")));
+        }
+        let mut i = skip_space(bytes, 0);
+        let term = match self.object(text, &mut i, 0).map_err(fail)? {
+            Object::Triple => match self.triple_term.take() {
+                Some(triple) => triple.into(),
+                None => unreachable!("a triple term object is kept in `triple_term`"),
+            },
+            object => self.object_ref(text, &object).into_owned(),
+        };
+        let end = skip_space(bytes, i);
+        if end < bytes.len() {
+            return Err(fail((end..bytes.len(), "text after the term")));
+        }
+        Ok(term)
+    }
+
     /// `versionDirective` after its keyword (ending at `at`): `'VERSION' STRING_LITERAL_QUOTE`
     /// and the end of the line. Every version label is accepted.
     fn version(&mut self, line: &str, at: usize) -> Result<(), Failure> {
@@ -634,6 +660,13 @@ pub(crate) fn is_pn_chars(c: char) -> bool {
         || matches!(c, '\u{300}'..='\u{36F}' | '\u{203F}'..='\u{2040}')
 }
 
+/// One term written as in N-Triples, the whole of `text` (spaces around it aside): blank
+/// node labels as written, IRIs checked. For protocols that pass terms one at a time (the
+/// RDF4J REST API's `subj`, `pred`, `obj` and `context`).
+pub fn parse_term(text: &str) -> Result<Term, RdfSyntaxError> {
+    LineParser::new(false, false, BlankNodes::AsWritten).term(text)
+}
+
 /// A syntax error at bytes `range` of a line.
 fn syntax(
     bytes: &[u8],
@@ -675,7 +708,7 @@ const SPECIAL: [bool; 256] = special();
 
 /// `text` quoted and escaped as N-Triples writes a string: what needs no escape is
 /// copied in one piece.
-fn quoted(out: &mut Vec<u8>, text: &str) {
+pub(crate) fn quoted(out: &mut Vec<u8>, text: &str) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let bytes = text.as_bytes();
     out.push(b'"');
@@ -816,6 +849,53 @@ mod tests {
     use nrese_rdf::{BlankNode, GraphName, Literal, NamedNode, Quad};
 
     use super::*;
+
+    /// One N-Triples term, read whole (N-Triples 1.2 §2.4–2.6): every kind of term, and
+    /// anything else refused.
+    #[test]
+    fn a_term_is_read_whole_or_refused() {
+        let iri = |s: &str| NamedNode::new_unchecked(s);
+        let triple = Triple::new(
+            iri("http://e/s"),
+            iri("http://e/p"),
+            Literal::new_simple_literal("o"),
+        );
+        let mut wrong = Vec::new();
+        for (text, expected) in [
+            ("<http://e/a>", Term::from(iri("http://e/a"))),
+            ("_:b1", BlankNode::new_unchecked("b1").into()),
+            ("\"a\\\"b\"", Literal::new_simple_literal("a\"b").into()),
+            (
+                "\"x\"@en-GB",
+                Literal::new_language_tagged_literal_unchecked("x", "en-gb").into(),
+            ),
+            (
+                "\"1\"^^<http://www.w3.org/2001/XMLSchema#int>",
+                Literal::new_typed_literal("1", iri("http://www.w3.org/2001/XMLSchema#int")).into(),
+            ),
+            ("<<( <http://e/s> <http://e/p> \"o\" )>>", triple.into()),
+            (" <http://e/a>\t", iri("http://e/a").into()),
+        ] {
+            if parse_term(text).ok().as_ref() != Some(&expected) {
+                wrong.push(format!("{text:?}: {:?}", parse_term(text)));
+            }
+        }
+        for text in [
+            "\"a\"\"",
+            "\"a\" \"b\"",
+            "\"a\nb\"",
+            "<http://e/a> <http://e/b>",
+            "<relative>",
+            "\"x\"@",
+            "plain",
+            "",
+        ] {
+            if let Ok(term) = parse_term(text) {
+                wrong.push(format!("{text:?} read as {term:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 
     /// The byte writer writes exactly what the terms' `Display` writes.
     #[test]

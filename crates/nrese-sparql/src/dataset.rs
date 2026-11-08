@@ -118,6 +118,11 @@ impl GraphSet {
 pub(crate) struct ResolvedDataset {
     pub(crate) default: DefaultGraph,
     pub(crate) named: Option<Vec<TermId>>,
+    /// Whether the store's default graph is in reach: what another store's name for it
+    /// (`GRAPH <urn:x-arq:DefaultGraph>`, [`crate::compat`]) reads. Always, but for a reader
+    /// who may not read it ([`Self::restricted`]): then it is absent, as an unreadable named
+    /// graph is.
+    pub(crate) store_default: bool,
 }
 
 impl ResolvedDataset {
@@ -131,6 +136,7 @@ impl ResolvedDataset {
                 DefaultGraph::Store
             },
             named: None,
+            store_default: true,
         }
     }
 
@@ -184,7 +190,11 @@ impl ResolvedDataset {
                 .filter_map(|name| graph(name.as_ref()))
                 .collect()
         });
-        Self { default, named }
+        Self {
+            default,
+            named,
+            store_default: true,
+        }
     }
 
     /// This dataset restricted to what `access` lets its user read: the default graph
@@ -233,6 +243,10 @@ impl ResolvedDataset {
                 .filter(|&g| access.allows_id(view, g))
                 .collect(),
         });
-        Self { default, named }
+        Self {
+            default,
+            named,
+            store_default: self.store_default && access.default_graph,
+        }
     }
 }

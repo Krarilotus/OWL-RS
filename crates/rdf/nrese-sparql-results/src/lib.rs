@@ -27,7 +27,9 @@ mod solution;
 mod tsv;
 mod xml;
 
-pub use error::{QueryResultsParseError, QueryResultsSyntaxError, TextPosition};
+pub use error::{
+    QueryResultsParseError, QueryResultsSyntaxError, TextPosition, XmlUnrepresentable,
+};
 pub use format::QueryResultsFormat;
 pub use parser::{
     QueryResultsParser, ReaderQueryResultsParserOutput, ReaderSolutionsParser,
