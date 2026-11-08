@@ -1,61 +1,81 @@
 //! The RDF, RDFS, OWL and XSD terms the mapping reads, by their ids in the source (absent
 //! ones never match).
 
-pub const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
-pub const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
-pub const OWL: &str = "http://www.w3.org/2002/07/owl#";
-pub const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+/// A namespace's IRI as a literal, so `concat!` joins IRIs at compile time.
+macro_rules! namespace {
+    (RDF) => {
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+    };
+    (RDFS) => {
+        "http://www.w3.org/2000/01/rdf-schema#"
+    };
+    (OWL) => {
+        "http://www.w3.org/2002/07/owl#"
+    };
+    (XSD) => {
+        "http://www.w3.org/2001/XMLSchema#"
+    };
+}
+
+pub const RDF: &str = namespace!(RDF);
+pub const RDFS: &str = namespace!(RDFS);
+pub const OWL: &str = namespace!(OWL);
+pub const XSD: &str = namespace!(XSD);
 
 /// The IRIs of the OWL 2 datatype map's datatypes and facets, `rdfs:Literal` and
 /// `rdf:langString`: those a source's ids are looked up by when it can't give an IRI's
-/// text.
+/// text. Joined at compile time, so a caller that looks them up pays no allocation for
+/// them (I24c-2; orchestrator, 8 Nov 17:28: "fixed IRIs cost nothing at run time").
+pub const DATA_IRIS: &[&str] = &[
+    concat!(namespace!(XSD), "decimal"),
+    concat!(namespace!(XSD), "integer"),
+    concat!(namespace!(XSD), "nonNegativeInteger"),
+    concat!(namespace!(XSD), "nonPositiveInteger"),
+    concat!(namespace!(XSD), "positiveInteger"),
+    concat!(namespace!(XSD), "negativeInteger"),
+    concat!(namespace!(XSD), "long"),
+    concat!(namespace!(XSD), "int"),
+    concat!(namespace!(XSD), "short"),
+    concat!(namespace!(XSD), "byte"),
+    concat!(namespace!(XSD), "unsignedLong"),
+    concat!(namespace!(XSD), "unsignedInt"),
+    concat!(namespace!(XSD), "unsignedShort"),
+    concat!(namespace!(XSD), "unsignedByte"),
+    concat!(namespace!(XSD), "float"),
+    concat!(namespace!(XSD), "double"),
+    concat!(namespace!(XSD), "string"),
+    concat!(namespace!(XSD), "normalizedString"),
+    concat!(namespace!(XSD), "token"),
+    concat!(namespace!(XSD), "language"),
+    concat!(namespace!(XSD), "Name"),
+    concat!(namespace!(XSD), "NCName"),
+    concat!(namespace!(XSD), "NMTOKEN"),
+    concat!(namespace!(XSD), "boolean"),
+    concat!(namespace!(XSD), "hexBinary"),
+    concat!(namespace!(XSD), "base64Binary"),
+    concat!(namespace!(XSD), "anyURI"),
+    concat!(namespace!(XSD), "dateTime"),
+    concat!(namespace!(XSD), "dateTimeStamp"),
+    concat!(namespace!(XSD), "minInclusive"),
+    concat!(namespace!(XSD), "maxInclusive"),
+    concat!(namespace!(XSD), "minExclusive"),
+    concat!(namespace!(XSD), "maxExclusive"),
+    concat!(namespace!(XSD), "length"),
+    concat!(namespace!(XSD), "minLength"),
+    concat!(namespace!(XSD), "maxLength"),
+    concat!(namespace!(XSD), "pattern"),
+    concat!(namespace!(OWL), "real"),
+    concat!(namespace!(OWL), "rational"),
+    concat!(namespace!(RDF), "PlainLiteral"),
+    concat!(namespace!(RDF), "langString"),
+    concat!(namespace!(RDF), "XMLLiteral"),
+    concat!(namespace!(RDF), "langRange"),
+    concat!(namespace!(RDFS), "Literal"),
+];
+
+/// [`DATA_IRIS`], owned.
 pub fn data_iris() -> Vec<String> {
-    let xsd = [
-        "decimal",
-        "integer",
-        "nonNegativeInteger",
-        "nonPositiveInteger",
-        "positiveInteger",
-        "negativeInteger",
-        "long",
-        "int",
-        "short",
-        "byte",
-        "unsignedLong",
-        "unsignedInt",
-        "unsignedShort",
-        "unsignedByte",
-        "float",
-        "double",
-        "string",
-        "normalizedString",
-        "token",
-        "language",
-        "Name",
-        "NCName",
-        "NMTOKEN",
-        "boolean",
-        "hexBinary",
-        "base64Binary",
-        "anyURI",
-        "dateTime",
-        "dateTimeStamp",
-        "minInclusive",
-        "maxInclusive",
-        "minExclusive",
-        "maxExclusive",
-        "length",
-        "minLength",
-        "maxLength",
-        "pattern",
-    ];
-    let mut out: Vec<String> = xsd.iter().map(|l| format!("{XSD}{l}")).collect();
-    out.extend(["real", "rational"].map(|l| format!("{OWL}{l}")));
-    out.extend(
-        ["PlainLiteral", "langString", "XMLLiteral", "langRange"].map(|l| format!("{RDF}{l}")),
-    );
-    out.push(format!("{RDFS}Literal"));
-    out
+    DATA_IRIS.iter().map(|&iri| iri.to_owned()).collect()
 }
 
 macro_rules! vocabulary {
@@ -67,6 +87,12 @@ macro_rules! vocabulary {
         }
 
         impl Vocabulary {
+            /// Every term, by its field's name, with its IRI, joined at compile time: what a
+            /// caller choosing input for the mapping reads by, at no run-time cost (I24c-2;
+            /// orchestrator, 8 Nov 17:28).
+            pub const IRIS: &'static [(&'static str, &'static str)] =
+                &[$((stringify!($field), concat!(namespace!($ns), $local)),)*];
+
             /// Looks every term up through `id_of`.
             pub fn new(id_of: &dyn Fn(&str) -> Option<u64>) -> Self {
                 Self {
@@ -74,9 +100,9 @@ macro_rules! vocabulary {
                 }
             }
 
-            /// Every term with its IRI (for writing).
+            /// Every term with its IRI (for writing): [`Self::IRIS`], owned.
             pub fn iris() -> Vec<(&'static str, String)> {
-                vec![$((stringify!($field), format!("{}{}", $ns, $local)),)*]
+                Self::IRIS.iter().map(|&(f, iri)| (f, iri.to_owned())).collect()
             }
         }
     };

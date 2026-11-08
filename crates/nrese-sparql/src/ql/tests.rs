@@ -558,7 +558,7 @@ fn the_reader_reads_the_mapping_vocabulary() {
         .collect();
     let stale: Vec<&&str> = NOT_READ.iter().filter(|n| !fields.contains(*n)).collect();
     assert!(stale.is_empty(), "not in the vocabulary: {stale:?}");
-    let (properties, classes) = &*READ;
+    let (properties, classes) = (&READ_PROPERTIES[..], &READ_CLASSES[..]);
     for (field, iri) in nrese_owl::Vocabulary::iris() {
         let read = properties
             .iter()
@@ -573,5 +573,5 @@ fn the_reader_reads_the_mapping_vocabulary() {
         );
     }
     let facet = format!("{}minInclusive", nrese_owl::vocab::XSD);
-    assert!(properties.contains(&facet), "the facets are read");
+    assert!(properties.contains(&facet.as_str()), "the facets are read");
 }

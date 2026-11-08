@@ -6,7 +6,7 @@
 //! rewriting of a query's basic graph patterns is `native/ql.rs`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Mutex};
 
 use nrese_engine::{
     AssertedIdentity, GraphSelector, QuadPattern, ReadModel, Snapshot, SnapshotIdentity, TermId,
@@ -68,39 +68,136 @@ const NOT_READ: &[&str] = &[
     "owl_annotated_target",
 ];
 
-/// The IRIs the reader reads, in every graph: the schema properties (with the data
-/// ranges' facets, `nrese_owl::vocab::data_iris`), and the classes whose members'
-/// `rdf:type` statements are read.
-static READ: std::sync::LazyLock<(Vec<String>, Vec<String>)> = std::sync::LazyLock::new(|| {
-    let (classes, mut properties): (Vec<String>, Vec<String>) = nrese_owl::Vocabulary::iris()
-        .into_iter()
-        .filter(|(field, _)| !NOT_READ.contains(field))
-        .map(|(_, iri)| iri)
-        .partition(|iri| {
-            let local = iri.rsplit(['#', '/']).next().unwrap_or("");
-            local.starts_with(|c: char| c.is_ascii_uppercase())
-        });
-    // `rdfs:Literal` is a datatype there and a class here.
-    let facets: Vec<String> = nrese_owl::vocab::data_iris()
-        .into_iter()
-        .filter(|iri| !classes.contains(iri))
-        .collect();
-    properties.extend(facets);
-    (properties, classes)
-});
+// What the reader reads, chosen at compile time from the mapping's vocabulary
+// (`nrese_owl::Vocabulary::IRIS`, `vocab::DATA_IRIS`): fixed IRIs cost nothing at run time
+// (orchestrator, 8 Nov 17:28; #155's count found a `LazyLock` table's 4.6 KB of peak live
+// bytes in every process).
 
-/// The list-valued properties whose lists are read.
+/// Whether `a` and `b` are the same text (in a `const`).
+const fn same(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Whether vocabulary field `field` is one of [`NOT_READ`].
+const fn not_read(field: &str) -> bool {
+    let mut i = 0;
+    while i < NOT_READ.len() {
+        if same(NOT_READ[i], field) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Whether an IRI's local name is capitalised: a class, read through its members.
+const fn capitalised(iri: &str) -> bool {
+    let b = iri.as_bytes();
+    let mut i = b.len();
+    while i > 0 && b[i - 1] != b'#' && b[i - 1] != b'/' {
+        i -= 1;
+    }
+    i < b.len() && b[i].is_ascii_uppercase()
+}
+
+/// Whether `iri` is one of the vocabulary's classes the reader reads.
+const fn read_class(iri: &str) -> bool {
+    let iris = nrese_owl::Vocabulary::IRIS;
+    let mut i = 0;
+    while i < iris.len() {
+        let (field, term) = iris[i];
+        if !not_read(field) && capitalised(term) && same(term, iri) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// The IRIs the reader reads as classes (`class`) or as schema properties, the first `N`
+/// of them, with how many there are. The properties take the data ranges' facets too
+/// (`DATA_IRIS`, but `rdfs:Literal`: a datatype there and a class here).
+const fn read_iris<const N: usize>(class: bool) -> ([&'static str; N], usize) {
+    let iris = nrese_owl::Vocabulary::IRIS;
+    let data = nrese_owl::vocab::DATA_IRIS;
+    let mut out = [""; N];
+    let mut n = 0;
+    let mut i = 0;
+    while i < iris.len() {
+        let (field, iri) = iris[i];
+        if !not_read(field) && capitalised(iri) == class {
+            if n < N {
+                out[n] = iri;
+            }
+            n += 1;
+        }
+        i += 1;
+    }
+    let mut j = 0;
+    while !class && j < data.len() {
+        if !read_class(data[j]) {
+            if n < N {
+                out[n] = data[j];
+            }
+            n += 1;
+        }
+        j += 1;
+    }
+    (out, n)
+}
+
+/// The schema properties read, in every graph.
+const READ_PROPERTIES: [&str; read_iris::<0>(false).1] = read_iris(false).0;
+/// The classes whose members' `rdf:type` statements are read.
+const READ_CLASSES: [&str; read_iris::<0>(true).1] = read_iris(true).0;
+
+/// The list-valued properties whose lists are read, by the vocabulary's fields.
 const LISTS: &[&str] = &[
-    "intersectionOf",
-    "unionOf",
-    "disjointUnionOf",
-    "propertyChainAxiom",
-    "hasKey",
-    "oneOf",
-    "members",
-    "onProperties",
-    "withRestrictions",
+    "owl_intersection_of",
+    "owl_union_of",
+    "owl_disjoint_union_of",
+    "owl_property_chain_axiom",
+    "owl_has_key",
+    "owl_one_of",
+    "owl_members",
+    "owl_on_properties",
+    "owl_with_restrictions",
 ];
+
+/// The IRI of vocabulary field `field`; a field the vocabulary lacks fails the build.
+const fn field_iri(field: &str) -> &'static str {
+    let iris = nrese_owl::Vocabulary::IRIS;
+    let mut i = 0;
+    while i < iris.len() {
+        if same(iris[i].0, field) {
+            return iris[i].1;
+        }
+        i += 1;
+    }
+    panic!("not a field of nrese_owl::Vocabulary")
+}
+
+/// [`LISTS`]' IRIs.
+const LIST_IRIS: [&str; LISTS.len()] = {
+    let mut out = [""; LISTS.len()];
+    let mut i = 0;
+    while i < LISTS.len() {
+        out[i] = field_iri(LISTS[i]);
+        i += 1;
+    }
+    out
+};
 
 /// What the QL rewriting did to one query (EXPLAIN, and with every answer).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -576,16 +673,6 @@ fn named(snapshot: &Snapshot, iri: &str) -> Option<TermId> {
     snapshot.lookup(NamedNodeRef::new_unchecked(iri).into())
 }
 
-/// The IRIs of the list properties every schema read looks up, joined once rather than on
-/// each read (#155's count: a `format!` per name and read). The schema properties and
-/// declarations are [`READ`]'s, joined once too; the class-expression markers are the
-/// mapping's ([`expressions_of`]).
-fn owl(table: &[&str]) -> Vec<String> {
-    table.iter().map(|l| format!("{OWL}{l}")).collect()
-}
-
-static LIST_IRIS: LazyLock<Vec<String>> = LazyLock::new(|| owl(LISTS));
-
 /// The asserted statements of the schema, in every graph, sorted: the schema properties',
 /// the declarations', the cells of the lists they name, and per class expression one
 /// statement of an individual in it, from a graph `keep` admits.
@@ -636,13 +723,12 @@ fn read_core(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
         object,
         graph: GraphSelector::Any,
     };
-    let (properties, classes) = &*READ;
-    for p in properties.iter().filter_map(|p| named(snapshot, p)) {
+    for p in READ_PROPERTIES.iter().filter_map(|p| named(snapshot, p)) {
         scan(pattern(p, None), &mut out);
     }
     let lookup = |term: NamedNodeRef<'_>| snapshot.lookup(term.into());
     if let Some(rdf_type) = lookup(vocab::rdf::TYPE) {
-        for class in classes.iter().filter_map(|c| named(snapshot, c)) {
+        for class in READ_CLASSES.iter().filter_map(|c| named(snapshot, c)) {
             scan(pattern(rdf_type, Some(class)), &mut out);
         }
     }
