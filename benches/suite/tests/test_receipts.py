@@ -410,6 +410,29 @@ class Driver(unittest.TestCase):
         # D2's own name was on disk before any of its attempts (its Manifest): it can't vanish.
         self.assertIn(self.root / "batch", synced)
 
+    def test_a_second_starter_never_opens_the_results_another_run_owns(self):
+        """Review cell-receipts r5 F1: Suite() created results.csv (schema.Writer: an exists check,
+        then open "w") before main took the directory's lock (Manifest), so two starters at once
+        could truncate each other's rows. While one run owns the directory, a second is refused
+        without opening its results.csv at all, and the first's rows stay as they were."""
+        first = self.suite(runs=1)
+        first.emit(dict(date=first.date, host="h", runtime="process", system="x", version="-", publish="free",
+                        workload="w", tier="1", regime="none", run=1), task="load", ms=5)
+        rows = (first.results / "results.csv").read_bytes()
+        opened = []
+        real = driver.Writer
+
+        def writer(path, *args, **kwargs):
+            opened.append(Path(path))
+            return real(path, *args, **kwargs)
+        with patch.object(driver, "Writer", side_effect=writer):
+            code, err, ran = self.main(first.results)
+        self.assertEqual(code, 2)
+        self.assertFalse(ran)
+        self.assertIn("another run is writing into it", err)
+        self.assertEqual(opened, [])
+        self.assertEqual((first.results / "results.csv").read_bytes(), rows)
+
     def test_a_run_into_a_directory_whose_manifest_can_t_be_read_is_refused_and_leaves_it(self):
         """Review cell-receipts r2 (orchestrator, 8 Nov 05:38): a manifest that couldn't be parsed was
         read as empty, and the next write dropped every earlier invocation's evidence. The run is
