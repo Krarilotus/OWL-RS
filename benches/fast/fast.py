@@ -947,10 +947,15 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
                     break
                 result = json.loads(path.read_text(encoding="utf-8"))
                 path.unlink()
-                if shapes and isinstance(result.get("shacl"), dict) and report_nt.exists():
-                    counts = shacl_report_counts(report_nt.read_text(encoding="utf-8"))
+                if shapes and isinstance(result.get("shacl"), dict):
+                    counts = shacl_report_counts(report_nt.read_text(encoding="utf-8")) if report_nt.exists() else None
                     if counts is None:
-                        record["notes"].append("its SHACL report isn't N-Triples as written: values and paths not counted")
+                        # Couldn't be read, not "not reported": its checks fail whatever --routes says
+                        # (fix check r2: check() left an absent value unchecked without routes).
+                        why = ("its SHACL report isn't N-Triples as written" if report_nt.exists()
+                               else "the invocation wrote no SHACL report") + ": values and paths not counted"
+                        record["notes"].append(why)
+                        result["_unreadable"] = {"shacl.values": why, "shacl.paths": why}
                     else:
                         result["shacl"].update(counts)
                 result["_sweep"] = " ".join(entry)
@@ -1244,6 +1249,8 @@ def check(path: str, want, result: dict, expect: dict, alt_expect: dict) -> dict
     got = lookup(path, result)
     shown = (want if isinstance(want, str) and (want[:2] in (">=", "<=") or want.startswith(("has ", "lacks ")))
              else expected)
+    if got is None and path in (result.get("_unreadable") or {}):  # its source couldn't be read: fails
+        return {"path": path, "expected": shown, "got": None, "ok": False, "note": result["_unreadable"][path]}
     if got is None and not OPTIONS["routes"]:
         # A perf lab without --routes reports no query's value, status or operators: such a
         # check is unchecked (ok None), not a wrong answer; its rows still are checked.
