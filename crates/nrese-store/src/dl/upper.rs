@@ -510,16 +510,37 @@ impl Change {
     }
 }
 
-/// Why U1 isn't available: its evaluation ran out of its budget.
+/// Why U1 isn't available: its evaluation ran out of its budget, or (`refused`) the queries'
+/// memory couldn't hold what it reads or keeps. A refused U1 is never kept: once memory is
+/// free again the next read builds it (SYN-61); one that gave up stays so for its revision.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GaveUp(pub String);
+pub struct GaveUp {
+    pub why: String,
+    pub refused: bool,
+}
+
+impl GaveUp {
+    /// Gave up within its budgets (time, the memory watch, a missing term).
+    pub fn new(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            refused: false,
+        }
+    }
+
+    /// A budget refused what U1 reads or keeps.
+    pub fn refused(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            refused: true,
+        }
+    }
+}
 
 /// Poll the caller's store watch as well as the process owner's safety fallback.
 fn check_stop(stop: Stop<'_>) -> Result<(), GaveUp> {
     if stop() || nrese_reasoner::eval::over_memory_limit() {
-        Err(GaveUp(
-            "the upper bound's evaluation was stopped".to_owned(),
-        ))
+        Err(GaveUp::new("the upper bound's evaluation was stopped"))
     } else {
         Ok(())
     }
@@ -612,7 +633,7 @@ fn view_facts(
         }
         facts
             .push([q.subject.raw(), q.predicate.raw(), q.object.raw()])
-            .map_err(|_| GaveUp(SCRATCH_REFUSED.to_owned()))?;
+            .map_err(|_| GaveUp::refused(SCRATCH_REFUSED))?;
     }
     sort_dedup(&mut facts);
     Ok(facts)
@@ -622,7 +643,7 @@ fn view_facts(
 const SCRATCH_REFUSED: &str = "its evaluation's input doesn't fit the queries' memory";
 
 /// `facts` sorted, each once; in place, allocating nothing.
-fn sort_dedup(facts: &mut nrese_exec::ChargedVec<Triple>) {
+pub(crate) fn sort_dedup(facts: &mut nrese_exec::ChargedVec<Triple>) {
     facts.sort_unstable();
     let mut kept = 0;
     for i in 0..facts.len() {
@@ -658,9 +679,8 @@ impl Upper {
         });
         let schema = Schema::owl(&mut vocabulary);
         if vocabulary.missing {
-            return Err(GaveUp(
-                "its terms haven't reached this replica yet: the primary interns them in a commit"
-                    .to_owned(),
+            return Err(GaveUp::new(
+                "its terms haven't reached this replica yet: the primary interns them in a commit",
             ));
         }
         // The literals U1 compares, by value: of the view, the program's facts, its rules.
@@ -687,7 +707,7 @@ impl Upper {
         for &fact in &facts {
             input
                 .push(fact)
-                .map_err(|_| GaveUp(SCRATCH_REFUSED.to_owned()))?;
+                .map_err(|_| GaveUp::refused(SCRATCH_REFUSED))?;
         }
         sort_dedup(&mut input);
         // The input's charge is held until the evaluation that consumes it returns.
@@ -703,12 +723,12 @@ impl Upper {
             nrese_reasoner::batch::Listing::Stored,
             stop,
         )
-        .map_err(|_| GaveUp("the upper bound's evaluation was stopped".to_owned()))?;
+        .map_err(|_| GaveUp::new("the upper bound's evaluation was stopped"))?;
         let same_as = program.names.same_as;
         // What U1 keeps of the evaluation, charged to `kept` before it is made (SYN-61); the
         // evaluation's own working set is watched (`stop`), as the support sets' is.
         let mut stack = Stack::within(kept);
-        let refused = |_| GaveUp("its facts don't fit the queries' memory".to_owned());
+        let refused = |_| GaveUp::refused("its facts don't fit the queries' memory");
         for (i, t) in m.derived.into_iter().enumerate() {
             if i % 1024 == 0 {
                 check_stop(stop)?;
@@ -840,7 +860,7 @@ impl Upper {
             self.ground.as_ref(),
             stop,
         )
-        .map_err(|_| GaveUp("the upper bound's maintenance was stopped".to_owned()))?;
+        .map_err(|_| GaveUp::new("the upper bound's maintenance was stopped"))?;
         change.program = update.program;
         // An equality the commit brings (the RL closure's, say: a functional property is
         // OWL 2 RL) or U1 derives: U1 then has classes.

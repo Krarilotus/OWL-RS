@@ -66,12 +66,12 @@ pub(super) fn decide_until(
     };
     let mut scratch = nrese_dl::memory::Scratch::new(Some(memory));
     if scratch
-        .charge(|| nrese_dl::memory::ontology_bytes(&base))
+        .charge(|| nrese_dl::memory::ontology_bytes(base.value()))
         .is_err()
     {
         return unresolved(nrese_dl::memory::EXHAUSTED);
     }
-    let mut ontology = (*base).clone();
+    let mut ontology = (**base.value()).clone();
     let ids = Ids::of(snapshot);
     let data_properties = data_properties(&ontology);
     let mut paths = Vec::new();
