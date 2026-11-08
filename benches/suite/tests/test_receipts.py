@@ -513,11 +513,48 @@ class Driver(unittest.TestCase):
         self.assertEqual(calls, ["fsync", "replace"] + (["fsync"] if driver.os.name != "nt" else []))
 
 
+    def test_a_receipt_s_code_is_unchanged_by_what_measuring_writes_into_the_repository(self):
+        """P2 design review F1 (orchestrator, 8 Nov 10:50): the code identity was the tree of all of
+        benches/, which holds the run records (benches/runs) and the views made from them, so committing
+        a run's own record changed the identity its receipt is held to: stale as it landed. It is
+        what a cell can execute: those left out, rust-toolchain.toml and .cargo/ in."""
+        def write(files):
+            for f, text in files.items():
+                (self.root / f).parent.mkdir(parents=True, exist_ok=True)
+                (self.root / f).write_text(text, encoding="utf-8")
+            git("add", "-A")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x")
+        git = lambda *a: subprocess.run(["git", "-C", str(self.root), *a], capture_output=True, text=True,  # noqa: E731
+                                        check=True).stdout
+        git("init", "-q")
+        write({".gitignore": "results*/\ndata/\ntmp/\n", "benches/suite/x.py": "1\n", "benches/runs/README.md": "r\n",
+               "benches/STATUS.md": "s\n", "scripts/lib/ns.sh": "n\n", "rust-toolchain.toml": "t\n",
+               ".cargo/config.toml": "c\n", "crates/x/lib.rs": "x\n"})
+        runs = iter(range(1, 10))
+
+        def code():
+            suite = self.suite(runs=1, results=f"results-{next(runs)}")
+            self.run_tiers(suite, [Plan("w", "1")], self.system())
+            return self.cells(suite)["w/1/x"]["code"]
+        first = code()
+        write({"benches/runs/2026-11-08-r1.toml": "id = 'r1'\n", "benches/STATUS.md": "s2\n",
+               "benches/STANDINGS.md": "t\n", "benches/CATALOG.md": "c\n", "benches/baselines/b.json": "{}\n"})
+        self.assertEqual(code(), first)  # the run's record and its views, committed: the same identity
+        for f in ("rust-toolchain.toml", ".cargo/config.toml", "benches/suite/x.py", "scripts/lib/ns.sh"):
+            with self.subTest(changed=f):
+                write({f: f"{f} changed\n"})
+                now = code()
+                self.assertNotEqual(now, first)
+                first = now
+
+
 class Code(unittest.TestCase):
     def test_a_cell_s_code_changes_with_anything_the_repository_holds_for_it(self):
         """R5: commit-latency's driver reads queries, the harness and GraphDB's configuration outside
         its kit's directory, LUBM's preparation sources scripts/lib: a change to any of them changes
-        the code of every cell (coarse and exact); without a commit to read, it is unknown."""
+        the code of every cell (coarse and exact); without a commit to read, it is unknown. Since F1 of
+        the P2 design review benches/ counts entry by entry (its records and views left out), so the
+        entry that changed is the one named."""
         with tempfile.TemporaryDirectory() as d:
             root = Path(d).resolve()
             files = ("benches/reasoning/maintenance/maintenance.py", "benches/reasoning/queries/lubm/q1.rq",
@@ -530,10 +567,11 @@ class Code(unittest.TestCase):
             git("init", "-q")
             commit = lambda: (git("add", "-A"), git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",  # noqa: E731
                                                     "-m", "x"), git("rev-parse", "HEAD"))[2]
-            paths = receipts.CODE_PATHS + receipts.BUILD_PATHS
-            before = receipts.object_ids(root, commit(), paths)
-            for f, changed in (("benches/reasoning/queries/lubm/q1.rq", "benches"),
-                               ("benches/competitors/graphdb/repo-owl2-rl.ttl", "benches"),
+            first = commit()
+            paths = receipts.code_paths(root, first) + receipts.BUILD_PATHS
+            before = receipts.object_ids(root, first, paths)
+            for f, changed in (("benches/reasoning/queries/lubm/q1.rq", "benches/reasoning"),
+                               ("benches/competitors/graphdb/repo-owl2-rl.ttl", "benches/competitors"),
                                ("scripts/lib/ns.sh", "scripts"), ("crates/x/src/lib.rs", "crates")):
                 with self.subTest(changed=f):
                     (root / f).write_text(f"{f}\n", encoding="utf-8")
