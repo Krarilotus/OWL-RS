@@ -106,17 +106,35 @@ pub fn create_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Names `dir`, a directory in the store's root, which the open has durably named already
-/// ([`create_dir_all`]), so that a reopen of a store at an absolute path syncs each directory
-/// once (timing of 8 Nov; a relative or `.` root still syncs `.` twice: fix check ONCE-N1):
+/// The directories [`create_dir_all`] syncs for the levels of `dir` it finds, outermost first:
+/// each level's holder (`.` for a relative name with no parent; the root, or a Windows prefix,
+/// is held by nothing). A store's open that finds its root defers these syncs to the first
+/// durable write that relies on them (`Wal::settle_names`, deferred-sync design note of 8 Nov).
+pub(crate) fn holders(dir: &Path) -> Vec<PathBuf> {
+    let mut holders: Vec<PathBuf> = dir
+        .ancestors()
+        .filter(|level| !level.as_os_str().is_empty())
+        .filter_map(|level| level.parent())
+        .map(|holder| match holder.as_os_str().is_empty() {
+            true => PathBuf::from("."),
+            false => holder.to_path_buf(),
+        })
+        .collect();
+    holders.reverse();
+    holders
+}
+
+/// Names `dir`, a directory in the store's root, and returns whether it made it, so that a
+/// reopen of a store at an absolute path syncs each directory once (timing of 8 Nov; a
+/// relative or `.` root still syncs `.` twice: fix check ONCE-N1):
 /// - missing, it is made as [`create_dir_all`] makes a level: the root's sync checked before,
 ///   done after, `dir` removed again if that fails;
-/// - found (or made meanwhile by someone else), the root isn't synced here: the open syncs it
-///   after replay, before anything relies on the name, which names every directory found in
-///   it at once.
-pub(crate) fn create_store_dir(dir: &Path) -> std::io::Result<()> {
+/// - found (or made meanwhile by someone else), the root isn't synced here: its sync after
+///   replay, at the open or before the first durable write (deferred-sync design note), names
+///   every directory found in it at once.
+pub(crate) fn create_store_dir(dir: &Path) -> std::io::Result<bool> {
     if dir.is_dir() {
-        return Ok(());
+        return Ok(false);
     }
     let root = match dir.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
@@ -126,7 +144,7 @@ pub(crate) fn create_store_dir(dir: &Path) -> std::io::Result<()> {
     match fs::create_dir(dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {
-            return Ok(());
+            return Ok(false);
         }
         Err(error) => return Err(error),
     }
@@ -134,7 +152,7 @@ pub(crate) fn create_store_dir(dir: &Path) -> std::io::Result<()> {
         let _ = fs::remove_dir(dir);
         return Err(error);
     }
-    Ok(())
+    Ok(true)
 }
 
 /// [`create_dir_all`]'s levels, outermost first; those it makes are pushed to `made`.
