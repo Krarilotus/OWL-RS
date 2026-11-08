@@ -13,6 +13,7 @@ mod dl;
 mod entailment_tests;
 mod equality_compact_tests;
 mod explanation_tests;
+mod graph_alias_input_tests;
 mod image_backup_tests;
 mod implicit_prefix_tests;
 mod inferred_access_tests;
