@@ -393,6 +393,89 @@ fn a_noted_commit_rescans_only_the_memberships_it_touched() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// An engine with `n` restrictions, `_:e0` to `_:e{n-1}`, each with members `:m{e}_0` to
+/// `:m{e}_2`.
+fn restrictions(n: usize) -> Engine {
+    let mut text = String::from(
+        "@prefix : <http://example.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> .\n",
+    );
+    for e in 0..n {
+        text.push_str(&format!(
+            "_:e{e} a owl:Restriction ; owl:onProperty :S{e} ; owl:someValuesFrom :A .\n"
+        ));
+        for k in 0..3 {
+            text.push_str(&format!(":m{e}_{k} a _:e{e} .\n"));
+        }
+    }
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for q in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
+        tx.insert(q.unwrap().as_ref());
+    }
+    tx.commit().unwrap();
+    engine
+}
+
+/// The `rdf:type` statement making `:{name}` a member of `_:e0` ([`restrictions`]): never
+/// the member a schema holds, which is one of the loaded ones.
+fn member_of_e0(engine: &Engine, name: &str) -> EncodedQuad {
+    let snapshot = engine.snapshot();
+    let rdf_type = iri(&snapshot, RDF, "type").unwrap();
+    let m0 = snapshot
+        .lookup(NamedNodeRef::new_unchecked(&format!("{EX}m0_0")).into())
+        .unwrap();
+    let e0 = snapshot
+        .quads_for_pattern_in(
+            ReadModel::Asserted,
+            &QuadPattern {
+                subject: Some(m0),
+                predicate: Some(rdf_type),
+                object: None,
+                graph: GraphSelector::Any,
+            },
+        )
+        .next()
+        .unwrap()
+        .object;
+    let tx = engine.transaction();
+    let subject = tx.intern(NamedNodeRef::new_unchecked(&format!("{EX}{name}")).into());
+    drop(tx);
+    EncodedQuad::new(subject, rdf_type, e0, TermId::DEFAULT_GRAPH)
+}
+
+/// A commit that never published leaves the next commit from the same state noted (DUR's
+/// condition 5 for `asserted_identity_after`, 8 Nov): a note to a state no snapshot has
+/// (a transaction's pending one), then a commit through [`QlRewriting::commit`] adding a
+/// member to `_:e0`. Expected: the read after it walks that change and scans nothing,
+/// `[0, 1, 0]` (scanned, walked, written), as after any noted commit.
+#[test]
+fn a_note_of_a_commit_that_never_published_leaves_the_next_noted() {
+    let engine = restrictions(20);
+    let ql = QlRewriting::new(Closure { lists: false });
+    ql.tbox(&engine.snapshot(), None);
+    let member = member_of_e0(&engine, "new");
+    let tx = engine.transaction();
+    let (from, never) = (
+        tx.base().asserted_identity(),
+        tx.pending_snapshot().asserted_identity(),
+    );
+    drop(tx);
+    ql.note_commit(from, never, Some(Vec::new()));
+    let mut tx = engine.transaction();
+    assert!(tx.insert_encoded(member));
+    ql.commit(tx).unwrap();
+    for cell in [&MEMBER_SCANS, &EXPRESSIONS_WALKED, &MEMBERS_WRITTEN] {
+        cell.set(0);
+    }
+    ql.tbox(&engine.snapshot(), None);
+    let counted = [
+        MEMBER_SCANS.get(),
+        EXPRESSIONS_WALKED.get(),
+        MEMBERS_WRITTEN.get(),
+    ];
+    assert_eq!(counted, [0, 1, 0], "(scanned, walked, written)");
+}
+
 #[test]
 fn introducing_owl_thing_without_changing_the_schema_matches_fresh_preparation() {
     let engine = engine("");

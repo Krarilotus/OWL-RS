@@ -352,22 +352,16 @@ impl MutationPipeline {
             let supports = self.store.supports();
             let touched = supports.wants_commits().then(|| supports.touched(&tx));
             let before = tx.base().revision();
-            // What the commit changes of individuals' memberships of class expressions,
-            // for the QL schema it compiles (only while the rewriting is on).
-            let ql = self.store.query_settings().ql();
-            let memberships = ql.as_ref().map(|_| {
-                (
-                    tx.base().asserted_identity(),
-                    nrese_sparql::ql::touched_expressions(&tx),
-                )
-            });
-            let summary = tx.commit().map_err(|error| MutationError::Store {
+            // With the rewriting on, the QL schema notes what the commit changes of
+            // individuals' memberships of class expressions, before the commit publishes.
+            let summary = match self.store.query_settings().ql() {
+                Some(ql) => ql.commit(tx),
+                None => tx.commit(),
+            }
+            .map_err(|error| MutationError::Store {
                 kind,
                 source: StoreError::Engine(error),
             })?;
-            if let (Some(ql), Some((from, touched))) = (ql, memberships) {
-                ql.note_commit(from, summary.asserted, touched);
-            }
             if let Some(touched) = touched {
                 supports.note_commit(before, summary.revision, touched);
             }
