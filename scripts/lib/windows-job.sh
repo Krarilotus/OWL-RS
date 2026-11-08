@@ -15,7 +15,9 @@
 # made from the Python the tree declares (scripts/lib/gate-tools.txt python-windows, python.org's
 # build, installed under the cache), it must run with the runtime the tree declares
 # (scripts/lib/gate-key.sh gate_runtime), or there is no verdict; the record states the runtime it
-# ran with, which scripts/lib/fleet-gate.sh checks against the declared one.
+# ran with, which scripts/lib/fleet-gate.sh checks against the declared one. The console's Node is
+# the pinned one (scripts/lib/gate-tools.txt node), installed under the cache by
+# scripts/lib/gate-node.sh, never the host's.
 #
 # The fleet starts a Windows step without a usable stdin (fleet backlog I14): Python's subprocess
 # and coreutils fail on it. The job says so after check.sh's summary, records it (`stdin` in
@@ -101,6 +103,14 @@ run() {
     || infra "no Python environment for the suite with the declared runtime"
   echo "$EPOCHSECONDS" | tee "${pybin%/*}/.last-used" > "${base%/tools/python.exe}/.last-used"
   export PATH="$pybin:$PATH"
+  # The console's Node (scripts/lib/gate-node.sh), the job's own under the host's cache, first on
+  # PATH: the tier's console step runs with the pinned build, never the host's.
+  local nodebin
+  # shellcheck source=gate-node.sh
+  . scripts/lib/gate-node.sh
+  nodebin=$(NRESE_PYTHON=python gate_node "$cache" scripts/lib/gate-tools.txt) || infra "no Node for the console"
+  echo "$EPOCHSECONDS" > "$nodebin/.last-used"
+  export PATH="$nodebin:$PATH"
 
   local temp
   mkdir -p tmp/windows-job/temp
