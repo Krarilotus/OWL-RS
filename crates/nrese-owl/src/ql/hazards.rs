@@ -664,16 +664,24 @@ fn existential_roles(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
 }
 
 /// The existentials concluded by `e` (`positive`) or by its complement: their roles into
-/// `roles`, their fillers' terms into `fillers`. The expression is read in negation normal
-/// form, the complement pushed inward (fix check r1, F3):
-/// - Generating: `∃R.F`, and `≥ n` and `= n` for n ≥ 1.
-/// - Generating once negated: `¬≤ n` (`≥ n+1`), `¬= n` (it may be `≥ n+1`), and `¬∀R.F`
-///   (`∃R.¬F`).
-/// - Not generating: `∀` and `≤` themselves, and `¬∃R.F` (`∀R.¬F`).
+/// `roles`, their fillers' terms into `fillers`. Every `≥ 1`-form of the expression's
+/// negation normal form is collected, at any depth (fix check r2, F4):
+/// - A restriction makes a successor where it reads as `≥ n` for n ≥ 1: `∃R.F`, `≥ n` and
+///   `= n` for n ≥ 1, `¬∀R.F` (`∃R.¬F`), `¬≤ n` (`≥ n+1`) and `¬= n` (it may be `≥ n+1`).
+///   `∀`, `≤` and `= 0` make none, nor do `¬∃` and `¬≥ n`, which are `∀` and `≤ n−1`.
+/// - Its filler is read where it holds of a successor, made or already there: `F` under
+///   `∃`, `∀` and `≥`; `¬F` under `¬∃` and `¬∀`; both under `≤` and `=`, which put each
+///   successor in `F` or in `¬F` (`≤ 0 R.¬∃S.D` is `∀R.∃S.D`).
+/// - Conjunctions and unions are read part by part, complements flip the polarity.
+/// - Nothing is inside a class, `⊤`, `⊥`, a nominal, `hasValue` or `hasSelf`: they make no
+///   anonymous individual (the `Enumeration`, `Value` and `SelfRestriction` hazards
+///   mark them). A data range has no class expression either: datatypes, facets and their
+///   combinations make a data value at most.
 ///
-/// It looks under conjunctions, unions, and the fillers of universals and existentials:
-/// a universal's filler holds of the successors it reaches (I24b: `∀R.∃S.A`). Conservative:
-/// it may name a role no individual is made for, never miss one.
+/// Inverses give the named property, its role component. Conservative: it may name a
+/// role no individual is made for, never miss one. Each (expression, polarity) is walked
+/// once, so reading both polarities under nested bounds doesn't double the walk at each
+/// level; a successor's filler terms are still collected per restriction that makes one.
 fn generated(
     o: &Ontology,
     e: ExprId,
@@ -681,67 +689,76 @@ fn generated(
     roles: &mut Vec<Term>,
     fillers: &mut Vec<Term>,
 ) {
-    // An existential on `p`, its successor in filler `f` (none for a data value).
-    fn generates(
-        o: &Ontology,
-        p: Term,
-        f: Option<ExprId>,
-        roles: &mut Vec<Term>,
-        fillers: &mut Vec<Term>,
-    ) {
-        roles.push(p);
-        if let Some(f) = f {
-            terms(o, f, fillers);
-            generated(o, f, true, roles, fillers);
-        }
+    nnf(o, e, positive, &mut HashSet::new(), roles, fillers);
+}
+
+fn nnf(
+    o: &Ontology,
+    e: ExprId,
+    positive: bool,
+    seen: &mut HashSet<(ExprId, bool)>,
+    roles: &mut Vec<Term>,
+    fillers: &mut Vec<Term>,
+) {
+    use ClassExpr as C;
+    if !seen.insert((e, positive)) {
+        return;
     }
-    match (o.class(e), positive) {
-        (ClassExpr::Some(p, f), true) => generates(o, p.named(), Some(*f), roles, fillers),
-        (ClassExpr::Min(n, p, f) | ClassExpr::Exact(n, p, f), true) if *n >= 1 => {
-            generates(o, p.named(), Some(*f), roles, fillers)
-        }
-        (ClassExpr::Max(_, p, f) | ClassExpr::Exact(_, p, f), false) => {
-            generates(o, p.named(), Some(*f), roles, fillers)
-        }
-        (ClassExpr::All(p, f), false) => {
-            // `∃R.¬F`: its successor is outside `F`, and in what `¬F` concludes.
-            roles.push(p.named());
-            terms(o, *f, fillers);
-            generated(o, *f, false, roles, fillers);
-        }
-        (ClassExpr::All(_, f), true) | (ClassExpr::Some(_, f), false) => {
-            generated(o, *f, positive, roles, fillers)
-        }
-        (ClassExpr::DataSome(p, _), true)
-        | (ClassExpr::DataAll(p, _), false)
-        | (ClassExpr::DataMax(_, p, _), false)
-        | (ClassExpr::DataExact(_, p, _), false) => generates(o, *p, None, roles, fillers),
-        (ClassExpr::DataMin(n, p, _) | ClassExpr::DataExact(n, p, _), true) if *n >= 1 => {
-            generates(o, *p, None, roles, fillers)
-        }
-        (ClassExpr::And(parts) | ClassExpr::Or(parts), _) => {
-            for &p in parts {
-                generated(o, p, positive, roles, fillers);
-            }
-        }
-        (ClassExpr::Not(inner), _) => generated(o, *inner, !positive, roles, fillers),
+    // An object restriction: its role and filler, whether it makes a successor, and
+    // whether its filler (`inside`) or the filler's complement (`outside`) holds of one.
+    let (p, f, makes, inside, outside) = match (o.class(e), positive) {
         (
-            ClassExpr::Thing
-            | ClassExpr::Nothing
-            | ClassExpr::Class(_)
-            | ClassExpr::OneOf(_)
-            | ClassExpr::Min(..)
-            | ClassExpr::Exact(..)
-            | ClassExpr::Max(..)
-            | ClassExpr::HasValue(..)
-            | ClassExpr::HasSelf(_)
-            | ClassExpr::DataSome(..)
-            | ClassExpr::DataMin(..)
-            | ClassExpr::DataExact(..)
-            | ClassExpr::DataAll(..)
-            | ClassExpr::DataHasValue(..)
-            | ClassExpr::DataMax(..),
+            C::Thing
+            | C::Nothing
+            | C::Class(_)
+            | C::OneOf(_)
+            | C::HasValue(..)
+            | C::HasSelf(_)
+            | C::DataHasValue(..),
             _,
-        ) => {}
+        ) => return,
+        (C::And(parts) | C::Or(parts), _) => {
+            for &part in parts {
+                nnf(o, part, positive, seen, roles, fillers);
+            }
+            return;
+        }
+        (C::Not(inner), _) => return nnf(o, *inner, !positive, seen, roles, fillers),
+        (C::DataSome(p, _), true)
+        | (C::DataAll(p, _), false)
+        | (C::DataMax(_, p, _), false)
+        | (C::DataExact(_, p, _), false) => {
+            roles.push(*p);
+            return;
+        }
+        (C::DataMin(n, p, _) | C::DataExact(n, p, _), true) => {
+            if *n >= 1 {
+                roles.push(*p);
+            }
+            return;
+        }
+        (C::DataSome(..), false)
+        | (C::DataAll(..), true)
+        | (C::DataMin(..), false)
+        | (C::DataMax(..), true) => return,
+        (C::Some(p, f), true) => (p, f, true, true, false),
+        (C::Some(p, f), false) => (p, f, false, false, true),
+        (C::All(p, f), true) => (p, f, false, true, false),
+        (C::All(p, f), false) => (p, f, true, false, true),
+        (C::Min(n, p, f), true) => (p, f, *n >= 1, true, false),
+        (C::Min(_, p, f), false) | (C::Max(_, p, f), true) => (p, f, false, true, true),
+        (C::Max(_, p, f), false) => (p, f, true, true, false),
+        (C::Exact(n, p, f), true) => (p, f, *n >= 1, true, true),
+        (C::Exact(_, p, f), false) => (p, f, true, true, true),
+    };
+    if makes {
+        roles.push(p.named());
+        terms(o, *f, fillers);
+    }
+    if inside {
+        nnf(o, *f, true, seen, roles, fillers);
+    }
+    if outside {
+        nnf(o, *f, false, seen, roles, fillers);
     }
 }
