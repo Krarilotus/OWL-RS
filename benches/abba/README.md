@@ -26,7 +26,8 @@ fleet results set:abba-<name>-<b8>     # its member's results hold abba-verdict.
 - The plan comes first: cases, hypotheses, blocks (from the cases' calibrated spread, at least one
   square; `--blocks` overrides), the estimate in host-hours with its exclusive share, and `fleet
   check`'s answer: which timing hosts can take it, and what runs or waits there now. `--plan` stops
-  there; otherwise it submits one set.
+  there, exit 0 when fleet's check takes the set and 1 when it refuses it (nothing queued either
+  way); otherwise it submits one set.
 - The job asks by capability, never a host: a Linux timing host that builds (roles measure and
   build), the cases' memory and data (`has`). It starts only where it can time, builds A, B and the
   harness there first and holds that host alone to its end (the fleet keeps a timed job's host only
