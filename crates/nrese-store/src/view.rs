@@ -34,6 +34,17 @@ impl GraphTarget {
         }
     }
 
+    /// This target as the store graph it addresses ([`Self::graph_name`]): `DefaultGraph` for
+    /// another store's name for it. What a graph result says (whether a graph exists, whether a
+    /// write created it) is decided on this, never on how the target was spelled (review r2 of
+    /// SYN-54 slice 3, S3-F3).
+    pub(crate) fn resolved(&self) -> StoreResult<GraphTarget> {
+        Ok(match self.graph_name()? {
+            GraphName::DefaultGraph => GraphTarget::DefaultGraph,
+            _ => self.clone(),
+        })
+    }
+
     /// The pattern selecting this graph's quads in `view`, or `None` for a named graph the
     /// view doesn't know (which therefore holds no quads).
     pub(crate) fn pattern_in(&self, view: &impl ReadView) -> StoreResult<Option<QuadPattern>> {
