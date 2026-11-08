@@ -6,11 +6,6 @@
 //! applied. `Private` ignores the bound passed in: its bound is its own (`start + n`), fixed when
 //! the overlay opened over a snapshot. A mismatched bound can't reach it in a release build.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "snapshots resolve through it from package 2b")
-)]
-
 use std::sync::Arc;
 
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
@@ -35,6 +30,10 @@ impl Vocabulary {
     /// The contract's b(V) (§4.1): ids below it are the dictionary's, the same in every
     /// vocabulary of that dictionary bounded at or past it. `bound` for shared, `start` for
     /// private.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "alignment by value reads it in package 5")
+    )]
     pub(crate) fn shared_bound(&self, bound: u64) -> u64 {
         match self {
             Self::Shared(_) => bound,
