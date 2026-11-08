@@ -7,6 +7,13 @@ cargo-nextest 0.9.146
 # Miri's toolchain (scripts/miri.sh)
 miri nightly-2026-10-01
 cargo-deny 0.20.2
+# The console's Node in both tiers (scripts/check.sh console; scripts/lib/gate-node.sh installs it,
+# under the host's cache, never the host's own): nodejs.org's build of this version, each
+# platform's archive by its sha256 (the release's SHASUMS256.txt). Within the console's engines
+# range (apps/nrese-console/package.json, which npm ci enforces: .npmrc engine-strict).
+#
+#   node version platform sha256 platform sha256
+node 22.23.4 linux-x64 b8492284c76a54baf58d61668dd0e41ee0fc98adabf9503d30f05d08f55b4406 win-x64 cbc74b5e0982c9dbb41525fd8fb5dcd32fbee237863f7829072f4639a1ce5f20
 # The suite's Python in the Windows tier (scripts/lib/windows-job.sh installs it, under the host's
 # cache, never the host's own): python.org's build of this version, its NuGet package
 # (https://www.nuget.org/packages/python) by the package's sha256, and the sys.version that

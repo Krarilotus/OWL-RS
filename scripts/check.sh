@@ -27,7 +27,7 @@
 #                                  the merge check's Windows part, on the fleet only
 #                                  (scripts/lib/fleet-gate.sh windows): COMMIT (default HEAD)
 #                                  built whole, clippy on it all, all its tests and doc tests,
-#                                  the suite contracts, by its own tier here, which its own
+#                                  the suite contracts, the console, by its own tier here, which its own
 #                                  scripts/lib/windows-job.sh runs on a Windows host. A commit
 #                                  whose inputs (scripts/lib/gate-key.sh windows_inputs)
 #                                  passed before, under the Python runtime it declares
@@ -452,6 +452,8 @@ case "$mode" in
     step test run_tests "${everything[@]}"
     step "doc tests" "$guarded" test --locked --workspace --doc --no-fail-fast
     step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
+    # The console's typecheck and tests, with the gate's own Node (scripts/lib/windows-job.sh).
+    console
     ;;
   all)
     step fmt cargo fmt --all --check
