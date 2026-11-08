@@ -396,3 +396,57 @@ fn a_support_update_s_first_pass_counts_each_fact() {
         "{read} facts' earlier sets read, the first of them cancelling (bound {bound}; {n} facts)"
     );
 }
+
+/// R8-1 (fix check r2): producer discovery is attempted work while its references are
+/// read. One task's poller over 32 candidates, each with 12,288 producers whose first
+/// succeeds at once (a single bound match); cancelled at the first candidate's first scan.
+/// The candidates after it read at most `POLL_UNITS` more producer references between
+/// them, not a whole producer list each (the reviewer's successful-prefix witness).
+#[test]
+fn producer_discovery_counts_each_reference_read() {
+    use crate::eval::{Poller, references_read};
+    use crate::graph_sets::derived_otherwise;
+    use crate::ir::Term;
+    let (r, n) = (3 * POLL_UNITS, 32);
+    let mut vocabulary = LocalVocabulary::default();
+    let (mut closure, ground, fact) = empty_producers(&mut vocabulary, r, "", "");
+    let producers = ground.unpolled().producers(fact);
+    assert_eq!(producers.len(), r, "a producer per subproperty");
+    // The first producer's body predicate: each candidate's one match goes through it.
+    let Term::Const(first) = ground.rules[producers[0]].body[0].0[1] else {
+        panic!("a constant predicate");
+    };
+    let q = fact[1];
+    let candidates: Vec<Triple> = (0..n)
+        .map(|j| {
+            let [a, b] = [format!("ex:a{j}"), format!("ex:b{j}")]
+                .map(|t| load(&mut vocabulary, &format!("{t} ex:q {t}"))[0][0]);
+            closure.push([a, first, b]);
+            [a, q, b]
+        })
+        .collect();
+    closure.extend(&candidates);
+    closure.sort_unstable();
+    closure.dedup();
+    let source = Asked::new(closure);
+    let stop = || source.cancel.load(Ordering::Relaxed);
+    let mut poll = Poller::new(&stop).expect("not stopped yet");
+    references_read::take();
+    let derived: Vec<bool> = candidates
+        .iter()
+        .map(|&c| derived_otherwise(&source, &ground, &[], c, &mut poll))
+        .collect();
+    let read = references_read::take();
+    // Guard: the witness is the successful prefix (each candidate's first producer derives it).
+    assert!(
+        derived.iter().all(|&d| d),
+        "every candidate derived otherwise"
+    );
+    let bound = POLL_UNITS + n;
+    assert!(bound < n * r, "the bound proves nothing");
+    assert!(
+        read <= bound,
+        "{read} producer references read over {n} candidates after a stop in the first (bound \
+         {bound}; {r} producers each)"
+    );
+}
