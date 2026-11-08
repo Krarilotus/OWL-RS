@@ -1136,6 +1136,7 @@ impl SupportSets {
         before: &Snapshot,
         access: &GraphAccess,
         working: &Work,
+        stop: nrese_reasoner::eval::Stop<'_>,
     ) -> Result<Option<Changes>, Unavailable> {
         let Some((from, changed)) = self.since.as_ref() else {
             return Ok(None);
@@ -1151,9 +1152,10 @@ impl SupportSets {
         // graph the reader reads both times, it is no extra of either view.
         let mut scanning = Reservation::new(Arc::clone(working));
         scanning.charge(snapshot.scan_bytes(ReadModel::Asserted))?;
-        // Each changed fact's reads counted on the query's cancellation (sweep M15).
-        let cancelled = || working.cancelled();
-        let poll = Poller::new(&cancelled).ok_or(Unavailable::Cancelled)?;
+        // Each changed fact counted before it is decided, and its reads, on `stop` (the
+        // query's cancellation; sweep M15, review r1 F4): a fact both versions hide is
+        // decided with no store read, and still counts.
+        let poll = Poller::new(stop).ok_or(Unavailable::Cancelled)?;
         let out_of_reach = |view: &Snapshot, fact: Triple| {
             asserted_counted(view, access, fact, &poll) == Some(Asserted::OutOfReach)
         };
@@ -1162,7 +1164,13 @@ impl SupportSets {
                 || self.decide(fact, &visible_now) != Decision::Hidden)
                 && (out_of_reach(before, fact) || out_of_reach(snapshot, fact))
         };
-        let any_extra = changed.iter().any(|&fact| extra(fact));
+        let mut any_extra = false;
+        for &fact in poll.counted(changed.iter()) {
+            if extra(fact) {
+                any_extra = true;
+                break;
+            }
+        }
         if poll.stopped() {
             return Err(Unavailable::Cancelled);
         }
@@ -1177,6 +1185,10 @@ impl SupportSets {
             show: ChargedVec::new(Arc::clone(working)),
         };
         for &fact in changed.iter() {
+            // The fact's four store probes, counted before they are made (review r1 F4).
+            if poll.attempt(4) {
+                return Err(Unavailable::Cancelled);
+            }
             let [s, p, o] = fact.map(TermId::from_raw);
             let quad = EncodedQuad::new(s, p, o, TermId::DEFAULT_GRAPH);
             let decided = |sets: &SupportSets, visible: &[bool], present: bool| match present {
@@ -1210,6 +1222,9 @@ impl SupportSets {
                 (true, false) => changes.show.push(quad)?,
                 _ => {}
             }
+        }
+        if poll.stopped() {
+            return Err(Unavailable::Cancelled);
         }
         Ok(Some(changes))
     }
@@ -1426,15 +1441,12 @@ struct After<'a> {
     removed: &'a [Triple],
 }
 
-impl After<'_> {
-    fn removed_matching(&self, bound: [Option<u64>; 3]) -> impl Iterator<Item = Triple> + '_ {
-        self.removed.iter().copied().filter(move |fact| {
-            bound
-                .iter()
-                .zip(fact)
-                .all(|(bound, term)| bound.is_none_or(|b| b == *term))
-        })
-    }
+/// Whether `fact` has `bound`'s terms where it binds them.
+fn matches(bound: [Option<u64>; 3], fact: &Triple) -> bool {
+    bound
+        .iter()
+        .zip(fact)
+        .all(|(bound, term)| bound.is_none_or(|b| b == *term))
 }
 
 /// Reads count as `Source` says: each quad a scan visits is a position, and so is each
@@ -1450,14 +1462,8 @@ impl Visits for After<'_> {
                 return;
             }
         }
-        let matches = |fact: &Triple| {
-            bound
-                .iter()
-                .zip(fact)
-                .all(|(bound, term)| bound.is_none_or(|b| b == *term))
-        };
         for &fact in self.removed {
-            let going = match matches(&fact) {
+            let going = match matches(bound, &fact) {
                 true => visit.fact(fact),
                 false => visit.skip(),
             };
@@ -1467,14 +1473,19 @@ impl Visits for After<'_> {
         }
     }
 
+    /// Each removed fact counted as it is read (review r1 F1).
     fn size(&self, bound: [Option<u64>; 3], _: Seg, probe: Probe<'_, '_>) -> usize {
-        if !probe.units(self.removed.len()) {
+        let removed = probe
+            .counted(self.removed)
+            .filter(|fact| matches(bound, fact))
+            .count();
+        if probe.poller().stopped() {
             return 0;
         }
         let stored = self
             .snapshot
             .estimate_in(ReadModel::Materialised, &bound_pattern(bound));
-        usize::try_from(stored).unwrap_or(usize::MAX) + self.removed_matching(bound).count()
+        usize::try_from(stored).unwrap_or(usize::MAX) + removed
     }
 
     fn holds(&self, fact: Triple, _: Probe<'_, '_>) -> bool {
@@ -2479,9 +2490,16 @@ impl Supports {
                 .flatten()
         };
         let mut form = None;
+        let cancelled = || working.cancelled();
         if let Some(reader) = earlier
-            && let Some(changes) =
-                sets.changes_since(snapshot, &reader.sets, &reader.snapshot, access, working)?
+            && let Some(changes) = sets.changes_since(
+                snapshot,
+                &reader.sets,
+                &reader.snapshot,
+                access,
+                working,
+                &cancelled,
+            )?
         {
             form = match &reader.form {
                 Form::Mask(mask) => {
@@ -2587,13 +2605,14 @@ impl Supports {
             readable.push(access.allows_id(snapshot, graph))?;
         }
         // A lookup in the closure's list, counted before it is made, then each graph entry
-        // it reads: on the reading task's poller (sol-loop r1 S4, r2 S5).
+        // as it is read: on the reading task's poller (sol-loop r1 S4, r2 S5, review r1 F1).
+        // Stopped, it reads as not readable, an answer the run's check discards.
         let reads = |fact: Triple, poll: &Poller<'_>| {
             if poll.tick() {
                 return false;
             }
-            let entries = closure.graphs_of(fact);
-            !poll.attempt(entries.len()) && entries.iter().any(|&(_, g)| readable[g as usize])
+            poll.counted(closure.graphs_of(fact))
+                .any(|&(_, g)| readable[g as usize])
         };
         let ground = program.ground_program(snapshot);
         let following = Following::new(working);

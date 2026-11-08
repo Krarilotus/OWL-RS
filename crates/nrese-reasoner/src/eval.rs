@@ -367,10 +367,34 @@ impl<'v, 'p> Probe<'v, 'p> {
         Self(poll)
     }
 
-    /// Counts `n` more units of the probe's work; false once the poller has stopped.
+    /// Counts `n` more units of the probe's work, at most `POLL_UNITS` ([`Poller::attempt`]);
+    /// false once the poller has stopped. A longer list of work goes through
+    /// [`Self::counted`].
     #[inline]
     pub fn units(self, n: usize) -> bool {
         !self.0.attempt(n)
+    }
+
+    /// [`Poller::counted`] on the probe's poller.
+    pub fn counted<I: IntoIterator>(self, items: I) -> Counted<'v, 'p, I::IntoIter> {
+        self.0.counted(items)
+    }
+
+    /// Counts `n` units of work another owner reports as it does it (an engine count's
+    /// visitor, `Snapshot::count_in_visiting`): a step it took in one go, counted in runs
+    /// of at most `POLL_UNITS`; false once the poller has stopped, which tells the owner to
+    /// stop.
+    pub fn visited(self, n: u64) -> bool {
+        let run = u64::from(nrese_exec::POLL_UNITS);
+        let mut left = n;
+        while left > 0 {
+            let k = left.min(run);
+            if self.0.attempt(k as usize) {
+                return false;
+            }
+            left -= k;
+        }
+        !self.0.stopped()
     }
 
     /// The poller, for the probe's reads of other sources.
@@ -1214,8 +1238,17 @@ impl<'a> Poller<'a> {
     /// producer, a range of driver positions, a read: [`Source`]); true once the stop has
     /// fired. The poller bounds attempted work, not delivered rows. The common path tests
     /// `stopped` and the ticker's countdown: no call and no atomic.
+    ///
+    /// `units` is at most `POLL_UNITS`: work counted at once runs to its end before the stop
+    /// is asked again, so a longer run would do its length past a stop (REAS-2's bound:
+    /// `POLL_UNITS` plus one run). A list of work of any length goes through
+    /// [`Self::counted`] (review r1 F1).
     #[inline]
     pub fn attempt(&self, units: usize) -> bool {
+        debug_assert!(
+            units <= nrese_exec::POLL_UNITS as usize,
+            "{units} units counted at once: at most POLL_UNITS (Poller::counted)"
+        );
         if self.stopped.get() {
             return true;
         }
@@ -1224,6 +1257,53 @@ impl<'a> Poller<'a> {
             self.stopped.set(true);
         }
         self.stopped.get()
+    }
+
+    /// The items of `items` as the work they are, each counted before it is handed on: a run
+    /// of at most `POLL_UNITS` counted at once (as many as the items say are left, at least
+    /// one), the stop asked at each run; no more once the poller has stopped. The way a leaf
+    /// reads a list it holds (a slice, a map's entries, a member list): one count per run, a
+    /// decrement per item (review r1 F1).
+    pub fn counted<I: IntoIterator>(&self, items: I) -> Counted<'_, 'a, I::IntoIter> {
+        Counted {
+            poll: self,
+            items: items.into_iter(),
+            ahead: 0,
+        }
+    }
+}
+
+/// [`Poller::counted`]'s items.
+pub struct Counted<'v, 'p, I> {
+    poll: &'v Poller<'p>,
+    items: I,
+    /// Items counted ahead and not yet handed on.
+    ahead: usize,
+}
+
+impl<I: Iterator> Iterator for Counted<'_, '_, I> {
+    type Item = I::Item;
+
+    #[inline]
+    fn next(&mut self) -> Option<I::Item> {
+        if self.ahead == 0 {
+            let run = self
+                .items
+                .size_hint()
+                .0
+                .clamp(1, nrese_exec::POLL_UNITS as usize);
+            if self.poll.attempt(run) {
+                return None;
+            }
+            self.ahead = run;
+        }
+        let item = self.items.next()?;
+        self.ahead -= 1;
+        Some(item)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, self.items.size_hint().1)
     }
 }
 
@@ -1836,9 +1916,13 @@ impl Dispatch {
                 return Vec::new();
             }
             any_delta = true;
+            // Each reference copied as it is counted; a stop ends the matching, whatever was
+            // copied before it (review r1 F1).
             if let Some(entries) = self.by_predicate.get(&p) {
-                poll.attempt(entries.len());
-                out.extend_from_slice(entries);
+                out.extend(poll.counted(entries).copied());
+            }
+            if poll.stopped() {
+                return Vec::new();
             }
             let Some(objects) = self.by_object.get(&p) else {
                 continue;
@@ -1847,8 +1931,7 @@ impl Dispatch {
             if objects.len() <= relation.delta_len() {
                 for (&o, entries) in objects {
                     if relation.delta_has_object(o, poll) {
-                        poll.attempt(entries.len());
-                        out.extend_from_slice(entries);
+                        out.extend(poll.counted(entries).copied());
                     }
                     if poll.stopped() {
                         return Vec::new();
@@ -1857,17 +1940,19 @@ impl Dispatch {
             } else {
                 relation.delta_objects(poll, &mut |o| {
                     if let Some(entries) = objects.get(&o) {
-                        poll.attempt(entries.len());
-                        out.extend_from_slice(entries);
+                        out.extend(poll.counted(entries).copied());
                     }
                 });
+                if poll.stopped() {
+                    return Vec::new();
+                }
             }
         }
-        if poll.attempt(self.any.len()) {
-            return Vec::new();
-        }
         if any_delta {
-            out.extend_from_slice(&self.any);
+            out.extend(poll.counted(&self.any).copied());
+        }
+        if poll.stopped() {
+            return Vec::new();
         }
         out.sort_unstable();
         out.dedup();

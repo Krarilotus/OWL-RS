@@ -301,22 +301,41 @@ impl IndexVersion {
     /// − 2 × tombstones in range): O(r log n) for tombstone-free runs, plus a popcount over
     /// the range otherwise. Plans with a default-graph post-filter count by scanning.
     pub(crate) fn count_plan(&self, plan: &AccessPlan) -> u64 {
+        self.count_plan_visiting(plan, &mut |_| true)
+            .expect("never stopped")
+    }
+
+    /// [`Self::count_plan`], calling `visit(n)` for its work as it goes: each run's range (its
+    /// tombstone words, plus one), each quad a default-graph post-filter scans. `None` as soon
+    /// as `visit` returns false (REAS-2: a caller's stop sees a long count).
+    pub(crate) fn count_plan_visiting(
+        &self,
+        plan: &AccessPlan,
+        visit: &mut dyn FnMut(u64) -> bool,
+    ) -> Option<u64> {
         let Some(adapted) = self.layout.adapt(plan) else {
-            return 0;
+            return Some(0);
         };
         if adapted.exclude_default_graph {
-            return self.scan_plan(plan).count() as u64;
+            let mut count = 0u64;
+            for _ in self.scan_plan(plan) {
+                if !visit(1) {
+                    return None;
+                }
+                count += 1;
+            }
+            return Some(count);
         }
-        let signed: i64 = self
-            .runs
-            .iter()
-            .map(|run| {
-                let perm = run.permutation(adapted.permutation);
-                let (start, end) = perm.range(&adapted.low, &adapted.high);
-                (end - start) as i64 - 2 * perm.tombstones_in(start, end) as i64
-            })
-            .sum();
-        u64::try_from(signed).expect("exact deltas never make a range count negative")
+        let mut signed: i64 = 0;
+        for run in self.runs.iter() {
+            let perm = run.permutation(adapted.permutation);
+            let (start, end) = perm.range(&adapted.low, &adapted.high);
+            if !visit((end - start) as u64 / 64 + 1) {
+                return None;
+            }
+            signed += (end - start) as i64 - 2 * perm.tombstones_in(start, end) as i64;
+        }
+        Some(u64::try_from(signed).expect("exact deltas never make a range count negative"))
     }
 
     /// True if some visible quad matches `plan`: one bound search per run, where no run has
