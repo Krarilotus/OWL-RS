@@ -94,8 +94,18 @@ impl Value {
             Datatype::Rational => Value::Real(number(Rational::parse_rational(lexical))?),
             Datatype::Decimal => Value::Real(number(Rational::parse_decimal(lexical))?),
             d if d.integer_bounds().is_some() => {
-                let r = number(Rational::parse_integer(lexical))?;
                 let (lo, hi) = d.integer_bounds().unwrap_or((None, None));
+                let r = match Rational::parse_integer(lexical) {
+                    // Past 128 bits, its sign alone puts it outside a bound the type has.
+                    Err(NumberError::Range) => {
+                        let negative = lexical.starts_with('-');
+                        if (negative && lo.is_some()) || (!negative && hi.is_some()) {
+                            return Err(ill("out of the datatype's range"));
+                        }
+                        number(Err(NumberError::Range))?
+                    }
+                    r => number(r)?,
+                };
                 let i = r.numerator();
                 if lo.is_some_and(|lo| i < lo) || hi.is_some_and(|hi| i > hi) {
                     return Err(ill("out of the datatype's range"));
@@ -152,22 +162,30 @@ impl Value {
                     Some(_) => LiteralError::Unsupported(format!("{lexical:?}: {e}")),
                     None => ill(&e.to_string()),
                 })?;
+                // The lexical space first (XML Schema 1.1 Part 2 §3.4.28.1), then what is
+                // represented.
+                let (instant, timezone) = d.timeline();
+                if datatype == Datatype::DateTimeStamp && timezone.is_none() {
+                    return Err(ill("a dateTimeStamp needs a timezone"));
+                }
                 if fraction_digits(lexical) > 18 {
                     return Err(LiteralError::Unsupported(format!(
                         "{lexical:?}: more than 18 fractional digits of a second"
                     )));
                 }
-                let (instant, timezone) = d.timeline();
-                if datatype == Datatype::DateTimeStamp && timezone.is_none() {
-                    return Err(ill("a dateTimeStamp needs a timezone"));
-                }
                 Value::DateTime(instant, timezone)
             }
-            Datatype::XmlLiteral => {
-                Value::XmlLiteral(super::xml::canonical(lexical).ok_or_else(|| {
-                    LiteralError::Unsupported(format!("{lexical:?}: an XML literal not decided"))
-                })?)
-            }
+            Datatype::XmlLiteral => match super::xml::classify(lexical) {
+                Ok(form) => Value::XmlLiteral(form),
+                Err(super::xml::NotCanonical::Malformed) => {
+                    return Err(ill("not well-balanced, self-contained XML content"));
+                }
+                Err(super::xml::NotCanonical::Undecided) => {
+                    return Err(LiteralError::Unsupported(format!(
+                        "{lexical:?}: an XML literal not decided"
+                    )));
+                }
+            },
             _ => return Err(ill("not a datatype of the map")),
         })
     }
@@ -189,8 +207,10 @@ fn fraction_digits(lexical: &str) -> usize {
     digits.trim_end_matches('0').len()
 }
 
+/// XML Schema's `hexBinary`: pairs of hexadecimal digits, nothing else (§3.3.15.2; Rust's
+/// `from_str_radix` alone would also take a sign).
 fn hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    if !s.len().is_multiple_of(2) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     (0..s.len())
