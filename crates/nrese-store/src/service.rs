@@ -1447,13 +1447,24 @@ impl StoreService {
     /// revision reached. Support graph sets start afresh (the records don't say what they
     /// touched in the sets' terms); nothing is reasoned here, the records carry the
     /// inferences.
-    pub fn apply_replication_log(&self, frames: &[u8]) -> StoreResult<u64> {
-        let revision = self
-            .engine
-            .apply_log(frames)
-            .map_err(crate::StoreError::Engine)?;
-        self.supports().forget();
-        Ok(revision)
+    ///
+    /// The answer says what it carries (`expected`): one that doesn't hold exactly that is
+    /// refused with nothing applied. `stop` ends it between records; what was published
+    /// before stays ([`nrese_engine::Applied`]).
+    pub fn apply_replication_log(
+        &self,
+        frames: &[u8],
+        expected: &nrese_engine::LogExpectation,
+        stop: &nrese_exec::stop::StopSource,
+    ) -> StoreResult<nrese_engine::Applied> {
+        let before = self.current_revision();
+        let applied = self.engine.apply_log(frames, expected, stop);
+        // Whatever was published, a whole answer or the records before a stop or a
+        // failure, the support sets start afresh.
+        if self.current_revision() != before {
+            self.supports().forget();
+        }
+        applied.map_err(crate::StoreError::Engine)
     }
 
     /// At most `limit` resources whose labels' or local names' words begin with the words

@@ -26,6 +26,8 @@ mod query_protocol_tests;
 mod rdf4j_admission_tests;
 mod rdf4j_protocol_tests;
 mod read_ahead_tests;
+mod replication_apply_tests;
+mod replication_rounds_tests;
 mod replication_tests;
 mod service_description_tests;
 mod shacl_api_tests;
