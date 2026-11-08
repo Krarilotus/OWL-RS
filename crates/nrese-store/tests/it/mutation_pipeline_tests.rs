@@ -1178,6 +1178,16 @@ fn a_commit_breaking_a_datatype_rule_is_rejected_with_the_rule_named() {
         )
         .unwrap_err();
     assert!(error.to_string().contains("dt-not-type"), "{error}");
+    // An ill-typed value has no data value, so it is in no range (RDF 1.2 Concepts §3.4, OWL 2
+    // Profiles table 8): rejected under owl2-rl.
+    let error = pipeline
+        .apply(
+            insert(&format!("<{ex}b> <{ex}age> \"abc\"^^<{xsd}integer>")),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .expect_err("an ill-typed value under a range is an inconsistency");
+    assert!(error.to_string().contains("dt-not-type"), "{error}");
     pipeline
         .apply(
             insert(&format!("<{ex}b> <{ex}age> \"5\"^^<{xsd}integer>")),
@@ -1185,6 +1195,132 @@ fn a_commit_breaking_a_datatype_rule_is_rejected_with_the_rule_named() {
             &MutationTicket::new(),
         )
         .unwrap();
+}
+
+/// A ranged owl2-rl commit is judged by the datatype's whole lexical space (XSDVAL review
+/// r1): a dateTimeStamp needs its timezone whatever its precision (XML Schema 1.1 Part 2
+/// §3.4.28.1, R1-W1), and hexBinary is hex digit pairs without a sign (§3.3.15.2, R1-W3):
+/// both are rejected with dt-not-type. The review's controls commit: the long fraction with
+/// a timezone, the long fraction as a dateTime (beyond what is represented: not judged), and
+/// valid hexBinary in either case or empty; an ordinary dateTimeStamp without a timezone is
+/// rejected. Every row is reported.
+#[test]
+fn ranged_commits_are_judged_by_the_whole_lexical_space() {
+    let ex = "http://example.com/";
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    let range = "http://www.w3.org/2000/01/rdf-schema#range";
+    let rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let pipeline = pipeline(ReasoningMode::Owl2Rl);
+    pipeline
+        .apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ <{ex}stamp> <{range}> <{xsd}dateTimeStamp> .
+                               <{ex}when> <{range}> <{xsd}dateTime> .
+                               <{ex}hex> <{range}> <{xsd}hexBinary> .
+                               <{ex}xml> <{range}> <{rdf}XMLLiteral> }}"
+            ))),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .unwrap();
+    let fraction = "2000-01-01T00:00:00.1234567890123456789";
+    let rows = [
+        (
+            "stamp",
+            format!("\"{fraction}\"^^<{xsd}dateTimeStamp>"),
+            true,
+        ),
+        ("hex", format!("\"+F\"^^<{xsd}hexBinary>"), true),
+        (
+            "stamp",
+            format!("\"2000-01-01T00:00:00\"^^<{xsd}dateTimeStamp>"),
+            true,
+        ),
+        (
+            "stamp",
+            format!("\"{fraction}Z\"^^<{xsd}dateTimeStamp>"),
+            false,
+        ),
+        ("when", format!("\"{fraction}\"^^<{xsd}dateTime>"), false),
+        ("hex", format!("\"0f\"^^<{xsd}hexBinary>"), false),
+        ("hex", format!("\"0F\"^^<{xsd}hexBinary>"), false),
+        ("hex", format!("\"\"^^<{xsd}hexBinary>"), false),
+        // rdf:XMLLiteral: well-balanced, self-contained XML content (RDF 1.1 Concepts); a
+        // character reference is unsigned digits (XML 1.0 §4.1); a tag ends in `>` or `/>`.
+        ("xml", format!("\"&#x+41;\"^^<{rdf}XMLLiteral>"), true),
+        ("xml", format!("\"<a /x></a>\"^^<{rdf}XMLLiteral>"), true),
+        (
+            "xml",
+            format!("\"<b>&#x41;</b>\"^^<{rdf}XMLLiteral>"),
+            false,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (n, (property, literal, rejected)) in rows.iter().enumerate() {
+        let result = pipeline.apply(
+            insert(&format!("<{ex}s{n}> <{ex}{property}> {literal}")),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        );
+        let ok = match &result {
+            Err(e) => *rejected && e.to_string().contains("dt-not-type"),
+            Ok(_) => !*rejected,
+        };
+        if !ok {
+            wrong.push(format!("{property} {literal}: {result:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The reasoning marker engine-v2 621bf318 (`SEMANTICS_VERSION` 3) wrote for the store of
+/// [`a_marker_from_older_datatype_semantics_is_rechecked`] after rematerialising it under
+/// owl2-rl: 0 violations (fleet probe xsdval-probe-marker-56fd5f94).
+const OLD_MARKER: &str =
+    "ruleset owl2-rl\nfingerprint a94cf90230548146\nviolations 0\nlists nil-class\n";
+
+/// A store whose reasoning marker a build with older datatype semantics wrote (engine-v2
+/// 621bf318, which didn't judge an ill-typed literal under a range, so recorded this data
+/// consistent) isn't current once the semantics change (rulesets::SEMANTICS_VERSION): on
+/// reopen it is rechecked, and the inconsistency is reported (XSDVAL review r1, R1-W2).
+#[test]
+fn a_marker_from_older_datatype_semantics_is_rechecked() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = nrese_store::StoreConfig {
+        mode: nrese_store::StoreMode::OnDisk,
+        data_dir: dir.path().to_path_buf(),
+        query_cache_bytes: 0,
+        ..nrese_store::StoreConfig::default()
+    };
+    let ruleset = nrese_reasoner::rulesets::Ruleset::Owl2Rl;
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    {
+        let store = StoreService::new(config.clone()).expect("store");
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ <{EX}age> <http://www.w3.org/2000/01/rdf-schema#range> <{xsd}nonNegativeInteger> .
+                               <{EX}b> <{EX}age> \"abc\"^^<{xsd}integer> }}"
+            )))
+            .expect("import");
+    }
+    // The marker 621bf318 wrote for this store after rematerialising it (fleet probe
+    // xsdval-probe-marker-56fd5f94).
+    std::fs::write(dir.path().join("reasoning.state"), OLD_MARKER).expect("write marker");
+    let store = StoreService::new(config).expect("reopen");
+    assert!(
+        !store
+            .reasoning_state()
+            .is_some_and(|state| state.is_current_for(ruleset)),
+        "an older build's marker is current"
+    );
+    let report = store.rematerialise(ruleset).expect("rematerialise");
+    assert!(report.violations >= 1, "{report:?}");
+    assert_eq!(
+        store.consistency(),
+        nrese_store::ConsistencyStatus::Inconsistent {
+            violations: report.violations
+        }
+    );
 }
 
 /// A full OWL 2 RL materialisation by representatives of the `owl:sameAs` classes

@@ -2,27 +2,56 @@
 //! Canonicalization, as RDF 2004 defines the value), so that two literals are the same
 //! value iff their forms are equal.
 //!
-//! Only fragments whose canonical form doesn't depend on what this leaves out are decided:
-//! elements, attributes, text, character and the predefined entity references, CDATA
-//! sections, and namespace declarations (rendered where visibly used, as exclusive
-//! canonicalisation does). Comments, processing instructions, document type declarations,
-//! other entities and prefixes declared outside the fragment give `None`: the caller
-//! doesn't know the value.
+//! The lexical forms are well-balanced, self-contained XML content (RDF 1.1 Concepts,
+//! `rdf:XMLLiteral`): balanced elements, declared prefixes, only the predefined and
+//! character references, no document type declaration. The whole fragment is checked
+//! first. Of the well-formed ones, those with comments or processing instructions aren't
+//! decided here: their value depends on what this canonical form leaves out. The others
+//! are decided: elements, attributes, text, references, CDATA sections, and namespace
+//! declarations (rendered where visibly used, as exclusive canonicalisation does).
 
 /// The namespace the `xml` prefix is bound to (Namespaces in XML 1.0 §3).
 const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 
-/// The canonical form of the fragment `text`, if it is well-formed and decided here.
-pub fn canonical(text: &str) -> Option<String> {
+/// The namespace of `xmlns` itself, which no prefix may be bound to (Namespaces in XML 1.0
+/// §3).
+const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
+
+/// `NCName (':' NCName)?` (Namespaces in XML 1.0 §4, QName): element and attribute names.
+fn is_qname(name: &str) -> bool {
+    match name.split_once(':') {
+        Some((prefix, local)) => super::text::is_ncname(prefix) && super::text::is_ncname(local),
+        None => super::text::is_ncname(name),
+    }
+}
+
+/// Why a fragment has no canonical form here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotCanonical {
+    /// Not well-balanced, self-contained XML content: no lexical form of the datatype.
+    Malformed,
+    /// Well-formed, with a comment or processing instruction: its value isn't decided here.
+    Undecided,
+}
+
+/// The canonical form of the fragment `text`, or why it has none; the whole fragment is
+/// checked before a comment or processing instruction leaves it undecided.
+pub fn classify(text: &str) -> Result<String, NotCanonical> {
     let mut p = Parser {
         s: text.as_bytes(),
         at: 0,
         out: String::new(),
         scopes: Vec::new(),
         rendered: Vec::new(),
+        undecided: false,
     };
-    p.content(None)?;
-    (p.at == p.s.len()).then_some(p.out)
+    if p.content(None).is_none() || p.at != p.s.len() {
+        return Err(NotCanonical::Malformed);
+    }
+    if p.undecided {
+        return Err(NotCanonical::Undecided);
+    }
+    Ok(p.out)
 }
 
 struct Parser<'a> {
@@ -33,6 +62,8 @@ struct Parser<'a> {
     scopes: Vec<Vec<(String, String)>>,
     /// Per open element: the declarations its canonical form renders.
     rendered: Vec<Vec<(String, String)>>,
+    /// A comment or processing instruction was read: well-formed so far, but not decided.
+    undecided: bool,
 }
 
 impl Parser<'_> {
@@ -42,6 +73,38 @@ impl Parser<'_> {
 
     fn starts(&self, prefix: &str) -> bool {
         self.s[self.at..].starts_with(prefix.as_bytes())
+    }
+
+    /// `<!--` text `-->` (XML 1.0 §2.5): characters without `--`, not ending in `-`.
+    fn comment(&mut self) -> Option<()> {
+        self.at += 4;
+        let end = self.s[self.at..].windows(3).position(|w| w == b"-->")?;
+        let body = std::str::from_utf8(&self.s[self.at..self.at + end]).ok()?;
+        if body.contains("--") || body.ends_with('-') || !body.chars().all(super::text::is_xml_char)
+        {
+            return None;
+        }
+        self.at += end + 3;
+        Some(())
+    }
+
+    /// `<?` target (space text)? `?>` (XML 1.0 §2.6): a target that is an NCName (Namespaces
+    /// in XML 1.0 §7) and not `xml` in any case, text without `?>`.
+    fn instruction(&mut self) -> Option<()> {
+        self.at += 2;
+        let end = self.s[self.at..].windows(2).position(|w| w == b"?>")?;
+        let body = std::str::from_utf8(&self.s[self.at..self.at + end]).ok()?;
+        let (target, text) = body
+            .split_once([' ', '\t', '\n', '\r'])
+            .unwrap_or((body, ""));
+        if !super::text::is_ncname(target)
+            || target.eq_ignore_ascii_case("xml")
+            || !text.chars().all(super::text::is_xml_char)
+        {
+            return None;
+        }
+        self.at += end + 2;
+        Some(())
     }
 
     fn space(&mut self) -> bool {
@@ -61,7 +124,7 @@ impl Parser<'_> {
             self.at += 1;
         }
         let name = std::str::from_utf8(&self.s[from..self.at]).ok()?;
-        (super::text::is_name(name)).then(|| name.to_owned())
+        is_qname(name).then(|| name.to_owned())
     }
 
     /// A reference after `&`, resolved.
@@ -75,13 +138,17 @@ impl Parser<'_> {
             "amp" => '&',
             "quot" => '"',
             "apos" => '\'',
+            // `&#[0-9]+;` or `&#x[0-9a-fA-F]+;` (XML 1.0 §4.1, CharRef): the digits are
+            // checked here, since Rust's parsers also take a sign.
             _ => {
-                let code = if let Some(hex) = body.strip_prefix("#x") {
-                    u32::from_str_radix(hex, 16).ok()?
-                } else {
-                    body.strip_prefix('#')?.parse().ok()?
+                let (digits, radix) = match body.strip_prefix("#x") {
+                    Some(hex) => (hex, 16),
+                    None => (body.strip_prefix('#')?, 10),
                 };
-                char::from_u32(code)?
+                if digits.is_empty() || !digits.bytes().all(|b| (b as char).is_digit(radix)) {
+                    return None;
+                }
+                char::from_u32(u32::from_str_radix(digits, radix).ok()?)?
             }
         };
         super::text::is_xml_char(c).then_some(c)
@@ -139,8 +206,17 @@ impl Parser<'_> {
                         self.escape_text(c);
                     }
                 }
-                // Comments, processing instructions, declarations: not decided.
-                Some(b'<') if self.starts("<!") || self.starts("<?") => return None,
+                // Comments and processing instructions are checked, then leave the fragment
+                // undecided; any other declaration has no place in content.
+                Some(b'<') if self.starts("<!--") => {
+                    self.comment()?;
+                    self.undecided = true;
+                }
+                Some(b'<') if self.starts("<?") => {
+                    self.instruction()?;
+                    self.undecided = true;
+                }
+                Some(b'<') if self.starts("<!") => return None,
                 Some(b'<') => self.element()?,
                 Some(b'&') => {
                     self.at += 1;
@@ -203,9 +279,14 @@ impl Parser<'_> {
             if attribute == "xmlns" || attribute.starts_with("xmlns:") {
                 let prefix = attribute.strip_prefix("xmlns").unwrap_or("");
                 let prefix = prefix.strip_prefix(':').unwrap_or(prefix).to_owned();
-                // `xml` is bound to its namespace, and nothing else is (Namespaces §3).
+                // `xml` is bound to its namespace, and nothing else is; `xmlns` is bound to
+                // none and its namespace to no prefix; a prefix can't be bound to the empty
+                // IRI, only the default can (Namespaces in XML 1.0 §3, §2).
                 if declarations.iter().any(|(p, _)| *p == prefix)
                     || (prefix == "xml") != (value == XML_NAMESPACE)
+                    || prefix == "xmlns"
+                    || value == XMLNS_NAMESPACE
+                    || (!prefix.is_empty() && value.is_empty())
                 {
                     return None;
                 }
@@ -217,11 +298,14 @@ impl Parser<'_> {
                 attributes.push((attribute, value));
             }
         }
+        // The tag ends in `/>` or `>`, nothing else (XML 1.0 §3.1, STag and EmptyElemTag).
         let empty = self.starts("/>");
         if empty {
             self.at += 2;
-        } else {
+        } else if self.peek() == Some(b'>') {
             self.at += 1;
+        } else {
+            return None;
         }
         // Exclusive canonicalisation renders a declaration on each element that visibly
         // uses its prefix (in its name or an attribute's), unless an output ancestor
@@ -341,7 +425,74 @@ impl Parser<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::canonical;
+    use super::{NotCanonical, classify};
+
+    /// The canonical form where there is one (malformed and undecided alike: `None`).
+    fn canonical(text: &str) -> Option<String> {
+        classify(text).ok()
+    }
+
+    /// RDF 1.1 Concepts (`rdf:XMLLiteral`: well-balanced, self-contained XML content), XML
+    /// 1.0 §2.5–2.6, §4.1 (WFC Entity Declared), Namespaces in XML 1.0 §5: what isn't a
+    /// lexical form is malformed, also after a comment or processing instruction; a
+    /// well-formed one with either is undecided. Every row is checked.
+    #[test]
+    fn malformed_and_undecided_are_told_apart() {
+        let rows: &[(&str, Result<&str, NotCanonical>)] = &[
+            ("<!-- c --><a/>", Err(NotCanonical::Undecided)),
+            ("<?pi x?>", Err(NotCanonical::Undecided)),
+            ("<a><!--c--></a>", Err(NotCanonical::Undecided)),
+            ("<!-- c --><a", Err(NotCanonical::Malformed)),
+            ("<?pi x?><a></b>", Err(NotCanonical::Malformed)),
+            ("<!-- a -- b -->", Err(NotCanonical::Malformed)),
+            ("<!-- a --->", Err(NotCanonical::Malformed)),
+            ("<?xml version='1.0'?>", Err(NotCanonical::Malformed)),
+            ("<?p:q x?>", Err(NotCanonical::Malformed)),
+            ("<!DOCTYPE a>", Err(NotCanonical::Malformed)),
+            ("<a>", Err(NotCanonical::Malformed)),
+            ("&nbsp;", Err(NotCanonical::Malformed)),
+            ("<p:a/>", Err(NotCanonical::Malformed)),
+            // CharRef is unsigned digits (XML 1.0 §4.1), in text and attribute values alike.
+            ("&#x+41;", Err(NotCanonical::Malformed)),
+            ("<!--c-->&#x+41;", Err(NotCanonical::Malformed)),
+            ("&#+65;", Err(NotCanonical::Malformed)),
+            ("&#x;", Err(NotCanonical::Malformed)),
+            ("<a b='&#x+41;'/>", Err(NotCanonical::Malformed)),
+            // A tag ends in `>` or `/>` (§3.1); names are QNames, a prefix isn't bound to the
+            // empty IRI, `xmlns` isn't declared nor its namespace bound (Namespaces §3, §4).
+            ("<a /x></a>", Err(NotCanonical::Malformed)),
+            ("<!--c--><a /x></a>", Err(NotCanonical::Malformed)),
+            ("<:a/>", Err(NotCanonical::Malformed)),
+            (
+                "<a xmlns:p='urn:x'><p:b:c/></a>",
+                Err(NotCanonical::Malformed),
+            ),
+            ("<a xmlns:p=''><p:b/></a>", Err(NotCanonical::Malformed)),
+            ("<a xmlns:xmlns='urn:x'/>", Err(NotCanonical::Malformed)),
+            (
+                "<a xmlns:p='http://www.w3.org/2000/xmlns/'/>",
+                Err(NotCanonical::Malformed),
+            ),
+            // Guards (right on the base too).
+            ("&#x41;&#65;", Ok("AA")),
+            ("<a b='&#x41;'/>", Ok("<a b=\"A\"></a>")),
+            ("<a />", Ok("<a></a>")),
+            (
+                "<a xmlns='urn:x'><b xmlns=''/></a>",
+                Ok("<a xmlns=\"urn:x\"><b xmlns=\"\"></b></a>"),
+            ),
+            ("<a/>", Ok("<a></a>")),
+            ("", Ok("")),
+        ];
+        let wrong: Vec<String> = rows
+            .iter()
+            .filter_map(|&(text, expected)| {
+                let got = classify(text);
+                (got.as_deref().map_err(|e| *e) != expected).then(|| format!("{text:?}: {got:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 
     #[test]
     fn equal_fragments_have_equal_forms() {

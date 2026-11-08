@@ -41,7 +41,10 @@ Every case needs a content check (`check`): a run whose check fails, on any side
 
 Exit codes of report: 0 no loss shown; 1 a loss shown, a confirmation round due (jobs --round 2);
 2 the family is invalid; 3 no verdict (evidence missing, incomplete or failed, or the A-A' arm
-itself differs); 4 a confirmed loss (Holm over the family, the rounds combined).
+itself differs); 4 a confirmed loss (Holm over the family, the rounds combined); 5 not compared:
+the round ran and is complete, but some hypotheses have no test, each for a stated reason (A's
+answer differs from the pinned one, a metric A doesn't report) and no loss shows on the rest. Not
+a pass, and not 3: running it again gives the same, the reason needs a decision.
 """
 from __future__ import annotations
 
@@ -69,7 +72,7 @@ spec.loader.exec_module(rg)
 
 SIDES = ("a", "a2", "b")  # A, A' (A's build, another copy), B: the palindrome's order
 MIN_BLOCKS = 3  # one whole Latin square of A, A' and B; a family may ask for more (owner, 20 Oct 2026)
-NO_LOSS, LOSS_SHOWN, INVALID, NO_VERDICT, CONFIRMED = 0, 1, 2, 3, 4
+NO_LOSS, LOSS_SHOWN, INVALID, NO_VERDICT, CONFIRMED, NOT_COMPARED = 0, 1, 2, 3, 4, 5
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 REV = re.compile(r"^[0-9a-f]{7,40}$")
 # A family carried in a job's environment (`run`, and `jobs` of a family of registry cases): its
@@ -335,14 +338,21 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
     steps = prepare + blocks + after
     by_name = {c["name"]: c for c in family["catalog"]}
     mine = [by_name[c["name"]] for c in family["cases"] if c["name"] in by_name]
-    # What its data takes where the host lacks it: the makers' needs and their disk (7 Nov 2026).
-    has, disk = rg.data_needs(mine), rg.data_disk_gb(mine)
+    # What its data takes where the host lacks it: the makers' needs, their disk (7 Nov 2026) and the
+    # containers they start, declared (8 Nov 2026), all by the harness whose prepare makes it, refused where
+    # that harness can't (orchestrator, 8 Nov 2026: abba-run-055fe886-f3da61f9; review r1 R1 of
+    # pkg/maker-containers): release_gate.data_job().
+    try:
+        requires, data_fields, data_env = rg.data_job(
+            mine, {"roles": rg.TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": max(12, cap)},
+            harness=(checkout, harness))
+    except rg.HarnessRefused as refused:
+        raise Invalid([str(refused)]) from None
+    env.update(data_env)
     fetched = rg.bench_inputs(mine)
     if fetched:  # the commit data_state() takes WatDiv's pinned query sets from
         env["BENCH_INPUTS_REV"] = fetched[0]["source"]["rev"]
-    requires = ({"roles": rg.TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": max(12, cap)}
-                | ({"has": has} if has else {}) | ({"disk_gb": disk} if disk else {}))
-    job = {"id": prefix, "group": "abba", "kind": "owlrs.timed", "class": "exclusive",
+    job = {"id": prefix, "group": "abba", "kind": "owlrs.timed", "class": "exclusive", **data_fields,
            "priority": priority, "priority_reason": reason or f"A-B-B-A: {b[:8]} against {a[:8]}, "
            f"{len(family['cases'])} cases", "notify": False,
            "env": env, "est_min": 0, "stall_after_min": 60, "steps": steps,
@@ -484,7 +494,28 @@ def judge(family: dict, results: Path) -> tuple[list[str], dict | None, dict | N
     ab = rg.gate(of("a", "b"), {"b": family["sides"]["b"], "a": a}, "b", ["a"], harness, family["blocks"],
                  catalog=catalog, context=context, family=family["hypotheses"], floor=floor)
     problems += ab["errors"] + ab["blocking"]
+    # B's own numbers where a hypothesis wasn't compared: what was measured, though nothing was tested.
+    ab["b_numbers"] = {h: b_number(of("b"), h) for h in ab.get("not_compared") or {}}
     return problems, aa, ab, host
+
+
+def b_number(passes: list[dict], hypothesis: str) -> str:
+    """A side's median (time, qps) or peak (memory) of one hypothesis's dimension over its passes."""
+    import statistics
+    _, case, d = hypothesis.split("|", 2)
+    e = rg.evidence(passes, case)
+    kind, _, sub = d.partition("/")
+    if kind == "time":
+        key = "process" if "process-p50" in e["estimator"] else "samples"
+        values, unit = [v for rep in e[key] for v in rep.get(sub) or []], "ms"
+    elif kind == "qps":
+        values, unit = [v for rep in e["qps"] for v in rep.get(sub) or []], "qps"
+    elif d in ("memory/anon_kernel", "memory/live"):
+        values, unit = [v for v in e[sub] if v is not None], "bytes"
+        return f"B {rg.fmt(max(values))} {unit} peak" if values else "B: none"
+    else:
+        return "B: -"
+    return f"B {rg.fmt(statistics.median(values))} {unit}" if values else "B: none"
 
 
 def rounds_errors(rounds: list[Path]) -> list[str]:
@@ -551,10 +582,21 @@ def report(family: dict, rounds: list[Path]) -> tuple[int, str, dict]:
         return NO_VERDICT, "\n".join(lines), out
     decided = rg.decide([[ab for _, _, ab, _ in judged]])
     out["decided"] = {k: decided[k] for k in ("losses", "pending", "m")}
+    # A hypothesis the gate didn't test in some round, for its stated reason: no part of a pass
+    # (SHACL lead, 8 Nov 2026: every hypothesis untested, decided over none, read "no loss"); the
+    # decision's own, as the release verdict reads it (release_gate.decide).
+    untested = decided["not_compared"]
+    out["not_compared"] = untested
+    m = len(family["hypotheses"])
     if decided["losses"]:
         code, word = CONFIRMED, "**Confirmed loss** (exit 4): Holm over the family rejects, the rounds combined"
     elif decided["pending"]:
         code, word = LOSS_SHOWN, "**Loss shown** (exit 1): a confirmation round is due (abba.py jobs --round 2)"
+    elif untested:
+        code, word = NOT_COMPARED, (f"**Not compared** (exit 5): {len(untested)} of {m} hypotheses not compared "
+                                    "(below, with why), " + ("none tested" if len(untested) == m else
+                                                             f"no loss shown on the other {m - len(untested)}")
+                                    + ": not a pass")
     else:
         code, word = NO_LOSS, "**No loss shown** (exit 0)"
     out["exit"] = code
@@ -563,6 +605,10 @@ def report(family: dict, rounds: list[Path]) -> tuple[int, str, dict]:
         lines += [f"## Round {k}", "", "| hypothesis | ratio | p | status |", "|---|---|---|---|"]
         for h in family["hypotheses"]:
             _, case, d = h.split("|", 2)
+            if h in (ab.get("not_compared") or {}):
+                lines.append(f"| {case} / {d} | - | - | not compared: {ab['not_compared'][h]}; "
+                             f"{ab['b_numbers'].get(h, 'B: -')} |")
+                continue
             r = ab["comparisons"]["a"][case]["dimensions"].get(d, {})
             lines.append(f"| {case} / {d} | {rg.fmt(r.get('ratio'))} | {r.get('p', 1.0):.3g} | {r.get('status', '-')} |")
         lines += ["", f"Floor: {ab['policy'].get('floor')}.", ""]
@@ -623,7 +669,11 @@ def run(args) -> int:
     except Invalid as error:
         print("\n".join(f"invalid family: {p}" for p in error.args[0]), file=sys.stderr)
         return INVALID
-    found = jobs(family, harness, checkout.as_posix(), args.host or "", args.round, args.priority, args.reason or "")
+    try:
+        found = jobs(family, harness, checkout.as_posix(), args.host or "", args.round, args.priority, args.reason or "")
+    except Invalid as error:  # the harness can't make, or wouldn't declare, its data (data_job())
+        print("\n".join(error.args[0]), file=sys.stderr)
+        return INVALID
     set_id = next(iter(found))
     set_path = out / f"{set_id}.set.toml"
     set_path.write_bytes(set_file(set_id, list(found.values())).encode("utf-8"))
@@ -632,8 +682,10 @@ def run(args) -> int:
     code, said = rg.fleet_call("check", str(set_path))
     print("  fleet check" + (f" (exit {code})" if code else "") + ":\n    " + "\n    ".join(said.splitlines() or ["-"]))
     if args.plan:
-        print("plan only: nothing queued")
-        return 0
+        # A plan the fleet refuses isn't one to read as taken (STAGE2's lead, 8 Nov 2026: exit 0 with
+        # "(exit 1)" in its text): it exits as an unsubmitted run does.
+        print("plan only: nothing queued" + ("; fleet check refuses it (above)" if code else ""))
+        return 1 if code else 0
     if code != 0:
         print("not submitted: fleet check didn't take it (above)", file=sys.stderr)
         return 1
@@ -730,8 +782,12 @@ def main() -> int:
         return 0
     if args.command == "jobs":
         harness = git(Path(args.checkout), "rev-parse", args.harness or family["sides"]["b"])
-        found = jobs(family, harness, args.checkout, args.host or family["host"], args.round, args.priority,
-                     args.reason or "")
+        try:
+            found = jobs(family, harness, args.checkout, args.host or family["host"], args.round, args.priority,
+                         args.reason or "")
+        except Invalid as error:  # the harness can't make, or wouldn't declare, its data (data_job())
+            print("\n".join(error.args[0]), file=sys.stderr)
+            return INVALID
         args.out.mkdir(parents=True, exist_ok=True)
         set_id = next(iter(found))
         path = args.out / f"{set_id}.set.toml"

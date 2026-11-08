@@ -285,3 +285,46 @@ fn data_values_are_compared_by_value() {
         assert!(status.is_complete(), "{q}: {:?}", status.reasons());
     }
 }
+
+/// U1 and its read view are the store's to keep, so the queries' memory pays for them while
+/// they are kept (SYN-61): kept, they are charged there; where it can't hold them (half of
+/// what they took with room), U1 is unavailable instead of kept uncharged.
+#[test]
+fn the_upper_bound_kept_is_charged_to_the_queries_memory() {
+    let store = |limit: usize| {
+        let config = nrese_store::StoreConfig {
+            total_query_memory_bytes: limit,
+            ..crate::support::in_memory_store_config()
+        };
+        let dl = nrese_store::MutationPipeline::new(
+            std::sync::Arc::new(nrese_store::StoreService::new(config).expect("store")),
+            std::sync::Arc::new(nrese_reasoner::ReasonerService::new(
+                nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Dl),
+            )),
+        );
+        insert(&dl, SCHEMA).expect("schema");
+        insert(
+            &dl,
+            ":ann a :Person . :bob :parent :ann . :cid :child :bob .",
+        )
+        .expect("data");
+        dl
+    };
+    let roomy = store(1 << 30);
+    let bounds = roomy.store().dl_bounds();
+    assert_eq!(bounds.unavailable, None, "{bounds:?}");
+    let (used, ..) = roomy.store().query_memory().expect("the queries' pool");
+    assert!(
+        used > 0,
+        "U1 and its view kept with nothing charged: {bounds:?}"
+    );
+    let tight = store(used / 2);
+    let bounds = tight.store().dl_bounds();
+    assert!(
+        bounds
+            .unavailable
+            .as_deref()
+            .is_some_and(|why| why.contains("memory")),
+        "{bounds:?}"
+    );
+}

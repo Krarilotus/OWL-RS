@@ -271,6 +271,8 @@ impl<'e> BulkLoad<'e> {
                     deleted: current.asserted.len(),
                     inferred_inserted: 0,
                     inferred_deleted: current.inferred.len(),
+                    // Replaced by the published version's once it is out.
+                    asserted: current.asserted_content,
                 };
                 let layout = Layout::holding(&quads);
                 let next = Next::Streamed {
@@ -291,9 +293,12 @@ impl<'e> BulkLoad<'e> {
                     deleted: current.asserted.len(),
                     inferred_inserted: 0,
                     inferred_deleted: current.inferred.len(),
+                    // Replaced by the published version's once it is out.
+                    asserted: current.asserted_content,
                 };
                 let next = Version {
                     content: super::Content::fresh(),
+                    asserted_content: super::AssertedIdentity::fresh(),
                     asserted: IndexVersion::from_quads(Layout::holding(&quads), quads),
                     inferred: IndexVersion::empty(Layout::DefaultGraph),
                     revision: summary.revision,
@@ -338,6 +343,8 @@ impl<'e> BulkLoad<'e> {
                     deleted: 0,
                     inferred_inserted: 0,
                     inferred_deleted: explicit.len() as u64,
+                    // Replaced by the published version's once it is out.
+                    asserted: current.asserted_content,
                 };
                 // The first quad in a named graph turns a default-graph stack into a quad
                 // stack.
@@ -348,6 +355,7 @@ impl<'e> BulkLoad<'e> {
                 let run = Run::from_quads(asserted.layout(), inserts);
                 let next = Version {
                     content: super::Content::fresh(),
+                    asserted_content: super::AssertedIdentity::fresh(),
                     asserted: asserted.with_run(run),
                     inferred: current.inferred.with_delta(&[], &explicit),
                     revision: summary.revision,
@@ -373,6 +381,11 @@ impl<'e> BulkLoad<'e> {
 
         let built = started.elapsed();
         publish(engine, next)?;
+        // The writer slot is held: the latest version is the one just published.
+        let summary = CommitSummary {
+            asserted: engine.shared.snapshot().asserted_identity(),
+            ..summary
+        };
         tracing::info!(
             revision = summary.revision,
             inserted = summary.inserted,
@@ -424,6 +437,8 @@ fn publish_spilled(
         deleted: current.asserted.len(),
         inferred_inserted: 0,
         inferred_deleted: current.inferred.len(),
+        // The writer slot is held: the latest version is the one just published.
+        asserted: engine.shared.snapshot().asserted_identity(),
     };
     tracing::info!(
         revision,
@@ -559,6 +574,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
             Arc::new(Version {
                 // The same statements, mapped from the checkpoint.
                 content: next.content,
+                asserted_content: next.asserted_content,
                 asserted,
                 inferred,
                 equality: Arc::clone(&next.equality),
@@ -612,6 +628,7 @@ fn publish_streamed(
             IndexVersion::from_packed(packed).map_err(crate::error::EngineError::Corruption)?;
         let next = Version {
             content: super::Content::fresh(),
+            asserted_content: super::AssertedIdentity::fresh(),
             asserted,
             inferred: IndexVersion::empty(Layout::DefaultGraph),
             revision,
@@ -673,6 +690,8 @@ fn publish_streamed(
     };
     let next = Arc::new(Version {
         content: super::Content::fresh(),
+        // New: always sound for a cache keyed by it (a rescan), kept only where certain.
+        asserted_content: super::AssertedIdentity::fresh(),
         asserted,
         inferred,
         revision,
@@ -810,6 +829,8 @@ impl<'e> Rematerialisation<'e> {
             deleted: 0,
             inferred_inserted: inserted as u64,
             inferred_deleted: deleted as u64,
+            // Rematerialisation keeps the asserted stack.
+            asserted: base.asserted_identity(),
         };
         if inserted + deleted == 0 {
             return Ok(CommitSummary {
@@ -825,6 +846,8 @@ impl<'e> Rematerialisation<'e> {
         debug_assert_eq!(current.revision, base.revision(), "single writer");
         let next = Version {
             content: super::Content::fresh(),
+            // Rematerialisation: the inferred stack only.
+            asserted_content: current.asserted_content,
             asserted: current.asserted.clone(),
             inferred,
             revision: summary.revision,

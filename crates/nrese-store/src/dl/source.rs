@@ -104,36 +104,59 @@ fn statement(q: nrese_engine::EncodedQuad) -> Statement {
     }
 }
 
-/// The ontology of a transaction's asserted statements, after its changes. O(asserted).
-pub(crate) fn read_pending(tx: &Transaction<'_>) -> Ontology {
-    let statements: Vec<Statement> = tx
-        .quads_for_pattern_in(ReadModel::Asserted, &ANY)
-        .map(statement)
-        .collect();
-    let decode = |id| tx.decode(id);
-    let lookup = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
-    nrese_owl::read(
-        &statements,
-        &StoreTerms {
-            decode: &decode,
-            lookup: &lookup,
-        },
-    )
+/// Every asserted statement of `quads`, charged to `budget` as they are collected (SYN-61:
+/// a store-scale list, the reader's scratch, freed once the ontology is read).
+fn statements<B: std::ops::Deref<Target = nrese_exec::Budget>>(
+    quads: impl Iterator<Item = nrese_engine::EncodedQuad>,
+    budget: B,
+) -> Result<nrese_exec::ChargedVec<Statement, B>, nrese_exec::BudgetExceeded> {
+    let mut statements = nrese_exec::ChargedVec::new(budget);
+    for q in quads {
+        statements.push(statement(q))?;
+    }
+    Ok(statements)
 }
 
-/// The ontology of a snapshot's asserted statements. O(asserted).
-pub(crate) fn read_snapshot(snapshot: &Snapshot) -> Ontology {
-    let statements: Vec<Statement> = snapshot
-        .quads_for_pattern_in(ReadModel::Asserted, &ANY)
-        .map(statement)
-        .collect();
-    let decode = |id| snapshot.decode(id);
-    let lookup = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
-    nrese_owl::read(
+/// The ontology of a transaction's asserted statements, after its changes, its scratch
+/// charged to `budget` (refused: `Err`, nothing kept). O(asserted).
+pub(crate) fn read_pending<B: std::ops::Deref<Target = nrese_exec::Budget>>(
+    tx: &Transaction<'_>,
+    budget: B,
+) -> Result<Ontology, nrese_exec::BudgetExceeded> {
+    let statements = statements(tx.quads_for_pattern_in(ReadModel::Asserted, &ANY), budget)?;
+    let decode = |id| tx.decode(id);
+    let lookup = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
+    Ok(nrese_owl::read(
         &statements,
         &StoreTerms {
             decode: &decode,
             lookup: &lookup,
         },
-    )
+    ))
+}
+
+/// The ontology of a snapshot's asserted statements, its scratch charged to `budget`
+/// (refused: `Err`, nothing kept). O(asserted).
+pub(crate) fn read_snapshot<B: std::ops::Deref<Target = nrese_exec::Budget>>(
+    snapshot: &Snapshot,
+    budget: B,
+) -> Result<Ontology, nrese_exec::BudgetExceeded> {
+    let statements = statements(
+        snapshot.quads_for_pattern_in(ReadModel::Asserted, &ANY),
+        budget,
+    )?;
+    let decode = |id| snapshot.decode(id);
+    let lookup = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
+    Ok(nrese_owl::read(
+        &statements,
+        &StoreTerms {
+            decode: &decode,
+            lookup: &lookup,
+        },
+    ))
+}
+
+/// Why an ontology wasn't read: its statements didn't fit `budget`'s memory.
+pub(crate) fn refused(what: &str) -> String {
+    nrese_dl::limits::Limit::Envelope.reached(format!("reading {what}'s statements"))
 }

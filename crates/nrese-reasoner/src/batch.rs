@@ -41,7 +41,9 @@ use super::representatives::{EqualityClasses, Guarded, over_classes};
 use super::violations::{Violations, unlimited};
 use nrese_exec::Budget;
 use nrese_exec::heap;
+use nrese_exec::memory::MemoryStopCause;
 use nrese_exec::search::Finger;
+use nrese_exec::{BudgetExceeded, ChargedVec};
 
 type Pair = (u64, u64);
 
@@ -1571,8 +1573,9 @@ impl Store {
             .zip(self.predicates)
             .map(|(relation, p)| (p, [relation.base.so, relation.recent.so]))
             .collect();
-        // At most this many, so the list never grows by doubling.
-        out.reserve(
+        // At most this many, so the list never grows by doubling: exactly, so a caller can
+        // charge the growth before it hands `out` over ([`list`]).
+        out.reserve_exact(
             from_input.len()
                 + runs
                     .iter()
@@ -1944,24 +1947,28 @@ impl Equality {
         members
     }
 
-    /// The expansions of the delta of `store` (see the type's docs), not yet in it; `None`
-    /// if `stop` (latched) fired. Its reads count on one poller for its sequential part and
-    /// one per parallel task for the expansions, each fact's three classes and their
-    /// product of probes (sweep M10). Stopped, its state (`partners`) may be part-read:
-    /// the module belongs to the operation, which ends with the stop.
+    /// The expansions of the delta of `store` (see the type's docs), not yet in it.
+    /// [`Interrupted`] for its memory, `operation` refused, where they don't fit what it
+    /// may still take at the round's start ([`OperationStop::room`]), charged before each
+    /// allocation of them; and once `operation`'s stop (latched) has fired. Its reads count
+    /// on one poller for its sequential part and one per parallel task for the expansions,
+    /// each fact's three classes and their product of probes (sweep M10). Stopped, its
+    /// state (`partners`) may be part-read: the module belongs to the operation, which ends
+    /// with the stop.
     pub(crate) fn run<S: Source + ?Sized>(
         &mut self,
         store: &S,
-        stop: super::eval::Stop<'_>,
-    ) -> Option<Vec<Triple>> {
-        let poll = Poller::new(stop)?;
+        operation: &OperationStop<'_>,
+    ) -> Result<Vec<Triple>, Interrupted> {
+        let stop: super::eval::Stop<'_> = &|| operation.fired();
+        let poll = Poller::new(stop).ok_or_else(|| operation.interrupted())?;
         let equalities = store.estimate([None, Some(self.same_as), None], Seg::All, &poll);
         if poll.stopped() {
-            return None;
+            return Err(operation.interrupted());
         }
         if equalities == 0 {
             self.produced.clear();
-            return Some(Vec::new());
+            return Ok(Vec::new());
         }
         let same_as = self.same_as;
         // A fact mentioning no term with a partner expands to itself only (#12 of the
@@ -2033,52 +2040,73 @@ impl Equality {
             store.scan([None, Some(a), None], Seg::All, &poll, &mut push);
         }
         if poll.stopped() {
-            return None;
+            return Err(operation.interrupted());
         }
         seeds.par_sort_unstable();
         seeds.dedup();
         self.member_scans += 3 * seeds.len() as u64;
-        let out: Vec<Triple> = seeds
+        let room = room_budget(operation)?;
+        let refused = |_: BudgetExceeded| operation.refuse(MemoryStopCause::OverLimit);
+        // Each thread's copies, charged a seed at a time before they are made, then moved
+        // into one list once; its reads count on the thread's own poller.
+        let chunks = seeds
             .par_iter()
-            .map_init(
-                || Poller::new(stop),
-                |poll, &[s, p, o]| {
-                    let Some(poll) = poll.as_ref().filter(|poll| !poll.stopped()) else {
-                        return Vec::new();
-                    };
-                    let (ms, mp, mo) = (
-                        self.members(store, s, poll),
-                        self.members(store, p, poll),
-                        self.members(store, o, poll),
-                    );
-                    // The product of its classes, a probe each: stopped, it ends there and
-                    // keeps nothing (sol-loop r1 S1); the later seeds of the task do nothing.
-                    let mut facts = Vec::new();
-                    for &s in &ms {
-                        for &p in &mp {
-                            for &o in &mo {
-                                let fact = [s, p, o];
-                                let held = store.contains(fact, poll);
-                                if poll.stopped() {
-                                    return Vec::new();
-                                }
-                                if !held {
-                                    facts.push(fact);
+            .try_fold(
+                || {
+                    (
+                        ChargedVec::new(&room),
+                        ChargedVec::new(&room),
+                        Poller::new(stop),
+                    )
+                },
+                |(mut copies, mut scratch, poll), &[s, p, o]| {
+                    // Stopped, the thread's later seeds do nothing.
+                    if let Some(poll) = poll.as_ref().filter(|poll| !poll.stopped()) {
+                        let (ms, mp, mo) = (
+                            self.members(store, s, poll),
+                            self.members(store, p, poll),
+                            self.members(store, o, poll),
+                        );
+                        let bound = copies_at_most([&ms, &mp, &mo]);
+                        // The product of its classes, a probe each: stopped, it ends there
+                        // (sol-loop r1 S1), and the operation ends with what it made.
+                        append_copies(&mut copies, &mut scratch, bound, |out| {
+                            for &s in &ms {
+                                for &p in &mp {
+                                    for &o in &mo {
+                                        let fact = [s, p, o];
+                                        let held = store.contains(fact, poll);
+                                        if poll.stopped() {
+                                            return;
+                                        }
+                                        if !held {
+                                            out.push(fact);
+                                        }
+                                    }
                                 }
                             }
-                        }
+                        })?;
                     }
-                    facts
+                    Ok((copies, scratch, poll))
                 },
             )
-            .flat_map_iter(|facts| facts)
-            .collect();
-        // A task that stopped left facts out; the stop is latched, so asking it again tells.
+            .map(|folded| folded.map(|(copies, _scratch, _poll)| copies))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(refused)?;
+        // A thread that stopped left facts out; the stop is latched, so asking it tells.
         if stop() {
-            return None;
+            return Err(operation.interrupted());
         }
+        let out = concatenated(&room, chunks).map_err(refused)?;
+        // The round's set of them, charged before it is made: under three slots a fact (a
+        // power of two, filled to 7/8), each a fact and a control byte.
+        let set_bytes = out.len().checked_mul(3 * (size_of::<Triple>() + 1));
+        if !set_bytes.is_some_and(|bytes| room.charge(bytes).is_ok()) {
+            return Err(operation.refuse(MemoryStopCause::OverLimit));
+        }
+        let (out, _held) = out.into_parts();
         self.produced = out.iter().copied().collect();
-        Some(out)
+        Ok(out)
     }
 }
 
@@ -2481,9 +2509,24 @@ pub fn materialise_grouped_within(
     stop: super::eval::Stop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<Materialisation, Interrupted> {
+    let stop = OperationStop::new(stop);
+    materialise_grouped_with(input, rules, lists, schema, &stop, memory)
+}
+
+/// [`materialise_grouped_within`] under one operation's `stop`, whose memory limit and room
+/// its caller chose ([`OperationStop::within`]): replication's copies are admitted by its
+/// room.
+pub fn materialise_grouped_with(
+    input: Vec<(u64, Vec<(u64, u64)>)>,
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+    stop: &OperationStop<'_>,
+    memory: &Arc<Budget>,
+) -> Result<Materialisation, Interrupted> {
     let clock = std::time::Instant::now();
     let store = Store::from_groups(input);
-    run(
+    run_latched(
         store,
         clock.elapsed(),
         rules,
@@ -2525,6 +2568,22 @@ pub fn materialise_representatives_within(
     stop: super::eval::Stop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<Materialisation, Interrupted> {
+    let stop = OperationStop::new(stop);
+    materialise_representatives_with(input, rules, lists, schema, listing, &stop, memory)
+}
+
+/// [`materialise_representatives_within`] under one operation's `stop`, whose memory limit
+/// and room its caller chose ([`OperationStop::within`]): the expanded listing's copies
+/// are admitted by its room.
+pub fn materialise_representatives_with(
+    input: Input,
+    rules: &[Rule],
+    lists: Option<&ListVocabulary>,
+    schema: &Schema,
+    listing: Listing,
+    stop: &OperationStop<'_>,
+    memory: &Arc<Budget>,
+) -> Result<Materialisation, Interrupted> {
     let clock = std::time::Instant::now();
     let store = match input {
         Input::Facts(facts) => Store::new(facts),
@@ -2541,7 +2600,7 @@ pub fn materialise_representatives_within(
     if representatives.is_none() && listing == Listing::Representatives {
         // Every fact: the input's too.
         let input_facts = store.facts_where(&|_| true);
-        let mut result = run(
+        let mut result = run_latched(
             store,
             clock.elapsed(),
             rules,
@@ -2556,7 +2615,7 @@ pub fn materialise_representatives_within(
         result.derived.dedup();
         return Ok(result);
     }
-    run(
+    run_latched(
         store,
         clock.elapsed(),
         rules,
@@ -2639,7 +2698,6 @@ fn run_latched(
     stop: &super::eval::OperationStop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<Materialisation, Interrupted> {
-    let fired = || stop.fired();
     run_body(
         store,
         load,
@@ -2647,13 +2705,13 @@ fn run_latched(
         lists,
         schema,
         representatives,
-        &fired,
+        stop,
         memory,
     )
     .map_err(|_| stop.interrupted())
 }
 
-/// [`run`]'s work, under the operation's latched `stop`.
+/// [`run`]'s work, under the operation's latched stop, `operation`.
 #[allow(clippy::too_many_arguments)]
 fn run_body(
     mut store: Store,
@@ -2662,9 +2720,10 @@ fn run_body(
     lists: Option<&ListVocabulary>,
     schema: &Schema,
     mut representatives: Option<Representatives>,
-    stop: super::eval::Stop<'_>,
+    operation: &OperationStop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<Materialisation, Interrupted> {
+    let stop: super::eval::Stop<'_> = &|| operation.fired();
     let check_stop = || {
         if stop() {
             Err(Interrupted::default())
@@ -2905,10 +2964,7 @@ fn run_body(
         ));
         result.counters.closure_pairs.push(transitive.read);
         if let Some(equality) = &mut equality {
-            let expanded = equality
-                .run(&store, stop)
-                .ok_or_else(Interrupted::default)?;
-            candidates.push((None, segments(expanded)));
+            candidates.push((None, segments(equality.run(&store, operation)?)));
         }
         let mut merged = false;
         // New equalities merge classes: the round's candidates and the stored facts that
@@ -3055,7 +3111,7 @@ fn run_body(
     let mut derived = match representatives {
         None => store.into_derived(),
         Some(reps) => {
-            let derived = list(store, &reps, stop).ok_or_else(Interrupted::default)?;
+            let derived = list(store, &reps, operation)?;
             result.classes = reps.classes;
             result.merges = reps.merges;
             derived
@@ -3067,12 +3123,84 @@ fn run_body(
     Ok(result)
 }
 
-/// What a materialisation with equality by representatives lists ([`Listing`]); `None` if
-/// `stop` (latched) fired while the expansion ran.
-fn list(store: Store, reps: &Representatives, stop: super::eval::Stop<'_>) -> Option<Vec<Triple>> {
+/// What `operation` may still take now ([`OperationStop::room`]), as the budget the copies
+/// of `owl:sameAs` classes are charged to before they are made; where it can't be read,
+/// `operation` refused for that.
+fn room_budget(operation: &OperationStop<'_>) -> Result<nrese_exec::Budget, Interrupted> {
+    let room = operation.room().map_err(|cause| operation.refuse(cause))?;
+    Ok(nrese_exec::Budget::new(
+        usize::try_from(room).unwrap_or(usize::MAX),
+    ))
+}
+
+/// The most copies a fact makes over its terms' classes `members` (each term's identities):
+/// every combination of them. Charged once per fact before its copies are made, so the
+/// loop that makes them only checks and writes: no charge per copy, which kept the store's
+/// membership check out of line there (1.4 % more instructions in replication). A count no
+/// vector can hold is refused by the charge.
+fn copies_at_most(members: [&[u64]; 3]) -> usize {
+    members.iter().fold(1, |product: usize, class| {
+        product.saturating_mul(class.len())
+    })
+}
+
+/// A thread's copies, charged to the operation's room.
+pub(crate) type Copies<'a> = ChargedVec<Triple, &'a nrese_exec::Budget>;
+
+/// One fact's copies, at most `bound` of them, that `make` writes, appended to the thread's
+/// `copies`. `make` writes into `scratch`, the thread's room for one fact's copies, charged
+/// for `bound` before it is lent and reused from fact to fact, so the loop that makes them
+/// only checks and writes. `copies` then grows by what was made, by doubling as a list does:
+/// lending it the bound itself kept room for copies not made (most of a fact's, where the
+/// store holds them) beside the joined list (#91, `abba-pr91-cost-r2`: 1.81 times the
+/// copies in replication's last round).
+pub(crate) fn append_copies<'a>(
+    copies: &mut Copies<'a>,
+    scratch: &mut Copies<'a>,
+    bound: usize,
+    make: impl FnOnce(&mut nrese_exec::Room<'_, Triple>),
+) -> Result<(), BudgetExceeded> {
+    scratch.clear();
+    scratch.fill(bound, make)?;
+    copies.extend_from_slice(scratch)
+}
+
+/// Each thread's copies, `chunks`, in one list of exactly their number: its room charged
+/// before it is made, beside theirs, then each chunk moved in and freed in turn, so every
+/// copy moves once and the list never grows (a pairwise reduction would move them at each
+/// of its levels and hold both halves beside their sum at the last). A full chunk alone is
+/// the list as it is.
+fn concatenated<'a>(
+    room: &'a nrese_exec::Budget,
+    mut chunks: Vec<ChargedVec<Triple, &'a nrese_exec::Budget>>,
+) -> Result<ChargedVec<Triple, &'a nrese_exec::Budget>, BudgetExceeded> {
+    chunks.retain(|chunk| !chunk.is_empty());
+    if let [chunk] = chunks.as_slice()
+        && chunk.len() == chunk.capacity()
+    {
+        return Ok(chunks.remove(0));
+    }
+    let copies = chunks.iter().map(|chunk| chunk.len()).sum();
+    let mut list = ChargedVec::with_capacity(room, copies)?;
+    for chunk in chunks {
+        // Within the capacity charged: it doesn't grow.
+        list.extend_from_slice(&chunk)?;
+    }
+    Ok(list)
+}
+
+/// What a materialisation with equality by representatives lists ([`Listing`]).
+/// [`Interrupted`] for its memory, `operation` refused, where the expanded closure doesn't
+/// fit what it may still take ([`OperationStop::room`]); and once `operation`'s stop
+/// (latched) has fired while the expansion ran.
+fn list(
+    store: Store,
+    reps: &Representatives,
+    operation: &OperationStop<'_>,
+) -> Result<Vec<Triple>, Interrupted> {
     let (stale, shared) = (&reps.stale, &reps.shared);
     let current = |fact: Triple| !stale.mentioned(fact);
-    Some(match reps.listing {
+    Ok(match reps.listing {
         Listing::Representatives => store.into_listed(&current, &current, Vec::new()),
         // Without classes, what was added.
         Listing::Stored | Listing::Expanded if reps.classes.is_empty() => store.into_derived(),
@@ -3083,49 +3211,81 @@ fn list(store: Store, reps: &Representatives, stop: super::eval::Stop<'_>) -> Op
         ),
         Listing::Expanded => {
             // The facts that mention a class, expanded while the input is there to leave
-            // its facts out; the others as they are. Each class expansion is a product of
-            // members, each copy a probe of the input: counted per task (sweep M12).
-            let expanded: Vec<Triple> = store
-                .facts_where(&|fact| current(fact) && shared.mentioned(fact))
-                .into_par_iter()
-                .map_init(
-                    || Poller::new(stop),
-                    |poll, [s, p, o]| {
-                        // The product's copies (`Classes::expand`), counted before it is built,
-                        // from one class lookup per term: a lookup is a hash walk, and counting
-                        // with lookups of its own doubled them (rl-sameas, REAS-2 timing).
-                        let classes = &reps.classes;
-                        let (ms, mp, mo) = (
-                            classes.class_of(s).unwrap_or(std::slice::from_ref(&s)),
-                            classes.class_of(p).unwrap_or(std::slice::from_ref(&p)),
-                            classes.class_of(o).unwrap_or(std::slice::from_ref(&o)),
-                        );
-                        let copies = ms.len() * mp.len() * mo.len();
-                        if poll.as_ref().is_none_or(|poll| poll.attempt(copies)) {
-                            return Vec::new();
-                        }
-                        let mut kept = Vec::with_capacity(copies);
-                        for &s in ms {
-                            for &p in mp {
-                                let relation = store.relation(p);
-                                for &o in mo {
-                                    if !relation
-                                        .is_some_and(|relation| relation.input.contains(s, o))
-                                    {
-                                        kept.push([s, p, o]);
+            // its facts out; the others as they are. Each thread's copies are charged a fact
+            // at a time before they are made, then moved into one list once, which gets the
+            // room for the others before it is handed on. Each class expansion is a product
+            // of members, each copy a probe of the input: counted on the thread's poller
+            // before it is made, from the same one class lookup per term (sweep M12).
+            let facts = store.facts_where(&|fact| current(fact) && shared.mentioned(fact));
+            let room = room_budget(operation)?;
+            let refused = |_: BudgetExceeded| operation.refuse(MemoryStopCause::OverLimit);
+            let stop: super::eval::Stop<'_> = &|| operation.fired();
+            let chunks = facts
+                .par_iter()
+                .try_fold(
+                    || {
+                        (
+                            ChargedVec::new(&room),
+                            ChargedVec::new(&room),
+                            Poller::new(stop),
+                        )
+                    },
+                    |(mut copies, mut scratch, poll), fact| {
+                        let [ms, mp, mo] = fact.each_ref().map(|id| {
+                            reps.classes
+                                .class_of(*id)
+                                .unwrap_or(std::slice::from_ref(id))
+                        });
+                        let bound = copies_at_most([ms, mp, mo]);
+                        // Stopped, the thread makes no more copies.
+                        if poll.as_ref().is_some_and(|poll| !poll.attempt(bound)) {
+                            append_copies(&mut copies, &mut scratch, bound, |out| {
+                                for &s in ms {
+                                    for &p in mp {
+                                        let relation = store.relation(p);
+                                        for &o in mo {
+                                            let input = relation.is_some_and(|relation| {
+                                                relation.input.contains(s, o)
+                                            });
+                                            if !input {
+                                                out.push([s, p, o]);
+                                            }
+                                        }
                                     }
                                 }
-                            }
+                            })?;
                         }
-                        kept
+                        Ok((copies, scratch, poll))
                     },
                 )
-                .flatten_iter()
-                .collect();
-            // A task that stopped left copies out; the stop is latched, so asking it tells.
+                .map(|folded| folded.map(|(copies, _scratch, _poll)| copies))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(refused)?;
+            // A thread that stopped left copies out; the stop is latched, so asking it tells.
             if stop() {
-                return None;
+                return Err(operation.interrupted());
             }
+            let expanded = concatenated(&room, chunks).map_err(refused)?;
+            // Expanded, they are freed before the list grows by the others.
+            drop(facts);
+            // What `into_listed` adds at most: the runs' facts. It adds none of the input's
+            // (its `input` below takes none), so their room isn't asked for. It grows the
+            // list to exactly that once it has freed the store's other parts: the buffer it
+            // grows into is charged here, beside the list's, not allocated here; where the
+            // list's capacity already holds them, it doesn't grow and nothing is charged.
+            let others: usize = store
+                .relations
+                .iter()
+                .map(|relation| relation.base.so.len() + relation.recent.so.len())
+                .sum();
+            let grown = expanded.len().checked_add(others);
+            if grown.is_none_or(|facts| facts > expanded.capacity()) {
+                let bytes = grown.and_then(|facts| facts.checked_mul(size_of::<Triple>()));
+                if !bytes.is_some_and(|bytes| room.charge(bytes).is_ok()) {
+                    return Err(operation.refuse(MemoryStopCause::OverLimit));
+                }
+            }
+            let (expanded, _held) = expanded.into_parts();
             store.into_listed(
                 &|_| false,
                 &|fact| current(fact) && !shared.mentioned(fact),
