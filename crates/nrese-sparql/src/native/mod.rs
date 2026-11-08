@@ -18,6 +18,8 @@ pub(crate) use cached::output_key;
 mod calendar;
 mod canonical;
 mod equality;
+#[cfg(test)]
+mod equality_tests;
 mod equijoin;
 mod estimate;
 mod exists;
