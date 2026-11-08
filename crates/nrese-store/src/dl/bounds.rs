@@ -38,6 +38,10 @@ use crate::StoreService;
 mod memory_tests;
 
 #[cfg(test)]
+#[path = "bounds_token_tests.rs"]
+mod token_tests;
+
+#[cfg(test)]
 #[path = "bounds_lock_tests.rs"]
 mod lock_tests;
 
