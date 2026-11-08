@@ -204,6 +204,7 @@ impl MutationPipeline {
             cancellation: ticket.evaluation_token(),
             union_default_graph: self.store.config().union_default_graph,
             geosparql_stated_only: self.store.config().geosparql_stated_only,
+            search_scope: self.store.search_scope(),
             services: self.store.services(),
             namespaces: self.store.namespaces().all(),
             supports: Arc::clone(self.store.supports()),

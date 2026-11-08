@@ -67,6 +67,11 @@ pub(crate) struct StoreSettings {
     /// data H-complete ([`StoreConfig::ql_rewriting`](crate::StoreConfig)).
     pub ql:
         std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>>>>,
+    /// [`StoreConfig::search_scope`](crate::StoreConfig), or the repository's: read once
+    /// per query and update, so a change applies to the next one.
+    pub search_scope: std::sync::Arc<std::sync::RwLock<nrese_sparql::SearchScope>>,
+    /// [`StoreConfig::reader_corpus_bytes`](crate::StoreConfig), or the repository's.
+    pub reader_corpus_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl StoreSettings {
@@ -85,6 +90,10 @@ impl StoreSettings {
     /// The QL rewriting queries get now.
     pub(crate) fn ql(&self) -> Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>> {
         self.ql.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    pub(crate) fn search_scope(&self) -> nrese_sparql::SearchScope {
+        *self.search_scope.read().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -670,5 +679,6 @@ fn query_options(
         result_cache: store.result_cache.clone(),
         pin: prepared.pin.clone(),
         ql: store.ql(),
+        search_scope: store.search_scope(),
     }
 }

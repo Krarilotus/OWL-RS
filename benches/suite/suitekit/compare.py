@@ -24,6 +24,10 @@ order, so that nothing lost hides behind a time:
 Runs of different hosts, or of one host under different configurations (benches/hosts.toml
 `config`, or a different CPU governor read by the runs), are not compared: compare exits 2
 unless --allow-host-change, and then flags every verdict as no evidence of a code change.
+Of two fast-suite reports, a case whose two sides didn't load the same frozen input files, byte
+for byte (each record's `inputs`), or don't say which, gets no verdict: it is listed as a
+different or unknown input, no evidence of a code change, and compare exits 2 when no case is
+left (7 Nov 2026: lubm-10/100's new release; a form pin never stands in for the bytes).
 
 BASE and NEW are fast-suite reports (`.json`: the full report, or a compact record that
 names it), perf-lab reports (`.json` with `queries`), or suite results (directories or
@@ -323,8 +327,11 @@ def kind_of(entry: dict) -> str:
     return "/".join(sorted(kinds)) if kinds else "unknown"
 
 
-def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, out: Out) -> list[float]:
-    """Fast-suite cases (or a perf-lab report as one), case by case; the spreads seen."""
+def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, out: Out,
+                  untimed: dict[str, str] | None = None) -> list[float]:
+    """Fast-suite cases (or a perf-lab report as one), case by case; the spreads seen. A case in
+    `untimed` (case: why) is compared in everything but its time and its spread."""
+    untimed = untimed or {}
     spreads = []
     for case in sorted(set(base) | set(new)):
         b, n = base.get(case), new.get(case)
@@ -373,27 +380,35 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
                         f"{','.join(sorted(sb))} -> {','.join(sorted(sn))}, metric {mb} -> {mn}, peak {pb} -> {pn} MiB"
                         + ("  WORSE" if worse else ""), worse)
             continue
-        if not complete_timing(b, n):
-            out.add("Missing", f"{case:<26} NOT COMPARABLE: missing/invalid timing series or repetitions", True)
-            continue
-        ratio, low, high = bootstrap_ratio(b["reps"], n["reps"])
-        series = sorted({s for rep in b["reps"] for s in rep} & {s for rep in n["reps"] for s in rep})
-        bm, nm = statistic(b["reps"], series), statistic(n["reps"], series)
-        # A change counts beyond max(10 %, the measured spread of both sides), the chosen floor,
-        # and with the interval excluding 1.
-        threshold = max(0.10, spread(b), spread(n))
-        spreads.append(max(spread(b), spread(n)))
-        verdict, slower = "same", False
-        if low > 1.0 and ratio >= 1 + threshold:
-            verdict = "SLOWER" if nm - bm >= min_ms else "slower, below absolute floor"
-            slower = nm - bm >= min_ms
-        elif high < 1.0 and ratio <= 1 / (1 + threshold):
-            verdict = "faster" if bm - nm >= min_ms else "faster, below absolute floor"
         work, notes = counter_changes(b["counters"], n["counters"])
-        if work:
-            verdict += ", MORE WORK"
-        out.add("Time", f"{case:<26} {bm:>11.4g} {nm:>11.4g} {ratio:>7.2f} {f'[{low:.2f}, {high:.2f}]':>15} "
-                f"{threshold:>6.0%}  {verdict}", slower)
+        if case in untimed:
+            # Its time has no baseline in these units: no ratio, and no spread of it for the memory
+            # threshold below; everything else is compared as for any case.
+            threshold, series = 0.10, []
+            out.add("Time", f"{case:<26} time not compared: {untimed[case]}" + (", MORE WORK" if work else ""))
+        else:
+            if not complete_timing(b, n):
+                out.add("Missing", f"{case:<26} NOT COMPARABLE: missing/invalid timing series or repetitions", True)
+                continue
+            ratio, low, high = bootstrap_ratio(b["reps"], n["reps"])
+            series = sorted({s for rep in b["reps"] for s in rep} & {s for rep in n["reps"] for s in rep})
+            bm, nm = statistic(b["reps"], series), statistic(n["reps"], series)
+            # A change counts beyond max(10 %, the measured spread of both sides), the chosen floor,
+            # and with the interval excluding 1.
+            threshold = max(0.10, spread(b), spread(n))
+            spreads.append(max(spread(b), spread(n)))
+            verdict, slower = "same", False
+            if low > 1.0 and ratio >= 1 + threshold:
+                verdict = "SLOWER" if nm - bm >= min_ms else "slower, below absolute floor"
+                slower = nm - bm >= min_ms
+            elif high < 1.0 and ratio <= 1 / (1 + threshold):
+                verdict = "faster" if bm - nm >= min_ms else "faster, below absolute floor"
+            if work:
+                verdict += ", MORE WORK"
+            out.add("Time", f"{case:<26} {bm:>11.4g} {nm:>11.4g} {ratio:>7.2f} {f'[{low:.2f}, {high:.2f}]':>15} "
+                    f"{threshold:>6.0%}  {verdict}", slower)
+            if verdict.startswith(("SLOWER", "faster")) and len(series) > 1:
+                out.add("Time", f"{'':<28}by series: " + ", ".join(series_ratios(b["reps"], n["reps"], series)[:3]))
         out.regressions += int(work)
         widths = {width for e in (b, n) for rep in e["qps"] for width in rep}
         if not widths and any(e["client_case"] for e in (b, n)):
@@ -415,8 +430,6 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
                     f"spread threshold {qt:.1%}; {qv}", qv == "LOWER QPS")
         for note in notes:
             out.add("Time", f"{'':<28}{note}")
-        if verdict.startswith(("SLOWER", "faster")) and len(series) > 1:
-            out.add("Time", f"{'':<28}by series: " + ", ".join(series_ratios(b["reps"], n["reps"], series)[:3]))
         # Memory: the case's peak (its kind kept with it) and each phase's peak apart.
         bp, np_ = (max(b["peaks"]) if b["peaks"] else None), (max(n["peaks"]) if n["peaks"] else None)
         bk, nk = kind_of(b), kind_of(n)
@@ -488,27 +501,249 @@ def host_check(base: list[dict | None], new: list[dict | None], allow: bool) -> 
     return None
 
 
+# The saved timing units' generation each fast.py record carries (`series_units`): 2 since 8 Nov
+# 2026, every series and metric in milliseconds of what the case declares. A record without it is
+# generation 1: a seconds field other than load_s/open_s was saved in seconds, and a non-p50 field
+# of a section that sampled its own latency was timed by that latency (fix check r2 of
+# pkg/declared-metrics, R2-F1). Raise it with any change of what a saved series means.
+SERIES_UNITS = 2
+GEN1_SAMPLED_SECTIONS = {"commits", "reason", "shacl", "kernel", "classification"}
+
+
+def normalised(record: dict, metric: str | None) -> dict | None:
+    """`record` in the current generation's units, `metric` its case's declared metric; None where
+    its generation can't be brought to them (an unknown generation, an unknown metric, or a series
+    of another quantity)."""
+    generation = record.get("series_units", 1)
+    if generation == SERIES_UNITS:
+        return record
+    if generation != 1 or metric is None:
+        return None
+    section, _, field = metric.rpartition(".")
+    if section in GEN1_SAMPLED_SECTIONS and field != "p50_ms":
+        return None  # timed by its section's latency then: another quantity
+    scale = 1000.0 if field.endswith("_s") and metric not in ("load_s", "open_s") else 1.0
+    if scale == 1.0:
+        return {**record, "series_units": SERIES_UNITS}
+    out = {**record, "series_units": SERIES_UNITS,
+           "samples": {k: [v * scale if isinstance(v, (int, float)) else v for v in vs]
+                       for k, vs in (record.get("samples") or {}).items()}}
+    if isinstance(record.get("metric"), (int, float)):
+        out["metric"] = record["metric"] * scale
+    return out
+
+
+def units_check(base_report: dict, new_report: dict) -> tuple[dict, dict, dict[str, str]]:
+    """Both reports' records in one generation of timing units, and the cases whose timing can't be,
+    with why: their records stay as saved, for every comparison but their time's (compare_cases
+    `untimed`; fix check r3, R3-F1: dropping them dropped a wrong status too). A case whose records are
+    all of one generation on both sides compares as it was saved."""
+    from . import cases as registry
+    declared = {c["name"]: c.get("metric") for c in registry.load()}
+    gens: dict[str, set] = {}
+    for r in base_report.get("records", []) + new_report.get("records", []):
+        gens.setdefault(r["case"], set()).add(r.get("series_units", 1))
+    refused: dict[str, str] = {}
+    for case, seen in gens.items():
+        unknown = sorted(g for g in seen if g not in (1, SERIES_UNITS))
+        if unknown:
+            refused[case] = f"unknown timing units (series_units {', '.join(map(str, unknown))})"
+
+    for r in base_report.get("records", []) + new_report.get("records", []):
+        case = r["case"]
+        if case not in refused and len(gens[case]) > 1 and normalised(r, declared.get(case)) is None:
+            refused[case] = ("timing units of two generations that can't be brought together "
+                             f"(series_units {sorted(gens[case])}: its old series was another quantity)")
+
+    def bring(report):
+        return {**report, "records": [r if r["case"] in refused or len(gens[r["case"]]) == 1
+                                      else normalised(r, declared.get(r["case"])) for r in report.get("records", [])]}
+    return bring(base_report), bring(new_report), refused
+
+
+UNRECORDED = object()  # a record without `inputs`: a report before 7 Nov 2026
+
+
+class Observed:
+    """What one side's records say a case loaded, every record's observation kept (fix check r3 of
+    pkg/stage-data, R3-W1, 7 Nov 2026: one `dict | None` per case made "a record doesn't say" and
+    "the records disagree" the same None, which a falsy test then took for "no input"). Each record
+    is in one of three states: unrecorded (no `inputs`), explicitly none (`{}`), or recorded external
+    (anything else: a mapping of file to SHA-256, or a value that isn't a mapping, its bytes unknown).
+    It has no truth value, so that no test can project it back to one."""
+
+    def __init__(self):
+        self.seen: list = []
+
+    def __bool__(self):
+        raise TypeError("an input observation has three states: ask .external or .recorded()")
+
+    @property
+    def external(self) -> bool:
+        """Whether any record names an external file (or records something that isn't a mapping)."""
+        return any(s is not UNRECORDED and s != {} for s in self.seen)
+
+    def recorded(self) -> dict | None:
+        """The one mapping every record states, or None: a record doesn't say, says something that
+        isn't a mapping, or two records disagree."""
+        first = self.seen[0] if self.seen else UNRECORDED
+        if first is UNRECORDED or not isinstance(first, dict) or any(s != first for s in self.seen):
+            return None
+        return first
+
+    def unknown(self, side: str) -> str | None:
+        """Why this side's records establish no one input, where they don't."""
+        if self.recorded() is not None:
+            return None
+        if all(s is UNRECORDED for s in self.seen):
+            return f"input unknown: {side} doesn't record the bytes it loaded"
+        return f"input unknown: {side}'s records don't state one input (" + "; ".join(
+            "no record" if s is UNRECORDED else json.dumps(s, sort_keys=True)[:200] for s in self.seen) + ")"
+
+
+def loaded_inputs(report: dict) -> dict[str, Observed]:
+    """Per case, what each of its records says it loaded (fast.py run's record `inputs`: the byte
+    SHA-256 of each external file), every record kept."""
+    out: dict[str, Observed] = {}
+    for r in report.get("records", []):
+        out.setdefault(r["case"], Observed()).seen.append(r["inputs"] if "inputs" in r else UNRECORDED)
+    return out
+
+
+def input_check(base_report: dict, new_report: dict) -> dict[str, str]:
+    """The cases whose two sides didn't load the same external input bytes, or don't say which, with
+    why: no verdict of theirs is evidence of a code change (review r1 of pkg/stage-data, R1-W1, 7 Nov
+    2026: lubm-10/100's new release made an old result "slower" than a new one). What a case loads is
+    suitekit.inputs.declared()'s one answer. Recorded identities come first: a case of generated data
+    alone (it declares nothing today, and no record on either side names an external file) needs none
+    recorded; any record naming one makes it a case of external input (fix check r3, R3-W1)."""
+    from . import cases as registry
+    from . import inputs
+    declares = {c["name"]: inputs.declared(c) for c in registry.load()}
+    base, new = loaded_inputs(base_report), loaded_inputs(new_report)
+    out = {}
+    for case in sorted(set(base) & set(new)):
+        b, n, want = base[case], new[case], declares.get(case)
+        if want == set() and not b.external and not n.external:
+            continue  # generated data alone, on both sides (sol-loop r3 V3)
+        if why := (b.unknown("the base") or n.unknown("the new run")
+                   or input_difference(b.recorded(), n.recorded(), declared=want)):
+            out[case] = why
+    return out
+
+
+def input_difference(base: dict | None, new: dict | None, base_bytes: dict | None = None,
+                     new_bytes: dict | None = None, declared: set[str] | None = None) -> str | None:
+    """The one input rule of both comparison paths (fast-suite reports, suite results): why the two
+    sides' external input files (file -> its byte SHA-256, None: not known; the whole mapping None: not
+    recorded) aren't the same bytes, or None when they are. Without hashes, another size (`*_bytes`)
+    is another input; the same size is unknown, never "the same". With `declared` (what the case
+    loads, suitekit.inputs.declared()), a declared file a side doesn't hash, or a hashed file the case
+    doesn't declare, is unknown, never none."""
+    if base is None or new is None:
+        side = "either side" if base is None and new is None else ("the base" if base is None else "the new run")
+        return f"input unknown: {side} doesn't record the bytes it loaded"
+    files = sorted(set(base) | set(new) | set(declared or ()))
+    sizes = lambda f: ((base_bytes or {}).get(f), (new_bytes or {}).get(f))  # noqa: E731
+    differ = [f for f in files if (base.get(f) and new.get(f) and base[f] != new[f])
+              or (None not in sizes(f) and sizes(f)[0] != sizes(f)[1])]
+    if differ:
+        return "different input: " + "; ".join(
+            f"{f} {('sha256 ' + str(base.get(f))[:12]) if base.get(f) else str(sizes(f)[0]) + ' bytes'} in the base, "
+            f"{('sha256 ' + str(new.get(f))[:12]) if new.get(f) else str(sizes(f)[1]) + ' bytes'} in the new run"
+            for f in differ)
+    unknown = [f for f in files if not base.get(f) or not new.get(f)]
+    if unknown:
+        return f"input unknown: no recorded SHA-256 of {', '.join(unknown)} on both sides"
+    if declared is not None and (undeclared := sorted(f for f in files if f not in declared)):
+        return f"input unknown: {', '.join(undeclared)} hashed, but not an input this case declares"
+    return None
+
+
+UNLISTED = "(inputs the run doesn't list with their SHA-256)"
+
+
+def suite_inputs(paths: list[Path]) -> tuple[dict | None, dict]:
+    """The /data files suite results read (the manifest.json beside each: `datasets`, their sizes,
+    and `dataset_sha256`): file -> SHA-256 (None: not recorded, or two invocations disagree), and
+    file -> size; (None, {}) where a manifest is missing. Only an invocation that states its inputs'
+    hashes (`dataset_sha256`, `{}` included) establishes them: `datasets` alone may miss what a
+    workload loads itself (sol-loop r3 V1: commit-latency's LUBM), so its inputs stay unknown
+    (UNLISTED), its listed sizes still showing another release."""
+    hashes: dict = {}
+    sizes: dict = {}
+    for path in dict.fromkeys(p.resolve() for p in paths):
+        try:
+            invocations = json.loads((path.parent / "manifest.json").read_text(encoding="utf-8"))["invocations"]
+        except (OSError, ValueError, KeyError):
+            return None, {}
+        for i in invocations:
+            if "dataset_sha256" not in i:
+                hashes[UNLISTED] = None
+            digests = i.get("dataset_sha256") or {}
+            listed = i.get("datasets") or {}
+            # Every file the run hashed or listed (fix check r2, R2-W1: a hash for a file the run loads
+            # outside its declared plan, commit-latency's LUBM, was dropped with the size map's keys).
+            for f in sorted(set(listed) | set(digests)):
+                sha, size = digests.get(f), listed.get(f)
+                if f not in hashes:
+                    hashes[f], sizes[f] = sha, size
+                    continue
+                # Disagreement: hashes that differ (or one missing), or two known sizes that differ; a
+                # size one invocation lists and another doesn't is no disagreement (sol-loop r5 X1).
+                if hashes[f] != sha or (size is not None and sizes.get(f) not in (None, size)):
+                    hashes[f] = None
+                if sizes.get(f) is None:
+                    sizes[f] = size
+                elif size is not None and sizes[f] != size:
+                    sizes[f] = None
+    return hashes, sizes
+
+
 def compare_reports(base_report: dict, new_report: dict, min_ms: float = 2.0, allow_host_change: bool = False) -> int:
-    """Two fast-suite (or perf-lab) reports; the exit status."""
+    """Two fast-suite (or perf-lab) reports; the exit status: 2 also where no case loaded the same
+    input on both sides, and where one side has no case whose timing units both sides' generations
+    share (units_check()), unless something else failed: a failure found is a verdict on the new run,
+    1, where 2 says only that its time has no baseline."""
     if not math.isfinite(min_ms) or min_ms < 0:
         raise ValueError("--min-ms must be finite and nonnegative")
     refused = host_check([identity(base_report.get("machine"), base_report.get("started"))],
                          [identity(new_report.get("machine"), new_report.get("started"))], allow_host_change)
     if refused:
         return refused
+    other_input = input_check(base_report, new_report)
+    if other_input:
+        print("## Inputs\n")
+        for case, why in other_input.items():
+            print(f"- {case}: {why}; not compared: no evidence of a code change")
+        print()
+        keep = lambda report: {**report, "records": [r for r in report.get("records", [])  # noqa: E731
+                                                     if r["case"] not in other_input]}
+        base_report, new_report = keep(base_report), keep(new_report)
+        if not base_report["records"] or not new_report["records"]:
+            print("REFUSED: no case loaded the same input on both sides")
+            return 2
+    base_report, new_report, untimed = units_check(base_report, new_report)
+    no_timing = bool(untimed) and any(all(r["case"] in untimed for r in report["records"])
+                                      for report in (base_report, new_report))
     for name, report in (("base", base_report), ("new", new_report)):
         if report.get("reps", 2) < 2:
             print(f"warning: the {name} run has one repetition: its spread is unknown, so a verdict "
                   "rests on the 10 % floor alone (run --reps 2 or more)")
     out = Out()
-    spreads = compare_cases(pooled(base_report), pooled(new_report), min_ms, out)
+    spreads = compare_cases(pooled(base_report), pooled(new_report), min_ms, out, untimed)
     out.print({"Time": f"{'case':<26} {'base ms':>11} {'new ms':>11} {'ratio':>7} {'95% CI':>15} {'spread':>7}  verdict"})
     if spreads:
         print(f"spread between repetitions: median {statistics.median(spreads):.0%}, max {max(spreads):.0%}")
     print(f"{out.regressions} regression(s)/acceptance failure(s): latency floor {min_ms:g} ms (default 2); "
           "changes require max(10 %, spread) and a 95 % ratio interval excluding 1; "
           "QPS is higher-is-better, judged per client width without a millisecond floor")
-    return 1 if out.regressions else 0
+    if out.regressions:
+        return 1
+    if no_timing:
+        print("REFUSED: no case left whose timing units both sides share")
+        return 2
+    return 0
 
 
 # --- suite results ---------------------------------------------------------------------------
@@ -733,6 +968,14 @@ def main(argv: list[str]) -> int:
     refused = host_check(manifest_identities(base_files), manifest_identities(new_files), args.allow_host_change)
     if refused:
         return refused
+    # The input rule of compare_reports() (input_difference()), over the /data files the runs read:
+    # another release of a dataset is no evidence of a code change (the orchestrator, 7 Nov 2026).
+    (base_sha, base_bytes), (new_sha, new_bytes) = suite_inputs(base_files), suite_inputs(new_files)
+    if base_sha != {} or new_sha != {}:
+        if why := input_difference(base_sha, new_sha, base_bytes, new_bytes):
+            print(f"## Inputs\n\n- {why}\n\nREFUSED: the runs didn't read the same input: no time or memory "
+                  "verdict would be evidence of a code change")
+            return 2
     base = collect(base_files, systems, args.include_restricted)
     new = collect(new_files, systems, args.include_restricted)
     print(f"# {args.new} against {args.base}\n")
