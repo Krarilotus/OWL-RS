@@ -54,7 +54,12 @@ SETTINGS = ["JAVA_HEAP", "DOCKER_MEMORY", "DOCKER_CPUS", "SKIP_COUNT", "QUERY_ME
             "VIRTUOSO_IMAGE", "VIRTUOSO_NUMBER_OF_BUFFERS", "VIRTUOSO_MAX_DIRTY_BUFFERS",
             "VIRTUOSO_THREADS_PER_QUERY", "VIRTUOSO_HTTP_THREADS", "VIRTUOSO_SERVER_THREADS",
             "MILLENNIUMDB_IMAGE", "MDB_THREADS", "MDB_IMPORT_BUFFER", "MDB_STRINGS_STATIC",
-            "MDB_STRINGS_DYNAMIC", "MDB_VERSIONED_BUFFER", "MDB_UNVERSIONED_BUFFER"]
+            "MDB_STRINGS_DYNAMIC", "MDB_VERSIONED_BUFFER", "MDB_UNVERSIONED_BUFFER",
+            # a build's configuration (P2 design review F4): its Rust image, its CPU, flags inherited
+            "RUST_IMAGE", "NRESE_TARGET_CPU", "RUSTFLAGS"]
+# Of these, where a run keeps its files and data, which changes no measurement (P2 design review F8):
+# a cell's receipt leaves them out of its settings (its data is in its own hashes).
+OPERATIONAL_SETTINGS = {"NRESE_BENCH_SCRATCH", "NRESE_BENCH_KEEP", "CARGO_TARGET_DIR", "SPARQL_DATA"}
 SECRET_SETTINGS = ["NRESE_LICENSES", "GRAPHDB_LICENSE", "RDFOX_LICENSE", "RGGS_REPO"]
 
 
