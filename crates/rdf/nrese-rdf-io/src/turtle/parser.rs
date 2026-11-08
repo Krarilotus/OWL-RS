@@ -25,35 +25,12 @@ use nrese_rdf::{
     QuadRef, TermRef, TripleRef,
 };
 
-use super::lexer::{Kind, Lexed, Malformed, Opening, Token, known_missing, lex, malformed};
+use super::lexer::{
+    Kind, Lexed, Malformed, Opening, Token, bracket, known_missing, lex, malformed, pair,
+};
 use crate::blank::BlankNodes;
 use crate::error::{RdfParseError, RdfSyntaxError, SkippedStatement, TextPosition};
 use crate::text::{NOT_IN_IRI, decode_iri, decode_string};
-
-/// The tokens that open something a statement must close: `[`, `(`, `<<(`, `<<`, `{|`. A
-/// pattern, the one list for a failing token (`unexpected`), for skipping a failed
-/// statement's rest (`resync`) and for debug builds' count in `take`; [`pair`] pairs each
-/// with its closer.
-macro_rules! opener {
-    () => {
-        Kind::OpenBracket
-            | Kind::OpenParen
-            | Kind::TripleTermOpen
-            | Kind::ReifiedOpen
-            | Kind::AnnotationOpen
-    };
-}
-
-/// Their closers: `]`, `)`, `)>>`, `>>`, `|}`.
-macro_rules! closer {
-    () => {
-        Kind::CloseBracket
-            | Kind::CloseParen
-            | Kind::TripleTermClose
-            | Kind::ReifiedClose
-            | Kind::AnnotationClose
-    };
-}
 
 mod n3;
 
@@ -416,7 +393,15 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         if !directives.is_empty() {
             let mut header = TurtleParser::from_slice(directives.as_bytes(), self.settings.clone());
             while let Some(step) = header.next_ref() {
-                step?;
+                match step {
+                    // Recovering, a directive that fails is the error of the chunk that holds
+                    // it; here it puts in force what it set before failing, as in the
+                    // sequential parse.
+                    Err(RdfParseError::Syntax(_)) if self.settings.recover => {}
+                    step => {
+                        step?;
+                    }
+                }
             }
             self.prefixes = header.prefixes;
             self.base = header.base;
@@ -1772,39 +1757,6 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             }
             _ => Term::Static(rdf::NIL),
         })
-    }
-}
-
-/// Which pair an [`opener!`] or [`closer!`] token is of: `[ ]`, `( )`, `<<( )>>`, `<< >>`,
-/// `{| |}`.
-fn pair(kind: Kind) -> usize {
-    match kind {
-        Kind::OpenBracket | Kind::CloseBracket => 0,
-        Kind::OpenParen | Kind::CloseParen => 1,
-        Kind::TripleTermOpen | Kind::TripleTermClose => 2,
-        Kind::ReifiedOpen | Kind::ReifiedClose => 3,
-        _ => 4,
-    }
-}
-
-/// An opener or closer met in a failed statement (`resync`), applied to what is open there:
-/// `open` (pairs, outermost first) and `counts` (how many of each pair it holds). An opener
-/// opens. A closer closes the innermost open bracket of its own pair, and the unfinished
-/// ones opened inside it go with it; with none of its pair open, it closes nothing. Each
-/// bracket is opened and closed once, and a closer of a pair not open costs O(1): linear
-/// work.
-fn bracket(open: &mut Vec<usize>, counts: &mut [usize; 5], kind: Kind) {
-    let pair = pair(kind);
-    if matches!(kind, opener!()) {
-        counts[pair] += 1;
-        open.push(pair);
-    } else if counts[pair] > 0 {
-        while let Some(inner) = open.pop() {
-            counts[inner] -= 1;
-            if inner == pair {
-                break;
-            }
-        }
     }
 }
 

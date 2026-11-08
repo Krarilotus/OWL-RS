@@ -1,21 +1,29 @@
 //! Exact statement boundaries in Turtle and TriG, for parsing in parallel.
 //!
 //! A [`Skimmer`] reads the document once, sequentially, but only far enough to know what
-//! is a string (four quote forms, with escapes), an IRI, a comment or an escaped character
-//! in a name, and how deep `[`, `(`, `{` and RDF 1.2's `<<` nest (`<<(` counts its `(`
-//! too, and `)>>` closes all three; `{|` opens with its `{`, and `|}` closes an annotation,
-//! never a TriG block): a table lookup per byte outside those,
-//! `memchr` inside them. A `.` at depth 0 followed by whitespace (or the end, or a
-//! comment), and a `}` that closes a TriG block, end a statement for certain; every other
-//! `.` is left alone (a boundary missed costs nothing, a wrong one would corrupt the parse).
-//! The skim also records every `@prefix`, `@base`, `PREFIX` and `BASE` directive, and RDF
-//! 1.2's `@version` and `VERSION`, so each chunk starts with exactly the prefixes, base and
-//! version in force where it begins, wherever the directives are in the document.
+//! is a string (four quote forms, with escapes), an IRI or a comment, and what is open:
+//! - brackets (`[ ]`, `( )`, `<<( )>>`, `<< >>`, `{| |}`), read as the lexer reads them
+//!   (`lexer::delimiter`) and held as recovery holds them (`lexer::bracket`): a closer
+//!   closes an open bracket of its own kind, or nothing;
+//! - TriG blocks (a `{` after a graph block's head, as the lexer reads it), and any other
+//!   `{` as a brace, as recovery reads one;
+//! - a name holding `\` is read by the lexer itself, token by token.
+//!
+//! It costs a table lookup per byte outside those, and `memchr` inside them. A `.` with
+//! nothing open followed by whitespace (or the end, or a comment), and a `}` that closes a
+//! TriG block, end a statement for certain. Every other `.` is left alone: a boundary missed
+//! costs nothing, a wrong one corrupts the parse. So where it is unsure the skimmer holds
+//! more open than a recovering parser would, never less, and every cut it makes is where the
+//! sequential recovering parse starts a statement. The skim also records every `@prefix`,
+//! `@base`, `PREFIX` and `BASE` directive, and RDF 1.2's `@version` and `VERSION`, so each
+//! chunk starts with exactly the prefixes, base and version in force where it begins,
+//! wherever the directives are in the document.
 //!
 //! Oxigraph's Turtle splitter guesses instead (a `.` after which three triples parse) and
 //! says it can fail or give wrong results on directives after the start or Turtle inside
-//! literals; this one can't, for a valid document. On an invalid document the chunks still
-//! report its error, maybe after other statements than a sequential parse would.
+//! literals; this one can't.
+
+use super::lexer::{Delimiter, Kind, Lexed, bracket, delimiter, lex};
 
 /// Bytes the skimmer must look at outside strings, IRIs and comments.
 const fn interesting() -> [bool; 256] {
@@ -30,19 +38,74 @@ const fn interesting() -> [bool; 256] {
 }
 const INTERESTING: [bool; 256] = interesting();
 
+/// The bytes that always end a token before them (the lexer's delimiters, quotes, `<`, `#`):
+/// a name holding `\` starts after the last one, or after whitespace.
+fn ends_token(b: u8) -> bool {
+    b.is_ascii_whitespace()
+        || matches!(
+            b,
+            b'"' | b'\'' | b'<' | b'>' | b'|' | b'#' | b'[' | b']' | b'{' | b'}' | b'(' | b')'
+        )
+}
+
+/// Whether a SPARQL-style directive's text so far is a `VERSION` (ending with its short
+/// string; `PREFIX` and `BASE` end with their IRI).
+fn version(text: &[u8]) -> bool {
+    let text = text.trim_ascii_start();
+    text.len() >= 7 && text[..7].eq_ignore_ascii_case(b"version")
+}
+
+/// What the tokens of a statement before a `{` make of it (TriG): a graph block's head
+/// (nothing, a graph name, `GRAPH` and a graph name), the start of one, or neither.
+#[derive(PartialEq)]
+enum Head {
+    Block,
+    Start,
+    Not,
+}
+
+/// [`Head`] of `text`, read by the lexer; `eof`: `text` ends there (at the `{`).
+fn head(text: &[u8], eof: bool) -> Head {
+    let mut kinds = [Kind::Eof; 3];
+    let mut n = 0;
+    let mut at = 0;
+    loop {
+        match lex(&text[at..], eof, false, false) {
+            Lexed::Token(token) if token.kind == Kind::Eof => break,
+            Lexed::Token(token) => {
+                if n == kinds.len() {
+                    return Head::Not;
+                }
+                kinds[n] = token.kind;
+                n += 1;
+                at += token.consumed;
+            }
+            Lexed::NeedMore => break,
+            Lexed::Error(..) => return Head::Not,
+        }
+    }
+    let name = |kind: &Kind| {
+        matches!(
+            kind,
+            Kind::IriRef { .. } | Kind::PrefixedName { .. } | Kind::BlankLabel
+        )
+    };
+    match &kinds[..n] {
+        [] | [Kind::OpenBracket, Kind::CloseBracket] => Head::Block,
+        [Kind::Graph, Kind::OpenBracket, Kind::CloseBracket] => Head::Block,
+        [kind] | [Kind::Graph, kind] if name(kind) => Head::Block,
+        [Kind::Graph] | [Kind::OpenBracket] | [Kind::Graph, Kind::OpenBracket] => Head::Start,
+        _ => Head::Not,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
     Normal,
-    /// After a `.` at depth 0: a boundary if whitespace, a comment or the end follows.
+    /// After a `.` with nothing open: a boundary if whitespace, a comment or the end follows.
     Dot,
-    /// After `\` outside a string: the next byte is escaped.
-    Escape,
     Comment,
-    /// After `<`: an IRI, or `<<` (the second byte decides).
-    Angle,
     Iri,
-    /// After `|` (outside strings and IRIs): `|}` closes an annotation block.
-    Pipe,
     /// In a short string with this quote; `escaped`: the previous byte was `\`.
     Short {
         quote: u8,
@@ -73,8 +136,26 @@ pub(crate) struct Skim {
 /// Reads a document in pieces and finds cuts near the targets.
 pub(crate) struct Skimmer {
     state: State,
-    depth: i64,
-    /// The document offset of the next byte fed.
+    /// TriG: `{` may open a graph block.
+    trig: bool,
+    /// What is open, as a recovering parser holds it: brackets by pair, outermost first,
+    /// with a count per pair (`lexer::bracket`); `{` opened inside a statement; a TriG
+    /// block.
+    open: Vec<usize>,
+    counts: [usize; 5],
+    braces: u64,
+    in_block: bool,
+    /// Where the current statement starts; while its tokens so far may be a TriG block's
+    /// head (at most a graph name after `GRAPH`), its bytes before the current input.
+    statement_start: u64,
+    head: Vec<u8>,
+    /// No `{` can open a block in this statement any more.
+    no_head: bool,
+    /// The bytes of the last input not read yet: a token whose reading needs what comes
+    /// after them (a word at the input's end, a delimiter cut by it). A token holds no
+    /// whitespace, so they end at the first whitespace of the next input.
+    pending: Vec<u8>,
+    /// The document offset of the next byte read.
     offset: u64,
     line: u64,
     line_start: u64,
@@ -91,12 +172,21 @@ pub(crate) struct Skimmer {
 }
 
 impl Skimmer {
-    /// A skimmer for a document of `length` bytes cut into up to `parts` chunks.
-    pub(crate) fn new(length: u64, parts: usize) -> Self {
+    /// A skimmer for a Turtle (or, with `trig`, TriG) document of `length` bytes cut into up
+    /// to `parts` chunks.
+    pub(crate) fn new(length: u64, parts: usize, trig: bool) -> Self {
         let parts = parts.max(1) as u64;
         Self {
             state: State::Normal,
-            depth: 0,
+            trig,
+            open: Vec::new(),
+            counts: [0; 5],
+            braces: 0,
+            in_block: false,
+            statement_start: 0,
+            head: Vec::new(),
+            no_head: false,
+            pending: Vec::new(),
             offset: 0,
             line: 0,
             line_start: 0,
@@ -123,10 +213,100 @@ impl Skimmer {
             }
         }
         self.start = Some((at, Vec::new()));
+        self.statement_start = at;
+        self.head.clear();
+        self.no_head = false;
+    }
+
+    /// Nothing open: a `.` here ends the statement.
+    fn level(&self) -> bool {
+        self.open.is_empty() && self.braces == 0 && !self.in_block
+    }
+
+    /// A statement ends whatever is open in it (a SPARQL-style directive's end).
+    fn close_all(&mut self) {
+        self.open.clear();
+        self.counts = [0; 5];
+        self.braces = 0;
+    }
+
+    /// A delimiter token at `bytes[at..]` applied to what is open, as a recovering parser
+    /// applies it (`skip_token`); `true` when it ends a TriG block (and the statement in it).
+    fn delimit(&mut self, kind: Kind, bytes: &[u8], at: usize) -> bool {
+        match kind {
+            Kind::OpenBrace => {
+                if self.trig
+                    && !self.in_block
+                    && self.open.is_empty()
+                    && self.braces == 0
+                    && !self.no_head
+                    && self.block_head(bytes, at)
+                {
+                    self.in_block = true;
+                } else {
+                    self.braces += 1;
+                }
+                self.no_head = true;
+                false
+            }
+            Kind::CloseBrace if self.braces > 0 => {
+                self.braces -= 1;
+                false
+            }
+            Kind::CloseBrace if self.in_block => {
+                self.in_block = false;
+                self.open.clear();
+                self.counts = [0; 5];
+                true
+            }
+            Kind::CloseBrace => false,
+            _ => {
+                bracket(&mut self.open, &mut self.counts, kind);
+                false
+            }
+        }
+    }
+
+    /// Whether the statement's tokens before the `{` at `bytes[at]` are a graph block's head.
+    fn block_head(&self, bytes: &[u8], at: usize) -> bool {
+        let joined;
+        let text = match self.statement_start.checked_sub(self.offset) {
+            Some(from) => &bytes[from as usize..at],
+            None => {
+                joined = [&self.head[..], &bytes[..at]].concat();
+                &joined[..]
+            }
+        };
+        head(text, true) == Head::Block
     }
 
     /// Feeds the next bytes of the document.
     pub(crate) fn feed(&mut self, bytes: &[u8]) {
+        let mut bytes = bytes;
+        if !self.pending.is_empty() {
+            // What was held back, with this input up to its first whitespace: enough to read
+            // it.
+            let k = bytes
+                .iter()
+                .position(u8::is_ascii_whitespace)
+                .map_or(bytes.len(), |k| k + 1);
+            let mut joined = std::mem::take(&mut self.pending);
+            joined.extend_from_slice(&bytes[..k]);
+            let read = self.scan(&joined, false);
+            self.pending = joined.split_off(read);
+            bytes = &bytes[k..];
+            if !self.pending.is_empty() {
+                self.pending.extend_from_slice(bytes);
+                return;
+            }
+        }
+        let read = self.scan(bytes, false);
+        self.pending.extend_from_slice(&bytes[read..]);
+    }
+
+    /// Reads `bytes`, the document's next bytes from `self.offset`: how many it read (the
+    /// rest is held back, see `pending`). `eof`: nothing comes after them.
+    fn scan(&mut self, bytes: &[u8], eof: bool) -> usize {
         let base = self.offset;
         // Lines: counted per piece with memchr (vectorised), and at each boundary from the
         // piece's start up to it.
@@ -145,10 +325,27 @@ impl Skimmer {
                 *counted = upto;
             }
         };
+        // A word at the input's end is held back (it may go on): it starts after the last
+        // whitespace or interesting byte.
+        let tail = if eof {
+            n
+        } else {
+            bytes
+                .iter()
+                .rposition(|&c| c.is_ascii_whitespace() || INTERESTING[c as usize])
+                .map_or(0, |k| k + 1)
+        };
+        // Where reading stopped for want of more input.
+        let mut held = None;
         while i < n {
+            if i >= tail && self.state == State::Normal {
+                held = Some(i);
+                break;
+            }
             // A statement's first bytes: is it a directive?
+            let level = self.level();
             if let Some((_, first)) = &mut self.start
-                && self.depth == 0
+                && level
                 && matches!(self.state, State::Normal)
             {
                 let b = bytes[i];
@@ -223,40 +420,128 @@ impl Skimmer {
             match self.state {
                 State::Normal => {
                     if !INTERESTING[b as usize] {
-                        // The fast path: skip to the next byte that matters (a directive's
-                        // text is copied byte by byte above, but directives are few).
+                        // The fast path: skip to the next byte that matters, up to the held
+                        // word (a directive's text is copied byte by byte above, but
+                        // directives are few).
                         if self.directive.is_none() && self.start.is_none() {
                             let rest = &bytes[i + 1..];
                             let skip = rest
                                 .iter()
                                 .position(|&c| INTERESTING[c as usize])
                                 .unwrap_or(rest.len());
-                            i += 1 + skip;
+                            i = (i + 1 + skip).min(tail.max(i + 1));
                         } else {
                             i += 1;
                         }
                         continue;
                     }
                     match b {
-                        b'"' | b'\'' => self.state = State::Opening { quote: b, count: 1 },
-                        b'<' => self.state = State::Angle,
-                        b'>' => self.depth -= 1,
-                        b'|' => self.state = State::Pipe,
-                        b'#' => self.state = State::Comment,
-                        b'\\' => self.state = State::Escape,
-                        b'[' | b'(' | b'{' => self.depth += 1,
-                        b']' | b')' => self.depth -= 1,
-                        b'}' => {
-                            self.depth -= 1;
-                            if self.depth == 0 {
-                                count_lines(self, &mut counted, i + 1);
-                                self.boundary(base + i as u64 + 1);
-                            }
+                        b'"' | b'\'' => {
+                            self.state = State::Opening { quote: b, count: 1 };
+                            i += 1;
                         }
-                        b'.' if self.depth == 0 => self.state = State::Dot,
-                        _ => {}
+                        b'#' => {
+                            self.state = State::Comment;
+                            i += 1;
+                        }
+                        b'.' => {
+                            if self.level() {
+                                self.state = State::Dot;
+                            }
+                            i += 1;
+                        }
+                        b'\\' => {
+                            // A name with an escape: read by the lexer from the token it is
+                            // in, as a recovering parser reads it.
+                            self.start = None;
+                            let mut from = i;
+                            while from > 0 && !ends_token(bytes[from - 1]) {
+                                from -= 1;
+                            }
+                            let mut at = from;
+                            let mut more = false;
+                            while at < n && !ends_token(bytes[at]) {
+                                match lex(&bytes[at..], eof, false, false) {
+                                    Lexed::Token(token) => {
+                                        let end = at + token.consumed;
+                                        match token.kind {
+                                            // A `.` with nothing open ends the statement if
+                                            // whitespace or a comment follows (`State::Dot`).
+                                            Kind::Dot if self.level() => {
+                                                if end == n {
+                                                    self.state = State::Dot;
+                                                } else if bytes[end].is_ascii_whitespace()
+                                                    || bytes[end] == b'#'
+                                                {
+                                                    count_lines(self, &mut counted, end);
+                                                    self.boundary(base + end as u64);
+                                                }
+                                            }
+                                            opener!()
+                                            | closer!()
+                                            | Kind::OpenBrace
+                                            | Kind::CloseBrace => {
+                                                let ended = self.delimit(token.kind, bytes, at);
+                                                if ended {
+                                                    count_lines(self, &mut counted, end);
+                                                    self.boundary(base + end as u64);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        at = end;
+                                    }
+                                    Lexed::NeedMore => {
+                                        more = true;
+                                        break;
+                                    }
+                                    // A byte the lexer can't read: skipped, as recovery does.
+                                    Lexed::Error(..) => at += 1,
+                                }
+                            }
+                            if let Some((text, _)) = &mut self.directive {
+                                if at > i + 1 {
+                                    text.extend_from_slice(&bytes[i + 1..at]);
+                                } else {
+                                    // Held before the `\`: its bytes are read again.
+                                    text.truncate(text.len() - (i + 1 - at));
+                                }
+                            }
+                            if more {
+                                held = Some(at);
+                                break;
+                            }
+                            i = at;
+                        }
+                        _ => match delimiter(bytes, i, eof, false) {
+                            Some(Delimiter::Token(kind, len)) => {
+                                if let Some((text, _)) = &mut self.directive {
+                                    text.extend_from_slice(&bytes[i + 1..i + len]);
+                                }
+                                let ended = self.delimit(kind, bytes, i);
+                                i += len;
+                                if ended {
+                                    count_lines(self, &mut counted, i);
+                                    self.boundary(base + i as u64);
+                                }
+                            }
+                            // A `>` or `|` that starts no delimiter: a byte the lexer can't
+                            // read, skipped.
+                            Some(Delimiter::Bad(_)) => i += 1,
+                            Some(Delimiter::NeedMore) => {
+                                if let Some((text, _)) = &mut self.directive {
+                                    text.pop();
+                                }
+                                held = Some(i);
+                                break;
+                            }
+                            // A `<` that starts an IRI.
+                            None => {
+                                self.state = State::Iri;
+                                i += 1;
+                            }
+                        },
                     }
-                    i += 1;
                 }
                 State::Dot => {
                     self.state = State::Normal;
@@ -268,35 +553,6 @@ impl Skimmer {
                     if b.is_ascii_whitespace() || b == b'#' {
                         count_lines(self, &mut counted, i);
                         self.boundary(base + i as u64);
-                    }
-                }
-                State::Escape => {
-                    self.state = State::Normal;
-                    i += 1;
-                }
-                State::Angle => {
-                    if b == b'<' {
-                        // `<<`: a reified triple or a triple term opens.
-                        self.depth += 2;
-                        self.state = State::Normal;
-                        i += 1;
-                    } else {
-                        // An IRI: this byte is its first, read again in that state.
-                        if let Some((text, _)) = &mut self.directive {
-                            text.pop();
-                        }
-                        self.state = State::Iri;
-                    }
-                }
-                State::Pipe => {
-                    self.state = State::Normal;
-                    if b == b'}' {
-                        // `|}`: an annotation block closes.
-                        self.depth -= 1;
-                        i += 1;
-                    } else if let Some((text, _)) = &mut self.directive {
-                        // Read again in the normal state.
-                        text.pop();
                     }
                 }
                 State::Comment => match memchr::memchr2(b'\n', b'\r', &bytes[i..]) {
@@ -321,11 +577,12 @@ impl Skimmer {
                         }
                         self.state = State::Normal;
                         i += k + 1;
-                        // A SPARQL-style directive ends with its IRI.
-                        if matches!(&self.directive, Some((text, false)) if text.iter().filter(|&&c| c == b'<').count() >= 1)
-                        {
+                        // A SPARQL-style `PREFIX` or `BASE` ends with its IRI, whatever is open
+                        // (a recovering parser ends a failed one there too).
+                        if matches!(&self.directive, Some((text, false)) if !version(text)) {
                             let at = base + i as u64;
                             count_lines(self, &mut counted, i);
+                            self.close_all();
                             self.boundary(at);
                         }
                     }
@@ -389,14 +646,13 @@ impl Skimmer {
                             };
                             i += k + 1;
                             // A SPARQL-style `VERSION` ends with its string (only short
-                            // strings may follow it).
+                            // strings may follow it), whatever is open.
                             if closed
-                                && matches!(&self.directive, Some((text, false))
-                                    if text.trim_ascii_start().len() >= 7
-                                        && text.trim_ascii_start()[..7].eq_ignore_ascii_case(b"version"))
+                                && matches!(&self.directive, Some((text, false)) if version(text))
                             {
                                 let at = base + i as u64;
                                 count_lines(self, &mut counted, i);
+                                self.close_all();
                                 self.boundary(at);
                             }
                         }
@@ -454,12 +710,29 @@ impl Skimmer {
                 }
             }
         }
-        count_lines(self, &mut counted, n);
-        self.offset = base + n as u64;
+        let read = held.unwrap_or(n);
+        count_lines(self, &mut counted, read);
+        // TriG: the statement's bytes so far, while they may be a block's head (a `{` later
+        // asks; see `block_head`).
+        if self.trig && !self.no_head && !self.in_block {
+            let from = self.statement_start.saturating_sub(base) as usize;
+            if from < read {
+                self.head.extend_from_slice(&bytes[from..read]);
+                if head(&self.head, false) == Head::Not {
+                    self.head.clear();
+                    self.no_head = true;
+                }
+            }
+        }
+        self.offset = base + read as u64;
+        read
     }
 
     /// Ends the document.
     pub(crate) fn finish(mut self) -> Skim {
+        let pending = std::mem::take(&mut self.pending);
+        let read = self.scan(&pending, true);
+        debug_assert_eq!(read, pending.len(), "nothing is held at the end");
         if self.state == State::Dot {
             self.boundary(self.offset);
         }
@@ -484,11 +757,53 @@ mod tests {
     use super::*;
 
     fn skim(text: &str, parts: usize, piece: usize) -> Skim {
-        let mut skimmer = Skimmer::new(text.len() as u64, parts);
+        skim_as(text, parts, piece, false)
+    }
+
+    fn skim_as(text: &str, parts: usize, piece: usize, trig: bool) -> Skim {
+        let mut skimmer = Skimmer::new(text.len() as u64, parts, trig);
         for chunk in text.as_bytes().chunks(piece.max(1)) {
             skimmer.feed(chunk);
         }
         skimmer.finish()
+    }
+
+    /// The cuts don't depend on the pieces the input comes in, where a delimiter, a name with
+    /// `\` or a block's head is cut by a piece's end too (fix of the splitter's witnesses).
+    /// A guard: written with the fix, the integration tests (`split_contract_tests`) give
+    /// the cuts' meaning.
+    #[test]
+    fn the_same_cuts_whatever_the_pieces() {
+        let documents = [
+            (
+                false,
+                "<urn:s> <urn:p> [ <urn:q> . ) . <urn:u> <urn:v> <urn:w> . ] . <urn:a> <urn:b> <urn:c> .\n",
+            ),
+            (
+                false,
+                "<urn:s> <urn:p> [ <urn:q> > . <urn:u> <urn:v> <urn:w> . ] . <urn:a> <urn:b> <urn:c> .\n",
+            ),
+            (
+                false,
+                "<urn:s> <urn:p> <urn:o> \\( . <urn:u> <urn:v> <urn:w> . ) . <urn:a> <urn:b> <urn:c> .\n",
+            ),
+            (
+                false,
+                "@prefix ex: <http://e/> .\nex:Foo_\\(bar\\) ex:p ex:o\\. .\nex:a ex:p <<( ex:a ex:b ex:c )>> {| ex:q ex:r |} .\n",
+            ),
+            (
+                true,
+                "ex:g { <urn:a> <urn:b> <urn:c> . } GRAPH [ ] { <urn:d> <urn:e> <urn:f> . }\n<urn:s> <urn:p> { <urn:q> . } <urn:x> <urn:y> <urn:z> .\n<urn:g> { <urn:s> <urn:p> [ <urn:q> <urn:o> }\n<urn:a> <urn:b> <urn:c> .\n",
+            ),
+        ];
+        for (trig, text) in documents {
+            let whole = skim_as(text, text.len(), text.len(), trig);
+            assert!(!whole.cuts.is_empty(), "{text:?}");
+            for piece in [1, 2, 3, 7, 64] {
+                let other = skim_as(text, text.len(), piece, trig);
+                assert_eq!(other.cuts, whole.cuts, "pieces of {piece}: {text:?}");
+            }
+        }
     }
 
     #[test]

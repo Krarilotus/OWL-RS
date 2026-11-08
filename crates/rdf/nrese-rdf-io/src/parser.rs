@@ -242,7 +242,8 @@ impl RdfParser {
         parts: usize,
     ) -> Result<Vec<QuadParser<'_, io::Empty>>, RdfParseError> {
         if matches!(self.format, RdfFormat::Turtle | RdfFormat::TriG) {
-            let mut skimmer = Skimmer::new(bytes.len() as u64, parts);
+            let trig = self.format == RdfFormat::TriG;
+            let mut skimmer = Skimmer::new(bytes.len() as u64, parts, trig);
             skimmer.feed(bytes);
             let skim = skimmer.finish();
             let mut starts = vec![(0, 0, 0)];
@@ -292,7 +293,8 @@ impl RdfParser {
             // The skim reads the file once, in large pieces.
             let mut file = BufReader::with_capacity(1 << 20, File::open(path)?);
             let length = file.get_ref().metadata()?.len();
-            let mut skimmer = Skimmer::new(length, parts);
+            let trig = self.format == RdfFormat::TriG;
+            let mut skimmer = Skimmer::new(length, parts, trig);
             let mut buffer = vec![0_u8; 1 << 20];
             loop {
                 let read = file.read(&mut buffer)?;
