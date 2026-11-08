@@ -242,3 +242,81 @@ fn an_explicit_context_naming_the_default_graph_is_the_default_graph() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// On a fresh store, a graph write of one triple to `target`, then a delete of it: whether the
+/// write created a graph, where the triple went, and whether the graph exists afterwards (for
+/// a graph exists check and for a graph read).
+fn graph_target(target: &str) -> String {
+    use nrese_store::{GraphReadRequest, GraphWriteRequest, MutationCommitReport, ReadContext};
+    let service = StoreService::new(StoreConfig::in_memory()).unwrap();
+    let target = match target {
+        "DEFAULT" => GraphTarget::DefaultGraph,
+        named => GraphTarget::NamedGraph(named.replace("ex:", EX)),
+    };
+    let write = MutationCommand::GraphWrite(GraphWriteRequest {
+        target: target.clone(),
+        format: GraphResultFormat::NTriples,
+        base_iri: None,
+        payload: b"<http://example.com/w> <http://example.com/p> \"w\" .".to_vec(),
+        replace: false,
+    });
+    let created = match service.apply(&write, &Requester::all()).unwrap() {
+        MutationCommitReport::GraphWrite(report) => report.created,
+        other => unreachable!("{other:?}"),
+    };
+    let written = exported(&service);
+    service
+        .apply(
+            &MutationCommand::GraphDelete(target.clone()),
+            &Requester::all(),
+        )
+        .unwrap();
+    let exists = service.graph_exists(&ReadContext::all(), &target).unwrap();
+    let read = service
+        .execute_graph_read(
+            &ReadContext::all(),
+            &GraphReadRequest {
+                target,
+                format: GraphResultFormat::NTriples,
+            },
+        )
+        .unwrap()
+        .exists;
+    format!("created {created} | {written} | exists {exists} | read {read}")
+}
+
+/// Review r2, S3-F3 (rows failed on slice 3's 6794ab22): a graph target naming another store's
+/// default graph is the default graph for what a graph result says too: a write to it creates
+/// no graph, and it exists while empty. An ordinary named graph is created and is gone once
+/// empty (guard).
+#[test]
+fn a_graph_target_naming_the_default_graph_answers_as_the_default_graph() {
+    let rows = [
+        (
+            "DEFAULT",
+            "created false | DEFAULT:w | exists true | read true",
+        ),
+        (
+            "urn:x-arq:DefaultGraph",
+            "created false | DEFAULT:w | exists true | read true",
+        ),
+        (
+            "urn:x-rdflib:default",
+            "created false | DEFAULT:w | exists true | read true",
+        ),
+        ("ex:g", "created true | g:w | exists false | read false"),
+    ];
+    let mut failures = Vec::new();
+    for (target, expected) in rows {
+        let got = graph_target(target);
+        let ok = got == expected;
+        println!(
+            "{} target {target}: {got}",
+            if ok { "ok" } else { "FAILED" }
+        );
+        if !ok {
+            failures.push(format!("{target}: expected {expected}, got {got}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
