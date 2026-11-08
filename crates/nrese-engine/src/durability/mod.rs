@@ -188,7 +188,7 @@ impl Durable {
         // an open does costs it a journal commit and a device flush (timing of 8 Nov,
         // deferred-sync design note). A root made: every level now, as a new store pays once.
         let found = root.is_dir();
-        let holders: Vec<PathBuf> = match found {
+        let mut holders: Vec<PathBuf> = match found {
             true => place::holders(root)?,
             false => {
                 place::create_dir_all(root)?;
@@ -264,11 +264,20 @@ impl Durable {
 
         let wal_dir = wal::wal_dir(root);
         // Named in the root: the root's sync after replay (or before the first durable write)
-        // names them.
-        changed |= place::create_store_dir(&wal_dir)?;
+        // names them. One found may itself be a link to a directory elsewhere (review r1,
+        // R1-L1): the names its resolution reads (the link's holder, its target's chain) join
+        // the holders, under the same found-level rule, as the store's records live there.
+        let mut internal = |dir: &Path| -> EngineResult<bool> {
+            let made = place::create_store_dir(dir)?;
+            if !made {
+                holders.extend(place::holders(dir)?);
+            }
+            Ok(made)
+        };
+        changed |= internal(&wal_dir)?;
         let archive = config.wal_archive.then(|| wal::archive_dir(root));
         if let Some(archive) = &archive {
-            changed |= place::create_store_dir(archive)?;
+            changed |= internal(archive)?;
         }
         let segments = wal::list_segments(&wal_dir)?;
         let last = segments.len().checked_sub(1);
