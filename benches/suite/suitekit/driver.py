@@ -25,6 +25,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 from collections import defaultdict
 from pathlib import Path
 
@@ -221,6 +222,7 @@ class Suite:
         self.made_images: list[str] = []
         self.written: list[Result] = []
         self.hashed: dict[str, str | None] = {}  # /data input -> its SHA-256 (data_hashes)
+        self.built: dict[str, dict] = {}  # program -> the checkout it was built from in this run
         self.hash_s = 0.0
         self.skips: list[str] = []
         self.manifest: Manifest | None = None
@@ -293,6 +295,7 @@ class Suite:
             return True
         ctx = self.context_for_images()
         source = nrese.source(ctx)
+        self.built[nrese.key] = {k: v for k, v in checkout_state(Path(source)).items() if k in ("commit", "dirty")}
         self.say(f"building {nrese.key} (release) from {source}")
         log = self.results / "logs" / f"{nrese.key}-build-{self.stamp}.log"
         if self.args.runtime == "docker":
@@ -335,6 +338,7 @@ class Suite:
             self.say(f"--skip-build requires an existing harness: {self.harness()} (set HARNESS)")
             return False
         self.say("building the harness (release)")
+        self.built["harness"] = {k: v for k, v in checkout_state(self.root).items() if k in ("commit", "dirty")}
         log = self.results / "logs" / f"harness-build-{self.stamp}.log"
         rc = self.host_command(["bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked", "--quiet",
                                 "--manifest-path", "benches/nrese-bench-harness/Cargo.toml"], log)
@@ -847,12 +851,17 @@ class Suite:
                 if unavailable.get(id(plan)):
                     self.skip(key, plan, unavailable[id(plan)], regime, unsupported=False)
                 elif plan.kind == "kit":
-                    self.kit(plan, key)
                     kits.append(key)
                 elif plan.kind == "driver":
                     drivers.append(key)
                 else:
                     runnable.append((key, system, regime))
+            # Each cell's attempt, before any of its work: a run stopped from here on leaves the
+            # cell incomplete, never an older attempt's receipt in its place (review r1 R2).
+            cells = [(key, None) for key in kits + drivers] + [(key, system) for key, system, _ in runnable]
+            attempts = self.attempts(plan, cells)
+            for key in kits:
+                self.kit(plan, key)
             if drivers:
                 self.driver(plan, drivers)
             for run in range(1, self.args.runs + 1):
@@ -862,41 +871,88 @@ class Suite:
                     if self.runtime.workers():
                         return 1
             # The tier's cells ran their whole protocol: their receipts, now, so that a run
-            # stopped later keeps them (an interrupted tier writes none).
-            self.receipts(plan, [(key, None) for key in kits + drivers]
-                          + [(key, system) for key, system, _ in runnable])
+            # stopped later keeps them (an interrupted tier's attempts stay incomplete).
+            self.receipts(plan, cells, attempts)
         self.cross_check()
         self.report_skips()
         self.say(f"\nresults: {self.writer.path}")
         return 0
 
-    def receipts(self, plan, cells: list[tuple[str, object]]):
-        """The receipts (receipts.py) of a tier's cells that ran their whole protocol, into the
-        manifest: what each ran, its own rows' outcome."""
+    def attempts(self, plan, cells: list[tuple[str, object]]) -> dict[str, dict]:
+        """Each cell's attempt (receipts.py), into the manifest before its work starts."""
         if not self.manifest or self.args.dry_run or not cells:
+            return {}
+        started = datetime.datetime.now().isoformat(timespec="microseconds")
+        out = {receipts.cell_key(plan.workload, plan.tier, key): {"attempt": uuid.uuid4().hex, "started": started,
+                                                                    "complete": False} for key, _ in cells}
+        self.manifest.update(cells=out)
+        return out
+
+    def receipts(self, plan, cells: list[tuple[str, object]], attempts: dict[str, dict]):
+        """The receipts of a tier's cells that ran their whole protocol, each under its attempt:
+        what it ran, its own rows' outcome; its answers once the run has written them."""
+        if not attempts:
             return
         entry = self.manifest.entry
-        commit, kit = entry["git"].get("commit") or "", (self.workloads.get(plan.workload) or {}).get("kit", "")
+        commit = entry["git"].get("commit") or ""
         ctx = self.context_for_images()
+        pins = ns.pinned(self.root)  # the ids the containers ran (runtime.py), never a tag looked up again
+        child = plan.kind in ("kit", "driver")
         out = {}
         for key, system in cells:
-            paths = receipts.code_paths(self.root, plan, kit, system.definition_paths if system is not None else ())
-            images = sorted({*system.images(ctx), *(i for i, _ in system.builds())}) if system is not None else []
+            cell = receipts.cell_key(plan.workload, plan.tier, key)
             rows = [receipts.csv_row(r) for r in self.written
                     if (r.workload, r.tier, r.system) == (plan.workload, plan.tier, key)]
             pair = summarise(rows).get((plan.workload, plan.tier, key))
-            build = {}
-            if isinstance(system, Nrese):
-                state = checkout_state(Path(system.source(ctx)))
-                build = {"skipped": True} if self.args.skip_build else {"commit": state["commit"], "dirty": state["dirty"]}
-            out[receipts.cell_key(plan.workload, plan.tier, key)] = {
-                "complete": True, "invocation": entry["started"], "commit": commit, "dirty": entry["git"].get("dirty"),
-                "code": receipts.object_ids(self.root, commit, paths),
-                "images": {i: (entry.get("images") or {}).get(i) for i in images}, "build": build,
-                "settings": dict(entry.get("settings") or {}),
-                "data": self.data_hashes([i for i in plan.inputs_of(key) if i.startswith("/data/")]),
-                "outcome": pair.outcome() if pair else {"outcome": "skipped"}}
+            compiled = isinstance(system, Nrese) or plan.kind == "cycle"
+            mine = receipts.unknown(f"a {plan.kind} plan's: its child's, not recorded here")
+            out[cell] = {
+                **attempts[cell], "complete": True, "commit": commit, "dirty": entry["git"].get("dirty"),
+                "code": receipts.object_ids(self.root, commit, receipts.CODE_PATHS
+                                            + (receipts.BUILD_PATHS if compiled or child else ())),
+                "images": mine if child else {i: pins.get(i) or receipts.unknown("not in the run's pin map")
+                                              for i in sorted({*system.images(ctx), *(i for i, _ in system.builds())})},
+                "build": mine if child else self.build_receipt(system),
+                "settings": mine if child else dict(entry.get("settings") or {}),
+                "data": mine if child else self.data_receipt(plan, key),
+                "outcome": pair.outcome() if pair else {"outcome": "skipped"},
+                "answers": "pending" if self.answers else "not captured"}
         self.manifest.update(cells=out, data_hash_s=round(self.hash_s, 1))
+
+    def build_receipt(self, system) -> dict:
+        """What the cell's compiled programs were: built in this run from a checkout (its state when
+        the build started), or unknown (--skip-build: whatever binary was there)."""
+        out = {"harness": receipts.unknown("--skip-build: the harness that was there") if self.args.skip_build
+               else self.built.get("harness") or receipts.unknown("not built in this run")}
+        if isinstance(system, Nrese):
+            out["nrese"] = (receipts.unknown("--skip-build: the binary that was there") if self.args.skip_build
+                            else self.built.get(system.key) or receipts.unknown("not built in this run"))
+        return out
+
+    def data_receipt(self, plan, key: str) -> dict:
+        inputs = plan.inputs_of(key)
+        out = {i: receipts.unknown("outside the datasets: not hashed") for i in inputs if not i.startswith("/data/")}
+        out.update({i: digest or receipts.unknown("not there when hashed")
+                    for i, digest in self.data_hashes([i for i in inputs if i.startswith("/data/")]).items()})
+        if plan.external:
+            out["external"] = receipts.unknown("an external driver's programs and data: not recorded")
+        return out
+
+    def answer_receipts(self):
+        """The run's answers into its cells' receipts: each cell's worst verdict this run, after
+        answers.json is written (Recorder: this invocation's captures only)."""
+        if not self.manifest or not self.answers:
+            return
+        from .answers import PRECEDENCE
+        worst: dict[str, str] = {}
+        for v in self.answers.verdicts():
+            cell = receipts.cell_key(v["workload"], str(v["tier"]), v["system"])
+            if cell not in worst or PRECEDENCE.index(v["verdict"]) < PRECEDENCE.index(worst[cell]):
+                worst[cell] = v["verdict"]
+        cells = self.manifest.entry.get("cells") or {}
+        done = {cell: {**r, "answers": worst.get(cell, "not captured")} for cell, r in cells.items() if r.get("complete")}
+        if done:
+            self.manifest.update(cells=done)
 
     def data_hashes(self, inputs: list[str]) -> dict[str, str | None]:
         """/data input -> the SHA-256 of its bytes here (None: not there), each file hashed once a run:
@@ -1004,8 +1060,8 @@ def main(argv: list[str], systems: dict, workloads: dict, root: Path) -> int:
         if code:
             raise
     finally:
-        if suite.answers:
-            suite.runtime.attempt(lambda: print(f"answers: {suite.answers.write()}"))
+        if suite.answers and suite.runtime.attempt(lambda: print(f"answers: {suite.answers.write()}")):
+            suite.runtime.attempt(suite.answer_receipts)  # written: the receipts' answers are this run's
         suite.runtime.attempt(suite.cleanup)
         atexit.unregister(suite.cleanup)
         if suite.runtime.cleanup_errors and code == 0:

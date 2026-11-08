@@ -65,8 +65,9 @@ the same shape ([2026-10-11-horn-recovery.toml](2026-10-11-horn-recovery.toml) i
 `ok` out of those run. Records from before 3 October 2026 have `commit = "unknown (before
 run manifests)"` unless it was added by hand.
 
-From 8 November 2026 a pair can also carry `answers`, its worst answer verdict in the run's
-answers.json (`wrong` stands against counts that look right; never for a licensed system), and
-`receipt`, what the cell ran once it completed: its own invocation's commit, code, images, build,
-settings, data hashes and outcome (benches/suite/suitekit/receipts.py). A pair without a receipt
-didn't finish in that run, or predates them.
+From 8 November 2026 a pair can also carry `receipt`, its cell's newest attempt
+(benches/suite/suitekit/receipts.py): `complete = false` if that attempt didn't finish (an
+older finished one never stands in for it); else its own invocation's commit, code, images,
+build, settings, data hashes, outcome and answer verdict (`wrong` stands against counts that look
+right). What it couldn't evidence is `{ unknown = "why" }`. A licensed system's receipt holds
+no outcome or answers, whatever the outcome. A pair without a receipt predates them.
