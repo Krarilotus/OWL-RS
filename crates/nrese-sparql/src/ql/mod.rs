@@ -175,25 +175,12 @@ const LISTS: &[&str] = &[
     "owl_with_restrictions",
 ];
 
-/// The IRI of vocabulary field `field`; a field the vocabulary lacks fails the build.
-const fn field_iri(field: &str) -> &'static str {
-    let iris = nrese_owl::Vocabulary::IRIS;
-    let mut i = 0;
-    while i < iris.len() {
-        if same(iris[i].0, field) {
-            return iris[i].1;
-        }
-        i += 1;
-    }
-    panic!("not a field of nrese_owl::Vocabulary")
-}
-
-/// [`LISTS`]' IRIs.
+/// [`LISTS`]' IRIs; a field the vocabulary lacks fails the build.
 const LIST_IRIS: [&str; LISTS.len()] = {
     let mut out = [""; LISTS.len()];
     let mut i = 0;
     while i < LISTS.len() {
-        out[i] = field_iri(LISTS[i]);
+        out[i] = nrese_owl::Vocabulary::iri(LISTS[i]);
         i += 1;
     }
     out
@@ -783,11 +770,11 @@ fn expressions_of(snapshot: &Snapshot, core: &[nrese_owl::Statement]) -> Vec<u64
     // The mapping's own markers, those it can't read included (an n-ary or a malformed
     // restriction), so the memberships of every node it would read as a class expression
     // reach it, and it reports what it can't read (I24c-2 review r1, F2; r2, F5).
-    let vocabulary = nrese_owl::Vocabulary::new(&|iri| named(snapshot, iri).map(TermId::raw));
-    let markers = nrese_owl::mapping::ClassExpressionMarkers::of(&vocabulary);
+    let id_of = |iri: &str| named(snapshot, iri).map(TermId::raw);
+    let markers = nrese_owl::mapping::ClassExpressionMarkers::lookup(&id_of);
     let operators = markers.properties();
     let types: Vec<u64> = markers.types.into_iter().flatten().collect();
-    let rdf_type = vocabulary.rdf_type;
+    let rdf_type = id_of(const { nrese_owl::Vocabulary::iri("rdf_type") });
     let mut out: Vec<u64> = core
         .iter()
         .filter(|s| {
