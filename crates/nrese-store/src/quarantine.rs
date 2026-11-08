@@ -461,28 +461,26 @@ impl Quarantine {
     /// Records `resolution`: appended to the log, then in effect.
     fn record(&self, resolution: Resolution) -> StoreResult<()> {
         if let Some(dir) = &self.dir {
-            // Durably named, the directory and the log the first time it is made (DUR-3): the
-            // quarantine reads them at open.
+            // Durably named, the directory and the log (DUR-3): the quarantine reads them at
+            // open. The directory is synced after every append, not only when the log is made: a
+            // log made by a call whose sync then failed is in place but not known durable, and
+            // the next call must not take it for so (fix check r1, R2-F1).
             nrese_engine::place::create_dir_all(dir)?;
-            let path = dir.join(RESOLUTIONS);
-            let new = !path.exists();
             let mut log = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&path)?;
+                .open(dir.join(RESOLUTIONS))?;
             let line = serde_json::to_string(&resolution).expect("a resolution serialises");
             log.write_all(format!("{line}\n").as_bytes())?;
             log.sync_data()?;
-            if new {
-                #[cfg(test)]
-                if tests::FAIL_LOG_DIR_SYNC.get() {
-                    return Err(std::io::Error::other(
-                        "the quarantine's directory sync failed (a test's)",
-                    )
-                    .into());
-                }
-                nrese_engine::place::sync_dir(dir)?;
+            #[cfg(test)]
+            if tests::FAIL_LOG_DIR_SYNC.get() {
+                return Err(std::io::Error::other(
+                    "the quarantine's directory sync failed (a test's)",
+                )
+                .into());
             }
+            nrese_engine::place::sync_dir(dir)?;
         }
         self.state()
             .resolutions
