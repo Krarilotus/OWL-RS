@@ -143,9 +143,8 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     let (earlier_failures, held_before) = validator_before.into_failures()?;
     drop(earlier_failures);
     let raw: Vec<RawResult> = introduced.into_iter().collect();
-    let report = decode(after, shapes, &raw, failures, resources);
-    // The raw results are freed, then their charges returned.
-    drop(raw);
+    // The raw results are freed as they are decoded, then their charges returned.
+    let report = decode(after, shapes, raw, failures, resources);
     drop((held_after, held_before));
     report
 }
@@ -195,9 +194,8 @@ pub fn validate_shapes_change<A: ReadView + Sync, B: ReadView + Sync>(
         drop(held_before);
         later = kept?;
     }
-    let report = decode(after, shapes_after, &later, failures, resources);
-    // The raw results are freed, then their charge returned.
-    drop(later);
+    // The raw results are freed as they are decoded, then their charge returned.
+    let report = decode(after, shapes_after, later, failures, resources);
     drop(held_after);
     report
 }

@@ -7,7 +7,7 @@ use std::ops::ControlFlow;
 use std::sync::{Arc, OnceLock};
 
 use nrese_engine::{TermId, TermKind};
-use nrese_exec::Reservation;
+use nrese_exec::{Budget, Reservation};
 use nrese_rdf::{BlankNode, NamedNode, NamedOrBlankNode, Term, Triple};
 use nrese_sparql::value::{Value, compare, lang_matches};
 use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
@@ -177,6 +177,33 @@ pub(crate) struct Failures {
 /// What a validation keeps ([`Validator::into_failures`]): its results, its failures with
 /// their charge, and the results' charge (free the results, then drop it).
 pub(crate) type Kept = (Vec<RawResult>, Failures, Reservation);
+
+/// The results one task keeps ([`Validator::validate_all`]), with their charge: the task's
+/// own, so the tasks of a validation charge without sharing a lock. The fields drop in this
+/// order: the results are freed, then their charge returned.
+pub(crate) struct TaskResults {
+    list: Vec<RawResult>,
+    held: Reservation,
+}
+
+impl TaskResults {
+    fn new(budget: &Arc<Budget>) -> Self {
+        Self {
+            list: Vec::new(),
+            held: Reservation::new(Arc::clone(budget)),
+        }
+    }
+
+    /// Drops the results from `start` on, then returns their charge.
+    fn truncate(&mut self, start: usize) {
+        let dropped: usize = self.list[start..]
+            .iter()
+            .map(RawResult::retained_bytes)
+            .sum();
+        self.list.truncate(start);
+        self.held.release(dropped);
+    }
+}
 
 /// Validates the data in `data` against every targeted shape: the results, and the
 /// failures (SPARQL-based constraints that couldn't be evaluated), with their charge to
@@ -358,9 +385,11 @@ pub(crate) struct Validator<'a, V: ReadView> {
     /// The charge, to the request's envelope, for the failures kept: made before each is
     /// kept; it goes with them ([`Failures`]). Declared after them: freed, then returned.
     held_failures: std::sync::Mutex<Reservation>,
-    /// The charge for the results kept: made before each is kept, held until they are
-    /// dropped ([`Validator::keep`]).
+    /// The charge for the results kept: made before each is kept, by its task
+    /// ([`TaskResults`]), and taken over here when the task ends; held until they are dropped.
     held_results: std::sync::Mutex<Reservation>,
+    /// The budget the results are charged to (`held_results`' and the tasks').
+    results_budget: Arc<Budget>,
     /// Whether failures are kept: not where they are thrown away ([`validate_raw_results`]),
     /// so they are neither made nor charged there.
     keep_failures: bool,
@@ -445,6 +474,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
         keep_failures: bool,
     ) -> Self {
         let graph = GraphView::new(view, data);
+        let results_budget = Arc::new(resources.memory.part());
         let mut validator = Self {
             rdf_type: graph.iri(RDF_TYPE),
             graph,
@@ -455,9 +485,8 @@ impl<'a, V: ReadView> Validator<'a, V> {
             held_failures: std::sync::Mutex::new(Reservation::new(Arc::new(
                 resources.memory.part(),
             ))),
-            held_results: std::sync::Mutex::new(Reservation::new(Arc::new(
-                resources.memory.part(),
-            ))),
+            held_results: std::sync::Mutex::new(Reservation::new(Arc::clone(&results_budget))),
+            results_budget,
             keep_failures,
             frontier: None,
             compares: false,
@@ -665,12 +694,6 @@ impl<'a, V: ReadView> Validator<'a, V> {
         self.stop.get().is_some()
     }
 
-    /// Charges `bytes` for a result to the request's envelope, or records its refusal as
-    /// the stop.
-    fn charge(&self, bytes: usize) -> bool {
-        charge_to(&self.held_results, &self.stop, bytes)
-    }
-
     /// Returns `bytes` charged for results that have been dropped.
     pub(crate) fn release(&self, bytes: usize) {
         self.held_results
@@ -679,11 +702,30 @@ impl<'a, V: ReadView> Validator<'a, V> {
             .release(bytes);
     }
 
-    /// Keeps `result` in `results`, charged first; a refusal is the validation's stop.
-    fn keep(&self, results: &mut Vec<RawResult>, result: RawResult) {
-        if self.charge(result.retained_bytes()) {
-            results.push(result);
+    /// Keeps `result` in `results`, charged first to the task's own reservation (no lock); a
+    /// refusal is the validation's stop.
+    fn keep(&self, results: &mut TaskResults, result: RawResult) {
+        match results.held.charge(result.retained_bytes()) {
+            Ok(()) => results.list.push(result),
+            Err(refused) => {
+                let _ = self.stop.set(QueryEvaluationError::MemoryLimit(refused));
+            }
         }
+    }
+
+    /// A task's results, its charge taken over by the validation's (one lock a task): the
+    /// charge is never returned in between, so the results stay charged throughout.
+    fn adopt(&self, task: TaskResults) -> Vec<RawResult> {
+        let TaskResults { list, held } = task;
+        let bytes = held.transfer();
+        let mut shared = self
+            .held_results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let empty = Reservation::new(Arc::clone(&self.results_budget));
+        let total = std::mem::replace(&mut *shared, empty).transfer() + bytes;
+        *shared = Reservation::adopt(Arc::clone(&self.results_budget), total);
+        list
     }
 
     /// Whether the validation has stopped: a stop was met, or the cancellation fires now
@@ -702,7 +744,8 @@ impl<'a, V: ReadView> Validator<'a, V> {
     }
 
     /// The results of validating each `(shape, focus node)` of `work`, in that order: in
-    /// parallel, a few dozen nodes per task.
+    /// parallel, a few dozen nodes per task, each task charging its own reservation, taken
+    /// over by the validation's when it ends ([`Validator::adopt`]).
     pub(crate) fn validate_all(&self, work: &[(ShapeRef, TermId)]) -> Vec<RawResult>
     where
         V: Sync,
@@ -710,11 +753,15 @@ impl<'a, V: ReadView> Validator<'a, V> {
         use rayon::prelude::*;
         work.par_iter()
             .with_min_len(32)
-            .flat_map_iter(|&(shape, focus)| {
-                let mut results = Vec::new();
-                self.validate_node(shape, focus, &mut results, &mut Vec::new());
-                results
-            })
+            .fold(
+                || TaskResults::new(&self.results_budget),
+                |mut task, &(shape, focus)| {
+                    self.validate_node(shape, focus, &mut task, &mut Vec::new());
+                    task
+                },
+            )
+            .map(|task| self.adopt(task))
+            .flat_map_iter(|list| list)
             .collect()
     }
 
@@ -755,21 +802,17 @@ impl<'a, V: ReadView> Validator<'a, V> {
 
     /// Whether `node` conforms to `shape`: validating it produces no result.
     fn conforms(&self, shape: ShapeRef, node: TermId, stack: &mut Stack) -> bool {
-        let mut results = Vec::new();
+        let mut results = TaskResults::new(&self.results_budget);
         self.validate_node(shape, node, &mut results, stack);
-        let conforms = results.is_empty();
-        // Only their existence counts: they are dropped, then their charge returned.
-        let charged: usize = results.iter().map(RawResult::retained_bytes).sum();
-        drop(results);
-        self.release(charged);
-        conforms
+        // Only their existence counts: dropped, they are freed, then their charge returned.
+        results.list.is_empty()
     }
 
     pub(crate) fn validate_node(
         &self,
         shape_ref: ShapeRef,
         focus: TermId,
-        results: &mut Vec<RawResult>,
+        results: &mut TaskResults,
         stack: &mut Stack,
     ) {
         // Every validation of a node against a shape, nested ones included, looks at the
@@ -843,7 +886,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
         focus: TermId,
         values: &[TermId],
         constraint: &Constraint,
-        results: &mut Vec<RawResult>,
+        results: &mut TaskResults,
         stack: &mut Stack,
     ) {
         let shape = &self.shapes.shapes[shape_ref];
@@ -1070,7 +1113,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
         focus: TermId,
         values: &[TermId],
         check: &SparqlCheck,
-        results: &mut Vec<RawResult>,
+        results: &mut TaskResults,
     ) {
         let shape = &self.shapes.shapes[shape_ref];
         let (view, data) = self.graph.parts();
@@ -1144,7 +1187,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                     // Each solution is decoded, made a result (by id) and dropped before the
                     // next: only the kept results, charged, stay. An evaluation error part way
                     // makes the combination a failure with no results, as when it was read whole.
-                    let start = results.len();
+                    let start = results.list.len();
                     for solution in solutions {
                         if self.stopped() {
                             return ControlFlow::Break(());
@@ -1156,10 +1199,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                                 return ControlFlow::Break(());
                             }
                             Err(sparql::Problem::Failed(error)) => {
-                                let dropped: usize =
-                                    results[start..].iter().map(RawResult::retained_bytes).sum();
                                 results.truncate(start);
-                                self.release(dropped);
                                 failure(&error);
                                 break;
                             }
