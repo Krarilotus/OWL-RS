@@ -1740,6 +1740,276 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// What the store's reader passes to the mapping, and what the mapping drops, can't hide an
+/// answer behind a `complete` status (I24c-2; master, 09:39 and 09:41). Each case under
+/// owl2-ql and owl2-rl, the QL rewriting on.
+///
+/// Answered true, or not reported `complete`:
+/// - `C ⊑ ∃d.integer[≥ 5]` with `c : C`: `c` has a `d` value. The data range's facets
+///   (`owl:onDatatype`, `owl:withRestrictions`, `xsd:minInclusive`) are vocabulary the
+///   mapping reads.
+/// - `c owl:sameAs e`, `e : D`: `c : D`. The QL closure has no equality rules.
+/// - Review r1 F3 (owl2-ql): the same beside `rdf:type owl:sameAs :discarded`, which the
+///   mapping leaves out and which comes first in scan order.
+///
+/// With their exact rows, not reported `complete` (review r1, F4: rows first). The mapping
+/// drops each structure, and a dropped axiom can't support the claim either way:
+/// - a malformed schema statement, a restriction without its filler: `C` is `c`;
+/// - review r1 F2, restrictions asserted of `c` directly: an n-ary data restriction
+///   (`owl:onProperties`), and one with no property: `Z` is `z`.
+///
+/// With their exact rows, still `complete` (guards):
+/// - a restriction no individual is in, which says nothing: `Z` is `z`;
+/// - an irreflexive, asymmetric property, which the reader now reads and which adds no
+///   fact: the `p` edges are `c`'s.
+#[test]
+fn schema_the_reader_or_the_mapping_leaves_out_is_reported() {
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n"
+    );
+    let answered = [
+        (
+            format!(
+                "{head}:d a owl:DatatypeProperty .
+                 :C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :d ;
+                     owl:someValuesFrom [ a rdfs:Datatype ; owl:onDatatype xsd:integer ;
+                         owl:withRestrictions ( [ xsd:minInclusive 5 ] ) ] ] .
+                 :c a :C ."
+            ),
+            format!("ASK {{ <{E}c> <{E}d> ?v }}"),
+        ),
+        (
+            format!("{head}:c owl:sameAs :e . :e a :D ."),
+            format!("ASK {{ <{E}c> a <{E}D> }}"),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (n, (turtle, query)) in answered.iter().enumerate() {
+        for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(turtle, dir.path(), ruleset, true);
+            let result = store
+                .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                .unwrap_or_else(|e| panic!("case {n}, {query}: {e}"));
+            let answer = String::from_utf8(result.payload).unwrap();
+            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+            if !answer.contains("true") && matches!(status, "complete" | "none") {
+                wrong.push(format!(
+                    "case {n}, {}, {query}: {answer}, {status}",
+                    ruleset.name()
+                ));
+            }
+        }
+    }
+    // Review r1 F3, under owl2-ql: the reader's equality may not rest on one sampled
+    // statement. Here the first `owl:sameAs` in scan order is `rdf:type owl:sameAs
+    // :discarded`, which the mapping leaves out (a reserved name); `c = e` must still count.
+    // The red proof shows that this ordering holds on the parent.
+    let reserved_first = format!(
+        "{head}<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> owl:sameAs :discarded .
+         :c owl:sameAs :e . :e a :D ."
+    );
+    let query = format!("ASK {{ <{E}c> a <{E}D> }}");
+    let dir = tempfile::tempdir().unwrap();
+    let reserved_store = store(&reserved_first, dir.path(), Ruleset::Owl2Ql, true);
+    // Its precondition (review r2, F6): the first asserted `owl:sameAs` in the snapshot's
+    // scan, the one a reader sampling one statement took, is the reserved one.
+    {
+        use nrese_engine::{GraphSelector, QuadPattern, ReadModel};
+        use nrese_rdf::NamedNodeRef;
+        let snapshot = reserved_store.read_snapshot(None).unwrap();
+        let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
+        let same_as = id("http://www.w3.org/2002/07/owl#sameAs").expect("owl:sameAs");
+        let first = snapshot
+            .quads_for_pattern_in(
+                ReadModel::Asserted,
+                &QuadPattern {
+                    subject: None,
+                    predicate: Some(same_as),
+                    object: None,
+                    graph: GraphSelector::Any,
+                },
+            )
+            .next()
+            .expect("an equality");
+        assert_eq!(
+            Some(first.subject),
+            id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            "the reserved equality comes first in scan order"
+        );
+    }
+    let result = reserved_store
+        .execute_query(&SparqlQueryRequest::all(query.as_str()))
+        .unwrap();
+    let answer = String::from_utf8(result.payload).unwrap();
+    let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+    if !answer.contains("true") && matches!(status, "complete" | "none") {
+        wrong.push(format!(
+            "reserved sameAs first, owl2-ql, {query}: {answer}, {status}"
+        ));
+    }
+    // Each with its specified rows, compared before its status (review r1, F4), and whether
+    // it must be `complete` (a guard) or must not be.
+    let z = format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}");
+    let rows_cases = [
+        // A malformed schema statement, a restriction without its filler.
+        (
+            "malformed",
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ] .
+                 :c a :C ."
+            ),
+            format!("SELECT ?x WHERE {{ ?x a <{E}C> }}"),
+            vec![format!("x={E}c")],
+            false,
+        ),
+        // Review r1 F2: restrictions asserted of an individual directly, which the mapping
+        // can't read: an n-ary data restriction, and one with no property.
+        (
+            "onProperties",
+            format!(
+                "{head}:z a :Z . :c a _:r .
+                 _:r a owl:Restriction ; owl:onProperties ( :d ) ; owl:someValuesFrom rdfs:Literal ."
+            ),
+            z.clone(),
+            vec![format!("x={E}z")],
+            false,
+        ),
+        (
+            "no property",
+            format!("{head}:z a :Z . :c a [ a owl:Restriction ; owl:someValuesFrom :D ] ."),
+            z.clone(),
+            vec![format!("x={E}z")],
+            false,
+        ),
+        // Guards. A structure no individual is in says nothing: still `complete`.
+        (
+            "unreferenced",
+            format!("{head}:z a :Z . [ a owl:Restriction ; owl:someValuesFrom :D ] ."),
+            z,
+            vec![format!("x={E}z")],
+            true,
+        ),
+        // An irreflexive or asymmetric property, read now, rules pairs out and adds no fact
+        // (OWL2Bench-QL's `isAffiliatedOrganizationOf`).
+        (
+            "irreflexive",
+            format!(
+                "{head}:p a owl:ObjectProperty, owl:IrreflexiveProperty, owl:AsymmetricProperty .
+                 :c :p :d ."
+            ),
+            format!("SELECT ?x WHERE {{ ?x <{E}p> ?y }}"),
+            vec![format!("x={E}c")],
+            true,
+        ),
+    ];
+    for (name, turtle, query, expected, complete) in rows_cases {
+        for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(&turtle, dir.path(), ruleset, true);
+            let result = store
+                .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                .unwrap();
+            let rows = select_rows(&result.payload);
+            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+            let claimed = matches!(status, "complete" | "none");
+            if rows != expected {
+                wrong.push(format!(
+                    "{name}, {}, {query}: {rows:?}, expected {expected:?}",
+                    ruleset.name()
+                ));
+            } else if claimed != complete {
+                wrong.push(format!(
+                    "{name}, {}, {query}: {status}, expected complete: {complete}",
+                    ruleset.name()
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A SELECT's rows (SPARQL JSON results), each `var=value` sorted by variable, sorted.
+fn select_rows(payload: &[u8]) -> Vec<String> {
+    let json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    let mut rows: Vec<String> = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|row| {
+            let mut cells: Vec<String> = row
+                .as_object()
+                .expect("a row")
+                .iter()
+                .map(|(var, v)| format!("{var}={}", v["value"].as_str().unwrap_or("")))
+                .collect();
+            cells.sort();
+            cells.join(" ")
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Review r1 F1 (I24c-2): an equality the reader may not read still keeps `complete` from
+/// being claimed under owl2-ql, but no name of it reaches the reader. `:privateA owl:sameAs
+/// :privateB` is in a graph the reader can't read; `:public a :C` in the default graph,
+/// which it can. The answer is exactly `:public`, and neither private name is in the
+/// completeness reasons or header, on a fresh preparation and on a cached one.
+#[test]
+fn an_unreadable_equality_names_no_individual() {
+    use std::sync::Arc;
+
+    use nrese_sparql::GraphAccess;
+    use nrese_store::{ReadScope, SparqlUpdateRequest};
+
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: nrese_store::QlRewritingMode::On,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
+    store
+        .execute_update(&SparqlUpdateRequest::new(
+            "PREFIX ex: <http://e/> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             INSERT DATA {
+                ex:public a ex:C .
+                GRAPH ex:secret { ex:privateA owl:sameAs ex:privateB }
+             }",
+        ))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Ql).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Ql.into()));
+    let scope = ReadScope::Graphs(Arc::new(GraphAccess {
+        graphs: vec!["http://e/open".to_owned()],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..GraphAccess::default()
+    }));
+    for run in ["fresh", "cached"] {
+        let request =
+            SparqlQueryRequest::new("SELECT ?x WHERE { ?x a <http://e/C> }", scope.clone());
+        let result = store.execute_query(&request).unwrap();
+        assert_eq!(
+            select_rows(&result.payload),
+            vec!["x=http://e/public".to_owned()],
+            "{run}: rows"
+        );
+        let mut said = Vec::new();
+        if let Some(c) = &result.completeness {
+            said.push(c.header());
+            said.extend(c.reasons.iter().map(|r| r.text.clone()));
+        }
+        if let Some(ql) = &result.ql {
+            said.extend(ql.completeness.reasons.iter().map(|r| r.text.clone()));
+        }
+        let leaked: Vec<&String> = said.iter().filter(|s| s.contains("private")).collect();
+        assert!(leaked.is_empty(), "{run}: {leaked:?}");
+    }
+}
+
 /// A rewritten query reads only what its reader may (design §1), and uses the schema as
 /// the RL closure the reader sees was computed: a reader who sees the inferences its graphs
 /// support (`inferred = "supported"`) gets the existentials of readable graphs only, one who
