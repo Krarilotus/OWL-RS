@@ -335,19 +335,32 @@ class Suite:
         """Where the image with this id came from, read off that id (the one the run's containers
         run, its pin), never off a tag that may name another by now (P1b review r1 F1): its build
         label; or, for a tag with a digest pin (images.toml), "pulled, pinned DIGEST" when that id
-        holds the pin (P1c); else unknown, with why."""
+        holds the pin (P1c); else unknown, with why. Unreadable is unknown with its reason, never an
+        exception: a receipt is written on a host without docker too (#161's Windows gate,
+        gate-windows-59532fff57-1794140734)."""
         if (image, image_id) not in self.image_sources:
+            self.image_sources[(image, image_id)] = self._image_source(image, image_id)
+        return self.image_sources[(image, image_id)]
+
+    def _image_source(self, image: str, image_id: str):
+        try:
             label = run_quiet(["docker", "image", "inspect", "--format",
                                f'{{{{index .Config.Labels "{IMAGE_LABEL}"}}}}', image_id])
-            found = (label.stdout.strip() if label.returncode == 0 else "").replace("<no value>", "")
-            pin = image_pins(self.root).get(image)
-            held = repo_digests(image_id)
-            self.image_sources[(image, image_id)] = (
-                f"built from {found}" if found else
-                f"pulled, pinned {pin}" if pin and pin in held else
-                receipts.unknown(f"pulled: its digests ({', '.join(sorted(held)) or 'none'}) aren't its pin {pin}")
-                if pin else receipts.unknown("no build label and no digest pin (benches/suite/images.toml)"))
-        return self.image_sources[(image, image_id)]
+        except OSError as error:
+            return receipts.unknown(f"docker not available: {error}")
+        if label.returncode != 0:
+            said = (label.stderr or label.stdout or "").strip().splitlines()
+            return receipts.unknown(f"docker image inspect failed (exit {label.returncode}): "
+                                    f"{said[-1] if said else 'no output'}")
+        found = label.stdout.strip().replace("<no value>", "")
+        if found:
+            return f"built from {found}"
+        pin = image_pins(self.root).get(image)
+        if not pin:
+            return receipts.unknown("no build label and no digest pin (benches/suite/images.toml)")
+        held = repo_digests(image_id)
+        return (f"pulled, pinned {pin}" if pin in held else
+                receipts.unknown(f"pulled: its digests ({', '.join(sorted(held)) or 'none'}) aren't its pin {pin}"))
 
     def build_nrese(self, nrese) -> bool:
         """Builds an NRESE server (`nrese` or `nrese-oxigraph`) from its source tree."""
@@ -1119,7 +1132,10 @@ def repository(image: str) -> str:
 
 def repo_digests(image: str) -> set[str]:
     """The registry digests a local image (tag or id) holds (`docker image inspect` RepoDigests)."""
-    done = run_quiet(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image])
+    try:
+        done = run_quiet(["docker", "image", "inspect", "--format", "{{json .RepoDigests}}", image])
+    except OSError:  # no docker here: it holds none
+        return set()
     try:
         return {d.rpartition("@")[2] for d in json.loads(done.stdout or "[]") or []} if done.returncode == 0 else set()
     except ValueError:
