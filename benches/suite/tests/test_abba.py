@@ -100,6 +100,35 @@ class Abba(unittest.TestCase):
         code, text, _ = abba.report(self.family, list(rounds))
         return code, text
 
+    def test_hypotheses_nothing_compared_never_read_as_no_loss(self):
+        """SHACL lead, 8 Nov 2026 (orchestrator 04:31): A's answers differ from the pinned ones and B's
+        match, so the gate takes neither side's time there (release_gate.compare_case, not_compared);
+        the report decided over no test at all and said "No loss shown (exit 0)", its rows `- | 1 | -`.
+        It names each hypothesis not compared and why, with B's own numbers, and never exits 0."""
+        pinned = {"q01-point-lookup": 5, "q06-text-filter": 1033}
+        for wrong in ({"q01-point-lookup": 4, "q06-text-filter": 1000}, {"q01-point-lookup": 4}):
+            with self.subTest(wrong=sorted(wrong)):
+                base = records()
+
+                def records_of(side, n):
+                    out = base(side, n)
+                    for o in out[0]["observations"]:
+                        o["rows"] = dict(pinned) if side == "b" else {**pinned, **wrong}
+                    return out
+                code, text = self.verdict(self.round_(records_of, name=f"r-{len(wrong)}"))
+                self.assertNotEqual(code, abba.NO_LOSS)
+                self.assertNotIn("No loss shown", text)
+                self.assertEqual(code, abba.NOT_COMPARED)
+                self.assertIn(f"{len(wrong)} of 2 hypotheses not compared", text)
+                for s in wrong:
+                    row = next(line for line in text.splitlines() if line.startswith(f"| lab-olympics / time/{s} |"))
+                    self.assertIn("not compared: answers differ from a's", row)
+                    self.assertRegex(row, r"B \d+(\.\d+)? ms")
+                for s in set(pinned) - set(wrong):  # the other one tested, as before: its ratio and p
+                    row = next(line for line in text.splitlines() if line.startswith(f"| lab-olympics / time/{s} |"))
+                    self.assertNotIn("not compared", row)
+                    self.assertNotIn("| - | - |", row)
+
     def test_missing_evidence_is_no_verdict_never_a_pass(self):
         self.assertEqual(self.verdict(self.round_(records()))[0], abba.NO_LOSS)
         cases = [("a slot missing", dict(drop=lambda p: p["n"] == 9)),

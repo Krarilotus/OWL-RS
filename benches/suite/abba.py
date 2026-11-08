@@ -41,7 +41,10 @@ Every case needs a content check (`check`): a run whose check fails, on any side
 
 Exit codes of report: 0 no loss shown; 1 a loss shown, a confirmation round due (jobs --round 2);
 2 the family is invalid; 3 no verdict (evidence missing, incomplete or failed, or the A-A' arm
-itself differs); 4 a confirmed loss (Holm over the family, the rounds combined).
+itself differs); 4 a confirmed loss (Holm over the family, the rounds combined); 5 not compared:
+the round ran and is complete, but some hypotheses have no test, each for a stated reason (A's
+answer differs from the pinned one, a metric A doesn't report) and no loss shows on the rest. Not
+a pass, and not 3: running it again gives the same, the reason needs a decision.
 """
 from __future__ import annotations
 
@@ -69,7 +72,7 @@ spec.loader.exec_module(rg)
 
 SIDES = ("a", "a2", "b")  # A, A' (A's build, another copy), B: the palindrome's order
 MIN_BLOCKS = 3  # one whole Latin square of A, A' and B; a family may ask for more (owner, 20 Oct 2026)
-NO_LOSS, LOSS_SHOWN, INVALID, NO_VERDICT, CONFIRMED = 0, 1, 2, 3, 4
+NO_LOSS, LOSS_SHOWN, INVALID, NO_VERDICT, CONFIRMED, NOT_COMPARED = 0, 1, 2, 3, 4, 5
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 REV = re.compile(r"^[0-9a-f]{7,40}$")
 # A family carried in a job's environment (`run`, and `jobs` of a family of registry cases): its
@@ -484,7 +487,28 @@ def judge(family: dict, results: Path) -> tuple[list[str], dict | None, dict | N
     ab = rg.gate(of("a", "b"), {"b": family["sides"]["b"], "a": a}, "b", ["a"], harness, family["blocks"],
                  catalog=catalog, context=context, family=family["hypotheses"], floor=floor)
     problems += ab["errors"] + ab["blocking"]
+    # B's own numbers where a hypothesis wasn't compared: what was measured, though nothing was tested.
+    ab["b_numbers"] = {h: b_number(of("b"), h) for h in ab.get("not_compared") or {}}
     return problems, aa, ab, host
+
+
+def b_number(passes: list[dict], hypothesis: str) -> str:
+    """A side's median (time, qps) or peak (memory) of one hypothesis's dimension over its passes."""
+    import statistics
+    _, case, d = hypothesis.split("|", 2)
+    e = rg.evidence(passes, case)
+    kind, _, sub = d.partition("/")
+    if kind == "time":
+        key = "process" if "process-p50" in e["estimator"] else "samples"
+        values, unit = [v for rep in e[key] for v in rep.get(sub) or []], "ms"
+    elif kind == "qps":
+        values, unit = [v for rep in e["qps"] for v in rep.get(sub) or []], "qps"
+    elif d in ("memory/anon_kernel", "memory/live"):
+        values, unit = [v for v in e[sub] if v is not None], "bytes"
+        return f"B {rg.fmt(max(values))} {unit} peak" if values else "B: none"
+    else:
+        return "B: -"
+    return f"B {rg.fmt(statistics.median(values))} {unit}" if values else "B: none"
 
 
 def rounds_errors(rounds: list[Path]) -> list[str]:
@@ -551,10 +575,21 @@ def report(family: dict, rounds: list[Path]) -> tuple[int, str, dict]:
         return NO_VERDICT, "\n".join(lines), out
     decided = rg.decide([[ab for _, _, ab, _ in judged]])
     out["decided"] = {k: decided[k] for k in ("losses", "pending", "m")}
+    # A hypothesis the gate didn't test in some round, for its stated reason: no part of a pass
+    # (SHACL lead, 8 Nov 2026: every hypothesis untested, decided over none, read "no loss").
+    untested = {h: ab["not_compared"][h] for _, _, ab, _ in judged for h in family["hypotheses"]
+                if h in (ab.get("not_compared") or {})}
+    out["not_compared"] = untested
+    m = len(family["hypotheses"])
     if decided["losses"]:
         code, word = CONFIRMED, "**Confirmed loss** (exit 4): Holm over the family rejects, the rounds combined"
     elif decided["pending"]:
         code, word = LOSS_SHOWN, "**Loss shown** (exit 1): a confirmation round is due (abba.py jobs --round 2)"
+    elif untested:
+        code, word = NOT_COMPARED, (f"**Not compared** (exit 5): {len(untested)} of {m} hypotheses not compared "
+                                    "(below, with why), " + ("none tested" if len(untested) == m else
+                                                             f"no loss shown on the other {m - len(untested)}")
+                                    + ": not a pass")
     else:
         code, word = NO_LOSS, "**No loss shown** (exit 0)"
     out["exit"] = code
@@ -563,6 +598,10 @@ def report(family: dict, rounds: list[Path]) -> tuple[int, str, dict]:
         lines += [f"## Round {k}", "", "| hypothesis | ratio | p | status |", "|---|---|---|---|"]
         for h in family["hypotheses"]:
             _, case, d = h.split("|", 2)
+            if h in (ab.get("not_compared") or {}):
+                lines.append(f"| {case} / {d} | - | - | not compared: {ab['not_compared'][h]}; "
+                             f"{ab['b_numbers'].get(h, 'B: -')} |")
+                continue
             r = ab["comparisons"]["a"][case]["dimensions"].get(d, {})
             lines.append(f"| {case} / {d} | {rg.fmt(r.get('ratio'))} | {r.get('p', 1.0):.3g} | {r.get('status', '-')} |")
         lines += ["", f"Floor: {ab['policy'].get('floor')}.", ""]
