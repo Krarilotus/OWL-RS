@@ -518,6 +518,102 @@ fn a_group_is_read_wherever_the_kernel_shows_it() {
     ]);
 }
 
+/// An ancestor reached on a view's own mount is read, whatever is bound over the group's entry
+/// in it (sol-loop r7 S1): a launcher binds the process's group /limited/worker (4 GiB) over
+/// itself, and /limited (1 GiB) is reached through the full tree. And a view whose way the
+/// kernel refuses may show a limit that applies (r7 S2): the full tree at /x/cg behind a
+/// refused /x, the group bound at /cg-local, is unknown, never the group's 4 GiB alone. Each
+/// group uses 512 MiB.
+#[test]
+fn a_reached_ancestor_is_read_and_a_refused_view_is_unknown() {
+    let (one, four, half) = (G.to_string(), (4 * G).to_string(), (G / 2).to_string());
+    let (one, four, half) = (one.as_str(), four.as_str(), half.as_str());
+    const SELF_BOUND: &str = concat!(
+        root!(),
+        "30 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+        "40 30 0:26 /limited/worker /sys/fs/cgroup/limited/worker rw - cgroup2 cgroup2 rw\n"
+    );
+    let self_bound = vec![
+        ("/proc/self/mountinfo", SELF_BOUND),
+        ("/proc/self/cgroup", "0::/limited/worker"),
+        ("/sys/fs/cgroup/limited/cgroup.controllers", "memory"),
+        ("/sys/fs/cgroup/limited/memory.max", one),
+        ("/sys/fs/cgroup/limited/memory.current", half),
+        ("/sys/fs/cgroup/limited/worker/cgroup.controllers", "memory"),
+        ("/sys/fs/cgroup/limited/worker/cgroup.procs", procs()),
+        ("/sys/fs/cgroup/limited/worker/memory.max", four),
+        ("/sys/fs/cgroup/limited/worker/memory.current", half),
+    ];
+    const BEHIND_REFUSED: &str = concat!(
+        root!(),
+        "30 23 0:26 / /x/cg rw - cgroup2 cgroup2 rw\n",
+        "40 23 0:26 /limited/worker /cg-local rw - cgroup2 cgroup2 rw\n"
+    );
+    let behind_refused = vec![
+        ("/proc/self/mountinfo", BEHIND_REFUSED),
+        ("/proc/self/cgroup", "0::/limited/worker"),
+        ("/x/cg/limited/cgroup.controllers", "memory"),
+        ("/x/cg/limited/memory.max", one),
+        ("/x/cg/limited/memory.current", half),
+        ("/x/cg/limited/worker/cgroup.controllers", "memory"),
+        ("/x/cg/limited/worker/cgroup.procs", procs()),
+        ("/x/cg/limited/worker/memory.max", four),
+        ("/x/cg/limited/worker/memory.current", half),
+        ("/cg-local/cgroup.controllers", "memory"),
+        ("/cg-local/cgroup.procs", procs()),
+        ("/cg-local/memory.max", four),
+        ("/cg-local/memory.current", half),
+    ];
+    check(vec![
+        (
+            "own group bound over itself",
+            self_bound,
+            "",
+            Some(G),
+            Some(G / 2),
+        ),
+        (
+            "the full tree behind a way the kernel refuses",
+            behind_refused,
+            "/x",
+            None,
+            None,
+        ),
+    ]);
+}
+
+/// The kernel lets the reader pass a directory it may search but not list (mode 0111; sol-loop
+/// r7 S2): a file below it is opened and read. As root, whom no mode refuses, the directory
+/// doesn't refuse a listing either, and the test says so.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_directory_that_may_be_searched_but_not_listed_is_passed() {
+    use cgroup::Fs;
+    use std::os::unix::fs::PermissionsExt;
+    let base = std::env::temp_dir().join(format!("nrese-exec-search-{}", std::process::id()));
+    let inner = base.join("x").join("y");
+    std::fs::create_dir_all(&inner).unwrap();
+    std::fs::write(inner.join("memory.max"), "1073741824\n").unwrap();
+    let file = std::fs::canonicalize(inner.join("memory.max")).unwrap();
+    let x = base.join("x");
+    std::fs::set_permissions(&x, std::fs::Permissions::from_mode(0o111)).unwrap();
+    let kernel = cgroup::Kernel;
+    let read = (|| {
+        let mut handle = kernel.root()?;
+        for name in file.iter().skip(1) {
+            handle = kernel.open_at(&handle, &name.to_string_lossy())?;
+        }
+        kernel.read(&handle)
+    })();
+    let listed = std::fs::read_dir(&x).is_ok();
+    std::fs::set_permissions(&x, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_dir_all(&base).unwrap();
+    if listed {
+        eprintln!("run as root: the mode refuses no listing, so this only shows the read");
+    }
+    assert_eq!(read.ok().as_deref(), Some("1073741824\n"));
+}
+
 /// A kernel that shows no mount ids (`/proc/self/fdinfo` has `mnt_id` from Linux 3.15) can't
 /// say which mount a file was reached through, so a limit that may apply is unknown; the same
 /// files with mount ids read as the group's 4 GiB.
