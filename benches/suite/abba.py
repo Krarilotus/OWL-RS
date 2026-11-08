@@ -338,20 +338,21 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
     steps = prepare + blocks + after
     by_name = {c["name"]: c for c in family["catalog"]}
     mine = [by_name[c["name"]] for c in family["cases"] if c["name"] in by_name]
-    # What its data takes where the host lacks it: the makers' needs and their disk (7 Nov 2026).
-    has, disk = rg.data_needs(mine), rg.data_disk_gb(mine)
-    # Planned as made by the job, so made by its harness's prepare: one from before the dataset makers
-    # wouldn't (orchestrator, 8 Nov 2026: abba-run-055fe886-f3da61f9, "7 not as pinned" after the builds).
-    if (made := rg.made_only(mine)) and not rg.makers_at(checkout, harness):
-        raise Invalid([f"the harness {harness[:12]} has no dataset makers (engine-v2 838cd7eb, PR #129), so it "
-                       f"can't make {made[0]}" + (f" and {len(made) - 1} more" if len(made) > 1 else "")
-                       + ": merge engine-v2 into it, or give --harness at or after that commit"])
+    # What its data takes where the host lacks it: the makers' needs, their disk (7 Nov 2026) and the
+    # containers they start, declared (8 Nov 2026), all by the harness whose prepare makes it, refused where
+    # that harness can't (orchestrator, 8 Nov 2026: abba-run-055fe886-f3da61f9; review r1 R1 of
+    # pkg/maker-containers): release_gate.data_job().
+    try:
+        requires, data_fields, data_env = rg.data_job(
+            mine, {"roles": rg.TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": max(12, cap)},
+            harness=(checkout, harness))
+    except rg.HarnessRefused as refused:
+        raise Invalid([str(refused)]) from None
+    env.update(data_env)
     fetched = rg.bench_inputs(mine)
     if fetched:  # the commit data_state() takes WatDiv's pinned query sets from
         env["BENCH_INPUTS_REV"] = fetched[0]["source"]["rev"]
-    requires = ({"roles": rg.TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": max(12, cap)}
-                | ({"has": has} if has else {}) | ({"disk_gb": disk} if disk else {}))
-    job = {"id": prefix, "group": "abba", "kind": "owlrs.timed", "class": "exclusive",
+    job = {"id": prefix, "group": "abba", "kind": "owlrs.timed", "class": "exclusive", **data_fields,
            "priority": priority, "priority_reason": reason or f"A-B-B-A: {b[:8]} against {a[:8]}, "
            f"{len(family['cases'])} cases", "notify": False,
            "env": env, "est_min": 0, "stall_after_min": 60, "steps": steps,
@@ -668,7 +669,11 @@ def run(args) -> int:
     except Invalid as error:
         print("\n".join(f"invalid family: {p}" for p in error.args[0]), file=sys.stderr)
         return INVALID
-    found = jobs(family, harness, checkout.as_posix(), args.host or "", args.round, args.priority, args.reason or "")
+    try:
+        found = jobs(family, harness, checkout.as_posix(), args.host or "", args.round, args.priority, args.reason or "")
+    except Invalid as error:  # the harness can't make, or wouldn't declare, its data (data_job())
+        print("\n".join(error.args[0]), file=sys.stderr)
+        return INVALID
     set_id = next(iter(found))
     set_path = out / f"{set_id}.set.toml"
     set_path.write_bytes(set_file(set_id, list(found.values())).encode("utf-8"))
@@ -777,8 +782,12 @@ def main() -> int:
         return 0
     if args.command == "jobs":
         harness = git(Path(args.checkout), "rev-parse", args.harness or family["sides"]["b"])
-        found = jobs(family, harness, args.checkout, args.host or family["host"], args.round, args.priority,
-                     args.reason or "")
+        try:
+            found = jobs(family, harness, args.checkout, args.host or family["host"], args.round, args.priority,
+                         args.reason or "")
+        except Invalid as error:  # the harness can't make, or wouldn't declare, its data (data_job())
+            print("\n".join(error.args[0]), file=sys.stderr)
+            return INVALID
         args.out.mkdir(parents=True, exist_ok=True)
         set_id = next(iter(found))
         path = args.out / f"{set_id}.set.toml"

@@ -6,8 +6,32 @@
 # run records that use it. A file whose maker labels its blank nodes afresh each time (riot)
 # is pinned by form too: `rdfc_sha256`, the SHA-256 of its RDFC-1.0 canonical N-Quads
 # (crates/rdf/nrese-rdf-io/examples/rdfc.rs), which a made copy must meet where its bytes can't.
+# [makers]: the makers a timing job runs where its host lacks a file, by their command's start
+# (benches/fast/release_gate.py reads them, and a harness's own: harness_tables()): what each
+# needs from its host, whether its copies meet only a form pin, whether it is the SPARQL data
+# step's, and the container it runs in, [memory GB, CPUs], which the job declares to the fleet.
 
 budget_gb = 300
+
+[makers."bash benches/reasoning/prepare-lubm.sh"]
+needs = ["docker"]
+container = [4, 8]
+note = "Twice the lowest cap that made every job-run file (maker-containers-measure-1, 8 Nov 2026: lubm-1/10/100 at 8 CPUs uncapped and under 8, 4 and 2 GB, the bytes as pinned under each; uncapped peaks UBA's lubm-100 run 3.8 GB, its sort 5.6 GB with its written file's page cache; at 2 GB the make took 133 s against 108 uncapped)"
+
+[makers."bash benches/reasoning/prepare-owl2bench.sh"]
+needs = ["docker"]
+form_only = true
+container = [4, 8]
+note = "riot labels blank nodes afresh on every make, so a copy meets only a form pin (rdfc_sha256); a file without one keeps the assets (sol-loop r1 S1: owl2bench-ql-1.nt). Its container: as LUBM's (owl2bench-rl-1 made under 2 GB, maker-containers-measure-1)"
+
+[makers."bash benches/sparql/prepare.sh"]
+sparql = true
+container = [8, 8]
+note = "The SPARQL data step's own maker (its files go to the SPARQL cache; it asks the host nothing): its container its own CAP, 8 GB / 8 CPUs, in a job that declares one"
+
+[makers."perf_lab generate support-stress"]
+needs = []
+note = "The harness's perf_lab generator: nothing beyond the build"
 
 [[dataset]]
 file = "ann/glove-100-angular.hdf5"

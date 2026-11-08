@@ -40,6 +40,80 @@ spec.loader.exec_module(gate_module)
 import fast  # noqa: E402
 from suitekit import gatestats  # noqa: E402
 
+def LOCAL_TABLES(checkout, harness):  # noqa: N802
+    """A fake harness (a test's "c" * 40 in "C:/repo") reads as this tree's dataset metadata."""
+    return gate_module.local_tables()
+
+
+def commit_all(repo: Path) -> str:
+    """Everything at `repo` committed in a repository of the test's own; the commit."""
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True,  # noqa: E731
+                                    check=True, timeout=60).stdout.strip()
+    if not (repo / ".git").exists():
+        git("init", "-q")
+    git("add", "-A")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "harness")
+    return git("rev-parse", "HEAD")
+
+
+LUBM_MAKER = "bash benches/reasoning/prepare-lubm.sh"
+
+
+MAKER_SCRIPTS = ("scripts/lib/ns.sh", "benches/reasoning/prepare-lubm.sh", "benches/reasoning/prepare-owl2bench.sh",
+                 "benches/sparql/prepare.sh")
+
+
+def harness_commit(repo: Path, lubm_size: tuple | None = (4, 8), lubm_made_by: str | None = None,
+                   tables: str | None = None, catalogue: bool = True, helper: bool = True,
+                   sparql_size: bool = True, drop: tuple = (), legacy: bool = False, after: str = "") -> str:
+    """A harness of the test's own whose dataset metadata (its catalogue's [makers], its catalogue,
+    its makers' scripts) differs from this tree's as asked: its LUBM maker's container size (None:
+    none), the LUBM files made otherwise (`lubm_made_by`), no catalogue, makers without ns_maker_args
+    (`helper`), no SPARQL size, catalogue entries dropped, or more release_gate.py source (`after`).
+    `legacy` (or `tables`, its text whole; or no catalogue): a harness from before [makers], its
+    tables as code in its release_gate.py, its LUBM size as MAKER_CONTAINERS there (as this package's
+    commits before [makers] had it)."""
+    (repo / "benches/fast").mkdir(parents=True)
+    for rel in MAKER_SCRIPTS:
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        (repo / rel).write_text(text if helper else text.replace("ns_maker_args", "ns_run_args"), encoding="utf-8")
+    legacy = legacy or tables is not None or not catalogue
+    sizes = {LUBM_MAKER: lubm_size, "bash benches/reasoning/prepare-owl2bench.sh": (4, 8),
+             "bash benches/sparql/prepare.sh": (8, 8) if sparql_size else None}
+    if legacy:
+        table = "{" + ", ".join(f'"{k}": {v!r}' for k, v in sizes.items() if v) + "}"
+        code = (f'DATASET_MAKERS = {{"{LUBM_MAKER}": ["docker"], "bash benches/reasoning/prepare-owl2bench.sh": '
+                '["docker"], "perf_lab generate support-stress": []}\n'
+                'FORM_ONLY = {"bash benches/reasoning/prepare-owl2bench.sh"}\nSPARQL_PREPARE = "benches/sparql/prepare.sh"\n'
+                + (f"MAKER_CONTAINERS = {table}\n" if lubm_size else ""))
+    else:
+        code = "# a harness's release_gate.py: its makers are its catalogue's [makers]\n"
+    (repo / "benches/fast/release_gate.py").write_text((tables if tables is not None else code) + after,
+                                                       encoding="utf-8")
+    if catalogue:
+        import tomllib
+        entries = tomllib.loads((ROOT / "benches/datasets.toml").read_text(encoding="utf-8"))["dataset"]
+        lines = []
+        if not legacy:
+            makers = {LUBM_MAKER: {"needs": ["docker"]}, "bash benches/reasoning/prepare-owl2bench.sh":
+                      {"needs": ["docker"], "form_only": True}, "bash benches/sparql/prepare.sh": {"sparql": True},
+                      "perf_lab generate support-stress": {"needs": []}}
+            for start, maker in makers.items():
+                if sizes.get(start):
+                    maker["container"] = list(sizes[start])
+                lines += [f"[makers.{gate_module.toml_value(start)}]"] + [
+                    f"{k} = {gate_module.toml_value(v)}" for k, v in maker.items()] + [""]
+        for entry in entries:
+            if entry["file"] in drop:
+                continue
+            if lubm_made_by and entry.get("made_by", "").startswith(LUBM_MAKER + " "):
+                entry = {**entry, "made_by": lubm_made_by}
+            lines += ["[[dataset]]"] + [f"{k} = {gate_module.toml_value(v)}" for k, v in entry.items()] + [""]
+        (repo / "benches/datasets.toml").write_text("\n".join(lines), encoding="utf-8")
+    return commit_all(repo)
+
+
 HARNESS = "h" * 40
 REVS = {"cand": "c" * 40, "base": "b" * 40, "main": "m" * 40}
 SIDES = ("base", "main", "cand")
@@ -498,6 +572,234 @@ class Rounds(unittest.TestCase):
         self.assertEqual(need([{"data": "volume:era-shacl/ERA.ttl"}]), ["owlrs-bench-assets"])  # no maker here
         self.assertEqual(need([{"data": "volume:lubm-10.nt"}, {"data": "ore:ore_ont_9724"}]),
                          ["docker", "owlrs-bench-assets"])
+
+    def test_a_job_whose_makers_start_containers_declares_them(self):
+        """The master, 8 Nov 2026 (#129's regression): a timing job making LUBM data asked the fleet
+        for Docker, and the fleet refused it, since a shared host's envelope can't hold containers a
+        script starts unseen. The fleet's contract (F61, job spec 9): the job declares them (`spec = 9`,
+        `containers`, Linux), each within every step's ask; their memory comes out of every step's
+        slice, so the job asks that much more and its builds and blocks keep what they had. The
+        makers' env carries the same limits (their containers are held to them)."""
+        base = {"roles": ["measure", "build"], "os": "linux", "cores": 16, "ram_gb": 12}
+        lubm = [{"data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}]
+        requires, fields, env = gate_module.data_job(lubm, dict(base), harness=None)
+        self.assertEqual(fields["spec"], 9)
+        [maker] = fields["containers"]
+        self.assertGreater(maker["memory_gb"], 0)
+        self.assertGreater(maker["cpus"], 0)
+        self.assertEqual(requires["ram_gb"], base["ram_gb"] + maker["memory_gb"])  # each slice keeps its 12 GB
+        self.assertLessEqual(maker["cpus"], requires["cores"])
+        self.assertEqual((requires["os"], "docker" in requires["has"]), ("linux", True))
+        self.assertGreaterEqual(requires["disk_gb"], 1)
+        self.assertEqual(env, {"NRESE_MAKER_MEMORY_GB": f"{maker['memory_gb']:g}", "NRESE_MAKER_CPUS": f"{maker['cpus']:g}"})
+        self.assertEqual(gate_module.data_job([{"data": "volume:owl2bench-rl-1.nt"}], dict(base), harness=None)[1]["spec"], 9)
+        # One declared container serves every maker of the job, one at a time: with a SPARQL file made
+        # beside, it is at least what benches/sparql/prepare.sh's own containers take (its CAP).
+        cap = re.search(r"^CAP=\(--cpus (\d+) --memory (\d+)g", (ROOT / "benches/sparql/prepare.sh").read_text(
+            encoding="utf-8"), re.M)
+        [both] = gate_module.data_job(lubm + [{"data": "volume:watdiv-10m.nt", "queries": "@watdiv-10m"}],
+                                      dict(base), harness=None)[1]["containers"]
+        self.assertGreaterEqual((both["memory_gb"], both["cpus"]), (int(cap[2]), int(cap[1])))
+        # Only the makers of the job's own files count, not every maker the catalogue names (the first
+        # plan of shacl-lubm declared SPARQL's 8 GB for LUBM alone: frozen() reads the whole catalogue).
+        self.assertEqual((maker["memory_gb"], maker["cpus"]),
+                         gate_module.MAKER_CONTAINERS["bash benches/reasoning/prepare-lubm.sh"])
+
+    def test_a_release_gate_part_asks_what_its_harness_makes_and_how(self):
+        """Review r1 R1 of pkg/maker-containers (8 Nov 2026): a part's data is made by its harness's own
+        prepare (release-gate.sh prepare runs the harness worktree's release_gate.py and catalogue), so
+        its declaration, its makers' env and its memory are the harness's (its MAKER_CONTAINERS and
+        catalogue), not the planning tree's. A harness whose LUBM maker takes 6 GB and 4 CPUs is
+        declared so; one whose catalogue has LUBM from the bench assets declares nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sized = harness_commit(Path(tmp) / "sized", lubm_size=(6, 4))
+            timed = gate_module.jobs(sized, sized, (Path(tmp) / "sized").as_posix(), "rg-test", 2, "shacl-lubm",
+                                     checks=False)["rg-test-timed"]
+            self.assertEqual(timed["containers"], [{"name": "maker", "memory_gb": 6, "cpus": 4}])
+            self.assertEqual((timed["env"]["NRESE_MAKER_MEMORY_GB"], timed["env"]["NRESE_MAKER_CPUS"]), ("6", "4"))
+            # Review r2 R2-W1: the sizes are the catalogue's [makers], declared data; nothing in the
+            # harness's code, a table of the same name written or changed there, alters what the job is told.
+            coded = harness_commit(Path(tmp) / "coded", lubm_size=(6, 4), after=(
+                f'MAKER_CONTAINERS = {{"{LUBM_MAKER}": (9, 9)}}\nMAKER_CONTAINERS["{LUBM_MAKER}"] = (9, 9)\n'))
+            self.assertEqual(gate_module.jobs(coded, coded, (Path(tmp) / "coded").as_posix(), "rg-test", 2,
+                                              "shacl-lubm", checks=False)["rg-test-timed"]["containers"],
+                             [{"name": "maker", "memory_gb": 6, "cpus": 4}])
+            assets = harness_commit(Path(tmp) / "assets", lubm_made_by="the bench assets' copy")
+            timed = gate_module.jobs(assets, assets, (Path(tmp) / "assets").as_posix(), "rg-test", 2, "shacl-lubm",
+                                     checks=False)["rg-test-timed"]
+            self.assertNotIn("containers", timed)
+            self.assertIn("owlrs-bench-assets", timed["requires"]["has"])
+            sized_ram = gate_module.jobs(sized, sized, (Path(tmp) / "sized").as_posix(), "rg-test", 2, "shacl-lubm",
+                                         checks=False)["rg-test-timed"]["requires"]["ram_gb"]
+            self.assertEqual(sized_ram, timed["requires"]["ram_gb"] + 6)  # its blocks' ask, plus the harness's maker
+
+    def test_a_harness_whose_makers_it_can_t_declare_is_refused(self):
+        """Review r1 R1 and sol-loop r1 S1 of pkg/maker-containers: a harness whose makers start
+        containers it declares no size for (between engine-v2 838cd7eb and this package: unlabelled,
+        unlimited), or whose tables are code, or whose catalogue can't be read, would have its data
+        step stopped or its data unknown: refused at the plan, saying why. Fix check r3 R3-W1 (the
+        master, 8 Nov 2026): a harness's tables are its catalogue's [makers] alone, so every harness
+        whose tables are code is refused for having no [makers], whatever the code says."""
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, kw, cases, why in (
+                    ("unsized", {"lubm_size": None}, "shacl-lubm", "container"),
+                    ("computed", {"tables": 'MAKER_CONTAINERS = {"bash " + "x": (1, 1)}\n'}, "shacl-lubm",
+                     "[makers]"),
+                    ("uncatalogued", {"catalogue": False, "lubm_size": None}, "shacl-lubm", "datasets.toml"),
+                    # Review r2 R2-W1: a harness from before [makers] whose sizes are code (this package's
+                    # commits before it; bafc5741 declared 4/8 where H's code made 6/4): refused, never run.
+                    ("sizes as code", {"legacy": True}, "shacl-lubm", "[makers]"),
+                    # Sol-loop r3 S1: sized makers whose scripts don't take the declaration.
+                    ("unheld", {"helper": False}, "shacl-lubm", "ns_maker_args"),
+                    # S3: SPARQL's maker shares the declared container, so its size counts too.
+                    ("no SPARQL size", {"sparql_size": False}, "shacl-lubm,watdiv-10m", "prepare.sh"),
+                    # S4: a file the harness's catalogue doesn't name: its data step can't make or check it.
+                    ("unnamed file", {"drop": ("lubm-10.nt",)}, "shacl-lubm", "lubm-10.nt"),
+                    # Review r2 R2-W1, its witnesses: a write after the literal of a harness whose tables are
+                    # code (the builder declared 4/8 where H says 6/4): refused, never run.
+                    *((f"changed by {how}", {"legacy": True, "after": text}, "shacl-lubm", "[makers]")
+                      for how, text in (
+                          ("subscript", f'MAKER_CONTAINERS["{LUBM_MAKER}"] = (6, 4)\n'),
+                          ("augmented", f'MAKER_CONTAINERS |= {{"{LUBM_MAKER}": (6, 4)}}\n'),
+                          ("update", f'MAKER_CONTAINERS.update({{"{LUBM_MAKER}": (6, 4)}})\n'),
+                          ("setdefault", 'MAKER_CONTAINERS.setdefault("bash x", (1, 1))\n'),
+                          ("del", f'del MAKER_CONTAINERS["{LUBM_MAKER}"]\n'),
+                          ("a function", 'def grow():\n    global MAKER_CONTAINERS\n    MAKER_CONTAINERS = {}\n'))),
+                    ("assigned twice", {"legacy": True, "after": f'MAKER_CONTAINERS = {{"{LUBM_MAKER}": (6, 4)}}\n'},
+                     "shacl-lubm", "[makers]"),
+                    ("re-assigned annotated", {"legacy": True,
+                                               "after": f'MAKER_CONTAINERS: dict = {{"{LUBM_MAKER}": (6, 4)}}\n'},
+                     "shacl-lubm", "[makers]"),
+                    ("malformed [makers]", {"lubm_size": (0, 4)}, "shacl-lubm", "[makers]")):
+                with self.subTest(name):
+                    repo = Path(tmp) / name.replace(" ", "-")
+                    harness = harness_commit(repo, **kw)
+                    with self.assertRaises(SystemExit) as refused:
+                        gate_module.jobs(harness, harness, repo.as_posix(), "rg-test", 2, cases, checks=False)
+                    self.assertIn(why, str(refused.exception))
+
+    def test_a_harness_s_makers_are_its_catalogue_s_and_its_code_is_never_read(self):
+        """Fix check r3 R3-W1 of pkg/maker-containers (8 Nov 2026): a harness without [makers] whose
+        release_gate.py gives LUBM's maker Docker through an alias (r3's witness: its literal says [],
+        `x = DATASET_MAKERS[LUBM]; x.append("docker")` after it) was planned with no container, no Docker
+        and its blocks' memory alone, while its data step starts LUBM's containers. The master's boundary
+        (8 Nov 2026): a harness's maker tables come only from its catalogue's [makers]; one without is
+        refused before admission, naming the remedy, and no Python of the harness is read. Each row on
+        its own: the witness (refused), and two guards that pass before and after: [makers] 6/4 declared
+        6/4 though the harness's code raises and says 9/9; its release_gate.py never shown."""
+        legacy = (f'DATASET_MAKERS = {{"{LUBM_MAKER}": [], "bash benches/reasoning/prepare-owl2bench.sh": ["docker"], '
+                  '"perf_lab generate support-stress": []}\n'
+                  'FORM_ONLY = {"bash benches/reasoning/prepare-owl2bench.sh"}\n'
+                  'SPARQL_PREPARE = "benches/sparql/prepare.sh"\n'
+                  f'_legacy_needs = DATASET_MAKERS["{LUBM_MAKER}"]\n_legacy_needs.append("docker")\n')
+        real = subprocess.run
+
+        def planned(repo: Path, harness: str):
+            shown = []
+
+            def run(args, *a, **kw):
+                if list(args[:2]) == ["git", "-C"] and len(args) > 4 and args[3] == "show":
+                    shown.append(str(args[4]).split(":", 1)[-1])
+                return real(args, *a, **kw)
+            try:
+                with patch.object(subprocess, "run", run):
+                    timed = gate_module.jobs(harness, harness, repo.as_posix(), "rg-test", 2, "shacl-lubm",
+                                             checks=False)["rg-test-timed"]
+            except SystemExit as refused:
+                return str(refused), shown
+            return timed, shown
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.subTest("r3 witness: no [makers], Docker added by an alias in its code"):
+                repo = Path(tmp) / "alias"
+                got, shown = planned(repo, harness_commit(repo, tables=legacy))
+                self.assertIsInstance(got, str, f"planned, not refused: {got}")
+                for said in ("[makers]", "merge refactor/engine-v2", "--harness"):
+                    self.assertIn(said, got)
+                self.assertNotIn("benches/fast/release_gate.py", shown)
+            with self.subTest("guard: [makers] 6/4, its code raising and saying 9/9"):
+                repo = Path(tmp) / "inert"
+                got, shown = planned(repo, harness_commit(repo, lubm_size=(6, 4), after=(
+                    'raise RuntimeError("the harness code ran")\n'
+                    f'MAKER_CONTAINERS = {{"{LUBM_MAKER}": (9, 9)}}\n')))
+                self.assertIsInstance(got, dict, f"refused: {got}")
+                self.assertEqual(got["containers"], [{"name": "maker", "memory_gb": 6, "cpus": 4}])
+                self.assertEqual((got["env"]["NRESE_MAKER_MEMORY_GB"], got["env"]["NRESE_MAKER_CPUS"]), ("6", "4"))
+                self.assertIn("benches/datasets.toml", shown)  # the probe sees the harness's reads
+                self.assertNotIn("benches/fast/release_gate.py", shown)
+
+    def test_a_catalogue_s_makers_are_refused_where_a_file_s_maker_would_be_ambiguous_or_unbounded(self):
+        """Sol-loop r6 S6/S7 of pkg/maker-containers: a file's maker is the [makers] start its made_by
+        begins with, so two starts one of which begins the other would depend on their order (which a
+        save re-sorts); a container must be finite and positive; an entry must be a table."""
+        for label, makers in (
+                ("overlapping starts", {LUBM_MAKER + " 10": {"needs": ["docker"], "container": [6, 4]},
+                                        LUBM_MAKER: {"needs": ["docker"], "container": [4, 8]}}),
+                ("infinite memory", {LUBM_MAKER: {"needs": ["docker"], "container": [float("inf"), 8]}}),
+                ("not a table", {LUBM_MAKER: 4}),
+                ("an unknown key", {LUBM_MAKER: {"needs": ["docker"], "size": 4}})):
+            with self.subTest(label), self.assertRaises(ValueError):
+                gate_module.catalogue_makers(makers)
+
+    def test_saving_the_catalogue_keeps_its_makers_as_they_are(self):
+        """Sol-loop r6 S5: `suite.py data freeze` rewrites benches/datasets.toml (datasets.save()); its
+        [makers] come back as they were, an empty section too (its presence says the catalogue holds them,
+        so a harness with it isn't read as one from before them)."""
+        from suitekit import datasets
+        import tomllib
+        for makers in (tomllib.loads((ROOT / "benches/datasets.toml").read_text(encoding="utf-8"))["makers"], {}):
+            with self.subTest(makers=len(makers)), tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "benches").mkdir()
+                datasets.save(Path(tmp), {"budget_gb": 300, "makers": makers, "dataset": []})
+                saved = tomllib.loads((Path(tmp) / "benches/datasets.toml").read_text(encoding="utf-8"))
+                self.assertEqual(saved.get("makers"), makers)
+
+    def test_this_tree_s_tables_are_the_literals_a_harness_reader_reads(self):
+        """harness_tables() reads a harness's makers from its catalogue's [makers], never running its
+        code: this tree, read so from a commit, gives the tables its own data step uses (one source:
+        catalogue_makers()), and its SPARQL data step is SPARQL_PREPARE: the one path planning and
+        preparation both use (sol-loop r6 S4), the catalogue's own."""
+        import tomllib
+        makers = tomllib.loads((ROOT / "benches/datasets.toml").read_text(encoding="utf-8"))["makers"]
+        [sparql] = [s for s, m in makers.items() if m.get("sparql")]
+        self.assertEqual("bash " + gate_module.SPARQL_PREPARE, sparql)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "benches/fast").mkdir(parents=True)
+            shutil.copy2(ROOT / "benches/fast/release_gate.py", repo / "benches/fast/release_gate.py")
+            shutil.copy2(ROOT / "benches/datasets.toml", repo / "benches/datasets.toml")
+            harness = commit_all(repo)
+            read = gate_module.harness_tables(repo.as_posix(), harness)
+        own = gate_module.local_tables()
+        self.assertEqual((read.makers, read.form_only, read.sparql, read.containers, read.catalogue),
+                         (own.makers, own.form_only, own.sparql, own.containers, own.catalogue))
+
+    def test_a_job_whose_makers_start_no_container_asks_as_before(self):
+        """Design note 2026-11-08-maker-containers, invariant 3: no maker that starts containers, no
+        declaration: the job's spec, memory and capabilities as data_needs() and data_disk_gb() say."""
+        base = {"roles": ["measure", "build"], "os": "linux", "cores": 16, "ram_gb": 12}
+        for cases in ([{"data": "social people=1000"}], [{"data": "ore:ore_ont_9724"}],
+                      [{"data": "volume:support-stress/copies-8.nq"}],
+                      [{"data": "volume:watdiv-10m.nt", "queries": "@watdiv-10m"}]):
+            with self.subTest(cases=cases):
+                requires, fields, env = gate_module.data_job(cases, dict(base), harness=None)
+                self.assertEqual((fields, env), ({}, {}))
+                has, disk = gate_module.data_needs(cases), gate_module.data_disk_gb(cases)
+                self.assertEqual(requires, base | ({"has": has} if has else {}) | ({"disk_gb": disk} if disk else {}))
+
+    def test_a_release_gate_part_making_lubm_declares_its_maker(self):
+        """The release gate's parts are the other job builder: the same declaration, from the same
+        function, and its TOML is what the fleet reads (an inline table per container)."""
+        import tomllib
+        with patch.object(gate_module, "harness_tables", LOCAL_TABLES, create=True):  # a fake harness: this tree's
+            found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "shacl-lubm", checks=False)
+        timed = found["rg-test-timed"]
+        self.assertEqual(timed["spec"], 9)
+        [maker] = timed["containers"]
+        self.assertEqual(timed["env"]["NRESE_MAKER_MEMORY_GB"], f"{maker['memory_gb']:g}")
+        read = tomllib.loads(gate_module.toml_set({"id": "rg-test", "fail": "continue"}, list(found.values())))
+        self.assertEqual(read["job"][0]["containers"], [maker])
+        self.assertEqual(read["job"][0]["spec"], 9)
 
     def test_a_dataset_is_as_pinned_by_its_bytes_or_by_its_rdfc_form(self):
         """7 Nov 2026: riot labels univ-bench.nt's blank nodes afresh on every make, so a made copy's
@@ -1203,6 +1505,7 @@ class Evidence(unittest.TestCase):
         })
 
 
+@patch.object(gate_module, "harness_tables", LOCAL_TABLES, create=True)  # fake harnesses: this tree's metadata
 class Parts(unittest.TestCase):
     def test_plan_never_lowers_a_cap(self):
         catalog = [{"name": "small", "cap_gb": 4}, {"name": "bsbm-bi-100m", "cap_gb": 28},
@@ -1795,6 +2098,7 @@ class Tradeoffs(unittest.TestCase):
             self.assertIn("missing approved, by, pays_with, reason", errors[0])
 
 
+@patch.object(gate_module, "harness_tables", LOCAL_TABLES, create=True)  # fake harnesses: this tree's metadata
 class Measurement(unittest.TestCase):
     """benches/NOISY.md: the noise reduced in the harness, not tolerated."""
 
