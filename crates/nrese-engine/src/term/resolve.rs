@@ -61,6 +61,16 @@ impl Vocabulary {
         }
     }
 
+    /// The dictionary under either kind, for what reads its shared state only (planning
+    /// choices, sizes, search's own indexes). Never a decoder of this vocabulary's ids: a
+    /// private one's own ids aren't in it.
+    pub(crate) fn underlying(&self) -> &Arc<Dictionary> {
+        match self {
+            Self::Shared(dictionary) => dictionary,
+            Self::Private(view) => view.dictionary(),
+        }
+    }
+
     pub(crate) fn lookup(&self, term: TermRef<'_>, bound: u64) -> Option<TermId> {
         match self {
             Self::Shared(dictionary) => dictionary.lookup_bounded(term, bound),
