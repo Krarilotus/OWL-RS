@@ -221,7 +221,11 @@ fn more_members_of_a_class_expression_keep_the_compiled_tbox() {
 ///   read equals a fresh one (still one member); deleting the last ones too: none left;
 /// - a commit without a note, and a transaction's pending state, rescan every one.
 ///
-/// Each schema read is compared with a fresh one: reuse never changes what is read.
+/// Each read counts three things: memberships scanned, expressions walked, membership
+/// statements written into a schema. A noted commit walks only the expressions it
+/// touched, and writes a schema only where a membership changed (P2-C1 probe, 8 Nov: the
+/// rebuild of every expression's took 188 us a snapshot). Each schema read is compared
+/// with a fresh one: reuse never changes what is read.
 #[test]
 fn a_noted_commit_rescans_only_the_memberships_it_touched() {
     let restrictions = 20;
@@ -244,15 +248,21 @@ fn a_noted_commit_rescans_only_the_memberships_it_touched() {
     tx.commit().unwrap();
     let ql = QlRewriting::new(Closure { lists: false });
     let scans = |snapshot: &Snapshot| {
-        MEMBER_SCANS.set(0);
-        let tbox = ql.tbox(snapshot, None);
-        (MEMBER_SCANS.get(), tbox)
+        for cell in [&MEMBER_SCANS, &EXPRESSIONS_WALKED, &MEMBERS_WRITTEN] {
+            cell.set(0);
+        }
+        ql.tbox(snapshot, None);
+        [
+            MEMBER_SCANS.get(),
+            EXPRESSIONS_WALKED.get(),
+            MEMBERS_WRITTEN.get(),
+        ]
     };
     let fresh = |snapshot: &Snapshot| schema_statements(snapshot, &|_| true);
     let mut wrong = Vec::new();
-    let (all, _) = scans(&engine.snapshot());
-    if all != restrictions {
-        wrong.push(format!("first read: {all} scans"));
+    let all = scans(&engine.snapshot());
+    if all != [restrictions; 3] {
+        wrong.push(format!("first read: {all:?} (scanned, walked, written)"));
     }
     // One restriction's node and its members' statements, as the store has them.
     let snapshot = engine.snapshot();
@@ -296,15 +306,15 @@ fn a_noted_commit_rescans_only_the_memberships_it_touched() {
             ql.note_commit(from, summary.asserted, touched);
         }
     };
-    let mut check = |name: &str, expected: usize| {
+    let mut check = |name: &str, expected: [usize; 3]| {
         let snapshot = engine.snapshot();
-        let (n, _) = scans(&snapshot);
+        let n = scans(&snapshot);
         let cached = ql.cached.lock().unwrap();
-        let read = cached[0].schema.to_vec();
+        let read = cached[0].schema(&snapshot);
         drop(cached);
         if n != expected || read != fresh(&snapshot) {
             wrong.push(format!(
-                "{name}: {n} scans (expected {expected}), equal to a fresh read: {}",
+                "{name}: {n:?} (expected {expected:?}; scanned, walked, written), equal to a                  fresh read: {}",
                 read == fresh(&snapshot)
             ));
         }
@@ -323,14 +333,14 @@ fn a_noted_commit_rescans_only_the_memberships_it_touched() {
         },
         true,
     );
-    check("a member added", 1);
+    check("a member added", [1, 1, 0]);
     commit(
         &|tx| {
             tx.insert(quad("ann", &format!("{EX}knows"), "bob").as_ref());
         },
         true,
     );
-    check("an edge", 0);
+    check("an edge", [0, 0, 0]);
     // The member the schema holds: the first of the restriction's in store order.
     commit(
         &|tx| {
@@ -338,7 +348,7 @@ fn a_noted_commit_rescans_only_the_memberships_it_touched() {
         },
         true,
     );
-    check("the held member deleted", 1);
+    check("the held member deleted", [1, 1, restrictions]);
     commit(
         &|tx| {
             for m in &members[1..] {
@@ -348,19 +358,18 @@ fn a_noted_commit_rescans_only_the_memberships_it_touched() {
         },
         true,
     );
-    check("every member deleted", 1);
+    check("every member deleted", [1, 1, restrictions - 1]);
     commit(
         &|tx| {
             tx.insert(member("again").as_ref());
         },
         false,
     );
-    check("a commit without a note", restrictions);
+    check("a commit without a note", [restrictions; 3]);
     let tx = engine.transaction();
-    MEMBER_SCANS.set(0);
-    ql.tbox(&tx.pending_snapshot(), None);
-    if MEMBER_SCANS.get() != restrictions {
-        wrong.push(format!("pending: {} scans", MEMBER_SCANS.get()));
+    let pending = scans(&tx.pending_snapshot());
+    if pending[..2] != [restrictions; 2] {
+        wrong.push(format!("pending: {pending:?}"));
     }
     drop(tx);
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
