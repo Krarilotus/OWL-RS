@@ -18,7 +18,11 @@ const DATA: &str = "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/
 #[test]
 fn the_bounds_views_of_a_published_snapshot_are_published() {
     let store = StoreService::new(StoreConfig::in_memory()).unwrap();
-    store.update_str_ungated(DATA).unwrap();
+    // Through the pipeline, as a product write: the store's write-path guard allows no other.
+    let reasoner = nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default());
+    crate::MutationPipeline::new(Arc::new(store.clone()), Arc::new(reasoner))
+        .execute_update(&crate::SparqlUpdateRequest::new(DATA.to_owned()))
+        .unwrap();
     let (snapshot, view) = view(&store);
     assert!(
         snapshot.shared_state().is_some(),
