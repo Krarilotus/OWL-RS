@@ -1,9 +1,16 @@
 //! The memory limits a Linux process runs under, from its cgroup membership: cgroup v2 (a
 //! `0::/path` line) reads `memory.max` in the process's group and every ancestor's, v1 (a
 //! line naming the `memory` controller) `memory.limit_in_bytes`; the smallest counts. The
-//! group's files are found through the mount the process sees its hierarchy through
-//! (`/proc/self/mountinfo`), as the JDK and the .NET runtime find them, so a hierarchy mounted
-//! elsewhere, or a container's own group at its mount's root, is read where it is.
+//! groups' files are found through the mounts the process sees its hierarchy through
+//! (`/proc/self/mountinfo`), so a hierarchy mounted elsewhere, or a container's own group at
+//! its mount's root, is read where it is.
+//!
+//! A value is read for a group only from a path that resolves to that group, as the kernel
+//! resolves it through the mount table (a mount over part of the path redirects it), and the
+//! process's own group only where its `cgroup.procs` lists the process (SYN-45 review r1
+//! R1-C1a: a path through a mount isn't proof of which group it reaches). An ancestor no path
+//! reaches, a mount over its path hiding it, is invisible to the process as one above its
+//! namespace is, and the walk stops there (option 1 below).
 //!
 //! "max", v1's page-aligned maximum and a v2 group without the controller (no `memory.max`)
 //! mean no limit; 0 is a limit of nothing. A limit that may apply but can't be read is
@@ -48,13 +55,10 @@ const V1: Files = Files {
     inactive: "total_inactive_file",
 };
 
-/// The process's memory group as this process sees it.
+/// The process's memory group: its hierarchy, and its path in it.
 struct Group {
     files: &'static Files,
-    /// The group's directory.
-    dir: String,
-    /// The directory of the mount it is seen through: its ancestors above aren't visible.
-    top: String,
+    path: String,
 }
 
 /// The process's memory group; `None` where no hierarchy has the memory controller (nothing
@@ -82,113 +86,158 @@ fn group(read: &impl Fn(&str) -> io::Result<String>) -> Result<Option<Group>, Un
         (None, None) => return Ok(None),
     };
     let path = path.trim();
-    let mounts = read("/proc/self/mountinfo").map_err(|_| Unknown)?;
-    // The mount of this hierarchy whose root holds the group, the widest such root. Every mount
-    // of one hierarchy shows the same tree, so the widest shows every ancestor a deeper one does
-    // and more: a bind mount of the group itself must not hide the limits above it (review r1
-    // R1-C1). Above the widest, nothing is visible. A mount another one covers isn't a view
-    // (sol-loop r3 S1, r4 S2): its files aren't reachable at its mount point.
-    let places: Vec<Option<(u64, u64, String)>> = mounts.lines().map(place).collect();
-    let mut best: Option<(usize, String, String)> = None;
-    for (index, line) in mounts.lines().enumerate() {
-        let Some((root, point)) = mount(line, files) else {
-            continue;
-        };
-        if covered(index, &places) {
-            continue;
-        }
-        let Some(rest) = under(path, &root) else {
-            continue;
-        };
-        if best
-            .as_ref()
-            .is_none_or(|(widest, ..)| root.len() < *widest)
-        {
-            best = Some((root.len(), point, rest.to_owned()));
-        }
-    }
-    let (_, point, rest) = best.ok_or(Unknown)?;
-    let top = point.trim_end_matches('/').to_owned();
+    let path = match path.trim_end_matches('/') {
+        "" => "/",
+        trimmed => trimmed,
+    };
     Ok(Some(Group {
         files,
-        dir: format!("{top}{rest}"),
-        top,
+        path: path.to_owned(),
     }))
 }
 
-/// A `/proc/self/mountinfo` line's root and mount point, where it mounts `files`'s hierarchy:
-/// `cgroup2` for v2, a `cgroup` naming `memory` in its super options for v1 (proc(5): the
-/// fields after the optional ones' `-` are the type, the source and the super options).
-fn mount(line: &str, files: &Files) -> Option<(String, String)> {
-    let (before, after) = line.split_once(" - ")?;
-    let mut fields = before.split(' ');
-    let (root, point) = (fields.nth(3)?, fields.next()?);
-    let mut after = after.split(' ');
-    let (kind, options) = (after.next()?, after.nth(1).unwrap_or(""));
-    let ours = if files.v1 {
-        kind == "cgroup" && options.split(',').any(|option| option == "memory")
-    } else {
-        kind == "cgroup2"
-    };
-    ours.then(|| (unescape(root), unescape(point)))
+/// One mount of `/proc/self/mountinfo` (proc_pid_mountinfo(5)): its id and its parent's, the
+/// directory of its filesystem it shows, where it shows it, and whether it is a mount of the
+/// process's memory hierarchy.
+struct Mount {
+    id: u64,
+    parent: u64,
+    root: String,
+    point: String,
+    ours: bool,
 }
 
-/// A mountinfo line's mount id, parent mount id and mount point (proc(5): the first, second
-/// and fifth fields).
-fn place(line: &str) -> Option<(u64, u64, String)> {
-    let mut fields = line.split(' ');
-    let id = fields.next()?.parse().ok()?;
-    let parent = fields.next()?.parse().ok()?;
-    let point = unescape(fields.nth(2)?);
-    Some((id, parent, point))
+/// The mount table, from mountinfo's text: `None` where a line makes no sense, since a mount
+/// left out could be one that redirects a path.
+fn mounts(text: &str, files: &Files) -> Option<Vec<Mount>> {
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            // The fields after the optional ones' `-`: the type, the source, the super options.
+            let (before, after) = line.split_once(" - ")?;
+            let mut fields = before.split(' ');
+            let id = fields.next()?.parse().ok()?;
+            let parent = fields.next()?.parse().ok()?;
+            let (root, point) = (fields.nth(1)?, fields.next()?);
+            let mut after = after.split(' ');
+            let (kind, options) = (after.next()?, after.nth(1).unwrap_or(""));
+            let ours = if files.v1 {
+                kind == "cgroup" && options.split(',').any(|option| option == "memory")
+            } else {
+                kind == "cgroup2"
+            };
+            Some(Mount {
+                id,
+                parent,
+                root: unescape(root),
+                point: unescape(point),
+                ours,
+            })
+        })
+        .collect()
 }
 
-/// Whether the mount at `index` of mountinfo is covered, from the mount tree alone (each
-/// mount's parent and point), never from the order of the lines, which a moved mount
-/// (`MS_MOVE`) doesn't change (sol-loop r4 S2). A mount is covered when
-/// - another is mounted on it at its own point (stacked on it), or
-/// - another on the same parent sits at a directory above its point (mounted over the path to
-///   it: a mount made at that path afterwards would have had the upper one as its parent), or
-/// - its parent is covered and it isn't the mount stacked on that parent.
-///
-/// A namespace's root is its own parent (proc_pid_mountinfo(5); an initramfs lists its
-/// rootfs so) and covers nothing: it is neither stacked on itself nor a sibling of what it
-/// holds (sol-loop r5 S3). A line that can't be read covers nothing: then a cgroup mount counts, and a wrong choice
-/// reads files that aren't there, which is Unknown, never a limit too high.
-fn covered(index: usize, places: &[Option<(u64, u64, String)>]) -> bool {
-    // Every mount that can cover another: a self-parented root can't.
-    let mounts: Vec<&(u64, u64, String)> = places
+/// The mount `path` resolves through and the rest of the path below its point, as the kernel
+/// walks it: from the namespace's root mount (at `/`, its parent itself or not listed), at each
+/// mount into a mount stacked on it at its own point, else into the child whose point is the
+/// shortest prefix of what is left (a child at a shorter point hides the deeper ones: a mount
+/// made below it afterwards would have had it as parent). `None` where the table doesn't say:
+/// no root, or two mounts at one place.
+fn resolve<'m>(mounts: &'m [Mount], path: &str) -> Option<(&'m Mount, String)> {
+    let listed = |id: u64| mounts.iter().any(|mount| mount.id == id);
+    let mut roots = mounts
         .iter()
-        .flatten()
-        .filter(|(id, parent, _)| id != parent)
-        .collect();
-    let Some(this) = &places[index] else {
-        return false;
+        .filter(|m| m.point == "/" && (m.parent == m.id || !listed(m.parent)));
+    let (mut at, None) = (roots.next()?, roots.next()) else {
+        return None;
     };
-    let mut at = this;
-    // Up the parent chain, at most once per mount.
     for _ in 0..=mounts.len() {
-        let (id, parent, point) = at;
-        let stacked = mounts.iter().any(|(_, on, over)| on == id && over == point);
-        let overmounted = mounts.iter().any(|(other, on, over)| {
-            other != id && on == parent && under(point, over).is_some_and(|rest| !rest.is_empty())
-        });
-        if stacked || overmounted {
-            return true;
+        let children = || mounts.iter().filter(|m| m.parent == at.id && m.id != at.id);
+        let mut stacked = children().filter(|m| m.point == at.point);
+        if let Some(on) = stacked.next() {
+            if stacked.next().is_some() {
+                return None;
+            }
+            at = on;
+            continue;
         }
-        // Inside its parent: covered with it, unless it is what's stacked on the parent.
-        let Some(&up) = mounts
-            .iter()
-            .find(|(other, ..)| other == parent && other != id)
-        else {
-            return false;
-        };
-        if up.2 == *point {
-            return false;
+        let mut below: Vec<&Mount> = children()
+            .filter(|m| under(path, &m.point).is_some())
+            .collect();
+        below.sort_by_key(|m| m.point.trim_end_matches('/').len());
+        match below.as_slice() {
+            [] => return Some((at, under(path, &at.point)?.to_owned())),
+            [first, second, ..] if first.point == second.point => return None,
+            [first, ..] => at = *first,
         }
-        at = up;
     }
-    false
+    None
+}
+
+/// The group of the process's hierarchy that `path` resolves to, if it resolves into it.
+fn group_at(mounts: &[Mount], path: &str) -> Option<String> {
+    let (mount, rest) = resolve(mounts, path)?;
+    mount.ours.then(|| join(&mount.root, &rest))
+}
+
+/// `base` with `rest` (empty, or from a `/`) after it.
+fn join(base: &str, rest: &str) -> String {
+    match (base.trim_end_matches('/'), rest) {
+        ("", "") => "/".to_owned(),
+        (base, rest) => format!("{base}{rest}"),
+    }
+}
+
+/// The paths that resolve to `group`: through each mount of the hierarchy whose root holds it,
+/// those the mount table doesn't redirect elsewhere.
+fn views(mounts: &[Mount], group: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for mount in mounts.iter().filter(|m| m.ours) {
+        let Some(rest) = under(group, &mount.root) else {
+            continue;
+        };
+        let path = join(&mount.point, rest);
+        if group_at(mounts, &path).as_deref() == Some(group) && !found.contains(&path) {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// The group above `group`; `None` above the root.
+fn parent_of(group: &str) -> Option<&str> {
+    match group.rfind('/')? {
+        _ if group == "/" => None,
+        0 => Some("/"),
+        at => Some(&group[..at]),
+    }
+}
+
+/// The process's id, as `/proc/self/stat` gives it: in the process's own pid namespace, the
+/// one a group's `cgroup.procs` lists it in when the process reads it.
+fn pid(read: &impl Fn(&str) -> io::Result<String>) -> Result<u64, Unknown> {
+    let stat = read("/proc/self/stat").map_err(|_| Unknown)?;
+    let id = stat.split_whitespace().next().ok_or(Unknown)?;
+    id.parse().map_err(|_| Unknown)
+}
+
+/// Of `paths` to the process's group, one that is the process's own: its `cgroup.procs` lists
+/// the process (a process is in one group of a hierarchy), and, in v2, it has
+/// `cgroup.controllers`, which only v2 groups have. A path that can't be read so isn't one.
+fn own(
+    read: &impl Fn(&str) -> io::Result<String>,
+    files: &Files,
+    paths: Vec<String>,
+    pid: u64,
+) -> Option<String> {
+    paths.into_iter().find(|path| {
+        let lists = read(&format!("{path}/cgroup.procs")).is_ok_and(|procs| {
+            procs
+                .lines()
+                .any(|line| line.trim().parse::<u64>() == Ok(pid))
+        });
+        lists && (files.v1 || read(&format!("{path}/cgroup.controllers")).is_ok())
+    })
 }
 
 /// A mountinfo field as the path it names: proc(5) writes space, tab, newline and backslash
@@ -229,23 +278,20 @@ fn limited(
     read: &impl Fn(&str) -> io::Result<String>,
     mut each: impl FnMut(&Files, &str, u64) -> Result<(), Unknown>,
 ) -> Result<(), Unknown> {
-    let Some(Group {
-        files,
-        mut dir,
-        top,
-    }) = group(read)?
-    else {
+    let Some(Group { files, path }) = group(read)? else {
         return Ok(());
     };
+    let text = read("/proc/self/mountinfo").map_err(|_| Unknown)?;
+    let mounts = mounts(&text, files).ok_or(Unknown)?;
+    let pid = pid(read)?;
+    let mut dir = own(read, files, views(&mounts, &path), pid).ok_or(Unknown)?;
+    let mut group = path;
     if files.v1 {
         // The kernel's own least limit over the whole hierarchy, groups above a namespace
         // included, which the walk below can't see (since Linux 2.6.29).
         if let Some(limit) = hierarchical(read, &dir)?.filter(|&limit| limit < NONE_ABOVE) {
             each(files, &dir, limit)?;
         }
-    } else {
-        // Every v2 group has it: without it the group isn't where its path leads.
-        read(&format!("{dir}/cgroup.controllers")).map_err(|_| Unknown)?;
     }
     loop {
         match read(&format!("{dir}/{}", files.limit)) {
@@ -263,10 +309,18 @@ fn limited(
             Err(error) if error.kind() == ErrorKind::NotFound && !files.v1 => {}
             Err(_) => return Err(Unknown),
         }
-        if dir.len() <= top.len() {
+        let Some(up) = parent_of(&group) else {
             return Ok(());
-        }
-        dir.truncate(dir.rfind('/').ok_or(Unknown)?);
+        };
+        let up = up.to_owned();
+        // No path reaches it (above every mount's root, or hidden by a mount over its path): not
+        // visible to the process, as above a namespace, so nothing above it is read (the
+        // orchestrator, 8 Nov 02:28: option 1 of IB2001-2a56 covers it).
+        let Some(path) = views(&mounts, &up).into_iter().next() else {
+            return Ok(());
+        };
+        dir = path;
+        group = up;
     }
 }
 
