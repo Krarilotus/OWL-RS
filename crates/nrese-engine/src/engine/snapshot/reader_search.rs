@@ -552,14 +552,22 @@ impl Snapshot {
     /// How many slices of a corpus walk over `words` words of bits run at once, and the most
     /// they hold besides the bits: per slice its group counts (16 bytes a term, 64 terms a
     /// word of the slice) from each run, and as many again where they are merged or
-    /// compared. As many at once as `room` holds, at least one, no more than the pool's
-    /// threads nor than there are slices.
+    /// compared; and the parts a large range's grouping is cut into
+    /// ([`crate::index::GROUP_PART`] entries each: a cut, a vector and at least four counts).
+    /// The slices running at once cover disjoint ranges, so their parts are at most the
+    /// runs' entries over a part, and two more a run and slice. As many at once as `room`
+    /// holds, at least one, no more than the pool's threads nor than there are slices.
     fn walk_scratch(&self, words: usize, per: usize, room: usize) -> (usize, usize) {
         let runs = self.version.runs().count().max(1);
         let slice = per * 64 * 16 * runs * 2;
         let most = words.div_ceil(per).min(rayon::current_num_threads()).max(1);
         let running = (room / slice).clamp(1, most);
-        (running, running * slice)
+        let entries: u64 = self.version.runs().map(|run| run.entries()).sum();
+        let parts = entries as usize / crate::index::GROUP_PART + 2 * runs * running;
+        let part = std::mem::size_of::<usize>()
+            + std::mem::size_of::<Vec<(u64, i64)>>()
+            + 4 * std::mem::size_of::<(u64, i64)>();
+        (running, running * slice + parts * part)
     }
 
     /// Whether a statement this snapshot shows in `scope`'s graphs in `model` has `id` at
