@@ -479,10 +479,7 @@ pub(crate) fn delete_insert(
             },
         };
         let graph = |g: &GraphNamePattern| match g {
-            GraphNamePattern::NamedNode(n) if crate::compat::names_default_graph(n.as_str()) => {
-                Some(nrese_rdf::GraphName::DefaultGraph)
-            }
-            GraphNamePattern::NamedNode(n) => Some(nrese_rdf::GraphName::from(n.clone())),
+            GraphNamePattern::NamedNode(n) => Some(crate::compat::graph_named(n).into_owned()),
             GraphNamePattern::DefaultGraph => Some(nrese_rdf::GraphName::DefaultGraph),
             GraphNamePattern::Variable(v) => match value(v)? {
                 Term::NamedNode(n) => Some(n.into()),
@@ -2165,16 +2162,16 @@ impl<'a> Context<'a> {
             // Jena's name for the default graph (`compat`): the store's default graph, where
             // it is in reach; for a reader who may not read it, absent as an unreadable named
             // graph is (below).
-            NamedNodePattern::NamedNode(n)
-                if crate::compat::names_default_graph(n.as_str()) && self.store_default =>
-            {
-                return self.in_graph(GraphScope::Default, inner);
-            }
             NamedNodePattern::NamedNode(n) => {
-                let id = (!crate::compat::names_default_graph(n.as_str()))
-                    .then(|| self.lookup_const(n.as_ref().into()))
-                    .flatten()
-                    .filter(|&id| self.is_named_graph(id));
+                let id = match crate::compat::graph_named(n) {
+                    nrese_rdf::GraphNameRef::DefaultGraph if self.store_default => {
+                        return self.in_graph(GraphScope::Default, inner);
+                    }
+                    nrese_rdf::GraphNameRef::DefaultGraph => None,
+                    _ => self
+                        .lookup_const(n.as_ref().into())
+                        .filter(|&id| self.is_named_graph(id)),
+                };
                 return match id {
                     Some(id) => self.in_graph(GraphScope::Named(id), inner),
                     // No such graph in the dataset: no solutions, whatever the pattern
