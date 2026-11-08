@@ -727,3 +727,5 @@ fn roles_grant_service_and_keep_it() {
     assert!(service("federator"));
     assert!(!service("reader"));
 }
+
+mod identity;
