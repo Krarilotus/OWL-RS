@@ -238,6 +238,15 @@ fn bytes_of<T>(capacity: usize) -> usize {
     capacity.saturating_mul(std::mem::size_of::<T>())
 }
 
+/// The most a vector of `capacity` values holds while it makes room for `wanted`: its old
+/// room and the new together while it moves.
+fn moved<T>(capacity: usize, wanted: usize) -> usize {
+    match wanted > capacity {
+        true => bytes_of::<T>(capacity).saturating_add(bytes_of::<T>(wanted)),
+        false => bytes_of::<T>(capacity),
+    }
+}
+
 /// An alternative's bags put together as its arms arrive, one at a time
 /// ([`PathEvaluator::either`]).
 enum Union<T> {
@@ -270,11 +279,13 @@ impl<T: Copy + Eq + std::hash::Hash + Ord> Union<T> {
         }
     }
 
-    /// The bytes it holds once [`Self::add`] made room for `arm`, named `times`.
-    fn bytes_with(&self, arm: &Bag<T>, times: usize) -> usize {
+    /// The most it holds while [`Self::add`] makes room for `arm`, named `times`: a vector
+    /// that grows moves, its old room beside the new until the move ends, as the budget
+    /// owner's `ChargedVec` charges it (sol-loop r1 S3 of EMS-R1).
+    fn peak_with(&self, arm: &Bag<T>, times: usize) -> usize {
         let room = |values: &Vec<T>| {
             let wanted = values.len().saturating_add(arm.entries());
-            bytes_of::<T>(values.capacity().max(wanted))
+            moved::<T>(values.capacity(), wanted)
         };
         match self {
             Self::Copies(values) if times == 1 && matches!(arm, Bag::Copies(_)) => room(values),
@@ -284,7 +295,10 @@ impl<T: Copy + Eq + std::hash::Hash + Ord> Union<T> {
                 let tally = Tally::<T>::bytes_for(wanted, wanted);
                 bytes_of::<T>(values.capacity()).saturating_add(tally)
             }
-            Self::Counted(tally) => tally.bytes_with(arm.entries()),
+            Self::Counted(tally) => match (tally.bytes(), tally.bytes_with(arm.entries())) {
+                (now, then) if then > now => now.saturating_add(then),
+                (now, _) => now,
+            },
             Self::Support { values, .. } => room(values),
         }
     }
@@ -506,8 +520,13 @@ impl PathEvaluator<'_> {
         }
     }
 
-    /// [`transitive_closure_until`] stopped with the query: then empty.
+    /// [`transitive_closure_until`] stopped with the query: then empty. None of edges a
+    /// refused charge cut short (sol-loop r1 S2 of EMS-R1): they are no path's, and their
+    /// closure would be built for nothing (no charge is taken while it runs).
     fn closure_of(&self, edges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+        if self.stopped() {
+            return Vec::new();
+        }
         self.closures.set(self.closures.get() + 1);
         let cancellation = self.cancellation;
         let stop = move || cancellation.is_some_and(crate::CancellationToken::is_cancelled);
@@ -877,7 +896,7 @@ impl PathEvaluator<'_> {
             let arm = bag(arm);
             let mut arrived = 0;
             let fits = self.hold(&mut arrived, arm.bytes())
-                && self.hold(&mut held, union.bytes_with(&arm, times));
+                && self.hold(&mut held, union.peak_with(&arm, times));
             if fits {
                 union.add(arm, times, i + 1 == arms.len());
             }
@@ -1052,6 +1071,10 @@ impl PathEvaluator<'_> {
 
     /// The pairs of each of `nodes` (distinct) with each value of its bag, `pair` making a
     /// `(start, end)` pair of the node and the value: copies while every bag is copies.
+    /// Each node's bag is charged as it arrives and the pairs' room before it grows, as an
+    /// alternative's union is ([`Self::either`]): the bags of 64 distinct arms from 4,096
+    /// bound values are 64 pairs a node (sol-loop r1 S1 of EMS-R1). What it returns is no
+    /// longer charged: the path's table charges it.
     fn pairs_at(
         &self,
         nodes: &[u64],
@@ -1059,19 +1082,71 @@ impl PathEvaluator<'_> {
         pair: impl Fn(u64, u64) -> (u64, u64),
     ) -> Bag<(u64, u64)> {
         let (mut copies, mut counted) = (Vec::new(), Vec::new());
+        let (mut held_copies, mut held_counted) = (0, 0);
         for &node in nodes.iter().take_while(|_| !self.stopped()) {
-            match bag(node) {
-                Bag::Copies(values) => copies.extend(values.into_iter().map(|v| pair(node, v))),
-                Bag::Counted(values) => {
-                    counted.extend(values.into_iter().map(|(v, n)| (pair(node, v), n)));
+            let bag = bag(node);
+            let mut arrived = 0;
+            let fits = self.hold(&mut arrived, bag.bytes())
+                && match &bag {
+                    Bag::Copies(values) => {
+                        self.room(&mut held_copies, &mut copies, values.len(), true)
+                    }
+                    Bag::Counted(values) => {
+                        self.room(&mut held_counted, &mut counted, values.len(), true)
+                    }
+                };
+            if fits {
+                match bag {
+                    Bag::Copies(values) => {
+                        copies.extend(values.into_iter().map(|v| pair(node, v)));
+                    }
+                    Bag::Counted(values) => {
+                        counted.extend(values.into_iter().map(|(v, n)| (pair(node, v), n)));
+                    }
                 }
             }
+            self.hold(&mut arrived, 0);
+            if !fits {
+                break;
+            }
         }
-        if counted.is_empty() {
-            return Bag::Copies(copies);
+        let pairs = match counted.is_empty() {
+            true => Bag::Copies(copies),
+            false => {
+                if self.room(&mut held_counted, &mut counted, copies.len(), false) {
+                    counted.extend(copies.into_iter().map(|pair| (pair, 1)));
+                }
+                Bag::Counted(counted)
+            }
+        };
+        self.hold(&mut held_copies, 0);
+        self.hold(&mut held_counted, 0);
+        pairs
+    }
+
+    /// Room for `additional` more values in `values`, its bytes held in `held` first: the
+    /// old room and the new together while the vector moves, then the new. `doubling`: at
+    /// least twice the old room, for a vector grown a bag at a time. False if refused.
+    fn room<T>(
+        &self,
+        held: &mut usize,
+        values: &mut Vec<T>,
+        additional: usize,
+        doubling: bool,
+    ) -> bool {
+        let wanted = values.len().saturating_add(additional);
+        if wanted <= values.capacity() {
+            return true;
         }
-        counted.extend(copies.into_iter().map(|pair| (pair, 1)));
-        Bag::Counted(counted)
+        let wanted = match doubling {
+            true => wanted.max(values.capacity().saturating_mul(2)),
+            false => wanted,
+        };
+        if !self.hold(held, moved::<T>(values.capacity(), wanted)) {
+            return false;
+        }
+        values.reserve_exact(wanted - values.len());
+        self.hold(held, bytes_of::<T>(values.capacity()))
     }
 
     /// The pairs of `path` as edges for a closure: each at least once ([`Self::support`]),
@@ -1424,5 +1499,44 @@ mod tests {
         let mut reached = evaluator.from(&plus, a).into_copies();
         reached.sort_unstable();
         assert_eq!(reached, vec![a.min(b), a.max(b)]);
+    }
+
+    /// Spec (sol-loop r1 S2 of EMS-R1): a charge the budget refused stops the evaluator, and
+    /// what it found so far is no answer, so no closure is built of it. Over 1,000 self-loops
+    /// and `m q m`, the arms `!(q)`, `!(q|q)`, `!(q|q|q)` under `+` under a 24 KiB budget: the
+    /// first arm's 1,000 pairs (16 KB) and the union's room for them don't fit together, so
+    /// the pairs are refused and no closure is computed.
+    #[test]
+    fn a_refused_alternative_builds_no_closure() {
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let [p, q, m] =
+            ["p", "q", "m"].map(|name| NamedNode::new_unchecked(format!("http://e/{name}")));
+        let mut tx = engine.transaction();
+        for i in 0..1000 {
+            let quad = Quad::new(node(i), p.clone(), node(i), GraphName::DefaultGraph);
+            tx.insert(quad.as_ref());
+        }
+        let marker = Quad::new(m.clone(), q.clone(), m, GraphName::DefaultGraph);
+        tx.insert(marker.as_ref());
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let arms = (1..=3)
+            .map(|i| PropertyPathExpression::NegatedPropertySet(vec![q.clone(); i]))
+            .collect();
+        let either = PropertyPathExpression::Alternative(arms);
+        let plus = Path::resolve(
+            &PropertyPathExpression::OneOrMore(Box::new(either)),
+            &snapshot,
+        );
+        let budget = Budget::new(24 << 10);
+        let evaluator = PathEvaluator::new(
+            &snapshot,
+            ReadModel::default(),
+            PathGraph::Default,
+            None,
+            &budget,
+        );
+        assert!(evaluator.pairs(&plus).is_err(), "the pairs are refused");
+        assert_eq!(evaluator.closures.get(), 0, "no closure of refused pairs");
     }
 }
