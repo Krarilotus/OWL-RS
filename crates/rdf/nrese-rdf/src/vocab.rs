@@ -110,18 +110,22 @@ vocabulary!(
 );
 
 vocabulary!(
-    /// OWL 2 (`owl:`): the terms the RL rules and the OWL 2 datatype map use.
+    /// OWL 2 (`owl:`): the terms the RL rules, the OWL 2 datatype map and the QL schema
+    /// reader use.
     owl = "http://www.w3.org/2002/07/owl#" {
         ALL_DIFFERENT = "AllDifferent",
         ALL_DISJOINT_CLASSES = "AllDisjointClasses",
         ALL_DISJOINT_PROPERTIES = "AllDisjointProperties",
         ALL_VALUES_FROM = "allValuesFrom",
+        ANNOTATION_PROPERTY = "AnnotationProperty",
         ASSERTION_PROPERTY = "assertionProperty",
         ASYMMETRIC_PROPERTY = "AsymmetricProperty",
+        CARDINALITY = "cardinality",
         CLASS = "Class",
         COMPLEMENT_OF = "complementOf",
         DATATYPE_PROPERTY = "DatatypeProperty",
         DIFFERENT_FROM = "differentFrom",
+        DISJOINT_UNION_OF = "disjointUnionOf",
         DISJOINT_WITH = "disjointWith",
         DISTINCT_MEMBERS = "distinctMembers",
         EQUIVALENT_CLASS = "equivalentClass",
@@ -137,17 +141,22 @@ vocabulary!(
         MAX_CARDINALITY = "maxCardinality",
         MAX_QUALIFIED_CARDINALITY = "maxQualifiedCardinality",
         MEMBERS = "members",
+        MIN_CARDINALITY = "minCardinality",
+        MIN_QUALIFIED_CARDINALITY = "minQualifiedCardinality",
         NAMED_INDIVIDUAL = "NamedIndividual",
         NEGATIVE_PROPERTY_ASSERTION = "NegativePropertyAssertion",
         NOTHING = "Nothing",
         OBJECT_PROPERTY = "ObjectProperty",
         ON_CLASS = "onClass",
+        ON_DATA_RANGE = "onDataRange",
         ON_PROPERTY = "onProperty",
         ONE_OF = "oneOf",
         PROPERTY_CHAIN_AXIOM = "propertyChainAxiom",
         PROPERTY_DISJOINT_WITH = "propertyDisjointWith",
+        QUALIFIED_CARDINALITY = "qualifiedCardinality",
         RATIONAL = "rational",
         REAL = "real",
+        REFLEXIVE_PROPERTY = "ReflexiveProperty",
         RESTRICTION = "Restriction",
         SAME_AS = "sameAs",
         SOME_VALUES_FROM = "someValuesFrom",
