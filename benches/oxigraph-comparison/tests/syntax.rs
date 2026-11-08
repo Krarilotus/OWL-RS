@@ -1161,19 +1161,19 @@ const EXPLAINED: &[(&str, &str, &str)] = &[
     (
         "sparql10/syntax-sparql2/syntax-general-04.rq",
         "different algebra",
-        "SPARQL 1.1 section 19.8 note 3 requires the longest token: NumericLiteralPositive [130] \
+        "SPARQL 1.1 section 19.8 note 3 requires the longest token: NumericLiteralPositive [132] \
          consumes `+11`; spargebra 0.4.6 instead consumes `+` as PathMod [93]",
     ),
     (
         "sparql10/syntax-sparql2/syntax-general-07.rq",
         "different algebra",
-        "SPARQL 1.1 section 19.8 note 3 requires the longest token: NumericLiteralPositive [130] \
+        "SPARQL 1.1 section 19.8 note 3 requires the longest token: NumericLiteralPositive [132] \
          consumes `+1.0`; spargebra 0.4.6 instead consumes `+` as PathMod [93]",
     ),
     (
         "sparql10/syntax-sparql2/syntax-general-10.rq",
         "different algebra",
-        "SPARQL 1.1 section 19.8 note 3 requires the longest token: NumericLiteralPositive [130] \
+        "SPARQL 1.1 section 19.8 note 3 requires the longest token: NumericLiteralPositive [132] \
          consumes `+1.0e+1`; spargebra 0.4.6 instead consumes `+` as PathMod [93]",
     ),
     (
