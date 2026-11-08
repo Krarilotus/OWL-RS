@@ -108,8 +108,11 @@ struct Builder {
     /// Generating axioms: (left, role, filler, data).
     generating: Vec<(u32, Role, Option<u32>, bool)>,
     fresh: HashMap<ExprId, u32>,
-    /// The right sides, or parts of them, read as nothing ([`Self::superclass`]): the
-    /// ledger the hazards classify, so what the TBox leaves out is never re-derived there.
+    /// The conclusions, or parts of them, the TBox doesn't read, per axiom: a right side
+    /// `superclass` reads as nothing, the right side of a left side read only in part
+    /// ([`Self::subclass`]), and a disjoint union's parts as the class's covering. This is
+    /// the ledger the hazards classify, so what the TBox leaves out is never re-derived
+    /// there.
     unread: std::collections::BTreeSet<ExprId>,
 }
 
@@ -503,9 +506,14 @@ impl Builder {
             Axiom::DisjointUnion(class, parts) => {
                 let class = self.basic(Basic::Class(*class));
                 for &part in parts {
-                    for (left, _) in self.lefts(o, part) {
+                    // A part the TBox reads only in part concludes the class only: nothing to
+                    // record.
+                    for (left, _) in self.lefts(o, part, &mut true) {
                         self.include(left, class, false);
                     }
+                    // The direction from the class to the union isn't read (review r1, F2):
+                    // the union's existentials are each part's.
+                    self.unread.insert(part);
                 }
             }
             Axiom::SubObjectPropertyOf(chain, sup) if chain.len() == 1 => {
@@ -569,14 +577,22 @@ impl Builder {
     }
 
     fn subclass(&mut self, o: &Ontology, sub: ExprId, sup: ExprId) {
-        for (left, base) in self.lefts(o, sub) {
+        let mut whole = true;
+        for (left, base) in self.lefts(o, sub, &mut whole) {
             self.superclass(o, left, sup, base);
+        }
+        // Individuals in the part of `sub` that isn't read are in `sup` unread (review r1,
+        // F1: `A ⊓ B ⊑ ∃S.D`).
+        if !whole {
+            self.unread.insert(sup);
         }
     }
 
     /// The basic concepts a subclass expression is read as, each with whether the
     /// materialisation applies an inclusion from it (`cax-sco`, `cls-svf2`, `cls-uni`).
-    fn lefts(&mut self, o: &Ontology, expr: ExprId) -> Vec<(u32, bool)> {
+    /// `whole` is cleared where some part of it isn't read: no basic concept, or a union's
+    /// branch without one.
+    fn lefts(&mut self, o: &Ontology, expr: ExprId, whole: &mut bool) -> Vec<(u32, bool)> {
         match o.class(expr) {
             ClassExpr::Class(a) => vec![(self.basic(Basic::Class(*a)), true)],
             ClassExpr::Thing => vec![(self.basic(Basic::Thing), false)],
@@ -602,11 +618,14 @@ impl Builder {
                 parts
                     .clone()
                     .into_iter()
-                    .flat_map(|part| self.lefts(o, part))
+                    .flat_map(|part| self.lefts(o, part, whole))
                     .map(|(left, base)| (left, base && lists))
                     .collect()
             }
-            _ => Vec::new(),
+            _ => {
+                *whole = false;
+                Vec::new()
+            }
         }
     }
 

@@ -41,8 +41,9 @@ pub enum Hazard {
     Filler(Term),
     /// The role of an existential an individual is asserted to be in.
     Asserted(Term),
-    /// The role of an existential in a right side the TBox reads as nothing (under a
-    /// universal, a union, a complement): anonymous individuals no generator types (I24b).
+    /// The role of an existential in a conclusion the TBox doesn't read (under a universal,
+    /// a union or a complement, after a left side it doesn't read, a disjoint union's
+    /// covering): anonymous individuals no generator types (I24b).
     Untyped(Term),
     /// A term on the right of an axiom whose left side any individual may be in, with
     /// none of that side's classes or properties (`⊤ ⊓ ≥ 0 R.⊤`, `B ⊔ ¬B`), where the
@@ -109,7 +110,7 @@ impl Hazard {
                 format!("an individual is asserted to be in an existential on {t}")
             }
             Self::Untyped(_) => {
-                format!("an existential on {t} under a universal, union or complement")
+                format!("an existential on {t} in a conclusion the TBox doesn't read")
             }
             Self::OpenLeft(_) => {
                 format!("an axiom on {t} whose left side any individual may be in")
@@ -301,8 +302,8 @@ fn terms(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
 }
 
 /// The hazards of `o` and the terms they reach, given the anonymous individuals' types
-/// (`types`, with `basics` naming their concepts) and the right sides the TBox read as
-/// nothing (`unread`, its ledger).
+/// (`types`, with `basics` naming their concepts) and the conclusions the TBox doesn't read
+/// (`unread`, its ledger).
 pub(crate) fn hazards(
     o: &Ontology,
     types: &[Type],
@@ -457,8 +458,8 @@ pub(crate) fn hazards(
         }
     }
     found.extend(collect.found);
-    // The ledger: a right side the TBox reads as nothing leaves the anonymous individuals
-    // of its existentials untyped. Each is seeded like an asserted one: its role, and its
+    // The ledger: a conclusion the TBox doesn't read leaves the anonymous individuals of
+    // its existentials untyped. Each is seeded like an asserted one: its role, and its
     // filler's terms.
     let mut untyped: Vec<(Term, Hazard)> = Vec::new();
     for &e in unread {
