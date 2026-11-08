@@ -828,9 +828,14 @@ class Driver(unittest.TestCase):
         export holds every file of the commit's tree with its committed bytes, nothing else; a build
         in it reads its committed .cargo/config.toml and is controlled."""
         self.checkout(self.root, "suite")
-        (self.root / "version.txt").write_text("$Format:%H$\n", encoding="utf-8", newline="\n")
-        self.git(self.root, "add", "version.txt")
-        self.git(self.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "subst")
+        raw = {"version.txt": (b"$Format:%H$\n", "100644"), "crlf.txt": (b"a\r\nb\r\n", "100644"),
+               "no-newline.txt": (b"no newline", "100644"), "bin.dat": (bytes(range(256)), "100644"),
+               "run.sh": (b"#!/bin/sh\nexit 0\n", "100755")}
+        for path, (data, mode) in raw.items():  # as committed bytes, no filter on the way in either
+            blob = subprocess.run(["git", "-C", str(self.root), "hash-object", "-w", "--no-filters", "--stdin"],
+                                  input=data, capture_output=True, check=True).stdout.decode().strip()
+            self.git(self.root, "update-index", "--add", "--cacheinfo", f"{mode},{blob},{path}")
+        self.git(self.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "raw")
         commit = self.git(self.root, "rev-parse", "HEAD")
         attributes = self.root / "data" / "attributes"
         attributes.write_text(".cargo/config.toml export-ignore\nversion.txt export-subst\n", encoding="utf-8")
@@ -842,20 +847,79 @@ class Driver(unittest.TestCase):
         self.git(self.root, "replace", lock, other)
         external = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.attributesFile",
                     "GIT_CONFIG_VALUE_0": str(attributes)}
-        expected = {path: self.git(self.root, "--no-replace-objects", "cat-file", "blob", f"{commit}:{path}")
-                    for path in self.git(self.root, "ls-tree", "-r", "--name-only", commit).splitlines()}
+        def blob(path: str) -> bytes:
+            return subprocess.run(["git", "-C", str(self.root), "--no-replace-objects", "cat-file", "blob",
+                                   f"{commit}:{path}"], capture_output=True, check=True).stdout
+        listed = self.git(self.root, "ls-tree", "-r", "--name-only", commit).splitlines()
+        expected = {path: blob(path) for path in listed}
+        for path, (data, _) in raw.items():
+            self.assertEqual(expected[path], data)  # the fixture is what the commit holds
         with tempfile.TemporaryDirectory() as d, patch.dict(driver.os.environ, external):
             driver.export_commit(self.root, commit, Path(d))
-            got = {f.relative_to(d).as_posix(): f.read_text(encoding="utf-8").strip()
-                   for f in Path(d).rglob("*") if f.is_file()}
+            got = {f.relative_to(d).as_posix(): f.read_bytes() for f in Path(d).rglob("*") if f.is_file()}
+            executable = os.access(Path(d) / "run.sh", os.X_OK)
+            plain = os.access(Path(d) / "crlf.txt", os.X_OK)
         self.assertEqual(set(got), set(expected))  # .cargo/config.toml and Cargo.lock both there
-        self.assertEqual(got, {k: v.strip() for k, v in expected.items()})  # $Format$ kept, Cargo.lock not replaced
+        self.assertEqual(got, expected)  # byte for byte: $Format$ kept, Cargo.lock not replaced, CRLF as committed
+        if os.name != "nt":  # Windows has no mode bits
+            self.assertTrue(executable)
+            self.assertFalse(plain)
         base = self.clean_root()
         with patch.dict(driver.os.environ, {**external, "CARGO_HOME": str(self.root / "no-cargo-home")}):
             build = self.built(export_base=base)
         for made in self.builds:
             self.assertIn(".cargo/config.toml", made["files"])
         self.assertIs(build["nrese"]["controlled"], True)
+
+    def commit_with(self, entries: dict) -> str:
+        """A commit of self.root whose tree is `entries` (path -> bytes), built with git mktree, which
+        keeps any name (git's index refuses some on Windows): for names an export must refuse."""
+        def blob(data: bytes) -> str:
+            return subprocess.run(["git", "-C", str(self.root), "hash-object", "-w", "--no-filters", "--stdin"],
+                                  input=data, capture_output=True, check=True).stdout.decode().strip()
+
+        def tree(level: dict) -> str:
+            lines = b""
+            for name, value in sorted(level.items()):
+                kind, oid = ("tree", tree(value)) if isinstance(value, dict) else ("blob", blob(value))
+                lines += f"{'040000' if kind == 'tree' else '100644'} {kind} {oid}\t{name}".encode() + b"\0"
+            return subprocess.run(["git", "-C", str(self.root), "mktree", "-z"], input=lines, capture_output=True,
+                                  check=True).stdout.decode().strip()
+        nested = {}
+        for path, data in entries.items():
+            level = nested
+            *dirs, name = path.split("/")
+            for d in dirs:
+                level = level.setdefault(d, {})
+            level[name] = data
+        return self.git(self.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit-tree", "-m", "names",
+                        tree(nested))
+
+    def test_an_export_refuses_every_name_its_filesystem_would_read_otherwise(self):
+        """P1e review r2 F1 (master 00:03): Windows reads names git keeps as plain characters: a
+        backslash as a directory, `..\\x` outside the export (surviving its removal), a colon as a
+        drive or an alternate stream, a device name, a trailing dot or space dropped. An export accepts
+        only portable names (attack 19) and refuses the whole tree otherwise, before writing anything:
+        the export directory stays empty and nothing appears beside it, on every system."""
+        self.checkout(self.root, "suite")
+        bad = ["dir\\file", "..\\outside.txt", "normal:stream", "C:x", "CON", "con.txt", "nul/x", "Aux .txt",
+               "COM1", "lpt9.log", "trail.", "trail ", "na\u00efve", "a*b", "q?", 'quote"', "lt<", "pipe|",
+               "tab\tname", "nested/dir\\file"]
+        for name in bad:
+            with self.subTest(name):
+                commit = self.commit_with({"Cargo.toml": b"[workspace]\n", name: b"x"})
+                with tempfile.TemporaryDirectory() as d:
+                    outer = Path(d)
+                    export = outer / "export"
+                    export.mkdir()
+                    with self.assertRaises(OSError):
+                        driver.export_commit(self.root, commit, export)
+                    self.assertEqual(list(export.iterdir()), [])  # nothing written, not even the good file
+                    self.assertEqual([p.name for p in outer.iterdir()], ["export"])  # nothing beside it
+        good = self.commit_with({"a/b c/d+e@f-g_h.txt": b"ok", ".cargo/config.toml": b"[build]\n", "..x": b"y"})
+        with tempfile.TemporaryDirectory() as d:
+            driver.export_commit(self.root, good, Path(d))
+            self.assertEqual((Path(d) / "a" / "b c" / "d+e@f-g_h.txt").read_bytes(), b"ok")
 
     def test_an_export_refuses_what_isn_t_a_plain_file(self):
         """P1e review r1 F1, attack 14: a symlink (or submodule) entry is refused, never followed nor

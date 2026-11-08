@@ -1300,12 +1300,29 @@ def build_export_base(checkout: Path) -> Path:
     return checkout.resolve().parent
 
 
+# The names an export writes (P1e review r2 F1, attack 19): Windows reads a backslash as a directory,
+# a colon as a drive or an alternate stream, a device name as a device, and drops a trailing dot or
+# space, all of which git keeps as plain characters. A component is written only if it is one or more
+# of these characters, not . or .., not ending in a dot or a space, and not a device name before its
+# first dot; anything else refuses the whole export. OWL-RS's tree has none of the others.
+PORTABLE_NAME = re.compile(r"[A-Za-z0-9._+@ -]+")
+DEVICE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                          *(f"LPT{i}" for i in range(1, 10))})
+
+
+def portable_name(component: str) -> bool:
+    """Whether `component` names the same file on every filesystem the suite builds on."""
+    return (PORTABLE_NAME.fullmatch(component) is not None and component not in (".", "..")
+            and not component.endswith((".", " ")) and component.split(".")[0].rstrip(" ").upper() not in DEVICE_NAMES)
+
+
 def export_commit(checkout: Path, commit: str, dest: Path, timeout: float = 600) -> None:
     """`dest` <- the tree of `commit` in `checkout`, exactly: every entry of its tree (git ls-tree)
     written with its object's bytes (git cat-file --batch), so no attribute applies (export-ignore,
     export-subst, a filter, from the commit or outside it: P1e review r1 F1), nor a replace ref
-    (--no-replace-objects). A plain file or an executable only: a symlink, a submodule, an unsafe
-    path or two paths this filesystem can't tell apart refuse it. Its files have the time they're
+    (--no-replace-objects). A plain file or an executable only, under a portable name
+    (portable_name) whose destination is inside `dest`: a symlink, a submodule, any other name, or two
+    paths this filesystem can't tell apart refuse it, before anything is written. Its files have the time they're
     written, never the commit's (cargo decides freshness by mtimes: an older commit's would read as
     older than the last build's outputs, a stale binary). One deadline for the whole export, its git
     children killed at it (r1 F4). Raises OSError where it can't be made exactly."""
@@ -1326,6 +1343,7 @@ def export_commit(checkout: Path, commit: str, dest: Path, timeout: float = 600)
         said = listed.stderr.decode(errors="replace").strip().splitlines()
         raise OSError(f"git ls-tree {commit[:12]} exited {listed.returncode}: {said[-1] if said else 'no output'}")
     entries, seen, spelled = [], set(), {}
+    root = dest.resolve()
     for record in filter(None, listed.stdout.split(b"\0")):
         meta, _, raw = record.partition(b"\t")
         mode, kind, oid = meta.split(b" ")
@@ -1333,8 +1351,10 @@ def export_commit(checkout: Path, commit: str, dest: Path, timeout: float = 600)
         if kind != b"blob" or mode not in (b"100644", b"100755"):
             raise OSError(f"{path}: a {kind.decode()} of mode {mode.decode()}, not a plain file: not exported")
         parts = path.split("/")
-        if path.startswith("/") or any(part in ("", ".", "..") for part in parts):
-            raise OSError(f"{path}: not a path inside the export")
+        if not all(map(portable_name, parts)):
+            raise OSError(f"{path}: not a portable name (P1e attack 19): not exported")
+        if not dest.joinpath(*parts).resolve().is_relative_to(root):
+            raise OSError(f"{path}: outside the export")
         # Every directory on the way, and the file, as this filesystem names it: two spellings git keeps
         # apart and it merges (case on Windows) refuse (sol-loop r3 S3).
         for depth in range(1, len(parts) + 1):
