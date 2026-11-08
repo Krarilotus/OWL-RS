@@ -150,12 +150,26 @@ pub(crate) struct Bounds {
     /// Taxonomies being built, by U1's compilation ([`State::compiled`]).
     taxonomies: BuildCell<u64, Taxonomy>,
     compilations: AtomicU64,
+    /// What the bounds keep is charged here while they keep it (SYN-61): the store's, within
+    /// the queries' memory ([`Bounds::set_kept`]); unlimited until the store sets it.
+    kept: std::sync::OnceLock<Arc<nrese_exec::Budget>>,
 }
 
 impl Bounds {
     /// A new compilation's number.
     fn compiled(&self) -> u64 {
         self.compilations.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The budget what the bounds keep is charged to: set once, by the store, before any read.
+    pub(crate) fn set_kept(&self, budget: Arc<nrese_exec::Budget>) {
+        let _ = self.kept.set(budget);
+    }
+
+    /// What the bounds keep is charged to (`Bounds::set_kept`).
+    pub(crate) fn kept(&self) -> &Arc<nrese_exec::Budget> {
+        self.kept
+            .get_or_init(|| Arc::new(nrese_exec::Budget::unlimited()))
     }
 }
 
@@ -561,7 +575,12 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
     };
     #[cfg(test)]
     seam::at(bounds, seam::Point::View);
-    let view = Arc::new(assemble(snapshot, parts));
+    let (view, charged) = assemble(snapshot, parts, bounds.kept());
+    let view = Arc::new(view);
+    if !charged {
+        // Not kept: the next read of the revision tries again.
+        return Some(view);
+    }
     let mut cached = lock(&bounds.view);
     if cached.as_ref().is_none_or(|v| v.revision < view.revision) {
         *cached = Some(Arc::clone(&view));
@@ -646,29 +665,50 @@ struct Parts {
     /// The view, its snapshots still `snapshot` itself.
     view: View,
     /// L's memberships from the taxonomy.
-    lower: Vec<EncodedQuad>,
+    lower: Vec<EncodedTriple>,
     upper: Option<UpperParts>,
 }
 
 /// What the upper view takes of U1.
 struct UpperParts {
     /// L's memberships over representatives (`None`: `Parts::lower` as they are).
-    over_representatives: Option<Vec<EncodedQuad>>,
+    over_representatives: Option<Vec<EncodedTriple>>,
     /// U1's facts beyond them.
-    facts: Vec<EncodedQuad>,
+    facts: Vec<EncodedTriple>,
     /// `owl:sameAs`, where U1 has classes.
     same_as: Option<u64>,
 }
 
-/// The view's runs, from what it took of U1: Rayon work, with no lock held.
-fn assemble(snapshot: &Snapshot, parts: Parts) -> View {
+/// The view's runs, from what it took of U1: Rayon work, with no lock held. What the view
+/// keeps is charged to `kept` before it is made (SYN-61), and `true`; where `kept` can't take
+/// it, the view of an unavailable U1 instead (sound only), and `false`: not to be kept.
+fn assemble(snapshot: &Snapshot, parts: Parts, kept: &Arc<nrese_exec::Budget>) -> (View, bool) {
     let Parts {
         mut view,
         lower,
         upper,
     } = parts;
+    let refused = |view: View| View {
+        lower: snapshot.clone(),
+        lower_facts: 0,
+        upper: None,
+        unavailable: Some(
+            "the upper bound isn't available: its view doesn't fit the queries' memory".to_owned(),
+        ),
+        gap_classes: HashSet::new(),
+        gap_predicates: HashSet::new(),
+        named_gap_classes: HashSet::new(),
+        named_gap_predicates: HashSet::new(),
+        internal: HashSet::new(),
+        facts: 0,
+        proves_consistency: false,
+        ..view
+    };
     if !lower.is_empty() {
-        view.lower = snapshot.with_inferred_added(&lower);
+        match snapshot.with_inferred_added_within(&lower, kept) {
+            Ok(lower) => view.lower = lower,
+            Err(_) => return (refused(view), false),
+        }
     }
     if let Some(UpperParts {
         over_representatives,
@@ -676,16 +716,18 @@ fn assemble(snapshot: &Snapshot, parts: Parts) -> View {
         same_as,
     }) = upper
     {
-        let mut quads = over_representatives.unwrap_or(lower);
-        quads.extend(facts);
-        let upper_view = snapshot.with_inferred_added(&quads);
+        let mut triples = over_representatives.unwrap_or(lower);
+        triples.extend(facts);
+        let Ok(upper_view) = snapshot.with_inferred_added_within(&triples, kept) else {
+            return (refused(view), false);
+        };
         // Read expanded to every identity of U1's classes (the stack keeps representatives).
         view.upper = Some(match same_as {
             None => upper_view,
             Some(same_as) => upper_view.with_equality(Some(TermId::from_raw(same_as))),
         });
     }
-    view
+    (view, true)
 }
 
 /// What a view of `revision` takes of U1 and of L's memberships `lower`: serial, O(U1's
@@ -752,9 +794,8 @@ fn parts(
             TermId::from_raw(p),
             TermId::from_raw(o),
         )
-        .in_default_graph()
     };
-    let lower_quads: Vec<EncodedQuad> = lower.iter().map(|&t| encode(t)).collect();
+    let lower_triples: Vec<EncodedTriple> = lower.iter().map(|&t| encode(t)).collect();
     let mut view = View {
         revision,
         lower: snapshot.clone(),
@@ -786,13 +827,13 @@ fn parts(
     let named = |t: u64| !upper.is_internal(t) || named_classes.contains(&t);
     // L's memberships beside it, over representatives as the expanded reads want them.
     let classes = upper.classes();
-    let over_representatives: Option<Vec<EncodedQuad>> = (!classes.is_empty()).then(|| {
+    let over_representatives: Option<Vec<EncodedTriple>> = (!classes.is_empty()).then(|| {
         lower
             .iter()
             .map(|&[s, p, o]| encode([classes.representative(s), p, classes.representative(o)]))
             .collect()
     });
-    let mut quads: Vec<EncodedQuad> = Vec::with_capacity(upper.stack.len());
+    let mut triples: Vec<EncodedTriple> = Vec::with_capacity(upper.stack.len());
     for [s, p, o] in upper.stack.iter() {
         // L's memberships from the taxonomy are certain: no gap.
         if lower.contains(&[s, p, o]) {
@@ -819,15 +860,15 @@ fn parts(
                 view.named_gap_predicates.insert(p);
             }
         }
-        quads.push(encode([s, p, o]));
+        triples.push(encode([s, p, o]));
     }
     let same_as = (!classes.is_empty()).then(|| upper.same_as());
     Parts {
         view,
-        lower: lower_quads,
+        lower: lower_triples,
         upper: Some(UpperParts {
             over_representatives,
-            facts: quads,
+            facts: triples,
             same_as,
         }),
     }
