@@ -1127,6 +1127,206 @@ mod tests {
         drop(held);
     }
 
+    /// A mapped checkpoint of `dictionary`'s first `len` entries, compressed, with its text
+    /// order: what a rebase serves them from.
+    fn mapped_base(dictionary: &Dictionary, len: u64, dir: &Path) -> super::Base {
+        let codec = Codec::train(&dictionary.export_keys(0, len));
+        let budget = Budget::unlimited();
+        let mut out = Checksummed {
+            inner: Vec::new(),
+            crc: crc32fast::Hasher::new(),
+            buffer: Vec::new(),
+            written: 0,
+            _held: Reservation::new(&budget),
+        };
+        super::write_dictionary(&mut out, dictionary, len, Some(&codec), &budget).unwrap();
+        super::write_text_order(&mut out, dictionary, len, &budget).unwrap();
+        out.flush_buffer().unwrap();
+        let path = dir.join("dictionary");
+        std::fs::write(&path, out.inner).unwrap();
+        let map = crate::mapped::map(&path).unwrap();
+        super::read_dictionary(&mut super::Reader::new(&map), &map, true, true, true).unwrap()
+    }
+
+    /// Package 1's rebase interleavings (`notes/2026-11-08-p1-prepared-install-design.md`,
+    /// T3–T5): a dictionary of `n` literals and a suffix of `added` more at its end.
+    fn with_suffix(n: u64, added: usize) -> (Dictionary, crate::term::suffix::Suffix, Vec<String>) {
+        let dictionary = Dictionary::default();
+        for i in 0..n {
+            dictionary.intern(LiteralRef::new_simple_literal(&format!("word {i}")).into());
+        }
+        let texts: Vec<String> = (0..added).map(|i| format!("added {i}")).collect();
+        let scratch = Dictionary::default();
+        for text in &texts {
+            scratch.intern(LiteralRef::new_simple_literal(text).into());
+        }
+        let budget = Arc::new(Budget::unlimited());
+        let mut suffix = crate::term::suffix::Suffix::at(dictionary.len(), budget);
+        for key in scratch.export_keys(0, scratch.len()) {
+            suffix
+                .push(&key, crate::term::hash::key_hash(&key))
+                .unwrap();
+        }
+        (dictionary, suffix, texts)
+    }
+
+    fn assert_added(dictionary: &Dictionary, n: u64, texts: &[String], row: &str) {
+        for (i, text) in texts.iter().enumerate() {
+            let id = dictionary
+                .lookup(LiteralRef::new_simple_literal(text).into())
+                .unwrap_or_else(|| panic!("{row}: {text} found"));
+            assert_eq!(id.payload(), n + i as u64, "{row}: {text}'s id");
+            assert_eq!(
+                dictionary.decode(id),
+                Some(Literal::new_simple_literal(text).into()),
+                "{row}: {text} decodes"
+            );
+        }
+    }
+
+    /// T3. A rebase between a prepared install and the install keeps the room it promised: the
+    /// install still allocates nothing, and every entry, old and added, is where it was.
+    /// Measured, alone.
+    #[test]
+    fn a_rebase_between_prepare_and_install_keeps_the_promised_room() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let n = 10_000;
+        let (dictionary, suffix, texts) = with_suffix(n, 2 * crate::term::BLOCK + 3);
+        let before = dictionary.export_keys(0, n);
+        let slot = parking_lot::Mutex::new(());
+        let guard = crate::term::slot::WriterGuard::hold(slot.lock());
+        let prepared = dictionary.prepare(&guard, &suffix).unwrap();
+        assert!(
+            dictionary
+                .rebase(mapped_base(&dictionary, 6_000, dir.path()))
+                .unwrap()
+        );
+        assert_eq!(
+            dictionary.promised(),
+            texts.len(),
+            "the promise kept across the rebase"
+        );
+        let ((), held) = nrese_exec::measure::measure(|| prepared.install());
+        assert_eq!(held, 0, "bytes allocated by the install after the rebase");
+        assert_eq!(dictionary.export_keys(0, n), before);
+        assert_added(&dictionary, n, &texts, "after the rebase");
+        dictionary.seal(&guard);
+        assert_added(&dictionary, n, &texts, "sealed");
+    }
+
+    /// T4. A rebase that finds no room for a promise gives up and changes nothing: the old state
+    /// and its promise stay, and the install goes on.
+    #[test]
+    fn a_rebase_without_room_for_the_promise_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = 10_000;
+        let (dictionary, suffix, texts) = with_suffix(n, 40);
+        let slot = parking_lot::Mutex::new(());
+        let guard = crate::term::slot::WriterGuard::hold(slot.lock());
+        let prepared = dictionary.prepare(&guard, &suffix).unwrap();
+        let base = mapped_base(&dictionary, 6_000, dir.path());
+        Dictionary::refuse_promised_room(true);
+        let refused = dictionary.rebase(base);
+        Dictionary::refuse_promised_room(false);
+        assert!(refused.is_err(), "the rebase gives up");
+        assert_eq!(
+            dictionary.stats().mapped_bytes,
+            0,
+            "the old state kept: nothing mapped"
+        );
+        assert_eq!(dictionary.promised(), 40, "the promise kept");
+        prepared.install();
+        assert_added(&dictionary, n, &texts, "installed after the refused rebase");
+    }
+
+    /// T5. A rebase between an install and its seal re-pushes the unsealed tail, sealing it as
+    /// it goes: the seal after it has nothing left to do, and every entry is where it was.
+    #[test]
+    fn a_rebase_between_install_and_seal_seals_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = 10_000;
+        let (dictionary, suffix, texts) = with_suffix(n, crate::term::BLOCK + 7);
+        let slot = parking_lot::Mutex::new(());
+        let guard = crate::term::slot::WriterGuard::hold(slot.lock());
+        dictionary.prepare(&guard, &suffix).unwrap().install();
+        assert!(dictionary.tail_len() >= crate::term::BLOCK, "unsealed");
+        assert!(
+            dictionary
+                .rebase(mapped_base(&dictionary, 6_000, dir.path()))
+                .unwrap()
+        );
+        assert!(
+            dictionary.tail_len() < crate::term::BLOCK,
+            "sealed by the rebase"
+        );
+        let tail = dictionary.tail_len();
+        dictionary.seal(&guard);
+        assert_eq!(dictionary.tail_len(), tail, "nothing left to seal");
+        assert_added(&dictionary, n, &texts, "rebased");
+    }
+
+    /// Package 2a (sol-loop r1 S3, S4). An overlay over a dictionary whose base is mapped and
+    /// compressed: its triple intern probes the base's compressed keys, and a view's charged
+    /// lookup of a triple term and of a literal too; what they allocate is charged first, at
+    /// the bound of either kind of base. The overlay's own block is the one allocation held
+    /// uncharged (design note §11). Measured, alone.
+    #[test]
+    fn overlay_probes_of_a_compressed_base_hold_only_what_they_charged() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = Arc::new(Dictionary::default());
+        let s = NamedNode::new_unchecked("http://e/s");
+        let p = NamedNode::new_unchecked("http://e/p");
+        dictionary.intern(s.as_ref().into());
+        dictionary.intern(p.as_ref().into());
+        for i in 0..10_000 {
+            dictionary.intern(LiteralRef::new_simple_literal(&format!("word {i}")).into());
+        }
+        let base = mapped_base(&dictionary, dictionary.len(), dir.path());
+        assert!(dictionary.rebase(base).unwrap());
+        assert!(dictionary.stats().mapped_bytes > 0, "the base is mapped");
+        let budget = Arc::new(Budget::unlimited());
+        let triple = nrese_rdf::Triple::new(s, p, Literal::new_simple_literal("word 5"));
+        let start = dictionary.len();
+        let overlay_block = 2 * size_of::<usize>() + size_of::<crate::term::overlay::Overlay>();
+        let ((), excess) = nrese_exec::measure::measure_within(&budget, || {
+            let overlay = crate::term::overlay::Overlay::over(
+                Arc::clone(&dictionary),
+                start,
+                Arc::clone(&budget),
+            );
+            let id = overlay.intern(nrese_rdf::TermRef::Triple(&triple)).unwrap();
+            assert!(
+                id.payload() >= start,
+                "a triple term the base lacks: the overlay's own"
+            );
+            let view = overlay.freeze().unwrap();
+            let mut held = Reservation::new(&*budget);
+            for term in [
+                nrese_rdf::TermRef::Triple(&triple),
+                LiteralRef::new_simple_literal("word 7").into(),
+            ] {
+                let found = view
+                    .lookup_charged(term, |bytes| held.charge(bytes))
+                    .unwrap();
+                assert!(found.is_some());
+            }
+            drop(held);
+            drop(view);
+            drop(overlay);
+        });
+        assert_eq!(
+            excess, overlay_block,
+            "bytes held beyond the charges: the overlay's own block alone"
+        );
+        assert_eq!(budget.used(), 0);
+    }
+
     /// Samples FSST trains on at its largest: the most keys a sample has, each empty (FSST
     /// copies the list of them), of either table; long keys of both (FSST samples them, one
     /// table trained while the other lives); every byte value, in no order (the most symbol

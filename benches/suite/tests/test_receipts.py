@@ -26,6 +26,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from suitekit import driver, ledger, manifest, receipts, schema  # noqa: E402
 from suitekit.workloads import Plan  # noqa: E402
 
+ROOT = Path(__file__).resolve().parents[3]  # this repository
+
 HEADER = ("date,host,runtime,system,version,publish,workload,tier,regime,run,task,item,repeat,status,ms,"
           "peak_mib,rows,bytes,note,cache,order,recall\n")
 
@@ -227,9 +229,10 @@ class Driver(unittest.TestCase):
         lines = (suite.results / "attempts.jsonl").read_text(encoding="utf-8").splitlines()
         return {a["cell"]: a for a in map(json.loads, filter(None, lines)) if "cell" in a}  # not invocations'
 
-    def system(self, images=()):
+    def system(self, images=(), script_builds=()):
         # definition_paths: what the reviewed head's adapters had (r1), so its red reaches the verdicts.
         return Mock(regimes={"none": ""}, images=Mock(return_value=list(images)), builds=Mock(return_value=[]),
+                    script_builds=Mock(return_value=list(script_builds)),
                     supports=Mock(return_value=None), definition_paths=())
 
     def run_tiers(self, suite, tiers, system, stop=lambda plan, run: False):
@@ -270,10 +273,99 @@ class Driver(unittest.TestCase):
         id), and so does the receipt; an image the pin map lacks is unknown."""
         suite = self.suite(runs=1)
         suite.manifest.update(images={"img:t": "sha256:B"})
-        with patch.object(driver.ns, "pinned", return_value={"img:t": "sha256:A"}):
+        # Docker's own answers mocked like every other docker call here: a host without docker runs
+        # this too (gate-windows-59532fff57-1794140734, khaleesi: FileNotFoundError).
+        with patch.object(driver.ns, "pinned", return_value={"img:t": "sha256:A"}), \
+                patch.object(driver, "run_quiet", return_value=Mock(returncode=0, stdout="\n", stderr="")):
             self.run_tiers(suite, [Plan("w", "1")], self.system(images=["img:t", "img:u"]))
-        self.assertEqual(self.cells(suite)["w/1/x"]["images"],
+        images = self.cells(suite)["w/1/x"]["images"]  # each with its source since F5 (below)
+        self.assertEqual({i: v["id"] for i, v in images.items()},
                          {"img:t": "sha256:A", "img:u": {"unknown": "not in the run's pin map"}})
+
+    def test_a_receipt_names_the_source_commit_an_image_was_built_at(self):
+        """Orchestrator, 8 Nov 13:39: an image built from a source checkout (images.sh: MillenniumDB,
+        G-CARE) carries its source commit beside its context's tree, both read off the id that ran,
+        so a build at another commit than its Dockerfile declares is visible as such."""
+        labels = {"sha256:A": ("benches/competitors/millenniumdb@" + "t" * 40, "ecbf6dde" + "0" * 32),
+                  "sha256:B": ("benches/competitors/jena@" + "t" * 40, "")}
+
+        def inspect(command, *a, **k):
+            built, commit = labels[command[-1]]
+            fields = command[-2].count("{{index")
+            return Mock(returncode=0, stdout=(built if fields == 1 else f"{built}|{commit}") + "\n", stderr="")
+        for pinned, expected in (("sha256:A", f"built from {labels['sha256:A'][0]}, source commit {labels['sha256:A'][1]}"),
+                                 ("sha256:B", f"built from {labels['sha256:B'][0]}")):
+            with self.subTest(pinned), patch.object(self, "root", self.root / pinned[-1]):
+                (self.root / "data").mkdir(parents=True)
+                suite = self.suite(runs=1)
+                with patch.object(driver.ns, "pinned", return_value={"img:t": pinned}), \
+                        patch.object(driver, "run_quiet", side_effect=inspect):
+                    self.run_tiers(suite, [Plan("w", "1")], self.system(images=["img:t"]))
+                self.assertEqual(self.cells(suite)["w/1/x"]["images"]["img:t"]["source"], expected)
+
+    def test_an_image_that_compiles_a_source_of_its_own_needs_its_source_commit_label(self):
+        """Review image-source-commit r1 F2 (orchestrator 18:26): an image its adapter declares built
+        from a source chosen apart from its context (script_builds: MillenniumDB's, by images.sh)
+        is known only with its source commit; its context's tree alone says unknown, why. An image
+        built from its context alone (builds: Jena's) is known by that tree, as before."""
+        tree = "t" * 40
+        labels = {"sha256:M": (f"benches/competitors/millenniumdb@{tree}", ""),
+                  "sha256:N": (f"benches/competitors/millenniumdb@{tree}", "ecbf6dde" + "0" * 32),
+                  "sha256:J": (f"benches/competitors/jena@{tree}", "")}
+
+        def inspect(command, *a, **k):
+            built, commit = labels[command[-1]]
+            return Mock(returncode=0, stdout=f"{built}|{commit}\n", stderr="")
+        declared = [("img:m", "competitors/millenniumdb", "MDB_COMMIT")]
+        for mdb, expected in (("sha256:M", None),
+                              ("sha256:N", f"built from benches/competitors/millenniumdb@{tree}, source commit "
+                                           + "ecbf6dde" + "0" * 32)):
+            with self.subTest(mdb), patch.object(self, "root", self.root / mdb[-1]):
+                (self.root / "data").mkdir(parents=True)
+                suite = self.suite(runs=1)
+                with patch.object(driver.ns, "pinned", return_value={"img:m": mdb, "img:j": "sha256:J"}), \
+                        patch.object(driver, "run_quiet", side_effect=inspect):
+                    self.run_tiers(suite, [Plan("w", "1")], self.system(images=["img:m", "img:j"],
+                                                                        script_builds=declared))
+                images = self.cells(suite)["w/1/x"]["images"]
+                if expected is None:
+                    self.assertIn("no source commit", images["img:m"]["source"]["unknown"])
+                else:
+                    self.assertEqual(images["img:m"]["source"], expected)
+                self.assertEqual(images["img:j"]["source"], f"built from benches/competitors/jena@{tree}")
+
+    def test_the_millenniumdb_adapter_declares_the_image_images_sh_builds_at_its_dockerfile_s_commit(self):
+        """Review r1 F2: the declaration is the adapter's own; its tag is the one images.sh builds
+        (nrese-bench/millenniumdb:<the declared commit's first seven>), so declaration, Dockerfile
+        and tag can't drift apart unnoticed."""
+        ctx = driver.Context(None, ROOT, ROOT, ROOT, driver.Mount("-", "/data"), [], 0, {}, "images")
+        mdb = driver.adapter("millenniumdb")
+        (tag, context, arg), = mdb.script_builds(ctx)
+        self.assertEqual(tag, mdb.images(ctx)[0])
+        declared = {line.split("=", 1)[1].strip() for line in
+                    (ROOT / "benches" / context / "Dockerfile").read_text(encoding="utf-8").splitlines()
+                    if line.startswith(f"ARG {arg}=")}
+        self.assertEqual(len(declared), 1)
+        self.assertEqual(tag, f"nrese-bench/millenniumdb:{declared.pop()[:7]}")
+
+    def test_a_receipt_says_why_an_image_s_source_couldn_t_be_read(self):
+        """#161's Windows gate (gate-windows-59532fff57-1794140734): reading an image's label raised
+        FileNotFoundError on a host without docker, and the receipt was never written. Without docker,
+        or with its inspect failing, the source is unknown with the reason; nothing raises."""
+        for name, effect, why in (("no docker", FileNotFoundError(2, "No such file or directory: 'docker'"),
+                                   "docker not available"),
+                                  ("inspect fails", Mock(returncode=1, stdout="", stderr="Error: No such image: sha256:A"),
+                                   "No such image")):
+            with self.subTest(name), patch.object(self, "root", self.root / name.replace(" ", "-")):
+                (self.root / "data").mkdir(parents=True)
+                suite = self.suite(runs=1)
+                quiet = {"side_effect": effect} if isinstance(effect, Exception) else {"return_value": effect}
+                with patch.object(driver.ns, "pinned", return_value={"img:t": "sha256:A"}), \
+                        patch.object(driver, "run_quiet", **quiet):
+                    self.run_tiers(suite, [Plan("w", "1")], self.system(images=["img:t"]))
+                source = self.cells(suite)["w/1/x"]["images"]["img:t"]["source"]
+                self.assertEqual(set(source), {"unknown"})
+                self.assertIn(why, source["unknown"])
 
     def test_a_run_s_answers_go_into_its_finished_attempts_only(self):
         """R3: the run's own answer verdicts, each cell's worst, into its finished attempts; an
@@ -289,8 +381,213 @@ class Driver(unittest.TestCase):
         self.assertEqual(self.cells(suite)["w/1/x"]["answers"], "pending")  # until the run wrote them
         suite.answer_receipts()
         cells = self.cells(suite)
-        self.assertEqual(cells["w/1/x"]["answers"], "wrong")
+        self.assertEqual(cells["w/1/x"]["answers"]["worst"], "wrong")  # its counts since F2 (below)
         self.assertNotIn("answers", cells.get("w/2/x", {}))
+
+    def test_a_cell_s_answers_qualify_only_if_every_query_s_do(self):
+        """P2 design review F2: the receipt kept one worst verdict, and `deviates` ranks above
+        `incomplete` (answers.PRECEDENCE), so a cell with one query never captured read `deviates`.
+        Its verdicts are counted, and it qualifies only when each is ok or deviates."""
+        cases = {"one never captured": (["deviates", "incomplete"], False),
+                 "one only its reference's": (["ok", "reference"], False),
+                 "ok and across datatypes": (["ok", "deviates", "ok"], True)}
+        for name, (verdicts, qualified) in cases.items():
+            with self.subTest(name), patch.object(self, "root", self.root / name.replace(" ", "-")):
+                (self.root / "data").mkdir(parents=True)
+                suite = self.suite(runs=1)
+                suite.answers = Mock(verdicts=Mock(return_value=[
+                    {"workload": "w", "tier": "1", "system": "x", "verdict": v} for v in verdicts]))
+                self.run_tiers(suite, [Plan("w", "1")], self.system())
+                suite.answer_receipts()
+                answers = self.cells(suite)["w/1/x"]["answers"]
+                self.assertIs(answers["qualified"], qualified)
+                self.assertEqual(sum(answers["verdicts"].values()), len(verdicts))
+
+    def test_a_receipt_holds_its_attempt_s_protocol_build_and_measuring_settings(self):
+        """P2 design review F3, F4, F8: the attempt's own protocol (a smoke run isn't the standard
+        cell); the build's CPU, flags and Rust image (an empty settings list proved no defaults); and
+        the settings that change a measurement, not where the run keeps its files."""
+        with patch.dict(driver.os.environ, {"NRESE_TARGET_CPU": "znver3", "RUSTFLAGS": "-C opt-level=2"}):
+            suite = self.suite(runs=1, skip_build=False)
+        suite.manifest.update(settings={"JAVA_HEAP": "8g", "NRESE_BENCH_SCRATCH": "/x", "NRESE_BENCH_KEEP": "1"})
+        nrese = Mock(spec=driver.Nrese, key="nrese", images=Mock(return_value=[]), builds=Mock(return_value=[]),
+                     script_builds=Mock(return_value=[]),
+                     regimes={"none": ""}, supports=Mock(return_value=None),
+                     source=Mock(return_value=self.root), rust_image=Mock(return_value="rust:1.98.1-bookworm"),
+                     target_volume="v")
+        with patch.dict(driver.os.environ, {"NRESE_TARGET_CPU": "znver3", "RUSTFLAGS": "-C opt-level=2"}), \
+                patch.object(suite, "host_command", return_value=0), patch.object(driver.ns, "docker"), \
+                patch.object(suite.args, "runtime", "docker"):
+            self.assertTrue(suite.build_nrese(nrese))
+        plan = Plan("w", "1")
+        suite.receipts(plan, [("x", nrese)], suite.attempts(plan, [("x", nrese)]))
+        receipt = self.cells(suite)["w/1/x"]
+        self.assertEqual(receipt["protocol"]["runs"], 1)
+        self.assertEqual({k: receipt["build"]["nrese"][k] for k in ("target_cpu", "rustflags_env", "rust_image", "rustflags")},
+                         {"target_cpu": "znver3", "rustflags_env": "-C opt-level=2",
+                          "rust_image": "rust:1.98.1-bookworm", "rustflags": "-C target-cpu=znver3"})
+        self.assertEqual(receipt["settings"], {"JAVA_HEAP": "8g"})
+        self.assertTrue({"RUST_IMAGE", "NRESE_TARGET_CPU", "RUSTFLAGS"} <= set(manifest.SETTINGS))
+
+    def test_an_image_built_here_carries_its_context_s_tree(self):
+        """P2 design review F5: a build of the suite's own image is labelled with its context's git
+        tree id (a clean checkout only), so the image that runs says what it was built from."""
+        suite = self.suite(runs=1)
+        calls = []
+
+        def docker(command, *args, **kwargs):
+            calls.append(command)
+            return 0
+        for dirty, labelled in ((0, True), (2, False)):
+            with self.subTest(dirty=dirty), patch.object(suite.args, "runtime", "docker"), \
+                    patch.object(suite, "host_command", side_effect=docker), \
+                    patch.object(suite.runtime, "image_present", return_value=False), \
+                    patch.object(driver, "checkout_state", return_value={"commit": "c" * 40, "dirty": dirty}), \
+                    patch.object(driver.receipts, "object_ids", return_value={"benches/competitors/jena": "t" * 40}):
+                calls.clear()
+                suite.ensure_images({"nrese-bench/jena:6.2.0": "competitors/jena"})
+                build = next(c for c in calls if "build" in c)
+                self.assertEqual(f"owlrs.built-from=benches/competitors/jena@{'t' * 40}" in build, labelled)
+
+    def test_an_image_s_source_is_the_pinned_id_s_own(self):
+        """P1b review r1 F1: the source was read from the tag, the id from the pin map, and the two
+        could be different images: (a) an earlier preparation in the job pinned the tag to A (old,
+        unlabelled), and the tag now names B, labelled from the current tree; the containers run A;
+        (b) the tag was replaced between its preparation (a build, labelled) and its first pin. The
+        receipt pairs the pinned id with that id's own label: A's, or unknown."""
+        label = {"sha256:A": "", "sha256:B": "benches/competitors/jena@" + "t" * 40, "sha256:C": "benches/competitors/jena@old",
+                 "img:t": "benches/competitors/jena@" + "t" * 40}  # by tag: B's, the current tree's
+        inspect = lambda command, *a, **k: Mock(returncode=0, stdout=label.get(command[-1], "") + "\n")  # noqa: E731
+        for name, pinned, present in (("an earlier pin to an unlabelled A", "sha256:A", True),
+                                      ("replaced after its build, by C", "sha256:C", False)):
+            with self.subTest(name), patch.object(self, "root", self.root / name.replace(" ", "-")):
+                (self.root / "data").mkdir(parents=True)
+                suite = self.suite(runs=1)
+                with patch.object(driver.ns, "pinned", return_value={"img:t": pinned}), \
+                        patch.object(driver, "run_quiet", side_effect=inspect):
+                    # Its preparation: (a) the tag present, naming B; (b) built here, labelled, then moved.
+                    with patch.object(suite.args, "runtime", "docker"), \
+                            patch.object(suite, "host_command", return_value=0), \
+                            patch.object(suite.runtime, "image_present", return_value=present), \
+                            patch.object(driver, "checkout_state", return_value={"commit": "c" * 40, "dirty": 0}), \
+                            patch.object(driver.receipts, "object_ids",
+                                         return_value={"benches/competitors/jena": "t" * 40}):
+                        suite.ensure_images({"img:t": "competitors/jena"})
+                    self.run_tiers(suite, [Plan("w", "1")], self.system(images=["img:t"]))
+                image = self.cells(suite)["w/1/x"]["images"]["img:t"]
+                self.assertEqual(image["id"], pinned)
+                expected = f"built from {label[pinned]}" if label[pinned] else None
+                if expected:
+                    self.assertEqual(image["source"], expected)
+                else:
+                    self.assertEqual(set(image["source"]), {"unknown"})
+
+    PIN = "sha256:" + "d" * 64
+
+    def pins(self, text):
+        """This test's checkout's digest pins (benches/suite/images.toml)."""
+        (self.root / "benches/suite").mkdir(parents=True, exist_ok=True)
+        (self.root / "benches/suite/images.toml").write_text(text, encoding="utf-8")
+
+    def test_a_pinned_image_is_pulled_by_its_digest(self):
+        """P1c (orchestrator, 8 Nov 11:22): a tag names no content, its digest does; a pulled image
+        with a pin is pulled by that digest and tagged, so the run runs the pinned content (one that
+        is present but isn't the pin is pulled again by it); one without a pin is pulled by its tag."""
+        self.pins(f'[pins]\n"qlever/qlever:latest" = "{self.PIN}"\n')
+        suite = self.suite(runs=1)
+        calls = []
+        present = {"qlever/qlever:latest": '["qlever/qlever@sha256:' + "e" * 64 + '"]'}
+        for image_present in (False, True):
+            with self.subTest(present=image_present), patch.object(suite.args, "runtime", "docker"), \
+                    patch.object(suite, "host_command", side_effect=lambda c, *a, **k: calls.append(c) or 0), \
+                    patch.object(suite.runtime, "image_present", return_value=image_present), \
+                    patch.object(driver, "run_quiet", side_effect=lambda c, *a, **k: Mock(
+                        returncode=0, stdout=present.get(c[-1], "[]") + "\n")):
+                calls.clear()
+                suite.ensure_images({"qlever/qlever:latest": None, "other/thing:1": None})
+                self.assertIn(["docker", "pull", "-q", f"qlever/qlever@{self.PIN}"], calls)
+                self.assertIn(["docker", "tag", f"qlever/qlever@{self.PIN}", "qlever/qlever:latest"], calls)
+                if not image_present:
+                    self.assertIn(["docker", "pull", "-q", "other/thing:1"], calls)
+
+    def test_a_pinned_image_runs_its_pin_or_the_run_stops_before_pinning(self):
+        """P1c review r1 F1, F2: the digest pull's and the retag's exit codes were ignored, so with a
+        mismatching image already holding the tag a failed pull went on, and the run timed the old
+        content. Modelled on a local docker's state (tags, ids, digests): the tag ends on the pinned
+        content, or the run stops (non-zero) before any image is pinned or timed."""
+        pinned_id, old_id = "sha256:" + "1" * 64, "sha256:" + "2" * 64
+        self.pins(f'[pins]\n"qlever/qlever:latest" = "{self.PIN}"\n')
+        for name, pull_ok, tag_ok in (("pinned", True, True), ("the pull fails", False, True), ("the retag fails", True, False)):
+            with self.subTest(name):
+                tags = {"qlever/qlever:latest": old_id}  # present, another build
+                digests = {old_id: {"sha256:" + "e" * 64}}
+
+                def docker(command, *a, **k):
+                    if command[:2] == ["docker", "pull"]:
+                        if not pull_ok:
+                            return 1
+                        tags[command[-1]] = pinned_id
+                        digests[pinned_id] = {self.PIN}
+                    elif command[:2] == ["docker", "tag"]:
+                        if not tag_ok or command[-2] not in tags:  # docker: no such source image
+                            return 1
+                        tags[command[-1]] = tags[command[-2]]
+                    return 0
+
+                def inspect(command, *a, **k):
+                    held = digests.get(tags.get(command[-1], command[-1]), set())
+                    return Mock(returncode=0, stdout=json.dumps(sorted(f"qlever/qlever@{d}" for d in held)) + "\n")
+                suite = self.suite(runs=1, results=f"results-{name.replace(' ', '-')}")
+                pinning = Mock()
+                with patch.object(suite.args, "runtime", "docker"), patch.object(suite, "host_command", side_effect=docker), \
+                        patch.object(suite.runtime, "image_present", side_effect=lambda image: image in tags), \
+                        patch.object(driver, "run_quiet", side_effect=inspect), patch.object(driver.ns, "pin_images", pinning), \
+                        patch.object(driver, "plans", return_value=[Plan("w", "1")]), \
+                        patch.object(driver, "adapter", return_value=self.system(images=["qlever/qlever:latest"])), \
+                        patch.object(suite, "cycle") as cycle, patch.object(suite, "build_harness", return_value=True), \
+                        patch.object(suite, "ensure_data", return_value=None), \
+                        patch.object(suite, "sif_missing", return_value=None):
+                    code = suite.run()
+                if pull_ok and tag_ok:
+                    self.assertEqual(tags["qlever/qlever:latest"], pinned_id)
+                    pinning.assert_called_once()
+                else:
+                    self.assertEqual(code, 1)
+                    pinning.assert_not_called()
+                    cycle.assert_not_called()
+
+    def test_a_pulled_image_s_source_is_its_pin_when_the_id_that_ran_holds_it(self):
+        """P1c: a pulled image counts only as the content its tag's pin names: the id that ran must
+        hold that digest. Pinned and held: "pulled, pinned <digest>"; held another: unknown, naming
+        both; no pin: unknown."""
+        cases = {"held": ([f"qlever/qlever@{self.PIN}"], True, f"pulled, pinned {self.PIN}"),
+                 "another": (["qlever/qlever@sha256:" + "e" * 64], True, None),
+                 "no pin": ([f"qlever/qlever@{self.PIN}"], False, None)}
+        for name, (digests, pinned, expected) in cases.items():
+            with self.subTest(name), patch.object(self, "root", self.root / name.replace(" ", "-")):
+                (self.root / "data").mkdir(parents=True)
+                self.pins(f'[pins]\n"qlever/qlever:latest" = "{self.PIN}"\n' if pinned else "[pins]\n")
+                suite = self.suite(runs=1)
+
+                def inspect(command, *a, **k):
+                    out = json.dumps(digests) if "RepoDigests" in command[-2] else ""
+                    return Mock(returncode=0, stdout=out + "\n")
+                with patch.object(driver.ns, "pinned", return_value={"qlever/qlever:latest": "sha256:ID"}), \
+                        patch.object(driver, "run_quiet", side_effect=inspect):
+                    self.run_tiers(suite, [Plan("w", "1")], self.system(images=["qlever/qlever:latest"]))
+                source = self.cells(suite)["w/1/x"]["images"]["qlever/qlever:latest"]["source"]
+                if expected:
+                    self.assertEqual(source, expected)
+                else:
+                    self.assertEqual(set(source), {"unknown"})
+                    self.assertIn("pin", source["unknown"])
+
+    def test_a_pin_that_isn_t_a_digest_is_refused(self):
+        for text in ('[pins]\n"a:1" = "latest"\n', '[pins]\n"a:1" = "sha256:abc"\n', "pins = 1\n"):
+            with self.subTest(text):
+                self.pins(text)
+                with self.assertRaises(ValueError):
+                    driver.image_pins(self.root)
 
     def test_what_a_cell_can_t_evidence_is_unknown_never_empty(self):
         """R6: a driver plan's inputs, images, build and settings are its child's; an input outside
@@ -301,7 +598,8 @@ class Driver(unittest.TestCase):
         child = self.cells(suite)["w/1/x"]
         for field in ("images", "build", "settings", "data"):
             self.assertEqual(set(child[field]), {"unknown"}, field)
-        nrese = Mock(spec=driver.Nrese, key="nrese", images=Mock(return_value=[]), builds=Mock(return_value=[]))
+        nrese = Mock(spec=driver.Nrese, key="nrese", images=Mock(return_value=[]), builds=Mock(return_value=[]),
+                     script_builds=Mock(return_value=[]))
         plan = Plan("w", "2", inputs=["/rggs/rg.ttl"], external=["bibm"])
         suite.receipts(plan, [("x", nrese)], suite.attempts(plan, [("x", nrese)]))
         served = self.cells(suite)["w/2/x"]
@@ -513,11 +811,48 @@ class Driver(unittest.TestCase):
         self.assertEqual(calls, ["fsync", "replace"] + (["fsync"] if driver.os.name != "nt" else []))
 
 
+    def test_a_receipt_s_code_is_unchanged_by_what_measuring_writes_into_the_repository(self):
+        """P2 design review F1 (orchestrator, 8 Nov 10:50): the code identity was the tree of all of
+        benches/, which holds the run records (benches/runs) and the views made from them, so committing
+        a run's own record changed the identity its receipt is held to: stale as it landed. It is
+        what a cell can execute: those left out, rust-toolchain.toml and .cargo/ in."""
+        def write(files):
+            for f, text in files.items():
+                (self.root / f).parent.mkdir(parents=True, exist_ok=True)
+                (self.root / f).write_text(text, encoding="utf-8")
+            git("add", "-A")
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x")
+        git = lambda *a: subprocess.run(["git", "-C", str(self.root), *a], capture_output=True, text=True,  # noqa: E731
+                                        check=True).stdout
+        git("init", "-q")
+        write({".gitignore": "results*/\ndata/\ntmp/\n", "benches/suite/x.py": "1\n", "benches/runs/README.md": "r\n",
+               "benches/STATUS.md": "s\n", "scripts/lib/ns.sh": "n\n", "rust-toolchain.toml": "t\n",
+               ".cargo/config.toml": "c\n", "crates/x/lib.rs": "x\n"})
+        runs = iter(range(1, 10))
+
+        def code():
+            suite = self.suite(runs=1, results=f"results-{next(runs)}")
+            self.run_tiers(suite, [Plan("w", "1")], self.system())
+            return self.cells(suite)["w/1/x"]["code"]
+        first = code()
+        write({"benches/runs/2026-11-08-r1.toml": "id = 'r1'\n", "benches/STATUS.md": "s2\n",
+               "benches/STANDINGS.md": "t\n", "benches/CATALOG.md": "c\n", "benches/baselines/b.json": "{}\n"})
+        self.assertEqual(code(), first)  # the run's record and its views, committed: the same identity
+        for f in ("rust-toolchain.toml", ".cargo/config.toml", "benches/suite/x.py", "scripts/lib/ns.sh"):
+            with self.subTest(changed=f):
+                write({f: f"{f} changed\n"})
+                now = code()
+                self.assertNotEqual(now, first)
+                first = now
+
+
 class Code(unittest.TestCase):
     def test_a_cell_s_code_changes_with_anything_the_repository_holds_for_it(self):
         """R5: commit-latency's driver reads queries, the harness and GraphDB's configuration outside
         its kit's directory, LUBM's preparation sources scripts/lib: a change to any of them changes
-        the code of every cell (coarse and exact); without a commit to read, it is unknown."""
+        the code of every cell (coarse and exact); without a commit to read, it is unknown. Since F1 of
+        the P2 design review benches/ counts entry by entry (its records and views left out), so the
+        entry that changed is the one named."""
         with tempfile.TemporaryDirectory() as d:
             root = Path(d).resolve()
             files = ("benches/reasoning/maintenance/maintenance.py", "benches/reasoning/queries/lubm/q1.rq",
@@ -530,10 +865,11 @@ class Code(unittest.TestCase):
             git("init", "-q")
             commit = lambda: (git("add", "-A"), git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",  # noqa: E731
                                                     "-m", "x"), git("rev-parse", "HEAD"))[2]
-            paths = receipts.CODE_PATHS + receipts.BUILD_PATHS
-            before = receipts.object_ids(root, commit(), paths)
-            for f, changed in (("benches/reasoning/queries/lubm/q1.rq", "benches"),
-                               ("benches/competitors/graphdb/repo-owl2-rl.ttl", "benches"),
+            first = commit()
+            paths = receipts.code_paths(root, first) + receipts.BUILD_PATHS
+            before = receipts.object_ids(root, first, paths)
+            for f, changed in (("benches/reasoning/queries/lubm/q1.rq", "benches/reasoning"),
+                               ("benches/competitors/graphdb/repo-owl2-rl.ttl", "benches/competitors"),
                                ("scripts/lib/ns.sh", "scripts"), ("crates/x/src/lib.rs", "crates")):
                 with self.subTest(changed=f):
                     (root / f).write_text(f"{f}\n", encoding="utf-8")

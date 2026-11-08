@@ -34,6 +34,10 @@ HEADER = """# The frozen benchmark datasets (benches/PROTOCOL.md §6; `suite.py 
 # run records that use it. A file whose maker labels its blank nodes afresh each time (riot)
 # is pinned by form too: `rdfc_sha256`, the SHA-256 of its RDFC-1.0 canonical N-Quads
 # (crates/rdf/nrese-rdf-io/examples/rdfc.rs), which a made copy must meet where its bytes can't.
+# [makers]: the makers a timing job runs where its host lacks a file, by their command's start
+# (benches/fast/release_gate.py reads them, and a harness's own: harness_tables()): what each
+# needs from its host, whether its copies meet only a form pin, whether it is the SPARQL data
+# step's, and the container it runs in, [memory GB, CPUs], which the job declares to the fleet.
 """
 
 
@@ -45,8 +49,19 @@ def load(root: Path) -> dict:
         return tomllib.load(f)
 
 
+MAKER_KEYS = ("needs", "form_only", "sparql", "container", "note")
+
+
 def save(root: Path, catalog: dict):
     lines = [HEADER, f"budget_gb = {catalog['budget_gb']}", ""]
+    # The job-run makers (release_gate.py reads them, a harness's too: harness_tables()), kept as they are,
+    # an empty section too: its presence says the catalogue holds them (sol-loop r6 S5).
+    if "makers" in catalog and not catalog["makers"]:
+        lines += ["[makers]", ""]
+    for start, maker in sorted((catalog.get("makers") or {}).items()):
+        lines.append(f"[makers.{toml_value(start)}]")
+        lines += [f"{key} = {toml_value(maker[key])}" for key in MAKER_KEYS if key in maker]
+        lines.append("")
     for d in sorted(catalog["dataset"], key=lambda d: d["file"]):
         lines.append("[[dataset]]")
         for key in ("file", "workload", "tier", "role", "made_by", "source", "bytes", "sha256", "rdfc_sha256",
