@@ -356,6 +356,63 @@ fn a_refused_intern_adds_nothing() {
     assert_eq!(view.decode(small), Some(literal("small")));
 }
 
+/// B12 (sol-loop r1 S2: what a refused triple intern leaves). The components interned before
+/// the refusal stay, each its own entry, found and charged; the triple term isn't added; a later
+/// intern of the same component finds the same id.
+#[test]
+fn a_refused_triple_intern_keeps_the_components_it_added() {
+    let budget = Arc::new(Budget::new(4_096));
+    let (_dictionary, overlay) = with_overlay(2, &budget);
+    let long = "z".repeat(8_192);
+    let triple = Triple::new(iri("new subject"), iri("p"), literal(&long));
+    assert!(overlay.intern(TermRef::Triple(&triple)).is_err());
+    let subject = overlay
+        .lookup(iri("new subject").as_ref().into())
+        .expect("the subject interned before the refusal stays");
+    assert_eq!(subject.payload(), 2, "the overlay's first own id");
+    assert!(budget.used() > 0, "it is charged");
+    assert_eq!(
+        overlay.lookup(TermRef::Triple(&triple)),
+        None,
+        "the triple isn't added"
+    );
+    assert_eq!(
+        overlay.intern(iri("new subject").as_ref().into()).unwrap(),
+        subject,
+        "one id per term"
+    );
+}
+
+/// B11 (sol-loop r1 S1: the order across kinds). Ids sort by kind before payload, so an own
+/// simple literal sorts before a shared language-tagged string: the merged matches are sorted
+/// as the dictionary's are, whatever kinds they mix.
+#[test]
+fn matching_strings_keeps_the_dictionarys_order_across_kinds() {
+    let budget = unlimited();
+    let dictionary = Arc::new(Dictionary::default());
+    let string = dictionary.intern(literal("old a").as_ref());
+    let tagged =
+        dictionary.intern(LiteralRef::new_language_tagged_literal_unchecked("old b", "de").into());
+    let overlay = Overlay::over(
+        Arc::clone(&dictionary),
+        dictionary.len(),
+        Arc::clone(&budget),
+    );
+    let own = overlay.intern(literal("old own").as_ref()).unwrap();
+    let view = Vocabulary::Private(overlay.freeze().unwrap());
+    let test = StringTest {
+        lang_strings: true,
+        ..strings_starting("old ")
+    };
+    let mut expected = vec![string, tagged, own];
+    expected.sort_unstable();
+    assert_eq!(view.matching_strings(&test, 0), expected);
+    assert!(
+        own < tagged,
+        "this case mixes kinds: the own string sorts before the shared tagged one"
+    );
+}
+
 /// B13. What an overlay's entries, its table and its views allocate is charged before it is
 /// allocated and released with the last holder: the overlay dropped before its view. Its
 /// reservations are made inside the measurement (`measure`'s rule), so the overlay is too; its
