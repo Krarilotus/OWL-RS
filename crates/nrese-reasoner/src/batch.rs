@@ -3524,6 +3524,36 @@ mod counted_tests {
         });
     }
 
+    /// REAS-2 review r1 F1: the stored facts mentioning a term ([`Store::mentioning`], what an
+    /// equality merge rewrites) are read as they are counted. A relation without its object
+    /// order is read whole for the objects: its input of 8 × `POLL_UNITS` pairs, none with the
+    /// object asked for, asks the stop at least once every `POLL_UNITS` plus one run (the
+    /// longest run counted at once, `POLL_UNITS`) of the pairs it reads. Counted all at once,
+    /// the whole input was one ask.
+    #[test]
+    fn a_term_s_mentions_are_read_within_a_run_of_the_stop() {
+        let interval = nrese_exec::POLL_UNITS as usize;
+        let n = 8 * interval as u64;
+        let mut store = Store::new((0..n).map(|i| [i, 5, 1_000_000 + i]).collect());
+        store.objects(&|_| false);
+        let asks = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || {
+            asks.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        // In no fact: subjects are below `n`, objects from 1,000,000 on.
+        let terms: HashSet<u64> = [5_000_000].into_iter().collect();
+        let found = store.mentioning(&terms, &stop).expect("never stopped");
+        assert!(found.is_empty(), "no fact mentions the term");
+        let run = interval;
+        let asks = asks.load(Ordering::Relaxed);
+        assert!(
+            asks >= n as usize / (interval + run),
+            "{asks} asks of the stop for {n} pairs read: more than {interval} plus one run of \
+             {run} read between two of them"
+        );
+    }
+
     /// REAS-2 (orchestrator, 8 Nov 15:54): a closed family's read of a marked delta
     /// ([`Run::scan_unmarked`]) counts a slice's positions ahead, so its reader asks its stop
     /// within `POLL_UNITS` plus one run, the longest run counted at once: [`RUN`], which is
