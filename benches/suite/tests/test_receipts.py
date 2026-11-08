@@ -469,13 +469,14 @@ class Driver(unittest.TestCase):
         return self.cells(suite)["w/1/x"]["build"]
 
     def test_a_build_names_the_trees_it_compiled_at_its_own_commit(self):
-        """Orchestrator, 8 Nov (P1d, design r2 F10; r3 F10): each build records the git ids of what it
-        compiled at its own source's commit, so a receipt is compared by content. NRESE: crates,
+        """Orchestrator, 8 Nov (P1d, design r2 F10; r3 F10): each build records the git ids of its
+        program's declared dependency envelope (P1d review r1 F2: what its build can read, not an exact
+        read set) at its own source's commit, so a receipt is compared by content. NRESE: crates,
         Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo, from its source, which can be another
         checkout. The harness, a workspace of its own built with --manifest-path whose path
         dependencies are crates/ members inheriting from the root Cargo.toml: its workspace
         directory, crates, Cargo.toml, rust-toolchain.toml, .cargo, from the repository. Both: the
-        launcher they build through, scripts/cargo-guarded.sh and what it sources (r4 B)."""
+        launcher, scripts/cargo-guarded.sh and what it sources (r4 B)."""
         self.checkout(self.root, "suite")
         source = self.checkout(self.root / "data" / "nrese-src", "nrese")
         build = self.built(source)
@@ -485,9 +486,11 @@ class Driver(unittest.TestCase):
                              *launcher)}
         for program, checkout in (("nrese", source), ("harness", self.root)):
             with self.subTest(program):
+                self.assertIn("sources", build[program], "the build names its sources")
                 self.assertEqual(build[program]["sources"], {p: self.git(checkout, "rev-parse", f"HEAD:{p}")
                                                             for p in paths[program]})
-                self.assertEqual(build[program]["commit"], self.git(checkout, "rev-parse", "HEAD"))
+                self.assertEqual(build[program].get("commit"), self.git(checkout, "rev-parse", "HEAD"))
+        self.assertTrue(all("sources" in build[p] for p in ("nrese", "harness")), "both builds name their sources")
         self.assertNotEqual(build["nrese"]["sources"]["crates"], build["harness"]["sources"]["crates"])
 
     def test_a_harness_built_from_other_source_says_so_where_nrese_s_trees_are_the_same(self):
@@ -498,6 +501,8 @@ class Driver(unittest.TestCase):
         first = self.built()
         self.checkout(self.root, "suite", harness="fn main() { println!(); }\n")
         second = self.built(results="results-2")
+        for build in (first, second):
+            self.assertTrue(all("sources" in build[p] for p in ("nrese", "harness")), "both builds name their sources")
         self.assertNotEqual(first["harness"]["sources"]["benches/nrese-bench-harness"],
                             second["harness"]["sources"]["benches/nrese-bench-harness"])
         self.assertEqual(first["nrese"]["sources"], second["nrese"]["sources"])
@@ -552,6 +557,9 @@ class Driver(unittest.TestCase):
                     (dist / name).parent.mkdir(parents=True, exist_ok=True)
                     (dist / name).write_text(text, encoding="utf-8")
             build = self.built(results=f"results-{len(seen)}")
+            for field in ("inputs", "sources"):
+                self.assertIn(field, build["nrese"], f"NRESE's build names its {field}")
+            self.assertIn("inputs", build["harness"], "the harness's build names its inputs")
             seen.append((case, build["nrese"]["inputs"], build["nrese"]["sources"]))
             self.assertEqual(build["harness"]["inputs"], {})
         values = {case: inputs["apps/nrese-console/dist"] for case, inputs, _ in seen}
@@ -565,7 +573,9 @@ class Driver(unittest.TestCase):
 
     def test_build_settings_are_read_from_the_environment_given_only(self):
         """P2 design check r3 F14 (orchestrator 17:39): the default build's settings come from the build
-        owner with an empty environment, whatever this process's environment holds; a given one is read."""
+        owner with an empty environment, whatever this process's environment holds; a given one is read.
+        (Its witness against an owner that takes `env` but reads os.environ is a mutation of that one
+        read, run in the proof: P1d review r1 F1.)"""
         with patch.dict(driver.os.environ, {"NRESE_TARGET_CPU": "znver3", "RUSTFLAGS": "-C opt-level=2"}):
             self.assertEqual(driver.build_settings({}), {"target_cpu": "native", "rustflags_env": ""})
         self.assertEqual(driver.build_settings({"NRESE_TARGET_CPU": "portable", "RUSTFLAGS": "-g"}),
