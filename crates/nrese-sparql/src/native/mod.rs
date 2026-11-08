@@ -2594,15 +2594,24 @@ impl<'a> Context<'a> {
         let solutions = match ends {
             // As many solutions without bindings as the path connects the two ways: a table
             // without columns, which holds no buffer, charged its rows ([`Self::produced`]).
+            // As many solutions without bindings as the path connects the two ways: a table
+            // without columns, which holds no buffer but counts its rows, charged before they
+            // are made (sol-loop r1 S1 of the executor memory stack's second lead: 64 `(p|p)`
+            // steps over `a p a` count `usize::MAX` ways, made one by one before the charge).
             (Err(start), Err(finish)) => {
                 let rows = evaluator
                     .solutions(&resolved, start, finish)
                     .map_err(refused)?;
-                self.produced(Solutions {
+                self.check()?;
+                let bytes = IdTable::new(0).bytes_for_rows(rows);
+                if bytes > 0 {
+                    self.budget.charge(bytes).map_err(refused)?;
+                }
+                Solutions {
                     vars: Vec::new(),
                     table: IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
                     ordered: false,
-                })?
+                }
             }
             (Err(start), Ok(o)) => {
                 let ends = evaluator.ends(&resolved, start).map_err(refused)?;
