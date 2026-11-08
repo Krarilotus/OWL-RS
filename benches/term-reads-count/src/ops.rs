@@ -131,7 +131,7 @@ pub(crate) fn run(
                 .map(|encoded| Vec::with_capacity(encoded.len()))
                 .collect();
             #[cfg(feature = "inject")]
-            let first_part = batches.as_ptr() as usize;
+            let (first_part, wrong_view) = (batches.as_ptr() as usize, hook("wrong-view"));
             parallel(
                 threads,
                 snapshot,
@@ -140,7 +140,7 @@ pub(crate) fn run(
                 window,
                 |snapshot, part, out| {
                     #[cfg(feature = "inject")]
-                    let mut injected = part.as_ptr() as usize != first_part;
+                    let mut injected = !wrong_view || part.as_ptr() as usize != first_part;
                     for (seen, batch) in out.iter_mut().zip(part) {
                         snapshot.with_views(|view| {
                             for &id in batch {
@@ -354,13 +354,22 @@ fn parallel<T: Sync, O: Send>(
         (items, out) = (rest, others);
     }
     let [start, done, end] = [(); 3].map(|()| Barrier::new(parts.len() + 1));
+    #[cfg(feature = "inject")]
+    let mut late = hook("late-reader");
     std::thread::scope(|scope| {
         let readers: Vec<_> = parts
             .into_iter()
             .map(|(part, out)| {
                 let snapshot = snapshot.clone();
                 let (start, done, end, read) = (&start, &done, &end, &read);
+                // The first reader only.
+                #[cfg(feature = "inject")]
+                let late = std::mem::take(&mut late);
                 scope.spawn(move || {
+                    #[cfg(feature = "inject")]
+                    if late {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
                     // The allocator sets up a thread's heap on its first allocation (about
                     // 7,500 instructions, measured): here, before the window, not in the op.
                     drop(std::hint::black_box(Box::new(0_u64)));
@@ -394,8 +403,16 @@ fn parallel<T: Sync, O: Send>(
     })
 }
 
-/// Test-only (`--features inject`, `tests/inject.rs`): the first IRI the first reader views,
-/// replaced by another IRI of the same length, a wrong answer the run must refuse.
+/// Test-only (`--features inject`, `tests/inject.rs`): whether the run's `TRC_INJECT` names
+/// `name`, one of the faults below. Read before any window opens.
+#[cfg(feature = "inject")]
+fn hook(name: &str) -> bool {
+    std::env::var("TRC_INJECT").is_ok_and(|hook| hook == name)
+}
+
+/// Test-only (`wrong-view`): the first IRI the first reader views, replaced by another IRI of
+/// the same length, a wrong answer the run must refuse. (`late-reader`, in [`parallel`]: the
+/// first reader starts a second late, whose warm-up must still stay out of the window.)
 #[cfg(feature = "inject")]
 fn inject<'v>(view: TermView<'v>, injected: &mut bool) -> TermView<'v> {
     match view {
