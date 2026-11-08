@@ -521,8 +521,8 @@ pub fn covered(o: &Ontology, axiom: &Axiom, rl: bool) -> bool {
 /// The terms an axiom concludes, where it isn't [`covered`]: those it can add positive
 /// facts on ([`positive_terms`]). They come from the right side of a subclass axiom, each
 /// uncovered direction of an equivalence, the class of a domain or range, every part of a
-/// disjointness (negated), a disjoint union's class and parts, and a characteristic's or
-/// chain's property.
+/// disjointness (negated), a disjoint union's class and parts, and a characteristic's (not
+/// irreflexivity's or asymmetry's) or chain's property.
 pub fn concluded_terms(o: &Ontology, axiom: &Axiom, rl: bool) -> Vec<Term> {
     let mut out = Vec::new();
     let sub = |e: ExprId| match rl {
@@ -544,6 +544,12 @@ pub fn concluded_terms(o: &Ontology, axiom: &Axiom, rl: bool) -> Vec<Term> {
         | Axiom::ObjectPropertyRange(_, c)
         | Axiom::DataPropertyDomain(_, c)
         | Axiom::ClassAssertion(c, _) => positive_terms(o, *c, true, &mut out),
+        // They rule pairs out and add no fact. Irreflexivity is outside the QL grammar
+        // (`w3c2012owl2profiles.txt:599`), though the QL feature list includes it.
+        Axiom::ObjectCharacteristic(
+            Characteristic::Irreflexive | Characteristic::Asymmetric,
+            _,
+        ) => {}
         Axiom::ObjectCharacteristic(_, p) => out.push(p.named()),
         Axiom::SubObjectPropertyOf(_, q) => out.push(q.named()),
         Axiom::DisjointClasses(v) => {
@@ -634,6 +640,8 @@ pub(crate) fn label(o: &Ontology, axiom: &Axiom) -> Option<Term> {
         Axiom::SubClassOf(a, b) => vec![*a, *b],
         Axiom::EquivalentClasses(v) | Axiom::DisjointClasses(v) => v.clone(),
         Axiom::DisjointUnion(c, _) => return Some(*c),
+        // Equality of individuals names no property or class.
+        Axiom::SameIndividual(v) => return v.first().copied(),
         Axiom::ObjectPropertyDomain(_, c)
         | Axiom::ObjectPropertyRange(_, c)
         | Axiom::DataPropertyDomain(_, c)
@@ -646,60 +654,102 @@ pub(crate) fn label(o: &Ontology, axiom: &Axiom) -> Option<Term> {
         .or_else(|| exprs.iter().find_map(|&e| any(o, e)))
 }
 
-/// Whether an uncovered axiom's conclusion can make named individuals equal, read in
-/// negation normal form with its polarity (review r1, F4):
-/// - Equating: a positive enumeration (`∀R.{a}` makes every `R`-successor `a`); a
-///   maximum of one or more (`≤ 1 R` merges successors), also as `¬≥ 2 R`; an exact
-///   count of one or more.
-/// - Not equating: `¬{a}`, which only separates individuals.
-///
-/// Then any fact may follow, and its hazard reaches every term.
-pub fn concludes_equality(o: &Ontology, axiom: &Axiom) -> bool {
-    /// `witness`: `e` describes a fresh witness of an existential, whose own nominal only
-    /// names it (`∃S.{a}` is the edge `S(x, a)`, Sol r2 S3). Constraints inside it may still
-    /// reach existing individuals, its predecessor through an inverse among them (Sol r3
-    /// S4: `∃S.(∀S⁻.{a})` makes `x` be `a`).
-    fn equates(o: &Ontology, e: ExprId, positive: bool, witness: bool) -> bool {
-        let w = |f: &ExprId, p: bool| equates(o, *f, p, true);
-        let every = |f: &ExprId, p: bool| equates(o, *f, p, false);
-        match (o.class(e), positive) {
-            (ClassExpr::OneOf(_), true) => !witness,
-            (ClassExpr::And(es) | ClassExpr::Or(es), p) => {
-                es.iter().any(|&e| equates(o, e, p, witness))
+/// The properties whose edges can make individuals equal: functional, inverse functional,
+/// in a key, functional on data; and, closed downward, every property whose edges are
+/// theirs: sub-, equivalent and inverse properties, a chain's links (Harness note
+/// `2026-11-08-i24c1-equality-fail-closed.md`).
+pub fn equating_properties(o: &Ontology) -> std::collections::HashSet<Term> {
+    let mut out = std::collections::HashSet::new();
+    for axiom in &o.axioms {
+        match axiom {
+            Axiom::ObjectCharacteristic(
+                Characteristic::Functional | Characteristic::InverseFunctional,
+                p,
+            ) => {
+                out.insert(p.named());
             }
-            (ClassExpr::Not(e), p) => equates(o, *e, !p, witness),
-            // `≤ n` for n ≥ 1, positive or as `¬≥ n+1`; `≤ 0 R.F` excludes `F`, so its filler
-            // counts negated (Sol r1 S1, S2: `≤ 0 R.¬{a}` equates, `= 0 R.{a}` doesn't).
-            (ClassExpr::Max(0, _, f) | ClassExpr::Exact(0, _, f), true)
-            | (ClassExpr::Min(1, _, f), false) => every(f, false),
-            (ClassExpr::Max(n, ..), true) => *n >= 1,
-            (ClassExpr::Min(n, ..), false) => *n >= 2,
-            // `= n` for n ≥ 1 holds `≤ n`.
-            (ClassExpr::Exact(..), true) => true,
-            // `¬= n` is `≤ n−1` or `≥ n+1`.
-            (ClassExpr::Exact(n, _, f), false) => {
-                *n >= 2 || (*n == 1 && every(f, false)) || w(f, true)
+            Axiom::FunctionalDataProperty(d) => {
+                out.insert(*d);
             }
-            // A filler that holds of every existing successor (`∀R.F`, `¬∃R.F`).
-            (ClassExpr::All(_, f), true) | (ClassExpr::Some(_, f), false) => every(f, positive),
-            // A filler that holds of a witness (`∃R.F`, `≥ n`, `¬∀R.F`, `¬≤ n`).
-            (ClassExpr::Some(_, f) | ClassExpr::Min(_, _, f), true)
-            | (ClassExpr::Max(_, _, f), false) => w(f, true),
-            (ClassExpr::All(_, f), false) => w(f, false),
-            _ => false,
+            Axiom::HasKey(_, ps, ds) => {
+                out.extend(ps.iter().map(|p| p.named()));
+                out.extend(ds.iter().copied());
+            }
+            _ => {}
         }
     }
+    loop {
+        let before = out.len();
+        for axiom in &o.axioms {
+            let (subs, sup): (Vec<Term>, Option<Term>) = match axiom {
+                Axiom::SubObjectPropertyOf(chain, q) => {
+                    (chain.iter().map(|p| p.named()).collect(), Some(q.named()))
+                }
+                Axiom::SubDataPropertyOf(a, b) => (vec![*a], Some(*b)),
+                // Linked both ways: either one's edges are the other's.
+                Axiom::EquivalentObjectProperties(_)
+                | Axiom::InverseObjectProperties(..)
+                | Axiom::EquivalentDataProperties(_) => (properties(o, axiom), None),
+                _ => continue,
+            };
+            let reached = match sup {
+                Some(q) => out.contains(&q),
+                None => subs.iter().any(|t| out.contains(t)),
+            };
+            if reached {
+                out.extend(subs);
+            }
+        }
+        if out.len() == before {
+            return out;
+        }
+    }
+}
+
+/// Whether an uncovered axiom's conclusion can make individuals equal, fail-closed by
+/// construction (fix check r1; master, 8 Nov 12:41): it can when it contains, in either
+/// polarity, a nominal (also `hasValue`), `Self`, a counting restriction that bounds from
+/// above in one of its polarities (`≤ n` and `= n` for n ≥ 1, `≥ n` for n ≥ 2), or a
+/// property of `equating` ([`equating_properties`]). No witness or polarity reading: a
+/// conjunction of nominals on one witness is as equating as one nominal (F1). `≥ 0` holds
+/// of everything and its complement of nothing, so it concludes nothing (F2).
+///
+/// Then any fact may follow, and its hazard reaches every term.
+pub fn concludes_equality(
+    o: &Ontology,
+    axiom: &Axiom,
+    equating: &std::collections::HashSet<Term>,
+) -> bool {
+    fn contains(o: &Ontology, e: ExprId, equating: &std::collections::HashSet<Term>) -> bool {
+        let p = |r: &ObjProp| equating.contains(&r.named());
+        let inner = |f: &ExprId| contains(o, *f, equating);
+        match o.class(e) {
+            ClassExpr::OneOf(_) | ClassExpr::HasValue(..) | ClassExpr::HasSelf(_) => true,
+            ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => false,
+            ClassExpr::And(es) | ClassExpr::Or(es) => es.iter().any(inner),
+            ClassExpr::Not(f) => inner(f),
+            ClassExpr::Min(0, ..) | ClassExpr::DataMin(0, ..) => false,
+            ClassExpr::Max(n, r, f) | ClassExpr::Exact(n, r, f) => *n >= 1 || p(r) || inner(f),
+            ClassExpr::Min(n, r, f) => *n >= 2 || p(r) || inner(f),
+            ClassExpr::Some(r, f) | ClassExpr::All(r, f) => p(r) || inner(f),
+            ClassExpr::DataSome(d, _)
+            | ClassExpr::DataAll(d, _)
+            | ClassExpr::DataHasValue(d, _)
+            | ClassExpr::DataMin(_, d, _)
+            | ClassExpr::DataMax(_, d, _)
+            | ClassExpr::DataExact(_, d, _) => equating.contains(d),
+        }
+    }
+    let any = |v: &[ExprId]| v.iter().any(|&e| contains(o, e, equating));
     match axiom {
-        Axiom::SubClassOf(_, b) => equates(o, *b, true, false),
-        Axiom::EquivalentClasses(v) => v.iter().any(|&e| equates(o, e, true, false)),
-        Axiom::DisjointClasses(v) => v.iter().any(|&e| equates(o, e, false, false)),
-        Axiom::DisjointUnion(_, v) => v
-            .iter()
-            .any(|&e| equates(o, e, true, false) || equates(o, e, false, false)),
+        Axiom::SubClassOf(_, b) => contains(o, *b, equating),
+        Axiom::EquivalentClasses(v) | Axiom::DisjointClasses(v) | Axiom::DisjointUnion(_, v) => {
+            any(v.as_slice())
+        }
         Axiom::ObjectPropertyDomain(_, c)
         | Axiom::ObjectPropertyRange(_, c)
         | Axiom::DataPropertyDomain(_, c)
-        | Axiom::ClassAssertion(c, _) => equates(o, *c, true, false),
+        | Axiom::ClassAssertion(c, _) => contains(o, *c, equating),
         Axiom::ObjectCharacteristic(
             Characteristic::Functional | Characteristic::InverseFunctional,
             _,
@@ -707,7 +757,8 @@ pub fn concludes_equality(o: &Ontology, axiom: &Axiom) -> bool {
         | Axiom::FunctionalDataProperty(_)
         | Axiom::HasKey(..)
         | Axiom::SameIndividual(_) => true,
-        _ => false,
+        // Any other conclusion on an equating property (a chain into a functional one).
+        _ => properties(o, axiom).iter().any(|t| equating.contains(t)),
     }
 }
 
