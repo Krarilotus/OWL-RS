@@ -34,10 +34,11 @@ def node_script(reports: str) -> bytes:
 
 def archive(platform: str, reports: str) -> bytes:
     """nodejs.org's layout: node-v<version>-<platform>/, with bin/node on Linux, node (Git Bash's
-    name for node.exe here) and npm beside it on Windows."""
+    name for node.exe here), npm and npx beside it on Windows."""
     top = f"node-v{VERSION}-{platform}"
-    files = {f"{top}/node": node_script(reports), f"{top}/npm": b"#!/bin/sh\n"} if platform == "win-x64" else \
-        {f"{top}/bin/node": node_script(reports), f"{top}/bin/npm": b"#!/bin/sh\n"}
+    where = top if platform == "win-x64" else f"{top}/bin"
+    files = {f"{where}/node": node_script(reports), f"{where}/npm": b"#!/bin/sh\necho 10.9.9\n",
+             f"{where}/npx": b"#!/bin/sh\necho 10.9.9\n"}
     out = io.BytesIO()
     if platform == "win-x64":
         with zipfile.ZipFile(out, "w") as z:
@@ -142,6 +143,28 @@ class GateNode(unittest.TestCase):
         reported = subprocess.run([BASH, "-c", 'exec "$1" --version', "-", (bin_dir / "node").as_posix()],
                                   capture_output=True, text=True).stdout.strip()
         self.assertEqual(reported, f"v{VERSION}", "SPEC gate-node: the entry is the pinned build now")
+
+    def test_an_entry_without_its_npm_is_made_again(self):
+        # sol-loop r1 S2: an entry with the pinned node but no npm or npx was taken, and PATH then
+        # reached the host's npm (on Windows its launcher runs its own node.exe beside it).
+        good = self.publish(VERSION)
+        tools = self.pin(good)
+        entry = self.cache / f"node-{VERSION}-{good[:12]}"
+        bin_dir = entry / "bin" if self.platform == "linux-x64" else entry
+        for missing in ("npm", "npx"):
+            with self.subTest(missing):
+                shutil.rmtree(self.cache, ignore_errors=True)
+                self.seen.unlink(missing_ok=True)
+                bin_dir.mkdir(parents=True)
+                for tool in ("node", "npm", "npx"):
+                    if tool != missing:
+                        (bin_dir / tool).write_bytes(node_script(VERSION) if tool == "node" else b"#!/bin/sh\n")
+                        (bin_dir / tool).chmod(0o755)
+                done = self.gate_node(tools)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(self.seen.read_text().count("dist.example"), 1,
+                                 f"SPEC gate-node: an entry without its {missing} is fetched again")
+                self.assertTrue((bin_dir / missing).exists(), f"SPEC gate-node: and has its {missing} then")
 
     def test_a_build_reporting_another_version_is_refused(self):
         sha = self.publish("1.0.0")  # the archive's sha256 is pinned, yet its node isn't VERSION

@@ -134,12 +134,15 @@ class ConsoleStep(unittest.TestCase):
                          f"SPEC console-step-windows: as a step of the tier's summary:\n{out}")
         self.assertEqual(done.returncode, 0, out)
 
-    def test_installed_dependencies_are_used_as_they_are(self):
+    def test_dependencies_left_by_an_earlier_tree_are_installed_again(self):
+        # sol-loop r1 S1: the Linux gate's worktree stays from one gate to the next, and `git clean -fd`
+        # keeps the ignored node_modules: an earlier tree's dependencies would stand in for this one's
+        # lockfile.
         (self.repo / "apps/nrese-console/node_modules").mkdir()
         done = self.push_tier()
         out = done.stdout + done.stderr
-        self.assertEqual([c for c in self.calls("npm") if " ci " in f"{c} "], [],
-                         f"SPEC console-step-installs: no install over installed dependencies:\n{out}")
+        self.assertEqual(self.calls("npm")[:1], ["npm --prefix apps/nrese-console ci --no-audit --no-fund"],
+                         f"SPEC console-step-installs: the lockfile's dependencies, whatever is installed:\n{out}")
         self.assertEqual(len(self.calls("npx")), 1, f"SPEC console-step-checks: the tests run:\n{out}")
         self.assertEqual(done.returncode, 0, out)
 
