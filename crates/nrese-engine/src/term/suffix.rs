@@ -131,8 +131,9 @@ impl Suffix {
     }
 
     /// Adds `key` (an entry neither here nor in the dictionary below `start`: the caller's
-    /// lookups) whose `key_hash` is `hash`; returns its id. What it allocates is charged first;
-    /// refused, nothing has changed.
+    /// lookups) whose `key_hash` is `hash`; returns its id. What it allocates is charged first.
+    /// Refused, no entry is added and the entries are as they were; room one of its lists grew
+    /// to before the other's was refused stays, charged, for the next push.
     pub(crate) fn push(&mut self, key: &[u8], hash: u64) -> Result<u64, BudgetExceeded> {
         let cost = key_cost(key.len());
         self.open_bytes.charge(cost)?;
@@ -174,7 +175,8 @@ impl Suffix {
 
     /// A view of the entries now, which later pushes don't change. The keys since the last
     /// freeze become a chunk first; the view holds the chunks, nothing else. Its lists are
-    /// charged to this suffix's budget; refused, nothing has changed.
+    /// charged to this suffix's budget. Refused, no view is made and the entries are as they
+    /// were (their keys may be a chunk now: the same keys at the same ids, charged as before).
     pub(crate) fn freeze(&mut self) -> Result<Frozen, BudgetExceeded> {
         self.close()?;
         let mut chunks = ChargedVec::with_capacity(Arc::clone(&self.budget), self.chunks.len())?;
@@ -189,7 +191,8 @@ impl Suffix {
         })
     }
 
-    /// Makes the keys since the last freeze a chunk. Refused, nothing has changed.
+    /// Makes the keys since the last freeze a chunk. Refused, the keys stay open, as they were;
+    /// room one of its lists grew to before the other's was refused stays, charged.
     fn close(&mut self) -> Result<(), BudgetExceeded> {
         if self.open.is_empty() {
             return Ok(());
