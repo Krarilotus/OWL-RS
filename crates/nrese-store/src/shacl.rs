@@ -6,8 +6,8 @@
 //!
 //! [`StoreConfig::shapes_graph`]: crate::StoreConfig::shapes_graph
 
-use nrese_engine::{EncodedQuad, GraphSelector, ReadModel, TermId, Transaction};
-use nrese_rdf::{GraphName, NamedNode, NamedNodeRef, Term};
+use nrese_engine::{EncodedQuad, GraphSelector, ReadModel, Snapshot, TermId, Transaction};
+use nrese_rdf::{GraphName, NamedNode, Term};
 use nrese_shacl::{
     PropertyPath, Selection, ShapeError, Shapes, ValidationReport, compile, validate,
     validate_changes,
@@ -19,8 +19,30 @@ use crate::query::GraphResultFormat;
 use crate::rdf_io::{BlankNodes, parse_graph, serialize_triples};
 use crate::service::StoreService;
 
-/// Where a request's shapes stay while it runs. They are never committed.
+/// Where a request's shapes stay while it runs (never committed): this graph, or the first
+/// of `…-1`, `…-2`, … that holds no statement ([`request_shapes_graph`]).
 const REQUEST_SHAPES_GRAPH: &str = "https://nrese.dev/ns/graph#shacl-request-shapes";
+
+/// The graph a request's shapes go into: the first of [`REQUEST_SHAPES_GRAPH`], `…-1`,
+/// `…-2`, … in which `base` holds no statement and that isn't `validated`, the graph the
+/// request validates by name. The shapes compiled from it are then the request's alone,
+/// leaving it out of the data leaves out nothing stored, and no data selection reads the
+/// shapes as data. The same store and request give the same graph each time, so repeated
+/// requests intern nothing more for it.
+fn request_shapes_graph(base: &Snapshot, validated: Option<&NamedNode>) -> NamedNode {
+    (0u64..)
+        .map(|i| match i {
+            0 => NamedNode::new_unchecked(REQUEST_SHAPES_GRAPH),
+            i => NamedNode::new_unchecked(format!("{REQUEST_SHAPES_GRAPH}-{i}")),
+        })
+        .find(|graph| {
+            Some(graph) != validated
+                && base
+                    .lookup(graph.as_ref().into())
+                    .is_none_or(|id| !base.contains_named_graph(id))
+        })
+        .expect("finitely many graphs hold statements")
+}
 
 /// The shapes to validate against.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,8 +318,16 @@ impl StoreService {
             } => {
                 // The shapes go into a graph of a speculative transaction, never committed:
                 // they share the repository's dictionary, as stored shapes do, and leave no
-                // trace. It takes no writer slot, so commits go on meanwhile.
-                let scratch = NamedNodeRef::new_unchecked(REQUEST_SHAPES_GRAPH);
+                // trace. It takes no writer slot, so commits go on meanwhile. The graph holds
+                // no stored statement (SYN-58).
+                let mut tx = self.engine().speculative();
+                let revision = tx.base().revision();
+                let validated = match &request.graphs {
+                    ValidatedGraphs::Named(iri) => Some(graph_iri(iri)?),
+                    ValidatedGraphs::AllData | ValidatedGraphs::Default => None,
+                };
+                let graph = request_shapes_graph(tx.base(), validated.as_ref());
+                let scratch = graph.as_ref();
                 let quads = parse_graph(
                     *format,
                     base_iri.as_deref(),
@@ -305,8 +335,6 @@ impl StoreService {
                     GraphName::NamedNode(scratch.into_owned()),
                     BlankNodes::Fresh,
                 )?;
-                let mut tx = self.engine().speculative();
-                let revision = tx.base().revision();
                 for quad in &quads {
                     tx.insert(quad.as_ref());
                 }
