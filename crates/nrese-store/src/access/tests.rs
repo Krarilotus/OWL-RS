@@ -5,6 +5,8 @@ use nrese_rdf::{GraphName, NamedNode};
 use super::*;
 use crate::{StoreConfig, StoreService};
 
+mod sessions;
+
 fn named(iri: &str) -> GraphName {
     GraphName::NamedNode(NamedNode::new_unchecked(iri))
 }

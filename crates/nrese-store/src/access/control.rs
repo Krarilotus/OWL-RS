@@ -133,6 +133,22 @@ impl AccessControl {
         base: &str,
         limits: LoginLimits,
     ) -> Result<Self, AccessError> {
+        Self::open_logins(store, base, Logins::new(limits))
+    }
+
+    /// [`Self::open_with`], checking passwords with `verify` (tests that act while a
+    /// login verifies).
+    #[cfg(test)]
+    pub(super) fn open_verifying_with(
+        store: StoreService,
+        base: &str,
+        limits: LoginLimits,
+        verify: fn(&str, &str) -> bool,
+    ) -> Result<Self, AccessError> {
+        Self::open_logins(store, base, Logins::verifying_with(limits, verify))
+    }
+
+    fn open_logins(store: StoreService, base: &str, logins: Logins) -> Result<Self, AccessError> {
         let quads = store
             .statements(
                 &crate::ReadContext::all().infer(false),
@@ -146,7 +162,7 @@ impl AccessControl {
             state: RwLock::new(Arc::new(state)),
             queries: RwLock::new(queries),
             writer: Mutex::new(0),
-            logins: Logins::new(limits),
+            logins,
         };
         let next = control
             .history(usize::MAX)?

@@ -316,7 +316,7 @@ impl Logins {
 
     /// [`Self::new`], checking passwords with `verify` instead of [`verify_password`].
     #[cfg(test)]
-    fn verifying_with(limits: LoginLimits, verify: fn(&str, &str) -> bool) -> Self {
+    pub(super) fn verifying_with(limits: LoginLimits, verify: fn(&str, &str) -> bool) -> Self {
         Self {
             verify: Verifier(verify),
             ..Self::new(limits)
