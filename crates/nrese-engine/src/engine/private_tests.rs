@@ -9,7 +9,7 @@ use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term, Triple};
 
 use super::super::{Engine, EngineConfig, InferredSubset, ReadModel, Snapshot, TextScope};
 use crate::error::EngineError;
-use crate::{SearchRefused, TermId, TextQuery, VectorQuery};
+use crate::{EncodedTriple, SearchRefused, TermId, TextQuery, VectorQuery};
 
 fn iri(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("http://example.com/{local}"))
@@ -483,4 +483,80 @@ fn a_private_transactions_vocabulary_is_charged_until_its_last_snapshot_goes() {
     assert!(charged.used() > 0, "one snapshot still holds it");
     drop(second);
     assert_eq!(charged.used(), 0, "released with the last holder");
+}
+
+/// An engine with equality off, `ex:c owl:sameAs ex:b` inferred: (it, `owl:sameAs`, `ex:b`).
+fn engine_with_a_class() -> (Engine, TermId, TermId) {
+    let engine = engine();
+    let mut tx = engine.transaction();
+    tx.insert(quad("b", "p", literal("v")).as_ref());
+    let same_as = tx.intern(
+        NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs")
+            .as_ref()
+            .into(),
+    );
+    let b = tx.lookup(iri("b").as_ref().into()).unwrap();
+    let c = tx.intern(iri("c").as_ref().into());
+    assert!(tx.insert_inferred(EncodedTriple::new(c, same_as, b)));
+    tx.commit().unwrap();
+    (engine, same_as, b)
+}
+
+/// Sol-loop r1 S1 (8 Nov): a private snapshot's equality classes are its own (§2 point 3: no
+/// private id reaches shared state), whichever is read first.
+///
+/// - Input: an engine with equality off and a published class {`ex:b`, `ex:c`}; a private
+///   transaction that infers `ex:x owl:sameAs ex:b`, `ex:x` its own term. Its pending snapshot
+///   and the published snapshot, each read with equality on, in both orders.
+/// - Expected: privately `ex:x` is in `ex:b`'s class; the published classes don't know it,
+///   whether they were read before or after the private ones.
+#[test]
+fn a_private_snapshots_equality_classes_stay_its_own() {
+    // The private classes first.
+    let (engine, same_as, b) = engine_with_a_class();
+    let base = engine.snapshot();
+    let mut tx = engine.speculative_over(&base, budget()).unwrap();
+    let x = tx.try_intern(iri("x").as_ref().into()).unwrap();
+    assert!(tx.insert_inferred(EncodedTriple::new(x, same_as, b)));
+    let private = tx.pending_snapshot().unwrap();
+    let classes = private
+        .with_equality(Some(same_as))
+        .equality_classes()
+        .unwrap();
+    assert_eq!(
+        classes.representative(x),
+        classes.representative(b),
+        "privately one class"
+    );
+    let published = base
+        .with_equality(Some(same_as))
+        .equality_classes()
+        .unwrap();
+    assert_ne!(
+        published.representative(x),
+        published.representative(b),
+        "the published classes, read after, don't know the private alias"
+    );
+
+    // The published classes first.
+    let (engine, same_as, b) = engine_with_a_class();
+    let base = engine.snapshot();
+    let published = base
+        .with_equality(Some(same_as))
+        .equality_classes()
+        .unwrap();
+    let mut tx = engine.speculative_over(&base, budget()).unwrap();
+    let x = tx.try_intern(iri("x").as_ref().into()).unwrap();
+    assert_ne!(published.representative(x), published.representative(b));
+    assert!(tx.insert_inferred(EncodedTriple::new(x, same_as, b)));
+    let private = tx.pending_snapshot().unwrap();
+    let classes = private
+        .with_equality(Some(same_as))
+        .equality_classes()
+        .unwrap();
+    assert_eq!(
+        classes.representative(x),
+        classes.representative(b),
+        "privately one class, the published classes read before"
+    );
 }
