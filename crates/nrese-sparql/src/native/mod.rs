@@ -2434,69 +2434,93 @@ impl<'a> Context<'a> {
             return self.filtered_path(path, None, start);
         };
         let pairs = pairs.map_err(QueryEvaluationError::MemoryLimit)?;
-        let adopted = evaluator.handover();
         let estimate = || self.path_estimate(path, Some(from));
         self.note_closures(&evaluator, path.path, estimate, pairs.len(), start);
-        let reached = self.path_pairs(pairs, adopted, s, o)?;
+        let reached = self.path_pairs(evaluator.pool(), pairs, s, o)?;
         self.filtered_path(path, Some((reached, from)), start)
     }
 
+    /// The table of a path's ends (or starts), a row per copy of its bag: a bag of copies moves
+    /// into the column with its charge; a counted one's copies are charged to `pool` before
+    /// they are made, beside it.
+    fn path_column<'e>(
+        &self,
+        pool: &'e nrese_exec::Pool,
+        variable: Variable,
+        ends: paths::Bag<'e, u64>,
+    ) -> NativeResult<Solutions> {
+        let column = ends
+            .into_copies(pool)
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        self.path_table(vec![variable], vec![column])
+    }
+
     /// The table of a path's `(s, o)` pairs (one column if `s` and `o` are one variable,
-    /// of the pairs that start where they end): a row per copy, every column charged
-    /// before it is made (a sequence of alternatives counts a pair once per way through),
-    /// with the pairs themselves, which the columns are made beside (their charge, `adopted`,
-    /// handed over by the evaluator, [`paths::PathEvaluator::handover`]).
+    /// of the pairs that start where they end): a row per copy (a sequence of alternatives
+    /// counts a pair once per way through), every column charged to `pool` before it is made,
+    /// beside the pairs, which are freed once the columns are made ([`Self::path_table`]).
     fn path_pairs(
         &self,
-        pairs: paths::Bag<(u64, u64)>,
-        adopted: usize,
+        pool: &nrese_exec::Pool,
+        pairs: paths::Bag<'_, (u64, u64)>,
         s: Variable,
         o: Variable,
     ) -> NativeResult<Solutions> {
-        let beside = pairs.bytes();
-        if s == o {
-            let same = || pairs.counted().filter(|((a, b), _)| a == b);
-            let rows = same().fold(0usize, |n, (_, copies)| n.saturating_add(copies));
-            let bytes = rows.saturating_mul(8).saturating_add(beside);
-            return self.path_table(bytes, adopted, || {
-                let mut column = Vec::with_capacity(rows);
-                for ((a, _), copies) in same() {
-                    column.extend(std::iter::repeat_n(a, copies));
+        let refused = QueryEvaluationError::MemoryLimit;
+        // A column of `rows` ids, the copies of each pair's `end` (of the pairs `keep` takes).
+        let column = |rows: usize, keep: fn(&(u64, u64)) -> bool, end: fn((u64, u64)) -> u64| {
+            let mut column = paths::Buf::with_capacity_in(pool, rows).map_err(refused)?;
+            let filled = column.fill(rows, |room| {
+                for (pair, copies) in pairs.counted().filter(|(pair, _)| keep(pair)) {
+                    (0..copies).for_each(|_| room.push(end(pair)));
                 }
-                (vec![s], IdTable::from_columns(vec![column]))
             });
-        }
-        let rows = pairs.len();
-        let bytes = rows.saturating_mul(16).saturating_add(beside);
-        self.path_table(bytes, adopted, || {
-            let (mut starts, mut ends) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
-            for ((a, b), copies) in pairs.counted() {
-                starts.extend(std::iter::repeat_n(a, copies));
-                ends.extend(std::iter::repeat_n(b, copies));
-            }
-            (vec![s, o], IdTable::from_columns(vec![starts, ends]))
-        })
+            filled.map_err(refused)?;
+            Ok::<_, NativeError>(column)
+        };
+        let (vars, columns) = if s == o {
+            let same = |(a, b): &(u64, u64)| a == b;
+            let rows = pairs
+                .counted()
+                .filter(|(pair, _)| same(pair))
+                .fold(0usize, |n, (_, copies)| n.saturating_add(copies));
+            (vec![s], vec![column(rows, same, |(a, _)| a)?])
+        } else {
+            let (rows, all) = (pairs.len(), |_: &(u64, u64)| true);
+            let starts = column(rows, all, |(a, _)| a)?;
+            (vec![s, o], vec![starts, column(rows, all, |(_, b)| b)?])
+        };
+        drop(pairs);
+        self.path_table(vars, columns)
     }
 
-    /// A path's table: `bytes` held before `make` makes it, from `adopted`, the charge of the
-    /// bag it is made of (taken over, never released and charged again: sol-loop r6 S2 of the
-    /// executor memory stack's package fix check r2), then the charge of exactly the table's
-    /// bytes, which it keeps.
+    /// A path's table of `columns`, each charged to the path's pool since before it was
+    /// made: their charge is handed to the table whole ([`nrese_exec::Share::transfer`]),
+    /// never released and charged again, exactly the table's bytes (the executor memory
+    /// stack's package fix check r3, EMS-R3-C1: a column's capacity released down to its
+    /// length while it lived). Cancelled or refused before, the columns are dropped: freed,
+    /// then released.
     fn path_table(
         &self,
-        bytes: usize,
-        adopted: usize,
-        make: impl FnOnce() -> (Vec<Variable>, IdTable),
+        vars: Vec<Variable>,
+        columns: Vec<paths::Buf<'_, u64>>,
     ) -> NativeResult<Solutions> {
-        let mut held = Reservation::adopt(Arc::clone(&self.budget), adopted);
-        held.resize(bytes)
-            .map_err(QueryEvaluationError::MemoryLimit)?;
-        // Declared after `held`: dropped before it.
-        let (vars, table) = make();
         self.check()?;
-        held.resize(table.memory_bytes())
-            .map_err(QueryEvaluationError::MemoryLimit)?;
-        held.transfer();
+        let mut bytes = 0usize;
+        let columns = columns
+            .into_iter()
+            .map(|column| {
+                let (column, held) = column.into_parts();
+                bytes += held.transfer();
+                column
+            })
+            .collect();
+        let table = IdTable::from_columns(columns);
+        debug_assert_eq!(
+            table.memory_bytes(),
+            bytes,
+            "a path table's charge is its bytes"
+        );
         Ok(Solutions {
             vars,
             table,
@@ -2565,41 +2589,32 @@ impl<'a> Context<'a> {
         let mut evaluator = self.path_evaluator()?;
         let constant = |end: &Result<Variable, u64>| end.as_ref().err().copied();
         evaluator.fixed = constant(&ends.0).or_else(|| constant(&ends.1));
-        // A row per copy of the path's bag, charged before it is made.
-        // A bag of copies moves into the column; a counted one stays beside its copies. Its
-        // charge is taken over from the evaluator, which hands it over with the bag.
-        let column = |variable: Variable, ends: paths::Bag<u64>, adopted: usize| {
-            let bytes = ends.len().saturating_mul(8);
-            let bytes = bytes.saturating_add(ends.bytes_beside_copies());
-            self.path_table(bytes, adopted, || {
-                (
-                    vec![variable],
-                    IdTable::from_columns(vec![ends.into_copies()]),
-                )
-            })
-        };
         let refused = QueryEvaluationError::MemoryLimit;
+        let pool = evaluator.pool();
         let solutions = match ends {
+            // As many solutions without bindings as the path connects the two ways: a table
+            // without columns, which holds no buffer, charged its rows ([`Self::produced`]).
             (Err(start), Err(finish)) => {
                 let rows = evaluator
                     .solutions(&resolved, start, finish)
                     .map_err(refused)?;
-                self.path_table(rows.saturating_mul(8), 0, || {
-                    let rows = IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows));
-                    (Vec::new(), rows)
+                self.produced(Solutions {
+                    vars: Vec::new(),
+                    table: IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
+                    ordered: false,
                 })?
             }
             (Err(start), Ok(o)) => {
                 let ends = evaluator.ends(&resolved, start).map_err(refused)?;
-                column(o, ends, evaluator.handover())?
+                self.path_column(pool, o, ends)?
             }
             (Ok(s), Err(finish)) => {
                 let starts = evaluator.starts(&resolved, finish).map_err(refused)?;
-                column(s, starts, evaluator.handover())?
+                self.path_column(pool, s, starts)?
             }
             (Ok(s), Ok(o)) => {
                 let pairs = evaluator.pairs(&resolved).map_err(refused)?;
-                self.path_pairs(pairs, evaluator.handover(), s, o)?
+                self.path_pairs(pool, pairs, s, o)?
             }
         };
         let estimate = || {

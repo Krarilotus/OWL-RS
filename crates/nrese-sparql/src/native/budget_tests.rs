@@ -518,9 +518,9 @@ fn rows_of(rows: Result<usize, String>, n: usize) -> Result<(), String> {
 ///   its length, then charged again, at 6449d5cd).
 /// - `?x (p|missing) ?y` (T2): the pairs' columns are made beside the pairs, whose charge
 ///   goes only once they are freed.
-/// - T2 under a limit one byte below the pairs and their two columns together (T3): the
-///   union of n pairs has room for n.next_power_of_two() of 16 bytes, each column n ids;
-///   refused at the columns, and the pairs freed before their charge is released.
+/// - T2 under a limit of its answer's two columns alone, n ids each (T3), which the pairs
+///   and their columns can't fit together: refused, wherever the refusal comes (the union's
+///   growth or a column), and every buffer freed before its charge is released.
 /// - `<h> p/q ?y` (T4, a sequence from a node), `?x p/q ?y` (T5, every pair), `?x p/(q/r) ?y`
 ///   (T6, a step that isn't a link), `<h> p/q <b>` (T7, both ends bound: the ways counted): a
 ///   step's input is freed before its charge goes.
@@ -568,10 +568,10 @@ fn a_paths_buffers_are_charged_while_they_live() {
             rows_of,
         ),
         holds_nothing_uncharged_per_row(
-            "T3 ?x (p|missing) ?y refused at its columns",
+            "T3 ?x (p|missing) ?y refused under its columns' bytes",
             wide,
             |n| (fanned(n), ("?x", either(), "?y")),
-            |n: usize| Some(n.next_power_of_two() * 16 + 2 * n * 8 - 1),
+            |n: usize| Some(2 * n * 8),
             refused,
         ),
         holds_nothing_uncharged_per_row(
