@@ -1278,6 +1278,202 @@ fn existentials_feeding_a_transitive_role_miss_with_the_flag() {
     }
 }
 
+/// An existential under a universal on the right makes anonymous individuals no
+/// generating axiom types (I24b): with `C ⊑ ∀R.(∃S.A)`, `c : C` and `R(c, x)`, `x` has an
+/// `S`-successor in `A` (OWL 2 Direct Semantics), so `ASK { :x :S ?y . ?y a :A }` and
+/// `ASK { ?y a :A }` are entailed. `∀` on the right is outside OWL 2 QL (OWL 2 Profiles
+/// §3.2), so neither closure need find them; then the status the store reports must not be
+/// `complete` (docs/design/ql-rewriting.md §7).
+#[test]
+fn existentials_under_a_universal_are_answered_or_reported() {
+    let turtle = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         :C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ; owl:allValuesFrom
+             [ a owl:Restriction ; owl:onProperty :S ; owl:someValuesFrom :A ] ] .
+         :c a :C ; :R :x ."
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mut wrong = Vec::new();
+    for ruleset in [Ruleset::Owl2Rl, Ruleset::Owl2Ql] {
+        let store = store(&turtle, dir.path(), ruleset, true);
+        for query in [
+            format!("ASK {{ <{E}x> <{E}S> ?y . ?y a <{E}A> }}"),
+            format!("ASK {{ ?y a <{E}A> }}"),
+        ] {
+            let result = store
+                .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let answer = String::from_utf8(result.payload).unwrap();
+            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+            if !answer.contains("true") && matches!(status, "complete" | "none") {
+                wrong.push(format!("{}, {query}: {answer}, {status}", ruleset.name()));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Existentials an axiom concludes where the TBox reads the axiom in part (I24b review r1,
+/// F1 and F2). Each case is entailed by the OWL 2 Direct Semantics (§2.2.3, §2.3.1). Each
+/// must be answered true, or reported as not `complete`, under owl2-rl and owl2-ql.
+/// - `(A ⊓ B) ⊑ ∃S.D` with `c : A, B`: `c` has an `S`-successor in `D`.
+/// - `(A ⊓ B) ⊑ ∀R.∃S.D` with `R(c, x)`: `x` has one.
+/// - `DisjointUnion(C, ∃R.A, ∃R.B)` with `c : C`: `c` has an `R`-successor, though neither
+///   branch is certain.
+/// - Disjointness concludes a part's complement (fix check r1, F3): with `c : A` and `A`
+///   disjoint from `≤ 0 S.D`, `c` is in `≥ 1 S.D`, so it has an `S`-successor in `D`. The
+///   disjointness can come from a disjoint union, `owl:disjointWith` or
+///   `owl:AllDisjointClasses`. The same holds where `A` is disjoint from `∀S.¬D`.
+#[test]
+fn existentials_of_axioms_the_tbox_reads_in_part_are_answered_or_reported() {
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n"
+    );
+    let some = "[ a owl:Restriction ; owl:onProperty :S ; owl:someValuesFrom :D ]";
+    let none = "[ a owl:Restriction ; owl:onProperty :S ; owl:onClass :D ;
+                  owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ]";
+    let all_not = "[ a owl:Restriction ; owl:onProperty :S ;
+                     owl:allValuesFrom [ a owl:Class ; owl:complementOf :D ] ]";
+    let successor = vec![format!("ASK {{ <{E}c> <{E}S> ?y . ?y a <{E}D> }}")];
+    let cases = [
+        (
+            format!(
+                "{head}[ owl:intersectionOf ( :A :B ) ] rdfs:subClassOf {some} .
+                 :c a :A, :B ."
+            ),
+            vec![
+                format!("ASK {{ <{E}c> <{E}S> ?y . ?y a <{E}D> }}"),
+                format!("ASK {{ ?y a <{E}D> }}"),
+            ],
+        ),
+        (
+            format!(
+                "{head}[ owl:intersectionOf ( :A :B ) ] rdfs:subClassOf
+                     [ a owl:Restriction ; owl:onProperty :R ; owl:allValuesFrom {some} ] .
+                 :c a :A, :B ; :R :x ."
+            ),
+            vec![
+                format!("ASK {{ <{E}x> <{E}S> ?y . ?y a <{E}D> }}"),
+                format!("ASK {{ ?y a <{E}D> }}"),
+            ],
+        ),
+        (
+            format!(
+                "{head}:C a owl:Class ; owl:disjointUnionOf (
+                     [ a owl:Restriction ; owl:onProperty :R ; owl:someValuesFrom :A ]
+                     [ a owl:Restriction ; owl:onProperty :R ; owl:someValuesFrom :B ] ) .
+                 :c a :C ."
+            ),
+            vec![format!("ASK {{ <{E}c> <{E}R> ?y }}")],
+        ),
+        (
+            format!(
+                "{head}:C a owl:Class ; owl:disjointUnionOf ( :A {none} ) .
+                 :c a :A ."
+            ),
+            successor.clone(),
+        ),
+        (
+            format!(
+                "{head}:C a owl:Class ; owl:disjointUnionOf ( :A {all_not} ) .
+                 :c a :A ."
+            ),
+            successor.clone(),
+        ),
+        (
+            format!(
+                "{head}:A owl:disjointWith {none} .
+                 :c a :A ."
+            ),
+            successor.clone(),
+        ),
+        (
+            format!(
+                "{head}[ a owl:AllDisjointClasses ; owl:members ( :A {none} ) ] .
+                 :c a :A ."
+            ),
+            successor.clone(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (n, (turtle, queries)) in cases.iter().enumerate() {
+        for ruleset in [Ruleset::Owl2Rl, Ruleset::Owl2Ql] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(turtle, dir.path(), ruleset, true);
+            for query in queries {
+                let result = store
+                    .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                    .unwrap_or_else(|e| panic!("case {n}, {query}: {e}"));
+                let answer = String::from_utf8(result.payload).unwrap();
+                let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+                if !answer.contains("true") && matches!(status, "complete" | "none") {
+                    wrong.push(format!(
+                        "case {n}, {}, {query}: {answer}, {status}",
+                        ruleset.name()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A bounded restriction forces an existential on a successor that exists (I24b fix check
+/// r2, F4; fixtures `review-i24b-r3/f4.ttl` and `f4-exact-zero.ttl`). `C ⊑ ¬(≥ 1 R.¬∃S.D)`
+/// and `C ⊑ (= 0 R.¬∃S.D)` are both `C ⊑ ∀R.∃S.D` (OWL 2 Direct Semantics §2.2.3): with
+/// `c : C` and `R(c, x)`, `x` has an `S`-successor in `D`, so both queries are entailed.
+/// Each must be answered true, or reported as not `complete`, under owl2-rl and owl2-ql.
+#[test]
+fn existentials_bounded_restrictions_force_are_answered_or_reported() {
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n"
+    );
+    let not_x = "[ a owl:Class ; owl:complementOf
+                   [ a owl:Restriction ; owl:onProperty :S ; owl:someValuesFrom :D ] ]";
+    let cases = [
+        format!(
+            "{head}:C rdfs:subClassOf [ a owl:Class ; owl:complementOf
+                 [ a owl:Restriction ; owl:onProperty :R ;
+                   owl:minQualifiedCardinality \"1\"^^xsd:nonNegativeInteger ; owl:onClass {not_x} ] ] .
+             :c a :C ; :R :x ."
+        ),
+        format!(
+            "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                 owl:qualifiedCardinality \"0\"^^xsd:nonNegativeInteger ; owl:onClass {not_x} ] .
+             :c a :C ; :R :x ."
+        ),
+    ];
+    let queries = [
+        format!("ASK {{ <{E}x> <{E}S> ?y . ?y a <{E}D> }}"),
+        format!("ASK {{ ?y a <{E}D> }}"),
+    ];
+    let mut wrong = Vec::new();
+    for (n, turtle) in cases.iter().enumerate() {
+        for ruleset in [Ruleset::Owl2Rl, Ruleset::Owl2Ql] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(turtle, dir.path(), ruleset, true);
+            for query in &queries {
+                let result = store
+                    .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                    .unwrap_or_else(|e| panic!("case {n}, {query}: {e}"));
+                let answer = String::from_utf8(result.payload).unwrap();
+                let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+                if !answer.contains("true") && matches!(status, "complete" | "none") {
+                    wrong.push(format!(
+                        "case {n}, {}, {query}: {answer}, {status}",
+                        ruleset.name()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A rewritten query reads only what its reader may (design §1), and uses the schema as
 /// the RL closure the reader sees was computed: a reader who sees the inferences its graphs
 /// support (`inferred = "supported"`) gets the existentials of readable graphs only, one who

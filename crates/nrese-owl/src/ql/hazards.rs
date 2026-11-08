@@ -41,6 +41,10 @@ pub enum Hazard {
     Filler(Term),
     /// The role of an existential an individual is asserted to be in.
     Asserted(Term),
+    /// The role of an existential in a conclusion the TBox doesn't read (under a universal,
+    /// a union or a complement, after a left side it doesn't read, a disjoint union's
+    /// covering): anonymous individuals no generator types (I24b).
+    Untyped(Term),
     /// A term on the right of an axiom whose left side any individual may be in, with
     /// none of that side's classes or properties (`⊤ ⊓ ≥ 0 R.⊤`, `B ⊔ ¬B`), where the
     /// rewriting doesn't read the axiom.
@@ -66,6 +70,7 @@ impl Hazard {
             | Self::Enumeration(t)
             | Self::Filler(t)
             | Self::Asserted(t)
+            | Self::Untyped(t)
             | Self::OpenLeft(t) => t,
         }
     }
@@ -103,6 +108,9 @@ impl Hazard {
             Self::Filler(_) => format!("an existential on {t} with a filler beyond OWL 2 QL"),
             Self::Asserted(_) => {
                 format!("an individual is asserted to be in an existential on {t}")
+            }
+            Self::Untyped(_) => {
+                format!("an existential on {t} in a conclusion the TBox doesn't read")
             }
             Self::OpenLeft(_) => {
                 format!("an axiom on {t} whose left side any individual may be in")
@@ -266,8 +274,14 @@ fn terms(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
 }
 
 /// The hazards of `o` and the terms they reach, given the anonymous individuals' types
-/// (`types`, with `basics` naming their concepts).
-pub(crate) fn hazards(o: &Ontology, types: &[Type], basic: &dyn Fn(u32) -> Basic) -> Hazards {
+/// (`types`, with `basics` naming their concepts) and the conclusions the TBox doesn't read
+/// (`unread`, its ledger, each with its polarity).
+pub(crate) fn hazards(
+    o: &Ontology,
+    types: &[Type],
+    unread: &std::collections::BTreeSet<(ExprId, bool)>,
+    basic: &dyn Fn(u32) -> Basic,
+) -> Hazards {
     let mut found: Vec<Hazard> = Vec::new();
     // Properties connected by inclusions, inverses, equivalences and chains.
     let mut links: Vec<(Term, Term)> = Vec::new();
@@ -416,6 +430,19 @@ pub(crate) fn hazards(o: &Ontology, types: &[Type], basic: &dyn Fn(u32) -> Basic
         }
     }
     found.extend(collect.found);
+    // The ledger: a conclusion the TBox doesn't read leaves the anonymous individuals of
+    // its existentials untyped. Each is seeded like an asserted one: its role, and its
+    // filler's terms.
+    let mut untyped: Vec<(Term, Hazard)> = Vec::new();
+    for &(e, positive) in unread {
+        let (mut roles, mut fillers) = (Vec::new(), Vec::new());
+        generated(o, e, positive, &mut roles, Some(&mut fillers));
+        if let Some(&role) = roles.first() {
+            let h = Hazard::Untyped(role);
+            untyped.extend(fillers.into_iter().map(|t| (t, h)));
+        }
+        found.extend(roles.into_iter().map(Hazard::Untyped));
+    }
 
     let mut by_term: HashMap<Term, Hazard> = HashMap::new();
     // The hazards that can equate individuals, apart: a term may have several hazards,
@@ -479,19 +506,23 @@ pub(crate) fn hazards(o: &Ontology, types: &[Type], basic: &dyn Fn(u32) -> Basic
             start.extend(classes.iter().map(|&c| (c, h)));
         }
     }
-    // Existentials asserted of individuals make anonymous individuals of their own.
+    // Existentials asserted of individuals, or in a right side the TBox doesn't read, make
+    // anonymous individuals of their own.
     for &h in &found {
-        if let Hazard::Asserted(p) = h {
+        if let Hazard::Asserted(p) | Hazard::Untyped(p) = h {
             start.extend(component(&mut parent, p).into_iter().map(|q| (q, h)));
         }
     }
     start.extend(asserted);
+    start.extend(untyped);
     // An axiom whose left side any individual may be in meets every anonymous individual,
     // whether or not it shares a term with the individual's type. Seeded after the others,
     // so a term they reach keeps their reason.
     let anonymous = open_generates
         || types.iter().any(|t| !t.data)
-        || found.iter().any(|h| matches!(h, Hazard::Asserted(_)));
+        || found
+            .iter()
+            .any(|h| matches!(h, Hazard::Asserted(_) | Hazard::Untyped(_)));
     let open: Vec<(Term, Hazard)> = match anonymous {
         true => open.iter().map(|&t| (t, Hazard::OpenLeft(t))).collect(),
         false => Vec::new(),
@@ -627,21 +658,124 @@ fn enumerated(o: &Ontology, e: ExprId) -> Option<Term> {
     }
 }
 
-/// The roles of the existentials (`∃`, `≥ n`) in an expression.
+/// The roles of the existentials (`∃`, `≥ n`) in an expression ([`generated`]).
 fn existential_roles(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
-    match o.class(e) {
-        ClassExpr::Some(p, f) | ClassExpr::Min(_, p, f) | ClassExpr::Exact(_, p, f) => {
-            out.push(p.named());
-            existential_roles(o, *f, out);
-        }
-        ClassExpr::DataSome(p, _) | ClassExpr::DataMin(_, p, _) | ClassExpr::DataExact(_, p, _) => {
-            out.push(*p);
-        }
-        ClassExpr::And(parts) | ClassExpr::Or(parts) => {
-            for &p in parts {
-                existential_roles(o, p, out);
+    generated(o, e, true, out, None);
+}
+
+/// The existentials concluded by `e` (`positive`) or by its complement: their roles into
+/// `roles`, their fillers' terms into `fillers` where given (a caller without them reads
+/// no filler's terms: #155's count). Every `≥ 1`-form of the expression's
+/// negation normal form is collected, at any depth (fix check r2, F4):
+/// - A restriction makes a successor where it reads as `≥ n` for n ≥ 1: `∃R.F`, `≥ n` and
+///   `= n` for n ≥ 1, `¬∀R.F` (`∃R.¬F`), `¬≤ n` (`≥ n+1`) and `¬= n` (it may be `≥ n+1`).
+///   `∀`, `≤` and `= 0` make none, nor do `¬∃` and `¬≥ n`, which are `∀` and `≤ n−1`.
+/// - Its filler is read where it holds of a successor, made or already there: `F` under
+///   `∃`, `∀` and `≥`; `¬F` under `¬∃` and `¬∀`; both under `≤` and `=`, which put each
+///   successor in `F` or in `¬F` (`≤ 0 R.¬∃S.D` is `∀R.∃S.D`).
+/// - Conjunctions and unions are read part by part, complements flip the polarity.
+/// - Nothing is inside a class, `⊤`, `⊥`, a nominal, `hasValue` or `hasSelf`: they make no
+///   anonymous individual (the `Enumeration`, `Value` and `SelfRestriction` hazards
+///   mark them). A data range has no class expression either: datatypes, facets and their
+///   combinations make a data value at most.
+///
+/// Inverses give the named property, its role component. Conservative: it may name a
+/// role no individual is made for, never miss one. Under a bound, whose filler is read both
+/// ways, each (expression, polarity) is walked once, so nested bounds don't double the walk
+/// at each level; elsewhere the walk follows the expression as before and allocates
+/// nothing (#155's count: a set per walk cost 3.9 % of a compile over 1,000 asserted
+/// restrictions). A successor's filler terms are still collected per restriction that
+/// makes one.
+fn generated(
+    o: &Ontology,
+    e: ExprId,
+    positive: bool,
+    roles: &mut Vec<Term>,
+    fillers: Option<&mut Vec<Term>>,
+) {
+    nnf(o, e, positive, false, &mut HashSet::new(), roles, fillers);
+}
+
+/// [`generated`]'s walk; `bounded` where it is inside a filler read both ways.
+fn nnf(
+    o: &Ontology,
+    e: ExprId,
+    positive: bool,
+    bounded: bool,
+    seen: &mut HashSet<(ExprId, bool)>,
+    roles: &mut Vec<Term>,
+    mut fillers: Option<&mut Vec<Term>>,
+) {
+    use ClassExpr as C;
+    if bounded && !seen.insert((e, positive)) {
+        return;
+    }
+    // An object restriction: its role and filler, whether it makes a successor, and
+    // whether its filler (`inside`) or the filler's complement (`outside`) holds of one.
+    let (p, f, makes, inside, outside) = match (o.class(e), positive) {
+        (
+            C::Thing
+            | C::Nothing
+            | C::Class(_)
+            | C::OneOf(_)
+            | C::HasValue(..)
+            | C::HasSelf(_)
+            | C::DataHasValue(..),
+            _,
+        ) => return,
+        (C::And(parts) | C::Or(parts), _) => {
+            for &part in parts {
+                nnf(
+                    o,
+                    part,
+                    positive,
+                    bounded,
+                    seen,
+                    roles,
+                    fillers.as_deref_mut(),
+                );
             }
+            return;
         }
-        _ => {}
+        (C::Not(inner), _) => return nnf(o, *inner, !positive, bounded, seen, roles, fillers),
+        (C::DataSome(p, _), true)
+        | (C::DataAll(p, _), false)
+        | (C::DataMax(_, p, _), false)
+        | (C::DataExact(_, p, _), false) => {
+            roles.push(*p);
+            return;
+        }
+        (C::DataMin(n, p, _) | C::DataExact(n, p, _), true) => {
+            if *n >= 1 {
+                roles.push(*p);
+            }
+            return;
+        }
+        (C::DataSome(..), false)
+        | (C::DataAll(..), true)
+        | (C::DataMin(..), false)
+        | (C::DataMax(..), true) => return,
+        (C::Some(p, f), true) => (p, f, true, true, false),
+        (C::Some(p, f), false) => (p, f, false, false, true),
+        (C::All(p, f), true) => (p, f, false, true, false),
+        (C::All(p, f), false) => (p, f, true, false, true),
+        (C::Min(n, p, f), true) => (p, f, *n >= 1, true, false),
+        (C::Min(_, p, f), false) | (C::Max(_, p, f), true) => (p, f, false, true, true),
+        (C::Max(_, p, f), false) => (p, f, true, true, false),
+        (C::Exact(n, p, f), true) => (p, f, *n >= 1, true, true),
+        (C::Exact(_, p, f), false) => (p, f, true, true, true),
+    };
+    if makes {
+        roles.push(p.named());
+        if let Some(fillers) = fillers.as_deref_mut() {
+            terms(o, *f, fillers);
+        }
+    }
+    let bounded = bounded || (inside && outside);
+    if inside {
+        nnf(o, *f, true, bounded, seen, roles, fillers.as_deref_mut());
+    }
+    if outside {
+        nnf(o, *f, false, bounded, seen, roles, fillers);
     }
 }
