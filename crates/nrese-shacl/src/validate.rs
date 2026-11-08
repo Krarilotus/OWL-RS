@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use nrese_engine::{TermId, TermKind};
 use nrese_exec::Reservation;
-use nrese_rdf::{BlankNode, GraphName, NamedNode, NamedOrBlankNode, Quad, Term, Triple};
+use nrese_rdf::{BlankNode, NamedNode, NamedOrBlankNode, Term, Triple};
 use nrese_sparql::value::{Value, compare, lang_matches};
 use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
 
@@ -49,7 +49,7 @@ pub(crate) struct Computed {
     /// of a query is one node of the report, however many results name it.
     pub(crate) term: Term,
     /// The term as it is compared, where that differs from `term`: its fresh blank nodes
-    /// named canonically and its stored ones by id ([`Validator::result_term`]).
+    /// named by their place in it and its stored ones by id ([`Validator::triple_key`]).
     key: Option<Term>,
 }
 
@@ -515,123 +515,84 @@ impl<'a, V: ReadView> Validator<'a, V> {
         }
     }
 
-    /// A term a query bound, as a result holds it, or `None` after a stop (recorded): its id
-    /// where the frontier knows it; else owned, with its comparison form. A blank node is
-    /// stored where this view knows it (a node of this state's data, compared by id), else
-    /// fresh (one the query made): the frontier isn't asked, since a later state may store a
-    /// node under a fresh node's name. A triple term holding blank nodes is stored where this
-    /// view stores it; if it holds a fresh one, it is computed, compared with its stored blank
-    /// nodes named by id and its fresh ones canonically
-    /// ([`nrese_rdf::canonical::canonical_until`], on the validation's stop); otherwise it goes
-    /// through the frontier as any other term.
-    fn result_term(&self, term: &Term) -> Option<ResultTerm> {
+    /// A term a query bound, as a result holds it: its id where the frontier knows it; else
+    /// owned, with its comparison form. A blank node is stored where this view knows it (a node
+    /// of this state's data, compared by id), else fresh (one the query made): the frontier
+    /// isn't asked, since a later state may store a node under a fresh node's name. A triple
+    /// term holding a fresh blank node can't be stored (the dictionary knows a triple term only
+    /// with its parts): computed, compared by [`Validator::triple_key`]. One holding only this
+    /// state's blank nodes goes through the frontier as any other term.
+    fn result_term(&self, term: &Term) -> ResultTerm {
         if let Term::BlankNode(_) = term {
-            return Some(match self.graph.lookup(term) {
+            return match self.graph.lookup(term) {
                 Some(id) => ResultTerm::Stored(id),
                 None => ResultTerm::Computed(Box::new(Computed {
                     term: term.clone(),
                     key: Some(fresh_blank()),
                 })),
-            });
+            };
         }
-        if let Term::Triple(_) = term
-            && holds_blank_node(term)
-        {
-            // Stored in this state: the id Core, ASK and the focus-node fallback hold too.
-            if let Some(id) = self.graph.lookup(term) {
-                return Some(ResultTerm::Stored(id));
+        let key = match term {
+            Term::Triple(_) if holds_blank_node(term) => {
+                let mut fresh = Vec::new();
+                let key = self.triple_key(term, &mut fresh);
+                if !fresh.is_empty() {
+                    return ResultTerm::Computed(Box::new(Computed {
+                        term: term.clone(),
+                        key: Some(key),
+                    }));
+                }
+                Some(key)
             }
-            // A blank node the query made: compared by the canonical form, never by id.
-            if self.holds_fresh_blank(term) {
-                let key = self.canonical_key(term)?;
-                return Some(ResultTerm::Computed(Box::new(Computed {
-                    term: term.clone(),
-                    key: Some(key),
-                })));
-            }
-            // Only this state's blank nodes: as any other term, through the frontier, compared
-            // (when computed) with its blank nodes named by id.
-            return Some(match self.known(term) {
-                Some(id) => ResultTerm::Stored(id),
-                None => ResultTerm::Computed(Box::new(Computed {
-                    term: term.clone(),
-                    key: Some(self.mark_stored_blanks(term)),
-                })),
-            });
-        }
-        Some(match self.known(term) {
+            _ => None,
+        };
+        match self.known(term) {
             Some(id) => ResultTerm::Stored(id),
             None => ResultTerm::Computed(Box::new(Computed {
                 term: term.clone(),
-                key: None,
+                key,
             })),
-        })
-    }
-
-    /// Whether `term` holds a blank node this view doesn't know: one the query made.
-    fn holds_fresh_blank(&self, term: &Term) -> bool {
-        match term {
-            Term::BlankNode(_) => self.graph.lookup(term).is_none(),
-            Term::Triple(triple) => {
-                let subject_fresh = match &triple.subject {
-                    NamedOrBlankNode::BlankNode(node) => {
-                        self.graph.lookup(&Term::BlankNode(node.clone())).is_none()
-                    }
-                    NamedOrBlankNode::NamedNode(_) => false,
-                };
-                subject_fresh || self.holds_fresh_blank(&triple.object)
-            }
-            _ => false,
         }
     }
 
-    /// The comparison form of a computed triple term that holds blank nodes, or `None` after
-    /// a stop (recorded).
-    fn canonical_key(&self, term: &Term) -> Option<Term> {
-        let marked = self.mark_stored_blanks(term);
-        let anchor = NamedNode::new_unchecked("urn:nrese-shacl:key");
-        let quads = BTreeSet::from([Quad::new(
-            anchor.clone(),
-            anchor,
-            marked,
-            GraphName::DefaultGraph,
-        )]);
-        let stopped = || self.resources.check().is_err();
-        match nrese_rdf::canonical::canonical_until(quads, &stopped) {
-            Ok(quads) => quads.into_iter().next().map(|quad| quad.object),
-            Err(nrese_rdf::canonical::Stopped) => {
-                let stop = self
-                    .resources
-                    .check()
-                    .err()
-                    .unwrap_or(QueryEvaluationError::Cancelled);
-                let _ = self.stop.set(stop);
-                None
-            }
-        }
-    }
-
-    /// `term` with each blank node this view knows replaced by its [`stored_blank`] IRI.
-    fn mark_stored_blanks(&self, term: &Term) -> Term {
-        match term {
-            Term::BlankNode(_) => match self.graph.lookup(term) {
+    /// The comparison form of a triple term holding blank nodes: each this view knows named by
+    /// its [`stored_blank`] IRI, each fresh one (gathered in `fresh`) by its place among them in
+    /// order of first appearance, subject before object, depth first. A triple term is an
+    /// ordered tree, so a renaming of fresh blank nodes that maps one term onto another maps
+    /// each place to the same place: two terms are the same up to their fresh nodes' names
+    /// exactly when their forms are equal. One walk over the term.
+    fn triple_key(&self, term: &Term, fresh: &mut Vec<BlankNode>) -> Term {
+        let mut blank = |node: &BlankNode| -> Term {
+            match self.graph.lookup(&Term::BlankNode(node.clone())) {
                 Some(id) => stored_blank(id).into(),
-                None => term.clone(),
-            },
+                None => {
+                    let place = match fresh.iter().position(|seen| seen == node) {
+                        Some(place) => place,
+                        None => {
+                            fresh.push(node.clone());
+                            fresh.len() - 1
+                        }
+                    };
+                    BlankNode::new_unchecked(format!("f{place}")).into()
+                }
+            }
+        };
+        match term {
+            Term::BlankNode(node) => blank(node),
             Term::Triple(triple) => {
                 let subject = match &triple.subject {
-                    NamedOrBlankNode::BlankNode(node) => {
-                        match self.graph.lookup(&Term::BlankNode(node.clone())) {
-                            Some(id) => NamedOrBlankNode::NamedNode(stored_blank(id)),
-                            None => triple.subject.clone(),
-                        }
-                    }
+                    NamedOrBlankNode::BlankNode(node) => match blank(node) {
+                        Term::NamedNode(stored) => NamedOrBlankNode::NamedNode(stored),
+                        Term::BlankNode(renamed) => NamedOrBlankNode::BlankNode(renamed),
+                        _ => unreachable!("a blank node's form is an IRI or a blank node"),
+                    },
                     NamedOrBlankNode::NamedNode(_) => triple.subject.clone(),
                 };
+                let object = self.triple_key(&triple.object, fresh);
                 Term::Triple(Box::new(Triple::new(
                     subject,
                     triple.predicate.clone(),
-                    self.mark_stored_blanks(&triple.object),
+                    object,
                 )))
             }
             _ => term.clone(),
@@ -1182,10 +1143,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                         // The bound value and path are the result's (SHACL §5.3.2), stored or
                         // computed ([`ResultTerm`]).
                         let value = match found.value {
-                            Some(term) => match self.result_term(term) {
-                                Some(value) => Some(value),
-                                None => return ControlFlow::Break(()),
-                            },
+                            Some(term) => Some(self.result_term(term)),
                             // A node shape's value is its focus node.
                             None => shape.path.is_none().then_some(ResultTerm::Stored(focus)),
                         };
