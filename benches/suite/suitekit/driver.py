@@ -36,7 +36,7 @@ from .runtime import (ApptainerRuntime, DockerRuntime, DryRuntime, Mount, Proces
                       run_quiet, shell)
 from . import receipts
 from .datasets import Store
-from .manifest import Manifest, ManifestError, image_ids
+from .manifest import Manifest, ManifestError, append_attempts, image_ids
 from .manifest import git as checkout_state
 from .schema import FIELDS, Result, Writer, problems, read
 from .summary import adjudications, summarise
@@ -879,14 +879,15 @@ class Suite:
         return 0
 
     def attempts(self, plan, cells: list[tuple[str, object]]) -> dict[str, dict]:
-        """Each cell's attempt (receipts.py), into the manifest, durably (Manifest._write), before its
-        work starts; if it can't be published that raises here, and the run stops before the work."""
+        """Each cell's attempt (receipts.py), appended to the results' attempt journal and on disk
+        (manifest.append_attempts) before its work starts; if it can't be, that raises here, and the
+        run stops before the work."""
         if not self.manifest or self.args.dry_run or not cells:
             return {}
         started = datetime.datetime.now().isoformat(timespec="microseconds")
         out = {receipts.cell_key(plan.workload, plan.tier, key): {"attempt": uuid.uuid4().hex, "started": started,
                                                                     "complete": False} for key, _ in cells}
-        self.manifest.update(cells=out)
+        append_attempts(self.manifest.path.parent, out)
         return out
 
     def receipts(self, plan, cells: list[tuple[str, object]], attempts: dict[str, dict]):

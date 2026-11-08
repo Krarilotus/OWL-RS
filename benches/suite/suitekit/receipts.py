@@ -1,8 +1,9 @@
-"""A cell's attempt and receipt: what one suite cell (a workload tier on one system) ran, in its
-invocation's manifest entry (`cells`). The attempt is written before the cell's work starts
-(`complete` false); its receipt replaces it, under the same attempt id, once the cell has run its
-whole protocol, and its answers once the run's answers.json is written. The ledger takes the
-newest attempt of each cell, finished or not, and never an older one in its place; `suite.py
+"""A cell's attempt and receipt: what one suite cell (a workload tier on one system) ran. The
+attempt is appended to the results' attempts.jsonl, on disk, before the cell's work starts
+(manifest.append_attempts); its receipt goes into its invocation's manifest entry (`cells`), under
+the same attempt id, once the cell has run its whole protocol, and its answers once the run's
+answers.json is written. The ledger takes the newest attempt of each cell, finished or not, its
+receipt only under that attempt, and never an older one in its place; `suite.py
 coverage` compares it with what the evaluated commit expects (Harness notes
 2026-11-08-coverage-refresh/design.md r2; review cell-receipts r1).
 

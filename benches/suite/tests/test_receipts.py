@@ -11,6 +11,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -20,7 +21,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from suitekit import driver, ledger, receipts  # noqa: E402
+from suitekit import driver, ledger, manifest, receipts  # noqa: E402
 from suitekit.workloads import Plan  # noqa: E402
 
 HEADER = ("date,host,runtime,system,version,publish,workload,tier,regime,run,task,item,repeat,status,ms,"
@@ -45,6 +46,51 @@ def done(attempt, started, commit, **fields):
             "outcome": {"outcome": "ok"}, "answers": "ok", **fields}
 
 
+class Crash:
+    """What a host crash leaves of a results directory, from the calls its manifest writers made:
+    a file's bytes once its fsync returned, under a name already on disk; a new name or a rename
+    once its directory was synced, which Windows can't (`windows`): there it is lost. What is
+    there at the start counts as long on disk. `fail` fails the fsync publishing an attempt."""
+
+    def __init__(self, directory: Path, windows: bool):
+        self.directory, self.windows, self.names, self.pending = directory, windows, {}, {}
+        self.disk = {p.name: p.read_bytes() for p in directory.iterdir()}
+
+    def patches(self, fail=False):
+        real_open, real_fsync, real_replace = open, os.fsync, os.replace
+
+        def opened(path, *args, **kwargs):
+            f = real_open(path, *args, **kwargs)
+            self.names[f.fileno()] = Path(path).name
+            return f
+
+        def fsync(fd):
+            name = self.names.get(fd)
+            data = (self.directory / name).read_bytes() if name else b""
+            if fail and b'"complete": false' in data:
+                raise OSError("fsync failed")
+            real_fsync(fd)
+            if name:
+                (self.disk if name in self.disk else self.pending)[name] = data
+
+        def replace(source, target):
+            real_replace(source, target)
+            self.pending[Path(target).name] = self.pending.pop(Path(source).name, b"")
+
+        def synced(directory):
+            if not self.windows:
+                self.disk.update(self.pending)
+                self.pending.clear()
+        return [patch("suitekit.manifest.open", opened, create=True), patch("suitekit.manifest.os.fsync", fsync),
+                patch("suitekit.manifest.os.replace", replace), patch("suitekit.manifest.sync_directory", synced)]
+
+    def reopen(self, directory: Path) -> Path:
+        directory.mkdir()
+        for name, data in self.disk.items():
+            (directory / name).write_bytes(data)
+        return directory
+
+
 class Ledger(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -56,6 +102,10 @@ class Ledger(unittest.TestCase):
     def record(self, lines, invocations, verdicts=None):
         (self.run / "results.csv").write_text(HEADER + "".join(lines), encoding="utf-8")
         (self.run / "manifest.json").write_text(json.dumps({"schema": 1, "invocations": invocations}), encoding="utf-8")
+        # Each cell there was attempted first: its record in the attempt journal, in order.
+        (self.run / "attempts.jsonl").write_text("".join(
+            "\n" + json.dumps({"cell": c, "attempt": a["attempt"], "started": a["started"], "complete": False})
+            for i in invocations for c, a in i["cells"].items()), encoding="utf-8")
         if verdicts is not None:
             (self.run / "answers.json").write_text(json.dumps({"verdicts": verdicts}), encoding="utf-8")
         with patch("suitekit.versus.versus", return_value=[]), patch("suitekit.cases.load", return_value=[]):
@@ -92,6 +142,14 @@ class Ledger(unittest.TestCase):
                                                         "complete": False})
         self.assertEqual(pairs["jena"]["receipt"]["attempt"], "b1")
         self.assertTrue(pairs["jena"]["receipt"]["complete"])
+
+    def test_a_torn_attempt_record_never_takes_the_next_one_with_it(self):
+        """Guard (attempt journal): a crash mid-append tears its record, whose work never started;
+        it is skipped, and the next invocation's attempt still stands."""
+        (self.run / "attempts.jsonl").write_text('\n{"cell": "lubm/1/x", "attem', encoding="utf-8")
+        a2 = {"attempt": "a2", "started": "t", "complete": False}
+        manifest.append_attempts(self.run, {"lubm/1/x": a2})
+        self.assertEqual(manifest.read_attempts(self.run), [{"cell": "lubm/1/x", **a2}])
 
     def test_answers_are_the_attempt_s_own_never_the_directory_s(self):
         """R3: I1 measured A with full answers, ok; I2 measured A again with --answers off. The
@@ -144,6 +202,10 @@ class Driver(unittest.TestCase):
     def cells(self, suite):
         return json.loads((suite.results / "manifest.json").read_text(encoding="utf-8"))["invocations"][-1].get("cells", {})
 
+    def journal(self, suite):
+        lines = (suite.results / "attempts.jsonl").read_text(encoding="utf-8").splitlines()
+        return {a["cell"]: a for a in map(json.loads, filter(None, lines))}
+
     def system(self, images=()):
         # definition_paths: what the reviewed head's adapters had (r1), so its red reaches the verdicts.
         return Mock(regimes={"none": ""}, images=Mock(return_value=list(images)), builds=Mock(return_value=[]),
@@ -169,17 +231,18 @@ class Driver(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             self.run_tiers(suite, [Plan("w", "1", inputs=["/data/a.nt"]), Plan("w", "2")], self.system(),
                            stop=lambda plan, run: plan.tier == "2" and run == 2)
-        cells = self.cells(suite)
-        self.assertEqual(sorted(cells), ["w/1/x", "w/2/x"])
-        self.assertFalse(cells["w/2/x"]["complete"])
-        self.assertEqual(sorted(cells["w/2/x"]), ["attempt", "complete", "started"])
+        cells, journal = self.cells(suite), self.journal(suite)
+        self.assertEqual(sorted(journal), ["w/1/x", "w/2/x"])
+        self.assertEqual(sorted(cells), ["w/1/x"])
+        self.assertEqual(sorted(journal["w/2/x"]), ["attempt", "cell", "complete", "started"])
         receipt = cells["w/1/x"]
+        self.assertEqual(receipt["attempt"], journal["w/1/x"]["attempt"])
         self.assertTrue(receipt["complete"])
         self.assertEqual(receipt["outcome"]["outcome"], "ok")
         self.assertEqual(receipt["outcome"]["runs"], 2)
         self.assertEqual(receipt["answers"], "not captured")  # --answers off
         self.assertEqual(receipt["data"], {"/data/a.nt": hashlib.sha256(b"<a> <b> <c> .\n").hexdigest()})
-        self.assertNotEqual(receipt["attempt"], cells["w/2/x"]["attempt"])
+        self.assertNotEqual(receipt["attempt"], journal["w/2/x"]["attempt"])
 
     def test_a_receipt_names_the_image_ids_the_run_pinned(self):
         """R4: the run pinned tag T to A; T was moved to B since. The containers ran A (by its pinned
@@ -206,7 +269,7 @@ class Driver(unittest.TestCase):
         suite.answer_receipts()
         cells = self.cells(suite)
         self.assertEqual(cells["w/1/x"]["answers"], "wrong")
-        self.assertNotIn("answers", cells["w/2/x"])
+        self.assertNotIn("answers", cells.get("w/2/x", {}))
 
     def test_what_a_cell_can_t_evidence_is_unknown_never_empty(self):
         """R6: a driver plan's inputs, images, build and settings are its child's; an input outside
@@ -237,32 +300,44 @@ class Driver(unittest.TestCase):
         self.assertEqual(hashes.call_count, 1)
 
 
-    def test_an_attempt_that_can_t_be_published_durably_starts_no_work(self):
-        """Fix check r2 (review cell-receipts r2, R2): the attempt was written with a replace and no
-        fsync, so after a host crash the older manifest could come back and I1's receipt stand for
-        I2's interrupted attempt. I1 completed A (tier 1) and B (tier 2); I2 attempts A again and
-        publishing its attempt fails at the file's fsync or at the replace: no work of A starts, no
-        row is written, A's evidence stays I1's, B's receipt is kept."""
-        for fault in ("fsync", "replace"):
-            with self.subTest(fault=fault):
+    def test_a_newer_attempt_outlives_a_crash_and_one_not_flushed_starts_no_work(self):
+        """R2 (reviews cell-receipts r2, r3): I1 completed A (tier 1) and B (tier 2), long on disk; I2
+        attempts A again. Its attempt's flush fails: no work of A starts, the rows stay, A is
+        incomplete. Or it is flushed, A's work starts and the host dies: reopened with only what was
+        on disk, A is I2's incomplete attempt, never I1's receipt, and B keeps I1's. Or the attempts'
+        file's name never reached the disk: on Windows (no directory flush: a rename or new name there
+        is lost) then no receipt stands; on POSIX I2's directory sync puts it there, B's with it."""
+        for windows, case in [(w, c) for w in (False, True) for c in ("flush fails", "crash", "journal lost")]:
+            with self.subTest(windows=windows, case=case):
                 self.setUp()
                 # A checkout, as a run's always is (the ledger reads its dirty count).
                 subprocess.run(["git", "init", "-q", str(self.root)], capture_output=True, check=True)
                 first = self.suite(runs=1)
                 self.run_tiers(first, [Plan("w", "1"), Plan("w", "2")], self.system())
                 rows = (first.results / "results.csv").read_text(encoding="utf-8")
-                again, started = self.suite(runs=1), []
-                with patch(f"suitekit.manifest.os.{fault}", side_effect=OSError(f"{fault} failed")), \
-                        self.assertRaises(OSError):
-                    self.run_tiers(again, [Plan("w", "1")], self.system(),
-                                   stop=lambda plan, run: started.append(plan.tier) or False)
-                self.assertEqual(started, [])
+                i1 = json.loads((first.results / "manifest.json").read_text(encoding="utf-8"))["invocations"][0]["cells"]
+                again, started, disk = self.suite(runs=1), [], Crash(first.results, windows)
+                if case == "journal lost":
+                    disk.disk.pop("attempts.jsonl", None)
+
+                def work(plan, run):
+                    started.append(plan.tier)
+                    if case != "flush fails":
+                        raise KeyboardInterrupt  # the host is gone
+                with contextlib.ExitStack() as stack, self.assertRaises((OSError, KeyboardInterrupt)):
+                    for p in disk.patches(fail=case == "flush fails"):
+                        stack.enter_context(p)
+                    self.run_tiers(again, [Plan("w", "1")], self.system(), stop=work)
+                self.assertEqual(started, [] if case == "flush fails" else ["1"])
                 self.assertEqual((first.results / "results.csv").read_text(encoding="utf-8"), rows)
                 with patch("suitekit.versus.versus", return_value=[]), patch("suitekit.cases.load", return_value=[]):
-                    pairs = {p["tier"]: p for p in ledger.from_results(first.results, self.root)["pairs"]}
-                i1 = json.loads((first.results / "manifest.json").read_text(encoding="utf-8"))["invocations"][0]["cells"]
-                self.assertEqual(pairs["1"]["receipt"]["attempt"], i1["w/1/x"]["attempt"])
-                self.assertTrue(pairs["2"]["receipt"]["complete"])
+                    record = ledger.from_results(first.results if case == "flush fails"
+                                                 else disk.reopen(self.root / "reopened"), self.root)
+                pairs = {p["tier"]: p.get("receipt", {}) for p in record["pairs"]}
+                self.assertNotEqual(pairs["1"].get("attempt"), i1["w/1/x"]["attempt"])  # never I1's for I2's
+                self.assertFalse(pairs["1"].get("complete"))
+                self.assertEqual(pairs["2"].get("attempt"),
+                         None if case == "journal lost" and windows else i1["w/2/x"]["attempt"])
 
     def test_a_run_into_a_directory_whose_manifest_can_t_be_read_is_refused_and_leaves_it(self):
         """Review cell-receipts r2 (orchestrator, 8 Nov 05:38): a manifest that couldn't be parsed was
@@ -286,8 +361,9 @@ class Driver(unittest.TestCase):
                 self.assertEqual((results / "manifest.json").read_text(encoding="utf-8"), text)
 
     def test_a_manifest_is_on_disk_before_it_replaces_the_old_one(self):
-        """The file's bytes are flushed (fsync) before the replace, and on POSIX the directory
-        after it, so a rename that survives a crash names a whole file."""
+        """Guard: the file's bytes are flushed (fsync) before the replace, and on POSIX the directory
+        after it, so a rename that survives a crash names a whole file (receipts; attempts don't
+        rest on it)."""
         suite, calls = self.suite(runs=1), []
         real_fsync, real_replace = driver.os.fsync, driver.os.replace
         with patch("suitekit.manifest.os.fsync", side_effect=lambda fd: (calls.append("fsync"), real_fsync(fd))[1]), \
