@@ -456,11 +456,14 @@ impl SupportSets {
         axioms.extend_from_slice(program.axioms())?;
         axioms.sort_unstable();
         let closure = Closure::of(snapshot, &graphs, &axioms, working)?;
-        // A lookup in the closure's list, then each graph entry it reads: counted on the
-        // reading task's poller (sol-loop r1 S4).
+        // A lookup in the closure's list, counted before it is made, then each graph entry
+        // it reads: on the reading task's poller (sol-loop r1 S4, r2 S5).
         let graphs_of = |fact: Triple, poll: &Poller<'_>| -> Vec<u32> {
+            if poll.tick() {
+                return Vec::new();
+            }
             let entries = closure.graphs_of(fact);
-            if poll.attempt(1 + entries.len()) {
+            if poll.attempt(entries.len()) {
                 return Vec::new();
             }
             entries.iter().map(|&(_, g)| g).collect()
@@ -623,9 +626,12 @@ impl SupportSets {
         }
         let graphs = graphs_in_order(snapshot, &self.graphs, kept, working)?;
         let index = index_of(&graphs, working)?;
-        // Store reads the update calls back, each quad read on the reading task's poller
-        // (REAS-2, sweep M14).
+        // Store reads the update calls back, the call and each quad read on the reading
+        // task's poller, the call before its lookup (REAS-2, sweep M14; sol-loop r2 S5).
         let graphs_of = |fact: Triple, poll: &Poller<'_>| -> Vec<u32> {
+            if poll.tick() {
+                return Vec::new();
+            }
             let mut found: Vec<u32> = Vec::new();
             for quad in snapshot
                 .quads_for_pattern_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any))
@@ -2567,11 +2573,14 @@ impl Supports {
         for &graph in graphs.iter() {
             readable.push(access.allows_id(snapshot, graph))?;
         }
-        // A lookup in the closure's list, then each graph entry it reads: counted on the
-        // reading task's poller (sol-loop r1 S4).
+        // A lookup in the closure's list, counted before it is made, then each graph entry
+        // it reads: on the reading task's poller (sol-loop r1 S4, r2 S5).
         let reads = |fact: Triple, poll: &Poller<'_>| {
+            if poll.tick() {
+                return false;
+            }
             let entries = closure.graphs_of(fact);
-            !poll.attempt(1 + entries.len()) && entries.iter().any(|&(_, g)| readable[g as usize])
+            !poll.attempt(entries.len()) && entries.iter().any(|&(_, g)| readable[g as usize])
         };
         let ground = program.ground_program(snapshot);
         let following = Following::new(working);
