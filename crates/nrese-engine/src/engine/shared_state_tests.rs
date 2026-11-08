@@ -132,7 +132,9 @@ fn pending_states_of_both_kinds_grant_no_token() {
     );
 }
 
-/// `source` with `added` as statements its DL bounds derived (3.0b).
+/// `source` with `added` as statements its DL bounds derived (3.0b): the constructor's own
+/// test, beside its one caller.
+#[allow(clippy::disallowed_methods)]
 fn derived(source: &Snapshot, added: EncodedQuad) -> Snapshot {
     let triple = EncodedTriple::new(added.subject, added.predicate, added.object);
     source
