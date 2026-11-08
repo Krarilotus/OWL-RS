@@ -268,52 +268,90 @@ fn a_suffix_and_its_views_hold_only_what_they_charged() {
     );
 }
 
-/// T12. Readers during an install and its seal see the old length or the new, never an entry
-/// below the length they read that they can't find.
+/// T12. A reader running across an install and its seal reads only the old length or the new
+/// one (the install is one step under the write guard), and once it reads the new one finds
+/// every installed entry at its id.
 #[test]
 fn readers_during_an_install_and_its_seal_see_whole_entries() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     let budget = Arc::new(Budget::unlimited());
     let new = texts("new", BLOCK + 100);
+    let old = (BLOCK - 10) as u64;
     let (dictionary, suffix) = dictionary_and_suffix(BLOCK - 10, &new, &budget);
-    let dictionary = Arc::new(dictionary);
-    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (dictionary, done, reads) = (
+        Arc::new(dictionary),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU64::new(0)),
+    );
     let reader = {
-        let (dictionary, done, new) = (Arc::clone(&dictionary), Arc::clone(&done), new.clone());
+        let (dictionary, done, reads) = (
+            Arc::clone(&dictionary),
+            Arc::clone(&done),
+            Arc::clone(&reads),
+        );
+        let new = new.clone();
         std::thread::spawn(move || {
-            let mut reads = 0u64;
-            while !done.load(std::sync::atomic::Ordering::Acquire) || reads == 0 {
+            let (mut saw_old, mut saw_new) = (false, false);
+            loop {
+                // Read the flag first: a read after it saw the install's end.
+                let last = done.load(Ordering::Acquire);
                 let len = dictionary.len();
-                for text in [&new[0], &new[new.len() - 1]] {
-                    if let Some(id) = dictionary.lookup(literal(text)) {
-                        assert!(
-                            id.payload() < len.max(dictionary.len()),
-                            "{text} below a length read"
-                        );
-                        assert!(dictionary.decode(id).is_some(), "{text} decodes");
+                assert!(len == old || len == old + new.len() as u64, "length {len}");
+                if len == old {
+                    saw_old = true;
+                } else {
+                    saw_new = true;
+                    for (i, text) in new.iter().enumerate() {
+                        let id = dictionary.lookup(literal(text));
+                        assert_eq!(id.map(|id| id.payload()), Some(old + i as u64), "{text}");
                     }
                 }
-                reads += 1;
+                reads.fetch_add(1, Ordering::Release);
+                if last {
+                    return (saw_old, saw_new);
+                }
             }
-            reads
         })
     };
+    // The reader reads the old length before the install starts.
+    while reads.load(Ordering::Acquire) == 0 {
+        std::thread::yield_now();
+    }
     let slot = slot();
     let guard = WriterGuard::hold(slot.lock());
     dictionary.prepare(&guard, &suffix).unwrap().install();
     dictionary.seal(&guard);
-    done.store(true, std::sync::atomic::Ordering::Release);
-    assert!(reader.join().unwrap() > 0);
-    assert_installed(&dictionary, (BLOCK - 10) as u64, &new, "after");
+    done.store(true, Ordering::Release);
+    assert_eq!(
+        reader.join().unwrap(),
+        (true, true),
+        "read before and after"
+    );
+    assert_installed(&dictionary, old, &new, "after");
 }
 
-/// T15 (the seal condition). Interning one key at a time past several blocks, as every path but
-/// an install does, seals at each block as before: the tail never holds a block's worth.
+/// T15 (the seal condition, `>= BLOCK`). An ordinary push onto the tail an install left unsealed,
+/// longer than a block, seals every full block at once and leaves fewer than a block; every
+/// entry, installed and pushed, stays at its id.
 #[test]
-fn interning_one_by_one_seals_at_every_block() {
-    let dictionary = Dictionary::default();
-    for (i, text) in texts("one", 3 * BLOCK + 1).iter().enumerate() {
-        dictionary.intern(literal(text));
-        assert!(dictionary.tail_len() < BLOCK, "after entry {i}");
-    }
-    assert_eq!(dictionary.tail_len(), 1);
+fn a_push_onto_an_unsealed_tail_seals_every_full_block() {
+    let budget = Arc::new(Budget::unlimited());
+    let new = texts("new", 2 * BLOCK + 7);
+    let (dictionary, suffix) = dictionary_and_suffix(5, &new, &budget);
+    let slot = slot();
+    let guard = WriterGuard::hold(slot.lock());
+    dictionary.prepare(&guard, &suffix).unwrap().install();
+    assert_eq!(dictionary.tail_len(), 2 * BLOCK + 12, "unsealed");
+    let pushed = dictionary.intern(literal("pushed after the install"));
+    assert_eq!(pushed.payload(), (2 * BLOCK + 12) as u64);
+    assert_eq!(dictionary.tail_len(), 13, "two blocks sealed, 13 keys left");
+    assert_installed(&dictionary, 5, &new, "after the push sealed");
+    assert_eq!(
+        dictionary.lookup(literal("pushed after the install")),
+        Some(pushed)
+    );
+    assert_eq!(
+        dictionary.lookup(literal("old 4")).map(|id| id.payload()),
+        Some(4)
+    );
 }
