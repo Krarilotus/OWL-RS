@@ -54,7 +54,11 @@ pub(crate) enum Path {
     Reverse(Box<Path>),
     /// The steps in order (ADR-0012: a list, walked in a loop however long).
     Sequence(Vec<Path>),
-    Alternative(Vec<Path>),
+    /// The arms, each once with how often the text names it: an arm named again is the same
+    /// bag again, found once here rather than at every node a traversal reaches (the
+    /// executor memory stack's path counts, EMS-15: per-node arm matching cost the closure
+    /// over an alternative +6 % instructions against engine-v2).
+    Alternative(Vec<(Path, usize)>),
     ZeroOrMore(Box<Path>),
     OneOrMore(Box<Path>),
     ZeroOrOne(Box<Path>),
@@ -78,7 +82,15 @@ impl Path {
                 Self::Sequence(steps.iter().map(|p| Self::resolve(p, snapshot)).collect())
             }
             PropertyPathExpression::Alternative(paths) => {
-                Self::Alternative(paths.iter().map(|p| Self::resolve(p, snapshot)).collect())
+                let mut arms: Vec<(Self, usize)> = Vec::with_capacity(paths.len());
+                for path in paths {
+                    let path = Self::resolve(path, snapshot);
+                    match arms.iter_mut().find(|(arm, _)| *arm == path) {
+                        Some((_, times)) => *times += 1,
+                        None => arms.push((path, 1)),
+                    }
+                }
+                Self::Alternative(arms)
             }
             PropertyPathExpression::ZeroOrMore(p) => Self::ZeroOrMore(boxed(p)),
             PropertyPathExpression::OneOrMore(p) => Self::OneOrMore(boxed(p)),
@@ -279,13 +291,14 @@ impl<T: Copy + Eq + std::hash::Hash + Ord> Union<T> {
         }
     }
 
-    /// The most it holds while [`Self::add`] makes room for `arm`, named `times`: a vector
-    /// that grows moves, its old room beside the new until the move ends, as the budget
-    /// owner's `ChargedVec` charges it (sol-loop r1 S3 of EMS-R1).
+    /// The most it holds, beside `arm`, while [`Self::add`] makes room for `arm`, named
+    /// `times`: a vector that grows moves, its old room beside the new until the move ends,
+    /// as the budget owner's `ChargedVec` charges it (sol-loop r1 S3 of EMS-R1); a first arm
+    /// of copies becomes the union, nothing beside it.
     fn peak_with(&self, arm: &Bag<T>, times: usize) -> usize {
-        let room = |values: &Vec<T>| {
-            let wanted = values.len().saturating_add(arm.entries());
-            moved::<T>(values.capacity(), wanted)
+        let room = |values: &Vec<T>| match (values.capacity(), arm) {
+            (0, Bag::Copies(_)) => 0,
+            (capacity, _) => moved::<T>(capacity, values.len().saturating_add(arm.entries())),
         };
         match self {
             Self::Copies(values) if times == 1 && matches!(arm, Bag::Copies(_)) => room(values),
@@ -316,6 +329,8 @@ impl<T: Copy + Eq + std::hash::Hash + Ord> Union<T> {
             *self = Self::Counted(tally);
         }
         match self {
+            // The first arm's vector becomes the union, not a copy of it.
+            Self::Copies(values) if values.capacity() == 0 => *values = arm.values(),
             Self::Copies(values) => {
                 values.reserve_exact(arm.entries());
                 values.extend(arm.values());
@@ -327,8 +342,12 @@ impl<T: Copy + Eq + std::hash::Hash + Ord> Union<T> {
                 }
             }
             Self::Support { values, distinct } => {
-                values.reserve_exact(arm.entries());
-                values.extend(arm.values());
+                if values.capacity() == 0 {
+                    *values = arm.values();
+                } else {
+                    values.reserve_exact(arm.entries());
+                    values.extend(arm.values());
+                }
                 if *distinct == 0 {
                     *distinct = values.len();
                 } else if !last && values.len() > distinct.saturating_mul(2) {
@@ -863,11 +882,13 @@ impl PathEvaluator<'_> {
     /// The bags of `paths` together (a UNION): copies stay copies, and counted ones are
     /// added up with them; for a set-valued path (`support`), the arms' values, each at
     /// least once.
-    /// An arm the alternative names again is the same bag again: it is followed once and
-    /// its values counted as often, never copied, so `p|p|…` costs and holds what `p` does
-    /// however often the path's text repeats it.
-    /// The arms come one at a time ([`Union`]): each charged as it arrives, then the room
-    /// the union makes for it before the union grows, then the arm given back once merged.
+    /// An arm the alternative names again is the same bag again ([`Path::Alternative`]:
+    /// matched when the path is resolved): it is followed once and its values counted as
+    /// often, never copied, so `p|p|…` costs and holds what `p` does however often the
+    /// path's text repeats it.
+    /// The arms come one at a time ([`Union`]): each charged as it arrives together with the
+    /// room the union makes for it, before the union grows, in one charge; once merged, the
+    /// union's own bytes are held (the first arm of copies becomes the union, not a copy).
     /// Distinct arms with overlapping bags (`!(q)|!(q|q)|…`) so hold the union and one arm,
     /// and under a set-valued path the union at most twice their support (the package
     /// review r1 of the executor memory stack, EMS-R1). A refused charge stops here with
@@ -876,31 +897,24 @@ impl PathEvaluator<'_> {
     /// alternative as it arrives, the path's table before it is made).
     fn either<T: Copy + Eq + std::hash::Hash + Ord>(
         &self,
-        paths: &[Path],
+        arms: &[(Path, usize)],
         support: bool,
         bag: impl Fn(&Path) -> Bag<T>,
     ) -> Bag<T> {
-        let mut arms: Vec<(&Path, usize)> = Vec::with_capacity(paths.len());
-        for path in paths {
-            match arms.iter_mut().find(|(arm, _)| *arm == path) {
-                Some((_, times)) => *times += 1,
-                None => arms.push((path, 1)),
-            }
-        }
         let mut union = Union::new(support);
         let mut held = 0;
-        for (i, &(arm, times)) in arms.iter().enumerate() {
+        for (i, (arm, times)) in arms.iter().enumerate() {
+            let times = *times;
             if self.stopped() {
                 break;
             }
             let arm = bag(arm);
-            let mut arrived = 0;
-            let fits = self.hold(&mut arrived, arm.bytes())
-                && self.hold(&mut held, union.peak_with(&arm, times));
+            // The arm as it arrives and the union's room for it, held in one charge.
+            let peak = union.peak_with(&arm, times).saturating_add(arm.bytes());
+            let fits = self.hold(&mut held, peak);
             if fits {
                 union.add(arm, times, i + 1 == arms.len());
             }
-            self.hold(&mut arrived, 0);
             if !fits || !self.hold(&mut held, union.bytes()) {
                 break;
             }
@@ -961,9 +975,9 @@ impl PathEvaluator<'_> {
                     .map(|(m, ways)| ways.saturating_mul(self.multiplicity(last, m, end)))
                     .fold(0, usize::saturating_add),
             },
-            Path::Alternative(paths) => paths
+            Path::Alternative(arms) => arms
                 .iter()
-                .map(|p| self.multiplicity(p, start, end))
+                .map(|(p, times)| self.multiplicity(p, start, end).saturating_mul(*times))
                 .fold(0, usize::saturating_add),
             Path::ZeroOrMore(_) | Path::OneOrMore(_) | Path::ZeroOrOne(_) => {
                 usize::from(self.connects(path, start, end))
@@ -993,7 +1007,7 @@ impl PathEvaluator<'_> {
                     middle.into_iter().any(|m| self.connects(last, m, end))
                 }
             },
-            Path::Alternative(paths) => paths.iter().any(|p| self.connects(p, start, end)),
+            Path::Alternative(arms) => arms.iter().any(|(p, _)| self.connects(p, start, end)),
             Path::ZeroOrMore(p) => {
                 if start == end {
                     self.is_node(start)
