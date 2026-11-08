@@ -1373,6 +1373,34 @@ impl Dispatch {
         }
     }
 
+    /// The rule of each (rule, atom) reference whose atom can match `fact`, read lazily in
+    /// ascending rule order, a rule once per reference (so repeated when several of its atoms
+    /// match). Each of the three lists is in ascending rule order, as rules and their
+    /// references are only appended ([`GroundProgram::add`]); this merges them as they are
+    /// read, with no copy and no sort. The one enumeration of a fact's producers
+    /// ([`GroundProgram::for_each_producer`] counts each reference it reads).
+    fn rules_matching(&self, [_, p, o]: Triple) -> impl Iterator<Item = usize> + '_ {
+        let by_object = self
+            .by_object
+            .get(&p)
+            .and_then(|objects| objects.get(&o))
+            .map_or(&[][..], Vec::as_slice);
+        let by_predicate = self.by_predicate.get(&p).map_or(&[][..], Vec::as_slice);
+        let mut lists = [by_object, by_predicate, self.any.as_slice()];
+        std::iter::from_fn(move || {
+            let (k, _) = lists
+                .iter()
+                .enumerate()
+                .filter_map(|(k, list)| list.first().map(|&(r, _)| (k, r)))
+                .min_by_key(|&(_, r)| r)?;
+            let (&(r, _), rest) = lists[k].split_first()?;
+            lists[k] = rest;
+            #[cfg(test)]
+            references_read::add(1);
+            Some(r as usize)
+        })
+    }
+
     /// The (rule, atom) pairs whose atom can match `fact`.
     fn matching_fact(&self, [_, p, o]: Triple, out: &mut Vec<(usize, usize)>) {
         let entries = self
@@ -1671,22 +1699,29 @@ impl GroundProgram {
         None
     }
 
-    /// Visits each rule (by index) whose head can give `fact`, once each, as
-    /// [`Self::for_each_alternative`] visits alternatives: the enumeration itself is a unit,
-    /// so a stopped poller lists none, and so is each producer.
+    /// Visits each rule (by index, ascending) whose head can give `fact`, once each, as
+    /// [`Self::for_each_alternative`] visits alternatives. Discovery is attempted work as it
+    /// is read: each head reference, a duplicate of the previous rule's included, is a unit
+    /// counted before it is used, and a `Break` leaves the rest unread (fix check r2, R8-1).
     pub fn for_each_producer<'p, B>(
         &self,
         fact: Triple,
         poll: &mut Poller<'p>,
         mut body: impl FnMut(usize, &mut Poller<'p>) -> ControlFlow<B>,
     ) -> Option<B> {
-        if poll.attempt(1) {
-            return None;
-        }
-        for r in self.producer_list(fact) {
+        let mut last = None;
+        for r in self.heads.rules_matching(fact) {
             if poll.attempt(1) {
                 return None;
             }
+            if last == Some(r) {
+                continue;
+            }
+            debug_assert!(
+                last.is_none_or(|l| l < r),
+                "producers in ascending rule order"
+            );
+            last = Some(r);
             if let ControlFlow::Break(out) = body(r, poll) {
                 return Some(out);
             }
@@ -2048,12 +2083,9 @@ impl GroundProgram {
             .filter(|link| self.transitive.contains(link))
     }
 
-    /// The rules (indexes into `rules`) whose head can give `fact`, each once.
+    /// The rules (indexes into `rules`) whose head can give `fact`, each once, ascending.
     fn producer_list(&self, fact: Triple) -> Vec<usize> {
-        let mut found = Vec::new();
-        self.heads.matching_fact(fact, &mut found);
-        let mut rules: Vec<usize> = found.into_iter().map(|(r, _)| r).collect();
-        rules.sort_unstable();
+        let mut rules: Vec<usize> = self.heads.rules_matching(fact).collect();
         rules.dedup();
         rules
     }
