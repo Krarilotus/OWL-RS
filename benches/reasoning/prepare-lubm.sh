@@ -19,7 +19,9 @@ set -euo pipefail
 # This job's names (scripts/lib/ns.sh): its containers and volumes; the shared datasets' volume.
 NS_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 . "$NS_ROOT/scripts/lib/ns.sh"
-DATA_VOLUME=$(ns_shared data)
+# NRESE_DATASET_DIR: an absolute directory instead, bind-mounted as /data: where a timing job makes
+# what its host lacks, aside, checked before it is kept (release_gate.py make_dataset(), 7 Nov 2026).
+DATA_VOLUME=${NRESE_DATASET_DIR:-$(ns_shared data)}
 # Shared datasets are prepared one at a time per host (their staging, the .part and .parts
 # files, and their publication): this script runs again under the host's datasets lock.
 ns_serialize datasets "$0" "$@"
@@ -58,7 +60,15 @@ for n in ${*:-1 10 100}; do
   fi
   docker run --rm -v "$DATA_VOLUME":/data nrese-bench/lubm-uba \
     -u "$n" -f NTRIPLES --consolidate Maximal -t 8 -q -o "/data/lubm-gen-$n" >/dev/null
+  # More than one university: UBA's threads interleave them in another order on every run, so the
+  # file is its distinct lines in byte order (GNU sort, C locale): the same bytes on every host, the
+  # same triples as any make (7 Nov 2026: stage-data-lubm-verified-1 and -made-1, sorted distinct
+  # lines equal; the bytes of three makes all different). One university comes out the same as it is.
+  order="cat"
+  [ "$n" -gt 1 ] && order="LC_ALL=C sort -u -S 1G -T /data"
   docker run --rm -v "$DATA_VOLUME":/data alpine sh -c "
-    cat /data/lubm-gen-$n/* | grep -v '^<> ' > /data/lubm-$n.nt && rm -rf /data/lubm-gen-$n &&
+    apk add -q coreutils >/dev/null &&
+    cat /data/lubm-gen-$n/* | grep -v '^<> ' | $order > /data/lubm-$n.nt.part &&
+    mv /data/lubm-$n.nt.part /data/lubm-$n.nt && rm -rf /data/lubm-gen-$n &&
     echo lubm-$n: \$(wc -l < /data/lubm-$n.nt) triples"
 done

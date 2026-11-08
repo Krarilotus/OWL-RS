@@ -33,8 +33,9 @@ def old_record(container, peak, phases, rep=1):
 
 
 def report(peaks):
+    # `inputs`: the frozen files it loaded, as every record says since 7 Nov 2026 (none here).
     records = [{"case": "c", "rep": rep, "status": "ok", "metric": 1.0, "samples": {"q": [1.0] * 4},
-                "checks": [], "routes": [], "peak_mib": peak, "memory_kind": "lifetime"}
+                "checks": [], "routes": [], "peak_mib": peak, "memory_kind": "lifetime", "inputs": {}}
                for rep, peak in enumerate(peaks, 1)]
     return {"reps": len(peaks), "records": records}
 
