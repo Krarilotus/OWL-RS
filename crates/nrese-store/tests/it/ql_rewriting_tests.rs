@@ -1491,6 +1491,9 @@ fn existentials_bounded_restrictions_force_are_answered_or_reported() {
 /// - F2: `C ⊑ ¬¬D` with `c : C`: `c : D`. Neither the TBox nor the closure removes the
 ///   double complement.
 /// - F2: `C ⊑ ¬(≥ 2 R)` with `c : C`, `R(c, x)`, `R(c, y)`, `x : D`: `x = y`, so `y : D`.
+/// - Sol r1 S1: `C ⊑ ≤ 0 R.¬D` with `R(c, x)`: `x : D`. With `≤ 0 R.¬{a}` and `a : D`:
+///   `x = a`, so `x : D`.
+/// - Sol r1 S2 (guard below): `C ⊑ = 0 R.{a}` equates nobody, so `Z` stays complete.
 ///
 /// Precision guards, each a query whose answers are complete under its regime:
 /// - `x : Person` and `x : Employed` of the third case, terms of the same axiom that no
@@ -1560,6 +1563,25 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
             ),
             format!("ASK {{ <{E}y> a <{E}D> }}"),
         ),
+        // Sol r1 S1: `≤ 0 R.F` puts every successor outside `F`.
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                     owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                     owl:onClass [ owl:complementOf :D ] ] .
+                 :c a :C ; :R :x ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}D> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                     owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                     owl:onClass [ owl:complementOf [ a owl:Class ; owl:oneOf ( :a ) ] ] ] .
+                 :c a :C ; :R :x . :a a :D ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}D> }}"),
+        ),
     ];
     let mut wrong = Vec::new();
     for (n, (turtle, query)) in cases.iter().enumerate() {
@@ -1589,6 +1611,13 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
              owl:allValuesFrom [ owl:complementOf [ a owl:Class ; owl:oneOf ( :a ) ] ] ] .
          :c a :C ; :R :b . :z a :Z ."
     );
+    // Sol r1 S2: `= 0 R.{a}` keeps successors away from `a`, equating nobody.
+    let zero_a = format!(
+        "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+             owl:qualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+             owl:onClass [ a owl:Class ; owl:oneOf ( :a ) ] ] .
+         :c a :C . :z a :Z ."
+    );
     let guards = [
         (
             &cases[2].0,
@@ -1607,6 +1636,11 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
         ),
         (
             &not_a,
+            vec![Ruleset::Owl2Ql, Ruleset::Owl2Rl],
+            format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}"),
+        ),
+        (
+            &zero_a,
             vec![Ruleset::Owl2Ql, Ruleset::Owl2Rl],
             format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}"),
         ),
