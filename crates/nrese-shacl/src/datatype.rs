@@ -1,8 +1,9 @@
 //! Whether a lexical form is in a datatype's lexical space (`sh:datatype` rejects
-//! ill-formed literals of the datatypes SPARQL supports).
+//! ill-typed literals of the datatypes the engine's datatype map knows).
 
 use std::str::FromStr;
 
+use nrese_xsd::owl::{Datatype as OwlDatatype, LiteralError, Value};
 use nrese_xsd::{
     Boolean, Date, DateTime, DayTimeDuration, Double, Duration, Float, GDay, GMonth, GMonthDay,
     GYear, GYearMonth, Time, YearMonthDuration,
@@ -42,13 +43,33 @@ fn integer_within(lexical: &str, min: Option<i128>, max: Option<i128>) -> bool {
     }
 }
 
-/// Whether `lexical` is a lexical form of `datatype`. Datatypes this function doesn't know
-/// accept everything.
-pub(crate) fn well_formed(datatype: &str, lexical: &str) -> bool {
-    let Some(local) = datatype.strip_prefix(XSD) else {
-        return true;
-    };
-    match local {
+/// Whether the literal with `lexical` (and `language`, a language-tagged one's tag) is a
+/// literal of `datatype`, not ill-typed. The XSD types SPARQL compares are checked here; every
+/// other datatype of the engine's datatype map (nrese-xsd's, which OWL reads too: binaries,
+/// `dateTimeStamp`, `anyURI`, the string types, `rdf:XMLLiteral`, …) by that map's lexical
+/// facts: what it calls ill-typed is ill-typed here. A form the map can't represent but
+/// doesn't reject (a number past 128 bits, more digits of a second than it keeps) is
+/// well-typed. Datatypes outside the map accept everything.
+pub(crate) fn well_formed(datatype: &str, lexical: &str, language: Option<&str>) -> bool {
+    if language.is_none()
+        && let Some(local) = datatype.strip_prefix(XSD)
+        && let Some(checked) = xsd_lexical(local, lexical)
+    {
+        return checked;
+    }
+    match OwlDatatype::from_iri(datatype) {
+        Some(datatype) => !matches!(
+            Value::parse(lexical, datatype, language),
+            Err(LiteralError::IllTyped(_))
+        ),
+        None => true,
+    }
+}
+
+/// Whether `lexical` is a lexical form of the XSD type `local`, for the types checked here;
+/// `None` for the others.
+fn xsd_lexical(local: &str, lexical: &str) -> Option<bool> {
+    Some(match local {
         "boolean" => Boolean::from_str(lexical).is_ok(),
         "integer" => is_integer(lexical),
         "decimal" => is_decimal(lexical),
@@ -77,8 +98,8 @@ pub(crate) fn well_formed(datatype: &str, lexical: &str) -> bool {
         "duration" => Duration::from_str(lexical).is_ok(),
         "dayTimeDuration" => DayTimeDuration::from_str(lexical).is_ok(),
         "yearMonthDuration" => YearMonthDuration::from_str(lexical).is_ok(),
-        _ => true,
-    }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -128,11 +149,11 @@ mod tests {
             ("string", "anything", true),
         ] {
             assert_eq!(
-                well_formed(&xsd(datatype), lexical),
+                well_formed(&xsd(datatype), lexical, None),
                 expected,
                 "{datatype} {lexical:?}"
             );
         }
-        assert!(well_formed("http://example.com/custom", "whatever"));
+        assert!(well_formed("http://example.com/custom", "whatever", None));
     }
 }
