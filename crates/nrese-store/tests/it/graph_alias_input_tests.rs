@@ -149,3 +149,96 @@ fn another_store_s_default_graph_name_is_stored_as_the_default_graph() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// What `op` leaves of a store holding `<t> <p> "t"` in the default graph and in `<g>`: its
+/// statements as exported, or how many a read matched, or `refused`.
+fn with_context(op: &str, writes: &str) -> String {
+    use nrese_rdf::{GraphName, NamedNode};
+    use nrese_store::{ReadContext, StatementPattern, WriteScope};
+    let service = StoreService::new(StoreConfig::in_memory()).unwrap();
+    service
+        .execute_update_str(
+            "INSERT DATA { <http://example.com/t> <http://example.com/p> \"t\" .
+             GRAPH <http://example.com/g> { <http://example.com/t> <http://example.com/p> \"t\" } }",
+        )
+        .unwrap();
+    let alias = || {
+        vec![GraphName::NamedNode(NamedNode::new_unchecked(
+            "urn:x-arq:DefaultGraph",
+        ))]
+    };
+    let triple = |s: &str| RdfPayload {
+        payload: format!("<http://example.com/{s}> <http://example.com/p> \"{s}\" .").into_bytes(),
+        format: GraphResultFormat::NTriples,
+        base_iri: None,
+    };
+    let t = || nrese_rdf::Term::from(NamedNode::new_unchecked(format!("{EX}t")));
+    let pattern = || StatementPattern {
+        subject: Some(t()),
+        predicate: None,
+        object: None,
+        contexts: alias(),
+    };
+    let writable = |graphs: Vec<String>, default_graph| {
+        WriteScope::of(Some(std::sync::Arc::new(nrese_sparql::GraphAccess {
+            graphs,
+            default_graph,
+            ..nrese_sparql::GraphAccess::default()
+        })))
+    };
+    let requester = match writes {
+        "all" => Requester::all(),
+        "default" => Requester::new(ReadScope::All, writable(Vec::new(), true)),
+        "alias-iri" => Requester::new(
+            ReadScope::All,
+            writable(vec!["urn:x-arq:DefaultGraph".to_owned()], false),
+        ),
+        _ => unreachable!("{writes}"),
+    };
+    let op = match op {
+        "add" => StatementOp::Add {
+            data: triple("n"),
+            contexts: alias(),
+        },
+        "remove-data" => StatementOp::RemoveData {
+            data: triple("t"),
+            contexts: alias(),
+        },
+        "remove-matching" => StatementOp::RemoveMatching(pattern()),
+        "read" => {
+            let read = service.statements(&ReadContext::all(), &pattern()).unwrap();
+            return format!("read {}", read.len());
+        }
+        _ => unreachable!("{op}"),
+    };
+    let command = MutationCommand::Statements(StatementsRequest::new(vec![op]));
+    match service.apply(&command, &requester) {
+        Ok(_) => exported(&service),
+        Err(_) => "refused".to_owned(),
+    }
+}
+
+/// Review r1, S3-F2 (rows failed on slice 3's 119f32bc): an explicit context naming another
+/// store's default graph (RDF4J `context=`, a quarantine replay's target) is the default graph,
+/// for writes, removals and reads, and so are its write rights.
+#[test]
+fn an_explicit_context_naming_the_default_graph_is_the_default_graph() {
+    let rows = [
+        ("add", "all", "DEFAULT:n DEFAULT:t g:t"),
+        ("remove-data", "all", "g:t"),
+        ("remove-matching", "all", "g:t"),
+        ("read", "all", "read 1"),
+        ("add", "default", "DEFAULT:n DEFAULT:t g:t"),
+        ("add", "alias-iri", "refused"),
+    ];
+    let mut failures = Vec::new();
+    for (op, writes, expected) in rows {
+        let got = with_context(op, writes);
+        let ok = got == expected;
+        println!("{} {op} {writes}: {got}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            failures.push(format!("{op} {writes}: expected {expected}, got {got}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
