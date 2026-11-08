@@ -1542,7 +1542,7 @@ fn grounding_sets<'a, L: Lookup + ?Sized>(
     if let Some(exceeded) = refused {
         return Err(exceeded);
     }
-    let mut held = choose(all, held_words, cap, run)?;
+    let mut held = choose(held_words, all, cap, run)?;
     // A derivation's sets: whatever they lack is beyond the head's own graphs.
     held.annotation.truncated |= truncated;
     held.annotation.beyond_own |= truncated;
@@ -1553,9 +1553,12 @@ fn grounding_sets<'a, L: Lookup + ?Sized>(
 /// charge of what its output holds: its output's slots charged before it is made; after it,
 /// the input's slots released (`minimal` freed them), the dropped sets' words released, and
 /// the kept sets' words carried over, not charged again (sol-loop r6 S3).
+///
+/// `words_held` comes first: parameters drop in reverse order, so on a refusal the sets
+/// are freed before their words' charge is released (sol-loop r7 S4).
 fn choose<'a>(
-    all: ChargedVec<GraphSet, &'a Budget>,
     mut words_held: Reservation<&'a Budget>,
+    all: ChargedVec<GraphSet, &'a Budget>,
     cap: usize,
     run: &Run<'a>,
 ) -> Result<Held<'a>, BudgetExceeded> {
@@ -1720,7 +1723,7 @@ mod tests {
         let mut all: ChargedVec<GraphSet, &Budget> = ChargedVec::new(b);
         all.extend_from_slice(&sets).unwrap();
         let run = Run::new(Limits::unlimited(&budget));
-        let held = choose(all, words_held, 8, &run).expect("nothing asked twice");
+        let held = choose(words_held, all, 8, &run).expect("nothing asked twice");
         assert_eq!(held.sets.len(), 6, "the two covering sets dropped");
         assert_eq!(
             budget.used(),
@@ -1728,6 +1731,41 @@ mod tests {
             "only what the output holds stays charged"
         );
         drop(held);
+        assert_eq!(budget.used(), 0);
+    }
+
+    /// Sol-loop r7 S4, by the allocator: a choice refused (no room for `minimal`'s output)
+    /// frees its sets before it releases their words' charge: nothing held beyond the
+    /// charge, and nothing charged after.
+    #[test]
+    fn a_refused_choice_frees_its_sets_before_their_charge() {
+        use super::{Budget, ChargedVec, GraphSet, Limits, Reservation, Run, choose, words};
+        use nrese_exec::measure;
+        use std::sync::Arc;
+        if !measure::alone() {
+            return;
+        }
+        // Eight singleton sets past 128 graphs: words on the heap, all kept.
+        let sets: Vec<GraphSet> = (0..8).map(|g| GraphSet::of(200 + g)).collect();
+        let gathered = {
+            let probe = Arc::new(Budget::unlimited());
+            let mut all: ChargedVec<GraphSet, &Budget> = ChargedVec::new(&probe);
+            all.extend_from_slice(&sets).unwrap();
+            all.charged() + words(&sets)
+        };
+        // Room for the gathered sets alone: the output's slots are refused.
+        let budget = Arc::new(Budget::new(gathered));
+        let (refused, excess) = measure::measure_within(&budget, || {
+            let b: &Budget = &budget;
+            let mut words_held = Reservation::new(b);
+            words_held.charge(words(&sets)).unwrap();
+            let mut all: ChargedVec<GraphSet, &Budget> = ChargedVec::new(b);
+            all.extend_from_slice(&sets).unwrap();
+            let run = Run::new(Limits::unlimited(&budget));
+            choose(words_held, all, 8, &run).is_err()
+        });
+        assert!(refused, "no room for the output");
+        assert_eq!(excess, 0, "{excess} bytes held beyond the charge");
         assert_eq!(budget.used(), 0);
     }
 
