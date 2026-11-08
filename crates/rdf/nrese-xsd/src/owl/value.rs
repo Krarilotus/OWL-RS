@@ -360,4 +360,93 @@ mod tests {
         .collect();
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
+
+    /// Each datatype's lexical space is checked whole before a value is decided or found
+    /// beyond what is represented (XSDVAL review r1): a form outside it is ill-typed, never
+    /// unsupported, and a std parser's wider grammar decides nothing. Sources: XML Schema 1.1
+    /// Part 2 §3.4.28.1 (dateTimeStamp needs a timezone), §3.3.15.2 (hexBinary: hex digit
+    /// pairs), §3.4.13 ff. (an integer type's bounds), OWL 2 Structural Specification §4.1
+    /// (owl:rational: a nonzero denominator), RDF 1.1 Concepts (rdf:XMLLiteral:
+    /// well-balanced, self-contained XML content). Every row is checked.
+    #[test]
+    fn the_lexical_space_is_checked_before_what_is_represented() {
+        #[derive(Debug, PartialEq)]
+        enum Is {
+            Ill,
+            Unsupported,
+            Valid,
+        }
+        let big = "9".repeat(50);
+        let long_fraction = "2000-01-01T00:00:00.1234567890123456789";
+        let rows: Vec<(String, Datatype, Is)> = vec![
+            // An early representation-only return.
+            (long_fraction.to_owned(), Datatype::DateTimeStamp, Is::Ill),
+            (
+                format!("{long_fraction}Z"),
+                Datatype::DateTimeStamp,
+                Is::Unsupported,
+            ),
+            (
+                long_fraction.to_owned(),
+                Datatype::DateTime,
+                Is::Unsupported,
+            ),
+            (format!("{big}/x"), Datatype::Rational, Is::Ill),
+            (format!("{big}/0"), Datatype::Rational, Is::Ill),
+            (format!("{big}/1"), Datatype::Rational, Is::Unsupported),
+            (big.clone(), Datatype::Byte, Is::Ill),
+            (big.clone(), Datatype::UnsignedLong, Is::Ill),
+            (big.clone(), Datatype::NonPositiveInteger, Is::Ill),
+            (format!("-{big}"), Datatype::NonNegativeInteger, Is::Ill),
+            (big.clone(), Datatype::NonNegativeInteger, Is::Unsupported),
+            (format!("-{big}"), Datatype::Integer, Is::Unsupported),
+            ("<!-- c --><a".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            ("<a>".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            ("&nbsp;".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            ("<p:a/>".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            (
+                "<!-- c --><a/>".to_owned(),
+                Datatype::XmlLiteral,
+                Is::Unsupported,
+            ),
+            ("<a/>".to_owned(), Datatype::XmlLiteral, Is::Valid),
+            ("&#x+41;".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            ("<!--c-->&#x+41;".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            ("<a /x></a>".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            ("<:a/>".to_owned(), Datatype::XmlLiteral, Is::Ill),
+            (
+                "<a xmlns:p=''><p:b/></a>".to_owned(),
+                Datatype::XmlLiteral,
+                Is::Ill,
+            ),
+            ("&#x41;".to_owned(), Datatype::XmlLiteral, Is::Valid),
+            // A std parser's grammar wider than the datatype's.
+            ("+F".to_owned(), Datatype::HexBinary, Is::Ill),
+            ("00+F".to_owned(), Datatype::HexBinary, Is::Ill),
+            ("0f".to_owned(), Datatype::HexBinary, Is::Valid),
+            ("0F".to_owned(), Datatype::HexBinary, Is::Valid),
+            (String::new(), Datatype::HexBinary, Is::Valid),
+            ("inf".to_owned(), Datatype::Double, Is::Ill),
+            ("Infinity".to_owned(), Datatype::Double, Is::Ill),
+            ("nan".to_owned(), Datatype::Float, Is::Ill),
+            ("1_0".to_owned(), Datatype::Double, Is::Ill),
+            (" 1".to_owned(), Datatype::Double, Is::Ill),
+            ("+INF".to_owned(), Datatype::Double, Is::Valid),
+            ("-INF".to_owned(), Datatype::Float, Is::Valid),
+            ("NaN".to_owned(), Datatype::Double, Is::Valid),
+        ];
+        let wrong: Vec<String> = rows
+            .iter()
+            .filter_map(|(lexical, d, expected)| {
+                let got = Value::parse(lexical, *d, None);
+                let is = match &got {
+                    Ok(_) => Is::Valid,
+                    Err(LiteralError::IllTyped(_)) => Is::Ill,
+                    Err(LiteralError::Unsupported(_)) => Is::Unsupported,
+                };
+                (is != *expected).then(|| format!("{lexical:.60} as {d:?}: {got:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 }
