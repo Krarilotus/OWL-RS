@@ -169,15 +169,36 @@ struct Cached {
     access: Option<GraphAccess>,
     /// The exact snapshot view it was read from, including pending changes and masks.
     key: SnapshotIdentity,
-    /// The exact sorted input, moved from the schema scan. Equality is linear in the
-    /// schema size, as hashing was; a hash collision must never select another TBox.
-    schema: Box<[nrese_owl::Statement]>,
+    /// The schema without its memberships, in every graph ([`read_core`]): what a new
+    /// snapshot's must equal for the entry to stand. Equality is linear in its size, as
+    /// hashing was; a hash collision must never select another TBox.
+    core: Box<[nrese_owl::Statement]>,
+    /// The class expressions `core` makes, sorted.
+    expressions: Box<[u64]>,
     /// Compilation also needs the dictionary's id of Thing, even if no schema axiom
     /// mentions it. Ordinary data can introduce that id without changing the schema.
     thing: Option<nrese_owl::Term>,
     tbox: Arc<Tbox>,
-    /// Each expression's membership in `schema`, for the next snapshot's read.
+    /// Each expression's membership in the compiled schema, for the next snapshot's read.
     members: Members,
+}
+
+impl Cached {
+    /// The schema it was compiled from: `core` in the reader's graphs, with the members.
+    #[cfg(test)]
+    fn schema(&self, snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
+        let core: Vec<nrese_owl::Statement> = self
+            .core
+            .iter()
+            .filter(|s| {
+                self.access
+                    .as_ref()
+                    .is_none_or(|a| a.allows_id(snapshot, TermId::from_raw(s.graph)))
+            })
+            .copied()
+            .collect();
+        with_members(&core, self.expressions.iter().map(|e| &self.members.of[e]))
+    }
 }
 
 impl QlRewriting {
@@ -305,38 +326,70 @@ impl QlRewriting {
         let keep = |graph: u64| {
             access.is_none_or(|access| access.allows_id(snapshot, TermId::from_raw(graph)))
         };
-        // The memberships the entry read, where nothing a commit since changed them can
-        // differ: the same view mode, and notes from its asserted state to this one.
         let asserted = snapshot.asserted_identity();
-        let reuse = at.map(|i| &cached[i].members).and_then(|m| {
-            (m.equality == key.equality && m.canonical == key.canonical)
-                .then(|| self.touched_between(m.at, asserted).map(|t| (m, t)))
-                .flatten()
-        });
-        let known = |node: u64| {
-            let (members, touched) = reuse.as_ref()?;
-            (!touched.contains(&node))
-                .then(|| members.of.get(&node).copied())
-                .flatten()
-        };
-        let (mut statements, of) = read_schema(snapshot, &keep, &known);
+        let (core, expressions) = read_core(snapshot);
+        // An entry of this reader whose core and view mode are this snapshot's, with notes
+        // from its memberships' asserted state to this one: only the noted expressions'
+        // memberships are read again, in place (P2-C1 probe, 8 Nov: rebuilding every
+        // expression's took 188 us a snapshot more than the base's whole read).
+        if let Some(i) = at {
+            let c = &mut cached[i];
+            let touched = (c.thing == thing
+                && c.members.equality == key.equality
+                && c.members.canonical == key.canonical
+                && *c.core == *core)
+                .then(|| self.touched_between(c.members.at, asserted))
+                .flatten();
+            if let Some(touched) = touched {
+                let mut changed = false;
+                for node in touched {
+                    if c.expressions.binary_search(&node).is_err() {
+                        continue;
+                    }
+                    #[cfg(test)]
+                    count(&EXPRESSIONS_WALKED, 1);
+                    let member = member_of(snapshot, node, &keep);
+                    if c.members.of.insert(node, member) != Some(member) {
+                        changed = true;
+                    }
+                }
+                c.key = key;
+                c.members.at = asserted;
+                if !changed {
+                    return Arc::clone(&c.tbox);
+                }
+                let statements = filtered_schema(c, snapshot, &core, access);
+                let tbox = Arc::new(compile(snapshot, &statements, self.closure, thing));
+                c.tbox = Arc::clone(&tbox);
+                return tbox;
+            }
+        }
+        // Otherwise every expression's membership, read afresh.
+        #[cfg(test)]
+        count(&EXPRESSIONS_WALKED, expressions.len());
+        let of: HashMap<u64, Member> = expressions
+            .iter()
+            .map(|&node| (node, member_of(snapshot, node, &keep)))
+            .collect();
         let members = Members {
             at: asserted,
             equality: key.equality,
             canonical: key.canonical,
             of,
         };
-        if let Some(access) = access {
-            statements.retain(|s| access.allows_id(snapshot, TermId::from_raw(s.graph)));
-        }
         if let Some(c) = at
             .map(|i| &mut cached[i])
-            .filter(|c| c.thing == thing && c.schema.as_ref() == statements)
+            .filter(|c| c.thing == thing && *c.core == *core && c.members.of == members.of)
         {
             c.key = key;
             c.members = members;
             return Arc::clone(&c.tbox);
         }
+        let mut reader_core = core.clone();
+        if let Some(access) = access {
+            reader_core.retain(|s| access.allows_id(snapshot, TermId::from_raw(s.graph)));
+        }
+        let statements = with_members(&reader_core, expressions.iter().map(|e| &members.of[e]));
         let tbox = Arc::new(compile(snapshot, &statements, self.closure, thing));
         if let Some(i) = at {
             cached.remove(i);
@@ -347,13 +400,30 @@ impl QlRewriting {
         cached.push(Cached {
             access: access.cloned(),
             key,
-            schema: statements.into_boxed_slice(),
+            core: core.into_boxed_slice(),
+            expressions: expressions.into_boxed_slice(),
             thing,
             tbox: Arc::clone(&tbox),
             members,
         });
         tbox
     }
+}
+
+/// The schema of entry `c` as its reader compiles it: `core` in the reader's graphs, with
+/// `c`'s memberships.
+fn filtered_schema(
+    c: &Cached,
+    snapshot: &Snapshot,
+    core: &[nrese_owl::Statement],
+    access: Option<&GraphAccess>,
+) -> Vec<nrese_owl::Statement> {
+    let reader_core: Vec<nrese_owl::Statement> = core
+        .iter()
+        .filter(|s| access.is_none_or(|a| a.allows_id(snapshot, TermId::from_raw(s.graph))))
+        .copied()
+        .collect();
+    with_members(&reader_core, c.expressions.iter().map(|e| &c.members.of[e]))
 }
 
 /// The class expressions `tx` changes a membership of: the blank objects of the
@@ -386,26 +456,35 @@ fn iri(snapshot: &Snapshot, namespace: &str, local: &str) -> Option<TermId> {
 /// the declarations', the cells of the lists they name, and per class expression one
 /// statement of an individual in it, from a graph `keep` admits.
 fn schema_statements(snapshot: &Snapshot, keep: &dyn Fn(u64) -> bool) -> Vec<nrese_owl::Statement> {
-    read_schema(snapshot, keep, &|_| None).0
+    let (core, expressions) = read_core(snapshot);
+    let members: Vec<Member> = expressions
+        .iter()
+        .map(|&node| member_of(snapshot, node, keep))
+        .collect();
+    with_members(&core, members.iter())
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Memberships [`read_schema`] scanned on this thread (the reuse tests count them).
+    /// What schema reads did on this thread (the reuse tests count it): memberships
+    /// scanned, expressions walked, membership statements written into a schema.
     static MEMBER_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EXPRESSIONS_WALKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MEMBERS_WRITTEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count(cell: &'static std::thread::LocalKey<std::cell::Cell<usize>>, n: usize) {
+    cell.set(cell.get() + n);
 }
 
 /// What an expression's membership is ([`schema_statements`]): one statement, or none.
 type Member = Option<nrese_owl::Statement>;
 
-/// [`schema_statements`], with each expression's membership taken from `known` where it
-/// knows it (`Some`), scanned otherwise; and the memberships, for the next read.
-fn read_schema(
-    snapshot: &Snapshot,
-    keep: &dyn Fn(u64) -> bool,
-    known: &dyn Fn(u64) -> Option<Member>,
-) -> (Vec<nrese_owl::Statement>, HashMap<u64, Member>) {
-    let mut members: HashMap<u64, Member> = HashMap::new();
+/// The schema without its memberships, sorted, in every graph; and the class expressions
+/// its statements make (blank subjects of a restriction's or a set operator's property),
+/// sorted.
+fn read_core(snapshot: &Snapshot) -> (Vec<nrese_owl::Statement>, Vec<u64>) {
     let mut out = Vec::new();
     let scan = |pattern: QuadPattern, out: &mut Vec<nrese_owl::Statement>| {
         out.extend(
@@ -434,55 +513,20 @@ fn read_schema(
                 scan(pattern(rdf_type, Some(class)), &mut out);
             }
         }
-        // Individuals asserted to be in a class expression (`:p a [ owl:onProperty … ]`),
-        // which have anonymous individuals of their own (design §7). What the hazards read
-        // of them is the expression, not who is in it: one `rdf:type` statement per blank
-        // node the schema read makes an expression, in a graph `keep` lets the reader see.
-        // The schema stays the expressions' size, and a membership that doesn't change
-        // which expressions have one keeps the compiled TBox (P2-C1 timing, 7 Nov: every
-        // membership read made 10,000 of them a 10 ms read after each commit).
-        let operators: Vec<u64> = EXPRESSIONS
-            .iter()
-            .filter_map(|local| iri(snapshot, OWL, local))
-            .map(TermId::raw)
-            .collect();
-        let mut expressions: Vec<u64> = out
-            .iter()
-            .filter(|s| operators.contains(&s.triple[1]))
-            .map(|s| s.triple[0])
-            .filter(|&node| TermId::from_raw(node).kind() == nrese_engine::TermKind::BlankNode)
-            .collect();
-        expressions.sort_unstable();
-        expressions.dedup();
-        for node in expressions {
-            if let Some(member) = known(node) {
-                out.extend(member);
-                members.insert(node, member);
-                continue;
-            }
-            #[cfg(test)]
-            MEMBER_SCANS.set(MEMBER_SCANS.get() + 1);
-            let member = snapshot
-                .quads_for_pattern_in(
-                    ReadModel::Asserted,
-                    &pattern(rdf_type, Some(TermId::from_raw(node))),
-                )
-                // One the reader keeps: it leaves out a reserved name as the individual
-                // (`rdf:type a _:e`), and another member must stand in (Sol r4 S1).
-                .find(|q| {
-                    keep(q.graph.raw())
-                        && !matches!(snapshot.decode(q.subject),
-                            Some(Term::NamedNode(n))
-                                if nrese_owl::diagnostics::reserved_name(n.as_str()))
-                });
-            let member = member.map(|q| nrese_owl::Statement {
-                triple: [q.subject.raw(), q.predicate.raw(), q.object.raw()],
-                graph: q.graph.raw(),
-            });
-            out.extend(member);
-            members.insert(node, member);
-        }
     }
+    let operators: Vec<u64> = EXPRESSIONS
+        .iter()
+        .filter_map(|local| iri(snapshot, OWL, local))
+        .map(TermId::raw)
+        .collect();
+    let mut expressions: Vec<u64> = out
+        .iter()
+        .filter(|s| operators.contains(&s.triple[1]))
+        .map(|s| s.triple[0])
+        .filter(|&node| TermId::from_raw(node).kind() == nrese_engine::TermKind::BlankNode)
+        .collect();
+    expressions.sort_unstable();
+    expressions.dedup();
     // The lists: from each head, `rdf:first` and `rdf:rest` along the cells.
     let (first, rest) = (iri(snapshot, RDF, "first"), iri(snapshot, RDF, "rest"));
     if let (Some(first), Some(rest)) = (first, rest) {
@@ -524,7 +568,54 @@ fn read_schema(
     }
     out.sort();
     out.dedup();
-    (out, members)
+    (out, expressions)
+}
+
+/// The membership the schema reads of class expression `node` (design §7: individuals
+/// asserted to be in it have anonymous individuals of their own): one `rdf:type`
+/// statement, the first in a graph `keep` admits whose individual the OWL reader keeps (it
+/// leaves out a reserved name, `rdf:type a _:e`: Sol r4 S1); `None` without one. What the
+/// hazards read of it is the expression, not who is in it.
+fn member_of(snapshot: &Snapshot, node: u64, keep: &dyn Fn(u64) -> bool) -> Member {
+    #[cfg(test)]
+    count(&MEMBER_SCANS, 1);
+    let rdf_type = iri(snapshot, RDF, "type")?;
+    snapshot
+        .quads_for_pattern_in(
+            ReadModel::Asserted,
+            &QuadPattern {
+                subject: None,
+                predicate: Some(rdf_type),
+                object: Some(TermId::from_raw(node)),
+                graph: GraphSelector::Any,
+            },
+        )
+        .find(|q| {
+            keep(q.graph.raw())
+                && !matches!(snapshot.decode(q.subject),
+                    Some(Term::NamedNode(n)) if nrese_owl::diagnostics::reserved_name(n.as_str()))
+        })
+        .map(|q| nrese_owl::Statement {
+            triple: [q.subject.raw(), q.predicate.raw(), q.object.raw()],
+            graph: q.graph.raw(),
+        })
+}
+
+/// `core` with the memberships `members`, sorted: the schema the TBox is compiled from.
+fn with_members<'a>(
+    core: &[nrese_owl::Statement],
+    members: impl Iterator<Item = &'a Member>,
+) -> Vec<nrese_owl::Statement> {
+    let mut out = core.to_vec();
+    let before = out.len();
+    out.extend(members.flatten().copied());
+    #[cfg(test)]
+    count(&MEMBERS_WRITTEN, out.len() - before);
+    #[cfg(not(test))]
+    let _ = before;
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The snapshot's terms, as the mapping reads them.
