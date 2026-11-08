@@ -2,19 +2,20 @@
 //! `0::/path` line) reads `memory.max` in the process's group and every ancestor's, v1 (a
 //! line naming the `memory` controller) `memory.limit_in_bytes`; the smallest counts.
 //!
-//! The kernel resolves every path, and each answer is verified for identity; nothing here
-//! interprets a path (SYN-45 review r1 R1-C1a, r2: three rounds of modelling the kernel's walk
-//! each left a corner open). `/proc/self/mountinfo` only lists the views of the hierarchy: each
-//! mount's id, the group it shows at its point, and where. A view of a group opens its point
-//! from the root and then the group below it, one name at a time (never `..`, never a path with
-//! a `/` in it, no symbolic link followed), and the handles from the point on must carry the
-//! view's mount id, so a mount over the point, over part of the way or over a single file is
-//! seen as another mount and refused. The process's own group must list
+//! The kernel resolves every path, and each answer is verified; nothing here interprets a path
+//! (SYN-45 review r1 R1-C1a, r2: three rounds of modelling the kernel's walk each left a corner
+//! open). `/proc/self/mountinfo` only lists the views of the hierarchy: each mount's id, the
+//! group it shows at its point, and where. A view of a group opens its point from the root and
+//! then the group's names below the view's group, one name at a time (never `..`, never a path
+//! with a `/` in it, no symbolic link followed, needing only search permission on the way), and
+//! the handles from the point on must carry the view's mount id, so a mount over the point,
+//! over part of the way or over a single file is seen as another mount and refused. Reached so,
+//! within one mount of the hierarchy, the directory is that group, an ancestor too. A way the
+//! kernel refuses or fails to open leaves the limit unknown. The process's own group must list
 //! the process (`getpid`, the pid namespace `cgroup.procs` lists ids in) in its `cgroup.procs`,
-//! or in a threaded v2 group its `cgroup.threads`; each ancestor must hold the group below it as
-//! a child of the same inode (kernfs: one inode per cgroup, the same through any bind). Each
-//! value file is read through its verified directory, on the same mount. Mount ids come from
-//! `/proc/self/fdinfo` (Linux 3.15); a kernel that doesn't show them leaves every limit unknown.
+//! or in a threaded v2 group its `cgroup.threads`. Each value file is read through its
+//! verified directory, on the same mount. Mount ids come from `/proc/self/fdinfo` (Linux 3.15);
+//! a kernel that doesn't show them leaves every limit unknown.
 //!
 //! An ancestor no view reaches, above every mount's root or hidden by a mount, is invisible to
 //! the process as one above its cgroup namespace is, and the walk stops there (the
@@ -53,12 +54,8 @@ pub(super) trait Fs {
     fn open_at(&self, dir: &Self::Handle, name: &str) -> io::Result<Self::Handle>;
     /// The id of the mount a handle is on, the one `/proc/self/mountinfo` lists.
     fn mount(&self, handle: &Self::Handle) -> io::Result<u64>;
-    /// A handle's device and inode.
-    fn identity(&self, handle: &Self::Handle) -> io::Result<(u64, u64)>;
     /// A handle's whole text.
     fn read(&self, handle: &Self::Handle) -> io::Result<String>;
-    /// The names in a directory.
-    fn names(&self, dir: &Self::Handle) -> io::Result<Vec<String>>;
 }
 
 /// Where a cgroup version keeps a group's memory limit, its use, and its statistics, and the
@@ -225,7 +222,9 @@ impl<F: Fs> Walk<'_, F> {
     /// Every directory of `group` the views reach: through each view whose group holds it
     /// without a step above (its names below the view's), its point opened and then each name,
     /// every handle on the view's own mount. A view the kernel answers otherwise doesn't reach
-    /// it (another mount over the point or the way, or a name not there).
+    /// it (another mount over the point or the way, or a name not there). A way the kernel
+    /// refuses or fails to open is a view that may show the group and wasn't read: `Unknown`
+    /// (sol-loop r7 S2).
     fn places(&self, group: &Path) -> Result<Vec<Place<F::Handle>>, Unknown> {
         let mut found = Vec::new();
         for view in &self.views {
@@ -235,8 +234,10 @@ impl<F: Fs> Walk<'_, F> {
             if below.iter().any(|name| name == "..") {
                 continue;
             }
-            let Ok(mut dir) = self.point(&view.point) else {
-                continue;
+            let mut dir = match self.point(&view.point) {
+                Ok(dir) => dir,
+                Err(error) if absent(&error) => continue,
+                Err(_) => return Err(Unknown),
             };
             let mut reached = self.mount(&dir)? == view.id;
             for name in below {
@@ -248,7 +249,8 @@ impl<F: Fs> Walk<'_, F> {
                         reached = self.mount(&next)? == view.id;
                         dir = next;
                     }
-                    Err(_) => reached = false,
+                    Err(error) if absent(&error) => reached = false,
+                    Err(_) => return Err(Unknown),
                 }
             }
             if reached {
@@ -299,36 +301,12 @@ impl<F: Fs> Walk<'_, F> {
                 && (self.files.v1 || matches!(self.file(place, "cgroup.controllers"), Ok(Ok(_)))),
         )
     }
+}
 
-    /// Whether `place` holds `child` as its entry: the entry named `name` (a name below the
-    /// namespace's root), or, where the child is above it and its name isn't shown, some entry,
-    /// on the same mount and of the child's inode.
-    fn holds(
-        &self,
-        place: &Place<F::Handle>,
-        name: Option<&str>,
-        child: (u64, u64),
-    ) -> Result<bool, Unknown> {
-        let is_child = |entry: &str| -> Result<bool, Unknown> {
-            let Ok(handle) = self.fs.open_at(&place.dir, entry) else {
-                return Ok(false);
-            };
-            let same = self.fs.identity(&handle).map_err(|_| Unknown)? == child;
-            Ok(same && self.mount(&handle)? == place.mount)
-        };
-        match name {
-            Some(name) => is_child(name),
-            None => {
-                let entries = self.fs.names(&place.dir).map_err(|_| Unknown)?;
-                for entry in entries {
-                    if is_child(&entry)? {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            }
-        }
-    }
+/// An open error that says the name isn't there (or a part of the way isn't a directory): a
+/// view that doesn't reach the group. Any other is the kernel refusing or failing.
+fn absent(error: &io::Error) -> bool {
+    matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
 }
 
 /// `each` of the process's memory group and its visible ancestors that has a limit, innermost
@@ -380,19 +358,14 @@ fn limited<F: Fs>(
             Err(error) if error.kind() == ErrorKind::NotFound && !files.v1 => {}
             Err(_) => return Err(Unknown),
         }
-        let child = fs.identity(&place.dir).map_err(|_| Unknown)?;
-        let name = group.last().filter(|name| *name != "..").cloned();
+        // The parent, reached on a view's own mount by its names below the view's group, is
+        // that group: within one mount of the hierarchy a name is the group's child. Whatever
+        // is bound over the child's entry there (the child itself, sol-loop r7 S1, or another
+        // group) doesn't change which group the parent is.
         let up = parent(&group);
-        let mut found = None;
-        for candidate in walk.places(&up)? {
-            if walk.holds(&candidate, name.as_deref(), child)? {
-                found = Some(candidate);
-                break;
-            }
-        }
         // None reaches it (above every view's group, or hidden by a mount): not visible to
         // the process, as above a namespace, so nothing above it is read (option 1).
-        let Some(found) = found else {
+        let Some(found) = walk.places(&up)?.into_iter().next() else {
             return Ok(());
         };
         place = found;
@@ -465,11 +438,25 @@ pub(super) fn left(fs: &impl Fs) -> Result<Option<u64>, Unknown> {
     Ok(least)
 }
 
-/// The kernel's own answers: files opened by the kernel, one name at a time through
-/// `/proc/self/fd/N/name` (the directory the descriptor holds, then the name in it), mount ids
-/// from `/proc/self/fdinfo/N`.
+/// The kernel's own answers: every handle a path-only descriptor (`O_PATH`, which needs search
+/// permission on the way and none on the entry, so a directory the process may pass but not
+/// list is passed, sol-loop r7 S2), opened one name at a time through `/proc/self/fd/N/name`
+/// (the directory the descriptor holds, then the name in it); mount ids from
+/// `/proc/self/fdinfo/N`; a file read by opening its descriptor's own link, the same file on
+/// the same mount, no path walked again.
 #[cfg(target_os = "linux")]
 pub(super) struct Kernel;
+
+#[cfg(target_os = "linux")]
+impl Kernel {
+    fn path_only(path: &str) -> io::Result<std::fs::File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+            .open(path)
+    }
+}
 
 #[cfg(target_os = "linux")]
 impl Fs for Kernel {
@@ -480,19 +467,15 @@ impl Fs for Kernel {
     }
 
     fn root(&self) -> io::Result<std::fs::File> {
-        std::fs::File::open("/")
+        Self::path_only("/")
     }
 
     fn open_at(&self, dir: &std::fs::File, name: &str) -> io::Result<std::fs::File> {
         use std::os::fd::AsRawFd;
-        use std::os::unix::fs::OpenOptionsExt;
         if name.is_empty() || name == "." || name == ".." || name.contains('/') {
             return Err(ErrorKind::InvalidInput.into());
         }
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(format!("/proc/self/fd/{}/{name}", dir.as_raw_fd()))
+        Self::path_only(&format!("/proc/self/fd/{}/{name}", dir.as_raw_fd()))
     }
 
     fn mount(&self, handle: &std::fs::File) -> io::Result<u64> {
@@ -504,24 +487,9 @@ impl Fs for Kernel {
             .ok_or_else(|| ErrorKind::Unsupported.into())
     }
 
-    fn identity(&self, handle: &std::fs::File) -> io::Result<(u64, u64)> {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = handle.metadata()?;
-        Ok((metadata.dev(), metadata.ino()))
-    }
-
     fn read(&self, handle: &std::fs::File) -> io::Result<String> {
-        use std::io::Read;
-        let mut text = String::new();
-        (&*handle).read_to_string(&mut text)?;
-        Ok(text)
-    }
-
-    fn names(&self, dir: &std::fs::File) -> io::Result<Vec<String>> {
         use std::os::fd::AsRawFd;
-        std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?
-            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
-            .collect()
+        std::fs::read_to_string(format!("/proc/self/fd/{}", handle.as_raw_fd()))
     }
 }
 
@@ -529,8 +497,8 @@ impl Fs for Kernel {
 /// its mount table. Each path is resolved as the kernel does for a path with no `..` (the walk
 /// tests of earlier rounds verified for those): from the root mount, into a mount stacked at a
 /// mount's point, else into the child at the shortest point on the way. A handle's mount is the
-/// mount it was reached through; its inode is the group (or file) the mount's root and the rest
-/// of the path name, one per group as kernfs has.
+/// mount it was reached through. A path the rows deny is one the kernel refuses to open, a
+/// directory on the way to it included.
 #[cfg(test)]
 pub(super) mod declared {
     use super::*;
@@ -540,9 +508,7 @@ pub(super) mod declared {
     struct Mount {
         id: u64,
         parent: u64,
-        root: String,
         point: String,
-        device: u64,
     }
 
     /// A handle: the absolute path it was opened at.
@@ -571,27 +537,15 @@ pub(super) mod declared {
                 .map(|text| {
                     text.lines()
                         .filter_map(|line| {
-                            let (before, after) = line.split_once(" - ")?;
+                            let (before, _) = line.split_once(" - ")?;
                             let mut fields = before.split(' ');
                             let id = fields.next()?.parse().ok()?;
                             let parent = fields.next()?.parse().ok()?;
-                            let (root, point) = (fields.nth(1)?, fields.next()?);
-                            // A device per hierarchy (v2; v1's memory one), else per mount.
-                            let mut after = after.split(' ');
-                            let kind = after.next()?;
-                            let memory =
-                                after.nth(1).unwrap_or("").split(',').any(|o| o == "memory");
-                            let device = match kind {
-                                "cgroup2" => 1,
-                                "cgroup" if memory => 2,
-                                _ => 1000 + id,
-                            };
+                            let point = fields.nth(2)?;
                             Some(Mount {
                                 id,
                                 parent,
-                                root: unescape(root),
                                 point: unescape(point),
-                                device,
                             })
                         })
                         .collect()
@@ -698,37 +652,12 @@ pub(super) mod declared {
                 .ok_or_else(|| ErrorKind::NotFound.into())
         }
 
-        fn identity(&self, handle: &At) -> io::Result<(u64, u64)> {
-            use std::hash::{Hash, Hasher};
-            let (mount, rest) = self.resolve(&handle.0).ok_or(ErrorKind::NotFound)?;
-            // One inode per group: the group the mount's root and the rest name, the same
-            // through every mount of the hierarchy; another file system's own.
-            let named = format!("{}{rest}", mount.root.trim_end_matches('/'));
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            names(&named).hash(&mut hasher);
-            Ok((mount.device, hasher.finish()))
-        }
-
         fn read(&self, handle: &At) -> io::Result<String> {
             let text = self.text(&handle.0)?;
             if text == "EOPNOTSUPP" {
                 return Err(io::Error::from_raw_os_error(EOPNOTSUPP));
             }
             Ok(text)
-        }
-
-        fn names(&self, dir: &At) -> io::Result<Vec<String>> {
-            let mut found: Vec<String> = self
-                .files
-                .keys()
-                .chain(self.mounts.iter().map(|m| &m.point))
-                .filter_map(|path| below(path, &dir.0)?.strip_prefix('/'))
-                .filter_map(|rest| rest.split('/').next())
-                .map(str::to_owned)
-                .collect();
-            found.sort();
-            found.dedup();
-            Ok(found)
         }
     }
 }
