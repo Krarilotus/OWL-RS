@@ -3,7 +3,7 @@
 //! A [`Skimmer`] reads the document once, sequentially, but only far enough to know what
 //! is a string (four quote forms, with escapes), an IRI or a comment, and what is open:
 //! - brackets (`[ ]`, `( )`, `<<( )>>`, `<< >>`, `{| |}`), read as the lexer reads them
-//!   (`lexer::delimiter`) and held as recovery holds them (`lexer::bracket`): a closer
+//!   (`lexer::delimiter`) and held as recovery holds them (`lexer::Brackets`): a closer
 //!   closes an open bracket of its own kind, or nothing;
 //! - TriG blocks (a `{` after a graph block's head, as the lexer reads it), and any other
 //!   `{` as a brace, as recovery reads one;
@@ -23,7 +23,7 @@
 //! says it can fail or give wrong results on directives after the start or Turtle inside
 //! literals; this one can't.
 
-use super::lexer::{Delimiter, Kind, Lexed, bracket, delimiter, lex};
+use super::lexer::{Brackets, Delimiter, Kind, Lexed, delimiter, lex};
 
 /// Bytes the skimmer must look at outside strings, IRIs and comments.
 const fn interesting() -> [bool; 256] {
@@ -154,11 +154,9 @@ pub(crate) struct Skimmer {
     state: State,
     /// TriG: `{` may open a graph block.
     trig: bool,
-    /// What is open, as a recovering parser holds it: brackets by pair, outermost first,
-    /// with a count per pair (`lexer::bracket`); `{` opened inside a statement; a TriG
-    /// block.
-    open: Vec<usize>,
-    counts: [usize; 5],
+    /// What is open, as a recovering parser holds it: brackets (`lexer::Brackets`); `{`
+    /// opened inside a statement; a TriG block.
+    open: Brackets,
     braces: u64,
     in_block: bool,
     /// Where the current statement starts; while its tokens so far may be a TriG block's
@@ -202,8 +200,7 @@ impl Skimmer {
         Self {
             state: State::Normal,
             trig,
-            open: Vec::new(),
-            counts: [0; 5],
+            open: Brackets::default(),
             braces: 0,
             in_block: false,
             statement_start: 0,
@@ -244,6 +241,7 @@ impl Skimmer {
     }
 
     /// Nothing open: a `.` here ends the statement.
+    #[inline(always)]
     fn level(&self) -> bool {
         self.open.is_empty() && self.braces == 0 && !self.in_block
     }
@@ -251,13 +249,26 @@ impl Skimmer {
     /// A statement ends whatever is open in it (a SPARQL-style directive's end).
     fn close_all(&mut self) {
         self.open.clear();
-        self.counts = [0; 5];
         self.braces = 0;
     }
 
     /// A delimiter token at `bytes[at..]` applied to what is open, as a recovering parser
     /// applies it (`skip_token`); `true` when it ends a TriG block (and the statement in it).
+    #[inline(always)]
     fn delimit(&mut self, kind: Kind, bytes: &[u8], at: usize) -> bool {
+        match kind {
+            Kind::OpenBrace | Kind::CloseBrace => self.brace(kind, bytes, at),
+            _ => {
+                self.open.apply(kind);
+                false
+            }
+        }
+    }
+
+    /// `delimit` for a brace: a TriG block's or a statement's (once per block or less: out of
+    /// the skim's loop).
+    #[inline(never)]
+    fn brace(&mut self, kind: Kind, bytes: &[u8], at: usize) -> bool {
         match kind {
             Kind::OpenBrace => {
                 if self.trig
@@ -281,18 +292,99 @@ impl Skimmer {
             Kind::CloseBrace if self.in_block => {
                 self.in_block = false;
                 self.open.clear();
-                self.counts = [0; 5];
                 true
             }
-            Kind::CloseBrace => false,
-            _ => {
-                bracket(&mut self.open, &mut self.counts, kind);
-                false
-            }
+            _ => false,
         }
     }
 
+    /// The lines of `bytes[*counted..upto]` (`bytes` the input from document offset `base`),
+    /// counted with memchr; `*counted` moves to `upto`.
+    fn lines(&mut self, bytes: &[u8], base: u64, counted: &mut usize, upto: usize) {
+        if upto > *counted {
+            let piece = &bytes[*counted..upto];
+            let breaks = memchr::memchr_iter(b'\n', piece).count() as u64;
+            if breaks > 0 {
+                let last = memchr::memrchr(b'\n', piece).unwrap_or(0);
+                self.line += breaks;
+                self.line_start = base + (*counted + last + 1) as u64;
+            }
+            *counted = upto;
+        }
+    }
+
+    /// A `\` at `bytes[i]` outside strings, IRIs and comments: the name it is in, read by the
+    /// lexer from the token's start (after the last byte that ends a token), token by token,
+    /// a byte it can't read skipped as a recovering parser skips it; the delimiters and `.`
+    /// among them applied. Where reading goes on, and whether it stopped for want of more
+    /// input (to hold from there). Rare: out of the skim's loop.
+    #[cold]
+    #[inline(never)]
+    fn escaped_name(
+        &mut self,
+        bytes: &[u8],
+        i: usize,
+        eof: bool,
+        base: u64,
+        counted: &mut usize,
+    ) -> (usize, bool) {
+        let n = bytes.len();
+        self.start = None;
+        let mut from = i;
+        while from > 0 && !ends_token(bytes[from - 1]) {
+            from -= 1;
+        }
+        let mut at = from;
+        let mut more = false;
+        while at < n && !ends_token(bytes[at]) {
+            match lex(&bytes[at..], eof, false, false) {
+                Lexed::Token(token) => {
+                    let end = at + token.consumed;
+                    match token.kind {
+                        // A `.` with nothing open ends the statement if whitespace or a
+                        // comment follows (`State::Dot`).
+                        Kind::Dot if self.level() => {
+                            if end == n {
+                                self.state = State::Dot;
+                            } else if bytes[end].is_ascii_whitespace() || bytes[end] == b'#' {
+                                self.lines(bytes, base, counted, end);
+                                self.boundary(base + end as u64);
+                            }
+                        }
+                        opener!() | closer!() | Kind::OpenBrace | Kind::CloseBrace => {
+                            let ended = self.delimit(token.kind, bytes, at);
+                            if ended {
+                                self.lines(bytes, base, counted, end);
+                                self.boundary(base + end as u64);
+                            }
+                        }
+                        _ => {}
+                    }
+                    at = end;
+                }
+                Lexed::NeedMore => {
+                    more = true;
+                    break;
+                }
+                // A byte the lexer can't read: skipped, as recovery does.
+                Lexed::Error(..) => at += 1,
+            }
+        }
+        if let Some((text, _)) = &mut self.directive {
+            if at > i + 1 {
+                text.extend_from_slice(&bytes[i + 1..at]);
+            } else {
+                // Held before the `\`: its bytes are read again.
+                text.truncate(text.len() - (i + 1 - at));
+            }
+        }
+        (at, more)
+    }
+
     /// Whether the statement's tokens before the `{` at `bytes[at]` are a graph block's head.
+    /// Once per TriG block: out of the skim's loop.
+    #[cold]
+    #[inline(never)]
     fn block_head(&self, bytes: &[u8], at: usize) -> bool {
         let joined;
         let text = match self.statement_start.checked_sub(self.offset) {
@@ -340,16 +432,7 @@ impl Skimmer {
         let mut i = 0;
         let n = bytes.len();
         let count_lines = |me: &mut Self, counted: &mut usize, upto: usize| {
-            if upto > *counted {
-                let piece = &bytes[*counted..upto];
-                let breaks = memchr::memchr_iter(b'\n', piece).count() as u64;
-                if breaks > 0 {
-                    let last = memchr::memrchr(b'\n', piece).unwrap_or(0);
-                    me.line += breaks;
-                    me.line_start = base + (*counted + last + 1) as u64;
-                }
-                *counted = upto;
-            }
+            me.lines(bytes, base, counted, upto);
         };
         // The document's start: a byte order mark is no text, as for the parser.
         if !self.started && base == 0 {
@@ -376,324 +459,214 @@ impl Skimmer {
         };
         // Where reading stopped for want of more input.
         let mut held = None;
-        while i < n {
-            if i >= tail && self.state == State::Normal {
-                held = Some(i);
-                break;
-            }
-            // A statement's first bytes: is it a directive?
-            let level = self.level();
-            if let Some((_, first)) = &mut self.start
-                && level
-                && matches!(self.state, State::Normal)
-            {
-                let b = bytes[i];
-                if first.is_empty() && b.is_ascii_whitespace() {
-                    i += 1;
-                    continue;
+        // A delimiter at `bytes[i]` (a byte `lexer::delimiter` reads), applied to what is
+        // open; `break`s the loop (`$done`) to hold it when it is cut by the input's end.
+        macro_rules! delimiter_arm {
+            ($me:ident, $done:lifetime) => {
+                match delimiter(bytes, i, eof, false) {
+                    Some(Delimiter::Token(kind, len)) => {
+                        if let Some((text, _)) = &mut $me.directive {
+                            text.extend_from_slice(&bytes[i + 1..i + len]);
+                        }
+                        let ended = $me.delimit(kind, bytes, i);
+                        i += len;
+                        if ended {
+                            count_lines($me, &mut counted, i);
+                            $me.boundary(base + i as u64);
+                        }
+                    }
+                    // A `>` or `|` that starts no delimiter: a byte the lexer can't read,
+                    // skipped.
+                    Some(Delimiter::Bad(_)) => i += 1,
+                    Some(Delimiter::NeedMore) => {
+                        if let Some((text, _)) = &mut $me.directive {
+                            text.pop();
+                        }
+                        held = Some(i);
+                        break $done;
+                    }
+                    // A `<` that starts an IRI.
+                    None => {
+                        $me.state = State::Iri;
+                        i += 1;
+                    }
                 }
-                if first.is_empty() && b == b'#' {
-                    // A comment before the statement.
-                } else {
-                    first.push(b);
-                    // As the lexer reads them: `@` and a run of letters that is `prefix`,
-                    // `base` or `version`; or a name that is `PREFIX`, `BASE` or `VERSION`
-                    // in any case and not followed by `:` (that would be a prefixed name).
-                    // No whitespace needs to follow (`BASE<…>`, `@prefix:<…>`). A
-                    // `VERSION "1.2"` read as a statement ran on to the next `.` and
-                    // swallowed the directive after it (a release whose second line
-                    // declared `prov:` failed to load in parallel, 4 October 2026).
-                    let (run, dotted) = match first.split_first() {
-                        Some((b'@', rest)) => (rest, true),
-                        _ => (&first[..], false),
-                    };
-                    let in_run = |c: u8| {
-                        if dotted {
-                            c.is_ascii_alphabetic()
-                        } else {
-                            c.is_ascii_alphanumeric()
-                                || matches!(c, b'_' | b'-' | b'.')
-                                || c >= 0x80
-                        }
-                    };
-                    let keywords: [&[u8]; 3] = [b"prefix", b"base", b"version"];
-                    let same = |word: &[u8], keyword: &[u8]| {
-                        if dotted {
-                            word == keyword
-                        } else {
-                            word.eq_ignore_ascii_case(keyword)
-                        }
-                    };
-                    let (&last, word) = run.split_last().unwrap_or((&b' ', &[]));
-                    if run.is_empty() {
-                        // Only the `@` so far.
-                    } else if in_run(last) {
-                        // Still in the run: a keyword can still come of it?
-                        let could_be = keywords.iter().any(|k| {
-                            run.len() <= k.len()
-                                && (if dotted {
-                                    k.starts_with(run)
-                                } else {
-                                    k[..run.len()].eq_ignore_ascii_case(run)
-                                })
-                        });
-                        if !could_be {
-                            self.start = None;
-                        }
-                    } else if keywords.iter().any(|k| same(word, k)) && (dotted || last != b':') {
-                        let mut text = std::mem::take(first);
-                        text.truncate(text.len() - 1);
-                        self.start = None;
-                        self.directive = Some((text, dotted));
-                        // Re-read this byte as part of the directive.
+            };
+        }
+        // The loop reads a view of the input, and asks nothing per byte about holding: first
+        // the bytes before the held word (`tail`), then, only if a token begun before the word
+        // goes on into it, all of them (see below). The view starts where the input does, so
+        // its offsets are the input's (`delimiter_arm` reads the whole input).
+        let whole = bytes;
+        let mut view = &whole[..tail];
+        'scan: loop {
+            let bytes = view;
+            let n = bytes.len();
+            while i < n {
+                debug_assert!(
+                    i < tail || self.state != State::Normal,
+                    "reading the held word"
+                );
+                // A statement's first bytes: is it a directive? (What is open is asked only while
+                // a statement's start is being read: this runs for every byte.)
+                if self.start.is_some()
+                    && matches!(self.state, State::Normal)
+                    && self.level()
+                    && let Some((_, first)) = &mut self.start
+                {
+                    let b = bytes[i];
+                    if first.is_empty() && b.is_ascii_whitespace() {
+                        i += 1;
                         continue;
+                    }
+                    if first.is_empty() && b == b'#' {
+                        // A comment before the statement.
                     } else {
-                        self.start = None;
+                        first.push(b);
+                        // As the lexer reads them: `@` and a run of letters that is `prefix`,
+                        // `base` or `version`; or a name that is `PREFIX`, `BASE` or `VERSION`
+                        // in any case and not followed by `:` (that would be a prefixed name).
+                        // No whitespace needs to follow (`BASE<…>`, `@prefix:<…>`). A
+                        // `VERSION "1.2"` read as a statement ran on to the next `.` and
+                        // swallowed the directive after it (a release whose second line
+                        // declared `prov:` failed to load in parallel, 4 October 2026).
+                        let (run, dotted) = match first.split_first() {
+                            Some((b'@', rest)) => (rest, true),
+                            _ => (&first[..], false),
+                        };
+                        let in_run = |c: u8| {
+                            if dotted {
+                                c.is_ascii_alphabetic()
+                            } else {
+                                c.is_ascii_alphanumeric()
+                                    || matches!(c, b'_' | b'-' | b'.')
+                                    || c >= 0x80
+                            }
+                        };
+                        let keywords: [&[u8]; 3] = [b"prefix", b"base", b"version"];
+                        let same = |word: &[u8], keyword: &[u8]| {
+                            if dotted {
+                                word == keyword
+                            } else {
+                                word.eq_ignore_ascii_case(keyword)
+                            }
+                        };
+                        let (&last, word) = run.split_last().unwrap_or((&b' ', &[]));
+                        if run.is_empty() {
+                            // Only the `@` so far.
+                        } else if in_run(last) {
+                            // Still in the run: a keyword can still come of it?
+                            let could_be = keywords.iter().any(|k| {
+                                run.len() <= k.len()
+                                    && (if dotted {
+                                        k.starts_with(run)
+                                    } else {
+                                        k[..run.len()].eq_ignore_ascii_case(run)
+                                    })
+                            });
+                            if !could_be {
+                                self.start = None;
+                            }
+                        } else if keywords.iter().any(|k| same(word, k)) && (dotted || last != b':')
+                        {
+                            let mut text = std::mem::take(first);
+                            text.truncate(text.len() - 1);
+                            self.start = None;
+                            self.directive = Some((text, dotted));
+                            // Re-read this byte as part of the directive.
+                            continue;
+                        } else {
+                            self.start = None;
+                        }
                     }
                 }
-            }
-            let b = bytes[i];
-            if let Some((text, _)) = &mut self.directive {
-                text.push(b);
-            }
-            match self.state {
-                State::Normal => {
-                    if !INTERESTING[b as usize] {
-                        // The fast path: skip to the next byte that matters, up to the held
-                        // word (a directive's text is copied byte by byte above, but
-                        // directives are few).
-                        if self.directive.is_none() && self.start.is_none() {
-                            let rest = &bytes[i + 1..];
-                            let skip = rest
-                                .iter()
-                                .position(|&c| INTERESTING[c as usize])
-                                .unwrap_or(rest.len());
-                            i = (i + 1 + skip).min(tail.max(i + 1));
-                        } else {
-                            i += 1;
-                        }
-                        continue;
-                    }
-                    match b {
-                        b'"' | b'\'' => {
-                            self.state = State::Opening { quote: b, count: 1 };
-                            i += 1;
-                        }
-                        b'#' => {
-                            self.state = State::Comment;
-                            i += 1;
-                        }
-                        b'.' => {
-                            if self.level() {
-                                self.state = State::Dot;
-                            }
-                            i += 1;
-                        }
-                        b'\\' => {
-                            // A name with an escape: read by the lexer from the token it is
-                            // in, as a recovering parser reads it.
-                            self.start = None;
-                            let mut from = i;
-                            while from > 0 && !ends_token(bytes[from - 1]) {
-                                from -= 1;
-                            }
-                            let mut at = from;
-                            let mut more = false;
-                            while at < n && !ends_token(bytes[at]) {
-                                match lex(&bytes[at..], eof, false, false) {
-                                    Lexed::Token(token) => {
-                                        let end = at + token.consumed;
-                                        match token.kind {
-                                            // A `.` with nothing open ends the statement if
-                                            // whitespace or a comment follows (`State::Dot`).
-                                            Kind::Dot if self.level() => {
-                                                if end == n {
-                                                    self.state = State::Dot;
-                                                } else if bytes[end].is_ascii_whitespace()
-                                                    || bytes[end] == b'#'
-                                                {
-                                                    count_lines(self, &mut counted, end);
-                                                    self.boundary(base + end as u64);
-                                                }
-                                            }
-                                            opener!()
-                                            | closer!()
-                                            | Kind::OpenBrace
-                                            | Kind::CloseBrace => {
-                                                let ended = self.delimit(token.kind, bytes, at);
-                                                if ended {
-                                                    count_lines(self, &mut counted, end);
-                                                    self.boundary(base + end as u64);
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                        at = end;
-                                    }
-                                    Lexed::NeedMore => {
-                                        more = true;
-                                        break;
-                                    }
-                                    // A byte the lexer can't read: skipped, as recovery does.
-                                    Lexed::Error(..) => at += 1,
-                                }
-                            }
-                            if let Some((text, _)) = &mut self.directive {
-                                if at > i + 1 {
-                                    text.extend_from_slice(&bytes[i + 1..at]);
-                                } else {
-                                    // Held before the `\`: its bytes are read again.
-                                    text.truncate(text.len() - (i + 1 - at));
-                                }
-                            }
-                            if more {
-                                held = Some(at);
-                                break;
-                            }
-                            i = at;
-                        }
-                        _ => match delimiter(bytes, i, eof, false) {
-                            Some(Delimiter::Token(kind, len)) => {
-                                if let Some((text, _)) = &mut self.directive {
-                                    text.extend_from_slice(&bytes[i + 1..i + len]);
-                                }
-                                let ended = self.delimit(kind, bytes, i);
-                                i += len;
-                                if ended {
-                                    count_lines(self, &mut counted, i);
-                                    self.boundary(base + i as u64);
-                                }
-                            }
-                            // A `>` or `|` that starts no delimiter: a byte the lexer can't
-                            // read, skipped.
-                            Some(Delimiter::Bad(_)) => i += 1,
-                            Some(Delimiter::NeedMore) => {
-                                if let Some((text, _)) = &mut self.directive {
-                                    text.pop();
-                                }
-                                held = Some(i);
-                                break;
-                            }
-                            // A `<` that starts an IRI.
-                            None => {
-                                self.state = State::Iri;
+                let b = bytes[i];
+                if let Some((text, _)) = &mut self.directive {
+                    text.push(b);
+                }
+                match self.state {
+                    State::Normal => {
+                        if !INTERESTING[b as usize] {
+                            // The fast path: skip to the next byte that matters, up to the held
+                            // word (a directive's text is copied byte by byte above, but
+                            // directives are few).
+                            if self.directive.is_none() && self.start.is_none() {
+                                let rest = &bytes[i + 1..];
+                                let skip = rest
+                                    .iter()
+                                    .position(|&c| INTERESTING[c as usize])
+                                    .unwrap_or(rest.len());
+                                i += 1 + skip;
+                            } else {
                                 i += 1;
                             }
-                        },
-                    }
-                }
-                State::Dot => {
-                    self.state = State::Normal;
-                    // The byte is read again in the normal state (a '#' starts a comment):
-                    // take it back from a directive's text.
-                    if let Some((text, _)) = &mut self.directive {
-                        text.pop();
-                    }
-                    if b.is_ascii_whitespace() || b == b'#' {
-                        count_lines(self, &mut counted, i);
-                        self.boundary(base + i as u64);
-                    }
-                }
-                State::Comment => match memchr::memchr2(b'\n', b'\r', &bytes[i..]) {
-                    Some(k) => {
-                        if let Some((text, _)) = &mut self.directive {
-                            text.extend_from_slice(&bytes[i + 1..i + k + 1]);
+                            continue;
                         }
+                        match b {
+                            b'"' | b'\'' => {
+                                self.state = State::Opening { quote: b, count: 1 };
+                                i += 1;
+                            }
+                            b'#' => {
+                                self.state = State::Comment;
+                                i += 1;
+                            }
+                            b'.' => {
+                                if self.level() {
+                                    self.state = State::Dot;
+                                }
+                                i += 1;
+                            }
+                            b'\\' => {
+                                let (at, more) =
+                                    self.escaped_name(bytes, i, eof, base, &mut counted);
+                                if more {
+                                    held = Some(at);
+                                    break 'scan;
+                                }
+                                i = at;
+                            }
+                            // The delimiters, read by the lexer's `delimiter`.
+                            _ => delimiter_arm!(self, 'scan),
+                        }
+                    }
+                    State::Dot => {
                         self.state = State::Normal;
-                        i += k + 1;
-                    }
-                    None => {
-                        if let Some((text, _)) = &mut self.directive {
-                            text.extend_from_slice(&bytes[i + 1..]);
-                        }
-                        i = n;
-                    }
-                },
-                State::Iri => match memchr::memchr(b'>', &bytes[i..]) {
-                    Some(k) => {
-                        if let Some((text, _)) = &mut self.directive {
-                            text.extend_from_slice(&bytes[i + 1..i + k + 1]);
-                        }
-                        self.state = State::Normal;
-                        i += k + 1;
-                        // A SPARQL-style `PREFIX` or `BASE` ends with its IRI, whatever is open
-                        // (a recovering parser ends a failed one there too).
-                        if matches!(&self.directive, Some((text, false)) if !version(text)) {
-                            let at = base + i as u64;
-                            count_lines(self, &mut counted, i);
-                            self.close_all();
-                            self.boundary(at);
-                        }
-                    }
-                    None => {
-                        if let Some((text, _)) = &mut self.directive {
-                            text.extend_from_slice(&bytes[i + 1..]);
-                        }
-                        i = n;
-                    }
-                },
-                State::Opening { quote, count } => {
-                    if b == quote && count == 1 {
-                        self.state = State::Opening { quote, count: 2 };
-                        i += 1;
-                    } else if b == quote && count == 2 {
-                        self.state = State::Long {
-                            quote,
-                            quotes: 0,
-                            escaped: false,
-                        };
-                        i += 1;
-                    } else {
-                        // The byte is read again in the next state: take it back from a
-                        // directive's text (a `VERSION` string held it twice).
+                        // The byte is read again in the normal state (a '#' starts a comment):
+                        // take it back from a directive's text.
                         if let Some((text, _)) = &mut self.directive {
                             text.pop();
-                            self.string_from = text.len();
                         }
-                        self.state = if count == 2 {
-                            // `""`: the empty string; this byte is after it.
-                            State::Normal
-                        } else {
-                            State::Short {
-                                quote,
-                                escaped: false,
-                            }
-                        };
+                        if b.is_ascii_whitespace() || b == b'#' {
+                            count_lines(self, &mut counted, i);
+                            self.boundary(base + i as u64);
+                        }
                     }
-                }
-                State::Short { quote, escaped } => {
-                    if escaped {
-                        self.state = State::Short {
-                            quote,
-                            escaped: false,
-                        };
-                        i += 1;
-                        continue;
-                    }
-                    match memchr::memchr2(quote, b'\\', &bytes[i..]) {
+                    State::Comment => match memchr::memchr2(b'\n', b'\r', &bytes[i..]) {
                         Some(k) => {
                             if let Some((text, _)) = &mut self.directive {
                                 text.extend_from_slice(&bytes[i + 1..i + k + 1]);
                             }
-                            let closed = bytes[i + k] == quote;
-                            self.state = if closed {
-                                State::Normal
-                            } else {
-                                State::Short {
-                                    quote,
-                                    escaped: true,
-                                }
-                            };
+                            self.state = State::Normal;
                             i += k + 1;
-                            // A SPARQL-style `VERSION` ends with its string (only short
-                            // strings may follow it), whatever is open; only with one the lexer
-                            // reads as a string token (one it can't read, a raw line break in
-                            // it, recovery skips, and the directive goes on to a `.`).
-                            let string_from = self.string_from;
-                            if closed
-                                && matches!(&self.directive, Some((text, false))
-                                    if version(text) && short_string(text, string_from))
-                            {
+                        }
+                        None => {
+                            if let Some((text, _)) = &mut self.directive {
+                                text.extend_from_slice(&bytes[i + 1..]);
+                            }
+                            i = n;
+                        }
+                    },
+                    State::Iri => match memchr::memchr(b'>', &bytes[i..]) {
+                        Some(k) => {
+                            if let Some((text, _)) = &mut self.directive {
+                                text.extend_from_slice(&bytes[i + 1..i + k + 1]);
+                            }
+                            self.state = State::Normal;
+                            i += k + 1;
+                            // A SPARQL-style `PREFIX` or `BASE` ends with its IRI, whatever is open
+                            // (a recovering parser ends a failed one there too).
+                            if matches!(&self.directive, Some((text, false)) if !version(text)) {
                                 let at = base + i as u64;
                                 count_lines(self, &mut counted, i);
                                 self.close_all();
@@ -701,57 +674,156 @@ impl Skimmer {
                             }
                         }
                         None => {
-                            // The string goes on in the next piece: keep this piece's part.
                             if let Some((text, _)) = &mut self.directive {
                                 text.extend_from_slice(&bytes[i + 1..]);
                             }
                             i = n;
                         }
+                    },
+                    State::Opening { quote, count } => {
+                        if b == quote && count == 1 {
+                            self.state = State::Opening { quote, count: 2 };
+                            i += 1;
+                        } else if b == quote && count == 2 {
+                            self.state = State::Long {
+                                quote,
+                                quotes: 0,
+                                escaped: false,
+                            };
+                            i += 1;
+                        } else {
+                            // The byte is read again in the next state: take it back from a
+                            // directive's text (a `VERSION` string held it twice).
+                            if let Some((text, _)) = &mut self.directive {
+                                text.pop();
+                                self.string_from = text.len();
+                            }
+                            self.state = if count == 2 {
+                                // `""`: the empty string; this byte is after it.
+                                State::Normal
+                            } else {
+                                State::Short {
+                                    quote,
+                                    escaped: false,
+                                }
+                            };
+                        }
                     }
-                }
-                State::Long {
-                    quote,
-                    quotes,
-                    escaped,
-                } => {
-                    if escaped {
-                        self.state = State::Long {
-                            quote,
-                            quotes: 0,
-                            escaped: false,
-                        };
-                        i += 1;
-                    } else if b == b'\\' {
-                        self.state = State::Long {
-                            quote,
-                            quotes: 0,
-                            escaped: true,
-                        };
-                        i += 1;
-                    } else if b == quote {
-                        if quotes == 2 {
-                            self.state = State::Normal;
+                    State::Short { quote, escaped } => {
+                        if escaped {
+                            self.state = State::Short {
+                                quote,
+                                escaped: false,
+                            };
+                            i += 1;
+                            continue;
+                        }
+                        match memchr::memchr2(quote, b'\\', &bytes[i..]) {
+                            Some(k) => {
+                                if let Some((text, _)) = &mut self.directive {
+                                    text.extend_from_slice(&bytes[i + 1..i + k + 1]);
+                                }
+                                let closed = bytes[i + k] == quote;
+                                self.state = if closed {
+                                    State::Normal
+                                } else {
+                                    State::Short {
+                                        quote,
+                                        escaped: true,
+                                    }
+                                };
+                                i += k + 1;
+                                // A SPARQL-style `VERSION` ends with its string (only short
+                                // strings may follow it), whatever is open; only with one the lexer
+                                // reads as a string token (one it can't read, a raw line break in
+                                // it, recovery skips, and the directive goes on to a `.`).
+                                let string_from = self.string_from;
+                                if closed
+                                    && matches!(&self.directive, Some((text, false))
+                                    if version(text) && short_string(text, string_from))
+                                {
+                                    let at = base + i as u64;
+                                    count_lines(self, &mut counted, i);
+                                    self.close_all();
+                                    self.boundary(at);
+                                }
+                            }
+                            None => {
+                                // The string goes on in the next piece: keep this piece's part.
+                                if let Some((text, _)) = &mut self.directive {
+                                    text.extend_from_slice(&bytes[i + 1..]);
+                                }
+                                i = n;
+                            }
+                        }
+                    }
+                    State::Long {
+                        quote,
+                        quotes,
+                        escaped,
+                    } => {
+                        if escaped {
+                            self.state = State::Long {
+                                quote,
+                                quotes: 0,
+                                escaped: false,
+                            };
+                            i += 1;
+                        } else if b == b'\\' {
+                            self.state = State::Long {
+                                quote,
+                                quotes: 0,
+                                escaped: true,
+                            };
+                            i += 1;
+                        } else if b == quote {
+                            if quotes == 2 {
+                                self.state = State::Normal;
+                            } else {
+                                self.state = State::Long {
+                                    quote,
+                                    quotes: quotes + 1,
+                                    escaped: false,
+                                };
+                            }
+                            i += 1;
                         } else {
                             self.state = State::Long {
                                 quote,
-                                quotes: quotes + 1,
+                                quotes: 0,
                                 escaped: false,
                             };
-                        }
-                        i += 1;
-                    } else {
-                        self.state = State::Long {
-                            quote,
-                            quotes: 0,
-                            escaped: false,
-                        };
-                        // Skip to the next quote or escape.
-                        match memchr::memchr2(quote, b'\\', &bytes[i..]) {
-                            Some(k) => i += k,
-                            None => i = n,
+                            // Skip to the next quote or escape.
+                            match memchr::memchr2(quote, b'\\', &bytes[i..]) {
+                                Some(k) => i += k,
+                                None => i = n,
+                            }
                         }
                     }
                 }
+            }
+            if n == whole.len() {
+                break;
+            }
+            // At `tail`: the held word, whose bytes end no token (as `tail` is after the last
+            // one that does).
+            match self.state {
+                State::Normal => {
+                    held = Some(i);
+                    break;
+                }
+                // A `.` or an empty string `""` just before it: the word's first byte ends
+                // nothing there, and the word is held.
+                State::Dot | State::Opening { count: 2, .. } => {
+                    self.state = State::Normal;
+                    held = Some(i);
+                    break;
+                }
+                // A token begun before it (a string, an IRI, a comment, or a quote not known to
+                // open an empty string yet) reads on: only a byte that ends a token (a quote, a
+                // `>`, a line break) ends one of them, so none ends in the word, and the normal
+                // state isn't reached again before the input's end.
+                _ => view = whole,
             }
         }
         let read = held.unwrap_or(n);
@@ -850,6 +922,12 @@ mod tests {
             (
                 true,
                 "\u{FEFF}<urn:g> { <urn:s> <urn:p> <urn:o> . }\n<urn:h> { <urn:a> <urn:b> <urn:c> . }\n",
+            ),
+            // Pieces ending right after an empty string or a `.` with a name's byte next, or
+            // inside a string, a long string, a comment: the word held at a piece's end.
+            (
+                false,
+                "<urn:s> <urn:p> \"\"@en . <urn:s> <urn:p> 1.5 . <urn:s> <urn:p> \"\"\"a\"b\"\"c\"\"\" . # c.d\n<urn:s> <urn:p> \"x\\\"y\" . <urn:a> <urn:b> <urn:c> .\n",
             ),
         ];
         for (trig, text) in documents {

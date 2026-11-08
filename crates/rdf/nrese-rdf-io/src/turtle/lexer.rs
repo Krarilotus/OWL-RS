@@ -151,23 +151,107 @@ pub(crate) fn pair(kind: Kind) -> usize {
     }
 }
 
-/// An opener or closer met where a statement is skipped (a failed statement's rest, or the
-/// skimmer's view of a document), applied to what is open there: `open` (pairs, outermost
-/// first) and `counts` (how many of each pair it holds). An opener opens. A closer closes the
-/// innermost open bracket of its own pair, and the unfinished ones opened inside it go with
-/// it; with none of its pair open, it closes nothing. Each bracket is opened and closed once,
-/// and a closer of a pair not open costs O(1): linear work.
-pub(crate) fn bracket(open: &mut Vec<usize>, counts: &mut [usize; 5], kind: Kind) {
-    let pair = pair(kind);
-    if matches!(kind, opener!()) {
-        counts[pair] += 1;
-        open.push(pair);
-    } else if counts[pair] > 0 {
-        while let Some(inner) = open.pop() {
-            counts[inner] -= 1;
-            if inner == pair {
-                break;
-            }
+/// What brackets are open where a statement is skipped (a failed statement's rest, or the
+/// skimmer's view of a document), by pair ([`pair`]): the one rule both apply
+/// ([`Brackets::apply`]). The innermost [`Brackets::LANES`] are kept in one word (3 bits
+/// each, a pair plus one, innermost lowest), the ones below them outermost first in `deep`
+/// with a count per pair. An opener, or a closer of the innermost bracket's pair, is a few
+/// register operations; a closer of another pair looks through at most `LANES` lanes and
+/// `deep`'s counts. Each bracket is opened and closed once: linear work.
+#[derive(Default)]
+pub(crate) struct Brackets {
+    lanes: u64,
+    depth: usize,
+    deep: Vec<u8>,
+    deep_counts: [usize; 5],
+}
+
+impl Brackets {
+    const LANES: usize = 21;
+
+    #[inline(always)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.depth == 0
+    }
+
+    /// How many are open (debug builds' check in `resync`, and tests).
+    #[cfg(any(debug_assertions, test))]
+    pub(crate) fn len(&self) -> usize {
+        self.depth
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.lanes = 0;
+        self.depth = 0;
+        self.deep.clear();
+        self.deep_counts = [0; 5];
+    }
+
+    /// Opens a bracket of `pair`.
+    #[inline(always)]
+    pub(crate) fn push(&mut self, pair: usize) {
+        if self.depth >= Self::LANES {
+            self.spill();
+        }
+        self.lanes = (self.lanes << 3) | (pair as u64 + 1);
+        self.depth += 1;
+    }
+
+    /// The outermost lane goes to `deep`, making room for one more.
+    #[cold]
+    fn spill(&mut self) {
+        let shift = 3 * (Self::LANES - 1);
+        let pair = ((self.lanes >> shift) & 7) as usize - 1;
+        self.deep.push(pair as u8);
+        self.deep_counts[pair] += 1;
+        self.lanes &= (1 << shift) - 1;
+    }
+
+    /// Closes the innermost bracket: its pair.
+    #[inline(always)]
+    fn pop(&mut self) -> usize {
+        let pair = (self.lanes & 7) as usize - 1;
+        self.lanes >>= 3;
+        self.depth -= 1;
+        if self.depth >= Self::LANES {
+            self.refill();
+        }
+        pair
+    }
+
+    /// The innermost of `deep` comes back into the outermost lane.
+    #[cold]
+    fn refill(&mut self) {
+        if let Some(pair) = self.deep.pop() {
+            self.deep_counts[pair as usize] -= 1;
+            self.lanes |= (pair as u64 + 1) << (3 * (Self::LANES - 1));
+        }
+    }
+
+    /// An opener or closer met: an opener opens. A closer closes the innermost open bracket
+    /// of its own pair, and the unfinished ones opened inside it go with it; with none of its
+    /// pair open, it closes nothing.
+    #[inline(always)]
+    pub(crate) fn apply(&mut self, kind: Kind) {
+        let pair = pair(kind);
+        if matches!(kind, opener!()) {
+            self.push(pair);
+        } else if self.depth > 0 && (self.lanes & 7) as usize == pair + 1 {
+            self.pop();
+        } else {
+            self.close_other(pair);
+        }
+    }
+
+    /// A closer whose pair is not the innermost one's.
+    #[cold]
+    #[inline(never)]
+    fn close_other(&mut self, pair: usize) {
+        let in_lanes = self.depth.min(Self::LANES);
+        let open = (0..in_lanes).any(|k| ((self.lanes >> (3 * k)) & 7) as usize == pair + 1)
+            || self.deep_counts[pair] > 0;
+        if open {
+            while self.depth > 0 && self.pop() != pair {}
         }
     }
 }
@@ -254,6 +338,19 @@ pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool, n3: bool) -> Lexe
             }
         };
     }
+    // The delimiter at `start`, as `delimiter` reads it.
+    macro_rules! delimited {
+        () => {
+            match delimiter(input, start, eof, n3) {
+                Some(Delimiter::Token(kind, len)) => {
+                    token(kind, start, start..start + len, start + len)
+                }
+                Some(Delimiter::Bad(message)) => Lexed::Error(start, message),
+                Some(Delimiter::NeedMore) => Lexed::NeedMore,
+                None => unreachable!("a delimiter's byte"),
+            }
+        };
+    }
     match input[start] {
         b'<' if n3 => n3_angle(input, start, eof),
         b'=' if n3 => match need!(1) {
@@ -262,25 +359,26 @@ pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool, n3: bool) -> Lexe
         },
         b'!' if n3 => token(Kind::Bang, start, start..start + 1, start + 1),
         b'?' if n3 => variable(input, start, eof),
-        b'<' | b'>' | b'|' | b'[' | b']' | b'(' | b')' | b'{' | b'}' => {
-            match delimiter(input, start, eof, n3) {
-                Some(Delimiter::Token(kind, len)) => {
-                    token(kind, start, start..start + len, start + len)
-                }
-                Some(Delimiter::Bad(message)) => Lexed::Error(start, message),
-                Some(Delimiter::NeedMore) => Lexed::NeedMore,
-                // A `<` that starts an IRI.
-                None => match memchr::memchr(b'>', &input[start..]) {
-                    Some(k) => {
-                        let text = start + 1..start + k;
-                        let escaped = input[text.clone()].contains(&b'\\');
-                        token(Kind::IriRef { escaped }, start, text, start + k + 1)
-                    }
-                    None if eof => Lexed::Error(start, "an IRI without its closing '>'"),
-                    None => Lexed::NeedMore,
-                },
+        // The delimiters, read by `delimiter` (shared with the skimmer): one arm per byte, so
+        // that its own match on the byte folds away in each.
+        b'<' if need!(1) == Some(b'<') => delimited!(),
+        b'<' => match memchr::memchr(b'>', &input[start..]) {
+            Some(k) => {
+                let text = start + 1..start + k;
+                let escaped = input[text.clone()].contains(&b'\\');
+                token(Kind::IriRef { escaped }, start, text, start + k + 1)
             }
-        }
+            None if eof => Lexed::Error(start, "an IRI without its closing '>'"),
+            None => Lexed::NeedMore,
+        },
+        b'>' => delimited!(),
+        b'|' => delimited!(),
+        b'[' => delimited!(),
+        b']' => delimited!(),
+        b'(' => delimited!(),
+        b')' => delimited!(),
+        b'{' => delimited!(),
+        b'}' => delimited!(),
         b'~' => token(Kind::Tilde, start, start..start + 1, start + 1),
         b'"' | b'\'' => string::<false>(input, start, eof),
         b'_' => match need!(1) {
@@ -856,6 +954,58 @@ fn prefixed_name(input: &[u8], start: usize, colon: usize, eof: bool) -> Lexed {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Brackets` holds what the rule says is open (an opener opens; a closer closes the
+    /// innermost open bracket of its own pair and those inside it, or nothing if none of its
+    /// pair is open), shown by a plain stack of pairs, nested past its lanes too: a sequence
+    /// of pseudo-random openers and closers, mostly openers while it nests deep, then mostly
+    /// closers, many of a pair not innermost or not open at all.
+    #[test]
+    fn brackets_hold_what_the_rule_holds_at_any_depth() {
+        let kinds = [
+            [Kind::OpenBracket, Kind::CloseBracket],
+            [Kind::OpenParen, Kind::CloseParen],
+            [Kind::TripleTermOpen, Kind::TripleTermClose],
+            [Kind::ReifiedOpen, Kind::ReifiedClose],
+            [Kind::AnnotationOpen, Kind::AnnotationClose],
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |below: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % below
+        };
+        let mut brackets = Brackets::default();
+        let mut model: Vec<usize> = Vec::new();
+        let mut deepest = 0;
+        for step in 0..20_000 {
+            // Rounds of 400 steps: openers 19 times in 20 (a closer of a random pair closes
+            // about five), then closers four times in five (down to none open, and closers
+            // with nothing open).
+            let opening = (step / 400) % 2 == 0;
+            let open = if opening { next(20) != 0 } else { next(5) == 0 };
+            let pair = next(5) as usize;
+            let kind = kinds[pair][usize::from(!open)];
+            brackets.apply(kind);
+            if open {
+                model.push(pair);
+            } else if let Some(at) = model.iter().rposition(|&p| p == pair) {
+                model.truncate(at);
+            }
+            deepest = deepest.max(model.len());
+            assert_eq!(brackets.len(), model.len(), "step {step}");
+            assert_eq!(brackets.is_empty(), model.is_empty(), "step {step}");
+        }
+        assert!(deepest > 3 * Brackets::LANES, "nested only {deepest} deep");
+        // Each still-open pair, innermost first, closes exactly its own bracket.
+        while let Some(&pair) = model.last() {
+            brackets.apply(kinds[pair][1]);
+            model.pop();
+            assert_eq!(brackets.len(), model.len());
+        }
+        assert!(brackets.is_empty());
+    }
 
     /// The tokens of a complete input, as (kind, text).
     fn tokens(text: &str) -> Vec<(Kind, String)> {

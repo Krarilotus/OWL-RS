@@ -26,7 +26,7 @@ use nrese_rdf::{
 };
 
 use super::lexer::{
-    Kind, Lexed, Malformed, Opening, Token, bracket, known_missing, lex, malformed, pair,
+    Brackets, Kind, Lexed, Malformed, Opening, Token, known_missing, lex, malformed, pair,
 };
 use crate::blank::BlankNodes;
 use crate::error::{RdfParseError, RdfSyntaxError, SkippedStatement, TextPosition};
@@ -559,7 +559,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     /// After a syntax error: skips to the end of the statement, a `.` outside brackets (or
     /// the `}` closing the TriG block it is in), so that parsing goes on with the next one.
     /// What is open while skipping, readable tokens or not, is one stack of brackets with
-    /// their kinds (see [`bracket`]):
+    /// their kinds (see [`Brackets::apply`]):
     /// - at its bottom, the brackets the statement had open when it failed (`unclosed`),
     ///   so a `.` inside them ends nothing; then its failing token if that was an opener, a
     ///   closer (braces included) or a `.` (`failed`), counted as the first token skipped: a
@@ -584,12 +584,12 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         self.triples.clear();
         self.triple_terms.clear();
         // Outermost first: `unclosed` was noted innermost first, as the error unwound.
-        let mut open = std::mem::take(&mut self.unclosed);
-        open.reverse();
-        let mut counts = [0usize; 5];
-        for &pair in &open {
-            counts[pair] += 1;
+        let mut open = Brackets::default();
+        for &pair in self.unclosed.iter().rev() {
+            open.push(pair);
         }
+        // The allocation is kept for the next failed statement.
+        self.unclosed.clear();
         let failed = self.failed.take();
         // Debug builds: every opener `take` counted is still open in a routine that noted it,
         // or is the failing token; every closer it counted closed its own routine's opener, or
@@ -619,31 +619,16 @@ impl<'a, R: Read> TurtleParser<'a, R> {
         // The failing token counts as the first one skipped: a `}` closing the TriG block
         // ends the statement right there.
         let ended = ending == Ending::Ended
-            || failed.is_some_and(|kind| {
-                self.skip_token(kind, &mut open, &mut counts, &mut braces, &mut ending)
-            });
-        let resumed = if ended {
-            true
-        } else {
-            self.skip_rest(&mut open, &mut counts, &mut braces, &mut ending)
-        };
-        // The allocation is kept for the next failed statement.
-        open.clear();
-        self.unclosed = open;
-        resumed
+            || failed
+                .is_some_and(|kind| self.skip_token(kind, &mut open, &mut braces, &mut ending));
+        ended || self.skip_rest(&mut open, &mut braces, &mut ending)
     }
 
     /// The rest of a failed statement, skipped token by token (`skip_token`) up to its end:
     /// `true` there, `false` at the end of the input or on a read error (see `resync`). A
     /// failed `PREFIX` or `BASE` ends after its next IRI, a failed `VERSION` after its next
     /// short string (`ending`).
-    fn skip_rest(
-        &mut self,
-        open: &mut Vec<usize>,
-        counts: &mut [usize; 5],
-        braces: &mut i64,
-        ending: &mut Ending,
-    ) -> bool {
+    fn skip_rest(&mut self, open: &mut Brackets, braces: &mut i64, ending: &mut Ending) -> bool {
         loop {
             if self.no_closing != [[false; 2]; 2] {
                 let no_closing = self.no_closing;
@@ -696,22 +681,21 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 self.after_string = false;
                 break true;
             }
-            if self.skip_token(token.kind, open, counts, braces, ending) {
+            if self.skip_token(token.kind, open, braces, ending) {
                 break true;
             }
         }
     }
 
     /// One token of a failed statement, its failing token or one of its rest, applied to
-    /// what is open there: brackets (`open` and `counts`, see [`bracket`]), the `{` opened in
-    /// it (`braces`) and the block of a failed graph block's head (`ending`). `true` when it
+    /// what is open there: brackets (`open`, see [`Brackets::apply`]), the `{` opened in it
+    /// (`braces`) and the block of a failed graph block's head (`ending`). `true` when it
     /// ends the statement: the `}` closing the TriG block it is in, or the one its own head
     /// opened (open brackets or not), or a `.` with nothing open outside that block.
     fn skip_token(
         &mut self,
         kind: Kind,
-        open: &mut Vec<usize>,
-        counts: &mut [usize; 5],
+        open: &mut Brackets,
         braces: &mut i64,
         ending: &mut Ending,
     ) -> bool {
@@ -734,7 +718,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 return true;
             }
             Kind::Dot => return open.is_empty() && *braces == 0 && *ending != Ending::Block,
-            opener!() | closer!() => bracket(open, counts, kind),
+            opener!() | closer!() => open.apply(kind),
             _ => {}
         }
         false
