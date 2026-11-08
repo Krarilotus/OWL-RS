@@ -107,6 +107,12 @@ pub(crate) struct Statistics {
     dir: Mutex<Option<std::path::PathBuf>>,
     /// Scans of the store for the sets begun: what the tests count.
     scans: AtomicU64,
+    /// The corpora of reader-scoped searches and their lineage ([`super::corpora`]): made
+    /// by the first such search, so an engine whose searches are all global holds none and
+    /// its commits record nothing. The engine's, shared with the views made from its
+    /// snapshots ([`Self::for_view`]): corpora are kept by the statements' identity, which
+    /// a view has of its own.
+    pub(crate) corpora: super::corpora::Corpora,
     /// Called once by the next build, its first scan published and not begun: what the
     /// tests hold a build with.
     #[cfg(test)]
@@ -169,6 +175,24 @@ type HeavyEntry = (
 const HEAVY_ENTRIES: usize = 256;
 
 impl Statistics {
+    /// Statistics of a view of this engine's snapshots: its own, but this engine's corpora
+    /// of reader-scoped searches.
+    pub(crate) fn for_view(&self) -> Self {
+        Self {
+            corpora: self.corpora.clone(),
+            ..Self::default()
+        }
+    }
+
+    /// Statistics of an engine: with the cell its corpora of reader-scoped searches are
+    /// made in ([`super::corpora::Corpora::engine`]).
+    pub(crate) fn for_engine() -> Self {
+        Self {
+            corpora: super::corpora::Corpora::engine(),
+            ..Self::default()
+        }
+    }
+
     /// The number of distinct subjects and objects of `graphs` in `model` at `version`:
     /// cached, or computed by `count` (`None`: it can't be, and nothing is kept).
     pub(crate) fn node_count(
