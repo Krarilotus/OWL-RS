@@ -13,7 +13,7 @@ other's builds and one job's cleanup removed another's volumes (office-pc, 19 Oc
                          A-B-B-A job's base and head)
     labels(root, owner)  docker --label arguments: nrese.ns, nrese.checkout (the checkout's path:
                          the host's sweep leaves a resource whose checkout still exists) and
-                         nrese.owner (the tool that made it: a tool's own cleanup)
+                         nrese.owner (tool cleanup), plus fleet.job=FLEET_JOB when set
     name_args(...)       `--name NAME` with the labels, for `docker run`
     volume(action, ...)  a `docker volume` command: create (labelled), rm, inspect
     directory(base, kind, root)   a job's own directory under a shared one (a kit's binaries,
@@ -78,8 +78,9 @@ def name(kind: str, root: Path | str, environ: dict | None = None) -> str:
 
 
 def labels(root: Path | str, owner: str, environ: dict | None = None) -> list[str]:
+    job = (os.environ if environ is None else environ).get("FLEET_JOB")
     return ["--label", f"{LABEL_NS}={namespace(root, environ)}", "--label", f"{LABEL_CHECKOUT}={checkout_path(root)}",
-            "--label", f"{LABEL_OWNER}={owner}"]
+            "--label", f"{LABEL_OWNER}={owner}"] + (["--label", f"fleet.job={job}"] if job else [])
 
 
 def name_args(container: str, root: Path | str, owner: str, environ: dict | None = None) -> list[str]:
