@@ -58,7 +58,7 @@ pub fn validate<V: ReadView + Sync>(
     data: Selection,
     resources: &Resources,
 ) -> Result<ValidationReport, QueryEvaluationError> {
-    let (raw, failures, held) = validate::validate_raw(view, shapes, data, resources, None)?;
+    let (raw, failures, held) = validate::validate_raw(view, shapes, data, resources)?;
     let report = report::decode(view, shapes, &raw, failures, resources);
     // The raw results are freed, then their charge returned.
     drop(raw);

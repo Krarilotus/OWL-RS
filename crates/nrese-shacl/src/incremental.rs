@@ -65,12 +65,13 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     let graph_after = GraphView::new(after, data);
     let sub_class_of = graph_after.iri(RDFS_SUB_CLASS_OF);
     let classes_moved = sub_class_of.is_some_and(|p| changed.iter().any(|q| q.predicate == p));
-    // The state before's failures are thrown away: none is made or charged.
-    let validator_before = Validator::discarding_failures(before, shapes, data, resources);
-    // Both states tell a query's terms stored or computed by the state before's dictionary:
+    // Both states tell a query's terms stored or computed by the state after's dictionary:
     // one term, one form in both ([`ResultTerm`]).
-    let frontier = |term: &Term| graph_before.lookup(term);
-    let validator_after = Validator::new(after, shapes, data, resources).with_frontier(&frontier);
+    let frontier = |term: &Term| graph_after.lookup(term);
+    // The state before's failures are thrown away: none is made or charged.
+    let validator_before =
+        Validator::discarding_failures(before, shapes, data, resources).with_frontier(&frontier);
+    let validator_after = Validator::new(after, shapes, data, resources);
     let mut introduced: BTreeSet<RawResult> = BTreeSet::new();
     if !changed.is_empty() {
         let rdf_type = graph_after.iri(RDF_TYPE);
@@ -172,25 +173,18 @@ pub fn validate_shapes_change<A: ReadView + Sync, B: ReadView + Sync>(
     data: Selection,
     resources: &Resources,
 ) -> Result<ValidationReport, QueryEvaluationError> {
-    // Both states tell a query's terms stored or computed by the state before's dictionary.
-    let graph_before = GraphView::new(before, data);
-    let frontier = |term: &Term| graph_before.lookup(term);
-    let (raw, failures, held_after) = validate::validate_raw(
-        after,
-        shapes_after,
-        data,
-        resources,
-        shapes_before
-            .is_some()
-            .then_some(&frontier as &validate::Frontier<'_>),
-    )?;
+    let (raw, failures, held_after) = validate::validate_raw(after, shapes_after, data, resources)?;
     // Declared after their charge, so dropped before it, whatever the outcome.
     let mut later = raw;
     if let Some(shapes_before) = shapes_before
         && !later.is_empty()
     {
+        // Both states tell a query's terms stored or computed by the state after's
+        // dictionary, which the state after's own ids (its shapes' paths included) are of.
+        let graph_after = GraphView::new(after, data);
+        let frontier = |term: &Term| graph_after.lookup(term);
         let (earlier, held_before) =
-            validate::validate_raw_results(before, shapes_before, data, resources)?;
+            validate::validate_raw_results(before, shapes_before, data, resources, &frontier)?;
         let kept = introduced(&earlier, shapes_before, later, shapes_after, resources);
         // The earlier results are freed, then their charge returned.
         drop(earlier);
