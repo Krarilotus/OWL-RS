@@ -1278,6 +1278,42 @@ fn existentials_feeding_a_transitive_role_miss_with_the_flag() {
     }
 }
 
+/// An existential under a universal on the right makes anonymous individuals no
+/// generating axiom types (I24b): with `C ⊑ ∀R.(∃S.A)`, `c : C` and `R(c, x)`, `x` has an
+/// `S`-successor in `A` (OWL 2 Direct Semantics), so `ASK { :x :S ?y . ?y a :A }` and
+/// `ASK { ?y a :A }` are entailed. `∀` on the right is outside OWL 2 QL (OWL 2 Profiles
+/// §3.2), so neither closure need find them; then the status the store reports must not be
+/// `complete` (docs/design/ql-rewriting.md §7).
+#[test]
+fn existentials_under_a_universal_are_answered_or_reported() {
+    let turtle = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         :C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ; owl:allValuesFrom
+             [ a owl:Restriction ; owl:onProperty :S ; owl:someValuesFrom :A ] ] .
+         :c a :C ; :R :x ."
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mut wrong = Vec::new();
+    for ruleset in [Ruleset::Owl2Rl, Ruleset::Owl2Ql] {
+        let store = store(&turtle, dir.path(), ruleset, true);
+        for query in [
+            format!("ASK {{ <{E}x> <{E}S> ?y . ?y a <{E}A> }}"),
+            format!("ASK {{ ?y a <{E}A> }}"),
+        ] {
+            let result = store
+                .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let answer = String::from_utf8(result.payload).unwrap();
+            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+            if !answer.contains("true") && matches!(status, "complete" | "none") {
+                wrong.push(format!("{}, {query}: {answer}, {status}", ruleset.name()));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A rewritten query reads only what its reader may (design §1), and uses the schema as
 /// the RL closure the reader sees was computed: a reader who sees the inferences its graphs
 /// support (`inferred = "supported"`) gets the existentials of readable graphs only, one who
