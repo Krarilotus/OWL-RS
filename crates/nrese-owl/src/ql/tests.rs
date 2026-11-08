@@ -1012,3 +1012,18 @@ fn outside_ql_irreflexivity_and_asymmetry_conclude_nothing() {
     let p = table.iri("http://e/p").expect(":p");
     assert!(!irreflexive.has_concerns(), "{:?}", irreflexive.concern(p));
 }
+
+/// An uncovered axiom that equates individuals makes the hazard global even where no term
+/// names it (master, 8 Nov 13:15): a global hazard reaches every term, so it needs none of
+/// its own. The reader gives every equating form a property, class or individual; an empty
+/// `SameIndividual`, built here directly, is one `label` can't name.
+#[test]
+fn outside_ql_an_unnamed_equating_axiom_is_global() {
+    let mut ontology = crate::mapping::Ontology::default();
+    ontology
+        .axioms
+        .push(crate::model::Axiom::SameIndividual(Vec::new()));
+    ontology.sources = vec![Vec::new()];
+    let tbox = Tbox::compile(&ontology, Closure { lists: false }, None);
+    assert!(tbox.global_hazard().is_some(), "no global hazard");
+}
