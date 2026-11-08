@@ -237,6 +237,69 @@ class LoadedInputs(unittest.TestCase):
                 self.assertIn("faster", text)
                 self.assertNotIn("input unknown", text)
 
+    LUBM = {"lubm-10.nt": "85b6ccc3" + "0" * 56, "univ-bench.nt": "u" * 64}
+
+    def two_cases(self, ms, lubm_inputs, status="ok", **fields):
+        """A report of an external-input case (rdfs-full-lubm10: its inputs as given, ABSENT for a report
+        before 7 Nov 2026) beside an unchanged generated-data one (rl-hierarchy), two repetitions each."""
+        records = []
+        for rep in (1, 2):
+            lubm = {"case": "rdfs-full-lubm10", "rep": rep, "status": status, "samples": {"reason.p50_ms": [ms, ms]},
+                    "metric": ms, **fields}
+            if lubm_inputs is not self.ABSENT:
+                lubm["inputs"] = lubm_inputs
+            records += [lubm, {"case": "rl-hierarchy", "rep": rep, "status": "ok", "inputs": {},
+                               "samples": {"reason.p50_ms": [10.0, 10.0]}, "metric": 10.0}]
+        return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
+                "started": "2026-11-07T16:00:00", "records": records}
+
+    def test_an_input_refused_case_s_status_is_still_judged(self):
+        """The master, 8 Nov 2026 (declared-metrics r4's merge note, as R3-F1 in #135): refusing a
+        case's verdict for its input dropped all its records, so a report from before 7 Nov (no
+        `inputs`) against a new one hid the external-input case's status: ok -> failed, beside an
+        unchanged generated-data case, came out exit 0. Specified: an input refusal withholds the
+        case's measures, never its status, checks or answers; a failure found is 1."""
+        base, new = self.two_cases(100.0, self.ABSENT), self.two_cases(50.0, self.LUBM, status="failed")
+        with tempfile.TemporaryDirectory() as d:  # the public entry point (fast.py / suite.py compare)
+            old_path, new_path = Path(d) / "base.json", Path(d) / "new.json"
+            old_path.write_text(json.dumps(base), encoding="utf-8")
+            new_path.write_text(json.dumps(new), encoding="utf-8")
+            self.assertEqual(compare.main([str(old_path), str(new_path)]), 1)
+            text = output(compare.main, [str(old_path), str(new_path)])
+        self.assertIn("rdfs-full-lubm10", text)
+        self.assertIn("CHANGED", text)
+        self.assertIn("input unknown", text)
+        # Every case of a side refused for its input, one failing: the failure is found, 1, not 2.
+        code, text = self.compare(self.reps(100.0, [self.ABSENT, self.ABSENT], "rdfs-full-lubm10"),
+                                  {**self.reps(50.0, [self.LUBM, self.LUBM], "rdfs-full-lubm10"),
+                                   "records": [{**r, "status": "failed"} for r in
+                                               self.reps(50.0, [self.LUBM, self.LUBM], "rdfs-full-lubm10")["records"]]})
+        self.assertEqual(code, 1, text)
+        self.assertIn("CHANGED", text)
+
+    def test_an_input_refused_case_s_answers_are_still_compared(self):
+        """As above: rows that differ from the baseline's are a finding about the new run, whatever the
+        input; the case's time stays uncompared."""
+        code, text = self.compare(self.two_cases(100.0, self.ABSENT, answers={"q1": 5}),
+                                  self.two_cases(50.0, self.LUBM, answers={"q1": 7}))
+        self.assertEqual(code, 1, text)
+        self.assertIn("ANSWERS DIFFER", text)
+        self.assertNotIn("faster", text)
+
+    def test_an_input_refused_case_gets_no_measure_verdict(self):
+        """Review r1 of pkg/stage-data, R1-W1 (7 Nov 2026): time AND memory verdicts across other input
+        bytes are no evidence of a code change; work counters and throughput alike. A case refused for
+        its input is judged in status, checks and answers only: a peak twice as high or more work over
+        other bytes is no regression. (A guard: on the record filter's code these records never reached
+        the comparison, so this held there too.)"""
+        code, text = self.compare(
+            self.two_cases(100.0, self.ABSENT, peak_mib=1000, memory_kind="lifetime", counters={"rows": 10}),
+            self.two_cases(300.0, self.LUBM, peak_mib=2000, memory_kind="lifetime", counters={"rows": 100}))
+        self.assertEqual(code, 0, text)
+        self.assertNotIn("MORE MEMORY", text)
+        self.assertNotIn("MORE WORK", text)
+        self.assertNotIn("SLOWER", text)
+
     def test_a_case_s_agreeing_records_compare_and_one_silent_record_doesn_t(self):
         """A case that loads frozen files: every record stating the same bytes on both sides compares;
         one record that doesn't say makes its side unknown (R3-W1's correction: no record's
