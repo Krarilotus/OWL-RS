@@ -213,31 +213,59 @@ fn parent_of(group: &str) -> Option<&str> {
     }
 }
 
-/// The process's id, as `/proc/self/stat` gives it: in the process's own pid namespace, the
-/// one a group's `cgroup.procs` lists it in when the process reads it.
-fn pid(read: &impl Fn(&str) -> io::Result<String>) -> Result<u64, Unknown> {
-    let stat = read("/proc/self/stat").map_err(|_| Unknown)?;
-    let id = stat.split_whitespace().next().ok_or(Unknown)?;
-    id.parse().map_err(|_| Unknown)
+/// A group's directory as the process reaches it, and the group: what its files are read
+/// through.
+struct Place<'m> {
+    mounts: &'m [Mount],
+    dir: String,
+    group: String,
+}
+
+impl Place<'_> {
+    /// The path of the group's file `name`, where that path resolves to the group's file: a
+    /// single file bound over it (mount(2) binds files too) is another group's (sol-loop r6
+    /// S1). `Unknown` otherwise: the path claims the group's file and isn't it.
+    fn file(&self, name: &str) -> Result<String, Unknown> {
+        let name = format!("/{name}");
+        let path = join(&self.dir, &name);
+        let expected = join(&self.group, &name);
+        match group_at(self.mounts, &path) {
+            Some(found) if found == expected => Ok(path),
+            _ => Err(Unknown),
+        }
+    }
 }
 
 /// Of `paths` to the process's group, one that is the process's own: its `cgroup.procs` lists
 /// the process (a process is in one group of a hierarchy), and, in v2, it has
-/// `cgroup.controllers`, which only v2 groups have. A path that can't be read so isn't one.
-fn own(
+/// `cgroup.controllers`, which only v2 groups have; both read where they are the group's own.
+/// The process's id is `getpid`'s, in the pid namespace it runs in: `cgroup.procs` lists ids
+/// in its reader's namespace (cgroup.c, cgroup_procs_show), which a /proc mounted from another
+/// namespace doesn't show (sol-loop r6 S2). A path that can't be read so isn't one.
+fn own<'m>(
     read: &impl Fn(&str) -> io::Result<String>,
     files: &Files,
-    paths: Vec<String>,
-    pid: u64,
-) -> Option<String> {
-    paths.into_iter().find(|path| {
-        let lists = read(&format!("{path}/cgroup.procs")).is_ok_and(|procs| {
-            procs
-                .lines()
-                .any(|line| line.trim().parse::<u64>() == Ok(pid))
-        });
-        lists && (files.v1 || read(&format!("{path}/cgroup.controllers")).is_ok())
-    })
+    mounts: &'m [Mount],
+    group: &str,
+) -> Option<Place<'m>> {
+    let pid = u64::from(std::process::id());
+    let reads =
+        |place: &Place<'_>, name: &str| place.file(name).ok().and_then(|path| read(&path).ok());
+    views(mounts, group)
+        .into_iter()
+        .map(|dir| Place {
+            mounts,
+            dir,
+            group: group.to_owned(),
+        })
+        .find(|place| {
+            let lists = reads(place, "cgroup.procs").is_some_and(|procs| {
+                procs
+                    .lines()
+                    .any(|line| line.trim().parse::<u64>() == Ok(pid))
+            });
+            lists && (files.v1 || reads(place, "cgroup.controllers").is_some())
+        })
 }
 
 /// A mountinfo field as the path it names: proc(5) writes space, tab, newline and backslash
@@ -276,31 +304,29 @@ fn under<'a>(path: &'a str, root: &str) -> Option<&'a str> {
 /// `each` couldn't read what it needs.
 fn limited(
     read: &impl Fn(&str) -> io::Result<String>,
-    mut each: impl FnMut(&Files, &str, u64) -> Result<(), Unknown>,
+    mut each: impl FnMut(&Files, &Place<'_>, u64) -> Result<(), Unknown>,
 ) -> Result<(), Unknown> {
     let Some(Group { files, path }) = group(read)? else {
         return Ok(());
     };
     let text = read("/proc/self/mountinfo").map_err(|_| Unknown)?;
     let mounts = mounts(&text, files).ok_or(Unknown)?;
-    let pid = pid(read)?;
-    let mut dir = own(read, files, views(&mounts, &path), pid).ok_or(Unknown)?;
-    let mut group = path;
+    let mut place = own(read, files, &mounts, &path).ok_or(Unknown)?;
     if files.v1 {
         // The kernel's own least limit over the whole hierarchy, groups above a namespace
         // included, which the walk below can't see (since Linux 2.6.29).
-        if let Some(limit) = hierarchical(read, &dir)?.filter(|&limit| limit < NONE_ABOVE) {
-            each(files, &dir, limit)?;
+        if let Some(limit) = hierarchical(read, &place)?.filter(|&limit| limit < NONE_ABOVE) {
+            each(files, &place, limit)?;
         }
     }
     loop {
-        match read(&format!("{dir}/{}", files.limit)) {
+        match read(&place.file(files.limit)?) {
             Ok(text) => {
                 let text = text.trim();
                 if text != "max" {
                     let limit: u64 = text.parse().map_err(|_| Unknown)?;
                     if limit < NONE_ABOVE {
-                        each(files, &dir, limit)?;
+                        each(files, &place, limit)?;
                     }
                 }
             }
@@ -309,18 +335,21 @@ fn limited(
             Err(error) if error.kind() == ErrorKind::NotFound && !files.v1 => {}
             Err(_) => return Err(Unknown),
         }
-        let Some(up) = parent_of(&group) else {
+        let Some(up) = parent_of(&place.group) else {
             return Ok(());
         };
         let up = up.to_owned();
         // No path reaches it (above every mount's root, or hidden by a mount over its path): not
         // visible to the process, as above a namespace, so nothing above it is read (the
         // orchestrator, 8 Nov 02:28: option 1 of IB2001-2a56 covers it).
-        let Some(path) = views(&mounts, &up).into_iter().next() else {
+        let Some(dir) = views(&mounts, &up).into_iter().next() else {
             return Ok(());
         };
-        dir = path;
-        group = up;
+        place = Place {
+            mounts: &mounts,
+            dir,
+            group: up,
+        };
     }
 }
 
@@ -329,9 +358,9 @@ fn limited(
 /// can't be read or the value makes no sense.
 fn hierarchical(
     read: &impl Fn(&str) -> io::Result<String>,
-    dir: &str,
+    place: &Place<'_>,
 ) -> Result<Option<u64>, Unknown> {
-    let stat = match read(&format!("{dir}/memory.stat")) {
+    let stat = match read(&place.file("memory.stat")?) {
         Ok(stat) => stat,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(Unknown),
@@ -362,13 +391,13 @@ pub(super) fn limit(read: &impl Fn(&str) -> io::Result<String>) -> Result<Option
 /// taken off, which leaves less, never more. `None`: no group has a limit.
 pub(super) fn left(read: &impl Fn(&str) -> io::Result<String>) -> Result<Option<u64>, Unknown> {
     let mut least = None;
-    limited(read, |files, dir, limit| {
+    limited(read, |files, place, limit| {
         let number = |text: &str| text.trim().parse::<u64>().ok();
-        let usage = read(&format!("{dir}/{}", files.usage))
+        let usage = read(&place.file(files.usage)?)
             .ok()
             .and_then(|text| number(&text))
             .ok_or(Unknown)?;
-        let inactive = read(&format!("{dir}/memory.stat"))
+        let inactive = read(&place.file("memory.stat")?)
             .ok()
             .and_then(|stat| {
                 stat.lines().find_map(|line| {
