@@ -1274,6 +1274,9 @@ struct Context<'a> {
     /// The name to pin the next part evaluated under: the query's whole pattern
     /// ([`Context::eval_root`]).
     pin: RefCell<Option<crate::cache::PinRequest>>,
+    /// [`QueryOptions::search_scope`]: what the searches rank and select among, chosen once
+    /// per search before its scan ([`search::SearchIn`]).
+    search_scope: crate::SearchScope,
 }
 
 /// The active graph of triple patterns.
@@ -1447,6 +1450,7 @@ impl<'a> Context<'a> {
             equality_closed: options.equality_closed,
             cache: None,
             pin: RefCell::default(),
+            search_scope: options.search_scope,
         };
         if let Some(cache) = &options.result_cache {
             // Besides the context's options, a result depends on the base IRI (`IRI()`)

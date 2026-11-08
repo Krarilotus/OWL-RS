@@ -168,8 +168,25 @@ impl<'e> Transaction<'e> {
                 && self.base.stack_contains(Stack::Inferred, quad)
         }));
         let base = self.base.version();
+        let content = super::Content::fresh();
+        if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
+            let changed = [
+                &asserted_inserts,
+                &asserted_deletes,
+                &inferred_inserts,
+                &inferred_deletes,
+            ];
+            corpora.record(
+                base.content,
+                content,
+                changed
+                    .into_iter()
+                    .flatten()
+                    .map(|quad| (quad.subject, quad.predicate, quad.object)),
+            );
+        }
         let version = Version {
-            content: super::Content::fresh(),
+            content,
             asserted: base
                 .asserted
                 .with_delta(&asserted_inserts, &asserted_deletes),
@@ -211,8 +228,19 @@ impl<'e> Transaction<'e> {
         gone.dedup();
         let asserted_inserts: Vec<EncodedQuad> = self.asserted.inserts.iter().copied().collect();
         let asserted_deletes: Vec<EncodedQuad> = self.asserted.deletes.iter().copied().collect();
+        let content = super::Content::fresh();
+        if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
+            corpora.record(
+                seen.content,
+                content,
+                [&asserted_inserts, &asserted_deletes, &gone]
+                    .into_iter()
+                    .flatten()
+                    .map(|quad| (quad.subject, quad.predicate, quad.object)),
+            );
+        }
         let version = Version {
-            content: super::Content::fresh(),
+            content,
             asserted: seen
                 .asserted
                 .with_delta(&asserted_inserts, &asserted_deletes),
@@ -575,11 +603,17 @@ impl Inner {
                 .is_none_or(|index| index.layout() == asserted_layout)
         );
         let revision = record.revision;
+        // The contents published from and to, for reader-scoped searches' lineage
+        // ([`super::corpora`]), recorded once the publication's locks are let go.
+        let published = std::cell::Cell::new(None);
+        let published_to = &published;
         let publish = move |current: &Version, committed: Option<u64>| {
             debug_assert_eq!(current.revision + 1, revision, "single writer");
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
+            let content = super::Content::fresh();
+            published_to.set(Some((current.content, content)));
             Version {
-                content: super::Content::fresh(),
+                content,
                 asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,
@@ -629,6 +663,25 @@ impl Inner {
                 0
             }
         };
+        // What the commit touched, where reader-scoped searches keep corpora: under the
+        // writer slot (steps are recorded in commit order), after the publication's locks.
+        // A search of the new version meanwhile finds no step and walks.
+        if let (Some(corpora), Some((parent, child))) =
+            (shared.statistics.corpora.get(), published.get())
+        {
+            let quads = record.inserts.iter().chain(&record.deletes);
+            let triples = record
+                .inferred_inserts
+                .iter()
+                .chain(&record.inferred_deletes);
+            corpora.record(
+                parent,
+                child,
+                quads
+                    .map(|q| (q.subject, q.predicate, q.object))
+                    .chain(triples.map(|t| (t.subject, t.predicate, t.object))),
+            );
+        }
         // After the commit's own compaction slot (a conversion's): compacting takes it.
         drop(_compaction);
         self.after_commit(wal_bytes);
