@@ -7,7 +7,6 @@
 
 use super::*;
 use std::collections::HashMap;
-use std::io::ErrorKind;
 
 const G: u64 = 1 << 30;
 
@@ -53,10 +52,7 @@ const V1_MOUNT: &str = concat!(
 /// A file system: `/proc/meminfo` as [`MEMINFO`] and `/proc/self/stat` as [`STAT`] unless
 /// `files` says otherwise, the other `files`, and `denied` (if not empty) refused
 /// (permission); any other file is not found.
-fn system(
-    files: &[(&str, &str)],
-    denied: &'static str,
-) -> impl Fn(&str) -> std::io::Result<String> {
+fn system(files: &[(&str, &str)], denied: &str) -> cgroup::declared::Declared {
     let mut map: HashMap<String, String> = HashMap::from([
         ("/proc/meminfo".to_owned(), MEMINFO.to_owned()),
         ("/proc/self/stat".to_owned(), stat()),
@@ -68,14 +64,7 @@ fn system(
             map.insert((*path).to_owned(), (*text).to_owned());
         }
     }
-    move |path| {
-        if !denied.is_empty() && path == denied {
-            return Err(ErrorKind::PermissionDenied.into());
-        }
-        map.get(path)
-            .cloned()
-            .ok_or_else(|| ErrorKind::NotFound.into())
-    }
+    cgroup::declared::Declared::new(map, denied)
 }
 
 /// A row: its name, the files the process sees, one it may not read (or ""), and what the
@@ -92,8 +81,8 @@ type Row<'a> = (
 fn check(rows: Vec<Row<'_>>) {
     let mut wrong = Vec::new();
     for (name, files, denied, available, remaining) in rows {
-        let read_available = linux_available(system(&files, denied));
-        let read_remaining = linux_remaining(system(&files, denied));
+        let read_available = linux_available(&system(&files, denied));
+        let read_remaining = linux_remaining(&system(&files, denied));
         if (read_available, read_remaining) != (available, remaining) {
             wrong.push(format!(
                 "{name}: available {read_available:?}, expected {available:?}; \
@@ -527,6 +516,89 @@ fn a_group_is_read_wherever_the_kernel_shows_it() {
             Some(2 * G - G / 2),
         ),
     ]);
+}
+
+/// A kernel that shows no mount ids (`/proc/self/fdinfo` has `mnt_id` from Linux 3.15) can't
+/// say which mount a file was reached through, so a limit that may apply is unknown; the same
+/// files with mount ids read as the group's 4 GiB.
+#[test]
+fn without_mount_ids_a_limit_is_unknown() {
+    let four = (4 * G).to_string();
+    let files = vec![
+        ("/proc/self/mountinfo", V2_MOUNT),
+        ("/proc/self/cgroup", "0::/app.slice"),
+        ("/sys/fs/cgroup/app.slice/cgroup.controllers", "memory"),
+        ("/sys/fs/cgroup/app.slice/cgroup.procs", procs()),
+        ("/sys/fs/cgroup/app.slice/memory.max", four.as_str()),
+        ("/sys/fs/cgroup/app.slice/memory.current", "0"),
+    ];
+    let shown = system(&files, "");
+    let mut hidden = system(&files, "");
+    hidden.no_mount_ids = true;
+    assert_eq!(
+        (linux_available(&shown), linux_available(&hidden)),
+        (Some(4 * G), None)
+    );
+    assert_eq!(
+        (linux_remaining(&shown), linux_remaining(&hidden)),
+        (Some(4 * G), None)
+    );
+}
+
+/// The kernel's own answers where the test runs, a fleet host's job among them: the process's
+/// memory group is found through a view, its `cgroup.procs` (or `cgroup.threads`) lists the
+/// process, and its limits are read. Where a plain view of the whole v2 hierarchy is mounted at
+/// /sys/fs/cgroup and the group is below the namespace's root, the limit read is the least
+/// `memory.max` on the group's path, read there directly. A host whose kernel shows the process
+/// no memory hierarchy fails by that name rather than passing.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_kernel_shows_the_process_its_own_group() {
+    let membership = std::fs::read_to_string("/proc/self/cgroup").expect("/proc/self/cgroup");
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").expect("/proc/self/mountinfo");
+    let v1 = membership.lines().find(|line| {
+        line.split(':')
+            .nth(1)
+            .is_some_and(|c| c.split(',').any(|c| c == "memory"))
+    });
+    let v2 = membership.lines().find_map(|line| line.strip_prefix("0::"));
+    assert!(
+        v1.is_some() || v2.is_some(),
+        "no cgroup memory hierarchy on this host: /proc/self/cgroup reads {membership:?}"
+    );
+    let limit = cgroup::limit(&cgroup::Kernel);
+    let left = cgroup::left(&cgroup::Kernel);
+    eprintln!("membership {membership:?}; limit {limit:?}; left {left:?}");
+    assert!(
+        limit.is_ok() && left.is_ok(),
+        "own group not found, listed or read: limit {limit:?}, left {left:?}; \
+         /proc/self/cgroup {membership:?}; mountinfo {mounts:?}"
+    );
+    // The independent reading: a plain whole-hierarchy view, no step above the root.
+    let plain = mounts.lines().any(|line| {
+        let fields: Vec<&str> = line.split(' ').collect();
+        fields.get(3) == Some(&"/")
+            && fields.get(4) == Some(&"/sys/fs/cgroup")
+            && line.contains(" - cgroup2 ")
+    });
+    match v2.map(str::trim) {
+        Some(path) if v1.is_none() && plain && !path.split('/').any(|name| name == "..") => {
+            let mut at = String::from("/sys/fs/cgroup");
+            let mut least: Option<u64> = None;
+            for name in std::iter::once("").chain(path.split('/').filter(|n| !n.is_empty())) {
+                if !name.is_empty() {
+                    at = format!("{at}/{name}");
+                }
+                let value = std::fs::read_to_string(format!("{at}/memory.max"))
+                    .ok()
+                    .and_then(|text| text.trim().parse::<u64>().ok());
+                least = super::least([least, value]);
+            }
+            eprintln!("read directly at /sys/fs/cgroup{path}: {least:?}");
+            assert_eq!(limit, Ok(least));
+        }
+        _ => eprintln!("no plain v2 view of the group: the direct reading isn't made"),
+    }
 }
 
 /// A mount another one covers isn't a view (sol-loop r3 S1; proc_pid_mountinfo(5) lists covered

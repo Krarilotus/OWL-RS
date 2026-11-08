@@ -679,11 +679,11 @@ mod imp {
     }
 
     pub fn available_bytes() -> Option<u64> {
-        super::linux_available(|path| std::fs::read_to_string(path))
+        super::linux_available(&super::cgroup::Kernel)
     }
 
     pub fn remaining_bytes() -> Option<u64> {
-        super::linux_remaining(|path| std::fs::read_to_string(path))
+        super::linux_remaining(&super::cgroup::Kernel)
     }
 }
 
@@ -823,21 +823,21 @@ fn meminfo_bytes(text: &str, field: &str) -> Option<u64> {
 }
 
 /// The memory a Linux process may use: the least of the machine's `MemTotal` and its cgroups'
-/// limits ([`cgroup::limit`]); `None` where either isn't known, not the machine's alone.
-/// `read` reads a file's text.
+/// limits ([`cgroup::limit`]); `None` where either isn't known, not the machine's alone. `fs`
+/// answers as the kernel does ([`cgroup::Kernel`]).
 #[cfg(any(target_os = "linux", test))]
-fn linux_available(read: impl Fn(&str) -> std::io::Result<String>) -> Option<u64> {
-    let machine = meminfo_bytes(&read("/proc/meminfo").ok()?, "MemTotal:")?;
-    least([Some(machine), cgroup::limit(&read).ok()?])
+fn linux_available(fs: &impl cgroup::Fs) -> Option<u64> {
+    let machine = meminfo_bytes(&fs.text("/proc/meminfo").ok()?, "MemTotal:")?;
+    least([Some(machine), cgroup::limit(fs).ok()?])
 }
 
 /// The memory a Linux process could still take: the least of the machine's `MemAvailable`
 /// and what its cgroups leave ([`cgroup::left`]); `None` where either isn't known, not the
-/// other alone. `read` reads a file's text.
+/// other alone.
 #[cfg(any(target_os = "linux", test))]
-fn linux_remaining(read: impl Fn(&str) -> std::io::Result<String>) -> Option<u64> {
-    let machine = meminfo_bytes(&read("/proc/meminfo").ok()?, "MemAvailable:")?;
-    least([Some(machine), cgroup::left(&read).ok()?])
+fn linux_remaining(fs: &impl cgroup::Fs) -> Option<u64> {
+    let machine = meminfo_bytes(&fs.text("/proc/meminfo").ok()?, "MemAvailable:")?;
+    least([Some(machine), cgroup::left(fs).ok()?])
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1020,7 +1020,7 @@ mod tests {
             )
         };
         let remaining = |meminfo: Option<String>, own: Option<&str>| {
-            linux_remaining(system(&files, meminfo.as_deref(), own))
+            linux_remaining(&system(&files, meminfo.as_deref(), own))
         };
         let v2 = Some("0::/app.slice/run.scope");
         assert_eq!(remaining(Some(meminfo(20 * G)), v2), Some(3 * G));
@@ -1079,22 +1079,22 @@ mod tests {
             .collect()
     }
 
-    /// A file system of `files` for the readers, with `/proc/meminfo` and `/proc/self/cgroup`
-    /// as given: a file it doesn't have is not found.
-    fn system<'a>(
-        files: &'a std::collections::HashMap<String, String>,
-        meminfo: Option<&'a str>,
-        own: Option<&'a str>,
-    ) -> impl Fn(&str) -> std::io::Result<String> + 'a {
-        move |path| {
-            let text = match path {
-                "/proc/meminfo" => meminfo.map(str::to_owned),
-                "/proc/self/cgroup" => own.map(str::to_owned),
-                "/proc/self/stat" => Some(stat()),
-                _ => files.get(path).cloned(),
+    /// The kernel's answers for `files`, with `/proc/meminfo` and `/proc/self/cgroup` as given:
+    /// a file it doesn't have is not found.
+    fn system(
+        files: &std::collections::HashMap<String, String>,
+        meminfo: Option<&str>,
+        own: Option<&str>,
+    ) -> cgroup::declared::Declared {
+        let mut files = files.clone();
+        files.insert("/proc/self/stat".to_owned(), stat());
+        for (path, text) in [("/proc/meminfo", meminfo), ("/proc/self/cgroup", own)] {
+            match text {
+                Some(text) => files.insert(path.to_owned(), text.to_owned()),
+                None => files.remove(path),
             };
-            text.ok_or_else(|| std::io::ErrorKind::NotFound.into())
         }
+        cgroup::declared::Declared::new(files, "")
     }
 
     /// A job whose limit counts something that can't be read leaves what isn't known, and so
