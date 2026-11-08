@@ -639,3 +639,33 @@ fn a_paths_buffers_are_charged_while_they_live() {
     .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// Spec (sol-loop r1 S1 of the executor memory stack's second lead): a path with both ends
+/// bound answers as many solutions as it connects the ends ways, a table without columns of
+/// that many rows, charged before its rows are made. Over `a p a`, 64 steps of `(p|p)`
+/// connect `a` to `a` 2^64 ways, saturated to `usize::MAX`: refused at once, within its
+/// deadline. Made row by row and charged afterwards, they ran for good.
+#[test]
+fn a_both_bound_paths_rows_are_charged_before_they_are_made() {
+    let (answered, answer) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let engine = default_store([("a".to_owned(), "p".to_owned(), "a".to_owned())]);
+        let snapshot = engine.snapshot();
+        let options = QueryOptions::default();
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let step = PropertyPathExpression::Alternative(vec![link("p"), link("p")]);
+        let path = PropertyPathExpression::Sequence(vec![step; 64]);
+        let solutions = ctx
+            .path(&end("a"), &path, &end("a"))
+            .map(|solutions| solutions.table.len())
+            .map_err(|error| format!("{:?}", QueryEvaluationError::from(error)));
+        let _ = answered.send(solutions);
+    });
+    let solutions = answer
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("answered within 30 s");
+    assert!(
+        matches!(&solutions, Err(refusal) if refusal.contains("MemoryLimit")),
+        "{solutions:?}"
+    );
+}
