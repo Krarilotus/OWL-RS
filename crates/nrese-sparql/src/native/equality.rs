@@ -26,7 +26,50 @@ pub(super) type Representatives = HashMap<u64, u64>;
 
 static CACHE: Mutex<Option<(Snapshot, Arc<Representatives>)>> = Mutex::new(None);
 
+#[cfg(test)]
+thread_local! {
+    /// Builds begun on this thread, and those its request's budget refused: what the guards
+    /// (`equality_tests`) read to know a query reached the classes. A query is evaluated on
+    /// its caller's thread.
+    static BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REFUSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Builds begun on this thread ([`BUILDS`]).
+#[cfg(test)]
+pub(super) fn builds() -> usize {
+    BUILDS.with(std::cell::Cell::get)
+}
+
+/// Builds on this thread its request's budget refused ([`REFUSED`]).
+#[cfg(test)]
+pub(super) fn refused() -> usize {
+    REFUSED.with(std::cell::Cell::get)
+}
+
+/// Whether the process-wide entry is for `snapshot`'s version.
+#[cfg(test)]
+pub(super) fn kept_for(snapshot: &Snapshot) -> bool {
+    CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_some_and(|(kept, _)| kept.same_version(snapshot))
+}
+
+/// Whether the process-wide entry, if any, was made from a published snapshot.
+#[cfg(test)]
+pub(super) fn kept_is_published() -> bool {
+    CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .is_none_or(|(kept, _)| kept.shared_state().is_some())
+}
+
 fn build(snapshot: &Snapshot) -> Representatives {
+    #[cfg(test)]
+    BUILDS.with(|builds| builds.set(builds.get() + 1));
     let mut out = HashMap::new();
     // A store kept over representatives knows its classes; its `sameAs` relation, read
     // expanded, would list every pair of each class.
