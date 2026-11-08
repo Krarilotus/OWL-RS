@@ -2065,7 +2065,7 @@ what = "the Turtle splitter alone (bulk load's skim before its parallel parse), 
 semantics = "none"
 data = "turtle entities=250000 nested=0"
 tool_loads = false
-args = ["--split-turtle", "16:{data}", "--runs", "5"]
+args = ["--split-turtle", "{data}:16", "--runs", "5"]
 queries = ""
 metric = "split_turtle.p50_ms"
 check = { "split_turtle.chunks" = 16 }
@@ -2081,7 +2081,7 @@ what = "the Turtle splitter alone, one thread, from memory: the parse-turtle-nes
 semantics = "none"
 data = "turtle entities=100000 nested=1"
 tool_loads = false
-args = ["--split-turtle", "16:{data}", "--runs", "5"]
+args = ["--split-turtle", "{data}:16", "--runs", "5"]
 queries = ""
 metric = "split_turtle.p50_ms"
 check = { "split_turtle.chunks" = 16 }
