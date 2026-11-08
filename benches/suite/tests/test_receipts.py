@@ -270,11 +270,33 @@ class Driver(unittest.TestCase):
         id), and so does the receipt; an image the pin map lacks is unknown."""
         suite = self.suite(runs=1)
         suite.manifest.update(images={"img:t": "sha256:B"})
-        with patch.object(driver.ns, "pinned", return_value={"img:t": "sha256:A"}):
+        # Docker's own answers mocked like every other docker call here: a host without docker runs
+        # this too (gate-windows-59532fff57-1794140734, khaleesi: FileNotFoundError).
+        with patch.object(driver.ns, "pinned", return_value={"img:t": "sha256:A"}), \
+                patch.object(driver, "run_quiet", return_value=Mock(returncode=0, stdout="\n", stderr="")):
             self.run_tiers(suite, [Plan("w", "1")], self.system(images=["img:t", "img:u"]))
         images = self.cells(suite)["w/1/x"]["images"]  # each with its source since F5 (below)
         self.assertEqual({i: v["id"] for i, v in images.items()},
                          {"img:t": "sha256:A", "img:u": {"unknown": "not in the run's pin map"}})
+
+    def test_a_receipt_says_why_an_image_s_source_couldn_t_be_read(self):
+        """#161's Windows gate (gate-windows-59532fff57-1794140734): reading an image's label raised
+        FileNotFoundError on a host without docker, and the receipt was never written. Without docker,
+        or with its inspect failing, the source is unknown with the reason; nothing raises."""
+        for name, effect, why in (("no docker", FileNotFoundError(2, "No such file or directory: 'docker'"),
+                                   "docker not available"),
+                                  ("inspect fails", Mock(returncode=1, stdout="", stderr="Error: No such image: sha256:A"),
+                                   "No such image")):
+            with self.subTest(name), patch.object(self, "root", self.root / name.replace(" ", "-")):
+                (self.root / "data").mkdir(parents=True)
+                suite = self.suite(runs=1)
+                quiet = {"side_effect": effect} if isinstance(effect, Exception) else {"return_value": effect}
+                with patch.object(driver.ns, "pinned", return_value={"img:t": "sha256:A"}), \
+                        patch.object(driver, "run_quiet", **quiet):
+                    self.run_tiers(suite, [Plan("w", "1")], self.system(images=["img:t"]))
+                source = self.cells(suite)["w/1/x"]["images"]["img:t"]["source"]
+                self.assertEqual(set(source), {"unknown"})
+                self.assertIn(why, source["unknown"])
 
     def test_a_run_s_answers_go_into_its_finished_attempts_only(self):
         """R3: the run's own answer verdicts, each cell's worst, into its finished attempts; an

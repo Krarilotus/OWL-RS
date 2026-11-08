@@ -321,9 +321,20 @@ class Suite:
         label, or unknown (no label: present before, built from an unclean checkout, or pulled with
         no digest pin to hold it to)."""
         if image_id not in self.image_sources:
-            label = run_quiet(["docker", "image", "inspect", "--format",
-                               f'{{{{index .Config.Labels "{IMAGE_LABEL}"}}}}', image_id])
-            found = (label.stdout.strip() if label.returncode == 0 else "").replace("<no value>", "")
+            # Unreadable is unknown with its reason, never an exception: a receipt is written on a
+            # host without docker too (#161's Windows gate, gate-windows-59532fff57-1794140734).
+            try:
+                label = run_quiet(["docker", "image", "inspect", "--format",
+                                   f'{{{{index .Config.Labels "{IMAGE_LABEL}"}}}}', image_id])
+            except OSError as error:
+                self.image_sources[image_id] = receipts.unknown(f"docker not available: {error}")
+                return self.image_sources[image_id]
+            if label.returncode != 0:
+                said = (label.stderr or label.stdout or "").strip().splitlines()
+                self.image_sources[image_id] = receipts.unknown(
+                    f"docker image inspect failed (exit {label.returncode}): {said[-1] if said else 'no output'}")
+                return self.image_sources[image_id]
+            found = label.stdout.strip().replace("<no value>", "")
             self.image_sources[image_id] = (f"built from {found}" if found else
                                             receipts.unknown("no build label on the image that ran"))
         return self.image_sources[image_id]
