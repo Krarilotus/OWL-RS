@@ -67,6 +67,9 @@ impl Drop for StoreLock {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         open.remove(&self.dir);
+        drop(open);
+        #[cfg(test)]
+        tests::after_release();
     }
 }
 
@@ -116,4 +119,89 @@ fn record_lock(file: &File) -> std::io::Result<bool> {
 #[cfg(not(unix))]
 fn lock_process(file: &File) -> std::io::Result<bool> {
     Ok(file.try_lock().is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::*;
+
+    thread_local! {
+        /// What a test does once a lock's drop has let the registry go.
+        static AFTER_RELEASE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn after_release() {
+        if let Some(then) = AFTER_RELEASE.with_borrow_mut(Option::take) {
+            then();
+        }
+    }
+
+    /// Whether another process is refused the store's lock on `lock`: a child that tries the
+    /// record lock (`fcntl F_SETLK`) on it between its fork and its exec.
+    #[cfg(unix)]
+    fn held_against_another_process(lock: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::process::CommandExt as _;
+        let path = std::ffi::CString::new(lock.as_os_str().as_bytes()).unwrap();
+        let mut command = std::process::Command::new("true");
+        // SAFETY: the hook runs in the forked child before exec and makes only system calls
+        // (open, fcntl, _exit) on memory made before the fork: no allocation and no lock.
+        unsafe {
+            command.pre_exec(move || {
+                let fd = libc::open(path.as_ptr(), libc::O_RDWR);
+                if fd < 0 {
+                    libc::_exit(2);
+                }
+                let mut range: libc::flock = std::mem::zeroed();
+                range.l_type = libc::F_WRLCK as _;
+                range.l_whence = libc::SEEK_SET as _;
+                let taken = libc::fcntl(fd, libc::F_SETLK, &range);
+                libc::_exit(if taken == 0 { 0 } else { 1 });
+            });
+        }
+        let code = command.status().unwrap().code();
+        assert!(matches!(code, Some(0 | 1)), "the probe failed: {code:?}");
+        code == Some(1)
+    }
+
+    /// Windows: a second handle's lock conflicts with the store's, as another process's does.
+    #[cfg(not(unix))]
+    fn held_against_another_process(lock: &Path) -> bool {
+        let other = OpenOptions::new().write(true).open(lock).unwrap();
+        other.try_lock().is_err()
+    }
+
+    /// A store opened again in this process as it closes (one thread's engine dropped while
+    /// another opens its directory) stays locked against other processes (sol-loop S1). The
+    /// second open runs at the moment the first's drop has let the registry go. Before the
+    /// fix the first's descriptor closed only after that, and closing any descriptor of the
+    /// file drops the process's record locks, the second's too: another process could then
+    /// lock the store and write it beside this one (Windows: the second open was refused, the
+    /// first handle still locking). Guard: released, another process locks it.
+    #[test]
+    fn a_store_reopened_as_it_closes_stays_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("LOCK");
+        let first = StoreLock::acquire(dir.path()).unwrap();
+        let reopened = Rc::new(RefCell::new(None));
+        let (slot, root) = (Rc::clone(&reopened), dir.path().to_path_buf());
+        AFTER_RELEASE.set(Some(Box::new(move || {
+            *slot.borrow_mut() = Some(StoreLock::acquire(&root));
+        })));
+        drop(first);
+        let second = reopened.borrow_mut().take().expect("the hook ran");
+        let second = second.expect("opened again as the first closed");
+        assert!(
+            held_against_another_process(&lock),
+            "another process could lock the store opened again"
+        );
+        drop(second);
+        assert!(
+            !held_against_another_process(&lock),
+            "released, another process is still refused"
+        );
+    }
 }

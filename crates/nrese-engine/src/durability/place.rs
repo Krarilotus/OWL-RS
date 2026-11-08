@@ -144,4 +144,36 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"new");
         assert!(!moved.exists() && !source.exists());
     }
+
+    /// A read-only file (an image backup kept read-only) is copied into place and readable
+    /// under the name (sol-loop S2). Before the fix the temporary kept the source's read-only
+    /// permission, and its sync through a writable handle was refused, so the restore failed.
+    #[test]
+    fn a_read_only_file_is_placed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, target) = (dir.path().join("image"), dir.path().join("placed"));
+        fs::write(&source, b"image").unwrap();
+        let mut read_only = fs::metadata(&source).unwrap().permissions();
+        read_only.set_readonly(true);
+        fs::set_permissions(&source, read_only).unwrap();
+        let placed = copy(&source, &target);
+        // Writable again, so the directory can be removed (Windows).
+        for path in [
+            source.clone(),
+            target.clone(),
+            dir.path().join("placed.placing"),
+        ] {
+            if let Ok(metadata) = fs::metadata(&path) {
+                let mut writable = metadata.permissions();
+                #[expect(
+                    clippy::permissions_set_readonly_false,
+                    reason = "a test's scratch file, made removable"
+                )]
+                writable.set_readonly(false);
+                let _ = fs::set_permissions(&path, writable);
+            }
+        }
+        placed.unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"image");
+    }
 }
