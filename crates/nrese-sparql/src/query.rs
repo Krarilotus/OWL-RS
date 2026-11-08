@@ -193,23 +193,27 @@ fn for_view<'o>(view: &impl ReadView, options: &'o QueryOptions) -> Cow<'o, Quer
 /// What the result cache holds of `query`'s whole answer on `view` written in `format`
 /// (the media type with its parameters, as sent) and `context` (what else the caller's
 /// answer depends on: the store's reasoning mode, the status it reports): its bytes, or a slot to offer them to
-/// once written, or nothing to do with the cache ([`crate::cache`]). A transaction's
-/// pending state, a pin and pre-bound variables are never answered from it.
-pub fn cached_output<V: ReadView>(
-    view: &V,
+/// once written, or nothing to do with the cache ([`crate::cache`]). Unpublished state (a
+/// transaction's pending state, a detached pending or private snapshot), a pin and
+/// pre-bound variables are never answered from it.
+pub fn cached_output<'v, V: ReadView>(
+    view: &'v V,
     query: &Query,
     options: &QueryOptions,
     format: &str,
     context: &str,
-) -> crate::cache::CachedOutput {
+) -> crate::cache::CachedOutput<'v> {
     use crate::cache::CachedOutput;
-    let (Some(cache), Some(snapshot), None) =
-        (&options.result_cache, view.snapshot(), &options.pin)
-    else {
+    let (Some(cache), Some(state), None) = (
+        &options.result_cache,
+        view.snapshot()
+            .and_then(nrese_engine::Snapshot::shared_state),
+        &options.pin,
+    ) else {
         return CachedOutput::Off;
     };
-    match crate::native::output_key(snapshot, query, options, format, context) {
-        Some(key) => cache.output(key),
+    match crate::native::output_key(state, query, options, format, context) {
+        Some(part) => cache.output(state, part),
         None => CachedOutput::Off,
     }
 }
