@@ -2043,7 +2043,7 @@ impl Equality {
             .map_init(
                 || Poller::new(stop),
                 |poll, &[s, p, o]| {
-                    let Some(poll) = poll.as_ref() else {
+                    let Some(poll) = poll.as_ref().filter(|poll| !poll.stopped()) else {
                         return Vec::new();
                     };
                     let (ms, mp, mo) = (
@@ -2051,12 +2051,18 @@ impl Equality {
                         self.members(store, p, poll),
                         self.members(store, o, poll),
                     );
+                    // The product of its classes, a probe each: stopped, it ends there and
+                    // keeps nothing (sol-loop r1 S1); the later seeds of the task do nothing.
                     let mut facts = Vec::new();
                     for &s in &ms {
                         for &p in &mp {
                             for &o in &mo {
                                 let fact = [s, p, o];
-                                if !store.contains(fact, poll) {
+                                let held = store.contains(fact, poll);
+                                if poll.stopped() {
+                                    return Vec::new();
+                                }
+                                if !held {
                                     facts.push(fact);
                                 }
                             }

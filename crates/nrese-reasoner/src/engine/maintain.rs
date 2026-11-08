@@ -52,10 +52,14 @@ impl<'a> EngineBase<'a> {
             .is_some()
     }
 
-    fn committed(&self, model: ReadModel, fact: Triple) -> bool {
+    /// Whether `fact` is committed in `model` and not deleted by the change: each graph's
+    /// copy it visits counted on `probe`, the deleted ones included (REAS-2, sol-loop r1
+    /// S2); false once that has stopped.
+    fn committed(&self, model: ReadModel, fact: Triple, probe: Probe<'_, '_>) -> bool {
         let [s, p, o] = fact.map(Some);
         self.snapshot
             .quads_for_pattern_in(model, &pattern([s, p, o], GraphSelector::Any))
+            .take_while(|_| probe.units(1))
             .any(|quad| !self.deletes.contains(&quad))
     }
 }
@@ -92,13 +96,13 @@ impl VisitsBase for EngineBase<'_> {
     }
 
     fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
-        self.inserts.holds(fact, probe) || self.committed(ReadModel::Materialised, fact)
+        self.inserts.holds(fact, probe) || self.committed(ReadModel::Materialised, fact, probe)
     }
 
     fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
         self.inserts.holds(fact, probe)
             || self.axioms.binary_search(&fact).is_ok()
-            || self.committed(ReadModel::Asserted, fact)
+            || self.committed(ReadModel::Asserted, fact, probe)
     }
 
     fn visit_asserted(&self, bound: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
@@ -642,6 +646,48 @@ mod tests {
         assert!(
             poll.stopped(),
             "{n} quads passed over without the poller polling"
+        );
+    }
+
+    /// The same for a membership probe (sol-loop r1 S2): whether a fact asserted in three
+    /// poll intervals of graphs, every copy deleted by the change, is still asserted reads
+    /// each copy; a poller whose stop has fired polls within that one probe.
+    #[test]
+    fn an_engine_base_probe_counts_the_deleted_copies_it_passes_over() {
+        let n = 3 * nrese_exec::POLL_UNITS as usize;
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into());
+        let [s, p, o] = ["s", "p", "o"].map(|t| iri(&format!("http://example.com/{t}")));
+        let graphs: Vec<_> = (0..n)
+            .map(|g| iri(&format!("http://example.com/g{g}")))
+            .collect();
+        let copies: Vec<EncodedQuad> = graphs
+            .iter()
+            .map(|&graph| EncodedQuad::new(s, p, o, graph))
+            .collect();
+        for &copy in &copies {
+            tx.insert_encoded(copy);
+        }
+        tx.commit().unwrap();
+        let mut tx = engine.transaction();
+        for &copy in &copies {
+            tx.remove_encoded(copy);
+        }
+        let base = EngineBase::new(&tx, &[]);
+        let fired = std::sync::atomic::AtomicBool::new(false);
+        let stop = || fired.load(Ordering::Relaxed);
+        let poll = Poller::new(&stop).expect("not stopped yet");
+        fired.store(true, Ordering::Relaxed);
+        let asserted = base.is_asserted([s.raw(), p.raw(), o.raw()], &poll);
+        assert!(!asserted, "every copy is deleted");
+        assert!(
+            poll.stopped(),
+            "{n} deleted copies read without the poller polling"
         );
     }
 
