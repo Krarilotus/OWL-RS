@@ -109,17 +109,24 @@ pub(crate) fn run(
                 .collect();
             let mut seen: Vec<Vec<usize>> =
                 batches.iter().map(|batch| vec![0; batch.len()]).collect();
+            #[cfg(feature = "inject")]
+            let first_part = batches.as_ptr() as usize;
             parallel(
                 threads,
                 snapshot,
                 &batches,
                 &mut seen,
                 window,
-                |snapshot, batches, out| {
-                    for (seen, batch) in out.iter_mut().zip(batches) {
+                |snapshot, part, out| {
+                    #[cfg(feature = "inject")]
+                    let mut injected = part.as_ptr() as usize != first_part;
+                    for (seen, batch) in out.iter_mut().zip(part) {
                         snapshot.with_views(|view| {
                             for (slot, &id) in seen.iter_mut().zip(batch) {
-                                *slot = view(id).map_or(0, view_key);
+                                let view = view(id);
+                                #[cfg(feature = "inject")]
+                                let view = view.map(|view| inject(view, &mut injected));
+                                *slot = view.map_or(0, view_key);
                             }
                         });
                     }
@@ -347,6 +354,23 @@ fn parallel<T: Sync, O: Send>(
         });
         counted.and(read)
     })
+}
+
+/// Test-only (`--features inject`, `tests/inject.rs`): the first IRI the first reader views,
+/// replaced by another IRI of the same length, a wrong answer the run must refuse.
+#[cfg(feature = "inject")]
+fn inject<'v>(view: TermView<'v>, injected: &mut bool) -> TermView<'v> {
+    match view {
+        TermView::Iri(iri) if !*injected => {
+            *injected = true;
+            let mut wrong = iri.to_owned();
+            let last = if wrong.ends_with('x') { 'y' } else { 'x' };
+            wrong.pop();
+            wrong.push(last);
+            TermView::Iri(Box::leak(wrong.into_boxed_str()))
+        }
+        view => view,
+    }
 }
 
 /// A view's kind and text length, as one number: what the counted pass keeps of each view,

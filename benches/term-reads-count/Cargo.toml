@@ -18,6 +18,14 @@ nrese-engine = { path = "../../crates/nrese-engine" }
 nrese-rdf = { path = "../../crates/rdf/nrese-rdf" }
 tempfile = "3.23.0"
 
+[features]
+# Test-only: tests/inject.rs's wrong view on one reader. Never in a counted build.
+inject = []
+
+[[test]]
+name = "inject"
+required-features = ["inject"]
+
 # The root workspace's release profile (fat LTO, one codegen unit), which a workspace of its
 # own doesn't inherit.
 [profile.release]
