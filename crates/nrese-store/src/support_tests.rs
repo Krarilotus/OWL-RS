@@ -376,3 +376,39 @@ fn the_closure_after_a_change_counts_the_removed_facts_it_passes_over() {
         "{n} removed facts passed over without the poller polling"
     );
 }
+
+/// REAS-2 review r1 F1: the closure after a change estimates its matches (the update's job
+/// planning) by reading the removed facts, each counted as it is read: 8 × `POLL_UNITS` of
+/// them ask the stop at least once every `POLL_UNITS` plus one run (the longest run counted
+/// at once, `POLL_UNITS`). Counted all at once, the whole list was one ask.
+#[test]
+fn the_closure_after_a_change_estimates_within_a_run_of_the_stop() {
+    let interval = nrese_exec::POLL_UNITS as usize;
+    let n = 8 * interval as u64;
+    let store = crate::StoreService::new(crate::StoreConfig::in_memory()).unwrap();
+    let snapshot = store.engine().snapshot();
+    let removed: Vec<Triple> = (0..n).map(|i| [i, 5, i]).collect();
+    let after = After {
+        snapshot: &snapshot,
+        removed: &removed,
+    };
+    let asks = std::sync::atomic::AtomicUsize::new(0);
+    let stop = || {
+        asks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    };
+    let poll = Poller::new(&stop).expect("never stopped");
+    let estimate =
+        nrese_reasoner::eval::Source::estimate(&after, [None, Some(6), None], Seg::All, &poll);
+    assert_eq!(
+        estimate, 0,
+        "no removed fact matches, the snapshot holds none"
+    );
+    let run = interval;
+    let asks = asks.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        asks >= n as usize / (interval + run),
+        "{asks} asks of the stop for {n} removed facts read: more than {interval} plus one run \
+         of {run} read between two of them"
+    );
+}

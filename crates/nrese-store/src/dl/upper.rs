@@ -1110,6 +1110,109 @@ mod tests {
         );
     }
 
+    /// U1's base over one literal value written `n` ways (`Values`: one representative, its
+    /// lexical members): an empty view, no program facts, an empty stack.
+    fn one_value_written(n: u64) -> (nrese_engine::Engine, super::Values, u64) {
+        let engine = nrese_engine::Engine::new(nrese_engine::EngineConfig {
+            background_maintenance: false,
+            ..nrese_engine::EngineConfig::default()
+        })
+        .unwrap();
+        let rep = 1_000_000;
+        let mut values = super::Values::default();
+        values.members.insert(rep, (rep..rep + n).collect());
+        (engine, values, rep)
+    }
+
+    /// REAS-2 review r1 F3: U1's base reads a value's lexical members as it visits them, each
+    /// counted: a scan bound to a value written 64 × `POLL_UNITS` ways, its stop fired since
+    /// its poller was made, stops within a poll interval of members and holds no copy of the
+    /// member list (at most a quarter of its bytes at any time). Copied first, the whole list
+    /// was copied before the first member was counted.
+    #[test]
+    fn the_upper_base_reads_a_value_s_members_as_it_visits_them() {
+        use nrese_reasoner::delta::Base;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        let n = 64 * u64::from(nrese_exec::POLL_UNITS);
+        let (engine, values, rep) = one_value_written(n);
+        let view = engine.snapshot();
+        let (facts, stack) = (std::collections::HashSet::new(), Stack::default());
+        let noting = super::Noting {
+            base: &values,
+            added: super::Values::default(),
+        };
+        let base = super::UpperBase {
+            view: &view,
+            facts: &facts,
+            stack: &stack,
+            values: &noting,
+        };
+        let fired = AtomicBool::new(false);
+        let stop = || fired.load(Ordering::Relaxed);
+        let poll = nrese_reasoner::eval::Poller::new(&stop).expect("not stopped yet");
+        fired.store(true, Ordering::Relaxed);
+        let (delivered, held) = nrese_exec::measure::measure(|| {
+            let mut delivered = 0;
+            base.scan([None, Some(5), Some(rep)], &poll, &mut |_| delivered += 1);
+            delivered
+        });
+        assert_eq!(delivered, 0, "the view holds nothing");
+        assert!(
+            poll.stopped(),
+            "{n} members visited without the poller polling"
+        );
+        let list = n as usize * size_of::<u64>();
+        assert!(
+            held <= list / 4,
+            "{held} bytes held by a stopped scan: the {list}-byte member list was copied"
+        );
+    }
+
+    /// REAS-2 review r1 F3: a negative lookup of a fact whose object is a value written
+    /// 8 × `POLL_UNITS` ways asks the view about each member, each counted as it is asked:
+    /// the stop at least once every `POLL_UNITS` plus one run (the longest run counted at
+    /// once, `POLL_UNITS`) of members. Counted all at once, the whole list was one ask.
+    #[test]
+    fn a_negative_upper_base_lookup_asks_its_stop_within_a_run() {
+        use nrese_reasoner::delta::Base;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let interval = nrese_exec::POLL_UNITS as usize;
+        let n = 8 * interval as u64;
+        let (engine, values, rep) = one_value_written(n);
+        let view = engine.snapshot();
+        let (facts, stack) = (std::collections::HashSet::new(), Stack::default());
+        let noting = super::Noting {
+            base: &values,
+            added: super::Values::default(),
+        };
+        let base = super::UpperBase {
+            view: &view,
+            facts: &facts,
+            stack: &stack,
+            values: &noting,
+        };
+        let asks = AtomicUsize::new(0);
+        let stop = || {
+            asks.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        let poll = nrese_reasoner::eval::Poller::new(&stop).expect("never stopped");
+        assert!(
+            !base.contains([1, 5, rep], &poll),
+            "the view asserts no member"
+        );
+        let run = interval;
+        let asks = asks.load(Ordering::Relaxed);
+        assert!(
+            asks >= n as usize / (interval + run),
+            "{asks} asks of the stop for {n} members asked about: more than {interval} plus one \
+             run of {run} between two of them"
+        );
+    }
+
     /// The delta executor reads estimates per job: they must be upper bounds, and zero
     /// only where nothing matches (a zero skips the job), and cost an index probe, not a
     /// count of the matches.

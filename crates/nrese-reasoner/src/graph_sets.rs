@@ -2869,4 +2869,37 @@ mod tests {
             Stopped::ProcessMemory
         );
     }
+
+    /// REAS-2 review r1 F1 (the reviewer's witness): a fact's graphs as the support sets read
+    /// them ([`super::InGraphs`], the store's `SupportSets::compute` and the own lookups) are
+    /// handed on as they are counted. One fact asserted in 3 × `POLL_UNITS` graphs, the stop
+    /// set from the first graph handed on: at most `POLL_UNITS` plus one run more are handed
+    /// on after it (REAS-2's bound; the run counted at once is at most `POLL_UNITS`). Counted
+    /// all at once, every one of them was.
+    #[test]
+    fn a_fact_s_graphs_are_handed_on_within_a_run_of_the_stop() {
+        use super::{Graphs, InGraphs};
+        use crate::eval::Poller;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let interval = nrese_exec::POLL_UNITS as usize;
+        let fact = [1, 2, 3];
+        let placed: Vec<([u64; 3], u32)> = (0..3 * interval as u32).map(|g| (fact, g)).collect();
+        let fired = AtomicBool::new(false);
+        let stop = || fired.load(Ordering::Relaxed);
+        let poll = Poller::new(&stop).expect("not stopped yet");
+        let (mut handed, mut after) = (0usize, 0usize);
+        InGraphs(&placed).each(fact, &poll, &mut |_| {
+            handed += 1;
+            match fired.load(Ordering::Relaxed) {
+                true => after += 1,
+                false => fired.store(true, Ordering::Relaxed),
+            }
+        });
+        assert!(handed > 0, "the first graph is handed on before the stop");
+        let run = interval;
+        assert!(
+            after <= interval + run,
+            "{after} graphs handed on after the stop (at most {interval} plus one run of {run})"
+        );
+    }
 }
