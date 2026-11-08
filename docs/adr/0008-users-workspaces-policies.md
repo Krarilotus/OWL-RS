@@ -31,7 +31,7 @@ API and the UI manage, with an audit log.
 ## Decision
 
 - **Workspaces are the user-facing unit.** A workspace is a named set of graphs (an IRI
-  prefix of its own, `…/workspace/{name}/`, plus graphs it takes in) with members, each
+  prefix of its own, `…/workspace/{name}~{id}/`, plus graphs it takes in) with members, each
   an owner, an editor or a viewer. Owners manage members; editors write the workspace's
   graphs; viewers read them. A project in ResearchSpace maps to a workspace.
 - **Every user has a personal space:** a workspace only they own and write, readable by
@@ -86,3 +86,22 @@ API and the UI manage, with an audit log.
   stays) or a session token from `POST /api/v1/access/login`; failures throttled per
   user name; sessions end with a password change. On by default, beside any token mode.
 - Provenance-based visibility of inferred statements waits for G3.
+
+## A reused name starts empty (8 November)
+
+Removing a workspace removes its record and keeps its graphs and saved queries (for
+administrators). Its name is free again, but its content is not passed on: the owner's
+decision of 26 October (C-204 (b)) binds content to an internal id.
+- The id is the number of the change that created the workspace, or the local user (a
+  user created with a password). Change numbers never repeat, so neither do ids.
+- The prefix carries it: `{base}workspace/{name}~{id}/`, and a local user's personal
+  space `{base}space/{user}~{id}/`. Names hold no `~`, so the prefixes of two incarnations
+  never overlap. Saved queries carry their space's id (`nra:spaceId`) and are found only in
+  that incarnation.
+- Workspaces and users from before ids keep their prefixes `…/workspace/{name}/` and
+  `…/space/{user}/`, as do users named by their credentials (a token's subject, who is the
+  same person whenever that name comes back) and user records created without a password.
+  No data is migrated.
+- A server older than this change drops the ids at its next access change, and those
+  spaces fall back to the prefixes without one: going back to such a version, once a
+  workspace or a local user with an id exists, is not supported.

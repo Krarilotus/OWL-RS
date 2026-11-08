@@ -257,7 +257,15 @@ async fn personal_spaces_and_workspaces_decide_what_users_read_and_write() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "only owners manage members");
-    let shared = "urn:nrese:workspace/project/data";
+    // Its prefix carries the change that created it (SYN-64): a later `project` is another.
+    let (_, project) = get(&app, ALICE, "/api/v1/access/workspaces/project").await;
+    let prefix = project["prefix"].as_str().unwrap();
+    assert!(
+        prefix.starts_with("urn:nrese:workspace/project~"),
+        "{prefix}"
+    );
+    let shared = format!("{prefix}data");
+    let shared = shared.as_str();
     assert_eq!(
         update(
             &app,
@@ -520,8 +528,12 @@ async fn local_users_log_in_with_passwords_besides_tokens() {
     let session: Value = serde_json::from_str(&session).unwrap();
     let bearer = format!("Bearer {}", session["token"].as_str().unwrap());
     assert_eq!(session["expires_in_seconds"], 12 * 3600);
-    let (status, _) = send_with(&app, &bearer, Method::GET, "/api/v1/access/me", "").await;
+    let (status, me) = send_with(&app, &bearer, Method::GET, "/api/v1/access/me", "").await;
     assert_eq!(status, StatusCode::OK);
+    // A local user's personal space carries the change that created it (SYN-64).
+    let me: Value = serde_json::from_str(&me).unwrap();
+    let space = me["personal_space"]["prefix"].as_str().unwrap().to_owned();
+    assert!(space.starts_with("urn:nrese:space/dana~"), "{space}");
     // Writes need enforcement (the personal space) or a role; then dana writes its own.
     let (status, _) = put(
         &app,
@@ -533,7 +545,7 @@ async fn local_users_log_in_with_passwords_besides_tokens() {
     assert_eq!(status, StatusCode::OK);
     let write = |graph: &str| format!("INSERT DATA {{ GRAPH <{graph}> {{ <urn:a> <urn:p> 1 }} }}");
     assert_eq!(
-        update_as(&app, &bearer, &write("urn:nrese:space/dana/x")).await,
+        update_as(&app, &bearer, &write(&format!("{space}x"))).await,
         StatusCode::NO_CONTENT
     );
     assert_eq!(
@@ -717,9 +729,25 @@ async fn workspaces_count_in_their_own_repository() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let insert = "update=INSERT+DATA+%7B+GRAPH+%3Curn%3Anrese%3Aworkspace%2Flab%2Fg%3E+%7B+%3Curn%3Aa%3E+%3Curn%3Ap%3E+1+%7D+%7D";
+    // Into the workspace's own prefix, as its view gives it (SYN-64: it carries an id).
+    let (_, lab) = get(&app, ALICE, "/api/v1/access/workspaces/lab").await;
+    let update = format!(
+        "INSERT DATA {{ GRAPH <{}g> {{ <urn:a> <urn:p> 1 }} }}",
+        lab["prefix"].as_str().unwrap()
+    );
+    let form: String = update
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' => {
+                char::from(byte).to_string()
+            }
+            b' ' => "+".to_owned(),
+            _ => format!("%{byte:02X}"),
+        })
+        .collect();
+    let insert = format!("update={form}");
     let write = |repository: &'static str| {
-        let app = app.clone();
+        let (app, insert) = (app.clone(), insert.clone());
         async move {
             send(
                 &app,
@@ -727,7 +755,7 @@ async fn workspaces_count_in_their_own_repository() {
                 Method::POST,
                 &format!("/repositories/{repository}/statements"),
                 Some("application/x-www-form-urlencoded"),
-                insert,
+                &insert,
             )
             .await
         }
