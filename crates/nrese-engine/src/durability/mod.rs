@@ -298,13 +298,25 @@ impl Durable {
                 .is_some_and(|(next, _)| *next <= covered_through.saturating_add(1))
             {
                 tracing::debug!(segment = %path.display(), "skipped a WAL segment the checkpoint covers");
-                if let Ok(contents) = wal::read_segment(path) {
-                    // A time past what a store keeps is damage here too: not taken.
-                    for record in &contents.records {
-                        if check_commit_time(record).is_ok() {
-                            store_clock = store_clock.max(record.committed_micros.unwrap_or(0));
+                let damaged = match wal::read_segment(path) {
+                    Ok(contents) => {
+                        let mut damaged = contents.torn;
+                        // A time past what a store keeps is damage here too: not taken.
+                        for record in &contents.records {
+                            match check_commit_time(record) {
+                                Ok(()) => {
+                                    store_clock =
+                                        store_clock.max(record.committed_micros.unwrap_or(0));
+                                }
+                                Err(_) => damaged = true,
+                            }
                         }
+                        damaged
                     }
+                    Err(_) => true,
+                };
+                if damaged {
+                    tracing::warn!(segment = %path.display(), "damage in a WAL segment the checkpoint covers: its records are all in the checkpoint, nothing is lost");
                 }
                 continue;
             }
