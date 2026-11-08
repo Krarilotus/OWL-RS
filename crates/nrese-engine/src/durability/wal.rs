@@ -176,7 +176,8 @@ pub(crate) struct Wal {
 impl Wal {
     /// Opens the log for appending after recovery. Appends to the newest segment, or starts
     /// one for `next_revision` if there is none. New segments are of the store's encoding
-    /// (`integers_in_dictionary`: version 4).
+    /// (`integers_in_dictionary`: version 4). `dir` and `archive` exist, durably named by the
+    /// store's open (`place::create_store_dir`).
     pub(crate) fn open(
         dir: &Path,
         next_revision: u64,
@@ -189,11 +190,6 @@ impl Wal {
             true => SEGMENT_MAGIC_V4,
             false => SEGMENT_MAGIC,
         };
-        // Durably named: the archive is made after the open's sync of the store's directory.
-        super::place::create_dir_all(dir)?;
-        if let Some(archive) = &archive {
-            super::place::create_dir_all(archive)?;
-        }
         // A segment a crash left under its temporary name was never part of the log.
         for entry in fs::read_dir(dir)? {
             let path = entry?.path();

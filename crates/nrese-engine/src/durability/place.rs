@@ -106,6 +106,36 @@ pub fn create_dir(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Names `dir`, a directory in the store's root, which the open has durably named already
+/// ([`create_dir_all`]), with each directory synced once per open (timing of 8 Nov):
+/// - missing, it is made as [`create_dir_all`] makes a level: the root's sync checked before,
+///   done after, `dir` removed again if that fails;
+/// - found (or made meanwhile by someone else), the root isn't synced here: the open syncs it
+///   after replay, before anything relies on the name, which names every directory found in
+///   it at once.
+pub(crate) fn create_store_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    let root = match dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    sync_dir(root)?;
+    match fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && dir.is_dir() => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    }
+    if let Err(error) = sync_dir(root) {
+        let _ = fs::remove_dir(dir);
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// [`create_dir_all`]'s levels, outermost first; those it makes are pushed to `made`.
 fn name_levels<'a>(dir: &'a Path, made: &mut Vec<&'a Path>) -> std::io::Result<()> {
     let levels: Vec<&Path> = dir
