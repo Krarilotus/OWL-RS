@@ -44,6 +44,7 @@ ns_name() { printf 'nrese-%s-%s-%s' "$(ns_slug "$1")" "$(ns_namespace "$2")" "$(
 
 ns_labels() {
   NS_LABELS=(--label "nrese.ns=$(ns_namespace "$1")" --label "nrese.checkout=$(ns_checkout "$1")" --label "nrese.owner=$2")
+  if [ -n "${FLEET_JOB:-}" ]; then NS_LABELS+=(--label "fleet.job=$FLEET_JOB"); fi
 }
 
 ns_run_args() { ns_labels "$2" "$3"; NS_ARGS=(--name "$1" "${NS_LABELS[@]}"); }
