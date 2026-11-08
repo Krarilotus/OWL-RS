@@ -84,6 +84,28 @@ pub fn create_dir_all(dir: &Path) -> std::io::Result<()> {
     named
 }
 
+/// Creates the new directory `dir`, claiming it: an `AlreadyExists` error if it exists. Its name
+/// is made durable as [`create_dir_all`] does for each level (the directories above it made or
+/// found through it, its holder's sync checked before `dir` is made and done after); a failed
+/// sync after removes `dir` again (sol-loop round 4 on review r1, S1: a backup's directory).
+pub fn create_dir(dir: &Path) -> std::io::Result<()> {
+    let holder = match dir.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            create_dir_all(parent)?;
+            parent
+        }
+        Some(_) => Path::new("."),
+        None => return Err(std::io::ErrorKind::AlreadyExists.into()),
+    };
+    sync_dir(holder)?;
+    fs::create_dir(dir)?;
+    if let Err(error) = sync_dir(holder) {
+        let _ = fs::remove_dir(dir);
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// [`create_dir_all`]'s levels, outermost first; those it makes are pushed to `made`.
 fn name_levels<'a>(dir: &'a Path, made: &mut Vec<&'a Path>) -> std::io::Result<()> {
     let levels: Vec<&Path> = dir
