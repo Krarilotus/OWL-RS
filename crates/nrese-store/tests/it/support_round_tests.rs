@@ -104,6 +104,15 @@ fn oracle(graphs: &[usize]) -> BTreeSet<(usize, usize)> {
 
 /// The pairs `ex:anc` relates for `scope`, under the query memory limit.
 fn read(store: &StoreService, scope: &ReadScope) -> Result<BTreeSet<(usize, usize)>, String> {
+    read_within(store, scope, LIMIT)
+}
+
+/// [`read`] under the query memory limit `limit`.
+fn read_within(
+    store: &StoreService,
+    scope: &ReadScope,
+    limit: usize,
+) -> Result<BTreeSet<(usize, usize)>, String> {
     let mut request = SparqlQueryRequest::new(
         // The default graph (inferred statements, and those asserted only where the reader
         // can't read, which its view adds) and the graphs it may read (their asserted edges).
@@ -112,7 +121,7 @@ fn read(store: &StoreService, scope: &ReadScope) -> Result<BTreeSet<(usize, usiz
         ),
         scope.clone(),
     );
-    request.memory_limit = Some(LIMIT);
+    request.memory_limit = Some(limit);
     let result = store
         .execute_query(&request)
         .map_err(|error| error.to_string())?;
@@ -169,6 +178,12 @@ fn a_restricted_read_of_a_complete_relation_fits_its_memory_limit() {
     assert!(
         expected.len() > NODES * (NODES - 1),
         "the closure adds the loops"
+    );
+    // Refused first, under a limit the read can't fit (probes: it needs 192 MiB): that
+    // refusal keeps no view, and the same reader's next read answers (review r1).
+    assert!(
+        read_within(&store, &scope, 16 << 20).is_err(),
+        "refused at 16 MiB"
     );
     assert_eq!(read(&store, &scope), Ok(expected));
     assert_eq!(

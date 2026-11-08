@@ -92,3 +92,107 @@ fn a_refused_round_ends_the_evaluation_and_holds_nothing() {
         ample.peak()
     );
 }
+
+/// One rule instance: `:s :p :m` and `:m :p :o` asserted (in that order), `:s :p :o`
+/// derived; the closure, the ground program and the asserted facts. With each premise in `n`
+/// graphs and every set kept (`cap = n`), the instance's premise product has n² unions, of
+/// which `minimal` keeps n.
+fn product_input() -> (Vec<Triple>, crate::eval::GroundProgram, Vec<Triple>) {
+    let mut vocabulary = LocalVocabulary::default();
+    let rules = parse_rules(
+        "chain: (?x rdfs:p ?y), (?y rdfs:p ?z) -> (?x rdfs:p ?z)",
+        &mut vocabulary,
+    )
+    .unwrap();
+    let schema = Schema::owl(&mut vocabulary);
+    let asserted = load(&mut vocabulary, "ex:s rdfs:p ex:m\nex:m rdfs:p ex:o");
+    let derived = load(&mut vocabulary, "ex:s rdfs:p ex:o");
+    let ground = program(
+        &MemoryBase::new(&asserted, &[]),
+        Rules {
+            rules: &rules,
+            lists: None,
+            schema: &schema,
+        },
+    );
+    let mut closure: Vec<Triple> = asserted.iter().chain(&derived).copied().collect();
+    closure.sort_unstable();
+    (closure, ground, asserted)
+}
+
+/// Review r1 C1 (`notes/review-p2-c5-r1/review.md`): the premise product, n² unions before
+/// `minimal` keeps n, is admitted on the working budget before it is built. Under a budget
+/// below its bytes (and far above what the kept sets take) the evaluation ends `Refused`,
+/// within the limit, holding nothing; with an ample one it answers. Two rows: unions held
+/// inline (graphs below 128) and unions whose words spill (graphs past 128).
+#[test]
+fn a_premise_product_is_admitted_before_it_is_built() {
+    let n = 60u32;
+    for (what, a, b) in [("inline", 0, n), ("spilled", 0, 200)] {
+        let (closure, ground, asserted) = product_input();
+        let graphs_of = |fact: Triple| -> Vec<u32> {
+            match asserted.iter().position(|&f| f == fact) {
+                Some(0) => (a..a + n).collect(),
+                Some(_) => (b..b + n).collect(),
+                None => Vec::new(),
+            }
+        };
+        // What the product's unions hold: their slots, and each union's words on the heap.
+        use crate::graph_sets::GraphSet;
+        let words: usize = (a..a + n)
+            .flat_map(|i| (b..b + n).map(move |j| (i, j)))
+            .map(|(i, j)| GraphSet::of(i).union(&GraphSet::of(j)).heap_bytes())
+            .sum();
+        assert_eq!(
+            words > 0,
+            what == "spilled",
+            "{what}: the row's unions spill or don't"
+        );
+        let product = (n * n) as usize * size_of::<GraphSet>() + words;
+        let tight = Arc::new(Budget::new(product / 2));
+        let result = support_sets(
+            &closure,
+            &ground,
+            &[],
+            &graphs_of,
+            n as usize,
+            Limits::unlimited(&tight),
+        );
+        assert!(
+            matches!(result, Err(Stopped::Refused(_))),
+            "{what}: {:?}",
+            result.map(|sets| sets.len())
+        );
+        assert!(tight.peak() <= tight.limit(), "{what}: past the limit");
+        assert_eq!(
+            tight.used(),
+            0,
+            "{what}: a refused evaluation holds nothing"
+        );
+        let ample = Arc::new(Budget::unlimited());
+        let sets = support_sets(
+            &closure,
+            &ground,
+            &[],
+            &graphs_of,
+            n as usize,
+            Limits::unlimited(&ample),
+        )
+        .unwrap();
+        let head = closure
+            .iter()
+            .find(|f| !asserted.contains(f))
+            .copied()
+            .unwrap();
+        assert_eq!(
+            sets[&head].sets.len(),
+            n as usize,
+            "{what}: the head keeps n sets"
+        );
+        assert!(
+            ample.peak() >= product,
+            "{what}: the bound proves nothing: {}",
+            ample.peak()
+        );
+    }
+}
