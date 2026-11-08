@@ -55,6 +55,22 @@ fn version(text: &[u8]) -> bool {
     text.len() >= 7 && text[..7].eq_ignore_ascii_case(b"version")
 }
 
+/// Whether the directive text's end, from its opening quote (just before `from`), is a short
+/// string the lexer reads as one token, by its own rules (escapes, line breaks).
+fn short_string(text: &[u8], from: usize) -> bool {
+    let Some(start) = from.checked_sub(1) else {
+        return false;
+    };
+    let string = &text[start..];
+    matches!(
+        lex(string, true, false, false),
+        Lexed::Token(token)
+            if matches!(token.kind, Kind::String { .. })
+                && token.start == 0
+                && token.consumed == string.len()
+    )
+}
+
 /// What the tokens of a statement before a `{` make of it (TriG): a graph block's head
 /// (nothing, a graph name, `GRAPH` and a graph name), the start of one, or neither.
 #[derive(PartialEq)]
@@ -670,16 +686,13 @@ impl Skimmer {
                             };
                             i += k + 1;
                             // A SPARQL-style `VERSION` ends with its string (only short
-                            // strings may follow it), whatever is open; not with one holding
-                            // a line break (a token the lexer can't read: recovery skips it,
-                            // and the directive goes on to a `.`).
+                            // strings may follow it), whatever is open; only with one the lexer
+                            // reads as a string token (one it can't read, a raw line break in
+                            // it, recovery skips, and the directive goes on to a `.`).
                             let string_from = self.string_from;
                             if closed
                                 && matches!(&self.directive, Some((text, false))
-                                    if version(text)
-                                        && !text[string_from.min(text.len())..]
-                                            .iter()
-                                            .any(|&c| c == b'\n' || c == b'\r'))
+                                    if version(text) && short_string(text, string_from))
                             {
                                 let at = base + i as u64;
                                 count_lines(self, &mut counted, i);
