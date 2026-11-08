@@ -6,4 +6,22 @@
 #
 # A pin is the registry digest of the tag as pulled: on a host that has pulled the systems'
 # images, `python benches/suite/suite.py images --digests [systems]` prints this table's lines.
+# Each system at its current stable release (rule.mem-owl-rs-fair-benchmarks; the standings owner,
+# 8 Nov 2026), its version and the day pinned beside it. Pulled and checked against the registry's
+# digest on 8 Nov 2026 (fleet jobs image-tags-1, image-digests-1). Licensed systems' pins name an
+# image, never a result.
 [pins]
+# QLever publishes no release tags: latest as of 8 Nov 2026 09:50 CET, = pr-3880.
+"adfreiburg/qlever:commit-0998359ab0" = "sha256:02acf43dddaf04ec440696ff24539a949c716b5ed79efe6afebfa4d574b1cd84"
+# Oxigraph 0.5.13, pinned 8 Nov 2026 (ghcr lists no digests: this one is the pull's).
+"ghcr.io/oxigraph/oxigraph:0.5.13" = "sha256:260454ee29c091d2cdb99dd156212594ff3127850627adb4cfdcd9b1e425d480"
+# Virtuoso Open Source 7.2.17, pinned 8 Nov 2026.
+"openlink/virtuoso-opensource-7:7.2.17" = "sha256:0dbe1ab4fa0cb7bbafc1f6c0c2b0a5d6f22d918dbd17672f2ddb24580aa6756a"
+# RDF4J 6.1.0 (Tomcat), pinned 8 Nov 2026.
+"eclipse/rdf4j-workbench:6.1.0-tomcat" = "sha256:7a18cecfc879f3143b5a57fe31176a0774fa57e5313f639c6f51756f390f7670"
+# GraphDB 11.5.2 Free (licensed: internal comparison only), pinned 8 Nov 2026.
+"ontotext/graphdb:11.5.2" = "sha256:7f6cf278500b46bab595f4dcf6a6a4e8bf30db35e0a64db5ac0ab5724ee2f9f1"
+# AnzoGraph 3.5.0, pinned 8 Nov 2026.
+"cambridgesemantics/anzograph:3.5.0" = "sha256:12190df909825812a814bbf9795f6ef5e857eb25ccd2e768e30cb1c80deaa74e"
+# NRESE's build image, at rust-toolchain.toml's 1.98.1 (the engine's toolchain), pinned 8 Nov 2026.
+"rust:1.98.1-bookworm" = "sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e"

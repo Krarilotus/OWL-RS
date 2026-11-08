@@ -493,7 +493,7 @@ class Qlever(Adapter):
     result_cache = True
 
     def images(self, ctx):
-        return [ctx.setting("QLEVER_IMAGE", "adfreiburg/qlever:latest")]
+        return [ctx.setting("QLEVER_IMAGE", "adfreiburg/qlever:commit-0998359ab0")]
 
     def load(self, ctx, store, inputs, regime):
         fmt = "nt" if all_ntriples(inputs) else "nq" if all(i.endswith(".nq") for i in inputs) else "ttl"
@@ -553,7 +553,7 @@ class Oxigraph(Adapter):
     key = "oxigraph"
 
     def images(self, ctx):
-        return [ctx.setting("OXIGRAPH_IMAGE", "ghcr.io/oxigraph/oxigraph:0.5.11")]
+        return [ctx.setting("OXIGRAPH_IMAGE", "ghcr.io/oxigraph/oxigraph:0.5.13")]
 
     def load(self, ctx, store, inputs, regime, log_name="load.log"):
         files = [a for i in inputs for a in ("--file", i)]
@@ -876,7 +876,7 @@ class Graphdb(Adapter):
 
     key = "graphdb"
     regimes = GRAPHDB_RULESETS
-    defaults = {"GRAPHDB_IMAGE": "ontotext/graphdb:11.5.1", "GRAPHDB_EDITION": "free",
+    defaults = {"GRAPHDB_IMAGE": "ontotext/graphdb:11.5.2", "GRAPHDB_EDITION": "free",
                 "GRAPHDB_ENTITY_ID_SIZE": "32", "GRAPHDB_ENTITY_INDEX_SIZE": "10000000",
                 "GRAPHDB_CONTEXT_INDEX": "false", "GRAPHDB_CHECK_INCONSISTENCIES": "false"}
 
