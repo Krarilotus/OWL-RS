@@ -1321,6 +1321,10 @@ fn existentials_under_a_universal_are_answered_or_reported() {
 /// - `(A ⊓ B) ⊑ ∀R.∃S.D` with `R(c, x)`: `x` has one.
 /// - `DisjointUnion(C, ∃R.A, ∃R.B)` with `c : C`: `c` has an `R`-successor, though neither
 ///   branch is certain.
+/// - Disjointness concludes a part's complement (fix check r1, F3): with `c : A` and `A`
+///   disjoint from `≤ 0 S.D`, `c` is in `≥ 1 S.D`, so it has an `S`-successor in `D`. The
+///   disjointness can come from a disjoint union, `owl:disjointWith` or
+///   `owl:AllDisjointClasses`. The same holds where `A` is disjoint from `∀S.¬D`.
 #[test]
 fn existentials_of_axioms_the_tbox_reads_in_part_are_answered_or_reported() {
     let head = format!(
@@ -1328,6 +1332,11 @@ fn existentials_of_axioms_the_tbox_reads_in_part_are_answered_or_reported() {
          @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n"
     );
     let some = "[ a owl:Restriction ; owl:onProperty :S ; owl:someValuesFrom :D ]";
+    let none = "[ a owl:Restriction ; owl:onProperty :S ; owl:onClass :D ;
+                  owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ]";
+    let all_not = "[ a owl:Restriction ; owl:onProperty :S ;
+                     owl:allValuesFrom [ a owl:Class ; owl:complementOf :D ] ]";
+    let successor = vec![format!("ASK {{ <{E}c> <{E}S> ?y . ?y a <{E}D> }}")];
     let cases = [
         (
             format!(
@@ -1358,6 +1367,34 @@ fn existentials_of_axioms_the_tbox_reads_in_part_are_answered_or_reported() {
                  :c a :C ."
             ),
             vec![format!("ASK {{ <{E}c> <{E}R> ?y }}")],
+        ),
+        (
+            format!(
+                "{head}:C a owl:Class ; owl:disjointUnionOf ( :A {none} ) .
+                 :c a :A ."
+            ),
+            successor.clone(),
+        ),
+        (
+            format!(
+                "{head}:C a owl:Class ; owl:disjointUnionOf ( :A {all_not} ) .
+                 :c a :A ."
+            ),
+            successor.clone(),
+        ),
+        (
+            format!(
+                "{head}:A owl:disjointWith {none} .
+                 :c a :A ."
+            ),
+            successor.clone(),
+        ),
+        (
+            format!(
+                "{head}[ a owl:AllDisjointClasses ; owl:members ( :A {none} ) ] .
+                 :c a :A ."
+            ),
+            successor.clone(),
         ),
     ];
     let mut wrong = Vec::new();
