@@ -16,7 +16,10 @@
 
 use std::sync::Arc;
 
+use hashbrown::HashTable;
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Reservation};
+
+use super::charged::ChargedArc;
 
 use super::dictionary::Dictionary;
 
@@ -33,13 +36,6 @@ fn key_cost(len: usize) -> usize {
     2 * size_of::<usize>() + len.next_multiple_of(align_of::<usize>())
 }
 
-/// What an `Arc<Chunk>` allocates (the `Arc` a [`ChunkRef`] shares).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the vocabulary freezes a suffix in package 2")
-)]
-const CHUNK_COST: usize = 2 * size_of::<usize>() + size_of::<Chunk>();
-
 /// Keys closed by a freeze: never changed once made, shared by the suffix, its frozen views
 /// and a prepared install.
 #[cfg_attr(
@@ -53,32 +49,13 @@ pub(crate) struct Chunk {
     keys: Vec<Arc<[u8]>>,
     hashes: Vec<u64>,
     _lists: [Reservation<Arc<Budget>>; 2],
-    /// The keys' bytes and counts, and this chunk's own `Arc`.
+    /// The keys' bytes and counts.
     _bytes: Reservation<Arc<Budget>>,
 }
 
-/// A holder's share of a [`Chunk`]. The last holder to let go takes the chunk out of its
-/// `Arc` first ([`Arc::into_inner`]), which frees the `Arc`'s block; the chunk's charges are
-/// released after, as its fields drop. An `Arc<Chunk>` dropped as such would release them
-/// first and free its block after: memory held beyond its charge.
-#[derive(Clone)]
-struct ChunkRef(Option<Arc<Chunk>>);
-
-impl std::ops::Deref for ChunkRef {
-    type Target = Chunk;
-
-    fn deref(&self) -> &Chunk {
-        self.0.as_deref().expect("a chunk until its holder drops")
-    }
-}
-
-impl Drop for ChunkRef {
-    fn drop(&mut self) {
-        if let Some(chunk) = self.0.take() {
-            drop(Arc::into_inner(chunk));
-        }
-    }
-}
+/// A holder's share of a [`Chunk`], its block charged and released after it is freed
+/// ([`ChargedArc`]).
+type ChunkRef = ChargedArc<Chunk>;
 
 /// A publisher's new entries, ids `start..start + len`, in the order it added them.
 #[cfg_attr(
@@ -95,7 +72,24 @@ pub(crate) struct Suffix {
     open: ChargedVec<Arc<[u8]>>,
     open_hashes: ChargedVec<u64>,
     open_bytes: Reservation<Arc<Budget>>,
+    /// Every entry's id with its hash, by hash: what finds a key ([`Self::find`]).
+    table: HashTable<(u64, u64)>,
+    /// The table's allocation, as [`table_cost`] bounds it.
+    table_bytes: Reservation<Arc<Budget>>,
     len: u64,
+}
+
+/// What a `HashTable<(u64, u64)>` with room for `capacity` entries allocates: hashbrown's
+/// buckets for it (`capacity_to_buckets`: 4 below 4, 8 below 8, else the power of two at or
+/// past `capacity · 8/7`), each a 16-byte slot and a control byte, plus one control group (at
+/// most 16 bytes on any target).
+fn table_cost(capacity: usize) -> usize {
+    let buckets = match capacity {
+        0..4 => 4,
+        4..8 => 8,
+        _ => (capacity * 8 / 7).next_power_of_two(),
+    };
+    buckets * (size_of::<(u64, u64)>() + 1) + 16
 }
 
 #[cfg_attr(
@@ -113,9 +107,33 @@ impl Suffix {
             open: ChargedVec::new(Arc::clone(&budget)),
             open_hashes: ChargedVec::new(Arc::clone(&budget)),
             open_bytes: Reservation::new(Arc::clone(&budget)),
+            table: HashTable::new(),
+            table_bytes: Reservation::new(Arc::clone(&budget)),
             budget,
             len: 0,
         }
+    }
+
+    /// The id of `key` (whose `key_hash` is `hash`) if it is an entry here.
+    pub(crate) fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
+        self.table
+            .find(hash, |&(id, _)| self.key(id) == Some(key))
+            .map(|&(id, _)| id)
+    }
+
+    /// Room for one more entry in the table, charged first: the new table's bytes beside the
+    /// old one's while it grows, the old one's released once it is freed.
+    fn table_room(&mut self) -> Result<(), BudgetExceeded> {
+        if self.table.len() < self.table.capacity() {
+            return Ok(());
+        }
+        let target = (2 * self.table.capacity()).max(self.table.len() + 1);
+        let held = self.table_bytes.bytes();
+        self.table_bytes.charge(table_cost(target))?;
+        self.table
+            .reserve(target - self.table.len(), |&(_, hash)| hash);
+        self.table_bytes.release(held);
+        Ok(())
     }
 
     pub(crate) fn start(&self) -> u64 {
@@ -137,14 +155,17 @@ impl Suffix {
             .open
             .reserve(1)
             .and_then(|()| self.open_hashes.reserve(1))
+            .and_then(|()| self.table_room())
         {
             self.open_bytes.release(cost);
             return Err(refused);
         }
         let id = self.start + self.len;
-        // Room is reserved and charged: neither push grows its vector.
+        // Room is reserved and charged: neither push grows its vector, nor the insert its table.
         self.open.push(Arc::from(key))?;
         self.open_hashes.push(hash)?;
+        self.table
+            .insert_unique(hash, (id, hash), |&(_, hash)| hash);
         self.len += 1;
         Ok(id)
     }
@@ -193,11 +214,12 @@ impl Suffix {
         if self.open.is_empty() {
             return Ok(());
         }
-        self.open_bytes.charge(CHUNK_COST)?;
-        if let Err(refused) = self.chunks.reserve(1).and_then(|()| self.starts.reserve(1)) {
-            self.open_bytes.release(CHUNK_COST);
-            return Err(refused);
-        }
+        // The chunk's block charged before the keys move into it: refused, they stay open.
+        let mut block = Reservation::new(Arc::clone(&self.budget));
+        block.charge(ChunkRef::COST)?;
+        self.chunks
+            .reserve(1)
+            .and_then(|()| self.starts.reserve(1))?;
         let start = self.start + self.len - self.open.len() as u64;
         let budget = &self.budget;
         let (keys, keys_charge) =
@@ -206,13 +228,16 @@ impl Suffix {
             std::mem::replace(&mut self.open_hashes, ChargedVec::new(Arc::clone(budget)))
                 .into_parts();
         let bytes = std::mem::replace(&mut self.open_bytes, Reservation::new(Arc::clone(budget)));
-        let chunk = ChunkRef(Some(Arc::new(Chunk {
-            start,
-            keys,
-            hashes,
-            _lists: [keys_charge, hashes_charge],
-            _bytes: bytes,
-        })));
+        let chunk = ChunkRef::with_reserved(
+            Chunk {
+                start,
+                keys,
+                hashes,
+                _lists: [keys_charge, hashes_charge],
+                _bytes: bytes,
+            },
+            block,
+        );
         // Room is reserved and charged: neither push grows its vector.
         self.chunks.push(chunk)?;
         self.starts.push(start)?;
@@ -247,6 +272,15 @@ impl Frozen {
             return None;
         }
         chunk_key(&self.chunks, &self.starts, id)
+    }
+
+    /// The entries with their ids, in id order.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (u64, &[u8])> {
+        self.chunks.iter().flat_map(|chunk| {
+            (chunk.start..)
+                .zip(chunk.keys.iter())
+                .map(|(id, key)| (id, &**key))
+        })
     }
 }
 

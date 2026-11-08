@@ -72,7 +72,7 @@ const TAG_TRIPLE: u8 = b'R';
 /// are interned first, so their ids are lower: the log and checkpoints replay keys in id
 /// order and find them.
 const TAG_TRIPLE_IDS: u8 = b'Q';
-const TRIPLE_KEY_LEN: usize = 25;
+pub(super) const TRIPLE_KEY_LEN: usize = 25;
 const SEP: u8 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -630,7 +630,21 @@ impl Dictionary {
     }
 
     /// The inline id of `term`, if it has one in this dictionary's encoding.
-    fn inline_id(&self, term: TermRef<'_>) -> Option<TermId> {
+    /// Whether the base's keys are stored compressed (what a lookup's scratch is sized by,
+    /// [`lookup_bytes`]).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "overlays read it; snapshots hold them from package 2b"
+        )
+    )]
+    pub(super) fn keys_compressed(&self) -> bool {
+        let inner = self.inner.read_recursive();
+        inner.base.as_ref().is_some_and(|base| base.codec.is_some())
+    }
+
+    pub(super) fn inline_id(&self, term: TermRef<'_>) -> Option<TermId> {
         match term {
             TermRef::Literal(literal) => {
                 try_inline_literal(literal, !self.integers_in_dictionary())
@@ -1591,7 +1605,8 @@ impl Dictionary {
     /// Reserves room for `suffix`'s entries, the next ids, so that installing them after the
     /// publisher's durable step allocates nothing and can't fail ([`Prepared::install`]).
     /// Under the writer slot, which `slot` proves: no one else adds entries until the install.
-    /// The room outlives a rebase meanwhile ([`Self::rebase`]). Refused, nothing changed.
+    /// The room outlives a rebase meanwhile ([`Self::rebase`]). Refused, the entries and the
+    /// promise are unchanged; room already grown may stay, as slack.
     #[cfg_attr(
         not(test),
         expect(
@@ -1929,7 +1944,7 @@ impl KeyBatch {
     }
 }
 
-fn graph_term(graph: GraphNameRef<'_>) -> Option<TermRef<'_>> {
+pub(super) fn graph_term(graph: GraphNameRef<'_>) -> Option<TermRef<'_>> {
     match graph {
         GraphNameRef::NamedNode(node) => Some(node.into()),
         GraphNameRef::BlankNode(node) => Some(node.into()),
@@ -1939,7 +1954,7 @@ fn graph_term(graph: GraphNameRef<'_>) -> Option<TermRef<'_>> {
 
 /// The most bytes a lookup of `term` allocates ([`Dictionary::lookup_charged`]), in a
 /// dictionary whose base's keys are `compressed` or not.
-fn lookup_bytes(term: TermRef<'_>, compressed: bool) -> usize {
+pub(super) fn lookup_bytes(term: TermRef<'_>, compressed: bool) -> usize {
     if let TermRef::Triple(triple) = term {
         let parts = [
             lookup_bytes(triple.subject.as_ref().into(), compressed),
@@ -1957,7 +1972,7 @@ fn lookup_bytes(term: TermRef<'_>, compressed: bool) -> usize {
 }
 
 /// The length of `term`'s key ([`encode_key`]), but a triple term's.
-fn encoded_len(term: TermRef<'_>) -> usize {
+pub(super) fn encoded_len(term: TermRef<'_>) -> usize {
     match term {
         TermRef::NamedNode(node) => 1 + node.as_str().len(),
         TermRef::BlankNode(node) => 1 + node.as_str().len(),
@@ -1976,7 +1991,7 @@ fn encoded_len(term: TermRef<'_>) -> usize {
     }
 }
 
-fn encode_key(term: TermRef<'_>, out: &mut Vec<u8>) -> TermKind {
+pub(super) fn encode_key(term: TermRef<'_>, out: &mut Vec<u8>) -> TermKind {
     match term {
         TermRef::NamedNode(node) => {
             out.push(TAG_IRI);
@@ -2067,7 +2082,7 @@ impl<'a> TermView<'a> {
     }
 }
 
-fn view_key(key: &[u8]) -> TermView<'_> {
+pub(super) fn view_key(key: &[u8]) -> TermView<'_> {
     let rest = &key[1..];
     let text = || std::str::from_utf8(rest).unwrap_or_default();
     match key[0] {
@@ -2099,7 +2114,7 @@ fn view_key(key: &[u8]) -> TermView<'_> {
     }
 }
 
-fn decode_key(key: &[u8]) -> Term {
+pub(super) fn decode_key(key: &[u8]) -> Term {
     let rest = &key[1..];
     let text = || std::str::from_utf8(rest).unwrap_or_default().to_owned();
     match key[0] {
@@ -2126,7 +2141,7 @@ fn decode_key(key: &[u8]) -> Term {
 }
 
 /// The key of a triple term with these component ids.
-fn triple_key(ids: [TermId; 3], out: &mut Vec<u8>) {
+pub(super) fn triple_key(ids: [TermId; 3], out: &mut Vec<u8>) {
     out.push(TAG_TRIPLE_IDS);
     for id in ids {
         out.extend_from_slice(&id.raw().to_be_bytes());
@@ -2134,7 +2149,7 @@ fn triple_key(ids: [TermId; 3], out: &mut Vec<u8>) {
 }
 
 /// The component ids of a triple term's key, if `key` is one.
-fn triple_ids(key: &[u8]) -> Option<[TermId; 3]> {
+pub(super) fn triple_ids(key: &[u8]) -> Option<[TermId; 3]> {
     if key.len() != TRIPLE_KEY_LEN || key[0] != TAG_TRIPLE_IDS {
         return None;
     }
