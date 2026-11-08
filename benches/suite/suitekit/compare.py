@@ -369,7 +369,7 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
                 if b["checks"][path] != n["checks"][path]:
                     out.add("Answers and completeness", f"{'':<28}{path}: {'/'.join(map(str, b['checks'][path]))} -> "
                             f"{'/'.join(map(str, n['checks'][path]))}")
-            if b["frontiers"] and n["frontiers"] and case not in unmeasured:
+            if b["frontiers"] and n["frontiers"]:
                 # Every repetition's run past the limit: its statuses, the medians of its metric and
                 # peak (one run alone is one sample; the A/B of 12 Oct 2026 had a 4,032 MiB first
                 # run beside three of 5,112-5,153).
@@ -378,11 +378,15 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
                     numbers = [[f.get(k) for f in runs if isinstance(f.get(k), (int, float))] for k in ("metric", "peak_mib")]
                     return ({f["status"] for f in runs}, *(statistics.median(v) if v else None for v in numbers))
                 (sb, mb, pb), (sn, mn, pn) = past(b), past(n)
+                # Its status is a finding about the new run whatever the input; its metric and peak only
+                # over the same input bytes (review r1 of pkg/compare-input-status, R1-W1).
                 worse = "ok" in sb and sn != {"ok"}
-                worse |= bool(pb and pn and pn > pb * 1.10 and pn - pb > 64)
+                measures = (f"metric and peak not compared: {unmeasured[case]}" if case in unmeasured
+                            else f"metric {mb} -> {mn}, peak {pb} -> {pn} MiB")
+                worse |= case not in unmeasured and bool(pb and pn and pn > pb * 1.10 and pn - pb > 64)
                 out.add("Answers and completeness",
                         f"{'':<28}past its limit ({len(b['frontiers'])} and {len(n['frontiers'])} runs, medians): "
-                        f"{','.join(sorted(sb))} -> {','.join(sorted(sn))}, metric {mb} -> {mn}, peak {pb} -> {pn} MiB"
+                        f"{','.join(sorted(sb))} -> {','.join(sorted(sn))}, {measures}"
                         + ("  WORSE" if worse else ""), worse)
             continue
         if case in unmeasured:
