@@ -171,12 +171,16 @@ fn a_late_build_of_a_revision_a_read_let_go_publishes_nothing() {
     let store = pooled(&members(200));
     let first = report(&store);
     assert_eq!(first.unavailable, None, "{first:?}");
+    // A reader holds the first revision's ontology, so its charge stays when the cache lets
+    // it go before the next cold build (N1): the squeeze below leaves U1 itself no room.
+    let reader = super::super::query::ontology_at(&store, &store.engine().snapshot()).unwrap();
     store
         .update_str_ungated("PREFIX : <urn:test:> INSERT DATA { :extra a :A . }")
         .unwrap();
     let hold = squeeze(&store, 0);
     let refused = report(&store);
     drop(hold);
+    drop(reader);
     let held = || lock(&store.dl().bounds.state).as_ref().map(|s| s.revision);
     assert_eq!(
         held(),
