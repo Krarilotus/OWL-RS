@@ -79,6 +79,8 @@ fn parse(turtle: &str) -> Parsed {
         individuals: BTreeSet::new(),
     };
     let mut named = BTreeSet::new();
+    // Declared data properties: neither classes nor saturated.
+    let mut data = BTreeSet::new();
     for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(turtle.as_bytes()) {
         let quad = quad.expect("a case parses");
         let (s, p, o) = (
@@ -94,10 +96,16 @@ fn parse(turtle: &str) -> Parsed {
             parsed.properties.insert(pi.clone());
             parsed.individuals.extend(si.iter().chain(&oi).cloned());
         } else if pi == RDF_TYPE {
-            if let (Some(s), Some(o)) = (&si, &oi)
-                && own(o)
-            {
-                parsed.individuals.insert(s.clone());
+            // A member of the case's own class, or a declared entity (generated cases).
+            if let (Some(s), Some(o)) = (&si, &oi) {
+                let declared = o.strip_prefix(OWL).unwrap_or_default();
+                if own(o) || declared == "NamedIndividual" {
+                    parsed.individuals.insert(s.clone());
+                } else if declared == "ObjectProperty" {
+                    parsed.properties.insert(s.clone());
+                } else if declared == "DatatypeProperty" {
+                    data.insert(s.clone());
+                }
             }
         } else if pi == format!("{OWL}onProperty") {
             parsed
@@ -105,9 +113,12 @@ fn parse(turtle: &str) -> Parsed {
                 .extend(oi.iter().filter(|t| own(t)).cloned());
         }
     }
+    parsed.properties.retain(|p| !data.contains(p));
     parsed.classes = named
         .into_iter()
-        .filter(|t| !parsed.properties.contains(t) && !parsed.individuals.contains(t))
+        .filter(|t| {
+            !parsed.properties.contains(t) && !parsed.individuals.contains(t) && !data.contains(t)
+        })
         .collect();
     parsed
 }
@@ -199,9 +210,19 @@ fn saturation(dl: &nrese_store::MutationPipeline, parsed: &Parsed) -> Result<Vec
 pub(crate) fn verdicts(case: &Case, relation: Relation) -> Vec<(Ruleset, Verdict)> {
     let both = |v: Verdict| vec![(Ruleset::Owl2Ql, v.clone()), (Ruleset::Owl2Rl, v)];
     let parsed = parse(case.turtle);
-    let dl = crate::dl::pipeline();
+    // Each owl2-dl task within a deadline and the tableau's node and branch budgets
+    // (design note, "The generator"): past them it can't decide, never agrees.
+    let dl = crate::dl::pipeline_with(nrese_store::DlConfig {
+        timeout: Some(std::time::Duration::from_secs(5)),
+        max_nodes: Some(100_000),
+        max_branch_points: Some(100_000),
+        ..nrese_store::DlConfig::default()
+    });
     if let Err(e) = crate::dl::insert(&dl, &parsed.lines.join("\n")) {
-        return both(match e.to_string().contains("inconsisten") {
+        // The commit gate names what it found ("violates … consistency check(s)").
+        let text = e.to_string();
+        let inconsistent = text.contains("inconsisten") || text.contains("consistency check");
+        return both(match inconsistent {
             true => Verdict::Inconsistent,
             false => Verdict::Undecided(format!("load: {e}")),
         });
@@ -405,4 +426,201 @@ fn the_review_fixtures_answer_as_the_dl_oracle() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A generated case (`nrese_owl::fuzz::templates::case`, all of SROIQ(D)) as N-Triples,
+/// with its family and its queries.
+fn generated(seed: u64) -> (String, &'static str, Vec<String>) {
+    use nrese_owl::fuzz::{Name, Profile, Rng, Signature, Sizes, templates};
+    let mut table = crate::dl::classification::Table::default();
+    for (_, iri) in nrese_owl::Vocabulary::iris() {
+        table.id(format!("<{iri}>"));
+    }
+    let sizes = Sizes {
+        object_properties: 3,
+        simple: 2,
+        individuals: 4,
+        ..Sizes::default()
+    };
+    let sig = Signature::new(sizes, &mut |name| match name {
+        Name::Iri(iri) => table.id(format!("<{iri}>")),
+        Name::Integer(i) => table.id(format!(
+            "\"{i}\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+        )),
+    });
+    let mut rng = Rng::new(seed);
+    // Depth 3 for a share of cases (design note, "Reuse"). The ABox is the case's own
+    // (named types and edges): the generator's negative and equality assertions made
+    // over a quarter of the first 40 cases inconsistent (`dlorc-g1-measure-442a326d`).
+    let profile = Profile {
+        axioms: 6,
+        depth: 2 + u32::from(rng.one_in(3)),
+        abox: false,
+        ..Profile::sroiq()
+    };
+    let case = templates::case(&mut rng, &sig, profile);
+    let vocabulary = nrese_owl::Vocabulary::new(&|iri| table.ids.get(&format!("<{iri}>")).copied());
+    let triples = nrese_owl::write(&case.ontology, &vocabulary, &mut table);
+    let text: String = triples
+        .iter()
+        .map(|t| t.map(|x| table.text[x as usize].clone()).join(" ") + " .\n")
+        .collect();
+    let iri = |t: nrese_owl::Term| table.text[t as usize].clone();
+    let queries = (0..2 + rng.below(3))
+        .map(|i| query(&mut rng, &sig, &case.focus[..], i % 2 == 0, &iri))
+        .collect();
+    (text, case.family, queries)
+}
+
+/// A tree-shaped conjunctive query of one to three atoms over `sig`, its classes and
+/// properties from `focus` where `prefer` (and `focus` has one of the kind). Rooted at `?x`
+/// (a SELECT) or at an individual (an ASK). Cyclic ones leave owl2-dl undecided
+/// (fixed-case run 2), so none is drawn.
+fn query(
+    rng: &mut nrese_owl::fuzz::Rng,
+    sig: &nrese_owl::fuzz::Signature,
+    focus: &[nrese_owl::Term],
+    prefer: bool,
+    iri: &dyn Fn(nrese_owl::Term) -> String,
+) -> String {
+    let from = |rng: &mut nrese_owl::fuzz::Rng, all: &[nrese_owl::Term]| {
+        let preferred: Vec<nrese_owl::Term> =
+            focus.iter().copied().filter(|t| all.contains(t)).collect();
+        let pool = match prefer && !preferred.is_empty() {
+            true => &preferred[..],
+            false => all,
+        };
+        iri(pool[rng.below(pool.len() as u64) as usize])
+    };
+    let ask = rng.one_in(2);
+    let root = match ask {
+        true => from(rng, &sig.individuals),
+        false => "?x".to_owned(),
+    };
+    let mut nodes = vec![root];
+    let mut atoms = Vec::new();
+    for i in 0..1 + rng.below(3) {
+        let at = nodes[rng.below(nodes.len() as u64) as usize].clone();
+        if rng.one_in(2) {
+            atoms.push(format!("{at} a {}", from(rng, &sig.classes)));
+        } else {
+            let (p, next) = (from(rng, &sig.object_properties), format!("?y{i}"));
+            atoms.push(match rng.one_in(3) {
+                true => format!("{next} {p} {at}"),
+                false => format!("{at} {p} {next}"),
+            });
+            nodes.push(next);
+        }
+    }
+    let body = atoms.join(" . ");
+    match ask {
+        true => format!("ASK {{ {body} }}"),
+        false => format!("SELECT ?x WHERE {{ {body} }}"),
+    }
+}
+
+/// The generator's cases (design note, "The generator", confirmed by the master 12:33).
+/// Under the direct relation, no QL or RL answer labelled `complete` misses a certain
+/// answer of owl2-dl, and none claimed `sound` holds an uncertain one. Each failure names
+/// its attribution, the saturated relation's verdict: missed there too, through anonymous
+/// individuals (the I24b ledger); agreed there, a named individual's (the I24c
+/// classification). The undecided cases are at most a fifth, in total and in each family
+/// with ten verdicts or more; every family's counts are printed (`FAMILY` lines).
+///
+/// `NRESE_FUZZ_SEED` varies the seeds; `NRESE_FUZZ_CASES` sets their number.
+#[test]
+fn generated_cases_answer_as_the_dl_oracle() {
+    let env = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse().ok());
+    let base: u64 = env("NRESE_FUZZ_SEED").unwrap_or(0);
+    // 100 cases, about 49 s on one test thread (0.49 s a case, redraws included:
+    // `dlorc-g1-measure3b-875092fd`, 120 cases in 58.6 s).
+    let cases: u64 = env("NRESE_FUZZ_CASES").unwrap_or(100);
+    let mut counts: std::collections::BTreeMap<&str, [usize; 6]> = Default::default();
+    let mut failures = Vec::new();
+    let mut redrawn = 0;
+    for i in 0..cases {
+        // An inconsistent case says nothing of `complete` here, so it is drawn again, up to
+        // three times (counted), and the families keep their share: nearly half the
+        // verdicts of `dlorc-g1-measure2-6cc10f32` were inconsistent.
+        let mut tries = 0u64;
+        let (seed, turtle, family, queries, first) = loop {
+            let seed = (i ^ base.wrapping_mul(0x9e37_79b9_7f4a_7c15)).wrapping_add(tries << 40);
+            let (turtle, family, queries) = generated(seed);
+            let case = Case {
+                name: family,
+                turtle: &turtle,
+                query: &queries[0],
+            };
+            let first = verdicts(&case, Relation::Direct);
+            if tries == 3 || !first.iter().any(|(_, v)| *v == Verdict::Inconsistent) {
+                break (seed, turtle, family, queries, first);
+            }
+            tries += 1;
+            redrawn += 1;
+        };
+        for (n, query) in queries.iter().enumerate() {
+            let case = Case {
+                name: family,
+                turtle: &turtle,
+                query,
+            };
+            let found = match n {
+                0 => first.clone(),
+                _ => verdicts(&case, Relation::Direct),
+            };
+            for (ruleset, verdict) in found {
+                if let Verdict::Undecided(why) = &verdict {
+                    let why: String = why.chars().take(120).collect();
+                    eprintln!(
+                        "UNDECIDED seed {seed} ({family}), {}: {why}",
+                        ruleset.name()
+                    );
+                }
+                let class = match verdict {
+                    Verdict::Agree => 0,
+                    Verdict::Reported => 1,
+                    Verdict::Missed(_) => 2,
+                    Verdict::Extra(_) => 3,
+                    Verdict::Undecided(_) => 4,
+                    Verdict::Inconsistent => 5,
+                };
+                counts.entry(family).or_default()[class] += 1;
+                if matches!(class, 2 | 3) {
+                    let saturated = verdicts(&case, Relation::Claim)
+                        .into_iter()
+                        .find(|(r, _)| *r == ruleset)
+                        .map(|(_, v)| v);
+                    failures.push(format!(
+                        "seed {seed} ({family}), {}: {verdict:?}; saturated: {saturated:?}\n\
+                         {query}\n{turtle}",
+                        ruleset.name()
+                    ));
+                }
+            }
+        }
+    }
+    let undecided = |c: &[usize; 6]| (c[4], c.iter().sum::<usize>());
+    let mut total = [0usize; 6];
+    let mut inconclusive = Vec::new();
+    for (family, c) in &counts {
+        eprintln!(
+            "FAMILY {family}: agree {}, reported {}, missed {}, extra {}, undecided {}, \
+             inconsistent {}",
+            c[0], c[1], c[2], c[3], c[4], c[5]
+        );
+        let (u, n) = undecided(c);
+        if n >= 10 && 5 * u > n {
+            inconclusive.push(format!("{family}: {u} of {n} undecided"));
+        }
+        for (t, x) in total.iter_mut().zip(c) {
+            *t += x;
+        }
+    }
+    eprintln!("REDRAWN {redrawn} inconsistent cases");
+    let (u, n) = undecided(&total);
+    if 5 * u > n {
+        inconclusive.push(format!("total: {u} of {n} undecided"));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    assert!(inconclusive.is_empty(), "{}", inconclusive.join("\n"));
 }

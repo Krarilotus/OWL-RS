@@ -24,6 +24,8 @@ use crate::model::{
     RangeId, Term, canonical,
 };
 
+pub mod templates;
+
 /// The IRIs of generated entities: `{FUZZ}C0`, `{FUZZ}p0`, `{FUZZ}d0`, `{FUZZ}a0`.
 pub const FUZZ: &str = "http://example.org/fuzz#";
 const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
