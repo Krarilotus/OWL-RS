@@ -222,6 +222,57 @@ fn a_stopped_materialisation_is_never_reported_complete() {
     }
 }
 
+/// An equality materialisation's expanded listing (every identity of a class) counts each
+/// fact's copies as it makes them: one class of 1000 identities lists about a million
+/// copies of its `sameAs` facts, a product far above `POLL_UNITS`, and the listing asks its
+/// stop at least once every `POLL_UNITS` copies. So a stop that fires while a product is
+/// made is seen within `POLL_UNITS` copies, and the materialisation ends `Interrupted`
+/// (REAS-2's invariant; a whole product counted at once was one ask for all its copies).
+#[test]
+fn an_expanded_listing_stops_within_its_poll_interval() {
+    use crate::rulesets::Ruleset;
+    let n = 1000;
+    let mut vocabulary = LocalVocabulary::default();
+    let text: Vec<String> = (1..n)
+        .map(|i| format!("ex:a{i} owl:sameAs ex:a0"))
+        .collect();
+    let input = load(&mut vocabulary, &text.join("\n"));
+    let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+    let schema = Schema::owl(&mut vocabulary);
+    let materialise = |stop: crate::eval::Stop<'_>| {
+        batch::materialise_representatives_until(
+            batch::Input::Facts(input.clone()),
+            &rules,
+            None,
+            &schema,
+            batch::Listing::Expanded,
+            stop,
+        )
+    };
+    let asks = AtomicUsize::new(0);
+    let whole = materialise(&|| {
+        asks.fetch_add(1, Ordering::Relaxed);
+        false
+    })
+    .expect("runs");
+    let interval = nrese_exec::POLL_UNITS as usize;
+    let copies = whole.derived.len();
+    assert!(
+        copies >= 100 * interval,
+        "{copies} copies: the class's product must be far above POLL_UNITS"
+    );
+    let polls = asks.load(Ordering::Relaxed);
+    assert!(
+        polls >= copies / interval,
+        "{polls} asks of the stop for {copies} copies: more than {interval} copies made \
+         between two of them"
+    );
+    // A stop that fires at the middle ask, most of which the listing makes, and stays fired.
+    let seen = AtomicUsize::new(0);
+    let stopped = materialise(&|| seen.fetch_add(1, Ordering::Relaxed) >= polls / 2);
+    assert_eq!(stopped.err(), Some(Interrupted::default()));
+}
+
 /// A support-set update (graph access) whose change's forward cone is one driver joined
 /// with two atoms of 300 facts each: once its caller's stop fires, the round under way
 /// ends within `POLL_UNITS` scanned facts plus the two scans open on its stack, and the
