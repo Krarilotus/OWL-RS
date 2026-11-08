@@ -12,9 +12,10 @@
 //!     nra:owner <urn:nrese:user:alice> ; nra:viewer <urn:nrese:user:bob> ; nra:id 7 .
 //! ```
 //!
-//! `nra:id` is the number of the change that created a workspace, or a user with a local
-//! login: its graph prefix carries it, so a name used again starts empty
-//! ([`super::AccessState::prefix`]). Records from before ids have none.
+//! `nra:id` is the number of the change that created a workspace, or that first gave a user
+//! record created after ids a local login: its graph prefix carries it, so a name used again
+//! starts empty ([`super::AccessState::prefix`]). `nra:created` is the number of the change
+//! that created a user record. Records from before ids have neither.
 
 use std::collections::BTreeMap;
 
@@ -161,6 +162,9 @@ pub(super) fn encode(state: &AccessState, graph: &NamedNode) -> Vec<Quad> {
         if let Some(hash) = &user.password_hash {
             push(&subject, "passwordHash", text(hash));
         }
+        if let Some(number) = user.created {
+            push(&subject, "created", id(number));
+        }
         if let Some(number) = user.id {
             push(&subject, "id", id(number));
         }
@@ -231,7 +235,8 @@ pub(super) fn decode(quads: &[Quad], base: &str) -> AccessState {
         };
         let flag = |local: &str| get(local).is_some_and(|v| v == "true" || v == "1");
         // A record from before ids has none: its space keeps its prefix (SYN-64).
-        let id = || get("id").and_then(|v| v.parse::<u64>().ok());
+        let number = |local: &str| get(local).and_then(|v| v.parse::<u64>().ok());
+        let id = || number("id");
         if subject == SETTINGS {
             let settings = &mut state.settings;
             settings.enforced = flag("enforced");
@@ -281,6 +286,7 @@ pub(super) fn decode(quads: &[Quad], base: &str) -> AccessState {
             user.admin = flag("admin");
             user.roles = all("role").into_iter().collect();
             user.password_hash = get("passwordHash");
+            user.created = number("created");
             user.id = id();
         } else if subject.starts_with(WORKSPACE) {
             let workspace = state.workspaces.entry(name).or_default();

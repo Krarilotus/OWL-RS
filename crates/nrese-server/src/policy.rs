@@ -19,7 +19,8 @@ pub struct PolicyConfig {
     pub access: Option<std::sync::Arc<crate::access::AccessPolicy>>,
     /// What workspace graph prefixes start with (`urn:nrese:` by default): a personal
     /// space is `{base}space/{user}/`, a workspace `{base}workspace/{name}~{id}/`, and a local
-    /// user's space `{base}space/{user}~{id}/` (`nrese_store::access::AccessState::prefix`).
+    /// user's space, its record created after ids, `{base}space/{user}~{id}/`
+    /// (`nrese_store::access::AccessState::prefix`).
     pub workspace_base: String,
     /// Whether users of the access state log in with their passwords (`Basic`
     /// credentials, or a session from `POST /api/v1/access/login`), besides the
