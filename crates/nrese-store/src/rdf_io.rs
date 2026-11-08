@@ -71,8 +71,21 @@ pub(crate) fn parse_graph(
         .collect()
 }
 
+/// `quad` as the store keeps it: in the default graph where its graph is another store's name
+/// for it (`urn:x-arq:DefaultGraph`, `urn:x-rdflib:default`: [`nrese_sparql::compat`]), which
+/// every SPARQL name of it reads; otherwise as it is. Every dataset input passes its quads
+/// through here: request payloads, restores, quarantine replays and bulk loads.
+pub(crate) fn stored(mut quad: Quad) -> Quad {
+    if let GraphName::NamedNode(graph) = &quad.graph_name
+        && nrese_sparql::compat::names_default_graph(graph.as_str())
+    {
+        quad.graph_name = GraphName::DefaultGraph;
+    }
+    quad
+}
+
 /// Parses a request payload into quads, in the graphs it names (the default graph for
-/// triples), with fresh blank nodes.
+/// triples, and for another store's name for it: [`stored`]), with fresh blank nodes.
 pub fn parse_payload(
     format: GraphResultFormat,
     base_iri: Option<&str>,
@@ -80,7 +93,7 @@ pub fn parse_payload(
 ) -> StoreResult<Vec<Quad>> {
     parser(format.rdf_format(), base_iri, BlankNodes::Fresh)?
         .for_slice(payload)
-        .map(|quad| quad.map_err(StoreError::from))
+        .map(|quad| quad.map(stored).map_err(StoreError::from))
         .collect()
 }
 
@@ -93,15 +106,15 @@ pub fn parse_payload_preserving_blank_nodes(
 ) -> StoreResult<Vec<Quad>> {
     parser(format.rdf_format(), base_iri, BlankNodes::AsWritten)?
         .for_slice(payload)
-        .map(|quad| quad.map_err(StoreError::from))
+        .map(|quad| quad.map(stored).map_err(StoreError::from))
         .collect()
 }
 
-/// Parses a dataset payload (N-Quads) into quads.
+/// Parses a dataset payload (N-Quads) into quads, in the graphs [`stored`] keeps them in.
 pub(crate) fn parse_dataset(format: RdfFormat, payload: &[u8]) -> StoreResult<Vec<Quad>> {
     parser(format, None, BlankNodes::Fresh)?
         .for_slice(payload)
-        .map(|quad| quad.map_err(StoreError::RdfParse))
+        .map(|quad| quad.map(stored).map_err(StoreError::RdfParse))
         .collect()
 }
 
