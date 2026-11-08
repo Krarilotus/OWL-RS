@@ -39,17 +39,72 @@ use nrese_reasoner::delta::{self, Base};
 use nrese_reasoner::eval::{GroundProgram, Schema, Stop};
 use nrese_reasoner::ir::{self, Triple};
 
-/// U1's own facts beyond its input, indexed for every bound pattern.
-#[derive(Debug, Default, Clone)]
+/// U1's own facts beyond its input, indexed for every bound pattern. What it holds is charged
+/// to `held` before it grows ([`Self::try_insert`], SYN-61); a fact's share is released once
+/// it is removed and the trees have freed what they free.
+#[derive(Debug, Default)]
 pub struct Stack {
     spo: BTreeSet<[u64; 3]>,
     pos: BTreeSet<[u64; 3]>,
     osp: BTreeSet<[u64; 3]>,
     /// Facts per predicate, for the delta executor's estimates.
     per_predicate: std::collections::HashMap<u64, usize>,
+    /// Last: released after the trees and table it covers are freed.
+    held: Option<nrese_exec::Reservation>,
 }
 
+/// The largest node of the stack's trees: std's B-tree (B = 6) internal node, 11 keys, 12
+/// child links, a parent link and two 16-bit counts, aligned.
+const TREE_NODE: usize =
+    (11 * size_of::<[u64; 3]>() + 13 * size_of::<usize>() + 4).next_multiple_of(8);
+/// An upper bound on what one fact takes in each tree: every node but the root holds at
+/// least 5 keys, after an insert and after a remove alike (std's B-tree rebalances an
+/// underfull node), so the nodes number at most one per 5 keys, the root aside.
+const TREE_FACT: usize = TREE_NODE.div_ceil(5);
+/// An upper bound on what one more predicate takes in the per-predicate table: an entry and
+/// its control byte at a load of 7/8 rounded up to a power of two (so at most 16/7 slots an
+/// entry), the old table beside the new one while it grows (half as many again).
+const PREDICATE: usize = (16 + 1) * 16 * 3 / (7 * 2) + 1;
+/// What the stack takes once it holds anything: each tree's root, which may hold fewer than 5
+/// keys, and the table's smallest allocation (4 slots and its control group), twice over while
+/// it grows.
+const FIRST: usize = 3 * TREE_NODE + 2 * (4 * (16 + 1) + 16);
+
 impl Stack {
+    /// An empty stack charging what it holds to `budget`.
+    pub fn within(budget: &std::sync::Arc<nrese_exec::Budget>) -> Self {
+        Self {
+            held: Some(nrese_exec::Reservation::new(std::sync::Arc::clone(budget))),
+            ..Self::default()
+        }
+    }
+
+    /// [`Self::insert`], charging what the fact takes first; nothing is inserted where the
+    /// budget can't take it.
+    pub fn try_insert(&mut self, t: Triple) -> Result<bool, nrese_exec::BudgetExceeded> {
+        if self.spo.contains(&t) {
+            return Ok(false);
+        }
+        if let Some(held) = &mut self.held {
+            // Charged once and kept: the roots and the table, which removes don't shrink.
+            let first = if held.bytes() == 0 { FIRST } else { 0 };
+            let predicate = match self.per_predicate.contains_key(&t[1]) {
+                true => 0,
+                false => PREDICATE,
+            };
+            held.charge(3 * TREE_FACT + first + predicate)?;
+        }
+        Ok(self.insert(t))
+    }
+
+    /// [`Self::remove`], releasing the fact's share of the trees once they have freed it.
+    pub fn remove_charged(&mut self, t: Triple) -> bool {
+        let removed = self.remove(t);
+        if removed && let Some(held) = &mut self.held {
+            held.release(3 * TREE_FACT);
+        }
+        removed
+    }
     pub fn len(&self) -> usize {
         self.spo.len()
     }
@@ -62,7 +117,8 @@ impl Stack {
         self.spo.contains(t)
     }
 
-    pub fn insert(&mut self, [s, p, o]: Triple) -> bool {
+    /// Uncharged: [`Self::try_insert`] outside this module.
+    fn insert(&mut self, [s, p, o]: Triple) -> bool {
         if !self.spo.insert([s, p, o]) {
             return false;
         }
@@ -72,7 +128,8 @@ impl Stack {
         true
     }
 
-    pub fn remove(&mut self, [s, p, o]: Triple) -> bool {
+    /// Uncharged: [`Self::remove_charged`] outside this module.
+    fn remove(&mut self, [s, p, o]: Triple) -> bool {
         if !self.spo.remove(&[s, p, o]) {
             return false;
         }
@@ -565,6 +622,7 @@ impl Upper {
         view: &Snapshot,
         resolve: &dyn Fn(TermRef<'_>) -> Option<TermId>,
         stop: Stop<'_>,
+        kept: &std::sync::Arc<nrese_exec::Budget>,
     ) -> Result<Self, GaveUp> {
         check_stop(stop)?;
         let started = Instant::now();
@@ -619,19 +677,24 @@ impl Upper {
         )
         .map_err(|_| GaveUp("the upper bound's evaluation was stopped".to_owned()))?;
         let same_as = program.names.same_as;
-        let mut stack = Stack::default();
+        // What U1 keeps of the evaluation, charged to `kept` before it is made (SYN-61); the
+        // evaluation's own working set is watched (`stop`), as the support sets' is.
+        let mut stack = Stack::within(kept);
+        let refused = |_| GaveUp("its facts don't fit the queries' memory".to_owned());
         for (i, t) in m.derived.into_iter().enumerate() {
             if i % 1024 == 0 {
                 check_stop(stop)?;
             }
-            stack.insert(t);
+            stack.try_insert(t).map_err(refused)?;
         }
         for (representative, members) in m.classes.classes() {
             for (i, &member) in members.iter().filter(|&&m| m != representative).enumerate() {
                 if i % 1024 == 0 {
                     check_stop(stop)?;
                 }
-                stack.insert([member, same_as, representative]);
+                stack
+                    .try_insert([member, same_as, representative])
+                    .map_err(refused)?;
             }
         }
         let s = &program.signature;
@@ -766,19 +829,21 @@ impl Upper {
     }
 
     /// Applies a commit's change ([`Self::change`]) once the commit is done, the literals
-    /// it read by value first among them.
-    pub fn apply(&mut self, change: Change) {
+    /// it read by value first among them. Refused where the stack's budget can't take its
+    /// new facts: U1 is then partly changed, and not to be kept.
+    pub fn apply(&mut self, change: Change) -> Result<(), nrese_exec::BudgetExceeded> {
         for t in change.moved.into_iter().chain(change.remove) {
-            self.stack.remove(t);
+            self.stack.remove_charged(t);
         }
         for t in change.insert {
-            self.stack.insert(t);
+            self.stack.try_insert(t)?;
         }
         if let Some(program) = change.program {
             self.ground = Some(program);
         }
         self.values.absorb(change.noted);
         self.elapsed = change.elapsed;
+        Ok(())
     }
 
     /// The clashes the stack would have after `change`.

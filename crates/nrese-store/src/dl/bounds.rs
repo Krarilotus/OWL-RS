@@ -350,6 +350,7 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         &pending,
         &|t| Some(tx.intern(t)),
         &stop,
+        store.dl().bounds.kept(),
     );
     Preparation {
         base,
@@ -440,7 +441,12 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
                         *state = None;
                         return;
                     };
-                    upper.apply(*change);
+                    // The stack's budget couldn't take the change: U1 is partly changed,
+                    // and the next read builds it afresh (or finds it doesn't fit).
+                    if upper.apply(*change).is_err() {
+                        *state = None;
+                        return;
+                    }
                 }
                 s.revision = revision;
                 s.last = "delta";
@@ -606,7 +612,8 @@ fn afresh(store: &StoreService, snapshot: &Snapshot) -> (Result<Upper, GaveUp>, 
     let resolve = |t: nrese_rdf::TermRef<'_>| source::resolve(replica, &tx, t);
     #[cfg(test)]
     seam::at(&store.dl().bounds, seam::Point::Build);
-    let upper = Upper::build(&ontology, &normalised, snapshot, &resolve, &stop);
+    let kept = store.dl().bounds.kept();
+    let upper = Upper::build(&ontology, &normalised, snapshot, &resolve, &stop, kept);
     (upper, false)
 }
 
@@ -949,6 +956,7 @@ pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[Str
             &snapshot,
             &|t| source::resolve(replica, &tx, t),
             &stop,
+            store.dl().bounds.kept(),
         )
         .ok()?;
         upper.stack.iter().collect()
