@@ -169,10 +169,10 @@ fn steps(path: &Path, from_link: bool) -> Vec<(Step, bool)> {
 /// symbolic link; on Windows a junction too) is followed: its own entry's holder counted, then
 /// its target walked the same way (an absolute target from its start, a relative one from the
 /// link's directory), so a link's name and its target's whole chain are both in the holders.
-/// `..` steps to the physical parent. Refused: a link whose target isn't there (dangling), more
-/// than [`MAX_LINKS`] links (a loop), an entry that isn't a directory, a `..` past a missing
-/// name. Holders are deduplicated by their canonical path (a junction's target is spelled
-/// `\\?\…`).
+/// `..` steps to the physical parent on Unix; Windows takes `..` lexically first ([`as_walked`]).
+/// Refused: a link whose target isn't there (dangling), more than [`MAX_LINKS`] links (a loop),
+/// an entry that isn't a directory, a `..` past a missing name. Holders are deduplicated by
+/// their canonical path (a junction's target is spelled `\\?\…`).
 fn resolve(path: &Path) -> std::io::Result<Resolution> {
     use std::collections::VecDeque;
     use std::io::{Error, ErrorKind};
@@ -181,7 +181,7 @@ fn resolve(path: &Path) -> std::io::Result<Resolution> {
     let mut current = PathBuf::new();
     let mut missing = Vec::new();
     let mut links = 0;
-    let mut queue: VecDeque<(Step, bool)> = steps(path, false).into();
+    let mut queue: VecDeque<(Step, bool)> = steps(&as_walked(path), false).into();
     while let Some((step, from_link)) = queue.pop_front() {
         if !missing.is_empty() {
             match step {
@@ -225,6 +225,10 @@ fn resolve(path: &Path) -> std::io::Result<Resolution> {
                             )));
                         }
                         let target = fs::read_link(&entry)?;
+                        // Windows resolves a relative target against the link's directory, `..`
+                        // taken lexically; Unix walks it from there physically.
+                        #[cfg(windows)]
+                        let target = as_walked(&current.join(&target));
                         hold(&mut holders, &mut seen, holder);
                         for step in steps(&target, true).into_iter().rev() {
                             queue.push_front(step);
@@ -257,6 +261,43 @@ fn resolve(path: &Path) -> std::io::Result<Resolution> {
         reached: current,
         missing,
     })
+}
+
+/// The path the file system walks for `path`. Unix: `path` as it is (its `..` taken physically
+/// as the walk reaches it). Windows: a path that isn't verbatim (`\\?\…`) has its `.` and `..`
+/// taken lexically first, as Windows normalises a path before the file system sees it, so
+/// `alias\..\x` is `x` whatever `alias` points to (sol-loop round 1, S1); a relative path keeps
+/// its leading `..`, and a root's `..` is the root.
+fn as_walked(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let verbatim = matches!(
+            path.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(
+                prefix.kind(),
+                Prefix::Verbatim(_) | Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(..)
+            )
+        );
+        if !verbatim {
+            let mut walked = PathBuf::new();
+            for component in path.components() {
+                match component {
+                    Component::CurDir => {}
+                    Component::ParentDir => match walked.components().next_back() {
+                        Some(Component::Normal(_)) => {
+                            walked.pop();
+                        }
+                        Some(Component::RootDir | Component::Prefix(_)) => {}
+                        _ => walked.push(".."),
+                    },
+                    other => walked.push(other.as_os_str()),
+                }
+            }
+            return walked;
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Adds `holder` to `holders` unless it's there already under some spelling.
