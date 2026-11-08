@@ -1102,6 +1102,48 @@ fn a_directory_is_made_only_where_its_name_can_be_made_durable() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Every directory a store, its log or archive, a restore, a backup or a replica's bootstrap
+/// places what recovery reads in is made through the placement owner (sol-loop round 3 on review
+/// r1, S1): a directory made elsewhere, then found by `place::create_dir_all`, is taken for one
+/// provisioned beforehand where its holder can't be synced, and its name is never made durable
+/// (replica bootstrap made its data directory that way). A source scan of those callers, their
+/// test modules left out.
+#[test]
+fn store_directories_are_made_through_the_placement_owner() {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let files = [
+        "nrese-engine/src/durability/mod.rs",
+        "nrese-engine/src/durability/wal.rs",
+        "nrese-engine/src/durability/tail.rs",
+        "nrese-engine/src/durability/checkpoint.rs",
+        "nrese-store/src/image_backup.rs",
+        "nrese-store/src/catalog.rs",
+        "nrese-store/src/metadata.rs",
+        "nrese-server/src/replication.rs",
+    ];
+    let mut found = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(crates.join(file)).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        for (n, line) in lines.iter().enumerate() {
+            let tests_begin = line.trim() == "#[cfg(test)]"
+                && lines
+                    .get(n + 1)
+                    .is_some_and(|next| next.trim_start().starts_with("mod tests"));
+            if tests_begin {
+                break;
+            }
+            if line.contains("create_dir_all(") && !line.contains("place::create_dir_all(") {
+                found.push(format!("{file}:{}: {}", n + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        found.is_empty(),
+        "made outside durability::place: {found:#?}"
+    );
+}
+
 /// What an open replayed is durable before it takes new commits (F5): the segments it
 /// replayed records from are synced. Before the fix nothing was, so under `OsBuffered` (or an
 /// `EveryCommit` record written but not synced when the process died) a power loss after the
