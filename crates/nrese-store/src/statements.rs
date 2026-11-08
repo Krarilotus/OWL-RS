@@ -64,11 +64,14 @@ impl StatementPattern {
             (_, false) => self
                 .contexts
                 .iter()
-                .filter_map(|context| match context {
-                    GraphName::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
-                    GraphName::NamedNode(n) => view.lookup(n.as_ref().into()),
-                    GraphName::BlankNode(b) => view.lookup(b.as_ref().into()),
-                })
+                // Each context as the store places it (`rdf_io::stored_graph`).
+                .filter_map(
+                    |context| match crate::rdf_io::stored_graph(context.clone()) {
+                        GraphName::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
+                        GraphName::NamedNode(n) => view.lookup(n.as_ref().into()),
+                        GraphName::BlankNode(b) => view.lookup(b.as_ref().into()),
+                    },
+                )
                 .collect(),
         };
         if let Some(access) = access {
@@ -92,22 +95,23 @@ pub struct RdfPayload {
 }
 
 impl RdfPayload {
-    /// The payload's statements placed per `contexts` (module docs).
+    /// The payload's statements placed per `contexts` (module docs), each in the graph the
+    /// store keeps it in (`rdf_io::stored`), after the contexts replace the payload's own.
     fn quads(&self, contexts: &[GraphName]) -> StoreResult<Vec<Quad>> {
         let parsed = parse_payload(self.format, self.base_iri.as_deref(), &self.payload)?;
         if contexts.is_empty() {
-            return Ok(parsed);
+            return Ok(parsed.into_iter().map(crate::rdf_io::stored).collect());
         }
         Ok(parsed
             .iter()
             .flat_map(|quad| {
                 contexts.iter().map(|graph| {
-                    Quad::new(
+                    crate::rdf_io::stored(Quad::new(
                         quad.subject.clone(),
                         quad.predicate.clone(),
                         quad.object.clone(),
                         graph.clone(),
-                    )
+                    ))
                 })
             })
             .collect())
