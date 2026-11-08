@@ -46,6 +46,7 @@ use super::offsets::{Ends, Offsets};
 use super::order::Key;
 use super::pending::{Adopted, NEW, Pending};
 use super::pieces::{BLOCK, Block, Heap, Inner, Segment, View};
+use super::suffix::{PrepareError, Prepared, Suffix};
 use super::vocabulary::{Codec, Sample};
 use super::{TermId, TermKind, inline_to_literal, try_inline_literal};
 use crate::error::{EngineError, EngineResult};
@@ -71,7 +72,7 @@ const TAG_TRIPLE: u8 = b'R';
 /// are interned first, so their ids are lower: the log and checkpoints replay keys in id
 /// order and find them.
 const TAG_TRIPLE_IDS: u8 = b'Q';
-const TRIPLE_KEY_LEN: usize = 25;
+pub(super) const TRIPLE_KEY_LEN: usize = 25;
 const SEP: u8 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -586,6 +587,32 @@ impl Dictionary {
         HeldView(self.view())
     }
 
+    /// Test support: the entries a prepared install has room promised for.
+    #[cfg(test)]
+    pub(crate) fn promised(&self) -> usize {
+        self.inner.read().promised()
+    }
+
+    /// Test support: whether a rebase on this thread finds no room for a prepared install's
+    /// promise, as an allocator out of it would.
+    #[cfg(test)]
+    pub(crate) fn refuse_promised_room(refuse: bool) {
+        super::pieces::REFUSE_PROMISED_ROOM.with(|cell| cell.set(refuse));
+    }
+
+    /// Test support: the keys in the heap's tail, unsealed.
+    #[cfg(test)]
+    pub(crate) fn tail_len(&self) -> usize {
+        self.inner.read().heap.tail.len()
+    }
+
+    /// Test support: whether a writer holds the entries' lock or is queued for it, so that a
+    /// plain (not recursive) read waits behind it: such a read then fails to start.
+    #[cfg(test)]
+    pub(crate) fn writer_waiting(&self) -> bool {
+        self.inner.try_read().is_none()
+    }
+
     /// Number of dictionary entries (inline terms are not counted).
     pub fn len(&self) -> u64 {
         self.inner.read().len()
@@ -610,7 +637,7 @@ impl Dictionary {
     }
 
     /// The inline id of `term`, if it has one in this dictionary's encoding.
-    fn inline_id(&self, term: TermRef<'_>) -> Option<TermId> {
+    pub(super) fn inline_id(&self, term: TermRef<'_>) -> Option<TermId> {
         match term {
             TermRef::Literal(literal) => {
                 try_inline_literal(literal, !self.integers_in_dictionary())
@@ -1568,6 +1595,81 @@ impl Dictionary {
         Ok(())
     }
 
+    /// Reserves room for `suffix`'s entries, the next ids, so that installing them after the
+    /// publisher's durable step allocates nothing and can't fail ([`Prepared::install`]).
+    /// Under the writer slot, which `slot` proves: no one else adds entries until the install.
+    /// The room outlives a rebase meanwhile ([`Self::rebase`]). Refused, the entries and the
+    /// promise are unchanged; room already grown may stay, as slack.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "publications prepare with it in package 9 (activation)"
+        )
+    )]
+    pub(crate) fn prepare<'s>(
+        &'s self,
+        slot: &'s super::slot::WriterGuard<'s>,
+        suffix: &'s Suffix,
+    ) -> Result<Prepared<'s>, PrepareError> {
+        let end = suffix.start().checked_add(suffix.len());
+        if end.is_none_or(|end| end > super::pending::PROVISIONAL) {
+            return Err(PrepareError::Full);
+        }
+        // What waiting for a lock allocates on this thread, made now: the install waits for
+        // readers on this thread (`Prepared` can't leave it), after the durable step.
+        super::slot::warm_parking();
+        let mut inner = self.inner.write();
+        if inner.len() != suffix.start() {
+            return Err(PrepareError::Diverged {
+                start: suffix.start(),
+                len: inner.len(),
+            });
+        }
+        let more = usize::try_from(suffix.len()).map_err(|_| PrepareError::NoRoom)?;
+        inner.promise(more).map_err(|_| PrepareError::NoRoom)?;
+        Ok(Prepared {
+            dictionary: self,
+            suffix,
+            installed: false,
+            _slot: slot,
+            _here: std::marker::PhantomData,
+        })
+    }
+
+    /// [`Prepared::install`]: `suffix`'s keys, the next ids, into the room promised.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "publications install with it in package 9 (activation)"
+        )
+    )]
+    pub(super) fn install_suffix(&self, suffix: &Suffix) {
+        let mut inner = self.inner.write();
+        debug_assert_eq!(inner.len(), suffix.start(), "prepared at this length");
+        debug_assert!(inner.promised() as u64 >= suffix.len(), "room promised");
+        inner.install(suffix.keys());
+    }
+
+    /// A prepared install given up (dropped): the room stays as slack.
+    pub(super) fn unpromise(&self) {
+        self.inner.write().unpromise();
+    }
+
+    /// Seals installed keys into blocks (the tail an install leaves unsealed), copying them
+    /// once. Ids and keys stay as they were. Under the writer slot, after the publication.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "publications seal after their install in package 9"
+        )
+    )]
+    pub(crate) fn seal(&self, _slot: &super::slot::WriterGuard<'_>) {
+        self.inner.write().seal();
+    }
+
     /// Serves the entries `0..base.len` from `base`, a checkpoint of them that this engine
     /// has written, instead of from memory or an older checkpoint; later entries stay in
     /// memory. `false` (and nothing changes) if the dictionary already uses a longer base.
@@ -1589,6 +1691,14 @@ impl Dictionary {
         for index in len..inner.len() {
             let key = inner.key(index);
             next.push(&key, key_hash(&key));
+        }
+        // A prepared install's room, reserved in the new state too, past the entries it holds
+        // now, or the rebase gives up and nothing changes: the install allocates nothing
+        // either way ([`Self::prepare`]).
+        if next.keep_promise(&inner).is_err() {
+            return Err(EngineError::Io(std::io::Error::from(
+                std::io::ErrorKind::OutOfMemory,
+            )));
         }
         *inner = next;
         // The in-memory text order covered entries the base orders now.
@@ -1827,7 +1937,7 @@ impl KeyBatch {
     }
 }
 
-fn graph_term(graph: GraphNameRef<'_>) -> Option<TermRef<'_>> {
+pub(super) fn graph_term(graph: GraphNameRef<'_>) -> Option<TermRef<'_>> {
     match graph {
         GraphNameRef::NamedNode(node) => Some(node.into()),
         GraphNameRef::BlankNode(node) => Some(node.into()),
@@ -1846,7 +1956,13 @@ fn lookup_bytes(term: TermRef<'_>, compressed: bool) -> usize {
         ];
         return parts.into_iter().max().unwrap_or(0).max(TRIPLE_KEY_LEN);
     }
-    let encoded = encoded_len(term);
+    key_lookup_bytes(encoded_len(term), compressed)
+}
+
+/// The most bytes a lookup of a key of `encoded` bytes allocates ([`lookup_bytes`] of a term
+/// that isn't a triple term): its key, grown by doubling from 64 bytes, and where the base's keys
+/// are `compressed` the compressor's output and the stored key it is copied into.
+pub(super) fn key_lookup_bytes(encoded: usize, compressed: bool) -> usize {
     let key = encoded.max(64);
     match compressed {
         false => 3 * key,
@@ -1855,7 +1971,7 @@ fn lookup_bytes(term: TermRef<'_>, compressed: bool) -> usize {
 }
 
 /// The length of `term`'s key ([`encode_key`]), but a triple term's.
-fn encoded_len(term: TermRef<'_>) -> usize {
+pub(super) fn encoded_len(term: TermRef<'_>) -> usize {
     match term {
         TermRef::NamedNode(node) => 1 + node.as_str().len(),
         TermRef::BlankNode(node) => 1 + node.as_str().len(),
@@ -1874,7 +1990,7 @@ fn encoded_len(term: TermRef<'_>) -> usize {
     }
 }
 
-fn encode_key(term: TermRef<'_>, out: &mut Vec<u8>) -> TermKind {
+pub(super) fn encode_key(term: TermRef<'_>, out: &mut Vec<u8>) -> TermKind {
     match term {
         TermRef::NamedNode(node) => {
             out.push(TAG_IRI);
@@ -1965,7 +2081,7 @@ impl<'a> TermView<'a> {
     }
 }
 
-fn view_key(key: &[u8]) -> TermView<'_> {
+pub(super) fn view_key(key: &[u8]) -> TermView<'_> {
     let rest = &key[1..];
     let text = || std::str::from_utf8(rest).unwrap_or_default();
     match key[0] {
@@ -1997,7 +2113,7 @@ fn view_key(key: &[u8]) -> TermView<'_> {
     }
 }
 
-fn decode_key(key: &[u8]) -> Term {
+pub(super) fn decode_key(key: &[u8]) -> Term {
     let rest = &key[1..];
     let text = || std::str::from_utf8(rest).unwrap_or_default().to_owned();
     match key[0] {
@@ -2024,7 +2140,7 @@ fn decode_key(key: &[u8]) -> Term {
 }
 
 /// The key of a triple term with these component ids.
-fn triple_key(ids: [TermId; 3], out: &mut Vec<u8>) {
+pub(super) fn triple_key(ids: [TermId; 3], out: &mut Vec<u8>) {
     out.push(TAG_TRIPLE_IDS);
     for id in ids {
         out.extend_from_slice(&id.raw().to_be_bytes());
@@ -2032,7 +2148,7 @@ fn triple_key(ids: [TermId; 3], out: &mut Vec<u8>) {
 }
 
 /// The component ids of a triple term's key, if `key` is one.
-fn triple_ids(key: &[u8]) -> Option<[TermId; 3]> {
+pub(super) fn triple_ids(key: &[u8]) -> Option<[TermId; 3]> {
     if key.len() != TRIPLE_KEY_LEN || key[0] != TAG_TRIPLE_IDS {
         return None;
     }
