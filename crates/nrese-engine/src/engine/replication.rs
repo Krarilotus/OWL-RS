@@ -346,7 +346,7 @@ impl Engine {
                     .any(|t| t.predicate == same_as)
         });
         self.inner
-            .publish_record(record, false, dictionary_len, changes_equality)
+            .publish_record(record, false, None, dictionary_len, changes_equality)
             .map(|_| ())
     }
 }

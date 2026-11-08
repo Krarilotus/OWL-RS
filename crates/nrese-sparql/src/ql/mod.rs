@@ -221,11 +221,31 @@ impl QlRewriting {
         }
     }
 
+    /// Commits `tx` with its note ([`Self::note_commit`]), which is in before the commit
+    /// publishes: no reader sees the new snapshot without it, so none reads every
+    /// expression again for it (P2-C1, 8 Nov: noted after publication, 40-48 of about 340
+    /// new snapshots a run were read fresh). A commit that fails leaves a note to an
+    /// asserted state no snapshot has, which nothing follows.
+    pub fn commit(
+        &self,
+        tx: nrese_engine::Transaction<'_>,
+    ) -> nrese_engine::EngineResult<nrese_engine::CommitSummary> {
+        self.note_commit(
+            tx.base().asserted_identity(),
+            tx.asserted_identity_after(),
+            touched_expressions(&tx),
+        );
+        tx.commit()
+    }
+
     /// Notes a commit from asserted state `from` to `to` that made the membership
     /// `changes` (`None`: unknown or too many; [`touched_expressions`]): the next schema
-    /// read keeps every membership those changes leave as it was. Only for a commit that
-    /// happened; a write without a note makes the next read scan every expression.
-    pub fn note_commit(
+    /// read keeps every membership those changes leave as it was. A write without a note
+    /// makes the next read scan every expression.
+    ///
+    /// It replaces a note from `from`: a single writer commits from a state once, so an
+    /// earlier note from it is of a commit that never published.
+    fn note_commit(
         &self,
         from: AssertedIdentity,
         to: AssertedIdentity,
@@ -235,6 +255,7 @@ impl QlRewriting {
             return;
         }
         let mut notes = self.notes.lock().unwrap_or_else(|p| p.into_inner());
+        notes.retain(|n| n.from != from);
         if notes.len() == NOTES {
             notes.pop_front();
         }
@@ -460,7 +481,7 @@ fn present(of: &HashMap<u64, Member>) -> Vec<u64> {
 /// The membership changes `tx` makes: the `rdf:type` statements with a blank object it
 /// asserts or retracts (`None` past [`TOUCHED`], or where `rdf:type` is new to it), for
 /// [`QlRewriting::note_commit`]. Costs the transaction's changes.
-pub fn touched_expressions(tx: &nrese_engine::Transaction<'_>) -> Option<Vec<MembershipChange>> {
+fn touched_expressions(tx: &nrese_engine::Transaction<'_>) -> Option<Vec<MembershipChange>> {
     let Some(rdf_type) = iri(tx.base(), RDF, "type") else {
         // No `rdf:type` term before it: every statement it adds may be one.
         return tx.inserted().next().is_none().then(Vec::new);

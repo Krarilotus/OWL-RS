@@ -1198,3 +1198,78 @@ fn a_reopen_gives_a_new_asserted_identity() {
     let engine = Engine::open(dir.path(), config()).unwrap();
     assert_ne!(engine.snapshot().asserted_identity(), before);
 }
+
+/// A change a transaction makes, for a table of rows.
+type Change = dyn Fn(&mut nrese_engine::Transaction<'_>);
+
+/// `Transaction::asserted_identity_after` names what the commit publishes (P2-C1, DUR's
+/// conditions of 8 Nov): a new id for a commit that changes asserted statements, the
+/// base's for an inferred-only one, an empty one, and one inserting and then removing the
+/// same statement (no net change); the same on every call; equal to the commit's summary
+/// and to the published snapshot's. In memory and durable.
+#[test]
+fn the_asserted_identity_after_a_transaction_is_what_its_commit_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let engines = [
+        ("in memory", Engine::new(config()).unwrap()),
+        ("durable", Engine::open(dir.path(), config()).unwrap()),
+    ];
+    let mut wrong = Vec::new();
+    for (kind, engine) in &engines {
+        let rows: [(&str, &Change, bool); 4] = [
+            (
+                "asserted",
+                &|tx| {
+                    tx.insert(quad(1).as_ref());
+                },
+                true,
+            ),
+            (
+                "inferred only",
+                &|tx| {
+                    let [s, p, o] = ["s", "p", "o"].map(|n| {
+                        tx.intern(
+                            NamedNode::new_unchecked(format!("http://example.com/{n}"))
+                                .as_ref()
+                                .into(),
+                        )
+                    });
+                    tx.insert_inferred(nrese_engine::EncodedTriple::new(s, p, o));
+                },
+                false,
+            ),
+            ("empty", &|_| {}, false),
+            (
+                "inserted, then removed",
+                &|tx| {
+                    tx.insert(quad(2).as_ref());
+                    tx.remove(quad(2).as_ref());
+                },
+                false,
+            ),
+        ];
+        for (name, change, new) in rows {
+            let base = engine.snapshot().asserted_identity();
+            let mut tx = engine.transaction();
+            change(&mut tx);
+            let after = tx.asserted_identity_after();
+            let again = tx.asserted_identity_after();
+            let summary = tx.commit().unwrap();
+            let published = engine.snapshot().asserted_identity();
+            let row = format!("{kind}, {name}");
+            if after != again {
+                wrong.push(format!("{row}: {after:?}, then {again:?}"));
+            }
+            if (after != base) != new {
+                wrong.push(format!("{row}: new {}, expected {new}", after != base));
+            }
+            if summary.asserted != after || published != after {
+                wrong.push(format!(
+                    "{row}: said {after:?}, summary {:?}, published {published:?}",
+                    summary.asserted
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
