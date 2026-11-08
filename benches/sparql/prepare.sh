@@ -58,8 +58,9 @@ box() {  # NAME IMAGE sh -c SCRIPT: a capped throwaway container with OUT at /ou
           # /out read as OUT (the image's tool, java or g++, then comes from the host's PATH)
   local name=$1 image=$2; shift 2
   if command -v docker >/dev/null 2>&1; then
-    ns_run_args "$(ns_name "sparql-prep-$name" "$NS_ROOT")" "$NS_ROOT" sparql
-    docker run --rm "${NS_ARGS[@]}" "${CAP[@]}" --cpu-shares 2 -u "$(id -u):$(id -g)" \
+    # Its labels; in a fleet job that declares its makers' container, the job's label and limits.
+    ns_maker_args "$(ns_name "sparql-prep-$name" "$NS_ROOT")" "$NS_ROOT" sparql "${CAP[@]}"
+    docker run --rm "${NS_ARGS[@]}" --cpu-shares 2 -u "$(id -u):$(id -g)" \
       -v "$OUT:/out" -w /out "$image" "$@"
   else
     local script=${3//\/out/$OUT}
