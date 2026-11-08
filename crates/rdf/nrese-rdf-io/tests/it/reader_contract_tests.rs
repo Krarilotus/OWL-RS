@@ -656,99 +656,33 @@ fn an_opener_refused_by_the_nesting_limit_stays_open() {
 /// here (fix check r3; P, r5). A guard: before, there was no such check.
 #[test]
 fn recovery_knows_every_bracket_open_wherever_a_statement_fails() {
-    const DELIMITERS: [&str; 13] = [
-        "[", "]", "(", ")", "<<(", ")>>", "<<", ">>", "{|", "|}", "{", "}", ".",
-    ];
-    let seeds = [
-        (
-            RdfFormat::Turtle,
-            "<urn:s> <urn:p> [ <urn:q> ( 1 <<( <urn:a> <urn:b> <urn:c> )>> ) ; <urn:r> << <urn:a> <urn:b> <urn:c> ~ <urn:x> >> {| <urn:p> <urn:o> |} ] .",
-        ),
-        (RdfFormat::Turtle, "[ <urn:p> <urn:o> ] <urn:q> <urn:r> ."),
-        (RdfFormat::Turtle, "[ ] <urn:p> <urn:o> ."),
-        (RdfFormat::Turtle, "( 1 2 ) <urn:p> <urn:o> ."),
-        (
-            RdfFormat::Turtle,
-            "<< << <urn:a> <urn:b> <urn:c> >> <urn:p> << <urn:a> <urn:b> <urn:c> >> >> <urn:q> <urn:r> .",
-        ),
-        (
-            RdfFormat::Turtle,
-            "<urn:s> <urn:p> << [ ] <urn:b> <<( <urn:a> <urn:b> \"x\" )>> ~ [ ] >> .",
-        ),
-        (
-            RdfFormat::Turtle,
-            "<urn:s> <urn:p> <<( [ ] <urn:b> <<( <urn:a> <urn:b> <urn:c> )>> )>> .",
-        ),
-        (
-            RdfFormat::Turtle,
-            "<urn:s> <urn:p> <urn:o> ~ [ ] {| <urn:q> [ <urn:r> <urn:o> ] |} .",
-        ),
-        (RdfFormat::Turtle, "<urn:s> <urn:p> \"x\"^^ <urn:dt> ."),
-        (RdfFormat::Turtle, "@prefix ex: <urn:ex#> ."),
-        (RdfFormat::Turtle, "@base <urn:b> ."),
-        (RdfFormat::Turtle, "@version \"1.2\" ."),
-        (RdfFormat::Turtle, "PREFIX ex: <urn:ex#>"),
-        (RdfFormat::TriG, "GRAPH [ ] { <urn:s> <urn:p> <urn:o> . }"),
-        (
-            RdfFormat::TriG,
-            "[ ] { <urn:s> <urn:p> [ <urn:q> <urn:o> ] . }",
-        ),
-        (
-            RdfFormat::TriG,
-            "<urn:g> { [ <urn:p> <urn:o> ] <urn:q> ( 1 ) . }",
-        ),
-        (RdfFormat::TriG, "[ ] <urn:p> <urn:o> ."),
-        (RdfFormat::TriG, "[ <urn:p> <urn:o> ] <urn:q> <urn:r> ."),
-    ];
     let mut table = Table::default();
-    for (format, seed) in seeds {
-        let tokens: Vec<&str> = seed.split(' ').collect();
-        for at in 0..=tokens.len() {
-            for delimiter in DELIMITERS {
-                for replace in [false, true] {
-                    if replace && at == tokens.len() {
-                        continue;
-                    }
-                    let mut mutated = tokens.clone();
-                    if replace {
-                        mutated[at] = delimiter;
-                    } else {
-                        mutated.insert(at, delimiter);
-                    }
-                    let document: &'static str = Box::leak(
-                        format!("{} <urn:after> <urn:p> <urn:o> .", mutated.join(" "))
-                            .into_boxed_str(),
-                    );
-                    let parser = || RdfParser::from_format(format).recovering();
-                    let bytes = || Pieces(document.as_bytes().chunks(1).map(Ok).collect());
-                    // Every item to the end: the delimiter can come after the seed's own
-                    // quads (fix check r3's sol-loop, S1). A parser that doesn't end fails
-                    // the row.
-                    const BOUND: usize = 1_000;
-                    let outcome = std::panic::catch_unwind(|| {
-                        [
-                            parser().for_slice(document.as_bytes()).take(BOUND).count(),
-                            parser().for_reader(document.as_bytes()).take(BOUND).count(),
-                            parser().for_reader(bytes()).take(BOUND).count(),
-                        ]
-                    })
-                    .map_err(|panic| {
-                        let message = panic
-                            .downcast_ref::<String>()
-                            .cloned()
-                            .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()));
-                        format!("panicked: {message:?}")
-                    })
-                    .and_then(|counts| {
-                        match counts.iter().all(|&n| n < BOUND) {
-                            true => Ok(()),
-                            false => Err(format!("no end within {BOUND} items: {counts:?}")),
-                        }
-                    });
-                    table.row(true, (format, document), outcome);
-                }
-            }
-        }
+    for (format, document) in crate::recovery_inputs::sweep() {
+        let document: &'static str = Box::leak(document.into_boxed_str());
+        let parser = || RdfParser::from_format(format).recovering();
+        let bytes = || Pieces(document.as_bytes().chunks(1).map(Ok).collect());
+        // Every item to the end: the delimiter can come after the seed's own quads (fix
+        // check r3's sol-loop, S1). A parser that doesn't end fails the row.
+        const BOUND: usize = 1_000;
+        let outcome = std::panic::catch_unwind(|| {
+            [
+                parser().for_slice(document.as_bytes()).take(BOUND).count(),
+                parser().for_reader(document.as_bytes()).take(BOUND).count(),
+                parser().for_reader(bytes()).take(BOUND).count(),
+            ]
+        })
+        .map_err(|panic| {
+            let message = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()));
+            format!("panicked: {message:?}")
+        })
+        .and_then(|counts| match counts.iter().all(|&n| n < BOUND) {
+            true => Ok(()),
+            false => Err(format!("no end within {BOUND} items: {counts:?}")),
+        });
+        table.row(true, (format, document), outcome);
     }
     table.done();
 }
