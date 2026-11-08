@@ -431,6 +431,8 @@ impl UpperBase<'_> {
     /// member's lookup counted on `poll` before it is made (review r1 F3: a value can be
     /// written in many ways). Stopped, it answers false, which the stage's check discards.
     fn in_view(&self, [s, p, o]: Triple, poll: &Poller<'_>) -> bool {
+        #[cfg(test)]
+        crate::witness::add(crate::witness::Site::InView, 1);
         poll.counted(self.values.members(o)).any(|o| {
             self.view
                 .quads_for_pattern_in(

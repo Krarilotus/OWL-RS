@@ -692,6 +692,8 @@ impl Iterator for QuadScan<'_> {
     fn next(&mut self) -> Option<EncodedQuad> {
         loop {
             let (key, sign) = self.merge.next()?;
+            #[cfg(test)]
+            crate::witness::add(crate::witness::Site::ScanSteps, 1);
             if sign <= 0 {
                 continue;
             }
@@ -708,5 +710,7 @@ impl Iterator for QuadScan<'_> {
     }
 }
 
+#[cfg(test)]
+mod count_tests;
 #[cfg(test)]
 mod model_tests;

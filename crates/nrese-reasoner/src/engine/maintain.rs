@@ -44,6 +44,8 @@ impl<'a> EngineBase<'a> {
     /// lookup, counted on `poll` before it is made (review r1 F5). Stopped, it reads as not
     /// known, an answer the caller discards.
     fn known_before(&self, fact: Triple, poll: &Poller<'_>) -> bool {
+        #[cfg(test)]
+        crate::witness::add(crate::witness::Site::KnownBefore, 1);
         if poll.tick() {
             return false;
         }
@@ -1112,6 +1114,54 @@ mod tests {
             asks >= n / (interval + run),
             "{asks} asks of the stop for {n} known-before lookups: more than {interval} plus one \
              run of {run} between two of them"
+        );
+    }
+
+    /// REAS-2 fix check r1 (R2-F3, F5). Spec (design note, rule 2: a stop is an error the
+    /// consumer has to handle, never an answer): a commit's maintenance ends at its stop. A
+    /// loaded state with its ground program, then a commit asserting 16 × `POLL_UNITS`
+    /// memberships new to the state, the stop firing at its first ask after the first
+    /// known-before lookup: the commit is interrupted, and no more than one lookup is made
+    /// after the stop fired. Read as "not known", a stopped lookup kept every fact after it,
+    /// and the filter looked each one up.
+    #[test]
+    fn a_commit_s_known_before_lookups_end_at_its_stop() {
+        use crate::witness::{self, Site};
+        let n = 16 * nrese_exec::POLL_UNITS as usize;
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let program = Program::compile(&crate::rulesets::Ruleset::Owl2Rl.into(), &|t| tx.intern(t));
+        let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+        let rdf_type = iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+        let subclass = iri("http://www.w3.org/2000/01/rdf-schema#subClassOf");
+        let (c0, c1) = (iri("http://example.com/C0"), iri("http://example.com/C1"));
+        let individuals: Vec<u64> = (0..n)
+            .map(|i| iri(&format!("http://example.com/i{i}")))
+            .collect();
+        tx.insert_encoded(encode([c1, subclass, c0]).in_default_graph());
+        let loaded = maintain(&program, None, &mut tx, crate::eval::NEVER).unwrap();
+        tx.commit().unwrap();
+        let ground = loaded.program.expect("the ground program after the load");
+        let mut tx = engine.transaction();
+        for &i in &individuals {
+            tx.insert_encoded(encode([i, rdf_type, c1]).in_default_graph());
+        }
+        let first = witness::FirstWork::new(Site::KnownBefore);
+        let stop = || first.ask();
+        let maintained = maintain(&program, Some(&ground), &mut tx, &stop);
+        let after = first.after();
+        assert!(
+            after <= 1,
+            "{after} known-before lookups after the stop fired, of {n}: at most the one that \
+             saw it"
+        );
+        assert!(
+            maintained.is_err(),
+            "a stopped commit's maintenance is interrupted"
         );
     }
 

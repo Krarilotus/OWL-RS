@@ -52,6 +52,8 @@ pub mod support;
 mod tell;
 pub mod update;
 mod view;
+#[cfg(test)]
+mod witness;
 
 pub use backup::{
     DIGEST_PREFIX, DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, DatasetRestoreReport,
