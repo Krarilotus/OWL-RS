@@ -136,6 +136,7 @@ pub fn restore_until(
     let manifest = restore_image(backup, data_dir)?;
     let wal = data_dir.join("wal");
     fs::create_dir_all(&wal).map_err(|e| io(e, &wal))?;
+    nrese_engine::place::sync_dir(data_dir).map_err(|e| io(e, data_dir))?;
     // Segments are named by their first revision; one ends where the next begins. Those
     // that can hold a revision after the image go along.
     let mut segments: Vec<(u64, PathBuf)> = Vec::new();
@@ -165,7 +166,8 @@ pub fn restore_until(
             .is_none_or(|(next, _)| *next > manifest.revision + 1);
         if after_image {
             let target = wal.join(path.file_name().expect("segment name"));
-            fs::copy(path, &target).map_err(|e| io(e, path))?;
+            // Synced and durably named before the store opens on it (F3).
+            nrese_engine::place::copy(path, &target).map_err(|e| io(e, path))?;
         }
     }
     let config = nrese_engine::EngineConfig {
@@ -232,10 +234,16 @@ pub fn place_image(
         )));
     }
     fs::create_dir_all(data_dir).map_err(|e| io(e, data_dir))?;
+    if let Some(parent) = data_dir
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        nrese_engine::place::sync_dir(parent).map_err(|e| io(e, parent))?;
+    }
     let target = data_dir.join(&name);
-    let partial = data_dir.join(format!("{name}.restoring"));
-    fs::copy(image, &partial).map_err(|e| io(e, image))?;
-    fs::rename(&partial, &target).map_err(|e| io(e, &target))?;
+    // Synced and durably named (F3): a power loss after the restore returned must not
+    // leave a short image, or one with regions that never landed, under the name.
+    nrese_engine::place::copy(image, &target).map_err(|e| io(e, image))?;
     Ok(manifest)
 }
 

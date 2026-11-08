@@ -129,7 +129,7 @@ pub(crate) fn keep(root: &Path, segment: &Path, bytes: &[u8], at: u64) -> Engine
     file.write_all(cut)?;
     file.sync_all()?;
     drop(file);
-    fs::rename(&temporary, &path)?;
+    super::place::rename(&temporary, &path)?;
     sync_cut_dir(&dir)?;
     Ok(path)
 }

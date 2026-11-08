@@ -22,12 +22,14 @@ pub(crate) mod checkpoint;
 pub(crate) mod codec;
 #[cfg(test)]
 pub(crate) mod fault;
+mod lock;
+pub mod place;
 pub(crate) mod tail;
 #[cfg(test)]
 mod tests;
 pub(crate) mod wal;
 
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
@@ -155,7 +157,7 @@ pub(crate) struct Durable {
     pub(crate) wal: Mutex<Wal>,
     pub(crate) checkpoint_slot: Mutex<()>,
     pub(crate) config: DurabilityConfig,
-    _lock: File,
+    _lock: lock::StoreLock,
 }
 
 /// State reconstructed by [`Durable::open`].
@@ -176,10 +178,7 @@ impl Durable {
         config: DurabilityConfig,
     ) -> EngineResult<Recovered> {
         fs::create_dir_all(root)?;
-        let lock = File::create(root.join("LOCK"))?;
-        if lock.try_lock().is_err() {
-            return Err(EngineError::Locked(root.to_path_buf()));
-        }
+        let lock = lock::StoreLock::acquire(root)?;
         checkpoint::remove_temporaries(root)?;
         crate::engine::spill::remove_leftovers(root)?;
         let clock = std::time::Instant::now();
@@ -282,9 +281,31 @@ impl Durable {
         }
         // Set once the log has been cut at `recover_until`: later segments go.
         let mut cut = false;
+        // What the checkpoint holds, and the segments records were replayed from.
+        let covered_through = version.revision;
+        let mut replayed = Vec::new();
         for (position, (_, path)) in segments.iter().enumerate() {
             if cut {
                 fs::remove_file(path)?;
+                continue;
+            }
+            // Wholly covered by the checkpoint (F7): its records all come before the next
+            // segment's first, which the checkpoint holds, so none is replayed. A release that
+            // failed or crashed left it, and damage in it can't cost a record: it never
+            // refuses the open. Its intact records' times still raise the store's clock.
+            if segments
+                .get(position + 1)
+                .is_some_and(|(next, _)| *next <= covered_through.saturating_add(1))
+            {
+                tracing::debug!(segment = %path.display(), "skipped a WAL segment the checkpoint covers");
+                if let Ok(contents) = wal::read_segment(path) {
+                    // A time past what a store keeps is damage here too: not taken.
+                    for record in &contents.records {
+                        if check_commit_time(record).is_ok() {
+                            store_clock = store_clock.max(record.committed_micros.unwrap_or(0));
+                        }
+                    }
+                }
                 continue;
             }
             let contents = wal::read_segment(path)?;
@@ -332,6 +353,9 @@ impl Durable {
                     )));
                 }
                 replay(&mut version, dictionary, policy, record)?;
+                if replayed.last() != Some(&path) {
+                    replayed.push(path);
+                }
             }
             if contents.torn && !cut {
                 if Some(position) != last {
@@ -392,6 +416,15 @@ impl Durable {
                 version.revision
             )));
         }
+        // What was recovered is durable before a new commit is acknowledged (F5): replayed
+        // records may be in the page cache only (written under `OsBuffered`, or not synced yet
+        // when the process died), and new commits may go to a segment after them. A
+        // checkpoint renamed just before the crash, and segments removed or cut, likewise.
+        for path in &replayed {
+            place::sync_file(path)?;
+        }
+        sync_dir(&wal_dir)?;
+        sync_dir(root)?;
         let integers_in_dictionary = integers_in_dictionary.unwrap_or(false);
         dictionary.set_integers_in_dictionary(integers_in_dictionary);
         let wal = Wal::open(
@@ -497,12 +530,7 @@ fn now_micros() -> u64 {
         .map_or(0, |since| since.as_micros() as u64)
 }
 
-/// Makes a rename or file creation in `dir` durable. Directories can't be opened as files on
-/// Windows; there, NTFS journals the metadata change and this is a no-op.
+/// Makes a rename, creation or removal in `dir` durable, on every platform ([`place`]).
 pub(crate) fn sync_dir(dir: &Path) -> EngineResult<()> {
-    #[cfg(unix)]
-    File::open(dir)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = dir;
-    Ok(())
+    Ok(place::sync_dir(dir)?)
 }
