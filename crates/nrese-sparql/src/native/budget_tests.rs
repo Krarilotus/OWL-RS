@@ -669,3 +669,131 @@ fn a_both_bound_paths_rows_are_charged_before_they_are_made() {
         "{solutions:?}"
     );
 }
+
+/// `urn:n0 p urn:n1 p … urn:n<n-1>`, closed into a cycle where `cycle`: a cycle is one
+/// strongly connected component whose closure has n² pairs; a chain is n components whose
+/// reach sets hold n(n+1)/2 ids, its closure n(n-1)/2 pairs.
+fn linked(n: usize, cycle: bool) -> Engine {
+    let last = if cycle { n } else { n - 1 };
+    default_store((0..last).map(|i| (format!("n{i}"), "p".to_owned(), format!("n{}", (i + 1) % n))))
+}
+
+fn plus(p: &str) -> PropertyPathExpression {
+    PropertyPathExpression::OneOrMore(Box::new(link(p)))
+}
+
+/// `query` over `engine` under a request limit of `limit` bytes: its rows or the refusal, and
+/// the most its evaluation held at once ([`measure`]).
+fn query_held(engine: &Engine, query: &str, limit: usize) -> (Result<usize, String>, usize) {
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new().parse_query(query).unwrap();
+    let mut options = QueryOptions::default();
+    options.resources.memory = Envelope::new(Some(limit), None);
+    measure(
+        || match crate::evaluate_query(&snapshot, &query, &options) {
+            Ok(crate::QueryResults::Solutions(mut rows)) => rows
+                .try_fold(0, |n, row| row.map(|_| n + 1))
+                .map_err(|error| format!("{error:?}")),
+            Ok(_) => Err("not solutions".to_owned()),
+            Err(error) => Err(format!("{error:?}")),
+        },
+    )
+}
+
+/// Spec (the code-quality triage's S-03, carrier E4; the executor memory stack's fix check r4,
+/// R4-F1): a closure's quadratic structures are charged before they are allocated, so a
+/// request whose limit they don't fit is refused while it holds little. Under a 1 MiB limit:
+/// - `?s p+ ?o` over a 1,024-node cycle: 1,048,576 pairs, 16 MiB of them;
+/// - over a 2,048-node chain: its reach sets, 2,098,176 ids (8 MiB), before its 2,096,128
+///   pairs;
+/// - `?s p+ ?o` from 4,097 bound starts (past the 4,096 a closure probes the index from), each
+///   leading into a 1,024-node cycle: 4,097 × 1,025 pairs from the bound values' closure.
+/// Each must be refused before holding a quarter of what it refuses (4 MiB, 2 MiB, 16 MiB).
+#[test]
+fn a_closures_quadratic_parts_are_refused_before_they_are_allocated() {
+    if !alone() {
+        return;
+    }
+    const LIMIT: usize = 1 << 20;
+    let pairs_query = "SELECT ?s ?o WHERE { ?s <urn:p>+ ?o }";
+    let starts = default_store(
+        (0..1024)
+            .map(|i| {
+                (
+                    format!("n{i}"),
+                    "p".to_owned(),
+                    format!("n{}", (i + 1) % 1024),
+                )
+            })
+            .chain((0..4097).flat_map(|i| {
+                [
+                    (format!("s{i}"), "p".to_owned(), "n0".to_owned()),
+                    (format!("s{i}"), "t".to_owned(), "c".to_owned()),
+                ]
+            })),
+    );
+    let bound_query = "SELECT ?s ?o WHERE { ?s <urn:t> <urn:c> . ?s <urn:p>+ ?o }";
+    let cases = [
+        (
+            "a 1,024-node cycle",
+            linked(1024, true),
+            pairs_query,
+            (1 << 20) * 16,
+        ),
+        (
+            "a 2,048-node chain",
+            linked(2048, false),
+            pairs_query,
+            2_098_176 * 4,
+        ),
+        ("4,097 bound starts", starts, bound_query, 4097 * 1025 * 16),
+    ];
+    let failures: Vec<String> = cases
+        .into_iter()
+        .filter_map(|(name, engine, query, refused_bytes)| {
+            let (rows, held) = query_held(&engine, query, LIMIT);
+            eprintln!("{name}: {rows:?}, held {held} bytes at most");
+            let refused = matches!(&rows, Err(refusal) if refusal.contains("MemoryLimit"));
+            match refused && held < refused_bytes / 4 {
+                true => None,
+                false => Some(format!(
+                    "{name}: {rows:?} holding {held} bytes, a quarter of what it refuses {}",
+                    refused_bytes / 4
+                )),
+            }
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Spec (as above, and #169's invariant): a closure's buffers are charged while they live:
+/// what `?s p+ ?o` holds beyond its charge at any moment is the same for a cycle of 256 nodes
+/// and of 512 (65,536 and 262,144 pairs), and for a chain of 512 and 1,024 (its reach sets).
+/// Charged on arrival, after they were made, the pairs and the reach sets were held uncharged.
+#[test]
+fn a_closures_buffers_are_charged_while_they_live() {
+    if !alone() {
+        return;
+    }
+    let unlimited = |_| None;
+    let failures: Vec<String> = [
+        holds_nothing_uncharged_per_row(
+            "?s p+ ?o over a cycle",
+            (256, 512),
+            |n| (linked(n, true), ("?s", plus("p"), "?o")),
+            unlimited,
+            |rows, n| rows_of(rows, n * n),
+        ),
+        holds_nothing_uncharged_per_row(
+            "?s p+ ?o over a chain",
+            (512, 1024),
+            |n| (linked(n, false), ("?s", plus("p"), "?o")),
+            unlimited,
+            |rows, n| rows_of(rows, n * (n - 1) / 2),
+        ),
+    ]
+    .into_iter()
+    .filter_map(Result::err)
+    .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

@@ -583,6 +583,43 @@ mod tests {
         assert_eq!(adjacency.sources(), &[1, 4]);
     }
 
+    use std::sync::atomic::Ordering;
+
+    /// A cycle of `n` nodes: one strongly connected component whose closure is all n² pairs.
+    fn cycle(n: u64) -> Vec<(u64, u64)> {
+        (0..n).map(|i| (i, (i + 1) % n)).collect()
+    }
+
+    /// Spec (stop.rs, W1: interruptible work reaches a checkpoint within `POLL_UNITS` units
+    /// per executing task; the code-quality triage's S-03): the closure of one strongly
+    /// connected component polls its stop while it writes the component's pairs. A
+    /// 1,024-node cycle has 1,048,576 pairs: a stop that never fires is asked at least once
+    /// per 4,096 of them.
+    #[test]
+    fn a_closure_polls_its_stop_inside_one_component() {
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || {
+            polls.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        let pairs = transitive_closure_until(&cycle(1024), &stop).expect("never stopped");
+        assert_eq!(pairs.len(), 1 << 20);
+        let polls = polls.load(Ordering::Relaxed);
+        assert!(
+            polls >= (1 << 20) / crate::POLL_UNITS as usize,
+            "polled {polls} times for 1,048,576 pairs"
+        );
+    }
+
+    /// Spec (as above): a stop that fires while one component's pairs are written stops the
+    /// closure there: at its 16th poll, of the 256 the 1,024-cycle's pairs take at least.
+    #[test]
+    fn a_closure_stops_inside_one_component() {
+        let polls = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || polls.fetch_add(1, Ordering::Relaxed) >= 16;
+        assert!(transitive_closure_until(&cycle(1024), &stop).is_none());
+    }
+
     /// The SCC kernel: components, each once, sinks first.
     #[test]
     fn components_come_sinks_first() {
