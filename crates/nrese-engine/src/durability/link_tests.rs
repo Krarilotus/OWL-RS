@@ -257,6 +257,51 @@ fn making_a_directory_reaches_through_links() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// `..` after a link on Windows (sol-loop round 1, S1): Windows takes a path's `..` lexically
+/// before the file system sees it (a verbatim `\\?\` path aside), so `b\alias\..\tenant\store`
+/// is `b\tenant\store` whatever `alias` points to. Row, for each link kind: `b\alias` →
+/// `t\deep`, both `b\tenant\store` and `t\tenant\store` there; naming the path syncs `b` and
+/// `b\tenant` (the holders of the store's actual names), and a failing sync of `b\tenant`
+/// refuses it. Before the fix the resolution followed `alias` first and named `t\tenant`'s
+/// chain instead: `b\tenant` was never synced.
+#[cfg(windows)]
+#[test]
+fn dot_dot_after_a_link_is_taken_as_windows_takes_it() {
+    let mut wrong = Vec::new();
+    for kind in kinds() {
+        let base = tempfile::tempdir().unwrap();
+        let base = base.path();
+        std::fs::create_dir_all(base.join("b\\tenant\\store")).unwrap();
+        std::fs::create_dir_all(base.join("t\\deep")).unwrap();
+        std::fs::create_dir_all(base.join("t\\tenant\\store")).unwrap();
+        if !link(kind, &base.join("t\\deep"), &base.join("b\\alias")) {
+            eprintln!("{kind:?} rows: not run (no privilege to make one on this host)");
+            continue;
+        }
+        let path = base.join("b\\alias\\..\\tenant\\store");
+        let row = format!("{kind:?}, `..` after a link");
+        let (named, synced) = syncs_of(|| place::name_existing(&path));
+        if let Err(error) = named {
+            wrong.push(format!("{row}: {error}"));
+        }
+        wrong.extend(judge(
+            &row,
+            &synced,
+            &[&base.join("b"), &base.join("b\\tenant")],
+            true,
+        ));
+        fault::FAIL_DIR_SYNC_OF.set(Some((base.join("b\\tenant"), std::io::ErrorKind::Other)));
+        let named = place::name_existing(&path);
+        fault::FAIL_DIR_SYNC_OF.set(None);
+        if named.is_ok() {
+            wrong.push(format!(
+                "{row}: named though the actual holder's sync failed"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// Links in links, relative links and `..` after a link (Linux): the resolution follows them as
 /// the kernel does. Rows, judged apart: a chain `l1` → `l2` → `t/inner` of relative links,
 /// `l1/store` synced through `t` and `t/inner`; `..` after a link (`x` → `p/q`, then

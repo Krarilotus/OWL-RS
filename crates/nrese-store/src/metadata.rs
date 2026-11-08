@@ -283,6 +283,8 @@ pub(crate) mod tests {
         opened: &'static str,
         /// The directory whose sync fails.
         failing: &'static str,
+        /// Other directories there.
+        extra: &'static [&'static str],
     }
 
     /// A store reached through a link has its metadata acknowledged only once every name the
@@ -295,7 +297,9 @@ pub(crate) mod tests {
     ///   namespace change refused, not
     ///   published, the store available; reopened, no binding; the fault cleared, a retry
     ///   acknowledged and there after a reopen;
-    /// - the **link's holder** failing (`stable`; the link's own name): refused alike.
+    /// - the **link's holder** failing (`stable`; the link's own name): refused alike;
+    /// - Windows, `..` after a link (`b\alias\..\tenant\store`, which Windows takes as
+    ///   `b\tenant\store`): the actual holder `b\tenant` failing refuses alike.
     ///
     /// Before the fix only the path's lexical holders were synced, so a target holder's fault
     /// was never reached and the change was acknowledged (the link-holder row refused then too).
@@ -313,6 +317,7 @@ pub(crate) mod tests {
                 target: "data/new/store",
                 opened: "stable/store",
                 failing: "data/new",
+                extra: &[],
             },
             LinkRow {
                 name: "an intermediate link, a target holder failing",
@@ -321,6 +326,7 @@ pub(crate) mod tests {
                 target: "real/a",
                 opened: "a/b/store",
                 failing: "real",
+                extra: &[],
             },
             LinkRow {
                 name: "the store's level a link, the link's holder failing",
@@ -329,8 +335,22 @@ pub(crate) mod tests {
                 target: "data/new/store",
                 opened: "stable/store",
                 failing: "stable",
+                extra: &[],
             },
         ];
+        // Windows takes `..` lexically (sol-loop round 1, S1): `b\alias\..\tenant\store` is
+        // `b\tenant\store`, though `alias` → `t\deep` and a `t\tenant\store` is there too; the
+        // actual holder `b\tenant` failing must refuse.
+        #[cfg(windows)]
+        let rows = rows.into_iter().chain([LinkRow {
+            name: "`..` after a link, the actual holder failing",
+            physical: "b/tenant/store",
+            link: "b/alias",
+            target: "t/deep",
+            opened: "b/alias/../tenant/store",
+            failing: "b/tenant",
+            extra: &["t/deep", "t/tenant/store"],
+        }]);
         for LinkRow {
             name: row,
             physical,
@@ -338,10 +358,14 @@ pub(crate) mod tests {
             target,
             opened,
             failing,
+            extra,
         } in rows
         {
             let base = tempfile::tempdir().unwrap();
             let base = base.path();
+            for dir in extra {
+                std::fs::create_dir_all(base.join(dir)).unwrap();
+            }
             drop(StoreService::new(StoreConfig::on_disk(base.join(physical))).unwrap());
             if let Some(holder) = base.join(link).parent() {
                 std::fs::create_dir_all(holder).unwrap();
