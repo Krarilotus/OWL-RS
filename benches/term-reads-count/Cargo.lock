@@ -697,6 +697,7 @@ dependencies = [
 name = "term-reads-count"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "mimalloc",
  "nrese-engine",
  "nrese-rdf",

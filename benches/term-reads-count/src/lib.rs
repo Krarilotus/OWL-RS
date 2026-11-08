@@ -18,6 +18,11 @@
 //!   `--control fd:CTL,ACK` (the same text as perf's), which this pass refuses to run without.
 //!   It writes `enable` and `disable` around the op and waits for perf's `ack` after each,
 //!   up to a deadline: a missing ack fails the run, so no unconfirmed window is reported.
+//!   Inside the window the harness allocates and formats nothing, and a 1-thread op runs on
+//!   the main thread with no synchronisation. What is left (returning from the enable's ack,
+//!   writing the disable, and at more threads the readers' start and end barriers) is what
+//!   the `noop` op counts: the same window around an empty body, so an op's count is read net
+//!   of the `noop` at its shape and threads.
 //! - **Allocations.** `--count allocs` runs `term-reads-count-allocs`, the binary beside this
 //!   one, whose global allocator counts on every thread ([`Counting`]): reset as the op's
 //!   window opens and read as it closes, so the load isn't counted. This binary's allocator
@@ -50,8 +55,9 @@ const ACK_DEADLINE_MS: u64 = 10_000;
 
 const USAGE: &str = "usage: term-reads-count --shape memory|reopened --op OP --threads N \
     [--seed SEED] (--control fd:CTL,ACK [--ack-deadline-ms MS] | --count allocs) \
-    [--side NAME] [--commit SHA]\n\
-    ops: decode lookup with_views decode_quad insert_remove takeover pending_snapshot pending_over";
+    [--side NAME] [--commit SHA] [--rows N (decode)]\n\
+    ops: decode lookup with_views decode_quad insert_remove takeover pending_snapshot pending_over \
+    noop";
 
 /// The two stores ([`store::Store::build`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -89,9 +95,11 @@ pub enum Op {
     Takeover,
     PendingSnapshot,
     PendingOver,
+    /// The window around an empty body: what the harness itself counts.
+    Noop,
 }
 
-const OPS: [(Op, &str); 8] = [
+const OPS: [(Op, &str); 9] = [
     (Op::Decode, "decode"),
     (Op::Lookup, "lookup"),
     (Op::WithViews, "with_views"),
@@ -100,6 +108,7 @@ const OPS: [(Op, &str); 8] = [
     (Op::Takeover, "takeover"),
     (Op::PendingSnapshot, "pending_snapshot"),
     (Op::PendingOver, "pending_over"),
+    (Op::Noop, "noop"),
 ];
 
 impl Op {
@@ -109,11 +118,12 @@ impl Op {
             .map_or("", |(_, name)| name)
     }
 
-    /// The read ops, which run on any number of threads; a transaction is single-writer.
+    /// The read ops (and `noop`), which run on any number of threads; a transaction is
+    /// single-writer.
     fn reads(self) -> bool {
         matches!(
             self,
-            Self::Decode | Self::Lookup | Self::WithViews | Self::DecodeQuad
+            Self::Decode | Self::Lookup | Self::WithViews | Self::DecodeQuad | Self::Noop
         )
     }
 }
@@ -126,6 +136,9 @@ struct Args {
     count_allocs: bool,
     control: Option<(i32, i32)>,
     ack_deadline_ms: u64,
+    /// `decode`'s ids, if not the case's 1,000,000: to check that a count net of `noop`
+    /// scales with its rows.
+    rows: Option<usize>,
     side: Option<String>,
     commit: Option<String>,
 }
@@ -141,6 +154,7 @@ impl Args {
             count_allocs: false,
             control: None,
             ack_deadline_ms: ACK_DEADLINE_MS,
+            rows: None,
             side: None,
             commit: None,
         };
@@ -172,6 +186,7 @@ impl Args {
                 },
                 "--control" => args.control = Some(control_fds(value()?)?),
                 "--ack-deadline-ms" => args.ack_deadline_ms = number(value()?)?,
+                "--rows" => args.rows = Some(number(value()?)? as usize),
                 "--side" => args.side = Some(name(value()?)?),
                 "--commit" => args.commit = Some(name(value()?)?),
                 other => return Err(format!("unknown argument {other}")),
@@ -185,6 +200,12 @@ impl Args {
         }
         if !args.op.reads() && args.threads != 1 {
             return Err(format!("{} runs on 1 thread", args.op.name()));
+        }
+        if args
+            .rows
+            .is_some_and(|rows| args.op != Op::Decode || rows == 0)
+        {
+            return Err("--rows is decode's, at least 1".into());
         }
         match (args.count_allocs, args.control.is_some()) {
             (true, true) => Err("--count allocs is a pass of its own, without --control".into()),
@@ -275,7 +296,14 @@ fn run(args: &Args) -> Result<String, String> {
         counted: None,
     };
     let store = store::Store::build(args.shape, args.seed)?;
-    let rows = ops::run(args.op, args.threads, &store, args.seed, &mut window)?;
+    let rows = ops::run(
+        args.op,
+        args.threads,
+        args.rows,
+        &store,
+        args.seed,
+        &mut window,
+    )?;
     let json =
         |value: &Option<String>| value.as_ref().map_or("null".into(), |v| format!("\"{v}\""));
     let (allocs, bytes) = match window.counted {
@@ -306,13 +334,16 @@ pub(crate) struct Window {
 
 impl Window {
     /// Runs `op` inside the window. `op` runs even if perf refuses to open it, so that
-    /// threads waiting inside it are let go; the refusal is the result then.
+    /// threads waiting inside it are let go; the refusal is the result then. Between perf's
+    /// enable and its disable the harness only returns from the enable's wait, checks the
+    /// allocation flag and writes the disable: nothing allocates or formats (the `noop` op
+    /// counts what is left).
     pub(crate) fn count<R>(&mut self, op: impl FnOnce() -> R) -> Result<R, String> {
         // The load's and the checkpoint's pool threads go to sleep first: perf counts every
         // thread of the process.
         std::thread::sleep(std::time::Duration::from_millis(200));
         let opened = match &mut self.control {
-            Some(control) => control.send("enable"),
+            Some(control) => control.send(b"enable\n"),
             None => Ok(()),
         };
         if self.counting {
@@ -327,26 +358,32 @@ impl Window {
             ));
         }
         let closed = match (&mut self.control, &opened) {
-            (Some(control), Ok(())) => control.send("disable"),
+            (Some(control), Ok(())) => control.send(b"disable\n"),
             _ => Ok(()),
         };
-        opened.and(closed).map(|()| result)
+        opened
+            .map_err(control_failed("enable"))
+            .and(closed.map_err(control_failed("disable")))
+            .map(|()| result)
     }
 }
 
-/// perf's control and acknowledgement descriptors (`--control fd:CTL,ACK`). A thread started
-/// with it reads perf's answers, so that waiting for one has a deadline.
+fn control_failed(command: &'static str) -> impl Fn(&'static str) -> String {
+    move |error| format!("perf control ({command}): {error}")
+}
+
+/// perf's control and acknowledgement descriptors (`--control fd:CTL,ACK`).
 #[cfg(target_os = "linux")]
 struct Control {
     ctl: std::fs::File,
-    answers: std::sync::mpsc::Receiver<Vec<u8>>,
-    deadline: std::time::Duration,
+    ack: std::fs::File,
+    /// `poll`'s timeout for one answer, in milliseconds.
+    deadline_ms: i32,
 }
 
 #[cfg(target_os = "linux")]
 impl Control {
     fn open((ctl, ack): (i32, i32), deadline_ms: u64) -> Result<Self, String> {
-        use std::io::Read;
         use std::os::fd::FromRawFd;
         for fd in [ctl, ack] {
             if std::fs::metadata(format!("/proc/self/fd/{fd}")).is_err() {
@@ -358,50 +395,54 @@ impl Control {
         // SAFETY: both descriptors are open (checked above), inherited from perf's caller for
         // this process to write commands to and read acknowledgements from; nothing else in
         // the process uses them, so these files own them.
-        let (ctl, mut ack) = unsafe {
+        let (ctl, ack) = unsafe {
             (
                 std::fs::File::from_raw_fd(ctl),
                 std::fs::File::from_raw_fd(ack),
             )
         };
-        let (answer, answers) = std::sync::mpsc::channel();
-        // Each answer, a line (perf writes a NUL after each); it ends with the descriptor.
-        let reader = move || {
-            let (mut line, mut buffer) = (Vec::new(), [0u8; 16]);
-            while let Ok(read @ 1..) = ack.read(&mut buffer) {
-                for &byte in buffer[..read].iter().filter(|&&byte| byte != 0) {
-                    line.push(byte);
-                    if byte == b'\n' && answer.send(std::mem::take(&mut line)).is_err() {
-                        return;
-                    }
-                }
-            }
-        };
-        std::thread::Builder::new()
-            .name("perf-ack".into())
-            .spawn(reader)
-            .map_err(|error| format!("--control: starting its reader failed: {error}"))?;
         Ok(Self {
             ctl,
-            answers,
-            deadline: std::time::Duration::from_millis(deadline_ms),
+            ack,
+            deadline_ms: i32::try_from(deadline_ms).unwrap_or(i32::MAX),
         })
     }
 
-    /// Sends `command` and waits for perf's `ack`, failing past the deadline: a window perf
-    /// didn't confirm is never reported.
-    fn send(&mut self, command: &str) -> Result<(), String> {
-        use std::io::Write;
+    /// Writes `command` (a line) and waits for perf's `ack\n` (perf writes a NUL after it),
+    /// failing past the deadline: a window perf didn't confirm is never reported. Runs in the
+    /// window, so it allocates and formats nothing: the answer goes into a buffer on the stack.
+    fn send(&mut self, command: &'static [u8]) -> Result<(), &'static str> {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
         self.ctl
-            .write_all(format!("{command}\n").as_bytes())
-            .map_err(|error| format!("perf control ({command}): {error}"))?;
-        match self.answers.recv_timeout(self.deadline) {
-            Ok(answer) if answer == b"ack\n" => Ok(()),
-            Ok(answer) => Err(format!("perf control ({command}): answered {answer:?}")),
-            Err(error) => Err(format!(
-                "perf control ({command}): no ack within {:?} ({error})",
-                self.deadline
-            )),
+            .write_all(command)
+            .map_err(|_| "writing the command failed")?;
+        let (mut answer, mut length) = ([0u8; 8], 0);
+        while !answer[..length].contains(&b'\n') {
+            let mut ready = libc::pollfd {
+                fd: self.ack.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one initialised pollfd, for a descriptor this process owns, and its count.
+            match unsafe { libc::poll(&mut ready, 1, self.deadline_ms) } {
+                0 => return Err("no ack within --ack-deadline-ms"),
+                1.. => {}
+                _ => return Err("waiting for the ack failed"),
+            }
+            let mut read = [0u8; 8];
+            let got = match self.ack.read(&mut read) {
+                Ok(0) | Err(_) => return Err("the ack descriptor closed"),
+                Ok(got) => got,
+            };
+            for &byte in read[..got].iter().filter(|&&byte| byte != 0) {
+                *answer.get_mut(length).ok_or("answered more than ack")? = byte;
+                length += 1;
+            }
+        }
+        match &answer[..length] == b"ack\n" {
+            true => Ok(()),
+            false => Err("answered something other than ack"),
         }
     }
 }
@@ -415,7 +456,7 @@ impl Control {
         Err("--control needs Linux (perf)".into())
     }
 
-    fn send(&mut self, _: &str) -> Result<(), String> {
+    fn send(&mut self, _: &'static [u8]) -> Result<(), &'static str> {
         Ok(())
     }
 }

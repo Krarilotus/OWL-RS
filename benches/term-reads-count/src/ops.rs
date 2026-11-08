@@ -6,19 +6,21 @@
 //!
 //! | Op | Rows | Through |
 //! |---|---|---|
-//! | `decode` | 1,000,000 ids, a seeded draw | `Snapshot::decode` |
+//! | `decode` | 1,000,000 ids (or `--rows`), a seeded draw | `Snapshot::decode` |
 //! | `lookup` | 200,000 terms, half present, half absent | `Snapshot::lookup` |
-//! | `with_views` | 1,000 batches of 1,024 ids (a row per id) | `Snapshot::with_views` |
+//! | `with_views` | 1,000 batches of 1,024 ids (a row per id), each view's fields copied into a buffer made before the window | `Snapshot::with_views` |
 //! | `decode_quad` | the 1,000,000 asserted quads, in a scan's order | `Snapshot::decode_quad` |
 //! | `insert_remove` | 100,000 inserts and 100,000 removes, each 10 % no-ops and 10 % cancellations | `Transaction::insert_encoded`, `remove_encoded` |
 //! | `takeover` | 10,000 inferred quads asserted, then the commit | `Transaction::insert_encoded`, `commit` |
 //! | `pending_snapshot` | the 30,000 pending entries of one call over 10,000 asserted inserts (1,000 of them inferred quads), 10,000 deletes and 10,000 inferred inserts | `Transaction::pending_snapshot` |
 //! | `pending_over` | the 21,000 entries one call reads over a view without 1,000 inferred quads: the same changes' asserted inserts and deletes, and 1,000 hidden | `Transaction::pending_over` |
+//! | `noop` | one: the window around an empty body, at the op's threads | nothing |
 //!
-//! The read ops split their rows over `threads` threads, each reading its own clone of the
-//! snapshot into its own part of the results; the threads start before the window opens and
-//! end after it closes. The reopened store's commit (`takeover`) appends to its WAL, unsynced:
-//! `instructions:u` counts only its user-space part.
+//! At 1 thread a read op runs on the main thread. At more, it splits its rows over `threads`
+//! threads, each reading its own clone of the snapshot into its own part of the results; the
+//! threads start before the window opens and end after it closes, and meet barriers inside it
+//! (counted by `noop` too). The reopened store's commit (`takeover`) appends to its WAL,
+//! unsynced: `instructions:u` counts only its user-space part.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Barrier;
@@ -27,7 +29,7 @@ use nrese_engine::{
     EncodedQuad, InferredSubset, QuadPattern, ReadModel, Snapshot, TermId, TermView, Transaction,
 };
 use nrese_rdf::vocab::xsd;
-use nrese_rdf::{GraphName, Quad, Term};
+use nrese_rdf::{BaseDirection, GraphName, Quad, Term};
 
 use crate::store::{self, INFERRED, QUADS, Rng, Store, TERMS};
 use crate::{Op, Window};
@@ -35,6 +37,7 @@ use crate::{Op, Window};
 pub(crate) fn run(
     op: Op,
     threads: usize,
+    rows: Option<usize>,
     store: &Store,
     seed: u64,
     window: &mut Window,
@@ -43,7 +46,9 @@ pub(crate) fn run(
     let snapshot = &store.snapshot;
     let rows = match op {
         Op::Decode => {
-            let drawn: Vec<usize> = (0..1_000_000).map(|_| rng.below(TERMS)).collect();
+            let drawn: Vec<usize> = (0..rows.unwrap_or(1_000_000))
+                .map(|_| rng.below(TERMS))
+                .collect();
             let ids: Vec<TermId> = drawn.iter().map(|&i| store.ids[i]).collect();
             let mut decoded: Vec<Option<Term>> =
                 std::iter::repeat_with(|| None).take(ids.len()).collect();
@@ -107,8 +112,24 @@ pub(crate) fn run(
                 .iter()
                 .map(|batch| batch.iter().map(|&i| store.ids[i]).collect())
                 .collect();
-            let mut seen: Vec<Vec<usize>> =
-                batches.iter().map(|batch| vec![0; batch.len()]).collect();
+            // A view borrows the dictionary only while `with_views` runs: each reader copies
+            // every field of each view it gets into its batch's buffer, made before the window
+            // as large as the expected views need (the copy is counted with the op). After the
+            // window each buffer is compared with the expected terms' encoding.
+            let expected: Vec<Vec<u8>> = drawn
+                .iter()
+                .map(|batch| {
+                    let mut encoded = Vec::new();
+                    for &i in batch {
+                        encode_term(&store.terms[i], &mut encoded);
+                    }
+                    encoded
+                })
+                .collect();
+            let mut seen: Vec<Vec<u8>> = expected
+                .iter()
+                .map(|encoded| Vec::with_capacity(encoded.len()))
+                .collect();
             #[cfg(feature = "inject")]
             let first_part = batches.as_ptr() as usize;
             parallel(
@@ -122,34 +143,22 @@ pub(crate) fn run(
                     let mut injected = part.as_ptr() as usize != first_part;
                     for (seen, batch) in out.iter_mut().zip(part) {
                         snapshot.with_views(|view| {
-                            for (slot, &id) in seen.iter_mut().zip(batch) {
+                            for &id in batch {
                                 let view = view(id);
                                 #[cfg(feature = "inject")]
                                 let view = view.map(|view| inject(view, &mut injected));
-                                *slot = view.map_or(0, view_key);
+                                encode_view(view, seen);
                             }
                         });
                     }
                 },
             )?;
-            // A view borrows the dictionary only while `with_views` runs, and copying it out
-            // inside the window would add work the op doesn't do. So the same ids are viewed
-            // again after the window, each view compared field by field with its term and
-            // with what the counted pass kept of it.
-            let right = snapshot.with_views(|view| {
-                drawn
-                    .iter()
-                    .flatten()
-                    .zip(batches.iter().flatten())
-                    .zip(seen.iter().flatten())
-                    .filter(|&((&i, &id), &seen)| {
-                        view(id).is_some_and(|view| {
-                            view_key(view) == seen && same_view(view, &store.terms[i])
-                        })
-                    })
-                    .count()
-            });
-            expect("viewed right", right, 1_000 * 1_024)?
+            let right = expected
+                .iter()
+                .zip(&seen)
+                .filter(|(want, seen)| want == seen);
+            expect("viewed right (batches)", right.count(), batches.len())?;
+            1_000 * 1_024
         }
         Op::DecodeQuad => {
             let quads: Vec<EncodedQuad> = snapshot
@@ -301,6 +310,18 @@ pub(crate) fn run(
             // leaves the pending inferred inserts out).
             21_000
         }
+        Op::Noop => {
+            let parts = vec![(); threads];
+            parallel(
+                threads,
+                snapshot,
+                &parts,
+                &mut vec![(); threads],
+                window,
+                |_, _, _| {},
+            )?;
+            1
+        }
     };
     Ok(rows as u64)
 }
@@ -316,6 +337,10 @@ fn parallel<T: Sync, O: Send>(
     window: &mut Window,
     read: impl Fn(&Snapshot, &[T], &mut [O]) + Sync,
 ) -> Result<(), String> {
+    if threads == 1 {
+        // On the main thread, nothing to meet: the window holds the op alone.
+        return window.count(|| read(snapshot, items, out));
+    }
     let size = items.len().div_ceil(threads);
     let parts: Vec<(&[T], &mut [O])> = items.chunks(size).zip(out.chunks_mut(size)).collect();
     let [start, done, end] = [(); 3].map(|()| Barrier::new(parts.len() + 1));
@@ -373,51 +398,58 @@ fn inject<'v>(view: TermView<'v>, injected: &mut bool) -> TermView<'v> {
     }
 }
 
-/// A view's kind and text length, as one number: what the counted pass keeps of each view,
-/// for the check's second pass to match.
-fn view_key(view: TermView<'_>) -> usize {
-    let kind = match view {
-        TermView::Iri(_) => 1,
-        TermView::String(_) => 2,
-        TermView::LangString { .. } => 3,
-        TermView::Typed { .. } => 4,
-        TermView::Triple => 5,
-        TermView::BlankNode(_) => 6,
-    };
-    view.str().map_or(0, str::len) * 8 + kind
-}
-
-/// Whether `view` shows `term`, every field the view has: text, language tag, base direction
-/// and datatype. A triple term's view has no parts (the `decode` op checks them).
-fn same_view(view: TermView<'_>, term: &Term) -> bool {
-    let literal = match (view, term) {
-        (TermView::Iri(iri), Term::NamedNode(term)) => return iri == term.as_str(),
-        (TermView::BlankNode(id), Term::BlankNode(term)) => return id == term.as_str(),
-        (TermView::Triple, Term::Triple(_)) => return true,
-        (_, Term::Literal(literal)) => literal,
-        _ => return false,
-    };
-    let plain = literal.datatype() == xsd::STRING;
+/// Every field of a view, appended to `out`: its kind, then each text with its length (value,
+/// language tag and base direction, or datatype). A triple term's view has no parts (the
+/// `decode` op checks them); no view is kind 0. [`encode_term`] writes a term the same way.
+fn encode_view(view: Option<TermView<'_>>, out: &mut Vec<u8>) {
     match view {
-        TermView::String(value) => {
-            plain && literal.language().is_none() && value == literal.value()
-        }
-        TermView::LangString {
+        None => out.push(0),
+        Some(TermView::Iri(iri)) => texts(out, 1, &[iri]),
+        Some(TermView::String(value)) => texts(out, 2, &[value]),
+        Some(TermView::LangString {
             value,
             language,
             direction,
-        } => {
-            literal.language() == Some(language)
-                && literal.direction() == direction
-                && value == literal.value()
+        }) => {
+            texts(out, 3, &[value, language]);
+            out.push(direction_code(direction));
         }
-        TermView::Typed { value, datatype } => {
-            literal.language().is_none()
-                && !plain
-                && datatype == literal.datatype().as_str()
-                && value == literal.value()
-        }
-        _ => false,
+        Some(TermView::Typed { value, datatype }) => texts(out, 4, &[value, datatype]),
+        Some(TermView::Triple) => out.push(5),
+        Some(TermView::BlankNode(id)) => texts(out, 6, &[id]),
+    }
+}
+
+/// What [`encode_view`] writes for the view of `term`.
+fn encode_term(term: &Term, out: &mut Vec<u8>) {
+    match term {
+        Term::NamedNode(iri) => texts(out, 1, &[iri.as_str()]),
+        Term::Literal(literal) => match literal.language() {
+            Some(language) => {
+                texts(out, 3, &[literal.value(), language]);
+                out.push(direction_code(literal.direction()));
+            }
+            None if literal.datatype() == xsd::STRING => texts(out, 2, &[literal.value()]),
+            None => texts(out, 4, &[literal.value(), literal.datatype().as_str()]),
+        },
+        Term::Triple(_) => out.push(5),
+        Term::BlankNode(id) => texts(out, 6, &[id.as_str()]),
+    }
+}
+
+fn texts(out: &mut Vec<u8>, kind: u8, texts: &[&str]) {
+    out.push(kind);
+    for text in texts {
+        out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+        out.extend_from_slice(text.as_bytes());
+    }
+}
+
+fn direction_code(direction: Option<BaseDirection>) -> u8 {
+    match direction {
+        None => 0,
+        Some(BaseDirection::Ltr) => 1,
+        Some(BaseDirection::Rtl) => 2,
     }
 }
 
