@@ -133,9 +133,11 @@ fn a_request_past_its_envelope_through_any_end_ends_within_it() {
         let memory = store.envelope(Some(limit));
         let end = run(&store, &memory);
         assert!(memory.refused() || end == End::Answered, "at {limit} bytes");
+        // Back to what the store keeps for every request (the bounds' U1 and views, charged
+        // within the catalog since SYN-61): nothing of the request stays.
         assert_eq!(
             catalog.used(),
-            0,
+            store.dl().bounds.kept().used(),
             "at {limit} bytes the catalog's budget is back"
         );
         ends.push((limit, end));
@@ -169,4 +171,17 @@ fn a_request_past_its_envelope_through_any_end_ends_within_it() {
     }
     // The store answers the next request in full.
     assert_eq!(run(&store, &store.envelope(None)), End::Answered);
+    // What the bounds kept goes with them: the store closed, the catalog holds nothing.
+    assert!(
+        store.dl().bounds.kept().used() > 0,
+        "the bounds kept nothing"
+    );
+    drop(unlimited);
+    drop(snapshot);
+    drop(store);
+    assert_eq!(
+        catalog.used(),
+        0,
+        "the store closed, its bounds still charged"
+    );
 }

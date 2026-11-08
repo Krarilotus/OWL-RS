@@ -219,6 +219,11 @@ impl StoreService {
         service
             .engine
             .charge_statistics_to(std::sync::Arc::new(service.envelope(None).part()));
+        // So are the owl2-dl bounds' U1 and read views (SYN-61), the same way.
+        service
+            .dl
+            .bounds
+            .set_kept(std::sync::Arc::new(service.envelope(None).part()));
         if service.engine.snapshot().revision() != before {
             service.invalidate_reasoning()?;
         }
