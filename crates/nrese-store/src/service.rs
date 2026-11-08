@@ -359,12 +359,19 @@ impl StoreService {
             return Ok(());
         }
         if let Some(path) = self.marker_path() {
-            match std::fs::remove_file(&path) {
+            // The removal durable too (DUR-3): a marker back after a power loss would claim the
+            // inferred stack exact for reasoning it no longer reflects.
+            // Gone already (an earlier try whose sync failed) still needs the sync.
+            let removed = match std::fs::remove_file(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                removed => removed,
+            }
+            .and_then(|()| nrese_engine::place::sync_dir(&self.config.data_dir));
+            match removed {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    // The file may still be there: the next invalidation tries again (the
-                    // review of 3 October 2026, A4).
+                    // The file may still be there, or its removal not durable: the next
+                    // invalidation tries again (the review of 3 October 2026, A4).
                     self.marker.store(true, Ordering::Release);
                     return Err(crate::error::StoreError::Io(error));
                 }
@@ -381,8 +388,18 @@ impl StoreService {
             return Ok(());
         };
         let temporary = path.with_extension("tmp");
-        std::fs::write(&temporary, text).map_err(crate::error::StoreError::Io)?;
-        std::fs::rename(&temporary, &path).map_err(crate::error::StoreError::Io)?;
+        // Synced and durably named (DUR-3): read at open, a marker lost or short after a power
+        // loss would misstate what the inferred stack is exact for.
+        let placed = (|| {
+            use std::io::Write as _;
+            let mut file = std::fs::File::create(&temporary)?;
+            file.write_all(text.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            nrese_engine::place::rename(&temporary, &path)?;
+            nrese_engine::place::sync_dir(&self.config.data_dir)
+        })();
+        placed.map_err(crate::error::StoreError::Io)?;
         self.marker
             .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
