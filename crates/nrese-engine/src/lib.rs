@@ -32,11 +32,12 @@ pub mod quad;
 pub mod term;
 
 pub use durability::checkpoint::image_revision;
-pub use durability::{DurabilityConfig, SyncPolicy};
+pub use durability::{DurabilityConfig, SyncPolicy, WalDamage};
 pub use engine::{
-    BulkLoad, BulkMode, CommitSummary, Content, Count, Engine, EngineConfig, EngineStats,
-    EqualityClasses, ImageInfo, InferredMask, InferredSubset, LogBatch, ProbeCursor, ReadModel,
-    Rematerialisation, Seek, Snapshot, SnapshotIdentity, Transaction,
+    Applied, BulkLoad, BulkMode, CommitSummary, Content, Count, Engine, EngineConfig, EngineStats,
+    EqualityClasses, HeavyGroups, ImageInfo, InferredMask, InferredSubset, LogBatch,
+    LogExpectation, ProbeCursor, ReadModel, Rematerialisation, Seek, Snapshot, SnapshotIdentity,
+    Transaction,
 };
 pub use error::{EngineError, EngineResult};
 pub use index::cursor::SeekStats;

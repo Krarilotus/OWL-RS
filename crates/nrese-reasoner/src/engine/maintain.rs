@@ -1,18 +1,20 @@
 //! Maintenance of a transaction's inferred stack on a commit ([`super::maintain`]).
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use nrese_engine::{
     EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, Snapshot, TermId,
     Transaction,
 };
+use nrese_exec::Budget;
 
 use rayon::prelude::*;
 
 use super::{Program, encode, pattern, storable, triple};
 use crate::delta::{self, Base, MemoryBase};
 use crate::eval::GroundProgram;
-use crate::ir::{Triple, Violation};
+use crate::ir::{Triple, Violations};
 use crate::lists::ListDiagnostic;
 
 /// A transaction's state as the delta executor reads it: the committed indexes (asserted
@@ -118,8 +120,8 @@ impl Base for EngineBase<'_> {
 /// What [`maintain`] did to a transaction's inferred stack.
 #[derive(Debug, Default)]
 pub struct Maintenance {
-    /// The consistency violations the change introduced.
-    pub violations: Vec<Violation>,
+    /// The consistency violations the change introduced, charged to its budget.
+    pub violations: Violations,
     pub inserted: u64,
     pub removed: u64,
     pub rounds: usize,
@@ -143,6 +145,19 @@ pub fn maintain(
     tx: &mut Transaction<'_>,
     stop: crate::eval::Stop<'_>,
 ) -> Result<Maintenance, delta::Interrupted> {
+    maintain_within(program, ground, tx, stop, &crate::violations::unlimited())
+}
+
+/// [`maintain`], the consistency violations (the rules' and the datatype checks', and a
+/// rebuild's) charged to `memory`: the operation's own part, whose refusal ends their list
+/// and keeps the change inconsistent ([`Violations`]).
+pub fn maintain_within(
+    program: &Program,
+    ground: Option<&GroundProgram>,
+    tx: &mut Transaction<'_>,
+    stop: crate::eval::Stop<'_>,
+    memory: &Arc<Budget>,
+) -> Result<Maintenance, delta::Interrupted> {
     // Axioms the state lacks (a store that never rematerialised): added with this commit.
     let mut missing_axioms: Vec<Triple> = Vec::new();
     // Unnamed classes left out: as the commit leaves them; one it makes consumable
@@ -162,14 +177,49 @@ pub fn maintain(
     // Revived memberships must participate in the delta executor's introduced-only
     // consistency checks. Keep the batch result for installation below: no second run.
     let mut rebuilt = if revived {
-        Some(super::materialise_until(
+        Some(super::materialise_within(
             program,
             &tx.pending_snapshot(),
             stop,
+            memory,
         )?)
     } else {
         None
     };
+    // A first load (no asserted fact before, nothing deleted): its closure is the whole
+    // closure, so it is materialised once, by the batch executor, and its violations are
+    // checked as the delta executor checks them, through the new facts only
+    // ([`delta::introduced_violations`]): an axiom's violation from before stays tolerated.
+    // The delta executor built one job per ground rule and copied each job's matches
+    // before the round ran: a 250-class subclass chain with 400 individuals held 757 MiB in
+    // a round that derived nothing, where a materialisation holds about 140 (DMW's A/B,
+    // fleet pm-dmwab-3, 21 Oct 2026). Not over a compact stack: its closure lists
+    // equalities over representatives, which the datatype checks don't read as the delta's
+    // expanded ones (Sol r1 F1). A fact no store holds (a literal subject) is new to the
+    // state where the axioms' own closure concludes none, as the state before held only
+    // that closure: such facts of the load's closure are reported with its others. Where
+    // the axioms conclude one, whether the change derives it anew can't be told from a
+    // state that can't hold it, so the delta executor, which follows the derivations,
+    // takes the change; either is decided before any run (Sol r2 F1, r3 F1; review r1 F1).
+    let first_load = !revived
+        && !program.stores_representatives()
+        && program
+            .plan
+            .is_none_or(|plan| plan == delta::policy::Plan::Rebuild)
+        && tx.base().len_in(ReadModel::Asserted) == 0
+        && tx.deleted().next().is_none()
+        && tx.inserted().next().is_some()
+        && program.axioms_conclude_only_storable(tx.base(), stop, memory)?;
+    let mut unstorable: Vec<Triple> = Vec::new();
+    if first_load {
+        rebuilt = Some(super::materialise::materialise_with_unstorable_within(
+            program,
+            &tx.pending_snapshot(),
+            stop,
+            memory,
+            &mut unstorable,
+        )?);
+    }
     let update = {
         let base = EngineBase::new(tx, &program.axioms);
         // Facts new to the state: in no graph and not inferred before the transaction.
@@ -187,7 +237,7 @@ pub fn maintain(
                 .collect();
             inserted.extend(missing_axioms.iter().copied());
         }
-        if let Some(closure) = &rebuilt {
+        if let Some(closure) = rebuilt.as_ref().filter(|_| !first_load) {
             inserted.extend(
                 closure
                     .inferred
@@ -218,17 +268,53 @@ pub fn maintain(
         };
         if inserted.is_empty() && deleted.is_empty() {
             delta::Update::default()
+        } else if let Some(closure) = rebuilt.as_mut().filter(|_| first_load) {
+            // The batch's own report isn't the one given (it holds an axiom's old violations
+            // too): let go of its charge before the introduced-only report takes the same
+            // budget, which then holds what the delta executor's single report would.
+            drop(std::mem::take(&mut closure.violations));
+            // The new inferred facts, as the delta executor reports them (its `insert`): the
+            // state tells which storable ones it held before, and none it can't hold (above).
+            let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
+            let derived: Vec<Triple> = closure
+                .inferred
+                .iter()
+                .map(|t| triple(t.in_default_graph()))
+                .filter(|&f| {
+                    !base.is_asserted(f) && !(base.contains(f) && !inserted_set.contains(&f))
+                })
+                .chain(unstorable.drain(..))
+                .collect();
+            delta::Update {
+                violations: delta::introduced_violations(
+                    &base, &inserted, &derived, rules, ground, stop, memory,
+                )?,
+                insert: derived,
+                policy: delta::policy::Counts {
+                    plan: delta::policy::Plan::Rebuild,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
         } else {
-            delta::update_with(&base, &inserted, &deleted, rules, ground, stop, policy)?
+            delta::update_within(
+                &base, &inserted, &deleted, rules, ground, stop, policy, memory,
+            )?
         }
     };
     let mut update = update;
-    update.violations.extend(super::datatypes::violations(
-        &update.insert,
-        program.rdf_type,
-        program.same_as,
-        &|id| tx.decode(TermId::from_raw(id)),
-    ));
+    // A list that already stopped at its budget makes the change inconsistent: the
+    // datatype checks would add nothing to that.
+    if update.violations.complete() {
+        let datatypes = super::datatypes::violations(
+            &update.insert,
+            program.rdf_type,
+            program.same_as,
+            &|id| tx.decode(TermId::from_raw(id)),
+            memory,
+        );
+        update.violations.append(datatypes);
+    }
     let (mut inserted, mut removed) = (0, 0);
     // Over representatives, a change that may split a class is rebuilt (B3a: the
     // translation can't follow it; the representative view for the delta executor is B3b).
@@ -261,7 +347,7 @@ pub fn maintain(
     if rebuild {
         let mut closure = match rebuilt.take() {
             Some(closure) => closure,
-            None => super::materialise_until(program, &tx.pending_snapshot(), stop)?,
+            None => super::materialise_within(program, &tx.pending_snapshot(), stop, memory)?,
         };
         // An interruption drops the transaction, these changes with it.
         if stop() {
@@ -605,7 +691,7 @@ mod tests {
                         }
                         let done =
                             maintain(&program, Some(&ground), &mut tx, crate::eval::NEVER).unwrap();
-                        assert!(done.violations.is_empty(), "no inconsistency is possible");
+                        assert!(done.violations.consistent(), "no inconsistency is possible");
                         let took = done.work.plan;
                         taken.insert(took);
                         tx.commit().unwrap();
@@ -755,9 +841,86 @@ mod tests {
             }
             let closure = super::super::materialise(&program, &tx.pending_snapshot());
             assert!(
-                closure.violations.iter().any(|v| v.rule == "cls-nothing2"),
+                closure
+                    .violations
+                    .iter()
+                    .any(|(rule, _)| rule == "cls-nothing2"),
                 "by representatives {representatives}: {:?}",
                 closure.violations
+            );
+        }
+    }
+
+    /// A first load is materialised once, not run through the delta executor: its stack
+    /// is the recomputed closure, an inconsistent one is still reported, and the next
+    /// commit, onto a loaded state, takes the delta.
+    #[test]
+    fn a_first_load_is_materialised_and_the_next_commit_takes_the_delta() {
+        use crate::delta::policy::Plan;
+        for consistent in [true, false] {
+            let engine = Engine::new(EngineConfig {
+                background_maintenance: false,
+                ..EngineConfig::default()
+            })
+            .unwrap();
+            let mut tx = engine.transaction();
+            let program =
+                Program::compile(&crate::rulesets::Ruleset::Owl2Rl.into(), &|t| tx.intern(t));
+            let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+            let rdf_type = iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+            let subclass = iri("http://www.w3.org/2000/01/rdf-schema#subClassOf");
+            let disjoint = iri("http://www.w3.org/2002/07/owl#disjointWith");
+            // A subclass chain of 20 with 10 individuals at the bottom (DMW's chain, small).
+            let class = |n: usize| iri(&format!("http://example.com/C{n}"));
+            let mut facts: Vec<Triple> = (1..20)
+                .map(|n| [class(n), subclass, class(n - 1)])
+                .collect();
+            facts.extend((0..10).map(|i| {
+                [
+                    iri(&format!("http://example.com/i{i}")),
+                    rdf_type,
+                    class(19),
+                ]
+            }));
+            if !consistent {
+                facts.push([class(0), disjoint, class(19)]);
+            }
+            let next = [iri("http://example.com/j"), rdf_type, class(10)];
+            for &fact in &facts {
+                tx.insert_encoded(encode(fact).in_default_graph());
+            }
+            let done = maintain(&program, None, &mut tx, crate::eval::NEVER).unwrap();
+            assert_eq!(done.work.plan, Plan::Rebuild, "consistent {consistent}");
+            assert_eq!(
+                done.violations.consistent(),
+                consistent,
+                "{:?}",
+                done.violations
+            );
+            if !consistent {
+                continue;
+            }
+            tx.commit().unwrap();
+            let snapshot = engine.snapshot();
+            let stored: HashSet<EncodedTriple> = snapshot
+                .stored()
+                .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+                .map(Into::into)
+                .collect();
+            let fresh: HashSet<EncodedTriple> = super::super::materialise(&program, &snapshot)
+                .inferred
+                .into_iter()
+                .filter(|t| !snapshot.contains_in(ReadModel::Asserted, &t.in_default_graph()))
+                .collect();
+            assert_eq!(stored, fresh);
+            let ground = done.program.expect("the ground program after the load");
+            let mut tx = engine.transaction();
+            tx.insert_encoded(encode(next).in_default_graph());
+            let done = maintain(&program, Some(&ground), &mut tx, crate::eval::NEVER).unwrap();
+            assert_ne!(
+                done.work.plan,
+                Plan::Rebuild,
+                "a loaded state takes the delta"
             );
         }
     }

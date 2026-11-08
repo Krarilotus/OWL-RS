@@ -445,12 +445,14 @@ impl Context<'_> {
                     true => semi_join_in_place(&mut solutions.table, &found.table, &lk, &rk),
                     false => anti_join_in_place(&mut solutions.table, &found.table, &lk, &rk),
                 }
+                .map_err(crate::QueryEvaluationError::from)?;
                 self.consumed(found);
                 note(joined, detail, solutions.table.len());
                 return Ok(solutions);
             }
             // An unbound variable isn't put into the pattern: any value matches.
-            let mask = compatible_mask(&solutions.table, &found.table, &lk, &rk, false);
+            let mask = compatible_mask(&solutions.table, &found.table, &lk, &rk, false)
+                .map_err(crate::QueryEvaluationError::from)?;
             self.consumed(found);
             let kept = mask.iter().filter(|m| **m == keep_matching).count();
             note(joined, detail, kept);
@@ -566,7 +568,8 @@ impl Context<'_> {
         if correlated.is_empty() {
             let found = self.eval(pattern)?;
             let (lk, rk) = shared_columns(solutions, &found);
-            let mask = compatible_mask(&solutions.table, &found.table, &lk, &rk, false);
+            let mask = compatible_mask(&solutions.table, &found.table, &lk, &rk, false)
+                .map_err(crate::QueryEvaluationError::from)?;
             self.consumed(found);
             return Ok(mask);
         }
@@ -655,7 +658,7 @@ impl Context<'_> {
             false,
             max_rows,
         )
-        .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
+        .map_err(|e| self.join_stopped(e, vars.len()))?;
         self.consumed(right);
         let pairs = self.produced(Solutions {
             vars,

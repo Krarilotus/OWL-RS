@@ -497,8 +497,9 @@ fn map_bytes<K, V>(capacity: usize) -> usize {
 }
 
 /// Room in `map` for one more entry. Its next table is charged to `held` before it is
-/// allocated, beside the table it replaces, which is released once the entries moved.
-fn map_room<K: std::hash::Hash + Eq, V, B: Deref<Target = Budget>>(
+/// allocated, beside the table it replaces, which is released once the entries moved
+/// (the spatial joins' maps, and a search's per-graph ranks).
+pub(super) fn map_room<K: std::hash::Hash + Eq, V, B: Deref<Target = Budget>>(
     held: &mut Reservation<B>,
     map: &mut HashMap<K, V>,
 ) -> Result<(), BudgetExceeded> {

@@ -79,8 +79,12 @@ fn catch_up(primary: &Engine, replica: &Engine) -> Result<u64, EngineError> {
         if batch.records == 0 {
             return Ok(at);
         }
-        let reached = replica.apply_log(&batch.frames)?;
-        assert_eq!(reached, batch.last);
+        let reached = replica.apply_log(
+            &batch.frames,
+            &batch.expectation(at),
+            &nrese_exec::stop::StopSource::none(),
+        )?;
+        assert_eq!(reached.revision, batch.last);
     }
 }
 
@@ -117,7 +121,14 @@ fn a_replica_holds_what_the_primary_holds() {
     assert_eq!((empty.records, empty.last, empty.latest), (0, 20, 20));
     // A batch applied twice changes nothing.
     let again = primary.log_since(10, 1 << 20).unwrap();
-    assert_eq!(replica.apply_log(&again.frames).unwrap(), 20);
+    let applied = replica
+        .apply_log(
+            &again.frames,
+            &again.expectation(10),
+            &nrese_exec::stop::StopSource::none(),
+        )
+        .unwrap();
+    assert_eq!(applied.revision, 20);
     assert_eq!(contents(&replica), contents(&primary));
 
     // The replica keeps what it applied across a restart (its own log).
@@ -153,12 +164,29 @@ fn records_out_of_order_are_refused() {
     // Revisions 3 to 5 without 2: a gap.
     let gap = primary.log_since(2, 1 << 20).unwrap();
     assert!(matches!(
-        replica.apply_log(&gap.frames),
+        replica.apply_log(
+            &gap.frames,
+            &gap.expectation(2),
+            &nrese_exec::stop::StopSource::none()
+        ),
         Err(EngineError::Corruption(_))
     ));
     assert_eq!(replica.stats().revision, 1, "nothing applied");
     // Garbage isn't a record.
-    assert!(replica.apply_log(b"not a record at all").is_err());
+    let one = nrese_engine::LogExpectation {
+        after: 1,
+        records: 1,
+        last: 2,
+    };
+    assert!(
+        replica
+            .apply_log(
+                b"not a record at all",
+                &one,
+                &nrese_exec::stop::StopSource::none()
+            )
+            .is_err()
+    );
     // In order, it applies.
     assert_eq!(catch_up(&primary, &replica).unwrap(), 5);
     // An in-memory primary has no log to ship.

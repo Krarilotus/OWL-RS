@@ -13,13 +13,15 @@
 //! - **Growth**: [`Hnsw::extend`] links the vectors appended since; nothing is removed
 //!   (the engine's vectors are append-only, a query checks that a hit is still used).
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
 
 use parking_lot::RwLock;
 use rayon::prelude::*;
 
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec};
+
+use crate::charged::Heap;
 use crate::{Hit, Metric, Ordered, Query, Vectors};
 
 /// How a graph is built.
@@ -165,20 +167,24 @@ impl Hnsw {
     }
 
     /// The `k` nearest of the linked vectors to `query` that `accept` takes (by id),
-    /// nearest first, with a beam of at least `ef`.
-    pub fn search(
+    /// nearest first, with a beam of at least `ef`. The beam's heaps and the hits are
+    /// charged to `budget` before they are allocated; a search the budget has no room for
+    /// is refused, with nothing left charged. (The per-thread visited marks and one node's
+    /// links are reused scratch of the graph's size, not of the search's.)
+    pub fn search<'b>(
         &self,
         vectors: &Vectors,
         query: &[f32],
         k: usize,
         ef: usize,
         accept: &(dyn Fn(u64) -> bool + Sync),
-    ) -> Vec<Hit> {
+        budget: &'b Budget,
+    ) -> Result<ChargedVec<Hit, &'b Budget>, BudgetExceeded> {
         let Some((entry, top)) = *self.entry.read() else {
-            return Vec::new();
+            return Ok(ChargedVec::new(budget));
         };
         if k == 0 || query.len() != vectors.dimension() {
-            return Vec::new();
+            return Ok(ChargedVec::new(budget));
         }
         let query = Query::new(query);
         let mut nearest = (self.distance(vectors, &query, entry), entry);
@@ -186,15 +192,14 @@ impl Hnsw {
             nearest = self.greedy(vectors, &query, nearest, level);
         }
         let accepted = |position: u32| accept(vectors.id(position));
-        let mut found = self.search_level(vectors, &query, &[nearest], ef.max(k), 0, &accepted);
+        let mut found =
+            self.search_level(vectors, &query, &[nearest], ef.max(k), 0, &accepted, budget)?;
         found.truncate(k);
-        found
-            .into_iter()
-            .map(|(distance, position)| Hit {
-                id: vectors.id(position),
-                distance,
-            })
-            .collect()
+        let hits = found.iter().map(|&(distance, position)| Hit {
+            id: vectors.id(position),
+            distance,
+        });
+        ChargedVec::collect(budget, found.len(), hits)
     }
 
     /// Bytes of the links.
@@ -261,16 +266,23 @@ impl Hnsw {
         }
         let mut entries = vec![nearest];
         for current in (0..=level.min(top)).rev() {
-            let candidates = self.search_level(
-                vectors,
-                &query,
-                &entries,
-                self.parameters.ef_construction,
-                current,
-                &|_| true,
-            );
+            // Building is the graph's own memory, outside any query (the store's derived
+            // indexes): an unlimited budget, as before.
+            let unlimited = Budget::unlimited();
+            let candidates = self
+                .search_level(
+                    vectors,
+                    &query,
+                    &entries,
+                    self.parameters.ef_construction,
+                    current,
+                    &|_| true,
+                    &unlimited,
+                )
+                .expect("an unlimited budget refuses nothing");
             let candidates: Vec<(f32, u32)> = candidates
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|&(_, found)| found != position)
                 .collect();
             let chosen = self.select(vectors, &candidates, self.parameters.m);
@@ -374,7 +386,8 @@ impl Hnsw {
 
     /// The `ef` nearest nodes to `query` at `level` that `accept` takes, nearest first:
     /// a beam search from `entries`.
-    fn search_level(
+    #[allow(clippy::too_many_arguments)]
+    fn search_level<'b>(
         &self,
         vectors: &Vectors,
         query: &Query<'_>,
@@ -382,16 +395,21 @@ impl Hnsw {
         ef: usize,
         level: u8,
         accept: &dyn Fn(u32) -> bool,
-    ) -> Vec<(f32, u32)> {
+        budget: &'b Budget,
+    ) -> Result<ChargedVec<(f32, u32), &'b Budget>, BudgetExceeded> {
         with_visited(self.links.len(), |visited| {
-            let mut candidates: BinaryHeap<Reverse<Ordered<u32>>> = BinaryHeap::new();
-            let mut results: BinaryHeap<Ordered<u32>> = BinaryHeap::new();
+            let mut candidates: Heap<'b, Reverse<Ordered<u32>>> = Heap::with_capacity(budget, 0)?;
+            // The results never hold more than the beam (or the nodes there are) and one being
+            // pushed: room for that, charged at once, and the loop's pushes neither grow nor
+            // fail.
+            let room = ef.max(entries.len()).min(self.links.len()) + 1;
+            let mut results: Heap<'b, Ordered<u32>> = Heap::with_capacity(budget, room)?;
             let mut links = Vec::new();
             for &(distance, node) in entries {
                 if visited.insert(node) {
-                    candidates.push(Reverse(Ordered(distance, node)));
+                    candidates.push(Reverse(Ordered(distance, node)))?;
                     if accept(node) {
-                        results.push(Ordered(distance, node));
+                        results.push(Ordered(distance, node))?;
                     }
                 }
             }
@@ -404,6 +422,9 @@ impl Hnsw {
                     break;
                 }
                 self.snapshot_links(node, level, &mut links);
+                // Room for every link at once, charged before the loop: its pushes neither
+                // grow nor fail.
+                candidates.reserve(links.len())?;
                 for &neighbour in &links {
                     if !visited.insert(neighbour) {
                         continue;
@@ -413,21 +434,18 @@ impl Hnsw {
                     if full && results.peek().is_some_and(|worst| distance >= worst.0) {
                         continue;
                     }
-                    candidates.push(Reverse(Ordered(distance, neighbour)));
+                    candidates.push_reserved(Reverse(Ordered(distance, neighbour)));
                     if accept(neighbour) {
-                        results.push(Ordered(distance, neighbour));
+                        results.push_reserved(Ordered(distance, neighbour));
                         if results.len() > ef {
                             results.pop();
                         }
                     }
                 }
             }
-            let mut found: Vec<(f32, u32)> = results
-                .into_iter()
-                .map(|Ordered(distance, node)| (distance, node))
-                .collect();
-            found.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-            found
+            drop(candidates);
+            // Nearest first, by distance then node.
+            results.into_sorted(|Ordered(distance, node)| (distance, node))
         })
     }
 }
@@ -451,24 +469,36 @@ impl Visited<'_> {
 }
 
 thread_local! {
-    static VISITED: RefCell<(Vec<u32>, u32)> = const { RefCell::new((Vec::new(), 0)) };
+    /// The thread's visited marks and their last stamp, kept between its searches.
+    static VISITED: Cell<(Vec<u32>, u32)> = const { Cell::new((Vec::new(), 0)) };
 }
 
+/// Runs `f` with visited marks for `nodes` nodes, none visited yet. The marks are taken
+/// out of the thread's for the run and put back after, so a search started inside `f` on
+/// this thread (by `accept`, or a Rayon part taken on while it waits) gets marks of its
+/// own: the thread's then hold none, and it allocates.
 fn with_visited<R>(nodes: usize, f: impl FnOnce(&mut Visited<'_>) -> R) -> R {
-    VISITED.with(|cell| {
-        let mut cell = cell.borrow_mut();
-        let (marks, stamp) = &mut *cell;
-        if marks.len() < nodes {
-            marks.resize(nodes, 0);
-        }
-        *stamp = stamp.wrapping_add(1);
-        if *stamp == 0 {
-            marks.iter_mut().for_each(|mark| *mark = 0);
-            *stamp = 1;
-        }
-        let stamp = *stamp;
-        f(&mut Visited { marks, stamp })
-    })
+    let (mut marks, mut stamp) = VISITED.take();
+    if marks.len() < nodes {
+        marks.resize(nodes, 0);
+    }
+    stamp = stamp.wrapping_add(1);
+    if stamp == 0 {
+        marks.iter_mut().for_each(|mark| *mark = 0);
+        stamp = 1;
+    }
+    let result = f(&mut Visited {
+        marks: &mut marks,
+        stamp,
+    });
+    // The larger of these marks and any a nested search put back is kept.
+    let kept = VISITED.take();
+    VISITED.set(if kept.0.len() > marks.len() {
+        kept
+    } else {
+        (marks, stamp)
+    });
+    result
 }
 
 #[cfg(test)]
@@ -529,8 +559,20 @@ mod tests {
                 .enumerate()
                 .map(|(i, v)| v + 0.05 * ((i + q) as f32).sin())
                 .collect();
-            let truth = exact(vectors, &query, k, graph.metric(), accept);
-            let hits = graph.search(vectors, &query, k, ef, accept);
+            let truth = exact(
+                vectors,
+                &query,
+                k,
+                graph.metric(),
+                accept,
+                &Budget::unlimited(),
+            )
+            .unwrap()
+            .to_vec();
+            let hits = graph
+                .search(vectors, &query, k, ef, accept, &Budget::unlimited())
+                .unwrap()
+                .to_vec();
             assert!(hits.iter().all(|hit| accept(hit.id)));
             found += hits
                 .iter()
@@ -561,25 +603,132 @@ mod tests {
         }
     }
 
+    /// Under every budget from none to what it held at its peak, a graph search either
+    /// answers as unlimited or is refused, and holds nothing afterwards either way (review
+    /// fix check, S2).
+    #[test]
+    fn graph_searches_refused_partway_release_everything() {
+        let vectors = random_vectors(2_000, 8, 5);
+        let mut graph = Hnsw::new(Metric::L2, HnswParameters::default());
+        graph.extend(&vectors);
+        let query = vectors.get(7).to_vec();
+        let unlimited = Budget::unlimited();
+        let truth = graph
+            .search(&vectors, &query, 50, 200, &|_| true, &unlimited)
+            .unwrap()
+            .to_vec();
+        let peak = unlimited.peak();
+        let (mut answered, mut refused) = (0, 0);
+        // The peak itself is one of the limits: the search is on this thread alone, so its
+        // peak is the same every run, and that run answers.
+        for limit in (0..peak).step_by((peak / 64).max(1)).chain([peak]) {
+            let budget = Budget::new(limit);
+            match graph.search(&vectors, &query, 50, 200, &|_| true, &budget) {
+                Ok(found) => {
+                    assert_eq!(*found, truth, "limit {limit}");
+                    answered += 1;
+                }
+                Err(_) => refused += 1,
+            }
+            assert_eq!(budget.used(), 0, "limit {limit}: released");
+        }
+        assert!(
+            answered > 0 && refused > 0,
+            "{answered} answered, {refused} refused"
+        );
+    }
+
     #[test]
     fn small_and_empty_graphs_answer() {
         let mut graph = Hnsw::new(Metric::Cosine, HnswParameters::default());
         let mut vectors = Vectors::new(3);
         assert!(
             graph
-                .search(&vectors, &[1.0, 0.0, 0.0], 5, 10, &|_| true)
+                .search(
+                    &vectors,
+                    &[1.0, 0.0, 0.0],
+                    5,
+                    10,
+                    &|_| true,
+                    &Budget::unlimited()
+                )
+                .unwrap()
+                .to_vec()
                 .is_empty()
         );
         vectors.push(7, &[1.0, 0.0, 0.0]);
         vectors.push(8, &[0.0, 1.0, 0.0]);
         graph.extend(&vectors);
-        let hits = graph.search(&vectors, &[0.9, 0.1, 0.0], 5, 10, &|_| true);
+        let hits = graph
+            .search(
+                &vectors,
+                &[0.9, 0.1, 0.0],
+                5,
+                10,
+                &|_| true,
+                &Budget::unlimited(),
+            )
+            .unwrap()
+            .to_vec();
         assert_eq!(hits.iter().map(|h| h.id).collect::<Vec<_>>(), [7, 8]);
         assert!(
             graph
-                .search(&vectors, &[1.0, 0.0], 5, 10, &|_| true)
+                .search(
+                    &vectors,
+                    &[1.0, 0.0],
+                    5,
+                    10,
+                    &|_| true,
+                    &Budget::unlimited()
+                )
+                .unwrap()
+                .to_vec()
                 .is_empty()
         );
+    }
+
+    /// A search's `accept` may search the graph again on its own thread (an embedder's
+    /// filter that searches, or a Rayon part a waiting thread takes on): both answer as a
+    /// search alone does. Each search had borrowed its thread's visited marks for its whole
+    /// run, and the nested one panicked on the second borrow.
+    #[test]
+    fn a_search_s_accept_may_search_again_on_its_thread() {
+        let vectors = random_vectors(500, 8, 7);
+        let mut graph = Hnsw::new(Metric::L2, HnswParameters::default());
+        graph.extend(&vectors);
+        let query = vectors.get(42).to_vec();
+        let unlimited = Budget::unlimited();
+        let ids = |hits: Result<ChargedVec<Hit, &Budget>, BudgetExceeded>| {
+            hits.unwrap().iter().map(|hit| hit.id).collect::<Vec<_>>()
+        };
+        let alone = ids(graph.search(&vectors, &query, 10, 64, &|_| true, &unlimited));
+        let nested = std::sync::Mutex::new(None);
+        let outer = ids(graph.search(
+            &vectors,
+            &query,
+            10,
+            64,
+            &|_| {
+                let mut nested = nested.lock().expect("unpoisoned");
+                if nested.is_none() {
+                    *nested = Some(ids(graph.search(
+                        &vectors,
+                        &query,
+                        10,
+                        64,
+                        &|_| true,
+                        &unlimited,
+                    )));
+                }
+                true
+            },
+            &unlimited,
+        ));
+        assert_eq!(
+            nested.into_inner().expect("unpoisoned"),
+            Some(alone.clone())
+        );
+        assert_eq!(outer, alone);
     }
 }
 
@@ -604,17 +753,39 @@ mod growth_tests {
         let query = all.get(5_000).to_vec();
         let read = Hnsw::from_parts(graph.to_parts()).expect("sound parts");
         assert_eq!(
-            read.search(&prefix, &query, 5, 64, &|_| true),
-            graph.search(&prefix, &query, 5, 64, &|_| true)
+            read.search(&prefix, &query, 5, 64, &|_| true, &Budget::unlimited())
+                .unwrap()
+                .to_vec(),
+            graph
+                .search(&prefix, &query, 5, 64, &|_| true, &Budget::unlimited())
+                .unwrap()
+                .to_vec()
         );
         // Prefix graph + exact tail: the true nearest is the queried vector itself.
-        let from_graph = graph.search(&all, &query, 5, 64, &|_| true);
-        let tail = exact_from(&all, graph.len(), &query, 5, Metric::L2, &|_| true);
-        let merged = merge(from_graph.into_iter().chain(tail), 5);
+        let from_graph = graph
+            .search(&all, &query, 5, 64, &|_| true, &Budget::unlimited())
+            .unwrap()
+            .to_vec();
+        let tail = exact_from(
+            &all,
+            graph.len(),
+            &query,
+            5,
+            Metric::L2,
+            &|_| true,
+            &Budget::unlimited(),
+        )
+        .unwrap()
+        .to_vec();
+        let merged = merge(from_graph.into_iter().chain(tail), 5, &Budget::unlimited())
+            .unwrap()
+            .to_vec();
         assert_eq!(merged[0].id, all.id(5_000));
         // The graph's part is approximate (and its parallel build not deterministic): at
         // least 4 of the exact 5 nearest, the exact tail's own hit first.
-        let truth: Vec<u64> = exact(&all, &query, 5, Metric::L2, &|_| true)[..5]
+        let truth: Vec<u64> = exact(&all, &query, 5, Metric::L2, &|_| true, &Budget::unlimited())
+            .unwrap()
+            .to_vec()[..5]
             .iter()
             .map(|hit| hit.id)
             .collect();
@@ -627,7 +798,11 @@ mod growth_tests {
         assert_eq!(grown.len(), 6_000);
         assert_eq!(graph.len(), 4_000);
         assert_eq!(
-            grown.search(&all, &query, 1, 64, &|_| true)[0].id,
+            grown
+                .search(&all, &query, 1, 64, &|_| true, &Budget::unlimited())
+                .unwrap()
+                .to_vec()[0]
+                .id,
             all.id(5_000)
         );
         // Unsound parts are refused.

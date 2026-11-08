@@ -9,16 +9,21 @@
 //! (point-in-time restore).
 //!
 //! Failure model: if an append fails midway, the file may end in a partial frame. The log
-//! is then *poisoned*: every later append fails until the engine is reopened, and recovery
-//! truncates the torn tail. Appending after a partial frame would turn a recoverable torn
-//! tail into mid-log corruption.
+//! is then *poisoned*: every later append, rotation and bulk publication fails until the
+//! engine is reopened, and recovery cuts the torn tail ([`super::tail`]). Appending after a
+//! partial frame would turn a recoverable torn tail into mid-log corruption. A new segment
+//! appears under its name only with its magic synced (written under a temporary name, then
+//! renamed): a rotation that fails before the rename leaves the log as it was; one whose
+//! outcome is unknown after it poisons the log.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::SyncPolicy;
-use super::codec::{CommitRecord, Frame, decode_frame, encode_record};
+#[cfg(test)]
+use super::codec::encode_record;
+use super::codec::{CommitRecord, Frame, decode_frame, encode_record_at};
 use crate::error::{EngineError, EngineResult};
 
 /// Version 2 added the inferred stack to commit records (roadmap E6); version 3 inlines
@@ -188,6 +193,17 @@ impl Wal {
         if let Some(archive) = &archive {
             fs::create_dir_all(archive)?;
         }
+        // A segment a crash left under its temporary name was never part of the log.
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(TEMPORARY_SUFFIX))
+            {
+                fs::remove_file(&path)?;
+            }
+        }
         // The newest segment is appended to if it is of the format written now; otherwise
         // (a store from before version 6) a new segment starts.
         let newest = list_segments(dir)?.pop().filter(|(_, path)| {
@@ -226,29 +242,36 @@ impl Wal {
         self.bytes_since_checkpoint
     }
 
-    /// Appends one record and makes it durable according to the sync policy. The caller
-    /// publishes the commit only after this returns `Ok`.
-    pub(crate) fn append(&mut self, record: &CommitRecord) -> EngineResult<()> {
+    /// Appends one record and makes it durable according to the sync policy, and returns its
+    /// commit time. The caller publishes the commit only after this returns `Ok`.
+    ///
+    /// A local commit is stamped here, by `stamp`, once the record's preparation and any
+    /// rotation are done and just before it is written and synced: the time is that of the
+    /// commit, not of its build (review r1, R1-F1). Without `stamp` (a replicated record)
+    /// the record's own time is kept.
+    pub(crate) fn append(
+        &mut self,
+        record: &CommitRecord,
+        stamp: Option<&mut dyn FnMut() -> u64>,
+    ) -> EngineResult<Option<u64>> {
         if self.poisoned {
             return Err(EngineError::WalPoisoned);
         }
         if self.active_bytes >= self.segment_bytes {
             self.rotate(record.revision)?;
         }
+        #[cfg(test)]
+        if let Some(at) = super::fault::CLOCK_AT_APPEND.get() {
+            super::fault::CLOCK.set(Some(at));
+        }
+        let committed = match stamp {
+            Some(stamp) => Some(stamp()),
+            None => record.committed_micros,
+        };
         self.buffer.clear();
         // Version 4 segments (stores that keep integers in their dictionary) have no times.
-        let timed;
-        let record = match self.magic == SEGMENT_MAGIC {
-            true => record,
-            false => {
-                timed = CommitRecord {
-                    committed_micros: None,
-                    ..record.clone()
-                };
-                &timed
-            }
-        };
-        encode_record(record, &mut self.buffer)?; // nothing written yet on error
+        let logged = committed.filter(|_| self.magic == SEGMENT_MAGIC);
+        encode_record_at(record, logged, &mut self.buffer)?; // nothing written yet on error
         let result = self
             .active
             .write_all(&self.buffer)
@@ -262,20 +285,54 @@ impl Wal {
         }
         self.active_bytes += self.buffer.len() as u64;
         self.bytes_since_checkpoint += self.buffer.len() as u64;
-        Ok(())
+        Ok(committed)
     }
 
-    /// Starts a new segment whose first record will be `next_revision`. No-op if the active
-    /// segment is still empty.
+    /// Starts a new segment for the records from `next_revision` on (a lower bound: a bulk
+    /// load rotates before it knows whether it commits). No-op if the active segment is
+    /// still empty; refused once the log is poisoned.
+    ///
+    /// A failure that leaves the log as it was is only returned. One that leaves its state
+    /// unknown poisons it: the active segment's sync (its records may not be on disk), or a
+    /// new segment possibly in place under its name (records appended to the old one after
+    /// it would sit behind a later-named segment, which replication and release read as
+    /// covering them).
     pub(crate) fn rotate(&mut self, next_revision: u64) -> EngineResult<()> {
+        if self.poisoned {
+            return Err(EngineError::WalPoisoned);
+        }
         if self.active_bytes <= SEGMENT_MAGIC.len() as u64 {
             return Ok(());
         }
-        self.active.sync_all()?;
-        self.active = create_segment(&self.dir, next_revision, self.magic)?;
-        self.active_first_revision = next_revision;
-        self.active_bytes = SEGMENT_MAGIC.len() as u64;
-        Ok(())
+        #[cfg(test)]
+        super::fault::check(&super::fault::FAIL_ROTATE, "rotation")?;
+        if let Err(error) = self.active.sync_all() {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        match create_segment(&self.dir, next_revision, self.magic) {
+            Ok(file) => {
+                self.active = file;
+                self.active_first_revision = next_revision;
+                self.active_bytes = SEGMENT_MAGIC.len() as u64;
+                Ok(())
+            }
+            Err(error) => {
+                if !matches!(
+                    segment_path(&self.dir, next_revision).try_exists(),
+                    Ok(false)
+                ) {
+                    self.poisoned = true;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Takes no more appends, rotations or bulk publications until the engine is reopened:
+    /// a revision may be on disk that the live state doesn't hold ([`crate::engine::bulk`]).
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
     }
 
     /// Called after a checkpoint at `revision`: restarts the byte counter and deletes (or
@@ -315,15 +372,31 @@ fn archive_segment(path: &Path, archive: &Path) -> EngineResult<()> {
 
 impl Wal {}
 
+/// What a segment is written under until its magic is synced.
+const TEMPORARY_SUFFIX: &str = ".wal.tmp";
+
+/// Places a new segment holding only its magic, under its name only once that is synced: a
+/// failure before the rename leaves no segment behind (its temporary goes, here or at the
+/// next open).
 fn create_segment(dir: &Path, first_revision: u64, magic: &[u8; 8]) -> EngineResult<File> {
     let path = segment_path(dir, first_revision);
-    let mut file = OpenOptions::new()
+    let temporary = dir.join(format!("{first_revision:020}{TEMPORARY_SUFFIX}"));
+    let written = OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
-        .open(&path)?;
-    file.write_all(magic)?;
-    file.sync_all()?;
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(magic)?;
+            file.sync_all()
+        });
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    fs::rename(&temporary, &path)?;
+    #[cfg(test)]
+    super::fault::check(&super::fault::FAIL_SEGMENT_PLACED, "segment directory sync")?;
     super::sync_dir(dir)?;
     Ok(OpenOptions::new().append(true).open(&path)?)
 }

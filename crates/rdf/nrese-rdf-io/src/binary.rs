@@ -174,7 +174,12 @@ impl<R: Read> BinaryParser<R> {
         let mut value: u32 = 0;
         for shift in (0..35).step_by(7) {
             let byte = self.byte()?;
-            value |= u32::from(byte & 0x7f) << shift;
+            let payload = u32::from(byte & 0x7f);
+            // The fifth byte has room for 4 bits: more would be lost by the shift.
+            if shift == 28 && payload > 0xF {
+                return Err(self.error("a variable-length integer longer than 32 bits"));
+            }
+            value |= payload << shift;
             if byte & 0x80 == 0 {
                 return Ok(value);
             }

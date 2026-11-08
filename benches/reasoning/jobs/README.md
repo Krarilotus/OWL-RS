@@ -1,5 +1,7 @@
 # The reasoning home-turf jobs
 
+> **Superseded (2 Nov 2026):** these job files were written for `suite/queue.py`, the queue before the fleet; they name hosts and aren't submitted any more. A run of this kit is a fleet job ([../../README.md](../../README.md#on-the-fleet)); porting them is a follow-up.
+
 Measurement-queue jobs ([../../suite/queue.py](../../suite/queue.py)) for this week's reasoning
 families: `lubm` (RDFox's L and LE programs), `claros`, `ldbc-spb`, `datalog-graphs`,
 `commit-latency`. Every system of a job runs on Office-PC (Phuoc-Yu has no Docker), one job

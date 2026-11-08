@@ -38,30 +38,30 @@ pub(crate) struct CommitRecord {
     pub committed_micros: Option<u64>,
 }
 
-/// Exact payload size of `record` in bytes.
-fn payload_len(record: &CommitRecord) -> u64 {
+/// Exact payload size of `record`, logged with the time `committed`, in bytes.
+fn payload_len(record: &CommitRecord, committed: Option<u64>) -> u64 {
     let keys: u64 = record.keys.iter().map(|key| 4 + key.len() as u64).sum();
     let quads = (record.inserts.len() + record.deletes.len()) as u64 * QUAD_BYTES as u64;
     let triples = (record.inferred_inserts.len() + record.inferred_deletes.len()) as u64
         * TRIPLE_BYTES as u64;
-    8 + 8
-        + 4
-        + keys
-        + 4 * 4
-        + quads
-        + triples
-        + if record.committed_micros.is_some() {
-            8
-        } else {
-            0
-        }
+    8 + 8 + 4 + keys + 4 * 4 + quads + triples + if committed.is_some() { 8 } else { 0 }
 }
 
 /// Appends one framed record to `out`. Fails without writing anything if the payload does
 /// not fit the 32-bit frame length (about 130 M quads); such loads go through the bulk
 /// loader, which writes a checkpoint instead of a WAL record.
 pub(crate) fn encode_record(record: &CommitRecord, out: &mut Vec<u8>) -> EngineResult<()> {
-    let len = payload_len(record);
+    encode_record_at(record, record.committed_micros, out)
+}
+
+/// [`encode_record`] with the commit time `committed` in place of the record's own: the
+/// log's, stamped as the record is written ([`super::wal::Wal::append`]).
+pub(crate) fn encode_record_at(
+    record: &CommitRecord,
+    committed: Option<u64>,
+    out: &mut Vec<u8>,
+) -> EngineResult<()> {
+    let len = payload_len(record, committed);
     let payload_len =
         u32::try_from(len).map_err(|_| EngineError::TransactionTooLarge { bytes: len })?;
     out.reserve(FRAME_HEADER + payload_len as usize);
@@ -79,7 +79,7 @@ pub(crate) fn encode_record(record: &CommitRecord, out: &mut Vec<u8>) -> EngineR
     put_quads(out, &record.deletes);
     put_triples(out, &record.inferred_inserts);
     put_triples(out, &record.inferred_deletes);
-    if let Some(micros) = record.committed_micros {
+    if let Some(micros) = committed {
         put_u64(out, micros);
     }
     debug_assert_eq!((out.len() - payload_start) as u64, len);
@@ -97,7 +97,7 @@ pub(crate) enum Frame {
     /// No bytes left.
     End,
     /// An incomplete or checksum-failing frame: a torn write at the tail of the log, or
-    /// corruption anywhere else. The caller decides which, based on the position.
+    /// damage. Recovery decides which ([`super::tail`]).
     Invalid,
 }
 

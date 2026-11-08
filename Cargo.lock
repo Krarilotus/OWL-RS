@@ -1263,10 +1263,12 @@ dependencies = [
  "mimalloc",
  "nrese-exec",
  "nrese-rdf",
+ "nrese-rdf-io",
  "nrese-reasoner",
  "nrese-sparql",
  "nrese-sparql-results",
  "nrese-store",
+ "nrese-xsd",
  "parking_lot",
  "reqwest",
  "serde",
@@ -1289,6 +1291,7 @@ name = "nrese-shacl"
 version = "0.1.0"
 dependencies = [
  "nrese-engine",
+ "nrese-exec",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-sparql",
@@ -1303,6 +1306,7 @@ name = "nrese-sparql"
 version = "0.1.0"
 dependencies = [
  "geo",
+ "hashbrown 0.16.1",
  "hex",
  "md-5",
  "nrese-engine",
@@ -1342,6 +1346,7 @@ name = "nrese-sparql-results"
 version = "0.1.0"
 dependencies = [
  "memchr",
+ "nrese-exec",
  "nrese-json",
  "nrese-rdf",
  "quick-xml",
@@ -1394,6 +1399,7 @@ dependencies = [
 name = "nrese-vector"
 version = "0.1.0"
 dependencies = [
+ "nrese-exec",
  "parking_lot",
  "rayon",
 ]

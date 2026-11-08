@@ -137,6 +137,7 @@ impl super::Context<'_> {
             index_joins: self.index_joins,
             merge_set: self.merge_set.clone(),
             named: self.named.clone(),
+            store_default: self.store_default,
             synthetic: Cell::new(self.synthetic.get()),
             services: self.services.clone(),
             service_denied: self.service_denied,

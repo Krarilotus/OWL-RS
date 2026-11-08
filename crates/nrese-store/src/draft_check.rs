@@ -3,18 +3,22 @@
 //!
 //! The protocol is the Datamodel Workflow's backend-agnostic store check
 //! ([`DRAFT_CHECK_PROTOCOL`]); any store can implement it. Inputs are N-Triples, as DMW
-//! pins them. The semantics follow DMW's own offline checks, so a store answer and an
-//! offline answer mean the same:
+//! pins them. The semantics ([`DRAFT_CHECK_SEMANTICS`]) are NRESE's: SHACL and queries
+//! as DMW's offline checks run them; reasoning decided by the OWL 2 RL rules and the OWL 2
+//! DL engines, which may say more than DMW's offline rules:
 //!
 //! - **SHACL**: data and schema in the default graph, asserted statements only, SHACL
 //!   Core. SHACL-SPARQL, SHACL-AF and `sh:entailment` are reported unsupported rather
 //!   than evaluated. The shapes are checked for well-formedness by the compiler.
 //! - **Query**: the data alone, asserted statements only; `ASK` and `SELECT`. More rows
 //!   than the limit is a failure, never a truncated answer.
-//! - **Reasoning**: the OWL 2 RL rules decide consistency over data and schema; the
-//!   OWL 2 DL classification lists unsatisfiable classes. Whatever the rules skipped,
-//!   and whatever left the classification incomplete, is reported unsupported, and the
-//!   answer is then not complete.
+//! - **Reasoning**: data and schema are inconsistent (`logical_consistent: false`) where
+//!   the OWL 2 RL rules or the OWL 2 DL engines find no model, consistent (`true`) where
+//!   neither does and both decided, and undecided (`null`) otherwise. The OWL 2 DL
+//!   classification lists unsatisfiable classes, of a consistent or undecided input only.
+//!   Whatever the rules skipped, and whatever left the classification incomplete, is
+//!   reported unsupported, and the answer is then not complete; nor is one without a
+//!   verdict.
 //!
 //! The caller enforces the time limit and owns the cancellation token.
 
@@ -34,7 +38,9 @@ use crate::{
 pub const DRAFT_CHECK_PROTOCOL: &str = "dmw-store-check/1";
 /// What this store's draft checks mean: the module documentation above. A change of
 /// meaning gets a new identifier, so old evidence stays interpretable.
-pub const DRAFT_CHECK_SEMANTICS: &str = "nrese:draft-check/1";
+/// `/2`: `logical_consistent` became the RL and DL verdict, `null` where undecided (it was
+/// the RL rules' alone); an inconsistent input lists no unsatisfiable class.
+pub const DRAFT_CHECK_SEMANTICS: &str = "nrese:draft-check/2";
 /// The profiles a draft check accepts.
 pub const DRAFT_CHECK_PROFILES: &[&str] = &["owl2-rl"];
 
@@ -185,7 +191,7 @@ pub fn run_draft_check(
     memory_limit: Option<usize>,
 ) -> DraftOutcome {
     let checked = match operation {
-        DraftOperation::Shacl => check_shacl(inputs, limits),
+        DraftOperation::Shacl => check_shacl(inputs, limits, cancellation),
         DraftOperation::Query => check_query(inputs, limits, cancellation, memory_limit),
         DraftOperation::Reasoning => check_reasoning(inputs, limits, cancellation),
     };
@@ -242,7 +248,11 @@ fn store_with(graphs: &[Option<&str>], limits: &DraftLimits) -> Result<StoreServ
     Ok(store)
 }
 
-fn check_shacl(inputs: &DraftInputs, limits: &DraftLimits) -> Checked {
+fn check_shacl(
+    inputs: &DraftInputs,
+    limits: &DraftLimits,
+    cancellation: &CancellationToken,
+) -> Checked {
     let shapes = inputs
         .shapes
         .as_deref()
@@ -275,7 +285,7 @@ fn check_shacl(inputs: &DraftInputs, limits: &DraftLimits) -> Checked {
     };
     let ShaclValidation {
         report, applicable, ..
-    } = match store.validate_shacl(&ReadScope::All, &request) {
+    } = match store.validate_shacl(&ReadScope::All, &request, cancellation) {
         Ok(validation) => validation,
         Err(StoreError::ShaclShapes(problems)) => {
             return Err(failed(format!(
@@ -283,7 +293,12 @@ fn check_shacl(inputs: &DraftInputs, limits: &DraftLimits) -> Checked {
                 problems.join("; ")
             )));
         }
-        Err(error) => return Err(failed(format!("SHACL validation failed: {error}"))),
+        Err(error) => {
+            return Err(cancelled_or(
+                cancellation,
+                format!("SHACL validation failed: {error}"),
+            ));
+        }
     };
     if !report.failures.is_empty() {
         return Err(failed(format!(
@@ -429,12 +444,23 @@ fn check_reasoning(
             .iter()
             .map(|why| format!("owl2-dl classification: {why}")),
     );
-    let consistent = report.violations == 0;
+    // A clash either finds is sound; "consistent" needs both to have decided.
+    let consistent = match (report.violations == 0, classification.consistency.decided()) {
+        (false, _) | (_, Some(false)) => Some(false),
+        (true, Some(true)) => Some(true),
+        (true, None) => None,
+    };
     Ok(DraftOutcome {
+        // An undecided verdict is among the classification's reasons, so never complete.
         complete: unsupported.is_empty(),
         unsupported,
-        logical_consistent: Some(consistent),
-        unsatisfiable_classes: classification.unsatisfiable,
+        logical_consistent: consistent,
+        // The classification report lists none for an inconsistent ontology; nor does an
+        // RL clash leave a class list that would describe a consistent one.
+        unsatisfiable_classes: match consistent {
+            Some(false) => Vec::new(),
+            _ => classification.unsatisfiable,
+        },
         ..DraftOutcome::terminal(
             DraftStatus::Completed,
             format!(

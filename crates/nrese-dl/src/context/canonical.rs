@@ -148,7 +148,7 @@ mod tests {
             subsumptions: vec![(1, 2), (1, 3), (1, 5), (2, 1), (2, 3), (2, 5), (3, 5)],
             unsatisfiable: vec![4],
             top: vec![5],
-            consistent: true,
+            consistency: crate::verdict::Verdict::Consistent,
         };
         let name = |t: Term| format!("http://e/{t}");
         let text = c.canonical(&name);
