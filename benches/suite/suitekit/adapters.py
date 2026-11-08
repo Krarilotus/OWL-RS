@@ -404,8 +404,10 @@ class Nrese(Adapter):
         return str(target / "release" / ("nrese-server.exe" if os.name == "nt" else "nrese-server"))
 
     def target_dir(self, ctx: Context) -> Path:
-        """The host build's output directory."""
-        return Path(ctx.setting("CARGO_TARGET_DIR", str(ctx.root / "target")))
+        """The host build's output directory; a relative CARGO_TARGET_DIR is the repository's (the
+        build runs in an export, removed after it: P1e sol-loop r1 S1)."""
+        target = Path(ctx.setting("CARGO_TARGET_DIR", str(ctx.root / "target")))
+        return target if target.is_absolute() else ctx.root / target
 
     def spec(self, ctx: Context, name: str, store: str, command: list[str], env: dict) -> Spec:
         env = {"NRESE_STORE_MODE": "on-disk", "NRESE_DATA_DIR": "/store", "RUST_LOG": "info", **env}
