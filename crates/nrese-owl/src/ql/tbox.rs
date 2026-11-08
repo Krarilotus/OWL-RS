@@ -108,6 +108,9 @@ struct Builder {
     /// Generating axioms: (left, role, filler, data).
     generating: Vec<(u32, Role, Option<u32>, bool)>,
     fresh: HashMap<ExprId, u32>,
+    /// The right sides, or parts of them, read as nothing ([`Self::superclass`]): the
+    /// ledger the hazards classify, so what the TBox leaves out is never re-derived there.
+    unread: std::collections::BTreeSet<ExprId>,
 }
 
 impl Tbox {
@@ -123,9 +126,11 @@ impl Tbox {
         for axiom in &ontology.axioms {
             b.axiom(ontology, axiom);
         }
+        let unread = std::mem::take(&mut b.unread);
         let mut tbox = b.finish();
-        tbox.hazards =
-            super::hazards::hazards(ontology, &tbox.types, &|id| tbox.basics[id as usize]);
+        tbox.hazards = super::hazards::hazards(ontology, &tbox.types, &unread, &|id| {
+            tbox.basics[id as usize]
+        });
         tbox.rewritable = tbox.rewritable_terms();
         tbox
     }
@@ -630,7 +635,9 @@ impl Builder {
             {
                 self.generates_data(left, *property);
             }
-            _ => {}
+            _ => {
+                self.unread.insert(expr);
+            }
         }
     }
 
