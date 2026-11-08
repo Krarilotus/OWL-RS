@@ -4,6 +4,7 @@
 mod api_tests;
 mod entity_bound_tests;
 mod jsonld_tests;
+mod oracle;
 mod rdfxml_tests;
 mod reader_contract_tests;
 mod recovery_inputs;
