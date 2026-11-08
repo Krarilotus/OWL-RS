@@ -49,6 +49,40 @@ fn the_upper_bounds_stack_is_charged_while_it_is_kept() {
     );
 }
 
+/// U1's build reads the whole materialised view as its evaluation's input (SYN-61): that
+/// scratch is charged to the bounds' budget while it is held, so the budget's peak is at least
+/// the view's facts as 24-byte keys. The view is many values of one individual, so U1's own
+/// facts (an individual's few, `owl:Thing` among them) stay far below it.
+#[test]
+fn the_upper_bounds_build_input_is_charged_while_it_is_held() {
+    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+    let mut data = String::from(
+        "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+         INSERT DATA { :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ;
+             owl:someValuesFrom :B ] . :a a :A .",
+    );
+    for i in 0..20_000 {
+        data.push_str(&format!(" :a :note \"n{i}\" ."));
+    }
+    data.push('}');
+    store.update_str_ungated(&data).unwrap();
+    let report = report(&store);
+    assert_eq!(report.unavailable, None, "{report:?}");
+    let view = store
+        .engine()
+        .snapshot()
+        .count_in(ReadModel::Materialised, &nrese_engine::QuadPattern::all())
+        .at_least();
+    let input = usize::try_from(view).unwrap() * std::mem::size_of::<[u64; 3]>();
+    let peak = store.dl().bounds.kept().peak();
+    assert!(
+        peak >= input,
+        "peak {peak} bytes while reading {view} facts ({input} bytes) for {} facts of U1",
+        report.upper_facts
+    );
+}
+
 #[test]
 fn embedded_low_memory_bounds_are_unavailable_on_every_build_path() {
     if !nrese_exec::memory::READS_MEMORY {
