@@ -519,9 +519,11 @@ impl<'a, V: ReadView> Validator<'a, V> {
     /// where the frontier knows it; else owned, with its comparison form. A blank node is
     /// stored where this view knows it (a node of this state's data, compared by id), else
     /// fresh (one the query made): the frontier isn't asked, since a later state may store a
-    /// node under a fresh node's name. A triple term holding blank nodes is always computed,
-    /// compared with its stored blank nodes named by id and its fresh ones canonically
-    /// ([`nrese_rdf::canonical::canonical_until`], on the validation's stop).
+    /// node under a fresh node's name. A triple term holding blank nodes is stored where this
+    /// view stores it; if it holds a fresh one, it is computed, compared with its stored blank
+    /// nodes named by id and its fresh ones canonically
+    /// ([`nrese_rdf::canonical::canonical_until`], on the validation's stop); otherwise it goes
+    /// through the frontier as any other term.
     fn result_term(&self, term: &Term) -> Option<ResultTerm> {
         if let Term::BlankNode(_) = term {
             return Some(match self.graph.lookup(term) {
@@ -535,11 +537,27 @@ impl<'a, V: ReadView> Validator<'a, V> {
         if let Term::Triple(_) = term
             && holds_blank_node(term)
         {
-            let key = self.canonical_key(term)?;
-            return Some(ResultTerm::Computed(Box::new(Computed {
-                term: term.clone(),
-                key: Some(key),
-            })));
+            // Stored in this state: the id Core, ASK and the focus-node fallback hold too.
+            if let Some(id) = self.graph.lookup(term) {
+                return Some(ResultTerm::Stored(id));
+            }
+            // A blank node the query made: compared by the canonical form, never by id.
+            if self.holds_fresh_blank(term) {
+                let key = self.canonical_key(term)?;
+                return Some(ResultTerm::Computed(Box::new(Computed {
+                    term: term.clone(),
+                    key: Some(key),
+                })));
+            }
+            // Only this state's blank nodes: as any other term, through the frontier, compared
+            // (when computed) with its blank nodes named by id.
+            return Some(match self.known(term) {
+                Some(id) => ResultTerm::Stored(id),
+                None => ResultTerm::Computed(Box::new(Computed {
+                    term: term.clone(),
+                    key: Some(self.mark_stored_blanks(term)),
+                })),
+            });
         }
         Some(match self.known(term) {
             Some(id) => ResultTerm::Stored(id),
@@ -548,6 +566,23 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 key: None,
             })),
         })
+    }
+
+    /// Whether `term` holds a blank node this view doesn't know: one the query made.
+    fn holds_fresh_blank(&self, term: &Term) -> bool {
+        match term {
+            Term::BlankNode(_) => self.graph.lookup(term).is_none(),
+            Term::Triple(triple) => {
+                let subject_fresh = match &triple.subject {
+                    NamedOrBlankNode::BlankNode(node) => {
+                        self.graph.lookup(&Term::BlankNode(node.clone())).is_none()
+                    }
+                    NamedOrBlankNode::NamedNode(_) => false,
+                };
+                subject_fresh || self.holds_fresh_blank(&triple.object)
+            }
+            _ => false,
+        }
     }
 
     /// The comparison form of a computed triple term that holds blank nodes, or `None` after
