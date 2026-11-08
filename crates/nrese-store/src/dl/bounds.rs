@@ -18,6 +18,7 @@
 
 use nrese_dl::classify::Taxonomy;
 use nrese_dl::limits::Deadline;
+use nrese_exec::ChargedVec;
 use nrese_exec::cell::{BuildCell, Claim, Kind};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -100,17 +101,58 @@ struct State {
     compiled: u64,
     /// The TBox's taxonomy for L's memberships ([`super::lower`]): computed on the first
     /// read, kept as long as U1's compilation (both change only with the schema).
-    taxonomy: Option<Arc<Taxonomy>>,
+    taxonomy: Option<KeptTaxonomy>,
     /// The ontology is in OWL 2 RL: the RL rules decide it (theorem PR1 of OWL 2
     /// Profiles: complete for its assertions and its consistency), and U1 isn't compiled.
     rules: bool,
 }
 
-/// Installs `state` unless the bounds describe its revision or a later one already: what
-/// is published only moves forward, and U1 of a revision, once there, stands.
-fn publish(slot: &mut Option<State>, state: State) {
-    if slot.as_ref().is_none_or(|s| s.revision < state.revision) {
-        *slot = Some(state);
+/// The bounds' U1 (`None`: none), and the revision below which nothing is published: what
+/// is published only moves forward (U1-P), a generation let go included (SYN-61).
+#[derive(Default)]
+struct Slot {
+    current: Option<State>,
+    floor: u64,
+}
+
+impl std::ops::Deref for Slot {
+    type Target = Option<State>;
+    fn deref(&self) -> &Option<State> {
+        &self.current
+    }
+}
+
+impl Slot {
+    fn get_mut(&mut self) -> Option<&mut State> {
+        self.current.as_mut()
+    }
+
+    /// Lets U1 go as `revision` supersedes it: nothing older is published after.
+    fn clear(&mut self, revision: u64) -> Option<State> {
+        self.floor = self.floor.max(revision);
+        self.current.take()
+    }
+
+    /// Lets U1 go if `revision` supersedes it.
+    fn evict_below(&mut self, revision: u64) -> Option<State> {
+        if self.current.as_ref().is_some_and(|s| s.revision < revision) {
+            self.clear(revision)
+        } else {
+            None
+        }
+    }
+}
+
+/// Installs `state` unless the bounds describe its revision or a later one already, or let
+/// a generation go for a later one: what is published only moves forward, and U1 of a
+/// revision, once there, stands.
+fn publish(slot: &mut Slot, state: State) {
+    let forward = slot
+        .current
+        .as_ref()
+        .is_none_or(|s| s.revision < state.revision);
+    if forward && state.revision >= slot.floor {
+        slot.current = Some(state);
     }
 }
 
@@ -126,7 +168,7 @@ fn routed_to_rules(ontology: &Ontology) -> bool {
 
 /// U1's place on the RL route: not compiled.
 fn not_compiled() -> GaveUp {
-    GaveUp("not compiled: the ontology is in OWL 2 RL, which the RL rules decide".to_owned())
+    GaveUp::new("not compiled: the ontology is in OWL 2 RL, which the RL rules decide")
 }
 
 /// The store's bounds: U1 for the revision it describes, and the read view of the latest
@@ -143,19 +185,34 @@ fn not_compiled() -> GaveUp {
 /// `state`; every dictionary lock after them.
 #[derive(Default)]
 pub(crate) struct Bounds {
-    state: Mutex<Option<State>>,
+    state: Mutex<Slot>,
     view: Mutex<Option<Arc<View>>>,
     /// Read views being built, by revision (U1 built afresh among them).
     views: BuildCell<u64, View>,
     /// Taxonomies being built, by U1's compilation ([`State::compiled`]).
-    taxonomies: BuildCell<u64, Taxonomy>,
+    /// What a build hands its waiters is the taxonomy with its charge (SYN-61).
+    taxonomies: BuildCell<u64, nrese_exec::cell::Kept<Taxonomy>>,
     compilations: AtomicU64,
+    /// What the bounds keep is charged here while they keep it (SYN-61): the store's, within
+    /// the queries' memory ([`Bounds::set_kept`]); unlimited until the store sets it.
+    kept: std::sync::OnceLock<Arc<nrese_exec::Budget>>,
 }
 
 impl Bounds {
     /// A new compilation's number.
     fn compiled(&self) -> u64 {
         self.compilations.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// The budget what the bounds keep is charged to: set once, by the store, before any read.
+    pub(crate) fn set_kept(&self, budget: Arc<nrese_exec::Budget>) {
+        let _ = self.kept.set(budget);
+    }
+
+    /// What the bounds keep is charged to (`Bounds::set_kept`).
+    pub(crate) fn kept(&self) -> &Arc<nrese_exec::Budget> {
+        self.kept
+            .get_or_init(|| Arc::new(nrese_exec::Budget::unlimited()))
     }
 }
 
@@ -248,9 +305,10 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         .as_ref()
         .filter(|s| s.revision == base)
         .map(|s| (s.rules, s.upper.clone()));
-    let asserted: Vec<Triple> = tx.inserted().chain(tx.deleted()).map(quad_triple).collect();
+    // The commit's asserted changes, read from the transaction each time: no copy of them.
+    let asserted = || tx.inserted().chain(tx.deleted()).map(quad_triple);
     if let Some((true, _)) = current
-        && !asserted.iter().any(|t| changes_schema(tx, *t))
+        && !asserted().any(|t| changes_schema(tx, t))
     {
         return Preparation {
             base,
@@ -264,8 +322,7 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         match upper.as_deref() {
             // A U1 with equality classes is evaluated afresh (`Upper`'s module docs).
             Ok(upper)
-                if upper.classes().is_empty()
-                    && asserted.iter().all(|t| upper.is_assertion(*t)) =>
+                if upper.classes().is_empty() && asserted().all(|t| upper.is_assertion(t)) =>
             {
                 let before = tx.base();
                 let inserted: Vec<Triple> = tx
@@ -305,7 +362,7 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
                     }
                 }
             }
-            Err(_) if !asserted.iter().any(|t| changes_schema(tx, *t)) => {
+            Err(_) if !asserted().any(|t| changes_schema(tx, t)) => {
                 return Preparation {
                     base,
                     prepared: Prepared::Unavailable,
@@ -318,7 +375,17 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         }
     }
     source::intern_vocabulary(tx);
-    let ontology = source::read_pending(tx);
+    let Ok(ontology) = source::read_pending(tx, Arc::clone(store.dl().bounds.kept())) else {
+        return Preparation {
+            base,
+            prepared: Prepared::Rebuilt(Box::new(Err(GaveUp::refused(source::refused(
+                "the commit",
+            ))))),
+            decided_by: "upper-bound",
+            proves_consistency: false,
+            ontology: None,
+        };
+    };
     if routed_to_rules(&ontology) && ontology.diagnostics.iter().all(|d| !d.is_fatal()) {
         // The RL gate that ran before has decided the commit's consistency.
         return Preparation {
@@ -336,6 +403,7 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         &pending,
         &|t| Some(tx.intern(t)),
         &stop,
+        store.dl().bounds.kept(),
     );
     Preparation {
         base,
@@ -394,6 +462,13 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
     let bounds = &store.dl().bounds;
     let mut state = lock(&bounds.state);
     match preparation.prepared {
+        // Refused for memory: not kept, so a read of the revision builds it again (SYN-61);
+        // the generation it would have replaced is superseded, and goes with its charge.
+        Prepared::Rebuilt(upper) if upper.as_ref().as_ref().is_err_and(|g| g.refused) => {
+            let superseded = state.evict_below(revision);
+            drop(state);
+            drop(superseded);
+        }
         Prepared::Rebuilt(upper) => publish(
             &mut state,
             State {
@@ -416,27 +491,33 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
                 rules: true,
             },
         ),
-        Prepared::Delta(change) => match state.as_mut() {
+        Prepared::Delta(change) => match state.get_mut() {
             Some(s) if s.revision == preparation.base => {
                 if let Ok(upper) = &mut s.upper {
                     // Nobody else holds it: the commit's preparation let go, and reads
                     // never keep it (`State::upper`).
                     let Some(upper) = Arc::get_mut(upper) else {
                         debug_assert!(false, "U1 shared at its commit's install");
-                        *state = None;
+                        drop(state.clear(revision));
                         return;
                     };
-                    upper.apply(*change);
+                    // The stack's budget couldn't take the change: U1 is partly changed,
+                    // and the next read builds it afresh (or finds it doesn't fit).
+                    if upper.apply(*change).is_err() {
+                        drop(state.clear(revision));
+                        return;
+                    }
                 }
                 s.revision = revision;
                 s.last = "delta";
             }
             // A query built U1 for the new revision (or a later one) meanwhile: it stands.
             Some(s) if s.revision >= revision => {}
-            _ => *state = None,
+            // Its base let go (or never built): the next read builds the revision afresh.
+            _ => drop(state.clear(revision)),
         },
         Prepared::Unavailable => {
-            if let Some(s) = state.as_mut()
+            if let Some(s) = state.get_mut()
                 && s.revision == preparation.base
             {
                 s.revision = revision;
@@ -494,6 +575,17 @@ pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
 fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
     let bounds = &store.dl().bounds;
     let revision = snapshot.revision();
+    // An older revision's view the cache keeps holds its charges: let it go before building
+    // this one, so the budget isn't held by a view no read of the latest wants (SYN-61).
+    // Readers keep their own.
+    let stale = {
+        let mut cached = lock(&bounds.view);
+        match cached.as_ref() {
+            Some(view) if view.revision < revision => cached.take(),
+            _ => None,
+        }
+    };
+    drop(stale);
     // The bounds' U1 at the revision: its compilation, route, `rdf:type`, taxonomy.
     let found = {
         let state = lock(&bounds.state);
@@ -508,60 +600,96 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
             _ => None,
         }
     };
+    let kept = bounds.kept();
+    // Whether the view may be kept: nothing a budget refused is (SYN-61).
+    let mut keep = true;
+    let memberships = |taxonomy: &Taxonomy, rdf_type: u64| {
+        super::lower::memberships(snapshot, taxonomy, rdf_type, kept).ok()
+    };
     let parts = match found {
-        Some((compiled, rules, rdf_type, kept)) => {
+        Some((compiled, rules, rdf_type, kept_taxonomy)) => {
             let lower = match rdf_type {
                 Some(rdf_type) if !rules => {
-                    let taxonomy = taxonomy(store, snapshot, compiled, kept);
-                    super::lower::memberships(snapshot, &taxonomy, rdf_type)
-                        .into_iter()
-                        .collect()
+                    // Held, with its charge, while its memberships are read.
+                    let taxonomy = taxonomy(store, snapshot, compiled, kept_taxonomy);
+                    keep &= taxonomy.is_ok();
+                    memberships(of(&taxonomy), rdf_type)
                 }
-                _ => HashSet::new(),
+                _ => Some(ChargedVec::new(Arc::clone(kept))),
             };
-            // Serial: what the view takes of U1, under the state (a commit's install
-            // may change U1 in place once it is let go).
-            let state = lock(&bounds.state);
-            let s = state
-                .as_ref()
-                .filter(|s| s.revision == revision && s.compiled == compiled)?;
-            parts(snapshot, s.revision, s.upper.as_deref(), s.rules, lower)
+            match lower {
+                // Serial: what the view takes of U1, under the state (a commit's install
+                // may change U1 in place once it is let go).
+                Some(lower) => {
+                    let state = lock(&bounds.state);
+                    let s = state
+                        .as_ref()
+                        .filter(|s| s.revision == revision && s.compiled == compiled)?;
+                    parts(
+                        snapshot,
+                        s.revision,
+                        s.upper.as_deref(),
+                        s.rules,
+                        &lower,
+                        kept,
+                    )
+                }
+                None => None,
+            }
         }
         None => {
+            // A superseded generation can't be maintained any more (no commit's base is
+            // older than the latest revision): let it and its charge go before building
+            // afresh, so the budget isn't held by it while the build needs room (SYN-61).
+            let superseded = lock(&bounds.state).evict_below(revision);
+            drop(superseded);
             let (upper, rules) = afresh(store, snapshot);
             let compiled = bounds.compiled();
             let taxonomy = match &upper {
                 Ok(_) if !rules => Some(taxonomy(store, snapshot, compiled, None)),
                 _ => None,
             };
+            keep &= taxonomy.as_ref().is_none_or(Result::is_ok);
             let lower = match (&upper, &taxonomy) {
                 (Ok(upper), Some(taxonomy)) => {
-                    super::lower::memberships(snapshot, taxonomy, upper.program.names.rdf_type)
-                        .into_iter()
-                        .collect()
+                    memberships(of(taxonomy), upper.program.names.rdf_type)
                 }
-                _ => HashSet::new(),
+                _ => Some(ChargedVec::new(Arc::clone(kept))),
             };
-            let parts = parts(snapshot, revision, upper.as_ref(), rules, lower);
-            let last = match rules {
-                true => "rules",
-                false => "read",
-            };
-            let state = State {
-                revision,
-                upper: upper.map(Arc::new),
-                last,
-                compiled,
-                taxonomy,
-                rules,
-            };
-            publish(&mut lock(&bounds.state), state);
+            let parts = lower
+                .and_then(|lower| parts(snapshot, revision, upper.as_ref(), rules, &lower, kept));
+            // A U1 a budget refused is not kept: the next read builds it again.
+            let refused_upper = upper.as_ref().is_err_and(|g| g.refused);
+            keep &= !refused_upper;
+            if !refused_upper {
+                let last = match rules {
+                    true => "rules",
+                    false => "read",
+                };
+                let state = State {
+                    revision,
+                    upper: upper.map(Arc::new),
+                    last,
+                    compiled,
+                    taxonomy: taxonomy.and_then(Result::ok),
+                    rules,
+                };
+                publish(&mut lock(&bounds.state), state);
+            }
             parts
         }
     };
+    let Some(parts) = parts else {
+        return Some(Arc::new(refused(snapshot, revision)));
+    };
     #[cfg(test)]
     seam::at(bounds, seam::Point::View);
-    let view = Arc::new(assemble(snapshot, parts));
+    let (view, charged) = assemble(snapshot, parts, kept);
+    let view = Arc::new(view);
+    if !(charged && keep) {
+        // Not kept: the next read of the revision tries again.
+        return Some(view);
+    }
     let mut cached = lock(&bounds.view);
     if cached.as_ref().is_none_or(|v| v.revision < view.revision) {
         *cached = Some(Arc::clone(&view));
@@ -576,7 +704,10 @@ fn afresh(store: &StoreService, snapshot: &Snapshot) -> (Result<Upper, GaveUp>, 
     if !replica {
         source::intern_vocabulary(&tx);
     }
-    let ontology = source::read_snapshot(snapshot);
+    let ontology = match source::read_snapshot(snapshot, Arc::clone(store.dl().bounds.kept())) {
+        Ok(ontology) => ontology,
+        Err(_) => return (Err(GaveUp::refused(source::refused("the revision"))), false),
+    };
     if routed_to_rules(&ontology) && ontology.diagnostics.iter().all(|d| !d.is_fatal()) {
         return (Err(not_compiled()), true);
     }
@@ -587,28 +718,54 @@ fn afresh(store: &StoreService, snapshot: &Snapshot) -> (Result<Upper, GaveUp>, 
     let resolve = |t: nrese_rdf::TermRef<'_>| source::resolve(replica, &tx, t);
     #[cfg(test)]
     seam::at(&store.dl().bounds, seam::Point::Build);
-    let upper = Upper::build(&ontology, &normalised, snapshot, &resolve, &stop);
+    let kept = store.dl().bounds.kept();
+    let upper = Upper::build(&ontology, &normalised, snapshot, &resolve, &stop, kept);
     (upper, false)
 }
 
+/// A taxonomy for a read: kept, with its charge, or (`Err`) one only this read uses, never
+/// kept.
+type ForRead = Result<KeptTaxonomy, Arc<Taxonomy>>;
+
+/// The taxonomy a read reads, kept or not.
+fn of(taxonomy: &ForRead) -> &Taxonomy {
+    match taxonomy {
+        Ok(kept) => kept.value(),
+        Err(unkept) => unkept,
+    }
+}
+
+/// A taxonomy kept for its compilation, charged to the bounds' budget (SYN-61).
+type KeptTaxonomy = Arc<nrese_exec::cell::Kept<Taxonomy>>;
+
 /// The TBox's taxonomy for U1's compilation `compiled` (`kept`: the bounds' own), built
 /// once per compilation: a read off the pool waits for the build under way, one on a
-/// Rayon worker builds its own (U1-B).
+/// Rayon worker builds its own (U1-B). Kept only charged to the bounds' budget: one whose
+/// ontology couldn't be read, or whose charge that budget can't take, serves this read and is
+/// never kept (SYN-61).
 fn taxonomy(
     store: &StoreService,
     snapshot: &Snapshot,
     compiled: u64,
-    kept: Option<Arc<Taxonomy>>,
-) -> Arc<Taxonomy> {
-    if let Some(taxonomy) = kept {
-        return taxonomy;
+    kept: Option<KeptTaxonomy>,
+) -> ForRead {
+    if let Some(kept) = kept {
+        return Ok(kept);
     }
     let bounds = &store.dl().bounds;
-    let build = || {
+    let build = || -> ForRead {
         #[cfg(test)]
         seam::at(bounds, seam::Point::Taxonomy);
-        let ontology = super::query::ontology_at(store, snapshot);
-        Arc::new(super::lower::tbox_taxonomy(store, &ontology))
+        let Ok(ontology) = super::query::ontology_at(store, snapshot) else {
+            return Err(refused_taxonomy(store));
+        };
+        let taxonomy = super::lower::tbox_taxonomy(store, ontology.value());
+        let bytes = nrese_dl::memory::taxonomy_bytes(&taxonomy);
+        let taxonomy = Arc::new(taxonomy);
+        let budget = Arc::clone(bounds.kept());
+        nrese_exec::cell::Kept::charge(Arc::clone(&taxonomy), bytes, budget)
+            .map(Arc::new)
+            .map_err(|_| taxonomy)
     };
     let kept = || {
         lock(&bounds.state)
@@ -622,17 +779,22 @@ fn taxonomy(
             .claim(compiled, Kind::Opaque, || kept().map(Some))
         {
             Claim::Build(builder) => {
-                let taxonomy = build();
-                if let Some(s) = lock(&bounds.state).as_mut()
+                let built = build();
+                let Ok(charge) = built else {
+                    // Given to nobody waiting: they read again (the builder's drop wakes them).
+                    return built;
+                };
+                if let Some(s) = lock(&bounds.state).get_mut()
                     && s.compiled == compiled
                 {
-                    s.taxonomy.get_or_insert_with(|| Arc::clone(&taxonomy));
+                    s.taxonomy.get_or_insert_with(|| Arc::clone(&charge));
                 }
-                builder.finish(Some(Arc::clone(&taxonomy)));
-                return taxonomy;
+                builder.finish(Some(Arc::clone(&charge)));
+                return Ok(charge);
             }
             Claim::Wait(flight) => match flight.wait() {
-                Ok(Some(taxonomy)) => return taxonomy,
+                // The taxonomy with its charge: kept while this read holds it.
+                Ok(Some(charge)) => return Ok(charge),
                 // The build failed: again.
                 Ok(None) => {}
                 Err(nrese_exec::cell::Busy) => return build(),
@@ -641,34 +803,73 @@ fn taxonomy(
     }
 }
 
-/// What a view takes of U1 ([`parts`]), before its runs are built ([`assemble`]).
+/// The taxonomy of a read whose TBox couldn't be read: no subsumption (L adds nothing, which
+/// is sound), its consistency unknown, incomplete.
+fn refused_taxonomy(store: &StoreService) -> Arc<Taxonomy> {
+    let mut empty = super::lower::tbox_taxonomy(store, &nrese_owl::Ontology::default());
+    let why = source::refused("the TBox");
+    empty.classification.consistency = nrese_dl::verdict::Verdict::Unknown(why.clone());
+    empty.incomplete.push(why);
+    Arc::new(empty)
+}
+
+/// What a view takes of U1 ([`parts`]), before its runs are built ([`assemble`]). Its lists
+/// are scratch charged to the bounds' budget (SYN-61), freed once the runs are built.
 struct Parts {
     /// The view, its snapshots still `snapshot` itself.
     view: View,
     /// L's memberships from the taxonomy.
-    lower: Vec<EncodedQuad>,
+    lower: ChargedVec<EncodedTriple>,
     upper: Option<UpperParts>,
 }
 
 /// What the upper view takes of U1.
 struct UpperParts {
     /// L's memberships over representatives (`None`: `Parts::lower` as they are).
-    over_representatives: Option<Vec<EncodedQuad>>,
+    over_representatives: Option<ChargedVec<EncodedTriple>>,
     /// U1's facts beyond them.
-    facts: Vec<EncodedQuad>,
+    facts: ChargedVec<EncodedTriple>,
     /// `owl:sameAs`, where U1 has classes.
     same_as: Option<u64>,
 }
 
-/// The view's runs, from what it took of U1: Rayon work, with no lock held.
-fn assemble(snapshot: &Snapshot, parts: Parts) -> View {
+/// The view of `revision` where what it reads or keeps doesn't fit the queries' memory: U1
+/// unavailable (answers sound only), not to be kept (SYN-61).
+fn refused(snapshot: &Snapshot, revision: u64) -> View {
+    View {
+        revision,
+        lower: snapshot.clone(),
+        lower_facts: 0,
+        upper: None,
+        unavailable: Some(
+            "the upper bound isn't available: its view doesn't fit the queries' memory".to_owned(),
+        ),
+        gap_classes: HashSet::new(),
+        gap_predicates: HashSet::new(),
+        named_gap_classes: HashSet::new(),
+        named_gap_predicates: HashSet::new(),
+        internal: HashSet::new(),
+        facts: 0,
+        proves_consistency: false,
+        rules: false,
+    }
+}
+
+/// The view's runs, from what it took of U1: Rayon work, with no lock held. What the view
+/// keeps is charged to `kept` before it is made (SYN-61), and `true`; where `kept` can't take
+/// it, the view of an unavailable U1 instead (sound only), and `false`: not to be kept.
+fn assemble(snapshot: &Snapshot, parts: Parts, kept: &Arc<nrese_exec::Budget>) -> (View, bool) {
     let Parts {
         mut view,
         lower,
         upper,
     } = parts;
+    let revision = view.revision;
     if !lower.is_empty() {
-        view.lower = snapshot.with_inferred_added(&lower);
+        match snapshot.with_inferred_added_within(&lower, kept) {
+            Ok(lower) => view.lower = lower,
+            Err(_) => return (refused(snapshot, revision), false),
+        }
     }
     if let Some(UpperParts {
         over_representatives,
@@ -676,27 +877,35 @@ fn assemble(snapshot: &Snapshot, parts: Parts) -> View {
         same_as,
     }) = upper
     {
-        let mut quads = over_representatives.unwrap_or(lower);
-        quads.extend(facts);
-        let upper_view = snapshot.with_inferred_added(&quads);
+        let mut triples = over_representatives.unwrap_or(lower);
+        if triples.extend_from_slice(&facts).is_err() {
+            return (refused(snapshot, revision), false);
+        }
+        drop(facts);
+        let Ok(upper_view) = snapshot.with_inferred_added_within(&triples, kept) else {
+            return (refused(snapshot, revision), false);
+        };
         // Read expanded to every identity of U1's classes (the stack keeps representatives).
         view.upper = Some(match same_as {
             None => upper_view,
             Some(same_as) => upper_view.with_equality(Some(TermId::from_raw(same_as))),
         });
     }
-    view
+    (view, true)
 }
 
-/// What a view of `revision` takes of U1 and of L's memberships `lower`: serial, O(U1's
-/// facts), nothing waited for (U1-I).
+/// What a view of `revision` takes of U1 and of L's memberships `lower` (sorted, each once):
+/// serial, O(U1's facts), nothing waited for (U1-I). Its copies are charged to `kept` as they
+/// grow (SYN-61); `None` where it can't take them.
 fn parts(
     snapshot: &Snapshot,
     revision: u64,
     upper: Result<&Upper, &GaveUp>,
     rules: bool,
-    lower: HashSet<Triple>,
-) -> Parts {
+    lower: &[Triple],
+    kept: &Arc<nrese_exec::Budget>,
+) -> Option<Parts> {
+    let empty = || ChargedVec::new(Arc::clone(kept));
     if rules {
         let view = View {
             revision,
@@ -713,15 +922,15 @@ fn parts(
             proves_consistency: true,
             rules: true,
         };
-        return Parts {
+        return Some(Parts {
             view,
-            lower: Vec::new(),
+            lower: empty(),
             upper: None,
-        };
+        });
     }
     let upper = match upper {
         Ok(upper) => upper,
-        Err(GaveUp(why)) => {
+        Err(GaveUp { why, .. }) => {
             let view = View {
                 revision,
                 lower: snapshot.clone(),
@@ -737,11 +946,11 @@ fn parts(
                 proves_consistency: false,
                 rules: false,
             };
-            return Parts {
+            return Some(Parts {
                 view,
-                lower: Vec::new(),
+                lower: empty(),
                 upper: None,
-            };
+            });
         }
     };
     let rdf_type = upper.program.names.rdf_type;
@@ -752,9 +961,11 @@ fn parts(
             TermId::from_raw(p),
             TermId::from_raw(o),
         )
-        .in_default_graph()
     };
-    let lower_quads: Vec<EncodedQuad> = lower.iter().map(|&t| encode(t)).collect();
+    let mut lower_triples = empty();
+    for &t in lower {
+        lower_triples.push(encode(t)).ok()?;
+    }
     let mut view = View {
         revision,
         lower: snapshot.clone(),
@@ -786,16 +997,25 @@ fn parts(
     let named = |t: u64| !upper.is_internal(t) || named_classes.contains(&t);
     // L's memberships beside it, over representatives as the expanded reads want them.
     let classes = upper.classes();
-    let over_representatives: Option<Vec<EncodedQuad>> = (!classes.is_empty()).then(|| {
-        lower
-            .iter()
-            .map(|&[s, p, o]| encode([classes.representative(s), p, classes.representative(o)]))
-            .collect()
-    });
-    let mut quads: Vec<EncodedQuad> = Vec::with_capacity(upper.stack.len());
+    let over_representatives = match classes.is_empty() {
+        true => None,
+        false => {
+            let mut over = empty();
+            for &[s, p, o] in lower {
+                over.push(encode([
+                    classes.representative(s),
+                    p,
+                    classes.representative(o),
+                ]))
+                .ok()?;
+            }
+            Some(over)
+        }
+    };
+    let mut triples = ChargedVec::with_capacity(Arc::clone(kept), upper.stack.len()).ok()?;
     for [s, p, o] in upper.stack.iter() {
         // L's memberships from the taxonomy are certain: no gap.
-        if lower.contains(&[s, p, o]) {
+        if lower.binary_search(&[s, p, o]).is_ok() {
             continue;
         }
         for t in [s, p, o] {
@@ -819,18 +1039,18 @@ fn parts(
                 view.named_gap_predicates.insert(p);
             }
         }
-        quads.push(encode([s, p, o]));
+        triples.push(encode([s, p, o])).ok()?;
     }
     let same_as = (!classes.is_empty()).then(|| upper.same_as());
-    Parts {
+    Some(Parts {
         view,
-        lower: lower_quads,
+        lower: lower_triples,
         upper: Some(UpperParts {
             over_representatives,
-            facts: quads,
+            facts: triples,
             same_as,
         }),
-    }
+    })
 }
 
 /// The bounds at the store's latest revision, for reports and tests.
@@ -897,7 +1117,8 @@ pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[Str
         if !replica {
             source::intern_vocabulary(&tx);
         }
-        let ontology = source::read_snapshot(&snapshot);
+        let ontology =
+            source::read_snapshot(&snapshot, Arc::clone(store.dl().bounds.kept())).ok()?;
         let normalised = nrese_owl::normalise(&ontology);
         let memory = store.memory_stop();
         let deadline = Deadline::after(store.config().dl.timeout);
@@ -908,6 +1129,7 @@ pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[Str
             &snapshot,
             &|t| source::resolve(replica, &tx, t),
             &stop,
+            store.dl().bounds.kept(),
         )
         .ok()?;
         upper.stack.iter().collect()

@@ -196,6 +196,26 @@ const NOT_BUDGETS: &[(&str, &str, &str)] = &[
         "fresh individuals the entailment tests use",
     ),
     (
+        "dl/upper.rs",
+        "const TREE_NODE",
+        "the size of std's largest B-tree node, U1's stack's charge per node",
+    ),
+    (
+        "dl/upper.rs",
+        "const TREE_FACT",
+        "a B-tree's bytes per key at its least fill, U1's stack's charge per fact",
+    ),
+    (
+        "dl/upper.rs",
+        "const PREDICATE",
+        "a hash-table entry's bytes while it grows, U1's stack's charge per predicate",
+    ),
+    (
+        "dl/upper.rs",
+        "const FIRST",
+        "the trees' roots and the table's first allocation, U1's stack's first charge",
+    ),
+    (
         "dl/mod.rs",
         "UNRESOLVED_SHOWN",
         "unresolved candidates a status names",

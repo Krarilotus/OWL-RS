@@ -171,18 +171,57 @@ impl Run {
         held: &mut nrese_exec::Reservation,
     ) -> Result<Self, nrese_exec::BudgetExceeded> {
         let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
-        let entries_bytes = (inserts.len() + deletes.len()) * std::mem::size_of::<(Key, bool)>();
         for &permutation in layout.permutations() {
-            held.charge(entries_bytes)?;
-            let mut entries: Vec<(Key, bool)> = Vec::with_capacity(inserts.len() + deletes.len());
-            entries.extend(inserts.iter().map(|q| (permutation.to_key(q), false)));
-            entries.extend(deletes.iter().map(|q| (permutation.to_key(q), true)));
-            entries.sort_unstable_by_key(|entry| entry.0);
-            let built = PermutationRun::from_sorted_within(entries, held, false);
-            held.release(entries_bytes);
-            perms[permutation as usize] = built?;
+            perms[permutation as usize] = permutation_within(permutation, inserts, deletes, held)?;
         }
         Ok(Self::from_permutations(layout, perms))
+    }
+
+    /// [`Self::from_delta_within`] with its permutations built in parallel on the caller's
+    /// pool once the delta makes it worthwhile ([`build_all`]'s threshold), each on a
+    /// reservation of its own of `budget`, charged before its arrays are made. The run, and
+    /// one reservation holding what it keeps, for its maker to hold while the run lives. A
+    /// refusal leaves nothing made: the permutations built are freed before their charges go.
+    pub(crate) fn from_delta_within_parallel(
+        layout: Layout,
+        inserts: &[EncodedQuad],
+        deletes: &[EncodedQuad],
+        budget: &std::sync::Arc<nrese_exec::Budget>,
+    ) -> Result<(Self, nrese_exec::Reservation), nrese_exec::BudgetExceeded> {
+        type Built = Result<(PermutationRun, nrese_exec::Reservation), nrese_exec::BudgetExceeded>;
+        let wanted = layout.permutations();
+        // One slot per permutation, on the stack: the parallel build allocates nothing beside
+        // what its reservations cover (a collected list would be uncharged).
+        let mut slots: [Option<Built>; Permutation::COUNT] = std::array::from_fn(|_| None);
+        let fill = |(i, slot): (usize, &mut Option<Built>)| {
+            let permutation = Permutation::ALL[i];
+            if wanted.contains(&permutation) {
+                let mut held = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
+                // The run before its charge in the tuple: dropped first on a refusal elsewhere.
+                *slot = Some(
+                    permutation_within(permutation, inserts, deletes, &mut held)
+                        .map(|run| (run, held)),
+                );
+            }
+        };
+        if inserts.len() + deletes.len() >= PARALLEL_BUILD_THRESHOLD {
+            slots.par_iter_mut().enumerate().for_each(fill);
+        } else {
+            slots.iter_mut().enumerate().for_each(fill);
+        }
+        if let Some(Err(refused)) = slots.iter().flatten().find(|built| built.is_err()) {
+            return Err(*refused);
+        }
+        let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
+        let mut bytes = 0;
+        for (i, slot) in slots.into_iter().enumerate() {
+            if let Some(Ok((run, held))) = slot {
+                perms[i] = run;
+                bytes += held.transfer();
+            }
+        }
+        let held = nrese_exec::Reservation::adopt(std::sync::Arc::clone(budget), bytes);
+        Ok((Self::from_permutations(layout, perms), held))
     }
 
     /// Builds a tombstone-free run from arbitrary quads, removing duplicates. Used for bulk
@@ -454,6 +493,26 @@ impl PermutationBuilder {
             }
         }
     }
+}
+
+/// One permutation of an exact delta, on one thread, every array reserved on `held` before
+/// it is made; the entries' sort buffer released once the run is packed, what the run keeps
+/// still reserved there.
+fn permutation_within(
+    permutation: Permutation,
+    inserts: &[EncodedQuad],
+    deletes: &[EncodedQuad],
+    held: &mut nrese_exec::Reservation,
+) -> Result<PermutationRun, nrese_exec::BudgetExceeded> {
+    let entries_bytes = (inserts.len() + deletes.len()) * std::mem::size_of::<(Key, bool)>();
+    held.charge(entries_bytes)?;
+    let mut entries: Vec<(Key, bool)> = Vec::with_capacity(inserts.len() + deletes.len());
+    entries.extend(inserts.iter().map(|q| (permutation.to_key(q), false)));
+    entries.extend(deletes.iter().map(|q| (permutation.to_key(q), true)));
+    entries.sort_unstable_by_key(|entry| entry.0);
+    let built = PermutationRun::from_sorted_within(entries, held, false);
+    held.release(entries_bytes);
+    built
 }
 
 /// Builds the permutations of `layout` (the others stay empty), in parallel once `size`
