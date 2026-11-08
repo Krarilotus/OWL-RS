@@ -150,6 +150,18 @@ impl Tbox {
         };
         tbox.hazards =
             super::hazards::hazards(ontology, &tbox.types, &read, &|id| tbox.basics[id as usize]);
+        // An axiom the mapping drops supports no claim: any term may miss its conclusions
+        // (I24c-2). An existing global hazard's reason is the more specific.
+        if tbox.hazards.global.is_none() {
+            use crate::diagnostics::Diagnostic;
+            tbox.hazards.global = ontology.diagnostics.iter().find_map(|d| match *d {
+                Diagnostic::Malformed { node, .. } | Diagnostic::Unsupported { node, .. } => {
+                    Some(Hazard::Dropped(node))
+                }
+                Diagnostic::BrokenList { head } => Some(Hazard::Dropped(head)),
+                _ => None,
+            });
+        }
         tbox.rewritable = tbox.rewritable_terms();
         tbox
     }
