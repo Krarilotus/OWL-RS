@@ -32,6 +32,9 @@ require_free_gb "${NRESE_MIN_FREE_GB:-40}" "$(basename "$0")" "$(dirname "$0")"
 # The datasets are kept frozen (benches/datasets.toml); the images and scratch this
 # creates are removed by scripts/bench-cleanup.sh.
 export MSYS_NO_PATHCONV=1
+# The images below are built by BuildKit, which starts no container (maker-containers-measure-1): the
+# legacy builder's would be unlabelled, and a fleet job declaring its containers stopped at them.
+export DOCKER_BUILDKIT=1
 native() { cygpath -m "$1" 2>/dev/null || echo "$1"; }
 HERE=$(native "$(cd "$(dirname "$0")" && pwd)")
 JENA_IMAGE=${JENA_IMAGE:-nrese-bench/jena:6.2.0}
@@ -41,24 +44,26 @@ docker image inspect "$JENA_IMAGE" >/dev/null 2>&1 ||
 ONTOLOGY_URL=http://swat.cse.lehigh.edu/onto/univ-bench.owl
 
 docker build -q -t nrese-bench/lubm-uba "$HERE/lubm" >/dev/null
+# Every container below: its labels, and in a fleet job the job's label and the limits it declared.
+ns_maker_args - "$NS_ROOT" lubm
 
-if ! docker run --rm -v "$DATA_VOLUME":/data alpine test -s /data/univ-bench.nt; then
-  docker run --rm -v "$DATA_VOLUME":/data alpine sh -c "
+if ! docker run --rm "${NS_ARGS[@]}" -v "$DATA_VOLUME":/data alpine test -s /data/univ-bench.nt; then
+  docker run --rm "${NS_ARGS[@]}" -v "$DATA_VOLUME":/data alpine sh -c "
     apk add -q curl >/dev/null &&
     curl -sSfL -o /tmp/univ-bench.owl $ONTOLOGY_URL &&
     sed 's#http://swat.cse.lehigh.edu/onto/univ-bench.owl#http://www.lehigh.edu/~zhp2/2004/0401/univ-bench.owl#g' \
       /tmp/univ-bench.owl > /data/univ-bench.owl"
-  docker run --rm -v "$DATA_VOLUME":/data --entrypoint sh "$JENA_IMAGE" -c \
+  docker run --rm "${NS_ARGS[@]}" -v "$DATA_VOLUME":/data --entrypoint sh "$JENA_IMAGE" -c \
     '/opt/apache-jena-6.2.0/bin/riot --quiet --output=nt /data/univ-bench.owl > /data/univ-bench.nt &&
      rm /data/univ-bench.owl'
 fi
 
 for n in ${*:-1 10 100}; do
-  if docker run --rm -v "$DATA_VOLUME":/data alpine test -s "/data/lubm-$n.nt"; then
+  if docker run --rm "${NS_ARGS[@]}" -v "$DATA_VOLUME":/data alpine test -s "/data/lubm-$n.nt"; then
     echo "lubm-$n: present"
     continue
   fi
-  docker run --rm -v "$DATA_VOLUME":/data nrese-bench/lubm-uba \
+  docker run --rm "${NS_ARGS[@]}" -v "$DATA_VOLUME":/data nrese-bench/lubm-uba \
     -u "$n" -f NTRIPLES --consolidate Maximal -t 8 -q -o "/data/lubm-gen-$n" >/dev/null
   # More than one university: UBA's threads interleave them in another order on every run, so the
   # file is its distinct lines in byte order (GNU sort, C locale): the same bytes on every host, the
@@ -66,7 +71,7 @@ for n in ${*:-1 10 100}; do
   # lines equal; the bytes of three makes all different). One university comes out the same as it is.
   order="cat"
   [ "$n" -gt 1 ] && order="LC_ALL=C sort -u -S 1G -T /data"
-  docker run --rm -v "$DATA_VOLUME":/data alpine sh -c "
+  docker run --rm "${NS_ARGS[@]}" -v "$DATA_VOLUME":/data alpine sh -c "
     apk add -q coreutils >/dev/null &&
     cat /data/lubm-gen-$n/* | grep -v '^<> ' | $order > /data/lubm-$n.nt.part &&
     mv /data/lubm-$n.nt.part /data/lubm-$n.nt && rm -rf /data/lubm-gen-$n &&
