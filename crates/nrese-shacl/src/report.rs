@@ -187,7 +187,9 @@ impl<V: ReadView> Terms<'_, V> {
     }
 }
 
-/// Decodes `raw` into a report. Ids come from `view`'s dictionary, so every one decodes.
+/// Decodes `raw` into a report. Ids come from `view`'s dictionary, so every one decodes; the
+/// terms a query computed are moved into the report, not copied. `raw` is freed as it is
+/// decoded, so the caller returns its charge after this.
 ///
 /// The report is charged to `resources`' envelope, each result before it is built (its
 /// messages, which every result of a shape copies, included), and holds that charge while
@@ -196,7 +198,7 @@ impl<V: ReadView> Terms<'_, V> {
 pub(crate) fn decode<V: ReadView>(
     view: &V,
     shapes: &Shapes,
-    raw: &[RawResult],
+    raw: Vec<RawResult>,
     failures: Failures,
     resources: &Resources,
 ) -> Result<ValidationReport, QueryEvaluationError> {
@@ -239,20 +241,12 @@ pub(crate) fn decode<V: ReadView>(
         {
             terms.load(id)?;
         }
-        let path = match &result.path {
+        // A computed path or value is the query's term as it made it ([`ResultTerm`]): moved
+        // out of the result, which is dropped after this one is built.
+        let path = match result.path {
             None => None,
-            Some(ResultPath::Path(path)) => decode_path(view, path),
-            Some(ResultPath::Computed(predicate)) => {
-                Some(PropertyPath::Predicate((**predicate).clone()))
-            }
-        };
-        // A computed value is the query's term as it made it ([`ResultTerm`]).
-        let value = |terms: &Terms<'_, V>| -> Option<Term> {
-            match &result.value {
-                None => None,
-                Some(ResultTerm::Stored(id)) => Some(terms.get(*id).clone()),
-                Some(ResultTerm::Computed(computed)) => Some(computed.term.clone()),
-            }
+            Some(ResultPath::Path(path)) => decode_path(view, &path),
+            Some(ResultPath::Computed(predicate)) => Some(PropertyPath::Predicate(*predicate)),
         };
         let value_bytes = match &result.value {
             None => 0,
@@ -284,10 +278,15 @@ pub(crate) fn decode<V: ReadView>(
             Some(Term::NamedNode(severity)) => severity.clone(),
             Some(_) => sh("Violation"),
         };
+        let value = match result.value {
+            None => None,
+            Some(ResultTerm::Stored(id)) => Some(terms.get(id).clone()),
+            Some(ResultTerm::Computed(computed)) => Some(computed.term),
+        };
         results.push(ValidationResult {
             focus_node: terms.get(result.focus).clone(),
             path,
-            value: value(&terms),
+            value,
             source_shape: terms.get(shape.node).clone(),
             component: match custom.map(|id| terms.get(id)) {
                 None => NamedNode::new_unchecked(result.component.iri()),
