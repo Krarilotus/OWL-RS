@@ -3090,20 +3090,34 @@ fn list(store: Store, reps: &Representatives, stop: super::eval::Stop<'_>) -> Op
                 .into_par_iter()
                 .map_init(
                     || Poller::new(stop),
-                    |poll, fact| {
-                        // The product's copies, counted before it is built.
-                        let members = |t: u64| reps.classes.class_of(t).map_or(1, <[u64]>::len);
-                        let copies = fact.iter().map(|&t| members(t)).product::<usize>();
+                    |poll, [s, p, o]| {
+                        // The product's copies (`Classes::expand`), counted before it is built,
+                        // from one class lookup per term: a lookup is a hash walk, and counting
+                        // with lookups of its own doubled them (rl-sameas, REAS-2 timing).
+                        let classes = &reps.classes;
+                        let (ms, mp, mo) = (
+                            classes.class_of(s).unwrap_or(std::slice::from_ref(&s)),
+                            classes.class_of(p).unwrap_or(std::slice::from_ref(&p)),
+                            classes.class_of(o).unwrap_or(std::slice::from_ref(&o)),
+                        );
+                        let copies = ms.len() * mp.len() * mo.len();
                         if poll.as_ref().is_none_or(|poll| poll.attempt(copies)) {
                             return Vec::new();
                         }
-                        let mut copies = reps.classes.expand(fact);
-                        copies.retain(|&[s, p, o]| {
-                            !store
-                                .relation(p)
-                                .is_some_and(|relation| relation.input.contains(s, o))
-                        });
-                        copies
+                        let mut kept = Vec::with_capacity(copies);
+                        for &s in ms {
+                            for &p in mp {
+                                let relation = store.relation(p);
+                                for &o in mo {
+                                    if !relation
+                                        .is_some_and(|relation| relation.input.contains(s, o))
+                                    {
+                                        kept.push([s, p, o]);
+                                    }
+                                }
+                            }
+                        }
+                        kept
                     },
                 )
                 .flatten_iter()
