@@ -25,8 +25,19 @@ struct Held<T> {
 }
 
 impl<T> ChargedArc<T> {
-    /// What the `Arc` block of one allocates: its two counts and the held value.
-    pub(crate) const COST: usize = 2 * size_of::<usize>() + size_of::<Held<T>>();
+    /// What the `Arc` block of one allocates: its two counts, padded to the held value's
+    /// alignment, then the held value, the whole padded to the block's alignment (the block
+    /// is `repr(C)`: the counts first, then the value).
+    pub(crate) const COST: usize = {
+        let value = align_of::<Held<T>>();
+        let block = if value > align_of::<usize>() {
+            value
+        } else {
+            align_of::<usize>()
+        };
+        ((2 * size_of::<usize>()).next_multiple_of(value) + size_of::<Held<T>>())
+            .next_multiple_of(block)
+    };
 
     /// `value`, shared, its block charged to `budget` first: refused, `value` is dropped.
     pub(crate) fn new(value: T, budget: &Arc<Budget>) -> Result<Self, BudgetExceeded> {
