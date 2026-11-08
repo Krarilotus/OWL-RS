@@ -910,7 +910,10 @@ impl<T, B: Deref<Target = Budget>> ChargedVec<T, B> {
             return Ok(());
         }
         let doubled = needed.max(self.items.capacity().saturating_mul(2));
-        self.set_capacity(self.most_that_fits(needed, doubled))
+        let capacity = self.most_that_fits(needed, doubled);
+        #[cfg(test)]
+        growing::pause();
+        self.set_capacity(capacity)
     }
 
     /// Of capacities from `needed` to `doubled` items, the most whose bytes the budget has
@@ -1342,6 +1345,31 @@ impl<B: Deref<Target = Budget>> Gauge<B> {
     }
 }
 
+/// Test-only: a pause on one thread between a growing vector's choice of capacity and its
+/// charge, where a sibling's growth can come between them (the budget types' owner's race,
+/// 8 Nov).
+#[cfg(test)]
+pub(crate) mod growing {
+    use std::cell::RefCell;
+
+    type Pause = Box<dyn Fn()>;
+
+    thread_local! {
+        static PAUSE: RefCell<Option<Pause>> = const { RefCell::new(None) };
+    }
+
+    /// `pause` runs at this thread's next growth, once.
+    pub(crate) fn pause_with(pause: impl Fn() + 'static) {
+        PAUSE.with(|slot| *slot.borrow_mut() = Some(Box::new(pause)));
+    }
+
+    pub(crate) fn pause() {
+        if let Some(pause) = PAUSE.with(|slot| slot.borrow_mut().take()) {
+            pause();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1614,6 +1642,49 @@ mod tests {
         assert!(budget.peak() <= LIMIT, "peak {}", budget.peak());
         assert_eq!(budget.used(), vec.capacity() * 8);
         assert!(vec.iter().copied().eq(0..pushed as u64));
+    }
+
+    /// Spec (the budget types' owner, 8 Nov): two vectors on one budget, growing at once near
+    /// its limit, both grow where what each asks fits, and the budget isn't recorded as
+    /// refused. The limit leaves room beside their 1,000 items each for both to ask 1,001 more,
+    /// and for either alone to double, but not for both to double. The first to grow pauses
+    /// between choosing its capacity and charging it (`growing`), and the other grows
+    /// meanwhile. Chosen from a reading of the room and then charged exactly, the first's
+    /// doubled capacity is refused, and the budget recorded as refused, though what it asked
+    /// fits.
+    #[test]
+    fn vectors_growing_at_once_near_the_limit_both_grow() {
+        use std::sync::{Arc, Barrier};
+        const ITEMS: usize = 1_000;
+        let budget = Budget::new((2 * ITEMS + 2_500) * 8);
+        let mut vectors = [(); 2].map(|()| {
+            let mut vec: ChargedVec<u64, &Budget> =
+                ChargedVec::with_capacity(&budget, ITEMS).unwrap();
+            vec.resize(ITEMS, 0).unwrap();
+            vec
+        });
+        let [first, second] = &mut vectors;
+        let (paused, resumed) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+        let (grew_first, grew_second) = std::thread::scope(|scope| {
+            let (pause, resume) = (Arc::clone(&paused), Arc::clone(&resumed));
+            let pausing = scope.spawn(move || {
+                growing::pause_with(move || {
+                    pause.wait();
+                    resume.wait();
+                });
+                first.push(1)
+            });
+            paused.wait();
+            let grew_second = second.push(1);
+            resumed.wait();
+            (pausing.join().unwrap(), grew_second)
+        });
+        assert!(
+            grew_first.is_ok() && grew_second.is_ok(),
+            "{grew_first:?}, {grew_second:?}"
+        );
+        assert!(!budget.refused(), "the budget recorded as refused");
+        assert_eq!(budget.used(), vectors[0].charged() + vectors[1].charged());
     }
 
     #[test]
