@@ -25,8 +25,8 @@ import signal
 import socket
 import subprocess
 import sys
-import tarfile
 import tempfile
+import threading
 import time
 import tomllib
 import uuid
@@ -389,7 +389,7 @@ class Suite:
         log = self.results / "logs" / f"{nrese.key}-build-{self.stamp}.log"
         # From a clean export of its commit, never the worktree (P1e: r5 F17 and every file git
         # doesn't hold); removed after the build, its binary in the build's own target.
-        tree = self.export_build(source, nrese.key)
+        tree = self.export_build(source, nrese.key, self.built[nrese.key].get("commit"))
         if tree is None:
             return False
         try:
@@ -450,26 +450,26 @@ class Suite:
         if self.manifest and self.built:
             self.manifest.update(builds=dict(self.built))
 
-    def export_build(self, source: Path, program: str) -> Path | None:
+    def export_build(self, source: Path, program: str, commit: str | None) -> Path | None:
         """A fresh export of `source`'s commit for a build of `program` (P1e), in a directory of this
         run's own, outside any checkout (cargo reads .cargo/config in every ancestor of the directory
-        it builds in): build_export_base. None, said why, where it can't be made; never the worktree
-        in its place. A dry run builds nothing: the source, for its echo."""
+        it builds in): build_export_base. Its commit is the one the build's record names (built_from's),
+        never HEAD read again (P1e review r1 F1). None, said why, where it can't be made; never the
+        worktree in its place. A dry run builds nothing: the source, for its echo."""
         if self.args.dry_run:
             return source
-        commit = checkout_state(source).get("commit")
         if not commit:
             self.say(f"the {program} build: {source} has no commit to export")
             return None
         try:
-            tree = Path(tempfile.mkdtemp(prefix=f"nrese-build-{program}-", dir=build_export_base(source, self.root)))
+            tree = Path(tempfile.mkdtemp(prefix=f"nrese-build-{program}-", dir=build_export_base(source)))
         except OSError as error:
             self.say(f"the {program} build: no directory for its export: {error}")
             return None
         self.made_exports.append(tree)
         try:
             export_commit(source, commit, tree)
-        except (OSError, tarfile.TarError, subprocess.SubprocessError) as error:
+        except (OSError, subprocess.SubprocessError) as error:
             self.say(f"the {program} build: exporting {commit[:12]} failed: {error}")
             self.remove_export(tree)
             return None
@@ -506,7 +506,7 @@ class Suite:
         self.say("building the harness (release)")
         self.built["harness"] = built_from(self.root, "harness")
         log = self.results / "logs" / f"harness-build-{self.stamp}.log"
-        tree = self.export_build(self.root, "harness")
+        tree = self.export_build(self.root, "harness", self.built["harness"].get("commit"))
         if tree is None:
             return False
         try:
@@ -1001,13 +1001,17 @@ class Suite:
         if self.manifest and self.args.runtime == "docker":
             self.manifest.update(images=image_ids(list(images)), pinned_images=ns.pinned(self.root))
         for key in dict.fromkeys(key for _, key, system, _ in chosen if isinstance(system, Nrese)):
-            built = self.build_nrese(adapter(key))
-            self.record_builds()
+            try:
+                built = self.build_nrese(adapter(key))
+            finally:
+                self.record_builds()  # a builder that raises too (P1e review r1 F2)
             if not built:
                 return 1
         if any(system is not None and plan.kind != "kit" for plan, _, system, _ in chosen):
-            built = self.build_harness()
-            self.record_builds()
+            try:
+                built = self.build_harness()
+            finally:
+                self.record_builds()
             if not built:
                 self.say("the harness build failed")
                 return 1
@@ -1288,38 +1292,89 @@ def controlled_environment(env: Mapping[str, str]) -> dict[str, str]:
     return {k: v for k, v in env.items() if passed(k)}
 
 
-def build_export_base(*checkouts: Path) -> Path:
-    """Where a build's export goes: the system's temporary directory, unless that is inside one of
-    `checkouts` (whose .cargo cargo would then read too), then beside the first of them."""
-    temp = Path(tempfile.gettempdir()).resolve()
-    for checkout in checkouts:
-        if temp.is_relative_to(checkout.resolve()):
-            return checkouts[0].resolve().parent
-    return temp
+def build_export_base(checkout: Path) -> Path:
+    """Where a build's export goes: beside the build's own checkout (its parent directory), outside it
+    (cargo would read the checkout's .cargo too), on the filesystem the launcher's free-disk guard
+    measures (it measures where it runs from: an export in a small /tmp refused a build whose target
+    had room, build-controlled-build-3). Cargo configs above it are still checked (cargo_configs)."""
+    return checkout.resolve().parent
 
 
 def export_commit(checkout: Path, commit: str, dest: Path, timeout: float = 600) -> None:
-    """`dest` <- the committed tree of `commit` in `checkout` (git archive): files git holds, nothing
-    it ignores. Every file and directory is stamped with the export's time, never the commit's: cargo
-    decides freshness by mtimes, and an older commit's would read as older than the last build's
-    outputs (a stale binary). Raises where git or the archive fails."""
-    now = time.time()
+    """`dest` <- the tree of `commit` in `checkout`, exactly: every entry of its tree (git ls-tree)
+    written with its object's bytes (git cat-file --batch), so no attribute applies (export-ignore,
+    export-subst, a filter, from the commit or outside it: P1e review r1 F1), nor a replace ref
+    (--no-replace-objects). A plain file or an executable only: a symlink, a submodule, an unsafe
+    path or two paths this filesystem can't tell apart refuse it. Its files have the time they're
+    written, never the commit's (cargo decides freshness by mtimes: an older commit's would read as
+    older than the last build's outputs, a stale binary). One deadline for the whole export, its git
+    children killed at it (r1 F4). Raises OSError where it can't be made exactly."""
+    started = time.monotonic()
+    git = ["git", "--no-replace-objects", "-C", str(checkout)]
 
-    def stamped(member, path):
-        member = tarfile.data_filter(member, path)
-        return None if member is None else member.replace(mtime=now, deep=False)
-    with subprocess.Popen(["git", "-C", str(checkout), "archive", "--format=tar", commit],
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as git:
+    def left() -> float:
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            raise OSError(f"exporting {commit[:12]}: past its deadline ({timeout} s)")
+        return remaining
+    try:
+        listed = subprocess.run([*git, "ls-tree", "-r", "-z", "--full-tree", commit], capture_output=True,
+                                timeout=left())
+    except subprocess.TimeoutExpired as error:
+        raise OSError(f"exporting {commit[:12]}: past its deadline ({timeout} s)") from error
+    if listed.returncode != 0:
+        said = listed.stderr.decode(errors="replace").strip().splitlines()
+        raise OSError(f"git ls-tree {commit[:12]} exited {listed.returncode}: {said[-1] if said else 'no output'}")
+    entries, seen, spelled = [], set(), {}
+    for record in filter(None, listed.stdout.split(b"\0")):
+        meta, _, raw = record.partition(b"\t")
+        mode, kind, oid = meta.split(b" ")
+        path = raw.decode("utf-8", "surrogateescape")
+        if kind != b"blob" or mode not in (b"100644", b"100755"):
+            raise OSError(f"{path}: a {kind.decode()} of mode {mode.decode()}, not a plain file: not exported")
+        parts = path.split("/")
+        if path.startswith("/") or any(part in ("", ".", "..") for part in parts):
+            raise OSError(f"{path}: not a path inside the export")
+        # Every directory on the way, and the file, as this filesystem names it: two spellings git keeps
+        # apart and it merges (case on Windows) refuse (sol-loop r3 S3).
+        for depth in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:depth])
+            folded = os.path.normcase(prefix)
+            if spelled.setdefault(folded, prefix) != prefix or (depth == len(parts) and folded in seen):
+                raise OSError(f"{path}: the same name here as {spelled[folded]}")
+        seen.add(os.path.normcase(path))
+        entries.append((mode, oid, path))
+    with subprocess.Popen([*git, "cat-file", "--batch"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL) as batch:
+        watchdog = threading.Timer(max(0.0, timeout - (time.monotonic() - started)), batch.kill)
+        watchdog.start()
         try:
-            with tarfile.open(fileobj=git.stdout, mode="r|") as tar:
-                tar.extractall(dest, filter=stamped)
-            said = git.stderr.read().decode(errors="replace").strip()
-            code = git.wait(timeout=timeout)
-        except BaseException:
-            git.kill()
-            raise
-    if code != 0:
-        raise OSError(f"git archive {commit[:12]} exited {code}: {said.splitlines()[-1] if said else 'no output'}")
+            for mode, oid, path in entries:
+                left()
+                batch.stdin.write(oid + b"\n")
+                batch.stdin.flush()
+                header = batch.stdout.readline().split()
+                if len(header) != 3 or header[0] != oid or header[1] != b"blob":
+                    left()  # killed at the deadline: that, not a garbled answer (sol-loop r3 S4)
+                    said = b" ".join(header).decode(errors="replace") or "nothing"
+                    raise OSError(f"{path}: git cat-file gave {said}")
+                size = int(header[2])
+                data = batch.stdout.read(size)
+                if len(data) != size or batch.stdout.read(1) != b"\n":
+                    left()
+                    raise OSError(f"{path}: git cat-file stopped inside its object")
+                target = dest.joinpath(*path.split("/"))
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with open(target, "xb") as out:
+                    out.write(data)
+                if mode == b"100755":
+                    target.chmod(0o755)
+            left()
+        except (BrokenPipeError, ValueError) as error:
+            raise OSError(f"exporting {commit[:12]}: git cat-file ended: {error}") from error
+        finally:
+            watchdog.cancel()
+            batch.kill()
 
 
 def declared_toolchain(root: Path) -> str | None:
