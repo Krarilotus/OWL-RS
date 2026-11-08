@@ -9,7 +9,7 @@ use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term, Triple};
 
 use super::super::{Engine, EngineConfig, InferredSubset, ReadModel, Snapshot, TextScope};
 use crate::error::EngineError;
-use crate::{EncodedTriple, SearchRefused, TermId, TextQuery, VectorQuery};
+use crate::{EncodedTriple, QuadPattern, SearchRefused, TermId, TextQuery, VectorQuery};
 
 fn iri(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("http://example.com/{local}"))
@@ -559,4 +559,155 @@ fn a_private_snapshots_equality_classes_stay_its_own() {
         classes.representative(b),
         "privately one class, the published classes read before"
     );
+}
+
+/// `?s ex:p ?o` read with equality on, expanded (`canonical` false) or canonical: each
+/// answer's subject and object, decoded (an id the snapshot can't decode as `?`), sorted.
+fn equality_answers(
+    snapshot: &Snapshot,
+    same_as: TermId,
+    canonical: bool,
+) -> Vec<(String, String)> {
+    let expanded = snapshot.with_equality(Some(same_as));
+    let view = match canonical {
+        true => expanded.with_canonical_equality(),
+        false => expanded,
+    };
+    let pattern = QuadPattern {
+        predicate: view.lookup(iri("p").as_ref().into()),
+        ..QuadPattern::all()
+    };
+    let text = |id| {
+        view.decode(id)
+            .map_or("?".to_owned(), |term| term.to_string())
+    };
+    let mut answers: Vec<(String, String)> = view
+        .quads_for_pattern_in(ReadModel::Materialised, &pattern)
+        .map(|quad| (text(quad.subject), text(quad.object)))
+        .collect();
+    answers.sort();
+    answers
+}
+
+fn pairs(rows: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = rows
+        .iter()
+        .map(|&(s, o)| (format!("<http://example.com/{s}>"), format!("\"{o}\"")))
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// Review P2B-F1 (8 Nov): a real equality class with a private member, its answers read
+/// canonically and expanded, in both orders.
+///
+/// - Input: the published class {`ex:b`, `ex:c`} (`ex:b` its representative, the smallest id)
+///   with `ex:b ex:p "v"`. A private transaction stores what the closure over representatives
+///   holds for its own `ex:x` joining that class (the module doc of `equality`): `ex:x
+///   owl:sameAs ex:b`, and `ex:b ex:p "w"` for its asserted `ex:x ex:p "w"`. Its pending
+///   snapshot and the published one read with equality on, canonically and expanded: the
+///   private first, then on a fresh engine the published first.
+/// - Expected, either order: canonically, privately `"v"` and `"w"` on `ex:b`, published
+///   `"v"` on `ex:b`. Expanded, privately both on each of `ex:b`, `ex:c` and `ex:x`; published
+///   `"v"` on `ex:b` and `ex:c` alone.
+#[test]
+fn equality_reads_keep_a_private_class_member_private() {
+    for private_first in [true, false] {
+        let (engine, same_as, b) = engine_with_a_class();
+        let base = engine.snapshot();
+        let read = |snapshot: &Snapshot| {
+            [false, true].map(|canonical| equality_answers(snapshot, same_as, canonical))
+        };
+        let published_before = (!private_first).then(|| read(&base));
+        let mut tx = engine.speculative_over(&base, budget()).unwrap();
+        let x = tx.try_intern(iri("x").as_ref().into()).unwrap();
+        let p = base.lookup(iri("p").as_ref().into()).unwrap();
+        let w = tx.try_intern(literal("w").as_ref()).unwrap();
+        assert!(tx.insert_inferred(EncodedTriple::new(x, same_as, b)));
+        assert!(tx.insert_inferred(EncodedTriple::new(b, p, w)));
+        assert!(
+            tx.try_insert(quad("x", "p", literal("w")).as_ref())
+                .unwrap()
+        );
+        let [private_expanded, private_canonical] = read(&tx.pending_snapshot().unwrap());
+        let [published_expanded, published_canonical] =
+            published_before.unwrap_or_else(|| read(&base));
+        let order = if private_first {
+            "private first"
+        } else {
+            "published first"
+        };
+        assert_eq!(
+            private_canonical,
+            pairs(&[("b", "v"), ("b", "w")]),
+            "{order}: privately, canonical"
+        );
+        assert_eq!(
+            private_expanded,
+            pairs(&[
+                ("b", "v"),
+                ("b", "w"),
+                ("c", "v"),
+                ("c", "w"),
+                ("x", "v"),
+                ("x", "w")
+            ]),
+            "{order}: privately, expanded"
+        );
+        assert_eq!(
+            published_canonical,
+            pairs(&[("b", "v")]),
+            "{order}: published, canonical"
+        );
+        assert_eq!(
+            published_expanded,
+            pairs(&[("b", "v"), ("c", "v")]),
+            "{order}: published, expanded"
+        );
+    }
+}
+
+/// Review P2B-F1 (8 Nov): `pending_over`'s version keeps its equality classes apart from its
+/// view's, in both orders.
+///
+/// - Input: the published class {`ex:b`, `ex:c`}; a restricted view of the base; a private
+///   transaction's `pending_over` that view, hiding the inferred `ex:c owl:sameAs ex:b`. The
+///   private result's classes and the view's, both read with equality on, the private one
+///   first, then on a fresh engine the view's first.
+/// - Expected: privately `ex:c` is outside `ex:b`'s class; in the view it is inside,
+///   whichever is read first.
+#[test]
+fn a_pending_view_hiding_an_equality_edge_keeps_its_classes_apart() {
+    for private_first in [true, false] {
+        let (engine, same_as, b) = engine_with_a_class();
+        let base = engine.snapshot();
+        let c = base.lookup(iri("c").as_ref().into()).unwrap();
+        let edge = EncodedTriple::new(c, same_as, b).in_default_graph();
+        let view = base.with_inferred_subset(InferredSubset::Without(Vec::new()));
+        let classes_of = |snapshot: &Snapshot| {
+            snapshot
+                .with_equality(Some(same_as))
+                .equality_classes()
+                .unwrap()
+        };
+        let view_before = (!private_first).then(|| classes_of(&view));
+        let tx = engine.speculative_over(&base, budget()).unwrap();
+        let private = classes_of(&tx.pending_over(&view, &[edge]).unwrap());
+        let viewed = view_before.unwrap_or_else(|| classes_of(&view));
+        let order = if private_first {
+            "private first"
+        } else {
+            "view first"
+        };
+        assert_ne!(
+            private.representative(c),
+            private.representative(b),
+            "{order}: the hidden edge joins nothing privately"
+        );
+        assert_eq!(
+            viewed.representative(c),
+            viewed.representative(b),
+            "{order}: the view keeps its class"
+        );
+    }
 }
