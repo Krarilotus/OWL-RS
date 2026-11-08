@@ -224,19 +224,31 @@ fn key_bytes(kind: KindRef<'_>) -> usize {
 }
 
 /// One step of the lineage: the content it was made from, the terms it touched (string
-/// and typed literals as objects, IRIs as subjects; raw ids, sorted), the predicates of the
-/// statements it added or removed (raw ids, sorted), each on the store's budget, and the
-/// charge of the step's own entry in the map and the order.
+/// and typed literals as objects, IRIs as subjects; raw ids, sorted) and the predicates of
+/// the statements it added or removed (raw ids, sorted), each on the store's budget. Its
+/// slots in the map and the order are charged with their storage ([`State::slots`]).
 struct Step {
     parent: Content,
     touched: Vec<u64>,
     predicates: Vec<u64>,
-    _charges: [Reservation; 3],
+    _charges: [Reservation; 2],
 }
 
-/// Bytes a step's entry takes in the map and the order.
-const STEP_ENTRY: usize =
-    std::mem::size_of::<(Content, Step)>() + 2 * std::mem::size_of::<Content>() + 16;
+/// Bytes the lineage's map and order hold when made for `capacity` steps
+/// (`HashMap::with_capacity`, `VecDeque::with_capacity`): the map's buckets (as `std`'s
+/// table sizes them: 4 or 8 below 8 steps, else the power of two of at least
+/// capacity × 8 / 7; an entry and a control byte each, a group of control bytes and its
+/// alignment) and one slot of the order each.
+fn slot_bytes(capacity: usize) -> usize {
+    let buckets = match capacity {
+        0..4 => 4,
+        4..8 => 8,
+        _ => (capacity * 8 / 7).next_power_of_two(),
+    };
+    buckets * (std::mem::size_of::<(Content, Step)>() + 1)
+        + 32
+        + capacity * std::mem::size_of::<Content>()
+}
 
 struct State {
     /// Least recently used first.
@@ -246,6 +258,10 @@ struct State {
     retired: Vec<(Weak<Corpus>, Reservation)>,
     steps: HashMap<Content, Step>,
     order: VecDeque<Content>,
+    /// The charge of the storage of `steps` and `order` on the store's budget: grown only
+    /// after its bytes are charged ([`CorpusStore::room_for_step`]), freed before its
+    /// charge goes. Held, never read.
+    _slots: Reservation,
 }
 
 /// The kept corpora and the lineage, shared by the snapshots of an engine and the views
@@ -323,14 +339,15 @@ impl Default for CorpusStore {
 impl CorpusStore {
     fn on(budget: Arc<Budget>) -> Self {
         Self {
-            budget: Mutex::new(budget),
-            tuning: Mutex::new(CorpusTuning::DEFAULT),
             state: Mutex::new(State {
                 kept: Vec::new(),
                 retired: Vec::new(),
                 steps: HashMap::new(),
                 order: VecDeque::new(),
+                _slots: Reservation::new(Arc::clone(&budget)),
             }),
+            budget: Mutex::new(budget),
+            tuning: Mutex::new(CorpusTuning::DEFAULT),
             steps: AtomicU64::new(0),
             walked: AtomicU64::new(0),
             derived: AtomicU64::new(0),
@@ -344,7 +361,7 @@ impl CorpusStore {
         for kept in std::mem::take(&mut state.kept) {
             Self::retire(&mut state, kept);
         }
-        Self::forget_lineage(&mut state);
+        Self::forget_lineage(&mut state, &budget);
         *self.budget.lock() = budget;
     }
 
@@ -382,22 +399,45 @@ impl CorpusStore {
         self.record_terms(parent, child, 2 * n, terms, n, predicates);
     }
 
-    /// A step's entry charge and its terms and predicates, sorted, on `budget`.
-    #[allow(clippy::type_complexity)]
+    /// A step's terms and predicates, sorted, on `budget`.
     fn charged_step(
         budget: &Arc<Budget>,
         bound: usize,
         terms: impl IntoIterator<Item = u64>,
         predicate_bound: usize,
         predicates: impl IntoIterator<Item = u64>,
-    ) -> Result<(Reservation, ChargedVec<u64>, ChargedVec<u64>), BudgetExceeded> {
-        let mut entry = Reservation::new(Arc::clone(budget));
-        entry.charge(STEP_ENTRY)?;
+    ) -> Result<(ChargedVec<u64>, ChargedVec<u64>), BudgetExceeded> {
         let mut touched = ChargedVec::collect(Arc::clone(budget), bound, terms)?;
         sort_dedup(&mut touched);
         let mut predicates = ChargedVec::collect(Arc::clone(budget), predicate_bound, predicates)?;
         sort_dedup(&mut predicates);
-        Ok((entry, touched, predicates))
+        Ok((touched, predicates))
+    }
+
+    /// Room in the lineage's map and order for one more step. Where either is full, both
+    /// are made anew for twice the steps (at least 16): the new storage charged first (old
+    /// and new are held together while the steps move), the old freed, then its charge
+    /// released. Growth is never left to the map itself, whose tombstones could make it
+    /// grow past what was charged. `false` where the budget refuses it.
+    fn room_for_step(state: &mut State, budget: &Arc<Budget>) -> bool {
+        let len = state.steps.len();
+        if len < state.steps.capacity() && state.order.len() < state.order.capacity() {
+            return true;
+        }
+        let target = (len * 2).max(16);
+        let mut charge = Reservation::new(Arc::clone(budget));
+        if charge.charge(slot_bytes(target)).is_err() {
+            return false;
+        }
+        let mut steps = HashMap::with_capacity(target);
+        steps.extend(state.steps.drain());
+        let mut order = VecDeque::with_capacity(target);
+        order.extend(state.order.drain(..));
+        // The old storage is freed by these assignments, then its charge by the last.
+        state.steps = steps;
+        state.order = order;
+        state._slots = charge;
+        true
     }
 
     fn insert_step(
@@ -405,7 +445,7 @@ impl CorpusStore {
         state: &mut State,
         parent: Content,
         child: Content,
-        (entry, touched, predicates): (Reservation, ChargedVec<u64>, ChargedVec<u64>),
+        (touched, predicates): (ChargedVec<u64>, ChargedVec<u64>),
     ) {
         let (touched, touched_charge) = touched.into_parts();
         let (predicates, predicates_charge) = predicates.into_parts();
@@ -415,7 +455,7 @@ impl CorpusStore {
                 parent,
                 touched,
                 predicates,
-                _charges: [entry, touched_charge, predicates_charge],
+                _charges: [touched_charge, predicates_charge],
             },
         );
         // A content is made once; a second step for it would leave its first in the order.
@@ -442,12 +482,20 @@ impl CorpusStore {
         if parent == child {
             return;
         }
-        let budget = self.budget();
         let mut state = self.state.lock();
+        // Under the state's lock (as `set_budget` sets it): a step is charged to the budget
+        // the lineage it joins is on.
+        let budget = self.budget();
         // Steps lead from a version to a kept corpus: with none kept, none are.
         if state.kept.is_empty() {
-            Self::forget_lineage(&mut state);
+            Self::forget_lineage(&mut state, &budget);
             return;
+        }
+        // A slot for it first; the oldest steps let go for room (they free slots).
+        while !Self::room_for_step(&mut state, &budget) {
+            if !Self::drop_oldest_step(&mut state) {
+                return;
+            }
         }
         let built = loop {
             let attempt = Self::charged_step(
@@ -466,9 +514,12 @@ impl CorpusStore {
         self.insert_step(&mut state, parent, child, built);
     }
 
-    fn forget_lineage(state: &mut State) {
-        state.steps.clear();
-        state.order.clear();
+    /// Lets the lineage go, its storage freed before its charge is released; the next
+    /// storage is charged to `budget`.
+    fn forget_lineage(state: &mut State, budget: &Arc<Budget>) {
+        state.steps = HashMap::new();
+        state.order = VecDeque::new();
+        state._slots = Reservation::new(Arc::clone(budget));
     }
 
     /// Lets the oldest step go; `false` if there is none.
@@ -665,7 +716,11 @@ impl CorpusStore {
             Some((Arc::new(corpus), charge))
         });
         let mut state = self.state.lock();
-        match (built, entry(&state)) {
+        // A budget set while it was built (`set_budget` let every entry go, and an entry
+        // made since is the new budget's): what was charged to the old one serves its
+        // search alone, as where its entry went.
+        let current = Arc::ptr_eq(&budget, &self.budget.lock());
+        match (built, entry(&state).filter(|_| current)) {
             (Some((corpus, charge)), Some(at)) => {
                 let mut kept = state.kept.remove(at);
                 let shared = Arc::clone(&corpus);
@@ -730,5 +785,100 @@ impl CorpusStore {
             walked: self.walked.load(Ordering::Relaxed),
             derived: self.derived.load(Ordering::Relaxed),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::term::text::Bits;
+
+    fn kind(scope: &TextScope) -> KindRef<'_> {
+        KindRef {
+            documents: Documents::Literals,
+            model: ReadModel::Materialised,
+            scope,
+            equality: None,
+            canonical: false,
+        }
+    }
+
+    /// A corpus of one document, on `budget`.
+    fn corpus(budget: &Arc<Budget>) -> Result<Corpus, BudgetExceeded> {
+        let mut bits = ChargedVec::with_capacity(Arc::clone(budget), 1)?;
+        bits.resize(1, 1)?;
+        let bits = Bits {
+            bits,
+            documents: 1,
+            total_words: 1,
+        };
+        Corpus::finish(&bits, 64, budget)
+    }
+
+    /// Sol-loop r2 R2-S1: a search builds its corpus on the store's budget; meanwhile the
+    /// budget is set anew (every entry let go) and another search makes the same entry on
+    /// the new one. What the first built is charged to the old budget: it serves that
+    /// search, and the new entry stays for a corpus on the new budget.
+    #[test]
+    fn a_corpus_built_across_a_budget_change_is_not_kept_under_the_new_one() {
+        let store = CorpusStore::default();
+        let version = Arc::new(Version::empty());
+        let scope = TextScope::EVERY;
+        let request = Arc::new(Budget::unlimited());
+        let fresh = Arc::new(Budget::new(1 << 20));
+        let made = store.find(&version, kind(&scope), &request);
+        assert!(matches!(made, Ok(Found::Build { keep: true, .. })));
+        let served = store.keep_built(&version, kind(&scope), 64, |old| {
+            store.set_budget(Arc::clone(&fresh));
+            let again = store.find(&version, kind(&scope), &request);
+            assert!(matches!(again, Ok(Found::Build { keep: true, .. })));
+            corpus(old)
+        });
+        assert!(served.is_some(), "the search gets its corpus");
+        let state = store.state.lock();
+        assert_eq!(state.kept.len(), 1);
+        assert!(
+            state.kept.iter().all(|k| k.corpus.is_none()),
+            "a corpus on the old budget kept under the new one"
+        );
+    }
+
+    /// Sol-loop r2 R2-S2: the lineage's map and order keep their storage when steps go;
+    /// that storage stays charged while it is held. 1,000 steps from a kept corpus, then a
+    /// corpus kept at the last version: every step leads nowhere and goes, the storage
+    /// stays. Oracle: the storage `std` reports (capacity times entry size, a lower bound).
+    #[test]
+    fn the_lineage_storage_stays_charged_while_it_is_held() {
+        let budget = Arc::new(Budget::new(64 << 20));
+        let store = CorpusStore::on(Arc::clone(&budget));
+        let scope = TextScope::EVERY;
+        let request = Arc::new(Budget::unlimited());
+        let first = Arc::new(Version::empty());
+        store.find(&first, kind(&scope), &request).unwrap();
+        store.keep_built(&first, kind(&scope), 64, corpus).unwrap();
+        let iri = TermId::new(TermKind::Iri, 1);
+        let mut parent = first.content;
+        for _ in 0..1000 {
+            let child = Content::fresh();
+            store.record(parent, child, std::iter::once((iri, iri, iri)));
+            parent = child;
+        }
+        drop(first);
+        let last = Arc::new(Version {
+            content: parent,
+            ..Version::empty()
+        });
+        store.find(&last, kind(&scope), &request).unwrap();
+        store.keep_built(&last, kind(&scope), 64, corpus).unwrap();
+        let state = store.state.lock();
+        assert!(state.steps.is_empty(), "{} steps left", state.steps.len());
+        let held = state.steps.capacity() * std::mem::size_of::<(Content, Step)>()
+            + state.order.capacity() * std::mem::size_of::<Content>();
+        assert!(held > 0);
+        assert!(
+            budget.used() >= held,
+            "storage of {held} bytes held, {} charged",
+            budget.used()
+        );
     }
 }

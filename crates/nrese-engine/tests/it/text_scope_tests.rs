@@ -976,6 +976,12 @@ fn a_reader_vector_search_selects_and_counts_the_visible_vectors() {
 #[test]
 fn a_literal_related_by_equality_is_in_the_corpus_after_a_commit() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
+    // A corpus of two documents and a commit touching one term: worth deriving at one
+    // document a probe, so the derivation is what this checks (sol-loop r2 R2-S4).
+    engine.set_corpus_tuning(nrese_engine::CorpusTuning {
+        documents_per_probe: 1,
+        ..nrese_engine::CorpusTuning::DEFAULT
+    });
     let ex = |s: &str| NamedNode::new_unchecked(format!("http://example.com/{s}"));
     let mut tx = engine.transaction();
     let r = tx.intern(ex("r").as_ref().into());
