@@ -25,9 +25,11 @@ Runs of different hosts, or of one host under different configurations (benches/
 `config`, or a different CPU governor read by the runs), are not compared: compare exits 2
 unless --allow-host-change, and then flags every verdict as no evidence of a code change.
 Of two fast-suite reports, a case whose two sides didn't load the same frozen input files, byte
-for byte (each record's `inputs`), or don't say which, gets no verdict: it is listed as a
-different or unknown input, no evidence of a code change, and compare exits 2 when no case is
-left (7 Nov 2026: lubm-10/100's new release; a form pin never stands in for the bytes).
+for byte (each record's `inputs`), or don't say which, gets no time, throughput, memory or work
+verdict: it is listed as a different or unknown input, no evidence of a code change (7 Nov 2026:
+lubm-10/100's new release; a form pin never stands in for the bytes); its status, checks and
+answers are judged as any case's, and compare exits 2 when no case of a side loaded the same input
+and nothing failed.
 
 BASE and NEW are fast-suite reports (`.json`: the full report, or a compact record that
 names it), perf-lab reports (`.json` with `queries`), or suite results (directories or
@@ -328,10 +330,13 @@ def kind_of(entry: dict) -> str:
 
 
 def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, out: Out,
-                  untimed: dict[str, str] | None = None) -> list[float]:
+                  untimed: dict[str, str] | None = None, unmeasured: dict[str, str] | None = None) -> list[float]:
     """Fast-suite cases (or a perf-lab report as one), case by case; the spreads seen. A case in
-    `untimed` (case: why) is compared in everything but its time and its spread."""
-    untimed = untimed or {}
+    `untimed` (case: why) is compared in everything but its time and its spread; one in `unmeasured`
+    (its two sides loaded other or unknown input bytes: input_check()) in its answers, status and
+    checks only, since none of its measures (time, throughput, memory, work, a known issue's peak) is
+    evidence of a code change over other input (review r1 of pkg/stage-data, R1-W1)."""
+    untimed, unmeasured = untimed or {}, unmeasured or {}
     spreads = []
     for case in sorted(set(base) | set(new)):
         b, n = base.get(case), new.get(case)
@@ -373,12 +378,19 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
                     numbers = [[f.get(k) for f in runs if isinstance(f.get(k), (int, float))] for k in ("metric", "peak_mib")]
                     return ({f["status"] for f in runs}, *(statistics.median(v) if v else None for v in numbers))
                 (sb, mb, pb), (sn, mn, pn) = past(b), past(n)
+                # Its status is a finding about the new run whatever the input; its metric and peak only
+                # over the same input bytes (review r1 of pkg/compare-input-status, R1-W1).
                 worse = "ok" in sb and sn != {"ok"}
-                worse |= bool(pb and pn and pn > pb * 1.10 and pn - pb > 64)
+                measures = (f"metric and peak not compared: {unmeasured[case]}" if case in unmeasured
+                            else f"metric {mb} -> {mn}, peak {pb} -> {pn} MiB")
+                worse |= case not in unmeasured and bool(pb and pn and pn > pb * 1.10 and pn - pb > 64)
                 out.add("Answers and completeness",
                         f"{'':<28}past its limit ({len(b['frontiers'])} and {len(n['frontiers'])} runs, medians): "
-                        f"{','.join(sorted(sb))} -> {','.join(sorted(sn))}, metric {mb} -> {mn}, peak {pb} -> {pn} MiB"
+                        f"{','.join(sorted(sb))} -> {','.join(sorted(sn))}, {measures}"
                         + ("  WORSE" if worse else ""), worse)
+            continue
+        if case in unmeasured:
+            out.add("Time", f"{case:<26} not measured against its baseline: {unmeasured[case]}")
             continue
         work, notes = counter_changes(b["counters"], n["counters"])
         if case in untimed:
@@ -715,14 +727,14 @@ def compare_reports(base_report: dict, new_report: dict, min_ms: float = 2.0, al
     if other_input:
         print("## Inputs\n")
         for case, why in other_input.items():
-            print(f"- {case}: {why}; not compared: no evidence of a code change")
+            print(f"- {case}: {why}; its time, memory, work and throughput not compared: no evidence of a "
+                  "code change")
         print()
-        keep = lambda report: {**report, "records": [r for r in report.get("records", [])  # noqa: E731
-                                                     if r["case"] not in other_input]}
-        base_report, new_report = keep(base_report), keep(new_report)
-        if not base_report["records"] or not new_report["records"]:
-            print("REFUSED: no case loaded the same input on both sides")
-            return 2
+    # Its records stay: a case refused for its input is judged in status, checks and answers, and its
+    # measures not at all (compare_cases `unmeasured`; the master, 8 Nov 2026: the record filter here
+    # dropped a wrong status, as R3-F1 found for the units in #135).
+    no_input = bool(other_input) and any(all(r["case"] in other_input for r in report.get("records", []))
+                                         for report in (base_report, new_report))
     base_report, new_report, untimed = units_check(base_report, new_report)
     no_timing = bool(untimed) and any(all(r["case"] in untimed for r in report["records"])
                                       for report in (base_report, new_report))
@@ -731,7 +743,7 @@ def compare_reports(base_report: dict, new_report: dict, min_ms: float = 2.0, al
             print(f"warning: the {name} run has one repetition: its spread is unknown, so a verdict "
                   "rests on the 10 % floor alone (run --reps 2 or more)")
     out = Out()
-    spreads = compare_cases(pooled(base_report), pooled(new_report), min_ms, out, untimed)
+    spreads = compare_cases(pooled(base_report), pooled(new_report), min_ms, out, untimed, other_input)
     out.print({"Time": f"{'case':<26} {'base ms':>11} {'new ms':>11} {'ratio':>7} {'95% CI':>15} {'spread':>7}  verdict"})
     if spreads:
         print(f"spread between repetitions: median {statistics.median(spreads):.0%}, max {max(spreads):.0%}")
@@ -740,6 +752,9 @@ def compare_reports(base_report: dict, new_report: dict, min_ms: float = 2.0, al
           "QPS is higher-is-better, judged per client width without a millisecond floor")
     if out.regressions:
         return 1
+    if no_input:
+        print("REFUSED: no case loaded the same input on both sides")
+        return 2
     if no_timing:
         print("REFUSED: no case left whose timing units both sides share")
         return 2
