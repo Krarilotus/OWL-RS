@@ -41,6 +41,12 @@
 //! **Pinned.** A named query's result can be pinned ([`ResultCache::pins`]): it is never
 //! evicted while its revision is current, and counts against the budget. After a commit it
 //! is pinned again the next time it is computed.
+//!
+//! **Published state only** (the lifecycle contract's S3). Everything that changes what
+//! other queries find (a claim, a pin, a revision's advance, an offer, an output slot, the
+//! insert and its evictions) takes the engine's [`SharedState`] of the snapshot computed on,
+//! and the key it stores under has that snapshot's identity: a writer's pending state, a
+//! speculative or private one, never reaches it. Looking a key up needs no token.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -48,7 +54,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::ThreadId;
 use std::time::Duration;
 
-use nrese_engine::SnapshotIdentity;
+use nrese_engine::{SharedState, SnapshotIdentity};
 use nrese_exec::IdTable;
 use nrese_rdf::Term;
 
@@ -77,6 +83,17 @@ const WAIT_CHECK: Duration = Duration::from_millis(10);
 pub(crate) struct Key {
     pub(crate) snapshot: SnapshotIdentity,
     pub(crate) part: Arc<[u8]>,
+}
+
+impl Key {
+    /// The key `part` is admitted under: the identity of the token's own snapshot. Every key
+    /// the cache stores, claims or pins under is made here.
+    fn admitted(state: SharedState<'_>, part: Arc<[u8]>) -> Self {
+        Self {
+            snapshot: state.snapshot().identity(),
+            part,
+        }
+    }
 }
 
 /// A part's result.
@@ -361,24 +378,67 @@ impl std::fmt::Debug for ResultCache {
 }
 
 /// A query's whole answer in one output format, as the result cache holds it
-/// ([`crate::query::cached_output`]).
-pub enum CachedOutput {
+/// ([`crate::query::cached_output`]), for the snapshot `'s` borrows.
+pub enum CachedOutput<'s> {
     /// The answer's bytes, as written before.
     Hit(Arc<[u8]>),
     /// Not cached: write the answer, then offer its bytes to the slot.
-    Miss(OutputSlot),
-    /// Not cached and not to be (no cache, a transaction's pending state, a volatile
-    /// query, a pin).
+    Miss(OutputSlot<'s>),
+    /// Not cached and not to be (no cache, unpublished state such as a transaction's pending
+    /// one, a volatile query, a pin).
     Off,
 }
 
-/// Where a written answer is offered to the result cache ([`CachedOutput::Miss`]).
-pub struct OutputSlot {
+/// Where a written answer is offered to the result cache ([`CachedOutput::Miss`]): it holds
+/// the token of the published snapshot it was made for, so its offer admits for that
+/// snapshot and no other, and it can't outlive the snapshot.
+///
+/// ```
+/// # use nrese_sparql::{CachedOutput, QueryOptions, ResultCache, cached_output};
+/// let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+/// let options = QueryOptions {
+///     result_cache: Some(std::sync::Arc::new(ResultCache::new(1 << 20))),
+///     ..QueryOptions::default()
+/// };
+/// let query = nrese_sparql_syntax::SparqlParser::new()
+///     .parse_query("SELECT * WHERE { ?s ?p ?o }")
+///     .unwrap();
+/// let snapshot = engine.snapshot();
+/// let slot = match cached_output(&snapshot, &query, &options, "text/csv", "") {
+///     CachedOutput::Miss(slot) => slot,
+///     _ => unreachable!("nothing is cached yet"),
+/// };
+/// slot.offer(b"s,p,o\r\n".to_vec(), std::time::Duration::from_millis(1));
+/// ```
+///
+/// Kept past its snapshot, it doesn't compile:
+///
+/// ```compile_fail
+/// # use nrese_sparql::{CachedOutput, QueryOptions, ResultCache, cached_output};
+/// let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+/// let options = QueryOptions {
+///     result_cache: Some(std::sync::Arc::new(ResultCache::new(1 << 20))),
+///     ..QueryOptions::default()
+/// };
+/// let query = nrese_sparql_syntax::SparqlParser::new()
+///     .parse_query("SELECT * WHERE { ?s ?p ?o }")
+///     .unwrap();
+/// let slot = {
+///     let snapshot = engine.snapshot();
+///     match cached_output(&snapshot, &query, &options, "text/csv", "") {
+///         CachedOutput::Miss(slot) => slot,
+///         _ => unreachable!("nothing is cached yet"),
+///     }
+/// };
+/// slot.offer(b"s,p,o\r\n".to_vec(), std::time::Duration::from_millis(1));
+/// ```
+pub struct OutputSlot<'s> {
     cache: Arc<ResultCache>,
-    key: Key,
+    state: SharedState<'s>,
+    part: Arc<[u8]>,
 }
 
-impl OutputSlot {
+impl OutputSlot<'_> {
     /// The largest answer the cache could keep: a copy of more isn't worth making.
     pub fn limit(&self) -> usize {
         self.cache.capacity / 4
@@ -390,7 +450,8 @@ impl OutputSlot {
         // Not a part computed: no miss (the query's parts counted theirs). No floor: a hit
         // replaces the whole request, whose parsing and key it pays as well.
         let len = bytes.len();
-        self.cache.admit(&self.key, len, cost, Duration::ZERO, || {
+        let key = Key::admitted(self.state, self.part);
+        self.cache.admit(&key, len, cost, Duration::ZERO, || {
             Some(Payload::Output(bytes.into()))
         });
     }
@@ -409,21 +470,28 @@ pub(crate) enum Claim<'c> {
     Bypass,
 }
 
-/// A part this query computes ([`Claim::Compute`]). Dropped without
+/// A part this query computes ([`Claim::Compute`]), for the published snapshot whose token
+/// claimed it: its key is that snapshot's, and it finishes for it alone. Dropped without
 /// [`Computing::finish`], it lets its waiters compute the part themselves.
 pub(crate) struct Computing<'c> {
     cache: &'c ResultCache,
-    key: Key,
+    /// The token it was claimed with: its key is this snapshot's ([`Self::key`]).
+    state: SharedState<'c>,
+    part: Arc<[u8]>,
     flight: Arc<Flight>,
     finished: bool,
 }
 
 impl Computing<'_> {
+    fn key(&self) -> Key {
+        Key::admitted(self.state, Arc::clone(&self.part))
+    }
+
     /// Whether a part of `bytes` that took `cost` to compute is wanted: the cache would
     /// admit it, or a query waits for it.
     pub(crate) fn wants(&self, bytes: usize, cost: Duration) -> bool {
         self.flight.waiters.load(Ordering::Acquire) > 0
-            || self.cache.state().pinned(&self.key.part)
+            || self.cache.state().pinned(&self.part)
             || self.cache.worth(bytes, cost, MIN_COST)
     }
 
@@ -432,14 +500,15 @@ impl Computing<'_> {
     /// other pinned ones.
     pub(crate) fn finish(mut self, part: Option<Part>, cost: Duration) -> Result<(), String> {
         self.finished = true;
+        let key = self.key();
         let part = part.map(Arc::new);
         let stored = match &part {
             Some(part) => self
                 .cache
-                .store(&self.key, Payload::Part(Arc::clone(part)), cost),
+                .store(&key, Payload::Part(Arc::clone(part)), cost),
             None => Ok(()),
         };
-        self.cache.land(&self.key, &self.flight, part);
+        self.cache.land(&key, &self.flight, part);
         stored
     }
 }
@@ -447,7 +516,7 @@ impl Computing<'_> {
 impl Drop for Computing<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.cache.land(&self.key, &self.flight, None);
+            self.cache.land(&self.key(), &self.flight, None);
         }
     }
 }
@@ -497,9 +566,15 @@ impl ResultCache {
             && micros.saturating_mul(COPY_BYTES_PER_MICRO) >= 2 * bytes as u64
     }
 
-    /// Looks `key` up; on a miss, the caller computes it or waits for whoever does.
-    /// `pin` names the query whose whole result `key` is, to pin it.
-    pub(crate) fn claim(&self, key: &Key, pin: Option<&PinRequest>) -> Claim<'_> {
+    /// Looks `part` up on the token's snapshot; on a miss, the caller computes it or waits
+    /// for whoever does. `pin` names the query whose whole result `part` is, to pin it.
+    pub(crate) fn claim<'c>(
+        &'c self,
+        token: SharedState<'c>,
+        part: &Arc<[u8]>,
+        pin: Option<&PinRequest>,
+    ) -> Claim<'c> {
+        let key = &Key::admitted(token, Arc::clone(part));
         let mut state = self.state();
         // A query on a newer revision: what older ones computed is unreachable now.
         state.advance(key.snapshot.revision);
@@ -524,7 +599,8 @@ impl ResultCache {
         let computing = |flight| {
             Claim::Compute(Computing {
                 cache: self,
-                key: key.clone(),
+                state: token,
+                part: Arc::clone(part),
                 flight,
                 finished: false,
             })
@@ -570,30 +646,37 @@ impl ResultCache {
         Some(payload)
     }
 
-    /// A query's whole answer in the format `key` names: the bytes if cached, else a slot
-    /// to offer them to once written ([`crate::query::cached_output`]).
-    pub(crate) fn output(self: &Arc<Self>, key: Key) -> CachedOutput {
-        match self.hit(&mut self.state(), &key) {
+    /// A query's whole answer on the token's snapshot in the format `part` names: the bytes
+    /// if cached, else a slot to offer them to once written ([`crate::query::cached_output`]).
+    pub(crate) fn output<'s>(
+        self: &Arc<Self>,
+        token: SharedState<'s>,
+        part: Arc<[u8]>,
+    ) -> CachedOutput<'s> {
+        match self.hit(&mut self.state(), &Key::admitted(token, Arc::clone(&part))) {
             Some(Payload::Output(bytes)) => CachedOutput::Hit(bytes),
             _ => CachedOutput::Miss(OutputSlot {
                 cache: Arc::clone(self),
-                key,
+                state: token,
+                part,
             }),
         }
     }
 
-    /// Offers a part computed without a claim (a prefix of a basic graph pattern's joins,
-    /// which no other query waits for): `part` is made only if one of `bytes` that took
-    /// `cost` is worth keeping.
+    /// Offers a part computed on the token's snapshot without a claim (a prefix of a basic
+    /// graph pattern's joins, which no other query waits for): `payload` is made only if
+    /// one of `bytes` that took `cost` is worth keeping.
     pub(crate) fn offer(
         &self,
-        key: &Key,
+        token: SharedState<'_>,
+        part: &Arc<[u8]>,
         bytes: usize,
         cost: Duration,
         payload: impl FnOnce() -> Option<Payload>,
     ) {
         self.misses.fetch_add(1, Ordering::Relaxed);
-        self.admit(key, bytes, cost, MIN_COST, payload);
+        let key = Key::admitted(token, Arc::clone(part));
+        self.admit(&key, bytes, cost, MIN_COST, payload);
     }
 
     /// Stores what `payload` makes if one of `bytes` that took `cost` (at least `floor`)
@@ -789,8 +872,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
 
-    fn identity(revision: u64) -> SnapshotIdentity {
-        // Snapshots of one engine at successive revisions.
+    /// A published snapshot at `revision` (one engine's, after that many commits).
+    fn published(revision: u64) -> nrese_engine::Snapshot {
         let engine = nrese_engine::Engine::new(nrese_engine::EngineConfig::default()).unwrap();
         for i in 0..revision {
             let mut tx = engine.transaction();
@@ -802,16 +885,44 @@ mod tests {
             ));
             tx.commit().unwrap();
         }
-        let identity = engine.snapshot().identity();
-        assert_eq!(identity.revision, revision);
-        identity
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.revision(), revision);
+        snapshot
     }
 
-    fn key(snapshot: SnapshotIdentity, part: &str) -> Key {
-        Key {
-            snapshot,
+    /// A part on a published snapshot: what a query admits it with (its snapshot's token) and
+    /// looks it up by ([`Self::key`]).
+    struct Probe {
+        snapshot: nrese_engine::Snapshot,
+        part: Arc<[u8]>,
+    }
+
+    impl Probe {
+        fn key(&self) -> Key {
+            Key {
+                snapshot: self.snapshot.identity(),
+                part: Arc::clone(&self.part),
+            }
+        }
+
+        fn token(&self) -> SharedState<'_> {
+            self.snapshot.shared_state().expect("a published snapshot")
+        }
+    }
+
+    fn key(snapshot: &nrese_engine::Snapshot, part: &str) -> Probe {
+        Probe {
+            snapshot: snapshot.clone(),
             part: part.as_bytes().into(),
         }
+    }
+
+    fn claim<'c>(cache: &'c ResultCache, at: &'c Probe, pin: Option<&PinRequest>) -> Claim<'c> {
+        cache.claim(at.token(), &at.part, pin)
+    }
+
+    fn output<'s>(cache: &Arc<ResultCache>, at: &'s Probe) -> CachedOutput<'s> {
+        cache.output(at.token(), Arc::clone(&at.part))
     }
 
     fn part(rows: usize) -> Part {
@@ -823,8 +934,8 @@ mod tests {
         }
     }
 
-    fn compute(cache: &ResultCache, key: &Key, rows: usize, cost: Duration) -> bool {
-        match cache.claim(key, None) {
+    fn compute(cache: &ResultCache, key: &Probe, rows: usize, cost: Duration) -> bool {
+        match claim(cache, key, None) {
             Claim::Hit(_) => true,
             Claim::Compute(computing) => {
                 computing.finish(Some(part(rows)), cost).unwrap();
@@ -838,65 +949,91 @@ mod tests {
 
     #[test]
     fn parts_are_kept_per_snapshot_within_the_budget() {
-        let one = identity(1);
+        let one = published(1);
         let cache = ResultCache::new(64 << 10);
-        assert!(!compute(&cache, &key(one, "a"), 100, SLOW));
-        assert!(compute(&cache, &key(one, "a"), 100, SLOW), "a hit");
+        assert!(!compute(&cache, &key(&one, "a"), 100, SLOW));
+        assert!(compute(&cache, &key(&one, "a"), 100, SLOW), "a hit");
         // Too cheap to recompute: not kept.
         assert!(!compute(
             &cache,
-            &key(one, "cheap"),
+            &key(&one, "cheap"),
             100,
             Duration::from_micros(5)
         ));
         assert!(!compute(
             &cache,
-            &key(one, "cheap"),
+            &key(&one, "cheap"),
             100,
             Duration::from_micros(5)
         ));
         // Larger than a quarter of the budget: not kept.
-        assert!(!compute(&cache, &key(one, "large"), 3_000, SLOW));
-        assert!(!compute(&cache, &key(one, "large"), 3_000, SLOW));
+        assert!(!compute(&cache, &key(&one, "large"), 3_000, SLOW));
+        assert!(!compute(&cache, &key(&one, "large"), 3_000, SLOW));
         // Many parts: the budget holds, the least beneficial go first.
         for i in 0..100 {
-            compute(&cache, &key(one, &format!("q{i}")), 100, SLOW);
+            compute(&cache, &key(&one, &format!("q{i}")), 100, SLOW);
             assert!(cache.stats().bytes <= 64 << 10);
         }
         assert!(cache.stats().evicted > 0);
         // A newer revision drops the older entries once it stores one.
-        let two = identity(2);
-        assert!(!compute(&cache, &key(two, "a"), 100, SLOW));
+        let two = published(2);
+        assert!(!compute(&cache, &key(&two, "a"), 100, SLOW));
         assert_eq!(cache.stats().entries, 1);
         // A part computed on an outdated snapshot is not kept.
-        assert!(matches!(cache.claim(&key(one, "b"), None), Claim::Bypass));
+        assert!(matches!(
+            claim(&cache, &key(&one, "b"), None),
+            Claim::Bypass
+        ));
+    }
+
+    /// Item 7 of the token design check (F3): a part claimed on a published snapshot and
+    /// finished after a newer revision stored its own is kept for neither: not as the newer
+    /// revision's (its key is its own snapshot's), nor under its old revision.
+    #[test]
+    fn a_part_finished_after_a_newer_revision_is_kept_for_neither() {
+        let (one, two) = (published(1), published(2));
+        let cache = ResultCache::new(1 << 20);
+        let old = key(&one, "part");
+        let Claim::Compute(computing) = claim(&cache, &old, None) else {
+            panic!("a miss")
+        };
+        let new = key(&two, "part");
+        assert!(!compute(&cache, &new, 10, SLOW));
+        computing.finish(Some(part(20)), SLOW).unwrap();
+        assert!(
+            cache.lookup(&old.key()).is_none(),
+            "not kept for revision 1"
+        );
+        assert_eq!(cache.lookup(&new.key()).unwrap().table.len(), 10);
+        assert_eq!(cache.stats().entries, 1);
+        assert!(cache.state().flights.is_empty());
     }
 
     #[test]
     fn a_part_worth_less_than_what_it_would_evict_is_not_admitted() {
-        let one = identity(1);
+        let one = published(1);
         // Room for four parts of 100 rows (1,597 bytes each with the bookkeeping).
         let cache = ResultCache::new(7_000);
         for name in ["a", "b", "c", "d"] {
-            compute(&cache, &key(one, name), 100, Duration::from_millis(50));
+            compute(&cache, &key(&one, name), 100, Duration::from_millis(50));
         }
         let before = cache.stats();
         // As large, much cheaper: it would evict a costlier part.
-        compute(&cache, &key(one, "x"), 100, Duration::from_micros(500));
+        compute(&cache, &key(&one, "x"), 100, Duration::from_micros(500));
         let after = cache.stats();
         assert_eq!(after.rejected, before.rejected + 1);
         assert_eq!(after.entries, before.entries);
         // As large, costlier: admitted, the cheapest goes.
-        compute(&cache, &key(one, "e"), 100, Duration::from_millis(500));
+        compute(&cache, &key(&one, "e"), 100, Duration::from_millis(500));
         assert!(cache.stats().evicted > 0);
-        assert!(compute(&cache, &key(one, "e"), 100, SLOW));
+        assert!(compute(&cache, &key(&one, "e"), 100, SLOW));
     }
 
     #[test]
     fn concurrent_requests_for_a_part_compute_it_once() {
-        let one = identity(1);
+        let one = published(1);
         let cache = ResultCache::new(1 << 20);
-        let key = key(one, "part");
+        let key = key(&one, "part");
         let threads = 8;
         let computed = AtomicUsize::new(0);
         let claimed = std::sync::Barrier::new(threads);
@@ -905,7 +1042,7 @@ mod tests {
                 scope.spawn(|| {
                     // Every thread claims before the part is finished: the one that
                     // computes waits for the others' claims.
-                    let claim = cache.claim(&key, None);
+                    let claim = claim(&cache, &key, None);
                     claimed.wait();
                     match claim {
                         Claim::Compute(computing) => {
@@ -949,11 +1086,11 @@ mod tests {
     /// makes it; `Err` if the watchdog had to stop its wait.
     fn request(
         cache: &ResultCache,
-        key: &Key,
+        key: &Probe,
         pin: Option<&PinRequest>,
         cancel: &AtomicBool,
     ) -> Result<usize, ()> {
-        match cache.claim(key, pin) {
+        match claim(cache, key, pin) {
             Claim::Hit(part) => Ok(part.table.len()),
             Claim::Compute(computing) => {
                 computing.finish(Some(part(10)), SLOW).unwrap();
@@ -983,7 +1120,7 @@ mod tests {
         use std::sync::OnceLock;
         let workers = pool(2);
         let cache = ResultCache::new(1 << 20);
-        let key = key(identity(1), "nested-flight");
+        let key = key(&published(1), "nested-flight");
         let (helper_ready, waiter_entered) = (AtomicBool::new(false), AtomicBool::new(false));
         let (producer, helper, waiter) = (OnceLock::new(), OnceLock::new(), OnceLock::new());
         let (outcome, rescued) = watched(|cancel| {
@@ -1001,7 +1138,7 @@ mod tests {
                 });
                 workers.install(|| {
                     producer.set(std::thread::current().id()).unwrap();
-                    let Claim::Compute(computing) = cache.claim(&key, None) else {
+                    let Claim::Compute(computing) = claim(&cache, &key, None) else {
                         panic!("the first request computes the part");
                     };
                     rayon::join(
@@ -1029,7 +1166,7 @@ mod tests {
         assert_eq!(outcome, Ok(10));
         assert_ne!(producer.get(), helper.get());
         assert_eq!(helper.get(), waiter.get(), "the helper ran the request");
-        assert_eq!(cache.lookup(&key).unwrap().table.len(), 10);
+        assert_eq!(cache.lookup(&key.key()).unwrap().table.len(), 10);
         assert!(cache.state().flights.is_empty());
     }
 
@@ -1039,8 +1176,8 @@ mod tests {
     #[test]
     fn a_kernel_on_one_worker_computes_the_part_its_caller_computes() {
         let cache = ResultCache::new(1 << 20);
-        let key = key(identity(1), "one-worker");
-        let Claim::Compute(computing) = cache.claim(&key, None) else {
+        let key = key(&published(1), "one-worker");
+        let Claim::Compute(computing) = claim(&cache, &key, None) else {
             panic!("a miss")
         };
         let (outcome, rescued) =
@@ -1058,12 +1195,12 @@ mod tests {
     #[test]
     fn requests_in_nested_kernels_progress_and_pin() {
         let cache = ResultCache::new(1 << 20);
-        let key = key(identity(1), "nested-kernels");
+        let key = key(&published(1), "nested-kernels");
         let pin = PinRequest {
             name: "nested".into(),
             query: "SELECT …".into(),
         };
-        let Claim::Compute(computing) = cache.claim(&key, None) else {
+        let Claim::Compute(computing) = claim(&cache, &key, None) else {
             panic!("a miss")
         };
         let ((outcomes, waited), rescued) = watched(|cancel| {
@@ -1074,7 +1211,7 @@ mod tests {
                 while cache
                     .state()
                     .flights
-                    .get(&key)
+                    .get(&key.key())
                     .is_some_and(|flight| flight.waiters.load(Ordering::Acquire) == 0)
                     && !cancel.load(Ordering::SeqCst)
                 {
@@ -1105,15 +1242,15 @@ mod tests {
 
     #[test]
     fn waiters_compute_themselves_when_the_computation_fails() {
-        let one = identity(1);
+        let one = published(1);
         let cache = ResultCache::new(1 << 20);
-        let key = key(one, "part");
-        let Claim::Compute(computing) = cache.claim(&key, None) else {
+        let key = key(&one, "part");
+        let Claim::Compute(computing) = claim(&cache, &key, None) else {
             panic!("a miss")
         };
         let flight = std::thread::scope(|scope| {
             scope
-                .spawn(|| match cache.claim(&key, None) {
+                .spawn(|| match claim(&cache, &key, None) {
                     Claim::Wait(flight) => flight,
                     _ => panic!("computed elsewhere"),
                 })
@@ -1121,70 +1258,70 @@ mod tests {
                 .unwrap()
         });
         // The same thread asking again (an evaluation inside its own) doesn't wait.
-        assert!(matches!(cache.claim(&key, None), Claim::Bypass));
+        assert!(matches!(claim(&cache, &key, None), Claim::Bypass));
         drop(computing);
         assert!(flight.wait(|| false).unwrap().is_none());
-        assert!(matches!(cache.claim(&key, None), Claim::Compute(_)));
+        assert!(matches!(claim(&cache, &key, None), Claim::Compute(_)));
     }
 
     #[test]
     fn an_answers_bytes_are_kept_where_writing_costs_more_than_copying() {
-        let one = identity(1);
+        let one = published(1);
         let cache = Arc::new(ResultCache::new(1 << 20));
         // A part this cheap isn't kept: looking it up costs about as much.
         assert!(!compute(
             &cache,
-            &key(one, "part"),
+            &key(&one, "part"),
             10,
             Duration::from_micros(5)
         ));
         assert!(!compute(
             &cache,
-            &key(one, "part"),
+            &key(&one, "part"),
             10,
             Duration::from_micros(5)
         ));
         // An answer's bytes replace the whole request: kept however cheap.
-        let CachedOutput::Miss(slot) = cache.output(key(one, "answer")) else {
+        let answer = key(&one, "answer");
+        let CachedOutput::Miss(slot) = output(&cache, &answer) else {
             panic!("nothing cached")
         };
         slot.offer(vec![b'x'; 100], Duration::from_micros(5));
         assert!(matches!(
-            cache.output(key(one, "answer")),
+            output(&cache, &answer),
             CachedOutput::Hit(bytes) if bytes.len() == 100
         ));
         // Unless copying them costs as much as writing them did.
-        let CachedOutput::Miss(slot) = cache.output(key(one, "large")) else {
+        let large = key(&one, "large");
+        let CachedOutput::Miss(slot) = output(&cache, &large) else {
             panic!("nothing cached")
         };
         slot.offer(vec![b'x'; 100_000], Duration::from_micros(5));
-        assert!(matches!(
-            cache.output(key(one, "large")),
-            CachedOutput::Miss(_)
-        ));
+        assert!(matches!(output(&cache, &large), CachedOutput::Miss(_)));
         let stats = cache.stats();
         assert_eq!((stats.answers, stats.entries), (1, 1));
     }
 
     #[test]
     fn pinned_results_stay_until_unpinned() {
-        let one = identity(1);
+        let one = published(1);
         let cache = ResultCache::new(8_000);
         let pin = PinRequest {
             name: "big".into(),
             query: "SELECT …".into(),
         };
         // Pinned: kept though cheap.
-        let Claim::Compute(computing) = cache.claim(&key(one, "pinned"), Some(&pin)) else {
+        let pinned = key(&one, "pinned");
+        let Claim::Compute(computing) = claim(&cache, &pinned, Some(&pin)) else {
             panic!("a miss")
         };
         computing
             .finish(Some(part(200)), Duration::from_micros(1))
             .unwrap();
         for i in 0..50 {
-            compute(&cache, &key(one, &format!("q{i}")), 100, SLOW);
+            compute(&cache, &key(&one, &format!("q{i}")), 100, SLOW);
         }
-        assert!(compute(&cache, &key(one, "pinned"), 200, SLOW));
+        assert!(compute(&cache, &key(&one, "pinned"), 200, SLOW));
         let pins = cache.pins();
         assert_eq!(pins.len(), 1);
         assert_eq!((pins[0].revision, pins[0].rows), (Some(1), 200));
@@ -1194,7 +1331,8 @@ mod tests {
             name: "huge".into(),
             query: "SELECT …".into(),
         };
-        let Claim::Compute(computing) = cache.claim(&key(one, "huge"), Some(&huge)) else {
+        let too_large = key(&one, "huge");
+        let Claim::Compute(computing) = claim(&cache, &too_large, Some(&huge)) else {
             panic!("a miss")
         };
         assert!(computing.finish(Some(part(2_000)), SLOW).is_err());

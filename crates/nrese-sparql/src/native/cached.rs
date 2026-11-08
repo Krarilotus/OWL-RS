@@ -40,8 +40,15 @@ pub(super) struct CacheScope {
 
 impl Context<'_> {
     /// The cache scope of this context: `fixed` (the base IRI, the access) and the
-    /// options that decide its results.
-    pub(super) fn cache_scope(&self, cache: Arc<ResultCache>, fixed: Arc<[u8]>) -> Arc<CacheScope> {
+    /// options that decide its results. `None` unless the context's own snapshot is
+    /// published (the lifecycle contract's S3): unpublished state is computed for its
+    /// request and kept nowhere, its parts and answer alike.
+    pub(super) fn cache_scope(
+        &self,
+        cache: Arc<ResultCache>,
+        fixed: Arc<[u8]>,
+    ) -> Option<Arc<CacheScope>> {
+        let state = self.snapshot.shared_state()?;
         let mut encoder = Encoder::default();
         encoder.bytes.extend_from_slice(&fixed);
         encoder.tag(self.model as u8);
@@ -84,19 +91,25 @@ impl Context<'_> {
         if self.search_scope == crate::SearchScope::Reader {
             encoder.tag(b'R');
         }
-        Arc::new(CacheScope {
+        Some(Arc::new(CacheScope {
             cache,
-            snapshot: self.snapshot.identity(),
+            snapshot: state.snapshot().identity(),
             fixed,
             context: encoder.bytes,
-        })
+        }))
     }
 
-    /// The cache scope of a context made from this one (with its own snapshot and
-    /// options).
+    /// The cache scope of a context made from this one (with its own snapshot, whose
+    /// publication decides, and options).
     pub(super) fn child_cache(&self, child: &Context<'_>) -> Option<Arc<CacheScope>> {
         let scope = self.cache.as_ref()?;
-        Some(child.cache_scope(Arc::clone(&scope.cache), Arc::clone(&scope.fixed)))
+        child.cache_scope(Arc::clone(&scope.cache), Arc::clone(&scope.fixed))
+    }
+
+    /// The cache scope with the token of the snapshot it was made for: what an admission
+    /// takes. `None` without a scope (no cache, or unpublished state).
+    fn admission(&self) -> Option<(&CacheScope, nrese_engine::SharedState<'_>)> {
+        Some((self.cache.as_deref()?, self.snapshot.shared_state()?))
     }
 
     /// An encoder holding the start of every key of this context: its options and the
@@ -149,7 +162,7 @@ impl Context<'_> {
         step: Option<usize>,
     ) -> NativeResult<Solutions> {
         let pin = self.pin.borrow_mut().take();
-        let Some(scope) = &self.cache else {
+        let Some((scope, token)) = self.admission() else {
             return self.eval_operator(pattern);
         };
         // Given rows: nothing to save. A basic graph pattern's joins are parts of their
@@ -180,7 +193,7 @@ impl Context<'_> {
                 None => self.eval_operator(pattern),
             };
         }
-        match scope.cache.claim(&key, pin.as_ref()) {
+        match scope.cache.claim(token, &key.part, pin.as_ref()) {
             Claim::Hit(part) => self.solutions_of(&part, &vars, step, "hit"),
             Claim::Wait(flight) => match flight.wait(|| self.cancelled()) {
                 Err(()) => Err(QueryEvaluationError::Cancelled.into()),
@@ -334,20 +347,21 @@ impl Context<'_> {
 /// template, and its pattern as parsed (the answer is the query's, however it is planned);
 /// for a SELECT, the names its answer shows, in order: the pattern numbers its variables
 /// (parts of renamed queries share answers), but these bytes hold the names in their header.
-/// `None` if the query isn't cached (no cache, a volatile query, pre-bound variables).
+/// `None` if the query isn't cached (no cache, a volatile query, pre-bound variables). The
+/// key's snapshot is the token's: these are its part bytes.
 pub(crate) fn output_key(
-    snapshot: &nrese_engine::Snapshot,
+    state: nrese_engine::SharedState<'_>,
     query: &nrese_sparql_syntax::Query,
     options: &crate::QueryOptions,
     format: &str,
     context: &str,
-) -> Option<Key> {
+) -> Option<Arc<[u8]>> {
     use nrese_sparql_syntax::Query;
     if options.pre_bound.is_some() {
         return None;
     }
     let ctx = Context::new(
-        snapshot,
+        state.snapshot(),
         options,
         super::query_dataset(query),
         super::query_base(query),
@@ -411,10 +425,7 @@ pub(crate) fn output_key(
             encoder.text(name.as_str());
         }
     }
-    Some(Key {
-        snapshot: scope.snapshot,
-        part: encoder.bytes.into(),
-    })
+    Some(encoder.bytes.into())
 }
 
 /// A basic graph pattern as [`Context::bgp`] joins it: its triples, their scans and range
@@ -591,7 +602,7 @@ impl Context<'_> {
         solutions: &Solutions,
         cost: std::time::Duration,
     ) {
-        let (Some(scope), Some(keys)) = (&self.cache, self.prefix_keys(joins)) else {
+        let (Some((scope, token)), Some(keys)) = (self.admission(), self.prefix_keys(joins)) else {
             return;
         };
         if length < 2 {
@@ -600,12 +611,16 @@ impl Context<'_> {
         let Some((key, vars)) = keys.key(length) else {
             return;
         };
-        scope
-            .cache
-            .offer(key, solutions.table.memory_bytes(), cost, || {
+        scope.cache.offer(
+            token,
+            &key.part,
+            solutions.table.memory_bytes(),
+            cost,
+            || {
                 let part = self.to_part(solutions, vars)?;
                 Some(crate::cache::Payload::Part(Arc::new(part)))
-            });
+            },
+        );
     }
 }
 
