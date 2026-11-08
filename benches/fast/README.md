@@ -132,6 +132,17 @@ its resolution floors and memory policy, and the measurements they rest on).
    configurations (its `config` in [hosts.toml](../hosts.toml) when each run started, or
    the CPU governor the runs read), are refused (exit 2); `--allow-host-change` compares
    them anyway, flagged as no evidence of a code change.
+   **One input:** a case whose two sides didn't load the same external input files, byte for
+   byte, or don't say which, gets no verdict. What a case loads has one answer,
+   `suitekit/inputs.py` (frozen datasets, converted ORE ontologies, reference taxonomies,
+   concatenations; a kind it doesn't know is external, of unknown bytes), which each record's
+   `inputs` hashes and the comparison requires in full. Such a case is listed as a different
+   or unknown input, and the comparison exits 2 when no case is left. A new release of a
+   dataset (lubm-10 and lubm-100 on 7 Nov 2026) is such a difference, whatever its triples,
+   and so is a concatenation's other order. Suite results follow the same rule over every
+   `/data` file their manifests list or hash: only a manifest that states its inputs'
+   SHA-256 (`dataset_sha256`) establishes them, so until suite runs record it their
+   comparisons are refused.
 1. **Lost work first:** cases, repetitions, series or client widths missing on one side,
    and failed checks, are listed before any time. A known issue (the outcome a case
    declares, such as a memory limit, on both sides) earns no timing verdict: its checked

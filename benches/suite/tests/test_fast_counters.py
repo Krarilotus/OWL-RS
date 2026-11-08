@@ -67,8 +67,9 @@ class FastCounters(unittest.TestCase):
 def report(ms=1.0, status="ok", qps=None):
     records = []
     for rep in range(1, 4):
+        # `inputs`: the frozen files it loaded, as every record says since 7 Nov 2026 (none here).
         records.append({"case": "micro", "rep": rep, "status": status, "metric": ms,
-                        "samples": {"q": [ms] * 4}, "checks": [], "routes": [],
+                        "samples": {"q": [ms] * 4}, "checks": [], "routes": [], "inputs": {},
                         **({"throughput": [{"clients": n, "qps": v} for n, v in qps.items()]}
                            if qps is not None else {})})
     return {"reps": 3, "records": records}
