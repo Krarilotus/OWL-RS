@@ -33,9 +33,12 @@ from . import hosts, ns
 from .answers import Recorder, capped_post
 from .runtime import (ApptainerRuntime, DockerRuntime, DryRuntime, Mount, ProcessRuntime, RootfsRuntime,
                       run_quiet, shell)
+from . import receipts
+from .datasets import Store
 from .manifest import Manifest, image_ids
+from .manifest import git as checkout_state
 from .schema import FIELDS, Result, Writer, problems, read
-from .summary import adjudications
+from .summary import adjudications, summarise
 from .workloads import plans
 
 EXE = ".exe" if os.name == "nt" else ""
@@ -217,6 +220,8 @@ class Suite:
         self.made_volumes: list[str] = []
         self.made_images: list[str] = []
         self.written: list[Result] = []
+        self.hashed: dict[str, str | None] = {}  # /data input -> its SHA-256 (data_hashes)
+        self.hash_s = 0.0
         self.skips: list[str] = []
         self.manifest: Manifest | None = None
         self.answers = (Recorder(self.results, args.answers_reference, adjudications())
@@ -837,12 +842,13 @@ class Suite:
             groups.setdefault(id(entry[0]), []).append(entry)
         for group in groups.values():
             plan = group[0][0]
-            runnable, drivers = [], []
+            runnable, drivers, kits = [], [], []
             for _, key, system, regime in group:
                 if unavailable.get(id(plan)):
                     self.skip(key, plan, unavailable[id(plan)], regime, unsupported=False)
                 elif plan.kind == "kit":
                     self.kit(plan, key)
+                    kits.append(key)
                 elif plan.kind == "driver":
                     drivers.append(key)
                 else:
@@ -855,10 +861,56 @@ class Suite:
                     self.cycle(plan, key, system, regime, run)
                     if self.runtime.workers():
                         return 1
+            # The tier's cells ran their whole protocol: their receipts, now, so that a run
+            # stopped later keeps them (an interrupted tier writes none).
+            self.receipts(plan, [(key, None) for key in kits + drivers]
+                          + [(key, system) for key, system, _ in runnable])
         self.cross_check()
         self.report_skips()
         self.say(f"\nresults: {self.writer.path}")
         return 0
+
+    def receipts(self, plan, cells: list[tuple[str, object]]):
+        """The receipts (receipts.py) of a tier's cells that ran their whole protocol, into the
+        manifest: what each ran, its own rows' outcome."""
+        if not self.manifest or self.args.dry_run or not cells:
+            return
+        entry = self.manifest.entry
+        commit, kit = entry["git"].get("commit") or "", (self.workloads.get(plan.workload) or {}).get("kit", "")
+        ctx = self.context_for_images()
+        out = {}
+        for key, system in cells:
+            paths = receipts.code_paths(self.root, plan, kit, system.definition_paths if system is not None else ())
+            images = sorted({*system.images(ctx), *(i for i, _ in system.builds())}) if system is not None else []
+            rows = [receipts.csv_row(r) for r in self.written
+                    if (r.workload, r.tier, r.system) == (plan.workload, plan.tier, key)]
+            pair = summarise(rows).get((plan.workload, plan.tier, key))
+            build = {}
+            if isinstance(system, Nrese):
+                state = checkout_state(Path(system.source(ctx)))
+                build = {"skipped": True} if self.args.skip_build else {"commit": state["commit"], "dirty": state["dirty"]}
+            out[receipts.cell_key(plan.workload, plan.tier, key)] = {
+                "complete": True, "invocation": entry["started"], "commit": commit, "dirty": entry["git"].get("dirty"),
+                "code": receipts.object_ids(self.root, commit, paths),
+                "images": {i: (entry.get("images") or {}).get(i) for i in images}, "build": build,
+                "settings": dict(entry.get("settings") or {}),
+                "data": self.data_hashes([i for i in plan.inputs_of(key) if i.startswith("/data/")]),
+                "outcome": pair.outcome() if pair else {"outcome": "skipped"}}
+        self.manifest.update(cells=out, data_hash_s=round(self.hash_s, 1))
+
+    def data_hashes(self, inputs: list[str]) -> dict[str, str | None]:
+        """/data input -> the SHA-256 of its bytes here (None: not there), each file hashed once a run:
+        nothing on the suite's path checks them against their pins (`suite.py data verify` is by hand)."""
+        todo = sorted({i for i in inputs if i not in self.hashed})
+        if todo:
+            start = time.monotonic()
+            store = Store(self.data_volume, None if self.data_volume else Path(self.data.source))
+            names = {i: i[len("/data/"):] for i in todo}
+            present = store.sizes(list(names.values()))
+            found = store.hashes([n for n in names.values() if n in present])
+            self.hashed.update({i: found.get(n) for i, n in names.items()})
+            self.hash_s += time.monotonic() - start
+        return {i: self.hashed[i] for i in sorted(set(inputs))}
 
     def cross_check(self):
         """Answer counts per query side by side, within each regime."""

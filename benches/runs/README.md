@@ -64,3 +64,9 @@ the same shape ([2026-10-11-horn-recovery.toml](2026-10-11-horn-recovery.toml) i
 `runs` counts the repetitions that loaded, and `items` gives the queries or tasks that were
 `ok` out of those run. Records from before 3 October 2026 have `commit = "unknown (before
 run manifests)"` unless it was added by hand.
+
+From 8 November 2026 a pair can also carry `answers`, its worst answer verdict in the run's
+answers.json (`wrong` stands against counts that look right; never for a licensed system), and
+`receipt`, what the cell ran once it completed: its own invocation's commit, code, images, build,
+settings, data hashes and outcome (benches/suite/suitekit/receipts.py). A pair without a receipt
+didn't finish in that run, or predates them.

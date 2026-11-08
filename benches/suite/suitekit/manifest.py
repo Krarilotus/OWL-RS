@@ -16,6 +16,8 @@ appends one entry to `invocations`:
 | images | image -> its content id, for every image the run used |
 | datasets | /data path -> size in bytes, for every input the run read |
 | sources | the downloads behind the datasets: URL and the server's Last-Modified (a "latest" dump changes) |
+| cells | `workload/tier/system` -> its receipt, once the cell ran its whole protocol (receipts.py) |
+| data_hash_s | the seconds the receipts' data hashes took |
 | exit | the run's exit code |
 
 Nothing in it is secret: licence paths are recorded as set/unset only.

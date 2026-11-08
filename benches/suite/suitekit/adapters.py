@@ -305,6 +305,9 @@ class Adapter:
     # Whether the system keeps query results for repeated queries; then the suite runs the
     # queries with it off and on (ctx.cache), and `serve` must honour the setting.
     result_cache = False
+    # The repository paths outside benches/suite it reads at run time (its configuration, rules):
+    # part of a cell's receipt (receipts.code_paths).
+    definition_paths: tuple[str, ...] = ()
 
     def __init__(self):
         self.server: Server | None = None
@@ -875,6 +878,7 @@ class Graphdb(Adapter):
     """
 
     key = "graphdb"
+    definition_paths = ("benches/competitors/graphdb",)
     regimes = GRAPHDB_RULESETS
     defaults = {"GRAPHDB_IMAGE": "ontotext/graphdb:11.5.1", "GRAPHDB_EDITION": "free",
                 "GRAPHDB_ENTITY_ID_SIZE": "32", "GRAPHDB_ENTITY_INDEX_SIZE": "10000000",
@@ -1141,6 +1145,7 @@ class Nemo(ClosureAdapter):
     a run always uses the committed file, and its SHA-256 goes into the step's note."""
 
     key = "nemo"
+    definition_paths = ("benches/reasoning/nemo",)
     regimes = {"owl2-rl": "owl2-rl"}
     rules = "owl2rl.rls"
 

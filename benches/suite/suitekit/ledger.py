@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import tomllib
 from pathlib import Path
 
@@ -50,7 +51,10 @@ def toml_value(value) -> str:
             return "[" + ", ".join(toml_value(v) for v in value) + "]"
         return "[\n" + "".join(f"  {toml_value(v)},\n" for v in value) + "]"
     if isinstance(value, dict):
-        return "{ " + ", ".join(f"{k} = {toml_value(v)}" for k, v in value.items()) + " }"
+        # A key that isn't bare (a receipt's repository path, /data input or image) is quoted; TOML
+        # has no null, so a value not known (None) is left out: absent, never the string "None".
+        return "{ " + ", ".join(f"{k if re.fullmatch(r'[A-Za-z0-9_-]+', k) else json.dumps(k)} = {toml_value(v)}"
+                                for k, v in value.items() if v is not None) + " }"
     return json.dumps(str(value), ensure_ascii=False)
 
 
@@ -101,6 +105,22 @@ def run_directories(directory: Path) -> list[Path]:
     return sorted(d for d in directory.iterdir() if (d / "results.csv").exists())
 
 
+def answer_verdicts(runs: list[Path]) -> dict[tuple, str]:
+    """(workload, tier, system) -> its worst answer verdict (answers.PRECEDENCE) in the runs'
+    answers.json: a recorded `wrong` stands against rows that count right."""
+    from .answers import PRECEDENCE
+    worst: dict[tuple, str] = {}
+    for run in runs:
+        path = run / "answers.json"
+        if not path.exists():
+            continue
+        for v in json.loads(path.read_text(encoding="utf-8")).get("verdicts", []):
+            key = (v["workload"], str(v["tier"]), v["system"])
+            if key not in worst or PRECEDENCE.index(v["verdict"]) < PRECEDENCE.index(worst[key]):
+                worst[key] = v["verdict"]
+    return worst
+
+
 def from_results(directory: Path, root: Path) -> dict:
     runs = run_directories(directory)
     rows, invocations = [], []
@@ -140,9 +160,20 @@ def from_results(directory: Path, root: Path) -> dict:
         record["started"] = rows[0]["date"]
         record["host"] = rows[0]["host"]
         record["commit"] = "unknown (before run manifests)"
+    # Each cell's receipt (receipts.py), its newest invocation's: what it ran and its own outcome,
+    # never the directory's commit or outcome (several invocations, several commits).
+    receipts: dict[str, dict] = {}
+    for invocation in invocations:
+        receipts.update(invocation.get("cells") or {})
+    verdicts = answer_verdicts(runs)
     pairs = []
     for (workload, tier, system), pair in sorted(summarise(rows).items()):
-        pairs.append({"workload": workload, "tier": tier, "system": system} | pair.outcome())
+        entry = {"workload": workload, "tier": tier, "system": system} | pair.outcome()
+        if entry["outcome"] != "restricted" and (worst := verdicts.get((workload, tier, system))):
+            entry["answers"] = worst  # a licensed system's verdict is a result: it stays local
+        if (receipt := receipts.get(f"{workload}/{tier}/{system}")) is not None:
+            entry["receipt"] = receipt
+        pairs.append(entry)
     record["pairs"] = pairs
     restricted = any(p["outcome"] == "restricted" for p in pairs)
     record["publishable"] = "free systems only" if restricted else "all"
