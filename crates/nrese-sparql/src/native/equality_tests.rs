@@ -385,20 +385,11 @@ fn views_of_unpublished_state_keep_no_classes() {
     assert_eq!(agreed(&published, &closed(), "published, after"), ORDINARY);
 }
 
-/// Review §5 item 3, 3.4's share: one version read in each interpretation, and a restriction
-/// against its source, warmed in both orders.
-///
-/// - Input: compact equality (facts over each class's smallest id, `b sameAs a` inferred)
-///   read with equality (the classes) and stored (a scan of `sameAs`), and with canonical
-///   answers; ordinary closed data and its restriction hiding every inferred statement, in
-///   which `a` and `b` are two identities.
-/// - Expected: in every order each is answered as written: the restriction `k1` and `k2` 1
-///   each (another identity's map would join `b`'s value to `k1`), its source as
-///   [`ORDINARY`].
-#[test]
-fn interpretations_and_restrictions_answer_in_either_order() {
-    let compact = Engine::new(config()).unwrap();
-    let mut tx = compact.transaction();
+/// Compact equality: facts over each class's smallest id, `b sameAs a` inferred. Answers
+/// expanded: `k1` and `k2` 2 each, `k3` 1.
+fn compact() -> Engine {
+    let engine = Engine::new(config()).unwrap();
+    let mut tx = engine.transaction();
     let i = Ids::interned(&tx, SAME_AS);
     for (s, p, o) in [
         (i.k1, i.p0, i.a),
@@ -412,8 +403,22 @@ fn interpretations_and_restrictions_answer_in_either_order() {
     }
     assert!(tx.insert_inferred(EncodedTriple::new(i.b, i.link, i.a)));
     tx.commit().unwrap();
-    compact.set_equality(Some(i.link));
-    let snapshot = compact.snapshot();
+    engine.set_equality(Some(i.link));
+    engine
+}
+
+/// Review §5 item 3, 3.4's share: one version read in each interpretation, each first on a
+/// version of its own, and a restriction against its source, warmed in both orders.
+///
+/// - Input: [`compact`] read with equality (the classes), stored (a scan of `sameAs`) and with
+///   canonical answers, each read first on a fresh engine's version, then the others; ordinary
+///   closed data and its restriction hiding every inferred statement, in which `a` and `b` are
+///   two identities.
+/// - Expected: in every order each is answered as written: the restriction `k1` and `k2` 1
+///   each (another identity's map would join `b`'s value to `k1`), its source as
+///   [`ORDINARY`].
+#[test]
+fn interpretations_and_restrictions_answer_in_either_order() {
     let plain = closed();
     let canonical = QueryOptions {
         equality_canonical: true,
@@ -424,15 +429,15 @@ fn interpretations_and_restrictions_answer_in_either_order() {
         "<http://example.com/k2> 2",
         "<http://example.com/k3> 1",
     ];
-    for reversed in [false, true] {
+    for first in 0..3 {
+        let engine = compact();
+        let snapshot = engine.snapshot();
         let mut reads: Vec<(&str, Snapshot, &QueryOptions)> = vec![
             ("compact, equality", snapshot.clone(), &plain),
             ("compact, stored", snapshot.stored(), &plain),
             ("compact, canonical", snapshot.clone(), &canonical),
         ];
-        if reversed {
-            reads.reverse();
-        }
+        reads.rotate_left(first);
         for (what, view, options) in &reads {
             let got = agreed(view, options, what);
             if *what == "compact, equality" {
