@@ -151,10 +151,17 @@ fn place(line: &str) -> Option<(u64, u64, String)> {
 ///   it: a mount made at that path afterwards would have had the upper one as its parent), or
 /// - its parent is covered and it isn't the mount stacked on that parent.
 ///
-/// A line that can't be read covers nothing: then a cgroup mount counts, and a wrong choice
+/// A namespace's root is its own parent (proc_pid_mountinfo(5); an initramfs lists its
+/// rootfs so) and covers nothing: it is neither stacked on itself nor a sibling of what it
+/// holds (sol-loop r5 S3). A line that can't be read covers nothing: then a cgroup mount counts, and a wrong choice
 /// reads files that aren't there, which is Unknown, never a limit too high.
 fn covered(index: usize, places: &[Option<(u64, u64, String)>]) -> bool {
-    let mounts: Vec<&(u64, u64, String)> = places.iter().flatten().collect();
+    // Every mount that can cover another: a self-parented root can't.
+    let mounts: Vec<&(u64, u64, String)> = places
+        .iter()
+        .flatten()
+        .filter(|(id, parent, _)| id != parent)
+        .collect();
     let Some(this) = &places[index] else {
         return false;
     };
