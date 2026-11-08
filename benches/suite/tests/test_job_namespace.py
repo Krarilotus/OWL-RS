@@ -223,12 +223,29 @@ class JobNamespaces(unittest.TestCase):
             self.assertIn("not removed: nrese-target-work", done.stdout)
 
     def test_python_and_shell_name_alike(self):
+        # Master r3 B1: shell launch labels and Python labels share exact fleet ownership.
         with tempfile.TemporaryDirectory() as tmp:
             for job in ("", "Consol-SCC@office"):
-                done = subprocess.run([BASH, "-c", f'. "{(ROOT / "scripts/lib/ns.sh").as_posix()}"; ns_name target "$1"',
+                done = subprocess.run([BASH, "-c", f'. "{(ROOT / "scripts/lib/ns.sh").as_posix()}"; ns_name target "$1"; '
+                                       'printf "\\n"; ns_run_args case "$1" suite; printf "%s\\n" "${NS_ARGS[@]}"',
                                        "-", Path(tmp).as_posix()], env={**os.environ, "FLEET_JOB": job},
                                       capture_output=True, text=True)
-                self.assertEqual(done.stdout, ns.name("target", tmp, {"FLEET_JOB": job}))
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertEqual(done.stdout.splitlines()[0], ns.name("target", tmp, {"FLEET_JOB": job}))
+                self.assertEqual(done.stdout.splitlines()[1:], ns.name_args("case", tmp, "suite", {"FLEET_JOB": job}))
+
+    def test_runtime_launch_carries_exact_fleet_ownership_only_in_a_job(self):
+        """Master r3 B1: real Docker launch argv is owned by FLEET_JOB, absent outside fleet."""
+        from suitekit.runtime import DockerRuntime, Spec
+        with tempfile.TemporaryDirectory() as tmp:
+            for job in ("", "Consol-SCC@office"):
+                with self.subTest(job=job), patch.dict(os.environ, {"FLEET_JOB": job} if job else {}, clear=True), \
+                        patch("suitekit.runtime.subprocess.run") as launch, \
+                        patch.object(DockerRuntime, "names", return_value=[]), patch.object(DockerRuntime, "sample"):
+                    DockerRuntime(Path(tmp), 0).start(Spec("case", "sha256:fixture", ["true"]), None)
+                argv = launch.call_args.args[0]
+                self.assertEqual([argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--label" and
+                                  argv[i + 1].startswith("fleet.job=")], [f"fleet.job={job}"] if job else [])
 
 
 @unittest.skipUnless(BASH, "needs bash")
