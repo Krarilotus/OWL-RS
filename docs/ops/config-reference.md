@@ -280,6 +280,9 @@ Read replicas ([replication.md](replication.md)); both sides need an on-disk sto
 - file key `replication.token`, env `NRESE_REPLICATION_TOKEN`: the bearer token a replica presents to its primary (an administrator's); a secret, never printed
 - file key `replication.poll`, env `NRESE_REPLICATION_POLL_MS`: how long a replica waits before asking again once caught up (default `500ms`)
 - file key `replication.batch_bytes`, env `NRESE_REPLICATION_BATCH_BYTES`: about how much log a replica asks for at once (default `8MiB`)
+- file key `replication.round_timeout`, env `NRESE_REPLICATION_ROUND_TIMEOUT_MS`: the longest one round of following the primary's log may take, its answer whole (default `5min`; `0` or `unlimited`: no total limit)
+- file key `replication.image_timeout`, env `NRESE_REPLICATION_IMAGE_TIMEOUT_MS`: the longest a replica waits for its primary to prepare an image (the primary writes and checks it before its answer begins; default `1h`; `0` or `unlimited`: no limit)
+- fixed limits on every exchange with the primary: a log answer must begin within 30 s, and every answer's body may pause at most 30 s between pieces (an image streams as long as it keeps coming, however large); a round past a limit is an error, retried with a growing pause and shown in the status
 
 ## Federation (`SERVICE`)
 

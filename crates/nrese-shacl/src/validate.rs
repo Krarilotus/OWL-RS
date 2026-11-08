@@ -3,9 +3,11 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::OnceLock;
+use std::ops::ControlFlow;
+use std::sync::{Arc, OnceLock};
 
 use nrese_engine::{TermId, TermKind};
+use nrese_exec::Reservation;
 use nrese_rdf::Term;
 use nrese_sparql::value::{Value, compare, lang_matches};
 use nrese_sparql::{QueryEvaluationError, ReadView, Resources};
@@ -36,18 +38,85 @@ pub(crate) struct RawResult {
     pub(crate) messages: Option<Vec<TermId>>,
 }
 
+impl RawResult {
+    /// What keeping this result can hold, at most: its slot in the vector of its focus node
+    /// and in the collected one (each up to twice its items while it grows), and its heap.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        4 * std::mem::size_of::<Self>()
+            + self.path.as_ref().map_or(0, path_bytes)
+            + self.messages.as_ref().map_or(0, |messages| {
+                messages.capacity() * std::mem::size_of::<TermId>()
+            })
+    }
+}
+
+/// The heap a path holds.
+fn path_bytes(path: &Path) -> usize {
+    match path {
+        Path::Predicate(_) => 0,
+        Path::Inverse(inner)
+        | Path::ZeroOrMore(inner)
+        | Path::OneOrMore(inner)
+        | Path::ZeroOrOne(inner) => std::mem::size_of::<Path>() + path_bytes(inner),
+        Path::Sequence(parts) | Path::Alternative(parts) => {
+            parts.capacity() * std::mem::size_of::<Path>()
+                + parts.iter().map(path_bytes).sum::<usize>()
+        }
+    }
+}
+
+/// A validation's failures with their charge, which goes where they go: the report takes
+/// both, nothing is charged twice. The fields drop in this order: the strings are freed,
+/// then their charge returned.
+pub(crate) struct Failures {
+    pub(crate) list: Vec<String>,
+    pub(crate) held: Reservation,
+}
+
+/// What a validation keeps ([`Validator::into_failures`]): its results, its failures with
+/// their charge, and the results' charge (free the results, then drop it).
+pub(crate) type Kept = (Vec<RawResult>, Failures, Reservation);
+
 /// Validates the data in `data` against every targeted shape: the results, and the
-/// failures (SPARQL-based constraints that couldn't be evaluated). Focus nodes are
-/// validated in parallel; the results keep the sequential order. A stop of `resources` is
-/// the outcome instead ([`Validator::into_failures`]).
+/// failures (SPARQL-based constraints that couldn't be evaluated), with their charge to
+/// `resources`' envelope. Focus nodes are validated in parallel; the results keep the
+/// sequential order. A stop of `resources` is the outcome instead
+/// ([`Validator::into_failures`]).
 pub(crate) fn validate_raw<V: ReadView + Sync>(
     view: &V,
     shapes: &Shapes,
     data: Selection,
     resources: &Resources,
-) -> Result<(Vec<RawResult>, Vec<String>), QueryEvaluationError> {
+) -> Result<Kept, QueryEvaluationError> {
     resources.check()?;
     let validator = Validator::new(view, shapes, data, resources);
+    let results = validate_every_focus(&validator, shapes);
+    let (failures, held) = validator.into_failures()?;
+    Ok((results, failures, held))
+}
+
+/// [`validate_raw`]'s results alone, with their charge, for a validation whose failures are
+/// thrown away (the state before a change, compared with the state after): its failures
+/// are neither kept nor charged, so they can't refuse it.
+pub(crate) fn validate_raw_results<V: ReadView + Sync>(
+    view: &V,
+    shapes: &Shapes,
+    data: Selection,
+    resources: &Resources,
+) -> Result<(Vec<RawResult>, Reservation), QueryEvaluationError> {
+    resources.check()?;
+    let validator = Validator::discarding_failures(view, shapes, data, resources);
+    let results = validate_every_focus(&validator, shapes);
+    let (_, held) = validator.into_failures()?;
+    Ok((results, held))
+}
+
+/// Every targeted shape against each of its focus nodes; after a stop, nothing (freed
+/// before the validator's charge goes).
+fn validate_every_focus<V: ReadView + Sync>(
+    validator: &Validator<'_, V>,
+    shapes: &Shapes,
+) -> Vec<RawResult> {
     let work: Vec<(ShapeRef, TermId)> = shapes
         .targeted()
         .flat_map(|shape| {
@@ -58,43 +127,112 @@ pub(crate) fn validate_raw<V: ReadView + Sync>(
         })
         .collect();
     let results = validator.validate_all(&work);
-    let failures = validator.into_failures()?;
-    Ok((results, failures))
+    if validator.has_stopped() {
+        return Vec::new();
+    }
+    results
+}
+
+/// Charges `bytes` to `held`, or records the refusal as the validation's stop.
+fn charge_to(
+    held: &std::sync::Mutex<Reservation>,
+    stop: &OnceLock<QueryEvaluationError>,
+    bytes: usize,
+) -> bool {
+    let charged = held
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .charge(bytes);
+    match charged {
+        Ok(()) => true,
+        Err(refused) => {
+            let _ = stop.set(QueryEvaluationError::MemoryLimit(refused));
+            false
+        }
+    }
 }
 
 /// Whether validating `data` against `shapes` checks anything: an active targeted shape
-/// with at least one focus node and at least one constraint, its own or reached through
-/// nested shapes. A conforming report with nothing applicable is a vacuous pass.
+/// that can fail ([`can_fail`]) and has at least one focus node. A conforming report with
+/// nothing applicable is a vacuous pass.
 pub(crate) fn applicable<V: ReadView + Sync>(view: &V, shapes: &Shapes, data: Selection) -> bool {
     // Only targets are read: no constraint runs, so nothing that resources stop.
     let resources = Resources::default();
-    let validator = Validator::new(view, shapes, data, &resources);
-    shapes.targeted().any(|shape| {
-        constrained(shapes, shape, &mut Vec::new())
-            && !validator.focus_nodes(&shapes.shapes[shape]).is_empty()
-    })
+    let validator = Validator::discarding_failures(view, shapes, data, &resources);
+    let fails = can_fail(shapes);
+    shapes
+        .targeted()
+        .any(|shape| fails[shape] && !validator.focus_nodes(&shapes.shapes[shape]).is_empty())
 }
 
-/// Whether `shape` is active and constrains something, directly or through the shapes
-/// its constraints name. `seen` stops cycles.
-fn constrained(shapes: &Shapes, shape: ShapeRef, seen: &mut Vec<ShapeRef>) -> bool {
-    if seen.contains(&shape) || shapes.shapes[shape].deactivated {
-        return false;
-    }
-    seen.push(shape);
-    shapes.shapes[shape]
-        .constraints
-        .iter()
-        .any(|constraint| match constraint {
-            Constraint::Not(nested) | Constraint::Node(nested) | Constraint::Property(nested) => {
-                constrained(shapes, *nested, seen)
+/// Which shapes can produce a result for some node: an active shape with a constraint that
+/// can fail. A shape that can't is satisfied by every node (an empty or deactivated shape
+/// conforms), which decides the logical components: `sh:not` of any shape can fail (a node
+/// that conforms fails it), `sh:or` only if every member can, `sh:xone` of one member as
+/// that member.
+///
+/// The least fixpoint over the shapes: every shape starts as one that can't fail, and a
+/// shape is checked again when one it names turns out to fail. The rules only ever turn a
+/// shape to "can fail", so each turns at most once; a shape reached again through itself
+/// counts as conforming meanwhile, as validation takes a node being validated against a
+/// shape to conform. The answer doesn't depend on the order shapes are visited in.
+fn can_fail(shapes: &Shapes) -> Vec<bool> {
+    let count = shapes.shapes.len();
+    // The shapes that name each shape in a constraint whose answer depends on it.
+    let mut named_by: Vec<Vec<ShapeRef>> = vec![Vec::new(); count];
+    for (shape, compiled) in shapes.shapes.iter().enumerate() {
+        for constraint in &compiled.constraints {
+            let nested: &[ShapeRef] = match constraint {
+                Constraint::Node(nested) | Constraint::Property(nested) => {
+                    std::slice::from_ref(nested)
+                }
+                Constraint::Logical(_, nested) => nested,
+                _ => &[],
+            };
+            for &nested in nested {
+                named_by[nested].push(shape);
             }
-            Constraint::Qualified { shape: nested, .. } => constrained(shapes, *nested, seen),
-            Constraint::Logical(_, nested) => nested
-                .iter()
-                .any(|nested| constrained(shapes, *nested, seen)),
+        }
+    }
+    let mut fails = vec![false; count];
+    let mut work: Vec<ShapeRef> = (0..count).collect();
+    while let Some(shape) = work.pop() {
+        let compiled = &shapes.shapes[shape];
+        if fails[shape] || compiled.deactivated {
+            continue;
+        }
+        if compiled
+            .constraints
+            .iter()
+            .any(|constraint| constraint_can_fail(constraint, &fails))
+        {
+            fails[shape] = true;
+            work.extend_from_slice(&named_by[shape]);
+        }
+    }
+    fails
+}
+
+/// Whether `constraint` can fail, given which shapes can (`fails`).
+fn constraint_can_fail(constraint: &Constraint, fails: &[bool]) -> bool {
+    match constraint {
+        // A node that conforms to the nested shape fails `sh:not`; one always does.
+        Constraint::Not(_) => true,
+        Constraint::Node(nested) | Constraint::Property(nested) => fails[*nested],
+        Constraint::Logical(Logical::And, nested) => nested.iter().any(|&nested| fails[nested]),
+        // Fails where no member conforms: never if one always does (`sh:or ()`: always).
+        Constraint::Logical(Logical::Or, nested) => nested.iter().all(|&nested| fails[nested]),
+        // Fails unless exactly one member conforms: never only for one member that always
+        // does.
+        Constraint::Logical(Logical::Xone, nested) => match nested.as_slice() {
+            [only] => fails[*only],
             _ => true,
-        })
+        },
+        // A count of conforming values: below a positive minimum (no values) or above a
+        // maximum (every value conforming) whatever the nested shape.
+        Constraint::Qualified { min, max, .. } => min.is_some_and(|min| min > 0) || max.is_some(),
+        _ => true,
+    }
 }
 
 pub(crate) struct Validator<'a, V: ReadView> {
@@ -107,6 +245,15 @@ pub(crate) struct Validator<'a, V: ReadView> {
     /// outcome, whatever the work returned.
     stop: OnceLock<QueryEvaluationError>,
     failures: std::sync::Mutex<Vec<String>>,
+    /// The charge, to the request's envelope, for the failures kept: made before each is
+    /// kept; it goes with them ([`Failures`]). Declared after them: freed, then returned.
+    held_failures: std::sync::Mutex<Reservation>,
+    /// The charge for the results kept: made before each is kept, held until they are
+    /// dropped ([`Validator::keep`]).
+    held_results: std::sync::Mutex<Reservation>,
+    /// Whether failures are kept: not where they are thrown away ([`validate_raw_results`]),
+    /// so they are neither made nor charged there.
+    keep_failures: bool,
     rdf_type: Option<TermId>,
     /// Each class the shapes name, with its subclasses (itself included).
     classes: HashMap<TermId, BTreeSet<TermId>>,
@@ -129,6 +276,26 @@ impl<'a, V: ReadView> Validator<'a, V> {
         data: Selection,
         resources: &'a Resources,
     ) -> Self {
+        Self::build(view, shapes, data, resources, true)
+    }
+
+    /// A validator whose failures are thrown away: none is made or charged.
+    pub(crate) fn discarding_failures(
+        view: &'a V,
+        shapes: &'a Shapes,
+        data: Selection,
+        resources: &'a Resources,
+    ) -> Self {
+        Self::build(view, shapes, data, resources, false)
+    }
+
+    fn build(
+        view: &'a V,
+        shapes: &'a Shapes,
+        data: Selection,
+        resources: &'a Resources,
+        keep_failures: bool,
+    ) -> Self {
         let graph = GraphView::new(view, data);
         let mut validator = Self {
             rdf_type: graph.iri(RDF_TYPE),
@@ -137,6 +304,13 @@ impl<'a, V: ReadView> Validator<'a, V> {
             resources,
             stop: OnceLock::new(),
             failures: std::sync::Mutex::default(),
+            held_failures: std::sync::Mutex::new(Reservation::new(Arc::new(
+                resources.memory.part(),
+            ))),
+            held_results: std::sync::Mutex::new(Reservation::new(Arc::new(
+                resources.memory.part(),
+            ))),
+            keep_failures,
             classes: HashMap::new(),
         };
         let sub_class_of = graph.iri(RDFS_SUB_CLASS_OF);
@@ -159,19 +333,80 @@ impl<'a, V: ReadView> Validator<'a, V> {
                     .or_insert_with(|| subclasses(&graph, sub_class_of, class));
             }
         }
+        // The shapes graph's `sh:entailment` values are failures of every validation (SHACL
+        // §1.5: no entailment regime is supported), the first ones, charged as the others are.
+        if validator.keep_failures {
+            for &regime in &shapes.entailments {
+                let regime = graph
+                    .decode(regime)
+                    .map_or_else(String::new, |term| term.to_string());
+                let failure = format!(
+                    "the shapes graph asks for the entailment regime {regime} (sh:entailment), \
+                     which this processor doesn't support"
+                );
+                if charge_to(
+                    &validator.held_failures,
+                    &validator.stop,
+                    2 * std::mem::size_of::<String>() + failure.len(),
+                ) {
+                    validator
+                        .failures
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(failure);
+                }
+            }
+        }
         validator
     }
 
-    /// The failures recorded while validating, or the stop that ended it: then no result
-    /// it produced may be used.
-    pub(crate) fn into_failures(self) -> Result<Vec<String>, QueryEvaluationError> {
+    /// The failures recorded while validating, with their charge, and the charge for the
+    /// results kept; or the stop that ended it: then no result it produced may be used (drop
+    /// them first: [`Validator::has_stopped`]).
+    pub(crate) fn into_failures(self) -> Result<(Failures, Reservation), QueryEvaluationError> {
         if let Some(stop) = self.stop.into_inner() {
             return Err(stop);
         }
-        Ok(self
+        let list = self
             .failures
             .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let held = self
+            .held_failures
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let results = self
+            .held_results
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok((Failures { list, held }, results))
+    }
+
+    /// Whether a stop was met: the results made are then dropped before the validator (and
+    /// with it their charge) goes.
+    pub(crate) fn has_stopped(&self) -> bool {
+        self.stop.get().is_some()
+    }
+
+    /// Charges `bytes` for a result to the request's envelope, or records its refusal as
+    /// the stop.
+    fn charge(&self, bytes: usize) -> bool {
+        charge_to(&self.held_results, &self.stop, bytes)
+    }
+
+    /// Returns `bytes` charged for results that have been dropped.
+    pub(crate) fn release(&self, bytes: usize) {
+        self.held_results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .release(bytes);
+    }
+
+    /// Keeps `result` in `results`, charged first; a refusal is the validation's stop.
+    fn keep(&self, results: &mut Vec<RawResult>, result: RawResult) {
+        if self.charge(result.retained_bytes()) {
+            results.push(result);
+        }
     }
 
     /// Whether the validation has stopped: a stop was met, or the cancellation fires now
@@ -245,7 +480,12 @@ impl<'a, V: ReadView> Validator<'a, V> {
     fn conforms(&self, shape: ShapeRef, node: TermId, stack: &mut Stack) -> bool {
         let mut results = Vec::new();
         self.validate_node(shape, node, &mut results, stack);
-        results.is_empty()
+        let conforms = results.is_empty();
+        // Only their existence counts: they are dropped, then their charge returned.
+        let charged: usize = results.iter().map(RawResult::retained_bytes).sum();
+        drop(results);
+        self.release(charged);
+        conforms
     }
 
     pub(crate) fn validate_node(
@@ -343,7 +583,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
         let mut each = |component: Component, ok: &mut dyn FnMut(TermId) -> bool| {
             for &value in values {
                 if !ok(value) {
-                    results.push(result(component, Some(value)));
+                    self.keep(results, result(component, Some(value)));
                 }
             }
         };
@@ -368,12 +608,12 @@ impl<'a, V: ReadView> Validator<'a, V> {
             }),
             Constraint::MinCount(min) => {
                 if (values.len() as u64) < *min {
-                    results.push(result(Component::MinCount, None));
+                    self.keep(results, result(Component::MinCount, None));
                 }
             }
             Constraint::MaxCount(max) => {
                 if values.len() as u64 > *max {
-                    results.push(result(Component::MaxCount, None));
+                    self.keep(results, result(Component::MaxCount, None));
                 }
             }
             Constraint::Range(bound, limit) => {
@@ -418,7 +658,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                     }
                 }
                 for _ in tags.values().filter(|&&count| count > 1) {
-                    results.push(result(Component::UniqueLang, None));
+                    self.keep(results, result(Component::UniqueLang, None));
                 }
             }
             Constraint::Equals(property) => {
@@ -426,7 +666,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 each(Component::Equals, &mut |v| other.binary_search(&v).is_ok());
                 for &value in &other {
                     if !values.contains(&value) {
-                        results.push(result(Component::Equals, Some(value)));
+                        self.keep(results, result(Component::Equals, Some(value)));
                     }
                 }
             }
@@ -459,7 +699,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                         let ok = matches!(order, Some(Ordering::Less))
                             || (!strict && matches!(order, Some(Ordering::Equal)));
                         if !ok {
-                            results.push(result(component, Some(value)));
+                            self.keep(results, result(component, Some(value)));
                         }
                     }
                 }
@@ -509,32 +749,35 @@ impl<'a, V: ReadView> Validator<'a, V> {
                     })
                     .count() as u64;
                 if min.is_some_and(|min| count < min) {
-                    results.push(result(Component::QualifiedMinCount, None));
+                    self.keep(results, result(Component::QualifiedMinCount, None));
                 }
                 if max.is_some_and(|max| count > max) {
-                    results.push(result(Component::QualifiedMaxCount, None));
+                    self.keep(results, result(Component::QualifiedMaxCount, None));
                 }
             }
             Constraint::Closed(allowed) => {
                 for &value in values {
                     for (predicate, object) in self.graph.edges(value) {
                         if !allowed.contains(&predicate) {
-                            results.push(RawResult {
-                                focus,
-                                path: Some(Path::Predicate(predicate)),
-                                value: Some(object),
-                                shape: shape_ref,
-                                component: Component::Closed,
-                                source: None,
-                                messages: None,
-                            });
+                            self.keep(
+                                results,
+                                RawResult {
+                                    focus,
+                                    path: Some(Path::Predicate(predicate)),
+                                    value: Some(object),
+                                    shape: shape_ref,
+                                    component: Component::Closed,
+                                    source: None,
+                                    messages: None,
+                                },
+                            );
                         }
                     }
                 }
             }
             Constraint::HasValue(expected) => {
                 if !values.contains(expected) {
-                    results.push(result(Component::HasValue, None));
+                    self.keep(results, result(Component::HasValue, None));
                 }
             }
             Constraint::In(allowed) => each(Component::In, &mut |v| allowed.contains(&v)),
@@ -564,55 +807,100 @@ impl<'a, V: ReadView> Validator<'a, V> {
             messages: (!check.messages.is_empty()).then(|| check.messages.clone()),
         };
         let failure = |problem: &str| {
+            // Where failures are thrown away, none is made.
+            if !self.keep_failures {
+                return;
+            }
             let at = self
                 .graph
                 .decode(focus)
                 .map_or_else(String::new, |term| term.to_string());
-            self.failures
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(format!("a SPARQL constraint at focus node {at}: {problem}"));
+            let failure = format!("a SPARQL constraint at focus node {at}: {problem}");
+            // Charged first (twice its slot, for the vector's growth), to the failures' own
+            // charge, which the report takes over with them.
+            if charge_to(
+                &self.held_failures,
+                &self.stop,
+                2 * std::mem::size_of::<String>() + failure.len(),
+            ) {
+                self.failures
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(failure);
+            }
         };
-        let outcome = sparql::run(
-            view,
-            data,
-            check,
-            focus,
-            values,
-            shape.node,
-            self.shapes.graph,
-            self.resources,
-        );
-        match outcome {
-            Err(sparql::Problem::Stopped(stop)) => {
-                let _ = self.stop.set(stop);
+        // Each combination of the parameters' values is a constraint of its own (SHACL §6.2),
+        // run in turn: a stop between them ends the walk.
+        check.each_combination(|parameters| {
+            if self.stopped() {
+                return ControlFlow::Break(());
             }
-            Err(sparql::Problem::Failed(error)) => failure(&error),
-            Ok(sparql::Outcome::Failed(failed)) => {
-                for value in failed {
-                    results.push(raw(Some(value), shape.path.clone()));
+            let outcome = sparql::run(
+                view,
+                data,
+                check,
+                parameters,
+                focus,
+                values,
+                shape.node,
+                self.shapes.graph,
+                self.resources,
+            );
+            match outcome {
+                Err(sparql::Problem::Stopped(stop)) => {
+                    let _ = self.stop.set(stop);
+                    return ControlFlow::Break(());
                 }
-            }
-            Ok(sparql::Outcome::Solutions(found)) => {
-                for solution in found {
-                    if solution.failure {
-                        failure("the query reported ?failure");
-                        continue;
+                Err(sparql::Problem::Failed(error)) => failure(&error),
+                Ok(sparql::Outcome::Failed(failed)) => {
+                    for value in failed {
+                        self.keep(results, raw(Some(value), shape.path.clone()));
                     }
-                    let value = match &solution.value {
-                        Some(term) => self.graph.lookup(term),
-                        // A node shape's value is its focus node.
-                        None => shape.path.is_none().then_some(focus),
-                    };
-                    let path = solution
-                        .path
-                        .and_then(|path| self.graph.lookup(&Term::NamedNode(path)))
-                        .map(Path::Predicate)
-                        .or_else(|| shape.path.clone());
-                    results.push(raw(value, path));
+                }
+                Ok(sparql::Outcome::Solutions(solutions)) => {
+                    // Each solution is decoded, made a result (by id) and dropped before the
+                    // next: only the kept results, charged, stay. An evaluation error part way
+                    // makes the combination a failure with no results, as when it was read whole.
+                    let start = results.len();
+                    for solution in solutions {
+                        if self.stopped() {
+                            return ControlFlow::Break(());
+                        }
+                        let solution = match solution.map_err(sparql::Problem::from) {
+                            Ok(solution) => sparql::found(&solution),
+                            Err(sparql::Problem::Stopped(stop)) => {
+                                let _ = self.stop.set(stop);
+                                return ControlFlow::Break(());
+                            }
+                            Err(sparql::Problem::Failed(error)) => {
+                                let dropped: usize =
+                                    results[start..].iter().map(RawResult::retained_bytes).sum();
+                                results.truncate(start);
+                                self.release(dropped);
+                                failure(&error);
+                                break;
+                            }
+                        };
+                        if solution.failure {
+                            failure("the query reported ?failure");
+                            continue;
+                        }
+                        let value = match &solution.value {
+                            Some(term) => self.graph.lookup(term),
+                            // A node shape's value is its focus node.
+                            None => shape.path.is_none().then_some(focus),
+                        };
+                        let path = solution
+                            .path
+                            .and_then(|path| self.graph.lookup(&Term::NamedNode(path)))
+                            .map(Path::Predicate)
+                            .or_else(|| shape.path.clone());
+                        self.keep(results, raw(value, path));
+                    }
                 }
             }
-        }
+            ControlFlow::Continue(())
+        });
     }
 }
 

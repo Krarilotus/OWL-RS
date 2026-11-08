@@ -2,8 +2,8 @@
 //!
 //! Every kind is deterministic for its parameters and seed, written as N-Triples (RDF 1.2
 //! where it holds triple terms; the multi-graph kinds `geo4` and `social4` as N-Quads over four
-//! named graphs, `ex:graph0` to `ex:graph3`), and computes here, independently of the store, the
-//! answers the suite checks before a time counts. They go to standard output as one JSON
+//! named graphs, `ex:graph0` to `ex:graph3`; `turtle` as Turtle), and computes here,
+//! independently of the store, the answers the suite checks before a time counts. They go to standard output as one JSON
 //! object (`expect`), with the statement count and the parameters used. Kinds that need
 //! commits also write `OUT.commits.ru`: one SPARQL update per line, one commit each;
 //! `support-stress` also writes its reader (`OUT.reader`) and that reader's own updates
@@ -139,6 +139,7 @@ pub fn main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "eq-addon" => eq_addon(&params, &mut nt)?,
         "fed-chain" => fed_chain(&params, &mut nt)?,
         "sameas-giant" => sameas_giant(&params, &mut nt, &commits)?,
+        "first-load" => first_load(&params, &commits)?,
         "dense" => dense(&params, &mut rng, &mut nt)?,
         "chain" => chain(&params, &mut nt)?,
         "layered" => layered(&params, &mut rng, &mut nt, &commits)?,
@@ -149,6 +150,7 @@ pub fn main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "text" => text(&params, &mut rng, &mut nt)?,
         "vectors" => vectors(&params, &mut rng, &mut nt)?,
         "rdf12" => rdf12(&params, &mut rng, &mut nt)?,
+        "turtle" => turtle(&params, &mut nt)?,
         "graph" => graph(&params, &mut rng, &mut nt)?,
         "twins" => twins(&params, &mut rng, &mut nt, out)?,
         "dl-transitive" => dl_transitive(&params, &mut nt)?,
@@ -832,6 +834,44 @@ fn vectors(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
     Ok(e)
 }
 
+/// Turtle (not N-Triples), for the Turtle parser alone (`perf_lab --parse-turtle`): `entities`
+/// subjects. `nested=0`: four flat IRI triples each. `nested=1`: one statement each using
+/// every Turtle and RDF 1.2 bracket: a blank-node property list holding a two-item list, a
+/// triple term, a reified triple and an annotation, 13 triples:
+///
+/// ```turtle
+/// <s> <p> [ <q> <o> ; <r> ( <a> <b> ) ] ;
+///     <t> <<( <a> <b> <o> )>> ;
+///     <u> << <a> <b> <o> >> ;
+///     <v> <o> {| <w> <x> |} .
+/// ```
+///
+/// (`[ … ]` 3 triples, the list 4, `<t>` 1, the reified triple 2, `<v>` 1, its annotation 2.)
+fn turtle(p: &Params, nt: &mut Nt) -> std::io::Result<Expect> {
+    let (n, nested) = (p.get("entities", 250_000), p.get("nested", 0) != 0);
+    let (a, b, x) = (ex("a"), ex("b"), ex("x"));
+    let [pp, q, r, t, u, v, w] = ["p", "q", "r", "t", "u", "v", "w"].map(ex);
+    for i in 0..n {
+        let (s, o) = (ex(format!("s{i}")), ex(format!("o{i}")));
+        if nested {
+            writeln!(
+                nt.out,
+                "{s} {pp} [ {q} {o} ; {r} ( {a} {b} ) ] ;\n    {t} <<( {a} {b} {o} )>> ;\n    \
+                 {u} << {a} {b} {o} >> ;\n    {v} {o} {{| {w} {x} |}} ."
+            )?;
+            nt.count += 13;
+        } else {
+            for p in [&pp, &q, &r, &t] {
+                writeln!(nt.out, "{s} {p} {o} .")?;
+            }
+            nt.count += 4;
+        }
+    }
+    let mut e = Expect::new();
+    e.insert("entities".into(), json!(n));
+    Ok(e)
+}
+
 /// Statements with reifiers (RDF 1.2 triple terms) that carry a source and a confidence.
 fn rdf12(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
     let (n, sources) = (p.get("statements", 1_000_000), p.get("sources", 100));
@@ -1357,6 +1397,38 @@ fn sameas_giant(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expec
         json!(2 * half * half + groups * 100),
     );
     e.insert("giant_values".into(), json!(size));
+    Ok(e)
+}
+
+/// A first commit into an empty store, as DMW loads its ontologies (its A/B harness's
+/// subclass chain, 21 Oct 2026): `classes` classes in a `rdfs:subClassOf` chain and
+/// `individuals` members of the last, as one INSERT DATA; with `ranged=1`, also a property
+/// with a range and one literal value, whose conclusion (the literal's type) no store holds
+/// (PR #46 review r1 F1). The data file stays empty.
+fn first_load(p: &Params, commits: &str) -> std::io::Result<Expect> {
+    let (classes, individuals) = (p.get("classes", 250), p.get("individuals", 400));
+    let t = |s: &str, p: &str, o: &str| format!("{s} {p} {o} .");
+    let mut statements = Vec::new();
+    for n in 0..classes {
+        let class = ex(format!("C{n}"));
+        statements.push(t(&class, &rdf("type"), &owl("Class")));
+        if n > 0 {
+            statements.push(t(&class, &rdfs("subClassOf"), &ex(format!("C{}", n - 1))));
+        }
+    }
+    let last = ex(format!("C{}", classes - 1));
+    for i in 0..individuals {
+        statements.push(t(&ex(format!("i{i}")), &rdf("type"), &last));
+    }
+    if p.get("ranged", 0) == 1 {
+        statements.push(t(&ex("note"), &rdfs("range"), &format!("<{XSD}string>")));
+        statements.push(t(&ex("i0"), &ex("note"), "\"x\""));
+    }
+    let mut out = BufWriter::new(File::create(commits)?);
+    writeln!(out, "INSERT DATA {{ {} }}", statements.join(" "))?;
+    out.flush()?;
+    let mut e = Expect::new();
+    e.insert("members".into(), json!(individuals));
     Ok(e)
 }
 

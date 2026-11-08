@@ -81,7 +81,9 @@ pub use nrese_engine::cpu;
 /// How the process returns freed memory to the system, registered by the binary that picks
 /// the allocator.
 pub use nrese_engine::memory::set_release as set_memory_release;
-pub use nrese_engine::{EngineError, IndexEncoding, ReadModel, VocabularyEncoding, WalDamage};
+pub use nrese_engine::{
+    Applied, EngineError, IndexEncoding, LogExpectation, ReadModel, VocabularyEncoding, WalDamage,
+};
 pub use nrese_shacl::{ValidationReport, ValidationResult};
 pub use nrese_sparql::{
     CancellationToken, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryEvaluationError,
