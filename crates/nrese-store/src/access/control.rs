@@ -201,7 +201,9 @@ impl AccessControl {
                 "a change of the access state needs a reason".to_owned(),
             ));
         }
-        // A user's sessions end when its password changes or it is removed.
+        // A user's sessions end when its password changes or it is removed: they are valid
+        // only for the credential they were opened with; closing them, after the new state
+        // is published, frees them (`Logins::open` relies on that order).
         let ends_sessions = match &change {
             Change::PutUser {
                 name,
@@ -310,24 +312,23 @@ impl AccessControl {
         password: &str,
         client: Option<std::net::IpAddr>,
     ) -> Result<(String, std::time::Duration), AccessError> {
-        self.login(user, password, client)?;
+        let credential = self.logins.verify(&self.state(), user, password, client)?;
         let hours = self.state().settings.session_hours.max(1);
         let lifetime = std::time::Duration::from_secs(u64::from(hours) * 3600);
-        Ok((self.logins.open(user, lifetime)?, lifetime))
+        let token = self
+            .logins
+            .open(user, credential, lifetime, || self.state())?;
+        Ok((token, lifetime))
     }
 
-    /// The principal of session `token`, while it lasts and its user has a local login.
+    /// The principal of session `token`, while it lasts and its user's local login is
+    /// still the one it was opened with.
     pub fn session(&self, token: &str) -> Option<Principal> {
-        let user = self.logins.session(token)?;
-        let state = self.state();
-        state
-            .users
-            .get(&user)
-            .is_some_and(|record| record.password_hash.is_some())
-            .then(|| Principal {
-                user: Some(user),
-                ..Principal::default()
-            })
+        let user = self.logins.session(token, &self.state())?;
+        Some(Principal {
+            user: Some(user),
+            ..Principal::default()
+        })
     }
 
     /// Closes session `token`; whether it was open.
