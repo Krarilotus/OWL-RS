@@ -40,7 +40,7 @@ COPIED = (".githooks/pre-push", "scripts/check.sh", "scripts/cargo-guarded.sh", 
           "scripts/lib/target-cpu.sh", "scripts/lib/remote.sh", "scripts/lib/gate-key.sh",
           "scripts/lib/fleet-gate.sh", "scripts/lib/fleet-job.sh", "scripts/lib/gate-tools.txt",
           "scripts/lib/gate-record.py", "scripts/lib/windows-job.ps1", "scripts/lib/windows-job.sh",
-          "scripts/lib/suite-python.sh", "scripts/lib/ns.sh", "benches/suite/requirements.txt")
+          "scripts/lib/suite-python.sh", *isolation.NS_SH, "benches/suite/requirements.txt")
 # A stand-in for the fleet's CLI: each submit keeps its job file; status, results and cancel as told.
 FLEET = """#!/bin/sh
 case "$1" in
@@ -480,8 +480,8 @@ class MeasurementRefs(Repo):
         super().setUp()
         (self.repo / "benches/fast").mkdir(parents=True, exist_ok=True)
         shutil.copy(ROOT / "benches/fast/release_gate.py", self.repo / "benches/fast/release_gate.py")
-        shutil.copytree(ROOT / "benches/suite/suitekit", self.repo / "benches/suite/suitekit",
-                        ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copytree(ROOT / "benches/suite/suitekit", self.repo / "benches/suite/suitekit",  # NS_SH's lock.py is there
+                        ignore=shutil.ignore_patterns("__pycache__"), dirs_exist_ok=True)
         self.side = self.add({self.PERF_LAB: "fn main() { spawn(); }\n",
                               "crates/nrese-store/src/lib.rs": "pub fn engine() {}\n"}, "an old side")
         self.git(self.repo, "push", "-q", "origin", "HEAD:refs/heads/refactor/engine-v2")
