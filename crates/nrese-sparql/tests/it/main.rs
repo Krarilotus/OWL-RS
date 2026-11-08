@@ -19,6 +19,7 @@ mod resource_tests;
 mod result_cache_tests;
 mod text_search_scope_tests;
 mod text_search_tests;
+mod transfer_tests;
 mod values_seed_tests;
 mod vector_scope_tests;
 mod vector_tests;
