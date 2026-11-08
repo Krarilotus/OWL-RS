@@ -668,14 +668,15 @@ pub fn concludes_equality(o: &Ontology, axiom: &Axiom) -> bool {
             (ClassExpr::Min(n, ..), false) => *n >= 2,
             // `= n` for n ≥ 1 holds `≤ n`.
             (ClassExpr::Exact(..), true) => true,
-            // `¬= n` is `≤ n−1` or `≥ n+1`.
-            (ClassExpr::Exact(n, _, f), false) => {
-                *n >= 2 || equates(o, *f, true) || (*n == 1 && equates(o, *f, false))
+            // `¬= n` is `≤ n−1` or `≥ n+1`; only the bound can equate.
+            (ClassExpr::Exact(n, _, f), false) => *n >= 2 || (*n == 1 && equates(o, *f, false)),
+            // A filler that holds of every existing successor (`∀R.F`, `¬∃R.F`) equates as
+            // it would of the individual. One that holds of a witness only (`∃R.F`, `≥ n`,
+            // `¬∀R.F`, `¬≤ n`) equates no existing individual: `∃S.{a}` is the edge
+            // `S(x, a)` (Sol r2 S3).
+            (ClassExpr::All(_, f), true) | (ClassExpr::Some(_, f), false) => {
+                equates(o, *f, positive)
             }
-            (ClassExpr::Max(_, _, f), false) | (ClassExpr::Min(_, _, f), true) => {
-                equates(o, *f, true)
-            }
-            (ClassExpr::Some(_, f) | ClassExpr::All(_, f), p) => equates(o, *f, p),
             _ => false,
         }
     }
