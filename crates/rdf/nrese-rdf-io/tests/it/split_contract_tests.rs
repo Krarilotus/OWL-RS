@@ -192,6 +192,14 @@ fn a_chunked_recovering_parse_is_the_sequential_one() {
             RdfFormat::Turtle,
             format!("VERSION \"a\\\nb\"\n<urn:s> <urn:p> \"o\" .{AFTER}"),
         ),
+        // A failed VERSION that ends with its string leaves no string behind: an `@` after it
+        // starts a directive, as after one that parses (sol-loop r3 S6).
+        (
+            false,
+            RdfFormat::Turtle,
+            "VERSION 12 \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\nb\"\n@prefix : <urn:> .\n:s :p :o ."
+                .to_owned(),
+        ),
         // A byte order mark before the first directive: the parser reads past it, so the
         // directive is in force in every chunk (sol-loop r1 S4; before this package too).
         (
