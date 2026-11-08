@@ -867,6 +867,22 @@ def shacl_report_counts(text: str) -> dict[str, int] | None:
     return {"values": values, "paths": paths}
 
 
+def shacl_report_reading(path: Path) -> tuple[dict[str, int] | None, str]:
+    """An invocation's SHACL report's counts (shacl_report_counts()), or None and why they're
+    unknown: every way of not getting them (none written, not UTF-8, a failed read, not N-Triples
+    as written) is the one unreadable state, never an exception out of measure() (fix check r3)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, "the invocation wrote no SHACL report"
+    except UnicodeDecodeError as error:
+        return None, f"its SHACL report isn't UTF-8 (byte {error.start}: {error.reason})"
+    except OSError as error:
+        return None, f"its SHACL report couldn't be read ({error.strerror or error})"
+    counts = shacl_report_counts(text)
+    return counts, "" if counts is not None else "its SHACL report isn't N-Triples as written"
+
+
 def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, data: str) -> dict:
     """run_case's measurement, its data ready: the record."""
     name = case["name"]
@@ -948,12 +964,11 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
                 result = json.loads(path.read_text(encoding="utf-8"))
                 path.unlink()
                 if shapes and isinstance(result.get("shacl"), dict):
-                    counts = shacl_report_counts(report_nt.read_text(encoding="utf-8")) if report_nt.exists() else None
+                    counts, why = shacl_report_reading(report_nt)
                     if counts is None:
                         # Couldn't be read, not "not reported": its checks fail whatever --routes says
                         # (fix check r2: check() left an absent value unchecked without routes).
-                        why = ("its SHACL report isn't N-Triples as written" if report_nt.exists()
-                               else "the invocation wrote no SHACL report") + ": values and paths not counted"
+                        why += ": values and paths not counted"
                         record["notes"].append(why)
                         result["_unreadable"] = {"shacl.values": why, "shacl.paths": why}
                     else:
