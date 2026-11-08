@@ -292,10 +292,12 @@ class Suite:
         return chosen or None
 
     # --- preparation ---
-    def ensure_images(self, needed: dict[str, str | None]):
-        """needed: image -> build context under benches/ (None: pulled)."""
+    def ensure_images(self, needed: dict[str, str | None]) -> bool:
+        """needed: image -> build context under benches/ (None: pulled). False, said why, when a pinned
+        image's digest can't be pulled or tagged: the tag may still name other content, so the run
+        stops before anything is pinned or timed (P1c review r1 F1)."""
         if self.args.runtime != "docker":
-            return
+            return True
         pins = image_pins(self.root)
         for image, context in needed.items():
             pin = None if context else pins.get(image)
@@ -305,8 +307,12 @@ class Suite:
                 # A tag names no content, its digest does: pulled by its pin and tagged, so what runs
                 # is the pinned content (P1c), one present that isn't it included.
                 self.say(f"pulling {image} at its pin {pin[:19]}")
-                self.host_command(["docker", "pull", "-q", f"{repository(image)}@{pin}"])
-                self.host_command(["docker", "tag", f"{repository(image)}@{pin}", image])
+                for step in (["docker", "pull", "-q", f"{repository(image)}@{pin}"],
+                             ["docker", "tag", f"{repository(image)}@{pin}", image]):
+                    if (rc := self.host_command(step)) != 0:
+                        self.say(f"images: {image}: `{' '.join(step[:2])}` of its pin failed (exit {rc}): "
+                                 "not run, since its tag may name other content")
+                        return False
             elif context:
                 # What it is built from, on the image itself: its context's git tree id in this run's
                 # commit, when that is clean (P2 design review F5). The receipt reads it off the id
@@ -323,6 +329,7 @@ class Suite:
                 self.say(f"pulling {image}")
                 self.host_command(["docker", "pull", "-q", image])
             self.made_images.append(image)
+        return True
 
     def image_source(self, image: str, image_id: str):
         """Where the image with this id came from, read off that id (the one the run's containers
@@ -869,7 +876,8 @@ class Suite:
                 images[image] = context
         if self.args.runtime == "docker":
             images.setdefault("alpine:latest", None)
-        self.ensure_images(images)
+        if not self.ensure_images(images):
+            return 1
         # Every image the run's containers use, resolved to its ID now, before anything is timed
         # (ns.pin_images): one that can't be stops the run; none is pulled or re-resolved later.
         if self.args.runtime == "docker" and not self.args.dry_run:
