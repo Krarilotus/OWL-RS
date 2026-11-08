@@ -127,7 +127,8 @@ impl Heap {
     }
 
     /// Room for `more` entries in the tail, the hashes and the table, made now so that
-    /// [`Self::install`] of that many allocates nothing. Nothing changes on an error.
+    /// [`Self::install`] of that many allocates nothing. On an error the entries are unchanged;
+    /// room already grown may stay, as slack.
     pub(super) fn reserve(&mut self, more: usize) -> Result<(), NoRoom> {
         self.tail.try_reserve(more).map_err(|_| NoRoom)?;
         self.hashes.try_reserve(more).map_err(|_| NoRoom)?;
@@ -293,7 +294,8 @@ impl Inner {
     }
 
     /// Reserves room in the heap for `more` entries and records it as promised to one
-    /// prepared install ([`super::suffix::Prepared`]). Nothing changes on an error.
+    /// prepared install ([`super::suffix::Prepared`]). On an error the entries and the promise
+    /// are unchanged; room already grown may stay, as slack.
     #[cfg_attr(
         not(test),
         expect(
@@ -325,19 +327,13 @@ impl Inner {
 
     /// The promise kept ([`Self::install`]) or given up (a prepared install dropped): the
     /// room stays, as slack.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "a publication's prepared install is dropped on failure in package 9"
-        )
-    )]
     pub(super) fn unpromise(&mut self) {
         self.promised = 0;
     }
 
     /// Takes `other`'s promise into this one, a rebase's new state, reserving its room here
-    /// first. Nothing changes on an error.
+    /// first. On an error the entries and the promise are unchanged; room already grown in this
+    /// new state may stay, as slack (the caller then keeps the old state).
     pub(super) fn keep_promise(&mut self, other: &Inner) -> Result<(), NoRoom> {
         #[cfg(test)]
         if other.promised > 0 && REFUSE_PROMISED_ROOM.with(std::cell::Cell::get) {
