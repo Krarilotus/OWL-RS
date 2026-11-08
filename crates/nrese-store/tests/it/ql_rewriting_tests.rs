@@ -1494,16 +1494,18 @@ fn existentials_bounded_restrictions_force_are_answered_or_reported() {
 /// - Sol r1 S1: `C ⊑ ≤ 0 R.¬D` with `R(c, x)`: `x : D`. With `≤ 0 R.¬{a}` and `a : D`:
 ///   `x = a`, so `x : D`.
 /// - Sol r3 S4: `C ⊑ ≤ 0 R.¬∃S.(∀S⁻.{a})` with `R(c, x)`, `a : D`: `x = a`, so `x : D`.
-/// - Sol r1 S2 (guard below): `C ⊑ = 0 R.{a}` equates nobody, so `Z` stays complete.
-/// - Sol r2 S3 (guard below): `C ⊑ ≤ 0 R.¬∃S.{a}`, which is `∀R.∃S.{a}`, adds an edge to
-///   `a` and equates nobody, so `Z` stays complete.
+/// - Fix check r1 F1: `C ⊑ ≤ 0 R.¬∃S.({a} ⊓ {b})` with `R(c, x)`, `a : D`: `x`'s
+///   `S`-successor is `a` and `b`, so `b : D`.
 ///
-/// Precision guards, each a query whose answers are complete under its regime:
+/// Guards, each with its specified answer, compared first:
 /// - `x : Person` and `x : Employed` of the third case, terms of the same axiom that no
-///   uncovered conclusion reaches (owl2-ql).
-/// - F3: after `A ⊓ B ⊑ C` and `C ⊑ ∀R.D`, the edges of `R`, which the universal adds none
-///   of (owl2-ql).
-/// - F4: `C ⊑ ∀R.¬{a}` equates nobody, so an unrelated class `Z` stays complete (both).
+///   uncovered conclusion reaches: `x`, complete (owl2-ql).
+/// - Review r1 F3: after `A ⊓ B ⊑ C` and `C ⊑ ∀R.D`, the edges of `R`, which the universal
+///   adds none of: `(c, z)`, complete (owl2-ql).
+/// - Fix check r1 F2: `C ⊑ ≥ 0 S.(∀T.{a})` concludes nothing: `Z` is `z`, complete (both).
+/// - R1-F4 `C ⊑ ∀R.¬{a}`, Sol r1 S2 `C ⊑ = 0 R.{a}`, Sol r2 S3 `C ⊑ ≤ 0 R.¬∃S.{a}`: `Z` is
+///   `z`. They equate nobody, but equality is fail-closed for any nominal (master, 8 Nov
+///   12:41), so their status isn't required.
 #[test]
 fn axioms_outside_the_profile_are_answered_or_reported() {
     let head = format!(
@@ -1598,6 +1600,19 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
             ),
             format!("ASK {{ <{E}x> a <{E}D> }}"),
         ),
+        // Fix check r1 F1: `x`'s required `S`-successor is both `a` and `b`, so `a = b`
+        // and `b : D`.
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                     owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                     owl:onClass [ owl:complementOf [ a owl:Restriction ; owl:onProperty :S ;
+                         owl:someValuesFrom [ owl:intersectionOf (
+                             [ owl:oneOf ( :a ) ] [ owl:oneOf ( :b ) ] ) ] ] ] ] .
+                 :c a :C ; :R :x . :a a :D ."
+            ),
+            format!("ASK {{ <{E}b> a <{E}D> }}"),
+        ),
     ];
     let mut wrong = Vec::new();
     for (n, (turtle, query)) in cases.iter().enumerate() {
@@ -1642,47 +1657,79 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
                  owl:someValuesFrom [ a owl:Class ; owl:oneOf ( :a ) ] ] ] ] .
          :c a :C ; :R :x . :z a :Z ."
     );
+    // Fix check r1 F2: `≥ 0 S.F` holds of everything and requires no successor.
+    let at_least_zero = format!(
+        "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :S ;
+             owl:minQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+             owl:onClass [ a owl:Restriction ; owl:onProperty :T ;
+                 owl:allValuesFrom [ a owl:Class ; owl:oneOf ( :a ) ] ] ] .
+         :c a :C . :z a :Z ."
+    );
+    let both = vec![Ruleset::Owl2Ql, Ruleset::Owl2Rl];
+    let ql = vec![Ruleset::Owl2Ql];
+    let z_query = format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}");
+    let z = vec![format!("x={E}z")];
+    // Each guard's specified rows, compared before its status (fix check r1, F3), and
+    // whether `complete` is required. The nominal guards of R1-F4, S2 and S3 keep their
+    // answers only: equality is fail-closed for any nominal (master, 12:41).
     let guards = [
         (
             &cases[2].0,
-            vec![Ruleset::Owl2Ql],
+            ql.clone(),
             format!("SELECT ?x WHERE {{ ?x a <{E}Person> }}"),
+            vec![format!("x={E}x")],
+            true,
         ),
         (
             &cases[2].0,
-            vec![Ruleset::Owl2Ql],
+            ql.clone(),
             format!("SELECT ?x WHERE {{ ?x a <{E}Employed> }}"),
+            vec![format!("x={E}x")],
+            true,
         ),
         (
             &universal,
-            vec![Ruleset::Owl2Ql],
+            ql,
             format!("SELECT ?x ?y WHERE {{ ?x <{E}R> ?y }}"),
+            vec![format!("x={E}c y={E}z")],
+            true,
         ),
-        (
-            &not_a,
-            vec![Ruleset::Owl2Ql, Ruleset::Owl2Rl],
-            format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}"),
-        ),
-        (
-            &zero_a,
-            vec![Ruleset::Owl2Ql, Ruleset::Owl2Rl],
-            format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}"),
-        ),
-        (
-            &edge_to_a,
-            vec![Ruleset::Owl2Ql, Ruleset::Owl2Rl],
-            format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}"),
-        ),
+        (&not_a, both.clone(), z_query.clone(), z.clone(), false),
+        (&zero_a, both.clone(), z_query.clone(), z.clone(), false),
+        (&edge_to_a, both.clone(), z_query.clone(), z.clone(), false),
+        (&at_least_zero, both, z_query, z, true),
     ];
-    for (turtle, rulesets, query) in guards {
+    for (turtle, rulesets, query, expected, complete) in guards {
         for ruleset in rulesets {
             let dir = tempfile::tempdir().unwrap();
             let store = store(turtle, dir.path(), ruleset, true);
             let result = store
                 .execute_query(&SparqlQueryRequest::all(query.as_str()))
                 .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&result.payload).unwrap();
+            let mut rows: Vec<String> = json["results"]["bindings"]
+                .as_array()
+                .expect("bindings")
+                .iter()
+                .map(|row| {
+                    let mut cells: Vec<String> = row
+                        .as_object()
+                        .expect("a row")
+                        .iter()
+                        .map(|(var, v)| format!("{var}={}", v["value"].as_str().unwrap_or("")))
+                        .collect();
+                    cells.sort();
+                    cells.join(" ")
+                })
+                .collect();
+            rows.sort();
             let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
-            if !matches!(status, "complete" | "none") {
+            if rows != expected {
+                wrong.push(format!(
+                    "guard, {}, {query}: {rows:?}, expected {expected:?}",
+                    ruleset.name()
+                ));
+            } else if complete && !matches!(status, "complete" | "none") {
                 wrong.push(format!(
                     "guard, {}, {query}: {status}, expected complete",
                     ruleset.name()
