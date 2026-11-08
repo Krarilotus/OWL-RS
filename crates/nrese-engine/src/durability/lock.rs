@@ -30,8 +30,9 @@ static OPEN: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
 /// The lock of an open store, released when dropped.
 pub(crate) struct StoreLock {
-    /// Held open for the lock (Unix: the record lock lives as long as it does).
-    _file: File,
+    /// Held open for the lock (Unix: the record lock lives as long as it does); closed, when
+    /// dropped, before [`OPEN`] lets another open of the store in.
+    file: Option<File>,
     /// Its entry in [`OPEN`].
     dir: PathBuf,
 }
@@ -57,7 +58,10 @@ impl StoreLock {
             return Err(locked());
         }
         open.insert(dir.clone());
-        Ok(Self { _file: file, dir })
+        Ok(Self {
+            file: Some(file),
+            dir,
+        })
     }
 }
 
@@ -66,6 +70,10 @@ impl Drop for StoreLock {
         let mut open = OPEN
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Closed first, under the registry: closing a descriptor of the file drops all this
+        // process's record locks on it, so it must not close after another open of the store
+        // has taken its own (sol-loop S1).
+        drop(self.file.take());
         open.remove(&self.dir);
         drop(open);
         #[cfg(test)]

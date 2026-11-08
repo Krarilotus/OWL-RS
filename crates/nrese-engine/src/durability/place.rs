@@ -58,14 +58,43 @@ pub fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut temporary = to.as_os_str().to_owned();
     temporary.push(".placing");
     let temporary = PathBuf::from(temporary);
+    // `fs::copy` keeps the source's permissions: a read-only one (an image kept read-only)
+    // is made writable for its sync, which needs a writable handle (sol-loop S2).
     let placed = fs::copy(from, &temporary)
-        .and_then(|_| sync_file(&temporary))
+        .and_then(|_| writable(&temporary))
+        .and_then(|()| sync_file(&temporary))
         .and_then(|()| rename(&temporary, to));
     if let Err(error) = placed {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
     sync_dir(to.parent().unwrap_or_else(|| Path::new(".")))
+}
+
+/// Lets the owner write the file at `path` (Unix: the owner's write bit; Windows: the
+/// read-only attribute cleared), keeping its other permissions.
+fn writable(path: &Path) -> std::io::Result<()> {
+    let mut permissions = fs::metadata(path)?.permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if permissions.mode() & 0o200 != 0 {
+            return Ok(());
+        }
+        permissions.set_mode(permissions.mode() | 0o200);
+    }
+    #[cfg(not(unix))]
+    {
+        if !permissions.readonly() {
+            return Ok(());
+        }
+        #[expect(
+            clippy::permissions_set_readonly_false,
+            reason = "not Unix: only the read-only attribute, no group or other bits"
+        )]
+        permissions.set_readonly(false);
+    }
+    fs::set_permissions(path, permissions)
 }
 
 #[cfg(windows)]
