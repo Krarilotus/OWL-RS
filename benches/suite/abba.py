@@ -334,11 +334,14 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
               "abba", named], [*gate_, "clean"]]
     steps = prepare + blocks + after
     by_name = {c["name"]: c for c in family["catalog"]}
-    has = rg.data_needs([by_name[c["name"]] for c in family["cases"] if c["name"] in by_name])
-    fetched = rg.bench_inputs([by_name[c["name"]] for c in family["cases"] if c["name"] in by_name])
+    mine = [by_name[c["name"]] for c in family["cases"] if c["name"] in by_name]
+    # What its data takes where the host lacks it: the makers' needs and their disk (7 Nov 2026).
+    has, disk = rg.data_needs(mine), rg.data_disk_gb(mine)
+    fetched = rg.bench_inputs(mine)
     if fetched:  # the commit data_state() takes WatDiv's pinned query sets from
         env["BENCH_INPUTS_REV"] = fetched[0]["source"]["rev"]
-    requires = {"roles": rg.TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": max(12, cap)} | ({"has": has} if has else {})
+    requires = ({"roles": rg.TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": max(12, cap)}
+                | ({"has": has} if has else {}) | ({"disk_gb": disk} if disk else {}))
     job = {"id": prefix, "group": "abba", "kind": "owlrs.timed", "class": "exclusive",
            "priority": priority, "priority_reason": reason or f"A-B-B-A: {b[:8]} against {a[:8]}, "
            f"{len(family['cases'])} cases", "notify": False,

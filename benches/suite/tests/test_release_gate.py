@@ -407,16 +407,207 @@ class Rounds(unittest.TestCase):
         capability, but the disk to make it in, its source and its file."""
         need = gate_module.data_needs
         self.assertEqual(need([{"data": "social people=1000"}]), [])
-        self.assertEqual(need([{"data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}]), ["owlrs-bench-assets"])
         self.assertEqual(need([{"data": "ore:ore_ont_9724"}]), ["owlrs-bench-assets"])
         self.assertEqual(need([{"data": "el classes=10", "reference": "/fast/ref/x.tax"}]), ["owlrs-bench-assets"])
         self.assertEqual(need([{"data": "volume:bsbm-100m.nt"}]), [])
         self.assertEqual(need([{"data": "volume:watdiv-10m.nt", "queries": "@watdiv-10m"}]), [])
-        self.assertEqual(need([{"data": "concat:volume:lubm-1.nt+social people=10"}]), ["owlrs-bench-assets"])
-        frozen = next(d for d in __import__("tomllib").loads((ROOT / "benches/datasets.toml").read_text(encoding="utf-8"))["dataset"]
-                      if d["file"] == "bsbm-100m.nt")
-        self.assertEqual(gate_module.data_disk_gb([{"data": "volume:bsbm-100m.nt"}]), -(-2 * frozen["bytes"] // 10 ** 9))
-        self.assertEqual(gate_module.data_disk_gb([{"data": "volume:lubm-10.nt"}]), 0)
+        frozen = {d["file"]: d for d in __import__("tomllib").loads((ROOT / "benches/datasets.toml").read_text(encoding="utf-8"))["dataset"]}
+        self.assertEqual(gate_module.data_disk_gb([{"data": "volume:bsbm-100m.nt"}]),
+                         -(-2 * frozen["bsbm-100m.nt"]["bytes"] // 10 ** 9))
+        # The LUBM data was the assets' until 7 Nov 2026; now a job makes it (the next test).
+        self.assertEqual(gate_module.data_disk_gb([{"data": "volume:lubm-10.nt"}]),
+                         -(-2 * frozen["lubm-10.nt"]["bytes"] // 10 ** 9))
+
+    def test_a_part_asks_for_what_its_data_s_makers_need_not_the_assets(self):
+        """Orchestrator, 7 Nov 2026 (Johannes's 2 Nov decisions 1 and 8: a job sets up what it needs
+        where it's missing, never a blanket copy): a set makes the datasets its cases read where a
+        host lacks them; only a file no maker here can make asks for the bench assets. The LUBM and
+        OWL2Bench makers run in Docker; perf_lab's support-stress generator needs only the build.
+        REAS (abba-run-8ac6a2b5-91f067f1) passed --plan and failed at its data step: its
+        support-stress files were on one host, and nothing made them."""
+        need = gate_module.data_needs
+        self.assertEqual(need([{"data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}]), ["docker"])
+        self.assertEqual(need([{"data": "concat:volume:lubm-1.nt+social people=10"}]), ["docker"])
+        self.assertEqual(need([{"data": "volume:owl2bench-rl-1.nt"}]), ["docker"])
+        # Sol-loop r1 S1: riot labels an OWL2Bench file's blank nodes afresh, so a made copy can meet
+        # only a form pin; one without it (owl2bench-ql-1.nt) still needs the assets.
+        self.assertEqual(need([{"data": "volume:owl2bench-ql-1.nt"}]), ["owlrs-bench-assets"])
+        self.assertEqual(need([{"data": "volume:support-stress/copies-8.nq"}]), [])
+        self.assertEqual(need([{"data": "volume:era-shacl/ERA.ttl"}]), ["owlrs-bench-assets"])  # no maker here
+        self.assertEqual(need([{"data": "volume:lubm-10.nt"}, {"data": "ore:ore_ont_9724"}]),
+                         ["docker", "owlrs-bench-assets"])
+
+    def test_a_dataset_is_as_pinned_by_its_bytes_or_by_its_rdfc_form(self):
+        """7 Nov 2026: riot labels univ-bench.nt's blank nodes afresh on every make, so a made copy's
+        bytes aren't the pin while its RDFC-1.0 canonical N-Quads' SHA-256 is the verified copy's
+        (stage-data-probe-1, stage-data-rdfc-1). A file pinned by form (`rdfc_sha256`) passes by
+        either; one pinned by bytes alone, by its bytes only; a form pin with nothing to compute the
+        form with fails closed."""
+        import hashlib
+        problem = gate_module.pin_problem
+        never = lambda _: self.fail("a bytes-only pin asked for the form")  # noqa: E731
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d, "f.nt")
+            path.write_bytes(b"<a> <b> _:x .\n")
+            sha, other = hashlib.sha256(b"<a> <b> _:x .\n").hexdigest(), "0" * 64
+            self.assertIsNone(problem(path, {"sha256": sha}, never))
+            self.assertIn("sha256", problem(path, {"sha256": other}, never))
+            self.assertIsNone(problem(path, {"sha256": other, "rdfc_sha256": "f" * 64}, lambda _: "f" * 64))
+            self.assertIn("RDFC-1.0", problem(path, {"sha256": other, "rdfc_sha256": "f" * 64}, lambda _: "e" * 64))
+            self.assertIn("rdfc", problem(path, {"sha256": other, "rdfc_sha256": "f" * 64}, None))
+
+    def test_a_copy_of_an_older_release_is_made_again_not_used(self):
+        """7 Nov 2026: lubm-10 and lubm-100 became their sorted distinct lines (UBA's threads order
+        them anew on every make), so the asset hosts' copies are an older release, at another size.
+        Where a maker can make the file, the data step makes it rather than stopping on the old copy;
+        the data view takes the first copy that is its pin (dataset_source())."""
+        import hashlib
+        if shutil.which("bash") is None:
+            self.skipTest("needs bash")
+        new, old = b"<a> <b> <c> .\n<d> <e> <f> .\n", b"<d> <e> <f> .\n<a> <b> <c> .\n<a> <b> <c> .\n"
+        entry = {"made_by": "bash benches/reasoning/prepare-lubm.sh 10", "bytes": len(new),
+                 "sha256": hashlib.sha256(new).hexdigest()}
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as cache, \
+                tempfile.TemporaryDirectory() as general:
+            root, cache, general = Path(root), Path(cache), Path(general)
+            (general / "lubm-10.nt").write_bytes(old)
+            (root / "benches/reasoning").mkdir(parents=True)
+            (root / "benches/reasoning/prepare-lubm.sh").write_text(
+                f"#!/usr/bin/env bash\nprintf '%s' '{new.decode()}' > \"$NRESE_DATASET_DIR/lubm-10.nt\"\n",
+                encoding="utf-8", newline="\n")
+            (root / "benches/datasets.toml").write_text(
+                '[[dataset]]\nfile = "lubm-10.nt"\n' + "".join(f'{k} = {json.dumps(v)}\n' for k, v in entry.items()),
+                encoding="utf-8")
+            with patch.dict(os.environ, {"SPARQL_DATA": str(cache)}), \
+                    patch.object(gate_module.hosts_registry, "input_path", return_value=general):
+                lines, ok = gate_module.data_state([{"data": "volume:lubm-10.nt"}], make=True, root=root)
+            self.assertTrue(ok, "\n".join(lines))
+            self.assertEqual((cache / "lubm-10.nt").read_bytes(), new)
+            self.assertEqual((general / "lubm-10.nt").read_bytes(), old)  # the assets are read-only
+            # The view: the first copy that is its pin, the older release skipped by its size.
+            chosen, problem = gate_module.dataset_source("lubm-10.nt", entry, [general, cache], None)
+            self.assertEqual((chosen, problem), (cache / "lubm-10.nt", None))
+            (cache / "lubm-10.nt").unlink()
+            chosen, problem = gate_module.dataset_source("lubm-10.nt", entry, [general, cache], None)
+            self.assertEqual(chosen, general / "lubm-10.nt")
+            self.assertIn("bytes", problem)
+
+    def test_a_record_says_which_frozen_bytes_its_case_loaded(self):
+        """Review r1 of pkg/stage-data, R1-W1: a comparison can hold a verdict to the same input only
+        if each record says which bytes its case loaded. The prepared manifest's hash where it holds
+        the file unchanged, else the file's own; None where the file isn't there, or the run can't
+        read it (the Docker runtime's volume)."""
+        import hashlib
+        with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as fast_data:
+            data, fast_data = Path(data), Path(fast_data)
+            (data / "lubm-10.nt").write_bytes(b"<a> <b> <c> .\n")
+            case = {"name": "t", "data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}
+            stat = (data / "lubm-10.nt").stat()
+            with patch.object(fast, "RUNTIME", "native"), patch.object(fast, "FAST_DATA", fast_data), \
+                    patch.object(fast.hosts, "input_path", return_value=data), \
+                    patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
+                self.assertEqual(fast.case_inputs(case), {"lubm-10.nt": hashlib.sha256(b"<a> <b> <c> .\n").hexdigest(),
+                                                          "univ-bench.nt": None})
+            (fast_data / fast.PREPARED).write_text(json.dumps({"files": {(data / "lubm-10.nt").as_posix(): {
+                "bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha256": "p" * 64}}}), encoding="utf-8")
+            with patch.object(fast, "RUNTIME", "native"), patch.object(fast, "FAST_DATA", fast_data), \
+                    patch.object(fast.hosts, "input_path", return_value=data), \
+                    patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
+                self.assertEqual(fast.case_inputs(case)["lubm-10.nt"], "p" * 64)  # the prepared manifest's
+            with patch.object(fast, "RUNTIME", "docker"), patch.dict(fast._DIGESTS, clear=True):
+                self.assertEqual(fast.case_inputs(case), {"lubm-10.nt": None, "univ-bench.nt": None})
+            # Sol-loop r3 V2: a concatenation's order is part of what was loaded.
+            (data / "univ-bench.nt").write_bytes(b"<u> <v> <w> .\n")
+            ab = {"name": "t", "data": "concat:volume:lubm-10.nt+volume:univ-bench.nt"}
+            ba = {"name": "t", "data": "concat:volume:univ-bench.nt+volume:lubm-10.nt"}
+            with patch.object(fast, "RUNTIME", "native"), patch.object(fast, "FAST_DATA", fast_data), \
+                    patch.object(fast.hosts, "input_path", return_value=data), \
+                    patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
+                self.assertNotEqual(fast.case_inputs(ab), fast.case_inputs(ba))
+                # Sol-loop r4 W1: the same concatenations listed in another order are the same input.
+                both = {"name": "t", "data": "volume:lubm-10.nt", "extra": [ab["data"], ba["data"]]}
+                self.assertEqual(fast.case_inputs(both), fast.case_inputs({**both, "extra": both["extra"][::-1]}))
+            # Fix check r2, R2-W2: an ORE case's converted ontology is a loaded external file, hashed.
+            (fast_data / "ore").mkdir()
+            (fast_data / "ore" / "ore_ont_9724.nt").write_bytes(b"<o> <p> <q> .\n")
+            with patch.object(fast, "RUNTIME", "native"), patch.object(fast, "FAST_DATA", fast_data), \
+                    patch.object(fast.hosts, "input_path", return_value=data), \
+                    patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
+                self.assertEqual(fast.case_inputs({"name": "o", "data": "ore:ore_ont_9724"}),
+                                 {"ore:ore_ont_9724": hashlib.sha256(b"<o> <p> <q> .\n").hexdigest()})
+                # Sol-loop r5 X2: a file there but unreadable is unknown, and the run goes on.
+                with patch.object(fast, "file_digest", side_effect=PermissionError("denied")), \
+                        patch.dict(fast._DIGESTS, clear=True):
+                    self.assertEqual(fast.case_inputs({"name": "o", "data": "ore:ore_ont_9724"}), {"ore:ore_ont_9724": None})
+                # A kind of input nothing here resolves is an external file of unknown bytes: never none.
+                self.assertEqual(fast.case_inputs({"name": "n", "data": "url:https://example.org/x.nt"}),
+                                 {"url:https://example.org/x.nt": None})
+
+    def test_which_external_files_a_case_loads_has_one_answer(self):
+        """The orchestrator, 7 Nov 2026 (18:12): the recorder and the comparison decide what an input
+        is by one function (suitekit.inputs.declared()); a kind it doesn't know is external, of
+        unknown bytes; only a bare generator spec is generated."""
+        from suitekit import inputs
+        self.assertEqual(inputs.declared({"data": "social people=1000"}), set())
+        self.assertEqual(inputs.declared({"data": "none"}), set())
+        self.assertEqual(inputs.declared({"data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}),
+                         {"lubm-10.nt", "univ-bench.nt"})
+        self.assertEqual(inputs.declared({"data": "ore:ore_ont_9724"}), {"ore:ore_ont_9724"})
+        self.assertEqual(inputs.declared({"data": "el classes=10", "reference": "/fast/ref/x.tax"}),
+                         {"reference:/fast/ref/x.tax"})
+        self.assertEqual(inputs.declared({"data": "concat:volume:univ-bench.nt+social people=10"}),
+                         {"univ-bench.nt", "concat:volume:univ-bench.nt+social people=10"})
+        self.assertEqual(inputs.declared({"data": "url:https://example.org/x.nt"}), {"url:https://example.org/x.nt"})
+
+    def test_the_catalogue_keeps_a_form_pin_and_a_note_when_it_is_written_again(self):
+        """7 Nov 2026: `suite.py data` rewrites benches/datasets.toml from a fixed list of keys, so a
+        freeze would have dropped univ-bench.nt's `rdfc_sha256` (its only pin a made copy can meet)
+        and a file's `note` (lubm-100's make time) without a word."""
+        from suitekit import datasets
+        entry = {"file": "univ-bench.nt", "made_by": "bash benches/reasoning/prepare-lubm.sh 1", "bytes": 47781,
+                 "sha256": "2" * 64, "rdfc_sha256": "7" * 64, "note": "made in 8 s on khaleesi-wsl"}
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / "benches").mkdir()
+            datasets.save(Path(root), {"budget_gb": 300, "dataset": [entry]})
+            self.assertEqual(datasets.load(Path(root))["dataset"], [entry])
+        # Sol-loop r1 S3: a freeze that changes the bytes drops the form pin, which was the old graph's
+        # (it accepted the old graph after a re-freeze); the same bytes keep it.
+        same = datasets.refreeze(dict(entry), 47781, "2" * 64, "2026-11-08")
+        self.assertEqual((same["rdfc_sha256"], same.get("frozen")), ("7" * 64, None))
+        changed = datasets.refreeze(dict(entry), 47781, "3" * 64, "2026-11-08")
+        self.assertNotIn("rdfc_sha256", changed)
+        self.assertEqual((changed["sha256"], changed["frozen"]), ("3" * 64, "2026-11-08"))
+
+    def test_the_data_step_makes_a_missing_file_aside_and_keeps_only_what_its_pin_accepts(self):
+        """Orchestrator, 7 Nov 2026: a maker writes into a directory aside (NRESE_DATASET_DIR, never
+        the shared volume); each file the cases need is checked against its pin and only then renamed
+        into the cache. A file that isn't its pin stays out, the cache as it was, and only it fails."""
+        import hashlib
+        if shutil.which("bash") is None:
+            self.skipTest("needs bash")
+        made = {"univ-bench.nt": b"<a> <b> <c> .\n", "lubm-1.nt": b"<q> <r> <s> .\n"}
+        pins = {"univ-bench.nt": hashlib.sha256(made["univ-bench.nt"]).hexdigest(),
+                "lubm-1.nt": hashlib.sha256(b"<not> <what> <it makes> .\n").hexdigest()}
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as cache:
+            root, cache = Path(root), Path(cache)
+            (root / "benches/reasoning").mkdir(parents=True)
+            (root / "benches/reasoning/prepare-lubm.sh").write_text(
+                '#!/usr/bin/env bash\nset -e\nd=${NRESE_DATASET_DIR:?}\n'
+                + "".join(f"printf '%s' '{body.decode()}' > \"$d/{name}\"\n" for name, body in made.items()),
+                encoding="utf-8", newline="\n")
+            (root / "benches/datasets.toml").write_text("".join(
+                f'[[dataset]]\nfile = "{name}"\nmade_by = "bash benches/reasoning/prepare-lubm.sh 1"\n'
+                f'bytes = {len(made[name])}\nsha256 = "{pins[name]}"\n\n' for name in made), encoding="utf-8")
+            with patch.dict(os.environ, {"SPARQL_DATA": str(cache)}), \
+                    patch.object(gate_module.hosts_registry, "input_path", return_value=None):
+                lines, ok = gate_module.data_state([{"data": "volume:lubm-1.nt", "extra": ["volume:univ-bench.nt"]}],
+                                                   make=True, root=root)
+            text = "\n".join(lines)
+            self.assertFalse(ok, text)
+            self.assertEqual(sorted(p.name for p in cache.iterdir()), ["univ-bench.nt"], text)  # nothing else, no aside
+            self.assertEqual((cache / "univ-bench.nt").read_bytes(), made["univ-bench.nt"])
+            self.assertIn("made univ-bench.nt", text)
+            self.assertIn("FAILED lubm-1.nt", text)
 
     def test_the_data_probe_says_what_a_host_holds_and_what_it_cannot_make(self):
         """The probe (release_gate.py data; release-gate.sh prepare with --make): a file in the cache
@@ -991,10 +1182,15 @@ esac
             (shim / "python3").chmod(0o755)
             inputs = Path(tmp) / "inputs" / "support-stress"
             inputs.mkdir(parents=True)
-            for name in ("copies-17.nq", "copies-17.nq.reader"):
-                (inputs / name).write_text("", encoding="utf-8")
-            (inputs / "copies-17.nq.commits.ru").write_text(
-                "INSERT DATA { <http://example.org/s> a <http://example.org/Absent> }\n", encoding="utf-8")
+            # Each at its pinned size, its bytes altered: the data step takes them as there, and the
+            # view's freeze check is what must refuse them (7 Nov 2026: at another size, a file a job
+            # can make is made instead, and that path has its own test).
+            pinned = {d["file"]: d["bytes"] for d in __import__("tomllib").loads(
+                (ROOT / "benches/datasets.toml").read_text(encoding="utf-8"))["dataset"]}
+            altered = b"INSERT DATA { <http://example.org/s> a <http://example.org/Absent> }\n"
+            for name in ("copies-17.nq", "copies-17.nq.reader", "copies-17.nq.commits.ru"):
+                size = pinned[f"support-stress/{name}"]
+                (inputs / name).write_bytes((altered * (size // len(altered) + 1))[:size])
             view = Path(tmp) / "gate" / "data" / "support-stress"
             view.mkdir(parents=True)
             (view / "copies-17.nq.commits.ru").symlink_to(inputs / "copies-17.nq.commits.ru")  # an earlier view's
