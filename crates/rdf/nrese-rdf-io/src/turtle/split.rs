@@ -152,9 +152,16 @@ pub(crate) struct Skimmer {
     /// No `{` can open a block in this statement any more.
     no_head: bool,
     /// The bytes of the last input not read yet: a token whose reading needs what comes
-    /// after them (a word at the input's end, a delimiter cut by it). A token holds no
-    /// whitespace, so they end at the first whitespace of the next input.
+    /// after them (a word at the input's end, a delimiter cut by it). They end at the next
+    /// byte that ends a token (`ends_token`).
     pending: Vec<u8>,
+    /// Whether a byte order mark at the document's start has been looked for (the parser
+    /// reads past one there).
+    started: bool,
+    /// In a SPARQL-style directive's short string: where in the directive's text it starts
+    /// (a `VERSION` ends with it only if it holds no line break: one that does is a token the
+    /// lexer can't read, which recovery skips).
+    string_from: usize,
     /// The document offset of the next byte read.
     offset: u64,
     line: u64,
@@ -187,6 +194,8 @@ impl Skimmer {
             head: Vec::new(),
             no_head: false,
             pending: Vec::new(),
+            started: false,
+            string_from: 0,
             offset: 0,
             line: 0,
             line_start: 0,
@@ -283,20 +292,21 @@ impl Skimmer {
     /// Feeds the next bytes of the document.
     pub(crate) fn feed(&mut self, bytes: &[u8]) {
         let mut bytes = bytes;
-        if !self.pending.is_empty() {
-            // What was held back, with this input up to its first whitespace: enough to read
-            // it.
-            let k = bytes
-                .iter()
-                .position(u8::is_ascii_whitespace)
-                .map_or(bytes.len(), |k| k + 1);
+        while !self.pending.is_empty() {
+            // What was held back goes on to the next byte that ends a token: until it comes,
+            // the input only grows it (each byte is looked at once). With that byte and two
+            // more (a delimiter's own length), it can be read.
+            let Some(k) = bytes.iter().position(|&c| ends_token(c)) else {
+                self.pending.extend_from_slice(bytes);
+                return;
+            };
+            let k = (k + 3).min(bytes.len());
             let mut joined = std::mem::take(&mut self.pending);
             joined.extend_from_slice(&bytes[..k]);
             let read = self.scan(&joined, false);
             self.pending = joined.split_off(read);
             bytes = &bytes[k..];
-            if !self.pending.is_empty() {
-                self.pending.extend_from_slice(bytes);
+            if bytes.is_empty() {
                 return;
             }
         }
@@ -325,14 +335,27 @@ impl Skimmer {
                 *counted = upto;
             }
         };
-        // A word at the input's end is held back (it may go on): it starts after the last
-        // whitespace or interesting byte.
+        // The document's start: a byte order mark is no text, as for the parser.
+        if !self.started && base == 0 {
+            const BOM: &[u8] = "\u{FEFF}".as_bytes();
+            if n < BOM.len() && !eof && BOM.starts_with(bytes) {
+                return 0;
+            }
+            self.started = true;
+            if bytes.starts_with(BOM) {
+                i = BOM.len();
+                self.statement_start = i as u64;
+                self.start = Some((i as u64, Vec::new()));
+            }
+        }
+        // A word at the input's end is held back (it may go on, its start is needed to read
+        // a `\` in it): it starts after the last byte that ends a token.
         let tail = if eof {
             n
         } else {
             bytes
                 .iter()
-                .rposition(|&c| c.is_ascii_whitespace() || INTERESTING[c as usize])
+                .rposition(|&c| ends_token(c))
                 .map_or(0, |k| k + 1)
         };
         // Where reading stopped for want of more input.
@@ -609,6 +632,7 @@ impl Skimmer {
                         // directive's text (a `VERSION` string held it twice).
                         if let Some((text, _)) = &mut self.directive {
                             text.pop();
+                            self.string_from = text.len();
                         }
                         self.state = if count == 2 {
                             // `""`: the empty string; this byte is after it.
@@ -646,9 +670,16 @@ impl Skimmer {
                             };
                             i += k + 1;
                             // A SPARQL-style `VERSION` ends with its string (only short
-                            // strings may follow it), whatever is open.
+                            // strings may follow it), whatever is open; not with one holding
+                            // a line break (a token the lexer can't read: recovery skips it,
+                            // and the directive goes on to a `.`).
+                            let string_from = self.string_from;
                             if closed
-                                && matches!(&self.directive, Some((text, false)) if version(text))
+                                && matches!(&self.directive, Some((text, false))
+                                    if version(text)
+                                        && !text[string_from.min(text.len())..]
+                                            .iter()
+                                            .any(|&c| c == b'\n' || c == b'\r'))
                             {
                                 let at = base + i as u64;
                                 count_lines(self, &mut counted, i);
@@ -718,7 +749,9 @@ impl Skimmer {
             let from = self.statement_start.saturating_sub(base) as usize;
             if from < read {
                 self.head.extend_from_slice(&bytes[from..read]);
-                if head(&self.head, false) == Head::Not {
+                // Inside a token (an IRI, a string, a comment) the head is told when it ends:
+                // a long one isn't read again at every input.
+                if self.state == State::Normal && head(&self.head, false) == Head::Not {
                     self.head.clear();
                     self.no_head = true;
                 }
