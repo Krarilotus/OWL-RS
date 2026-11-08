@@ -449,12 +449,15 @@ fn a_crossed_group_by_a_key_named_again_draws_from_the_query_budget() {
 /// k distinct arms, each every `ex:p` statement) give each of the 2n `ex:p` pairs k times;
 /// under `+` each pair once (the self-pairs and the hub's), from the hub each `ex:n<i>`
 /// once, under `?` each pair once and every node with itself (2n + 2), COUNT under `+` 2n,
-/// `^(…)+` each reversed pair once. Outside a closure the bag keeps its copies: 4 arms
-/// answer each pair 4 times; 64 arms make 128n rows, over 1 MiB for n = 1,024 and 4,096:
-/// `MemoryLimit`. Each way, the query's thread holds at most the limit and its bookkeeping
-/// (holding every arm's bag at once would be 64 × 2n × 16 bytes, 8 MiB for n = 4,096; the
-/// package review r1 of the executor memory stack, EMS-R1). On the default path and as
-/// written alike.
+/// `^(…)+` each reversed pair once. Outside a closure the bag keeps its copies, followed
+/// whole or from the values `?x ex:p ?x` binds (OPTIONAL): 4 arms answer each pair 4 times
+/// for n = 1,024; for n = 4,096 the 512 KiB answer, the union it is made from and that
+/// union's move as it grows need more than 1 MiB, so it is answered or refused with
+/// `MemoryLimit`, either way within the bound; 64 arms make 128n rows, over 1 MiB for
+/// n = 1,024 and 4,096: `MemoryLimit`. Each way, the query's thread holds at most the
+/// limit and its bookkeeping (holding every arm's bag at once would be 64 × 2n × 16 bytes,
+/// 8 MiB for n = 4,096; the package review r1 of the executor memory stack, EMS-R1, and its
+/// sol-loop r1 S1: the bound values' pairs). On the default path and as written alike.
 #[test]
 fn overlapping_alternative_arms_draw_from_the_query_budget() {
     let mut failed = Vec::new();
@@ -495,40 +498,62 @@ fn overlapping_alternative_arms_draw_from_the_query_budget() {
                 .map(|i| row(&[("y", iri(&format!("n{i}")))]))
                 .collect();
             let count = vec![row(&[("c", integer(2 * n))])];
-            // The solutions of each case (None: the memory error).
-            let cases: [(&str, String, Option<Vec<Row>>); 6] = [
+            let bound = (0..n).flat_map(|i| {
+                let pair = (iri(&format!("n{i}")), iri(&format!("n{i}")));
+                std::iter::repeat_n(pair, k)
+            });
+            // Near the limit: answered or refused, never past the bound.
+            let near = k == 4 && n == 1 << 12;
+            // The solutions of each case (None: the memory error), and whether the memory
+            // error may stand for them.
+            let cases: [(&str, String, Option<Vec<Row>>, bool); 7] = [
                 (
                     "under +",
                     format!("SELECT ?x ?y WHERE {{ ?x ({arms})+ ?y }}"),
                     Some(pairs(once.clone())),
+                    false,
                 ),
                 (
                     "from the hub under +",
                     format!("SELECT ?y WHERE {{ {} ({arms})+ ?y }}", iri("h")),
                     Some(ends),
+                    false,
                 ),
                 (
                     "under ?",
                     format!("SELECT ?x ?y WHERE {{ ?x ({arms})? ?y }}"),
                     Some(pairs(zero_or_one)),
+                    false,
                 ),
                 (
                     "reversed under +",
                     format!("SELECT ?x ?y WHERE {{ ?x (^({arms}))+ ?y }}"),
                     Some(pairs(reversed)),
+                    false,
                 ),
                 (
                     "COUNT under +",
                     format!("SELECT (COUNT(*) AS ?c) WHERE {{ ?x ({arms})+ ?y }}"),
                     Some(count),
+                    false,
                 ),
                 (
                     "outside a closure",
                     format!("SELECT ?x ?y WHERE {{ ?x ({arms}) ?y }}"),
                     (k == 4).then(|| pairs(copies.collect())),
+                    near,
+                ),
+                (
+                    "from bound values, outside a closure",
+                    format!(
+                        "SELECT ?x ?y WHERE {{ ?x {} ?x OPTIONAL {{ ?x ({arms}) ?y }} }}",
+                        iri("p")
+                    ),
+                    (k == 4).then(|| pairs(bound.collect())),
+                    near,
                 ),
             ];
-            for (case, query, expected) in &cases {
+            for (case, query, expected, refusable) in &cases {
                 let answered = expected.as_ref().map(Vec::len);
                 for as_written in [false, true] {
                     let (outcome, peak) = run(&engine, query, as_written);
@@ -537,7 +562,9 @@ fn overlapping_alternative_arms_draw_from_the_query_budget() {
                         Err(QueryEvaluationError::MemoryLimit(_)) => None,
                         other => Some(other.map_err(|e| e.to_string())),
                     };
-                    if outcome != answered.map(Ok) {
+                    if outcome.is_none() && *refusable {
+                        // Refused near the limit: the bound below still holds.
+                    } else if outcome != answered.map(Ok) {
                         failed.push(format!(
                             "{case}: {outcome:?}, not {answered:?} (None: the memory error)"
                         ));
