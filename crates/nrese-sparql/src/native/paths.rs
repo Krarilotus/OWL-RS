@@ -29,22 +29,35 @@
 //! evaluation would give for them, without the rest. `?p a :Person . ?x owl:sameAs* ?p`
 //! then costs what the persons' identity groups cost, not one row per node of the graph.
 //!
-//! What the path's text multiplies draws from the query's budget where it grows
-//! ([`PathEvaluator::either`]): an alternative takes its arms one at a time, its union
-//! charged before it grows, and under a set-valued path only the arms' support, each pair
-//! once as they come (the executor memory stack's review r1, EMS-R1: 64 distinct arms over
-//! the same statements once held 64 bags at once). A refused charge stops the evaluator as a
+//! Every buffer a path's evaluation makes (its bags, an alternative's union, a sequence
+//! step's ends and their tally, the pairs from bound values, the answer's columns) is a
+//! [`Buf`] or a [`Map`]: its memory is charged to the query's budget, through the evaluator's
+//! [`Pool`], before it is allocated, the charge moves with it, and it is freed before its
+//! charge is released. No code here counts bytes: the charge is the buffer's (the executor
+//! memory stack's second lead, 8 Nov: a charge kept beside its vector by hand disagreed with
+//! it at one more site in each of six review rounds). What the path's text multiplies is
+//! held down by the algorithm: an alternative takes its arms one at a time, under a
+//! set-valued path only their support (EMS-R1), and a sequence step counts its ends once
+//! they would outnumber its entries (EMS-16). A refused charge stops the evaluator as a
 //! cancellation does, and its entry points report it ([`PathEvaluator::ends`] and the others).
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
+use std::sync::Arc;
 
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::graph::{
     Adjacency, closure, closure_sizes_until, reachable, transitive_closure_until,
 };
-use nrese_exec::{Budget, BudgetExceeded, Grant};
+use nrese_exec::{Budget, BudgetExceeded, Charged, ChargedMap, Pool, Share};
 use nrese_sparql_syntax::algebra::PropertyPathExpression;
+
+/// A buffer of a path's evaluation: charged to the query's budget through the evaluator's
+/// pool while it lives ([`Charged`]).
+pub(crate) type Buf<'e, T> = Charged<T, Share<'e>>;
+
+/// A hash map of a path's evaluation, charged as a [`Buf`] is ([`ChargedMap`]).
+type Map<'e, K, V> = ChargedMap<K, V, Share<'e>>;
 
 /// A path with its IRIs resolved to ids; `None` marks an IRI the store doesn't know (no
 /// edges). Equal paths have equal bags ([`PathEvaluator::either`]).
@@ -113,31 +126,20 @@ impl Path {
 /// Beyond, it scans its step once into an [`Adjacency`] and walks that from the values.
 const PROBED_VALUES: usize = 4096;
 
-fn dedup_keep_order(mut values: Vec<u64>) -> Vec<u64> {
-    let mut seen = std::collections::HashSet::with_capacity(values.len());
-    values.retain(|v| seen.insert(*v));
-    values
-}
-
-fn dedup_pairs(mut pairs: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
-    let mut seen = std::collections::HashSet::with_capacity(pairs.len());
-    pairs.retain(|p| seen.insert(*p));
-    pairs
-}
-
 /// A path's solutions from a node, or all of them: a bag (an alternative is a UNION, a
 /// sequence a join). A sequence of alternatives multiplies the ways through a node: over
 /// one statement `a p a`, `(p|p)/(p|p)/…` reaches `a` 2^n ways in n steps, so a sequence's
 /// bag holds each value once with how often it occurs, never the copies, whose number grows
-/// with the path's text. Only the caller that charges the copies ([`Self::len`]) makes them.
-pub(crate) enum Bag<T> {
+/// with the path's text. Only the caller that charges the copies ([`Self::into_copies`])
+/// makes them.
+pub(crate) enum Bag<'e, T> {
     /// One entry per copy.
-    Copies(Vec<T>),
+    Copies(Buf<'e, T>),
     /// Each entry with how many copies it stands for (saturating).
-    Counted(Vec<(T, usize)>),
+    Counted(Buf<'e, (T, usize)>),
 }
 
-impl<T: Copy> Bag<T> {
+impl<'e, T: Copy> Bag<'e, T> {
     /// How many copies the bag holds (saturating).
     pub(crate) fn len(&self) -> usize {
         match self {
@@ -161,201 +163,144 @@ impl<T: Copy> Bag<T> {
             Self::Copies(values) => (Some(values), None),
             Self::Counted(counted) => (None, Some(counted)),
         };
-        let copies = copies.into_iter().flatten().map(|&value| (value, 1));
-        copies.chain(counted.into_iter().flatten().copied())
+        let copies = copies
+            .into_iter()
+            .flat_map(|v| v.iter())
+            .map(|&value| (value, 1));
+        copies.chain(counted.into_iter().flat_map(|c| c.iter()).copied())
     }
 
-    /// The values, without their copies (a value may still come more than once).
-    fn values(self) -> Vec<T> {
-        match self {
-            Self::Copies(values) => values,
-            Self::Counted(counted) => counted.into_iter().map(|(value, _)| value).collect(),
-        }
-    }
-
-    /// Every copy: as many values as [`Self::len`], which the caller charged.
-    pub(crate) fn into_copies(self) -> Vec<T> {
+    /// Every copy, as many values as [`Self::len`]: a bag of copies moves out whole, with its
+    /// charge; a counted one's copies are charged to `pool` before they are made, beside it.
+    pub(crate) fn into_copies(self, pool: &'e Pool) -> Result<Buf<'e, T>, BudgetExceeded> {
         let total = self.len();
         let counted = match self {
-            Self::Copies(values) => return values,
+            Self::Copies(values) => return Ok(values),
             Self::Counted(counted) => counted,
         };
-        let mut values = Vec::with_capacity(total);
-        for (value, copies) in counted {
-            values.extend(std::iter::repeat_n(value, copies));
+        let mut values = Buf::with_capacity_in(pool, total)?;
+        values.fill(total, |room| {
+            for &(value, copies) in counted.iter() {
+                (0..copies).for_each(|_| room.push(value));
+            }
+        })?;
+        Ok(values)
+    }
+
+    /// How many entries the bag holds: its copies, or its counted values.
+    fn entries(&self) -> usize {
+        match self {
+            Self::Copies(values) => values.len(),
+            Self::Counted(counted) => counted.len(),
         }
-        values
     }
 }
 
 /// Bags added up, each value once with its copies, in the order each value first comes.
-struct Tally<T> {
-    counted: Vec<(T, usize)>,
-    at: std::collections::HashMap<T, usize>,
+struct Tally<'e, T> {
+    counted: Buf<'e, (T, usize)>,
+    at: Map<'e, T, usize>,
 }
 
-impl<T: Copy + Eq + std::hash::Hash> Tally<T> {
-    fn new() -> Self {
+impl<'e, T: Copy + Eq + std::hash::Hash> Tally<'e, T> {
+    fn new(pool: &'e Pool) -> Self {
         Self {
-            counted: Vec::new(),
-            at: std::collections::HashMap::new(),
+            counted: Buf::in_pool(pool),
+            at: Map::in_pool(pool),
         }
     }
 
-    fn add(&mut self, value: T, copies: usize) {
-        match self.at.entry(value) {
-            std::collections::hash_map::Entry::Occupied(at) => {
-                let held = &mut self.counted[*at.get()].1;
+    /// `value` added `copies` times; its room charged first. Refused, nothing changes.
+    fn add(&mut self, value: T, copies: usize) -> Result<(), BudgetExceeded> {
+        let next = self.counted.len();
+        // The entry's room before its index's: an index never points past the entries.
+        self.counted.reserve(1)?;
+        let (&mut at, new) = self.at.get_or_insert_with(value, || next)?;
+        match new {
+            true => self.counted.push((value, copies)),
+            false => {
+                let held = &mut self.counted[at].1;
                 *held = held.saturating_add(copies);
-            }
-            std::collections::hash_map::Entry::Vacant(at) => {
-                at.insert(self.counted.len());
-                self.counted.push((value, copies));
+                Ok(())
             }
         }
     }
 
-    fn finish(self) -> Bag<T> {
+    /// The values `values` holds, a copy each.
+    fn of(pool: &'e Pool, values: &[T]) -> Result<Self, BudgetExceeded> {
+        let mut tally = Self::new(pool);
+        for &value in values {
+            tally.add(value, 1)?;
+        }
+        Ok(tally)
+    }
+
+    fn finish(self) -> Bag<'e, T> {
         Bag::Counted(self.counted)
-    }
-
-    /// Room for `additional` more values.
-    fn reserve(&mut self, additional: usize) {
-        self.counted.reserve_exact(additional);
-        self.at.reserve(additional);
-    }
-
-    /// The bytes it holds.
-    fn bytes(&self) -> usize {
-        Self::bytes_for(self.counted.capacity(), self.at.capacity())
-    }
-
-    /// The bytes it holds with room for `additional` more values.
-    fn bytes_with(&self, additional: usize) -> usize {
-        let wanted = self.counted.len().saturating_add(additional);
-        let counted = self.counted.capacity().max(wanted);
-        Self::bytes_for(counted, self.at.capacity().max(wanted))
-    }
-
-    /// The bytes of room for `counted` values and an index of `at`: the index's an estimate
-    /// of a hash table's (a bucket and a control byte per entry, buckets a power of two at
-    /// least 8/7 of the room).
-    fn bytes_for(counted: usize, at: usize) -> usize {
-        let entry = std::mem::size_of::<(T, usize)>();
-        let buckets = match at {
-            0 => 0,
-            at => (at.saturating_mul(8) / 7).max(1).next_power_of_two(),
-        };
-        counted
-            .saturating_mul(entry)
-            .saturating_add(buckets.saturating_mul(entry + 1))
-    }
-}
-
-/// The bytes of `capacity` values of a vector.
-fn bytes_of<T>(capacity: usize) -> usize {
-    capacity.saturating_mul(std::mem::size_of::<T>())
-}
-
-/// The most a vector of `capacity` values holds while it makes room for `wanted`: its old
-/// room and the new together while it moves.
-fn moved<T>(capacity: usize, wanted: usize) -> usize {
-    match wanted > capacity {
-        true => bytes_of::<T>(capacity).saturating_add(bytes_of::<T>(wanted)),
-        false => bytes_of::<T>(capacity),
     }
 }
 
 /// An alternative's bags put together as its arms arrive, one at a time
 /// ([`PathEvaluator::either`]).
-enum Union<T> {
+enum Union<'e, T> {
     /// Every arm so far copies, and named once: their copies, concatenated.
-    Copies(Vec<T>),
+    Copies(Buf<'e, T>),
     /// Each value once with its copies.
-    Counted(Tally<T>),
+    Counted(Tally<'e, T>),
     /// The arms' values, for a set-valued path, deduplicated whenever an arm that isn't the
     /// last leaves more than twice `distinct` (the first arm's, or what the last
     /// deduplication left): at most twice the support and one arm.
-    Support { values: Vec<T>, distinct: usize },
+    Support { values: Buf<'e, T>, distinct: usize },
 }
 
-impl<T: Copy + Eq + std::hash::Hash + Ord> Union<T> {
-    fn new(support: bool) -> Self {
+impl<'e, T: Copy + Eq + std::hash::Hash + Ord> Union<'e, T> {
+    fn new(pool: &'e Pool, support: bool) -> Self {
         match support {
             true => Self::Support {
-                values: Vec::new(),
+                values: Buf::in_pool(pool),
                 distinct: 0,
             },
-            false => Self::Copies(Vec::new()),
+            false => Self::Copies(Buf::in_pool(pool)),
         }
     }
 
-    /// The most it holds, beside `arm`, while [`Self::add`] makes room for `arm`, named
-    /// `times`: a vector that grows moves, its old room beside the new until the move ends,
-    /// as the budget owner's `ChargedVec` charges it (sol-loop r1 S3 of EMS-R1); a first arm
-    /// of copies becomes the union, nothing beside it.
-    fn peak_with(&self, arm: &Bag<T>, times: usize) -> usize {
-        let room = |values: &Vec<T>| match (values.capacity(), arm) {
-            (0, Bag::Copies(_)) => 0,
-            (capacity, _) => moved::<T>(capacity, values.len().saturating_add(arm.entries())),
-        };
-        match self {
-            Self::Copies(values) if times == 1 && matches!(arm, Bag::Copies(_)) => room(values),
-            // Counted from here on: the copies beside the tally they go into.
-            Self::Copies(values) => {
-                let wanted = values.len().saturating_add(arm.entries());
-                let tally = Tally::<T>::bytes_for(wanted, wanted);
-                bytes_of::<T>(values.capacity()).saturating_add(tally)
-            }
-            Self::Counted(tally) => match (tally.bytes(), tally.bytes_with(arm.entries())) {
-                (now, then) if then > now => now.saturating_add(then),
-                (now, _) => now,
-            },
-            Self::Support { values, .. } => room(values),
-        }
-    }
-
-    /// `arm`, named `times`, added (`last`: no arm after it).
-    fn add(&mut self, arm: Bag<T>, times: usize, last: bool) {
+    /// `arm`, named `times`, added: the union grows beside the arm, which is freed once it is
+    /// in. A first arm of copies becomes the union, not a copy of it. Refused, the union stops
+    /// growing. A support is settled after it ([`Self::settle`]).
+    fn add(&mut self, pool: &'e Pool, arm: Bag<'e, T>, times: usize) -> Result<(), BudgetExceeded> {
         if let Self::Copies(values) = self
             && (times > 1 || matches!(arm, Bag::Counted(_)))
         {
-            let mut tally = Tally::new();
-            tally.reserve(values.len().saturating_add(arm.entries()));
-            for &value in values.iter() {
-                tally.add(value, 1);
-            }
+            // The copies beside the tally they go into, then freed.
+            let tally = Tally::of(pool, values)?;
             *self = Self::Counted(tally);
         }
-        match self {
-            // The first arm's vector becomes the union, not a copy of it.
-            Self::Copies(values) if values.capacity() == 0 => *values = arm.values(),
-            Self::Copies(values) => {
-                values.reserve_exact(arm.entries());
-                values.extend(arm.values());
+        match (self, arm) {
+            (Self::Copies(values) | Self::Support { values, .. }, Bag::Copies(arm))
+                if values.capacity() == 0 =>
+            {
+                *values = arm;
             }
-            Self::Counted(tally) => {
-                tally.reserve(arm.entries());
+            (Self::Copies(values) | Self::Support { values, .. }, Bag::Copies(arm)) => {
+                values.extend_from_slice(&arm)?;
+            }
+            (Self::Support { values, .. }, Bag::Counted(arm)) => {
+                values.extend_bounded(arm.len(), arm.iter().map(|&(value, _)| value))?;
+            }
+            (Self::Counted(tally), arm) => {
                 for (value, copies) in arm.counted() {
-                    tally.add(value, copies.saturating_mul(times));
+                    tally.add(value, copies.saturating_mul(times))?;
                 }
             }
-            Self::Support { values, .. } => {
-                if values.capacity() == 0 {
-                    *values = arm.values();
-                } else {
-                    values.reserve_exact(arm.entries());
-                    values.extend(arm.values());
-                }
-                self.settle(last);
-            }
+            (Self::Copies(_), Bag::Counted(_)) => unreachable!("counted from here on, above"),
         }
+        Ok(())
     }
 
     /// The vector an arm named `times` can be streamed into, value by value, without a
     /// vector of its own ([`PathEvaluator::stream`]): the copies' (named once) or the
     /// support's.
-    fn streamed(&mut self, times: usize) -> Option<&mut Vec<T>> {
+    fn streamed(&mut self, times: usize) -> Option<&mut Buf<'e, T>> {
         match self {
             Self::Copies(values) if times == 1 => Some(values),
             Self::Support { values, .. } => Some(values),
@@ -371,18 +316,28 @@ impl<T: Copy + Eq + std::hash::Hash + Ord> Union<T> {
                 *distinct = values.len();
             } else if !last && values.len() > distinct.saturating_mul(2) {
                 values.sort_unstable();
-                values.dedup();
+                dedup_sorted(values);
                 *distinct = values.len();
             }
         }
     }
 
-    fn finish(self) -> Bag<T> {
+    fn finish(self) -> Bag<'e, T> {
         match self {
             Self::Copies(values) | Self::Support { values, .. } => Bag::Copies(values),
             Self::Counted(tally) => tally.finish(),
         }
     }
+}
+
+/// `values`, sorted, with each value once.
+fn dedup_sorted<T: PartialEq + Copy>(values: &mut Buf<'_, T>) {
+    let mut previous = None;
+    values.retain(|&value| {
+        let first = previous != Some(value);
+        previous = Some(value);
+        first
+    });
 }
 
 /// A sequence step's ends: pushed as they come, a copy each, unless what it starts from is
@@ -395,141 +350,49 @@ impl<T: Copy + Eq + std::hash::Hash + Ord> Union<T> {
 /// then each end once, never 64·n (the package fix check r2 of the executor memory stack,
 /// EMS-R1). Counting hashes every end: a sequence whose steps give one end an entry
 /// (`author/city`) needs none of it (the executor memory stack's timing: counting every step
-/// cost path alternatives x1.56). Every growth is charged before it happens ([`Self::add`]).
-enum Ends<T> {
-    Copies(Vec<T>),
-    Counted(Tally<T>),
+/// cost path alternatives x1.56).
+enum Ends<'e, T> {
+    Copies(Buf<'e, T>),
+    Counted(Tally<'e, T>),
 }
 
-impl<T: Copy + Eq + std::hash::Hash> Ends<T> {
-    fn new(counted: bool) -> Self {
+impl<'e, T: Copy + Eq + std::hash::Hash> Ends<'e, T> {
+    fn new(pool: &'e Pool, counted: bool) -> Self {
         match counted {
-            true => Self::Counted(Tally::new()),
-            false => Self::Copies(Vec::new()),
+            true => Self::Counted(Tally::new(pool)),
+            false => Self::Copies(Buf::in_pool(pool)),
         }
     }
 
-    /// The bytes it holds.
-    fn bytes(&self) -> usize {
-        match self {
-            Self::Copies(values) => bytes_of::<T>(values.capacity()),
-            Self::Counted(tally) => tally.bytes(),
-        }
-    }
-
-    /// `value` added `copies` times, in a step given `entries` entries, its growth held in
-    /// `held` before it happens (the old room beside the new while it moves, doubling): a copy
-    /// while copies don't outnumber the entries, else counted from here on. False if the
-    /// budget refused the growth (recorded by `evaluator`).
+    /// `value` added `copies` times, in a step given `entries` entries: a copy while copies
+    /// don't outnumber the entries, else counted from here on (the copies beside the tally
+    /// they go into, then freed). Refused, it stops growing.
     fn add(
         &mut self,
-        evaluator: &PathEvaluator<'_>,
-        held: &mut usize,
+        pool: &'e Pool,
         value: T,
         copies: usize,
         entries: usize,
-    ) -> bool {
+    ) -> Result<(), BudgetExceeded> {
         if let Self::Copies(values) = self {
             if copies == 1 && values.len() < entries {
-                if values.len() == values.capacity() && !evaluator.room(held, values, 1, true) {
-                    return false;
-                }
-                values.push(value);
-                return true;
+                return values.push(value);
             }
-            let wanted = values.len().saturating_add(1);
-            let peak = bytes_of::<T>(values.capacity())
-                .saturating_add(Tally::<T>::bytes_for(wanted, wanted));
-            if !evaluator.hold(held, peak) {
-                return false;
-            }
-            let mut tally = Tally::new();
-            tally.reserve(wanted);
-            for &value in values.iter() {
-                tally.add(value, 1);
-            }
+            let tally = Tally::of(pool, values)?;
             *self = Self::Counted(tally);
         }
-        let Self::Counted(tally) = self else {
-            unreachable!("copies were counted above")
-        };
-        let full = tally.counted.len() == tally.counted.capacity()
-            || tally.at.len() == tally.at.capacity();
-        if full {
-            let more = tally.counted.len().max(1);
-            let peak = tally.bytes().saturating_add(tally.bytes_with(more));
-            if !evaluator.hold(held, peak) {
-                return false;
-            }
-            tally.reserve(more);
+        match self {
+            Self::Counted(tally) => tally.add(value, copies),
+            Self::Copies(_) => unreachable!("copies were counted above"),
         }
-        tally.add(value, copies);
-        evaluator.hold(held, self.bytes())
     }
 
-    fn finish(self) -> Bag<T> {
+    fn finish(self) -> Bag<'e, T> {
         match self {
             Self::Copies(values) => Bag::Copies(values),
             Self::Counted(tally) => tally.finish(),
         }
     }
-}
-
-impl<T> Bag<T> {
-    /// How many entries the bag holds: its copies, or its counted values.
-    fn entries(&self) -> usize {
-        match self {
-            Self::Copies(values) => values.len(),
-            Self::Counted(counted) => counted.len(),
-        }
-    }
-
-    /// The bytes it holds.
-    pub(crate) fn bytes(&self) -> usize {
-        match self {
-            Self::Copies(values) => bytes_of::<T>(values.capacity()),
-            Self::Counted(counted) => bytes_of::<(T, usize)>(counted.capacity()),
-        }
-    }
-
-    /// The bytes it holds beside a column made of its copies ([`Bag::into_copies`]): none
-    /// for copies, which move into the column; counted ones stay while the copies are made.
-    pub(crate) fn bytes_beside_copies(&self) -> usize {
-        match self {
-            Self::Copies(_) => 0,
-            Self::Counted(_) => self.bytes(),
-        }
-    }
-
-    /// Its copies, if it holds copies.
-    fn copies_entries(&self) -> usize {
-        match self {
-            Self::Copies(values) => values.len(),
-            Self::Counted(_) => 0,
-        }
-    }
-
-    /// Its counted values, if it holds counted ones.
-    fn counted_entries(&self) -> usize {
-        match self {
-            Self::Copies(_) => 0,
-            Self::Counted(counted) => counted.len(),
-        }
-    }
-}
-
-/// A vector's capacity once it has room for `additional` more values, at least doubling
-/// where it grows, and the most its room holds meanwhile: the old beside the new while it
-/// moves.
-fn grown<T>(values: &Vec<T>, additional: usize) -> (usize, usize) {
-    let capacity = values.capacity();
-    let wanted = values.len().saturating_add(additional);
-    if wanted <= capacity {
-        return (capacity, bytes_of::<T>(capacity));
-    }
-    let to = wanted.max(capacity.saturating_mul(2));
-    let peak = bytes_of::<T>(capacity).saturating_add(bytes_of::<T>(to));
-    (to, peak)
 }
 
 /// The graph a path is followed in.
@@ -560,33 +423,25 @@ pub(crate) struct PathEvaluator<'a> {
     /// Closures computed per strongly connected component so far (an open `p+` or `p*`,
     /// or its size for `COUNT`), for EXPLAIN.
     pub(crate) closures: Cell<usize>,
-    /// What the alternatives being put together hold, charged to the query's budget before
-    /// they grow ([`Self::hold`]): every byte, from a [`Grant`]'s spare, so the small bags
-    /// of a traversal's nodes cost no budget call. Its spare is the budget owner's rule
-    /// ([`Grant::new`]: the part's cap over the pool's workers, none under an envelope's
-    /// 1 KiB floor), so evaluators in parallel workers (EXISTS) hold one cap between them.
-    scratch: RefCell<Grant<&'a Budget>>,
-    /// The query's budget, for the fresh grant a handover leaves ([`Self::handover`]).
-    budget: &'a Budget,
+    /// What every buffer of the evaluation draws from: a grant on the query's budget whose
+    /// spare makes the small bags of a traversal's nodes cost no budget call. Its spare is
+    /// the budget owner's rule ([`nrese_exec::Grant::new`]: the part's cap over the pool's
+    /// workers, none under an envelope's 1 KiB floor), so evaluators in parallel workers
+    /// (EXISTS) hold one cap between them.
+    pool: Pool,
     /// The first charge the budget refused: it stops the evaluator as a cancellation does,
     /// and the entry points report it ([`Self::answer`]).
     refused: Cell<Option<BudgetExceeded>>,
-    /// The charge of the bag a producer just returned (an alternative's union, a sequence's
-    /// ends, a path's pairs from bound values), handed on with it: its consumer takes it over
-    /// the moment it receives the bag ([`Self::adopt`]), so a bag is never held uncharged
-    /// between its producer and its consumer (the package fix check r2 of the executor
-    /// memory stack). What no consumer takes over is released with the evaluator.
-    carried: Cell<usize>,
 }
 
 impl<'a> PathEvaluator<'a> {
-    /// An evaluator of paths in `graph` whose scratch draws from `budget`.
+    /// An evaluator of paths in `graph` whose buffers draw from `budget`.
     pub(crate) fn new(
         snapshot: &'a Snapshot,
         model: ReadModel,
         graph: PathGraph<'a>,
         cancellation: Option<&'a crate::CancellationToken>,
-        budget: &'a Budget,
+        budget: &Arc<Budget>,
     ) -> Self {
         Self {
             snapshot,
@@ -595,15 +450,19 @@ impl<'a> PathEvaluator<'a> {
             fixed: None,
             cancellation,
             closures: Cell::new(0),
-            scratch: RefCell::new(Grant::new(budget)),
-            budget,
+            pool: Pool::new(Arc::clone(budget)),
             refused: Cell::new(None),
-            carried: Cell::new(0),
         }
     }
 }
 
 impl PathEvaluator<'_> {
+    /// What the evaluation's buffers draw from: the answer's columns are made in it
+    /// ([`Bag::into_copies`]) and their charge handed to the answer's table.
+    pub(crate) fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
     /// Cancelled, or refused a charge.
     fn stopped(&self) -> bool {
         self.refused.get().is_some()
@@ -612,57 +471,22 @@ impl PathEvaluator<'_> {
                 .is_some_and(crate::CancellationToken::is_cancelled)
     }
 
-    /// Holds `bytes` of scratch where `held` were held: the difference charged, or given
-    /// back. False if the budget refused the charge (recorded: the evaluator stops), `held`
-    /// then unchanged.
-    fn hold(&self, held: &mut usize, bytes: usize) -> bool {
-        if bytes == *held {
-            return true;
+    /// The first refusal recorded: the evaluator stops.
+    fn refuse(&self, refused: BudgetExceeded) {
+        if self.refused.get().is_none() {
+            self.refused.set(Some(refused));
         }
-        let mut scratch = self.scratch.borrow_mut();
-        if bytes > *held {
-            if let Err(refused) = scratch.take(bytes - *held) {
-                if self.refused.get().is_none() {
-                    self.refused.set(Some(refused));
-                }
-                return false;
+    }
+
+    /// Whether a buffer's growth fitted; a refusal is recorded.
+    fn fits(&self, grown: Result<(), BudgetExceeded>) -> bool {
+        match grown {
+            Ok(()) => true,
+            Err(refused) => {
+                self.refuse(refused);
+                false
             }
-        } else {
-            scratch.give_back(*held - bytes);
         }
-        *held = bytes;
-        true
-    }
-
-    /// Hands `held`, the charge of the bag about to be returned, on to its consumer.
-    fn carry(&self, held: usize) {
-        self.carried.set(self.carried.get().saturating_add(held));
-    }
-
-    /// The charge handed on with the bag just received: the consumer holds it from here
-    /// (called at once, before any other evaluation can hand on another).
-    fn adopt(&self) -> usize {
-        self.carried.take()
-    }
-
-    /// The bag just received used up: its handed-on charge released.
-    fn done(&self, held: usize) {
-        let mut held = held;
-        self.hold(&mut held, 0);
-    }
-
-    /// The charge of the bag an entry point just returned, for the holder of the table made of
-    /// it to take over ([`nrese_exec::Reservation::adopt`]): the evaluator's grant handed over
-    /// whole (all it holds then is that bag's, every other hold having been given back), its
-    /// spare released, a fresh grant in its place. Never released and charged again: a bag
-    /// of copies moves into its table whole, so holding both charges refused what fits
-    /// (sol-loop r5 S1 of the package fix check r2: `<h> (<p>|<missing>) ?y` over 65,536
-    /// statements, 512 KiB charged twice), and releasing it first let another query sharing
-    /// the server's budget take its room while the bag still lived (sol-loop r6 S2).
-    pub(crate) fn handover(&self) -> usize {
-        self.carried.set(0);
-        let fresh = Grant::new(self.budget);
-        std::mem::replace(&mut *self.scratch.borrow_mut(), fresh).transfer()
     }
 
     /// `value`, unless a charge was refused while it was made: then what a stopped traversal
@@ -672,6 +496,71 @@ impl PathEvaluator<'_> {
             Some(refused) => Err(refused),
             None => Ok(value),
         }
+    }
+
+    /// An empty buffer of the evaluation.
+    fn buf<T>(&self) -> Buf<'_, T> {
+        Buf::in_pool(&self.pool)
+    }
+
+    /// `items` in a buffer of the evaluation, charged as it grows; refused, the items so far.
+    fn collect<T>(&self, items: impl Iterator<Item = T>) -> Buf<'_, T> {
+        let mut values = self.buf();
+        self.push_all(&mut values, items);
+        values
+    }
+
+    /// `items` pushed into `values`, its growth charged first. False if refused: then the
+    /// items so far.
+    fn push_all<T>(&self, values: &mut Buf<'_, T>, items: impl Iterator<Item = T>) -> bool {
+        for item in items {
+            if !self.fits(values.push(item)) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// A vector a producer that doesn't charge made ([`nrese_exec::graph`]'s closures),
+    /// charged now it has arrived; refused, freed, and the evaluator stops.
+    fn adopted<T>(&self, values: Vec<T>) -> Buf<'_, T> {
+        match self.buf().adopt_vec(values) {
+            Ok(values) => values,
+            Err(refused) => {
+                self.refuse(refused);
+                self.buf()
+            }
+        }
+    }
+
+    /// The values of a bag, without their copies (a value may still come more than once).
+    fn values<'e, T: Copy>(&'e self, bag: Bag<'e, T>) -> Buf<'e, T> {
+        match bag {
+            Bag::Copies(values) => values,
+            Bag::Counted(counted) => {
+                let mut values = self.buf();
+                if self.fits(values.reserve_exact(counted.len())) {
+                    self.push_all(&mut values, counted.iter().map(|&(value, _)| value));
+                }
+                values
+            }
+        }
+    }
+
+    /// `values` with each value once, in the order it first comes.
+    fn dedup_keep_order<'e, T: Copy + Eq + std::hash::Hash>(
+        &'e self,
+        mut values: Buf<'e, T>,
+    ) -> Buf<'e, T> {
+        let mut seen: Map<'e, T, ()> = Map::in_pool(&self.pool);
+        values.retain(|&value| match seen.get_or_insert_with(value, || ()) {
+            Ok((_, first)) => first,
+            Err(refused) => {
+                self.refuse(refused);
+                true
+            }
+        });
+        values
     }
 
     /// [`transitive_closure_until`] stopped with the query: then empty. None of edges a
@@ -692,76 +581,64 @@ impl PathEvaluator<'_> {
     /// The search takes each end once, however many ways lead there.
     fn step_from(&self, path: &Path, node: u64, out: &mut Vec<u64>) {
         if !self.stopped() {
-            let ends = self.support_from(path, node);
-            let held = self.adopt();
-            out.extend(ends);
-            self.done(held);
+            out.extend_from_slice(&self.support_from(path, node));
         }
     }
 
     /// [`Self::step_from`] backwards.
     fn step_to(&self, path: &Path, node: u64, out: &mut Vec<u64>) {
         if !self.stopped() {
-            let starts = self.support_to(path, node);
-            let held = self.adopt();
-            out.extend(starts);
-            self.done(held);
+            out.extend_from_slice(&self.support_to(path, node));
         }
     }
 
     /// The ends of `path` from `node`, for a set-valued path (a search's step, `p?`): each
     /// at least once, an alternative's put together as a support ([`Self::either`]).
-    fn support_from(&self, path: &Path, node: u64) -> Vec<u64> {
+    fn support_from(&self, path: &Path, node: u64) -> Buf<'_, u64> {
         match path {
-            Path::Alternative(paths) => self
-                .either(
-                    paths,
-                    true,
-                    |p| Bag::Copies(self.support_from(p, node)),
-                    |p, held, values| self.stream(p, held, values, Some(node), None, |(_, _, o)| o),
-                )
-                .values(),
+            Path::Alternative(paths) => self.values(self.either(
+                paths,
+                true,
+                |p| Bag::Copies(self.support_from(p, node)),
+                |p, values| self.stream(p, values, Some(node), None, |(_, _, o)| o),
+            )),
             Path::Reverse(p) => self.support_to(p, node),
-            _ => self.from(path, node).values(),
+            _ => self.values(self.from(path, node)),
         }
     }
 
     /// [`Self::support_from`] backwards: the starts reaching `node`.
-    fn support_to(&self, path: &Path, node: u64) -> Vec<u64> {
+    fn support_to(&self, path: &Path, node: u64) -> Buf<'_, u64> {
         match path {
-            Path::Alternative(paths) => self
-                .either(
-                    paths,
-                    true,
-                    |p| Bag::Copies(self.support_to(p, node)),
-                    |p, held, values| self.stream(p, held, values, None, Some(node), |(s, _, _)| s),
-                )
-                .values(),
+            Path::Alternative(paths) => self.values(self.either(
+                paths,
+                true,
+                |p| Bag::Copies(self.support_to(p, node)),
+                |p, values| self.stream(p, values, None, Some(node), |(s, _, _)| s),
+            )),
             Path::Reverse(p) => self.support_from(p, node),
-            _ => self.to(path, node).values(),
+            _ => self.values(self.to(path, node)),
         }
     }
 
     /// The pairs of `path`, for a set-valued path (a closure's edges, `p?`): each at least
     /// once, an alternative's put together as a support ([`Self::either`]).
-    fn support(&self, path: &Path) -> Vec<(u64, u64)> {
+    fn support(&self, path: &Path) -> Buf<'_, (u64, u64)> {
         match path {
-            Path::Alternative(paths) => self
-                .either(
-                    paths,
-                    true,
-                    |p| Bag::Copies(self.support(p)),
-                    |p, held, values| self.stream(p, held, values, None, None, |(s, _, o)| (s, o)),
-                )
-                .values(),
+            Path::Alternative(paths) => self.values(self.either(
+                paths,
+                true,
+                |p| Bag::Copies(self.support(p)),
+                |p, values| self.stream(p, values, None, None, |(s, _, o)| (s, o)),
+            )),
             Path::Reverse(p) => {
                 let mut pairs = self.support(p);
-                for pair in &mut pairs {
+                for pair in pairs.iter_mut() {
                     *pair = (pair.1, pair.0);
                 }
                 pairs
             }
-            _ => self.open(path).values(),
+            _ => self.values(self.open(path)),
         }
     }
 
@@ -819,10 +696,16 @@ impl PathEvaluator<'_> {
     }
 
     /// Every subject and object of the graph, each once, sorted.
-    fn nodes(&self) -> Vec<u64> {
+    fn nodes(&self) -> Buf<'_, u64> {
         let (subjects, objects) = self.subjects_and_objects();
-        let mut nodes = Vec::with_capacity(subjects.len().max(objects.len()));
-        merge_union(&subjects, &objects, |node| nodes.push(node));
+        let mut nodes = self.buf();
+        if self.fits(nodes.reserve_exact(subjects.len().max(objects.len()))) {
+            merge_union(&subjects, &objects, |node| {
+                if !self.stopped() {
+                    self.fits(nodes.push(node));
+                }
+            });
+        }
         nodes
     }
 
@@ -899,6 +782,7 @@ impl PathEvaluator<'_> {
         let Some(sizes) = closure_sizes_until(&edges, &stop) else {
             return Ok(None);
         };
+        drop(edges);
         if matches!(path, Path::OneOrMore(_)) {
             return Ok(Some(sizes.iter().map(|&(_, reached, _)| reached).sum()));
         }
@@ -941,18 +825,21 @@ impl PathEvaluator<'_> {
     }
 
     /// Ends reachable from `start` (a bag), or the charge refused while they were found.
-    pub(crate) fn ends(&self, path: &Path, start: u64) -> Result<Bag<u64>, BudgetExceeded> {
-        self.answer(self.from(path, start))
+    pub(crate) fn ends(&self, path: &Path, start: u64) -> Result<Bag<'_, u64>, BudgetExceeded> {
+        let ends = self.from(path, start);
+        self.answer(ends)
     }
 
     /// Starts that reach `end` (a bag), or the charge refused while they were found.
-    pub(crate) fn starts(&self, path: &Path, end: u64) -> Result<Bag<u64>, BudgetExceeded> {
-        self.answer(self.to(path, end))
+    pub(crate) fn starts(&self, path: &Path, end: u64) -> Result<Bag<'_, u64>, BudgetExceeded> {
+        let starts = self.to(path, end);
+        self.answer(starts)
     }
 
     /// Every `(start, end)` pair (a bag), or the charge refused while they were found.
-    pub(crate) fn pairs(&self, path: &Path) -> Result<Bag<(u64, u64)>, BudgetExceeded> {
-        self.answer(self.open(path))
+    pub(crate) fn pairs(&self, path: &Path) -> Result<Bag<'_, (u64, u64)>, BudgetExceeded> {
+        let pairs = self.open(path);
+        self.answer(pairs)
     }
 
     /// How many solutions `start path end` has ([`Self::multiplicity`]), or the charge
@@ -967,13 +854,12 @@ impl PathEvaluator<'_> {
     }
 
     /// Ends reachable from `start` (a bag).
-    fn from(&self, path: &Path, start: u64) -> Bag<u64> {
+    fn from(&self, path: &Path, start: u64) -> Bag<'_, u64> {
         let copies = match path {
-            Path::Link(None) => Vec::new(),
-            Path::Link(Some(p)) => self
-                .quads(Some(start), Some(*p), None)
-                .map(|(_, _, o)| o)
-                .collect(),
+            Path::Link(None) => self.buf(),
+            Path::Link(Some(p)) => {
+                self.collect(self.quads(Some(start), Some(*p), None).map(|(_, _, o)| o))
+            }
             Path::Reverse(p) => return self.to(p, start),
             Path::Sequence(steps) => return self.through(steps, start, true),
             Path::Alternative(paths) => {
@@ -981,44 +867,47 @@ impl PathEvaluator<'_> {
                     paths,
                     false,
                     |p| self.from(p, start),
-                    |p, held, values| {
-                        self.stream(p, held, values, Some(start), None, |(_, _, o)| o)
-                    },
+                    |p, values| self.stream(p, values, Some(start), None, |(_, _, o)| o),
                 );
             }
-            Path::OneOrMore(p) => reachable(start, false, |n, out| self.step_from(p, n, out)),
+            Path::OneOrMore(p) => {
+                self.adopted(reachable(start, false, |n, out| self.step_from(p, n, out)))
+            }
             Path::ZeroOrMore(p) => {
                 if !self.is_node(start) {
-                    return Bag::Copies(Vec::new());
+                    return Bag::Copies(self.buf());
                 }
-                reachable(start, true, |n, out| self.step_from(p, n, out))
+                self.adopted(reachable(start, true, |n, out| self.step_from(p, n, out)))
             }
             Path::ZeroOrOne(p) => {
                 if !self.is_node(start) {
-                    return Bag::Copies(Vec::new());
+                    return Bag::Copies(self.buf());
                 }
-                let mut ends = vec![start];
-                let support = self.support_from(p, start);
-                let held = self.adopt();
-                ends.extend(support);
-                self.done(held);
-                dedup_keep_order(ends)
+                let mut ends = self.buf();
+                if self.fits(ends.push(start)) {
+                    let support = self.support_from(p, start);
+                    self.fits(ends.extend_from_slice(&support));
+                }
+                self.dedup_keep_order(ends)
             }
-            Path::Negated(excluded) => self
-                .quads(Some(start), None, None)
-                .filter(|(_, p, _)| !excluded.contains(p))
-                .map(|(_, _, o)| o)
-                .collect(),
+            Path::Negated(excluded) => self.collect(
+                self.quads(Some(start), None, None)
+                    .filter(|(_, p, _)| !excluded.contains(p))
+                    .map(|(_, _, o)| o),
+            ),
         };
         Bag::Copies(copies)
     }
 
     /// The ends reached from `node` through `steps` in sequence (`forward`), or the starts
     /// reaching it (the last step first): one per way through, each end once with how
-    /// many, step by step ([`Self::step`]). Its charge is handed on with it.
-    fn through(&self, steps: &[Path], node: u64, forward: bool) -> Bag<u64> {
-        let mut nodes = Bag::Copies(vec![node]);
-        let mut held = 0;
+    /// many, step by step ([`Self::step`]); each step's input freed once the next is made.
+    fn through(&self, steps: &[Path], node: u64, forward: bool) -> Bag<'_, u64> {
+        let mut start = self.buf();
+        if !self.fits(start.push(node)) {
+            return Bag::Copies(start);
+        }
+        let mut nodes = Bag::Copies(start);
         let ordered: Box<dyn Iterator<Item = &Path>> = match forward {
             true => Box::new(steps.iter()),
             false => Box::new(steps.iter().rev()),
@@ -1028,34 +917,29 @@ impl PathEvaluator<'_> {
             if nodes.is_empty() {
                 break;
             }
-            let mut next = 0;
-            let ends = self.step(&nodes, step, forward, |m| m, |_, end| end, &mut next);
-            self.done(held);
-            held = next;
-            nodes = ends.finish();
+            nodes = self
+                .step(&nodes, step, forward, |m| m, |_, end| end)
+                .finish();
         }
-        self.carry(held);
         nodes
     }
 
     /// One step of a sequence: each entry of `input` (its node `node`) followed through
     /// `step` forwards, or backwards to the starts reaching it, `out` making the result of an
-    /// entry and an end, the ways multiplied ([`Ends::add`]: charged in `held` before every
-    /// growth, counted once its copies would outnumber the entries). A leaf step (a link, a
-    /// negated set) streams its statements' ends in, with no vector of their own; another
-    /// step's bag arrives with its charge handed on and gives it back once added. Stops
+    /// entry and an end, the ways multiplied ([`Ends::add`]: counted once its copies would
+    /// outnumber the entries). A leaf step (a link, a negated set) streams its statements'
+    /// ends in, with no vector of their own; another step's bag is added, then freed. Stops
     /// early once a charge was refused.
-    fn step<I: Copy, O: Copy + Eq + std::hash::Hash>(
-        &self,
-        input: &Bag<I>,
+    fn step<'e, I: Copy, O: Copy + Eq + std::hash::Hash>(
+        &'e self,
+        input: &Bag<'e, I>,
         step: &Path,
         forward: bool,
         node: impl Fn(I) -> u64,
         out: impl Fn(I, u64) -> O,
-        held: &mut usize,
-    ) -> Ends<O> {
+    ) -> Ends<'e, O> {
         let entries = input.entries();
-        let mut next = Ends::new(matches!(input, Bag::Counted(_)));
+        let mut next = Ends::new(&self.pool, matches!(input, Bag::Counted(_)));
         for (item, ways) in input.counted() {
             if self.stopped() {
                 break;
@@ -1067,26 +951,18 @@ impl PathEvaluator<'_> {
             };
             let streamed = self.leaf_each(step, subject, object, |(s, _, o)| {
                 let end = if forward { o } else { s };
-                next.add(self, held, out(item, end), ways, entries)
+                self.fits(next.add(&self.pool, out(item, end), ways, entries))
             });
-            let fits = match streamed {
-                Some(fits) => fits,
-                None => {
-                    let ends = match forward {
-                        true => self.from(step, m),
-                        false => self.to(step, m),
-                    };
-                    let mut arrived = self.adopt();
-                    let charge = arrived.max(ends.bytes());
-                    let fits = self.hold(&mut arrived, charge)
-                        && ends.counted().all(|(end, more)| {
-                            let ways = ways.saturating_mul(more);
-                            next.add(self, held, out(item, end), ways, entries)
-                        });
-                    self.done(arrived);
-                    fits
-                }
-            };
+            let fits = streamed.unwrap_or_else(|| {
+                let ends = match forward {
+                    true => self.from(step, m),
+                    false => self.to(step, m),
+                };
+                ends.counted().all(|(end, more)| {
+                    let ways = ways.saturating_mul(more);
+                    self.fits(next.add(&self.pool, out(item, end), ways, entries))
+                })
+            });
             if !fits {
                 break;
             }
@@ -1123,33 +999,30 @@ impl PathEvaluator<'_> {
     /// often, never copied, so `p|p|…` costs and holds what `p` does however often the
     /// path's text repeats it.
     /// The arms come one at a time ([`Union`]). A leaf arm (a link, a negated set) streams
-    /// its values into the union, charged as the union grows ([`Self::stream`]), with no
-    /// vector of its own, as engine-v2's `flat_map` did (the executor memory stack's path
-    /// counts, EMS-15: an arm's vector copied into the union cost a closure over an
-    /// alternative +38 M instructions a run). Any other arm arrives as its bag, held with the
-    /// union's room for it in one charge before the union grows (the first arm of copies
-    /// becomes the union, not a copy). Distinct arms with overlapping bags (`!(q)|!(q|q)|…`)
-    /// so hold the union and one arm, and under a set-valued path the union at most twice
-    /// their support (the package review r1 of the executor memory stack, EMS-R1). A
-    /// refused charge stops here with what was put together, which the entry points never
-    /// answer ([`Self::answer`]). What it returns is no longer charged: its consumer charges
-    /// it (an enclosing alternative as it arrives, the path's table before it is made).
-    fn either<T: Copy + Eq + std::hash::Hash + Ord>(
-        &self,
+    /// its values into the union ([`Self::stream`]), with no vector of its own, as
+    /// engine-v2's `flat_map` did (the executor memory stack's path counts, EMS-15: an arm's
+    /// vector copied into the union cost a closure over an alternative +38 M instructions a
+    /// run). Any other arm arrives as its bag, the union grown beside it, then the arm freed
+    /// (the first arm of copies becomes the union, not a copy). Distinct arms with
+    /// overlapping bags (`!(q)|!(q|q)|…`) so hold the union and one arm, and under a
+    /// set-valued path the union at most twice their support (the package review r1 of the
+    /// executor memory stack, EMS-R1). A refused charge stops here with what was put
+    /// together, which the entry points never answer ([`Self::answer`]).
+    fn either<'e, T: Copy + Eq + std::hash::Hash + Ord>(
+        &'e self,
         arms: &[(Path, usize)],
         support: bool,
-        bag: impl Fn(&Path) -> Bag<T>,
-        stream: impl Fn(&Path, &mut usize, &mut Vec<T>) -> Option<bool>,
-    ) -> Bag<T> {
-        let mut union = Union::new(support);
-        let mut held: usize = 0;
+        bag: impl Fn(&Path) -> Bag<'e, T>,
+        stream: impl Fn(&Path, &mut Buf<'e, T>) -> Option<bool>,
+    ) -> Bag<'e, T> {
+        let mut union = Union::new(&self.pool, support);
         for (i, (arm, times)) in arms.iter().enumerate() {
             let (times, last) = (*times, i + 1 == arms.len());
             if self.stopped() {
                 break;
             }
             let streamed = match union.streamed(times) {
-                Some(values) => stream(arm, &mut held, values),
+                Some(values) => stream(arm, values),
                 None => None,
             };
             match streamed {
@@ -1161,17 +1034,11 @@ impl PathEvaluator<'_> {
                 None => {}
             }
             let arm = bag(arm);
-            // The arm as it arrives, its charge handed on taken over, and the union's room
-            // for it, held in one charge (what the merge frees stays held until the next
-            // arm's charge or the end).
-            held = held.saturating_add(self.adopt());
-            let peak = union.peak_with(&arm, times).saturating_add(arm.bytes());
-            if !self.hold(&mut held, peak) {
+            if !self.fits(union.add(&self.pool, arm, times)) {
                 break;
             }
-            union.add(arm, times, last);
+            union.settle(last);
         }
-        self.carry(held);
         union.finish()
     }
 
@@ -1181,8 +1048,7 @@ impl PathEvaluator<'_> {
     fn stream<T>(
         &self,
         path: &Path,
-        held: &mut usize,
-        values: &mut Vec<T>,
+        values: &mut Buf<'_, T>,
         subject: Option<u64>,
         object: Option<u64>,
         value: impl Fn((u64, u64, u64)) -> T,
@@ -1191,42 +1057,24 @@ impl PathEvaluator<'_> {
             Path::Link(None) => Some(true),
             Path::Link(Some(p)) => {
                 let statements = self.quads(subject, Some(*p), object);
-                Some(self.push_all(held, values, statements.map(value)))
+                Some(self.push_all(values, statements.map(value)))
             }
             Path::Negated(excluded) => {
                 let statements = self.quads(subject, None, object);
                 let kept = statements.filter(|(_, p, _)| !excluded.contains(p));
-                Some(self.push_all(held, values, kept.map(value)))
+                Some(self.push_all(values, kept.map(value)))
             }
             _ => None,
         }
     }
 
-    /// `items` pushed into `values`, its room held in `held` before each growth
-    /// ([`Self::room`], doubling). False if refused: then the items so far.
-    fn push_all<T>(
-        &self,
-        held: &mut usize,
-        values: &mut Vec<T>,
-        items: impl Iterator<Item = T>,
-    ) -> bool {
-        for item in items {
-            if values.len() == values.capacity() && !self.room(held, values, 1, true) {
-                return false;
-            }
-            values.push(item);
-        }
-        true
-    }
-
     /// Starts that reach `end` (a bag).
-    fn to(&self, path: &Path, end: u64) -> Bag<u64> {
+    fn to(&self, path: &Path, end: u64) -> Bag<'_, u64> {
         let copies = match path {
-            Path::Link(None) => Vec::new(),
-            Path::Link(Some(p)) => self
-                .quads(None, Some(*p), Some(end))
-                .map(|(s, _, _)| s)
-                .collect(),
+            Path::Link(None) => self.buf(),
+            Path::Link(Some(p)) => {
+                self.collect(self.quads(None, Some(*p), Some(end)).map(|(s, _, _)| s))
+            }
             Path::Reverse(p) => return self.from(p, end),
             Path::Sequence(steps) => return self.through(steps, end, false),
             Path::Alternative(paths) => {
@@ -1234,32 +1082,34 @@ impl PathEvaluator<'_> {
                     paths,
                     false,
                     |p| self.to(p, end),
-                    |p, held, values| self.stream(p, held, values, None, Some(end), |(s, _, _)| s),
+                    |p, values| self.stream(p, values, None, Some(end), |(s, _, _)| s),
                 );
             }
-            Path::OneOrMore(p) => reachable(end, false, |n, out| self.step_to(p, n, out)),
+            Path::OneOrMore(p) => {
+                self.adopted(reachable(end, false, |n, out| self.step_to(p, n, out)))
+            }
             Path::ZeroOrMore(p) => {
                 if !self.is_node(end) {
-                    return Bag::Copies(Vec::new());
+                    return Bag::Copies(self.buf());
                 }
-                reachable(end, true, |n, out| self.step_to(p, n, out))
+                self.adopted(reachable(end, true, |n, out| self.step_to(p, n, out)))
             }
             Path::ZeroOrOne(p) => {
                 if !self.is_node(end) {
-                    return Bag::Copies(Vec::new());
+                    return Bag::Copies(self.buf());
                 }
-                let mut starts = vec![end];
-                let support = self.support_to(p, end);
-                let held = self.adopt();
-                starts.extend(support);
-                self.done(held);
-                dedup_keep_order(starts)
+                let mut starts = self.buf();
+                if self.fits(starts.push(end)) {
+                    let support = self.support_to(p, end);
+                    self.fits(starts.extend_from_slice(&support));
+                }
+                self.dedup_keep_order(starts)
             }
-            Path::Negated(excluded) => self
-                .quads(None, None, Some(end))
-                .filter(|(_, p, _)| !excluded.contains(p))
-                .map(|(s, _, _)| s)
-                .collect(),
+            Path::Negated(excluded) => self.collect(
+                self.quads(None, None, Some(end))
+                    .filter(|(_, p, _)| !excluded.contains(p))
+                    .map(|(s, _, _)| s),
+            ),
         };
         Bag::Copies(copies)
     }
@@ -1275,16 +1125,11 @@ impl PathEvaluator<'_> {
             Path::Reverse(p) => self.multiplicity(p, end, start),
             Path::Sequence(steps) => match steps.split_last() {
                 None => usize::from(start == end),
-                Some((last, before)) => {
-                    let middle = self.through(before, start, true);
-                    let held = self.adopt();
-                    let ways = middle
-                        .counted()
-                        .map(|(m, ways)| ways.saturating_mul(self.multiplicity(last, m, end)))
-                        .fold(0, usize::saturating_add);
-                    self.done(held);
-                    ways
-                }
+                Some((last, before)) => self
+                    .through(before, start, true)
+                    .counted()
+                    .map(|(m, ways)| ways.saturating_mul(self.multiplicity(last, m, end)))
+                    .fold(0, usize::saturating_add),
             },
             Path::Alternative(arms) => arms
                 .iter()
@@ -1312,13 +1157,10 @@ impl PathEvaluator<'_> {
             Path::Sequence(steps) => match steps.split_last() {
                 None => start == end,
                 Some((last, before)) => {
-                    let mut middle = self.through(before, start, true).values();
-                    let held = self.adopt();
+                    let mut middle = self.values(self.through(before, start, true));
                     middle.sort_unstable();
-                    middle.dedup();
-                    let connects = middle.into_iter().any(|m| self.connects(last, m, end));
-                    self.done(held);
-                    connects
+                    dedup_sorted(&mut middle);
+                    middle.iter().any(|&m| self.connects(last, m, end))
                 }
             },
             Path::Alternative(arms) => arms.iter().any(|(p, _)| self.connects(p, start, end)),
@@ -1351,20 +1193,20 @@ impl PathEvaluator<'_> {
         &self,
         path: &Path,
         starts: &[u64],
-    ) -> Result<Bag<(u64, u64)>, BudgetExceeded> {
+    ) -> Result<Bag<'_, (u64, u64)>, BudgetExceeded> {
         let pairs = match path {
             Path::OneOrMore(step) | Path::ZeroOrMore(step) if starts.len() > PROBED_VALUES => {
                 let reflexive = matches!(path, Path::ZeroOrMore(_));
-                let adjacency = Adjacency::new(self.edges(step));
-                let held = self.adopt();
+                // The edges' charge stays while the adjacency made of them lives (declared
+                // before it: dropped after it).
+                let (edges, _held) = self.edges(step).into_parts();
+                let adjacency = Adjacency::new(edges);
                 let starts = starts
                     .iter()
                     .copied()
                     .take_while(|_| !self.stopped())
                     .filter(|&node| !reflexive || self.is_node(node));
-                let pairs = Bag::Copies(pairs_of(closure(&adjacency, starts, reflexive)));
-                self.done(held);
-                pairs
+                Bag::Copies(self.adopted(pairs_of(closure(&adjacency, starts, reflexive))))
             }
             _ => self.pairs_at(
                 starts,
@@ -1381,21 +1223,27 @@ impl PathEvaluator<'_> {
         &self,
         path: &Path,
         ends: &[u64],
-    ) -> Result<Bag<(u64, u64)>, BudgetExceeded> {
+    ) -> Result<Bag<'_, (u64, u64)>, BudgetExceeded> {
         let pairs = match path {
             Path::OneOrMore(step) | Path::ZeroOrMore(step) if ends.len() > PROBED_VALUES => {
                 let reflexive = matches!(path, Path::ZeroOrMore(_));
-                let backwards =
-                    Adjacency::new(self.edges(step).into_iter().map(|(s, o)| (o, s)).collect());
-                let held = self.adopt();
+                let mut backwards = self.edges(step);
+                for edge in backwards.iter_mut() {
+                    *edge = (edge.1, edge.0);
+                }
+                // The edges' charge stays while the adjacency made of them lives.
+                let (backwards, _held) = backwards.into_parts();
+                let adjacency = Adjacency::new(backwards);
                 let ends = ends
                     .iter()
                     .copied()
                     .take_while(|_| !self.stopped())
                     .filter(|&node| !reflexive || self.is_node(node));
-                let pairs = pairs_of(closure(&backwards, ends, reflexive));
-                self.done(held);
-                Bag::Copies(pairs.into_iter().map(|(end, start)| (start, end)).collect())
+                let mut pairs = self.adopted(pairs_of(closure(&adjacency, ends, reflexive)));
+                for pair in pairs.iter_mut() {
+                    *pair = (pair.1, pair.0);
+                }
+                Bag::Copies(pairs)
             }
             _ => self.pairs_at(ends, |end| self.to(path, end), |end, start| (start, end)),
         };
@@ -1404,141 +1252,80 @@ impl PathEvaluator<'_> {
 
     /// The pairs of each of `nodes` (distinct) with each value of its bag, `pair` making a
     /// `(start, end)` pair of the node and the value: copies while every bag is copies.
-    /// Each node's bag and the pairs' room for it are held in one charge before the pairs
-    /// grow (doubling; the old room beside the new while a vector moves), as an
-    /// alternative's union is ([`Self::either`]): the bags of 64 distinct arms from 4,096
-    /// bound values are 64 pairs a node (sol-loop r1 S1 of EMS-R1). Each bag's handed-on
-    /// charge is taken over as it arrives, and the pairs' charge handed on with them.
-    fn pairs_at(
-        &self,
+    /// The pairs grow beside each node's bag, which is freed once it is in (the bags of 64
+    /// distinct arms from 4,096 bound values are 64 pairs a node: sol-loop r1 S1 of EMS-R1).
+    fn pairs_at<'e>(
+        &'e self,
         nodes: &[u64],
-        bag: impl Fn(u64) -> Bag<u64>,
+        bag: impl Fn(u64) -> Bag<'e, u64>,
         pair: impl Fn(u64, u64) -> (u64, u64),
-    ) -> Bag<(u64, u64)> {
-        let (mut copies, mut counted) = (Vec::new(), Vec::new());
-        let mut held: usize = 0;
+    ) -> Bag<'e, (u64, u64)> {
+        let (mut copies, mut counted) = (self.buf(), self.buf());
         for &node in nodes.iter().take_while(|_| !self.stopped()) {
-            let bag = bag(node);
-            held = held.saturating_add(self.adopt());
-            let (copies_to, copies_peak) = grown(&copies, bag.copies_entries());
-            let (counted_to, counted_peak) = grown(&counted, bag.counted_entries());
-            let peak = copies_peak
-                .saturating_add(counted_peak)
-                .saturating_add(bag.bytes());
-            if !self.hold(&mut held, peak) {
-                break;
-            }
-            match bag {
+            let added = match bag(node) {
                 Bag::Copies(values) => {
-                    copies.reserve_exact(copies_to - copies.len());
-                    copies.extend(values.into_iter().map(|v| pair(node, v)));
+                    let pairs = values.iter().map(|&value| pair(node, value));
+                    copies.extend_bounded(values.len(), pairs)
                 }
                 Bag::Counted(values) => {
-                    counted.reserve_exact(counted_to - counted.len());
-                    counted.extend(values.into_iter().map(|(v, n)| (pair(node, v), n)));
+                    let pairs = values.iter().map(|&(value, n)| (pair(node, value), n));
+                    counted.extend_bounded(values.len(), pairs)
                 }
+            };
+            if !self.fits(added) {
+                break;
             }
         }
-        let pairs = match counted.is_empty() {
-            true => Bag::Copies(copies),
-            false => {
-                let peak = moved::<((u64, u64), usize)>(
-                    counted.capacity(),
-                    counted.len().saturating_add(copies.len()),
-                )
-                .saturating_add(bytes_of::<(u64, u64)>(copies.capacity()));
-                if self.hold(&mut held, peak) {
-                    counted.reserve_exact(copies.len());
-                    counted.extend(copies.into_iter().map(|pair| (pair, 1)));
-                }
-                Bag::Counted(counted)
-            }
-        };
-        self.carry(held);
-        pairs
-    }
-
-    /// Room for `additional` more values in `values`, its bytes held in `held` first: the
-    /// old room and the new together while the vector moves, then the new. `doubling`: at
-    /// least twice the old room, for a vector grown a bag at a time. False if refused.
-    fn room<T>(
-        &self,
-        held: &mut usize,
-        values: &mut Vec<T>,
-        additional: usize,
-        doubling: bool,
-    ) -> bool {
-        let wanted = values.len().saturating_add(additional);
-        if wanted <= values.capacity() {
-            return true;
+        if counted.is_empty() {
+            return Bag::Copies(copies);
         }
-        let wanted = match doubling {
-            true => wanted.max(values.capacity().saturating_mul(2)),
-            false => wanted,
-        };
-        if !self.hold(held, moved::<T>(values.capacity(), wanted)) {
-            return false;
+        if self.fits(counted.reserve_exact(copies.len())) {
+            self.push_all(&mut counted, copies.iter().map(|&pair| (pair, 1)));
         }
-        values.reserve_exact(wanted - values.len());
-        self.hold(held, bytes_of::<T>(values.capacity()))
+        Bag::Counted(counted)
     }
 
     /// The pairs of `path` as edges for a closure: each at least once ([`Self::support`]),
     /// which is all a closure's reachability needs.
-    fn edges(&self, path: &Path) -> Vec<(u64, u64)> {
+    fn edges(&self, path: &Path) -> Buf<'_, (u64, u64)> {
         self.support(path)
     }
 
     /// Every `(start, end)` pair.
-    fn open(&self, path: &Path) -> Bag<(u64, u64)> {
+    fn open(&self, path: &Path) -> Bag<'_, (u64, u64)> {
         let copies = match path {
-            Path::Link(None) => Vec::new(),
-            Path::Link(Some(p)) => self
-                .quads(None, Some(*p), None)
-                .map(|(s, _, o)| (s, o))
-                .collect(),
+            Path::Link(None) => self.buf(),
+            Path::Link(Some(p)) => {
+                self.collect(self.quads(None, Some(*p), None).map(|(s, _, o)| (s, o)))
+            }
             Path::Reverse(p) => {
-                let flip = |(s, o): (u64, u64)| (o, s);
+                let flip = |&mut (s, o): &mut (u64, u64)| (o, s);
                 return match self.open(p) {
-                    Bag::Copies(pairs) => Bag::Copies(pairs.into_iter().map(flip).collect()),
-                    Bag::Counted(pairs) => {
-                        Bag::Counted(pairs.into_iter().map(|(p, n)| (flip(p), n)).collect())
+                    Bag::Copies(mut pairs) => {
+                        pairs.iter_mut().for_each(|pair| *pair = flip(pair));
+                        Bag::Copies(pairs)
+                    }
+                    Bag::Counted(mut pairs) => {
+                        pairs.iter_mut().for_each(|(pair, _)| *pair = flip(pair));
+                        Bag::Counted(pairs)
                     }
                 };
             }
             Path::Sequence(steps) => {
                 let Some((first, rest)) = steps.split_first() else {
-                    return Bag::Copies(self.nodes().into_iter().map(|n| (n, n)).collect());
+                    return Bag::Copies(self.collect(self.nodes().iter().map(|&n| (n, n))));
                 };
-                // Each pair once with how many ways through, step by step (`through`): the
-                // first step's pairs charged as they arrive (their handed-on charge, or their
-                // bytes where their producer charged none), each next step's as it grows.
+                // Each pair once with how many ways through, step by step (`through`), each
+                // step's input freed once the next is made.
                 let mut pairs = self.open(first);
-                let mut held = self.adopt();
-                let charge = held.max(pairs.bytes());
-                if !self.hold(&mut held, charge) {
-                    self.carry(held);
-                    return pairs;
-                }
                 for step in rest {
                     // Stopped, the step makes nothing: a stopped sequence ends empty.
                     if pairs.is_empty() {
                         break;
                     }
-                    let mut next = 0;
-                    let ends = self.step(
-                        &pairs,
-                        step,
-                        true,
-                        |(_, m)| m,
-                        |(s, _), o| (s, o),
-                        &mut next,
-                    );
-                    self.done(held);
-                    held = next;
-                    pairs = ends.finish();
+                    let next = self.step(&pairs, step, true, |(_, m)| m, |(s, _), o| (s, o));
+                    pairs = next.finish();
                 }
-                self.carry(held);
                 return pairs;
             }
             Path::Alternative(paths) => {
@@ -1546,51 +1333,42 @@ impl PathEvaluator<'_> {
                     paths,
                     false,
                     |p| self.open(p),
-                    |p, held, values| self.stream(p, held, values, None, None, |(s, _, o)| (s, o)),
+                    |p, values| self.stream(p, values, None, None, |(s, _, o)| (s, o)),
                 );
             }
+            // The closure's pairs charged as they arrive, while its edges are still held.
             Path::OneOrMore(p) => {
                 let edges = self.edges(p);
-                let held = self.adopt();
-                let pairs = self.closure_of(&edges);
-                drop(edges);
-                self.done(held);
-                pairs
+                self.adopted(self.closure_of(&edges))
             }
             Path::ZeroOrMore(p) => {
                 let edges = self.edges(p);
-                let held = self.adopt();
-                let mut pairs = self.closure_of(&edges);
+                let mut pairs = self.adopted(self.closure_of(&edges));
                 drop(edges);
-                self.done(held);
                 // Every node with itself, unless the closure has it already (on a cycle).
-                let mut on_cycle: Vec<u64> = pairs
-                    .iter()
-                    .filter(|(a, b)| a == b)
-                    .map(|&(a, _)| a)
-                    .collect();
+                let mut on_cycle =
+                    self.collect(pairs.iter().filter(|(a, b)| a == b).map(|&(a, _)| a));
                 on_cycle.sort_unstable();
-                pairs.extend(
-                    self.nodes()
-                        .into_iter()
-                        .filter(|node| on_cycle.binary_search(node).is_err())
-                        .map(|node| (node, node)),
-                );
+                let nodes = self.nodes();
+                let reflexive = nodes
+                    .iter()
+                    .filter(|node| on_cycle.binary_search(node).is_err())
+                    .map(|&node| (node, node));
+                self.push_all(&mut pairs, reflexive);
                 pairs
             }
             Path::ZeroOrOne(p) => {
-                let mut pairs: Vec<(u64, u64)> = self.nodes().into_iter().map(|n| (n, n)).collect();
+                let mut pairs = self.collect(self.nodes().iter().map(|&n| (n, n)));
                 let support = self.support(p);
-                let held = self.adopt();
-                pairs.extend(support);
-                self.done(held);
-                dedup_pairs(pairs)
+                self.fits(pairs.extend_from_slice(&support));
+                drop(support);
+                self.dedup_keep_order(pairs)
             }
-            Path::Negated(excluded) => self
-                .quads(None, None, None)
-                .filter(|(_, p, _)| !excluded.contains(p))
-                .map(|(s, _, o)| (s, o))
-                .collect(),
+            Path::Negated(excluded) => self.collect(
+                self.quads(None, None, None)
+                    .filter(|(_, p, _)| !excluded.contains(p))
+                    .map(|(s, _, o)| (s, o)),
+            ),
         };
         Bag::Copies(copies)
     }
@@ -1639,6 +1417,19 @@ mod tests {
         NamedNode::new_unchecked(format!("http://e/n{i}"))
     }
 
+    /// A bag's copies, sorted.
+    fn sorted<T: Copy + Ord>(evaluator: &PathEvaluator<'_>, bag: Bag<'_, T>) -> Vec<T> {
+        let mut values = bag.into_copies(evaluator.pool()).unwrap().to_vec();
+        values.sort_unstable();
+        values
+    }
+
+    /// `values`, sorted.
+    fn sorted_vec<T: Ord>(mut values: Vec<T>) -> Vec<T> {
+        values.sort_unstable();
+        values
+    }
+
     #[test]
     fn cancelled_traversals_stop_inside() {
         // The review of 3 October 2026 (P3): a closure, a search and the pairs of a
@@ -1662,7 +1453,7 @@ mod tests {
             &snapshot,
         );
         let token = crate::CancellationToken::new();
-        let budget = Budget::unlimited();
+        let budget = Arc::new(Budget::unlimited());
         let evaluator = PathEvaluator::new(
             &snapshot,
             ReadModel::default(),
@@ -1713,7 +1504,7 @@ mod tests {
             &snapshot,
         );
         let sequence = Path::resolve(&sequence, &snapshot);
-        let budget = Budget::unlimited();
+        let budget = Arc::new(Budget::unlimited());
         let evaluator = PathEvaluator::new(
             &snapshot,
             ReadModel::default(),
@@ -1722,19 +1513,11 @@ mod tests {
             &budget,
         );
         let [a, b, c] = [&a, &b, &c].map(|n| snapshot.lookup(n.as_ref().into()).unwrap().raw());
-        let sorted = |bag: Bag<u64>| {
-            let mut values = bag.into_copies();
-            values.sort_unstable();
-            values
-        };
-        let pairs = |bag: Bag<(u64, u64)>| {
-            let mut values = bag.into_copies();
-            values.sort_unstable();
-            values
-        };
+        let sorted = |bag| sorted(&evaluator, bag);
+        let pairs = |bag| sorted_pairs(&evaluator, bag);
         assert_eq!(
             sorted(evaluator.from(&sequence, a)),
-            sorted(Bag::Copies(vec![a, a, c, c]))
+            sorted_vec(vec![a, a, c, c])
         );
         assert_eq!(sorted(evaluator.to(&sequence, c)), vec![a, a]);
         assert_eq!(sorted(evaluator.to(&sequence, b)), vec![b]);
@@ -1745,7 +1528,7 @@ mod tests {
         assert!(!evaluator.connects(&sequence, c, a));
         assert_eq!(
             pairs(evaluator.open(&sequence)),
-            pairs(Bag::Copies(vec![(a, a), (a, a), (a, c), (a, c), (b, b)]))
+            sorted_vec(vec![(a, a), (a, a), (a, c), (a, c), (b, b)])
         );
         assert_eq!(
             pairs(evaluator.reached_from(&sequence, &[b]).unwrap()),
@@ -1755,17 +1538,19 @@ mod tests {
             pairs(evaluator.reaching(&sequence, &[c]).unwrap()),
             vec![(a, c), (a, c)]
         );
-        assert_eq!(
-            sorted(evaluator.from(&plus, a)),
-            sorted(Bag::Copies(vec![a, c]))
-        );
-        assert_eq!(evaluator.from(&plus, b).into_copies(), vec![b]);
+        assert_eq!(sorted(evaluator.from(&plus, a)), sorted_vec(vec![a, c]));
+        assert_eq!(sorted(evaluator.from(&plus, b)), vec![b]);
         assert_eq!(evaluator.multiplicity(&plus, a, c), 1);
         assert_eq!(evaluator.multiplicity(&plus, b, c), 0);
         assert_eq!(
             pairs(evaluator.open(&plus)),
-            pairs(Bag::Copies(vec![(a, a), (a, c), (b, b)]))
+            sorted_vec(vec![(a, a), (a, c), (b, b)])
         );
+    }
+
+    /// [`sorted`] for pairs (a closure can't be generic).
+    fn sorted_pairs(evaluator: &PathEvaluator<'_>, bag: Bag<'_, (u64, u64)>) -> Vec<(u64, u64)> {
+        sorted(evaluator, bag)
     }
 
     /// Guard (the executor memory stack's timing, notes/2026-11-02-exec-memory-stack.md
@@ -1799,7 +1584,7 @@ mod tests {
         ]);
         let [plain, either, stepped] =
             [plain, either, stepped].map(|path| Path::resolve(&path, &snapshot));
-        let budget = Budget::unlimited();
+        let budget = Arc::new(Budget::unlimited());
         let evaluator = PathEvaluator::new(
             &snapshot,
             ReadModel::default(),
@@ -1841,7 +1626,7 @@ mod tests {
             &snapshot,
         );
         let steps = Path::resolve(&steps, &snapshot);
-        let budget = Budget::unlimited();
+        let budget = Arc::new(Budget::unlimited());
         let evaluator = PathEvaluator::new(
             &snapshot,
             ReadModel::default(),
@@ -1865,16 +1650,17 @@ mod tests {
             Bag::Counted(counted) => counted.len(),
         };
         assert_eq!(entries, 4, "each pair once, not a copy per way");
-        let mut reached = evaluator.from(&plus, a).into_copies();
-        reached.sort_unstable();
-        assert_eq!(reached, vec![a.min(b), a.max(b)]);
+        assert_eq!(
+            sorted(&evaluator, evaluator.from(&plus, a)),
+            vec![a.min(b), a.max(b)]
+        );
     }
 
     /// Spec (sol-loop r1 S2 of EMS-R1): a charge the budget refused stops the evaluator, and
     /// what it found so far is no answer, so no closure is built of it. Over 1,000 self-loops
     /// and `m q m`, the arms `!(q)`, `!(q|q)`, `!(q|q|q)` under `+` under a 24 KiB budget: the
-    /// first arm's 1,000 pairs (16 KB) and the union's room for them don't fit together, so
-    /// the pairs are refused and no closure is computed.
+    /// union's room for the arms' 2,000 and more pairs (16 KB each arm) doesn't fit, so the
+    /// pairs are refused and no closure is computed.
     #[test]
     fn a_refused_alternative_builds_no_closure() {
         let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -1897,7 +1683,7 @@ mod tests {
             &PropertyPathExpression::OneOrMore(Box::new(either)),
             &snapshot,
         );
-        let budget = Budget::new(24 << 10);
+        let budget = Arc::new(Budget::new(24 << 10));
         let evaluator = PathEvaluator::new(
             &snapshot,
             ReadModel::default(),
