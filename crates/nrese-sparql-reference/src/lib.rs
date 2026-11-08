@@ -277,6 +277,21 @@ impl Dataset {
                         GraphTarget::AllGraphs => false,
                     });
                 }
+                // SPARQL 1.1 Update §3.2.3: the statements stored in `from`, whatever the
+                // options a WHERE clause reads with.
+                GraphUpdateOperation::Add { from, to, .. } => {
+                    let (from, to) = (graph_of(from), graph_of(to));
+                    let copies: Vec<Quad> = self
+                        .quads
+                        .iter()
+                        .filter(|q| q.graph_name == from)
+                        .map(|q| Quad {
+                            graph_name: to.clone(),
+                            ..q.clone()
+                        })
+                        .collect();
+                    self.quads.extend(copies);
+                }
             }
         }
         Ok(())

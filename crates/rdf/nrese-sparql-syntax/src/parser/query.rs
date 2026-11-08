@@ -646,26 +646,19 @@ impl<'a> Parser<'a> {
                         GraphName::NamedNode(n) => GraphTarget::NamedNode(n.clone()),
                         GraphName::DefaultGraph => GraphTarget::DefaultGraph,
                     };
+                    let drop_to = GraphUpdateOperation::Drop {
+                        silent: true,
+                        graph: target(&to),
+                    };
+                    let drop_from = GraphUpdateOperation::Drop {
+                        silent,
+                        graph: target(&from),
+                    };
+                    let add = GraphUpdateOperation::Add { silent, from, to };
                     match word.as_str() {
-                        "ADD" => vec![copy_graph(&from, &to)],
-                        "MOVE" => vec![
-                            GraphUpdateOperation::Drop {
-                                silent: true,
-                                graph: target(&to),
-                            },
-                            copy_graph(&from, &to),
-                            GraphUpdateOperation::Drop {
-                                silent,
-                                graph: target(&from),
-                            },
-                        ],
-                        _ => vec![
-                            GraphUpdateOperation::Drop {
-                                silent: true,
-                                graph: target(&to),
-                            },
-                            copy_graph(&from, &to),
-                        ],
+                        "ADD" => vec![add],
+                        "MOVE" => vec![drop_to, add, drop_from],
+                        _ => vec![drop_to, add],
                     }
                 }
             }
@@ -915,31 +908,6 @@ fn bound_in(expression: &Expression, visible: &HashSet<Variable>) -> bool {
         Expression::If(a, b, c) => {
             bound_in(a, visible) && bound_in(b, visible) && bound_in(c, visible)
         }
-    }
-}
-
-/// `ADD`'s copy of every triple of `from` into `to`.
-fn copy_graph(from: &GraphName, to: &GraphName) -> GraphUpdateOperation {
-    let [s, p, o] = ["s", "p", "o"].map(Variable::new_unchecked);
-    let bgp = GraphPattern::Bgp {
-        patterns: vec![TriplePattern::new(s.clone(), p.clone(), o.clone())],
-    };
-    GraphUpdateOperation::DeleteInsert {
-        delete: Vec::new(),
-        insert: vec![QuadPattern::new(
-            s,
-            p,
-            o,
-            GraphNamePattern::from(to.clone()),
-        )],
-        using: None,
-        pattern: Box::new(match from {
-            GraphName::NamedNode(from) => GraphPattern::Graph {
-                name: from.clone().into(),
-                inner: Box::new(bgp),
-            },
-            GraphName::DefaultGraph => bgp,
-        }),
     }
 }
 
