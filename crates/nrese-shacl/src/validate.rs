@@ -29,11 +29,13 @@ const RDFS_SUB_CLASS_OF: &str = "http://www.w3.org/2000/01/rdf-schema#subClassOf
 /// the dictionary as it found it.
 ///
 /// Which one is decided against a *frontier* view ([`Validator::with_frontier`]): the view
-/// validated, or for a comparison of two states the earlier one, so one RDF term has one
-/// form in both (the dictionary only grows: what the earlier view knows, the later knows by
-/// the same id). Equality and order are the comparison's: a computed term by its
-/// [`Computed::key`], so fresh blank nodes compare up to their names; a stored and a
-/// computed term are never equal.
+/// validated, or for a comparison of two states the later one, for both. The dictionary only
+/// grows, so what the earlier view knows the later knows by the same id, and every id a
+/// result holds otherwise (a focus or value node, a shape's path) is the later dictionary's
+/// too: one RDF term has one form in both states, whatever made it. Blank nodes and triple
+/// terms holding them are the exception ([`Validator::result_term`]). Equality and order are
+/// the comparison's: a computed term by its [`Computed::key`], so fresh blank nodes compare
+/// up to their names; a stored and a computed term are never equal.
 #[derive(Debug, Clone)]
 pub(crate) enum ResultTerm {
     Stored(TermId),
@@ -180,20 +182,15 @@ pub(crate) type Kept = (Vec<RawResult>, Failures, Reservation);
 /// failures (SPARQL-based constraints that couldn't be evaluated), with their charge to
 /// `resources`' envelope. Focus nodes are validated in parallel; the results keep the
 /// sequential order. A stop of `resources` is the outcome instead
-/// ([`Validator::into_failures`]). Terms a query bound are told stored or computed against
-/// `frontier` (`None`: `view`'s own dictionary; [`ResultTerm`]).
-pub(crate) fn validate_raw<'a, V: ReadView + Sync>(
-    view: &'a V,
-    shapes: &'a Shapes,
+/// ([`Validator::into_failures`]).
+pub(crate) fn validate_raw<V: ReadView + Sync>(
+    view: &V,
+    shapes: &Shapes,
     data: Selection,
-    resources: &'a Resources,
-    frontier: Option<&'a Frontier<'a>>,
+    resources: &Resources,
 ) -> Result<Kept, QueryEvaluationError> {
     resources.check()?;
-    let mut validator = Validator::new(view, shapes, data, resources);
-    if let Some(frontier) = frontier {
-        validator = validator.with_frontier(frontier);
-    }
+    let validator = Validator::new(view, shapes, data, resources);
     let results = validate_every_focus(&validator, shapes);
     let (failures, held) = validator.into_failures()?;
     Ok((results, failures, held))
@@ -201,15 +198,18 @@ pub(crate) fn validate_raw<'a, V: ReadView + Sync>(
 
 /// [`validate_raw`]'s results alone, with their charge, for a validation whose failures are
 /// thrown away (the state before a change, compared with the state after): its failures
-/// are neither kept nor charged, so they can't refuse it.
-pub(crate) fn validate_raw_results<V: ReadView + Sync>(
-    view: &V,
-    shapes: &Shapes,
+/// are neither kept nor charged, so they can't refuse it. Its terms are told stored or
+/// computed against `frontier`, the state after's dictionary ([`ResultTerm`]).
+pub(crate) fn validate_raw_results<'a, V: ReadView + Sync>(
+    view: &'a V,
+    shapes: &'a Shapes,
     data: Selection,
-    resources: &Resources,
+    resources: &'a Resources,
+    frontier: &'a Frontier<'a>,
 ) -> Result<(Vec<RawResult>, Reservation), QueryEvaluationError> {
     resources.check()?;
-    let validator = Validator::discarding_failures(view, shapes, data, resources);
+    let validator =
+        Validator::discarding_failures(view, shapes, data, resources).with_frontier(frontier);
     let results = validate_every_focus(&validator, shapes);
     let (_, held) = validator.into_failures()?;
     Ok((results, held))
@@ -501,7 +501,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
     }
 
     /// The validator, deciding stored and computed terms against `frontier`'s dictionary: the
-    /// earlier state's, where this one's results are compared with it ([`ResultTerm`]).
+    /// later state's, where this one (the earlier) is compared with it ([`ResultTerm`]).
     pub(crate) fn with_frontier(mut self, frontier: &'a Frontier<'a>) -> Self {
         self.frontier = Some(frontier);
         self
@@ -517,10 +517,11 @@ impl<'a, V: ReadView> Validator<'a, V> {
 
     /// A term a query bound, as a result holds it, or `None` after a stop (recorded): its id
     /// where the frontier knows it; else owned, with its comparison form. A blank node is
-    /// stored where this view knows it (a node of the data, compared by id), else fresh (one
-    /// the query made). Inside a computed triple term, stored blank nodes are named by id and
-    /// fresh ones canonically ([`nrese_rdf::canonical::canonical_until`], on the validation's
-    /// stop).
+    /// stored where this view knows it (a node of this state's data, compared by id), else
+    /// fresh (one the query made): the frontier isn't asked, since a later state may store a
+    /// node under a fresh node's name. A triple term holding blank nodes is always computed,
+    /// compared with its stored blank nodes named by id and its fresh ones canonically
+    /// ([`nrese_rdf::canonical::canonical_until`], on the validation's stop).
     fn result_term(&self, term: &Term) -> Option<ResultTerm> {
         if let Term::BlankNode(_) = term {
             return Some(match self.graph.lookup(term) {
@@ -531,17 +532,22 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 })),
             });
         }
-        if let Some(id) = self.known(term) {
-            return Some(ResultTerm::Stored(id));
+        if let Term::Triple(_) = term
+            && holds_blank_node(term)
+        {
+            let key = self.canonical_key(term)?;
+            return Some(ResultTerm::Computed(Box::new(Computed {
+                term: term.clone(),
+                key: Some(key),
+            })));
         }
-        let key = match term {
-            Term::Triple(_) if holds_blank_node(term) => Some(self.canonical_key(term)?),
-            _ => None,
-        };
-        Some(ResultTerm::Computed(Box::new(Computed {
-            term: term.clone(),
-            key,
-        })))
+        Some(match self.known(term) {
+            Some(id) => ResultTerm::Stored(id),
+            None => ResultTerm::Computed(Box::new(Computed {
+                term: term.clone(),
+                key: None,
+            })),
+        })
     }
 
     /// The comparison form of a computed triple term that holds blank nodes, or `None` after
