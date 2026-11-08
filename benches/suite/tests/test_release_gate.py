@@ -754,6 +754,69 @@ class DeclaredMetric(unittest.TestCase):
         self.assertEqual(code, 1, out.getvalue())
         self.assertNotIn("below absolute floor", out.getvalue())
 
+    @staticmethod
+    def saved(case, metric, series, units=None):
+        records = []
+        for rep in (1, 2):
+            r = {"case": case, "rep": rep, "status": "ok", "checks": [], "routes": [], "metric": metric,
+                 "samples": {"_": list(series)}}
+            if units is not None:
+                r["series_units"] = units
+            records.append(r)
+        return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
+                "started": "2026-11-08T02:00:00", "records": records}
+
+    def compared(self, base, new):
+        from suitekit import compare
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = compare.compare_reports(base, new)
+        return code, out.getvalue()
+
+    def test_reports_of_two_timing_unit_generations_are_normalised_or_refused(self):
+        """Fix check r2, R2-F1: reports before 8 Nov 2026 saved `commits.whole_s` in seconds and
+        timed it by its section's commit latencies; new ones save milliseconds of the whole run. A
+        record says its generation (`series_units`; none: 1); compare normalises what that generation
+        fixes exactly and refuses what it can't, before any verdict."""
+        # The verdicts first (a red run fails at a verdict, not at a missing name); generation 2 literal.
+        # An old rule-delta-sweep record timed its commit latencies: another quantity, refused.
+        old = self.saved("rule-delta-sweep", 3.0, [0.2, 0.2, 0.2])
+        new = self.saved("rule-delta-sweep", 3000.0, [3000.0], units=2)
+        code, text = self.compared(old, new)
+        self.assertEqual(code, 2, text)
+        self.assertNotIn("faster", text)
+        self.assertIn("timing units", text)
+        # A load_s case was milliseconds in both generations: an old 3.0 s load against a new 3.6 s is
+        # a 600 ms regression.
+        load = next(c["name"] for c in __import__("suitekit.cases", fromlist=["load"]).load() if c.get("metric") == "load_s")
+        code, text = self.compared(self.saved(load, 3000.0, [3000.0]),
+                                   self.saved(load, 3600.0, [3600.0], units=2))
+        self.assertEqual(code, 1, text)
+        self.assertIn("SLOWER", text)
+        # Same generation on both sides compares as it always did.
+        code, text = self.compared(self.saved("rule-delta-sweep", 3.0, [10.0] * 3),
+                                   self.saved("rule-delta-sweep", 3.0, [20.0] * 3))
+        self.assertEqual(code, 1, text)  # 10 ms more, above the 2 ms floor
+        # A generation compare doesn't know is refused.
+        code, text = self.compared(new, self.saved("rule-delta-sweep", 3600.0, [3600.0], units=99))
+        self.assertEqual(code, 2, text)
+        self.assertIn("unknown timing units", text)
+        # Every record fast.py writes says its generation: compare's own.
+        from suitekit import compare
+        self.assertEqual(fast.SERIES_UNITS, compare.SERIES_UNITS)
+        self.assertEqual(compare.SERIES_UNITS, 2)
+
+    def test_an_old_seconds_series_is_milliseconds_after_normalising(self):
+        """A generation-1 record of a seconds field whose series was its own value (no section samples):
+        its metric and series times 1000."""
+        from suitekit import compare
+        record = {"case": "x", "metric": 3.0, "samples": {"_": [3.0, 3.1]}}
+        self.assertEqual(compare.normalised(record, "phase.whole_s"),
+                         {**record, "metric": 3000.0, "samples": {"_": [3000.0, 3100.0]},
+                          "series_units": compare.SERIES_UNITS})
+        self.assertIsNone(compare.normalised({**record, "case": "y"}, "commits.whole_s"))  # section latency
+        self.assertEqual(compare.normalised(dict(record), "load_s")["metric"], 3.0)  # was ms already
+
     def test_c1_s_read_slowdown_is_a_loss_in_its_family(self):
         """The run's own values, per pass: A 0.004 ms in every block, B 10.371, 9.843 and 10.547 ms."""
         a = [fast.samples(self.CASE, self.result(0.004))["_"] for _ in range(3)]

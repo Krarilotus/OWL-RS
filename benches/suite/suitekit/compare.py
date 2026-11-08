@@ -488,14 +488,91 @@ def host_check(base: list[dict | None], new: list[dict | None], allow: bool) -> 
     return None
 
 
+# The saved timing units' generation each fast.py record carries (`series_units`): 2 since 8 Nov
+# 2026, every series and metric in milliseconds of what the case declares. A record without it is
+# generation 1: a seconds field other than load_s/open_s was saved in seconds, and a non-p50 field
+# of a section that sampled its own latency was timed by that latency (fix check r2 of
+# pkg/declared-metrics, R2-F1). Raise it with any change of what a saved series means.
+SERIES_UNITS = 2
+GEN1_SAMPLED_SECTIONS = {"commits", "reason", "shacl", "kernel", "classification"}
+
+
+def normalised(record: dict, metric: str | None) -> dict | None:
+    """`record` in the current generation's units, `metric` its case's declared metric; None where
+    its generation can't be brought to them (an unknown generation, an unknown metric, or a series
+    of another quantity)."""
+    generation = record.get("series_units", 1)
+    if generation == SERIES_UNITS:
+        return record
+    if generation != 1 or metric is None:
+        return None
+    section, _, field = metric.rpartition(".")
+    if section in GEN1_SAMPLED_SECTIONS and field != "p50_ms":
+        return None  # timed by its section's latency then: another quantity
+    scale = 1000.0 if field.endswith("_s") and metric not in ("load_s", "open_s") else 1.0
+    if scale == 1.0:
+        return {**record, "series_units": SERIES_UNITS}
+    out = {**record, "series_units": SERIES_UNITS,
+           "samples": {k: [v * scale if isinstance(v, (int, float)) else v for v in vs]
+                       for k, vs in (record.get("samples") or {}).items()}}
+    if isinstance(record.get("metric"), (int, float)):
+        out["metric"] = record["metric"] * scale
+    return out
+
+
+def units_check(base_report: dict, new_report: dict) -> tuple[dict, dict, dict[str, str]]:
+    """Both reports' records in one generation of timing units, and the cases that can't be: listed
+    with why, never compared. A case whose records are all of one generation on both sides compares
+    as it was saved."""
+    from . import cases as registry
+    declared = {c["name"]: c.get("metric") for c in registry.load()}
+    gens: dict[str, set] = {}
+    for r in base_report.get("records", []) + new_report.get("records", []):
+        gens.setdefault(r["case"], set()).add(r.get("series_units", 1))
+    refused: dict[str, str] = {}
+    for case, seen in gens.items():
+        unknown = sorted(g for g in seen if g not in (1, SERIES_UNITS))
+        if unknown:
+            refused[case] = f"unknown timing units (series_units {', '.join(map(str, unknown))})"
+
+    def bring(report):
+        records = []
+        for r in report.get("records", []):
+            if r["case"] in refused:
+                continue
+            if len(gens[r["case"]]) == 1:
+                records.append(r)
+                continue
+            n = normalised(r, declared.get(r["case"]))
+            if n is None:
+                refused[r["case"]] = ("timing units of two generations that can't be brought together "
+                                      f"(series_units {sorted(gens[r['case']])}: its old series was another quantity)")
+                continue
+            records.append(n)
+        return {**report, "records": records}
+    base, new = bring(base_report), bring(new_report)
+    keep = lambda report: {**report, "records": [r for r in report["records"] if r["case"] not in refused]}  # noqa: E731
+    return keep(base), keep(new), refused
+
+
 def compare_reports(base_report: dict, new_report: dict, min_ms: float = 2.0, allow_host_change: bool = False) -> int:
-    """Two fast-suite (or perf-lab) reports; the exit status."""
+    """Two fast-suite (or perf-lab) reports; the exit status: 2 also where no case is left whose
+    timing units both sides' generations share (units_check())."""
     if not math.isfinite(min_ms) or min_ms < 0:
         raise ValueError("--min-ms must be finite and nonnegative")
     refused = host_check([identity(base_report.get("machine"), base_report.get("started"))],
                          [identity(new_report.get("machine"), new_report.get("started"))], allow_host_change)
     if refused:
         return refused
+    base_report, new_report, other_units = units_check(base_report, new_report)
+    if other_units:
+        print("## Timing units\n")
+        for case, why in sorted(other_units.items()):
+            print(f"- {case}: {why}; not compared")
+        print()
+        if not base_report["records"] or not new_report["records"]:
+            print("REFUSED: no case left whose timing units both sides share")
+            return 2
     for name, report in (("base", base_report), ("new", new_report)):
         if report.get("reps", 2) < 2:
             print(f"warning: the {name} run has one repetition: its spread is unknown, so a verdict "
