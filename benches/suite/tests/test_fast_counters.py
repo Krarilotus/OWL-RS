@@ -80,7 +80,9 @@ def shapes_run(scratch, report="", json_text='{"shacl": {"results": 3, "p50_ms":
         if json_text is not None:
             (scratch / "shapes.json").write_text(json_text)
         found = re.search(r"'--shacl-report' '/out/([^']+)'", command[-1])
-        if found:
+        if found and isinstance(report, bytes):
+            (scratch / found.group(1)).write_bytes(report)
+        elif found:
             (scratch / found.group(1)).write_text(report, encoding="utf-8")
         return 0, "", "", 1
     return measured, commands
@@ -224,6 +226,50 @@ class FastComparison(unittest.TestCase):
                     failed = {c["path"]: c for c in record["observations"][0]["checks"] if c["ok"] is not True}
                     self.assertEqual(sorted(failed), ["shacl.paths", "shacl.values"])
                     self.assertTrue(all(c["ok"] is False and "not counted" in c["note"] for c in failed.values()))
+
+    def test_a_report_that_can_t_be_read_or_decoded_fails_its_counts_and_aborts_nothing(self):
+        """Fix check r3 (review-shacl-report-counts-r3): a report that isn't UTF-8, or whose read
+        fails, raised out of measure() before its counts were marked unreadable. Every way of not
+        getting the report is one state: with values and paths pinned the verdict is wrong whatever
+        --routes, each count's check fails with the reason; a case that pins neither is unaffected,
+        ok; and the report is removed either way."""
+        sh = "http://www.w3.org/ns/shacl#"
+        undecodable = f'_:r0 <{sh}value> "'.encode() + b'\xff\xfe' + f'" .\n_:r0 <{sh}resultPath> <http://x/p> .\n'.encode()
+        unpinned = {**SHAPES_CASE, "check": {"shacl.results": 3}}
+        opened = Path.open
+
+        def failing_read(path, mode="r", *args, **kwargs):  # the disk, not the report, fails
+            if path.name.endswith(".shacl.nt") and "r" in mode:
+                raise OSError(5, "Input/output error", str(path))
+            return opened(path, mode, *args, **kwargs)
+
+        for routes in (False, True):
+            for failure, reason in (("invalid UTF-8", "isn't UTF-8"), ("read error", "couldn't be read")):
+                for case, verdict in ((SHAPES_CASE, "wrong"), (unpinned, "ok")):
+                    pinned = case is SHAPES_CASE
+                    with self.subTest(routes=routes, failure=failure, pinned=pinned), \
+                            tempfile.TemporaryDirectory() as directory:
+                        scratch = Path(directory)
+                        measured, _ = shapes_run(scratch, report=undecodable if failure == "invalid UTF-8" else "")
+                        with patch.object(fast, "SCRATCH", scratch), patch.object(fast, "container", measured), \
+                                patch.dict(fast.OPTIONS, routes=routes), \
+                                (patch.object(Path, "open", failing_read) if failure == "read error"
+                                 else contextlib.nullcontext()):
+                            try:
+                                record = fast.measure(case, "shapes", 1, {}, {}, "none")
+                                got = fast.verdict(case, record)["verdict"]
+                            except Exception as error:  # noqa: BLE001 - the defect is that it raises
+                                record, got = None, f"raised {type(error).__name__}"
+                        self.assertEqual(got, verdict)
+                        self.assertEqual(sorted(p.name for p in scratch.iterdir() if p.name.endswith(".nt")), [])
+                        checks = {c["path"]: c for c in record["observations"][0]["checks"]}
+                        if pinned:
+                            failed = {p: c for p, c in checks.items() if c["ok"] is not True}
+                            self.assertEqual(sorted(failed), ["shacl.paths", "shacl.values"])
+                            self.assertTrue(all(c["ok"] is False and reason in c["note"] for c in failed.values()))
+                        else:
+                            self.assertEqual([(p, c["ok"]) for p, c in checks.items()], [("shacl.results", True)])
+                        self.assertTrue(any(reason in note for note in record["notes"]))
 
     def test_a_report_is_removed_however_its_invocation_ends_and_a_stale_one_refused(self):
         """Fix check r1 (lifecycle): the report's path was one per checkout and stayed behind when an
