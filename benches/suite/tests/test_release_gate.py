@@ -13,6 +13,7 @@ host's noise between instances.
 """
 from __future__ import annotations
 
+import argparse
 import contextlib
 import copy
 import importlib.util
@@ -816,6 +817,74 @@ class DeclaredMetric(unittest.TestCase):
                           "series_units": compare.SERIES_UNITS})
         self.assertIsNone(compare.normalised({**record, "case": "y"}, "commits.whole_s"))  # section latency
         self.assertEqual(compare.normalised(dict(record), "load_s")["metric"], 3.0)  # was ms already
+
+    CHECK = "closure_after_commits.equal"  # rule-delta-sweep's registry check (benches/cases/core.toml)
+
+    @classmethod
+    def two_cases(cls, units, sweep_status="ok", sweep_peak=1000):
+        """r3's reports: rule-delta-sweep of one generation (1: seconds and its commit latencies;
+        2: milliseconds of the whole run) beside an unchanged rl-hierarchy."""
+        records = []
+        for rep in (1, 2):
+            ok = sweep_status == "ok"
+            sweep = {"case": "rule-delta-sweep", "rep": rep, "status": sweep_status, "routes": [],
+                     "checks": [{"path": cls.CHECK, "want": "true", "got": ok, "ok": ok}],
+                     "metric": 3.0 if units is None else 3000.0,
+                     "samples": {"_": [0.2, 0.2, 0.2] if units is None else [3000.0]},
+                     "peak_mib": sweep_peak, "memory_kind": "lifetime"}
+            hierarchy = {"case": "rl-hierarchy", "rep": rep, "status": "ok", "checks": [], "routes": [],
+                         "metric": 100.0, "samples": {"_": [100.0]}, "peak_mib": 500, "memory_kind": "lifetime"}
+            for r in (sweep, hierarchy):
+                if units is not None:
+                    r["series_units"] = units
+                records.append(r)
+        return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
+                "started": "2026-11-08T02:00:00", "records": records}
+
+    def test_refused_timing_keeps_the_case_s_status_checks_and_memory(self):
+        """Fix check r3, R3-F1: refusing a case's timing (units of two generations) dropped its whole
+        record, so a case gone from ok to wrong beside an unchanged one exited 0. Specified (r3's
+        required revision; compare.py's order, "nothing lost hides behind a time"): only the refused
+        case's time is not compared; its status, checks and memory are, and their failure is nonzero."""
+        no_ratio = lambda text: self.assertIsNone(re.search(r"^rule-delta-sweep +\d", text, re.M), text)  # noqa: E731
+        with self.subTest("ok -> wrong beside an unchanged case: an acceptance failure, the status named"):
+            code, text = self.compared(self.two_cases(None), self.two_cases(2, sweep_status="wrong"))
+            self.assertEqual(code, 1, text)
+            self.assertRegex(text, r"rule-delta-sweep +status ok -> wrong +CHANGED")
+            no_ratio(text)
+            self.assertRegex(text, r"rl-hierarchy .* same")
+        with self.subTest("the wrong case alone: no timing left, its failure is the verdict (1), not the refusal (2)"):
+            def alone(report):
+                return {**report, "records": [r for r in report["records"] if r["case"] == "rule-delta-sweep"]}
+            code, text = self.compared(alone(self.two_cases(None)), alone(self.two_cases(2, sweep_status="wrong")))
+            self.assertEqual(code, 1, text)
+            self.assertIn("status ok -> wrong", text)
+        with self.subTest("a refused case's peak still counts: 1000 -> 2000 MiB"):
+            code, text = self.compared(self.two_cases(None), self.two_cases(2, sweep_peak=2000))
+            self.assertEqual(code, 1, text)
+            self.assertRegex(text, r"rule-delta-sweep +peak .*1000 -> 2000 MiB +MORE MEMORY")
+        with self.subTest("guard (as at 43b1f309): all ok, the refused case listed, no ratio for it, exit 0"):
+            code, text = self.compared(self.two_cases(None), self.two_cases(2))
+            self.assertEqual(code, 0, text)
+            self.assertRegex(text, r"rule-delta-sweep.*not compared")
+            no_ratio(text)
+
+    def test_refused_timing_keeps_the_wrong_status_in_compact_reports(self):
+        """R3-F1 through `fast.py compare` on compact records alone (their full reports not here):
+        they keep status, checks and `series_units`, so the verdict is the full reports'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for name, report in (("base", self.two_cases(None)), ("new", self.two_cases(2, sweep_status="wrong"))):
+                full = Path(tmp) / f"{name}-full.json"
+                full.write_text(json.dumps(report), encoding="utf-8")
+                paths.append(fast.write_compact(full, Path(tmp) / f"{name}.json"))
+                full.unlink()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = fast.compare(argparse.Namespace(base=str(paths[0]), new=str(paths[1])))
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertRegex(out.getvalue(), r"rule-delta-sweep +status ok -> wrong +CHANGED")
+        self.assertIn("full report isn't here", out.getvalue())
 
     def test_c1_s_read_slowdown_is_a_loss_in_its_family(self):
         """The run's own values, per pass: A 0.004 ms in every block, B 10.371, 9.843 and 10.547 ms."""

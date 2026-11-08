@@ -132,6 +132,11 @@ its resolution floors and memory policy, and the measurements they rest on).
    configurations (its `config` in [hosts.toml](../hosts.toml) when each run started, or
    the CPU governor the runs read), are refused (exit 2); `--allow-host-change` compares
    them anyway, flagged as no evidence of a code change.
+   **One generation of timing units:** each record says its own (`series_units`; none is 1).
+   A case whose two sides' units can't be brought together (an unknown generation, or an old
+   series of another quantity) gets no time verdict and no ratio; its status, checks, work
+   counters, throughput and memory are compared as for any case. With no case left on one
+   side whose time compares, compare exits 2, unless something else failed: that is exit 1.
 1. **Lost work first:** cases, repetitions, series or client widths missing on one side,
    and failed checks, are listed before any time. A known issue (the outcome a case
    declares, such as a memory limit, on both sides) earns no timing verdict: its checked
