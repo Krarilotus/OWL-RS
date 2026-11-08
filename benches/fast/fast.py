@@ -45,6 +45,7 @@ import tempfile
 import time
 import threading
 import tomllib
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -842,15 +843,28 @@ def verdict(case: dict, record: dict) -> dict:
 
 
 SH = "<http://www.w3.org/ns/shacl#"
+# A record's subject (an IRI or a blank node: a triple term is only ever an object, RDF 1.2) and
+# predicate (an IRI), as N-Triples terms, its whitespace a space or a tab; nothing after them
+# (the object, a literal) is read.
+NT_HEAD = re.compile(r'[ \t]*(<[^\x00-\x20<>"{}|^`\\]*>|_:[^ \t]+)[ \t]+(<[^\x00-\x20<>"{}|^`\\]*>)[ \t]')
 
 
-def shacl_report_counts(text: str) -> dict[str, int]:
-    """A SHACL validation report's (N-Triples) sh:value and sh:resultPath triples: its results'
-    values and paths (SHACL 1.0 §5.3.2). A predicate is a line's second term: a subject is an IRI
-    or a blank node, a triple term only an object (RDF 1.2), so nothing before it has a space."""
-    predicates = [parts[1] for line in text.splitlines()
-                  if len(parts := line.split(None, 2)) == 3 and not line.startswith("#")]
-    return {"values": predicates.count(f"{SH}value>"), "paths": predicates.count(f"{SH}resultPath>")}
+def shacl_report_counts(text: str) -> dict[str, int] | None:
+    """A SHACL validation report's (N-Triples, as nrese-rdf-io writes it) sh:value and
+    sh:resultPath triples: its results' values and paths (SHACL 1.0 §5.3.2). Records end only at
+    a physical newline: the writer escapes every control character in a literal (ntriples.rs
+    `quoted`), but not U+2028, U+2029 or U+0085, at which str.splitlines() would also split (fix
+    check r1 W). None: a record that isn't N-Triples as written, counts unknown, never guessed."""
+    values = paths = 0
+    for record in text.split("\n"):
+        if not record.strip(" \t\r") or record.lstrip(" \t").startswith("#"):
+            continue
+        head = NT_HEAD.match(record)
+        if head is None:
+            return None
+        values += head.group(2) == f"{SH}value>"
+        paths += head.group(2) == f"{SH}resultPath>"
+    return {"values": values, "paths": paths}
 
 
 def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, data: str) -> dict:
@@ -886,11 +900,12 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
             record["notes"].append(f"timed by its load: its metric ({case['metric']}) is the suite driver's")
         command = [*base, *loads, *(["--queries", queries] if queries else []),
                    *substitute(case.get("args", []), data, scratch)]
-        # A case with shapes writes its last validation's report (every perf lab of engine-v2 can), so
-        # that what the results hold is counted, not only how many (shacl_report_counts()).
-        report_nt = SCRATCH / f"{case['name']}.shacl.nt"
-        if "--shapes" in case.get("args", []):
-            command += ["--shacl-report", f"/out/{case['name']}.shacl.nt"]
+        # A case with shapes writes each invocation's last validation's report (every perf lab of
+        # engine-v2 can) to a path of that invocation's own, so that what the results hold is counted,
+        # not only how many (shacl_report_counts()); removed however the invocation ends.
+        shapes = "--shapes" in case.get("args", [])
+        owner = uuid.uuid4().hex[:12]
+        made: list[Path] = []
         script = ""
         if "setup" in case:
             setup = ["/target/release/examples/perf_lab", *substitute(case["setup"], data, scratch)]
@@ -908,37 +923,51 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         record["page_cache"] = modes
         # Warm and cold alternate, so that drift over the case touches both alike.
         runs = invocation_plan(case, modes)
-        for index, identity in enumerate(runs):
-            entry, mode = sweep[identity["sweep"]], identity["cache"]
-            if mode == "cold" and index > 0 and not drop_page_cache(record):
-                break
-            # The setup (a store on disk) runs once; each repeat is a fresh process opening it.
-            shell = (script if index == 0 else "") + " ".join(f"'{c}'" for c in [*command, *entry])
-            code, _, err, w = container(name, case["cap_gb"], ["bash", "-c", shell], case.get("env"), timeout=timeout_s)
-            wall += w
-            path = SCRATCH / f"{case['name']}.json"
-            if not path.exists():
-                record["status"] = "failed"
-                record["notes"].append("invocation did not produce its JSON report")
-                break
-            result = json.loads(path.read_text(encoding="utf-8"))
-            path.unlink()
-            if report_nt.exists():
-                if isinstance(result.get("shacl"), dict):
-                    result["shacl"].update(shacl_report_counts(report_nt.read_text(encoding="utf-8")))
-                report_nt.unlink()
-            result["_sweep"] = " ".join(entry)
-            result["_page_cache"] = mode
-            if case.get("queries", "").startswith("@vectors") and code == 0:
-                result["recall"] = vector_recall(case, expect)
-            observation = invocation_observation(case, result, err, identity)
-            observation["exit"] = code
-            observation["checks"] = [check(p, w, result, expect, alt_expect) for p, w in case.get("check", {}).items()]
-            observation["routes"] = [route(p, w, result) for p, w in case.get("route", {}).items()]
-            observations.append(observation)
-            samples_runs.append(result)
-            if code != 0:
-                break
+        try:
+            for index, identity in enumerate(runs):
+                entry, mode = sweep[identity["sweep"]], identity["cache"]
+                if mode == "cold" and index > 0 and not drop_page_cache(record):
+                    break
+                report_nt = SCRATCH / f"{case['name']}-{owner}-{index}.shacl.nt"
+                if shapes and report_nt.exists():  # not this invocation's: never counted, never removed
+                    record["status"] = "failed"
+                    record["notes"].append(f"a SHACL report was already at {report_nt.name}: not this run's")
+                    break
+                reporting = ["--shacl-report", f"/out/{report_nt.name}"] if shapes else []
+                if shapes:
+                    made.append(report_nt)
+                # The setup (a store on disk) runs once; each repeat is a fresh process opening it.
+                shell = (script if index == 0 else "") + " ".join(f"'{c}'" for c in [*command, *reporting, *entry])
+                code, _, err, w = container(name, case["cap_gb"], ["bash", "-c", shell], case.get("env"), timeout=timeout_s)
+                wall += w
+                path = SCRATCH / f"{case['name']}.json"
+                if not path.exists():
+                    record["status"] = "failed"
+                    record["notes"].append("invocation did not produce its JSON report")
+                    break
+                result = json.loads(path.read_text(encoding="utf-8"))
+                path.unlink()
+                if shapes and isinstance(result.get("shacl"), dict) and report_nt.exists():
+                    counts = shacl_report_counts(report_nt.read_text(encoding="utf-8"))
+                    if counts is None:
+                        record["notes"].append("its SHACL report isn't N-Triples as written: values and paths not counted")
+                    else:
+                        result["shacl"].update(counts)
+                result["_sweep"] = " ".join(entry)
+                result["_page_cache"] = mode
+                if case.get("queries", "").startswith("@vectors") and code == 0:
+                    result["recall"] = vector_recall(case, expect)
+                observation = invocation_observation(case, result, err, identity)
+                observation["exit"] = code
+                observation["checks"] = [check(p, w, result, expect, alt_expect) for p, w in case.get("check", {}).items()]
+                observation["routes"] = [route(p, w, result) for p, w in case.get("route", {}).items()]
+                observations.append(observation)
+                samples_runs.append(result)
+                if code != 0:
+                    break
+        finally:
+            for report_nt in made:  # only the paths this measurement named, each its own invocation's
+                report_nt.unlink(missing_ok=True)
         if "setup" in case:
             container(name, 1, ["rm", "-rf", scratch])
         if samples_runs:
