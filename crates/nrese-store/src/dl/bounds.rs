@@ -645,6 +645,10 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
             // afresh, so the budget isn't held by it while the build needs room (SYN-61).
             let superseded = lock(&bounds.state).evict_below(revision);
             drop(superseded);
+            // The query ontology an older revision's reading left in its cache too: the cache
+            // lets it go only when the taxonomy below reads this revision's, after the build
+            // has read in its room (N1).
+            store.dl().query_ontology.evict_below(revision);
             let (upper, rules) = afresh(store, snapshot);
             let compiled = bounds.compiled();
             let taxonomy = match &upper {
