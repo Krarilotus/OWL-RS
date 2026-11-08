@@ -1152,7 +1152,6 @@ dependencies = [
  "crc32fast",
  "fsst-rs",
  "hashbrown 0.16.1",
- "libc",
  "memchr",
  "memmap2",
  "nrese-exec",

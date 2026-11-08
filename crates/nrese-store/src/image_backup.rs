@@ -135,8 +135,7 @@ pub fn restore_until(
 ) -> StoreResult<(ImageManifest, u64)> {
     let manifest = restore_image(backup, data_dir)?;
     let wal = data_dir.join("wal");
-    fs::create_dir_all(&wal).map_err(|e| io(e, &wal))?;
-    nrese_engine::place::sync_dir(data_dir).map_err(|e| io(e, data_dir))?;
+    nrese_engine::place::create_dir_all(&wal).map_err(|e| io(e, &wal))?;
     // Segments are named by their first revision; one ends where the next begins. Those
     // that can hold a revision after the image go along.
     let mut segments: Vec<(u64, PathBuf)> = Vec::new();
@@ -233,13 +232,8 @@ pub fn place_image(
             data_dir.display()
         )));
     }
-    fs::create_dir_all(data_dir).map_err(|e| io(e, data_dir))?;
-    if let Some(parent) = data_dir
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        nrese_engine::place::sync_dir(parent).map_err(|e| io(e, parent))?;
-    }
+    // Every new level durably named (review r1, R1-F2), as the placement owns it.
+    nrese_engine::place::create_dir_all(data_dir).map_err(|e| io(e, data_dir))?;
     let target = data_dir.join(&name);
     // Synced and durably named (F3): a power loss after the restore returned must not
     // leave a short image, or one with regions that never landed, under the name.

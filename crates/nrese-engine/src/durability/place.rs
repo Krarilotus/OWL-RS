@@ -48,6 +48,37 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Creates the directory `dir` and every missing directory above it, each durably named: once
+/// one is made, the directory holding it is synced (`.` for a relative name with no parent),
+/// as a sync makes the entries in a directory durable, not its own name (review r1, R1-F2).
+/// Directories that exist are left as they are. A sync that fails fails the call.
+pub fn create_dir_all(dir: &Path) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut at = dir;
+    while !at.as_os_str().is_empty() && !at.is_dir() {
+        missing.push(at);
+        match at.parent() {
+            Some(parent) => at = parent,
+            None => break,
+        }
+    }
+    for created in missing.into_iter().rev() {
+        match fs::create_dir(created) {
+            Ok(()) => {}
+            // Made meanwhile by someone else: its name still needs the sync below.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && created.is_dir() => {
+            }
+            Err(error) => return Err(error),
+        }
+        let holding = match created.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        sync_dir(holding)?;
+    }
+    Ok(())
+}
+
 /// Makes the content of the file at `path` durable, through a writable handle (Windows'
 /// `FlushFileBuffers` needs one).
 pub fn sync_file(path: &Path) -> std::io::Result<()> {
@@ -60,7 +91,9 @@ pub fn sync_file(path: &Path) -> std::io::Result<()> {
 }
 
 /// Copies `from` to `to` durably: to a temporary name beside `to`, synced, [`rename`]d into
-/// place and the directory synced. A failure leaves `to` as it was (and no temporary).
+/// place and the directory synced. A failure before the rename leaves `to` as it was (and no
+/// temporary); one of the directory's sync after it leaves `to` replaced but not known to be
+/// durable (review r1, N3).
 pub fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut temporary = to.as_os_str().to_owned();
     temporary.push(".placing");
