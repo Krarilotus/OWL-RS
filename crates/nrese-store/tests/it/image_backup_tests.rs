@@ -281,13 +281,19 @@ fn a_restore_names_every_directory_it_creates() {
     if fs::read_dir(&sealed).is_ok() {
         eprintln!("row sealed: not checked (the directory opens: root?)");
     } else {
-        let restored = restore_image(&backup, &sealed.join("a").join("b"));
-        eprintln!(
-            "row sealed: {}",
-            if restored.is_err() { "ok" } else { "FAILED" }
-        );
-        if restored.is_ok() {
-            wrong.push("restored under a directory whose sync fails".to_owned());
+        // Tried twice (sol-loop on review r1, S1): the first refusal mustn't leave `a` for the
+        // second to take as durably named.
+        for attempt in ["sealed", "sealed, tried again"] {
+            let restored = restore_image(&backup, &sealed.join("a").join("b"));
+            eprintln!(
+                "row {attempt}: {}",
+                if restored.is_err() { "ok" } else { "FAILED" }
+            );
+            if restored.is_ok() {
+                wrong.push(format!(
+                    "{attempt}: restored under a directory whose sync fails"
+                ));
+            }
         }
     }
     fs::set_permissions(&sealed, fs::Permissions::from_mode(0o755)).unwrap();
