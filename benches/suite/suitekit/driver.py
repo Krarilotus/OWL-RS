@@ -36,7 +36,7 @@ from .runtime import (ApptainerRuntime, DockerRuntime, DryRuntime, Mount, Proces
                       run_quiet, shell)
 from . import receipts
 from .datasets import Store
-from .manifest import Manifest, image_ids
+from .manifest import Manifest, ManifestError, image_ids
 from .manifest import git as checkout_state
 from .schema import FIELDS, Result, Writer, problems, read
 from .summary import adjudications, summarise
@@ -879,7 +879,8 @@ class Suite:
         return 0
 
     def attempts(self, plan, cells: list[tuple[str, object]]) -> dict[str, dict]:
-        """Each cell's attempt (receipts.py), into the manifest before its work starts."""
+        """Each cell's attempt (receipts.py), into the manifest, durably (Manifest._write), before its
+        work starts; if it can't be published that raises here, and the run stops before the work."""
         if not self.manifest or self.args.dry_run or not cells:
             return {}
         started = datetime.datetime.now().isoformat(timespec="microseconds")
@@ -1046,7 +1047,12 @@ def main(argv: list[str], systems: dict, workloads: dict, root: Path) -> int:
     args = arguments(argv)
     suite = Suite(args, systems, workloads, root)
     if not args.dry_run:
-        suite.manifest = Manifest(suite.results, root, argv, args, args.runtime, suite.settings)
+        try:
+            suite.manifest = Manifest(suite.results, root, argv, args, args.runtime, suite.settings)
+        except ManifestError as error:  # nothing has run: its own scratch goes, the manifest stays
+            suite.runtime.attempt(suite.cleanup)
+            print(f"refused: {error}", file=sys.stderr)
+            return 2
     atexit.register(suite.cleanup)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     code = 1

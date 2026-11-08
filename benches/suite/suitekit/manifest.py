@@ -16,7 +16,7 @@ appends one entry to `invocations`:
 | images | image -> its content id, for every image the run used |
 | datasets | /data path -> size in bytes, for every input the run read |
 | sources | the downloads behind the datasets: URL and the server's Last-Modified (a "latest" dump changes) |
-| cells | `workload/tier/system` -> its attempt, written before its work, then its receipt once it ran its whole protocol (receipts.py) |
+| cells | `workload/tier/system` -> its attempt, before its work; its receipt once it ran it all (receipts.py) |
 | data_hash_s | the seconds the receipts' data hashes took |
 | exit | the run's exit code |
 
@@ -217,6 +217,22 @@ def now() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
+class ManifestError(RuntimeError):
+    """A results directory's manifest that can't be read or parsed: its run is refused."""
+
+
+def sync_directory(directory: Path):
+    """A rename in `directory` made durable: on POSIX the directory's own fsync; Windows can't
+    open a directory to flush it, and NTFS journals the rename (MoveFileEx's replace)."""
+    if os.name == "nt":
+        return
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class Manifest:
     """One invocation's entry in <results>/manifest.json, written at the start and updated
     as the run learns its images and datasets, and at the end."""
@@ -247,16 +263,31 @@ class Manifest:
         self._write(data)
 
     def _read(self) -> dict:
-        try:
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        """The manifest as it is: none yet is an empty one; one that can't be read or parsed is
+        refused (ManifestError), never taken for empty: the next write would drop every earlier
+        invocation's evidence (review cell-receipts r2)."""
+        if not self.path.exists():
             return {"schema": 1, "invocations": []}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise ManifestError(f"{self.path}: can't be read as a manifest ({error}); it is left as it is") from error
+        if not isinstance(data, dict) or not isinstance(data.get("invocations", []), list):
+            raise ManifestError(f"{self.path}: not a manifest (no invocations list); it is left as it is")
+        return data
 
     def _write(self, data: dict):
+        """The manifest, durably: its bytes on disk before it replaces the old one, and the
+        replacement itself on disk, before this returns (a cell's attempt must survive a host crash
+        before its work starts: review cell-receipts r2). Raises if any of that fails."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(json.dumps(data, indent=2) + "\n")
+            f.flush()
+            os.fsync(f.fileno())  # on Windows _commit, i.e. FlushFileBuffers
         os.replace(tmp, self.path)
+        sync_directory(self.path.parent)
 
     def update(self, **fields):
         for key, value in fields.items():
