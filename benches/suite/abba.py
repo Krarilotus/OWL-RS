@@ -582,9 +582,9 @@ def report(family: dict, rounds: list[Path]) -> tuple[int, str, dict]:
     decided = rg.decide([[ab for _, _, ab, _ in judged]])
     out["decided"] = {k: decided[k] for k in ("losses", "pending", "m")}
     # A hypothesis the gate didn't test in some round, for its stated reason: no part of a pass
-    # (SHACL lead, 8 Nov 2026: every hypothesis untested, decided over none, read "no loss").
-    untested = {h: ab["not_compared"][h] for _, _, ab, _ in judged for h in family["hypotheses"]
-                if h in (ab.get("not_compared") or {})}
+    # (SHACL lead, 8 Nov 2026: every hypothesis untested, decided over none, read "no loss"); the
+    # decision's own, as the release verdict reads it (release_gate.decide).
+    untested = decided["not_compared"]
     out["not_compared"] = untested
     m = len(family["hypotheses"])
     if decided["losses"]:
@@ -677,8 +677,10 @@ def run(args) -> int:
     code, said = rg.fleet_call("check", str(set_path))
     print("  fleet check" + (f" (exit {code})" if code else "") + ":\n    " + "\n    ".join(said.splitlines() or ["-"]))
     if args.plan:
-        print("plan only: nothing queued")
-        return 0
+        # A plan the fleet refuses isn't one to read as taken (STAGE2's lead, 8 Nov 2026: exit 0 with
+        # "(exit 1)" in its text): it exits as an unsubmitted run does.
+        print("plan only: nothing queued" + ("; fleet check refuses it (above)" if code else ""))
+        return 1 if code else 0
     if code != 0:
         print("not submitted: fleet check didn't take it (above)", file=sys.stderr)
         return 1
