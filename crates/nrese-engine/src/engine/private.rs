@@ -27,7 +27,8 @@ use crate::term::overlay::Overlay;
 /// Speculative changes over one snapshot, with a vocabulary of their own: no writer slot, no
 /// commit, nothing added to the dictionary.
 pub struct PrivateTransaction<'e> {
-    engine: &'e Inner,
+    /// Its engine, which it doesn't outlive, as a write transaction doesn't.
+    _engine: &'e Inner,
     /// The transaction's vocabulary: the dictionary below the base's length, then its own.
     overlay: Arc<Overlay>,
     /// The base snapshot and the pending changes over it.
@@ -54,7 +55,7 @@ impl<'e> PrivateTransaction<'e> {
         }
         let overlay = Overlay::over(Arc::clone(dictionary), base.dictionary_len(), budget);
         Ok(Self {
-            engine,
+            _engine: engine,
             overlay,
             pending: Pending::over(base.clone()),
         })
@@ -125,10 +126,9 @@ impl<'e> PrivateTransaction<'e> {
             committed_micros: base.committed_micros,
             // Every id it knows is below its vocabulary's end.
             dictionary_len: view.end(),
-            equality: match self.changes_equality() {
-                true => Default::default(),
-                false => Arc::clone(&base.equality),
-            },
+            // Its own: classes built from its statements name its own ids, and the base's
+            // cell is the published version's.
+            equality: Default::default(),
             canonical: Default::default(),
         };
         Ok(self.pending.base().with_version(version).private(view))
@@ -152,22 +152,11 @@ impl<'e> PrivateTransaction<'e> {
             revision: seen.revision,
             committed_micros: seen.committed_micros,
             dictionary_len: vocabulary.end(),
-            equality: match self.changes_equality() {
-                true => Default::default(),
-                false => Arc::clone(&seen.equality),
-            },
+            // Its own, as `pending_snapshot`'s.
+            equality: Default::default(),
             canonical: Default::default(),
         };
         Ok(view.with_version(version).private(vocabulary))
-    }
-
-    /// Whether the pending changes touch an `owl:sameAs` statement while reads expand
-    /// equality classes, as the write transaction's do.
-    fn changes_equality(&self) -> bool {
-        let Some(same_as) = *self.engine.shared.equality.read() else {
-            return false;
-        };
-        self.pending.touches_predicate(same_as)
     }
 
     /// Number of asserted and inferred quads, including pending changes.

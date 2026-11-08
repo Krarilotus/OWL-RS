@@ -209,7 +209,7 @@ impl Pending {
     }
 
     /// Whether any pending change, of either stack, has `same_as` as its predicate.
-    pub(in crate::engine) fn touches_predicate(&self, same_as: TermId) -> bool {
+    pub(super) fn touches_predicate(&self, same_as: TermId) -> bool {
         [
             &self.asserted.inserts,
             &self.asserted.deletes,
