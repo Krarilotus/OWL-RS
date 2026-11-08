@@ -4,6 +4,7 @@ import contextlib
 import copy
 import io
 import json
+import re
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -62,6 +63,29 @@ class FastCounters(unittest.TestCase):
         self.assertTrue(grew)
         self.assertEqual(len(notes), 2)
         self.assertIn("MORE WORK", notes[1])
+
+
+SHAPES_CASE = {"name": "shapes", "data": "none", "args": ["--shapes", "/src/shapes.ttl"], "queries": "",
+               "metric": "shacl.p50_ms", "cap_gb": 2,
+               "check": {"shacl.results": 3, "shacl.values": 3, "shacl.paths": 2}}
+
+
+def shapes_run(scratch, report="", json_text='{"shacl": {"results": 3, "p50_ms": 1.0}}'):
+    """A container that runs perf_lab with shapes: writes its JSON (None: none) and its SHACL
+    report where the command says (--shacl-report /out/NAME); the commands it was given."""
+    commands = []
+
+    def measured(name, cap, command, env=None, timeout=None):
+        commands.append(command[-1])
+        if json_text is not None:
+            (scratch / "shapes.json").write_text(json_text)
+        found = re.search(r"'--shacl-report' '/out/([^']+)'", command[-1])
+        if found and isinstance(report, bytes):
+            (scratch / found.group(1)).write_bytes(report)
+        elif found:
+            (scratch / found.group(1)).write_text(report, encoding="utf-8")
+        return 0, "", "", 1
+    return measured, commands
 
 
 def report(ms=1.0, status="ok", qps=None):
@@ -130,6 +154,150 @@ class FastComparison(unittest.TestCase):
             self.assertEqual(record["samples"][f"{mode}/q/first"], [5, 5])
             self.assertEqual(record["samples"][f"{mode}/q/repeat"], [2, 2])
         self.assertEqual(fast.case_manifest([case])["cache_modes"], {"cache": ["warm", "cold"]})
+
+    def test_a_shacl_case_counts_its_report_s_values_and_paths(self):
+        """SHACL lead, 8 Nov 2026 (shacl-lubm-computed): the specified answer has 40,944 sh:value and
+        20,472 sh:resultPath (SHACL 1.0 §5.3.2), which perf_lab doesn't count; its --shacl-report
+        writes the report as N-Triples. A case with --shapes asks for it, counts them as
+        shacl.values and shacl.paths, so a check can pin them, and leaves no report behind."""
+        sh = "http://www.w3.org/ns/shacl#"
+        report = "".join([f"_:r{i} <{sh}value> \"v{i}\" .\n" for i in range(3)]
+                         + [f"_:r{i} <{sh}resultPath> <http://x/p{i}> .\n" for i in range(2)]
+                         + [f"_:r0 <{sh}focusNode> <<( _:b <{sh}value> <http://x/o> )>> .\n",
+                            f"_:v <{sh}conforms> \"false\"^^<http://www.w3.org/2001/XMLSchema#boolean> .\n"])
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            measured, commands = shapes_run(scratch, report=report)
+            with patch.object(fast, "SCRATCH", scratch), patch.object(fast, "container", measured):
+                record = fast.measure({**SHAPES_CASE, "repeat": 2}, "shapes", 1, {}, {}, "none")
+            left = sorted(p.name for p in scratch.iterdir())
+        for observation in record["observations"]:
+            self.assertEqual([(c["path"], c["got"], c["ok"]) for c in observation["checks"]],
+                             [("shacl.results", 3, True), ("shacl.values", 3, True), ("shacl.paths", 2, True)])
+        named = [re.search(r"'--shacl-report' '/out/([^']+)'", c).group(1) for c in commands]
+        self.assertEqual(len(set(named)), 2)  # each invocation its own report
+        self.assertEqual(left, [])
+        self.assertEqual({k: record["counters"][k] for k in ("shacl.values", "shacl.paths")},
+                         {"shacl.values": 3, "shacl.paths": 2})  # a triple term's sh:value isn't one
+
+    def test_only_a_record_s_own_subject_and_predicate_are_counted(self):
+        """Fix check r1 W (review-shacl-report-counts-r1): the writer escapes a literal's control
+        characters but not U+2028, U+2029 or U+0085, where str.splitlines() also splits, so text
+        inside a literal counted as a record of its own. Records end at a physical newline only;
+        only their subject and predicate terms are read; a record that isn't N-Triples counts nothing."""
+        sh = "http://www.w3.org/ns/shacl#"
+        report = "".join(f"{line}\n" for line in [
+            f'_:r0 <{sh}value> "a _:fake <{sh}value> y" .',
+            f'_:r1 <{sh}value> "b <{sh}value> z" .',
+            f'_:r2 <{sh}resultMessage> "c\u0085_:f <{sh}resultPath> <http://x/p> ." .',
+            f'_:r3 <{sh}resultMessage> " <{sh}value> <{sh}resultPath> " .',
+            f"_:r4 <{sh}focusNode> <<( _:b <{sh}value> <http://x/o> )>> .",
+            f"_:r5 <{sh}resultPath> <http://x/p> .",
+            "# a comment", ""])
+        self.assertEqual(fast.shacl_report_counts(report), {"values": 2, "paths": 1})
+        for broken in (f'"a literal" <{sh}value> "x" .', f"_:r0 {sh}value <x> .", f"<<( _:a <p> <o> )>> <{sh}value> <x> ."):
+            with self.subTest(record=broken):
+                self.assertIsNone(fast.shacl_report_counts(report + broken + "\n"))
+
+    def test_counts_its_report_couldn_t_give_fail_their_checks_with_or_without_routes(self):
+        """Fix check r2 (review-shacl-report-counts-r2): without --routes check() leaves an absent
+        value unchecked (ok None), and measure() fails a case only on ok False, so a report that
+        couldn't be parsed, with its values and paths pinned, ended ok. Couldn't be read isn't
+        "not reported": the verdict is wrong, whatever --routes, and the note says why. A report
+        the invocation didn't write is never read, though one is where an older harness put its own."""
+        sh = "http://www.w3.org/ns/shacl#"
+        unparseable = f'_:r0 <{sh}value> "x" .\n"a literal" <{sh}value> "y" .\n'
+        stale = "".join([f"_:s{i} <{sh}value> \"v\" .\n" for i in range(3)]
+                        + [f"_:s{i} <{sh}resultPath> <http://x/p> .\n" for i in range(2)])
+        for routes in (False, True):
+            for kind in ("unparseable", "not written"):
+                with self.subTest(routes=routes, report=kind), tempfile.TemporaryDirectory() as directory:
+                    scratch = Path(directory)
+                    (scratch / "shapes.shacl.nt").write_text(stale, encoding="utf-8")  # an older harness's path
+                    measured, _ = shapes_run(scratch, report=unparseable)
+                    if kind == "not written":
+                        def measured(name, cap, command, env=None, timeout=None):  # noqa: F811
+                            (scratch / "shapes.json").write_text('{"shacl": {"results": 3, "p50_ms": 1.0}}')
+                            return 0, "", "", 1
+                    with patch.object(fast, "SCRATCH", scratch), patch.object(fast, "container", measured), \
+                            patch.dict(fast.OPTIONS, routes=routes):
+                        record = fast.measure(SHAPES_CASE, "shapes", 1, {}, {}, "none")
+                    self.assertEqual(fast.verdict(SHAPES_CASE, record)["verdict"], "wrong")
+                    failed = {c["path"]: c for c in record["observations"][0]["checks"] if c["ok"] is not True}
+                    self.assertEqual(sorted(failed), ["shacl.paths", "shacl.values"])
+                    self.assertTrue(all(c["ok"] is False and "not counted" in c["note"] for c in failed.values()))
+
+    def test_a_report_that_can_t_be_read_or_decoded_fails_its_counts_and_aborts_nothing(self):
+        """Fix check r3 (review-shacl-report-counts-r3): a report that isn't UTF-8, or whose read
+        fails, raised out of measure() before its counts were marked unreadable. Every way of not
+        getting the report is one state: with values and paths pinned the verdict is wrong whatever
+        --routes, each count's check fails with the reason; a case that pins neither is unaffected,
+        ok; and the report is removed either way."""
+        sh = "http://www.w3.org/ns/shacl#"
+        undecodable = f'_:r0 <{sh}value> "'.encode() + b'\xff\xfe' + f'" .\n_:r0 <{sh}resultPath> <http://x/p> .\n'.encode()
+        unpinned = {**SHAPES_CASE, "check": {"shacl.results": 3}}
+        opened = Path.open
+
+        def failing_read(path, mode="r", *args, **kwargs):  # the disk, not the report, fails
+            if path.name.endswith(".shacl.nt") and "r" in mode:
+                raise OSError(5, "Input/output error", str(path))
+            return opened(path, mode, *args, **kwargs)
+
+        for routes in (False, True):
+            for failure, reason in (("invalid UTF-8", "isn't UTF-8"), ("read error", "couldn't be read")):
+                for case, verdict in ((SHAPES_CASE, "wrong"), (unpinned, "ok")):
+                    pinned = case is SHAPES_CASE
+                    with self.subTest(routes=routes, failure=failure, pinned=pinned), \
+                            tempfile.TemporaryDirectory() as directory:
+                        scratch = Path(directory)
+                        measured, _ = shapes_run(scratch, report=undecodable if failure == "invalid UTF-8" else "")
+                        with patch.object(fast, "SCRATCH", scratch), patch.object(fast, "container", measured), \
+                                patch.dict(fast.OPTIONS, routes=routes), \
+                                (patch.object(Path, "open", failing_read) if failure == "read error"
+                                 else contextlib.nullcontext()):
+                            try:
+                                record = fast.measure(case, "shapes", 1, {}, {}, "none")
+                                got = fast.verdict(case, record)["verdict"]
+                            except Exception as error:  # noqa: BLE001 - the defect is that it raises
+                                record, got = None, f"raised {type(error).__name__}"
+                        self.assertEqual(got, verdict)
+                        self.assertEqual(sorted(p.name for p in scratch.iterdir() if p.name.endswith(".nt")), [])
+                        checks = {c["path"]: c for c in record["observations"][0]["checks"]}
+                        if pinned:
+                            failed = {p: c for p, c in checks.items() if c["ok"] is not True}
+                            self.assertEqual(sorted(failed), ["shacl.paths", "shacl.values"])
+                            self.assertTrue(all(c["ok"] is False and reason in c["note"] for c in failed.values()))
+                        else:
+                            self.assertEqual([(p, c["ok"]) for p, c in checks.items()], [("shacl.results", True)])
+                        self.assertTrue(any(reason in note for note in record["notes"]))
+
+    def test_a_report_is_removed_however_its_invocation_ends_and_a_stale_one_refused(self):
+        """Fix check r1 (lifecycle): the report's path was one per checkout and stayed behind when an
+        invocation wrote no JSON or a broken one; it is the invocation's own, removed in every case,
+        and one already there is refused, never counted or removed."""
+        for ending in ("no json", "broken json"):
+            with self.subTest(ending=ending), tempfile.TemporaryDirectory() as directory:
+                scratch = Path(directory)
+                measured, _ = shapes_run(scratch, json_text=None if ending == "no json" else "{")
+                with patch.object(fast, "SCRATCH", scratch), patch.object(fast, "container", measured):
+                    if ending == "no json":
+                        self.assertEqual(fast.measure(SHAPES_CASE, "shapes", 1, {}, {}, "none")["status"], "failed")
+                    else:
+                        with self.assertRaises(json.JSONDecodeError):
+                            fast.measure(SHAPES_CASE, "shapes", 1, {}, {}, "none")
+                self.assertEqual(sorted(p.name for p in scratch.iterdir() if p.name.endswith(".nt")), [])
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            measured, commands = shapes_run(scratch)
+            fixed = SimpleNamespace(hex="0123456789abcdef")
+            stale = scratch / "shapes-0123456789ab-0.shacl.nt"
+            stale.write_text("_:old <http://www.w3.org/ns/shacl#value> 1 .\n", encoding="utf-8")
+            with patch.object(fast, "SCRATCH", scratch), patch.object(fast, "container", measured), \
+                    patch("uuid.uuid4", return_value=fixed):
+                record = fast.measure(SHAPES_CASE, "shapes", 1, {}, {}, "none")
+            self.assertEqual(record["status"], "failed")
+            self.assertEqual(commands, [])
+            self.assertTrue(stale.exists())
 
     def test_single_client_level_survives_measurement_and_compaction(self):
         clients = {"clients": 32, "qps": 100, "p99_ms": 1, "memory": {"peak_mib": 64}}
