@@ -37,7 +37,8 @@ pub use engine::{
     Applied, AssertedIdentity, BulkLoad, BulkMode, CommitSummary, Content, CorpusTuning, Count,
     DEFAULT_READER_CORPUS_BYTES, Engine, EngineConfig, EngineStats, EqualityClasses, HeavyGroups,
     ImageInfo, InferredMask, InferredSubset, LogBatch, LogExpectation, ProbeCursor, ReadModel,
-    Rematerialisation, Seek, Snapshot, SnapshotIdentity, TextCorpusStats, TextScope, Transaction,
+    Rematerialisation, SearchRefused, Seek, Snapshot, SnapshotIdentity, TextCorpusStats, TextScope,
+    Transaction,
 };
 pub use error::{EngineError, EngineResult};
 pub use index::cursor::SeekStats;

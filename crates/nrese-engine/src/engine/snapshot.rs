@@ -1887,26 +1887,43 @@ impl Snapshot {
         self.underlying().stats().arena_bytes
     }
 
+    /// Refused, before any search touches the dictionary, for a private snapshot: the
+    /// shared indexes don't cover its own terms, and building or extending them would change
+    /// state every snapshot shares.
+    fn searchable(&self) -> Result<(), SearchRefused> {
+        match self.is_private() {
+            true => Err(SearchRefused::Private),
+            false => Ok(()),
+        }
+    }
+
     /// The string literals this snapshot's dictionary holds that match `query`, best first
-    /// (whether statements still use them is the caller's to check).
-    pub fn text_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
+    /// (whether statements still use them is the caller's to check). Refused for a private
+    /// snapshot ([`SearchRefused::Private`]).
+    pub fn text_search(
+        &self,
+        query: &crate::TextQuery,
+    ) -> Result<Vec<crate::TextMatch>, SearchRefused> {
+        self.searchable()?;
         let known = self.version.dictionary_len;
         let mut matches = self.underlying().text_search(query);
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
-        matches
+        Ok(matches)
     }
 
     /// The vector literals this snapshot's dictionary holds that are nearest to
     /// `query.vector`, among those `accept` takes, nearest first, with how the search went
     /// (whether statements still use them is the caller's to check, in `accept`). What the
     /// search holds, the hits included, is charged to `budget` before it is allocated: a
-    /// search the budget has no room for is refused, with nothing left charged.
+    /// search the budget has no room for is refused, with nothing left charged. Refused for
+    /// a private snapshot too.
     pub fn vector_search<'b>(
         &self,
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
         budget: &'b nrese_exec::Budget,
-    ) -> Result<VectorHits<'b>, nrese_exec::BudgetExceeded> {
+    ) -> Result<VectorHits<'b>, SearchRefused> {
+        self.searchable()?;
         let (hits, report) =
             self.underlying()
                 .vector_search(query, self.version.dictionary_len, accept, budget)?;
@@ -1924,18 +1941,60 @@ impl Snapshot {
 
     /// Builds the graph searches like `query` use, covering every vector of its
     /// dimension, before returning: a warm-up (searches build it themselves, a large one
-    /// on a thread of its own while they scan exactly).
+    /// on a thread of its own while they scan exactly). Nothing for a private snapshot,
+    /// which doesn't search: a build is shared state.
     pub fn prepare_vector_graph(&self, query: &crate::VectorQuery) {
-        self.underlying().prepare_vector_graph(query);
+        if self.searchable().is_ok() {
+            self.underlying().prepare_vector_graph(query);
+        }
     }
 
     /// The IRIs this snapshot's dictionary holds whose local names match `query`, best
-    /// first (whether statements still use them is the caller's to check).
-    pub fn iri_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
+    /// first (whether statements still use them is the caller's to check). Refused for a
+    /// private snapshot.
+    pub fn iri_search(
+        &self,
+        query: &crate::TextQuery,
+    ) -> Result<Vec<crate::TextMatch>, SearchRefused> {
+        self.searchable()?;
         let known = self.version.dictionary_len;
         let mut matches = self.underlying().iri_search(query);
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
-        matches
+        Ok(matches)
+    }
+}
+
+/// Why a [`Snapshot`]'s search gave no answer: a refusal, never an empty answer.
+#[derive(Debug, Clone, Copy)]
+pub enum SearchRefused {
+    /// The search's budget had no room ([`nrese_exec::BudgetExceeded`]).
+    Memory(nrese_exec::BudgetExceeded),
+    /// The snapshot is private ([`Snapshot::is_private`]): the shared indexes don't cover
+    /// its own terms, and no search changes them for it.
+    Private,
+}
+
+impl From<nrese_exec::BudgetExceeded> for SearchRefused {
+    fn from(exceeded: nrese_exec::BudgetExceeded) -> Self {
+        Self::Memory(exceeded)
+    }
+}
+
+impl std::fmt::Display for SearchRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory(exceeded) => exceeded.fmt(f),
+            Self::Private => f.write_str("a private snapshot can't be searched"),
+        }
+    }
+}
+
+impl std::error::Error for SearchRefused {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Memory(exceeded) => Some(exceeded),
+            Self::Private => None,
+        }
     }
 }
 

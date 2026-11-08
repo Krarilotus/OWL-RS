@@ -52,6 +52,17 @@ pub enum QueryEvaluationError {
     Unexpected(String),
 }
 
+impl From<nrese_engine::SearchRefused> for QueryEvaluationError {
+    /// A search's refusal: its memory as any other memory refusal; a private snapshot's as
+    /// an error of its own, never an empty answer and never the client's.
+    fn from(refused: nrese_engine::SearchRefused) -> Self {
+        match refused {
+            nrese_engine::SearchRefused::Memory(exceeded) => Self::MemoryLimit(exceeded),
+            nrese_engine::SearchRefused::Private => Self::Unexpected(refused.to_string()),
+        }
+    }
+}
+
 /// A flag a running query checks; cancelling it stops the query at its next check.
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken(Arc<AtomicBool>);
