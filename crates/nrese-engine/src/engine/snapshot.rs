@@ -976,6 +976,16 @@ impl Snapshot {
         }
     }
 
+    /// This snapshot with `view` as its vocabulary: a private transaction's pending state
+    /// ([`super::PrivateTransaction`]). Every snapshot made from it keeps the view. Its
+    /// statistics are its own, as a restricted view's are: nothing built from its statements,
+    /// whose own ids mean nothing to the engine, is kept for published snapshots.
+    pub(super) fn private(mut self, view: crate::term::overlay::OverlayView) -> Snapshot {
+        self.vocabulary = Vocabulary::Private(view);
+        self.statistics = Arc::new(self.statistics.for_view());
+        self
+    }
+
     pub(crate) fn version(&self) -> &Version {
         &self.version
     }

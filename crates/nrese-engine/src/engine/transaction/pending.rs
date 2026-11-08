@@ -13,9 +13,9 @@
 //!   leave the inferred stack. Both pending-snapshot builders take that set from here.
 //! - **No way to publication.** It is a value; only the write transaction turns its deltas into a
 //!   commit record ([`Pending::into_parts`]). That is by visibility: this module is the write
-//!   transaction's child, and what is `pub(super)` here, `into_parts` and the deltas' sets among
-//!   it, is the write transaction's alone. What a private transaction needs is widened to
-//!   `pub(in crate::engine)` when it arrives; those parts never are.
+//!   transaction's child, and what is `pub(super)` here, `into_parts`, the deltas' sets and the
+//!   takeover among it, is the write transaction's alone. What the private transaction
+//!   (`super::super::private`) reads and changes is `pub(in crate::engine)`.
 
 use hashbrown::HashSet;
 
@@ -27,7 +27,7 @@ use crate::term::TermId;
 /// absent from the base, `deletes` are present in it, and the two sets are disjoint. That
 /// invariant is what the index's sign-sum visibility rule relies on.
 #[derive(Default)]
-pub(super) struct Delta {
+pub(in crate::engine) struct Delta {
     pub(super) inserts: HashSet<EncodedQuad>,
     pub(super) deletes: HashSet<EncodedQuad>,
 }
@@ -54,14 +54,24 @@ impl Delta {
         self.inserts.contains(quad) || (!self.deletes.contains(quad) && in_base())
     }
 
-    pub(super) fn counts(&self) -> (usize, usize) {
+    pub(in crate::engine) fn counts(&self) -> (usize, usize) {
         (self.inserts.len(), self.deletes.len())
     }
 
     /// No net change: what a commit publishes no run for, and, for the asserted stack,
     /// keeps the asserted identity for ([`super::Transaction::asserted_identity_after`]).
-    pub(super) fn is_empty(&self) -> bool {
+    pub(in crate::engine) fn is_empty(&self) -> bool {
         self.counts() == (0, 0)
+    }
+
+    /// The pending inserts, read only.
+    pub(in crate::engine) fn inserted(&self) -> impl Iterator<Item = EncodedQuad> + '_ {
+        self.inserts.iter().copied()
+    }
+
+    /// The pending deletes, read only.
+    pub(in crate::engine) fn deleted(&self) -> impl Iterator<Item = EncodedQuad> + '_ {
+        self.deletes.iter().copied()
     }
 
     fn net(&self) -> i64 {
@@ -70,7 +80,7 @@ impl Delta {
 }
 
 /// The pending changes of both stacks over one base snapshot, held for life.
-pub(super) struct Pending {
+pub(in crate::engine) struct Pending {
     base: Snapshot,
     asserted: Delta,
     inferred: Delta,
@@ -78,16 +88,16 @@ pub(super) struct Pending {
 
 /// [`Pending::snapshot_changes`]: the changes a pending snapshot of the whole base applies, each
 /// stack's inserts and deletes, disjointness applied.
-pub(super) struct SnapshotChanges {
-    pub(super) asserted_inserts: Vec<EncodedQuad>,
-    pub(super) asserted_deletes: Vec<EncodedQuad>,
-    pub(super) inferred_inserts: Vec<EncodedQuad>,
-    pub(super) inferred_deletes: Vec<EncodedQuad>,
+pub(in crate::engine) struct SnapshotChanges {
+    pub(in crate::engine) asserted_inserts: Vec<EncodedQuad>,
+    pub(in crate::engine) asserted_deletes: Vec<EncodedQuad>,
+    pub(in crate::engine) inferred_inserts: Vec<EncodedQuad>,
+    pub(in crate::engine) inferred_deletes: Vec<EncodedQuad>,
 }
 
 impl Pending {
     /// No changes yet, over `base`, which these changes are exact against for their life.
-    pub(super) fn over(base: Snapshot) -> Self {
+    pub(in crate::engine) fn over(base: Snapshot) -> Self {
         Self {
             base,
             asserted: Delta::default(),
@@ -95,15 +105,15 @@ impl Pending {
         }
     }
 
-    pub(super) fn base(&self) -> &Snapshot {
+    pub(in crate::engine) fn base(&self) -> &Snapshot {
         &self.base
     }
 
-    pub(super) fn asserted(&self) -> &Delta {
+    pub(in crate::engine) fn asserted(&self) -> &Delta {
         &self.asserted
     }
 
-    pub(super) fn inferred(&self) -> &Delta {
+    pub(in crate::engine) fn inferred(&self) -> &Delta {
         &self.inferred
     }
 
@@ -150,7 +160,7 @@ impl Pending {
 
     /// The changes a pending snapshot of the whole base applies, disjointness applied: a
     /// statement asserted now leaves the inferred stack (as [`Self::take_over_inferred`]).
-    pub(super) fn snapshot_changes(&self) -> SnapshotChanges {
+    pub(in crate::engine) fn snapshot_changes(&self) -> SnapshotChanges {
         let shadowed: HashSet<EncodedQuad> = self.shadowed_inferred().collect();
         let asserted_inserts: Vec<EncodedQuad> = self.asserted.inserts.iter().copied().collect();
         let asserted_deletes: Vec<EncodedQuad> = self.asserted.deletes.iter().copied().collect();
@@ -179,7 +189,7 @@ impl Pending {
     /// The inferred statements of `inferred_view` (a restricted view of the base) that a pending
     /// view over it drops: those the pending changes delete or assert, and `hidden`. Sorted,
     /// each once.
-    pub(super) fn over_gone(
+    pub(in crate::engine) fn over_gone(
         &self,
         inferred_view: &crate::index::IndexVersion,
         hidden: &[EncodedQuad],
@@ -199,7 +209,7 @@ impl Pending {
     }
 
     /// Whether any pending change, of either stack, has `same_as` as its predicate.
-    pub(super) fn touches_predicate(&self, same_as: TermId) -> bool {
+    pub(in crate::engine) fn touches_predicate(&self, same_as: TermId) -> bool {
         [
             &self.asserted.inserts,
             &self.asserted.deletes,
@@ -212,7 +222,7 @@ impl Pending {
 
     /// Number of quads visible in `model`, including pending changes. O(1) for the asserted
     /// stack; the inferred count costs O(d log n) for d pending inserts.
-    pub(super) fn len_in(&self, model: ReadModel) -> u64 {
+    pub(in crate::engine) fn len_in(&self, model: ReadModel) -> u64 {
         Stack::ALL
             .into_iter()
             .filter(|&stack| model.includes(stack))
@@ -229,7 +239,7 @@ impl Pending {
             .sum()
     }
 
-    pub(super) fn contains_in(&self, model: ReadModel, quad: &EncodedQuad) -> bool {
+    pub(in crate::engine) fn contains_in(&self, model: ReadModel, quad: &EncodedQuad) -> bool {
         Stack::ALL
             .into_iter()
             .any(|stack| model.includes(stack) && self.stack_contains(stack, quad))
@@ -237,7 +247,7 @@ impl Pending {
 
     /// Quads matching `pattern` in `model`, including pending changes. Per stack, base quads
     /// come first, in index order, followed by pending inserts in no particular order.
-    pub(super) fn quads_for_pattern_in<'a>(
+    pub(in crate::engine) fn quads_for_pattern_in<'a>(
         &'a self,
         model: ReadModel,
         pattern: &QuadPattern,
@@ -264,7 +274,7 @@ impl Pending {
     }
 
     /// True if the named graph `graph` contains at least one quad, including pending changes.
-    pub(super) fn contains_named_graph(&self, graph: TermId) -> bool {
+    pub(in crate::engine) fn contains_named_graph(&self, graph: TermId) -> bool {
         !graph.is_default_graph()
             && self
                 .quads_for_pattern_in(ReadModel::Materialised, &QuadPattern::in_graph(graph))
@@ -273,7 +283,7 @@ impl Pending {
     }
 
     /// Named graphs that are non-empty including pending changes, in id order.
-    pub(super) fn named_graphs(&self) -> Vec<TermId> {
+    pub(in crate::engine) fn named_graphs(&self) -> Vec<TermId> {
         let mut graphs: Vec<TermId> = self
             .base
             .named_graphs()
@@ -288,7 +298,7 @@ impl Pending {
 
     /// Asserts `quad` (its ids from the base's dictionary or its transaction's vocabulary).
     /// Returns whether it changed anything: `false` if it was already asserted.
-    pub(super) fn insert_asserted(&mut self, quad: EncodedQuad) -> bool {
+    pub(in crate::engine) fn insert_asserted(&mut self, quad: EncodedQuad) -> bool {
         let base = &self.base;
         self.asserted
             .insert(quad, || base.stack_contains(Stack::Asserted, &quad))
@@ -296,14 +306,14 @@ impl Pending {
 
     /// Retracts an asserted quad; returns whether it changed anything. Inferred quads are
     /// unaffected.
-    pub(super) fn remove_asserted(&mut self, quad: EncodedQuad) -> bool {
+    pub(in crate::engine) fn remove_asserted(&mut self, quad: EncodedQuad) -> bool {
         let base = &self.base;
         self.asserted
             .remove(quad, || base.stack_contains(Stack::Asserted, &quad))
     }
 
     /// Adds an inferred quad: `false` if it is already inferred, or asserted.
-    pub(super) fn insert_inferred(&mut self, quad: EncodedQuad) -> bool {
+    pub(in crate::engine) fn insert_inferred(&mut self, quad: EncodedQuad) -> bool {
         if self.stack_contains(Stack::Asserted, &quad) {
             return false;
         }
@@ -313,7 +323,7 @@ impl Pending {
     }
 
     /// Removes an inferred quad: `false` if it was not visible as inferred.
-    pub(super) fn remove_inferred(&mut self, quad: EncodedQuad) -> bool {
+    pub(in crate::engine) fn remove_inferred(&mut self, quad: EncodedQuad) -> bool {
         if !self.stack_contains(Stack::Inferred, &quad) {
             return false;
         }

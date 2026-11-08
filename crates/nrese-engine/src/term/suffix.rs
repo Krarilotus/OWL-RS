@@ -25,13 +25,6 @@ use super::dictionary::Dictionary;
 
 /// What an `Arc<[u8]>` of `len` bytes allocates: its two counts, then the bytes, rounded up to
 /// the counts' alignment.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the vocabulary interns into a suffix in package 2"
-    )
-)]
 fn key_cost(len: usize) -> usize {
     2 * size_of::<usize>() + len.next_multiple_of(align_of::<usize>())
 }
@@ -58,10 +51,6 @@ pub(crate) struct Chunk {
 type ChunkRef = ChargedArc<Chunk>;
 
 /// A publisher's new entries, ids `start..start + len`, in the order it added them.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the vocabulary interns into it in package 2")
-)]
 pub(crate) struct Suffix {
     start: u64,
     budget: Arc<Budget>,
