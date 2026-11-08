@@ -1442,6 +1442,70 @@ def file_digest(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+_DIGESTS: dict = {}
+
+
+def case_inputs(case: dict) -> dict[str, str | None]:
+    """The byte SHA-256 of every external file the case loads, as this run found it: exactly the
+    keys suitekit.inputs.declared() gives (frozen datasets, converted ORE ontologies, a reference
+    taxonomy, each concatenation), each resolved by data_file() as the run reads it; None where it
+    isn't there or can't be read here (the Docker runtime's volume, a kind nothing resolves). From
+    FAST_DATA/PREPARED.json where it holds the file unchanged, else hashed once a run. A record
+    carries them so that a comparison can tell runs of the same input from others (compare.input_check();
+    review r1 R1-W1 and fix check r2 of pkg/stage-data, 7 Nov 2026)."""
+    from suitekit import inputs
+    if "prepared" not in _DIGESTS:
+        try:
+            _DIGESTS["prepared"] = json.loads((FAST_DATA / PREPARED).read_text(encoding="utf-8")).get("files", {})
+        except (OSError, ValueError):
+            _DIGESTS["prepared"] = {}
+    out: dict[str, str | None] = {}
+    keys = inputs.declared(case)
+    for key in sorted(k for k in keys if inputs.kind(k) != "concat"):
+        out[key] = loaded_digest(key)
+    # A concatenation loads its parts in its order: the same parts in another order are other bytes
+    # (sol-loop r3 V2). Its fingerprint: its parts in order, each by its input's hash (a generated part
+    # by its spec), keyed by the concatenation itself (sol-loop r4 W1).
+    for spec in sorted(k for k in keys if inputs.kind(k) == "concat"):
+        parts = []
+        for part in spec[len("concat:"):].split("+"):
+            own = inputs.spec_keys(part)
+            parts.append((part, out.get(own[0]) if own else part))
+        out[spec] = (None if any(v is None for _, v in parts)
+                     else hashlib.sha256("\n".join(f"{p}={v}" for p, v in parts).encode()).hexdigest())
+    return out
+
+
+def loaded_digest(key: str) -> str | None:
+    """The SHA-256 of the file behind one inputs.declared() key, as this run reads it, or None."""
+    from suitekit import inputs
+    if key.startswith("reference:"):
+        container = key[len("reference:"):]
+    elif inputs.kind(key) == "ore":
+        container = data_file(key)
+    elif inputs.kind(key) == "unknown":
+        return None  # a kind nothing here resolves: its bytes unknown
+    else:
+        container = data_file(f"volume:{key}")
+    try:
+        # The Docker runtime reads them from a volume this process can't hash: unknown, said so.
+        path = Path(native(container)) if RUNTIME == "native" else None
+        stat = path.stat() if path else None
+    except (OSError, RuntimeError):
+        stat = None
+    if stat is None:
+        return None
+    cache = (path.as_posix(), stat.st_size, stat.st_mtime_ns)
+    if cache not in _DIGESTS:
+        was = _DIGESTS["prepared"].get(path.as_posix(), {})
+        same = (was.get("bytes"), was.get("mtime_ns")) == (stat.st_size, stat.st_mtime_ns)
+        try:
+            _DIGESTS[cache] = was["sha256"] if same and was.get("sha256") else file_digest(path)
+        except OSError:
+            return None  # there but unreadable: unknown, and the run goes on (sol-loop r5 X2)
+    return _DIGESTS[cache]
+
+
 # One copy of a host's prepared data for every gate (NRESE_FAST_SHARED; release-gate.sh sets it):
 # each file under FAST_DATA lives once, read-only, as SHARED/blobs/<sha256>, hardlinked into each
 # gate's FAST_DATA, and SHARED/index/<generator>.json says which files a data file and its
@@ -1697,6 +1761,7 @@ def run(args) -> int:
             record["series_units"] = SERIES_UNITS
             # The case's own time, without the wait for the quiet slot.
             record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
+            record["inputs"] = case_inputs(case)  # the frozen bytes it loaded (compare.input_check)
             report["records"].append(record)
             mark = "" if record["status"] == record.get("expected_outcome", "ok") else "  <<<"
             metric = record.get("metric")
@@ -1913,6 +1978,7 @@ def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict],
             record["verdict"] = verdict(case, record)
             record["series_units"] = SERIES_UNITS
             record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
+            record["inputs"] = case_inputs(case)  # the frozen bytes it loaded (compare.input_check)
             record.update(started_ns=start_ns, finished_ns=time.time_ns(), block=args.block, layout=args.layout,
                           side=name, run=run)
             reports[(name, run)]["records"].append(record)

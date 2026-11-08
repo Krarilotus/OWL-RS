@@ -168,6 +168,8 @@ pub struct UpdateContext<'a> {
     pub(crate) union_default_graph: bool,
     /// [`crate::StoreConfig::geosparql_stated_only`].
     pub(crate) geosparql_stated_only: bool,
+    /// [`crate::StoreService::search_scope`], as the write started.
+    pub(crate) search_scope: nrese_sparql::SearchScope,
     pub(crate) services: Option<nrese_sparql::Services>,
     /// The repository's namespaces: what a prefix an update uses without declaring it
     /// means (as for queries, [`crate::PreparedQuery::parse_with`]).
@@ -223,6 +225,7 @@ impl UpdateContext<'_> {
             access: requester.read.access().cloned(),
             writable: requester.write.access().cloned(),
             geosparql_stated_only: self.geosparql_stated_only,
+            search_scope: self.search_scope,
             read_model,
             read: read.map(|read| Arc::new(read) as Arc<dyn nrese_sparql::ReadSource>),
         }
