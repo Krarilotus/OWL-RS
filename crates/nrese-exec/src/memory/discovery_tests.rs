@@ -14,10 +14,18 @@ const G: u64 = 1 << 30;
 /// 32 GiB in total, 20 GiB available.
 const MEMINFO: &str = "MemTotal:       33554432 kB\nMemAvailable:   20971520 kB\n";
 
-/// The process, as `/proc/self/stat` names it (its pid first, in its own pid namespace), and
-/// as a group's `cgroup.procs` lists it.
-const STAT: &str = "4242 (nrese-server) S 1 4242 4242 0 -1 4194560\n";
-const PROCS: &str = "4242\n";
+/// This process as a group's `cgroup.procs` lists it: its id in the pid namespace it runs in,
+/// the one `cgroup.procs` translates to for its reader (cgroup.c, cgroup_procs_show).
+fn procs() -> &'static str {
+    static PROCS: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format!("{}\n", std::process::id()));
+    PROCS.as_str()
+}
+
+/// `/proc/self/stat` where /proc is this pid namespace's: its first field is the same id.
+fn stat() -> String {
+    format!("{} (nrese-server) S 1\n", std::process::id())
+}
 
 /// The namespace's root mount, its own parent as proc_pid_mountinfo(5) shows it.
 macro_rules! root {
@@ -51,7 +59,7 @@ fn system(
 ) -> impl Fn(&str) -> std::io::Result<String> {
     let mut map: HashMap<String, String> = HashMap::from([
         ("/proc/meminfo".to_owned(), MEMINFO.to_owned()),
-        ("/proc/self/stat".to_owned(), STAT.to_owned()),
+        ("/proc/self/stat".to_owned(), stat()),
     ]);
     for (path, text) in files {
         if text.is_empty() {
@@ -168,7 +176,7 @@ fn a_value_is_read_only_where_the_path_reaches_the_group() {
             ("/cg-safe/memory.max", one),
             ("/cg-safe/memory.current", half),
             ("/cg-safe/worker/cgroup.controllers", "memory"),
-            ("/cg-safe/worker/cgroup.procs", PROCS),
+            ("/cg-safe/worker/cgroup.procs", procs()),
             ("/cg-safe/worker/memory.max", four),
             ("/cg-safe/worker/memory.current", half),
         ]
@@ -181,7 +189,7 @@ fn a_value_is_read_only_where_the_path_reaches_the_group() {
         ("/sys/fs/cgroup/limited/memory.max", two.as_str()),
         ("/sys/fs/cgroup/limited/memory.current", half),
         ("/sys/fs/cgroup/limited/worker/cgroup.controllers", "memory"),
-        ("/sys/fs/cgroup/limited/worker/cgroup.procs", PROCS),
+        ("/sys/fs/cgroup/limited/worker/cgroup.procs", procs()),
         ("/sys/fs/cgroup/limited/worker/memory.max", four),
         ("/sys/fs/cgroup/limited/worker/memory.current", half),
     ];
@@ -207,7 +215,7 @@ fn a_value_is_read_only_where_the_path_reaches_the_group() {
         ),
         ("/cg-safe/memory.limit_in_bytes", one),
         ("/cg-safe/memory.usage_in_bytes", half),
-        ("/cg-safe/worker/cgroup.procs", PROCS),
+        ("/cg-safe/worker/cgroup.procs", procs()),
         ("/cg-safe/worker/memory.limit_in_bytes", four),
         ("/cg-safe/worker/memory.usage_in_bytes", half),
         (
@@ -259,6 +267,124 @@ fn a_value_is_read_only_where_the_path_reaches_the_group() {
     ]);
 }
 
+/// A file is read for a group only where its own path resolves to the group's file (sol-loop
+/// r6 S1: mount(2) binds single files too): a launcher binds `/loose/memory.max` (8 GiB) over
+/// a group's `memory.max`, or loose/worker's `memory.stat` over the process's. Over the own
+/// group's or a reachable ancestor's file it claims that group's value and isn't it: unknown.
+/// And the process is named as `cgroup.procs` names it, in the pid namespace it runs in, not
+/// as a /proc mounted from another namespace shows it (sol-loop r6 S2: `unshare --pid --fork`
+/// keeping the old /proc).
+#[test]
+fn a_file_is_read_only_where_its_own_path_reaches_the_group() {
+    let (one, four, eight, half) = (
+        G.to_string(),
+        (4 * G).to_string(),
+        (8 * G).to_string(),
+        (G / 2).to_string(),
+    );
+    let (one, four, eight, half) = (one.as_str(), four.as_str(), eight.as_str(), half.as_str());
+    // The process in /limited; loose's memory.max bound over limited's.
+    const OWN_BOUND: &str = concat!(
+        root!(),
+        "30 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+        "70 30 0:26 /loose/memory.max /sys/fs/cgroup/limited/memory.max rw - cgroup2 cgroup2 rw\n"
+    );
+    let own_bound = vec![
+        ("/proc/self/mountinfo", OWN_BOUND),
+        ("/proc/self/cgroup", "0::/limited"),
+        ("/sys/fs/cgroup/limited/cgroup.controllers", "memory"),
+        ("/sys/fs/cgroup/limited/cgroup.procs", procs()),
+        ("/sys/fs/cgroup/limited/memory.max", eight),
+        ("/sys/fs/cgroup/limited/memory.current", half),
+    ];
+    // The process in /limited/worker (4 GiB); loose's memory.max bound over limited's (1 GiB).
+    const PARENT_BOUND: &str = concat!(
+        root!(),
+        "30 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
+        "70 30 0:26 /loose/memory.max /sys/fs/cgroup/limited/memory.max rw - cgroup2 cgroup2 rw\n"
+    );
+    let parent_bound = vec![
+        ("/proc/self/mountinfo", PARENT_BOUND),
+        ("/proc/self/cgroup", "0::/limited/worker"),
+        ("/sys/fs/cgroup/limited/memory.max", eight),
+        ("/sys/fs/cgroup/limited/memory.current", half),
+        ("/sys/fs/cgroup/limited/worker/cgroup.controllers", "memory"),
+        ("/sys/fs/cgroup/limited/worker/cgroup.procs", procs()),
+        ("/sys/fs/cgroup/limited/worker/memory.max", four),
+        ("/sys/fs/cgroup/limited/worker/memory.current", half),
+    ];
+    // v1: the process in /limited/worker, whose memory.stat (hierarchical 1 GiB) loose/worker's
+    // (8 GiB) is bound over.
+    const STAT_BOUND: &str = concat!(
+        root!(),
+        "25 23 0:22 / /sys/fs/cgroup ro - tmpfs tmpfs ro\n",
+        "35 25 0:31 / /sys/fs/cgroup/memory rw - cgroup cgroup rw,memory\n",
+        "70 35 0:31 /loose/worker/memory.stat /sys/fs/cgroup/memory/limited/worker/memory.stat rw - \
+         cgroup cgroup rw,memory\n"
+    );
+    const NONE: &str = "9223372036854771712";
+    let stat_bound = vec![
+        ("/proc/self/mountinfo", STAT_BOUND),
+        ("/proc/self/cgroup", "3:memory:/limited/worker"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", NONE),
+        ("/sys/fs/cgroup/memory/limited/memory.limit_in_bytes", NONE),
+        ("/sys/fs/cgroup/memory/limited/worker/cgroup.procs", procs()),
+        (
+            "/sys/fs/cgroup/memory/limited/worker/memory.limit_in_bytes",
+            four,
+        ),
+        (
+            "/sys/fs/cgroup/memory/limited/worker/memory.usage_in_bytes",
+            half,
+        ),
+        (
+            "/sys/fs/cgroup/memory/limited/worker/memory.stat",
+            "hierarchical_memory_limit 8589934592\ntotal_inactive_file 0\n",
+        ),
+    ];
+    // A /proc from the parent pid namespace: its stat names the process otherwise.
+    let foreign_proc = format!("{} (nrese-server) S 1\n", std::process::id() + 100_000);
+    let pid_namespace = vec![
+        ("/proc/self/mountinfo", V2_MOUNT),
+        ("/proc/self/cgroup", "0::/app.slice"),
+        ("/proc/self/stat", foreign_proc.as_str()),
+        ("/sys/fs/cgroup/app.slice/cgroup.controllers", "memory"),
+        ("/sys/fs/cgroup/app.slice/cgroup.procs", procs()),
+        ("/sys/fs/cgroup/app.slice/memory.max", four),
+        ("/sys/fs/cgroup/app.slice/memory.current", one),
+    ];
+    check(vec![
+        (
+            "own group's limit file bound from another group",
+            own_bound,
+            "",
+            None,
+            None,
+        ),
+        (
+            "an ancestor's limit file bound from another group",
+            parent_bound,
+            "",
+            None,
+            None,
+        ),
+        (
+            "v1 own group's statistics bound from another group",
+            stat_bound,
+            "",
+            None,
+            None,
+        ),
+        (
+            "/proc from another pid namespace",
+            pid_namespace,
+            "",
+            Some(4 * G),
+            Some(3 * G),
+        ),
+    ]);
+}
+
 /// A mount another one covers isn't a view (sol-loop r3 S1; proc_pid_mountinfo(5) lists covered
 /// mounts too): a launcher bind-mounts the process's group `worker` (4 GiB, 1 GiB used) over the
 /// full v2 tree at /sys/fs/cgroup, or covers /sys/fs with a tmpfs and leaves the group bind-mounted
@@ -297,13 +423,13 @@ fn a_covered_mount_isnt_a_view() {
         match at {
             "/sys/fs/cgroup" => [
                 ("/sys/fs/cgroup/cgroup.controllers", "memory"),
-                ("/sys/fs/cgroup/cgroup.procs", PROCS),
+                ("/sys/fs/cgroup/cgroup.procs", procs()),
                 ("/sys/fs/cgroup/memory.max", four),
                 ("/sys/fs/cgroup/memory.current", used),
             ],
             _ => [
                 ("/cg-local/cgroup.controllers", "memory"),
-                ("/cg-local/cgroup.procs", PROCS),
+                ("/cg-local/cgroup.procs", procs()),
                 ("/cg-local/memory.max", four),
                 ("/cg-local/memory.current", used),
             ],
@@ -345,7 +471,7 @@ fn a_covered_mount_isnt_a_view() {
                 ("/proc/self/mountinfo", ROOTED),
                 ("/proc/self/cgroup", "0::/limited/worker"),
                 ("/sys/fs/cgroup/limited/worker/cgroup.controllers", "memory"),
-                ("/sys/fs/cgroup/limited/worker/cgroup.procs", PROCS),
+                ("/sys/fs/cgroup/limited/worker/cgroup.procs", procs()),
                 ("/sys/fs/cgroup/limited/worker/memory.max", four),
                 ("/sys/fs/cgroup/limited/worker/memory.current", used),
             ],
@@ -383,14 +509,14 @@ fn a_deeper_mount_doesnt_hide_a_visible_ancestor() {
             ("/sys/fs/cgroup/limited/memory.max", one.as_str()),
             ("/sys/fs/cgroup/limited/memory.current", half.as_str()),
             ("/sys/fs/cgroup/limited/worker/cgroup.controllers", "memory"),
-            ("/sys/fs/cgroup/limited/worker/cgroup.procs", PROCS),
+            ("/sys/fs/cgroup/limited/worker/cgroup.procs", procs()),
             ("/sys/fs/cgroup/limited/worker/memory.max", four.as_str()),
             (
                 "/sys/fs/cgroup/limited/worker/memory.current",
                 half.as_str(),
             ),
             ("/cg-local/cgroup.controllers", "memory"),
-            ("/cg-local/cgroup.procs", PROCS),
+            ("/cg-local/cgroup.procs", procs()),
             ("/cg-local/memory.max", four.as_str()),
             ("/cg-local/memory.current", half.as_str()),
         ]
@@ -437,7 +563,7 @@ fn a_limit_that_may_apply_but_wasnt_read_is_unknown_never_none() {
             "/sys/fs/cgroup/app.slice/cgroup.controllers",
             "cpu io memory pids",
         ),
-        ("/sys/fs/cgroup/app.slice/cgroup.procs", PROCS),
+        ("/sys/fs/cgroup/app.slice/cgroup.procs", procs()),
         ("/sys/fs/cgroup/app.slice/memory.max", four),
         ("/sys/fs/cgroup/app.slice/memory.current", used),
     ];
@@ -513,7 +639,7 @@ fn a_limit_that_may_apply_but_wasnt_read_is_unknown_never_none() {
                     "/proc/self/cgroup",
                     "4:cpu,cpuacct:/docker/abc\n3:memory:/docker/abc",
                 ),
-                ("/sys/fs/cgroup/memory/docker/abc/cgroup.procs", PROCS),
+                ("/sys/fs/cgroup/memory/docker/abc/cgroup.procs", procs()),
             ],
             "",
             None,
@@ -537,7 +663,7 @@ fn a_limit_that_may_apply_but_wasnt_read_is_unknown_never_none() {
                 ("/proc/self/mountinfo", custom),
                 ("/proc/self/cgroup", "0::/app.slice"),
                 ("/custom/cg/app.slice/cgroup.controllers", "memory"),
-                ("/custom/cg/app.slice/cgroup.procs", PROCS),
+                ("/custom/cg/app.slice/cgroup.procs", procs()),
                 ("/custom/cg/app.slice/memory.max", four),
                 ("/custom/cg/app.slice/memory.current", used),
             ],
@@ -552,7 +678,7 @@ fn a_limit_that_may_apply_but_wasnt_read_is_unknown_never_none() {
                 ("/proc/self/mountinfo", escaped),
                 ("/proc/self/cgroup", "0::/app.slice"),
                 ("/custom cg/app.slice/cgroup.controllers", "memory"),
-                ("/custom cg/app.slice/cgroup.procs", PROCS),
+                ("/custom cg/app.slice/cgroup.procs", procs()),
                 ("/custom cg/app.slice/memory.max", four),
                 ("/custom cg/app.slice/memory.current", used),
             ],
@@ -567,7 +693,7 @@ fn a_limit_that_may_apply_but_wasnt_read_is_unknown_never_none() {
             vec![
                 ("/proc/self/mountinfo", unnamespaced),
                 ("/proc/self/cgroup", "3:memory:/docker/abc"),
-                ("/sys/fs/cgroup/memory/cgroup.procs", PROCS),
+                ("/sys/fs/cgroup/memory/cgroup.procs", procs()),
                 ("/sys/fs/cgroup/memory/memory.limit_in_bytes", four),
                 ("/sys/fs/cgroup/memory/memory.usage_in_bytes", used),
             ],
@@ -583,7 +709,7 @@ fn a_limit_that_may_apply_but_wasnt_read_is_unknown_never_none() {
             vec![
                 ("/proc/self/mountinfo", unnamespaced),
                 ("/proc/self/cgroup", "3:memory:/docker/abc"),
-                ("/sys/fs/cgroup/memory/cgroup.procs", PROCS),
+                ("/sys/fs/cgroup/memory/cgroup.procs", procs()),
                 ("/sys/fs/cgroup/memory/memory.limit_in_bytes", four),
                 ("/sys/fs/cgroup/memory/memory.usage_in_bytes", used),
                 (
@@ -600,7 +726,7 @@ fn a_limit_that_may_apply_but_wasnt_read_is_unknown_never_none() {
             vec![
                 ("/proc/self/mountinfo", unnamespaced),
                 ("/proc/self/cgroup", "3:memory:/docker/abc"),
-                ("/sys/fs/cgroup/memory/cgroup.procs", PROCS),
+                ("/sys/fs/cgroup/memory/cgroup.procs", procs()),
                 ("/sys/fs/cgroup/memory/memory.limit_in_bytes", four),
                 ("/sys/fs/cgroup/memory/memory.usage_in_bytes", used),
             ],
@@ -615,7 +741,7 @@ fn a_limit_that_may_apply_but_wasnt_read_is_unknown_never_none() {
             vec![
                 ("/proc/self/mountinfo", neighbour),
                 ("/proc/self/cgroup", "3:memory:/docker/abc"),
-                ("/sys/fs/cgroup/memory/cgroup.procs", PROCS),
+                ("/sys/fs/cgroup/memory/cgroup.procs", procs()),
                 ("/sys/fs/cgroup/memory/memory.limit_in_bytes", four),
                 ("/sys/fs/cgroup/memory/memory.usage_in_bytes", used),
             ],
@@ -634,7 +760,7 @@ fn a_limit_that_may_apply_but_wasnt_read_is_unknown_never_none() {
                     "/sys/fs/cgroup/app.slice/run.scope/cgroup.controllers",
                     "cpu io",
                 ),
-                ("/sys/fs/cgroup/app.slice/run.scope/cgroup.procs", PROCS),
+                ("/sys/fs/cgroup/app.slice/run.scope/cgroup.procs", procs()),
                 ("/sys/fs/cgroup/app.slice/cgroup.controllers", "memory"),
                 ("/sys/fs/cgroup/app.slice/memory.max", eight),
                 ("/sys/fs/cgroup/app.slice/memory.current", used),
