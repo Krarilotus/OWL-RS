@@ -133,7 +133,7 @@ def container_start_ms(root: Path) -> float | None:
     times = []
     for _ in range(3):
         started = time.monotonic()
-        if ns.docker(["run", "--rm", image, "true"], timeout=60).returncode != 0:
+        if ns.docker([*ns.run_args(root, "suite"), "--rm", image, "true"], timeout=60).returncode != 0:
             return None
         times.append((time.monotonic() - started) * 1000)
     return round(statistics.median(times), 1)
