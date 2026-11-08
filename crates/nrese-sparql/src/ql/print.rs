@@ -84,7 +84,7 @@ pub fn print<V: ReadView>(
 ) -> Result<Printed, QueryEvaluationError> {
     let snapshot = view.evaluation_snapshot();
     let snapshot: &Snapshot = &snapshot;
-    let statements = schema_statements(snapshot);
+    let statements = schema_statements(snapshot, &|_| true);
     let ontology = nrese_owl::read(&statements, &SnapshotTerms(snapshot));
     let thing = iri(snapshot, OWL, "Thing").map(TermId::raw);
     let tbox = Tbox::compile(&ontology, Closure { lists: true }, thing);

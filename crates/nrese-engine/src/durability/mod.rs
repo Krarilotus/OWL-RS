@@ -221,6 +221,8 @@ impl Durable {
                 };
                 Version {
                     content: crate::engine::Content::fresh(),
+                    // A recovery: replay below changes this version's asserted stack in place.
+                    asserted_content: crate::engine::AssertedIdentity::fresh(),
                     asserted,
                     inferred,
                     revision: loaded.revision,
