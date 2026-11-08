@@ -316,9 +316,12 @@ fn canonical_version(
         asserted,
         inferred: version.inferred.clone(),
         revision: version.revision,
+        committed_micros: version.committed_micros,
         dictionary_len: version.dictionary_len,
         equality: Arc::new(EqualityCell::holding(same_as, Arc::clone(classes))),
         content: version.content,
+        // Its asserted stack renamed to representatives: not the stored ids.
+        asserted_content: super::AssertedIdentity::fresh(),
         canonical: Default::default(),
     });
     Ok(Some(View(Some(Arc::new(ViewData {

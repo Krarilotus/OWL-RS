@@ -5,6 +5,12 @@
 #   ns_namespace ROOT            FLEET_JOB when set, else c + a digest of the checkout's path
 #   ns_name KIND ROOT            nrese-<kind>-<namespace>-<checkout digest>
 #   ns_run_args NAME ROOT OWNER  sets NS_ARGS: --name NAME and the labels, for `docker run`
+#   ns_maker_args NAME ROOT OWNER [LIMIT...]   sets NS_ARGS for a dataset maker's `docker run`:
+#                                --name NAME (- for none), the labels; in a fleet job, its
+#                                `fleet.job` label; and the limits its job
+#                                declares (NRESE_MAKER_MEMORY_GB, NRESE_MAKER_CPUS: release_gate.py
+#                                data_job()), else LIMIT. A declared job's runner stops the step at
+#                                a container without both (fleet F61)
 #   ns_volume create NAME ROOT OWNER | rm NAME | inspect NAME   a `docker volume` command
 #   ns_shared KIND               a host-wide resource jobs share on purpose: data, cargo
 #   ns_network create NAME ROOT OWNER | rm NAME   a labelled `docker network` (swept like volumes)
@@ -48,6 +54,21 @@ ns_labels() {
 }
 
 ns_run_args() { ns_labels "$2" "$3"; NS_ARGS=(--name "$1" "${NS_LABELS[@]}"); }
+
+ns_maker_args() {
+  local name=$1
+  ns_labels "$2" "$3"
+  shift 3
+  NS_ARGS=("${NS_LABELS[@]}")
+  [ "$name" = - ] || NS_ARGS=(--name "$name" "${NS_ARGS[@]}")
+  [ -z "${FLEET_JOB:-}" ] || NS_ARGS+=(--label "fleet.job=$FLEET_JOB")
+  if [ -n "${NRESE_MAKER_MEMORY_GB:-}" ]; then
+    NS_ARGS+=(--memory "${NRESE_MAKER_MEMORY_GB}g" --memory-swap "${NRESE_MAKER_MEMORY_GB}g"
+              --cpus "${NRESE_MAKER_CPUS:?NRESE_MAKER_CPUS goes with NRESE_MAKER_MEMORY_GB}")
+  else
+    NS_ARGS+=("$@")
+  fi
+}
 
 ns_volume() {
   case $1 in

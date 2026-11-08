@@ -45,6 +45,8 @@ use super::hash::key_hash;
 use super::offsets::{Ends, Offsets};
 use super::order::Key;
 use super::pending::{Adopted, NEW, Pending};
+use super::pieces::{BLOCK, Block, Heap, Inner, Segment, View};
+use super::suffix::{PrepareError, Prepared, Suffix};
 use super::vocabulary::{Codec, Sample};
 use super::{TermId, TermKind, inline_to_literal, try_inline_literal};
 use crate::error::{EngineError, EngineResult};
@@ -70,7 +72,7 @@ const TAG_TRIPLE: u8 = b'R';
 /// are interned first, so their ids are lower: the log and checkpoints replay keys in id
 /// order and find them.
 const TAG_TRIPLE_IDS: u8 = b'Q';
-const TRIPLE_KEY_LEN: usize = 25;
+pub(super) const TRIPLE_KEY_LEN: usize = 25;
 const SEP: u8 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -134,7 +136,7 @@ impl Base {
     /// The most bytes entry `index`'s key holds while [`Self::plain`] decompresses it and
     /// its text is copied out of it: the buffer it starts in and the one it moves to (a
     /// code is at most a symbol of 8 bytes), then that one and the text.
-    fn decode_bound(&self, index: u64) -> usize {
+    pub(super) fn decode_bound(&self, index: u64) -> usize {
         let stored = self.key(index).len();
         match &self.codec {
             None => stored,
@@ -146,7 +148,7 @@ impl Base {
     }
 
     /// The index of the plain `key`, whose hash is `hash`, if it is an entry.
-    fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
+    pub(super) fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
         match &self.codec {
             None => self.find_stored(hash, key),
             Some(codec) => {
@@ -225,215 +227,6 @@ pub(crate) fn base_slots(len: u64) -> u64 {
     (len + len / 3 + 1).next_power_of_two()
 }
 
-/// Entries kept on the heap, one after another, from id `start` on.
-#[derive(Default)]
-struct Heap {
-    start: u64,
-    /// The keys, one after another.
-    bytes: Vec<u8>,
-    /// Their end offsets in `bytes`.
-    ends: Vec<u64>,
-    /// Their [`key_hash`]es: the table grows by moving numbers, without reading and
-    /// hashing every key again under the write lock (a bulk load stalled on it).
-    hashes: Vec<u64>,
-    /// Their ids, by [`key_hash`].
-    table: HashTable<u64>,
-}
-
-impl Heap {
-    fn at(start: u64) -> Self {
-        Self {
-            start,
-            ..Self::default()
-        }
-    }
-
-    fn len(&self) -> u64 {
-        self.ends.len() as u64
-    }
-
-    fn key(&self, id: u64) -> &[u8] {
-        heap_key(&self.bytes, &self.ends, (id - self.start) as usize)
-    }
-
-    fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
-        self.table.find(hash, |&id| self.key(id) == key).copied()
-    }
-
-    /// Appends `key` (not an entry yet), whose hash is `hash`, and returns its id.
-    fn push(&mut self, key: &[u8], hash: u64) -> u64 {
-        let id = self.start + self.len();
-        self.bytes.extend_from_slice(key);
-        self.ends.push(self.bytes.len() as u64);
-        self.hashes.push(hash);
-        let Heap {
-            table,
-            hashes,
-            start,
-            ..
-        } = self;
-        table.insert_unique(hash, id, |&i| hashes[(i - *start) as usize]);
-        id
-    }
-}
-
-/// Entries between the base and the live heap: a heap frozen when a bulk load's terms
-/// came after it, or a bulk load's terms in the arenas they were interned into
-/// ([`super::pending`]).
-enum Segment {
-    Heap(Heap),
-    Adopted(Adopted),
-}
-
-impl Segment {
-    fn start(&self) -> u64 {
-        match self {
-            Self::Heap(heap) => heap.start,
-            Self::Adopted(adopted) => adopted.start,
-        }
-    }
-
-    fn key(&self, id: u64) -> &[u8] {
-        match self {
-            Self::Heap(heap) => heap.key(id),
-            Self::Adopted(adopted) => adopted.key(id - adopted.start),
-        }
-    }
-
-    fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
-        match self {
-            Self::Heap(heap) => heap.find(hash, key),
-            Self::Adopted(adopted) => adopted.find(hash, key),
-        }
-    }
-}
-
-#[derive(Default)]
-struct Inner {
-    /// Entries `0..base.len` from a mapped checkpoint.
-    base: Option<Base>,
-    /// Entries after the base, before the heap, by id.
-    segments: Vec<Segment>,
-    /// The entries interned one by one since, at the end.
-    heap: Heap,
-}
-
-impl Inner {
-    fn with_base(base: Base) -> Self {
-        Self {
-            heap: Heap::at(base.len),
-            base: Some(base),
-            segments: Vec::new(),
-        }
-    }
-
-    fn base_len(&self) -> u64 {
-        self.base.as_ref().map_or(0, |base| base.len)
-    }
-
-    fn len(&self) -> u64 {
-        self.heap.start + self.heap.len()
-    }
-
-    /// Entry `index`'s plain key: in place, or decoded from a compressed base.
-    fn key(&self, index: u64) -> Key<'_> {
-        if index < self.base_len() {
-            return self
-                .base
-                .as_ref()
-                .expect("an index below the base")
-                .plain(index);
-        }
-        Key::Borrowed(self.added_key(index))
-    }
-
-    /// Entry `index`'s key, above the base: on the heap or in a segment, in place.
-    fn added_key(&self, index: u64) -> &[u8] {
-        if index >= self.heap.start {
-            return self.heap.key(index);
-        }
-        let at = self.segments.partition_point(|s| s.start() <= index) - 1;
-        self.segments[at].key(index)
-    }
-
-    /// [`Self::key`], a key of a compressed base decoded into `decoded`, its room charged
-    /// first; every other key is read in place.
-    fn key_within<'k, B: std::ops::Deref<Target = Budget>>(
-        &'k self,
-        index: u64,
-        decoded: &'k mut ChargedVec<u8, B>,
-    ) -> Result<&'k [u8], BudgetExceeded> {
-        let Some(base) = self.base.as_ref().filter(|base| index < base.len) else {
-            return Ok(self.added_key(index));
-        };
-        match &base.codec {
-            None => Ok(base.key(index)),
-            Some(codec) => {
-                decoded.clear();
-                codec.decompress_within(base.key(index), decoded)?;
-                Ok(decoded)
-            }
-        }
-    }
-
-    /// The most bytes decoding entry `index` allocates: its text's, and for a key stored
-    /// compressed the buffer it is decompressed into ([`Base::decode_bound`]).
-    fn decode_bound(&self, index: u64) -> usize {
-        match &self.base {
-            Some(base) if index < base.len => base.decode_bound(index),
-            _ => self.key(index).len(),
-        }
-    }
-
-    /// The index of `key`, whose hash is `hash`, if it is an entry.
-    fn find(&self, hash: u64, key: &[u8]) -> Option<u64> {
-        if let Some(index) = self.base.as_ref().and_then(|base| base.find(hash, key)) {
-            return Some(index);
-        }
-        self.segments
-            .iter()
-            .find_map(|segment| segment.find(hash, key))
-            .or_else(|| self.heap.find(hash, key))
-    }
-
-    /// Appends `key` (not an entry yet), whose hash is `hash`, and returns its index.
-    fn push(&mut self, key: &[u8], hash: u64) -> u64 {
-        self.heap.push(key, hash)
-    }
-
-    /// Takes a bulk load's numbered terms, ids `adopted.start..` (the next ones): the heap
-    /// so far is frozen before them, a new one begins after.
-    fn adopt(&mut self, adopted: Adopted) {
-        assert_eq!(adopted.start, self.len(), "adopted terms take the next ids");
-        let after = adopted.start + adopted.len();
-        let heap = std::mem::replace(&mut self.heap, Heap::at(after));
-        if heap.len() > 0 {
-            self.segments.push(Segment::Heap(heap));
-        }
-        self.segments.push(Segment::Adopted(adopted));
-    }
-
-    /// The heaps' and segments' key bytes and index bytes.
-    fn heap_bytes(&self) -> (u64, u64) {
-        let heap = |h: &Heap| {
-            (
-                h.bytes.len() as u64,
-                (h.ends.capacity() * 16 + h.table.capacity() * 9) as u64,
-            )
-        };
-        let mut total = heap(&self.heap);
-        for segment in &self.segments {
-            let (keys, index) = match segment {
-                Segment::Heap(h) => heap(h),
-                Segment::Adopted(a) => a.bytes(),
-            };
-            total.0 += keys;
-            total.1 += index;
-        }
-        total
-    }
-}
-
 /// Keys decoded while views of them are lent out ([`Dictionary::with_views`]): each stays
 /// where it is until the arena is dropped, after the views.
 ///
@@ -502,19 +295,47 @@ fn decoded_slice(
 /// A slice of the dictionary for a string scan: entries `.1` of one arena.
 enum Part<'i> {
     Base(&'i Base, (usize, usize)),
-    Heap(&'i Heap, (usize, usize)),
+    /// A heap's sealed block, its first id `.1`.
+    Keys(&'i Block, u64, (usize, usize)),
+    /// A heap's tail keys `.2`, each its own `Arc`, the first's id `.1`: searched in place.
+    Tail(&'i [std::sync::Arc<[u8]>], u64, (usize, usize)),
     /// Shard `.1` of a bulk load's terms.
     Shard(&'i Adopted, usize, (usize, usize)),
 }
 
-/// Heap entry `local` (counted from the end of the base).
-fn heap_key<'a>(bytes: &'a [u8], ends: &[u64], local: usize) -> &'a [u8] {
-    let start = if local == 0 {
-        0
-    } else {
-        ends[local - 1] as usize
-    };
-    &bytes[start..ends[local] as usize]
+#[cfg(test)]
+thread_local! {
+    /// Test hook: runs once, in the next prefix search on this thread, between its view of the
+    /// keys and its order's installation.
+    static BETWEEN_VIEW_AND_INSTALL: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn between_view_and_install() {
+    if let Some(hook) = BETWEEN_VIEW_AND_INSTALL.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+/// Test support: a view of the keys held across other work (a rebase).
+#[cfg(test)]
+pub(crate) struct HeldView(View);
+
+#[cfg(test)]
+impl HeldView {
+    pub(crate) fn key(&self, index: u64) -> Vec<u8> {
+        self.0.pieces().key(index).into_owned()
+    }
+
+    /// Whether the view alone holds its heap's sealed blocks: the dictionary let go of them.
+    pub(crate) fn sole_owner_of_its_heap(&self) -> bool {
+        let blocks = &self.0.pieces().heap.blocks;
+        !blocks.is_empty()
+            && blocks
+                .iter()
+                .all(|block| std::sync::Arc::strong_count(block) == 1)
+    }
 }
 
 #[derive(Default)]
@@ -743,6 +564,48 @@ impl Dictionary {
         }
     }
 
+    /// The keys as they are now, held with no lock ([`View`]): for parallel work over them.
+    fn view(&self) -> View {
+        self.inner.read().view()
+    }
+
+    /// [`Self::view`], what it allocates charged to `budget` first, under the same guard. The
+    /// reservation comes first: bound in that order, it is released after the view is freed.
+    fn view_within<'b>(
+        &self,
+        budget: &'b Budget,
+    ) -> Result<(Reservation<&'b Budget>, View), BudgetExceeded> {
+        let inner = self.inner.read();
+        let mut held = Reservation::new(budget);
+        held.charge(inner.view_bytes())?;
+        Ok((held, inner.view()))
+    }
+
+    /// Test support: [`Self::view`], held ([`HeldView`]).
+    #[cfg(test)]
+    pub(crate) fn held_view(&self) -> HeldView {
+        HeldView(self.view())
+    }
+
+    /// Test support: the entries a prepared install has room promised for.
+    #[cfg(test)]
+    pub(crate) fn promised(&self) -> usize {
+        self.inner.read().promised()
+    }
+
+    /// Test support: whether a rebase on this thread finds no room for a prepared install's
+    /// promise, as an allocator out of it would.
+    #[cfg(test)]
+    pub(crate) fn refuse_promised_room(refuse: bool) {
+        super::pieces::REFUSE_PROMISED_ROOM.with(|cell| cell.set(refuse));
+    }
+
+    /// Test support: the keys in the heap's tail, unsealed.
+    #[cfg(test)]
+    pub(crate) fn tail_len(&self) -> usize {
+        self.inner.read().heap.tail.len()
+    }
+
     /// Number of dictionary entries (inline terms are not counted).
     pub fn len(&self) -> u64 {
         self.inner.read().len()
@@ -767,7 +630,7 @@ impl Dictionary {
     }
 
     /// The inline id of `term`, if it has one in this dictionary's encoding.
-    fn inline_id(&self, term: TermRef<'_>) -> Option<TermId> {
+    pub(super) fn inline_id(&self, term: TermRef<'_>) -> Option<TermId> {
         match term {
             TermRef::Literal(literal) => {
                 try_inline_literal(literal, !self.integers_in_dictionary())
@@ -794,7 +657,7 @@ impl Dictionary {
             arena_bytes: inner.heap_bytes().0 + base.map_or(0, |b| b.arena.len() as u64),
             // A slot is the stored index plus one control byte.
             index_bytes: inner.heap_bytes().1,
-            mapped_bytes: base.map_or(0, Base::bytes),
+            mapped_bytes: base.map_or(0, |base| base.bytes()),
         }
     }
 
@@ -938,42 +801,87 @@ impl Dictionary {
         }
     }
 
-    /// The string literals matching `query`, best first; the text index first takes in the
-    /// terms interned since the last search.
-    pub fn text_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
-        self.load_text(TEXT, &self.text);
-        if self.text.read().covered() < self.len() {
-            let mut text = self.text.write();
+    /// The text index of the string literals (with `iris`, of the IRIs' local names): from
+    /// its file at the first use, then taking in the terms interned since, and with the
+    /// stems of `stem` prepared. Takes and lets go of the index's write lock, so the
+    /// caller holds none of the dictionary's.
+    pub(crate) fn prepare_text(&self, iris: bool, stem: Option<&str>) {
+        use rayon::prelude::*;
+        let (which, slot) = match iris {
+            false => (TEXT, &self.text),
+            true => (IRI_TEXT, &self.iri_text),
+        };
+        self.load_text(which, slot);
+        if slot.read().covered() < self.len() {
+            let mut text = slot.write();
             let inner = self.inner.read();
             let end = inner.len();
             // In batches, each tokenised on every core (TextIndex::extend).
             let mut start = text.covered();
             while start < end {
                 let stop = (start + TEXT_BATCH).min(end);
-                let keys: Vec<(u64, Key<'_>)> = (start..stop)
-                    .map(|index| (index, inner.key(index)))
-                    .collect();
-                let documents: Vec<(u64, &str)> = keys
-                    .iter()
-                    .filter_map(|(index, key)| match view_key(key) {
-                        TermView::String(value) | TermView::LangString { value, .. } => {
-                            Some((*index, value))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                text.extend(&documents);
+                match iris {
+                    false => {
+                        let keys: Vec<(u64, Key<'_>)> = (start..stop)
+                            .map(|index| (index, inner.key(index)))
+                            .collect();
+                        let documents: Vec<(u64, &str)> =
+                            keys.iter()
+                                .filter_map(|(index, key)| match view_key(key) {
+                                    TermView::String(value)
+                                    | TermView::LangString { value, .. } => Some((*index, value)),
+                                    _ => None,
+                                })
+                                .collect();
+                        text.extend(&documents);
+                    }
+                    true => {
+                        // The local names on every core: string work per IRI (25 M in
+                        // DBpedia).
+                        let inner_ref: &Inner = &inner;
+                        let names: Vec<(u64, String)> = (start..stop)
+                            .into_par_iter()
+                            .filter_map(|index| match view_key(&inner_ref.key(index)) {
+                                TermView::Iri(iri) => {
+                                    Some((index, super::text::local_name_text(iri)?))
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        let documents: Vec<(u64, &str)> = names
+                            .iter()
+                            .map(|(index, words)| (*index, words.as_str()))
+                            .collect();
+                        text.extend(&documents);
+                    }
+                }
                 start = stop;
             }
             text.cover(end);
         }
-        if let Some(language) = query.stem.as_deref() {
+        if let Some(language) = stem {
             // The read lock goes before the write lock is taken.
-            let ready = self.text.read().stems_ready(language);
+            let ready = slot.read().stems_ready(language);
             if !ready {
-                self.text.write().prepare_stems(language);
+                slot.write().prepare_stems(language);
             }
         }
+    }
+
+    /// The string literals matching `query`, best first; the text index first takes in the
+    /// terms interned since the last search.
+    pub fn text_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
+        self.text_search_in(query, None)
+    }
+
+    /// [`Self::text_search`], ranked among `corpus`'s documents alone where one is given
+    /// (`SearchScope::Reader`), else among every indexed one.
+    pub(crate) fn text_search_in(
+        &self,
+        query: &super::TextQuery,
+        corpus: Option<&super::text::Corpus>,
+    ) -> Vec<super::TextMatch> {
+        self.prepare_text(false, query.stem.as_deref());
         // The index's lock before `inner`'s (the lock order).
         let text = self.text.read();
         let inner = self.inner.read();
@@ -982,7 +890,10 @@ impl Dictionary {
             _ => None,
         };
         // Matches are entry numbers: as ids, by the entry's kind.
-        let mut matches = text.search(query, &text_of);
+        let mut matches = match corpus {
+            None => text.search(query, &text_of),
+            Some(corpus) => text.search_over(query, &text_of, corpus),
+        };
         for found in &mut matches {
             let kind = match view_key(&inner.key(found.id)) {
                 TermView::LangString { .. } => TermKind::LangString,
@@ -996,12 +907,19 @@ impl Dictionary {
     /// The vector literals nearest to `query.vector` among the first `known` entries that
     /// `accept` takes (by id), nearest first; the index first takes in the vector literals
     /// interned since the last search, and builds or extends the graph the search uses.
-    pub fn vector_search(
+    pub fn vector_search<'b>(
         &self,
         query: &super::VectorQuery,
         known: u64,
         accept: &(dyn Fn(TermId) -> bool + Sync),
-    ) -> (Vec<nrese_vector::Hit>, super::VectorSearchReport) {
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<
+        (
+            nrese_exec::ChargedVec<nrese_vector::Hit, &'b nrese_exec::Budget>,
+            super::VectorSearchReport,
+        ),
+        nrese_exec::BudgetExceeded,
+    > {
         self.cover_vectors();
         if self.vectors.read().may_need_work(query) {
             let work = self.vectors.write().work_for(query);
@@ -1026,7 +944,7 @@ impl Dictionary {
         // What the search reads, taken under the lock; the search and `accept` run without
         // it (`accept` may intern and search again; the scans are parallel).
         let input = self.vectors.read().search_input(query);
-        super::vectors::search(input, query, &accept)
+        super::vectors::search(input, query, &accept, budget)
     }
 
     /// Builds the graph a search like `query` uses, covering every vector, before
@@ -1088,39 +1006,17 @@ impl Dictionary {
     /// The IRIs whose local name's words match `query`, best first; the index first takes
     /// in the IRIs interned since the last search.
     pub fn iri_search(&self, query: &super::TextQuery) -> Vec<super::TextMatch> {
-        use rayon::prelude::*;
-        self.load_text(IRI_TEXT, &self.iri_text);
-        if self.iri_text.read().covered() < self.len() {
-            let mut text = self.iri_text.write();
-            let inner = self.inner.read();
-            let end = inner.len();
-            let mut start = text.covered();
-            while start < end {
-                let stop = (start + TEXT_BATCH).min(end);
-                // The local names on every core: string work per IRI (25 M in DBpedia).
-                let inner_ref: &Inner = &inner;
-                let names: Vec<(u64, String)> = (start..stop)
-                    .into_par_iter()
-                    .filter_map(|index| match view_key(&inner_ref.key(index)) {
-                        TermView::Iri(iri) => Some((index, super::text::local_name_text(iri)?)),
-                        _ => None,
-                    })
-                    .collect();
-                let documents: Vec<(u64, &str)> = names
-                    .iter()
-                    .map(|(index, words)| (*index, words.as_str()))
-                    .collect();
-                text.extend(&documents);
-                start = stop;
-            }
-            text.cover(end);
-        }
-        if let Some(language) = query.stem.as_deref() {
-            let ready = self.iri_text.read().stems_ready(language);
-            if !ready {
-                self.iri_text.write().prepare_stems(language);
-            }
-        }
+        self.iri_search_in(query, None)
+    }
+
+    /// [`Self::iri_search`], ranked among `corpus`'s documents alone where one is given
+    /// (`SearchScope::Reader`), else among every indexed one.
+    pub(crate) fn iri_search_in(
+        &self,
+        query: &super::TextQuery,
+        corpus: Option<&super::text::Corpus>,
+    ) -> Vec<super::TextMatch> {
+        self.prepare_text(true, query.stem.as_deref());
         // The index's lock before `inner`'s (the lock order).
         let text = self.iri_text.read();
         let inner = self.inner.read();
@@ -1128,7 +1024,10 @@ impl Dictionary {
             TermView::Iri(iri) => super::text::local_name_text(iri),
             _ => None,
         };
-        let mut matches = text.search(query, &text_of);
+        let mut matches = match corpus {
+            None => text.search(query, &text_of),
+            Some(corpus) => text.search_over(query, &text_of, corpus),
+        };
         for found in &mut matches {
             found.id = TermId::new(TermKind::Iri, found.id).raw();
         }
@@ -1158,8 +1057,20 @@ impl Dictionary {
         {
             return self.prefix_matches(test, limit);
         }
-        let inner = self.inner.read();
+        // The keys as they are now, held with no lock: the parallel loop runs on the caller's
+        // pool, and no job it takes on there can wait for a lock this scan holds.
+        let view = self.view();
+        let inner = view.pieces();
         let below = |start: u64, count: usize| (limit.saturating_sub(start) as usize).min(count);
+        let heaps: Vec<&Heap> = inner
+            .segments
+            .iter()
+            .filter_map(|segment| match &**segment {
+                Segment::Heap(heap) => Some(heap),
+                Segment::Adopted(_) => None,
+            })
+            .chain([&inner.heap])
+            .collect();
         let mut arenas = 0;
         let mut parts: Vec<Part<'_>> = Vec::new();
         if let Some(base) = &inner.base {
@@ -1167,23 +1078,22 @@ impl Dictionary {
             let entries = below(0, base.len as usize);
             parts.extend(super::strings::slices(entries).map(|s| Part::Base(base, s)));
         }
-        let heaps = inner
-            .segments
-            .iter()
-            .filter_map(|segment| match segment {
-                Segment::Heap(heap) => Some(heap),
-                Segment::Adopted(_) => None,
-            })
-            .chain([&inner.heap]);
-        for heap in heaps {
+        for heap in &heaps {
             arenas += 1;
-            let entries = below(heap.start, heap.ends.len());
-            parts.extend(super::strings::slices(entries).map(|s| Part::Heap(heap, s)));
+            for (b, block) in heap.blocks.iter().enumerate() {
+                let start = heap.start + (b * BLOCK) as u64;
+                let entries = below(start, block.len());
+                parts.extend(super::strings::slices(entries).map(|s| Part::Keys(block, start, s)));
+            }
+            // The tail's keys where they are: nothing copied, none at or past the limit.
+            let start = heap.start + (heap.blocks.len() * BLOCK) as u64;
+            let entries = below(start, heap.tail.len());
+            parts.extend(super::strings::slices(entries).map(|s| Part::Tail(&heap.tail, start, s)));
         }
         // A bulk load's terms: each shard's arena, its entries numbered to their ids
         // (an entry that existed already shows under its own id too: deduplicated).
         for segment in &inner.segments {
-            let Segment::Adopted(adopted) = segment else {
+            let Segment::Adopted(adopted) = &**segment else {
                 continue;
             };
             if limit <= adopted.start {
@@ -1202,9 +1112,17 @@ impl Dictionary {
                 decoded_slice(base, &matcher, test, slice, out)
             }
             Part::Base(base, slice) => matcher.slice(&base.arena, &base.offsets, slice, 0, out),
-            Part::Heap(heap, slice) => {
-                matcher.slice(&heap.bytes, &heap.ends[..], slice, heap.start, out)
+            Part::Keys(block, start, slice) => {
+                matcher.slice(&block.bytes, &block.ends[..], slice, start, out)
             }
+            // Each key an arena of one entry: the search never runs into the next key.
+            Part::Tail(keys, start, (first, last)) => (first..last)
+                .map(|i| {
+                    let key = &keys[i];
+                    let ends = [key.len() as u64];
+                    matcher.slice(key, &ends[..], (0, 1), start + i as u64, out)
+                })
+                .sum(),
             Part::Shard(adopted, s, slice) => {
                 let shard = &adopted.shards[s];
                 let from = out.len();
@@ -1244,12 +1162,21 @@ impl Dictionary {
     }
 
     /// The entries below `limit` that pass `test`, a prefix test, from the text order.
+    ///
+    /// The kept order is cloned first, then the keys are viewed: the view holds every entry
+    /// the order does. Where the order doesn't cover the view, it is extended from the view
+    /// with no lock held, the answer read from the extension; the extension is installed only
+    /// if the kept order is still the one it extended, in the generation the view read.
     fn prefix_matches(
         &self,
         test: &super::StringTest<'_>,
         limit: u64,
     ) -> (Vec<TermId>, super::StringScan) {
-        let inner = self.inner.read();
+        let kept = self.order.read().clone();
+        let view = self.view();
+        #[cfg(test)]
+        between_view_and_install();
+        let inner = view.pieces();
         let key = |index: u64| inner.key(index);
         let needle = test.needle.as_bytes();
         let mut candidates: Vec<u64> = Vec::new();
@@ -1261,12 +1188,21 @@ impl Dictionary {
             }
             None => 0,
         };
-        {
-            let mut order = self.order.write();
-            order.extend(first, inner.len(), &key);
-            let (start, end) = super::order::prefix_range(&order.order, &key, needle);
-            candidates.extend_from_slice(&order.order[start..end]);
-        }
+        let order = if kept.covers(first, inner.len()) {
+            kept
+        } else {
+            let mut extended = kept.clone();
+            extended.extend(first, inner.len(), &key);
+            if kept.generation == view.generation() {
+                let mut current = self.order.write();
+                if current.same(&kept) {
+                    *current = extended.clone();
+                }
+            }
+            extended
+        };
+        let (start, end) = super::order::prefix_range(&order.order, &key, needle);
+        candidates.extend_from_slice(&order.order[start..end]);
         candidates.retain(|&index| index < limit);
         let scan = super::StringScan {
             keys_tested: candidates.len() as u64,
@@ -1291,7 +1227,15 @@ impl Dictionary {
         len: u64,
         budget: &'b Budget,
     ) -> EngineResult<ChargedVec<u32, &'b Budget>> {
-        let inner = self.inner.read();
+        // The kept order cloned, then the keys viewed (holding every entry the order does):
+        // the sort runs with no lock held ([`prefix_matches`](Self::prefix_matches)).
+        let order = self.order.read().clone();
+        let (_view_held, view) = self.view_within(budget)?;
+        let inner = view.pieces();
+        debug_assert!(
+            len <= inner.len(),
+            "a checkpoint of entries the dictionary holds"
+        );
         let key = |index: u64| inner.key(index);
         let text = |index: u64| super::order::text_in(key(index));
         let (base, first): (&[u32], u64) =
@@ -1299,13 +1243,12 @@ impl Dictionary {
                 Some(order) => (order, inner.base_len()),
                 None => (&[], 0),
             };
-        let order = self.order.read();
         // The others: the kept order where it covers them, else sorted. Declared before
         // the sorted order, its reservation is released after it is freed.
         let _sorted_held: Reservation<&Budget>;
         let sorted: Vec<u32>;
         let kept: &[u64];
-        if order.first == first && order.covered >= len.max(first) {
+        if order.covers(first, len.max(first)) {
             (kept, sorted, _sorted_held) = (&order.order, Vec::new(), Reservation::new(budget));
         } else {
             kept = &[];
@@ -1522,24 +1465,36 @@ impl Dictionary {
     }
 
     /// Numbers a bulk load's `pending` terms after the entries there are (in the order of
-    /// their first occurrence in the input: [`super::pending`]), calls `remap` with them so
-    /// the load's quads take their ids, and adds them as a segment: their text stays where
-    /// it was interned. Readers go on meanwhile; writers wait.
+    /// their first occurrence in the input: [`super::pending`]), adds them as a segment
+    /// (their text stays where it was interned), then calls `remap` with them so the load's
+    /// quads take their ids. Readers go on meanwhile; writers wait for the adoption.
+    ///
+    /// The adoption guard is held across the numbering only, whose parallel parts run on
+    /// threads of no pool and take no lock ([`Pending::number`]): every one ends, whatever
+    /// waits for the dictionary. `remap` runs after the guard is let go, with any parallel
+    /// work it likes: the ids it reads are published, and the terms are entries before any
+    /// quad refers to them (as an aborted transaction's are).
     pub(crate) fn adopt_pending(&self, pending: Pending, remap: impl FnOnce(&Adopted)) {
         if pending.is_empty() {
             remap(&Adopted::empty(self.len()));
             return;
         }
-        let inner = self.inner.upgradable_read();
-        // A load into an empty dictionary finds none of its terms there: no hashing.
-        let empty = inner.len() == 0;
-        let adopted = pending.number(inner.len(), |key| match empty {
-            true => None,
-            false => inner.find(key_hash(key), key),
-        });
-        remap(&adopted);
-        let mut inner = parking_lot::RwLockUpgradableReadGuard::upgrade(inner);
-        inner.adopt(adopted);
+        let segment = {
+            let inner = self.inner.upgradable_read();
+            let held: &Inner = &inner;
+            // A load into an empty dictionary finds none of its terms there: no hashing.
+            let empty = held.len() == 0;
+            let adopted = pending.number(held.len(), |key| match empty {
+                true => None,
+                false => held.find(key_hash(key), key),
+            });
+            let mut inner = parking_lot::RwLockUpgradableReadGuard::upgrade(inner);
+            inner.adopt(adopted)
+        };
+        let Segment::Adopted(adopted) = &*segment else {
+            unreachable!("an adoption's segment");
+        };
+        remap(adopted);
     }
 
     /// Encodes `quad` without interning; `None` if any term is unknown (below `limit`).
@@ -1629,8 +1584,83 @@ impl Dictionary {
                 "checkpoint dictionary restored into a non-empty dictionary".to_owned(),
             ));
         }
-        *inner = Inner::with_base(base);
+        *inner = Inner::with_base(base, inner.generation);
         Ok(())
+    }
+
+    /// Reserves room for `suffix`'s entries, the next ids, so that installing them after the
+    /// publisher's durable step allocates nothing and can't fail ([`Prepared::install`]).
+    /// Under the writer slot, which `slot` proves: no one else adds entries until the install.
+    /// The room outlives a rebase meanwhile ([`Self::rebase`]). Refused, the entries and the
+    /// promise are unchanged; room already grown may stay, as slack.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "publications prepare with it in package 9 (activation)"
+        )
+    )]
+    pub(crate) fn prepare<'s>(
+        &'s self,
+        slot: &'s super::slot::WriterGuard<'s>,
+        suffix: &'s Suffix,
+    ) -> Result<Prepared<'s>, PrepareError> {
+        let end = suffix.start().checked_add(suffix.len());
+        if end.is_none_or(|end| end > super::pending::PROVISIONAL) {
+            return Err(PrepareError::Full);
+        }
+        // What waiting for a lock allocates on this thread, made now: the install waits for
+        // readers on this thread (`Prepared` can't leave it), after the durable step.
+        super::slot::warm_parking();
+        let mut inner = self.inner.write();
+        if inner.len() != suffix.start() {
+            return Err(PrepareError::Diverged {
+                start: suffix.start(),
+                len: inner.len(),
+            });
+        }
+        let more = usize::try_from(suffix.len()).map_err(|_| PrepareError::NoRoom)?;
+        inner.promise(more).map_err(|_| PrepareError::NoRoom)?;
+        Ok(Prepared {
+            dictionary: self,
+            suffix,
+            installed: false,
+            _slot: slot,
+            _here: std::marker::PhantomData,
+        })
+    }
+
+    /// [`Prepared::install`]: `suffix`'s keys, the next ids, into the room promised.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "publications install with it in package 9 (activation)"
+        )
+    )]
+    pub(super) fn install_suffix(&self, suffix: &Suffix) {
+        let mut inner = self.inner.write();
+        debug_assert_eq!(inner.len(), suffix.start(), "prepared at this length");
+        debug_assert!(inner.promised() as u64 >= suffix.len(), "room promised");
+        inner.install(suffix.keys());
+    }
+
+    /// A prepared install given up (dropped): the room stays as slack.
+    pub(super) fn unpromise(&self) {
+        self.inner.write().unpromise();
+    }
+
+    /// Seals installed keys into blocks (the tail an install leaves unsealed), copying them
+    /// once. Ids and keys stay as they were. Under the writer slot, after the publication.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "publications seal after their install in package 9"
+        )
+    )]
+    pub(crate) fn seal(&self, _slot: &super::slot::WriterGuard<'_>) {
+        self.inner.write().seal();
     }
 
     /// Serves the entries `0..base.len` from `base`, a checkpoint of them that this engine
@@ -1647,14 +1677,25 @@ impl Dictionary {
                 "a checkpoint's dictionary doesn't match the dictionary".to_owned(),
             ));
         }
-        let mut next = Inner::with_base(base);
+        // A new generation: a text order built for the old one is never installed. Views taken
+        // before keep the old pieces, and read every key they held.
+        let generation = inner.generation + 1;
+        let mut next = Inner::with_base(base, generation);
         for index in len..inner.len() {
             let key = inner.key(index);
             next.push(&key, key_hash(&key));
         }
+        // A prepared install's room, reserved in the new state too, past the entries it holds
+        // now, or the rebase gives up and nothing changes: the install allocates nothing
+        // either way ([`Self::prepare`]).
+        if next.keep_promise(&inner).is_err() {
+            return Err(EngineError::Io(std::io::Error::from(
+                std::io::ErrorKind::OutOfMemory,
+            )));
+        }
         *inner = next;
         // The in-memory text order covered entries the base orders now.
-        *self.order.write() = super::order::TextOrder::default();
+        *self.order.write() = super::order::TextOrder::at(generation);
         Ok(true)
     }
 
@@ -1673,38 +1714,9 @@ impl Dictionary {
                 "checkpoint dictionary restored into a non-empty dictionary".to_owned(),
             ));
         }
-        let Heap {
-            table,
-            bytes,
-            ends,
-            hashes: kept,
-            ..
-        } = &mut inner.heap;
-        bytes.reserve_exact(keys.iter().map(|key| key.len()).sum());
-        ends.reserve_exact(keys.len());
-        for key in keys {
-            bytes.extend_from_slice(key);
-            ends.push(bytes.len() as u64);
-        }
-        let key = |i: u64| {
-            let i = i as usize;
-            let start = if i == 0 { 0 } else { ends[i - 1] as usize };
-            &bytes[start..ends[i] as usize]
-        };
-        *table = HashTable::with_capacity(keys.len());
-        for (index, &hash) in hashes.iter().enumerate() {
-            let index = index as u64;
-            if table
-                .find(hash, |&other| key(other) == key(index))
-                .is_some()
-            {
-                return Err(EngineError::Corruption(format!(
-                    "duplicate dictionary key at {index}"
-                )));
-            }
-            table.insert_unique(hash, index, |&i| hashes[i as usize]);
-        }
-        *kept = hashes;
+        inner.heap = Heap::of_keys(0, keys, hashes).map_err(|index| {
+            EngineError::Corruption(format!("duplicate dictionary key at {index}"))
+        })?;
         Ok(())
     }
 
@@ -1918,7 +1930,7 @@ impl KeyBatch {
     }
 }
 
-fn graph_term(graph: GraphNameRef<'_>) -> Option<TermRef<'_>> {
+pub(super) fn graph_term(graph: GraphNameRef<'_>) -> Option<TermRef<'_>> {
     match graph {
         GraphNameRef::NamedNode(node) => Some(node.into()),
         GraphNameRef::BlankNode(node) => Some(node.into()),
@@ -1937,7 +1949,13 @@ fn lookup_bytes(term: TermRef<'_>, compressed: bool) -> usize {
         ];
         return parts.into_iter().max().unwrap_or(0).max(TRIPLE_KEY_LEN);
     }
-    let encoded = encoded_len(term);
+    key_lookup_bytes(encoded_len(term), compressed)
+}
+
+/// The most bytes a lookup of a key of `encoded` bytes allocates ([`lookup_bytes`] of a term
+/// that isn't a triple term): its key, grown by doubling from 64 bytes, and where the base's keys
+/// are `compressed` the compressor's output and the stored key it is copied into.
+pub(super) fn key_lookup_bytes(encoded: usize, compressed: bool) -> usize {
     let key = encoded.max(64);
     match compressed {
         false => 3 * key,
@@ -1946,7 +1964,7 @@ fn lookup_bytes(term: TermRef<'_>, compressed: bool) -> usize {
 }
 
 /// The length of `term`'s key ([`encode_key`]), but a triple term's.
-fn encoded_len(term: TermRef<'_>) -> usize {
+pub(super) fn encoded_len(term: TermRef<'_>) -> usize {
     match term {
         TermRef::NamedNode(node) => 1 + node.as_str().len(),
         TermRef::BlankNode(node) => 1 + node.as_str().len(),
@@ -1965,7 +1983,7 @@ fn encoded_len(term: TermRef<'_>) -> usize {
     }
 }
 
-fn encode_key(term: TermRef<'_>, out: &mut Vec<u8>) -> TermKind {
+pub(super) fn encode_key(term: TermRef<'_>, out: &mut Vec<u8>) -> TermKind {
     match term {
         TermRef::NamedNode(node) => {
             out.push(TAG_IRI);
@@ -2056,7 +2074,7 @@ impl<'a> TermView<'a> {
     }
 }
 
-fn view_key(key: &[u8]) -> TermView<'_> {
+pub(super) fn view_key(key: &[u8]) -> TermView<'_> {
     let rest = &key[1..];
     let text = || std::str::from_utf8(rest).unwrap_or_default();
     match key[0] {
@@ -2088,7 +2106,7 @@ fn view_key(key: &[u8]) -> TermView<'_> {
     }
 }
 
-fn decode_key(key: &[u8]) -> Term {
+pub(super) fn decode_key(key: &[u8]) -> Term {
     let rest = &key[1..];
     let text = || std::str::from_utf8(rest).unwrap_or_default().to_owned();
     match key[0] {
@@ -2115,7 +2133,7 @@ fn decode_key(key: &[u8]) -> Term {
 }
 
 /// The key of a triple term with these component ids.
-fn triple_key(ids: [TermId; 3], out: &mut Vec<u8>) {
+pub(super) fn triple_key(ids: [TermId; 3], out: &mut Vec<u8>) {
     out.push(TAG_TRIPLE_IDS);
     for id in ids {
         out.extend_from_slice(&id.raw().to_be_bytes());
@@ -2123,7 +2141,7 @@ fn triple_key(ids: [TermId; 3], out: &mut Vec<u8>) {
 }
 
 /// The component ids of a triple term's key, if `key` is one.
-fn triple_ids(key: &[u8]) -> Option<[TermId; 3]> {
+pub(super) fn triple_ids(key: &[u8]) -> Option<[TermId; 3]> {
     if key.len() != TRIPLE_KEY_LEN || key[0] != TAG_TRIPLE_IDS {
         return None;
     }
@@ -2164,9 +2182,18 @@ fn validate_key(key: &[u8]) -> EngineResult<()> {
     }
 }
 
+mod reader_search;
+
 #[cfg(test)]
 #[path = "dictionary_lock_tests.rs"]
 mod lock_order_tests;
+
+#[cfg(test)]
+/// A budget that refuses nothing, for vector searches whose memory a test doesn't check.
+pub(crate) fn unlimited() -> &'static nrese_exec::Budget {
+    static UNLIMITED: std::sync::OnceLock<nrese_exec::Budget> = std::sync::OnceLock::new();
+    UNLIMITED.get_or_init(nrese_exec::Budget::unlimited)
+}
 
 #[cfg(test)]
 mod tests {
@@ -2174,6 +2201,384 @@ mod tests {
     use nrese_rdf::{BlankNodeRef, LiteralRef, NamedNodeRef};
 
     use super::*;
+
+    /// Rounds of each lock-span guard: on the parent tree the shape shows as a race (the
+    /// holder's thread must take a fed job while it waits), so a guard tries several times.
+    const ROUNDS: usize = 4;
+
+    /// Whether the dictionary's lock is free now (taken and let go, never waited for).
+    fn free(dictionary: &std::sync::Arc<Dictionary>) -> impl Fn() -> bool + Send + Sync + 'static {
+        let dictionary = std::sync::Arc::clone(dictionary);
+        move || dictionary.inner.try_write().is_some() && dictionary.order.try_write().is_some()
+    }
+
+    /// A dictionary of `n` simple literals, each holding a `w`: enough entries for several
+    /// scan slices and a parallel text order.
+    fn literals(n: usize) -> std::sync::Arc<Dictionary> {
+        let dictionary = Dictionary::default();
+        for i in 0..n {
+            let text = format!("w{:07}", (i * 7_919) % n);
+            dictionary.intern(LiteralRef::new_simple_literal(&text).into());
+        }
+        std::sync::Arc::new(dictionary)
+    }
+
+    fn containing<'a>(
+        needle: &'a str,
+        placement: super::super::Placement,
+    ) -> super::super::StringTest<'a> {
+        super::super::StringTest {
+            needle,
+            placement,
+            iris: false,
+            strings: true,
+            lang_strings: false,
+            typed: false,
+            language: None,
+            ascii_case_insensitive: false,
+        }
+    }
+
+    /// Span 1 (P2-01). A bulk load's numbering and renumbering under the adoption guard never
+    /// have the holder's thread run a pool job while the guard is held: a job that wanted the
+    /// dictionary (to intern, or to read behind a queued writer) would wait there with the
+    /// numbering under it, and the numbering would wait for it. On engine-v2 688181dd they
+    /// ran as Rayon work on the caller's pool, which the holder's thread helps with.
+    #[test]
+    fn a_loads_numbering_takes_on_no_job_under_the_adoption_guard() {
+        let dictionary = std::sync::Arc::new(Dictionary::default());
+        let mut every_time = true;
+        for round in 0..ROUNDS {
+            let pending = Pending::default();
+            let mut provisional: Vec<u64> = Vec::new();
+            for b in 0..200u32 {
+                let keys: Vec<Vec<u8>> = (0..500)
+                    .map(|k| format!("Iurn:t-{round}-{b}-{k}").into_bytes())
+                    .collect();
+                let mut indexes = vec![NEW; keys.len()];
+                pending.intern((1, b), &mut indexes, &mut Vec::new(), |k| {
+                    (&keys[k][..], key_hash(&keys[k]))
+                });
+                provisional.extend_from_slice(&indexes);
+            }
+            let id = |payload: u64| TermId::new(TermKind::Iri, payload);
+            let mut quads: Vec<EncodedQuad> = provisional
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|q| EncodedQuad::new(id(q[0]), id(q[1]), id(q[2]), id(q[3])))
+                .collect();
+            every_time &= nrese_exec::workers::contended(
+                || dictionary.adopt_pending(pending, |adopted| adopted.renumber(&mut quads)),
+                free(&dictionary),
+            );
+            // Renumbered to the ids the dictionary holds now.
+            let start = (round * 200 * 500) as u64;
+            assert_eq!(quads[0].subject, id(start));
+            assert_eq!(quads.last().unwrap().graph, id(start + 200 * 500 - 1));
+        }
+        assert!(
+            every_time,
+            "a job ran on the numbering's thread under the adoption guard"
+        );
+        assert_eq!(dictionary.len(), (ROUNDS * 200 * 500) as u64);
+    }
+
+    /// Span 2 (P2-01). A substring scan of the arenas takes on no pool job under the
+    /// dictionary's read guard (the hazard of span 1, behind a queued writer).
+    #[test]
+    fn a_substring_scan_takes_on_no_job_under_the_read_guard() {
+        let n = 300_000;
+        let dictionary = literals(n);
+        let test = containing("w", super::super::Placement::Anywhere);
+        let mut every_time = true;
+        for _ in 0..ROUNDS {
+            let found = std::sync::Arc::new(std::sync::Mutex::new(0));
+            let scan = {
+                let (dictionary, found) = (std::sync::Arc::clone(&dictionary), found.clone());
+                move || {
+                    *found.lock().unwrap() = dictionary.matching_strings(&test, n as u64).len();
+                }
+            };
+            every_time &= nrese_exec::workers::contended(scan, free(&dictionary));
+            assert_eq!(*found.lock().unwrap(), n);
+        }
+        assert!(
+            every_time,
+            "a job ran on the scan's thread under the read guard"
+        );
+    }
+
+    /// Span 3 (P2-01). A checkpoint's text order, sorted for entries no kept order covers,
+    /// takes on no pool job under the dictionary's guards.
+    #[test]
+    fn a_checkpoints_text_order_takes_on_no_job_under_the_guards() {
+        let n = 300_000;
+        let dictionary = literals(n);
+        let mut every_time = true;
+        for _ in 0..ROUNDS {
+            let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let build = {
+                let (dictionary, order) = (std::sync::Arc::clone(&dictionary), order.clone());
+                move || {
+                    let budget = Budget::unlimited();
+                    *order.lock().unwrap() =
+                        dictionary.text_order(n as u64, &budget).unwrap().to_vec();
+                }
+            };
+            every_time &= nrese_exec::workers::contended(build, free(&dictionary));
+            let order = order.lock().unwrap();
+            assert_eq!(order.len(), n);
+            let text = |i: u32| dictionary.inner.read().key(u64::from(i)).into_owned();
+            assert!(order.windows(2).all(|w| text(w[0]) < text(w[1])));
+        }
+        assert!(
+            every_time,
+            "a job ran on the text order's thread under the guards"
+        );
+    }
+
+    /// Span 4 (P2-01). A prefix search that first takes the entries interned since into the
+    /// kept text order takes on no pool job under the guards (`order` written, `inner` read).
+    #[test]
+    fn a_prefix_search_extending_the_order_takes_on_no_job_under_the_guards() {
+        let n = 300_000;
+        let mut every_time = true;
+        for _ in 0..ROUNDS {
+            // Afresh each round: the order is extended once, by the first search.
+            let dictionary = literals(n);
+            let found = std::sync::Arc::new(std::sync::Mutex::new(0));
+            let search = {
+                let (dictionary, found) = (std::sync::Arc::clone(&dictionary), found.clone());
+                move || {
+                    let test = containing("w0000", super::super::Placement::Start);
+                    *found.lock().unwrap() = dictionary.matching_strings(&test, n as u64).len();
+                }
+            };
+            every_time &= nrese_exec::workers::contended(search, free(&dictionary));
+            // `w0000` and three digits: the values 0..1000 (`literals` holds each of 0..n once).
+            assert_eq!(*found.lock().unwrap(), 1_000);
+            assert_eq!(dictionary.order.read().covered, n as u64);
+        }
+        assert!(
+            every_time,
+            "a job ran on the prefix search's thread under the guards"
+        );
+    }
+
+    /// Sets the hook a prefix search runs between its view and its installation.
+    fn set_between_view_and_install(hook: impl FnOnce() + 'static) {
+        BETWEEN_VIEW_AND_INSTALL.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// P2-01 A2. A key interned between a prefix search's view and its order's installation
+    /// keeps one id. The search answers from its view (without the key), the order it installs
+    /// covers the view, and the next search finds the key.
+    #[test]
+    fn a_key_interned_between_a_view_and_its_order_is_found_by_the_next_search() {
+        let n = 20_000u64;
+        let dictionary = literals(n as usize);
+        let late = LiteralRef::new_simple_literal("w0000777 late");
+        let interned = std::sync::Arc::new(std::sync::Mutex::new(None));
+        {
+            let (dictionary, interned) = (dictionary.clone(), interned.clone());
+            set_between_view_and_install(move || {
+                *interned.lock().unwrap() = Some(dictionary.intern(late.into()));
+            });
+        }
+        let prefix = containing("w0000", super::super::Placement::Start);
+        // `w0000` and three digits: the values 0..1000.
+        assert_eq!(dictionary.matching_strings(&prefix, u64::MAX).len(), 1_000);
+        let late_id = interned.lock().unwrap().expect("the hook ran");
+        assert_eq!(dictionary.lookup(late.into()), Some(late_id));
+        assert_eq!(dictionary.order.read().covered, n);
+        let found = dictionary.matching_strings(&prefix, u64::MAX);
+        assert_eq!(found.len(), 1_001);
+        assert!(found.contains(&late_id));
+        assert_eq!(dictionary.order.read().covered, n + 1);
+    }
+
+    /// P2-01 A6. An order extended in one generation is not installed after the dictionary
+    /// moved to another (here advanced by hand between the view and the installation, as a
+    /// rebase does); the search still answers from its own extension.
+    #[test]
+    fn an_order_extended_in_an_older_generation_is_not_installed() {
+        let dictionary = literals(20_000);
+        {
+            let dictionary = dictionary.clone();
+            set_between_view_and_install(move || {
+                let mut inner = dictionary.inner.write();
+                inner.generation += 1;
+                *dictionary.order.write() = super::super::order::TextOrder::at(inner.generation);
+            });
+        }
+        let prefix = containing("w0000", super::super::Placement::Start);
+        assert_eq!(dictionary.matching_strings(&prefix, u64::MAX).len(), 1_000);
+        let order = dictionary.order.read();
+        assert_eq!((order.covered, order.generation), (0, 1));
+    }
+
+    /// P2-01 A7. Of two prefix searches extending the order at once (one runs inside the
+    /// other's window), both answer, and the installed order is the text order of every entry.
+    #[test]
+    fn of_two_extensions_at_once_the_order_stays_the_text_order() {
+        let n = 20_000u64;
+        let dictionary = literals(n as usize);
+        let inner_found = std::sync::Arc::new(std::sync::Mutex::new(0));
+        {
+            let (dictionary, inner_found) = (dictionary.clone(), inner_found.clone());
+            set_between_view_and_install(move || {
+                let prefix = containing("w0001", super::super::Placement::Start);
+                *inner_found.lock().unwrap() = dictionary.matching_strings(&prefix, u64::MAX).len();
+            });
+        }
+        let prefix = containing("w0000", super::super::Placement::Start);
+        assert_eq!(dictionary.matching_strings(&prefix, u64::MAX).len(), 1_000);
+        assert_eq!(*inner_found.lock().unwrap(), 1_000);
+        let order = dictionary.order.read().clone();
+        assert_eq!(order.covered, n);
+        let text = |i: u64| dictionary.inner.read().key(i).into_owned();
+        assert!(
+            order
+                .order
+                .windows(2)
+                .all(|w| (text(w[0]), w[0]) < (text(w[1]), w[1]))
+        );
+    }
+
+    /// P2-01 A5. A view copies no key bytes: a 64 MiB literal in the heap's tail is the very
+    /// allocation the view holds.
+    #[test]
+    fn a_view_shares_the_tails_keys() {
+        let dictionary = Dictionary::default();
+        let long = "x".repeat(64 << 20);
+        let id = dictionary.intern(LiteralRef::new_simple_literal(&long).into());
+        let view = dictionary.view();
+        let inner = dictionary.inner.read();
+        let local = id.payload() as usize;
+        assert!(std::sync::Arc::ptr_eq(
+            &inner.heap.tail[local],
+            &view.pieces().heap.tail[local]
+        ));
+    }
+
+    /// P2-01 A8. The heap seals its tail into a block at every BLOCK-th key: keys keep their
+    /// ids across a seal, every block holds BLOCK keys, and the tail the rest.
+    #[test]
+    fn keys_keep_their_ids_across_a_seal() {
+        let key = |i: usize| format!("k{i}");
+        for n in [BLOCK - 1, BLOCK, BLOCK + 1, 2 * BLOCK + 3] {
+            let dictionary = Dictionary::default();
+            let ids: Vec<TermId> = (0..n)
+                .map(|i| dictionary.intern(LiteralRef::new_simple_literal(&key(i)).into()))
+                .collect();
+            {
+                let inner = dictionary.inner.read();
+                assert_eq!(
+                    (inner.heap.blocks.len(), inner.heap.tail.len()),
+                    (n / BLOCK, n % BLOCK)
+                );
+                assert!(inner.heap.blocks.iter().all(|block| block.len() == BLOCK));
+            }
+            for (i, &id) in ids.iter().enumerate() {
+                let text = key(i);
+                let literal = LiteralRef::new_simple_literal(&text);
+                assert_eq!(dictionary.lookup(literal.into()), Some(id));
+                assert_eq!(
+                    dictionary.decode(id),
+                    Some(Term::from(literal.into_owned()))
+                );
+            }
+        }
+    }
+
+    /// P2-01, the inline lengths and first ids (an optimisation: its oracle). Across every
+    /// kind of piece (frozen heaps, one with a sealed block, adopted bulk segments, the live
+    /// heap), every id's key read through the dictionary and through a view is the key it was
+    /// given, and every key is found at its id.
+    #[test]
+    fn every_id_reads_its_own_key_across_the_pieces() {
+        let dictionary = Dictionary::default();
+        let mut expected: Vec<Vec<u8>> = Vec::new();
+        let intern = |expected: &mut Vec<Vec<u8>>, text: String| {
+            let id = dictionary.intern(LiteralRef::new_simple_literal(&text).into());
+            assert_eq!(id.payload(), expected.len() as u64);
+            expected.push([&b"S"[..], text.as_bytes()].concat());
+        };
+        let adopt = |expected: &mut Vec<Vec<u8>>, round: usize| {
+            let pending = Pending::default();
+            let keys: Vec<Vec<u8>> = (0..3)
+                .map(|k| format!("Iurn:bulk-{round}-{k}").into_bytes())
+                .collect();
+            let mut indexes = vec![NEW; keys.len()];
+            pending.intern((1, 0), &mut indexes, &mut Vec::new(), |k| {
+                (&keys[k][..], key_hash(&keys[k]))
+            });
+            dictionary.adopt_pending(pending, |_| {});
+            expected.extend(keys);
+        };
+        for i in 0..BLOCK + 10 {
+            intern(&mut expected, format!("first {i}"));
+        }
+        adopt(&mut expected, 0);
+        for i in 0..100 {
+            intern(&mut expected, format!("second {i}"));
+        }
+        adopt(&mut expected, 1);
+        for i in 0..50 {
+            intern(&mut expected, format!("live {i}"));
+        }
+        assert_eq!(dictionary.inner.read().segments.len(), 4);
+        let view = dictionary.view();
+        let inner = dictionary.inner.read();
+        for (id, key) in expected.iter().enumerate() {
+            let id = id as u64;
+            assert_eq!(&*inner.key(id), &key[..], "entry {id}");
+            assert_eq!(
+                &*view.pieces().key(id),
+                &key[..],
+                "entry {id} through a view"
+            );
+            assert_eq!(inner.find(key_hash(key), key), Some(id), "entry {id} found");
+        }
+    }
+
+    /// P2-01, Sol r1 S1. A scan copies no key of a heap's tail, a frozen heap's included: its
+    /// peak stays below half the tail's bytes, where any copy of the tail holds all of them.
+    /// Here 64 keys of 256 KiB in a heap frozen by a bulk load, and a needle matching none.
+    #[test]
+    fn a_scan_copies_no_tail_keys() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        let dictionary = Dictionary::default();
+        let long = 256 << 10;
+        let padding = "x".repeat(long);
+        for i in 0..64 {
+            let text = format!("{i:04}{padding}");
+            dictionary.intern(LiteralRef::new_simple_literal(&text).into());
+        }
+        let pending = Pending::default();
+        let key = b"Iurn:freezes-the-heap".to_vec();
+        let mut indexes = vec![NEW];
+        pending.intern((1, 0), &mut indexes, &mut Vec::new(), |_| {
+            (&key[..], key_hash(&key))
+        });
+        dictionary.adopt_pending(pending, |_| {});
+        assert!(matches!(
+            &*dictionary.inner.read().segments[0],
+            Segment::Heap(heap) if heap.tail.len() == 64
+        ));
+        let test = containing("no such text", super::super::Placement::Anywhere);
+        let (found, peak) =
+            nrese_exec::measure::measure(|| dictionary.matching_strings(&test, u64::MAX));
+        assert!(found.is_empty());
+        assert!(
+            peak < 64 * long / 2,
+            "the scan held {peak} bytes over tails of {} bytes",
+            64 * long
+        );
+    }
 
     /// Views of decoded keys stay valid while the arena keeps more (its list grows and
     /// moves): the case Miri's Stacked Borrows checks (the audit of 2 October).
@@ -2461,7 +2866,9 @@ mod tests {
         };
         let query = VectorQuery::new(vec![1.0], 1);
         let search = |dictionary: &Dictionary| {
-            dictionary.vector_search(&query, dictionary.len(), &|_| true);
+            dictionary
+                .vector_search(&query, dictionary.len(), &|_| true, unlimited())
+                .unwrap();
         };
         let dir = tempfile::tempdir().unwrap();
         let source = Dictionary::default();

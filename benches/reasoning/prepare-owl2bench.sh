@@ -10,7 +10,9 @@ set -euo pipefail
 # This job's names (scripts/lib/ns.sh): its containers and volumes; the shared datasets' volume.
 NS_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 . "$NS_ROOT/scripts/lib/ns.sh"
-DATA_VOLUME=$(ns_shared data)
+# NRESE_DATASET_DIR: an absolute directory instead, bind-mounted as /data: where a timing job makes
+# what its host lacks, aside, checked before it is kept (release_gate.py make_dataset(), 7 Nov 2026).
+DATA_VOLUME=${NRESE_DATASET_DIR:-$(ns_shared data)}
 # Shared datasets are prepared one at a time per host (their staging, the .part and .parts
 # files, and their publication): this script runs again under the host's datasets lock.
 ns_serialize datasets "$0" "$@"
@@ -21,6 +23,9 @@ require_free_gb "${NRESE_MIN_FREE_GB:-40}" "$(basename "$0")" "$(dirname "$0")"
 # What this creates (the dataset volume, images) is removed by scripts/bench-cleanup.sh,
 # which the scorecards run when they exit.
 export MSYS_NO_PATHCONV=1
+# The images below are built by BuildKit, which starts no container (maker-containers-measure-1): the
+# legacy builder's would be unlabelled, and a fleet job declaring its containers stopped at them.
+export DOCKER_BUILDKIT=1
 native() { cygpath -m "$1" 2>/dev/null || echo "$1"; }
 HERE=$(native "$(cd "$(dirname "$0")" && pwd)")
 JENA_IMAGE=${JENA_IMAGE:-nrese-bench/jena:6.2.0}
@@ -29,18 +34,20 @@ docker image inspect "$JENA_IMAGE" >/dev/null 2>&1 ||
   docker build -q -t "$JENA_IMAGE" "$HERE/../competitors/jena" >/dev/null
 
 docker build -q -t nrese-bench/owl2bench "$HERE/owl2bench" >/dev/null
+# Every container below: its labels, and in a fleet job the job's label and the limits it declared.
+ns_maker_args - "$NS_ROOT" owl2bench
 for spec in ${*:-RL:1 RL:10 EL:1 QL:1 DL:1}; do
   profile=${spec%%:*} n=${spec#*:}
   name=owl2bench-$(echo "$profile" | tr '[:upper:]' '[:lower:]')-$n
-  if docker run --rm -v "$DATA_VOLUME":/data alpine test -s "/data/$name.nt"; then
+  if docker run --rm "${NS_ARGS[@]}" -v "$DATA_VOLUME":/data alpine test -s "/data/$name.nt"; then
     echo "$name: present"
     continue
   fi
-  docker run --rm -v "$DATA_VOLUME":/data --entrypoint sh nrese-bench/owl2bench -c \
+  docker run --rm "${NS_ARGS[@]}" -v "$DATA_VOLUME":/data --entrypoint sh nrese-bench/owl2bench -c \
     "mkdir -p /data/owl2bench-gen && cd /work && java -jar OWL2Bench.jar $n $profile 1 >/dev/null &&
      mv OWL2$profile-$n.owl /data/owl2bench-gen/"
-  docker run --rm -v "$DATA_VOLUME":/data --entrypoint sh "$JENA_IMAGE" -c \
+  docker run --rm "${NS_ARGS[@]}" -v "$DATA_VOLUME":/data --entrypoint sh "$JENA_IMAGE" -c \
     "/opt/apache-jena-6.2.0/bin/riot --quiet --output=nt /data/owl2bench-gen/OWL2$profile-$n.owl > /data/$name.nt &&
      rm /data/owl2bench-gen/OWL2$profile-$n.owl && echo $name: \$(wc -l < /data/$name.nt) triples"
 done
-docker run --rm -v "$DATA_VOLUME":/data alpine sh -c 'rmdir /data/owl2bench-gen 2>/dev/null || true'
+docker run --rm "${NS_ARGS[@]}" -v "$DATA_VOLUME":/data alpine sh -c 'rmdir /data/owl2bench-gen 2>/dev/null || true'

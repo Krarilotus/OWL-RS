@@ -2,6 +2,14 @@
 //! store, tell, backup/restore, stats - and the mutation pipeline that owns commit semantics.
 //! No HTTP concerns live here. See `docs/ARCHITECTURE.md`.
 
+/// The unit tests' allocator: the system's, counting what measured operations hold against
+/// their budgets ([`nrese_exec::measure`]), so that an allocation not charged to its budget
+/// fails a test (as `nrese-engine`'s unit tests do).
+#[cfg(test)]
+#[global_allocator]
+static MEASURED: nrese_exec::measure::Measured<std::alloc::System> =
+    nrese_exec::measure::Measured(std::alloc::System);
+
 pub mod access;
 pub mod autocomplete;
 mod backup;
@@ -82,11 +90,13 @@ pub use nrese_engine::cpu;
 /// the allocator.
 pub use nrese_engine::memory::set_release as set_memory_release;
 pub use nrese_engine::{
-    Applied, EngineError, IndexEncoding, LogExpectation, ReadModel, VocabularyEncoding, WalDamage,
+    Applied, CorpusTuning, EngineError, IndexEncoding, LogExpectation, ReadModel,
+    VocabularyEncoding, WalDamage,
 };
 pub use nrese_shacl::{ValidationReport, ValidationResult};
 pub use nrese_sparql::{
     CancellationToken, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryEvaluationError,
+    SearchScope,
 };
 pub use quarantine::{
     EntryState, InvalidStatements, Outcome, Quarantine, QuarantineFilter, QuarantineItem,

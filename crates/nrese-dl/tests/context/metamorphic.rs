@@ -27,7 +27,7 @@ fn mapped(c: &Classification, f: &dyn Fn(u64) -> u64) -> Classification {
         subsumptions: c.subsumptions.iter().map(|&(a, b)| (f(a), f(b))).collect(),
         unsatisfiable: c.unsatisfiable.iter().map(|&t| f(t)).collect(),
         top: c.top.iter().map(|&t| f(t)).collect(),
-        consistent: c.consistent,
+        consistency: c.consistency.clone(),
     };
     out.classes.sort_unstable();
     out.subsumptions.sort_unstable();
@@ -49,7 +49,7 @@ fn restricted(c: &Classification, keep: &[u64]) -> Classification {
             .collect(),
         unsatisfiable: c.unsatisfiable.iter().copied().filter(k).collect(),
         top: c.top.iter().copied().filter(k).collect(),
-        consistent: c.consistent,
+        consistency: c.consistency.clone(),
     }
 }
 

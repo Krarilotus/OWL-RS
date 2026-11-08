@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &[],
         &graph_of,
         cap,
-        nrese_reasoner::graph_sets::UNWATCHED,
+        nrese_reasoner::graph_sets::Limits::UNLIMITED,
     )
     .map_err(|stopped| format!("{stopped:?}"))?;
     let elapsed = started.elapsed();

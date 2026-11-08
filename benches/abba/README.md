@@ -26,7 +26,8 @@ fleet results set:abba-<name>-<b8>     # its member's results hold abba-verdict.
 - The plan comes first: cases, hypotheses, blocks (from the cases' calibrated spread, at least one
   square; `--blocks` overrides), the estimate in host-hours with its exclusive share, and `fleet
   check`'s answer: which timing hosts can take it, and what runs or waits there now. `--plan` stops
-  there; otherwise it submits one set.
+  there, exit 0 when fleet's check takes the set and 1 when it refuses it (nothing queued either
+  way); otherwise it submits one set.
 - The job asks by capability, never a host: a Linux timing host that builds (roles measure and
   build), the cases' memory and data (`has`). It starts only where it can time, builds A, B and the
   harness there first and holds that host alone to its end (the fleet keeps a timed job's host only
@@ -54,6 +55,14 @@ The verdict's exit codes:
   rounds that aren't distinct runs, or an A-A' arm that itself differs. That is a failed experiment,
   never a pass.
 - 4: a confirmed loss (Holm over the family, the rounds combined).
+- 5: not compared: the round is complete and judged, but some declared hypotheses have no test,
+  each for the reason the report gives (A's answer differs from the pinned one, a metric A doesn't
+  report), and no loss shows on the rest. Never a pass, and not 3: running it again gives the
+  same; the reason needs a decision (a fixed A, or a family without that hypothesis).
+
+Precedence, highest first: 2, 3, then 4, 1, 5, 0: a family that is invalid or a round without
+evidence says so first; a loss shown or confirmed on the hypotheses tested outranks the untested
+ones, which the report still lists; 0 only when every declared hypothesis was tested.
 
 ## Rules
 

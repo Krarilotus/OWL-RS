@@ -310,3 +310,86 @@ fn cancellation_takes_precedence_over_partial_answers_and_incompleteness() {
         ));
     }
 }
+
+/// A store whose U1 takes the existential route (not OWL 2 RL's), written past the pipeline:
+/// its first read builds U1 cold, and that build's taxonomy fills the query-ontology cache.
+fn existential_store() -> Arc<StoreService> {
+    let store = Arc::new(StoreService::new(crate::StoreConfig::in_memory()).unwrap());
+    store
+        .update_str_ungated(
+            "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA { :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ;
+                 owl:someValuesFrom :B ] . :a a :A . }",
+        )
+        .unwrap();
+    store
+}
+
+/// The revision of the query-ontology cache's entry.
+fn cached(store: &StoreService) -> Option<u64> {
+    let cache = store.dl().query_ontology.0.lock().unwrap();
+    cache.as_ref().map(|(revision, _)| *revision)
+}
+
+/// What the cache holds as U1's next cold build begins (`None`: no build began).
+fn cached_as_a_build_begins(
+    store: &Arc<StoreService>,
+) -> Arc<std::sync::Mutex<Option<Option<u64>>>> {
+    use super::super::bounds::seam;
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let (at, into) = (Arc::clone(store), Arc::clone(&seen));
+    seam::set(&store.dl().bounds, seam::Point::Build, move || {
+        *into.lock().unwrap() = Some(cached(&at));
+    });
+    seen
+}
+
+/// A cold build of U1 begins with no older revision's ontology that only the cache keeps
+/// (SYN-61 review r1 N1): its charge would hold the room the build's own reading needs, and
+/// the cache lets it go only when the build's taxonomy reads the new one, after.
+#[test]
+fn a_cold_build_begins_with_no_older_cached_ontology() {
+    let store = existential_store();
+    let first = super::super::bounds::report(&store);
+    assert_eq!(first.unavailable, None, "{first:?}");
+    assert_eq!(
+        cached(&store),
+        Some(first.revision),
+        "the first build's taxonomy"
+    );
+    store
+        .update_str_ungated("PREFIX : <urn:test:> INSERT DATA { :b a :A . }")
+        .unwrap();
+    let seen = cached_as_a_build_begins(&store);
+    let after = super::super::bounds::report(&store);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(None),
+        "the cache as revision {}'s build began",
+        after.revision
+    );
+}
+
+/// The cache's entry for the revision a cold build is of stays (N1): a reader that read it
+/// first keeps it for the build's taxonomy, so it isn't read again.
+#[test]
+fn a_cold_build_keeps_the_cached_ontology_of_its_own_revision() {
+    let store = existential_store();
+    let first = super::super::bounds::report(&store);
+    assert_eq!(first.unavailable, None, "{first:?}");
+    store
+        .update_str_ungated("PREFIX : <urn:test:> INSERT DATA { :b a :A . }")
+        .unwrap();
+    let snapshot = store.engine().snapshot();
+    drop(ontology_at(&store, &snapshot).unwrap());
+    let seen = cached_as_a_build_begins(&store);
+    let after = super::super::bounds::report(&store);
+    assert_eq!(after.revision, snapshot.revision());
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(Some(after.revision)),
+        "the cache as revision {}'s build began",
+        after.revision
+    );
+}

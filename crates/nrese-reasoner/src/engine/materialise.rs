@@ -11,6 +11,7 @@ use rayon::prelude::*;
 use super::{Program, encode, storable};
 use crate::batch::{self, Phases, Schema};
 use crate::delta;
+use crate::eval::OperationStop;
 use crate::ir::{Triple, Violations};
 use crate::lists::ListDiagnostic;
 
@@ -50,6 +51,65 @@ pub fn materialise_within(
     stop: crate::eval::Stop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<Closure, delta::Interrupted> {
+    materialise_with(program, snapshot, &OperationStop::new(stop), memory)
+}
+
+/// [`materialise_within`] under one operation's `stop`, whose memory limit and room its
+/// caller chose ([`OperationStop::within`]): the equality copies are admitted by its room.
+pub fn materialise_with(
+    program: &Program,
+    snapshot: &Snapshot,
+    stop: &OperationStop<'_>,
+    memory: &Arc<Budget>,
+) -> Result<Closure, delta::Interrupted> {
+    closure_with(program, snapshot, stop, memory, None)
+}
+
+/// [`materialise_with`], with the derived facts no store can hold (a literal subject, a
+/// non-IRI predicate) appended to `unstorable`, for a first load that reports them
+/// ([`super::maintain`]). Nothing else keeps them: a rematerialisation would hold them
+/// through its heap's peak.
+pub(super) fn materialise_with_unstorable(
+    program: &Program,
+    snapshot: &Snapshot,
+    operation: &OperationStop<'_>,
+    memory: &Arc<Budget>,
+    unstorable: &mut Vec<Triple>,
+) -> Result<Closure, delta::Interrupted> {
+    closure_with(program, snapshot, operation, memory, Some(unstorable))
+}
+
+impl Program {
+    /// Whether the closure of the axioms alone concludes only facts a store can hold, read
+    /// from `empty`, a snapshot with no asserted statement: then each such fact a first
+    /// load's closure holds is new to the state (review r1 F1, [`super::maintain`]).
+    /// Computed once for the program; `Err` if `operation` fired first, its cause kept. The
+    /// axioms' own violations are those of the state before: charged to `memory` while it
+    /// runs, and their equality copies to the operation's room.
+    pub(super) fn axioms_conclude_only_storable(
+        &self,
+        empty: &Snapshot,
+        operation: &OperationStop<'_>,
+        memory: &Arc<Budget>,
+    ) -> Result<bool, delta::Interrupted> {
+        if let Some(&known) = self.axioms_storable.get() {
+            return Ok(known);
+        }
+        debug_assert_eq!(empty.len_in(ReadModel::Asserted), 0);
+        let mut unstorable = Vec::new();
+        closure_with(self, empty, operation, memory, Some(&mut unstorable))?;
+        Ok(*self.axioms_storable.get_or_init(|| unstorable.is_empty()))
+    }
+}
+
+/// [`materialise_with`]'s work, the unstorable facts kept where `unstorable` asks for them.
+fn closure_with(
+    program: &Program,
+    snapshot: &Snapshot,
+    stop: &OperationStop<'_>,
+    memory: &Arc<Budget>,
+    mut unstorable: Option<&mut Vec<Triple>>,
+) -> Result<Closure, delta::Interrupted> {
     nrese_exec::heap::phase("reasoner: input");
     let (input, axioms) = input_of(program, snapshot);
     let schema = program.schema_for(snapshot);
@@ -60,7 +120,7 @@ pub fn materialise_within(
                 // again by replication. A compact stack keeps the closure over
                 // representatives.
                 result if result.nil_merged && !program.store_representatives => {
-                    batch::materialise_grouped_within(
+                    batch::materialise_grouped_with(
                         input_of(program, snapshot).0,
                         &program.rules,
                         program.lists.as_ref(),
@@ -72,7 +132,7 @@ pub fn materialise_within(
                 result => result,
             }
         }
-        None => batch::materialise_grouped_within(
+        None => batch::materialise_grouped_with(
             input,
             &program.rules,
             program.lists.as_ref(),
@@ -98,14 +158,13 @@ pub fn materialise_within(
     // At its exact size: collected by doubling, the list held up to twice the facts, and
     // at a doubling three times, beside them (LUBM 1000: 6.6 GB at this step's peak).
     let mut inferred = Vec::with_capacity(result.derived.len() + axioms.len());
-    inferred.extend(
-        result
-            .derived
-            .into_iter()
-            .chain(axioms)
-            .filter(|&t| storable(t))
-            .map(encode),
-    );
+    for t in result.derived.into_iter().chain(axioms) {
+        if storable(t) {
+            inferred.push(encode(t));
+        } else if let Some(unstorable) = unstorable.as_deref_mut() {
+            unstorable.push(t);
+        }
+    }
     Ok(Closure {
         inferred,
         violations,
@@ -151,14 +210,14 @@ fn by_representatives(
     input: Grouped,
     same_as: u64,
     schema: &Schema,
-    stop: crate::eval::Stop<'_>,
+    stop: &OperationStop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<batch::Materialisation, delta::Interrupted> {
     let listing = match program.store_representatives {
         true => batch::Listing::Stored,
         false => batch::Listing::Expanded,
     };
-    let mut result = batch::materialise_representatives_within(
+    let mut result = batch::materialise_representatives_with(
         batch::Input::Grouped(input),
         &program.rules,
         program.lists.as_ref(),
@@ -193,10 +252,20 @@ pub fn equality_report_until(
     snapshot: &Snapshot,
     stop: crate::eval::Stop<'_>,
 ) -> Result<String, crate::delta::Interrupted> {
-    let before = crate::eval::OperationStop::new(stop);
-    if before.fired() {
-        return Err(before.interrupted());
+    equality_report_with(program, snapshot, &OperationStop::new(stop))
+}
+
+/// [`equality_report_until`] under one operation's `stop`, whose memory limit and room its
+/// caller chose ([`OperationStop::within`]): replication's copies are admitted by its room.
+pub fn equality_report_with(
+    program: &Program,
+    snapshot: &Snapshot,
+    operation: &OperationStop<'_>,
+) -> Result<String, crate::delta::Interrupted> {
+    if operation.fired() {
+        return Err(operation.interrupted());
     }
+    let stop: crate::eval::Stop<'_> = &|| operation.fired();
     let input: Vec<Triple> = asserted_by_predicate(snapshot)
         .into_iter()
         .flat_map(|(p, pairs)| pairs.into_iter().map(move |(o, s)| [s, p, o]))
@@ -212,12 +281,12 @@ pub fn equality_report_until(
     let representative_time = started.elapsed();
     let asserted = input.len();
     let started = Instant::now();
-    let replicated = batch::materialise_owned_until(
+    let replicated = batch::materialise_owned_with(
         input,
         &program.rules,
         program.lists.as_ref(),
         &program.schema,
-        stop,
+        operation,
     )?;
     let replicated_time = started.elapsed();
     let classes = closure.classes.classes().count();

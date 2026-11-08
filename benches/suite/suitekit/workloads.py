@@ -231,8 +231,9 @@ def fast_data_name(spec: str) -> str:
     if spec.startswith("volume:"):
         return spec[len("volume:"):]
     kind, *params = spec.split()
-    # The multi-graph kinds write N-Quads (perf_lab generate geo4, social4, support-stress).
-    suffix = ".nq" if kind in QUAD_KINDS else ".nt"
+    # The multi-graph kinds write N-Quads (perf_lab generate geo4, social4, support-stress),
+    # `turtle` writes Turtle.
+    suffix = ".nq" if kind in QUAD_KINDS else ".ttl" if kind == "turtle" else ".nt"
     return "-".join([kind, *[p.replace("=", "") for p in params]]) + suffix
 
 
