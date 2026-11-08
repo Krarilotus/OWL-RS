@@ -93,10 +93,12 @@ macro_rules! vocabulary {
             pub const IRIS: &'static [(&'static str, &'static str)] =
                 &[$((stringify!($field), concat!(namespace!($ns), $local)),)*];
 
-            /// Looks every term up through `id_of`.
+            /// Looks every term up through `id_of`, by IRIs joined at compile time: no
+            /// allocation per term (orchestrator, 8 Nov 17:28; the QL reader builds one per
+            /// fresh read, the mapping one per read).
             pub fn new(id_of: &dyn Fn(&str) -> Option<u64>) -> Self {
                 Self {
-                    $($field: id_of(&format!("{}{}", $ns, $local)),)*
+                    $($field: id_of(concat!(namespace!($ns), $local)),)*
                 }
             }
 
