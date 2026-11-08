@@ -16,6 +16,7 @@ mod native_differential_tests;
 mod plan_guard_tests;
 mod ql_tests;
 mod resource_tests;
+mod result_cache_admission_tests;
 mod result_cache_tests;
 mod text_search_scope_tests;
 mod text_search_tests;
