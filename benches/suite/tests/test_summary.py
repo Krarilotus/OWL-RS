@@ -300,6 +300,67 @@ class LoadedInputs(unittest.TestCase):
         self.assertNotIn("MORE WORK", text)
         self.assertNotIn("SLOWER", text)
 
+    def known_issue(self, ms, history, frontier_status, frontier_metric=50.0, frontier_peak=1000):
+        """mem-load-20m-2g stopping at its declared memory limit on every repetition (a known issue), its
+        run past the limit as given, its records loading `history.nt` as `history` (an older definition
+        of the case: stage-data r3/r4), beside an unchanged generated-data case (rl-hierarchy)."""
+        records = []
+        for rep in (1, 2):
+            frontier = {"status": frontier_status, "metric": frontier_metric, "peak_mib": frontier_peak,
+                        "checks": [{"path": "loaded", "expected": 20000000, "got": 20000000 if frontier_status == "ok"
+                                    else 0, "ok": frontier_status == "ok"}]}
+            records += [{"case": "mem-load-20m-2g", "rep": rep, "status": "memory-limit",
+                         "expected_outcome": "memory-limit", "inputs": {"history.nt": history}, "metric": None,
+                         "samples": {}, "checks": [], "routes": [], **({"frontier": frontier} if rep == 1 else {})},
+                        {"case": "rl-hierarchy", "rep": rep, "status": "ok", "inputs": {}, "metric": 10.0,
+                         "samples": {"reason.p50_ms": [10.0, 10.0]}, "checks": [], "routes": []}]
+        return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
+                "started": "2026-11-07T16:00:00", "records": records}
+
+    def compare_paths(self, base, new, compact=False):
+        """compare.main over the two reports as files: the full reports, or their compact records whose
+        full report isn't here (load_report()'s fallback)."""
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "fast"))
+        import fast
+        with tempfile.TemporaryDirectory() as d:
+            paths = []
+            for name, report in (("base", base), ("new", new)):
+                if compact:
+                    report = {**{k: v for k, v in report.items() if k != "records"},
+                              "full_report": {"path": str(Path(d) / f"{name}-gone.json"), "host": "elsewhere",
+                                              "bytes": 1, "sha256": "0" * 64},
+                              "records": [fast.compact_record(r) for r in report["records"]]}
+                path = Path(d) / f"{name}.json"
+                path.write_text(json.dumps(report), encoding="utf-8")
+                paths.append(str(path))
+            code = compare.main(paths)
+            return code, output(compare.main, paths)
+
+    def test_an_input_refused_known_issue_s_run_past_its_limit_is_still_judged(self):
+        """Review r1 of pkg/compare-input-status, R1-W1 (8 Nov 2026): the frontier of a known issue
+        (its run past the declared limit) went ok -> wrong over other input bytes, and compare exited 0:
+        the input refusal withheld the frontier's status with its metric and peak. Specified: its status
+        is a finding about the new run whatever the input, 1; only its metric and peak go uncompared."""
+        for compact in (False, True):
+            with self.subTest(compact=compact):
+                code, text = self.compare_paths(self.known_issue(100.0, "a" * 64, "ok"),
+                                                self.known_issue(100.0, "b" * 64, "wrong"), compact)
+                self.assertEqual(code, 1, text)
+                self.assertIn("mem-load-20m-2g", text)
+                self.assertIn("WORSE", text)
+
+    def test_an_input_refused_frontier_s_measures_alone_are_no_finding(self):
+        """The control: the same frontier ok on both sides, its metric and peak far worse over other
+        input bytes, is no regression (no evidence of a code change), and its measures aren't shown."""
+        for compact in (False, True):
+            with self.subTest(compact=compact):
+                code, text = self.compare_paths(
+                    self.known_issue(100.0, "a" * 64, "ok", frontier_metric=50.0, frontier_peak=1000),
+                    self.known_issue(100.0, "b" * 64, "ok", frontier_metric=500.0, frontier_peak=4000), compact)
+                self.assertEqual(code, 0, text)
+                self.assertNotIn("WORSE", text)
+                self.assertNotIn("4000", text)
+
     def test_a_case_s_agreeing_records_compare_and_one_silent_record_doesn_t(self):
         """A case that loads frozen files: every record stating the same bytes on both sides compares;
         one record that doesn't say makes its side unknown (R3-W1's correction: no record's
