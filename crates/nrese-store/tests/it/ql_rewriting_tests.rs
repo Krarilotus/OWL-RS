@@ -1494,6 +1494,8 @@ fn existentials_bounded_restrictions_force_are_answered_or_reported() {
 /// - Sol r1 S1: `C ⊑ ≤ 0 R.¬D` with `R(c, x)`: `x : D`. With `≤ 0 R.¬{a}` and `a : D`:
 ///   `x = a`, so `x : D`.
 /// - Sol r1 S2 (guard below): `C ⊑ = 0 R.{a}` equates nobody, so `Z` stays complete.
+/// - Sol r2 S3 (guard below): `C ⊑ ≤ 0 R.¬∃S.{a}`, which is `∀R.∃S.{a}`, adds an edge to
+///   `a` and equates nobody, so `Z` stays complete.
 ///
 /// Precision guards, each a query whose answers are complete under its regime:
 /// - `x : Person` and `x : Employed` of the third case, terms of the same axiom that no
@@ -1618,6 +1620,14 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
              owl:onClass [ a owl:Class ; owl:oneOf ( :a ) ] ] .
          :c a :C . :z a :Z ."
     );
+    // Sol r2 S3: `≤ 0 R.¬∃S.{a}` is `∀R.∃S.{a}`, an edge to `a`, equating nobody.
+    let edge_to_a = format!(
+        "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+             owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+             owl:onClass [ owl:complementOf [ a owl:Restriction ; owl:onProperty :S ;
+                 owl:someValuesFrom [ a owl:Class ; owl:oneOf ( :a ) ] ] ] ] .
+         :c a :C ; :R :x . :z a :Z ."
+    );
     let guards = [
         (
             &cases[2].0,
@@ -1641,6 +1651,11 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
         ),
         (
             &zero_a,
+            vec![Ruleset::Owl2Ql, Ruleset::Owl2Rl],
+            format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}"),
+        ),
+        (
+            &edge_to_a,
             vec![Ruleset::Owl2Ql, Ruleset::Owl2Rl],
             format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}"),
         ),
