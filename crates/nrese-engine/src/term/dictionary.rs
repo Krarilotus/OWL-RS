@@ -46,6 +46,7 @@ use super::offsets::{Ends, Offsets};
 use super::order::Key;
 use super::pending::{Adopted, NEW, Pending};
 use super::pieces::{BLOCK, Block, Heap, Inner, Segment, View};
+use super::suffix::{PrepareError, Prepared, Suffix};
 use super::vocabulary::{Codec, Sample};
 use super::{TermId, TermKind, inline_to_literal, try_inline_literal};
 use crate::error::{EngineError, EngineResult};
@@ -584,6 +585,25 @@ impl Dictionary {
     #[cfg(test)]
     pub(crate) fn held_view(&self) -> HeldView {
         HeldView(self.view())
+    }
+
+    /// Test support: the entries a prepared install has room promised for.
+    #[cfg(test)]
+    pub(crate) fn promised(&self) -> usize {
+        self.inner.read().promised()
+    }
+
+    /// Test support: whether a rebase on this thread finds no room for a prepared install's
+    /// promise, as an allocator out of it would.
+    #[cfg(test)]
+    pub(crate) fn refuse_promised_room(refuse: bool) {
+        super::pieces::REFUSE_PROMISED_ROOM.with(|cell| cell.set(refuse));
+    }
+
+    /// Test support: the keys in the heap's tail, unsealed.
+    #[cfg(test)]
+    pub(crate) fn tail_len(&self) -> usize {
+        self.inner.read().heap.tail.len()
     }
 
     /// Number of dictionary entries (inline terms are not counted).
@@ -1568,6 +1588,80 @@ impl Dictionary {
         Ok(())
     }
 
+    /// Reserves room for `suffix`'s entries, the next ids, so that installing them after the
+    /// publisher's durable step allocates nothing and can't fail ([`Prepared::install`]).
+    /// Under the writer slot, which `slot` proves: no one else adds entries until the install.
+    /// The room outlives a rebase meanwhile ([`Self::rebase`]). Refused, nothing changed.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "publications prepare with it in package 9 (activation)"
+        )
+    )]
+    pub(crate) fn prepare<'s>(
+        &'s self,
+        slot: &'s super::slot::WriterGuard<'s>,
+        suffix: &'s Suffix,
+    ) -> Result<Prepared<'s>, PrepareError> {
+        let end = suffix.start().checked_add(suffix.len());
+        if end.is_none_or(|end| end > super::pending::PROVISIONAL) {
+            return Err(PrepareError::Full);
+        }
+        // What waiting for a lock allocates on this thread, made now: the install waits for
+        // readers on this thread (`Prepared` can't leave it), after the durable step.
+        super::slot::warm_parking();
+        let mut inner = self.inner.write();
+        if inner.len() != suffix.start() {
+            return Err(PrepareError::Diverged {
+                start: suffix.start(),
+                len: inner.len(),
+            });
+        }
+        let more = usize::try_from(suffix.len()).map_err(|_| PrepareError::NoRoom)?;
+        inner.promise(more).map_err(|_| PrepareError::NoRoom)?;
+        Ok(Prepared {
+            dictionary: self,
+            suffix,
+            installed: false,
+            _slot: slot,
+            _here: std::marker::PhantomData,
+        })
+    }
+
+    /// [`Prepared::install`]: `suffix`'s keys, the next ids, into the room promised.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "publications install with it in package 9 (activation)"
+        )
+    )]
+    pub(super) fn install_suffix(&self, suffix: &Suffix) {
+        let mut inner = self.inner.write();
+        debug_assert_eq!(inner.len(), suffix.start(), "prepared at this length");
+        debug_assert!(inner.promised() as u64 >= suffix.len(), "room promised");
+        inner.install(suffix.keys());
+    }
+
+    /// A prepared install given up (dropped): the room stays as slack.
+    pub(super) fn unpromise(&self) {
+        self.inner.write().unpromise();
+    }
+
+    /// Seals installed keys into blocks (the tail an install leaves unsealed), copying them
+    /// once. Ids and keys stay as they were. Under the writer slot, after the publication.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "publications seal after their install in package 9"
+        )
+    )]
+    pub(crate) fn seal(&self, _slot: &super::slot::WriterGuard<'_>) {
+        self.inner.write().seal();
+    }
+
     /// Serves the entries `0..base.len` from `base`, a checkpoint of them that this engine
     /// has written, instead of from memory or an older checkpoint; later entries stay in
     /// memory. `false` (and nothing changes) if the dictionary already uses a longer base.
@@ -1589,6 +1683,14 @@ impl Dictionary {
         for index in len..inner.len() {
             let key = inner.key(index);
             next.push(&key, key_hash(&key));
+        }
+        // A prepared install's room, reserved in the new state too, past the entries it holds
+        // now, or the rebase gives up and nothing changes: the install allocates nothing
+        // either way ([`Self::prepare`]).
+        if next.keep_promise(&inner).is_err() {
+            return Err(EngineError::Io(std::io::Error::from(
+                std::io::ErrorKind::OutOfMemory,
+            )));
         }
         *inner = next;
         // The in-memory text order covered entries the base orders now.
