@@ -54,12 +54,15 @@ pub enum Hazard {
     /// are complete only for that profile, so named individuals may miss its conclusions
     /// (I24c).
     OutsideProfile(Term),
+    /// An axiom outside the profile, as [`Self::OutsideProfile`], that equates individuals
+    /// and names no term: global, which needs none (master, 8 Nov 13:15).
+    Equating,
 }
 
 impl Hazard {
-    /// The property or class it is about.
-    pub fn term(self) -> Term {
-        match self {
+    /// The property or class it is about; none for [`Self::Equating`].
+    pub fn term(self) -> Option<Term> {
+        Some(match self {
             Self::Transitive(t)
             | Self::Chain(t)
             | Self::Functional(t)
@@ -78,7 +81,8 @@ impl Hazard {
             | Self::Untyped(t)
             | Self::OpenLeft(t)
             | Self::OutsideProfile(t) => t,
-        }
+            Self::Equating => return None,
+        })
     }
 
     /// Whether it can make an anonymous individual equal to another: then any fact may
@@ -92,7 +96,7 @@ impl Hazard {
 
     /// What it is, with `name` writing its term.
     pub fn describe(self, name: &dyn Fn(Term) -> String) -> String {
-        let t = name(self.term());
+        let t = self.term().map(name).unwrap_or_default();
         match self {
             Self::Transitive(_) => format!("{t} is transitive"),
             Self::Chain(_) => format!("{t} is in a property chain"),
@@ -124,6 +128,7 @@ impl Hazard {
             Self::OutsideProfile(_) => {
                 format!("an axiom on {t} outside the profile whose rules the closure applies")
             }
+            Self::Equating => "an axiom outside the profile equates individuals".to_owned(),
         }
     }
 }
@@ -467,10 +472,11 @@ pub(crate) fn hazards(
     // The hazards that can equate individuals, apart: a term may have several hazards,
     // and one of those must not hide behind another.
     let mut equating: HashMap<Term, Hazard> = HashMap::new();
-    for &h in &found {
-        by_term.entry(h.term()).or_insert(h);
+    // (The walk finds hazards on terms; [`Hazard::Equating`] is only ever global.)
+    for (t, h) in found.iter().filter_map(|&h| Some((h.term()?, h))) {
+        by_term.entry(t).or_insert(h);
         if h.equates() {
-            equating.entry(h.term()).or_insert(h);
+            equating.entry(t).or_insert(h);
         }
     }
     // Connected properties (union-find over the links).
@@ -555,13 +561,15 @@ pub(crate) fn hazards(
             None if equality => crate::profile::label(o, axiom),
             None => None,
         };
+        // An equating axiom is global whether or not a term names it: a global hazard
+        // reaches every term (master, 8 Nov 13:15).
+        if equality && outside_global.is_none() {
+            outside_global = Some(name.map_or(Hazard::Equating, Hazard::OutsideProfile));
+        }
         let Some(first) = name else {
             continue;
         };
         let h = Hazard::OutsideProfile(first);
-        if equality && outside_global.is_none() {
-            outside_global = Some(h);
-        }
         outside.extend(concluded.into_iter().map(|t| (t, h, i)));
     }
     // An axiom whose left side any individual may be in meets every anonymous individual,
