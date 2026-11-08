@@ -55,6 +55,9 @@ from suitekit.runtime import end_scope, scope_argv  # noqa: E402
 from suitekit.compare import (KEPT_POINTS, UNSTABLE_PEAK, bootstrap_ratio, client_throughput,  # noqa: E402,F401
                               compare_reports, counter_changes, load_report, peak_spread, pooled,
                               process_peak, series_ratios, spread, statistic, thin)
+# Every record says the generation of its timing units (compare.units_check() normalises or refuses
+# a mix; fix check r2 of pkg/declared-metrics).
+from suitekit.compare import SERIES_UNITS  # noqa: E402
 from suitekit.workloads import fast_data_name  # noqa: E402
 from suitekit import ns  # noqa: E402
 
@@ -1691,6 +1694,7 @@ def run(args) -> int:
                           "checks": [], "routes": [], "samples": {}, "metric": None,
                           "expected_outcome": case.get("outcome", "ok")}
             record["verdict"] = verdict(case, record)
+            record["series_units"] = SERIES_UNITS
             # The case's own time, without the wait for the quiet slot.
             record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
             report["records"].append(record)
@@ -1907,6 +1911,7 @@ def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict],
                           "checks": [], "routes": [], "samples": {}, "metric": None,
                           "expected_outcome": case.get("outcome", "ok")}
             record["verdict"] = verdict(case, record)
+            record["series_units"] = SERIES_UNITS
             record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
             record.update(started_ns=start_ns, finished_ns=time.time_ns(), block=args.block, layout=args.layout,
                           side=name, run=run)
