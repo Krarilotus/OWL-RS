@@ -272,7 +272,8 @@ class Driver(unittest.TestCase):
         suite.manifest.update(images={"img:t": "sha256:B"})
         with patch.object(driver.ns, "pinned", return_value={"img:t": "sha256:A"}):
             self.run_tiers(suite, [Plan("w", "1")], self.system(images=["img:t", "img:u"]))
-        self.assertEqual(self.cells(suite)["w/1/x"]["images"],
+        images = self.cells(suite)["w/1/x"]["images"]  # each with its source since F5 (below)
+        self.assertEqual({i: v["id"] for i, v in images.items()},
                          {"img:t": "sha256:A", "img:u": {"unknown": "not in the run's pin map"}})
 
     def test_a_run_s_answers_go_into_its_finished_attempts_only(self):
@@ -289,8 +290,77 @@ class Driver(unittest.TestCase):
         self.assertEqual(self.cells(suite)["w/1/x"]["answers"], "pending")  # until the run wrote them
         suite.answer_receipts()
         cells = self.cells(suite)
-        self.assertEqual(cells["w/1/x"]["answers"], "wrong")
+        self.assertEqual(cells["w/1/x"]["answers"]["worst"], "wrong")  # its counts since F2 (below)
         self.assertNotIn("answers", cells.get("w/2/x", {}))
+
+    def test_a_cell_s_answers_qualify_only_if_every_query_s_do(self):
+        """P2 design review F2: the receipt kept one worst verdict, and `deviates` ranks above
+        `incomplete` (answers.PRECEDENCE), so a cell with one query never captured read `deviates`.
+        Its verdicts are counted, and it qualifies only when each is ok or deviates."""
+        cases = {"one never captured": (["deviates", "incomplete"], False),
+                 "one only its reference's": (["ok", "reference"], False),
+                 "ok and across datatypes": (["ok", "deviates", "ok"], True)}
+        for name, (verdicts, qualified) in cases.items():
+            with self.subTest(name), patch.object(self, "root", self.root / name.replace(" ", "-")):
+                (self.root / "data").mkdir(parents=True)
+                suite = self.suite(runs=1)
+                suite.answers = Mock(verdicts=Mock(return_value=[
+                    {"workload": "w", "tier": "1", "system": "x", "verdict": v} for v in verdicts]))
+                self.run_tiers(suite, [Plan("w", "1")], self.system())
+                suite.answer_receipts()
+                answers = self.cells(suite)["w/1/x"]["answers"]
+                self.assertIs(answers["qualified"], qualified)
+                self.assertEqual(sum(answers["verdicts"].values()), len(verdicts))
+
+    def test_a_receipt_holds_its_attempt_s_protocol_build_and_measuring_settings(self):
+        """P2 design review F3, F4, F8: the attempt's own protocol (a smoke run isn't the standard
+        cell); the build's CPU, flags and Rust image (an empty settings list proved no defaults); and
+        the settings that change a measurement, not where the run keeps its files."""
+        with patch.dict(driver.os.environ, {"NRESE_TARGET_CPU": "znver3", "RUSTFLAGS": "-C opt-level=2"}):
+            suite = self.suite(runs=1, skip_build=False)
+        suite.manifest.update(settings={"JAVA_HEAP": "8g", "NRESE_BENCH_SCRATCH": "/x", "NRESE_BENCH_KEEP": "1"})
+        nrese = Mock(spec=driver.Nrese, key="nrese", images=Mock(return_value=[]), builds=Mock(return_value=[]),
+                     regimes={"none": ""}, supports=Mock(return_value=None),
+                     source=Mock(return_value=self.root), rust_image=Mock(return_value="rust:1.98.1-bookworm"),
+                     target_volume="v")
+        with patch.dict(driver.os.environ, {"NRESE_TARGET_CPU": "znver3", "RUSTFLAGS": "-C opt-level=2"}), \
+                patch.object(suite, "host_command", return_value=0), patch.object(driver.ns, "docker"), \
+                patch.object(suite.args, "runtime", "docker"):
+            self.assertTrue(suite.build_nrese(nrese))
+        plan = Plan("w", "1")
+        suite.receipts(plan, [("x", nrese)], suite.attempts(plan, [("x", nrese)]))
+        receipt = self.cells(suite)["w/1/x"]
+        self.assertEqual(receipt["protocol"]["runs"], 1)
+        self.assertEqual({k: receipt["build"]["nrese"][k] for k in ("target_cpu", "rustflags_env", "rust_image", "rustflags")},
+                         {"target_cpu": "znver3", "rustflags_env": "-C opt-level=2",
+                          "rust_image": "rust:1.98.1-bookworm", "rustflags": "-C target-cpu=znver3"})
+        self.assertEqual(receipt["settings"], {"JAVA_HEAP": "8g"})
+        self.assertTrue({"RUST_IMAGE", "NRESE_TARGET_CPU", "RUSTFLAGS"} <= set(manifest.SETTINGS))
+
+    def test_an_image_s_receipt_says_where_it_came_from(self):
+        """P2 design review F5: a versioned tag with a known id isn't the image the checkout defines (a
+        cached build of an older context). One built here carries its context's tree id as a label;
+        one present before says it only by that label; a pulled one has no digest pin yet."""
+        suite = self.suite(runs=1)
+        calls = []
+
+        def docker(command, *args, **kwargs):
+            calls.append(command)
+            return 0
+        present = {"built:old": "benches/competitors/jena@0123", "cached:unlabelled": ""}
+        with patch.object(suite.args, "runtime", "docker"), patch.object(suite, "host_command", side_effect=docker), \
+                patch.object(suite.runtime, "image_present", side_effect=lambda image: image in present), \
+                patch.object(driver, "run_quiet", side_effect=lambda command, *a, **k: Mock(
+                    returncode=0, stdout=present.get(command[-1], "") + "\n")), \
+                patch.object(driver, "checkout_state", return_value={"commit": "c" * 40, "dirty": 0}), \
+                patch.object(driver.receipts, "object_ids", return_value={"benches/competitors/jena": "t" * 40}):
+            suite.ensure_images({"built:old": "competitors/jena", "cached:unlabelled": "competitors/jena",
+                                 "built:new": "competitors/jena", "pulled:tag": None})
+        self.assertEqual(suite.image_source["built:old"], "built from benches/competitors/jena@0123")
+        self.assertEqual(set(suite.image_source["cached:unlabelled"]), {"unknown"})
+        self.assertEqual(suite.image_source["built:new"], f"built from benches/competitors/jena@{'t' * 40}")
+        self.assertIn(f"owlrs.built-from=benches/competitors/jena@{'t' * 40}", next(c for c in calls if "build" in c))
+        self.assertIn("digest pin", suite.image_source["pulled:tag"]["unknown"])
 
     def test_what_a_cell_can_t_evidence_is_unknown_never_empty(self):
         """R6: a driver plan's inputs, images, build and settings are its child's; an input outside
