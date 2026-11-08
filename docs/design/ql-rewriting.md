@@ -134,6 +134,15 @@ alternative (or the atom itself) follows from it by what the ruleset materialise
 (subclasses, domains, ranges, sub- and inverse properties, `∃P.⊤ ⊑ A`; intersections on
 the right only under `owl2-rl`, whose list rules apply them).
 
+`owl:Thing` on the left (`⊤ ⊑ A`, `⊤ ⊑ ∃R`, and `≥ 0 R.C`, read as `⊤`) makes every
+individual an instance, and the closure applies it to none (it states no individual to be
+a Thing). An atom `A(t)` with `⊤` below `A`, or a witness folded to `⊤`, then needs only
+`t` to be an individual: true for a constant that is no literal, `FILTER(!isLITERAL(?t))`
+for a variable another atom binds, and nothing for an existential variable nothing else
+has (the domain is never empty: `⊤ ⊑ A` answers `ASK { ?x a :A }` true). An answer
+variable nothing else binds would range over every individual, which a query can't list:
+the atom runs as written and the answer says `sound-only`.
+
 ## 3. Semantics: sets and bags
 
 Certain answers are sets. Inside `DISTINCT`, `REDUCED` and `ASK` the rewritten pattern is
@@ -288,18 +297,27 @@ conservatively:
   in a key, or under `allValuesFrom`, `hasValue`, `hasSelf`, a cardinality restriction or a
   qualified `someValuesFrom` on the left; classes in an intersection, a filler or an
   enumeration on the left; generating axioms whose filler the rewriting reads only in part;
-  individuals asserted to be in an existential restriction;
+  individuals asserted to be in an existential restriction (the schema read includes the
+  `rdf:type` statements whose object is a class expression's blank node), whose anonymous
+  successors count also where the schema has nothing to rewrite, and are in the
+  expression's classes;
 - an anonymous individual's type is *affected* when a property connected to its role (by
   inclusions, inverses, equivalences or chains) or one of its classes has a hazard;
 - the *affected terms* are the properties and classes of affected types, closed upward
   along every axiom (from the terms of its premise to those of its conclusion); a hazard
   that can make individuals equal (functional, keys, cardinality, enumerations) affects
-  every term.
+  every term;
+- an axiom whose left side any individual may be in with none of that side's terms
+  (`⊤ ⊓ ≥ 0 R.⊤`, `B ⊔ ¬B`, `¬⊥`, anything negative or bounded above), unless the TBox
+  reads it whole (`⊤` or `≥ 0 R.C` on the left, a right side without hazard, union,
+  enumeration or complement), meets every anonymous individual: the terms of its right
+  side are affected, an enumeration there affects every term, and an existential there makes
+  anonymous individuals of its own.
 
 **Per query:** `sound-only` when an atom reads an affected term, when a pattern reached a
 bound (§5), when a predicate or class is a variable, or when a pattern the rewriting doesn't
 enter (`SERVICE`, a property path, an aggregate's `EXISTS`) reads a term the rewriting
-would change; otherwise `complete`. Under a negation each of these is `unsound` instead
+would change or an affected term; otherwise `complete`. Under a negation each of these is `unsound` instead
 (§1). Each reason names the term and the hazard.
 
 **Reported** in EXPLAIN (`ql.completeness`, `ql.sound`, `ql.complete`, `ql.reasons`, both

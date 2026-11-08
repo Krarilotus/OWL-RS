@@ -10,7 +10,9 @@ set -euo pipefail
 # This job's names (scripts/lib/ns.sh): its containers and volumes; the shared datasets' volume.
 NS_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 . "$NS_ROOT/scripts/lib/ns.sh"
-DATA_VOLUME=$(ns_shared data)
+# NRESE_DATASET_DIR: an absolute directory instead, bind-mounted as /data: where a timing job makes
+# what its host lacks, aside, checked before it is kept (release_gate.py make_dataset(), 7 Nov 2026).
+DATA_VOLUME=${NRESE_DATASET_DIR:-$(ns_shared data)}
 # Shared datasets are prepared one at a time per host (their staging, the .part and .parts
 # files, and their publication): this script runs again under the host's datasets lock.
 ns_serialize datasets "$0" "$@"

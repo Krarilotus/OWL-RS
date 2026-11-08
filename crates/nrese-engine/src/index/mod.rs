@@ -145,7 +145,7 @@ impl Layout {
 
 /// Keys per part of a group walk over a large range, walked in parallel: a multiple of
 /// the block size.
-const GROUP_PART: usize = 1 << 16;
+pub(crate) const GROUP_PART: usize = 1 << 16;
 const _: () = assert!(GROUP_PART.is_multiple_of(keys::BLOCK));
 
 #[derive(Debug, Clone, Default)]
@@ -229,6 +229,20 @@ impl IndexVersion {
         };
         let run = Run::from_delta(base.layout, inserts, deletes);
         base.with_run(run)
+    }
+
+    /// [`Self::with_delta`] for default-graph `inserts` (which fit either layout, so no stack
+    /// is converted), its run built with [`Run::from_delta_within_parallel`] on `budget`: the
+    /// new version and the reservation of what its run keeps (its list of runs is the
+    /// caller's to charge: [`Self::runs_bytes`]).
+    pub(crate) fn with_delta_within(
+        &self,
+        inserts: &[EncodedQuad],
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<(Self, nrese_exec::Reservation), nrese_exec::BudgetExceeded> {
+        debug_assert!(inserts.iter().all(|q| q.graph == TermId::DEFAULT_GRAPH));
+        Run::from_delta_within_parallel(self.layout, inserts, &[], budget)
+            .map(|(run, held)| (self.with_run(run), held))
     }
 
     /// The same quads in the quad layout: each run's graph-first permutations are its

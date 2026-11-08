@@ -203,11 +203,27 @@ fn check_with_budget(
             evidence: Vec::new(),
         };
     }
+    // The check's memory: the request's envelope, its reading of the ontology included.
+    let memory = operation.memory.clone().unwrap_or_default();
     let ontology = match preparation.ontology.take() {
         Some(ontology) => ontology,
         None => {
             source::intern_vocabulary(tx);
-            source::read_pending(tx)
+            match source::read_pending(tx, memory.clone()) {
+                Ok(ontology) => ontology,
+                // Unknown, never consistent: the check didn't run.
+                Err(_) => {
+                    return Gate {
+                        checked: Checked {
+                            verdict: Verdict::Unknown(source::refused("the commit")),
+                            engine: "none",
+                            elapsed: started.elapsed(),
+                        },
+                        reject: None,
+                        evidence: Vec::new(),
+                    };
+                }
+            }
         }
     };
     let budget = operation.remaining(deadline);
@@ -228,11 +244,11 @@ fn check_with_budget(
             revision,
             consistency,
         }) if revision == before => consistency.verdict == Verdict::Inconsistent,
-        _ => {
-            let ontology = source::read_snapshot(tx.base());
+        // Unread, as undecided: not known to have been inconsistent, so rejected.
+        _ => source::read_snapshot(tx.base(), memory).is_ok_and(|ontology| {
             let checked = consistency::check(&ontology, &operation.remaining(deadline));
             checked.verdict == Verdict::Inconsistent
-        }
+        }),
     };
     if was_inconsistent {
         return Gate {
@@ -358,6 +374,74 @@ mod tests {
         assert_eq!(base.remaining(Deadline::NONE).timeout, None);
     }
 
+    /// A commit's check reads its ontology within the request's envelope (SYN-61): where it
+    /// can't hold the commit's statements (half of them), its verdict is unknown for memory,
+    /// never consistent. The commit touches one small island, so the check itself fits: with
+    /// the reading outside the envelope, the touched-islands check answered consistent there.
+    #[test]
+    fn a_gate_that_cannot_read_the_ontology_is_unknown_never_consistent() {
+        use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+        use std::sync::Arc;
+        let store = Arc::new(StoreService::new(crate::StoreConfig::in_memory()).unwrap());
+        let pipeline = crate::MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Owl2Dl,
+            ))),
+        );
+        let mut data = String::from(
+            "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#> INSERT DATA { \
+             :Person owl:equivalentClass [ owl:unionOf ( :Man :Woman ) ] . \
+             :Man owl:disjointWith :Woman .",
+        );
+        for i in 0..20_000 {
+            data.push_str(&format!(" :f{i} :q :g{i} ."));
+        }
+        data.push('}');
+        // Committed through the pipeline: U1 is at the base, so the next commit's change is the
+        // delta's, which reads no ontology, and the gate reads it.
+        pipeline
+            .apply(
+                crate::MutationCommand::Update(crate::SparqlUpdateRequest::new(data)),
+                &crate::Requester::all(),
+                &crate::MutationTicket::new(),
+            )
+            .unwrap();
+        let mut tx = store.engine().speculative();
+        tx.insert(
+            nrese_rdf::Quad::new(
+                nrese_rdf::NamedNode::new_unchecked("urn:test:ann"),
+                nrese_rdf::vocab::rdf::TYPE,
+                nrese_rdf::NamedNode::new_unchecked("urn:test:Person"),
+                nrese_rdf::GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+        let check = |memory: &nrese_exec::Envelope| {
+            let mut prepared =
+                super::super::bounds::prepare(&store, &tx, nrese_reasoner::eval::NEVER);
+            assert!(!prepared.proves_consistency, "U1 clashes: the gate decides");
+            assert!(prepared.ontology.is_none(), "the gate reads the ontology");
+            let reader = crate::ReadScope::All;
+            check_commit(&store, &tx, &|| false, &mut prepared, &reader, memory).checked
+        };
+        // Guard: with room, the commit is consistent (Ann is a man or a woman).
+        let roomy = check(&nrese_exec::Envelope::unlimited());
+        assert_eq!(roomy.verdict, Verdict::Consistent, "{roomy:?}");
+        let asserted = tx
+            .quads_for_pattern_in(
+                nrese_engine::ReadModel::Asserted,
+                &nrese_engine::QuadPattern::all(),
+            )
+            .count();
+        let limit = asserted * std::mem::size_of::<nrese_owl::Statement>() / 2;
+        let tight = check(&store.envelope(Some(limit)));
+        assert!(
+            matches!(&tight.verdict, Verdict::Unknown(_)),
+            "{limit} bytes for {asserted} statements: {tight:?}"
+        );
+    }
+
     #[test]
     fn bridge_observes_an_already_cancelled_request_before_starting_work() {
         cancellable(&|| true, |cancel| assert!(cancel.is_cancelled()));
@@ -375,7 +459,7 @@ mod tests {
             nrese_rdf::GraphName::DefaultGraph,
         );
         tx.insert(quad.as_ref());
-        let ontology = source::read_pending(&tx);
+        let ontology = source::read_pending(&tx, nrese_exec::Envelope::unlimited()).unwrap();
         for stop in ["deadline", "cancelled", "running"] {
             let cancel = Cancel::default();
             if stop == "cancelled" {

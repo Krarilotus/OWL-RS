@@ -27,6 +27,7 @@
 
 mod bulk;
 pub mod characteristic;
+mod corpora;
 mod equality;
 #[cfg(test)]
 mod lock_tests;
@@ -53,10 +54,12 @@ use crate::quad::{EncodedQuad, EncodedTriple};
 use crate::term::{Dictionary, DictionaryStats, TermId};
 
 pub use bulk::{BulkLoad, BulkMode, Rematerialisation};
+pub use corpora::{CorpusTuning, DEFAULT_READER_CORPUS_BYTES, TextCorpusStats};
 pub use equality::Classes as EqualityClasses;
 pub use replication::{Applied, LogBatch, LogExpectation};
 pub use snapshot::{
-    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot, SnapshotIdentity,
+    Count, HeavyGroups, InferredMask, InferredSubset, ProbeCursor, Seek, Snapshot,
+    SnapshotIdentity, TextScope,
 };
 pub use transaction::{CommitSummary, Transaction};
 
@@ -230,8 +233,37 @@ pub(crate) struct Version {
     /// What its statements are: kept where only their layout changes (compaction, a
     /// checkpoint mapped), new for any other version ([`Content`]).
     pub(crate) content: Content,
+    /// What its asserted statements are ([`AssertedIdentity`]): new wherever the asserted
+    /// stack is built or changed (a commit with asserted changes, a bulk publication,
+    /// recovery and open, a transaction's pending state), kept wherever only the inferred
+    /// stack, the layout or the view changes. No default: each construction chooses, and
+    /// `Engine::build`'s `..version` is the only copy by spread (its version is recovery's
+    /// or the empty one).
+    pub(crate) asserted_content: AssertedIdentity,
     /// What canonical reads of it read, once asked for ([`equality::CanonicalCache`]).
     pub(crate) canonical: equality::CanonicalCache,
+}
+
+/// The identity of a snapshot's asserted statements ([`Snapshot::asserted_identity`]
+/// (crate::Snapshot::asserted_identity)): two snapshots with the same one hold the same
+/// asserted statements, by the same ids. It is shared across the views of one asserted
+/// stack (restricted, inferred-masked, equality and canonical views): a cache keyed by it
+/// must not depend on the view's scope or equality mode. A transaction's pending state has
+/// one of its own. Unique within the process, never persisted: an open or a recovery gives
+/// a new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AssertedIdentity(u64);
+
+impl AssertedIdentity {
+    pub(crate) fn fresh() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// The identity as a number.
+    pub fn raw(self) -> u64 {
+        self.0
+    }
 }
 
 /// The identity of a version's statements: two versions with the same one show the same
@@ -266,6 +298,7 @@ impl Version {
             dictionary_len: 0,
             equality: Default::default(),
             content: Content::fresh(),
+            asserted_content: AssertedIdentity::fresh(),
             canonical: Default::default(),
         }
     }
@@ -295,6 +328,7 @@ impl Version {
             dictionary_len: self.dictionary_len,
             equality: Arc::clone(&self.equality),
             content: self.content,
+            asserted_content: self.asserted_content,
             canonical: Default::default(),
         }
     }
@@ -309,6 +343,7 @@ impl Version {
             equality: Arc::clone(&self.equality),
             // Only compaction replaces a stack this way: the same statements.
             content: self.content,
+            asserted_content: self.asserted_content,
             // A canonical view of the old runs would hold them: made afresh.
             canonical: Default::default(),
         };
@@ -594,6 +629,8 @@ impl Shared {
                     dictionary_len: current.dictionary_len,
                     equality: Arc::clone(&current.equality),
                     content: current.content,
+                    // A checkpoint mapped: the same statements.
+                    asserted_content: current.asserted_content,
                     canonical: Default::default(),
                 }
             });
@@ -932,7 +969,7 @@ impl Engine {
         };
         let shared = Arc::new(Shared {
             dictionary,
-            statistics: Arc::default(),
+            statistics: Arc::new(statistics::Statistics::for_engine()),
             versions: Versions {
                 current: RwLock::new(Arc::new(version)),
                 compaction_slot: Mutex::new(()),
@@ -1004,6 +1041,27 @@ impl Engine {
     /// on use it.
     pub fn set_canonical_view_budget(&self, budget: Arc<nrese_exec::Budget>) {
         *self.inner.shared.views.write() = budget;
+    }
+
+    /// How reader-scoped searches build their corpora from now on ([`CorpusTuning`]; at
+    /// first its defaults). Makes the engine's store of corpora if no reader-scoped search
+    /// did yet.
+    pub fn set_corpus_tuning(&self, tuning: CorpusTuning) {
+        if let Some(store) = self.inner.shared.statistics.corpora.get_or_init() {
+            store.set_tuning(tuning);
+        }
+    }
+
+    /// What the corpora of reader-scoped searches the engine keeps are charged to from now
+    /// on ([`Snapshot::text_search_in`]; at first [`DEFAULT_READER_CORPUS_BYTES`] of their
+    /// own): a store that uses
+    /// reader-scoped search gives them its share. The kept corpora and their lineage are let
+    /// go (searches holding one keep it, charged to the old budget, until they let go).
+    /// Makes the engine's store of corpora if no reader-scoped search did yet.
+    pub fn set_text_corpus_budget(&self, budget: Arc<nrese_exec::Budget>) {
+        if let Some(store) = self.inner.shared.statistics.corpora.get_or_init() {
+            store.set_budget(budget);
+        }
     }
 
     /// What runs the vector graph builds searches start from now on in the background

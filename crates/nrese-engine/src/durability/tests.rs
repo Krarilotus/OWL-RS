@@ -1282,3 +1282,55 @@ fn an_open_syncs_what_it_replayed() {
         );
     }
 }
+
+/// A commit that fails leaves the asserted identity it was to publish
+/// (`Transaction::asserted_identity_after`) unused (P2-C1, DUR's condition 5 of 8 Nov):
+/// a rotation that fails before it changes anything, one whose segment may be placed
+/// (which poisons the log), and a commit on that poisoned log. Expected: neither the
+/// snapshot after the failure, nor the next commit's summary and snapshot, nor the store
+/// reopened has it.
+#[test]
+fn a_failed_commit_never_publishes_its_asserted_identity() {
+    let mut wrong = Vec::new();
+    for (step, point, poisoned_first) in [
+        ("rotation", &fault::FAIL_ROTATE, false),
+        ("segment placed", &fault::FAIL_SEGMENT_PLACED, false),
+        ("poisoned log", &fault::FAIL_SEGMENT_PLACED, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(dir.path(), small_segments()).unwrap();
+        commit(&engine, 1).unwrap();
+        if poisoned_first {
+            point.set(true);
+            assert!(commit(&engine, 2).is_err());
+            point.set(false);
+        }
+        let mut tx = engine.transaction();
+        tx.insert(quad(3).as_ref());
+        let reserved = tx.asserted_identity_after();
+        point.set(!poisoned_first);
+        let failed = tx.commit();
+        point.set(false);
+        if failed.is_ok() {
+            wrong.push(format!("{step}: the commit succeeded"));
+            continue;
+        }
+        let mut seen = vec![("after the failure", engine.snapshot().asserted_identity())];
+        if let Ok(next) = commit(&engine, 4) {
+            seen.push(("the next commit's summary", next.asserted));
+            seen.push((
+                "the next commit's snapshot",
+                engine.snapshot().asserted_identity(),
+            ));
+        }
+        drop(engine);
+        let engine = Engine::open(dir.path(), small_segments()).unwrap();
+        seen.push(("reopened", engine.snapshot().asserted_identity()));
+        wrong.extend(
+            seen.iter()
+                .filter(|(_, identity)| *identity == reserved)
+                .map(|(at, _)| format!("{step}: {at} has the failed commit's identity")),
+        );
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

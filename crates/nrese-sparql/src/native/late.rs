@@ -145,6 +145,7 @@ impl super::Context<'_> {
             reads_refused: self.reads_refused,
             cache: None,
             pin: RefCell::default(),
+            search_scope: self.search_scope,
         };
         child.cache = self.child_cache(&child);
         child

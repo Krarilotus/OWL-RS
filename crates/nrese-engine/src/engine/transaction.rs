@@ -1,5 +1,6 @@
 //! Write transactions: exact deltas over a base snapshot, published atomically on commit.
 
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
 use hashbrown::HashSet;
@@ -24,6 +25,10 @@ pub struct CommitSummary {
     /// Inferred quads added and removed.
     pub inferred_inserted: u64,
     pub inferred_deleted: u64,
+    /// The asserted state after it ([`Snapshot::asserted_identity`](crate::Snapshot::asserted_identity)):
+    /// new where it changed asserted statements, the base's otherwise. A caller that
+    /// keeps state by it learns here what the commit published, never from a later read.
+    pub asserted: super::AssertedIdentity,
 }
 
 /// Pending changes to one stack, kept *exact* against the base snapshot: `inserts` are
@@ -61,6 +66,12 @@ impl Delta {
         (self.inserts.len(), self.deletes.len())
     }
 
+    /// No net change: what a commit publishes no run for, and, for the asserted stack,
+    /// keeps the asserted identity for ([`Transaction::asserted_identity_after`]).
+    fn is_empty(&self) -> bool {
+        self.counts() == (0, 0)
+    }
+
     fn net(&self) -> i64 {
         self.inserts.len() as i64 - self.deletes.len() as i64
     }
@@ -91,6 +102,8 @@ pub struct Transaction<'e> {
     base: Snapshot,
     asserted: Delta,
     inferred: Delta,
+    /// What [`Self::asserted_identity_after`] answered first, which the commit publishes.
+    after: OnceLock<super::AssertedIdentity>,
 }
 
 impl<'e> Transaction<'e> {
@@ -101,7 +114,32 @@ impl<'e> Transaction<'e> {
             _slot: slot,
             asserted: Delta::default(),
             inferred: Delta::default(),
+            after: OnceLock::new(),
         }
+    }
+
+    /// The asserted identity the commit will publish
+    /// ([`CommitSummary::asserted`]): a new one, reserved here, where the pending changes
+    /// change asserted statements, the base's otherwise (an inferred-only change, none, or
+    /// inserts undone by removes). A caller can key state by it before the commit makes
+    /// it visible. The same on every call. It holds only if no asserted change follows the
+    /// call (debug builds check that, and the commit's id against it); a commit that fails
+    /// or never happens leaves the id to no snapshot. Never persisted: a reopen gives new
+    /// ones.
+    pub fn asserted_identity_after(&self) -> super::AssertedIdentity {
+        *self.after.get_or_init(|| match self.asserted.is_empty() {
+            true => self.base.asserted_identity(),
+            false => super::AssertedIdentity::fresh(),
+        })
+    }
+
+    /// Debug builds: no asserted change follows [`Self::asserted_identity_after`].
+    fn assert_unanswered(&self, changed: bool) -> bool {
+        debug_assert!(
+            !changed || self.after.get().is_none(),
+            "an asserted change after asserted_identity_after"
+        );
+        changed
     }
 
     fn delta(&self, stack: Stack) -> &Delta {
@@ -168,8 +206,27 @@ impl<'e> Transaction<'e> {
                 && self.base.stack_contains(Stack::Inferred, quad)
         }));
         let base = self.base.version();
+        let content = super::Content::fresh();
+        if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
+            let changed = [
+                &asserted_inserts,
+                &asserted_deletes,
+                &inferred_inserts,
+                &inferred_deletes,
+            ];
+            corpora.record(
+                base.content,
+                content,
+                changed
+                    .into_iter()
+                    .flatten()
+                    .map(|quad| (quad.subject, quad.predicate, quad.object)),
+            );
+        }
         let version = Version {
-            content: super::Content::fresh(),
+            content,
+            // Pending: its own, even without asserted changes (staged terms).
+            asserted_content: super::AssertedIdentity::fresh(),
             asserted: base
                 .asserted
                 .with_delta(&asserted_inserts, &asserted_deletes),
@@ -211,8 +268,21 @@ impl<'e> Transaction<'e> {
         gone.dedup();
         let asserted_inserts: Vec<EncodedQuad> = self.asserted.inserts.iter().copied().collect();
         let asserted_deletes: Vec<EncodedQuad> = self.asserted.deletes.iter().copied().collect();
+        let content = super::Content::fresh();
+        if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
+            corpora.record(
+                seen.content,
+                content,
+                [&asserted_inserts, &asserted_deletes, &gone]
+                    .into_iter()
+                    .flatten()
+                    .map(|quad| (quad.subject, quad.predicate, quad.object)),
+            );
+        }
         let version = Version {
-            content: super::Content::fresh(),
+            content,
+            // Pending: its own, even without asserted changes (staged terms).
+            asserted_content: super::AssertedIdentity::fresh(),
             asserted: seen
                 .asserted
                 .with_delta(&asserted_inserts, &asserted_deletes),
@@ -405,15 +475,19 @@ impl<'e> Transaction<'e> {
     /// (it becomes explicit).
     pub fn insert_encoded(&mut self, quad: EncodedQuad) -> bool {
         let base = &self.base;
-        self.asserted
-            .insert(quad, || base.stack_contains(Stack::Asserted, &quad))
+        let changed = self
+            .asserted
+            .insert(quad, || base.stack_contains(Stack::Asserted, &quad));
+        self.assert_unanswered(changed)
     }
 
     /// Retracts an asserted quad; inferred quads are unaffected.
     pub fn remove_encoded(&mut self, quad: EncodedQuad) -> bool {
         let base = &self.base;
-        self.asserted
-            .remove(quad, || base.stack_contains(Stack::Asserted, &quad))
+        let changed = self
+            .asserted
+            .remove(quad, || base.stack_contains(Stack::Asserted, &quad));
+        self.assert_unanswered(changed)
     }
 
     /// Retracts every asserted quad matching `pattern` (SPARQL `CLEAR`/`DROP`, GSP
@@ -484,25 +558,42 @@ impl<'e> Transaction<'e> {
         }
         self.take_over_inferred();
         let changes_equality = self.changes_equality();
+        // The id the commit publishes where it changes asserted statements: the one
+        // reserved ([`Self::asserted_identity_after`]), or one chosen when published. Never
+        // the base's: a change after an answer of "unchanged" still gets a new one.
+        let reserved =
+            self.after.get().copied().filter(|&after| {
+                !self.asserted.is_empty() && after != self.base.asserted_identity()
+            });
         let Self {
             engine,
             _slot,
             base,
             asserted,
             inferred,
+            after,
         } = self;
+        let promised = after.into_inner();
         let count = |set: &HashSet<EncodedQuad>| set.len() as u64;
-        let summary = |revision| CommitSummary {
+        let summary = |revision, asserted_identity| CommitSummary {
             revision,
+            asserted: asserted_identity,
             inserted: count(&asserted.inserts),
             deleted: count(&asserted.deletes),
             inferred_inserted: count(&inferred.inserts),
             inferred_deleted: count(&inferred.deletes),
         };
-        if asserted.counts() == (0, 0) && inferred.counts() == (0, 0) {
-            return Ok(summary(base.revision()));
+        let checked = |summary: CommitSummary| {
+            debug_assert!(
+                promised.is_none_or(|promised| promised == summary.asserted),
+                "the commit publishes what asserted_identity_after said"
+            );
+            summary
+        };
+        if asserted.is_empty() && inferred.is_empty() {
+            return Ok(checked(summary(base.revision(), base.asserted_identity())));
         }
-        let summary = summary(base.revision() + 1);
+        let mut summary = summary(base.revision() + 1, base.asserted_identity());
         let shared = &engine.shared;
         let dictionary_len = shared.dictionary.len();
         let dictionary_start = base.dictionary_len();
@@ -525,8 +616,13 @@ impl<'e> Transaction<'e> {
             // Stamped as it goes to the log ([`Inner::publish_record`]).
             committed_micros: None,
         };
-        engine.publish_record(&record, true, dictionary_len, changes_equality)?;
-        Ok(summary)
+        // Kept: the base's (single writer; a merge keeps it).
+        if let Some(new) =
+            engine.publish_record(&record, true, reserved, dictionary_len, changes_equality)?
+        {
+            summary.asserted = new;
+        }
+        Ok(checked(summary))
     }
 }
 
@@ -534,6 +630,10 @@ impl Inner {
     /// Publishes `record` as the next revision, its terms already in the dictionary
     /// (`dictionary_len` of them): logged first in durable mode, then post-commit
     /// maintenance. The caller holds the writer slot: a commit, or a replicated record.
+    /// Returns the published version's new [`AssertedIdentity`](super::AssertedIdentity),
+    /// `None` where it keeps the previous one (no asserted change). A `local` commit may
+    /// bring the new one, `reserved` ([`Transaction::asserted_identity_after`]); otherwise
+    /// it is chosen here.
     ///
     /// A `local` commit is stamped by the store's clock ([`Shared::stamp`]) when its record
     /// goes to the log, its runs built and its layout converted, and the record and the
@@ -543,9 +643,20 @@ impl Inner {
         &self,
         record: &CommitRecord,
         local: bool,
+        reserved: Option<super::AssertedIdentity>,
         dictionary_len: u64,
         changes_equality: bool,
-    ) -> EngineResult<()> {
+    ) -> EngineResult<Option<super::AssertedIdentity>> {
+        // New where the record changes asserted statements; kept for an inferred-only one.
+        // Chosen once, for the durable and the in-memory path alike.
+        let changes_asserted = !record.inserts.is_empty() || !record.deletes.is_empty();
+        debug_assert!(local || reserved.is_none(), "only a local commit reserves");
+        debug_assert!(
+            reserved.is_none() || changes_asserted,
+            "the commit's delta and its record agree on an asserted change"
+        );
+        let asserted_identity =
+            changes_asserted.then(|| reserved.unwrap_or_else(super::AssertedIdentity::fresh));
         let shared = &self.shared;
         // The first quad in a named graph turns a default-graph asserted stack into a quad
         // stack. No merge or mapped checkpoint may replace its runs between the conversion
@@ -575,11 +686,18 @@ impl Inner {
                 .is_none_or(|index| index.layout() == asserted_layout)
         );
         let revision = record.revision;
+        // The contents published from and to, for reader-scoped searches' lineage
+        // ([`super::corpora`]), recorded once the publication's locks are let go.
+        let published = std::cell::Cell::new(None);
+        let published_to = &published;
         let publish = move |current: &Version, committed: Option<u64>| {
             debug_assert_eq!(current.revision + 1, revision, "single writer");
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
+            let content = super::Content::fresh();
+            published_to.set(Some((current.content, content)));
             Version {
-                content: super::Content::fresh(),
+                content,
+                asserted_content: asserted_identity.unwrap_or(current.asserted_content),
                 asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,
@@ -629,9 +747,28 @@ impl Inner {
                 0
             }
         };
+        // What the commit touched, where reader-scoped searches keep corpora: under the
+        // writer slot (steps are recorded in commit order), after the publication's locks.
+        // A search of the new version meanwhile finds no step and walks.
+        if let (Some(corpora), Some((parent, child))) =
+            (shared.statistics.corpora.get(), published.get())
+        {
+            let quads = record.inserts.iter().chain(&record.deletes);
+            let triples = record
+                .inferred_inserts
+                .iter()
+                .chain(&record.inferred_deletes);
+            corpora.record(
+                parent,
+                child,
+                quads
+                    .map(|q| (q.subject, q.predicate, q.object))
+                    .chain(triples.map(|t| (t.subject, t.predicate, t.object))),
+            );
+        }
         // After the commit's own compaction slot (a conversion's): compacting takes it.
         drop(_compaction);
         self.after_commit(wal_bytes);
-        Ok(())
+        Ok(asserted_identity)
     }
 }

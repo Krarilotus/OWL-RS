@@ -13,7 +13,7 @@ use rayon::prelude::*;
 
 use super::{Program, encode, pattern, storable, triple};
 use crate::delta::{self, Base, MemoryBase};
-use crate::eval::GroundProgram;
+use crate::eval::{GroundProgram, OperationStop};
 use crate::ir::{Triple, Violations};
 use crate::lists::ListDiagnostic;
 
@@ -158,6 +158,19 @@ pub fn maintain_within(
     stop: crate::eval::Stop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<Maintenance, delta::Interrupted> {
+    maintain_with(program, ground, tx, &OperationStop::new(stop), memory)
+}
+
+/// [`maintain_within`] as one operation under `operation`, whose memory limit and room its
+/// caller chose ([`OperationStop::within`]): the equality copies are admitted by its room,
+/// and once it fires, every part of the maintenance stops.
+pub fn maintain_with(
+    program: &Program,
+    ground: Option<&GroundProgram>,
+    tx: &mut Transaction<'_>,
+    operation: &OperationStop<'_>,
+    memory: &Arc<Budget>,
+) -> Result<Maintenance, delta::Interrupted> {
     // Axioms the state lacks (a store that never rematerialised): added with this commit.
     let mut missing_axioms: Vec<Triple> = Vec::new();
     // Unnamed classes left out: as the commit leaves them; one it makes consumable
@@ -177,10 +190,10 @@ pub fn maintain_within(
     // Revived memberships must participate in the delta executor's introduced-only
     // consistency checks. Keep the batch result for installation below: no second run.
     let mut rebuilt = if revived {
-        Some(super::materialise_within(
+        Some(super::materialise_with(
             program,
             &tx.pending_snapshot(),
-            stop,
+            operation,
             memory,
         )?)
     } else {
@@ -209,13 +222,13 @@ pub fn maintain_within(
         && tx.base().len_in(ReadModel::Asserted) == 0
         && tx.deleted().next().is_none()
         && tx.inserted().next().is_some()
-        && program.axioms_conclude_only_storable(tx.base(), stop, memory)?;
+        && program.axioms_conclude_only_storable(tx.base(), operation, memory)?;
     let mut unstorable: Vec<Triple> = Vec::new();
     if first_load {
-        rebuilt = Some(super::materialise::materialise_with_unstorable_within(
+        rebuilt = Some(super::materialise::materialise_with_unstorable(
             program,
             &tx.pending_snapshot(),
-            stop,
+            operation,
             memory,
             &mut unstorable,
         )?);
@@ -287,7 +300,7 @@ pub fn maintain_within(
                 .collect();
             delta::Update {
                 violations: delta::introduced_violations(
-                    &base, &inserted, &derived, rules, ground, stop, memory,
+                    &base, &inserted, &derived, rules, ground, operation, memory,
                 )?,
                 insert: derived,
                 policy: delta::policy::Counts {
@@ -297,8 +310,8 @@ pub fn maintain_within(
                 ..Default::default()
             }
         } else {
-            delta::update_within(
-                &base, &inserted, &deleted, rules, ground, stop, policy, memory,
+            delta::update_in(
+                &base, &inserted, &deleted, rules, ground, operation, policy, memory,
             )?
         }
     };
@@ -347,11 +360,11 @@ pub fn maintain_within(
     if rebuild {
         let mut closure = match rebuilt.take() {
             Some(closure) => closure,
-            None => super::materialise_within(program, &tx.pending_snapshot(), stop, memory)?,
+            None => super::materialise_with(program, &tx.pending_snapshot(), operation, memory)?,
         };
         // An interruption drops the transaction, these changes with it.
-        if stop() {
-            return Err(delta::Interrupted::default());
+        if operation.fired() {
+            return Err(operation.interrupted());
         }
         // Only the difference is applied: O(stored + rebuilt closure) to sort and walk,
         // and a transaction update per fact that changed. A stored snapshot shares the old
@@ -400,8 +413,8 @@ pub fn maintain_within(
                 .collect();
         }
         update.program = Some(after);
-        if stop() {
-            return Err(delta::Interrupted::default());
+        if operation.fired() {
+            return Err(operation.interrupted());
         }
     }
     Ok(Maintenance {

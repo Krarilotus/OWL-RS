@@ -299,20 +299,28 @@ pub fn update_within<B: Base + ?Sized>(
     // The process's memory limit stops it too, whatever the caller polls; once stopped it
     // stays stopped, so no morsel skipped is taken for done.
     let stop = super::eval::OperationStop::new(stop);
-    update_body(
-        base,
-        inserted,
-        deleted,
-        rules,
-        cache,
-        &|| stop.fired(),
-        policy,
-        memory,
-    )
-    .map_err(|_| stop.interrupted())
+    update_in(base, inserted, deleted, rules, cache, &stop, policy, memory)
 }
 
-/// [`update_with`]'s work, under the operation's latched `stop`.
+/// [`update_within`] under one operation's `stop`, whose memory limit and room its caller
+/// chose ([`super::eval::OperationStop::within`]): replication's copies are admitted by
+/// its room.
+#[allow(clippy::too_many_arguments)]
+pub fn update_in<B: Base + ?Sized>(
+    base: &B,
+    inserted: &[Triple],
+    deleted: &[Triple],
+    rules: Rules<'_>,
+    cache: Option<&GroundProgram>,
+    stop: &super::eval::OperationStop<'_>,
+    policy: policy::Policy,
+    memory: &Arc<Budget>,
+) -> Result<Update, Interrupted> {
+    update_body(base, inserted, deleted, rules, cache, stop, policy, memory)
+        .map_err(|_| stop.interrupted())
+}
+
+/// [`update_with`]'s work, under the operation's latched stop, `operation`.
 #[allow(clippy::too_many_arguments)]
 fn update_body<B: Base + ?Sized>(
     base: &B,
@@ -320,10 +328,11 @@ fn update_body<B: Base + ?Sized>(
     deleted: &[Triple],
     rules: Rules<'_>,
     cache: Option<&GroundProgram>,
-    stop: Stop<'_>,
+    operation: &super::eval::OperationStop<'_>,
     policy: policy::Policy,
     memory: &Arc<Budget>,
 ) -> Result<Update, Interrupted> {
+    let stop: Stop<'_> = &|| operation.fired();
     let check_stop = || {
         if stop() {
             Err(Interrupted::default())
@@ -637,9 +646,7 @@ fn update_body<B: Base + ?Sized>(
                 // Independent per candidate: in parallel.
                 candidates = candidates
                     .into_par_iter()
-                    .filter(|&f| {
-                        stop() || !old_program.derivable_by(&left, f, &non_recursive, false)
-                    })
+                    .filter(|&f| !old_program.derivable_by(&left, f, &non_recursive, false, stop))
                     .collect();
                 check_stop()?;
             }
@@ -661,6 +668,7 @@ fn update_body<B: Base + ?Sized>(
                     failed: HashSet::new(),
                     active: HashSet::new(),
                     budget: PROOF_BUDGET,
+                    poll: super::eval::Poller::new(stop),
                 };
                 candidates = candidates
                     .into_par_iter()
@@ -745,7 +753,7 @@ fn update_body<B: Base + ?Sized>(
             let by_rules: Vec<Triple> = open
                 .par_iter()
                 .copied()
-                .filter(|&f| !stop() && program.derivable_by(&remaining, f, &not_equality, true))
+                .filter(|&f| program.derivable_by(&remaining, f, &not_equality, true, stop))
                 .collect();
             let by_rules: HashSet<Triple> = by_rules.into_iter().collect();
             check_stop()?;
@@ -811,9 +819,8 @@ fn update_body<B: Base + ?Sized>(
         .par_iter()
         .copied()
         .filter(|&fact| {
-            !stop()
-                && !base.is_asserted(fact)
-                && settled.derivable_with(&remaining, fact, !recloses.contains(&fact[1]))
+            !base.is_asserted(fact)
+                && settled.derivable_with(&remaining, fact, !recloses.contains(&fact[1]), stop)
         })
         .collect();
     rederived.extend(others);
@@ -879,7 +886,7 @@ fn update_body<B: Base + ?Sized>(
         candidates.extend(run_jobs(&state, &jobs, &|fact| !state.contains(fact), stop));
         check_stop()?;
         if let Some(equality) = &mut equality {
-            candidates.extend(equality.run(&state));
+            candidates.extend(equality.run(&state, operation)?);
         }
         drop(jobs);
         // Transitive properties: newly declared ones closed in full (SCC condensation), the
@@ -997,27 +1004,27 @@ fn update_body<B: Base + ?Sized>(
 /// derived the new facts in bulk (a first load, [`crate::engine::maintain`]): the same
 /// report, through the new facts only, with the ground program extended by the instances of
 /// new schema and list facts as phase 3 extends it; charged to `memory` as the delta's own
-/// is ([`update_within`]), and stopped by `stop` or the process's memory limit as it is.
+/// is ([`update_within`]), and stopped as the operation it is part of is (`operation`: its
+/// latch and its cause, shared with the rest of the maintenance, [`update_in`]).
 pub fn introduced_violations<B: Base + ?Sized>(
     base: &B,
     inserted: &[Triple],
     derived: &[Triple],
     rules: Rules<'_>,
     cache: Option<&GroundProgram>,
-    stop: Stop<'_>,
+    operation: &super::eval::OperationStop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<Violations, Interrupted> {
-    let stop = super::eval::OperationStop::new(stop);
     introduced_violations_body(
         base,
         inserted,
         derived,
         rules,
         cache,
-        &|| stop.fired(),
+        &|| operation.fired(),
         memory,
     )
-    .map_err(|_| stop.interrupted())
+    .map_err(|_| operation.interrupted())
 }
 
 fn introduced_violations_body<B: Base + ?Sized>(
@@ -1169,13 +1176,17 @@ impl<S: Source + ?Sized> Source for Outside<'_, S> {
 /// support), and a failure is memoised only if no cycle was cut beneath it. The search
 /// has a node budget: when it runs out the fact counts as unproved, which only costs
 /// overdeletion that the rederive phase repairs.
-struct Prover<'a, B: Base + ?Sized> {
+struct Prover<'a, 'p, B: Base + ?Sized> {
     base: &'a B,
     program: &'a GroundProgram,
     proved: HashSet<Triple>,
     failed: HashSet<Triple>,
     active: HashSet<Triple>,
     budget: usize,
+    /// The update's stop, one poller per parallel task: each alternative, producer, search
+    /// and scanned fact of a proof is attempted work (sol sweep M09). `None`: stopped before
+    /// the task began.
+    poll: Option<super::eval::Poller<'p>>,
 }
 
 /// Proof steps a prover takes at most before it gives up (the candidate is then overdeleted
@@ -1186,7 +1197,7 @@ const PROOF_BUDGET: usize = 10_000;
 const PROOF_BRANCHES: usize = 32;
 const PROOF_DEPTH: usize = 64;
 
-impl<B: Base + ?Sized> Prover<'_, B> {
+impl<B: Base + ?Sized> Prover<'_, '_, B> {
     /// Whether `fact` is provable over `state` without the facts in `gone`; the second
     /// value says whether a cycle (or the budget) cut the search.
     fn prove<S: Source + ?Sized>(
@@ -1215,10 +1226,16 @@ impl<B: Base + ?Sized> Prover<'_, B> {
         if self.active.contains(&fact) || self.budget == 0 || depth > PROOF_DEPTH {
             return (false, true);
         }
+        let program = self.program;
+        let Some(poll) = self.poll.as_mut() else {
+            return (false, true);
+        };
+        let bodies = program.derivation_bodies(state, fact, PROOF_BRANCHES, poll);
+        // Stopped: the bodies are incomplete, so a failure here decides nothing (not kept).
+        let mut cut = poll.stopped();
         self.budget -= 1;
         self.active.insert(fact);
-        let mut cut = false;
-        for body in self.program.derivation_bodies(state, fact, PROOF_BRANCHES) {
+        for body in bodies {
             if body.iter().any(|&g| gone.contains(g)) {
                 continue;
             }
