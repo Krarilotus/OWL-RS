@@ -65,7 +65,8 @@
 //!   writes the store's statements, inferred ones included, as N-Triples (the closure the
 //!   stores without reasoning load). `--canonicalize` canonicalises blank nodes.
 //!   `--parse-turtle FILE` parses a Turtle file `--runs` times on one thread, nothing stored
-//!   (the Turtle parser alone).
+//!   (the Turtle parser alone); `--split-turtle PARTS:FILE` cuts it into up to PARTS chunks
+//!   as bulk load does, nothing parsed (the skim alone).
 //!   `--prepare-vector-graph 64:cosine` synchronously prepares that vector space before
 //!   query timing, recording its preparation phase and checking full graph coverage.
 //!   `--replication COMMITS:QUADS` times read replicas' log shipping: COMMITS commits of
@@ -276,6 +277,7 @@ struct Args {
     parse_only: bool,
     kernel: Option<String>,
     parse_turtle: Option<PathBuf>,
+    split_turtle: Option<(usize, PathBuf)>,
     replication: Option<String>,
     replication_probe: bool,
     classify: bool,
@@ -325,6 +327,7 @@ fn parse_args() -> Result<Args, String> {
         parse_only: false,
         kernel: None,
         parse_turtle: None,
+        split_turtle: None,
         replication: None,
         replication_probe: false,
         classify: false,
@@ -413,6 +416,16 @@ fn parse_args() -> Result<Args, String> {
             "--parse-only" => args.parse_only = true,
             "--kernel" => args.kernel = Some(value()?),
             "--parse-turtle" => args.parse_turtle = Some(value()?.into()),
+            "--split-turtle" => {
+                let spec = value()?;
+                let (parts, file) = spec
+                    .split_once(':')
+                    .ok_or("--split-turtle takes PARTS:FILE")?;
+                let parts = parts
+                    .parse()
+                    .map_err(|e| format!("--split-turtle parts: {e}"))?;
+                args.split_turtle = Some((parts, file.into()));
+            }
             "--replication" => args.replication = Some(value()?),
             "--replication-probe" => match value()?.as_str() {
                 "swap-one" => args.replication_probe = true,
@@ -1110,6 +1123,13 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         report
             .sections
             .push(("parse_turtle", modes::parse_turtle(file, args.runs)?));
+        return Ok(());
+    }
+    if let Some((parts, file)) = &args.split_turtle {
+        report.sections.push((
+            "split_turtle",
+            modes::split_turtle(file, *parts, args.runs)?,
+        ));
         return Ok(());
     }
     if let Some(spec) = &args.replication {
