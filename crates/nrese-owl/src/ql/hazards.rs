@@ -537,6 +537,9 @@ pub(crate) fn hazards(
     // Axioms outside the closure's profile that no other hazard covers (I24c, design note
     // "Source 3"): seeded after the walk below, along their own edges.
     let mut outside: Vec<(Term, Hazard, usize)> = Vec::new();
+    // An uncovered axiom that equates named individuals: global, unless another hazard
+    // already is (that one's reason is the more specific).
+    let mut outside_global: Option<Hazard> = None;
     for (i, axiom) in o.axioms.iter().enumerate() {
         // Read whole, the rewriting answers it; in the closure's profile, its rules do.
         if !read.partial.contains(&i) || crate::profile::covered(o, axiom, rl) {
@@ -544,18 +547,19 @@ pub(crate) fn hazards(
         }
         let concluded = crate::profile::concluded_terms(o, axiom, rl);
         let equality = crate::profile::concludes_equality(o, axiom);
-        // A conclusion that equates may name no term of its own (`∀R.{a}`): its hazard is
-        // global, named by the axiom's properties.
-        let named = match concluded.is_empty() && equality {
-            true => crate::profile::properties(o, axiom),
-            false => concluded.clone(),
+        // A conclusion that equates may name no term of its own (`∀R.{a}`, `C ⊑ {a}`): its
+        // hazard is global, named by any term of the axiom (review r1, F1).
+        let name = match concluded.first() {
+            Some(&t) => Some(t),
+            None if equality => crate::profile::label(o, axiom),
+            None => None,
         };
-        let Some(&first) = named.first() else {
+        let Some(first) = name else {
             continue;
         };
         let h = Hazard::OutsideProfile(first);
-        if equality && global.is_none() {
-            global = Some(h);
+        if equality && outside_global.is_none() {
+            outside_global = Some(h);
         }
         outside.extend(concluded.into_iter().map(|t| (t, h, i)));
     }
@@ -607,6 +611,9 @@ pub(crate) fn hazards(
     // An enumeration such an axiom concludes can make every individual one.
     if anonymous && global.is_none() {
         global = open_individual.map(Hazard::OpenLeft);
+    }
+    if global.is_none() {
+        global = outside_global;
     }
     // What named individuals may miss of uncovered axioms' conclusions, along every axiom
     // from premise to conclusion (design note "Source 3"). A seed doesn't follow its own
@@ -660,29 +667,36 @@ pub(crate) fn hazards(
 /// own, property inclusions, inverses and equivalences as they link. Assertions have
 /// none.
 fn directed_edges(o: &Ontology, axiom: &Axiom) -> Vec<(Vec<Term>, Vec<Term>)> {
+    // Premises by every term they read; conclusions by the terms they can add positive
+    // facts on (`profile::positive_terms`, review r1, F3: `∀R.D` adds none on `R`).
     let t = |e: ExprId| {
         let mut out = Vec::new();
         terms(o, e, &mut out);
         out
     };
+    let c = |e: ExprId, positive: bool| {
+        let mut out = Vec::new();
+        crate::profile::positive_terms(o, e, positive, &mut out);
+        out
+    };
+    let pairs = |v: &[ExprId], positive: bool| -> Vec<(Vec<Term>, Vec<Term>)> {
+        v.iter()
+            .flat_map(|&a| v.iter().filter(move |&&b| b != a).map(move |&b| (a, b)))
+            .map(|(a, b)| (t(a), c(b, positive)))
+            .collect()
+    };
     match axiom {
-        Axiom::SubClassOf(l, r) => vec![(t(*l), t(*r))],
-        Axiom::EquivalentClasses(v) => v
-            .iter()
-            .flat_map(|&a| {
-                v.iter()
-                    .filter(move |&&b| b != a)
-                    .map(move |&b| (t(a), t(b)))
-            })
-            .collect(),
+        Axiom::SubClassOf(l, r) => vec![(t(*l), c(*r, true))],
+        Axiom::EquivalentClasses(v) => pairs(v, true),
+        Axiom::DisjointClasses(v) => pairs(v, false),
         Axiom::DisjointUnion(class, parts) => parts
             .iter()
-            .flat_map(|&p| [(t(p), vec![*class]), (vec![*class], t(p))])
+            .flat_map(|&p| [(t(p), vec![*class]), (vec![*class], c(p, true))])
             .collect(),
-        Axiom::ObjectPropertyDomain(p, c) | Axiom::ObjectPropertyRange(p, c) => {
-            vec![(vec![p.named()], t(*c))]
+        Axiom::ObjectPropertyDomain(p, e) | Axiom::ObjectPropertyRange(p, e) => {
+            vec![(vec![p.named()], c(*e, true))]
         }
-        Axiom::DataPropertyDomain(p, c) => vec![(vec![*p], t(*c))],
+        Axiom::DataPropertyDomain(p, e) => vec![(vec![*p], c(*e, true))],
         Axiom::SubObjectPropertyOf(chain, sup) => {
             vec![(chain.iter().map(|p| p.named()).collect(), vec![sup.named()])]
         }

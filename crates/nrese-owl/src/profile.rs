@@ -476,38 +476,10 @@ fn super_covered(o: &Ontology, e: ExprId, rl: bool) -> bool {
             // `∀R.F` concludes `F` of the successors: what the closure's `cls-avf` gives,
             // where RL has it.
             ClassExpr::All(_, f) => rl && super_covered(o, *f, rl),
-            // `= 0 R.F` is `≤ 0 R.F`.
-            ClassExpr::Exact(0, _, f) => {
-                rl && (matches!(o.class(*f), ClassExpr::Thing) || rl_sub(o, *f))
-            }
-            ClassExpr::Not(inner) => negation_covered(o, *inner, rl),
-            _ => false,
-        }
-}
-
-/// Whether `¬inner` is covered as a superclass expression, read in negation normal form:
-/// a complement the profile's grammar allows as written, or one that normal form makes
-/// covered. `¬¬F` is `F`, `¬∀R.F` is `∃R.¬F` and `¬≤ n` is `≥ n+1` (existentials),
-/// `¬≥ n R.F` is `≤ n−1 R.F`, `¬∃R.F` is `∀R.¬F`, and `¬(A ⊔ B)` is `¬A ⊓ ¬B`.
-fn negation_covered(o: &Ontology, inner: ExprId, rl: bool) -> bool {
-    let inner = unwrap(o, inner);
-    let as_written = match rl {
-        true => rl_sub(o, inner),
-        false => ql_sub(o, inner),
-    };
-    as_written
-        || match o.class(inner) {
-            ClassExpr::Not(e) => super_covered(o, *e, rl),
-            ClassExpr::All(..)
-            | ClassExpr::Max(..)
-            | ClassExpr::DataAll(..)
-            | ClassExpr::DataMax(..) => true,
-            ClassExpr::Min(0, ..) | ClassExpr::Thing => true,
-            ClassExpr::Min(n, _, f) => {
-                rl && *n <= 2 && (matches!(o.class(*f), ClassExpr::Thing) || rl_sub(o, *f))
-            }
-            ClassExpr::Some(_, f) => rl && negation_covered(o, *f, rl),
-            ClassExpr::Or(es) => es.iter().all(|&e| negation_covered(o, e, rl)),
+            // Nothing else: a form the grammar doesn't admit as written is answered by
+            // neither the TBox nor the rules, which see it as written (review r1, F2:
+            // `¬¬D`, `¬≥ 2 R`). What it may conclude decides whether it matters
+            // ([`concluded_terms`], [`concludes_equality`]).
             _ => false,
         }
 }
@@ -546,24 +518,24 @@ pub fn covered(o: &Ontology, axiom: &Axiom, rl: bool) -> bool {
     }
 }
 
-/// The terms an axiom concludes, where it isn't [`covered`]: what an answer that misses
-/// its conclusions reads. They are the right side of a subclass axiom, the class or the
-/// property of a domain or range, a characteristic's property, a chain's result, and
-/// every term of the other axioms.
+/// The terms an axiom concludes, where it isn't [`covered`]: those it can add positive
+/// facts on ([`positive_terms`]). They come from the right side of a subclass axiom, each
+/// uncovered direction of an equivalence, the class of a domain or range, every part of a
+/// disjointness (negated), a disjoint union's class and parts, and a characteristic's or
+/// chain's property.
 pub fn concluded_terms(o: &Ontology, axiom: &Axiom, rl: bool) -> Vec<Term> {
     let mut out = Vec::new();
-    let mut exprs: Vec<ExprId> = Vec::new();
     let sub = |e: ExprId| match rl {
         true => rl_sub(o, e),
         false => ql_sub(o, e),
     };
     match axiom {
-        Axiom::SubClassOf(_, b) => exprs.push(*b),
+        Axiom::SubClassOf(_, b) => positive_terms(o, *b, true, &mut out),
         Axiom::EquivalentClasses(v) => {
             for &a in v {
                 for &b in v.iter().filter(|&&b| b != a) {
                     if !(sub(a) && super_covered(o, b, rl)) {
-                        exprs.push(b);
+                        positive_terms(o, b, true, &mut out);
                     }
                 }
             }
@@ -571,78 +543,138 @@ pub fn concluded_terms(o: &Ontology, axiom: &Axiom, rl: bool) -> Vec<Term> {
         Axiom::ObjectPropertyDomain(_, c)
         | Axiom::ObjectPropertyRange(_, c)
         | Axiom::DataPropertyDomain(_, c)
-        | Axiom::ClassAssertion(c, _) => exprs.push(*c),
+        | Axiom::ClassAssertion(c, _) => positive_terms(o, *c, true, &mut out),
         Axiom::ObjectCharacteristic(_, p) => out.push(p.named()),
         Axiom::SubObjectPropertyOf(_, q) => out.push(q.named()),
-        Axiom::DisjointUnion(c, v) => {
-            out.push(*c);
-            exprs.extend(v);
-        }
-        _ => {
-            out.extend(properties(o, axiom));
-            match axiom {
-                Axiom::DisjointClasses(v) => exprs.extend(v),
-                Axiom::HasKey(c, ..) => exprs.push(*c),
-                _ => {}
+        Axiom::DisjointClasses(v) => {
+            for &e in v {
+                positive_terms(o, e, false, &mut out);
             }
         }
-    }
-    for e in exprs {
-        class_terms(o, e, &mut out);
+        Axiom::DisjointUnion(c, v) => {
+            out.push(*c);
+            for &e in v {
+                positive_terms(o, e, true, &mut out);
+                positive_terms(o, e, false, &mut out);
+            }
+        }
+        _ => out.extend(properties(o, axiom)),
     }
     out.sort_unstable();
     out.dedup();
     out
 }
 
-/// The named classes and properties a concluded expression can add facts on: a
-/// universal's filler but not its property, which it adds no edge of.
-fn class_terms(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
-    match o.class(e) {
-        ClassExpr::Class(c) => out.push(*c),
-        ClassExpr::And(es) | ClassExpr::Or(es) => {
+/// The named classes and properties on which concluding `e` (`positive`), or its
+/// complement, can add a positive fact. It is read in negation normal form, so a
+/// complement flips the polarity, as the hazards' reading of existentials does:
+/// - `∀R.F` adds facts on `F` only, never an `R` edge (review r1, F3); `¬∀R.F` adds an
+///   `R` edge.
+/// - `¬∃R.F` adds no `R` edge, only the negation of `F`.
+/// - `≤ n` adds none; `¬≤ n` is `≥ n+1`, which adds `R` and its filler.
+/// - A class adds a membership positively only.
+///
+/// Equality is [`concludes_equality`]'s.
+pub(crate) fn positive_terms(o: &Ontology, e: ExprId, positive: bool, out: &mut Vec<Term>) {
+    match (o.class(e), positive) {
+        (ClassExpr::Class(c), true) => out.push(*c),
+        (ClassExpr::And(es) | ClassExpr::Or(es), p) => {
             for &e in es {
-                class_terms(o, e, out);
+                positive_terms(o, e, p, out);
             }
         }
-        ClassExpr::Not(e) => class_terms(o, *e, out),
-        ClassExpr::All(_, f) => class_terms(o, *f, out),
-        ClassExpr::Some(p, f)
-        | ClassExpr::Min(_, p, f)
-        | ClassExpr::Max(_, p, f)
-        | ClassExpr::Exact(_, p, f) => {
-            out.push(p.named());
-            class_terms(o, *f, out);
+        (ClassExpr::Not(e), p) => positive_terms(o, *e, !p, out),
+        (ClassExpr::Some(r, f), true) | (ClassExpr::All(r, f), false) => {
+            out.push(r.named());
+            positive_terms(o, *f, positive, out);
         }
-        _ => expr_properties(o, e, out),
+        (ClassExpr::Some(_, f), false) | (ClassExpr::All(_, f), true) => {
+            positive_terms(o, *f, positive, out)
+        }
+        (ClassExpr::Min(n, r, f) | ClassExpr::Exact(n, r, f), true) if *n >= 1 => {
+            out.push(r.named());
+            positive_terms(o, *f, true, out);
+        }
+        (ClassExpr::Max(_, r, f) | ClassExpr::Exact(_, r, f), false) => {
+            out.push(r.named());
+            positive_terms(o, *f, true, out);
+        }
+        (ClassExpr::HasValue(r, _) | ClassExpr::HasSelf(r), true) => out.push(r.named()),
+        (ClassExpr::DataSome(d, _) | ClassExpr::DataHasValue(d, _), true)
+        | (ClassExpr::DataAll(d, _) | ClassExpr::DataMax(_, d, _), false) => out.push(*d),
+        (ClassExpr::DataMin(n, d, _) | ClassExpr::DataExact(n, d, _), true) if *n >= 1 => {
+            out.push(*d)
+        }
+        (ClassExpr::DataExact(_, d, _), false) => out.push(*d),
+        _ => {}
     }
 }
 
-/// Whether an uncovered axiom's conclusion can make named individuals equal: an
-/// enumeration (`∀R.{a}` makes every `R`-successor `a`), or a maximum of one or more
-/// (`≤ 1 R` merges successors). Then any fact may follow, and its hazard reaches every term.
-pub fn concludes_equality(o: &Ontology, axiom: &Axiom) -> bool {
-    fn equates(o: &Ontology, e: ExprId) -> bool {
+/// A term to name an axiom's hazard by: a property, else a class or an individual of its
+/// expressions (review r1, F1: `C ⊑ {a}` names no property).
+pub(crate) fn label(o: &Ontology, axiom: &Axiom) -> Option<Term> {
+    fn any(o: &Ontology, e: ExprId) -> Option<Term> {
         match o.class(e) {
-            ClassExpr::OneOf(_) => true,
-            ClassExpr::Max(n, _, f) | ClassExpr::Exact(n, _, f) => *n >= 1 || equates(o, *f),
-            ClassExpr::And(es) | ClassExpr::Or(es) => es.iter().any(|&e| equates(o, e)),
-            ClassExpr::Not(e) => equates(o, *e),
-            ClassExpr::All(_, f) | ClassExpr::Some(_, f) | ClassExpr::Min(_, _, f) => {
-                equates(o, *f)
+            ClassExpr::Class(c) => Some(*c),
+            ClassExpr::OneOf(xs) => xs.first().copied(),
+            ClassExpr::And(es) | ClassExpr::Or(es) => es.iter().find_map(|&e| any(o, e)),
+            ClassExpr::Not(e) => any(o, *e),
+            _ => None,
+        }
+    }
+    let exprs: Vec<ExprId> = match axiom {
+        Axiom::SubClassOf(a, b) => vec![*a, *b],
+        Axiom::EquivalentClasses(v) | Axiom::DisjointClasses(v) => v.clone(),
+        Axiom::DisjointUnion(c, _) => return Some(*c),
+        Axiom::ObjectPropertyDomain(_, c)
+        | Axiom::ObjectPropertyRange(_, c)
+        | Axiom::DataPropertyDomain(_, c)
+        | Axiom::ClassAssertion(c, _) => vec![*c],
+        _ => Vec::new(),
+    };
+    properties(o, axiom)
+        .first()
+        .copied()
+        .or_else(|| exprs.iter().find_map(|&e| any(o, e)))
+}
+
+/// Whether an uncovered axiom's conclusion can make named individuals equal, read in
+/// negation normal form with its polarity (review r1, F4):
+/// - Equating: a positive enumeration (`∀R.{a}` makes every `R`-successor `a`); a
+///   maximum of one or more (`≤ 1 R` merges successors), also as `¬≥ 2 R`; an exact
+///   count of one or more.
+/// - Not equating: `¬{a}`, which only separates individuals.
+///
+/// Then any fact may follow, and its hazard reaches every term.
+pub fn concludes_equality(o: &Ontology, axiom: &Axiom) -> bool {
+    fn equates(o: &Ontology, e: ExprId, positive: bool) -> bool {
+        match (o.class(e), positive) {
+            (ClassExpr::OneOf(_), true) => true,
+            (ClassExpr::And(es) | ClassExpr::Or(es), p) => es.iter().any(|&e| equates(o, e, p)),
+            (ClassExpr::Not(e), p) => equates(o, *e, !p),
+            // `≤ n`, positive or as `¬≥ n+1`.
+            (ClassExpr::Max(n, ..), true) => *n >= 1,
+            (ClassExpr::Min(n, ..), false) => *n >= 2,
+            (ClassExpr::Exact(n, _, f), true) => *n >= 1 || equates(o, *f, true),
+            (ClassExpr::Exact(n, _, f), false) => *n >= 2 || equates(o, *f, true),
+            (ClassExpr::Max(_, _, f), false) | (ClassExpr::Min(_, _, f), true) => {
+                equates(o, *f, true)
             }
+            (ClassExpr::Some(_, f) | ClassExpr::All(_, f), p) => equates(o, *f, p),
             _ => false,
         }
     }
     match axiom {
-        Axiom::SubClassOf(_, b) => equates(o, *b),
-        Axiom::EquivalentClasses(v) | Axiom::DisjointClasses(v) | Axiom::DisjointUnion(_, v) => {
-            v.iter().any(|&e| equates(o, e))
-        }
+        Axiom::SubClassOf(_, b) => equates(o, *b, true),
+        Axiom::EquivalentClasses(v) => v.iter().any(|&e| equates(o, e, true)),
+        Axiom::DisjointClasses(v) => v.iter().any(|&e| equates(o, e, false)),
+        Axiom::DisjointUnion(_, v) => v
+            .iter()
+            .any(|&e| equates(o, e, true) || equates(o, e, false)),
         Axiom::ObjectPropertyDomain(_, c)
         | Axiom::ObjectPropertyRange(_, c)
         | Axiom::DataPropertyDomain(_, c)
-        | Axiom::ClassAssertion(c, _) => equates(o, *c),
+        | Axiom::ClassAssertion(c, _) => equates(o, *c, true),
         Axiom::ObjectCharacteristic(
             Characteristic::Functional | Characteristic::InverseFunctional,
             _,
