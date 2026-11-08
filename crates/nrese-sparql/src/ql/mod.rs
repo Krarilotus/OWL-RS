@@ -765,8 +765,10 @@ fn read_core(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
 
 /// The class expressions `core` makes ([`read_core`]): blank subjects of a restriction's
 /// or a set operator's property, sorted. Read from the core, never from data: an entry
-/// whose core is unchanged keeps its list.
+/// whose core is unchanged keeps its list. `core` is sorted, so each subject's statements
+/// are adjacent, and each subject is taken once, in order.
 fn expressions_of(snapshot: &Snapshot, core: &[nrese_owl::Statement]) -> Vec<u64> {
+    debug_assert!(core.is_sorted());
     // The mapping's own markers, those it can't read included (an n-ary or a malformed
     // restriction), so the memberships of every node it would read as a class expression
     // reach it, and it reports what it can't read (I24c-2 review r1, F2; r2, F5).
@@ -775,18 +777,18 @@ fn expressions_of(snapshot: &Snapshot, core: &[nrese_owl::Statement]) -> Vec<u64
     let operators = markers.properties();
     let types: Vec<u64> = markers.types.into_iter().flatten().collect();
     let rdf_type = id_of(const { nrese_owl::Vocabulary::iri("rdf_type") });
-    let mut out: Vec<u64> = core
-        .iter()
-        .filter(|s| {
-            operators.contains(&s.triple[1])
-                || (Some(s.triple[1]) == rdf_type && types.contains(&s.triple[2]))
+    // A restriction has both a marker type and a marker property: matched statement by
+    // statement, each was found twice, then sorted and deduplicated (i24c2-attrib3-da692156).
+    core.chunk_by(|a, b| a.triple[0] == b.triple[0])
+        .filter(|of| {
+            TermId::from_raw(of[0].triple[0]).kind() == nrese_engine::TermKind::BlankNode
+                && of.iter().any(|s| {
+                    operators.contains(&s.triple[1])
+                        || (Some(s.triple[1]) == rdf_type && types.contains(&s.triple[2]))
+                })
         })
-        .map(|s| s.triple[0])
-        .filter(|&node| TermId::from_raw(node).kind() == nrese_engine::TermKind::BlankNode)
-        .collect();
-    out.sort_unstable();
-    out.dedup();
-    out
+        .map(|of| of[0].triple[0])
+        .collect()
 }
 
 /// The membership the schema reads of class expression `node` (design §7: individuals
