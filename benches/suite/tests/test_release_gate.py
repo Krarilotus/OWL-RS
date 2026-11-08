@@ -699,6 +699,37 @@ class MainAdapter(unittest.TestCase):
             self.assertEqual(fast.changed_inputs(files), [data.as_posix()])
 
 
+class DeclaredMetric(unittest.TestCase):
+    """The orchestrator, 7 Nov 2026 (18:05): C1's A-B-B-A abba-run-2102481f-fbbc9ee1 timed
+    ql-memberships-type-commits-wide, which declares `commits.read_p50_ms`, by the commit latency
+    (`time/_`, ratio 0.98), while B's reader read in ~10 ms against A's 0.004 ms: a loss in no
+    hypothesis. fast.samples() took a section's `samples_ms` (the commits') for any metric of that
+    section. A case's timed series is the metric it declares."""
+    CASE = {"name": "ql-memberships-type-commits-wide", "metric": "commits.read_p50_ms", "tool": "perf_lab"}
+
+    @staticmethod
+    def result(read_p50, commit_ms=0.2077):
+        return {"commits": {"commits": 400, "p50_ms": commit_ms, "p99_ms": 0.9461, "reads": 10010,
+                            "read_p50_ms": read_p50, "read_p99_ms": 0.119, "samples_ms": [commit_ms] * 400}}
+
+    def test_a_case_is_timed_by_the_metric_it_declares(self):
+        self.assertEqual(fast.samples(self.CASE, self.result(0.004)), {"_": [0.004]})
+        # Its section's own latency keeps its samples (the commits' p50 is what they sample).
+        self.assertEqual(fast.samples({**self.CASE, "metric": "commits.p50_ms"}, self.result(0.004))["_"],
+                         [0.2077] * 400)
+        # Another statistic of a sampled section is that statistic, not the samples' median.
+        self.assertEqual(fast.samples({**self.CASE, "metric": "commits.p99_ms"}, self.result(0.004)), {"_": [0.9461]})
+
+    def test_c1_s_read_slowdown_is_a_loss_in_its_family(self):
+        """The run's own values, per pass: A 0.004 ms in every block, B 10.371, 9.843 and 10.547 ms."""
+        a = [fast.samples(self.CASE, self.result(0.004))["_"] for _ in range(3)]
+        b = [fast.samples(self.CASE, self.result(ms, 0.2056))["_"] for ms in (10.371, 9.843, 10.547)]
+        blocks = [1, 2, 3]
+        r = gate_module.dimension(a, blocks, b, blocks, {}, "ms")
+        self.assertEqual(r["status"], "loss shown", r)
+        self.assertGreater(r["ratio"], 1000)
+
+
 class Memory(unittest.TestCase):
     def test_the_scope_s_anon_and_kernel_memory_is_gated_its_page_cache_reported(self):
         summary = run_gate(passes(lambda side, n: [record(cgroup=5000 if side == "cand" else 1000,
