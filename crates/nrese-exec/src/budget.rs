@@ -794,6 +794,14 @@ impl<B: Deref<Target = Budget>> Grant<B> {
     /// ([`Budget::take_up_to`]); never refused nor recorded as refused. What it took
     /// ([`Share`]'s optional growth).
     fn take_up_to(&mut self, wanted: usize, unit: usize) -> usize {
+        // Within the spare (a small buffer's growth, nothing wanted included): a subtraction.
+        if wanted <= self.spare {
+            self.spare -= wanted;
+            self.own += wanted;
+            #[cfg(any(test, feature = "measure"))]
+            crate::measure::reserved(&self.budget, self.tag, wanted);
+            return wanted;
+        }
         let unit = unit.max(1);
         let from_spare = wanted.min(self.spare) / unit * unit;
         self.spare -= from_spare;
@@ -1035,7 +1043,7 @@ impl<B: Deref<Target = Budget>> Charge for Reservation<B> {
         #[cfg(test)]
         growing::pause();
         let wanted = most.saturating_sub(least);
-        let extra = match self.budget.try_take(wanted) {
+        let extra = match wanted == 0 || self.budget.try_take(wanted) {
             true => wanted,
             false => {
                 let extra = self.budget.take_up_to(wanted);
@@ -1287,8 +1295,18 @@ impl<T, H: Hold> Charged<T, H> {
         if needed <= self.items.capacity() {
             return Ok(());
         }
-        let doubled = needed.max(self.items.capacity().saturating_mul(2));
         let size = std::mem::size_of::<T>();
+        // At least std's first capacity (`Vec`'s: 8 items of a byte, 4 up to 1 KiB, else 1),
+        // so a small bag grows once, not three times (the executor memory stack's second
+        // lead's counts: a path from 2.7 million bound values makes a bag at each).
+        let first = match size {
+            1 => 8,
+            2..=1024 => 4,
+            _ => 1,
+        };
+        let doubled = needed
+            .max(self.items.capacity().saturating_mul(2))
+            .max(first);
         if size == 0 {
             return self.set_capacity(doubled);
         }
