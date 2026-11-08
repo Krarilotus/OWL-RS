@@ -630,20 +630,6 @@ impl Dictionary {
     }
 
     /// The inline id of `term`, if it has one in this dictionary's encoding.
-    /// Whether the base's keys are stored compressed (what a lookup's scratch is sized by,
-    /// [`lookup_bytes`]).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "overlays read it; snapshots hold them from package 2b"
-        )
-    )]
-    pub(super) fn keys_compressed(&self) -> bool {
-        let inner = self.inner.read_recursive();
-        inner.base.as_ref().is_some_and(|base| base.codec.is_some())
-    }
-
     pub(super) fn inline_id(&self, term: TermRef<'_>) -> Option<TermId> {
         match term {
             TermRef::Literal(literal) => {
@@ -1954,7 +1940,7 @@ pub(super) fn graph_term(graph: GraphNameRef<'_>) -> Option<TermRef<'_>> {
 
 /// The most bytes a lookup of `term` allocates ([`Dictionary::lookup_charged`]), in a
 /// dictionary whose base's keys are `compressed` or not.
-pub(super) fn lookup_bytes(term: TermRef<'_>, compressed: bool) -> usize {
+fn lookup_bytes(term: TermRef<'_>, compressed: bool) -> usize {
     if let TermRef::Triple(triple) = term {
         let parts = [
             lookup_bytes(triple.subject.as_ref().into(), compressed),
@@ -1963,7 +1949,13 @@ pub(super) fn lookup_bytes(term: TermRef<'_>, compressed: bool) -> usize {
         ];
         return parts.into_iter().max().unwrap_or(0).max(TRIPLE_KEY_LEN);
     }
-    let encoded = encoded_len(term);
+    key_lookup_bytes(encoded_len(term), compressed)
+}
+
+/// The most bytes a lookup of a key of `encoded` bytes allocates ([`lookup_bytes`] of a term
+/// that isn't a triple term): its key, grown by doubling from 64 bytes, and where the base's keys
+/// are `compressed` the compressor's output and the stored key it is copied into.
+pub(super) fn key_lookup_bytes(encoded: usize, compressed: bool) -> usize {
     let key = encoded.max(64);
     match compressed {
         false => 3 * key,
