@@ -417,7 +417,8 @@ class Driver(unittest.TestCase):
                      target_volume="v")
         with patch.dict(driver.os.environ, {"NRESE_TARGET_CPU": "znver3", "RUSTFLAGS": "-C opt-level=2"}), \
                 patch.object(suite, "host_command", return_value=0), patch.object(driver.ns, "docker"), \
-                patch.object(suite.args, "runtime", "docker"):
+                patch.object(driver.ns, "pinned", return_value={"rust:1.98.1-bookworm": "sha256:" + "r" * 64}), \
+                patch.object(suite.args, "runtime", "docker"):  # pinned before any build, as a run's are
             self.assertTrue(suite.build_nrese(nrese))
         plan = Plan("w", "1")
         suite.receipts(plan, [("x", nrese)], suite.attempts(plan, [("x", nrese)]))
@@ -428,6 +429,167 @@ class Driver(unittest.TestCase):
                           "rust_image": "rust:1.98.1-bookworm", "rustflags": "-C target-cpu=znver3"})
         self.assertEqual(receipt["settings"], {"JAVA_HEAP": "8g"})
         self.assertTrue({"RUST_IMAGE", "NRESE_TARGET_CPU", "RUSTFLAGS"} <= set(manifest.SETTINGS))
+
+    def checkout(self, path: Path, version: str, harness: str = "") -> Path:
+        """A source checkout of its own: what the builds compile (crates, Cargo.toml, Cargo.lock,
+        rust-toolchain.toml, .cargo, the harness's own workspace, and the launcher), committed."""
+        path.mkdir(parents=True, exist_ok=True)
+        if not (path / ".git").exists():
+            self.git(path, "init", "-q")
+        for name, text in {"crates/a/src/lib.rs": version, "Cargo.toml": "[workspace]\n", "Cargo.lock": version,
+                           "rust-toolchain.toml": '[toolchain]\nchannel = "1.98.1"\n', ".cargo/config.toml": version,
+                           "benches/nrese-bench-harness/Cargo.toml": "[workspace]\n",
+                           "benches/nrese-bench-harness/Cargo.lock": version,
+                           "benches/nrese-bench-harness/src/main.rs": harness or version,
+                           "scripts/cargo-guarded.sh": version, "scripts/lib/target-cpu.sh": version,
+                           "scripts/lib/disk.sh": version}.items():
+            (path / name).parent.mkdir(parents=True, exist_ok=True)
+            (path / name).write_text(text, encoding="utf-8")
+        self.git(path, "add", "-A")
+        self.git(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
+        return path
+
+    @staticmethod
+    def git(path: Path, *args: str) -> str:
+        done = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, check=True)
+        return done.stdout.strip()
+
+    def built(self, source: Path | None = None, results: str = "results") -> dict:
+        """The receipt's `build` of one NRESE cell after this run built NRESE (from `source`, else the
+        repository) and the harness (from the repository), into `results`."""
+        suite = self.suite(runs=1, skip_build=False, results=results)
+        nrese = Mock(spec=driver.Nrese, key="nrese", images=Mock(return_value=[]), builds=Mock(return_value=[]),
+                     script_builds=Mock(return_value=[]), regimes={"none": ""}, supports=Mock(return_value=None),
+                     source=Mock(return_value=source or self.root), target_volume="v")
+        with patch.object(suite, "host_command", return_value=0):
+            self.assertTrue(suite.build_nrese(nrese))
+            self.assertTrue(suite.build_harness())
+        plan = Plan("w", "1")
+        suite.receipts(plan, [("x", nrese)], suite.attempts(plan, [("x", nrese)]))
+        return self.cells(suite)["w/1/x"]["build"]
+
+    def test_a_build_names_the_trees_it_compiled_at_its_own_commit(self):
+        """Orchestrator, 8 Nov (P1d, design r2 F10; r3 F10): each build records the git ids of what it
+        compiled at its own source's commit, so a receipt is compared by content. NRESE: crates,
+        Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo, from its source, which can be another
+        checkout. The harness, a workspace of its own built with --manifest-path whose path
+        dependencies are crates/ members inheriting from the root Cargo.toml: its workspace
+        directory, crates, Cargo.toml, rust-toolchain.toml, .cargo, from the repository. Both: the
+        launcher they build through, scripts/cargo-guarded.sh and what it sources (r4 B)."""
+        self.checkout(self.root, "suite")
+        source = self.checkout(self.root / "data" / "nrese-src", "nrese")
+        build = self.built(source)
+        launcher = ("scripts/cargo-guarded.sh", "scripts/lib/target-cpu.sh", "scripts/lib/disk.sh")  # r4 B
+        paths = {"nrese": ("crates", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo", *launcher),
+                 "harness": ("benches/nrese-bench-harness", "crates", "Cargo.toml", "rust-toolchain.toml", ".cargo",
+                             *launcher)}
+        for program, checkout in (("nrese", source), ("harness", self.root)):
+            with self.subTest(program):
+                self.assertEqual(build[program]["sources"], {p: self.git(checkout, "rev-parse", f"HEAD:{p}")
+                                                            for p in paths[program]})
+                self.assertEqual(build[program]["commit"], self.git(checkout, "rev-parse", "HEAD"))
+        self.assertNotEqual(build["nrese"]["sources"]["crates"], build["harness"]["sources"]["crates"])
+
+    def test_a_harness_built_from_other_source_says_so_where_nrese_s_trees_are_the_same(self):
+        """P2 design check r3 F10 (orchestrator 17:39): two commits that differ only in the harness's
+        src give different harness sources and the same NRESE ones: a harness built at another commit
+        with NRESE's five trees unchanged is never read as the same build."""
+        self.checkout(self.root, "suite", harness="fn main() {}\n")
+        first = self.built()
+        self.checkout(self.root, "suite", harness="fn main() { println!(); }\n")
+        second = self.built(results="results-2")
+        self.assertNotEqual(first["harness"]["sources"]["benches/nrese-bench-harness"],
+                            second["harness"]["sources"]["benches/nrese-bench-harness"])
+        self.assertEqual(first["nrese"]["sources"], second["nrese"]["sources"])
+
+    def test_a_checkout_that_moves_during_the_run_and_stays_moved_has_no_commit(self):
+        """P2 design r4 R1 (orchestrator 17:47): as a tier's receipts are written the checkout is read
+        again; one on another commit than the run started from, or changed since a clean start, gives
+        the receipt no commit but why, so it is never current. (A run whose results directory is in the
+        checkout and not ignored starts dirty, as the manifest records it after making that directory:
+        unqualified already, so only a clean start's changes are the guard's.)"""
+        for case in ("stays", "moved", "edited"):
+            with self.subTest(case):
+                self.setUp()
+                (self.root / ".gitignore").write_text("data/\nresults/\n", encoding="utf-8")
+                (self.root / "a.txt").write_text("a\n", encoding="utf-8")
+                self.git(self.root, "init", "-q")
+                self.git(self.root, "add", "-A")
+                self.git(self.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "start")
+                start = self.git(self.root, "rev-parse", "HEAD")
+                suite = self.suite(runs=1)
+                self.assertEqual(suite.manifest.entry["git"]["dirty"], 0)  # a clean start: the guard's case
+
+                def move(plan, run):
+                    (self.root / "a.txt").write_text("b\n", encoding="utf-8")
+                    if case == "moved":
+                        self.git(self.root, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "b")
+                    return False
+                self.run_tiers(suite, [Plan("w", "1")], self.system(),
+                               stop=move if case != "stays" else lambda p, r: False)
+                commit = self.cells(suite)["w/1/x"]["commit"]
+                if case == "stays":
+                    self.assertEqual(commit, start)
+                else:
+                    self.assertIsInstance(commit, dict)
+                    self.assertIn({"moved": "moved during the run", "edited": "changed during the run"}[case],
+                                  commit["unknown"])
+
+    def test_a_build_names_what_its_build_scripts_read_from_outside_git(self):
+        """P2 design check r4 A (orchestrator 17:56): crates/nrese-server/build.rs embeds every file of
+        the ignored apps/nrese-console/dist, so equal trees with other console bytes are another binary.
+        NRESE's build records them: "no files" when the directory is missing or empty (the same empty
+        table), else a digest of every file's path and bytes, which changes with them. The harness reads
+        none."""
+        self.checkout(self.root, "suite")
+        dist = self.root / "apps" / "nrese-console" / "dist"
+        seen = []
+        for case, files in (("missing", None), ("empty", {}), ("bundle a", {"index.html": "a"}),
+                            ("bundle b", {"index.html": "b"}), ("nested", {"index.html": "b", "assets/x.js": "x"})):
+            if files is not None:
+                dist.mkdir(parents=True, exist_ok=True)
+                for name, text in files.items():
+                    (dist / name).parent.mkdir(parents=True, exist_ok=True)
+                    (dist / name).write_text(text, encoding="utf-8")
+            build = self.built(results=f"results-{len(seen)}")
+            seen.append((case, build["nrese"]["inputs"], build["nrese"]["sources"]))
+            self.assertEqual(build["harness"]["inputs"], {})
+        values = {case: inputs["apps/nrese-console/dist"] for case, inputs, _ in seen}
+        self.assertEqual(values["missing"], "no files")
+        self.assertEqual(values["empty"], "no files")
+        self.assertEqual(driver.expected_build_inputs("nrese"), {"apps/nrese-console/dist": "no files"})
+        self.assertEqual(driver.expected_build_inputs("harness"), {})
+        self.assertRegex(values["bundle a"], "^sha256:[0-9a-f]{64}$")
+        self.assertEqual(len({values["bundle a"], values["bundle b"], values["nested"], "no files"}), 4)
+        self.assertEqual(len({str(sources) for _, _, sources in seen}), 1)  # the git trees never told them apart
+
+    def test_build_settings_are_read_from_the_environment_given_only(self):
+        """P2 design check r3 F14 (orchestrator 17:39): the default build's settings come from the build
+        owner with an empty environment, whatever this process's environment holds; a given one is read."""
+        with patch.dict(driver.os.environ, {"NRESE_TARGET_CPU": "znver3", "RUSTFLAGS": "-C opt-level=2"}):
+            self.assertEqual(driver.build_settings({}), {"target_cpu": "native", "rustflags_env": ""})
+        self.assertEqual(driver.build_settings({"NRESE_TARGET_CPU": "portable", "RUSTFLAGS": "-g"}),
+                         {"target_cpu": "portable", "rustflags_env": "-g"})
+
+    def test_a_docker_build_runs_in_its_rust_image_s_pinned_id(self):
+        """Orchestrator, 8 Nov (P1d): the Rust image a Docker build compiles in is the run's pinned
+        one (ns.pinned, as every container's), by id, never its tag looked up again, and the receipt
+        names that id; a build whose image isn't pinned doesn't start."""
+        suite = self.suite(runs=1, skip_build=False)
+        nrese = Mock(spec=driver.Nrese, key="nrese", source=Mock(return_value=self.root),
+                     rust_image=Mock(return_value="rust:1.98.1-bookworm"), target_volume="v")
+        for pins, built in (({"rust:1.98.1-bookworm": "sha256:" + "r" * 64}, True), ({}, False)):
+            with self.subTest(pinned=bool(pins)), patch.object(suite.args, "runtime", "docker"), \
+                    patch.object(suite, "host_command", return_value=0) as run, patch.object(driver.ns, "docker"), \
+                    patch.object(driver.ns, "pinned", return_value=pins):
+                self.assertIs(suite.build_nrese(nrese), built)
+                if built:
+                    command = run.call_args.args[0]
+                    self.assertIn("sha256:" + "r" * 64, command)
+                    self.assertNotIn("rust:1.98.1-bookworm", command)
+                    self.assertEqual(suite.built["nrese"]["rust_image_id"], "sha256:" + "r" * 64)
+                else:
+                    run.assert_not_called()
 
     def test_an_image_built_here_carries_its_context_s_tree(self):
         """P2 design review F5: a build of the suite's own image is labelled with its context's git

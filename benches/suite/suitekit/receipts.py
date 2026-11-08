@@ -19,7 +19,10 @@ coverage` compares it with what the evaluated commit expects (Harness notes
 |  | read off that id, never off the tag: "built from benches/CONTEXT@TREE" (its build label), |
 |  | "pulled, pinned DIGEST" (the id holds its tag's pin, images.toml), else unknown, with why |
 | build | NRESE's server and the timing harness: built in this run from `commit` (its `dirty`), with |
-|  | `target_cpu`, inherited `rustflags_env`, and in Docker `rust_image` and `rustflags`; or unknown |
+|  | `target_cpu`, inherited `rustflags_env`, `sources` (its program's BUILD_SOURCES -> git id at |
+|  | the build's own commit, which is not the invocation's: what it compiled, by content), `inputs` |
+|  | (BUILD_INPUTS -> "no files" or a digest: what its build scripts read from outside git), and |
+|  | in Docker `rust_image`, the pinned `rust_image_id` it compiled in, and `rustflags`; or unknown |
 | settings | the suite settings in force that change a measurement (manifest `settings` less |
 |  | OPERATIONAL_SETTINGS: where a run keeps its files) |
 | protocol | the attempt's own (manifest `protocol`): runs, query runs, cache modes, order, limits |
@@ -45,6 +48,19 @@ from pathlib import Path
 CODE_ROOTS = ("benches", "scripts", "rust-toolchain.toml", ".cargo")
 RESULTS = ("benches/runs", "benches/baselines", "benches/STATUS.md", "benches/STANDINGS.md", "benches/CATALOG.md")
 BUILD_PATHS = ("crates", "Cargo.toml", "Cargo.lock")  # a compiled NRESE server or timing harness
+# What each program's build compiles, with the toolchain it compiles with (rustup and cargo read
+# rust-toolchain.toml and .cargo from the repository root, where both builds run). The harness is a
+# workspace of its own (--manifest-path, its own Cargo.lock) whose path dependencies are crates/
+# members that inherit fields from the root Cargo.toml; it doesn't read the root Cargo.lock.
+# Both build through scripts/cargo-guarded.sh, which sources the other two (P2 design check r4 B).
+LAUNCHER = ("scripts/cargo-guarded.sh", "scripts/lib/target-cpu.sh", "scripts/lib/disk.sh")
+BUILD_SOURCES = {
+    "nrese": (*BUILD_PATHS, "rust-toolchain.toml", ".cargo", *LAUNCHER),
+    "harness": ("benches/nrese-bench-harness", "crates", "Cargo.toml", "rust-toolchain.toml", ".cargo", *LAUNCHER),
+}
+# What a program's build scripts read that git doesn't hold (r4 A): crates/nrese-server/build.rs
+# embeds every file of the ignored console build.
+BUILD_INPUTS = {"nrese": ("apps/nrese-console/dist",), "harness": ()}
 
 
 def code_paths(root: Path, commit: str) -> tuple[str, ...]:
