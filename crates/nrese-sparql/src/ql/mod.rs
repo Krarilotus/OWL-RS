@@ -6,13 +6,13 @@
 //! rewriting of a query's basic graph patterns is `native/ql.rs`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use nrese_engine::{
     AssertedIdentity, GraphSelector, QuadPattern, ReadModel, Snapshot, SnapshotIdentity, TermId,
 };
 use nrese_owl::ql::Tbox;
-use nrese_rdf::{NamedNodeRef, Term};
+use nrese_rdf::{NamedNodeRef, Term, vocab};
 
 use crate::GraphAccess;
 
@@ -517,8 +517,27 @@ fn touched_expressions(tx: &nrese_engine::Transaction<'_>) -> Option<Vec<Members
 }
 
 fn iri(snapshot: &Snapshot, namespace: &str, local: &str) -> Option<TermId> {
-    snapshot.lookup(NamedNodeRef::new_unchecked(&format!("{namespace}{local}")).into())
+    named(snapshot, &format!("{namespace}{local}"))
 }
+
+fn named(snapshot: &Snapshot, iri: &str) -> Option<TermId> {
+    snapshot.lookup(NamedNodeRef::new_unchecked(iri).into())
+}
+
+/// The IRIs of the tables every schema read looks up, joined once rather than on each read
+/// (#155's count: a `format!` per name and read).
+fn joined(table: &[(&str, &str)]) -> Vec<String> {
+    table.iter().map(|(n, l)| format!("{n}{l}")).collect()
+}
+
+fn owl(table: &[&str]) -> Vec<String> {
+    table.iter().map(|l| format!("{OWL}{l}")).collect()
+}
+
+static SCHEMA_IRIS: LazyLock<Vec<String>> = LazyLock::new(|| joined(SCHEMA));
+static DECLARATION_IRIS: LazyLock<Vec<String>> = LazyLock::new(|| joined(DECLARATIONS));
+static EXPRESSION_IRIS: LazyLock<Vec<String>> = LazyLock::new(|| owl(EXPRESSIONS));
+static LIST_IRIS: LazyLock<Vec<String>> = LazyLock::new(|| owl(LISTS));
 
 /// The asserted statements of the schema, in every graph, sorted: the schema properties',
 /// the declarations', the cells of the lists they name, and per class expression one
@@ -570,24 +589,25 @@ fn read_core(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
         object,
         graph: GraphSelector::Any,
     };
-    for &(namespace, local) in SCHEMA {
-        if let Some(p) = iri(snapshot, namespace, local) {
+    for p in SCHEMA_IRIS.iter() {
+        if let Some(p) = named(snapshot, p) {
             scan(pattern(p, None), &mut out);
         }
     }
-    if let Some(rdf_type) = iri(snapshot, RDF, "type") {
-        for &(namespace, local) in DECLARATIONS {
-            if let Some(class) = iri(snapshot, namespace, local) {
+    let lookup = |term: NamedNodeRef<'_>| snapshot.lookup(term.into());
+    if let Some(rdf_type) = lookup(vocab::rdf::TYPE) {
+        for class in DECLARATION_IRIS.iter() {
+            if let Some(class) = named(snapshot, class) {
                 scan(pattern(rdf_type, Some(class)), &mut out);
             }
         }
     }
     // The lists: from each head, `rdf:first` and `rdf:rest` along the cells.
-    let (first, rest) = (iri(snapshot, RDF, "first"), iri(snapshot, RDF, "rest"));
+    let (first, rest) = (lookup(vocab::rdf::FIRST), lookup(vocab::rdf::REST));
     if let (Some(first), Some(rest)) = (first, rest) {
-        let heads: Vec<u64> = LISTS
+        let heads: Vec<u64> = LIST_IRIS
             .iter()
-            .filter_map(|local| iri(snapshot, OWL, local))
+            .filter_map(|p| named(snapshot, p))
             .flat_map(|p| {
                 out.iter()
                     .filter(move |s| s.triple[1] == p.raw())
@@ -630,9 +650,9 @@ fn read_core(snapshot: &Snapshot) -> Vec<nrese_owl::Statement> {
 /// or a set operator's property, sorted. Read from the core, never from data: an entry
 /// whose core is unchanged keeps its list.
 fn expressions_of(snapshot: &Snapshot, core: &[nrese_owl::Statement]) -> Vec<u64> {
-    let operators: Vec<u64> = EXPRESSIONS
+    let operators: Vec<u64> = EXPRESSION_IRIS
         .iter()
-        .filter_map(|local| iri(snapshot, OWL, local))
+        .filter_map(|p| named(snapshot, p))
         .map(TermId::raw)
         .collect();
     let mut out: Vec<u64> = core
