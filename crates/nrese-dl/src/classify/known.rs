@@ -291,10 +291,10 @@ fn lower(c: &crate::context::Classification, classes: &[Term]) -> Lower {
         exact: false,
         exact_for: vec![false; n],
         top_exact: false,
-        inconsistent: !c.consistent,
+        inconsistent: c.consistency == crate::verdict::Verdict::Inconsistent,
     };
     let index = |t: &Term| classes.binary_search(t).ok();
-    if !c.consistent {
+    if lower.inconsistent {
         // The part has no model, so neither has the ontology: every class is below
         // `owl:Nothing` (the driver's consistency test says so itself).
         lower.unsat = vec![true; n];

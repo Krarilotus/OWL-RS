@@ -83,7 +83,7 @@ SELECT ?s ?o ?score WHERE {
 | `bds:minRelevance`, `bds:minRank`, `bds:maxRank` | limits |
 | `bds:stem "en"` | words match by their Snowball stem in that language, phrases too: `"connect"` finds *connected*, *connection*, *connecting* (an NRESE extension; Blazegraph ignores it). Languages: ar, da, de, el, en, es, fi, fr, hu, it, nl, no, pt, ro, ru, sv, ta, tr |
 
-The matched literal (the subject) is a simple or language-tagged string that is the object of a statement in the graph the pattern reads. Words are runs of letters and digits. The index is built in memory at the first search and extended with new literals at later searches; a durable store writes it to `derived/` of its data directory after each checkpoint and reads it back at the first search after a restart, so it isn't built again. Searches start the pattern's joins.
+The matched literal (the subject) is a simple or language-tagged string that is the object of a statement in the graph the pattern reads. Under `GRAPH ?g` the search runs per named graph of the query's dataset (SPARQL 1.1 §18.6): a row per literal and graph that has it, `?g` bound, at the same relevance; `bds:rank`, `bds:minRank` and `bds:maxRank` count within each graph, so there `bds:maxRank` doesn't shorten the search (every match is read), while `bds:minRelevance` does. Words are runs of letters and digits. The index is built in memory at the first search and extended with new literals at later searches; a durable store writes it to `derived/` of its data directory after each checkpoint and reads it back at the first search after a restart, so it isn't built again. Searches start the pattern's joins.
 
 The same index answers **Jena's `text:query`** (what Fuseki clients send) and **GraphDB's legacy `luc:` predicates**:
 
@@ -97,7 +97,7 @@ PREFIX luc: <http://www.ontotext.com/owlim/lucene#>
 SELECT ?x ?score WHERE { ?x luc:myIndex "tower bridge" ; luc:score ?score }
 ```
 
-`text:query`'s subject is `?s` or a list of `?s`, the score, the matched literal (then its graph and property, unbound); its object is the query string or a list of an optional property, the query string, an optional limit on the matched literals and `"lang:xx"`. Without a property, a literal matches as the object of any property. `luc:` takes any index name (there is one index, over every string literal) and finds the resources with a matching literal. Query strings are read as Lucene's syntax as far as this index goes: words, phrases, `word*`, fuzzy `word~` and `word~1`, `AND` (every word needed, else any), `NOT` and `-` (the word is excluded; a phrase after them is dropped); `OR`, `+`, field names and boosts (`^`) are dropped. Scores are the relevance above, not Lucene's.
+`text:query`'s subject is `?s` or a list of `?s`, the score, the matched literal (then its graph and property, unbound); its object is the query string or a list of an optional property, the query string, an optional limit on the matched literals (counted among the objects of the property, if one is given) and `"lang:xx"`. Without a property, a literal matches as the object of any property. `luc:` takes any index name (there is one index, over every string literal) and finds the resources with a matching literal. Query strings are read as Lucene's syntax as far as this index goes: words, phrases, `word*`, fuzzy `word~` and `word~1`, `AND` (every word needed, else any), `NOT` and `-` (the word is excluded; a phrase after them is dropped); `OR`, `+`, field names and boosts (`^`) are dropped. Scores are the relevance above, not Lucene's.
 
 **Vector similarity search** through a virtual `SERVICE`: the vectors are literals of the datatype `nrv:vector` (`"[0.12, -0.5, 0.33]"^^nrv:vector`, numbers as in a JSON array; what embedding services return), and the search finds the nearest ones:
 
@@ -114,12 +114,12 @@ SELECT ?doc ?score WHERE {
 | Predicate | Object |
 |---|---|
 | `nrv:near` | the query vector: a vector literal, or a variable the rest of the query binds to one (`?other ex:embedding ?q`: a search per value) |
-| `nrv:k` | how many nearest vectors per query vector (default 10, at most 10,000) |
+| `nrv:k` | how many nearest vectors per query vector (default 10; 1 to 10,000, else a client error) |
 | `nrv:score` | a variable: the cosine similarity or dot product (`xsd:double`), or the Euclidean distance with `nrv:metric "l2"` |
 | `nrv:rank` | a variable: the rank, from 1 |
 | `nrv:metric` | `"cosine"` (the default), `"dot"` or `"l2"` |
 | `nrv:exact true` | compare every vector |
-| `nrv:searchBudget` | the graph search's beam (default 64): wider finds more of the true nearest, slower |
+| `nrv:searchBudget` | the graph search's beam (default 64; 1 to 1,000,000, else a client error): wider finds more of the true nearest, slower |
 
 The subject is the matched vector literal; only literals the query's dataset uses as objects are found, so a user finds no vector of a graph it may not read. The search returns the `k` nearest vectors that satisfy the patterns joined to it (`?doc ex:embedding ?v` with other conditions on `?doc`). Where those patterns are estimated to bind few rows, they go first and the search is among their values: an exact scan when they are few (under 2% of the vectors of that dimension), the graph with that filter otherwise. Where they bind many, the search goes first, its beam widened by the share of the vectors they are estimated to bind (as for a filter the graph applies itself), and each hit, nearest first, is checked against them through the indexes until `k` pass (100,000 vectors of 384 dimensions: 0.24 ms a query through the graph, recall@10 0.94; 1.3 ms exact). Vectors of each dimension are indexed in memory at the first search and extended with new literals at later ones; up to 20,000 of a dimension are compared exactly, beyond that through an HNSW graph per metric. The graph is built at the first search that needs it, at once up to 50,000 vectors and on a thread of its own beyond (searches scan exactly until it is there); vectors added later are scanned exactly until they pass a tenth of the graph, which is then extended on a thread. A durable store keeps the vectors and graphs in `derived/` (written after each checkpoint), so a restart doesn't rebuild them. Wrong options are client errors that name the option.
 
@@ -151,10 +151,12 @@ On the combined URL a form is a query or an update by its field, and a body by i
 
 `GET /dataset/classification`: the OWL 2 DL class hierarchy of the asserted statements (all graphs), computed on request by the DL engines ([design](../design/owl2-dl.md) §7): the context core where its Horn stage takes the ontology (EL and Horn ontologies), else the hypertableau driver (known and possible subsumers, tests in parallel on `dl.threads` workers, within `dl.timeout`). The result is kept per revision, so a second request on an unchanged store is free.
 
-- `application/json` (the default): `subsumptions` (pairs `[sub, super]` of class IRIs, every one, equivalent classes both ways, without `owl:Thing`), `unsatisfiable` (classes that can have no instance), `equivalent_to_thing`, `consistent` (false: the ontology has no model, and every class is unsatisfiable), `engine` (`context-core` or `tableau`), `complete` and `incomplete` (why subsumptions may be missing: a budget ran out, or a construct the engines lack; what is listed is entailed either way), `micros`
-- `application/n-triples`: the same as `rdfs:subClassOf` statements, `owl:Nothing` as the superclass of unsatisfiable classes
+- `application/json` (the default): `subsumptions` (pairs `[sub, super]` of class IRIs, every one, equivalent classes both ways, without `owl:Thing`), `unsatisfiable` (classes that can have no instance), `equivalent_to_thing`, `consistent` (`true`; `false`: the ontology has no model, and nothing is listed; `null`: not decided) with `consistency` (`consistent`, `inconsistent` or `unknown`), `engine` (`context-core` or `tableau`), `complete` (nothing left out and the consistency decided) and `incomplete` (why subsumptions may be missing: a budget ran out, or a construct the engines lack; what is listed is entailed either way), `micros`
+- `application/n-triples`: the same as `rdfs:subClassOf` statements, `owl:Nothing` as the superclass of unsatisfiable classes; an inconsistent ontology as the one statement `owl:Thing rdfs:subClassOf owl:Nothing`
 
-`GET /dataset/realisation`: each named individual's types under OWL 2 DL, by the same engines (a type is tested by whether its negation makes the ontology inconsistent, candidates cut by the models found). JSON: `types` (individual IRI → every named class it is an instance of), `consistent`, `engine`, `complete`, `incomplete`, `micros`; N-Triples: `rdf:type` statements.
+Both forms carry `NRESE-Completeness` (regime `owl2-dl`, as query answers do): `complete`, or `sound-only` with the reasons (`dl: …`), an undecided consistency among them.
+
+`GET /dataset/realisation`: each named individual's types under OWL 2 DL, by the same engines (a type is tested by whether its negation makes the ontology inconsistent, candidates cut by the models found). JSON: `types` (individual IRI → every named class it is an instance of; none for an inconsistent ontology), `consistent` and `consistency` (as above), `engine`, `complete`, `incomplete`, `micros`; N-Triples: `rdf:type` statements, or an inconsistency's one statement as above; the same `NRESE-Completeness` header.
 
 The hierarchy isn't stored; the reasoning modes materialise instance-level inferences (see [config-reference.md](config-reference.md)).
 
@@ -240,7 +242,7 @@ Isolated checks of pinned inputs, for the Datamodel Workflow and any other clien
 Every answer is 200 with a terminal status (`completed`, `failed`, `timeout`, `unsupported`) and echoes the request's identity. A request that isn't a draft-check request is 400; a larger one than the upload limit, 413.
 
 Limits today:
-- One profile, `owl2-rl`: consistency by the OWL 2 RL rules, unsatisfiable classes by the OWL 2 EL classifier. Axioms either skipped are reported as unsupported, and the answer is then not complete.
+- One profile, `owl2-rl`, under the semantics `nrese:draft-check/2`: `logical_consistent` is `false` where the OWL 2 RL rules or the OWL 2 DL engines find no model, `true` where neither does and both decided, and `null` where it isn't decided; unsatisfiable classes by the OWL 2 DL classification, none listed for an inconsistent input. Axioms either skipped, and an undecided verdict, are reported as unsupported, and the answer is then not complete. (`/1`'s `logical_consistent` was the RL rules' alone; it is no longer served.)
 - SHACL Core only; SHACL-SPARQL, SHACL-AF and `sh:entailment` are reported as unsupported.
 - A time limit above the server's query timeout is refused, not shortened.
 

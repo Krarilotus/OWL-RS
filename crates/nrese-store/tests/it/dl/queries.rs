@@ -233,9 +233,19 @@ fn schema_vocabulary_and_variable_predicates_are_not_bounded() {
     );
     let (_, status) = query(&dl, "SELECT ?x { ?x ?p :y }");
     assert!(status.reasons()[0].contains("variable predicate"));
-    // rdf:type and owl:sameAs are bounded.
-    let (_, status) = query(&dl, "SELECT ?x { ?x owl:sameAs ?y }");
+    // Guard (holds on the base too): rdf:type and owl:sameAs between two distinct terms
+    // are bounded.
+    let (_, status) = query(&dl, "ASK { :x owl:sameAs :y }");
     assert!(status.is_complete(), "{:?}", status.reasons());
+    // Reflexive owl:sameAs (OWL 2 Profiles table 4, eq-ref) is in neither bound: ?x = ?y
+    // for every individual is missing, so not complete (RSH-04).
+    let (_, status) = query(&dl, "SELECT ?x { ?x owl:sameAs ?y }");
+    assert!(!status.is_complete(), "{:?}", status.reasons());
+    assert!(
+        status.reasons()[0].contains("reflexive"),
+        "{:?}",
+        status.reasons()
+    );
 }
 
 #[test]
@@ -357,7 +367,7 @@ fn class_queries_answer_as_the_realisation_on_random_ontologies() {
         if !reference.incomplete.is_empty() || !reference.taxonomy.complete() {
             continue;
         }
-        if !reference.taxonomy.classification.consistent {
+        if reference.taxonomy.classification.consistency != nrese_dl::verdict::Verdict::Consistent {
             continue;
         }
         let vocabulary =

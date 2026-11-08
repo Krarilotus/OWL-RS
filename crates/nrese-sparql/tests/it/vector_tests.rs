@@ -96,17 +96,18 @@ fn rows(engine: &Engine, query: &str, options: &QueryOptions) -> Vec<Vec<String>
         .collect()
 }
 
-fn error(engine: &Engine, query: &str) -> String {
+/// The query's error, if it has one.
+fn error_of(engine: &Engine, query: &str) -> Option<String> {
     let text = format!("{PREFIXES}{query}");
     let query = SparqlParser::new().parse_query(&text).unwrap();
     let snapshot = engine.snapshot();
     match evaluate_query(&snapshot, &query, &QueryOptions::default()) {
         Ok(QueryResults::Solutions(mut solutions)) => match solutions.next() {
-            Some(Err(error)) => error.to_string(),
-            _ => panic!("an error expected"),
+            Some(Err(error)) => Some(error.to_string()),
+            _ => None,
         },
-        Ok(_) => panic!("an error expected"),
-        Err(error) => error.to_string(),
+        Ok(_) => None,
+        Err(error) => Some(error.to_string()),
     }
 }
 
@@ -255,7 +256,7 @@ fn a_user_finds_only_vectors_of_graphs_it_may_read() {
 #[test]
 fn malformed_searches_are_explained() {
     let engine = engine();
-    for (block, expected) in [
+    let cases: [(&str, &str); 10] = [
         ("?v nrv:k 3", "nrv:near gives the query vector"),
         ("?v nrv:near \"[1, x]\"^^nrv:vector", "not a finite number"),
         (
@@ -271,13 +272,62 @@ fn malformed_searches_are_explained() {
             "whole number",
         ),
         ("?v nrv:near ?q", "has no value"),
-    ] {
-        let message = error(
+        // Past their bounds, refused rather than clamped to another question.
+        (
+            &format!("?v nrv:near {} ; nrv:k 0", near(0.0)),
+            "nrv:k is from 1 to 10000, not 0",
+        ),
+        (
+            &format!("?v nrv:near {} ; nrv:k 10001", near(0.0)),
+            "nrv:k is from 1 to 10000, not 10001",
+        ),
+        (
+            &format!("?v nrv:near {} ; nrv:searchBudget 0", near(0.0)),
+            "nrv:searchBudget is from 1 to 1000000, not 0",
+        ),
+        (
+            &format!("?v nrv:near {} ; nrv:searchBudget 1000001", near(0.0)),
+            "nrv:searchBudget is from 1 to 1000000, not 1000001",
+        ),
+    ];
+    // Every row's outcome, before failing: the red proof shows each one.
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|(block, expected)| {
+            match error_of(
+                &engine,
+                &format!("SELECT * WHERE {{ SERVICE nrv:search {{ {block} }} }}"),
+            ) {
+                Some(message) if message.contains(expected) => None,
+                Some(message) => Some(format!("{block}: {message}")),
+                None => Some(format!("{block}: answered, an error expected")),
+            }
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// `nrv:k` and `nrv:searchBudget` at their largest are taken as given: every one of the
+/// 36 vectors the default graph uses, the widest beam answering as a narrow one.
+#[test]
+fn the_largest_k_and_budget_are_taken_as_given() {
+    let engine = engine();
+    let plain = QueryOptions::default();
+    let query = |options: &str| {
+        rows(
             &engine,
-            &format!("SELECT * WHERE {{ SERVICE nrv:search {{ {block} }} }}"),
-        );
-        assert!(message.contains(expected), "{block}: {message}");
-    }
+            &format!(
+                "SELECT ?v WHERE {{ SERVICE nrv:search {{ ?v nrv:near {} ; {options} }} }}",
+                near(0.0)
+            ),
+            &plain,
+        )
+    };
+    assert_eq!(query("nrv:k 10000").len(), 36);
+    assert_eq!(
+        query("nrv:k 3 ; nrv:searchBudget 1000000"),
+        query("nrv:k 3 ; nrv:searchBudget 1")
+    );
 }
 
 /// A large joined pattern: the search goes first and each hit is probed against the
