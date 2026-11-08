@@ -616,6 +616,9 @@ impl Statistics {
 }
 
 #[cfg(test)]
+mod admission_tests;
+
+#[cfg(test)]
 mod tests {
     use rayon::prelude::*;
 
