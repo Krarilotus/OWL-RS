@@ -1162,10 +1162,10 @@ def repo_digests(image: str) -> set[str]:
 
 
 def built_from(source: Path, program: str) -> dict:
-    """What a build of `program` ("nrese", "harness") compiles, as it starts: its checkout's commit and
-    dirty count (the build's own, recorded apart from the invocation's), the git ids of its
-    receipts.BUILD_SOURCES at that commit, what its build scripts read outside git (build_inputs),
-    and its configuration (build_settings, this process's)."""
+    """What a build of `program` ("nrese", "harness") is made from, as it starts: its checkout's commit
+    and dirty count (the build's own, recorded apart from the invocation's), the git ids of its
+    declared dependency envelope (receipts.BUILD_SOURCES) at that commit, what its build scripts read
+    outside git (build_inputs), and its configuration (build_settings, this process's)."""
     state = {k: v for k, v in checkout_state(source).items() if k in ("commit", "dirty")}
     return {**state, "sources": receipts.object_ids(source, state.get("commit") or "", receipts.BUILD_SOURCES[program]),
             "inputs": build_inputs(source, program), **build_settings(os.environ)}

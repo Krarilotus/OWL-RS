@@ -20,7 +20,8 @@ coverage` compares it with what the evaluated commit expects (Harness notes
 |  | "pulled, pinned DIGEST" (the id holds its tag's pin, images.toml), else unknown, with why |
 | build | NRESE's server and the timing harness: built in this run from `commit` (its `dirty`), with |
 |  | `target_cpu`, inherited `rustflags_env`, `sources` (its program's BUILD_SOURCES -> git id at |
-|  | the build's own commit, which is not the invocation's: what it compiled, by content), `inputs` |
+|  | the build's own commit, which is not the invocation's: its declared dependency envelope, by |
+|  | content, a superset of what any one build reads), `inputs` |
 |  | (BUILD_INPUTS -> "no files" or a digest: what its build scripts read from outside git), and |
 |  | in Docker `rust_image`, the pinned `rust_image_id` it compiled in, and `rustflags`; or unknown |
 | settings | the suite settings in force that change a measurement (manifest `settings` less |
@@ -48,11 +49,17 @@ from pathlib import Path
 CODE_ROOTS = ("benches", "scripts", "rust-toolchain.toml", ".cargo")
 RESULTS = ("benches/runs", "benches/baselines", "benches/STATUS.md", "benches/STANDINGS.md", "benches/CATALOG.md")
 BUILD_PATHS = ("crates", "Cargo.toml", "Cargo.lock")  # a compiled NRESE server or timing harness
-# What each program's build compiles, with the toolchain it compiles with (rustup and cargo read
-# rust-toolchain.toml and .cargo from the repository root, where both builds run). The harness is a
-# workspace of its own (--manifest-path, its own Cargo.lock) whose path dependencies are crates/
-# members that inherit fields from the root Cargo.toml; it doesn't read the root Cargo.lock.
-# Both build through scripts/cargo-guarded.sh, which sources the other two (P2 design check r4 B).
+# Each program's declared dependency envelope (P1d review r1 F2): the repository paths whose content
+# can change what its build makes, with the toolchain's configuration (rustup and cargo read
+# rust-toolchain.toml and .cargo from the repository root, where both builds run). Conservative, not
+# an exact read set: a change anywhere in it re-qualifies the build, though a given build may read
+# less (whole crates/ trees; the launcher, which a Docker NRESE build doesn't run, as cargo runs in
+# its image). Exact per-runtime sets, if ever wanted, are declared here, never in a reader. The
+# harness is a workspace of its own (--manifest-path, its own Cargo.lock) whose path dependencies
+# are crates/ members that inherit fields from the root Cargo.toml; it doesn't read the root
+# Cargo.lock. The launcher: scripts/cargo-guarded.sh and the two it sources for the compiler's flags
+# and room (P2 design check r4 B); on Windows it also runs scripts/lib/memory-cap.ps1, admission
+# only, which shapes no program content and isn't in the envelope.
 LAUNCHER = ("scripts/cargo-guarded.sh", "scripts/lib/target-cpu.sh", "scripts/lib/disk.sh")
 BUILD_SOURCES = {
     "nrese": (*BUILD_PATHS, "rust-toolchain.toml", ".cargo", *LAUNCHER),
