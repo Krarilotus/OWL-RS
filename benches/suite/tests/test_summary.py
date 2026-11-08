@@ -52,6 +52,12 @@ def write(directory: Path, rows: list[dict]) -> Path:
         writer = csv.DictWriter(f, fieldnames=FIELDS)
         writer.writeheader()
         writer.writerows(rows)
+    # A suite run's manifest, as every run writes one: these fixtures read no /data file (7 Nov 2026:
+    # without one, compare can't tell which input a run read, and refuses).
+    manifest = directory / "manifest.json"
+    if not manifest.exists():
+        manifest.write_text(json.dumps({"schema": 1, "invocations": [{"datasets": {}, "dataset_sha256": {}}]}),
+                            encoding="utf-8")
     return path
 
 
@@ -60,6 +66,272 @@ def output(main, argv) -> str:
     with contextlib.redirect_stdout(out):
         main(argv)
     return out.getvalue()
+
+
+class LoadedInputs(unittest.TestCase):
+    """Review r1 of pkg/stage-data, R1-W1 (7 Nov 2026): lubm-10 and lubm-100 became a new release
+    (their sorted distinct lines), and `compare` called a new LUBM result faster than an old one
+    without saying the two had loaded other bytes. A case's code-change verdict needs the same
+    frozen input files, byte for byte, on both sides; a form pin never stands in for them."""
+    OLD, NEW = "66f44fa8" + "0" * 56, "85b6ccc3" + "0" * 56
+
+    def report(self, ms, inputs=None, case="rdfs-full-lubm10"):
+        record = {"case": case, "status": "ok", "samples": {"reason.p50_ms": [ms, ms]}, "metric": ms}
+        if inputs is not None:
+            record["inputs"] = inputs
+        return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
+                "started": "2026-11-07T16:00:00", "records": [dict(record), dict(record)]}
+
+    def compare(self, base, new):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = compare.compare_reports(base, new)
+        return code, out.getvalue()
+
+    def test_an_old_release_against_the_new_one_gives_no_code_change_verdict(self):
+        old = {"lubm-10.nt": self.OLD, "univ-bench.nt": "u" * 64}
+        new = {"lubm-10.nt": self.NEW, "univ-bench.nt": "u" * 64}
+        code, text = self.compare(self.report(100.0, old), self.report(50.0, new))
+        self.assertIn("different input", text)
+        self.assertIn("lubm-10.nt", text)
+        self.assertNotIn("faster", text)
+        self.assertEqual(code, 2, text)  # nothing left that compares
+
+    def test_a_case_whose_loaded_bytes_aren_t_known_gets_no_verdict(self):
+        code, text = self.compare(self.report(100.0), self.report(50.0, {"lubm-10.nt": self.NEW, "univ-bench.nt": "u" * 64}))
+        self.assertIn("input unknown", text)
+        self.assertNotIn("faster", text)
+        self.assertEqual(code, 2, text)
+        # A file whose bytes a run couldn't read (the Docker runtime's volume) is unknown on both
+        # sides alike: never "the same".
+        unread = {"lubm-10.nt": None, "univ-bench.nt": None}
+        code, text = self.compare(self.report(100.0, unread), self.report(50.0, unread))
+        self.assertIn("input unknown", text)
+        self.assertNotIn("faster", text)
+
+    def test_the_same_bytes_compare_as_before(self):
+        same = {"lubm-10.nt": self.NEW, "univ-bench.nt": "u" * 64}
+        code, text = self.compare(self.report(100.0, same), self.report(50.0, same))
+        self.assertIn("faster", text)
+        self.assertNotIn("different input", text)
+        self.assertEqual(code, 0, text)
+
+    def suite_run(self, directory, ms, datasets=None, digests=None):
+        path = write(directory, [load(), query("q1", ms), query("q1", ms, run=2), query("q1", ms, run=3)])
+        invocation = {"machine": {"host": "fixture", "governor": "performance"}, "started": "2026-11-07T16:00:00",
+                      "datasets": datasets or {}}
+        if digests is not None:
+            invocation["dataset_sha256"] = digests
+        (directory / "manifest.json").write_text(json.dumps({"schema": 1, "invocations": [invocation]}),
+                                                 encoding="utf-8")
+        return path
+
+    def test_suite_results_of_another_release_give_no_verdict(self):
+        """The orchestrator, 7 Nov 2026 (16:55): suite results are compared by their own path
+        (compare.main -> compare_pairs), which printed faster or slower across another release of a
+        dataset. The same rule holds there: the /data files both runs read, the same bytes, or no
+        verdict; without recorded hashes, another size is another input and the same size unknown."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            old = self.suite_run(d / "old", 100, {"/data/lubm-10.nt": 231509261})
+            new = self.suite_run(d / "new", 50, {"/data/lubm-10.nt": 224996086})
+            text = output(compare.main, [str(old), str(new)])
+            self.assertIn("different input", text)
+            self.assertNotIn("faster", text)
+            self.assertEqual(compare.main([str(old), str(new)]), 2)
+            same_size = self.suite_run(d / "same-size", 50, {"/data/lubm-10.nt": 231509261})
+            self.assertIn("input unknown", output(compare.main, [str(old), str(same_size)]))
+            # Recorded hashes decide: the same bytes compare as before.
+            a = self.suite_run(d / "a", 100, {"/data/lubm-10.nt": 1}, {"/data/lubm-10.nt": "s" * 64})
+            b = self.suite_run(d / "b", 50, {"/data/lubm-10.nt": 1}, {"/data/lubm-10.nt": "s" * 64})
+            text = output(compare.main, [str(a), str(b)])
+            self.assertNotIn("different input", text)
+            self.assertNotIn("input unknown", text)
+            self.assertIn("faster", text)
+
+    def test_a_perf_lab_case_compares_on_the_same_bytes_and_is_refused_on_others(self):
+        """The orchestrator, 7 Nov 2026 (17:12): leads compare perf-lab runs (the `lab-*` cases, the
+        perf lab through fast.py) for counts; their records say what they loaded like every case."""
+        same = {"olympics.nt": "o" * 64}
+        code, text = self.compare(self.report(100.0, same, case="lab-olympics"),
+                                  self.report(50.0, same, case="lab-olympics"))
+        self.assertIn("faster", text)
+        self.assertEqual(code, 0, text)
+        code, text = self.compare(self.report(100.0, same, case="lab-olympics"),
+                                  self.report(50.0, {"olympics.nt": "p" * 64}, case="lab-olympics"))
+        self.assertIn("different input", text)
+        self.assertNotIn("faster", text)
+        self.assertEqual(code, 2, text)
+
+    def test_a_case_of_generated_data_alone_needs_no_recorded_inputs(self):
+        code, text = self.compare(self.report(100.0, case="rl-hierarchy"), self.report(50.0, case="rl-hierarchy"))
+        self.assertIn("faster", text)
+        self.assertEqual(code, 0, text)
+        # Sol-loop r3 V3: an older record without `inputs` against a new one saying {} (none read).
+        code, text = self.compare(self.report(100.0, case="rl-hierarchy"), self.report(50.0, {}, case="rl-hierarchy"))
+        self.assertIn("faster", text)
+        self.assertEqual(code, 0, text)
+
+    ABSENT = object()  # a record before 7 Nov 2026: no `inputs` key at all
+
+    def reps(self, ms, observations, case="rl-hierarchy"):
+        """A report of one case whose records each say what they loaded: a mapping, or ABSENT."""
+        records = []
+        for rep, seen in enumerate(observations, 1):
+            record = {"case": case, "rep": rep, "status": "ok", "samples": {"reason.p50_ms": [ms, ms]}, "metric": ms}
+            if seen is not self.ABSENT:
+                record["inputs"] = seen
+            records.append(record)
+        return {"reps": len(records), "machine": {"host": "fixture", "governor": "performance"},
+                "started": "2026-11-07T16:00:00", "records": records}
+
+    def test_recorded_external_bytes_that_disagree_are_not_generated_data(self):
+        """Fix check r3, R3-W1 (7 Nov 2026): a case that once loaded a frozen file (`volume:history.nt`)
+        and now generates its data under the same name (today's rl-hierarchy declares no input). A
+        historical run without --prepared recorded other bytes of that file in its two repetitions; its
+        records collapsed to "unknown", the generated-only exemption read that as "no input", and the
+        new run came out faster, exit 0. Specified (the review's required correction): the exemption
+        holds only where no record on either side names an external file; recorded external evidence
+        that disagrees, or that only some records state, is unknown and refused before pooling."""
+        a, b = {"history.nt": "a" * 64}, {"history.nt": "b" * 64}
+        generated = [{}, {}]
+        for label, old, new in (("the base's repetitions disagree", [a, b], generated),
+                                ("one base repetition records a file, one says nothing", [a, self.ABSENT], generated),
+                                ("one base repetition records a file, one records none", [a, {}], generated),
+                                ("the base disagrees, the new run says nothing", [a, b], [self.ABSENT, self.ABSENT]),
+                                ("both sides disagree", [a, b], [b, a]),
+                                ("the new run's repetitions disagree", generated, [a, b])):
+            with self.subTest(label):
+                code, text = self.compare(self.reps(100.0, old), self.reps(50.0, new))
+                self.assertEqual(code, 2, text)
+                self.assertNotIn("faster", text)
+                self.assertIn("input unknown", text)
+        # The public entry point (suite.py compare / fast.py compare BASE.json NEW.json), the review's witness.
+        with tempfile.TemporaryDirectory() as d:
+            old, new = Path(d) / "history-base.json", Path(d) / "history-new.json"
+            old.write_text(json.dumps(self.reps(100.0, [a, b])), encoding="utf-8")
+            new.write_text(json.dumps(self.reps(50.0, generated)), encoding="utf-8")
+            self.assertEqual(compare.main([str(old), str(new)]), 2)
+            text = output(compare.main, [str(old), str(new)])
+            self.assertNotIn("faster", text)
+            self.assertIn("input unknown", text)
+
+    def test_an_inputs_field_that_isn_t_a_mapping_is_not_none(self):
+        """Design note r3w1, invariant 1: a record that has `inputs` but not as a mapping of file to
+        hash says something was recorded, not that nothing was loaded; for a case of generated data
+        today it is unknown, never the generated-only exemption."""
+        for seen in (None, [], "lubm-10.nt", 0):
+            with self.subTest(inputs=seen):
+                code, text = self.compare(self.reps(100.0, [seen, seen]), self.reps(50.0, [{}, {}]))
+                self.assertEqual(code, 2, text)
+                self.assertNotIn("faster", text)
+
+    def test_generated_data_alone_compares_whatever_mix_of_old_and_new_records(self):
+        """Sol-loop r3 V3, kept by R3-W1's correction: records that name no external file, older ones
+        without `inputs` and newer ones saying {} in any mix, on either side, compare."""
+        for old, new in (([self.ABSENT, {}], [{}, {}]), ([{}, {}], [self.ABSENT, {}]),
+                         ([self.ABSENT, self.ABSENT], [{}, self.ABSENT]), ([{}, {}], [{}, {}])):
+            with self.subTest(old=old, new=new):
+                code, text = self.compare(self.reps(100.0, old), self.reps(50.0, new))
+                self.assertEqual(code, 0, text)
+                self.assertIn("faster", text)
+                self.assertNotIn("input unknown", text)
+
+    def test_a_case_s_agreeing_records_compare_and_one_silent_record_doesn_t(self):
+        """A case that loads frozen files: every record stating the same bytes on both sides compares;
+        one record that doesn't say makes its side unknown (R3-W1's correction: no record's
+        observation is dropped on the way to the decision)."""
+        same = {"lubm-10.nt": self.NEW, "univ-bench.nt": "u" * 64}
+        code, text = self.compare(self.reps(100.0, [same, same], "rdfs-full-lubm10"),
+                                  self.reps(50.0, [same, same], "rdfs-full-lubm10"))
+        self.assertEqual(code, 0, text)
+        self.assertIn("faster", text)
+        code, text = self.compare(self.reps(100.0, [same, self.ABSENT], "rdfs-full-lubm10"),
+                                  self.reps(50.0, [same, same], "rdfs-full-lubm10"))
+        self.assertEqual(code, 2, text)
+        self.assertNotIn("faster", text)
+        self.assertIn("input unknown", text)
+
+    def test_a_concatenation_s_order_is_part_of_its_input(self):
+        """Sol-loop r3 V2: the same parts concatenated in another order are other bytes loaded."""
+        a = {"lubm-1.nt": "l" * 64, "univ-bench.nt": "u" * 64, "concat 1": "a" * 64}
+        b = {"lubm-1.nt": "l" * 64, "univ-bench.nt": "u" * 64, "concat 1": "b" * 64}
+        code, text = self.compare(self.report(100.0, a, case="dl-abox-lubm1"), self.report(50.0, b, case="dl-abox-lubm1"))
+        self.assertIn("different input", text)
+        self.assertEqual(code, 2, text)
+
+    def test_an_ore_case_s_converted_ontology_is_its_input(self):
+        """Fix check r2, R2-W2: an `ore:` case loads a converted external ontology, not generated data;
+        it was taken as input-free, and the registry's shortcut even dropped two different recorded
+        hashes. Recorded identities come first; without them the input is unknown."""
+        a, b = {"ore:ore_ont_9724": "a" * 64}, {"ore:ore_ont_9724": "b" * 64}
+        code, text = self.compare(self.report(100.0, a, case="ctx-ore-9724"), self.report(50.0, b, case="ctx-ore-9724"))
+        self.assertEqual(code, 2, text)
+        self.assertNotIn("faster", text)
+        self.assertIn("different input", text)
+        code, text = self.compare(self.report(100.0, case="ctx-ore-9724"), self.report(50.0, case="ctx-ore-9724"))
+        self.assertEqual(code, 2, text)  # an older report: unknown, never "none"
+        self.assertIn("input unknown", text)
+        code, text = self.compare(self.report(100.0, a, case="ctx-ore-9724"), self.report(50.0, a, case="ctx-ore-9724"))
+        self.assertEqual(code, 0, text)
+        self.assertIn("faster", text)
+
+    def test_suite_results_hashing_a_file_they_don_t_list_by_size_hold_to_it(self):
+        """Fix check r2, R2-W1: a hash in `dataset_sha256` for a file outside `datasets` was dropped,
+        and two runs of other bytes compared (commit-latency loads LUBM its plan doesn't declare)."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            old = self.suite_run(d / "old", 100, {}, {"/data/lubm-10.nt": "o" * 64})
+            new = self.suite_run(d / "new", 50, {}, {"/data/lubm-10.nt": "n" * 64})
+            self.assertEqual(compare.main([str(old), str(new)]), 2)
+            text = output(compare.main, [str(old), str(new)])
+            self.assertNotIn("faster", text)
+            self.assertIn("different input", text)
+            same = self.suite_run(d / "same", 50, {}, {"/data/lubm-10.nt": "o" * 64})
+            self.assertIn("faster", output(compare.main, [str(old), str(same)]))
+
+    def test_invocations_agreeing_on_a_hash_hold_whatever_size_each_lists(self):
+        """Sol-loop r5 X1: two invocations hashing a file alike, one listing its size and one not, were
+        taken as disagreeing, and a same-bytes comparison was refused."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            runs = []
+            for name, ms in (("old", 100), ("new", 50)):
+                path = self.suite_run(d / name, ms)
+                invocation = {"machine": {"host": "fixture", "governor": "performance"}, "started": "2026-11-07T16:00:00",
+                              "dataset_sha256": {"/data/lubm-10.nt": "s" * 64}}
+                (d / name / "manifest.json").write_text(json.dumps({"schema": 1, "invocations": [
+                    {**invocation, "datasets": {}}, {**invocation, "datasets": {"/data/lubm-10.nt": 224996086}}]}),
+                    encoding="utf-8")
+                runs.append(path)
+            self.assertEqual(compare.main([str(runs[0]), str(runs[1])]), 0)
+            self.assertIn("faster", output(compare.main, [str(runs[0]), str(runs[1])]))
+
+    def test_a_case_s_declared_input_missing_from_a_record_is_unknown(self):
+        """The orchestrator, 7 Nov 2026 (18:12): a declared input a record doesn't hash, or a hash for
+        an input the case doesn't declare, is unknown, never none."""
+        code, text = self.compare(self.report(100.0, {"lubm-10.nt": "x" * 64}),
+                                  self.report(50.0, {"lubm-10.nt": "x" * 64}))  # univ-bench.nt unhashed
+        self.assertEqual(code, 2, text)
+        self.assertIn("input unknown", text)
+        extra = {"lubm-10.nt": "x" * 64, "univ-bench.nt": "u" * 64, "lubm-100.nt": "y" * 64}
+        code, text = self.compare(self.report(100.0, extra), self.report(50.0, extra))
+        self.assertEqual(code, 2, text)
+        self.assertIn("input unknown", text)
+
+    def test_suite_results_that_don_t_list_their_inputs_hashes_are_unknown(self):
+        """Sol-loop r3 V1: `datasets: {}` doesn't prove a run read no frozen file (commit-latency
+        loads LUBM outside its declared inputs, maintenance.py). Only a manifest that states its
+        inputs' hashes (`dataset_sha256`, `{}` included) establishes them."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            old, new = self.suite_run(d / "old", 100, {}), self.suite_run(d / "new", 50, {})
+            text = output(compare.main, [str(old), str(new)])
+            self.assertIn("input unknown", text)
+            self.assertNotIn("faster", text)
+            stated_old = self.suite_run(d / "so", 100, {}, {})
+            stated_new = self.suite_run(d / "sn", 50, {}, {})
+            self.assertIn("faster", output(compare.main, [str(stated_old), str(stated_new)]))
 
 
 class Contracts(unittest.TestCase):

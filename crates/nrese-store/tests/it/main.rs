@@ -29,6 +29,7 @@ mod repository_catalog_tests;
 mod scope_tests;
 mod search_scope_tests;
 mod shacl_gate_tests;
+mod shacl_request_shapes_tests;
 mod store_service_tests;
 mod support_cap_tests;
 mod user_rules_tests;

@@ -241,6 +241,15 @@ systems = []
         self.assertEqual((timed["env"]["GATE_HOST"], read), ("office-pc", ["office-pc"]))
         self.assertIn("pin_reason", timed)
 
+    def test_a_job_asks_for_what_making_its_data_takes(self):
+        """Orchestrator, 7 Nov 2026: a set makes the datasets its cases read where its host lacks
+        them (LUBM's in Docker), so it asks for Docker and the disk to make them in, not the bench
+        assets; asked for nothing, it could land where its data can be neither found nor made."""
+        self.path.write_bytes(abba.family_text("t", {"a": A, "b": B}, ["dlmode-lubm1"], 6).encode("utf-8"))
+        job = next(iter(abba.jobs(self.load(), B, self.repo.as_posix()).values()))
+        self.assertEqual(job["requires"].get("has"), ["docker"])
+        self.assertGreaterEqual(job["requires"].get("disk_gb", 0), 1)
+
     def test_one_job_asks_by_capability_and_builds_where_it_times(self):
         """The brief of 2 Nov 2026: no host names. A build job and a timed job pinned to one host
         were the only way to time where the binaries were built; one job does both, its host held
