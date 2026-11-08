@@ -1474,6 +1474,272 @@ fn existentials_bounded_restrictions_force_are_answered_or_reported() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// A `complete` status under a regime is claimed only where every axiom an answer's terms
+/// can meet is in that regime's profile, or covered by a hazard (I24c; master's ruling of
+/// 8 Nov 10:31). The profile's rules are complete only for its ontologies (W3C OWL 2
+/// Profiles, theorem PR1). Each `true` below is entailed under the OWL 2 Direct Semantics.
+///
+/// Answered true, or not reported `complete`:
+/// - W-N1 (I24b r4 review): `C ⊑ ∀R.Self(S)` with `c : C`, `R(c, x)`: `S(x, x)`.
+/// - W-N2: `C ⊑ ∀R.{a}` with `c : C`, `R(c, x)`, `a : D`: `x = a`, so `x : D`.
+/// - Under owl2-ql, `Person ⊓ Employed ⊑ Worker ⊑ Taxpayer` with `x : Person, Employed`:
+///   `x : Taxpayer`, on a superclass of the uncovered conclusion.
+/// - `C ⊑ ∃R.Self`, `R` with domain `D`, `D ⊓ F ⊑ G`, with `x : C, F`: `x : G`. The chain
+///   runs through two axioms in the RL profile, which RL's rules apply only to facts the
+///   closure has.
+/// - Review r1 F1: `C ⊑ {a}` with `c : C`, `a : D`: `c = a`, so `c : D`.
+/// - F2: `C ⊑ ¬¬D` with `c : C`: `c : D`. Neither the TBox nor the closure removes the
+///   double complement.
+/// - F2: `C ⊑ ¬(≥ 2 R)` with `c : C`, `R(c, x)`, `R(c, y)`, `x : D`: `x = y`, so `y : D`.
+/// - Sol r1 S1: `C ⊑ ≤ 0 R.¬D` with `R(c, x)`: `x : D`. With `≤ 0 R.¬{a}` and `a : D`:
+///   `x = a`, so `x : D`.
+/// - Sol r3 S4: `C ⊑ ≤ 0 R.¬∃S.(∀S⁻.{a})` with `R(c, x)`, `a : D`: `x = a`, so `x : D`.
+/// - Fix check r1 F1: `C ⊑ ≤ 0 R.¬∃S.({a} ⊓ {b})` with `R(c, x)`, `a : D`: `x`'s
+///   `S`-successor is `a` and `b`, so `b : D`.
+///
+/// Guards, each with its specified answer, compared first:
+/// - `x : Person` and `x : Employed` of the third case, terms of the same axiom that no
+///   uncovered conclusion reaches: `x`, complete (owl2-ql).
+/// - Review r1 F3: after `A ⊓ B ⊑ C` and `C ⊑ ∀R.D`, the edges of `R`, which the universal
+///   adds none of: `(c, z)`, complete (owl2-ql).
+/// - Fix check r1 F2: `C ⊑ ≥ 0 S.(∀T.{a})` concludes nothing: `Z` is `z`, complete (both).
+/// - R1-F4 `C ⊑ ∀R.¬{a}`, Sol r1 S2 `C ⊑ = 0 R.{a}`, Sol r2 S3 `C ⊑ ≤ 0 R.¬∃S.{a}`: `Z` is
+///   `z`. They equate nobody, but equality is fail-closed for any nominal (master, 8 Nov
+///   12:41), so their status isn't required.
+#[test]
+fn axioms_outside_the_profile_are_answered_or_reported() {
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n"
+    );
+    let cases = [
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ; owl:allValuesFrom
+                     [ a owl:Restriction ; owl:onProperty :S ; owl:hasSelf true ] ] .
+                 :c a :C ; :R :x ."
+            ),
+            format!("ASK {{ <{E}x> <{E}S> <{E}x> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                     owl:allValuesFrom [ a owl:Class ; owl:oneOf ( :a ) ] ] .
+                 :c a :C ; :R :x . :a a :D ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}D> }}"),
+        ),
+        (
+            format!(
+                "{head}[ owl:intersectionOf ( :Person :Employed ) ] rdfs:subClassOf :Worker .
+                 :Worker rdfs:subClassOf :Taxpayer .
+                 :x a :Person, :Employed ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}Taxpayer> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ; owl:hasSelf true ] .
+                 :R rdfs:domain :D .
+                 [ owl:intersectionOf ( :D :F ) ] rdfs:subClassOf :G .
+                 :x a :C, :F ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}G> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Class ; owl:oneOf ( :a ) ] .
+                 :c a :C . :a a :D ."
+            ),
+            format!("ASK {{ <{E}c> a <{E}D> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ owl:complementOf [ owl:complementOf :D ] ] .
+                 :c a :C ."
+            ),
+            format!("ASK {{ <{E}c> a <{E}D> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ owl:complementOf [ a owl:Restriction ;
+                     owl:onProperty :R ; owl:minCardinality 2 ] ] .
+                 :c a :C ; :R :x , :y . :x a :D ."
+            ),
+            format!("ASK {{ <{E}y> a <{E}D> }}"),
+        ),
+        // Sol r1 S1: `≤ 0 R.F` puts every successor outside `F`.
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                     owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                     owl:onClass [ owl:complementOf :D ] ] .
+                 :c a :C ; :R :x ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}D> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                     owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                     owl:onClass [ owl:complementOf [ a owl:Class ; owl:oneOf ( :a ) ] ] ] .
+                 :c a :C ; :R :x . :a a :D ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}D> }}"),
+        ),
+        // Sol r3 S4: `≤ 0 R.¬∃S.(∀S⁻.{a})` gives `x` an `S`-successor whose every
+        // `S`-predecessor, `x` among them, is `a`.
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                     owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                     owl:onClass [ owl:complementOf [ a owl:Restriction ; owl:onProperty :S ;
+                         owl:someValuesFrom [ a owl:Restriction ; owl:onProperty [ owl:inverseOf :S ] ;
+                             owl:allValuesFrom [ a owl:Class ; owl:oneOf ( :a ) ] ] ] ] ] .
+                 :c a :C ; :R :x . :a a :D ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}D> }}"),
+        ),
+        // Fix check r1 F1: `x`'s required `S`-successor is both `a` and `b`, so `a = b`
+        // and `b : D`.
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                     owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                     owl:onClass [ owl:complementOf [ a owl:Restriction ; owl:onProperty :S ;
+                         owl:someValuesFrom [ owl:intersectionOf (
+                             [ owl:oneOf ( :a ) ] [ owl:oneOf ( :b ) ] ) ] ] ] ] .
+                 :c a :C ; :R :x . :a a :D ."
+            ),
+            format!("ASK {{ <{E}b> a <{E}D> }}"),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (n, (turtle, query)) in cases.iter().enumerate() {
+        for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(turtle, dir.path(), ruleset, true);
+            let result = store
+                .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                .unwrap_or_else(|e| panic!("case {n}, {query}: {e}"));
+            let answer = String::from_utf8(result.payload).unwrap();
+            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+            if !answer.contains("true") && matches!(status, "complete" | "none") {
+                wrong.push(format!(
+                    "case {n}, {}, {query}: {answer}, {status}",
+                    ruleset.name()
+                ));
+            }
+        }
+    }
+    let universal = format!(
+        "{head}[ owl:intersectionOf ( :A :B ) ] rdfs:subClassOf :C .
+         :C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ; owl:allValuesFrom :D ] .
+         :c a :A, :B ; :R :z ."
+    );
+    let not_a = format!(
+        "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+             owl:allValuesFrom [ owl:complementOf [ a owl:Class ; owl:oneOf ( :a ) ] ] ] .
+         :c a :C ; :R :b . :z a :Z ."
+    );
+    // Sol r1 S2: `= 0 R.{a}` keeps successors away from `a`, equating nobody.
+    let zero_a = format!(
+        "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+             owl:qualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+             owl:onClass [ a owl:Class ; owl:oneOf ( :a ) ] ] .
+         :c a :C . :z a :Z ."
+    );
+    // Sol r2 S3: `≤ 0 R.¬∃S.{a}` is `∀R.∃S.{a}`, an edge to `a`, equating nobody.
+    let edge_to_a = format!(
+        "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+             owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+             owl:onClass [ owl:complementOf [ a owl:Restriction ; owl:onProperty :S ;
+                 owl:someValuesFrom [ a owl:Class ; owl:oneOf ( :a ) ] ] ] ] .
+         :c a :C ; :R :x . :z a :Z ."
+    );
+    // Fix check r1 F2: `≥ 0 S.F` holds of everything and requires no successor.
+    let at_least_zero = format!(
+        "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :S ;
+             owl:minQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+             owl:onClass [ a owl:Restriction ; owl:onProperty :T ;
+                 owl:allValuesFrom [ a owl:Class ; owl:oneOf ( :a ) ] ] ] .
+         :c a :C . :z a :Z ."
+    );
+    let both = vec![Ruleset::Owl2Ql, Ruleset::Owl2Rl];
+    let ql = vec![Ruleset::Owl2Ql];
+    let z_query = format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}");
+    let z = vec![format!("x={E}z")];
+    // Each guard's specified rows, compared before its status (fix check r1, F3), and
+    // whether `complete` is required. The nominal guards of R1-F4, S2 and S3 keep their
+    // answers only: equality is fail-closed for any nominal (master, 12:41).
+    let guards = [
+        (
+            &cases[2].0,
+            ql.clone(),
+            format!("SELECT ?x WHERE {{ ?x a <{E}Person> }}"),
+            vec![format!("x={E}x")],
+            true,
+        ),
+        (
+            &cases[2].0,
+            ql.clone(),
+            format!("SELECT ?x WHERE {{ ?x a <{E}Employed> }}"),
+            vec![format!("x={E}x")],
+            true,
+        ),
+        (
+            &universal,
+            ql,
+            format!("SELECT ?x ?y WHERE {{ ?x <{E}R> ?y }}"),
+            vec![format!("x={E}c y={E}z")],
+            true,
+        ),
+        (&not_a, both.clone(), z_query.clone(), z.clone(), false),
+        (&zero_a, both.clone(), z_query.clone(), z.clone(), false),
+        (&edge_to_a, both.clone(), z_query.clone(), z.clone(), false),
+        (&at_least_zero, both, z_query, z, true),
+    ];
+    for (turtle, rulesets, query, expected, complete) in guards {
+        for ruleset in rulesets {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(turtle, dir.path(), ruleset, true);
+            let result = store
+                .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&result.payload).unwrap();
+            let mut rows: Vec<String> = json["results"]["bindings"]
+                .as_array()
+                .expect("bindings")
+                .iter()
+                .map(|row| {
+                    let mut cells: Vec<String> = row
+                        .as_object()
+                        .expect("a row")
+                        .iter()
+                        .map(|(var, v)| format!("{var}={}", v["value"].as_str().unwrap_or("")))
+                        .collect();
+                    cells.sort();
+                    cells.join(" ")
+                })
+                .collect();
+            rows.sort();
+            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+            if rows != expected {
+                wrong.push(format!(
+                    "guard, {}, {query}: {rows:?}, expected {expected:?}",
+                    ruleset.name()
+                ));
+            } else if complete && !matches!(status, "complete" | "none") {
+                wrong.push(format!(
+                    "guard, {}, {query}: {status}, expected complete",
+                    ruleset.name()
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A rewritten query reads only what its reader may (design §1), and uses the schema as
 /// the RL closure the reader sees was computed: a reader who sees the inferences its graphs
 /// support (`inferred = "supported"`) gets the existentials of readable graphs only, one who
