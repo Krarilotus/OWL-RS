@@ -199,6 +199,8 @@ impl AccessControl {
         let before = self.state();
         let mut after = (*before).clone();
         let summary = after.apply(by, change)?;
+        // The records it creates are named by its number (SYN-64).
+        after.identify_new(&before, *next);
         let graph = iri(STATE_GRAPH);
         let old: BTreeSet<Quad> = rdf::encode(&before, &graph).into_iter().collect();
         let new: BTreeSet<Quad> = rdf::encode(&after, &graph).into_iter().collect();

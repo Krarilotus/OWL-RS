@@ -9,8 +9,12 @@
 //!     nra:defaultGraph "read" .
 //! <urn:nrese:user:alice> a nra:User ; nra:name "alice" ; nra:admin false ; nra:role "analyst" .
 //! <urn:nrese:workspace:project> a nra:Workspace ; nra:name "project" ; nra:title "Project" ;
-//!     nra:owner <urn:nrese:user:alice> ; nra:viewer <urn:nrese:user:bob> .
+//!     nra:owner <urn:nrese:user:alice> ; nra:viewer <urn:nrese:user:bob> ; nra:id 7 .
 //! ```
+//!
+//! `nra:id` is the number of the change that created a workspace, or a user with a local
+//! login: its graph prefix carries it, so a name used again starts empty
+//! ([`super::AccessState::prefix`]). Records from before ids have none.
 
 use std::collections::BTreeMap;
 
@@ -121,6 +125,9 @@ pub(super) fn encode(state: &AccessState, graph: &NamedNode) -> Vec<Quad> {
         integer(s.min_password_length),
     );
     push(&settings, "sessionHours", integer(s.session_hours));
+    let id = |value: u64| -> Term {
+        Literal::new_typed_literal(value.to_string(), iri(XSD_INTEGER)).into()
+    };
     for rule in state.roles.values() {
         let subject = iri(&format!("{ROLE}{}", encode_name(&rule.name)));
         push(&subject, "a", term("Role").into());
@@ -154,6 +161,9 @@ pub(super) fn encode(state: &AccessState, graph: &NamedNode) -> Vec<Quad> {
         if let Some(hash) = &user.password_hash {
             push(&subject, "passwordHash", text(hash));
         }
+        if let Some(number) = user.id {
+            push(&subject, "id", id(number));
+        }
     }
     for (name, workspace) in &state.workspaces {
         let subject = iri(&format!("{WORKSPACE}{}", encode_name(name)));
@@ -170,6 +180,9 @@ pub(super) fn encode(state: &AccessState, graph: &NamedNode) -> Vec<Quad> {
         }
         for (member, level) in &workspace.members {
             push(&subject, level.name(), user_iri(member).into());
+        }
+        if let Some(number) = workspace.id {
+            push(&subject, "id", id(number));
         }
     }
     quads
@@ -217,6 +230,8 @@ pub(super) fn decode(quads: &[Quad], base: &str) -> AccessState {
                 .collect()
         };
         let flag = |local: &str| get(local).is_some_and(|v| v == "true" || v == "1");
+        // A record from before ids has none: its space keeps its prefix (SYN-64).
+        let id = || get("id").and_then(|v| v.parse::<u64>().ok());
         if subject == SETTINGS {
             let settings = &mut state.settings;
             settings.enforced = flag("enforced");
@@ -266,8 +281,10 @@ pub(super) fn decode(quads: &[Quad], base: &str) -> AccessState {
             user.admin = flag("admin");
             user.roles = all("role").into_iter().collect();
             user.password_hash = get("passwordHash");
+            user.id = id();
         } else if subject.starts_with(WORKSPACE) {
             let workspace = state.workspaces.entry(name).or_default();
+            workspace.id = id();
             workspace.title = get("title");
             workspace.repository = get("repository");
             workspace.graphs = all("graph");

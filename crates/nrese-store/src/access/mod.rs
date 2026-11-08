@@ -181,11 +181,19 @@ pub struct User {
     pub roles: BTreeSet<String>,
     /// The PHC string of its local login's password, if it has one.
     pub password_hash: Option<String>,
+    /// The change that created it, if it was created with a local login: its personal
+    /// space's prefix carries it ([`AccessState::prefix`]). `None` for a user from before
+    /// ids, or one whose name its credentials give (a token's subject).
+    pub id: Option<u64>,
 }
 
 /// A workspace.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Workspace {
+    /// The change that created it: its prefix carries it, so a workspace removed and
+    /// created again under its name starts empty ([`AccessState::prefix`]). `None` for one
+    /// from before ids, which keeps its prefix.
+    pub id: Option<u64>,
     pub title: Option<String>,
     /// The repository it is in; `None`: every repository.
     pub repository: Option<String>,
@@ -335,6 +343,15 @@ pub fn personal_space(user: &str) -> String {
     format!("~{user}")
 }
 
+/// What names one incarnation of a space, in its graph prefix and its saved queries'
+/// IRIs: `name`, and `~{id}` after it when it has an id (SYN-64).
+fn space_key(name: &str, id: Option<u64>) -> String {
+    match id {
+        Some(id) => format!("{name}~{id}"),
+        None => name.to_owned(),
+    }
+}
+
 /// Whether `name` can name a user: letters, digits and `. _ @ + | : -`, at most 128.
 pub fn valid_user_name(name: &str) -> bool {
     !name.is_empty()
@@ -437,11 +454,44 @@ impl AccessState {
     }
 
     /// The graph IRI prefix of workspace `name`: `{base}space/{user}/` for a personal
-    /// space, `{base}workspace/{name}/` for the others.
+    /// space, `{base}workspace/{name}/` for the others; with `~{id}` after the name for a
+    /// space with an id ([`Self::space_id`]), so that no two incarnations of a name share
+    /// graphs (SYN-64). Names hold no `~`: the prefixes of incarnations are disjoint.
     pub fn prefix(&self, name: &str) -> String {
+        let (kind, bare) = match name.strip_prefix('~') {
+            Some(user) => ("space", user),
+            None => ("workspace", name),
+        };
+        format!(
+            "{}{kind}/{}/",
+            self.base,
+            space_key(&encode_name(bare), self.space_id(name))
+        )
+    }
+
+    /// The id of space `name`'s current incarnation: its workspace's, or for a personal
+    /// space its user's. `None` for one from before ids, or without a record.
+    pub fn space_id(&self, name: &str) -> Option<u64> {
         match name.strip_prefix('~') {
-            Some(user) => format!("{}space/{}/", self.base, encode_name(user)),
-            None => format!("{}workspace/{}/", self.base, encode_name(name)),
+            Some(user) => self.users.get(user).and_then(|user| user.id),
+            None => self.workspaces.get(name).and_then(|workspace| workspace.id),
+        }
+    }
+
+    /// Gives each workspace this state has and `before` hadn't, and each user it has and
+    /// `before` hadn't that has a local login, the id `number` (the number of the change
+    /// that made this state from `before`; one change creates one record at most).
+    fn identify_new(&mut self, before: &AccessState, number: u64) {
+        // A personal space's record (its sharing) takes its user's id.
+        for (name, workspace) in &mut self.workspaces {
+            if !name.starts_with('~') && !before.workspaces.contains_key(name) {
+                workspace.id = Some(number);
+            }
+        }
+        for (name, user) in &mut self.users {
+            if !before.users.contains_key(name) && user.password_hash.is_some() {
+                user.id = Some(number);
+            }
         }
     }
 
