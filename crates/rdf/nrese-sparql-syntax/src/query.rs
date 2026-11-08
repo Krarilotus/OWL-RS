@@ -114,8 +114,8 @@ impl fmt::Display for Update {
     }
 }
 
-/// One operation of an update. `ADD`, `MOVE` and `COPY` become `DeleteInsert` and `Drop`
-/// as SPARQL 1.1 Update §3.2 defines them.
+/// One operation of an update. `MOVE` and `COPY` become `Drop` and [`Self::Add`] as SPARQL 1.1
+/// Update §3.2.4–3.2.5 define them; a transfer of a graph to itself is no operation.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum GraphUpdateOperation {
     InsertData {
@@ -146,6 +146,15 @@ pub enum GraphUpdateOperation {
     Drop {
         silent: bool,
         graph: GraphTarget,
+    },
+    /// `ADD`, and the copy step of `MOVE` and `COPY` (§3.2.3): every statement the Graph
+    /// Store holds in `from` inserted into `to`. Its input is that graph as stored, whatever
+    /// a `WHERE` clause would read: not a union default graph, inferred statements or a
+    /// protocol dataset (SYN-54). `from` and `to` differ.
+    Add {
+        silent: bool,
+        from: GraphName,
+        to: GraphName,
     },
 }
 

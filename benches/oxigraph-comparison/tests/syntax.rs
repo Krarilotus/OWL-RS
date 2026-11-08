@@ -13,7 +13,9 @@
 //!   `-01`, `-.5`, `-1.5e3`, `-9223372036854775808`) is unresolved, since spargebra reads the
 //!   token and the expression (`+(1)`) alike though they are two terms;
 //! - the shape of a nest of `&&` or `||` (both associative): nrese balances it, spargebra
-//!   folds it left.
+//!   folds it left;
+//! - `ADD` and the copy step of `MOVE` and `COPY`: nrese keeps the operation (it reads the
+//!   stored graph, SYN-54), spargebra lowers it to the `DELETE`/`INSERT` §3.2.3 defines it as.
 //!
 //! Every other difference is listed. Those explained (spargebra's right-associative
 //! `-` and `/`, and what each accepts or rejects) are checked to be exactly the expected
@@ -327,9 +329,7 @@ impl Names {
                 expr: self.expr(expr),
                 inner: b(self, inner),
             },
-            S::Union { left, right } => {
-                P::union_all(vec![self.pattern(left), self.pattern(right)])
-            }
+            S::Union { left, right } => P::union_all(vec![self.pattern(left), self.pattern(right)]),
             S::Graph { name, inner } => P::Graph {
                 name: self.nnp(name),
                 inner: b(self, inner),
@@ -938,10 +938,40 @@ fn canonical(mut query: Query) -> Canonical {
     }
 }
 
+/// spargebra's form of nrese's `ADD`: the `DeleteInsert` SPARQL 1.1 Update §3.2.3 defines it
+/// as, `?s ?p ?o` of `from` into `to`.
+fn lowered(from: &GraphName, to: &GraphName) -> U {
+    let [s, p, o] = ["s", "p", "o"].map(Variable::new_unchecked);
+    let bgp = P::Bgp {
+        patterns: vec![TriplePattern::new(s.clone(), p.clone(), o.clone())],
+    };
+    U::DeleteInsert {
+        delete: Vec::new(),
+        insert: vec![QuadPattern::new(
+            s,
+            p,
+            o,
+            GraphNamePattern::from(to.clone()),
+        )],
+        using: None,
+        pattern: Box::new(match from {
+            GraphName::NamedNode(from) => P::Graph {
+                name: from.clone().into(),
+                inner: Box::new(bgp),
+            },
+            GraphName::DefaultGraph => bgp,
+        }),
+    }
+}
+
 /// An update as the test compares it, as [`canonical`] a query.
 fn canonical_update(mut update: Update) -> Canonical {
     let mut names = Generated::default();
     for operation in &mut update.operations {
+        if let U::Add { from, to, .. } = operation {
+            let lowered = lowered(from, to);
+            *operation = lowered;
+        }
         match operation {
             U::InsertData { data } => {
                 for quad in data {
@@ -974,7 +1004,8 @@ fn canonical_update(mut update: Update) -> Canonical {
             | U::Load { .. }
             | U::Clear { .. }
             | U::Create { .. }
-            | U::Drop { .. } => {}
+            | U::Drop { .. }
+            | U::Add { .. } => {}
         }
     }
     Canonical {
@@ -1212,9 +1243,15 @@ fn subtraction_associates_to_the_left_in_nrese_only() {
     let ours = format!("{ours:?}");
     // spargebra: the outer subtraction's left operand is the literal 10, its right `5 - 2`.
     assert!(!theirs.contains("Subtract(Subtract("), "{theirs}");
-    assert!(theirs.contains("Subtract(Literal(Literal { value: \"10\""), "{theirs}");
+    assert!(
+        theirs.contains("Subtract(Literal(Literal { value: \"10\""),
+        "{theirs}"
+    );
     // nrese: the left operand of the outer subtraction is `10 - 5`.
-    assert!(ours.contains("Subtract(Subtract(Literal(Literal { value: \"10\""), "{ours}");
+    assert!(
+        ours.contains("Subtract(Subtract(Literal(Literal { value: \"10\""),
+        "{ours}"
+    );
 }
 
 /// SYNTAX5-F1 (Sol, PR #61 fix check 2): `&&` and `||` were reassociated in the algebra's
