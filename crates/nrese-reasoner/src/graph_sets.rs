@@ -39,7 +39,7 @@
 mod found;
 
 use std::ops::ControlFlow;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hashbrown::{HashMap, HashSet};
@@ -212,11 +212,20 @@ impl<'a> Run<'a> {
 
     /// Every task's derivations in one, its room charged first; `Err` if the run has
     /// stopped (a part may be cut short) or the room is refused.
-    fn gather(&self, parts: Vec<Found<'a>>) -> Result<Found<'a>, Stopped> {
+    ///
+    /// Gathered into the part with the most room, which usually holds them all already: a
+    /// fresh buffer of their total beside every part was the round's peak, 1.1 MB above
+    /// the base's on support-update-committed (merge-time count
+    /// `p2c5-r4-memcount1-2df9ed96`, by phase `p2c5-r4-memprof3-e2a444ec`).
+    fn gather(&self, mut parts: Vec<Found<'a>>) -> Result<Found<'a>, Stopped> {
         if self.fired() {
             return Err(self.stopped());
         }
-        let mut all = self.found();
+        let roomiest = (0..parts.len()).max_by_key(|&i| parts[i].capacity());
+        let mut all = match roomiest {
+            Some(i) => parts.swap_remove(i),
+            None => self.found(),
+        };
         all.reserve(parts.iter().map(Found::len).sum())
             .map_err(Stopped::Refused)?;
         for part in parts {
@@ -575,6 +584,11 @@ impl<'r> Lookup<'r> for Recomputing<'_, '_, 'r> {
     }
 }
 
+/// The graphs an own lookup keeps on the stack while it reads them ([`own_sets`]): 256 bytes,
+/// past the 32 graphs a fact of support-product-1024 is asserted in; a fact in more is read
+/// a second time. A stack buffer's size, not a limit: nothing is refused past it.
+const OWN_READ_ONCE: usize = 64;
+
 /// The sets `fact` starts with ([`initial_sets`] of its graphs; the empty set for an axiom,
 /// one of `axioms`, sorted), made for a lookup: one graph's set held inline is made with
 /// nothing allocated; any more are charged to `run` before they are made (fix check r2,
@@ -589,25 +603,34 @@ fn own_sets<'k, 'r>(
     if axioms.binary_search(&fact).is_ok() {
         return Ok(Some(Looked::One(GraphSet::default())));
     }
-    let (mut n, mut words, mut first) = (0usize, 0usize, None);
+    // Read once: the graphs kept on the stack as they are counted, read again only past
+    // its room (a second snapshot scan per lookup cost the product's commit-2 update 13 %,
+    // `p2c5-r4-memcount3-caded3cf`).
+    let mut seen = [0u32; OWN_READ_ONCE];
+    let (mut n, mut words) = (0usize, 0usize);
     graphs.each(fact, &mut |graph| {
+        if let Some(slot) = seen.get_mut(n) {
+            *slot = graph;
+        }
         n += 1;
         words = words.saturating_add(GraphSet::heap_bytes_of(graph));
-        first.get_or_insert(graph);
     });
-    match first {
-        None => Ok(None),
-        Some(graph) if n == 1 && words == 0 && cap > 0 => {
-            Ok(Some(Looked::One(GraphSet::of(graph))))
-        }
-        Some(_) => {
+    match n {
+        0 => Ok(None),
+        1 if words == 0 && cap > 0 => Ok(Some(Looked::One(GraphSet::of(seen[0])))),
+        _ => {
             // As `initial_sets`: `minimal` of the graphs' sets, each its own.
             let mut made = Charged::with_capacity(run, n, cap, words)?;
-            graphs.each(fact, &mut |graph| {
-                if made.sets.len() < n {
-                    made.push(GraphSet::of(graph));
-                }
-            });
+            match seen.get(..n) {
+                Some(kept) => kept
+                    .iter()
+                    .for_each(|&graph| made.push(GraphSet::of(graph))),
+                None => graphs.each(fact, &mut |graph| {
+                    if made.sets.len() < n {
+                        made.push(GraphSet::of(graph));
+                    }
+                }),
+            }
             let held = made.minimal(cap, &|_| true)?;
             Ok((!held.is_empty()).then_some(Looked::Made(held)))
         }
@@ -1354,13 +1377,13 @@ pub fn update_support_sets<S: Source + Sync + ?Sized>(
 }
 
 /// [`update_support_sets`] under one run's limits.
-fn update_support_sets_run<S: Source + Sync + ?Sized>(
+fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
     change: &Change<'_, S>,
     program: &GroundProgram,
     axioms: &[Triple],
     graphs_of: &dyn Graphs,
     cap: usize,
-    run: &Run<'_>,
+    run: &Run<'r>,
 ) -> Result<Option<HashMap<Triple, Annotation>>, Stopped> {
     let schema = program.schema_premises();
     let owned = body_rules(program);
@@ -1434,9 +1457,12 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
         .map(|(k, &(_, grounding))| (grounding, k))
         .collect();
     let premises_in_closure = |body: &[Triple]| body.iter().all(|&p| (change.in_closure)(p));
-    // Every derivation of every affected fact, against the sets as they start.
-    // Each fact's derivations charged and kept once per set as they come ([`found`]).
-    let found: Vec<(Triple, Found)> = {
+    // Every derivation of every affected fact, against the sets as they start: each fact's
+    // sets charged and kept once as they come, moved in, not copied ([`Gathered`]), then held
+    // as the base held them, a fact and its annotation, their charges in `pool` (declared
+    // first: dropped after them).
+    let pool = Pooled::new(run.scratch);
+    let found: Vec<(Triple, Annotation)> = {
         let lookup = Recomputing {
             now: &now,
             affected: &affected,
@@ -1458,21 +1484,24 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                     // found is incomplete (nothing), and the check after the pass ends the
                     // run before it is read.
                     let Some(poll) = poll.as_mut() else {
-                        return (fact, run.found());
+                        return (fact, Annotation::default());
                     };
                     if poll.attempt(1) {
-                        return (fact, run.found());
+                        return (fact, Annotation::default());
                     }
-                    // Charged and kept once per set as they come ([`found`]); a refusal
-                    // latches the run, which its pollers see.
-                    let mut from = run.found();
-                    let mut refused = false;
-                    let mut take = |found: Result<Held<'_>, BudgetExceeded>| {
+                    // Charged and kept once per set as they come ([`Gathered`]); a refusal
+                    // latches the run, which its pollers see. A derivation's mark counts
+                    // where it gave a set (as an entry's did).
+                    let mut from = Gathered::new(run.scratch);
+                    let (mut marked, mut refused) = (false, false);
+                    let mut take = |found: Result<Held<'r>, BudgetExceeded>| {
                         if refused {
                             return;
                         }
-                        let added = found
-                            .and_then(|found| from.add_all(fact, &found.sets, found.truncated));
+                        let added = found.and_then(|found| {
+                            marked |= found.truncated && !found.is_empty();
+                            from.take(found)
+                        });
                         if let Err(exceeded) = added {
                             run.refuse(exceeded);
                             refused = true;
@@ -1522,19 +1551,20 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
                         search(Grounding::Transitive(fact[1]), poll);
                     }
                     // Its copies are `minimal`'s to sort and drop, as before.
-                    (fact, from)
+                    (fact, from.into_annotation(marked, &pool))
                 },
             )
             .collect()
     };
-    run.check(held(&now, annotations) + found.capacity() * size_of::<(Triple, Found)>())?;
+    run.check(held(&now, annotations) + found.capacity() * size_of::<(Triple, Annotation)>())?;
     let mut changed: Vec<Triple> = Vec::new();
     for (fact, from) in found {
         if merge_found(
             run,
             &mut now,
             fact,
-            from.entries(),
+            from.sets.iter(),
+            from.truncated,
             cap,
             graphs_of,
             &mut annotations,
@@ -1542,6 +1572,8 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
             changed.push(fact);
         }
     }
+    // Every fact's derivations merged (and freed, or kept as its sets): their charge goes.
+    drop(pool);
     // Semi-naive rounds among the affected facts.
     while !changed.is_empty() {
         changed.sort_unstable();
@@ -1591,7 +1623,18 @@ fn update_support_sets_run<S: Source + Sync + ?Sized>(
             let fact = entries[start].0;
             let end = start + entries[start..].partition_point(|e| e.0 == fact);
             let from = &entries[start..end];
-            if merge_found(run, &mut now, fact, from, cap, graphs_of, &mut annotations)? {
+            let marked = from.iter().any(|&(_, _, marked)| marked);
+            let sets = from.iter().map(|(_, set, _)| set);
+            if merge_found(
+                run,
+                &mut now,
+                fact,
+                sets,
+                marked,
+                cap,
+                graphs_of,
+                &mut annotations,
+            )? {
                 changed.push(fact);
             }
             start = end;
@@ -1610,36 +1653,34 @@ fn words<'s>(sets: impl IntoIterator<Item = &'s GraphSet>) -> usize {
     sets.into_iter().map(GraphSet::heap_bytes).sum()
 }
 
-/// [`merge`] of one fact's reduced derivations `entries` ([`found`]) into its sets in
-/// `now`, the copies on the way charged first (sol-loop r1 S1, r2 S1/S2): the derivations'
-/// list (their slots and words), and beside it `merge`'s, at its final capacity, of the
-/// fact's sets (copied: slots and words) with the derivations (moved: slots only).
-fn merge_found(
+/// [`merge`] of one fact's derivations, their sets `found` (marked if one was: [`merge`]
+/// reads the mark as one beyond the fact's own graphs), into its sets in `now`, the copies
+/// on the way charged first (sol-loop r1 S1, r2 S1/S2): the derivations' list (their slots
+/// and words), and beside it `merge`'s, at its final capacity, of the fact's sets (copied:
+/// slots and words) with the derivations (moved: slots only).
+#[allow(clippy::too_many_arguments)]
+fn merge_found<'s>(
     run: &Run<'_>,
     now: &mut HashMap<Triple, Annotation>,
     fact: Triple,
-    entries: &[found::Entry],
+    found: impl ExactSizeIterator<Item = &'s GraphSet> + Clone,
+    marked: bool,
     cap: usize,
     graphs_of: &dyn Graphs,
     annotations: &mut usize,
 ) -> Result<bool, Stopped> {
     let (n, kept) = (
-        entries.len(),
+        found.len(),
         now.get(&fact).map_or(&[][..], |a| a.sets.as_slice()),
     );
-    let copies = slots(n)
-        + words(entries.iter().map(|(_, set, _)| set))
-        + slots(kept.len() + n)
-        + words(kept);
+    let copies = slots(n) + words(found.clone()) + slots(kept.len() + n) + words(kept);
     let _room = run.room(copies).map_err(Stopped::Refused)?;
-    Ok(merge(
-        now,
-        fact,
-        annotation_of(entries),
-        cap,
-        graphs_of,
-        annotations,
-    ))
+    let from = Annotation {
+        sets: found.cloned().collect(),
+        truncated: marked,
+        beyond_own: false,
+    };
+    Ok(merge(now, fact, from, cap, graphs_of, annotations))
 }
 
 /// An annotation of the support algebra and the charge of what its sets hold, on the run's
@@ -1799,12 +1840,44 @@ impl<'a> ChargedSet<'a> {
     }
 }
 
+/// Charges a parallel pass's tasks hand over for what they keep, held as one on `budget` and
+/// released when it drops: declared before what they charge, it drops after it, also as an
+/// unwinding pass ends (free before release).
+struct Pooled<'a> {
+    budget: &'a Budget,
+    bytes: AtomicUsize,
+}
+
+impl<'a> Pooled<'a> {
+    fn new(budget: &'a Budget) -> Self {
+        Self {
+            budget,
+            bytes: AtomicUsize::new(0),
+        }
+    }
+
+    /// `bytes` handed over (`Reservation::transfer`): held until this drops.
+    fn add(&self, bytes: usize) {
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Pooled<'_> {
+    fn drop(&mut self) {
+        drop(Reservation::adopt(self.budget, *self.bytes.get_mut()));
+    }
+}
+
 /// Sets gathered as they come under one budget, owned together: their list (charged as it
-/// grows) drops before their words' charge.
+/// grows) drops before their words' charge. Each set kept once as they come, at doubling
+/// thresholds ([`found`]'s reduction, without the fact: a fact's derivations take a set's
+/// slot each, as the base's did; merge-time count `p2c5-r4-memcount3-caded3cf`).
 struct Gathered<'a> {
     /// Before `words`: fields drop in order.
     sets: ChargedVec<GraphSet, &'a Budget>,
     words: Reservation<&'a Budget>,
+    /// The length at which the next reduction runs: twice what the last one kept.
+    reduce_at: usize,
     budget: &'a Budget,
 }
 
@@ -1813,7 +1886,40 @@ impl<'a> Gathered<'a> {
         Self {
             sets: ChargedVec::new(budget),
             words: Reservation::new(budget),
+            reduce_at: found::REDUCE_AT,
             budget,
+        }
+    }
+
+    /// Its sets sorted, each once, the dropped copies' words released.
+    fn reduce(&mut self) {
+        let sets = &mut self.sets[..];
+        sets.sort_unstable();
+        let mut write = 0;
+        for i in 0..sets.len() {
+            if write > 0 && sets[write - 1] == sets[i] {
+                continue;
+            }
+            sets.swap(write, i);
+            write += 1;
+        }
+        let dropped: usize = sets[write..].iter().map(GraphSet::heap_bytes).sum();
+        self.sets.truncate(write);
+        self.words.release(dropped);
+        self.reduce_at = found::REDUCE_AT.max(2 * write);
+    }
+
+    /// Its sets as an annotation marked `truncated`, and the bytes charged for them (their
+    /// slots and words), handed over to `pool`, which keeps them charged while the sets
+    /// live: a fact's derivations held as the base held them, a fact and its sets.
+    fn into_annotation(self, truncated: bool, pool: &Pooled<'a>) -> Annotation {
+        let Self { sets, words, .. } = self;
+        let (sets, slots) = sets.into_parts();
+        pool.add(slots.transfer() + words.transfer());
+        Annotation {
+            sets,
+            truncated,
+            beyond_own: false,
         }
     }
 
@@ -1822,6 +1928,9 @@ impl<'a> Gathered<'a> {
     /// charge. Moved, its old list is freed: of its charge, its slots' part is released and
     /// its sets' words' part handed over, not charged again.
     fn take(&mut self, mut held: Held<'a>) -> Result<(), BudgetExceeded> {
+        if self.sets.len() >= self.reduce_at {
+            self.reduce();
+        }
         let n = held.sets.len();
         let moved_words = words(&held.sets);
         let sets = &mut held.annotation.sets;
@@ -1860,16 +1969,6 @@ impl std::ops::Deref for Held<'_> {
 
     fn deref(&self) -> &Annotation {
         &self.annotation
-    }
-}
-
-/// One fact's reduced derivations ([`found`]) as an annotation: their sets, marked if one
-/// was ([`merge`] reads the mark as one beyond the fact's own graphs).
-fn annotation_of(entries: &[found::Entry]) -> Annotation {
-    Annotation {
-        sets: entries.iter().map(|(_, set, _)| set.clone()).collect(),
-        truncated: entries.iter().any(|&(_, _, marked)| marked),
-        beyond_own: false,
     }
 }
 

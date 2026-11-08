@@ -23,7 +23,7 @@ use super::GraphSet;
 use crate::ir::Triple;
 
 /// Entries a buffer takes before its first reduction; after one, twice what it kept.
-const REDUCE_AT: usize = 1 << 16;
+pub(super) const REDUCE_AT: usize = 1 << 16;
 
 /// Entries past which a reduction sorts them in parallel (a round's merged buffer).
 const PARALLEL_SORT: usize = 1 << 14;
@@ -104,6 +104,11 @@ impl<'a> Found<'a> {
 
     pub(super) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// The entries it has room for.
+    pub(super) fn capacity(&self) -> usize {
+        self.entries.capacity()
     }
 
     /// Room for `additional` more entries, charged first.
