@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 
 import { NreseClient } from "./client";
+import { DEFAULT_GRAPH, selectedGraphTarget } from "./endpoints";
 
 describe("NreseClient", () => {
   test("builds query requests against the configured base URL", async () => {
@@ -76,6 +77,16 @@ describe("NreseClient", () => {
     ]);
   });
 
+  // Guard (unchanged behaviour): the console's selector names the default graph in default
+  // mode whatever its hidden IRI field holds, and the typed IRI in named mode.
+  test("maps the console's graph selector to its target", () => {
+    expect(selectedGraphTarget("default", "http://example.com/g")).toEqual({ kind: "default" });
+    expect(selectedGraphTarget("named", "http://example.com/g")).toEqual({
+      kind: "named",
+      iri: "http://example.com/g",
+    });
+  });
+
   test("sends the configured headers with every request", async () => {
     // The review of 3 October 2026 (C3): diagnostics reads and graph DELETE went without.
     const fetchImpl = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
@@ -94,10 +105,10 @@ describe("NreseClient", () => {
     await client.autocomplete("x");
     await client.runQuery("ASK {}", "application/sparql-results+json");
     await client.runUpdate("INSERT DATA {}");
-    await client.runTell("", "default", "");
-    await client.readGraph("default", "");
-    await client.writeGraph("PUT", "", "default", "");
-    await client.deleteGraph("default", "");
+    await client.runTell("", DEFAULT_GRAPH);
+    await client.readGraph(DEFAULT_GRAPH);
+    await client.writeGraph("PUT", "", DEFAULT_GRAPH);
+    await client.deleteGraph(DEFAULT_GRAPH);
 
     expect(fetchImpl).toHaveBeenCalledTimes(12);
     for (const [input, init] of fetchImpl.mock.calls) {
