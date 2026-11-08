@@ -128,8 +128,8 @@ struct Builder {
     unread: std::collections::BTreeSet<(ExprId, bool)>,
     /// The axioms (their indices in the ontology) the TBox reads only in part or not at all.
     /// One it reads whole the rewriting answers, so the closure's profile doesn't bound it
-    /// (I24c).
-    partial: std::collections::BTreeSet<usize>,
+    /// (I24c). Ascending and without repeats: axioms are read in order ([`Self::mark_partial`]).
+    partial: Vec<usize>,
     /// The axiom being read.
     current: usize,
 }
@@ -512,6 +512,13 @@ fn reach(edges: &[Vec<u32>], start: impl IntoIterator<Item = u32>) -> Vec<u32> {
 }
 
 impl Builder {
+    /// Records that the axiom being read is read only in part or not at all.
+    fn mark_partial(&mut self) {
+        if self.partial.last() != Some(&self.current) {
+            self.partial.push(self.current);
+        }
+    }
+
     fn basic(&mut self, basic: Basic) -> u32 {
         if let Some(&id) = self.tbox.ids.get(&basic) {
             return id;
@@ -564,7 +571,7 @@ impl Builder {
                     // the union's existentials are each part's.
                     self.unread.insert((part, true));
                 }
-                self.partial.insert(self.current);
+                self.mark_partial();
                 self.disjoint(parts);
             }
             Axiom::DisjointClasses(classes) => self.disjoint(classes),
@@ -619,7 +626,7 @@ impl Builder {
             }
             // Not read: what the closure's profile says of it decides (I24c).
             _ => {
-                self.partial.insert(self.current);
+                self.mark_partial();
             }
         }
     }
@@ -633,7 +640,7 @@ impl Builder {
     fn disjoint(&mut self, parts: &[ExprId]) {
         if parts.len() >= 2 {
             self.unread.extend(parts.iter().map(|&p| (p, false)));
-            self.partial.insert(self.current);
+            self.mark_partial();
         }
     }
 
@@ -650,7 +657,7 @@ impl Builder {
         // F1: `A ⊓ B ⊑ ∃S.D`).
         if !whole {
             self.unread.insert((sup, true));
-            self.partial.insert(self.current);
+            self.mark_partial();
         }
     }
 
@@ -722,7 +729,7 @@ impl Builder {
             }
             _ => {
                 self.unread.insert((expr, true));
-                self.partial.insert(self.current);
+                self.mark_partial();
             }
         }
     }
