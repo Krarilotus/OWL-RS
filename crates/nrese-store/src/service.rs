@@ -458,14 +458,9 @@ impl StoreService {
         }
         if let Some(path) = self.marker_path() {
             // The removal durable too (DUR-3): a marker back after a power loss would claim the
-            // inferred stack exact for reasoning it no longer reflects.
-            // Gone already (an earlier try whose sync failed) still needs the sync.
-            let removed = match std::fs::remove_file(&path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                removed => removed,
-            }
-            .and_then(|()| nrese_engine::place::sync_dir(&self.config.data_dir));
-            match removed {
+            // inferred stack exact for reasoning it no longer reflects. Gone already (an
+            // earlier try whose sync failed) still needs the sync ([`crate::metadata::remove`]).
+            match crate::metadata::remove(&path) {
                 Ok(()) => {}
                 Err(error) => {
                     // The file may still be there, or its removal not durable: the next
@@ -485,30 +480,15 @@ impl StoreService {
         let Some(path) = self.marker_path() else {
             return Ok(());
         };
-        let temporary = path.with_extension("tmp");
         // "A marker may be in place", before anything is written (fix check r1, R2-F2): a
         // publication that fails after its rename leaves the marker under its name, and the
         // next invalidation must remove it, or refuse, not skip it.
         self.marker
             .store(true, std::sync::atomic::Ordering::Release);
-        // Synced and durably named (DUR-3): read at open, a marker lost or short after a power
-        // loss would misstate what the inferred stack is exact for.
-        let placed = (|| {
-            use std::io::Write as _;
-            let mut file = std::fs::File::create(&temporary)?;
-            file.write_all(text.as_bytes())?;
-            file.sync_all()?;
-            drop(file);
-            nrese_engine::place::rename(&temporary, &path)?;
-            #[cfg(test)]
-            if marker_tests::FAIL_MARKER_SYNC.get() {
-                return Err(std::io::Error::other(
-                    "the marker's directory sync failed (a test's)",
-                ));
-            }
-            nrese_engine::place::sync_dir(&self.config.data_dir)
-        })();
-        placed.map_err(crate::error::StoreError::Io)?;
+        // Synced and durably named, the store's path included (DUR-3; fix check DEFER-F1): read
+        // at open, a marker lost or short after a power loss would misstate what the inferred
+        // stack is exact for.
+        crate::metadata::write(&path, text.as_bytes())?;
         Ok(())
     }
 
@@ -2143,15 +2123,11 @@ fn for_its_reader<T>(
 
 #[cfg(test)]
 mod marker_tests {
-    use std::cell::Cell;
-
     use super::StoreService;
     use crate::StoreConfig;
-
-    thread_local! {
-        /// The reasoning marker's directory sync fails, after its rename.
-        pub(super) static FAIL_MARKER_SYNC: Cell<bool> = const { Cell::new(false) };
-    }
+    // The reasoning marker is written as the store's metadata: its directory sync, after the
+    // rename, fails through metadata's fault (`metadata::tests::FAIL_DIR_SYNC`).
+    use crate::metadata::tests::FAIL_DIR_SYNC as FAIL_MARKER_SYNC;
 
     /// A reasoning marker whose publication failed after its rename is still cleared by the
     /// next clear of the inferences (DUR-3 fix check r1, R2-F2). A rematerialisation under RDFS

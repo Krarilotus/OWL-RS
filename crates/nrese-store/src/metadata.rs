@@ -3,6 +3,13 @@
 //! leaves the earlier complete file (or none), never a truncated one, except where the
 //! write says otherwise ([`WriteError::renamed`]): the new file is in place, but a crash may
 //! still bring the earlier one back.
+//!
+//! Each write, removal and sync here first names its directory's path durably ([`name`]): a
+//! store's open leaves those names to the first durable write that relies on them (DUR-3,
+//! deferred-sync design note of 8 Nov), and a metadata file acknowledged under a name a power
+//! loss can undo would be lost with it (fix check, DEFER-F1). Every durable write a store makes
+//! under its directory outside the engine passes through here, or names its directory itself
+//! with the same placement-owner operation (the quarantine's log).
 
 use std::fs::{self, File};
 use std::io::Write;
@@ -35,10 +42,15 @@ impl From<WriteError> for crate::StoreError {
     }
 }
 
-/// Writes `bytes` to `file`: into a temporary file beside it, synced, renamed over `file`,
-/// and the directory synced ([`nrese_engine::place`]).
+/// Writes `bytes` to `file`: its directory's path named ([`name`]), then into a temporary file
+/// beside it, synced, renamed over `file`, and the directory synced ([`nrese_engine::place`]).
+/// A path that can't be named refuses the write before anything is written.
 pub(crate) fn write(file: &Path, bytes: &[u8]) -> Result<(), WriteError> {
     let dir = file.parent().unwrap_or_else(|| Path::new("."));
+    name(dir).map_err(|error| WriteError {
+        error,
+        renamed: false,
+    })?;
     let mut staged = file.as_os_str().to_owned();
     staged.push(STAGING);
     let staged = std::path::PathBuf::from(staged);
@@ -70,18 +82,38 @@ pub(crate) fn remove(file: &Path) -> std::io::Result<()> {
     if tests::FAIL_REMOVE.get() {
         return Err(std::io::Error::other("removal failed (a test's)"));
     }
+    let dir = file.parent().unwrap_or_else(|| Path::new("."));
+    name(dir)?;
     match fs::remove_file(file) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    sync_dir(file.parent().unwrap_or_else(|| Path::new(".")))
+    sync_dir(dir)
 }
 
 /// Makes what was done in `dir` durable: every entry added, renamed or removed there before
-/// survives a crash once this returns `Ok`.
+/// survives a crash once this returns `Ok`, `dir`'s own path named first ([`name`]).
 pub(crate) fn sync(dir: &Path) -> std::io::Result<()> {
+    name(dir)?;
     sync_dir(dir)
+}
+
+/// Makes the names leading to `dir` durable: the placement owner's
+/// [`nrese_engine::place::name_existing`], which syncs the directory holding each level of the
+/// path (one this process may not open is left as it is) and refuses a directory that isn't
+/// there. A store's open that finds its directory leaves exactly these to the first durable
+/// write (the engine's own writes sync them through it); a metadata write is one, and the
+/// catalogue's directory has no engine at all, so this names them itself.
+fn name(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if tests::FAIL_NAMING_OF.with_borrow(|failing| failing.as_deref() == Some(dir)) {
+        return Err(std::io::Error::other(format!(
+            "naming {} failed (a test's)",
+            dir.display()
+        )));
+    }
+    nrese_engine::place::name_existing(dir)
 }
 
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
