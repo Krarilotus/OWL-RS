@@ -139,6 +139,7 @@ impl super::Context<'_> {
             services: self.services.clone(),
             service_denied: self.service_denied,
             equality_closed: self.equality_closed,
+            representatives: super::equality::Found::default(),
             late: None,
             canonical: None,
             canonical_refused: None,

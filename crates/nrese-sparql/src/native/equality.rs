@@ -8,13 +8,19 @@
 //! key feeding only duplicate-insensitive aggregates) work on representatives
 //! ([`super::sets`]).
 //!
-//! The classes are built at the first use and cached while the snapshot is the latest
-//! one queried.
+//! A published snapshot's classes (one with a [`SharedState`]) are built at their first use
+//! and kept, process-wide, while it is the latest published snapshot queried; any snapshot of
+//! the same version reads them. An unpublished snapshot's (a transaction's pending state, a
+//! private or an added-to view) are built for its query alone, charged to the query's
+//! budget, and kept nowhere else (the dictionary lifecycle contract's S3).
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::convert::Infallible;
+use std::sync::{Arc, Mutex, PoisonError};
 
-use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot};
+use nrese_engine::{GraphSelector, QuadPattern, ReadModel, SharedState, Snapshot};
+use nrese_exec::Reservation;
 use nrese_rdf::NamedNodeRef;
 
 use super::{Context, GraphScope};
@@ -24,7 +30,17 @@ const SAME_AS: &str = "http://www.w3.org/2002/07/owl#sameAs";
 /// Each identity's representative (terms outside every class are absent).
 pub(super) type Representatives = HashMap<u64, u64>;
 
+/// The latest published snapshot queried and its representatives: written by [`admit`] alone.
 static CACHE: Mutex<Option<(Snapshot, Arc<Representatives>)>> = Mutex::new(None);
+
+/// What a query's own representatives hold besides their table: the `Arc`'s counts and the map.
+const SHARED: usize = 2 * size_of::<usize>() + size_of::<Representatives>();
+
+/// A query's representatives ([`Context::representatives`]), found at their first use: the
+/// published entry's, or built for the query alone and held with their charge to its budget;
+/// `None` where the budget had no room for them.
+#[derive(Default)]
+pub(super) struct Found(OnceCell<Option<(Arc<Representatives>, Option<Reservation>)>>);
 
 #[cfg(test)]
 thread_local! {
@@ -67,7 +83,11 @@ pub(super) fn kept_is_published() -> bool {
         .is_none_or(|(kept, _)| kept.shared_state().is_some())
 }
 
-fn build(snapshot: &Snapshot) -> Representatives {
+/// `snapshot`'s representatives, room for each entry made by `room` before it goes in.
+fn build<E>(
+    snapshot: &Snapshot,
+    mut room: impl FnMut(&mut Representatives) -> Result<(), E>,
+) -> Result<Representatives, E> {
     #[cfg(test)]
     BUILDS.with(|builds| builds.set(builds.get() + 1));
     let mut out = HashMap::new();
@@ -76,13 +96,14 @@ fn build(snapshot: &Snapshot) -> Representatives {
     if let Some(classes) = snapshot.equality_classes() {
         for (representative, members) in classes.iter() {
             for &member in members {
+                room(&mut out)?;
                 out.insert(member, representative);
             }
         }
-        return out;
+        return Ok(out);
     }
     let Some(same_as) = snapshot.lookup(NamedNodeRef::new_unchecked(SAME_AS).into()) else {
-        return out;
+        return Ok(out);
     };
     let pattern = QuadPattern {
         subject: None,
@@ -97,11 +118,28 @@ fn build(snapshot: &Snapshot) -> Representatives {
         }
         let least = s.min(o);
         for term in [s, o] {
+            room(&mut out)?;
             let entry = out.entry(term).or_insert(term);
             *entry = (*entry).min(least);
         }
     }
-    out
+    Ok(out)
+}
+
+/// `state`'s representatives admitted to the process-wide entry, replacing what it held: the
+/// entry's only writer, for published state alone. They are built from the token's own
+/// snapshot and kept with it.
+fn admit(
+    cache: &mut Option<(Snapshot, Arc<Representatives>)>,
+    state: &SharedState<'_>,
+) -> Arc<Representatives> {
+    let snapshot = state.snapshot();
+    let representatives = match build(snapshot, |_| Ok::<(), Infallible>(())) {
+        Ok(representatives) => Arc::new(representatives),
+        Err(never) => match never {},
+    };
+    *cache = Some((snapshot.clone(), Arc::clone(&representatives)));
+    representatives
 }
 
 impl Context<'_> {
@@ -122,17 +160,45 @@ impl Context<'_> {
         if !scope_ok {
             return None;
         }
-        let mut cache = CACHE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((snapshot, representatives)) = cache.as_ref()
-            && snapshot.same_version(&self.snapshot)
+        self.representatives
+            .0
+            .get_or_init(|| self.find_representatives())
+            .as_ref()
+            .map(|(representatives, _)| Arc::clone(representatives))
+    }
+
+    /// The published entry's representatives for this query's version; else, for a published
+    /// snapshot, its own admitted; else built for this query alone.
+    fn find_representatives(&self) -> Option<(Arc<Representatives>, Option<Reservation>)> {
+        let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((kept, representatives)) = cache.as_ref()
+            && kept.same_version(&self.snapshot)
         {
-            return Some(Arc::clone(representatives));
+            return Some((Arc::clone(representatives), None));
         }
-        let representatives = Arc::new(build(&self.snapshot));
-        *cache = Some(((*self.snapshot).clone(), Arc::clone(&representatives)));
-        Some(representatives)
+        if let Some(state) = self.snapshot.shared_state() {
+            return Some((admit(&mut cache, &state), None));
+        }
+        drop(cache);
+        // Unpublished: built for this query alone and kept nowhere else (S3), what they hold
+        // charged to the query's budget before it is allocated. Where the budget has no room
+        // for them, the query goes on without: they only let a join run on one identity per
+        // class where its aggregates can't tell, and the join on every identity gives the same
+        // answer (`notes/2026-11-08-dict3-4-equality-design.md`, D1).
+        let mut held = Reservation::new(Arc::clone(&self.budget));
+        let built = held.charge(SHARED).and_then(|()| {
+            build(&self.snapshot, |map| {
+                super::spatial::map_room(&mut held, map)
+            })
+        });
+        match built {
+            Ok(representatives) => Some((Arc::new(representatives), Some(held))),
+            Err(_) => {
+                #[cfg(test)]
+                REFUSED.with(|refused| refused.set(refused.get() + 1));
+                None
+            }
+        }
     }
 }
 
