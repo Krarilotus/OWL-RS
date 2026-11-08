@@ -5,12 +5,13 @@
 //!
 //! - Input: every `.rs` file under the workspace's `crates/*/src`, test files excepted
 //!   (`*_tests.rs`, `tests.rs`, anything under a `tests` directory).
-//! - Expected: the method's name followed by `(` appears only in the store's DL bounds and in
-//!   the engine's snapshot module, which defines it.
+//! - Expected: the method's name appears only in the store's DL bounds and in the engine's
+//!   snapshot module, which defines it.
 
 use std::path::{Path, PathBuf};
 
-const METHOD: &str = "with_inferred_derived_within(";
+/// The bare name, so a call, a method reference or a re-export all count (sol-loop r1 S1).
+const METHOD: &str = "with_inferred_derived_within";
 
 /// The files allowed to name it, sorted: its definition and its one caller.
 const ALLOWED: [&str; 2] = [
