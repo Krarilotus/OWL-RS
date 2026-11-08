@@ -31,7 +31,13 @@ HEADER = """# The frozen benchmark datasets (benches/PROTOCOL.md §6; `suite.py 
 # command that made it and the release of its source. The reserved space holds them for
 # good (budget_gb); scripts/bench-cleanup.sh never removes a catalogued file. Regenerating a
 # file must give the same hash, or it is a new release: freeze it again and say so in the
-# run records that use it.
+# run records that use it. A file whose maker labels its blank nodes afresh each time (riot)
+# is pinned by form too: `rdfc_sha256`, the SHA-256 of its RDFC-1.0 canonical N-Quads
+# (crates/rdf/nrese-rdf-io/examples/rdfc.rs), which a made copy must meet where its bytes can't.
+# [makers]: the makers a timing job runs where its host lacks a file, by their command's start
+# (benches/fast/release_gate.py reads them, and a harness's own: harness_tables()): what each
+# needs from its host, whether its copies meet only a form pin, whether it is the SPARQL data
+# step's, and the container it runs in, [memory GB, CPUs], which the job declares to the fleet.
 """
 
 
@@ -43,16 +49,38 @@ def load(root: Path) -> dict:
         return tomllib.load(f)
 
 
+MAKER_KEYS = ("needs", "form_only", "sparql", "container", "note")
+
+
 def save(root: Path, catalog: dict):
     lines = [HEADER, f"budget_gb = {catalog['budget_gb']}", ""]
+    # The job-run makers (release_gate.py reads them, a harness's too: harness_tables()), kept as they are,
+    # an empty section too: its presence says the catalogue holds them (sol-loop r6 S5).
+    if "makers" in catalog and not catalog["makers"]:
+        lines += ["[makers]", ""]
+    for start, maker in sorted((catalog.get("makers") or {}).items()):
+        lines.append(f"[makers.{toml_value(start)}]")
+        lines += [f"{key} = {toml_value(maker[key])}" for key in MAKER_KEYS if key in maker]
+        lines.append("")
     for d in sorted(catalog["dataset"], key=lambda d: d["file"]):
         lines.append("[[dataset]]")
-        for key in ("file", "workload", "tier", "role", "made_by", "source", "bytes", "sha256", "frozen",
-                    "n_triples"):
+        for key in ("file", "workload", "tier", "role", "made_by", "source", "bytes", "sha256", "rdfc_sha256",
+                    "frozen", "n_triples", "note"):
             if d.get(key) not in (None, ""):
                 lines.append(f"{key} = {toml_value(d[key])}")
         lines.append("")
     (root / "benches/datasets.toml").write_text("\n".join(lines), encoding="utf-8", newline="\n")
+
+
+def refreeze(entry: dict, size: int, sha256: str, today: str) -> dict:
+    """`entry` frozen anew at `size` bytes and `sha256`: new bytes are a new release (dated today),
+    and its form pin (`rdfc_sha256`), the old graph's, goes with them (sol-loop r1 S3: kept, it
+    accepted the old graph). Same bytes: unchanged but for its size."""
+    if entry.get("sha256") != sha256:
+        entry["frozen"] = today
+        entry.pop("rdfc_sha256", None)
+    entry["bytes"], entry["sha256"] = size, sha256
+    return entry
 
 
 class Store:
@@ -157,9 +185,10 @@ def main(argv: list[str], workloads: dict, root: Path) -> int:
             entry.setdefault("role", "source" if f.startswith("real/") else "core")
             if f in sources:
                 entry["source"] = sources[f]
-            if entry.get("sha256") != hashes.get(f):
-                entry["frozen"] = today
-            entry["bytes"], entry["sha256"] = size, hashes.get(f, "")
+            if entry.get("rdfc_sha256") and entry.get("sha256") != hashes.get(f):
+                print(f"{f}: its bytes changed: its form pin (rdfc_sha256) was the old graph's and is dropped; "
+                      "compute it anew (crates/rdf/nrese-rdf-io/examples/rdfc.rs) before a job may make it")
+            refreeze(entry, size, hashes.get(f, ""), today)
         catalog["dataset"] = list(by_file.values())
         save(root, catalog)
         print(f"{len(present)} files frozen into benches/datasets.toml")

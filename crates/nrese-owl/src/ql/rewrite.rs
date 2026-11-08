@@ -70,6 +70,11 @@ pub struct Rewriting {
     pub branches: Vec<Branch>,
     pub vars: u32,
     pub witnesses: usize,
+    /// Terms (classes, or a folded witness's first predicate) whose atom holds of every
+    /// individual (`⊤ ⊑ …`) on an answer variable nothing else binds: their answers are
+    /// every individual, which a query can't list, so those beyond the closure's may be
+    /// missing.
+    pub unlisted: Vec<Term>,
 }
 
 impl Rewriting {
@@ -94,7 +99,7 @@ impl Branch {
         self.parts
             .iter()
             .map(|p| match p {
-                Part::Atom(_) => 1,
+                Part::Atom(_) | Part::Top(_) => 1,
                 Part::Any(alternatives) => alternatives.len(),
             })
             .sum()
@@ -106,6 +111,9 @@ impl Branch {
 pub enum Part {
     Atom(Atom),
     Any(Vec<Atom>),
+    /// The term is an individual (not a literal): a constant, or a variable another part
+    /// of the branch binds. What an atom that holds of every individual (`⊤ ⊑ …`) leaves.
+    Top(QTerm),
 }
 
 /// What the data may be asked about a tree witness before it is folded: whether every
@@ -314,6 +322,7 @@ fn rewrite_within(
             }],
             vars: cq.vars,
             witnesses: 0,
+            unlisted: Vec::new(),
         });
     }
     let Some(sets) = independent_sets(&witnesses, limits.branches, work) else {
@@ -324,6 +333,7 @@ fn rewrite_within(
         alternatives: &alternatives,
         next: cq.vars,
         work,
+        unlisted: Vec::new(),
     };
     let mut branches = Vec::new();
     let mut size = 0;
@@ -345,10 +355,14 @@ fn rewrite_within(
             }
         }
     }
+    let mut unlisted = builder.unlisted;
+    unlisted.sort_unstable();
+    unlisted.dedup();
     Outcome::Rewritten(Rewriting {
         branches,
         vars: builder.next,
         witnesses: witnesses.len(),
+        unlisted,
     })
 }
 
@@ -432,6 +446,16 @@ struct Build<'a> {
     next: u32,
     /// A branch takes a step per atom and alternative it writes, and per root it merges.
     work: &'a Work,
+    /// [`Rewriting::unlisted`].
+    unlisted: Vec<Term>,
+}
+
+/// An atom that holds of every individual, before the branch says what binds its term:
+/// the term, the atom as written (for a class atom), and the term it is reported under.
+struct Everyone {
+    t: QTerm,
+    written: Option<Atom>,
+    term: Term,
 }
 
 impl Build<'_> {
@@ -496,6 +520,7 @@ impl Build<'_> {
             .flat_map(|(w, _)| w.atoms.iter().copied())
             .collect();
         let mut parts: Vec<Part> = Vec::new();
+        let mut everyone: Vec<Everyone> = Vec::new();
         let mut written: HashSet<Part> = HashSet::new();
         let table = self.alternatives;
         for (i, atom) in cq.atoms.iter().enumerate() {
@@ -511,6 +536,16 @@ impl Build<'_> {
             }
             let atom = atom.map(&map);
             let part = match (&atom, alternatives) {
+                (Atom::Class(t, class), Some(alternatives))
+                    if alternatives[..] == [Basic::Thing] =>
+                {
+                    everyone.push(Everyone {
+                        t: *t,
+                        written: Some(atom.clone()),
+                        term: *class,
+                    });
+                    continue;
+                }
                 (Atom::Class(t, _), Some(alternatives)) => {
                     let fresh = self.fresh();
                     Part::Any(alternatives.iter().map(|&b| stated(b, *t, fresh)).collect())
@@ -532,10 +567,71 @@ impl Build<'_> {
             if !self.work.take(fold.len()) {
                 return Err(());
             }
+            if fold[..] == [Basic::Thing] {
+                let term = witness.atoms.first().and_then(|&i| match &cq.atoms[i] {
+                    Atom::Class(_, c) => Some(*c),
+                    Atom::Role(_, p, _) => Some(*p),
+                    Atom::Other(..) => None,
+                });
+                everyone.push(Everyone {
+                    t: root,
+                    written: None,
+                    term: term.unwrap_or_default(),
+                });
+                continue;
+            }
             let fresh = self.fresh();
             parts.push(Part::Any(
                 fold.iter().map(|&b| stated(b, root, fresh)).collect(),
             ));
+        }
+        // An atom that holds of every individual needs only its term to be one: a
+        // constant, or a variable another part binds. An existential variable nothing else
+        // has is some individual, and the domain is never empty. An answer variable nothing
+        // else binds would be every individual: kept as written, and said.
+        // The terms the other parts bind, read once, a step per term (Sol r2 S1).
+        let mut bound: HashSet<QTerm> = HashSet::new();
+        if !everyone.is_empty() {
+            for p in &parts {
+                let read: Vec<Vec<QTerm>> = match p {
+                    Part::Atom(a) => vec![a.terms()],
+                    Part::Any(alternatives) => alternatives.iter().map(Atom::terms).collect(),
+                    Part::Top(_) => continue,
+                };
+                if !self.work.take(read.iter().map(Vec::len).sum()) {
+                    return Err(());
+                }
+                // A union binds a term every alternative has.
+                if let Some((first, others)) = read.split_first() {
+                    bound.extend(
+                        first
+                            .iter()
+                            .filter(|t| others.iter().all(|terms| terms.contains(t))),
+                    );
+                }
+            }
+        }
+        let mut tops = Vec::new();
+        for e in everyone {
+            match e.t {
+                QTerm::Const(_) => tops.push(Part::Top(e.t)),
+                t if bound.contains(&t) => tops.push(Part::Top(t)),
+                // Variables from `cq.vars` on are the branch's own: existential.
+                QTerm::Var(v) if cq.existential.get(v as usize).is_none_or(|&e| e) => {}
+                QTerm::Var(_) => {
+                    self.unlisted.push(e.term);
+                    // A witness's root: the branch can't bind it, so it goes.
+                    let Some(atom) = e.written else {
+                        return Ok(None);
+                    };
+                    tops.push(Part::Atom(atom));
+                }
+            }
+        }
+        for top in tops {
+            if written.insert(top.clone()) {
+                parts.push(top);
+            }
         }
         let mut merged: Vec<(u32, QTerm)> = stands_for
             .into_iter()

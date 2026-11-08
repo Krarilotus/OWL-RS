@@ -1097,6 +1097,97 @@ fn hazard_kinds(completeness: &Completeness) -> Vec<&'static str> {
         .collect()
 }
 
+/// `owl:Thing` on the left of an OWL 2 QL axiom (OWL 2 Profiles §3.2.3 allows any class
+/// there): every individual is in its right side (OWL 2 Direct Semantics §2.3.1), and the
+/// domain is never empty. P2-C1 review r1 F1: `⊤ ⊑ A` with no data must answer
+/// `ASK { ?x a :A }` true.
+///
+/// Rows (expected answer first, then the status):
+/// - `⊤ ⊑ A`, no data: `ASK { ?x a :A }` is `true`;
+/// - `⊤ ⊑ ∃P1.⊤`, no data: `ASK { ?x :P1 ?y }` is `true`;
+/// - the same two with a constant no statement has (`:zzz`, an individual all the same):
+///   `ASK { :zzz a :A }` and `ASK { :zzz :P1 ?y }` are `true`;
+/// - guard: `⊤ ⊑ A`: `ASK { ?x a :Zzz }`, a class no axiom names, is `false`, complete;
+/// - `⊤ ⊑ A`, `P0(a0, a1)`: `SELECT ?x { ?x :P0 ?y . ?y a :A }` is `{a0}`, complete;
+/// - `⊤ ⊑ A`, `P0(a0, a1)`: `SELECT ?x { ?x a :A }` has the certain answers `{a0, a1}`:
+///   what is returned is among them, and if it isn't all of them the status says so;
+/// - guard: `⊤ ⊑ A`, `D(a0, "3")`: `SELECT ?x { :a0 :D ?y . ?y a :A }` has no answer (a
+///   literal is in no class), complete (it passes on the base too).
+#[test]
+fn owl_thing_on_the_left_answers_for_every_individual() {
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> ."
+    );
+    let top = "owl:Thing rdfs:subClassOf :A .";
+    let some = "owl:Thing rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :P1 ;
+        owl:someValuesFrom owl:Thing ] .";
+    let edge = ":a0 :P0 :a1 .";
+    let data = ":D a owl:DatatypeProperty . :a0 :D \"3\" .";
+    let ask = |store: &StoreService, query: &str| -> (String, String) {
+        let result = store
+            .execute_query(&SparqlQueryRequest::all(query))
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        let answer = String::from_utf8(result.payload).unwrap();
+        let answer = if answer.contains("true") {
+            "true"
+        } else {
+            "false"
+        };
+        let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+        (answer.to_owned(), status.to_owned())
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut wrong = Vec::new();
+    for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
+        let name = ruleset.name();
+        let open = |extra: &str| store(&format!("{head}\n{extra}"), dir.path(), ruleset, true);
+        for (axiom, query) in [
+            (top, format!("ASK {{ ?x a <{E}A> }}")),
+            (some, format!("ASK {{ ?x <{E}P1> ?y }}")),
+            // A constant no statement has is an individual too.
+            (top, format!("ASK {{ <{E}zzz> a <{E}A> }}")),
+            (some, format!("ASK {{ <{E}zzz> <{E}P1> ?y }}")),
+        ] {
+            let (answer, status) = ask(&open(axiom), &query);
+            if answer != "true" {
+                wrong.push(format!("{name}, {query}: {answer}, {status}"));
+            }
+        }
+        // Guard: a class no axiom names has no member.
+        let unseen = format!("ASK {{ ?x a <{E}Zzz> }}");
+        let (answer, status) = ask(&open(top), &unseen);
+        if (answer.as_str(), status.as_str()) != ("false", "complete") {
+            wrong.push(format!("{name}, guard {unseen}: {answer}, {status}"));
+        }
+        let store_ = open(&format!("{top}\n{edge}"));
+        let through = format!("SELECT ?x {{ ?x <{E}P0> ?y . ?y a <{E}A> }}");
+        let (rows, status) = store_answer(&store_, &through);
+        if rows != [vec![0]] || status.as_str() != "complete" {
+            wrong.push(format!("{name}, {through}: {rows:?}, {}", status.as_str()));
+        }
+        let all = format!("SELECT ?x {{ ?x a <{E}A> }}");
+        let (rows, status) = store_answer(&store_, &all);
+        let rows: BTreeSet<Vec<usize>> = rows.into_iter().collect();
+        let certain = BTreeSet::from([vec![0], vec![1]]);
+        if !rows.is_subset(&certain) || (rows != certain && status.complete) {
+            wrong.push(format!("{name}, {all}: {rows:?}, {}", status.as_str()));
+        }
+        // Guard: a literal is in no class.
+        let store_ = open(&format!("{top}\n{data}"));
+        let literal = format!("SELECT ?y {{ <{E}a0> <{E}D> ?y . ?y a <{E}A> }}");
+        let result = store_
+            .execute_query(&SparqlQueryRequest::all(literal.as_str()))
+            .unwrap_or_else(|e| panic!("{literal}: {e}"));
+        let text = String::from_utf8(result.payload).unwrap();
+        let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+        if text.contains("\"3\"") || status != "complete" {
+            wrong.push(format!("{name}, guard {literal}: {text}, {status}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// The research review's case: existentials feeding a transitive role. `Engine ⊑
 /// ∃partOf.Car`, `Car ⊑ ∃partOf.Fleet`, `partOf` transitive, `e1 a Engine`; `SELECT ?x
 /// { ?x partOf ?f . ?f a Fleet }` has the certain answer `e1` (through two anonymous

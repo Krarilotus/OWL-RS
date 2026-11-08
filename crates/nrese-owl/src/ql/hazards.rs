@@ -41,6 +41,10 @@ pub enum Hazard {
     Filler(Term),
     /// The role of an existential an individual is asserted to be in.
     Asserted(Term),
+    /// A term on the right of an axiom whose left side any individual may be in, with
+    /// none of that side's classes or properties (`⊤ ⊓ ≥ 0 R.⊤`, `B ⊔ ¬B`), where the
+    /// rewriting doesn't read the axiom.
+    OpenLeft(Term),
 }
 
 impl Hazard {
@@ -61,7 +65,8 @@ impl Hazard {
             | Self::Union(t)
             | Self::Enumeration(t)
             | Self::Filler(t)
-            | Self::Asserted(t) => t,
+            | Self::Asserted(t)
+            | Self::OpenLeft(t) => t,
         }
     }
 
@@ -98,6 +103,9 @@ impl Hazard {
             Self::Filler(_) => format!("an existential on {t} with a filler beyond OWL 2 QL"),
             Self::Asserted(_) => {
                 format!("an individual is asserted to be in an existential on {t}")
+            }
+            Self::OpenLeft(_) => {
+                format!("an axiom on {t} whose left side any individual may be in")
             }
         }
     }
@@ -274,9 +282,25 @@ pub(crate) fn hazards(o: &Ontology, types: &[Type], basic: &dyn Fn(u32) -> Basic
         o,
         found: Vec::new(),
     };
+    // What axioms whose left side any individual may be in give every anonymous one
+    // unread (`open_axiom`): their right sides' terms, and an enumerated individual.
+    let mut open: Vec<Term> = Vec::new();
+    let mut open_individual: Option<Term> = None;
+    // Whether such an axiom concludes an existential: anonymous individuals of its own.
+    let mut open_generates = false;
+    // The terms of expressions individuals are asserted to be in, with an existential.
+    let mut asserted: Vec<(Term, Hazard)> = Vec::new();
     for axiom in &o.axioms {
         match axiom {
             Axiom::SubClassOf(l, r) => {
+                open_axiom(
+                    o,
+                    *l,
+                    *r,
+                    &mut open,
+                    &mut open_individual,
+                    &mut open_generates,
+                );
                 collect.walk(*l, Place::LeftTop);
                 collect.walk(*r, Place::Right(None));
                 let left = expr_terms(*l);
@@ -291,6 +315,16 @@ pub(crate) fn hazards(o: &Ontology, types: &[Type], basic: &dyn Fn(u32) -> Basic
             Axiom::EquivalentClasses(classes) => {
                 let all: Vec<Term> = classes.iter().flat_map(|&c| expr_terms(c)).collect();
                 for &c in classes {
+                    for &d in classes.iter().filter(|&&d| d != c) {
+                        open_axiom(
+                            o,
+                            c,
+                            d,
+                            &mut open,
+                            &mut open_individual,
+                            &mut open_generates,
+                        );
+                    }
                     collect.walk(c, Place::LeftTop);
                     collect.walk(c, Place::Right(None));
                     if matches!(o.class(c), ClassExpr::Or(_)) {
@@ -304,6 +338,13 @@ pub(crate) fn hazards(o: &Ontology, types: &[Type], basic: &dyn Fn(u32) -> Basic
             }
             Axiom::DisjointUnion(class, parts) => {
                 found.push(Hazard::Union(*class));
+                // A part is a left side of the class, which the TBox reads (a class).
+                if parts
+                    .iter()
+                    .any(|&p| needs_no_term(o, p) && !read_as_top(o, p))
+                {
+                    open.push(*class);
+                }
                 let mut all: Vec<Term> = parts.iter().flat_map(|&c| expr_terms(c)).collect();
                 for &p in parts {
                     collect.walk(p, Place::LeftTop);
@@ -363,6 +404,11 @@ pub(crate) fn hazards(o: &Ontology, types: &[Type], basic: &dyn Fn(u32) -> Basic
             Axiom::ClassAssertion(c, _) if !matches!(o.class(*c), ClassExpr::Class(_)) => {
                 let mut roles = Vec::new();
                 existential_roles(o, *c, &mut roles);
+                // The anonymous individuals it makes are in its fillers' classes too.
+                if let Some(&role) = roles.first() {
+                    let h = Hazard::Asserted(role);
+                    asserted.extend(expr_terms(*c).into_iter().map(|t| (t, h)));
+                }
                 found.extend(roles.into_iter().map(Hazard::Asserted));
                 collect.walk(*c, Place::Right(None));
             }
@@ -439,6 +485,17 @@ pub(crate) fn hazards(o: &Ontology, types: &[Type], basic: &dyn Fn(u32) -> Basic
             start.extend(component(&mut parent, p).into_iter().map(|q| (q, h)));
         }
     }
+    start.extend(asserted);
+    // An axiom whose left side any individual may be in meets every anonymous individual,
+    // whether or not it shares a term with the individual's type. Seeded after the others,
+    // so a term they reach keeps their reason.
+    let anonymous = open_generates
+        || types.iter().any(|t| !t.data)
+        || found.iter().any(|h| matches!(h, Hazard::Asserted(_)));
+    let open: Vec<(Term, Hazard)> = match anonymous {
+        true => open.iter().map(|&t| (t, Hazard::OpenLeft(t))).collect(),
+        false => Vec::new(),
+    };
 
     // Upward along the axioms.
     let mut next: HashMap<Term, Vec<Term>> = HashMap::new();
@@ -451,26 +508,123 @@ pub(crate) fn hazards(o: &Ontology, types: &[Type], basic: &dyn Fn(u32) -> Basic
     }
     let mut affected: HashMap<Term, Hazard> = HashMap::new();
     let mut queue: VecDeque<(Term, Hazard)> = VecDeque::new();
-    for (t, h) in start {
-        if let std::collections::hash_map::Entry::Vacant(e) = affected.entry(t) {
-            e.insert(h);
-            queue.push_back((t, h));
-        }
-    }
-    while let Some((t, h)) = queue.pop_front() {
-        // An anonymous individual may be in `t` unread, and `t`'s own hazard can equate it
-        // with another: any fact may follow, as for the types' terms above.
-        if global.is_none() {
-            global = equating.get(&t).copied();
-        }
-        for &u in next.get(&t).into_iter().flatten() {
-            if let std::collections::hash_map::Entry::Vacant(e) = affected.entry(u) {
+    for seeds in [start, open] {
+        for (t, h) in seeds {
+            if let std::collections::hash_map::Entry::Vacant(e) = affected.entry(t) {
                 e.insert(h);
-                queue.push_back((u, h));
+                queue.push_back((t, h));
+            }
+        }
+        while let Some((t, h)) = queue.pop_front() {
+            // An anonymous individual may be in `t` unread, and `t`'s own hazard can equate
+            // it with another: any fact may follow, as for the types' terms above.
+            if global.is_none() {
+                global = equating.get(&t).copied();
+            }
+            for &u in next.get(&t).into_iter().flatten() {
+                if let std::collections::hash_map::Entry::Vacant(e) = affected.entry(u) {
+                    e.insert(h);
+                    queue.push_back((u, h));
+                }
             }
         }
     }
+    // An enumeration such an axiom concludes can make every individual one.
+    if anonymous && global.is_none() {
+        global = open_individual.map(Hazard::OpenLeft);
+    }
     Hazards { affected, global }
+}
+
+/// For an axiom `l ⊑ r` whose left side any individual may be in with none of its terms,
+/// unless the TBox reads it exactly (`l` as `⊤`, `r` whole): `r`'s terms into `terms`, an
+/// individual `r` may make every individual equal to into `individual`, and whether `r`
+/// has an existential (anonymous individuals the TBox doesn't type) into `generates`.
+fn open_axiom(
+    o: &Ontology,
+    l: ExprId,
+    r: ExprId,
+    terms_out: &mut Vec<Term>,
+    individual: &mut Option<Term>,
+    generates: &mut bool,
+) {
+    if !needs_no_term(o, l) || (read_as_top(o, l) && read_on_right(o, r)) {
+        return;
+    }
+    terms(o, r, terms_out);
+    if individual.is_none() {
+        *individual = enumerated(o, r);
+    }
+    let mut roles = Vec::new();
+    existential_roles(o, r, &mut roles);
+    *generates |= !roles.is_empty();
+}
+
+/// Whether an individual may be in `e` with none of `e`'s classes or properties holding of
+/// it: no membership of its classes, no edge of its properties. Conservative: a part that
+/// is negative or bounded above may hold without either.
+fn needs_no_term(o: &Ontology, e: ExprId) -> bool {
+    match o.class(e) {
+        ClassExpr::Thing
+        | ClassExpr::Not(_)
+        | ClassExpr::All(..)
+        | ClassExpr::Max(..)
+        | ClassExpr::DataAll(..)
+        | ClassExpr::DataMax(..) => true,
+        ClassExpr::Min(n, ..)
+        | ClassExpr::Exact(n, ..)
+        | ClassExpr::DataMin(n, ..)
+        | ClassExpr::DataExact(n, ..) => *n == 0,
+        ClassExpr::And(parts) => parts.iter().all(|&p| needs_no_term(o, p)),
+        ClassExpr::Or(parts) => parts.iter().any(|&p| needs_no_term(o, p)),
+        ClassExpr::Nothing
+        | ClassExpr::Class(_)
+        | ClassExpr::OneOf(_)
+        | ClassExpr::Some(..)
+        | ClassExpr::HasValue(..)
+        | ClassExpr::HasSelf(_)
+        | ClassExpr::DataSome(..)
+        | ClassExpr::DataHasValue(..) => false,
+    }
+}
+
+/// Whether the TBox reads left side `e` as `⊤` (`Tbox`'s left sides: `⊤`, `≥ 0 R.C`, and a
+/// union with such a part).
+fn read_as_top(o: &Ontology, e: ExprId) -> bool {
+    match o.class(e) {
+        ClassExpr::Thing | ClassExpr::Min(0, ..) => true,
+        ClassExpr::Or(parts) => parts.iter().any(|&p| read_as_top(o, p)),
+        _ => false,
+    }
+}
+
+/// Whether the TBox reads right side `e` whole: no hazard in it, and no union, enumeration
+/// or complement outside an existential.
+fn read_on_right(o: &Ontology, e: ExprId) -> bool {
+    fn plain(o: &Ontology, e: ExprId) -> bool {
+        match o.class(e) {
+            ClassExpr::Or(_) | ClassExpr::OneOf(_) | ClassExpr::Not(_) => false,
+            ClassExpr::And(parts) => parts.iter().all(|&p| plain(o, p)),
+            _ => true,
+        }
+    }
+    let mut collect = Collect {
+        o,
+        found: Vec::new(),
+    };
+    collect.walk(e, Place::Right(None));
+    collect.found.is_empty() && plain(o, e)
+}
+
+/// An individual of an enumeration in `e` outside an existential, if there is one.
+fn enumerated(o: &Ontology, e: ExprId) -> Option<Term> {
+    match o.class(e) {
+        ClassExpr::OneOf(individuals) => individuals.first().copied(),
+        ClassExpr::And(parts) | ClassExpr::Or(parts) => {
+            parts.iter().find_map(|&p| enumerated(o, p))
+        }
+        _ => None,
+    }
 }
 
 /// The roles of the existentials (`∃`, `≥ n`) in an expression.

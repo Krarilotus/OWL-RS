@@ -133,6 +133,7 @@ fn branches(rewriting: &Rewriting, table: &Table, vars: &[String]) -> Vec<String
                 .iter()
                 .map(|p| match p {
                     Part::Atom(a) => atom(a),
+                    Part::Top(t) => format!("⊤({})", term(t)),
                     Part::Any(alternatives) => {
                         let mut alternatives: Vec<String> = alternatives.iter().map(atom).collect();
                         alternatives.sort();
@@ -686,5 +687,35 @@ fn class_alternatives_are_paid_for_alike_cold_and_warm() {
     assert!(
         long >= short + 30,
         "{short} steps for 10 classes, {long} for 40"
+    );
+}
+
+/// What binds an atom every individual is in (`⊤ ⊑ A`: `A(?x)` needs `?x` bound
+/// elsewhere) is read once, paid: each atom `p(?y ?z)` beside `A(?x)` costs its two terms'
+/// reading on top of what the rewriting takes for it otherwise. Measured (7 Nov, proofs
+/// p2c1-s1-measure-*): 6 steps an atom without that read (10, 40, 100 atoms: 71, 251, 611),
+/// 8 with it (91, 331, 811). The bound sits between the two: 30 more atoms take at least
+/// 30 × 7 more steps (180 without the read, 240 with it), so a later saving that still
+/// pays the terms passes (P2-C1 merge Sol r2 S1: unpaid, the check was quadratic).
+#[test]
+fn what_binds_an_atom_on_every_individual_is_read_once_and_paid() {
+    let (tbox, mut table) = tbox("SubClassOf(owl:Thing :A)", true);
+    let limits = Limits::default();
+    let none = &mut |_: &Probe<'_>| false;
+    let mut used = |n: usize| {
+        let atoms: Vec<String> = std::iter::once("A(?x)".to_owned())
+            .chain((0..n).map(|i| format!("p(?y{i} ?z{i})")))
+            .collect();
+        let (query, _) = cq(&mut table, &atoms.join(", "), &["x"]);
+        let budget = Budget::new(limits.query_work);
+        let Outcome::Rewritten(_) = rewrite_with(&tbox, &query, &limits, &budget, none) else {
+            panic!("not rewritten ({n})");
+        };
+        limits.query_work - budget.left()
+    };
+    let (short, long) = (used(10), used(40));
+    assert!(
+        long >= short + 30 * 7,
+        "{short} steps for 10 atoms, {long} for 40"
     );
 }

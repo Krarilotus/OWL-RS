@@ -10,6 +10,9 @@ use super::naive::{Triple, Violation, materialise};
 use super::rulesets::Ruleset;
 use super::vocabulary::LocalVocabulary;
 
+mod attempted;
+mod stops;
+
 const EX: &str = "http://example.com/";
 
 /// Parses `s p o` lines of prefixed names (`ex:`, `rdf:`, `rdfs:`, `owl:`); `_:x` are
@@ -2248,7 +2251,7 @@ fn check_supports(
     case: &str,
 ) -> [u64; 3] {
     use super::delta::{MemoryBase, Rules, program};
-    use super::graph_sets::{Annotation, UNWATCHED, closure_within, support_sets};
+    use super::graph_sets::{Annotation, Limits, closure_within, support_sets};
     let compiled = Rules {
         rules,
         lists: Some(lists),
@@ -2282,10 +2285,18 @@ fn check_supports(
         let [s, p, o] = t.map(|id| vocabulary.text(id).to_owned());
         format!("{s} {p} {o}")
     };
-    let every = support_sets(&full, &ground, &[], &graphs_of, usize::MAX, UNWATCHED).unwrap();
+    let every = support_sets(
+        &full,
+        &ground,
+        &[],
+        &graphs_of,
+        usize::MAX,
+        Limits::UNLIMITED,
+    )
+    .unwrap();
     let mut counts = [0u64; 3];
     for &cap in caps {
-        let sets = support_sets(&full, &ground, &[], &graphs_of, cap, UNWATCHED).unwrap();
+        let sets = support_sets(&full, &ground, &[], &graphs_of, cap, Limits::UNLIMITED).unwrap();
         for (fact, kept) in &sets {
             match kept.truncated {
                 true => counts[1] += 1,
@@ -2314,7 +2325,7 @@ fn check_supports(
             });
             let within = undecided.then(|| {
                 let read = |fact: Triple| data.binary_search(&fact).is_ok();
-                closure_within(&full, &ground, &[], &read, UNWATCHED).unwrap()
+                closure_within(&full, &ground, &[], &read, Limits::UNLIMITED).unwrap()
             });
             let visible: Vec<Triple> = full
                 .iter()
@@ -2346,6 +2357,7 @@ fn check_supports(
                     .iter()
                     .flat_map(|&f| {
                         ground
+                            .unpolled()
                             .named_derivations(&store, f, 20)
                             .into_iter()
                             .map(move |d| (f, d))
@@ -2467,7 +2479,7 @@ pub(super) fn support_sets_against_closures() {
 pub(super) fn support_set_updates_against_recomputation() {
     use super::delta::{MemoryBase, Rules, program};
     use super::graph_sets::{
-        Annotation, Change, UNWATCHED, closure_within, support_sets, update_support_sets,
+        Annotation, Change, Limits, closure_within, support_sets, update_support_sets,
     };
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
     let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
@@ -2585,7 +2597,7 @@ pub(super) fn support_set_updates_against_recomputation() {
             &[],
             &|f| graphs_in(&placed, f),
             usize::MAX,
-            UNWATCHED,
+            Limits::UNLIMITED,
         )
         .unwrap();
         let mut served = true;
@@ -2596,7 +2608,7 @@ pub(super) fn support_set_updates_against_recomputation() {
                 &[],
                 &|f| graphs_in(&old_placed, f),
                 cap,
-                UNWATCHED,
+                Limits::UNLIMITED,
             )
             .unwrap();
             let previous = |f: Triple| sets_before.get(&f).cloned().unwrap_or_default();
@@ -2613,7 +2625,7 @@ pub(super) fn support_set_updates_against_recomputation() {
                 &[],
                 &|f| graphs_in(&placed, f),
                 cap,
-                UNWATCHED,
+                Limits::UNLIMITED,
             )
             .unwrap() else {
                 served = false;
@@ -2652,7 +2664,8 @@ pub(super) fn support_set_updates_against_recomputation() {
                 data.dedup();
                 let fresh = closure(&data);
                 let read = |fact: Triple| data.binary_search(&fact).is_ok();
-                let within = closure_within(&after, &ground_after, &[], &read, UNWATCHED).unwrap();
+                let within =
+                    closure_within(&after, &ground_after, &[], &read, Limits::UNLIMITED).unwrap();
                 let seen: Vec<Triple> = after
                     .iter()
                     .copied()
@@ -3061,4 +3074,33 @@ _:l33a rdf:rest _:l33b"#,
             "{policy:?}: extra {extra:?}, missing {missing:?}"
         );
     }
+}
+
+/// A thread's equality copies keep no room for copies a fact could have made but didn't
+/// (#91, `abba-pr91-cost-r2`: replication's memory 1.035 times the uncharged copies' at
+/// 20,000 classes of 10, the threads' chunks at 1.81 times their copies beside the joined
+/// list). Here 1,000 facts that could each make 10,000 copies (a fact over a 100-identity
+/// class twice, as eq-giant-split's) make one each, the others already stored: the chunk
+/// holds its 1,000 copies within twice that, as a list grown by doubling does. Room for
+/// every fact's whole bound held it at 20,000.
+#[test]
+fn equality_copies_keep_no_room_for_copies_not_made() {
+    let budget = nrese_exec::Budget::unlimited();
+    let (mut copies, mut scratch) = (
+        nrese_exec::ChargedVec::new(&budget),
+        nrese_exec::ChargedVec::new(&budget),
+    );
+    for fact in 0..1_000u64 {
+        batch::append_copies(&mut copies, &mut scratch, 10_000, |out| {
+            out.push([fact, 1, 2]);
+        })
+        .expect("unlimited");
+    }
+    assert_eq!(copies.len(), 1_000);
+    assert!(
+        copies.capacity() <= 2 * copies.len(),
+        "{} copies in room for {}",
+        copies.len(),
+        copies.capacity()
+    );
 }

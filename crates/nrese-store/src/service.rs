@@ -77,20 +77,41 @@ impl MemoryStop {
             .is_some_and(nrese_exec::memory::MemoryWatch::exceeded)
     }
 
+    /// What the operation may still take under this watch now
+    /// ([`nrese_exec::memory::MemoryWatch::room`]): its room for the reasoner
+    /// ([`nrese_reasoner::eval::OperationStop::within`]), which admits by the least of it
+    /// and the process's. Without a watch, no bound of its own.
+    pub(crate) fn room(&self) -> nrese_exec::memory::Reading {
+        self.0
+            .as_ref()
+            .map_or(Ok(u64::MAX), nrese_exec::memory::MemoryWatch::room)
+    }
+
     /// The error of the operation `interrupted` ended, if memory ended it: this watch's
-    /// stop (past its limit, or the memory unread), else the process limit's, by the cause
-    /// the operation itself kept. `None`: its caller stopped it.
+    /// stop (past its limit, or the memory unread), else by the cause the operation itself
+    /// kept: the process limit's stop, or an allocation its room couldn't admit (by the
+    /// least of this watch's and the process's limits, [`Self::room`]), named with the
+    /// least of those limits set. `None`: its caller stopped it.
     pub(crate) fn error(
         &self,
         interrupted: nrese_reasoner::delta::Interrupted,
     ) -> Option<crate::StoreError> {
         use nrese_exec::memory::MemoryStopCause;
-        let process = || nrese_exec::memory::process_limit().unwrap_or(0);
+        let limit = || {
+            [
+                self.0.as_ref().map(nrese_exec::memory::MemoryWatch::limit),
+                nrese_exec::memory::process_limit(),
+            ]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(0)
+        };
         let watch = self
             .0
             .as_ref()
             .and_then(|watch| Some((watch.limit(), watch.cause()?)))
-            .or_else(|| Some((process(), interrupted.memory?)));
+            .or_else(|| Some((limit(), interrupted.memory?)));
         match watch {
             Some((limit, MemoryStopCause::Unread)) => {
                 Some(crate::StoreError::MemoryUnreadable { limit })
@@ -167,6 +188,15 @@ impl StoreService {
         engine.set_canonical_view_budget(std::sync::Arc::new(
             nrese_exec::Budget::unlimited().within(runtime.query_memory()),
         ));
+        // So do the corpora reader-scoped searches keep, where they are on.
+        if config.search_scope == crate::SearchScope::Reader {
+            start_reader_corpora(
+                &engine,
+                &runtime,
+                config.reader_corpus_bytes,
+                config.reader_corpus_tuning,
+            );
+        }
         let before = engine.snapshot().revision();
         let preloaded_ontology = preload_ontology(&engine, &config)?;
         let ql_mode = config.ql_rewriting;
@@ -182,6 +212,10 @@ impl StoreService {
                 std::sync::Arc::new(nrese_sparql::ResultCache::new(config.query_cache_bytes))
             }),
             ql: std::sync::Arc::default(),
+            search_scope: std::sync::Arc::new(std::sync::RwLock::new(config.search_scope)),
+            reader_corpus_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                config.reader_corpus_bytes,
+            )),
         };
         let unavailable = std::sync::Arc::<std::sync::OnceLock<String>>::default();
         let namespaces = crate::namespaces::Namespaces::open(
@@ -219,6 +253,11 @@ impl StoreService {
         service
             .engine
             .charge_statistics_to(std::sync::Arc::new(service.envelope(None).part()));
+        // So are the owl2-dl bounds' U1 and read views (SYN-61), the same way.
+        service
+            .dl
+            .bounds
+            .set_kept(std::sync::Arc::new(service.envelope(None).part()));
         if service.engine.snapshot().revision() != before {
             service.invalidate_reasoning()?;
         }
@@ -279,6 +318,65 @@ impl StoreService {
     /// When queries are rewritten for OWL 2 QL.
     pub fn ql_rewriting(&self) -> crate::QlRewritingMode {
         *self.ql_mode.read().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// What searches rank and select among ([`crate::StoreConfig::search_scope`]).
+    pub fn search_scope(&self) -> crate::SearchScope {
+        self.settings.search_scope()
+    }
+
+    /// Changes what searches rank and select among (a repository's setting): queries and
+    /// updates that start from now on read it; running ones keep theirs. Their cached
+    /// results stay apart ([`nrese_sparql::ResultCache`] keys a reader's scope).
+    pub fn set_search_scope(&self, scope: crate::SearchScope) {
+        let mut current = self
+            .settings
+            .search_scope
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        // Turned on: the corpora the engine keeps for it draw on the queries' memory.
+        if scope == crate::SearchScope::Reader && *current != scope {
+            self.start_reader_corpora();
+        }
+        *current = scope;
+    }
+
+    /// Changes the bytes a `reader` search scope's corpora may take (a repository's
+    /// setting; [`crate::StoreConfig::reader_corpus_bytes`]): searches from now on keep
+    /// theirs within it, and the corpora kept so far are let go. Under `global` it is read
+    /// when `reader` is turned on.
+    pub fn set_reader_corpus_bytes(&self, bytes: usize) {
+        // Under the scope's lock: a scope turned on meanwhile reads the new bytes.
+        let current = self
+            .settings
+            .search_scope
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let before = self
+            .settings
+            .reader_corpus_bytes
+            .swap(bytes, std::sync::atomic::Ordering::Relaxed);
+        if before != bytes && *current == crate::SearchScope::Reader {
+            self.start_reader_corpora();
+        }
+    }
+
+    /// The bytes a `reader` search scope's corpora may take now.
+    pub fn reader_corpus_bytes(&self) -> usize {
+        self.settings
+            .reader_corpus_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Gives the engine's corpora their budget (the setting's bytes within the queries'
+    /// memory) and their tuning: reader-scoped searches from now on use them.
+    fn start_reader_corpora(&self) {
+        start_reader_corpora(
+            &self.engine,
+            &self.settings.runtime,
+            self.reader_corpus_bytes(),
+            self.config.reader_corpus_tuning,
+        );
     }
 
     /// Changes when queries are rewritten for OWL 2 QL (a repository's setting), at once.
@@ -439,6 +537,12 @@ impl StoreService {
         self.engine.stats()
     }
 
+    /// The corpora a `reader` search scope keeps: their bytes against their budget, and how
+    /// many were walked or derived; `started` false while none was made.
+    pub fn text_corpus_stats(&self) -> nrese_engine::TextCorpusStats {
+        self.engine.snapshot().text_corpus_stats()
+    }
+
     /// Every statement in `format` (a backup); for a scope that reads every graph.
     pub fn export_dataset(
         &self,
@@ -472,6 +576,7 @@ impl StoreService {
             cancellation,
             union_default_graph: self.config.union_default_graph,
             geosparql_stated_only: self.config.geosparql_stated_only,
+            search_scope: self.search_scope(),
             services: self.services(),
             namespaces: self.namespaces.all(),
             supports: std::sync::Arc::clone(&self.supports),
@@ -1477,12 +1582,18 @@ impl StoreService {
         infer: bool,
     ) -> StoreResult<Vec<crate::autocomplete::Suggestion>> {
         scope.require_all("autocompletion")?;
+        // A reader's corpora draw from the request's envelope, as a query's do.
+        let search_scope = self.search_scope();
+        let budget = (search_scope == crate::SearchScope::Reader)
+            .then(|| std::sync::Arc::new(self.envelope(None).part()));
         Ok(crate::autocomplete::autocomplete(
             &self.engine.snapshot(),
             read_model(infer),
             typed,
             limit,
-        ))
+            search_scope,
+            budget.as_ref(),
+        )?)
     }
 
     /// The named graphs `scope` reads (RDF4J's `/contexts`).
@@ -1773,17 +1884,17 @@ impl StoreService {
     /// `program` on the asserted data, or an explicit diagnostic if stopped.
     pub fn equality_report(&self, program: impl Into<nrese_reasoner::RuleProgram>) -> String {
         let memory = self.memory_stop();
-        let stop = || memory.exceeded();
+        let (stop, room) = (|| memory.exceeded(), || memory.room());
+        let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
         let tx = self.engine.transaction();
         let program = crate::reasoning::Program::compile(&program.into(), &|term| tx.intern(term));
-        nrese_reasoner::engine::equality_report_until(&program, tx.base(), &stop).unwrap_or_else(
-            |interrupted| match memory.error(interrupted) {
+        nrese_reasoner::engine::equality_report_with(&program, tx.base(), &operation)
+            .unwrap_or_else(|interrupted| match memory.error(interrupted) {
                 Some(unread @ crate::StoreError::MemoryUnreadable { .. }) => {
                     format!("equality: {unread}")
                 }
                 _ => "equality: stopped by the process memory limit".to_owned(),
-            },
-        )
+            })
     }
 
     /// Replaces the inferred stack with `program`'s closure over the asserted data, as one
@@ -1819,15 +1930,17 @@ impl StoreService {
                 .storing_representatives(self.config.equality_compact);
         let memory = self.memory_stop();
         let stop = || stop() || memory.exceeded();
+        let room = || memory.room();
         let stopped = |interrupted| {
             memory
                 .error(interrupted)
                 .unwrap_or(crate::StoreError::MaterialisationCancelled)
         };
-        let closure = crate::reasoning::materialise_within(
+        let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
+        let closure = crate::reasoning::materialise_with(
             &program,
             rematerialisation.base(),
-            &stop,
+            &operation,
             &self.operation_memory(),
         )
         .map_err(stopped)?;
@@ -1919,6 +2032,20 @@ impl StoreService {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
+}
+
+/// Gives `engine`'s corpora of reader-scoped searches ([`crate::SearchScope::Reader`]) a
+/// budget of `bytes` within the memory the queries draw on, and `tuning`.
+fn start_reader_corpora(
+    engine: &Engine,
+    runtime: &crate::Runtime,
+    bytes: usize,
+    tuning: nrese_engine::CorpusTuning,
+) {
+    engine.set_text_corpus_budget(std::sync::Arc::new(
+        nrese_exec::Budget::new(bytes).within(runtime.query_memory()),
+    ));
+    engine.set_corpus_tuning(tuning);
 }
 
 /// The read model of RDF4J's `infer` parameter.

@@ -141,17 +141,19 @@ impl Rational {
         let invalid =
             || NumberError::Lexical(ParseError::new("rational", "not numerator/denominator"));
         let (numerator, denominator) = input.split_once('/').ok_or_else(invalid)?;
+        // The whole form first: a numerator past 128 bits doesn't excuse a denominator that
+        // isn't one (digits, not all zero).
+        if denominator.is_empty()
+            || !denominator.bytes().all(|b| b.is_ascii_digit())
+            || denominator.bytes().all(|b| b == b'0')
+        {
+            return Err(invalid());
+        }
         let n = Self::parse_integer(numerator).map_err(|e| match e {
             NumberError::Range => NumberError::Range,
             NumberError::Lexical(_) => invalid(),
         })?;
-        if denominator.is_empty() || !denominator.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(invalid());
-        }
         let d = accumulate(denominator.trim_start_matches('0').bytes())?;
-        if d == 0 {
-            return Err(invalid());
-        }
         let d = i128::try_from(d).map_err(|_| NumberError::Range)?;
         Self::new(n.num, d).ok_or(NumberError::Range)
     }

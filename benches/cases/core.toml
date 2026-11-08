@@ -243,11 +243,71 @@ extra = ["volume:univ-bench.nt"]
 args = ["--reason", "owl2-ql", "--reason-runs", "35", "--runs", "10"]
 queries = "lubm"
 metric = "reason.p50_ms"
-check = {}
+check = { "q.q01.rows" = 4, "q.q02.rows" = 28, "q.q03.rows" = 6, "q.q04.rows" = 34, "q.q05.rows" = 719, "q.q06.rows" = 75547, "q.q07.rows" = 59, "q.q08.rows" = 5916, "q.q09.rows" = 1233, "q.q10.rows" = 0, "q.q11.rows" = 0, "q.q12.rows" = 0, "q.q13.rows" = 33, "q.q14.rows" = 75547 }
+pinned = "independent of NRESE (P2-C1, 7 Nov 2026; trail Harness notes/trail/p2c1-lubm10-oracle-20261107.md): LUBM(10,0)'s complete counts (Guo, Pan, Heflin 2005, Table 3; Shi, Maly, Zeil 2014, Table XII for q11-q13) where OWL 2 QL reaches them (q01-q05, q13, q14); below them where univ-bench's answers need axioms outside OWL 2 QL (Profiles §3.2): Student and Chair defined by an intersection on the left (q06-q10, q12; q06-q09 as the RDFS-level counts of Guo's Table 3), subOrganizationOf transitive (q11). Statuses not pinned: `complete` is regime-relative (docs/design/ql-rewriting.md §7)"
 route = {}
 cap_gb = 4
 systems = ["graphdb:owl2-ql", "stardog:owl2-ql", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 rewrite = "expressible"
+
+# --- the QL schema reader's work per blank class expression (P2-C1 review r1) ------------
+
+[[case]]
+name = "ql-memberships-reuse"
+area = "reasoning"
+what = "100 restrictions with 100 individuals asserted to be in each, queried with the OWL 2 QL rewriting on one snapshot: the compiled schema reused"
+semantics = "owl2-ql"
+data = "ql-memberships expressions=100 members=100"
+args = ["--reason", "owl2-ql", "--runs", "20"]
+queries = "ql-memberships"
+metric = "sum_p50_ms"
+check = { "q.knows.value" = "expect.knows", "q.people.value" = "expect.people" }
+route = {}
+cap_gb = 4
+systems = []
+
+[[case]]
+name = "ql-memberships-data-commits"
+area = "reasoning"
+what = "the same with 400 commits of an ordinary edge (added, then removed) and a reader running the queries meanwhile: each new snapshot's first query reads the schema again"
+semantics = "owl2-ql"
+data = "ql-memberships expressions=100 members=100 commits=200"
+args = ["--reason", "owl2-ql", "--commits", "{data}.commits.ru", "--readers", "1"]
+queries = "ql-memberships"
+metric = "commits.read_p50_ms"
+check = { "closure_after_commits.equal" = "true", "commits.commits" = "expect.commits", "q.knows.value" = "expect.knows", "q.people.value" = "expect.people" }
+route = {}
+cap_gb = 4
+systems = []
+
+[[case]]
+name = "ql-memberships-type-commits-wide"
+area = "reasoning"
+what = "1,000 restrictions with 10 members each, and 400 commits of memberships (each adds one to every restriction on S0, then removes it) with a reader: the schema read and compiled again per membership revision"
+semantics = "owl2-ql"
+data = "ql-memberships expressions=1000 members=10 commits=200 types=1"
+args = ["--reason", "owl2-ql", "--commits", "{data}.commits.ru", "--readers", "1"]
+queries = "ql-memberships"
+metric = "commits.read_p50_ms"
+check = { "closure_after_commits.equal" = "true", "commits.commits" = "expect.commits", "q.knows.value" = "expect.knows", "q.people.value" = "expect.people" }
+route = {}
+cap_gb = 4
+systems = []
+
+[[case]]
+name = "ql-memberships-type-commits-deep"
+area = "reasoning"
+what = "10 restrictions with 1,000 members each, and the same membership commits with a reader: few expressions, many memberships per expression"
+semantics = "owl2-ql"
+data = "ql-memberships expressions=10 members=1000 commits=200 types=1"
+args = ["--reason", "owl2-ql", "--commits", "{data}.commits.ru", "--readers", "1"]
+queries = "ql-memberships"
+metric = "commits.read_p50_ms"
+check = { "closure_after_commits.equal" = "true", "commits.commits" = "expect.commits", "q.knows.value" = "expect.knows", "q.people.value" = "expect.people" }
+route = {}
+cap_gb = 4
+systems = []
+
 [[case]]
 name = "custom-tc"
 area = "reasoning"
@@ -1914,6 +1974,32 @@ systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "qlever:rewritten", "oxigraph:rewr
 guards = ["Store-2: equality by class ids; a deletion splits a class (B/F style)"]
 rewrite = "not-expressible"
 [[case]]
+name = "first-load-chain"
+area = "maintenance"
+what = "a first commit into an empty store: a 250-class subclass chain and 400 members of its last class, as one INSERT DATA (DMW's A/B chain; 21 Oct 2026: the repository route held 854-862 MiB VmHWM, main 518-558)"
+semantics = "owl2-rl"
+data = "first-load classes=250 individuals=400"
+args = ["--reason", "owl2-rl", "--commits", "{data}.commits.ru"]
+queries = "first-load"
+metric = "commits.p50_ms"
+check = { "closure_after_commits.equal" = "true", "q.members.value" = "expect.members" }
+cap_gb = 4
+repeat = 5
+systems = []
+[[case]]
+name = "first-load-chain-ranged"
+area = "maintenance"
+what = "first-load-chain plus a ranged property with one literal value, whose conclusion (the literal's type) no store holds (PR #46 review r1 F1: such a load ran the batch, dropped it and ran the delta executor)"
+semantics = "owl2-rl"
+data = "first-load classes=250 individuals=400 ranged=1"
+args = ["--reason", "owl2-rl", "--commits", "{data}.commits.ru"]
+queries = "first-load"
+metric = "commits.p50_ms"
+check = { "closure_after_commits.equal" = "true", "q.members.value" = "expect.members" }
+cap_gb = 4
+repeat = 5
+systems = []
+[[case]]
 name = "deletes-tail"
 area = "maintenance"
 what = "3,000 people of the data deleted one per commit under OWL 2 RL: the tail of deletion latency (p99)"
@@ -1955,6 +2041,68 @@ metric = "sum_p50_ms"
 check = {}
 route = {}
 cap_gb = 4
+systems = []
+
+[[case]]
+name = "parse-turtle-flat"
+area = "parse"
+what = "the Turtle parser alone, one thread, from memory: 1 M flat IRI triples (250,000 subjects, four each, no brackets), the parser's per-token cost"
+semantics = "none"
+data = "turtle entities=250000 nested=0"
+tool_loads = false
+args = ["--parse-turtle", "{data}", "--runs", "5"]
+queries = ""
+metric = "parse_turtle.p50_ms"
+check = { "parse_turtle.quads" = "expect.statements" }
+route = {}
+cap_gb = 2
+systems = []
+
+[[case]]
+name = "split-turtle-flat"
+area = "parse"
+what = "the Turtle splitter alone (bulk load's skim before its parallel parse), one thread, from memory: the parse-turtle-flat file cut into 16 chunks, recovering, nothing parsed"
+semantics = "none"
+data = "turtle entities=250000 nested=0"
+tool_loads = false
+args = ["--split-turtle", "{data}:16", "--runs", "5"]
+queries = ""
+metric = "split_turtle.p50_ms"
+check = { "split_turtle.chunks" = 16 }
+pinned = "16 parts, a target in each of 1 M statements: 16 chunks"
+route = {}
+cap_gb = 2
+systems = []
+
+[[case]]
+name = "split-turtle-nested"
+area = "parse"
+what = "the Turtle splitter alone, one thread, from memory: the parse-turtle-nested file (every bracket) cut into 16 chunks, recovering, nothing parsed"
+semantics = "none"
+data = "turtle entities=100000 nested=1"
+tool_loads = false
+args = ["--split-turtle", "{data}:16", "--runs", "5"]
+queries = ""
+metric = "split_turtle.p50_ms"
+check = { "split_turtle.chunks" = 16 }
+pinned = "16 parts, a target in each of 100,000 statements: 16 chunks"
+route = {}
+cap_gb = 2
+systems = []
+
+[[case]]
+name = "parse-turtle-nested"
+area = "parse"
+what = "the Turtle parser alone, one thread, from memory: 1.3 M triples from 100,000 statements each using every bracket ([ ], ( ), <<( )>>, << >>, {| |}), the parser's cost per nested span"
+semantics = "none"
+data = "turtle entities=100000 nested=1"
+tool_loads = false
+args = ["--parse-turtle", "{data}", "--runs", "5"]
+queries = ""
+metric = "parse_turtle.p50_ms"
+check = { "parse_turtle.quads" = "expect.statements" }
+route = {}
+cap_gb = 2
 systems = []
 
 [[case]]
@@ -2393,6 +2541,26 @@ systems = []
 guards = ["DL in the store (owl2-dl): a commit's consistency proved by the upper bound U1"]
 
 [[case]]
+name = "dlmode-commits-readers"
+area = "maintenance"
+what = "4,000 owl2-dl commits over a schema outside OWL 2 RL (a union on the right), 8 readers alongside, each read taking the bounds' view of the latest revision: U1's change and install against its reads; the last commit, inconsistent only under OWL 2 DL, is rejected"
+semantics = "owl2-dl"
+# `violate=2`'s union keeps the ontology outside OWL 2 RL, so U1 is compiled and each commit
+# maintains it (the RL schema alone routes every commit to the RL rules, with no U1).
+data = "churn people=20000 changes=2000 violate=2"
+args = ["--reason", "owl2-dl", "--commits", "{data}.commits.ru", "--readers", "8"]
+queries = "churn"
+# The whole run: commits and reads that wait for each other show in it (a commit's tail, a
+# read's stall), where one commit's p50 doesn't.
+metric = "commits.whole_s"
+check = { "commits.commits" = 4000, "commits.error" = "has inconsistent under OWL 2 DL" }
+# Only the DL gate rejects the last commit: the ontology took the U1 route, not the RL one.
+route = { "commits.error" = "has touched-islands" }
+cap_gb = 4
+systems = []
+guards = ["U1's locks are leaves: no read waits for a commit's change of U1, no install for a read's build (SYN-22, P2-C6b)"]
+
+[[case]]
 name = "dlmode-commits-small"
 area = "maintenance"
 what = "400 commits under owl2-dl on a tenth of dlmode-commits' data: a commit's fixed cost of the DL check (PR #30's and #37's timing)"
@@ -2430,7 +2598,7 @@ data = "horn classes=3000"
 args = ["--classify", "--runs", "1"]
 queries = ""
 metric = "classification.max_ms"
-check = { "classification.consistent" = "true", "classification.subsumptions" = 1161634 }
+check = { "classification.consistency" = "consistent", "classification.subsumptions" = 1161634 }
 route = { "classification.engine" = "== context-core" }
 cap_gb = 6
 systems = ["hermit:dl", "konclude:dl"]
@@ -2445,7 +2613,7 @@ data = "dl-number n=24 individuals=100"
 args = ["--classify", "--runs", "1"]
 queries = ""
 metric = "classification.max_ms"
-check = { "classification.consistent" = "true", "classification.subsumptions" = 2 }
+check = { "classification.consistency" = "consistent", "classification.subsumptions" = 2 }
 route = { "classification.engine" = "== tableau" }
 cap_gb = 6
 systems = ["hermit:dl", "konclude:dl"]

@@ -69,12 +69,12 @@ The protocol, as NRESE implements it:
    - `terminal_status` (`completed`, `failed`, `timeout`, `unsupported`), `complete`, `unsupported` and `detail`
    - SHACL: `shacl_conforms`, `shacl_applicable` (some targeted shape had a focus node and a constraint), `shacl_meta_validated`
    - query: `observed_ask`, or `observed_rows` with terms as `kind` (`uri`, `literal`, `bnode`), `value`, `datatype`, `language`
-   - reasoning: `logical_consistent` and `unsatisfiable_classes`
+   - reasoning: `logical_consistent` (`true`, `false`, or `null` where undecided: read it as "cannot run", never as a pass) and `unsatisfiable_classes`
 
-What a check means (`nrese:draft-check/1`) follows DMW's offline checks, so both answer alike:
+What a check means (`nrese:draft-check/2`). SHACL and queries follow DMW's offline checks; reasoning is NRESE's own regime, the OWL 2 RL rules and the OWL 2 DL engines, and may decide more than DMW's offline rules:
 
 - **SHACL:** data and schema together, asserted statements only, SHACL Core. The shapes are checked for well-formedness when they are compiled.
 - **Query:** the data alone, asserted statements only, `ASK` and `SELECT`. More rows than `max_results` is a failure, never a truncated answer.
-- **Reasoning:** the OWL 2 RL rules decide consistency; the OWL 2 EL classifier lists unsatisfiable classes. Whatever either skipped is listed as unsupported, and the answer is then not complete.
+- **Reasoning:** inconsistent (`false`) where the OWL 2 RL rules or the OWL 2 DL engines find no model, consistent (`true`) where neither does and both decided, undecided (`null`) otherwise. The OWL 2 DL classification lists unsatisfiable classes, none for an inconsistent input. Whatever either skipped, and an undecided verdict, is listed as unsupported, and the answer is then not complete. (Under `/1`, `logical_consistent` was the RL rules' alone.)
 
 The server refuses, in the reply, a request for another build, semantics or profile, a time limit above its own, and inputs that don't match their pinned SHA-256 (`@active_data`, `@active_schema`, `@active_shapes`, `@query`).

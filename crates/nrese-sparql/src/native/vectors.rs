@@ -16,12 +16,12 @@
 //! | Predicate | Object |
 //! |---|---|
 //! | `nrv:near` | the query vector: a vector literal, or a variable the rest of the query binds to one (a search per value) |
-//! | `nrv:k` | how many nearest vectors (default 10) |
+//! | `nrv:k` | how many nearest vectors (default 10; 1 to 10,000, else an argument error) |
 //! | `nrv:score` | a variable: the cosine similarity or dot product, or the Euclidean distance |
 //! | `nrv:rank` | a variable: the rank, from 1 |
 //! | `nrv:metric` | `"cosine"` (the default), `"dot"` or `"l2"` |
 //! | `nrv:exact` | `true`: compare every vector (else large spaces are searched through an HNSW graph) |
-//! | `nrv:searchBudget` | the graph search's beam (default 64): wider finds more of the true nearest |
+//! | `nrv:searchBudget` | the graph search's beam (default 64; 1 to 1,000,000): wider finds more of the true nearest |
 //!
 //! The subject is the matched vector literal. Only literals the query's dataset uses as
 //! objects are found (so a user sees no vector from a graph it may not read). When the
@@ -29,11 +29,11 @@
 //! is among those values only: an exact scan of them when they are few, the graph with a
 //! filter otherwise. The nearest `k` are returned per query vector, nearest first.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use nrese_engine::vector::Metric;
 use nrese_engine::{TermId, VectorQuery, VectorSearchReport, VectorStrategy};
-use nrese_exec::{Budget, IdTable, Reservation, UNDEF};
+use nrese_exec::{Budget, ChargedVec, IdTable, Reservation, UNDEF};
 use nrese_rdf::{Literal, Term, Variable};
 use nrese_sparql_syntax::algebra::GraphPattern;
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern};
@@ -50,6 +50,9 @@ const DEFAULT_K: usize = 10;
 
 /// The most `nrv:k` takes.
 const MAX_K: usize = 10_000;
+
+/// The widest beam `nrv:searchBudget` takes.
+const MAX_BUDGET: usize = 100 * MAX_K;
 
 /// The search goes first when the pattern joined to it is estimated at more than this
 /// many rows per vector wanted.
@@ -76,6 +79,17 @@ enum Near {
 
 fn argument(message: impl Into<String>) -> QueryEvaluationError {
     QueryEvaluationError::Argument(format!("SERVICE nrv:search: {}", message.into()))
+}
+
+/// `value` if it lies in 1..=`max`, else an argument error naming `option`.
+fn within(value: usize, max: usize, option: &str) -> Result<usize, QueryEvaluationError> {
+    if (1..=max).contains(&value) {
+        Ok(value)
+    } else {
+        Err(argument(format!(
+            "{option} is from 1 to {max}, not {value}"
+        )))
+    }
 }
 
 /// The search `inner` (the block of `SERVICE nrv:search`) states.
@@ -136,8 +150,9 @@ fn parse(inner: &GraphPattern) -> Result<Search, QueryEvaluationError> {
                     _ => return Err(argument("nrv:near takes a vector literal or a variable")),
                 });
             }
-            "k" => search.k = number()?.clamp(1, MAX_K),
-            "searchBudget" => search.ef = Some(number()?.clamp(1, 100 * MAX_K)),
+            // Taken as given or refused, never clamped: a clamp answers another question.
+            "k" => search.k = within(number()?, MAX_K, "nrv:k")?,
+            "searchBudget" => search.ef = Some(within(number()?, MAX_BUDGET, "nrv:searchBudget")?),
             "score" => {
                 search.score = Some(variable.ok_or_else(|| argument("nrv:score takes a variable"))?)
             }
@@ -217,7 +232,10 @@ impl Context<'_> {
             }
         };
         let mut rows = Rows::new(&search);
-        let mut used: HashMap<u64, bool> = HashMap::new();
+        // Whether each hit is used in the active graph, kept across the query vectors:
+        // charged, as it grows with the hits the searches widen to.
+        let mut used: Ids<'_, bool> = Ids::new(&self.budget);
+        let within = self.search_in()?;
         for (near_id, vector) in queries {
             self.check()?;
             let accept = |id: TermId| {
@@ -229,18 +247,23 @@ impl Context<'_> {
                 &search,
                 vector,
                 candidates.as_ref().map(HashSet::len),
-                |query| self.snapshot.vector_search(query, &accept),
+                |query| self.vector_fetch(&within, query, &accept),
                 |id| {
-                    Ok((*used
-                        .entry(id.raw())
-                        .or_insert_with(|| self.used_as_object(id)))
-                    .then_some(()))
+                    let used = match used.get(id.raw()) {
+                        Some(&used) => used,
+                        None => {
+                            let found = self.used_as_object(id);
+                            used.insert(id.raw(), found)?;
+                            found
+                        }
+                    };
+                    Ok(used.then_some(()))
                 },
             )?;
             rows.push(
                 self,
                 &search,
-                found.into_iter().map(|(id, d, ())| (id, d)),
+                found.kept.iter().map(|&(id, d, ())| (id, d)),
                 near_id,
             );
         }
@@ -279,11 +302,12 @@ impl Context<'_> {
         // beam is widened by the inverse share as for a filter it applies itself. Without
         // it the first `k` hits that pass come from an approximate list whose tail misses
         // them (recall 0.50 against 0.98, one kind in ten of 200,000 vectors).
+        let within = self.search_in()?;
         let found = self.nearest(
             &search,
             vector.clone(),
             Some(estimate.ceil() as usize),
-            |query| self.snapshot.vector_search(query, &|_| true),
+            |query| self.vector_fetch(&within, query, &|_| true),
             |id| {
                 if !self.used_as_object(id) {
                     return Ok(None);
@@ -307,19 +331,21 @@ impl Context<'_> {
         rows.push(
             self,
             &search,
-            found.iter().map(|(id, d, _)| (*id, *d)),
+            found.kept.iter().map(|(id, d, _)| (*id, *d)),
             None,
         );
         // Union consumes its inputs, also when it fails; the winners not yet handed to it
-        // are released as they drop.
+        // are released as they drop, then their room's charge.
+        let Nearest { kept, held } = found;
         let mut probed = None;
-        for (_, _, winner) in found {
+        for (_, _, winner) in kept {
             let rows = winner.take();
             probed = Some(match probed.take() {
                 Some(earlier) => self.union(earlier, rows)?,
                 None => rows,
             });
         }
+        drop(held);
         let local = match probed {
             Some(rows) => rows,
             None => {
@@ -343,17 +369,50 @@ impl Context<'_> {
         self.join(local, found)
     }
 
+    /// One round of a vector search, over what `within` says: the dictionary's index
+    /// (global), or the vectors the reader sees, compared exactly; charged to the query's
+    /// budget either way, a refusal (the search's or a reader's corpus) its memory error.
+    fn vector_fetch(
+        &self,
+        within: &super::search::SearchIn,
+        query: &VectorQuery,
+        accept: &(dyn Fn(TermId) -> bool + Sync),
+    ) -> NativeResult<Fetched<'_>> {
+        use super::search::SearchIn;
+        let found = match within {
+            SearchIn::Global => self.snapshot.vector_search(query, accept, &self.budget),
+            SearchIn::Reader(None) => Ok((
+                ChargedVec::new(&*self.budget),
+                VectorSearchReport {
+                    space: 0,
+                    graph: false,
+                    scanned: 0,
+                },
+            )),
+            SearchIn::Reader(Some((_, scope))) => {
+                self.snapshot
+                    .vector_search_in(self.model, scope, query, accept, &self.budget)
+            }
+        };
+        found.map_err(|e| QueryEvaluationError::MemoryLimit(e).into())
+    }
+
     /// Merge sorted search rounds with retained, successfully probed candidates.
     /// O(fetched + k) per round, probing each ID at most once. Keeps at most k payloads
     /// between probes, plus one incoming probe; a displaced payload drops at once.
-    fn nearest<T>(
-        &self,
+    ///
+    /// A round that finds too few that pass fetches again with four times the `k`, up to
+    /// the whole space, so what the rounds hold grows with the space: the hits fetched
+    /// (`fetch` charges them) and the ids seen are charged to the query's budget before
+    /// they are allocated, and a search past the budget is refused with nothing left held.
+    fn nearest<'c, T>(
+        &'c self,
         search: &Search,
         vector: Vec<f32>,
         accepted: Option<usize>,
-        mut fetch: impl FnMut(&VectorQuery) -> (Vec<(TermId, f32)>, VectorSearchReport),
+        mut fetch: impl FnMut(&VectorQuery) -> NativeResult<Fetched<'c>>,
         mut keep: impl FnMut(TermId) -> NativeResult<Option<T>>,
-    ) -> NativeResult<Vec<(TermId, f32, T)>> {
+    ) -> NativeResult<Nearest<'c, T>> {
         let mut query = VectorQuery {
             metric: search.metric,
             strategy: search.strategy,
@@ -363,13 +422,24 @@ impl Context<'_> {
         if let Some(ef) = search.ef {
             query.ef = ef;
         }
-        let mut seen: HashSet<u64> = HashSet::new();
-        let mut kept: Vec<(TermId, f32, T)> = Vec::new();
-        let mut next = Vec::new();
+        let budget: &'c Budget = &self.budget;
+        let mut seen: Ids<'c, ()> = Ids::new(budget);
+        // The kept candidates and the next round's, at most `k` each: their room charged
+        // first, and never grown.
+        let slot = size_of::<(TermId, f32, T)>();
+        let mut held = Reservation::new(budget);
+        held.charge(slot.saturating_mul(search.k).saturating_mul(2))
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        let mut kept: Vec<(TermId, f32, T)> = Vec::with_capacity(search.k);
+        let mut next = Vec::with_capacity(search.k);
+        held.resize(slot * (kept.capacity() + next.capacity()))
+            .map_err(QueryEvaluationError::MemoryLimit)?;
         loop {
             self.check()?;
-            let (hits, report) = fetch(&query);
+            let (hits, report) = fetch(&query)?;
             let fetched = hits.len();
+            // The hits are freed when the round is done with them, then their charge.
+            let (hits, hits_held) = hits.into_parts();
             let mut hits = hits.into_iter().peekable();
             let mut pending = kept.drain(..);
             while next.len() < search.k {
@@ -381,7 +451,7 @@ impl Context<'_> {
                 if old_first {
                     next.push(pending.next().expect("pending candidate"));
                 } else if let Some((id, distance)) = hits.next() {
-                    if seen.insert(id.raw())
+                    if seen.insert(id.raw(), ())?.is_none()
                         && let Some(rows) = keep(id)?
                     {
                         next.push((id, distance, rows));
@@ -396,16 +466,79 @@ impl Context<'_> {
                 }
             }
             drop(pending);
+            drop(hits);
+            drop(hits_held);
             self.check()?;
             std::mem::swap(&mut kept, &mut next);
             // Enough, or nothing more to fetch.
             if kept.len() == search.k || fetched < query.k || query.k >= report.space {
-                return Ok(kept);
+                drop(next);
+                held.resize(slot * kept.capacity())
+                    .map_err(QueryEvaluationError::MemoryLimit)?;
+                return Ok(Nearest { kept, held });
             }
             query.k = (query.k * 4).min(report.space.max(1));
             query.ef = query.ef.max(query.k);
         }
     }
+}
+
+/// A search round's hits, nearest first, charged to the query's budget, and how it went.
+type Fetched<'b> = (ChargedVec<(TermId, f32), &'b Budget>, VectorSearchReport);
+
+/// The candidates a search kept, nearest first, and the charge of their room (released
+/// when it drops, after them).
+pub(super) struct Nearest<'b, T> {
+    kept: Vec<(TermId, f32, T)>,
+    held: Reservation<&'b Budget>,
+}
+
+/// Ids with a value each, in a hash table charged to a budget: each growth of the table is
+/// charged first (at most what the new table takes, beside the old one), then trimmed to
+/// what the new table holds once the old one is freed. Dropped, the table is freed, then
+/// its charge released.
+struct Ids<'b, V> {
+    /// Before `held`: fields drop in order, the table first.
+    map: hashbrown::HashMap<u64, V>,
+    held: Reservation<&'b Budget>,
+}
+
+impl<'b, V> Ids<'b, V> {
+    fn new(budget: &'b Budget) -> Self {
+        Self {
+            map: hashbrown::HashMap::new(),
+            held: Reservation::new(budget),
+        }
+    }
+
+    fn get(&self, id: u64) -> Option<&V> {
+        self.map.get(&id)
+    }
+
+    /// Inserts `value` for `id`, growing the table first if it is full; the old value.
+    fn insert(&mut self, id: u64, value: V) -> NativeResult<Option<V>> {
+        if self.map.len() == self.map.capacity() && !self.map.contains_key(&id) {
+            let target = self.map.capacity().saturating_mul(2).max(4);
+            self.held
+                .charge(table_bound::<(u64, V)>(target))
+                .map_err(QueryEvaluationError::MemoryLimit)?;
+            self.map.reserve(target - self.map.len());
+            self.held
+                .resize(self.map.allocation_size())
+                .map_err(QueryEvaluationError::MemoryLimit)?;
+        }
+        Ok(self.map.insert(id, value))
+    }
+}
+
+/// At least what a hash table of `capacity` entries of `T` allocates: its buckets (a power
+/// of two, at most twice `capacity` · 8/7, at least 4), a control byte each, a group's more
+/// and the alignment.
+fn table_bound<T>(capacity: usize) -> usize {
+    let buckets = capacity.saturating_mul(16) / 7 + 16;
+    buckets
+        .saturating_mul(size_of::<T>() + 1)
+        .saturating_add(64)
 }
 
 /// Probe rows charged to the query's budget: released if they drop, handed on by
@@ -517,11 +650,46 @@ mod tests {
         }
     }
 
-    fn hits(values: &[(u64, f32)]) -> Vec<(TermId, f32)> {
-        values
-            .iter()
-            .map(|&(id, distance)| (TermId::from_raw(id), distance))
-            .collect()
+    /// A budget that refuses nothing, for the hits a test hands to `nearest`.
+    fn unlimited() -> &'static Budget {
+        static UNLIMITED: std::sync::OnceLock<Budget> = std::sync::OnceLock::new();
+        UNLIMITED.get_or_init(Budget::unlimited)
+    }
+
+    fn hits(values: &[(u64, f32)]) -> ChargedVec<(TermId, f32), &'static Budget> {
+        let mut hits = ChargedVec::new(unlimited());
+        for &(id, distance) in values {
+            hits.push((TermId::from_raw(id), distance)).unwrap();
+        }
+        hits
+    }
+
+    /// A payload counted while it lives: `live` is how many there are, `most` the most at
+    /// once.
+    struct Counted<'b> {
+        rows: Option<Probed<'b>>,
+        live: &'b Cell<usize>,
+    }
+
+    impl<'b> Counted<'b> {
+        fn new(rows: Probed<'b>, live: &'b Cell<usize>, most: &Cell<usize>) -> Self {
+            live.set(live.get() + 1);
+            most.set(most.get().max(live.get()));
+            Self {
+                rows: Some(rows),
+                live,
+            }
+        }
+
+        fn take(mut self) -> Solutions {
+            self.rows.take().expect("rows").take()
+        }
+    }
+
+    impl Drop for Counted<'_> {
+        fn drop(&mut self) {
+            self.live.set(self.live.get() - 1);
+        }
     }
 
     fn report(space: usize) -> VectorSearchReport {
@@ -560,9 +728,10 @@ mod tests {
         let unrelated = payload(&ctx, 99);
         let bytes = unrelated.table.memory_bytes();
         let probes = RefCell::new(Vec::new());
-        let buffers = RefCell::new(HashMap::new());
+        let buffers = RefCell::new(std::collections::HashMap::new());
         let rounds = Cell::new(0);
-        let found = ctx
+        let (live, most) = (Cell::new(0), Cell::new(0));
+        let Nearest { kept, held } = ctx
             .nearest(
                 &search(3),
                 vec![1.0],
@@ -585,31 +754,24 @@ mod tests {
                         ],
                         _ => panic!("unnecessary search"),
                     };
-                    (hits(&values), report(100))
+                    Ok((hits(&values), report(100)))
                 },
                 |id| {
                     let id = id.raw();
                     probes.borrow_mut().push(id);
-                    assert!(
-                        shared.used() <= own + bytes * 4,
-                        "at most k retained payloads plus unrelated"
-                    );
+                    assert!(live.get() <= 3, "at most k retained payloads");
                     if id == 0 {
                         return Ok(None);
                     }
                     if id == 3 {
-                        assert_eq!(
-                            shared.used(),
-                            own + bytes * 4,
-                            "9 is released before 3 is probed"
-                        );
+                        assert_eq!(live.get(), 3, "9 is released before 3 is probed");
                     }
                     assert!(matches!(id, 1 | 2 | 3 | 8 | 9), "dominated suffix probed");
                     let rows = payload(&ctx, id);
                     buffers
                         .borrow_mut()
                         .insert(id, rows.table.column(0).as_ptr());
-                    Ok(Some(Probed::new(&ctx, rows)))
+                    Ok(Some(Counted::new(Probed::new(&ctx, rows), &live, &most)))
                 },
             )
             .map_err(QueryEvaluationError::from)
@@ -617,16 +779,16 @@ mod tests {
         assert_eq!(rounds.get(), 2);
         assert_eq!(*probes.borrow(), [0, 8, 9, 1, 2, 3]);
         assert_eq!(
-            found.iter().map(|(id, _, _)| id.raw()).collect::<Vec<_>>(),
+            kept.iter().map(|(id, _, _)| id.raw()).collect::<Vec<_>>(),
             [1, 2, 3]
         );
-        assert_eq!(shared.used(), own + bytes * 4, "8 is released");
+        assert_eq!(live.get(), 3, "8 is released");
         assert_eq!(
-            shared.peak(),
-            own + bytes * 5,
+            most.get(),
+            4,
             "one incoming probe may overlap the k retained bags"
         );
-        for (id, _, rows) in found {
+        for (id, _, rows) in kept {
             let rows = rows.take();
             assert_eq!(
                 rows.table.column(0).as_ptr(),
@@ -635,10 +797,11 @@ mod tests {
             );
             ctx.consumed(rows);
         }
+        drop(held);
         assert_eq!(
             shared.used(),
             own + bytes,
-            "unrelated reservation survives disposal"
+            "unrelated reservation survives disposal; the search's own room is released"
         );
         ctx.consumed(unrelated);
         drop(ctx);
@@ -681,10 +844,10 @@ mod tests {
                     Some(100),
                     |query| {
                         assert_eq!(query.accepted, Some(100));
-                        (
+                        Ok((
                             hits(&rounds.next().expect("two rounds suffice")),
                             report(100),
-                        )
+                        ))
                     },
                     |id| {
                         assert!(seen.insert(id.raw()), "each ID probed once");
@@ -695,7 +858,8 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 found
-                    .into_iter()
+                    .kept
+                    .iter()
                     .map(|(id, _, ())| id.raw())
                     .collect::<Vec<_>>(),
                 expected
@@ -716,14 +880,14 @@ mod tests {
                     |_| {
                         assert!(!fetched);
                         fetched = true;
-                        (hits(&values), report(space))
+                        Ok((hits(&values), report(space)))
                     },
                     |id| Ok((id.raw() != 0).then_some(())),
                 )
                 .map_err(QueryEvaluationError::from)
                 .unwrap();
             assert_eq!(
-                found.len(),
+                found.kept.len(),
                 values.iter().filter(|(id, _)| *id != 0).count()
             );
         }
@@ -756,14 +920,14 @@ mod tests {
                     if round == 2 && stop == "fetch_cancel" {
                         token.cancel();
                     }
-                    (
+                    Ok((
                         if round == 1 {
                             hits(&[(0, 0.0), (8, 0.8), (9, 0.9)])
                         } else {
                             hits(&[(0, 0.0), (1, 0.1), (2, 0.2), (3, 0.3)])
                         },
                         report(100),
-                    )
+                    ))
                 },
                 |id| {
                     if id.raw() == 0 {
@@ -836,9 +1000,13 @@ mod tests {
         // its own.
         let unrelated = 128 + super::super::own_bytes(&snapshot);
         const UNRELATED: usize = 128;
+        // Beside the winners, the room the search keeps for its k candidates until the union
+        // has them (charged since SRCH r1): the limit leaves room for it, so that the fourth
+        // union is still the one past it.
+        let room = 6 * size_of::<(TermId, f32, Probed<'_>)>();
         let options = QueryOptions {
             resources: crate::Resources {
-                memory: nrese_exec::Envelope::new(Some(unrelated + 8192 - 1), None),
+                memory: nrese_exec::Envelope::new(Some(unrelated + room + 8192 - 1), None),
                 ..Default::default()
             },
             ..Default::default()
@@ -853,7 +1021,10 @@ mod tests {
             Err(QueryEvaluationError::MemoryLimit(error)) => error,
             _ => panic!("fourth winner's union must exceed the remaining budget"),
         };
-        assert_eq!((error.used, error.requested), (unrelated + 2048, 6144));
+        assert_eq!(
+            (error.used, error.requested),
+            (unrelated + 2048 + room, 6144)
+        );
         assert_eq!(
             ctx.budget.used(),
             unrelated,
@@ -870,7 +1041,12 @@ mod tests {
             strategy: VectorStrategy::Exact,
             ..VectorQuery::new(vec![0.0], 1)
         };
-        let id = snapshot.vector_search(&query, &|_| true).0[0].0.raw();
+        let id = snapshot
+            .vector_search(&query, &|_| true, unlimited())
+            .unwrap()
+            .0[0]
+            .0
+            .raw();
         let empty = ctx
             .eval_from(payload(&ctx, id), &rejected)
             .map_err(QueryEvaluationError::from)

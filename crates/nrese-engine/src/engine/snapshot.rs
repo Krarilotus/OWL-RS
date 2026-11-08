@@ -17,6 +17,10 @@ pub type HeavyGroups = Arc<nrese_exec::ChargedVec<(TermId, u64)>>;
 mod cursor;
 pub use cursor::{ProbeCursor, Seek};
 
+mod reader_search;
+pub(crate) use reader_search::Documents;
+pub use reader_search::TextScope;
+
 /// A consistent view of one committed revision. Cheap to clone; holding it keeps that
 /// revision's runs alive but never blocks writers or compaction.
 ///
@@ -632,6 +636,39 @@ impl Snapshot {
         )
     }
 
+    /// [`Self::with_inferred_added`] for `added` in the default graph, everything the view
+    /// makes charged to `budget` before it is made and held by the view until its last
+    /// reader lets it go: its run (each permutation's arrays), the stack's list of runs, its
+    /// version, statistics and equality classes. Past the run builder's threshold the
+    /// permutations are built in parallel on the caller's pool, each charging its own
+    /// arrays first. A refusal leaves nothing made. O(k log k) for k statements.
+    pub fn with_inferred_added_within(
+        &self,
+        added: &[crate::quad::EncodedTriple],
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        use std::mem::size_of;
+        let stack = &self.version.inferred;
+        let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
+        held.charge(
+            Self::restricted_bytes()
+                + stack.runs_bytes(1)
+                + boxed(size_of::<crate::index::run::Run>())
+                + Held::overhead(self.held.count()),
+        )?;
+        // The statements as quads, while the run is built from them.
+        let mut scratch = nrese_exec::Reservation::new(Arc::clone(budget));
+        scratch.charge(added.len() * size_of::<EncodedQuad>())?;
+        let quads: Vec<EncodedQuad> = added.iter().map(|t| t.in_default_graph()).collect();
+        let built = stack.with_delta_within(&quads, budget);
+        drop(quads);
+        drop(scratch);
+        let (inferred, run) = built?;
+        let held =
+            nrese_exec::Reservation::adopt(Arc::clone(budget), held.transfer() + run.transfer());
+        Ok(self.restricted(inferred, Held::new(self.held.with(0), held)))
+    }
+
     /// This snapshot with the inferred statements `mask` hides removed, as
     /// [`Self::with_inferred_subset`] does, by stacking its runs: O(r) for its r runs.
     /// `Ok(None)` if the mask was built for another layout of the stack. What the view
@@ -673,9 +710,12 @@ impl Snapshot {
     fn restricted(&self, inferred: crate::index::IndexVersion, held: Held) -> Snapshot {
         let version = Arc::new(Version {
             content: super::Content::fresh(),
+            // A masked or restricted view: the same asserted stack.
+            asserted_content: self.version.asserted_content,
             asserted: self.version.asserted.clone(),
             inferred,
             revision: self.version.revision,
+            committed_micros: self.version.committed_micros,
             dictionary_len: self.version.dictionary_len,
             equality: Default::default(),
             canonical: Default::default(),
@@ -687,7 +727,7 @@ impl Snapshot {
             reads: self.reads.clone(),
             version,
             dictionary: Arc::clone(&self.dictionary),
-            statistics: Arc::default(),
+            statistics: Arc::new(self.statistics.for_view()),
             equality: self.equality,
             canonical: self.canonical,
             held,
@@ -955,6 +995,13 @@ impl Snapshot {
 
     pub fn revision(&self) -> u64 {
         self.version.revision
+    }
+
+    /// What its asserted statements are ([`super::AssertedIdentity`]): shared across the
+    /// views of one asserted stack, so a cache keyed by it must not depend on the view's
+    /// scope or equality mode; a transaction's pending state has its own.
+    pub fn asserted_identity(&self) -> super::AssertedIdentity {
+        self.version.asserted_content
     }
 
     /// What this snapshot reads, for caches of results computed on it: two snapshots with
@@ -1841,20 +1888,28 @@ impl Snapshot {
 
     /// The vector literals this snapshot's dictionary holds that are nearest to
     /// `query.vector`, among those `accept` takes, nearest first, with how the search went
-    /// (whether statements still use them is the caller's to check, in `accept`).
-    pub fn vector_search(
+    /// (whether statements still use them is the caller's to check, in `accept`). What the
+    /// search holds, the hits included, is charged to `budget` before it is allocated: a
+    /// search the budget has no room for is refused, with nothing left charged.
+    pub fn vector_search<'b>(
         &self,
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
-    ) -> (Vec<(TermId, f32)>, crate::VectorSearchReport) {
+        budget: &'b nrese_exec::Budget,
+    ) -> Result<VectorHits<'b>, nrese_exec::BudgetExceeded> {
         let (hits, report) =
             self.dictionary
-                .vector_search(query, self.version.dictionary_len, accept);
-        let hits = hits
-            .into_iter()
-            .map(|hit| (TermId::from_raw(hit.id), hit.distance))
-            .collect();
-        (hits, report)
+                .vector_search(query, self.version.dictionary_len, accept, budget)?;
+        let len = hits.len();
+        let (hits, held) = hits.into_parts();
+        let found = nrese_exec::ChargedVec::collect(
+            budget,
+            len,
+            hits.into_iter()
+                .map(|hit| (TermId::from_raw(hit.id), hit.distance)),
+        );
+        drop(held);
+        Ok((found?, report))
     }
 
     /// Builds the graph searches like `query` use, covering every vector of its
@@ -1963,6 +2018,13 @@ where
         }
     }
 }
+
+/// A vector search's hits, nearest first, charged to the budget it was given, and how the
+/// search went ([`Snapshot::vector_search`]).
+pub type VectorHits<'b> = (
+    nrese_exec::ChargedVec<(TermId, f32), &'b nrese_exec::Budget>,
+    crate::VectorSearchReport,
+);
 
 #[cfg(test)]
 mod canonical_lifetime_tests {

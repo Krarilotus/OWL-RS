@@ -2,8 +2,8 @@
 //!
 //! Every kind is deterministic for its parameters and seed, written as N-Triples (RDF 1.2
 //! where it holds triple terms; the multi-graph kinds `geo4` and `social4` as N-Quads over four
-//! named graphs, `ex:graph0` to `ex:graph3`), and computes here, independently of the store, the
-//! answers the suite checks before a time counts. They go to standard output as one JSON
+//! named graphs, `ex:graph0` to `ex:graph3`; `turtle` as Turtle), and computes here,
+//! independently of the store, the answers the suite checks before a time counts. They go to standard output as one JSON
 //! object (`expect`), with the statement count and the parameters used. Kinds that need
 //! commits also write `OUT.commits.ru`: one SPARQL update per line, one commit each;
 //! `support-stress` also writes its reader (`OUT.reader`) and that reader's own updates
@@ -139,16 +139,19 @@ pub fn main(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         "eq-addon" => eq_addon(&params, &mut nt)?,
         "fed-chain" => fed_chain(&params, &mut nt)?,
         "sameas-giant" => sameas_giant(&params, &mut nt, &commits)?,
+        "first-load" => first_load(&params, &commits)?,
         "dense" => dense(&params, &mut rng, &mut nt)?,
         "chain" => chain(&params, &mut nt)?,
         "layered" => layered(&params, &mut rng, &mut nt, &commits)?,
         "entities" => entities(&params, &mut rng, &mut nt)?,
         "churn" => churn(&params, &mut nt, &commits)?,
+        "ql-memberships" => ql_memberships(&params, &mut nt, &commits)?,
         "batches" => batches(&params, &mut nt, &commits)?,
         "geo" => geo(&params, &mut rng, &mut nt)?,
         "text" => text(&params, &mut rng, &mut nt)?,
         "vectors" => vectors(&params, &mut rng, &mut nt)?,
         "rdf12" => rdf12(&params, &mut rng, &mut nt)?,
+        "turtle" => turtle(&params, &mut nt)?,
         "graph" => graph(&params, &mut rng, &mut nt)?,
         "twins" => twins(&params, &mut rng, &mut nt, out)?,
         "dl-transitive" => dl_transitive(&params, &mut nt)?,
@@ -583,6 +586,78 @@ fn entities(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
     Ok(e)
 }
 
+/// What the OWL 2 QL schema reader reads per blank class expression (P2-C1 review r1's cost
+/// question): `expressions` restrictions `_:eE` (`owl:onProperty :S{E mod 10}`,
+/// `owl:someValuesFrom :A{E mod 10}`), each with `members` individuals asserted to be in it
+/// (`:mE_K a _:eE`), a generating axiom `:P ⊑ ∃worksFor.Org`, 1,000 people in `P` linked by
+/// `knows`. `commits` commits each add a statement and as many later remove it again:
+/// `types=1` a membership of every restriction on `S0` (what the reader rescans), otherwise a
+/// `knows` edge (ordinary data). After the last commit the store holds what it held before.
+fn ql_memberships(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expect> {
+    let (expressions, members) = (p.get("expressions", 100), p.get("members", 100));
+    let (changes, types) = (p.get("commits", 0), p.get("types", 0) == 1);
+    let people = 1000;
+    let a = rdf("type");
+    for e in 0..expressions {
+        let node = format!("_:e{e}");
+        nt.t(&node, &a, &owl("Restriction"))?;
+        nt.t(&node, &owl("onProperty"), &ex(format!("S{}", e % 10)))?;
+        nt.t(&node, &owl("someValuesFrom"), &ex(format!("A{}", e % 10)))?;
+        for k in 0..members {
+            nt.t(&ex(format!("m{e}_{k}")), &a, &node)?;
+        }
+    }
+    nt.t("_:works", &a, &owl("Restriction"))?;
+    nt.t("_:works", &owl("onProperty"), &ex("worksFor"))?;
+    nt.t("_:works", &owl("someValuesFrom"), &ex("Org"))?;
+    nt.t(&ex("P"), &rdfs("subClassOf"), "_:works")?;
+    for i in 0..people {
+        nt.t(&ex(format!("p{i}")), &a, &ex("P"))?;
+        nt.t(
+            &ex(format!("p{i}")),
+            &ex("knows"),
+            &ex(format!("p{}", (i + 1) % people)),
+        )?;
+    }
+    let mut out = BufWriter::new(File::create(commits)?);
+    let (on, s0) = (owl("onProperty"), ex("S0"));
+    for i in 0..changes {
+        if types {
+            writeln!(
+                out,
+                "INSERT {{ {} a ?e }} WHERE {{ ?e {on} {s0} }}",
+                ex(format!("new{i}"))
+            )?;
+        } else {
+            writeln!(
+                out,
+                "INSERT DATA {{ {} {} {} }}",
+                ex(format!("new{i}")),
+                ex("knows"),
+                ex("p0")
+            )?;
+        }
+    }
+    for i in 0..changes {
+        if types {
+            writeln!(out, "DELETE WHERE {{ {} a ?e }}", ex(format!("new{i}")))?;
+        } else {
+            writeln!(
+                out,
+                "DELETE DATA {{ {} {} {} }}",
+                ex(format!("new{i}")),
+                ex("knows"),
+                ex("p0")
+            )?;
+        }
+    }
+    let mut e = Expect::new();
+    e.insert("knows".into(), json!(people));
+    e.insert("people".into(), json!(people));
+    e.insert("commits".into(), json!(2 * changes));
+    Ok(e)
+}
+
 /// A small university-like schema and `people` people, and commits that each add a
 /// person with types and links and later remove them: after the last commit the store
 /// holds what it held before, so the closure must too.
@@ -829,6 +904,44 @@ fn vectors(p: &Params, rng: &mut Rng, nt: &mut Nt) -> std::io::Result<Expect> {
             ),
         );
     }
+    Ok(e)
+}
+
+/// Turtle (not N-Triples), for the Turtle parser alone (`perf_lab --parse-turtle`): `entities`
+/// subjects. `nested=0`: four flat IRI triples each. `nested=1`: one statement each using
+/// every Turtle and RDF 1.2 bracket: a blank-node property list holding a two-item list, a
+/// triple term, a reified triple and an annotation, 13 triples:
+///
+/// ```turtle
+/// <s> <p> [ <q> <o> ; <r> ( <a> <b> ) ] ;
+///     <t> <<( <a> <b> <o> )>> ;
+///     <u> << <a> <b> <o> >> ;
+///     <v> <o> {| <w> <x> |} .
+/// ```
+///
+/// (`[ … ]` 3 triples, the list 4, `<t>` 1, the reified triple 2, `<v>` 1, its annotation 2.)
+fn turtle(p: &Params, nt: &mut Nt) -> std::io::Result<Expect> {
+    let (n, nested) = (p.get("entities", 250_000), p.get("nested", 0) != 0);
+    let (a, b, x) = (ex("a"), ex("b"), ex("x"));
+    let [pp, q, r, t, u, v, w] = ["p", "q", "r", "t", "u", "v", "w"].map(ex);
+    for i in 0..n {
+        let (s, o) = (ex(format!("s{i}")), ex(format!("o{i}")));
+        if nested {
+            writeln!(
+                nt.out,
+                "{s} {pp} [ {q} {o} ; {r} ( {a} {b} ) ] ;\n    {t} <<( {a} {b} {o} )>> ;\n    \
+                 {u} << {a} {b} {o} >> ;\n    {v} {o} {{| {w} {x} |}} ."
+            )?;
+            nt.count += 13;
+        } else {
+            for p in [&pp, &q, &r, &t] {
+                writeln!(nt.out, "{s} {p} {o} .")?;
+            }
+            nt.count += 4;
+        }
+    }
+    let mut e = Expect::new();
+    e.insert("entities".into(), json!(n));
     Ok(e)
 }
 
@@ -1357,6 +1470,38 @@ fn sameas_giant(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expec
         json!(2 * half * half + groups * 100),
     );
     e.insert("giant_values".into(), json!(size));
+    Ok(e)
+}
+
+/// A first commit into an empty store, as DMW loads its ontologies (its A/B harness's
+/// subclass chain, 21 Oct 2026): `classes` classes in a `rdfs:subClassOf` chain and
+/// `individuals` members of the last, as one INSERT DATA; with `ranged=1`, also a property
+/// with a range and one literal value, whose conclusion (the literal's type) no store holds
+/// (PR #46 review r1 F1). The data file stays empty.
+fn first_load(p: &Params, commits: &str) -> std::io::Result<Expect> {
+    let (classes, individuals) = (p.get("classes", 250), p.get("individuals", 400));
+    let t = |s: &str, p: &str, o: &str| format!("{s} {p} {o} .");
+    let mut statements = Vec::new();
+    for n in 0..classes {
+        let class = ex(format!("C{n}"));
+        statements.push(t(&class, &rdf("type"), &owl("Class")));
+        if n > 0 {
+            statements.push(t(&class, &rdfs("subClassOf"), &ex(format!("C{}", n - 1))));
+        }
+    }
+    let last = ex(format!("C{}", classes - 1));
+    for i in 0..individuals {
+        statements.push(t(&ex(format!("i{i}")), &rdf("type"), &last));
+    }
+    if p.get("ranged", 0) == 1 {
+        statements.push(t(&ex("note"), &rdfs("range"), &format!("<{XSD}string>")));
+        statements.push(t(&ex("i0"), &ex("note"), "\"x\""));
+    }
+    let mut out = BufWriter::new(File::create(commits)?);
+    writeln!(out, "INSERT DATA {{ {} }}", statements.join(" "))?;
+    out.flush()?;
+    let mut e = Expect::new();
+    e.insert("members".into(), json!(individuals));
     Ok(e)
 }
 

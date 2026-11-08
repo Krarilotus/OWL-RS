@@ -3,9 +3,35 @@
 # command that made it and the release of its source. The reserved space holds them for
 # good (budget_gb); scripts/bench-cleanup.sh never removes a catalogued file. Regenerating a
 # file must give the same hash, or it is a new release: freeze it again and say so in the
-# run records that use it.
+# run records that use it. A file whose maker labels its blank nodes afresh each time (riot)
+# is pinned by form too: `rdfc_sha256`, the SHA-256 of its RDFC-1.0 canonical N-Quads
+# (crates/rdf/nrese-rdf-io/examples/rdfc.rs), which a made copy must meet where its bytes can't.
+# [makers]: the makers a timing job runs where its host lacks a file, by their command's start
+# (benches/fast/release_gate.py reads them, and a harness's own: harness_tables()): what each
+# needs from its host, whether its copies meet only a form pin, whether it is the SPARQL data
+# step's, and the container it runs in, [memory GB, CPUs], which the job declares to the fleet.
 
 budget_gb = 300
+
+[makers."bash benches/reasoning/prepare-lubm.sh"]
+needs = ["docker"]
+container = [4, 8]
+note = "Twice the lowest cap that made every job-run file (maker-containers-measure-1, 8 Nov 2026: lubm-1/10/100 at 8 CPUs uncapped and under 8, 4 and 2 GB, the bytes as pinned under each; uncapped peaks UBA's lubm-100 run 3.8 GB, its sort 5.6 GB with its written file's page cache; at 2 GB the make took 133 s against 108 uncapped)"
+
+[makers."bash benches/reasoning/prepare-owl2bench.sh"]
+needs = ["docker"]
+form_only = true
+container = [4, 8]
+note = "riot labels blank nodes afresh on every make, so a copy meets only a form pin (rdfc_sha256); a file without one keeps the assets (sol-loop r1 S1: owl2bench-ql-1.nt). Its container: as LUBM's (owl2bench-rl-1 made under 2 GB, maker-containers-measure-1)"
+
+[makers."bash benches/sparql/prepare.sh"]
+sparql = true
+container = [8, 8]
+note = "The SPARQL data step's own maker (its files go to the SPARQL cache; it asks the host nothing): its container its own CAP, 8 GB / 8 CPUs, in a job that declares one"
+
+[makers."perf_lab generate support-stress"]
+needs = []
+note = "The harness's perf_lab generator: nothing beyond the build"
 
 [[dataset]]
 file = "ann/glove-100-angular.hdf5"
@@ -199,9 +225,10 @@ workload = "lubm"
 tier = "10"
 role = "core"
 made_by = "bash benches/reasoning/prepare-lubm.sh 10"
-bytes = 231509261
-sha256 = "66f44fa87db99b5b9465e01d95463bdd2c9e94158a2987d39162d042eb4b17ba"
-frozen = "2026-10-03"
+bytes = 224996086
+sha256 = "85b6ccc3301b0073a933d8de721f9572760959d106a6d58d24ce35e6f2b0f2d1"
+frozen = "2026-11-07"
+note = "A new release, 7 Nov 2026: its 1,272,575 distinct lines in byte order (prepare-lubm.sh sorts a file of more than one university; UBA's threads order it anew on every make). The same triples as the release of 3 Oct (231,509,261 bytes, sha256 66f44fa87db99b5b9465e01d95463bdd2c9e94158a2987d39162d042eb4b17ba, as the asset hosts hold it), in another order and without its duplicate lines: results on the two aren't the same input (stage-data-lubm-verified-1, stage-data-lubm-made-1)"
 
 [[dataset]]
 file = "lubm-100-materialised.nt"
@@ -219,9 +246,10 @@ workload = "lubm"
 tier = "100"
 role = "core"
 made_by = "bash benches/reasoning/prepare-lubm.sh 100"
-bytes = 2459544707
-sha256 = "61f43e3fb8fbe6b090223b187e1b1204b6c2c2cb5fbd657230e416ab230a4a0d"
-frozen = "2026-10-03"
+bytes = 2389482844
+sha256 = "d3dd17e21031b3028290e050a515a7f88d09c7fdecede6fd54690fdd9dcdaa10"
+frozen = "2026-11-07"
+note = "A new release, 7 Nov 2026: its 13,405,381 distinct lines in byte order (prepare-lubm.sh sorts a file of more than one university; UBA's threads order it anew on every make). The same triples as the release of 3 Oct (2,459,544,707 bytes, sha256 61f43e3fb8fbe6b090223b187e1b1204b6c2c2cb5fbd657230e416ab230a4a0d, as the asset hosts hold it), in another order and without its duplicate lines: results on the two aren't the same input (stage-data-lubm-verified-1, stage-data-lubm-made-1). Made on khaleesi-wsl in 90 s, sorted included (stage-data-make-2; UBA alone 59 s); RDFC-1.0 of it peaks at 22 GB, so it is pinned by bytes"
 
 [[dataset]]
 file = "lubm-1000.nt"
@@ -261,6 +289,7 @@ role = "core"
 made_by = "bash benches/reasoning/prepare-owl2bench.sh RL:1"
 bytes = 7671699
 sha256 = "2454795bdd76fd1cb1ccbb149a4098a1166707acaf9c0a1441e8e6f75ad81499"
+rdfc_sha256 = "f7a5bc0333b7fc7e2d8c2c9d1cf40a27defe07d90ea0c3f990442c3d0bd4e080"
 frozen = "2026-10-03"
 
 [[dataset]]
@@ -321,7 +350,9 @@ role = "core"
 made_by = "bash benches/reasoning/prepare-lubm.sh 1"
 bytes = 47781
 sha256 = "2c42947cd544da0bb1466b0a89a558b90f36cde15b824df15c9b4159a0e99210"
+rdfc_sha256 = "7a5ff83cff8bce1b02d0c54bd42009c797e29d981606f2bf00600543749802df"
 frozen = "2026-10-03"
+note = "riot labels its blank nodes afresh on every make: a made copy meets rdfc_sha256, not sha256 (made on khaleesi-wsl 7 Nov 2026, stage-data-probe-1; the verified copy's form, stage-data-rdfc-1). Its source, http://swat.cse.lehigh.edu/onto/univ-bench.owl, was 14,433 bytes, sha256 e6eca926fcb7d6c7925ea0c48f7c5d79abc2818f89e7432fd16561aafeb3f67a"
 
 [[dataset]]
 file = "wikidata-lexemes-60m.nt"
