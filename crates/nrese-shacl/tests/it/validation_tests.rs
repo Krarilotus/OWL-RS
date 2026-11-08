@@ -1213,6 +1213,72 @@ fn a_computed_term_the_change_stores_is_the_same_result() {
     }
 }
 
+/// SYN-56 Part B sol r1 S1: a path is compared as the IRI it is, whether a query computed it
+/// or the shape names it. Before: property shape ex:S has path ex:p, and its constraint ex:Q
+/// computes `<urn:x>` (no statement uses it) as `?path`. The change gives ex:S the path
+/// `<urn:x>` and ex:Q a query that names no path, so the result's path is the shape's: the
+/// same IRI, the same result, nothing introduced.
+#[test]
+fn a_computed_path_that_becomes_the_shape_s_path_is_the_same_result() {
+    let shapes = "ex:S a sh:PropertyShape ; sh:targetNode ex:a ; sh:path ex:p ; sh:sparql ex:Q .
+        ex:Q sh:select '''SELECT $this (IRI(CONCAT(\"urn:\", \"x\")) AS ?path) WHERE { }''' .";
+    let store = engine("ex:b ex:q ex:c .", shapes);
+    let before = store.snapshot();
+    let shapes_before = compiled(&before);
+    let quads = |turtle: &str| -> Vec<nrese_rdf::Quad> {
+        RdfParser::from_format(RdfFormat::Turtle)
+            .for_slice(format!("{PREFIXES}{turtle}").as_bytes())
+            .map(|quad| quad.expect("turtle"))
+            .collect()
+    };
+    let graph = GraphNameRef::from(NamedNodeRef::new_unchecked(SHAPES_GRAPH));
+    let mut tx = store.transaction();
+    for quad in quads(
+        "ex:S sh:path ex:p .
+         ex:Q sh:select '''SELECT $this (IRI(CONCAT(\"urn:\", \"x\")) AS ?path) WHERE { }''' .",
+    ) {
+        tx.remove(QuadRef::new(
+            &quad.subject,
+            &quad.predicate,
+            &quad.object,
+            graph,
+        ));
+    }
+    for quad in quads("ex:S sh:path <urn:x> . ex:Q sh:select '''SELECT $this WHERE { }''' .") {
+        tx.insert(QuadRef::new(
+            &quad.subject,
+            &quad.predicate,
+            &quad.object,
+            graph,
+        ));
+    }
+    let after = tx.pending_snapshot();
+    let shapes_after = compile(&after, shapes_selection(&before)).expect("shapes");
+    let later = validate(&after, &shapes_after, DEFAULT);
+    let paths: Vec<_> = later.results.iter().map(|r| r.path.clone()).collect();
+    assert_eq!(
+        paths,
+        [Some(PropertyPath::Predicate(NamedNode::new_unchecked(
+            "urn:x"
+        )))],
+        "the state after's result has the shape's path"
+    );
+    let introduced = nrese_shacl::validate_shapes_change(
+        &before,
+        Some(&shapes_before),
+        &after,
+        &shapes_after,
+        DEFAULT,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    assert!(
+        introduced.results.is_empty(),
+        "the same path, the same result: {:?}",
+        introduced.results
+    );
+}
+
 /// A blank node a constraint's query makes (`BNODE() AS ?value`) is the result's value
 /// (SHACL §5.3.2), and the same result found again is the same result: a change elsewhere
 /// introduces none, though the query makes a new blank node at each evaluation (SYN-56 r1 S3).
