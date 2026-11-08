@@ -108,12 +108,16 @@ struct Builder {
     /// Generating axioms: (left, role, filler, data).
     generating: Vec<(u32, Role, Option<u32>, bool)>,
     fresh: HashMap<ExprId, u32>,
-    /// The conclusions, or parts of them, the TBox doesn't read, per axiom: a right side
-    /// `superclass` reads as nothing, the right side of a left side read only in part
-    /// ([`Self::subclass`]), and a disjoint union's parts as the class's covering. This is
-    /// the ledger the hazards classify, so what the TBox leaves out is never re-derived
-    /// there.
-    unread: std::collections::BTreeSet<ExprId>,
+    /// The conclusions, or parts of them, the TBox doesn't read, per axiom, each with its
+    /// polarity (`false`: the expression's complement is concluded). They are:
+    /// - a right side `superclass` reads as nothing;
+    /// - the right side of a left side read only in part ([`Self::subclass`]);
+    /// - a disjoint union's parts, as the class's covering;
+    /// - every part of a disjointness, negated (fix check r1, F3: `A ⊑ ¬≤0 S.D`).
+    ///
+    /// This is the ledger the hazards classify, so what the TBox leaves out is never
+    /// re-derived there.
+    unread: std::collections::BTreeSet<(ExprId, bool)>,
 }
 
 impl Tbox {
@@ -513,9 +517,11 @@ impl Builder {
                     }
                     // The direction from the class to the union isn't read (review r1, F2):
                     // the union's existentials are each part's.
-                    self.unread.insert(part);
+                    self.unread.insert((part, true));
                 }
+                self.disjoint(parts);
             }
+            Axiom::DisjointClasses(classes) => self.disjoint(classes),
             Axiom::SubObjectPropertyOf(chain, sup) if chain.len() == 1 => {
                 self.role(chain[0], *sup, true);
             }
@@ -572,6 +578,15 @@ impl Builder {
     /// A role inclusion; `base` if the materialisation applies it (`prp-spo1`,
     /// `prp-inv1/2`, `prp-symp`, `prp-eqp1/2`): every one, through an inverse expression
     /// too, since its facts are generalised triples (`x [owl:inverseOf p] y`).
+    /// Disjoint class expressions: each part's members are in every other part's
+    /// complement, which the TBox doesn't read (fix check r1, F3). So with two parts or
+    /// more, each part is recorded negated.
+    fn disjoint(&mut self, parts: &[ExprId]) {
+        if parts.len() >= 2 {
+            self.unread.extend(parts.iter().map(|&p| (p, false)));
+        }
+    }
+
     fn role(&mut self, sub: Role, sup: Role, base: bool) {
         self.roles.push((sub, sup, base));
     }
@@ -584,7 +599,7 @@ impl Builder {
         // Individuals in the part of `sub` that isn't read are in `sup` unread (review r1,
         // F1: `A ⊓ B ⊑ ∃S.D`).
         if !whole {
-            self.unread.insert(sup);
+            self.unread.insert((sup, true));
         }
     }
 
@@ -655,7 +670,7 @@ impl Builder {
                 self.generates_data(left, *property);
             }
             _ => {
-                self.unread.insert(expr);
+                self.unread.insert((expr, true));
             }
         }
     }

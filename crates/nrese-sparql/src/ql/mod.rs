@@ -57,6 +57,10 @@ const SCHEMA: &[(&str, &str)] = &[
     (OWL, "hasSelf"),
     (OWL, "maxCardinality"),
     (OWL, "maxQualifiedCardinality"),
+    // Disjointness concludes a part's complement, which may be an existential (I24b
+    // fix check r1, F3: `A ⊑ ¬≤0 S.D`).
+    (OWL, "disjointWith"),
+    (OWL, "members"),
 ];
 
 /// The classes whose members' `rdf:type` statements are read: what the mapping needs to
@@ -74,6 +78,7 @@ const DECLARATIONS: &[(&str, &str)] = &[
     (OWL, "TransitiveProperty"),
     (OWL, "FunctionalProperty"),
     (OWL, "InverseFunctionalProperty"),
+    (OWL, "AllDisjointClasses"),
 ];
 
 /// The properties that make their blank subject a class expression (`nrese-owl`'s
@@ -94,6 +99,7 @@ const LISTS: &[&str] = &[
     "propertyChainAxiom",
     "hasKey",
     "oneOf",
+    "members",
 ];
 
 /// What the QL rewriting did to one query (EXPLAIN, and with every answer).
