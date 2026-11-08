@@ -690,7 +690,13 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 }
                 _ => false,
             };
-            if directive_end || self.skip_token(token.kind, open, counts, braces, ending) {
+            if directive_end {
+                // A version label isn't a literal: no language tag follows it (as in
+                // `version`), and the next statement starts as a chunk does.
+                self.after_string = false;
+                break true;
+            }
+            if self.skip_token(token.kind, open, counts, braces, ending) {
                 break true;
             }
         }
