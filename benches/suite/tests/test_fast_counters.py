@@ -197,6 +197,34 @@ class FastComparison(unittest.TestCase):
             with self.subTest(record=broken):
                 self.assertIsNone(fast.shacl_report_counts(report + broken + "\n"))
 
+    def test_counts_its_report_couldn_t_give_fail_their_checks_with_or_without_routes(self):
+        """Fix check r2 (review-shacl-report-counts-r2): without --routes check() leaves an absent
+        value unchecked (ok None), and measure() fails a case only on ok False, so a report that
+        couldn't be parsed, with its values and paths pinned, ended ok. Couldn't be read isn't
+        "not reported": the verdict is wrong, whatever --routes, and the note says why. A report
+        the invocation didn't write is never read, though one is where an older harness put its own."""
+        sh = "http://www.w3.org/ns/shacl#"
+        unparseable = f'_:r0 <{sh}value> "x" .\n"a literal" <{sh}value> "y" .\n'
+        stale = "".join([f"_:s{i} <{sh}value> \"v\" .\n" for i in range(3)]
+                        + [f"_:s{i} <{sh}resultPath> <http://x/p> .\n" for i in range(2)])
+        for routes in (False, True):
+            for kind in ("unparseable", "not written"):
+                with self.subTest(routes=routes, report=kind), tempfile.TemporaryDirectory() as directory:
+                    scratch = Path(directory)
+                    (scratch / "shapes.shacl.nt").write_text(stale, encoding="utf-8")  # an older harness's path
+                    measured, _ = shapes_run(scratch, report=unparseable)
+                    if kind == "not written":
+                        def measured(name, cap, command, env=None, timeout=None):  # noqa: F811
+                            (scratch / "shapes.json").write_text('{"shacl": {"results": 3, "p50_ms": 1.0}}')
+                            return 0, "", "", 1
+                    with patch.object(fast, "SCRATCH", scratch), patch.object(fast, "container", measured), \
+                            patch.dict(fast.OPTIONS, routes=routes):
+                        record = fast.measure(SHAPES_CASE, "shapes", 1, {}, {}, "none")
+                    self.assertEqual(fast.verdict(SHAPES_CASE, record)["verdict"], "wrong")
+                    failed = {c["path"]: c for c in record["observations"][0]["checks"] if c["ok"] is not True}
+                    self.assertEqual(sorted(failed), ["shacl.paths", "shacl.values"])
+                    self.assertTrue(all(c["ok"] is False and "not counted" in c["note"] for c in failed.values()))
+
     def test_a_report_is_removed_however_its_invocation_ends_and_a_stale_one_refused(self):
         """Fix check r1 (lifecycle): the report's path was one per checkout and stayed behind when an
         invocation wrote no JSON or a broken one; it is the invocation's own, removed in every case,
