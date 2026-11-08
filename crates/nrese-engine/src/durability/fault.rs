@@ -28,10 +28,10 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     /// A file sync through `durability::place` fails.
     pub(crate) static FAIL_FILE_SYNC: Cell<bool> = const { Cell::new(false) };
-    /// The sync of this directory through `durability::place` fails, as the name of a new
-    /// entry in it is unknown to be durable.
-    pub(crate) static FAIL_DIR_SYNC_OF: std::cell::RefCell<Option<std::path::PathBuf>> =
-        const { std::cell::RefCell::new(None) };
+    /// The sync of this directory through `durability::place` fails, with this kind of error.
+    pub(crate) static FAIL_DIR_SYNC_OF: std::cell::RefCell<
+        Option<(std::path::PathBuf, std::io::ErrorKind)>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 /// An error if `point` is set on this thread.

@@ -967,55 +967,84 @@ fn a_directory_sync_is_real() {
 /// - one missing level, the same;
 /// - a relative single directory, the sync of `.` failing (made in the working directory,
 ///   removed after);
-/// - guards: an existing store directory opens though its parent's sync fails (nothing new is
-///   named there), and two missing levels open with every sync working.
+/// - the same open tried again, the sync still failing (sol-loop on review r1, S1): the first
+///   refusal mustn't leave a directory the retry takes for durably named;
+/// - a directory that exists, made by someone else (another attempt, another process) and not
+///   known to be named durably: its holder's sync failing, the open refuses;
+/// - guards: an existing directory whose holder can't be opened for the sync (no permission)
+///   opens, as nothing more can be done for its name there; two missing levels open with every
+///   sync working.
 #[test]
 fn an_open_names_every_directory_it_creates() {
+    use std::io::ErrorKind;
+    use std::path::PathBuf;
     let base = tempfile::tempdir().unwrap();
-    let relative = std::path::PathBuf::from(format!("dur3-relative-{}", std::process::id()));
-    // (row, store directory, the directory whose sync fails, whether it must open)
-    type Row<'a> = (
-        &'a str,
-        std::path::PathBuf,
-        Option<std::path::PathBuf>,
-        bool,
-    );
-    let rows: [Row; 5] = [
+    let relative = PathBuf::from(format!("dur3-relative-{}", std::process::id()));
+    std::fs::create_dir(base.path().join("made")).unwrap();
+    // (row, store directory, the directory whose sync fails and how, attempts, whether the
+    // last must open)
+    type Row<'a> = (&'a str, PathBuf, Option<(PathBuf, ErrorKind)>, usize, bool);
+    let failing = |dir: &std::path::Path| Some((dir.to_path_buf(), ErrorKind::Other));
+    let rows: [Row; 7] = [
         (
             "two missing levels",
             base.path().join("a").join("b"),
-            Some(base.path().to_path_buf()),
+            failing(base.path()),
+            1,
             false,
         ),
         (
             "one missing level",
             base.path().join("c"),
-            Some(base.path().to_path_buf()),
+            failing(base.path()),
+            1,
             false,
         ),
         (
             "a relative single directory",
             relative.clone(),
-            Some(std::path::PathBuf::from(".")),
+            failing(std::path::Path::new(".")),
+            1,
             false,
         ),
         (
-            "an existing directory (guard)",
+            "tried again",
+            base.path().join("r").join("s"),
+            failing(base.path()),
+            2,
+            false,
+        ),
+        (
+            "a directory someone else made",
+            base.path().join("made"),
+            failing(base.path()),
+            1,
+            false,
+        ),
+        (
+            "an existing directory, its holder not to be opened (guard)",
             base.path().to_path_buf(),
-            base.path().parent().map(std::path::Path::to_path_buf),
+            base.path()
+                .parent()
+                .map(|parent| (parent.to_path_buf(), ErrorKind::PermissionDenied)),
+            1,
             true,
         ),
         (
             "two missing levels, every sync working (guard)",
             base.path().join("d").join("e"),
             None,
+            1,
             true,
         ),
     ];
     let mut failures = Vec::new();
-    for (row, dir, failing, opens) in rows {
+    for (row, dir, failing, attempts, opens) in rows {
         fault::FAIL_DIR_SYNC_OF.set(failing);
-        let opened = Engine::open(&dir, config()).map(|engine| commit(&engine, 0).map(drop));
+        let mut opened = Err(EngineError::Configuration("not tried".to_owned()));
+        for _ in 0..attempts {
+            opened = Engine::open(&dir, config()).map(|engine| commit(&engine, 0).map(drop));
+        }
         fault::FAIL_DIR_SYNC_OF.set(None);
         let ok = match opens {
             true => matches!(opened, Ok(Ok(()))),
