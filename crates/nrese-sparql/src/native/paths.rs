@@ -566,6 +566,8 @@ pub(crate) struct PathEvaluator<'a> {
     /// ([`Grant::new`]: the part's cap over the pool's workers, none under an envelope's
     /// 1 KiB floor), so evaluators in parallel workers (EXISTS) hold one cap between them.
     scratch: RefCell<Grant<&'a Budget>>,
+    /// The query's budget, for the fresh grant a handover leaves ([`Self::handover`]).
+    budget: &'a Budget,
     /// The first charge the budget refused: it stops the evaluator as a cancellation does,
     /// and the entry points report it ([`Self::answer`]).
     refused: Cell<Option<BudgetExceeded>>,
@@ -594,6 +596,7 @@ impl<'a> PathEvaluator<'a> {
             cancellation,
             closures: Cell::new(0),
             scratch: RefCell::new(Grant::new(budget)),
+            budget,
             refused: Cell::new(None),
             carried: Cell::new(0),
         }
@@ -648,14 +651,18 @@ impl PathEvaluator<'_> {
         self.hold(&mut held, 0);
     }
 
-    /// An entry point's result, as [`Self::answer`], its handed-on charge released: the
-    /// executor charges the table it makes of it, and a bag of copies moves into that table
-    /// whole, so holding both charges would refuse what fits (sol-loop r5 S1 of the package
-    /// fix check r2: `<h> (<p>|<missing>) ?y` over 65,536 statements, 512 KiB charged twice).
-    fn handed<R>(&self, value: R) -> Result<R, BudgetExceeded> {
-        let held = self.adopt();
-        self.done(held);
-        self.answer(value)
+    /// The charge of the bag an entry point just returned, for the holder of the table made of
+    /// it to take over ([`nrese_exec::Reservation::adopt`]): the evaluator's grant handed over
+    /// whole (all it holds then is that bag's, every other hold having been given back), its
+    /// spare released, a fresh grant in its place. Never released and charged again: a bag
+    /// of copies moves into its table whole, so holding both charges refused what fits
+    /// (sol-loop r5 S1 of the package fix check r2: `<h> (<p>|<missing>) ?y` over 65,536
+    /// statements, 512 KiB charged twice), and releasing it first let another query sharing
+    /// the server's budget take its room while the bag still lived (sol-loop r6 S2).
+    pub(crate) fn handover(&self) -> usize {
+        self.carried.set(0);
+        let fresh = Grant::new(self.budget);
+        std::mem::replace(&mut *self.scratch.borrow_mut(), fresh).transfer()
     }
 
     /// `value`, unless a charge was refused while it was made: then what a stopped traversal
@@ -935,17 +942,17 @@ impl PathEvaluator<'_> {
 
     /// Ends reachable from `start` (a bag), or the charge refused while they were found.
     pub(crate) fn ends(&self, path: &Path, start: u64) -> Result<Bag<u64>, BudgetExceeded> {
-        self.handed(self.from(path, start))
+        self.answer(self.from(path, start))
     }
 
     /// Starts that reach `end` (a bag), or the charge refused while they were found.
     pub(crate) fn starts(&self, path: &Path, end: u64) -> Result<Bag<u64>, BudgetExceeded> {
-        self.handed(self.to(path, end))
+        self.answer(self.to(path, end))
     }
 
     /// Every `(start, end)` pair (a bag), or the charge refused while they were found.
     pub(crate) fn pairs(&self, path: &Path) -> Result<Bag<(u64, u64)>, BudgetExceeded> {
-        self.handed(self.open(path))
+        self.answer(self.open(path))
     }
 
     /// How many solutions `start path end` has ([`Self::multiplicity`]), or the charge
@@ -956,7 +963,7 @@ impl PathEvaluator<'_> {
         start: u64,
         end: u64,
     ) -> Result<usize, BudgetExceeded> {
-        self.handed(self.multiplicity(path, start, end))
+        self.answer(self.multiplicity(path, start, end))
     }
 
     /// Ends reachable from `start` (a bag).
@@ -1365,7 +1372,7 @@ impl PathEvaluator<'_> {
                 |start, end| (start, end),
             ),
         };
-        self.handed(pairs)
+        self.answer(pairs)
     }
 
     /// The `(start, end)` pairs of [`Self::open`] whose end is one of `ends` (distinct
@@ -1392,7 +1399,7 @@ impl PathEvaluator<'_> {
             }
             _ => self.pairs_at(ends, |end| self.to(path, end), |end, start| (start, end)),
         };
-        self.handed(pairs)
+        self.answer(pairs)
     }
 
     /// The pairs of each of `nodes` (distinct) with each value of its bag, `pair` making a
