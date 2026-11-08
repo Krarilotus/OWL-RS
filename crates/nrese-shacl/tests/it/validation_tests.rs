@@ -1279,6 +1279,122 @@ fn a_computed_path_that_becomes_the_shape_s_path_is_the_same_result() {
     );
 }
 
+/// SYN-56 Part B sol r2 S3: a stored triple term holding a blank node is the same value
+/// whether the query binds it or the focus node stands for it. ex:S targets the objects of
+/// ex:p, the stored `<<( _:b ex:q ex:o )>>`; while a flag holds, its query binds `?value` to
+/// that same triple (read from the data: a triple-term `$this` isn't substituted into the
+/// query, so `BIND($this …)` inside the OPTIONAL wouldn't see it), and else binds nothing,
+/// so the value is the focus node either way. Deleting the flag changes no result: nothing
+/// is introduced.
+#[test]
+fn a_stored_triple_term_is_the_same_value_bound_or_not() {
+    let shapes = "ex:S a sh:NodeShape ; sh:targetObjectsOf ex:p ; sh:sparql [ sh:select '''
+        SELECT $this ?value WHERE {
+          OPTIONAL { <urn:flag> <urn:on> <urn:yes> . ?x <http://example.com/p> ?value }
+        }''' ] .";
+    let store = engine(
+        "ex:s ex:p <<( _:b ex:q ex:o )>> . <urn:flag> <urn:on> <urn:yes> .",
+        shapes,
+    );
+    let before = store.snapshot();
+    let compiled_before = compiled(&before);
+    let mut tx = store.transaction();
+    tx.remove(QuadRef::new(
+        NamedNodeRef::new_unchecked("urn:flag"),
+        NamedNodeRef::new_unchecked("urn:on"),
+        NamedNodeRef::new_unchecked("urn:yes"),
+        GraphNameRef::DefaultGraph,
+    ));
+    let changed: Vec<_> = tx.deleted().collect();
+    assert_eq!(changed.len(), 1, "the flag is removed");
+    let after = tx.pending_snapshot();
+    // Both states have the one result, the triple term its value: bound, then the focus node.
+    for (state, report) in [
+        ("before", validate(&before, &compiled_before, DEFAULT)),
+        ("after", validate(&after, &compiled_before, DEFAULT)),
+    ] {
+        assert!(report.failures.is_empty(), "{state}: {:?}", report.failures);
+        let values: Vec<_> = report.results.iter().map(|r| r.value.clone()).collect();
+        assert!(
+            matches!(values.as_slice(), [Some(nrese_rdf::Term::Triple(_))]),
+            "{state}: {values:?}"
+        );
+    }
+    let introduced = nrese_shacl::validate_changes(
+        &before,
+        &after,
+        &compiled_before,
+        DEFAULT,
+        &changed,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    assert!(
+        introduced.results.is_empty(),
+        "the same value, the same result: {:?}",
+        introduced.results
+    );
+}
+
+/// The same across a change of the shapes (sol r2 S3): a constraint component's property
+/// validator, a SELECT reporting each value of the path, becomes an ASK that every value
+/// fails. ex:s's one value, the stored `<<( _:b ex:q ex:o )>>`, is reported by both: the same
+/// result, nothing introduced.
+#[test]
+fn a_stored_triple_term_is_the_same_value_from_select_or_ask() {
+    let shapes = "ex:C a sh:ConstraintComponent ; sh:parameter [ sh:path ex:on ] ;
+          sh:propertyValidator ex:V .
+        ex:V sh:select '''SELECT $this ?value WHERE { $this $PATH ?value }''' .
+        ex:P a sh:PropertyShape ; sh:targetNode ex:s ; sh:path ex:p ; ex:on true .";
+    let store = engine("ex:s ex:p <<( _:b ex:q ex:o )>> .", shapes);
+    let before = store.snapshot();
+    let shapes_before = compiled(&before);
+    let graph = GraphNameRef::from(NamedNodeRef::new_unchecked(SHAPES_GRAPH));
+    let validator = NamedNodeRef::new_unchecked("http://example.com/V");
+    let mut tx = store.transaction();
+    tx.remove(QuadRef::new(
+        validator,
+        NamedNodeRef::new_unchecked("http://www.w3.org/ns/shacl#select"),
+        nrese_rdf::LiteralRef::new_simple_literal(
+            "SELECT $this ?value WHERE { $this $PATH ?value }",
+        ),
+        graph,
+    ));
+    tx.insert(QuadRef::new(
+        validator,
+        NamedNodeRef::new_unchecked("http://www.w3.org/ns/shacl#ask"),
+        nrese_rdf::LiteralRef::new_simple_literal("ASK { FILTER(false) }"),
+        graph,
+    ));
+    let after = tx.pending_snapshot();
+    let shapes_after = compile(&after, shapes_selection(&before)).expect("shapes");
+    for (state, report) in [
+        ("SELECT", validate(&before, &shapes_before, DEFAULT)),
+        ("ASK", validate(&after, &shapes_after, DEFAULT)),
+    ] {
+        assert!(report.failures.is_empty(), "{state}: {:?}", report.failures);
+        let values: Vec<_> = report.results.iter().map(|r| r.value.clone()).collect();
+        assert!(
+            matches!(values.as_slice(), [Some(nrese_rdf::Term::Triple(_))]),
+            "{state}: {values:?}"
+        );
+    }
+    let introduced = nrese_shacl::validate_shapes_change(
+        &before,
+        Some(&shapes_before),
+        &after,
+        &shapes_after,
+        DEFAULT,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    assert!(
+        introduced.results.is_empty(),
+        "the same value, the same result: {:?}",
+        introduced.results
+    );
+}
+
 /// A blank node a constraint's query makes (`BNODE() AS ?value`) is the result's value
 /// (SHACL §5.3.2), and the same result found again is the same result: a change elsewhere
 /// introduces none, though the query makes a new blank node at each evaluation (SYN-56 r1 S3).
