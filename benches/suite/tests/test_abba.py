@@ -250,6 +250,30 @@ systems = []
         self.assertEqual(job["requires"].get("has"), ["docker"])
         self.assertGreaterEqual(job["requires"].get("disk_gb", 0), 1)
 
+    def test_a_job_making_its_data_in_containers_declares_them(self):
+        """The master, 8 Nov 2026 (#129's regression): `abba.py --plan` of shacl-lubm on engine-v2 was
+        refused by the fleet ("a Docker job a shared host could take: its steps start no container the
+        fleet can see"). The job declares its maker's container (F61, spec 9) from the one data ask
+        (release_gate.data_job()), asks that memory on top of what its blocks ask, and tells its
+        makers the limits; a job making nothing in containers declares nothing."""
+        self.path.write_bytes(abba.family_text("t", {"a": A, "b": B}, ["shacl-lubm"], 6).encode("utf-8"))
+        job = next(iter(abba.jobs(self.load(), B, self.repo.as_posix()).values()))
+        self.assertEqual(job["spec"], 9)
+        [maker] = job["containers"]
+        plain = next(iter(abba.jobs(self.family, B, self.repo.as_posix()).values()))  # FAMILY's cases make nothing
+        self.assertNotIn("containers", plain)
+        self.assertNotIn("spec", plain)
+        # What its blocks ask (at least 12 GB, more for a case's cap), plus the maker's container.
+        blocks = max(12, *(c["cap_gb"] for c in self.load()["cases"]))
+        self.assertEqual(job["requires"]["ram_gb"], blocks + maker["memory_gb"])
+        self.assertEqual((job["env"]["NRESE_MAKER_MEMORY_GB"], job["env"]["NRESE_MAKER_CPUS"]),
+                         (f"{maker['memory_gb']:g}", f"{maker['cpus']:g}"))
+        self.assertNotIn("NRESE_MAKER_MEMORY_GB", plain["env"])
+        import tomllib
+        set_id = next(iter(abba.jobs(self.load(), B, self.repo.as_posix())))
+        read = tomllib.loads(abba.set_file(set_id, [job]))["job"][0]
+        self.assertEqual((read["spec"], read["containers"]), (9, [maker]))
+
     def test_one_job_asks_by_capability_and_builds_where_it_times(self):
         """The brief of 2 Nov 2026: no host names. A build job and a timed job pinned to one host
         were the only way to time where the binaries were built; one job does both, its host held

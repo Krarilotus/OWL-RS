@@ -437,6 +437,101 @@ class Rounds(unittest.TestCase):
         self.assertEqual(need([{"data": "volume:lubm-10.nt"}, {"data": "ore:ore_ont_9724"}]),
                          ["docker", "owlrs-bench-assets"])
 
+    def test_a_job_whose_makers_start_containers_declares_them(self):
+        """The master, 8 Nov 2026 (#129's regression): a timing job making LUBM data asked the fleet
+        for Docker, and the fleet refused it, since a shared host's envelope can't hold containers a
+        script starts unseen. The fleet's contract (F61, job spec 9): the job declares them (`spec = 9`,
+        `containers`, Linux), each within every step's ask; their memory comes out of every step's
+        slice, so the job asks that much more and its builds and blocks keep what they had. The
+        makers' env carries the same limits (their containers are held to them)."""
+        base = {"roles": ["measure", "build"], "os": "linux", "cores": 16, "ram_gb": 12}
+        lubm = [{"data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}]
+        requires, fields, env = gate_module.data_job(lubm, dict(base))
+        self.assertEqual(fields["spec"], 9)
+        [maker] = fields["containers"]
+        self.assertGreater(maker["memory_gb"], 0)
+        self.assertGreater(maker["cpus"], 0)
+        self.assertEqual(requires["ram_gb"], base["ram_gb"] + maker["memory_gb"])  # each slice keeps its 12 GB
+        self.assertLessEqual(maker["cpus"], requires["cores"])
+        self.assertEqual((requires["os"], "docker" in requires["has"]), ("linux", True))
+        self.assertGreaterEqual(requires["disk_gb"], 1)
+        self.assertEqual(env, {"NRESE_MAKER_MEMORY_GB": f"{maker['memory_gb']:g}", "NRESE_MAKER_CPUS": f"{maker['cpus']:g}"})
+        self.assertEqual(gate_module.data_job([{"data": "volume:owl2bench-rl-1.nt"}], dict(base))[1]["spec"], 9)
+        # One declared container serves every maker of the job, one at a time: with a SPARQL file made
+        # beside, it is at least what benches/sparql/prepare.sh's own containers take (its CAP).
+        cap = re.search(r"^CAP=\(--cpus (\d+) --memory (\d+)g", (ROOT / "benches/sparql/prepare.sh").read_text(
+            encoding="utf-8"), re.M)
+        [both] = gate_module.data_job(lubm + [{"data": "volume:watdiv-10m.nt", "queries": "@watdiv-10m"}],
+                                      dict(base))[1]["containers"]
+        self.assertGreaterEqual((both["memory_gb"], both["cpus"]), (int(cap[2]), int(cap[1])))
+        # Only the makers of the job's own files count, not every maker the catalogue names (the first
+        # plan of shacl-lubm declared SPARQL's 8 GB for LUBM alone: frozen() reads the whole catalogue).
+        self.assertEqual((maker["memory_gb"], maker["cpus"]),
+                         gate_module.MAKER_CONTAINERS["bash benches/reasoning/prepare-lubm.sh"])
+
+    def test_a_plan_whose_harness_runs_makers_older_than_the_declaration_is_refused(self):
+        """Sol-loop r1 S1 of pkg/maker-containers (8 Nov 2026): a job's data step runs the harness's own
+        makers (release-gate.sh prepare, in the harness's worktree). A plan from this checkout declaring
+        the maker's container, with a harness whose makers don't label and limit their containers,
+        would pass the fleet's check and have its data step stopped on a host lacking the data. Such a
+        plan is refused, naming what's missing; a harness with them, or a job declaring nothing, passes."""
+        lubm = [{"data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}]
+        base = {"roles": ["measure", "build"], "os": "linux", "cores": 16, "ram_gb": 12}
+        requires, fields, env = gate_module.data_job(lubm, base)
+        found = {"j": {"id": "j", "requires": requires, **fields}}
+        self.assertEqual(fields["_makers"], ["benches/reasoning/prepare-lubm.sh"])
+        self.assertNotIn("_makers", gate_module.spec(found["j"]))  # the planner's own: never sent
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            git = lambda *a: subprocess.run(["git", "-C", str(tmp), *a], capture_output=True, text=True,  # noqa: E731
+                                            check=True, timeout=60).stdout.strip()
+            (tmp / "scripts/lib").mkdir(parents=True)
+            (tmp / "benches/reasoning").mkdir(parents=True)
+            (tmp / "scripts/lib/ns.sh").write_text("ns_run_args() { :; }\n", encoding="utf-8")
+            (tmp / "benches/reasoning/prepare-lubm.sh").write_text("docker run --rm alpine true\n", encoding="utf-8")
+            git("init", "-q")
+            git("add", "-A")
+            git("commit", "-q", "-m", "old makers")
+            old = git("rev-parse", "HEAD")
+            shutil.copy2(ROOT / "scripts/lib/ns.sh", tmp / "scripts/lib/ns.sh")
+            shutil.copy2(ROOT / "benches/reasoning/prepare-lubm.sh", tmp / "benches/reasoning/prepare-lubm.sh")
+            git("add", "-A")
+            git("commit", "-q", "-m", "makers held to the declaration")
+            new = git("rev-parse", "HEAD")
+            [why] = gate_module.staged_makers_problems(found, tmp.as_posix(), old)
+            self.assertIn("scripts/lib/ns.sh", why)
+            self.assertIn("benches/reasoning/prepare-lubm.sh", why)
+            self.assertEqual(gate_module.staged_makers_problems(found, tmp.as_posix(), new), [])
+            self.assertTrue(gate_module.staged_makers_problems(found, tmp.as_posix(), "f" * 40))  # unreadable: refused
+        plain = {"j": {"id": "j", "requires": base}}
+        self.assertEqual(gate_module.staged_makers_problems(plain, "C:/no-such-checkout", "f" * 40), [])
+
+    def test_a_job_whose_makers_start_no_container_asks_as_before(self):
+        """Design note 2026-11-08-maker-containers, invariant 3: no maker that starts containers, no
+        declaration: the job's spec, memory and capabilities as data_needs() and data_disk_gb() say."""
+        base = {"roles": ["measure", "build"], "os": "linux", "cores": 16, "ram_gb": 12}
+        for cases in ([{"data": "social people=1000"}], [{"data": "ore:ore_ont_9724"}],
+                      [{"data": "volume:support-stress/copies-8.nq"}],
+                      [{"data": "volume:watdiv-10m.nt", "queries": "@watdiv-10m"}]):
+            with self.subTest(cases=cases):
+                requires, fields, env = gate_module.data_job(cases, dict(base))
+                self.assertEqual((fields, env), ({}, {}))
+                has, disk = gate_module.data_needs(cases), gate_module.data_disk_gb(cases)
+                self.assertEqual(requires, base | ({"has": has} if has else {}) | ({"disk_gb": disk} if disk else {}))
+
+    def test_a_release_gate_part_making_lubm_declares_its_maker(self):
+        """The release gate's parts are the other job builder: the same declaration, from the same
+        function, and its TOML is what the fleet reads (an inline table per container)."""
+        import tomllib
+        found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "shacl-lubm", checks=False)
+        timed = found["rg-test-timed"]
+        self.assertEqual(timed["spec"], 9)
+        [maker] = timed["containers"]
+        self.assertEqual(timed["env"]["NRESE_MAKER_MEMORY_GB"], f"{maker['memory_gb']:g}")
+        read = tomllib.loads(gate_module.toml_set({"id": "rg-test", "fail": "continue"}, list(found.values())))
+        self.assertEqual(read["job"][0]["containers"], [maker])
+        self.assertEqual(read["job"][0]["spec"], 9)
+
     def test_a_dataset_is_as_pinned_by_its_bytes_or_by_its_rdfc_form(self):
         """7 Nov 2026: riot labels univ-bench.nt's blank nodes afresh on every make, so a made copy's
         bytes aren't the pin while its RDFC-1.0 canonical N-Quads' SHA-256 is the verified copy's
