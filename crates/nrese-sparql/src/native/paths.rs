@@ -387,12 +387,15 @@ impl<T: Copy + Eq + std::hash::Hash + Ord> Union<T> {
 
 /// A sequence step's ends: pushed as they come, a copy each, unless what it starts from is
 /// counted already; then each end once with how many ways ([`Tally`]). A step whose copies
-/// outnumber the entries it was given is counted when it ends ([`Self::finish`]): ways that
-/// grow, by the path's text (an alternative) or by the data (a node's several ends), are
-/// the only ones that compound over the next steps (`(p?/…/p?)+` over a cycle: 2^n copies),
-/// and a step that doesn't grow never gives more copies than it got. Counting hashes every
-/// end: a sequence whose steps give one end an entry (`author/city`) needs none of it (the
-/// executor memory stack's timing: counting every step cost path alternatives x1.56).
+/// would outnumber the entries it was given is counted from that end on: ways that grow, by
+/// the path's text (an alternative) or by the data (a node's several ends), are the only
+/// ones that compound over the next steps (`(p?/…/p?)+` over a cycle: 2^n copies), and a
+/// step that doesn't grow never gives more copies than it got. So a step holds at most its
+/// entries' copies before it counts: `p/(64 distinct arms)` over n pairs holds n copies and
+/// then each end once, never 64·n (the package fix check r2 of the executor memory stack,
+/// EMS-R1). Counting hashes every end: a sequence whose steps give one end an entry
+/// (`author/city`) needs none of it (the executor memory stack's timing: counting every step
+/// cost path alternatives x1.56). Every growth is charged before it happens ([`Self::add`]).
 enum Ends<T> {
     Copies(Vec<T>),
     Counted(Tally<T>),
@@ -406,32 +409,66 @@ impl<T: Copy + Eq + std::hash::Hash> Ends<T> {
         }
     }
 
-    fn add(&mut self, value: T, copies: usize) {
+    /// The bytes it holds.
+    fn bytes(&self) -> usize {
         match self {
-            Self::Copies(values) if copies == 1 => values.push(value),
-            Self::Copies(values) => {
-                let mut tally = Tally::new();
-                for &value in values.iter() {
-                    tally.add(value, 1);
-                }
-                tally.add(value, copies);
-                *self = Self::Counted(tally);
-            }
-            Self::Counted(tally) => tally.add(value, copies),
+            Self::Copies(values) => bytes_of::<T>(values.capacity()),
+            Self::Counted(tally) => tally.bytes(),
         }
     }
 
-    /// The step's bag, given the number of entries it started from: copies that outnumber
-    /// them are counted.
-    fn finish(self, entries: usize) -> Bag<T> {
-        match self {
-            Self::Copies(values) if values.len() > entries => {
-                let mut tally = Tally::new();
-                for value in values {
-                    tally.add(value, 1);
+    /// `value` added `copies` times, in a step given `entries` entries, its growth held in
+    /// `held` before it happens (the old room beside the new while it moves, doubling): a copy
+    /// while copies don't outnumber the entries, else counted from here on. False if the
+    /// budget refused the growth (recorded by `evaluator`).
+    fn add(
+        &mut self,
+        evaluator: &PathEvaluator<'_>,
+        held: &mut usize,
+        value: T,
+        copies: usize,
+        entries: usize,
+    ) -> bool {
+        if let Self::Copies(values) = self {
+            if copies == 1 && values.len() < entries {
+                if values.len() == values.capacity() && !evaluator.room(held, values, 1, true) {
+                    return false;
                 }
-                tally.finish()
+                values.push(value);
+                return true;
             }
+            let wanted = values.len().saturating_add(1);
+            let peak = bytes_of::<T>(values.capacity())
+                .saturating_add(Tally::<T>::bytes_for(wanted, wanted));
+            if !evaluator.hold(held, peak) {
+                return false;
+            }
+            let mut tally = Tally::new();
+            tally.reserve(wanted);
+            for &value in values.iter() {
+                tally.add(value, 1);
+            }
+            *self = Self::Counted(tally);
+        }
+        let Self::Counted(tally) = self else {
+            unreachable!("copies were counted above")
+        };
+        let full = tally.counted.len() == tally.counted.capacity()
+            || tally.at.len() == tally.at.capacity();
+        if full {
+            let more = tally.counted.len().max(1);
+            let peak = tally.bytes().saturating_add(tally.bytes_with(more));
+            if !evaluator.hold(held, peak) {
+                return false;
+            }
+            tally.reserve(more);
+        }
+        tally.add(value, copies);
+        evaluator.hold(held, self.bytes())
+    }
+
+    fn finish(self) -> Bag<T> {
+        match self {
             Self::Copies(values) => Bag::Copies(values),
             Self::Counted(tally) => tally.finish(),
         }
@@ -448,10 +485,19 @@ impl<T> Bag<T> {
     }
 
     /// The bytes it holds.
-    fn bytes(&self) -> usize {
+    pub(crate) fn bytes(&self) -> usize {
         match self {
             Self::Copies(values) => bytes_of::<T>(values.capacity()),
             Self::Counted(counted) => bytes_of::<(T, usize)>(counted.capacity()),
+        }
+    }
+
+    /// The bytes it holds beside a column made of its copies ([`Bag::into_copies`]): none
+    /// for copies, which move into the column; counted ones stay while the copies are made.
+    pub(crate) fn bytes_beside_copies(&self) -> usize {
+        match self {
+            Self::Copies(_) => 0,
+            Self::Counted(_) => self.bytes(),
         }
     }
 
@@ -523,6 +569,12 @@ pub(crate) struct PathEvaluator<'a> {
     /// The first charge the budget refused: it stops the evaluator as a cancellation does,
     /// and the entry points report it ([`Self::answer`]).
     refused: Cell<Option<BudgetExceeded>>,
+    /// The charge of the bag a producer just returned (an alternative's union, a sequence's
+    /// ends, a path's pairs from bound values), handed on with it: its consumer takes it over
+    /// the moment it receives the bag ([`Self::adopt`]), so a bag is never held uncharged
+    /// between its producer and its consumer (the package fix check r2 of the executor
+    /// memory stack). What no consumer takes over is released with the evaluator.
+    carried: Cell<usize>,
 }
 
 impl<'a> PathEvaluator<'a> {
@@ -543,6 +595,7 @@ impl<'a> PathEvaluator<'a> {
             closures: Cell::new(0),
             scratch: RefCell::new(Grant::new(budget)),
             refused: Cell::new(None),
+            carried: Cell::new(0),
         }
     }
 }
@@ -578,6 +631,33 @@ impl PathEvaluator<'_> {
         true
     }
 
+    /// Hands `held`, the charge of the bag about to be returned, on to its consumer.
+    fn carry(&self, held: usize) {
+        self.carried.set(self.carried.get().saturating_add(held));
+    }
+
+    /// The charge handed on with the bag just received: the consumer holds it from here
+    /// (called at once, before any other evaluation can hand on another).
+    fn adopt(&self) -> usize {
+        self.carried.take()
+    }
+
+    /// The bag just received used up: its handed-on charge released.
+    fn done(&self, held: usize) {
+        let mut held = held;
+        self.hold(&mut held, 0);
+    }
+
+    /// An entry point's result, as [`Self::answer`], its handed-on charge released: the
+    /// executor charges the table it makes of it, and a bag of copies moves into that table
+    /// whole, so holding both charges would refuse what fits (sol-loop r5 S1 of the package
+    /// fix check r2: `<h> (<p>|<missing>) ?y` over 65,536 statements, 512 KiB charged twice).
+    fn handed<R>(&self, value: R) -> Result<R, BudgetExceeded> {
+        let held = self.adopt();
+        self.done(held);
+        self.answer(value)
+    }
+
     /// `value`, unless a charge was refused while it was made: then what a stopped traversal
     /// returned, never an answer.
     fn answer<R>(&self, value: R) -> Result<R, BudgetExceeded> {
@@ -605,14 +685,20 @@ impl PathEvaluator<'_> {
     /// The search takes each end once, however many ways lead there.
     fn step_from(&self, path: &Path, node: u64, out: &mut Vec<u64>) {
         if !self.stopped() {
-            out.extend(self.support_from(path, node));
+            let ends = self.support_from(path, node);
+            let held = self.adopt();
+            out.extend(ends);
+            self.done(held);
         }
     }
 
     /// [`Self::step_from`] backwards.
     fn step_to(&self, path: &Path, node: u64, out: &mut Vec<u64>) {
         if !self.stopped() {
-            out.extend(self.support_to(path, node));
+            let starts = self.support_to(path, node);
+            let held = self.adopt();
+            out.extend(starts);
+            self.done(held);
         }
     }
 
@@ -849,17 +935,17 @@ impl PathEvaluator<'_> {
 
     /// Ends reachable from `start` (a bag), or the charge refused while they were found.
     pub(crate) fn ends(&self, path: &Path, start: u64) -> Result<Bag<u64>, BudgetExceeded> {
-        self.answer(self.from(path, start))
+        self.handed(self.from(path, start))
     }
 
     /// Starts that reach `end` (a bag), or the charge refused while they were found.
     pub(crate) fn starts(&self, path: &Path, end: u64) -> Result<Bag<u64>, BudgetExceeded> {
-        self.answer(self.to(path, end))
+        self.handed(self.to(path, end))
     }
 
     /// Every `(start, end)` pair (a bag), or the charge refused while they were found.
     pub(crate) fn pairs(&self, path: &Path) -> Result<Bag<(u64, u64)>, BudgetExceeded> {
-        self.answer(self.open(path))
+        self.handed(self.open(path))
     }
 
     /// How many solutions `start path end` has ([`Self::multiplicity`]), or the charge
@@ -870,7 +956,7 @@ impl PathEvaluator<'_> {
         start: u64,
         end: u64,
     ) -> Result<usize, BudgetExceeded> {
-        self.answer(self.multiplicity(path, start, end))
+        self.handed(self.multiplicity(path, start, end))
     }
 
     /// Ends reachable from `start` (a bag).
@@ -905,7 +991,10 @@ impl PathEvaluator<'_> {
                     return Bag::Copies(Vec::new());
                 }
                 let mut ends = vec![start];
-                ends.extend(self.support_from(p, start));
+                let support = self.support_from(p, start);
+                let held = self.adopt();
+                ends.extend(support);
+                self.done(held);
                 dedup_keep_order(ends)
             }
             Path::Negated(excluded) => self
@@ -919,34 +1008,104 @@ impl PathEvaluator<'_> {
 
     /// The ends reached from `node` through `steps` in sequence (`forward`), or the starts
     /// reaching it (the last step first): one per way through, each end once with how
-    /// many, step by step.
+    /// many, step by step ([`Self::step`]). Its charge is handed on with it.
     fn through(&self, steps: &[Path], node: u64, forward: bool) -> Bag<u64> {
         let mut nodes = Bag::Copies(vec![node]);
+        let mut held = 0;
         let ordered: Box<dyn Iterator<Item = &Path>> = match forward {
             true => Box::new(steps.iter()),
             false => Box::new(steps.iter().rev()),
         };
         for step in ordered {
+            // Stopped, the step makes nothing: a stopped sequence ends empty.
             if nodes.is_empty() {
                 break;
             }
-            let entries = nodes.entries();
-            let mut next = Ends::new(matches!(nodes, Bag::Counted(_)));
-            for (m, ways) in nodes.counted() {
-                if self.stopped() {
-                    break;
-                }
-                let ends = match forward {
-                    true => self.from(step, m),
-                    false => self.to(step, m),
-                };
-                for (end, more) in ends.counted() {
-                    next.add(end, ways.saturating_mul(more));
-                }
-            }
-            nodes = next.finish(entries);
+            let mut next = 0;
+            let ends = self.step(&nodes, step, forward, |m| m, |_, end| end, &mut next);
+            self.done(held);
+            held = next;
+            nodes = ends.finish();
         }
+        self.carry(held);
         nodes
+    }
+
+    /// One step of a sequence: each entry of `input` (its node `node`) followed through
+    /// `step` forwards, or backwards to the starts reaching it, `out` making the result of an
+    /// entry and an end, the ways multiplied ([`Ends::add`]: charged in `held` before every
+    /// growth, counted once its copies would outnumber the entries). A leaf step (a link, a
+    /// negated set) streams its statements' ends in, with no vector of their own; another
+    /// step's bag arrives with its charge handed on and gives it back once added. Stops
+    /// early once a charge was refused.
+    fn step<I: Copy, O: Copy + Eq + std::hash::Hash>(
+        &self,
+        input: &Bag<I>,
+        step: &Path,
+        forward: bool,
+        node: impl Fn(I) -> u64,
+        out: impl Fn(I, u64) -> O,
+        held: &mut usize,
+    ) -> Ends<O> {
+        let entries = input.entries();
+        let mut next = Ends::new(matches!(input, Bag::Counted(_)));
+        for (item, ways) in input.counted() {
+            if self.stopped() {
+                break;
+            }
+            let m = node(item);
+            let (subject, object) = match forward {
+                true => (Some(m), None),
+                false => (None, Some(m)),
+            };
+            let streamed = self.leaf_each(step, subject, object, |(s, _, o)| {
+                let end = if forward { o } else { s };
+                next.add(self, held, out(item, end), ways, entries)
+            });
+            let fits = match streamed {
+                Some(fits) => fits,
+                None => {
+                    let ends = match forward {
+                        true => self.from(step, m),
+                        false => self.to(step, m),
+                    };
+                    let mut arrived = self.adopt();
+                    let charge = arrived.max(ends.bytes());
+                    let fits = self.hold(&mut arrived, charge)
+                        && ends.counted().all(|(end, more)| {
+                            let ways = ways.saturating_mul(more);
+                            next.add(self, held, out(item, end), ways, entries)
+                        });
+                    self.done(arrived);
+                    fits
+                }
+            };
+            if !fits {
+                break;
+            }
+        }
+        next
+    }
+
+    /// A leaf path's statements `subject ? object` (bound where given), each passed to
+    /// `each` until it returns false: `None` for any other path, else whether all were.
+    fn leaf_each(
+        &self,
+        path: &Path,
+        subject: Option<u64>,
+        object: Option<u64>,
+        mut each: impl FnMut((u64, u64, u64)) -> bool,
+    ) -> Option<bool> {
+        match path {
+            Path::Link(None) => Some(true),
+            Path::Link(Some(p)) => Some(self.quads(subject, Some(*p), object).all(&mut each)),
+            Path::Negated(excluded) => Some(
+                self.quads(subject, None, object)
+                    .filter(|(_, p, _)| !excluded.contains(p))
+                    .all(&mut each),
+            ),
+            _ => None,
+        }
     }
 
     /// The bags of `paths` together (a UNION): copies stay copies, and counted ones are
@@ -976,7 +1135,7 @@ impl PathEvaluator<'_> {
         stream: impl Fn(&Path, &mut usize, &mut Vec<T>) -> Option<bool>,
     ) -> Bag<T> {
         let mut union = Union::new(support);
-        let mut held = 0;
+        let mut held: usize = 0;
         for (i, (arm, times)) in arms.iter().enumerate() {
             let (times, last) = (*times, i + 1 == arms.len());
             if self.stopped() {
@@ -995,15 +1154,17 @@ impl PathEvaluator<'_> {
                 None => {}
             }
             let arm = bag(arm);
-            // The arm as it arrives and the union's room for it, held in one charge (what
-            // the merge frees stays held until the next arm's charge or the end).
+            // The arm as it arrives, its charge handed on taken over, and the union's room
+            // for it, held in one charge (what the merge frees stays held until the next
+            // arm's charge or the end).
+            held = held.saturating_add(self.adopt());
             let peak = union.peak_with(&arm, times).saturating_add(arm.bytes());
             if !self.hold(&mut held, peak) {
                 break;
             }
             union.add(arm, times, last);
         }
-        self.hold(&mut held, 0);
+        self.carry(held);
         union.finish()
     }
 
@@ -1081,7 +1242,10 @@ impl PathEvaluator<'_> {
                     return Bag::Copies(Vec::new());
                 }
                 let mut starts = vec![end];
-                starts.extend(self.support_to(p, end));
+                let support = self.support_to(p, end);
+                let held = self.adopt();
+                starts.extend(support);
+                self.done(held);
                 dedup_keep_order(starts)
             }
             Path::Negated(excluded) => self
@@ -1104,11 +1268,16 @@ impl PathEvaluator<'_> {
             Path::Reverse(p) => self.multiplicity(p, end, start),
             Path::Sequence(steps) => match steps.split_last() {
                 None => usize::from(start == end),
-                Some((last, before)) => self
-                    .through(before, start, true)
-                    .counted()
-                    .map(|(m, ways)| ways.saturating_mul(self.multiplicity(last, m, end)))
-                    .fold(0, usize::saturating_add),
+                Some((last, before)) => {
+                    let middle = self.through(before, start, true);
+                    let held = self.adopt();
+                    let ways = middle
+                        .counted()
+                        .map(|(m, ways)| ways.saturating_mul(self.multiplicity(last, m, end)))
+                        .fold(0, usize::saturating_add);
+                    self.done(held);
+                    ways
+                }
             },
             Path::Alternative(arms) => arms
                 .iter()
@@ -1137,9 +1306,12 @@ impl PathEvaluator<'_> {
                 None => start == end,
                 Some((last, before)) => {
                     let mut middle = self.through(before, start, true).values();
+                    let held = self.adopt();
                     middle.sort_unstable();
                     middle.dedup();
-                    middle.into_iter().any(|m| self.connects(last, m, end))
+                    let connects = middle.into_iter().any(|m| self.connects(last, m, end));
+                    self.done(held);
+                    connects
                 }
             },
             Path::Alternative(arms) => arms.iter().any(|(p, _)| self.connects(p, start, end)),
@@ -1177,12 +1349,15 @@ impl PathEvaluator<'_> {
             Path::OneOrMore(step) | Path::ZeroOrMore(step) if starts.len() > PROBED_VALUES => {
                 let reflexive = matches!(path, Path::ZeroOrMore(_));
                 let adjacency = Adjacency::new(self.edges(step));
+                let held = self.adopt();
                 let starts = starts
                     .iter()
                     .copied()
                     .take_while(|_| !self.stopped())
                     .filter(|&node| !reflexive || self.is_node(node));
-                Bag::Copies(pairs_of(closure(&adjacency, starts, reflexive)))
+                let pairs = Bag::Copies(pairs_of(closure(&adjacency, starts, reflexive)));
+                self.done(held);
+                pairs
             }
             _ => self.pairs_at(
                 starts,
@@ -1190,7 +1365,7 @@ impl PathEvaluator<'_> {
                 |start, end| (start, end),
             ),
         };
-        self.answer(pairs)
+        self.handed(pairs)
     }
 
     /// The `(start, end)` pairs of [`Self::open`] whose end is one of `ends` (distinct
@@ -1205,17 +1380,19 @@ impl PathEvaluator<'_> {
                 let reflexive = matches!(path, Path::ZeroOrMore(_));
                 let backwards =
                     Adjacency::new(self.edges(step).into_iter().map(|(s, o)| (o, s)).collect());
+                let held = self.adopt();
                 let ends = ends
                     .iter()
                     .copied()
                     .take_while(|_| !self.stopped())
                     .filter(|&node| !reflexive || self.is_node(node));
                 let pairs = pairs_of(closure(&backwards, ends, reflexive));
+                self.done(held);
                 Bag::Copies(pairs.into_iter().map(|(end, start)| (start, end)).collect())
             }
             _ => self.pairs_at(ends, |end| self.to(path, end), |end, start| (start, end)),
         };
-        self.answer(pairs)
+        self.handed(pairs)
     }
 
     /// The pairs of each of `nodes` (distinct) with each value of its bag, `pair` making a
@@ -1223,8 +1400,8 @@ impl PathEvaluator<'_> {
     /// Each node's bag and the pairs' room for it are held in one charge before the pairs
     /// grow (doubling; the old room beside the new while a vector moves), as an
     /// alternative's union is ([`Self::either`]): the bags of 64 distinct arms from 4,096
-    /// bound values are 64 pairs a node (sol-loop r1 S1 of EMS-R1). What it returns is no
-    /// longer charged: the path's table charges it.
+    /// bound values are 64 pairs a node (sol-loop r1 S1 of EMS-R1). Each bag's handed-on
+    /// charge is taken over as it arrives, and the pairs' charge handed on with them.
     fn pairs_at(
         &self,
         nodes: &[u64],
@@ -1232,9 +1409,10 @@ impl PathEvaluator<'_> {
         pair: impl Fn(u64, u64) -> (u64, u64),
     ) -> Bag<(u64, u64)> {
         let (mut copies, mut counted) = (Vec::new(), Vec::new());
-        let mut held = 0;
+        let mut held: usize = 0;
         for &node in nodes.iter().take_while(|_| !self.stopped()) {
             let bag = bag(node);
+            held = held.saturating_add(self.adopt());
             let (copies_to, copies_peak) = grown(&copies, bag.copies_entries());
             let (counted_to, counted_peak) = grown(&counted, bag.counted_entries());
             let peak = copies_peak
@@ -1269,7 +1447,7 @@ impl PathEvaluator<'_> {
                 Bag::Counted(counted)
             }
         };
-        self.hold(&mut held, 0);
+        self.carry(held);
         pairs
     }
 
@@ -1325,21 +1503,35 @@ impl PathEvaluator<'_> {
                 let Some((first, rest)) = steps.split_first() else {
                     return Bag::Copies(self.nodes().into_iter().map(|n| (n, n)).collect());
                 };
-                // Each pair once with how many ways through, step by step (`through`).
+                // Each pair once with how many ways through, step by step (`through`): the
+                // first step's pairs charged as they arrive (their handed-on charge, or their
+                // bytes where their producer charged none), each next step's as it grows.
                 let mut pairs = self.open(first);
-                for step in rest {
-                    let entries = pairs.entries();
-                    let mut next = Ends::new(matches!(pairs, Bag::Counted(_)));
-                    for ((s, m), ways) in pairs.counted() {
-                        if self.stopped() {
-                            break;
-                        }
-                        for (o, more) in self.from(step, m).counted() {
-                            next.add((s, o), ways.saturating_mul(more));
-                        }
-                    }
-                    pairs = next.finish(entries);
+                let mut held = self.adopt();
+                let charge = held.max(pairs.bytes());
+                if !self.hold(&mut held, charge) {
+                    self.carry(held);
+                    return pairs;
                 }
+                for step in rest {
+                    // Stopped, the step makes nothing: a stopped sequence ends empty.
+                    if pairs.is_empty() {
+                        break;
+                    }
+                    let mut next = 0;
+                    let ends = self.step(
+                        &pairs,
+                        step,
+                        true,
+                        |(_, m)| m,
+                        |(s, _), o| (s, o),
+                        &mut next,
+                    );
+                    self.done(held);
+                    held = next;
+                    pairs = ends.finish();
+                }
+                self.carry(held);
                 return pairs;
             }
             Path::Alternative(paths) => {
@@ -1350,9 +1542,20 @@ impl PathEvaluator<'_> {
                     |p, held, values| self.stream(p, held, values, None, None, |(s, _, o)| (s, o)),
                 );
             }
-            Path::OneOrMore(p) => self.closure_of(&self.edges(p)),
+            Path::OneOrMore(p) => {
+                let edges = self.edges(p);
+                let held = self.adopt();
+                let pairs = self.closure_of(&edges);
+                drop(edges);
+                self.done(held);
+                pairs
+            }
             Path::ZeroOrMore(p) => {
-                let mut pairs = self.closure_of(&self.edges(p));
+                let edges = self.edges(p);
+                let held = self.adopt();
+                let mut pairs = self.closure_of(&edges);
+                drop(edges);
+                self.done(held);
                 // Every node with itself, unless the closure has it already (on a cycle).
                 let mut on_cycle: Vec<u64> = pairs
                     .iter()
@@ -1370,7 +1573,10 @@ impl PathEvaluator<'_> {
             }
             Path::ZeroOrOne(p) => {
                 let mut pairs: Vec<(u64, u64)> = self.nodes().into_iter().map(|n| (n, n)).collect();
-                pairs.extend(self.support(p));
+                let support = self.support(p);
+                let held = self.adopt();
+                pairs.extend(support);
+                self.done(held);
                 dedup_pairs(pairs)
             }
             Path::Negated(excluded) => self

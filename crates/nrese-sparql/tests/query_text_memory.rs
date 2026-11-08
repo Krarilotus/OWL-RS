@@ -457,7 +457,12 @@ fn a_crossed_group_by_a_key_named_again_draws_from_the_query_budget() {
 /// n = 1,024 and 4,096: `MemoryLimit`. Each way, the query's thread holds at most the
 /// limit and its bookkeeping (holding every arm's bag at once would be 64 × 2n × 16 bytes,
 /// 8 MiB for n = 4,096; the package review r1 of the executor memory stack, EMS-R1, and its
-/// sol-loop r1 S1: the bound values' pairs). On the default path and as written alike.
+/// sol-loop r1 S1: the bound values' pairs). The arms as a sequence's step, `ex:p/(…)`,
+/// reach the same ends k ways each, so under `+` they answer the same pairs once, from the
+/// hub each `ex:n<i>` once, and as an alternative's arm beside `ex:q` the pairs and
+/// `(ex:m, ex:m)` (2n + 1): a step that held every copy before counting them would hold
+/// k × 2n pairs, 8 MiB (the package fix check r2, EMS-R1). On the default path and as
+/// written alike.
 #[test]
 fn overlapping_alternative_arms_draw_from_the_query_budget() {
     let mut failed = Vec::new();
@@ -494,9 +499,11 @@ fn overlapping_alternative_arms_draw_from_the_query_budget() {
             let mut zero_or_one = once.clone();
             zero_or_one.extend([(iri("h"), iri("h")), (iri("m"), iri("m"))]);
             let reversed = once.iter().map(|(x, y)| (y.clone(), x.clone())).collect();
-            let ends = (0..n)
+            let ends: Vec<Row> = (0..n)
                 .map(|i| row(&[("y", iri(&format!("n{i}")))]))
                 .collect();
+            let mut beside = once.clone();
+            beside.push((iri("m"), iri("m")));
             let count = vec![row(&[("c", integer(2 * n))])];
             let bound = (0..n).flat_map(|i| {
                 let pair = (iri(&format!("n{i}")), iri(&format!("n{i}")));
@@ -506,7 +513,7 @@ fn overlapping_alternative_arms_draw_from_the_query_budget() {
             let near = k == 4 && n == 1 << 12;
             // The solutions of each case (None: the memory error), and whether the memory
             // error may stand for them.
-            let cases: [(&str, String, Option<Vec<Row>>, bool); 7] = [
+            let cases: [(&str, String, Option<Vec<Row>>, bool); 10] = [
                 (
                     "under +",
                     format!("SELECT ?x ?y WHERE {{ ?x ({arms})+ ?y }}"),
@@ -516,7 +523,33 @@ fn overlapping_alternative_arms_draw_from_the_query_budget() {
                 (
                     "from the hub under +",
                     format!("SELECT ?y WHERE {{ {} ({arms})+ ?y }}", iri("h")),
+                    Some(ends.clone()),
+                    false,
+                ),
+                (
+                    "a sequence's step under +",
+                    format!("SELECT ?x ?y WHERE {{ ?x ({}/({arms}))+ ?y }}", iri("p")),
+                    Some(pairs(once.clone())),
+                    false,
+                ),
+                (
+                    "a sequence's step from the hub under +",
+                    format!(
+                        "SELECT ?y WHERE {{ {} ({}/({arms}))+ ?y }}",
+                        iri("h"),
+                        iri("p")
+                    ),
                     Some(ends),
+                    false,
+                ),
+                (
+                    "a sequence as an alternative's arm under +",
+                    format!(
+                        "SELECT ?x ?y WHERE {{ ?x (({}/({arms}))|{})+ ?y }}",
+                        iri("p"),
+                        iri("q")
+                    ),
+                    Some(pairs(beside)),
                     false,
                 ),
                 (
@@ -585,6 +618,46 @@ fn overlapping_alternative_arms_draw_from_the_query_budget() {
                     }
                 }
             }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// Spec: a path's answer is charged once (`Resources::memory`): the bag the path's ends are
+/// put together in moves into the answer's column. Over 65,536 statements
+/// `ex:h ex:p ex:n<i>`, `ex:h (ex:p|ex:missing) ?y` answers each `ex:n<i>` once under
+/// 900 KiB: its union of 512 KiB is the column, so charging both would ask 1 MiB and
+/// refuse what fits (sol-loop r5 S1 of the executor memory stack's package fix check r2).
+/// Within the bound under the 1 MiB limit too. On the default path and as written alike.
+#[test]
+fn a_paths_answer_moved_into_its_column_is_charged_once() {
+    let rows = 1usize << 16;
+    let engine = engine((0..rows).map(|i| {
+        let node = ex(&format!("n{i}"));
+        Quad::new(ex("h"), ex("p"), node, GraphName::DefaultGraph)
+    }));
+    let query = format!("SELECT ?y WHERE {{ <{EX}h> (<{EX}p>|<{EX}missing>) ?y }}");
+    let mut expected: Vec<Row> = (0..rows)
+        .map(|i| row(&[("y", format!("<{EX}n{i}>"))]))
+        .collect();
+    expected.sort();
+    let mut failed = Vec::new();
+    for as_written in [false, true] {
+        match answers(&engine, &query, as_written, Some(900 << 10)) {
+            Ok(got) => failed.extend(
+                difference(&got, &expected).map(|d| format!("as_written={as_written}: {d}")),
+            ),
+            Err(error) => failed.push(format!("as_written={as_written}: {error}")),
+        }
+        let (outcome, peak) = run(&engine, &query, as_written);
+        if outcome.as_ref().ok() != Some(&rows) {
+            let outcome = outcome.map_err(|e| e.to_string());
+            failed.push(format!("as_written={as_written}: {outcome:?} under 1 MiB"));
+        }
+        if peak > LIMIT + BOOKKEEPING {
+            failed.push(format!(
+                "as_written={as_written}: held {peak} bytes under a {LIMIT}-byte limit"
+            ));
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));

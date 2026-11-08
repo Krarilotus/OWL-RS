@@ -2442,17 +2442,20 @@ impl<'a> Context<'a> {
 
     /// The table of a path's `(s, o)` pairs (one column if `s` and `o` are one variable,
     /// of the pairs that start where they end): a row per copy, every column charged
-    /// before it is made (a sequence of alternatives counts a pair once per way through).
+    /// before it is made (a sequence of alternatives counts a pair once per way through),
+    /// with the pairs themselves, which the columns are made beside (the evaluator hands
+    /// them over uncharged, [`paths::PathEvaluator::pairs`]).
     fn path_pairs(
         &self,
         pairs: paths::Bag<(u64, u64)>,
         s: Variable,
         o: Variable,
     ) -> NativeResult<Solutions> {
+        let beside = pairs.bytes();
         if s == o {
             let same = || pairs.counted().filter(|((a, b), _)| a == b);
             let rows = same().fold(0usize, |n, (_, copies)| n.saturating_add(copies));
-            return self.path_table(rows.saturating_mul(8), || {
+            return self.path_table(rows.saturating_mul(8).saturating_add(beside), || {
                 let mut column = Vec::with_capacity(rows);
                 for ((a, _), copies) in same() {
                     column.extend(std::iter::repeat_n(a, copies));
@@ -2461,7 +2464,7 @@ impl<'a> Context<'a> {
             });
         }
         let rows = pairs.len();
-        self.path_table(rows.saturating_mul(16), || {
+        self.path_table(rows.saturating_mul(16).saturating_add(beside), || {
             let (mut starts, mut ends) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
             for ((a, b), copies) in pairs.counted() {
                 starts.extend(std::iter::repeat_n(a, copies));
@@ -2556,8 +2559,10 @@ impl<'a> Context<'a> {
         let constant = |end: &Result<Variable, u64>| end.as_ref().err().copied();
         evaluator.fixed = constant(&ends.0).or_else(|| constant(&ends.1));
         // A row per copy of the path's bag, charged before it is made.
+        // A bag of copies moves into the column; a counted one stays beside its copies.
         let column = |variable: Variable, ends: paths::Bag<u64>| {
-            self.path_table(ends.len().saturating_mul(8), || {
+            let bytes = ends.len().saturating_mul(8);
+            self.path_table(bytes.saturating_add(ends.bytes_beside_copies()), || {
                 (
                     vec![variable],
                     IdTable::from_columns(vec![ends.into_copies()]),
