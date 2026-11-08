@@ -1268,6 +1268,65 @@ mod tests {
         assert_added(&dictionary, n, &texts, "rebased");
     }
 
+    /// Package 2a (sol-loop r1 S3, S4). An overlay over a dictionary whose base is mapped and
+    /// compressed: its triple intern probes the base's compressed keys, and a view's charged
+    /// lookup of a triple term and of a literal too; what they allocate is charged first, at
+    /// the bound of either kind of base. The overlay's own block is the one allocation held
+    /// uncharged (design note §11). Measured, alone.
+    #[test]
+    fn overlay_probes_of_a_compressed_base_hold_only_what_they_charged() {
+        if !nrese_exec::measure::alone() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dictionary = Arc::new(Dictionary::default());
+        let s = NamedNode::new_unchecked("http://e/s");
+        let p = NamedNode::new_unchecked("http://e/p");
+        dictionary.intern(s.as_ref().into());
+        dictionary.intern(p.as_ref().into());
+        for i in 0..10_000 {
+            dictionary.intern(LiteralRef::new_simple_literal(&format!("word {i}")).into());
+        }
+        let base = mapped_base(&dictionary, dictionary.len(), dir.path());
+        assert!(dictionary.rebase(base).unwrap());
+        assert!(dictionary.stats().mapped_bytes > 0, "the base is mapped");
+        let budget = Arc::new(Budget::unlimited());
+        let triple = nrese_rdf::Triple::new(s, p, Literal::new_simple_literal("word 5"));
+        let start = dictionary.len();
+        let overlay_block = 2 * size_of::<usize>() + size_of::<crate::term::overlay::Overlay>();
+        let ((), excess) = nrese_exec::measure::measure_within(&budget, || {
+            let overlay = crate::term::overlay::Overlay::over(
+                Arc::clone(&dictionary),
+                start,
+                Arc::clone(&budget),
+            );
+            let id = overlay.intern(nrese_rdf::TermRef::Triple(&triple)).unwrap();
+            assert!(
+                id.payload() >= start,
+                "a triple term the base lacks: the overlay's own"
+            );
+            let view = overlay.freeze().unwrap();
+            let mut held = Reservation::new(&*budget);
+            for term in [
+                nrese_rdf::TermRef::Triple(&triple),
+                LiteralRef::new_simple_literal("word 7").into(),
+            ] {
+                let found = view
+                    .lookup_charged(term, |bytes| held.charge(bytes))
+                    .unwrap();
+                assert!(found.is_some());
+            }
+            drop(held);
+            drop(view);
+            drop(overlay);
+        });
+        assert_eq!(
+            excess, overlay_block,
+            "bytes held beyond the charges: the overlay's own block alone"
+        );
+        assert_eq!(budget.used(), 0);
+    }
+
     /// Samples FSST trains on at its largest: the most keys a sample has, each empty (FSST
     /// copies the list of them), of either table; long keys of both (FSST samples them, one
     /// table trained while the other lives); every byte value, in no order (the most symbol
