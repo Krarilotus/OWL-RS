@@ -23,6 +23,11 @@ thread_local! {
     /// What `CLOCK` reads once a transaction's record is about to be written to the log,
     /// its preparation (runs, a layout conversion, a rotation) done: the time that took.
     pub(crate) static CLOCK_AT_APPEND: Cell<Option<u64>> = const { Cell::new(None) };
+    /// The files this thread synced through `durability::place`, in order.
+    pub(crate) static SYNCED: std::cell::RefCell<Vec<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// A file sync through `durability::place` fails.
+    pub(crate) static FAIL_FILE_SYNC: Cell<bool> = const { Cell::new(false) };
 }
 
 /// An error if `point` is set on this thread.
