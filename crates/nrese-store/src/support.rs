@@ -52,8 +52,8 @@ use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Envelope, Reservation};
 use nrese_reasoner::RuleProgram;
 use nrese_reasoner::eval::{Seg, Source};
 use nrese_reasoner::graph_sets::{
-    Annotation, Change, GraphSet, Limits, Stopped, closure_within, initial_sets, rederived,
-    rederived_candidates, support_sets, update_support_sets,
+    Annotation, Change, GraphSet, Graphs, InGraphs, Limits, Previous, Sets, Stopped,
+    closure_within, rederived, rederived_candidates, support_sets, update_support_sets,
 };
 use nrese_reasoner::ir::Triple;
 use nrese_sparql::{CancellationToken, GraphAccess, ReadView};
@@ -245,6 +245,7 @@ impl Following {
             Stopped::ProcessMemory => Unavailable::ProcessMemory,
             Stopped::MemoryUnreadable => Unavailable::MemoryUnreadable,
             Stopped::Cancelled => Unavailable::Cancelled,
+            Stopped::Refused(exceeded) => Unavailable::Memory(exceeded),
             // The watch refused: the budget, or else the cancellation.
             Stopped::Memory { .. } => self
                 .refused
@@ -436,6 +437,31 @@ impl Closure {
     }
 }
 
+/// Where `snapshot` asserts facts, its graphs numbered by `graphs` (`index`, sorted by graph,
+/// the other way): read from the snapshot as asked, no list made.
+struct InSnapshot<'s> {
+    snapshot: &'s Snapshot,
+    graphs: &'s [TermId],
+    index: &'s [(TermId, u32)],
+}
+
+impl Graphs for InSnapshot<'_> {
+    fn each(&self, fact: Triple, graph: &mut dyn FnMut(u32)) {
+        self.snapshot
+            .quads_for_pattern_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any))
+            .for_each(|quad| graph(graph_index(self.index, quad.graph)));
+    }
+
+    fn holds(&self, fact: Triple, graph: u32) -> bool {
+        self.graphs.get(graph as usize).is_some_and(|&id| {
+            self.snapshot.exists_in(
+                ReadModel::Asserted,
+                &pattern(fact, GraphSelector::Exact(id)),
+            )
+        })
+    }
+}
+
 impl SupportSets {
     /// The sets of `snapshot`'s facts under `program`, at most `cap` per fact, kept on
     /// `kept`; what computing them reads and builds charged to `working`.
@@ -452,9 +478,8 @@ impl SupportSets {
         axioms.extend_from_slice(program.axioms())?;
         axioms.sort_unstable();
         let closure = Closure::of(snapshot, &graphs, &axioms, working)?;
-        let graphs_of = |fact: Triple| -> Vec<u32> {
-            closure.graphs_of(fact).iter().map(|&(_, g)| g).collect()
-        };
+        // Read where the closure keeps them, no list per fact (fix check r2, C1.b residual).
+        let graphs_of = InGraphs(&closure.asserted);
         let ground = program.ground_program(snapshot);
         let following = Following::new(working);
         let by_fact = support_sets(
@@ -466,6 +491,7 @@ impl SupportSets {
             Limits {
                 watch: &|bytes| following.watch(bytes),
                 stop: &|| following.cancelled(),
+                scratch: &working.budget,
             },
         )
         .map_err(|stopped| following.failure(stopped))?;
@@ -613,14 +639,10 @@ impl SupportSets {
         }
         let graphs = graphs_in_order(snapshot, &self.graphs, kept, working)?;
         let index = index_of(&graphs, working)?;
-        let graphs_of = |fact: Triple| -> Vec<u32> {
-            let mut found: Vec<u32> = snapshot
-                .quads_for_pattern_in(ReadModel::Asserted, &pattern(fact, GraphSelector::Any))
-                .map(|quad| graph_index(&index, quad.graph))
-                .collect();
-            found.sort_unstable();
-            found.dedup();
-            found
+        let graphs_of = InSnapshot {
+            snapshot,
+            graphs: &graphs,
+            index: &index,
         };
         let in_closure = |fact: Triple| {
             snapshot.exists_in(ReadModel::Materialised, &pattern(fact, GraphSelector::Any))
@@ -637,19 +659,15 @@ impl SupportSets {
             snapshot,
             removed: &removed,
         };
-        let previous = |fact: Triple| -> Annotation {
-            match self.record(fact) {
-                // The record keeps one mark: the second taken to be as wide.
-                Record::Kept(entries, truncated) => Annotation {
-                    sets: entries
-                        .iter()
-                        .map(|&(_, id)| self.sets.sets[id as usize].clone())
-                        .collect(),
-                    truncated,
-                    beyond_own: truncated,
-                },
-                Record::Own => self.initial(fact, graphs_of(fact), cap),
+        // Lent from the pool for the whole update, not copied (fix check r2, C1.b residual):
+        // `self` outlives it, and the pool is shared and never changed. A fact recorded as
+        // its own sets keeps none; the update makes them, charged.
+        let previous = |fact: Triple| match self.record(fact) {
+            // The record keeps one mark: the second taken to be as wide.
+            Record::Kept(entries, truncated) => {
+                Previous::Sets(Sets::pooled(entries, &self.sets.sets, truncated))
             }
+            Record::Own => Previous::Own,
         };
         let change = Change {
             source: &source,
@@ -662,6 +680,7 @@ impl SupportSets {
         let limits = Limits {
             watch: &|bytes| following.watch(bytes),
             stop: &|| following.cancelled(),
+            scratch: &working.budget,
         };
         let recomputed =
             match update_support_sets(&change, &ground, &self.axioms, &graphs_of, cap, limits) {
@@ -888,12 +907,6 @@ impl SupportSets {
         self.elsewhere = Shared::new(elsewhere, kept)?;
         self.overlay = Shared::new(Overlay::empty(kept), kept)?;
         Ok(())
-    }
-
-    /// The sets `fact` starts with, from its graphs.
-    fn initial(&self, fact: Triple, graphs: Vec<u32>, cap: usize) -> Annotation {
-        let axiom = self.axioms.binary_search(&fact).is_ok();
-        initial_sets(if axiom { Vec::new() } else { graphs }, axiom, cap)
     }
 
     /// What `fact`'s sets are recorded as.
@@ -2144,6 +2157,7 @@ impl Supports {
         let limits = Limits {
             watch: &watch,
             stop: &stop,
+            scratch: &working.budget,
         };
         let closure = After {
             snapshot,
@@ -2472,6 +2486,7 @@ impl Supports {
         let limits = Limits {
             watch: &|bytes| following.watch(bytes),
             stop: &|| following.cancelled(),
+            scratch: &working.budget,
         };
         let held = closure_within(&closure.facts, &ground, &axioms, &reads, limits)
             .map_err(|stopped| following.failure(stopped))?;
