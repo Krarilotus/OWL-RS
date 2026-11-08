@@ -202,13 +202,7 @@ fn resolve(path: &Path) -> std::io::Result<Resolution> {
         }
         match step {
             Step::Start(start) => current = start,
-            Step::Parent => {
-                if current.as_os_str().is_empty() || current.ends_with("..") {
-                    current.push("..");
-                } else if current.parent().is_some() {
-                    current.pop();
-                }
-            }
+            Step::Parent => step_up(&mut current),
             Step::Name(name) => {
                 let holder = match current.as_os_str().is_empty() {
                     true => PathBuf::from("."),
@@ -226,9 +220,15 @@ fn resolve(path: &Path) -> std::io::Result<Resolution> {
                         }
                         let target = fs::read_link(&entry)?;
                         // Windows resolves a relative target against the link's directory, `..`
-                        // taken lexically; Unix walks it from there physically.
+                        // taken lexically; Unix walks it from there physically. The joined
+                        // target holds the link's directory already: a relative one (from a
+                        // relative root) is walked from the start again (sol-loop round 2, S2).
                         #[cfg(windows)]
                         let target = as_walked(&current.join(&target));
+                        #[cfg(windows)]
+                        if target.is_relative() {
+                            current = PathBuf::new();
+                        }
                         hold(&mut holders, &mut seen, holder);
                         for step in steps(&target, true).into_iter().rev() {
                             queue.push_front(step);
@@ -284,13 +284,7 @@ pub(super) fn as_walked(path: &Path) -> PathBuf {
             for component in path.components() {
                 match component {
                     Component::CurDir => {}
-                    Component::ParentDir => match walked.components().next_back() {
-                        Some(Component::Normal(_)) => {
-                            walked.pop();
-                        }
-                        Some(Component::RootDir | Component::Prefix(_)) => {}
-                        _ => walked.push(".."),
-                    },
+                    Component::ParentDir => step_up(&mut walked),
                     other => walked.push(other.as_os_str()),
                 }
             }
@@ -298,6 +292,21 @@ pub(super) fn as_walked(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+/// `path`'s parent, in place: its last name dropped; a root (`/`, `C:\`, `\\server\share\`) its
+/// own parent; and where neither is there to drop (an empty or relative start, a drive-relative
+/// `C:`, a `..` already) a `..` kept, which the file system resolves from the working directory
+/// (sol-loop round 2, S3: a drive-relative prefix doesn't absorb a `..` as a root does).
+fn step_up(path: &mut PathBuf) {
+    use std::path::Component;
+    match path.components().next_back() {
+        Some(Component::Normal(_)) => {
+            path.pop();
+        }
+        Some(Component::RootDir) => {}
+        _ => path.push(".."),
+    }
 }
 
 /// Adds `holder` to `holders` unless it's there already under some spelling.
