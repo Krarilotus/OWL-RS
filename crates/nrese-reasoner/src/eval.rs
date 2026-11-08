@@ -1316,6 +1316,26 @@ pub fn rule_key(rule: &Rule) -> RuleKey {
 /// A (rule, atom) reference into a [`GroundProgram`].
 type AtomRef = (u32, u8);
 
+/// Test builds only: the dispatch references read on this thread, for tests that count
+/// enumeration work no source sees (sol-loop r8, R8-1).
+#[cfg(test)]
+pub(crate) mod references_read {
+    use std::cell::Cell;
+
+    thread_local! {
+        static READ: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn add(n: usize) {
+        READ.with(|read| read.set(read.get() + n));
+    }
+
+    /// The references read since the last call.
+    pub(crate) fn take() -> usize {
+        READ.with(|read| read.replace(0))
+    }
+}
+
 /// Ground rules' atoms indexed by what they can match, so a round only visits the rules
 /// with an atom that can match a fact of the delta (the "dispatch tables" of design §3.2):
 /// `(?x type C)` atoms by `(type, C)`, other constant-predicate atoms by predicate.
@@ -1363,7 +1383,12 @@ impl Dispatch {
             .flatten()
             .chain(self.by_predicate.get(&p).into_iter().flatten())
             .chain(&self.any);
+        let before = out.len();
         out.extend(entries.map(|&(r, a)| (r as usize, usize::from(a))));
+        #[cfg(test)]
+        references_read::add(out.len() - before);
+        #[cfg(not(test))]
+        let _ = before;
     }
 
     /// The (rule, atom) pairs whose atom can match a fact of `delta`'s delta, sorted.
