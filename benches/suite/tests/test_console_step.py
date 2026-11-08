@@ -77,6 +77,7 @@ class ConsoleStep(unittest.TestCase):
                           "apps/nrese-console/package-lock.json": "{}\n", CONSOLE_FILE: "export {};\n"}.items():
             (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.repo / rel).write_text(text, newline="\n")
+        (self.repo / "scripts/cargo-guarded.sh").chmod(0o755)  # check.sh runs it, as the tree's is
         self.git(self.repo, "add", "-A")
         self.git(self.repo, "commit", "-q", "-m", "base")
         self.git(self.repo, "update-ref", "refs/remotes/origin/refactor/engine-v2", "HEAD")
