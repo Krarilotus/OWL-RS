@@ -42,6 +42,40 @@ impl Resources {
     }
 }
 
+/// What full-text relevance, IRI search and vector selection are computed over
+/// (`store.search_scope`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum SearchScope {
+    /// The dictionary's whole text and vector indexes: the fastest. Returned data respects
+    /// graph access, but relevance and approximate selection may depend on data outside
+    /// the reader's graphs.
+    #[default]
+    Global,
+    /// The statements the reader's own scans show (snapshot, read model, active graphs as
+    /// access restricts them): nothing outside them changes a score, a rank or which
+    /// vectors are selected. Costs a corpus per scope (kept, and derived across commits)
+    /// and an exact scan of the visible vectors.
+    Reader,
+}
+
+impl SearchScope {
+    /// The scope named `name` (`global`, `reader`), if it is one.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "global" => Some(Self::Global),
+            "reader" => Some(Self::Reader),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Reader => "reader",
+        }
+    }
+}
+
 /// Per-request query options (the transport layer fills these from the protocol request).
 #[derive(Clone, Default)]
 pub struct QueryOptions {
@@ -114,6 +148,9 @@ pub struct QueryOptions {
     /// the inferred statements, without a dataset, access restrictions or pre-bound
     /// variables.
     pub ql: Option<std::sync::Arc<crate::ql::QlRewriting>>,
+    /// What search relevance and vector selection are computed over ([`SearchScope`]);
+    /// subqueries, `EXISTS` and update `WHERE` clauses evaluate with their query's.
+    pub search_scope: SearchScope,
 }
 
 /// Evaluates `query` against `view` over the engine's id tables (`native`); a transaction

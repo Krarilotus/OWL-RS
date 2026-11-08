@@ -1094,6 +1094,10 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
         ))
         .unwrap_or_default(),
         support_sets: args.support_sets.unwrap_or(config.support_sets),
+        // What searches rank and select among, as the server takes it (`NRESE_SEARCH_SCOPE`:
+        // global, reader).
+        search_scope: nrese_store::SearchScope::from_name(&setting("NRESE_SEARCH_SCOPE"))
+            .unwrap_or_default(),
         checkpoint_after_wal_bytes: args
             .checkpoint_after_wal_bytes
             .unwrap_or(config.checkpoint_after_wal_bytes),
