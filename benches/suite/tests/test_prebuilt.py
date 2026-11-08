@@ -139,7 +139,7 @@ class GraphdbContract(unittest.TestCase):
         for phase in ('load', 'serve'):
             raw = (self.ctx.logs / f'graphdb-{phase}-config.json').read_text()
             record = json.loads(raw)
-            self.assertEqual(record['image'], 'ontotext/graphdb:11.5.1')
+            self.assertEqual(record['image'], 'ontotext/graphdb:11.5.2')
             self.assertEqual(record['requested_edition'], 'free')
             self.assertEqual(record['env']['GDB_HEAP_SIZE'], '2g')
             self.assertIn('graphdb.license.file=<set>', record['env']['GDB_JAVA_OPTS'])
