@@ -48,6 +48,7 @@ EXE = ".exe" if os.name == "nt" else ""
 # minutes to start; name it to run it.
 EXPLICIT_ONLY = {"anzograph"}
 IMAGE_LABEL = "owlrs.built-from"  # a suite-built image's context and its tree id (receipts: images)
+SOURCE_LABEL = "owlrs.source-commit"  # the source commit an image built from a checkout compiled (images.sh)
 QUALIFIED_ANSWERS = {"ok", "deviates"}  # a cell's answers qualify when every query's verdict is one of these
 
 
@@ -345,16 +346,17 @@ class Suite:
     def _image_source(self, image: str, image_id: str):
         try:
             label = run_quiet(["docker", "image", "inspect", "--format",
-                               f'{{{{index .Config.Labels "{IMAGE_LABEL}"}}}}', image_id])
+                               f'{{{{index .Config.Labels "{IMAGE_LABEL}"}}}}|'
+                               f'{{{{index .Config.Labels "{SOURCE_LABEL}"}}}}', image_id])
         except OSError as error:
             return receipts.unknown(f"docker not available: {error}")
         if label.returncode != 0:
             said = (label.stderr or label.stdout or "").strip().splitlines()
             return receipts.unknown(f"docker image inspect failed (exit {label.returncode}): "
                                     f"{said[-1] if said else 'no output'}")
-        found = label.stdout.strip().replace("<no value>", "")
+        found, _, commit = label.stdout.strip().replace("<no value>", "").partition("|")
         if found:
-            return f"built from {found}"
+            return f"built from {found}" + (f", source commit {commit}" if commit else "")
         pin = image_pins(self.root).get(image)
         if not pin:
             return receipts.unknown("no build label and no digest pin (benches/suite/images.toml)")

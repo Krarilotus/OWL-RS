@@ -22,14 +22,30 @@ done
 [ "$build" = 0 ] || trap 'docker buildx rm "$BUILDER" >/dev/null 2>&1 || true' EXIT
 [ "$build" = 0 ] || docker buildx inspect "$BUILDER" >/dev/null 2>&1 || docker buildx create --name "$BUILDER" --driver docker-container \
   --driver-opt cpuset-cpus=0-7 --driver-opt cpu-shares=2 --driver-opt memory=8g --driver-opt memory-swap=8g >/dev/null
+# What an image is built from, on the image itself: its context's git tree and the source commit it
+# builds (the receipt reads them off the id that ran: suitekit/driver.py image_source). Only from a
+# clean checkout; a build at another commit than its Dockerfile's says so in its own label.
+labels() {  # CONTEXT (under the repository) COMMIT -> LABELS
+  LABELS=()
+  [ -z "$(git -C "$ROOT" status --porcelain 2>/dev/null)" ] || return 0
+  local tree
+  tree=$(git -C "$ROOT" rev-parse "HEAD:$1" 2>/dev/null) || return 0
+  LABELS=(--label "owlrs.built-from=$1@$tree" --label "owlrs.source-commit=$2")
+}
+# The source commit a context declares: its Dockerfile's ARG default (the one place it is named).
+declared() { sed -n "s/^ARG $2=//p" "$ROOT/benches/competitors/$1/Dockerfile" | head -n 1; }
 case ${1:-} in
   millenniumdb)
-    commit=${2:-ecbf6dde5a5864f088eee3b0836ad6adba1d623b}
+    commit=${2:-$(declared millenniumdb MDB_COMMIT)}
+    labels benches/competitors/millenniumdb "$commit"
     docker buildx build --builder "$BUILDER" --load --build-arg "MDB_COMMIT=$commit" --build-arg JOBS=8 \
-      -t "nrese-bench/millenniumdb:${commit:0:7}" "$ROOT/benches/competitors/millenniumdb"
+      "${LABELS[@]}" -t "nrese-bench/millenniumdb:${commit:0:7}" "$ROOT/benches/competitors/millenniumdb"
     ;;
   gcare)
-    docker buildx build --builder "$BUILDER" --load -t nrese-bench/gcare:d603d2b "$ROOT/benches/competitors/gcare"
+    commit=$(declared gcare GCARE_COMMIT)
+    labels benches/competitors/gcare "$commit"
+    docker buildx build --builder "$BUILDER" --load "${LABELS[@]}" -t "nrese-bench/gcare:$commit" \
+      "$ROOT/benches/competitors/gcare"
     ;;
   export)
     # An image for the rootfs runtime (suitekit/runtime.py RootfsRuntime) of a host without
