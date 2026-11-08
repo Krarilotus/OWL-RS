@@ -1740,6 +1740,105 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// What the store's reader passes to the mapping, and what the mapping drops, can't hide an
+/// answer behind a `complete` status (I24c-2; master, 09:39 and 09:41). Each case under
+/// owl2-ql and owl2-rl, the QL rewriting on.
+///
+/// Answered true, or not reported `complete`:
+/// - `C ⊑ ∃d.integer[≥ 5]` with `c : C`: `c` has a `d` value. The data range's facets
+///   (`owl:onDatatype`, `owl:withRestrictions`, `xsd:minInclusive`) are vocabulary the
+///   mapping reads.
+/// - `c owl:sameAs e`, `e : D`: `c : D`. The QL closure has no equality rules.
+///
+/// Not reported `complete`: a malformed schema statement, a restriction without its filler,
+/// which the mapping drops. A dropped axiom can't support the claim either way.
+///
+/// Still `complete` (a guard): an irreflexive, asymmetric property, which the reader now
+/// reads and which adds no fact.
+#[test]
+fn schema_the_reader_or_the_mapping_leaves_out_is_reported() {
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n"
+    );
+    let answered = [
+        (
+            format!(
+                "{head}:d a owl:DatatypeProperty .
+                 :C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :d ;
+                     owl:someValuesFrom [ a rdfs:Datatype ; owl:onDatatype xsd:integer ;
+                         owl:withRestrictions ( [ xsd:minInclusive 5 ] ) ] ] .
+                 :c a :C ."
+            ),
+            format!("ASK {{ <{E}c> <{E}d> ?v }}"),
+        ),
+        (
+            format!("{head}:c owl:sameAs :e . :e a :D ."),
+            format!("ASK {{ <{E}c> a <{E}D> }}"),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (n, (turtle, query)) in answered.iter().enumerate() {
+        for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(turtle, dir.path(), ruleset, true);
+            let result = store
+                .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                .unwrap_or_else(|e| panic!("case {n}, {query}: {e}"));
+            let answer = String::from_utf8(result.payload).unwrap();
+            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+            if !answer.contains("true") && matches!(status, "complete" | "none") {
+                wrong.push(format!(
+                    "case {n}, {}, {query}: {answer}, {status}",
+                    ruleset.name()
+                ));
+            }
+        }
+    }
+    let malformed = format!(
+        "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ] .
+         :c a :C ."
+    );
+    let query = format!("SELECT ?x WHERE {{ ?x a <{E}C> }}");
+    for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&malformed, dir.path(), ruleset, true);
+        let result = store
+            .execute_query(&SparqlQueryRequest::all(query.as_str()))
+            .unwrap();
+        let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+        if matches!(status, "complete" | "none") {
+            wrong.push(format!(
+                "malformed, {}, {query}: {status}, expected not complete",
+                ruleset.name()
+            ));
+        }
+    }
+    // Guard: an irreflexive or asymmetric property, read now, rules pairs out and adds no
+    // fact, so it costs no `complete` (OWL2Bench-QL's `isAffiliatedOrganizationOf`).
+    let guard = format!(
+        "{head}:p a owl:ObjectProperty, owl:IrreflexiveProperty, owl:AsymmetricProperty .
+         :c :p :d ."
+    );
+    let query = format!("SELECT ?x WHERE {{ ?x <{E}p> ?y }}");
+    for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&guard, dir.path(), ruleset, true);
+        let result = store
+            .execute_query(&SparqlQueryRequest::all(query.as_str()))
+            .unwrap();
+        let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+        if status != "complete" {
+            wrong.push(format!(
+                "irreflexive, {}, {query}: {status}, expected complete",
+                ruleset.name()
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 /// A rewritten query reads only what its reader may (design §1), and uses the schema as
 /// the RL closure the reader sees was computed: a reader who sees the inferences its graphs
 /// support (`inferred = "supported"`) gets the existentials of readable graphs only, one who
