@@ -120,6 +120,114 @@ async fn answers_carry_their_status() -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
+/// The status of an answer, and its body, for `request`.
+async fn answer(
+    app: &axum::Router,
+    request: Request<Body>,
+) -> Result<(Option<String>, String), Box<dyn std::error::Error>> {
+    let response = app.clone().oneshot(request).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let status = response
+        .headers()
+        .get("nrese-completeness")
+        .map(|v| v.to_str().map(str::to_owned))
+        .transpose()?;
+    Ok((status, body_text(response).await?))
+}
+
+/// SYN-72 slice 2 review r1 F1: under `owl2-dl`, an inferred-only read (GraphDB's
+/// `onto:implicit`, in `FROM` or as `default-graph-uri`) reads the rules' closure without
+/// the DL bounds: x, a D only through the union, is missing, so the answers are never
+/// certified complete. The same from the result cache and inside a transaction (nothing
+/// pending, or an addition pending). Asserted statements alone stay `complete`.
+#[tokio::test]
+async fn inferred_only_reads_are_never_certified_complete() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("union.ttl");
+    std::fs::write(&path, ONTOLOGY)?;
+    let app = test_app_with_store_config(
+        StoreConfig::in_memory().with_ontology(path),
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
+    )?;
+    const IMPLICIT: &str = "http://www.ontotext.com/implicit";
+    let from = format!("SELECT ?x FROM <{IMPLICIT}> {{ ?x a <http://example.com/D> }}");
+    let plain = "SELECT ?x { ?x a <http://example.com/D> }";
+    let by_param = format!(
+        "&{}",
+        serde_urlencoded::to_string([("default-graph-uri", IMPLICIT)])?
+    );
+    let not_complete = |label: &str, (status, text): (Option<String>, String)| {
+        assert!(
+            text.contains("http://example.com/y") && !text.contains("http://example.com/x"),
+            "{label}: the rules' closure, without x: {text}"
+        );
+        let status = status.unwrap_or_default();
+        assert!(
+            status.starts_with("sound-only; regime=owl2-dl"),
+            "{label}: NRESE-Completeness {status:?}"
+        );
+    };
+    // The second round's answers come from the result cache.
+    for round in ["first", "cached"] {
+        not_complete(
+            &format!("FROM, {round}"),
+            answer(&app, get(&from, "")?).await?,
+        );
+        not_complete(
+            &format!("default-graph-uri, {round}"),
+            answer(&app, get(plain, &by_param)?).await?,
+        );
+    }
+    let explicit =
+        "SELECT ?x FROM <http://www.ontotext.com/explicit> { ?x a <http://example.com/D> }";
+    let (status, _) = answer(&app, get(explicit, "")?).await?;
+    assert_eq!(
+        status.as_deref(),
+        Some("complete"),
+        "asserted statements alone"
+    );
+
+    // Inside an RDF4J transaction: nothing pending, then an addition pending.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/repositories/nrese/transactions")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let location = response.headers()["location"].to_str()?.to_owned();
+    let tx = &location[location.find("/repositories/").expect("a transaction path")..];
+    let in_tx = |extra: String| {
+        Request::builder()
+            .method(Method::PUT)
+            .uri(format!("{tx}?action={extra}"))
+            .header("accept", "application/sparql-results+json")
+            .header("content-type", "text/turtle")
+    };
+    let query = format!("QUERY&{}", serde_urlencoded::to_string([("query", &from)])?);
+    not_complete(
+        "transaction, nothing pending",
+        answer(&app, in_tx(query.clone()).body(Body::empty())?).await?,
+    );
+    let response = app
+        .clone()
+        .oneshot(in_tx("ADD".to_owned()).body(Body::from(
+            "<http://example.com/z> a <http://example.com/B> .",
+        ))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    not_complete(
+        "transaction, an addition pending",
+        answer(&app, in_tx(query).body(Body::empty())?).await?,
+    );
+    Ok(())
+}
+
 /// Spec (C-501): an OWL 2 DL explanation whose first entailment test a budget stops is
 /// undecided: 422, the incomplete-answer problem under owl2-dl with the budget as its
 /// reason, never a 404 (w a D holds: `answers_carry_their_status`).
