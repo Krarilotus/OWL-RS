@@ -402,6 +402,39 @@ impl Budget {
         }
     }
 
+    /// `bytes` charged here and at every level above where every level has room for them, else
+    /// nothing; never recorded as refused, never waiting: an optional charge (a vector's
+    /// doubling beyond what it asks, [`hold::Charge::renew_up_to`]). Whether it was taken.
+    pub(crate) fn try_take(&self, bytes: usize) -> bool {
+        #[cfg(test)]
+        calls::count();
+        let mut used = self.used.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = used.checked_add(bytes).filter(|&next| next <= self.limit) else {
+                return false;
+            };
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => {
+                    self.peak.fetch_max(next, Ordering::Relaxed);
+                    break;
+                }
+                Err(actual) => used = actual,
+            }
+        }
+        let above = match &self.parent {
+            Some(Parent::Server(shared)) => shared.charge(bytes).is_ok(),
+            Some(Parent::Envelope(envelope)) => envelope.try_take(bytes),
+            None => true,
+        };
+        if !above {
+            self.used.fetch_sub(bytes, Ordering::Relaxed);
+        }
+        above
+    }
+
     /// Up to `wanted` bytes charged here and at every level above, never more than half of
     /// the room left at a level: never refused and never recorded as refused, never
     /// waiting. What was taken. A [`Grant`]'s refill.
@@ -755,6 +788,36 @@ impl<B: Deref<Target = Budget>> Grant<B> {
         Ok(())
     }
 
+    /// Up to `wanted` more bytes for its items (a whole number of `unit`s), without refusal:
+    /// from its spare first, then the rest whole where every level has room for it
+    /// ([`Budget::try_take`]), else as far as half of the room left at a level allows
+    /// ([`Budget::take_up_to`]); never refused nor recorded as refused. What it took
+    /// ([`Share`]'s optional growth).
+    fn take_up_to(&mut self, wanted: usize, unit: usize) -> usize {
+        let unit = unit.max(1);
+        let from_spare = wanted.min(self.spare) / unit * unit;
+        self.spare -= from_spare;
+        let rest = wanted - from_spare;
+        let above = match rest {
+            0 => 0,
+            rest if self.budget.try_take(rest) => rest,
+            rest => {
+                let above = self.budget.take_up_to(rest);
+                // Whole units: the part of one returned at once.
+                let part = above % unit;
+                if part > 0 {
+                    self.budget.give(part);
+                }
+                above - part
+            }
+        };
+        let got = from_spare + above;
+        self.own += got;
+        #[cfg(any(test, feature = "measure"))]
+        crate::measure::reserved(&self.budget, self.tag, got);
+        got
+    }
+
     /// Gives up to `bytes` back: kept as spare up to the cap, the rest released at every
     /// level.
     pub fn give_back(&mut self, bytes: usize) {
@@ -813,6 +876,19 @@ impl<B: Deref<Target = Budget>> Grant<B> {
         self.release_ahead();
     }
 
+    /// Hands `bytes` of its items' charge (one [`Share`]'s) to a holder that releases them
+    /// itself (with [`Budget::release`]): they stay charged at every level, and are no longer
+    /// the grant's; nothing is released.
+    fn hand_off(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.own);
+        self.own -= bytes;
+        #[cfg(any(test, feature = "measure"))]
+        {
+            crate::measure::charged(&self.budget, bytes);
+            crate::measure::unreserved(&self.budget, self.tag, bytes);
+        }
+    }
+
     /// Hands its items' charge to a holder that releases it itself (with
     /// [`Budget::release`]); the spare is released.
     pub fn transfer(mut self) -> usize {
@@ -848,28 +924,283 @@ impl<B: Deref<Target = Budget>> Drop for Grant<B> {
     }
 }
 
-/// A vector whose memory is charged to a budget before it is allocated. Every change of its
-/// capacity takes one path ([`ChargedVec::set_capacity`]): the new capacity is charged
-/// first, beside the old (a reallocation holds both while it moves the items), then
-/// allocated, then the old capacity released; one the budget has no room for fails without
-/// allocating. It never holds more than it was charged, however a call ends: what it lends
-/// a writer ([`ChargedVec::fill`]) can't grow it. Dropped, it frees the items, then
-/// releases their charge; [`ChargedVec::into_parts`] hands the items out with their
-/// reservation.
+/// What holds a charged buffer's charge ([`Charged`], [`crate::ChargedMap`]): a
+/// [`Reservation`] on a budget, or a [`Share`] of a [`Pool`]. Its methods are the buffers'
+/// own: each takes a token only this crate makes, so nothing but a buffer's growth, its
+/// drop and its hand-over ([`Reservation::transfer`], [`Share::transfer`]) changes what a
+/// buffer is charged (the executor memory stack's second lead, 8 Nov: a path bag's charge
+/// kept beside its vector by hand disagreed with it at a new site in each of six rounds).
+pub trait Hold: hold::Charge {}
+
+impl<B: Deref<Target = Budget>> Hold for Reservation<B> {}
+
+impl<B: Deref<Target = Budget>> Hold for Share<'_, B> {}
+
+/// [`Hold`]'s methods, sealed: each takes a [`hold::Token`], which only this crate can make.
+pub mod hold {
+    use super::BudgetExceeded;
+
+    /// Made only in this crate: a [`Charge`] method can't be called from outside it.
+    #[derive(Clone, Copy)]
+    pub struct Token(());
+
+    pub(crate) const TOKEN: Token = Token(());
+
+    pub trait Charge {
+        /// What holds the old bytes while a buffer moves: released when it drops.
+        type Old<'a>
+        where
+            Self: 'a;
+
+        /// The bytes held.
+        fn held(&self, _: Token) -> usize;
+
+        /// Holds `bytes` in place of what it held, as a charge made now: they are charged,
+        /// and what it held is handed back, released when that drops. Until then both are
+        /// held, as a reallocation holds the old block and the new. A refusal changes nothing.
+        fn renew(&mut self, _: Token, bytes: usize) -> Result<Self::Old<'_>, BudgetExceeded>;
+
+        /// [`Self::renew`] to at least `least` bytes and at most `most`, in whole `unit`s:
+        /// `least` charged exactly (refused, and recorded as refused, where it doesn't fit),
+        /// the rest never refused nor recorded: whole where every level has room for it
+        /// ([`super::Budget::try_take`]), else no more than half of the room left at a level
+        /// ([`super::Budget::take_up_to`]'s rule, which leaves siblings room). What it holds
+        /// then, with the old bytes' holder. A refusal changes nothing.
+        fn renew_up_to(
+            &mut self,
+            _: Token,
+            least: usize,
+            most: usize,
+            unit: usize,
+        ) -> Result<(Self::Old<'_>, usize), BudgetExceeded>;
+
+        /// What it holds beyond `bytes` released (an upper bound trimmed to what was
+        /// allocated). Never refused.
+        fn trim(&mut self, _: Token, bytes: usize);
+
+        /// The refusal of a size no buffer can hold.
+        fn too_large(&self, _: Token) -> BudgetExceeded;
+    }
+}
+
+/// Test-only: a pause on one thread between a growing vector's exact charge and its
+/// optional one, where a sibling's growth can come between them (the budget types' owner's
+/// race, 8 Nov).
+#[cfg(test)]
+pub(crate) mod growing {
+    use std::cell::RefCell;
+
+    type Pause = Box<dyn Fn()>;
+
+    thread_local! {
+        static PAUSE: RefCell<Option<Pause>> = const { RefCell::new(None) };
+    }
+
+    /// `pause` runs at this thread's next growth, once.
+    pub(crate) fn pause_with(pause: impl Fn() + 'static) {
+        PAUSE.with(|slot| *slot.borrow_mut() = Some(Box::new(pause)));
+    }
+
+    pub(crate) fn pause() {
+        if let Some(pause) = PAUSE.with(|slot| slot.borrow_mut().take()) {
+            pause();
+        }
+    }
+}
+
+use hold::{Charge, TOKEN};
+
+impl<B: Deref<Target = Budget>> Charge for Reservation<B> {
+    type Old<'a>
+        = Reservation<&'a Budget>
+    where
+        Self: 'a;
+
+    fn held(&self, _: hold::Token) -> usize {
+        self.bytes
+    }
+
+    fn renew(&mut self, _: hold::Token, bytes: usize) -> Result<Self::Old<'_>, BudgetExceeded> {
+        Reservation::renew(self, bytes)
+    }
+
+    fn renew_up_to(
+        &mut self,
+        _: hold::Token,
+        least: usize,
+        most: usize,
+        unit: usize,
+    ) -> Result<(Self::Old<'_>, usize), BudgetExceeded> {
+        self.budget.take(least)?;
+        #[cfg(test)]
+        growing::pause();
+        let wanted = most.saturating_sub(least);
+        let extra = match self.budget.try_take(wanted) {
+            true => wanted,
+            false => {
+                let extra = self.budget.take_up_to(wanted);
+                // Whole units: the part of one returned at once.
+                let part = extra % unit.max(1);
+                if part > 0 {
+                    self.budget.give(part);
+                }
+                extra - part
+            }
+        };
+        let held = least + extra;
+        let old = Reservation {
+            budget: &*self.budget,
+            bytes: std::mem::replace(&mut self.bytes, held),
+            #[cfg(any(test, feature = "measure"))]
+            tag: std::mem::replace(&mut self.tag, crate::measure::tag()),
+        };
+        #[cfg(any(test, feature = "measure"))]
+        crate::measure::reserved(old.budget, self.tag, held);
+        Ok((old, held))
+    }
+
+    fn trim(&mut self, _: hold::Token, bytes: usize) {
+        if self.bytes > bytes {
+            self.release(self.bytes - bytes);
+        }
+    }
+
+    fn too_large(&self, _: hold::Token) -> BudgetExceeded {
+        self.budget.refuse(usize::MAX, self.budget.used())
+    }
+}
+
+/// One thread's [`Grant`], which the buffers of one operation draw from together (a path
+/// evaluator's bags, unions and columns): each holds its part as a [`Share`], so a small
+/// buffer's growth comes from the grant's spare, a local subtraction, with no call up the
+/// budget's levels (the executor memory stack's timings: an atomic per item or per node
+/// cost up to x1.94 in parallel workers). Not `Sync`: one thread's. Its buffers borrow it,
+/// so every one is freed, and its share given back, before the pool's grant releases what
+/// it holds.
 #[derive(Debug)]
-pub struct ChargedVec<T, B: Deref<Target = Budget> = Arc<Budget>> {
+pub struct Pool<B: Deref<Target = Budget> = Arc<Budget>>(std::cell::RefCell<Grant<B>>);
+
+impl<B: Deref<Target = Budget>> Pool<B> {
+    /// A pool for an operation on the global pool's threads ([`Grant::new`]).
+    pub fn new(budget: B) -> Self {
+        Self(std::cell::RefCell::new(Grant::new(budget)))
+    }
+
+    /// Whether its grant draws from `budget`.
+    pub fn is_on(&self, budget: &Budget) -> bool {
+        std::ptr::eq(&*self.0.borrow().budget, budget)
+    }
+}
+
+/// What one buffer holds of a [`Pool`]'s grant: charged at every level of the pool's
+/// budget, given back to the grant when it drops. It has no method that changes its
+/// bytes: only its buffer's growth does ([`Hold`]).
+#[derive(Debug)]
+pub struct Share<'p, B: Deref<Target = Budget> = Arc<Budget>> {
+    pool: &'p Pool<B>,
+    bytes: usize,
+}
+
+impl<'p, B: Deref<Target = Budget>> Share<'p, B> {
+    /// Nothing of `pool` held yet, for a buffer to grow.
+    pub(crate) fn empty(pool: &'p Pool<B>) -> Self {
+        Self { pool, bytes: 0 }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Hands the bytes to a holder that releases them itself (with [`Budget::release`]),
+    /// out of the pool's grant: nothing is released.
+    pub fn transfer(mut self) -> usize {
+        let bytes = std::mem::take(&mut self.bytes);
+        self.pool.0.borrow_mut().hand_off(bytes);
+        bytes
+    }
+}
+
+impl<'p, B: Deref<Target = Budget>> Charge for Share<'p, B> {
+    type Old<'a>
+        = Share<'p, B>
+    where
+        Self: 'a;
+
+    fn held(&self, _: hold::Token) -> usize {
+        self.bytes
+    }
+
+    fn renew(&mut self, _: hold::Token, bytes: usize) -> Result<Self::Old<'_>, BudgetExceeded> {
+        self.pool.0.borrow_mut().take(bytes)?;
+        Ok(Share {
+            pool: self.pool,
+            bytes: std::mem::replace(&mut self.bytes, bytes),
+        })
+    }
+
+    fn renew_up_to(
+        &mut self,
+        _: hold::Token,
+        least: usize,
+        most: usize,
+        unit: usize,
+    ) -> Result<(Self::Old<'_>, usize), BudgetExceeded> {
+        let held = {
+            let mut grant = self.pool.0.borrow_mut();
+            grant.take(least)?;
+            least + grant.take_up_to(most.saturating_sub(least), unit)
+        };
+        let old = Share {
+            pool: self.pool,
+            bytes: std::mem::replace(&mut self.bytes, held),
+        };
+        Ok((old, held))
+    }
+
+    fn trim(&mut self, _: hold::Token, bytes: usize) {
+        if self.bytes > bytes {
+            self.pool.0.borrow_mut().give_back(self.bytes - bytes);
+            self.bytes = bytes;
+        }
+    }
+
+    fn too_large(&self, _: hold::Token) -> BudgetExceeded {
+        let grant = self.pool.0.borrow();
+        grant.budget.refuse(usize::MAX, grant.budget.used())
+    }
+}
+
+impl<B: Deref<Target = Budget>> Drop for Share<'_, B> {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            self.pool.0.borrow_mut().give_back(self.bytes);
+        }
+    }
+}
+
+/// A vector whose memory is charged before it is allocated, to a budget ([`ChargedVec`]) or
+/// to a [`Pool`]. Every change of its capacity takes one path ([`Charged::set_capacity`]):
+/// the new capacity is charged first, beside the old (a reallocation holds both while it
+/// moves the items), then allocated, then the old capacity released; one there is no room
+/// for fails without allocating. It never holds more than it was charged, however a call
+/// ends: what it lends a writer ([`Charged::fill`]) can't grow it. Dropped, it frees the
+/// items, then releases their charge; [`Charged::into_parts`] hands the items out with
+/// their charge, whose holder hands the bytes on ([`Reservation::transfer`],
+/// [`Share::transfer`]) to a table that counts them, never released and charged again.
+#[derive(Debug)]
+pub struct Charged<T, H: Hold = Reservation> {
     /// Before `held`: fields drop in order, the items first.
     items: Vec<T>,
     /// Exactly `items`' capacity in bytes.
-    held: Reservation<B>,
+    held: H,
 }
 
-impl<T, B: Deref<Target = Budget>> ChargedVec<T, B> {
+/// A [`Charged`] vector on a budget.
+pub type ChargedVec<T, B = Arc<Budget>> = Charged<T, Reservation<B>>;
+
+impl<T, B: Deref<Target = Budget>> Charged<T, Reservation<B>> {
     pub fn new(budget: B) -> Self {
-        Self {
-            items: Vec::new(),
-            held: Reservation::new(budget),
-        }
+        Self::empty(Reservation::new(budget))
     }
 
     /// Room for `capacity` items, reserved first.
@@ -889,6 +1220,44 @@ impl<T, B: Deref<Target = Budget>> ChargedVec<T, B> {
         vec.extend_bounded(bound, items)?;
         Ok(vec)
     }
+}
+
+impl<'p, T, B: Deref<Target = Budget>> Charged<T, Share<'p, B>> {
+    /// An empty vector drawing from `pool`.
+    pub fn in_pool(pool: &'p Pool<B>) -> Self {
+        Self::empty(Share::empty(pool))
+    }
+
+    /// Room for `capacity` items, drawn from `pool` first.
+    pub fn with_capacity_in(pool: &'p Pool<B>, capacity: usize) -> Result<Self, BudgetExceeded> {
+        let mut vec = Self::in_pool(pool);
+        vec.reserve_exact(capacity)?;
+        Ok(vec)
+    }
+}
+
+impl<T, H: Hold> Charged<T, H> {
+    fn empty(held: H) -> Self {
+        debug_assert_eq!(held.held(TOKEN), 0);
+        Self {
+            items: Vec::new(),
+            held,
+        }
+    }
+
+    /// `items`, made outside any budget (a producer that doesn't charge, such as a
+    /// [`crate::graph`] closure), taken by this empty vector and their capacity charged now,
+    /// after they were allocated; refused, they are freed and nothing is charged.
+    ///
+    /// # Panics
+    /// If this vector has a capacity.
+    pub fn adopt_vec(mut self, items: Vec<T>) -> Result<Self, BudgetExceeded> {
+        assert_eq!(self.items.capacity(), 0, "adopt_vec: into an empty vector");
+        let bytes = Self::bytes(items.capacity()).expect("a vector's capacity has a layout");
+        drop(self.held.renew(TOKEN, bytes)?);
+        self.items = items;
+        Ok(self)
+    }
 
     /// The bytes of `capacity` items, if a vector can hold them.
     fn bytes(capacity: usize) -> Option<usize> {
@@ -897,33 +1266,40 @@ impl<T, B: Deref<Target = Budget>> ChargedVec<T, B> {
             .map(|layout| layout.size())
     }
 
-    /// Room for `additional` more items: the capacity doubles where the budget has room
-    /// for it, else grows to the most it has room for, and at least by what is asked.
+    /// Room for `additional` more items: what is asked charged exactly (refused where it
+    /// doesn't fit), and up to double the capacity as far as there is room, without refusal
+    /// ([`hold::Charge::renew_up_to`]), beside the current capacity (a reallocation holds
+    /// both).
     ///
     /// Grown by only what is asked, a vector near its limit reallocated at every push,
     /// copying all its items each time, until it was refused: pushes there cost copies
-    /// quadratic in the vector's length (the executor memory stack's second lead, 8 Nov).
-    /// Grown to what fits, it is refused at most one growth later.
+    /// quadratic in the vector's length (the executor memory stack's second lead, 8 Nov). And
+    /// a capacity chosen from a reading of the room, then charged exactly, was refused, and
+    /// its budget recorded as refused, where a sibling's growth came between the reading and
+    /// the charge although what was asked still fitted (the budget types' owner, 8 Nov). Grown
+    /// by what is asked, then doubled where that fits whole, else by no more than half of the
+    /// room beyond (not half of the room alone: a vector that could double stopped short and
+    /// was refused at its next growth, r5's 65,536 ends under 900 KiB), near the limit it grows
+    /// a logarithmic number of times before it is refused, and it is refused only where what is
+    /// asked has no room.
     pub fn reserve(&mut self, additional: usize) -> Result<(), BudgetExceeded> {
         let needed = self.needed(additional)?;
         if needed <= self.items.capacity() {
             return Ok(());
         }
         let doubled = needed.max(self.items.capacity().saturating_mul(2));
-        let capacity = self.most_that_fits(needed, doubled);
-        #[cfg(test)]
-        growing::pause();
-        self.set_capacity(capacity)
-    }
-
-    /// Of capacities from `needed` to `doubled` items, the most whose bytes the budget has
-    /// room for beside the current capacity's (a reallocation holds both); `needed` if none
-    /// fits, which its charge then refuses.
-    fn most_that_fits(&self, needed: usize, doubled: usize) -> usize {
-        match std::mem::size_of::<T>() {
-            0 => doubled,
-            size => (self.held.budget.remaining() / size).clamp(needed, doubled),
+        let size = std::mem::size_of::<T>();
+        if size == 0 {
+            return self.set_capacity(doubled);
         }
+        let least = Self::bytes(needed).ok_or_else(|| self.held.too_large(TOKEN))?;
+        let most = Self::bytes(doubled).unwrap_or(least);
+        // Released when it drops: after the reallocation, or as an unwinding one ends.
+        let (_old, held) = self.held.renew_up_to(TOKEN, least, most, size)?;
+        let capacity = held / size;
+        self.items.reserve_exact(capacity - self.items.len());
+        debug_assert_eq!(Self::bytes(self.items.capacity()), Some(held));
+        Ok(())
     }
 
     /// Room for exactly `additional` more items.
@@ -937,22 +1313,19 @@ impl<T, B: Deref<Target = Budget>> ChargedVec<T, B> {
 
     /// The length with `additional` more items, if it can be counted.
     fn needed(&self, additional: usize) -> Result<usize, BudgetExceeded> {
-        let budget = &self.held.budget;
         self.items
             .len()
             .checked_add(additional)
-            .ok_or_else(|| budget.refuse(usize::MAX, budget.used()))
+            .ok_or_else(|| self.held.too_large(TOKEN))
     }
 
     /// The one path that changes the capacity, to `capacity` items (at least the length):
     /// charged beside the old capacity, the vector reallocated, the old capacity released.
-    /// A capacity no vector can hold is refused as one the budget has no room for.
+    /// A capacity no vector can hold is refused as one there is no room for.
     fn set_capacity(&mut self, capacity: usize) -> Result<(), BudgetExceeded> {
-        let budget = &self.held.budget;
-        let bytes =
-            Self::bytes(capacity).ok_or_else(|| budget.refuse(usize::MAX, budget.used()))?;
+        let bytes = Self::bytes(capacity).ok_or_else(|| self.held.too_large(TOKEN))?;
         // Released when it drops: after the reallocation, or as an unwinding one ends.
-        let _old = self.held.renew(bytes)?;
+        let _old = self.held.renew(TOKEN, bytes)?;
         if capacity > self.items.capacity() {
             self.items.reserve_exact(capacity - self.items.len());
         } else {
@@ -1032,18 +1405,18 @@ impl<T, B: Deref<Target = Budget>> ChargedVec<T, B> {
 
     /// The bytes held: the capacity's.
     pub fn charged(&self) -> usize {
-        self.held.bytes()
+        self.held.held(TOKEN)
     }
 
-    /// The items, and the reservation of their capacity, for a holder that keeps it until
-    /// they are freed.
-    pub fn into_parts(self) -> (Vec<T>, Reservation<B>) {
+    /// The items, and the charge of their capacity, for a holder that keeps it until they
+    /// are freed or hands it on with them.
+    pub fn into_parts(self) -> (Vec<T>, H) {
         let Self { items, held } = self;
         (items, held)
     }
 }
 
-impl<T, B: Deref<Target = Budget>> Deref for ChargedVec<T, B> {
+impl<T, H: Hold> Deref for Charged<T, H> {
     type Target = [T];
 
     fn deref(&self) -> &[T] {
@@ -1051,13 +1424,13 @@ impl<T, B: Deref<Target = Budget>> Deref for ChargedVec<T, B> {
     }
 }
 
-impl<T, B: Deref<Target = Budget>> std::ops::DerefMut for ChargedVec<T, B> {
+impl<T, H: Hold> std::ops::DerefMut for Charged<T, H> {
     fn deref_mut(&mut self) -> &mut [T] {
         &mut self.items
     }
 }
 
-/// The room a [`ChargedVec`] lends a writer ([`ChargedVec::fill`]): items are added within
+/// The room a [`Charged`] vector lends a writer ([`Charged::fill`]): items are added within
 /// the capacity reserved, which it never grows.
 #[derive(Debug)]
 pub struct Room<'v, T>(&'v mut Vec<T>);
@@ -1345,31 +1718,6 @@ impl<B: Deref<Target = Budget>> Gauge<B> {
     }
 }
 
-/// Test-only: a pause on one thread between a growing vector's choice of capacity and its
-/// charge, where a sibling's growth can come between them (the budget types' owner's race,
-/// 8 Nov).
-#[cfg(test)]
-pub(crate) mod growing {
-    use std::cell::RefCell;
-
-    type Pause = Box<dyn Fn()>;
-
-    thread_local! {
-        static PAUSE: RefCell<Option<Pause>> = const { RefCell::new(None) };
-    }
-
-    /// `pause` runs at this thread's next growth, once.
-    pub(crate) fn pause_with(pause: impl Fn() + 'static) {
-        PAUSE.with(|slot| *slot.borrow_mut() = Some(Box::new(pause)));
-    }
-
-    pub(crate) fn pause() {
-        if let Some(pause) = PAUSE.with(|slot| slot.borrow_mut().take()) {
-            pause();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1612,11 +1960,13 @@ mod tests {
     }
 
     /// Pushes near a budget's limit cost copies linear in what they push, and the vector
-    /// never holds more than the limit: where doubling has no room it grows to what fits,
-    /// and is refused at most one growth later, not reallocated (every item copied) at
-    /// each push. The limit is 90,000 items' bytes, so doubling from 32,768 items (32,768
-    /// beside 65,536) has no room. Grown by what each push asks, that vector reallocated
-    /// about 12,000 times from 32,768 items on, about 470 million items copied.
+    /// never holds more than the limit: where doubling has no room it grows by what is asked
+    /// and half of the room beyond, so it is refused after a few growths, not reallocated
+    /// (every item copied) at each push. The limit is 90,000 items' bytes, so doubling from
+    /// 32,768 items (32,768 beside 65,536) has no room. Grown by what each push asks, that
+    /// vector reallocated 12,248 times from 32,768 items on: 475,655,739 items copied for
+    /// 45,000 pushes. Doubling's copies are at most two a push; the last growths, by half of
+    /// the room left, add at most one more.
     #[test]
     fn pushes_near_the_limit_copy_each_item_a_bounded_number_of_times() {
         const LIMIT: usize = 90_000 * 8;
@@ -1636,7 +1986,7 @@ mod tests {
             assert!(budget.used() <= LIMIT && vec.capacity() * 8 <= LIMIT);
         }
         assert!(
-            copied <= 2 * pushed,
+            copied <= 3 * pushed,
             "{copied} items copied for {pushed} pushes in {growths} growths"
         );
         assert!(budget.peak() <= LIMIT, "peak {}", budget.peak());
@@ -1648,10 +1998,10 @@ mod tests {
     /// its limit, both grow where what each asks fits, and the budget isn't recorded as
     /// refused. The limit leaves room beside their 1,000 items each for both to ask 1,001 more,
     /// and for either alone to double, but not for both to double. The first to grow pauses
-    /// between choosing its capacity and charging it (`growing`), and the other grows
+    /// between its exact charge and its optional one (`growing`), and the other grows
     /// meanwhile. Chosen from a reading of the room and then charged exactly, the first's
-    /// doubled capacity is refused, and the budget recorded as refused, though what it asked
-    /// fits.
+    /// doubled capacity was refused, and the budget recorded as refused, though what it asked
+    /// fitted.
     #[test]
     fn vectors_growing_at_once_near_the_limit_both_grow() {
         use std::sync::{Arc, Barrier};
@@ -1685,6 +2035,82 @@ mod tests {
         );
         assert!(!budget.refused(), "the budget recorded as refused");
         assert_eq!(budget.used(), vectors[0].charged() + vectors[1].charged());
+    }
+
+    /// A vector whose doubling fits doubles, however near the limit: 32,768 items under a
+    /// limit of three times their bytes (32,768 beside 65,536 while it moves) grow to 65,536
+    /// and take them all. Grown by half of the room beyond what is asked alone, it stopped at
+    /// 49,152 and its next growth was refused (r5's path column of 65,536 ends under 900 KiB,
+    /// ems-r4-c6-bf3699b9).
+    #[test]
+    fn a_vector_whose_doubling_fits_doubles() {
+        const ITEMS: usize = 32_768;
+        let budget = Budget::new(3 * ITEMS * 8);
+        let mut vec: ChargedVec<u64, &Budget> = ChargedVec::with_capacity(&budget, ITEMS).unwrap();
+        vec.resize(ITEMS, 0).unwrap();
+        vec.push(1).unwrap();
+        assert_eq!(vec.capacity(), 2 * ITEMS);
+        vec.resize(2 * ITEMS, 0).unwrap();
+        assert!(!budget.refused());
+        assert_eq!(budget.used(), 2 * ITEMS * 8);
+    }
+
+    /// A pool's vectors draw on its grant: each is charged exactly its capacity while it
+    /// lives, and given back to the grant once dropped (freed first); a vector's charge handed
+    /// over with its items ([`Share::transfer`]) stays charged at the budget and is the
+    /// grant's no more, so the pool's end releases only the rest. Nothing is held beyond its
+    /// charge at any moment.
+    #[test]
+    fn a_pools_vectors_hold_their_charge_and_hand_it_over_whole() {
+        if !crate::measure::alone() {
+            return;
+        }
+        let envelope = Envelope::new(Some(1 << 20), None);
+        let part = envelope.part();
+        let ((), excess) = crate::measure::measure_within(&part, || {
+            let pool = Pool::new(&part);
+            let mut kept: Charged<u64, Share<'_, &Budget>> = Charged::in_pool(&pool);
+            let mut dropped: Charged<u64, Share<'_, &Budget>> = Charged::in_pool(&pool);
+            for i in 0..1_000 {
+                kept.push(i).unwrap();
+                dropped.push(i).unwrap();
+            }
+            assert_eq!(kept.charged(), kept.capacity() * 8);
+            assert_eq!(dropped.charged(), dropped.capacity() * 8);
+            assert!(part.used() >= kept.charged() + dropped.charged());
+            drop(dropped);
+            let (items, share) = kept.into_parts();
+            let bytes = share.transfer();
+            assert_eq!(bytes, items.capacity() * 8);
+            drop(pool);
+            assert_eq!(
+                part.used(),
+                bytes,
+                "the handed-over bytes alone stay charged"
+            );
+            drop(items);
+            part.release(bytes);
+        });
+        assert_eq!((excess, part.used()), (0, 0));
+    }
+
+    /// A vector made outside a budget, adopted, is charged its capacity, not its length; one
+    /// there is no room for is refused, freed, and charges nothing.
+    #[test]
+    fn an_adopted_vector_is_charged_its_capacity_or_refused() {
+        let budget = Budget::new(1 << 10);
+        let mut items: Vec<u64> = Vec::with_capacity(100);
+        items.extend(0..10);
+        let adopted = ChargedVec::new(&budget).adopt_vec(items).unwrap();
+        assert_eq!(
+            (adopted.len(), adopted.charged(), budget.used()),
+            (10, 800, 800)
+        );
+        let refused = ChargedVec::new(&budget).adopt_vec(Vec::<u64>::with_capacity(100));
+        assert!(refused.is_err());
+        assert_eq!(budget.used(), 800, "nothing charged for the refused one");
+        drop(adopted);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
