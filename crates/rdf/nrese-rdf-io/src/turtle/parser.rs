@@ -26,8 +26,10 @@ use nrese_rdf::{
 };
 
 use super::lexer::{
-    Brackets, Kind, Lexed, Malformed, Opening, Token, known_missing, lex, malformed, pair,
+    Brackets, Kind, Lexed, Malformed, Opening, Token, characters, known_missing, lex, malformed,
+    pair,
 };
+use super::split::Cut;
 use crate::blank::BlankNodes;
 use crate::error::{RdfParseError, RdfSyntaxError, SkippedStatement, TextPosition};
 use crate::text::{NOT_IN_IRI, decode_iri, decode_string};
@@ -102,6 +104,11 @@ struct Input<'a, R> {
     base: u64,
     line: u64,
     line_start: u64,
+    /// The start of the line `data()[0]` is in, and that line's characters before it: a
+    /// column counts characters, also where its line began before the buffer (a chunk's
+    /// first line, a long line across refills).
+    first_line_start: u64,
+    first_line_chars: u64,
     /// A read error met while recovery read ahead: the next `refill` returns it, or the
     /// parser does once it has stopped, so it is never lost (see `skip_malformed`).
     held: Option<io::Error>,
@@ -136,6 +143,15 @@ impl<R: Read> Input<'_, R> {
             return Ok(());
         };
         if self.position > 0 {
+            // The line the new `data()[0]` is in, and its characters before it.
+            let gone = &buffer[..self.position];
+            match memchr::memrchr(b'\n', gone) {
+                Some(k) => {
+                    self.first_line_start = self.base + k as u64 + 1;
+                    self.first_line_chars = characters(&gone[k + 1..]);
+                }
+                None => self.first_line_chars += characters(gone),
+            }
             buffer.copy_within(self.position..*end, 0);
             *end -= self.position;
             self.base += self.position as u64;
@@ -225,16 +241,17 @@ impl<R: Read> Input<'_, R> {
                 self.line_start
             } else {
                 // The line began before the buffer where no break precedes `at` in it.
-                memchr::memrchr(b'\n', &data[..at]).map_or(self.base, |i| self.base + i as u64 + 1)
+                memchr::memrchr(b'\n', &data[..at])
+                    .map_or(self.first_line_start, |i| self.base + i as u64 + 1)
             };
             (self.line.saturating_sub(breaks), line_start)
         };
-        // Characters when the line is still buffered, bytes otherwise.
-        let column = if line_start >= self.base && line_start <= offset {
-            let from = (line_start - self.base) as usize;
-            String::from_utf8_lossy(&data[from..at]).chars().count() as u64
-        } else {
-            offset.saturating_sub(line_start)
+        // Characters from the line's start: in the buffer, or before it too where the line
+        // began earlier (then it is the line `data()[0]` is in).
+        let column = match line_start.checked_sub(self.base) {
+            Some(from) if line_start <= offset => characters(&data[from as usize..at]),
+            Some(_) => 0,
+            None => self.first_line_chars + characters(&data[..at]),
         };
         TextPosition {
             line,
@@ -376,20 +393,16 @@ type Step<T> = Result<T, RdfParseError>;
 
 impl<'a, R: Read> TurtleParser<'a, R> {
     /// This parser for a chunk of a larger document ([`super::split`]): where the chunk
-    /// starts there (so errors give the document's lines), and the directives in force at
-    /// its start, read now.
-    pub(crate) fn for_chunk(
-        mut self,
-        offset: u64,
-        line: u64,
-        line_start: u64,
-        directives: &str,
-    ) -> Result<Self, RdfParseError> {
-        self.input.base = offset;
-        self.input.line = line;
-        self.input.line_start = line_start;
+    /// starts there (`cut`: so errors give the document's lines and columns), and the
+    /// directives in force at its start, read now.
+    pub(crate) fn for_chunk(mut self, cut: Cut, directives: &str) -> Result<Self, RdfParseError> {
+        self.input.base = cut.offset;
+        self.input.line = cut.line;
+        self.input.line_start = cut.line_start;
+        self.input.first_line_start = cut.line_start;
+        self.input.first_line_chars = cut.column;
         // A byte order mark can only be at the document's start.
-        self.started = offset > 0;
+        self.started = cut.offset > 0;
         if !directives.is_empty() {
             let mut header = TurtleParser::from_slice(directives.as_bytes(), self.settings.clone());
             while let Some(step) = header.next_ref() {
@@ -416,6 +429,8 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             base: 0,
             line: 0,
             line_start: 0,
+            first_line_start: 0,
+            first_line_chars: 0,
             held: None,
         };
         Self {

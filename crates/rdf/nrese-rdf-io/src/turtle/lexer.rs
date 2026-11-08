@@ -420,6 +420,20 @@ pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool, n3: bool) -> Lexe
     }
 }
 
+/// Whitespace, as Turtle and TriG have it (`WS`: space, tab, CR, LF; no form feed): the
+/// one class the lexer and the skimmer (`split`) read it by.
+#[inline(always)]
+pub(crate) fn is_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// The characters in `bytes`, as a column counts them (`TextPosition`): the bytes that
+/// don't continue a UTF-8 character. Additive, so a line's count can be taken in parts (a
+/// skim's pieces, a reader's refills, a chunk and what came before it).
+pub(crate) fn characters(bytes: &[u8]) -> u64 {
+    bytes.iter().filter(|&&b| (b as i8) >= -0x40).count() as u64
+}
+
 /// Where the next token starts: past whitespace and comments. `None` if a comment may
 /// still go on (more input may come).
 #[inline(always)]
@@ -427,7 +441,7 @@ fn space(input: &[u8], eof: bool) -> Option<usize> {
     let len = input.len();
     let mut i = 0;
     loop {
-        while i < len && matches!(input[i], b' ' | b'\t' | b'\n' | b'\r') {
+        while i < len && is_space(input[i]) {
             i += 1;
         }
         if i < len && input[i] == b'#' {

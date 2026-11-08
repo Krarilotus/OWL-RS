@@ -23,7 +23,7 @@
 //! says it can fail or give wrong results on directives after the start or Turtle inside
 //! literals; this one can't.
 
-use super::lexer::{Brackets, Delimiter, Kind, Lexed, delimiter, lex};
+use super::lexer::{Brackets, Delimiter, Kind, Lexed, characters, delimiter, is_space, lex};
 
 /// Bytes the skimmer must look at outside strings, IRIs and comments.
 const fn interesting() -> [bool; 256] {
@@ -38,10 +38,10 @@ const fn interesting() -> [bool; 256] {
 }
 const INTERESTING: [bool; 256] = interesting();
 
-/// The bytes that always end a token before them (the lexer's delimiters, quotes, `<`, `#`):
-/// a name holding `\` starts after the last one, or after whitespace.
+/// The bytes that always end a token before them (the lexer's whitespace, delimiters,
+/// quotes, `<`, `#`): a name holding `\` starts after the last one.
 fn ends_token(b: u8) -> bool {
-    b.is_ascii_whitespace()
+    is_space(b)
         || matches!(
             b,
             b'"' | b'\'' | b'<' | b'>' | b'|' | b'#' | b'[' | b']' | b'{' | b'}' | b'(' | b')'
@@ -51,7 +51,6 @@ fn ends_token(b: u8) -> bool {
 /// Whether a SPARQL-style directive's text so far is a `VERSION` (ending with its short
 /// string; `PREFIX` and `BASE` end with their IRI).
 fn version(text: &[u8]) -> bool {
-    let text = text.trim_ascii_start();
     text.len() >= 7 && text[..7].eq_ignore_ascii_case(b"version")
 }
 
@@ -140,11 +139,33 @@ enum State {
     },
 }
 
+/// A cut: where a chunk starts, as its parser counts positions there (`for_chunk`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Cut {
+    /// Its byte offset in the document.
+    pub(crate) offset: u64,
+    /// The line it is in (from 0), and the offset of that line's start.
+    pub(crate) line: u64,
+    pub(crate) line_start: u64,
+    /// The characters on that line before it: a column counts characters (`TextPosition`).
+    pub(crate) column: u64,
+}
+
+impl Cut {
+    /// The document's start: the first chunk's.
+    pub(crate) const START: Cut = Cut {
+        offset: 0,
+        line: 0,
+        line_start: 0,
+        column: 0,
+    };
+}
+
 /// The skim of one document: where to cut, and the directives.
 #[derive(Debug, Default)]
 pub(crate) struct Skim {
-    /// The chosen cuts: byte offset, and the line and line start there.
-    pub(crate) cuts: Vec<(u64, u64, u64)>,
+    /// The chosen cuts.
+    pub(crate) cuts: Vec<Cut>,
     /// Each directive: where it ends (offset of the byte after it) and its text.
     pub(crate) directives: Vec<(u64, String)>,
 }
@@ -180,13 +201,15 @@ pub(crate) struct Skimmer {
     offset: u64,
     line: u64,
     line_start: u64,
+    /// The characters from `line_start` to `offset` (a cut later in the line, in the next
+    /// input, counts its column from them).
+    line_chars: u64,
     /// Where cuts are wanted, ascending; the first one not yet reached.
     targets: Vec<u64>,
     next_target: usize,
     skim: Skim,
-    /// At the start of a statement: the first bytes, to tell a directive (up to 7 bytes),
-    /// and where the statement began.
-    start: Option<(u64, Vec<u8>)>,
+    /// At the start of a statement, its first token not read yet (it tells a directive).
+    start: bool,
     /// The directive being read: its text so far, and whether it ends at a '.' (`@` forms)
     /// or after its IRI or, for `VERSION`, its string (SPARQL forms).
     directive: Option<(Vec<u8>, bool)>,
@@ -212,10 +235,11 @@ impl Skimmer {
             offset: 0,
             line: 0,
             line_start: 0,
+            line_chars: 0,
             targets: (1..parts).map(|k| length * k / parts).collect(),
             next_target: 0,
             skim: Skim::default(),
-            start: Some((0, Vec::new())),
+            start: true,
             directive: None,
         }
     }
@@ -229,12 +253,18 @@ impl Skimmer {
                 .push((at, String::from_utf8_lossy(&text).into_owned()));
         }
         if self.next_target < self.targets.len() && at >= self.targets[self.next_target] {
-            self.skim.cuts.push((at, self.line, self.line_start));
+            // The column is counted where the piece is read to its end (`scan`, `finish`).
+            self.skim.cuts.push(Cut {
+                offset: at,
+                line: self.line,
+                line_start: self.line_start,
+                column: 0,
+            });
             while self.next_target < self.targets.len() && self.targets[self.next_target] <= at {
                 self.next_target += 1;
             }
         }
-        self.start = Some((at, Vec::new()));
+        self.start = true;
         self.statement_start = at;
         self.head.clear();
         self.no_head = false;
@@ -329,7 +359,7 @@ impl Skimmer {
         counted: &mut usize,
     ) -> (usize, bool) {
         let n = bytes.len();
-        self.start = None;
+        self.start = false;
         let mut from = i;
         while from > 0 && !ends_token(bytes[from - 1]) {
             from -= 1;
@@ -346,7 +376,7 @@ impl Skimmer {
                         Kind::Dot if self.level() => {
                             if end == n {
                                 self.state = State::Dot;
-                            } else if bytes[end].is_ascii_whitespace() || bytes[end] == b'#' {
+                            } else if is_space(bytes[end]) || bytes[end] == b'#' {
                                 self.lines(bytes, base, counted, end);
                                 self.boundary(base + end as u64);
                             }
@@ -426,6 +456,8 @@ impl Skimmer {
     /// rest is held back, see `pending`). `eof`: nothing comes after them.
     fn scan(&mut self, bytes: &[u8], eof: bool) -> usize {
         let base = self.offset;
+        // The cuts made in this input: their columns are counted at its end.
+        let first_cut = self.skim.cuts.len();
         // Lines: counted per piece with memchr (vectorised), and at each boundary from the
         // piece's start up to it.
         let mut counted = 0_usize;
@@ -444,7 +476,7 @@ impl Skimmer {
             if bytes.starts_with(BOM) {
                 i = BOM.len();
                 self.statement_start = i as u64;
-                self.start = Some((i as u64, Vec::new()));
+                self.start = true;
             }
         }
         // A word at the input's end is held back (it may go on, its start is needed to read
@@ -507,76 +539,43 @@ impl Skimmer {
                     i < tail || self.state != State::Normal,
                     "reading the held word"
                 );
-                // A statement's first bytes: is it a directive? (What is open is asked only while
-                // a statement's start is being read: this runs for every byte.)
-                if self.start.is_some()
-                    && matches!(self.state, State::Normal)
-                    && self.level()
-                    && let Some((_, first)) = &mut self.start
-                {
+                // A statement's first token: is it a directive? Past the lexer's whitespace and
+                // comments, the lexer reads it, where a directive's keyword can start: `@`
+                // (`@prefix`, `@base`, `@version`) or the first letter of `PREFIX`, `BASE`,
+                // `VERSION` in any case. (What is open is asked only while a statement's start
+                // is being read: this runs for every byte.) A `VERSION "1.2"` read as a
+                // statement ran on to the next `.` and swallowed the directive after it (a
+                // release whose second line declared `prov:` failed to load in parallel, 4
+                // October 2026).
+                if self.start && matches!(self.state, State::Normal) && self.level() {
                     let b = bytes[i];
-                    if first.is_empty() && b.is_ascii_whitespace() {
+                    if is_space(b) {
                         i += 1;
                         continue;
                     }
-                    if first.is_empty() && b == b'#' {
-                        // A comment before the statement.
-                    } else {
-                        first.push(b);
-                        // As the lexer reads them: `@` and a run of letters that is `prefix`,
-                        // `base` or `version`; or a name that is `PREFIX`, `BASE` or `VERSION`
-                        // in any case and not followed by `:` (that would be a prefixed name).
-                        // No whitespace needs to follow (`BASE<…>`, `@prefix:<…>`). A
-                        // `VERSION "1.2"` read as a statement ran on to the next `.` and
-                        // swallowed the directive after it (a release whose second line
-                        // declared `prov:` failed to load in parallel, 4 October 2026).
-                        let (run, dotted) = match first.split_first() {
-                            Some((b'@', rest)) => (rest, true),
-                            _ => (&first[..], false),
-                        };
-                        let in_run = |c: u8| {
-                            if dotted {
-                                c.is_ascii_alphabetic()
-                            } else {
-                                c.is_ascii_alphanumeric()
-                                    || matches!(c, b'_' | b'-' | b'.')
-                                    || c >= 0x80
+                    // A comment before the statement is read below, and the start is kept.
+                    if b != b'#' {
+                        self.start = false;
+                        if matches!(b, b'@' | b'p' | b'P' | b'b' | b'B' | b'v' | b'V') {
+                            match lex(&bytes[i..], eof, false, false) {
+                                Lexed::Token(token) => match token.kind {
+                                    Kind::AtPrefix | Kind::AtBase | Kind::AtVersion => {
+                                        self.directive = Some((Vec::new(), true));
+                                    }
+                                    Kind::Prefix | Kind::Base | Kind::Version => {
+                                        self.directive = Some((Vec::new(), false));
+                                    }
+                                    _ => {}
+                                },
+                                // The token goes on in the next input: read it again then.
+                                Lexed::NeedMore => {
+                                    self.start = true;
+                                    held = Some(i);
+                                    break 'scan;
+                                }
+                                // A byte the lexer can't read: the statement fails there.
+                                Lexed::Error(..) => {}
                             }
-                        };
-                        let keywords: [&[u8]; 3] = [b"prefix", b"base", b"version"];
-                        let same = |word: &[u8], keyword: &[u8]| {
-                            if dotted {
-                                word == keyword
-                            } else {
-                                word.eq_ignore_ascii_case(keyword)
-                            }
-                        };
-                        let (&last, word) = run.split_last().unwrap_or((&b' ', &[]));
-                        if run.is_empty() {
-                            // Only the `@` so far.
-                        } else if in_run(last) {
-                            // Still in the run: a keyword can still come of it?
-                            let could_be = keywords.iter().any(|k| {
-                                run.len() <= k.len()
-                                    && (if dotted {
-                                        k.starts_with(run)
-                                    } else {
-                                        k[..run.len()].eq_ignore_ascii_case(run)
-                                    })
-                            });
-                            if !could_be {
-                                self.start = None;
-                            }
-                        } else if keywords.iter().any(|k| same(word, k)) && (dotted || last != b':')
-                        {
-                            let mut text = std::mem::take(first);
-                            text.truncate(text.len() - 1);
-                            self.start = None;
-                            self.directive = Some((text, dotted));
-                            // Re-read this byte as part of the directive.
-                            continue;
-                        } else {
-                            self.start = None;
                         }
                     }
                 }
@@ -590,7 +589,7 @@ impl Skimmer {
                             // The fast path: skip to the next byte that matters, up to the held
                             // word (a directive's text is copied byte by byte above, but
                             // directives are few).
-                            if self.directive.is_none() && self.start.is_none() {
+                            if self.directive.is_none() && !self.start {
                                 let rest = &bytes[i + 1..];
                                 let skip = rest
                                     .iter()
@@ -637,7 +636,7 @@ impl Skimmer {
                         if let Some((text, _)) = &mut self.directive {
                             text.pop();
                         }
-                        if b.is_ascii_whitespace() || b == b'#' {
+                        if is_space(b) || b == b'#' {
                             count_lines(self, &mut counted, i);
                             self.boundary(base + i as u64);
                         }
@@ -828,6 +827,23 @@ impl Skimmer {
         }
         let read = held.unwrap_or(n);
         count_lines(self, &mut counted, read);
+        // Columns in characters: each cut's from its line's start (in this input, or before
+        // it: `line_chars`), then `line_chars` for the next input. Only the bytes of a cut's
+        // line before it are counted, and of the last line read.
+        let since =
+            |line_start: u64, to: usize, chars_before: u64| match line_start.checked_sub(base) {
+                Some(from) => characters(&bytes[from as usize..to]),
+                None => chars_before + characters(&bytes[..to]),
+            };
+        for k in first_cut..self.skim.cuts.len() {
+            let cut = self.skim.cuts[k];
+            self.skim.cuts[k].column = since(
+                cut.line_start,
+                (cut.offset - base) as usize,
+                self.line_chars,
+            );
+        }
+        self.line_chars = since(self.line_start, read, self.line_chars);
         // TriG: the statement's bytes so far, while they may be a block's head (a `{` later
         // asks; see `block_head`).
         if self.trig && !self.no_head && !self.in_block {
@@ -852,7 +868,12 @@ impl Skimmer {
         let read = self.scan(&pending, true);
         debug_assert_eq!(read, pending.len(), "nothing is held at the end");
         if self.state == State::Dot {
+            let cuts = self.skim.cuts.len();
             self.boundary(self.offset);
+            // A cut at the end: after all the characters read on its line.
+            if self.skim.cuts.len() > cuts {
+                self.skim.cuts[cuts].column = self.line_chars;
+            }
         }
         self.skim
     }
@@ -947,7 +968,7 @@ mod tests {
         let cuts: Vec<&str> = every
             .cuts
             .iter()
-            .map(|&(at, _, _)| &text[..at as usize])
+            .map(|cut| &text[..cut.offset as usize])
             .collect();
         // Every cut is at the end of a statement (a valid prefix of the document).
         for cut in &cuts {
