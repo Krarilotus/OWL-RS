@@ -2936,15 +2936,21 @@ fn copies_at_most(members: [&[u64]; 3]) -> usize {
 pub(crate) type Copies<'a> = ChargedVec<Triple, &'a nrese_exec::Budget>;
 
 /// One fact's copies, at most `bound` of them, that `make` writes, appended to the thread's
-/// `copies`; `scratch` is the thread's room for one fact's copies.
+/// `copies`. `make` writes into `scratch`, the thread's room for one fact's copies, charged
+/// for `bound` before it is lent and reused from fact to fact, so the loop that makes them
+/// only checks and writes. `copies` then grows by what was made, by doubling as a list does:
+/// lending it the bound itself kept room for copies not made (most of a fact's, where the
+/// store holds them) beside the joined list (#91, `abba-pr91-cost-r2`: 1.81 times the
+/// copies in replication's last round).
 pub(crate) fn append_copies<'a>(
     copies: &mut Copies<'a>,
     scratch: &mut Copies<'a>,
     bound: usize,
     make: impl FnOnce(&mut nrese_exec::Room<'_, Triple>),
 ) -> Result<(), BudgetExceeded> {
-    let _ = scratch;
-    copies.fill(bound, make)
+    scratch.clear();
+    scratch.fill(bound, make)?;
+    copies.extend_from_slice(scratch)
 }
 
 /// Each thread's copies, `chunks`, in one list of exactly their number: its room charged
