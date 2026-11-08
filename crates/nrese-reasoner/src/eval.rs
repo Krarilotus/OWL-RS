@@ -235,14 +235,18 @@ impl<'v, 'p> Visit<'v, 'p> {
         Self { poll, f, ahead: 0 }
     }
 
-    /// Counts one position; false once the poller has stopped.
+    /// Counts one position; false once the poller has stopped. A position of a run counted
+    /// ahead ([`Self::ahead`]) isn't checked again: the run's own count asked the poller
+    /// before it began, and the next count after it asks again, so a stop that fires inside
+    /// the run is seen within the run, at most `POLL_UNITS` long (REAS-2's bound: `POLL_UNITS`
+    /// plus one run).
     #[inline]
     fn count(&mut self) -> bool {
         match self.ahead {
             0 => !self.poll.tick(),
             _ => {
                 self.ahead -= 1;
-                !self.poll.stopped()
+                true
             }
         }
     }
@@ -266,9 +270,15 @@ impl<'v, 'p> Visit<'v, 'p> {
     }
 
     /// `n` positions about to be visited (a slice, a run), counted up front: the next `n`
-    /// [`Self::fact`] and [`Self::skip`] calls don't tick again. False once stopped.
+    /// [`Self::fact`] and [`Self::skip`] calls don't tick or check the poller again. False
+    /// once stopped. `n` is at most `POLL_UNITS` (the store's runs, `batch::RUN`, and the
+    /// morsels' ranges, `MORSEL`): a longer run would deliver past a stop by its length.
     #[inline]
     pub fn ahead(&mut self, n: usize) -> bool {
+        debug_assert!(
+            n <= nrese_exec::POLL_UNITS as usize,
+            "a run of {n} positions counted ahead: at most POLL_UNITS"
+        );
         if self.poll.attempt(n) {
             return false;
         }

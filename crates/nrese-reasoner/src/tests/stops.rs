@@ -226,8 +226,8 @@ fn a_stopped_materialisation_is_never_reported_complete() {
 /// fact's copies as it makes them: one class of 1000 identities lists about a million
 /// copies of its `sameAs` facts, a product far above `POLL_UNITS`. REAS-2's invariant: once
 /// a stop fires, a task does at most `POLL_UNITS` more units plus the work in progress, here
-/// the run of copies counted at once, at most `POLL_UNITS` long (the listing's runs,
-/// `mo.chunks(POLL_UNITS)` in `batch::list`). So the listing asks its stop at least once
+/// the run of copies counted at once, at most `POLL_UNITS` long (`batch::RUN`, which
+/// `batch::list` cuts its copies by: `mo.chunks(RUN)`). So the listing asks its stop at least once
 /// every `POLL_UNITS` plus one run's worth of copies, a stop that fires while a product is
 /// made is seen within that, and the materialisation ends `Interrupted` (a whole product
 /// counted at once was one ask for all its copies).

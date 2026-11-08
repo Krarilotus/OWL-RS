@@ -773,14 +773,16 @@ impl Run {
     /// Hands every position matching the bound positions to `f`: a pair `keep` accepts as
     /// [`At::Pair`], every other position it visits (the ones `keep` or the object filter
     /// passes over) as [`At::Skip`]; ends once `f` returns false (the reader's poller
-    /// stopped: [`Visit`]).
-    fn scan(
+    /// stopped: [`Visit`]). `f` is generic, so the reader's step inlines into the loop over
+    /// the positions (REAS-2 timing: a call per position through a `dyn` was most of the
+    /// read layer's cost on replication).
+    fn scan<F: FnMut(At) -> bool>(
         &self,
         s: Option<u64>,
         o: Option<u64>,
         keep: &dyn Fn(u64, u64) -> bool,
         missed: &std::sync::atomic::AtomicU64,
-        f: &mut dyn FnMut(At) -> bool,
+        f: &mut F,
     ) {
         let at = |s, o| match keep(s, o) {
             true => At::Pair(s, o),
@@ -794,16 +796,16 @@ impl Run {
                 });
             }
             (Some(s), None) => {
-                for &(_, o) in self.so.range(s).flatten() {
-                    if !f(at(s, o)) {
+                for pairs in self.so.range(s) {
+                    if !in_runs(pairs, f, |(_, o)| at(s, o)) {
                         return;
                     }
                 }
             }
             (None, Some(o)) => match &self.os {
                 Some(os) => {
-                    for &(_, s) in os.range(o).flatten() {
-                        if !f(at(s, o)) {
+                    for pairs in os.range(o) {
+                        if !in_runs(pairs, f, |(_, s)| at(s, o)) {
                             return;
                         }
                     }
@@ -814,20 +816,20 @@ impl Run {
                     if self.len() > 0 {
                         missed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                    for &(s, other) in self.so.iter() {
-                        let at = match other == o {
+                    for pairs in &self.so.chunks {
+                        let read = |(s, other): Pair| match other == o {
                             true => at(s, o),
                             false => At::Skip,
                         };
-                        if !f(at) {
+                        if !in_runs(pairs, f, read) {
                             return;
                         }
                     }
                 }
             },
             (None, None) => {
-                for &(s, o) in self.so.iter() {
-                    if !f(at(s, o)) {
+                for pairs in &self.so.chunks {
+                    if !in_runs(pairs, f, |(s, o)| at(s, o)) {
                         return;
                     }
                 }
@@ -914,13 +916,13 @@ impl Run {
 
     /// [`Run::scan`] without the pairs `marks` marks: each slice's positions handed on
     /// ahead ([`At::Ahead`], the marked ones included), its pairs, then [`At::Settle`].
-    fn scan_unmarked(
+    fn scan_unmarked<F: FnMut(At) -> bool>(
         &self,
         s: Option<u64>,
         o: Option<u64>,
         marks: &Marks,
         missed: &std::sync::atomic::AtomicU64,
-        f: &mut dyn FnMut(At) -> bool,
+        f: &mut F,
     ) {
         if marks.all {
             return;
@@ -928,21 +930,30 @@ impl Run {
         let mut slices = Slices::new();
         if self.matching_unmarked(s, o, marks, &mut slices) {
             for slice in &slices {
-                if !f(At::Ahead(slice.pairs.len())) {
-                    return;
-                }
-                let mut going = true;
-                slice.for_each(|(a, b)| {
-                    // Stopped by a read of `f`'s: the rest of the slice is passed over.
-                    if going {
-                        going = f(match slice.swapped {
-                            true => At::Pair(b, a),
-                            false => At::Pair(a, b),
-                        });
+                // A slice is handed on in pieces of at most POLL_UNITS positions, each
+                // counted ahead: a chunk (up to CHUNK_PAIRS, 1 << 20) counted at once was
+                // one poll for all of it.
+                let len = slice.pairs.len();
+                let mut start = 0;
+                while start < len {
+                    let end = len.min(start + RUN);
+                    if !f(At::Ahead(end - start)) {
+                        return;
                     }
-                });
-                if !going || !f(At::Settle) {
-                    return;
+                    let mut going = true;
+                    slice.for_each_in(start..end, |(a, b)| {
+                        // Stopped by a read of `f`'s: the rest of the piece is passed over.
+                        if going {
+                            going = f(match slice.swapped {
+                                true => At::Pair(b, a),
+                                false => At::Pair(a, b),
+                            });
+                        }
+                    });
+                    if !going || !f(At::Settle) {
+                        return;
+                    }
+                    start = end;
                 }
             }
             return;
@@ -1038,6 +1049,9 @@ impl<'a> Slice<'a> {
         }
     }
 
+    /// [`Self::for_each_in`] over the whole slice (the chunk tests' reads; the store reads a
+    /// slice a run at a time).
+    #[cfg(test)]
     fn for_each(&self, f: impl FnMut(Pair)) {
         self.for_each_in(0..self.pairs.len(), f);
     }
@@ -1062,6 +1076,36 @@ enum At {
     Skip,
     Ahead(usize),
     Settle,
+}
+
+/// The longest run of positions (or copies, or probes) a read counts ahead at once: REAS-2's
+/// bound on the work after a stop is `POLL_UNITS` plus one run, so a run never exceeds
+/// `POLL_UNITS` ([`in_runs`], [`Run::scan_unmarked`], `Equality::run`'s and `list`'s
+/// products).
+const RUN: usize = nrese_exec::POLL_UNITS as usize;
+
+/// Hands `pairs` to `f` a run of at most [`RUN`] positions at a time, each run counted
+/// ahead ([`At::Ahead`], then each position as `read` makes it, then [`At::Settle`]):
+/// one count per run, not per position; false once `f` returns false.
+fn in_runs<F: FnMut(At) -> bool>(
+    pairs: &[Pair],
+    f: &mut F,
+    mut read: impl FnMut(Pair) -> At,
+) -> bool {
+    for run in pairs.chunks(RUN) {
+        if !f(At::Ahead(run.len())) {
+            return false;
+        }
+        for &pair in run {
+            if !f(read(pair)) {
+                return false;
+            }
+        }
+        if !f(At::Settle) {
+            return false;
+        }
+    }
+    true
 }
 
 /// What a relation's positions are, to the store's reader `visit`: `p`'s facts.
@@ -1275,7 +1319,7 @@ impl Relation {
 
     /// Hands every position matching the bound positions in `seg` to `f`, as its runs visit
     /// them ([`Run::scan`]); ends once `f` returns false.
-    fn scan(&self, s: Option<u64>, o: Option<u64>, seg: Seg, f: &mut dyn FnMut(At) -> bool) {
+    fn scan<F: FnMut(At) -> bool>(&self, s: Option<u64>, o: Option<u64>, seg: Seg, f: &mut F) {
         let all = |_: u64, _: u64| true;
         let missed = &self.missed;
         match seg {
@@ -1955,7 +1999,7 @@ impl Equality {
     /// each fact's three classes and their product of probes (sweep M10). Stopped, its
     /// state (`partners`) may be part-read: the module belongs to the operation, which ends
     /// with the stop.
-    pub(crate) fn run<S: Source + ?Sized>(
+    pub(crate) fn run<S: Visits + ?Sized>(
         &mut self,
         store: &S,
         operation: &OperationStop<'_>,
@@ -2068,19 +2112,24 @@ impl Equality {
                             self.members(store, o, poll),
                         );
                         let bound = copies_at_most([&ms, &mp, &mo]);
-                        // The product of its classes, a probe each: stopped, it ends there
-                        // (sol-loop r1 S1), and the operation ends with what it made.
+                        // The product of its classes, a probe each, counted ahead a run of at
+                        // most POLL_UNITS objects at a time ([`Visit::ahead`]'s rule): stopped,
+                        // it ends there (sol-loop r1 S1), and the operation ends with what it
+                        // made. A tick and a stop check per probe were a quarter of the read
+                        // layer's cost on replication (REAS-2 timing, p2-reas2-abl-v1).
+                        let probe = Probe::of(poll);
                         append_copies(&mut copies, &mut scratch, bound, |out| {
                             for &s in &ms {
                                 for &p in &mp {
-                                    for &o in &mo {
-                                        let fact = [s, p, o];
-                                        let held = store.contains(fact, poll);
-                                        if poll.stopped() {
+                                    for objects in mo.chunks(RUN) {
+                                        if poll.attempt(objects.len()) {
                                             return;
                                         }
-                                        if !held {
-                                            out.push(fact);
+                                        for &o in objects {
+                                            let fact = [s, p, o];
+                                            if !store.holds(fact, probe) {
+                                                out.push(fact);
+                                            }
                                         }
                                     }
                                 }
@@ -3237,18 +3286,26 @@ fn list(
                                 .unwrap_or(std::slice::from_ref(id))
                         });
                         let bound = copies_at_most([ms, mp, mo]);
-                        // Stopped, the thread makes no more copies.
-                        if poll.as_ref().is_some_and(|poll| !poll.attempt(bound)) {
+                        // Stopped, the thread makes no more copies. A fact's copies are
+                        // counted as they are made, a run of at most POLL_UNITS objects at a
+                        // time ([`Visit::ahead`]'s rule): a product counted whole ran its
+                        // full length past a stop that fired while it was made.
+                        if let Some(poll) = poll.as_ref().filter(|poll| !poll.stopped()) {
                             append_copies(&mut copies, &mut scratch, bound, |out| {
                                 for &s in ms {
                                     for &p in mp {
                                         let relation = store.relation(p);
-                                        for &o in mo {
-                                            let input = relation.is_some_and(|relation| {
-                                                relation.input.contains(s, o)
-                                            });
-                                            if !input {
-                                                out.push([s, p, o]);
+                                        for objects in mo.chunks(RUN) {
+                                            if poll.attempt(objects.len()) {
+                                                return;
+                                            }
+                                            for &o in objects {
+                                                let input = relation.is_some_and(|relation| {
+                                                    relation.input.contains(s, o)
+                                                });
+                                                if !input {
+                                                    out.push([s, p, o]);
+                                                }
                                             }
                                         }
                                     }
@@ -3469,8 +3526,8 @@ mod counted_tests {
 
     /// REAS-2 (orchestrator, 8 Nov 15:54): a closed family's read of a marked delta
     /// ([`Run::scan_unmarked`]) counts a slice's positions ahead, so its reader asks its stop
-    /// within `POLL_UNITS` plus one run, the longest run counted at once: `POLL_UNITS`
-    /// (`Run::scan_unmarked` hands each slice on in pieces of at most `POLL_UNITS`). One
+    /// within `POLL_UNITS` plus one run, the longest run counted at once: [`RUN`], which is
+    /// `POLL_UNITS` (`Run::scan_unmarked` hands each slice on in pieces of at most `RUN`). One
     /// delta chunk of the production chunk size, 1 << 20 pairs ([`CHUNK_PAIRS`]), none of
     /// them marked: counted as one attempt, the whole chunk was one ask. The chunk is built
     /// as one ([`Pairs::whole`]) rather than through [`set_chunk_pairs`], a process-wide
