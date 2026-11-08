@@ -14,6 +14,7 @@ mod graph_search_tests;
 mod lateral_tests;
 mod native_differential_tests;
 mod plan_guard_tests;
+mod pre_bound_delivery_tests;
 mod ql_tests;
 mod resource_tests;
 mod result_cache_tests;
