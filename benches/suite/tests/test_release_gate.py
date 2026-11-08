@@ -13,8 +13,10 @@ host's noise between instances.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 import re
@@ -719,6 +721,38 @@ class DeclaredMetric(unittest.TestCase):
                          [0.2077] * 400)
         # Another statistic of a sampled section is that statistic, not the samples' median.
         self.assertEqual(fast.samples({**self.CASE, "metric": "commits.p99_ms"}, self.result(0.004)), {"_": [0.9461]})
+
+    def test_a_metric_in_seconds_is_a_series_in_milliseconds(self):
+        """Review r1 R1-F1: `commits.whole_s` reached the series in seconds, where the comparison's
+        floors are milliseconds. A metric declared in seconds (`*_s`) is milliseconds in the series,
+        per process and over repeated processes alike; a p50 sample series is as it was."""
+        case = {"name": "rule-delta-sweep", "metric": "commits.whole_s", "tool": "perf_lab"}
+        whole = lambda s: {"commits": {"whole_s": s, "p50_ms": 0.2, "samples_ms": [0.2] * 4}}  # noqa: E731
+        self.assertEqual(fast.samples(case, whole(3.0)), {"_": [3000.0]})
+        self.assertEqual(fast.samples(case, {**whole(3.0), "_repeats": [whole(3.0), whole(3.2)]}), {"_": [3000.0, 3200.0]})
+        self.assertEqual(fast.metric_value(case, whole(3.0)), 3000.0)
+        self.assertEqual(fast.samples({**case, "metric": "commits.p50_ms"}, whole(3.0)), {"_": [0.2] * 4})
+
+    def test_a_600_ms_whole_run_loss_is_a_regression_in_compare(self):
+        """Review r1 R1-F1, the real caller: `fast.py compare` (compare_reports) with its 2 ms floor
+        called 3.0 s -> 3.6 s "slower, below absolute floor" and exited 0. Specified independently: a
+        whole run 600 ms slower, 20 % and far above 2 ms, is a regression."""
+        from suitekit import compare
+        case = {"name": "rule-delta-sweep", "metric": "commits.whole_s", "tool": "perf_lab"}
+
+        def report(seconds):
+            records = []
+            for rep in (1, 2):
+                result = {"commits": {"whole_s": seconds, "p50_ms": 0.2, "samples_ms": [0.2] * 4}}
+                records.append({"case": case["name"], "rep": rep, "status": "ok", "checks": [], "routes": [],
+                                "metric": fast.metric_value(case, result), "samples": fast.samples(case, result)})
+            return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
+                    "started": "2026-11-08T02:00:00", "records": records}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = compare.compare_reports(report(3.0), report(3.6))
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertNotIn("below absolute floor", out.getvalue())
 
     def test_c1_s_read_slowdown_is_a_loss_in_its_family(self):
         """The run's own values, per pass: A 0.004 ms in every block, B 10.371, 9.843 and 10.547 ms."""

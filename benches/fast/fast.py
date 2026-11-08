@@ -1283,7 +1283,16 @@ def cold_ms(result: dict) -> float | None:
     return result["open_s"] * 1000.0 + sum(firsts)
 
 
+def ms_scale(metric: str) -> float:
+    """The factor from a metric's declared unit to the milliseconds every timed series and metric value
+    is in: a field in seconds (its last name ends in `_s`: load_s, open_s, commits.whole_s) times 1000,
+    anything else as it is (review r1 of pkg/declared-metrics, R1-F1: `commits.whole_s` reached the
+    series in seconds, under the comparison's 2 ms floor)."""
+    return 1000.0 if metric.rsplit(".", 1)[-1].endswith("_s") else 1.0
+
+
 def metric_value(case: dict, result: dict):
+    """The case's declared metric in this result, in milliseconds (ms_scale())."""
     case = {**case, "metric": timed_metric(case)}
     if case["metric"] == "cold_ms":
         # With the page cache warm and emptied: the sum of the two modes' medians.
@@ -1292,12 +1301,13 @@ def metric_value(case: dict, result: dict):
             if values:
                 total = (total or 0.0) + statistics.median(values)
         return total
+    scale = ms_scale(case["metric"])
     value = lookup(case["metric"], result)
-    if case["metric"] in ("load_s", "open_s") and value is not None:
-        value = value * 1000.0
-    if "_repeats" in result and case["metric"] in ("load_s", "open_s", "clients.p99_ms", "canonicalize.p50_ms"):
+    if value is not None:
+        value = value * scale
+    if "_repeats" in result and (scale != 1.0 or case["metric"] in ("clients.p99_ms", "canonicalize.p50_ms")):
         values = [lookup(case["metric"], r) for r in result["_repeats"]]
-        values = [v * (1000.0 if case["metric"] in ("load_s", "open_s") else 1.0) for v in values if v is not None]
+        values = [v * scale for v in values if v is not None]
         value = statistics.median(values) if values else value
     return value
 
@@ -1309,7 +1319,7 @@ def samples(case: dict, result: dict) -> dict:
     if result.get("client_sweep"):
         return {f"{level['clients']} clients p99": [level["p99_ms"]] for level in result["client_sweep"]}
     if case.get("sweep") and "_repeats" in result:
-        scale = 1000.0 if metric in ("load_s", "open_s") else 1.0
+        scale = ms_scale(metric)
         series: dict[str, list[float]] = {}
         for r in result["_repeats"]:
             value = lookup(metric, r)
@@ -1344,7 +1354,7 @@ def samples(case: dict, result: dict) -> dict:
         return {"_": [s for r in runs for s in r.get("samples_ms", []) if s is not None]}
     if "_repeats" in result:
         values = [lookup(metric, r) for r in result["_repeats"]]
-        scale = 1000.0 if metric in ("load_s", "open_s") else 1.0
+        scale = ms_scale(metric)
         return {"_": [v * scale for v in values if v is not None]}
     value = metric_value(case, result)
     return {"_": [value]} if value is not None else {}
