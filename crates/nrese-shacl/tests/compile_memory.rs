@@ -219,6 +219,56 @@ fn a_shapes_change_holds_less_than_its_results_messages() {
     assert!(bytes < 4 << 20, "held {bytes} bytes");
 }
 
+/// SYN-56 B: a report holds the terms a query computed once. 64 solutions each bind ?value to
+/// a computed 64 KiB literal (one stored literal and a suffix: no statement holds it), so the
+/// report's values are 4 MiB of text. Decoding moves each value from its result into the
+/// report: the validation holds at most 6 MiB, where a copy beside the results' would hold
+/// more than 8 MiB.
+#[test]
+fn a_report_holds_its_computed_terms_once() {
+    if !measure::alone() {
+        return;
+    }
+    let rows: Vec<String> = (0..64).map(|i| format!("ex:s{i} ex:q ex:o{i} .")).collect();
+    let turtle = format!(
+        "@prefix ex: <http://example.com/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+         ex:a ex:big \"{}\" . {}
+         ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select \"\"\"
+           SELECT $this (CONCAT(?big, \"!\") AS ?value) WHERE {{
+             $this <http://example.com/big> ?big .
+             ?x <http://example.com/q> ?o }}\"\"\" ] .",
+        "x".repeat(64 << 10),
+        rows.join(" ")
+    );
+    let snapshot = load(&turtle);
+    let graph = snapshot
+        .lookup(NamedNodeRef::new_unchecked(SHAPES).into())
+        .expect("the shapes graph");
+    let shapes =
+        compile(&snapshot, Selection::asserted(GraphSelector::Exact(graph))).expect("shapes");
+    // The data is the same graph as the shapes.
+    let data = Selection::of(GraphSelector::Exact(graph));
+    let resources = nrese_sparql::Resources::default();
+    // Once outside the measurement: what reading builds lazily is the snapshot's.
+    drop(nrese_shacl::validate(&snapshot, &shapes, data, &resources).expect("affordable"));
+    let (outcome, bytes) = measure::measure(|| {
+        nrese_shacl::validate(&snapshot, &shapes, data, &resources).map(|report| {
+            let long = report
+                .results
+                .iter()
+                .filter(|result| {
+                    matches!(&result.value, Some(nrese_rdf::Term::Literal(value))
+                        if value.value().len() == (64 << 10) + 1)
+                })
+                .count();
+            (report.results.len(), long)
+        })
+    });
+    eprintln!("a report of 64 computed 64 KiB values held at most {bytes} bytes: {outcome:?}");
+    assert!(matches!(outcome, Ok((64, 64))), "{outcome:?}");
+    assert!(bytes < 6 << 20, "held {bytes} bytes");
+}
+
 /// Doubling the values of each parameter at most doubles what compiling the shapes holds at
 /// once (it adds as many statements); built once per combination, it would hold eight times
 /// as much.
