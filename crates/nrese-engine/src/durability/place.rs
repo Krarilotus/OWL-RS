@@ -52,33 +52,64 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Creates the directory `dir` and every missing directory above it, each durably named: once
-/// one is made, the directory holding it is synced (`.` for a relative name with no parent),
-/// as a sync makes the entries in a directory durable, not its own name (review r1, R1-F2).
-/// Directories that exist are left as they are. A sync that fails fails the call.
+/// Creates the directory `dir` and every missing directory above it, each durably named (review
+/// r1, R1-F2): for every level of the path, made now or found, the directory holding it is
+/// synced (`.` for a relative name with no parent), as a sync makes the entries in a directory
+/// durable, not its own name. A level found can't be taken as durably named: another attempt
+/// whose sync failed, or another process still on its way to the sync, may have just made it
+/// (sol-loop on review r1, S1).
+/// - A sync that fails fails the call, and the levels this call made are removed again (they
+///   are empty), so a retry makes and syncs them anew.
+/// - One exception: a level found whose holder this process may not open for the sync
+///   (`PermissionDenied`) is left as it is. Nothing more can be done for its name here, and
+///   refusing would close every store beneath it.
 pub fn create_dir_all(dir: &Path) -> std::io::Result<()> {
-    let mut missing = Vec::new();
-    let mut at = dir;
-    while !at.as_os_str().is_empty() && !at.is_dir() {
-        missing.push(at);
-        match at.parent() {
-            Some(parent) => at = parent,
-            None => break,
+    let mut made = Vec::new();
+    let named = name_levels(dir, &mut made);
+    if named.is_err() {
+        // Deepest first; one that isn't empty any more stays.
+        for level in made.iter().rev() {
+            let _ = fs::remove_dir(level);
         }
     }
-    for created in missing.into_iter().rev() {
-        match fs::create_dir(created) {
+    named
+}
+
+/// [`create_dir_all`]'s levels, outermost first; those it makes are pushed to `made`.
+fn name_levels<'a>(dir: &'a Path, made: &mut Vec<&'a Path>) -> std::io::Result<()> {
+    let levels: Vec<&Path> = dir
+        .ancestors()
+        .filter(|level| !level.as_os_str().is_empty())
+        .collect();
+    for &level in levels.iter().rev() {
+        // The root (or a Windows prefix) is held by nothing.
+        let Some(holder) = level.parent() else {
+            continue;
+        };
+        let holder = match holder.as_os_str().is_empty() {
+            true => Path::new("."),
+            false => holder,
+        };
+        // Found levels aren't made again (an ancestor may be one this process can't write).
+        let new = !level.is_dir()
+            && match fs::create_dir(level) {
+                Ok(()) => true,
+                // Made meanwhile by someone else.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists && level.is_dir() =>
+                {
+                    false
+                }
+                Err(error) => return Err(error),
+            };
+        if new {
+            made.push(level);
+        }
+        match sync_dir(holder) {
             Ok(()) => {}
-            // Made meanwhile by someone else: its name still needs the sync below.
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && created.is_dir() => {
-            }
+            Err(error) if !new && error.kind() == std::io::ErrorKind::PermissionDenied => {}
             Err(error) => return Err(error),
         }
-        let holding = match created.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent,
-            _ => Path::new("."),
-        };
-        sync_dir(holding)?;
     }
     Ok(())
 }
