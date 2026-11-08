@@ -157,6 +157,9 @@ pub(crate) struct Durable {
     pub(crate) wal: Mutex<Wal>,
     pub(crate) checkpoint_slot: Mutex<()>,
     pub(crate) config: DurabilityConfig,
+    /// Set once the names a reopen left pending are synced ([`Self::settle_names`]): read
+    /// without the WAL's lock, so the log is served without taking it after that.
+    names_settled: std::sync::atomic::AtomicBool,
     _lock: lock::StoreLock,
 }
 
@@ -177,9 +180,22 @@ impl Durable {
         policy: &CompactionPolicy,
         config: DurabilityConfig,
     ) -> EngineResult<Recovered> {
-        // Durably named, every new level of it (review r1, R1-F2): commits acknowledged in it
-        // must not lose the directory that holds them.
-        place::create_dir_all(root)?;
+        // Durably named, every level of it (review r1, R1-F2): commits acknowledged in it must
+        // not lose the directory that holds them. A root found: its holders' syncs are left to
+        // the first durable write that relies on them (`Wal::settle_names`), as the first sync
+        // an open does costs it a journal commit and a device flush (timing of 8 Nov,
+        // deferred-sync design note). A root made: every level now, as a new store pays once.
+        let found = root.is_dir();
+        let holders: Vec<PathBuf> = match found {
+            true => place::holders(root),
+            false => {
+                place::create_dir_all(root)?;
+                Vec::new()
+            }
+        };
+        // Whether the open changes the store on disk: then what it changed, and the names
+        // with it, are synced before it returns, as before.
+        let mut changed = !found;
         let lock = lock::StoreLock::acquire(root)?;
         checkpoint::remove_temporaries(root)?;
         crate::engine::spill::remove_leftovers(root)?;
@@ -245,11 +261,12 @@ impl Durable {
         );
 
         let wal_dir = wal::wal_dir(root);
-        // Named in the root, durably named above: the root's sync after replay names them.
-        place::create_store_dir(&wal_dir)?;
+        // Named in the root: the root's sync after replay (or before the first durable write)
+        // names them.
+        changed |= place::create_store_dir(&wal_dir)?;
         let archive = config.wal_archive.then(|| wal::archive_dir(root));
         if let Some(archive) = &archive {
-            place::create_store_dir(archive)?;
+            changed |= place::create_store_dir(archive)?;
         }
         let segments = wal::list_segments(&wal_dir)?;
         let last = segments.len().checked_sub(1);
@@ -426,8 +443,11 @@ impl Durable {
                     }
                 }
                 wal::truncate_segment(path, at)?;
+                changed = true;
             }
         }
+        // A point-in-time cut removed or truncated segments.
+        changed |= cut;
 
         if let Some(until) = config.recover_until
             && version.revision < until
@@ -442,11 +462,18 @@ impl Durable {
         // when the process died), and new commits may go to a segment after them. A
         // checkpoint renamed just before the crash, and segments removed or cut, likewise. The
         // root's sync also names the WAL's directory and the archive, found in it above.
+        // - What was replayed is synced now: no reader sees content a power loss could undo.
+        // - The names (the root's holders, the WAL's directory, the root) are synced now if the
+        //   open changed the store; otherwise before the first durable write that relies on
+        //   them: a commit's record, a checkpoint, a bulk publication, the log served to a
+        //   follower (`Wal::settle_names`). Nothing is acknowledged before they are durable.
         for path in &replayed {
             place::sync_file(path)?;
         }
-        sync_dir(&wal_dir)?;
-        sync_dir(root)?;
+        let mut pending = wal::PendingNames::new(holders, [wal_dir.clone(), root.to_path_buf()]);
+        if changed {
+            pending.settle()?;
+        }
         let integers_in_dictionary = integers_in_dictionary.unwrap_or(false);
         dictionary.set_integers_in_dictionary(integers_in_dictionary);
         let wal = Wal::open(
@@ -456,6 +483,7 @@ impl Durable {
             config.sync,
             integers_in_dictionary,
             archive,
+            pending,
         )?;
         Ok(Recovered {
             durable: Self {
@@ -463,6 +491,7 @@ impl Durable {
                 wal: Mutex::new(wal),
                 checkpoint_slot: Mutex::new(()),
                 config,
+                names_settled: std::sync::atomic::AtomicBool::new(false),
                 _lock: lock,
             },
             clock: store_clock.max(version.committed_micros.unwrap_or(0)),
@@ -472,6 +501,19 @@ impl Durable {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Syncs the names the open left pending (`Wal::settle_names`), for what relies on them
+    /// without appending: the log served to a follower. Takes the WAL's lock only until they
+    /// are settled; holds no other lock (call it before taking any).
+    pub(crate) fn settle_names(&self) -> EngineResult<()> {
+        use std::sync::atomic::Ordering;
+        if self.names_settled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.wal.lock().settle_names()?;
+        self.names_settled.store(true, Ordering::Release);
+        Ok(())
     }
 }
 
