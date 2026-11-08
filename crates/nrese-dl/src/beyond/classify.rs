@@ -136,13 +136,13 @@ pub fn classify(o: &Ontology, options: &Options, with: &classify::Options) -> Cl
     let deadline = options.timeout.map(|t| std::time::Instant::now() + t);
     let decision = consistency(o, options);
     let classes = crate::context::signature(o);
-    match &decision.verdict {
+    // The whole input's verdict, whatever the DL part's classification says of its part.
+    let consistency = decision.verdict.consistency();
+    let mut out = match &decision.verdict {
         Verdict::Inconsistent { .. } => Classified {
             classification: Classification {
-                classes: classes.clone(),
-                unsatisfiable: classes,
-                consistent: false,
-                ..Classification::default()
+                unsatisfiable: classes.clone(),
+                ..Classification::new(classes, consistency.clone())
             },
             exact: true,
             why: vec!["inconsistent: every class is unsatisfiable".into()],
@@ -215,7 +215,9 @@ pub fn classify(o: &Ontology, options: &Options, with: &classify::Options) -> Cl
                 decision,
             }
         }
-    }
+    };
+    out.classification.consistency = consistency;
+    out
 }
 
 /// A term for a fresh anonymous individual (a witness): far from any store's ids and from

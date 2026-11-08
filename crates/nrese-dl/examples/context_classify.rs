@@ -25,6 +25,7 @@ use std::io::{BufRead, BufWriter, Write};
 use std::time::{Duration, Instant};
 
 use nrese_dl::context::{self, Classification, Options, Strategy};
+use nrese_dl::verdict::Verdict;
 use nrese_owl::{Statement, Term, TermKind, Terms};
 use nrese_rdf_io::{RdfFormat, RdfParser};
 
@@ -193,12 +194,12 @@ fn el_view(el: &nrese_reasoner::classify::Classification, ours: &Classification)
         classes: ours.classes.clone(),
         subsumptions: el.subsumptions.clone(),
         unsatisfiable: el.unsatisfiable.clone(),
-        top: if ours.consistent {
-            el.top.clone()
-        } else {
+        top: if ours.consistency == Verdict::Inconsistent {
             Vec::new()
+        } else {
+            el.top.clone()
         },
-        consistent: ours.consistent,
+        consistency: ours.consistency.clone(),
     }
 }
 
@@ -257,12 +258,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let write = started.elapsed();
     eprintln!(
-        "{} triples; {} classes, {} subsumptions, {} unsatisfiable, consistent {}",
+        "{} triples; {} classes, {} subsumptions, {} unsatisfiable, {}",
         triples.len(),
         ours.classes.len(),
         ours.subsumptions.len(),
         ours.unsatisfiable.len(),
-        ours.consistent
+        ours.consistency.as_str()
     );
     if let Some(el) = &el_result {
         let theirs = el_view(el, &ours);

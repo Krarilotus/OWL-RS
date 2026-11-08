@@ -50,6 +50,52 @@ pub fn materialise_within(
     stop: crate::eval::Stop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<Closure, delta::Interrupted> {
+    closure_within(program, snapshot, stop, memory, None)
+}
+
+/// [`materialise_within`], with the derived facts no store can hold (a literal subject, a
+/// non-IRI predicate) appended to `unstorable`, for a first load that reports them
+/// ([`super::maintain`]). Nothing else keeps them: a rematerialisation would hold them
+/// through its heap's peak.
+pub(super) fn materialise_with_unstorable_within(
+    program: &Program,
+    snapshot: &Snapshot,
+    stop: crate::eval::Stop<'_>,
+    memory: &Arc<Budget>,
+    unstorable: &mut Vec<Triple>,
+) -> Result<Closure, delta::Interrupted> {
+    closure_within(program, snapshot, stop, memory, Some(unstorable))
+}
+
+impl Program {
+    /// Whether the closure of the axioms alone concludes only facts a store can hold, read
+    /// from `empty`, a snapshot with no asserted statement: then each such fact a first
+    /// load's closure holds is new to the state (review r1 F1, [`super::maintain`]).
+    /// Computed once for the program; `Err` if `stop` fired first. The axioms' own
+    /// violations are those of the state before: charged to `memory` while it runs.
+    pub(super) fn axioms_conclude_only_storable(
+        &self,
+        empty: &Snapshot,
+        stop: crate::eval::Stop<'_>,
+        memory: &Arc<Budget>,
+    ) -> Result<bool, delta::Interrupted> {
+        if let Some(&known) = self.axioms_storable.get() {
+            return Ok(known);
+        }
+        debug_assert_eq!(empty.len_in(ReadModel::Asserted), 0);
+        let mut unstorable = Vec::new();
+        closure_within(self, empty, stop, memory, Some(&mut unstorable))?;
+        Ok(*self.axioms_storable.get_or_init(|| unstorable.is_empty()))
+    }
+}
+
+fn closure_within(
+    program: &Program,
+    snapshot: &Snapshot,
+    stop: crate::eval::Stop<'_>,
+    memory: &Arc<Budget>,
+    mut unstorable: Option<&mut Vec<Triple>>,
+) -> Result<Closure, delta::Interrupted> {
     nrese_exec::heap::phase("reasoner: input");
     let (input, axioms) = input_of(program, snapshot);
     let schema = program.schema_for(snapshot);
@@ -98,14 +144,13 @@ pub fn materialise_within(
     // At its exact size: collected by doubling, the list held up to twice the facts, and
     // at a doubling three times, beside them (LUBM 1000: 6.6 GB at this step's peak).
     let mut inferred = Vec::with_capacity(result.derived.len() + axioms.len());
-    inferred.extend(
-        result
-            .derived
-            .into_iter()
-            .chain(axioms)
-            .filter(|&t| storable(t))
-            .map(encode),
-    );
+    for t in result.derived.into_iter().chain(axioms) {
+        if storable(t) {
+            inferred.push(encode(t));
+        } else if let Some(unstorable) = unstorable.as_deref_mut() {
+            unstorable.push(t);
+        }
+    }
     Ok(Closure {
         inferred,
         violations,

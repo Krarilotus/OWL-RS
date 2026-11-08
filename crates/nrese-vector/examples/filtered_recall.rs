@@ -4,6 +4,7 @@
 //!
 //!   cargo run --release -p nrese-vector --example filtered_recall [items] [queries] [dim]
 
+use nrese_exec::Budget;
 use nrese_vector::{Hnsw, HnswParameters, Metric, Vectors, exact, merge};
 
 struct Rng(u64);
@@ -38,7 +39,10 @@ fn probe_first(
     let mut fetched_total = 0;
     loop {
         let beam = ((ef.max(k) as f64) / share).ceil() as usize;
-        let hits = graph.search(vectors, query, k, beam, &|_| true);
+        let hits = graph
+            .search(vectors, query, k, beam, &|_| true, &Budget::unlimited())
+            .unwrap()
+            .to_vec();
         fetched_total += hits.len();
         for hit in &hits {
             if accept(hit.id) && !kept.iter().any(|&(_, id)| id == hit.id) {
@@ -80,17 +84,37 @@ fn main() {
     };
     for _ in 0..queries {
         let query: Vec<f32> = (0..dim).map(|_| rng.unit()).collect();
-        let truth_all: Vec<u64> = exact(&vectors, &query, K, Metric::Cosine, &|_| true)
-            .iter()
-            .map(|h| h.id)
-            .collect();
-        let truth: Vec<u64> = exact(&vectors, &query, K, Metric::Cosine, &filter)
-            .iter()
-            .map(|h| h.id)
-            .collect();
+        let truth_all: Vec<u64> = exact(
+            &vectors,
+            &query,
+            K,
+            Metric::Cosine,
+            &|_| true,
+            &Budget::unlimited(),
+        )
+        .unwrap()
+        .to_vec()
+        .iter()
+        .map(|h| h.id)
+        .collect();
+        let truth: Vec<u64> = exact(
+            &vectors,
+            &query,
+            K,
+            Metric::Cosine,
+            &filter,
+            &Budget::unlimited(),
+        )
+        .unwrap()
+        .to_vec()
+        .iter()
+        .map(|h| h.id)
+        .collect();
         for ef in [64usize, 256, 1024] {
             let got: Vec<u64> = graph
-                .search(&vectors, &query, K, ef, &|_| true)
+                .search(&vectors, &query, K, ef, &|_| true, &Budget::unlimited())
+                .unwrap()
+                .to_vec()
                 .iter()
                 .map(|h| h.id)
                 .collect();
@@ -128,7 +152,10 @@ fn main() {
                 K,
                 ((64.0 / share).ceil()) as usize,
                 &filter,
+                &Budget::unlimited(),
             )
+            .unwrap()
+            .to_vec()
             .iter()
             .map(|h| h.id)
             .collect();
@@ -138,18 +165,28 @@ fn main() {
             &truth,
             K,
         );
-        let first = graph.search(
-            &vectors,
-            &query,
-            (K as f64 / share) as usize * 2,
-            ((64.0 / share).ceil()) as usize,
-            &|_| true,
-        );
+        let first = graph
+            .search(
+                &vectors,
+                &query,
+                (K as f64 / share) as usize * 2,
+                ((64.0 / share).ceil()) as usize,
+                &|_| true,
+                &Budget::unlimited(),
+            )
+            .unwrap()
+            .to_vec();
         let fetched = first.len();
-        let got: Vec<u64> = merge(first.into_iter().filter(|h| filter(h.id)), K)
-            .iter()
-            .map(|h| h.id)
-            .collect();
+        let got: Vec<u64> = merge(
+            first.into_iter().filter(|h| filter(h.id)),
+            K,
+            &Budget::unlimited(),
+        )
+        .unwrap()
+        .to_vec()
+        .iter()
+        .map(|h| h.id)
+        .collect();
         add(
             "F probe-first, one round of 2k/share, beam 64/share",
             &got,

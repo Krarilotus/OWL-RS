@@ -173,7 +173,7 @@ fn functionality_over_asserted_edges_is_never_left_out() {
         }
         let answer = classify(&b.done(), 1);
         assert!(
-            !matches!(&answer, Ok(c) if c.consistent),
+            !matches!(&answer, Ok(c) if c.consistency == nrese_dl::verdict::Verdict::Consistent),
             "b ≠ c asserted: {different}: {answer:?}"
         );
     }

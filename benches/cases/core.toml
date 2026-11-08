@@ -1914,6 +1914,32 @@ systems = ["nemo:owl2-rl", "graphdb:owl2-rl", "qlever:rewritten", "oxigraph:rewr
 guards = ["Store-2: equality by class ids; a deletion splits a class (B/F style)"]
 rewrite = "not-expressible"
 [[case]]
+name = "first-load-chain"
+area = "maintenance"
+what = "a first commit into an empty store: a 250-class subclass chain and 400 members of its last class, as one INSERT DATA (DMW's A/B chain; 21 Oct 2026: the repository route held 854-862 MiB VmHWM, main 518-558)"
+semantics = "owl2-rl"
+data = "first-load classes=250 individuals=400"
+args = ["--reason", "owl2-rl", "--commits", "{data}.commits.ru"]
+queries = "first-load"
+metric = "commits.p50_ms"
+check = { "closure_after_commits.equal" = "true", "q.members.value" = "expect.members" }
+cap_gb = 4
+repeat = 5
+systems = []
+[[case]]
+name = "first-load-chain-ranged"
+area = "maintenance"
+what = "first-load-chain plus a ranged property with one literal value, whose conclusion (the literal's type) no store holds (PR #46 review r1 F1: such a load ran the batch, dropped it and ran the delta executor)"
+semantics = "owl2-rl"
+data = "first-load classes=250 individuals=400 ranged=1"
+args = ["--reason", "owl2-rl", "--commits", "{data}.commits.ru"]
+queries = "first-load"
+metric = "commits.p50_ms"
+check = { "closure_after_commits.equal" = "true", "q.members.value" = "expect.members" }
+cap_gb = 4
+repeat = 5
+systems = []
+[[case]]
 name = "deletes-tail"
 area = "maintenance"
 what = "3,000 people of the data deleted one per commit under OWL 2 RL: the tail of deletion latency (p99)"
@@ -1955,6 +1981,36 @@ metric = "sum_p50_ms"
 check = {}
 route = {}
 cap_gb = 4
+systems = []
+
+[[case]]
+name = "parse-turtle-flat"
+area = "parse"
+what = "the Turtle parser alone, one thread, from memory: 1 M flat IRI triples (250,000 subjects, four each, no brackets), the parser's per-token cost"
+semantics = "none"
+data = "turtle entities=250000 nested=0"
+tool_loads = false
+args = ["--parse-turtle", "{data}", "--runs", "5"]
+queries = ""
+metric = "parse_turtle.p50_ms"
+check = { "parse_turtle.quads" = "expect.statements" }
+route = {}
+cap_gb = 2
+systems = []
+
+[[case]]
+name = "parse-turtle-nested"
+area = "parse"
+what = "the Turtle parser alone, one thread, from memory: 1.3 M triples from 100,000 statements each using every bracket ([ ], ( ), <<( )>>, << >>, {| |}), the parser's cost per nested span"
+semantics = "none"
+data = "turtle entities=100000 nested=1"
+tool_loads = false
+args = ["--parse-turtle", "{data}", "--runs", "5"]
+queries = ""
+metric = "parse_turtle.p50_ms"
+check = { "parse_turtle.quads" = "expect.statements" }
+route = {}
+cap_gb = 2
 systems = []
 
 [[case]]
@@ -2251,6 +2307,59 @@ cap_gb = 6
 systems = []
 home_turf = "virtuoso"
 
+# Background checkpoints overlapping reads and commits (IB0024 fix check F1): a checkpoint
+# runs as a job of the global pool, its file writing on one of its threads. A durable store,
+# 5,000 commits under 8 readers, a checkpoint asked for every 128 KiB of log (a count at
+# 10,000 commits and 1 MiB wrote 2: about 1.2 MiB of log here, 8 to 10 asked); the check makes
+# sure checkpoints were written during them. Readers at the host's width and on a pool of
+# one thread (where the checkpoint's thread is the pool's only one), commits at the host's;
+# each case has a store of its own: a sweep would replay the same commits on a store they
+# changed.
+[[case]]
+name = "checkpoint-under-readers"
+area = "concurrency"
+what = "5,000 commits on a durable store under 8 readers, background checkpoints every 128 KiB of log, the host's pool width: read latency (p99) while checkpoints are written"
+semantics = "none"
+data = "churn people=200000 changes=2500"
+setup = ["--store", "{scratch}/store", "--load", "{data}"]
+args = ["--store", "{scratch}/store", "--commits", "{data}.commits.ru", "--readers", "8", "--checkpoint-after-wal-bytes", "131072"]
+queries = "churn"
+metric = "commits.read_p99_ms"
+check = { "commits.commits" = 5000, "commits.checkpoints" = ">= 4" }
+route = {}
+cap_gb = 6
+systems = []
+
+[[case]]
+name = "checkpoint-under-readers-commits"
+area = "concurrency"
+what = "checkpoint-under-readers timed by its commits: write latency (p99) while background checkpoints are written, the host's pool width"
+semantics = "none"
+data = "churn people=200000 changes=2500"
+setup = ["--store", "{scratch}/store", "--load", "{data}"]
+args = ["--store", "{scratch}/store", "--commits", "{data}.commits.ru", "--readers", "8", "--checkpoint-after-wal-bytes", "131072"]
+queries = "churn"
+metric = "commits.p99_ms"
+check = { "commits.commits" = 5000, "commits.checkpoints" = ">= 4" }
+route = {}
+cap_gb = 6
+systems = []
+
+[[case]]
+name = "checkpoint-under-readers-w1"
+area = "concurrency"
+what = "checkpoint-under-readers on a pool of one thread: the checkpoint's thread is the pool's only one"
+semantics = "none"
+data = "churn people=200000 changes=2500"
+setup = ["--store", "{scratch}/store", "--load", "{data}"]
+args = ["--store", "{scratch}/store", "--commits", "{data}.commits.ru", "--readers", "8", "--checkpoint-after-wal-bytes", "131072", "--threads", "1"]
+queries = "churn"
+metric = "commits.read_p99_ms"
+check = { "commits.commits" = 5000, "commits.checkpoints" = ">= 4" }
+route = {}
+cap_gb = 6
+systems = []
+
 [[case]]
 name = "cache-replay"
 area = "cache"
@@ -2340,6 +2449,26 @@ systems = []
 guards = ["DL in the store (owl2-dl): a commit's consistency proved by the upper bound U1"]
 
 [[case]]
+name = "dlmode-commits-readers"
+area = "maintenance"
+what = "4,000 owl2-dl commits over a schema outside OWL 2 RL (a union on the right), 8 readers alongside, each read taking the bounds' view of the latest revision: U1's change and install against its reads; the last commit, inconsistent only under OWL 2 DL, is rejected"
+semantics = "owl2-dl"
+# `violate=2`'s union keeps the ontology outside OWL 2 RL, so U1 is compiled and each commit
+# maintains it (the RL schema alone routes every commit to the RL rules, with no U1).
+data = "churn people=20000 changes=2000 violate=2"
+args = ["--reason", "owl2-dl", "--commits", "{data}.commits.ru", "--readers", "8"]
+queries = "churn"
+# The whole run: commits and reads that wait for each other show in it (a commit's tail, a
+# read's stall), where one commit's p50 doesn't.
+metric = "commits.whole_s"
+check = { "commits.commits" = 4000, "commits.error" = "has inconsistent under OWL 2 DL" }
+# Only the DL gate rejects the last commit: the ontology took the U1 route, not the RL one.
+route = { "commits.error" = "has touched-islands" }
+cap_gb = 4
+systems = []
+guards = ["U1's locks are leaves: no read waits for a commit's change of U1, no install for a read's build (SYN-22, P2-C6b)"]
+
+[[case]]
 name = "dlmode-commits-small"
 area = "maintenance"
 what = "400 commits under owl2-dl on a tenth of dlmode-commits' data: a commit's fixed cost of the DL check (PR #30's and #37's timing)"
@@ -2377,7 +2506,7 @@ data = "horn classes=3000"
 args = ["--classify", "--runs", "1"]
 queries = ""
 metric = "classification.max_ms"
-check = { "classification.consistent" = "true", "classification.subsumptions" = 1161634 }
+check = { "classification.consistency" = "consistent", "classification.subsumptions" = 1161634 }
 route = { "classification.engine" = "== context-core" }
 cap_gb = 6
 systems = ["hermit:dl", "konclude:dl"]
@@ -2392,7 +2521,7 @@ data = "dl-number n=24 individuals=100"
 args = ["--classify", "--runs", "1"]
 queries = ""
 metric = "classification.max_ms"
-check = { "classification.consistent" = "true", "classification.subsumptions" = 2 }
+check = { "classification.consistency" = "consistent", "classification.subsumptions" = 2 }
 route = { "classification.engine" = "== tableau" }
 cap_gb = 6
 systems = ["hermit:dl", "konclude:dl"]
