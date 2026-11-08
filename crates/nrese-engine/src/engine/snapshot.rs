@@ -1544,8 +1544,9 @@ impl Snapshot {
         // Which reads the walk answers is decided before the list kept: a stored read of
         // this version keeps one under the same key.
         let (plan, bound) = self.group_plan(model, &read, permutation)?;
+        let reader = self.reads.as_ref().map(|reads| Arc::clone(&reads.budget));
         self.statistics
-            .heavy_groups(self.data(model), model, read, permutation, min, |budget| {
+            .heavy_groups(self, model, (read, permutation, min), reader, |budget| {
                 self.heavy_groups_walked(model, &plan, bound, min, budget)
             })
     }
@@ -1707,38 +1708,36 @@ impl Snapshot {
         {
             return None;
         }
-        self.statistics
-            .node_count(&self.version, model, graphs, || {
-                let (pattern, by_subject, by_object) = match graphs {
-                    GraphSelector::Exact(graph) => (
-                        QuadPattern::in_graph(graph),
-                        Permutation::Gspo,
-                        Permutation::Gosp,
-                    ),
-                    _ => (QuadPattern::all(), Permutation::Spog, Permutation::Ospg),
-                };
-                let distinct = |permutation| -> Option<Vec<TermId>> {
-                    let counts = self.group_counts_in(model, &pattern, permutation)?;
-                    Some(counts.into_iter().map(|(id, _)| id).collect())
-                };
-                let (subjects, objects) =
-                    rayon::join(|| distinct(by_subject), || distinct(by_object));
-                let (subjects, objects) = (subjects?, objects?);
-                // |S ∪ O| by a merge of the two sorted lists.
-                let (mut i, mut j, mut both) = (0, 0, 0u64);
-                while i < subjects.len() && j < objects.len() {
-                    match subjects[i].cmp(&objects[j]) {
-                        std::cmp::Ordering::Less => i += 1,
-                        std::cmp::Ordering::Greater => j += 1,
-                        std::cmp::Ordering::Equal => {
-                            both += 1;
-                            i += 1;
-                            j += 1;
-                        }
+        self.statistics.node_count(self, model, graphs, || {
+            let (pattern, by_subject, by_object) = match graphs {
+                GraphSelector::Exact(graph) => (
+                    QuadPattern::in_graph(graph),
+                    Permutation::Gspo,
+                    Permutation::Gosp,
+                ),
+                _ => (QuadPattern::all(), Permutation::Spog, Permutation::Ospg),
+            };
+            let distinct = |permutation| -> Option<Vec<TermId>> {
+                let counts = self.group_counts_in(model, &pattern, permutation)?;
+                Some(counts.into_iter().map(|(id, _)| id).collect())
+            };
+            let (subjects, objects) = rayon::join(|| distinct(by_subject), || distinct(by_object));
+            let (subjects, objects) = (subjects?, objects?);
+            // |S ∪ O| by a merge of the two sorted lists.
+            let (mut i, mut j, mut both) = (0, 0, 0u64);
+            while i < subjects.len() && j < objects.len() {
+                match subjects[i].cmp(&objects[j]) {
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                    std::cmp::Ordering::Equal => {
+                        both += 1;
+                        i += 1;
+                        j += 1;
                     }
                 }
-                Some(subjects.len() as u64 + objects.len() as u64 - both)
-            })
+            }
+            Some(subjects.len() as u64 + objects.len() as u64 - both)
+        })
     }
 
     /// The number of distinct values of the first unbound component of `pattern` in
