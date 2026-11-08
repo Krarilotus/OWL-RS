@@ -378,6 +378,26 @@ from suitekit import hosts; print(hosts.input_path("general") or "")')
   # It reads the host's own inputs ($general, as resolved above), never the gate's data view that
   # fast_env points BENCH_GENERAL_DATA at for fast.py: the view holds only what an earlier
   # preparation linked (trail pkg-bench-registry, hypothesis 4).
+  # The datasets the job makes where the host lacks them (release_gate.py DATASET_MAKERS; orchestrator,
+  # 7 Nov 2026): support-stress's generator is the harness's verified perf_lab; a file pinned by form
+  # (datasets.toml rdfc_sha256) is checked by the harness's `rdfc`, built here where its source is
+  # (a harness without it leaves such a file unchecked, so refused).
+  export NRESE_PERF_LAB=$bin/release/examples/perf_lab
+  unset NRESE_RDFC
+  # Built only where a planned case reads a file pinned by form (sol-loop r1 S4).
+  form=$(cd "$tree" && py -c 'import sys, tomllib; sys.path[:0] = ["benches/suite", "benches/fast"]
+import release_gate as rg; from suitekit import cases as r
+want = set(sys.argv[1].split(",")); pins = {d["file"]: d for d in tomllib.load(open("benches/datasets.toml", "rb"))["dataset"]}
+print(any(pins.get(f, {}).get("rdfc_sha256") for c in r.load() if c["name"] in want for f in rg.volume_files(c)))' "$cases")
+  if [ "$form" = True ] && [ -e "$tree/crates/rdf/nrese-rdf-io/examples/rdfc.rs" ]; then
+    rdfc_target=$SPACE/build/target-rdfc
+    if (cd "$tree" && CARGO_TARGET_DIR=$rdfc_target bash scripts/cargo-guarded.sh build --release --locked --quiet \
+          -p nrese-rdf-io --example rdfc); then
+      export NRESE_RDFC=$rdfc_target/release/examples/rdfc
+    else
+      log "prepare: the harness's rdfc didn't build: files pinned by form will be refused"
+    fi
+  fi
   (cd "$tree" && if [ -n "$general" ]; then export BENCH_GENERAL_DATA=$general; else unset BENCH_GENERAL_DATA; fi
    SPARQL_DATA=$SPARQL_DATA py benches/fast/release_gate.py data --cases "$cases" --make) > "$OUT/data.txt" 2>&1
   data_code=$?
@@ -391,7 +411,10 @@ from suitekit import hosts; print(hosts.input_path("general") or "")')
 import hashlib, os, subprocess, sys, tomllib
 from pathlib import Path
 sys.path.insert(0, "benches/suite")
+sys.path.insert(0, "benches/fast")
 from suitekit import cases as registry
+import release_gate as rg  # its pin_problem(): the datasets' one check, here and for a made file
+rdfc = rg.rdfc_hash(os.environ.get("NRESE_RDFC"))
 wanted, general, sparql, view = sys.argv[1].split(","), Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4])
 frozen = {d["file"]: d for d in tomllib.loads(Path("benches/datasets.toml").read_text())["dataset"]}
 files = sorted({spec[len("volume:"):] for c in registry.load() if c["name"] in wanted
@@ -402,18 +425,19 @@ def digest(path):
         return hashlib.file_digest(f, "sha256").hexdigest()
 failed = False
 for name in files:
-    source = next((d / name for d in (general, sparql) if (d / name).is_file()), None)
+    entry = frozen.get(name, {})
+    # The first copy that is its pin (an older release at another size is skipped; 7 Nov 2026).
+    source, problem = rg.dataset_source(name, entry, [general, sparql], rdfc)
     if source is None:
         print(f"MISSING {name}: neither in {general} nor in {sparql}"); failed = True; continue
     target, sha = view / name, digest(source)
-    entry = frozen.get(name, {})
-    if sha != entry.get("sha256"):
+    if problem:
         if target.is_symlink() or target.exists():
             target.unlink()  # an earlier preparation's
-        print(f"NOT the freeze {name}: {source} sha256 {sha}, frozen {entry.get('sha256', 'none')[:12]}")
+        print(f"NOT the freeze {name}: {source} {problem}")
         failed = True
         continue
-    status = "frozen"
+    status = "frozen" if sha == entry.get("sha256") else "frozen by its RDFC-1.0 form"
     target.parent.mkdir(parents=True, exist_ok=True)
     if entry.get("n_triples") or name.startswith("bsbm-"):
         # Not N-Triples as frozen (BSBM's Turtle doubles): converted once per source, which

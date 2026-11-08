@@ -52,7 +52,7 @@ use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Envelope, Reservation};
 use nrese_reasoner::RuleProgram;
 use nrese_reasoner::eval::{Seg, Source};
 use nrese_reasoner::graph_sets::{
-    Annotation, Change, GraphSet, Stopped, closure_within, initial_sets, rederived,
+    Annotation, Change, GraphSet, Limits, Stopped, closure_within, initial_sets, rederived,
     rederived_candidates, support_sets, update_support_sets,
 };
 use nrese_reasoner::ir::Triple;
@@ -218,12 +218,16 @@ impl Following {
         }
     }
 
-    fn watch(&self, bytes: usize) -> bool {
-        if self
-            .cancellation
+    /// Whether the reading query is cancelled: the evaluation's stop, asked at its rounds and
+    /// inside its scans (an atomic load, no lock).
+    fn cancelled(&self) -> bool {
+        self.cancellation
             .as_ref()
             .is_some_and(CancellationToken::is_cancelled)
-        {
+    }
+
+    fn watch(&self, bytes: usize) -> bool {
+        if self.cancelled() {
             return false;
         }
         let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
@@ -240,6 +244,7 @@ impl Following {
         match stopped {
             Stopped::ProcessMemory => Unavailable::ProcessMemory,
             Stopped::MemoryUnreadable => Unavailable::MemoryUnreadable,
+            Stopped::Cancelled => Unavailable::Cancelled,
             // The watch refused: the budget, or else the cancellation.
             Stopped::Memory { .. } => self
                 .refused
@@ -458,7 +463,10 @@ impl SupportSets {
             &axioms,
             &graphs_of,
             cap,
-            &|bytes| following.watch(bytes),
+            Limits {
+                watch: &|bytes| following.watch(bytes),
+                stop: &|| following.cancelled(),
+            },
         )
         .map_err(|stopped| following.failure(stopped))?;
         let schema = ground.schema_premises();
@@ -651,10 +659,12 @@ impl SupportSets {
             limit: self.base.len() / 4 + 10_000,
         };
         let following = Following::new(working);
+        let limits = Limits {
+            watch: &|bytes| following.watch(bytes),
+            stop: &|| following.cancelled(),
+        };
         let recomputed =
-            match update_support_sets(&change, &ground, &self.axioms, &graphs_of, cap, &|bytes| {
-                following.watch(bytes)
-            }) {
+            match update_support_sets(&change, &ground, &self.axioms, &graphs_of, cap, limits) {
                 Ok(Some(recomputed)) => recomputed,
                 Ok(None) => return Ok(None),
                 Err(stopped) => return Err(following.failure(stopped)),
@@ -2130,6 +2140,11 @@ impl Supports {
         let revision = snapshot.revision();
         let following = Following::new(working);
         let watch = |bytes: usize| following.watch(bytes);
+        let stop = || following.cancelled();
+        let limits = Limits {
+            watch: &watch,
+            stop: &stop,
+        };
         let closure = After {
             snapshot,
             removed: &[],
@@ -2146,7 +2161,7 @@ impl Supports {
         // facts without each.
         let decide = |candidates: &[Triple]| -> Result<Kept<Triple>, Unavailable> {
             let (found, undecided) = rederived(
-                &closure, &ground, &axioms, &asserted, candidates, limit, &watch,
+                &closure, &ground, &axioms, &asserted, candidates, limit, limits,
             )
             .map_err(|stopped| following.failure(stopped))?;
             let mut passing: Kept<Triple> =
@@ -2158,7 +2173,7 @@ impl Supports {
                 let whole = Closure::of(snapshot, &graphs, &axioms, working)?;
                 for &fact in &undecided {
                     let without = |other: Triple| other != fact && asserted(other);
-                    let held = closure_within(&whole.facts, &ground, &axioms, &without, &watch)
+                    let held = closure_within(&whole.facts, &ground, &axioms, &without, limits)
                         .map_err(|stopped| following.failure(stopped))?;
                     if held.contains_key(&fact) {
                         passing.push(fact)?;
@@ -2201,7 +2216,7 @@ impl Supports {
                 snapshot,
                 removed: &removed,
             };
-            let candidates = rederived_candidates(&after, &ground, &touched, limit, &watch)
+            let candidates = rederived_candidates(&after, &ground, &touched, limit, limits)
                 .map_err(|stopped| following.failure(stopped))?;
             if let Some(candidates) = candidates {
                 let mut reachable: Kept<Triple> =
@@ -2454,10 +2469,12 @@ impl Supports {
         };
         let ground = program.ground_program(snapshot);
         let following = Following::new(working);
-        let held = closure_within(&closure.facts, &ground, &axioms, &reads, &|bytes| {
-            following.watch(bytes)
-        })
-        .map_err(|stopped| following.failure(stopped))?;
+        let limits = Limits {
+            watch: &|bytes| following.watch(bytes),
+            stop: &|| following.cancelled(),
+        };
+        let held = closure_within(&closure.facts, &ground, &axioms, &reads, limits)
+            .map_err(|stopped| following.failure(stopped))?;
         drop(ground);
         let mut facts: Kept<Triple> = ChargedVec::with_capacity(Arc::clone(working), held.len())?;
         facts.extend_bounded(held.len(), held.keys().copied())?;

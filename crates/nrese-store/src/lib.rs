@@ -82,11 +82,13 @@ pub use nrese_engine::cpu;
 /// the allocator.
 pub use nrese_engine::memory::set_release as set_memory_release;
 pub use nrese_engine::{
-    Applied, EngineError, IndexEncoding, LogExpectation, ReadModel, VocabularyEncoding, WalDamage,
+    Applied, CorpusTuning, EngineError, IndexEncoding, LogExpectation, ReadModel,
+    VocabularyEncoding, WalDamage,
 };
 pub use nrese_shacl::{ValidationReport, ValidationResult};
 pub use nrese_sparql::{
     CancellationToken, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryEvaluationError,
+    SearchScope,
 };
 pub use quarantine::{
     EntryState, InvalidStatements, Outcome, Quarantine, QuarantineFilter, QuarantineItem,

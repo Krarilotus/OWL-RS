@@ -145,7 +145,7 @@ impl Layout {
 
 /// Keys per part of a group walk over a large range, walked in parallel: a multiple of
 /// the block size.
-const GROUP_PART: usize = 1 << 16;
+pub(crate) const GROUP_PART: usize = 1 << 16;
 const _: () = assert!(GROUP_PART.is_multiple_of(keys::BLOCK));
 
 #[derive(Debug, Clone, Default)]
