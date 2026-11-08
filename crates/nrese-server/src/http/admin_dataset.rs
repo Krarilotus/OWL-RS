@@ -227,6 +227,51 @@ mod tests {
 
     use super::parse_restore_format;
 
+    /// A backup's directory is durably named (sol-loop round 4 on DUR-3 review r1, S1): in
+    /// `sealed/backups`, where `sealed/backups` exists but can't be opened (mode 0o311), so its
+    /// sync, which must name the new directory, fails, the claim must refuse. Before the fix it
+    /// made the directory, and the image backup's placement then took it for one provisioned
+    /// beforehand. Guards: in a readable directory it claims `name`, then `name-1` beside it.
+    /// Unix only (permissions); as root, where the mode doesn't keep the directory closed, the
+    /// first row isn't checked.
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_directory_is_claimed_only_where_its_name_can_be_durable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tempfile::tempdir().unwrap();
+        let mut wrong = Vec::new();
+        let sealed = base.path().join("sealed");
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o311)).unwrap();
+        if std::fs::read_dir(&sealed).is_ok() {
+            eprintln!("row sealed: not checked (the directory opens: root?)");
+        } else {
+            let claimed = super::claim_backup_dir(&sealed, "image");
+            eprintln!(
+                "row sealed: {}",
+                if claimed.is_err() { "ok" } else { "FAILED" }
+            );
+            if let Ok(claimed) = claimed {
+                wrong.push(format!(
+                    "claimed under a directory whose sync fails: {claimed:?}"
+                ));
+            }
+        }
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let open = base.path().join("open");
+        let first = super::claim_backup_dir(&open, "image");
+        let second = super::claim_backup_dir(&open, "image");
+        let ok = first.as_ref().is_ok_and(|dir| dir == &open.join("image"))
+            && second
+                .as_ref()
+                .is_ok_and(|dir| dir == &open.join("image-1"));
+        eprintln!("row open (guard): {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            wrong.push(format!("guard: claims {first:?}, {second:?}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     #[test]
     fn restore_format_accepts_parameterized_nquads_content_type() {
         let value = HeaderValue::from_static("application/n-quads; charset=utf-8");

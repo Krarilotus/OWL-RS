@@ -1120,20 +1120,26 @@ fn store_directories_are_made_through_the_placement_owner() {
         "nrese-store/src/catalog.rs",
         "nrese-store/src/metadata.rs",
         "nrese-server/src/replication.rs",
+        "nrese-server/src/http/admin_dataset.rs",
     ];
     let mut found = Vec::new();
     for file in files {
         let text = std::fs::read_to_string(crates.join(file)).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         for (n, line) in lines.iter().enumerate() {
+            // An inline test module ends the file's code (an out-of-line `mod tests;` doesn't:
+            // sol-loop round 4, S2).
             let tests_begin = line.trim() == "#[cfg(test)]"
                 && lines
                     .get(n + 1)
-                    .is_some_and(|next| next.trim_start().starts_with("mod tests"));
+                    .is_some_and(|next| next.trim().ends_with("mod tests {"));
             if tests_begin {
                 break;
             }
-            if line.contains("create_dir_all(") && !line.contains("place::create_dir_all(") {
+            let makes = ["create_dir_all(", "create_dir("]
+                .into_iter()
+                .any(|call| line.contains(call) && !line.contains(&format!("place::{call}")));
+            if makes {
                 found.push(format!("{file}:{}: {}", n + 1, line.trim()));
             }
         }
