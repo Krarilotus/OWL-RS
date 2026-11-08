@@ -8,6 +8,7 @@ use super::equality::{Classes as EqualityClasses, Expand, Visibility as CopyVisi
 use super::statistics::Statistics;
 use super::{ReadModel, Stack, Version};
 use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
+use crate::term::resolve::Vocabulary;
 use crate::term::{Dictionary, TermId};
 
 /// A pattern's heavy groups as the engine keeps them ([`Snapshot::heavy_groups_in`]): values
@@ -37,7 +38,9 @@ pub use reader_search::TextScope;
 #[derive(Clone)]
 pub struct Snapshot {
     version: Arc<Version>,
-    dictionary: Arc<Dictionary>,
+    /// What its ids mean: the engine's dictionary, bounded by `version.dictionary_len`, or a
+    /// private transaction's overlay view. Every snapshot made from this one keeps it.
+    vocabulary: Vocabulary,
     statistics: Arc<Statistics>,
     /// `owl:sameAs`, when reads expand equality classes.
     equality: Option<TermId>,
@@ -356,7 +359,7 @@ impl Snapshot {
     ) -> Self {
         Self {
             version,
-            dictionary,
+            vocabulary: Vocabulary::Shared(dictionary),
             statistics,
             equality,
             canonical: false,
@@ -726,7 +729,7 @@ impl Snapshot {
             views: Arc::clone(&self.views),
             reads: self.reads.clone(),
             version,
-            dictionary: Arc::clone(&self.dictionary),
+            vocabulary: self.vocabulary.clone(),
             statistics: Arc::new(self.statistics.for_view()),
             equality: self.equality,
             canonical: self.canonical,
@@ -956,7 +959,7 @@ impl Snapshot {
         Arc::ptr_eq(&self.version, &other.version)
     }
 
-    /// A snapshot of `version` over this one's dictionary and statistics.
+    /// A snapshot of `version` over this one's vocabulary and statistics.
     pub(super) fn with_version(&self, version: Version) -> Snapshot {
         let version = Arc::new(version);
         let canonical_data = self.canonical_view(&version);
@@ -965,7 +968,7 @@ impl Snapshot {
             views: Arc::clone(&self.views),
             reads: self.reads.clone(),
             version,
-            dictionary: Arc::clone(&self.dictionary),
+            vocabulary: self.vocabulary.clone(),
             statistics: Arc::clone(&self.statistics),
             equality: self.equality,
             canonical: self.canonical,
@@ -973,19 +976,46 @@ impl Snapshot {
         }
     }
 
+    /// This snapshot with `view` as its vocabulary: a private transaction's pending state
+    /// ([`super::PrivateTransaction`]). Every snapshot made from it keeps the view. Its
+    /// statistics are its own, as a restricted view's are: nothing built from its statements,
+    /// whose own ids mean nothing to the engine, is kept for published snapshots.
+    pub(super) fn private(mut self, view: crate::term::overlay::OverlayView) -> Snapshot {
+        self.vocabulary = Vocabulary::Private(view);
+        self.statistics = Arc::new(self.statistics.for_view());
+        self
+    }
+
     pub(crate) fn version(&self) -> &Version {
         &self.version
     }
 
-    pub(crate) fn dictionary(&self) -> &Dictionary {
-        &self.dictionary
+    /// The published dictionary, for readers of published state (the checkpoint, the
+    /// statistics' saved sets): `None` for a private snapshot, whose ids past its start mean
+    /// terms the dictionary doesn't have. Those readers refuse or skip it.
+    pub(crate) fn shared_dictionary(&self) -> Option<&Arc<Dictionary>> {
+        self.vocabulary.dictionary()
+    }
+
+    /// The dictionary under this snapshot's vocabulary, private or not, for what reads its
+    /// shared state only (planning, sizes, search's indexes). Never a decoder of this
+    /// snapshot's ids: a private snapshot's own ids aren't in it.
+    fn underlying(&self) -> &Dictionary {
+        self.vocabulary.underlying()
     }
 
     /// Whether dictionary IDs denote the same terms in both snapshots. This is distinct
     /// from content identity: derived views can share a dictionary while reading different
-    /// statements. It says nothing about query-local computed IDs.
+    /// statements. It says nothing about query-local computed IDs. Two private snapshots
+    /// share one only if they are views of the same transaction's vocabulary; a private one
+    /// never shares one with a published one.
     pub fn shares_dictionary_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.dictionary, &other.dictionary)
+        self.vocabulary.same_as(&other.vocabulary)
+    }
+
+    /// Whether this snapshot's ids include a private transaction's own terms.
+    pub fn is_private(&self) -> bool {
+        self.vocabulary.is_private()
     }
 
     /// Dictionary entries visible to this snapshot.
@@ -1743,7 +1773,7 @@ impl Snapshot {
         term: TermRef<'_>,
         charge: impl FnOnce(usize) -> Result<(), E>,
     ) -> Result<Option<TermId>, E> {
-        self.dictionary
+        self.vocabulary
             .lookup_charged(term, self.version.dictionary_len, charge)
     }
 
@@ -1762,13 +1792,12 @@ impl Snapshot {
     }
 
     pub fn lookup(&self, term: TermRef<'_>) -> Option<TermId> {
-        self.dictionary
-            .lookup_bounded(term, self.version.dictionary_len)
+        self.vocabulary.lookup(term, self.version.dictionary_len)
     }
 
     pub fn lookup_quad(&self, quad: QuadRef<'_>) -> Option<EncodedQuad> {
-        self.dictionary
-            .lookup_quad_bounded(quad, self.version.dictionary_len)
+        self.vocabulary
+            .lookup_quad(quad, self.version.dictionary_len)
     }
 
     /// The triple term `<<( subject predicate object )>>` of these ids as of this snapshot:
@@ -1780,22 +1809,19 @@ impl Snapshot {
         predicate: TermId,
         object: TermId,
     ) -> Option<TermId> {
-        self.dictionary
-            .triple_term_bounded([subject, predicate, object], self.version.dictionary_len)
+        self.vocabulary
+            .triple_term([subject, predicate, object], self.version.dictionary_len)
     }
 
     /// The subject, predicate and object ids of the triple term `id`, nothing decoded.
     /// `None` for another kind of term, one this snapshot doesn't know, and a triple term
     /// the first RDF 1.2 version keyed by its text ([`crate::Dictionary::components`]).
     pub fn components(&self, id: TermId) -> Option<[TermId; 3]> {
-        if id.payload() >= self.version.dictionary_len {
-            return None;
-        }
-        self.dictionary.components(id)
+        self.vocabulary.components(id, self.version.dictionary_len)
     }
 
     pub fn decode(&self, id: TermId) -> Option<Term> {
-        self.dictionary.decode(id)
+        self.vocabulary.decode(id)
     }
 
     /// [`Self::decode`] of the dictionary term `id`, what it allocates charged first
@@ -1807,10 +1833,8 @@ impl Snapshot {
         id: TermId,
         charge: impl FnOnce(usize) -> Result<(), E>,
     ) -> Result<Option<Term>, E> {
-        if id.kind().is_dictionary() && id.payload() >= self.version.dictionary_len {
-            return Ok(None);
-        }
-        self.dictionary.decode_charged(id, charge)
+        self.vocabulary
+            .decode_charged(id, self.version.dictionary_len, charge)
     }
 
     /// An upper bound of the bytes [`Self::decode`] allocates for `id`, for the dictionary
@@ -1818,20 +1842,16 @@ impl Snapshot {
     /// decode goes through [`Self::decode_charged`]. `None` for inline ids, triple terms and
     /// ids this snapshot doesn't know.
     pub fn decode_bound(&self, id: TermId) -> Option<usize> {
-        if id.kind().is_dictionary() && id.payload() >= self.version.dictionary_len {
-            return None;
-        }
-        self.dictionary.decode_bound(id)
+        self.vocabulary
+            .decode_bound(id, self.version.dictionary_len)
     }
 
     /// Calls `f` with a borrowed view of the dictionary term `id` (see
     /// [`Dictionary::with_view`](crate::Dictionary::with_view)); `None` for inline ids and
     /// ids this snapshot doesn't know.
     pub fn with_view<R>(&self, id: TermId, f: impl FnOnce(crate::TermView<'_>) -> R) -> Option<R> {
-        if id.kind().is_dictionary() && id.payload() >= self.version.dictionary_len {
-            return None;
-        }
-        self.dictionary.with_view(id, f)
+        self.vocabulary
+            .with_view(id, self.version.dictionary_len, f)
     }
 
     /// Calls `f` with a lookup of the views of this snapshot's dictionary terms, under one
@@ -1840,11 +1860,11 @@ impl Snapshot {
         &self,
         f: impl for<'v> FnOnce(&'v dyn Fn(TermId) -> Option<crate::TermView<'v>>) -> R,
     ) -> R {
-        self.dictionary.with_views(self.version.dictionary_len, f)
+        self.vocabulary.with_views(self.version.dictionary_len, f)
     }
 
     pub fn decode_quad(&self, quad: EncodedQuad) -> Option<Quad> {
-        self.dictionary.decode_quad(quad)
+        self.vocabulary.decode_quad(quad)
     }
 
     /// The dictionary terms this snapshot knows whose text passes `test`, sorted (whether
@@ -1852,7 +1872,7 @@ impl Snapshot {
     /// worth it where a pattern has many more rows than the dictionary has bytes per row
     /// of a random read.
     pub fn matching_strings(&self, test: &crate::StringTest<'_>) -> Vec<TermId> {
-        self.dictionary
+        self.vocabulary
             .matching_strings(test, self.version.dictionary_len)
     }
 
@@ -1861,44 +1881,61 @@ impl Snapshot {
         &self,
         test: &crate::StringTest<'_>,
     ) -> (Vec<TermId>, crate::StringScan) {
-        self.dictionary
+        self.vocabulary
             .matching_strings_scan(test, self.version.dictionary_len)
     }
 
     /// Whether a prefix test ([`crate::Placement::Start`]) is answered from the text order
     /// by binary search, rather than by a pass over the dictionary.
     pub fn text_order_ready(&self) -> bool {
-        self.dictionary.text_order_ready()
+        self.underlying().text_order_ready()
     }
 
     /// The size of this snapshot's dictionary text in bytes (the arena: what
     /// [`matching_strings`](Self::matching_strings) reads).
     pub fn dictionary_bytes(&self) -> u64 {
-        self.dictionary.stats().arena_bytes
+        self.underlying().stats().arena_bytes
+    }
+
+    /// Refused, before any search touches the dictionary, for a private snapshot: the
+    /// shared indexes don't cover its own terms, and building or extending them would change
+    /// state every snapshot shares.
+    fn searchable(&self) -> Result<(), SearchRefused> {
+        match self.is_private() {
+            true => Err(SearchRefused::Private),
+            false => Ok(()),
+        }
     }
 
     /// The string literals this snapshot's dictionary holds that match `query`, best first
-    /// (whether statements still use them is the caller's to check).
-    pub fn text_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
+    /// (whether statements still use them is the caller's to check). Refused for a private
+    /// snapshot ([`SearchRefused::Private`]).
+    pub fn text_search(
+        &self,
+        query: &crate::TextQuery,
+    ) -> Result<Vec<crate::TextMatch>, SearchRefused> {
+        self.searchable()?;
         let known = self.version.dictionary_len;
-        let mut matches = self.dictionary.text_search(query);
+        let mut matches = self.underlying().text_search(query);
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
-        matches
+        Ok(matches)
     }
 
     /// The vector literals this snapshot's dictionary holds that are nearest to
     /// `query.vector`, among those `accept` takes, nearest first, with how the search went
     /// (whether statements still use them is the caller's to check, in `accept`). What the
     /// search holds, the hits included, is charged to `budget` before it is allocated: a
-    /// search the budget has no room for is refused, with nothing left charged.
+    /// search the budget has no room for is refused, with nothing left charged. Refused for
+    /// a private snapshot too.
     pub fn vector_search<'b>(
         &self,
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
         budget: &'b nrese_exec::Budget,
-    ) -> Result<VectorHits<'b>, nrese_exec::BudgetExceeded> {
+    ) -> Result<VectorHits<'b>, SearchRefused> {
+        self.searchable()?;
         let (hits, report) =
-            self.dictionary
+            self.underlying()
                 .vector_search(query, self.version.dictionary_len, accept, budget)?;
         let len = hits.len();
         let (hits, held) = hits.into_parts();
@@ -1914,18 +1951,60 @@ impl Snapshot {
 
     /// Builds the graph searches like `query` use, covering every vector of its
     /// dimension, before returning: a warm-up (searches build it themselves, a large one
-    /// on a thread of its own while they scan exactly).
+    /// on a thread of its own while they scan exactly). Nothing for a private snapshot,
+    /// which doesn't search: a build is shared state.
     pub fn prepare_vector_graph(&self, query: &crate::VectorQuery) {
-        self.dictionary.prepare_vector_graph(query);
+        if self.searchable().is_ok() {
+            self.underlying().prepare_vector_graph(query);
+        }
     }
 
     /// The IRIs this snapshot's dictionary holds whose local names match `query`, best
-    /// first (whether statements still use them is the caller's to check).
-    pub fn iri_search(&self, query: &crate::TextQuery) -> Vec<crate::TextMatch> {
+    /// first (whether statements still use them is the caller's to check). Refused for a
+    /// private snapshot.
+    pub fn iri_search(
+        &self,
+        query: &crate::TextQuery,
+    ) -> Result<Vec<crate::TextMatch>, SearchRefused> {
+        self.searchable()?;
         let known = self.version.dictionary_len;
-        let mut matches = self.dictionary.iri_search(query);
+        let mut matches = self.underlying().iri_search(query);
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
-        matches
+        Ok(matches)
+    }
+}
+
+/// Why a [`Snapshot`]'s search gave no answer: a refusal, never an empty answer.
+#[derive(Debug, Clone, Copy)]
+pub enum SearchRefused {
+    /// The search's budget had no room ([`nrese_exec::BudgetExceeded`]).
+    Memory(nrese_exec::BudgetExceeded),
+    /// The snapshot is private ([`Snapshot::is_private`]): the shared indexes don't cover
+    /// its own terms, and no search changes them for it.
+    Private,
+}
+
+impl From<nrese_exec::BudgetExceeded> for SearchRefused {
+    fn from(exceeded: nrese_exec::BudgetExceeded) -> Self {
+        Self::Memory(exceeded)
+    }
+}
+
+impl std::fmt::Display for SearchRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Memory(exceeded) => exceeded.fmt(f),
+            Self::Private => f.write_str("a private snapshot can't be searched"),
+        }
+    }
+}
+
+impl std::error::Error for SearchRefused {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Memory(exceeded) => Some(exceeded),
+            Self::Private => None,
+        }
     }
 }
 

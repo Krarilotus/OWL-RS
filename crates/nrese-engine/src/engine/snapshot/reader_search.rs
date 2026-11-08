@@ -136,18 +136,20 @@ impl Snapshot {
     /// building the corpus takes is charged to `budget` while the search holds it (the
     /// request's; `None`: unbounded); a kept corpus is the engine's. A budget that has no
     /// room returns its refusal, as does a read the reader's budget refused
-    /// ([`Self::read_refused`]): what it read may be incomplete.
+    /// ([`Self::read_refused`]): what it read may be incomplete. Refused for a private
+    /// snapshot, before anything is built ([`super::SearchRefused::Private`]).
     pub fn text_search_in(
         &self,
         model: ReadModel,
         scope: &TextScope,
         query: &crate::TextQuery,
         budget: Option<&Arc<nrese_exec::Budget>>,
-    ) -> Result<Vec<crate::TextMatch>, nrese_exec::BudgetExceeded> {
+    ) -> Result<Vec<crate::TextMatch>, super::SearchRefused> {
+        self.searchable()?;
         let request = request_budget(budget);
         let corpus = self.text_corpus(Documents::Literals, model, scope, &request)?;
         let known = self.version.dictionary_len;
-        let mut matches = self.dictionary.text_search_in(query, Some(&corpus));
+        let mut matches = self.underlying().text_search_in(query, Some(&corpus));
         matches.retain(|m| TermId::from_raw(m.id).payload() < known);
         Ok(matches)
     }
@@ -158,18 +160,19 @@ impl Snapshot {
     /// canonically, a class is its representative, named by every identity: each
     /// identity's local name is a document while the representative is a subject, and a
     /// match is answered as the representative, each once, at its best identity's
-    /// relevance.
+    /// relevance. Refused for a private snapshot.
     pub fn iri_search_in(
         &self,
         model: ReadModel,
         scope: &TextScope,
         query: &crate::TextQuery,
         budget: Option<&Arc<nrese_exec::Budget>>,
-    ) -> Result<Vec<crate::TextMatch>, nrese_exec::BudgetExceeded> {
+    ) -> Result<Vec<crate::TextMatch>, super::SearchRefused> {
+        self.searchable()?;
         let request = request_budget(budget);
         let corpus = self.text_corpus(Documents::Subjects, model, scope, &request)?;
         let known = self.version.dictionary_len;
-        let mut found = self.dictionary.iri_search_in(query, Some(&corpus));
+        let mut found = self.underlying().iri_search_in(query, Some(&corpus));
         found.retain(|m| TermId::from_raw(m.id).payload() < known);
         if let Some((classes, true)) = self.corpus_classes(Documents::Subjects, model) {
             // Best first: the first of each class is its best identity's.
@@ -189,6 +192,7 @@ impl Snapshot {
     /// version's, an open transaction's, a deleted one, one in a graph outside the scope)
     /// changes the answer or the report. Building the corpus, the scan and the hits are
     /// charged to `budget` before they are allocated, as [`Snapshot::vector_search`]'s are.
+    /// Refused for a private snapshot.
     pub fn vector_search_in<'b>(
         &self,
         model: ReadModel,
@@ -196,10 +200,11 @@ impl Snapshot {
         query: &crate::VectorQuery,
         accept: &(dyn Fn(TermId) -> bool + Sync),
         budget: &'b Arc<nrese_exec::Budget>,
-    ) -> Result<super::VectorHits<'b>, nrese_exec::BudgetExceeded> {
+    ) -> Result<super::VectorHits<'b>, super::SearchRefused> {
+        self.searchable()?;
         // The space first: no vector of the query's dimension, nothing found and nothing
         // reported, before a corpus is admitted (attack list item 7; sol-loop r1 S3).
-        let Some(input) = self.dictionary.vector_input(query) else {
+        let Some(input) = self.underlying().vector_input(query) else {
             let none = crate::VectorSearchReport {
                 space: 0,
                 graph: false,
@@ -244,14 +249,15 @@ impl Snapshot {
     /// The members of the corpus of [`Self::text_search_in`] for `model` and `scope` (with
     /// `iris`, of [`Self::iri_search_in`]'s), dictionary entries ascending, with their
     /// number and words, as a search finds them (kept, derived or walked): for checks
-    /// against the statements this snapshot's scans show.
+    /// against the statements this snapshot's scans show. Refused for a private snapshot.
     #[doc(hidden)]
     pub fn text_corpus_members(
         &self,
         model: ReadModel,
         scope: &TextScope,
         iris: bool,
-    ) -> (Vec<u64>, u64, u64) {
+    ) -> Result<(Vec<u64>, u64, u64), super::SearchRefused> {
+        self.searchable()?;
         let documents = match iris {
             false => Documents::Literals,
             true => Documents::Subjects,
@@ -259,17 +265,23 @@ impl Snapshot {
         let corpus = self
             .text_corpus(documents, model, scope, &request_budget(None))
             .expect("no budget to exceed");
-        (corpus.members(), corpus.documents(), corpus.total_words())
+        Ok((corpus.members(), corpus.documents(), corpus.total_words()))
     }
 
     /// The members of [`Self::vector_search_in`]'s corpus for `model` and `scope`: the
     /// typed literals that are objects of statements this snapshot shows there (the scan
-    /// reads the vectors among them).
+    /// reads the vectors among them). Refused for a private snapshot.
     #[doc(hidden)]
-    pub fn vector_corpus_members(&self, model: ReadModel, scope: &TextScope) -> Vec<u64> {
-        self.text_corpus(Documents::Vectors, model, scope, &request_budget(None))
+    pub fn vector_corpus_members(
+        &self,
+        model: ReadModel,
+        scope: &TextScope,
+    ) -> Result<Vec<u64>, super::SearchRefused> {
+        self.searchable()?;
+        Ok(self
+            .text_corpus(Documents::Vectors, model, scope, &request_budget(None))
             .expect("no budget to exceed")
-            .members()
+            .members())
     }
 
     /// Whether this snapshot's reads in `model` expand equality classes that hold literals
@@ -441,7 +453,7 @@ impl Snapshot {
                     // Every typed literal is a member (of one word): the scan reads the
                     // vectors among them.
                     true => Bits::derived(&base, &changes, span, request, |_| 1)?,
-                    false => self.dictionary.with_text_index(iris, |index| {
+                    false => self.underlying().with_text_index(iris, |index| {
                         index.derive(&base, &changes, span, request)
                     })?,
                 }
@@ -535,10 +547,10 @@ impl Snapshot {
         Ok(match documents {
             Documents::Vectors => Bits::counted(bits, |_| 1),
             Documents::Literals => self
-                .dictionary
+                .underlying()
                 .with_text_index(false, |index| index.corpus(bits)),
             Documents::Subjects => self
-                .dictionary
+                .underlying()
                 .with_text_index(true, |index| index.corpus(bits)),
         })
     }
@@ -547,8 +559,8 @@ impl Snapshot {
     /// dictionary's entries.
     fn cover(&self, documents: Documents) {
         match documents {
-            Documents::Literals => self.dictionary.prepare_text(false, None),
-            Documents::Subjects => self.dictionary.prepare_text(true, None),
+            Documents::Literals => self.underlying().prepare_text(false, None),
+            Documents::Subjects => self.underlying().prepare_text(true, None),
             // The vector search covers its index itself, under its own lock.
             Documents::Vectors => {}
         }
