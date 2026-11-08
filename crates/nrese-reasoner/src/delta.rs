@@ -377,16 +377,24 @@ pub fn update_within<B: Base + ?Sized>(
     // The process's memory limit stops it too, whatever the caller polls; once stopped it
     // stays stopped, so no morsel skipped is taken for done.
     let stop = super::eval::OperationStop::new(stop);
-    let update = update_body(
-        base,
-        inserted,
-        deleted,
-        rules,
-        cache,
-        &|| stop.fired(),
-        policy,
-        memory,
-    );
+    update_in(base, inserted, deleted, rules, cache, &stop, policy, memory)
+}
+
+/// [`update_within`] under one operation's `stop`, whose memory limit and room its caller
+/// chose ([`super::eval::OperationStop::within`]): replication's copies are admitted by
+/// its room.
+#[allow(clippy::too_many_arguments)]
+pub fn update_in<B: Base + ?Sized>(
+    base: &B,
+    inserted: &[Triple],
+    deleted: &[Triple],
+    rules: Rules<'_>,
+    cache: Option<&GroundProgram>,
+    stop: &super::eval::OperationStop<'_>,
+    policy: policy::Policy,
+    memory: &Arc<Budget>,
+) -> Result<Update, Interrupted> {
+    let update = update_body(base, inserted, deleted, rules, cache, stop, policy, memory);
     // A read on a stopped poller answers "nothing" (REAS-2): whatever the body decided
     // after the stop (a plan, a phase's facts) is discarded here, at one place, as much as
     // at each stage's own check.
@@ -396,7 +404,7 @@ pub fn update_within<B: Base + ?Sized>(
     }
 }
 
-/// [`update_with`]'s work, under the operation's latched `stop`.
+/// [`update_with`]'s work, under the operation's latched stop, `operation`.
 #[allow(clippy::too_many_arguments)]
 fn update_body<B: Base + ?Sized>(
     base: &B,
@@ -404,10 +412,11 @@ fn update_body<B: Base + ?Sized>(
     deleted: &[Triple],
     rules: Rules<'_>,
     cache: Option<&GroundProgram>,
-    stop: Stop<'_>,
+    operation: &super::eval::OperationStop<'_>,
     policy: policy::Policy,
     memory: &Arc<Budget>,
 ) -> Result<Update, Interrupted> {
+    let stop: Stop<'_> = &|| operation.fired();
     let check_stop = || {
         if stop() {
             Err(Interrupted::default())
@@ -1006,10 +1015,7 @@ fn update_body<B: Base + ?Sized>(
         candidates.extend(run_jobs(&state, &jobs, &keep, stop));
         check_stop()?;
         if let Some(equality) = &mut equality {
-            let expanded = equality
-                .run(&state, stop)
-                .ok_or_else(Interrupted::default)?;
-            candidates.extend(expanded);
+            candidates.extend(equality.run(&state, operation)?);
         }
         drop(jobs);
         // Transitive properties: newly declared ones closed in full (SCC condensation), the
@@ -1134,27 +1140,27 @@ fn update_body<B: Base + ?Sized>(
 /// derived the new facts in bulk (a first load, [`crate::engine::maintain`]): the same
 /// report, through the new facts only, with the ground program extended by the instances of
 /// new schema and list facts as phase 3 extends it; charged to `memory` as the delta's own
-/// is ([`update_within`]), and stopped by `stop` or the process's memory limit as it is.
+/// is ([`update_within`]), and stopped as the operation it is part of is (`operation`: its
+/// latch and its cause, shared with the rest of the maintenance, [`update_in`]).
 pub fn introduced_violations<B: Base + ?Sized>(
     base: &B,
     inserted: &[Triple],
     derived: &[Triple],
     rules: Rules<'_>,
     cache: Option<&GroundProgram>,
-    stop: Stop<'_>,
+    operation: &super::eval::OperationStop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<Violations, Interrupted> {
-    let stop = super::eval::OperationStop::new(stop);
     introduced_violations_body(
         base,
         inserted,
         derived,
         rules,
         cache,
-        &|| stop.fired(),
+        &|| operation.fired(),
         memory,
     )
-    .map_err(|_| stop.interrupted())
+    .map_err(|_| operation.interrupted())
 }
 
 fn introduced_violations_body<B: Base + ?Sized>(

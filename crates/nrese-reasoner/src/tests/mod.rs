@@ -3078,3 +3078,32 @@ _:l33a rdf:rest _:l33b"#,
         );
     }
 }
+
+/// A thread's equality copies keep no room for copies a fact could have made but didn't
+/// (#91, `abba-pr91-cost-r2`: replication's memory 1.035 times the uncharged copies' at
+/// 20,000 classes of 10, the threads' chunks at 1.81 times their copies beside the joined
+/// list). Here 1,000 facts that could each make 10,000 copies (a fact over a 100-identity
+/// class twice, as eq-giant-split's) make one each, the others already stored: the chunk
+/// holds its 1,000 copies within twice that, as a list grown by doubling does. Room for
+/// every fact's whole bound held it at 20,000.
+#[test]
+fn equality_copies_keep_no_room_for_copies_not_made() {
+    let budget = nrese_exec::Budget::unlimited();
+    let (mut copies, mut scratch) = (
+        nrese_exec::ChargedVec::new(&budget),
+        nrese_exec::ChargedVec::new(&budget),
+    );
+    for fact in 0..1_000u64 {
+        batch::append_copies(&mut copies, &mut scratch, 10_000, |out| {
+            out.push([fact, 1, 2]);
+        })
+        .expect("unlimited");
+    }
+    assert_eq!(copies.len(), 1_000);
+    assert!(
+        copies.capacity() <= 2 * copies.len(),
+        "{} copies in room for {}",
+        copies.len(),
+        copies.capacity()
+    );
+}

@@ -41,9 +41,10 @@ pub use explain::{
     InferenceStep, JUSTIFICATIONS_AT_MOST, JustificationAnswer, JustificationMode,
     JustifiedStatement, explain_fact, explain_violation, justify_fact,
 };
-pub use maintain::{EngineBase, Maintenance, maintain, maintain_within};
+pub use maintain::{EngineBase, Maintenance, maintain, maintain_with, maintain_within};
 pub use materialise::{
-    Closure, equality_report_until, materialise, materialise_until, materialise_within,
+    Closure, equality_report_until, equality_report_with, materialise, materialise_until,
+    materialise_with, materialise_within,
 };
 
 /// A rule program compiled against the engine dictionary: its rules, list vocabulary and

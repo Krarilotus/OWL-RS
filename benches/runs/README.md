@@ -64,3 +64,13 @@ the same shape ([2026-10-11-horn-recovery.toml](2026-10-11-horn-recovery.toml) i
 `runs` counts the repetitions that loaded, and `items` gives the queries or tasks that were
 `ok` out of those run. Records from before 3 October 2026 have `commit = "unknown (before
 run manifests)"` unless it was added by hand.
+
+From 8 November 2026 a pair can also carry `receipt`, its cell's newest attempt
+(benches/suite/suitekit/receipts.py): `complete = false` if that attempt didn't finish (an
+older finished one never stands in for it); else its own invocation's commit, code, images,
+build, settings, data hashes, outcome and answer verdict (`wrong` stands against counts that look
+right). What it couldn't evidence is `{ unknown = "why" }`. A licensed system's receipt holds
+no outcome or answers, whatever the outcome. A pair without a receipt predates them, or its
+attempts' record (attempts.jsonl) didn't survive: either way it has no evidence. Where a
+directory's attempts.jsonl lost records (its manifest names an invocation it lacks), every pair
+of the record has `receipt = { unknown = "…" }`: which cells those were, nothing tells.

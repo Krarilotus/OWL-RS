@@ -223,7 +223,9 @@ with such a side uses one value per process on both sides, each process's p50 (t
 samples. Each query's rows are compared between the sides; rows that differ block unless a
 check pins the head's answer (then the baseline's time is not compared). A case a baseline
 can't run (an argument or tool it lacks, a wrong answer of its own) is *not compared* against
-it, with that reason, and doesn't block: it isn't evidence about the head. The head failing a
+it, with that reason: it isn't evidence about the head, and it isn't a pass either: a declared
+hypothesis any round didn't compare keeps the verdict NOT PASSED (`release_gate.py verdict`; `abba.py
+report` exit 5), its reason listed, until the family or the baseline changes. The head failing a
 case blocks; so does the head stopping at its declared limit where a baseline completed.
 
 **The inference** (`suitekit/gatestats.py`; research round 8, 19 Oct 2026). One question per
@@ -288,7 +290,8 @@ phuoc-yu and the big host); a declared hypothesis a round doesn't test counts at
   with a hypothesis at p1 <= 0.045; round 3 those whose round-2 p Holm could still reject if
   round 3 came out at 0 (with a thousand hypotheses that takes about alpha / m, not 0.005).
 - *Holm over the whole family* at alpha 0.05 decides: what it rejects is a confirmed loss
-  (blocks unless a trade-off covers it); what it doesn't passes at the end of its budget. No
+  (blocks unless a trade-off covers it); a tested hypothesis it doesn't reject passes at the end
+  of its budget; one that any round given didn't compare (not compared, above) never does. No
   interim look: no block early and no pass early, so the error needs no spending.
 - *The counter's resolution is no verdict either way.* A difference within the counter's step
   (1 µs, 1 µs / K batched, a coarser reported step, a byte) that the test doesn't reject is

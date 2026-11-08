@@ -5,6 +5,7 @@ Windows. Standard library only, Python 3.8 on: scripts/lib/ns.sh runs this file 
 is missing.
 
     with lock(path): ...
+    with lock(path, wait=False): ...     OSError at once if another holds it
     python lock.py FILE -- COMMAND...    COMMAND under the lock, its exit code
 """
 from __future__ import annotations
@@ -18,7 +19,7 @@ from pathlib import Path
 
 
 @contextlib.contextmanager
-def lock(path):
+def lock(path, wait: bool = True):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o666)
@@ -28,9 +29,11 @@ def lock(path):
             while True:  # LK_LOCK gives up after ten tries of a second: wait on
                 try:
                     os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                    msvcrt.locking(fd, msvcrt.LK_LOCK if wait else msvcrt.LK_NBLCK, 1)
                     break
                 except OSError:
+                    if not wait:
+                        raise
                     time.sleep(0.05)
             try:
                 yield
@@ -39,7 +42,7 @@ def lock(path):
                 msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         else:
             import fcntl
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
             try:
                 yield
             finally:

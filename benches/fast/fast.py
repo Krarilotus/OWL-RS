@@ -45,6 +45,7 @@ import tempfile
 import time
 import threading
 import tomllib
+import uuid
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -55,6 +56,9 @@ from suitekit.runtime import end_scope, scope_argv  # noqa: E402
 from suitekit.compare import (KEPT_POINTS, UNSTABLE_PEAK, bootstrap_ratio, client_throughput,  # noqa: E402,F401
                               compare_reports, counter_changes, load_report, peak_spread, pooled,
                               process_peak, series_ratios, spread, statistic, thin)
+# Every record says the generation of its timing units (compare.units_check() normalises or refuses
+# a mix; fix check r2 of pkg/declared-metrics).
+from suitekit.compare import SERIES_UNITS  # noqa: E402
 from suitekit.workloads import fast_data_name  # noqa: E402
 from suitekit import ns  # noqa: E402
 
@@ -841,6 +845,47 @@ def verdict(case: dict, record: dict) -> dict:
     return out
 
 
+SH = "<http://www.w3.org/ns/shacl#"
+# A record's subject (an IRI or a blank node: a triple term is only ever an object, RDF 1.2) and
+# predicate (an IRI), as N-Triples terms, its whitespace a space or a tab; nothing after them
+# (the object, a literal) is read.
+NT_HEAD = re.compile(r'[ \t]*(<[^\x00-\x20<>"{}|^`\\]*>|_:[^ \t]+)[ \t]+(<[^\x00-\x20<>"{}|^`\\]*>)[ \t]')
+
+
+def shacl_report_counts(text: str) -> dict[str, int] | None:
+    """A SHACL validation report's (N-Triples, as nrese-rdf-io writes it) sh:value and
+    sh:resultPath triples: its results' values and paths (SHACL 1.0 §5.3.2). Records end only at
+    a physical newline: the writer escapes every control character in a literal (ntriples.rs
+    `quoted`), but not U+2028, U+2029 or U+0085, at which str.splitlines() would also split (fix
+    check r1 W). None: a record that isn't N-Triples as written, counts unknown, never guessed."""
+    values = paths = 0
+    for record in text.split("\n"):
+        if not record.strip(" \t\r") or record.lstrip(" \t").startswith("#"):
+            continue
+        head = NT_HEAD.match(record)
+        if head is None:
+            return None
+        values += head.group(2) == f"{SH}value>"
+        paths += head.group(2) == f"{SH}resultPath>"
+    return {"values": values, "paths": paths}
+
+
+def shacl_report_reading(path: Path) -> tuple[dict[str, int] | None, str]:
+    """An invocation's SHACL report's counts (shacl_report_counts()), or None and why they're
+    unknown: every way of not getting them (none written, not UTF-8, a failed read, not N-Triples
+    as written) is the one unreadable state, never an exception out of measure() (fix check r3)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None, "the invocation wrote no SHACL report"
+    except UnicodeDecodeError as error:
+        return None, f"its SHACL report isn't UTF-8 (byte {error.start}: {error.reason})"
+    except OSError as error:
+        return None, f"its SHACL report couldn't be read ({error.strerror or error})"
+    counts = shacl_report_counts(text)
+    return counts, "" if counts is not None else "its SHACL report isn't N-Triples as written"
+
+
 def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, data: str) -> dict:
     """run_case's measurement, its data ready: the record."""
     name = case["name"]
@@ -874,6 +919,12 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
             record["notes"].append(f"timed by its load: its metric ({case['metric']}) is the suite driver's")
         command = [*base, *loads, *(["--queries", queries] if queries else []),
                    *substitute(case.get("args", []), data, scratch)]
+        # A case with shapes writes each invocation's last validation's report (every perf lab of
+        # engine-v2 can) to a path of that invocation's own, so that what the results hold is counted,
+        # not only how many (shacl_report_counts()); removed however the invocation ends.
+        shapes = "--shapes" in case.get("args", [])
+        owner = uuid.uuid4().hex[:12]
+        made: list[Path] = []
         script = ""
         if "setup" in case:
             setup = ["/target/release/examples/perf_lab", *substitute(case["setup"], data, scratch)]
@@ -891,33 +942,55 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
         record["page_cache"] = modes
         # Warm and cold alternate, so that drift over the case touches both alike.
         runs = invocation_plan(case, modes)
-        for index, identity in enumerate(runs):
-            entry, mode = sweep[identity["sweep"]], identity["cache"]
-            if mode == "cold" and index > 0 and not drop_page_cache(record):
-                break
-            # The setup (a store on disk) runs once; each repeat is a fresh process opening it.
-            shell = (script if index == 0 else "") + " ".join(f"'{c}'" for c in [*command, *entry])
-            code, _, err, w = container(name, case["cap_gb"], ["bash", "-c", shell], case.get("env"), timeout=timeout_s)
-            wall += w
-            path = SCRATCH / f"{case['name']}.json"
-            if not path.exists():
-                record["status"] = "failed"
-                record["notes"].append("invocation did not produce its JSON report")
-                break
-            result = json.loads(path.read_text(encoding="utf-8"))
-            path.unlink()
-            result["_sweep"] = " ".join(entry)
-            result["_page_cache"] = mode
-            if case.get("queries", "").startswith("@vectors") and code == 0:
-                result["recall"] = vector_recall(case, expect)
-            observation = invocation_observation(case, result, err, identity)
-            observation["exit"] = code
-            observation["checks"] = [check(p, w, result, expect, alt_expect) for p, w in case.get("check", {}).items()]
-            observation["routes"] = [route(p, w, result) for p, w in case.get("route", {}).items()]
-            observations.append(observation)
-            samples_runs.append(result)
-            if code != 0:
-                break
+        try:
+            for index, identity in enumerate(runs):
+                entry, mode = sweep[identity["sweep"]], identity["cache"]
+                if mode == "cold" and index > 0 and not drop_page_cache(record):
+                    break
+                report_nt = SCRATCH / f"{case['name']}-{owner}-{index}.shacl.nt"
+                if shapes and report_nt.exists():  # not this invocation's: never counted, never removed
+                    record["status"] = "failed"
+                    record["notes"].append(f"a SHACL report was already at {report_nt.name}: not this run's")
+                    break
+                reporting = ["--shacl-report", f"/out/{report_nt.name}"] if shapes else []
+                if shapes:
+                    made.append(report_nt)
+                # The setup (a store on disk) runs once; each repeat is a fresh process opening it.
+                shell = (script if index == 0 else "") + " ".join(f"'{c}'" for c in [*command, *reporting, *entry])
+                code, _, err, w = container(name, case["cap_gb"], ["bash", "-c", shell], case.get("env"), timeout=timeout_s)
+                wall += w
+                path = SCRATCH / f"{case['name']}.json"
+                if not path.exists():
+                    record["status"] = "failed"
+                    record["notes"].append("invocation did not produce its JSON report")
+                    break
+                result = json.loads(path.read_text(encoding="utf-8"))
+                path.unlink()
+                if shapes and isinstance(result.get("shacl"), dict):
+                    counts, why = shacl_report_reading(report_nt)
+                    if counts is None:
+                        # Couldn't be read, not "not reported": its checks fail whatever --routes says
+                        # (fix check r2: check() left an absent value unchecked without routes).
+                        why += ": values and paths not counted"
+                        record["notes"].append(why)
+                        result["_unreadable"] = {"shacl.values": why, "shacl.paths": why}
+                    else:
+                        result["shacl"].update(counts)
+                result["_sweep"] = " ".join(entry)
+                result["_page_cache"] = mode
+                if case.get("queries", "").startswith("@vectors") and code == 0:
+                    result["recall"] = vector_recall(case, expect)
+                observation = invocation_observation(case, result, err, identity)
+                observation["exit"] = code
+                observation["checks"] = [check(p, w, result, expect, alt_expect) for p, w in case.get("check", {}).items()]
+                observation["routes"] = [route(p, w, result) for p, w in case.get("route", {}).items()]
+                observations.append(observation)
+                samples_runs.append(result)
+                if code != 0:
+                    break
+        finally:
+            for report_nt in made:  # only the paths this measurement named, each its own invocation's
+                report_nt.unlink(missing_ok=True)
         if "setup" in case:
             container(name, 1, ["rm", "-rf", scratch])
         if samples_runs:
@@ -1085,7 +1158,7 @@ COUNTERS = ("reason.new_facts", "reason.inferred", "reason.rounds",
             "held.index_mib", "held.dictionary_terms", "held.inferred",
             "clauses", "nodes_created", "branch_points", "backjumps", "clashes", "merges", "facts", "clauses_fired",
             "concepts", "contexts", "subsumers", "links", "conclusions", "duplicates", "dl_clauses", "functions",
-            "shacl.results", "kernel.rows", "held.index_bytes",
+            "shacl.results", "shacl.values", "shacl.paths", "kernel.rows", "held.index_bytes",
             "reason.bindings", "reason.probes", "reason.passes", "cache.hits", "subset_checks", "clauses_generated", "clauses_kept",
             "redundant_forward", "redundant_backward", "contexts_created", "hyper", "pred")
 
@@ -1194,6 +1267,8 @@ def check(path: str, want, result: dict, expect: dict, alt_expect: dict) -> dict
     got = lookup(path, result)
     shown = (want if isinstance(want, str) and (want[:2] in (">=", "<=") or want.startswith(("has ", "lacks ")))
              else expected)
+    if got is None and path in (result.get("_unreadable") or {}):  # its source couldn't be read: fails
+        return {"path": path, "expected": shown, "got": None, "ok": False, "note": result["_unreadable"][path]}
     if got is None and not OPTIONS["routes"]:
         # A perf lab without --routes reports no query's value, status or operators: such a
         # check is unchecked (ok None), not a wrong answer; its rows still are checked.
@@ -1283,7 +1358,16 @@ def cold_ms(result: dict) -> float | None:
     return result["open_s"] * 1000.0 + sum(firsts)
 
 
+def ms_scale(metric: str) -> float:
+    """The factor from a metric's declared unit to the milliseconds every timed series and metric value
+    is in: a field in seconds (its last name ends in `_s`: load_s, open_s, commits.whole_s) times 1000,
+    anything else as it is (review r1 of pkg/declared-metrics, R1-F1: `commits.whole_s` reached the
+    series in seconds, under the comparison's 2 ms floor)."""
+    return 1000.0 if metric.rsplit(".", 1)[-1].endswith("_s") else 1.0
+
+
 def metric_value(case: dict, result: dict):
+    """The case's declared metric in this result, in milliseconds (ms_scale())."""
     case = {**case, "metric": timed_metric(case)}
     if case["metric"] == "cold_ms":
         # With the page cache warm and emptied: the sum of the two modes' medians.
@@ -1292,12 +1376,13 @@ def metric_value(case: dict, result: dict):
             if values:
                 total = (total or 0.0) + statistics.median(values)
         return total
+    scale = ms_scale(case["metric"])
     value = lookup(case["metric"], result)
-    if case["metric"] in ("load_s", "open_s") and value is not None:
-        value = value * 1000.0
-    if "_repeats" in result and case["metric"] in ("load_s", "open_s", "clients.p99_ms", "canonicalize.p50_ms"):
+    if value is not None:
+        value = value * scale
+    if "_repeats" in result and (scale != 1.0 or case["metric"] in ("clients.p99_ms", "canonicalize.p50_ms")):
         values = [lookup(case["metric"], r) for r in result["_repeats"]]
-        values = [v * (1000.0 if case["metric"] in ("load_s", "open_s") else 1.0) for v in values if v is not None]
+        values = [v * scale for v in values if v is not None]
         value = statistics.median(values) if values else value
     return value
 
@@ -1309,7 +1394,7 @@ def samples(case: dict, result: dict) -> dict:
     if result.get("client_sweep"):
         return {f"{level['clients']} clients p99": [level["p99_ms"]] for level in result["client_sweep"]}
     if case.get("sweep") and "_repeats" in result:
-        scale = 1000.0 if metric in ("load_s", "open_s") else 1.0
+        scale = ms_scale(metric)
         series: dict[str, list[float]] = {}
         for r in result["_repeats"]:
             value = lookup(metric, r)
@@ -1334,13 +1419,17 @@ def samples(case: dict, result: dict) -> dict:
     section = metric.split(".")[0]
     # Repeated processes (`repeat`) pool their samples, as the queries' above.
     runs = result.get("_repeats", [result])
-    if isinstance(result.get(section), dict) and "samples_ms" in result[section]:
+    # A section's samples are its own latency: they stand for the metric only where the metric is
+    # that latency's median (`SECTION.p50_ms`). Another field of it (a read latency, a p99, a max) is
+    # its own value, per process below (the orchestrator, 7 Nov 2026: C1's `commits.read_p50_ms` was
+    # timed by its commits' samples, and a 2,500-fold read slowdown was in no hypothesis).
+    if metric == f"{section}.p50_ms" and isinstance(result.get(section), dict) and "samples_ms" in result[section]:
         return {"_": [s for r in runs for s in (r.get(section) or {}).get("samples_ms", [])]}
     if "samples_ms" in result:
         return {"_": [s for r in runs for s in r.get("samples_ms", []) if s is not None]}
     if "_repeats" in result:
         values = [lookup(metric, r) for r in result["_repeats"]]
-        scale = 1000.0 if metric in ("load_s", "open_s") else 1.0
+        scale = ms_scale(metric)
         return {"_": [v * scale for v in values if v is not None]}
     value = metric_value(case, result)
     return {"_": [value]} if value is not None else {}
@@ -1741,6 +1830,7 @@ def run(args) -> int:
                           "checks": [], "routes": [], "samples": {}, "metric": None,
                           "expected_outcome": case.get("outcome", "ok")}
             record["verdict"] = verdict(case, record)
+            record["series_units"] = SERIES_UNITS
             # The case's own time, without the wait for the quiet slot.
             record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
             record["inputs"] = case_inputs(case)  # the frozen bytes it loaded (compare.input_check)
@@ -1958,6 +2048,7 @@ def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict],
                           "checks": [], "routes": [], "samples": {}, "metric": None,
                           "expected_outcome": case.get("outcome", "ok")}
             record["verdict"] = verdict(case, record)
+            record["series_units"] = SERIES_UNITS
             record["case_s"] = round(time.monotonic() - t0 - record.get("slot_wait_s", 0.0), 1)
             record["inputs"] = case_inputs(case)  # the frozen bytes it loaded (compare.input_check)
             record.update(started_ns=start_ns, finished_ns=time.time_ns(), block=args.block, layout=args.layout,

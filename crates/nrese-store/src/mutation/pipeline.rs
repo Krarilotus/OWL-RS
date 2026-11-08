@@ -235,11 +235,13 @@ impl MutationPipeline {
             // So does the process's memory limit: the commit is refused, not the machine.
             let memory = self.store.memory_stop();
             let stop = || ticket.is_cancelled() || memory.exceeded();
+            let room = || memory.room();
+            let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
             // The violations' list draws on the request's envelope: past it, the list stops
             // and the commit is still rejected (the change is inconsistent either way).
             let report_memory = Arc::new(envelope.part());
             let (violations, materialisation, changed) =
-                crate::reasoning::apply_delta(program, cached, &mut tx, &stop, &report_memory)
+                crate::reasoning::apply_delta(program, cached, &mut tx, &operation, &report_memory)
                     .map_err(|interrupted| {
                         memory
                             .error(interrupted)
@@ -353,7 +355,13 @@ impl MutationPipeline {
             let supports = self.store.supports();
             let touched = supports.wants_commits().then(|| supports.touched(&tx));
             let before = tx.base().revision();
-            let summary = tx.commit().map_err(|error| MutationError::Store {
+            // With the rewriting on, the QL schema notes what the commit changes of
+            // individuals' memberships of class expressions, before the commit publishes.
+            let summary = match self.store.query_settings().ql() {
+                Some(ql) => ql.commit(tx),
+                None => tx.commit(),
+            }
+            .map_err(|error| MutationError::Store {
                 kind,
                 source: StoreError::Engine(error),
             })?;
