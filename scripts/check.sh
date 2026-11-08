@@ -238,14 +238,13 @@ harness() {
     --all-targets
   step "test (bench harness)" "$guarded" test --locked --manifest-path $manifest --no-fail-fast
 }
-# The console's typecheck and tests, wherever the tier runs. A gate's checkout is fresh: the
-# dependencies come from the console's lockfile first, and a host that can't install them fails
-# that step by name; the console is never passed unchecked (benches/suite/tests/test_console_step.py).
+# The console's typecheck and tests, wherever the tier runs. The dependencies come from the
+# console's lockfile first, every time (`npm ci` replaces node_modules: the Linux gate's worktree
+# keeps an earlier tree's, sol-loop r1 S1), and a host that can't install them fails that step by
+# name; the console is never passed unchecked (benches/suite/tests/test_console_step.py).
 console() {
-  if [ ! -d apps/nrese-console/node_modules ]; then
-    step "console dependencies" npm --prefix apps/nrese-console ci --no-audit --no-fund
-    [ "${results[-1]%% *}" = 0 ] || return 0
-  fi
+  step "console dependencies" npm --prefix apps/nrese-console ci --no-audit --no-fund
+  [ "${results[-1]%% *}" = 0 ] || return 0
   step "console typecheck" npm --prefix apps/nrese-console run typecheck
   step "console tests" npx --prefix apps/nrese-console vitest run --root apps/nrese-console
 }

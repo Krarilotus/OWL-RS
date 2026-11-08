@@ -31,13 +31,17 @@ gate_node() {
   suite_python_entry "$cache/node-$version-${sha:0:12}" gate_node_is gate_node_unpack "$version" "$platform" "$sha"
 }
 
-# DIR VERSION PLATFORM SHA256: DIR's directory of node and npm, if its node reports VERSION.
+# DIR VERSION PLATFORM SHA256: DIR's directory of node, npm and npx, if its node reports VERSION and
+# its npm runs: an entry without them would leave PATH to the host's npm, which may run the host's
+# node (sol-loop r1 S2).
 gate_node_is() {
   local bin=$1/bin found
   [ "$3" != win-x64 ] || bin=$1
   [ -x "$bin/node" ] || [ -x "$bin/node.exe" ] || return 1
   found=$("$bin/node" --version 2> /dev/null | tr -d '\r')
   [ "$found" = "v$2" ] || { echo "$bin/node reports ${found:-nothing}, not the pinned v$2" >&2; return 1; }
+  [ -e "$bin/npm" ] && [ -e "$bin/npx" ] && PATH="$bin:$PATH" "$bin/npm" --version > /dev/null 2>&1 \
+    || { echo "$bin has no npm and npx of its own that run" >&2; return 1; }
   echo "$bin"
 }
 
