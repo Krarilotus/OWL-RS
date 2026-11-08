@@ -36,7 +36,7 @@ impl From<WriteError> for crate::StoreError {
 }
 
 /// Writes `bytes` to `file`: into a temporary file beside it, synced, renamed over `file`,
-/// and the directory synced (on Unix; Windows has no directory sync, as in the engine).
+/// and the directory synced ([`nrese_engine::place`]).
 pub(crate) fn write(file: &Path, bytes: &[u8]) -> Result<(), WriteError> {
     let dir = file.parent().unwrap_or_else(|| Path::new("."));
     let mut staged = file.as_os_str().to_owned();
@@ -47,7 +47,7 @@ pub(crate) fn write(file: &Path, bytes: &[u8]) -> Result<(), WriteError> {
         out.write_all(bytes)?;
         out.sync_all()?;
         drop(out);
-        fs::rename(&staged, file)
+        nrese_engine::place::rename(&staged, file)
     })();
     if let Err(error) = result {
         let _ = fs::remove_file(&staged);
@@ -89,11 +89,8 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
     if tests::FAIL_DIR_SYNC.get() {
         return Err(std::io::Error::other("directory sync failed (a test's)"));
     }
-    #[cfg(unix)]
-    File::open(dir)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = dir;
-    Ok(())
+    // A real sync on every platform, Windows included (the engine's placement owner).
+    nrese_engine::place::sync_dir(dir)
 }
 
 #[cfg(test)]

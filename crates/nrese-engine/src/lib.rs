@@ -32,7 +32,7 @@ pub mod quad;
 pub mod term;
 
 pub use durability::checkpoint::image_revision;
-pub use durability::{DurabilityConfig, SyncPolicy, WalDamage};
+pub use durability::{DurabilityConfig, SyncPolicy, WalDamage, place};
 pub use engine::{
     Applied, BulkLoad, BulkMode, CommitSummary, Content, Count, Engine, EngineConfig, EngineStats,
     EqualityClasses, HeavyGroups, ImageInfo, InferredMask, InferredSubset, LogBatch,

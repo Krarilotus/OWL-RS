@@ -1152,6 +1152,7 @@ dependencies = [
  "crc32fast",
  "fsst-rs",
  "hashbrown 0.16.1",
+ "libc",
  "memchr",
  "memmap2",
  "nrese-exec",
@@ -1164,6 +1165,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

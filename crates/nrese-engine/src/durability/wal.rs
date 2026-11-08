@@ -361,9 +361,10 @@ impl Wal {
 /// Moves a segment into `archive` (a copy where a rename can't cross file systems).
 fn archive_segment(path: &Path, archive: &Path) -> EngineResult<()> {
     let target = archive.join(path.file_name().expect("segment file name"));
-    if fs::rename(path, &target).is_err() {
-        fs::copy(path, &target)?;
-        File::open(&target)?.sync_all()?;
+    if super::place::rename(path, &target).is_err() {
+        // Synced through a writable handle (the read-only one this took before can't be
+        // flushed on Windows), and in place before the original goes.
+        super::place::copy(path, &target)?;
         fs::remove_file(path)?;
     }
     super::sync_dir(archive)?;
@@ -394,7 +395,7 @@ fn create_segment(dir: &Path, first_revision: u64, magic: &[u8; 8]) -> EngineRes
         let _ = fs::remove_file(&temporary);
         return Err(error.into());
     }
-    fs::rename(&temporary, &path)?;
+    super::place::rename(&temporary, &path)?;
     #[cfg(test)]
     super::fault::check(&super::fault::FAIL_SEGMENT_PLACED, "segment directory sync")?;
     super::sync_dir(dir)?;
