@@ -420,6 +420,268 @@ fn axioms_beyond_ql_that_meet_anonymous_individuals_are_hazards() {
     );
 }
 
+/// Existentials in a conclusion the TBox doesn't read make anonymous individuals no
+/// generator types (I24b). Each row gives the entailment that names the terms, from the
+/// OWL 2 Direct Semantics. A row expecting nothing has no anonymous individual to meet.
+/// - `C ⊑ ∀R.∃S.A`: an `R`-successor of a `C` has an `S`-successor in `A`. The same holds
+///   through an inverse, nested under `∀T`, and for `∃S.⊤` (`S` only).
+/// - `C ⊑ ∃R.A ⊔ ∃R.B`: a `C` has an `R`-successor.
+/// - `C ⊑ ¬∀R.¬A`, which is `∃R.A`.
+/// - An individual asserted to be in `∀R.∃S.A`, with an `R`-successor: that successor has
+///   an `S`-successor in `A`.
+/// - A left side the TBox doesn't read, or reads in part (review r1, F1): `A ⊓ B ⊑ ∃S.A`
+///   gives an `A ⊓ B` an `S`-successor in `A`. The same holds for `A ⊓ B ⊑ ∀R.∃S.A`, and
+///   for the unread branch of `A ⊔ (B ⊓ E) ⊑ ∃S.A`.
+/// - `DisjointUnion(C, ∃R.A, ∃R.B)` (F2): a `C` has an `R`-successor (the direction from
+///   `C` to the union).
+/// - Nothing: `∀R.⊤`, `∀R.⊥`, `≤ 0 R`, `∀` over a data property, and an unread left side
+///   whose conclusion is a class (`A ⊓ B ⊑ C`).
+#[test]
+fn existentials_in_right_sides_the_tbox_reads_as_nothing_are_hazards() {
+    let untyped = |r: &str, ts: &[&str]| -> Vec<String> {
+        ts.iter()
+            .map(|t| format!("{t}: an existential on {r} in a conclusion the TBox doesn't read"))
+            .collect()
+    };
+    let asserted = |r: &str, ts: &[&str]| -> Vec<String> {
+        ts.iter()
+            .map(|t| format!("{t}: an individual is asserted to be in an existential on {r}"))
+            .collect()
+    };
+    let some = "ObjectSomeValuesFrom(:S :A)";
+    let rows: Vec<(String, &str, Vec<String>)> = vec![
+        (
+            format!("SubClassOf(:C ObjectAllValuesFrom(:R {some}))"),
+            "S(?x ?y), A(?y)",
+            untyped("S", &["S", "A"]),
+        ),
+        (
+            format!("SubClassOf(:C ObjectAllValuesFrom(ObjectInverseOf(:R) {some}))"),
+            "S(?x ?y), A(?y)",
+            untyped("S", &["S", "A"]),
+        ),
+        (
+            format!("SubClassOf(:C ObjectAllValuesFrom(:R ObjectAllValuesFrom(:T {some})))"),
+            "S(?x ?y), A(?y)",
+            untyped("S", &["S", "A"]),
+        ),
+        (
+            "SubClassOf(:C ObjectAllValuesFrom(:R ObjectSomeValuesFrom(:S owl:Thing)))".into(),
+            "S(?x ?y)",
+            untyped("S", &["S"]),
+        ),
+        (
+            "SubClassOf(:C ObjectUnionOf(ObjectSomeValuesFrom(:R :A) ObjectSomeValuesFrom(:R :B)))"
+                .into(),
+            "R(?x ?y)",
+            untyped("R", &["R"]),
+        ),
+        (
+            "SubClassOf(:C ObjectComplementOf(ObjectAllValuesFrom(:R ObjectComplementOf(:A))))"
+                .into(),
+            "R(?x ?y), A(?y)",
+            untyped("R", &["R", "A"]),
+        ),
+        (
+            format!("ClassAssertion(ObjectAllValuesFrom(:R {some}) :c)\nObjectPropertyAssertion(:R :c :x)"),
+            "S(?x ?y), A(?y)",
+            asserted("S", &["S", "A"]),
+        ),
+        (
+            format!("SubClassOf(ObjectIntersectionOf(:A :B) {some})"),
+            "S(?x ?y), A(?y)",
+            untyped("S", &["S", "A"]),
+        ),
+        (
+            format!("SubClassOf(ObjectIntersectionOf(:A :B) ObjectAllValuesFrom(:R {some}))"),
+            "S(?x ?y), A(?y)",
+            untyped("S", &["S", "A"]),
+        ),
+        (
+            "SubClassOf(ObjectUnionOf(:A ObjectIntersectionOf(:B :E)) ObjectSomeValuesFrom(:S :D))"
+                .into(),
+            "S(?x ?y), D(?y)",
+            untyped("S", &["S", "D"]),
+        ),
+        (
+            "DisjointUnion(:C ObjectSomeValuesFrom(:R :A) ObjectSomeValuesFrom(:R :B))".into(),
+            "R(?x ?y)",
+            untyped("R", &["R"]),
+        ),
+        (
+            "SubClassOf(ObjectIntersectionOf(:A :B) :C)".into(),
+            "C(?x), A(?x)",
+            Vec::new(),
+        ),
+        (
+            "SubClassOf(:C ObjectAllValuesFrom(:R owl:Thing))".into(),
+            "R(?x ?y), C(?x)",
+            Vec::new(),
+        ),
+        (
+            "SubClassOf(:C ObjectAllValuesFrom(:R owl:Nothing))".into(),
+            "R(?x ?y), C(?x)",
+            Vec::new(),
+        ),
+        (
+            "SubClassOf(:C ObjectMaxCardinality(0 :R))".into(),
+            "R(?x ?y), C(?x)",
+            Vec::new(),
+        ),
+        (
+            "Declaration(DataProperty(:d))\nSubClassOf(:C DataAllValuesFrom(:d <http://www.w3.org/2001/XMLSchema#integer>))"
+                .into(),
+            "d(?x ?y), C(?x)",
+            Vec::new(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (axioms, atoms, expected) in rows {
+        let found = concerns(&axioms, atoms);
+        if found != expected {
+            wrong.push(format!(
+                "{axioms}\n  {atoms}: {found:?}, expected {expected:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Disjointness concludes a part's complement (fix check r1, F3), read in negation normal
+/// form. An `A` disjoint from `≤ 0 S.D` is in `≥ 1 S.D`; one disjoint from `∀S.¬D` is in
+/// `∃S.D`. Either way it has an `S`-successor in `D` (OWL 2 Direct Semantics), so every
+/// atom of `S(?x ?y), D(?y)` has a concern. The reason may be any hazard that reaches it.
+/// Guards, with no anonymous individual: `≤ 0 S.D` and `∀S.¬D` as a plain conclusion, and
+/// named disjoint classes.
+#[test]
+fn disjointness_concludes_the_complement_of_its_parts() {
+    let none = "ObjectMaxCardinality(0 :S :D)";
+    let all_not = "ObjectAllValuesFrom(:S ObjectComplementOf(:D))";
+    let mut wrong = Vec::new();
+    for axioms in [
+        format!("DisjointUnion(:C :A {none})"),
+        format!("DisjointUnion(:C :A {all_not})"),
+        format!("DisjointClasses(:A {none})"),
+        format!("DisjointClasses({all_not} :A)"),
+    ] {
+        let found = concerns(&axioms, "S(?x ?y), D(?y)");
+        if found.len() != 2 {
+            wrong.push(format!(
+                "{axioms}: {found:?}, expected a concern on S and on D"
+            ));
+        }
+    }
+    for axioms in [
+        format!("SubClassOf(:C {none})"),
+        format!("SubClassOf(:C {all_not})"),
+        "DisjointClasses(:A :B)".to_owned(),
+    ] {
+        let found = concerns(&axioms, "S(?x ?y), D(?y), A(?x)");
+        if !found.is_empty() {
+            wrong.push(format!("{axioms}: {found:?}, expected nothing"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A bounded restriction makes no successor itself, but it can force an existential on a
+/// successor that exists (fix check r2, F4). With `X = ∃S.D`, each conclusion below gives
+/// an `R`-successor of a `C` an `S`-successor in `D`, or may for some successor (OWL 2
+/// Direct Semantics §2.2.3): `≤ 0 R.¬X`, `¬≥ 1 R.¬X` and `= 0 R.¬X` are `∀R.X`; `≤ 1 R.¬X`,
+/// `¬≥ 2 R.¬X` and `= 1 R.¬X` put every `R`-successor past the first in `X`; `≤ 0 R.∀S.¬D`
+/// is `∀R.X` too. The same holds under `∀T` and nested twice, through an inverse, in a
+/// disjointness, in an asserted membership, and for a data existential (`∃d.integer`).
+/// (`∀R.X` alone is a row of the test above.) So every atom of the
+/// existential has a concern; the reason may be any hazard that reaches it.
+/// Guards, with no existential inside: `≤ 1 R.D`, `= 0 R.D`, `¬≥ 1 R.D` and `∀R.∀S.¬D`
+/// conclude nothing of a successor's successors, and nothing of `C`'s: nothing.
+#[test]
+fn existentials_under_bounded_restrictions_are_hazards() {
+    let x = "ObjectSomeValuesFrom(:S :D)";
+    let not_x = format!("ObjectComplementOf({x})");
+    let atoms = "S(?x ?y), D(?y)";
+    let rows: Vec<(String, &str, &[&str])> = vec![
+        (format!("SubClassOf(:C ObjectMaxCardinality(0 :R {not_x}))"), atoms, &["S", "D"]),
+        (format!("SubClassOf(:C ObjectMaxCardinality(1 :R {not_x}))"), atoms, &["S", "D"]),
+        (format!("SubClassOf(:C ObjectExactCardinality(0 :R {not_x}))"), atoms, &["S", "D"]),
+        (format!("SubClassOf(:C ObjectExactCardinality(1 :R {not_x}))"), atoms, &["S", "D"]),
+        (
+            format!("SubClassOf(:C ObjectComplementOf(ObjectMinCardinality(1 :R {not_x})))"),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            format!("SubClassOf(:C ObjectComplementOf(ObjectMinCardinality(2 :R {not_x})))"),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            "SubClassOf(:C ObjectMaxCardinality(0 :R ObjectAllValuesFrom(:S ObjectComplementOf(:D))))"
+                .into(),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            format!("SubClassOf(:C ObjectAllValuesFrom(:T ObjectMaxCardinality(0 :R {not_x})))"),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            format!(
+                "SubClassOf(:C ObjectComplementOf(ObjectMinCardinality(1 :T ObjectComplementOf(ObjectExactCardinality(0 :R {not_x})))))"
+            ),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            format!("SubClassOf(:C ObjectMaxCardinality(0 ObjectInverseOf(:R) {not_x}))"),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            format!("DisjointClasses(:A ObjectMinCardinality(1 :R {not_x}))"),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            format!(
+                "ClassAssertion(ObjectMaxCardinality(0 :R {not_x}) :c)\nObjectPropertyAssertion(:R :c :x)"
+            ),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            "Declaration(DataProperty(:d))\nSubClassOf(:C ObjectMaxCardinality(0 :R ObjectComplementOf(DataSomeValuesFrom(:d <http://www.w3.org/2001/XMLSchema#integer>))))"
+                .into(),
+            "d(?x ?y)",
+            &["d"],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (axioms, atoms, terms) in rows {
+        let found = concerns(&axioms, atoms);
+        for t in terms {
+            if !found.iter().any(|c| c.starts_with(&format!("{t}: "))) {
+                wrong.push(format!(
+                    "{axioms}\n  {atoms}: {found:?}, expected a concern on {t}"
+                ));
+            }
+        }
+    }
+    for axioms in [
+        "SubClassOf(:C ObjectMaxCardinality(1 :R :D))",
+        "SubClassOf(:C ObjectExactCardinality(0 :R :D))",
+        "SubClassOf(:C ObjectComplementOf(ObjectMinCardinality(1 :R :D)))",
+        "SubClassOf(:C ObjectAllValuesFrom(:R ObjectAllValuesFrom(:S ObjectComplementOf(:D))))",
+    ] {
+        let found = concerns(axioms, "R(?x ?y), S(?y ?z), D(?z), C(?x)");
+        if !found.is_empty() {
+            wrong.push(format!("{axioms}: {found:?}, expected nothing"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 #[test]
 fn an_equating_hazard_is_not_hidden_by_another_on_the_same_role() {
     // Found by the mixed differential test (case 2378 of seed 11): a transitive property
