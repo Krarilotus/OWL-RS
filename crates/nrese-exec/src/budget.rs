@@ -1336,7 +1336,9 @@ impl<T, H: Hold> Charged<T, H> {
     }
 
     pub fn push(&mut self, item: T) -> Result<(), BudgetExceeded> {
-        self.reserve(1)?;
+        if self.items.len() == self.items.capacity() {
+            self.reserve(1)?;
+        }
         self.items.push(item);
         Ok(())
     }
@@ -1460,6 +1462,18 @@ impl<T> Room<'_, T> {
             "past the room reserved"
         );
         self.0.extend_from_slice(items);
+    }
+
+    /// `items` appended at once, as many as they say they are: one check of the room, not
+    /// one an item ([`Self::push`]; a path's columns, made of millions of copies, paid one
+    /// each). Panics where there is no room for them; items past the room, where an iterator
+    /// yields more than it said, are cut there, never grow the vector.
+    pub fn extend<I: IntoIterator<Item = T, IntoIter: ExactSizeIterator>>(&mut self, items: I) {
+        let items = items.into_iter();
+        let room = self.0.capacity() - self.0.len();
+        assert!(items.len() <= room, "past the room reserved");
+        // Taken at most `room`: an iterator longer than it says can't grow the vector.
+        self.0.extend(items.take(room));
     }
 
     /// The room left, to be written; [`Self::set_len`] then takes what was written.
@@ -1917,6 +1931,42 @@ mod tests {
             "each item made dropped once"
         );
         assert_eq!(budget.used(), items.charged(), "the items' memory released");
+    }
+
+    /// A writer's run of items ([`Room::extend`]) can't grow its vector either: one that says
+    /// it has more items than the room left panics before anything is written, and one that
+    /// yields more than it says is cut at the room. Within the room, the items come in order.
+    #[test]
+    fn a_run_of_items_stays_within_the_room() {
+        /// Says it has one item, yields `n`.
+        struct Lying(usize);
+        impl Iterator for Lying {
+            type Item = u64;
+            fn next(&mut self) -> Option<u64> {
+                self.0.checked_sub(1).map(|left| {
+                    self.0 = left;
+                    left as u64
+                })
+            }
+        }
+        impl ExactSizeIterator for Lying {
+            fn len(&self) -> usize {
+                1
+            }
+        }
+        let budget = Budget::new(1 << 10);
+        let mut vec: ChargedVec<u64, &Budget> = ChargedVec::with_capacity(&budget, 4).unwrap();
+        let past = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            vec.fill(0, |room| room.extend([1, 2, 3, 4, 5]))
+        }));
+        assert!(past.is_err());
+        assert!(vec.is_empty());
+        vec.fill(0, |room| room.extend(Lying(10))).unwrap();
+        assert_eq!((vec.len(), vec.capacity(), budget.used()), (4, 4, 32));
+        vec.truncate(0);
+        vec.fill(0, |room| room.extend(std::iter::repeat_n(7, 3)))
+            .unwrap();
+        assert_eq!(&vec[..], &[7, 7, 7]);
     }
 
     /// A charged vector never holds more than it was charged: every path that grows it
