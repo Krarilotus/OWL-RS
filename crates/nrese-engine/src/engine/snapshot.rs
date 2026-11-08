@@ -727,8 +727,8 @@ impl Snapshot {
     /// [`Self::with_inferred_added_within`] for statements this snapshot's own DL bounds
     /// derive from it alone: the view keeps this snapshot's publication (a published
     /// snapshot's gets a token, an unpublished one's none). F2's contract revision for the
-    /// store's DL bounds (the master, 8 Nov): they are its only caller, and a test fails any
-    /// other (`tests/derived_view_callers.rs`).
+    /// store's DL bounds (the master, 8 Nov): they are its only caller. The workspace's
+    /// `clippy.toml` disallows it everywhere else, a source policy, not a capability.
     pub fn with_inferred_derived_within(
         &self,
         derived: &[crate::quad::EncodedTriple],
