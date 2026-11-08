@@ -388,6 +388,11 @@ impl StoreService {
             return Ok(());
         };
         let temporary = path.with_extension("tmp");
+        // "A marker may be in place", before anything is written (fix check r1, R2-F2): a
+        // publication that fails after its rename leaves the marker under its name, and the
+        // next invalidation must remove it, or refuse, not skip it.
+        self.marker
+            .store(true, std::sync::atomic::Ordering::Release);
         // Synced and durably named (DUR-3): read at open, a marker lost or short after a power
         // loss would misstate what the inferred stack is exact for.
         let placed = (|| {
@@ -406,8 +411,6 @@ impl StoreService {
             nrese_engine::place::sync_dir(&self.config.data_dir)
         })();
         placed.map_err(crate::error::StoreError::Io)?;
-        self.marker
-            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 

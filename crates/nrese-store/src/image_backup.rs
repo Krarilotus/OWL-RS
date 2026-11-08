@@ -92,8 +92,23 @@ pub(crate) fn backup_image(
     };
     let json = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| StoreError::Configuration(error.to_string()))?;
+    // Written under a temporary name, synced, then placed and its directory synced (fix check
+    // r1): a restore reads it, and a backup reported done must not lose it to a power loss.
     let path = dir.join(MANIFEST);
-    fs::write(&path, json).map_err(|e| io(e, &path))?;
+    let temporary = path.with_extension("tmp");
+    let placed = (|| {
+        use std::io::Write as _;
+        let mut file = fs::File::create(&temporary)?;
+        file.write_all(&json)?;
+        file.sync_all()?;
+        drop(file);
+        nrese_engine::place::rename(&temporary, &path)?;
+        nrese_engine::place::sync_dir(dir)
+    })();
+    if let Err(error) = placed {
+        let _ = fs::remove_file(&temporary);
+        return Err(io(error, &path));
+    }
     Ok(manifest)
 }
 
