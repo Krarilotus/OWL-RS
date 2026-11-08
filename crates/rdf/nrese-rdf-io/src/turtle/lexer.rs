@@ -114,6 +114,119 @@ pub(crate) enum Lexed {
     Error(usize, &'static str),
 }
 
+/// The tokens that open something a statement must close: `[`, `(`, `<<(`, `<<`, `{|`. A
+/// pattern, the one list for a failing token (`unexpected`), for skipping a failed
+/// statement's rest (`resync`), for the skimmer's cuts (`split`) and for debug builds' count
+/// in `take`; [`pair`] pairs each with its closer.
+macro_rules! opener {
+    () => {
+        Kind::OpenBracket
+            | Kind::OpenParen
+            | Kind::TripleTermOpen
+            | Kind::ReifiedOpen
+            | Kind::AnnotationOpen
+    };
+}
+
+/// Their closers: `]`, `)`, `)>>`, `>>`, `|}`.
+macro_rules! closer {
+    () => {
+        Kind::CloseBracket
+            | Kind::CloseParen
+            | Kind::TripleTermClose
+            | Kind::ReifiedClose
+            | Kind::AnnotationClose
+    };
+}
+
+/// Which pair an [`opener!`] or [`closer!`] token is of: `[ ]`, `( )`, `<<( )>>`, `<< >>`,
+/// `{| |}`.
+pub(crate) fn pair(kind: Kind) -> usize {
+    match kind {
+        Kind::OpenBracket | Kind::CloseBracket => 0,
+        Kind::OpenParen | Kind::CloseParen => 1,
+        Kind::TripleTermOpen | Kind::TripleTermClose => 2,
+        Kind::ReifiedOpen | Kind::ReifiedClose => 3,
+        _ => 4,
+    }
+}
+
+/// An opener or closer met where a statement is skipped (a failed statement's rest, or the
+/// skimmer's view of a document), applied to what is open there: `open` (pairs, outermost
+/// first) and `counts` (how many of each pair it holds). An opener opens. A closer closes the
+/// innermost open bracket of its own pair, and the unfinished ones opened inside it go with
+/// it; with none of its pair open, it closes nothing. Each bracket is opened and closed once,
+/// and a closer of a pair not open costs O(1): linear work.
+pub(crate) fn bracket(open: &mut Vec<usize>, counts: &mut [usize; 5], kind: Kind) {
+    let pair = pair(kind);
+    if matches!(kind, opener!()) {
+        counts[pair] += 1;
+        open.push(pair);
+    } else if counts[pair] > 0 {
+        while let Some(inner) = open.pop() {
+            counts[inner] -= 1;
+            if inner == pair {
+                break;
+            }
+        }
+    }
+}
+
+/// What a byte that may start a delimiter (`[ ] ( ) { } < > |`) starts, as [`lex`] reads it:
+/// the one reading the lexer and the skimmer (`split`) share.
+pub(crate) enum Delimiter {
+    /// A delimiter of this kind and length.
+    Token(Kind, usize),
+    /// A `>` or `|` that starts none: a byte the lexer can't read, and why.
+    Bad(&'static str),
+    /// The input ends inside it; more may come.
+    NeedMore,
+}
+
+/// The delimiter at `input[start]`: `[`, `]`, `(`, `)`, `{`, `}`, and, outside N3, `<<(`,
+/// `<<`, `)>>`, `>>`, `{|` and `|}`. `None` for anything else (a `<` that starts an IRI
+/// included). `eof`: no more input will come.
+#[inline(always)]
+pub(crate) fn delimiter(input: &[u8], start: usize, eof: bool, n3: bool) -> Option<Delimiter> {
+    let next = |k: usize| input.get(start + k).copied();
+    // A byte after the first, or "need more" if it may still come.
+    macro_rules! need {
+        ($k:expr) => {
+            match next($k) {
+                Some(b) => Some(b),
+                None if eof => None,
+                None => return Some(Delimiter::NeedMore),
+            }
+        };
+    }
+    let token = |kind, len| Some(Delimiter::Token(kind, len));
+    match input[start] {
+        b'<' if !n3 && need!(1) == Some(b'<') => match need!(2) {
+            Some(b'(') => token(Kind::TripleTermOpen, 3),
+            _ => token(Kind::ReifiedOpen, 2),
+        },
+        b'>' => match need!(1) {
+            Some(b'>') => token(Kind::ReifiedClose, 2),
+            _ => Some(Delimiter::Bad("expected '>>'")),
+        },
+        b'|' => match need!(1) {
+            Some(b'}') => token(Kind::AnnotationClose, 2),
+            _ => Some(Delimiter::Bad("expected '|}'")),
+        },
+        b'[' => token(Kind::OpenBracket, 1),
+        b']' => token(Kind::CloseBracket, 1),
+        b'(' => token(Kind::OpenParen, 1),
+        b')' if !n3 && need!(1) == Some(b'>') && need!(2) == Some(b'>') => {
+            token(Kind::TripleTermClose, 3)
+        }
+        b')' => token(Kind::CloseParen, 1),
+        b'{' if !n3 && need!(1) == Some(b'|') => token(Kind::AnnotationOpen, 2),
+        b'{' => token(Kind::OpenBrace, 1),
+        b'}' => token(Kind::CloseBrace, 1),
+        _ => None,
+    }
+}
+
 /// Reads the next token of `input`. `eof`: no more input will come. `after_string`: the
 /// previous token was a string, so `@` starts a language tag (not `@prefix`). `n3`: N3's
 /// tokens too.
@@ -149,28 +262,26 @@ pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool, n3: bool) -> Lexe
         },
         b'!' if n3 => token(Kind::Bang, start, start..start + 1, start + 1),
         b'?' if n3 => variable(input, start, eof),
-        b'<' if need!(1) == Some(b'<') => match need!(2) {
-            Some(b'(') => token(Kind::TripleTermOpen, start, start..start + 3, start + 3),
-            _ => token(Kind::ReifiedOpen, start, start..start + 2, start + 2),
-        },
-        b'>' => match need!(1) {
-            Some(b'>') => token(Kind::ReifiedClose, start, start..start + 2, start + 2),
-            _ => Lexed::Error(start, "expected '>>'"),
-        },
-        b'~' => token(Kind::Tilde, start, start..start + 1, start + 1),
-        b'|' => match need!(1) {
-            Some(b'}') => token(Kind::AnnotationClose, start, start..start + 2, start + 2),
-            _ => Lexed::Error(start, "expected '|}'"),
-        },
-        b'<' => match memchr::memchr(b'>', &input[start..]) {
-            Some(k) => {
-                let text = start + 1..start + k;
-                let escaped = input[text.clone()].contains(&b'\\');
-                token(Kind::IriRef { escaped }, start, text, start + k + 1)
+        b'<' | b'>' | b'|' | b'[' | b']' | b'(' | b')' | b'{' | b'}' => {
+            match delimiter(input, start, eof, n3) {
+                Some(Delimiter::Token(kind, len)) => {
+                    token(kind, start, start..start + len, start + len)
+                }
+                Some(Delimiter::Bad(message)) => Lexed::Error(start, message),
+                Some(Delimiter::NeedMore) => Lexed::NeedMore,
+                // A `<` that starts an IRI.
+                None => match memchr::memchr(b'>', &input[start..]) {
+                    Some(k) => {
+                        let text = start + 1..start + k;
+                        let escaped = input[text.clone()].contains(&b'\\');
+                        token(Kind::IriRef { escaped }, start, text, start + k + 1)
+                    }
+                    None if eof => Lexed::Error(start, "an IRI without its closing '>'"),
+                    None => Lexed::NeedMore,
+                },
             }
-            None if eof => Lexed::Error(start, "an IRI without its closing '>'"),
-            None => Lexed::NeedMore,
-        },
+        }
+        b'~' => token(Kind::Tilde, start, start..start + 1, start + 1),
         b'"' | b'\'' => string::<false>(input, start, eof),
         b'_' => match need!(1) {
             Some(b':') => blank_label(input, start, eof),
@@ -201,18 +312,6 @@ pub(crate) fn lex(input: &[u8], eof: bool, after_string: bool, n3: bool) -> Lexe
         b'+' | b'-' | b'0'..=b'9' => number(input, start, eof),
         b';' => token(Kind::Semicolon, start, start..start + 1, start + 1),
         b',' => token(Kind::Comma, start, start..start + 1, start + 1),
-        b'[' => token(Kind::OpenBracket, start, start..start + 1, start + 1),
-        b']' => token(Kind::CloseBracket, start, start..start + 1, start + 1),
-        b'(' => token(Kind::OpenParen, start, start..start + 1, start + 1),
-        b')' if !n3 && need!(1) == Some(b'>') && need!(2) == Some(b'>') => {
-            token(Kind::TripleTermClose, start, start..start + 3, start + 3)
-        }
-        b')' => token(Kind::CloseParen, start, start..start + 1, start + 1),
-        b'{' if !n3 && need!(1) == Some(b'|') => {
-            token(Kind::AnnotationOpen, start, start..start + 2, start + 2)
-        }
-        b'{' => token(Kind::OpenBrace, start, start..start + 1, start + 1),
-        b'}' => token(Kind::CloseBrace, start, start..start + 1, start + 1),
         b'^' => match need!(1) {
             Some(b'^') => token(Kind::Datatype, start, start..start + 2, start + 2),
             _ if n3 => token(Kind::Caret, start, start..start + 1, start + 1),
