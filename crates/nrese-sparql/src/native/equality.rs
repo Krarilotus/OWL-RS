@@ -104,6 +104,7 @@ fn build<E>(
         return Ok(out);
     }
     let Some(same_as) = snapshot.lookup(NamedNodeRef::new_unchecked(SAME_AS).into()) else {
+        room(0)?;
         return Ok(out);
     };
     let pattern = QuadPattern {
