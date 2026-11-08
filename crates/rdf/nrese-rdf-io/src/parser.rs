@@ -18,7 +18,7 @@ use crate::jsonld::JsonLdOptions;
 use crate::jsonld::parser::{JsonLdParser, JsonLdSettings};
 use crate::ntriples::LineParser;
 use crate::rdfxml::{RdfXmlParser, RdfXmlSettings};
-use crate::turtle::split::{Skimmer, directives_before};
+use crate::turtle::split::{Skim, Skimmer, directives_before};
 use crate::turtle::{TurtleParser, TurtleSettings};
 
 /// How to read a document: its format, and the settings that apply to every format.
@@ -246,24 +246,7 @@ impl RdfParser {
             let mut skimmer = Skimmer::new(bytes.len() as u64, parts, trig);
             skimmer.feed(bytes);
             let skim = skimmer.finish();
-            let mut starts = vec![(0, 0, 0)];
-            starts.extend(skim.cuts.iter().copied());
-            let mut parsers = Vec::with_capacity(starts.len());
-            for (i, &(start, line, line_start)) in starts.iter().enumerate() {
-                let end = starts.get(i + 1).map_or(bytes.len() as u64, |s| s.0);
-                let parser = TurtleParser::from_slice(
-                    &bytes[start as usize..end as usize],
-                    self.turtle_settings(),
-                )
-                .for_chunk(
-                    start,
-                    line,
-                    line_start,
-                    &directives_before(&skim, start),
-                )?;
-                parsers.push(self.clone().wrap(Inner::Turtle(parser)));
-            }
-            return Ok(parsers);
+            return self.turtle_chunks(bytes, &skim, &skim.cuts);
         }
         self.line_based()?;
         let bounds = boundaries(bytes.len() as u64, parts, |at| {
@@ -280,6 +263,29 @@ impl RdfParser {
                 )
             })
             .collect())
+    }
+
+    /// Turtle or TriG `bytes` in chunks starting at `cuts` (cuts of `skim`, the skim of
+    /// `bytes`), each starting with the directives in force there.
+    fn turtle_chunks<'b>(
+        &self,
+        bytes: &'b [u8],
+        skim: &Skim,
+        cuts: &[(u64, u64, u64)],
+    ) -> Result<Vec<QuadParser<'b, io::Empty>>, RdfParseError> {
+        let mut starts = vec![(0, 0, 0)];
+        starts.extend(cuts.iter().copied());
+        let mut parsers = Vec::with_capacity(starts.len());
+        for (i, &(start, line, line_start)) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).map_or(bytes.len() as u64, |s| s.0);
+            let parser = TurtleParser::from_slice(
+                &bytes[start as usize..end as usize],
+                self.turtle_settings(),
+            )
+            .for_chunk(start, line, line_start, &directives_before(skim, start))?;
+            parsers.push(self.clone().wrap(Inner::Turtle(parser)));
+        }
+        Ok(parsers)
     }
 
     /// The file at `path` in up to `parts` chunks that parse independently, each read
@@ -606,3 +612,6 @@ impl<R: Read> Iterator for QuadParser<'_, R> {
         Some(self.next_ref()?.map(QuadRef::into_owned))
     }
 }
+
+#[cfg(test)]
+mod split_cuts;
