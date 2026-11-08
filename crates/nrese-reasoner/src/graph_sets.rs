@@ -398,7 +398,8 @@ fn support_sets_run(
         .map_init(
             || Poller::new(&fired),
             |poll, &fact| {
-                let poll = poll.as_ref()?;
+                // A task whose poller has stopped reads nothing more (sol-loop r2 S5).
+                let poll = poll.as_ref().filter(|poll| !poll.stopped())?;
                 let axiom = axioms.binary_search(&fact).is_ok();
                 let graphs = if axiom {
                     Vec::new()
