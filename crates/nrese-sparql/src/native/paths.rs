@@ -283,14 +283,6 @@ impl<T: Copy + Eq + std::hash::Hash + Ord> Union<T> {
         }
     }
 
-    /// The bytes it holds.
-    fn bytes(&self) -> usize {
-        match self {
-            Self::Copies(values) | Self::Support { values, .. } => bytes_of::<T>(values.capacity()),
-            Self::Counted(tally) => tally.bytes(),
-        }
-    }
-
     /// The most it holds, beside `arm`, while [`Self::add`] makes room for `arm`, named
     /// `times`: a vector that grows moves, its old room beside the new until the move ends,
     /// as the budget owner's `ChargedVec` charges it (sol-loop r1 S3 of EMS-R1); a first arm
@@ -341,20 +333,39 @@ impl<T: Copy + Eq + std::hash::Hash + Ord> Union<T> {
                     tally.add(value, copies.saturating_mul(times));
                 }
             }
-            Self::Support { values, distinct } => {
+            Self::Support { values, .. } => {
                 if values.capacity() == 0 {
                     *values = arm.values();
                 } else {
                     values.reserve_exact(arm.entries());
                     values.extend(arm.values());
                 }
-                if *distinct == 0 {
-                    *distinct = values.len();
-                } else if !last && values.len() > distinct.saturating_mul(2) {
-                    values.sort_unstable();
-                    values.dedup();
-                    *distinct = values.len();
-                }
+                self.settle(last);
+            }
+        }
+    }
+
+    /// The vector an arm named `times` can be streamed into, value by value, without a
+    /// vector of its own ([`PathEvaluator::stream`]): the copies' (named once) or the
+    /// support's.
+    fn streamed(&mut self, times: usize) -> Option<&mut Vec<T>> {
+        match self {
+            Self::Copies(values) if times == 1 => Some(values),
+            Self::Support { values, .. } => Some(values),
+            _ => None,
+        }
+    }
+
+    /// A support after an arm (`last`: no arm after it): deduplicated once more than twice
+    /// what the last deduplication left (the first arm's count stands for it).
+    fn settle(&mut self, last: bool) {
+        if let Self::Support { values, distinct } = self {
+            if *distinct == 0 {
+                *distinct = values.len();
+            } else if !last && values.len() > distinct.saturating_mul(2) {
+                values.sort_unstable();
+                values.dedup();
+                *distinct = values.len();
             }
         }
     }
@@ -436,6 +447,36 @@ impl<T> Bag<T> {
             Self::Counted(counted) => bytes_of::<(T, usize)>(counted.capacity()),
         }
     }
+
+    /// Its copies, if it holds copies.
+    fn copies_entries(&self) -> usize {
+        match self {
+            Self::Copies(values) => values.len(),
+            Self::Counted(_) => 0,
+        }
+    }
+
+    /// Its counted values, if it holds counted ones.
+    fn counted_entries(&self) -> usize {
+        match self {
+            Self::Copies(_) => 0,
+            Self::Counted(counted) => counted.len(),
+        }
+    }
+}
+
+/// A vector's capacity once it has room for `additional` more values, at least doubling
+/// where it grows, and the most its room holds meanwhile: the old beside the new while it
+/// moves.
+fn grown<T>(values: &Vec<T>, additional: usize) -> (usize, usize) {
+    let capacity = values.capacity();
+    let wanted = values.len().saturating_add(additional);
+    if wanted <= capacity {
+        return (capacity, bytes_of::<T>(capacity));
+    }
+    let to = wanted.max(capacity.saturating_mul(2));
+    let peak = bytes_of::<T>(capacity).saturating_add(bytes_of::<T>(to));
+    (to, peak)
 }
 
 /// The graph a path is followed in.
@@ -573,7 +614,12 @@ impl PathEvaluator<'_> {
     fn support_from(&self, path: &Path, node: u64) -> Vec<u64> {
         match path {
             Path::Alternative(paths) => self
-                .either(paths, true, |p| Bag::Copies(self.support_from(p, node)))
+                .either(
+                    paths,
+                    true,
+                    |p| Bag::Copies(self.support_from(p, node)),
+                    |p, held, values| self.stream(p, held, values, Some(node), None, |(_, _, o)| o),
+                )
                 .values(),
             Path::Reverse(p) => self.support_to(p, node),
             _ => self.from(path, node).values(),
@@ -584,7 +630,12 @@ impl PathEvaluator<'_> {
     fn support_to(&self, path: &Path, node: u64) -> Vec<u64> {
         match path {
             Path::Alternative(paths) => self
-                .either(paths, true, |p| Bag::Copies(self.support_to(p, node)))
+                .either(
+                    paths,
+                    true,
+                    |p| Bag::Copies(self.support_to(p, node)),
+                    |p, held, values| self.stream(p, held, values, None, Some(node), |(s, _, _)| s),
+                )
                 .values(),
             Path::Reverse(p) => self.support_from(p, node),
             _ => self.to(path, node).values(),
@@ -596,7 +647,12 @@ impl PathEvaluator<'_> {
     fn support(&self, path: &Path) -> Vec<(u64, u64)> {
         match path {
             Path::Alternative(paths) => self
-                .either(paths, true, |p| Bag::Copies(self.support(p)))
+                .either(
+                    paths,
+                    true,
+                    |p| Bag::Copies(self.support(p)),
+                    |p, held, values| self.stream(p, held, values, None, None, |(s, _, o)| (s, o)),
+                )
                 .values(),
             Path::Reverse(p) => {
                 let mut pairs = self.support(p);
@@ -821,7 +877,14 @@ impl PathEvaluator<'_> {
             Path::Reverse(p) => return self.to(p, start),
             Path::Sequence(steps) => return self.through(steps, start, true),
             Path::Alternative(paths) => {
-                return self.either(paths, false, |p| self.from(p, start));
+                return self.either(
+                    paths,
+                    false,
+                    |p| self.from(p, start),
+                    |p, held, values| {
+                        self.stream(p, held, values, Some(start), None, |(_, _, o)| o)
+                    },
+                );
             }
             Path::OneOrMore(p) => reachable(start, false, |n, out| self.step_from(p, n, out)),
             Path::ZeroOrMore(p) => {
@@ -886,41 +949,99 @@ impl PathEvaluator<'_> {
     /// matched when the path is resolved): it is followed once and its values counted as
     /// often, never copied, so `p|p|…` costs and holds what `p` does however often the
     /// path's text repeats it.
-    /// The arms come one at a time ([`Union`]): each charged as it arrives together with the
-    /// room the union makes for it, before the union grows, in one charge; once merged, the
-    /// union's own bytes are held (the first arm of copies becomes the union, not a copy).
-    /// Distinct arms with overlapping bags (`!(q)|!(q|q)|…`) so hold the union and one arm,
-    /// and under a set-valued path the union at most twice their support (the package
-    /// review r1 of the executor memory stack, EMS-R1). A refused charge stops here with
-    /// what was put together, which the entry points never answer ([`Self::answer`]).
-    /// What it returns is no longer charged: its consumer charges it (an enclosing
-    /// alternative as it arrives, the path's table before it is made).
+    /// The arms come one at a time ([`Union`]). A leaf arm (a link, a negated set) streams
+    /// its values into the union, charged as the union grows ([`Self::stream`]), with no
+    /// vector of its own, as engine-v2's `flat_map` did (the executor memory stack's path
+    /// counts, EMS-15: an arm's vector copied into the union cost a closure over an
+    /// alternative +38 M instructions a run). Any other arm arrives as its bag, held with the
+    /// union's room for it in one charge before the union grows (the first arm of copies
+    /// becomes the union, not a copy). Distinct arms with overlapping bags (`!(q)|!(q|q)|…`)
+    /// so hold the union and one arm, and under a set-valued path the union at most twice
+    /// their support (the package review r1 of the executor memory stack, EMS-R1). A
+    /// refused charge stops here with what was put together, which the entry points never
+    /// answer ([`Self::answer`]). What it returns is no longer charged: its consumer charges
+    /// it (an enclosing alternative as it arrives, the path's table before it is made).
     fn either<T: Copy + Eq + std::hash::Hash + Ord>(
         &self,
         arms: &[(Path, usize)],
         support: bool,
         bag: impl Fn(&Path) -> Bag<T>,
+        stream: impl Fn(&Path, &mut usize, &mut Vec<T>) -> Option<bool>,
     ) -> Bag<T> {
         let mut union = Union::new(support);
         let mut held = 0;
         for (i, (arm, times)) in arms.iter().enumerate() {
-            let times = *times;
+            let (times, last) = (*times, i + 1 == arms.len());
             if self.stopped() {
                 break;
             }
-            let arm = bag(arm);
-            // The arm as it arrives and the union's room for it, held in one charge.
-            let peak = union.peak_with(&arm, times).saturating_add(arm.bytes());
-            let fits = self.hold(&mut held, peak);
-            if fits {
-                union.add(arm, times, i + 1 == arms.len());
+            let streamed = match union.streamed(times) {
+                Some(values) => stream(arm, &mut held, values),
+                None => None,
+            };
+            match streamed {
+                Some(true) => {
+                    union.settle(last);
+                    continue;
+                }
+                Some(false) => break,
+                None => {}
             }
-            if !fits || !self.hold(&mut held, union.bytes()) {
+            let arm = bag(arm);
+            // The arm as it arrives and the union's room for it, held in one charge (what
+            // the merge frees stays held until the next arm's charge or the end).
+            let peak = union.peak_with(&arm, times).saturating_add(arm.bytes());
+            if !self.hold(&mut held, peak) {
                 break;
             }
+            union.add(arm, times, last);
         }
         self.hold(&mut held, 0);
         union.finish()
+    }
+
+    /// A leaf arm's values pushed into `values` (an alternative's union, [`Self::either`]):
+    /// the statements `subject ? object`, bound where given, `value` making each value of
+    /// a statement. `None` for any other path; false if the union's growth was refused.
+    fn stream<T>(
+        &self,
+        path: &Path,
+        held: &mut usize,
+        values: &mut Vec<T>,
+        subject: Option<u64>,
+        object: Option<u64>,
+        value: impl Fn((u64, u64, u64)) -> T,
+    ) -> Option<bool> {
+        match path {
+            Path::Link(None) => Some(true),
+            Path::Link(Some(p)) => {
+                let statements = self.quads(subject, Some(*p), object);
+                Some(self.push_all(held, values, statements.map(value)))
+            }
+            Path::Negated(excluded) => {
+                let statements = self.quads(subject, None, object);
+                let kept = statements.filter(|(_, p, _)| !excluded.contains(p));
+                Some(self.push_all(held, values, kept.map(value)))
+            }
+            _ => None,
+        }
+    }
+
+    /// `items` pushed into `values`, its room held in `held` before each growth
+    /// ([`Self::room`], doubling). False if refused: then the items so far.
+    fn push_all<T>(
+        &self,
+        held: &mut usize,
+        values: &mut Vec<T>,
+        items: impl Iterator<Item = T>,
+    ) -> bool {
+        for item in items {
+            if values.len() == values.capacity() && !self.room(held, values, 1, true) {
+                return false;
+            }
+            values.push(item);
+        }
+        true
     }
 
     /// Starts that reach `end` (a bag).
@@ -933,7 +1054,14 @@ impl PathEvaluator<'_> {
                 .collect(),
             Path::Reverse(p) => return self.from(p, end),
             Path::Sequence(steps) => return self.through(steps, end, false),
-            Path::Alternative(paths) => return self.either(paths, false, |p| self.to(p, end)),
+            Path::Alternative(paths) => {
+                return self.either(
+                    paths,
+                    false,
+                    |p| self.to(p, end),
+                    |p, held, values| self.stream(p, held, values, None, Some(end), |(s, _, _)| s),
+                );
+            }
             Path::OneOrMore(p) => reachable(end, false, |n, out| self.step_to(p, n, out)),
             Path::ZeroOrMore(p) => {
                 if !self.is_node(end) {
@@ -1085,7 +1213,8 @@ impl PathEvaluator<'_> {
 
     /// The pairs of each of `nodes` (distinct) with each value of its bag, `pair` making a
     /// `(start, end)` pair of the node and the value: copies while every bag is copies.
-    /// Each node's bag is charged as it arrives and the pairs' room before it grows, as an
+    /// Each node's bag and the pairs' room for it are held in one charge before the pairs
+    /// grow (doubling; the old room beside the new while a vector moves), as an
     /// alternative's union is ([`Self::either`]): the bags of 64 distinct arms from 4,096
     /// bound values are 64 pairs a node (sol-loop r1 S1 of EMS-R1). What it returns is no
     /// longer charged: the path's table charges it.
@@ -1096,45 +1225,44 @@ impl PathEvaluator<'_> {
         pair: impl Fn(u64, u64) -> (u64, u64),
     ) -> Bag<(u64, u64)> {
         let (mut copies, mut counted) = (Vec::new(), Vec::new());
-        let (mut held_copies, mut held_counted) = (0, 0);
+        let mut held = 0;
         for &node in nodes.iter().take_while(|_| !self.stopped()) {
             let bag = bag(node);
-            let mut arrived = 0;
-            let fits = self.hold(&mut arrived, bag.bytes())
-                && match &bag {
-                    Bag::Copies(values) => {
-                        self.room(&mut held_copies, &mut copies, values.len(), true)
-                    }
-                    Bag::Counted(values) => {
-                        self.room(&mut held_counted, &mut counted, values.len(), true)
-                    }
-                };
-            if fits {
-                match bag {
-                    Bag::Copies(values) => {
-                        copies.extend(values.into_iter().map(|v| pair(node, v)));
-                    }
-                    Bag::Counted(values) => {
-                        counted.extend(values.into_iter().map(|(v, n)| (pair(node, v), n)));
-                    }
-                }
-            }
-            self.hold(&mut arrived, 0);
-            if !fits {
+            let (copies_to, copies_peak) = grown(&copies, bag.copies_entries());
+            let (counted_to, counted_peak) = grown(&counted, bag.counted_entries());
+            let peak = copies_peak
+                .saturating_add(counted_peak)
+                .saturating_add(bag.bytes());
+            if !self.hold(&mut held, peak) {
                 break;
+            }
+            match bag {
+                Bag::Copies(values) => {
+                    copies.reserve_exact(copies_to - copies.len());
+                    copies.extend(values.into_iter().map(|v| pair(node, v)));
+                }
+                Bag::Counted(values) => {
+                    counted.reserve_exact(counted_to - counted.len());
+                    counted.extend(values.into_iter().map(|(v, n)| (pair(node, v), n)));
+                }
             }
         }
         let pairs = match counted.is_empty() {
             true => Bag::Copies(copies),
             false => {
-                if self.room(&mut held_counted, &mut counted, copies.len(), false) {
+                let peak = moved::<((u64, u64), usize)>(
+                    counted.capacity(),
+                    counted.len().saturating_add(copies.len()),
+                )
+                .saturating_add(bytes_of::<(u64, u64)>(copies.capacity()));
+                if self.hold(&mut held, peak) {
+                    counted.reserve_exact(copies.len());
                     counted.extend(copies.into_iter().map(|pair| (pair, 1)));
                 }
                 Bag::Counted(counted)
             }
         };
-        self.hold(&mut held_copies, 0);
-        self.hold(&mut held_counted, 0);
+        self.hold(&mut held, 0);
         pairs
     }
 
@@ -1207,7 +1335,14 @@ impl PathEvaluator<'_> {
                 }
                 return pairs;
             }
-            Path::Alternative(paths) => return self.either(paths, false, |p| self.open(p)),
+            Path::Alternative(paths) => {
+                return self.either(
+                    paths,
+                    false,
+                    |p| self.open(p),
+                    |p, held, values| self.stream(p, held, values, None, None, |(s, _, o)| (s, o)),
+                );
+            }
             Path::OneOrMore(p) => self.closure_of(&self.edges(p)),
             Path::ZeroOrMore(p) => {
                 let mut pairs = self.closure_of(&self.edges(p));
