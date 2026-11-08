@@ -170,14 +170,15 @@ pub async fn image_backup(state: AppState, repository: &str) -> Result<Response,
 /// it is taken (two backups within a second; creating the directory claims it, so
 /// concurrent backups can't share one).
 fn claim_backup_dir(backups: &std::path::Path, name: &str) -> std::io::Result<std::path::PathBuf> {
-    std::fs::create_dir_all(backups)?;
     for n in 0u32.. {
         let dir = if n == 0 {
             backups.join(name)
         } else {
             backups.join(format!("{name}-{n}"))
         };
-        match std::fs::create_dir(&dir) {
+        // Durably named, `backups` too (DUR-3): made elsewhere, the image backup's placement
+        // would take it for one provisioned beforehand.
+        match nrese_store::place::create_dir(&dir) {
             Ok(()) => return Ok(dir),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && n < 10_000 => {}
             Err(error) => return Err(error),
