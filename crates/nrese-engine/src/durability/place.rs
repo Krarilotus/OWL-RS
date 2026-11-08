@@ -107,7 +107,8 @@ pub fn create_dir(dir: &Path) -> std::io::Result<()> {
 }
 
 /// Names `dir`, a directory in the store's root, which the open has durably named already
-/// ([`create_dir_all`]), with each directory synced once per open (timing of 8 Nov):
+/// ([`create_dir_all`]), so that a reopen of a store at an absolute path syncs each directory
+/// once (timing of 8 Nov; a relative or `.` root still syncs `.` twice: fix check ONCE-N1):
 /// - missing, it is made as [`create_dir_all`] makes a level: the root's sync checked before,
 ///   done after, `dir` removed again if that fails;
 /// - found (or made meanwhile by someone else), the root isn't synced here: the open syncs it
