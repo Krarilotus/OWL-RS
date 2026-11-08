@@ -982,8 +982,8 @@ class WindowsJob(Repo):
                                     f'exec "{Path(sys.executable).as_posix()}" "$@"\n', newline="\n")
         (own / "python").chmod(0o755)
         # The console's Node the tree pins (scripts/lib/gate-tools.txt node), in the host's cache
-        # already, as gate-node.sh lays it out on this platform: its node reports the pinned version,
-        # and npm and npx (the tier's console step) succeed.
+        # already, as gate-node.sh lays it out on this platform, with its record of the archive: its
+        # node reports the pinned version, and npm and npx (the tier's console step) succeed.
         platform = "win-x64" if os.name == "nt" else "linux-x64"
         node_version, node_sha = re.search(rf"^node (\S+) .*?\b{platform} (\S+)",
                                            (self.repo / "scripts/lib/gate-tools.txt").read_text(), re.M).groups()
@@ -995,6 +995,9 @@ class WindowsJob(Repo):
                            "npx": "exit 0\n"}.items():
             (node_bin / tool).write_text(f"#!/bin/sh\n{body}", newline="\n")
             (node_bin / tool).chmod(0o755)
+        # The record gate-node.sh keeps of the verified archive the entry was unpacked from.
+        archive = f"node-v{node_version}-{platform}.{'zip' if platform == 'win-x64' else 'tar.gz'}"
+        (node_entry / ".provenance").write_text(f"sha256 {node_sha} {archive}\n", newline="\n")
         # The toolchain: there; missing, or there without clippy (another job installed the release with
         # a minimal profile), and rustup installs it; or missing and rustup can't install it.
         there, missing, no_clippy, uninstallable = None, ("toolchain", ""), ("clippy", ""), ("toolchain", "1")
