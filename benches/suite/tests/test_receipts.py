@@ -279,6 +279,27 @@ class Driver(unittest.TestCase):
         self.assertEqual({i: v["id"] for i, v in images.items()},
                          {"img:t": "sha256:A", "img:u": {"unknown": "not in the run's pin map"}})
 
+    def test_a_receipt_names_the_source_commit_an_image_was_built_at(self):
+        """Orchestrator, 8 Nov 13:39: an image built from a source checkout (images.sh: MillenniumDB,
+        G-CARE) carries its source commit beside its context's tree, both read off the id that ran,
+        so a build at another commit than its Dockerfile declares is visible as such."""
+        labels = {"sha256:A": ("benches/competitors/millenniumdb@" + "t" * 40, "ecbf6dde" + "0" * 32),
+                  "sha256:B": ("benches/competitors/jena@" + "t" * 40, "")}
+
+        def inspect(command, *a, **k):
+            built, commit = labels[command[-1]]
+            fields = command[-2].count("{{index")
+            return Mock(returncode=0, stdout=(built if fields == 1 else f"{built}|{commit}") + "\n", stderr="")
+        for pinned, expected in (("sha256:A", f"built from {labels['sha256:A'][0]}, source commit {labels['sha256:A'][1]}"),
+                                 ("sha256:B", f"built from {labels['sha256:B'][0]}")):
+            with self.subTest(pinned), patch.object(self, "root", self.root / pinned[-1]):
+                (self.root / "data").mkdir(parents=True)
+                suite = self.suite(runs=1)
+                with patch.object(driver.ns, "pinned", return_value={"img:t": pinned}), \
+                        patch.object(driver, "run_quiet", side_effect=inspect):
+                    self.run_tiers(suite, [Plan("w", "1")], self.system(images=["img:t"]))
+                self.assertEqual(self.cells(suite)["w/1/x"]["images"]["img:t"]["source"], expected)
+
     def test_a_receipt_says_why_an_image_s_source_couldn_t_be_read(self):
         """#161's Windows gate (gate-windows-59532fff57-1794140734): reading an image's label raised
         FileNotFoundError on a host without docker, and the receipt was never written. Without docker,
