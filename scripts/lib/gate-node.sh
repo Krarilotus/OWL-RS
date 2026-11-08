@@ -31,17 +31,29 @@ gate_node() {
   suite_python_entry "$cache/node-$version-${sha:0:12}" gate_node_is gate_node_unpack "$version" "$platform" "$sha"
 }
 
-# DIR VERSION PLATFORM SHA256: DIR's directory of node, npm and npx, if its node reports VERSION and
-# its npm runs: an entry without them would leave PATH to the host's npm, which may run the host's
-# node (sol-loop r1 S2).
+# PLATFORM VERSION SHA256: the provenance record of an entry unpacked from that archive.
+gate_node_provenance() {
+  local ext=tar.gz
+  [ "$1" != win-x64 ] || ext=zip
+  printf 'sha256 %s node-v%s-%s.%s\n' "$3" "$2" "$1" "$ext"
+}
+
+# DIR VERSION PLATFORM SHA256: DIR's directory of node, npm and npx, if DIR records the archive of
+# SHA256 it was unpacked from (review r1 F2: a version string alone isn't the build), its node reports
+# VERSION, and its own node, npm and npx are files that run: one that doesn't would leave PATH to the
+# host's, and on Windows the host's npm and npx run the host's node (sol-loop r1 S2, review r1 F1).
 gate_node_is() {
-  local bin=$1/bin found
+  local bin=$1/bin found tool
   [ "$3" != win-x64 ] || bin=$1
+  [ "$(tr -d '\r' < "$1/.provenance" 2> /dev/null)" = "$(gate_node_provenance "$3" "$2" "$4")" ] \
+    || { echo "$1 records no archive of sha256 $4" >&2; return 1; }
   [ -x "$bin/node" ] || [ -x "$bin/node.exe" ] || return 1
   found=$("$bin/node" --version 2> /dev/null | tr -d '\r')
   [ "$found" = "v$2" ] || { echo "$bin/node reports ${found:-nothing}, not the pinned v$2" >&2; return 1; }
-  [ -e "$bin/npm" ] && [ -e "$bin/npx" ] && PATH="$bin:$PATH" "$bin/npm" --version > /dev/null 2>&1 \
-    || { echo "$bin has no npm and npx of its own that run" >&2; return 1; }
+  for tool in npm npx; do
+    [ -f "$bin/$tool" ] && PATH="$bin:$PATH" "$bin/$tool" --version > /dev/null 2>&1 \
+      || { echo "$bin has no $tool of its own that runs" >&2; return 1; }
+  done
   echo "$bin"
 }
 
@@ -63,5 +75,8 @@ gate_node_unpack() {
   rm -f -- "$part/$archive"
   # The archive's one top directory, its contents moved up into PART.
   [ -d "$part/$name" ] || { echo "$archive has no $name/" >&2; return 1; }
-  find "$part/$name" -mindepth 1 -maxdepth 1 -exec mv -t "$part" -- {} + && rmdir -- "$part/$name"
+  find "$part/$name" -mindepth 1 -maxdepth 1 -exec mv -t "$part" -- {} + && rmdir -- "$part/$name" || return 1
+  # The record of the verified archive, in the part: published with the whole entry when it is moved
+  # into place (suite_python_entry), never on an entry made otherwise.
+  gate_node_provenance "$platform" "$version" "$sha" > "$part/.provenance"
 }
