@@ -36,6 +36,14 @@ pub struct Closure {
     pub lists: bool,
 }
 
+impl Closure {
+    /// Whether it applies equality between individuals (`eq-*`): `owl2-rl`'s rules do, as
+    /// they have the list rules; `owl2-ql`'s have neither.
+    pub fn equality(self) -> bool {
+        self.lists
+    }
+}
+
 /// A generating axiom `left ⊑ ∃role.filler` (`filler` `None`: `owl:Thing`, or a data
 /// value), with the type of the anonymous element it makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -150,8 +158,33 @@ impl Tbox {
         };
         tbox.hazards =
             super::hazards::hazards(ontology, &tbox.types, &read, &|id| tbox.basics[id as usize]);
+        // An axiom the mapping drops supports no claim: any term may miss its conclusions
+        // (I24c-2). An existing global hazard's reason is the more specific.
+        if tbox.hazards.global.is_none() {
+            use crate::diagnostics::Diagnostic;
+            tbox.hazards.global = ontology.diagnostics.iter().find_map(|d| match *d {
+                Diagnostic::Malformed { node, .. } | Diagnostic::Unsupported { node, .. } => {
+                    Some(Hazard::Dropped(node))
+                }
+                Diagnostic::BrokenList { head } => Some(Hazard::Dropped(head)),
+                _ => None,
+            });
+        }
         tbox.rewritable = tbox.rewritable_terms();
         tbox
+    }
+
+    /// The source holds an equality of individuals (`owl:sameAs`) that isn't among the
+    /// axioms compiled. The store's reader reads only whether one exists, in any graph, so no
+    /// name of it reaches a reader who can't read it, and no sampled statement can be lost
+    /// to the mapping (I24c-2 review r1, F1, F3). Where `closure` applies no equality
+    /// (owl2-ql), any fact may follow: the hazard is global, [`Hazard::Equating`], unless one
+    /// already is.
+    pub fn with_equality(mut self, closure: Closure) -> Self {
+        if !closure.equality() && self.hazards.global.is_none() {
+            self.hazards.global = Some(Hazard::Equating);
+        }
+        self
     }
 
     /// Why answers to `cq` through anonymous individuals may be missing

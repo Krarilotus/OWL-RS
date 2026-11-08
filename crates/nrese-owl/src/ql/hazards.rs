@@ -57,6 +57,9 @@ pub enum Hazard {
     /// An axiom outside the profile, as [`Self::OutsideProfile`], that equates individuals
     /// and names no term: global, which needs none (master, 8 Nov 13:15).
     Equating,
+    /// A structure the mapping drops (malformed, unsupported, a broken list), at the node
+    /// it reports: the axiom it was part of isn't read at all (I24c-2).
+    Dropped(Term),
 }
 
 impl Hazard {
@@ -80,7 +83,8 @@ impl Hazard {
             | Self::Asserted(t)
             | Self::Untyped(t)
             | Self::OpenLeft(t)
-            | Self::OutsideProfile(t) => t,
+            | Self::OutsideProfile(t)
+            | Self::Dropped(t) => t,
             Self::Equating => return None,
         })
     }
@@ -129,6 +133,7 @@ impl Hazard {
                 format!("an axiom on {t} outside the profile whose rules the closure applies")
             }
             Self::Equating => "an axiom outside the profile equates individuals".to_owned(),
+            Self::Dropped(_) => format!("a schema structure at {t} that can't be read"),
         }
     }
 }
