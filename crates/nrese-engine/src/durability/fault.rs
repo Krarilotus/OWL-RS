@@ -34,9 +34,12 @@ thread_local! {
     > = const { std::cell::RefCell::new(None) };
     /// Called with each directory `durability::place` syncs, before the sync: what a test
     /// sees at that moment.
-    pub(crate) static ON_DIR_SYNC: std::cell::RefCell<Option<Box<dyn FnMut(&std::path::Path)>>> =
+    pub(crate) static ON_DIR_SYNC: std::cell::RefCell<Option<DirSyncHook>> =
         const { std::cell::RefCell::new(None) };
 }
+
+/// What [`ON_DIR_SYNC`] calls.
+pub(crate) type DirSyncHook = Box<dyn FnMut(&std::path::Path)>;
 
 /// An error if `point` is set on this thread.
 pub(crate) fn check(point: &'static LocalKey<Cell<bool>>, what: &str) -> std::io::Result<()> {

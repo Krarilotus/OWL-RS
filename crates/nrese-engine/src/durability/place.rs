@@ -66,9 +66,12 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
 /// (sol-loop on review r1, S1).
 /// - A sync that fails fails the call, and the levels this call made are removed again (they
 ///   are empty), so a retry makes and syncs them anew.
+/// - A level is made only under a holder whose sync works, checked before it is made, so no
+///   open leaves a level in sight under a holder nothing can sync.
 /// - One exception: a level found whose holder this process may not open for the sync
-///   (`PermissionDenied`) is left as it is. Nothing more can be done for its name here, and
-///   refusing would close every store beneath it.
+///   (`PermissionDenied`) is left as it is. No open made it (see above): it was provisioned,
+///   and refusing would close every store beneath it. A process with other rights may have
+///   made it a moment ago, before its own sync: not covered.
 pub fn create_dir_all(dir: &Path) -> std::io::Result<()> {
     let mut made = Vec::new();
     let named = name_levels(dir, &mut made);
@@ -96,8 +99,17 @@ fn name_levels<'a>(dir: &'a Path, made: &mut Vec<&'a Path>) -> std::io::Result<(
             true => Path::new("."),
             false => holder,
         };
-        // Found levels aren't made again (an ancestor may be one this process can't write).
-        let new = !level.is_dir()
+        // Found levels aren't made again (an ancestor may be one this process can't write). A
+        // level is made only once its holder's sync is known to work (sol-loop round 2 on
+        // review r1, S1): a level made under a holder no sync reaches would be in sight of
+        // another process, which couldn't sync it either and would take it for one provisioned
+        // beforehand (the exception below). So a found level under such a holder wasn't made by
+        // an open, but provisioned.
+        let missing = !level.is_dir();
+        if missing {
+            sync_dir(holder)?;
+        }
+        let new = missing
             && match fs::create_dir(level) {
                 Ok(()) => true,
                 // Made meanwhile by someone else.
