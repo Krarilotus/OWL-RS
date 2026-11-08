@@ -1283,6 +1283,65 @@ fn an_open_syncs_what_it_replayed() {
     }
 }
 
+/// A reopen syncs each directory once (timing of 8 Nov, the master's decision 1): every
+/// directory holding a level of the store's path (the names R1-F2 makes durable), the WAL's
+/// directory and the store's own (F5's syncs after replay, which also name the store's
+/// subdirectories it found), each exactly once, whatever else of the open names them. Before the
+/// fix the open named the store's path again for the WAL's directory, and the WAL named both
+/// again: every directory above the store three times, the store's twice, and once more with the
+/// WAL archive. Rows, judged apart: a reopen; a reopen with the WAL archive.
+#[test]
+fn a_reopen_syncs_each_directory_once() {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+    let mut wrong = Vec::new();
+    for (row, wal_archive) in [("a reopen", false), ("a reopen with the WAL archive", true)] {
+        let archived = || EngineConfig {
+            durability: DurabilityConfig {
+                wal_archive,
+                ..config().durability
+            },
+            ..config()
+        };
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("store");
+        {
+            let engine = Engine::open(&root, archived()).unwrap();
+            commit(&engine, 1).unwrap();
+        }
+        // Each holder of a level of the store's path (the root, or a Windows prefix, holds
+        // nothing), then the WAL's directory and the store's.
+        let mut expected: BTreeMap<PathBuf, usize> = root
+            .ancestors()
+            .skip(1)
+            .filter(|level| !level.as_os_str().is_empty())
+            .map(|level| (level.to_path_buf(), 1))
+            .collect();
+        expected.insert(super::wal::wal_dir(&root), 1);
+        expected.insert(root.clone(), 1);
+        let synced = Rc::new(std::cell::RefCell::new(BTreeMap::<PathBuf, usize>::new()));
+        let seen = Rc::clone(&synced);
+        fault::ON_DIR_SYNC.set(Some(Box::new(move |dir: &Path| {
+            *seen.borrow_mut().entry(dir.to_path_buf()).or_default() += 1;
+        })));
+        let opened = Engine::open(&root, archived());
+        fault::ON_DIR_SYNC.set(None);
+        if let Err(error) = &opened {
+            wrong.push(format!("{row}: the reopen failed: {error}"));
+            continue;
+        }
+        let synced = synced.take();
+        eprintln!("row {row}: {synced:?}");
+        if synced != expected {
+            wrong.push(format!(
+                "{row}: synced {synced:#?}, expected each once: {expected:#?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A commit that fails leaves the asserted identity it was to publish
 /// (`Transaction::asserted_identity_after`) unused (P2-C1, DUR's condition 5 of 8 Nov):
 /// a rotation that fails before it changes anything, one whose segment may be placed
