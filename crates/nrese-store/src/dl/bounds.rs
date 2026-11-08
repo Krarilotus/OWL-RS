@@ -60,24 +60,26 @@ pub(crate) mod seam {
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
-    static HOOK: Mutex<Option<(usize, Point, Hook)>> = Mutex::new(None);
+    /// One hook a store and point: tests running at once, each on its own store, keep theirs.
+    static HOOKS: Mutex<Vec<(usize, Point, Hook)>> = Mutex::new(Vec::new());
 
     fn key(bounds: &super::Bounds) -> usize {
         std::ptr::from_ref(bounds) as usize
     }
 
     pub(crate) fn set(bounds: &super::Bounds, point: Point, hook: impl FnOnce() + Send + 'static) {
-        *HOOK.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some((key(bounds), point, Box::new(hook)));
+        let mut hooks = HOOKS.lock().unwrap_or_else(|p| p.into_inner());
+        hooks.retain(|(k, p, _)| !(*k == key(bounds) && *p == point));
+        hooks.push((key(bounds), point, Box::new(hook)));
     }
 
     pub(crate) fn at(bounds: &super::Bounds, point: Point) {
         let hook = {
-            let mut slot = HOOK.lock().unwrap_or_else(|p| p.into_inner());
-            match &*slot {
-                Some((k, p, _)) if *k == key(bounds) && *p == point => slot.take(),
-                _ => None,
-            }
+            let mut hooks = HOOKS.lock().unwrap_or_else(|p| p.into_inner());
+            let at = hooks
+                .iter()
+                .position(|(k, p, _)| *k == key(bounds) && *p == point);
+            at.map(|at| hooks.swap_remove(at))
         };
         if let Some((_, _, hook)) = hook {
             hook();
