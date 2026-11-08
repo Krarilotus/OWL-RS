@@ -6,12 +6,15 @@ had no interleaved A-A' arm, or checked counts instead of content.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -128,6 +131,23 @@ class Abba(unittest.TestCase):
                     row = next(line for line in text.splitlines() if line.startswith(f"| lab-olympics / time/{s} |"))
                     self.assertNotIn("not compared", row)
                     self.assertNotIn("| - | - |", row)
+
+    def test_a_plan_the_fleet_refuses_exits_as_refused(self):
+        """STAGE2's lead, 8 Nov 2026: `abba.py run --plan` exited 0 when the fleet check it ran
+        refused the set ("(exit 1)" in its text only), so a script read a refused plan as taken. It
+        exits 1, as a run that wasn't submitted does; a plan the fleet takes still exits 0."""
+        catalog = abba.cases_registry.load()
+        for code, expected in ((1, 1), (0, 0)):
+            with self.subTest(fleet_check=code), tempfile.TemporaryDirectory(dir=self.repo) as out:
+                args = SimpleNamespace(checkout=self.repo.as_posix(), a=self.commits[0], b=self.commits[-1],
+                                       harness=None, cases="lab-olympics", areas="", blocks=3, min_samples=3,
+                                       name=None, out=Path(out), host=None, round=1, priority=790, reason="",
+                                       plan=True)
+                with patch.object(abba.cases_registry, "load_at", return_value=catalog), \
+                        patch.object(abba.rg, "fleet_call", return_value=(code, "refused: a reason")) as fleet, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(abba.run(args), expected)
+                self.assertEqual([c.args[0] for c in fleet.call_args_list], ["check"])  # never submitted
 
     def test_missing_evidence_is_no_verdict_never_a_pass(self):
         self.assertEqual(self.verdict(self.round_(records()))[0], abba.NO_LOSS)

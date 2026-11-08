@@ -356,6 +356,28 @@ class Rounds(unittest.TestCase):
                     self.assertEqual(n % sides, 0, (cand, main, calibrated, n))
                     self.assertGreaterEqual(n, calibrated or gate_module.CONFIRM_BLOCKS[0])
 
+    def test_a_hypothesis_no_round_compared_is_never_a_pass(self):
+        """Review abba-not-compared r1 W-OUT1 (8 Nov 2026): a baseline that reports no memory leaves
+        the family's memory hypotheses not compared (compare_case, "unsupported by this baseline"),
+        out of the p-values; decide() saw none and verdict() said PASSED over no test. The shared
+        decision result carries each untested hypothesis with its reason, and the verdict names it
+        and doesn't pass, whether every hypothesis or one of them went untested."""
+        def records_of(side, n):
+            return [record(samples={"q01": [10.0, 10.1, 9.9], "q06": [4.8, 4.85, 4.8]},
+                           anon=None if side != "cand" else 2_000_000)]
+        memory = [f"{s}|lab-olympics|memory/anon_kernel" for s in ("base", "main")]
+        for family in (memory, memory + ["base|lab-olympics|time/q01"]):
+            with self.subTest(hypotheses=len(family)):
+                s = run_gate(passes(records_of, blocks=4), family=family)
+                passed, text = gate_module.verdict([s], self.W3C, self.GUARDS)
+                self.assertFalse(passed)
+                self.assertNotIn("**PASSED**", text)
+                for h in memory:
+                    side = h.split("|")[0]
+                    self.assertIn(f"**not compared**: lab-olympics against {side}: memory/anon_kernel: "
+                                  f"{side} reports none (unsupported by this baseline)", text)
+                self.assertEqual(sorted(gate_module.decide([[s]])["not_compared"]), sorted(memory))
+
     def test_nothing_flagged_needs_no_confirmation(self):
         clean = self.round_(1.0)
         self.assertIsNone(gate_module.confirm_job([clean], "C:/repo"))
