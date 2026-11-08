@@ -981,6 +981,65 @@ mod tests {
     /// is the recomputed closure, an inconsistent one is still reported, and the next
     /// commit, onto a loaded state, takes the delta.
     #[test]
+    fn an_engine_base_estimate_counts_the_engine_s_count() {
+        // REAS-2 review r1 F2: maintenance's estimates (the policy's, job planning's) ask the
+        // engine for a count, which under compact equality scans the stored matches and
+        // weighs each by its copies. A representative with 50 identities and 8 × `POLL_UNITS`
+        // statements `rep p o`: the estimate of `? p ?` asks its stop at least once every
+        // `POLL_UNITS` plus one run (the longest run counted at once) of the stored matches
+        // it scans. Uncounted, the whole count was one unit.
+        let interval = nrese_exec::POLL_UNITS as usize;
+        let n = 8 * interval;
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let id =
+            |tx: &mut Transaction<'_>, s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into());
+        let same_as = id(&mut tx, "http://www.w3.org/2002/07/owl#sameAs");
+        let (rep, p) = (
+            id(&mut tx, "http://example.com/rep"),
+            id(&mut tx, "http://example.com/p"),
+        );
+        for i in 1..50 {
+            let alias = id(&mut tx, &format!("http://example.com/alias{i}"));
+            tx.insert_inferred(EncodedTriple {
+                subject: alias,
+                predicate: same_as,
+                object: rep,
+            });
+        }
+        for i in 0..n {
+            let o = id(&mut tx, &format!("http://example.com/o{i}"));
+            tx.insert_encoded(encode([rep.raw(), p.raw(), o.raw()]).in_default_graph());
+        }
+        tx.commit().unwrap();
+        engine.set_equality(Some(same_as));
+        let tx = engine.transaction();
+        let base = EngineBase::new(&tx, &[]);
+        let asks = AtomicUsize::new(0);
+        let stop = || {
+            asks.fetch_add(1, Ordering::Relaxed);
+            false
+        };
+        let poll = Poller::new(&stop).expect("never stopped");
+        let estimate = base.estimate([None, Some(p.raw()), None], &poll);
+        assert!(
+            estimate >= n,
+            "{estimate}: an upper bound on the {n} statements and their copies"
+        );
+        let run = interval;
+        let asks = asks.load(Ordering::Relaxed);
+        assert!(
+            asks >= n / (interval + run),
+            "{asks} asks of the stop for a count over {n} stored matches: more than {interval} \
+             plus one run of {run} between two of them"
+        );
+    }
+
+    #[test]
     fn known_before_probes_ask_their_stop_within_a_run() {
         // REAS-2 review r1 F5: a commit's new assertions are each looked up in the state
         // before it (`EngineBase::known_before`), each lookup counted on the preparation's
