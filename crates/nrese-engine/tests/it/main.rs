@@ -11,3 +11,9 @@ mod inferred_stack_tests;
 mod replication_tests;
 mod vector_tests;
 mod vocabulary_tests;
+
+/// A budget that refuses nothing, for vector searches whose memory a test doesn't check.
+pub fn unlimited() -> &'static nrese_exec::Budget {
+    static UNLIMITED: std::sync::OnceLock<nrese_exec::Budget> = std::sync::OnceLock::new();
+    UNLIMITED.get_or_init(nrese_exec::Budget::unlimited)
+}

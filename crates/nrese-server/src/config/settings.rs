@@ -425,6 +425,21 @@ pub const SETTINGS: &[Setting] = &[
         "About how much log a replica asks for at once (default 8MiB).",
     ),
     setting(
+        "replication.round_timeout",
+        names::REPLICATION_ROUND_TIMEOUT_MS,
+        Limit(Some(Duration)),
+        "The longest one round of following the primary's log may take, its answer whole \
+         (default 5min; 0 or unlimited: no total limit, the 30 s limits between pieces stay).",
+    ),
+    setting(
+        "replication.image_timeout",
+        names::REPLICATION_IMAGE_TIMEOUT_MS,
+        Limit(Some(Duration)),
+        "The longest a replica waits for its primary to prepare an image, until the answer \
+         begins (default 1h; 0 or unlimited: no limit); the image then streams as long as \
+         its pieces come.",
+    ),
+    setting(
         "federation.timeout",
         names::FEDERATION_TIMEOUT_MS,
         Amount(Duration),

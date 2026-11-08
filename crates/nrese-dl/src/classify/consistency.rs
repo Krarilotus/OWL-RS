@@ -17,7 +17,7 @@ use crate::tableau::{self, Answer, At, Prepared, Probe, Want};
 
 /// A decided consistency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Verdict {
+pub(crate) enum Decided {
     Consistent,
     Inconsistent,
 }
@@ -37,7 +37,7 @@ pub(crate) fn by_context_core(
     config: &tableau::Config,
     core: &crate::context::Options,
     workers: &nrese_exec::workers::Workers,
-) -> Option<Verdict> {
+) -> Option<Decided> {
     let has_data = !normalised.facts.data.is_empty();
     if has_data && reads_data(normalised) {
         return None;
@@ -48,14 +48,14 @@ pub(crate) fn by_context_core(
         crate::context::saturate_normalised(&rest, classes, core, config.cancel.clone(), workers)
             .ok()?;
     if !saturated.consistent() {
-        return Some(Verdict::Inconsistent);
+        return Some(Decided::Inconsistent);
     }
     // A merge left out may hide a clash.
     if !saturated.complete() {
         return None;
     }
     if !has_data {
-        return Some(Verdict::Consistent);
+        return Some(Decided::Consistent);
     }
     // The literals alone.
     let literals = Normalised {
@@ -74,8 +74,8 @@ pub(crate) fn by_context_core(
         negative: &[],
     };
     match program.probe(&probe, config, Want::default()).answer {
-        Answer::Consistent => Some(Verdict::Consistent),
-        Answer::Inconsistent => Some(Verdict::Inconsistent),
+        Answer::Consistent => Some(Decided::Consistent),
+        Answer::Inconsistent => Some(Decided::Inconsistent),
         _ => None,
     }
 }
