@@ -509,3 +509,110 @@ fn a_store_opened_through_a_link_syncs_its_targets_names() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// The quad `n` of these rows.
+fn quad(n: u64) -> nrese_rdf::Quad {
+    let node =
+        |name: String| nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{name}"));
+    nrese_rdf::Quad::new(
+        node(format!("s{n}")),
+        node("p".to_owned()),
+        node(format!("o{n}")),
+        nrese_rdf::GraphName::DefaultGraph,
+    )
+}
+
+/// Commits `quad(n)`.
+fn commit(engine: &Engine, n: u64) -> crate::EngineResult<crate::CommitSummary> {
+    let mut tx = engine.transaction();
+    tx.insert(quad(n).as_ref());
+    tx.commit()
+}
+
+/// Whether `engine`'s latest snapshot holds `quad(n)`.
+fn holds(engine: &Engine, n: u64) -> bool {
+    let snapshot = engine.snapshot();
+    snapshot
+        .lookup_quad(quad(n).as_ref())
+        .is_some_and(|encoded| snapshot.contains(&encoded))
+}
+
+/// A store whose own WAL directory (or WAL archive) is a link to a directory elsewhere has the
+/// names its target's resolution reads made durable before a commit is acknowledged (review
+/// r1, R1-L1): the store's internal directories are opened through such a link, so their
+/// target's chain holds every record. A store made and closed at `store`, its `wal` (or, with
+/// the WAL archive, `wal-archive`) then moved to `data/new-parent/` and linked back. With the
+/// sync of `data/new-parent` (a target ancestor) failing with a non-permission error, the
+/// reopen or its first commit is refused, not acknowledged. The fault cleared, the store
+/// reopened (the log may be poisoned by the refusal: a reopen settles it), a commit is
+/// acknowledged and is there after another reopen, with the first. Whether the refused commit
+/// is there isn't judged (its outcome is unknown). Rows, judged apart: the WAL, the archive;
+/// for each link kind. Before the fix only the store's own path and the link's leaf were synced:
+/// the commit was acknowledged with `data/new-parent` never synced.
+#[test]
+fn a_store_whose_wal_is_a_link_names_its_targets_chain() {
+    let mut wrong = Vec::new();
+    for kind in kinds() {
+        for (dir, archive) in [("wal", false), ("wal-archive", true)] {
+            let configured = || EngineConfig {
+                durability: DurabilityConfig {
+                    wal_archive: archive,
+                    ..config().durability
+                },
+                ..config()
+            };
+            let base = tempfile::tempdir().unwrap();
+            let base = base.path();
+            let store = base.join("store");
+            {
+                let engine = Engine::open(&store, configured()).unwrap();
+                commit(&engine, 1).unwrap();
+            }
+            let target = base.join("data").join("new-parent").join(dir);
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::rename(store.join(dir), &target).unwrap();
+            if !link(kind, &target, &store.join(dir)) {
+                eprintln!("{kind:?} rows: not run (no privilege to make one on this host)");
+                break;
+            }
+            let row = format!("{kind:?}, the store's {dir} a link");
+            fault::FAIL_DIR_SYNC_OF.set(Some((
+                base.join("data").join("new-parent"),
+                std::io::ErrorKind::Other,
+            )));
+            let refused = match Engine::open(&store, configured()) {
+                Err(_) => true,
+                Ok(engine) => commit(&engine, 2).is_err(),
+            };
+            fault::FAIL_DIR_SYNC_OF.set(None);
+            if !refused {
+                wrong.push(format!(
+                    "{row}: acknowledged though a target ancestor's sync failed"
+                ));
+            }
+            match Engine::open(&store, configured()) {
+                Ok(engine) => {
+                    if let Err(error) = commit(&engine, 3) {
+                        wrong.push(format!("{row}: the commit once the fault cleared: {error}"));
+                    }
+                }
+                Err(error) => {
+                    wrong.push(format!("{row}: the reopen once the fault cleared: {error}"))
+                }
+            }
+            match Engine::open(&store, configured()) {
+                Ok(engine) => {
+                    for n in [1, 3] {
+                        if !holds(&engine, n) {
+                            wrong.push(format!(
+                                "{row}: acknowledged commit {n} gone after a reopen"
+                            ));
+                        }
+                    }
+                }
+                Err(error) => wrong.push(format!("{row}: the last reopen: {error}")),
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
