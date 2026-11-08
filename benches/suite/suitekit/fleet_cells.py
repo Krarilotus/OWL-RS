@@ -144,7 +144,7 @@ def jobs(groups, args):
         print(f"{key} / {case['workload']} / {case['tier']}: resource basis {basis}; ask {needs}; adapter needs {adapter_needs}; workload/driver needs {workload_needs}")
         payload = {"identity": identity, "group": group, "nrese": args.nrese, "harness": args.harness, "member": member,
                    "result_root": args.result_root, "deadline_min": group["minutes"] * args.deadline_factor}
-        members.append({"id": member, "group": "suite-cells", "kind": "owlrs.timed", "class": "exclusive",
+        members.append({"spec": 9, "containers": [{"name": "suite", "memory_gb": cap}], "id": member, "group": "suite-cells", "kind": "owlrs.timed", "class": "exclusive",
                         "purpose": "timing", "priority": 600, "priority_reason": "catalogue cells below confirmation and merge gates",
                         "notify": False, "hold_between_steps": True, "est_min": group["minutes"],
                         "step_deadline_min": payload["deadline_min"], "results_at": f"{args.result_root}/{member}",
