@@ -492,16 +492,52 @@ def host_check(base: list[dict | None], new: list[dict | None], allow: bool) -> 
     return None
 
 
-def loaded_inputs(report: dict) -> dict[str, dict | None]:
-    """Per case, the byte SHA-256 of each frozen file its records say they loaded (fast.py run's
-    record `inputs`): one mapping, or None where a record doesn't say or two records disagree."""
-    out: dict[str, dict | None] = {}
+UNRECORDED = object()  # a record without `inputs`: a report before 7 Nov 2026
+
+
+class Observed:
+    """What one side's records say a case loaded, every record's observation kept (fix check r3 of
+    pkg/stage-data, R3-W1, 7 Nov 2026: one `dict | None` per case made "a record doesn't say" and
+    "the records disagree" the same None, which a falsy test then took for "no input"). Each record
+    is in one of three states: unrecorded (no `inputs`), explicitly none (`{}`), or recorded external
+    (anything else: a mapping of file to SHA-256, or a value that isn't a mapping, its bytes unknown).
+    It has no truth value, so that no test can project it back to one."""
+
+    def __init__(self):
+        self.seen: list = []
+
+    def __bool__(self):
+        raise TypeError("an input observation has three states: ask .external or .recorded()")
+
+    @property
+    def external(self) -> bool:
+        """Whether any record names an external file (or records something that isn't a mapping)."""
+        return any(s is not UNRECORDED and s != {} for s in self.seen)
+
+    def recorded(self) -> dict | None:
+        """The one mapping every record states, or None: a record doesn't say, says something that
+        isn't a mapping, or two records disagree."""
+        first = self.seen[0] if self.seen else UNRECORDED
+        if first is UNRECORDED or not isinstance(first, dict) or any(s != first for s in self.seen):
+            return None
+        return first
+
+    def unknown(self, side: str) -> str | None:
+        """Why this side's records establish no one input, where they don't."""
+        if self.recorded() is not None:
+            return None
+        if all(s is UNRECORDED for s in self.seen):
+            return f"input unknown: {side} doesn't record the bytes it loaded"
+        return f"input unknown: {side}'s records don't state one input (" + "; ".join(
+            "no record" if s is UNRECORDED else json.dumps(s, sort_keys=True)[:200] for s in self.seen) + ")"
+
+
+def loaded_inputs(report: dict) -> dict[str, Observed]:
+    """Per case, what each of its records says it loaded (fast.py run's record `inputs`: the byte
+    SHA-256 of each external file), every record kept."""
+    out: dict[str, Observed] = {}
     for r in report.get("records", []):
-        seen = r.get("inputs")
-        if r["case"] not in out:
-            out[r["case"]] = seen
-        elif out[r["case"]] != seen:
-            out[r["case"]] = None
+        out.setdefault(r["case"], Observed()).seen.append(r["inputs"] if "inputs" in r else UNRECORDED)
     return out
 
 
@@ -509,8 +545,9 @@ def input_check(base_report: dict, new_report: dict) -> dict[str, str]:
     """The cases whose two sides didn't load the same external input bytes, or don't say which, with
     why: no verdict of theirs is evidence of a code change (review r1 of pkg/stage-data, R1-W1, 7 Nov
     2026: lubm-10/100's new release made an old result "slower" than a new one). What a case loads is
-    suitekit.inputs.declared()'s one answer. Recorded identities come first; a case of generated data
-    alone (it declares nothing, and neither side records a file) needs none recorded."""
+    suitekit.inputs.declared()'s one answer. Recorded identities come first: a case of generated data
+    alone (it declares nothing today, and no record on either side names an external file) needs none
+    recorded; any record naming one makes it a case of external input (fix check r3, R3-W1)."""
     from . import cases as registry
     from . import inputs
     declares = {c["name"]: inputs.declared(c) for c in registry.load()}
@@ -518,9 +555,10 @@ def input_check(base_report: dict, new_report: dict) -> dict[str, str]:
     out = {}
     for case in sorted(set(base) & set(new)):
         b, n, want = base[case], new[case], declares.get(case)
-        if want == set() and not b and not n:
+        if want == set() and not b.external and not n.external:
             continue  # generated data alone, on both sides (sol-loop r3 V3)
-        if why := input_difference(b, n, declared=want):
+        if why := (b.unknown("the base") or n.unknown("the new run")
+                   or input_difference(b.recorded(), n.recorded(), declared=want)):
             out[case] = why
     return out
 
