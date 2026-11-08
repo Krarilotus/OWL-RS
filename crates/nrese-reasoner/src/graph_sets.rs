@@ -1559,16 +1559,7 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
     run.check(held(&now, annotations) + found.capacity() * size_of::<(Triple, Annotation)>())?;
     let mut changed: Vec<Triple> = Vec::new();
     for (fact, from) in found {
-        if merge_found(
-            run,
-            &mut now,
-            fact,
-            from.sets.iter(),
-            from.truncated,
-            cap,
-            graphs_of,
-            &mut annotations,
-        )? {
+        if merge_owned(run, &mut now, fact, from, cap, graphs_of, &mut annotations)? {
             changed.push(fact);
         }
     }
@@ -1653,11 +1644,10 @@ fn words<'s>(sets: impl IntoIterator<Item = &'s GraphSet>) -> usize {
     sets.into_iter().map(GraphSet::heap_bytes).sum()
 }
 
-/// [`merge`] of one fact's derivations, their sets `found` (marked if one was: [`merge`]
-/// reads the mark as one beyond the fact's own graphs), into its sets in `now`, the copies
-/// on the way charged first (sol-loop r1 S1, r2 S1/S2): the derivations' list (their slots
-/// and words), and beside it `merge`'s, at its final capacity, of the fact's sets (copied:
-/// slots and words) with the derivations (moved: slots only).
+/// [`merge`] of one fact's derivations, their sets `found` borrowed (marked if one was:
+/// [`merge`] reads the mark as one beyond the fact's own graphs), into its sets in `now`:
+/// their copy (its slots and words) charged before it is made (sol-loop r1 S1), then
+/// [`merge_owned`].
 #[allow(clippy::too_many_arguments)]
 fn merge_found<'s>(
     run: &Run<'_>,
@@ -1669,17 +1659,36 @@ fn merge_found<'s>(
     graphs_of: &dyn Graphs,
     annotations: &mut usize,
 ) -> Result<bool, Stopped> {
-    let (n, kept) = (
-        found.len(),
-        now.get(&fact).map_or(&[][..], |a| a.sets.as_slice()),
-    );
-    let copies = slots(n) + words(found.clone()) + slots(kept.len() + n) + words(kept);
-    let _room = run.room(copies).map_err(Stopped::Refused)?;
+    let _copy = run
+        .room(slots(found.len()) + words(found.clone()))
+        .map_err(Stopped::Refused)?;
     let from = Annotation {
         sets: found.cloned().collect(),
         truncated: marked,
         beyond_own: false,
     };
+    merge_owned(run, now, fact, from, cap, graphs_of, annotations)
+}
+
+/// [`merge`] of one fact's derivations it holds, `from` (charged by its holder), into its
+/// sets in `now`, moved, not copied (the base's merge; a copy of a fact's first-pass sets was
+/// the product's commit-2 peak, 1 MiB above the base's, phase `upd: first merge` of
+/// `p2c5-r4-memprof5-1809b4a9`): `merge`'s list, at its final capacity, of the fact's sets
+/// (copied: slots and words) with `from`'s (moved: slots only), charged first (sol-loop r1
+/// S1, r2 S1/S2).
+fn merge_owned(
+    run: &Run<'_>,
+    now: &mut HashMap<Triple, Annotation>,
+    fact: Triple,
+    from: Annotation,
+    cap: usize,
+    graphs_of: &dyn Graphs,
+    annotations: &mut usize,
+) -> Result<bool, Stopped> {
+    let kept = now.get(&fact).map_or(&[][..], |a| a.sets.as_slice());
+    let _room = run
+        .room(slots(kept.len() + from.sets.len()) + words(kept))
+        .map_err(Stopped::Refused)?;
     Ok(merge(now, fact, from, cap, graphs_of, annotations))
 }
 
