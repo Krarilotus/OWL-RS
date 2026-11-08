@@ -167,7 +167,7 @@ pub fn read(statements: &[Statement], terms: &dyn Terms) -> Ontology {
 /// reader, by memberships) finds class expressions by the same definition (I24c-2 review
 /// r1 F2, r2 F5). Both take it apart field by field, so a marker added here doesn't compile
 /// until each of them handles it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClassExpressionMarkers {
     /// `owl:Class`, `rdfs:Class`, `owl:Restriction`.
     pub types: [Option<Term>; 3],
@@ -191,6 +191,28 @@ impl ClassExpressionMarkers {
             ],
             on_properties: v.owl_on_properties,
             on_property: v.owl_on_property,
+        }
+    }
+
+    /// [`Self::of`] the source's vocabulary, looking up only these terms, by their
+    /// compile-time IRIs: a caller needing nothing else of the vocabulary looks nothing else
+    /// up. The QL reader does this once per fresh read, where a whole [`Vocabulary::new`]
+    /// cost 0.6 % of a compile (count i24c-attrib2-f6ec07c9).
+    pub fn lookup(id_of: &dyn Fn(&str) -> Option<Term>) -> Self {
+        Self {
+            types: [
+                id_of(const { Vocabulary::iri("owl_class") }),
+                id_of(const { Vocabulary::iri("rdfs_class") }),
+                id_of(const { Vocabulary::iri("owl_restriction") }),
+            ],
+            set_operators: [
+                id_of(const { Vocabulary::iri("owl_intersection_of") }),
+                id_of(const { Vocabulary::iri("owl_union_of") }),
+                id_of(const { Vocabulary::iri("owl_complement_of") }),
+                id_of(const { Vocabulary::iri("owl_one_of") }),
+            ],
+            on_properties: id_of(const { Vocabulary::iri("owl_on_properties") }),
+            on_property: id_of(const { Vocabulary::iri("owl_on_property") }),
         }
     }
 

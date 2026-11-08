@@ -78,6 +78,22 @@ pub fn data_iris() -> Vec<String> {
     DATA_IRIS.iter().map(|&iri| iri.to_owned()).collect()
 }
 
+/// Whether `a` and `b` are the same text (in a `const`).
+const fn same(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 macro_rules! vocabulary {
     ($($field:ident = $ns:ident $local:literal),* $(,)?) => {
         /// The ids of the terms the mapping reads.
@@ -100,6 +116,19 @@ macro_rules! vocabulary {
                 Self {
                     $($field: id_of(concat!(namespace!($ns), $local)),)*
                 }
+            }
+
+            /// The IRI of field `field`, for a `const`: a field the vocabulary lacks fails
+            /// the build there.
+            pub const fn iri(field: &str) -> &'static str {
+                let mut i = 0;
+                while i < Self::IRIS.len() {
+                    if same(Self::IRIS[i].0, field) {
+                        return Self::IRIS[i].1;
+                    }
+                    i += 1;
+                }
+                panic!("not a field of nrese_owl::Vocabulary")
             }
 
             /// Every term with its IRI (for writing): [`Self::IRIS`], owned.
