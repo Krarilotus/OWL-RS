@@ -1082,9 +1082,14 @@ pub(crate) fn fmt_operation(
             f.write_str(if *silent { "CREATE SILENT " } else { "CREATE " })?;
             write!(f, "GRAPH {graph}")
         }
-        GraphUpdateOperation::Add { silent, from, to } => {
-            f.write_str(if *silent { "ADD SILENT " } else { "ADD " })?;
-            write!(f, "{from} TO {to}")
+        GraphUpdateOperation::Transfer {
+            op,
+            silent,
+            from,
+            to,
+        } => {
+            let silent = if *silent { " SILENT" } else { "" };
+            write!(f, "{}{silent} {from} TO {to}", op.keyword())
         }
     }
 }

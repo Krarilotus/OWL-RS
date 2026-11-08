@@ -14,8 +14,9 @@
 //!   token and the expression (`+(1)`) alike though they are two terms;
 //! - the shape of a nest of `&&` or `||` (both associative): nrese balances it, spargebra
 //!   folds it left;
-//! - `ADD` and the copy step of `MOVE` and `COPY`: nrese keeps the operation (it reads the
-//!   stored graph, SYN-54), spargebra lowers it to the `DELETE`/`INSERT` §3.2.3 defines it as.
+//! - `ADD`, `MOVE` and `COPY`: nrese keeps each as one operation (it reads the stored graph and
+//!   resolves both names first, SYN-54), spargebra lowers it to the `DROP` and `DELETE`/`INSERT`
+//!   steps §3.2.3–3.2.5 define it as, none for two equal names.
 //!
 //! Every other difference is listed. Those explained (spargebra's right-associative
 //! `-` and `/`, and what each accepts or rejects) are checked to be exactly the expected
@@ -38,7 +39,7 @@ use nrese_sparql_syntax::term::{
     TriplePattern,
 };
 use nrese_sparql_syntax::visit::{Node, NodeMut};
-use nrese_sparql_syntax::{GraphUpdateOperation as U, Query, SparqlParser, Update};
+use nrese_sparql_syntax::{GraphUpdateOperation as U, Query, SparqlParser, TransferOp, Update};
 use oxigraph_comparison::w3c;
 use spargebra::algebra as sa;
 use spargebra::term as st;
@@ -964,14 +965,53 @@ fn lowered(from: &GraphName, to: &GraphName) -> U {
     }
 }
 
+/// spargebra's form of nrese's transfer: nothing for two equal names, else the `DROP` and
+/// `DELETE`/`INSERT` steps SPARQL 1.1 Update §3.2.3–3.2.5 define it as.
+fn spargebra_form(operation: U) -> Vec<U> {
+    let U::Transfer {
+        op,
+        silent,
+        from,
+        to,
+    } = operation
+    else {
+        return vec![operation];
+    };
+    if from == to {
+        return Vec::new();
+    }
+    let target = |g: &GraphName| match g {
+        GraphName::NamedNode(n) => GraphTarget::NamedNode(n.clone()),
+        GraphName::DefaultGraph => GraphTarget::DefaultGraph,
+    };
+    let drop_to = U::Drop {
+        silent: true,
+        graph: target(&to),
+    };
+    let copy = lowered(&from, &to);
+    match op {
+        TransferOp::Add => vec![copy],
+        TransferOp::Copy => vec![drop_to, copy],
+        TransferOp::Move => vec![
+            drop_to,
+            copy,
+            U::Drop {
+                silent,
+                graph: target(&from),
+            },
+        ],
+    }
+}
+
 /// An update as the test compares it, as [`canonical`] a query.
 fn canonical_update(mut update: Update) -> Canonical {
     let mut names = Generated::default();
+    update.operations = update
+        .operations
+        .into_iter()
+        .flat_map(spargebra_form)
+        .collect();
     for operation in &mut update.operations {
-        if let U::Add { from, to, .. } = operation {
-            let lowered = lowered(from, to);
-            *operation = lowered;
-        }
         match operation {
             U::InsertData { data } => {
                 for quad in data {
@@ -1005,7 +1045,7 @@ fn canonical_update(mut update: Update) -> Canonical {
             | U::Clear { .. }
             | U::Create { .. }
             | U::Drop { .. }
-            | U::Add { .. } => {}
+            | U::Transfer { .. } => {}
         }
     }
     Canonical {

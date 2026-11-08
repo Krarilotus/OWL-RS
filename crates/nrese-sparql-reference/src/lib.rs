@@ -41,7 +41,7 @@ use nrese_sparql_syntax::term::{
     GraphNamePattern, GroundQuadPattern, GroundTermPattern, NamedNodePattern,
     QuadPattern as PatternQuad, TermPattern, TriplePattern,
 };
-use nrese_sparql_syntax::{GraphUpdateOperation, Query, Update};
+use nrese_sparql_syntax::{GraphUpdateOperation, Query, TransferOp, Update};
 
 /// A dataset: quads, the default graph's with [`GraphName::DefaultGraph`].
 #[derive(Debug, Clone, Default)]
@@ -277,10 +277,13 @@ impl Dataset {
                         GraphTarget::AllGraphs => false,
                     });
                 }
-                // SPARQL 1.1 Update §3.2.3: the statements stored in `from`, whatever the
-                // options a WHERE clause reads with.
-                GraphUpdateOperation::Add { from, to, .. } => {
+                // SPARQL 1.1 Update §3.2.3–3.2.5: the statements stored in `from`, whatever the
+                // options a WHERE clause reads with; a graph to itself changes nothing.
+                GraphUpdateOperation::Transfer { op, from, to, .. } => {
                     let (from, to) = (graph_of(from), graph_of(to));
+                    if from == to {
+                        continue;
+                    }
                     let copies: Vec<Quad> = self
                         .quads
                         .iter()
@@ -290,6 +293,12 @@ impl Dataset {
                             ..q.clone()
                         })
                         .collect();
+                    if *op != TransferOp::Add {
+                        self.quads.retain(|q| q.graph_name != to);
+                    }
+                    if *op == TransferOp::Move {
+                        self.quads.retain(|q| q.graph_name != from);
+                    }
                     self.quads.extend(copies);
                 }
             }

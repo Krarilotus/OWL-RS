@@ -114,8 +114,9 @@ impl fmt::Display for Update {
     }
 }
 
-/// One operation of an update. `MOVE` and `COPY` become `Drop` and [`Self::Add`] as SPARQL 1.1
-/// Update §3.2.4–3.2.5 define them; a transfer of a graph to itself is no operation.
+/// One operation of an update. `ADD`, `MOVE` and `COPY` stay one operation each
+/// ([`Self::Transfer`]): which graphs their names denote, and so whether a transfer is one of a
+/// graph to itself, is for the store to say, not the syntax.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum GraphUpdateOperation {
     InsertData {
@@ -147,15 +148,41 @@ pub enum GraphUpdateOperation {
         silent: bool,
         graph: GraphTarget,
     },
-    /// `ADD`, and the copy step of `MOVE` and `COPY` (§3.2.3): every statement the Graph
-    /// Store holds in `from` inserted into `to`. Its input is that graph as stored, whatever
-    /// a `WHERE` clause would read: not a union default graph, inferred statements or a
-    /// protocol dataset (SYN-54). `from` and `to` differ.
-    Add {
+    /// `ADD`, `MOVE` or `COPY` (SPARQL 1.1 Update §3.2.3–3.2.5): every statement the Graph Store
+    /// holds in `from` inserted into `to`, which `MOVE` and `COPY` empty first and `MOVE` then
+    /// empties `from`. Its input is that graph as stored, whatever a `WHERE` clause would read:
+    /// not a union default graph, inferred statements or a protocol dataset (SYN-54). Kept
+    /// whole until the names are resolved: a transfer between two names of one graph changes
+    /// nothing (§3.2.4–3.2.5), and only the store knows which names those are (review r1 of
+    /// SYN-54 slice 2, S2-F1).
+    Transfer {
+        op: TransferOp,
         silent: bool,
         from: GraphName,
         to: GraphName,
     },
+}
+
+/// Which transfer a [`GraphUpdateOperation::Transfer`] is.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum TransferOp {
+    /// Keeps what `to` held.
+    Add,
+    /// Empties `to` first, then `from`.
+    Move,
+    /// Empties `to` first.
+    Copy,
+}
+
+impl TransferOp {
+    /// Its keyword.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::Add => "ADD",
+            Self::Move => "MOVE",
+            Self::Copy => "COPY",
+        }
+    }
 }
 
 impl fmt::Display for GraphUpdateOperation {
