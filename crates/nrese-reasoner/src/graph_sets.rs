@@ -722,20 +722,21 @@ fn support_sets_run(
                     return None;
                 }
                 // The copies `minimal` takes, charged first (sol-loop r1 S1).
-                let copies = slots(kept.len() + group.len())
-                    + words(kept.iter().chain(group.iter().map(|(_, set, _)| set)));
-                let _room = match run.room(copies) {
-                    Ok(room) => room,
+                let copied = words(kept.iter().chain(group.iter().map(|(_, set, _)| set)));
+                let chosen = Charged::with_capacity(run, kept.len() + group.len(), copied)
+                    .and_then(|mut all| {
+                        kept.iter().for_each(|set| all.push(set.clone()));
+                        group.iter().for_each(|(_, set, _)| all.push(set.clone()));
+                        all.minimal(cap, &own_graph_of(fact, graphs_of))
+                    });
+                // Kept as the fact's sets: the retained sets' exemption (module doc).
+                let mut next = match chosen {
+                    Ok(chosen) => chosen.into_retained(),
                     Err(exceeded) => {
                         run.refuse(exceeded);
                         return None;
                     }
                 };
-                // At its final capacity: what is charged is what is allocated.
-                let mut all = Vec::with_capacity(kept.len() + group.len());
-                all.extend_from_slice(kept);
-                all.extend(group.iter().map(|(_, set, _)| set.clone()));
-                let mut next = minimal(all, cap, &own_graph_of(fact, graphs_of));
                 next.truncated |= truncated || marks;
                 next.beyond_own |= beyond_own || marks;
                 (next.sets.as_slice() != kept
@@ -1403,6 +1404,105 @@ impl<'a> Held<'a> {
     }
 }
 
+impl<'a> Held<'a> {
+    /// The annotation alone, its charge released: for sets the evaluation keeps (the
+    /// retained sets, under the W1 exemption of the module doc).
+    fn into_retained(self) -> Annotation {
+        let Self { annotation, .. } = self;
+        annotation
+    }
+}
+
+/// Sets made under a charge taken before they were, owned together: the storage drops
+/// before its charge, and [`Self::minimal`] consumes the sets while the charge holds, so the
+/// release-before-free order can't be written by hand (sol-loop r5–r7, three rounds of it;
+/// the master, 8 Nov 05:10).
+struct Charged<'a> {
+    /// Before `charge`: fields drop in order.
+    sets: Vec<GraphSet>,
+    charge: Reservation<&'a Budget>,
+}
+
+impl<'a> Charged<'a> {
+    /// Room for `n` sets and `extra` bytes beside them (their words, `minimal`'s output),
+    /// charged before anything is allocated.
+    fn with_capacity(run: &Run<'a>, n: usize, extra: usize) -> Result<Self, BudgetExceeded> {
+        let charge = run.room(slots(n).saturating_add(extra))?;
+        Ok(Self {
+            sets: Vec::with_capacity(n),
+            charge,
+        })
+    }
+
+    /// One more set, within the room charged.
+    fn push(&mut self, set: GraphSet) {
+        debug_assert!(
+            self.sets.len() < self.sets.capacity(),
+            "past the room charged"
+        );
+        self.sets.push(set);
+    }
+
+    /// `minimal` of the sets, made while their charge holds, with the charge of what its
+    /// output holds alone.
+    fn minimal(
+        self,
+        cap: usize,
+        own: &dyn Fn(&GraphSet) -> bool,
+    ) -> Result<Held<'a>, BudgetExceeded> {
+        let Self { sets, mut charge } = self;
+        let out = minimal(sets, cap, own);
+        charge.resize(slots(out.sets.capacity()) + words(&out.sets))?;
+        Ok(Held {
+            annotation: out,
+            _charge: charge,
+        })
+    }
+}
+
+/// Sets gathered as they come under one budget, owned together: their list (charged as it
+/// grows) drops before their words' charge.
+struct Gathered<'a> {
+    /// Before `words`: fields drop in order.
+    sets: ChargedVec<GraphSet, &'a Budget>,
+    words: Reservation<&'a Budget>,
+}
+
+impl<'a> Gathered<'a> {
+    fn new(budget: &'a Budget) -> Self {
+        Self {
+            sets: ChargedVec::new(budget),
+            words: Reservation::new(budget),
+        }
+    }
+
+    /// `held`'s sets moved in: their words charged here first, their list's room too.
+    fn take(&mut self, held: Held<'a>) -> Result<(), BudgetExceeded> {
+        self.words.charge(words(&held.sets))?;
+        let annotation = held.into_retained();
+        let n = annotation.sets.len();
+        self.sets.fill(n, |room| {
+            annotation.sets.into_iter().for_each(|set| room.push(set))
+        })
+    }
+
+    /// `minimal` of the sets (its output's slots charged first, then every charge they hold
+    /// made one, so nothing is charged twice; sol-loop r6 S3), with the charge of what the
+    /// output holds alone.
+    fn choose(self, cap: usize, run: &Run<'a>) -> Result<Held<'a>, BudgetExceeded> {
+        // Refused here, the whole drops: the list before the words.
+        let out = run.room(slots(self.sets.len().min(cap)))?;
+        let Self { sets, words } = self;
+        let (sets, slots_held) = sets.into_parts();
+        let bytes = out.transfer() + slots_held.transfer() + words.transfer();
+        Charged {
+            sets,
+            charge: Reservation::adopt(&**run.scratch, bytes),
+        }
+        .minimal(cap, &|_| false)
+    }
+}
+
 impl std::ops::Deref for Held<'_> {
     type Target = Annotation;
 
@@ -1516,20 +1616,12 @@ fn grounding_sets<'a, L: Lookup + ?Sized>(
     poll: &mut Poller<'_>,
     run: &Run<'a>,
 ) -> Result<Held<'a>, BudgetExceeded> {
-    let budget: &'a Budget = run.scratch;
-    // Before the sets: locals drop in reverse, the sets first (sol-loop r5 S2).
-    let mut held_words = Reservation::new(budget);
-    let mut all: ChargedVec<GraphSet, &Budget> = ChargedVec::new(budget);
+    let mut all = Gathered::new(run.scratch);
     let (mut truncated, mut refused) = (false, None);
     program.for_each_alternative(grounding, poll, |premises, _| {
         let added = premise_sets_from(premises, empty, sets, cap, run).and_then(|found| {
             truncated |= found.truncated;
-            held_words.charge(words(&found.sets))?;
-            let Held { annotation, .. } = found;
-            let n = annotation.sets.len();
-            all.fill(n, |room| {
-                annotation.sets.into_iter().for_each(|set| room.push(set))
-            })
+            all.take(found)
         });
         match added {
             Ok(()) => ControlFlow::Continue(()),
@@ -1542,38 +1634,11 @@ fn grounding_sets<'a, L: Lookup + ?Sized>(
     if let Some(exceeded) = refused {
         return Err(exceeded);
     }
-    let mut held = choose(held_words, all, cap, run)?;
+    let mut held = all.choose(cap, run)?;
     // A derivation's sets: whatever they lack is beyond the head's own graphs.
     held.annotation.truncated |= truncated;
     held.annotation.beyond_own |= truncated;
     Ok(held)
-}
-
-/// `minimal` of the sets `all` gathered (their words charged in `words_held`), with the
-/// charge of what its output holds: its output's slots charged before it is made; after it,
-/// the input's slots released (`minimal` freed them), the dropped sets' words released, and
-/// the kept sets' words carried over, not charged again (sol-loop r6 S3).
-///
-/// `words_held` comes first: parameters drop in reverse order, so on a refusal the sets
-/// are freed before their words' charge is released (sol-loop r7 S4).
-fn choose<'a>(
-    mut words_held: Reservation<&'a Budget>,
-    all: ChargedVec<GraphSet, &'a Budget>,
-    cap: usize,
-    run: &Run<'a>,
-) -> Result<Held<'a>, BudgetExceeded> {
-    let mut charge = run.room(slots(all.len().min(cap)))?;
-    let (all, input) = all.into_parts();
-    let out = minimal(all, cap, &|_| false);
-    drop(input);
-    // Both shrink: what the output holds is at most what was charged for it.
-    words_held.resize(words(&out.sets))?;
-    charge.resize(slots(out.sets.capacity()))?;
-    let bytes = charge.transfer() + words_held.transfer();
-    Ok(Held {
-        annotation: out,
-        _charge: Reservation::adopt(&**run.scratch, bytes),
-    })
 }
 
 /// The minimal unions of the sets `start` with one set per premise of `body`, marked if
@@ -1628,10 +1693,19 @@ fn premise_sets_from<'a, L: Lookup + ?Sized>(
             };
         }
     }
-    // The product as it stands, held under `held` until the next replaces it (sol-loop r5
-    // S1): declared first, so it drops after the sets.
-    let mut held = run.room(slots(start.sets.len()) + words(&start.sets))?;
-    let mut product = start.clone();
+    // The product as it stands, with its charge, until the next replaces it (sol-loop r5 S1).
+    let mut product = {
+        let mut copy = Charged::with_capacity(run, start.sets.len(), words(&start.sets))?;
+        start.sets.iter().for_each(|set| copy.push(set.clone()));
+        Held {
+            annotation: Annotation {
+                sets: copy.sets,
+                truncated: start.truncated,
+                beyond_own: start.beyond_own,
+            },
+            _charge: copy.charge,
+        }
+    };
     for premise in body {
         let Some(own) = sets.sets_of(premise) else {
             return Ok(Held::uncharged(Annotation::default(), run));
@@ -1639,33 +1713,26 @@ fn premise_sets_from<'a, L: Lookup + ?Sized>(
         // Charged first: the unions (their slots, at most the longer operand's words each)
         // and `minimal`'s output beside them; past what a budget can count, refused.
         let n = product.sets.len().saturating_mul(own.sets.len());
-        let bytes = slots(n)
-            .saturating_add(slots(n.min(cap)))
+        let extra = slots(n.min(cap))
             .saturating_add(own.sets.len().saturating_mul(words(&product.sets)))
             .saturating_add(product.sets.len().saturating_mul(words(own.sets.iter())));
-        let mut room = run.room(bytes)?;
-        let mut next = Vec::with_capacity(n);
+        let mut next = Charged::with_capacity(run, n, extra)?;
         for a in &product.sets {
             for b in own.sets.iter() {
                 next.push(a.union(b));
             }
         }
         let truncated = product.truncated || own.truncated;
-        // The step's product replaces the last (freed under its charge, still held), and
-        // only what it holds stays charged.
-        product = minimal(next, cap, &|_| false);
-        product.truncated |= truncated;
-        product.beyond_own |= truncated;
-        room.resize(slots(product.sets.capacity()) + words(&product.sets))?;
-        held = room;
+        let mut chosen = next.minimal(cap, &|_| false)?;
+        chosen.annotation.truncated |= truncated;
+        chosen.annotation.beyond_own |= truncated;
+        // The last product goes (its sets, then its charge) once this one is made.
+        product = chosen;
     }
     // A premise without sets yet: the instance gives nothing now, whatever was cut.
     Ok(match product.is_empty() {
         true => Held::uncharged(Annotation::default(), run),
-        false => Held {
-            annotation: product,
-            _charge: held,
-        },
+        false => product,
     })
 }
 
@@ -1703,7 +1770,7 @@ mod tests {
     /// holds stays charged.
     #[test]
     fn chosen_sets_are_charged_once() {
-        use super::{Budget, ChargedVec, GraphSet, Limits, Reservation, Run, choose, slots, words};
+        use super::{Budget, ChargedVec, Gathered, GraphSet, Limits, Run, slots, words};
         use std::sync::Arc;
         // Eight sets past 128 graphs, each with words on the heap, two of them covering
         // others (`minimal` drops them), cap 8.
@@ -1717,13 +1784,11 @@ mod tests {
             all.charged() + words(&sets)
         };
         let budget = Arc::new(Budget::new(gathered + slots(sets.len())));
-        let b: &Budget = &budget;
-        let mut words_held = Reservation::new(b);
-        words_held.charge(words(&sets)).unwrap();
-        let mut all: ChargedVec<GraphSet, &Budget> = ChargedVec::new(b);
-        all.extend_from_slice(&sets).unwrap();
+        let mut all = Gathered::new(&budget);
+        all.words.charge(words(&sets)).unwrap();
+        all.sets.extend_from_slice(&sets).unwrap();
         let run = Run::new(Limits::unlimited(&budget));
-        let held = choose(words_held, all, 8, &run).expect("nothing asked twice");
+        let held = all.choose(8, &run).expect("nothing asked twice");
         assert_eq!(held.sets.len(), 6, "the two covering sets dropped");
         assert_eq!(
             budget.used(),
@@ -1739,7 +1804,7 @@ mod tests {
     /// charge, and nothing charged after.
     #[test]
     fn a_refused_choice_frees_its_sets_before_their_charge() {
-        use super::{Budget, ChargedVec, GraphSet, Limits, Reservation, Run, choose, words};
+        use super::{Budget, ChargedVec, Gathered, GraphSet, Limits, Run, words};
         use nrese_exec::measure;
         use std::sync::Arc;
         if !measure::alone() {
@@ -1756,13 +1821,11 @@ mod tests {
         // Room for the gathered sets alone: the output's slots are refused.
         let budget = Arc::new(Budget::new(gathered));
         let (refused, excess) = measure::measure_within(&budget, || {
-            let b: &Budget = &budget;
-            let mut words_held = Reservation::new(b);
-            words_held.charge(words(&sets)).unwrap();
-            let mut all: ChargedVec<GraphSet, &Budget> = ChargedVec::new(b);
-            all.extend_from_slice(&sets).unwrap();
+            let mut all = Gathered::new(&budget);
+            all.words.charge(words(&sets)).unwrap();
+            all.sets.extend_from_slice(&sets).unwrap();
             let run = Run::new(Limits::unlimited(&budget));
-            choose(words_held, all, 8, &run).is_err()
+            all.choose(8, &run).is_err()
         });
         assert!(refused, "no room for the output");
         assert_eq!(excess, 0, "{excess} bytes held beyond the charge");
