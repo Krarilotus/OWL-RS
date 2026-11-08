@@ -942,3 +942,57 @@ fn a_rotation_whose_segment_may_be_placed_takes_no_more_commits() {
     assert_eq!(contents(&engine), [quad(1)].into_iter().collect());
     commit(&engine, 4).unwrap();
 }
+
+/// A directory sync is a real one on every platform (F2): syncing a directory that isn't
+/// there fails. Before the fix it was a no-op on Windows, so a checkpoint's or segment's
+/// rename there wasn't durable when its commit was acknowledged. (A guard on Unix, where the
+/// sync was always real; red on Windows.)
+#[test]
+fn a_directory_sync_is_real() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("not-there");
+    assert!(
+        super::sync_dir(&missing).is_err(),
+        "synced a missing directory"
+    );
+    super::sync_dir(dir.path()).unwrap();
+}
+
+/// What an open replayed is durable before it takes new commits (F5): the segments it
+/// replayed records from are synced. Before the fix nothing was, so under `OsBuffered` (or an
+/// `EveryCommit` record written but not synced when the process died) a power loss after the
+/// reopen could take the replayed tail, though commits acknowledged after it were in a new
+/// segment.
+#[test]
+fn an_open_syncs_what_it_replayed() {
+    let buffered = || EngineConfig {
+        durability: DurabilityConfig {
+            sync: SyncPolicy::OsBuffered,
+            ..config().durability
+        },
+        ..config()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), buffered()).unwrap();
+        commit(&engine, 1).unwrap();
+        commit(&engine, 2).unwrap();
+    }
+    let segments: Vec<std::path::PathBuf> =
+        super::wal::list_segments(&super::wal::wal_dir(dir.path()))
+            .unwrap()
+            .into_iter()
+            .map(|(_, path)| path)
+            .collect();
+    fault::SYNCED.with_borrow_mut(Vec::clear);
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    let synced = fault::SYNCED.take();
+    assert_eq!(contents(&engine), [quad(1), quad(2)].into_iter().collect());
+    for segment in &segments {
+        assert!(
+            synced.contains(segment),
+            "{} replayed but not synced (synced: {synced:?})",
+            segment.display()
+        );
+    }
+}

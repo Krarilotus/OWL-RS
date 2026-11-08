@@ -500,6 +500,135 @@ fn crash_between_checkpoint_and_wal_release_skips_covered_records() {
     assert_eq!(contents(&engine), states[9]);
 }
 
+/// Damage in a segment the checkpoint wholly covers, one a failed release left behind,
+/// neither refuses the open nor costs a record after it (F7): its records are all in the
+/// checkpoint. Here records 1 to 10 are in a leftover segment, the checkpoint is at 10, and
+/// records 11 and 12 are in the next segment; the leftover's middle is garbled. Before the fix
+/// the open refused it as damage outside the last segment, and the repair that refusal named
+/// (`recover_until`) cut away the later segments.
+#[test]
+fn damage_in_a_covered_leftover_segment_costs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved_wal = tempfile::tempdir().unwrap();
+    let states = {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        let mut states = commit_all(&engine, &batches(0..10));
+        copy_dir(&dir.path().join("wal"), saved_wal.path());
+        engine.checkpoint().unwrap();
+        states.extend(commit_all(&engine, &batches(10..12)));
+        states
+    };
+    // The covered segment back, as if its release had failed, garbled in the middle.
+    for entry in fs::read_dir(saved_wal.path()).unwrap() {
+        let path = entry.unwrap().path();
+        let mut bytes = fs::read(&path).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        fs::write(
+            dir.path().join("wal").join(path.file_name().unwrap()),
+            bytes,
+        )
+        .unwrap();
+    }
+    assert!(segments(dir.path()).len() >= 2);
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(engine.stats().revision, 12);
+    assert_eq!(contents(&engine), states[11]);
+}
+
+/// A store closed and reopened while another thread of the process starts a child process
+/// opens again (open row IB1312-8ba4, the store lock's). On Linux the child is forked holding a
+/// copy of every open descriptor, the store's `LOCK` among them, until it execs; here it is held
+/// in that window (a `pre_exec` hook that marks it is there and sleeps 3 s) while the store
+/// is dropped and reopened. A lock held by the descriptor's open file description (`flock`)
+/// is then still held by the child, and the reopen fails with `Locked`. On Windows the same
+/// sequence with a child that just lives a while (handles are not inherited unless marked).
+#[test]
+fn a_reopen_is_not_locked_out_by_a_child_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let marks = tempfile::tempdir().unwrap();
+    let mark = marks.path().join("forked");
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    commit_all(&engine, &batches(0..1));
+    let spawner = {
+        let marker = fs::File::create(&mark).unwrap();
+        std::thread::spawn(move || child_in_its_window(marker))
+    };
+    // The child exists, holding what it inherited, before the store is dropped.
+    let started = std::time::Instant::now();
+    while fs::metadata(&mark).unwrap().len() == 0 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the child never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    drop(engine);
+    let reopened = Engine::open(dir.path(), config());
+    let ended = spawner.join().unwrap();
+    assert!(
+        reopened.is_ok(),
+        "reopened while a child process was starting: {:?}",
+        reopened.err()
+    );
+    assert!(ended, "the child ran");
+}
+
+/// Guard (right on the base too): a store an earlier binary has open is refused. An earlier
+/// binary holds `flock` on `LOCK` for as long as it runs; here a second open file description
+/// in this process holds it (`flock` locks of two descriptions conflict, in one process too).
+/// Released, the store opens.
+#[test]
+fn a_store_an_earlier_binary_has_open_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Engine::open(dir.path(), config()).unwrap());
+    let earlier = fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("LOCK"))
+        .unwrap();
+    earlier.try_lock().unwrap();
+    let refused = Engine::open(dir.path(), config());
+    assert!(
+        matches!(refused, Err(EngineError::Locked(_))),
+        "opened beside an earlier binary: {:?}",
+        refused.err()
+    );
+    earlier.unlock().unwrap();
+    drop(earlier);
+    Engine::open(dir.path(), config()).unwrap();
+}
+
+/// Starts a child that marks `marker` once it exists and holds the process's descriptors
+/// for 3 s before it runs (Linux: in its fork-to-exec window); whether it ran.
+#[cfg(unix)]
+fn child_in_its_window(marker: fs::File) -> bool {
+    use std::io::Write as _;
+    use std::os::unix::process::CommandExt as _;
+    let mut command = std::process::Command::new("true");
+    // SAFETY: the hook runs in the forked child before exec and only writes to an already
+    // open file and sleeps (system calls, no allocation and no lock), which is safe there.
+    unsafe {
+        command.pre_exec(move || {
+            (&marker).write_all(b"x")?;
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            Ok(())
+        });
+    }
+    command.status().is_ok_and(|status| status.success())
+}
+
+/// Windows: a child that lives 3 s, started while the store is open.
+#[cfg(windows)]
+fn child_in_its_window(marker: fs::File) -> bool {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "ping -n 4 127.0.0.1 > NUL"])
+        .spawn()
+        .unwrap();
+    (&marker).write_all(b"x").unwrap();
+    child.wait().is_ok_and(|status| status.success())
+}
+
 #[test]
 fn terms_from_aborted_transactions_keep_the_dictionary_contiguous() {
     let dir = tempfile::tempdir().unwrap();
