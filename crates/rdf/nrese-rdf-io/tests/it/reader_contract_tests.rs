@@ -378,6 +378,71 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
             "<urn:s> <urn:p> } . <urn:after> <urn:p> <urn:o> .",
             vec![None, Some(&after)],
         ),
+        // A TriG graph block whose name fails (an undeclared prefix, an IRI that can't be
+        // one) is skipped through its own `}`: the statement after the block isn't part of
+        // it. Before, the `{` was read as a brace of the failed statement, which went on to
+        // the next `.` and took that statement with it.
+        (
+            false,
+            RdfFormat::TriG,
+            "ex:g { <urn:u> <urn:v> <urn:w> . } <http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::TriG,
+            "GRAPH <a b> { <urn:u> <urn:v> <urn:w> . } <http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        // A name that fails without a block after it is a failed statement, as before.
+        (
+            true,
+            RdfFormat::TriG,
+            "ex:s <urn:p> <urn:o> . <http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        // A SPARQL-style directive that fails ends after its IRI (PREFIX, BASE) or its string
+        // (VERSION), as one that parses does: the statement after it isn't part of it.
+        // Before, the failed directive went on to the next `.` and took that statement with
+        // it.
+        (
+            false,
+            RdfFormat::Turtle,
+            "PREFIX ex: <a b>\n<http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::Turtle,
+            "PREFIX ex <x>\n<http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::Turtle,
+            "BASE <a b>\n<http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        (
+            false,
+            RdfFormat::Turtle,
+            "VERSION 12 \"1.2\"\n<http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
+        // With no IRI (or string) to end it, it ends at a `.` with nothing open, as before.
+        (
+            true,
+            RdfFormat::Turtle,
+            "VERSION 12\n<urn:u> <urn:v> <urn:w> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&after)],
+        ),
+        // In its `@` form a directive ends at its `.`, failed or not, as before.
+        (
+            true,
+            RdfFormat::Turtle,
+            "@prefix ex: <a b> <urn:u> .\n<http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
         // A string with a line break in it, closed later: its end is known, so it is
         // skipped whole and the `] .` and statement in it are text, not structure (fix
         // check r2). LF and CR, both quotes, and in a TriG block.
