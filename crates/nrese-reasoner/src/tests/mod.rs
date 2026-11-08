@@ -2275,7 +2275,7 @@ fn check_supports(
         .filter(|f| asserted.binary_search(f).is_err())
         .collect();
     let ground = program(&MemoryBase::new(&asserted, &inferred), compiled);
-    let graphs_of = |fact: Triple| -> Vec<u32> {
+    let graphs_of = |fact: Triple, _: &crate::eval::Poller<'_>| -> Vec<u32> {
         placed
             .iter()
             .filter(|&&(f, _)| f == fact)
@@ -2325,7 +2325,8 @@ fn check_supports(
                     .is_some_and(|kept| kept.truncated && !fits(kept))
             });
             let within = undecided.then(|| {
-                let read = |fact: Triple| data.binary_search(&fact).is_ok();
+                let read =
+                    |fact: Triple, _: &crate::eval::Poller<'_>| data.binary_search(&fact).is_ok();
                 closure_within(&full, &ground, &[], &read, Limits::UNLIMITED).unwrap()
             });
             let visible: Vec<Triple> = full
@@ -2596,7 +2597,7 @@ pub(super) fn support_set_updates_against_recomputation() {
             &after,
             &ground_after,
             &[],
-            &|f| graphs_in(&placed, f),
+            &|f, _| graphs_in(&placed, f),
             usize::MAX,
             Limits::UNLIMITED,
         )
@@ -2607,7 +2608,7 @@ pub(super) fn support_set_updates_against_recomputation() {
                 &before,
                 &ground_before,
                 &[],
-                &|f| graphs_in(&old_placed, f),
+                &|f, _| graphs_in(&old_placed, f),
                 cap,
                 Limits::UNLIMITED,
             )
@@ -2615,16 +2616,16 @@ pub(super) fn support_set_updates_against_recomputation() {
             let previous = |f: Triple| sets_before.get(&f).cloned().unwrap_or_default();
             let change = Change {
                 source: &source,
-                in_closure: &|f| after.binary_search(&f).is_ok(),
+                in_closure: &|f, _| after.binary_search(&f).is_ok(),
                 touched: &touched,
-                previous: &previous,
+                previous: &|f, _| previous(f),
                 limit: usize::MAX,
             };
             let Some(update) = update_support_sets(
                 &change,
                 &ground_after,
                 &[],
-                &|f| graphs_in(&placed, f),
+                &|f, _| graphs_in(&placed, f),
                 cap,
                 Limits::UNLIMITED,
             )
@@ -2664,7 +2665,8 @@ pub(super) fn support_set_updates_against_recomputation() {
                 data.sort_unstable();
                 data.dedup();
                 let fresh = closure(&data);
-                let read = |fact: Triple| data.binary_search(&fact).is_ok();
+                let read =
+                    |fact: Triple, _: &crate::eval::Poller<'_>| data.binary_search(&fact).is_ok();
                 let within =
                     closure_within(&after, &ground_after, &[], &read, Limits::UNLIMITED).unwrap();
                 let seen: Vec<Triple> = after
@@ -2908,18 +2910,18 @@ fn in_place_drivers_visit_what_a_scan_visits() {
                 term(&mut next, 0, 12),
             ];
             for seg in [Seg::Delta, Seg::Old, Seg::All] {
+                let poll = crate::eval::Poller::never();
                 let mut scanned = Vec::new();
-                store.scan(pattern, seg, &mut |t| scanned.push(t));
+                store.scan(pattern, seg, &poll, &mut |t| scanned.push(t));
                 let len = store
-                    .matches_len(pattern, seg)
+                    .matches_len(pattern, seg, &poll)
                     .expect("the store indexes its matches");
                 assert!(len >= scanned.len());
                 let morsel = 1 + next(7);
                 let mut ranged = Vec::new();
                 for start in (0..len).step_by(morsel) {
-                    store.scan_range(pattern, seg, start..(start + morsel).min(len), &mut |t| {
-                        ranged.push(t)
-                    });
+                    let range = start..(start + morsel).min(len);
+                    store.scan_range(pattern, seg, range, &poll, &mut |t| ranged.push(t));
                 }
                 assert_eq!(ranged, scanned, "{pattern:?} {seg:?} morsel {morsel}");
             }

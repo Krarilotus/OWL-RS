@@ -6,35 +6,38 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::load;
 use crate::batch::{self, Schema};
-use crate::delta::{Base, Interrupted, MemoryBase, Rules, update_until};
-use crate::eval::OperationStop;
+use crate::delta::{Interrupted, MemoryBase, Rules, VisitsBase, update_until};
+use crate::eval::{OperationStop, Poller, Probe, Visit};
 use crate::ir::{Triple, parse_rules};
 use crate::vocabulary::LocalVocabulary;
 
-/// A base that counts the facts its scans hand out.
+/// A base that counts the facts its scans hand out; reads count on the inner base's.
 struct Counting {
     base: MemoryBase,
     scanned: AtomicUsize,
 }
 
-impl Base for Counting {
-    fn scan(&self, pattern: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
-        self.base.scan(pattern, &mut |fact| {
-            self.scanned.fetch_add(1, Ordering::Relaxed);
-            f(fact);
-        });
+impl VisitsBase for Counting {
+    fn visit(&self, pattern: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
+        visit.filtered(
+            &|_| {
+                self.scanned.fetch_add(1, Ordering::Relaxed);
+                true
+            },
+            |inner| self.base.visit(pattern, inner),
+        );
     }
 
-    fn estimate(&self, pattern: [Option<u64>; 3]) -> usize {
-        self.base.estimate(pattern)
+    fn size(&self, pattern: [Option<u64>; 3], probe: Probe<'_, '_>) -> usize {
+        self.base.size(pattern, probe)
     }
 
-    fn contains(&self, fact: Triple) -> bool {
-        self.base.contains(fact)
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
+        self.base.holds(fact, probe)
     }
 
-    fn is_asserted(&self, fact: Triple) -> bool {
-        self.base.is_asserted(fact)
+    fn asserts(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
+        self.base.asserts(fact, probe)
     }
 }
 
@@ -225,7 +228,7 @@ fn a_stopped_materialisation_is_never_reported_complete() {
 /// update ends `Cancelled`, with no sets (RSH-18, the support facet).
 #[test]
 fn a_cancelled_support_update_stops_within_its_poll_interval() {
-    use crate::eval::{Seg, Source};
+    use crate::eval::{Seg, Visits};
     use crate::graph_sets::{Annotation, Change, Limits, Stopped, UNWATCHED, update_support_sets};
 
     /// The closure, counting the facts its scans hand out.
@@ -233,18 +236,21 @@ fn a_cancelled_support_update_stops_within_its_poll_interval() {
         facts: batch::Store,
         scanned: AtomicUsize,
     }
-    impl Source for Closure {
-        fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple)) {
-            self.facts.scan(pattern, seg, &mut |fact| {
-                self.scanned.fetch_add(1, Ordering::Relaxed);
-                f(fact);
-            });
+    impl Visits for Closure {
+        fn visit(&self, pattern: [Option<u64>; 3], seg: Seg, visit: &mut Visit<'_, '_>) {
+            visit.filtered(
+                &|_| {
+                    self.scanned.fetch_add(1, Ordering::Relaxed);
+                    true
+                },
+                |inner| self.facts.visit(pattern, seg, inner),
+            );
         }
-        fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize {
-            self.facts.estimate(pattern, seg)
+        fn size(&self, pattern: [Option<u64>; 3], seg: Seg, probe: Probe<'_, '_>) -> usize {
+            self.facts.size(pattern, seg, probe)
         }
-        fn contains(&self, fact: Triple) -> bool {
-            self.facts.contains(fact)
+        fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
+            self.facts.holds(fact, probe)
         }
     }
 
@@ -277,10 +283,10 @@ fn a_cancelled_support_update_stops_within_its_poll_interval() {
         facts: batch::Store::new(closure.clone()),
         scanned: AtomicUsize::new(0),
     };
-    let previous = |_: Triple| Annotation::default();
+    let previous = |_: Triple, _: &Poller<'_>| Annotation::default();
     let change = Change {
         source: &source,
-        in_closure: &|f| closure.binary_search(&f).is_ok(),
+        in_closure: &|f, _| closure.binary_search(&f).is_ok(),
         touched: &touched,
         previous: &previous,
         limit: usize::MAX,
@@ -291,7 +297,7 @@ fn a_cancelled_support_update_stops_within_its_poll_interval() {
         watch: UNWATCHED,
         stop: &stop,
     };
-    let result = update_support_sets(&change, &ground, &[], &|_| vec![0], 1, limits);
+    let result = update_support_sets(&change, &ground, &[], &|_, _| vec![0], 1, limits);
     assert_eq!(result.err(), Some(Stopped::Cancelled));
     let scanned = source.scanned.load(Ordering::Relaxed);
     let bound = fires + nrese_exec::POLL_UNITS as usize + 2 * n;

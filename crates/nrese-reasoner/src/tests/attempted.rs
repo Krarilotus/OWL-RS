@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use super::load;
 use crate::batch::{self, Schema};
 use crate::delta::{MemoryBase, Rules};
-use crate::eval::{GroundProgram, NEVER, OperationStop, Seg, Source};
+use crate::eval::{GroundProgram, NEVER, OperationStop, Poller, Probe, Seg, Visit, Visits};
 use crate::ir::{Triple, parse_rules};
 use crate::vocabulary::LocalVocabulary;
 
@@ -40,21 +40,22 @@ impl Asked {
     }
 }
 
-impl Source for Asked {
-    fn scan(&self, pattern: [Option<u64>; 3], seg: Seg, f: &mut dyn FnMut(Triple)) {
+/// Reads are the store's.
+impl Visits for Asked {
+    fn visit(&self, pattern: [Option<u64>; 3], seg: Seg, visit: &mut Visit<'_, '_>) {
         self.scans.fetch_add(1, Ordering::Relaxed);
         self.cancel.store(true, Ordering::Relaxed);
-        self.facts.scan(pattern, seg, f);
+        self.facts.visit(pattern, seg, visit);
     }
 
-    fn estimate(&self, pattern: [Option<u64>; 3], seg: Seg) -> usize {
+    fn size(&self, pattern: [Option<u64>; 3], seg: Seg, probe: Probe<'_, '_>) -> usize {
         self.estimates.fetch_add(1, Ordering::Relaxed);
-        self.facts.estimate(pattern, seg)
+        self.facts.size(pattern, seg, probe)
     }
 
-    fn contains(&self, fact: Triple) -> bool {
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> bool {
         self.contains.fetch_add(1, Ordering::Relaxed);
-        self.facts.contains(fact)
+        self.facts.holds(fact, probe)
     }
 }
 
@@ -112,7 +113,7 @@ fn empty_support_searches_count_towards_the_stop() {
         "a producer per subproperty"
     );
     let source = Asked::new(closure.clone());
-    let asserted = |f: Triple| closure.binary_search(&f).is_ok();
+    let asserted = |f: Triple, _: &Poller<'_>| closure.binary_search(&f).is_ok();
     let stop = || source.cancel.load(Ordering::Relaxed);
     let limits = Limits {
         watch: UNWATCHED,
@@ -180,7 +181,8 @@ fn a_derivation_check_after_its_stop_reads_nothing() {
 
 /// A store whose every position of `p` is stale, as `Current` hides the facts of a
 /// representative that lost its place: it counts `n` positions, and its range scans visit
-/// them and deliver none. The first range scan sets `cancel`.
+/// them and deliver none. The first range scan sets `cancel`. Its reads count as [`Source`]
+/// says: a range's positions before it is read.
 struct Stale {
     p: u64,
     n: usize,
@@ -188,10 +190,10 @@ struct Stale {
     cancel: AtomicBool,
 }
 
-impl Source for Stale {
-    fn scan(&self, _: [Option<u64>; 3], _: Seg, _: &mut dyn FnMut(Triple)) {}
+impl Visits for Stale {
+    fn visit(&self, _: [Option<u64>; 3], _: Seg, _: &mut Visit<'_, '_>) {}
 
-    fn estimate(&self, pattern: [Option<u64>; 3], _: Seg) -> usize {
+    fn size(&self, pattern: [Option<u64>; 3], _: Seg, _: Probe<'_, '_>) -> usize {
         if pattern[1] == Some(self.p) {
             self.n
         } else {
@@ -199,23 +201,29 @@ impl Source for Stale {
         }
     }
 
-    fn contains(&self, _: Triple) -> bool {
+    fn holds(&self, _: Triple, _: Probe<'_, '_>) -> bool {
         false
     }
 
-    fn matches_len(&self, pattern: [Option<u64>; 3], _: Seg) -> Option<usize> {
+    fn positions(&self, pattern: [Option<u64>; 3], _: Seg, _: Probe<'_, '_>) -> Option<usize> {
         (pattern[1] == Some(self.p)).then_some(self.n)
     }
 
-    fn scan_range(
+    /// Every position of the range stale: each passed over, within the range counted ahead.
+    fn visit_range(
         &self,
         _: [Option<u64>; 3],
         _: Seg,
-        _: std::ops::Range<usize>,
-        _: &mut dyn FnMut(Triple),
+        range: std::ops::Range<usize>,
+        visit: &mut Visit<'_, '_>,
     ) {
         self.ranges.fetch_add(1, Ordering::Relaxed);
         self.cancel.store(true, Ordering::Relaxed);
+        for _ in range {
+            if !visit.skip() {
+                return;
+            }
+        }
     }
 }
 
@@ -300,14 +308,14 @@ fn each_premise_alternative_counts_towards_the_stop() {
     closure.sort_unstable();
     let source = batch::Store::new(closure.clone());
     let asked = AtomicUsize::new(0);
-    let previous = |_: Triple| {
+    let previous = |_: Triple, _: &Poller<'_>| {
         asked.fetch_add(1, Ordering::Relaxed);
         Annotation::default()
     };
     let touched = [fact];
     let change = Change {
         source: &source,
-        in_closure: &|f| closure.binary_search(&f).is_ok(),
+        in_closure: &|f, _| closure.binary_search(&f).is_ok(),
         touched: &touched,
         previous: &previous,
         limit: usize::MAX,
@@ -317,7 +325,7 @@ fn each_premise_alternative_counts_towards_the_stop() {
         watch: UNWATCHED,
         stop: &stop,
     };
-    let result = update_support_sets(&change, &ground, &[], &|_| vec![0], 1, limits);
+    let result = update_support_sets(&change, &ground, &[], &|_, _| vec![0], 1, limits);
     assert_eq!(result.err(), Some(Stopped::Cancelled));
     let read = asked.load(Ordering::Relaxed);
     let bound = 1 + POLL_UNITS;
@@ -365,13 +373,13 @@ fn a_support_update_s_first_pass_counts_each_fact() {
     let touched = inferred;
     let source = batch::Store::new(closure.clone());
     let asked = AtomicUsize::new(0);
-    let previous = |_: Triple| {
+    let previous = |_: Triple, _: &Poller<'_>| {
         asked.fetch_add(1, Ordering::Relaxed);
         Annotation::default()
     };
     let change = Change {
         source: &source,
-        in_closure: &|f| closure.binary_search(&f).is_ok(),
+        in_closure: &|f, _| closure.binary_search(&f).is_ok(),
         touched: &touched,
         previous: &previous,
         limit: usize::MAX,
@@ -386,7 +394,7 @@ fn a_support_update_s_first_pass_counts_each_fact() {
         .build()
         .unwrap();
     let result =
-        pool.install(|| update_support_sets(&change, &ground, &[], &|_| vec![0], 1, limits));
+        pool.install(|| update_support_sets(&change, &ground, &[], &|_, _| vec![0], 1, limits));
     assert_eq!(result.err(), Some(Stopped::Cancelled));
     let read = asked.load(Ordering::Relaxed);
     let bound = 1 + POLL_UNITS;
@@ -404,7 +412,7 @@ fn a_support_update_s_first_pass_counts_each_fact() {
 /// them, not a whole producer list each (the reviewer's successful-prefix witness).
 #[test]
 fn producer_discovery_counts_each_reference_read() {
-    use crate::eval::{Poller, references_read};
+    use crate::eval::references_read;
     use crate::graph_sets::derived_otherwise;
     use crate::ir::Term;
     let (r, n) = (3 * POLL_UNITS, 32);
@@ -430,11 +438,11 @@ fn producer_discovery_counts_each_reference_read() {
     closure.dedup();
     let source = Asked::new(closure);
     let stop = || source.cancel.load(Ordering::Relaxed);
-    let mut poll = Poller::new(&stop).expect("not stopped yet");
+    let poll = Poller::new(&stop).expect("not stopped yet");
     references_read::take();
     let derived: Vec<bool> = candidates
         .iter()
-        .map(|&c| derived_otherwise(&source, &ground, &[], c, &mut poll))
+        .map(|&c| derived_otherwise(&source, &ground, &[], c, &poll))
         .collect();
     let read = references_read::take();
     // Guard: the witness is the successful prefix (each candidate's first producer derives it).

@@ -347,3 +347,32 @@ fn a_view_stopped_unread_fails_as_memory_unreadable() {
         crate::StoreError::ProcessMemoryLimit { .. }
     ));
 }
+
+/// REAS-2 (master, 8 Nov 05:29: a counted test per leaf that filters): the closure after a
+/// change counts the removed facts its scan passes over (sweep M13), not only those it
+/// delivers. Over three poll intervals of removed facts, none matching, a poller whose stop
+/// has fired polls within the scan and is stopped by it; uncounted, it would never poll.
+#[test]
+fn the_closure_after_a_change_counts_the_removed_facts_it_passes_over() {
+    let n = 3 * u64::from(nrese_exec::POLL_UNITS);
+    let store = crate::StoreService::new(crate::StoreConfig::in_memory()).unwrap();
+    let snapshot = store.engine().snapshot();
+    let removed: Vec<Triple> = (0..n).map(|i| [i, 5, i]).collect();
+    let after = After {
+        snapshot: &snapshot,
+        removed: &removed,
+    };
+    let fired = std::sync::atomic::AtomicBool::new(false);
+    let stop = || fired.load(std::sync::atomic::Ordering::Relaxed);
+    let poll = Poller::new(&stop).expect("not stopped yet");
+    fired.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut delivered = 0;
+    nrese_reasoner::eval::Source::scan(&after, [None, Some(6), None], Seg::All, &poll, &mut |_| {
+        delivered += 1
+    });
+    assert_eq!(delivered, 0, "no removed fact matches");
+    assert!(
+        poll.stopped(),
+        "{n} removed facts passed over without the poller polling"
+    );
+}

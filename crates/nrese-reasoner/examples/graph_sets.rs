@@ -64,7 +64,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut all = asserted.clone();
     all.extend(&inferred);
     all.sort_unstable();
-    let graph_of = |fact: Triple| -> Vec<u32> {
+    // An in-memory lookup: nothing for the reading task's poller to count beyond its call.
+    let graph_of = |fact: Triple, _: &nrese_reasoner::eval::Poller<'_>| -> Vec<u32> {
         if asserted.binary_search(&fact).is_ok() {
             vec![(fact[0] % u64::from(graphs)) as u32]
         } else {
