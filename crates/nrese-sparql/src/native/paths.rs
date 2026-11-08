@@ -48,7 +48,7 @@ use nrese_sparql_syntax::algebra::PropertyPathExpression;
 
 /// A path with its IRIs resolved to ids; `None` marks an IRI the store doesn't know (no
 /// edges). Equal paths have equal bags ([`PathEvaluator::either`]).
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) enum Path {
     Link(Option<u64>),
     Reverse(Box<Path>),
@@ -81,13 +81,20 @@ impl Path {
             PropertyPathExpression::Sequence(steps) => {
                 Self::Sequence(steps.iter().map(|p| Self::resolve(p, snapshot)).collect())
             }
+            // Each arm once, in the order it first comes, found by hash: matching pairwise
+            // made 65,536 distinct arms 2.1 billion comparisons (sol-loop r3 S1 of EMS-R1).
             PropertyPathExpression::Alternative(paths) => {
                 let mut arms: Vec<(Self, usize)> = Vec::with_capacity(paths.len());
+                let mut at: std::collections::HashMap<Self, usize> =
+                    std::collections::HashMap::with_capacity(paths.len());
                 for path in paths {
                     let path = Self::resolve(path, snapshot);
-                    match arms.iter_mut().find(|(arm, _)| *arm == path) {
-                        Some((_, times)) => *times += 1,
-                        None => arms.push((path, 1)),
+                    match at.get(&path) {
+                        Some(&i) => arms[i].1 += 1,
+                        None => {
+                            at.insert(path.clone(), arms.len());
+                            arms.push((path, 1));
+                        }
                     }
                 }
                 Self::Alternative(arms)
