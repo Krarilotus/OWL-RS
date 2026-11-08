@@ -13,8 +13,11 @@ host's noise between instances.
 """
 from __future__ import annotations
 
+import argparse
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 import re
@@ -407,16 +410,207 @@ class Rounds(unittest.TestCase):
         capability, but the disk to make it in, its source and its file."""
         need = gate_module.data_needs
         self.assertEqual(need([{"data": "social people=1000"}]), [])
-        self.assertEqual(need([{"data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}]), ["owlrs-bench-assets"])
         self.assertEqual(need([{"data": "ore:ore_ont_9724"}]), ["owlrs-bench-assets"])
         self.assertEqual(need([{"data": "el classes=10", "reference": "/fast/ref/x.tax"}]), ["owlrs-bench-assets"])
         self.assertEqual(need([{"data": "volume:bsbm-100m.nt"}]), [])
         self.assertEqual(need([{"data": "volume:watdiv-10m.nt", "queries": "@watdiv-10m"}]), [])
-        self.assertEqual(need([{"data": "concat:volume:lubm-1.nt+social people=10"}]), ["owlrs-bench-assets"])
-        frozen = next(d for d in __import__("tomllib").loads((ROOT / "benches/datasets.toml").read_text(encoding="utf-8"))["dataset"]
-                      if d["file"] == "bsbm-100m.nt")
-        self.assertEqual(gate_module.data_disk_gb([{"data": "volume:bsbm-100m.nt"}]), -(-2 * frozen["bytes"] // 10 ** 9))
-        self.assertEqual(gate_module.data_disk_gb([{"data": "volume:lubm-10.nt"}]), 0)
+        frozen = {d["file"]: d for d in __import__("tomllib").loads((ROOT / "benches/datasets.toml").read_text(encoding="utf-8"))["dataset"]}
+        self.assertEqual(gate_module.data_disk_gb([{"data": "volume:bsbm-100m.nt"}]),
+                         -(-2 * frozen["bsbm-100m.nt"]["bytes"] // 10 ** 9))
+        # The LUBM data was the assets' until 7 Nov 2026; now a job makes it (the next test).
+        self.assertEqual(gate_module.data_disk_gb([{"data": "volume:lubm-10.nt"}]),
+                         -(-2 * frozen["lubm-10.nt"]["bytes"] // 10 ** 9))
+
+    def test_a_part_asks_for_what_its_data_s_makers_need_not_the_assets(self):
+        """Orchestrator, 7 Nov 2026 (Johannes's 2 Nov decisions 1 and 8: a job sets up what it needs
+        where it's missing, never a blanket copy): a set makes the datasets its cases read where a
+        host lacks them; only a file no maker here can make asks for the bench assets. The LUBM and
+        OWL2Bench makers run in Docker; perf_lab's support-stress generator needs only the build.
+        REAS (abba-run-8ac6a2b5-91f067f1) passed --plan and failed at its data step: its
+        support-stress files were on one host, and nothing made them."""
+        need = gate_module.data_needs
+        self.assertEqual(need([{"data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}]), ["docker"])
+        self.assertEqual(need([{"data": "concat:volume:lubm-1.nt+social people=10"}]), ["docker"])
+        self.assertEqual(need([{"data": "volume:owl2bench-rl-1.nt"}]), ["docker"])
+        # Sol-loop r1 S1: riot labels an OWL2Bench file's blank nodes afresh, so a made copy can meet
+        # only a form pin; one without it (owl2bench-ql-1.nt) still needs the assets.
+        self.assertEqual(need([{"data": "volume:owl2bench-ql-1.nt"}]), ["owlrs-bench-assets"])
+        self.assertEqual(need([{"data": "volume:support-stress/copies-8.nq"}]), [])
+        self.assertEqual(need([{"data": "volume:era-shacl/ERA.ttl"}]), ["owlrs-bench-assets"])  # no maker here
+        self.assertEqual(need([{"data": "volume:lubm-10.nt"}, {"data": "ore:ore_ont_9724"}]),
+                         ["docker", "owlrs-bench-assets"])
+
+    def test_a_dataset_is_as_pinned_by_its_bytes_or_by_its_rdfc_form(self):
+        """7 Nov 2026: riot labels univ-bench.nt's blank nodes afresh on every make, so a made copy's
+        bytes aren't the pin while its RDFC-1.0 canonical N-Quads' SHA-256 is the verified copy's
+        (stage-data-probe-1, stage-data-rdfc-1). A file pinned by form (`rdfc_sha256`) passes by
+        either; one pinned by bytes alone, by its bytes only; a form pin with nothing to compute the
+        form with fails closed."""
+        import hashlib
+        problem = gate_module.pin_problem
+        never = lambda _: self.fail("a bytes-only pin asked for the form")  # noqa: E731
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d, "f.nt")
+            path.write_bytes(b"<a> <b> _:x .\n")
+            sha, other = hashlib.sha256(b"<a> <b> _:x .\n").hexdigest(), "0" * 64
+            self.assertIsNone(problem(path, {"sha256": sha}, never))
+            self.assertIn("sha256", problem(path, {"sha256": other}, never))
+            self.assertIsNone(problem(path, {"sha256": other, "rdfc_sha256": "f" * 64}, lambda _: "f" * 64))
+            self.assertIn("RDFC-1.0", problem(path, {"sha256": other, "rdfc_sha256": "f" * 64}, lambda _: "e" * 64))
+            self.assertIn("rdfc", problem(path, {"sha256": other, "rdfc_sha256": "f" * 64}, None))
+
+    def test_a_copy_of_an_older_release_is_made_again_not_used(self):
+        """7 Nov 2026: lubm-10 and lubm-100 became their sorted distinct lines (UBA's threads order
+        them anew on every make), so the asset hosts' copies are an older release, at another size.
+        Where a maker can make the file, the data step makes it rather than stopping on the old copy;
+        the data view takes the first copy that is its pin (dataset_source())."""
+        import hashlib
+        if shutil.which("bash") is None:
+            self.skipTest("needs bash")
+        new, old = b"<a> <b> <c> .\n<d> <e> <f> .\n", b"<d> <e> <f> .\n<a> <b> <c> .\n<a> <b> <c> .\n"
+        entry = {"made_by": "bash benches/reasoning/prepare-lubm.sh 10", "bytes": len(new),
+                 "sha256": hashlib.sha256(new).hexdigest()}
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as cache, \
+                tempfile.TemporaryDirectory() as general:
+            root, cache, general = Path(root), Path(cache), Path(general)
+            (general / "lubm-10.nt").write_bytes(old)
+            (root / "benches/reasoning").mkdir(parents=True)
+            (root / "benches/reasoning/prepare-lubm.sh").write_text(
+                f"#!/usr/bin/env bash\nprintf '%s' '{new.decode()}' > \"$NRESE_DATASET_DIR/lubm-10.nt\"\n",
+                encoding="utf-8", newline="\n")
+            (root / "benches/datasets.toml").write_text(
+                '[[dataset]]\nfile = "lubm-10.nt"\n' + "".join(f'{k} = {json.dumps(v)}\n' for k, v in entry.items()),
+                encoding="utf-8")
+            with patch.dict(os.environ, {"SPARQL_DATA": str(cache)}), \
+                    patch.object(gate_module.hosts_registry, "input_path", return_value=general):
+                lines, ok = gate_module.data_state([{"data": "volume:lubm-10.nt"}], make=True, root=root)
+            self.assertTrue(ok, "\n".join(lines))
+            self.assertEqual((cache / "lubm-10.nt").read_bytes(), new)
+            self.assertEqual((general / "lubm-10.nt").read_bytes(), old)  # the assets are read-only
+            # The view: the first copy that is its pin, the older release skipped by its size.
+            chosen, problem = gate_module.dataset_source("lubm-10.nt", entry, [general, cache], None)
+            self.assertEqual((chosen, problem), (cache / "lubm-10.nt", None))
+            (cache / "lubm-10.nt").unlink()
+            chosen, problem = gate_module.dataset_source("lubm-10.nt", entry, [general, cache], None)
+            self.assertEqual(chosen, general / "lubm-10.nt")
+            self.assertIn("bytes", problem)
+
+    def test_a_record_says_which_frozen_bytes_its_case_loaded(self):
+        """Review r1 of pkg/stage-data, R1-W1: a comparison can hold a verdict to the same input only
+        if each record says which bytes its case loaded. The prepared manifest's hash where it holds
+        the file unchanged, else the file's own; None where the file isn't there, or the run can't
+        read it (the Docker runtime's volume)."""
+        import hashlib
+        with tempfile.TemporaryDirectory() as data, tempfile.TemporaryDirectory() as fast_data:
+            data, fast_data = Path(data), Path(fast_data)
+            (data / "lubm-10.nt").write_bytes(b"<a> <b> <c> .\n")
+            case = {"name": "t", "data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}
+            stat = (data / "lubm-10.nt").stat()
+            with patch.object(fast, "RUNTIME", "native"), patch.object(fast, "FAST_DATA", fast_data), \
+                    patch.object(fast.hosts, "input_path", return_value=data), \
+                    patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
+                self.assertEqual(fast.case_inputs(case), {"lubm-10.nt": hashlib.sha256(b"<a> <b> <c> .\n").hexdigest(),
+                                                          "univ-bench.nt": None})
+            (fast_data / fast.PREPARED).write_text(json.dumps({"files": {(data / "lubm-10.nt").as_posix(): {
+                "bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha256": "p" * 64}}}), encoding="utf-8")
+            with patch.object(fast, "RUNTIME", "native"), patch.object(fast, "FAST_DATA", fast_data), \
+                    patch.object(fast.hosts, "input_path", return_value=data), \
+                    patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
+                self.assertEqual(fast.case_inputs(case)["lubm-10.nt"], "p" * 64)  # the prepared manifest's
+            with patch.object(fast, "RUNTIME", "docker"), patch.dict(fast._DIGESTS, clear=True):
+                self.assertEqual(fast.case_inputs(case), {"lubm-10.nt": None, "univ-bench.nt": None})
+            # Sol-loop r3 V2: a concatenation's order is part of what was loaded.
+            (data / "univ-bench.nt").write_bytes(b"<u> <v> <w> .\n")
+            ab = {"name": "t", "data": "concat:volume:lubm-10.nt+volume:univ-bench.nt"}
+            ba = {"name": "t", "data": "concat:volume:univ-bench.nt+volume:lubm-10.nt"}
+            with patch.object(fast, "RUNTIME", "native"), patch.object(fast, "FAST_DATA", fast_data), \
+                    patch.object(fast.hosts, "input_path", return_value=data), \
+                    patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
+                self.assertNotEqual(fast.case_inputs(ab), fast.case_inputs(ba))
+                # Sol-loop r4 W1: the same concatenations listed in another order are the same input.
+                both = {"name": "t", "data": "volume:lubm-10.nt", "extra": [ab["data"], ba["data"]]}
+                self.assertEqual(fast.case_inputs(both), fast.case_inputs({**both, "extra": both["extra"][::-1]}))
+            # Fix check r2, R2-W2: an ORE case's converted ontology is a loaded external file, hashed.
+            (fast_data / "ore").mkdir()
+            (fast_data / "ore" / "ore_ont_9724.nt").write_bytes(b"<o> <p> <q> .\n")
+            with patch.object(fast, "RUNTIME", "native"), patch.object(fast, "FAST_DATA", fast_data), \
+                    patch.object(fast.hosts, "input_path", return_value=data), \
+                    patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
+                self.assertEqual(fast.case_inputs({"name": "o", "data": "ore:ore_ont_9724"}),
+                                 {"ore:ore_ont_9724": hashlib.sha256(b"<o> <p> <q> .\n").hexdigest()})
+                # Sol-loop r5 X2: a file there but unreadable is unknown, and the run goes on.
+                with patch.object(fast, "file_digest", side_effect=PermissionError("denied")), \
+                        patch.dict(fast._DIGESTS, clear=True):
+                    self.assertEqual(fast.case_inputs({"name": "o", "data": "ore:ore_ont_9724"}), {"ore:ore_ont_9724": None})
+                # A kind of input nothing here resolves is an external file of unknown bytes: never none.
+                self.assertEqual(fast.case_inputs({"name": "n", "data": "url:https://example.org/x.nt"}),
+                                 {"url:https://example.org/x.nt": None})
+
+    def test_which_external_files_a_case_loads_has_one_answer(self):
+        """The orchestrator, 7 Nov 2026 (18:12): the recorder and the comparison decide what an input
+        is by one function (suitekit.inputs.declared()); a kind it doesn't know is external, of
+        unknown bytes; only a bare generator spec is generated."""
+        from suitekit import inputs
+        self.assertEqual(inputs.declared({"data": "social people=1000"}), set())
+        self.assertEqual(inputs.declared({"data": "none"}), set())
+        self.assertEqual(inputs.declared({"data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}),
+                         {"lubm-10.nt", "univ-bench.nt"})
+        self.assertEqual(inputs.declared({"data": "ore:ore_ont_9724"}), {"ore:ore_ont_9724"})
+        self.assertEqual(inputs.declared({"data": "el classes=10", "reference": "/fast/ref/x.tax"}),
+                         {"reference:/fast/ref/x.tax"})
+        self.assertEqual(inputs.declared({"data": "concat:volume:univ-bench.nt+social people=10"}),
+                         {"univ-bench.nt", "concat:volume:univ-bench.nt+social people=10"})
+        self.assertEqual(inputs.declared({"data": "url:https://example.org/x.nt"}), {"url:https://example.org/x.nt"})
+
+    def test_the_catalogue_keeps_a_form_pin_and_a_note_when_it_is_written_again(self):
+        """7 Nov 2026: `suite.py data` rewrites benches/datasets.toml from a fixed list of keys, so a
+        freeze would have dropped univ-bench.nt's `rdfc_sha256` (its only pin a made copy can meet)
+        and a file's `note` (lubm-100's make time) without a word."""
+        from suitekit import datasets
+        entry = {"file": "univ-bench.nt", "made_by": "bash benches/reasoning/prepare-lubm.sh 1", "bytes": 47781,
+                 "sha256": "2" * 64, "rdfc_sha256": "7" * 64, "note": "made in 8 s on khaleesi-wsl"}
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / "benches").mkdir()
+            datasets.save(Path(root), {"budget_gb": 300, "dataset": [entry]})
+            self.assertEqual(datasets.load(Path(root))["dataset"], [entry])
+        # Sol-loop r1 S3: a freeze that changes the bytes drops the form pin, which was the old graph's
+        # (it accepted the old graph after a re-freeze); the same bytes keep it.
+        same = datasets.refreeze(dict(entry), 47781, "2" * 64, "2026-11-08")
+        self.assertEqual((same["rdfc_sha256"], same.get("frozen")), ("7" * 64, None))
+        changed = datasets.refreeze(dict(entry), 47781, "3" * 64, "2026-11-08")
+        self.assertNotIn("rdfc_sha256", changed)
+        self.assertEqual((changed["sha256"], changed["frozen"]), ("3" * 64, "2026-11-08"))
+
+    def test_the_data_step_makes_a_missing_file_aside_and_keeps_only_what_its_pin_accepts(self):
+        """Orchestrator, 7 Nov 2026: a maker writes into a directory aside (NRESE_DATASET_DIR, never
+        the shared volume); each file the cases need is checked against its pin and only then renamed
+        into the cache. A file that isn't its pin stays out, the cache as it was, and only it fails."""
+        import hashlib
+        if shutil.which("bash") is None:
+            self.skipTest("needs bash")
+        made = {"univ-bench.nt": b"<a> <b> <c> .\n", "lubm-1.nt": b"<q> <r> <s> .\n"}
+        pins = {"univ-bench.nt": hashlib.sha256(made["univ-bench.nt"]).hexdigest(),
+                "lubm-1.nt": hashlib.sha256(b"<not> <what> <it makes> .\n").hexdigest()}
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as cache:
+            root, cache = Path(root), Path(cache)
+            (root / "benches/reasoning").mkdir(parents=True)
+            (root / "benches/reasoning/prepare-lubm.sh").write_text(
+                '#!/usr/bin/env bash\nset -e\nd=${NRESE_DATASET_DIR:?}\n'
+                + "".join(f"printf '%s' '{body.decode()}' > \"$d/{name}\"\n" for name, body in made.items()),
+                encoding="utf-8", newline="\n")
+            (root / "benches/datasets.toml").write_text("".join(
+                f'[[dataset]]\nfile = "{name}"\nmade_by = "bash benches/reasoning/prepare-lubm.sh 1"\n'
+                f'bytes = {len(made[name])}\nsha256 = "{pins[name]}"\n\n' for name in made), encoding="utf-8")
+            with patch.dict(os.environ, {"SPARQL_DATA": str(cache)}), \
+                    patch.object(gate_module.hosts_registry, "input_path", return_value=None):
+                lines, ok = gate_module.data_state([{"data": "volume:lubm-1.nt", "extra": ["volume:univ-bench.nt"]}],
+                                                   make=True, root=root)
+            text = "\n".join(lines)
+            self.assertFalse(ok, text)
+            self.assertEqual(sorted(p.name for p in cache.iterdir()), ["univ-bench.nt"], text)  # nothing else, no aside
+            self.assertEqual((cache / "univ-bench.nt").read_bytes(), made["univ-bench.nt"])
+            self.assertIn("made univ-bench.nt", text)
+            self.assertIn("FAILED lubm-1.nt", text)
 
     def test_the_data_probe_says_what_a_host_holds_and_what_it_cannot_make(self):
         """The probe (release_gate.py data; release-gate.sh prepare with --make): a file in the cache
@@ -697,6 +891,200 @@ class MainAdapter(unittest.TestCase):
             self.assertEqual(fast.changed_inputs(files), [])
             data.write_text("xy")
             self.assertEqual(fast.changed_inputs(files), [data.as_posix()])
+
+
+class DeclaredMetric(unittest.TestCase):
+    """The orchestrator, 7 Nov 2026 (18:05): C1's A-B-B-A abba-run-2102481f-fbbc9ee1 timed
+    ql-memberships-type-commits-wide, which declares `commits.read_p50_ms`, by the commit latency
+    (`time/_`, ratio 0.98), while B's reader read in ~10 ms against A's 0.004 ms: a loss in no
+    hypothesis. fast.samples() took a section's `samples_ms` (the commits') for any metric of that
+    section. A case's timed series is the metric it declares."""
+    CASE = {"name": "ql-memberships-type-commits-wide", "metric": "commits.read_p50_ms", "tool": "perf_lab"}
+
+    @staticmethod
+    def result(read_p50, commit_ms=0.2077):
+        return {"commits": {"commits": 400, "p50_ms": commit_ms, "p99_ms": 0.9461, "reads": 10010,
+                            "read_p50_ms": read_p50, "read_p99_ms": 0.119, "samples_ms": [commit_ms] * 400}}
+
+    def test_a_case_is_timed_by_the_metric_it_declares(self):
+        self.assertEqual(fast.samples(self.CASE, self.result(0.004)), {"_": [0.004]})
+        # Its section's own latency keeps its samples (the commits' p50 is what they sample).
+        self.assertEqual(fast.samples({**self.CASE, "metric": "commits.p50_ms"}, self.result(0.004))["_"],
+                         [0.2077] * 400)
+        # Another statistic of a sampled section is that statistic, not the samples' median.
+        self.assertEqual(fast.samples({**self.CASE, "metric": "commits.p99_ms"}, self.result(0.004)), {"_": [0.9461]})
+
+    def test_a_metric_in_seconds_is_a_series_in_milliseconds(self):
+        """Review r1 R1-F1: `commits.whole_s` reached the series in seconds, where the comparison's
+        floors are milliseconds. A metric declared in seconds (`*_s`) is milliseconds in the series,
+        per process and over repeated processes alike; a p50 sample series is as it was."""
+        case = {"name": "rule-delta-sweep", "metric": "commits.whole_s", "tool": "perf_lab"}
+        whole = lambda s: {"commits": {"whole_s": s, "p50_ms": 0.2, "samples_ms": [0.2] * 4}}  # noqa: E731
+        self.assertEqual(fast.samples(case, whole(3.0)), {"_": [3000.0]})
+        self.assertEqual(fast.samples(case, {**whole(3.0), "_repeats": [whole(3.0), whole(3.2)]}), {"_": [3000.0, 3200.0]})
+        self.assertEqual(fast.metric_value(case, whole(3.0)), 3000.0)
+        self.assertEqual(fast.samples({**case, "metric": "commits.p50_ms"}, whole(3.0)), {"_": [0.2] * 4})
+
+    def test_a_600_ms_whole_run_loss_is_a_regression_in_compare(self):
+        """Review r1 R1-F1, the real caller: `fast.py compare` (compare_reports) with its 2 ms floor
+        called 3.0 s -> 3.6 s "slower, below absolute floor" and exited 0. Specified independently: a
+        whole run 600 ms slower, 20 % and far above 2 ms, is a regression."""
+        from suitekit import compare
+        case = {"name": "rule-delta-sweep", "metric": "commits.whole_s", "tool": "perf_lab"}
+
+        def report(seconds):
+            records = []
+            for rep in (1, 2):
+                result = {"commits": {"whole_s": seconds, "p50_ms": 0.2, "samples_ms": [0.2] * 4}}
+                records.append({"case": case["name"], "rep": rep, "status": "ok", "checks": [], "routes": [],
+                                "metric": fast.metric_value(case, result), "samples": fast.samples(case, result)})
+            return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
+                    "started": "2026-11-08T02:00:00", "records": records}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = compare.compare_reports(report(3.0), report(3.6))
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertNotIn("below absolute floor", out.getvalue())
+
+    @staticmethod
+    def saved(case, metric, series, units=None):
+        records = []
+        for rep in (1, 2):
+            r = {"case": case, "rep": rep, "status": "ok", "checks": [], "routes": [], "metric": metric,
+                 "samples": {"_": list(series)}}
+            if units is not None:
+                r["series_units"] = units
+            records.append(r)
+        return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
+                "started": "2026-11-08T02:00:00", "records": records}
+
+    def compared(self, base, new):
+        from suitekit import compare
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = compare.compare_reports(base, new)
+        return code, out.getvalue()
+
+    def test_reports_of_two_timing_unit_generations_are_normalised_or_refused(self):
+        """Fix check r2, R2-F1: reports before 8 Nov 2026 saved `commits.whole_s` in seconds and
+        timed it by its section's commit latencies; new ones save milliseconds of the whole run. A
+        record says its generation (`series_units`; none: 1); compare normalises what that generation
+        fixes exactly and refuses what it can't, before any verdict."""
+        # The verdicts first (a red run fails at a verdict, not at a missing name); generation 2 literal.
+        # An old rule-delta-sweep record timed its commit latencies: another quantity, refused.
+        old = self.saved("rule-delta-sweep", 3.0, [0.2, 0.2, 0.2])
+        new = self.saved("rule-delta-sweep", 3000.0, [3000.0], units=2)
+        code, text = self.compared(old, new)
+        self.assertEqual(code, 2, text)
+        self.assertNotIn("faster", text)
+        self.assertIn("timing units", text)
+        # A load_s case was milliseconds in both generations: an old 3.0 s load against a new 3.6 s is
+        # a 600 ms regression.
+        load = next(c["name"] for c in __import__("suitekit.cases", fromlist=["load"]).load() if c.get("metric") == "load_s")
+        code, text = self.compared(self.saved(load, 3000.0, [3000.0]),
+                                   self.saved(load, 3600.0, [3600.0], units=2))
+        self.assertEqual(code, 1, text)
+        self.assertIn("SLOWER", text)
+        # Same generation on both sides compares as it always did.
+        code, text = self.compared(self.saved("rule-delta-sweep", 3.0, [10.0] * 3),
+                                   self.saved("rule-delta-sweep", 3.0, [20.0] * 3))
+        self.assertEqual(code, 1, text)  # 10 ms more, above the 2 ms floor
+        # A generation compare doesn't know is refused.
+        code, text = self.compared(new, self.saved("rule-delta-sweep", 3600.0, [3600.0], units=99))
+        self.assertEqual(code, 2, text)
+        self.assertIn("unknown timing units", text)
+        # Every record fast.py writes says its generation: compare's own.
+        from suitekit import compare
+        self.assertEqual(fast.SERIES_UNITS, compare.SERIES_UNITS)
+        self.assertEqual(compare.SERIES_UNITS, 2)
+
+    def test_an_old_seconds_series_is_milliseconds_after_normalising(self):
+        """A generation-1 record of a seconds field whose series was its own value (no section samples):
+        its metric and series times 1000."""
+        from suitekit import compare
+        record = {"case": "x", "metric": 3.0, "samples": {"_": [3.0, 3.1]}}
+        self.assertEqual(compare.normalised(record, "phase.whole_s"),
+                         {**record, "metric": 3000.0, "samples": {"_": [3000.0, 3100.0]},
+                          "series_units": compare.SERIES_UNITS})
+        self.assertIsNone(compare.normalised({**record, "case": "y"}, "commits.whole_s"))  # section latency
+        self.assertEqual(compare.normalised(dict(record), "load_s")["metric"], 3.0)  # was ms already
+
+    CHECK = "closure_after_commits.equal"  # rule-delta-sweep's registry check (benches/cases/core.toml)
+
+    @classmethod
+    def two_cases(cls, units, sweep_status="ok", sweep_peak=1000):
+        """r3's reports: rule-delta-sweep of one generation (1: seconds and its commit latencies;
+        2: milliseconds of the whole run) beside an unchanged rl-hierarchy."""
+        records = []
+        for rep in (1, 2):
+            ok = sweep_status == "ok"
+            sweep = {"case": "rule-delta-sweep", "rep": rep, "status": sweep_status, "routes": [],
+                     "checks": [{"path": cls.CHECK, "want": "true", "got": ok, "ok": ok}],
+                     "metric": 3.0 if units is None else 3000.0,
+                     "samples": {"_": [0.2, 0.2, 0.2] if units is None else [3000.0]},
+                     "peak_mib": sweep_peak, "memory_kind": "lifetime"}
+            hierarchy = {"case": "rl-hierarchy", "rep": rep, "status": "ok", "checks": [], "routes": [],
+                         "metric": 100.0, "samples": {"_": [100.0]}, "peak_mib": 500, "memory_kind": "lifetime"}
+            for r in (sweep, hierarchy):
+                if units is not None:
+                    r["series_units"] = units
+                records.append(r)
+        return {"reps": 2, "machine": {"host": "fixture", "governor": "performance"},
+                "started": "2026-11-08T02:00:00", "records": records}
+
+    def test_refused_timing_keeps_the_case_s_status_checks_and_memory(self):
+        """Fix check r3, R3-F1: refusing a case's timing (units of two generations) dropped its whole
+        record, so a case gone from ok to wrong beside an unchanged one exited 0. Specified (r3's
+        required revision; compare.py's order, "nothing lost hides behind a time"): only the refused
+        case's time is not compared; its status, checks and memory are, and their failure is nonzero."""
+        no_ratio = lambda text: self.assertIsNone(re.search(r"^rule-delta-sweep +\d", text, re.M), text)  # noqa: E731
+        with self.subTest("ok -> wrong beside an unchanged case: an acceptance failure, the status named"):
+            code, text = self.compared(self.two_cases(None), self.two_cases(2, sweep_status="wrong"))
+            self.assertEqual(code, 1, text)
+            self.assertRegex(text, r"rule-delta-sweep +status ok -> wrong +CHANGED")
+            no_ratio(text)
+            self.assertRegex(text, r"rl-hierarchy .* same")
+        with self.subTest("the wrong case alone: no timing left, its failure is the verdict (1), not the refusal (2)"):
+            def alone(report):
+                return {**report, "records": [r for r in report["records"] if r["case"] == "rule-delta-sweep"]}
+            code, text = self.compared(alone(self.two_cases(None)), alone(self.two_cases(2, sweep_status="wrong")))
+            self.assertEqual(code, 1, text)
+            self.assertIn("status ok -> wrong", text)
+        with self.subTest("a refused case's peak still counts: 1000 -> 2000 MiB"):
+            code, text = self.compared(self.two_cases(None), self.two_cases(2, sweep_peak=2000))
+            self.assertEqual(code, 1, text)
+            self.assertRegex(text, r"rule-delta-sweep +peak .*1000 -> 2000 MiB +MORE MEMORY")
+        with self.subTest("guard (as at 43b1f309): all ok, the refused case listed, no ratio for it, exit 0"):
+            code, text = self.compared(self.two_cases(None), self.two_cases(2))
+            self.assertEqual(code, 0, text)
+            self.assertRegex(text, r"rule-delta-sweep.*not compared")
+            no_ratio(text)
+
+    def test_refused_timing_keeps_the_wrong_status_in_compact_reports(self):
+        """R3-F1 through `fast.py compare` on compact records alone (their full reports not here):
+        they keep status, checks and `series_units`, so the verdict is the full reports'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for name, report in (("base", self.two_cases(None)), ("new", self.two_cases(2, sweep_status="wrong"))):
+                full = Path(tmp) / f"{name}-full.json"
+                full.write_text(json.dumps(report), encoding="utf-8")
+                paths.append(fast.write_compact(full, Path(tmp) / f"{name}.json"))
+                full.unlink()
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = fast.compare(argparse.Namespace(base=str(paths[0]), new=str(paths[1])))
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertRegex(out.getvalue(), r"rule-delta-sweep +status ok -> wrong +CHANGED")
+        self.assertIn("full report isn't here", out.getvalue())
+
+    def test_c1_s_read_slowdown_is_a_loss_in_its_family(self):
+        """The run's own values, per pass: A 0.004 ms in every block, B 10.371, 9.843 and 10.547 ms."""
+        a = [fast.samples(self.CASE, self.result(0.004))["_"] for _ in range(3)]
+        b = [fast.samples(self.CASE, self.result(ms, 0.2056))["_"] for ms in (10.371, 9.843, 10.547)]
+        blocks = [1, 2, 3]
+        r = gate_module.dimension(a, blocks, b, blocks, {}, "ms")
+        self.assertEqual(r["status"], "loss shown", r)
+        self.assertGreater(r["ratio"], 1000)
 
 
 class Memory(unittest.TestCase):
@@ -991,10 +1379,15 @@ esac
             (shim / "python3").chmod(0o755)
             inputs = Path(tmp) / "inputs" / "support-stress"
             inputs.mkdir(parents=True)
-            for name in ("copies-17.nq", "copies-17.nq.reader"):
-                (inputs / name).write_text("", encoding="utf-8")
-            (inputs / "copies-17.nq.commits.ru").write_text(
-                "INSERT DATA { <http://example.org/s> a <http://example.org/Absent> }\n", encoding="utf-8")
+            # Each at its pinned size, its bytes altered: the data step takes them as there, and the
+            # view's freeze check is what must refuse them (7 Nov 2026: at another size, a file a job
+            # can make is made instead, and that path has its own test).
+            pinned = {d["file"]: d["bytes"] for d in __import__("tomllib").loads(
+                (ROOT / "benches/datasets.toml").read_text(encoding="utf-8"))["dataset"]}
+            altered = b"INSERT DATA { <http://example.org/s> a <http://example.org/Absent> }\n"
+            for name in ("copies-17.nq", "copies-17.nq.reader", "copies-17.nq.commits.ru"):
+                size = pinned[f"support-stress/{name}"]
+                (inputs / name).write_bytes((altered * (size // len(altered) + 1))[:size])
             view = Path(tmp) / "gate" / "data" / "support-stress"
             view.mkdir(parents=True)
             (view / "copies-17.nq.commits.ru").symlink_to(inputs / "copies-17.nq.commits.ru")  # an earlier view's
