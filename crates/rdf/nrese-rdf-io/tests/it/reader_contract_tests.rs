@@ -429,6 +429,14 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
             "VERSION 12 \"1.2\"\n<http://e/a> <http://e/b> <http://e/c> . <urn:after> <urn:p> <urn:o> .",
             vec![None, Some(&abc), Some(&after)],
         ),
+        // The string a failed VERSION ends with is its label, not a literal: an `@` after it
+        // starts a directive, as after a VERSION that parses (sol-loop r3 S6).
+        (
+            false,
+            RdfFormat::Turtle,
+            "VERSION 12 \"1.2\"\n@prefix ex: <http://e/> .\nex:a ex:b ex:c . <urn:after> <urn:p> <urn:o> .",
+            vec![None, Some(&abc), Some(&after)],
+        ),
         // With no IRI (or string) to end it, it ends at a `.` with nothing open, as before.
         (
             true,
