@@ -24,6 +24,22 @@ fn local_user(name: &str, password: &str) -> Change {
     }
 }
 
+/// A store holding `state` as an access state from before ids (records without one), as
+/// an upgraded store holds it.
+fn seeded(state: &AccessState) -> StoreService {
+    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+    let state_graph = nrese_rdf::NamedNode::new_unchecked(STATE_GRAPH);
+    let quads = crate::access::rdf::encode(state, &state_graph);
+    let insert = format!(
+        "INSERT DATA {{\n{}\n}}",
+        crate::access::control::data(&quads)
+    );
+    store
+        .update_ungated(&crate::SparqlUpdateRequest::new(insert))
+        .unwrap();
+    store
+}
+
 /// An enforcing access state in `store`.
 fn enforcing(store: &StoreService) -> AccessControl {
     let control = AccessControl::open(store.clone(), "urn:nrese:").unwrap();
@@ -95,19 +111,10 @@ fn a_reused_name_starts_empty() {
 
     // C2 and C3: a workspace from before ids (its record without one, as in an upgraded
     // store) keeps its prefix, also reopened; removed and created again, it starts empty.
-    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
     let mut legacy = AccessState::new("urn:nrese:");
     legacy.apply(&admin(), Change::Import(policy())).unwrap();
     legacy.apply(&alice, workspace("team")).unwrap();
-    let state_graph = nrese_rdf::NamedNode::new_unchecked(STATE_GRAPH);
-    let quads = crate::access::rdf::encode(&legacy, &state_graph);
-    let insert = format!(
-        "INSERT DATA {{\n{}\n}}",
-        crate::access::control::data(&quads)
-    );
-    store
-        .update_ungated(&crate::SparqlUpdateRequest::new(insert))
-        .unwrap();
+    let store = seeded(&legacy);
     let control = AccessControl::open(store.clone(), "urn:nrese:").unwrap();
     let before_ids = "urn:nrese:workspace/team/";
     if control.state().prefix("team") != before_ids {
@@ -177,6 +184,58 @@ fn a_reused_name_starts_empty() {
             "C7 guard: a token user's space moved: {token_user} -> {}",
             control.state().prefix("~dave")
         ));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// C17 (package review R1-D1; red without its fix) and C18 (guard): a local user from before
+/// ids, removed, created again without a password and given one in a second change, is a
+/// new person and inherits nothing; an unchanged account from before ids, its password
+/// reset, keeps its space. Both also after reopen. Specified (C-204 (b)): a reused name
+/// starts empty; a missing password isn't evidence of a continuing identity.
+#[test]
+fn a_local_user_recreated_in_two_steps_starts_empty() {
+    let (carol, erin) = (user("carol"), user("erin"));
+    let mut legacy = AccessState::new("urn:nrese:");
+    legacy.apply(&admin(), Change::Import(policy())).unwrap();
+    for change in [
+        local_user("carol", "the first carol's secret"),
+        local_user("erin", "erin's long secret"),
+    ] {
+        legacy.apply(&admin(), change).unwrap();
+    }
+    let store = seeded(&legacy);
+    let control = AccessControl::open(store.clone(), "urn:nrese:").unwrap();
+    let old = keep(&control, &carol, "~carol");
+    let kept = keep(&control, &erin, "~erin");
+    let record = Change::PutUser {
+        name: "carol".to_owned(),
+        admin: None,
+        roles: Some(BTreeSet::from(["analyst".to_owned()])),
+        password_hash: None,
+    };
+    for (change, reason) in [
+        (Change::RemoveUser("carol".to_owned()), "left"),
+        (record, "hired, her login to follow"),
+        (
+            local_user("carol", "the second carol's secret"),
+            "her login",
+        ),
+        (local_user("erin", "erin's new long secret"), "reset"),
+    ] {
+        control.apply(&admin(), change, reason).unwrap();
+    }
+    let reopened = AccessControl::open(store.clone(), "urn:nrese:").unwrap();
+    let mut wrong = Vec::new();
+    for (when, control) in [("now", control), ("reopened", reopened)] {
+        for found in inherited(&control, &carol, "~carol", &old) {
+            wrong.push(format!("C17 {when}: the second carol {found}"));
+        }
+        let keeps = control.view(&erin, "nrese").can_write(&named(&kept))
+            && control.saved_query(&erin, "~erin", "kept").is_ok();
+        if !keeps {
+            wrong.push(format!("C18 guard {when}: erin lost her own space"));
+        }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
