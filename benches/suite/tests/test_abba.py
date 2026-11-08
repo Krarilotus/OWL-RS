@@ -284,7 +284,9 @@ systems = []
         """Orchestrator, 8 Nov 2026: REAS's and C5's sets (abba-run-055fe886-f3da61f9) were planned by a
         submitter that makes support-stress data, so asked for no assets, but prepared by a harness
         from before the dataset makers (838cd7eb, PR #129), which didn't make them: "7 not as pinned"
-        on a host without them, after the builds. Refused at the plan, saying why."""
+        on a host without them, after the builds. Refused at the plan, saying why. Fix check r3 R3-W1
+        of pkg/maker-containers (the master, 8 Nov 2026): a harness's makers are its catalogue's
+        [makers], so one without them is refused as such, whichever of the cases' files it would make."""
         old = self.commits[-1]  # a real harness commit whose tree has no dataset makers
         sides = {"a": self.commits[0], "b": old}
         self.path.write_bytes(abba.family_text("t", sides, ["support-copies-17"], 6).encode("utf-8"))
@@ -292,27 +294,37 @@ systems = []
             with self.assertRaises(abba.Invalid) as refused:  # planned unrefused, it asks for no assets
                 abba.jobs(self.load(), old, self.repo.as_posix())
         text = "\n".join(refused.exception.args[0])
-        self.assertIn("support-stress/copies-17.nq", text)
+        self.assertIn("[makers]", text)
         self.assertIn("dataset makers", text)
         # The same family, a harness that makes it (this tree's metadata; the class's patch).
         job = next(iter(abba.jobs(self.load(), old, self.repo.as_posix()).values()))
         self.assertNotIn("owlrs-bench-assets", job["requires"].get("has", []))
 
-    def test_whether_a_harness_makes_data_is_read_from_its_own_tree(self):
-        """The harness's own release_gate.py, at that commit, names the dataset makers or doesn't
-        (harness_tables(): PR #139's makers_at(), unified into the one reader of a harness's metadata)."""
+    def test_whether_a_harness_makes_data_is_read_from_its_own_catalogue(self):
+        """The harness's own catalogue, at that commit, names its dataset makers ([makers]) or doesn't
+        (harness_tables(): PR #139's makers_at(), unified into the one reader of a harness's metadata).
+        Fix check r3 R3-W1 (the master, 8 Nov 2026): one without [makers] is refused, whatever its
+        release_gate.py says, as is a commit the checkout doesn't have."""
         with tempfile.TemporaryDirectory() as d:
             git = lambda *a: abba.subprocess.run(["git", "-C", d, *a], capture_output=True, text=True,  # noqa: E731
                                                  check=True).stdout.strip()
             git("init", "-q")
             Path(d, "benches/fast").mkdir(parents=True)
-            commit = lambda text: (Path(d, "benches/fast/release_gate.py").write_text(text, encoding="utf-8"),  # noqa: E731
-                                   git("add", "-A"), git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
-                                                         "-m", "x"), git("rev-parse", "HEAD"))[3]
-            before, after = commit("# no makers\n"), commit("DATASET_MAKERS = {}\n")
-            self.assertIsNone(HARNESS_TABLES(d, before).makers)
+            Path(d, "benches/fast/release_gate.py").write_text("DATASET_MAKERS = {}\n", encoding="utf-8")
+
+            def commit(makers: str) -> str:
+                Path(d, "benches/datasets.toml").write_text(f'budget_gb = 1\n{makers}\n[[dataset]]\nfile = "x.nt"\n',
+                                                            encoding="utf-8")
+                git("add", "-A")
+                git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x")
+                return git("rev-parse", "HEAD")
+            before, after = commit("# no makers"), commit("[makers]")
+            for name, harness in (("no [makers]", before), ("not there", "0" * 40)):
+                with self.subTest(name):
+                    with self.assertRaises(abba.rg.HarnessRefused) as refused:
+                        HARNESS_TABLES(d, harness)
+                    self.assertIn("[makers]", str(refused.exception))
             self.assertEqual(HARNESS_TABLES(d, after).makers, {})
-            self.assertIsNone(HARNESS_TABLES(d, "0" * 40).makers)  # not there: unknown, refused
 
     def test_a_job_asks_what_its_harness_makes_and_how(self):
         """Review r1 R1 of pkg/maker-containers (8 Nov 2026): a job's data is made by its harness's own

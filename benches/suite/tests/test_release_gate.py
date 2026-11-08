@@ -574,17 +574,19 @@ class Rounds(unittest.TestCase):
     def test_a_harness_whose_makers_it_can_t_declare_is_refused(self):
         """Review r1 R1 and sol-loop r1 S1 of pkg/maker-containers: a harness whose makers start
         containers it declares no size for (between engine-v2 838cd7eb and this package: unlabelled,
-        unlimited), or whose tables aren't literals to read, or whose catalogue can't be read, would
-        have its data step stopped or its data unknown: refused at the plan, saying why."""
+        unlimited), or whose tables are code, or whose catalogue can't be read, would have its data
+        step stopped or its data unknown: refused at the plan, saying why. Fix check r3 R3-W1 (the
+        master, 8 Nov 2026): a harness's tables are its catalogue's [makers] alone, so every harness
+        whose tables are code is refused for having no [makers], whatever the code says."""
         with tempfile.TemporaryDirectory() as tmp:
             for name, kw, cases, why in (
                     ("unsized", {"lubm_size": None}, "shacl-lubm", "container"),
                     ("computed", {"tables": 'MAKER_CONTAINERS = {"bash " + "x": (1, 1)}\n'}, "shacl-lubm",
-                     "isn't a literal"),
+                     "[makers]"),
                     ("uncatalogued", {"catalogue": False, "lubm_size": None}, "shacl-lubm", "datasets.toml"),
                     # Review r2 R2-W1: a harness from before [makers] whose sizes are code (this package's
                     # commits before it; bafc5741 declared 4/8 where H's code made 6/4): refused, never run.
-                    ("sizes as code", {"legacy": True}, "shacl-lubm", "container sizes are code"),
+                    ("sizes as code", {"legacy": True}, "shacl-lubm", "[makers]"),
                     # Sol-loop r3 S1: sized makers whose scripts don't take the declaration.
                     ("unheld", {"helper": False}, "shacl-lubm", "ns_maker_args"),
                     # S3: SPARQL's maker shares the declared container, so its size counts too.
@@ -593,7 +595,7 @@ class Rounds(unittest.TestCase):
                     ("unnamed file", {"drop": ("lubm-10.nt",)}, "shacl-lubm", "lubm-10.nt"),
                     # Review r2 R2-W1, its witnesses: a write after the literal of a harness whose tables are
                     # code (the builder declared 4/8 where H says 6/4): refused, never run.
-                    *((f"changed by {how}", {"legacy": True, "after": text}, "shacl-lubm", "MAKER_CONTAINERS")
+                    *((f"changed by {how}", {"legacy": True, "after": text}, "shacl-lubm", "[makers]")
                       for how, text in (
                           ("subscript", f'MAKER_CONTAINERS["{LUBM_MAKER}"] = (6, 4)\n'),
                           ("augmented", f'MAKER_CONTAINERS |= {{"{LUBM_MAKER}": (6, 4)}}\n'),
@@ -602,10 +604,10 @@ class Rounds(unittest.TestCase):
                           ("del", f'del MAKER_CONTAINERS["{LUBM_MAKER}"]\n'),
                           ("a function", 'def grow():\n    global MAKER_CONTAINERS\n    MAKER_CONTAINERS = {}\n'))),
                     ("assigned twice", {"legacy": True, "after": f'MAKER_CONTAINERS = {{"{LUBM_MAKER}": (6, 4)}}\n'},
-                     "shacl-lubm", "more than once"),
+                     "shacl-lubm", "[makers]"),
                     ("re-assigned annotated", {"legacy": True,
                                                "after": f'MAKER_CONTAINERS: dict = {{"{LUBM_MAKER}": (6, 4)}}\n'},
-                     "shacl-lubm", "more than once"),
+                     "shacl-lubm", "[makers]"),
                     ("malformed [makers]", {"lubm_size": (0, 4)}, "shacl-lubm", "[makers]")):
                 with self.subTest(name):
                     repo = Path(tmp) / name.replace(" ", "-")
@@ -613,6 +615,56 @@ class Rounds(unittest.TestCase):
                     with self.assertRaises(SystemExit) as refused:
                         gate_module.jobs(harness, harness, repo.as_posix(), "rg-test", 2, cases, checks=False)
                     self.assertIn(why, str(refused.exception))
+
+    def test_a_harness_s_makers_are_its_catalogue_s_and_its_code_is_never_read(self):
+        """Fix check r3 R3-W1 of pkg/maker-containers (8 Nov 2026): a harness without [makers] whose
+        release_gate.py gives LUBM's maker Docker through an alias (r3's witness: its literal says [],
+        `x = DATASET_MAKERS[LUBM]; x.append("docker")` after it) was planned with no container, no Docker
+        and its blocks' memory alone, while its data step starts LUBM's containers. The master's boundary
+        (8 Nov 2026): a harness's maker tables come only from its catalogue's [makers]; one without is
+        refused before admission, naming the remedy, and no Python of the harness is read. Each row on
+        its own: the witness (refused), and two guards that pass before and after: [makers] 6/4 declared
+        6/4 though the harness's code raises and says 9/9; its release_gate.py never shown."""
+        legacy = (f'DATASET_MAKERS = {{"{LUBM_MAKER}": [], "bash benches/reasoning/prepare-owl2bench.sh": ["docker"], '
+                  '"perf_lab generate support-stress": []}\n'
+                  'FORM_ONLY = {"bash benches/reasoning/prepare-owl2bench.sh"}\n'
+                  'SPARQL_PREPARE = "benches/sparql/prepare.sh"\n'
+                  f'_legacy_needs = DATASET_MAKERS["{LUBM_MAKER}"]\n_legacy_needs.append("docker")\n')
+        real = subprocess.run
+
+        def planned(repo: Path, harness: str):
+            shown = []
+
+            def run(args, *a, **kw):
+                if list(args[:2]) == ["git", "-C"] and len(args) > 4 and args[3] == "show":
+                    shown.append(str(args[4]).split(":", 1)[-1])
+                return real(args, *a, **kw)
+            try:
+                with patch.object(subprocess, "run", run):
+                    timed = gate_module.jobs(harness, harness, repo.as_posix(), "rg-test", 2, "shacl-lubm",
+                                             checks=False)["rg-test-timed"]
+            except SystemExit as refused:
+                return str(refused), shown
+            return timed, shown
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.subTest("r3 witness: no [makers], Docker added by an alias in its code"):
+                repo = Path(tmp) / "alias"
+                got, shown = planned(repo, harness_commit(repo, tables=legacy))
+                self.assertIsInstance(got, str, f"planned, not refused: {got}")
+                for said in ("[makers]", "merge refactor/engine-v2", "--harness"):
+                    self.assertIn(said, got)
+                self.assertNotIn("benches/fast/release_gate.py", shown)
+            with self.subTest("guard: [makers] 6/4, its code raising and saying 9/9"):
+                repo = Path(tmp) / "inert"
+                got, shown = planned(repo, harness_commit(repo, lubm_size=(6, 4), after=(
+                    'raise RuntimeError("the harness code ran")\n'
+                    f'MAKER_CONTAINERS = {{"{LUBM_MAKER}": (9, 9)}}\n')))
+                self.assertIsInstance(got, dict, f"refused: {got}")
+                self.assertEqual(got["containers"], [{"name": "maker", "memory_gb": 6, "cpus": 4}])
+                self.assertEqual((got["env"]["NRESE_MAKER_MEMORY_GB"], got["env"]["NRESE_MAKER_CPUS"]), ("6", "4"))
+                self.assertIn("benches/datasets.toml", shown)  # the probe sees the harness's reads
+                self.assertNotIn("benches/fast/release_gate.py", shown)
 
     def test_a_catalogue_s_makers_are_refused_where_a_file_s_maker_would_be_ambiguous_or_unbounded(self):
         """Sol-loop r6 S6/S7 of pkg/maker-containers: a file's maker is the [makers] start its made_by
