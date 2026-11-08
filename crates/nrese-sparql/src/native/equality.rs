@@ -83,10 +83,11 @@ pub(super) fn kept_is_published() -> bool {
         .is_none_or(|(kept, _)| kept.shared_state().is_some())
 }
 
-/// `snapshot`'s representatives, room for each entry made by `room` before it goes in.
+/// `snapshot`'s representatives; `room` is told the most entries they can have before
+/// anything is made.
 fn build<E>(
     snapshot: &Snapshot,
-    mut room: impl FnMut(&mut Representatives) -> Result<(), E>,
+    room: impl FnOnce(usize) -> Result<(), E>,
 ) -> Result<Representatives, E> {
     #[cfg(test)]
     BUILDS.with(|builds| builds.set(builds.get() + 1));
@@ -94,9 +95,9 @@ fn build<E>(
     // A store kept over representatives knows its classes; its `sameAs` relation, read
     // expanded, would list every pair of each class.
     if let Some(classes) = snapshot.equality_classes() {
+        room(classes.iter().map(|(_, members)| members.len()).sum())?;
         for (representative, members) in classes.iter() {
             for &member in members {
-                room(&mut out)?;
                 out.insert(member, representative);
             }
         }
@@ -111,6 +112,10 @@ fn build<E>(
         object: None,
         graph: GraphSelector::Any,
     };
+    // Two entries at most per statement read; without equality classes the count is exact.
+    let statements = snapshot.count_in(ReadModel::Materialised, &pattern);
+    debug_assert!(statements.exact().is_some(), "a count without expansion");
+    room(usize::try_from(statements.at_least()).map_or(usize::MAX, |n| n.saturating_mul(2)))?;
     for quad in snapshot.quads_for_pattern_in(ReadModel::Materialised, &pattern) {
         let (s, o) = (quad.subject.raw(), quad.object.raw());
         if s == o {
@@ -118,7 +123,6 @@ fn build<E>(
         }
         let least = s.min(o);
         for term in [s, o] {
-            room(&mut out)?;
             let entry = out.entry(term).or_insert(term);
             *entry = (*entry).min(least);
         }
@@ -185,14 +189,19 @@ impl Context<'_> {
         // for them, the query goes on without: they only let a join run on one identity per
         // class where its aggregates can't tell, and the join on every identity gives the same
         // answer (`notes/2026-11-08-dict3-4-equality-design.md`, D1).
+        // One charge before anything is made: the most the map's tables hold while it grows to
+        // its bound, its last table beside the one it replaces; trimmed to what it holds.
         let mut held = Reservation::new(Arc::clone(&self.budget));
-        let built = held.charge(SHARED).and_then(|()| {
-            build(&self.snapshot, |map| {
-                super::spatial::map_room(&mut held, map)
-            })
+        let table = super::spatial::map_bytes::<u64, u64>;
+        let built = build(&self.snapshot, |entries| {
+            held.charge(SHARED.saturating_add(table(entries).saturating_mul(2)))
         });
         match built {
-            Ok(representatives) => Some((Arc::new(representatives), Some(held))),
+            Ok(representatives) => {
+                let holds = SHARED + table(representatives.capacity());
+                held.release(held.bytes().saturating_sub(holds));
+                Some((Arc::new(representatives), Some(held)))
+            }
             Err(_) => {
                 #[cfg(test)]
                 REFUSED.with(|refused| refused.set(refused.get() + 1));
